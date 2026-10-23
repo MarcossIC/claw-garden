@@ -12,6 +12,7 @@ use clawg_cli::daemon::api::{serve_ephemeral, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use clawg_cli::mcp::tools::{format_context, format_search};
 use clawg_core::eval_api::{EvalEmbedder, EvalError, EvalIngest, EvalTokenCounter};
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 
 use super::matcher::Corpus;
 use super::parse::ParseError;
@@ -150,7 +151,7 @@ async fn answer_cases(
 
         let started = Instant::now();
         let prompt = session.client.context(&case.query, AGENT_ID, None, None, None).await?.prompt;
-        let context_text = format_context(&prompt);
+        let context_text = format_context(Lang::En, &prompt);
         let context_ms = elapsed_ms(started);
         let context_found = read_context(&context_text, &case.expected_refs, corpus);
 

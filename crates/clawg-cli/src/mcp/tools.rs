@@ -8,11 +8,16 @@
 //! The house style for every list: one line per row, the id first (because the
 //! follow-up tool call needs it), then the metadata that decides whether the
 //! row is worth reading, then the content.
+//!
+//! The prose comes in the session's language, one `match` per sentence; the
+//! markers (`score=`, `topic=`, `by`, `piece=K/N`, `from=`, `live=`, `lost=`,
+//! `origin=`, the tool, argument and type names, and the values of a status)
+//! are the same in every language, since the model and `rag-eval` read them.
 
 use std::path::Path;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution, ResolvedRow};
-use clawg_core::memory::prompt_builder::{display_author, SHARED_NOTE};
+use clawg_core::memory::prompt_builder::{display_author, shared_note};
 use clawg_core::memory::provenance::mark;
 use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
@@ -72,20 +77,42 @@ pub fn relevant_hits(hits: Vec<Hit>) -> Vec<Hit> {
 /// close enough to show: unlike "no memories found", there are memories.
 pub const NO_RELEVANT_MEMORIES: &str = "no relevant memories for this query";
 
-fn nothing_relevant(withheld: usize) -> String {
-    format!("{NO_RELEVANT_MEMORIES}: {withheld} searched, none close enough to show")
+/// [`NO_RELEVANT_MEMORIES`] in `lang`.
+pub fn no_relevant_memories(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => NO_RELEVANT_MEMORIES,
+        Lang::Es => "no hay memorias relevantes para esta consulta",
+    }
+}
+
+/// What a search says when the scope holds nothing at all, in `lang`.
+pub fn no_memories_found(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "no memories found",
+        Lang::Es => "no se encontraron memorias",
+    }
+}
+
+fn nothing_relevant(lang: Lang, withheld: usize) -> String {
+    let head = no_relevant_memories(lang);
+    match lang {
+        Lang::En => format!("{head}: {withheld} searched, none close enough to show"),
+        Lang::Es if withheld == 1 => format!("{head}: 1 buscada, ninguna lo bastante cerca para mostrarla"),
+        Lang::Es => format!("{head}: {withheld} buscadas, ninguna lo bastante cerca para mostrarla"),
+    }
 }
 
 /// What `search_memory` hands the model for a search's answer, as `reader`,
 /// whose saves go to `save_project`, in a session whose preferred language
 /// is `language`.
 pub fn format_search(found: Found, reader: &str, save_project: Option<&str>, language: Option<Lang>) -> String {
+    let lang = language.unwrap_or(Lang::En);
     let returned = found.hits.len();
     let hits = relevant_hits(found.hits);
     let text = if hits.is_empty() && returned + found.withheld > 0 {
-        nothing_relevant(returned + found.withheld)
+        nothing_relevant(lang, returned + found.withheld)
     } else {
-        format_hits(&hits, reader, save_project)
+        format_hits(lang, &hits, reader, save_project)
     };
     with_other_language(text, language, found.other_language.as_ref(), hits.len())
 }
@@ -108,16 +135,39 @@ fn with_other_language(text: String, language: Option<Lang>, other: Option<&Othe
 /// fewer than [`FEW_SHOWN`]. Nothing when no memory is left in the other
 /// language, which is how the second search stops being asked for.
 pub fn other_language_line(language: Option<Lang>, other: Option<&OtherLanguage>, shown: usize) -> Option<String> {
-    language?;
+    let lang = language?;
     let other = other.filter(|o| o.memories > 0 && shown < FEW_SHOWN)?;
-    let name = Lang::parse(&other.lang)?.name();
-    let (count, finds) = match other.memories {
-        1 => ("1 memory in this scope is".to_string(), "a query finds a memory best in its own language"),
-        n => (format!("{n} memories in this scope are"), "a query finds memories best in their own language"),
-    };
-    Some(format!(
-        "clawg: {count} still in {name}, and {finds}: if this does not answer, search again with the query in {name}."
-    ))
+    let theirs = Lang::parse(&other.lang)?;
+    Some(match (lang, other.memories) {
+        (Lang::En, 1) => format!(
+            "clawg: 1 memory in this scope is still in {name}, and a query finds a memory best in its own language: \
+             if this does not answer, search again with the query in {name}.",
+            name = theirs.name()
+        ),
+        (Lang::En, n) => format!(
+            "clawg: {n} memories in this scope are still in {name}, and a query finds memories best in their own \
+             language: if this does not answer, search again with the query in {name}.",
+            name = theirs.name()
+        ),
+        (Lang::Es, 1) => format!(
+            "clawg: 1 memoria de este ámbito sigue en {name}, y una consulta encuentra mejor una memoria en su propio \
+             idioma: si esto no responde, busca de nuevo con la consulta en {name}.",
+            name = name_in_spanish(theirs)
+        ),
+        (Lang::Es, n) => format!(
+            "clawg: {n} memorias de este ámbito siguen en {name}, y una consulta encuentra mejor las memorias en su \
+             propio idioma: si esto no responde, busca de nuevo con la consulta en {name}.",
+            name = name_in_spanish(theirs)
+        ),
+    })
+}
+
+/// A language's name as a Spanish sentence writes it.
+pub fn name_in_spanish(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "inglés",
+        Lang::Es => "español",
+    }
 }
 
 /// Whether a save in `save_project` revises a row of `row_project` under its
@@ -138,11 +188,11 @@ fn shared_author<'a>(hit: &'a Hit, reader: &str) -> Option<&'a str> {
 /// Renders search hits as a numbered list, or says plainly that there were
 /// none. A hit another agent saved names it, and the list then ends with the
 /// note on how to read such hits.
-fn format_hits(hits: &[Hit], reader: &str, save_project: Option<&str>) -> String {
+fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_project: Option<&str>) -> String {
     if hits.is_empty() {
         // A sentence, not an empty string: a model reading `""` cannot tell a
         // successful empty search from a broken tool.
-        return "no memories found".to_string();
+        return no_memories_found(lang).to_string();
     }
     let mut lines: Vec<String> = hits
         .iter()
@@ -173,20 +223,22 @@ fn format_hits(hits: &[Hit], reader: &str, save_project: Option<&str>) -> String
         })
         .collect();
     if hits.iter().any(|h| shared_author(h, reader).is_some()) {
-        lines.push(SHARED_NOTE.to_string());
+        lines.push(shared_note(lang).to_string());
     }
     lines.join("\n")
 }
 
 /// One line per side of a resolved dispute, the kept row first.
-pub fn format_resolution(r: &Resolution) -> String {
-    let line = |row: &ResolvedRow| match row.superseded_by {
-        Some(by) if row.status == "superseded" => format!("#{} superseded by #{by}", row.id),
+pub fn format_resolution(lang: Lang, r: &Resolution) -> String {
+    let line = |row: &ResolvedRow| match (row.superseded_by, lang) {
+        (Some(by), Lang::En) if row.status == "superseded" => format!("#{} superseded by #{by}", row.id),
+        (Some(by), Lang::Es) if row.status == "superseded" => format!("#{} reemplazada por #{by}", row.id),
         _ => format!("#{} {}", row.id, row.status),
     };
     let rows = format!("{}\n{}", line(&r.keep), line(&r.other));
-    match r.pair.as_deref() {
-        Some("escalated") => format!("{rows}\nthe pair waits for the user in ACTIVE CONFLICTS"),
+    match (r.pair.as_deref(), lang) {
+        (Some("escalated"), Lang::En) => format!("{rows}\nthe pair waits for the user in ACTIVE CONFLICTS"),
+        (Some("escalated"), Lang::Es) => format!("{rows}\nel par espera a la persona en ACTIVE CONFLICTS"),
         _ => rows,
     }
 }
@@ -200,27 +252,47 @@ fn side((id, mark): (i64, Option<&str>)) -> String {
 }
 
 /// What `memory_status` says about the pairs the agent has not judged.
-pub fn format_open_pairs(open: &OpenPairs) -> String {
+pub fn format_open_pairs(lang: Lang, open: &OpenPairs) -> String {
     if open.pending == 0 && open.escalated == 0 {
-        return "conflict candidates: none open".to_string();
+        return match lang {
+            Lang::En => "conflict candidates: none open",
+            Lang::Es => "candidatos a conflicto: ninguno abierto",
+        }
+        .to_string();
     }
-    let mut out = format!(
-        "conflict candidates: {} for you to judge, {} waiting for the user in ACTIVE CONFLICTS",
-        open.pending, open.escalated
-    );
+    let mut out = match lang {
+        Lang::En => format!(
+            "conflict candidates: {} for you to judge, {} waiting for the user in ACTIVE CONFLICTS",
+            open.pending, open.escalated
+        ),
+        Lang::Es => format!(
+            "candidatos a conflicto: {} para que juzgues, {} esperando a la persona en ACTIVE CONFLICTS",
+            open.pending, open.escalated
+        ),
+    };
+    let close = match lang {
+        Lang::En => "close to",
+        Lang::Es => "cerca de",
+    };
     for p in &open.pairs {
         let new = (p.new_id, p.new_mark.as_deref());
         let old = (p.old_id, p.old_mark.as_deref());
         // A side that may be the user's goes first: an inference is the one
         // more likely to give way, though the agent still judges the pair.
         let (first, second) = if new.1.is_some() && old.1.is_none() { (old, new) } else { (new, old) };
-        out.push_str(&format!("\n  {} close to {}", side(first), side(second)));
+        out.push_str(&format!("\n  {} {close} {}", side(first), side(second)));
     }
     if open.pending > 0 {
-        out.push_str(
-            "\nread_memory both sides, then resolve_conflict: supersedes, compatible, scoped (with a \
-             reason) or conflicts to put the pair to the user",
-        );
+        out.push_str(match lang {
+            Lang::En => {
+                "\nread_memory both sides, then resolve_conflict: supersedes, compatible, scoped (with a \
+                 reason) or conflicts to put the pair to the user"
+            }
+            Lang::Es => {
+                "\nread_memory de los dos lados, después resolve_conflict: supersedes, compatible, scoped (con un \
+                 reason) o conflicts para plantearle el par a la persona"
+            }
+        });
     }
     out
 }
@@ -229,7 +301,7 @@ pub fn format_open_pairs(open: &OpenPairs) -> String {
 /// row of the save, then the whole text. A position with no row it may read
 /// is named, so the model knows the text has a gap there. The key shows only
 /// when a save in `save_project` would revise the row, as on a search hit.
-pub fn format_save(save: &SavedText, save_project: Option<&str>) -> String {
+pub fn format_save(lang: Lang, save: &SavedText, save_project: Option<&str>) -> String {
     let topic = save
         .topic_key
         .as_deref()
@@ -239,33 +311,55 @@ pub fn format_save(save: &SavedText, save_project: Option<&str>) -> String {
     if save.pieces <= 1 {
         return format!("#{}{topic}\n{}", save.id, save.text);
     }
+    let missing = match lang {
+        Lang::En => "(missing)",
+        Lang::Es => "(falta)",
+    };
     let ids = save
         .ids
         .iter()
-        .map(|id| id.map_or_else(|| "(missing)".to_string(), |id| format!("#{id}")))
+        .map(|id| id.map_or_else(|| missing.to_string(), |id| format!("#{id}")))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("#{} is piece {} of {} of one save: {ids}{topic}\n{}", save.id, save.piece, save.pieces, save.text)
+    match lang {
+        Lang::En => {
+            format!("#{} is piece {} of {} of one save: {ids}{topic}\n{}", save.id, save.piece, save.pieces, save.text)
+        }
+        Lang::Es => {
+            format!("#{} es la pieza {} de {} de un save: {ids}{topic}\n{}", save.id, save.piece, save.pieces, save.text)
+        }
+    }
 }
 
 /// What `update_memory` tells the model about the row it changed. The tier is
 /// the one thing the model cannot work out from its own request, and the one
 /// that says whether the row is still in the workspace. After a move
 /// (`moved`), where the row is and what went with it.
-pub fn format_update(u: &Updated, moved: bool) -> String {
-    let fields = match &u.memory_type {
-        Some(t) => format!("{t}, importance {:.1}", u.importance),
-        None => format!("importance {:.1}", u.importance),
+pub fn format_update(lang: Lang, u: &Updated, moved: bool) -> String {
+    let fields = match (&u.memory_type, lang) {
+        (Some(t), Lang::En) => format!("{t}, importance {:.1}", u.importance),
+        (Some(t), Lang::Es) => format!("{t}, importancia {:.1}", u.importance),
+        (None, Lang::En) => format!("importance {:.1}", u.importance),
+        (None, Lang::Es) => format!("importancia {:.1}", u.importance),
     };
-    let mut out = format!("updated #{} {}: {fields}, tier {}", u.id, u.kind, u.tier);
+    let mut out = match lang {
+        Lang::En => format!("updated #{} {}: {fields}, tier {}", u.id, u.kind, u.tier),
+        Lang::Es => format!("se actualizó #{} {}: {fields}, tier {}", u.id, u.kind, u.tier),
+    };
     if moved {
-        match &u.project_id {
-            Some(p) => out.push_str(&format!(", in project {p}")),
-            None => out.push_str(", in no project, where every project's searches find it"),
-        }
+        out.push_str(&match (&u.project_id, lang) {
+            (Some(p), Lang::En) => format!(", in project {p}"),
+            (Some(p), Lang::Es) => format!(", en el proyecto {p}"),
+            (None, Lang::En) => ", in no project, where every project's searches find it".to_string(),
+            (None, Lang::Es) => ", en ningún proyecto, donde la encuentran las búsquedas de cualquier proyecto".to_string(),
+        });
         if !u.pulled_in.is_empty() {
             let ids: Vec<String> = u.pulled_in.iter().map(|id| format!("#{id}")).collect();
-            out.push_str(&format!("; moved with it, from its save or topic history: {}", ids.join(", ")));
+            let ids = ids.join(", ");
+            out.push_str(&match lang {
+                Lang::En => format!("; moved with it, from its save or topic history: {ids}"),
+                Lang::Es => format!("; se movieron con ella, de su save o de su historial de tema: {ids}"),
+            });
         }
     }
     out
@@ -275,29 +369,48 @@ pub fn format_update(u: &Updated, moved: bool) -> String {
 /// `id` of its own agent and project. The same text saved again under a key
 /// only gives the stored row that key, so the next version under it replaces
 /// this one; the `close to earlier memories` line above says how to replace
-/// `id` itself.
-pub fn topic_key_warning(id: i64) -> String {
-    format!(
-        "this save has no topic_key: if it revises #{id}, save it again under a topic_key naming their subject, \
-         so the next revision replaces it"
-    )
+/// `id` itself. The English line is the one `revision-eval` measured.
+pub fn topic_key_warning(lang: Lang, id: i64) -> String {
+    match lang {
+        Lang::En => format!(
+            "this save has no topic_key: if it revises #{id}, save it again under a topic_key naming their subject, \
+             so the next revision replaces it"
+        ),
+        Lang::Es => format!(
+            "este save no tiene topic_key: si revisa #{id}, guárdalo de nuevo bajo un topic_key que nombre su tema, \
+             así la próxima revisión lo reemplaza"
+        ),
+    }
 }
 
 /// What `delete_memory` tells the model. Deleting the current version of a
 /// topic brings back the one it replaced, which the model would not expect;
 /// a row a verdict replaced stays out of searches with it.
-pub fn format_delete(d: &Deleted) -> String {
-    let mut out = format!("deleted {}; restore_memory with the same id and kind undoes it", d.deleted);
+pub fn format_delete(lang: Lang, d: &Deleted) -> String {
+    let mut out = match lang {
+        Lang::En => format!("deleted {}; restore_memory with the same id and kind undoes it", d.deleted),
+        Lang::Es => format!("se borró {}; restore_memory con el mismo id y kind lo deshace", d.deleted),
+    };
     if !d.revived.is_empty() {
         let named: Vec<String> = d.revived.iter().map(|r| format!("#{} \"{}\"", r.id, r.excerpt)).collect();
-        out.push_str(&format!("\nthe version it had replaced is current again: {}", named.join(", ")));
+        let named = named.join(", ");
+        out.push_str(&match lang {
+            Lang::En => format!("\nthe version it had replaced is current again: {named}"),
+            Lang::Es => format!("\nla versión que había reemplazado vuelve a ser la actual: {named}"),
+        });
     }
     if !d.hidden.is_empty() {
         let named: Vec<String> = d.hidden.iter().map(|id| format!("#{id}")).collect();
-        out.push_str(&format!(
-            "\n{} stay superseded by it, as a resolve_conflict verdict left them, so searches leave them out",
-            named.join(", ")
-        ));
+        let named = named.join(", ");
+        out.push_str(&match lang {
+            Lang::En => format!(
+                "\n{named} stay superseded by it, as a resolve_conflict verdict left them, so searches leave them out"
+            ),
+            Lang::Es => format!(
+                "\n{named} siguen reemplazadas por ella, como las dejó un veredicto de resolve_conflict, así que las \
+                 búsquedas las dejan afuera"
+            ),
+        });
     }
     out
 }
@@ -306,39 +419,58 @@ pub fn format_delete(d: &Deleted) -> String {
 /// was deleted comes back superseded, and searching for it would find nothing;
 /// when the row that superseded it is deleted too, a verdict cannot keep it,
 /// since that row is not there to judge against.
-pub fn format_restore(r: &Restored) -> String {
+pub fn format_restore(lang: Lang, r: &Restored) -> String {
     let key = r.topic_key.as_deref().map(|k| format!(" topic={k}")).unwrap_or_default();
-    let mut out = match r.superseded_by {
-        Some(by) if r.status == "superseded" && r.superseded_by_deleted => format!(
-            "restored #{}{key}; it is still superseded by #{by}, which is deleted too, so searches leave it out \
-             until restore_memory brings #{by} back or the content is saved again",
-            r.id
+    let id = r.id;
+    let mut out = match (r.superseded_by, lang) {
+        (Some(by), Lang::En) if r.status == "superseded" && r.superseded_by_deleted => format!(
+            "restored #{id}{key}; it is still superseded by #{by}, which is deleted too, so searches leave it out \
+             until restore_memory brings #{by} back or the content is saved again"
         ),
-        Some(by) if r.status == "superseded" => format!(
-            "restored #{}{key}; it is still superseded by #{by}, so searches leave it out until \
-             resolve_conflict keeps it",
-            r.id
+        (Some(by), Lang::Es) if r.status == "superseded" && r.superseded_by_deleted => format!(
+            "se restauró #{id}{key}; sigue reemplazada por #{by}, que también está borrada, así que las búsquedas la \
+             dejan afuera hasta que restore_memory traiga #{by} de vuelta o el contenido se guarde de nuevo"
         ),
-        _ => format!("restored #{}{key}", r.id),
+        (Some(by), Lang::En) if r.status == "superseded" => format!(
+            "restored #{id}{key}; it is still superseded by #{by}, so searches leave it out until \
+             resolve_conflict keeps it"
+        ),
+        (Some(by), Lang::Es) if r.status == "superseded" => format!(
+            "se restauró #{id}{key}; sigue reemplazada por #{by}, así que las búsquedas la dejan afuera hasta que \
+             resolve_conflict la mantenga"
+        ),
+        (_, Lang::En) => format!("restored #{id}{key}"),
+        (_, Lang::Es) => format!("se restauró #{id}{key}"),
     };
     if !r.replaced.is_empty() {
         let named: Vec<String> = r.replaced.iter().map(|m| format!("#{} \"{}\"", m.id, m.excerpt)).collect();
-        out.push_str(&format!("\nreplaces again the version its delete had brought back: {}", named.join(", ")));
+        let named = named.join(", ");
+        out.push_str(&match lang {
+            Lang::En => format!("\nreplaces again the version its delete had brought back: {named}"),
+            Lang::Es => format!("\nvuelve a reemplazar la versión que su borrado había traído de vuelta: {named}"),
+        });
     }
     if !r.related.is_empty() {
+        let asks = match lang {
+            Lang::En => ", asks the user",
+            Lang::Es => ", se le pregunta a la persona",
+        };
         let named: Vec<String> = r
             .related
             .iter()
-            .map(|m| {
-                let asks = if m.escalated { ", asks the user" } else { "" };
-                format!("#{} \"{}\"{asks}", m.id, m.excerpt)
-            })
+            .map(|m| format!("#{} \"{}\"{}", m.id, m.excerpt, if m.escalated { asks } else { "" }))
             .collect();
-        out.push_str(&format!(
-            "\nsaved while it was deleted, close to it: {}. If a newer one replaces it, call resolve_conflict \
-             with verdict supersedes (keep = the newer id); if both hold, compatible or scoped",
-            named.join("; ")
-        ));
+        let named = named.join("; ");
+        out.push_str(&match lang {
+            Lang::En => format!(
+                "\nsaved while it was deleted, close to it: {named}. If a newer one replaces it, call resolve_conflict \
+                 with verdict supersedes (keep = the newer id); if both hold, compatible or scoped"
+            ),
+            Lang::Es => format!(
+                "\nguardadas mientras estaba borrada, cerca de ella: {named}. Si una más nueva la reemplaza, llama a \
+                 resolve_conflict con verdict supersedes (keep = el id más nuevo); si valen las dos, compatible o scoped"
+            ),
+        });
     }
     out
 }
@@ -346,9 +478,13 @@ pub fn format_restore(r: &Restored) -> String {
 /// Renders inventory rows as a compact one-line-per-row table. A row another
 /// agent than `reader` saved names it after `by `, as a search hit does; the
 /// `by=#N` of a replaced row always carries its `=`.
-pub fn format_rows(rows: &[MemoryRow], reader: &str) -> String {
+pub fn format_rows(lang: Lang, rows: &[MemoryRow], reader: &str) -> String {
     if rows.is_empty() {
-        return "no memories stored".to_string();
+        return match lang {
+            Lang::En => "no memories stored",
+            Lang::Es => "no hay memorias guardadas",
+        }
+        .to_string();
     }
     rows.iter()
         .map(|r| {
@@ -405,22 +541,52 @@ fn sources(r: &MemoryRow) -> String {
 /// What a conclusion is and how to save one, at the top of every
 /// `synthesize` answer that has something to review. It is the only place the
 /// model learns what this store means by a conclusion.
-const SYNTHESIS_GUIDE: &str = "\
+fn synthesis_guide(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => {
+            "\
 Look for conclusions in the memories below: a preference of the user, a convention or \
 guideline of the project, a recurring error and its fix, or a trend in the decisions made. \
 A conclusion generalizes two or more memories; do not restate a single one. Save each \
 conclusion with `save_memory`, the memory_type that fits (user_preference, \
 architectural_decision or semantic_fact), and `derived_from` set to the ids it rests on. \
 If an existing conclusion is now wrong or incomplete, save the corrected one and settle the \
-conflict it raises with `resolve_conflict`. If nothing generalizes yet, save nothing.";
+conflict it raises with `resolve_conflict`. If nothing generalizes yet, save nothing."
+        }
+        Lang::Es => {
+            "\
+Busca conclusiones en las memorias de abajo: una preferencia de la persona, una convención o \
+pauta del proyecto, un error que se repite y su arreglo, o una tendencia en las decisiones tomadas. \
+Una conclusión generaliza dos o más memorias; no repitas una sola. Guarda cada conclusión con \
+`save_memory`, el memory_type que corresponda (user_preference, architectural_decision o \
+semantic_fact), y `derived_from` con los ids en los que descansa. Si una conclusión que ya existe \
+ahora está mal o incompleta, guarda la corregida y resuelve el conflicto que abre con \
+`resolve_conflict`. Si todavía nada generaliza, no guardes nada."
+        }
+    }
+}
 
 /// What to do with a conclusion that lost a source, before the list of them.
-const REVIEW_GUIDE: &str = "\
+fn review_guide(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => {
+            "\
 These conclusions rest on memories deleted, replaced or purged since they were drawn. Read \
 each against the sources it has left. If it no longer holds, delete it with `delete_memory`. \
 If it holds only in part, or now rests on the memories that replaced its sources, delete it \
 and save the corrected conclusion with `derived_from` set to the memories it rests on now. \
-If it still holds as it is, leave it.";
+If it still holds as it is, leave it."
+        }
+        Lang::Es => {
+            "\
+Estas conclusiones descansan en memorias que se borraron, se reemplazaron o se purgaron desde que \
+se sacaron. Lee cada una contra las fuentes que le quedan. Si ya no vale, bórrala con \
+`delete_memory`. Si vale sólo en parte, o ahora descansa en las memorias que reemplazaron a sus \
+fuentes, bórrala y guarda la conclusión corregida con `derived_from` en las memorias en las que \
+descansa ahora. Si sigue valiendo tal como está, déjala."
+        }
+    }
+}
 
 fn synthesis_line(r: &MemoryRow) -> String {
     synthesis_line_with(r, "")
@@ -441,7 +607,8 @@ fn synthesis_line_with(r: &MemoryRow, extra: &str) -> String {
     )
 }
 
-/// `#4 deleted`, `#5 replaced by #11`, `#6 purged`.
+/// `#4 deleted`, `#5 replaced by #11`, `#6 purged`: what follows `lost=`,
+/// read as a marker, so it does not change with the language.
 fn lost_source(l: &LostSource) -> String {
     match (l.state.as_str(), l.superseded_by) {
         ("superseded", Some(by)) => format!("#{} replaced by #{by}", l.id),
@@ -461,38 +628,46 @@ fn review_line(r: &ConclusionReview) -> String {
 /// What `synthesize` hands the model: the guide, the conclusions already
 /// drawn (first, so a new one updates them instead of repeating them), then
 /// the memories no conclusion covers, saying how many more there are.
-pub fn format_synthesis(s: &Synthesis) -> String {
+pub fn format_synthesis(lang: Lang, s: &Synthesis) -> String {
     let to_review: Vec<i64> = s.to_review.iter().map(|r| r.conclusion.id).collect();
     let drawn: Vec<&MemoryRow> = s.conclusions.iter().filter(|c| !to_review.contains(&c.id)).collect();
     let mut conclusions = Vec::new();
     if !drawn.is_empty() {
-        conclusions.extend([String::new(), "Conclusions already drawn:".to_string()]);
+        let title = match lang {
+            Lang::En => "Conclusions already drawn:",
+            Lang::Es => "Conclusiones ya sacadas:",
+        };
+        conclusions.extend([String::new(), title.to_string()]);
         conclusions.extend(drawn.into_iter().map(synthesis_line));
     }
     if !s.to_review.is_empty() {
         conclusions.push(String::new());
-        conclusions.push(format!(
-            "Conclusions to review ({} of {}, newest first). {REVIEW_GUIDE}",
-            s.to_review.len(),
-            s.to_review_total
-        ));
+        let (n, total, guide) = (s.to_review.len(), s.to_review_total, review_guide(lang));
+        conclusions.push(match lang {
+            Lang::En => format!("Conclusions to review ({n} of {total}, newest first). {guide}"),
+            Lang::Es => format!("Conclusiones para revisar ({n} de {total}, lo más nuevo primero). {guide}"),
+        });
         conclusions.extend(s.to_review.iter().map(review_line));
     }
     // The conclusions still answer "what have you learned" when nothing is
     // left to conclude; only the guide to saving one would be noise.
     if s.pending.is_empty() {
-        let mut out = vec!["no memories are waiting for a conclusion".to_string()];
+        let none = match lang {
+            Lang::En => "no memories are waiting for a conclusion",
+            Lang::Es => "ninguna memoria espera una conclusión",
+        };
+        let mut out = vec![none.to_string()];
         out.extend(conclusions);
         return out.join("\n");
     }
-    let mut out = vec![SYNTHESIS_GUIDE.to_string()];
+    let mut out = vec![synthesis_guide(lang).to_string()];
     out.extend(conclusions);
     out.push(String::new());
-    out.push(format!(
-        "Memories without a conclusion ({} of {}, newest first):",
-        s.pending.len(),
-        s.pending_total
-    ));
+    let (n, total) = (s.pending.len(), s.pending_total);
+    out.push(match lang {
+        Lang::En => format!("Memories without a conclusion ({n} of {total}, newest first):"),
+        Lang::Es => format!("Memorias sin conclusión ({n} de {total}, lo más nuevo primero):"),
+    });
     out.extend(s.pending.iter().map(synthesis_line));
     out.join("\n")
 }
@@ -500,20 +675,36 @@ pub fn format_synthesis(s: &Synthesis) -> String {
 /// What `search_project` hands the model: each passage in full under its
 /// breadcrumb, so the model knows which file and section to open next. A
 /// passage is already capped at one embedding window, so nothing is cut.
-pub fn format_docs(found: &DocsSearchBody) -> String {
+pub fn format_docs(lang: Lang, found: &DocsSearchBody) -> String {
     let mut out: Vec<String> = Vec::new();
     if found.indexing {
-        out.push("This project's docs are still being indexed; the results may be incomplete.".into());
+        out.push(
+            match lang {
+                Lang::En => "This project's docs are still being indexed; the results may be incomplete.",
+                Lang::Es => "La documentación de este proyecto todavía se está indexando; los resultados pueden estar incompletos.",
+            }
+            .into(),
+        );
     }
     if let Some(warning) = &found.warning {
-        out.push(format!("The index could not be refreshed ({warning}); these results are from before."));
+        out.push(match lang {
+            Lang::En => format!("The index could not be refreshed ({warning}); these results are from before."),
+            Lang::Es => format!("No se pudo actualizar el índice ({warning}); estos resultados son de antes."),
+        });
     }
     if found.hits.is_empty() {
-        out.push(if found.docs == 0 && !found.indexing {
-            "No docs are indexed for this project: it has no Markdown files or manifests clawg can read.".into()
-        } else {
-            "No passage of the project's docs matches.".into()
-        });
+        let empty = found.docs == 0 && !found.indexing;
+        out.push(
+            match (empty, lang) {
+                (true, Lang::En) => "No docs are indexed for this project: it has no Markdown files or manifests clawg can read.",
+                (true, Lang::Es) => {
+                    "Este proyecto no tiene documentación indexada: no tiene archivos Markdown ni manifiestos que clawg pueda leer."
+                }
+                (false, Lang::En) => "No passage of the project's docs matches.",
+                (false, Lang::Es) => "Ningún pasaje de la documentación del proyecto coincide.",
+            }
+            .into(),
+        );
     }
     out.extend(found.hits.iter().enumerate().map(|(i, hit)| format!("[{}] {}\n{}", i + 1, hit.breadcrumb, hit.text)));
     out.join("\n\n")
@@ -524,50 +715,94 @@ pub fn format_docs(found: &DocsSearchBody) -> String {
 /// and stop being read; far above it, the review is a long read.
 pub const SYNTHESIS_NUDGE_THRESHOLD: usize = 20;
 
-pub(crate) fn synthesis_nudge(unreviewed: usize) -> Option<String> {
-    (unreviewed >= SYNTHESIS_NUDGE_THRESHOLD).then(|| {
-        format!(
+pub(crate) fn synthesis_nudge(lang: Lang, unreviewed: usize) -> Option<String> {
+    (unreviewed >= SYNTHESIS_NUDGE_THRESHOLD).then(|| match lang {
+        Lang::En => format!(
             "{unreviewed} memories here have not been reviewed for conclusions yet. When the \
              current task is done, call `synthesize`."
-        )
+        ),
+        Lang::Es => format!(
+            "{unreviewed} memorias de aquí todavía no se revisaron en busca de conclusiones. Cuando \
+             termine la tarea actual, llama a `synthesize`."
+        ),
     })
 }
 
 /// From one conclusion with a lost source, `recall_context` reminds the model
 /// to review it: one is rarer than a new memory, and costs more if left.
-pub(crate) fn review_nudge(conclusions: usize) -> Option<String> {
-    let n = match conclusions {
-        0 => return None,
-        1 => "1 conclusion here rests".to_string(),
-        n => format!("{n} conclusions here rest"),
-    };
-    Some(format!(
-        "{n} on memories that were deleted or replaced since the last review. When the current \
-         task is done, call `synthesize` to check {}.",
-        if conclusions == 1 { "it" } else { "them" }
-    ))
+pub(crate) fn review_nudge(lang: Lang, conclusions: usize) -> Option<String> {
+    Some(match (conclusions, lang) {
+        (0, _) => return None,
+        (1, Lang::En) => "1 conclusion here rests on memories that were deleted or replaced since the last review. \
+                          When the current task is done, call `synthesize` to check it."
+            .to_string(),
+        (n, Lang::En) => format!(
+            "{n} conclusions here rest on memories that were deleted or replaced since the last review. When the \
+             current task is done, call `synthesize` to check them."
+        ),
+        (1, Lang::Es) => "1 conclusión de aquí descansa en memorias que se borraron o se reemplazaron desde la última \
+                          revisión. Cuando termine la tarea actual, llama a `synthesize` para revisarla."
+            .to_string(),
+        (n, Lang::Es) => format!(
+            "{n} conclusiones de aquí descansan en memorias que se borraron o se reemplazaron desde la última \
+             revisión. Cuando termine la tarea actual, llama a `synthesize` para revisarlas."
+        ),
+    })
 }
 
 /// Why the context holds no memory, said before it: a prompt holding only the
 /// workspace, or nothing, otherwise reads as "there are no memories".
-fn retrieval_notice(retrieval: &Retrieval, has_context: bool) -> Option<String> {
+fn retrieval_notice(lang: Lang, retrieval: &Retrieval, has_context: bool) -> Option<String> {
     let why = match retrieval {
         Retrieval::Searched { hits: 0, withheld } if *withheld > 0 => {
-            let shown = if has_context { "the workspace and any active conflicts are shown below" } else { "the workspace is empty" };
-            return Some(format!("{}; {shown}.", nothing_relevant(*withheld)));
+            let shown = match (has_context, lang) {
+                (true, Lang::En) => "the workspace and any active conflicts are shown below",
+                (false, Lang::En) => "the workspace is empty",
+                (true, Lang::Es) => "abajo se muestran el workspace y los conflictos activos que haya",
+                (false, Lang::Es) => "el workspace está vacío",
+            };
+            return Some(format!("{}; {shown}.", nothing_relevant(lang, *withheld)));
         }
         Retrieval::Searched { .. } | Retrieval::Unknown => return None,
-        Retrieval::EmbedderNotReady => {
-            "the embedding model is still loading; call again in a minute".to_string()
-        }
-        Retrieval::EmbedderFailed { detail, retryable } => format!(
-            "the embedding model could not load ({detail}), and memories stay out of reach {}",
-            if *retryable { "until clawg's retry succeeds" } else { "until the cause is fixed" }
-        ),
-        Retrieval::SearchFailed { detail } => format!("the search failed ({detail}); calling again may work"),
+        Retrieval::EmbedderNotReady => match lang {
+            Lang::En => "the embedding model is still loading; call again in a minute".to_string(),
+            Lang::Es => "el modelo de embeddings todavía está cargando; vuelve a llamar en un minuto".to_string(),
+        },
+        Retrieval::EmbedderFailed { detail, retryable } => match (lang, *retryable) {
+            (Lang::En, true) => format!(
+                "the embedding model could not load ({detail}), and memories stay out of reach until clawg's retry succeeds"
+            ),
+            (Lang::En, false) => format!(
+                "the embedding model could not load ({detail}), and memories stay out of reach until the cause is fixed"
+            ),
+            (Lang::Es, true) => format!(
+                "el modelo de embeddings no pudo cargar ({detail}), y las memorias quedan fuera de alcance hasta que \
+                 funcione el reintento de clawg"
+            ),
+            (Lang::Es, false) => format!(
+                "el modelo de embeddings no pudo cargar ({detail}), y las memorias quedan fuera de alcance hasta que \
+                 se arregle la causa"
+            ),
+        },
+        Retrieval::SearchFailed { detail } => match lang {
+            Lang::En => format!("the search failed ({detail}); calling again may work"),
+            Lang::Es => format!("la búsqueda falló ({detail}); volver a llamar puede funcionar"),
+        },
     };
-    let shown = if has_context { "Only the workspace is shown below" } else { "The workspace is empty" };
-    Some(format!("Memories were not searched: {why}. {shown}; that does not mean there are no memories."))
+    Some(match (has_context, lang) {
+        (true, Lang::En) => {
+            format!("Memories were not searched: {why}. Only the workspace is shown below; that does not mean there are no memories.")
+        }
+        (false, Lang::En) => {
+            format!("Memories were not searched: {why}. The workspace is empty; that does not mean there are no memories.")
+        }
+        (true, Lang::Es) => format!(
+            "No se buscaron memorias: {why}. Abajo se muestra sólo el workspace; eso no significa que no haya memorias."
+        ),
+        (false, Lang::Es) => {
+            format!("No se buscaron memorias: {why}. El workspace está vacío; eso no significa que no haya memorias.")
+        }
+    })
 }
 
 /// What `recall_context` hands the model: why memories were not searched when
@@ -575,16 +810,17 @@ fn retrieval_notice(retrieval: &Retrieval, has_context: bool) -> Option<String> 
 /// memories wait for it, to review conclusions that lost a source, and, in a
 /// session with a preferred language, to search again in the other one.
 pub fn format_recall(context: &Context, language: Option<Lang>) -> String {
+    let lang = language.unwrap_or(Lang::En);
     let has_context = !context.prompt.trim().is_empty();
-    let notice = context.retrieval.as_ref().and_then(|r| retrieval_notice(r, has_context));
+    let notice = context.retrieval.as_ref().and_then(|r| retrieval_notice(lang, r, has_context));
     let text = match notice {
         Some(notice) if has_context => format!("{notice}\n\n{}", context.prompt),
         Some(notice) => notice,
-        None => format_context(&context.prompt),
+        None => format_context(lang, &context.prompt),
     };
     let mut out = vec![text];
-    out.extend(synthesis_nudge(context.unreviewed));
-    out.extend(review_nudge(context.conclusions_to_review));
+    out.extend(synthesis_nudge(lang, context.unreviewed));
+    out.extend(review_nudge(lang, context.conclusions_to_review));
     // Only after a search: a context that could not search has nothing a
     // query in the other language would do better.
     if let Some(Retrieval::Searched { hits, .. }) = &context.retrieval {
@@ -598,9 +834,13 @@ pub fn format_recall(context: &Context, language: Option<Lang>) -> String {
 ///
 /// An empty string is a legitimate answer from the daemon (a fresh install has
 /// no memories), but handing `""` to a model reads as a malfunction.
-pub fn format_context(prompt: &str) -> String {
+pub fn format_context(lang: Lang, prompt: &str) -> String {
     if prompt.trim().is_empty() {
-        "no context yet".to_string()
+        match lang {
+            Lang::En => "no context yet",
+            Lang::Es => "todavía no hay contexto",
+        }
+        .to_string()
     } else {
         prompt.to_string()
     }
@@ -638,34 +878,64 @@ pub fn indexes_docs(project: &ProjectIdentity, bridge: Option<&ProjectIdentity>)
 }
 
 /// The `memory_status` line on whose memories `reader` reads besides its own.
-pub fn format_sharing(policy: &Result<SharingPolicy, SharingError>, reader: &str) -> String {
-    match policy {
-        Ok(p) => match p.reach_for(reader) {
-            Reach::Own => "shared: none (reads and changes no other agent's memories)".to_string(),
-            Reach::AllBut(hidden) if hidden.is_empty() => "shared: reads and changes every agent's memories".to_string(),
-            Reach::AllBut(hidden) => format!("shared: reads and changes every agent's memories but {}'s", hidden.join("'s, ")),
+pub fn format_sharing(lang: Lang, policy: &Result<SharingPolicy, SharingError>, reader: &str) -> String {
+    match (policy, lang) {
+        (Ok(p), _) => match (p.reach_for(reader), lang) {
+            (Reach::Own, Lang::En) => "shared: none (reads and changes no other agent's memories)".to_string(),
+            (Reach::Own, Lang::Es) => {
+                "compartido: nada (no lee ni cambia las memorias de ningún otro agente)".to_string()
+            }
+            (Reach::AllBut(hidden), Lang::En) if hidden.is_empty() => {
+                "shared: reads and changes every agent's memories".to_string()
+            }
+            (Reach::AllBut(hidden), Lang::Es) if hidden.is_empty() => {
+                "compartido: lee y cambia las memorias de todos los agentes".to_string()
+            }
+            (Reach::AllBut(hidden), Lang::En) => {
+                format!("shared: reads and changes every agent's memories but {}'s", hidden.join("'s, "))
+            }
+            (Reach::AllBut(hidden), Lang::Es) => {
+                format!("compartido: lee y cambia las memorias de todos los agentes salvo las de {}", hidden.join(", "))
+            }
         },
-        Err(e) => format!("shared: none ({e})"),
+        (Err(e), Lang::En) => format!("shared: none ({e})"),
+        (Err(e), Lang::Es) => format!("compartido: nada ({e})"),
     }
 }
 
 /// The `memory_status` line on language: the one this session kept from its
 /// start, and what `preferences.json` says now when that differs, since a
 /// change reaches only a new session. Nothing without a preference either
-/// way.
+/// way. It speaks the session's language.
 pub fn format_language(session: Option<Lang>, now: Option<Lang>) -> Option<String> {
-    let named = |l: Option<Lang>| l.map_or("none", Lang::name);
-    match (session, now) {
-        (None, None) => None,
-        (Some(s), Some(n)) if s == n => Some(format!("language: {} (preferences.json)", s.name())),
-        (s, None) => Some(format!(
+    let lang = session.unwrap_or(Lang::En);
+    let named = |l: Option<Lang>| match (l, lang) {
+        (Some(l), Lang::En) => l.name(),
+        (Some(l), Lang::Es) => name_in_spanish(l),
+        (None, Lang::En) => "none",
+        (None, Lang::Es) => "ninguno",
+    };
+    match (session, now, lang) {
+        (None, None, _) => None,
+        (Some(s), Some(n), Lang::En) if s == n => Some(format!("language: {} (preferences.json)", named(Some(s)))),
+        (Some(s), Some(n), Lang::Es) if s == n => Some(format!("idioma: {} (preferences.json)", named(Some(s)))),
+        (s, None, Lang::En) => Some(format!(
             "language: {} for this session; preferences.json now sets none, which a new session uses",
             named(s)
         )),
-        (s, Some(n)) => Some(format!(
+        (s, None, Lang::Es) => Some(format!(
+            "idioma: {} en esta sesión; preferences.json ahora no fija ninguno, y así arranca una sesión nueva",
+            named(s)
+        )),
+        (s, Some(n), Lang::En) => Some(format!(
             "language: {} for this session; preferences.json now says {}, which a new session uses",
             named(s),
-            n.name()
+            named(Some(n))
+        )),
+        (s, Some(n), Lang::Es) => Some(format!(
+            "idioma: {} en esta sesión; preferences.json ahora dice {}, que usa una sesión nueva",
+            named(s),
+            named(Some(n))
         )),
     }
 }
@@ -675,6 +945,7 @@ pub fn format_language(session: Option<Lang>, now: Option<Lang>) -> Option<Strin
 /// bridge is attached to, whose memories the agent reads, and the language
 /// line of [`format_language`] when there is one.
 pub fn format_status(
+    lang: Lang,
     health: &Health,
     profile: Profile,
     base_dir: &Path,
@@ -689,8 +960,12 @@ pub fn format_status(
     // the branch is reachable.
     let json = serde_json::to_string_pretty(health)
         .unwrap_or_else(|_| format!("{{\"status\":\"{}\"}}", health.status));
+    let (profile_label, dir_label, agent_label) = match lang {
+        Lang::En => ("profile", "data dir", "agent"),
+        Lang::Es => ("perfil", "directorio de datos", "agente"),
+    };
     let mut out = format!(
-        "{json}\n\nprofile: {}\ndata dir: {}\nagent: {agent} ({origin})\n{sharing}",
+        "{json}\n\n{profile_label}: {}\n{dir_label}: {}\n{agent_label}: {agent} ({origin})\n{sharing}",
         profile.as_str(),
         base_dir.display()
     );
@@ -701,14 +976,22 @@ pub fn format_status(
         out.push_str(&format!("\n{conflicts}"));
     }
     if let Some(failed) = health.ingest.as_ref().map(|i| i.failed).filter(|n| *n > 0) {
-        let (saves, each, them, they) = match failed {
-            1 => ("save", "it", "it", "it"),
-            _ => ("saves", "each", "them", "they"),
-        };
-        out.push_str(&format!(
-            "\n{failed} {saves} failed for good; the user retries or discards {each} with \
-             `clawg outbox retry|discard <operation_id>` (ingest.problems names {them} and the memories {they} stored)"
-        ));
+        out.push_str(&match (failed, lang) {
+            (1, Lang::En) => "\n1 save failed for good; the user retries or discards it with \
+                              `clawg outbox retry|discard <operation_id>` (ingest.problems names it and the memories it stored)"
+                .to_string(),
+            (n, Lang::En) => format!(
+                "\n{n} saves failed for good; the user retries or discards each with \
+                 `clawg outbox retry|discard <operation_id>` (ingest.problems names them and the memories they stored)"
+            ),
+            (1, Lang::Es) => "\n1 save falló para siempre; la persona lo reintenta o lo descarta con \
+                              `clawg outbox retry|discard <operation_id>` (ingest.problems lo nombra con las memorias que guardó)"
+                .to_string(),
+            (n, Lang::Es) => format!(
+                "\n{n} saves fallaron para siempre; la persona reintenta o descarta cada uno con \
+                 `clawg outbox retry|discard <operation_id>` (ingest.problems los nombra con las memorias que guardaron)"
+            ),
+        });
     }
     out
 }
@@ -760,8 +1043,8 @@ mod tests {
         Some(OtherLanguage { lang: lang.into(), memories })
     }
 
-    const TWELVE_IN_ENGLISH: &str = "clawg: 12 memories in this scope are still in English, and a query finds memories \
-                                     best in their own language: if this does not answer, search again with the query in English.";
+    const TWELVE_IN_ENGLISH: &str = "clawg: 12 memorias de este ámbito siguen en inglés, y una consulta encuentra mejor \
+                                     las memorias en su propio idioma: si esto no responde, busca de nuevo con la consulta en inglés.";
 
     #[test]
     fn a_poor_search_names_the_memories_in_the_other_language() {
@@ -771,10 +1054,10 @@ mod tests {
 
         let nothing = Found { hits: Vec::new(), withheld: 4, other_language: other("en", 1) };
         let out = format_search(nothing, "a", None, Some(Lang::Es));
-        assert!(out.starts_with(NO_RELEVANT_MEMORIES), "{out}");
+        assert!(out.starts_with("no hay memorias relevantes para esta consulta: 4 buscadas"), "{out}");
         assert!(
-            out.ends_with("clawg: 1 memory in this scope is still in English, and a query finds a memory best in its own \
-                           language: if this does not answer, search again with the query in English."),
+            out.ends_with("clawg: 1 memoria de este ámbito sigue en inglés, y una consulta encuentra mejor una memoria en su \
+                           propio idioma: si esto no responde, busca de nuevo con la consulta en inglés."),
             "{out}"
         );
         let empty = Found { hits: Vec::new(), withheld: 0, other_language: other("es", 2) };
@@ -807,7 +1090,7 @@ mod tests {
         let one = scored(&[0.5]);
         assert_eq!(format_search(shown(one.clone()), "a", None, Some(Lang::Es)), format_search(shown(one), "a", None, None));
         let unknown = Found { other_language: other("fr", 12), ..shown(scored(&[0.5])) };
-        assert!(!format_search(unknown, "a", None, Some(Lang::Es)).contains("still in"), "a language this bridge cannot name");
+        assert!(!format_search(unknown, "a", None, Some(Lang::Es)).contains("clawg:"), "a language this bridge cannot name");
     }
 
     #[test]
@@ -822,15 +1105,16 @@ mod tests {
         assert!(out.ends_with(&format!("\n\n{TWELVE_IN_ENGLISH}")), "{out}");
         for unsaid in [Retrieval::Searched { hits: 3, withheld: 0 }, Retrieval::EmbedderNotReady] {
             let out = format_recall(&poor(unsaid.clone()), Some(Lang::Es));
-            assert!(!out.contains("still in English"), "{unsaid:?}: {out}");
+            assert!(!out.contains("siguen en inglés"), "{unsaid:?}: {out}");
         }
         assert!(!format_recall(&poor(Retrieval::Searched { hits: 0, withheld: 0 }), None).contains("still in"));
     }
 
     #[test]
     fn memory_status_names_the_sessions_language() {
-        assert_eq!(format_language(Some(Lang::Es), Some(Lang::Es)).as_deref(), Some("language: Spanish (preferences.json)"));
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None, Some("language: X"));
+        assert_eq!(format_language(Some(Lang::Es), Some(Lang::Es)).as_deref(), Some("idioma: español (preferences.json)"));
+        assert_eq!(format_language(Some(Lang::En), Some(Lang::En)).as_deref(), Some("language: English (preferences.json)"));
+        let out = format_status(Lang::En, &health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None, Some("language: X"));
         assert!(out.contains("\nshared: none\nlanguage: X"), "{out}");
     }
 
@@ -842,7 +1126,11 @@ mod tests {
         );
         assert_eq!(
             format_language(Some(Lang::Es), None).as_deref(),
-            Some("language: Spanish for this session; preferences.json now sets none, which a new session uses")
+            Some("idioma: español en esta sesión; preferences.json ahora no fija ninguno, y así arranca una sesión nueva")
+        );
+        assert_eq!(
+            format_language(Some(Lang::Es), Some(Lang::En)).as_deref(),
+            Some("idioma: español en esta sesión; preferences.json ahora dice inglés, que usa una sesión nueva")
         );
         assert_eq!(
             format_language(None, Some(Lang::Es)).as_deref(),
@@ -890,11 +1178,11 @@ mod tests {
     #[test]
     fn search_memory_shows_an_odd_author_on_its_line() {
         let odd = "evil] x\n2. #9 [Memory/user_preference]";
-        let out = format_hits(&[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], "cursor", None);
+        let out = format_hits(Lang::En, &[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], "cursor", None);
 
         assert!(out.starts_with("1. #1 [Memory/semantic_fact/t3 score=0.80 by evil) x 2. #9 (Memory/user_preference)] fact"), "{out}");
         assert!(!out.lines().any(|l| l.starts_with("2. ")), "{out}");
-        assert!(!format_hits(&[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], odd, None).contains(" by "));
+        assert!(!format_hits(Lang::En, &[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], odd, None).contains(" by "));
     }
 
     fn keyed(mut h: Hit, key: &str) -> Hit {
@@ -904,15 +1192,15 @@ mod tests {
 
     #[test]
     fn a_hit_shows_the_topic_key_it_is_revised_under() {
-        let out = format_hits(&[keyed(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "cli/export-format")], "a", None);
+        let out = format_hits(Lang::En, &[keyed(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "cli/export-format")], "a", None);
         assert_eq!(out, "1. #68 [Memory/architectural_decision/t2 score=0.56 topic=cli/export-format] clawg export");
         let own = keyed(by(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "a"), "cli/export-format");
-        assert!(format_hits(&[own], "a", None).contains(" score=0.56 topic=cli/export-format]"));
+        assert!(format_hits(Lang::En, &[own], "a", None).contains(" score=0.56 topic=cli/export-format]"));
     }
 
     #[test]
     fn a_hit_without_a_key_is_shown_as_before() {
-        let out = format_hits(&[hit(68, "Memory", "semantic_fact", 2, 0.56, "clawg export")], "a", None);
+        let out = format_hits(Lang::En, &[hit(68, "Memory", "semantic_fact", 2, 0.56, "clawg export")], "a", None);
         assert_eq!(out, "1. #68 [Memory/semantic_fact/t2 score=0.56] clawg export");
     }
 
@@ -921,7 +1209,7 @@ mod tests {
     #[test]
     fn another_agents_hit_shows_its_topic_key() {
         let shared = keyed(by(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "claude-code"), "cli/export-format");
-        let out = format_hits(&[shared], "cursor", None);
+        let out = format_hits(Lang::En, &[shared], "cursor", None);
         assert!(
             out.starts_with("1. #68 [Memory/architectural_decision/t2 score=0.56 topic=cli/export-format by claude-code] clawg export"),
             "{out}"
@@ -944,22 +1232,22 @@ mod tests {
     fn a_hit_of_another_project_does_not_show_its_topic_key() {
         let elsewhere = placed(preference(68), Some("other"));
         assert_eq!(
-            format_hits(&[elsewhere.clone()], "a", Some("here")),
+            format_hits(Lang::En, &[elsewhere.clone()], "a", Some("here")),
             "1. #68 [Memory/user_preference/t2 score=0.56] tabs"
         );
-        assert!(format_hits(&[elsewhere], "a", Some("other")).contains(" score=0.56 topic=style/indent]"));
+        assert!(format_hits(Lang::En, &[elsewhere], "a", Some("other")).contains(" score=0.56 topic=style/indent]"));
     }
 
     #[test]
     fn a_hit_without_a_project_shows_its_key_only_to_a_bridge_without_one() {
         let unplaced = placed(preference(68), None);
-        assert!(!format_hits(&[unplaced.clone()], "a", Some("here")).contains("topic="));
-        assert!(format_hits(&[unplaced], "a", None).contains(" score=0.56 topic=style/indent]"));
+        assert!(!format_hits(Lang::En, &[unplaced.clone()], "a", Some("here")).contains("topic="));
+        assert!(format_hits(Lang::En, &[unplaced], "a", None).contains(" score=0.56 topic=style/indent]"));
     }
 
     #[test]
     fn a_hit_from_an_older_daemon_shows_its_key() {
-        assert!(format_hits(&[preference(68)], "a", Some("here")).contains(" score=0.56 topic=style/indent]"));
+        assert!(format_hits(Lang::En, &[preference(68)], "a", Some("here")).contains(" score=0.56 topic=style/indent]"));
     }
 
     #[test]
@@ -1004,7 +1292,7 @@ mod tests {
         };
         let plain = row(2, "memory", Some("semantic_fact"), "tabs");
 
-        let out = format_rows(&[current, old, plain], "a");
+        let out = format_rows(Lang::En, &[current, old, plain], "a");
 
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "#9 memory architectural_decision t2 imp=5.0 acc=3 active topic=storage/engine postgres");
@@ -1045,12 +1333,12 @@ mod tests {
 
     #[test]
     fn format_hits_says_so_when_there_are_none() {
-        assert_eq!(format_hits(&[], "a", None), "no memories found");
+        assert_eq!(format_hits(Lang::En, &[], "a", None), "no memories found");
     }
 
     #[test]
     fn format_hits_numbers_rows_and_leads_with_the_id() {
-        let out = format_hits(&[
+        let out = format_hits(Lang::En, &[
             hit(42, "Memory", "semantic_fact", 2, 0.876, "first"),
             hit(7, "Procedural", "procedural_skill", 1, 0.5, "second"),
         ], "a", None);
@@ -1062,7 +1350,7 @@ mod tests {
 
     #[test]
     fn format_hits_carries_kind_type_tier_and_score() {
-        let out = format_hits(&[hit(42, "Memory", "semantic_fact", 2, 0.876, "content here")], "a", None);
+        let out = format_hits(Lang::En, &[hit(42, "Memory", "semantic_fact", 2, 0.876, "content here")], "a", None);
         assert!(out.contains("Memory/semantic_fact/t2"), "out was: {out}");
         assert!(out.contains("score=0.88"), "score must be readable, not raw f64: {out}");
         assert!(out.contains("content here"), "out was: {out}");
@@ -1071,7 +1359,7 @@ mod tests {
     #[test]
     fn format_hits_truncates_long_content() {
         let long = "x".repeat(CONTENT_PREVIEW_LIMIT + 100);
-        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, &long)], "a", None);
+        let out = format_hits(Lang::En, &[hit(1, "Memory", "chat_message", 3, 0.1, &long)], "a", None);
         assert!(out.ends_with('…'), "out ended: {:?}", &out[out.len().saturating_sub(20)..]);
         assert!(out.len() < long.len(), "the preview must be shorter than the content");
     }
@@ -1080,7 +1368,7 @@ mod tests {
     fn format_hits_names_the_piece_of_a_long_save() {
         let mut piece = hit(58, "Memory", "semantic_fact", 3, 0.81, "the retry budget was set");
         piece.piece = Some(crate::client::PiecePosition { piece: 2, pieces: 4 });
-        let out = format_hits(&[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")], "a", None);
+        let out = format_hits(Lang::En, &[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")], "a", None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #58 [Memory/semantic_fact/t3 piece=2/4 score=0.81] the retry budget was set");
         assert_eq!(lines[1], "2. #7 [Memory/semantic_fact/t3 score=0.50] a short one");
@@ -1090,7 +1378,7 @@ mod tests {
     /// the numbering meaningless to whoever is reading it.
     #[test]
     fn format_hits_keeps_each_hit_on_one_line() {
-        let out = format_hits(&[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")], "a", None);
+        let out = format_hits(Lang::En, &[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")], "a", None);
         assert_eq!(out.lines().count(), 1, "out was: {out:?}");
     }
 
@@ -1110,11 +1398,11 @@ mod tests {
             project_id: None,
         };
         assert_eq!(
-            format_save(&save, None),
+            format_save(Lang::En, &save, None),
             "#58 is piece 2 of 4 of one save: #57, #58, (missing), #60\nfirst and second\nfourth"
         );
         let single = SavedText { piece: 1, pieces: 1, ids: vec![Some(58)], missing: vec![], text: "short".into(), ..save };
-        assert_eq!(format_save(&single, None), "#58\nshort");
+        assert_eq!(format_save(Lang::En, &single, None), "#58\nshort");
     }
 
     #[test]
@@ -1130,10 +1418,10 @@ mod tests {
             topic_key: Some("cli/export-format".into()),
             project_id: None,
         };
-        assert_eq!(format_save(&single, None), "#68 topic=cli/export-format\nshort");
+        assert_eq!(format_save(Lang::En, &single, None), "#68 topic=cli/export-format\nshort");
         let piece = SavedText { piece: 2, pieces: 3, ids: vec![Some(67), Some(68), Some(69)], ..single };
         assert_eq!(
-            format_save(&piece, None),
+            format_save(Lang::En, &piece, None),
             "#68 is piece 2 of 3 of one save: #67, #68, #69 topic=cli/export-format\nshort"
         );
     }
@@ -1151,17 +1439,17 @@ mod tests {
             topic_key: Some("style/indent".into()),
             project_id: Some(Some("other".into())),
         };
-        assert_eq!(format_save(&save, Some("here")), "#68\ntabs");
-        assert_eq!(format_save(&save, Some("other")), "#68 topic=style/indent\ntabs");
+        assert_eq!(format_save(Lang::En, &save, Some("here")), "#68\ntabs");
+        assert_eq!(format_save(Lang::En, &save, Some("other")), "#68 topic=style/indent\ntabs");
         let from_an_older_daemon = SavedText { project_id: None, ..save };
-        assert_eq!(format_save(&from_an_older_daemon, Some("here")), "#68 topic=style/indent\ntabs");
+        assert_eq!(format_save(Lang::En, &from_an_older_daemon, Some("here")), "#68 topic=style/indent\ntabs");
     }
 
     // ── format_rows ─────────────────────────────────────────────────────────
 
     #[test]
     fn format_rows_says_so_when_there_are_none() {
-        assert_eq!(format_rows(&[], "a"), "no memories stored");
+        assert_eq!(format_rows(Lang::En, &[], "a"), "no memories stored");
     }
 
     #[test]
@@ -1170,7 +1458,7 @@ mod tests {
         theirs.agent_id = Some("claude-code".into());
         let mut mine = row(13, "memory", Some("semantic_fact"), "another fact");
         mine.agent_id = Some("cursor".into());
-        let out = format_rows(&[theirs, mine], "cursor");
+        let out = format_rows(Lang::En, &[theirs, mine], "cursor");
         assert_eq!(
             out,
             "#12 memory semantic_fact t2 imp=5.0 acc=3 active by claude-code a fact\n\
@@ -1180,7 +1468,7 @@ mod tests {
 
     #[test]
     fn format_rows_renders_one_line_per_row_with_the_id_first() {
-        let out = format_rows(&[
+        let out = format_rows(Lang::En, &[
             row(12, "memory", Some("semantic_fact"), "a fact"),
             row(3, "episodic", None, "a trajectory"),
         ], "a");
@@ -1197,14 +1485,14 @@ mod tests {
     /// other two kinds rather than shifting every field after it.
     #[test]
     fn format_rows_renders_a_missing_memory_type_as_a_dash() {
-        let out = format_rows(&[row(3, "episodic", None, "a trajectory")], "a");
+        let out = format_rows(Lang::En, &[row(3, "episodic", None, "a trajectory")], "a");
         assert!(out.contains(" - "), "out was: {out}");
     }
 
     #[test]
     fn format_rows_truncates_and_keeps_one_line_per_row() {
         let long = "y".repeat(CONTENT_PREVIEW_LIMIT + 50);
-        let out = format_rows(&[row(1, "memory", Some("chat_message"), &format!("{long}\nmore"))], "a");
+        let out = format_rows(Lang::En, &[row(1, "memory", Some("chat_message"), &format!("{long}\nmore"))], "a");
         assert_eq!(out.lines().count(), 1);
         assert!(out.ends_with('…'));
     }
@@ -1220,7 +1508,7 @@ mod tests {
             project_id: None,
             pulled_in: Vec::new(),
         };
-        assert_eq!(format_update(&memory, false), "updated #12 memory: user_preference, importance 8.0, tier 1");
+        assert_eq!(format_update(Lang::En, &memory, false), "updated #12 memory: user_preference, importance 8.0, tier 1");
         let skill = Updated {
             kind: "procedural".into(),
             id: 3,
@@ -1230,7 +1518,7 @@ mod tests {
             project_id: None,
             pulled_in: Vec::new(),
         };
-        assert_eq!(format_update(&skill, false), "updated #3 procedural: importance 2.0, tier 1");
+        assert_eq!(format_update(Lang::En, &skill, false), "updated #3 procedural: importance 2.0, tier 1");
     }
 
     #[test]
@@ -1245,13 +1533,13 @@ mod tests {
             pulled_in: vec![13, 14],
         };
         assert_eq!(
-            format_update(&moved, true),
+            format_update(Lang::En, &moved, true),
             "updated #12 memory: semantic_fact, importance 5.0, tier 3, in project repo-1a2b; \
              moved with it, from its save or topic history: #13, #14"
         );
         let out = Updated { project_id: None, pulled_in: Vec::new(), ..moved };
         assert_eq!(
-            format_update(&out, true),
+            format_update(Lang::En, &out, true),
             "updated #12 memory: semantic_fact, importance 5.0, tier 3, in no project, where every project's searches find it"
         );
     }
@@ -1262,15 +1550,15 @@ mod tests {
 
     #[test]
     fn format_restore_says_when_the_row_is_still_superseded() {
-        assert_eq!(format_restore(&restored(12, "active", None)), "restored #12");
+        assert_eq!(format_restore(Lang::En, &restored(12, "active", None)), "restored #12");
         assert_eq!(
-            format_restore(&restored(12, "superseded", Some(15))),
+            format_restore(Lang::En, &restored(12, "superseded", Some(15))),
             "restored #12; it is still superseded by #15, so searches leave it out until \
              resolve_conflict keeps it"
         );
         let gone = Restored { superseded_by_deleted: true, ..restored(12, "superseded", Some(15)) };
         assert_eq!(
-            format_restore(&gone),
+            format_restore(Lang::En, &gone),
             "restored #12; it is still superseded by #15, which is deleted too, so searches leave it out \
              until restore_memory brings #15 back or the content is saved again"
         );
@@ -1288,7 +1576,7 @@ mod tests {
             ..restored(12, "active", None)
         };
         assert_eq!(
-            format_restore(&r),
+            format_restore(Lang::En, &r),
             "restored #12 topic=storage/engine\n\
              replaces again the version its delete had brought back: #4 \"Storage engine is SQLite\"\n\
              saved while it was deleted, close to it: #20 \"the store keeps one file\"; \
@@ -1300,14 +1588,14 @@ mod tests {
     #[test]
     fn format_delete_names_what_came_back_and_what_stays_hidden() {
         let plain = Deleted { deleted: 1, ..Deleted::default() };
-        assert_eq!(format_delete(&plain), "deleted 1; restore_memory with the same id and kind undoes it");
+        assert_eq!(format_delete(Lang::En, &plain), "deleted 1; restore_memory with the same id and kind undoes it");
         let both = Deleted {
             deleted: 1,
             revived: vec![ReplacedMemory { id: 4, excerpt: "Storage engine is SQLite".into() }],
             hidden: vec![7, 8],
         };
         assert_eq!(
-            format_delete(&both),
+            format_delete(Lang::En, &both),
             "deleted 1; restore_memory with the same id and kind undoes it\n\
              the version it had replaced is current again: #4 \"Storage engine is SQLite\"\n\
              #7, #8 stay superseded by it, as a resolve_conflict verdict left them, so searches leave them out"
@@ -1317,7 +1605,7 @@ mod tests {
     #[test]
     fn rows_show_where_a_conclusion_came_from() {
         let conclusion = MemoryRow { derived_from: Some(vec![3, 7]), ..row(9, "memory", Some("user_preference"), "tabs") };
-        let out = format_rows(&[conclusion, row(3, "memory", Some("semantic_fact"), "a fact")], "a");
+        let out = format_rows(Lang::En, &[conclusion, row(3, "memory", Some("semantic_fact"), "a fact")], "a");
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].contains(" from=#3,#7 "), "line was: {}", lines[0]);
         assert!(!lines[1].contains("from="), "line was: {}", lines[1]);
@@ -1353,7 +1641,7 @@ mod tests {
         );
         s.to_review = vec![to_review()];
         s.to_review_total = 3;
-        let out = format_synthesis(&s);
+        let out = format_synthesis(Lang::En, &s);
 
         assert!(
             out.contains("#9 user_preference from=#3,#4,#5,#6 live=1/4 lost=#4 deleted,#5 replaced by #11,#6 purged tabs everywhere"),
@@ -1372,7 +1660,7 @@ mod tests {
         let mut s = synthesis(vec![], 0, vec![to_review().conclusion]);
         s.to_review = vec![to_review()];
         s.to_review_total = 1;
-        let out = format_synthesis(&s);
+        let out = format_synthesis(Lang::En, &s);
 
         assert!(out.starts_with("no memories are waiting for a conclusion"), "{out}");
         assert!(out.contains("live=1/4"), "{out}");
@@ -1390,13 +1678,13 @@ mod tests {
         assert!(one.contains("rests on memories that were deleted or replaced"), "the verb agrees with memories: {one}");
         assert!(one.contains("`synthesize`"), "{one}");
         let two = format_recall(&Context { unreviewed: SYNTHESIS_NUDGE_THRESHOLD, ..context(2) }, None);
-        assert!(two.ends_with(&review_nudge(2).unwrap()), "the review comes after the synthesis reminder: {two}");
+        assert!(two.ends_with(&review_nudge(Lang::En, 2).unwrap()), "the review comes after the synthesis reminder: {two}");
         assert!(two.contains("2 conclusions here rest "), "{two}");
     }
 
     #[test]
     fn the_synthesis_text_says_what_to_save() {
-        let out = format_synthesis(&synthesis(
+        let out = format_synthesis(Lang::En, &synthesis(
             vec![row(12, "memory", Some("semantic_fact"), "the go service uses tabs")],
             40,
             vec![MemoryRow { derived_from: Some(vec![3, 7]), ..row(9, "memory", Some("user_preference"), "tabs everywhere") }],
@@ -1418,7 +1706,7 @@ mod tests {
             created_by_type: Some(by.into()),
             ..row(id, "memory", Some("semantic_fact"), "text")
         };
-        let out = format_synthesis(&synthesis(
+        let out = format_synthesis(Lang::En, &synthesis(
             vec![origin(12, "explicit", "agent"), origin(13, "explicit", "user")],
             2,
             vec![MemoryRow { derived_from: Some(vec![12, 13]), ..origin(9, "synthesis", "agent") }],
@@ -1431,7 +1719,7 @@ mod tests {
 
     #[test]
     fn a_synthesis_with_nothing_pending_asks_for_nothing() {
-        let out = format_synthesis(&synthesis(vec![], 0, vec![]));
+        let out = format_synthesis(Lang::En, &synthesis(vec![], 0, vec![]));
         assert!(!out.contains("save_memory"), "{out}");
         assert!(out.contains("no memories"), "{out}");
     }
@@ -1455,36 +1743,36 @@ mod tests {
 
     #[test]
     fn docs_are_numbered_under_their_breadcrumbs() {
-        let out = format_docs(&docs(&[("README.md > Build", "Run make."), ("docs/a.md", "Intro.")], 2, false));
+        let out = format_docs(Lang::En, &docs(&[("README.md > Build", "Run make."), ("docs/a.md", "Intro.")], 2, false));
         assert_eq!(out, "[1] README.md > Build\nRun make.\n\n[2] docs/a.md\nIntro.");
     }
 
     #[test]
     fn search_project_warns_while_indexing() {
-        let out = format_docs(&docs(&[("README.md", "Partial.")], 1, true));
+        let out = format_docs(Lang::En, &docs(&[("README.md", "Partial.")], 1, true));
         assert!(out.starts_with("This project's docs are still being indexed"), "{out}");
         assert!(out.ends_with("[1] README.md\nPartial."), "{out}");
     }
 
     #[test]
     fn an_empty_index_and_no_match_read_differently() {
-        assert!(format_docs(&docs(&[], 0, false)).contains("No docs are indexed"));
-        assert!(format_docs(&docs(&[], 3, false)).contains("No passage"));
-        assert!(format_docs(&docs(&[], 0, true)).contains("still being indexed"));
+        assert!(format_docs(Lang::En, &docs(&[], 0, false)).contains("No docs are indexed"));
+        assert!(format_docs(Lang::En, &docs(&[], 3, false)).contains("No passage"));
+        assert!(format_docs(Lang::En, &docs(&[], 0, true)).contains("still being indexed"));
     }
 
     #[test]
     fn a_failed_refresh_is_named_before_the_results() {
         let mut found = docs(&[("a.md", "Old.")], 1, false);
         found.warning = Some("project root /gone is not a directory".into());
-        let out = format_docs(&found);
+        let out = format_docs(Lang::En, &found);
         assert!(out.starts_with("The index could not be refreshed (project root /gone"), "{out}");
         assert!(out.ends_with("[1] a.md\nOld."), "{out}");
     }
 
     #[test]
     fn the_conclusions_show_even_with_nothing_pending() {
-        let out = format_synthesis(&synthesis(
+        let out = format_synthesis(Lang::En, &synthesis(
             vec![],
             0,
             vec![MemoryRow { derived_from: Some(vec![3, 7]), ..row(9, "memory", Some("user_preference"), "tabs everywhere") }],
@@ -1560,7 +1848,7 @@ mod tests {
     #[test]
     fn format_resolution_names_both_rows_and_what_replaced_one() {
         let row = |id, status: &str, superseded_by| ResolvedRow { id, status: status.into(), superseded_by };
-        let out = format_resolution(&Resolution { keep: row(9, "active", None), other: row(4, "superseded", Some(9)), pair: None });
+        let out = format_resolution(Lang::En, &Resolution { keep: row(9, "active", None), other: row(4, "superseded", Some(9)), pair: None });
         assert_eq!(out, "#9 active\n#4 superseded by #9");
     }
 
@@ -1568,13 +1856,13 @@ mod tests {
 
     #[test]
     fn format_context_passes_a_real_prompt_through_untouched() {
-        assert_eq!(format_context("## WORKSPACE\nstuff"), "## WORKSPACE\nstuff");
+        assert_eq!(format_context(Lang::En, "## WORKSPACE\nstuff"), "## WORKSPACE\nstuff");
     }
 
     #[test]
     fn format_context_substitutes_a_sentence_for_an_empty_prompt() {
-        assert_eq!(format_context(""), "no context yet");
-        assert_eq!(format_context("   \n "), "no context yet");
+        assert_eq!(format_context(Lang::En, ""), "no context yet");
+        assert_eq!(format_context(Lang::En, "   \n "), "no context yet");
     }
 
     // ── resolve_project ─────────────────────────────────────────────────────
@@ -1645,7 +1933,7 @@ mod tests {
 
     #[test]
     fn format_status_includes_the_health_json_the_data_dir_and_the_profile() {
-        let out = format_status(&health(), Profile::Dev, Path::new("/home/u/.clawg-dev"), "a", "from --agent", "shared: none", None, None);
+        let out = format_status(Lang::En, &health(), Profile::Dev, Path::new("/home/u/.clawg-dev"), "a", "from --agent", "shared: none", None, None);
         assert!(out.contains("\"pid\": 4242"), "health must be pretty JSON: {out}");
         assert!(out.contains("loading"), "out was: {out}");
         assert!(out.contains(".clawg-dev"), "the data dir must be named: {out}");
@@ -1670,7 +1958,7 @@ mod tests {
             }),
             ..health()
         };
-        let out = format_status(&h, Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None, None);
+        let out = format_status(Lang::En, &h, Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None, None);
         assert!(out.contains("\"failed\": 1"), "out was: {out}");
         assert!(out.contains("\"operation_id\": \"op-1\""), "out was: {out}");
         assert!(
@@ -1680,27 +1968,27 @@ mod tests {
             ),
             "out was: {out}"
         );
-        let none_failed = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None, None);
+        let none_failed = format_status(Lang::En, &health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", None, None);
         assert!(!none_failed.contains("clawg outbox"), "out was: {none_failed}");
     }
 
     #[test]
     fn format_status_names_the_agent() {
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "claude-code", "from --agent", "shared: none", None, None);
+        let out = format_status(Lang::En, &health(), Profile::Dev, Path::new("/d"), "claude-code", "from --agent", "shared: none", None, None);
         assert!(out.contains("\nagent: claude-code (from --agent)\n"), "out was: {out}");
     }
 
     #[test]
     fn format_status_says_whom_the_agent_reads() {
         let policy = SharingPolicy::parse(r#"{"version":1,"hides":{"cursor":["codex","claude-code"],"aider":["*"]}}"#);
-        assert_eq!(format_sharing(&policy, "cursor"), "shared: reads and changes every agent's memories but claude-code's, codex's");
-        assert_eq!(format_sharing(&policy, "codex"), "shared: reads and changes every agent's memories");
-        assert_eq!(format_sharing(&policy, "aider"), "shared: none (reads and changes no other agent's memories)");
+        assert_eq!(format_sharing(Lang::En, &policy, "cursor"), "shared: reads and changes every agent's memories but claude-code's, codex's");
+        assert_eq!(format_sharing(Lang::En, &policy, "codex"), "shared: reads and changes every agent's memories");
+        assert_eq!(format_sharing(Lang::En, &policy, "aider"), "shared: none (reads and changes no other agent's memories)");
         let broken = SharingPolicy::parse(r#"{"version":2}"#);
-        let line = format_sharing(&broken, "cursor");
+        let line = format_sharing(Lang::En, &broken, "cursor");
         assert!(line.starts_with("shared: none (") && line.contains("version 2"), "{line}");
 
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "cursor", "from --agent", &format_sharing(&policy, "cursor"), None, None);
+        let out = format_status(Lang::En, &health(), Profile::Dev, Path::new("/d"), "cursor", "from --agent", &format_sharing(Lang::En, &policy, "cursor"), None, None);
         assert!(out.ends_with("\nshared: reads and changes every agent's memories but claude-code's, codex's"), "out was: {out}");
     }
 
@@ -1727,7 +2015,7 @@ mod tests {
             ],
         };
 
-        let out = format_open_pairs(&open);
+        let out = format_open_pairs(Lang::En, &open);
 
         assert!(out.contains("\n  #4 close to #9 inferred\n"), "{out}");
         assert!(out.contains("\n  #12 close to #4 inferred\n"), "{out}");
@@ -1744,7 +2032,7 @@ mod tests {
                 open_pair(12, 4, None, None),
             ],
         };
-        let out = format_status(&health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(&open)), None);
+        let out = format_status(Lang::En, &health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(Lang::En, &open)), None);
         assert!(
             out.ends_with(
                 "\nconflict candidates: 2 for you to judge, 1 waiting for the user in ACTIVE CONFLICTS\n  #9 close to #4\n  \
@@ -1753,7 +2041,7 @@ mod tests {
             ),
             "out was: {out}"
         );
-        assert_eq!(format_open_pairs(&OpenPairs::default()), "conflict candidates: none open");
+        assert_eq!(format_open_pairs(Lang::En, &OpenPairs::default()), "conflict candidates: none open");
     }
 
     fn by(mut h: Hit, author: &str) -> Hit {
@@ -1771,7 +2059,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #1 [Memory/semantic_fact/t2 score=0.80] propia");
         assert_eq!(lines[1], "2. #2 [Memory/semantic_fact/t3 score=0.70 by claude-code] ajena");
-        assert_eq!(lines[2], SHARED_NOTE);
+        assert_eq!(lines[2], shared_note(Lang::En));
         assert_eq!(lines.len(), 3);
     }
 
@@ -1782,5 +2070,139 @@ mod tests {
             format_search(shown(own), "cursor", None, None),
             "1. #1 [Memory/semantic_fact/t2 score=0.80] propia\n2. #2 [Memory/semantic_fact/t3 score=0.70] vieja"
         );
+    }
+
+    // ── in Spanish ──────────────────────────────────────────────────────
+
+    #[test]
+    fn a_spanish_search_keeps_its_markers() {
+        let shared = Hit {
+            agent_id: Some("cursor".into()),
+            topic_key: Some("api/port".into()),
+            piece: Some(crate::client::PiecePosition { piece: 2, pieces: 3 }),
+            ..hit(4, "memory", "semantic_fact", 3, 0.91, "El puerto es 8080")
+        };
+        let en = format_search(shown(vec![shared.clone()]), "a", None, None);
+        let es = format_search(shown(vec![shared]), "a", None, Some(Lang::Es));
+        let line = "1. #4 [memory/semantic_fact/t3 piece=2/3 score=0.91 topic=api/port by cursor] El puerto es 8080";
+        assert_eq!(en.lines().next(), Some(line));
+        assert_eq!(es.lines().next(), Some(line), "a hit line is markers and the row's own text");
+        assert_eq!(es.lines().nth(1), Some(shared_note(Lang::Es)));
+        assert_eq!(format_search(shown(Vec::new()), "a", None, Some(Lang::Es)), "no se encontraron memorias");
+        let none = Found { hits: Vec::new(), withheld: 3, other_language: None };
+        assert_eq!(
+            format_search(none, "a", None, Some(Lang::Es)),
+            "no hay memorias relevantes para esta consulta: 3 buscadas, ninguna lo bastante cerca para mostrarla"
+        );
+    }
+
+    #[test]
+    fn the_spanish_answers_of_each_tool() {
+        let moved = Updated {
+            kind: "memory".into(),
+            id: 12,
+            importance: 8.0,
+            memory_type: Some("user_preference".into()),
+            tier: 1,
+            project_id: None,
+            pulled_in: vec![13],
+        };
+        assert_eq!(
+            format_update(Lang::Es, &moved, true),
+            "se actualizó #12 memory: user_preference, importancia 8.0, tier 1, en ningún proyecto, donde la encuentran \
+             las búsquedas de cualquier proyecto; se movieron con ella, de su save o de su historial de tema: #13"
+        );
+        let both = Deleted {
+            deleted: 1,
+            revived: vec![ReplacedMemory { id: 4, excerpt: "Storage engine is SQLite".into() }],
+            hidden: vec![7],
+        };
+        assert_eq!(
+            format_delete(Lang::Es, &both),
+            "se borró 1; restore_memory con el mismo id y kind lo deshace\n\
+             la versión que había reemplazado vuelve a ser la actual: #4 \"Storage engine is SQLite\"\n\
+             #7 siguen reemplazadas por ella, como las dejó un veredicto de resolve_conflict, así que las búsquedas las \
+             dejan afuera"
+        );
+        let r = Restored { topic_key: Some("storage/engine".into()), ..restored(4, "superseded", Some(9)) };
+        assert_eq!(
+            format_restore(Lang::Es, &r),
+            "se restauró #4 topic=storage/engine; sigue reemplazada por #9, así que las búsquedas la dejan afuera hasta \
+             que resolve_conflict la mantenga"
+        );
+        assert_eq!(format_rows(Lang::Es, &[], "a"), "no hay memorias guardadas");
+        let listed = format_rows(Lang::Es, &[row(3, "memory", Some("semantic_fact"), "un hecho")], "a");
+        assert_eq!(listed, format_rows(Lang::En, &[row(3, "memory", Some("semantic_fact"), "un hecho")], "a"));
+        assert_eq!(format_context(Lang::Es, " "), "todavía no hay contexto");
+        assert_eq!(
+            topic_key_warning(Lang::Es, 7),
+            "este save no tiene topic_key: si revisa #7, guárdalo de nuevo bajo un topic_key que nombre su tema, así la \
+             próxima revisión lo reemplaza"
+        );
+        let save = SavedText {
+            kind: "memory".into(),
+            id: 5,
+            piece: 2,
+            pieces: 3,
+            ids: vec![Some(4), Some(5), None],
+            missing: vec![3],
+            text: "texto".into(),
+            topic_key: None,
+            project_id: None,
+        };
+        assert_eq!(format_save(Lang::Es, &save, None), "#5 es la pieza 2 de 3 de un save: #4, #5, (falta)\ntexto");
+    }
+
+    #[test]
+    fn the_spanish_synthesis_and_nudges() {
+        let s = Synthesis { to_review: vec![to_review()], to_review_total: 1, ..synthesis(vec![row(2, "memory", None, "x")], 1, vec![]) };
+        let out = format_synthesis(Lang::Es, &s);
+        assert!(out.starts_with("Busca conclusiones en las memorias de abajo"), "{out}");
+        assert!(out.contains("Conclusiones para revisar (1 de 1, lo más nuevo primero). Estas conclusiones descansan"), "{out}");
+        assert!(out.contains(" live=1/4 lost=#4 deleted,#5 replaced by #11,#6 purged "), "the markers stay: {out}");
+        assert!(out.contains("\nMemorias sin conclusión (1 de 1, lo más nuevo primero):\n#2 - x"), "{out}");
+        assert_eq!(format_synthesis(Lang::Es, &synthesis(vec![], 0, vec![])), "ninguna memoria espera una conclusión");
+        assert_eq!(
+            synthesis_nudge(Lang::Es, 25).as_deref(),
+            Some("25 memorias de aquí todavía no se revisaron en busca de conclusiones. Cuando termine la tarea actual, \
+                  llama a `synthesize`.")
+        );
+        assert!(review_nudge(Lang::Es, 1).unwrap().starts_with("1 conclusión de aquí descansa"));
+        assert!(review_nudge(Lang::Es, 2).unwrap().ends_with("para revisarlas."));
+    }
+
+    #[test]
+    fn the_spanish_status_docs_and_recall() {
+        let out = format_status(
+            Lang::Es,
+            &Health { ingest: Some(OutboxSummary { failed: 2, ..Default::default() }), ..health() },
+            Profile::Dev,
+            Path::new("/d"),
+            "a",
+            "de --agent",
+            "compartido: nada",
+            Some("candidatos a conflicto: ninguno abierto"),
+            Some("idioma: español (preferences.json)"),
+        );
+        assert!(
+            out.ends_with(
+                "\n\nperfil: dev\ndirectorio de datos: /d\nagente: a (de --agent)\ncompartido: nada\n\
+                 idioma: español (preferences.json)\ncandidatos a conflicto: ninguno abierto\n\
+                 2 saves fallaron para siempre; la persona reintenta o descarta cada uno con \
+                 `clawg outbox retry|discard <operation_id>` (ingest.problems los nombra con las memorias que guardaron)"
+            ),
+            "{out}"
+        );
+        assert_eq!(
+            format_docs(Lang::Es, &docs(&[], 0, false)),
+            "Este proyecto no tiene documentación indexada: no tiene archivos Markdown ni manifiestos que clawg pueda leer."
+        );
+        let context = Context { retrieval: Some(Retrieval::EmbedderNotReady), ..Default::default() };
+        assert_eq!(
+            format_recall(&context, Some(Lang::Es)),
+            "No se buscaron memorias: el modelo de embeddings todavía está cargando; vuelve a llamar en un minuto. El \
+             workspace está vacío; eso no significa que no haya memorias."
+        );
+        assert_eq!(format_sharing(Lang::Es, &Ok(SharingPolicy::default()), "a"), "compartido: lee y cambia las memorias de todos los agentes");
     }
 }

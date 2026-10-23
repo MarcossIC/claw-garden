@@ -99,8 +99,9 @@ pub fn session_start_text(
              search memories until it does{retry}."
         ));
     }
-    parts.extend(synthesis_nudge(context.unreviewed));
-    parts.extend(review_nudge(context.conclusions_to_review));
+    let lang = language.unwrap_or(Lang::En);
+    parts.extend(synthesis_nudge(lang, context.unreviewed));
+    parts.extend(review_nudge(lang, context.conclusions_to_review));
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
@@ -280,7 +281,7 @@ mod tests {
     #[test]
     fn session_start_carries_the_synthesis_nudge() {
         let text = session_start_text(&context("ctx", 25), None, false, None).unwrap();
-        assert!(text.ends_with(&synthesis_nudge(25).unwrap()), "{text}");
+        assert!(text.ends_with(&synthesis_nudge(Lang::En, 25).unwrap()), "{text}");
         assert!(!session_start_text(&context("ctx", 19), None, false, None).unwrap().contains("synthesize"));
     }
 
@@ -288,8 +289,8 @@ mod tests {
     fn session_start_carries_the_review_nudge() {
         let to_review = Context { conclusions_to_review: 2, ..context("ctx", 25) };
         let text = session_start_text(&to_review, None, false, None).unwrap();
-        assert!(text.ends_with(&review_nudge(2).unwrap()), "{text}");
-        assert!(text.contains(&synthesis_nudge(25).unwrap()), "{text}");
+        assert!(text.ends_with(&review_nudge(Lang::En, 2).unwrap()), "{text}");
+        assert!(text.contains(&synthesis_nudge(Lang::En, 25).unwrap()), "{text}");
         let without_context = Context { conclusions_to_review: 1, ..context("", 0) };
         assert!(session_start_text(&without_context, None, false, None).is_some(), "the reminder comes on its own");
     }

@@ -19,6 +19,7 @@ use clawg_core::eval_api::{
     EvalError, EvalIngest, EvalSave, EvalSaved, EvalTokenCounter,
 };
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 use clawg_core::runtime::MemoryRuntime;
 use serde::Serialize;
 
@@ -361,7 +362,7 @@ async fn read_router(
             .await?;
         let search = format_search(found.clone(), AGENT, Some(PROJECT), None);
         let prompt = client.context(&chain.query, AGENT, Some(PROJECT), None, None).await?.prompt;
-        let context = format_context(&prompt);
+        let context = format_context(Lang::En, &prompt);
         shown.push(Shown { search: positions(own, &search_ids(&search)), context: positions(own, &context_ids(&context)) });
         queries.push(Query { found, prompt });
     }
