@@ -40,8 +40,8 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 7. La ruta y el comando (HI16, HI17, HI18)
 
-- [ ] Tests de `tests/api.rs`, `cli.rs` e `import.rs` del CLI.
-- [ ] `ImportRequest.from` y `project_map`, el `503` sin tokenizer; `--from` y `--project-map`; `render` en los dos idiomas.
+- [x] Tests de `tests/api.rs`, `cli.rs` e `import.rs` del CLI.
+- [x] `ImportRequest.from` y `project_map`, el `503` sin tokenizer; `--from` y `--project-map`; `render` en los dos idiomas.
 - Commit: `feat(cli): import a memory export from another tool`
 
 ## 8. El binario real (HI16)

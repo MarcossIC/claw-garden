@@ -1309,16 +1309,23 @@ impl DaemonClient {
         Ok(read_response::<Body>(answer)?.path)
     }
 
-    /// Imports the export `text`. `map_roots` pairs an exported root with
-    /// the root it has here, already resolved.
+    /// Imports the export `text` of the tool `from` (`clawg`, `engram`).
+    /// `map_roots` pairs an exported root with the root it has here, and
+    /// `project_map` a project name of another tool with one, both already
+    /// resolved.
     pub async fn import(
         &self,
         text: &str,
+        from: &str,
         dry_run: bool,
         agent: Option<&str>,
         map_roots: &[(String, String)],
+        project_map: &[(String, String)],
     ) -> Result<ImportReport, ClientError> {
-        let body = serde_json::json!({ "text": text, "dry_run": dry_run, "agent": agent, "map_roots": map_roots });
+        let body = serde_json::json!({
+            "text": text, "from": from, "dry_run": dry_run, "agent": agent,
+            "map_roots": map_roots, "project_map": project_map,
+        });
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/import").json(&body)?).await?)
     }
 

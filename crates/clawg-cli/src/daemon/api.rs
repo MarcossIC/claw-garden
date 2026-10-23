@@ -32,6 +32,7 @@ use clawg_core::memory::admin::{
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
+use clawg_core::memory::chunker::ChatChunker;
 use clawg_core::memory::dispute::{judge_pair, open_pairs, resolve_dispute_core, OpenPairs, Outcome, Resolution, ResolveError, Verdict};
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshGuard};
@@ -1866,21 +1867,30 @@ const IMPORT_BODY_LIMIT: usize = 2 * MAX_IMPORT_BYTES;
 
 #[derive(Debug, Deserialize)]
 pub struct ImportRequest {
-    /// The export, as `clawg export` wrote it.
+    /// The export, as `clawg export` wrote it, or as another tool did.
     pub text: String,
+    /// The tool the export comes from: `clawg` when missing, or `engram`.
+    #[serde(default)]
+    pub from: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
     /// The agent every row that has one is stored under instead.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Exported project roots and the roots they have here.
+    /// Exported project roots and the roots they have here, for a clawg
+    /// export.
     #[serde(default)]
     pub map_roots: Vec<(String, String)>,
+    /// Project names of another tool and the roots they have here.
+    #[serde(default)]
+    pub project_map: Vec<(String, String)>,
 }
 
 /// Imports an export. The file is read before the embedder is asked for, so
 /// a file this binary cannot read is a 400 even while the model loads, and a
-/// dry run needs no model at all.
+/// dry run needs no model at all. Another tool's export is split by the
+/// model's tokenizer as a save of each note's text, so without it nothing is
+/// imported, not even a dry run: cut by bytes, the pieces would be others.
 async fn import_memories(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<ImportRequest>,
@@ -1895,11 +1905,43 @@ async fn import_memories(
         Some("") => return Err(ApiError::bad_request("agent must not be blank")),
         agent => agent.map(str::to_string),
     };
-    portability::format::parse(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let foreign = match body.from.as_deref() {
+        None | Some("clawg") => {
+            if !body.project_map.is_empty() {
+                return Err(ApiError::bad_request(
+                    "project_map maps the projects of another tool's export; name the tool in from",
+                ));
+            }
+            portability::format::parse(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            None
+        }
+        Some("engram") => {
+            if !body.map_roots.is_empty() {
+                return Err(ApiError::bad_request(
+                    "map_roots maps the roots of a clawg export; another tool's projects take project_map",
+                ));
+            }
+            let export = portability::engram::read(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            if app.runtime.tokenizer.get().is_none() {
+                return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "tokenizer_not_ready"));
+            }
+            Some(export)
+        }
+        Some(other) => return Err(ApiError::bad_request(format!("unknown source {other:?}; expected clawg or engram"))),
+    };
     let embedder = if body.dry_run { None } else { Some(ready_embedder(&app)?) };
-    let options = ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map: Vec::new() };
+    let options =
+        ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map: body.project_map };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-    match portability::import(&app.runtime.store, embedder.as_deref(), &backups, &body.text, &options).await {
+    let store = &app.runtime.store;
+    let imported = match foreign {
+        None => portability::import(store, embedder.as_deref(), &backups, &body.text, &options).await,
+        Some(export) => {
+            let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
+            portability::import_foreign(store, embedder.as_deref(), chunker, &backups, export, &options).await
+        }
+    };
+    match imported {
         Ok(report) => Ok(Json(report)),
         Err(ImportError::Format(e)) => Err(ApiError::bad_request(e.to_string())),
         Err(ImportError::NoEmbedder) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),

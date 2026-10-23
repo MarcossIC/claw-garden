@@ -1154,10 +1154,10 @@ mod tests {
     use crate::memory::events::{MemoryEvent, MemorySource};
     use crate::memory::portability::export::{read, Export, ExportFilter};
     use crate::memory::portability::fixtures::{other_project, project, seed, ROOT};
-    use crate::memory::portability::foreign::{ForeignNote, ForeignRelation, When};
+    use crate::memory::portability::foreign::{ForeignNote, ForeignRelation, NoteKind, When};
     use crate::memory::portability::format::tests::EXAMPLE;
     use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note, T0};
-    use crate::memory::portability::translate::{ProjectCount, TakenKey, TakenProject};
+    use crate::memory::portability::translate::{rewrite_key, KeyChange, ProjectCount, TakenKey, TakenProject, TypeCount};
     use crate::memory::relocate::{move_memories_core, MoveFilter};
     use crate::memory::search::{search_all_memories, SearchScope};
     use crate::memory::worker::save_for_test;
@@ -2266,6 +2266,79 @@ mod tests {
         assert_eq!(foreign.relations_left_out, left_out.iter().map(|(r, n)| (r.to_string(), *n)).collect::<BTreeMap<_, _>>());
         assert_eq!(foreign.unplaced, unplaced);
         assert_eq!(foreign.without_text, ["engram:empty"]);
+    }
+
+    #[tokio::test]
+    async fn the_foreign_report_counts_what_the_import_did() {
+        let root = "/work/notes";
+        let here = crate::memory::identity::derive_project_id(Path::new(root));
+        let token = format!("ghp_{}", "aB3".repeat(12));
+        let in_a = |n: ForeignNote| ForeignNote { project: Some("a".into()), ..n };
+        let notes = vec![
+            in_a(ForeignNote { source_type: Some("decision".into()), ..named("decision", 0) }),
+            in_a(ForeignNote { topic_key: Some("Sdd X".into()), ..named("keyed", 1) }),
+            in_a(ForeignNote { content: "one writer per store, ".repeat(150), ..named("long", 2) }),
+            ForeignNote { project: Some("b".into()), ..named("unmapped", 3) },
+            ForeignNote { content: format!("deploy with {token}"), ..named("secret", 4) },
+            ForeignNote { kind: NoteKind::Prompt, source_type: None, ..named("prompt", 5) },
+            ForeignNote { written: When::Unreadable, ..named("undated", 6) },
+            ForeignNote { deleted: Some(When::At(T0 + 7)), ..named("gone", 7) },
+        ];
+        let export = ForeignExport {
+            relations: vec![relation("unmapped", "decision", "related")],
+            unplaced: BTreeMap::from([("observation.tool_name".to_string(), 1)]),
+            rewritten: 2,
+            discarded_sessions: 1,
+            ..foreign_export(notes)
+        };
+        let options = ImportOptions {
+            project_map: vec![("a".into(), root.into()), ("c".into(), "/work/c".into())],
+            ..Default::default()
+        };
+        let dst = destination().await;
+        let (report, _) = run_export(&dst, export.clone(), options.clone()).await;
+
+        let foreign = report.foreign.clone().unwrap();
+        assert_eq!((foreign.source.as_str(), foreign.version.as_str(), foreign.notes), ("engram", "0.2.0", 8));
+        let types = |kind: &str, source_type: Option<&str>, memory_type: &str, notes| TypeCount {
+            kind: kind.into(),
+            source_type: source_type.map(str::to_owned),
+            memory_type: memory_type.into(),
+            notes,
+        };
+        assert_eq!(
+            foreign.by_source_type,
+            [
+                types("observation", Some("decision"), "architectural_decision", 1),
+                types("observation", Some("discovery"), "semantic_fact", 6),
+                types("prompt", None, "chat_message", 1),
+            ]
+        );
+        let project = |name: Option<&str>, root: Option<&str>, project_id: Option<&str>, notes| ProjectCount {
+            project: name.map(str::to_owned),
+            personal: false,
+            root: root.map(str::to_owned),
+            project_id: project_id.map(str::to_owned),
+            notes,
+        };
+        assert_eq!(
+            foreign.by_source_project,
+            [project(None, None, None, 4), project(Some("a"), Some(root), Some(&here), 3), project(Some("b"), None, None, 1)]
+        );
+        assert_eq!((foreign.unmapped.clone(), foreign.unused_map.clone()), (vec!["b".to_string()], vec!["c".to_string()]));
+        assert_eq!((foreign.rows, foreign.split_notes, foreign.masked_notes), (report.rows, 1, 1));
+        assert_eq!(foreign.rewritten_keys, [KeyChange { from: "Sdd X".into(), to: rewrite_key("Sdd X") }]);
+        assert_eq!((foreign.clamped_dates.clone(), foreign.deleted), (vec!["engram:undated".to_string()], 1));
+        assert_eq!(foreign.relations, BTreeMap::from([("compatible".to_string(), 1)]));
+        assert_eq!((foreign.unplaced.clone(), foreign.rewritten_at_source, foreign.discarded_sessions), (export.unplaced.clone(), 2, 1));
+        assert!(foreign.present.is_empty() && foreign.left_out.is_empty() && foreign.merged.is_empty(), "{foreign:#?}");
+        assert_eq!(report.by_project[&here], report.rows - 5, "the rows of the notes of a");
+        assert_eq!(report.by_lang.values().sum::<usize>(), report.inserted);
+
+        let (again, _) = run_export(&dst, export, options).await;
+        assert_eq!(again.inserted, 0);
+        let present = again.foreign.unwrap().present;
+        assert_eq!(present, BTreeMap::from([(String::new(), 5), (here, 3)]));
     }
 
     #[test]

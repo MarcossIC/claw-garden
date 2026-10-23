@@ -104,12 +104,17 @@ pub enum Command {
         profile: ProfileArg,
     },
     /// Import a file `clawg export` wrote, keeping each memory's dates,
-    /// accesses, state and links. Needs a running daemon, which embeds each
-    /// memory again; the store is snapshotted first. Importing a file twice
-    /// adds nothing.
+    /// accesses, state and links, or the export of another memory tool, each
+    /// note split and masked as a save of its text. Needs a running daemon,
+    /// which embeds each memory again; the store is snapshotted first.
+    /// Importing a file twice adds nothing.
     Import {
-        /// The file `clawg export` wrote.
+        /// The file `clawg export` wrote, or the other tool's export (for
+        /// engram, `engram export --all`).
         file: PathBuf,
+        /// The tool the file comes from.
+        #[arg(long, value_enum, default_value_t = ImportSource::Clawg)]
+        from: ImportSource,
         /// Report what would be imported, and write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -117,9 +122,16 @@ pub enum Command {
         #[arg(long, value_parser = parse_agent)]
         agent: Option<String>,
         /// Store the memories of the exported project root OLD in the project
-        /// the directory NEW is in. Repeat it for each root that moved.
+        /// the directory NEW is in. Repeat it for each root that moved. Only
+        /// for a clawg export.
         #[arg(long = "map-root", value_name = "OLD=NEW", value_parser = parse_root_map)]
         map_root: Vec<RootMap>,
+        /// Store the notes of the other tool's project NAME in the project
+        /// the directory PATH is in. Repeat it for each project; the notes of
+        /// a project not named are stored in none, and `clawg projects move
+        /// --origin-project NAME` places them later.
+        #[arg(long = "project-map", value_name = "NAME=PATH", value_parser = parse_project_map)]
+        project_map: Vec<ProjectMap>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -276,6 +288,71 @@ fn parse_root_map(raw: &str) -> Result<RootMap, String> {
             Ok(RootMap { old: old.to_string(), new: PathBuf::from(new) })
         }
         _ => Err(format!("{raw:?} is not OLD=NEW")),
+    }
+}
+
+/// The tool a file `clawg import` reads comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ImportSource {
+    /// A file `clawg export` wrote.
+    Clawg,
+    /// The JSON `engram export` writes.
+    Engram,
+}
+
+impl ImportSource {
+    /// As the daemon names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImportSource::Clawg => "clawg",
+            ImportSource::Engram => "engram",
+        }
+    }
+}
+
+/// A project name of another tool and the directory whose project takes its
+/// notes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMap {
+    pub name: String,
+    pub root: PathBuf,
+}
+
+/// `NAME=PATH`, split at the last `=`: a project name may hold one, a path
+/// here does not.
+fn parse_project_map(raw: &str) -> Result<ProjectMap, String> {
+    match raw.rsplit_once('=') {
+        Some((name, root)) if !name.is_empty() && !root.is_empty() => {
+            Ok(ProjectMap { name: name.to_string(), root: PathBuf::from(root) })
+        }
+        _ => Err(format!("{raw:?} is not NAME=PATH")),
+    }
+}
+
+impl Cli {
+    /// Parses `args` as clap does, then refuses what no single argument
+    /// tells clap: a map of the other kind of export than `--from` names.
+    pub fn parse_args<I, T>(args: I) -> Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let cli = Cli::try_parse_from(args)?;
+        if let Command::Import { from, map_root, project_map, .. } = &cli.command {
+            let refused = match from {
+                ImportSource::Clawg if !project_map.is_empty() => {
+                    Some("--project-map maps the projects of another tool's export; name the tool with --from")
+                }
+                ImportSource::Engram if !map_root.is_empty() => {
+                    Some("--map-root maps the roots of a clawg export; another tool's projects take --project-map")
+                }
+                _ => None,
+            };
+            if let Some(message) = refused {
+                return Err(<Cli as clap::CommandFactory>::command().error(clap::error::ErrorKind::ArgumentConflict, message));
+            }
+        }
+        Ok(cli)
     }
 }
 
@@ -935,17 +1012,49 @@ mod tests {
             .command,
             Command::Import {
                 file: PathBuf::from("m.jsonl"),
+                from: ImportSource::Clawg,
                 dry_run: true,
                 agent: Some("dev".into()),
                 map_root: vec![
                     RootMap { old: "/a/repo".into(), new: PathBuf::from(".") },
                     RootMap { old: "C:\\work".into(), new: PathBuf::from("D:\\work") },
                 ],
+                project_map: Vec::new(),
                 profile: ProfileArg { profile: None },
             }
         );
         for bad in ["/a/repo", "=.", "/a/repo="] {
             assert!(Cli::try_parse_from(["clawg", "import", "m.jsonl", "--map-root", bad]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn import_takes_a_source_and_project_maps() {
+        let args = ["clawg", "import", "--from", "engram", "e.json", "--project-map", "my=app=C:\\work\\app", "--project-map", "b=."];
+        assert_eq!(
+            Cli::parse_args(args).expect("parse").command,
+            Command::Import {
+                file: PathBuf::from("e.json"),
+                from: ImportSource::Engram,
+                dry_run: false,
+                agent: None,
+                map_root: Vec::new(),
+                project_map: vec![
+                    ProjectMap { name: "my=app".into(), root: PathBuf::from("C:\\work\\app") },
+                    ProjectMap { name: "b".into(), root: PathBuf::from(".") },
+                ],
+                profile: ProfileArg { profile: None },
+            }
+        );
+        let parses = |args: &[&str]| Cli::parse_args(args).map(|_| ()).map_err(|e| e.kind());
+        assert_eq!(parses(&["clawg", "import", "--from", "clawg", "m.jsonl", "--map-root", "/a=."]), Ok(()));
+        let conflict = Err(clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(parses(&["clawg", "import", "--from", "engram", "e.json", "--map-root", "/a=."]), conflict);
+        assert_eq!(parses(&["clawg", "import", "m.jsonl", "--project-map", "a=."]), conflict);
+        assert_eq!(parses(&["clawg", "import", "--from", "clawg", "m.jsonl", "--project-map", "a=."]), conflict);
+        assert!(parses(&["clawg", "import", "--from", "notion", "n.json"]).is_err());
+        for bad in ["a", "=.", "a="] {
+            assert!(parses(&["clawg", "import", "--from", "engram", "e.json", "--project-map", bad]).is_err(), "{bad}");
         }
     }
 

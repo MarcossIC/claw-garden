@@ -7,6 +7,17 @@ pub use chat::{ChatChunker, SaveSplit};
 
 use std::borrow::Cow;
 
+/// A tokenizer with no vocabulary but `[UNK]`, over a whitespace
+/// pre-tokenizer, so each word is one token: what a test puts where the
+/// model's tokenizer goes, to split by tokens without the model.
+#[cfg(any(test, feature = "testing"))]
+pub fn word_tokenizer() -> std::sync::Arc<tokenizers::Tokenizer> {
+    let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,
+        "pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,
+        "model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}}"#;
+    std::sync::Arc::new(json.parse().expect("the word tokenizer parses"))
+}
+
 use crate::models::chat::Role;
 
 /// Upper bound on a chunk's token count. Stays under the embedder's 512-token
