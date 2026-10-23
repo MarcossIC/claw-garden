@@ -21,8 +21,8 @@ use crate::memory::store_insert::MemoryType;
 use crate::memory::tier::compute_tier;
 use crate::memory::topic::{validate_topic_key, MAX_TOPIC_KEY_LEN};
 
-use super::foreign::{ForeignExport, ForeignNote, NoteKind, When};
-use super::format::{MemoryLine, Parsed, PieceLine, ProjectLine};
+use super::foreign::{ForeignExport, ForeignNote, ForeignRelation, NoteKind, When};
+use super::format::{ConflictLine, MemoryLine, Parsed, PieceLine, ProjectLine};
 
 /// The agent rows from another tool are stored under: the tool does not say
 /// which agent wrote each note.
@@ -206,6 +206,14 @@ pub struct ForeignReport {
     pub older_versions: Vec<String>,
     /// Notes the source deleted whose rows here were left as they are.
     pub deleted_at_source: Vec<String>,
+    /// Relations stored as pairs, by the pair's state: `pending`,
+    /// `escalated`, or the verdict of a judged one.
+    pub relations: BTreeMap<String, usize>,
+    /// Relations left out, by why: `orphaned`; `replaced`, by the source or
+    /// by a newer relation of the same two notes; `missing_note`, an end that
+    /// gives no row of this export; `same_note`, two ends the same text made
+    /// one; `unknown:<verb>`.
+    pub relations_left_out: BTreeMap<String, usize>,
 }
 
 /// Importance of a note, and of one the source pinned, which is never
@@ -326,7 +334,9 @@ pub fn translate(export: &ForeignExport, options: &TranslateOptions, chunker: &C
     let (mut drafts, empty): (Vec<_>, Vec<_>) = drafts.into_iter().partition(|d| !d.pieces.is_empty());
     report.without_text.extend(empty.into_iter().map(|d| d.note.origin.clone()));
     drafts.sort_by(|a, b| (a.written, &a.note.origin).cmp(&(b.written, &b.note.origin)));
-    lines(&drafts, options, report)
+    let mut translated = lines(&drafts, options, report);
+    relate(&export.relations, now_ms, &mut translated);
+    translated
 }
 
 /// The title on the first line and the content under it, or whichever of
@@ -635,6 +645,145 @@ fn lines(drafts: &[Draft<'_>], options: &TranslateOptions, mut report: ForeignRe
         }
     }
     Translated { parsed, notes, report }
+}
+
+/// What a relation of the source becomes here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PairFor {
+    Pending,
+    /// Judged with this verdict.
+    Judged(&'static str),
+    /// Left to the user.
+    Escalated,
+    /// Not stored, counted by this reason.
+    LeftOut(String),
+}
+
+/// The pair a relation `verb` the source judged `judgment` becomes. A
+/// `supersedes` over a preference or a decision (`protected`) is a verdict
+/// only the user gives, so one the user did not mark is left to them.
+fn pair_for(verb: &str, judgment: &str, by_user: bool, protected: bool) -> PairFor {
+    if judgment == "orphaned" {
+        return PairFor::LeftOut("orphaned".to_owned());
+    }
+    if verb == "pending" || judgment == "pending" {
+        return PairFor::Pending;
+    }
+    if judgment == "ignored" {
+        return PairFor::Judged("compatible");
+    }
+    match verb {
+        "related" | "compatible" | "not_conflict" => PairFor::Judged("compatible"),
+        "scoped" => PairFor::Judged("scoped"),
+        "conflicts_with" => PairFor::Escalated,
+        "supersedes" if protected && !by_user => PairFor::Escalated,
+        "supersedes" => PairFor::Judged("supersedes"),
+        other => PairFor::LeftOut(format!("unknown:{other}")),
+    }
+}
+
+/// Writes each relation between two notes that give rows as a pair of their
+/// first rows, the newer note's the `new_id`, and gives their rows the state
+/// the pair means: the live rows of a `supersedes`'s target replaced by its
+/// source, unless the source is deleted, and the newer row of an escalated
+/// pair disputed. Of the relations of two notes the newest counts.
+fn relate(relations: &[ForeignRelation], now_ms: i64, t: &mut Translated) {
+    let at = |when: When| match when {
+        When::At(at) if at <= now_ms => at,
+        _ => now_ms,
+    };
+    let mut left_out: BTreeMap<String, usize> = BTreeMap::new();
+    let mut count = |reason: &str| *left_out.entry(reason.to_owned()).or_default() += 1;
+    let mut newest: BTreeMap<(i64, i64), (&ForeignRelation, Range<i64>, Range<i64>)> = BTreeMap::new();
+    {
+        let into: HashMap<&str, &str> = t.report.absorbed.iter().map(|a| (a.origin.as_str(), a.into.as_str())).collect();
+        let rows_of: HashMap<&str, Range<i64>> = t.notes.iter().map(|n| (n.origin.as_str(), n.rows.clone())).collect();
+        let end = |origin: &str| rows_of.get(into.get(origin).copied().unwrap_or(origin)).cloned();
+        let date = |r: &ForeignRelation| (at(r.updated), at(r.created));
+        for r in relations {
+            if r.superseded {
+                count("replaced");
+                continue;
+            }
+            if r.judgment == "orphaned" {
+                count("orphaned");
+                continue;
+            }
+            let (Some(source), Some(target)) = (end(&r.source), end(&r.target)) else {
+                count("missing_note");
+                continue;
+            };
+            if source.start == target.start {
+                count("same_note");
+                continue;
+            }
+            let pair = (source.start.max(target.start), source.start.min(target.start));
+            if newest.get(&pair).is_some_and(|(kept, ..)| date(kept) >= date(r)) {
+                count("replaced");
+                continue;
+            }
+            if newest.insert(pair, (r, source, target)).is_some() {
+                count("replaced");
+            }
+        }
+    }
+
+    let mut stored: BTreeMap<String, usize> = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    // A memory line's number is its id, and its index is one less.
+    let memories = &mut t.parsed.memories;
+    let live = |m: &MemoryLine| m.deleted_at.is_none() && matches!(m.status.as_str(), "active" | "disputed");
+    for ((new_id, old_id), (r, source, target)) in newest {
+        let protected = MemoryType::is_protected_name(&memories[(target.start - 1) as usize].1.memory_type);
+        let (state, verdict) = match pair_for(&r.verb, &r.judgment, r.by_user, protected) {
+            PairFor::LeftOut(reason) => {
+                count(&reason);
+                continue;
+            }
+            PairFor::Pending => ("pending", None),
+            PairFor::Escalated => {
+                let newer = &mut memories[(new_id - 1) as usize].1;
+                if live(newer) {
+                    newer.status = "disputed".to_owned();
+                    newer.disputed_against.push(old_id);
+                }
+                ("escalated", None)
+            }
+            PairFor::Judged(verdict) => {
+                if verdict == "supersedes" && memories[(source.start - 1) as usize].1.deleted_at.is_none() {
+                    for id in target {
+                        let replaced = &mut memories[(id - 1) as usize].1;
+                        if live(replaced) {
+                            replaced.status = "superseded".to_owned();
+                            replaced.superseded_by = Some(source.start);
+                            replaced.supersede_cause = Some("verdict".to_owned());
+                        }
+                    }
+                }
+                ("judged", Some(verdict))
+            }
+        };
+        *stored.entry(verdict.unwrap_or(state).to_owned()).or_default() += 1;
+        let reason = match (&r.reason, &r.evidence) {
+            (Some(reason), Some(evidence)) => Some(format!("{reason}\n{evidence}")),
+            (reason, evidence) => reason.clone().or_else(|| evidence.clone()),
+        };
+        conflicts.push(ConflictLine {
+            new_id,
+            old_id,
+            distance: None,
+            state: state.to_owned(),
+            verdict: verdict.map(str::to_owned),
+            reason,
+            created_at: at(r.created),
+            judged_at: verdict.map(|_| at(r.updated)),
+            topic_key_warned: false,
+        });
+    }
+    let first_line = t.parsed.memories.len() + t.parsed.pieces.len() + 1;
+    t.parsed.conflicts = conflicts.into_iter().enumerate().map(|(k, c)| (first_line + k, c)).collect();
+    t.report.relations = stored;
+    t.report.relations_left_out = left_out;
 }
 
 #[cfg(test)]
@@ -1195,6 +1344,25 @@ pub(crate) mod tests {
             ("session_summary", "agent", "Wired the importer")
         );
         assert_eq!((summary.created_at, summary.origin_project.as_deref()), (T0 + 7, Some("a")));
+    }
+
+    #[test]
+    fn relations_map_to_pair_states() {
+        use PairFor::*;
+        assert_eq!(pair_for("pending", "", false, false), Pending);
+        assert_eq!(pair_for("related", "pending", false, false), Pending);
+        assert_eq!(pair_for("conflicts_with", "pending", false, false), Pending, "a judgment still pending wins");
+        assert_eq!(pair_for("conflicts_with", "ignored", false, false), Judged("compatible"));
+        for verb in ["related", "compatible", "not_conflict"] {
+            assert_eq!(pair_for(verb, "judged", false, false), Judged("compatible"), "{verb}");
+        }
+        assert_eq!(pair_for("scoped", "judged", false, false), Judged("scoped"));
+        assert_eq!(pair_for("conflicts_with", "judged", false, false), Escalated);
+        assert_eq!(pair_for("supersedes", "judged", false, false), Judged("supersedes"));
+        assert_eq!(pair_for("supersedes", "judged", false, true), Escalated, "a protected note is replaced on the user's word");
+        assert_eq!(pair_for("supersedes", "judged", true, true), Judged("supersedes"));
+        assert_eq!(pair_for("related", "orphaned", false, false), LeftOut("orphaned".into()));
+        assert_eq!(pair_for("mentions", "judged", false, false), LeftOut("unknown:mentions".into()));
     }
 
     #[test]

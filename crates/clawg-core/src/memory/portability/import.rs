@@ -714,7 +714,9 @@ fn place_rows(
 }
 
 /// Writes every link of the file whose ends were placed, translated to the
-/// ids here. Rows already here only get the links they lack.
+/// ids here. Rows already here only get the links they lack, and only the
+/// ones their state holds: a row here that is live is replaced or disputed by
+/// no link of a file.
 fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -> rusqlite::Result<()> {
     let id_of = |src: i64| ledger.placed.get(&src).map(|p| p.id());
     let absent = |src: i64| ledger.absent.contains(&src);
@@ -729,7 +731,10 @@ fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -
         if let Some(by) = row.src.superseded_by {
             match id_of(by) {
                 Some(by) => {
-                    tx.execute("UPDATE memory SET superseded_by = ?2 WHERE id = ?1 AND superseded_by IS NULL", [id, by])?;
+                    tx.execute(
+                        "UPDATE memory SET superseded_by = ?2 WHERE id = ?1 AND superseded_by IS NULL AND status = 'superseded'",
+                        [id, by],
+                    )?;
                 }
                 None if absent(by) => {}
                 None => dropped.push(Invalid {
@@ -753,6 +758,7 @@ fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -
         for other in &row.src.disputed_against {
             match id_of(*other) {
                 Some(other) => against.push(other),
+                None if absent(*other) => {}
                 None => dropped.push(Invalid {
                     line: row.line,
                     reason: format!("memory {} is disputed against {other}, which is not in the file", row.src.id),
@@ -762,7 +768,7 @@ fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -
         if !against.is_empty() {
             let list = serde_json::to_string(&against).expect("Vec<i64> serialises infallibly");
             tx.execute(
-                "UPDATE memory SET disputed_against = ?2 WHERE id = ?1 AND disputed_against IS NULL",
+                "UPDATE memory SET disputed_against = ?2 WHERE id = ?1 AND disputed_against IS NULL AND status = 'disputed'",
                 rusqlite::params![id, list],
             )?;
         } else if placement.inserted() {
@@ -791,11 +797,15 @@ fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -
     }
 
     for (line, c) in &prepared.parsed.conflicts {
-        if !(owned(c.new_id) || owned(c.old_id)) {
+        if !(owned(c.new_id) || owned(c.old_id)) || absent(c.new_id) || absent(c.old_id) {
             continue;
         }
         match (id_of(c.new_id), id_of(c.old_id)) {
-            (Some(new_id), Some(old_id)) if new_id != old_id => {
+            (Some(a), Some(b)) if a != b => {
+                // A pair is named by its larger id, as the detector writes it,
+                // and an end already here under an older id can turn the
+                // file's order around.
+                let (new_id, old_id) = (a.max(b), a.min(b));
                 let reason = c.reason.as_deref().map(|r| redact(r).text);
                 tx.execute(
                     "INSERT OR IGNORE INTO memory_conflict \
@@ -1144,7 +1154,7 @@ mod tests {
     use crate::memory::events::{MemoryEvent, MemorySource};
     use crate::memory::portability::export::{read, Export, ExportFilter};
     use crate::memory::portability::fixtures::{other_project, project, seed, ROOT};
-    use crate::memory::portability::foreign::{ForeignNote, When};
+    use crate::memory::portability::foreign::{ForeignNote, ForeignRelation, When};
     use crate::memory::portability::format::tests::EXAMPLE;
     use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note, T0};
     use crate::memory::portability::translate::{ProjectCount, TakenKey, TakenProject};
@@ -1657,12 +1667,55 @@ mod tests {
     }
 
     async fn run_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+        run_export(store, foreign_export(notes), options).await
+    }
+
+    async fn run_export(store: &MemoryStore, export: ForeignExport, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
         let backups = tempfile::tempdir().unwrap();
         let chunker = Arc::new(ChatChunker::with_fallback());
-        let report = import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), foreign_export(notes), &options)
-            .await
-            .unwrap();
+        let report =
+            import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options).await.unwrap();
         (report, backups)
+    }
+
+    /// `source` and `target` judged related by `verb`, by an agent.
+    fn relation(source: &str, target: &str, verb: &str) -> ForeignRelation {
+        ForeignRelation {
+            source: format!("engram:{source}"),
+            target: format!("engram:{target}"),
+            verb: verb.to_owned(),
+            judgment: "judged".to_owned(),
+            by_user: false,
+            reason: None,
+            evidence: None,
+            created: When::At(T0 + 100),
+            updated: When::At(T0 + 200),
+            superseded: false,
+        }
+    }
+
+    /// The note `name`, written `k` ms after `T0`, so the ids here follow `k`.
+    fn named(name: &str, k: i64) -> ForeignNote {
+        ForeignNote { written: When::At(T0 + k), ..foreign_note(&format!("engram:{name}"), name, &format!("the note {name}")) }
+    }
+
+    /// Each pair by the text of its newer and older row: state, verdict, reason.
+    async fn pairs(store: &MemoryStore) -> Vec<(String, String, String, Option<String>, Option<String>)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT n.content, o.content, p.state, p.verdict, p.reason, p.new_id > p.old_id FROM memory_conflict p \
+                     JOIN memory n ON n.id = p.new_id JOIN memory o ON o.id = p.old_id ORDER BY p.new_id, p.old_id",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    assert!(r.get::<_, bool>(5)?, "a pair's new_id is its larger id");
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap()
     }
 
     /// Each piece of every linked save, in order: its text, the head it was
@@ -1693,6 +1746,7 @@ mod tests {
         project: Option<String>,
         key: Option<String>,
         deleted: bool,
+        disputed_against: Option<String>,
     }
 
     /// The rows imported from `origin`, by id.
@@ -1702,7 +1756,7 @@ mod tests {
             .call(move |c| {
                 let mut stmt = c.prepare(
                     "SELECT id, content, status, superseded_by, supersede_cause, project_id, topic_key, \
-                     deleted_at IS NOT NULL FROM memory \
+                     deleted_at IS NOT NULL, disputed_against FROM memory \
                      WHERE source = 'import' AND created_by_ref = ?1 ORDER BY id",
                 )?;
                 let rows = stmt.query_map([origin], |r| {
@@ -1715,6 +1769,7 @@ mod tests {
                         project: r.get(5)?,
                         key: r.get(6)?,
                         deleted: r.get(7)?,
+                        disputed_against: r.get(8)?,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -2076,6 +2131,141 @@ mod tests {
             assert_eq!(foreign.present, BTreeMap::from([(String::new(), 1)]));
         }
         assert!(imported(&dst, "engram:port").await.iter().all(|r| !r.deleted));
+    }
+
+    #[tokio::test]
+    async fn a_deleted_note_comes_in_deleted_without_a_vector() {
+        let dst = destination().await;
+        let gone = ForeignNote { deleted: Some(When::At(T0 + 5)), ..foreign_note("engram:gone", "Port", "the daemon listens on 27390") };
+        let (report, _) = run_foreign(&dst, vec![gone], ImportOptions::default()).await;
+
+        assert_eq!((report.by_state.clone(), report.foreign.as_ref().unwrap().deleted), (BTreeMap::from([("deleted".to_string(), 1)]), 1));
+        let row = &imported(&dst, "engram:gone").await[0];
+        assert!(row.deleted);
+        let id = row.id;
+        let vectors = dst
+            .conn
+            .call(move |c| c.query_row("SELECT count(*) FROM memory_vectors WHERE rowid = ?1", [id], |r| r.get::<_, i64>(0)))
+            .await
+            .unwrap();
+        assert_eq!(vectors, 0);
+        assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH '27390'").await, 0);
+
+        restore_memory_core(&dst, &FakeEmbedder::default(), MemoryKind::Memory, id, None).await.unwrap();
+        assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH '27390'").await, 1, "indexed once");
+    }
+
+    #[tokio::test]
+    async fn relations_become_pairs() {
+        let notes: Vec<ForeignNote> =
+            ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"].iter().enumerate().map(|(k, n)| named(n, k as i64)).collect();
+        let relations = vec![
+            ForeignRelation { judgment: "pending".into(), ..relation("b", "a", "related") },
+            relation("d", "c", "compatible"),
+            ForeignRelation {
+                reason: Some("each holds in its own crate".into()),
+                evidence: Some("see Cargo.toml".into()),
+                ..relation("f", "e", "scoped")
+            },
+            relation("h", "g", "conflicts_with"),
+            relation("j", "i", "supersedes"),
+            ForeignRelation { judgment: "ignored".into(), ..relation("l", "k", "conflicts_with") },
+        ];
+        let export = ForeignExport { relations, ..foreign_export(notes.clone()) };
+        let dst = destination().await;
+        let (report, _) = run_export(&dst, export.clone(), ImportOptions::default()).await;
+
+        let text = |n: &str| format!("{n}\nthe note {n}");
+        let pair = |new: &str, old: &str, state: &str, verdict: Option<&str>, reason: Option<&str>| {
+            (text(new), text(old), state.to_string(), verdict.map(str::to_owned), reason.map(str::to_owned))
+        };
+        let expected = vec![
+            pair("b", "a", "pending", None, None),
+            pair("d", "c", "judged", Some("compatible"), None),
+            pair("f", "e", "judged", Some("scoped"), Some("each holds in its own crate\nsee Cargo.toml")),
+            pair("h", "g", "escalated", None, None),
+            pair("j", "i", "judged", Some("supersedes"), None),
+            pair("l", "k", "judged", Some("compatible"), None),
+        ];
+        assert_eq!(pairs(&dst).await, expected);
+        let (g, h) = (&imported(&dst, "engram:g").await[0], &imported(&dst, "engram:h").await[0]);
+        assert_eq!((h.status.as_str(), h.disputed_against.clone()), ("disputed", Some(format!("[{}]", g.id))));
+        assert_eq!(g.status, "active");
+        let (i, j) = (&imported(&dst, "engram:i").await[0], &imported(&dst, "engram:j").await[0]);
+        assert_eq!((i.status.as_str(), i.by, i.cause.as_deref()), ("superseded", Some(j.id), Some("verdict")));
+        let stored = report.foreign.unwrap().relations;
+        let by_state = [("compatible", 2), ("escalated", 1), ("pending", 1), ("scoped", 1), ("supersedes", 1)];
+        assert_eq!(stored, by_state.iter().map(|(s, n)| (s.to_string(), *n)).collect::<BTreeMap<_, _>>());
+
+        let before = dump(&dst, EVERYTHING).await;
+        let (again, _) = run_export(&dst, export, ImportOptions::default()).await;
+        assert_eq!(again.inserted, 0);
+        assert_eq!(dump(&dst, EVERYTHING).await, before, "a second import adds no pair");
+
+        // A relation the source drew later between notes already here keeps
+        // its pair and changes no row here.
+        let dst = destination().await;
+        run_foreign(&dst, notes.clone(), ImportOptions::default()).await;
+        let later = ForeignExport { relations: vec![relation("j", "i", "supersedes")], ..foreign_export(notes) };
+        run_export(&dst, later, ImportOptions::default()).await;
+        assert_eq!(pairs(&dst).await, vec![pair("j", "i", "judged", Some("supersedes"), None)]);
+        let i = &imported(&dst, "engram:i").await[0];
+        assert_eq!((i.status.as_str(), i.by), ("active", None));
+    }
+
+    #[tokio::test]
+    async fn supersedes_over_a_decision_without_the_user_is_escalated() {
+        let notes = || vec![ForeignNote { source_type: Some("decision".into()), ..named("a", 0) }, named("b", 1)];
+        let by_agent = ForeignExport { relations: vec![relation("b", "a", "supersedes")], ..foreign_export(notes()) };
+        let dst = destination().await;
+        run_export(&dst, by_agent, ImportOptions::default()).await;
+        let (a, b) = (&imported(&dst, "engram:a").await[0], &imported(&dst, "engram:b").await[0]);
+        assert_eq!(a.status, "active", "a decision is replaced only on the user's word");
+        assert_eq!((b.status.as_str(), b.disputed_against.clone()), ("disputed", Some(format!("[{}]", a.id))));
+        assert_eq!(pairs(&dst).await[0].2, "escalated");
+
+        let by_user = ForeignExport {
+            relations: vec![ForeignRelation { by_user: true, ..relation("b", "a", "supersedes") }],
+            ..foreign_export(notes())
+        };
+        let dst = destination().await;
+        run_export(&dst, by_user, ImportOptions::default()).await;
+        let (a, b) = (&imported(&dst, "engram:a").await[0], &imported(&dst, "engram:b").await[0]);
+        assert_eq!((a.status.as_str(), a.by, a.cause.as_deref()), ("superseded", Some(b.id), Some("verdict")));
+        assert_eq!((pairs(&dst).await[0].2.as_str(), pairs(&dst).await[0].3.as_deref()), ("judged", Some("supersedes")));
+    }
+
+    #[tokio::test]
+    async fn what_has_no_place_is_counted() {
+        let notes = vec![
+            named("a", 0),
+            named("b", 1),
+            named("c", 2),
+            ForeignNote { written: When::At(T0 + 3), ..foreign_note("engram:a2", "a", "the note a") },
+            ForeignNote { title: String::new(), content: String::new(), ..named("empty", 4) },
+        ];
+        let relations = vec![
+            ForeignRelation { superseded: true, ..relation("b", "a", "related") },
+            ForeignRelation { judgment: "orphaned".into(), ..relation("b", "a", "compatible") },
+            relation("c", "missing", "related"),
+            relation("c", "empty", "related"),
+            relation("c", "b", "mentions"),
+            relation("a2", "a", "related"),
+            relation("c", "a", "related"),
+            ForeignRelation { updated: When::At(T0 + 300), ..relation("a", "c", "conflicts_with") },
+        ];
+        let unplaced = BTreeMap::from([("observation.tool_name".to_string(), 2)]);
+        let export = ForeignExport { relations, unplaced: unplaced.clone(), ..foreign_export(notes) };
+        let dst = destination().await;
+        let (report, _) = run_export(&dst, export, ImportOptions::default()).await;
+
+        assert_eq!(pairs(&dst).await.into_iter().map(|p| p.2).collect::<Vec<_>>(), ["escalated"], "the newest relation of two notes");
+        let foreign = report.foreign.unwrap();
+        assert_eq!(foreign.relations, BTreeMap::from([("escalated".to_string(), 1)]));
+        let left_out = [("missing_note", 2), ("orphaned", 1), ("replaced", 2), ("same_note", 1), ("unknown:mentions", 1)];
+        assert_eq!(foreign.relations_left_out, left_out.iter().map(|(r, n)| (r.to_string(), *n)).collect::<BTreeMap<_, _>>());
+        assert_eq!(foreign.unplaced, unplaced);
+        assert_eq!(foreign.without_text, ["engram:empty"]);
     }
 
     #[test]

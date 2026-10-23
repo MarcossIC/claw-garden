@@ -34,8 +34,8 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 6. Borradas y relaciones (HI14)
 
-- [ ] Tests `relations_map_to_pair_states` (`translate.rs`) y los de `import.rs`.
-- [ ] `pair_for`, las líneas `conflict` y los estados de las filas; `write_links` escribe cada par como `(mayor, menor)`.
+- [x] Tests `relations_map_to_pair_states` (`translate.rs`) y los de `import.rs`.
+- [x] `pair_for`, las líneas `conflict` y los estados de las filas; `write_links` escribe cada par como `(mayor, menor)`.
 - Commit: `feat(core): import the relations between notes as conflict pairs`
 
 ## 7. La ruta y el comando (HI16, HI17, HI18)
