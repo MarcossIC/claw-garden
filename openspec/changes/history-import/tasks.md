@@ -46,7 +46,7 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 8. El binario real (HI16)
 
-- [ ] `an_engram_export_imports_through_the_binary` (`tests/binary.rs`).
+- [x] `an_engram_export_imports_through_the_binary` (`tests/binary.rs`); el stand-in `fake` le da al proceso un tokenizer de una palabra por token, como una carga del modelo le da el suyo.
 - Commit: `test(cli): import an engram export through a real daemon`
 
 ## 9. Docs

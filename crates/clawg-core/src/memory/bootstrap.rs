@@ -304,9 +304,9 @@ pub fn production_deps(
 }
 
 /// Env var that, in a build with the `testing` feature, replaces the model
-/// `clawg serve` loads: `fake` loads [`FakeEmbedder`] at once, `stalled`
-/// never finishes the download and `blocked` downloads at once and never
-/// returns from the load, holding its blocking thread. It lets a test run the real binary without
+/// `clawg serve` loads: `fake` loads [`FakeEmbedder`] and a word tokenizer at
+/// once, `stalled` never finishes the download and `blocked` downloads at
+/// once and never returns from the load, holding its blocking thread. It lets a test run the real binary without
 /// the 470 MB model; a release build never reads it.
 ///
 /// [`FakeEmbedder`]: crate::memory::embedder::FakeEmbedder
@@ -340,8 +340,15 @@ impl TestEmbedder {
 
     /// The bootstrap dependencies for this stand-in, whose cache is whatever
     /// its download gives. The contract check is the real one, so a test
-    /// store records and verifies the fake model's identity.
-    pub fn deps(self, store: Arc<MemoryStore>, backups: std::path::PathBuf) -> EmbedderDeps {
+    /// store records and verifies the fake model's identity. A load fills
+    /// `tokenizer` as the model's does, so what splits by tokens (an import
+    /// of another tool's export) runs against the binary too.
+    pub fn deps(
+        self,
+        store: Arc<MemoryStore>,
+        backups: std::path::PathBuf,
+        tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
+    ) -> EmbedderDeps {
         let verify = contract_verifier(store, backups);
         let ensure: EnsureModelFn = match self {
             Self::Fake | Self::Blocked => Arc::new(|_base_dir, _progress| {
@@ -366,7 +373,8 @@ impl TestEmbedder {
                     std::thread::park();
                 }
             }),
-            Self::Fake | Self::Stalled => Arc::new(|_files| {
+            Self::Fake | Self::Stalled => Arc::new(move |_files| {
+                tokenizer.get_or_init(crate::memory::chunker::word_tokenizer);
                 Ok(Arc::new(crate::memory::embedder::FakeEmbedder::default()) as Arc<dyn Embedder>)
             }),
         };
@@ -388,7 +396,7 @@ pub fn serve_deps(
 ) -> Result<EmbedderDeps, String> {
     let raw = std::env::var(TEST_EMBEDDER_VAR).ok();
     Ok(match TestEmbedder::parse(raw.as_deref())? {
-        Some(stand_in) => stand_in.deps(store, backups),
+        Some(stand_in) => stand_in.deps(store, backups, tokenizer),
         None => production_deps(store, backups, tokenizer),
     })
 }
@@ -1696,7 +1704,9 @@ mod tests {
     #[tokio::test]
     async fn the_fake_test_embedder_loads_at_once_and_records_its_contract() {
         let store = Arc::new(MemoryStore::new_for_test().await.expect("test store"));
-        let EmbedderDeps { ensure, cached, load, verify } = TestEmbedder::Fake.deps(store, std::env::temp_dir());
+        let tokenizer = Arc::new(OnceCell::new());
+        let EmbedderDeps { ensure, cached, load, verify } =
+            TestEmbedder::Fake.deps(store, std::env::temp_dir(), tokenizer.clone());
 
         let files = tokio::time::timeout(Duration::from_secs(1), ensure(std::env::temp_dir(), None))
             .await
@@ -1706,8 +1716,10 @@ mod tests {
             .await
             .expect("no download")
             .expect("the same files from the cache");
+        assert!(tokenizer.get().is_none());
         let embedder = load(files).expect("the fake loads");
         assert_eq!(embedder.model_id(), "fake-embedder");
+        assert!(tokenizer.get().is_some(), "a load gives the process its tokenizer, as the model's does");
         let status = verify(embedder).await.expect("the real contract check");
         assert!(matches!(status, ContractStatus::Initialized));
     }
@@ -1715,7 +1727,7 @@ mod tests {
     #[tokio::test]
     async fn the_stalled_test_embedder_never_finishes_the_download() {
         let store = Arc::new(MemoryStore::new_for_test().await.expect("test store"));
-        let EmbedderDeps { ensure, .. } = TestEmbedder::Stalled.deps(store, std::env::temp_dir());
+        let EmbedderDeps { ensure, .. } = TestEmbedder::Stalled.deps(store, std::env::temp_dir(), Arc::new(OnceCell::new()));
 
         let waited = tokio::time::timeout(Duration::from_millis(200), ensure(std::env::temp_dir(), None)).await;
         assert!(waited.is_err(), "the download must still be running");
