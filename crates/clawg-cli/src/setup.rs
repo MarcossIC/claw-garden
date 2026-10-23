@@ -567,7 +567,7 @@ pub(crate) fn block(eol: &str, language: Option<Lang>) -> String {
 /// Where the block is in the file: from its first marker to the end of its
 /// last. A marker without its pair is an error, since there is no knowing
 /// where clawg's text ends.
-fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupError> {
+pub(crate) fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupError> {
     let Some(text) = &file.text else { return Ok(None) };
     let lone = || SetupError::LoneMarker { path: file.path.clone() };
     match (text.find(BEGIN_MARKER), text.find(END_MARKER)) {

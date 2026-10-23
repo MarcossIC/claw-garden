@@ -20,6 +20,7 @@ use clawg_core::memory::sharing;
 use clawg_core::memory::spill::{REJECTED_FILE, SPILL_FILE};
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock};
 use clawg_core::paths::{PathsError, Profile};
+use clawg_core::preferences::{self, Lang};
 use serde::Serialize;
 
 use finding::{Finding, Summary};
@@ -167,6 +168,19 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     ));
     let sharing_error = sharing::load(&data_dir).err().map(|e| e.to_string());
     found.extend(checks::sharing(sharing_error.as_deref(), profile));
+    let preferences_path = clawg_core::paths::preferences_file(&data_dir);
+    let (state, language) = if !preferences_path.exists() {
+        (checks::PreferencesState::Missing, None)
+    } else {
+        match preferences::load(&data_dir) {
+            Ok(p) => (checks::PreferencesState::Readable, p.language),
+            Err(e) => (checks::PreferencesState::Invalid(e.to_string()), None),
+        }
+    };
+    found.extend(checks::preferences(&state, &preferences_path));
+    if let Some(language) = language {
+        found.extend(protocol_block(language, profile));
+    }
     if let Some(facts) = &inspection.facts {
         let daemon_running = owner.as_ref().is_some_and(|o| o.holder == StoreHolder::Daemon);
         found.extend(checks::outbox(&facts.outbox, daemon_running, profile));
@@ -228,6 +242,28 @@ fn present(dir: &Path, name: &str) -> Option<PathBuf> {
 /// The lines of a file, counted and never kept: they are someone's saves.
 fn lines_in(path: &Path) -> usize {
     std::fs::read(path).map(|b| b.split(|&c| c == b'\n').filter(|l| !l.is_empty()).count()).unwrap_or(0)
+}
+
+/// The protocol block of the user `CLAUDE.md` `clawg setup claude-code`
+/// writes, against the one it would write for `language`.
+fn protocol_block(language: Lang, profile: Profile) -> Vec<Finding> {
+    let home = clawg_core::paths::home_dir();
+    let Ok((_, _, path)) = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")) else {
+        return Vec::new();
+    };
+    let state = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => checks::BlockState::Missing,
+        Err(e) => checks::BlockState::Unreadable(e.to_string()),
+        Ok(text) => {
+            let file = crate::setup::File { path: path.clone(), text: Some(text) };
+            match crate::setup::find_block(&file) {
+                Ok(Some((begin, end))) => checks::BlockState::Installed(file.text.unwrap_or_default()[begin..end].to_string()),
+                Ok(None) => checks::BlockState::Missing,
+                Err(e) => checks::BlockState::Unreadable(e.to_string()),
+            }
+        }
+    };
+    checks::protocol_block(&state, &crate::setup::block("\n", Some(language)), &path, profile)
 }
 
 /// Claude Code's registration of this profile's server, from the file
