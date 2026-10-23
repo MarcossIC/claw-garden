@@ -37,7 +37,7 @@ El export MUST escribir `origin_project` en cada línea `memory` (`null` cuando 
 
 ## HI3. Elegir filas por su proyecto de origen
 
-`clawg projects move` MUST aceptar `--origin-project NOMBRE`, que elige las filas cuyo `origin_project` es exactamente `NOMBRE`, y cuenta como filtro de selección (PR9 de [`specs/project`](../../specs/project/spec.md)). `POST /v1/memories/move` MUST aceptar `origin_project` con el mismo efecto. `clawg memories list --origin-project NOMBRE` y `GET /v1/memories?origin_project=NOMBRE` MUST listar sólo esas filas, con los demás filtros.
+`clawg projects move` MUST aceptar `--origin-project NOMBRE`, que elige las filas cuyo `origin_project` es exactamente `NOMBRE`, y cuenta como filtro de selección (R12 de [`specs/project`](../../specs/project/spec.md)). `POST /v1/memories/move` MUST aceptar `origin_project` con el mismo efecto. `clawg memories list --origin-project NOMBRE` y `GET /v1/memories?origin_project=NOMBRE` MUST listar sólo esas filas, con los demás filtros.
 
 #### Escenario: acomodar un proyecto de la fuente
 - GIVEN notas importadas sin proyecto de dos proyectos de origen, `a` y `b`
