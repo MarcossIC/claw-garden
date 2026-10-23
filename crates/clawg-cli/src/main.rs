@@ -40,6 +40,7 @@ use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::memory::embedder::keep_one_malloc_arena;
+use clawg_core::memory::portability::export::project_id_of;
 use clawg_core::memory::portability::ExportFilter;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::memory::secrets::{mask_reasons, purge, scan};
@@ -221,7 +222,14 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Command::Export { out, project, agent, include_deleted, format, profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            let project_id = project.map(|path| ProjectIdentity::resolve(&path).id);
+            let project_id = match project {
+                Some(path) => {
+                    let root = ProjectIdentity::resolve(&path).root;
+                    let remote = clawg_core::memory::identity::origin_key(&root);
+                    Some(project_id_of(&base_dir, &root, remote.as_deref()).map_err(|e| e.to_string())?)
+                }
+                None => None,
+            };
             let filter = ExportFilter { project_id, agent, include_deleted };
             println!("{}", export::run(language(&base_dir), &base_dir, &out, &filter, format, now_ms() as i64)?);
             Ok(ExitCode::SUCCESS)

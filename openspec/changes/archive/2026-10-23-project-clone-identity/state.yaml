@@ -1,0 +1,15 @@
+change: project-clone-identity
+objective: "2"
+depends_on: [project-root-guard, project-reassign]
+phase: archived
+artifacts:
+  exploration: done  # decisiones con el usuario: remoto como pista, W3, Q1, I1
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux y el binario real en un home temporal; Windows queda al CI y el perfil dev no se corrió
+  archive: done
+updated: 2026-10-23
+main_spec: openspec/specs/project/spec.md, openspec/specs/project-docs/spec.md, openspec/specs/hooks/spec.md, openspec/specs/portability/spec.md, openspec/specs/storage/spec.md, openspec/specs/doctor/spec.md

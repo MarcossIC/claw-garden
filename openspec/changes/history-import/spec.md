@@ -9,7 +9,7 @@ Suma requisitos a [`specs/portability`](../../specs/portability/spec.md) (HI2 y 
 - **Origen de una nota:** la fuente y el id estable de la nota en ella, escrito en `created_by_ref` como `engram:<sync_id>`; sin `sync_id`, `engram:observation:<id>` o `engram:prompt:<id>`; el resumen de una sesión, `engram:session:<id>`.
 - **Grupo de origen:** el proyecto y el scope que la nota tenía en la fuente (`personal` o no), y «sin proyecto» como un grupo más.
 - **Fecha del texto:** `updated_at` de la nota, o `created_at` sin él; en UTC.
-- **Destino de una nota:** el id que `derive_project_id` da a la raíz que el mapa le asigna a su proyecto de la fuente, o «sin proyecto».
+- **Destino de una nota:** el id de proyecto que un registro le daría a la raíz que el mapa le asigna a su proyecto de la fuente (R15 y R16 de [`specs/project`](../../specs/project/spec.md), como a una raíz de `--map-root`), o «sin proyecto». Dos clones de un remoto son un mismo destino.
 - **Fila viva:** `deleted_at IS NULL` y `status IN ('active', 'disputed')`.
 - **Fila protegida:** `memory_type` `user_preference` o `architectural_decision` ([`specs/disputes`](../../specs/disputes/spec.md)).
 
@@ -98,14 +98,19 @@ El texto de una nota MUST enmascararse entero (`redact`) antes de partirlo, y MU
 
 ## HI7. Autor, proyecto y origen
 
-Cada fila importada de una fuente MUST tener `scope = 'agent'`, `agent_id` `migrated` (o el de `--agent`), `source = 'import'`, `created_by_type` `user` para un prompt y `agent` para lo demás, su origen en `created_by_ref`, el nombre de su proyecto en la fuente en `origin_project` (NULL sin proyecto), y la sesión de la fuente en `source_session_id` cuando es de 1 a 128 caracteres ASCII visibles (otra se reporta). Su `project_id` MUST ser su destino: el de su nombre en el mapa; sin proyecto si el nombre no está en el mapa, si la nota no tiene proyecto o si es `personal`. Cada raíz del mapa MUST registrarse en `project` sin `index_docs`; si su id ya pertenece a otra raíz, las notas de ese nombre MUST reportarse y no importarse.
+Cada fila importada de una fuente MUST tener `scope = 'agent'`, `agent_id` `migrated` (o el de `--agent`), `source = 'import'`, `created_by_type` `user` para un prompt y `agent` para lo demás, su origen en `created_by_ref`, el nombre de su proyecto en la fuente en `origin_project` (NULL sin proyecto), y la sesión de la fuente en `source_session_id` cuando es de 1 a 128 caracteres ASCII visibles (otra se reporta). Su `project_id` MUST ser su destino: el de su nombre en el mapa; sin proyecto si el nombre no está en el mapa, si la nota no tiene proyecto o si es `personal`. Los ids de las raíces del mapa MUST planearse antes de traducir (`plan_ids_in`), porque las claves se distinguen por destino (HI8). Cada raíz del mapa MUST registrarse en `project` sin `index_docs`, y su remoto en `project_remote`, como las de `--map-root`. Si entre el plan y la escritura un registro le dio ese id a otra raíz, las notas de ese nombre MUST reportarse por su proyecto y no importarse.
 
 #### Escenario: el mapa
 - GIVEN notas de `a`, de `b` y sin proyecto, y una `personal` de `a`
 - WHEN se importa con `--project-map a=RUTA`
 - THEN las de `a` quedan en el proyecto de `RUTA`, las demás sin proyecto, y `origin_project` es `a`, `b`, NULL y `a`
 
-**Tests:** `the_project_map_places_notes_and_the_rest_have_none`, `every_row_carries_its_origin_and_author` (`translate.rs`); `a_mapped_root_of_another_project_is_reported_and_skipped` (`import.rs`).
+#### Escenario: el id de la raíz ya es de otra
+- GIVEN `project` con el id que `derive_project_id` da a `RUTA` para otra raíz
+- WHEN se importa con `--project-map a=RUTA`
+- THEN las notas de `a` quedan en el siguiente id libre de `RUTA`, y el reporte nombra ese proyecto
+
+**Tests:** `the_project_map_places_notes_and_the_rest_have_none`, `every_row_carries_its_origin_and_author` (`translate.rs`); `a_mapped_root_whose_id_is_taken_gets_its_own`, `a_project_taken_while_importing_is_told_by_its_notes` (`import.rs`).
 
 ## HI8. Claves de tema
 
@@ -118,7 +123,12 @@ Si notas de más de un grupo de origen caen en un mismo destino con la misma cla
 - WHEN se importa
 - THEN quedan vivas las dos, con `a/sdd/x/proposal` y `b/sdd/x/proposal`
 
-**Tests:** `a_valid_key_is_kept_and_an_invalid_one_rewritten_stably`, `keys_of_two_origins_in_one_destination_are_qualified`, `a_qualified_key_that_takes_another_projects_key_is_qualified_again`, `two_notes_of_one_origin_and_key_leave_the_newest_live` (`translate.rs`); `a_key_held_here_supersedes_the_imported_note` (`import.rs`).
+#### Escenario: dos clones de un remoto
+- GIVEN una nota de `a` y una de `b` con la clave `sdd/x`, mapeadas a dos clones de un remoto que ya tiene proyecto
+- WHEN se importa
+- THEN quedan vivas las dos en el proyecto del remoto, con `a/sdd/x` y `b/sdd/x`
+
+**Tests:** `a_valid_key_is_kept_and_an_invalid_one_rewritten_stably`, `keys_of_two_origins_in_one_destination_are_qualified`, `a_qualified_key_that_takes_another_projects_key_is_qualified_again`, `keys_of_two_roots_of_one_project_here_are_qualified`, `two_notes_of_one_origin_and_key_leave_the_newest_live` (`translate.rs`); `a_key_held_here_supersedes_the_imported_note`, `notes_mapped_to_clones_of_one_remote_share_its_project` (`import.rs`).
 
 ## HI9. Fechas, accesos, importancia y tier
 

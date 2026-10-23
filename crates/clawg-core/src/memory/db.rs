@@ -699,7 +699,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 23);
+        assert_eq!(after.0, 24);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1606,6 +1606,63 @@ mod tests {
         assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
     }
 
+    /// No root knew its remote before V24, so a store from before it opens
+    /// with every row and every registered root as they were and nothing
+    /// joined.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_no_remote_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(23)).await;
+        let snapshot = |c: &mut rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, scope, agent_id, project_id, status, superseded_by, topic_key, content_hash) \
+                 FROM memory WHERE id >= 10 \
+                 UNION ALL SELECT json_array(id, root_path, created_at, index_docs) FROM project ORDER BY 1",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, root_path, created_at, index_docs) VALUES \
+                       ('app-1a2b', '/work/app', 1, 1), ('app-3c4d', '/review/app', 2, 0);",
+                )?;
+                for (id, project, key) in [(10, "app-1a2b", Some("storage/engine")), (11, "app-3c4d", Some("storage/engine")), (12, "app-3c4d", None)] {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, topic_key, content_hash) \
+                         VALUES (?1, 'agent', 'a', ?2, 'A note', 'semantic_fact', 'explicit', ?1, 'agent', 'x', \
+                          ?1, ?1, 5.0, 3, 'active', ?3, 'same-text')",
+                        rusqlite::params![id, project, key],
+                    )?;
+                }
+                snapshot(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, remotes, supersedes): (Vec<String>, i64, i64) = store
+            .conn
+            .call(move |c| {
+                let after = snapshot(c)?;
+                let remotes = c.query_row("SELECT COUNT(*) FROM project_remote", [], |r| r.get(0))?;
+                let supersedes = c.query_row("SELECT COUNT(*) FROM memory_move_supersede", [], |r| r.get(0))?;
+                Ok::<_, rusqlite::Error>((after, remotes, supersedes))
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 5);
+        assert_eq!(after, before, "migrating changes no row and no root");
+        assert_eq!((remotes, supersedes), (0, 0));
+    }
+
     #[tokio::test]
     async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
         ensure_vec0_registered();
@@ -2070,7 +2127,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 23, "Expected exactly 23 applied migrations, got {}", count);
+        assert_eq!(count, 24, "Expected exactly 24 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2531,7 +2588,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 23);
+        assert_eq!(migration_count, 24);
     }
 
     // -----------------------------------------------------------------------

@@ -213,6 +213,20 @@ async fn read_input(input: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= INPUT_LIMIT).then_some(bytes)
 }
 
+/// The project the daemon gives the root of `cwd`, registered without
+/// letting the daemon read its files. A daemon that cannot register reads as
+/// the id derived from the root, as the bridge reads it; one from before
+/// assigned ids that refuses the root, as nothing.
+async fn project_of(client: &DaemonClient, cwd: &Path) -> Option<String> {
+    let identity = ProjectIdentity::resolve(cwd);
+    let legacy = identity.legacy_ids();
+    match client.register_project(&identity.root, &legacy, false).await {
+        Ok(given) => Some(given.project_id),
+        Err(e) if e.is_root_collision() => None,
+        Err(_) => Some(identity.id),
+    }
+}
+
 async fn answer(
     event: HookEvent,
     agent: &str,
@@ -224,7 +238,7 @@ async fn answer(
     let input = HookInput::parse(&bytes)?;
     let client = DaemonClient::from_data_dir(base_dir)?;
     let cwd = input.cwd.clone().or_else(|| std::env::current_dir().ok())?;
-    let project = ProjectIdentity::resolve(&cwd).id;
+    let project = project_of(&client, &cwd).await?;
     // Both events register: a daemon started since the session began learns
     // it at the next prompt. A refusal changes nothing the hook prints.
     let register = async {

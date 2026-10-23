@@ -10,14 +10,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::memory::chunker::ChatChunker;
 use crate::memory::dedup::content_hash;
-use crate::memory::identity::derive_project_id;
 use crate::memory::redact::redact;
 use crate::memory::store_insert::MemoryType;
 use crate::memory::tier::compute_tier;
@@ -34,9 +32,18 @@ pub const MIGRATED_AGENT: &str = "migrated";
 pub struct TranslateOptions {
     /// The agent every row is stored under.
     pub agent: String,
-    /// A project name of the source and the root it has here; the first
-    /// entry of a name counts.
-    pub project_map: Vec<(String, String)>,
+    /// The first entry of a name counts.
+    pub project_map: Vec<MappedProject>,
+}
+
+/// A project name of the source, the root it has here, and the project the
+/// rows of that root go to, as registering the root gives it: two clones of
+/// one remote are one project here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappedProject {
+    pub name: String,
+    pub root: String,
+    pub project_id: String,
 }
 
 /// An export as the lines to import.
@@ -124,8 +131,8 @@ pub struct TakenKey {
     pub by: i64,
 }
 
-/// The notes of a project of the source whose root is another project's
-/// here, left out.
+/// The notes of a project of the source left out because a registration gave
+/// the id planned for its root to another root while the import ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakenProject {
     pub project: String,
@@ -249,14 +256,14 @@ impl<'a> Draft<'a> {
         let (written, late) = clamp(note.written);
         let last_seen = note.last_seen.map(clamp);
         let deleted = note.deleted.map(clamp);
-        let root = note.project.as_deref().filter(|_| !note.personal).and_then(|name| root_of(options, name));
+        let mapped = note.project.as_deref().filter(|_| !note.personal).and_then(|name| mapping(options, name));
         Some(Draft {
             note,
             masked: !masked.kinds.is_empty(),
             text: masked.text,
             memory_type: memory_type_of(note),
             group: Group { project: note.project.clone(), personal: note.personal },
-            project_id: root.map(|root| derive_project_id(Path::new(root))),
+            project_id: mapped.map(|m| m.project_id.clone()),
             written,
             // Writing a note is seeing it too, and a row is never read before
             // it was written.
@@ -332,8 +339,8 @@ fn memory_type_of(note: &ForeignNote) -> MemoryType {
     }
 }
 
-fn root_of<'o>(options: &'o TranslateOptions, name: &str) -> Option<&'o str> {
-    options.project_map.iter().find(|(n, _)| n == name).map(|(_, root)| root.as_str())
+fn mapping<'o>(options: &'o TranslateOptions, name: &str) -> Option<&'o MappedProject> {
+    options.project_map.iter().find(|m| m.name == name)
 }
 
 fn kept_session(id: &str) -> bool {
@@ -372,7 +379,7 @@ fn count_notes(drafts: &[Draft<'_>], options: &TranslateOptions, report: &mut Fo
     report.by_source_project = projects
         .into_iter()
         .map(|(group, (project_id, notes))| ProjectCount {
-            root: project_id.as_ref().and(group.project.as_deref()).and_then(|name| root_of(options, name)).map(str::to_owned),
+            root: project_id.as_ref().and(group.project.as_deref()).and_then(|name| mapping(options, name)).map(|m| m.root.clone()),
             project: group.project,
             personal: group.personal,
             project_id,
@@ -381,10 +388,10 @@ fn count_notes(drafts: &[Draft<'_>], options: &TranslateOptions, report: &mut Fo
         .collect();
     let named: BTreeSet<&str> =
         drafts.iter().filter(|d| !d.note.personal).filter_map(|d| d.note.project.as_deref()).collect();
-    report.unmapped = named.iter().filter(|name| root_of(options, name).is_none()).map(|name| name.to_string()).collect();
-    for (name, _) in &options.project_map {
-        if !named.contains(name.as_str()) && !report.unused_map.contains(name) {
-            report.unused_map.push(name.clone());
+    report.unmapped = named.iter().filter(|name| mapping(options, name).is_none()).map(|name| name.to_string()).collect();
+    for m in &options.project_map {
+        if !named.contains(m.name.as_str()) && !report.unused_map.contains(&m.name) {
+            report.unused_map.push(m.name.clone());
         }
     }
 }
@@ -603,11 +610,12 @@ fn lines(drafts: &[Draft<'_>], options: &TranslateOptions, mut report: ForeignRe
     }
     report.rows = parsed.memories.len();
     parsed.pieces = pieces.into_iter().enumerate().map(|(k, p)| (report.rows + k + 1, p)).collect();
+    // Each root once, in the order of the map: the import plans the ids of
+    // the roots in that order and lines them up with these lines.
     let mut recorded = HashSet::new();
-    for (_, root) in &options.project_map {
-        let id = derive_project_id(Path::new(root));
-        if recorded.insert(id.clone()) {
-            parsed.projects.push((0, ProjectLine { id, root_path: root.clone() }));
+    for m in &options.project_map {
+        if recorded.insert(m.root.as_str()) {
+            parsed.projects.push((0, ProjectLine { id: m.project_id.clone(), root_path: m.root.clone() }));
         }
     }
     Translated { parsed, notes, report }
@@ -615,7 +623,10 @@ fn lines(drafts: &[Draft<'_>], options: &TranslateOptions, mut report: ForeignRe
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::memory::identity::derive_project_id;
 
     /// 2025-01-01 10:00:00 UTC.
     pub(crate) const T0: i64 = 1_735_725_600_000;
@@ -654,10 +665,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// Each root to the project a registration gives it in an empty store.
     fn options(map: &[(&str, &str)]) -> TranslateOptions {
         TranslateOptions {
             agent: MIGRATED_AGENT.to_owned(),
-            project_map: map.iter().map(|(name, root)| (name.to_string(), root.to_string())).collect(),
+            project_map: map
+                .iter()
+                .map(|(name, root)| MappedProject { name: name.to_string(), root: root.to_string(), project_id: id_of(root) })
+                .collect(),
         }
     }
 
@@ -994,6 +1009,24 @@ pub(crate) mod tests {
         );
         let keys: HashSet<String> = t.parsed.memories.iter().map(|(_, m)| m.topic_key.clone().unwrap()).collect();
         assert_eq!(keys.len(), 3, "{keys:?}");
+    }
+
+    #[test]
+    fn keys_of_two_roots_of_one_project_here_are_qualified() {
+        let clone = |name: &str, root: &str| MappedProject { name: name.into(), root: root.into(), project_id: "app-1a2b".into() };
+        let options = TranslateOptions { agent: MIGRATED_AGENT.into(), project_map: vec![clone("a", "/work/app"), clone("b", "/home/app")] };
+        let notes = vec![keyed("engram:a", Some("a"), false, "sdd/x"), keyed("engram:b", Some("b"), false, "sdd/x")];
+        let t = translate(&export(notes), &options, &ChatChunker::with_fallback(), NOW);
+
+        let placed = |origin: &str| {
+            let m = row(&t, origin);
+            (m.project_id.clone().unwrap(), m.topic_key.clone().unwrap(), m.status.clone())
+        };
+        assert_eq!(placed("engram:a"), ("app-1a2b".into(), "a/sdd/x".into(), "active".into()));
+        assert_eq!(placed("engram:b"), ("app-1a2b".into(), "b/sdd/x".into(), "active".into()));
+        let projects: Vec<(String, String)> = t.parsed.projects.iter().map(|(_, p)| (p.id.clone(), p.root_path.clone())).collect();
+        let recorded = vec![("app-1a2b".into(), "/work/app".into()), ("app-1a2b".into(), "/home/app".into())];
+        assert_eq!(projects, recorded, "each root is recorded");
     }
 
     #[test]

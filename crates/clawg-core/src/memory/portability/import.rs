@@ -18,7 +18,7 @@
 //! transactions, does no harm.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, Transaction};
@@ -29,13 +29,14 @@ use crate::memory::chunker::{embedding_text, ChatChunker};
 use crate::memory::clock::TimestampMs;
 use crate::memory::dedup::content_hash;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::identity::derive_project_id;
+use crate::memory::identity::origin_key;
+use crate::memory::project::plan_ids_in;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
 use crate::memory::portability::format::{parse, FormatError, Invalid, MemoryLine, Parsed};
 use crate::memory::portability::translate::{
-    translate, ForeignReport, LeftOut, MergedNote, NoteRows, TakenKey, TakenProject, TranslateOptions, Translated,
-    MIGRATED_AGENT,
+    translate, ForeignReport, LeftOut, MappedProject, MergedNote, NoteRows, TakenKey, TakenProject, TranslateOptions,
+    Translated, MIGRATED_AGENT,
 };
 use crate::memory::redact::redact;
 use crate::memory::vector::to_unit;
@@ -163,9 +164,43 @@ impl Row {
 #[derive(Debug)]
 struct Prepared {
     rows: Vec<Row>,
-    /// Every project to record: id here, root here.
-    projects: Vec<(String, String)>,
+    /// Every project to record: its root here, the root's id and remote, and
+    /// the project its rows go to.
+    projects: Vec<ProjectHere>,
     parsed: Parsed,
+}
+
+/// A project of the file, as it is recorded here.
+#[derive(Debug, Clone)]
+struct ProjectHere {
+    root: String,
+    root_id: String,
+    remote: Option<String>,
+    project_id: String,
+}
+
+/// The root here of every project line, with the key of its remote.
+fn roots_here(parsed: &Parsed, options: &ImportOptions) -> Vec<(PathBuf, Option<String>)> {
+    parsed
+        .projects
+        .iter()
+        .map(|(_, p)| {
+            let root = options
+                .map_roots
+                .iter()
+                .find(|(old, _)| *old == p.root_path)
+                .map(|(_, new)| new.clone())
+                .unwrap_or_else(|| p.root_path.clone());
+            let remote = origin_key(Path::new(&root));
+            (PathBuf::from(root), remote)
+        })
+        .collect()
+}
+
+/// The ids a registration of each root would give it now, in order.
+async fn plan(store: &MemoryStore, roots: &[(PathBuf, Option<String>)]) -> Result<Vec<(String, String)>, ImportError> {
+    let planned = roots.to_vec();
+    Ok(store.conn.call(move |c| plan_ids_in(c, &planned)).await.map_err(MemoryError::Connection)?)
 }
 
 /// Whether the texts of a file are masked yet.
@@ -178,19 +213,25 @@ enum Texts<'a> {
     Masked(&'a HashSet<i64>),
 }
 
-fn prepare(mut parsed: Parsed, options: &ImportOptions, texts: Texts<'_>) -> Prepared {
+/// `roots` are the roots here of the file's projects, in order, and `ids`
+/// what [`plan`] gave them.
+fn prepare(
+    mut parsed: Parsed,
+    roots: &[(PathBuf, Option<String>)],
+    ids: &[(String, String)],
+    options: &ImportOptions,
+    texts: Texts<'_>,
+) -> Prepared {
     let mut project_ids: HashMap<String, String> = HashMap::new();
     let mut projects = Vec::new();
-    for (_, p) in &parsed.projects {
-        let root = options
-            .map_roots
-            .iter()
-            .find(|(old, _)| *old == p.root_path)
-            .map(|(_, new)| new.clone())
-            .unwrap_or_else(|| p.root_path.clone());
-        let id = derive_project_id(Path::new(&root));
-        project_ids.insert(p.id.clone(), id.clone());
-        projects.push((id, root));
+    for (((_, p), (root, remote)), (root_id, project_id)) in parsed.projects.iter().zip(roots).zip(ids) {
+        project_ids.insert(p.id.clone(), project_id.clone());
+        projects.push(ProjectHere {
+            root: root.to_string_lossy().into_owned(),
+            root_id: root_id.clone(),
+            remote: remote.clone(),
+            project_id: project_id.clone(),
+        });
     }
     if let Texts::Raw = texts {
         // The head of a save is stored with its pieces, so it is masked as
@@ -270,8 +311,8 @@ struct Ledger {
     /// The agent each row inserted here had in the file, so two agents'
     /// rows merged under one `--agent` still keep one live save per key.
     import_agents: HashMap<i64, Option<String>>,
-    /// Project ids of the file that belong to another root here, with that
-    /// root: their rows are left out.
+    /// Project ids a registration gave another root since the ids were
+    /// planned, with that root: their rows are left out.
     taken: HashMap<String, String>,
     invalid: Vec<Invalid>,
     dropped: Vec<Invalid>,
@@ -303,18 +344,26 @@ const INSERT_SQL: &str = "INSERT INTO memory \
       lang, origin_project) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)";
 
-/// Records each project, and returns the ids that already belong to another
-/// root, with that root.
-fn record_projects(tx: &Transaction<'_>, projects: &[(String, String)], now: i64) -> rusqlite::Result<HashMap<String, String>> {
+/// Records each project, and returns the project ids whose rows stay out,
+/// with the root that holds them: an id a registration gave another root
+/// since the ids were planned.
+fn record_projects(tx: &Transaction<'_>, projects: &[ProjectHere], now: i64) -> rusqlite::Result<HashMap<String, String>> {
     let mut taken = HashMap::new();
-    for (id, root) in projects {
+    for p in projects {
         tx.execute(
             "INSERT OR IGNORE INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, 0)",
-            rusqlite::params![id, root, now],
+            rusqlite::params![p.root_id, p.root, now],
         )?;
-        let existing: String = tx.query_row("SELECT root_path FROM project WHERE id = ?1", [id], |r| r.get(0))?;
-        if existing != *root {
-            taken.insert(id.clone(), existing);
+        let existing: String = tx.query_row("SELECT root_path FROM project WHERE id = ?1", [&p.root_id], |r| r.get(0))?;
+        if existing != p.root && p.project_id == p.root_id {
+            taken.insert(p.project_id.clone(), existing);
+            continue;
+        }
+        if let Some(remote) = &p.remote {
+            tx.execute(
+                "INSERT OR IGNORE INTO project_remote (remote, project_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![remote, p.project_id, now],
+            )?;
         }
     }
     Ok(taken)
@@ -589,7 +638,9 @@ pub async fn import(
     options: &ImportOptions,
 ) -> Result<ImportReport, ImportError> {
     let (_, parsed) = parse(text)?;
-    let prepared = Arc::new(prepare(parsed, options, Texts::Raw));
+    let roots = roots_here(&parsed, options);
+    let ids = plan(store, &roots).await?;
+    let prepared = Arc::new(prepare(parsed, &roots, &ids, options, Texts::Raw));
     let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
     Ok(report(&prepared, &ledger, options.dry_run, snapshot))
 }
@@ -597,7 +648,8 @@ pub async fn import(
 /// Imports the notes of another tool's export as [`import`] imports a file:
 /// each note masked whole and split by `chunker` into the rows a save of its
 /// text would store, under the agent of `options` or [`MIGRATED_AGENT`], in
-/// the project `options.project_map` gives its project or in none.
+/// the project a registration gives the root `options.project_map` names for
+/// its project, or in none.
 pub async fn import_foreign(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
@@ -606,9 +658,21 @@ pub async fn import_foreign(
     export: ForeignExport,
     options: &ImportOptions,
 ) -> Result<ImportReport, ImportError> {
+    // Planned before the translation, which tells keys apart by the project
+    // each note goes to here.
+    let mut seen = HashSet::new();
+    let mapped: Vec<&str> = options.project_map.iter().map(|(_, root)| root.as_str()).filter(|root| seen.insert(*root)).collect();
+    let roots: Vec<(PathBuf, Option<String>)> =
+        mapped.iter().map(|root| (PathBuf::from(root), origin_key(Path::new(root)))).collect();
+    let ids = plan(store, &roots).await?;
+    let project_of: HashMap<&str, &str> = mapped.iter().copied().zip(ids.iter().map(|(_, project_id)| project_id.as_str())).collect();
     let translate_options = TranslateOptions {
         agent: options.agent.clone().unwrap_or_else(|| MIGRATED_AGENT.to_owned()),
-        project_map: options.project_map.clone(),
+        project_map: options
+            .project_map
+            .iter()
+            .map(|(name, root)| MappedProject { name: name.clone(), root: root.clone(), project_id: project_of[root.as_str()].to_owned() })
+            .collect(),
     };
     let now = TimestampMs::now().as_millis_i64();
     // Masking and splitting thousands of notes is work the daemon's other
@@ -616,7 +680,7 @@ pub async fn import_foreign(
     let (prepared, notes, foreign) = tokio::task::spawn_blocking(move || {
         let Translated { parsed, notes, report } = translate(&export, &translate_options, &chunker, now);
         let secret: HashSet<i64> = notes.iter().filter(|n| n.masked).flat_map(|n| n.rows.clone()).collect();
-        (prepare(parsed, &ImportOptions::default(), Texts::Masked(&secret)), notes, report)
+        (prepare(parsed, &roots, &ids, &ImportOptions::default(), Texts::Masked(&secret)), notes, report)
     })
     .await
     .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
@@ -813,7 +877,7 @@ mod tests {
     use crate::memory::portability::foreign::ForeignNote;
     use crate::memory::portability::format::tests::EXAMPLE;
     use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note};
-    use crate::memory::portability::translate::{TakenKey, TakenProject};
+    use crate::memory::portability::translate::{ProjectCount, TakenKey, TakenProject};
     use crate::memory::search::{search_all_memories, SearchScope};
     use crate::memory::worker::save_for_test;
     use crate::models::chat::Role;
@@ -1172,7 +1236,7 @@ mod tests {
         let elsewhere = "/elsewhere/repo";
         let options = ImportOptions { map_roots: vec![(ROOT.into(), elsewhere.into())], ..Default::default() };
         let (report, _) = run(&dst, &file, options).await;
-        let moved = derive_project_id(Path::new(elsewhere));
+        let moved = crate::memory::identity::derive_project_id(Path::new(elsewhere));
         assert_eq!(report.by_project.get(&moved), Some(&13));
         let roots = dst
             .conn
@@ -1187,7 +1251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_project_id_of_another_root_is_reported_and_skipped() {
+    async fn an_import_gives_a_colliding_root_its_own_id() {
         let file = seeded_file().await;
         let dst = destination().await;
         let id = project();
@@ -1196,9 +1260,34 @@ mod tests {
             .await
             .unwrap();
         let (report, _) = run(&dst, &file, ImportOptions::default()).await;
-        assert_eq!(report.inserted, 4, "the rows without a project and the other project's");
-        assert_eq!(report.invalid.len(), 13);
-        assert!(report.invalid[0].reason.contains("already belongs to /not/the/repo"), "{:?}", report.invalid[0]);
+        assert!(report.invalid.is_empty(), "{:?}", report.invalid);
+        let own = crate::memory::identity::candidate_id(Path::new(ROOT), 1);
+        assert_eq!(report.by_project.get(&own), Some(&13));
+        assert_eq!(report.by_project.get(&project()), None, "nothing goes to the other root's project");
+    }
+
+    #[tokio::test]
+    async fn an_import_into_a_clone_goes_to_the_project_of_its_remote() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        dst.conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 0);
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 0);",
+                )
+            })
+            .await
+            .unwrap();
+        let clone = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(clone.path().join(".git")).unwrap();
+        std::fs::write(clone.path().join(".git").join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
+        let here = clone.path().to_string_lossy().into_owned();
+        let options = ImportOptions { map_roots: vec![(ROOT.into(), here)], ..Default::default() };
+
+        let (report, _) = run(&dst, &file, options).await;
+
+        assert_eq!(report.by_project.get("app-1a2b"), Some(&13), "{:?}", report.by_project);
     }
 
     #[tokio::test]
@@ -1373,7 +1462,8 @@ mod tests {
     async fn a_key_held_here_supersedes_the_imported_note() {
         let root = "/work/notes";
         let dst = destination().await;
-        let holder = insert_row(&dst, "claude-code", Some(derive_project_id(Path::new(root))), "Storage engine: DuckDB", Some("storage/engine"), 5).await;
+        let here = crate::memory::identity::derive_project_id(Path::new(root));
+        let holder = insert_row(&dst, "claude-code", Some(here), "Storage engine: DuckDB", Some("storage/engine"), 5).await;
         let long = ForeignNote {
             project: Some("a".into()),
             topic_key: Some("storage/engine".into()),
@@ -1400,10 +1490,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mapped_root_of_another_project_is_reported_and_skipped() {
+    async fn a_mapped_root_whose_id_is_taken_gets_its_own() {
         let root = "/work/notes";
         let dst = destination().await;
-        let id = derive_project_id(Path::new(root));
+        let id = crate::memory::identity::derive_project_id(Path::new(root));
         dst.conn
             .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/not/the/notes', 0)", [id]))
             .await
@@ -1413,15 +1503,77 @@ mod tests {
         let options = ImportOptions { project_map: vec![("a".into(), root.into())], ..Default::default() };
         let (report, _) = run_foreign(&dst, notes, options).await;
 
-        assert_eq!(report.inserted, 1, "{report:#?}");
-        assert_eq!(imported(&dst, "engram:loose").await.len(), 1);
-        assert!(imported(&dst, "engram:a1").await.is_empty() && imported(&dst, "engram:a2").await.is_empty());
+        let own = crate::memory::identity::candidate_id(Path::new(root), 1);
+        assert_eq!(report.by_project, BTreeMap::from([(String::new(), 1), (own.clone(), 2)]), "{report:#?}");
         let foreign = report.foreign.clone().unwrap();
-        assert_eq!(
-            foreign.taken_projects,
-            vec![TakenProject { project: "a".into(), root: root.into(), belongs_to: "/not/the/notes".into(), notes: 2 }]
-        );
-        assert!(report.invalid.is_empty() && foreign.left_out.is_empty(), "{report:#?}");
+        let in_project: Vec<Option<&str>> = foreign.by_source_project.iter().map(|p| p.project_id.as_deref()).collect();
+        assert_eq!(in_project, vec![None, Some(own.as_str())], "the report names the project the notes went to");
+        assert!(foreign.taken_projects.is_empty() && foreign.left_out.is_empty(), "{report:#?}");
+    }
+
+    #[tokio::test]
+    async fn notes_mapped_to_clones_of_one_remote_share_its_project() {
+        let dst = destination().await;
+        dst.conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 0);
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 0);",
+                )
+            })
+            .await
+            .unwrap();
+        let clone = || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+            std::fs::write(dir.path().join(".git").join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
+            dir
+        };
+        let (one, two) = (clone(), clone());
+        let root = |dir: &tempfile::TempDir| dir.path().to_string_lossy().into_owned();
+        let keyed = |origin: &str, project: &str, content: &str| ForeignNote {
+            project: Some(project.into()),
+            topic_key: Some("sdd/x".into()),
+            ..foreign_note(origin, "Proposal", content)
+        };
+        let notes = vec![keyed("engram:a", "a", "the proposal of a"), keyed("engram:b", "b", "the proposal of b")];
+        let options = ImportOptions { project_map: vec![("a".into(), root(&one)), ("b".into(), root(&two))], ..Default::default() };
+        let (report, _) = run_foreign(&dst, notes, options).await;
+
+        assert_eq!(report.by_project, BTreeMap::from([("app-1a2b".to_string(), 2)]), "{report:#?}");
+        assert_eq!(report.by_state, BTreeMap::from([("live".to_string(), 2)]), "each key qualified by its project of the source");
+        let foreign = report.foreign.clone().unwrap();
+        let qualified: Vec<&str> = foreign.qualified_keys.iter().map(|k| k.to.as_str()).collect();
+        assert_eq!(qualified, vec!["a/sdd/x", "b/sdd/x"]);
+    }
+
+    #[test]
+    fn a_project_taken_while_importing_is_told_by_its_notes() {
+        let (id, root, other) = ("notes-1a2b", "/work/notes", "/not/the/notes");
+        let notes = vec![
+            NoteRows { origin: "engram:a1".into(), project_id: Some(id.into()), rows: 1..2, masked: false },
+            NoteRows { origin: "engram:a2".into(), project_id: Some(id.into()), rows: 2..3, masked: false },
+        ];
+        let ledger = Ledger { taken: HashMap::from([(id.to_string(), other.to_string())]), ..Default::default() };
+        let invalid = |line| Invalid { line, reason: format!("project id {id} already belongs to {other}") };
+        let report = ImportReport { invalid: vec![invalid(1), invalid(2)], ..Default::default() };
+        let foreign = ForeignReport {
+            by_source_project: vec![ProjectCount {
+                project: Some("a".into()),
+                personal: false,
+                root: Some(root.into()),
+                project_id: Some(id.into()),
+                notes: 2,
+            }],
+            ..Default::default()
+        };
+
+        let told = with_foreign(report, foreign, &notes, &ledger);
+
+        let foreign = told.foreign.unwrap();
+        let taken = TakenProject { project: "a".into(), root: root.into(), belongs_to: other.into(), notes: 2 };
+        assert_eq!(foreign.taken_projects, vec![taken]);
+        assert!(told.invalid.is_empty() && foreign.left_out.is_empty(), "told by project, not by note: {foreign:#?}");
     }
 
     #[tokio::test]

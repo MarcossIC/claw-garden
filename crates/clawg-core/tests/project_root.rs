@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clawg_core::memory::identity::{resolve_project_root, strip_verbatim};
+use clawg_core::memory::identity::{origin_key, resolve_project_root, strip_verbatim};
 use clawg_core::memory::{derive_project_id, ProjectIdentity};
 
 /// A temporary directory by its canonical name, so expected roots compare
@@ -123,4 +123,60 @@ fn windows_spellings_of_one_directory_share_a_root() {
         assert_eq!(root, repo, "{}", spelling.display());
         assert!(!root.to_string_lossy().starts_with(r"\\?\"));
     }
+}
+
+fn with_origin(git_dir: &Path, url: &str) {
+    fs::create_dir_all(git_dir).expect("create git dir");
+    fs::write(git_dir.join("config"), format!("[core]\n\tbare = false\n[remote \"origin\"]\n\turl = {url}\n"))
+        .expect("write config");
+}
+
+#[test]
+fn two_clones_of_one_remote_have_one_key() {
+    let (_tmp, base) = canonical_tempdir();
+    let (work, review, fork) = (base.join("work").join("app"), base.join("review").join("app"), base.join("fork").join("app"));
+    with_origin(&work.join(".git"), "https://github.com/Acme/App.git");
+    with_origin(&review.join(".git"), "git@github.com:acme/app.git");
+    with_origin(&fork.join(".git"), "git@github.com:me/app.git");
+
+    assert_eq!(origin_key(&work).as_deref(), Some("github.com/acme/app"));
+    assert_eq!(origin_key(&work), origin_key(&review));
+    assert_ne!(origin_key(&work), origin_key(&fork));
+}
+
+#[test]
+fn the_key_of_a_worktree_and_of_a_submodule() {
+    let (_tmp, base) = canonical_tempdir();
+    let repo = base.join("repo");
+    with_origin(&repo.join(".git"), "https://github.com/acme/repo");
+    let admin = repo.join(".git").join("worktrees").join("wt");
+    fs::create_dir_all(&admin).expect("create worktree admin dir");
+    fs::write(admin.join("commondir"), "../..\n").expect("write commondir");
+    let wt = base.join("wt");
+    fs::create_dir_all(&wt).expect("create worktree");
+    fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).expect("write .git file");
+
+    let module = repo.join(".git").join("modules").join("sub");
+    with_origin(&module, "https://github.com/acme/sub.git");
+    let sub = repo.join("sub");
+    fs::create_dir_all(&sub).expect("create submodule");
+    fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").expect("write .git file");
+
+    assert_eq!(origin_key(&wt).as_deref(), Some("github.com/acme/repo"));
+    assert_eq!(origin_key(&sub).as_deref(), Some("github.com/acme/sub"));
+}
+
+#[test]
+fn a_root_without_origin_has_no_key() {
+    let (_tmp, base) = canonical_tempdir();
+    let bare = base.join("bare");
+    git_repo(&bare);
+    let local = base.join("local");
+    with_origin(&local.join(".git"), "/srv/git/local.git");
+    let plain = base.join("plain");
+    fs::create_dir_all(&plain).expect("create plain dir");
+
+    assert_eq!(origin_key(&bare), None);
+    assert_eq!(origin_key(&local), None);
+    assert_eq!(origin_key(&plain), None);
 }

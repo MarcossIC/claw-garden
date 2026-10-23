@@ -11,6 +11,7 @@ use clawg_core::memory::backup::{parse_snapshot_time, ProbeState, SchemaPlan, St
 use clawg_core::memory::bootstrap::is_pooling_upgrade;
 use clawg_core::memory::db::{EmbeddingIdentity, StoredContract};
 use clawg_core::memory::derive_project_id;
+use clawg_core::memory::identity::is_candidate_for;
 use clawg_core::memory::inspect::{AgentRows, Invariants, OutboxFacts, ProjectRow};
 use clawg_core::memory::store_lock::StoreOwner;
 use clawg_core::paths::Profile;
@@ -561,8 +562,9 @@ pub fn projects(lang: Lang, rows: &[ProjectRow]) -> Vec<Finding> {
     let mut found: Vec<Finding> = rows
         .iter()
         .filter_map(|p| {
-            let derived = derive_project_id(Path::new(&p.root_path));
-            (derived != p.id).then(|| {
+            let root = Path::new(&p.root_path);
+            let derived = derive_project_id(root);
+            (!is_candidate_for(root, &p.id)).then(|| {
                 let message = match lang {
                     Lang::En => format!("the project {} is recorded for a root whose id is {derived}", p.id),
                     Lang::Es => format!("el proyecto {} está registrado para una raíz cuyo id es {derived}", p.id),
@@ -574,8 +576,8 @@ pub fn projects(lang: Lang, rows: &[ProjectRow]) -> Vec<Finding> {
         .collect();
     if found.is_empty() {
         let message = match lang {
-            Lang::En => "every project id matches its root",
-            Lang::Es => "el id de cada proyecto coincide con su raíz",
+            Lang::En => "every project id is one its root may be given",
+            Lang::Es => "el id de cada proyecto es uno que su raíz puede recibir",
         };
         found.push(Finding::ok("projects", message).evidence(json!({ "projects": rows.len() })));
     }
@@ -747,6 +749,7 @@ mod tests {
     use clawg_core::memory::inspect::{
         DanglingRevived, DanglingSuperseded, FailedSave, HashDuplicates, PurgedHeader, TopicVersions,
     };
+    use clawg_core::memory::identity::candidate_id;
     use clawg_core::memory::store_lock::StoreHolder;
 
     const P: Profile = Profile::Dev;
@@ -947,6 +950,13 @@ mod tests {
         let found = projects(L, &[good, bad]);
         assert_eq!(kinds(&found), [("projects", Severity::Warn, "id_mismatch")]);
         assert_eq!(found[0].evidence["project_id"], "proj-0000");
+    }
+
+    #[test]
+    fn a_project_id_assigned_to_its_root_is_ok() {
+        let root = if cfg!(windows) { r"C:\work\proj" } else { "/work/proj" };
+        let assigned = ProjectRow { id: candidate_id(Path::new(root), 3), root_path: root.into() };
+        assert_eq!(kinds(&projects(L, &[assigned])), [("projects", Severity::Ok, "healthy")]);
     }
 
     #[test]
