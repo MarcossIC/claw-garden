@@ -1368,8 +1368,8 @@ mod tests {
         let spanish = State { language: Some(Lang::Es), ..state(None, None, None) };
         let plan_ = plan(&spanish, Mode::Install).unwrap();
         let text = written(&plan_.instructions);
-        assert!(text.contains("Save memories and search in Spanish"), "{text}");
-        assert!(text.contains("Reply to the user in Spanish unless they write in another language"), "{text}");
+        assert!(text.contains("# Protocolo de memoria de Claw Garden"), "{text}");
+        assert!(text.contains("Responde a la persona en español salvo que escriba en otro idioma"), "{text}");
         assert_eq!(text, format!("{}\n", block("\n", Some(Lang::Es))));
         assert_ne!(block("\n", Some(Lang::Es)), block("\n", None));
     }

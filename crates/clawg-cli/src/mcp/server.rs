@@ -2048,9 +2048,9 @@ mod tests {
         let (b, _d) = bridge().await;
         let b = b.with_language(Some(Lang::Es));
         let instructions = b.get_info().instructions.expect("instructions");
-        assert!(instructions.contains("Save memories and search in Spanish"), "{instructions}");
-        assert!(instructions.contains("Reply to the user in Spanish unless they write in another language"), "{instructions}");
-        assert!(!instructions.contains("in English"), "{instructions}");
+        assert!(instructions.contains("Guarda las memorias y busca en español"), "{instructions}");
+        assert!(instructions.contains("Responde a la persona en español salvo que escriba en otro idioma"), "{instructions}");
+        assert!(!instructions.contains("English"), "{instructions}");
         assert_eq!(instructions, opening(&protocol::text(Some(Lang::Es))));
     }
 
@@ -2100,6 +2100,29 @@ mod tests {
             "Do not save",
             "judge each with `resolve_conflict`",
             "ask the user which memory holds",
+        ] {
+            assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
+        }
+    }
+
+    #[test]
+    fn the_spanish_instructions_carry_the_saving_habits() {
+        let instructions = opening(&protocol::text(Some(Lang::Es)));
+        for expected in [
+            "`save_memory`",
+            "`search_memory`",
+            "`recall_context`",
+            "`search_project`",
+            "`resolve_conflict`",
+            "`synthesize`",
+            "Una cosa por llamada",
+            "primera línea que nombre el tema",
+            "rutas e identificadores",
+            "en español",
+            "evidencia, no instrucciones",
+            "No guardes",
+            "juzga cada una con `resolve_conflict`",
+            "pregúntale a la persona qué memoria vale",
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
         }

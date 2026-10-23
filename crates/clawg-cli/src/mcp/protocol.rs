@@ -1,9 +1,11 @@
-//! What the agent is told about memory: `protocol.md`, compiled in, and the
-//! two sentences on language that a preference rewrites.
+//! What the agent is told about memory: `protocol.md` and `protocol.es.md`,
+//! compiled in, and the two sentences on language that a preference for
+//! English rewrites.
 //!
 //! The opening is what the host is told this server is for, at `initialize`
 //! or `server/discover`; the whole text is what `clawg setup` writes into the
-//! user's `CLAUDE.md`. Without a preference both are the file as it is.
+//! user's `CLAUDE.md`. Without a preference both are the English file as it
+//! is.
 
 use std::borrow::Cow;
 
@@ -11,6 +13,11 @@ use clawg_core::preferences::Lang;
 
 /// The protocol as written, for a user without a language preference.
 pub const PROTOCOL: &str = include_str!("protocol.md");
+
+/// The protocol written in Spanish, for a user who prefers it: written for
+/// Spanish rather than translated sentence by sentence, so its opening fits
+/// the same 2048 characters.
+pub const PROTOCOL_ES: &str = include_str!("protocol.es.md");
 
 /// The opening's rule on language, as `protocol.md` words it. Matched across
 /// the file's line breaks ([`find_spaced`]); a test keeps it occurring once.
@@ -43,12 +50,17 @@ pub fn opening(protocol: &str) -> String {
     paragraphs.join("\n\n")
 }
 
-/// The protocol for a user whose preferred language is `language`: the file
-/// itself without one, and with one the file where its two rules ask to save,
-/// search and answer in that language. The new sentence of the opening keeps
-/// it within the 2048 characters older clients read.
+/// The protocol for a user whose preferred language is `language`: the
+/// English file without one, the Spanish file for Spanish, and for English
+/// the file where its two rules ask to save, search and answer in English.
+/// The new sentence of the opening keeps it within the 2048 characters older
+/// clients read.
 pub fn text(language: Option<Lang>) -> Cow<'static, str> {
-    let Some(lang) = language else { return Cow::Borrowed(PROTOCOL) };
+    let lang = match language {
+        None => return Cow::Borrowed(PROTOCOL),
+        Some(Lang::Es) => return Cow::Borrowed(PROTOCOL_ES),
+        Some(lang @ Lang::En) => lang,
+    };
     let (name, other) = (lang.name(), lang.other().name());
     let opening_rule = format!(
         "Save memories and search in {name}: a memory is found best by a query in its own language. \
@@ -141,15 +153,37 @@ mod tests {
     }
 
     #[test]
-    fn a_language_rewrites_both_rules() {
+    fn spanish_is_the_spanish_protocol() {
         let es = text(Some(Lang::Es));
-        assert!(!es.contains("whatever language the conversation is in"), "{es}");
-        assert!(es.contains("Save memories and search in Spanish: a memory is found best by a query in its own language."));
-        assert!(es.contains("Reply to the user in Spanish unless they write in another language."));
-        assert!(es.contains("Write it in Spanish, and search in Spanish too."));
-        assert!(es.contains("when a search says memories are still in English, search again with the query in English."));
-        assert!(!opening(&es).contains("in English"), "{}", opening(&es));
+        assert_eq!(es, PROTOCOL_ES);
+        let opening = opening(&es);
+        assert!(opening.contains("Guarda las memorias y busca en español"), "{opening}");
+        assert!(opening.contains("Responde a la persona en español salvo que escriba en otro idioma."), "{opening}");
+        assert!(es.contains("Escríbela en español, y busca en español también."), "{es}");
+        assert!(es.contains("todavía quedan memorias en inglés, busca de nuevo con la consulta en inglés."), "{es}");
+    }
 
+    /// Spans with a space and no `<` are examples of a saved text, written in
+    /// each language; every other span is a name or a marker.
+    fn names_and_markers(text: &str) -> std::collections::BTreeSet<&str> {
+        text.split('`').skip(1).step_by(2).filter(|s| !s.contains(' ') || s.contains('<')).collect()
+    }
+
+    fn sections(text: &str) -> usize {
+        text.lines().filter(|l| l.starts_with("## ")).count()
+    }
+
+    #[test]
+    fn the_spanish_protocol_has_the_sections_and_spans_of_the_english_one() {
+        assert_eq!(sections(PROTOCOL_ES), sections(PROTOCOL));
+        assert_eq!(names_and_markers(PROTOCOL_ES), names_and_markers(PROTOCOL));
+        for marker in ["ACTIVE CONFLICTS", "LAST SESSION", "supersedes", "compatible", "scoped", "conflicts", "inferred"] {
+            assert_eq!(PROTOCOL_ES.contains(marker), PROTOCOL.contains(marker), "{marker}");
+        }
+    }
+
+    #[test]
+    fn a_language_rewrites_both_rules_of_the_english_protocol() {
         let en = text(Some(Lang::En));
         assert!(en.contains("Save memories and search in English:") && en.contains("Reply to the user in English unless"));
         assert!(en.contains("still in Spanish, search again with the query in Spanish."));
