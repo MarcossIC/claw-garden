@@ -160,7 +160,7 @@ Una nota cuyo origen tiene en el store una fila con su misma fecha del texto (`c
 
 ## HI12. Una nota que la fuente reescribió
 
-Una nota cuyo origen tiene filas no borradas, ninguna con su fecha del texto, MUST entrar como una revisión de la versión guardada más nueva: en el proyecto donde está, con la clave que tiene (la suya si no tiene). Si su fecha es más nueva, MUST entrar viva y dejar las filas vivas guardadas de su origen `superseded` por su primera fila, con causa `revision`, en la misma transacción, salvo las que comparte por ser del mismo texto. Si es más vieja, MUST entrar `superseded` por la primera fila viva guardada de su origen, con causa `revision`, o, sin filas vivas, con las reglas de siempre en ese proyecto. Una nota borrada en la fuente cuyo origen tiene filas MUST NOT cambiar nada y MUST reportarse.
+Una nota cuyo origen tiene filas no borradas, ninguna con su fecha del texto, MUST entrar como una revisión de la versión guardada más nueva: en el proyecto donde está, con la clave que tiene (la suya si no tiene). Si su fecha es más nueva, MUST entrar viva y dejar las filas vivas guardadas de su origen `superseded` por su primera fila, con causa `revision`, en la misma transacción, salvo las que comparte por ser del mismo texto. Si es más vieja, MUST entrar `superseded` por la primera fila viva guardada de su origen, con causa `revision`, o, sin filas vivas, con las reglas de siempre en ese proyecto. Una nota borrada en la fuente cuyo origen tiene filas MUST NOT cambiar nada, y MUST reportarse cuando alguna de esas filas no está borrada.
 
 #### Escenario: reescrita
 - GIVEN una nota importada, y el mismo origen con otro texto y una fecha posterior
@@ -171,7 +171,7 @@ Una nota cuyo origen tiene filas no borradas, ninguna con su fecha del texto, MU
 
 ## HI13. Escritura por nota
 
-Las filas de una nota, y lo que su revisión reemplaza, MUST escribirse en una sola transacción: las transacciones del import MUST cerrarse sólo entre dos notas. Los vínculos de piezas de una nota MUST escribirse salvo que una fila de su origen ya tenga uno; una fila fundida con otra nota MAY ser pieza de las dos, como la comparten dos saves.
+Las filas de una nota, y lo que su revisión reemplaza, MUST escribirse en una sola transacción: las transacciones del import MUST cerrarse sólo entre dos notas. Los vínculos de piezas de una nota MUST escribirse salvo que una de sus filas que es de su origen ya tenga uno, o que el texto de una de sus piezas ya no esté; una fila fundida con otra nota, o compartida con la versión que una revisión reemplaza, MAY ser pieza de las dos, como la comparten dos saves.
 
 **Tests:** `write_batches_never_split_a_note` (`import.rs`, puro); `links_lost_between_transactions_are_filled_by_importing_again` (`import.rs`, con una nota de otra fuente).
 

@@ -35,12 +35,12 @@ El origen va en `created_by_ref`, que el export de 43 ya lleva, y V23 lo indexa 
 | Lo que hay de su origen | Decisión |
 |---|---|
 | Nada | Nueva: las reglas de 43 en su destino |
-| Una fila con su fecha, o la fecha se acotó y hay alguna | Presente: cada fila va a la fila de su origen con su hash, o, si se fundió con otra nota, a la que le da `TWIN_SQL` |
+| Una fila con su fecha, o la fecha se acotó y hay alguna | Presente: cada fila va a la fila de su origen con su hash, o, si se fundió con otra nota, a la que le da `TWIN_SQL`, o a ninguna si su texto ya no está (una pieza purgada) |
 | Sólo filas borradas | Presente (el usuario la borró) |
-| Filas no borradas con otras fechas, y la nota borrada en la fuente | Presente, reportada |
+| Filas no borradas con otras fechas, y la nota borrada en la fuente | Presente |
 | Filas no borradas con otras fechas | Revisión de la más nueva: en su proyecto y con su clave; más nueva, viva y reemplaza a las vivas del origen que no comparte; más vieja, reemplazada por la primera viva |
 
-Para una revisión, la búsqueda del titular de la clave deja fuera las filas de su propio origen, que la revisión reemplaza en vez de ser reemplazada por ellas.
+Una nota borrada en la fuente que queda presente con alguna fila no borrada se reporta, tenga o no su fecha: la fuente la borró y acá sigue. Para una revisión, la búsqueda del titular de la clave deja fuera las filas de su propio origen, que la revisión reemplaza en vez de ser reemplazada por ellas. Un registro que le dio a otra raíz el id planeado deja afuera sólo las notas nuevas: una presente o una revisión va adonde ya están sus filas.
 
 | Alternativa | Por qué no |
 |---|---|
@@ -53,7 +53,7 @@ Para una revisión, la búsqueda del titular de la clave deja fuera las filas de
 
 El pase que escribe junta notas enteras hasta llegar a `WRITE_BATCH` filas (`note_batches`, pura), y cada lote es una transacción: una nota y lo que su revisión reemplaza nunca quedan partidos entre dos. Un corte entre lotes deja notas enteras, que el import siguiente reconoce como presentes. Los vínculos siguen en la última transacción, como en 43; si falta, el import siguiente los completa, porque una nota presente lleva sus filas a las de su origen.
 
-Los vínculos de piezas de una nota se escriben salvo que una fila de su origen ya tenga uno. La regla de 43 («ninguna de sus filas tiene una pieza») dejaría sin piezas a una nota que comparte una pieza con otra, cuando el worker deja que una fila sea pieza de dos saves.
+Los vínculos de piezas de una nota se escriben salvo que una de sus filas que es de su origen ya tenga uno, o que una de sus piezas no esté. La regla de 43 («ninguna de sus filas tiene una pieza») dejaría sin piezas a una nota que comparte una pieza con otra, o a una revisión que comparte piezas con la versión que reemplaza, cuando el worker deja que una fila sea pieza de dos saves. Para un archivo de clawg sigue la regla de 43.
 
 ## D5. Claves
 
