@@ -14,6 +14,26 @@ pub fn derive_project_id(project_path: &Path) -> String {
     format!("{}-{}", name, h)
 }
 
+/// How many ids a root may be given: [`candidate_id`] for `n` below this.
+pub const CANDIDATES: u32 = 64;
+
+/// The `n`th id a root may be given when the ones before belong to other
+/// roots: [`derive_project_id`] for 0, and the same format with `#n` after
+/// the path's bytes for the rest.
+pub fn candidate_id(root: &Path, n: u32) -> String {
+    if n == 0 {
+        return derive_project_id(root);
+    }
+    let mut bytes = root.as_os_str().as_encoded_bytes().to_vec();
+    bytes.extend_from_slice(format!("#{n}").as_bytes());
+    format!("{}-{}", basename(root), hash4(&bytes))
+}
+
+/// Whether `id` is one of the ids [`candidate_id`] gives `root`.
+pub fn is_candidate_for(root: &Path, id: &str) -> bool {
+    (0..CANDIDATES).any(|n| candidate_id(root, n) == id)
+}
+
 /// A project as the store keys it: the root every path inside it resolves to,
 /// the id derived from that root, and the id the same path had before paths
 /// were resolved, which rows saved back then still carry.
@@ -435,5 +455,16 @@ mod tests {
         assert_eq!(git_config_dir(dir, &worktree), PathBuf::from("/w/repo/.git"));
         let submodule = GitMarker::Link { gitdir: PathBuf::from("/w/repo/.git/modules/sub"), commondir: None };
         assert_eq!(git_config_dir(dir, &submodule), PathBuf::from("/w/repo/.git/modules/sub"));
+    }
+
+    #[test]
+    fn the_candidates_of_a_root_keep_its_name_and_start_with_its_id() {
+        let root = Path::new("/work/my-app");
+        assert_eq!(candidate_id(root, 0), derive_project_id(root));
+        let ids: std::collections::HashSet<String> = (0..CANDIDATES).map(|n| candidate_id(root, n)).collect();
+        assert!(ids.len() > 60, "{ids:?}");
+        assert!(ids.iter().all(|id| id.starts_with("my-app-") && id.len() == "my-app-".len() + 4));
+        assert!(is_candidate_for(root, &candidate_id(root, 7)));
+        assert!(!is_candidate_for(root, "my-app-zzzz"));
     }
 }

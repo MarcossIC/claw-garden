@@ -82,6 +82,10 @@ pub struct MoveReport {
     pub protected: usize,
     /// The `pre-move` snapshot taken before writing.
     pub snapshot: Option<String>,
+    /// What joining two projects superseded, each row with the one that
+    /// stays live in its place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<Supersede>,
 }
 
 impl MoveReport {
@@ -637,6 +641,13 @@ pub async fn undo_move_core(
         if !known {
             return Err(MoveError::UnknownMove(move_id));
         }
+        c.execute(
+            "UPDATE memory SET status = s.from_status, superseded_by = s.from_superseded_by, \
+             supersede_cause = s.from_cause FROM memory_move_supersede AS s \
+             WHERE s.move_id = ?1 AND s.row_id = memory.id \
+               AND memory.status = 'superseded' AND memory.superseded_by = s.superseded_by",
+            [move_id],
+        )?;
         let back: Vec<(i64, Option<String>)> = {
             let mut stmt = c.prepare(
                 "SELECT m.row_id, m.from_project FROM memory_move m JOIN memory r ON r.id = m.row_id \
@@ -659,6 +670,238 @@ pub async fn undo_move_core(
         Ok(report)
     })
     .await
+}
+
+/// A row joining two projects leaves superseded by `by`, which holds its key
+/// or its text in the joined project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Supersede {
+    pub row: i64,
+    pub by: i64,
+}
+
+/// [`decide`] for joining the projects `origins` into `target`: a clash is
+/// no refusal, since [`reconcile`] settles it after the move, and a unit may
+/// already have rows in the target, which stay. A unit with a row anywhere
+/// else is left where it is.
+pub(crate) fn decide_merge(units: &[Unit], origins: &[String], target: &str) -> MoveReport {
+    let mut report = MoveReport::default();
+    for unit in units {
+        let first = unit.selected.first().copied().unwrap_or_default();
+        let elsewhere = unit
+            .rows
+            .iter()
+            .any(|r| r.project_id.as_deref() != Some(target) && !r.project_id.as_ref().is_some_and(|p| origins.contains(p)));
+        if elsewhere {
+            report.skipped.push(Skipped { id: first, refusal: Refusal::SpansProjects });
+            continue;
+        }
+        let mut moved_any = false;
+        for r in unit.rows.iter().filter(|r| r.project_id.as_deref() != Some(target)) {
+            moved_any = true;
+            let protected = (r.live && MemoryType::is_protected_name(&r.memory_type)).then(|| r.memory_type.clone());
+            report.protected += usize::from(protected.is_some());
+            report.moved.push(MovedRow {
+                id: r.id,
+                from_project: r.project_id.clone(),
+                to_project: Some(target.to_string()),
+                from_scope: r.scope.clone(),
+                to_scope: scope_after(r.agent_id.as_deref(), &r.scope, Some(target)),
+                protected,
+            });
+            if !unit.selected.contains(&r.id) {
+                report.pulled_in.push(r.id);
+            }
+        }
+        if !moved_any {
+            report.unchanged.extend(&unit.selected);
+        }
+    }
+    report
+}
+
+/// A live row of a joined project, as [`reconcile`] reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LiveRow {
+    pub id: i64,
+    pub created_at: i64,
+    pub topic_key: Option<String>,
+    pub content_hash: Option<String>,
+    /// The save it is a piece of (the lowest when several), or none.
+    pub save: Option<i64>,
+    /// The first row of that save, or the row itself.
+    pub head: i64,
+    /// How many live rows that save has; 1 without a save.
+    pub save_live: usize,
+    /// A piece of a save whose first row is live without this row's key:
+    /// superseding it would cut a hole in that save.
+    pub foreign_piece: bool,
+    /// Joining moved it here.
+    pub moved: bool,
+}
+
+impl LiveRow {
+    fn save_key(&self) -> i64 {
+        self.save.unwrap_or(-self.id)
+    }
+}
+
+/// What joining leaves live in a project, from its live rows in the groups a
+/// moved row touches: of the saves under one key, the one with the newest
+/// row, as a new save under the key would; then, of the rows of one text, the
+/// oldest, as the dedup keeps it. A row of a save with several live rows is
+/// replaced for its text only when all of them are, so no save is cut.
+pub(crate) fn reconcile(rows: &[LiveRow]) -> Vec<Supersede> {
+    fn age(r: &&&LiveRow) -> (i64, i64) {
+        (r.created_at, r.id)
+    }
+    let mut out: Vec<Supersede> = Vec::new();
+    let mut keys: BTreeMap<&str, Vec<&LiveRow>> = BTreeMap::new();
+    for r in rows {
+        if let Some(k) = &r.topic_key {
+            keys.entry(k).or_default().push(r);
+        }
+    }
+    for group in keys.values() {
+        let saves: BTreeSet<i64> = group.iter().map(|r| r.save_key()).collect();
+        if saves.len() < 2 || !group.iter().any(|r| r.moved) {
+            continue;
+        }
+        let Some(winner) = group.iter().max_by_key(age) else {
+            continue;
+        };
+        for r in group.iter().filter(|r| r.save_key() != winner.save_key() && !r.foreign_piece) {
+            out.push(Supersede { row: r.id, by: winner.head });
+        }
+    }
+    let gone: HashSet<i64> = out.iter().map(|s| s.row).collect();
+    let mut texts: BTreeMap<&str, Vec<&LiveRow>> = BTreeMap::new();
+    for r in rows.iter().filter(|r| !gone.contains(&r.id)) {
+        if let Some(h) = &r.content_hash {
+            texts.entry(h).or_default().push(r);
+        }
+    }
+    let mut candidates: Vec<(&LiveRow, i64)> = Vec::new();
+    for group in texts.values() {
+        if group.len() < 2 || !group.iter().any(|r| r.moved) {
+            continue;
+        }
+        let Some(keeper) = group.iter().min_by_key(age) else {
+            continue;
+        };
+        candidates.extend(group.iter().filter(|r| r.save_key() != keeper.save_key()).map(|r| (*r, keeper.id)));
+    }
+    let mut per_save: HashMap<i64, usize> = HashMap::new();
+    for (r, _) in &candidates {
+        *per_save.entry(r.save_key()).or_default() += 1;
+    }
+    out.extend(
+        candidates
+            .into_iter()
+            .filter(|(r, _)| per_save[&r.save_key()] >= r.save_live)
+            .map(|(r, by)| Supersede { row: r.id, by }),
+    );
+    out.sort_by_key(|s| s.row);
+    out
+}
+
+/// The live rows of `target` that share a key or a text with a live row of
+/// `moved`, as [`reconcile`] reads them.
+fn live_rows_in(c: &Connection, target: &str, moved: &HashSet<i64>) -> rusqlite::Result<Vec<LiveRow>> {
+    const LIVE: &str = "deleted_at IS NULL AND status IN ('active', 'disputed')";
+    let ids = serde_json::to_string(&moved.iter().collect::<Vec<_>>()).unwrap_or_default();
+    let mut stmt = c.prepare(&format!(
+        "WITH m AS (SELECT topic_key, content_hash FROM memory \
+                    WHERE id IN (SELECT value FROM json_each(?2)) AND {LIVE}) \
+         SELECT r.id, r.created_at, r.topic_key, r.content_hash, \
+                (SELECT MIN(save_id) FROM memory_piece WHERE memory_id = r.id) \
+         FROM memory r WHERE r.project_id = ?1 AND {LIVE} \
+           AND (r.topic_key IN (SELECT topic_key FROM m) OR r.content_hash IN (SELECT content_hash FROM m)) \
+         ORDER BY r.id"
+    ))?;
+    let found = stmt
+        .query_map(rusqlite::params![target, ids], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, Option<i64>>(4)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut head = c.prepare_cached("SELECT memory_id FROM memory_piece WHERE save_id = ?1 AND piece = 1")?;
+    let mut live_pieces = c.prepare_cached(
+        "SELECT COUNT(*) FROM memory_piece p JOIN memory m ON m.id = p.memory_id \
+         WHERE p.save_id = ?1 AND m.deleted_at IS NULL AND m.status IN ('active', 'disputed')",
+    )?;
+    let mut foreign = c.prepare_cached(&format!(
+        "SELECT EXISTS (SELECT 1 FROM memory WHERE id = ?1 AND id != ?2 AND topic_key IS NOT ?3 AND {LIVE})"
+    ))?;
+    let mut rows = Vec::new();
+    for (id, created_at, topic_key, content_hash, save) in found {
+        let (head_id, save_live) = match save {
+            Some(save) => (
+                head.query_row([save], |r| r.get(0)).optional()?.unwrap_or(id),
+                live_pieces.query_row([save], |r| r.get::<_, i64>(0))? as usize,
+            ),
+            None => (id, 1),
+        };
+        let foreign_piece: bool = topic_key.is_some()
+            && foreign.query_row(rusqlite::params![head_id, id, topic_key], |r| r.get(0))?;
+        rows.push(LiveRow {
+            id,
+            created_at,
+            topic_key,
+            content_hash,
+            save,
+            head: head_id,
+            save_live: save_live.max(1),
+            foreign_piece,
+            moved: moved.contains(&id),
+        });
+    }
+    Ok(rows)
+}
+
+/// Writes what [`reconcile`] decided as part of move `move_id`, each row with
+/// the state it had, so [`undo_move_core`] can give it back.
+fn supersede_in(c: &Connection, move_id: i64, supersedes: &[Supersede]) -> rusqlite::Result<()> {
+    let mut log = c.prepare_cached(
+        "INSERT INTO memory_move_supersede \
+         (move_id, row_id, superseded_by, from_status, from_superseded_by, from_cause) \
+         SELECT ?1, id, ?3, status, superseded_by, supersede_cause FROM memory WHERE id = ?2",
+    )?;
+    let mut write = c.prepare_cached(
+        "UPDATE memory SET status = 'superseded', superseded_by = ?2, supersede_cause = 'revision' WHERE id = ?1",
+    )?;
+    for s in supersedes {
+        log.execute(rusqlite::params![move_id, s.row, s.by])?;
+        write.execute(rusqlite::params![s.row, s.by])?;
+    }
+    Ok(())
+}
+
+/// Joins the projects `origins` into `target` inside the caller's
+/// transaction: every row of theirs, deleted ones too, moves with its unit as
+/// one logged move, and then the target keeps one live row per key and per
+/// text that a moved row touches (see [`reconcile`]). Nothing but `project_id`,
+/// `scope`, and the state of the rows replaced, changes.
+pub(crate) fn merge_in(c: &Connection, origins: &[String], target: &str, now: TimestampMs) -> rusqlite::Result<MoveReport> {
+    let seeds: Vec<(i64, Option<String>)> = {
+        let ids = serde_json::to_string(origins).unwrap_or_default();
+        let mut stmt = c.prepare(
+            "SELECT id FROM memory WHERE project_id IN (SELECT value FROM json_each(?1)) ORDER BY id",
+        )?;
+        let rows = stmt.query_map([ids], |r| r.get::<_, i64>(0))?;
+        rows.map(|id| id.map(|id| (id, Some(target.to_string())))).collect::<rusqlite::Result<_>>()?
+    };
+    let units = read_units_in(c, &seeds, None)?;
+    let mut report = decide_merge(&units, origins, target);
+    for skipped in &report.skipped {
+        log::warn!("memory #{} stays where it is: {}", skipped.id, skipped.refusal);
+    }
+    report.move_id = apply_in(c, &report, now)?;
+    if let Some(move_id) = report.move_id {
+        let moved: HashSet<i64> = report.moved.iter().map(|m| m.id).collect();
+        report.superseded = reconcile(&live_rows_in(c, target, &moved)?);
+        supersede_in(c, move_id, &report.superseded)?;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1453,5 +1696,190 @@ mod tests {
         let narrowed = MoveFilter { origin_project: Some("A".into()), ..MoveFilter::default() };
         let none = move_to(&store, &narrowed, Some(A)).await;
         assert!(none.moved.is_empty(), "the name is compared whole: {none:?}");
+    }
+
+    // ── joining two projects ────────────────────────────────────────────
+
+    fn live(id: i64, created_at: i64, key: Option<&str>, hash: &str, moved: bool) -> LiveRow {
+        LiveRow {
+            id,
+            created_at,
+            topic_key: key.map(str::to_string),
+            content_hash: Some(hash.into()),
+            save: None,
+            head: id,
+            save_live: 1,
+            foreign_piece: false,
+            moved,
+        }
+    }
+
+    #[test]
+    fn reconcile_keeps_the_newest_save_of_a_key_whichever_side_moved() {
+        let k = Some("storage/engine");
+        for moved_first in [true, false] {
+            let rows = [live(1, 10, k, "h1", moved_first), live(2, 20, k, "h2", !moved_first)];
+            assert_eq!(reconcile(&rows), vec![Supersede { row: 1, by: 2 }]);
+        }
+        let untouched = [live(1, 10, k, "h1", false), live(2, 20, k, "h2", false)];
+        assert_eq!(reconcile(&untouched), vec![], "a clash no moved row is part of stays");
+    }
+
+    #[test]
+    fn reconcile_keeps_the_oldest_row_of_a_text() {
+        let rows = [live(1, 10, None, "same", false), live(2, 5, None, "same", true), live(3, 1, None, "other", true)];
+        assert_eq!(reconcile(&rows), vec![Supersede { row: 1, by: 2 }]);
+    }
+
+    #[test]
+    fn reconcile_replaces_a_piece_only_with_its_whole_save() {
+        let piece = |id, save, hash: &str, moved| LiveRow { save: Some(save), head: save * 10, save_live: 2, ..live(id, 50, None, hash, moved) };
+        let half = [live(1, 1, None, "a", false), piece(70, 7, "a", true), piece(71, 7, "own", true)];
+        assert_eq!(reconcile(&half), vec![], "a save with one piece of its own stays whole");
+
+        let whole = [live(1, 1, None, "a", false), live(2, 1, None, "b", false), piece(70, 7, "a", true), piece(71, 7, "b", true)];
+        assert_eq!(reconcile(&whole), vec![Supersede { row: 70, by: 1 }, Supersede { row: 71, by: 2 }]);
+    }
+
+    #[test]
+    fn reconcile_leaves_a_piece_another_save_holds_and_one_key_per_save() {
+        let k = Some("api/style");
+        let foreign = LiveRow { foreign_piece: true, ..live(1, 1, k, "x", false) };
+        let same_save = |id, created_at| LiveRow { save: Some(9), head: 30, save_live: 2, ..live(id, created_at, k, &format!("p{id}"), true) };
+        let rows = [foreign, live(2, 5, k, "y", false), same_save(30, 10), same_save(31, 10)];
+        assert_eq!(reconcile(&rows), vec![Supersede { row: 2, by: 30 }], "the winner's pieces stay, the foreign piece too");
+    }
+
+    #[test]
+    fn decide_merge_moves_what_is_not_in_the_target_and_stops_at_other_projects() {
+        let origins = vec![A.to_string()];
+        let report = decide_merge(
+            &[
+                unit(vec![row(1, Some(A)), row(2, Some(B))], &[1], Some(B)),
+                unit(vec![row(3, Some(A)), row(4, Some("repo-cccc"))], &[3], Some(B)),
+                unit(vec![row(5, Some(B))], &[5], Some(B)),
+            ],
+            &origins,
+            B,
+        );
+        assert_eq!(moved_ids(&report), vec![1]);
+        assert_eq!(report.skipped, vec![Skipped { id: 3, refusal: Refusal::SpansProjects }]);
+        assert_eq!(report.unchanged, vec![5]);
+    }
+
+    async fn merge(store: &MemoryStore, from: &str, to: &str) -> MoveReport {
+        let (from, to) = (vec![from.to_string()], to.to_string());
+        store
+            .conn
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let report = merge_in(&tx, &from, &to, TimestampMs::now())?;
+                tx.commit()?;
+                Ok::<_, rusqlite::Error>(report)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// `(project_id, status, superseded_by, supersede_cause)` of every row.
+    async fn states(store: &MemoryStore) -> Vec<(i64, Option<String>, String, Option<i64>, Option<String>)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt =
+                    c.prepare("SELECT id, project_id, status, superseded_by, supersede_cause FROM memory ORDER BY id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+                rows.collect()
+            })
+            .await
+            .unwrap()
+    }
+
+    fn at(evt: MemoryEvent, ms: u64) -> MemoryEvent {
+        MemoryEvent { timestamp_ms: ms, ..evt }
+    }
+
+    #[tokio::test]
+    async fn merging_keeps_the_newest_version_of_a_key() {
+        let store = store().await;
+        let theirs = save_one(&store, at(keyed("Storage engine is SQLite", Some(A), "storage/engine"), 20)).await;
+        let ours = save_one(&store, at(keyed("Storage engine is SQLite with WAL", Some(B), "storage/engine"), 10)).await;
+
+        let report = merge(&store, A, B).await;
+
+        assert_eq!(moved_ids(&report), vec![theirs]);
+        assert_eq!(report.superseded, vec![Supersede { row: ours, by: theirs }]);
+        let after = states(&store).await;
+        assert!(after.contains(&(ours, Some(B.into()), "superseded".into(), Some(theirs), Some("revision".into()))), "{after:?}");
+        let deleted = delete_memory_core(&store, theirs, MemoryKind::Memory, None).await.unwrap();
+        assert_eq!(deleted.revived.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ours], "the older version comes back");
+    }
+
+    #[tokio::test]
+    async fn merging_keeps_the_oldest_row_of_a_text() {
+        let store = store().await;
+        let text = "the daemon listens on clawg.sock";
+        let theirs = save_one(&store, at(fact(text, Some(A)), 5)).await;
+        let ours = save_one(&store, at(fact(text, Some(B)), 9)).await;
+        let other = save_one(&store, at(fact("tests run with cargo nextest", Some(A)), 6)).await;
+
+        let report = merge(&store, A, B).await;
+
+        assert_eq!(moved_ids(&report), vec![theirs, other]);
+        assert_eq!(report.superseded, vec![Supersede { row: ours, by: theirs }]);
+        let found = found_from(&store, Some(B), text).await;
+        assert!(found.contains(&theirs) && !found.contains(&ours), "{found:?}");
+    }
+
+    #[tokio::test]
+    async fn merging_does_not_depend_on_which_clone_came_first() {
+        let mut outcomes = Vec::new();
+        for (from, to) in [(A, B), (B, A)] {
+            let store = store().await;
+            let old = save_one(&store, at(keyed("Logs go to serve.log", Some(A), "logging/target"), 10)).await;
+            let new = save_one(&store, at(keyed("Logs go to serve.log, rotated", Some(B), "logging/target"), 20)).await;
+            let first = save_one(&store, at(fact("the socket is clawg.sock", Some(B)), 1)).await;
+            let second = save_one(&store, at(fact("the socket is clawg.sock", Some(A)), 2)).await;
+            merge(&store, from, to).await;
+            let live: Vec<i64> = states(&store).await.into_iter().filter(|r| r.2 == "active").map(|r| r.0).collect();
+            outcomes.push((live, vec![new, first], old, second));
+        }
+        for (live, expected, _, _) in &outcomes {
+            assert_eq!(live, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn merging_a_long_save_twice_keeps_one_whole() {
+        let store = store().await;
+        let text = long_text("tokio");
+        let theirs = save(&store, at(fact(&text, Some(A)), 1)).await;
+        let ours = save(&store, at(fact(&text, Some(B)), 2)).await;
+        assert!(theirs.len() > 1, "{theirs:?}");
+
+        let report = merge(&store, A, B).await;
+
+        let replaced: Vec<i64> = report.superseded.iter().map(|s| s.row).collect();
+        assert_eq!(replaced, ours, "every piece of the newer copy, none of the older");
+    }
+
+    #[tokio::test]
+    async fn undoing_a_merge_restores_every_row_and_state() {
+        let store = store().await;
+        let a_key = save_one(&store, at(keyed("Storage engine is SQLite", Some(A), "storage/engine"), 20)).await;
+        save_one(&store, at(keyed("Storage engine is SQLite with WAL", Some(B), "storage/engine"), 10)).await;
+        save_one(&store, at(fact("the daemon listens on clawg.sock", Some(A)), 5)).await;
+        save_one(&store, at(fact("the daemon listens on clawg.sock", Some(B)), 9)).await;
+        let deleted = save_one(&store, at(fact("an old note", Some(A)), 3)).await;
+        delete_memory_core(&store, deleted, MemoryKind::Memory, None).await.unwrap();
+        let before = (states(&store).await, everything_else(&store).await);
+
+        let report = merge(&store, A, B).await;
+        assert_eq!(report.superseded.len(), 2);
+        assert!(moved_ids(&report).contains(&a_key) && moved_ids(&report).contains(&deleted));
+        let backups = tempfile::tempdir().unwrap();
+        undo_move_core(&store, backups.path(), report.move_id.unwrap(), false).await.unwrap();
+
+        assert_eq!((states(&store).await, everything_else(&store).await), before);
     }
 }

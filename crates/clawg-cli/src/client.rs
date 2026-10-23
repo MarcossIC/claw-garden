@@ -794,6 +794,17 @@ fn map_transport(e: reqwest::Error) -> ClientError {
     classify_transport(e.is_connect(), e.is_timeout(), e.to_string())
 }
 
+/// The ids `POST /v1/projects` gives a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registered {
+    /// Where its memories are read and written.
+    pub project_id: String,
+    /// Its own id, which its docs index uses.
+    pub root_id: String,
+    /// Rows the registration joined into the project.
+    pub rekeyed: usize,
+}
+
 /// A handle on one daemon: its address, its token, and a reusable HTTP client.
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -1303,18 +1314,19 @@ impl DaemonClient {
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/import").json(&body)?).await?)
     }
 
-    /// Records `root` as a project and moves rows saved under `legacy_ids`
-    /// onto it, letting the daemon read its files when `index_docs`. Returns
-    /// the id the daemon derived and how many rows moved.
+    /// Records `root` as a project and joins into its project the rows saved
+    /// under `legacy_ids`, letting the daemon read its files when
+    /// `index_docs`. Returns the ids the daemon gave the root.
     pub async fn register_project(
         &self,
         root: &std::path::Path,
         legacy_ids: &[String],
         index_docs: bool,
-    ) -> Result<(String, usize), ClientError> {
+    ) -> Result<Registered, ClientError> {
         #[derive(Deserialize)]
         struct Body {
             project_id: String,
+            root_id: Option<String>,
             rekeyed: usize,
         }
         let body = serde_json::json!({
@@ -1324,7 +1336,9 @@ impl DaemonClient {
         });
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/projects").json(&body)?).await?;
         let body = read_response::<Body>(answer)?;
-        Ok((body.project_id, body.rekeyed))
+        // A daemon from before assigned ids keeps one id per root.
+        let root_id = body.root_id.unwrap_or_else(|| body.project_id.clone());
+        Ok(Registered { project_id: body.project_id, root_id, rekeyed: body.rekeyed })
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {

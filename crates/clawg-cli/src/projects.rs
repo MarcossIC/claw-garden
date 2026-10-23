@@ -32,7 +32,7 @@ pub async fn add(lang: Lang, client: &DaemonClient, path: &Path) -> Result<Strin
         return Err(AddError::NotADirectory(project.root));
     }
     let legacy: Vec<String> = Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
-    let (id, _) = client.register_project(&project.root, &legacy, true).await?;
+    let id = client.register_project(&project.root, &legacy, true).await?.project_id;
     let root = project.root.display();
     Ok(match lang {
         Lang::En => format!("added {root} as project {id}; the daemon is indexing its files in the background"),
@@ -52,7 +52,7 @@ pub async fn move_memories(lang: Lang, client: &DaemonClient, opts: &MoveOpts, c
             }
             let legacy: Vec<String> =
                 Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
-            Some(client.register_project(&project.root, &legacy, false).await?.0)
+            Some(client.register_project(&project.root, &legacy, false).await?.project_id)
         }
         None => None,
     };
@@ -253,7 +253,7 @@ mod tests {
         let root = ProjectIdentity::resolve(repo.path()).root;
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("README.md"), "# Other\nHow the other project ships.\n").unwrap();
-        let (id, _) = c.register_project(&root, &[], false).await.expect("register as a label");
+        let id = c.register_project(&root, &[], false).await.expect("register as a label").project_id;
         let refused = c.search_docs(&id, "How the other project ships", None).await.expect_err("not accepted");
         assert!(matches!(refused, ClientError::Daemon { status: 403, .. }), "{refused:?}");
 
