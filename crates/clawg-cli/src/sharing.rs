@@ -7,28 +7,32 @@
 use std::path::Path;
 
 use clawg_core::memory::sharing;
+use clawg_core::preferences::Lang;
 
 use crate::cli::SharingAction;
 
 /// Applies `action` (none shows the policy) and returns the policy as it now
-/// stands, one exclusion per line.
-pub fn run(base_dir: &Path, action: Option<&SharingAction>) -> Result<String, String> {
+/// stands, one exclusion per line, in `lang`.
+pub fn run(lang: Lang, base_dir: &Path, action: Option<&SharingAction>) -> Result<String, String> {
     if let Some(SharingAction::Hide(e) | SharingAction::Unhide(e)) = action {
-        e.check()?;
+        e.check(lang)?;
     }
     // An unreadable file is never overwritten: it may be a hand edit halfway
     // done, and replacing it would throw away every exclusion it holds.
     let mut policy = sharing::load(base_dir).map_err(|e| match action {
         None => e.to_string(),
-        Some(_) => format!("{e}; nothing was changed"),
+        Some(_) => match lang {
+            Lang::En => format!("{e}; nothing was changed"),
+            Lang::Es => format!("{e}; no se cambió nada"),
+        },
     })?;
     match action {
-        None => return Ok(policy.render()),
+        None => return Ok(policy.render(lang)),
         Some(SharingAction::Hide(e)) => policy.hide(&e.reader, &e.author),
         Some(SharingAction::Unhide(e)) => policy.unhide(&e.reader, &e.author),
     }
     sharing::save(base_dir, &policy).map_err(|e| e.to_string())?;
-    Ok(policy.render())
+    Ok(policy.render(lang))
 }
 
 #[cfg(test)]
@@ -45,10 +49,10 @@ mod tests {
     fn hide_and_unhide_print_the_policy_they_leave() {
         let dir = tempfile::tempdir().unwrap();
         let everything = "every agent reads every other agent";
-        assert_eq!(run(dir.path(), None).unwrap(), everything);
-        assert_eq!(run(dir.path(), Some(&SharingAction::Hide(exclusion("cursor", "claude-code")))).unwrap(), "cursor does not read claude-code");
-        assert_eq!(run(dir.path(), None).unwrap(), "cursor does not read claude-code");
-        assert_eq!(run(dir.path(), Some(&SharingAction::Unhide(exclusion("cursor", "claude-code")))).unwrap(), everything);
+        assert_eq!(run(Lang::En, dir.path(), None).unwrap(), everything);
+        assert_eq!(run(Lang::En, dir.path(), Some(&SharingAction::Hide(exclusion("cursor", "claude-code")))).unwrap(), "cursor does not read claude-code");
+        assert_eq!(run(Lang::En, dir.path(), None).unwrap(), "cursor does not read claude-code");
+        assert_eq!(run(Lang::En, dir.path(), Some(&SharingAction::Unhide(exclusion("cursor", "claude-code")))).unwrap(), everything);
     }
 
     #[test]
@@ -57,9 +61,9 @@ mod tests {
         let hand_edit = r#"{"version":1,"hides":{"cursor":["claude-code",]}}"#;
         std::fs::write(sharing_file(dir.path()), hand_edit).unwrap();
 
-        let shown = run(dir.path(), None).unwrap_err();
+        let shown = run(Lang::En, dir.path(), None).unwrap_err();
         assert!(shown.contains("sharing.json is not valid"), "{shown}");
-        let refused = run(dir.path(), Some(&SharingAction::Hide(exclusion("codex", "cursor")))).unwrap_err();
+        let refused = run(Lang::En, dir.path(), Some(&SharingAction::Hide(exclusion("codex", "cursor")))).unwrap_err();
         assert!(refused.ends_with("nothing was changed"), "{refused}");
         assert_eq!(std::fs::read_to_string(sharing_file(dir.path())).unwrap(), hand_edit);
     }
@@ -67,13 +71,26 @@ mod tests {
     #[test]
     fn hiding_an_agent_from_itself_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(run(dir.path(), Some(&SharingAction::Hide(exclusion("cursor", "cursor")))).is_err());
+        assert!(run(Lang::En, dir.path(), Some(&SharingAction::Hide(exclusion("cursor", "cursor")))).is_err());
         assert!(!sharing_file(dir.path()).exists());
     }
 
     #[test]
     fn every_agent_on_both_sides_stops_all_sharing() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(run(dir.path(), Some(&SharingAction::Hide(exclusion("*", "*")))).unwrap(), "no agent reads another");
+        assert_eq!(run(Lang::En, dir.path(), Some(&SharingAction::Hide(exclusion("*", "*")))).unwrap(), "no agent reads another");
+    }
+
+    #[test]
+    fn the_sharing_command_speaks_spanish() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(run(Lang::Es, dir.path(), None).unwrap(), "cada agente lee a todos los demás");
+        let hide = SharingAction::Hide(exclusion("cursor", "claude-code"));
+        assert_eq!(run(Lang::Es, dir.path(), Some(&hide)).unwrap(), "cursor no lee a claude-code");
+        let itself = run(Lang::Es, dir.path(), Some(&SharingAction::Hide(exclusion("cursor", "cursor")))).unwrap_err();
+        assert_eq!(itself, "cursor siempre lee sus propias memorias");
+        std::fs::write(sharing_file(dir.path()), "{").unwrap();
+        let refused = run(Lang::Es, dir.path(), Some(&hide)).unwrap_err();
+        assert!(refused.ends_with("; no se cambió nada"), "{refused}");
     }
 }

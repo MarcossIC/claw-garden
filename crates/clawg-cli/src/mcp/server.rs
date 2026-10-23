@@ -80,11 +80,14 @@ pub enum AgentSource {
 
 impl AgentSource {
     /// How `memory_status` explains the origin to the person reading it.
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::Flag => "from --agent",
-            Self::Client => "reported by the client; pin it with --agent",
-            Self::Fallback => "the client did not identify itself; pin one with --agent",
+    pub fn describe(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (Self::Flag, Lang::En) => "from --agent",
+            (Self::Client, Lang::En) => "reported by the client; pin it with --agent",
+            (Self::Fallback, Lang::En) => "the client did not identify itself; pin one with --agent",
+            (Self::Flag, Lang::Es) => "de --agent",
+            (Self::Client, Lang::Es) => "lo informa el cliente; fíjalo con --agent",
+            (Self::Fallback, Lang::Es) => "el cliente no se identificó; fija uno con --agent",
         }
     }
 }
@@ -101,6 +104,27 @@ pub fn resolve_agent(flag: Option<&str>, client: Option<&str>) -> (String, Agent
     match client.filter(|name| !name.trim().is_empty()) {
         Some(name) => (name.to_string(), AgentSource::Client),
         None => (FALLBACK_AGENT_ID.to_string(), AgentSource::Fallback),
+    }
+}
+
+/// Puts `table`'s descriptions on the tools and arguments it names: the
+/// description of each tool, and of each property of its input schema.
+fn describe(router: &mut ToolRouter<ClawgMcp>, table: &[(&str, Option<&str>, &'static str)]) {
+    for route in router.map.values_mut() {
+        let tool = &mut route.attr;
+        let mut schema = (*tool.input_schema).clone();
+        for (_, argument, text) in table.iter().filter(|(name, _, _)| *name == tool.name) {
+            match argument {
+                None => tool.description = Some((*text).into()),
+                Some(argument) => {
+                    let property = schema.get_mut("properties").and_then(|p| p.get_mut(*argument)).and_then(|p| p.as_object_mut());
+                    if let Some(property) = property {
+                        property.insert("description".into(), (*text).into());
+                    }
+                }
+            }
+        }
+        tool.input_schema = std::sync::Arc::new(schema);
     }
 }
 
@@ -318,19 +342,50 @@ pub struct UpdateMemoryArgs {
 /// The line `save_memory` adds when the save is close to earlier memories:
 /// the agent still has the conversation that produced it, so it is the one to
 /// judge the pairs, except those already put to the user.
-fn related_text(related: &[RelatedMemory]) -> String {
+fn related_text(lang: Lang, related: &[RelatedMemory]) -> String {
+    let asks = match lang {
+        Lang::En => ", asks the user",
+        Lang::Es => ", se le pregunta a la persona",
+    };
     let named = related
         .iter()
-        .map(|r| {
-            let asks = if r.escalated { ", asks the user" } else { "" };
-            format!("#{} \"{}\"{asks}", r.id, r.excerpt)
-        })
+        .map(|r| format!("#{} \"{}\"{}", r.id, r.excerpt, if r.escalated { asks } else { "" }))
         .collect::<Vec<_>>()
         .join("; ");
-    format!(
-        "\nclose to earlier memories: {named}. If this save replaces one, call resolve_conflict with \
-         verdict supersedes (keep = the new id); if both hold, compatible or scoped"
-    )
+    match lang {
+        Lang::En => format!(
+            "\nclose to earlier memories: {named}. If this save replaces one, call resolve_conflict with \
+             verdict supersedes (keep = the new id); if both hold, compatible or scoped"
+        ),
+        Lang::Es => format!(
+            "\ncerca de memorias anteriores: {named}. Si este save reemplaza una, llama a resolve_conflict con \
+             verdict supersedes (keep = el id nuevo); si valen las dos, compatible o scoped"
+        ),
+    }
+}
+
+/// What stands for a cause the daemon did not give.
+fn no_cause(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "no cause given",
+        Lang::Es => "sin causa",
+    }
+}
+
+/// A save the daemon refused, with its own sentence as it came.
+fn not_saved(lang: Lang, cause: &str) -> String {
+    match lang {
+        Lang::En => format!("not saved: {cause}"),
+        Lang::Es => format!("no se guardó: {cause}"),
+    }
+}
+
+/// What a tool says it could not do, after a daemon older than the bridge
+/// answered its own bare 404.
+#[derive(Debug, Clone, Copy)]
+enum Route {
+    RestoreMemory,
+    ReadSave,
 }
 
 /// The verdicts `resolve_conflict` takes, from the one list in the core.
@@ -445,10 +500,20 @@ impl ClawgMcp {
         }
     }
 
-    /// The preferred language this session speaks and searches in.
+    /// The preferred language this session speaks and searches in. In
+    /// Spanish the tools are described in Spanish too: the router is
+    /// rewritten once here, so `tools/list` and every test read the same list.
     pub fn with_language(mut self, language: Option<Lang>) -> Self {
         self.language = language;
+        if language == Some(Lang::Es) {
+            describe(&mut self.tool_router, crate::mcp::tools_es::DESCRIPTIONS);
+        }
         self
+    }
+
+    /// The language this session's answers are written in.
+    fn speaks(&self) -> Lang {
+        self.language.unwrap_or(Lang::En)
     }
 
     /// Pins the agent id every call uses, whatever the peer declares.
@@ -501,7 +566,8 @@ impl ClawgMcp {
         F: Fn(DaemonClient) -> Fut,
         Fut: Future<Output = Result<T, ClientError>>,
     {
-        let unavailable = |e: &ClientError| CallToolResult::error(vec![ContentBlock::text(Self::explain(e))]);
+        let unavailable =
+            |e: &ClientError| CallToolResult::error(vec![ContentBlock::text(Self::explain(self.speaks(), e))]);
         let (client, reresolved) = match self.client.get().await {
             Ok(client) => (client, false),
             Err(start) if on_failure(&start) == Next::Reresolve => match self.client.reresolve().await {
@@ -528,158 +594,248 @@ impl ClawgMcp {
     /// embedder that is not ready yet (wait and retry) and one that failed to
     /// load (search is out until it does). Everything else is one message,
     /// because the model's next move is the same either way.
-    fn explain(err: &ClientError) -> String {
-        match err {
+    fn explain(lang: Lang, err: &ClientError) -> String {
+        let text = match (err, lang) {
             // Reached only after the daemon's files were read again, so the
             // daemon is truly gone, and this bridge does not bring it back
             // (see `ClientHandle::reresolve`).
-            ClientError::NotRunning => {
+            (ClientError::NotRunning, Lang::En) => {
                 "the clawg daemon is not running (it may have been stopped or updated); start it \
                  with `clawg serve`, or reconnect clawg in your MCP client, then call again"
-                    .to_string()
+            }
+            (ClientError::NotRunning, Lang::Es) => {
+                "el daemon de clawg no está corriendo (puede que lo hayan detenido o actualizado); arráncalo \
+                 con `clawg serve`, o vuelve a conectar clawg en tu cliente MCP, y llama de nuevo"
             }
             // Also only after a fresh read: the client's own text, which says
             // to delete the token, would not give this bridge a valid one.
-            ClientError::Unauthorized => {
+            (ClientError::Unauthorized, Lang::En) => {
                 "the clawg daemon rejected the token in its data directory even after re-reading it, \
                  so the token file no longer matches the running daemon; restart the daemon \
                  (`clawg status` shows its pid) and call again"
-                    .to_string()
+            }
+            (ClientError::Unauthorized, Lang::Es) => {
+                "el daemon de clawg rechazó el token de su directorio de datos aun después de volver a leerlo, \
+                 así que el archivo del token ya no coincide con el daemon que corre; reinicia el daemon \
+                 (`clawg status` muestra su pid) y llama de nuevo"
             }
             // Starting it was tried, so `clawg serve` is not the advice: the
             // reason it gave up (a store from a newer clawg, say) is what
             // `clawg status` reports.
-            ClientError::StartTimeout(_) => {
+            (ClientError::StartTimeout(_), Lang::En) => {
                 "clawg tried to start its daemon and it is not up; run `clawg status` to see \
                  why, or try again if it is still starting"
-                    .to_string()
             }
-            ClientError::Daemon { details, .. } if is_root_collision(err) => format!(
-                "not done: {}, and clawg will not mix two projects' memories under one id, so this \
-                 project cannot be used until one of the two folders is renamed; all_projects \
-                 still searches every project",
-                details.detail.as_deref().unwrap_or("this project's id belongs to another root")
-            ),
-            ClientError::Daemon { status: 503, message, .. } if message == "embedder_not_ready" => {
+            (ClientError::StartTimeout(_), Lang::Es) => {
+                "clawg intentó arrancar su daemon y no está arriba; ejecuta `clawg status` para ver \
+                 por qué, o prueba de nuevo si todavía está arrancando"
+            }
+            (ClientError::Daemon { details, .. }, _) if is_root_collision(err) => {
+                let detail = details.detail.as_deref().unwrap_or(match lang {
+                    Lang::En => "this project's id belongs to another root",
+                    Lang::Es => "el id de este proyecto pertenece a otra raíz",
+                });
+                return match lang {
+                    Lang::En => format!(
+                        "not done: {detail}, and clawg will not mix two projects' memories under one id, so this \
+                         project cannot be used until one of the two folders is renamed; all_projects \
+                         still searches every project"
+                    ),
+                    Lang::Es => format!(
+                        "no se hizo: {detail}, y clawg no mezcla las memorias de dos proyectos bajo un id, así que \
+                         este proyecto no se puede usar hasta que se renombre una de las dos carpetas; all_projects \
+                         sigue buscando en todos los proyectos"
+                    ),
+                };
+            }
+            (ClientError::Daemon { status: 503, message, .. }, Lang::En) if message == "embedder_not_ready" => {
                 "the memory index is still loading its embedding model; \
                  saving works now, and search will work in a minute"
-                    .to_string()
             }
-            ClientError::Daemon { message, details, .. } if message == "embedder_failed" => {
-                format!(
-                    "the memory index could not load its embedding model ({}); search and \
-                     saving are unavailable {}",
-                    details.detail.as_deref().unwrap_or("no cause given"),
-                    if details.retryable == Some(true) {
-                        "until clawg's retry succeeds"
-                    } else {
-                        "until the cause is fixed"
-                    }
-                )
+            (ClientError::Daemon { status: 503, message, .. }, Lang::Es) if message == "embedder_not_ready" => {
+                "el índice de memorias todavía está cargando su modelo de embeddings; \
+                 guardar ya funciona, y buscar va a funcionar en un minuto"
             }
-            other => other.to_string(),
-        }
+            (ClientError::Daemon { message, details, .. }, _) if message == "embedder_failed" => {
+                let detail = details.detail.as_deref().unwrap_or(no_cause(lang));
+                return match (lang, details.retryable == Some(true)) {
+                    (Lang::En, true) => format!(
+                        "the memory index could not load its embedding model ({detail}); search and \
+                         saving are unavailable until clawg's retry succeeds"
+                    ),
+                    (Lang::En, false) => format!(
+                        "the memory index could not load its embedding model ({detail}); search and \
+                         saving are unavailable until the cause is fixed"
+                    ),
+                    (Lang::Es, true) => format!(
+                        "el índice de memorias no pudo cargar su modelo de embeddings ({detail}); buscar y \
+                         guardar no están disponibles hasta que funcione el reintento de clawg"
+                    ),
+                    (Lang::Es, false) => format!(
+                        "el índice de memorias no pudo cargar su modelo de embeddings ({detail}); buscar y \
+                         guardar no están disponibles hasta que se arregle la causa"
+                    ),
+                };
+            }
+            (other, _) => return other.to_string(),
+        };
+        text.to_string()
     }
 
     /// What `save_memory` tells the model: `Ok` is a success result, `Err` an
     /// error result. Every id it names is one `delete_memory` takes with
     /// `kind: "memory"`.
-    fn save_outcome_text(result: Result<SaveOutcome, ClientError>) -> Result<String, String> {
+    fn save_outcome_text(lang: Lang, result: Result<SaveOutcome, ClientError>) -> Result<String, String> {
         let ids = |memories: &[crate::client::SavedMemory]| {
             memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
         };
         match result {
             Ok(SaveOutcome::Saved { memories, redacted, related, replaced, key_dropped, revision_candidate }) => {
-                let mut text = match memories.as_slice() {
-                    [one] if one.outcome == "reinforced" => format!(
+                let mut text = match (memories.as_slice(), lang) {
+                    ([one], Lang::En) if one.outcome == "reinforced" => format!(
                         "already stored as #{}; reinforced it instead of saving a copy \
                          (update_memory changes its importance or type)",
                         one.id
                     ),
-                    [one] => format!("saved #{}", one.id),
-                    many => format!(
+                    ([one], Lang::Es) if one.outcome == "reinforced" => format!(
+                        "ya estaba guardada como #{}; se reforzó en lugar de guardar una copia \
+                         (update_memory cambia su importancia o su tipo)",
+                        one.id
+                    ),
+                    ([one], Lang::En) => format!("saved #{}", one.id),
+                    ([one], Lang::Es) => format!("se guardó #{}", one.id),
+                    (many, Lang::En) => format!(
                         "saved as {} pieces: {}; read_memory with any of them returns the whole text",
+                        many.len(),
+                        ids(many)
+                    ),
+                    (many, Lang::Es) => format!(
+                        "se guardó en {} piezas: {}; read_memory con cualquiera de ellas devuelve el texto entero",
                         many.len(),
                         ids(many)
                     ),
                 };
                 if !redacted.is_empty() {
-                    text.push_str(&format!("; masked {} before storing it", redacted.join(", ")));
+                    let kinds = redacted.join(", ");
+                    text.push_str(&match lang {
+                        Lang::En => format!("; masked {kinds} before storing it"),
+                        Lang::Es => format!("; se enmascaró {kinds} antes de guardarla"),
+                    });
                 }
                 if !replaced.is_empty() {
                     let named: Vec<String> = replaced.iter().map(|r| format!("#{} \"{}\"", r.id, r.excerpt)).collect();
-                    text.push_str(&format!("; replaces {}", named.join(", ")));
+                    let named = named.join(", ");
+                    text.push_str(&match lang {
+                        Lang::En => format!("; replaces {named}"),
+                        Lang::Es => format!("; reemplaza {named}"),
+                    });
                 }
                 if key_dropped {
-                    text.push_str(
-                        "; the running clawg daemon predates topic_key, so this replaced nothing: restart it \
-                         with the installed clawg (`clawg stop`, then save again)",
-                    );
+                    text.push_str(match lang {
+                        Lang::En => {
+                            "; the running clawg daemon predates topic_key, so this replaced nothing: restart it \
+                             with the installed clawg (`clawg stop`, then save again)"
+                        }
+                        Lang::Es => {
+                            "; el daemon de clawg que corre es anterior a topic_key, así que esto no reemplazó nada: \
+                             reinícialo con el clawg instalado (`clawg stop`, y después guarda de nuevo)"
+                        }
+                    });
                 }
                 if !related.is_empty() {
-                    text.push_str(&related_text(&related));
+                    text.push_str(&related_text(lang, &related));
                 }
                 if let Some(id) = revision_candidate {
                     text.push('\n');
-                    text.push_str(&topic_key_warning(id));
+                    text.push_str(&topic_key_warning(lang, id));
                 }
                 Ok(text)
             }
             Ok(SaveOutcome::Queued { reason, operation_id, memories, detail }) => {
-                let accepted = match &operation_id {
-                    Some(id) => format!("accepted as operation {id}"),
-                    None => "accepted".to_string(),
+                let accepted = match (&operation_id, lang) {
+                    (Some(id), Lang::En) => format!("accepted as operation {id}"),
+                    (Some(id), Lang::Es) => format!("aceptado como la operación {id}"),
+                    (None, Lang::En) => "accepted".to_string(),
+                    (None, Lang::Es) => "aceptado".to_string(),
                 };
-                Ok(match reason.as_deref() {
-                    Some("retrying") => format!(
-                        "{accepted}; the embedding model could not take it ({}), and clawg keeps retrying \
-                         until it is stored (memory_status lists it if it fails)",
-                        detail.as_deref().unwrap_or("no cause given"),
+                let detail = detail.as_deref().unwrap_or(no_cause(lang));
+                Ok(match (reason.as_deref(), lang) {
+                    (Some("retrying"), Lang::En) => format!(
+                        "{accepted}; the embedding model could not take it ({detail}), and clawg keeps retrying \
+                         until it is stored (memory_status lists it if it fails)"
                     ),
-                    Some("partially_saved") => format!(
-                        "partially saved as {} ({}); the rest waits as operation {}, which clawg retries \
+                    (Some("retrying"), Lang::Es) => format!(
+                        "{accepted}; el modelo de embeddings no pudo tomarlo ({detail}), y clawg lo sigue \
+                         reintentando hasta guardarlo (memory_status lo lista si falla)"
+                    ),
+                    (Some("partially_saved"), Lang::En) => format!(
+                        "partially saved as {} ({detail}); the rest waits as operation {}, which clawg retries \
                          when the daemon next starts (memory_status lists it if it fails)",
                         ids(&memories),
-                        detail.as_deref().unwrap_or("no cause given"),
                         operation_id.as_deref().unwrap_or("unknown"),
                     ),
-                    Some("embedder_loading") => format!(
+                    (Some("partially_saved"), Lang::Es) => format!(
+                        "se guardó en parte como {} ({detail}); el resto espera como la operación {}, que clawg \
+                         reintenta en el próximo arranque del daemon (memory_status la lista si falla)",
+                        ids(&memories),
+                        operation_id.as_deref().unwrap_or("desconocida"),
+                    ),
+                    (Some("embedder_loading"), Lang::En) => format!(
                         "{accepted}; it will be stored once the embedding model finishes loading \
                          (memory_status lists it if it fails)"
                     ),
-                    Some("already_queued") => format!("{accepted} earlier and still waiting to be stored"),
-                    _ => format!(
+                    (Some("embedder_loading"), Lang::Es) => format!(
+                        "{accepted}; se va a guardar cuando el modelo de embeddings termine de cargar \
+                         (memory_status lo lista si falla)"
+                    ),
+                    (Some("already_queued"), Lang::En) => format!("{accepted} earlier and still waiting to be stored"),
+                    (Some("already_queued"), Lang::Es) => format!("{accepted} antes y todavía esperando a guardarse"),
+                    (_, Lang::En) => format!(
                         "{accepted} but not confirmed yet; memory_status lists it if it fails, \
                          list_memories shows it once stored"
+                    ),
+                    (_, Lang::Es) => format!(
+                        "{accepted} pero todavía sin confirmar; memory_status lo lista si falla, \
+                         list_memories lo muestra una vez guardado"
                     ),
                 })
             }
             Err(ClientError::Daemon { message, details, .. }) if message == "embedder_failed" => {
-                let mut text = format!(
-                    "not saved: the embedding model failed to load ({})",
-                    details.detail.as_deref().unwrap_or("no cause given")
-                );
+                let detail = details.detail.as_deref().unwrap_or(no_cause(lang));
+                let mut text = match lang {
+                    Lang::En => format!("not saved: the embedding model failed to load ({detail})"),
+                    Lang::Es => format!("no se guardó: el modelo de embeddings no pudo cargar ({detail})"),
+                };
                 if details.retryable == Some(true) {
-                    text.push_str("; clawg will retry");
+                    text.push_str(match lang {
+                        Lang::En => "; clawg will retry",
+                        Lang::Es => "; clawg va a reintentar",
+                    });
                 }
                 Err(text)
             }
             // The daemon's sentence says what was wrong with the call, an
             // unknown memory_type with the accepted ones among them.
-            Err(ClientError::Daemon { status: 400, message, .. }) => Err(format!("not saved: {message}")),
-            Err(ClientError::Daemon { message, .. }) if message == "ingest_queue_full" => {
-                Err("not saved: the ingest queue is full; try again shortly".into())
+            Err(ClientError::Daemon { status: 400, message, .. }) => Err(not_saved(lang, &message)),
+            Err(ClientError::Daemon { message, .. }) if message == "ingest_queue_full" => Err(match lang {
+                Lang::En => "not saved: the ingest queue is full; try again shortly",
+                Lang::Es => "no se guardó: la cola de ingesta está llena; prueba de nuevo en un momento",
             }
+            .into()),
             Err(ClientError::Daemon { message, details, .. })
                 if message == "ingest_failed" || message == "embedder_unavailable" =>
             {
-                let mut text = format!("not saved: {}", details.detail.unwrap_or(message));
+                let mut text = not_saved(lang, &details.detail.unwrap_or(message));
                 if !details.memories.is_empty() {
-                    text.push_str(&format!("; partially saved as {}", ids(&details.memories)));
+                    let saved = ids(&details.memories);
+                    text.push_str(&match lang {
+                        Lang::En => format!("; partially saved as {saved}"),
+                        Lang::Es => format!("; se guardó en parte como {saved}"),
+                    });
                 }
                 Err(text)
             }
-            Err(other) => Err(Self::explain(&other)),
+            Err(other) => Err(Self::explain(lang, &other)),
         }
     }
 
@@ -745,7 +901,10 @@ impl ClawgMcp {
         args: SaveMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if args.content.trim().is_empty() {
-            return Self::failed("content must not be empty");
+            return Self::failed(match self.speaks() {
+                Lang::En => "content must not be empty",
+                Lang::Es => "content no puede estar vacío",
+            });
         }
         let args = &args;
         let result = self
@@ -775,7 +934,7 @@ impl ClawgMcp {
         // "saved" only when the daemon confirmed the rows exist: telling a
         // model otherwise invites it to search for something still in a
         // channel.
-        match Self::save_outcome_text(result) {
+        match Self::save_outcome_text(self.speaks(), result) {
             Ok(text) => Self::ok(text),
             Err(text) => Self::failed(text),
         }
@@ -809,7 +968,7 @@ impl ClawgMcp {
             Ok(Ok((found, save_project))) => {
                 Self::ok(format_search(found, agent_id, save_project.as_deref(), self.language))
             }
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -828,7 +987,7 @@ impl ClawgMcp {
             .await;
         match result {
             Ok(Ok(context)) => Self::ok(format_recall(&context, self.language)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -859,8 +1018,8 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(rows)) => Self::ok(format_rows(&rows, agent_id)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok(rows)) => Self::ok(format_rows(self.speaks(), &rows, agent_id)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -878,8 +1037,8 @@ impl ClawgMcp {
             .call(|client| async move { client.delete(&args.kind, args.id, Some(agent_id)).await })
             .await;
         match result {
-            Ok(Ok(deleted)) => Self::ok(format_delete(&deleted)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok(deleted)) => Self::ok(format_delete(self.speaks(), &deleted)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -895,8 +1054,8 @@ impl ClawgMcp {
             .call(|client| async move { client.restore(&args.kind, args.id, Some(agent_id)).await })
             .await;
         match result {
-            Ok(Ok(restored)) => Self::ok(format_restore(&restored)),
-            Ok(Err(e)) => Self::failed(Self::route_failure_text(&e, "restore a memory")),
+            Ok(Ok(restored)) => Self::ok(format_restore(self.speaks(), &restored)),
+            Ok(Err(e)) => Self::failed(Self::route_failure_text(self.speaks(), &e, Route::RestoreMemory)),
             Err(failure) => Ok(failure),
         }
     }
@@ -917,8 +1076,8 @@ impl ClawgMcp {
         match result {
             // `read_memory` names no project, so a save after it goes to the
             // bridge's own.
-            Ok(Ok(save)) => Self::ok(format_save(&save, self.save_project(None).as_deref())),
-            Ok(Err(e)) => Self::failed(Self::route_failure_text(&e, "read a save")),
+            Ok(Ok(save)) => Self::ok(format_save(self.speaks(), &save, self.save_project(None).as_deref())),
+            Ok(Err(e)) => Self::failed(Self::route_failure_text(self.speaks(), &e, Route::ReadSave)),
             Err(failure) => Ok(failure),
         }
     }
@@ -926,15 +1085,27 @@ impl ClawgMcp {
     /// A daemon older than the route answers its own bare 404, with no error
     /// text of the daemon's; telling the model the row is missing would be
     /// false.
-    fn route_failure_text(err: &ClientError, what: &str) -> String {
+    fn route_failure_text(lang: Lang, err: &ClientError, route: Route) -> String {
         match err {
             ClientError::Daemon { status: 404, message, .. } if message == "404 Not Found" => {
-                format!(
-                    "the running clawg daemon cannot {what}; restart it with the installed clawg \
-                     (`clawg stop`, then call again)"
-                )
+                let what = match (route, lang) {
+                    (Route::RestoreMemory, Lang::En) => "restore a memory",
+                    (Route::ReadSave, Lang::En) => "read a save",
+                    (Route::RestoreMemory, Lang::Es) => "restaurar una memoria",
+                    (Route::ReadSave, Lang::Es) => "leer un save",
+                };
+                match lang {
+                    Lang::En => format!(
+                        "the running clawg daemon cannot {what}; restart it with the installed clawg \
+                         (`clawg stop`, then call again)"
+                    ),
+                    Lang::Es => format!(
+                        "el daemon de clawg que corre no puede {what}; reinícialo con el clawg instalado \
+                         (`clawg stop`, y después llama de nuevo)"
+                    ),
+                }
             }
-            other => Self::explain(other),
+            other => Self::explain(lang, other),
         }
     }
 
@@ -946,13 +1117,20 @@ impl ClawgMcp {
         agent_id: &str,
         args: UpdateMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let lang = self.speaks();
         if args.to_project_path.is_some() && args.clear_project {
-            return Self::failed("pass to_project_path or clear_project, not both");
+            return Self::failed(match lang {
+                Lang::En => "pass to_project_path or clear_project, not both",
+                Lang::Es => "pasa to_project_path o clear_project, no los dos",
+            });
         }
         if let Some(path) = args.to_project_path.as_deref() {
             let root = ProjectIdentity::resolve(std::path::Path::new(path)).root;
             if !root.is_dir() {
-                return Self::failed(format!("{} is not a directory: name a directory of the project", root.display()));
+                return Self::failed(match lang {
+                    Lang::En => format!("{} is not a directory: name a directory of the project", root.display()),
+                    Lang::Es => format!("{} no es un directorio: nombra un directorio del proyecto", root.display()),
+                });
             }
         }
         let moved = args.to_project_path.is_some() || args.clear_project;
@@ -978,8 +1156,8 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(updated)) => Self::ok(format_update(&updated, moved)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok(updated)) => Self::ok(format_update(lang, &updated, moved)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -999,14 +1177,22 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(resolution)) => Self::ok(format_resolution(&resolution)),
+            Ok(Ok(resolution)) => Self::ok(format_resolution(self.speaks(), &resolution)),
             // The daemon's own 404 names the row; a bare one is a daemon that
             // predates verdicts.
-            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => Self::failed(
-                "the running clawg daemon is older than this bridge and cannot take a verdict; \
-                 restart it with `clawg stop` and call the tool again",
-            ),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => {
+                Self::failed(match self.speaks() {
+                    Lang::En => {
+                        "the running clawg daemon is older than this bridge and cannot take a verdict; \
+                         restart it with `clawg stop` and call the tool again"
+                    }
+                    Lang::Es => {
+                        "el daemon de clawg que corre es más viejo que este puente y no puede tomar un veredicto; \
+                         reinícialo con `clawg stop` y vuelve a llamar a la herramienta"
+                    }
+                })
+            }
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -1024,18 +1210,29 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(Some(found))) => Self::ok(format_docs(&found)),
-            Ok(Ok(None)) => Self::failed("no project to search: pass project_path"),
+            Ok(Ok(Some(found))) => Self::ok(format_docs(self.speaks(), &found)),
+            Ok(Ok(None)) => Self::failed(match self.speaks() {
+                Lang::En => "no project to search: pass project_path",
+                Lang::Es => "no hay proyecto en el que buscar: pasa project_path",
+            }),
             // Already the sentence the model should act on: which root, and
             // the command the user runs to have it read.
             Ok(Err(ClientError::Daemon { status: 403, message, .. })) => Self::failed(message),
             // The daemon's own 404 names the project; a bare one is a daemon
             // that predates the route.
-            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => Self::failed(
-                "the running clawg daemon is older than this bridge and cannot search project docs; \
-                 restart it with `clawg stop` and call the tool again",
-            ),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => {
+                Self::failed(match self.speaks() {
+                    Lang::En => {
+                        "the running clawg daemon is older than this bridge and cannot search project docs; \
+                         restart it with `clawg stop` and call the tool again"
+                    }
+                    Lang::Es => {
+                        "el daemon de clawg que corre es más viejo que este puente y no puede buscar en la \
+                         documentación del proyecto; reinícialo con `clawg stop` y vuelve a llamar a la herramienta"
+                    }
+                })
+            }
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -1058,8 +1255,8 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(synthesis)) => Self::ok(format_synthesis(&synthesis)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok(synthesis)) => Self::ok(format_synthesis(self.speaks(), &synthesis)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -1074,7 +1271,8 @@ impl ClawgMcp {
                 // Read here rather than asked of the daemon: both read the same
                 // file in the same data directory, so this is what the next
                 // search will use.
-                let sharing = format_sharing(&sharing::load(client.base_dir()), &agent_id);
+                let lang = self.speaks();
+                let sharing = format_sharing(lang, &sharing::load(client.base_dir()), &agent_id);
                 // The file is read again here: a session keeps its language,
                 // and the user has to learn that a change waits for a new one.
                 let language = format_language(self.language, clawg_core::preferences::language_in(client.base_dir()));
@@ -1082,19 +1280,20 @@ impl ClawgMcp {
                 // and a status must not fail over a line it can leave out.
                 let project = self.save_project(None);
                 let conflicts =
-                    client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(&open)).ok();
+                    client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(lang, &open)).ok();
                 Self::ok(format_status(
+                    lang,
                     &health,
                     self.profile,
                     client.base_dir(),
                     &agent_id,
-                    source.describe(),
+                    source.describe(lang),
                     &sharing,
                     conflicts.as_deref(),
                     language.as_deref(),
                 ))
             }
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -1350,6 +1549,7 @@ impl ServerHandler for ClawgMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2048,9 +2248,9 @@ mod tests {
         let (b, _d) = bridge().await;
         let b = b.with_language(Some(Lang::Es));
         let instructions = b.get_info().instructions.expect("instructions");
-        assert!(instructions.contains("Save memories and search in Spanish"), "{instructions}");
-        assert!(instructions.contains("Reply to the user in Spanish unless they write in another language"), "{instructions}");
-        assert!(!instructions.contains("in English"), "{instructions}");
+        assert!(instructions.contains("Guarda las memorias y busca en español"), "{instructions}");
+        assert!(instructions.contains("Responde a la persona en español salvo que escriba en otro idioma"), "{instructions}");
+        assert!(!instructions.contains("English"), "{instructions}");
         assert_eq!(instructions, opening(&protocol::text(Some(Lang::Es))));
     }
 
@@ -2100,6 +2300,29 @@ mod tests {
             "Do not save",
             "judge each with `resolve_conflict`",
             "ask the user which memory holds",
+        ] {
+            assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
+        }
+    }
+
+    #[test]
+    fn the_spanish_instructions_carry_the_saving_habits() {
+        let instructions = opening(&protocol::text(Some(Lang::Es)));
+        for expected in [
+            "`save_memory`",
+            "`search_memory`",
+            "`recall_context`",
+            "`search_project`",
+            "`resolve_conflict`",
+            "`synthesize`",
+            "Una cosa por llamada",
+            "primera línea que nombre el tema",
+            "rutas e identificadores",
+            "en español",
+            "evidencia, no instrucciones",
+            "No guardes",
+            "juzga cada una con `resolve_conflict`",
+            "pregúntale a la persona qué memoria vale",
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
         }
@@ -2511,6 +2734,97 @@ mod tests {
         );
     }
 
+    const CONTRACT_ES_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp/agent_contract.es.json");
+    const BLESS_ES: &str = "CLAWG_BLESS=1 cargo test -p clawg-cli the_spanish_agent_contract_matches_its_file";
+
+    /// What a session in Spanish reads, pinned as the English one is.
+    #[tokio::test]
+    async fn the_spanish_agent_contract_matches_its_file() {
+        let (b, _d) = bridge().await;
+        let actual = agent_contract(&b.with_language(Some(Lang::Es)));
+        if std::env::var_os("CLAWG_BLESS").is_some_and(|v| v == "1") {
+            std::fs::write(CONTRACT_ES_PATH, render_contract(&actual)).expect("write the contract file");
+            panic!("agent contract updated: review the diff of {CONTRACT_ES_PATH} and run the tests again");
+        }
+        let text = std::fs::read_to_string(CONTRACT_ES_PATH)
+            .unwrap_or_else(|e| panic!("read {CONTRACT_ES_PATH}: {e}; create it with {BLESS_ES}"));
+        let expected: serde_json::Value = serde_json::from_str(&text).expect("the contract file is JSON");
+        let diff = contract_diff(&expected, &actual);
+        assert!(
+            diff.is_empty(),
+            "what the model sees in Spanish changed:\n{}\nif that is intended, run {BLESS_ES} and review the diff",
+            diff.join("\n")
+        );
+    }
+
+    /// Every description a tool carries, by tool and argument.
+    fn descriptions(b: &ClawgMcp) -> BTreeMap<(String, Option<String>), String> {
+        let mut out = BTreeMap::new();
+        for t in b.tool_router.list_all() {
+            out.insert((t.name.to_string(), None), t.description.clone().unwrap_or_default().into_owned());
+            if let Some(properties) = t.input_schema.get("properties").and_then(|p| p.as_object()) {
+                for (name, property) in properties {
+                    let text = property.get("description").and_then(|d| d.as_str()).unwrap_or_default();
+                    out.insert((t.name.to_string(), Some(name.clone())), text.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn the_spanish_table_covers_every_tool_and_argument() {
+        let (b, _d) = bridge().await;
+        let english: Vec<_> = descriptions(&b).into_keys().collect();
+        let mut table: Vec<_> = crate::mcp::tools_es::DESCRIPTIONS
+            .iter()
+            .map(|(tool, arg, _)| (tool.to_string(), arg.map(str::to_string)))
+            .collect();
+        table.sort();
+        let len = table.len();
+        table.dedup();
+        assert_eq!(table.len(), len, "an entry is listed twice");
+        assert_eq!(table, english, "one entry per tool and per argument, and no other");
+    }
+
+    #[tokio::test]
+    async fn the_spanish_descriptions_name_what_the_english_ones_name() {
+        let (b, _d) = bridge().await;
+        let english = descriptions(&b);
+        let spanish = descriptions(&b.with_language(Some(Lang::Es)));
+        for (key, en) in &english {
+            let es = &spanish[key];
+            assert_ne!(es, en, "{key:?} is not translated");
+            let names = |text: &str| text.split('`').skip(1).step_by(2).map(str::to_string).collect::<BTreeSet<_>>();
+            assert_eq!(names(es), names(en), "{key:?} names other things in Spanish: {es}");
+        }
+    }
+
+    /// The model calls a tool by its names and types, which stay what the
+    /// daemon reads whatever the language.
+    #[tokio::test]
+    async fn only_descriptions_change_with_the_language() {
+        let (b, _d) = bridge().await;
+        let strip = |b: &ClawgMcp| -> Vec<serde_json::Value> {
+            b.tool_router
+                .list_all()
+                .into_iter()
+                .map(|t| {
+                    let mut tool = serde_json::to_value(&t).expect("a tool serializes");
+                    tool["description"] = serde_json::Value::Null;
+                    if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+                        for property in properties.values_mut() {
+                            property["description"] = serde_json::Value::Null;
+                        }
+                    }
+                    tool
+                })
+                .collect()
+        };
+        let english = strip(&b);
+        assert_eq!(strip(&b.with_language(Some(Lang::Es))), english);
+    }
+
     /// An explicit save with no type is stored as `semantic_fact`
     /// (`NewMemoryRecord::from_event_and_chunk`). A schema that names another
     /// default teaches the model to pass a type it did not mean.
@@ -2746,7 +3060,7 @@ mod tests {
 
     #[test]
     fn a_masked_save_tells_the_agent_what_was_masked() {
-        let text = |r| ClawgMcp::save_outcome_text(r);
+        let text = |r| ClawgMcp::save_outcome_text(Lang::En, r);
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "inserted")],
@@ -2768,7 +3082,7 @@ mod tests {
 
     #[test]
     fn save_outcome_text_covers_every_daemon_answer() {
-        let text = |r| ClawgMcp::save_outcome_text(r);
+        let text = |r| ClawgMcp::save_outcome_text(Lang::En, r);
         assert_eq!(
             text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None })),
             Ok("saved #57".to_string())
@@ -2888,11 +3202,11 @@ mod tests {
 
     #[test]
     fn a_daemon_that_did_not_start_points_at_status() {
-        let t = ClawgMcp::explain(&ClientError::StartTimeout(std::time::Duration::from_secs(30)));
+        let t = ClawgMcp::explain(Lang::En, &ClientError::StartTimeout(std::time::Duration::from_secs(30)));
         assert!(t.contains("clawg status"), "{t}");
         assert!(!t.contains("clawg serve"), "{t}");
 
-        let t = ClawgMcp::explain(&ClientError::NotRunning);
+        let t = ClawgMcp::explain(Lang::En, &ClientError::NotRunning);
         assert!(t.contains("clawg serve"), "{t}");
     }
 
@@ -2903,12 +3217,12 @@ mod tests {
             "embedder_failed",
             ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![] },
         );
-        let t = ClawgMcp::explain(&failed);
+        let t = ClawgMcp::explain(Lang::En, &failed);
         assert!(!t.contains("in a minute"), "{t}");
         assert!(t.contains("connection refused"), "{t}");
 
         let loading = daemon_error(503, "embedder_not_ready", ErrorDetails::default());
-        assert!(ClawgMcp::explain(&loading).contains("loading"));
+        assert!(ClawgMcp::explain(Lang::En, &loading).contains("loading"));
     }
 
     #[tokio::test]
@@ -2956,6 +3270,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_spanish_session_answers_in_spanish() {
+        let (b, _d) = bridge().await;
+        let b = b.with_language(Some(Lang::Es));
+        let empty = b.save_memory_impl("agent-mcp", save_args("  ")).await.expect("save");
+        assert_eq!(text(&empty), "content no puede estar vacío");
+        let saved = text(&b.save_memory_impl("agent-mcp", save_args("La rama se corta los jueves.")).await.expect("save"));
+        assert!(saved.starts_with("se guardó #"), "{saved}");
+        let listed = text(&b.list_memories_impl("agent-mcp", list_all()).await.expect("list"));
+        assert!(listed.contains(" semantic_fact t") && listed.contains("La rama se corta los jueves."), "{listed}");
+        let status = text(&b.memory_status_impl(b.agent_for(None)).await.expect("status"));
+        assert!(status.contains("\nperfil: dev\n") && status.contains("compartido: lee y cambia"), "{status}");
+        let moved = UpdateMemoryArgs {
+            kind: "memory".into(),
+            id: 1,
+            importance: None,
+            memory_type: None,
+            to_project_path: Some("/a".into()),
+            clear_project: true,
+            user_answered: false,
+        };
+        assert_eq!(text(&b.update_memory_impl("agent-mcp", moved).await.expect("update")), "pasa to_project_path o clear_project, no los dos");
+    }
+
+    #[tokio::test]
     async fn search_memory_sends_the_bridges_language() {
         let (b, _d) = bridge().await;
         saved_id(&b, "agent-mcp", "The release branch is cut on thursdays, and it is tagged by the release script.").await;
@@ -2965,9 +3303,9 @@ mod tests {
 
         let b = b.with_language(Some(Lang::Es));
         let r = b.search_memory_impl("agent-mcp", search_args(query)).await.expect("search");
-        assert!(text(&r).ends_with("search again with the query in English."), "{}", text(&r));
+        assert!(text(&r).ends_with("busca de nuevo con la consulta en inglés."), "{}", text(&r));
         let r = b.recall_context_impl("agent-mcp", RecallContextArgs { query: query.into(), project_path: None, budget: None }).await;
-        assert!(text(&r.expect("context")).contains("1 memory in this scope is still in English"));
+        assert!(text(&r.expect("context")).contains("1 memoria de este ámbito sigue en inglés"));
     }
 
     #[tokio::test]
@@ -2979,9 +3317,9 @@ mod tests {
         };
         assert!(!status(&b).await.contains("language:"), "nothing without a preference");
         let b = b.with_language(Some(Lang::Es));
-        assert!(status(&b).await.contains("language: Spanish for this session; preferences.json now sets none"));
+        assert!(status(&b).await.contains("idioma: español en esta sesión; preferences.json ahora no fija ninguno"));
         clawg_core::preferences::save(d.path(), &clawg_core::preferences::Preferences { language: Some(Lang::Es) }).unwrap();
-        assert!(status(&b).await.contains("language: Spanish (preferences.json)"));
+        assert!(status(&b).await.contains("idioma: español (preferences.json)"));
     }
 
     #[tokio::test]
@@ -3103,7 +3441,7 @@ mod tests {
     #[test]
     fn save_outcome_text_names_related_memories() {
         let related = |id, escalated| RelatedMemory { id, escalated, excerpt: format!("claim {id}") };
-        let text = ClawgMcp::save_outcome_text(Ok(SaveOutcome::Saved {
+        let text = ClawgMcp::save_outcome_text(Lang::En, Ok(SaveOutcome::Saved {
             memories: vec![saved(57, "inserted")],
             redacted: vec![],
             related: vec![related(12, false), related(15, true)],
@@ -3122,7 +3460,7 @@ mod tests {
 
     #[test]
     fn an_unkeyed_save_close_to_its_own_row_is_told_to_take_a_key() {
-        let text = ClawgMcp::save_outcome_text(Ok(SaveOutcome::Saved {
+        let text = ClawgMcp::save_outcome_text(Lang::En, Ok(SaveOutcome::Saved {
             memories: vec![saved(57, "inserted")],
             redacted: vec![],
             related: vec![RelatedMemory { id: 412, escalated: false, excerpt: "Build tool".into() }],
@@ -3143,7 +3481,7 @@ mod tests {
     #[test]
     fn save_outcome_text_names_the_replaced_memories() {
         let replaced = |id| ReplacedMemory { id, excerpt: format!("claim {id}") };
-        let text = ClawgMcp::save_outcome_text(Ok(SaveOutcome::Saved {
+        let text = ClawgMcp::save_outcome_text(Lang::En, Ok(SaveOutcome::Saved {
             memories: vec![saved(57, "inserted")],
             redacted: vec![],
             related: vec![],
@@ -3465,19 +3803,19 @@ mod tests {
     #[test]
     fn a_daemon_without_the_restore_route_is_named_as_such() {
         let old = daemon_error(404, "404 Not Found", ErrorDetails::default());
-        let text = ClawgMcp::route_failure_text(&old, "restore a memory");
+        let text = ClawgMcp::route_failure_text(Lang::En, &old, Route::RestoreMemory);
         assert!(text.contains("cannot restore a memory") && text.contains("restart"), "{text}");
         let missing = daemon_error(404, "no Memory row with id 7", ErrorDetails::default());
-        assert_eq!(ClawgMcp::route_failure_text(&missing, "restore a memory"), ClawgMcp::explain(&missing));
+        assert_eq!(ClawgMcp::route_failure_text(Lang::En, &missing, Route::RestoreMemory), ClawgMcp::explain(Lang::En, &missing));
     }
 
     #[test]
     fn a_daemon_without_the_save_route_is_named_as_such() {
         let old = daemon_error(404, "404 Not Found", ErrorDetails::default());
-        let text = ClawgMcp::route_failure_text(&old, "read a save");
+        let text = ClawgMcp::route_failure_text(Lang::En, &old, Route::ReadSave);
         assert!(text.contains("cannot read a save") && text.contains("restart"), "{text}");
         let missing = daemon_error(404, "no Memory row with id 7", ErrorDetails::default());
-        assert_eq!(ClawgMcp::route_failure_text(&missing, "read a save"), ClawgMcp::explain(&missing));
+        assert_eq!(ClawgMcp::route_failure_text(Lang::En, &missing, Route::ReadSave), ClawgMcp::explain(Lang::En, &missing));
     }
 
     fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {

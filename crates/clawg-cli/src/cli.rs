@@ -573,9 +573,12 @@ impl Exclusion {
     /// Refuses hiding an agent from itself: an agent always reads its own
     /// memories, and accepting it would tell the user something changed when
     /// nothing did. `* *` is not that: it means no agent reads another.
-    pub fn check(&self) -> Result<(), String> {
+    pub fn check(&self, lang: Lang) -> Result<(), String> {
         if self.reader == self.author && self.reader != sharing::EVERY_AGENT {
-            return Err(format!("{} always reads its own memories", self.reader));
+            return Err(match lang {
+                Lang::En => format!("{} always reads its own memories", self.reader),
+                Lang::Es => format!("{} siempre lee sus propias memorias", self.reader),
+            });
         }
         Ok(())
     }
@@ -1145,7 +1148,7 @@ mod tests {
         assert!(Cli::try_parse_from(["clawg", "sharing", "hide", " ", "claude-code"]).is_err());
         assert!(Cli::try_parse_from(["clawg", "sharing", "hide", "cursor"]).is_err(), "both agents are needed");
         let e = hide_of(&["clawg", "sharing", "hide", "cursor", "cursor"]);
-        assert_eq!(e.check(), Err("cursor always reads its own memories".to_string()));
+        assert_eq!(e.check(Lang::En), Err("cursor always reads its own memories".to_string()));
     }
 
     #[test]
@@ -1169,7 +1172,7 @@ mod tests {
     fn every_agent_is_accepted_on_either_side() {
         for args in [["*", "codex"], ["cursor", "*"], ["*", "*"]] {
             let e = hide_of(&["clawg", "sharing", "hide", args[0], args[1]]);
-            assert_eq!(e.check(), Ok(()), "{args:?}");
+            assert_eq!(e.check(Lang::En), Ok(()), "{args:?}");
         }
     }
 

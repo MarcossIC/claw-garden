@@ -424,7 +424,8 @@ pub struct ContextRequest {
     /// [`MAX_BUDGET`], that.
     #[serde(default)]
     pub budget: Option<usize>,
-    /// As in [`SearchRequest`]; counted only when there is a query.
+    /// As in [`SearchRequest`], counted only when there is a query; with or
+    /// without one, the language of the notes the prompt adds.
     #[serde(default)]
     pub lang: Option<String>,
 }
@@ -1509,6 +1510,7 @@ async fn context(
     let prompt = match query {
         Some(query) => {
             build_memory_prompt(
+                lang.unwrap_or(Lang::En),
                 &app.runtime.store,
                 &workspace,
                 app.runtime.embedder.get().cloned(),
@@ -1524,7 +1526,17 @@ async fn context(
         }
         None => {
             let reach = reach(&app, &body.agent_id);
-            build_session_prompt(&app.runtime.store, &workspace, &body.agent_id, project_id, &reach, &emitted, budget).await
+            build_session_prompt(
+                lang.unwrap_or(Lang::En),
+                &app.runtime.store,
+                &workspace,
+                &body.agent_id,
+                project_id,
+                &reach,
+                &emitted,
+                budget,
+            )
+            .await
         }
     }
     .map_err(ApiError::internal)?;

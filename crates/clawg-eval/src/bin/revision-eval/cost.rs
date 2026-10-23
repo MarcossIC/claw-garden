@@ -335,6 +335,6 @@ mod tests {
 
     #[test]
     fn save_memory_ships_the_warning_line_that_was_measured() {
-        assert_eq!(clawg_cli::mcp::tools::topic_key_warning(123), WARNING_LINE);
+        assert_eq!(clawg_cli::mcp::tools::topic_key_warning(clawg_core::preferences::Lang::En, 123), WARNING_LINE);
     }
 }

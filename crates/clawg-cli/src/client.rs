@@ -1051,14 +1051,19 @@ impl DaemonClient {
     }
 
     /// The context without a query: the workspace and the newest saves, as
-    /// a session starts. A daemon that predates it refuses the request.
+    /// a session starts, its notes in `lang`. A daemon that predates it
+    /// refuses the request.
     pub async fn recent_context(
         &self,
         agent_id: &str,
         project_id: Option<&str>,
         budget: usize,
+        lang: Option<Lang>,
     ) -> Result<Context, ClientError> {
-        let body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "budget": budget });
+        let mut body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "budget": budget });
+        if let Some(lang) = lang {
+            body["lang"] = lang.as_str().into();
+        }
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/context").json(&body)?).await?;
         read_response(answer)
     }

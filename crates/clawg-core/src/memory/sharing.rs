@@ -13,6 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::sharing_file;
+use crate::preferences::Lang;
 
 /// The only file format this build reads and writes.
 const VERSION: u32 = 1;
@@ -174,22 +175,30 @@ impl SharingPolicy {
         }
     }
 
-    /// One line per exclusion, or that everything is shared.
-    pub fn render(&self) -> String {
+    /// One line per exclusion, or that everything is shared, in `lang`.
+    pub fn render(&self, lang: Lang) -> String {
         let lines: Vec<String> = self
             .hides
             .iter()
             .flat_map(|(r, authors)| {
-                authors.iter().map(move |a| match (r.as_str(), a.as_str()) {
-                    (EVERY_AGENT, EVERY_AGENT) => "no agent reads another".to_owned(),
-                    (EVERY_AGENT, a) => format!("no agent reads {a}"),
-                    (r, EVERY_AGENT) => format!("{r} reads no other agent"),
-                    (r, a) => format!("{r} does not read {a}"),
+                authors.iter().map(move |a| match (r.as_str(), a.as_str(), lang) {
+                    (EVERY_AGENT, EVERY_AGENT, Lang::En) => "no agent reads another".to_owned(),
+                    (EVERY_AGENT, EVERY_AGENT, Lang::Es) => "ningún agente lee a otro".to_owned(),
+                    (EVERY_AGENT, a, Lang::En) => format!("no agent reads {a}"),
+                    (EVERY_AGENT, a, Lang::Es) => format!("ningún agente lee a {a}"),
+                    (r, EVERY_AGENT, Lang::En) => format!("{r} reads no other agent"),
+                    (r, EVERY_AGENT, Lang::Es) => format!("{r} no lee a ningún otro agente"),
+                    (r, a, Lang::En) => format!("{r} does not read {a}"),
+                    (r, a, Lang::Es) => format!("{r} no lee a {a}"),
                 })
             })
             .collect();
         if lines.is_empty() {
-            return "every agent reads every other agent".to_owned();
+            return match lang {
+                Lang::En => "every agent reads every other agent",
+                Lang::Es => "cada agente lee a todos los demás",
+            }
+            .to_owned();
         }
         lines.join("\n")
     }
@@ -395,14 +404,17 @@ mod tests {
     #[test]
     fn render_lists_one_exclusion_per_line() {
         let mut p = SharingPolicy::default();
-        assert_eq!(p.render(), "every agent reads every other agent");
+        assert_eq!(p.render(Lang::En), "every agent reads every other agent");
+        assert_eq!(p.render(Lang::Es), "cada agente lee a todos los demás");
         p.hide("cursor", "codex");
         p.hide("*", "claude-code");
         p.hide("codex", "*");
-        assert_eq!(p.render(), "no agent reads claude-code\ncodex reads no other agent\ncursor does not read codex");
+        assert_eq!(p.render(Lang::En), "no agent reads claude-code\ncodex reads no other agent\ncursor does not read codex");
+        assert_eq!(p.render(Lang::Es), "ningún agente lee a claude-code\ncodex no lee a ningún otro agente\ncursor no lee a codex");
         let mut off = SharingPolicy::default();
         off.hide("*", "*");
-        assert_eq!(off.render(), "no agent reads another");
+        assert_eq!(off.render(Lang::En), "no agent reads another");
+        assert_eq!(off.render(Lang::Es), "ningún agente lee a otro");
     }
 
     #[cfg(unix)]
