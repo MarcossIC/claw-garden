@@ -63,6 +63,7 @@ mod tests {
             (19, "conflict_topic_key_warned", 10065829539537553357),
             (20, "project_scoped_indexes", 11833462148711770144),
             (21, "memory_move", 7771689620137773022),
+            (22, "memory_lang", 10609892886635042350),
         ];
         let mut actual: Vec<(i32, String, u64)> = runner()
             .get_migrations()

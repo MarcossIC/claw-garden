@@ -9,6 +9,7 @@ use crate::memory::chunker::Chunk;
 use crate::memory::clock::TimestampMs;
 use crate::memory::contradiction::Candidate;
 use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::language;
 use crate::memory::vector::to_unit;
 use crate::memory::outbox::{apply_note, OutboxNote};
 use crate::memory::provenance::seal;
@@ -528,6 +529,7 @@ struct PreparedRow {
     disputed_against: Option<String>,
     last_disputed_at: Option<TimestampMs>,
     content_hash: String,
+    lang: &'static str,
 }
 
 impl PreparedRow {
@@ -554,6 +556,9 @@ impl PreparedRow {
             // (worker.rs, before embed) — writing it here too keeps every row
             // dedup-eligible regardless of which producer inserted it.
             content_hash: crate::memory::dedup::content_hash(&record.content),
+            // The row's own text, already masked: a piece is long enough to
+            // tell, and the import and the maintenance pass see rows too.
+            lang: language::column_value(language::detect(&record.content)),
             record,
         })
     }
@@ -566,8 +571,8 @@ impl PreparedRow {
              (scope, agent_id, project_id, content, memory_type, source, \
               created_at, created_by_type, created_by_ref, \
               last_modified_at, last_accessed_at, access_count, importance, tier, \
-              status, disputed_against, last_disputed_at, content_hash, topic_key, source_session_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              status, disputed_against, last_disputed_at, content_hash, topic_key, source_session_id, lang) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
                 record.scope,
                 record.agent_id,
@@ -599,6 +604,7 @@ impl PreparedRow {
                 self.content_hash,
                 record.topic_key,
                 record.source_session_id,
+                self.lang,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -1290,6 +1296,31 @@ mod tests {
             .await
             .expect("select");
         assert_eq!(source, "explicit");
+    }
+
+    #[tokio::test]
+    async fn a_save_records_the_language_of_each_row() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let mut ids = Vec::new();
+        for content in [
+            "El daemon guarda cada memoria en una sola transacción, y la búsqueda las encuentra.",
+            "The daemon stores every memory in one transaction, and the search finds them.",
+            "`MemoryStore::open` in crates/clawg-core/src/memory/db.rs",
+        ] {
+            let record = NewMemoryRecord { content: content.to_string(), ..make_record("a", None) };
+            ids.push(store.insert_memory_with_vector(record, make_embedding_384()).await.unwrap());
+        }
+        let langs: Vec<Option<String>> = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                let mut stmt = c.prepare("SELECT lang FROM memory ORDER BY id")?;
+                let langs = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok(langs)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(langs, [Some("es".to_string()), Some("en".to_string()), Some("und".to_string())]);
     }
 
     // ── INSERT writes status/disputed_against/last_disputed_at ──
