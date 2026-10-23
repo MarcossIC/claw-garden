@@ -1,13 +1,13 @@
 change: language-preference
 objective: "1, 4"
 depends_on: []
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done  # las diez decisiones abiertas, cerradas con la opción recomendada; B y C son 79 y 80
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
