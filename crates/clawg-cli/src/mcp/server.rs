@@ -104,6 +104,27 @@ pub fn resolve_agent(flag: Option<&str>, client: Option<&str>) -> (String, Agent
     }
 }
 
+/// Puts `table`'s descriptions on the tools and arguments it names: the
+/// description of each tool, and of each property of its input schema.
+fn describe(router: &mut ToolRouter<ClawgMcp>, table: &[(&str, Option<&str>, &'static str)]) {
+    for route in router.map.values_mut() {
+        let tool = &mut route.attr;
+        let mut schema = (*tool.input_schema).clone();
+        for (_, argument, text) in table.iter().filter(|(name, _, _)| *name == tool.name) {
+            match argument {
+                None => tool.description = Some((*text).into()),
+                Some(argument) => {
+                    let property = schema.get_mut("properties").and_then(|p| p.get_mut(*argument)).and_then(|p| p.as_object_mut());
+                    if let Some(property) = property {
+                        property.insert("description".into(), (*text).into());
+                    }
+                }
+            }
+        }
+        tool.input_schema = std::sync::Arc::new(schema);
+    }
+}
+
 /// The client name a request reads and writes under: the one it declares,
 /// else the last one a client declared to this bridge. Blank names count as
 /// none.
@@ -445,9 +466,14 @@ impl ClawgMcp {
         }
     }
 
-    /// The preferred language this session speaks and searches in.
+    /// The preferred language this session speaks and searches in. In
+    /// Spanish the tools are described in Spanish too: the router is
+    /// rewritten once here, so `tools/list` and every test read the same list.
     pub fn with_language(mut self, language: Option<Lang>) -> Self {
         self.language = language;
+        if language == Some(Lang::Es) {
+            describe(&mut self.tool_router, crate::mcp::tools_es::DESCRIPTIONS);
+        }
         self
     }
 
@@ -1350,6 +1376,7 @@ impl ServerHandler for ClawgMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2532,6 +2559,97 @@ mod tests {
             "what the model sees changed:\n{}\nif that is intended, run {BLESS} and review the diff",
             diff.join("\n")
         );
+    }
+
+    const CONTRACT_ES_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp/agent_contract.es.json");
+    const BLESS_ES: &str = "CLAWG_BLESS=1 cargo test -p clawg-cli the_spanish_agent_contract_matches_its_file";
+
+    /// What a session in Spanish reads, pinned as the English one is.
+    #[tokio::test]
+    async fn the_spanish_agent_contract_matches_its_file() {
+        let (b, _d) = bridge().await;
+        let actual = agent_contract(&b.with_language(Some(Lang::Es)));
+        if std::env::var_os("CLAWG_BLESS").is_some_and(|v| v == "1") {
+            std::fs::write(CONTRACT_ES_PATH, render_contract(&actual)).expect("write the contract file");
+            panic!("agent contract updated: review the diff of {CONTRACT_ES_PATH} and run the tests again");
+        }
+        let text = std::fs::read_to_string(CONTRACT_ES_PATH)
+            .unwrap_or_else(|e| panic!("read {CONTRACT_ES_PATH}: {e}; create it with {BLESS_ES}"));
+        let expected: serde_json::Value = serde_json::from_str(&text).expect("the contract file is JSON");
+        let diff = contract_diff(&expected, &actual);
+        assert!(
+            diff.is_empty(),
+            "what the model sees in Spanish changed:\n{}\nif that is intended, run {BLESS_ES} and review the diff",
+            diff.join("\n")
+        );
+    }
+
+    /// Every description a tool carries, by tool and argument.
+    fn descriptions(b: &ClawgMcp) -> BTreeMap<(String, Option<String>), String> {
+        let mut out = BTreeMap::new();
+        for t in b.tool_router.list_all() {
+            out.insert((t.name.to_string(), None), t.description.clone().unwrap_or_default().into_owned());
+            if let Some(properties) = t.input_schema.get("properties").and_then(|p| p.as_object()) {
+                for (name, property) in properties {
+                    let text = property.get("description").and_then(|d| d.as_str()).unwrap_or_default();
+                    out.insert((t.name.to_string(), Some(name.clone())), text.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn the_spanish_table_covers_every_tool_and_argument() {
+        let (b, _d) = bridge().await;
+        let english: Vec<_> = descriptions(&b).into_keys().collect();
+        let mut table: Vec<_> = crate::mcp::tools_es::DESCRIPTIONS
+            .iter()
+            .map(|(tool, arg, _)| (tool.to_string(), arg.map(str::to_string)))
+            .collect();
+        table.sort();
+        let len = table.len();
+        table.dedup();
+        assert_eq!(table.len(), len, "an entry is listed twice");
+        assert_eq!(table, english, "one entry per tool and per argument, and no other");
+    }
+
+    #[tokio::test]
+    async fn the_spanish_descriptions_name_what_the_english_ones_name() {
+        let (b, _d) = bridge().await;
+        let english = descriptions(&b);
+        let spanish = descriptions(&b.with_language(Some(Lang::Es)));
+        for (key, en) in &english {
+            let es = &spanish[key];
+            assert_ne!(es, en, "{key:?} is not translated");
+            let names = |text: &str| text.split('`').skip(1).step_by(2).map(str::to_string).collect::<BTreeSet<_>>();
+            assert_eq!(names(es), names(en), "{key:?} names other things in Spanish: {es}");
+        }
+    }
+
+    /// The model calls a tool by its names and types, which stay what the
+    /// daemon reads whatever the language.
+    #[tokio::test]
+    async fn only_descriptions_change_with_the_language() {
+        let (b, _d) = bridge().await;
+        let strip = |b: &ClawgMcp| -> Vec<serde_json::Value> {
+            b.tool_router
+                .list_all()
+                .into_iter()
+                .map(|t| {
+                    let mut tool = serde_json::to_value(&t).expect("a tool serializes");
+                    tool["description"] = serde_json::Value::Null;
+                    if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+                        for property in properties.values_mut() {
+                            property["description"] = serde_json::Value::Null;
+                        }
+                    }
+                    tool
+                })
+                .collect()
+        };
+        let english = strip(&b);
+        assert_eq!(strip(&b.with_language(Some(Lang::Es))), english);
     }
 
     /// An explicit save with no type is stored as `semantic_fact`

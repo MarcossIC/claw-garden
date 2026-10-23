@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod server;
 pub mod startup;
 pub mod tools;
+pub mod tools_es;
 
 use std::path::Path;
 use std::sync::Arc;
