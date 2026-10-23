@@ -1089,7 +1089,7 @@ async fn session_start_without_a_daemon_still_names_the_language() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     let printed: Value = serde_json::from_str(&stdout_of(&out)).expect("the hook's envelope");
     let context = printed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default();
-    assert!(context.starts_with("clawg: the user's language is Spanish."), "{printed}");
+    assert!(context.starts_with("clawg: el idioma de la persona es el español."), "{printed}");
     assert!(!sandbox.data_dir().join("daemon.json").exists(), "no daemon was started");
 
     let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &input);
