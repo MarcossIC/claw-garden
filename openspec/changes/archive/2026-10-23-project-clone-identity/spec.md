@@ -1,6 +1,6 @@
 # project-clone-identity — Especificación
 
-Cambia y suma requisitos a [`specs/project`](../../specs/project/spec.md) (R2, R4, R6 y nuevos), [`specs/project-docs`](../../specs/project-docs/spec.md), [`specs/hooks`](../../specs/hooks/spec.md), [`specs/portability`](../../specs/portability/spec.md), [`specs/storage`](../../specs/storage/spec.md) y [`specs/doctor`](../../specs/doctor/spec.md). Lo que no se nombra aquí sigue como está.
+Cambia y suma requisitos a [`specs/project`](../../../specs/project/spec.md) (R2, R4, R6 y nuevos), [`specs/project-docs`](../../../specs/project-docs/spec.md), [`specs/hooks`](../../../specs/hooks/spec.md), [`specs/portability`](../../../specs/portability/spec.md), [`specs/storage`](../../../specs/storage/spec.md) y [`specs/doctor`](../../../specs/doctor/spec.md). Lo que no se nombra aquí sigue como está.
 
 ## Definiciones
 
@@ -33,7 +33,7 @@ La clave MUST NOT contener usuario, contraseña ni token.
 - GIVEN un worktree cuyo `gitdir` tiene `commondir`, y un submódulo cuyo `gitdir` no lo tiene
 - THEN la clave del worktree sale del `config` del directorio común y la del submódulo del `config` de su `gitdir`
 
-**Tests:** `a_remote_normalizes_to_host_owner_and_repo`, `a_local_remote_has_no_key`, `the_origin_url_is_read_from_its_section` (puros, `identity.rs`); `the_key_of_a_worktree_and_of_a_submodule` y `a_root_without_origin_has_no_key` (`crates/clawg-core/tests/project_root.rs`).
+**Tests:** `a_remote_normalizes_to_host_owner_and_repo`, `a_local_remote_has_no_key`, `the_origin_url_is_read_from_its_section`, `the_config_of_a_worktree_is_in_its_common_directory` (puros, `identity.rs`); `two_clones_of_one_remote_have_one_key`, `the_key_of_a_worktree_and_of_a_submodule` y `a_root_without_origin_has_no_key` (`crates/clawg-core/tests/project_root.rs`).
 
 ## CI2. El registro asigna el id de raíz
 
@@ -49,7 +49,7 @@ La clave MUST NOT contener usuario, contraseña ni token.
 - WHEN se registra `/work/repo`
 - THEN recibe otro id del mismo formato, `project` tiene las dos raíces, y la marca `index_docs` de `/elsewhere/repo` no cambia
 
-**Tests:** `the_root_of_always_keeps_its_id`, `a_root_whose_id_is_taken_gets_the_next_free_one`, `a_root_keeps_the_id_it_was_given` (`project.rs`); `registering_two_roots_that_collide_gives_each_its_own_id` (`crates/clawg-cli/tests/api.rs`).
+**Tests:** `the_root_of_always_keeps_its_id`, `a_root_whose_id_is_taken_gets_the_next_free_one`, `a_root_keeps_the_id_it_was_given`, `every_id_taken_is_an_error_that_writes_nothing` (`project.rs`); `registering_two_roots_that_collide_gives_each_its_own_id` (`crates/clawg-cli/tests/api.rs`).
 
 ## CI3. Dos clones de un remoto comparten el id de proyecto
 
@@ -80,7 +80,7 @@ Una raíz con clave MUST usar como id de proyecto el que `project_remote` guarda
 - WHEN la registra un pedido sin `assigned`
 - THEN la respuesta es 409 y nada cambia
 
-**Tests:** `a_caller_that_derives_its_id_keeps_the_conflict` (`project.rs`); `registering_without_assigned_ids_keeps_the_old_answer` (`tests/api.rs`).
+**Tests:** `a_caller_that_derives_its_id_keeps_the_conflict` y `a_caller_that_derives_its_id_joins_no_remote` (`project.rs`); `registering_without_assigned_ids_keeps_the_old_answer` (`tests/api.rs`).
 
 ## CI5. Unir reconcilia
 
@@ -96,7 +96,7 @@ Ninguna otra columna MUST cambiar. Cada reemplazo MUST quedar en `memory_move_su
 - WHEN se unen
 - THEN hay una sola fila viva por clave (la más nueva) y por texto (la más vieja), las otras quedan `superseded` por ellas con causa `revision`, y al borrar la vigente de la clave la otra vuelve viva
 
-**Tests:** `merging_keeps_the_newest_version_of_a_key`, `merging_keeps_the_oldest_row_of_a_text`, `merging_does_not_depend_on_which_clone_came_first`, `merging_never_cuts_a_save` (`relocate.rs`).
+**Tests:** los `reconcile_*` y `decide_merge_*` (puros), `merging_keeps_the_newest_version_of_a_key`, `merging_keeps_the_oldest_row_of_a_text`, `merging_does_not_depend_on_which_clone_came_first`, `merging_a_long_save_twice_keeps_one_whole` (`relocate.rs`).
 
 ## CI6. Deshacer una unión
 
@@ -114,7 +114,7 @@ Un registro que va a mover filas MUST tomar antes un snapshot `pre-rekey` (`Reas
 
 El puente MUST registrar cada raíz con `assigned` y usar, para memorias, el id de proyecto que responde, y para `search_project`, el id de raíz; si el registro falla por otra causa que un 409 o un rechazo de conexión, MUST seguir con `derive_project_id(raíz)` y un warn, como antes. Los hooks MUST registrar la raíz del `cwd` (sin `index_docs`) y leer con el id que responde; si el registro falla, MUST leer con `derive_project_id(raíz)` y, ante un 409, no imprimir el contexto. `clawg projects add`, `projects move --to PATH` y `--here` MUST registrar y usar ese id. `clawg export --project PATH` MUST leer el id del store sin el daemon: el de `project_remote` para la clave de la raíz, si no el de la raíz en `project`, si no `derive_project_id`. El import MUST asignar los ids de sus raíces dentro de su transacción con la misma regla, y una raíz con clave MUST dar el id de proyecto de esa clave.
 
-**Tests:** `a_bridge_uses_the_ids_the_daemon_gives` y `search_project_reads_the_docs_of_its_own_root` (`server.rs`); `the_hook_reads_the_project_the_daemon_gives` (`hook.rs`); `export_reads_the_project_id_from_the_store` (`crates/clawg-core/src/memory/project.rs`); `an_import_gives_a_colliding_root_its_own_id` (`import.rs`).
+**Tests:** `two_clones_of_one_remote_share_their_memories`, `search_project_reads_the_docs_of_its_own_root` y `a_colliding_root_gets_a_project_of_its_own` (`server.rs`); `two_clones_share_their_memories_through_a_real_daemon` (`tests/binary.rs`: el hook y `memories list --here` en el segundo clone); `export_reads_the_project_id_from_the_store` (`crates/clawg-core/src/memory/portability/export.rs`); `an_import_gives_a_colliding_root_its_own_id` y `an_import_into_a_clone_goes_to_the_project_of_its_remote` (`import.rs`).
 
 ## CI9. `doctor`
 
