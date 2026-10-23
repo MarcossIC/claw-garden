@@ -1165,6 +1165,39 @@ async fn session_start_injects_the_saved_memories() {
 }
 
 #[tokio::test]
+async fn two_clones_share_their_memories_through_a_real_daemon() {
+    let sandbox = Sandbox::new();
+    let clone = |name: &str| {
+        let root = sandbox.home.join(name).join("app");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[remote \"origin\"]\n\turl = git@github.com:acme/app.git\n")
+            .unwrap();
+        root
+    };
+    let (work, review) = (clone("work"), clone("review"));
+    let daemon = sandbox.serve().await;
+    let (status, registered) =
+        daemon.post("/v1/projects", json!({ "root_path": work.to_string_lossy(), "assigned": true })).await;
+    assert_eq!(status, 200, "{registered}");
+    let (status, body) = daemon
+        .post(
+            "/v1/memories",
+            json!({ "content": "the deploy script lives in ops/deploy.sh", "agent_id": "smoke", "project_id": registered["project_id"] }),
+        )
+        .await;
+    assert!(status == 201 || status == 202, "{body}");
+    daemon.wait_until_ingested().await;
+
+    let input = json!({ "session_id": "s", "cwd": review, "hook_event_name": "SessionStart", "source": "startup" });
+    let out = hook(&sandbox, &["session-start", "--agent", "smoke", "--profile", "dev"], &input.to_string());
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let reply: Value = serde_json::from_str(&stdout_of(&out)).expect("one JSON object");
+    let context = reply["hookSpecificOutput"]["additionalContext"].as_str().expect("context");
+    assert!(context.contains("ops/deploy.sh"), "the other clone's memory: {context}");
+}
+
+#[tokio::test]
 async fn a_hook_registers_the_session_of_the_saves() {
     let sandbox = Sandbox::new();
     let root = sandbox.home.join("repo");
