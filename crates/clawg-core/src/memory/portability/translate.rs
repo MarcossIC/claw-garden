@@ -68,6 +68,9 @@ pub struct NoteRows {
     pub rows: Range<i64>,
     /// Its text held a secret, masked before it was split.
     pub masked: bool,
+    /// Its text date was after the import or could not be read, so its rows
+    /// carry the time of this import, which no later import gives again.
+    pub undated: bool,
 }
 
 /// Notes of one type of the source, and the type they were stored as.
@@ -194,6 +197,15 @@ pub struct ForeignReport {
     pub topic_taken: Vec<TakenKey>,
     pub taken_projects: Vec<TakenProject>,
     pub left_out: Vec<LeftOut>,
+    /// Notes already here, by the project they are in here (`""` for none),
+    /// wherever the map would put them now.
+    pub present: BTreeMap<String, usize>,
+    /// Notes stored as a newer version of the one their origin has here, and
+    /// notes stored as an older one.
+    pub revised: Vec<String>,
+    pub older_versions: Vec<String>,
+    /// Notes the source deleted whose rows here were left as they are.
+    pub deleted_at_source: Vec<String>,
 }
 
 /// Importance of a note, and of one the source pinned, which is never
@@ -235,6 +247,8 @@ struct Draft<'a> {
     deleted_at: Option<i64>,
     /// A date after the import, or one that could not be read, was replaced.
     clamped: bool,
+    /// The date replaced was its text's.
+    undated: bool,
     accesses: i64,
     pinned: bool,
     session: Option<String>,
@@ -270,6 +284,7 @@ impl<'a> Draft<'a> {
             last_accessed: last_seen.map_or(written, |(at, _)| at.max(written)),
             deleted_at: deleted.map(|(at, _)| at),
             clamped: late || last_seen.is_some_and(|(_, c)| c) || deleted.is_some_and(|(_, c)| c),
+            undated: late,
             accesses: i64::try_from(note.seen).unwrap_or(i64::MAX).max(1),
             pinned: note.pinned,
             session: note.session.clone().filter(|id| kept_session(id)),
@@ -606,6 +621,7 @@ fn lines(drafts: &[Draft<'_>], options: &TranslateOptions, mut report: ForeignRe
             project_id: d.project_id.clone(),
             rows: first..first + d.pieces.len() as i64,
             masked: d.masked,
+            undated: d.undated,
         });
     }
     report.rows = parsed.memories.len();
@@ -1116,6 +1132,8 @@ pub(crate) mod tests {
         assert_eq!(row(&t, "engram:deleted").deleted_at, Some(NOW));
         assert_eq!(row(&t, "engram:fine").created_at, T0);
         assert_eq!(t.report.clamped_dates, ["engram:future", "engram:unreadable", "engram:seen", "engram:deleted"]);
+        let undated: Vec<&str> = t.notes.iter().filter(|n| n.undated).map(|n| n.origin.as_str()).collect();
+        assert_eq!(undated, ["engram:future", "engram:unreadable"], "only a replaced text date leaves a note without its own");
     }
 
     #[test]

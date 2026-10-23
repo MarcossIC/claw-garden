@@ -6,7 +6,9 @@
 //! stored row is kept here too: the text masked, its hash, its text index
 //! entry, one live row per text and one live save per topic key. An export
 //! of another tool takes the same passes once [`super::translate`] has made
-//! its notes rows, each masked whole and split as a save of its text.
+//! its notes rows, each masked whole and split as a save of its text; a note
+//! whose origin is here already is found where its rows are, as the same
+//! version or as a rewrite of theirs that goes where they are.
 //!
 //! Three passes. The first places every row and link inside a transaction it
 //! then drops, so rows of one file see each other and a dry run is exactly
@@ -17,7 +19,9 @@
 //! empty, so importing the same file twice, or again after a crash between
 //! transactions, does no harm.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -46,7 +50,8 @@ use crate::memory::{MemoryError, MemoryStore};
 /// memory while it is placed, embedded and written.
 pub const MAX_IMPORT_BYTES: usize = 256 * 1024 * 1024;
 
-/// Rows written per transaction.
+/// Rows written per transaction, whole notes of another tool each: a note
+/// longer than this is written alone.
 const WRITE_BATCH: usize = 256;
 /// Texts embedded per call.
 const EMBED_BATCH: usize = 32;
@@ -144,6 +149,8 @@ struct Row {
     /// Read from the text stored here, never from the file's `lang`: a file
     /// cannot say what its text does not.
     lang: &'static str,
+    /// The note of another tool it came from, in [`Prepared::notes`].
+    note: Option<usize>,
 }
 
 impl Row {
@@ -168,6 +175,33 @@ struct Prepared {
     /// the project its rows go to.
     projects: Vec<ProjectHere>,
     parsed: Parsed,
+    /// For another tool's export, the notes its rows came from, in the order
+    /// of their rows; empty for a clawg file.
+    notes: Vec<NoteRows>,
+}
+
+impl Prepared {
+    /// The rows of each unit a write batch keeps whole, in order: a note of
+    /// another tool, or one row of a clawg file.
+    fn units(&self) -> Vec<usize> {
+        let mut units: Vec<usize> = Vec::new();
+        let mut last = None;
+        for row in &self.rows {
+            match (row.note, units.last_mut()) {
+                (Some(n), Some(len)) if last == Some(n) => *len += 1,
+                (note, _) => {
+                    units.push(1);
+                    last = note;
+                }
+            }
+        }
+        units
+    }
+
+    /// What the import found here of the note `row` came from.
+    fn found<'l>(&self, row: &Row, ledger: &'l Ledger) -> Option<&'l Found> {
+        ledger.notes.get(&self.notes[row.note?].rows.start)
+    }
 }
 
 /// A project of the file, as it is recorded here.
@@ -203,14 +237,13 @@ async fn plan(store: &MemoryStore, roots: &[(PathBuf, Option<String>)]) -> Resul
     Ok(store.conn.call(move |c| plan_ids_in(c, &planned)).await.map_err(MemoryError::Connection)?)
 }
 
-/// Whether the texts of a file are masked yet.
-#[derive(Clone, Copy)]
-enum Texts<'a> {
+/// What the texts of a file are.
+enum Texts {
     /// As a clawg export carries them: masked here.
     Raw,
-    /// Masked whole before they were split, which masking a piece alone
-    /// could undo; the rows whose text held a secret.
-    Masked(&'a HashSet<i64>),
+    /// The rows of notes of another tool, each masked whole before it was
+    /// split, which masking a piece alone could undo.
+    Notes(Vec<NoteRows>),
 }
 
 /// `roots` are the roots here of the file's projects, in order, and `ids`
@@ -220,7 +253,7 @@ fn prepare(
     roots: &[(PathBuf, Option<String>)],
     ids: &[(String, String)],
     options: &ImportOptions,
-    texts: Texts<'_>,
+    texts: Texts,
 ) -> Prepared {
     let mut project_ids: HashMap<String, String> = HashMap::new();
     let mut projects = Vec::new();
@@ -246,17 +279,24 @@ fn prepare(
             contexts.entry(piece.memory).or_insert_with(|| piece.context.clone());
         }
     }
+    let notes = match texts {
+        Texts::Raw => Vec::new(),
+        Texts::Notes(notes) => notes,
+    };
+    let secret: HashSet<i64> = notes.iter().filter(|n| n.masked).flat_map(|n| n.rows.clone()).collect();
+    let note_of: HashMap<i64, usize> = notes.iter().enumerate().flat_map(|(i, n)| n.rows.clone().map(move |id| (id, i))).collect();
     let mut lines = std::mem::take(&mut parsed.memories);
     lines.sort_by_key(|(_, m)| m.id);
     let rows = lines
         .into_iter()
         .map(|(line, src)| {
-            let (content, redacted) = match texts {
-                Texts::Raw => {
+            let note = note_of.get(&src.id).copied();
+            let (content, redacted) = match note {
+                None => {
                     let masked = redact(&src.content);
                     (masked.text, !masked.kinds.is_empty())
                 }
-                Texts::Masked(secret) => (src.content.clone(), secret.contains(&src.id)),
+                Some(_) => (src.content.clone(), secret.contains(&src.id)),
             };
             Row {
                 line,
@@ -268,10 +308,11 @@ fn prepare(
                 lang: language::column_value(language::detect(&content)),
                 content,
                 src,
+                note,
             }
         })
         .collect();
-    Prepared { rows, projects, parsed }
+    Prepared { rows, projects, parsed, notes }
 }
 
 /// Where a row of the file ended up.
@@ -284,13 +325,16 @@ enum Placement {
     Merged(i64),
     /// Inserted superseded by the live row holding its topic key.
     TopicTaken { id: i64, by: i64 },
+    /// Inserted superseded by the first live row of a newer version of its
+    /// note.
+    Older { id: i64, by: i64 },
 }
 
 impl Placement {
     fn id(self) -> i64 {
         match self {
             Placement::Inserted(id) | Placement::Present(id) | Placement::Merged(id) => id,
-            Placement::TopicTaken { id, .. } => id,
+            Placement::TopicTaken { id, .. } | Placement::Older { id, .. } => id,
         }
     }
 
@@ -300,7 +344,7 @@ impl Placement {
     }
 
     fn inserted(self) -> bool {
-        matches!(self, Placement::Inserted(_) | Placement::TopicTaken { .. })
+        matches!(self, Placement::Inserted(_) | Placement::TopicTaken { .. } | Placement::Older { .. })
     }
 }
 
@@ -316,6 +360,135 @@ struct Ledger {
     taken: HashMap<String, String>,
     invalid: Vec<Invalid>,
     dropped: Vec<Invalid>,
+    /// What each note of another tool is here, by its first row.
+    notes: HashMap<i64, Found>,
+    /// Rows of notes that are here whose text is not stored any more: there
+    /// is nothing to place, and no link to write or drop.
+    absent: HashSet<i64>,
+}
+
+/// A row here imported from the origin of a note.
+#[derive(Debug, Clone)]
+struct OriginRow {
+    id: i64,
+    project: Option<String>,
+    key: Option<String>,
+    created_at: i64,
+    hash: String,
+    deleted: bool,
+    live: bool,
+}
+
+/// What the rows of its origin here make of a note, decided at its first
+/// row and kept for the others.
+#[derive(Debug, Clone)]
+enum Found {
+    /// Nothing of its origin is here.
+    New,
+    /// It is here, in `project`, wherever the map puts it now: each of its
+    /// rows is the row of its origin with its text. `kept`: the source
+    /// deleted it and its rows here are not deleted.
+    Present { project: Option<String>, rows: Vec<OriginRow>, kept: bool },
+    /// The source rewrote it: its rows go to the project and the key of the
+    /// latest version here, and a row of the text of a live row of its
+    /// origin (`shared`) is that row. A newer version replaces the other live
+    /// rows (`replaces`); an older one goes under the first live row.
+    Revision {
+        project: Option<String>,
+        key: Option<String>,
+        newer: bool,
+        shared: Vec<OriginRow>,
+        replaces: Vec<i64>,
+    },
+}
+
+const ORIGIN_SQL: &str = "SELECT id, project_id, topic_key, created_at, content_hash, \
+       deleted_at IS NOT NULL, deleted_at IS NULL AND status IN ('active', 'disputed') \
+     FROM memory WHERE source = 'import' AND created_by_ref = ?1 ORDER BY id";
+
+const REVISED_SQL: &str = "UPDATE memory SET status = 'superseded', superseded_by = ?2, supersede_cause = 'revision' \
+     WHERE id = ?1 AND deleted_at IS NULL AND status IN ('active', 'disputed')";
+
+/// What the rows of `note`'s origin here make of it; `rows` are the note's.
+/// A note is the same version as a row of its origin with its date, the one
+/// a source gives a text when it writes or rewrites it.
+fn find(tx: &Transaction<'_>, note: &NoteRows, rows: &[&Row]) -> rusqlite::Result<Found> {
+    let stored: Vec<OriginRow> = {
+        let mut stmt = tx.prepare_cached(ORIGIN_SQL)?;
+        let found = stmt.query_map([&note.origin], |r| {
+            Ok(OriginRow {
+                id: r.get(0)?,
+                project: r.get(1)?,
+                key: r.get(2)?,
+                created_at: r.get(3)?,
+                hash: r.get(4)?,
+                deleted: r.get(5)?,
+                live: r.get(6)?,
+            })
+        })?;
+        found.collect::<rusqlite::Result<_>>()?
+    };
+    let Some(first) = rows.first() else { return Ok(Found::New) };
+    if stored.is_empty() {
+        return Ok(Found::New);
+    }
+    let written = first.src.created_at;
+    let deleted_at_source = first.src.deleted_at.is_some();
+    let undeleted: Vec<&OriginRow> = stored.iter().filter(|r| !r.deleted).collect();
+    let present =
+        |project: Option<String>| Found::Present { project, rows: stored.clone(), kept: deleted_at_source && !undeleted.is_empty() };
+    if let Some(same) = stored.iter().find(|r| r.created_at == written) {
+        return Ok(present(same.project.clone()));
+    }
+    let Some(latest) = newest(undeleted.iter().copied()) else {
+        // Deleted here: an import never brings back what the user deleted.
+        return Ok(present(newest(&stored).and_then(|r| r.project.clone())));
+    };
+    // Without a date of its own the note cannot tell its version, and a note
+    // the source deleted leaves what is here as it is.
+    if note.undated || deleted_at_source {
+        return Ok(present(latest.project.clone()));
+    }
+    let newer = written > latest.created_at;
+    let shared: Vec<OriginRow> = stored.iter().filter(|r| r.live).cloned().collect();
+    let hashes: HashSet<&str> = rows.iter().map(|r| r.hash.as_str()).collect();
+    let replaces = match newer {
+        true => shared.iter().filter(|r| !hashes.contains(r.hash.as_str())).map(|r| r.id).collect(),
+        false => Vec::new(),
+    };
+    Ok(Found::Revision {
+        project: latest.project.clone(),
+        key: latest.key.clone().or_else(|| first.src.topic_key.clone()),
+        newer,
+        shared,
+        replaces,
+    })
+}
+
+/// The first row of the version with the latest date.
+fn newest<'a>(rows: impl IntoIterator<Item = &'a OriginRow>) -> Option<&'a OriginRow> {
+    rows.into_iter().min_by_key(|r| (Reverse(r.created_at), r.id))
+}
+
+/// The row here of a row of a note that is here: the row of its origin with
+/// its text, of the note's own date first, or the live row of its text it was
+/// merged into. `None` when its text is not stored here any more.
+fn present_at(tx: &Transaction<'_>, row: &Row, project: Option<&str>, stored: &[OriginRow]) -> rusqlite::Result<Option<Placement>> {
+    let own = stored.iter().filter(|r| r.hash == row.hash).min_by_key(|r| (r.created_at != row.src.created_at, r.id));
+    if let Some(r) = own {
+        return Ok(Some(Placement::Present(r.id)));
+    }
+    let twin: Option<i64> = tx.query_row(TWIN_SQL, rusqlite::params![project, row.hash], |r| r.get(0)).optional()?;
+    Ok(twin.map(Placement::Merged))
+}
+
+/// The project and key `row` goes to here: its own, or the latest stored
+/// version's for a rewrite of a note that is here.
+fn target<'a>(row: &'a Row, found: Option<&'a Found>) -> (Option<&'a str>, Option<&'a str>) {
+    match found {
+        Some(Found::Revision { project, key, .. }) => (project.as_deref(), key.as_deref()),
+        _ => (row.project.as_deref(), row.src.topic_key.as_deref()),
+    }
 }
 
 const PRESENT_SQL: &str = "SELECT id FROM memory \
@@ -330,9 +503,12 @@ const TWIN_SQL: &str = "SELECT id FROM memory \
        AND content_hash = ?2 AND deleted_at IS NULL AND status IN ('active', 'disputed') \
      ORDER BY created_at ASC LIMIT 1";
 
+/// The live rows of the project that hold the key, but for the rows of the
+/// origin `?3`, which a revision replaces instead of going under them.
 const TOPIC_HOLDERS_SQL: &str = "SELECT id FROM memory \
      WHERE COALESCE(project_id, '') = COALESCE(?1, '') \
        AND topic_key = ?2 AND deleted_at IS NULL AND status IN ('active', 'disputed') \
+       AND NOT (source = 'import' AND created_by_ref IS ?3) \
      ORDER BY id";
 
 /// `disputed_against`, `revived_from` and a `superseded_by` from the file
@@ -369,33 +545,45 @@ fn record_projects(tx: &Transaction<'_>, projects: &[ProjectHere], now: i64) -> 
     Ok(taken)
 }
 
-/// Places one row: finds it here, or inserts it with `vector`. `None` when
-/// the row would be inserted live and has no vector, which only happens on
-/// the writing pass when the store changed since the first.
+/// Places one row where `found` sends the rows of its note: finds it here,
+/// or inserts it with `vector`. `None` when the row would be inserted live
+/// and has no vector, which only happens on the writing pass when the store
+/// changed since the first.
 fn place(
     tx: &Transaction<'_>,
     row: &Row,
+    found: Option<&Found>,
     ledger: &mut Ledger,
     vector: Option<&[u8]>,
     needs_vector: bool,
 ) -> rusqlite::Result<Option<Placement>> {
+    let (project, key) = target(row, found);
+    let (under, origin) = match found {
+        Some(Found::Revision { newer, shared, .. }) => {
+            if let Some(r) = shared.iter().find(|r| r.hash == row.hash) {
+                return Ok(Some(Placement::Merged(r.id)));
+            }
+            let under = if *newer { None } else { shared.first().map(|r| r.id) };
+            (under, Some(row.src.created_by_ref.as_str()))
+        }
+        _ => (None, None),
+    };
     let present: Option<i64> = tx
-        .query_row(PRESENT_SQL, rusqlite::params![row.agent, row.project, row.hash, row.src.created_at], |r| r.get(0))
+        .query_row(PRESENT_SQL, rusqlite::params![row.agent, project, row.hash, row.src.created_at], |r| r.get(0))
         .optional()?;
     if let Some(id) = present {
         return Ok(Some(Placement::Present(id)));
     }
     let mut topic_holder = None;
-    if row.live() {
-        let twin: Option<i64> =
-            tx.query_row(TWIN_SQL, rusqlite::params![row.project, row.hash], |r| r.get(0)).optional()?;
+    if under.is_none() && row.live() {
+        let twin: Option<i64> = tx.query_row(TWIN_SQL, rusqlite::params![project, row.hash], |r| r.get(0)).optional()?;
         if let Some(id) = twin {
             return Ok(Some(Placement::Merged(id)));
         }
-        if let Some(key) = &row.src.topic_key {
+        if let Some(key) = key {
             let mut stmt = tx.prepare_cached(TOPIC_HOLDERS_SQL)?;
             let holders: Vec<i64> =
-                stmt.query_map(rusqlite::params![row.project, key], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                stmt.query_map(rusqlite::params![project, key, origin], |r| r.get(0))?.collect::<Result<_, _>>()?;
             // The pieces of one save in the file share its key.
             topic_holder = holders.into_iter().find(|id| match ledger.import_agents.get(id) {
                 Some(agent) => *agent != row.src.agent_id,
@@ -406,7 +594,7 @@ fn place(
     if needs_vector && row.src.deleted_at.is_none() && vector.is_none() {
         return Ok(None);
     }
-    let (status, superseded_by, cause) = match topic_holder {
+    let (status, superseded_by, cause) = match under.or(topic_holder) {
         Some(by) => ("superseded", Some(by), Some("revision")),
         None => (row.src.status.as_str(), None, row.src.supersede_cause.as_deref()),
     };
@@ -414,7 +602,7 @@ fn place(
     tx.prepare_cached(INSERT_SQL)?.execute(rusqlite::params![
         src.scope,
         row.agent,
-        row.project,
+        project,
         row.content,
         src.memory_type,
         src.source,
@@ -435,7 +623,7 @@ fn place(
         src.dispute_count,
         src.last_disputed_at,
         row.hash,
-        src.topic_key,
+        key,
         row.lang,
         src.origin_project,
     ])?;
@@ -454,33 +642,72 @@ fn place(
         }
     }
     ledger.import_agents.insert(id, row.src.agent_id.clone());
-    Ok(Some(match topic_holder {
-        Some(by) => Placement::TopicTaken { id, by },
-        None => Placement::Inserted(id),
+    Ok(Some(match (under, topic_holder) {
+        (Some(by), _) => Placement::Older { id, by },
+        (None, Some(by)) => Placement::TopicTaken { id, by },
+        (None, None) => Placement::Inserted(id),
     }))
 }
 
-/// Places `rows`, skipping the ones a project of another root keeps out.
+/// Places the rows `range` of `prepared`, skipping the ones a project of
+/// another root keeps out. The rows of a note go where the rows of its
+/// origin here send them, found at its first row, which a batch never
+/// leaves out.
 fn place_rows(
     tx: &Transaction<'_>,
-    rows: &[Row],
+    prepared: &Prepared,
+    range: Range<usize>,
     ledger: &mut Ledger,
     vectors: &HashMap<i64, Vec<u8>>,
     needs_vector: bool,
 ) -> rusqlite::Result<()> {
-    for row in rows {
-        if let Some((id, root)) = row.project.as_ref().and_then(|p| ledger.taken.get(p).map(|root| (p, root))) {
+    let rows = &prepared.rows[range];
+    let mut current = None;
+    for (k, row) in rows.iter().enumerate() {
+        let note = row.note.map(|n| &prepared.notes[n]);
+        let first = note.is_some_and(|n| n.rows.start == row.src.id);
+        if let (Some(n), true) = (note, first) {
+            let own: Vec<&Row> = rows[k..].iter().take_while(|r| r.note == row.note).collect();
+            let found = find(tx, n, &own)?;
+            ledger.notes.insert(n.rows.start, found.clone());
+            current = Some(found);
+        }
+        let found = note.and(current.as_ref());
+        // A note here or rewritten goes where it is, not to the project of
+        // the map.
+        let goes_to_map = matches!(found, None | Some(Found::New));
+        if let Some((id, root)) =
+            row.project.as_ref().filter(|_| goes_to_map).and_then(|p| ledger.taken.get(p).map(|root| (p, root)))
+        {
             ledger.invalid.push(Invalid { line: row.line, reason: format!("project id {id} already belongs to {root}") });
             continue;
         }
-        match place(tx, row, ledger, vectors.get(&row.src.id).map(Vec::as_slice), needs_vector)? {
-            Some(placement) => {
-                ledger.placed.insert(row.src.id, placement);
+        let placement = match found {
+            Some(Found::Present { project, rows: stored, .. }) => match present_at(tx, row, project.as_deref(), stored)? {
+                Some(placement) => placement,
+                None => {
+                    ledger.absent.insert(row.src.id);
+                    continue;
+                }
+            },
+            _ => match place(tx, row, found, ledger, vectors.get(&row.src.id).map(Vec::as_slice), needs_vector)? {
+                Some(placement) => placement,
+                None => {
+                    ledger.invalid.push(Invalid {
+                        line: row.line,
+                        reason: "the store changed while importing; import the file again".into(),
+                    });
+                    continue;
+                }
+            },
+        };
+        ledger.placed.insert(row.src.id, placement);
+        // In the transaction that stores the note, so no cut between two
+        // transactions leaves both versions live.
+        if let (true, Some(Found::Revision { replaces, .. })) = (first, found) {
+            for id in replaces {
+                tx.prepare_cached(REVISED_SQL)?.execute([*id, placement.id()])?;
             }
-            None => ledger.invalid.push(Invalid {
-                line: row.line,
-                reason: "the store changed while importing; import the file again".into(),
-            }),
         }
     }
     Ok(())
@@ -490,6 +717,7 @@ fn place_rows(
 /// ids here. Rows already here only get the links they lack.
 fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -> rusqlite::Result<()> {
     let id_of = |src: i64| ledger.placed.get(&src).map(|p| p.id());
+    let absent = |src: i64| ledger.absent.contains(&src);
     let mut dropped = Vec::new();
 
     for row in &prepared.rows {
@@ -503,6 +731,7 @@ fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -
                 Some(by) => {
                     tx.execute("UPDATE memory SET superseded_by = ?2 WHERE id = ?1 AND superseded_by IS NULL", [id, by])?;
                 }
+                None if absent(by) => {}
                 None => dropped.push(Invalid {
                     line: row.line,
                     reason: format!("memory {} is superseded by {by}, which is not in the file", row.src.id),
@@ -597,13 +826,17 @@ fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -
     for (line, p) in &prepared.parsed.pieces {
         saves.entry(p.save).or_default().push((*line, p.piece, p.memory));
     }
+    // A note of another tool shares a row with another note as two saves of
+    // one text do, which the worker lets be a piece of both: only the rows of
+    // its own origin tell whether its pieces were written.
+    let notes = !prepared.notes.is_empty();
     for pieces in saves.values() {
-        let placed: Vec<(i64, i64)> = pieces.iter().filter_map(|(_, piece, m)| id_of(*m).map(|id| (*piece, id))).collect();
-        if !pieces.iter().any(|(_, _, m)| owned(*m)) {
+        if !pieces.iter().any(|(_, _, m)| owned(*m)) || pieces.iter().any(|(_, _, m)| absent(*m)) {
             continue;
         }
+        let placed: Vec<i64> = pieces.iter().filter(|(_, _, m)| !notes || owned(*m)).filter_map(|(_, _, m)| id_of(*m)).collect();
         let mut linked = false;
-        for (_, id) in &placed {
+        for id in &placed {
             linked |= tx.query_row("SELECT EXISTS (SELECT 1 FROM memory_piece WHERE memory_id = ?1)", [id], |r| r.get::<_, bool>(0))?;
         }
         if linked {
@@ -677,16 +910,35 @@ pub async fn import_foreign(
     let now = TimestampMs::now().as_millis_i64();
     // Masking and splitting thousands of notes is work the daemon's other
     // requests should not wait behind.
-    let (prepared, notes, foreign) = tokio::task::spawn_blocking(move || {
+    let (prepared, foreign) = tokio::task::spawn_blocking(move || {
         let Translated { parsed, notes, report } = translate(&export, &translate_options, &chunker, now);
-        let secret: HashSet<i64> = notes.iter().filter(|n| n.masked).flat_map(|n| n.rows.clone()).collect();
-        (prepare(parsed, &roots, &ids, &ImportOptions::default(), Texts::Masked(&secret)), notes, report)
+        (prepare(parsed, &roots, &ids, &ImportOptions::default(), Texts::Notes(notes)), report)
     })
     .await
     .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
     let prepared = Arc::new(prepared);
     let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
-    Ok(with_foreign(report(&prepared, &ledger, options.dry_run, snapshot), foreign, &notes, &ledger))
+    Ok(with_foreign(report(&prepared, &ledger, options.dry_run, snapshot), foreign, &prepared.notes, &ledger))
+}
+
+/// The batches the rows are written in, one transaction each, from the rows
+/// of each unit in order: whole units up to `limit` rows, or one unit alone
+/// when it has more. A cut between two transactions leaves whole notes, each
+/// with what its revision replaces, which the next import finds here.
+fn note_batches(units: &[usize], limit: usize) -> Vec<Range<usize>> {
+    let mut batches = Vec::new();
+    let (mut start, mut end) = (0, 0);
+    for &len in units {
+        if end > start && end - start + len > limit {
+            batches.push(start..end);
+            start = end;
+        }
+        end += len;
+    }
+    if end > start {
+        batches.push(start..end);
+    }
+    batches
 }
 
 /// Places every row and link of `prepared` and, unless this is a dry run,
@@ -706,7 +958,7 @@ async fn write(
         .call(move |c| -> rusqlite::Result<Ledger> {
             let tx = c.transaction()?;
             let mut ledger = Ledger { taken: record_projects(&tx, &decide.projects, now)?, ..Default::default() };
-            place_rows(&tx, &decide.rows, &mut ledger, &HashMap::new(), false)?;
+            place_rows(&tx, &decide, 0..decide.rows.len(), &mut ledger, &HashMap::new(), false)?;
             write_links(&tx, &decide, &mut ledger)?;
             // Dropped, never committed: this pass only finds out.
             Ok(ledger)
@@ -738,18 +990,22 @@ async fn write(
 
     let vectors = Arc::new(vectors);
     let mut ledger = Ledger::default();
-    for start in (0..prepared.rows.len().max(1)).step_by(WRITE_BATCH) {
+    let mut batches = note_batches(&prepared.units(), WRITE_BATCH);
+    if batches.is_empty() {
+        // The projects are recorded even when there is no row.
+        batches.push(0..0);
+    }
+    for (k, range) in batches.into_iter().enumerate() {
         let (batch, vectors) = (prepared.clone(), vectors.clone());
         let mut placed = std::mem::take(&mut ledger);
         ledger = store
             .conn
             .call(move |c| -> rusqlite::Result<Ledger> {
                 let tx = c.transaction()?;
-                if start == 0 {
+                if k == 0 {
                     placed.taken = record_projects(&tx, &batch.projects, now)?;
                 }
-                let end = (start + WRITE_BATCH).min(batch.rows.len());
-                place_rows(&tx, &batch.rows[start..end], &mut placed, &vectors, true)?;
+                place_rows(&tx, &batch, range, &mut placed, &vectors, true)?;
                 tx.commit()?;
                 Ok(placed)
             })
@@ -791,19 +1047,20 @@ fn report(prepared: &Prepared, ledger: &Ledger, dry_run: bool, snapshot: Option<
         match ledger.placed.get(&row.src.id) {
             Some(Placement::Present(_)) => report.present += 1,
             Some(Placement::Merged(into)) => report.merged.push(Merged { line: row.line, id: row.src.id, into: *into }),
-            Some(placement @ (Placement::Inserted(_) | Placement::TopicTaken { .. })) => {
+            Some(placement @ (Placement::Inserted(_) | Placement::TopicTaken { .. } | Placement::Older { .. })) => {
+                let (project, key) = target(row, prepared.found(row, ledger));
                 report.inserted += 1;
                 *report.by_type.entry(row.src.memory_type.clone()).or_default() += 1;
-                let state = if matches!(placement, Placement::TopicTaken { .. }) { "superseded" } else { row.state() };
+                let state = if matches!(placement, Placement::Inserted(_)) { row.state() } else { "superseded" };
                 *report.by_state.entry(state.to_string()).or_default() += 1;
-                *report.by_project.entry(row.project.clone().unwrap_or_default()).or_default() += 1;
+                *report.by_project.entry(project.unwrap_or_default().to_owned()).or_default() += 1;
                 *report.by_lang.entry(row.lang.to_string()).or_default() += 1;
                 report.redacted += usize::from(row.redacted);
                 if let Placement::TopicTaken { id, by } = placement {
                     report.topic_taken.push(TopicTaken {
                         line: row.line,
                         id: row.src.id,
-                        topic_key: row.src.topic_key.clone().unwrap_or_default(),
+                        topic_key: key.unwrap_or_default().to_owned(),
                         stored_as: *id,
                         by: *by,
                     });
@@ -861,6 +1118,19 @@ fn with_foreign(mut report: ImportReport, mut foreign: ForeignReport, notes: &[N
             })
         })
         .collect();
+    for note in notes {
+        match ledger.notes.get(&note.rows.start) {
+            Some(Found::Present { project, kept, .. }) => {
+                *foreign.present.entry(project.clone().unwrap_or_default()).or_default() += 1;
+                if *kept {
+                    foreign.deleted_at_source.push(note.origin.clone());
+                }
+            }
+            Some(Found::Revision { newer: true, .. }) => foreign.revised.push(note.origin.clone()),
+            Some(Found::Revision { newer: false, .. }) => foreign.older_versions.push(note.origin.clone()),
+            Some(Found::New) | None => {}
+        }
+    }
     report.foreign = Some(foreign);
     report
 }
@@ -868,16 +1138,17 @@ fn with_foreign(mut report: ImportReport, mut foreign: ForeignReport, notes: &[N
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::admin::{restore_memory_core, MemoryKind};
+    use crate::memory::admin::{delete_memory_core, restore_memory_core, MemoryKind};
     use crate::memory::db::seed_on_disk;
     use crate::memory::embedder::FakeEmbedder;
     use crate::memory::events::{MemoryEvent, MemorySource};
     use crate::memory::portability::export::{read, Export, ExportFilter};
     use crate::memory::portability::fixtures::{other_project, project, seed, ROOT};
-    use crate::memory::portability::foreign::ForeignNote;
+    use crate::memory::portability::foreign::{ForeignNote, When};
     use crate::memory::portability::format::tests::EXAMPLE;
-    use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note};
+    use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note, T0};
     use crate::memory::portability::translate::{ProjectCount, TakenKey, TakenProject};
+    use crate::memory::relocate::{move_memories_core, MoveFilter};
     use crate::memory::search::{search_all_memories, SearchScope};
     use crate::memory::worker::save_for_test;
     use crate::models::chat::Role;
@@ -1072,6 +1343,19 @@ mod tests {
             .unwrap();
         let (again, _) = run(&dst, &file, ImportOptions::default()).await;
         assert_eq!(again.present, 17);
+        assert_eq!(dump(&dst, EVERYTHING).await, whole);
+
+        // Notes of another tool, whose rows are found by their origin.
+        let dst = destination().await;
+        run_foreign(&dst, sample_notes(), ImportOptions::default()).await;
+        let whole = dump(&dst, EVERYTHING).await;
+        assert!(!whole.pieces.is_empty() && whole.memories.iter().any(|m| m.superseded_by.is_some()));
+        dst.conn
+            .call(|c| c.execute_batch("UPDATE memory SET superseded_by = NULL; DELETE FROM memory_piece;"))
+            .await
+            .unwrap();
+        let (again, _) = run_foreign(&dst, sample_notes(), ImportOptions::default()).await;
+        assert_eq!((again.inserted, again.present), (0, again.rows), "{again:#?}");
         assert_eq!(dump(&dst, EVERYTHING).await, whole);
     }
 
@@ -1399,20 +1683,105 @@ mod tests {
             .unwrap()
     }
 
-    /// The rows imported from `origin`: id, status, what supersedes it and why.
-    async fn imported(store: &MemoryStore, origin: &'static str) -> Vec<(i64, String, Option<i64>, Option<String>)> {
+    #[derive(Debug)]
+    struct Stored {
+        id: i64,
+        content: String,
+        status: String,
+        by: Option<i64>,
+        cause: Option<String>,
+        project: Option<String>,
+        key: Option<String>,
+        deleted: bool,
+    }
+
+    /// The rows imported from `origin`, by id.
+    async fn imported(store: &MemoryStore, origin: &'static str) -> Vec<Stored> {
         store
             .conn
             .call(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, status, superseded_by, supersede_cause FROM memory \
+                    "SELECT id, content, status, superseded_by, supersede_cause, project_id, topic_key, \
+                     deleted_at IS NOT NULL FROM memory \
                      WHERE source = 'import' AND created_by_ref = ?1 ORDER BY id",
                 )?;
-                let rows = stmt.query_map([origin], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                let rows = stmt.query_map([origin], |r| {
+                    Ok(Stored {
+                        id: r.get(0)?,
+                        content: r.get(1)?,
+                        status: r.get(2)?,
+                        by: r.get(3)?,
+                        cause: r.get(4)?,
+                        project: r.get(5)?,
+                        key: r.get(6)?,
+                        deleted: r.get(7)?,
+                    })
+                })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .await
             .unwrap()
+    }
+
+    /// The text of the pieces of each linked save, in order.
+    async fn saves(store: &MemoryStore) -> Vec<Vec<String>> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT p.save_id, m.content FROM memory_piece p JOIN memory m ON m.id = p.memory_id \
+                     ORDER BY p.save_id, p.piece",
+                )?;
+                let mut saves: Vec<(i64, Vec<String>)> = Vec::new();
+                for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+                    let (save, content) = row?;
+                    match saves.last_mut() {
+                        Some((last, pieces)) if *last == save => pieces.push(content),
+                        _ => saves.push((save, vec![content])),
+                    }
+                }
+                Ok::<_, rusqlite::Error>(saves.into_iter().map(|(_, pieces)| pieces).collect())
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The distinct pieces a save of `text` stores, in order.
+    fn pieces_of(text: &str) -> Vec<String> {
+        let mut seen = HashSet::new();
+        ChatChunker::with_fallback().split_save(text).pieces.into_iter().map(|c| c.text).filter(|p| seen.insert(content_hash(p))).collect()
+    }
+
+    /// Records `root` as a project here and returns its id.
+    async fn register(store: &MemoryStore, root: &'static str) -> String {
+        let id = crate::memory::identity::derive_project_id(Path::new(root));
+        let recorded = id.clone();
+        store
+            .conn
+            .call(move |c| {
+                c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", rusqlite::params![recorded, root])
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Notes of two projects of the source and of none: a long one, two under
+    /// one key, and one the source deleted.
+    fn sample_notes() -> Vec<ForeignNote> {
+        let in_a = |origin: &str, title: &str, content: &str| ForeignNote { project: Some("a".into()), ..foreign_note(origin, title, content) };
+        vec![
+            in_a("engram:long", "Notes on clawg-ledger", &"one writer per store, ".repeat(150)),
+            ForeignNote { topic_key: Some("sdd/x".into()), ..in_a("engram:old", "Proposal", "the first proposal") },
+            ForeignNote {
+                topic_key: Some("sdd/x".into()),
+                written: When::At(T0 + 1000),
+                ..in_a("engram:new", "Proposal", "the second proposal")
+            },
+            ForeignNote { project: Some("b".into()), ..foreign_note("engram:b", "In b", "a note of b") },
+            foreign_note("engram:loose", "Loose", "a note of no project"),
+            ForeignNote { deleted: Some(When::At(T0 + 5)), ..in_a("engram:gone", "Gone", "a note the source deleted") },
+        ]
     }
 
     #[tokio::test]
@@ -1474,8 +1843,8 @@ mod tests {
 
         let rows = imported(&dst, "engram:a").await;
         assert!(rows.len() > 1);
-        for (_, status, by, cause) in &rows {
-            assert_eq!((status.as_str(), *by, cause.as_deref()), ("superseded", Some(holder), Some("revision")));
+        for r in &rows {
+            assert_eq!((r.status.as_str(), r.by, r.cause.as_deref()), ("superseded", Some(holder), Some("revision")));
         }
         let foreign = report.foreign.clone().unwrap();
         assert_eq!(foreign.topic_taken, vec![TakenKey { origin: "engram:a".into(), topic_key: "storage/engine".into(), by: holder }]);
@@ -1547,12 +1916,181 @@ mod tests {
         assert_eq!(qualified, vec!["a/sdd/x", "b/sdd/x"]);
     }
 
+    #[tokio::test]
+    async fn a_second_import_adds_nothing_even_with_another_map() {
+        let dst = destination().await;
+        run_foreign(&dst, sample_notes(), ImportOptions::default()).await;
+        let first = dump(&dst, EVERYTHING).await;
+
+        let options = ImportOptions { project_map: vec![("a".into(), "/work/notes".into())], ..Default::default() };
+        let (again, _) = run_foreign(&dst, sample_notes(), options).await;
+
+        assert_eq!((again.inserted, again.present), (0, again.rows), "{again:#?}");
+        assert!(again.merged.is_empty() && again.invalid.is_empty() && again.dropped_links.is_empty(), "{again:#?}");
+        let second = dump(&dst, EVERYTHING).await;
+        assert_eq!(first.memories, second.memories, "no row added and no access counted");
+        assert_eq!((first.pieces, first.conflicts), (second.pieces, second.conflicts));
+        let foreign = again.foreign.unwrap();
+        assert_eq!(foreign.present, BTreeMap::from([(String::new(), 6)]), "counted where they are, not where the map puts them");
+        assert!(foreign.revised.is_empty() && foreign.older_versions.is_empty() && foreign.merged.is_empty(), "{foreign:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_moved_note_is_recognized_where_it_is() {
+        let dst = destination().await;
+        run_foreign(&dst, sample_notes(), ImportOptions::default()).await;
+        let moved_to = register(&dst, "/work/moved").await;
+        let backups = tempfile::tempdir().unwrap();
+        let filter = MoveFilter { origin_project: Some("a".into()), include_deleted: true, ..Default::default() };
+        let moved = move_memories_core(&dst, backups.path(), &filter, Some(moved_to.clone()), false).await.unwrap();
+        assert!(!moved.moved.is_empty());
+        let before = dump(&dst, EVERYTHING).await;
+
+        let options = ImportOptions { project_map: vec![("a".into(), "/work/other".into())], ..Default::default() };
+        let (again, _) = run_foreign(&dst, sample_notes(), options).await;
+
+        assert_eq!((again.inserted, again.present), (0, again.rows), "{again:#?}");
+        assert_eq!(dump(&dst, EVERYTHING).await.memories, before.memories);
+        let present = again.foreign.unwrap().present;
+        assert_eq!(present, BTreeMap::from([(String::new(), 2), (moved_to, 4)]));
+    }
+
+    #[tokio::test]
+    async fn a_note_deleted_here_is_not_brought_back() {
+        let dst = destination().await;
+        let port = || foreign_note("engram:port", "Port", "the daemon listens on 27380");
+        run_foreign(&dst, vec![port()], ImportOptions::default()).await;
+        let id = imported(&dst, "engram:port").await[0].id;
+        delete_memory_core(&dst, id, MemoryKind::Memory, None).await.unwrap();
+        let before = dump(&dst, EVERYTHING).await;
+
+        let rewritten = ForeignNote { written: When::At(T0 + 1000), ..foreign_note("engram:port", "Port", "the daemon listens on 27390") };
+        for notes in [vec![port()], vec![rewritten]] {
+            let (again, _) = run_foreign(&dst, notes, ImportOptions::default()).await;
+            assert_eq!(again.inserted, 0, "{again:#?}");
+            let foreign = again.foreign.unwrap();
+            assert_eq!(foreign.present, BTreeMap::from([(String::new(), 1)]));
+            assert!(foreign.revised.is_empty() && foreign.deleted_at_source.is_empty(), "{foreign:#?}");
+            assert_eq!(dump(&dst, EVERYTHING).await.memories, before.memories);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_note_rewritten_at_the_source_revises_the_stored_one_where_it_is() {
+        let dst = destination().await;
+        let words: Vec<String> = (0..700).map(|i| format!("w{i}")).collect();
+        let long = |end: &str, written: i64| ForeignNote {
+            written: When::At(written),
+            ..foreign_note("engram:long", "Notes on clawg-ledger", &format!("{} {end}", words.join(" ")))
+        };
+        let proposal = |project: &str, content: &str, written: i64| ForeignNote {
+            project: Some(project.into()),
+            topic_key: Some("sdd/x".into()),
+            written: When::At(written),
+            ..foreign_note(&format!("engram:{project}"), "Proposal", content)
+        };
+        let first = vec![proposal("a", "the proposal of a", T0), proposal("b", "the proposal of b", T0), long("closing", T0)];
+        run_foreign(&dst, first, ImportOptions::default()).await;
+        let elsewhere = register(&dst, "/work/elsewhere").await;
+        let backups = tempfile::tempdir().unwrap();
+        let filter = MoveFilter { origin_project: Some("a".into()), ..Default::default() };
+        move_memories_core(&dst, backups.path(), &filter, Some(elsewhere.clone()), false).await.unwrap();
+
+        let rewritten = vec![proposal("a", "the second proposal of a", T0 + 1000), long("changed", T0 + 1000)];
+        let (report, _) = run_foreign(&dst, rewritten, ImportOptions::default()).await;
+
+        let a = imported(&dst, "engram:a").await;
+        assert_eq!(a.len(), 2, "{a:#?}");
+        let (old, new) = (&a[0], &a[1]);
+        assert_eq!(
+            (new.content.as_str(), new.status.as_str(), new.project.as_deref(), new.key.as_deref()),
+            ("Proposal\nthe second proposal of a", "active", Some(elsewhere.as_str()), Some("a/sdd/x")),
+            "where the stored version is, under its key"
+        );
+        assert_eq!((old.status.as_str(), old.by, old.cause.as_deref()), ("superseded", Some(new.id), Some("revision")));
+        assert_eq!(imported(&dst, "engram:b").await[0].status, "active");
+
+        let text = |end: &str| format!("Notes on clawg-ledger\n{} {end}", words.join(" "));
+        let (before, after) = (pieces_of(&text("closing")), pieces_of(&text("changed")));
+        assert_eq!(before[0], after[0], "the rewrite changes only the end");
+        let rows = imported(&dst, "engram:long").await;
+        let head = rows.iter().find(|r| r.content == after[0]).unwrap().id;
+        let live: Vec<&str> = rows.iter().filter(|r| r.status == "active").map(|r| r.content.as_str()).collect();
+        assert_eq!(live, after.iter().map(String::as_str).collect::<Vec<_>>(), "the pieces of the new version, the shared ones kept");
+        for r in rows.iter().filter(|r| !after.contains(&r.content)) {
+            assert_eq!((r.status.as_str(), r.by, r.cause.as_deref()), ("superseded", Some(head), Some("revision")), "{r:?}");
+        }
+        assert_eq!(rows.len(), before.len() + after.iter().filter(|p| !before.contains(p)).count(), "no text stored twice");
+        let saves = saves(&dst).await;
+        assert!(saves.contains(&before) && saves.contains(&after), "each version is a save of its text: {saves:#?}");
+
+        assert_eq!(report.by_project.get(&elsewhere), Some(&1), "{report:#?}");
+        let foreign = report.foreign.unwrap();
+        assert_eq!(foreign.revised, ["engram:a", "engram:long"]);
+        assert!(foreign.present.is_empty() && foreign.older_versions.is_empty(), "{foreign:#?}");
+    }
+
+    #[tokio::test]
+    async fn an_older_version_enters_superseded() {
+        let dst = destination().await;
+        let older = || foreign_note("engram:port", "Port", "the daemon listens on 27380");
+        let newer = ForeignNote { written: When::At(T0 + 1000), ..foreign_note("engram:port", "Port", "the daemon listens on 27390") };
+        run_foreign(&dst, vec![newer], ImportOptions::default()).await;
+
+        let (report, _) = run_foreign(&dst, vec![older()], ImportOptions::default()).await;
+
+        let rows = imported(&dst, "engram:port").await;
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        let (live, old) = (&rows[0], &rows[1]);
+        assert_eq!((live.status.as_str(), live.by), ("active", None));
+        assert_eq!(
+            (old.content.as_str(), old.status.as_str(), old.by, old.cause.as_deref()),
+            ("Port\nthe daemon listens on 27380", "superseded", Some(live.id), Some("revision"))
+        );
+        assert_eq!((report.inserted, report.by_state.clone()), (1, BTreeMap::from([("superseded".to_string(), 1)])));
+        assert_eq!(report.foreign.unwrap().older_versions, ["engram:port"]);
+
+        let (again, _) = run_foreign(&dst, vec![older()], ImportOptions::default()).await;
+        assert_eq!((again.inserted, again.present), (0, 1), "{again:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_note_deleted_at_the_source_changes_nothing() {
+        let dst = destination().await;
+        let port = || foreign_note("engram:port", "Port", "the daemon listens on 27380");
+        run_foreign(&dst, vec![port()], ImportOptions::default()).await;
+        let before = dump(&dst, EVERYTHING).await;
+
+        let deleted = ForeignNote { deleted: Some(When::At(T0 + 5)), ..port() };
+        let rewritten_then_deleted = ForeignNote {
+            written: When::At(T0 + 1000),
+            deleted: Some(When::At(T0 + 2000)),
+            ..foreign_note("engram:port", "Port", "the daemon listens on 27390")
+        };
+        for note in [deleted, rewritten_then_deleted] {
+            let (report, _) = run_foreign(&dst, vec![note], ImportOptions::default()).await;
+            assert_eq!(report.inserted, 0, "{report:#?}");
+            assert_eq!(dump(&dst, EVERYTHING).await.memories, before.memories);
+            let foreign = report.foreign.unwrap();
+            assert_eq!(foreign.deleted_at_source, ["engram:port"]);
+            assert_eq!(foreign.present, BTreeMap::from([(String::new(), 1)]));
+        }
+        assert!(imported(&dst, "engram:port").await.iter().all(|r| !r.deleted));
+    }
+
+    #[test]
+    fn write_batches_never_split_a_note() {
+        assert_eq!(note_batches(&[100, 100, 100, 10, 300, 1], 256), vec![0..200, 200..310, 310..610, 610..611]);
+        assert_eq!(note_batches(&[1; 5], 2), vec![0..2, 2..4, 4..5], "a clawg file's rows are units of one");
+        assert!(note_batches(&[], 256).is_empty());
+    }
+
     #[test]
     fn a_project_taken_while_importing_is_told_by_its_notes() {
         let (id, root, other) = ("notes-1a2b", "/work/notes", "/not/the/notes");
         let notes = vec![
-            NoteRows { origin: "engram:a1".into(), project_id: Some(id.into()), rows: 1..2, masked: false },
-            NoteRows { origin: "engram:a2".into(), project_id: Some(id.into()), rows: 2..3, masked: false },
+            NoteRows { origin: "engram:a1".into(), project_id: Some(id.into()), rows: 1..2, masked: false, undated: false },
+            NoteRows { origin: "engram:a2".into(), project_id: Some(id.into()), rows: 2..3, masked: false, undated: false },
         ];
         let ledger = Ledger { taken: HashMap::from([(id.to_string(), other.to_string())]), ..Default::default() };
         let invalid = |line| Invalid { line, reason: format!("project id {id} already belongs to {other}") };

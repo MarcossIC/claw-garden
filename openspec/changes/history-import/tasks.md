@@ -28,8 +28,8 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 5. Reconocimiento por origen y revisiones (HI11 a HI13)
 
-- [ ] Tests `a_second_import_adds_nothing_even_with_another_map`, `a_moved_note_is_recognized_where_it_is`, `a_note_deleted_here_is_not_brought_back`, `a_note_rewritten_at_the_source_revises_the_stored_one_where_it_is`, `an_older_version_enters_superseded`, `a_note_deleted_at_the_source_changes_nothing`, `write_batches_never_split_a_note` y el de vínculos entre transacciones (`import.rs`).
-- [ ] La decisión por origen en `place`, `note_batches`, la regla de piezas por origen.
+- [x] Tests `a_second_import_adds_nothing_even_with_another_map`, `a_moved_note_is_recognized_where_it_is`, `a_note_deleted_here_is_not_brought_back`, `a_note_rewritten_at_the_source_revises_the_stored_one_where_it_is`, `an_older_version_enters_superseded`, `a_note_deleted_at_the_source_changes_nothing`, `write_batches_never_split_a_note` y el de vínculos entre transacciones (`import.rs`).
+- [x] La decisión por origen en `place`, `note_batches`, la regla de piezas por origen.
 - Commit: `feat(core): recognize imported notes by their origin and take in their rewrites`
 
 ## 6. Borradas y relaciones (HI14)
