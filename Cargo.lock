@@ -343,7 +343,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clawg-cli"
-version = "0.53.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "clawg-core"
-version = "0.53.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "clawg-eval"
-version = "0.53.0"
+version = "0.54.0"
 dependencies = [
  "clawg-cli",
  "clawg-core",
