@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M–L (la parte B de la [exploración de 78](../language-preference/exploration.md#alcance-candidato)) | language-preference (78): `Lang` y `preferences.json` | ver [`state.yaml`](state.yaml) |
+| 1 | M–L (la parte B de la [exploración de 78](../archive/2026-10-23-language-preference/exploration.md#alcance-candidato)) | language-preference (78): `Lang` y `preferences.json` | ver [`state.yaml`](state.yaml) |
 
 ## Problema
 
@@ -40,7 +40,7 @@ Las decisiones 6 y 10 de la exploración ya están cerradas: se localiza lo que 
 6. `export` e `import`: sus informes.
 7. `restore`, `undelete`, `outbox`, `projects` (`add` y `move`), `sharing` (la política, que compone `SharingPolicy::render` en `clawg-core`, y la negativa de ocultar a un agente de sí mismo), `metrics` (los errores que compone), `memories` (las listas vacías, el pie de cada listado, el resumen de `stats`, `explain_unavailable` y `version_warning`) y `stop`.
 8. Los tests: cada informe en los dos idiomas, y un test que recorre los chequeos de `doctor` con los mismos hechos en `en` y `es` y compara todo menos `message`.
-9. `.claude/CLAUDE.md`. Las specs `doctor` (R1: `message` deja de ser «en inglés»), `setup`, `self-update`, `secrets` y `portability` se reescriben al archivar, junto con las de language-preference, que todavía no se volcaron en `specs/`.
+9. `.claude/CLAUDE.md`. Las specs `doctor` (R1: `message` deja de ser «en inglés»), `setup`, `self-update`, `secrets` y `portability` se reescriben al archivar.
 
 ## Fuera de alcance
 

@@ -10,6 +10,15 @@ Sobre `d79fff1`, en `target-test` (limpiado con `cargo clean --workspace` antes 
 - `the_agent_contract_matches_its_file` se bendijo con `CLAWG_BLESS=1` y el diff se revisó: cambia sólo la descripción de `search_memory` (LP10). Las instrucciones sin preferencia quedan iguales.
 - Las instrucciones miden 2.028 caracteres sin preferencia y 2.045 con `es` o con `en` (`the_instructions_fit_older_clients` corre sobre las tres).
 
+## Linux (2026-10-23)
+
+Sobre `f5c16d6`, en `target`, con el compilador de `rust-toolchain.toml`. El build no pudo bajar ONNX Runtime de `cdn.pyke.io` (la red lo rechazó), así que `ort-sys` se enlazó dinámicamente contra la misma versión, 1.24.2, sacada del wheel `onnxruntime` de PyPI (`ORT_LIB_LOCATION`, `ORT_PREFER_DYNAMIC_LINK=1` y `LD_LIBRARY_PATH` a ese directorio). Ningún test usa el modelo real; el cambio no toca ese enlace.
+
+- `cargo test --workspace --locked`: pasa, ningún test falla.
+- `cargo clippy --workspace --all-targets --locked -- -A clippy::all -D warnings` y `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings`: salen con 0.
+- `cargo test --locked -p clawg-core --lib build_info`, el lado sin `testing` que el CI corre sólo en Linux: pasa.
+- `tests/binary.rs` entero, con los escenarios sólo Unix (el modo del directorio de datos, el `0600` del export, SIGTERM, `setup` con un `claude` de shell y `admits_peer`) y los tres de la preferencia: pasa.
+
 ## RED antes de cada cambio
 
 - **Se vieron fallar antes del código:** los tests de `preferences.rs` y del detector en `language.rs` (no compilaban), los de la migración y el export (`MemoryLine.lang` no existía; después `published_migration_checksums_are_pinned` por la fila de V22 y `the_pinned_example_reads_and_writes_back_unchanged` por el campo nuevo), el de las notas escuetas del detector (`a_terse_note_with_evidence_of_one_language_alone_is_that_language`, que dio `None`) y `the_agent_contract_matches_its_file`.
@@ -41,7 +50,8 @@ La primera medida dio 98,4 % en el expandido y 83,3 % en `golden.json`: 8 de las
 
 ## Lo que no se midió
 
-- Linux: lo corre el CI del pull request.
+- `a_broken_preferences_file_leaves_the_bridge_as_without_one`, que la spec nombraba para LP2, no se escribió: el puente lee la preferencia con `language_in`, que `an_invalid_file_reads_as_no_preference` prueba, y ningún test arranca el puente con un archivo roto.
+
 - M6, a mano sobre el perfil `dev`, que pide autorización y una sesión nueva de Claude Code: `clawg preferences set language es --profile dev`, comprobar que el agente responde y guarda en español, que una búsqueda pobre muestra la línea del otro idioma y una que trae lo suficiente no, que `memory_status` nombra el idioma y que `clawg setup claude-code --profile dev` reescribe el bloque.
 - El relleno sobre un store real (unas 880 filas en inglés): corre en la primera pasada del mantenimiento, cinco minutos después de arrancar el daemon, y hasta entonces el conteo del otro idioma es cero.
 - M1, M2 y M3 (paridad español contra inglés, el store mezclado con el umbral `FEW_SHOWN` y los tokens por idioma) son del cambio 80, como dice la propuesta. `FEW_SHOWN` (3) no está medido.

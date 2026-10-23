@@ -87,6 +87,6 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## Verificación
 
-- La suite y clippy en Linux y en Windows (`target-test`).
-- `rag-eval --lang-detect --golden docs/eval/golden-expanded.json`: la barra de la propuesta.
-- Con autorización, el recorrido manual sobre el perfil `dev` (M6).
+- [x] La suite y clippy en Linux y en Windows (`target-test`).
+- [x] `rag-eval --lang-detect --golden docs/eval/golden-expanded.json`: la barra de la propuesta.
+- [ ] Con autorización, el recorrido manual sobre el perfil `dev` (M6): no se corrió.

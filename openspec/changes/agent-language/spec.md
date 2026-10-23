@@ -1,6 +1,6 @@
 # agent-language — Especificación
 
-Suma requisitos a [`specs/mcp`](../../specs/mcp/spec.md), [`specs/retrieval`](../../specs/retrieval/spec.md), [`specs/hooks`](../../specs/hooks/spec.md), [`specs/quality`](../../specs/quality/spec.md) y [`specs/eval`](../../specs/eval/spec.md). Lo que no se nombra aquí sigue como está. Las definiciones de [language-preference](../language-preference/spec.md) (preferencia, idioma preferido) valen aquí.
+Suma requisitos a [`specs/mcp`](../../specs/mcp/spec.md), [`specs/retrieval`](../../specs/retrieval/spec.md), [`specs/hooks`](../../specs/hooks/spec.md), [`specs/quality`](../../specs/quality/spec.md) y [`specs/eval`](../../specs/eval/spec.md). Lo que no se nombra aquí sigue como está. Las definiciones de [language-preference](../archive/2026-10-23-language-preference/spec.md) (preferencia, idioma preferido) valen aquí.
 
 ## Definiciones
 

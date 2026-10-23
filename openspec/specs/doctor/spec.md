@@ -5,6 +5,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 **Origen:**
 - [doctor-checks](../../changes/archive/2026-10-20-doctor-checks/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. El análisis del PATH (`analyze`) es anterior y queda como estaba.
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: `memory.topic` y `memory.content_hash` agrupan por proyecto y nombran a los autores; el texto de `fallback_agent`.
+- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23: los chequeos `preferences` y `protocol_block` (LP14).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 
@@ -111,6 +112,12 @@ Un store más nuevo, divergente, ilegible o sin migraciones MUST NOT leerse más
 La edad de un snapshot MUST salir de su nombre (`parse_snapshot_time`, pura), no del reloj del sistema de archivos. Un nombre que no es de un snapshot no cuenta.
 
 **Tests:** `data_dir_findings`, `socket_findings`, `backup_findings`, `spill_findings`, `sharing_findings` (`doctor`); `snapshot_times_come_from_their_names` (`backup.rs`).
+
+## LP14. La preferencia y el bloque del protocolo
+
+Cuando `preferences.json` existe, `doctor` MUST sumar el chequeo `preferences` (`checks::preferences`, `crates/clawg-cli/src/doctor/checks.rs:322`): `ok` legible, o `warn` `invalid` con la causa en `message`, sin `safe_next_step` y con el path en `evidence`. Con preferencia, MUST sumar el chequeo `protocol_block` (`checks.rs:350`) sobre el `CLAUDE.md` del usuario que lee `setup`: `ok` cuando el bloque es el que `setup` escribiría, `warn` `stale` cuando es otro e `info` `not_installed` sin bloque, las dos con `safe_next_step` `clawg setup claude-code --profile P`, y `warn` `unreadable` cuando el archivo no se puede leer o tiene un marcador suelto. Sin el archivo MUST NOT sumar ninguno de los dos.
+
+**Test:** `preferences_findings` y `protocol_block_findings` (`doctor/checks.rs`); `doctor_names_a_broken_preferences_file` (`tests/binary.rs`).
 
 ## R6. Invariantes del estado de `memory`
 

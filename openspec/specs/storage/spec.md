@@ -17,6 +17,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20 (SIGTERM como apagado ordenado, «Cada fase del apagado tiene tope» y «Las fases caben en `STOP_TIMEOUT`»). Lo que hace `clawg update` cuando `stop` vence está en [`specs/self-update`](../self-update/spec.md).
 - [serve-log-rotation](../../changes/archive/2026-10-22-serve-log-rotation/proposal.md), archivado el 2026-10-22 («El log del daemon»).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 (sólo «Una base en V19 abre con los índices por proyecto» y su vuelta atrás).
+- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «El idioma de cada fila», LP4 y LP5 de esa spec). La preferencia y su archivo están en [`specs/preferences`](../preferences/spec.md).
 
 ## Definiciones
 
@@ -313,7 +314,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V20) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V22) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -417,7 +418,7 @@ Un binario anterior a V20 MUST NOT abrir una base en V20: la rechaza sin tocarla
 La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:409`, llamada en `db.rs:195`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V20), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V22), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 
@@ -889,3 +890,42 @@ Un `clawg serve` lanzado a mano escribe donde lo redirija quien lo lanza, sin ro
 V21 MUST crear `memory_move` (`move_id`, `row_id`, `from_project`, `from_scope`, `to_project`, `to_scope`, `moved_at`) con un índice por `move_id`, sin clave foránea a `memory` (un `purge` no debe frenarse por un movimiento viejo) y sin tocar ninguna fila. Una base en V20 MUST abrir con el registro vacío y cada fila igual. La vuelta atrás del esquema es el snapshot `pre-migration`, o deshacer los movimientos y `DROP TABLE memory_move; DELETE FROM refinery_schema_history WHERE version = 21;`. El lote de [`specs/project`](../project/spec.md) R12 escribe antes el snapshot `pre-move` (`Reason::PreMove`).
 
 **Test:** `a_database_from_the_previous_version_opens_with_an_empty_move_log` (`db.rs`), `published_migration_checksums_are_pinned` (`migrations.rs`), `snapshot_names_parse_back_to_their_reason` (`backup.rs`).
+
+## El idioma de cada fila
+
+### LP4. El detector
+
+`clawg_core::memory::language::detect` (`crates/clawg-core/src/memory/language.rs:88`) MUST ser una función pura de un texto que devuelve `en`, `es` o «indeciso». MUST ignorar los bloques y spans de código, las URL, las rutas y los identificadores (palabras con dígitos, `_`, `::`, `.` interno o mayúsculas internas), y decidir por palabras funcionales de cada idioma y por las marcas del español (`ñ`, `¿`, `¡`, vocales con tilde). Con menos de `MIN_EVIDENCE` (3) puntos MUST dar «indeciso», salvo que la evidencia sea de un idioma solo y el texto tenga `TERSE_PROSE` (8) palabras de prosa o más, y entonces alcanza un punto (`language.rs:58-64`): las notas técnicas escuetas casi no traen palabras funcionales.
+
+#### Escenario: prosa y código
+- WHEN el texto es un párrafo en español, uno en inglés, un bloque de código, un identificador suelto, una ruta o tres palabras
+- THEN da `es`, `en`, indeciso, indeciso, indeciso e indeciso
+
+#### Escenario: identificadores en prosa
+- WHEN un párrafo en español nombra `content_hash`, `MemoryStore::open` y `crates/clawg-core/src/memory/db.rs`
+- THEN da `es`
+
+**Test:** `spanish_prose_is_spanish`, `english_prose_is_english`, `code_paths_and_identifiers_are_undecided`, `a_short_text_is_undecided`, `identifiers_in_spanish_prose_do_not_make_it_english`, `a_mixed_text_follows_its_prose` y `a_terse_note_with_evidence_of_one_language_alone_is_that_language` (`language.rs`).
+
+### LP5. `memory.lang`
+
+V22 (`crates/clawg-core/migrations/V22__memory_lang.sql`) MUST agregar a `memory` la columna `lang` (NULL o `en`, `es`, `und`, con un `CHECK`), el índice parcial `idx_memory_lang` sobre las filas vivas y `idx_memory_lang_unset` sobre las filas sin clasificar, sin cambiar ninguna fila. Ningún trigger de `memory` lee la columna. Cada fila que inserten el save (`PreparedRow`) y la importación MUST llevar el idioma que `detect` da sobre su propio texto ya enmascarado (`und` si indeciso; `column_value`, `language.rs:119`). El mantenimiento MUST clasificar las filas con `lang` NULL, borradas incluidas, por tandas de a lo sumo 500 (`LANG_BATCH`, `crates/clawg-core/src/memory/maintenance.rs:160`), cada una en su transacción, sin cambiar `content`, `content_hash`, `last_modified_at`, `update_count` ni `memory_fts`, hasta que no quede ninguna (`classify_languages`, `maintenance.rs:168`). MUST NOT tocar `episodic_trajectory` ni `procedural_skill`.
+
+#### Escenario: una base anterior
+- GIVEN una base en V21 con filas en los dos idiomas, sin autor, con claves, borradas y reemplazadas
+- WHEN la abre `MemoryStore::open`
+- THEN escribe el snapshot `pre-migration`, cada fila sigue igual y alcanzable, y `lang` es NULL en todas
+
+#### Escenario: el relleno
+- WHEN corre el mantenimiento sobre esa base
+- THEN cada fila tiene `lang`, y su `content`, `content_hash`, `last_modified_at`, `update_count` y el índice de texto son los de antes
+
+#### Escenario: un save y sus piezas
+- WHEN se guarda un texto en español de tres piezas
+- THEN cada pieza tiene `lang = 'es'`
+
+**Test:** `a_store_from_before_the_language_column_keeps_its_rows_and_gains_it` (`db.rs`); `published_migration_checksums_are_pinned` con V22 (`migrations.rs`); `a_save_records_the_language_of_each_row` (`store_insert.rs`); `the_maintenance_pass_classifies_rows_without_a_language` y `classifying_leaves_content_and_modification_alone` (`maintenance.rs`); `counting_by_language_uses_its_index` (`language.rs`, el plan de consulta sin `TEMP B-TREE` ni `SCAN memory`). La migración por `clawg update` la recorren los escenarios de `tests/binary.rs` sobre un store con migraciones pendientes, que ahora llegan a V22; no hay uno propio desde V21.
+
+#### Vuelta atrás de V22
+
+Un binario anterior a V22 MUST NOT abrir una base en V22: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`, que `clawg update` restaura sola si el binario viejo se niega ([`specs/self-update`](../self-update/spec.md)). Quitar V22 a mano no pierde ninguna fila: `DROP INDEX idx_memory_lang; DROP INDEX idx_memory_lang_unset; ALTER TABLE memory DROP COLUMN lang; DELETE FROM refinery_schema_history WHERE version = 22;` (SQLite no borra una columna indexada).
