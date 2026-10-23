@@ -4,8 +4,8 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 ## 1. V23 y el origen en el formato (HI1, HI2)
 
-- [ ] Tests `a_database_from_the_previous_version_opens_with_no_origin_project` (`db.rs`), `an_export_carries_the_origin_project` (`export.rs`), `an_import_keeps_the_origin_project` y `an_export_without_an_origin_project_imports` (`import.rs`).
-- [ ] `V23__origin_project.sql`, el checksum fijado, los conteos de migraciones; `MemoryLine.origin_project`, el export y `INSERT_SQL`.
+- [x] Tests `a_database_from_the_previous_version_opens_with_no_origin_project` (`db.rs`), `an_export_carries_the_origin_project` (`export.rs`), `an_import_keeps_the_origin_project` y `an_export_without_an_origin_project_imports` (`import.rs`).
+- [x] `V23__origin_project.sql`, el checksum fijado, los conteos de migraciones; `MemoryLine.origin_project`, el export y `INSERT_SQL`.
 - Commit: `feat(core): keep the project a memory had in the tool it came from`
 
 ## 2. El filtro (HI3)

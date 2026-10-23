@@ -257,8 +257,8 @@ const INSERT_SQL: &str = "INSERT INTO memory \
      (scope, agent_id, project_id, content, memory_type, source, created_at, created_by_type, created_by_ref, \
       source_session_id, last_modified_at, last_modified_by, update_count, last_accessed_at, access_count, \
       importance, tier, status, superseded_by, supersede_cause, dispute_count, last_disputed_at, content_hash, topic_key, \
-      lang) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)";
+      lang, origin_project) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)";
 
 /// Records each project, and returns the ids that already belong to another
 /// root, with that root.
@@ -347,6 +347,7 @@ fn place(
         // Read from the text stored here, never from the file's `lang`: a
         // file cannot say what its text does not.
         language::column_value(language::detect(&row.content)),
+        src.origin_project,
     ])?;
     let id = tx.last_insert_rowid();
     match src.deleted_at {
@@ -967,6 +968,45 @@ mod tests {
         let (report, _) = run(&dst, &older, ImportOptions::default()).await;
         assert_eq!((report.inserted, report.invalid.len()), (1, 0), "{report:#?}");
         assert_eq!(imported_lang(&dst, "Storage engine").await.as_deref(), Some("und"), "too few words to tell");
+    }
+
+    #[tokio::test]
+    async fn an_import_keeps_the_origin_project() {
+        let file = live_example()
+            .replace("\"source\":\"explicit\"", "\"source\":\"import\"")
+            .replace("\"created_by_ref\":\"claude-code\"", "\"created_by_ref\":\"engram:42\"")
+            .replace("\"origin_project\":null", "\"origin_project\":\"notes/app\"");
+        assert!(file.contains("\"origin_project\":\"notes/app\"") && file.contains("engram:42"));
+        let dst = destination().await;
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+        assert_eq!((report.inserted, report.invalid.len()), (1, 0), "{report:#?}");
+        let row: (String, String, Option<String>) = dst
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT source, created_by_ref, origin_project FROM memory WHERE instr(content, 'Storage engine') > 0",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(row, ("import".to_string(), "engram:42".to_string(), Some("notes/app".to_string())));
+    }
+
+    #[tokio::test]
+    async fn an_export_without_an_origin_project_imports() {
+        let dst = destination().await;
+        let older = live_example().replacen(",\"origin_project\":null", "", 1);
+        assert!(!older.contains("origin_project"));
+        let (report, _) = run(&dst, &older, ImportOptions::default()).await;
+        assert_eq!((report.inserted, report.invalid.len()), (1, 0), "{report:#?}");
+        let origin: Option<String> = dst
+            .conn
+            .call(|c| c.query_row("SELECT origin_project FROM memory WHERE instr(content, 'Storage engine') > 0", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(origin, None);
     }
 
     #[tokio::test]
