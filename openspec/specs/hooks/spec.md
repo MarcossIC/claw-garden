@@ -6,6 +6,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - [agent-lifecycle-hooks](../../changes/archive/2026-10-18-agent-lifecycle-hooks/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec: R1 vive en [`specs/retrieval`](../retrieval/spec.md) y acá están R2 a R5.
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo R6, que en esa spec es R5, y el campo `session_id` de R2). El registro del daemon y el sello en el save están en [`specs/ingest`](../ingest/spec.md), «La sesión del host».
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19 (sólo el aviso de revisión de R4).
+- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (R7, LP12 de esa spec, y la excepción que suma a R3).
 
 ## Definiciones
 
@@ -25,7 +26,7 @@ Esta spec no instala el hook: lo instala `clawg setup claude-code`, en forma exe
 
 ## R3. Un hook nunca rompe la sesión
 
-Sin daemon, con un daemon que responde un error o no responde a tiempo, o con una entrada que no es JSON, el hook MUST NOT escribir nada en stdout y MUST salir con 0 (`respond` y `answer`, `hook.rs:130-186`; `Command::Hook`, `main.rs:108-115`). El tope es de 3 s en total, de leer stdin a la respuesta (`HOOK_DEADLINE`, `hook.rs:25`), por debajo de los 5 s con los que se configura un hook, para que el host nunca lo cancele. Un error de uso de `clawg hook`, o un perfil rechazado, MUST salir con 1 y el motivo en stderr; `clawg hook` MUST NOT salir con 2, el código de clap para un uso inválido, que el host leería como «bloquear» y borraría el mensaje del usuario (`is_hook_invocation`, `cli.rs:298`; el camino de `Cli::try_parse` en `main.rs:43-55`, que hace lo mismo con `clawg` sin argumentos, [`specs/setup`](../setup/spec.md) R8).
+Sin daemon, con un daemon que responde un error o no responde a tiempo, o con una entrada que no es JSON, el hook MUST NOT escribir nada en stdout, salvo la línea del idioma de `session-start` cuando hay preferencia (R7), y MUST salir con 0 (`respond` y `answer`, `hook.rs:130-186`; `Command::Hook`, `main.rs:108-115`). El tope es de 3 s en total, de leer stdin a la respuesta (`HOOK_DEADLINE`, `hook.rs:25`), por debajo de los 5 s con los que se configura un hook, para que el host nunca lo cancele. Un error de uso de `clawg hook`, o un perfil rechazado, MUST salir con 1 y el motivo en stderr; `clawg hook` MUST NOT salir con 2, el código de clap para un uso inválido, que el host leería como «bloquear» y borraría el mensaje del usuario (`is_hook_invocation`, `cli.rs:298`; el camino de `Cli::try_parse` en `main.rs:43-55`, que hace lo mismo con `clawg` sin argumentos, [`specs/setup`](../setup/spec.md) R8).
 
 El hook MUST NOT arrancar un daemon (usa `DaemonClient::from_data_dir`, no `probe_running(.., true)`, que puede esperar hasta 60 s): el puente MCP es quien arranca el daemon con la sesión, así que el primer `SessionStart` del día puede llegar antes y quedar sin contexto. Es la decisión de no autoarrancar (D6 del diseño archivado), y ese es todo su costo.
 
@@ -77,3 +78,14 @@ Registran los dos eventos, y no sólo el inicio: un daemon que arrancó después
 - THEN la fila lleva `s1`; después de un `user-prompt-submit` con `s2`, el save siguiente lleva `s2`
 
 **Tests:** `the_hook_input_tolerates_unknown_and_missing_fields` (`hook.rs`, que lee `session_id`); `a_hook_registers_the_session_of_the_saves` (`tests/binary.rs`, con el binario real). Con Claude Code sobre el perfil dev, dos sesiones seguidas guardaron con el `session_id` que el host les mandó ([verify](../../changes/archive/2026-10-19-session-handoff/verify.md#claude-code-sobre-el-perfil-dev-2026-10-19)).
+
+## R7. El idioma de la persona en `session-start`
+
+Con preferencia ([`specs/preferences`](../preferences/spec.md)), `session-start` MUST abrir con una línea que dice el idioma de la persona, que se le responda en él salvo que escriba en otro, y que se guarde y se busque en él (`language_line`, `crates/clawg-cli/src/hook.rs:62`; `session_start_text`, `hook.rs:72`). MUST imprimirla, sola en el sobre, aunque no haya daemon, falle, no responda a tiempo o el contexto no traiga nada (`respond` y `answer`, `hook.rs:149-175`), y lo que el hook suma MUST seguir ocupando menos de 1.000 bytes. Sin preferencia, lo de R3 y R4 sin cambios. `user-prompt-submit` no cambia.
+
+#### Escenario: sin daemon
+- GIVEN la preferencia `es` y ningún daemon
+- WHEN corre `clawg hook session-start`
+- THEN imprime el sobre con la línea del idioma y sale con 0
+
+**Test:** `session_start_names_the_users_language`, `what_the_hook_adds_stays_small` con la línea y `without_a_preference_session_start_says_what_it_said` (`hook.rs`); `session_start_without_a_daemon_still_names_the_language` (`hook.rs` y `tests/binary.rs`, donde `user-prompt-submit` no imprime nada).

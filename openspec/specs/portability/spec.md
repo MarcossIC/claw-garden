@@ -2,7 +2,7 @@
 
 Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`. Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
 
-**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5.
+**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6).
 
 ## Dónde está
 
@@ -118,3 +118,9 @@ Una línea que no es JSON, de un `kind` desconocido, o una fila `memory` con un 
 `--dry-run` MUST responder el mismo reporte sin escribir, sin embeber y sin snapshot. El reporte MUST traer: cuántas filas se insertan (o se insertarían), por tipo, por estado (`live`, `superseded`, `deleted`) y por proyecto de destino; cuántas estaban presentes; las fundidas con su fila; las reemplazadas por una clave tomada; cuántas se enmascararon; las inválidas con línea y motivo; los vínculos descartados; y la ruta del snapshot cuando lo hubo. `clawg import` MUST imprimirlo legible y salir 0, también con inválidas.
 
 **Tests:** `a_dry_run_reports_without_writing` (`crates/clawg-core/src/memory/portability/import.rs`); `import_report_lists_counts_and_invalid_lines`, `render_names_merged_taken_and_dropped_rows` y `a_missing_file_is_named_before_the_daemon_is_asked` (`crates/clawg-cli/src/import.rs`).
+
+## LP6. El idioma en el export y el import
+
+El export MUST escribir `lang` en cada línea `memory` (`MemoryLine.lang`, `null` sin clasificar). El import MUST calcular el idioma de cada fila que inserta con `detect` sobre su texto enmascarado ([`specs/storage`](../storage/spec.md), LP4 y LP5), sin leer el `lang` del archivo, y MUST aceptar un archivo sin ese campo. La versión del formato `clawg-memories` MUST seguir siendo 1: un lector ignora los campos que no conoce.
+
+**Test:** `an_export_carries_the_language_of_each_row` (`export.rs`); `an_import_computes_the_language_whatever_the_file_says` y `an_export_without_languages_imports` (`import.rs`).

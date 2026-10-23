@@ -1,6 +1,6 @@
 # language-preference — Especificación
 
-Crea [`specs/preferences`](../../specs/preferences/spec.md) y suma requisitos a [`specs/storage`](../../specs/storage/spec.md), [`specs/portability`](../../specs/portability/spec.md), [`specs/retrieval`](../../specs/retrieval/spec.md), [`specs/mcp`](../../specs/mcp/spec.md), [`specs/hooks`](../../specs/hooks/spec.md), [`specs/setup`](../../specs/setup/spec.md), [`specs/doctor`](../../specs/doctor/spec.md) y [`specs/eval`](../../specs/eval/spec.md). Lo que no se nombra aquí sigue como está.
+Crea [`specs/preferences`](../../../specs/preferences/spec.md) y suma requisitos a [`specs/storage`](../../../specs/storage/spec.md), [`specs/portability`](../../../specs/portability/spec.md), [`specs/retrieval`](../../../specs/retrieval/spec.md), [`specs/mcp`](../../../specs/mcp/spec.md), [`specs/hooks`](../../../specs/hooks/spec.md), [`specs/setup`](../../../specs/setup/spec.md), [`specs/doctor`](../../../specs/doctor/spec.md) y [`specs/eval`](../../../specs/eval/spec.md). Lo que no se nombra aquí sigue como está.
 
 ## Definiciones
 
@@ -8,7 +8,7 @@ Crea [`specs/preferences`](../../specs/preferences/spec.md) y suma requisitos a 
 - **Idioma preferido:** el `language` de la preferencia, `es` o `en`. El **otro idioma** es el que no es el preferido.
 - **Idioma de una fila:** `memory.lang`: `en`, `es`, `und` (no se pudo decidir) o NULL (no se clasificó todavía).
 - **Fila viva:** `deleted_at IS NULL` y `status IN ('active', 'disputed')`.
-- **Alcance de una búsqueda:** las filas que la búsqueda puede devolver: las del proyecto pedido, las sin proyecto y toda `user_preference` (o todas, sin proyecto), que el lector alcanza según [`specs/sharing`](../../specs/sharing/spec.md).
+- **Alcance de una búsqueda:** las filas que la búsqueda puede devolver: las del proyecto pedido, las sin proyecto y toda `user_preference` (o todas, sin proyecto), que el lector alcanza según [`specs/sharing`](../../../specs/sharing/spec.md).
 - **Save:** una fila sin piezas, o todas las piezas de un save de `memory_piece`, que cuentan como uno.
 
 ## LP1. La preferencia y su archivo
@@ -149,7 +149,7 @@ Con preferencia al arrancar, `memory_status` MUST decir el idioma de la sesión.
 
 ## LP12. `session-start`
 
-Con preferencia, `session-start` MUST imprimir una línea que dice el idioma de la persona, que se le responda en él salvo que escriba en otro, y que se guarde y se busque en él. MUST imprimirla aunque no haya daemon, falle o no responda a tiempo, y lo que el hook suma MUST seguir ocupando menos de 1.000 bytes. Cambia R3 de [`specs/hooks`](../../specs/hooks/spec.md): sin daemon, `session-start` imprime esa línea si hay preferencia, y nada si no. `user-prompt-submit` no cambia.
+Con preferencia, `session-start` MUST imprimir una línea que dice el idioma de la persona, que se le responda en él salvo que escriba en otro, y que se guarde y se busque en él. MUST imprimirla aunque no haya daemon, falle o no responda a tiempo, y lo que el hook suma MUST seguir ocupando menos de 1.000 bytes. Cambia R3 de [`specs/hooks`](../../../specs/hooks/spec.md): sin daemon, `session-start` imprime esa línea si hay preferencia, y nada si no. `user-prompt-submit` no cambia.
 
 #### Escenario: sin daemon
 - GIVEN la preferencia `es` y ningún daemon

@@ -1,0 +1,15 @@
+change: language-preference
+objective: "1, 4"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done  # las diez decisiones abiertas, cerradas con la opción recomendada; B y C son 79 y 80
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Windows, Linux y el binario real en un home temporal; M6 sobre el perfil dev no se corrió
+  archive: done
+updated: 2026-10-23
+main_spec: openspec/specs/preferences/spec.md, openspec/specs/storage/spec.md, openspec/specs/portability/spec.md, openspec/specs/retrieval/spec.md, openspec/specs/mcp/spec.md, openspec/specs/hooks/spec.md, openspec/specs/setup/spec.md, openspec/specs/doctor/spec.md, openspec/specs/eval/spec.md

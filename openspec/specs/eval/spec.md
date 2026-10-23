@@ -11,6 +11,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [memory-rank-fusion](../../changes/archive/2026-10-17-memory-rank-fusion/proposal.md), archivado el 2026-10-17 (`all_hit_rate` de agent-view, el subconjunto `lexical_related` y su baseline).
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo «`conflict-eval`: el detector entero» y su baseline).
 - [revision-eval](../../changes/archive/2026-10-21-revision-eval/proposal.md), archivado el 2026-10-21 (sólo «`revision-eval`: revisiones por clave» y su baseline).
+- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «`rag-eval --lang-detect`», LP15 de esa spec).
 
 ## Definiciones
 
@@ -667,6 +668,14 @@ Mide docs y código juntos ([`specs/project-docs`](../project-docs/spec.md)) y M
 El golden set de docs se versiona porque pregunta sobre los docs públicos de este repo, a diferencia de `docs/eval/golden.json`. Sus preguntas evitan las palabras del pasaje que las responde, para medir sentido y no coincidencia léxica; cuando el mismo contenido vive en dos archivos, cualquiera cuenta.
 
 **Tests:** `the_docs_golden_set_parses_and_rejects_unknown_fields`, `hits_count_when_path_and_heading_match`, `an_expected_doc_missing_from_the_corpus_fails_validation`, `the_report_scores_docs_and_code_apart` y `the_shipped_golden_set_names_docs_this_workspace_has` en `crates/clawg-eval/src/bin/rag-eval/docs.rs`; `docs_reads_its_own_golden_set_and_this_workspace_by_default`, `docs_takes_a_root_and_a_golden_set`, `root_without_docs_is_an_error` y `docs_with_another_mode_is_an_error` en `crates/clawg-eval/src/bin/rag-eval/cli.rs`; `a_doc_index_answers_from_the_root_it_indexed` y `a_doc_the_index_could_not_embed_fails_the_measurement` en `crates/clawg-core/src/eval_api.rs`; `docs_mode_runs_end_to_end_with_the_fake_embedder` y `docs_mode_refuses_a_golden_set_naming_a_doc_the_root_lacks` en `crates/clawg-eval/tests/docs_mode.rs`.
+
+## `rag-eval --lang-detect`: el detector de idioma
+
+`rag-eval --lang-detect [--golden FILE]` MUST imprimir como JSON, sin cargar el modelo ni abrir un store, la matriz de confusión de `detect` ([`specs/storage`](../storage/spec.md) LP4) sobre las filas del corpus que traen `lang`: por idioma etiquetado, cuántas dio `en`, `es` e indeciso, en total y entre las de ocho palabras o más, y el porcentaje de aciertos, de cruces (el otro idioma) y de indecisos (`crates/clawg-eval/src/bin/rag-eval/lang_detect.rs`). MUST NOT imprimir ningún texto de fila.
+
+La barra con la que se aceptó el detector: al menos 95 % de aciertos y a lo sumo 1 % al otro idioma sobre `golden-expanded.json`. Medido el 2026-10-22: 99,8 % de aciertos, ningún cruce y 0,2 % indecisas (3 filas en inglés sin ninguna palabra funcional) sobre 1.280 filas; 93,75 % en `golden.json` y `golden-cross.json`, ningún cruce ([verify](../../changes/archive/2026-10-23-language-preference/verify.md)).
+
+**Test:** `lang_detect_counts_by_label` y `lang_detect_prints_no_text` (`lang_detect.rs`).
 
 ## Baseline medida
 
