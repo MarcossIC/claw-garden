@@ -359,7 +359,7 @@ async fn read_router(
                 lang: None,
             })
             .await?;
-        let search = format_search(found.clone(), AGENT, Some(PROJECT));
+        let search = format_search(found.clone(), AGENT, Some(PROJECT), None);
         let prompt = client.context(&chain.query, AGENT, Some(PROJECT), None, None).await?.prompt;
         let context = format_context(&prompt);
         shown.push(Shown { search: positions(own, &search_ids(&search)), context: positions(own, &context_ids(&context)) });

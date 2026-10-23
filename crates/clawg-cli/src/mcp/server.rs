@@ -50,7 +50,7 @@ use crate::client::{
 use crate::mcp::protocol::{self, opening};
 use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
-    format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
+    format_docs, format_language, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
     format_delete, format_open_pairs, format_restore, format_status, format_synthesis, format_update, indexes_docs, resolve_project,
     topic_key_warning,
 };
@@ -799,14 +799,16 @@ impl ClawgMcp {
                         agent_id: agent_id.to_string(),
                         project_id,
                         limit: args.limit,
-                        lang: None,
+                        lang: self.language,
                     })
                     .await
                     .map(|found| (found, save_project))
             })
             .await;
         match result {
-            Ok(Ok((found, save_project))) => Self::ok(format_search(found, agent_id, save_project.as_deref())),
+            Ok(Ok((found, save_project))) => {
+                Self::ok(format_search(found, agent_id, save_project.as_deref(), self.language))
+            }
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
@@ -821,11 +823,11 @@ impl ClawgMcp {
         let result = self
             .call(|client| async move {
                 let project_id = self.project_for(&client, args.project_path.as_deref(), false).await?;
-                client.context(&args.query, agent_id, project_id.as_deref(), args.budget, None).await
+                client.context(&args.query, agent_id, project_id.as_deref(), args.budget, self.language).await
             })
             .await;
         match result {
-            Ok(Ok(context)) => Self::ok(format_recall(&context)),
+            Ok(Ok(context)) => Self::ok(format_recall(&context, self.language)),
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
             Err(failure) => Ok(failure),
         }
@@ -1073,6 +1075,9 @@ impl ClawgMcp {
                 // file in the same data directory, so this is what the next
                 // search will use.
                 let sharing = format_sharing(&sharing::load(client.base_dir()), &agent_id);
+                // The file is read again here: a session keeps its language,
+                // and the user has to learn that a change waits for a new one.
+                let language = format_language(self.language, clawg_core::preferences::language_in(client.base_dir()));
                 // A daemon that predates the pair table has nothing to count,
                 // and a status must not fail over a line it can leave out.
                 let project = self.save_project(None);
@@ -1086,6 +1091,7 @@ impl ClawgMcp {
                     source.describe(),
                     &sharing,
                     conflicts.as_deref(),
+                    language.as_deref(),
                 ))
             }
             Ok(Err(e)) => Self::failed(Self::explain(&e)),
@@ -2947,6 +2953,35 @@ mod tests {
         let r = b.search_memory_impl("agent-mcp", search_args("which port does the proxy use")).await.expect("search");
         assert!(!is_error(&r), "nothing relevant is not an error");
         assert_eq!(text(&r), "no relevant memories for this query: 1 searched, none close enough to show");
+    }
+
+    #[tokio::test]
+    async fn search_memory_sends_the_bridges_language() {
+        let (b, _d) = bridge().await;
+        saved_id(&b, "agent-mcp", "The release branch is cut on thursdays, and it is tagged by the release script.").await;
+        let query = "¿Qué día se corta la rama de la versión?";
+        let plain = text(&b.search_memory_impl("agent-mcp", search_args(query)).await.expect("search"));
+        assert!(!plain.contains("still in"), "without a language the answer is as before: {plain}");
+
+        let b = b.with_language(Some(Lang::Es));
+        let r = b.search_memory_impl("agent-mcp", search_args(query)).await.expect("search");
+        assert!(text(&r).ends_with("search again with the query in English."), "{}", text(&r));
+        let r = b.recall_context_impl("agent-mcp", RecallContextArgs { query: query.into(), project_path: None, budget: None }).await;
+        assert!(text(&r.expect("context")).contains("1 memory in this scope is still in English"));
+    }
+
+    #[tokio::test]
+    async fn memory_status_names_the_language_of_the_session() {
+        let (b, d) = bridge().await;
+        let status = |b: &ClawgMcp| {
+            let b = b.clone();
+            async move { text(&b.memory_status_impl(b.agent_for(None)).await.expect("status")) }
+        };
+        assert!(!status(&b).await.contains("language:"), "nothing without a preference");
+        let b = b.with_language(Some(Lang::Es));
+        assert!(status(&b).await.contains("language: Spanish for this session; preferences.json now sets none"));
+        clawg_core::preferences::save(d.path(), &clawg_core::preferences::Preferences { language: Some(Lang::Es) }).unwrap();
+        assert!(status(&b).await.contains("language: Spanish (preferences.json)"));
     }
 
     #[tokio::test]
