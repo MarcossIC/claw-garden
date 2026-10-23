@@ -699,7 +699,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 22);
+        assert_eq!(after.0, 23);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1539,6 +1539,73 @@ mod tests {
         assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
     }
 
+    /// No row knew the project it came from in another tool, so a store from
+    /// before the column opens with every row as it was and the column empty.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_no_origin_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(22)).await;
+        type Rows = (Vec<String>, Vec<Vec<rusqlite::types::Value>>);
+        // Every column, so a migration that rewrote any of them would show.
+        let whole_rows = |c: &mut rusqlite::Connection| -> rusqlite::Result<Rows> {
+            let mut stmt = c.prepare("SELECT * FROM memory WHERE id >= 10 ORDER BY id")?;
+            let names = stmt.column_names().into_iter().map(String::from).collect();
+            let n = stmt.column_count();
+            let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
+            Ok((names, rows))
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                for (id, agent, project, source, status, deleted, key) in [
+                    (10, Some("a"), Some("p"), "explicit", "active", None, Some("storage/engine")),
+                    (11, Some("b"), None, "explicit", "superseded", None, None),
+                    (12, None, Some("p"), "import", "active", None, None),
+                    (13, Some("b"), Some("p"), "import", "active", Some(13), None),
+                ] {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, deleted_at, topic_key) \
+                         VALUES (?1, CASE WHEN ?2 IS NULL THEN 'project' ELSE 'agent' END, ?2, ?3, 'A note ' || ?1, \
+                          'semantic_fact', ?4, ?1, 'agent', 'x', ?1, ?1, 5.0, 3, ?5, ?6, ?7)",
+                        rusqlite::params![id, agent, project, source, status, deleted, key],
+                    )?;
+                }
+                whole_rows(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let ((names, mut rows), indexes): (Rows, Vec<String>) = store
+            .conn
+            .call(move |c| {
+                let rows = whole_rows(c)?;
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'memory' \
+                     AND name IN ('idx_memory_origin_project', 'idx_memory_import_origin') ORDER BY name",
+                )?;
+                let indexes = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok::<_, rusqlite::Error>((rows, indexes))
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.1.len(), 4);
+        let origin = names.iter().position(|n| n == "origin_project").expect("the column exists");
+        let origins: Vec<_> = rows.iter_mut().map(|r| r.remove(origin)).collect();
+        assert!(origins.iter().all(|v| *v == rusqlite::types::Value::Null), "{origins:?}");
+        let mut other_names = names.clone();
+        other_names.remove(origin);
+        assert_eq!((other_names, rows), before, "migrating changes no row");
+        assert_eq!(indexes, ["idx_memory_import_origin", "idx_memory_origin_project"]);
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
     #[tokio::test]
     async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
         ensure_vec0_registered();
@@ -2003,7 +2070,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 22, "Expected exactly 22 applied migrations, got {}", count);
+        assert_eq!(count, 23, "Expected exactly 23 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2464,7 +2531,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 22);
+        assert_eq!(migration_count, 23);
     }
 
     // -----------------------------------------------------------------------

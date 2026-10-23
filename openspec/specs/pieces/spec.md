@@ -7,8 +7,8 @@ Fuente de verdad del comportamiento actual de un save que no entra en un pedazo:
 ## Definiciones
 
 - **Save:** un evento de ingesta (`MemoryEvent`): un `save_memory` o un turno de chat. Es la misma unidad que los pedazos hermanos de [`specs/disputes`](../disputes/spec.md) R8.
-- **Texto del save:** el contenido del evento después de enmascarar secretos (`redact`, en `ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:730`). Todo lo de abajo trabaja sobre ese texto.
-- **Pedazo:** cada ventana que deja el chunker, después de colapsar los repetidos dentro del mismo evento (`collapse_duplicate_chunks`, `worker.rs:162`). Su posición es 1, 2, … en ese orden.
+- **Texto del save:** el contenido del evento después de enmascarar secretos (`redact`, en `ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:751`). Todo lo de abajo trabaja sobre ese texto.
+- **Pedazo:** cada ventana que deja el chunker, después de colapsar los repetidos dentro del mismo evento (`collapse_duplicate_chunks`, `worker.rs:166`). Su posición es 1, 2, … en ese orden.
 - **Save largo:** un save con dos pedazos o más.
 - **Cabecera:** los primeros `SAVE_HEAD_TOKENS` = 48 tokens del texto del save, contados con el mismo splitter del chunker (en modo sin tokenizer, 4 bytes por token).
 - **Texto embebido de un pedazo:** el pedazo, o `cabecera + "\n…\n" + pedazo` cuando tiene contexto.
@@ -34,7 +34,7 @@ Dos `const _: () = assert!(...)` (`chunker/mod.rs:48-49`) comprueban en compilac
 
 Cada pedazo desde el segundo MUST embeberse con contexto (la cabecera). El primero se embebe sin él, porque ya empieza con la cabecera. La fila MUST guardar sólo el pedazo: el contenido, el hash de dedup y el FTS no llevan la cabecera.
 
-El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:55`), una función pura que usan el worker (`worker.rs:855`) y el re-embed (R7).
+El armado del texto embebido es `embedding_text(context, piece)` (`chunker/mod.rs:55`), una función pura que usan el worker (`worker.rs:877`) y el re-embed (R7).
 
 Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 96 sólo aplica si el de 480 no alcanza. El save más corto que se parte (más de 480 tokens) da al menos 7 pedazos.
 
@@ -57,16 +57,16 @@ Un save de un pedazo de hasta 480 tokens no se parte con este tope: el tope de 9
 
 ## R3. El save deja su vínculo
 
-Cuando un save largo termina sin falla, el worker MUST escribir, en una sola transacción, un vínculo por pedazo (`link_in`, `crates/clawg-core/src/memory/pieces.rs:228`). Si el save tiene una fila del outbox, el vínculo y el borrado de la fila van en la misma transacción (`outbox_finish`, `crates/clawg-core/src/memory/outbox.rs:459`, llamado por `process_tracked`, `worker.rs:664`; [`specs/storage`](../storage/spec.md), «Un save aceptado está en el outbox hasta que termina»); un evento sin fila lo vincula `finish_save` (`worker.rs:965`, por `MemoryStore::finish_save`, `crates/clawg-core/src/memory/topic.rs:174`, que en la misma transacción aplica la revisión de su `topic_key`, ver R10 y [`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»):
+Cuando un save largo termina sin falla, el worker MUST escribir, en una sola transacción, un vínculo por pedazo (`link_in`, `crates/clawg-core/src/memory/pieces.rs:228`). Si el save tiene una fila del outbox, el vínculo y el borrado de la fila van en la misma transacción (`outbox_finish`, `crates/clawg-core/src/memory/outbox.rs:459`, llamado por `process_tracked`, `worker.rs:679`; [`specs/storage`](../storage/spec.md), «Un save aceptado está en el outbox hasta que termina»); un evento sin fila lo vincula `finish_save` (`worker.rs:987`, por `MemoryStore::finish_save`, `crates/clawg-core/src/memory/topic.rs:174`, que en la misma transacción aplica la revisión de su `topic_key`, ver R10 y [`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»):
 
 - `save_id`: un número nuevo, uno más que el mayor de la tabla;
 - `piece`: la posición del pedazo, desde 1;
-- `memory_id`: la fila que lo guarda, insertada por este evento o absorbida por el dedup (`absorb_duplicate`, `worker.rs:583`);
+- `memory_id`: la fila que lo guarda, insertada por este evento o absorbida por el dedup (`absorb_duplicate`, `worker.rs:587`);
 - `context`: la cabecera con la que se embebió la fila si este evento la insertó con contexto; si no, vacío. Una fila absorbida conserva el vector que ya tenía, así que su vínculo no dice que lo embebió con contexto.
 
-Un save de un pedazo MUST NOT dejar vínculos. Un save que se corta a mitad de camino (`IngestReport.failure`, `worker.rs:83`, o una pausa del apagado, `IngestReport.paused`) MUST NOT dejar vínculos todavía: sus filas quedan sueltas mientras tanto. Si tiene fila en el outbox, la fila MUST quedar aunque el que guardó esperaba la respuesta (que es `202 partially_saved`, [`specs/ingest`](../ingest/spec.md), «Un fallo del worker llega al que guardó»), y el siguiente arranque retoma después de las piezas ya guardadas y escribe el vínculo al terminar ([`specs/storage`](../storage/spec.md), «Un replay retoma donde quedó»); si llega a `failed`, `clawg outbox discard` borra las que insertó ([`specs/storage`](../storage/spec.md), «Una fila `failed` se reintenta o se descarta»). Sin fila (tests y evaluación), al guardarlo de nuevo los pedazos se absorben y el vínculo se escribe entonces.
+Un save de un pedazo MUST NOT dejar vínculos. Un save que se corta a mitad de camino (`IngestReport.failure`, `worker.rs:84`, o una pausa del apagado, `IngestReport.paused`) MUST NOT dejar vínculos todavía: sus filas quedan sueltas mientras tanto. Si tiene fila en el outbox, la fila MUST quedar aunque el que guardó esperaba la respuesta (que es `202 partially_saved`, [`specs/ingest`](../ingest/spec.md), «Un fallo del worker llega al que guardó»), y el siguiente arranque retoma después de las piezas ya guardadas y escribe el vínculo al terminar ([`specs/storage`](../storage/spec.md), «Un replay retoma donde quedó»); si llega a `failed`, `clawg outbox discard` borra las que insertó ([`specs/storage`](../storage/spec.md), «Una fila `failed` se reintenta o se descarta»). Sin fila (tests y evaluación), al guardarlo de nuevo los pedazos se absorben y el vínculo se escribe entonces.
 
-Si escribir el vínculo falla, el save MUST seguir informándose como guardado: sus filas ya están y se encuentran igual. La falla va al log (`worker.rs:971`, y `worker.rs:705` con una fila en el outbox, que entonces queda para que el próximo arranque la termine).
+Si escribir el vínculo falla, el save MUST seguir informándose como guardado: sus filas ya están y se encuentran igual. La falla va al log (`worker.rs:998`, y `worker.rs:725` con una fila en el outbox, que entonces queda para que el próximo arranque la termine).
 
 Guardar otra vez exactamente las mismas filas, en el mismo orden, MUST devolver el `save_id` que ya forman (`existing_save`, `pieces.rs:267`) y no escribir nada: el mismo save no se vincula dos veces.
 
@@ -102,11 +102,11 @@ El descarte es una función pura sobre los hits y los vínculos de sus filas. Si
 
 Un hit con vínculo MUST mostrar `piece=K/N` en su metadato:
 
-- `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:107`): `{rank}. #{id} [{kind}/{type}/t{tier} piece={K}/{N} score={score}] {contenido}`;
-- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:726-738`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
+- `search_memory` (`crates/clawg-cli/src/mcp/tools.rs:191`): `{rank}. #{id} [{kind}/{type}/t{tier} piece={K}/{N} score={score}] {contenido}`;
+- `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:763-775`): `[YYYY-MM-DD #{id} {type} piece={K}/{N}] {contenido}` para `memory`; las otras tablas llevan su kind antes del tipo, como ya hacían.
 - un hit de otro agente suma ` by <autor>` antes del `]` en los dos ([`specs/sharing`](../sharing/spec.md) R4).
 
-Un hit sin vínculo MUST seguir con el formato de antes. `Hit` en el cliente (`crates/clawg-cli/src/client.rs:166`) MUST leer `piece` con `#[serde(default)]` (`client.rs:182`), así un daemon viejo sigue respondiendo.
+Un hit sin vínculo MUST seguir con el formato de antes. `Hit` en el cliente (`crates/clawg-cli/src/client.rs:181`) MUST leer `piece` con `#[serde(default)]` (`client.rs:197`), así un daemon viejo sigue respondiendo.
 
 Los parsers del eval (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs`) MUST leer los dos formatos y devolver el id de cada línea de búsqueda.
 
@@ -119,7 +119,7 @@ Los parsers del eval (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs`) 
 
 ## R6. El save entero
 
-`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:864`, handler `get_save`, `api.rs:1427`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:101`):
+`GET /v1/memories/{kind}/{id}/save` (`crates/clawg-cli/src/daemon/api.rs:1036`, handler `get_save`, `api.rs:1662`) con la query `agent` MUST devolver el save de la fila (`read_save_core`, `crates/clawg-core/src/memory/pieces.rs:101`):
 
 - `id`, `kind`, `piece` (la posición de la fila pedida), `pieces` (el total) e `ids`: el id de cada posición, o `null` si esa fila está borrada o fuera del alcance del lector (`agent`);
 - `missing`: las posiciones sin fila visible;
@@ -130,9 +130,9 @@ Una fila sin vínculos MUST devolverse como save de un pedazo, con su contenido 
 
 Quitar el solapamiento es `join_pieces` (`pieces.rs:64`), una función pura: entre dos pedazos vecinos busca el sufijo más largo del primero que es prefijo del segundo, de al menos 16 caracteres (`MIN_OVERLAP_CHARS`, `pieces.rs:56`) y dentro de los últimos 2.048 bytes (`MAX_OVERLAP_BYTES`, `pieces.rs:59`), y lo deja una sola vez (`overlap`, `pieces.rs:84`). Si no lo encuentra, une con un salto de línea y no recorta nada. `read_save_core` aplica `join_pieces` a cada tramo de pedazos visibles consecutivos y une los tramos con un salto de línea: nunca compara dos pedazos que no eran vecinos.
 
-El puente MUST exponer `read_memory(id, kind?)` (`crates/clawg-cli/src/mcp/server.rs:1146`, `read_memory_impl`, `server.rs:895`), con `kind = memory` por defecto y el agente que llama. La respuesta (`format_save`, `crates/clawg-cli/src/mcp/tools.rs:198`) MUST abrir con una línea que dice qué pedazo es y de cuántos, los ids del save y los que faltan, y seguir con `text`. Si la fila pedida tiene clave, esa línea MUST terminar con ` topic=K` (un save de un pedazo abre con `#id topic=K`), salvo que la fila sea de otro proyecto que el del puente, donde un save bajo esa clave no la revisaría ([`specs/mcp`](../mcp/spec.md), «La clave de tema en las herramientas»). Sobre una fila que `sharing.json` le oculta MUST fallar como si no existiera; la de otro agente que alcanza la lee entera.
+El puente MUST exponer `read_memory(id, kind?)` (`crates/clawg-cli/src/mcp/server.rs:1365`, `read_memory_impl`, `server.rs:1065`), con `kind = memory` por defecto y el agente que llama. La respuesta (`format_save`, `crates/clawg-cli/src/mcp/tools.rs:304`) MUST abrir con una línea que dice qué pedazo es y de cuántos, los ids del save y los que faltan, y seguir con `text`. Si la fila pedida tiene clave, esa línea MUST terminar con ` topic=K` (un save de un pedazo abre con `#id topic=K`), salvo que la fila sea de otro proyecto que el del puente, donde un save bajo esa clave no la revisaría ([`specs/mcp`](../mcp/spec.md), «La clave de tema en las herramientas»). Sobre una fila que `sharing.json` le oculta MUST fallar como si no existiera; la de otro agente que alcanza la lee entera.
 
-`save_memory` MUST nombrar `read_memory` en su descripción (`server.rs:1074-1082`) y en la respuesta de un save largo (`saved as N pieces: …; read_memory with any of them returns the whole text`). `search_memory` MUST explicar `piece=K/N` en su descripción (`server.rs:1101-1103`). `tools/list` MUST listar `read_memory` entre sus herramientas; el conteo vigente, doce, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
+`save_memory` MUST nombrar `read_memory` en su descripción (`server.rs:1308-1316`) y en la respuesta de un save largo (`saved as N pieces: …; read_memory with any of them returns the whole text`). `search_memory` MUST explicar `piece=K/N` en su descripción (`server.rs:1336-1338`). `tools/list` MUST listar `read_memory` entre sus herramientas; el conteo vigente, doce, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
 
 Contra un daemon que no tiene la ruta, su 404 no trae el error JSON del daemon: `route_failure_text` (`crates/clawg-cli/src/mcp/server.rs`) MUST decir que hay que reiniciar el daemon, no que la fila no existe.
 

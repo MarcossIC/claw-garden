@@ -264,6 +264,7 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
         project_id: q.project,
         no_project,
         status: q.status,
+        origin_project: q.origin_project,
         query: q.q,
         limit: q.limit,
         offset: q.offset,
@@ -465,6 +466,9 @@ pub struct ListQuery {
     /// `true` lists the deleted rows instead of the live ones.
     #[serde(default)]
     pub deleted: Option<bool>,
+    /// Only the rows that came from this project of another tool.
+    #[serde(default)]
+    pub origin_project: Option<String>,
 }
 
 /// Strict for the same reason as [`ListQuery`]: a misspelt filter would answer
@@ -885,6 +889,9 @@ pub struct MoveRequest {
     /// Free text over memory content, as `GET /v1/memories` reads `q`.
     #[serde(default)]
     pub q: Option<String>,
+    /// The project the rows had in the tool they were imported from, whole.
+    #[serde(default)]
+    pub origin_project: Option<String>,
     #[serde(default)]
     pub include_deleted: bool,
     #[serde(default)]
@@ -921,6 +928,7 @@ impl MoveRequest {
             source: self.source,
             session_id: self.session_id,
             query: self.q,
+            origin_project: self.origin_project,
             include_deleted: self.include_deleted,
         };
         match (self.undo, self.to_project, self.to_none) {

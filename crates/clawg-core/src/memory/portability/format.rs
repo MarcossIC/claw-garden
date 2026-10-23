@@ -99,6 +99,10 @@ pub struct MemoryLine {
     /// text again and never from here.
     #[serde(default)]
     pub lang: Option<String>,
+    /// The project the row had in the tool it was imported from, `null` for
+    /// any other row or a store from before the column.
+    #[serde(default)]
+    pub origin_project: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,7 +303,7 @@ pub(crate) mod tests {
         "\n",
         r#"{"kind":"project","id":"repo-1a2b","root_path":"/work/repo"}"#,
         "\n",
-        r#"{"kind":"memory","id":7,"scope":"agent","agent_id":"claude-code","project_id":"repo-1a2b","content":"Storage engine: SQLite with WAL","memory_type":"architectural_decision","source":"explicit","created_at":1750000000000,"created_by_type":"user","created_by_ref":"claude-code","source_session_id":"s-1","last_modified_at":1750000000000,"last_modified_by":null,"update_count":0,"last_accessed_at":1755000000000,"access_count":4,"importance":8.0,"tier":1,"status":"superseded","superseded_by":9,"supersede_cause":"revision","dispute_count":0,"disputed_against":[],"last_disputed_at":null,"deleted_at":null,"topic_key":"storage/engine","revived_from":null,"lang":"und"}"#,
+        r#"{"kind":"memory","id":7,"scope":"agent","agent_id":"claude-code","project_id":"repo-1a2b","content":"Storage engine: SQLite with WAL","memory_type":"architectural_decision","source":"explicit","created_at":1750000000000,"created_by_type":"user","created_by_ref":"claude-code","source_session_id":"s-1","last_modified_at":1750000000000,"last_modified_by":null,"update_count":0,"last_accessed_at":1755000000000,"access_count":4,"importance":8.0,"tier":1,"status":"superseded","superseded_by":9,"supersede_cause":"revision","dispute_count":0,"disputed_against":[],"last_disputed_at":null,"deleted_at":null,"topic_key":"storage/engine","revived_from":null,"lang":"und","origin_project":null}"#,
         "\n",
         r#"{"kind":"derivation","memory":9,"source":7,"created_at":1751000000000}"#,
         "\n",

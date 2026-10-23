@@ -14,9 +14,10 @@ El export se midió el 2026-10-22 con un script que imprime sólo nombres de cam
 
 | Premisa | Resultado |
 |---|---|
-| La fuente exporta un formato documentado | **Cierta.** `engram export [file]` escribe todo en JSON, e `import <file>` lo lee. |
+| La fuente exporta un formato documentado | **Cierta.** `engram export [file]` escribe JSON, e `import <file>` lo lee. Las versiones nuevas exportan sólo el proyecto que deducen del directorio en que se corren, salvo con `--all`: corrido desde un directorio sin proyecto, el export sale vacío; desde un proyecto, no trae los demás ni las notas sin proyecto. El archivo no dice qué alcance tuvo. |
 | Hay una sola versión del formato | **Falsa.** El export medido declara `"version": "0.1.0"`. Las versiones más nuevas de engram escriben `"0.2.0"`, que suma a cada observación su borrado, la nota en la que se fundió y una fecha de revisión, y al nivel superior las relaciones entre notas y los prompts borrados. También exporta las notas borradas. Engram lee las dos. |
 | Forma del export `0.1.0` | Nivel superior: `version`, `exported_at`, `sessions`, `observations`, `prompts`. Sesión: `{id, project, directory, started_at}`. Observación: `{id, sync_id, session_id, type, title, content, project, scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at}`. |
+| Forma del export `0.2.0` | Medida el 2026-10-23 sobre el mismo store, exportado con `--all`: las mismas 22 sesiones, 3.768 observaciones y 14 prompts. Suma a la observación `pinned`, siempre presente, y cuando los tiene `deleted_at`, `review_after` y `superseded_by_sync_id`; a la sesión, `ownership_mode`; al prompt, `source_inbox_id`; al nivel superior, `relations` y `prompt_tombstones`, que faltan cuando no hay ninguno. Una lista vacía de sesiones o de prompts viene como `null`. Las fechas que la fuente pone al borrar o revisar una nota, y `exported_at`, llevan fracción de segundo: `YYYY-MM-DD HH:MM:SS.fffffffff`. Este store no tiene relaciones, notas borradas ni fijadas, ni prompts borrados. |
 | Volumen | 22 sesiones, 3.713 observaciones y 14 prompts; ninguna borrada. 17 tipos: `architecture` 1.015, `session_summary` 605, `decision` 604, `bugfix` 568, `discovery` 493, `pattern` 307, `preference` 48, `feature` 32, `config` 22 y ocho con 5 o menos. `scope`: 3.706 `project` y 6 `personal`. |
 | El proyecto sale del `directory` de la sesión | **Falsa.** Las 22 sesiones tienen `directory` vacío. 2.118 notas traen `project`, con 21 nombres distintos; las otras 1.594 (43 %) no tienen proyecto ni en la nota ni en su sesión. El proyecto sólo viene como nombre. |
 | Muchas notas son largas | **Cierta.** Título más contenido: mediana 2.055 caracteres, p90 5.628, p99 24.276, máximo 45.403. 2.036 (55 %) pasan los ~1.900 caracteres de una pieza (480 tokens; `CHUNK_MAX_TOKENS`, `crates/clawg-core/src/memory/chunker/mod.rs:15`). Ninguna pasa los 64 KiB de un save (`MAX_CONTENT_BYTES`, `crates/clawg-cli/src/daemon/api.rs:592`). Partidas como un save, a unos 4 caracteres por token, darían unas 36.000 filas. |
@@ -63,7 +64,7 @@ El export se midió el 2026-10-22 con un script que imprime sólo nombres de cam
 
 ### A. Leer el export JSON de la fuente (elegido)
 
-El usuario corre `engram export <archivo fuera del repo>`, y `clawg import --from engram <archivo>` lo traduce y lo importa por el camino de 43. Es un contrato que la fuente documenta en su CLI y no depende de sus tablas. Se valida `version` y se rechaza una desconocida sin escribir.
+El usuario corre `engram export --all <archivo fuera del repo>` (sin `--all`, las versiones nuevas exportan sólo el proyecto del directorio en que se corre), y `clawg import --from engram <archivo>` lo traduce y lo importa por el camino de 43. Es un contrato que la fuente documenta en su CLI y no depende de sus tablas. Se valida `version` y se rechaza una desconocida sin escribir.
 
 Dónde se traduce y se parte:
 
@@ -104,7 +105,7 @@ Lo que siguen de ellas:
 2. La traducción común de ese modelo a filas de clawg: tipos, texto, claves, fechas, origen, choques de clave, enmascarado y partición como un save.
 3. `clawg import --from engram FILE [--dry-run] [--agent A] [--project-map NOMBRE=RUTA]...`.
 4. El reporte, también en `--dry-run`.
-5. Docs: cómo exportar fuera del repo, el mapeo y qué queda sólo para leer.
+5. Docs: cómo exportar todo (`--all`) fuera del repo, el mapeo y qué queda sólo para leer.
 
 ### No-alcance
 

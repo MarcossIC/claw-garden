@@ -1,0 +1,15 @@
+change: agent-language
+objective: "1"
+depends_on: [language-preference]
+phase: archived
+artifacts:
+  exploration: done  # la parte C de la exploración de language-preference
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux y el binario real en un home temporal; Windows por el CI del pull request; M1, M2 y M6 no se corrieron
+  archive: done
+updated: 2026-10-23
+main_spec: openspec/specs/mcp/spec.md, openspec/specs/retrieval/spec.md, openspec/specs/hooks/spec.md, openspec/specs/quality/spec.md, openspec/specs/eval/spec.md

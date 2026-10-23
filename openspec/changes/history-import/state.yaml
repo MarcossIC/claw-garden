@@ -1,14 +1,14 @@
 change: history-import
 objective: "1, 2"
 depends_on: [memory-portability, agent-authorship, project-reassign, language-preference]
-phase: propose
+phase: apply
 artifacts:
   exploration: done
-  proposal: draft
-  spec: pending
-  design: pending
-  tasks: pending
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-10-22
+updated: 2026-10-23

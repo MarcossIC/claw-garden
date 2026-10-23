@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M–L (la parte B de la [exploración de 78](../archive/2026-10-23-language-preference/exploration.md#alcance-candidato)) | language-preference (78): `Lang` y `preferences.json` | ver [`state.yaml`](state.yaml) |
+| 1 | M–L (la parte B de la [exploración de 78](../2026-10-23-language-preference/exploration.md#alcance-candidato)) | language-preference (78): `Lang` y `preferences.json` | ver [`state.yaml`](state.yaml) |
 
 ## Problema
 

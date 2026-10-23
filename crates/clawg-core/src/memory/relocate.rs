@@ -471,6 +471,8 @@ pub struct MoveFilter {
     pub session_id: Option<String>,
     /// Free text over `memory.content`, as the viewer searches it.
     pub query: Option<String>,
+    /// The project the row had in the tool it came from, compared whole.
+    pub origin_project: Option<String>,
     /// Selects deleted rows too; a unit's deleted rows move with it anyway.
     pub include_deleted: bool,
 }
@@ -484,6 +486,7 @@ impl MoveFilter {
             && self.source.is_none()
             && self.session_id.is_none()
             && self.query.is_none()
+            && self.origin_project.is_none()
     }
 
     /// The SQL that selects the rows and its parameters, every value bound.
@@ -514,6 +517,7 @@ impl MoveFilter {
             ("memory_type", &self.memory_type),
             ("source", &self.source),
             ("source_session_id", &self.session_id),
+            ("origin_project", &self.origin_project),
         ] {
             if let Some(v) = value {
                 sql.push_str(&format!(" AND {column} = ?"));
@@ -1404,5 +1408,50 @@ mod tests {
             ..MoveFilter::default()
         };
         assert_eq!(moved_ids(&move_to(&store, &filter, Some(B)).await), vec![mine]);
+    }
+
+    #[tokio::test]
+    async fn a_batch_move_selects_by_origin_project() {
+        let store = store().await;
+        let a_pieces = save(&store, fact(&long_text("alpha"), None)).await;
+        let a_single = save_one(&store, fact("a note that came from a", None)).await;
+        let b_note = save_one(&store, fact("a note that came from b", None)).await;
+        let own = save_one(&store, fact("a note with no origin", None)).await;
+        let seed = |ids: Vec<i64>, origin: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .conn
+                    .call(move |c| {
+                        for id in ids {
+                            c.execute("UPDATE memory SET origin_project = ?1 WHERE id = ?2", rusqlite::params![origin, id])?;
+                        }
+                        Ok::<(), rusqlite::Error>(())
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        seed(a_pieces.iter().copied().chain([a_single]).collect(), "a").await;
+        seed(vec![b_note], "b").await;
+        assert!(a_pieces.len() > 1, "{a_pieces:?}");
+
+        let alone = MoveFilter { origin_project: Some("a".into()), ..MoveFilter::default() };
+        let dry = move_memories_core(&store, tempfile::tempdir().unwrap().path(), &alone, Some(B.into()), true).await.unwrap();
+        assert!(!dry.moved.is_empty(), "origin_project alone is a selection");
+
+        let report = move_to(&store, &alone, Some(B)).await;
+
+        let mut expected: Vec<i64> = a_pieces.iter().copied().chain([a_single]).collect();
+        expected.sort();
+        let mut moved = moved_ids(&report);
+        moved.sort();
+        assert_eq!(moved, expected);
+        assert_eq!(projects_of(&store, &expected).await, vec![Some(B.to_string()); expected.len()]);
+        assert_eq!(projects_of(&store, &[b_note, own]).await, vec![None, None]);
+
+        let narrowed = MoveFilter { origin_project: Some("A".into()), ..MoveFilter::default() };
+        let none = move_to(&store, &narrowed, Some(A)).await;
+        assert!(none.moved.is_empty(), "the name is compared whole: {none:?}");
     }
 }

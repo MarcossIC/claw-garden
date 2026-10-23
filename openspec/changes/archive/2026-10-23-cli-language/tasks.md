@@ -47,3 +47,9 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 - [x] `.claude/CLAUDE.md`. Las specs se reescriben al archivar (ver la propuesta, alcance 9).
 - Commit: `docs: describe the commands in the preferred language`
+
+## Verificación
+
+- [x] La suite y clippy en Linux (`target`) y, por el CI del pull request, en Linux y en Windows.
+- [x] Los tests de `tests/binary.rs` con el binario real en un home temporal.
+- [ ] Con autorización, el recorrido a mano sobre el perfil `dev`: no se corrió.

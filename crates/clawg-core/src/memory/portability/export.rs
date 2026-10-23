@@ -197,7 +197,7 @@ fn read_memories(c: &Connection, filter: &ExportFilter) -> rusqlite::Result<Vec<
         "SELECT id, scope, agent_id, project_id, content, memory_type, source, created_at, created_by_type, \
          created_by_ref, source_session_id, last_modified_at, last_modified_by, update_count, last_accessed_at, \
          access_count, importance, tier, status, superseded_by, {}, dispute_count, disputed_against, \
-         last_disputed_at, deleted_at, {}, {}, {} \
+         last_disputed_at, deleted_at, {}, {}, {}, {} \
          FROM memory \
          WHERE (?1 IS NULL OR project_id = ?1) AND (?2 IS NULL OR agent_id = ?2) AND (?3 OR deleted_at IS NULL) \
          ORDER BY id",
@@ -205,6 +205,7 @@ fn read_memories(c: &Connection, filter: &ExportFilter) -> rusqlite::Result<Vec<
         or_null("topic_key"),
         or_null("revived_from"),
         or_null("lang"),
+        or_null("origin_project"),
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![filter.project_id, filter.agent, filter.include_deleted], |r| {
@@ -240,6 +241,7 @@ fn read_memories(c: &Connection, filter: &ExportFilter) -> rusqlite::Result<Vec<
             topic_key: r.get(25)?,
             revived_from: r.get(26)?,
             lang: r.get(27)?,
+            origin_project: r.get(28)?,
         })
     })?;
     rows.collect()
@@ -346,6 +348,50 @@ mod tests {
         assert_eq!((lang(2), lang(3)), (Some("es".to_string()), None), "a row not yet classified exports null");
         let (_, parsed) = parse(&exported.to_jsonl()).unwrap();
         assert_eq!(parsed.memories.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), exported.memories);
+    }
+
+    #[tokio::test]
+    async fn an_export_carries_the_origin_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed(&store).await;
+        store
+            .conn
+            .call(|c| c.execute("UPDATE memory SET origin_project = 'notes/app' WHERE id = 2", []))
+            .await
+            .unwrap();
+        let exported = store
+            .conn
+            .call(|c| Ok::<_, rusqlite::Error>(read(c, &ExportFilter::default(), 0)))
+            .await
+            .unwrap()
+            .unwrap();
+        let origin = |id: i64| exported.memories.iter().find(|m| m.id == id).unwrap().origin_project.clone();
+        assert_eq!((origin(2), origin(3)), (Some("notes/app".to_string()), None));
+        let text = exported.to_jsonl();
+        let memory_lines: Vec<&str> = text.lines().filter(|l| l.contains("\"kind\":\"memory\"")).collect();
+        assert!(!memory_lines.is_empty() && memory_lines.iter().all(|l| l.contains("\"origin_project\":")), "every line names it");
+        let (_, parsed) = parse(&text).unwrap();
+        assert_eq!(parsed.memories.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), exported.memories);
+    }
+
+    #[tokio::test]
+    async fn a_store_older_than_the_origin_column_exports_it_as_null() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed(&store).await;
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch("DROP INDEX idx_memory_origin_project; ALTER TABLE memory DROP COLUMN origin_project;")
+            })
+            .await
+            .unwrap();
+        let exported = store
+            .conn
+            .call(|c| Ok::<_, rusqlite::Error>(read(c, &ExportFilter::default(), 0)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!exported.memories.is_empty() && exported.memories.iter().all(|m| m.origin_project.is_none()));
     }
 
     #[tokio::test]

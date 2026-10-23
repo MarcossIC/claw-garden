@@ -1,10 +1,10 @@
 # cli-language — Especificación
 
-Suma requisitos a [`specs/preferences`](../../specs/preferences/spec.md), [`specs/doctor`](../../specs/doctor/spec.md), [`specs/setup`](../../specs/setup/spec.md), [`specs/self-update`](../../specs/self-update/spec.md), [`specs/secrets`](../../specs/secrets/spec.md) y [`specs/portability`](../../specs/portability/spec.md). Lo que no se nombra aquí sigue como está.
+Suma requisitos a [`specs/preferences`](../../../specs/preferences/spec.md), [`specs/doctor`](../../../specs/doctor/spec.md), [`specs/setup`](../../../specs/setup/spec.md), [`specs/self-update`](../../../specs/self-update/spec.md), [`specs/secrets`](../../../specs/secrets/spec.md) y [`specs/portability`](../../../specs/portability/spec.md). Lo que no se nombra aquí sigue como está.
 
 ## Definiciones
 
-- **Idioma del comando:** el idioma preferido del perfil del comando ([`specs/preferences`](../../specs/preferences/spec.md)), leído una vez al empezar; `en` sin preferencia o con un archivo que no se puede leer.
+- **Idioma del comando:** el idioma preferido del perfil del comando ([`specs/preferences`](../../../specs/preferences/spec.md)), leído una vez al empezar; `en` sin preferencia o con un archivo que no se puede leer.
 - **Frase del CLI:** un texto que clawg compone para la persona y un comando imprime: un informe, un aviso, la frase que enmarca un fallo o el `message` de un hallazgo de `doctor`.
 - **Causa técnica:** el `Display` de un error tipado, un error de SQLite, del sistema, de HTTP o del servidor de releases. No es una frase del CLI aunque vaya dentro de una.
 

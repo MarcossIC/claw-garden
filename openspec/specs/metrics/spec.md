@@ -50,13 +50,13 @@ Los minutos MUST guardarse `MINUTES_KEPT_MS` (14 días, `store.rs:24`); los más
 
 ## R5. Latencia HTTP
 
-Un middleware sobre el router entero, por fuera del guard y del token (`time_request`, `crates/clawg-cli/src/daemon/metrics.rs:75`; `crates/clawg-cli/src/daemon/api.rs:900`), MUST contar toda petición, por el socket o por TCP, a cualquier ruta, `/health` incluida y también las que el guard (403) o el token (401) rechazan:
+Un middleware sobre el router entero, por fuera del guard y del token (`time_request`, `crates/clawg-cli/src/daemon/metrics.rs:75`; `crates/clawg-cli/src/daemon/api.rs:1062`), MUST contar toda petición, por el socket o por TCP, a cualquier ruta, `/health` incluida y también las que el guard (403) o el token (401) rechazan:
 
 - `http.duration` (`us`, desde que llega hasta que se forma la respuesta) con `method` (`GET`, `POST`, `PATCH`, `DELETE`, `PUT`, `HEAD`, `OPTIONS`, si no `other`), `route` (la plantilla que axum emparejó, como `/v1/memories/{kind}/{id}`, o `unmatched`), `status` (`1xx` a `5xx`) y `transport`;
 - `http.request_bytes` (bytes, de `Content-Length`; `0` sin él o con uno inválido) con `method` y `route`;
 - `http.in_flight`, un gauge de las peticiones en curso, que baja también cuando el cliente se va.
 
-`transport` MUST ser `unix` o `tcp` según el servidor: `serve` marca cada copia del router con `router_on` (`api.rs:904`; `serve.rs:246`, `:255`), y un router sin marca (los tests en proceso, `serve_ephemeral`) es `tcp`. Ningún valor de etiqueta MUST venir de la URL concreta, de la consulta ni del cuerpo, que nunca se lee.
+`transport` MUST ser `unix` o `tcp` según el servidor: `serve` marca cada copia del router con `router_on` (`api.rs:1066`; `serve.rs:246`, `:255`), y un router sin marca (los tests en proceso, `serve_ephemeral`) es `tcp`. Ningún valor de etiqueta MUST venir de la URL concreta, de la consulta ni del cuerpo, que nunca se lee.
 
 **Tests:** `every_request_is_timed_by_route_status_and_transport`, `a_server_marked_unix_labels_its_requests_so`, `refused_requests_are_timed_too`, `no_label_comes_from_the_request` en `crates/clawg-cli/tests/api.rs`; `a_status_falls_in_its_class`, `a_size_without_a_valid_content_length_is_zero` en `daemon/metrics.rs`.
 
@@ -79,7 +79,7 @@ En cada cambio de minuto y al apagarse, el escritor MUST registrar como gauges (
 
 ## R7. `GET /v1/metrics`
 
-Detrás del token (`metrics`, `api.rs:1424`), MUST devolver en JSON `version`, `started_at_ms`, `writing`, el minuto en curso (`minute.histograms` con `name`, `labels`, `unit`, `count`, `sum`, `min`, `max`, `p50`, `p95`, `p99` y `buckets` con su `le`, `null` para el abierto; `minute.gauges` con `count`, `mean`, `min`, `max` y `last`) y `run.histograms`, los de toda la ejecución. Con `?format=prometheus` MUST devolver los histogramas de la ejecución y el último valor de cada gauge en el formato de texto de Prometheus, `text/plain; version=0.0.4` (`prometheus_text`, `metrics.rs:396`): nombres `clawg_<nombre con _>`, los `us` en segundos con sufijo `_seconds`, los bytes con sufijo `_bytes`, buckets acumulados con `le` (`+Inf` el último), `_sum` y `_count`, y los valores de etiqueta escapados. Otro `format` MUST ser un 400. No lee `metrics.db`.
+Detrás del token (`metrics`, `api.rs:1618`), MUST devolver en JSON `version`, `started_at_ms`, `writing`, el minuto en curso (`minute.histograms` con `name`, `labels`, `unit`, `count`, `sum`, `min`, `max`, `p50`, `p95`, `p99` y `buckets` con su `le`, `null` para el abierto; `minute.gauges` con `count`, `mean`, `min`, `max` y `last`) y `run.histograms`, los de toda la ejecución. Con `?format=prometheus` MUST devolver los histogramas de la ejecución y el último valor de cada gauge en el formato de texto de Prometheus, `text/plain; version=0.0.4` (`prometheus_text`, `metrics.rs:396`): nombres `clawg_<nombre con _>`, los `us` en segundos con sufijo `_seconds`, los bytes con sufijo `_bytes`, buckets acumulados con `le` (`+Inf` el último), `_sum` y `_count`, y los valores de etiqueta escapados. Otro `format` MUST ser un 400. No lee `metrics.db`.
 
 **Tests:** `metrics_needs_the_token_and_answers_the_minute_and_the_run`, `metrics_speaks_prometheus_text` en `crates/clawg-cli/tests/api.rs`; `a_label_value_is_escaped_for_prometheus` en `daemon/metrics.rs`.
 

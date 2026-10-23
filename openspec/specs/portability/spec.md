@@ -2,13 +2,13 @@
 
 Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`. Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
 
-**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6).
+**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6). [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó el idioma de los informes de `export` e `import` (CL3).
 
 ## Dónde está
 
 - El formato: `FORMAT` y `VERSION` (`crates/clawg-core/src/memory/portability/format.rs:14-16`), las líneas (`format.rs:19-140`), `parse` (`format.rs:176`), las comprobaciones de una fila y de un par (`check_memory`, `format.rs:229`; `check_conflict`, `format.rs:262`) y `render` (`format.rs:278`).
 - El export: `export` y `read` (`crates/clawg-core/src/memory/portability/export.rs:68` y `export.rs:80`); la vista, `markdown::render` (`crates/clawg-core/src/memory/portability/markdown.rs:12`); el comando, `run` y `write_new` (`crates/clawg-cli/src/export.rs:16` y `export.rs:31`).
-- El import: `MAX_IMPORT_BYTES` (`crates/clawg-core/src/memory/portability/import.rs:38`), `prepare` (`import.rs:149`), qué es la misma fila (`PRESENT_SQL`, `TWIN_SQL`, `TOPIC_HOLDERS_SQL`, `import.rs:236-247`), `record_projects` (`import.rs:262`), `place` (`import.rs:280`), `write_links` (`import.rs:398`), las tres pasadas (`import`, `import.rs:530`) y el reporte (`import.rs:614`); la ruta, `import_memories` (`crates/clawg-cli/src/daemon/api.rs:1619`, con su tope de cuerpo en `api.rs:1600`); el comando, `run` y `render` (`crates/clawg-cli/src/import.rs:28` y `import.rs:57`).
+- El import: `MAX_IMPORT_BYTES` (`crates/clawg-core/src/memory/portability/import.rs:38`), `prepare` (`import.rs:149`), qué es la misma fila (`PRESENT_SQL`, `TWIN_SQL`, `TOPIC_HOLDERS_SQL`, `import.rs:236-247`), `record_projects` (`import.rs:262`), `place` (`import.rs:280`), `write_links` (`import.rs:398`), las tres pasadas (`import`, `import.rs:530`) y el reporte (`import.rs:614`); la ruta, `import_memories` (`crates/clawg-cli/src/daemon/api.rs:1883`, con su tope de cuerpo en `api.rs:1864`); el comando, `run` y `render` (`crates/clawg-cli/src/import.rs:28` y `import.rs:57`).
 - El snapshot: `Reason::PreImport`, `pre-import`, podado con los demás automáticos (`crates/clawg-core/src/memory/backup.rs`).
 
 ## R1. El formato `clawg-memories` versión 1
@@ -124,3 +124,13 @@ Una línea que no es JSON, de un `kind` desconocido, o una fila `memory` con un 
 El export MUST escribir `lang` en cada línea `memory` (`MemoryLine.lang`, `null` sin clasificar). El import MUST calcular el idioma de cada fila que inserta con `detect` sobre su texto enmascarado ([`specs/storage`](../storage/spec.md), LP4 y LP5), sin leer el `lang` del archivo, y MUST aceptar un archivo sin ese campo. La versión del formato `clawg-memories` MUST seguir siendo 1: un lector ignora los campos que no conoce.
 
 **Test:** `an_export_carries_the_language_of_each_row` (`export.rs`); `an_import_computes_the_language_whatever_the_file_says` y `an_export_without_languages_imports` (`import.rs`).
+
+## CL3. Los informes en el idioma del comando
+
+La salida de `clawg export` (`report`, `crates/clawg-cli/src/export.rs`) y la de `clawg import` (`render`, `crates/clawg-cli/src/import.rs`) MUST salir en el idioma del comando ([`specs/preferences`](../preferences/spec.md), CL1 a CL3), en inglés sin preferencia, con cada frase con número concordando con él en cada idioma (CL5). Los conteos, los tipos y estados de memoria, los números de línea, los motivos de una línea inválida que da el import, las rutas y los comandos MUST NOT cambiar. El formato `clawg-memories` y la vista `--format markdown` MUST NOT depender del idioma.
+
+#### Escenario: una fila y varias
+- WHEN `clawg export` escribe una memoria, un proyecto y un vínculo de cada clase, y después varias
+- THEN cada idioma dice el singular con uno y el plural con varios, y los números son los mismos en los dos
+
+**Tests:** `the_export_report_agrees_with_its_numbers_in_both_languages` (`export.rs`); `the_import_report_speaks_spanish` (`import.rs`).

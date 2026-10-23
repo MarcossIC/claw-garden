@@ -8,6 +8,10 @@ En `target`, con el compilador de `rust-toolchain.toml`. ONNX Runtime 1.24.2, la
 - `cargo clippy --workspace --all-targets -- -A clippy::all -D warnings` y `cargo clippy -p clawg-cli -- -A clippy::all -D warnings`: salen sin un aviso.
 - Cada commit corrió los tests del crate que tocaba (`clawg-cli --lib`, `--test binary`, `clawg-core --lib sharing`) y clippy del workspace.
 
+## Windows y Linux en el CI (2026-10-23)
+
+El CI del pull request que trajo el cambio con agent-language encima corrió sobre `a38075a`, el último commit con código: el job `test` pasó en `windows-latest` y en `ubuntu-latest`. Ese job corre `cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings`, `cargo test --locked --workspace` (con `tests/binary.rs`, así que `doctor_speaks_the_preferred_language` y `stop_speaks_the_preferred_language` corrieron también en Windows), `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` y, en Linux, `cargo test --locked -p clawg-core --lib build_info`. Lo que el merge con `develop` sumó después son documentos de openspec y la versión.
+
 ## RED antes de cada cambio
 
 - **Se vieron fallar antes del código:** ninguno por la aserción; los tests nuevos piden un `Lang` en funciones que no lo recibían, así que no compilaban.
@@ -25,5 +29,5 @@ Con `CLAWG_TEST_HOME` en un directorio temporal (`crates/clawg-cli/tests/binary.
 
 ## Lo que no se verificó
 
-- Windows: lo corre el CI del pull request. `clawg path` es de Windows y queda en inglés (no tiene perfil).
+- `clawg path` es de Windows y queda en inglés (no tiene perfil), así que no tiene test en español.
 - A mano, sobre el perfil `dev`, con autorización: `clawg preferences set language es --profile dev` y después `clawg doctor`, `clawg update --check` y `clawg setup claude-code --dry-run`.

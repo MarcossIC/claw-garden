@@ -640,6 +640,8 @@ pub struct ListArgs {
     pub offset: Option<u32>,
     /// Lists the deleted rows instead of the live ones.
     pub deleted: bool,
+    /// Only the rows that came from this project of another tool.
+    pub origin_project: Option<String>,
 }
 
 /// A batch move as `POST /v1/memories/move` takes it: a selection and one
@@ -662,6 +664,8 @@ pub struct MoveRequest {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub q: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_project: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub include_deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1144,6 +1148,9 @@ impl DaemonClient {
         }
         if args.deleted {
             query.push(("deleted", "true".into()));
+        }
+        if let Some(o) = &args.origin_project {
+            query.push(("origin_project", o.clone()));
         }
 
         let answer = self.send(Call::new(reqwest::Method::GET, "/v1/memories").query(query)).await?;
