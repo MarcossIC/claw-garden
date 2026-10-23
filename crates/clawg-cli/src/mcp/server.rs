@@ -33,6 +33,7 @@ use clawg_core::memory::project_docs::corpus::{auto_indexable, has_project_marke
 use clawg_core::memory::identity::strip_verbatim;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -46,6 +47,7 @@ use serde::Deserialize;
 use crate::client::{
     ClientError, DaemonClient, ListArgs, RelatedMemory, SaveArgs, SaveOutcome, SearchArgs, SynthesisArgs,
 };
+use crate::mcp::protocol::{self, opening};
 use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
@@ -112,34 +114,6 @@ pub fn resolve_agent(flag: Option<&str>, client: Option<&str>) -> (String, Agent
 /// and its memories must not drop out of sight under the fallback.
 fn client_name<'a>(declared: Option<&'a str>, remembered: Option<&'a str>) -> Option<&'a str> {
     [declared, remembered].into_iter().flatten().find(|name| !name.trim().is_empty())
-}
-
-/// What the agent is told about saving and reading memories. Its opening is
-/// what the host is told this server is for, at `initialize` or
-/// `server/discover`; the whole text is for whatever hands the agent more
-/// than that.
-const PROTOCOL: &str = include_str!("protocol.md");
-
-/// The paragraphs between the title and the first section, each on one line:
-/// the file is wrapped for reading, and a host shows instructions as prose.
-fn opening(protocol: &str) -> String {
-    let mut paragraphs: Vec<String> = Vec::new();
-    let mut current: Vec<&str> = Vec::new();
-    for line in protocol.lines().skip(1).take_while(|line| !line.starts_with("## ")) {
-        let line = line.trim();
-        if line.is_empty() {
-            if !current.is_empty() {
-                paragraphs.push(current.join(" "));
-                current.clear();
-            }
-        } else {
-            current.push(line);
-        }
-    }
-    if !current.is_empty() {
-        paragraphs.push(current.join(" "));
-    }
-    paragraphs.join("\n\n")
 }
 
 // ── Tool parameters ─────────────────────────────────────────────────────────
@@ -410,6 +384,9 @@ pub struct ClawgMcp {
     /// clones the server per call.
     registered: Arc<tokio::sync::Mutex<HashSet<(PathBuf, String)>>>,
     profile: Profile,
+    /// The user's preferred language when the bridge started, which this
+    /// session's instructions, searches and answers keep.
+    language: Option<Lang>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -463,8 +440,15 @@ impl ClawgMcp {
             default_project,
             registered: Arc::default(),
             profile,
+            language: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The preferred language this session speaks and searches in.
+    pub fn with_language(mut self, language: Option<Lang>) -> Self {
+        self.language = language;
+        self
     }
 
     /// Pins the agent id every call uses, whatever the peer declares.
@@ -1139,7 +1123,8 @@ impl ClawgMcp {
         description = "Find stored memories related to a query. Use this first, before \
                        answering anything that depends on an earlier session. Matching is by \
                        meaning, so pass a full natural-language question, not keywords; it \
-                       finds memories written in other words or in another language. Returns a \
+                       finds memories written in other words, but often misses one written in \
+                       another language than the query. Returns a \
                        numbered list of the memories close in relevance to the best match (at \
                        least two), with their ids, kinds and relevance scores; a short list \
                        means the rest scored far lower, not that nothing else is stored. \
@@ -1341,7 +1326,7 @@ impl ServerHandler for ClawgMcp {
         // the other.
         info.server_info =
             Implementation::new(self.profile.mcp_server_name(), clawg_core::build_info::version());
-        info.instructions = Some(opening(PROTOCOL));
+        info.instructions = Some(opening(&protocol::text(self.language)));
         info
     }
 
@@ -1368,6 +1353,7 @@ mod tests {
 
     use crate::client::{ErrorDetails, ListArgs, ReplacedMemory, SaveArgs, SaveOutcome, SavedMemory};
     use crate::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, SAVE_CONFIRM_TIMEOUT};
+    use crate::mcp::protocol::PROTOCOL;
     use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
     /// Brings up an in-process daemon and returns a bridge pointed at it.
@@ -2021,11 +2007,9 @@ mod tests {
             && span.split('_').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase()))
     }
 
-    #[test]
-    fn opening_joins_the_lines_of_each_paragraph() {
-        assert_eq!(opening("# T\n\nuno\ndos\n\ntres\n## S\ncuatro"), "uno dos\n\ntres");
-        assert_eq!(opening("# T\r\n\r\nuno\r\n  dos\r\n\r\n\r\ntres\r\n## S\r\n"), "uno dos\n\ntres");
-        assert_eq!(opening("# T\nsolo"), "solo");
+    /// The protocol without a preference and with each language.
+    fn every_protocol() -> Vec<String> {
+        [None, Some(Lang::En), Some(Lang::Es)].into_iter().map(|l| protocol::text(l).into_owned()).collect()
     }
 
     #[test]
@@ -2047,8 +2031,47 @@ mod tests {
     /// characters, and they are paid for in every session.
     #[test]
     fn the_instructions_fit_older_clients() {
-        let length = opening(PROTOCOL).chars().count();
-        assert!(length <= 2048, "the instructions are {length} characters");
+        for protocol in every_protocol() {
+            let length = opening(&protocol).chars().count();
+            assert!(length <= 2048, "the instructions are {length} characters: {}", opening(&protocol));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_instructions_follow_the_preferred_language() {
+        let (b, _d) = bridge().await;
+        let b = b.with_language(Some(Lang::Es));
+        let instructions = b.get_info().instructions.expect("instructions");
+        assert!(instructions.contains("Save memories and search in Spanish"), "{instructions}");
+        assert!(instructions.contains("Reply to the user in Spanish unless they write in another language"), "{instructions}");
+        assert!(!instructions.contains("in English"), "{instructions}");
+        assert_eq!(instructions, opening(&protocol::text(Some(Lang::Es))));
+    }
+
+    #[tokio::test]
+    async fn without_a_preference_the_instructions_are_the_opening() {
+        let (b, d) = bridge().await;
+        std::fs::write(clawg_core::paths::preferences_file(d.path()), "{ not json").unwrap();
+        let b = b.with_language(clawg_core::preferences::language_in(d.path()));
+        assert_eq!(b.get_info().instructions.as_deref(), Some(opening(PROTOCOL).as_str()), "a broken file is no preference");
+    }
+
+    #[tokio::test]
+    async fn the_bridge_keeps_the_language_it_started_with() {
+        let (b, d) = bridge().await;
+        let b = b.with_language(Some(Lang::En));
+        let before = b.get_info().instructions;
+        let p = clawg_core::preferences::Preferences { language: Some(Lang::Es) };
+        clawg_core::preferences::save(d.path(), &p).unwrap();
+        assert_eq!(b.get_info().instructions, before, "a session keeps the language it was opened in");
+    }
+
+    #[tokio::test]
+    async fn search_memory_does_not_promise_other_languages() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "search_memory");
+        assert!(!d.contains("or in another language"), "{d}");
+        assert!(d.contains("in another language than the query"), "{d}");
     }
 
     /// Until a session hook delivers the whole protocol, the opening is all
@@ -2106,17 +2129,19 @@ mod tests {
                 known.extend(properties.keys().cloned());
             }
         }
-        let spans = code_spans(PROTOCOL);
+        for protocol in every_protocol() {
+            let spans = code_spans(&protocol);
 
-        let unknown: Vec<&str> = spans.iter().copied().filter(|s| is_name(s) && !known.contains(*s)).collect();
-        assert!(unknown.is_empty(), "the protocol names what does not exist: {unknown:?}");
-        let unnamed: Vec<String> = tools
-            .iter()
-            .map(|t| t.name.to_string())
-            .chain(MemoryType::ALL.iter().map(|t| t.as_str().to_string()))
-            .filter(|name| !spans.contains(&name.as_str()))
-            .collect();
-        assert!(unnamed.is_empty(), "the protocol never names: {unnamed:?}");
+            let unknown: Vec<&str> = spans.iter().copied().filter(|s| is_name(s) && !known.contains(*s)).collect();
+            assert!(unknown.is_empty(), "the protocol names what does not exist: {unknown:?}");
+            let unnamed: Vec<String> = tools
+                .iter()
+                .map(|t| t.name.to_string())
+                .chain(MemoryType::ALL.iter().map(|t| t.as_str().to_string()))
+                .filter(|name| !spans.contains(&name.as_str()))
+                .collect();
+            assert!(unnamed.is_empty(), "the protocol never names: {unnamed:?}");
+        }
     }
 
     #[tokio::test]

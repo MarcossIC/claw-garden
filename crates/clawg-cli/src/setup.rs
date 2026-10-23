@@ -33,9 +33,7 @@ pub const AGENT: &str = "claude-code";
 pub const BEGIN_MARKER: &str = "<!-- BEGIN CLAWG MEMORY PROTOCOL -->";
 pub const END_MARKER: &str = "<!-- END CLAWG MEMORY PROTOCOL -->";
 
-/// What the agent is told about memory, the same text the MCP server's
-/// instructions open with.
-const PROTOCOL: &str = include_str!("mcp/protocol.md");
+use crate::mcp::protocol::PROTOCOL;
 
 const SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
 

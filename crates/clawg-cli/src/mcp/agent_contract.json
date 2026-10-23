@@ -308,7 +308,7 @@
       "name": "save_memory"
     },
     "search_memory": {
-      "description": "Find stored memories related to a query. Use this first, before answering anything that depends on an earlier session. Matching is by meaning, so pass a full natural-language question, not keywords; it finds memories written in other words or in another language. Returns a numbered list of the memories close in relevance to the best match (at least two), with their ids, kinds and relevance scores; a short list means the rest scored far lower, not that nothing else is stored. Content longer than 500 characters is truncated. A hit marked piece=K/N is the best matching piece K of a long text saved as N pieces; read_memory with its id returns the whole text.",
+      "description": "Find stored memories related to a query. Use this first, before answering anything that depends on an earlier session. Matching is by meaning, so pass a full natural-language question, not keywords; it finds memories written in other words, but often misses one written in another language than the query. Returns a numbered list of the memories close in relevance to the best match (at least two), with their ids, kinds and relevance scores; a short list means the rest scored far lower, not that nothing else is stored. Content longer than 500 characters is truncated. A hit marked piece=K/N is the best matching piece K of a long text saved as N pieces; read_memory with its id returns the whole text.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {

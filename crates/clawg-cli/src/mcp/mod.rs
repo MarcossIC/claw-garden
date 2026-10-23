@@ -9,6 +9,7 @@
 //! or in [`server`] ever writes to stdout directly.
 
 pub mod handshake;
+pub mod protocol;
 pub mod server;
 pub mod startup;
 pub mod tools;
@@ -124,8 +125,11 @@ where
     // Guarded, never bare: a host that cancels its `server/discover` probe
     // before a session exists must not end the process.
     let transport = PreInitGuard::new(transport);
+    // Read once: a session keeps the language it was opened in, its
+    // instructions and its answers alike.
     let service = ClawgMcp::pending(client, profile)
         .with_agent(agent)
+        .with_language(clawg_core::preferences::language_in(base_dir))
         .serve(transport)
         .await
         .map_err(|e| McpError::Serve(e.to_string()))?;
