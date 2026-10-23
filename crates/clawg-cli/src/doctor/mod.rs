@@ -145,29 +145,7 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let analysis = analyze(&exe, &entries, name, |p| p.is_file());
     let data_dir = clawg_core::paths::data_dir(profile)?;
 
-    let mut found = checks::path(&analysis);
-    found.extend(checks::data_dir(&data_dir, dir_state(&data_dir)));
-    let socket = clawg_core::paths::socket_file(&data_dir);
-    found.extend(checks::socket(&socket, &crate::daemon::socket::check_socket_path(&socket)));
-    let owner = StoreLock::current_owner(&data_dir);
-    found.extend(checks::store_owner(owner.as_ref()));
-
-    let inspection = inspect(&data_dir);
-    found.extend(checks::schema(&inspection.schema, profile));
-    if let Some(facts) = &inspection.facts {
-        found.extend(checks::contract(facts.contract.as_ref(), &clawg_core::memory::bootstrap::serving_contract()));
-        let has_rows = facts.agents.iter().any(|a| a.total > 0);
-        let backups = names_in(&clawg_core::paths::backups_dir(&data_dir));
-        found.extend(checks::backups(&backups, has_rows, now_ms(), profile));
-    }
-    let rejected = present(&data_dir, REJECTED_FILE)
-        .map(|path| (lines_in(&path), path));
-    found.extend(checks::spill(
-        present(&data_dir, SPILL_FILE).as_deref(),
-        rejected.as_ref().map(|(lines, path)| (path.as_path(), *lines)),
-    ));
-    let sharing_error = sharing::load(&data_dir).err().map(|e| e.to_string());
-    found.extend(checks::sharing(sharing_error.as_deref(), profile));
+    // Read first: every message is written in the language it names.
     let preferences_path = clawg_core::paths::preferences_file(&data_dir);
     let (state, language) = if !preferences_path.exists() {
         (checks::PreferencesState::Missing, None)
@@ -177,18 +155,44 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
             Err(e) => (checks::PreferencesState::Invalid(e.to_string()), None),
         }
     };
-    found.extend(checks::preferences(&state, &preferences_path));
+    let lang = language.unwrap_or(Lang::En);
+
+    let mut found = checks::path(lang, &analysis);
+    found.extend(checks::data_dir(lang, &data_dir, dir_state(&data_dir)));
+    let socket = clawg_core::paths::socket_file(&data_dir);
+    found.extend(checks::socket(lang, &socket, &crate::daemon::socket::check_socket_path(&socket)));
+    let owner = StoreLock::current_owner(&data_dir);
+    found.extend(checks::store_owner(lang, owner.as_ref()));
+
+    let inspection = inspect(&data_dir);
+    found.extend(checks::schema(lang, &inspection.schema, profile));
+    if let Some(facts) = &inspection.facts {
+        found.extend(checks::contract(lang, facts.contract.as_ref(), &clawg_core::memory::bootstrap::serving_contract()));
+        let has_rows = facts.agents.iter().any(|a| a.total > 0);
+        let backups = names_in(&clawg_core::paths::backups_dir(&data_dir));
+        found.extend(checks::backups(lang, &backups, has_rows, now_ms(), profile));
+    }
+    let rejected = present(&data_dir, REJECTED_FILE)
+        .map(|path| (lines_in(&path), path));
+    found.extend(checks::spill(
+        lang,
+        present(&data_dir, SPILL_FILE).as_deref(),
+        rejected.as_ref().map(|(lines, path)| (path.as_path(), *lines)),
+    ));
+    let sharing_error = sharing::load(&data_dir).err().map(|e| e.to_string());
+    found.extend(checks::sharing(lang, sharing_error.as_deref(), profile));
+    found.extend(checks::preferences(lang, &state, &preferences_path));
     if let Some(language) = language {
         found.extend(protocol_block(language, profile));
     }
     if let Some(facts) = &inspection.facts {
         let daemon_running = owner.as_ref().is_some_and(|o| o.holder == StoreHolder::Daemon);
-        found.extend(checks::outbox(&facts.outbox, daemon_running, profile));
-        found.extend(checks::agents(&facts.agents));
-        found.extend(checks::projects(&facts.projects));
-        found.extend(checks::invariants(&facts.invariants));
+        found.extend(checks::outbox(lang, &facts.outbox, daemon_running, profile));
+        found.extend(checks::agents(lang, &facts.agents));
+        found.extend(checks::projects(lang, &facts.projects));
+        found.extend(checks::invariants(lang, &facts.invariants));
     }
-    found.extend(claude_code(profile, &exe));
+    found.extend(claude_code(lang, profile, &exe));
 
     let summary = Summary::of(&found);
     Ok(Report {
@@ -263,12 +267,12 @@ fn protocol_block(language: Lang, profile: Profile) -> Vec<Finding> {
             }
         }
     };
-    checks::protocol_block(&state, &crate::setup::block("\n", Some(language)), &path, profile)
+    checks::protocol_block(language, &state, &crate::setup::block("\n", Some(language)), &path, profile)
 }
 
 /// Claude Code's registration of this profile's server, from the file
 /// `clawg setup claude-code` reads.
-fn claude_code(profile: Profile, exe: &Path) -> Vec<Finding> {
+fn claude_code(lang: Lang, profile: Profile, exe: &Path) -> Vec<Finding> {
     let home = clawg_core::paths::home_dir();
     let Ok((path, _, _)) = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")) else {
         return Vec::new();
@@ -278,7 +282,7 @@ fn claude_code(profile: Profile, exe: &Path) -> Vec<Finding> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => mcp::Config::Missing,
         Err(e) => mcp::Config::Unreadable(e.to_string()),
     };
-    mcp::mcp(&path, &config, profile, exe, Path::is_file)
+    mcp::mcp(lang, &path, &config, profile, exe, Path::is_file)
 }
 
 #[cfg(test)]
@@ -388,7 +392,7 @@ mod tests {
     #[test]
     fn the_report_serialises_the_documented_fields() {
         let analysis = analyze(&exe("new"), &dirs(&["old", "new"]), NAME, |_| true);
-        let found = checks::path(&analysis);
+        let found = checks::path(Lang::En, &analysis);
         let report = Report {
             exe: exe("new"),
             version: "0.1.0".into(),
@@ -412,7 +416,7 @@ mod tests {
     #[test]
     fn path_findings() {
         let kinds = |a: &Analysis| -> Vec<(finding::Severity, &'static str)> {
-            checks::path(a).iter().map(|f| (f.severity, f.reason_code)).collect()
+            checks::path(Lang::En, a).iter().map(|f| (f.severity, f.reason_code)).collect()
         };
         let healthy = analyze(&exe("new"), &dirs(&["new"]), NAME, present(&["new"]));
         assert_eq!(kinds(&healthy), [(finding::Severity::Ok, "healthy")]);
@@ -423,7 +427,7 @@ mod tests {
             kinds(&shadowed),
             [(finding::Severity::Error, "shadowed"), (finding::Severity::Error, "duplicate")]
         );
-        assert!(Summary::of(&checks::path(&shadowed)).fails(), "an unhealthy PATH still exits 1");
+        assert!(Summary::of(&checks::path(Lang::En, &shadowed)).fails(), "an unhealthy PATH still exits 1");
         let later = analyze(&exe("new"), &dirs(&["new", "old"]), NAME, present(&["old", "new"]));
         assert_eq!(kinds(&later), [(finding::Severity::Error, "duplicate")]);
     }
