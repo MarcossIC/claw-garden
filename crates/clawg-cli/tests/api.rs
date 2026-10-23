@@ -638,6 +638,7 @@ async fn a_daemon_client_passes_the_guard() {
             agent_id: "a".into(),
             project_id: None,
             limit: None,
+            lang: None,
         })
         .await
         .expect("search");
@@ -1531,6 +1532,62 @@ async fn context_returns_a_prompt_string() {
         body["prompt"].is_string(),
         "an empty prompt is a valid answer, a missing field is not: {body}"
     );
+}
+
+const ENGLISH_NOTE: &str = "The deploy script lives in the ops folder, and it runs after every merge.";
+const SPANISH_NOTE: &str = "El script de despliegue vive en la carpeta ops y corre después de cada merge.";
+
+#[tokio::test]
+async fn a_search_with_a_language_counts_the_other_one() {
+    let h = Harness::start().await;
+    save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    save_id(&h, json!({ "content": SPANISH_NOTE, "agent_id": "a" })).await;
+    save_id(&h, json!({ "content": format!("{ENGLISH_NOTE} Twice."), "agent_id": "b" })).await;
+
+    let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a", "lang": "es" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["other_language"], json!({ "lang": "en", "memories": 2 }), "{body}");
+    let (_, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a", "lang": "en" })).await;
+    assert_eq!(body["other_language"], json!({ "lang": "es", "memories": 1 }), "{body}");
+
+    write_policy(&h, r#"{"version":1,"hides":{"a":["b"]}}"#);
+    let (_, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a", "lang": "es" })).await;
+    assert_eq!(body["other_language"], json!({ "lang": "en", "memories": 1 }), "a hidden author counts for nothing: {body}");
+}
+
+#[tokio::test]
+async fn a_search_without_a_language_has_no_count() {
+    let h = Harness::start().await;
+    save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("other_language").is_none(), "{body}");
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "lang": "es" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("other_language").is_none(), "a context without a query searches nothing: {body}");
+}
+
+#[tokio::test]
+async fn a_context_with_a_query_counts_the_other_language() {
+    let h = Harness::start().await;
+    save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let (status, body) = h.post_json("/v1/context", json!({ "query": "despliegue", "agent_id": "a", "lang": "es" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["other_language"], json!({ "lang": "en", "memories": 1 }), "{body}");
+}
+
+#[tokio::test]
+async fn an_unknown_language_is_a_bad_request() {
+    let h = Harness::start().await;
+    for (path, body) in [
+        ("/v1/search", json!({ "query": "deploy", "agent_id": "a", "lang": "fr" })),
+        ("/v1/context", json!({ "query": "deploy", "agent_id": "a", "lang": "ES" })),
+    ] {
+        let (status, body) = h.post_json(path, body).await;
+        assert_eq!(status, 400, "{path}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains("en") && error.contains("es"), "{path}: {body}");
+    }
 }
 
 /// An empty or workspace-only prompt reads as "no memories" unless the

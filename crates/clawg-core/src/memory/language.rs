@@ -5,9 +5,53 @@
 //! The detector counts function words and the marks only Spanish has. Code,
 //! paths and identifiers are left out first: in this kind of store they are
 //! English whatever the prose around them is. Two languages need no model or
-//! dependency; with too little evidence the answer is undecided.
+//! dependency; with too little evidence the answer is undecided. The detector
+//! is pure; [`count_saves_in`] reads the column it fills.
 
+use crate::memory::search::{memory_project_predicate, reader_bind, reader_predicate};
+use crate::memory::sharing::Reader;
+use crate::memory::{MemoryError, MemoryStore};
 use crate::preferences::Lang;
+
+/// Live saves in language `?1` of the scope a search of project `?2` (NULL
+/// for every project) reads, within reach `?3` as [`reader_bind`] binds it. A
+/// long save counts once, under the lowest save that holds the row; a row of
+/// no save counts as its own, by a negative key no save id takes.
+const COUNT_SAVES_SQL: &str = concat!(
+    "SELECT COUNT(DISTINCT COALESCE(",
+    "(SELECT MIN(p.save_id) FROM memory_piece p WHERE p.memory_id = m.id), -m.id)) ",
+    "FROM memory m ",
+    "WHERE m.lang = ?1 AND m.deleted_at IS NULL AND m.status IN ('active', 'disputed') AND ",
+    memory_project_predicate!("m.", "?2"),
+    " AND ",
+    reader_predicate!("m.agent_id", "?3"),
+);
+
+/// How many live saves in `lang` a search of `project_id` by `reader` could
+/// return: the project's, the ones without a project and every
+/// `user_preference`, or all of them without a project. Rows not classified
+/// yet, or undecided, count for no language.
+pub async fn count_saves_in(
+    store: &MemoryStore,
+    lang: Lang,
+    project_id: Option<&str>,
+    reader: &Reader,
+) -> Result<usize, MemoryError> {
+    let reach = reader_bind(Some(reader));
+    let project_id = project_id.map(str::to_owned);
+    store
+        .conn
+        .call(move |c| {
+            c.prepare_cached(COUNT_SAVES_SQL)?
+                .query_row(rusqlite::params![lang.as_str(), project_id, reach], |r| r.get::<_, i64>(0))
+                .map(|n| n as usize)
+        })
+        .await
+        .map_err(|e| match e {
+            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
+            other => MemoryError::Backend(format!("language count: {other}")),
+        })
+}
 
 /// Fewest points of evidence, words and marks of both languages together,
 /// before a text is given a language.
@@ -102,6 +146,7 @@ fn without_code(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::sharing::Reach;
 
     #[test]
     fn spanish_prose_is_spanish() {
@@ -156,6 +201,94 @@ mod tests {
         let text = "El usuario pidió que the search finds them, y que se guarde para todos los proyectos \
                     en los que trabaja con el agente.";
         assert_eq!(detect(text), Some(Lang::Es));
+    }
+
+    struct Seed {
+        id: i64,
+        agent: Option<&'static str>,
+        project: Option<&'static str>,
+        lang: Option<&'static str>,
+        status: &'static str,
+        deleted: bool,
+        memory_type: &'static str,
+    }
+
+    const fn row(id: i64, agent: Option<&'static str>, project: Option<&'static str>, lang: Option<&'static str>) -> Seed {
+        Seed { id, agent, project, lang, status: "active", deleted: false, memory_type: "semantic_fact" }
+    }
+
+    async fn seeded(rows: Vec<Seed>, pieces: &'static [(i64, i64, i64)]) -> MemoryStore {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .conn
+            .call(move |c| {
+                for s in &rows {
+                    c.execute(
+                        "INSERT INTO memory (id, scope, agent_id, project_id, content, memory_type, source, created_at, \
+                         created_by_type, created_by_ref, last_modified_at, last_accessed_at, importance, tier, status, \
+                         deleted_at, lang) \
+                         VALUES (?1, CASE WHEN ?2 IS NOT NULL THEN 'agent' WHEN ?3 IS NULL THEN 'global' ELSE 'project' END, \
+                         ?2, ?3, 'row ' || ?1, ?4, 'explicit', ?1, 'agent', 'x', ?1, ?1, 5.0, 3, ?5, ?6, ?7)",
+                        rusqlite::params![s.id, s.agent, s.project, s.memory_type, s.status, s.deleted.then_some(9), s.lang],
+                    )?;
+                }
+                for (save, piece, memory) in pieces {
+                    c.execute(
+                        "INSERT INTO memory_piece (save_id, piece, memory_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![save, piece, memory],
+                    )?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn counting_the_other_language_follows_the_search_scope() {
+        let rows = vec![
+            row(1, Some("r"), Some("pa"), Some("en")),
+            row(2, Some("r"), Some("pa"), Some("en")),
+            row(3, Some("r"), Some("pa"), Some("en")),
+            row(4, Some("r"), Some("pa"), Some("en")),
+            Seed { deleted: true, ..row(5, Some("r"), Some("pa"), Some("en")) },
+            Seed { status: "superseded", ..row(6, Some("r"), Some("pa"), Some("en")) },
+            row(7, Some("hidden"), Some("pa"), Some("en")),
+            row(8, Some("a"), Some("pb"), Some("en")),
+            Seed { memory_type: "user_preference", ..row(9, Some("a"), Some("pb"), Some("en")) },
+            row(10, Some("a"), Some("pa"), Some("es")),
+            row(11, None, Some("pa"), Some("und")),
+            row(12, None, Some("pa"), None),
+            row(13, None, None, Some("en")),
+        ];
+        let store = seeded(rows, &[(2, 1, 2), (2, 2, 3), (2, 3, 4)]).await;
+        let reader = Reader::new("r", Reach::AllBut(vec!["hidden".into()]));
+
+        let count = |lang, project| count_saves_in(&store, lang, project, &reader);
+        assert_eq!(count(Lang::En, Some("pa")).await.unwrap(), 4, "rows 1 and 13, the save of 2-4, the preference 9");
+        assert_eq!(count(Lang::En, None).await.unwrap(), 5, "row 8 of another project too");
+        assert_eq!(count(Lang::Es, Some("pa")).await.unwrap(), 1);
+
+        let own = Reader::new("r", Reach::Own);
+        assert_eq!(count_saves_in(&store, Lang::En, Some("pa"), &own).await.unwrap(), 3, "rows 1 and 13, the save of 2-4");
+    }
+
+    #[tokio::test]
+    async fn counting_by_language_uses_its_index() {
+        let store = seeded(vec![row(1, Some("r"), Some("pa"), Some("en"))], &[]).await;
+        let reader = crate::memory::search::reader_bind(Some(&Reader::new("r", Reach::AllBut(Vec::new()))));
+        let plan: Vec<String> = store
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {COUNT_SAVES_SQL}"))?;
+                let rows = stmt.query_map(rusqlite::params!["en", "pa", reader], |r| r.get::<_, String>(3))?;
+                rows.collect::<rusqlite::Result<_>>()
+            })
+            .await
+            .unwrap();
+        assert!(plan.iter().any(|d| d.contains("idx_memory_lang")), "{plan:?}");
+        assert!(!plan.iter().any(|d| d.starts_with("SCAN m")), "{plan:?}");
     }
 
     #[test]

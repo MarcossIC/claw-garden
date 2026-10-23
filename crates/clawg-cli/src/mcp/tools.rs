@@ -681,7 +681,7 @@ mod tests {
 
     /// A search answer that held nothing back.
     fn shown(hits: Vec<Hit>) -> Found {
-        Found { hits, withheld: 0 }
+        Found { hits, withheld: 0, other_language: None }
     }
 
     fn ids(hits: &[Hit]) -> Vec<i64> {
@@ -798,8 +798,8 @@ mod tests {
     #[test]
     fn search_says_when_nothing_was_relevant() {
         let sentence = |n: usize| format!("no relevant memories for this query: {n} searched, none close enough to show");
-        assert_eq!(format_search(Found { hits: Vec::new(), withheld: 3 }, "a", None), sentence(3), "the daemon cut them all");
-        assert_eq!(format_search(Found { hits: scored(&[0.0, 0.0]), withheld: 1 }, "a", None), sentence(3), "the bridge cut the rest");
+        assert_eq!(format_search(Found { hits: Vec::new(), withheld: 3, other_language: None }, "a", None), sentence(3), "the daemon cut them all");
+        assert_eq!(format_search(Found { hits: scored(&[0.0, 0.0]), withheld: 1, other_language: None }, "a", None), sentence(3), "the bridge cut the rest");
     }
 
     #[test]

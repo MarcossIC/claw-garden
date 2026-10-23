@@ -815,6 +815,7 @@ impl ClawgMcp {
                         agent_id: agent_id.to_string(),
                         project_id,
                         limit: args.limit,
+                        lang: None,
                     })
                     .await
                     .map(|found| (found, save_project))
@@ -836,7 +837,7 @@ impl ClawgMcp {
         let result = self
             .call(|client| async move {
                 let project_id = self.project_for(&client, args.project_path.as_deref(), false).await?;
-                client.context(&args.query, agent_id, project_id.as_deref(), args.budget).await
+                client.context(&args.query, agent_id, project_id.as_deref(), args.budget, None).await
             })
             .await;
         match result {

@@ -40,6 +40,7 @@ use clawg_core::memory::worker::{
 };
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
+use clawg_core::memory::language::count_saves_in;
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::project::{register_project, RegisterError};
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
@@ -53,6 +54,7 @@ use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveTex
 use clawg_core::metrics::Recorder;
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
 use clawg_core::memory::redact::SecretKind;
 use clawg_core::memory::store_insert::MemoryType;
@@ -403,6 +405,10 @@ pub struct SearchRequest {
     /// every ranked hit up to `limit` comes back.
     #[serde(default)]
     pub min_relative_score: Option<f64>,
+    /// The language the caller searches in, `en` or `es`. With it, the answer
+    /// counts the live saves of the scope in the other one.
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,6 +424,9 @@ pub struct ContextRequest {
     /// [`MAX_BUDGET`], that.
     #[serde(default)]
     pub budget: Option<usize>,
+    /// As in [`SearchRequest`]; counted only when there is a query.
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 /// `deny_unknown_fields` because every field here narrows the result: an
@@ -683,6 +692,8 @@ pub struct SearchBody {
     /// Hits the relevance cut kept back, so a caller handed none can tell
     /// "nothing came close" from "nothing is stored".
     pub withheld: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_language: Option<OtherLanguage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -695,6 +706,36 @@ pub struct ContextBody {
     /// reviewed for conclusions.
     pub conclusions_to_review: usize,
     pub retrieval: RetrievalState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_language: Option<OtherLanguage>,
+}
+
+/// How many live saves of the searched scope are in the language the caller
+/// did not search in, which a query in its own language is likely to miss.
+#[derive(Debug, Serialize)]
+pub struct OtherLanguage {
+    pub lang: Lang,
+    pub memories: usize,
+}
+
+/// The caller's language, or the 400 that lists the ones there are.
+fn check_lang(lang: Option<&str>) -> Result<Option<Lang>, ApiError> {
+    lang.map(|code| Lang::parse(code).ok_or_else(|| ApiError::bad_request(format!("lang must be one of: en, es (got {code:?})"))))
+        .transpose()
+}
+
+/// The other language's count for a search in `lang`, with the scope and the
+/// reach the search used. A count that fails is logged and left out: the
+/// search already answered.
+async fn other_language(app: &AppCtx, lang: Lang, project_id: Option<&str>, reader: &Reader) -> Option<OtherLanguage> {
+    let other = lang.other();
+    match count_saves_in(&app.runtime.store, other, project_id, reader).await {
+        Ok(memories) => Some(OtherLanguage { lang: other, memories }),
+        Err(e) => {
+            log::warn!("could not count the memories in {}: {e}", other.name());
+            None
+        }
+    }
 }
 
 /// Whether the context searched memories. Without it a prompt holding only
@@ -1374,6 +1415,7 @@ async fn search(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SearchRequest>,
 ) -> ApiResult<Json<SearchBody>> {
+    let lang = check_lang(body.lang.as_deref())?;
     // A distinct status rather than empty results: "nothing matched" and "I
     // cannot search yet" are different answers, and a client that conflated
     // them would cache an empty corpus for the life of the model download.
@@ -1386,9 +1428,10 @@ async fn search(
         .await
         .map_err(embed_failure)?;
 
+    let caller = reader(&app, &body.agent_id);
     let scope = SearchScope::all_default()
         .with_project(body.project_id.as_deref())
-        .with_reach(reach(&app, &body.agent_id));
+        .with_reach(caller.reach.clone());
     let mut hits = search_all_memories(
         &app.runtime.store,
         &embedding,
@@ -1412,7 +1455,11 @@ async fn search(
     app.runtime.access_tracker.record_hits(&hits);
 
     let withheld = found - hits.len();
-    Ok(Json(SearchBody { hits, withheld }))
+    let other_language = match lang {
+        Some(lang) => other_language(&app, lang, body.project_id.as_deref(), &caller).await,
+        None => None,
+    };
+    Ok(Json(SearchBody { hits, withheld, other_language }))
 }
 
 /// `agent` with what the policy in the data directory lets it reach, read on
@@ -1443,8 +1490,10 @@ async fn context(
     Json(body): Json<ContextRequest>,
 ) -> ApiResult<Json<ContextBody>> {
     let budget = check_budget(body.budget)?;
+    let lang = check_lang(body.lang.as_deref())?;
     let workspace = app.runtime.workspaces();
     let project_id = body.project_id.as_deref();
+    let query = body.query.as_deref().filter(|q| !q.trim().is_empty());
 
     // Unconditional regen (~2-5 ms). A failure degrades to "no ids were
     // emitted", which can make the prompt repeat a row — a degraded prompt
@@ -1457,7 +1506,7 @@ async fn context(
             Default::default()
         });
 
-    let prompt = match body.query.as_deref().filter(|q| !q.trim().is_empty()) {
+    let prompt = match query {
         Some(query) => {
             build_memory_prompt(
                 &app.runtime.store,
@@ -1493,8 +1542,13 @@ async fn context(
             0
         });
 
+    let other_language = match (lang, query) {
+        (Some(lang), Some(_)) => other_language(&app, lang, project_id, &caller).await,
+        _ => None,
+    };
+
     let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
-    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval }))
+    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval, other_language }))
 }
 
 /// Records the host session `agent_id` works in for `project_id`, as a hook

@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn the_abstention_sentence_parses_to_no_lines() {
         let text = clawg_cli::mcp::tools::format_search(
-            clawg_cli::client::Found { hits: Vec::new(), withheld: 3 },
+            clawg_cli::client::Found { hits: Vec::new(), withheld: 3, other_language: None },
             "agent",
             None,
         );
