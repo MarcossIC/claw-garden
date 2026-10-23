@@ -1,14 +1,14 @@
 change: agent-language
 objective: "1"
 depends_on: [language-preference]
-phase: apply
+phase: verify
 artifacts:
   exploration: done  # la parte C de la exploración de language-preference
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: partial  # Linux y el binario real en un home temporal; Windows queda al CI; M1, M2 y M6 no se corrieron
   archive: pending
 updated: 2026-10-23

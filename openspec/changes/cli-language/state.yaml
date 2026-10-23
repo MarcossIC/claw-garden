@@ -9,6 +9,6 @@ artifacts:
   design: skipped  # las decisiones 6 y 10 de la exploración; la propuesta las concreta
   tasks: done
   apply: done
-  verify: pending
+  verify: partial  # Linux y el binario real en un home temporal; Windows queda al CI y el perfil dev no se corrió
   archive: pending
 updated: 2026-10-23

@@ -41,7 +41,7 @@ Con el idioma de la sesión `es`, la prosa de cada respuesta del puente MUST est
 #### Escenario: un hit
 - THEN la línea del hit es `1. #4 [memory/semantic_fact/t3 score=0.91 topic=api/port by cursor] …`, igual que en inglés
 
-**Test:** un test por `format_*` en español (`tools.rs`) y `a_spanish_session_answers_in_spanish` (`server.rs`).
+**Test:** `a_spanish_search_keeps_its_markers`, `the_spanish_answers_of_each_tool`, `the_spanish_synthesis_and_nudges`, `the_spanish_status_docs_and_recall` y los de la línea del otro idioma (`tools.rs`); `a_spanish_session_answers_in_spanish` y `memory_status_names_the_language_of_the_session` (`server.rs`).
 
 ## AL5. El contexto
 
