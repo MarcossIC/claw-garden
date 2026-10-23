@@ -22,7 +22,7 @@ Después, `import.rs` sigue por las tres pasadas de 43 (`prepare`, `place`, `wri
 
 ## D2. Ids sintéticos en orden de fecha
 
-La traducción ordena las notas por fecha del texto y, a igual fecha, por origen, y numera sus filas desde 1 en ese orden: la primera fila de cada nota antes que las demás. `place` inserta por id del archivo, así que los ids de acá siguen las fechas, y el par de una relación tiene `new_id` en la nota más nueva, como lo escribe el detector. `write_links` escribe cada par como `(mayor, menor)` (`RECORD_PAIR_SQL`, `crates/clawg-core/src/memory/dispute.rs:300`), también para un archivo de clawg, donde ya vienen así salvo que un extremo estuviera presente con un id viejo.
+La traducción ordena las notas por fecha del texto y, a igual fecha, por origen, y numera sus filas desde 1 en ese orden: la primera fila de cada nota antes que las demás (`rows_are_numbered_by_the_date_of_their_note`). El número de línea de cada fila es su id, así el import lleva lo que dice por línea a la nota de esa fila. `place` inserta por id del archivo, así que los ids de acá siguen las fechas, y el par de una relación tiene `new_id` en la nota más nueva, como lo escribe el detector. `write_links` escribe cada par como `(mayor, menor)` (`RECORD_PAIR_SQL`, `crates/clawg-core/src/memory/dispute.rs:300`), también para un archivo de clawg, donde ya vienen así salvo que un extremo estuviera presente con un id viejo.
 
 Las filas de una nota llegan enmascaradas por la nota entera, así que `prepare` no las vuelve a enmascarar (`Row.redacted` sale de la nota). Volver a pasar `redact` por una pieza podría enmascarar lo que el texto entero no (una marca después de una comilla invertida que el corte dejó al principio), y la pieza dejaría de ser la de un save.
 
@@ -61,11 +61,13 @@ Los vínculos de piezas de una nota se escriben salvo que una fila de su origen 
 
 La calificación se decide sobre el archivo entero: se agrupan las notas por destino y clave final; un grupo con más de un grupo de origen califica cada nota con `<grupo>/<clave>` y la vuelve a pasar por `rewrite_key`. Se califican todas y no sólo la segunda, así el resultado no depende del orden del archivo.
 
+El segmento de un grupo es el nombre tal cual cuando ya es un segmento válido, salvo que sea `no-project` o termine en `.personal`: esos dos se leerían como el grupo sin proyecto o como el `personal` de otro nombre, y un nombre que hubo que reescribir podría coincidir con otro. En los tres casos lleva `-` y el hash del nombre, con la misma regla que una clave. Una clave calificada todavía puede caer sobre la de una nota de otro grupo (`a` con la clave `b/k`, `b` con `k`), así que la calificación se repite hasta que ningún destino tenga una clave de dos grupos; cada pasada alarga las claves que toca, y un tope de ocho sólo asegura que el ciclo termine.
+
 Dos notas vivas del mismo grupo de origen y destino con una clave: la de fecha más nueva queda viva, y cada otra lleva en su línea `memory` `status` `superseded`, `superseded_by` la primera fila de la nueva y causa `revision`, que `write_links` ya traduce.
 
 ## D6. Notas de igual texto
 
-Se agrupan las notas vivas por grupo de origen y hash del texto enmascarado. La de fecha más vieja (y origen menor) queda con la suma de los `duplicate_count` y el `last_seen_at` más nuevo; las demás no dan filas, el reporte las nombra y sus relaciones van a ella. Un segundo import arma los mismos grupos, encuentra presente a la que quedó y no inserta las otras, con cualquier mapa. Por grupo de origen y no por destino: el destino cambia con el mapa, el grupo de origen no.
+Se agrupan las notas vivas por grupo de origen y hash del texto enmascarado. La de fecha más vieja (y origen menor) queda con la suma de los `duplicate_count`, el `last_seen_at` más nuevo y la marca `pinned` de cualquiera; las demás no dan filas, el reporte las nombra y sus relaciones van a ella. Un segundo import arma los mismos grupos, encuentra presente a la que quedó y no inserta las otras, con cualquier mapa. Por grupo de origen y no por destino: el destino cambia con el mapa, el grupo de origen no.
 
 ## D7. Fechas
 
@@ -86,7 +88,7 @@ El daemon arma el chunker con `ChatChunker::from_cell(runtime.tokenizer)` (`crat
 
 ## D10. La ruta, el comando y el reporte
 
-`ImportRequest` suma `from` (un enum, `clawg` por defecto) y `project_map`. `ImportOptions` suma el mapa; `import_foreign(store, embedder, chunker, backups, text, options)` lee, traduce y sigue por el mismo camino que `import`. `ImportReport` suma `by_lang` y `foreign: Option<ForeignReport>`; un cliente anterior ignora los campos.
+`ImportRequest` suma `from` (un enum, `clawg` por defecto) y `project_map`. `ImportOptions` suma el mapa; `import_foreign(store, embedder, chunker, backups, export, options)` recibe el export que el daemon ya leyó con el adaptador de su fuente (lo lee antes de pedir el embedder, HI16, y así no lo lee dos veces, y `clawg-core` no elige adaptador), lo traduce en `spawn_blocking`, porque enmascarar y partir miles de notas no debe frenar las demás rutas, y sigue por el mismo camino que `import`. `ImportReport` suma `by_lang` y `foreign: Option<ForeignReport>`; un cliente anterior ignora los campos. Con otra fuente, `merged`, `topic_taken` e `invalid` quedan vacíos y lo mismo va en `foreign` por nota, nombrada por su origen (`with_foreign`), y las notas de un proyecto cuya raíz es de otro, por ese proyecto.
 
 En el CLI, `--from` es un `ValueEnum`; `--project-map NOMBRE=RUTA` se corta en el último `=` (un nombre de proyecto puede tener `=`, una ruta de Windows no) y `RUTA` se resuelve con `resolve_project_root`. clap rechaza `--map-root` con `--from engram` y `--project-map` sin él.
 
