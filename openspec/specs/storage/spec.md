@@ -745,7 +745,7 @@ Un snapshot MUST incluir el outbox, y con él el texto enmascarado de los saves 
 
 ### Retención
 
-Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:241`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`, `pre-import`, `pre-move`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:248`); el borrado es best-effort.
+Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:241`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`, `pre-import`, `pre-move`, `pre-rekey`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:248`); el borrado es best-effort.
 
 #### Escenario
 - GIVEN 7 snapshots automáticos, 2 manuales y un `notas.txt`
@@ -890,6 +890,12 @@ Un `clawg serve` lanzado a mano escribe donde lo redirija quien lo lanza, sin ro
 V21 MUST crear `memory_move` (`move_id`, `row_id`, `from_project`, `from_scope`, `to_project`, `to_scope`, `moved_at`) con un índice por `move_id`, sin clave foránea a `memory` (un `purge` no debe frenarse por un movimiento viejo) y sin tocar ninguna fila. Una base en V20 MUST abrir con el registro vacío y cada fila igual. La vuelta atrás del esquema es el snapshot `pre-migration`, o deshacer los movimientos y `DROP TABLE memory_move; DELETE FROM refinery_schema_history WHERE version = 21;`. El lote de [`specs/project`](../project/spec.md) R12 escribe antes el snapshot `pre-move` (`Reason::PreMove`).
 
 **Test:** `a_database_from_the_previous_version_opens_with_an_empty_move_log` (`db.rs`), `published_migration_checksums_are_pinned` (`migrations.rs`), `snapshot_names_parse_back_to_their_reason` (`backup.rs`).
+
+## Los remotos y lo que reemplaza una unión
+
+V24 MUST crear `project_remote` (`remote` como clave primaria, `project_id`, `created_at`) y `memory_move_supersede` (`move_id`, `row_id`, `superseded_by`, `from_status`, `from_superseded_by`, `from_cause`, con un índice por `move_id`), y un índice de `project` por `root_path`, sin tocar ninguna fila. Una base en V23 MUST abrir con las dos tablas vacías y cada fila de `memory` y de `project` igual. La vuelta atrás del esquema es el snapshot `pre-migration`, o deshacer las uniones y `DROP INDEX idx_project_root; DROP TABLE memory_move_supersede; DROP TABLE project_remote; DELETE FROM refinery_schema_history WHERE version = 24;`. Un registro que une filas escribe antes el snapshot `pre-rekey` (`Reason::PreRekey`; [`specs/project`](../project/spec.md) R17).
+
+**Test:** `a_database_from_the_previous_version_opens_with_no_remote_recorded` (`db.rs`), `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 ## El idioma de cada fila
 

@@ -2798,6 +2798,75 @@ async fn registering_a_root_whose_id_is_taken_by_another_is_a_conflict() {
 }
 
 #[tokio::test]
+async fn registering_two_roots_that_collide_gives_each_its_own_id() {
+    let h = Harness::start().await;
+    let root = "/work/repo";
+    let taken = clawg_core::memory::derive_project_id(std::path::Path::new(root));
+    let seeded = taken.clone();
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [seeded])
+        })
+        .await
+        .expect("seed a colliding project");
+
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root, "assigned": true })).await;
+
+    assert_eq!(status, 200, "{body}");
+    let id = body["project_id"].as_str().expect("project_id");
+    assert_ne!(id, taken);
+    assert!(clawg_core::memory::project::is_project_id(id), "{id}");
+    assert_eq!(body["root_id"], id, "a root without a remote keeps its memories under its own id");
+}
+
+#[tokio::test]
+async fn two_clones_of_one_remote_register_into_one_project() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let mut ids = Vec::new();
+    for clone in ["work", "review"] {
+        let git = base.path().join(clone).join("app").join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config"), "[remote \"origin\"]\n\turl = git@github.com:acme/app.git\n").unwrap();
+        let root = base.path().join(clone).join("app");
+        let (status, body) =
+            h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true })).await;
+        assert_eq!(status, 200, "{body}");
+        ids.push((body["project_id"].as_str().unwrap().to_string(), body["root_id"].as_str().unwrap().to_string()));
+    }
+    assert_eq!(ids[0].0, ids[1].0, "one project: {ids:?}");
+    assert_eq!(ids[0].0, ids[0].1, "the first clone gives the project its id");
+    assert_ne!(ids[1].1, ids[1].0, "the second keeps its own root id: {ids:?}");
+}
+
+#[tokio::test]
+async fn registering_without_assigned_ids_keeps_the_old_answer() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let git = base.path().join("app").join(".git");
+    std::fs::create_dir_all(&git).unwrap();
+    std::fs::write(git.join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
+    let root = base.path().join("app");
+
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy() })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["project_id"], clawg_core::memory::derive_project_id(&root));
+    let remotes: i64 = h
+        .ctx
+        .runtime
+        .store
+        .conn
+        .call(|c| c.query_row("SELECT COUNT(*) FROM project_remote", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(remotes, 0, "a caller that derives its id joins no remote");
+}
+
+#[tokio::test]
 async fn registering_needs_the_token() {
     let h = Harness::start().await;
     let status = h

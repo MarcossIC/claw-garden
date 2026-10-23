@@ -385,6 +385,14 @@ Desde la próxima búsqueda, `cursor` deja de encontrar lo que guardó `claude-c
 
 Las herramientas que recibe el agente están en [Herramientas MCP](#herramientas-mcp).
 
+### Un proyecto en varias copias
+
+La memoria de un proyecto es la de la raíz del repositorio (o de la carpeta, si no es un repo): un subdirectorio, una rama en otro worktree o un monorepo entero comparten una sola. Dos copias del mismo repositorio en carpetas distintas (una de trabajo y otra de revisión, o un clone nuevo) también la comparten, si su remoto `origin` es el mismo: `https://github.com/acme/app.git` y `git@github.com:acme/app.git` cuentan como el mismo. clawg lo lee de `.git/config`, sin red, y no guarda la URL, que puede llevar una contraseña. Un fork tiene otro `origin` y es otro proyecto; una carpeta sin git o sin `origin` se identifica por su ruta, como siempre. El índice de documentación (`search_project`) sigue siendo de cada copia, así cada una ve los archivos de su rama.
+
+La primera vez que se abre la segunda copia, lo que había guardado en ella pasa al proyecto compartido. Si las dos tenían una versión del mismo tema (`topic_key`), queda vigente la más nueva; si tenían el mismo texto, queda uno. Antes guarda un snapshot `pre-rekey` en `backups`, y el log del daemon dice cuántas filas unió. Para deshacerlo, `clawg projects move --undo N` con el número del movimiento.
+
+Para unir a mano dos proyectos que clawg no relaciona (un repo que cambió de remoto, un fork), está `clawg projects move --from-project <id> --to <ruta>`.
+
 ## Otros clientes MCP
 
 Cualquier cliente que acepte servidores MCP por stdio sirve: hay que darle el comando y sus argumentos. En los que se configuran con un JSON del estilo `mcpServers` (por ejemplo Cursor), sería:

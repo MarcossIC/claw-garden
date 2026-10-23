@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2 | M | project-root-guard (define qué es una colisión y cómo se avisa; este cambio la redefine) | exploración (borrador) |
+| 2 | M | project-root-guard (define qué es una colisión y cómo se avisa; este cambio la redefine) | exploración cerrada: ver [«Decisiones tomadas»](#decisiones-tomadas) |
 
 **Tesis:** la identidad de un proyecto es la ruta del disco, no el repositorio. Dos clones del mismo repo son dos proyectos y sus memorias se parten. Quien tiene una copia de trabajo y otra de revisión, o vuelve a clonar un repo en otra carpeta, pierde la memoria que juntó. El caso de los worktrees, que se planteaba como el principal, **ya está resuelto**; lo que queda es el clone y los bordes del worktree.
 
@@ -200,9 +200,28 @@ Hay quien quiere memorias separadas por clone (por ejemplo, un clone de producci
 - El chequeo de colisiones en reposo (`doctor-checks`).
 - Tocar worktrees de repos bare: se mantiene la decisión actual (`identity.rs:92-95`).
 
-## Decisiones abiertas
+## Decisiones tomadas
 
-Son del usuario.
+Las tomó el usuario sobre las opciones de arriba:
+
+- **Identidad: el remoto como pista (A), sobre la raíz de siempre.** El proyecto sigue siendo la raíz que da R1 de `specs/project` (la raíz git más cercana, o la carpeta sin git). Un monorepo sigue siendo un proyecto, y una carpeta sin git, o un repo sin `origin`, o con un `origin` que es una ruta local, se identifica por su ruta como hoy. El `origin` normalizado sólo sirve para que dos clones del mismo repo compartan la memoria. Se lee del `config` del directorio git de la raíz (el común para un worktree, el propio para un submódulo). Partir un monorepo en subproyectos queda fuera, como cambio aparte.
+- **Ancho: W3, el registro asigna el id.** La primera raíz conserva el id que ya tenía (`derive_project_id`), una raíz cuyo id ya es de otra recibe otro libre con el mismo formato, y la primera raíz que registra un remoto le da su id. Un choque deja de bloquear: deja de existir.
+- **Reconciliar al unir: Q1, y registrarlo.** Gana la versión más nueva de cada clave y la fila más vieja de cada texto; la otra queda `superseded` por ella (causa `revision`). Todo queda en `memory_move` (V21) y en una tabla nueva junto a él, se deshace con `clawg projects move --undo N`, y un registro que mueve filas toma antes un snapshot `pre-rekey`.
+- **Índice de documentos: I1, por checkout.** El índice se queda en el id de la raíz; la memoria usa el del proyecto.
+
+Las resolvió la evidencia o el resto de las decisiones:
+
+- **Forks:** un fork tiene otro `origin` y es otro proyecto; unirlo es un `clawg projects move`.
+- **Qué remoto:** sólo `origin`.
+- **Mayúsculas:** todo en minúsculas (host, dueño y repo). GitHub, GitLab y Bitbucket no distinguen mayúsculas en esas rutas; partir un repo por cómo se escribió la URL al clonar es más probable que dos repos que sólo difieren en mayúsculas en un servidor que sí las distingue.
+- **Si cambia el remoto:** el remoto nuevo que nadie registró toma el id de la primera raíz que lo trae, que es la misma: el proyecto no cambia. Si el remoto nuevo ya es de otro proyecto, la raíz pasa a ese y sus filas se unen como las de un clone.
+- **Repos sin remoto que luego lo ganan:** lo mismo; las filas de la raíz se unen al proyecto del remoto si ya era de otra.
+- **Opt-out (C) y `projects merge`:** no hacen falta. `clawg projects move --from-project ID --to PATH` (77) ya une y se deshace; la clave explícita queda fuera.
+- **Snapshot:** un `Reason::PreRekey` nuevo. La poda ya conserva el más nuevo de cada motivo (`to_prune`, `crates/clawg-core/src/memory/backup.rs:289-310`), que era el arreglo del backlog que esta exploración pedía antes.
+
+## Decisiones abiertas (ya cerradas)
+
+Se cerraron arriba. Quedan como las planteó la exploración.
 
 - [ ] **Qué identifica un proyecto.** ¿Remoto `origin` normalizado y raíz si no hay (A, recomendado), sólo raíz con `merge` manual (B), o con clave explícita como override (C)?
 - [ ] **Forks.** Un fork tiene otro `origin`, así que es otro proyecto. ¿Se acepta, o el usuario espera que el fork comparta con el original (entonces haría falta mirar `upstream`)?

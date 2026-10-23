@@ -83,14 +83,23 @@ El detector de contradicciones MUST NOT correr sobre lo importado. Los vínculos
 
 ## R4. Proyectos
 
-Cada fila de un proyecto con línea `project` MUST quedar con el `project_id` que `derive_project_id` da para su raíz en el destino: la `root_path` exportada, o `NEW` si `--map-root OLD=NEW` nombra esa raíz (el CLI resuelve `NEW` como un puente). El proyecto MUST registrarse en `project` sin `index_docs`. Si ese id ya pertenece a otra raíz, las filas de ese proyecto MUST reportarse inválidas y no importarse. Una fila con un `project_id` sin línea `project` (un id de antes de que se registraran raíces) lo conserva.
+Cada fila de un proyecto con línea `project` MUST quedar con el id de proyecto que un registro le daría a su raíz en el destino ([`specs/project`](../project/spec.md) R15 y R16): la `root_path` exportada, o `NEW` si `--map-root OLD=NEW` nombra esa raíz (el CLI resuelve `NEW` como un puente). Los ids se planean antes de escribir, sin que dos raíces del archivo tomen el mismo (`plan_ids_in`, `crates/clawg-core/src/memory/project.rs`), y una raíz cuyo `origin` ya tiene proyecto va a ese. El proyecto MUST registrarse en `project` sin `index_docs`, y su remoto en `project_remote`. Si entre el plan y la escritura un registro le dio ese id a otra raíz, las filas de ese proyecto MUST reportarse inválidas y no importarse. Una fila con un `project_id` sin línea `project` (un id de antes de que se registraran raíces) lo conserva.
 
 #### Escenario: otra raíz
 - GIVEN un export de `/a/repo`
 - WHEN se importa con `--map-root /a/repo=/b/repo`
 - THEN las filas quedan con `derive_project_id("/b/repo")` y `project` lo registra con esa raíz
 
-**Tests:** `map_root_gives_the_destination_project_id`, `a_project_id_of_another_root_is_reported_and_skipped` (`crates/clawg-core/src/memory/portability/import.rs`).
+#### Escenario: una raíz cuyo id es de otra
+- GIVEN `project` con el id de la raíz exportada para otra raíz
+- WHEN se importa
+- THEN las filas quedan con el siguiente candidato de la raíz y ninguna es inválida
+
+**Tests:** `map_root_gives_the_destination_project_id`, `an_import_gives_a_colliding_root_its_own_id`, `an_import_into_a_clone_goes_to_the_project_of_its_remote` (`crates/clawg-core/src/memory/portability/import.rs`).
+
+`clawg export --project PATH` MUST tomar el id de proyecto de la raíz de PATH del store, sin escribir: el de su remoto, si no el de su raíz en `project`, si no el que recibiría (`project_id_of`, `crates/clawg-core/src/memory/portability/export.rs`); en un store sin `project`, `derive_project_id`.
+
+**Tests:** `export_reads_the_project_id_from_the_store`, `a_store_from_before_roots_were_recorded_gives_the_derived_id` (`export.rs`).
 
 ## R5. Un segundo import no duplica
 

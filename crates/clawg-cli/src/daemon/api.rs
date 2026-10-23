@@ -42,7 +42,8 @@ use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::language::count_saves_in;
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
-use clawg_core::memory::project::{register_project, RegisterError};
+use clawg_core::memory::identity::origin_key;
+use clawg_core::memory::project::{register_project, RegisterError, Registration};
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach, Reader};
@@ -1918,18 +1919,26 @@ pub struct RegisterRequest {
     /// caller that does not say only labels memories with the root.
     #[serde(default)]
     pub index_docs: bool,
+    /// The caller reads and writes under the ids this answer gives. False
+    /// when missing: a caller from before derives the id from the root.
+    #[serde(default)]
+    pub assigned: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RegisteredBody {
     pub project_id: String,
+    pub root_id: String,
     pub rekeyed: usize,
 }
 
-/// Records a project root and moves rows saved under its legacy ids onto it.
+/// Records a project root and joins into its project the rows saved under
+/// its legacy ids and, for a clone of a remote another root registered, its
+/// own.
 ///
-/// The id is derived here from `root_path` rather than taken from the caller,
-/// so the row in `project` can never name a root that does not hash to it.
+/// The ids are settled here from `root_path` and the remote its git
+/// directory names, never taken from the caller, so a row in `project` can
+/// never name a root it was not given to.
 async fn register(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<RegisterRequest>,
@@ -1941,31 +1950,50 @@ async fn register(
     if body.index_docs && !root.is_dir() {
         return Err(ApiError::bad_request(format!("{} is not a directory, so it has no files to index", body.root_path)));
     }
-    let outcome = register_project(
-        &app.runtime.store,
-        &app.runtime.workspaces(),
+    let remote = if body.assigned {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || origin_key(&root)).await.ok().flatten()
+    } else {
+        None
+    };
+    let registration = Registration {
         root,
-        &body.legacy_ids,
-        body.index_docs,
-    )
-    .await
-    .map_err(|e| match e {
-        RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
-        RegisterError::RootCollision { id, existing } => ApiError {
-            detail: Some(format!("{} gets the project id {id}, which already belongs to {existing}", root.display())),
-            ..ApiError::conflict("project_root_collision")
-        },
-        RegisterError::Store(_) => ApiError::internal(e),
-    })?;
+        remote: remote.as_deref(),
+        legacy_ids: &body.legacy_ids,
+        index_docs: body.index_docs,
+        assigned: body.assigned,
+    };
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration)
+        .await
+        .map_err(|e| match e {
+            RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
+            RegisterError::RootCollision { id, existing } => ApiError {
+                detail: Some(format!("{} gets the project id {id}, which already belongs to {existing}", root.display())),
+                ..ApiError::conflict("project_root_collision")
+            },
+            RegisterError::NoFreeId(_) => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("no_free_project_id") },
+            RegisterError::Store(_) => ApiError::internal(e),
+        })?;
+    if outcome.rekeyed > 0 {
+        log::info!(
+            "{} joined {} rows of its earlier ids into project {}{}{}",
+            root.display(),
+            outcome.rekeyed,
+            outcome.project_id,
+            outcome.move_id.map(|n| format!("; `clawg projects move --undo {n}` moves its memories back")).unwrap_or_default(),
+            outcome.snapshot.as_ref().map(|s| format!("; the store before is {}", s.display())).unwrap_or_default()
+        );
+    }
     // A bridge registers its root as its session starts, so the model that
     // went away while nobody worked starts loading before the first search.
     if let Some(embedder) = app.runtime.embedder.get() {
         embedder.wake();
     }
     if outcome.index_docs {
-        spawn_doc_refresh(app.clone(), outcome.project_id.clone());
+        spawn_doc_refresh(app.clone(), outcome.root_id.clone());
     }
-    Ok(Json(RegisteredBody { project_id: outcome.project_id, rekeyed: outcome.rekeyed }))
+    Ok(Json(RegisteredBody { project_id: outcome.project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
 }
 
 /// Refreshes the project's documentation index in the background, once the

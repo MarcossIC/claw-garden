@@ -14,6 +14,26 @@ pub fn derive_project_id(project_path: &Path) -> String {
     format!("{}-{}", name, h)
 }
 
+/// How many ids a root may be given: [`candidate_id`] for `n` below this.
+pub const CANDIDATES: u32 = 64;
+
+/// The `n`th id a root may be given when the ones before belong to other
+/// roots: [`derive_project_id`] for 0, and the same format with `#n` after
+/// the path's bytes for the rest.
+pub fn candidate_id(root: &Path, n: u32) -> String {
+    if n == 0 {
+        return derive_project_id(root);
+    }
+    let mut bytes = root.as_os_str().as_encoded_bytes().to_vec();
+    bytes.extend_from_slice(format!("#{n}").as_bytes());
+    format!("{}-{}", basename(root), hash4(&bytes))
+}
+
+/// Whether `id` is one of the ids [`candidate_id`] gives `root`.
+pub fn is_candidate_for(root: &Path, id: &str) -> bool {
+    (0..CANDIDATES).any(|n| candidate_id(root, n) == id)
+}
+
 /// A project as the store keys it: the root every path inside it resolves to,
 /// the id derived from that root, and the id the same path had before paths
 /// were resolved, which rows saved back then still carry.
@@ -29,6 +49,12 @@ impl ProjectIdentity {
     pub fn resolve(path: &Path) -> Self {
         let root = resolve_project_root(path);
         Self { id: derive_project_id(&root), legacy_id: derive_project_id(path), root }
+    }
+
+    /// What a registration of this project names as its legacy ids: the id of
+    /// the path it was reached through, when that is not the root's.
+    pub fn legacy_ids(&self) -> Vec<String> {
+        Some(self.legacy_id.clone()).filter(|l| *l != self.id).into_iter().collect()
     }
 }
 
@@ -141,6 +167,104 @@ pub fn strip_verbatim(path: &Path) -> PathBuf {
         Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
         _ => path.to_path_buf(),
     }
+}
+
+/// What makes two checkouts one project: the `origin` remote of the root's
+/// git directory, normalized by [`normalize_remote`]. `None` outside git,
+/// without an `origin`, or with one that is not a server.
+pub fn origin_key(root: &Path) -> Option<String> {
+    let marker = read_marker(root)?;
+    let config = std::fs::read_to_string(git_config_dir(root, &marker).join("config")).ok()?;
+    normalize_remote(&origin_url(&config)?)
+}
+
+/// The directory whose `config` holds the remotes of the checkout at `dir`:
+/// the common git directory of a worktree, the git directory of a submodule.
+pub fn git_config_dir(dir: &Path, marker: &GitMarker) -> PathBuf {
+    match marker {
+        GitMarker::Dir => dir.join(".git"),
+        GitMarker::Link { gitdir, commondir: Some(common) } => normalize_lexical(&gitdir.join(common.trim())),
+        GitMarker::Link { gitdir, commondir: None } => gitdir.clone(),
+    }
+}
+
+/// The first `url` of the `origin` remote in the text of a git `config`.
+/// Section names are matched without case and the subsection exactly, as git
+/// does; `include` and `insteadOf` are not followed.
+pub fn origin_url(config: &str) -> Option<String> {
+    let mut in_origin = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            let header = header.split(']').next().unwrap_or_default().trim();
+            in_origin = match header.split_once(char::is_whitespace) {
+                Some((name, sub)) => {
+                    name.eq_ignore_ascii_case("remote") && sub.trim().trim_matches('"') == "origin"
+                }
+                None => header.eq_ignore_ascii_case("remote.origin"),
+            };
+            continue;
+        }
+        if !in_origin {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("url") {
+            continue;
+        }
+        let value = value.trim();
+        let value = match value.strip_prefix('"') {
+            Some(quoted) => quoted.split('"').next().unwrap_or_default(),
+            None => value.split(['#', ';']).next().unwrap_or_default().trim(),
+        };
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// `host/owner/repo` for a remote URL, in lower case, without scheme, user,
+/// password, port, trailing slash or `.git`. `None` for anything that is not
+/// a server two clones would name alike: a path, `file://`, an empty value.
+pub fn normalize_remote(url: &str) -> Option<String> {
+    let url = url.trim();
+    let (authority, path) = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let scheme = scheme.to_ascii_lowercase();
+            if !matches!(scheme.as_str(), "https" | "http" | "ssh" | "git" | "git+ssh" | "ssh+git") {
+                return None;
+            }
+            rest.split_once('/').unwrap_or((rest, ""))
+        }
+        None => {
+            let drive = url.as_bytes().get(1) == Some(&b':') && url.as_bytes()[0].is_ascii_alphabetic();
+            if drive || url.starts_with(['/', '.', '~', '\\']) {
+                return None;
+            }
+            let (host, path) = url.split_once(':')?;
+            if host.contains('/') {
+                return None;
+            }
+            (host, path)
+        }
+    };
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let (host, path) = match host.split_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => (h, path.to_string()),
+        Some((h, prefix)) => (h, format!("{prefix}/{path}")),
+        None => (host, path.to_string()),
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path).trim_matches('/');
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if host.is_empty() || segments.is_empty() {
+        return None;
+    }
+    Some(format!("{host}/{}", segments.join("/")).to_lowercase())
 }
 
 /// Return the 4-hex-character SipHash-1-3 fingerprint of `s`.
@@ -273,5 +397,80 @@ mod tests {
             commondir: None,
         };
         assert_eq!(root_from_marker(Path::new("/w/repo/sub"), &marker), PathBuf::from("/w/repo/sub"));
+    }
+
+    #[test]
+    fn a_remote_normalizes_to_host_owner_and_repo() {
+        for url in [
+            "https://github.com/Acme/App.git",
+            "git@github.com:acme/app.git",
+            "ssh://git@github.com:22/Acme/App",
+            "https://u:tok@github.com/Acme/App/",
+            "git+ssh://git@GitHub.com/acme/app",
+            "  https://github.com/acme/app  ",
+        ] {
+            let key = normalize_remote(url);
+            assert_eq!(key.as_deref(), Some("github.com/acme/app"), "{url}");
+            assert!(!key.unwrap().contains("tok"));
+        }
+        assert_eq!(normalize_remote("https://gitlab.com/group/sub/repo.git").as_deref(), Some("gitlab.com/group/sub/repo"));
+        assert_ne!(normalize_remote("https://github.com/acme/app"), normalize_remote("https://github.com/me/app"));
+    }
+
+    #[test]
+    fn a_local_remote_has_no_key() {
+        for url in [
+            "/srv/git/app.git",
+            "../app",
+            "./app",
+            "~/repos/app",
+            "file:///srv/app",
+            r"C:\repos\app",
+            "C:/repos/app",
+            r"\\server\share\app",
+            "",
+            "https://github.com",
+            "https://github.com/",
+            "app",
+            "ftp://host/app",
+        ] {
+            assert_eq!(normalize_remote(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn the_origin_url_is_read_from_its_section() {
+        let config = "[core]\n\tbare = false\n[remote \"upstream\"]\n\turl = https://github.com/up/app\n\
+                      ; a comment\n[Remote \"origin\"]\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+                      \tURL = git@github.com:acme/app.git # mine\n\turl = https://second/url\n[branch \"main\"]\n\tremote = origin\n";
+        assert_eq!(origin_url(config).as_deref(), Some("git@github.com:acme/app.git"));
+        assert_eq!(origin_url("[remote \"origin\"]\n  url = \"https://h/o/r\"\n").as_deref(), Some("https://h/o/r"));
+        assert_eq!(origin_url("[remote \"Origin\"]\n  url = https://h/o/r\n"), None, "the subsection is exact");
+        assert_eq!(origin_url("[remote \"upstream\"]\n  url = https://h/o/r\n"), None);
+        assert_eq!(origin_url(""), None);
+    }
+
+    #[test]
+    fn the_config_of_a_worktree_is_in_its_common_directory() {
+        let dir = Path::new("/w/wt");
+        assert_eq!(git_config_dir(Path::new("/w/repo"), &GitMarker::Dir), PathBuf::from("/w/repo/.git"));
+        let worktree = GitMarker::Link {
+            gitdir: PathBuf::from("/w/repo/.git/worktrees/wt"),
+            commondir: Some("../..\n".into()),
+        };
+        assert_eq!(git_config_dir(dir, &worktree), PathBuf::from("/w/repo/.git"));
+        let submodule = GitMarker::Link { gitdir: PathBuf::from("/w/repo/.git/modules/sub"), commondir: None };
+        assert_eq!(git_config_dir(dir, &submodule), PathBuf::from("/w/repo/.git/modules/sub"));
+    }
+
+    #[test]
+    fn the_candidates_of_a_root_keep_its_name_and_start_with_its_id() {
+        let root = Path::new("/work/my-app");
+        assert_eq!(candidate_id(root, 0), derive_project_id(root));
+        let ids: std::collections::HashSet<String> = (0..CANDIDATES).map(|n| candidate_id(root, n)).collect();
+        assert!(ids.len() > 60, "{ids:?}");
+        assert!(ids.iter().all(|id| id.starts_with("my-app-") && id.len() == "my-app-".len() + 4));
+        assert!(is_candidate_for(root, &candidate_id(root, 7)));
+        assert!(!is_candidate_for(root, "my-app-zzzz"));
     }
 }

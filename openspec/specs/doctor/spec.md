@@ -168,11 +168,11 @@ Las reglas 1 y 4 agrupan por proyecto, como la clave de tema y el dedup ([`specs
 | `outbox` | una fila `failed` | `warn` `failed`, una por fila, con el `operation_id`, el agente y los intentos | `clawg outbox retry <OPERATION_ID> --agent <AGENT> --profile P` |
 | `agents` | siempre que haya filas | `ok`, con cada agente y sus filas vivas y totales | — |
 | `agents` | filas vivas del agente de respaldo `mcp` | `warn` `fallback_agent`, con la cantidad: un cliente no dio `--agent` ni `clientInfo.name`; todo agente las lee y las cambia, pero el workspace y RECENT del agente real del cliente no las incluyen | — |
-| `projects` | una fila de `project` cuyo id no es `derive_project_id(root_path)` | `warn` `id_mismatch`, con el id y la ruta | — |
+| `projects` | una fila de `project` cuyo id no es ninguno de los que su raíz puede recibir (`candidate_id(root_path, 0..64)`, `is_candidate_for`) | `warn` `id_mismatch`, con el id y la ruta | — |
 
 Con filas `pending` y un daemon vivo no hay hallazgo: las está ingiriendo.
 
-**Tests:** `the_facts_name_agents_projects_the_outbox_and_the_contract` (`inspect.rs`); `outbox_findings`, `agent_findings`, `project_findings`, `shell_words_are_quoted_only_when_a_shell_would_read_them` (`doctor`).
+**Tests:** `the_facts_name_agents_projects_the_outbox_and_the_contract` (`inspect.rs`); `outbox_findings`, `agent_findings`, `project_findings`, `a_project_id_assigned_to_its_root_is_ok`, `shell_words_are_quoted_only_when_a_shell_would_read_them` (`doctor`).
 
 ## R8. El registro MCP de Claude Code
 
