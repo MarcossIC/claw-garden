@@ -148,7 +148,7 @@ Dos matches que se superponen MUST resolverse a favor del que empieza antes y, s
 
 El daemon MUST enmascarar el contenido de un save antes de escribir su fila en el outbox (`MemoryRuntime::accept`, `crates/clawg-core/src/runtime.rs:239`): la fila vive en `memory.db` y en cada snapshot mientras el save espera o queda `failed`, y guarda sólo el texto ya enmascarado ([`specs/ingest`](../ingest/spec.md), «Aceptar es durable»). El volcado de una versión anterior, que sí guardaba texto crudo, se enmascara al importarlo (`import_spill`, `runtime.rs:520`).
 
-El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualquier fuente, antes de elegir el chunker y de trocear (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:730`): sobre el texto de una fila del outbox ya no encuentra nada, porque `redact` es idempotente (R1), y es la pasada que enmascara un evento que ninguna fila respalda (los caminos en proceso de tests y evaluación). El hash de dedup, el embedding, el FTS y `memory.content` MUST calcularse sobre el texto enmascarado. `IngestReport.redacted` (`worker.rs:85`) MUST llevar los tipos que el worker enmascaró del evento en todos los caminos de salida, también cuando el evento falla después.
+El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualquier fuente, antes de elegir el chunker y de trocear (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:751`): sobre el texto de una fila del outbox ya no encuentra nada, porque `redact` es idempotente (R1), y es la pasada que enmascara un evento que ninguna fila respalda (los caminos en proceso de tests y evaluación). El hash de dedup, el embedding, el FTS y `memory.content` MUST calcularse sobre el texto enmascarado. `IngestReport.redacted` (`worker.rs:86`) MUST llevar los tipos que el worker enmascaró del evento en todos los caminos de salida, también cuando el evento falla después.
 
 #### Escenario: el secreto no llega a la base
 - GIVEN un save `deploy uses ghp_<36 caracteres>`
@@ -169,13 +169,13 @@ El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualqui
 
 ### R3. El save dice qué se enmascaró
 
-Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:524`; `save_response`, `api.rs:1003`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1071`; sólo un evento sin fila puede sumar algo en el worker):
+Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:576`; `save_response`, `api.rs:1183`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1252`; sólo un evento sin fila puede sumar algo en el worker):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "redacted": ["github_token"]}
 ```
 
-`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:549`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:588`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:543`).
+`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:581`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:688`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:600`).
 
 #### Escenario
 - GIVEN un daemon con el embedder listo

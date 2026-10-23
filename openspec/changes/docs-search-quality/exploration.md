@@ -49,7 +49,7 @@ El texto de cada pasaje que entra a los dos canales es `breadcrumb + "\n\n" + cu
 
 ### Por qué ahora
 
-El protocolo de memoria (22) empuja a los agentes a llamar `search_project` antes de abrir archivos (`memory-protocol/exploration.md:99`; `INSTRUCTIONS` en `server.rs:108`). Una herramienta que acierta una de cuatro cuesta tokens cada vez que el agente confía en ella y se equivoca, y lo más probable es que abra los archivos de todos modos.
+El protocolo de memoria (22) empuja a los agentes a llamar `search_project` antes de abrir archivos (`memory-protocol/exploration.md:99`; `INSTRUCTIONS` en `protocol.rs:15`). Una herramienta que acierta una de cuatro cuesta tokens cada vez que el agente confía en ella y se equivoca, y lo más probable es que abra los archivos de todos modos.
 
 ## Lo que ya existe y se reutiliza
 

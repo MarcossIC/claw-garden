@@ -7,7 +7,7 @@ Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de 
 ## Definiciones
 
 - **Feature `testing`:** la feature de clawg-core que compila los sustitutos de prueba (`crates/clawg-core/Cargo.toml:25`).
-- **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:23`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:73`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
+- **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:26`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:73`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
 - **Home de prueba:** el valor no vacío de `CLAWG_TEST_HOME` (`TEST_HOME_VAR`, `crates/clawg-core/src/paths.rs:169`).
 - **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:313`), `fake`, `stalled` o `blocked` (`TestEmbedder`, `bootstrap.rs:318`).
 
@@ -29,7 +29,7 @@ Se reemplaza el home y no el directorio de datos para que el perfil siga eligien
 - WHEN corre `clawg status --profile prod`
 - THEN sale con 1, el error dice que un build debug no abre prod, y no existe `<home>/.clawg`
 
-**Tests:** `a_test_home_replaces_the_system_home` y `an_unset_or_empty_test_home_keeps_the_system_home` (`paths.rs`, mod tests); `a_debug_binary_refuses_prod_even_with_a_test_home` (`binary.rs:471`).
+**Tests:** `a_test_home_replaces_the_system_home` y `an_unset_or_empty_test_home_keeps_the_system_home` (`paths.rs`, mod tests); `a_debug_binary_refuses_prod_even_with_a_test_home` (`binary.rs:707`).
 
 ## El embedder de prueba
 
@@ -65,7 +65,7 @@ El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la
 
 ## El binario sobrevive a lo que sólo ve un proceso
 
-`crates/clawg-cli/tests/binary.rs` MUST lanzar el build de test como proceso hijo y probar los escenarios de abajo. Cada prueba MUST correr en su propio home de prueba (`Sandbox`, `binary.rs:32`), con `fake` salvo que el escenario pida otro y con `--port 0`. El puerto y el token se leen de `daemon.json` y `token` cuando `daemon.json` nombra el pid del hijo (`published`, `binary.rs:297`), así que las pruebas corren en paralelo sin chocar. Un puente MUST arrancar en una carpeta vacía propia (`Sandbox::bridge`, `binary.rs:102`), porque registra su raíz con `index_docs` y si no, indexaría lo que haya. Cada línea del stdout de un puente MUST ser un mensaje JSON-RPC: otra cosa falla la prueba con la línea a la vista (`Bridge::reply`, `binary.rs:310`).
+`crates/clawg-cli/tests/binary.rs` MUST lanzar el build de test como proceso hijo y probar los escenarios de abajo. Cada prueba MUST correr en su propio home de prueba (`Sandbox`, `binary.rs:35`), con `fake` salvo que el escenario pida otro y con `--port 0`. El puerto y el token se leen de `daemon.json` y `token` cuando `daemon.json` nombra el pid del hijo (`published`, `binary.rs:327`), así que las pruebas corren en paralelo sin chocar. Un puente MUST arrancar en una carpeta vacía propia (`Sandbox::bridge`, `binary.rs:120`), porque registra su raíz con `index_docs` y si no, indexaría lo que haya. Cada línea del stdout de un puente MUST ser un mensaje JSON-RPC: otra cosa falla la prueba con la línea a la vista (`Bridge::reply`, `binary.rs:350`).
 
 #### Escenario: kill duro
 - GIVEN un daemon con `stalled` que respondió `202` a un save
@@ -107,7 +107,7 @@ El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la
 - WHEN el daemon se detiene con `clawg stop` y arranca otro, con otro token
 - THEN la herramienta siguiente responde sin error
 
-**Tests:** `a_save_accepted_before_a_hard_kill_is_stored_after_the_restart` (`binary.rs:400`), `a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_first` (`binary.rs:430`), `status_and_stop_follow_the_daemon_process` (`binary.rs:446`), `a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store` (`binary.rs:482`), `a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemon` (`binary.rs:520`), `a_bridge_on_real_stdio_serves_a_host_that_never_initializes` (`binary.rs:544`) y `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`binary.rs:564`).
+**Tests:** `a_save_accepted_before_a_hard_kill_is_stored_after_the_restart` (`binary.rs:426`), `a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_first` (`binary.rs:506`), `status_and_stop_follow_the_daemon_process` (`binary.rs:547`), `a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store` (`binary.rs:718`), `a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemon` (`binary.rs:991`), `a_bridge_on_real_stdio_serves_a_host_that_never_initializes` (`binary.rs:1015`) y `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`binary.rs:1035`).
 
 Un daemon que la suite no lanza con `--port` (el que autoarranca un puente, el que arranca `update`, los de las pruebas del socket) MUST NOT tomar el puerto del perfil de la máquina: cada hijo lleva `CLAWG_TEST_DEFAULT_PORT=off` en Unix y en Windows (`socket_only`, `binary.rs`), que un build con `testing` lee en lugar del puerto del perfil (`off`, o un número que lo reemplaza; `build_info::default_port_override`), y ese daemon escucha sólo en el socket de su home. Así el autoarranque se prueba a través del binario en los dos sistemas.
 
@@ -120,7 +120,7 @@ Un daemon que la suite no lanza con `--port` (el que autoarranca un puente, el q
 
 ## Ningún hijo sobrevive a su prueba
 
-Cada proceso que lanza la suite MUST terminarse por su propio handle cuando su prueba termina, también si la prueba entra en pánico. `Daemon` y `Bridge` matan y esperan a su hijo al soltarse (`binary.rs:290` y `binary.rs:366`). Un hilo cosecha cada daemon apenas sale (`Daemon::watch`, `binary.rs:163`): en Unix, un hijo sin cosechar queda zombi, y `clawg stop`, que pregunta por el pid, esperaría hasta su tope.
+Cada proceso que lanza la suite MUST terminarse por su propio handle cuando su prueba termina, también si la prueba entra en pánico. `Daemon` y `Bridge` matan y esperan a su hijo al soltarse (`binary.rs:310` y `binary.rs:392`). Un hilo cosecha cada daemon apenas sale (`Daemon::watch`, `binary.rs:196`): en Unix, un hijo sin cosechar queda zombi, y `clawg stop`, que pregunta por el pid, esperaría hasta su tope.
 
 La suite MUST NOT terminar procesos por nombre: un `clawg` que corre el editor del usuario tiene que sobrevivirla.
 
@@ -128,7 +128,7 @@ La suite MUST NOT terminar procesos por nombre: un `clawg` que corre el editor d
 - GIVEN una prueba que entra en pánico con su daemon corriendo
 - THEN otro daemon puede tomar el mismo directorio de datos enseguida
 
-**Test:** `a_test_that_fails_midway_leaves_no_daemon_holding_the_store` (`binary.rs:583`). Que no se termine nada por nombre no tiene test: se cumple por construcción, porque el repo no tiene ningún `taskkill`, `pkill`, `killall` ni `Stop-Process`.
+**Test:** `a_test_that_fails_midway_leaves_no_daemon_holding_the_store` (`binary.rs:1408`). Que no se termine nada por nombre no tiene test: se cumple por construcción, porque el repo no tiene ningún `taskkill`, `pkill`, `killall` ni `Stop-Process`.
 
 ## CI
 
