@@ -31,7 +31,7 @@ Con el idioma del comando `en`, cada frase del CLI MUST ser idéntica, byte a by
 
 ## CL3. Las frases en español
 
-Con el idioma del comando `es`, cada frase del CLI de estos comandos MUST estar en español: `doctor` (cada `message`), `update` (el informe de éxito, el de fallo, el de `--check` y la frase de un directorio que no se puede escribir), `setup` (cada línea del informe), `secrets` y `purge` (los informes y las negativas sin `--yes`), `export`, `import`, `restore`, `undelete`, `outbox retry|discard`, `projects add|move`, `sharing` (la frase que enmarca un archivo inválido), `metrics report` (la falta del archivo o de la métrica), `memories` (los avisos de lista vacía, el pie de `list --deleted`, la falta de daemon y el aviso de versión), `stop` y `path`. Una causa técnica MUST ir tal cual dentro de la frase. Los comandos entre comillas invertidas, los ids, las rutas y los nombres de memoria MUST NOT cambiar.
+Con el idioma del comando `es`, cada frase del CLI de estos comandos MUST estar en español: `doctor` (cada `message`), `update` (el informe de éxito, el de fallo y el de `--check`), `setup` (cada línea del informe), `secrets` y `purge` (los informes y las negativas sin `--yes`), `export`, `import`, `restore`, `undelete`, `outbox retry|discard`, `projects add|move`, `sharing` (la política que imprime, la negativa de ocultar a un agente de sí mismo y la frase que enmarca un archivo inválido), `metrics report` (la falta del archivo o de la métrica), `memories` (las listas vacías, el pie de cada listado, el resumen de `stats`, la falta de daemon y el aviso de versión) y `stop`. Una causa técnica MUST ir tal cual dentro de la frase. Los comandos entre comillas invertidas, los ids, las rutas y los nombres de memoria MUST NOT cambiar.
 
 #### Escenario: el informe de un purge
 - GIVEN el idioma del comando `es`
@@ -42,7 +42,7 @@ Con el idioma del comando `es`, cada frase del CLI de estos comandos MUST estar 
 - GIVEN el idioma del comando `es` y una actualización que falla al bajar el binario por `the download does not match SHA256SUMS`
 - THEN la primera línea está en español y contiene `the download does not match SHA256SUMS` tal cual
 
-**Test:** un test por informe con `Lang::Es`: `the_secrets_report_speaks_spanish`, `the_purge_report_speaks_spanish`, `the_update_reports_speak_spanish`, `the_setup_report_speaks_spanish`, `the_export_and_import_reports_speak_spanish`, `the_move_report_speaks_spanish`, y los de `restore`, `undelete`, `outbox` y `memories`; `stop_speaks_the_preferred_language` (`tests/binary.rs`).
+**Test:** un test por informe con `Lang::Es`: `the_secrets_report_speaks_spanish`, `the_purge_report_speaks_spanish` (`secrets.rs`), `the_update_reports_speak_spanish` (`update/report.rs`), `the_report_names_the_versions` (`update/mod.rs`), `the_setup_report_speaks_spanish` (`setup.rs`), `the_export_report_agrees_with_its_numbers_in_both_languages` (`export.rs`), `the_import_report_speaks_spanish` (`import.rs`), `the_move_report_speaks_spanish` (`projects.rs`), `the_restore_lines_speak_spanish`, `the_undelete_report_speaks_spanish`, `the_outbox_reports_speak_spanish`, `the_sharing_command_speaks_spanish`, `a_missing_file_or_metric_is_named_in_spanish`, `the_viewer_speaks_spanish` (`memories.rs`), `render_lists_one_exclusion_per_line` (`clawg-core`, `sharing.rs`); `stop_speaks_the_preferred_language` (`tests/binary.rs`).
 
 ## CL4. Los identificadores de `doctor` no cambian
 
@@ -63,4 +63,4 @@ Una frase del CLI con un número MUST concordar con él en cada idioma: singular
 - WHEN `clawg secrets` encuentra una fila con un secreto, y después dos
 - THEN en `es` dice `1 memoria guarda un secreto` y `2 memorias guardan un secreto`
 
-**Test:** `the_secrets_report_speaks_spanish` (`secrets.rs`) y `the_export_and_import_reports_speak_spanish` (`export.rs`, `import.rs`) con uno y con varios.
+**Test:** `the_secrets_report_speaks_spanish` (`secrets.rs`), `the_export_report_agrees_with_its_numbers_in_both_languages` (`export.rs`) y `a_finding_in_spanish_agrees_with_its_number` (`doctor/checks.rs`), con uno y con varios.
