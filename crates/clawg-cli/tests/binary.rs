@@ -1079,6 +1079,24 @@ async fn a_hook_without_a_daemon_prints_nothing() {
 }
 
 #[tokio::test]
+async fn session_start_without_a_daemon_still_names_the_language() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let input = json!({ "cwd": sandbox.home, "source": "startup" }).to_string();
+
+    let out = hook(&sandbox, &["session-start", "--agent", "smoke", "--profile", "dev"], &input);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let printed: Value = serde_json::from_str(&stdout_of(&out)).expect("the hook's envelope");
+    let context = printed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default();
+    assert!(context.starts_with("clawg: the user's language is Spanish."), "{printed}");
+    assert!(!sandbox.data_dir().join("daemon.json").exists(), "no daemon was started");
+
+    let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &input);
+    assert_eq!((out.status.code(), stdout_of(&out)), (Some(0), String::new()), "only the session's start names it");
+}
+
+#[tokio::test]
 async fn a_hook_with_input_that_is_not_json_prints_nothing() {
     let sandbox = Sandbox::new();
     let _daemon = sandbox.serve().await;
@@ -1250,6 +1268,50 @@ async fn doctor_reads_a_running_daemons_store_without_changing_it() {
     assert_eq!(findings(&report, "store.owner"), [("ok", "healthy")]);
     assert_eq!(findings(&report, "agents"), [("ok", "healthy")]);
     assert_eq!(store_files(&sandbox.data_dir()), before, "a stopped store gains no file and no byte");
+}
+
+#[tokio::test]
+async fn preferences_set_and_unset_write_the_profiles_file() {
+    let sandbox = Sandbox::new();
+    let file = sandbox.data_dir().join("preferences.json");
+    let shown = sandbox.run(&["preferences", "--profile", "dev"]);
+    assert_eq!((shown.status.code(), stdout_of(&shown).trim()), (Some(0), "no language preference: clawg uses English"));
+
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    assert!(stdout_of(&set).starts_with("Idioma: español."), "{}", stdout_of(&set));
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&file).expect("the file")).unwrap();
+    assert_eq!(written, json!({ "version": 1, "language": "es" }));
+    assert_eq!(stdout_of(&sandbox.run(&["preferences", "--profile", "dev"])).trim(), "idioma: español");
+
+    let unset = sandbox.run(&["preferences", "unset", "language", "--profile", "dev"]);
+    assert_eq!(unset.status.code(), Some(0), "{}", stderr_of(&unset));
+    assert!(stdout_of(&unset).starts_with("No language preference: clawg uses English."), "{}", stdout_of(&unset));
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&file).expect("the file")).unwrap();
+    assert_eq!(written, json!({ "version": 1 }));
+
+    let bad = sandbox.run(&["preferences", "set", "language", "fr", "--profile", "dev"]);
+    assert_ne!(bad.status.code(), Some(0), "an unknown language is a usage error");
+}
+
+#[tokio::test]
+async fn doctor_names_a_broken_preferences_file() {
+    let sandbox = Sandbox::new();
+    let (_, report) = doctor(&sandbox);
+    assert!(findings(&report, "preferences").is_empty(), "no file, no finding: {report}");
+
+    std::fs::create_dir_all(sandbox.data_dir()).expect("data dir");
+    std::fs::write(sandbox.data_dir().join("preferences.json"), r#"{"version":1,"language":"fr"}"#).expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "preferences"), [("warn", "invalid")]);
+    assert!(findings(&report, "protocol_block").is_empty(), "no preference to hold the block to: {report}");
+
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_ne!(set.status.code(), Some(0), "an invalid file is never overwritten");
+    std::fs::write(sandbox.data_dir().join("preferences.json"), r#"{"version":1,"language":"es"}"#).expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "preferences"), [("ok", "healthy")]);
+    assert_eq!(findings(&report, "protocol_block"), [("info", "not_installed")], "{report}");
 }
 
 #[tokio::test]
