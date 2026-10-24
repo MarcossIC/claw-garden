@@ -28,7 +28,7 @@ Cierran las [decisiones abiertas](exploration.md#decisiones-abiertas) con la opc
    - y el próximo id de `memory`.
 
    Ninguna llamada depende del tamaño del store. Los proyectos y las claves a buscar salen del archivo y de las filas de origen ya cargadas, que son los únicos que las reglas pueden pedir.
-3. **El umbral.** En la prueba de intercalado, ninguna sonda espera más de 300 ms (la décima parte del plazo del hook) durante la corrida en seco de 4.000 notas, que hoy tiene la conexión varios segundos. En el banco de 15.047 filas, la pasada de decisión baja a menos de la décima parte de los 16,4 s de hoy con el índice; se mide al verificar.
+3. **El umbral.** En la prueba de intercalado, ninguna sonda espera más de 300 ms (la décima parte del plazo del hook) durante la corrida en seco de 10.000 notas, que hoy tiene la conexión varios segundos. En el banco de 15.047 filas, la pasada de decisión baja a menos de la décima parte de los 16,4 s de hoy con el índice; se mide al verificar.
 4. **Parada.** El planificador corre en `spawn_blocking` y mira, entre lote y lote de escritura (`note_batches`), un `AtomicBool` que un guard pone en verdadero cuando se suelta el futuro del import. Así, un apagado que corta el pedido no espera el plan entero.
 5. **Empate de `created_at` en `TWIN_SQL`.** Se agrega `id` al `ORDER BY`, así el SQL y el planificador eligen la misma fila por construcción. El índice sigue sirviendo el orden: lleva el `rowid` detrás.
 6. **C (otra conexión) no se escribe.** Queda en la exploración como descartada. Si la carga resultara larga al medirla, el remedio es achicar el lote, no otra conexión.
@@ -53,7 +53,7 @@ Lo que la [exploración](exploration.md#no-alcance) deja fuera: la escritura, lo
 
 Tests (la lista está en la [spec](spec.md)):
 
-1. **Intercalado:** una sonda `SELECT 1` en la conexión durante la corrida en seco de 4.000 notas nunca espera más de 300 ms. Hoy falla, porque la sonda espera la pasada entera.
+1. **Intercalado:** una sonda `SELECT 1` en la conexión durante la corrida en seco de 10.000 notas nunca espera más de 300 ms. Hoy falla, porque la sonda espera la pasada entera.
 2. **Equivalencia:** el `Ledger` de `Planned` es igual al de la pasada SQL en cada escenario de la tabla. Hoy no compila, porque el planificador no existe.
 3. **Ids después de una purga:** con `sqlite_sequence` por encima de `MAX(id)`, la corrida en seco reporta lo mismo que la real. Es una guarda: hoy pasa, y falla con un planificador que parta de `MAX(id)`.
 4. **Sin escritura:** después de la corrida en seco, `memory`, `project`, `project_remote`, `memory_fts` y `sqlite_sequence` siguen iguales.

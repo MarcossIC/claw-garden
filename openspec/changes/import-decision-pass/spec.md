@@ -5,7 +5,7 @@
 La pasada que decide dónde va cada fila de un import (la que corre una corrida en seco entera y la real antes de embeber) MUST NOT correr en una llamada a la conexión del store que dure con el archivo. Lo que lee del store MUST cargarse en llamadas de como mucho `LOAD_BATCH` búsquedas por índice, cada una su propio `conn.call`, sin una transacción abierta entre una y otra. La decisión MUST correr fuera de la conexión y fuera de los hilos del runtime async (`spawn_blocking`). La pasada MUST NOT escribir nada en el store.
 
 #### Escenario: una sonda durante la corrida en seco
-- GIVEN un store vacío y un export de otra herramienta de 4.000 notas
+- GIVEN un store vacío y un export de otra herramienta de 10.000 notas
 - WHEN corre `--dry-run` y, al mismo tiempo, una sonda hace `SELECT 1` en la conexión cada 5 ms
 - THEN ninguna sonda espera más de 300 ms
 
