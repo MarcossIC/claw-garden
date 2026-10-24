@@ -17,6 +17,22 @@ pub enum By {
     Day,
     Hour,
     Version,
+    /// The local date and minute, over the days the minutes are kept.
+    Minute,
+}
+
+/// Where a report `by` starts when asked for `since_ms` at `now_ms`. By
+/// minute it starts no earlier than the first whole hour of the minutes kept:
+/// an older row is an hour, which would read as its first minute.
+pub fn since_for(by: By, since_ms: i64, now_ms: i64) -> i64 {
+    const HOUR_MS: i64 = 3_600_000;
+    match by {
+        By::Minute => {
+            let kept = now_ms - super::store::MINUTES_KEPT_MS;
+            since_ms.max((kept + HOUR_MS - 1).div_euclid(HOUR_MS) * HOUR_MS)
+        }
+        _ => since_ms,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -78,6 +94,11 @@ pub fn report(metric: &str, rows: Rows, runs: &[RunRow], labels: &[(String, Stri
                 (0, format!("{y:04}-{m:02}-{d:02}"))
             }
             By::Hour => (0, format!("{:02}", local_ms.rem_euclid(86_400_000) / 3_600_000)),
+            By::Minute => {
+                let (y, m, d) = crate::memory::backup::civil_from_days(local_ms.div_euclid(86_400_000));
+                let minute = local_ms.rem_euclid(86_400_000) / 60_000;
+                (0, format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", minute / 60, minute % 60))
+            }
             // Versions in the order they first ran, not as text.
             By::Version => (
                 run.map_or(i64::MAX, |r| r.started_at_ms),
@@ -228,6 +249,32 @@ mod tests {
         let Stats::Histogram { p50, max, .. } = &by_version.groups[1].stats else { panic!("a histogram") };
         assert_eq!(*max, 300);
         assert!(p50.is_some_and(|p| (100..=250).contains(&p)), "{p50:?}");
+    }
+
+    #[test]
+    fn a_report_by_minute_keys_each_local_minute() {
+        let runs = [run(1, "0.62.0", DAY0, false, -3 * 3600)];
+        let rows = Rows::Histograms(vec![
+            hist(1, DAY0 + HOUR + 5 * 60_000, "", &[1]),
+            hist(1, DAY0 + HOUR + 5 * 60_000, "route=/health", &[2]),
+            hist(1, DAY0 + 2 * HOUR, "", &[3]),
+        ]);
+
+        let r = report("http.duration", rows, &runs, &[], By::Minute, 0);
+
+        assert_eq!(counts(&r), vec![("2026-10-19 22:05".into(), 2, 1, 1), ("2026-10-19 23:00".into(), 1, 1, 1)]);
+        assert_eq!(serde_json::to_value(&r).unwrap()["by"], "minute");
+    }
+
+    #[test]
+    fn a_report_by_minute_starts_where_the_minutes_are_kept() {
+        let now = DAY0 + 30 * 24 * HOUR + 20 * 60_000;
+        let first_whole_hour = now - crate::metrics::store::MINUTES_KEPT_MS + 40 * 60_000;
+
+        assert_eq!(since_for(By::Minute, 0, now), first_whole_hour, "an hour folded at the edge stays out");
+        assert_eq!(since_for(By::Minute, first_whole_hour - HOUR, now), first_whole_hour);
+        assert_eq!(since_for(By::Minute, now - HOUR, now), now - HOUR);
+        assert_eq!(since_for(By::Hour, 0, now), 0);
     }
 
     #[test]
