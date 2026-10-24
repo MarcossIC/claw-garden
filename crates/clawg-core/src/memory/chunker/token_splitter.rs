@@ -737,6 +737,91 @@ mod tests {
         (words.join(" "), words)
     }
 
+    /// Roots of the subword fixture: an opening consonant, a vowel and a
+    /// closing consonant. All of one length, and no opening is `r`, so the
+    /// greedy match of WordPiece takes exactly three letters at the start of
+    /// any word the fixture generates.
+    fn subword_roots() -> Vec<String> {
+        let mut roots = Vec::new();
+        for opening in "bcdfgklmnp".chars() {
+            for vowel in "aeiou".chars() {
+                for closing in "lmnrst".chars() {
+                    roots.push(format!("{opening}{vowel}{closing}"));
+                }
+            }
+        }
+        roots
+    }
+
+    /// What follows `##`: a vowel and a closing consonant. None starts with
+    /// `ev`, so `##evi` never matches inside a generated word.
+    fn subword_continuations() -> Vec<String> {
+        "aeiou".chars().flat_map(|vowel| "lmnrst".chars().map(move |closing| format!("{vowel}{closing}"))).collect()
+    }
+
+    /// CJK scalars in the vocabulary, as roots and as continuations: a run of
+    /// them with no space between is one word of one token per character.
+    const SUBWORD_CJK: u32 = 400;
+
+    /// A `WordPiece` tokenizer over a whitespace split, which cuts a word into
+    /// a root and `##` continuations, as the model's tokenizer does: the
+    /// word-level tokenizers above make one token of every word and so never
+    /// show a cut inside one. `retrievies` is `retri ##evi ##es`; a word it has
+    /// no pieces for is one `[UNK]`.
+    fn subword_tokenizer() -> Arc<tokenizers::Tokenizer> {
+        let mut tokens = vec!["[UNK]".to_string(), "retri".to_string(), "##evi".to_string()];
+        tokens.extend(subword_roots());
+        tokens.extend(subword_continuations().iter().map(|c| format!("##{c}")));
+        for c in (0..SUBWORD_CJK).map(|i| char::from_u32(0x4E00 + i).expect("CJK block is dense here")) {
+            tokens.push(c.to_string());
+            tokens.push(format!("##{c}"));
+        }
+        let vocab: serde_json::Map<String, serde_json::Value> =
+            tokens.into_iter().enumerate().map(|(id, token)| (token, id.into())).collect();
+        let json = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": null, "decoder": null,
+            "model": {
+                "type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 1000, "vocab": vocab
+            }
+        });
+        Arc::new(json.to_string().parse::<tokenizers::Tokenizer>().expect("the subword tokenizer parses"))
+    }
+
+    /// `count` distinct words for [`subword_tokenizer`], alternating a root and
+    /// one continuation (two tokens) with a root and two (three tokens).
+    fn subword_words(count: usize) -> Vec<String> {
+        let (roots, continuations) = (subword_roots(), subword_continuations());
+        (0..count)
+            .map(|i| {
+                let mut word = format!("{}{}", roots[i % roots.len()], continuations[(i / roots.len()) % continuations.len()]);
+                if i % 2 == 1 {
+                    word.push_str(&continuations[(7 * i + 3) % continuations.len()]);
+                }
+                word
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_subword_fixture_cuts_a_word_into_its_pieces() {
+        let tok = subword_tokenizer();
+        let enc = tok.encode("a retrievies b", false).expect("the fixture encodes");
+        assert_eq!(enc.get_tokens(), ["[UNK]", "retri", "##evi", "##es", "[UNK]"]);
+        assert_eq!(enc.get_offsets()[1..4], [(2, 7), (7, 10), (10, 12)], "every piece lies inside the word");
+
+        let words = subword_words(1600);
+        assert_eq!(words.iter().collect::<std::collections::HashSet<_>>().len(), words.len(), "the words are distinct");
+        for (i, word) in words.iter().enumerate() {
+            let enc = tok.encode(word.as_str(), false).expect("the fixture encodes");
+            assert_eq!(enc.len(), 2 + i % 2, "{word}: {:?}", enc.get_tokens());
+        }
+        let run: String = (0..300).map(|i| char::from_u32(0x4E00 + i).expect("CJK block is dense here")).collect();
+        assert_eq!(tok.encode(run.as_str(), false).expect("the fixture encodes").len(), 300, "one token per character");
+    }
+
     #[test]
     fn token_path_splits_on_token_windows_with_the_requested_overlap() {
         let (text, words) = word_fixture(300);
