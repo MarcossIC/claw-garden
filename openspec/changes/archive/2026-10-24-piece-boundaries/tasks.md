@@ -74,11 +74,11 @@ Mismos requisitos que la tarea 0.
 
 ## 10. Verificación
 
-- [ ] Suite y clippy de `.claude/CLAUDE.md` en Linux y en Windows (`target-test`), y el CI en verde. Windows hecho; Linux y el CI quedan para el pull request.
+- [x] Suite y clippy de `.claude/CLAUDE.md` en Linux y en Windows (`target-test`), y el CI en verde. Windows en la rama del cambio y otra vez en `develop`; Linux y Windows en el CI del pull request #87 ([verify](verify.md#ci-y-develop)).
 - [x] `verify.md`: el resultado de U0-U4 con las rutas de los JSON fechados, el recuento de filas de cada build, los brazos que no se adoptaron y por qué, y la advertencia de D5 sobre los casos `long`. Sin textos ni ids de filas.
 - [x] Ningún directorio de build fuera de `target` y `target-test`.
 
 ## 11. Archive
 
-- [ ] `specs/pieces` con R1, R2, R4 y el brazo adoptado; `specs/project-docs` con R3; el cambio a `changes/archive/AAAA-MM-DD-piece-boundaries/`.
-- [ ] Subir el minor de `[workspace.package] version`, `cargo update --workspace`, y el commit `chore: bump version to X.Y.Z`.
+- [x] `specs/pieces` con R1, R2, R4, R5 y el brazo adoptado, como PB1, PB2, PB4, PB5 y PB6; `specs/project-docs` con R3, como PB3; el cambio a `changes/archive/2026-10-24-piece-boundaries/` ([verify](verify.md#al-archivar-2026-10-24)).
+- [x] Subir el minor de `[workspace.package] version`, `cargo update --workspace`, y el commit `chore: bump version to 0.61.0`.

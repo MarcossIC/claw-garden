@@ -37,7 +37,12 @@ Antes del corte en frontera fallaban por la aserción `no_piece_starts_or_ends_i
 
 ## Suite
 
-`cargo test --workspace --no-fail-fast --target-dir target-test`, en `2af509b` y en `5ba7ff6`: 3.337 pasan, 0 fallan, 3 ignorados (los que necesitan el modelo). `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`: sin warnings. Linux queda para el CI del pull request. Al terminar quedan sólo `target` y `target-test`.
+`cargo test --workspace --no-fail-fast --target-dir target-test`, en `2af509b` y en `5ba7ff6`: 3.337 pasan, 0 fallan, 3 ignorados (los que necesitan el modelo). `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`: sin warnings. Linux queda para el CI del pull request ([abajo](#ci-y-develop)). Al terminar quedan sólo `target` y `target-test`.
+
+## CI y develop
+
+- **CI:** el del pull request #87 (`develop` → `main`, cabeza `30387e8`, que tiene los commits de este cambio y los de import-undo) pasó en `ubuntu-latest` y en `windows-latest`, con el clippy y la suite de `ci.yml`.
+- **Windows, otra vez:** en `30387e8`, con `target-test` limpio de los artefactos del workspace, pasan la suite (`cargo test --locked --workspace --target-dir target-test`) y los dos clippy de `.claude/CLAUDE.md`. Quedan ignorados los dos bancos y los dos tests que piden el modelo real, `the_real_tokenizer_cuts_no_piece_inside_a_word` entre ellos, que ya había pasado en `2af509b` y en `5ba7ff6` con el modelo (R5).
 
 ## Medición
 
@@ -88,3 +93,10 @@ La rama de medición y su worktree se borraron, y el export de engram también, 
 ### Advertencia de D5
 
 Los 12 casos `long` abren con la clave del save en la primera oración. Eso favorece a una cabecera corta, y la medición del brazo (b) puede sobrestimarla.
+
+## Al archivar (2026-10-24)
+
+- Los ids de la spec del cambio (R1 a R6) chocaban con R1 a R10 de [`specs/pieces`](../../../specs/pieces/spec.md), así que entraron con prefijo: R1, R2, R4, R5 y R6b como PB1, PB2, PB4, PB5 y PB6. R6a no entró.
+- R3 se partió en dos. Los pasajes del índice de docs van a [`specs/project-docs`](../../../specs/project-docs/spec.md) como PB3, que nombra los tres troceos que pasan por `emit` (Markdown, manifiestos y código), y no sólo el de Markdown, como decía R3. La nota importada va a PB2, porque se parte con `split_save` como cualquier save.
+- En `specs/pieces`, la **cabecera** de las definiciones y de R2 pasa de 48 tokens a las palabras enteras de los primeros 32, y R2 dice que sus bordes son los de PB1. Las citas de `chunker/mod.rs` y de `pieces.rs` apuntan otra vez a cada símbolo: las de `pieces.rs` ya estaban una línea corridas antes de este cambio, que las corrió dos más.
+- Las citas `archivo.rs:N` de la exploración, la propuesta y el diseño quedan como estaban: describen el código contra el que se escribieron. Se corrigieron sólo los dos links relativos que el traslado al archivo rompía (a `specs/` en la spec y a long-save-ranking en el diseño).

@@ -79,7 +79,7 @@ En el paso 1 de D2, si hay un inicio de oración en `[s + max - SENTENCE_LOOKBAC
 
 Sólo entra si pasa U4. Es cambiar `SAVE_HEAD_TOKENS` (`chunker/mod.rs:40`). La aserción `SAVE_HEAD_TOKENS + HEAD_JOIN_RESERVE + PIECE_MAX_TOKENS <= CHUNK_MAX_TOKENS` (`:61`) sigue valiendo para todo valor del barrido. La cabecera ya pasa por D2, así que termina en frontera de palabra con cualquier valor.
 
-El ahorro es `48 - H` tokens por cada pieza posterior a la primera, y no hace falta medirlo. Lo que se mide es lo que puede perderse: la clave del save, que la cabecera lleva al vector de cada pieza ([design D1 de long-save-ranking](../archive/2026-10-15-long-save-ranking/design.md#d1-bajar-el-tope-no-cambiar-la-fórmula)). Los casos `long` abren con la clave en la primera oración, y eso favorece a una cabecera corta: el resultado puede sobrestimarla, y `verify.md` lo dice.
+El ahorro es `48 - H` tokens por cada pieza posterior a la primera, y no hace falta medirlo. Lo que se mide es lo que puede perderse: la clave del save, que la cabecera lleva al vector de cada pieza ([design D1 de long-save-ranking](../2026-10-15-long-save-ranking/design.md#d1-bajar-el-tope-no-cambiar-la-fórmula)). Los casos `long` abren con la clave en la primera oración, y eso favorece a una cabecera corta: el resultado puede sobrestimarla, y `verify.md` lo dice.
 
 **Resultado: se adoptó 32.** Contra U1, 32 no mostró ninguna regresión. Con 24 cayó un caso de 12 de `multi_ref` (no distinguible, y fuera de la definición de regresión de la propuesta), y con 16 un caso `long` perdió la respuesta en las dos herramientas. U4, al pie de la letra, daba 24, la menor cabecera sin regresión. Se tomó 32 por la advertencia de arriba y por ese único retroceso, que aparece justo en 24.
 

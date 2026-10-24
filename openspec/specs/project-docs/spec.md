@@ -7,6 +7,7 @@ Fuente de verdad del comportamiento actual del índice de la documentación y el
 - [project-root-guard](../../changes/archive/2026-10-15-project-root-guard/proposal.md), archivado el 2026-10-15 (qué raíces se leen, el 403 de la búsqueda, `clawg projects add` y la columna `index_docs`).
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (la raíz del puente se acepta sola sólo si es un proyecto, y la frase del 403).
 - [docs-refresh-background](../../changes/archive/2026-10-22-docs-refresh-background/proposal.md), archivado el 2026-10-22 (el refresco vencido corre en segundo plano y la búsqueda lo espera a lo sumo 3 s, el error del último refresco en `warning`, y un doc con un vector inservible no frena a los demás).
+- [piece-boundaries](../../changes/archive/2026-10-24-piece-boundaries/proposal.md), archivado el 2026-10-24 (PB3: un pasaje largo se corta en frontera de palabra). El divisor y su regla están en [`specs/pieces`](../pieces/spec.md) (PB1).
 
 ## Definiciones
 
@@ -106,7 +107,7 @@ El recorrido del disco (`walk`, `corpus.rs:84`), aparte de esa función:
 - dar un pasaje por sección con texto no vacío; una sección sin cuerpo MUST NOT dar pasaje, pero su encabezado MUST seguir en el breadcrumb de sus subsecciones;
 - formar el breadcrumb con los encabezados de nivel estrictamente menor que la contienen, más el propio;
 - recortar un breadcrumb de más de 256 bytes (`MAX_BREADCRUMB_BYTES`, `chunk.rs:12`) por el principio, en un límite de carácter, con `…` adelante, para conservar los encabezados más cercanos;
-- si el texto indexado pasa de `CHUNK_MAX_TOKENS` (480, `crates/clawg-core/src/memory/chunker/mod.rs:15`), partir el cuerpo con el `TokenSplitter` en pedazos que, con el breadcrumb, entren en el tope, con `CHUNK_OVERLAP_TOKENS` (64, `chunker/mod.rs:21`) de solapamiento, y repetir el breadcrumb en cada pedazo (`emit`, `chunk.rs:127`).
+- si el texto indexado pasa de `CHUNK_MAX_TOKENS` (480, `crates/clawg-core/src/memory/chunker/mod.rs:26`), partir el cuerpo con el `TokenSplitter` en pedazos que, con el breadcrumb, entren en el tope, con `CHUNK_OVERLAP_TOKENS` (64, `chunker/mod.rs:32`) de solapamiento y los bordes en frontera de palabra (PB3), y repetir el breadcrumb en cada pedazo (`emit`, `chunk.rs:127`).
 
 Sólo se reconocen los encabezados ATX: los de subrayado (`===` o `---` bajo una línea) son texto, porque `---` también es una regla horizontal o el cierre de un front matter. Un encabezado con cuatro espacios de sangría es texto.
 
@@ -160,6 +161,19 @@ No se suman los imports al breadcrumb: alargan cada pasaje y el agente los tiene
 - THEN sus métodos salen bajo `<ruta> > class <Nombre>` (`<ruta> > export class <Nombre>` en TypeScript con `export`)
 
 **Tests:** en `crates/clawg-core/src/memory/project_docs/code.rs`: `non_whitespace_size_ignores_formatting`, `small_siblings_merge_and_keep_their_doc_comments`, `a_node_over_the_cap_is_split_by_its_children_under_its_header`, `python_and_typescript_classes_split_by_method`, `a_leaf_over_the_cap_falls_back_to_the_token_splitter`, `every_passage_fits_the_token_cap` y `an_empty_file_has_no_passages`; `classify_takes_code_by_extension` en `corpus.rs`; `a_refresh_indexes_code_by_definition` en `project_docs/mod.rs`.
+
+## PB3. Un pasaje largo se corta en frontera de palabra
+
+Los tres troceos parten un cuerpo largo por `emit` (`chunk.rs:127`), que lo corta con el mismo `TokenSplitter` que los saves: el de Markdown, el de manifiestos y el de código, también el archivo entero de uno sin árbol. Con un tokenizer cargado, sus pasajes MUST cortar con los bordes de [`specs/pieces`](../pieces/spec.md) PB1: ninguno empieza ni termina dentro de una palabra salvo una palabra más larga que el tope o un texto sin espacios, y el siguiente empieza en la frontera más cercana a los 64 tokens de solape. Sin tokenizer, el respaldo por bytes corta como antes.
+
+Un pasaje ya guardado MUST NOT volver a partirse mientras su archivo no cambie de sha256 ni cambie el modelo (el refresco incremental de abajo): el índice existente toma los bordes nuevos a medida que sus archivos cambian.
+
+#### Escenario: una sección de docs larga
+- GIVEN una sección de Markdown de 1.600 palabras de varios subtokens (el `subword_tokenizer` de PB1)
+- WHEN se trocea
+- THEN ningún pasaje empieza ni termina dentro de una palabra, y cada uno, con su breadcrumb, entra en 480 tokens
+
+**Test:** `a_long_section_is_not_cut_inside_a_word` (`crates/clawg-core/src/memory/project_docs/chunk.rs`).
 
 ## Refresco incremental
 
