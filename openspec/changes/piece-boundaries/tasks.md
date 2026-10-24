@@ -51,10 +51,11 @@ Mismos requisitos que la tarea 0.
 
 ## 7b. El solape a la frontera más cercana (D3)
 
-- [ ] Tests primero: `char_spans_count_the_characters_before_each_token`, `plan_word_windows_starts_at_the_word_start_nearest_the_overlap` y `plan_word_windows_keeps_the_characters_join_pieces_needs` (puros); el barrido de `plan_word_windows_terminates_covers_and_never_nests` con la regla nueva del paso 2, y `no_piece_starts_or_ends_inside_a_word` con el solape de 24 tokens, uno más o uno menos, y 16 caracteres.
-- [ ] `char_spans`, `MIN_OVERLAP_CHARS` en `pub(crate)` y el paso 2 de D2. `plan_word_windows_keeps_at_least_the_overlap` se va con la regla que fijaba.
-- [ ] Commit: `fix(chunker): start the next piece at the nearest word start`.
-- [ ] Las corridas de la tarea 7 con la punta nueva, contra U0. Si U1 o U2 no se cumplen, se vuelve al diseño.
+- [x] Tests primero: `char_spans_count_the_characters_before_each_token`, `plan_word_windows_starts_at_the_word_start_nearest_the_overlap` y `plan_word_windows_keeps_the_characters_join_pieces_needs` (puros); el barrido de `plan_word_windows_terminates_covers_and_never_nests` con la regla nueva del paso 2, y `no_piece_starts_or_ends_inside_a_word` con el solape de 24 tokens, uno más o uno menos, y 16 caracteres.
+- [x] `char_spans`, `MIN_OVERLAP_CHARS` en `pub(crate)` y el paso 2 de D2. `plan_word_windows_keeps_at_least_the_overlap` se va con la regla que fijaba.
+- [x] `the_real_tokenizer_cuts_no_piece_inside_a_word` encontró con la regla nueva una pieza de 97 tokens: la ventana empezaba después de un `▁` suelto, que el tokenizador vuelve a anteponer al contar la pieza. `word_starts` marca el `▁` y no el token que le sigue ([design D1](design.md#d1-la-frontera-sale-de-los-bytes-no-de-word_ids)), en el commit `fix(chunker): open a word at a lone whitespace token`, antes del de la regla.
+- [x] Commit: `fix(chunker): start the next piece at the nearest word start`.
+- [x] Las corridas de la tarea 7 con la punta nueva, contra U0. Si U1 o U2 no se cumplen, se vuelve al diseño. U1 se cumple y U2 también: 54.321 filas contra 51.996, un 4,47 % más.
 
 ## 8. Brazos en la rama de medición (U3, U4)
 

@@ -10,7 +10,9 @@ Un token abre una palabra cuando el corte justo antes de él no parte una palabr
 
 La tercera condición cubre un tokenizador cuyo primer token de palabra incluye el espacio previo en su offset (`▁foo` sobre `" foo"`). La segunda cubre uno que no lo incluye. No hace falta saber cuál de los dos es el real.
 
-Lo que cuenta es el texto, no los tokens. El embedder vuelve a tokenizar el texto de la pieza (`embedding_text`, `chunker/mod.rs:66-72`), y `memory_fts` indexa ese texto. La ventana de tokens sólo decide dónde cortar el texto. Un token vacío (un `▁` suelto con offset `(k, k)`) puede marcarse como inicio de palabra junto con el token que le sigue. Eso es correcto, porque cortar en cualquiera de los dos deja el corte en el mismo byte, al lado de un espacio.
+Lo que cuenta es el texto, no los tokens. El embedder vuelve a tokenizar el texto de la pieza (`embedding_text`, `chunker/mod.rs:66-72`), y `memory_fts` indexa ese texto. La ventana de tokens sólo decide dónde cortar el texto.
+
+Hay una excepción. **Un token hecho sólo de espacio en blanco** abre la palabra que le sigue, y el token siguiente ya no la abre. Es el `▁` suelto que el tokenizador real da antes de una palabra que no une con él (`▁` + `crates`), o uno con offset vacío. Las dos marcas dejan el corte al lado de un espacio, pero una pieza que empieza después del `▁` lo recupera cuando el tokenizador la cuenta sola, y queda un token por encima del tope. Lo encontró `the_real_tokenizer_cuts_no_piece_inside_a_word` con la regla de D3: una pieza de 97 tokens para un tope de 96.
 
 | Alternativa | Por qué no |
 |---|---|
@@ -53,7 +55,7 @@ Una simulación sobre el mismo export y el tokenizador real reproduce la medici�
 | Primera frontera `>= t`, con piso de 16 caracteres | +1,21 % | 0 | 78 | 1.668 |
 | **Frontera más cercana a `t`, con piso de 16 caracteres** | **+4,50 %** | **0** | **82** | **349** |
 
-Se elige la última fila:
+Se elige la última fila. La importación en seco con ella dio después 54.321 filas contra 51.996, un 4,47 % más, y U1 siguió sin regresión.
 
 - **La razón del solape.** Es que una oración cortada en el borde quede entera en una de las dos piezas (`PIECE_OVERLAP_TOKENS`, `chunker/mod.rs`). Con la frontera más cercana, el solape medio queda en 24,3 tokens, y sólo un 0,7 % de los bordes comparte menos de 12. Achicarlo hasta la frontera siguiente lo deja en 21,9 de media, con un 3,4 % por debajo de 12.
 - **`join_pieces`.** Necesita que la pieza siguiente empiece con al menos `MIN_OVERLAP_CHARS` = 16 caracteres del final de la anterior (`pieces.rs`, `overlap`). Sin un piso, una palabra larga que cruza `t` deja la frontera siguiente a uno o dos tokens de `e`, y `read_memory` uniría con un salto de línea donde no lo hay. Eso pasa en 148 bordes con la frontera más cercana sin piso. El piso retrocede hasta la frontera que deja los 16 caracteres, y por eso `MIN_OVERLAP_CHARS` pasa a `pub(crate)`: las dos reglas tienen que concordar, y una constante duplicada se desfasaría.
