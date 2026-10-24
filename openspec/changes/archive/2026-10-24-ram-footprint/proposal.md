@@ -27,7 +27,7 @@ Las abiertas en la exploración, con estos valores por defecto:
 3. **M2 es `process.private_peak_bytes`**: `PeakPagefileUsage`, de la misma llamada a `GetProcessMemoryInfo` que ya da `PrivateUsage`. Linux no tiene un pico de `RssAnon` y, por la regla de 71, se deja afuera en lugar de escribir 0.
 4. **M3 va en el log, no en `metrics.db`.** La carga que hace `IdleEmbedder` dice quién la pidió (`for a wake`, `for a call that embeds`, `for a call that found its worker gone`) y la memoria privada antes y después. Si una carga la pidió un `wake`, el log dice cuánto tardó la primera llamada en usar el modelo. Si nadie lo usó, la descarga por ocio termina con `; no call used it after the wake that loaded it`. La memoria se lee con un `MemoryProbe` (`fn() -> Option<u64>`) que pasa el daemon, porque las llamadas al sistema viven en `clawg-cli` (`process.rs`) y `clawg-core` no tiene dependencias de sistema. Sin sonda, en las pruebas y en `clawg-eval`, la línea no lleva memoria. Las series permanentes son de pipeline-metrics (73).
 5. **M4 agrega `private N MiB` al final de cada línea de paso del import.** Es la memoria privada al terminar el paso, tomada con la misma sonda. Sólo la registra el handler del daemon (`ImportTimings::with_memory`); las pruebas de `import.rs` siguen sin sonda.
-6. **B, C, D y E no entran en esta tanda.** Cada uno espera su medición sobre un día de uso real con el modelo real (M3 para B, M2 para C, M4 para D), que necesita un perfil con uso real. Se deciden en el mismo cambio cuando esa medición esté en `verify.md`.
+6. **B, C, D y E no entran en este cambio.** Cada uno espera su medición sobre un día de uso real con el modelo real (M3 para B, M2 para C, M4 para D), y esa medición necesita un perfil con uso real y un release que traiga el paso 0. Al principio iban a decidirse en este mismo cambio. Al archivar, el cambio se partió: el día de uso y B, C, D y E pasaron a [ram-footprint-gates](../../ram-footprint-gates/exploration.md) (92). El día de uso no verifica ningún requisito de esta spec: es lo que decide esos brazos. Además, esperarlo dejaba a `specs/project-docs` contradiciendo a A en el release que lo publica.
 
 ## Alcance
 
@@ -40,7 +40,7 @@ Las abiertas en la exploración, con estos valores por defecto:
 
 ### No-alcance
 
-- B, C, D y E hasta tener su medición.
+- B, C, D y E, y el día de uso que los decide: [ram-footprint-gates](../../ram-footprint-gates/exploration.md) (92).
 - El modelo, el contrato de embedding y el tamaño de las tandas.
 - El tokenizer (91) y la CPU del embedder (62).
 - Series nuevas de `metrics.db` para el embedder (73).
@@ -55,7 +55,7 @@ Tests que fallan sin el cambio (la lista está en la [spec](spec.md)):
 4. **M3.** La línea de carga nombra la causa y la memoria. Un modelo que cargó un `wake` y que nadie usó se descarga marcado como tal; uno que usó una llamada, o que cargó una llamada, no.
 5. **M4.** Con sonda, cada paso lleva la memoria y su línea la muestra; sin sonda, no.
 
-Lo que decide B, C y D es el día de uso real: `metrics report --by minute` sobre `process.private_bytes`, `process.private_peak_bytes` y `embedder.resident`, contra las líneas de carga, descarga y refresco de `serve.log` ([exploración, «Cómo se mide»](exploration.md#cómo-se-mide)).
+Lo que decide B, C y D es el día de uso real, que hace ram-footprint-gates (92): `metrics report --by minute` sobre `process.private_bytes`, `process.private_peak_bytes` y `embedder.resident`, contra las líneas de carga, descarga y refresco de `serve.log` ([exploración, «Cómo se mide»](exploration.md#cómo-se-mide)).
 
 ## Datos
 

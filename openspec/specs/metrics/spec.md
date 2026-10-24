@@ -4,6 +4,7 @@ Fuente de verdad del comportamiento actual de las métricas de uso del daemon: q
 
 **Origen:**
 - [usage-metrics](../../changes/archive/2026-10-22-usage-metrics/proposal.md), archivado el 2026-10-22.
+- [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (`process.private_peak_bytes` en R6, que es RF3 de esa spec, y `--by minute` en R8, que es RF2).
 
 ## Definiciones
 
@@ -68,14 +69,17 @@ En cada cambio de minuto y al apagarse, el escritor MUST registrar como gauges (
 |---|---|---|---|
 | `process.rss_bytes`, `process.rss_peak_bytes` | `VmRSS`, `VmHWM` de `/proc/self/status` | `WorkingSetSize`, `PeakWorkingSetSize` | — |
 | `process.private_bytes` | `RssAnon` | `PrivateUsage` | — |
+| `process.private_peak_bytes` | — | `PeakPagefileUsage` | — |
 | `process.threads` | `Threads` | — | — |
 | `process.open_files` | entradas de `/proc/self/fd` | — | — |
 | `process.handles` | — | `GetProcessHandleCount` | — |
 | `process.cpu_ratio` | `getrusage` | `GetProcessTimes` | `getrusage` |
 
-`process.cpu_ratio` es el tiempo de CPU del proceso (usuario y sistema) desde la muestra anterior sobre el tiempo de reloj entre las dos, sin dividir por núcleos; falta en la primera muestra. También `embedder.resident` (1 o 0, si hay embedder), `rt.alive_tasks` y `rt.global_queue_depth` de tokio, y `rt.worker_busy_ratio`: el tiempo ocupado de todos los workers desde la muestra anterior sobre el tiempo de reloj por el número de workers. Lo que un sistema no da MUST faltar, nunca valer 0. El desfase local de la ejecución sale de `localtime_r` (`tm_gmtoff`) en Unix y de `GetTimeZoneInformation` en Windows (`utc_offset_s`, `process.rs:152`, `:167`).
+`process.cpu_ratio` es el tiempo de CPU del proceso (usuario y sistema) desde la muestra anterior sobre el tiempo de reloj entre las dos, sin dividir por núcleos; falta en la primera muestra. También `embedder.resident` (1 o 0, si hay embedder), `rt.alive_tasks` y `rt.global_queue_depth` de tokio, y `rt.worker_busy_ratio`: el tiempo ocupado de todos los workers desde la muestra anterior sobre el tiempo de reloj por el número de workers. Lo que un sistema no da MUST faltar, nunca valer 0. El desfase local de la ejecución sale de `localtime_r` (`tm_gmtoff`) en Unix y de `GetTimeZoneInformation` en Windows (`utc_offset_s`, `process.rs:162`, `:177`).
 
-**Tests:** `the_linux_status_file_is_read_in_bytes`, `a_ratio_is_the_delta_over_the_wall_time`, `the_sample_of_this_process_has_its_memory` (Linux y Windows), `the_utc_offset_is_within_a_day`, `the_runtime_sample_counts_its_workers` en `process.rs`; `each_minute_and_the_stop_are_written` en `daemon/metrics.rs`.
+`process.private_peak_bytes` es el máximo de la memoria privada desde que arrancó el proceso, aunque haya durado menos de un minuto. Sale de la misma llamada a `GetProcessMemoryInfo` que da `PrivateUsage` (`ProcessSample::private_peak_bytes`, `process.rs:18`, leído en `:114`; el escritor, `crates/clawg-cli/src/daemon/metrics.rs:174`). Linux no lleva un pico de `RssAnon`, así que allí la serie MUST faltar.
+
+**Tests:** `the_linux_status_file_is_read_in_bytes`, `a_ratio_is_the_delta_over_the_wall_time`, `the_sample_of_this_process_has_its_memory` (Linux y Windows; en Windows el pico es mayor o igual que `private_bytes`, en Linux falta), `the_utc_offset_is_within_a_day`, `the_runtime_sample_counts_its_workers` en `process.rs`; `each_minute_and_the_stop_are_written` en `daemon/metrics.rs`.
 
 ## R7. `GET /v1/metrics`
 
@@ -85,17 +89,28 @@ Detrás del token (`metrics`, `api.rs:1618`), MUST devolver en JSON `version`, `
 
 ## R8. `clawg metrics report`
 
-`clawg metrics report --metric M [--label K=V]... [--by day|hour|version] [--since Nd|Nh] [--profile P]` MUST abrir `metrics.db` en sólo lectura, sin daemon y sin el lock del store, y MUST imprimir un JSON (`crates/clawg-cli/src/metrics.rs:14`; la agregación pura en `report`, `crates/clawg-core/src/metrics/report.rs:66`) con `metric`, `kind` (`histogram` o `gauge`), `unit` (de un histograma), `by`, `since_ms`, `runs` y `groups`:
+`clawg metrics report --metric M [--label K=V]... [--by day|hour|minute|version] [--since Nd|Nh] [--profile P]` MUST abrir `metrics.db` en sólo lectura, sin daemon y sin el lock del store, y MUST imprimir un JSON (`crates/clawg-cli/src/metrics.rs:16`; la agregación pura en `report`, `crates/clawg-core/src/metrics/report.rs:82`) con `metric`, `kind` (`histogram` o `gauge`), `unit` (de un histograma), `by`, `since_ms`, `runs` y `groups`:
 
 - los grupos suman minutos y horas desde `--since` (por defecto `30d`) de las series de nombre `M` que tienen cada par `K=V`;
-- `--by version` (por defecto) agrupa por la versión de la ejecución, en el orden en que cada una corrió primero; `--by day`, por la fecha local; `--by hour`, por la hora del día local, `00` a `23`, juntando todos los días. La hora local de una fila es la de su ejecución (`utc_offset_s`), así que un cambio de horario a mitad de una ejecución corre una hora su agrupación;
+- `--by version` (por defecto) agrupa por la versión de la ejecución, en el orden en que cada una corrió primero; `--by day`, por la fecha local; `--by hour`, por la hora del día local, `00` a `23`, juntando todos los días; `--by minute`, por el minuto local, con la clave `AAAA-MM-DD HH:MM` (`By::Minute`, `report.rs:97`). La hora local de una fila es la de su ejecución (`utc_offset_s`), así que un cambio de horario a mitad de una ejecución corre una hora su agrupación;
+- por minuto, el reporte MUST empezar en el mayor entre lo que pide `--since` y la primera hora entera de los minutos que se guardan (`since_for`, `report.rs:27`; R4), y `since_ms` MUST ser ese comienzo. Una fila más vieja es una hora plegada, y una hora que el último `prune` dejó a medias en el borde se leería como su primer minuto. Las otras agrupaciones empiezan en `--since`;
 - cada grupo de un histograma trae `count`, `mean`, `min`, `max`, `p50`, `p95` y `p99`; el de un gauge, `samples`, `mean`, `min` y `max`; los dos, `runs` y `not_stopped` de las ejecuciones con filas en el grupo;
 - `runs` cuenta todas las ejecuciones que empezaron desde `--since`, con o sin filas: `total` y `not_stopped` (sin `stopped_at_ms`: matadas, caídas o todavía en marcha);
 - una ventana sin filas de una métrica conocida da `groups` vacío con su `kind`.
 
 Sin `metrics.db` MUST salir con 1 diciendo que el daemon lo escribe salvo con `CLAWG_METRICS=off`, sin crearlo; con una métrica que no existe, con 1 y los nombres que hay. `--label` sin `=` o con un lado vacío, y un `--since` que no sea un entero de días u horas, son errores de uso.
 
-**Tests:** `a_report_groups_by_version_day_and_hour`, `a_label_filter_keeps_only_matching_series`, `a_gauge_report_gives_samples_and_extremes` en `report.rs`; `a_report_reads_the_file_without_a_daemon`, `a_window_without_rows_keeps_the_kind_of_the_metric`, `a_missing_file_or_metric_is_named` en `crates/clawg-cli/src/metrics.rs`; `metrics_report_takes_a_metric_labels_a_grouping_and_an_age` en `cli.rs`.
+#### Escenario: dos minutos de una ejecución tres horas detrás de UTC
+- GIVEN filas de las 01:05 y las 02:00 UTC del 2026-10-20, de una ejecución con desplazamiento −3 h
+- WHEN se agrupan por minuto
+- THEN las claves son `2026-10-19 22:05` (con las dos series de ese minuto sumadas) y `2026-10-19 23:00`
+
+#### Escenario: un `--since` más largo que los minutos guardados
+- GIVEN `--since 30d` a las HH:20
+- WHEN se reporta por minuto
+- THEN el reporte empieza 14 días atrás, en la hora entera siguiente
+
+**Tests:** `a_report_groups_by_version_day_and_hour`, `a_label_filter_keeps_only_matching_series`, `a_gauge_report_gives_samples_and_extremes`, `a_report_by_minute_keys_each_local_minute` y `a_report_by_minute_starts_where_the_minutes_are_kept` en `report.rs`; `a_report_reads_the_file_without_a_daemon`, `a_window_without_rows_keeps_the_kind_of_the_metric`, `a_missing_file_or_metric_is_named`, `a_report_by_minute_reads_the_minutes_of_the_file` en `crates/clawg-cli/src/metrics.rs`; `metrics_report_takes_a_metric_labels_a_grouping_and_an_age` en `cli.rs`.
 
 ## R9. De punta a punta
 
@@ -109,7 +124,7 @@ Sin `metrics.db` MUST salir con 1 diciendo que el daemon lo escribe salvo con `C
 
 ## Límites conocidos
 
-- Sin eventos por ejecución (cargas del modelo, recuperaciones, mantenimiento) ni métricas del ingest, la búsqueda por rama, el embedder o los docs: es pipeline-metrics (73).
+- Sin eventos por ejecución (cargas del modelo, recuperaciones, mantenimiento) ni métricas del ingest, la búsqueda por rama, el embedder o los docs: es pipeline-metrics (73). Por ahora, cada carga del modelo deja en el log quién la pidió y la memoria antes y después ([`specs/storage`](../storage/spec.md), «Cada carga dice quién la pidió y cuánto costó»).
 - `clawg metrics diff` con pruebas estadísticas no existe; `report --by version` da los números que compararía.
 - Sin etiqueta de agente: el `agent_id` es autodeclarado y abriría series sin cota.
 - `process.threads` falta en Windows (pediría recorrer un snapshot de Toolhelp) y la memoria falta en macOS.

@@ -9,7 +9,8 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22 (R8 a R13: mover filas de `memory` a otro proyecto o a ninguno, con su unidad, su registro y su vuelta atrás).
 - [project-clone-identity](../../changes/archive/2026-10-23-project-clone-identity/proposal.md), archivado el 2026-10-23 (R14 a R19: el daemon asigna los ids, los clones de un remoto comparten el proyecto, y unir reconcilia; cambia R4 y R6).
 - [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (HI3: elegir y listar filas por su proyecto de origen).
-- [project-registry](../../changes/project-registry/proposal.md), entrega 0, publicada en 0.62.1 (R20: una fila de un camino sirve a una raíz sólo si su remoto no la contradice; cambia R15, R16 y R18).
+- [project-registry](../../changes/project-registry/proposal.md), entrega 0, publicada en 0.63.0 (R20: una fila de un camino sirve a una raíz sólo si su remoto no la contradice; cambia R15, R16 y R18).
+- [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (RF1: un registro lanza el refresco de docs sólo si trae `index_docs: true`; cambia la nota de R4).
 
 ## Definiciones
 
@@ -98,7 +99,7 @@ El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el i
 - Por cada id viejo distinto del de proyecto, y por el id de raíz cuando difiere de él, MUST unir al id de proyecto todas las filas que lo tengan, incluidas las borradas lógicamente, en **una** transacción: las de `memory` con R17, registradas en `memory_move`; las de `episodic_trajectory` y `procedural_skill` con una fila por fila movida en `project_rekey` (la tabla, el id de la fila, el id viejo, el nuevo y la fecha). Un id viejo que es el id de raíz de otra raíz MUST quedar como está.
 - Un id viejo con formato inválido (fuera de `{basename}-[0-9a-f]{4}`) MUST dar 400 sin mover nada.
 - La operación MUST ser idempotente: repetirla no mueve filas ni agrega entradas a `project_rekey`.
-- Un registro que tiene éxito (nuevo o ya conocido) y deja la raíz aceptada también lanza el refresco del índice de documentación del proyecto, en segundo plano y sin que la respuesta lo espere: [`specs/project-docs`](../project-docs/spec.md), «Registrar una raíz aceptada la indexa en segundo plano». No lo lanzan uno que deja la raíz sólo registrada ni uno que falla (400, 409).
+- Un registro que tiene éxito (nuevo o ya conocido), trae `index_docs: true` y deja la raíz aceptada también lanza el refresco del índice de documentación del proyecto, en segundo plano y sin que la respuesta lo espere: [`specs/project-docs`](../project-docs/spec.md), «Un registro que lo pide indexa la raíz en segundo plano». No lo lanzan uno sin `index_docs`, aunque la raíz ya estuviera aceptada (los hooks registran así en cada evento), uno que deja la raíz sólo registrada ni uno que falla (400, 409).
 
 #### Escenario: la marca sólo sube
 - GIVEN una raíz registrada con `index_docs: false`

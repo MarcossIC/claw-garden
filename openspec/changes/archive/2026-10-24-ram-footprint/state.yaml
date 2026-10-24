@@ -1,0 +1,15 @@
+change: ram-footprint
+objective: "transversal"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # las alternativas están en la exploración (A a E) y lo elegido en la propuesta
+  tasks: done
+  apply: done  # A y el paso 0 (M1 a M4); B, C, D y E pasaron a ram-footprint-gates (92)
+  verify: done  # Linux y el CI de Linux y Windows; el día de uso real pasó a ram-footprint-gates (92)
+  archive: done
+updated: 2026-10-24
+main_spec: openspec/specs/project-docs/spec.md, openspec/specs/project/spec.md, openspec/specs/metrics/spec.md, openspec/specs/storage/spec.md, openspec/specs/portability/spec.md

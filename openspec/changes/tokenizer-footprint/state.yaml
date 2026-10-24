@@ -1,6 +1,6 @@
 change: tokenizer-footprint
 objective: "transversal"
-depends_on: [ram-footprint]
+depends_on: [ram-footprint-gates]
 phase: explore
 artifacts:
   exploration: draft

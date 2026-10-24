@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | M–L (el paso 0 es S; un `Model` propio es L) | ram-footprint (90), que mide el piso en uso real; se coordina con 62 y 17 | exploración (borrador) |
+| transversal | M–L (el paso 0 es S; un `Model` propio es L) | ram-footprint-gates (92), que mide el piso en uso real con lo que dejó ram-footprint (90); se coordina con 62 y 17 | exploración (borrador) |
 
 **Tesis:** con el modelo suelto, el daemon ocupa ~284 MiB en prod, y casi todo eso es el tokenizer de `multilingual-e5-small`: un `tokenizer.json` de 17 MB se convierte en ~255 MB residentes, en 1,18 millones de asignaciones chicas. Se parsea una vez y queda toda la vida del proceso. No se lo puede soltar junto con el modelo, porque en Windows reparsearlo fragmenta el heap. El sospechoso es la estructura del modelo Unigram de `tokenizers`, no los datos. El cambio es de **medición primero**: saber de qué están hechos esos 255 MB antes de decidir entre una representación compacta propia, un arreglo upstream o cerrar con lo medido.
 
@@ -71,7 +71,7 @@ Si el paso 0 muestra que lo evitable es poco.
 
 ## Interacciones
 
-- **ram-footprint (90).** Mide el piso en uso real (M1). Cuanto menos tiempo pasa el modelo cargado, más pesa este cambio.
+- **ram-footprint (90) y ram-footprint-gates (92).** 90 dejó la serie por minuto (M1), y 92 mide con ella el piso en uso real (su pregunta 5). Cuanto menos tiempo pasa el modelo cargado, más pesa este cambio.
 - **embedder-footprint (62).** Su brazo C (`set_parallelism(false)`) toca el mismo tokenizer, en otro eje (hilos). Si llega antes, la comparación de B se hace con el paralelismo como quede.
 - **model-reembed (17).** Un cambio de modelo podría traer otro tokenizer y volver inútil este cambio. No hay ninguno planeado.
 - **embed-throughput (85).** INT8 no cambia el tokenizer. El costo de tokenizar que mida 85 es la referencia para que B no sea más lento.

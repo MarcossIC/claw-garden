@@ -21,6 +21,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (sólo «El proyecto de origen», HI1 de esa spec). Cómo se llena la columna está en [`specs/portability`](../portability/spec.md).
 - [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24 (sólo V25: IL2, su vuelta atrás e IL3). Que la importación llegue a sus filas por índice está en [`specs/portability`](../portability/spec.md) (IL1 e IL5).
 - [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24 (sólo V26, «El diario de los imports», IU6, y el motivo `pre-undo` en la poda). Qué escribe el diario y cómo se deshace un import está en [`specs/portability`](../portability/spec.md) (IU1 a IU5).
+- [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (sólo «Cada carga dice quién la pidió y cuánto costó», RF4 de esa spec). Las series de memoria con que se lee en uso real están en [`specs/metrics`](../metrics/spec.md) (R6 y R8).
 
 ## Definiciones
 
@@ -577,10 +578,10 @@ Sin la variable, vacía o con sólo espacios, el origen MUST ser `https://huggin
 
 ## Ciclo de vida del embedder
 
-El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory/idle_embedder.rs:206`), que lo suelta tras un tiempo sin uso y lo vuelve a cargar cuando una llamada necesita un vector, y que recarga también un modelo cuyo hilo de inferencia murió. Lo envuelve siempre, también con `CLAWG_EMBEDDER_IDLE_MINUTES=0`. Lo arma `unloading_when_idle` (`crates/clawg-core/src/memory/bootstrap.rs:406`), con la lectura de la caché para recargar y la descarga para repararla, cableado en `crates/clawg-cli/src/daemon/serve.rs:116`.
+El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory/idle_embedder.rs:251`), que lo suelta tras un tiempo sin uso y lo vuelve a cargar cuando una llamada necesita un vector, y que recarga también un modelo cuyo hilo de inferencia murió. Lo envuelve siempre, también con `CLAWG_EMBEDDER_IDLE_MINUTES=0`. Lo arma `unloading_when_idle` (`crates/clawg-core/src/memory/bootstrap.rs:444`), con la lectura de la caché para recargar, la descarga para repararla y la sonda de memoria del daemon, cableado en `crates/clawg-cli/src/daemon/serve.rs:147`.
 
 **Definiciones:**
-- **Tiempo de ocio:** los minutos de `CLAWG_EMBEDDER_IDLE_MINUTES` (`IDLE_MINUTES_VAR`, `idle_embedder.rs:31`), 10 si falta o está vacía.
+- **Tiempo de ocio:** los minutos de `CLAWG_EMBEDDER_IDLE_MINUTES` (`IDLE_MINUTES_VAR`, `idle_embedder.rs:32`), 10 si falta o está vacía.
 - **Residente:** el modelo está en memoria y una llamada no necesita cargarlo.
 - **Uso:** una llamada de embedding, desde que pide el modelo (incluida su carga) hasta que vuelve.
 - **Hilo muerto:** una llamada al modelo devuelve `EmbedError::WorkerGone` (`crates/clawg-core/src/memory/embedder.rs:191`): el hilo `embedder-worker`, dueño de la sesión, terminó o soltó la petición sin contestarla.
@@ -588,7 +589,7 @@ El daemon envuelve el modelo en un `IdleEmbedder` (`crates/clawg-core/src/memory
 
 ### Soltar el modelo ocioso
 
-El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último uso y no hay ningún uso en curso (`should_unload`, `idle_embedder.rs:61`, pura). Un uso MUST reiniciar la cuenta. Con `CLAWG_EMBEDDER_IDLE_MINUTES=0` MUST NOT soltarlo nunca: el `IdleEmbedder` se arma sin barrido. Un valor que no es un número entero de minutos SHOULD avisar en el log y MUST usar 10, sin impedir el arranque. El barrido corre cada cuarto del tiempo de ocio, entre 1 y 60 s (`sweep_period`, `idle_embedder.rs:67`), y termina con el embedder.
+El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último uso y no hay ningún uso en curso (`should_unload`, `idle_embedder.rs:62`, pura). Un uso MUST reiniciar la cuenta. Con `CLAWG_EMBEDDER_IDLE_MINUTES=0` MUST NOT soltarlo nunca: el `IdleEmbedder` se arma sin barrido. Un valor que no es un número entero de minutos SHOULD avisar en el log y MUST usar 10, sin impedir el arranque. El barrido corre cada cuarto del tiempo de ocio, entre 1 y 60 s (`sweep_period`, `idle_embedder.rs:68`), y termina con el embedder.
 
 #### Escenario: se suelta tras el ocio
 - GIVEN un modelo residente con un tiempo de ocio de 10 minutos
@@ -615,14 +616,14 @@ Una llamada con el modelo suelto MUST cargarlo con la misma carga del arranque s
 
 ### Una recarga que falla no deja nada roto
 
-Una recarga cuya caché no pasa (falta un archivo, no se lee o tiene otro SHA-256; `DownloadError::NotCached`, `crates/clawg-core/src/memory/model_download.rs:348`) MUST responder «no listo» (`EmbedError::NotReady`) sin esperar ninguna descarga, y MUST lanzar una reparación: `ensure` en una tarea del runtime, fuera del cerrojo del modelo, salvo que ya haya una en curso, así que hay a lo sumo una a la vez (`repair_in_background`, `bootstrap.rs:450`). La reparación no carga el modelo: la llamada siguiente que encuentre la caché reparada MUST cargarla. Una reparación que falla MUST dejarlo en el log, y la llamada siguiente MAY lanzar otra. Cualquier otra recarga que falla MUST responder «no listo» igual, y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga ni por una reparación.
+Una recarga cuya caché no pasa (falta un archivo, no se lee o tiene otro SHA-256; `DownloadError::NotCached`, `crates/clawg-core/src/memory/model_download.rs:348`) MUST responder «no listo» (`EmbedError::NotReady`) sin esperar ninguna descarga, y MUST lanzar una reparación: `ensure` en una tarea del runtime, fuera del cerrojo del modelo, salvo que ya haya una en curso, así que hay a lo sumo una a la vez (`repair_in_background`, `bootstrap.rs:489`). La reparación no carga el modelo: la llamada siguiente que encuentre la caché reparada MUST cargarla. Una reparación que falla MUST dejarlo en el log, y la llamada siguiente MAY lanzar otra. Cualquier otra recarga que falla MUST responder «no listo» igual, y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga ni por una reparación.
 
 El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca lo que tarda la red: la lectura recorre los cinco archivos aunque el que no pasa sea chico, así que el «no listo» llega después de hashear el ONNX. Medido el 2026-10-19 con el modelo real, en un build debug en Windows: las dos búsquedas respondieron en 8,7 y 9,2 s, lo que una recarga buena tarda en leer y verificar la caché (9,5 s).
 
 #### Escenario: un archivo borrado del modelo suelto
 - GIVEN el modelo suelto, `tokenizer_config.json` borrado de la caché y una descarga que tarda
 - WHEN llegan dos búsquedas seguidas
-- THEN las dos responden `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1406`) sin esperar la descarga, y hay una sola en curso
+- THEN las dos responden `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1410`) sin esperar la descarga, y hay una sola en curso
 - AND cuando la descarga termina, la búsqueda siguiente carga el modelo y responde
 
 **Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_reload_with_a_damaged_cache_is_not_ready_and_repairs_it_once_in_the_background` (`bootstrap.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
@@ -648,9 +649,9 @@ No se conoce un camino que haga entrar en pánico a la inferencia (ver [embedder
 
 ### Un hilo muerto se recupera en la misma llamada
 
-Cuando el modelo devuelve `WorkerGone`, `IdleEmbedder` (`with_model` y `discard`, `idle_embedder.rs:158` y `:145`) MUST descartarlo, salvo que la celda ya tenga otro modelo (una recuperación concurrente, comparada por `Arc::ptr_eq`), MUST marcarlo no residente y MUST repetir la llamada una vez sobre un modelo cargado con la misma recarga del modelo suelto. Las llamadas que encuentran el mismo hilo muerto a la vez MUST compartir una sola recarga. Si la repetición también encuentra el hilo muerto, la llamada MUST responder `NotReady`. `WorkerGone` MUST NOT salir de `IdleEmbedder`, así que búsqueda y `recall_context` responden el `503 embedder_not_ready` de una recarga que falla, y el ingest deja el save pendiente. Con `CLAWG_EMBEDDER_IDLE_MINUTES=0` vale igual. `embedder` en `/health` MUST seguir en `ready`; `embedder_resident` es `false` mientras el modelo está descartado.
+Cuando el modelo devuelve `WorkerGone`, `IdleEmbedder` (`with_model` y `discard`, `idle_embedder.rs:202` y `:189`) MUST descartarlo, salvo que la celda ya tenga otro modelo (una recuperación concurrente, comparada por `Arc::ptr_eq`), MUST marcarlo no residente y MUST repetir la llamada una vez sobre un modelo cargado con la misma recarga del modelo suelto. Las llamadas que encuentran el mismo hilo muerto a la vez MUST compartir una sola recarga. Si la repetición también encuentra el hilo muerto, la llamada MUST responder `NotReady`. `WorkerGone` MUST NOT salir de `IdleEmbedder`, así que búsqueda y `recall_context` responden el `503 embedder_not_ready` de una recarga que falla, y el ingest deja el save pendiente. Con `CLAWG_EMBEDDER_IDLE_MINUTES=0` vale igual. `embedder` en `/health` MUST seguir en `ready`; `embedder_resident` es `false` mientras el modelo está descartado.
 
-Una recarga que reemplaza un modelo muerto MUST NOT ocurrir menos de `RECOVERY_INTERVAL` (60 s, `idle_embedder.rs:41`) después de la anterior: entretanto el modelo queda descartado y toda llamada MUST responder `NotReady`; la primera llamada pasado el minuto MUST recargar. La primera recuperación MUST NOT esperar. La recarga del modelo soltado por ocio no cuenta y no espera, y una recarga de recuperación que falla no retiene las siguientes: un modelo que muere en cada llamada se lee, se verifica y se arma a lo sumo una vez por minuto, en vez de en cada llamada.
+Una recarga que reemplaza un modelo muerto MUST NOT ocurrir menos de `RECOVERY_INTERVAL` (60 s, `idle_embedder.rs:42`) después de la anterior: entretanto el modelo queda descartado y toda llamada MUST responder `NotReady`; la primera llamada pasado el minuto MUST recargar. La primera recuperación MUST NOT esperar. La recarga del modelo soltado por ocio no cuenta y no espera, y una recarga de recuperación que falla no retiene las siguientes: un modelo que muere en cada llamada se lee, se verifica y se arma a lo sumo una vez por minuto, en vez de en cada llamada.
 
 #### Escenario: el hilo murió entre dos llamadas
 - GIVEN un modelo residente cuyo hilo terminó
@@ -684,7 +685,7 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 
 ### Registrar un proyecto despierta el modelo
 
-`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:1963`; `wake`, `idle_embedder.rs:287`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
+`POST /v1/projects` MUST empezar a cargar un modelo suelto y MUST responder sin esperar esa carga (`embedder.wake()`, `api.rs:2073`; `wake`, `idle_embedder.rs:341`). Con el modelo residente MUST NOT cargar nada. Un modelo despertado MUST contar como recién usado.
 
 #### Escenario: el puente empieza una sesión
 - GIVEN el modelo suelto
@@ -692,6 +693,31 @@ Buscar, guardar, restaurar y `recall_context` con el modelo suelto MUST esperar 
 - THEN la respuesta llega enseguida y el modelo queda residente poco después, sin que nadie haya buscado
 
 **Tests:** `wake_loads_the_model_without_a_caller_waiting` y `a_woken_model_gets_a_full_idle_time` (`idle_embedder.rs`); `registering_a_project_wakes_an_unloaded_model_without_waiting_for_it` (`crates/clawg-cli/tests/api.rs`).
+
+### Cada carga dice quién la pidió y cuánto costó
+
+Cuando `IdleEmbedder` vuelve a cargar el modelo MUST dejar en el log una línea de `info` con la duración, quién la pidió y, si el daemon le dio una sonda de memoria, la memoria privada antes y después (`load_line`, `idle_embedder.rs:85`):
+
+```
+embedding model loaded again in 9234 ms for a wake; private memory 284.0 MiB before, 740.0 MiB after
+```
+
+Quién la pidió MUST ser `for a wake` (un registro, [arriba](#registrar-un-proyecto-despierta-el-modelo)), `for a call that embeds` o `for a call that found its worker gone` (una recuperación). Cuando la cargó un `wake`, la primera llamada que use el modelo MUST dejar `the model a wake loaded was first used N s later` (`:153`). Si el modelo se suelta por ocio sin que ninguna llamada lo haya usado, la línea de la descarga MUST terminar con `; no call used it after the wake that loaded it` (`unload_if_idle`, `:231`). Un modelo que cargó una llamada nunca cuenta como despertado.
+
+La sonda es un `MemoryProbe` (`fn() -> Option<u64>`, `crates/clawg-core/src/metrics/mod.rs:15`), porque las llamadas al sistema viven en `clawg-cli` y `clawg-core` no depende del sistema. `clawg serve` pasa `process::private_bytes` (`crates/clawg-cli/src/daemon/serve.rs:153`). Sin sonda (en las pruebas y en `clawg-eval`), la línea no lleva memoria. Nada de esto cambia cuándo se carga o se suelta el modelo.
+
+#### Escenario: un `wake` que nadie usó
+- GIVEN un modelo suelto
+- WHEN un `wake` lo carga y pasa el tiempo de ocio sin llamadas
+- THEN la descarga queda marcada como sin uso después del `wake`
+- AND si un `wake` lo carga y después una llamada embebe, la descarga no queda marcada
+
+#### Escenario: una carga que pidió una llamada
+- GIVEN un modelo suelto
+- WHEN una llamada que embebe lo carga y después pasa el tiempo de ocio
+- THEN la descarga no queda marcada
+
+**Tests:** `the_sweep_tells_a_woken_model_nobody_used_from_one_a_call_used`, `a_model_a_call_loaded_is_never_counted_as_woken` y `a_load_names_who_asked_and_the_memory_around_it` (`idle_embedder.rs`); `memory_reads_in_mib` (`crates/clawg-core/src/metrics/mod.rs`). Las pruebas del ciclo de vida de arriba pasan sin cambiar ninguna aserción.
 
 ### La memoria vuelve al sistema
 

@@ -35,16 +35,14 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 - [x] Suite y clippy de `.claude/CLAUDE.md` en Linux.
 - [x] El CI en verde en Linux y Windows (RF3 y la muestra de Windows sólo corren allá).
-- [ ] **[perfil con uso real, modelo real, con autorización]** Un día de uso normal con Claude Code: `metrics report --by minute` sobre `process.private_bytes`, `process.private_peak_bytes` y `embedder.resident`, contra las líneas de carga, descarga y refresco de `serve.log`. Las mismas lecturas que la exploración tomó en prod, ahora con A. Responde las cinco preguntas del problema.
-- [ ] `verify.md`.
+- [x] `verify.md`.
+
+El día de uso real con el modelo real (`metrics report --by minute` sobre `process.private_bytes`, `process.private_peak_bytes` y `embedder.resident`, contra las líneas de carga, descarga y refresco de `serve.log`) no se hizo en este cambio. Pasó a [ram-footprint-gates](../../ram-footprint-gates/exploration.md) (92) al partirlo, porque no verifica RF1 a RF5: decide B, C y D ([verify](verify.md#el-día-de-uso-real)).
 
 ## 8. Según la medición
 
-- [ ] B (despertar sólo al empezar una sesión), si M3 muestra que más de la mitad de las cargas de un día son de un `wake` que nadie usó. Antes, elegir entre B1, B2 y B3.
-- [ ] C (cargar el ONNX con `commit_from_file`), si M2 muestra que la carga es el máximo del proceso; antes, aceptar la ventana entre la verificación y la carga.
-- [ ] D (embeber el import por tanda), con import-job (87), si M4 muestra que los vectores pesan; antes, aceptar que un import cortado quede parcial y deshacible.
-- [ ] E, al final, si todavía hace falta.
+B (despertar sólo al empezar una sesión), C (cargar el ONNX con `commit_from_file`), D (embeber el import por tanda, con import-job, 87) y E pasaron a ram-footprint-gates (92), con sus puertas y sus decisiones previas.
 
 ## 9. Archive
 
-- [ ] Consolidar RF1 a RF5 (y lo que entre de B, C, D) en `specs/project-docs`, `specs/project`, `specs/metrics`, `specs/storage` y `specs/portability`; `git mv` a `changes/archive/`; subir el minor.
+- [x] RF1 en `specs/project-docs` y `specs/project`, RF2 y RF3 en `specs/metrics`, RF4 en `specs/storage` y RF5 en `specs/portability`; `git mv` a `changes/archive/2026-10-24-ram-footprint`; `state.yaml` archivado; las filas 62, 90 y 91, la nueva 92 y el orden de ejecución del `README.md` de openspec; subir el minor. También se realinearon las citas de las secciones que este cambio movió ([verify](verify.md#al-archivar-2026-10-24)).
