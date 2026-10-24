@@ -713,6 +713,11 @@ fn place_rows(
     Ok(())
 }
 
+/// Whether row `?1` is a piece of a save already.
+const LINKED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM memory_piece WHERE memory_id = ?1)";
+
+const NEXT_SAVE_SQL: &str = "SELECT COALESCE(MAX(save_id), 0) + 1 FROM memory_piece";
+
 /// Writes every link of the file whose ends were placed, translated to the
 /// ids here. Rows already here only get the links they lack, and only the
 /// ones their state holds: a row here that is live is replaced or disputed by
@@ -847,12 +852,12 @@ fn write_links(tx: &Transaction<'_>, prepared: &Prepared, ledger: &mut Ledger) -
         let placed: Vec<i64> = pieces.iter().filter(|(_, _, m)| !notes || owned(*m)).filter_map(|(_, _, m)| id_of(*m)).collect();
         let mut linked = false;
         for id in &placed {
-            linked |= tx.query_row("SELECT EXISTS (SELECT 1 FROM memory_piece WHERE memory_id = ?1)", [id], |r| r.get::<_, bool>(0))?;
+            linked |= tx.query_row(LINKED_SQL, [id], |r| r.get::<_, bool>(0))?;
         }
         if linked {
             continue;
         }
-        let save_id: i64 = tx.query_row("SELECT COALESCE(MAX(save_id), 0) + 1 FROM memory_piece", [], |r| r.get(0))?;
+        let save_id: i64 = tx.query_row(NEXT_SAVE_SQL, [], |r| r.get(0))?;
         for (line, piece, memory) in pieces {
             let Some(id) = id_of(*memory) else {
                 dropped.push(Invalid { line: *line, reason: format!("piece {piece} is memory {memory}, which is not in the file") });
@@ -2391,5 +2396,52 @@ mod tests {
             (row.agent_id, row.memory_type, row.status, row.created_at, row.access_count, row.tier, row.source),
             (source.agent_id.clone(), source.memory_type.clone(), source.status.clone(), source.created_at, source.access_count, source.tier, source.source.clone())
         );
+    }
+
+    /// Each runs once per row or per save of a file, in the pass that decides
+    /// and again in the one that writes, so a scan makes an import grow with
+    /// the square of its rows.
+    #[tokio::test]
+    async fn the_import_lookups_seek_an_index() {
+        use rusqlite::types::Value::{Integer, Null, Text};
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed(&store).await;
+        let hash = || Text(content_hash("Storage engine: SQLite with WAL"));
+        let cases = [
+            ("ORIGIN_SQL", ORIGIN_SQL, vec![Text("engram:a".into())], "idx_memory_import_origin"),
+            ("PRESENT_SQL in a project", PRESENT_SQL, vec![Text("claude-code".into()), Text(project()), hash(), Integer(1)], "idx_memory_dedup"),
+            ("PRESENT_SQL without a project", PRESENT_SQL, vec![Text(MIGRATED_AGENT.into()), Null, hash(), Integer(1)], "idx_memory_dedup"),
+            ("TWIN_SQL in a project", TWIN_SQL, vec![Text(project()), hash()], "idx_memory_dedup"),
+            ("TWIN_SQL without a project", TWIN_SQL, vec![Null, hash()], "idx_memory_dedup"),
+            ("TOPIC_HOLDERS_SQL", TOPIC_HOLDERS_SQL, vec![Text(project()), Text("storage/engine".into()), Text("engram:a".into())], "idx_memory_topic"),
+            ("REVISED_SQL", REVISED_SQL, vec![Integer(-1), Integer(-2)], "INTEGER PRIMARY KEY"),
+            ("LINKED_SQL", LINKED_SQL, vec![Integer(5)], "idx_memory_piece_memory"),
+            ("NEXT_SAVE_SQL", NEXT_SAVE_SQL, vec![], "PRIMARY KEY"),
+        ];
+        let mut wrong = Vec::new();
+        for (name, sql, binds, index) in cases {
+            let (plan, steps) = store
+                .conn
+                .call(move |c| -> rusqlite::Result<(Vec<String>, i32)> {
+                    let plan: Vec<String> = c
+                        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                        .query_map(rusqlite::params_from_iter(&binds), |r| r.get(3))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    let mut stmt = c.prepare(sql)?;
+                    let mut rows = stmt.query(rusqlite::params_from_iter(&binds))?;
+                    while rows.next()?.is_some() {}
+                    drop(rows);
+                    Ok((plan, stmt.get_status(rusqlite::StatementStatus::FullscanStep)))
+                })
+                .await
+                .unwrap();
+            let seeks = plan.iter().any(|l| l.starts_with("SEARCH") && l.contains(index));
+            // `SELECT EXISTS (…)` reads the one row of a SELECT without FROM.
+            let scans = plan.iter().any(|l| l.starts_with("SCAN") && l != "SCAN CONSTANT ROW");
+            if !seeks || scans || steps != 0 {
+                wrong.push(format!("{name} should seek `{index}`: {plan:?}, {steps} full scan steps"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
