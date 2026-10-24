@@ -20,6 +20,9 @@
 //! already there is never inserted again and its links are only filled where
 //! empty, so importing the same file twice, or again after a crash between
 //! transactions, does no harm.
+//!
+//! Each step logs how long it took as it ends ([`super::timing`]), and the
+//! steps on the connection how much of it was SQLite and how much waiting.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -28,6 +31,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -42,6 +46,7 @@ use crate::memory::project::plan_ids_in;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
 use crate::memory::portability::format::{parse, ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
+use crate::memory::portability::timing::{ImportTimings, Step, Timing};
 use crate::memory::portability::translate::{
     translate, ForeignReport, LeftOut, MappedProject, MergedNote, NoteRows, TakenKey, TakenProject, TranslateOptions,
     Translated, MIGRATED_AGENT,
@@ -239,10 +244,38 @@ fn roots_here(parsed: &Parsed, options: &ImportOptions) -> Vec<(PathBuf, Option<
         .collect()
 }
 
+/// Runs `f` on the store's connection and counts the call in `timing`: how
+/// long it held the connection, and how long it waited for it behind others.
+async fn timed<T, F>(store: &MemoryStore, timing: &mut Timing, f: F) -> Result<T, MemoryError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+{
+    let asked = Instant::now();
+    let (value, ran) = store
+        .conn
+        .call(move |c| {
+            let started = Instant::now();
+            let value = f(c)?;
+            Ok::<_, rusqlite::Error>((value, started.elapsed()))
+        })
+        .await
+        .map_err(MemoryError::Connection)?;
+    timing.call(asked.elapsed(), ran);
+    Ok(value)
+}
+
 /// The ids a registration of each root would give it now, in order.
-async fn plan(store: &MemoryStore, roots: &[(PathBuf, Option<String>)]) -> Result<Vec<(String, String)>, ImportError> {
+async fn plan(
+    store: &MemoryStore,
+    roots: &[(PathBuf, Option<String>)],
+    timings: &mut ImportTimings,
+) -> Result<Vec<(String, String)>, ImportError> {
+    let (clock, mut timing) = (Instant::now(), Timing::new(Step::Plan));
     let planned = roots.to_vec();
-    Ok(store.conn.call(move |c| plan_ids_in(c, &planned)).await.map_err(MemoryError::Connection)?)
+    let ids = timed(store, &mut timing, move |c| plan_ids_in(c, &planned)).await?;
+    timings.record(Timing { elapsed: clock.elapsed(), ..timing });
+    Ok(ids)
 }
 
 /// What the texts of a file are.
@@ -896,25 +929,27 @@ impl Seat for Planned {
 }
 
 /// Runs `sql` once per set of `binds`, [`LOAD_BATCH`] to a call.
-async fn known(store: &MemoryStore, sql: &'static str, binds: Vec<Vec<String>>) -> Result<Vec<Known>, MemoryError> {
+async fn known(
+    store: &MemoryStore,
+    sql: &'static str,
+    binds: Vec<Vec<String>>,
+    timing: &mut Timing,
+) -> Result<Vec<Known>, MemoryError> {
     let mut rows = Vec::new();
     for batch in binds.chunks(LOAD_BATCH) {
         let batch = batch.to_vec();
-        let found = store
-            .conn
-            .call(move |c| -> rusqlite::Result<Vec<Known>> {
-                let mut stmt = c.prepare_cached(sql)?;
-                let mut rows = Vec::new();
-                for bind in &batch {
-                    let found = stmt.query_map(rusqlite::params_from_iter(bind), Known::read)?;
-                    for row in found {
-                        rows.push(row?);
-                    }
+        let found = timed(store, timing, move |c| {
+            let mut stmt = c.prepare_cached(sql)?;
+            let mut rows = Vec::new();
+            for bind in &batch {
+                let found = stmt.query_map(rusqlite::params_from_iter(bind), Known::read)?;
+                for row in found {
+                    rows.push(row?);
                 }
-                Ok(rows)
-            })
-            .await
-            .map_err(MemoryError::Connection)?;
+            }
+            Ok(rows)
+        })
+        .await?;
         rows.extend(found);
     }
     Ok(rows)
@@ -923,10 +958,10 @@ async fn known(store: &MemoryStore, sql: &'static str, binds: Vec<Vec<String>>) 
 /// Loads what the rules can read of the store for `prepared`. The rows of
 /// each origin of the file come first: with the file's own, their projects
 /// and keys are every project and key the rules can ask about.
-async fn load(store: &MemoryStore, prepared: &Prepared) -> Result<Planned, MemoryError> {
+async fn load(store: &MemoryStore, prepared: &Prepared, timing: &mut Timing) -> Result<Planned, MemoryError> {
     let origins: BTreeSet<&str> = prepared.notes.iter().map(|n| n.origin.as_str()).collect();
     let binds = origins.iter().map(|o| vec![o.to_string()]).collect();
-    let mut rows = known(store, ORIGIN_ROWS_SQL, binds).await?;
+    let mut rows = known(store, ORIGIN_ROWS_SQL, binds, timing).await?;
 
     let mut reach: HashMap<&str, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new();
     for row in &rows {
@@ -956,47 +991,42 @@ async fn load(store: &MemoryStore, prepared: &Prepared) -> Result<Planned, Memor
             keys.extend(row_keys.iter().map(|key| vec![project.clone(), key.clone()]));
         }
     }
-    rows.extend(known(store, TEXT_ROWS_SQL, texts.into_iter().collect()).await?);
-    rows.extend(known(store, KEY_ROWS_SQL, keys.into_iter().collect()).await?);
+    rows.extend(known(store, TEXT_ROWS_SQL, texts.into_iter().collect(), timing).await?);
+    rows.extend(known(store, KEY_ROWS_SQL, keys.into_iter().collect(), timing).await?);
     rows.sort_by_key(|r| r.id);
     rows.dedup_by_key(|r| r.id);
+    timing.rows = Some(rows.len());
 
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     let mut linked = HashSet::new();
     for batch in ids.chunks(LOAD_BATCH) {
         let batch = batch.to_vec();
-        let found = store
-            .conn
-            .call(move |c| -> rusqlite::Result<Vec<i64>> {
-                let mut stmt = c.prepare_cached(LINKED_SQL)?;
-                let mut linked = Vec::new();
-                for id in batch {
-                    if stmt.query_row([id], |r| r.get(0))? {
-                        linked.push(id);
-                    }
+        let found = timed(store, timing, move |c| {
+            let mut stmt = c.prepare_cached(LINKED_SQL)?;
+            let mut linked = Vec::new();
+            for id in batch {
+                if stmt.query_row([id], |r| r.get(0))? {
+                    linked.push(id);
                 }
-                Ok(linked)
-            })
-            .await
-            .map_err(MemoryError::Connection)?;
+            }
+            Ok(linked)
+        })
+        .await?;
         linked.extend(found);
     }
 
     let root_ids: Vec<String> = prepared.projects.iter().map(|p| p.root_id.clone()).collect();
-    let (roots, next_id) = store
-        .conn
-        .call(move |c| -> rusqlite::Result<(HashMap<String, String>, i64)> {
-            let mut roots = HashMap::new();
-            let mut stmt = c.prepare_cached(PROJECT_ROOT_SQL)?;
-            for id in root_ids {
-                if let Some(root) = stmt.query_row([&id], |r| r.get(0)).optional()? {
-                    roots.insert(id, root);
-                }
+    let (roots, next_id) = timed(store, timing, move |c| {
+        let mut roots = HashMap::new();
+        let mut stmt = c.prepare_cached(PROJECT_ROOT_SQL)?;
+        for id in root_ids {
+            if let Some(root) = stmt.query_row([&id], |r| r.get(0)).optional()? {
+                roots.insert(id, root);
             }
-            Ok((roots, c.query_row(NEXT_ID_SQL, [], |r| r.get(0))?))
-        })
-        .await
-        .map_err(MemoryError::Connection)?;
+        }
+        Ok((roots, c.query_row(NEXT_ID_SQL, [], |r| r.get(0))?))
+    })
+    .await?;
 
     let mut planned = Planned { linked, roots, next_id, ..Default::default() };
     for row in rows {
@@ -1439,26 +1469,41 @@ fn write_links<S: Seat>(seat: &mut S, prepared: &Prepared, ledger: &mut Ledger) 
 }
 
 /// Reads `text` and imports it into `store`, writing the `pre-import`
-/// snapshot into `backups` first. A dry run writes nothing and needs no
-/// embedder.
+/// snapshot into `backups` first, each step logged in `timings` as it ends.
+/// A dry run writes nothing and needs no embedder.
 pub async fn import(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
     backups: &Path,
     text: &str,
     options: &ImportOptions,
+    timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
-    let prepared = prepare_file(store, text, options).await?;
-    let written = write(store, embedder, backups, &prepared, options.dry_run, "clawg").await?;
+    let prepared = prepare_file(store, text, options, timings).await?;
+    let written = write(store, embedder, backups, &prepared, options.dry_run, "clawg", timings).await?;
     Ok(report(&prepared, &written, options.dry_run))
 }
 
 /// A clawg export, worked out against the ids its roots would get here.
-async fn prepare_file(store: &MemoryStore, text: &str, options: &ImportOptions) -> Result<Arc<Prepared>, ImportError> {
+async fn prepare_file(
+    store: &MemoryStore,
+    text: &str,
+    options: &ImportOptions,
+    timings: &mut ImportTimings,
+) -> Result<Arc<Prepared>, ImportError> {
+    let clock = Instant::now();
     let (_, parsed) = parse(text)?;
     let roots = roots_here(&parsed, options);
-    let ids = plan(store, &roots).await?;
-    Ok(Arc::new(prepare(parsed, &roots, &ids, options, Texts::Raw)))
+    let parsing = clock.elapsed();
+    let ids = plan(store, &roots, timings).await?;
+    let clock = Instant::now();
+    let prepared = prepare(parsed, &roots, &ids, options, Texts::Raw);
+    timings.record(Timing {
+        elapsed: parsing + clock.elapsed(),
+        rows: Some(prepared.rows.len()),
+        ..Timing::new(Step::Prepare)
+    });
+    Ok(Arc::new(prepared))
 }
 
 /// Imports the notes of another tool's export as [`import`] imports a file:
@@ -1473,10 +1518,11 @@ pub async fn import_foreign(
     backups: &Path,
     export: ForeignExport,
     options: &ImportOptions,
+    timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
     let source = export.source;
-    let (prepared, foreign) = prepare_export(store, chunker, export, options).await?;
-    let written = write(store, embedder, backups, &prepared, options.dry_run, source).await?;
+    let (prepared, foreign) = prepare_export(store, chunker, export, options, timings).await?;
+    let written = write(store, embedder, backups, &prepared, options.dry_run, source, timings).await?;
     Ok(with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger))
 }
 
@@ -1487,6 +1533,7 @@ async fn prepare_export(
     chunker: Arc<ChatChunker>,
     export: ForeignExport,
     options: &ImportOptions,
+    timings: &mut ImportTimings,
 ) -> Result<(Arc<Prepared>, ForeignReport), ImportError> {
     // Planned before the translation, which tells keys apart by the project
     // each note goes to here.
@@ -1494,7 +1541,7 @@ async fn prepare_export(
     let mapped: Vec<&str> = options.project_map.iter().map(|(_, root)| root.as_str()).filter(|root| seen.insert(*root)).collect();
     let roots: Vec<(PathBuf, Option<String>)> =
         mapped.iter().map(|root| (PathBuf::from(root), origin_key(Path::new(root)))).collect();
-    let ids = plan(store, &roots).await?;
+    let ids = plan(store, &roots, timings).await?;
     let project_of: HashMap<&str, &str> = mapped.iter().copied().zip(ids.iter().map(|(_, project_id)| project_id.as_str())).collect();
     let translate_options = TranslateOptions {
         agent: options.agent.clone().unwrap_or_else(|| MIGRATED_AGENT.to_owned()),
@@ -1505,6 +1552,7 @@ async fn prepare_export(
             .collect(),
     };
     let now = TimestampMs::now().as_millis_i64();
+    let clock = Instant::now();
     // Masking and splitting thousands of notes is work the daemon's other
     // requests should not wait behind.
     let (prepared, foreign) = tokio::task::spawn_blocking(move || {
@@ -1513,6 +1561,7 @@ async fn prepare_export(
     })
     .await
     .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
+    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..Timing::new(Step::Translate) });
     Ok((Arc::new(prepared), foreign))
 }
 
@@ -1555,9 +1604,14 @@ async fn write(
     prepared: &Arc<Prepared>,
     dry_run: bool,
     source: &'static str,
+    timings: &mut ImportTimings,
 ) -> Result<Written, ImportError> {
     let now = TimestampMs::now().as_millis_i64();
-    let planned = load(store, prepared).await?;
+    let (clock, mut timing) = (Instant::now(), Timing::new(Step::Load));
+    let planned = load(store, prepared, &mut timing).await?;
+    timings.record(Timing { elapsed: clock.elapsed(), ..timing });
+
+    let clock = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
     let _stop = StopOnDrop(stop.clone());
     let decide_from = prepared.clone();
@@ -1565,6 +1619,7 @@ async fn write(
         .await
         .map_err(|e| MemoryError::Internal(format!("could not plan the import: {e}")))?
         .ok_or_else(|| MemoryError::Internal("the import was stopped".to_owned()))?;
+    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..Timing::new(Step::Decide) });
 
     if dry_run {
         return Ok(Written { ledger: decided, snapshot: None, import_id: None });
@@ -1576,17 +1631,23 @@ async fn write(
         .iter()
         .filter(|r| r.src.deleted_at.is_none() && decided.placed.get(&r.src.id).is_some_and(|p| p.inserted()))
         .collect();
+    let (clock, mut timing) = (Instant::now(), Timing { rows: Some(to_embed.len()), ..Timing::new(Step::Embed) });
     let mut vectors: HashMap<i64, Vec<u8>> = HashMap::with_capacity(to_embed.len());
     for batch in to_embed.chunks(EMBED_BATCH) {
+        let asked = Instant::now();
         let texts: Vec<String> = batch.iter().map(|r| embedding_text(&r.context, &r.content).into_owned()).collect();
         let embedded = embedder.embed_batch(&texts, EmbedRole::Passage).await?;
         for (row, vector) in batch.iter().zip(embedded) {
             let unit = to_unit(&vector).map_err(|e| EmbedError::InferenceFailed(e.to_string()))?;
             vectors.insert(row.src.id, unit.iter().flat_map(|f| f.to_le_bytes()).collect());
         }
+        timing.batch(asked.elapsed());
     }
+    timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
+    let clock = Instant::now();
     let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreImport).await?.display().to_string();
+    timings.record(Timing { elapsed: clock.elapsed(), ..Timing::new(Step::Snapshot) });
 
     let vectors = Arc::new(vectors);
     let mut ledger = Ledger::default();
@@ -1598,41 +1659,37 @@ async fn write(
         // The projects are recorded even when there is no row.
         batches.push(0..0);
     }
+    let (clock, mut timing) = (Instant::now(), Timing { rows: Some(prepared.rows.len()), ..Timing::new(Step::Write) });
     for (k, range) in batches.into_iter().enumerate() {
         let (batch, vectors) = (prepared.clone(), vectors.clone());
         let mut placed = std::mem::take(&mut ledger);
         let mut logged = journal;
-        (ledger, journal) = store
-            .conn
-            .call(move |c| -> rusqlite::Result<(Ledger, Journal)> {
-                let tx = c.transaction()?;
-                if k == 0 {
-                    placed.taken = record_projects(&tx, &batch.projects, now, &mut logged)?;
-                }
-                place_rows(&mut SqlSeat(&tx, &mut logged), &batch, range, &mut placed, &vectors, true)?;
-                tx.commit()?;
-                Ok((placed, logged))
-            })
-            .await
-            .map_err(MemoryError::Connection)?;
-    }
-    let links = prepared.clone();
-    let (ledger, journal) = store
-        .conn
-        .call(move |c| -> rusqlite::Result<(Ledger, Journal)> {
+        (ledger, journal) = timed(store, &mut timing, move |c| {
             let tx = c.transaction()?;
-            write_links(&mut SqlSeat(&tx, &mut journal), &links, &mut ledger)?;
-            if let Some(id) = journal.id {
-                tx.execute(
-                    "UPDATE memory_import SET finished_at = ?2 WHERE import_id = ?1",
-                    [id, TimestampMs::now().as_millis_i64()],
-                )?;
+            if k == 0 {
+                placed.taken = record_projects(&tx, &batch.projects, now, &mut logged)?;
             }
+            place_rows(&mut SqlSeat(&tx, &mut logged), &batch, range, &mut placed, &vectors, true)?;
             tx.commit()?;
-            Ok((ledger, journal))
+            Ok((placed, logged))
         })
-        .await
-        .map_err(MemoryError::Connection)?;
+        .await?;
+    }
+    timings.record(Timing { elapsed: clock.elapsed(), ..timing });
+
+    let (clock, mut timing) = (Instant::now(), Timing::new(Step::Links));
+    let links = prepared.clone();
+    let (ledger, journal) = timed(store, &mut timing, move |c| {
+        let tx = c.transaction()?;
+        write_links(&mut SqlSeat(&tx, &mut journal), &links, &mut ledger)?;
+        if let Some(id) = journal.id {
+            tx.execute("UPDATE memory_import SET finished_at = ?2 WHERE import_id = ?1", [id, TimestampMs::now().as_millis_i64()])?;
+        }
+        tx.commit()?;
+        Ok((ledger, journal))
+    })
+    .await?;
+    timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
     Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id })
 }
@@ -1812,7 +1869,7 @@ pub(crate) mod tests {
 
     pub(crate) async fn run(store: &MemoryStore, text: &str, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
         let backups = tempfile::tempdir().unwrap();
-        let report = import(store, Some(&FakeEmbedder::default()), backups.path(), text, &options).await.unwrap();
+        let report = import(store, Some(&FakeEmbedder::default()), backups.path(), text, &options, &mut ImportTimings::new(false)).await.unwrap();
         (report, backups)
     }
 
@@ -1976,7 +2033,7 @@ pub(crate) mod tests {
         let file = seeded_file().await.replacen("\"version\":1", "\"version\":2", 1);
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
-        let err = import(&dst, Some(&FakeEmbedder::default()), backups.path(), &file, &ImportOptions::default()).await.unwrap_err();
+        let err = import(&dst, Some(&FakeEmbedder::default()), backups.path(), &file, &ImportOptions::default(), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::Format(FormatError::UnknownVersion(2))), "{err}");
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert!(files_in(backups.path()).is_empty());
@@ -1989,7 +2046,7 @@ pub(crate) mod tests {
         let backups = tempfile::tempdir().unwrap();
         let sequence = "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'memory'), 0)";
         let before = count(&dst, sequence).await;
-        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }).await.unwrap();
+        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, &mut ImportTimings::new(false)).await.unwrap();
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert_eq!(count(&dst, "SELECT count(*) FROM project").await, 0);
         assert_eq!(count(&dst, "SELECT count(*) FROM project_remote").await, 0);
@@ -2049,7 +2106,7 @@ pub(crate) mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
-        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }).await.unwrap();
+        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, &mut ImportTimings::new(false)).await.unwrap();
         assert_eq!(dry.import_id, None);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_import").await, 0);
         let (first, _) = run(&dst, &file, ImportOptions::default()).await;
@@ -2063,7 +2120,7 @@ pub(crate) mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
-        let err = import(&dst, None, backups.path(), &file, &ImportOptions::default()).await.unwrap_err();
+        let err = import(&dst, None, backups.path(), &file, &ImportOptions::default(), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::NoEmbedder));
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert!(files_in(backups.path()).is_empty());
@@ -2339,7 +2396,7 @@ pub(crate) mod tests {
         let backups = tempfile::tempdir().unwrap();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let report =
-            import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options).await.unwrap();
+            import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options, &mut ImportTimings::new(false)).await.unwrap();
         (report, backups)
     }
 
@@ -2514,7 +2571,7 @@ pub(crate) mod tests {
         let backups = tempfile::tempdir().unwrap();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let dry_run = ImportOptions { dry_run: true, ..Default::default() };
-        let dry = import_foreign(&dst, None, chunker, backups.path(), foreign_export(notes.clone()), &dry_run).await.unwrap();
+        let dry = import_foreign(&dst, None, chunker, backups.path(), foreign_export(notes.clone()), &dry_run, &mut ImportTimings::new(false)).await.unwrap();
         assert!(files_in(backups.path()).is_empty());
         let (report, _) = run_foreign(&dst, notes, ImportOptions::default()).await;
         assert_eq!(ImportReport { dry_run: false, snapshot: report.snapshot.clone(), import_id: report.import_id, ..dry }, report);
@@ -3111,11 +3168,11 @@ pub(crate) mod tests {
     }
 
     async fn file_of(store: &MemoryStore, text: &str, options: ImportOptions) -> Arc<Prepared> {
-        prepare_file(store, text, &options).await.unwrap()
+        prepare_file(store, text, &options, &mut ImportTimings::new(false)).await.unwrap()
     }
 
     async fn notes_of(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> Arc<Prepared> {
-        prepare_export(store, Arc::new(ChatChunker::with_fallback()), foreign_export(notes), &options).await.unwrap().0
+        prepare_export(store, Arc::new(ChatChunker::with_fallback()), foreign_export(notes), &options, &mut ImportTimings::new(false)).await.unwrap().0
     }
 
     /// What the pass that decided on the connection made of `prepared`: the
@@ -3138,7 +3195,7 @@ pub(crate) mod tests {
 
     async fn decides_alike(store: &MemoryStore, prepared: Arc<Prepared>, case: &str) -> Ledger {
         let by_sql = decided_by_sql(store, &prepared).await;
-        let planned = load(store, &prepared).await.unwrap();
+        let planned = load(store, &prepared, &mut Timing::new(Step::Load)).await.unwrap();
         let by_plan = decide(planned, &prepared, &AtomicBool::new(false)).unwrap();
         assert_eq!(by_plan, by_sql, "{case}");
         by_plan
@@ -3259,7 +3316,7 @@ pub(crate) mod tests {
     async fn a_stopped_planner_decides_nothing() {
         let dst = destination().await;
         let prepared = file_of(&dst, &seeded_file().await, ImportOptions::default()).await;
-        let planned = load(&dst, &prepared).await.unwrap();
+        let planned = load(&dst, &prepared, &mut Timing::new(Step::Load)).await.unwrap();
         assert!(decide(planned, &prepared, &AtomicBool::new(true)).is_none());
     }
 
@@ -3271,10 +3328,110 @@ pub(crate) mod tests {
         let purged = insert_row(&dst, "claude-code", None, "A row purged since", None, 6).await;
         dst.conn.call(move |c| c.execute("DELETE FROM memory WHERE id = ?1", [purged])).await.unwrap();
         let backups = tempfile::tempdir().unwrap();
-        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }).await.unwrap();
+        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, &mut ImportTimings::new(false)).await.unwrap();
         assert!(dry.topic_taken.iter().all(|t| t.stored_as > purged) && !dry.topic_taken.is_empty(), "{dry:#?}");
         let (real, _) = run(&dst, &file, ImportOptions::default()).await;
         assert_eq!(ImportReport { dry_run: false, snapshot: real.snapshot.clone(), import_id: real.import_id, ..dry }, real);
+    }
+
+    fn steps(timings: &ImportTimings) -> Vec<Step> {
+        timings.steps().iter().map(|t| t.step).collect()
+    }
+
+    fn timing_of(timings: &ImportTimings, step: Step) -> &Timing {
+        timings.steps().iter().find(|t| t.step == step).unwrap()
+    }
+
+    async fn timed_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, dry_run: bool) -> (ImportReport, ImportTimings) {
+        let backups = tempfile::tempdir().unwrap();
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let options = ImportOptions { dry_run, ..Default::default() };
+        let mut timings = ImportTimings::new(dry_run);
+        let export = foreign_export(notes);
+        let report = import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options, &mut timings)
+            .await
+            .unwrap();
+        (report, timings)
+    }
+
+    async fn timed_file(store: &MemoryStore, file: &str) -> (ImportReport, ImportTimings) {
+        let backups = tempfile::tempdir().unwrap();
+        let mut timings = ImportTimings::new(false);
+        let report =
+            import(store, Some(&FakeEmbedder::default()), backups.path(), file, &ImportOptions::default(), &mut timings)
+                .await
+                .unwrap();
+        (report, timings)
+    }
+
+    #[tokio::test]
+    async fn an_import_times_each_step_once_in_order() {
+        let dst = destination().await;
+        let (report, timings) = timed_foreign(&dst, sample_notes(), false).await;
+        use Step::*;
+        assert_eq!(steps(&timings), [Plan, Translate, Load, Decide, Embed, Snapshot, Write, Links]);
+        let deleted = report.by_state.get("deleted").copied().unwrap_or(0);
+        assert!(deleted > 0, "{report:#?}");
+        assert_eq!(timing_of(&timings, Embed).rows, Some(report.inserted - deleted));
+        assert_eq!(timing_of(&timings, Translate).rows, Some(report.rows));
+        assert_eq!(timing_of(&timings, Decide).rows, Some(report.rows));
+        assert_eq!(timing_of(&timings, Write).rows, Some(report.rows));
+        assert_eq!(timing_of(&timings, Links).calls.map(|c| c.count), Some(1));
+        assert_eq!(timing_of(&timings, Snapshot).calls, None);
+    }
+
+    #[tokio::test]
+    async fn a_clawg_file_is_prepared_rather_than_translated() {
+        let dst = destination().await;
+        let (report, timings) = timed_file(&dst, &seeded_file().await).await;
+        use Step::*;
+        assert_eq!(steps(&timings), [Plan, Prepare, Load, Decide, Embed, Snapshot, Write, Links]);
+        assert_eq!(timing_of(&timings, Prepare).rows, Some(report.rows));
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_times_only_what_it_runs() {
+        let dst = destination().await;
+        let (_, timings) = timed_foreign(&dst, sample_notes(), true).await;
+        use Step::*;
+        assert_eq!(steps(&timings), [Plan, Translate, Load, Decide]);
+    }
+
+    #[tokio::test]
+    async fn time_in_sqlite_never_exceeds_the_call() {
+        const ROWS: usize = 600;
+        let src = MemoryStore::new_for_test().await.unwrap();
+        src.conn
+            .call(|c| {
+                for k in 0..ROWS {
+                    c.execute(
+                        "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+                         created_by_ref, last_modified_at, last_accessed_at, access_count, importance, tier, status, \
+                         content_hash) \
+                         VALUES ('agent', 'claude-code', ?1, 'semantic_fact', 'explicit', ?2, 'agent', 'claude-code', ?2, \
+                         ?2, 1, 5.0, 3, 'active', content_hash(?1))",
+                        rusqlite::params![format!("The row number {k}"), k as i64],
+                    )?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        let file = dump(&src, EVERYTHING).await.to_jsonl();
+        let dst = MemoryStore::new_for_test().await.unwrap();
+        let (report, timings) = timed_file(&dst, &file).await;
+        assert_eq!(report.inserted, ROWS);
+
+        let load = timing_of(&timings, Step::Load);
+        let texts = ROWS.div_ceil(LOAD_BATCH);
+        assert_eq!(load.calls.map(|c| c.count), Some(texts + 1), "the texts, then the roots");
+        let write = timing_of(&timings, Step::Write);
+        assert_eq!(write.calls.map(|c| c.count), Some(note_batches(&[1; ROWS], WRITE_BATCH).len()));
+        for timing in [load, write] {
+            let calls = timing.calls.unwrap();
+            assert!(calls.in_sqlite + calls.queued <= timing.elapsed, "{timing}");
+            assert!(timing.slowest.unwrap() <= calls.in_sqlite, "{timing}");
+        }
     }
 
     /// An import's time grows with its rows: twice the notes, of one row each,
