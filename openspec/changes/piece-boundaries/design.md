@@ -71,6 +71,8 @@ En el paso 1 de D2, si hay un inicio de oración en `[s + max - SENTENCE_LOOKBAC
 
 **Techo del retroceso.** Con un retroceso de `L` tokens y un solape de unos 4 (16 caracteres), el paso es de unos `96 - L - 4` tokens. Supera el de D3, de unos 69 tokens, sólo si `L` es menor que unos 23. Si `L` es grande, el brazo deja más filas, no menos. El barrido 4, 8 y 12 queda por debajo, y una aserción de compilación fija `SENTENCE_LOOKBACK_TOKENS + 4 < PIECE_OVERLAP_TOKENS`.
 
+**Resultado: no se adoptó.** Con un retroceso de 4 tokens la importación en seco dejó un 2,1 % menos de filas que U1, y con 12 un 3,8 % menos, los dos por debajo del 5 % de U3. Además, con 4 dos casos `long` perdieron la respuesta en `recall_context`, y con 12 uno la perdió en las dos herramientas. El build de 8 falló por falta de memoria de la máquina y no se repitió, porque quedaba entre dos valores que no cumplen.
+
 **Alternativa descartada:** el solape 0 en fin de oración. Es lo más barato en filas, pero `join_pieces` uniría cada borde con un salto de línea que el texto no tiene, y `read_memory` mostraría un save que no es el que se guardó.
 
 ## D5. Brazo (b): una cabecera más corta
@@ -78,6 +80,8 @@ En el paso 1 de D2, si hay un inicio de oración en `[s + max - SENTENCE_LOOKBAC
 Sólo entra si pasa U4. Es cambiar `SAVE_HEAD_TOKENS` (`chunker/mod.rs:40`). La aserción `SAVE_HEAD_TOKENS + HEAD_JOIN_RESERVE + PIECE_MAX_TOKENS <= CHUNK_MAX_TOKENS` (`:61`) sigue valiendo para todo valor del barrido. La cabecera ya pasa por D2, así que termina en frontera de palabra con cualquier valor.
 
 El ahorro es `48 - H` tokens por cada pieza posterior a la primera, y no hace falta medirlo. Lo que se mide es lo que puede perderse: la clave del save, que la cabecera lleva al vector de cada pieza ([design D1 de long-save-ranking](../archive/2026-10-15-long-save-ranking/design.md#d1-bajar-el-tope-no-cambiar-la-fórmula)). Los casos `long` abren con la clave en la primera oración, y eso favorece a una cabecera corta: el resultado puede sobrestimarla, y `verify.md` lo dice.
+
+**Resultado: se adoptó 32.** Contra U1, 32 no mostró ninguna regresión. Con 24 cayó un caso de 12 de `multi_ref` (no distinguible, y fuera de la definición de regresión de la propuesta), y con 16 un caso `long` perdió la respuesta en las dos herramientas. U4, al pie de la letra, daba 24, la menor cabecera sin regresión. Se tomó 32 por la advertencia de arriba y por ese único retroceso, que aparece justo en 24.
 
 ## D6. La rama de medición
 

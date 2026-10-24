@@ -1,15 +1,15 @@
 change: piece-boundaries
 objective: "1"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done  # the open decisions taken with the exploration's recommendation, except word boundaries from bytes and an overlap at the nearest word start, which replaced the first rule after it failed U2
   spec: done
   design: done
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done  # arm (b) adopted with a head of 32 tokens; arm (a) not adopted
+  verify: in_progress  # Windows done; Linux and CI on the pull request
   archive: pending
 main_spec: openspec/specs/pieces/spec.md
 updated: 2026-10-24

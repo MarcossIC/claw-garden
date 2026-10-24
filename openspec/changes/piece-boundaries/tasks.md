@@ -61,22 +61,22 @@ Mismos requisitos que la tarea 0.
 
 [Design D6](design.md#d6-la-rama-de-medición). Un worktree aparte desde la punta, que se borra con su build al terminar.
 
-- [ ] Brazo (a), TDD: `sentence_starts_marks_a_word_after_a_full_stop_or_a_blank_line`, `a_cut_at_a_sentence_end_keeps_the_shortest_overlap_that_joins` y `the_pieces_cut_at_sentence_ends_join_back_into_their_text` *(subpalabras)*; `sentence_starts` y la regla de D4, con la aserción de compilación del retroceso. Se mide con `SENTENCE_LOOKBACK_TOKENS` en 4, 8 y 12: las corridas de la tarea 7 y la importación en seco, contra U1.
-- [ ] Brazo (b): `SAVE_HEAD_TOKENS` en 32, 24 y 16, con las corridas de `rag-eval` de la tarea 7, contra U1.
-- [ ] Si los dos pasan, la combinación de los valores elegidos se mide una vez más contra U1.
-- [ ] Cada valor se elige leyendo `by_split.calibration` y se informa `by_split.test`.
-- [ ] El brazo que pasa se lleva a la rama del cambio como un commit con sus tests: `perf(chunker): …` para (a) y para (b). El que no pasa no deja código.
+- [x] Brazo (a), TDD: `sentence_starts_marks_a_word_after_a_full_stop_or_a_blank_line`, `a_cut_at_a_sentence_end_keeps_the_shortest_overlap_that_joins` y `the_pieces_cut_at_sentence_ends_join_back_into_their_text` *(subpalabras)*; `sentence_starts` y la regla de D4, con la aserción de compilación del retroceso. Se mide con `SENTENCE_LOOKBACK_TOKENS` en 4, 8 y 12: las corridas de la tarea 7 y la importación en seco, contra U1. Se midieron 4 y 12; el build de 8 falló por falta de memoria de la máquina y no se repitió, porque ni 4 ni 12 cumplen U3. **No se adopta.**
+- [x] Brazo (b): `SAVE_HEAD_TOKENS` en 32, 24 y 16, con las corridas de `rag-eval` de la tarea 7, contra U1. **Se adopta 32.**
+- [x] Si los dos pasan, la combinación de los valores elegidos se mide una vez más contra U1. Pasa uno solo: no hay combinación.
+- [x] Cada valor se elige leyendo `by_split.calibration` y se informa `by_split.test`. Ninguna fila del ancla pasa de una pieza, así que ningún valor la mueve en ninguna de las dos mitades; la elección sale de los casos `long` y del resto del set seed 7.
+- [x] El brazo que pasa se lleva a la rama del cambio como un commit con sus tests: `perf(chunker): …` para (a) y para (b). El que no pasa no deja código. (b) es `perf(chunker): embed each later piece behind a head of 32 tokens`; las ramas de medición y su worktree se borraron.
 
 ## 9. Docs
 
-- [ ] `.claude/CLAUDE.md`: el párrafo de los saves largos dice que los bordes caen en frontera de palabra con el tokenizador cargado, y el brazo adoptado si lo hay.
-- [ ] El mapa de `openspec/README.md`.
+- [x] `.claude/CLAUDE.md`: el párrafo de los saves largos dice que los bordes caen en frontera de palabra con el tokenizador cargado, y el brazo adoptado si lo hay.
+- [x] El mapa de `openspec/README.md`.
 
 ## 10. Verificación
 
-- [ ] Suite y clippy de `.claude/CLAUDE.md` en Linux y en Windows (`target-test`), y el CI en verde.
-- [ ] `verify.md`: el resultado de U0-U4 con las rutas de los JSON fechados, el recuento de filas de cada build, los brazos que no se adoptaron y por qué, y la advertencia de D5 sobre los casos `long`. Sin textos ni ids de filas.
-- [ ] Ningún directorio de build fuera de `target` y `target-test`.
+- [ ] Suite y clippy de `.claude/CLAUDE.md` en Linux y en Windows (`target-test`), y el CI en verde. Windows hecho; Linux y el CI quedan para el pull request.
+- [x] `verify.md`: el resultado de U0-U4 con las rutas de los JSON fechados, el recuento de filas de cada build, los brazos que no se adoptaron y por qué, y la advertencia de D5 sobre los casos `long`. Sin textos ni ids de filas.
+- [x] Ningún directorio de build fuera de `target` y `target-test`.
 
 ## 11. Archive
 

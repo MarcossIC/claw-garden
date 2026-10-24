@@ -48,9 +48,9 @@ Un save largo MUST partirse como dice R2 de `specs/pieces`, con los bordes de R1
 `join_pieces` (`crates/clawg-core/src/memory/pieces.rs:65`) MUST rearmar exactamente el texto de un save partido con esos bordes.
 
 #### Escenario: la cabecera
-- GIVEN un save de 1.200 tokens cuyo token 48 es la continuación de una palabra *(subpalabras)*
+- GIVEN un save de 1.200 tokens de palabras de dos y tres subtokens *(subpalabras)*
 - WHEN se parte para guardarlo
-- THEN la cabecera termina al final de la palabra anterior a esa, y tiene a lo sumo 48 tokens
+- THEN la cabecera son las palabras enteras que caben en los primeros `SAVE_HEAD_TOKENS` tokens, y termina al final de la última de ellas
 
 #### Escenario: el save se lee entero
 - GIVEN un save de 1.200 tokens partido *(subpalabras)*
@@ -95,7 +95,7 @@ Con el `tokenizer.json` del modelo, las piezas de un save largo en inglés y en 
 
 ## R6. Brazos medidos
 
-Cada brazo entra sólo si pasa su umbral (U3 y U4 de la [propuesta](proposal.md#éxito)). Los requisitos de abajo valen sólo para el brazo que entre.
+Cada brazo entra sólo si pasa su umbral (U3 y U4 de la [propuesta](proposal.md#éxito)). Los requisitos de abajo valen sólo para el brazo que entre. **Entró R6b con 32 tokens; R6a no entró** ([verify](verify.md#u3-y-u4-los-brazos)).
 
 **R6a. Menos solape en fin de oración.** Cuando hay un inicio de oración ([design D4](design.md#d4-brazo-a-menos-solape-donde-el-corte-cae-en-fin-de-oración)) a lo sumo `SENTENCE_LOOKBACK_TOKENS` tokens antes del tope, el corte MUST caer en el último de ellos, y la pieza siguiente MUST empezar en la última frontera de palabra que deja al menos `MIN_OVERLAP_CHARS` caracteres de solape. `join_pieces` MUST seguir rearmando el texto exacto.
 
