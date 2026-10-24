@@ -31,8 +31,38 @@ Es `write` con `dry_run` sobre 15.047 notas de una fila en un store vacío, en d
 
 `twice_the_notes_import_in_at_most_three_times_the_time`, en debug y no en release, que pide autorización: 10.000 notas en 3,28 s y 20.000 en 6,32 s, una razón de 1,93, por debajo del tope de 3.
 
+## Windows (2026-10-24)
+
+En `076eeb7`, cuyo `crates/` es el de la cabeza del pull request (`f3d8e62`), pasan la suite (`cargo test --locked --workspace --target-dir target-test`, con `target-test` limpio de los artefactos del workspace) y los dos clippy de `.claude/CLAUDE.md`. Quedan ignorados los dos bancos (`the_socket_is_not_slower_than_tcp` y el de 81) y `the_vectors_are_the_ones_fastembed_gave`, que pide el modelo real.
+
+## CI
+
+El del pull request #88 (cabeza `f3d8e62`) pasó en `ubuntu-latest` y en `windows-latest`.
+
+## Importación real en el perfil de desarrollo (2026-10-24)
+
+Se hizo con autorización explícita y con el método de import-linear. Se usó el binario de depuración de `target-test` en `076eeb7`, con el feature `testing`, y el modelo real. El perfil `dev` corrió en un home temporal (`CLAWG_TEST_HOME`) sobre una **copia** del snapshot `pre-import` del 2026-10-23 y una copia de su modelo, así que de `~/.clawg-dev` sólo se leyó. Por la longitud de esa ruta, el daemon sirvió sólo por TCP. Un `engram export --all` nuevo dio las mismas 3.814 notas y 52.080 filas que el de origen. Se guardó fuera del repositorio y se borró al terminar, junto con el home temporal y la copia del baseline.
+
+Una sonda hizo una ronda por segundo de `/health`, el listado de una fila y una búsqueda, cada una con tope de 15 s, durante las dos corridas en seco y la importación. En la segunda corrida en seco se agregó una sonda densa, sólo de listado: 866 muestras en 68,9 s, con un hueco máximo de 204 ms entre dos. Cualquier retención de la conexión más larga que ese hueco habría quedado atrapada.
+
+| | import-linear | Con este cambio |
+|---|---|---|
+| `--dry-run` | 70 s | 73,5 s y 68,9 s |
+| Espera más larga del listado durante el dry run | 8,8 s, detrás de la pasada de decisión | 19,8 ms (ronda por segundo) y 15,1 ms (sonda densa) |
+| Importación | 1.218 s | 1.362 s |
+| Espera más larga en la importación | listado 1,7 s, búsqueda 1,3 s | listado 298 ms, búsqueda 1,77 s |
+| Filas importadas | 51.996 de 52.080 | 51.996 de 52.080 |
+
+Ninguna petición venció ni respondió algo distinto de 200. Por fase de la importación:
+
+- **Antes de embeber** (los primeros 150 s, con la traducción y la pasada de decisión): el listado esperó a lo sumo 8,8 ms, y `/health` trajo su bloque `ingest` en todas las rondas.
+- **Embebiendo:** el listado esperó a lo sumo 23,7 ms. Las búsquedas de hasta 1,77 s esperan al embedder, no a la conexión: en las mismas rondas, el listado, que no pide un vector, respondió en milisegundos. Es de embed-throughput (85).
+- **Escribiendo** (los últimos 23 s, desde el snapshot `pre-import`): el listado llegó a 298 ms, y una vez `/health` respondió sin su bloque `ingest`, porque el store no contestó dentro de 250 ms. Es la colocación por lote dentro de la transacción que escribe, que este cambio deja fuera.
+
+La importación tardó 144 s más que la de import-linear. El dry run, que hace todo lo que este cambio toca y no embebe, tardó lo mismo, así que la diferencia está en los embeddings y la escritura.
+
+El informe de la importación es idéntico al de los dos dry run, salvo «would import» y la línea del snapshot. Las 51.996 filas importadas son las de la medición de origen, comparadas con su snapshot `pre-move`. Las trece columnas que compara import-linear (agente, proyecto, hash, fecha, estado, tipo, clave, borrado, causa, origen, proyecto de origen, idioma e importancia) dan el mismo SHA-256. Esta vez también dan el mismo los ids, `superseded_by`, `revived_from` y los enlaces de `memory_piece`, y coinciden las piezas (51.068) y los pares (141). Con datos reales, el planificador asigna los mismos ids que la pasada SQL de 0.56.0 (ID2). Sólo difieren los accesos (52.320 contra 52.405), por las búsquedas que recibió cada store.
+
 ## Pendiente
 
-- La suite y clippy en Windows (`target-test`).
-- El CI del pull request en Linux y Windows.
-- **[perfil dev, con autorización]** Una importación real con sondas (`/health`, listado y búsqueda): que la fase de decisión no agote ningún plazo.
+Nada de la verificación. Queda el archivo (tareas, 5).

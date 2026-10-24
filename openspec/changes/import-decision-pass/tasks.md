@@ -31,10 +31,10 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 - [x] Suite y clippy de `.claude/CLAUDE.md` en Linux.
 - [x] El banco de 81 y la espera máxima de la sonda, antes y después, en `verify.md`.
-- [ ] Suite y clippy en Windows (`target-test`).
-- [ ] El CI en verde en Linux y Windows.
-- [ ] **[perfil dev, con autorización]** Una importación real con sondas (`/health`, listado y búsqueda): la fase de decisión no agota ningún plazo.
-- [ ] `verify.md`.
+- [x] Suite y clippy en Windows (`target-test`).
+- [x] El CI en verde en Linux y Windows.
+- [x] **[perfil dev, con autorización]** Una importación real con sondas (`/health`, listado y búsqueda): la fase de decisión no agota ningún plazo.
+- [x] `verify.md`.
 
 ## 5. Archive
 
