@@ -556,6 +556,94 @@ mod tests {
         }
     }
 
+    /// An embedder that keeps every text it is given and embeds it as the
+    /// fake one does.
+    struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for Recorder {
+        async fn embed_with_role(
+            &self,
+            text: &str,
+            role: crate::memory::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            self.0.lock().unwrap().push(text.to_string());
+            crate::memory::embedder::FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "recorder" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    /// A long save cut the way the splitter cut one before it looked for
+    /// word starts: 96 tokens every 72 and a head of the first 48, wherever
+    /// they fall.
+    fn cut_by_token_count(text: &str, tok: &tokenizers::Tokenizer) -> (Vec<String>, String) {
+        let offsets = tok.encode(text, false).expect("the fixture encodes").get_offsets().to_vec();
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        loop {
+            let end = (start + 96).min(offsets.len());
+            pieces.push(text[offsets[start].0..offsets[end - 1].1].to_string());
+            if end == offsets.len() {
+                return (pieces, text[..offsets[47].1].to_string());
+            }
+            start += 72;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_save_cut_inside_words_before_is_still_found_read_and_reembedded() {
+        use crate::memory::chunker::embedding_text;
+        use crate::memory::chunker::token_splitter::tests::{is_word_boundary, piece_ranges, subword_tokenizer, subword_words};
+        use crate::memory::search::{search_all_memories, SearchScope};
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tok = subword_tokenizer();
+        let words = subword_words(680);
+        let old_text = words[..340].join(" ");
+        let (old_pieces, old_head) = cut_by_token_count(&old_text, &tok);
+        let old_refs: Vec<&str> = old_pieces.iter().map(String::as_str).collect();
+        assert!(
+            piece_ranges(&old_text, &old_refs).iter().any(|&(s, _)| !is_word_boundary(&old_text, s)),
+            "some old piece starts inside a word"
+        );
+        assert!(!is_word_boundary(&old_text, old_head.len()), "the old head ends inside a word");
+        let new_text = words[340..].join(" ");
+        let new_split = crate::memory::chunker::ChatChunker::with_tokenizer(tok).split_save(&new_text);
+        let new_pieces: Vec<String> = new_split.pieces.into_iter().map(|c| c.text).collect();
+        let new_head = new_split.head.expect("a long save has a head");
+        assert_eq!((old_pieces.len(), new_pieces.len()), (12, 12), "two saves of 12 pieces");
+
+        let old_ids = store_save(&store, &old_pieces, &old_head, 1).await;
+        let new_ids = store_save(&store, &new_pieces, &new_head, 2).await;
+
+        let mut query = vec![0.0_f32; 384];
+        query[0] = 1.0;
+        let hits = search_all_memories(&store, &query, None, "agent-a", SearchScope::all_default(), 10).await.unwrap();
+        let found: Vec<(i64, i64)> = hits.iter().map(|h| (h.id, h.piece.expect("a linked row").pieces)).collect();
+        assert_eq!(found, vec![(old_ids[0], 12), (new_ids[0], 12)], "one hit per save");
+        for (ids, text) in [(&old_ids, &old_text), (&new_ids, &new_text)] {
+            let save = read_save_core(&store, MemoryKind::Memory, ids[5], Some(&shared("agent-a"))).await.unwrap().unwrap();
+            assert_eq!(&save.text, text, "the save reads back as it was saved");
+        }
+
+        let texts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plan = crate::memory::maintenance::ReInferPlan::new(std::sync::Arc::new(Recorder(texts.clone())));
+        crate::memory::maintenance::reembed_all(&store, crate::memory::maintenance::ReembedMode::ReInfer(plan)).await;
+        let mut embedded = texts.lock().unwrap().clone();
+        let mut expected: Vec<String> = [(&old_pieces, &old_head), (&new_pieces, &new_head)]
+            .into_iter()
+            .flat_map(|(pieces, head)| {
+                pieces.iter().enumerate().map(move |(i, p)| embedding_text(if i == 0 { "" } else { head }, p).into_owned())
+            })
+            .collect();
+        embedded.sort();
+        expected.sort();
+        assert_eq!(embedded, expected, "every piece is embedded again behind the head it was saved with");
+    }
+
     /// A store left by the previous version holds a long save as unrelated
     /// rows. Opening it adds the table and links nothing; every row is still
     /// found, listed, read as a save of one piece and re-embedded from its
@@ -619,22 +707,6 @@ mod tests {
         assert_eq!((save.pieces, save.text.as_str()), (1, pieces[1]), "an unlinked row reads as a save of one piece");
 
         let texts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-        #[async_trait::async_trait]
-        impl Embedder for Recorder {
-            async fn embed_with_role(
-                &self,
-                text: &str,
-                role: EmbedRole,
-            ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
-                self.0.lock().unwrap().push(text.to_string());
-                FakeEmbedder::default().embed_with_role(text, role).await
-            }
-            fn dimensions(&self) -> usize { 384 }
-            fn model_id(&self) -> &str { "recorder" }
-            fn query_prefix(&self) -> &str { "" }
-            fn passage_prefix(&self) -> &str { "" }
-        }
         let plan = crate::memory::maintenance::ReInferPlan::new(std::sync::Arc::new(Recorder(texts.clone())));
         crate::memory::maintenance::reembed_all(&store, crate::memory::maintenance::ReembedMode::ReInfer(plan)).await;
         let texts = texts.lock().unwrap();
