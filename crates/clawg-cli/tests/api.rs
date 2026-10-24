@@ -272,6 +272,7 @@ impl Harness {
                     Arc::new(FakeEmbedder::default()),
                     reload,
                     Some(Duration::from_secs(600)),
+                    None,
                     &tokio::runtime::Handle::current(),
                 );
                 idle.unload().await;

@@ -30,6 +30,12 @@ pub fn sample() -> ProcessSample {
     sample
 }
 
+/// The private memory of this process now, for the log lines that set a step
+/// against what it cost.
+pub fn private_bytes() -> Option<u64> {
+    os_sample().private_bytes
+}
+
 /// The fields of `/proc/self/status` this module uses, in bytes and counts.
 pub fn parse_proc_status(text: &str) -> ProcessSample {
     let mut sample = ProcessSample::default();
