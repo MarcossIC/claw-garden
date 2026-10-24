@@ -3664,9 +3664,11 @@ async fn an_engram_import_stores_notes_and_a_dry_run_reports_the_same() {
     let unmarked = |mut r: Value| {
         r["dry_run"] = Value::Null;
         r["snapshot"] = Value::Null;
+        r["import_id"] = Value::Null;
         r
     };
     assert!(report["snapshot"].is_string(), "{report}");
+    assert_eq!((dry["import_id"].clone(), report["import_id"].clone()), (Value::Null, json!(1)), "only what writes has a number");
     assert_eq!(unmarked(dry), unmarked(report.clone()));
     assert_eq!((report["foreign"]["source"].clone(), report["foreign"]["notes"].clone()), (json!("engram"), json!(2)));
     assert_eq!(report["foreign"]["split_notes"], 1, "{report}");

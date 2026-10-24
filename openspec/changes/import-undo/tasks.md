@@ -12,7 +12,7 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 - [ ] Tests primero (`import.rs`): `an_import_is_numbered_and_journaled`, `a_dry_run_and_an_import_that_adds_nothing_have_no_number`.
 - [ ] `Journal` en `SqlSeat`, `record_projects` y la transacción de los vínculos; `import_id` en `ImportReport`; el registro de imports en curso en `MemoryStore`.
-- [ ] El oráculo de import (`import.rs`, `tests/api.rs`, `tests/binary.rs`) pasa sin editar ninguna aserción.
+- [ ] El oráculo de import (`import.rs`, `tests/api.rs`, `tests/binary.rs`) pasa; sólo cambian las comparaciones entre un dry run y el real, que suman `import_id` a lo que difiere.
 
 ## 3. Deshacer (IU2, IU3, IU4)
 

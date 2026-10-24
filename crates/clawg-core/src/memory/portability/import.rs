@@ -116,6 +116,10 @@ pub struct ImportReport {
     pub dropped_links: Vec<Invalid>,
     /// The `pre-import` snapshot, when one was written.
     pub snapshot: Option<String>,
+    /// The import's number, which `clawg import --undo` takes; `None` on a
+    /// dry run and for an import that wrote nothing.
+    #[serde(default)]
+    pub import_id: Option<i64>,
     /// Inserted rows by the language of their text: `en`, `es` or `und`.
     #[serde(default)]
     pub by_lang: BTreeMap<String, usize>,
@@ -437,6 +441,79 @@ enum Link<'a> {
     Save(&'a [(i64, i64, String)]),
 }
 
+/// What the import wrote so far, logged in the transaction of each write so
+/// that [`super::undo`] can take back what is still as it was left (V26).
+/// Carried from one transaction to the next, as the [`Ledger`] is.
+#[derive(Debug)]
+struct Journal {
+    /// The import's number, which its first write takes.
+    id: Option<i64>,
+    source: &'static str,
+    started_at: i64,
+    snapshot: Option<String>,
+    /// The rows it inserted: what it writes in them goes with them, so only
+    /// what it writes in other rows is an extra.
+    inserted: HashSet<i64>,
+    /// The store's imports in progress, which hold this one's number until
+    /// the journal is dropped.
+    running: Arc<std::sync::Mutex<HashSet<i64>>>,
+}
+
+impl Journal {
+    fn new(store: &MemoryStore, source: &'static str, started_at: i64, snapshot: Option<String>) -> Self {
+        Journal { id: None, source, started_at, snapshot, inserted: HashSet::new(), running: store.importing.clone() }
+    }
+
+    fn number(&mut self, c: &rusqlite::Connection) -> rusqlite::Result<i64> {
+        if let Some(id) = self.id {
+            return Ok(id);
+        }
+        let id: i64 = c.query_row("SELECT COALESCE(MAX(import_id), 0) + 1 FROM memory_import", [], |r| r.get(0))?;
+        c.execute(
+            "INSERT INTO memory_import (import_id, started_at, source, snapshot) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, self.started_at, self.source, self.snapshot],
+        )?;
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+        self.id = Some(id);
+        Ok(id)
+    }
+
+    fn row(&mut self, c: &rusqlite::Connection, id: i64, new: &NewRow<'_>) -> rusqlite::Result<()> {
+        let import_id = self.number(c)?;
+        c.prepare_cached(
+            "INSERT INTO memory_import_row (import_id, row_id, update_count, deleted_at, supersede_cause) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute(rusqlite::params![import_id, id, new.row.src.update_count, new.row.src.deleted_at, new.cause])?;
+        self.inserted.insert(id);
+        Ok(())
+    }
+
+    fn extra(&mut self, c: &rusqlite::Connection, kind: &str, a: Option<i64>, b: &str, value: Option<&str>) -> rusqlite::Result<()> {
+        let import_id = self.number(c)?;
+        c.prepare_cached("INSERT INTO memory_import_extra (import_id, kind, a, b, value) VALUES (?1, ?2, ?3, ?4, ?5)")?
+            .execute(rusqlite::params![import_id, kind, a, b, value])?;
+        Ok(())
+    }
+
+    /// A link written in row `id` where it was empty, unless the import
+    /// inserted that row.
+    fn fill(&mut self, c: &rusqlite::Connection, changed: usize, id: i64, column: &str, value: &str) -> rusqlite::Result<()> {
+        match changed == 1 && !self.inserted.contains(&id) {
+            true => self.extra(c, "fill", Some(id), column, Some(value)),
+            false => Ok(()),
+        }
+    }
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        }
+    }
+}
+
 /// What placing rows reads of the store and writes to it. The rules are
 /// written once over it: [`SqlSeat`] is the transaction that writes, and
 /// [`Planned`] what the pass that only decides loaded of the store, so that
@@ -459,8 +536,8 @@ trait Seat {
     fn link(&mut self, link: Link<'_>) -> Result<(), Self::Error>;
 }
 
-/// The rules over the transaction they write in.
-struct SqlSeat<'t, 'c>(&'t Transaction<'c>);
+/// The rules over the transaction they write in, journaling each write.
+struct SqlSeat<'t, 'c>(&'t Transaction<'c>, &'t mut Journal);
 
 impl Seat for SqlSeat<'_, '_> {
     type Error = rusqlite::Error;
@@ -539,11 +616,27 @@ impl Seat for SqlSeat<'_, '_> {
                 }
             }
         }
+        self.1.row(self.0, id, new)?;
         Ok(id)
     }
 
     fn revise(&mut self, id: i64, by: i64) -> rusqlite::Result<()> {
-        self.0.prepare_cached(REVISED_SQL)?.execute([id, by])?;
+        let before: Option<(String, Option<i64>, Option<String>)> = self
+            .0
+            .query_row("SELECT status, superseded_by, supersede_cause FROM memory WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        if self.0.prepare_cached(REVISED_SQL)?.execute([id, by])? == 1 {
+            let (status, superseded_by, cause) = before.expect("a row that was revised is there");
+            let import_id = self.1.number(self.0)?;
+            self.0.execute(
+                "INSERT INTO memory_import_supersede \
+                 (import_id, row_id, superseded_by, from_status, from_superseded_by, from_cause) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![import_id, id, by, status, superseded_by, cause],
+            )?;
+        }
         Ok(())
     }
 
@@ -552,36 +645,43 @@ impl Seat for SqlSeat<'_, '_> {
     }
 
     fn link(&mut self, link: Link<'_>) -> rusqlite::Result<()> {
-        let tx = self.0;
+        let (tx, journal) = (self.0, &mut *self.1);
         match link {
             Link::SupersededBy { id, by } => {
-                tx.execute(
+                let changed = tx.execute(
                     "UPDATE memory SET superseded_by = ?2 WHERE id = ?1 AND superseded_by IS NULL AND status = 'superseded'",
                     [id, by],
                 )?;
+                journal.fill(tx, changed, id, "superseded_by", &by.to_string())?;
             }
             Link::RevivedFrom { id, from } => {
-                tx.execute("UPDATE memory SET revived_from = ?2 WHERE id = ?1 AND revived_from IS NULL", [id, from])?;
+                let changed =
+                    tx.execute("UPDATE memory SET revived_from = ?2 WHERE id = ?1 AND revived_from IS NULL", [id, from])?;
+                journal.fill(tx, changed, id, "revived_from", &from.to_string())?;
             }
             Link::DisputedAgainst { id, against } => {
                 let list = serde_json::to_string(against).expect("Vec<i64> serialises infallibly");
-                tx.execute(
+                let changed = tx.execute(
                     "UPDATE memory SET disputed_against = ?2 WHERE id = ?1 AND disputed_against IS NULL AND status = 'disputed'",
                     rusqlite::params![id, list],
                 )?;
+                journal.fill(tx, changed, id, "disputed_against", &list)?;
             }
             Link::Undisputed(id) => {
                 tx.execute("UPDATE memory SET status = 'active' WHERE id = ?1 AND status = 'disputed'", [id])?;
             }
             Link::Derivation { memory, source, created_at } => {
-                tx.execute(
+                let changed = tx.execute(
                     "INSERT OR IGNORE INTO memory_derivation (memory_id, source_id, created_at) VALUES (?1, ?2, ?3)",
                     [memory, source, created_at],
                 )?;
+                if changed == 1 && !journal.inserted.contains(&memory) {
+                    journal.extra(tx, "derivation", Some(memory), &source.to_string(), None)?;
+                }
             }
             Link::Conflict { new_id, old_id, pair } => {
                 let reason = pair.reason.as_deref().map(|r| redact(r).text);
-                tx.execute(
+                let changed = tx.execute(
                     "INSERT OR IGNORE INTO memory_conflict \
                      (new_id, old_id, distance, state, verdict, reason, created_at, judged_at, topic_key_warned) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -597,6 +697,10 @@ impl Seat for SqlSeat<'_, '_> {
                         pair.topic_key_warned
                     ],
                 )?;
+                if changed == 1 {
+                    let written = serde_json::json!([pair.state, pair.verdict]).to_string();
+                    journal.extra(tx, "pair", Some(new_id), &old_id.to_string(), Some(&written))?;
+                }
             }
             Link::Save(pieces) => {
                 if pieces.is_empty() {
@@ -604,10 +708,13 @@ impl Seat for SqlSeat<'_, '_> {
                 }
                 let save_id: i64 = tx.query_row(NEXT_SAVE_SQL, [], |r| r.get(0))?;
                 for (piece, id, context) in pieces {
-                    tx.execute(
+                    let changed = tx.execute(
                         "INSERT OR IGNORE INTO memory_piece (save_id, piece, memory_id, context) VALUES (?1, ?2, ?3, ?4)",
                         rusqlite::params![save_id, piece, id, context],
                     )?;
+                    if changed == 1 && !journal.inserted.contains(id) {
+                        journal.extra(tx, "piece", Some(save_id), &piece.to_string(), None)?;
+                    }
                 }
             }
         }
@@ -1045,8 +1152,14 @@ fn taken_projects<'p>(
     (taken, remotes)
 }
 
-/// Records each project, and returns [`taken_projects`].
-fn record_projects(tx: &Transaction<'_>, projects: &[ProjectHere], now: i64) -> rusqlite::Result<HashMap<String, String>> {
+/// Records each project, journaling the ones it adds, and returns
+/// [`taken_projects`].
+fn record_projects(
+    tx: &Transaction<'_>,
+    projects: &[ProjectHere],
+    now: i64,
+    journal: &mut Journal,
+) -> rusqlite::Result<HashMap<String, String>> {
     let mut roots = HashMap::new();
     for p in projects {
         let root: Option<String> = tx.prepare_cached(PROJECT_ROOT_SQL)?.query_row([&p.root_id], |r| r.get(0)).optional()?;
@@ -1056,16 +1169,22 @@ fn record_projects(tx: &Transaction<'_>, projects: &[ProjectHere], now: i64) -> 
     }
     let (taken, remotes) = taken_projects(projects, &mut roots);
     for p in projects {
-        tx.execute(
+        let added = tx.execute(
             "INSERT OR IGNORE INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, 0)",
             rusqlite::params![p.root_id, p.root, now],
         )?;
+        if added == 1 {
+            journal.extra(tx, "project", None, &p.root_id, None)?;
+        }
     }
     for p in remotes {
-        tx.execute(
+        let added = tx.execute(
             "INSERT OR IGNORE INTO project_remote (remote, project_id, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![p.remote, p.project_id, now],
         )?;
+        if let (1, Some(remote)) = (added, &p.remote) {
+            journal.extra(tx, "remote", None, remote, None)?;
+        }
     }
     Ok(taken)
 }
@@ -1330,8 +1449,8 @@ pub async fn import(
     options: &ImportOptions,
 ) -> Result<ImportReport, ImportError> {
     let prepared = prepare_file(store, text, options).await?;
-    let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
-    Ok(report(&prepared, &ledger, options.dry_run, snapshot))
+    let written = write(store, embedder, backups, &prepared, options.dry_run, "clawg").await?;
+    Ok(report(&prepared, &written, options.dry_run))
 }
 
 /// A clawg export, worked out against the ids its roots would get here.
@@ -1355,9 +1474,10 @@ pub async fn import_foreign(
     export: ForeignExport,
     options: &ImportOptions,
 ) -> Result<ImportReport, ImportError> {
+    let source = export.source;
     let (prepared, foreign) = prepare_export(store, chunker, export, options).await?;
-    let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
-    Ok(with_foreign(report(&prepared, &ledger, options.dry_run, snapshot), foreign, &prepared.notes, &ledger))
+    let written = write(store, embedder, backups, &prepared, options.dry_run, source).await?;
+    Ok(with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger))
 }
 
 /// Another tool's export translated into rows, with what the translation
@@ -1416,16 +1536,26 @@ fn note_batches(units: &[usize], limit: usize) -> Vec<Range<usize>> {
     batches
 }
 
+/// Where every row went, and what the writing left behind.
+struct Written {
+    ledger: Ledger,
+    /// The `pre-import` snapshot.
+    snapshot: Option<String>,
+    /// The import's number in `memory_import`, when it wrote anything.
+    import_id: Option<i64>,
+}
+
 /// Places every row and link of `prepared` and, unless this is a dry run,
 /// embeds the rows to insert and writes them after a `pre-import` snapshot,
-/// whose path it returns.
+/// journaled as an import from `source`.
 async fn write(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
     backups: &Path,
     prepared: &Arc<Prepared>,
     dry_run: bool,
-) -> Result<(Ledger, Option<String>), ImportError> {
+    source: &'static str,
+) -> Result<Written, ImportError> {
     let now = TimestampMs::now().as_millis_i64();
     let planned = load(store, prepared).await?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -1437,7 +1567,7 @@ async fn write(
         .ok_or_else(|| MemoryError::Internal("the import was stopped".to_owned()))?;
 
     if dry_run {
-        return Ok((decided, None));
+        return Ok(Written { ledger: decided, snapshot: None, import_id: None });
     }
     let embedder = embedder.ok_or(ImportError::NoEmbedder)?;
 
@@ -1456,10 +1586,13 @@ async fn write(
         }
     }
 
-    let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreImport).await?;
+    let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreImport).await?.display().to_string();
 
     let vectors = Arc::new(vectors);
     let mut ledger = Ledger::default();
+    // A transaction a cut leaves unwritten journals nothing, and the number
+    // is the first write's, so an import that adds nothing has none.
+    let mut journal = Journal::new(store, source, now, Some(snapshot.clone()));
     let mut batches = note_batches(&prepared.units(), WRITE_BATCH);
     if batches.is_empty() {
         // The projects are recorded even when there is no row.
@@ -1468,41 +1601,50 @@ async fn write(
     for (k, range) in batches.into_iter().enumerate() {
         let (batch, vectors) = (prepared.clone(), vectors.clone());
         let mut placed = std::mem::take(&mut ledger);
-        ledger = store
+        let mut logged = journal;
+        (ledger, journal) = store
             .conn
-            .call(move |c| -> rusqlite::Result<Ledger> {
+            .call(move |c| -> rusqlite::Result<(Ledger, Journal)> {
                 let tx = c.transaction()?;
                 if k == 0 {
-                    placed.taken = record_projects(&tx, &batch.projects, now)?;
+                    placed.taken = record_projects(&tx, &batch.projects, now, &mut logged)?;
                 }
-                place_rows(&mut SqlSeat(&tx), &batch, range, &mut placed, &vectors, true)?;
+                place_rows(&mut SqlSeat(&tx, &mut logged), &batch, range, &mut placed, &vectors, true)?;
                 tx.commit()?;
-                Ok(placed)
+                Ok((placed, logged))
             })
             .await
             .map_err(MemoryError::Connection)?;
     }
     let links = prepared.clone();
-    let ledger = store
+    let (ledger, journal) = store
         .conn
-        .call(move |c| -> rusqlite::Result<Ledger> {
+        .call(move |c| -> rusqlite::Result<(Ledger, Journal)> {
             let tx = c.transaction()?;
-            write_links(&mut SqlSeat(&tx), &links, &mut ledger)?;
+            write_links(&mut SqlSeat(&tx, &mut journal), &links, &mut ledger)?;
+            if let Some(id) = journal.id {
+                tx.execute(
+                    "UPDATE memory_import SET finished_at = ?2 WHERE import_id = ?1",
+                    [id, TimestampMs::now().as_millis_i64()],
+                )?;
+            }
             tx.commit()?;
-            Ok(ledger)
+            Ok((ledger, journal))
         })
         .await
         .map_err(MemoryError::Connection)?;
 
-    Ok((ledger, Some(snapshot.display().to_string())))
+    Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id })
 }
 
-fn report(prepared: &Prepared, ledger: &Ledger, dry_run: bool, snapshot: Option<String>) -> ImportReport {
+fn report(prepared: &Prepared, written: &Written, dry_run: bool) -> ImportReport {
+    let ledger = &written.ledger;
     let mut report = ImportReport {
         dry_run,
         rows: prepared.rows.len(),
         invalid: prepared.parsed.invalid.clone(),
-        snapshot,
+        snapshot: written.snapshot.clone(),
+        import_id: written.import_id,
         ..Default::default()
     };
     report.invalid.extend(ledger.invalid.iter().cloned());
@@ -1855,7 +1997,64 @@ mod tests {
         assert_eq!(count(&dst, sequence).await, before);
         assert!(files_in(backups.path()).is_empty());
         let (real, _) = run(&dst, &file, ImportOptions::default()).await;
-        assert_eq!(ImportReport { dry_run: false, snapshot: real.snapshot.clone(), ..dry }, real);
+        assert_eq!(ImportReport { dry_run: false, snapshot: real.snapshot.clone(), import_id: real.import_id, ..dry }, real);
+    }
+
+    /// The journal of import `id`: its header (source, snapshot, finished),
+    /// the rows it inserted and its extras by kind.
+    async fn journal_of(store: &MemoryStore, id: i64) -> (Option<(String, Option<String>, bool)>, Vec<i64>, BTreeMap<String, usize>) {
+        store
+            .conn
+            .call(move |c| {
+                let header = c
+                    .query_row(
+                        "SELECT source, snapshot, finished_at IS NOT NULL FROM memory_import WHERE import_id = ?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let mut stmt = c.prepare("SELECT row_id FROM memory_import_row WHERE import_id = ?1 ORDER BY row_id")?;
+                let rows = stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+                let mut stmt = c.prepare("SELECT kind, COUNT(*) FROM memory_import_extra WHERE import_id = ?1 GROUP BY kind")?;
+                let extras = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+                Ok::<_, rusqlite::Error>((header, rows, extras))
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_import_is_numbered_and_journaled() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+        assert_eq!(report.import_id, Some(1), "{report:#?}");
+        let (header, rows, extras) = journal_of(&dst, 1).await;
+        assert_eq!(header, Some(("clawg".to_owned(), report.snapshot.clone(), true)));
+        let inserted: Vec<i64> = dump(&dst, EVERYTHING).await.memories.iter().map(|m| m.id).filter(|id| *id > 1).collect();
+        assert_eq!((rows.len(), &rows), (17, &inserted), "every inserted row, and only those");
+        let pairs = dump(&dst, EVERYTHING).await.conflicts.len();
+        assert_eq!(extras, BTreeMap::from([("pair".to_owned(), pairs), ("project".to_owned(), 2)]), "the links of its own rows go with them");
+
+        let (foreign, _) = run_foreign(&dst, sample_notes(), ImportOptions::default()).await;
+        assert_eq!(foreign.import_id, Some(2));
+        let (header, rows, _) = journal_of(&dst, 2).await;
+        assert_eq!(header.map(|h| h.0), Some("engram".to_owned()));
+        assert_eq!(rows.len(), foreign.inserted);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_and_an_import_that_adds_nothing_have_no_number() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        let backups = tempfile::tempdir().unwrap();
+        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }).await.unwrap();
+        assert_eq!(dry.import_id, None);
+        assert_eq!(count(&dst, "SELECT count(*) FROM memory_import").await, 0);
+        let (first, _) = run(&dst, &file, ImportOptions::default()).await;
+        let (again, _) = run(&dst, &file, ImportOptions::default()).await;
+        assert_eq!((first.import_id, again.import_id), (Some(1), None), "{again:#?}");
+        assert_eq!(count(&dst, "SELECT count(*) FROM memory_import").await, 1);
     }
 
     #[tokio::test]
@@ -2317,7 +2516,7 @@ mod tests {
         let dry = import_foreign(&dst, None, chunker, backups.path(), foreign_export(notes.clone()), &dry_run).await.unwrap();
         assert!(files_in(backups.path()).is_empty());
         let (report, _) = run_foreign(&dst, notes, ImportOptions::default()).await;
-        assert_eq!(ImportReport { dry_run: false, snapshot: report.snapshot.clone(), ..dry }, report);
+        assert_eq!(ImportReport { dry_run: false, snapshot: report.snapshot.clone(), import_id: report.import_id, ..dry }, report);
 
         let saved = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let event = MemoryEvent {
@@ -2926,9 +3125,10 @@ mod tests {
             .conn
             .call(move |c| -> rusqlite::Result<Ledger> {
                 let tx = c.transaction()?;
-                let mut ledger = Ledger { taken: record_projects(&tx, &prepared.projects, 0)?, ..Default::default() };
-                place_rows(&mut SqlSeat(&tx), &prepared, 0..prepared.rows.len(), &mut ledger, &HashMap::new(), false)?;
-                write_links(&mut SqlSeat(&tx), &prepared, &mut ledger)?;
+                let mut journal = Journal { id: None, source: "clawg", started_at: 0, snapshot: None, inserted: HashSet::new(), running: Arc::default() };
+                let mut ledger = Ledger { taken: record_projects(&tx, &prepared.projects, 0, &mut journal)?, ..Default::default() };
+                place_rows(&mut SqlSeat(&tx, &mut journal), &prepared, 0..prepared.rows.len(), &mut ledger, &HashMap::new(), false)?;
+                write_links(&mut SqlSeat(&tx, &mut journal), &prepared, &mut ledger)?;
                 Ok(ledger)
             })
             .await
@@ -3073,7 +3273,7 @@ mod tests {
         let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }).await.unwrap();
         assert!(dry.topic_taken.iter().all(|t| t.stored_as > purged) && !dry.topic_taken.is_empty(), "{dry:#?}");
         let (real, _) = run(&dst, &file, ImportOptions::default()).await;
-        assert_eq!(ImportReport { dry_run: false, snapshot: real.snapshot.clone(), ..dry }, real);
+        assert_eq!(ImportReport { dry_run: false, snapshot: real.snapshot.clone(), import_id: real.import_id, ..dry }, real);
     }
 
     /// An import's time grows with its rows: twice the notes, of one row each,
@@ -3090,7 +3290,7 @@ mod tests {
             let elapsed = started.elapsed();
             // The snapshot's path carries the time it was written; without it
             // the report's hash is the same in every run that imports alike.
-            let report = ImportReport { snapshot: None, ..report };
+            let report = ImportReport { snapshot: None, import_id: None, ..report };
             println!("{count} notes in {elapsed:?}, report {}", content_hash(&serde_json::to_string(&report).unwrap()));
             (elapsed, report)
         }
