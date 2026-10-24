@@ -1,16 +1,17 @@
 # portability — Especificación
 
-Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`, también desde el export de otra herramienta de memoria (HI4 a HI18), cómo escala la importación (IL1 e IL5), cómo decide sin ocupar la conexión del store (ID1 a ID3) y cómo se deshace un import sin perder lo guardado después (IU1 a IU5). Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
+Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`, también desde el export de otra herramienta de memoria (HI4 a HI18), cómo escala la importación (IL1 e IL5), cómo decide sin ocupar la conexión del store (ID1 a ID3), cómo se deshace un import sin perder lo guardado después (IU1 a IU5) y qué deja en el log cada fase de una importación (IT1 a IT4). Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
 
-**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6). [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó el idioma de los informes de `export` e `import` (CL3). [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24, sumó el proyecto de origen al formato (HI2) y el import desde otra herramienta (HI4 a HI18); su V23 está en [`specs/storage`](../storage/spec.md) y el filtro `--origin-project` en [`specs/project`](../project/spec.md) (HI3). [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24, sumó que cada búsqueda de la importación llega a sus filas por índice (IL1) y que su tiempo crece con sus filas (IL5); su V25 está en [`specs/storage`](../storage/spec.md) (IL2 e IL3). [import-decision-pass](../../changes/archive/2026-10-24-import-decision-pass/proposal.md), archivado el 2026-10-24, sumó que la pasada de decisión no ocupa la conexión (ID1), que decide lo mismo que la pasada SQL (ID2) y que deja de planificar cuando se suelta el import (ID3), y llevó a la tabla de IL1 las consultas de su carga (ID4). [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24, sumó el número y el diario de cada import (IU1), `clawg import --undo N` (IU2 a IU4) y sus puertas en el daemon y el CLI (IU5); su V26 está en [`specs/storage`](../storage/spec.md) (IU6).
+**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6). [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó el idioma de los informes de `export` e `import` (CL3). [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24, sumó el proyecto de origen al formato (HI2) y el import desde otra herramienta (HI4 a HI18); su V23 está en [`specs/storage`](../storage/spec.md) y el filtro `--origin-project` en [`specs/project`](../project/spec.md) (HI3). [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24, sumó que cada búsqueda de la importación llega a sus filas por índice (IL1) y que su tiempo crece con sus filas (IL5); su V25 está en [`specs/storage`](../storage/spec.md) (IL2 e IL3). [import-decision-pass](../../changes/archive/2026-10-24-import-decision-pass/proposal.md), archivado el 2026-10-24, sumó que la pasada de decisión no ocupa la conexión (ID1), que decide lo mismo que la pasada SQL (ID2) y que deja de planificar cuando se suelta el import (ID3), y llevó a la tabla de IL1 las consultas de su carga (ID4). [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24, sumó el número y el diario de cada import (IU1), `clawg import --undo N` (IU2 a IU4) y sus puertas en el daemon y el CLI (IU5); su V26 está en [`specs/storage`](../storage/spec.md) (IU6). [import-timing](../../changes/archive/2026-10-24-import-timing/proposal.md), archivado el 2026-10-24, sumó la línea de log de cada fase de una importación (IT1), el tiempo en SQLite y en la cola de las fases que usan la conexión (IT2), el resumen (IT3) y que medir no cambia la importación (IT4).
 
 ## Dónde está
 
 - El formato: `FORMAT` y `VERSION` (`crates/clawg-core/src/memory/portability/format.rs:14-16`), las líneas (`format.rs:19-140`), `parse` (`format.rs:176`), las comprobaciones de una fila y de un par (`check_memory`, `format.rs:229`; `check_conflict`, `format.rs:262`) y `render` (`format.rs:278`).
 - El export: `export` y `read` (`crates/clawg-core/src/memory/portability/export.rs:68` y `export.rs:80`); la vista, `markdown::render` (`crates/clawg-core/src/memory/portability/markdown.rs:12`); el comando, `run` y `write_new` (`crates/clawg-cli/src/export.rs:16` y `export.rs:31`).
-- El import: `MAX_IMPORT_BYTES` (`crates/clawg-core/src/memory/portability/import.rs:55`), `prepare` (`import.rs:259`), el asiento sobre el que se escriben las reglas que colocan cada fila (`Seat`, `import.rs:521`) y sus dos implementaciones, la transacción (`SqlSeat`, `import.rs:540`) y el planificador (`Planned`, `import.rs:808`), qué es la misma fila (`PRESENT_SQL`, `TWIN_SQL`, `TOPIC_HOLDERS_SQL`, `import.rs:1100-1115`), `record_projects` (`import.rs:1157`, con su parte pura, `taken_projects`, `import.rs:1136`), `place` (`import.rs:1196`), `write_links` (`import.rs:1320`), la carga de la pasada de decisión (`LOAD_BATCH`, `import.rs:728`; `ORIGIN_ROWS_SQL`, `TEXT_ROWS_SQL` y `KEY_ROWS_SQL`, `import.rs:741-746`; `PROJECT_ROOT_SQL`, `import.rs:1130`; `load`, `import.rs:926`) y la decisión (`decide`, `import.rs:1010`), las tres pasadas (`import`, `import.rs:1444`, y `write`, `import.rs:1551`), el de otra fuente (`import_foreign`, `import.rs:1469`; las transacciones por nota, `note_batches`, `import.rs:1523`) y el reporte (`import.rs:1640`); la ruta, `import_memories` (`crates/clawg-cli/src/daemon/api.rs:1895`, con su tope de cuerpo en `api.rs:1867`); el comando, `run` y `render` (`crates/clawg-cli/src/import.rs:42` y `import.rs:76`).
-- El diario: `Journal` (`import.rs:448`), que escribe cada transacción de `SqlSeat` y de `record_projects` y que `write` cierra con `finished_at` (`import.rs:1627`), y los imports en curso del proceso (`MemoryStore::importing`, `crates/clawg-core/src/memory/db.rs:171`).
-- El deshacer: `undo_import` (`crates/clawg-core/src/memory/portability/undo.rs:805`), la carga (`load`, `undo.rs:547`; `LOAD_BATCH` y `WRITE_BATCH`, `undo.rs:30-32`), la decisión pura (`decide`, `undo.rs:284`), lo que borra una fila (`REMOVE_SQL` y `remove_in`, `undo.rs:710` y `undo.rs:723`), lo que devuelve en las demás (`restore_in` y `take_back_in`, `undo.rs:730` y `undo.rs:742`) y el reporte (`UndoReport`, `undo.rs:60`); la ruta, `undo_import` (`crates/clawg-cli/src/daemon/api.rs:1966`); el comando, `undo` y `render_undo` (`crates/clawg-cli/src/import.rs:187` y `import.rs:197`).
+- El import: `MAX_IMPORT_BYTES` (`crates/clawg-core/src/memory/portability/import.rs:60`), `prepare` (`import.rs:292`), el asiento sobre el que se escriben las reglas que colocan cada fila (`Seat`, `import.rs:554`) y sus dos implementaciones, la transacción (`SqlSeat`, `import.rs:573`) y el planificador (`Planned`, `import.rs:841`), qué es la misma fila (`PRESENT_SQL`, `TWIN_SQL`, `TOPIC_HOLDERS_SQL`, `import.rs:1130-1145`), `record_projects` (`import.rs:1187`, con su parte pura, `taken_projects`, `import.rs:1166`), `place` (`import.rs:1226`), `write_links` (`import.rs:1350`), la carga de la pasada de decisión (`LOAD_BATCH`, `import.rs:761`; `ORIGIN_ROWS_SQL`, `TEXT_ROWS_SQL` y `KEY_ROWS_SQL`, `import.rs:774-779`; `PROJECT_ROOT_SQL`, `import.rs:1160`; `load`, `import.rs:961`) y la decisión (`decide`, `import.rs:1040`), las tres pasadas (`import`, `import.rs:1474`, y `write`, `import.rs:1600`), el de otra fuente (`import_foreign`, `import.rs:1514`; las transacciones por nota, `note_batches`, `import.rs:1572`) y el reporte (`import.rs:1697`); la ruta, `import_memories` (`crates/clawg-cli/src/daemon/api.rs:1896`, con su tope de cuerpo en `api.rs:1868`); el comando, `run` y `render` (`crates/clawg-cli/src/import.rs:42` y `import.rs:76`).
+- Lo que registra: las fases (`Step`, `crates/clawg-core/src/memory/portability/timing.rs:11`), una fase con sus llamadas (`Timing`, `timing.rs:62`), las de un import, que `record` registra al terminar cada una y `finish` cierra con el resumen (`ImportTimings`, `timing.rs:132`; `Summary`, `timing.rs:165`), y el ayudante que mide cada llamada a la conexión dentro y fuera de su clausura (`timed`, `import.rs:249`); `read` y el resumen, en `import_memories`.
+- El diario: `Journal` (`import.rs:481`), que escribe cada transacción de `SqlSeat` y de `record_projects` y que `write` cierra con `finished_at` (`import.rs:1686`), y los imports en curso del proceso (`MemoryStore::importing`, `crates/clawg-core/src/memory/db.rs:171`).
+- El deshacer: `undo_import` (`crates/clawg-core/src/memory/portability/undo.rs:805`), la carga (`load`, `undo.rs:547`; `LOAD_BATCH` y `WRITE_BATCH`, `undo.rs:30-32`), la decisión pura (`decide`, `undo.rs:284`), lo que borra una fila (`REMOVE_SQL` y `remove_in`, `undo.rs:710` y `undo.rs:723`), lo que devuelve en las demás (`restore_in` y `take_back_in`, `undo.rs:730` y `undo.rs:742`) y el reporte (`UndoReport`, `undo.rs:60`); la ruta, `undo_import` (`crates/clawg-cli/src/daemon/api.rs:1973`); el comando, `undo` y `render_undo` (`crates/clawg-cli/src/import.rs:187` y `import.rs:197`).
 - Otra fuente: el modelo común (`ForeignExport`, `ForeignNote`, `ForeignRelation`, `crates/clawg-core/src/memory/portability/foreign.rs:12-72`), el adaptador de engram (`read`, `crates/clawg-core/src/memory/portability/engram.rs:22`) y la traducción a filas (`translate` y `rewrite_key`, `crates/clawg-core/src/memory/portability/translate.rs:307` y `translate.rs:502`).
 - Los snapshots: `Reason::PreImport`, `pre-import`, y `Reason::PreUndo`, `pre-undo`, podados con los demás automáticos (`crates/clawg-core/src/memory/backup.rs`).
 
@@ -541,3 +542,70 @@ Un `import_id` sin cabecera MUST ser `UnknownImport` (`404`); un import que este
 `POST /v1/import/undo` (`import_id`, `dry_run`) MUST responder el `UndoReport` sin pedir el embedder. `clawg import --undo N [--dry-run]` MUST mandarlo y decir lo que hizo en el idioma de la preferencia; `--undo` MUST NOT aceptar un archivo, `--from`, `--agent`, `--map-root` ni `--project-map`, y `clawg import` sin archivo ni `--undo` MUST ser un error de uso. La salida de un import con número MUST nombrar el comando que lo deshace.
 
 **Tests:** `import_takes_a_file_or_an_undo` (`crates/clawg-cli/src/cli.rs`); `render_undo_names_what_it_took_back_and_what_stayed`, `the_undo_report_speaks_spanish` e `import_report_lists_counts_and_invalid_lines`, con el deshacer contra un daemon de prueba (`crates/clawg-cli/src/import.rs`); `an_import_is_undone_by_its_number` (`crates/clawg-cli/tests/api.rs`), también sin embedder.
+
+## IT1. Cada fase de una importación se registra al terminar
+
+Una importación MUST registrar cada fase que corre al terminarla, una vez y en el orden en que corre, con una línea de `info` en el log del daemon (`import: <fase> …`). Las fases son:
+
+| Fase | Qué mide | Detalle |
+|---|---|---|
+| `read` | el handler lee el archivo (`format::parse` o `engram::read`) | — |
+| `plan` | los ids que daría el registro de cada raíz | llamadas |
+| `prepare` | export de clawg: analizar, enmascarar y armar las filas | filas |
+| `translate` | export de otra herramienta: traducir las notas y armar las filas | filas |
+| `load` | lo que la pasada de decisión lee del store | filas leídas, llamadas |
+| `decide` | la pasada de decisión | filas |
+| `embed` | los vectores de las filas a insertar | filas, tandas, filas/s, la tanda más lenta |
+| `snapshot` | el snapshot `pre-import` | — |
+| `write` | los lotes de escritura | filas, llamadas |
+| `links` | los vínculos y el cierre del diario | llamadas |
+
+Un export de clawg se analiza antes de `plan` y se arma después; las dos partes suman en `prepare`, que se registra una vez, después de `plan`. Un dry run MUST terminar en `decide`. Ninguna línea MUST llevar texto de una fila, un id, una clave ni una ruta. Una importación que falla deja las líneas de las fases que terminó.
+
+#### Escenario: una importación real de otra herramienta
+- GIVEN un store y las notas de muestra de otra herramienta
+- WHEN se importan con `FakeEmbedder`
+- THEN quedan registradas `plan`, `translate`, `load`, `decide`, `embed`, `snapshot`, `write` y `links`, una vez cada una y en ese orden
+- AND las filas de `embed` son las insertadas no borradas del reporte
+- AND las llamadas de `write` son los lotes de `note_batches`
+
+#### Escenario: un export de clawg
+- GIVEN el export del store de prueba
+- WHEN se importa
+- THEN las fases son `plan`, `prepare`, `load`, `decide`, `embed`, `snapshot`, `write` y `links`
+
+#### Escenario: un dry run
+- GIVEN las mismas notas
+- WHEN corre `--dry-run`
+- THEN las fases son `plan`, `translate`, `load` y `decide`
+
+**Tests:** `an_import_times_each_step_once_in_order`, `a_clawg_file_is_prepared_rather_than_translated` y `a_dry_run_times_only_what_it_runs` (`crates/clawg-core/src/memory/portability/import.rs`).
+
+## IT2. La conexión: SQLite y la cola por separado
+
+En cada fase que usa la conexión del store (`plan`, `load`, `write`, `links`), la línea MUST contar las llamadas y separar el tiempo dentro de la clausura (`in sqlite`) de lo que falta hasta que vuelve la llamada (`queued`). También MUST nombrar la llamada que más tiempo tuvo la conexión. La suma de los dos tiempos MUST NOT superar la duración de la fase. `load` MUST hacer una llamada por cada `LOAD_BATCH` búsquedas de cada conjunto, más la de las raíces. `snapshot` abre una conexión propia en un hilo bloqueante, así que sólo lleva su duración.
+
+#### Escenario: las llamadas de `load`
+- GIVEN un store vacío y un export de clawg de 600 filas de textos distintos, sin clave y sin origen
+- WHEN se importa
+- THEN `load` hace 4 llamadas (3 de textos y 1 de las raíces)
+- AND en `load` y en `write`, `in sqlite` + `queued` ≤ la duración
+
+**Tests:** `time_in_sqlite_never_exceeds_the_call` (`import.rs`).
+
+## IT3. El resumen
+
+Al terminar una importación con éxito, el daemon MUST registrar una línea con el total desde que el handler la empezó y la duración de cada fase en el orden de IT1, en segundos con un decimal (`import: done in …`). Un dry run MUST decirlo en esa línea (`import: dry run done in …`). Una importación que falla no tiene resumen.
+
+#### Escenario: el texto
+- GIVEN una estructura armada a mano con las fases de una importación real
+- WHEN se formatean una fase y el resumen
+- THEN dan, por ejemplo, `load 3.1 s (812 rows, 5 calls, 2.6 s in sqlite, 0.5 s queued, slowest 41 ms)` e `import: done in 1362.4 s: read 1.8, …, links 0.4`
+
+**Tests:** `a_step_reads_as_its_numbers` y `the_summary_names_every_step` (`crates/clawg-core/src/memory/portability/timing.rs`).
+
+## IT4. Medir no cambia la importación
+
+Ni lo que una importación escribe ni su reporte MUST cambiar. Los tiempos van al log y no al reporte, porque la paridad entre el dry run y el real (R7) no admite un valor que cambia en cada corrida.
+
+**Tests:** las pruebas de import de `import.rs`, `undo.rs`, `crates/clawg-cli/tests/api.rs` y `crates/clawg-cli/tests/binary.rs`, sin cambiar ninguna aserción.

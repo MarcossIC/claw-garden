@@ -22,10 +22,10 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 ## 4. Verificación
 
 - [x] Suite y clippy de `.claude/CLAUDE.md` en Linux.
-- [ ] El CI en verde en Linux y Windows.
-- [ ] **[perfil dev, modelo real, con autorización]** Una importación real: la suma de las fases cierra contra el tiempo del cliente con un resto menor al 1 %.
+- [x] El CI en verde en Linux y Windows.
+- [x] **[perfil dev, modelo real, con autorización]** Una importación real: la suma de las fases cierra contra el tiempo del cliente con un resto menor al 1 %. Resto de 0,03 % en la real y de 0,78 % en el dry run ([verify](verify.md#la-importación-real-en-el-perfil-dev-windows-2026-10-24)).
 - [x] `verify.md`.
 
 ## 5. Archive
 
-- [ ] `specs/portability` con IT1 a IT4; `git mv` a `changes/archive/<fecha>-import-timing`; `state.yaml` archivado; la fila 88 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/portability` con IT1 a IT4; `git mv` a `changes/archive/2026-10-24-import-timing`; `state.yaml` archivado; la fila 88 y el orden de ejecución del `README.md` de openspec; subir el minor. También se realinearon las citas de `import.rs` y `api.rs` en «Dónde está» ([verify](verify.md#al-archivar-2026-10-24)).
