@@ -1,14 +1,14 @@
 # portability — Especificación
 
-Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`, también desde el export de otra herramienta de memoria (HI4 a HI18), y cómo escala la importación (IL1 e IL5). Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
+Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`, también desde el export de otra herramienta de memoria (HI4 a HI18), cómo escala la importación (IL1 e IL5) y cómo decide sin ocupar la conexión del store (ID1 a ID3). Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
 
-**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6). [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó el idioma de los informes de `export` e `import` (CL3). [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24, sumó el proyecto de origen al formato (HI2) y el import desde otra herramienta (HI4 a HI18); su V23 está en [`specs/storage`](../storage/spec.md) y el filtro `--origin-project` en [`specs/project`](../project/spec.md) (HI3). [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24, sumó que cada búsqueda de la importación llega a sus filas por índice (IL1) y que su tiempo crece con sus filas (IL5); su V25 está en [`specs/storage`](../storage/spec.md) (IL2 e IL3).
+**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6). [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó el idioma de los informes de `export` e `import` (CL3). [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24, sumó el proyecto de origen al formato (HI2) y el import desde otra herramienta (HI4 a HI18); su V23 está en [`specs/storage`](../storage/spec.md) y el filtro `--origin-project` en [`specs/project`](../project/spec.md) (HI3). [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24, sumó que cada búsqueda de la importación llega a sus filas por índice (IL1) y que su tiempo crece con sus filas (IL5); su V25 está en [`specs/storage`](../storage/spec.md) (IL2 e IL3). [import-decision-pass](../../changes/archive/2026-10-24-import-decision-pass/proposal.md), archivado el 2026-10-24, sumó que la pasada de decisión no ocupa la conexión (ID1), que decide lo mismo que la pasada SQL (ID2) y que deja de planificar cuando se suelta el import (ID3), y llevó a la tabla de IL1 las consultas de su carga (ID4).
 
 ## Dónde está
 
 - El formato: `FORMAT` y `VERSION` (`crates/clawg-core/src/memory/portability/format.rs:14-16`), las líneas (`format.rs:19-140`), `parse` (`format.rs:176`), las comprobaciones de una fila y de un par (`check_memory`, `format.rs:229`; `check_conflict`, `format.rs:262`) y `render` (`format.rs:278`).
 - El export: `export` y `read` (`crates/clawg-core/src/memory/portability/export.rs:68` y `export.rs:80`); la vista, `markdown::render` (`crates/clawg-core/src/memory/portability/markdown.rs:12`); el comando, `run` y `write_new` (`crates/clawg-cli/src/export.rs:16` y `export.rs:31`).
-- El import: `MAX_IMPORT_BYTES` (`crates/clawg-core/src/memory/portability/import.rs:55`), `prepare` (`import.rs:255`), qué es la misma fila (`PRESENT_SQL`, `TWIN_SQL`, `TOPIC_HOLDERS_SQL`, `import.rs:993-1008`), `record_projects` (`import.rs:1049`), `place` (`import.rs:1077`), `write_links` (`import.rs:1201`), las tres pasadas (`import`, `import.rs:1325`), el de otra fuente (`import_foreign`, `import.rs:1350`; las transacciones por nota, `note_batches`, `import.rs:1403`) y el reporte (`import.rs:1500`); la ruta, `import_memories` (`crates/clawg-cli/src/daemon/api.rs:1894`, con su tope de cuerpo en `api.rs:1866`); el comando, `run` y `render` (`crates/clawg-cli/src/import.rs:42` y `import.rs:76`).
+- El import: `MAX_IMPORT_BYTES` (`crates/clawg-core/src/memory/portability/import.rs:55`), `prepare` (`import.rs:255`), el asiento sobre el que se escriben las reglas que colocan cada fila (`Seat`, `import.rs:444`) y sus dos implementaciones, la transacción (`SqlSeat`, `import.rs:463`) y el planificador (`Planned`, `import.rs:701`), qué es la misma fila (`PRESENT_SQL`, `TWIN_SQL`, `TOPIC_HOLDERS_SQL`, `import.rs:993-1008`), `record_projects` (`import.rs:1049`, con su parte pura, `taken_projects`, `import.rs:1029`), `place` (`import.rs:1077`), `write_links` (`import.rs:1201`), la carga de la pasada de decisión (`LOAD_BATCH`, `import.rs:621`; `ORIGIN_ROWS_SQL`, `TEXT_ROWS_SQL` y `KEY_ROWS_SQL`, `import.rs:634-639`; `PROJECT_ROOT_SQL`, `import.rs:1023`; `load`, `import.rs:819`) y la decisión (`decide`, `import.rs:903`), las tres pasadas (`import`, `import.rs:1325`, y `write`, `import.rs:1422`), el de otra fuente (`import_foreign`, `import.rs:1350`; las transacciones por nota, `note_batches`, `import.rs:1403`) y el reporte (`import.rs:1500`); la ruta, `import_memories` (`crates/clawg-cli/src/daemon/api.rs:1894`, con su tope de cuerpo en `api.rs:1866`); el comando, `run` y `render` (`crates/clawg-cli/src/import.rs:42` y `import.rs:76`).
 - Otra fuente: el modelo común (`ForeignExport`, `ForeignNote`, `ForeignRelation`, `crates/clawg-core/src/memory/portability/foreign.rs:12-72`), el adaptador de engram (`read`, `crates/clawg-core/src/memory/portability/engram.rs:22`) y la traducción a filas (`translate` y `rewrite_key`, `crates/clawg-core/src/memory/portability/translate.rs:307` y `translate.rs:502`).
 - El snapshot: `Reason::PreImport`, `pre-import`, podado con los demás automáticos (`crates/clawg-core/src/memory/backup.rs`).
 
@@ -356,17 +356,21 @@ Desde el agente del puente, una nota importada larga MUST leerse entera con `rea
 
 ## IL1. Las búsquedas de la importación llegan a sus filas por índice
 
-Toda sentencia que la importación (`crates/clawg-core/src/memory/portability/import.rs`) ejecuta por fila o por save, y que busca por una columna o por el rowid, MUST tener en `EXPLAIN QUERY PLAN` una línea `SEARCH` que nombre su índice, y MUST NOT tener ninguna línea `SCAN` que recorra una tabla. `SCAN CONSTANT ROW`, la fila única de un `SELECT EXISTS (…)` sin `FROM`, no recorre ninguna tabla. Esto vale sin estadísticas del planificador. Ejecutada contra un store con filas, ninguna de esas sentencias MUST dar un paso de recorrido completo (`StatementStatus::FullscanStep` igual a 0). El índice que corresponde a cada una:
+Toda sentencia que la importación (`crates/clawg-core/src/memory/portability/import.rs`) ejecuta por fila, por save o por proyecto, al cargar el store para la pasada de decisión o al colocar las filas en la que escribe, y que busca por una columna o por el rowid, MUST tener en `EXPLAIN QUERY PLAN` una línea `SEARCH` que nombre su índice, y MUST NOT tener ninguna línea `SCAN` que recorra una tabla. `SCAN CONSTANT ROW`, la fila única de un `SELECT EXISTS (…)` sin `FROM`, no recorre ninguna tabla. Esto vale sin estadísticas del planificador. Ejecutada contra un store con filas, ninguna de esas sentencias MUST dar un paso de recorrido completo (`StatementStatus::FullscanStep` igual a 0). El índice que corresponde a cada una:
 
 | Sentencia | Índice |
 |---|---|
 | `ORIGIN_SQL` | `idx_memory_import_origin` |
 | `PRESENT_SQL`, con proyecto y sin él | `idx_memory_dedup` |
-| `TWIN_SQL`, con proyecto y sin él | `idx_memory_dedup` |
+| `TWIN_SQL`, con proyecto y sin él, con `id` en su orden (ID4) | `idx_memory_dedup` |
 | `TOPIC_HOLDERS_SQL` | `idx_memory_topic` |
 | `REVISED_SQL` | la clave primaria de `memory` (`INTEGER PRIMARY KEY`) |
 | `LINKED_SQL`, si la fila ya es una pieza (`write_links`) | `idx_memory_piece_memory` |
 | `NEXT_SAVE_SQL`, el próximo `save_id` (`write_links`) | la clave primaria de `memory_piece` |
+| `ORIGIN_ROWS_SQL`, las filas de un origen, en la carga (ID4) | `idx_memory_import_origin` |
+| `TEXT_ROWS_SQL`, las filas de un texto, en la carga (ID4) | `idx_memory_dedup` |
+| `KEY_ROWS_SQL`, las filas vivas de una clave, en la carga (ID4) | `idx_memory_topic` |
+| `PROJECT_ROOT_SQL`, la raíz de un proyecto, en la carga (ID4) | la clave primaria de `project` |
 
 `PRESENT_SQL` MUST seguir encontrando la fila con el agente, el proyecto, el hash y la fecha dados, esté borrada o no: por eso `idx_memory_dedup` no tiene predicado ([`specs/storage`](../storage/spec.md) IL2).
 
@@ -394,3 +398,56 @@ Importar el doble de notas en un store vacío SHOULD tardar como mucho tres vece
 - AND la segunda tarda como mucho tres veces lo que la primera
 
 **Test:** `twice_the_notes_import_in_at_most_three_times_the_time` (`import.rs`, `#[ignore]`). Depende de la máquina, así que queda fuera de CI, y sólo se comparan corridas de una misma compilación.
+
+## ID1. La pasada de decisión no ocupa la conexión
+
+La pasada que decide dónde va cada fila de un import (la que corre una corrida en seco entera y la real antes de embeber) MUST NOT correr en una llamada a la conexión del store que dure con el archivo. Lo que lee del store MUST cargarse en llamadas de como mucho `LOAD_BATCH` búsquedas por índice, cada una su propio `conn.call`, sin una transacción abierta entre una y otra. La decisión MUST correr fuera de la conexión y fuera de los hilos del runtime async (`spawn_blocking`). La pasada MUST NOT escribir nada en el store.
+
+#### Escenario: una sonda durante la corrida en seco
+- GIVEN un store vacío y un export de otra herramienta de 10.000 notas
+- WHEN corre `--dry-run` y, al mismo tiempo, una sonda hace `SELECT 1` en la conexión cada 5 ms
+- THEN ninguna sonda espera más de 300 ms
+
+#### Escenario: nada escrito
+- GIVEN el store de `a_dry_run_reports_without_writing`
+- WHEN corre la corrida en seco
+- THEN `memory`, `project`, `project_remote`, `memory_fts` y `sqlite_sequence` quedan iguales y no hay snapshot
+
+**Tests:** `a_dry_run_leaves_the_connection_to_other_calls` y `a_dry_run_reports_without_writing` (`import.rs`).
+
+## ID2. El planificador decide lo mismo que la pasada SQL
+
+El `Ledger` que da el planificador MUST ser igual al que da la pasada SQL sobre el mismo store y el mismo archivo. Esa pasada es `place_rows` y `write_links` sobre `SqlSeat`, en una transacción que se suelta, y hoy sólo la corre la prueba diferencial. La igualdad incluye las ubicaciones con sus ids, los agentes de las filas insertadas, los proyectos tomados, las líneas inválidas, los enlaces perdidos, lo que se encontró de cada nota y las filas ausentes. Las reglas MUST estar escritas una vez, sobre un asiento que implementan la transacción y el planificador. Los ids que asigna MUST seguir a `sqlite_sequence`, como `AUTOINCREMENT`, y no a `MAX(id)`. Entre dos filas vivas del mismo texto y la misma fecha, el gemelo MUST ser la de menor id, en los dos.
+
+#### Escenario: la tabla
+- GIVEN cada uno de estos stores y archivos:
+  - un export de clawg en un store con una fila;
+  - el mismo, importado por segunda vez;
+  - con un gemelo vivo de otro agente;
+  - con una clave tomada;
+  - con `--agent`;
+  - las notas de muestra de otra herramienta, primero y por segunda vez;
+  - una nota reescrita en la fuente, más nueva y más vieja;
+  - una nota borrada acá y otra borrada en la fuente;
+  - dos notas de un mismo origen;
+  - un texto repetido en el archivo;
+  - una clave repetida en el archivo;
+  - un proyecto que tomó otra raíz;
+  - dos filas vivas del mismo texto y la misma fecha;
+  - un store con la última fila purgada;
+  - un export cuyos enlaces se perdieron entre transacciones.
+- WHEN se decide con la pasada SQL y con el planificador
+- THEN los dos `Ledger` son iguales
+
+#### Escenario: después de una purga
+- GIVEN un store cuya fila de mayor id se borró, así que `sqlite_sequence` queda por encima de `MAX(id)`
+- WHEN corre la corrida en seco y después la real
+- THEN los dos reportes coinciden salvo `dry_run` y el snapshot
+
+**Tests:** `the_planner_decides_as_the_sql_pass` y `a_dry_run_after_a_purge_reports_the_ids_of_the_import` (`import.rs`), y las pruebas de import de `import.rs`, `crates/clawg-cli/tests/api.rs` y `crates/clawg-cli/tests/binary.rs`.
+
+## ID3. Un import soltado deja de planificar
+
+Cuando se suelta el futuro de un import mientras el planificador corre (un apagado que corta el pedido), el planificador MUST terminar antes del próximo lote de filas sin decidir el resto.
+
+**Test:** `a_stopped_planner_decides_nothing` (`import.rs`).

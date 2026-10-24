@@ -1,5 +1,7 @@
 # import-decision-pass — Especificación
 
+Suma requisitos a [`specs/portability`](../../../specs/portability/spec.md): ID1 a ID3 con sus ids, e ID4 como las filas de la carga y el orden de `TWIN_SQL` en la tabla de IL1.
+
 ## ID1. La pasada de decisión no ocupa la conexión
 
 La pasada que decide dónde va cada fila de un import (la que corre una corrida en seco entera y la real antes de embeber) MUST NOT correr en una llamada a la conexión del store que dure con el archivo. Lo que lee del store MUST cargarse en llamadas de como mucho `LOAD_BATCH` búsquedas por índice, cada una su propio `conn.call`, sin una transacción abierta entre una y otra. La decisión MUST correr fuera de la conexión y fuera de los hilos del runtime async (`spawn_blocking`). La pasada MUST NOT escribir nada en el store.

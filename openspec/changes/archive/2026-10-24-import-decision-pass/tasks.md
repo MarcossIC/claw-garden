@@ -38,4 +38,4 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 5. Archive
 
-- [ ] `specs/portability` con ID1 a ID4; `git mv` a `changes/archive/AAAA-MM-DD-import-decision-pass`; `state.yaml` archivado; la fila 82 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/portability` con ID1 a ID3, e ID4 en la tabla de IL1; `git mv` a `changes/archive/2026-10-24-import-decision-pass`; `state.yaml` archivado; la fila 82 y el orden de ejecución del `README.md` de openspec; subir el minor. También se corrigió el comentario de `the_import_lookups_seek_an_index`, que import-linear dejó anotado ([verify](verify.md#al-archivar-2026-10-24)).

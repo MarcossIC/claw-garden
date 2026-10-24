@@ -63,6 +63,8 @@ La importación tardó 144 s más que la de import-linear. El dry run, que hace 
 
 El informe de la importación es idéntico al de los dos dry run, salvo «would import» y la línea del snapshot. Las 51.996 filas importadas son las de la medición de origen, comparadas con su snapshot `pre-move`. Las trece columnas que compara import-linear (agente, proyecto, hash, fecha, estado, tipo, clave, borrado, causa, origen, proyecto de origen, idioma e importancia) dan el mismo SHA-256. Esta vez también dan el mismo los ids, `superseded_by`, `revived_from` y los enlaces de `memory_piece`, y coinciden las piezas (51.068) y los pares (141). Con datos reales, el planificador asigna los mismos ids que la pasada SQL de 0.56.0 (ID2). Sólo difieren los accesos (52.320 contra 52.405), por las búsquedas que recibió cada store.
 
-## Pendiente
+## Al archivar (2026-10-24)
 
-Nada de la verificación. Queda el archivo (tareas, 5).
+- ID1 a ID3 pasan a [`specs/portability`](../../../specs/portability/spec.md) con sus ids. ID4 entra en la tabla de IL1, que es la misma regla con la misma prueba: suma las cuatro consultas de la carga y el orden por `id` de `TWIN_SQL`. «Dónde está» nombra ahora el asiento, la carga y la decisión.
+- El comentario de `the_import_lookups_seek_an_index` decía que cada búsqueda corre en la pasada que decide y otra vez en la que escribe. Desde este cambio, una corre cuando la pasada que decide carga el store, y otra cuando la que escribe coloca sus filas: `ff9da3e` lo corrige, sin cambiar ninguna línea de lugar.
+- Las citas `import.rs:N` de la exploración y de la propuesta quedan como estaban: describen `38ceb07` (`write` en `:957`, `place_rows` en `:656`), contra el que se escribieron.
