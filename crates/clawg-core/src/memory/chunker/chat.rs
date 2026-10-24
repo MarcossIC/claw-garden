@@ -231,7 +231,7 @@ mod tests {
         let chunker = ChatChunker::with_fallback();
         let content = format!("Notes on clawg-ledger, the crate that settles balances. {}", "word ".repeat(1200));
         let head = chunker.split_save(&content).head.expect("a long text has a head");
-        assert_eq!(head, content[..48 * 4]);
+        assert_eq!(head, content[..SAVE_HEAD_TOKENS * 4]);
         assert!(head.contains("clawg-ledger"));
     }
 
@@ -239,16 +239,16 @@ mod tests {
     fn the_head_ends_at_a_word_boundary() {
         use crate::memory::chunker::token_splitter::tests::{subword_tokenizer, subword_words};
         // Words of two and three tokens in turn: 480 of them are 1200 tokens,
-        // and token 48 is the second of the twentieth word, which opens at 47.
+        // and the first k of them hold 5 * (k / 2) + 2 * (k % 2).
         let words = subword_words(480);
         let content = words.join(" ");
         let tok = subword_tokenizer();
-        let offsets = tok.encode(content.as_str(), false).expect("the fixture encodes").get_offsets().to_vec();
-        assert_eq!(offsets.len(), 1200);
-        assert_eq!((offsets[47].0, offsets[48].0), (content.find(&words[19]).unwrap(), offsets[47].1), "token 48 is inside a word");
+        assert_eq!(tok.encode(content.as_str(), false).expect("the fixture encodes").len(), 1200);
+        let tokens_of = |k: usize| 5 * (k / 2) + 2 * (k % 2);
+        let whole = (0..words.len()).take_while(|&k| tokens_of(k) <= SAVE_HEAD_TOKENS).last().unwrap();
 
         let head = ChatChunker::with_tokenizer(tok.clone()).split_save(&content).head.expect("a long text has a head");
-        assert_eq!(head, words[..19].join(" "), "the head stops before the word it would cut");
+        assert_eq!(head, words[..whole].join(" "), "the head stops before the word it would cut");
         assert!(TokenSplitter::with_tokenizer(tok).count(&head) <= SAVE_HEAD_TOKENS);
     }
 

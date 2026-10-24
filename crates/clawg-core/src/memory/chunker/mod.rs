@@ -34,10 +34,10 @@ pub(crate) const CHUNK_OVERLAP_TOKENS: usize = 64;
 /// Leading tokens of a save that go into the embedder with each piece after
 /// the first. A piece cut from the middle of a long text loses whatever the
 /// text named at its start (the crate, the decision, the bug), and so does
-/// its vector; the head puts that topic back. 48 tokens is a sentence or two:
-/// enough to carry a subject line, small enough to leave most of the window
-/// to the piece's own text.
-pub(crate) const SAVE_HEAD_TOKENS: usize = 48;
+/// its vector; the head puts that topic back. 32 tokens is about a sentence:
+/// enough to carry a subject line, and in rag-eval no long save lost to 48,
+/// while 16 began to.
+pub(crate) const SAVE_HEAD_TOKENS: usize = 32;
 
 /// Room for the separator, and for the tokens a tokenizer can add where two
 /// texts are joined: token counts are not additive across the seam.
