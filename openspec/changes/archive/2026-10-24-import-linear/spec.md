@@ -1,5 +1,7 @@
 # import-linear — Especificación
 
+Suma requisitos a [`specs/portability`](../../../specs/portability/spec.md) (R1 y R5, como IL1 e IL5) y a [`specs/storage`](../../../specs/storage/spec.md) (R2 y R3, como IL2 e IL3). R4 no suma ninguno: lo que la importación hace sigue en R3 a R7 y HI2 a HI18 de `specs/portability`.
+
 ## R1. Las búsquedas de la importación llegan a sus filas por índice
 
 Toda sentencia que la importación (`crates/clawg-core/src/memory/portability/import.rs`) ejecuta por fila o por save, y que busca por una columna o por el rowid, MUST tener en `EXPLAIN QUERY PLAN` una línea `SEARCH` que nombre su índice, y MUST NOT tener ninguna línea `SCAN` que recorra una tabla. `SCAN CONSTANT ROW`, la fila única de un `SELECT EXISTS (…)` sin `FROM`, no recorre ninguna tabla. Esto vale sin estadísticas del planificador. Ejecutada contra un store con filas, ninguna de esas sentencias MUST dar un paso de recorrido completo (`StatementStatus::FullscanStep` igual a 0). El índice que corresponde a cada una:
@@ -55,7 +57,7 @@ V25 (`crates/clawg-core/migrations/V25__dedup_index_all_rows.sql`) MUST sólo re
 
 ## R4. Lo que la importación hace no cambia
 
-Las filas que la importación inserta, encuentra, fusiona o deja reemplazadas, sus enlaces y su informe MUST ser los mismos que antes del cambio ([`specs/portability`](../../specs/portability/spec.md)).
+Las filas que la importación inserta, encuentra, fusiona o deja reemplazadas, sus enlaces y su informe MUST ser los mismos que antes del cambio ([`specs/portability`](../../../specs/portability/spec.md)).
 
 **Tests:** las pruebas existentes de `import.rs`, sin cambios, `a_second_import_adds_nothing`, `a_live_twin_absorbs_the_imported_row` y `a_taken_topic_key_supersedes_the_imported_row` entre ellas.
 

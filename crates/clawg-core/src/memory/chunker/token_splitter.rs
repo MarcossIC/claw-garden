@@ -45,9 +45,10 @@ impl TokenSplitter {
         }
     }
 
-    /// Split `text` so each output `Chunk` has `<= max_tokens` tokens, with
-    /// `overlap` tokens repeated between adjacent chunks. `overlap == 0`
-    /// reproduces the pre-overlap behavior exactly. Preserves UTF-8 boundaries.
+    /// Split `text` so each output `Chunk` has `<= max_tokens` tokens, with at
+    /// least `overlap` tokens repeated between adjacent chunks; `overlap == 0`
+    /// tiles the text. With a tokenizer, every cut falls where a word starts
+    /// when one is in reach ([`plan_word_windows`]). Preserves UTF-8 boundaries.
     pub fn split(&self, text: &str, max_tokens: usize, overlap: usize) -> Vec<Chunk> {
         if max_tokens == 0 || text.is_empty() {
             return vec![];
@@ -90,7 +91,7 @@ impl TokenSplitter {
         if offsets.is_empty() {
             return vec![];
         }
-        plan_windows(offsets.len(), max, overlap)
+        plan_word_windows(&word_starts(text, offsets), max, overlap)
             .into_iter()
             .map(|(start, end)| {
                 let start_byte = offsets[start].0;
@@ -142,36 +143,61 @@ impl TokenSplitter {
     }
 }
 
-/// The windowing arithmetic shared by both the token path (units = tokens)
-/// and the byte-fallback path (units = bytes, char-snapped by the caller).
-/// Pure and tokenizer-free so it is unit-testable without loading a model.
-///
-/// Returns half-open `[start, end)` index pairs into the unit sequence.
-/// `overlap` MUST already be `< max` (callers clamp before reaching here);
-/// an unclamped `overlap >= max` collapses the stride to 0 and this function
-/// would loop forever, which is exactly why `split()` never lets that happen.
-fn plan_windows(n: usize, max: usize, overlap: usize) -> Vec<(usize, usize)> {
+/// Which tokens open a word of `text`: a cut just before token `i` leaves no
+/// word in two when `i` is the first token, or when whitespace comes right
+/// before its offset or right at it. The second rule is for a tokenizer
+/// whose first token of a word holds the space before it (`▁foo` over
+/// `" foo"`), the first for one that leaves it out. Signs are not
+/// boundaries, so a path or an identifier is never cut at a `/` or a `::`.
+fn word_starts(text: &str, offsets: &[(usize, usize)]) -> Vec<bool> {
+    offsets
+        .iter()
+        .enumerate()
+        .map(|(i, &(start, _))| {
+            i == 0
+                || text.get(..start).and_then(|t| t.chars().next_back()).is_some_and(char::is_whitespace)
+                || text.get(start..).and_then(|t| t.chars().next()).is_some_and(char::is_whitespace)
+        })
+        .collect()
+}
+
+/// The windows of at most `max` tokens a text is cut into, as half-open
+/// `[start, end)` token ranges, given which tokens open a word. A window ends
+/// at the last word start within `max` of its start, and the next one starts
+/// at the last word start that leaves `overlap` tokens shared: the overlap
+/// grows back to the start of a word instead of shrinking, so the neighbours
+/// still share what `join_pieces` looks for. Where no word start is in reach,
+/// as in a word longer than the window or a text without spaces, the cut
+/// falls on the token. With every token a word start the windows advance by
+/// exactly `max - overlap`. Pure and tokenizer-free.
+fn plan_word_windows(starts: &[bool], max: usize, overlap: usize) -> Vec<(usize, usize)> {
+    let n = starts.len();
     if max == 0 || n == 0 {
         return vec![];
     }
+    // Keeps every end more than `overlap` past its start, which is what makes
+    // the next start advance; `split()` clamps too, but nothing stops another
+    // caller from passing a larger overlap.
     let overlap = overlap.min(max - 1);
-    let stride = max - overlap;
+    let last_start_in = |from: usize, to: usize| (from..=to).rev().find(|&i| starts[i]);
     let mut out = Vec::new();
-    let mut s = 0usize;
+    let (mut start, mut previous_end) = (0usize, 0usize);
     loop {
-        let e = (s + max).min(n);
-        out.push((s, e));
-        // Breaking the instant the window reaches `n` is what makes the tail
-        // unreachable-by-construction: continuing with `while s < n` would
-        // keep emitting windows whose range is fully inside the one just
-        // pushed (e.g. n=1920, max=1920, overlap=256 emits [0,1920) then
-        // [1664,1920) — the second is a strict subset of the first).
-        if e == n {
-            break;
+        // Stopping once a window reaches the end is what keeps a tail window
+        // from lying inside the one before it.
+        if start + max >= n {
+            out.push((start, n));
+            return out;
         }
-        s += stride;
+        let cap = start + max;
+        // Past the overlap and past the end before it, so no window but the
+        // last is shorter than the overlap or lies inside the one before.
+        let end = last_start_in((start + overlap).max(previous_end) + 1, cap).unwrap_or(cap);
+        out.push((start, end));
+        let latest = end - overlap;
+        previous_end = end;
+        start = last_start_in(start + 1, latest).unwrap_or(latest);
     }
-    out
 }
 
 fn floor_char_boundary(text: &str, index: usize) -> usize {
@@ -197,54 +223,69 @@ fn ceil_char_boundary(text: &str, index: usize) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    // ── plan_windows: pure arithmetic, no tokenizer needed ──────────────────
+    // ── word_starts and plan_word_windows: pure, no tokenizer needed ────────
 
     #[test]
-    fn plan_windows_empty_input_yields_no_windows() {
-        assert_eq!(plan_windows(0, 480, 64), vec![]);
+    fn word_starts_marks_tokens_after_or_on_whitespace() {
+        // `retri ##evi ##es`, `are` and `found`, each offset without the space.
+        let text = "retrievies are\nfound";
+        assert_eq!(word_starts(text, &[(0, 5), (5, 8), (8, 10), (11, 14), (15, 20)]), [true, false, false, true, true]);
+        // Signs are not boundaries: a path and an identifier stay whole.
+        let text = "crates/clawg-core Store::insert";
+        let offsets = [(0, 6), (6, 7), (7, 17), (18, 23), (23, 25), (25, 31)];
+        assert_eq!(word_starts(text, &offsets), [true, false, false, true, false, false]);
     }
 
     #[test]
-    fn plan_windows_zero_max_yields_no_windows() {
-        assert_eq!(plan_windows(100, 0, 0), vec![]);
+    fn word_starts_takes_an_offset_that_holds_the_leading_space() {
+        // `▁are` and `▁found` over " are" and " found".
+        let text = "retrievies are found";
+        assert_eq!(word_starts(text, &[(0, 5), (5, 10), (10, 14), (14, 20)]), [true, false, true, true]);
+        // A lone `▁` with an empty offset at the space opens the word as the
+        // token after it does: a cut before either falls on the same byte.
+        assert_eq!(word_starts(text, &[(0, 10), (10, 10), (11, 14)]), [true, true, true]);
+    }
+
+    /// The plan of `n` tokens that each open a word.
+    fn every_word(n: usize, max: usize, overlap: usize) -> Vec<(usize, usize)> {
+        plan_word_windows(&vec![true; n], max, overlap)
     }
 
     #[test]
-    fn plan_windows_input_at_or_under_cap_yields_one_window() {
-        assert_eq!(plan_windows(1, 480, 64), vec![(0, 1)]);
-        assert_eq!(plan_windows(480, 480, 64), vec![(0, 480)]);
-    }
+    fn plan_word_windows_with_every_start_marked_keeps_a_fixed_stride() {
+        let table: [(usize, usize, usize, &[(usize, usize)]); 7] = [
+            (0, 480, 64, &[]),
+            (1, 480, 64, &[(0, 1)]),
+            (480, 480, 64, &[(0, 480)]),
+            (300, 100, 20, &[(0, 100), (80, 180), (160, 260), (240, 300)]),
+            (5760, 1920, 256, &[(0, 1920), (1664, 3584), (3328, 5248), (4992, 5760)]),
+            (5, 1, 0, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]),
+            (8, 4, 4, &[(0, 4), (1, 5), (2, 6), (3, 7), (4, 8)]),
+        ];
+        for (n, max, overlap, expected) in table {
+            assert_eq!(every_word(n, max, overlap), expected, "n={n} max={max} overlap={overlap}");
+        }
+        assert!(every_word(100, 0, 0).is_empty(), "a cap of zero cuts nothing");
 
-    #[test]
-    fn plan_windows_count_formula_three_cases() {
-        // n <= overlap would give a negative/zero numerator under the naive
-        // ceil((n-ov)/stride) formula — but n <= max here still yields count 1.
-        assert_eq!(plan_windows(30, 480, 64).len(), 1); // n <= max
-        // n > max: ceil((n - ov) / stride)
-        let n = 5760usize; // matches the worker fixture (a*1920+b*1920+c*1920)
-        let max = 1920;
-        let ov = 256;
-        let stride = max - ov;
-        let expected = ((n - ov) as f64 / stride as f64).ceil() as usize;
-        assert_eq!(plan_windows(n, max, ov).len(), expected);
-        assert_eq!(expected, 4);
-    }
-
-    #[test]
-    fn plan_windows_terminates_and_every_window_is_bounded() {
+        // Every window starts one stride after the one before and is `max`
+        // wide but for the last, which reaches the end: the count is 1 up to
+        // the cap and ceil((n - overlap) / stride) past it.
         for max in 1..40usize {
             for overlap in 0..max {
-                for n in 0..600usize {
-                    let windows = plan_windows(n, max, overlap);
-                    // Termination: bounded number of windows for bounded n/stride.
-                    assert!(windows.len() <= n + 1, "max={max} overlap={overlap} n={n}");
-                    for &(s, e) in &windows {
-                        assert!(e > s, "empty window at max={max} overlap={overlap} n={n}");
-                        assert!(e - s <= max, "window exceeds max at max={max} overlap={overlap} n={n}");
-                        assert!(e <= n, "window exceeds n at max={max} overlap={overlap} n={n}");
+                let stride = max - overlap;
+                for n in 0..300usize {
+                    let windows = every_word(n, max, overlap);
+                    let count = match n {
+                        0 => 0,
+                        n if n <= max => 1,
+                        n => (n - overlap).div_ceil(stride),
+                    };
+                    assert_eq!(windows.len(), count, "n={n} max={max} overlap={overlap}");
+                    for (k, &(s, e)) in windows.iter().enumerate() {
+                        assert_eq!((s, e), (k * stride, (k * stride + max).min(n)), "n={n} max={max} overlap={overlap}");
                     }
                 }
             }
@@ -252,29 +293,83 @@ mod tests {
     }
 
     #[test]
-    fn plan_windows_no_window_range_is_contained_in_another() {
-        // `s` strictly increases every iteration, so starts are strictly
-        // ascending and `e = min(s + max, n)` is therefore non-decreasing —
-        // which means containment between ANY pair (not just neighbours)
-        // can only exist if two ADJACENT windows already share the same end
-        // (a run of equal ends is what makes a later, narrower window sit
-        // inside an earlier one; a strict increase anywhere in the middle
-        // rules out containment on either side of it). Checking neighbours
-        // is therefore equivalent to the full O(w^2) pairwise check for this
-        // shape of sequence, and turns the exhaustive sweep from
-        // quadratic-in-window-count into linear.
-        for max in 1..40usize {
-            for overlap in 0..max {
-                for n in 0..600usize {
-                    let windows = plan_windows(n, max, overlap);
-                    for pair in windows.windows(2) {
-                        let (s0, e0) = pair[0];
-                        let (s1, e1) = pair[1];
-                        assert!(s1 > s0, "starts must strictly increase at max={max} overlap={overlap} n={n}");
-                        assert!(
-                            e1 != e0,
-                            "adjacent windows share an end (later window contained in earlier one) at max={max} overlap={overlap} n={n}: {pair:?}"
-                        );
+    fn plan_word_windows_clamps_the_overlap_and_never_hangs() {
+        // A stride of 0 would re-emit `(0, max)` forever, every window of it
+        // non-empty: what the clamp shows is that the starts advance.
+        assert_eq!(every_word(1000, 4, 4), every_word(1000, 4, 3), "overlap == max behaves as max - 1");
+        assert_eq!(every_word(1000, 4, 4).len(), 997);
+        let words_of_three: Vec<bool> = (0..100).map(|i| i % 3 == 0).collect();
+        assert_eq!(plan_word_windows(&words_of_three, 5, 50), plan_word_windows(&words_of_three, 5, 4));
+    }
+
+    /// Mark patterns for the sweep: every token, only the first, words of a
+    /// fixed length, and words of mixed lengths with an occasional one of 30
+    /// tokens, longer than most caps of the sweep.
+    fn mark_patterns(n: usize) -> Vec<Vec<bool>> {
+        let mut patterns = vec![vec![true; n], (0..n).map(|i| i == 0).collect()];
+        for len in 2..=5 {
+            patterns.push((0..n).map(|i| i % len == 0).collect());
+        }
+        for seed in 1..=4u64 {
+            let mut state = seed;
+            let mut marks = vec![false; n];
+            let mut i = 0;
+            while i < n {
+                marks[i] = true;
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                i += if state >> 61 == 0 { 30 } else { 1 + (state >> 33) as usize % 6 };
+            }
+            patterns.push(marks);
+        }
+        patterns
+    }
+
+    /// Fails when `windows` is not the plan D2 describes for `starts`: bounded,
+    /// covering, never nested, never shorter than the overlap but at the end,
+    /// sharing at least the overlap, and cut at the last word start in reach.
+    fn check_plan(starts: &[bool], max: usize, overlap: usize, windows: &[(usize, usize)]) {
+        let n = starts.len();
+        let at = || format!("n={n} max={max} overlap={overlap} starts={starts:?} windows={windows:?}");
+        if n == 0 {
+            assert!(windows.is_empty(), "{}", at());
+            return;
+        }
+        let overlap = overlap.min(max - 1);
+        let marked = |from: usize, to: usize| (from..=to).filter(|&i| starts[i]).last();
+        assert_eq!((windows[0].0, windows[windows.len() - 1].1), (0, n), "{}", at());
+        let mut previous_end = 0;
+        for (k, &(s, e)) in windows.iter().enumerate() {
+            assert!(e > s && e - s <= max, "window {k} is empty or over the cap: {}", at());
+            let Some(&(next_s, next_e)) = windows.get(k + 1) else { break };
+            assert!(e - s > overlap, "window {k} is shorter than the overlap: {}", at());
+            let expected_end = marked((s + overlap).max(previous_end) + 1, s + max).unwrap_or(s + max);
+            assert_eq!(e, expected_end, "window {k} does not end at the last word start in reach: {}", at());
+            assert!(next_s > s && next_e > e, "window {} lies inside window {k}: {}", k + 1, at());
+            let expected_start = marked(s + 1, e - overlap).unwrap_or(e - overlap);
+            assert_eq!(next_s, expected_start, "window {} does not start at the last word start: {}", k + 1, at());
+            previous_end = e;
+        }
+    }
+
+    #[test]
+    fn plan_word_windows_terminates_covers_and_never_nests() {
+        // Every pattern of marks up to ten tokens, the first always marked as
+        // `word_starts` marks it.
+        for n in 1..=10usize {
+            for bits in 0..1u32 << (n - 1) {
+                let starts: Vec<bool> = (0..n).map(|i| i == 0 || (bits >> (i - 1)) & 1 == 1).collect();
+                for max in 1..=12usize {
+                    for overlap in 0..=max {
+                        check_plan(&starts, max, overlap, &plan_word_windows(&starts, max, overlap));
+                    }
+                }
+            }
+        }
+        for n in 0..100usize {
+            for starts in mark_patterns(n) {
+                for max in 1..24usize {
+                    for overlap in 0..max {
+                        check_plan(&starts, max, overlap, &plan_word_windows(&starts, max, overlap));
                     }
                 }
             }
@@ -282,79 +377,38 @@ mod tests {
     }
 
     #[test]
-    fn plan_windows_adjacent_pairs_share_exactly_overlap_units() {
-        for max in 2..40usize {
-            for overlap in 0..max {
-                for n in (max + 1)..600usize {
-                    let windows = plan_windows(n, max, overlap);
-                    for pair in windows.windows(2) {
-                        let (_, e0) = pair[0];
-                        let (s1, _) = pair[1];
-                        // shared span is [s1, e0) when e0 > s1
-                        let shared = e0.saturating_sub(s1);
-                        assert_eq!(shared, overlap, "max={max} overlap={overlap} n={n} pair={pair:?}");
-                    }
-                }
-            }
-        }
+    fn plan_word_windows_cuts_at_the_last_word_start_under_the_cap() {
+        // Words of three tokens: no window ends at its cap of 10, every one at
+        // the word start just under it.
+        let starts: Vec<bool> = (0..30).map(|i| i % 3 == 0).collect();
+        assert_eq!(plan_word_windows(&starts, 10, 2), [(0, 9), (6, 15), (12, 21), (18, 27), (24, 30)]);
     }
 
     #[test]
-    fn plan_windows_window_length_equals_end_minus_start_for_every_window() {
-        // Pins the window length `split_by_tokens` slices each chunk by
-        // (`end - start`) so an off-by-one there cannot silently drift from
-        // what the windowing arithmetic actually produced.
-        for &(max, overlap, n) in &[(480, 64, 6000usize), (1920, 256, 5760), (4, 0, 20), (1, 0, 5)] {
-            let windows = plan_windows(n, max, overlap);
-            for &(s, e) in &windows {
-                assert!(e - s >= 1, "window length must be >= 1 at max={max} overlap={overlap} n={n}");
-                assert!(e - s <= max, "window length must be <= max at max={max} overlap={overlap} n={n}");
-            }
-        }
-    }
-
-    #[test]
-    fn plan_windows_non_final_windows_are_exactly_max_wide() {
-        let windows = plan_windows(5760, 1920, 256);
-        for &(s, e) in &windows[..windows.len() - 1] {
-            assert_eq!(e - s, 1920, "non-final window must be exactly max wide");
-        }
-    }
-
-    #[test]
-    fn plan_windows_clamps_overlap_and_never_hangs() {
-        // overlap >= max: the clamp must pull it to `max - 1` so the stride
-        // stays >= 1. Asserting only "non-empty, every window non-degenerate"
-        // does NOT test the clamp: a stride of 0 re-emits `(0, max)` forever,
-        // and every such window is non-empty too. The observable consequence
-        // of the clamp is that the starts ADVANCE — so pin the exact plan.
-        let clamped = plan_windows(1000, 4, 4);
+    fn plan_word_windows_cuts_a_word_longer_than_the_cap_by_token() {
+        // Five words of one token, one of 25 (tokens 5 to 29) and ten more.
+        let starts: Vec<bool> = (0..40).map(|i| !(6..30).contains(&i)).collect();
         assert_eq!(
-            clamped,
-            plan_windows(1000, 4, 3),
-            "overlap == max must behave exactly as overlap == max - 1"
+            plan_word_windows(&starts, 10, 2),
+            [(0, 5), (3, 13), (5, 15), (13, 23), (21, 31), (29, 39), (37, 40)],
+            "inside the long word the cuts fall on tokens 13, 15, 21, 23 and 29"
         );
-        assert_eq!(clamped.len(), 997, "stride 1 over n=1000, max=4 gives 997 windows");
-        assert_eq!(clamped[0], (0, 4));
-        assert_eq!(*clamped.last().unwrap(), (996, 1000));
-        for pair in clamped.windows(2) {
-            assert!(pair[1].0 > pair[0].0, "clamped stride must still advance the start");
-        }
-
-        // Far out of contract, not merely one over.
-        let far = plan_windows(100, 5, 50);
-        assert_eq!(far, plan_windows(100, 5, 4), "any overlap >= max clamps to max - 1");
     }
 
     #[test]
-    fn plan_windows_max_one_yields_one_unit_per_window() {
-        let windows = plan_windows(5, 1, 0);
-        assert_eq!(windows, vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]);
+    fn plan_word_windows_keeps_at_least_the_overlap() {
+        // A word of six tokens (3 to 8) crosses where the next window would
+        // start: it starts back at that word, sharing 7 tokens, rather than
+        // at the word after it, which would share 1.
+        let starts: Vec<bool> = (0..30).map(|i| !(4..9).contains(&i)).collect();
+        let windows = plan_word_windows(&starts, 10, 4);
+        assert_eq!(windows[..2], [(0, 10), (3, 13)]);
+        for pair in windows.windows(2) {
+            assert!(pair[0].1 - pair[1].0 >= 4, "{windows:?}");
+        }
     }
 
-    // ── TokenSplitter (byte-fallback path — the only path exercised here;
-    //    the tokenizer path has no bundled model to test against, see the
-    //    ASCII parity test below for how its arithmetic is still covered) ──
+    // ── TokenSplitter, byte-fallback path ───────────────────────────────────
 
     #[test]
     fn split_short_input_single_chunk_identical_to_input() {
@@ -737,6 +791,189 @@ mod tests {
         (words.join(" "), words)
     }
 
+    /// Roots of the subword fixture: an opening consonant, a vowel and a
+    /// closing consonant. All of one length, and no opening is `r`, so the
+    /// greedy match of WordPiece takes exactly three letters at the start of
+    /// any word the fixture generates.
+    fn subword_roots() -> Vec<String> {
+        let mut roots = Vec::new();
+        for opening in "bcdfgklmnp".chars() {
+            for vowel in "aeiou".chars() {
+                for closing in "lmnrst".chars() {
+                    roots.push(format!("{opening}{vowel}{closing}"));
+                }
+            }
+        }
+        roots
+    }
+
+    /// What follows `##`: a vowel and a closing consonant. None starts with
+    /// `ev`, so `##evi` never matches inside a generated word.
+    fn subword_continuations() -> Vec<String> {
+        "aeiou".chars().flat_map(|vowel| "lmnrst".chars().map(move |closing| format!("{vowel}{closing}"))).collect()
+    }
+
+    /// CJK scalars in the vocabulary, as roots and as continuations: a run of
+    /// them with no space between is one word of one token per character.
+    const SUBWORD_CJK: u32 = 400;
+
+    /// A `WordPiece` tokenizer over a whitespace split, which cuts a word into
+    /// a root and `##` continuations, as the model's tokenizer does: the
+    /// word-level tokenizers above make one token of every word and so never
+    /// show a cut inside one. `retrievies` is `retri ##evi ##es`; a word it has
+    /// no pieces for is one `[UNK]`.
+    pub(crate) fn subword_tokenizer() -> Arc<tokenizers::Tokenizer> {
+        let mut tokens = vec!["[UNK]".to_string(), "retri".to_string(), "##evi".to_string()];
+        tokens.extend(subword_roots());
+        tokens.extend(subword_continuations().iter().map(|c| format!("##{c}")));
+        for c in (0..SUBWORD_CJK).map(|i| char::from_u32(0x4E00 + i).expect("CJK block is dense here")) {
+            tokens.push(c.to_string());
+            tokens.push(format!("##{c}"));
+        }
+        let vocab: serde_json::Map<String, serde_json::Value> =
+            tokens.into_iter().enumerate().map(|(id, token)| (token, id.into())).collect();
+        let json = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": null, "decoder": null,
+            "model": {
+                "type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 1000, "vocab": vocab
+            }
+        });
+        Arc::new(json.to_string().parse::<tokenizers::Tokenizer>().expect("the subword tokenizer parses"))
+    }
+
+    /// `count` distinct words for [`subword_tokenizer`], alternating a root and
+    /// one continuation (two tokens) with a root and two (three tokens).
+    pub(crate) fn subword_words(count: usize) -> Vec<String> {
+        let (roots, continuations) = (subword_roots(), subword_continuations());
+        (0..count)
+            .map(|i| {
+                let mut word = format!("{}{}", roots[i % roots.len()], continuations[(i / roots.len()) % continuations.len()]);
+                if i % 2 == 1 {
+                    word.push_str(&continuations[(7 * i + 3) % continuations.len()]);
+                }
+                word
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_subword_fixture_cuts_a_word_into_its_pieces() {
+        let tok = subword_tokenizer();
+        let enc = tok.encode("a retrievies b", false).expect("the fixture encodes");
+        assert_eq!(enc.get_tokens(), ["[UNK]", "retri", "##evi", "##es", "[UNK]"]);
+        assert_eq!(enc.get_offsets()[1..4], [(2, 7), (7, 10), (10, 12)], "every piece lies inside the word");
+
+        let words = subword_words(1600);
+        assert_eq!(words.iter().collect::<std::collections::HashSet<_>>().len(), words.len(), "the words are distinct");
+        for (i, word) in words.iter().enumerate() {
+            let enc = tok.encode(word.as_str(), false).expect("the fixture encodes");
+            assert_eq!(enc.len(), 2 + i % 2, "{word}: {:?}", enc.get_tokens());
+        }
+        let run: String = (0..300).map(|i| char::from_u32(0x4E00 + i).expect("CJK block is dense here")).collect();
+        assert_eq!(tok.encode(run.as_str(), false).expect("the fixture encodes").len(), 300, "one token per character");
+    }
+
+    /// Whether a cut at byte `b` of `text` leaves every word of it whole: at
+    /// either end, or next to whitespace.
+    pub(crate) fn is_word_boundary(text: &str, b: usize) -> bool {
+        b == 0
+            || b == text.len()
+            || text[..b].chars().next_back().is_some_and(char::is_whitespace)
+            || text[b..].chars().next().is_some_and(char::is_whitespace)
+    }
+
+    /// Where each of `pieces` lies in `text`, in order: each is looked for from
+    /// just after the start of the one before.
+    pub(crate) fn piece_ranges(text: &str, pieces: &[&str]) -> Vec<(usize, usize)> {
+        let mut from = 0;
+        pieces
+            .iter()
+            .enumerate()
+            .map(|(k, piece)| {
+                let start = from + text[from..].find(piece).unwrap_or_else(|| panic!("piece {k} is not in the text: {piece:?}"));
+                from = start + piece.chars().next().map_or(1, char::len_utf8);
+                (start, start + piece.len())
+            })
+            .collect()
+    }
+
+    /// The text on both sides of byte `b`, for a failure message.
+    fn around(text: &str, b: usize) -> String {
+        let before: String = text[..b].chars().rev().take(16).collect::<Vec<_>>().into_iter().rev().collect();
+        let after: String = text[b..].chars().take(16).collect();
+        format!("{before:?} | {after:?}")
+    }
+
+    /// Fails when a piece of `text` starts or ends inside one of its words.
+    pub(crate) fn assert_cut_at_word_boundaries(text: &str, pieces: &[&str]) {
+        for (k, (start, end)) in piece_ranges(text, pieces).into_iter().enumerate() {
+            assert!(is_word_boundary(text, start), "piece {k} starts inside a word: {}", around(text, start));
+            assert!(is_word_boundary(text, end), "piece {k} ends inside a word: {}", around(text, end));
+        }
+    }
+
+    #[test]
+    fn no_piece_starts_or_ends_inside_a_word() {
+        let text = subword_words(600).join(" ");
+        let splitter = TokenSplitter::with_tokenizer(subword_tokenizer());
+        let chunks = splitter.split(&text, 96, 24);
+        let pieces: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert!(pieces.len() > 10, "the fixture yields many pieces, got {}", pieces.len());
+
+        assert_cut_at_word_boundaries(&text, &pieces);
+        let ranges = piece_ranges(&text, &pieces);
+        assert_eq!((ranges[0].0, ranges[ranges.len() - 1].1), (0, text.len()), "the pieces reach both ends");
+        for piece in &pieces {
+            assert!(splitter.count(piece) <= 96, "a piece of {} tokens", splitter.count(piece));
+        }
+        for (k, pair) in ranges.windows(2).enumerate() {
+            let shared = &text[pair[1].0..pair[0].1];
+            assert!(splitter.count(shared) >= 24, "pieces {k} and {} share {} tokens", k + 1, splitter.count(shared));
+        }
+    }
+
+    #[test]
+    fn a_word_longer_than_the_cap_is_cut_by_token_and_loses_no_byte() {
+        let words = subword_words(60);
+        let long: String = std::iter::once("bal".to_string())
+            .chain((0..149).map(|i| char::from_u32(0x4E00 + i).expect("CJK block is dense here").to_string()))
+            .collect();
+        let text = format!("{} {long} {}", words[..20].join(" "), words[20..].join(" "));
+        let long_start = text.find(&long).expect("the long word is in the text");
+        let long_end = long_start + long.len();
+        let splitter = TokenSplitter::with_tokenizer(subword_tokenizer());
+        assert_eq!(splitter.count(&long), 150, "the long word is 150 tokens");
+
+        let chunks = splitter.split(&text, 96, 24);
+        let pieces: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let ranges = piece_ranges(&text, &pieces);
+        assert_eq!((ranges[0].0, ranges[ranges.len() - 1].1), (0, text.len()), "the pieces reach both ends");
+        for (k, pair) in ranges.windows(2).enumerate() {
+            assert!(pair[1].0 <= pair[0].1, "bytes {}..{} after piece {k} are in no piece", pair[0].1, pair[1].0);
+        }
+        for piece in &pieces {
+            assert!(splitter.count(piece) <= 96, "a piece of {} tokens", splitter.count(piece));
+        }
+        let cuts: Vec<usize> = ranges.iter().flat_map(|&(s, e)| [s, e]).collect();
+        assert!(cuts.iter().any(|&b| b > long_start && b < long_end), "the long word is cut by token");
+        for &b in cuts.iter().filter(|&&b| b <= long_start || b >= long_end) {
+            assert!(is_word_boundary(&text, b), "a cut outside the long word falls inside a word at byte {b}");
+        }
+    }
+
+    #[test]
+    fn a_text_without_spaces_is_cut_as_before() {
+        let text: String = (0..300).map(|i| char::from_u32(0x4E00 + i).expect("CJK block is dense here")).collect();
+        let chunks = TokenSplitter::with_tokenizer(subword_tokenizer()).split(&text, 96, 24);
+        let chars: Vec<char> = text.chars().collect();
+        let expected: Vec<String> =
+            [(0, 96), (72, 168), (144, 240), (216, 300)].iter().map(|&(s, e)| chars[s..e].iter().collect()).collect();
+        assert_eq!(chunks.into_iter().map(|c| c.text).collect::<Vec<_>>(), expected, "one window every 72 tokens");
+    }
+
     #[test]
     fn token_path_splits_on_token_windows_with_the_requested_overlap() {
         let (text, words) = word_fixture(300);
@@ -745,9 +982,9 @@ mod tests {
 
         let (max, overlap) = (100usize, 20usize);
         let chunks = splitter.split(&text, max, overlap);
-        let expected = plan_windows(words.len(), max, overlap);
-        assert_eq!(chunks.len(), expected.len(), "token path must follow plan_windows");
-        assert!(chunks.len() >= 3, "fixture must yield >= 3 chunks, got {}", chunks.len());
+        // Every word is one token, so every token opens a word.
+        let expected = [(0, 100), (80, 180), (160, 260), (240, 300)];
+        assert_eq!(chunks.len(), expected.len(), "one window every 80 tokens");
 
         for (chunk, &(s, e)) in chunks.iter().zip(expected.iter()) {
             // Exact text: pins BOTH offset lookups (start uses the token's
@@ -829,20 +1066,11 @@ mod tests {
     }
 
     #[test]
-    fn split_ascii_byte_path_matches_plan_windows_shape() {
-        // Parity: for ASCII input, the byte-fallback path's chunk boundaries
-        // must land on exactly the same offsets plan_windows would compute
-        // over raw bytes — this is the coverage substitute for the untested
-        // tokenizer path, which shares the same plan_windows call.
+    fn split_ascii_byte_path_cuts_windows_of_the_cap_at_its_stride() {
+        // On ASCII the byte path cuts 1920-byte windows every 1664 bytes, as
+        // the token path does when every token opens a word.
         let content = "y".repeat(4000);
-        let max_b = 1920;
-        let ov_b = 256;
-        let expected = plan_windows(content.len(), max_b, ov_b);
-        let splitter = TokenSplitter::fallback();
-        let chunks = splitter.split(&content, 480, 64);
-        assert_eq!(chunks.len(), expected.len());
-        for (chunk, &(s, e)) in chunks.iter().zip(expected.iter()) {
-            assert_eq!(chunk.text.len(), e - s);
-        }
+        let chunks = TokenSplitter::fallback().split(&content, 480, 64);
+        assert_eq!(chunks.iter().map(|c| c.text.len()).collect::<Vec<_>>(), [1920, 1920, 672]);
     }
 }

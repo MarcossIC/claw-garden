@@ -29,8 +29,8 @@ Strict TDD: en cada tarea que agrega conducta nueva, el test va primero y falla 
 
 - [x] Toda la suite y clippy en Windows sobre el último commit, y el banco antes y después ([verify](verify.md)).
 - [x] Con autorización explícita: una importación real en el perfil de desarrollo, con compilación de depuración. Tardó 1 218 s contra 3 078 s, y el dry run 70 s contra 910 s, con las mismas filas ([verify](verify.md#importación-real-en-el-perfil-de-desarrollo-2026-10-24)).
-- [ ] El CI en verde en Linux y Windows.
+- [x] El CI en verde en Linux y Windows: el del pull request #87 sobre `42b1aec` y sobre `076eeb7` ([verify](verify.md#ci-2026-10-24)).
 
 ## 6. Archive
 
-- [ ] `specs/storage` (V25 y su vuelta atrás, checksums hasta V25, `idx_memory_dedup` ya no parcial en `:375` y `:397`) y `specs/portability` (R1, R5); `git mv` a `changes/archive/AAAA-MM-DD-import-linear`; `state.yaml` archivado; fila 81 y orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/storage` (V25 y su vuelta atrás como IL2, R3 como IL3, checksums hasta V25, `idx_memory_dedup` ya no parcial en las secciones de V18 y V20) y `specs/portability` (R1 y R5 como IL1 e IL5); `git mv` a `changes/archive/2026-10-24-import-linear`; `state.yaml` archivado; fila 81 y orden de ejecución del `README.md` de openspec; subir el minor. También se realinearon las citas a `import.rs`, `db.rs` y `migrations.rs` ([verify](verify.md#al-archivar-2026-10-24)).

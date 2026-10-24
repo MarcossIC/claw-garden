@@ -31,11 +31,11 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 - [x] Suite y clippy de `.claude/CLAUDE.md` en Linux.
 - [x] El banco de 81 y la espera máxima de la sonda, antes y después, en `verify.md`.
-- [ ] Suite y clippy en Windows (`target-test`).
-- [ ] El CI en verde en Linux y Windows.
-- [ ] **[perfil dev, con autorización]** Una importación real con sondas (`/health`, listado y búsqueda): la fase de decisión no agota ningún plazo.
-- [ ] `verify.md`.
+- [x] Suite y clippy en Windows (`target-test`).
+- [x] El CI en verde en Linux y Windows.
+- [x] **[perfil dev, con autorización]** Una importación real con sondas (`/health`, listado y búsqueda): la fase de decisión no agota ningún plazo.
+- [x] `verify.md`.
 
 ## 5. Archive
 
-- [ ] `specs/portability` con ID1 a ID4; `git mv` a `changes/archive/AAAA-MM-DD-import-decision-pass`; `state.yaml` archivado; la fila 82 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/portability` con ID1 a ID3, e ID4 en la tabla de IL1; `git mv` a `changes/archive/2026-10-24-import-decision-pass`; `state.yaml` archivado; la fila 82 y el orden de ejecución del `README.md` de openspec; subir el minor. También se corrigió el comentario de `the_import_lookups_seek_an_index`, que import-linear dejó anotado ([verify](verify.md#al-archivar-2026-10-24)).

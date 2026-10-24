@@ -19,6 +19,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 (sólo «Una base en V19 abre con los índices por proyecto» y su vuelta atrás).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «El idioma de cada fila», LP4 y LP5 de esa spec). La preferencia y su archivo están en [`specs/preferences`](../preferences/spec.md).
 - [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (sólo «El proyecto de origen», HI1 de esa spec). Cómo se llena la columna está en [`specs/portability`](../portability/spec.md).
+- [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24 (sólo V25: IL2, su vuelta atrás e IL3). Que la importación llegue a sus filas por índice está en [`specs/portability`](../portability/spec.md) (IL1 e IL5).
 
 ## Definiciones
 
@@ -299,7 +300,7 @@ La resolución es una función pura que recibe el home (`data_dir_in`, `paths.rs
 
 ### Migraciones atómicas
 
-Las migraciones pendientes de un arranque MUST aplicarse en una sola transacción junto con sus filas de historial (`configured`, `crates/clawg-core/src/memory/db.rs:394`, con `set_grouped(true)`). Si una falla, la base MUST quedar como estaba antes del arranque.
+Las migraciones pendientes de un arranque MUST aplicarse en una sola transacción junto con sus filas de historial (`configured`, `crates/clawg-core/src/memory/db.rs:417`, con `set_grouped(true)`). Si una falla, la base MUST quedar como estaba antes del arranque.
 
 #### Escenario: fallo a mitad
 - GIVEN una base vacía y la lista V1–V8 más una V9 cuyo SQL falla
@@ -315,7 +316,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V22) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V25) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -360,7 +361,7 @@ Una base en V16 MUST abrir con V17 con cada fila igual, salvo `supersede_cause`,
 - WHEN se abre con la versión nueva
 - THEN la revisión queda `revision`, los dos veredictos `verdict`, la revisión deshecha `verdict`, y las demás filas sin causa ni `revived_from`
 
-**Tests:** `a_database_from_before_revivals_opens_with_its_supersede_causes` (`crates/clawg-core/src/memory/db.rs:1152`), que siembra V16 con SQL directo; el checksum de V17 en `published_migration_checksums_are_pinned` (`migrations.rs`). Que `clawg update` aplique V17 sobre una base en V16 con revisiones y veredictos, y que el daemon nuevo actúe según esas causas, está en [`specs/self-update`](../self-update/spec.md), S10, «Escenario: migración pendiente sobre filas sin causa de reemplazo».
+**Tests:** `a_database_from_before_revivals_opens_with_its_supersede_causes` (`crates/clawg-core/src/memory/db.rs:1175`), que siembra V16 con SQL directo; el checksum de V17 en `published_migration_checksums_are_pinned` (`migrations.rs`). Que `clawg update` aplique V17 sobre una base en V16 con revisiones y veredictos, y que el daemon nuevo actúe según esas causas, está en [`specs/self-update`](../self-update/spec.md), S10, «Escenario: migración pendiente sobre filas sin causa de reemplazo».
 
 #### Vuelta atrás de V17
 
@@ -372,7 +373,7 @@ Una base escrita por una versión anterior a V17 puede tener una versión reempl
 
 ### Una base en V17 abre con los índices de las sentencias de sesión
 
-V18 (`crates/clawg-core/migrations/V18__session_indexes.sql`) sólo toca índices de `memory`: crea `idx_memory_session_summary` sobre `(project_id, created_at DESC)` para los `session_summary` no borrados, que lee LAST SESSION, e `idx_memory_agent_created` sobre `(agent_id, created_at DESC)` para las filas no borradas, que lee RECENT ([`specs/retrieval`](../retrieval/spec.md), «Las sentencias de sesión leen por índice»), y reconstruye `idx_memory_dedup` como `(agent_id, COALESCE(project_id, ''), content_hash, created_at)` con el mismo predicado parcial. El índice del agente entrega las filas de `agent_id = ?` por `created_at`, y sin el sello en el de dedup el planificador lo elegía para las búsquedas de dedup (`ORDER BY created_at ASC LIMIT 1`): cada guardado habría recorrido las filas vivas del agente. Con el sello, esas búsquedas (`REINFORCE_LOOKUP_SQL`, `crates/clawg-core/src/memory/store_insert.rs:300`; `TWIN_SQL` del import; `RESTORE_TWIN` del undelete) llegan por el índice de dedup sin ordenar. Ningún predicado nombra `status`: un índice parcial sólo sirve a una sentencia cuyo `WHERE` implica el del índice, y eso ataría el índice al texto de los estados.
+V18 (`crates/clawg-core/migrations/V18__session_indexes.sql`) sólo toca índices de `memory`: crea `idx_memory_session_summary` sobre `(project_id, created_at DESC)` para los `session_summary` no borrados, que lee LAST SESSION, e `idx_memory_agent_created` sobre `(agent_id, created_at DESC)` para las filas no borradas, que lee RECENT ([`specs/retrieval`](../retrieval/spec.md), «Las sentencias de sesión leen por índice»), y reconstruye `idx_memory_dedup` como `(agent_id, COALESCE(project_id, ''), content_hash, created_at)` con el mismo predicado parcial. El índice del agente entrega las filas de `agent_id = ?` por `created_at`, y sin el sello en el de dedup el planificador lo elegía para las búsquedas de dedup (`ORDER BY created_at ASC LIMIT 1`): cada guardado habría recorrido las filas vivas del agente. Con el sello, esas búsquedas (`REINFORCE_LOOKUP_SQL`, `crates/clawg-core/src/memory/store_insert.rs:300`; `TWIN_SQL` del import; `RESTORE_TWIN` del undelete) llegan por el índice de dedup sin ordenar. Ningún predicado nombra `status`: un índice parcial sólo sirve a una sentencia cuyo `WHERE` implica el del índice, y eso ataría el índice al texto de los estados. V20 le cambia las columnas a `idx_memory_dedup` y V25 le quita el predicado (abajo).
 
 Una base en V17 MUST abrir con V18 con cada fila igual y con los tres índices. La migración MUST NOT cambiar ninguna fila.
 
@@ -386,7 +387,7 @@ Una base en V17 MUST abrir con V18 con cada fila igual y con los tres índices. 
 - WHEN se pide el plan de `REINFORCE_LOOKUP_SQL`
 - THEN nombra `idx_memory_dedup` y ninguna línea nombra `TEMP B-TREE`
 
-**Tests:** `a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them` (`crates/clawg-core/src/memory/db.rs:1320`), que abre con `MemoryStore::open`, así que pasa también por el snapshot `pre-migration`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs:2165`); el checksum de V18 en `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them` (`crates/clawg-core/src/memory/db.rs:1343`), que abre con `MemoryStore::open`, así que pasa también por el snapshot `pre-migration`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs:2165`); el checksum de V18 en `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 #### Vuelta atrás de V18
 
@@ -394,7 +395,7 @@ Un binario anterior a V18 MUST NOT abrir una base en V18: la rechaza sin tocarla
 
 ### Una base en V19 abre con los índices por proyecto
 
-V20 (`crates/clawg-core/migrations/V20__project_scoped_indexes.sql`) sólo toca índices de `memory`: reconstruye `idx_memory_dedup` como `(COALESCE(project_id, ''), content_hash, created_at)` e `idx_memory_topic` como `(COALESCE(project_id, ''), topic_key)`, con los mismos predicados parciales. La dedup y la clave de tema comparan un save con su proyecto, de cualquier autor ([`specs/ingest`](../ingest/spec.md)), y ninguna búsqueda trae ya una igualdad sobre `agent_id`, con la que empezaban los dos. El autor queda como filtro residual del alcance del que guarda (`reach_predicate!`): el índice lleva a las filas del proyecto con ese hash o esa clave, que son pocas. Usan el de dedup `REINFORCE_LOOKUP_SQL` (refuerzo y `insert_unless_twin`), `RESTORE_TWIN` y `TWIN_SQL` del import; el de la clave, `SCOPE_ROWS_SQL` (`crates/clawg-core/src/memory/topic.rs`), `RESTORE_TOPIC_HOLDER`, `KEY_HELD_SQL` y `TOPIC_HOLDERS_SQL`.
+V20 (`crates/clawg-core/migrations/V20__project_scoped_indexes.sql`) sólo toca índices de `memory`: reconstruye `idx_memory_dedup` como `(COALESCE(project_id, ''), content_hash, created_at)` e `idx_memory_topic` como `(COALESCE(project_id, ''), topic_key)`, con los mismos predicados parciales. La dedup y la clave de tema comparan un save con su proyecto, de cualquier autor ([`specs/ingest`](../ingest/spec.md)), y ninguna búsqueda trae ya una igualdad sobre `agent_id`, con la que empezaban los dos. El autor queda como filtro residual del alcance del que guarda (`reach_predicate!`): el índice lleva a las filas del proyecto con ese hash o esa clave, que son pocas. Usan el de dedup `REINFORCE_LOOKUP_SQL` (refuerzo y `insert_unless_twin`), `RESTORE_TWIN` y `TWIN_SQL` del import; el de la clave, `SCOPE_ROWS_SQL` (`crates/clawg-core/src/memory/topic.rs`), `RESTORE_TOPIC_HOLDER`, `KEY_HELD_SQL` y `TOPIC_HOLDERS_SQL`. V25 le quita el predicado a `idx_memory_dedup` y le deja estas columnas; `idx_memory_topic` sigue parcial.
 
 Una base en V19 MUST abrir con V20 con cada fila igual, con `synthesis_review` igual y con los dos índices nuevos. La migración MUST NOT cambiar ninguna fila. Lo que las reglas por agente dejaban convivir (dos titulares de una clave o dos filas con un mismo texto en un proyecto, de agentes distintos) sigue vivo y alcanzable: el doctor lo marca ([`specs/doctor`](../doctor/spec.md)) y el próximo save con esa clave reemplaza a los dos.
 
@@ -414,12 +415,43 @@ Una base en V19 MUST abrir con V20 con cada fila igual, con `synthesis_review` i
 
 Un binario anterior a V20 MUST NOT abrir una base en V20: la rechaza sin tocarla con `SchemaNewer`. La vuelta atrás es la copia `pre-migration` que se escribió antes de V20, que `clawg update` restaura sola si el binario viejo se niega ([`specs/self-update`](../self-update/spec.md)). Quitar V20 a mano no pierde ninguna fila: `DROP INDEX idx_memory_dedup; CREATE INDEX idx_memory_dedup ON memory (agent_id, COALESCE(project_id, ''), content_hash, created_at) WHERE deleted_at IS NULL AND content_hash IS NOT NULL; DROP INDEX idx_memory_topic; CREATE INDEX idx_memory_topic ON memory (agent_id, COALESCE(project_id, ''), topic_key) WHERE deleted_at IS NULL AND topic_key IS NOT NULL; DELETE FROM refinery_schema_history WHERE version = 20;`. Lo que las reglas por proyecto hicieron mientras tanto (una fila reforzada por otro agente, una versión reemplazada por la clave de otro agente) queda: son filas y estados que la versión anterior sabe leer.
 
+### IL2. Una base en V24 abre con el índice de dedup entero
+
+V25 (`crates/clawg-core/migrations/V25__dedup_index_all_rows.sql`) MUST sólo reconstruir `idx_memory_dedup` como `(COALESCE(project_id, ''), content_hash, created_at)`, sin `WHERE`, y MUST NOT cambiar ninguna fila. El índice MUST tener una entrada por cada fila, también por las borradas y por las que no tienen `content_hash`. La importación pregunta si una fila de un agente, un proyecto, un texto y una fecha ya está, borrada o no (`PRESENT_SQL`, [`specs/portability`](../portability/spec.md) IL1), así que esa búsqueda no lleva término `deleted_at`; con el predicado de V20 el índice no le servía y recorría `memory` por cada fila del archivo. Filas sin hash casi no hay, porque V6 se lo calculó a toda fila con texto (`crates/clawg-core/migrations/V6__content_hash.sql:7`), y las borradas son una minoría.
+
+Una base en V24 MUST abrir con V25 con cada fila tal como estaba, después de la copia `pre-migration` que se escribe antes de toda migración.
+
+#### Escenario
+- GIVEN un `memory.db` migrado hasta V24, con una fila viva, una borrada y otra sin `content_hash`
+- WHEN `MemoryStore::open` lo abre
+- THEN las tres filas siguen con las mismas columnas
+- AND el `sql` de `idx_memory_dedup` en `sqlite_master` tiene la misma lista de columnas y no lleva `WHERE`
+- AND una consulta `INDEXED BY idx_memory_dedup` encuentra la fila borrada por su proyecto, su hash y su fecha
+- AND en `backups` hay una copia `pre-migration`
+
+**Tests:** `a_store_from_before_the_unfiltered_dedup_index_keeps_its_rows` (`crates/clawg-core/src/memory/db.rs`), que abre con `MemoryStore::open`; el checksum de V25 en `published_migration_checksums_are_pinned` (`migrations.rs`); `a_v8_database_opens_unchanged_under_grouped_migrations`, `idempotent_migrations_second_open` y `e2e_store_smoke` (`db.rs`), que cuentan 25 migraciones.
+
+#### Vuelta atrás de V25
+
+Un binario anterior a V25 MUST NOT abrir una base en V25: la rechaza sin tocarla con `SchemaNewer`. La vuelta atrás es la copia `pre-migration` que se escribió antes de V25, que `clawg update` restaura sola si el binario viejo se niega ([`specs/self-update`](../self-update/spec.md)). Quitar V25 a mano no pierde ninguna fila, y la importación vuelve a recorrer `memory` por cada fila: `DROP INDEX idx_memory_dedup; CREATE INDEX idx_memory_dedup ON memory (COALESCE(project_id, ''), content_hash, created_at) WHERE deleted_at IS NULL AND content_hash IS NOT NULL; DELETE FROM refinery_schema_history WHERE version = 25;`.
+
+### IL3. Las búsquedas del texto vivo y de la clave no cambian de índice
+
+`REINFORCE_LOOKUP_SQL` (`crates/clawg-core/src/memory/store_insert.rs`) MUST seguir llegando por `idx_memory_dedup` sin ninguna línea `TEMP B-TREE`. `SCOPE_ROWS_SQL` (`crates/clawg-core/src/memory/topic.rs`) y `TOPIC_HOLDERS_SQL` del import MUST seguir llegando por `idx_memory_topic`, aunque `idx_memory_dedup`, ya sin predicado, también sirva a cualquier consulta con una igualdad sobre `COALESCE(project_id, '')`. Las entradas de filas borradas que ahora tiene el índice se descartan como filtro residual: ninguna de estas consultas MUST devolver otra fila que la que devolvía con el índice parcial.
+
+#### Escenario
+- GIVEN un store migrado
+- WHEN se pide el plan de `REINFORCE_LOOKUP_SQL`, de `SCOPE_ROWS_SQL` y de `TOPIC_HOLDERS_SQL`
+- THEN el primero nombra `idx_memory_dedup` sin `TEMP B-TREE`, y los otros dos nombran `idx_memory_topic`
+
+**Tests:** `reinforce_lookup_uses_dedup_index` (`store_insert.rs`) y `the_scope_lookup_uses_the_topic_index` (`topic.rs`), que V25 no cambió; `TOPIC_HOLDERS_SQL` en `the_import_lookups_seek_an_index` (`crates/clawg-core/src/memory/portability/import.rs`).
+
 ### Verificación del esquema antes de migrar
 
-La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:409`, llamada en `db.rs:195`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
+La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:432`, llamada en `db.rs:200`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V22), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V25), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 
@@ -431,7 +463,7 @@ La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST c
 
 ### Snapshot antes de migrar
 
-Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplicar la primera migración pendiente (`db.rs:229`). Si falla, MUST devolver `MemoryError::Backup` y MUST NOT migrar. Con `Fresh` y `UpToDate` MUST NOT hacer snapshot.
+Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplicar la primera migración pendiente (`db.rs:234`). Si falla, MUST devolver `MemoryError::Backup` y MUST NOT migrar. Con `Fresh` y `UpToDate` MUST NOT hacer snapshot.
 
 #### Escenario
 - GIVEN una base migrada hasta V7, con filas
@@ -766,7 +798,7 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 
 `clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:140`) MUST producir un snapshot `manual` e imprimir su ruta.
 
-- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1857`, ruta en `:1046`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/db.rs:271`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1857`, ruta en `:1046`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/db.rs:294`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
 - Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:339`).
 - Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
 
