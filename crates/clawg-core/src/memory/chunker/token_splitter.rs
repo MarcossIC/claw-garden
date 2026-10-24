@@ -147,16 +147,21 @@ impl TokenSplitter {
 /// word in two when `i` is the first token, or when whitespace comes right
 /// before its offset or right at it. The second rule is for a tokenizer
 /// whose first token of a word holds the space before it (`▁foo` over
-/// `" foo"`), the first for one that leaves it out. Signs are not
-/// boundaries, so a path or an identifier is never cut at a `/` or a `::`.
+/// `" foo"`), the first for one that leaves it out. A token of whitespace
+/// alone, as a lone `▁` is, opens the word that follows and the token after
+/// it does not: the tokenizer puts the `▁` back when it counts a piece cut
+/// after it, one token over what the window held. Signs are not boundaries,
+/// so a path or an identifier is never cut at a `/` or a `::`.
 fn word_starts(text: &str, offsets: &[(usize, usize)]) -> Vec<bool> {
+    let blank = |(start, end): (usize, usize)| text.get(start..end).is_some_and(|t| t.chars().all(char::is_whitespace));
     offsets
         .iter()
         .enumerate()
         .map(|(i, &(start, _))| {
             i == 0
-                || text.get(..start).and_then(|t| t.chars().next_back()).is_some_and(char::is_whitespace)
-                || text.get(start..).and_then(|t| t.chars().next()).is_some_and(char::is_whitespace)
+                || (!blank(offsets[i - 1])
+                    && (text.get(..start).and_then(|t| t.chars().next_back()).is_some_and(char::is_whitespace)
+                        || text.get(start..).and_then(|t| t.chars().next()).is_some_and(char::is_whitespace)))
         })
         .collect()
 }
@@ -244,9 +249,11 @@ pub(crate) mod tests {
         // `▁are` and `▁found` over " are" and " found".
         let text = "retrievies are found";
         assert_eq!(word_starts(text, &[(0, 5), (5, 10), (10, 14), (14, 20)]), [true, false, true, true]);
-        // A lone `▁` with an empty offset at the space opens the word as the
-        // token after it does: a cut before either falls on the same byte.
-        assert_eq!(word_starts(text, &[(0, 10), (10, 10), (11, 14)]), [true, true, true]);
+        // A lone `▁` over the space, or with an empty offset, opens the word
+        // and the token after it does not: a piece cut after the `▁` would
+        // gain it back when the tokenizer counts the piece alone.
+        assert_eq!(word_starts(text, &[(0, 10), (10, 11), (11, 14), (14, 15), (15, 20)]), [true, true, false, true, false]);
+        assert_eq!(word_starts(text, &[(0, 10), (11, 11), (11, 14)]), [true, true, false]);
     }
 
     /// The plan of `n` tokens that each open a word.

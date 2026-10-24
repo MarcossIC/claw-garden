@@ -312,7 +312,7 @@ fn the_real_tokenizer_cuts_no_piece_inside_a_word() {
         assert!(start <= covered, "bytes {covered}..{start} before piece {k} are in no piece");
         assert!(is_word_boundary(&text, start), "piece {k} starts inside a word: {}", around(&text, start));
         assert!(is_word_boundary(&text, end), "piece {k} ends inside a word: {}", around(&text, end));
-        assert!(counter.count(piece) <= 96, "piece {k} has {} tokens", counter.count(piece));
+        assert!(counter.count(piece) <= 96, "piece {k} has {} tokens, from {}", counter.count(piece), around(&text, start));
         from = start + piece.chars().next().map_or(1, char::len_utf8);
         covered = end;
     }
