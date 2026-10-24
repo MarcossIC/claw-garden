@@ -32,6 +32,8 @@ pub struct StoreFacts {
     pub contract: Option<StoredContract>,
     pub agents: Vec<AgentRows>,
     pub projects: Vec<ProjectRow>,
+    /// `project_remote`, by project and then remote.
+    pub remotes: Vec<RemoteRow>,
     pub outbox: OutboxFacts,
     pub invariants: Invariants,
 }
@@ -48,6 +50,13 @@ pub struct AgentRows {
 pub struct ProjectRow {
     pub id: String,
     pub root_path: String,
+}
+
+/// A remote and the project its clones share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRow {
+    pub remote: String,
+    pub project_id: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -155,6 +164,7 @@ fn read_facts(c: &Connection) -> rusqlite::Result<StoreFacts> {
         contract: if has.table("embedding_contract") { contract(c)? } else { None },
         agents: agents(c)?,
         projects: if has.table("project") { projects(c)? } else { Vec::new() },
+        remotes: if has.table("project_remote") { remotes(c)? } else { Vec::new() },
         outbox: if has.table("ingest_outbox") { outbox(c)? } else { OutboxFacts::default() },
         invariants: Invariants {
             topic_versions: if has.memory_column("topic_key") { topic_versions(c, &has)? } else { Vec::new() },
@@ -217,6 +227,12 @@ fn agents(c: &Connection) -> rusqlite::Result<Vec<AgentRows>> {
 fn projects(c: &Connection) -> rusqlite::Result<Vec<ProjectRow>> {
     let mut stmt = c.prepare("SELECT id, root_path FROM project ORDER BY id")?;
     let rows = stmt.query_map([], |r| Ok(ProjectRow { id: r.get(0)?, root_path: r.get(1)? }))?;
+    rows.collect()
+}
+
+fn remotes(c: &Connection) -> rusqlite::Result<Vec<RemoteRow>> {
+    let mut stmt = c.prepare("SELECT remote, project_id FROM project_remote ORDER BY project_id, remote")?;
+    let rows = stmt.query_map([], |r| Ok(RemoteRow { remote: r.get(0)?, project_id: r.get(1)? }))?;
     rows.collect()
 }
 
@@ -649,6 +665,28 @@ mod tests {
             }
         );
         assert_eq!(facts.contract.map(|c| (c.model_id, c.dim)), Some(("some-model".into(), 384)));
+    }
+
+    #[tokio::test]
+    async fn the_facts_name_the_remotes_of_each_project() {
+        let dir = store_with(|c| {
+            for (remote, project) in
+                [("github.com/acme/b", "app-1a2b"), ("github.com/acme/a", "app-1a2b"), ("github.com/acme/w", "w-3c4d")]
+            {
+                c.execute(
+                    "INSERT INTO project_remote (remote, project_id, created_at) VALUES (?1, ?2, 0)",
+                    [remote, project],
+                )
+                .unwrap();
+            }
+        })
+        .await;
+        let facts = inspect(dir.path()).facts.unwrap();
+        let remote = |remote: &str, project_id: &str| RemoteRow { remote: remote.into(), project_id: project_id.into() };
+        assert_eq!(
+            facts.remotes,
+            [remote("github.com/acme/a", "app-1a2b"), remote("github.com/acme/b", "app-1a2b"), remote("github.com/acme/w", "w-3c4d")]
+        );
     }
 
     #[tokio::test]

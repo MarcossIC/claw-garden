@@ -190,6 +190,12 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
         found.extend(checks::outbox(lang, &facts.outbox, daemon_running, profile));
         found.extend(checks::agents(lang, &facts.agents));
         found.extend(checks::projects(lang, &facts.projects));
+        let origins: Vec<_> = facts
+            .projects
+            .iter()
+            .map(|p| (p.clone(), clawg_core::memory::identity::origin_key(Path::new(&p.root_path))))
+            .collect();
+        found.extend(checks::project_remotes(lang, &facts.remotes, &origins));
         found.extend(checks::invariants(lang, &facts.invariants));
     }
     found.extend(claude_code(lang, profile, &exe));

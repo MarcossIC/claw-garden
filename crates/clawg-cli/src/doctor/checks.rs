@@ -12,7 +12,7 @@ use clawg_core::memory::bootstrap::is_pooling_upgrade;
 use clawg_core::memory::db::{EmbeddingIdentity, StoredContract};
 use clawg_core::memory::derive_project_id;
 use clawg_core::memory::identity::is_candidate_for;
-use clawg_core::memory::inspect::{AgentRows, Invariants, OutboxFacts, ProjectRow};
+use clawg_core::memory::inspect::{AgentRows, Invariants, OutboxFacts, ProjectRow, RemoteRow};
 use clawg_core::memory::store_lock::StoreOwner;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
@@ -584,6 +584,51 @@ pub fn projects(lang: Lang, rows: &[ProjectRow]) -> Vec<Finding> {
     found
 }
 
+/// A project bound to more than one remote, each root that uses it named
+/// with the remote it has now (`origins`, beside its row): a repository
+/// cloned where another one was joined the other's project before a row
+/// served only the remote bound to it, and a renamed remote leaves the same.
+/// Telling them apart takes the user, so nothing is proposed.
+pub fn project_remotes(lang: Lang, remotes: &[RemoteRow], origins: &[(ProjectRow, Option<String>)]) -> Vec<Finding> {
+    let mut by_project: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for r in remotes {
+        by_project.entry(&r.project_id).or_default().push(&r.remote);
+    }
+    let mut found = Vec::new();
+    for (project_id, mut bound) in by_project.into_iter().filter(|(_, bound)| bound.len() > 1) {
+        bound.sort_unstable();
+        let roots: Vec<_> = origins
+            .iter()
+            .filter(|(row, origin)| row.id == project_id || origin.as_deref().is_some_and(|o| bound.contains(&o)))
+            .map(|(row, origin)| json!({ "root_id": row.id, "root_path": row.root_path, "origin": origin }))
+            .collect();
+        let message = match lang {
+            Lang::En => format!(
+                "the project {project_id} is bound to {} remotes: a repository cloned where another one was may have \
+                 joined it, or its remote was renamed",
+                bound.len()
+            ),
+            Lang::Es => format!(
+                "el proyecto {project_id} está atado a {} remotos: un repositorio clonado donde estaba otro pudo \
+                 haberse unido a él, o se renombró su remoto",
+                bound.len()
+            ),
+        };
+        found.push(
+            Finding::new("project_remotes", Severity::Warn, "several_remotes", message)
+                .evidence(json!({ "project_id": project_id, "remotes": bound, "roots": roots })),
+        );
+    }
+    if found.is_empty() {
+        let message = match lang {
+            Lang::En => "no project is bound to more than one remote",
+            Lang::Es => "ningún proyecto está atado a más de un remoto",
+        };
+        found.push(Finding::ok("project_remotes", message).evidence(json!({ "remotes": remotes.len() })));
+    }
+    found
+}
+
 /// One check per rule of `memory`, `ok` when nothing breaks it.
 pub fn invariants(lang: Lang, inv: &Invariants) -> Vec<Finding> {
     let mut found = Vec::new();
@@ -960,6 +1005,40 @@ mod tests {
     }
 
     #[test]
+    fn project_remote_findings() {
+        let remote = |remote: &str, project_id: &str| RemoteRow { remote: remote.into(), project_id: project_id.into() };
+        let root = |id: &str, root_path: &str, origin: Option<&str>| {
+            (ProjectRow { id: id.into(), root_path: root_path.into() }, origin.map(str::to_string))
+        };
+        let healthy = [remote("github.com/acme/a", "app-1a2b"), remote("github.com/acme/w", "w-3c4d")];
+        let roots = [root("app-1a2b", "/work/app", Some("github.com/acme/a")), root("w-3c4d", "/else/w", None)];
+        let ok = project_remotes(L, &healthy, &roots);
+        assert_eq!(kinds(&ok), [("project_remotes", Severity::Ok, "healthy")]);
+        assert_eq!(ok[0].evidence["remotes"], 2);
+
+        let fused = [remote("github.com/acme/b", "app-1a2b"), remote("github.com/acme/a", "app-1a2b"), remote("github.com/acme/w", "w-3c4d")];
+        let roots = [
+            root("app-1a2b", "/work/app", Some("github.com/acme/b")),
+            root("app-5e6f", "/review/a", Some("github.com/acme/a")),
+            root("w-3c4d", "/else/w", Some("github.com/acme/w")),
+        ];
+        let found = project_remotes(L, &fused, &roots);
+        assert_eq!(kinds(&found), [("project_remotes", Severity::Warn, "several_remotes")]);
+        assert_eq!(
+            found[0].evidence,
+            json!({
+                "project_id": "app-1a2b",
+                "remotes": ["github.com/acme/a", "github.com/acme/b"],
+                "roots": [
+                    { "root_id": "app-1a2b", "root_path": "/work/app", "origin": "github.com/acme/b" },
+                    { "root_id": "app-5e6f", "root_path": "/review/a", "origin": "github.com/acme/a" },
+                ],
+            })
+        );
+        assert_eq!(found[0].safe_next_step, None);
+    }
+
+    #[test]
     fn invariant_findings() {
         let healthy = invariants(L, &Invariants::default());
         assert_eq!(
@@ -1095,6 +1174,12 @@ mod tests {
         all.extend(agents(lang, &[]));
         all.extend(projects(lang, &[ProjectRow { id: "proj-0000".into(), root_path: root.into() }]));
         all.extend(projects(lang, &[]));
+        let fused = [
+            RemoteRow { remote: "github.com/acme/a".into(), project_id: "proj-0000".into() },
+            RemoteRow { remote: "github.com/acme/b".into(), project_id: "proj-0000".into() },
+        ];
+        all.extend(project_remotes(lang, &fused, &[(ProjectRow { id: "proj-0000".into(), root_path: root.into() }, None)]));
+        all.extend(project_remotes(lang, &[], &[]));
         all.extend(invariants(lang, &broken));
         all.extend(invariants(lang, &Invariants::default()));
         all
