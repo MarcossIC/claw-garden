@@ -3602,6 +3602,36 @@ async fn an_import_stores_rows_with_their_state_and_a_dry_run_stores_none() {
 }
 
 #[tokio::test]
+async fn an_import_is_undone_by_its_number() {
+    let h = Harness::start().await;
+    let (status, report) = h.post_json("/v1/import", json!({ "text": export_file(1) })).await;
+    assert_eq!((status, report["import_id"].clone()), (200, json!(1)), "{report}");
+    let count = || async { h.get_json("/v1/memories?kind=memory&agent=a").await.1["items"].as_array().map(Vec::len) };
+
+    let (status, dry) = h.post_json("/v1/import/undo", json!({ "import_id": 1, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!((dry["removed"].as_array().map(Vec::len), dry["snapshot"].clone()), (Some(2), Value::Null), "{dry}");
+    assert_eq!(count().await, Some(2), "a dry run writes nothing");
+
+    let (status, undone) = h.post_json("/v1/import/undo", json!({ "import_id": 1 })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert_eq!(undone["removed"], dry["removed"], "{undone}");
+    assert!(undone["snapshot"].as_str().is_some_and(|s| s.ends_with("-pre-undo.db")), "{undone}");
+    assert_eq!(count().await, Some(0));
+
+    let (status, again) = h.post_json("/v1/import/undo", json!({ "import_id": 1 })).await;
+    assert_eq!((status, again["removed"].clone(), again["snapshot"].clone()), (200, json!([]), Value::Null), "{again}");
+    let (status, body) = h.post_json("/v1/import/undo", json!({ "import_id": 9 })).await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = h.post_json("/v1/import/undo", json!({ "import": 1 })).await;
+    assert!((400..500).contains(&status), "a misspelt field undoes nothing: {status} {body}");
+
+    let h = Harness::start_without_embedder().await;
+    let (status, body) = h.post_json("/v1/import/undo", json!({ "import_id": 1 })).await;
+    assert_eq!(status, 404, "an undo needs no model: {body}");
+}
+
+#[tokio::test]
 async fn import_answers_400_for_an_unknown_version_before_the_embedder() {
     let h = Harness::start_without_embedder().await;
     let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(2) })).await;
