@@ -53,8 +53,9 @@ pub struct SaveText {
 }
 
 /// Shortest repeated text treated as the overlap between two neighbours;
-/// anything shorter is as likely a coincidence as a repeat.
-const MIN_OVERLAP_CHARS: usize = 16;
+/// anything shorter is as likely a coincidence as a repeat. The chunker
+/// keeps at least this much between the pieces it cuts.
+pub(crate) const MIN_OVERLAP_CHARS: usize = 16;
 /// Farthest back an overlap is looked for. The chunker repeats at least 24
 /// tokens between the pieces of a save (64 between chunks), stretched back to
 /// where a word starts: well under this at any realistic token length.

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use super::Chunk;
+use crate::memory::pieces::MIN_OVERLAP_CHARS;
 
 /// Pure "split this text by token cap with overlap" helper.
 #[derive(Clone)]
@@ -91,7 +92,7 @@ impl TokenSplitter {
         if offsets.is_empty() {
             return vec![];
         }
-        plan_word_windows(&word_starts(text, offsets), max, overlap)
+        plan_word_windows(&word_starts(text, offsets), &char_spans(text, offsets), max, overlap)
             .into_iter()
             .map(|(start, end)| {
                 let start_byte = offsets[start].0;
@@ -166,16 +167,29 @@ fn word_starts(text: &str, offsets: &[(usize, usize)]) -> Vec<bool> {
         .collect()
 }
 
+/// The characters of `text` before the start and before the end of each
+/// token: what `join_pieces` counts when it looks for an overlap.
+fn char_spans(text: &str, offsets: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut before = vec![0usize; text.len() + 1];
+    let mut count = 0;
+    for (byte, _) in text.char_indices() {
+        before[byte] = count;
+        count += 1;
+    }
+    before[text.len()] = count;
+    let at = |byte: usize| before.get(byte).copied().unwrap_or(count);
+    offsets.iter().map(|&(start, end)| (at(start), at(end))).collect()
+}
+
 /// The windows of at most `max` tokens a text is cut into, as half-open
-/// `[start, end)` token ranges, given which tokens open a word. A window ends
-/// at the last word start within `max` of its start, and the next one starts
-/// at the last word start that leaves `overlap` tokens shared: the overlap
-/// grows back to the start of a word instead of shrinking, so the neighbours
-/// still share what `join_pieces` looks for. Where no word start is in reach,
-/// as in a word longer than the window or a text without spaces, the cut
-/// falls on the token. With every token a word start the windows advance by
-/// exactly `max - overlap`. Pure and tokenizer-free.
-fn plan_word_windows(starts: &[bool], max: usize, overlap: usize) -> Vec<(usize, usize)> {
+/// `[start, end)` token ranges, given which tokens open a word and the
+/// characters before each ([`char_spans`]). A window ends at the last word
+/// start within `max` of its start, and the next one starts where
+/// [`next_start`] says. Where no word start is in reach, as in a word longer
+/// than the window or a text without spaces, the cut falls on the token. With
+/// every token a word start the windows advance by exactly `max - overlap`.
+/// Pure and tokenizer-free.
+fn plan_word_windows(starts: &[bool], chars: &[(usize, usize)], max: usize, overlap: usize) -> Vec<(usize, usize)> {
     let n = starts.len();
     if max == 0 || n == 0 {
         return vec![];
@@ -199,10 +213,38 @@ fn plan_word_windows(starts: &[bool], max: usize, overlap: usize) -> Vec<(usize,
         // last is shorter than the overlap or lies inside the one before.
         let end = last_start_in((start + overlap).max(previous_end) + 1, cap).unwrap_or(cap);
         out.push((start, end));
-        let latest = end - overlap;
         previous_end = end;
-        start = last_start_in(start + 1, latest).unwrap_or(latest);
+        start = next_start(starts, chars, start, end, overlap);
     }
+}
+
+/// Where the window after `[start, end)` starts: at the word start nearest
+/// the token that leaves `overlap` shared, the one before it on a tie, so the
+/// overlap stays about `overlap` on average. Always taking the word start
+/// before it would add rows wherever a long word (a path, an identifier)
+/// crosses that token. When the text it shares holds fewer than
+/// [`MIN_OVERLAP_CHARS`], `join_pieces` would find no overlap, so it moves
+/// back to the last word start that keeps them. Without a word start to move
+/// to, it falls on the token. With no overlap asked for there is no floor,
+/// and the windows tile the text.
+fn next_start(starts: &[bool], chars: &[(usize, usize)], start: usize, end: usize, overlap: usize) -> usize {
+    let target = end - overlap;
+    let before = (start + 1..=target).rev().find(|&i| starts[i]);
+    if overlap == 0 {
+        return before.unwrap_or(target);
+    }
+    let after = (target..end).find(|&i| starts[i]);
+    let nearest = match (before, after) {
+        (Some(b), Some(a)) if a - target < target - b => a,
+        (Some(b), _) => b,
+        (None, Some(a)) => a,
+        (None, None) => return target,
+    };
+    let joins = |i: usize| chars[end - 1].1 - chars[i].0 >= MIN_OVERLAP_CHARS;
+    if joins(nearest) {
+        return nearest;
+    }
+    (start + 1..nearest).rev().find(|&i| starts[i] && joins(i)).or(before).unwrap_or(target)
 }
 
 fn floor_char_boundary(text: &str, index: usize) -> usize {
@@ -256,9 +298,27 @@ pub(crate) mod tests {
         assert_eq!(word_starts(text, &[(0, 10), (11, 11), (11, 14)]), [true, true, false]);
     }
 
+    #[test]
+    fn char_spans_count_the_characters_before_each_token() {
+        // `ñ` and `文` are two and three bytes, one character each.
+        let text = "año 文 x";
+        assert_eq!(char_spans(text, &[(0, 4), (5, 8), (9, 10)]), [(0, 3), (4, 5), (6, 7)]);
+    }
+
+    /// The characters `char_spans` gives `n` tokens of `width` each.
+    fn even_chars(n: usize, width: usize) -> Vec<(usize, usize)> {
+        (0..n).map(|i| (i * width, (i + 1) * width)).collect()
+    }
+
+    /// The plan of `starts` with every token so wide that one shared token
+    /// already holds what `join_pieces` looks for.
+    fn wide(starts: &[bool], max: usize, overlap: usize) -> Vec<(usize, usize)> {
+        plan_word_windows(starts, &even_chars(starts.len(), MIN_OVERLAP_CHARS), max, overlap)
+    }
+
     /// The plan of `n` tokens that each open a word.
     fn every_word(n: usize, max: usize, overlap: usize) -> Vec<(usize, usize)> {
-        plan_word_windows(&vec![true; n], max, overlap)
+        wide(&vec![true; n], max, overlap)
     }
 
     #[test]
@@ -306,7 +366,7 @@ pub(crate) mod tests {
         assert_eq!(every_word(1000, 4, 4), every_word(1000, 4, 3), "overlap == max behaves as max - 1");
         assert_eq!(every_word(1000, 4, 4).len(), 997);
         let words_of_three: Vec<bool> = (0..100).map(|i| i % 3 == 0).collect();
-        assert_eq!(plan_word_windows(&words_of_three, 5, 50), plan_word_windows(&words_of_three, 5, 4));
+        assert_eq!(wide(&words_of_three, 5, 50), wide(&words_of_three, 5, 4));
     }
 
     /// Mark patterns for the sweep: every token, only the first, words of a
@@ -331,12 +391,27 @@ pub(crate) mod tests {
         patterns
     }
 
-    /// Fails when `windows` is not the plan D2 describes for `starts`: bounded,
-    /// covering, never nested, never shorter than the overlap but at the end,
-    /// sharing at least the overlap, and cut at the last word start in reach.
-    fn check_plan(starts: &[bool], max: usize, overlap: usize, windows: &[(usize, usize)]) {
+    /// Character widths for the sweep: so wide that one shared token joins,
+    /// so narrow that the floor moves most starts back, and mixed.
+    fn char_patterns(n: usize) -> Vec<Vec<(usize, usize)>> {
+        let mut mixed = Vec::with_capacity(n);
+        let mut at = 0;
+        for i in 0..n {
+            let width = 1 + (7 * i + 3) % 6;
+            mixed.push((at, at + width));
+            at += width;
+        }
+        vec![even_chars(n, MIN_OVERLAP_CHARS), even_chars(n, 1), mixed]
+    }
+
+    /// Fails when `windows` is not the plan D2 and D3 describe for `starts`
+    /// and `chars`: bounded, covering, never nested, never shorter than the
+    /// overlap but at the end, cut at the last word start in reach, and each
+    /// next window started at the word start nearest the overlap that still
+    /// joins.
+    fn check_plan(starts: &[bool], chars: &[(usize, usize)], max: usize, overlap: usize, windows: &[(usize, usize)]) {
         let n = starts.len();
-        let at = || format!("n={n} max={max} overlap={overlap} starts={starts:?} windows={windows:?}");
+        let at = || format!("n={n} max={max} overlap={overlap} starts={starts:?} chars={chars:?} windows={windows:?}");
         if n == 0 {
             assert!(windows.is_empty(), "{}", at());
             return;
@@ -352,8 +427,25 @@ pub(crate) mod tests {
             let expected_end = marked((s + overlap).max(previous_end) + 1, s + max).unwrap_or(s + max);
             assert_eq!(e, expected_end, "window {k} does not end at the last word start in reach: {}", at());
             assert!(next_s > s && next_e > e, "window {} lies inside window {k}: {}", k + 1, at());
-            let expected_start = marked(s + 1, e - overlap).unwrap_or(e - overlap);
-            assert_eq!(next_s, expected_start, "window {} does not start at the last word start: {}", k + 1, at());
+
+            let target = e - overlap;
+            let joins = |i: usize| chars[e - 1].1 - chars[i].0 >= MIN_OVERLAP_CHARS;
+            let before = marked(s + 1, target);
+            let after = (target..e).find(|&i| starts[i]);
+            let nearest = match (before, after) {
+                (Some(b), Some(a)) => Some(if a - target < target - b { a } else { b }),
+                (b, a) => b.or(a),
+            };
+            let expected_start = match nearest {
+                _ if overlap == 0 => before.unwrap_or(target),
+                None => target,
+                Some(c) if joins(c) => c,
+                Some(c) => (s + 1..c).rev().find(|&i| starts[i] && joins(i)).or(before).unwrap_or(target),
+            };
+            assert_eq!(next_s, expected_start, "window {} does not start where D3 says: {}", k + 1, at());
+            if overlap > 0 && (s + 1..e).any(|i| starts[i] && joins(i)) {
+                assert!(joins(next_s), "windows {k} and {} share under 16 characters: {}", k + 1, at());
+            }
             previous_end = e;
         }
     }
@@ -365,18 +457,22 @@ pub(crate) mod tests {
         for n in 1..=10usize {
             for bits in 0..1u32 << (n - 1) {
                 let starts: Vec<bool> = (0..n).map(|i| i == 0 || (bits >> (i - 1)) & 1 == 1).collect();
-                for max in 1..=12usize {
-                    for overlap in 0..=max {
-                        check_plan(&starts, max, overlap, &plan_word_windows(&starts, max, overlap));
+                for chars in char_patterns(n) {
+                    for max in 1..=12usize {
+                        for overlap in 0..=max {
+                            check_plan(&starts, &chars, max, overlap, &plan_word_windows(&starts, &chars, max, overlap));
+                        }
                     }
                 }
             }
         }
         for n in 0..100usize {
             for starts in mark_patterns(n) {
-                for max in 1..24usize {
-                    for overlap in 0..max {
-                        check_plan(&starts, max, overlap, &plan_word_windows(&starts, max, overlap));
+                for chars in char_patterns(n) {
+                    for max in 1..24usize {
+                        for overlap in 0..max {
+                            check_plan(&starts, &chars, max, overlap, &plan_word_windows(&starts, &chars, max, overlap));
+                        }
                     }
                 }
             }
@@ -388,7 +484,7 @@ pub(crate) mod tests {
         // Words of three tokens: no window ends at its cap of 10, every one at
         // the word start just under it.
         let starts: Vec<bool> = (0..30).map(|i| i % 3 == 0).collect();
-        assert_eq!(plan_word_windows(&starts, 10, 2), [(0, 9), (6, 15), (12, 21), (18, 27), (24, 30)]);
+        assert_eq!(wide(&starts, 10, 2), [(0, 9), (6, 15), (12, 21), (18, 27), (24, 30)]);
     }
 
     #[test]
@@ -396,23 +492,41 @@ pub(crate) mod tests {
         // Five words of one token, one of 25 (tokens 5 to 29) and ten more.
         let starts: Vec<bool> = (0..40).map(|i| !(6..30).contains(&i)).collect();
         assert_eq!(
-            plan_word_windows(&starts, 10, 2),
-            [(0, 5), (3, 13), (5, 15), (13, 23), (21, 31), (29, 39), (37, 40)],
-            "inside the long word the cuts fall on tokens 13, 15, 21, 23 and 29"
+            wide(&starts, 10, 2),
+            [(0, 5), (3, 13), (5, 15), (13, 23), (21, 31), (30, 40)],
+            "inside the long word the cuts fall on tokens 13, 15, 21 and 23, and the window after it opens at the word that follows"
         );
     }
 
     #[test]
-    fn plan_word_windows_keeps_at_least_the_overlap() {
-        // A word of six tokens (3 to 8) crosses where the next window would
-        // start: it starts back at that word, sharing 7 tokens, rather than
-        // at the word after it, which would share 1.
-        let starts: Vec<bool> = (0..30).map(|i| !(4..9).contains(&i)).collect();
-        let windows = plan_word_windows(&starts, 10, 4);
-        assert_eq!(windows[..2], [(0, 10), (3, 13)]);
+    fn plan_word_windows_starts_at_the_word_start_nearest_the_overlap() {
+        // After the window [0, 10) an overlap of 4 points at token 6. The word
+        // start at 7 is one token from it and the one at 2 four: the next
+        // window starts at 7.
+        let starts: Vec<bool> = (0..40).map(|i| [0, 2, 7].contains(&i) || i >= 10).collect();
+        assert_eq!(wide(&starts, 10, 4)[..2], [(0, 10), (7, 17)]);
+        // Two tokens on either side: the one before, so the overlap grows.
+        let starts: Vec<bool> = (0..40).map(|i| [0, 4, 8].contains(&i) || i >= 10).collect();
+        assert_eq!(wide(&starts, 10, 4)[..2], [(0, 10), (4, 14)]);
+    }
+
+    #[test]
+    fn plan_word_windows_keeps_the_characters_join_pieces_needs() {
+        // Tokens of two characters: 4 shared tokens are 8 characters, under
+        // the 16 `join_pieces` looks for, so each next window starts back
+        // where the shared text holds 16.
+        let starts = vec![true; 40];
+        let narrow = even_chars(40, 2);
+        let windows = plan_word_windows(&starts, &narrow, 10, 4);
+        assert_eq!(windows[..2], [(0, 10), (2, 12)]);
         for pair in windows.windows(2) {
-            assert!(pair[0].1 - pair[1].0 >= 4, "{windows:?}");
+            assert!(narrow[pair[0].1 - 1].1 - narrow[pair[1].0].0 >= MIN_OVERLAP_CHARS, "{windows:?}");
         }
+        // No overlap asked for, no floor: the windows tile the text.
+        assert_eq!(plan_word_windows(&starts, &narrow, 10, 0), [(0, 10), (10, 20), (20, 30), (30, 40)]);
+        // A window of 10 characters cannot share 16: the next one starts at
+        // the word start the overlap points at.
+        assert_eq!(plan_word_windows(&starts, &even_chars(40, 1), 10, 4)[..2], [(0, 10), (6, 16)]);
     }
 
     // ── TokenSplitter, byte-fallback path ───────────────────────────────────
@@ -936,9 +1050,13 @@ pub(crate) mod tests {
         for piece in &pieces {
             assert!(splitter.count(piece) <= 96, "a piece of {} tokens", splitter.count(piece));
         }
+        // Words are two or three tokens, so the word start nearest the 24th
+        // token from a piece's end is at most one token off.
         for (k, pair) in ranges.windows(2).enumerate() {
             let shared = &text[pair[1].0..pair[0].1];
-            assert!(splitter.count(shared) >= 24, "pieces {k} and {} share {} tokens", k + 1, splitter.count(shared));
+            let tokens = splitter.count(shared);
+            assert!((23..=25).contains(&tokens), "pieces {k} and {} share {tokens} tokens", k + 1);
+            assert!(shared.chars().count() >= 16, "pieces {k} and {} share under 16 characters", k + 1);
         }
     }
 
