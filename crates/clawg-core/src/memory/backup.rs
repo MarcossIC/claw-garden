@@ -141,10 +141,12 @@ pub enum Reason {
     PreMove,
     /// Before registering a root joined rows of other ids into its project.
     PreRekey,
+    /// Before `clawg import --undo` took an import back.
+    PreUndo,
 }
 
 impl Reason {
-    const ALL: [Reason; 7] = [
+    const ALL: [Reason; 8] = [
         Reason::PreMigration,
         Reason::PreRestore,
         Reason::Manual,
@@ -152,6 +154,7 @@ impl Reason {
         Reason::PreImport,
         Reason::PreMove,
         Reason::PreRekey,
+        Reason::PreUndo,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -163,6 +166,7 @@ impl Reason {
             Reason::PreImport => "pre-import",
             Reason::PreMove => "pre-move",
             Reason::PreRekey => "pre-rekey",
+            Reason::PreUndo => "pre-undo",
         }
     }
 

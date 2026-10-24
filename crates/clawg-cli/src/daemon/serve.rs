@@ -526,10 +526,34 @@ mod tests {
 
     /// A port a child inherits stays open after the daemon lets it go: it
     /// takes connections nobody answers, reset when the child exits, and keeps
-    /// the next daemon off the port.
+    /// the next daemon off the port, for as long as the child lives. The port
+    /// is one below every system's ephemeral range (32768 on Linux, 49152 on
+    /// Windows): one of those, freed, can go at once to another test's
+    /// `bind(0)` or outgoing connection.
     #[tokio::test]
     async fn a_child_started_while_the_port_is_bound_does_not_keep_it() {
-        let (listener, port) = bind_tcp(0).await.expect("bind");
+        // A test run with its stdin closed hands fd 0 to the first file or
+        // socket it opens, and every child any test spawns meanwhile with
+        // the stdin it inherits gets that one as its own: the listener must
+        // not be it.
+        #[cfg(unix)]
+        loop {
+            use std::os::fd::AsRawFd;
+            let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+            if null.as_raw_fd() > 2 {
+                break;
+            }
+            std::mem::forget(null);
+        }
+        let first = 20_000 + (std::process::id() % 10_000) as u16;
+        let mut bound = None;
+        for k in 0..10_000 {
+            if let Ok(b) = bind_tcp(20_000 + (first - 20_000 + k) % 10_000).await {
+                bound = Some(b);
+                break;
+            }
+        }
+        let (listener, port) = bound.expect("a free port between 20000 and 30000");
         let mut command = if cfg!(windows) {
             let mut c = std::process::Command::new("ping");
             c.args(["-n", "30", "127.0.0.1"]);
@@ -539,10 +563,20 @@ mod tests {
             c.arg("30");
             c
         };
-        let mut child = command.stdout(std::process::Stdio::null()).spawn().expect("spawn a long-lived process");
+        // Nor any stdio of this process, which may be another test's socket.
+        let null = std::process::Stdio::null;
+        let mut child = command.stdin(null()).stdout(null()).stderr(null()).spawn().expect("spawn a long-lived process");
         drop(listener);
 
-        let rebound = std::net::TcpListener::bind(("127.0.0.1", port));
+        // Another test's spawn forks with a copy of every descriptor until it
+        // execs, a few milliseconds: only a copy that outlives that is kept.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let rebound = loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Err(_) if std::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(20)).await,
+                bound => break bound,
+            }
+        };
         let _ = child.kill();
         let _ = child.wait();
         rebound.expect("the port is free once the daemon lets it go");

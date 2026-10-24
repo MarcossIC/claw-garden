@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
-use clawg_core::memory::portability::ImportReport;
+use clawg_core::memory::portability::{ImportReport, UndoReport};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
@@ -1327,6 +1327,12 @@ impl DaemonClient {
             "map_roots": map_roots, "project_map": project_map,
         });
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/import").json(&body)?).await?)
+    }
+
+    /// Takes import `import_id` back, or says what that would do.
+    pub async fn undo_import(&self, import_id: i64, dry_run: bool) -> Result<UndoReport, ClientError> {
+        let body = serde_json::json!({ "import_id": import_id, "dry_run": dry_run });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/import/undo").json(&body)?).await?)
     }
 
     /// Records `root` as a project and joins into its project the rows saved

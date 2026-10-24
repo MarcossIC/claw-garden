@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use clawg_core::memory::identity::resolve_project_root;
 use clawg_core::memory::portability::translate::ForeignReport;
-use clawg_core::memory::portability::{ImportReport, MAX_IMPORT_BYTES};
+use clawg_core::memory::portability::{ImportReport, KeepReason, UndoReport, MAX_IMPORT_BYTES};
 use clawg_core::preferences::Lang;
 
 use crate::cli::{ImportSource, ProjectMap, RootMap};
@@ -174,7 +174,94 @@ pub fn render(lang: Lang, r: &ImportReport) -> String {
             Lang::Es => format!("el store de antes de la importación está en {snapshot}; `clawg restore` lo trae de vuelta"),
         });
     }
+    if let Some(n) = r.import_id {
+        lines.push(match lang {
+            Lang::En => format!("this is import {n}; `clawg import --undo {n}` takes it back and keeps what changed since"),
+            Lang::Es => format!("esta es la importación {n}; `clawg import --undo {n}` la deshace y conserva lo que cambió desde entonces"),
+        });
+    }
     lines.join("\n")
+}
+
+/// Asks the daemon to take import `import_id` back and says what it did.
+pub async fn undo(lang: Lang, client: &DaemonClient, import_id: i64, dry_run: bool) -> Result<String, ImportError> {
+    Ok(render_undo(lang, &client.undo_import(import_id, dry_run).await?))
+}
+
+fn ids(ids: &[i64]) -> String {
+    ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(", ")
+}
+
+/// What an undo did, one fact per line, in `lang`. Why a memory stayed is
+/// the daemon's identifier.
+pub fn render_undo(lang: Lang, r: &UndoReport) -> String {
+    let (n, removed) = (r.import_id, r.removed.len());
+    let nothing = r.removed.is_empty()
+        && r.restored.is_empty()
+        && r.kept.is_empty()
+        && r.unfilled.is_empty()
+        && r.links == 0
+        && r.projects.is_empty()
+        && r.remotes.is_empty();
+    if nothing {
+        return match lang {
+            Lang::En => format!("nothing of import {n} is left to take back"),
+            Lang::Es => format!("no queda nada de la importación {n} para deshacer"),
+        };
+    }
+    let mut lines = vec![match (r.dry_run, lang) {
+        (true, Lang::En) => format!("would take back import {n}: remove {removed} memories"),
+        (false, Lang::En) => format!("took back import {n}: removed {removed} memories"),
+        (true, Lang::Es) => format!("se desharía la importación {n}: se quitarían {removed} memorias"),
+        (false, Lang::Es) => format!("se deshizo la importación {n}: se quitaron {removed} memorias"),
+    }];
+    if !r.restored.is_empty() {
+        lines.push(match lang {
+            Lang::En => format!("memories it had replaced, live again: {}", ids(&r.restored)),
+            Lang::Es => format!("memorias que había reemplazado, vivas de nuevo: {}", ids(&r.restored)),
+        });
+    }
+    let heading = match lang {
+        Lang::En => "kept, because they changed or something that stays needs them:",
+        Lang::Es => "se quedan, porque cambiaron o algo que queda las necesita:",
+    };
+    list(&mut lines, heading, r.kept.iter().map(|k| format!("#{}: {}", k.id, reason(k.reason))));
+    if !r.unfilled.is_empty() {
+        lines.push(match lang {
+            Lang::En => format!("links it had filled, emptied again in: {}", ids(&r.unfilled)),
+            Lang::Es => format!("vínculos que había completado, vacíos de nuevo en: {}", ids(&r.unfilled)),
+        });
+    }
+    if r.links > 0 {
+        lines.push(match lang {
+            Lang::En => format!("pairs, derivations and pieces it had added, removed: {}", r.links),
+            Lang::Es => format!("pares, derivaciones y piezas que había agregado, quitados: {}", r.links),
+        });
+    }
+    if !r.projects.is_empty() {
+        lines.push(match lang {
+            Lang::En => format!("roots it had recorded, removed: {}", r.projects.join(", ")),
+            Lang::Es => format!("raíces que había registrado, quitadas: {}", r.projects.join(", ")),
+        });
+    }
+    if !r.remotes.is_empty() {
+        lines.push(match lang {
+            Lang::En => format!("remotes it had recorded, removed: {}", r.remotes.join(", ")),
+            Lang::Es => format!("remotos que había registrado, quitados: {}", r.remotes.join(", ")),
+        });
+    }
+    if let Some(snapshot) = &r.snapshot {
+        lines.push(match lang {
+            Lang::En => format!("the store before the undo is in {snapshot}; `clawg restore` brings it back"),
+            Lang::Es => format!("el store de antes de deshacer está en {snapshot}; `clawg restore` lo trae de vuelta"),
+        });
+    }
+    lines.join("\n")
+}
+
+/// The identifier the daemon gives `reason`.
+fn reason(reason: KeepReason) -> String {
+    serde_json::to_value(reason).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()
 }
 
 /// `heading` and an indented line per item, unless there is none.
@@ -375,6 +462,7 @@ fn render_foreign(lang: Lang, f: &ForeignReport, lines: &mut Vec<String>) {
 mod tests {
     use super::*;
     use crate::client::tests::{publish, start_daemon};
+    use clawg_core::memory::portability::KeptRow;
     use clawg_core::memory::portability::format::Invalid;
 
     const FILE: &str = concat!(
@@ -410,9 +498,73 @@ mod tests {
         let done = send(false).await.expect("import");
         assert!(done.starts_with("imported 1 of 1 memories in the file\n  by type: semantic_fact 1\n  by state: live 1\n"), "{done}");
         assert!(done.contains("-pre-import.db; `clawg restore` brings it back"), "{done}");
+        assert!(done.ends_with("\nthis is import 1; `clawg import --undo 1` takes it back and keeps what changed since"), "{done}");
 
         let again = send(false).await.expect("again");
         assert!(again.starts_with("imported 0 of 1 memories in the file\nalready here: 1\n"), "{again}");
+        assert!(!again.contains("--undo"), "an import that wrote nothing has no number: {again}");
+
+        let would = undo(Lang::En, &client, 1, true).await.expect("dry undo");
+        assert_eq!(would, format!("would take back import 1: remove 1 memories\nroots it had recorded, removed: {project}"));
+        let undone = undo(Lang::En, &client, 1, false).await.expect("undo");
+        assert!(undone.starts_with("took back import 1: removed 1 memories\n"), "{undone}");
+        assert!(undone.contains("-pre-undo.db; `clawg restore` brings it back"), "{undone}");
+        let nothing = undo(Lang::En, &client, 1, false).await.expect("undo again");
+        assert_eq!(nothing, "nothing of import 1 is left to take back");
+        let unknown = undo(Lang::En, &client, 9, false).await.unwrap_err();
+        assert!(unknown.to_string().contains("no import 9"), "{unknown}");
+    }
+
+    fn undo_report() -> UndoReport {
+        UndoReport {
+            import_id: 3,
+            removed: vec![10, 11],
+            restored: vec![4],
+            kept: vec![KeptRow { id: 12, reason: KeepReason::Edited }, KeptRow { id: 13, reason: KeepReason::Tied }],
+            unfilled: vec![2],
+            links: 1,
+            projects: vec!["repo-1a2b".into()],
+            remotes: vec!["example.com/team/repo".into()],
+            snapshot: Some("/b/memory-x-pre-undo.db".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn render_undo_names_what_it_took_back_and_what_stayed() {
+        assert_eq!(
+            render_undo(Lang::En, &undo_report()),
+            "took back import 3: removed 2 memories\n\
+             memories it had replaced, live again: #4\n\
+             kept, because they changed or something that stays needs them:\n  #12: edited\n  #13: tied\n\
+             links it had filled, emptied again in: #2\n\
+             pairs, derivations and pieces it had added, removed: 1\n\
+             roots it had recorded, removed: repo-1a2b\n\
+             remotes it had recorded, removed: example.com/team/repo\n\
+             the store before the undo is in /b/memory-x-pre-undo.db; `clawg restore` brings it back"
+        );
+        let report = ImportReport { rows: 1, inserted: 1, import_id: Some(3), ..Default::default() };
+        assert!(render(Lang::En, &report).ends_with("this is import 3; `clawg import --undo 3` takes it back and keeps what changed since"));
+    }
+
+    #[test]
+    fn the_undo_report_speaks_spanish() {
+        assert_eq!(
+            render_undo(Lang::Es, &undo_report()),
+            "se deshizo la importación 3: se quitaron 2 memorias\n\
+             memorias que había reemplazado, vivas de nuevo: #4\n\
+             se quedan, porque cambiaron o algo que queda las necesita:\n  #12: edited\n  #13: tied\n\
+             vínculos que había completado, vacíos de nuevo en: #2\n\
+             pares, derivaciones y piezas que había agregado, quitados: 1\n\
+             raíces que había registrado, quitadas: repo-1a2b\n\
+             remotos que había registrado, quitados: example.com/team/repo\n\
+             el store de antes de deshacer está en /b/memory-x-pre-undo.db; `clawg restore` lo trae de vuelta"
+        );
+        let dry = UndoReport { import_id: 3, dry_run: true, removed: vec![10], ..Default::default() };
+        assert_eq!(render_undo(Lang::Es, &dry), "se desharía la importación 3: se quitarían 1 memorias");
+        assert_eq!(render_undo(Lang::Es, &UndoReport { import_id: 3, ..Default::default() }), "no queda nada de la importación 3 para deshacer");
+        let report = ImportReport { rows: 1, inserted: 1, import_id: Some(3), ..Default::default() };
+        assert!(render(Lang::Es, &report).ends_with("esta es la importación 3; `clawg import --undo 3` la deshace y conserva lo que cambió desde entonces"));
     }
 
     #[test]
