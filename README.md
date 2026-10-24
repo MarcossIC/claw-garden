@@ -328,6 +328,13 @@ clawg import memorias.jsonl --agent claude-code --profile dev         # todas ba
 
 Importar dos veces el mismo archivo no agrega nada. Una memoria cuyo texto ya está vivo acá no se duplica, y una cuya `topic_key` ya tiene una versión viva acá queda reemplazada por esa. El reporte dice cuántas trajo por tipo, estado y proyecto, y cuáles no pudo traer y por qué.
 
+Cada importación que escribe algo tiene un número, que el reporte nombra. `clawg import --undo N` la deshace días después sin perder lo guardado desde entonces: borra para siempre las memorias que trajo y siguen como las dejó, y devuelve lo que cambió en las que ya estaban. Las que alguien editó, borró, restauró o juzgó, y las que otra memoria necesita (una conclusión que se apoya en ellas, por ejemplo), se quedan, y el reporte dice por qué. Antes de escribir guarda un snapshot `pre-undo`:
+
+```powershell
+clawg import --undo 3 --dry-run --profile dev    # qué sacaría, sin escribir nada
+clawg import --undo 3 --profile dev
+```
+
 ### Traer memorias de otra herramienta
 
 `clawg import --from` lee el export de otra herramienta de memoria y guarda cada nota como la guardaría un save de su texto: enmascarada entera, partida en las mismas piezas, con su tipo, sus fechas, sus accesos, su clave y las relaciones entre notas. Hoy lee el export de engram. Exportá todo (sin `--all`, las versiones nuevas exportan sólo el proyecto del directorio en que se corren) y a un archivo fuera del repo, porque lleva el texto de cada nota tal como está:
@@ -499,6 +506,7 @@ clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el d
 clawg export --out m.jsonl --profile dev  # las memorias, una fila por línea (--project, --agent, --include-deleted, --format markdown)
 clawg import m.jsonl --profile dev        # las trae a este perfil, con el daemon corriendo (--dry-run, --agent, --map-root OLD=NEW)
 clawg import --from engram e.json --profile dev   # las notas de otra herramienta (--project-map NOMBRE=RUTA)
+clawg import --undo 3 --profile dev       # deshace la importación 3 y conserva lo que cambió desde entonces (--dry-run)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
 clawg metrics report --metric http.duration --label route=/v1/search --by version   # latencias y memoria del daemon (--by day|hour, --since 7d)
 ```

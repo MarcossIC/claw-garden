@@ -107,15 +107,23 @@ pub enum Command {
     /// accesses, state and links, or the export of another memory tool, each
     /// note split and masked as a save of its text. Needs a running daemon,
     /// which embeds each memory again; the store is snapshotted first.
-    /// Importing a file twice adds nothing.
+    /// Importing a file twice adds nothing. `--undo N` takes import N back,
+    /// keeping what was saved, edited or judged since.
     Import {
         /// The file `clawg export` wrote, or the other tool's export (for
         /// engram, `engram export --all`).
-        file: PathBuf,
+        #[arg(required_unless_present = "undo")]
+        file: Option<PathBuf>,
+        /// Take back import N, the number its report gave: remove for good
+        /// the memories it inserted that are still as it left them, and give
+        /// back what it changed in the others. The store is snapshotted
+        /// first.
+        #[arg(long, value_name = "N", conflicts_with_all = ["file", "from", "agent", "map_root", "project_map"])]
+        undo: Option<i64>,
         /// The tool the file comes from.
         #[arg(long, value_enum, default_value_t = ImportSource::Clawg)]
         from: ImportSource,
-        /// Report what would be imported, and write nothing.
+        /// Report what would be imported, or undone, and write nothing.
         #[arg(long)]
         dry_run: bool,
         /// Store every memory that has an agent under this one instead.
@@ -1011,7 +1019,8 @@ mod tests {
             ])
             .command,
             Command::Import {
-                file: PathBuf::from("m.jsonl"),
+                file: Some(PathBuf::from("m.jsonl")),
+                undo: None,
                 from: ImportSource::Clawg,
                 dry_run: true,
                 agent: Some("dev".into()),
@@ -1029,12 +1038,40 @@ mod tests {
     }
 
     #[test]
+    fn import_takes_a_file_or_an_undo() {
+        assert_eq!(
+            parse(&["clawg", "import", "--undo", "4", "--dry-run"]).command,
+            Command::Import {
+                file: None,
+                undo: Some(4),
+                from: ImportSource::Clawg,
+                dry_run: true,
+                agent: None,
+                map_root: Vec::new(),
+                project_map: Vec::new(),
+                profile: ProfileArg { profile: None },
+            }
+        );
+        for refused in [
+            &["clawg", "import"][..],
+            &["clawg", "import", "m.jsonl", "--undo", "4"],
+            &["clawg", "import", "--undo", "4", "--from", "engram"],
+            &["clawg", "import", "--undo", "4", "--agent", "dev"],
+            &["clawg", "import", "--undo", "4", "--map-root", "/a=."],
+            &["clawg", "import", "--undo", "4", "--project-map", "a=."],
+        ] {
+            assert!(Cli::parse_args(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
     fn import_takes_a_source_and_project_maps() {
         let args = ["clawg", "import", "--from", "engram", "e.json", "--project-map", "my=app=C:\\work\\app", "--project-map", "b=."];
         assert_eq!(
             Cli::parse_args(args).expect("parse").command,
             Command::Import {
-                file: PathBuf::from("e.json"),
+                file: Some(PathBuf::from("e.json")),
+                undo: None,
                 from: ImportSource::Engram,
                 dry_run: false,
                 agent: None,

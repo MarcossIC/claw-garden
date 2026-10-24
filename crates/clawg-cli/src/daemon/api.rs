@@ -42,7 +42,7 @@ use clawg_core::memory::worker::{
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::language::count_saves_in;
-use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
+use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, UndoError, UndoReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::identity::origin_key;
 use clawg_core::memory::project::{register_project, RegisterError, Registration};
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
@@ -1047,6 +1047,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/metrics", get(metrics))
         .route("/backup", post(backup))
         .route("/import", post(import_memories).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
+        .route("/import/undo", post(undo_import))
         .route("/projects", post(register))
         .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
@@ -1947,6 +1948,31 @@ async fn import_memories(
         Err(ImportError::NoEmbedder) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),
         Err(ImportError::Embed(e)) => Err(embed_failure(e)),
         Err(e @ ImportError::Store(_)) => Err(ApiError::internal(e)),
+    }
+}
+
+/// The body of `POST /v1/import/undo`. Strict, as a move's: a misspelt
+/// field must not undo an import as if it were not there.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoImportRequest {
+    pub import_id: i64,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Takes an import back for the user, keeping what changed since. Needs no
+/// embedder: it only removes rows and gives back links and states.
+async fn undo_import(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<UndoImportRequest>,
+) -> ApiResult<Json<UndoReport>> {
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    match portability::undo_import(&app.runtime.store, &backups, body.import_id, body.dry_run).await {
+        Ok(report) => Ok(Json(report)),
+        Err(e @ UndoError::UnknownImport(_)) => Err(ApiError::not_found(e.to_string())),
+        Err(e @ UndoError::Running(_)) => Err(ApiError::conflict(e.to_string())),
+        Err(e @ UndoError::Store(_)) => Err(ApiError::internal(e)),
     }
 }
 

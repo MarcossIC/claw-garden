@@ -234,7 +234,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Import { file, from, dry_run, agent, map_root, project_map, profile } => {
+        Command::Import { file, undo, from, dry_run, agent, map_root, project_map, profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             // The daemon is the store's only writer and has the model that
             // embeds each row; with none running, nothing is started.
@@ -246,7 +246,12 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
             let maps = import::Maps { roots: &map_root, projects: &project_map };
-            let out = import::run(lang, &client, &file, from, dry_run, agent.as_deref(), maps).await.map_err(|e| match e {
+            let out = match (undo, file) {
+                (Some(n), _) => import::undo(lang, &client, n, dry_run).await,
+                (None, Some(file)) => import::run(lang, &client, &file, from, dry_run, agent.as_deref(), maps).await,
+                (None, None) => return Err("name the file to import, or --undo N".into()),
+            }
+            .map_err(|e| match e {
                 import::ImportError::Client(e) => unavailable(e),
                 other => other.to_string(),
             })?;
