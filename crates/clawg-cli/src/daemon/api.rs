@@ -1897,7 +1897,7 @@ async fn import_memories(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportReport>> {
-    let mut timings = ImportTimings::new(body.dry_run);
+    let mut timings = ImportTimings::new(body.dry_run).with_memory(super::process::private_bytes);
     let read = Instant::now();
     if body.text.len() > MAX_IMPORT_BYTES {
         return Err(ApiError::bad_request(format!(
