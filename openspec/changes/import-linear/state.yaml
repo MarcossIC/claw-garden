@@ -9,6 +9,6 @@ artifacts:
   design: skipped  # la única decisión con alternativas, el índice, está en la exploración (enfoques A y B) y en la propuesta
   tasks: done
   apply: done
-  verify: in_progress  # Windows y el banco hechos; falta la importación real en el perfil dev (con autorización) y el CI
+  verify: in_progress  # Windows, el banco y la importación real en el perfil dev hechos; falta el CI
   archive: pending
 updated: 2026-10-24

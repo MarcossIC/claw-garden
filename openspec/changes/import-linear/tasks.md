@@ -28,7 +28,7 @@ Strict TDD: en cada tarea que agrega conducta nueva, el test va primero y falla 
 ## 5. Verificación
 
 - [x] Toda la suite y clippy en Windows sobre el último commit, y el banco antes y después ([verify](verify.md)).
-- [ ] Con autorización explícita: una importación real en el perfil de desarrollo, con compilación de depuración, para comparar con los 3 078 s.
+- [x] Con autorización explícita: una importación real en el perfil de desarrollo, con compilación de depuración. Tardó 1 218 s contra 3 078 s, y el dry run 70 s contra 910 s, con las mismas filas ([verify](verify.md#importación-real-en-el-perfil-de-desarrollo-2026-10-24)).
 - [ ] El CI en verde en Linux y Windows.
 
 ## 6. Archive

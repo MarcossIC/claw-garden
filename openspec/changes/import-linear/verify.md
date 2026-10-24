@@ -35,7 +35,21 @@ En todas las corridas el informe (sin la ruta del snapshot) tiene el mismo SHA-2
 
 Estos tiempos son de depuración y no se trasladan a release; lo que vale es la comparación entre corridas de la misma compilación. El banco no mide la parte de la importación real que este cambio no toca: la traducción de notas largas y los embeddings del modelo.
 
+## Importación real en el perfil de desarrollo (2026-10-24)
+
+Se hizo con autorización explícita, con el binario de depuración de `f967979` (`target-test`, que lleva el feature `testing`, como el de la medición de origen) y el modelo real. El perfil `dev` corrió en un home temporal (`CLAWG_TEST_HOME`) sobre una **copia** del snapshot `pre-import` que había dejado la medición de origen, con una copia de su modelo. Así el punto de partida fue el mismo y `~/.clawg-dev`, que ya tiene esa importación, no se tocó. La exportación nueva (`engram export --all`) dio las mismas 3 814 notas y 52 080 filas que la de origen. Se guardó fuera del repositorio y, como tiene el texto sin enmascarar, se borró al terminar, junto con el home temporal. Por la longitud de esa ruta el daemon sirvió sólo por TCP.
+
+| | Origen (0.56.0, índice parcial) | Con este cambio |
+|---|---|---|
+| `--dry-run` | 910 s | 70 s |
+| Importación | 3 078 s | 1 218 s |
+| Filas importadas | 51 996 de 52 080 | 51 996 de 52 080 |
+| Peticiones al store durante la importación (`/health`, listado de una fila, búsqueda; una ronda cada 20 s, con tope de 15 s) | ~800 s en que todas vencían; búsquedas de más de 15 s mientras escribía | ninguna venció: el listado tardó como mucho 1,7 s y la búsqueda 1,3 s |
+
+El informe de la importación es idéntico al de su dry run. Las 51 996 filas importadas son las mismas que dejó la medición de origen (comparadas con su snapshot `pre-move`, sin ids): agente, proyecto, hash, fecha, estado, tipo, clave, borrado, causa, origen, proyecto de origen, idioma e importancia dan el mismo SHA-256, y coinciden las piezas (51 068) y los pares (141). Sólo 70 filas difieren, y sólo en los accesos: 63 las tocaron las búsquedas que se hicieron después de la importación de origen, y 7 las tocó la sonda de esta corrida.
+
+Lo que queda de los 1 218 s es casi todo el embedding de las filas con el modelo real (~19 min) y la traducción de las notas (~1 min), que este cambio no toca (embed-throughput, 85). El pase de decisión sigue reteniendo la única conexión mientras corre: en el dry run, un listado esperó 8,8 s detrás de él. Antes eran unos 800 s. Quitar esa espera es de import-decision-pass (82).
+
 ## Pendiente
 
-- La importación real en el perfil de desarrollo, con una exportación completa y compilación de depuración, para comparar con los 3 078 s. Necesita autorización explícita, porque usa `~/.clawg-dev` y una exportación con el texto sin enmascarar, que se guarda fuera del repositorio y se borra al terminar.
 - El CI del pull request en Linux y Windows.
