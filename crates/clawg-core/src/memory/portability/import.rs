@@ -478,7 +478,7 @@ fn present_at(tx: &Transaction<'_>, row: &Row, project: Option<&str>, stored: &[
     if let Some(r) = own {
         return Ok(Some(Placement::Present(r.id)));
     }
-    let twin: Option<i64> = tx.query_row(TWIN_SQL, rusqlite::params![project, row.hash], |r| r.get(0)).optional()?;
+    let twin: Option<i64> = tx.prepare_cached(TWIN_SQL)?.query_row(rusqlite::params![project, row.hash], |r| r.get(0)).optional()?;
     Ok(twin.map(Placement::Merged))
 }
 
@@ -569,14 +569,15 @@ fn place(
         _ => (None, None),
     };
     let present: Option<i64> = tx
-        .query_row(PRESENT_SQL, rusqlite::params![row.agent, project, row.hash, row.src.created_at], |r| r.get(0))
+        .prepare_cached(PRESENT_SQL)?
+        .query_row(rusqlite::params![row.agent, project, row.hash, row.src.created_at], |r| r.get(0))
         .optional()?;
     if let Some(id) = present {
         return Ok(Some(Placement::Present(id)));
     }
     let mut topic_holder = None;
     if under.is_none() && row.live() {
-        let twin: Option<i64> = tx.query_row(TWIN_SQL, rusqlite::params![project, row.hash], |r| r.get(0)).optional()?;
+        let twin: Option<i64> = tx.prepare_cached(TWIN_SQL)?.query_row(rusqlite::params![project, row.hash], |r| r.get(0)).optional()?;
         if let Some(id) = twin {
             return Ok(Some(Placement::Merged(id)));
         }
