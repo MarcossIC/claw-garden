@@ -1897,7 +1897,7 @@ async fn import_memories(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportReport>> {
-    let mut timings = ImportTimings::new(body.dry_run);
+    let mut timings = ImportTimings::new(body.dry_run).with_memory(super::process::private_bytes);
     let read = Instant::now();
     if body.text.len() > MAX_IMPORT_BYTES {
         return Err(ApiError::bad_request(format!(
@@ -2065,7 +2065,9 @@ async fn register(
     if let Some(embedder) = app.runtime.embedder.get() {
         embedder.wake();
     }
-    if outcome.index_docs {
+    // Only a caller that asks: the hooks register an accepted root on every
+    // prompt, and `search_project` already refreshes an index gone stale.
+    if body.index_docs && outcome.index_docs {
         spawn_doc_refresh(app.clone(), outcome.root_id.clone());
     }
     Ok(Json(RegisteredBody { project_id: outcome.project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
