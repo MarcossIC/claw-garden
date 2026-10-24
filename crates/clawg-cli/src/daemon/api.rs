@@ -42,7 +42,8 @@ use clawg_core::memory::worker::{
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::language::count_saves_in;
-use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, UndoError, UndoReport, MAX_IMPORT_BYTES};
+use clawg_core::memory::portability::timing::{Step, Timing};
+use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::identity::origin_key;
 use clawg_core::memory::project::{register_project, RegisterError, Registration};
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
@@ -1896,6 +1897,8 @@ async fn import_memories(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportReport>> {
+    let mut timings = ImportTimings::new(body.dry_run);
+    let read = Instant::now();
     if body.text.len() > MAX_IMPORT_BYTES {
         return Err(ApiError::bad_request(format!(
             "the file is {} bytes; at most {MAX_IMPORT_BYTES} are imported",
@@ -1930,20 +1933,24 @@ async fn import_memories(
         }
         Some(other) => return Err(ApiError::bad_request(format!("unknown source {other:?}; expected clawg or engram"))),
     };
+    timings.record(Timing { elapsed: read.elapsed(), ..Timing::new(Step::Read) });
     let embedder = if body.dry_run { None } else { Some(ready_embedder(&app)?) };
     let options =
         ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map: body.project_map };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let store = &app.runtime.store;
     let imported = match foreign {
-        None => portability::import(store, embedder.as_deref(), &backups, &body.text, &options).await,
+        None => portability::import(store, embedder.as_deref(), &backups, &body.text, &options, &mut timings).await,
         Some(export) => {
             let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
-            portability::import_foreign(store, embedder.as_deref(), chunker, &backups, export, &options).await
+            portability::import_foreign(store, embedder.as_deref(), chunker, &backups, export, &options, &mut timings).await
         }
     };
     match imported {
-        Ok(report) => Ok(Json(report)),
+        Ok(report) => {
+            timings.finish();
+            Ok(Json(report))
+        }
         Err(ImportError::Format(e)) => Err(ApiError::bad_request(e.to_string())),
         Err(ImportError::NoEmbedder) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),
         Err(ImportError::Embed(e)) => Err(embed_failure(e)),
