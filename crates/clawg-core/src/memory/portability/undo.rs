@@ -330,6 +330,7 @@ pub(crate) fn decide(facts: &Facts) -> Plan {
             _ => None,
         })
         .collect();
+    let gone: HashSet<i64> = plan.gone.iter().copied().collect();
     loop {
         let retire = |id: &i64, kept: &BTreeMap<i64, KeepReason>| candidates.contains(id) && !kept.contains_key(id);
         let mut more = Vec::new();
@@ -340,8 +341,11 @@ pub(crate) fn decide(facts: &Facts) -> Plan {
         }
         for (save, pieces) in &facts.saves {
             // A piece link the import added to a row it did not insert goes
-            // with the undo, and holds nothing.
-            let stays = pieces.iter().any(|(piece, memory)| !retire(memory, &plan.kept) && !added_pieces.contains(&(*save, *piece)));
+            // with the undo, and the link a purge left to its row holds
+            // nothing either.
+            let stays = pieces.iter().any(|(piece, memory)| {
+                !retire(memory, &plan.kept) && !gone.contains(memory) && !added_pieces.contains(&(*save, *piece))
+            });
             if stays {
                 more.extend(pieces.iter().filter(|(_, m)| retire(m, &plan.kept)).map(|(_, m)| (*m, KeepReason::Tied)));
             }
@@ -357,7 +361,6 @@ pub(crate) fn decide(facts: &Facts) -> Plan {
 
     let kept = |id: &i64| plan.kept.contains_key(id);
     plan.restore = facts.replaced.iter().filter(replaced_now).filter(|r| !kept(&r.by)).cloned().collect();
-    let gone: HashSet<i64> = plan.gone.iter().copied().collect();
     let after = |id: &i64| !plan.retire.contains(id) && !gone.contains(id);
     let mut rows_left: HashMap<&str, i64> = HashMap::new();
     for id in &plan.retire {
@@ -393,6 +396,12 @@ pub(crate) fn decide(facts: &Facts) -> Plan {
                 }
             }
             _ => {}
+        }
+    }
+    // A save the undo takes whole loses the link a purge left to a piece.
+    for (save, pieces) in &facts.saves {
+        if !pieces.iter().any(|(_, m)| kept(m)) {
+            plan.links.extend(pieces.iter().filter(|(_, m)| gone.contains(m)).map(|(piece, _)| Extra::Piece { save: *save, piece: *piece }));
         }
     }
     for extra in &facts.extras {
@@ -976,6 +985,8 @@ mod tests {
         // through what the import wrote in them.
         facts.references.extend([(200, 7), (2, 8), (1, 9), (300, 11), (400, 1)]);
         facts.saves.insert(40, vec![(1, 10), (2, 2)]);
+        // 12 was purged, and its save goes with 13.
+        facts.saves.insert(41, vec![(1, 12), (2, 13)]);
         // 300 was here, and the import filled its link to 11.
         facts.now.insert(300, Now { superseded_by: Some(11), ..now(None) });
         facts.extras.push(Extra::Fill { row: 300, column: Column::SupersededBy, value: "11".into() });
@@ -1007,7 +1018,7 @@ mod tests {
         assert_eq!(plan.gone, [12]);
         assert_eq!(plan.restore.iter().map(|r| r.row).collect::<Vec<_>>(), [400], "not under a row that stays, nor one replaced since");
         assert_eq!(plan.unfill, [Extra::Fill { row: 300, column: Column::SupersededBy, value: "11".into() }]);
-        assert_eq!(plan.links, Vec::<Extra>::new(), "the pair goes with its rows");
+        assert_eq!(plan.links, [Extra::Piece { save: 41, piece: 1 }], "the pair goes with its rows, and the link to a purged piece with its save");
         assert!(plan.projects.is_empty(), "kept rows still use the root");
 
         let mut empty = facts.clone();
@@ -1292,12 +1303,22 @@ mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let (imported, _) = run(&dst, &file, ImportOptions::default()).await;
-        let purged = id_of(&dst, "hello there").await;
-        sql(&dst, format!("DELETE FROM memory_vectors WHERE rowid = {purged}; DELETE FROM memory WHERE id = {purged};")).await;
+        // A purge leaves a piece's link, which says which piece is missing.
+        for text in ["hello there", "fn main() { first half of a long save }"] {
+            let purged = id_of(&dst, text).await;
+            sql(&dst, format!("DELETE FROM memory_vectors WHERE rowid = {purged}; DELETE FROM memory WHERE id = {purged};")).await;
+        }
         let (report, _) = undo(&dst, imported.import_id.unwrap()).await;
-        assert_eq!(report.removed.len(), 16, "{report:#?}");
-        let journal: i64 = dst.conn.call(|c| c.query_row("SELECT COUNT(*) FROM memory_import_row", [], |r| r.get(0))).await.unwrap();
-        assert_eq!(journal, 0, "the purged row leaves the journal too");
+        assert_eq!((report.removed.len(), report.kept.len()), (15, 0), "{report:#?}");
+        let left = dst
+            .conn
+            .call(|c| {
+                let count = |table: &str| c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0));
+                Ok::<_, rusqlite::Error>((count("memory_import_row")?, count("memory_piece")?))
+            })
+            .await
+            .unwrap();
+        assert_eq!(left, (0, 0), "the purged rows leave the journal, and their save goes whole");
     }
 
     #[tokio::test]
