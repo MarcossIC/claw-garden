@@ -268,6 +268,12 @@ pub fn sharing_file(base_dir: &std::path::Path) -> PathBuf {
     base_dir.join("sharing.json")
 }
 
+/// The user's own settings (`<base_dir>/preferences.json`), such as the
+/// language clawg and its agent use with them.
+pub fn preferences_file(base_dir: &std::path::Path) -> PathBuf {
+    base_dir.join("preferences.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

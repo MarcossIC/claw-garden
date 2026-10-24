@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use crate::memory::search::{identifier_tokens, search_all_memories, SearchScope};
+use crate::memory::sharing::Reader;
 use crate::memory::record::TableKind;
 use crate::memory::store_insert::MemoryType;
 use crate::memory::MemoryStore;
@@ -81,6 +82,10 @@ pub struct Candidate {
     pub escalated: bool,
     /// The first line of the candidate, cut to [`EXCERPT_CHARS`].
     pub excerpt: String,
+    /// Saved in the new row's own project, or like it in none: a row a
+    /// `topic_key` of the new save could revise. The detector also reaches
+    /// rows without a project and preferences of other projects.
+    pub same_scope: bool,
 }
 
 /// The save a candidate belongs to: the `memory_piece` save of a piece, the
@@ -165,17 +170,17 @@ pub(crate) fn excerpt(content: &str) -> String {
 // black-box test of `detect_contradiction`'s output cannot distinguish this
 // field's value from its opposite. A direct assertion on the returned
 // struct is the only way to pin it.
-fn contradiction_search_scope(project_id: Option<&str>, pool: usize) -> SearchScope {
+fn contradiction_search_scope(project_id: Option<&str>, pool: usize, saver: &Reader) -> SearchScope {
     SearchScope {
         memory: Some(pool),
         episodic: None,
         procedural: None,
         project_id: project_id.map(str::to_owned),
         lexical: None,
-        // A save disputes only the saver's own rows: sharing lets an agent
-        // read another's memories, never mark them disputed, and a pair with
-        // a row no agent saved is one no agent could judge.
-        reach: crate::memory::sharing::Reach::OwnOnly,
+        // A save is compared with every row its agent reaches, whoever saved
+        // it: an agent judges any pair it reaches, and a row hidden from it
+        // must not reach it through a pair's excerpt.
+        reach: saver.reach.clone(),
     }
 }
 
@@ -183,11 +188,12 @@ pub(crate) async fn detect_contradiction(
     store: &MemoryStore,
     embedding: &[f32],
     text: &str,
-    agent_id: &str,
+    saver: &Reader,
     project_id: Option<&str>,
     candidate_type: MemoryType,
     siblings: &[i64],
 ) -> Vec<(SaveKey, Candidate)> {
+    let agent_id = saver.agent_id.as_str();
     if !candidate_type.is_claim_bearing() {
         return Vec::new();
     }
@@ -196,7 +202,7 @@ pub(crate) async fn detect_contradiction(
     // grows by their count: otherwise a long save fills all five slots with
     // its own chunks and a real dispute with an older row is never seen.
     let pool = CANDIDATE_POOL + siblings.len();
-    let scope = contradiction_search_scope(project_id, pool);
+    let scope = contradiction_search_scope(project_id, pool, saver);
     let hits = match search_all_memories(store, embedding, None, agent_id, scope, pool).await {
         Ok(hits) => hits,
         Err(e) => {
@@ -218,7 +224,8 @@ pub(crate) async fn detect_contradiction(
         .filter_map(|h| {
             let old_type = MemoryType::from_db_str(&h.memory_type).filter(|t| t.is_claim_bearing())?;
             let escalated = needs_user(candidate_type, old_type, Some(h.distance), shares_identifier(text, &h.content));
-            Some(Candidate { id: h.id, distance: h.distance, escalated, excerpt: excerpt(&h.content) })
+            let same_scope = h.project_id.as_deref() == project_id;
+            Some(Candidate { id: h.id, distance: h.distance, escalated, excerpt: excerpt(&h.content), same_scope })
         })
         .collect();
     if found.is_empty() {
@@ -249,6 +256,7 @@ pub(crate) async fn detect_contradiction(
 mod tests {
     use super::*;
     use crate::memory::db::MemoryStore;
+    use crate::memory::sharing::Reach;
 
     // ── shared test helpers ──────────────────────────────────────────────────
 
@@ -261,7 +269,8 @@ mod tests {
         candidate_type: MemoryType,
         siblings: &[i64],
     ) -> Vec<i64> {
-        detect_contradiction(store, embedding, "", agent_id, project_id, candidate_type, siblings)
+        let saver = Reader::new(agent_id, Reach::AllBut(Vec::new()));
+        detect_contradiction(store, embedding, "", &saver, project_id, candidate_type, siblings)
             .await
             .into_iter()
             .map(|(_, c)| c.id)
@@ -581,7 +590,7 @@ mod tests {
     /// to catch that mutation.
     #[test]
     fn contradiction_search_scope_disables_the_lexical_channel() {
-        let scope = contradiction_search_scope(None, CANDIDATE_POOL);
+        let scope = contradiction_search_scope(None, CANDIDATE_POOL, &Reader::new("a", Reach::Own));
         assert_eq!(
             scope.lexical, None,
             "the near-duplicate detector's distance band must never be fed lexically \
@@ -589,16 +598,17 @@ mod tests {
         );
     }
 
-    /// The detector reaches the saver's own rows whatever the sharing policy
-    /// says: a save may dispute those, never rows it is only allowed to read.
+    /// The detector reaches what the saver reaches, as its searches do: a
+    /// save is compared with every author's rows unless the policy hides them.
     #[test]
-    fn contradiction_probe_ignores_shared_authors() {
-        let scope = contradiction_search_scope(Some("proj"), CANDIDATE_POOL);
-        assert_eq!(scope.reach, crate::memory::sharing::Reach::OwnOnly);
+    fn contradiction_probe_reaches_other_authors() {
+        let saver = Reader::new("a", Reach::AllBut(vec!["c".into()]));
+        let scope = contradiction_search_scope(Some("proj"), CANDIDATE_POOL, &saver);
+        assert_eq!(scope.reach, saver.reach);
     }
 
     #[tokio::test]
-    async fn a_save_is_never_paired_with_a_row_no_agent_saved() {
+    async fn a_save_is_paired_with_another_agents_row_and_a_row_no_agent_saved() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let base = base_vec(5);
         let global = insert_row(&store, "agent-x", &base).await;
@@ -607,10 +617,24 @@ mod tests {
             .call(move |c| c.execute("UPDATE memory SET scope = 'global', agent_id = NULL WHERE id = ?1", [global]))
             .await
             .unwrap();
+        let theirs = insert_row(&store, "agent-y", &base).await;
 
         let ids = detected(&store, &near(&base, 3.0), "agent-x", None, MemoryType::UserPreference, &[]).await;
 
-        assert!(!ids.contains(&global), "no agent could judge a pair with a row that has no owner: {ids:?}");
+        assert!(ids.contains(&global), "a row no agent saved is a candidate: {ids:?}");
+        assert!(ids.contains(&theirs), "so is another agent's: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn a_hidden_author_is_never_a_candidate() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let base = base_vec(5);
+        let theirs = insert_row(&store, "agent-y", &base).await;
+
+        let saver = Reader::new("agent-x", Reach::AllBut(vec!["agent-y".into()]));
+        let found = detect_contradiction(&store, &near(&base, 3.0), "", &saver, None, MemoryType::UserPreference, &[]).await;
+
+        assert!(found.iter().all(|(_, c)| c.id != theirs), "{found:?}");
     }
 
     // ── Type gate: candidate side ───────────────────────────────────────────

@@ -1,0 +1,15 @@
+change: usage-metrics
+objective: "transversal"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux and the binary in a test home; the Windows code type-checked against windows-sys; the CI of the pull request covers Linux and Windows
+  archive: done
+updated: 2026-10-22
+main_spec: openspec/specs/metrics/spec.md

@@ -16,7 +16,7 @@ use crate::memory::error::MemoryError;
 use crate::memory::events::MemoryEvent;
 use crate::memory::pieces::{link_in, StoredPiece};
 use crate::memory::redact::redact;
-use crate::memory::topic::{revise_in, Replaced, Revision};
+use crate::memory::topic::{mark_warned_in, revise_in, Replaced, Revision};
 use crate::memory::MemoryStore;
 
 /// How many times a row is taken before it is given up as failed. A save that
@@ -455,12 +455,14 @@ impl MemoryStore {
     }
 
     /// Finishes `row`: links the save's pieces when there are two or more,
-    /// applies its revision and drops the row, in one transaction.
+    /// applies its revision, marks the pair with the row its warning names
+    /// and drops the row, in one transaction.
     pub(crate) async fn outbox_finish(
         &self,
         row: i64,
         pieces: Vec<StoredPiece>,
         revision: Option<Revision>,
+        warned: Option<i64>,
     ) -> Result<Vec<Replaced>, MemoryError> {
         let now = TimestampMs::now();
         self.conn
@@ -473,6 +475,9 @@ impl MemoryStore {
                     Some(revision) => revise_in(&tx, revision, now)?,
                     None => Vec::new(),
                 };
+                if let Some(candidate) = warned {
+                    mark_warned_in(&tx, &pieces, candidate)?;
+                }
                 tx.execute("DELETE FROM ingest_outbox WHERE id = ?1", [row])?;
                 tx.commit()?;
                 Ok(replaced)
@@ -800,10 +805,14 @@ mod tests {
                     StoredPiece { memory_id: 11, context: "head".into() },
                 ],
                 None,
+                None,
             )
             .await
             .unwrap();
-        store.outbox_finish(single, vec![StoredPiece { memory_id: 12, context: String::new() }], None).await.unwrap();
+        store
+            .outbox_finish(single, vec![StoredPiece { memory_id: 12, context: String::new() }], None, None)
+            .await
+            .unwrap();
 
         assert_eq!(row_state(&store, row).await, None);
         assert_eq!(row_state(&store, single).await, None);

@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use clawg_core::eval_api::{EmbedRole, EvalEmbedder, EvalTokenCounter};
+use clawg_core::eval_api::{join_pieces, EmbedRole, EvalEmbedder, EvalTokenCounter};
 use serde::{Deserialize, Serialize};
 
 const MODEL_DIR_VAR: &str = "CLAWG_E5_MODEL_DIR";
@@ -259,6 +259,66 @@ async fn bless(embedder: &EvalEmbedder, base: &Path) -> ! {
         .expect("create the fixture directory");
     std::fs::write(FIXTURE, render(&fixture)).expect("write the fixture");
     panic!("fixture written: review the diff of {FIXTURE} and run the test again without {BLESS_VAR}");
+}
+
+/// A long save in English and in Spanish, with paths, identifiers and signs.
+/// Every sentence is numbered, so no stretch of it repeats.
+fn mixed_save() -> String {
+    (0..40)
+        .map(|i| {
+            format!(
+                "Step {i:03}: the worker in crates/clawg-core/src/memory/worker.rs calls \
+                 Store::insert_unless_present() for save #{i:03}, then link_pieces(); see \
+                 `memory_piece.context` and HEAD_SEPARATOR (\"\\n…\\n\"). Paso {i:03}: el daemon \
+                 guarda la memoria número {i:03} en ~/.clawg-dev/memory.db; ¿por qué? Porque \
+                 split_save() corta las piezas, ¡así de fácil!\n\n"
+            )
+        })
+        .collect()
+}
+
+/// Whether a cut at byte `b` of `text` leaves every word of it whole.
+fn is_word_boundary(text: &str, b: usize) -> bool {
+    b == 0
+        || b == text.len()
+        || text[..b].chars().next_back().is_some_and(char::is_whitespace)
+        || text[b..].chars().next().is_some_and(char::is_whitespace)
+}
+
+/// The text on both sides of byte `b`, for a failure message.
+fn around(text: &str, b: usize) -> String {
+    let before: String = text[..b].chars().rev().take(16).collect::<Vec<_>>().into_iter().rev().collect();
+    let after: String = text[b..].chars().take(16).collect();
+    format!("{before:?} | {after:?}")
+}
+
+#[test]
+#[ignore = "needs the real model in CLAWG_E5_MODEL_DIR (<data dir>/models/multilingual-e5-small)"]
+fn the_real_tokenizer_cuts_no_piece_inside_a_word() {
+    let counter = EvalTokenCounter::real(&data_dir_of(&model_dir())).expect("the tokenizer loads");
+    let text = mixed_save();
+    let (pieces, head) = counter.split_save(&text);
+    assert!(pieces.len() > 10, "the fixture is a long save: {} pieces", pieces.len());
+
+    let head = head.expect("a long save has a head");
+    assert!(text.starts_with(&head));
+    assert!(is_word_boundary(&text, head.len()), "the head ends inside a word: {}", around(&text, head.len()));
+    assert!(counter.count(&head) <= 48, "the head has {} tokens", counter.count(&head));
+
+    let (mut from, mut covered) = (0, 0);
+    for (k, piece) in pieces.iter().enumerate() {
+        let start = from + text[from..].find(piece.as_str()).unwrap_or_else(|| panic!("piece {k} is not in the text"));
+        let end = start + piece.len();
+        assert!(start <= covered, "bytes {covered}..{start} before piece {k} are in no piece");
+        assert!(is_word_boundary(&text, start), "piece {k} starts inside a word: {}", around(&text, start));
+        assert!(is_word_boundary(&text, end), "piece {k} ends inside a word: {}", around(&text, end));
+        assert!(counter.count(piece) <= 96, "piece {k} has {} tokens, from {}", counter.count(piece), around(&text, start));
+        from = start + piece.chars().next().map_or(1, char::len_utf8);
+        covered = end;
+    }
+    assert_eq!(covered, text.len(), "the last piece reaches the end of the text");
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    assert_eq!(join_pieces(&pieces), text, "the save reads back whole");
 }
 
 #[tokio::test]

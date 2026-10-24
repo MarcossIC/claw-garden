@@ -33,9 +33,9 @@ pub const AGENT: &str = "claude-code";
 pub const BEGIN_MARKER: &str = "<!-- BEGIN CLAWG MEMORY PROTOCOL -->";
 pub const END_MARKER: &str = "<!-- END CLAWG MEMORY PROTOCOL -->";
 
-/// What the agent is told about memory, the same text the MCP server's
-/// instructions open with.
-const PROTOCOL: &str = include_str!("mcp/protocol.md");
+use clawg_core::preferences::{self, Lang};
+
+use crate::mcp::protocol;
 
 const SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
 
@@ -76,6 +76,8 @@ pub struct State {
     pub settings: File,
     /// The user `CLAUDE.md`, where the protocol goes.
     pub instructions: File,
+    /// The profile's preferred language, which the protocol's rules name.
+    pub language: Option<Lang>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -235,7 +237,7 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
     };
     let other_registered = registered(other.mcp_server_name()).is_some_and(is_clawg_server);
     let (block, instructions) = match mode {
-        Mode::Install => install_block(&state.instructions)?,
+        Mode::Install => install_block(&state.instructions, state.language)?,
         Mode::Remove if other_registered => {
             find_block(&state.instructions)?;
             (BlockStep::Kept, FileStep::Unchanged)
@@ -554,9 +556,10 @@ fn line_ending(text: &str) -> &'static str {
     }
 }
 
-/// The protocol between its markers, without a final line ending.
-fn block(eol: &str) -> String {
-    let protocol = PROTOCOL.replace("\r\n", "\n");
+/// The protocol for `language` ([`protocol::text`]) between its markers,
+/// without a final line ending.
+pub(crate) fn block(eol: &str, language: Option<Lang>) -> String {
+    let protocol = protocol::text(language).replace("\r\n", "\n");
     let body = protocol.trim_end().replace('\n', eol);
     format!("{BEGIN_MARKER}{eol}{body}{eol}{END_MARKER}")
 }
@@ -564,7 +567,7 @@ fn block(eol: &str) -> String {
 /// Where the block is in the file: from its first marker to the end of its
 /// last. A marker without its pair is an error, since there is no knowing
 /// where clawg's text ends.
-fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupError> {
+pub(crate) fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupError> {
     let Some(text) = &file.text else { return Ok(None) };
     let lone = || SetupError::LoneMarker { path: file.path.clone() };
     match (text.find(BEGIN_MARKER), text.find(END_MARKER)) {
@@ -580,13 +583,13 @@ fn find_block(file: &File) -> Result<Option<(usize, usize)>, SetupError> {
     }
 }
 
-fn install_block(file: &File) -> Result<(BlockStep, FileStep), SetupError> {
+fn install_block(file: &File, language: Option<Lang>) -> Result<(BlockStep, FileStep), SetupError> {
     let range = find_block(file)?;
     let Some(text) = &file.text else {
-        return Ok((BlockStep::Added, FileStep::Write(block("\n") + "\n")));
+        return Ok((BlockStep::Added, FileStep::Write(block("\n", language) + "\n")));
     };
     let eol = line_ending(text);
-    let wanted = block(eol);
+    let wanted = block(eol, language);
     if let Some((begin, end)) = range {
         if text[begin..end] == wanted {
             return Ok((BlockStep::Unchanged, FileStep::Unchanged));
@@ -645,10 +648,23 @@ fn read(path: PathBuf) -> Result<File, SetupError> {
     }
 }
 
-/// Reads what [`plan`] decides from.
-pub fn read_state(exe: PathBuf, profile: Profile, home: Option<&Path>, config_dir: Option<OsString>) -> Result<State, SetupError> {
+/// Reads what [`plan`] decides from, the preferred language from `data_dir`.
+pub fn read_state(
+    exe: PathBuf,
+    profile: Profile,
+    home: Option<&Path>,
+    config_dir: Option<OsString>,
+    data_dir: &Path,
+) -> Result<State, SetupError> {
     let (servers, settings, instructions) = locations(home, config_dir)?;
-    Ok(State { exe, profile, servers: read(servers)?, settings: read(settings)?, instructions: read(instructions)? })
+    Ok(State {
+        exe,
+        profile,
+        servers: read(servers)?,
+        settings: read(settings)?,
+        instructions: read(instructions)?,
+        language: preferences::language_in(data_dir),
+    })
 }
 
 /// The first `claude` the PATH resolves to.
@@ -862,40 +878,85 @@ fn create_fresh(path: &Path, _mode: Option<u32>) -> std::io::Result<std::fs::Fil
 }
 
 /// The report, one line per step, and the exit code: 1 when a step did not
-/// end as planned (a conflict, the manual command, a failure).
+/// end as planned (a conflict, the manual command, a failure). It speaks the
+/// profile's preferred language; the commands and paths it names do not change.
 pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String, u8) {
+    let lang = state.language.unwrap_or(Lang::En);
     let dry = applied.is_none();
-    let will = |done: &str, planned: &str| if dry { format!("would {planned}") } else { done.to_string() };
+    // A step as done, or as a dry run would do it: each language gives both.
+    let will = |en: (&str, &str), es: (&str, &str)| {
+        let (done, planned) = match lang {
+            Lang::En => en,
+            Lang::Es => es,
+        };
+        match (dry, lang) {
+            (false, _) => done.to_string(),
+            (true, Lang::En) => format!("would {planned}"),
+            (true, Lang::Es) => planned.to_string(),
+        }
+    };
     let mut lines = Vec::new();
     let mut incomplete = false;
     let name = plan.server.name;
+    let server = match lang {
+        Lang::En => format!("mcp server {name}"),
+        Lang::Es => format!("servidor mcp {name}"),
+    };
 
     let server_line = match (&plan.server_step, applied.map(|a| &a.server)) {
         (ServerStep::Add | ServerStep::Remove, Some(ServerOutcome::Manual)) => {
             incomplete = true;
-            if plan.server_step == ServerStep::Add {
-                format!("mcp server {name}: claude is not on the PATH; register it with:\n  {}", plan.server.add_line())
-            } else {
-                format!("mcp server {name}: claude is not on the PATH; remove it with:\n  claude mcp remove --scope user {name}")
+            let add = plan.server_step == ServerStep::Add;
+            match (add, lang) {
+                (true, Lang::En) => format!("{server}: claude is not on the PATH; register it with:\n  {}", plan.server.add_line()),
+                (true, Lang::Es) => format!("{server}: claude no está en el PATH; regístralo con:\n  {}", plan.server.add_line()),
+                (false, Lang::En) => {
+                    format!("{server}: claude is not on the PATH; remove it with:\n  claude mcp remove --scope user {name}")
+                }
+                (false, Lang::Es) => {
+                    format!("{server}: claude no está en el PATH; quítalo con:\n  claude mcp remove --scope user {name}")
+                }
             }
         }
         (_, Some(ServerOutcome::Failed(why))) => {
             incomplete = true;
-            format!("mcp server {name}: claude failed: {why}")
+            match lang {
+                Lang::En => format!("{server}: claude failed: {why}"),
+                Lang::Es => format!("{server}: claude falló: {why}"),
+            }
         }
-        (ServerStep::Add, _) => format!("mcp server {name}: {} ({})", will("registered", "register it"), plan.server.add_line()),
-        (ServerStep::Remove, _) => format!("mcp server {name}: {}", will("removed", "remove it")),
-        (ServerStep::Unchanged, _) => format!("mcp server {name}: already registered"),
-        (ServerStep::Absent, _) => format!("mcp server {name}: not registered"),
+        (ServerStep::Add, _) => {
+            let step = will(("registered", "register it"), ("registrado", "se registraría"));
+            format!("{server}: {step} ({})", plan.server.add_line())
+        }
+        (ServerStep::Remove, _) => {
+            let step = will(("removed", "remove it"), ("quitado", "se quitaría"));
+            format!("{server}: {step}")
+        }
+        (ServerStep::Unchanged, _) => match lang {
+            Lang::En => format!("{server}: already registered"),
+            Lang::Es => format!("{server}: ya está registrado"),
+        },
+        (ServerStep::Absent, _) => match lang {
+            Lang::En => format!("{server}: not registered"),
+            Lang::Es => format!("{server}: no está registrado"),
+        },
         (ServerStep::Conflict(found), _) => {
             incomplete = true;
-            let fix = match plan.mode {
-                Mode::Install => format!(
+            let fix = match (plan.mode, lang) {
+                (Mode::Install, Lang::En) => format!(
                     "`clawg setup claude-code --remove` takes away a clawg registration, `claude mcp remove --scope user {name}` any other"
                 ),
-                Mode::Remove => "it is not clawg's".to_string(),
+                (Mode::Install, Lang::Es) => format!(
+                    "`clawg setup claude-code --remove` quita un registro de clawg, `claude mcp remove --scope user {name}` cualquier otro"
+                ),
+                (Mode::Remove, Lang::En) => "it is not clawg's".to_string(),
+                (Mode::Remove, Lang::Es) => "no es de clawg".to_string(),
             };
-            format!("mcp server {name}: registered as `{found}`; left as it is ({fix})")
+            match lang {
+                Lang::En => format!("{server}: registered as `{found}`; left as it is ({fix})"),
+                Lang::Es => format!("{server}: registrado como `{found}`; queda como está ({fix})"),
+            }
         }
     };
     lines.push(server_line);
@@ -903,42 +964,85 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
     let hooks = &plan.hooks;
     let mut parts = Vec::new();
     if !hooks.added.is_empty() {
-        parts.push(format!("{} {}", will("added", "add"), hooks.added.join(", ")));
+        let step = will(("added", "add"), ("agregados", "se agregarían"));
+        parts.push(format!("{step} {}", hooks.added.join(", ")));
     }
     if !hooks.removed.is_empty() {
-        parts.push(format!("{} {}", will("removed", "remove"), hooks.removed.join(", ")));
+        let step = will(("removed", "remove"), ("quitados", "se quitarían"));
+        parts.push(format!("{step} {}", hooks.removed.join(", ")));
     }
     if !hooks.migrated.is_empty() {
-        parts.push(format!("{} {} to run without a shell", will("migrated", "migrate"), hooks.migrated.join(", ")));
+        let step = will(("migrated", "migrate"), ("pasados", "se pasarían"));
+        let to = match lang {
+            Lang::En => "to run without a shell",
+            Lang::Es => "a correr sin shell",
+        };
+        parts.push(format!("{step} {} {to}", hooks.migrated.join(", ")));
     }
     if !hooks.unchanged.is_empty() {
-        parts.push(format!("{} already there", hooks.unchanged.join(", ")));
+        let unchanged = hooks.unchanged.join(", ");
+        parts.push(match lang {
+            Lang::En => format!("{unchanged} already there"),
+            Lang::Es => format!("{unchanged} ya están"),
+        });
     }
     for (event, command) in &hooks.conflicts {
         incomplete = true;
-        parts.push(format!("{event} has another clawg hook, `{command}`; left as it is (`clawg setup claude-code --remove` takes it away)"));
+        parts.push(match lang {
+            Lang::En => format!(
+                "{event} has another clawg hook, `{command}`; left as it is (`clawg setup claude-code --remove` takes it away)"
+            ),
+            Lang::Es => format!(
+                "{event} tiene otro hook de clawg, `{command}`; queda como está (`clawg setup claude-code --remove` lo quita)"
+            ),
+        });
     }
     if parts.is_empty() {
-        parts.push("none of clawg's".to_string());
+        parts.push(
+            match lang {
+                Lang::En => "none of clawg's",
+                Lang::Es => "ninguno de clawg",
+            }
+            .to_string(),
+        );
     }
-    lines.push(format!("hooks in {}: {}", state.settings.path.display(), parts.join("; ")));
+    let settings = state.settings.path.display();
+    lines.push(match lang {
+        Lang::En => format!("hooks in {settings}: {}", parts.join("; ")),
+        Lang::Es => format!("hooks en {settings}: {}", parts.join("; ")),
+    });
 
-    let block = match plan.block {
-        BlockStep::Added => will("added", "add it"),
-        BlockStep::Rewritten => will("updated", "update it"),
-        BlockStep::Removed => will("removed", "remove it"),
-        BlockStep::Unchanged => "up to date".to_string(),
-        BlockStep::Absent => "not there".to_string(),
-        BlockStep::Kept => "kept, the other profile's server still uses it".to_string(),
+    let block = match (plan.block, lang) {
+        (BlockStep::Added, _) => will(("added", "add it"), ("agregado", "se agregaría")),
+        (BlockStep::Rewritten, _) => will(("updated", "update it"), ("actualizado", "se actualizaría")),
+        (BlockStep::Removed, _) => will(("removed", "remove it"), ("quitado", "se quitaría")),
+        (BlockStep::Unchanged, Lang::En) => "up to date".to_string(),
+        (BlockStep::Unchanged, Lang::Es) => "al día".to_string(),
+        (BlockStep::Absent, Lang::En) => "not there".to_string(),
+        (BlockStep::Absent, Lang::Es) => "no está".to_string(),
+        (BlockStep::Kept, Lang::En) => "kept, the other profile's server still uses it".to_string(),
+        (BlockStep::Kept, Lang::Es) => "se mantiene, el servidor del otro perfil todavía lo usa".to_string(),
     };
-    lines.push(format!("memory protocol in {}: {block}", state.instructions.path.display()));
+    let instructions = state.instructions.path.display();
+    lines.push(match lang {
+        Lang::En => format!("memory protocol in {instructions}: {block}"),
+        Lang::Es => format!("protocolo de memoria en {instructions}: {block}"),
+    });
 
     if let Some(applied) = applied {
         for backup in &applied.backups {
-            lines.push(format!("previous file copied to {}", backup.display()));
+            let backup = backup.display();
+            lines.push(match lang {
+                Lang::En => format!("previous file copied to {backup}"),
+                Lang::Es => format!("archivo anterior copiado a {backup}"),
+            });
         }
         for copy in &applied.pruned {
-            lines.push(format!("older copy removed: {}", copy.display()));
+            let copy = copy.display();
+            lines.push(match lang {
+                Lang::En => format!("older copy removed: {copy}"),
+                Lang::Es => format!("copia más vieja borrada: {copy}"),
+            });
         }
         for failure in &applied.failures {
             incomplete = true;
@@ -949,7 +1053,13 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
         || plan.settings != FileStep::Unchanged
         || plan.instructions != FileStep::Unchanged;
     if changed && !dry {
-        lines.push("Open a new Claude Code session for the change to take effect.".to_string());
+        lines.push(
+            match lang {
+                Lang::En => "Open a new Claude Code session for the change to take effect.",
+                Lang::Es => "Abre una sesión nueva de Claude Code para que el cambio tenga efecto.",
+            }
+            .to_string(),
+        );
     }
     (lines.join("\n"), if incomplete { 1 } else { 0 })
 }
@@ -974,7 +1084,7 @@ pub fn run_in(
 pub fn run(profile: Profile, mode: Mode, dry_run: bool) -> Result<(String, u8), SetupError> {
     let base_dir = clawg_core::paths::data_dir(profile).map_err(|_| SetupError::NoHome)?;
     let home = clawg_core::paths::home_dir();
-    let state = read_state(current_exe()?, profile, home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR"))?;
+    let state = read_state(current_exe()?, profile, home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR"), &base_dir)?;
     let entries: Vec<PathBuf> = std::env::var_os("PATH").map(|raw| std::env::split_paths(&raw).collect()).unwrap_or_default();
     let claude = find_claude(&entries, Path::is_file);
     let now_ms = std::time::SystemTime::now()
@@ -1017,6 +1127,7 @@ mod tests {
             servers: file(".claude.json", servers),
             settings: file("settings.json", settings),
             instructions: file("CLAUDE.md", instructions),
+            language: None,
         }
     }
 
@@ -1253,16 +1364,78 @@ mod tests {
     }
 
     #[test]
+    fn the_block_follows_the_preferred_language() {
+        let spanish = State { language: Some(Lang::Es), ..state(None, None, None) };
+        let plan_ = plan(&spanish, Mode::Install).unwrap();
+        let text = written(&plan_.instructions);
+        assert!(text.contains("# Protocolo de memoria de Claw Garden"), "{text}");
+        assert!(text.contains("Responde a la persona en español salvo que escriba en otro idioma"), "{text}");
+        assert_eq!(text, format!("{}\n", block("\n", Some(Lang::Es))));
+        assert_ne!(block("\n", Some(Lang::Es)), block("\n", None));
+    }
+
+    #[test]
+    fn the_setup_report_speaks_spanish() {
+        let installed = format!("# Mine\n\n{}\n", block("\n", None));
+        let s = State { language: Some(Lang::Es), ..state(None, None, Some(&installed)) };
+        let plan_ = plan(&s, Mode::Install).unwrap();
+        let (dry, code) = report(&plan_, &s, None);
+        assert_eq!(code, 0);
+        for needed in [
+            "servidor mcp clawg-dev: se registraría (claude mcp add --scope user clawg-dev -- ",
+            ": se agregarían SessionStart, UserPromptSubmit",
+            "protocolo de memoria en ",
+            ": se actualizaría",
+        ] {
+            assert!(dry.contains(needed), "missing {needed:?} in:\n{dry}");
+        }
+        let applied = Applied {
+            server: ServerOutcome::Manual,
+            backups: vec![PathBuf::from("/b/settings.json.1")],
+            pruned: vec![PathBuf::from("/b/settings.json.0")],
+            failures: vec![],
+        };
+        let (text, code) = report(&plan_, &s, Some(&applied));
+        assert_eq!(code, 1, "the manual command is not done");
+        for needed in [
+            "servidor mcp clawg-dev: claude no está en el PATH; regístralo con:\n  claude mcp add --scope user clawg-dev -- ",
+            ": agregados SessionStart, UserPromptSubmit",
+            ": actualizado",
+            "archivo anterior copiado a /b/settings.json.1",
+            "copia más vieja borrada: /b/settings.json.0",
+            "Abre una sesión nueva de Claude Code para que el cambio tenga efecto.",
+        ] {
+            assert!(text.contains(needed), "missing {needed:?} in:\n{text}");
+        }
+
+        let servers = r#"{"mcpServers":{"clawg-dev":{"type":"stdio","command":"/old/clawg","args":["mcp","--profile","dev"]}}}"#;
+        let conflict = State { language: Some(Lang::Es), ..state(Some(servers), None, None) };
+        let (text, code) = report(&plan(&conflict, Mode::Install).unwrap(), &conflict, None);
+        assert_eq!(code, 1);
+        assert!(text.contains("registrado como `/old/clawg mcp --profile dev`; queda como está"), "{text}");
+    }
+
+    #[test]
+    fn another_language_rewrites_the_block() {
+        let installed = format!("# Mine\n\n{}\n", block("\n", None));
+        assert_eq!(plan(&state(None, None, Some(&installed)), Mode::Install).unwrap().block, BlockStep::Unchanged);
+        let spanish = State { language: Some(Lang::Es), ..state(None, None, Some(&installed)) };
+        let plan_ = plan(&spanish, Mode::Install).unwrap();
+        assert_eq!(plan_.block, BlockStep::Rewritten, "what a --dry-run reports, since it plans the same");
+        assert_eq!(written(&plan_.instructions), format!("# Mine\n\n{}\n", block("\n", Some(Lang::Es))));
+    }
+
+    #[test]
     fn the_block_is_appended_and_rewritten_in_place() {
         let mine = "# My rules\n\nUse tabs.\n";
         let plan_ = plan(&state(None, None, Some(mine)), Mode::Install).unwrap();
         let added = written(&plan_.instructions).to_string();
-        assert_eq!(added, format!("{mine}\n{}\n", block("\n")));
+        assert_eq!(added, format!("{mine}\n{}\n", block("\n", None)));
 
         let stale = format!("# My rules\n\n{BEGIN_MARKER}\nold protocol\n{END_MARKER}\n\nAfter.\n");
         let plan_ = plan(&state(None, None, Some(&stale)), Mode::Install).unwrap();
         assert_eq!(plan_.block, BlockStep::Rewritten);
-        assert_eq!(written(&plan_.instructions), format!("# My rules\n\n{}\n\nAfter.\n", block("\n")));
+        assert_eq!(written(&plan_.instructions), format!("# My rules\n\n{}\n\nAfter.\n", block("\n", None)));
 
         let crlf = "line one\r\nline two\r\n";
         let plan_ = plan(&state(None, None, Some(crlf)), Mode::Install).unwrap();
@@ -1372,7 +1545,7 @@ mod tests {
     #[test]
     fn remove_keeps_the_block_while_the_other_profile_is_registered() {
         let both = r#"{"mcpServers":{"clawg":{"command":"/opt/clawg/clawg","args":["mcp","--profile","prod"]},"clawg-dev":{"command":"/x/clawg","args":["mcp"]}}}"#;
-        let md = format!("{}\n", block("\n"));
+        let md = format!("{}\n", block("\n", None));
         let plan = plan(&state(Some(both), None, Some(&md)), Mode::Remove).unwrap();
         assert_eq!(plan.server_step, ServerStep::Remove);
         assert_eq!((plan.block, &plan.instructions), (BlockStep::Kept, &FileStep::Unchanged));

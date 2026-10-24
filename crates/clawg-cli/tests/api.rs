@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clawg_cli::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, SAVE_CONFIRM_TIMEOUT};
+use clawg_cli::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, REFRESH_GRACE, SAVE_CONFIRM_TIMEOUT};
 use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
 use clawg_core::memory::idle_embedder::{IdleEmbedder, ReloadFn};
@@ -53,6 +53,48 @@ enum EmbedderState {
     /// Texts holding one of these keys embed to its vector, so a test decides
     /// the cosines; any other text embeds as the fake model would.
     Fixed(Vec<(&'static str, Vec<f32>)>),
+    /// Queries embed as the fake model does; passages wait for a gate to
+    /// open, and may then fail.
+    Docs(DocsEmbedder),
+}
+
+/// `FakeEmbedder` under the same model id, except that a passage waits until
+/// the gate reads true and then fails if `fail`, so a test holds or breaks a
+/// docs refresh without touching searches.
+struct DocsEmbedder {
+    open: tokio::sync::watch::Receiver<bool>,
+    fail: bool,
+}
+
+/// The embedder and the sender of its gate.
+fn docs_embedder(open: bool, fail: bool) -> (DocsEmbedder, tokio::sync::watch::Sender<bool>) {
+    let (gate, open) = tokio::sync::watch::channel(open);
+    (DocsEmbedder { open, fail }, gate)
+}
+
+#[async_trait::async_trait]
+impl Embedder for DocsEmbedder {
+    async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        if role == EmbedRole::Passage {
+            let _ = self.open.clone().wait_for(|open| *open).await;
+            if self.fail {
+                return Err(EmbedError::InferenceFailed("passages refused".into()));
+            }
+        }
+        FakeEmbedder::default().embed_with_role(text, role).await
+    }
+    fn dimensions(&self) -> usize {
+        384
+    }
+    fn model_id(&self) -> &str {
+        "fake-embedder"
+    }
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+    fn passage_prefix(&self) -> &str {
+        ""
+    }
 }
 
 struct FixedEmbedder(Vec<(&'static str, Vec<f32>)>);
@@ -270,6 +312,12 @@ impl Harness {
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 (runtime, None)
             }
+            EmbedderState::Docs(embedder) => {
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
+                runtime.embedder.set(Arc::new(embedder) as Arc<dyn Embedder>).ok();
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+                (runtime, None)
+            }
             EmbedderState::DroppingReplies => {
                 let mut rx = rx;
                 tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -299,6 +347,7 @@ impl Harness {
             shutdown,
             save_timeout,
             sessions: Default::default(),
+            metrics: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -589,6 +638,7 @@ async fn a_daemon_client_passes_the_guard() {
             agent_id: "a".into(),
             project_id: None,
             limit: None,
+            lang: None,
         })
         .await
         .expect("search");
@@ -814,18 +864,20 @@ async fn get_save_returns_the_whole_text() {
 }
 
 #[tokio::test]
-async fn get_save_of_another_agent_is_404() {
+async fn get_save_of_another_agent_reads_whole_unless_hidden() {
     let h = Harness::start().await;
     let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
     let id = body["memories"][0]["id"].as_i64().expect("id");
 
-    let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
-    assert_eq!(status, 404, "another agent's save reads as missing");
+    let (status, save) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
+    assert_eq!(status, 200, "another agent reads it whole: {save}");
+    assert_eq!((save["pieces"].as_i64(), save["text"].as_str()), (Some(1), Some(CONTENT)));
     let (status, _) = h.get_json("/v1/memories/memory/999999/save?agent=agent-http").await;
     assert_eq!(status, 404);
-    let (status, save) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-http")).await;
-    assert_eq!(status, 200, "{save}");
-    assert_eq!((save["pieces"].as_i64(), save["text"].as_str()), (Some(1), Some(CONTENT)));
+
+    write_policy(&h, HIDE_AUTHOR);
+    let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
+    assert_eq!(status, 404, "a hidden author's save reads as missing");
 }
 
 #[tokio::test]
@@ -1482,6 +1534,62 @@ async fn context_returns_a_prompt_string() {
     );
 }
 
+const ENGLISH_NOTE: &str = "The deploy script lives in the ops folder, and it runs after every merge.";
+const SPANISH_NOTE: &str = "El script de despliegue vive en la carpeta ops y corre después de cada merge.";
+
+#[tokio::test]
+async fn a_search_with_a_language_counts_the_other_one() {
+    let h = Harness::start().await;
+    save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    save_id(&h, json!({ "content": SPANISH_NOTE, "agent_id": "a" })).await;
+    save_id(&h, json!({ "content": format!("{ENGLISH_NOTE} Twice."), "agent_id": "b" })).await;
+
+    let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a", "lang": "es" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["other_language"], json!({ "lang": "en", "memories": 2 }), "{body}");
+    let (_, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a", "lang": "en" })).await;
+    assert_eq!(body["other_language"], json!({ "lang": "es", "memories": 1 }), "{body}");
+
+    write_policy(&h, r#"{"version":1,"hides":{"a":["b"]}}"#);
+    let (_, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a", "lang": "es" })).await;
+    assert_eq!(body["other_language"], json!({ "lang": "en", "memories": 1 }), "a hidden author counts for nothing: {body}");
+}
+
+#[tokio::test]
+async fn a_search_without_a_language_has_no_count() {
+    let h = Harness::start().await;
+    save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("other_language").is_none(), "{body}");
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "lang": "es" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("other_language").is_none(), "a context without a query searches nothing: {body}");
+}
+
+#[tokio::test]
+async fn a_context_with_a_query_counts_the_other_language() {
+    let h = Harness::start().await;
+    save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let (status, body) = h.post_json("/v1/context", json!({ "query": "despliegue", "agent_id": "a", "lang": "es" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["other_language"], json!({ "lang": "en", "memories": 1 }), "{body}");
+}
+
+#[tokio::test]
+async fn an_unknown_language_is_a_bad_request() {
+    let h = Harness::start().await;
+    for (path, body) in [
+        ("/v1/search", json!({ "query": "deploy", "agent_id": "a", "lang": "fr" })),
+        ("/v1/context", json!({ "query": "deploy", "agent_id": "a", "lang": "ES" })),
+    ] {
+        let (status, body) = h.post_json(path, body).await;
+        assert_eq!(status, 400, "{path}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains("en") && error.contains("es"), "{path}: {body}");
+    }
+}
+
 /// An empty or workspace-only prompt reads as "no memories" unless the
 /// answer says the memories were never searched.
 #[tokio::test]
@@ -1529,6 +1637,28 @@ async fn context_without_a_query_does_not_need_the_embedder() {
     let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a" })).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["retrieval"], json!({ "state": "recent", "hits": 0 }), "nothing was embedded: {body}");
+}
+
+#[tokio::test]
+async fn a_context_in_spanish_keeps_its_markers() {
+    let h = Harness::start().await;
+    let summary = json!({
+        "content": "Objetivo: cortar la rama. Próximos pasos: etiquetar la versión.",
+        "agent_id": "b",
+        "project_id": "p",
+        "memory_type": "session_summary",
+    });
+    h.post_json("/v1/memories", summary).await;
+    h.wait_for_rows("memory", 1).await;
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "project_id": "p", "lang": "es" })).await;
+    assert_eq!(status, 200, "{body}");
+    let prompt = body["prompt"].as_str().unwrap();
+    for marker in ["=== LAST SESSION ===", "session_summary by b]", "=== SHARED ==="] {
+        assert!(prompt.contains(marker), "{marker:?} stays as it is: {prompt}");
+    }
+    assert!(prompt.contains("Las líneas marcadas \"by <agent>\" las guardó otro agente."), "{prompt}");
+    let (_, english) = h.post_json("/v1/context", json!({ "agent_id": "a", "project_id": "p" })).await;
+    assert!(english["prompt"].as_str().unwrap().contains("Lines marked \"by <agent>\" were saved by another agent."), "{english}");
 }
 
 /// Under the fake model only the row identical to the query scores; the
@@ -1603,11 +1733,11 @@ async fn context_reports_unreviewed_memories() {
     let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "b", "project_id": "p" })).await;
     assert_eq!(status, 200, "{body}");
     let (_, body) = context().await;
-    assert_eq!(body["unreviewed"], 2, "another agent's review is not this one's: {body}");
+    assert_eq!(body["unreviewed"], 0, "a review is the project's, whichever agent made it: {body}");
 
-    h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
+    h.post_json("/v1/memories", json!({ "content": "the python package uses spaces", "agent_id": "b", "project_id": "p" })).await;
     let (_, body) = context().await;
-    assert_eq!(body["unreviewed"], 0, "{body}");
+    assert_eq!(body["unreviewed"], 1, "another agent's new memory is this one's to review too: {body}");
 }
 
 // ── conclusions and synthesis ───────────────────────────────────────────────
@@ -1844,24 +1974,41 @@ async fn user_stated_with_derived_from_is_refused() {
 }
 
 #[tokio::test]
-async fn an_agent_neither_reviews_nor_cites_another_agents_memories() {
+async fn an_agent_reviews_another_agents_memories_unless_hidden() {
     let h = Harness::start().await;
     let mine = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a", "project_id": "p" })).await;
     let theirs = save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "b", "project_id": "p" })).await;
+    let pending = || async {
+        let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
+        assert_eq!(status, 200, "{body}");
+        body["pending"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect::<Vec<i64>>()
+    };
 
-    let (status, body) = h.post_json("/v1/synthesis", json!({ "agent_id": "a", "project_id": "p" })).await;
-    assert_eq!(status, 200, "{body}");
-    let pending: Vec<i64> = body["pending"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
-    assert_eq!(pending, vec![mine], "{body}");
+    assert_eq!(pending().await, vec![theirs, mine]);
+    write_policy(&h, r#"{"version":1,"hides":{"a":["b"]}}"#);
+    assert_eq!(pending().await, vec![mine]);
+}
 
-    let (status, body) = h
-        .post_json(
+#[tokio::test]
+async fn a_conclusion_may_cite_another_agents_memory_unless_hidden() {
+    let h = Harness::start().await;
+    let mine = save_id(&h, json!({ "content": "the go service uses tabs", "agent_id": "a", "project_id": "p" })).await;
+    let theirs = save_id(&h, json!({ "content": "the deploy runs on fridays", "agent_id": "b", "project_id": "p" })).await;
+    let conclude = |content: &'static str| {
+        h.post_json(
             "/v1/memories",
-            json!({ "content": "a conclusion", "agent_id": "a", "project_id": "p", "derived_from": [mine, theirs] }),
+            json!({ "content": content, "agent_id": "a", "project_id": "p", "derived_from": [mine, theirs] }),
         )
-        .await;
+    };
+
+    write_policy(&h, r#"{"version":1,"hides":{"a":["b"]}}"#);
+    let (status, body) = conclude("a conclusion the policy refuses").await;
     assert_eq!(status, 400, "{body}");
     assert!(body.to_string().contains(&theirs.to_string()), "{body}");
+
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    let (status, body) = conclude("a conclusion drawn from both agents").await;
+    assert_eq!(status, 201, "{body}");
 }
 
 #[tokio::test]
@@ -2073,7 +2220,7 @@ async fn a_protected_verdict_without_the_answer_is_a_409() {
 }
 
 #[tokio::test]
-async fn disputes_lists_pending_pairs_of_the_agent() {
+async fn disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project() {
     let h = Harness::start().await;
     let (old, new) = seed_dispute(&h).await;
     h.ctx
@@ -2096,7 +2243,13 @@ async fn disputes_lists_pending_pairs_of_the_agent() {
     assert_eq!(body["pairs"][0]["old_id"], old, "{body}");
 
     let (_, other) = h.get_json("/v1/disputes?agent_id=agent-other").await;
-    assert_eq!(other["pending"], 0, "{other}");
+    assert_eq!(other["pending"], 1, "another agent judges it too: {other}");
+    let (_, elsewhere) = h.get_json("/v1/disputes?agent_id=agent-other&project_id=p").await;
+    assert_eq!(elsewhere["pending"], 1, "a pair without a project is every project's: {elsewhere}");
+
+    write_policy(&h, HIDE_AUTHOR);
+    let (_, hidden) = h.get_json("/v1/disputes?agent_id=agent-other").await;
+    assert_eq!(hidden["pending"], 0, "{hidden}");
 }
 
 #[tokio::test]
@@ -2134,27 +2287,38 @@ async fn resolve_rows_without_a_dispute_conflict() {
     assert_eq!(status, 409, "{body}");
 }
 
+/// `agent-other` does not read `agent-http`.
+const HIDE_AUTHOR: &str = r#"{"version":1,"hides":{"agent-other":["agent-http"]}}"#;
+
 #[tokio::test]
-async fn delete_with_another_agent_is_404_and_keeps_the_row() {
+async fn delete_with_a_hidden_author_is_404_and_another_agent_deletes_otherwise() {
+    let h = Harness::start().await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
+    let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().expect("id");
+    let delete = || h.authed(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other")))).send();
+
+    write_policy(&h, HIDE_AUTHOR);
+    assert_eq!(delete().await.expect("request").status(), 404, "a hidden author's row reads as missing");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert!(row["item"]["deleted_at"].is_null(), "{row}");
+
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    assert_eq!(delete().await.expect("request").status(), 200, "another agent deletes what it reaches");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert!(!row["item"]["deleted_at"].is_null(), "{row}");
+}
+
+#[tokio::test]
+async fn an_unreadable_policy_leaves_an_agent_its_own_rows_and_the_authorless() {
     let h = Harness::start().await;
     h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
     let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().expect("id");
 
-    let r = h
-        .authed(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other"))))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(r.status(), 404, "another agent's row reads as missing");
-    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
-    assert!(row["item"]["deleted_at"].is_null(), "{row}");
-
-    let r = h
-        .authed(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=agent-http"))))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(r.status(), 200, "the owner can delete it");
+    write_policy(&h, "{ not json");
+    let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-other")).await;
+    assert_eq!(status, 404, "an unreadable policy shares nothing");
+    let (status, _) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=agent-http")).await;
+    assert_eq!(status, 200, "its author still reads it");
 }
 
 #[tokio::test]
@@ -2235,47 +2399,45 @@ async fn an_invalid_patch_changes_nothing() {
 }
 
 #[tokio::test]
-async fn patch_with_another_agent_is_404_and_keeps_the_importance() {
+async fn patch_with_a_hidden_author_is_404_and_another_agent_patches_otherwise() {
     let h = Harness::start().await;
     h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http" })).await;
     let item = h.wait_for_rows("memory", 1).await.remove(0);
     let id = item["id"].as_i64().expect("id");
+    let patch = || {
+        h.authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other"))))
+            .json(&json!({ "importance": 9.5 }))
+            .send()
+    };
 
-    let r = h
-        .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=agent-other"))))
-        .json(&json!({ "importance": 9.5 }))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(r.status(), 404);
+    write_policy(&h, HIDE_AUTHOR);
+    assert_eq!(patch().await.expect("request").status(), 404);
     let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
     assert_eq!(row["item"]["importance"], item["importance"], "{row}");
 
-    let r = h
-        .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=agent-http"))))
-        .json(&json!({ "importance": 9.5 }))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(r.status(), 200);
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    assert_eq!(patch().await.expect("request").status(), 200);
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    assert_eq!(row["item"]["importance"], 9.5, "{row}");
 }
 
 #[tokio::test]
-async fn resolve_with_another_agent_is_404_and_changes_nothing() {
+async fn resolve_with_a_hidden_author_is_404_and_another_agent_resolves_otherwise() {
     let h = Harness::start().await;
     let (old, new) = seed_dispute(&h).await;
+    let resolve = || h.post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "agent_id": "agent-other" }));
 
-    let (status, body) = h
-        .post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "agent_id": "agent-other" }))
-        .await;
+    write_policy(&h, HIDE_AUTHOR);
+    let (status, body) = resolve().await;
     assert_eq!(status, 404, "{body}");
     let (_, row) = h.get_json(&format!("/v1/memories/memory/{new}")).await;
     assert_eq!(row["item"]["status"], "disputed", "{row}");
 
-    let (status, body) = h
-        .post_json("/v1/disputes/resolve", json!({ "keep": new, "other": old, "agent_id": "agent-http" }))
-        .await;
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    let (status, body) = resolve().await;
     assert_eq!(status, 200, "{body}");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{old}")).await;
+    assert_eq!(row["item"]["status"], "superseded", "{row}");
 }
 
 #[tokio::test]
@@ -2636,6 +2798,75 @@ async fn registering_a_root_whose_id_is_taken_by_another_is_a_conflict() {
 }
 
 #[tokio::test]
+async fn registering_two_roots_that_collide_gives_each_its_own_id() {
+    let h = Harness::start().await;
+    let root = "/work/repo";
+    let taken = clawg_core::memory::derive_project_id(std::path::Path::new(root));
+    let seeded = taken.clone();
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [seeded])
+        })
+        .await
+        .expect("seed a colliding project");
+
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root, "assigned": true })).await;
+
+    assert_eq!(status, 200, "{body}");
+    let id = body["project_id"].as_str().expect("project_id");
+    assert_ne!(id, taken);
+    assert!(clawg_core::memory::project::is_project_id(id), "{id}");
+    assert_eq!(body["root_id"], id, "a root without a remote keeps its memories under its own id");
+}
+
+#[tokio::test]
+async fn two_clones_of_one_remote_register_into_one_project() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let mut ids = Vec::new();
+    for clone in ["work", "review"] {
+        let git = base.path().join(clone).join("app").join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config"), "[remote \"origin\"]\n\turl = git@github.com:acme/app.git\n").unwrap();
+        let root = base.path().join(clone).join("app");
+        let (status, body) =
+            h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true })).await;
+        assert_eq!(status, 200, "{body}");
+        ids.push((body["project_id"].as_str().unwrap().to_string(), body["root_id"].as_str().unwrap().to_string()));
+    }
+    assert_eq!(ids[0].0, ids[1].0, "one project: {ids:?}");
+    assert_eq!(ids[0].0, ids[0].1, "the first clone gives the project its id");
+    assert_ne!(ids[1].1, ids[1].0, "the second keeps its own root id: {ids:?}");
+}
+
+#[tokio::test]
+async fn registering_without_assigned_ids_keeps_the_old_answer() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let git = base.path().join("app").join(".git");
+    std::fs::create_dir_all(&git).unwrap();
+    std::fs::write(git.join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
+    let root = base.path().join("app");
+
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy() })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["project_id"], clawg_core::memory::derive_project_id(&root));
+    let remotes: i64 = h
+        .ctx
+        .runtime
+        .store
+        .conn
+        .call(|c| c.query_row("SELECT COUNT(*) FROM project_remote", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(remotes, 0, "a caller that derives its id joins no remote");
+}
+
+#[tokio::test]
 async fn registering_needs_the_token() {
     let h = Harness::start().await;
     let status = h
@@ -2861,6 +3092,109 @@ async fn registering_a_missing_root_to_index_it_is_a_bad_request() {
 }
 
 #[tokio::test]
+async fn a_background_refresh_that_failed_warns_the_next_search() {
+    let (embedder, _gate) = docs_embedder(true, true);
+    let h = Harness::start_inner(EmbedderState::Docs(embedder)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Readme\nnever embedded\n").unwrap();
+
+    let (status, body) = h
+        .post_json("/v1/projects", json!({ "root_path": dir.path().display().to_string(), "index_docs": true }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["project_id"].as_str().expect("project_id").to_string();
+    let index = &h.ctx.runtime.project_docs;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while index.is_due(&id, Instant::now()) || index.is_running(&id) {
+        assert!(Instant::now() < deadline, "the background refresh never ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "readme" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert!(body["warning"].as_str().is_some_and(|w| w.contains("passages refused")), "{body}");
+    assert_eq!(body["docs"], 0);
+}
+
+/// A project indexed with `a.md` outside the daemon's own bookkeeping, so the
+/// daemon finds it due for a refresh, whose `a.md` then changed and which got a
+/// `b.md`.
+async fn indexed_project_that_changed(h: &Harness) -> (tempfile::TempDir, String) {
+    let (dir, id) = project_with_docs(h, &[("a.md", "# A\nold passage\n")]).await;
+    let elsewhere = Arc::new(clawg_core::memory::project_docs::DocIndex::default());
+    elsewhere.try_refresh(&h.ctx.runtime.store, &FakeEmbedder::default(), None, &id).await.unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\nnew passage\n").unwrap();
+    std::fs::write(dir.path().join("b.md"), "# B\nanother passage\n").unwrap();
+    (dir, id)
+}
+
+fn texts(body: &Value) -> Vec<&str> {
+    body["hits"].as_array().expect("hits").iter().filter_map(|h| h["text"].as_str()).collect()
+}
+
+#[tokio::test]
+async fn a_search_answers_from_the_index_while_a_long_refresh_runs() {
+    let (embedder, gate) = docs_embedder(false, false);
+    let h = Harness::start_inner(EmbedderState::Docs(embedder)).await;
+    let (_dir, id) = indexed_project_that_changed(&h).await;
+
+    let search = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "passage" }));
+    let (status, body) = tokio::time::timeout(REFRESH_GRACE + Duration::from_secs(5), search)
+        .await
+        .expect("the search waited for the whole refresh");
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["indexing"], true, "{body}");
+    assert_eq!(body["docs"], 1, "{body}");
+    assert_eq!(texts(&body), ["old passage"]);
+
+    gate.send(true).unwrap();
+    assert!(h.ctx.runtime.project_docs.wait_idle(&id, Duration::from_secs(10)).await);
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "passage" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["indexing"], false, "{body}");
+    assert_eq!(body["docs"], 2, "{body}");
+    let mut found = texts(&body);
+    found.sort();
+    assert_eq!(found, ["another passage", "new passage"]);
+}
+
+#[tokio::test]
+async fn a_small_edit_is_found_by_the_search_that_refreshes() {
+    let h = Harness::start().await;
+    let (_dir, id) = indexed_project_that_changed(&h).await;
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "passage" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["indexing"], false, "{body}");
+    assert_eq!(body["docs"], 2, "{body}");
+    assert!(texts(&body).contains(&"new passage"), "{body}");
+    assert!(!texts(&body).contains(&"old passage"), "{body}");
+}
+
+#[tokio::test]
+async fn the_refresh_outlives_the_search_that_started_it() {
+    let (embedder, gate) = docs_embedder(false, false);
+    let h = Harness::start_inner(EmbedderState::Docs(embedder)).await;
+    let (_dir, id) = indexed_project_that_changed(&h).await;
+
+    let gone = h
+        .authed(h.http.post(h.url("/v1/projects/docs/search")))
+        .json(&json!({ "project_id": id, "query": "passage" }))
+        .timeout(Duration::from_millis(200))
+        .send()
+        .await;
+    assert!(gone.is_err(), "the client was meant to give up first: {gone:?}");
+    // Let the server see the closed connection before the refresh can go on.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    gate.send(true).unwrap();
+    wait_for_docs(&h, &id, 2).await;
+}
+
+#[tokio::test]
 async fn a_search_during_the_first_index_waits_for_it() {
     let h = Harness::start().await;
     let (_dir, id) = project_with_docs(&h, &[("a.md", "# A\nfound after the wait\n")]).await;
@@ -2904,17 +3238,19 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn restore_brings_a_deleted_memory_back_for_its_owner() {
+async fn restore_brings_a_deleted_memory_back_for_any_agent_that_reaches_it() {
     let h = Harness::start().await;
     let id = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
     h.delete_row(id).await;
     assert!(!finds(&h, "a", id).await);
 
+    write_policy(&h, r#"{"version":1,"hides":{"b":["a"]}}"#);
     let (status, body) = h.restore("memory", id, Some("b")).await;
-    assert_eq!(status, 404, "another agent's row reads as missing: {body}");
+    assert_eq!(status, 404, "a hidden author's row reads as missing: {body}");
     assert!(!finds(&h, "a", id).await);
 
-    let (status, body) = h.restore("memory", id, Some("a")).await;
+    write_policy(&h, r#"{"version":1,"hides":{}}"#);
+    let (status, body) = h.restore("memory", id, Some("b")).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, json!({ "restored": 1, "id": id, "status": "active", "superseded_by": null }));
     assert!(finds(&h, "a", id).await, "it is found again");
@@ -3266,6 +3602,36 @@ async fn an_import_stores_rows_with_their_state_and_a_dry_run_stores_none() {
 }
 
 #[tokio::test]
+async fn an_import_is_undone_by_its_number() {
+    let h = Harness::start().await;
+    let (status, report) = h.post_json("/v1/import", json!({ "text": export_file(1) })).await;
+    assert_eq!((status, report["import_id"].clone()), (200, json!(1)), "{report}");
+    let count = || async { h.get_json("/v1/memories?kind=memory&agent=a").await.1["items"].as_array().map(Vec::len) };
+
+    let (status, dry) = h.post_json("/v1/import/undo", json!({ "import_id": 1, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!((dry["removed"].as_array().map(Vec::len), dry["snapshot"].clone()), (Some(2), Value::Null), "{dry}");
+    assert_eq!(count().await, Some(2), "a dry run writes nothing");
+
+    let (status, undone) = h.post_json("/v1/import/undo", json!({ "import_id": 1 })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert_eq!(undone["removed"], dry["removed"], "{undone}");
+    assert!(undone["snapshot"].as_str().is_some_and(|s| s.ends_with("-pre-undo.db")), "{undone}");
+    assert_eq!(count().await, Some(0));
+
+    let (status, again) = h.post_json("/v1/import/undo", json!({ "import_id": 1 })).await;
+    assert_eq!((status, again["removed"].clone(), again["snapshot"].clone()), (200, json!([]), Value::Null), "{again}");
+    let (status, body) = h.post_json("/v1/import/undo", json!({ "import_id": 9 })).await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = h.post_json("/v1/import/undo", json!({ "import": 1 })).await;
+    assert!((400..500).contains(&status), "a misspelt field undoes nothing: {status} {body}");
+
+    let h = Harness::start_without_embedder().await;
+    let (status, body) = h.post_json("/v1/import/undo", json!({ "import_id": 1 })).await;
+    assert_eq!(status, 404, "an undo needs no model: {body}");
+}
+
+#[tokio::test]
 async fn import_answers_400_for_an_unknown_version_before_the_embedder() {
     let h = Harness::start_without_embedder().await;
     let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(2) })).await;
@@ -3277,4 +3643,535 @@ async fn import_answers_400_for_an_unknown_version_before_the_embedder() {
     assert_eq!(status, 200, "a dry run needs no model: {body}");
     let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(1), "agent": "  " })).await;
     assert_eq!(status, 400, "{body}");
+}
+
+/// An engram export of format 0.2.0 holding `observations`.
+fn engram_export(observations: Vec<Value>) -> String {
+    json!({ "version": "0.2.0", "exported_at": "2025-03-01 10:00:00", "sessions": [], "observations": observations, "prompts": [] })
+        .to_string()
+}
+
+fn observation(sync_id: &str, project: Option<&str>, title: &str, content: &str) -> Value {
+    json!({
+        "id": 1, "sync_id": sync_id, "session_id": "s1", "type": "discovery", "title": title, "content": content,
+        "project": project, "scope": "project", "revision_count": 1, "duplicate_count": 1,
+        "created_at": "2025-01-01 10:00:00", "updated_at": "2025-01-01 10:00:00",
+    })
+}
+
+/// 700 distinct words, long enough to be split into pieces.
+fn long_note() -> String {
+    (0..700).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ")
+}
+
+impl Harness {
+    /// Gives the daemon a tokenizer, as loading the model does.
+    fn with_tokenizer(self) -> Self {
+        self.ctx.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+        self
+    }
+}
+
+#[tokio::test]
+async fn an_engram_import_stores_notes_and_a_dry_run_reports_the_same() {
+    let h = Harness::start().await.with_tokenizer();
+    let root = tempfile::tempdir().expect("tempdir");
+    let text = engram_export(vec![
+        observation("a", Some("app"), "Notes on clawg-ledger", &long_note()),
+        observation("b", None, "Port", "the daemon listens on 27380"),
+    ]);
+    let body = |dry_run| {
+        json!({ "text": text, "from": "engram", "dry_run": dry_run, "project_map": [["app", root.path().to_string_lossy()]] })
+    };
+
+    let (status, dry) = h.post_json("/v1/import", body(true)).await;
+    assert_eq!(status, 200, "{dry}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "a dry run writes nothing: {listed}");
+    let (status, report) = h.post_json("/v1/import", body(false)).await;
+    assert_eq!(status, 200, "{report}");
+
+    let unmarked = |mut r: Value| {
+        r["dry_run"] = Value::Null;
+        r["snapshot"] = Value::Null;
+        r["import_id"] = Value::Null;
+        r
+    };
+    assert!(report["snapshot"].is_string(), "{report}");
+    assert_eq!((dry["import_id"].clone(), report["import_id"].clone()), (Value::Null, json!(1)), "only what writes has a number");
+    assert_eq!(unmarked(dry), unmarked(report.clone()));
+    assert_eq!((report["foreign"]["source"].clone(), report["foreign"]["notes"].clone()), (json!("engram"), json!(2)));
+    assert_eq!(report["foreign"]["split_notes"], 1, "{report}");
+    let inserted = report["inserted"].as_u64().expect("inserted");
+    assert!(inserted > 2, "{report}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated&limit=100").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(inserted as usize), "{listed}");
+}
+
+#[tokio::test]
+async fn an_engram_export_without_notes_imports_nothing() {
+    let h = Harness::start().await.with_tokenizer();
+    let text = r#"{"version":"0.2.0","sessions":null,"observations":[],"prompts":null}"#;
+    let (status, report) = h.post_json("/v1/import", json!({ "text": text, "from": "engram" })).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!((report["rows"].clone(), report["inserted"].clone(), report["foreign"]["notes"].clone()), (json!(0), json!(0), json!(0)));
+    let (_, listed) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+}
+
+#[tokio::test]
+async fn import_refuses_an_unknown_source_or_a_mixed_map() {
+    let h = Harness::start().await.with_tokenizer();
+    let engram = engram_export(vec![observation("a", None, "Port", "the daemon listens on 27380")]);
+    let map = json!([["app", "/work/app"]]);
+    for (body, names) in [
+        (json!({ "text": engram, "from": "notion" }), "notion"),
+        (json!({ "text": export_file(1), "from": "clawg", "project_map": map }), "project_map"),
+        (json!({ "text": export_file(1), "project_map": map }), "project_map"),
+        (json!({ "text": engram, "from": "engram", "map_roots": [["/a", "/b"]] }), "map_roots"),
+    ] {
+        let (status, answer) = h.post_json("/v1/import", body).await;
+        assert_eq!(status, 400, "{answer}");
+        assert!(answer["error"].as_str().unwrap_or("").contains(names), "{answer}");
+    }
+    let (_, listed) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+}
+
+#[tokio::test]
+async fn an_engram_export_without_from_is_a_400() {
+    let h = Harness::start().await.with_tokenizer();
+    let engram = engram_export(vec![observation("a", None, "Port", "the daemon listens on 27380")]);
+    let (status, answer) = h.post_json("/v1/import", json!({ "text": engram })).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(answer["error"].as_str().unwrap_or("").contains("header"), "{answer}");
+}
+
+#[tokio::test]
+async fn a_foreign_import_without_the_tokenizer_is_a_503() {
+    let h = Harness::start_without_embedder().await;
+    for (text, names) in [("{not json", "not JSON"), (r#"{"version":"0.3.0"}"#, "0.3.0")] {
+        let (status, answer) = h.post_json("/v1/import", json!({ "text": text, "from": "engram" })).await;
+        assert_eq!(status, 400, "a file the adapter cannot read is refused first: {answer}");
+        assert!(answer["error"].as_str().unwrap_or("").contains(names), "{answer}");
+    }
+    let engram = engram_export(vec![observation("a", None, "Port", "the daemon listens on 27380")]);
+    for dry_run in [false, true] {
+        let (status, answer) = h.post_json("/v1/import", json!({ "text": engram, "from": "engram", "dry_run": dry_run })).await;
+        assert_eq!((status, answer["error"].clone()), (503, json!("tokenizer_not_ready")), "dry run {dry_run}: {answer}");
+    }
+
+    let h = h.with_tokenizer();
+    let (status, answer) = h.post_json("/v1/import", json!({ "text": engram, "from": "engram", "dry_run": true })).await;
+    assert_eq!(status, 200, "a dry run needs no model: {answer}");
+    let (status, answer) = h.post_json("/v1/import", json!({ "text": engram, "from": "engram" })).await;
+    assert_eq!((status, answer["error"].clone()), (503, json!("embedder_not_ready")), "{answer}");
+}
+
+#[tokio::test]
+async fn an_imported_long_note_reads_whole_and_changes_for_the_bridge_agent() {
+    let h = Harness::start().await.with_tokenizer();
+    let text = engram_export(vec![observation("a", None, "Notes on clawg-ledger", &long_note())]);
+    let (status, report) = h.post_json("/v1/import", json!({ "text": text, "from": "engram" })).await;
+    assert_eq!(status, 200, "{report}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated&limit=100").await;
+    let ids: Vec<i64> = listed["items"].as_array().expect("items").iter().filter_map(|m| m["id"].as_i64()).collect();
+    assert!(ids.len() > 1, "{listed}");
+    let id = ids[ids.len() / 2];
+
+    let (status, save) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=claude-code")).await;
+    assert_eq!(status, 200, "{save}");
+    assert_eq!(save["text"], format!("Notes on clawg-ledger\n{}", long_note()), "{save}");
+    let patch = h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=claude-code"))).json(&json!({ "importance": 8.0 }));
+    let (status, patched) = h.send(patch).await;
+    assert_eq!(status, 200, "{patched}");
+    let (status, deleted) = h.send(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=claude-code")))).await;
+    assert_eq!(status, 200, "{deleted}");
+}
+
+#[tokio::test]
+async fn an_unkeyed_save_names_the_row_a_key_would_revise() {
+    let vectors = vec![
+        ("builds with cargo", at_cosine(1.0, 1)),
+        ("builds with make", at_cosine(0.96, 2)),
+        ("builds with ninja", at_cosine(0.96, 3)),
+    ];
+    let h = Harness::start_inner(EmbedderState::Fixed(vectors)).await;
+    let save = |content: &str, key: Option<&str>| {
+        let mut body = json!({ "content": content, "agent_id": "a", "project_id": "p", "memory_type": "semantic_fact" });
+        if let Some(key) = key {
+            body["topic_key"] = json!(key);
+        }
+        body
+    };
+    let older = save_id(&h, save("the project builds with cargo", None)).await;
+
+    let (status, unkeyed) = h.post_json("/v1/memories", save("the project builds with make", None)).await;
+    assert_eq!(status, 201, "{unkeyed}");
+    assert_eq!(unkeyed["related"][0]["id"], older, "{unkeyed}");
+    assert_eq!(unkeyed["revision_candidate"], older, "{unkeyed}");
+
+    let (status, keyed) = h.post_json("/v1/memories", save("the project builds with ninja", Some("build/tool"))).await;
+    assert_eq!(status, 201, "{keyed}");
+    assert!(keyed["related"].as_array().is_some_and(|r| !r.is_empty()), "{keyed}");
+    assert!(keyed.get("revision_candidate").is_none(), "a key already revises: {keyed}");
+}
+
+// ── Metrics ─────────────────────────────────────────────────────────────────
+
+/// The `http.duration` series of the run, as label strings with their count.
+fn http_durations(h: &Harness) -> Vec<(String, u64)> {
+    h.ctx
+        .metrics
+        .run()
+        .iter()
+        .filter(|(key, _)| key.name == "http.duration")
+        .map(|(key, histogram)| (key.labels.clone(), histogram.count()))
+        .collect()
+}
+
+fn count_of(series: &[(String, u64)], labels: &str) -> u64 {
+    series.iter().find(|(l, _)| l == labels).map(|(_, n)| *n).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn every_request_is_timed_by_route_status_and_transport() {
+    let h = Harness::start().await;
+    h.http.get(h.url("/health")).send().await.expect("health");
+    let (status, _) = h.post_json("/v1/search", json!({ "query": "anything", "agent_id": "a" })).await;
+    assert_eq!(status, 200);
+    let (status, _) = h.get_json("/v1/memories/memory/999999").await;
+    assert_eq!(status, 404);
+
+    let series = http_durations(&h);
+    assert_eq!(count_of(&series, "method=GET,route=/health,status=2xx,transport=tcp"), 1, "{series:?}");
+    assert_eq!(count_of(&series, "method=POST,route=/v1/search,status=2xx,transport=tcp"), 1, "{series:?}");
+    assert_eq!(count_of(&series, "method=GET,route=/v1/memories/{kind}/{id},status=4xx,transport=tcp"), 1, "{series:?}");
+
+    let run = h.ctx.metrics.run();
+    let bytes = run
+        .iter()
+        .find(|(key, _)| key.name == "http.request_bytes" && key.labels == "method=POST,route=/v1/search")
+        .map(|(_, histogram)| histogram.clone())
+        .expect("the size of the search is recorded");
+    assert!(bytes.max() > 0, "the size comes from Content-Length");
+    let minute = h.ctx.metrics.minute();
+    let in_flight = minute.gauges.iter().find(|(key, _)| key.name == "http.in_flight").expect("in flight").1;
+    assert!(in_flight.max >= 1.0 && in_flight.last == 0.0, "{in_flight:?}");
+}
+
+#[tokio::test]
+async fn a_server_marked_unix_labels_its_requests_so() {
+    let h = Harness::start().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = clawg_cli::daemon::api::router_on(h.ctx.clone(), clawg_cli::daemon::metrics::Transport::Unix);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    h.http.get(format!("http://{addr}/health")).send().await.expect("health");
+
+    let series = http_durations(&h);
+    assert_eq!(count_of(&series, "method=GET,route=/health,status=2xx,transport=unix"), 1, "{series:?}");
+}
+
+#[tokio::test]
+async fn refused_requests_are_timed_too() {
+    let h = Harness::start().await;
+    let r = h.http.post(h.url("/v1/search")).json(&json!({ "query": "q" })).send().await.expect("request");
+    assert_eq!(r.status(), 401);
+    let r = h.http.get(h.url("/health")).header("origin", "http://evil.example").send().await.expect("request");
+    assert_eq!(r.status(), 403);
+
+    let series = http_durations(&h);
+    assert_eq!(count_of(&series, "method=POST,route=/v1/search,status=4xx,transport=tcp"), 1, "{series:?}");
+    assert_eq!(count_of(&series, "method=GET,route=/health,status=4xx,transport=tcp"), 1, "{series:?}");
+}
+
+#[tokio::test]
+async fn no_label_comes_from_the_request() {
+    let h = Harness::start().await;
+    h.authed(h.http.get(h.url("/v1/memories/memory/424242?agent=secretagent")))
+        .body("zebra-colored secret text")
+        .send()
+        .await
+        .expect("request");
+    h.authed(h.http.post(h.url("/nowhere/qwerty"))).body("zebra").send().await.expect("request");
+    h.authed(h.http.request(reqwest::Method::from_bytes(b"BREW").unwrap(), h.url("/health")))
+        .send()
+        .await
+        .expect("request");
+
+    let labels: Vec<String> = h.ctx.metrics.run().keys().map(|key| key.labels.clone()).collect();
+    for label in &labels {
+        for leaked in ["424242", "secretagent", "zebra", "qwerty", "nowhere", "BREW"] {
+            assert!(!label.contains(leaked), "{label} carries {leaked}");
+        }
+    }
+    assert!(labels.iter().any(|l| l.contains("route=/v1/memories/{kind}/{id}")), "{labels:?}");
+    assert!(labels.iter().any(|l| l.contains("method=POST,route=unmatched")), "{labels:?}");
+    assert!(labels.iter().any(|l| l.contains("method=other")), "{labels:?}");
+}
+
+#[tokio::test]
+async fn metrics_needs_the_token_and_answers_the_minute_and_the_run() {
+    let h = Harness::start().await;
+    let r = h.http.get(h.url("/v1/metrics")).send().await.expect("request");
+    assert_eq!(r.status(), 401);
+    h.http.get(h.url("/health")).send().await.expect("health");
+
+    let (status, body) = h.get_json("/v1/metrics").await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["version"], clawg_core::build_info::version());
+    assert!(body["started_at_ms"].as_u64().is_some_and(|ms| ms > 0), "{body}");
+    assert_eq!(body["writing"], false, "a daemon in a test keeps no file");
+    let health = |list: &Value| {
+        list.as_array()
+            .and_then(|l| {
+                l.iter().find(|s| s["name"] == "http.duration" && s["labels"]["route"] == "/health" && s["labels"]["status"] == "2xx")
+            })
+            .cloned()
+    };
+    let minute = health(&body["minute"]["histograms"]).expect("the health check of this minute");
+    assert_eq!(minute["unit"], "us");
+    assert_eq!(minute["count"], 1);
+    assert_eq!(minute["labels"]["transport"], "tcp");
+    assert!(minute["p50"].as_u64().is_some() && minute["p99"].as_u64().is_some(), "{minute}");
+    assert!(minute["buckets"].as_array().is_some_and(|b| !b.is_empty()), "{minute}");
+    let run = health(&body["run"]["histograms"]).expect("the health check of the run");
+    assert_eq!(run["count"], 1);
+    assert!(body["minute"]["gauges"].as_array().is_some_and(|g| g.iter().any(|g| g["name"] == "http.in_flight")), "{body}");
+}
+
+#[tokio::test]
+async fn metrics_speaks_prometheus_text() {
+    let h = Harness::start().await;
+    h.http.get(h.url("/health")).send().await.expect("health");
+
+    let r = h.authed(h.http.get(h.url("/v1/metrics?format=prometheus"))).send().await.expect("request");
+
+    assert_eq!(r.status(), 200);
+    let kind = r.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(kind.starts_with("text/plain") && kind.contains("version=0.0.4"), "{kind}");
+    let text = r.text().await.expect("text");
+    assert!(text.contains("# TYPE clawg_http_duration_seconds histogram"), "{text}");
+    let health = r#"method="GET",route="/health",status="2xx",transport="tcp""#;
+    assert!(text.contains(&format!("clawg_http_duration_seconds_count{{{health}}} 1")), "{text}");
+    assert!(text.contains(&format!("clawg_http_duration_seconds_bucket{{{health},le=\"+Inf\"}} 1")), "{text}");
+    assert!(text.contains(&format!("clawg_http_duration_seconds_bucket{{{health},le=\"0.00005\"}}")), "{text}");
+    assert!(text.contains("# TYPE clawg_http_request_bytes histogram"), "{text}");
+    assert!(text.contains("# TYPE clawg_http_in_flight gauge"), "{text}");
+    let r = h.authed(h.http.get(h.url("/v1/metrics?format=yaml"))).send().await.expect("request");
+    assert_eq!(r.status(), 400);
+}
+
+// ── Moving memories between projects ───────────────────────────────────────
+
+/// Registers `root` with the daemon and answers its project id.
+async fn registered(h: &Harness, root: &str) -> String {
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root })).await;
+    assert_eq!(status, 200, "{body}");
+    body["project_id"].as_str().expect("project_id").to_string()
+}
+
+async fn patch(h: &Harness, id: i64, body: Value) -> (u16, Value) {
+    let r = h
+        .authed(h.http.patch(h.url(&format!("/v1/memories/memory/{id}"))))
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    let status = r.status().as_u16();
+    (status, r.json().await.unwrap_or(Value::Null))
+}
+
+async fn project_of(h: &Harness, id: i64) -> Value {
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{id}")).await;
+    row["item"]["project_id"].clone()
+}
+
+fn saved_ids(body: &Value) -> Vec<i64> {
+    body["memories"].as_array().expect("memories").iter().map(|m| m["id"].as_i64().unwrap()).collect()
+}
+
+#[tokio::test]
+async fn patch_moves_a_whole_save() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let content = (0..600).map(|i| format!("w{i:05}")).collect::<Vec<_>>().join(" ");
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+    let pieces = saved_ids(&body);
+
+    let (status, body) = patch(&h, pieces[3], json!({ "project_id": target })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["project_id"], json!(target), "{body}");
+    assert_eq!(body["move_id"], 1, "{body}");
+    assert_eq!(body["pulled_in"].as_array().map(Vec::len), Some(pieces.len() - 1), "{body}");
+    for id in pieces {
+        assert_eq!(project_of(&h, id).await, json!(target));
+    }
+}
+
+#[tokio::test]
+async fn patch_with_a_clash_is_409_and_changes_nothing() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+    let loose = saved_ids(&body)[0];
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": target })).await;
+    let twin = saved_ids(&body)[0];
+
+    let (status, body) = patch(&h, loose, json!({ "project_id": target, "importance": 9.0 })).await;
+
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap_or_default().contains(&format!("#{twin}")), "{body}");
+    assert_eq!(project_of(&h, loose).await, Value::Null);
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{loose}")).await;
+    assert_ne!(row["item"]["importance"], 9.0, "{row}");
+}
+
+#[tokio::test]
+async fn patch_with_both_destinations_is_400() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+    let id = saved_ids(&body)[0];
+
+    let (status, body) = patch(&h, id, json!({ "project_id": target, "no_project": true })).await;
+
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn a_move_to_an_unregistered_project_is_404() {
+    let h = Harness::start().await;
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a" })).await;
+    let id = saved_ids(&body)[0];
+
+    let (status, body) = patch(&h, id, json!({ "project_id": "typo-0000" })).await;
+
+    assert_eq!(status, 404, "{body}");
+    assert!(body["error"].as_str().unwrap_or_default().contains("typo-0000"), "{body}");
+}
+
+#[tokio::test]
+async fn patch_moves_while_the_embedder_loads() {
+    let h = Harness::start_serving_without_embedder().await;
+    let target = registered(&h, "/work/target").await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": target })).await;
+    let id = h.wait_for_rows("memory", 1).await[0]["id"].as_i64().unwrap();
+
+    let (status, body) = patch(&h, id, json!({ "no_project": true })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(project_of(&h, id).await, Value::Null);
+}
+
+#[tokio::test]
+async fn the_listing_reaches_the_rows_without_a_project() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": target })).await;
+    let (_, body) = h.post_json("/v1/memories", json!({ "content": "a note filed nowhere", "agent_id": "a" })).await;
+    let loose = saved_ids(&body)[0];
+
+    let (status, body) = h.get_json("/v1/memories?no_project=true").await;
+    assert_eq!(status, 200, "{body}");
+    let ids: Vec<i64> = body["items"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![loose]);
+
+    let (status, body) = h.get_json(&format!("/v1/memories?no_project=true&project={target}")).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn the_batch_moves_reports_and_snapshots() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let mut loose = Vec::new();
+    for content in ["the first unfiled note", "the second unfiled note"] {
+        let (_, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+        loose.extend(saved_ids(&body));
+    }
+    let request = json!({ "from_none": true, "to_project": target });
+
+    let (status, dry) = h.post_json("/v1/memories/move", json!({ "from_none": true, "to_project": target, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!(dry["moved"].as_array().map(Vec::len), Some(2), "{dry}");
+    assert_eq!(project_of(&h, loose[0]).await, Value::Null, "a dry run moves nothing");
+
+    let (status, done) = h.post_json("/v1/memories/move", request).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["move_id"], 1, "{done}");
+    let snapshot = done["snapshot"].as_str().expect("snapshot");
+    assert!(snapshot.ends_with("-pre-move.db") && std::path::Path::new(snapshot).exists(), "{snapshot}");
+    for &id in &loose {
+        assert_eq!(project_of(&h, id).await, json!(target));
+    }
+
+    let (status, undone) = h.post_json("/v1/memories/move", json!({ "undo": 1 })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert_eq!(undone["move_id"], 2, "{undone}");
+    assert_eq!(project_of(&h, loose[1]).await, Value::Null);
+}
+
+#[tokio::test]
+async fn move_and_list_select_by_origin_project() {
+    let h = Harness::start().await;
+    let target = registered(&h, "/work/target").await;
+    let from = |origin: &'static str, content: &'static str| {
+        let h = &h;
+        async move {
+            let (_, body) = h.post_json("/v1/memories", json!({ "content": content, "agent_id": "a" })).await;
+            let id = saved_ids(&body)[0];
+            h.ctx
+                .runtime
+                .store
+                .conn
+                .call(move |c| c.execute("UPDATE memory SET origin_project = ?1 WHERE id = ?2", rusqlite::params![origin, id]))
+                .await
+                .expect("seed");
+            id
+        }
+    };
+    let (a1, a2) = (from("a", "the first note of a").await, from("a", "the second note of a").await);
+    let b = from("b", "the only note of b").await;
+    let ids_of = |body: &Value| -> Vec<i64> {
+        let mut ids: Vec<i64> = body["items"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    let (status, body) = h.get_json("/v1/memories?origin_project=a").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ids_of(&body), vec![a1, a2]);
+    let (_, body) = h.get_json("/v1/memories?origin_project=b&agent=a").await;
+    assert_eq!(ids_of(&body), vec![b]);
+
+    let (status, dry) = h.post_json("/v1/memories/move", json!({ "origin_project": "a", "to_project": target, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!(dry["moved"].as_array().map(Vec::len), Some(2), "{dry}");
+
+    let (status, done) = h.post_json("/v1/memories/move", json!({ "origin_project": "a", "to_project": target })).await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(project_of(&h, a1).await, json!(target));
+    assert_eq!(project_of(&h, a2).await, json!(target));
+    assert_eq!(project_of(&h, b).await, Value::Null);
+
+    let (status, answer) = h.post_json("/v1/memories/move", json!({ "origin_project": "a", "undo": 1 })).await;
+    assert_eq!(status, 400, "an undo takes no selection: {answer}");
+}
+
+#[tokio::test]
+async fn a_batch_without_a_selection_or_a_target_is_400() {
+    let h = Harness::start().await;
+
+    for body in [json!({ "to_none": true }), json!({ "ids": [1] }), json!({ "ids": [1], "to_none": true, "undo": 1 }), json!({ "ids": [1], "to_none": true, "projects": "x" })] {
+        let (status, answer) = h.post_json("/v1/memories/move", body.clone()).await;
+        assert!(status == 400 || status == 422, "{body} -> {status} {answer}");
+    }
+    let (status, answer) = h.post_json("/v1/memories/move", json!({ "undo": 9 })).await;
+    assert_eq!(status, 404, "{answer}");
 }

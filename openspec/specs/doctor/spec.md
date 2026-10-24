@@ -4,6 +4,9 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 
 **Origen:**
 - [doctor-checks](../../changes/archive/2026-10-20-doctor-checks/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. El análisis del PATH (`analyze`) es anterior y queda como estaba.
+- [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: `memory.topic` y `memory.content_hash` agrupan por proyecto y nombran a los autores; el texto de `fallback_agent`.
+- [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23: los chequeos `preferences` y `protocol_block` (LP14).
+- [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23: `message` en el idioma del comando (R1) y el resto del hallazgo igual en los dos idiomas (CL4).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 
@@ -18,7 +21,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 | `check_id` | Estable, en inglés (`path`, `store.schema`, `memory.topic`, …) |
 | `severity` | `ok`, `info`, `warn` o `error` |
 | `reason_code` | Estable por causa (`shadowed`, `stale`, `dangling`, …); `healthy` para `ok` |
-| `message` | Una frase en inglés para una persona |
+| `message` | Una frase para una persona, en el idioma del comando ([`specs/preferences`](../preferences/spec.md), CL1): en inglés sin preferencia |
 | `evidence` | Un objeto con hechos medidos: rutas, conteos, ids, fechas, nombres de agente o de proyecto |
 | `safe_next_step` | Un comando que se puede copiar, o `null` |
 | `requires_confirmation` | `true` cuando ese paso cambia datos |
@@ -111,20 +114,39 @@ La edad de un snapshot MUST salir de su nombre (`parse_snapshot_time`, pura), no
 
 **Tests:** `data_dir_findings`, `socket_findings`, `backup_findings`, `spill_findings`, `sharing_findings` (`doctor`); `snapshot_times_come_from_their_names` (`backup.rs`).
 
+## LP14. La preferencia y el bloque del protocolo
+
+Cuando `preferences.json` existe, `doctor` MUST sumar el chequeo `preferences` (`checks::preferences`, `crates/clawg-cli/src/doctor/checks.rs:322`): `ok` legible, o `warn` `invalid` con la causa en `message`, sin `safe_next_step` y con el path en `evidence`. Con preferencia, MUST sumar el chequeo `protocol_block` (`checks.rs:350`) sobre el `CLAUDE.md` del usuario que lee `setup`: `ok` cuando el bloque es el que `setup` escribiría, `warn` `stale` cuando es otro e `info` `not_installed` sin bloque, las dos con `safe_next_step` `clawg setup claude-code --profile P`, y `warn` `unreadable` cuando el archivo no se puede leer o tiene un marcador suelto. Sin el archivo MUST NOT sumar ninguno de los dos.
+
+**Test:** `preferences_findings` y `protocol_block_findings` (`doctor/checks.rs`); `doctor_names_a_broken_preferences_file` (`tests/binary.rs`).
+
+## CL4. Sólo `message` cambia de idioma
+
+Cada chequeo de `checks.rs` y `mcp.rs` MUST recibir el idioma del comando, que `doctor::run` lee de `preferences.json`, y componer su `message` con un `match` sobre `Lang`. Los hallazgos de unos mismos hechos MUST tener, en `en` y en `es`, el mismo `check_id`, `severity`, `reason_code`, `evidence`, `safe_next_step` y `requires_confirmation`; sólo `message` cambia. Una causa que va en `evidence` (la de `config_unreadable`, por ejemplo) MUST quedar en inglés. Las claves y los demás valores del JSON de `doctor`, y su código de salida, MUST NOT cambiar.
+
+#### Escenario: mismos hechos, dos idiomas
+- GIVEN los hechos que hacen saltar cada `reason_code` de `checks.rs` y `mcp.rs`
+- WHEN se corren los chequeos con `en` y con `es`
+- THEN las dos listas de hallazgos son iguales salvo en `message`, y cada `message` de `es` es distinto del de `en`
+
+**Test:** `the_findings_are_the_same_in_both_languages_but_their_message` y `a_finding_in_spanish_agrees_with_its_number` (`doctor/checks.rs`), `the_mcp_findings_are_the_same_in_both_languages_but_their_message` (`doctor/mcp.rs`); `doctor_speaks_the_preferred_language` (`tests/binary.rs`).
+
 ## R6. Invariantes del estado de `memory`
 
 Una fila está viva cuando `deleted_at IS NULL AND status <> 'superseded'`. Un save es el conjunto de filas de un mismo `save_id` de `memory_piece`, o la fila sola cuando no tiene vínculo. Cada invariante MUST ser una consulta de sólo lectura, y cada violación MUST nombrar ids:
 
 | # | `check_id` | Violación | Severidad | `reason_code` |
 |---|---|---|---|---|
-| 1 | `memory.topic` | más de un save vivo por (agente, proyecto, `topic_key`) | `warn` | `several_live_saves`, con el agente, el proyecto y la primera fila de cada save |
+| 1 | `memory.topic` | más de un save vivo por (proyecto, `topic_key`), de cualquier autor | `warn` | `several_live_saves`, con los autores (`agents`, `null` por una fila sin autor), el proyecto y la primera fila de cada save |
 | 2 | `memory.superseded_by` | una fila no borrada `superseded` cuyo `superseded_by` es nulo o no existe | `warn` (`dangling`) si su causa es `revision` o nula; `info` (`dangling_verdict`) si es `verdict`, que `purge` deja a propósito | |
 | 3 | `memory.revived_from` | `revived_from` que no existe | `info` | `dangling` (sólo impide volver a ocultarla al restaurar una fila purgada) |
-| 4 | `memory.content_hash` | dos filas vivas con el mismo `content_hash` en el mismo (agente, proyecto) | `warn` | `live_duplicates` |
+| 4 | `memory.content_hash` | dos filas vivas con el mismo `content_hash` en el mismo proyecto, de cualquier autor | `warn` | `live_duplicates`, con los autores (`agents`), el proyecto y los ids |
 | 5 | `memory.pieces` | un save cuyo primer pedazo ya no existe y algún otro vínculo guarda `context` | `warn` | `purged_header`, con el `save_id`: el texto purgado sigue en `memory.db` |
 | 6 | `memory.disputed` | una fila viva `disputed` sin ninguna fila viva en `disputed_against` | `info` | `no_live_rival` (la limpieza diaria la devuelve a `active`) |
 
 Un vínculo de `memory_piece` hacia una fila que no existe sin `context` no es una violación: `purge` lo deja a propósito para decir qué pedazo falta.
+
+Las reglas 1 y 4 agrupan por proyecto, como la clave de tema y el dedup ([`specs/ingest`](../ingest/spec.md)). Una base de una versión anterior, cuando esas reglas eran por agente y proyecto, puede tener dos agentes con un titular o un mismo texto vivo cada uno en un proyecto: el doctor los marca, sin `safe_next_step`, y el próximo save con esa clave reemplaza a los dos. Dos agentes que `sharing.json` oculta entre sí también pueden dejar un titular cada uno a propósito, y el doctor, que no lee la política, los marca igual.
 
 #### Escenario: pedazos de un save
 - GIVEN un save largo de tres pedazos vivos bajo un mismo `topic_key`
@@ -145,12 +167,12 @@ Un vínculo de `memory_piece` hacia una fila que no existe sin `context` no es u
 | `outbox` | filas `pending` sin daemon | `info` `pending`, con la cantidad | `clawg serve --profile P` |
 | `outbox` | una fila `failed` | `warn` `failed`, una por fila, con el `operation_id`, el agente y los intentos | `clawg outbox retry <OPERATION_ID> --agent <AGENT> --profile P` |
 | `agents` | siempre que haya filas | `ok`, con cada agente y sus filas vivas y totales | — |
-| `agents` | filas vivas del agente de respaldo `mcp` | `warn` `fallback_agent`, con la cantidad: un cliente no dio `--agent` ni `clientInfo.name` | — |
-| `projects` | una fila de `project` cuyo id no es `derive_project_id(root_path)` | `warn` `id_mismatch`, con el id y la ruta | — |
+| `agents` | filas vivas del agente de respaldo `mcp` | `warn` `fallback_agent`, con la cantidad: un cliente no dio `--agent` ni `clientInfo.name`; todo agente las lee y las cambia, pero el workspace y RECENT del agente real del cliente no las incluyen | — |
+| `projects` | una fila de `project` cuyo id no es ninguno de los que su raíz puede recibir (`candidate_id(root_path, 0..64)`, `is_candidate_for`) | `warn` `id_mismatch`, con el id y la ruta | — |
 
 Con filas `pending` y un daemon vivo no hay hallazgo: las está ingiriendo.
 
-**Tests:** `the_facts_name_agents_projects_the_outbox_and_the_contract` (`inspect.rs`); `outbox_findings`, `agent_findings`, `project_findings`, `shell_words_are_quoted_only_when_a_shell_would_read_them` (`doctor`).
+**Tests:** `the_facts_name_agents_projects_the_outbox_and_the_contract` (`inspect.rs`); `outbox_findings`, `agent_findings`, `project_findings`, `a_project_id_assigned_to_its_root_is_ok`, `shell_words_are_quoted_only_when_a_shell_would_read_them` (`doctor`).
 
 ## R8. El registro MCP de Claude Code
 

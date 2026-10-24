@@ -1,0 +1,57 @@
+name: Cache
+
+# Writes, from main, the build cache that ci.yml's pull requests read, so no
+# pull request's build script reaches it. ci.yml builds nothing on main, so this
+# builds what its `test` job tests, without running the tests. It is not named
+# CI, so release.yml does not wait for it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/cache.yml'
+  # GitHub evicts a cache nobody restored for seven days.
+  schedule:
+    - cron: '23 5 * * 1,4'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # rust-cache keys a cache by job id, runner, CARGO_/RUST environment and lock,
+  # never by workflow: this job keeps the id and environment of ci.yml's job, so
+  # the cache it writes is the one that job restores.
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: 1.99.1
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings
+      - run: cargo test --locked --workspace --no-run
+      - run: cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings
+      - run: cargo test --locked -p clawg-core --lib build_info --no-run
+        if: runner.os == 'Linux'

@@ -1,0 +1,15 @@
+change: import-timing
+objective: "1"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # las alternativas están en la exploración (A, B, C, D) y lo elegido en la propuesta
+  tasks: done
+  apply: done
+  verify: done  # Linux, el CI de Linux y Windows y la importación real en el perfil dev
+  archive: done
+updated: 2026-10-24
+main_spec: openspec/specs/portability/spec.md

@@ -328,6 +328,27 @@ clawg import memorias.jsonl --agent claude-code --profile dev         # todas ba
 
 Importar dos veces el mismo archivo no agrega nada. Una memoria cuyo texto ya está vivo acá no se duplica, y una cuya `topic_key` ya tiene una versión viva acá queda reemplazada por esa. El reporte dice cuántas trajo por tipo, estado y proyecto, y cuáles no pudo traer y por qué.
 
+Cada importación que escribe algo tiene un número, que el reporte nombra. `clawg import --undo N` la deshace días después sin perder lo guardado desde entonces: borra para siempre las memorias que trajo y siguen como las dejó, y devuelve lo que cambió en las que ya estaban. Las que alguien editó, borró, restauró o juzgó, y las que otra memoria necesita (una conclusión que se apoya en ellas, por ejemplo), se quedan, y el reporte dice por qué. Antes de escribir guarda un snapshot `pre-undo`:
+
+```powershell
+clawg import --undo 3 --dry-run --profile dev    # qué sacaría, sin escribir nada
+clawg import --undo 3 --profile dev
+```
+
+### Traer memorias de otra herramienta
+
+`clawg import --from` lee el export de otra herramienta de memoria y guarda cada nota como la guardaría un save de su texto: enmascarada entera, partida en las mismas piezas, con su tipo, sus fechas, sus accesos, su clave y las relaciones entre notas. Hoy lee el export de engram. Exportá todo (sin `--all`, las versiones nuevas exportan sólo el proyecto del directorio en que se corren) y a un archivo fuera del repo, porque lleva el texto de cada nota tal como está:
+
+```powershell
+engram export --all $HOME\engram.json
+clawg import --from engram $HOME\engram.json --dry-run --profile dev    # qué traería, por proyecto de la otra herramienta
+clawg import --from engram $HOME\engram.json --project-map claw-garden=C:\code\claw-garden --profile dev
+```
+
+`--project-map NOMBRE=RUTA` guarda las notas del proyecto `NOMBRE` de la otra herramienta en el proyecto de `RUTA`, que tiene que ser un directorio. Las de un proyecto que no nombrás, las que no tienen proyecto y las `personal` quedan sin proyecto: `clawg memories list --origin-project NOMBRE` las lista y `clawg projects move --origin-project NOMBRE --to RUTA` las acomoda después. Las notas quedan bajo el agente `migrated`, que sólo dice quién las escribió: cualquier agente las lee y las cambia como a las suyas.
+
+Importar otra vez el mismo export, o uno más nuevo, no duplica nada: cada nota se reconoce por su id en la otra herramienta, esté donde esté. Una que la otra herramienta reescribió entra como la versión nueva de la que ya está, en su proyecto y con su clave; una que borraste acá no vuelve. El reporte dice qué fue de cada nota y cuenta, por campo, lo que la otra herramienta guarda y clawg no tiene dónde poner.
+
 ## Conectarlo a Claude Code
 
 Con Claude Code instalado (`claude` en el PATH), un solo comando conecta clawg:
@@ -384,6 +405,14 @@ Desde la próxima búsqueda, `cursor` deja de encontrar lo que guardó `claude-c
 - Si `sharing.json` queda inválido, ningún agente lee a otro hasta que lo arregles, y `memory_status` dice por qué.
 
 Las herramientas que recibe el agente están en [Herramientas MCP](#herramientas-mcp).
+
+### Un proyecto en varias copias
+
+La memoria de un proyecto es la de la raíz del repositorio (o de la carpeta, si no es un repo): un subdirectorio, una rama en otro worktree o un monorepo entero comparten una sola. Dos copias del mismo repositorio en carpetas distintas (una de trabajo y otra de revisión, o un clone nuevo) también la comparten, si su remoto `origin` es el mismo: `https://github.com/acme/app.git` y `git@github.com:acme/app.git` cuentan como el mismo. clawg lo lee de `.git/config`, sin red, y no guarda la URL, que puede llevar una contraseña. Un fork tiene otro `origin` y es otro proyecto; una carpeta sin git o sin `origin` se identifica por su ruta, como siempre. El índice de documentación (`search_project`) sigue siendo de cada copia, así cada una ve los archivos de su rama.
+
+La primera vez que se abre la segunda copia, lo que había guardado en ella pasa al proyecto compartido. Si las dos tenían una versión del mismo tema (`topic_key`), queda vigente la más nueva; si tenían el mismo texto, queda uno. Antes guarda un snapshot `pre-rekey` en `backups`, y el log del daemon dice cuántas filas unió. Para deshacerlo, `clawg projects move --undo N` con el número del movimiento.
+
+Para unir a mano dos proyectos que clawg no relaciona (un repo que cambió de remoto, un fork), está `clawg projects move --from-project <id> --to <ruta>`.
 
 ## Otros clientes MCP
 
@@ -476,7 +505,10 @@ clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted
 clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)
 clawg export --out m.jsonl --profile dev  # las memorias, una fila por línea (--project, --agent, --include-deleted, --format markdown)
 clawg import m.jsonl --profile dev        # las trae a este perfil, con el daemon corriendo (--dry-run, --agent, --map-root OLD=NEW)
+clawg import --from engram e.json --profile dev   # las notas de otra herramienta (--project-map NOMBRE=RUTA)
+clawg import --undo 3 --profile dev       # deshace la importación 3 y conserva lo que cambió desde entonces (--dry-run)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
+clawg metrics report --metric http.duration --label route=/v1/search --by version   # latencias y memoria del daemon (--by day|hour, --since 7d)
 ```
 
 `clawg mcp --no-autostart` falla en vez de arrancar un daemon, y `clawg mcp --agent <nombre>` fija el agente con el que guarda y busca. `clawg serve --port <n>` escucha también en ese puerto TCP (`0` elige uno libre). `clawg path add|remove [--dir <dir>]` edita el PATH del usuario en Windows.
@@ -514,6 +546,8 @@ Registra `clawg-dev` con la ruta de ese binario y sus hooks con `--profile dev`;
 El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha en un socket dentro del directorio de datos (`clawg.sock`). En Linux y macOS descarta toda conexión de otro usuario; en Windows es un socket AF_UNIX nativo y lo protegen los permisos del directorio de datos, que el archivo hereda: una cuenta sin acceso de escritura a él no puede conectarse. Los clientes van por él siempre que el daemon lo publique y nunca vuelven a TCP. Además escucha en `127.0.0.1`, en el puerto que pida `--port` o, sin él, en el del perfil, para los clientes de versiones anteriores al socket; si ese puerto está ocupado (por ejemplo por el daemon de otro usuario) sigue sólo por el socket. Si la ruta del socket no cabe en `sun_path` (108 bytes en Linux y Windows, 104 en macOS), el daemon no arranca y nombra la ruta, salvo que se le dé `--port`, y entonces sigue sólo por TCP; si el sistema no tiene AF_UNIX (un Windows antiguo), sigue sólo por TCP. Para mirarlo a mano: `curl --unix-socket ~/.clawg/clawg.sock http://localhost/health`. Los endpoints `/v1` exigen un token bearer guardado en el directorio de datos (en Unix, con permisos 0600 desde que se crea). En Unix el directorio de datos es privado de su dueño: clawg lo crea 0700, igual que los directorios que crea adentro, y a uno que ya existía con permisos para el grupo u otros se los quita y lo deja escrito en el registro con el modo anterior y el nuevo (si se compartía por grupo a propósito, `chmod` lo devuelve). Así otro usuario de la máquina no lee la memoria, las copias ni los registros. Toda ruta, `/health` incluida, responde 403 a una petición dirigida a un nombre que no sea `127.0.0.1`, `localhost` o `[::1]`, o que traiga una cabecera `Origin`: así una página web abierta en el navegador no llega al daemon, ni con DNS rebinding. No es una barrera contra un proceso del mismo usuario, que puede leer el token.
 
 Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, si hay socket, versión), `token`, `clawg.sock`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén. Si se excluyó algo con `clawg sharing`, también `sharing.json`.
+
+El daemon también guarda sus propias métricas en `metrics.db`, aparte de la memoria: cuánto tarda cada petición (por ruta, clase de estado y transporte, nunca la URL ni el texto), la memoria, la CPU y los descriptores del proceso, un minuto por fila durante 14 días y una hora por fila durante 400. Nada sale de la máquina. `clawg metrics report` lo resume por versión, por día o por hora del día, con el daemon corriendo o parado; `GET /v1/metrics` da el minuto en curso (o, con `?format=prometheus`, texto para Prometheus). `CLAWG_METRICS=off` evita que se escriba el archivo; borrarlo sólo pierde esa historia.
 
 ### Workspace
 

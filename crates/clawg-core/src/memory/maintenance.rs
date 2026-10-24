@@ -131,6 +131,11 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
         log::info!("maintenance: dropped {dropped} conflict pairs that name a row no longer stored");
     }
 
+    let classified = classify_languages(store).await;
+    if classified > 0 {
+        log::info!("maintenance: recorded the language of {classified} rows saved before it was recorded");
+    }
+
     // Placed after the demotion pass so the counts describe the post-pass
     // state. A query failure here logs and returns like the demotion above —
     // losing one day's corpus-size log line is not worth stopping the loop.
@@ -147,6 +152,64 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
             );
         }
         Err(e) => log::warn!("maintenance: row count query failed: {e}"),
+    }
+}
+
+/// Rows [`classify_languages`] reads and writes per transaction, so a save
+/// waiting for the single connection waits for one short batch at most.
+const LANG_BATCH: i64 = 500;
+
+/// Records the language of every `memory` row that has none, deleted and
+/// superseded rows included since they can come back, and returns how many.
+/// Only `lang` changes: no trigger reads it, so the text index, the content,
+/// its hash and the modification stamps stay as they were. The text is read
+/// in batches and classified off the connection's thread. A failure is
+/// logged and ends the pass; the next one picks up what is left.
+async fn classify_languages(store: &MemoryStore) -> usize {
+    let mut classified = 0usize;
+    loop {
+        let batch = store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare_cached("SELECT id, content FROM memory WHERE lang IS NULL ORDER BY id LIMIT ?1")?;
+                let rows = stmt.query_map([LANG_BATCH], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await;
+        let batch = match batch {
+            Ok(batch) if batch.is_empty() => return classified,
+            Ok(batch) => batch,
+            Err(e) => {
+                log::warn!("maintenance: reading rows without a language failed: {e}");
+                return classified;
+            }
+        };
+        let langs: Vec<(i64, &'static str)> = batch
+            .iter()
+            .map(|(id, content)| (*id, crate::memory::language::column_value(crate::memory::language::detect(content))))
+            .collect();
+        let written = store
+            .conn
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let mut written = 0usize;
+                {
+                    let mut stmt = tx.prepare_cached("UPDATE memory SET lang = ?2 WHERE id = ?1 AND lang IS NULL")?;
+                    for (id, lang) in &langs {
+                        written += stmt.execute(rusqlite::params![id, lang])?;
+                    }
+                }
+                tx.commit()?;
+                Ok::<_, rusqlite::Error>(written)
+            })
+            .await;
+        match written {
+            Ok(n) => classified += n,
+            Err(e) => {
+                log::warn!("maintenance: recording the language of {} rows failed: {e}", batch.len());
+                return classified;
+            }
+        }
     }
 }
 
@@ -1928,5 +1991,101 @@ mod tests {
             "re-running ReInfer over unchanged text must produce byte-identical vectors — \
              same bytes, but NOT free: it pays for inference again"
         );
+    }
+
+    // ── classifying the language of older rows ────────────────────────────
+
+    /// `n` rows without a language, as a store from before the column has
+    /// them: every third one Spanish, every third English, the rest code; the
+    /// last one deleted.
+    async fn seed_unclassified(store: &MemoryStore, n: i64) {
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < ?1) \
+                     INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+                      created_by_ref, last_modified_at, last_accessed_at, importance, tier, status, content_hash, \
+                      update_count, deleted_at) \
+                     SELECT 'agent', 'a', CASE i % 3 \
+                       WHEN 0 THEN 'La fila ' || i || ' se guardó en español para que la búsqueda la encuentre.' \
+                       WHEN 1 THEN 'Row ' || i || ' was saved in English so that the search finds it.' \
+                       ELSE '`fn row_' || i || '()`' END, \
+                      'semantic_fact', 'explicit', i, 'agent', 'a', 7, 7, 5.0, 3, 'active', 'h' || i, 2, \
+                      CASE WHEN i = ?1 THEN 9 END \
+                     FROM k",
+                    [n],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    type Untouched = (Vec<(i64, String, String, i64, i64)>, i64);
+
+    /// What classifying must leave as it was: each row's text, hash,
+    /// modification and update count, and the text index.
+    async fn untouched(store: &MemoryStore) -> Untouched {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt =
+                    c.prepare("SELECT id, content, content_hash, last_modified_at, update_count FROM memory ORDER BY id")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let indexed = c.query_row("SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'search'", [], |r| r.get(0))?;
+                Ok::<_, rusqlite::Error>((rows, indexed))
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn langs(store: &MemoryStore) -> Vec<(i64, Option<String>)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT id, lang FROM memory ORDER BY id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+                Ok::<_, rusqlite::Error>(rows)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_maintenance_pass_classifies_rows_without_a_language() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_unclassified(&store, 1203).await;
+
+        super::run_maintenance_once_at(&store, TimestampMs::now()).await;
+
+        let langs = langs(&store).await;
+        assert_eq!(langs.len(), 1203);
+        assert!(langs.iter().all(|(_, l)| l.is_some()), "every row is classified, past one batch");
+        let expected = |id: i64| match id % 3 {
+            0 => "es",
+            1 => "en",
+            _ => "und",
+        };
+        for (id, lang) in &langs {
+            assert_eq!(lang.as_deref(), Some(expected(*id)), "row {id}");
+        }
+        assert_eq!(langs.last().unwrap().1.as_deref(), Some("es"), "a deleted row is classified too");
+    }
+
+    #[tokio::test]
+    async fn classifying_leaves_content_and_modification_alone() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_unclassified(&store, 6).await;
+        store.conn.call(|c| c.execute("UPDATE memory SET lang = 'en' WHERE id = 3", [])).await.unwrap();
+        let before = untouched(&store).await;
+        assert!(before.1 > 0, "the English rows are indexed");
+
+        super::run_maintenance_once_at(&store, TimestampMs::now()).await;
+
+        assert_eq!(untouched(&store).await, before);
+        let langs = langs(&store).await;
+        assert_eq!(langs[2], (3, Some("en".to_string())), "a classified row is never classified again");
     }
 }

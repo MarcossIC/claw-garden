@@ -96,6 +96,9 @@ pub enum ParseOutcome {
     Help,
     Run(Cli),
     Diff { a: PathBuf, b: PathBuf, fail_on_regression: bool },
+    /// `--lang-detect`: label the golden rows' language, with neither a
+    /// model nor a store, so no mode is needed.
+    LangDetect { golden: PathBuf },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -204,6 +207,11 @@ OPTIONS:
                          floor for the full ranking; writes {date}-{mode}-lexical-only.json,
                          which --diff compares with any other run. Mutually exclusive with
                          --agent-view, --follow-up, --docs and every sweep flag.
+    --lang-detect       Print as JSON how clawg's language detector labels the corpus rows
+                         that carry a lang (en or es): by label, in total and for the rows
+                         of eight words or more, with the share right, crossed and
+                         undecided. Counts only, no row text. Needs neither --fake/--real
+                         nor a store; reads --golden (default: docs/eval/golden.json).
     --help, -h          Print this message and exit
 
 EXIT CODES:
@@ -273,10 +281,12 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut docs_root: Option<PathBuf> = None;
     let mut fail_on_regression = false;
     let mut lexical_only = false;
+    let mut lang_detect = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
+            "--lang-detect" => lang_detect = true,
             "--follow-up" => follow_up = true,
             "--agent-view" => agent_view = true,
             "--docs" => docs = true,
@@ -368,6 +378,9 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         }
     }
 
+    if lang_detect {
+        return Ok(ParseOutcome::LangDetect { golden: golden_path.unwrap_or_else(default_golden_path) });
+    }
     let mode = mode.ok_or(CliError::MissingMode)?;
 
     // `--follow-up` varies query TEXT; the sweep axes vary scoring CONFIG.
@@ -454,11 +467,21 @@ mod tests {
             .into_iter()
     }
 
+    #[test]
+    fn lang_detect_needs_no_mode() {
+        assert_eq!(
+            parse(argv(&["--lang-detect", "--golden", "x.json"])),
+            Ok(ParseOutcome::LangDetect { golden: PathBuf::from("x.json") })
+        );
+        assert_eq!(parse(argv(&["--lang-detect"])), Ok(ParseOutcome::LangDetect { golden: default_golden_path() }));
+    }
+
     fn run_cli(items: &[&str]) -> Cli {
         match parse(argv(items)).expect("parse must succeed") {
             ParseOutcome::Run(cli) => cli,
             ParseOutcome::Help => panic!("expected Run, got Help"),
             ParseOutcome::Diff { a, b, .. } => panic!("expected Run, got Diff({a:?}, {b:?})"),
+            ParseOutcome::LangDetect { golden } => panic!("expected Run, got LangDetect({golden:?})"),
         }
     }
 

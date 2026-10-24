@@ -21,7 +21,7 @@
 //! and all the behaviour lives in an `*_impl` taking that id explicitly, where
 //! a test can drive it against an in-process daemon.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ use clawg_core::memory::project_docs::corpus::{auto_indexable, has_project_marke
 use clawg_core::memory::identity::strip_verbatim;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -46,22 +47,20 @@ use serde::Deserialize;
 use crate::client::{
     ClientError, DaemonClient, ListArgs, RelatedMemory, SaveArgs, SaveOutcome, SearchArgs, SynthesisArgs,
 };
+use crate::mcp::protocol::{self, opening};
 use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
-    format_docs, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
+    format_docs, format_language, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
     format_delete, format_open_pairs, format_restore, format_status, format_synthesis, format_update, indexes_docs, resolve_project,
+    topic_key_warning,
 };
 
 /// The daemon refused a root because its id already belongs to another one.
-fn is_root_collision(err: &ClientError) -> bool {
-    matches!(err, ClientError::Daemon { status: 409, message, .. } if message == "project_root_collision")
-}
-
 /// Agent id used when neither `--agent` nor the MCP client named one.
 ///
-/// Memories are scoped per agent, so this is not cosmetic: everything saved
-/// under it is retrievable under it, and a client that changes its reported
-/// name effectively gets a new memory.
+/// Not cosmetic: every agent reads and changes what it saves under it, but
+/// the workspace, RECENT and the hook's reminder are per agent, so a client
+/// that changes its reported name leaves those behind.
 pub const FALLBACK_AGENT_ID: &str = "mcp";
 
 /// Where the agent id of a call came from.
@@ -77,11 +76,14 @@ pub enum AgentSource {
 
 impl AgentSource {
     /// How `memory_status` explains the origin to the person reading it.
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::Flag => "from --agent",
-            Self::Client => "reported by the client; pin it with --agent",
-            Self::Fallback => "the client did not identify itself; pin one with --agent",
+    pub fn describe(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (Self::Flag, Lang::En) => "from --agent",
+            (Self::Client, Lang::En) => "reported by the client; pin it with --agent",
+            (Self::Fallback, Lang::En) => "the client did not identify itself; pin one with --agent",
+            (Self::Flag, Lang::Es) => "de --agent",
+            (Self::Client, Lang::Es) => "lo informa el cliente; fíjalo con --agent",
+            (Self::Fallback, Lang::Es) => "el cliente no se identificó; fija uno con --agent",
         }
     }
 }
@@ -101,6 +103,27 @@ pub fn resolve_agent(flag: Option<&str>, client: Option<&str>) -> (String, Agent
     }
 }
 
+/// Puts `table`'s descriptions on the tools and arguments it names: the
+/// description of each tool, and of each property of its input schema.
+fn describe(router: &mut ToolRouter<ClawgMcp>, table: &[(&str, Option<&str>, &'static str)]) {
+    for route in router.map.values_mut() {
+        let tool = &mut route.attr;
+        let mut schema = (*tool.input_schema).clone();
+        for (_, argument, text) in table.iter().filter(|(name, _, _)| *name == tool.name) {
+            match argument {
+                None => tool.description = Some((*text).into()),
+                Some(argument) => {
+                    let property = schema.get_mut("properties").and_then(|p| p.get_mut(*argument)).and_then(|p| p.as_object_mut());
+                    if let Some(property) = property {
+                        property.insert("description".into(), (*text).into());
+                    }
+                }
+            }
+        }
+        tool.input_schema = std::sync::Arc::new(schema);
+    }
+}
+
 /// The client name a request reads and writes under: the one it declares,
 /// else the last one a client declared to this bridge. Blank names count as
 /// none.
@@ -111,34 +134,6 @@ pub fn resolve_agent(flag: Option<&str>, client: Option<&str>) -> (String, Agent
 /// and its memories must not drop out of sight under the fallback.
 fn client_name<'a>(declared: Option<&'a str>, remembered: Option<&'a str>) -> Option<&'a str> {
     [declared, remembered].into_iter().flatten().find(|name| !name.trim().is_empty())
-}
-
-/// What the agent is told about saving and reading memories. Its opening is
-/// what the host is told this server is for, at `initialize` or
-/// `server/discover`; the whole text is for whatever hands the agent more
-/// than that.
-const PROTOCOL: &str = include_str!("protocol.md");
-
-/// The paragraphs between the title and the first section, each on one line:
-/// the file is wrapped for reading, and a host shows instructions as prose.
-fn opening(protocol: &str) -> String {
-    let mut paragraphs: Vec<String> = Vec::new();
-    let mut current: Vec<&str> = Vec::new();
-    for line in protocol.lines().skip(1).take_while(|line| !line.starts_with("## ")) {
-        let line = line.trim();
-        if line.is_empty() {
-            if !current.is_empty() {
-                paragraphs.push(current.join(" "));
-                current.clear();
-            }
-        } else {
-            current.push(line);
-        }
-    }
-    if !current.is_empty() {
-        paragraphs.push(current.join(" "));
-    }
-    paragraphs.join("\n\n")
 }
 
 // ── Tool parameters ─────────────────────────────────────────────────────────
@@ -255,6 +250,10 @@ pub struct SynthesizeArgs {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ListMemoriesArgs {
+    /// Only the memories this agent saved, as named after `by` in a listing
+    /// or a search. Lists every agent's you can read when omitted.
+    #[serde(default)]
+    pub agent: Option<String>,
     /// Which table to list: memory, episodic or procedural. Lists all three
     /// when omitted.
     #[serde(default)]
@@ -320,8 +319,18 @@ pub struct UpdateMemoryArgs {
     #[serde(default)]
     #[schemars(transform = memory_type_enum)]
     pub memory_type: Option<String>,
+    /// A directory of the project to move this memory to, with the rest of
+    /// its save and topic history, when it was saved in the wrong project or
+    /// in none. Omit it to leave the memory where it is.
+    #[serde(default)]
+    pub to_project_path: Option<String>,
+    /// True to move this memory out of every project, so every project's
+    /// searches find it. Not with to_project_path.
+    #[serde(default)]
+    pub clear_project: bool,
     /// True only when the user told you to: taking a user_preference or an
-    /// architectural_decision out of its type needs it.
+    /// architectural_decision out of its type, or moving one to another
+    /// project, needs it.
     #[serde(default)]
     pub user_answered: bool,
 }
@@ -329,19 +338,50 @@ pub struct UpdateMemoryArgs {
 /// The line `save_memory` adds when the save is close to earlier memories:
 /// the agent still has the conversation that produced it, so it is the one to
 /// judge the pairs, except those already put to the user.
-fn related_text(related: &[RelatedMemory]) -> String {
+fn related_text(lang: Lang, related: &[RelatedMemory]) -> String {
+    let asks = match lang {
+        Lang::En => ", asks the user",
+        Lang::Es => ", se le pregunta a la persona",
+    };
     let named = related
         .iter()
-        .map(|r| {
-            let asks = if r.escalated { ", asks the user" } else { "" };
-            format!("#{} \"{}\"{asks}", r.id, r.excerpt)
-        })
+        .map(|r| format!("#{} \"{}\"{}", r.id, r.excerpt, if r.escalated { asks } else { "" }))
         .collect::<Vec<_>>()
         .join("; ");
-    format!(
-        "\nclose to earlier memories: {named}. If this save replaces one, call resolve_conflict with \
-         verdict supersedes (keep = the new id); if both hold, compatible or scoped"
-    )
+    match lang {
+        Lang::En => format!(
+            "\nclose to earlier memories: {named}. If this save replaces one, call resolve_conflict with \
+             verdict supersedes (keep = the new id); if both hold, compatible or scoped"
+        ),
+        Lang::Es => format!(
+            "\ncerca de memorias anteriores: {named}. Si este save reemplaza una, llama a resolve_conflict con \
+             verdict supersedes (keep = el id nuevo); si valen las dos, compatible o scoped"
+        ),
+    }
+}
+
+/// What stands for a cause the daemon did not give.
+fn no_cause(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "no cause given",
+        Lang::Es => "sin causa",
+    }
+}
+
+/// A save the daemon refused, with its own sentence as it came.
+fn not_saved(lang: Lang, cause: &str) -> String {
+    match lang {
+        Lang::En => format!("not saved: {cause}"),
+        Lang::Es => format!("no se guardó: {cause}"),
+    }
+}
+
+/// What a tool says it could not do, after a daemon older than the bridge
+/// answered its own bare 404.
+#[derive(Debug, Clone, Copy)]
+enum Route {
+    RestoreMemory,
+    ReadSave,
 }
 
 /// The verdicts `resolve_conflict` takes, from the one list in the core.
@@ -391,11 +431,22 @@ pub struct ClawgMcp {
     /// without the user adding it (see [`own_root_to_index`]).
     docs_root: Option<ProjectIdentity>,
     /// Roots (with the legacy id they were reached through) already sent to
-    /// `POST /v1/projects` by this process. Shared by every clone, because rmcp
-    /// clones the server per call.
-    registered: Arc<tokio::sync::Mutex<HashSet<(PathBuf, String)>>>,
+    /// `POST /v1/projects` by this process, with the ids it gave them. Shared
+    /// by every clone, because rmcp clones the server per call.
+    registered: Arc<tokio::sync::Mutex<HashMap<(PathBuf, String), ProjectIds>>>,
     profile: Profile,
+    /// The user's preferred language when the bridge started, which this
+    /// session's instructions, searches and answers keep.
+    language: Option<Lang>,
     tool_router: ToolRouter<Self>,
+}
+
+/// The ids the daemon gave a root: where its memories are, and its own,
+/// which its docs index uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectIds {
+    project: String,
+    root: String,
 }
 
 /// The bridge's own project, when its root is one the daemon may read on its
@@ -448,8 +499,25 @@ impl ClawgMcp {
             default_project,
             registered: Arc::default(),
             profile,
+            language: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The preferred language this session speaks and searches in. In
+    /// Spanish the tools are described in Spanish too: the router is
+    /// rewritten once here, so `tools/list` and every test read the same list.
+    pub fn with_language(mut self, language: Option<Lang>) -> Self {
+        self.language = language;
+        if language == Some(Lang::Es) {
+            describe(&mut self.tool_router, crate::mcp::tools_es::DESCRIPTIONS);
+        }
+        self
+    }
+
+    /// The language this session's answers are written in.
+    fn speaks(&self) -> Lang {
+        self.language.unwrap_or(Lang::En)
     }
 
     /// Pins the agent id every call uses, whatever the peer declares.
@@ -502,7 +570,8 @@ impl ClawgMcp {
         F: Fn(DaemonClient) -> Fut,
         Fut: Future<Output = Result<T, ClientError>>,
     {
-        let unavailable = |e: &ClientError| CallToolResult::error(vec![ContentBlock::text(Self::explain(e))]);
+        let unavailable =
+            |e: &ClientError| CallToolResult::error(vec![ContentBlock::text(Self::explain(self.speaks(), e))]);
         let (client, reresolved) = match self.client.get().await {
             Ok(client) => (client, false),
             Err(start) if on_failure(&start) == Next::Reresolve => match self.client.reresolve().await {
@@ -529,175 +598,271 @@ impl ClawgMcp {
     /// embedder that is not ready yet (wait and retry) and one that failed to
     /// load (search is out until it does). Everything else is one message,
     /// because the model's next move is the same either way.
-    fn explain(err: &ClientError) -> String {
-        match err {
+    fn explain(lang: Lang, err: &ClientError) -> String {
+        let text = match (err, lang) {
             // Reached only after the daemon's files were read again, so the
             // daemon is truly gone, and this bridge does not bring it back
             // (see `ClientHandle::reresolve`).
-            ClientError::NotRunning => {
+            (ClientError::NotRunning, Lang::En) => {
                 "the clawg daemon is not running (it may have been stopped or updated); start it \
                  with `clawg serve`, or reconnect clawg in your MCP client, then call again"
-                    .to_string()
+            }
+            (ClientError::NotRunning, Lang::Es) => {
+                "el daemon de clawg no está corriendo (puede que lo hayan detenido o actualizado); arráncalo \
+                 con `clawg serve`, o vuelve a conectar clawg en tu cliente MCP, y llama de nuevo"
             }
             // Also only after a fresh read: the client's own text, which says
             // to delete the token, would not give this bridge a valid one.
-            ClientError::Unauthorized => {
+            (ClientError::Unauthorized, Lang::En) => {
                 "the clawg daemon rejected the token in its data directory even after re-reading it, \
                  so the token file no longer matches the running daemon; restart the daemon \
                  (`clawg status` shows its pid) and call again"
-                    .to_string()
+            }
+            (ClientError::Unauthorized, Lang::Es) => {
+                "el daemon de clawg rechazó el token de su directorio de datos aun después de volver a leerlo, \
+                 así que el archivo del token ya no coincide con el daemon que corre; reinicia el daemon \
+                 (`clawg status` muestra su pid) y llama de nuevo"
             }
             // Starting it was tried, so `clawg serve` is not the advice: the
             // reason it gave up (a store from a newer clawg, say) is what
             // `clawg status` reports.
-            ClientError::StartTimeout(_) => {
+            (ClientError::StartTimeout(_), Lang::En) => {
                 "clawg tried to start its daemon and it is not up; run `clawg status` to see \
                  why, or try again if it is still starting"
-                    .to_string()
             }
-            ClientError::Daemon { details, .. } if is_root_collision(err) => format!(
-                "not done: {}, and clawg will not mix two projects' memories under one id, so this \
-                 project cannot be used until one of the two folders is renamed; all_projects \
-                 still searches every project",
-                details.detail.as_deref().unwrap_or("this project's id belongs to another root")
-            ),
-            ClientError::Daemon { status: 503, message, .. } if message == "embedder_not_ready" => {
+            (ClientError::StartTimeout(_), Lang::Es) => {
+                "clawg intentó arrancar su daemon y no está arriba; ejecuta `clawg status` para ver \
+                 por qué, o prueba de nuevo si todavía está arrancando"
+            }
+            (ClientError::Daemon { details, .. }, _) if err.is_root_collision() => {
+                let detail = details.detail.as_deref().unwrap_or(match lang {
+                    Lang::En => "this project's id belongs to another root",
+                    Lang::Es => "el id de este proyecto pertenece a otra raíz",
+                });
+                return match lang {
+                    Lang::En => format!(
+                        "not done: {detail}, and clawg will not mix two projects' memories under one id, so this \
+                         project cannot be used until one of the two folders is renamed; all_projects \
+                         still searches every project"
+                    ),
+                    Lang::Es => format!(
+                        "no se hizo: {detail}, y clawg no mezcla las memorias de dos proyectos bajo un id, así que \
+                         este proyecto no se puede usar hasta que se renombre una de las dos carpetas; all_projects \
+                         sigue buscando en todos los proyectos"
+                    ),
+                };
+            }
+            (ClientError::Daemon { status: 503, message, .. }, Lang::En) if message == "embedder_not_ready" => {
                 "the memory index is still loading its embedding model; \
                  saving works now, and search will work in a minute"
-                    .to_string()
             }
-            ClientError::Daemon { message, details, .. } if message == "embedder_failed" => {
-                format!(
-                    "the memory index could not load its embedding model ({}); search and \
-                     saving are unavailable {}",
-                    details.detail.as_deref().unwrap_or("no cause given"),
-                    if details.retryable == Some(true) {
-                        "until clawg's retry succeeds"
-                    } else {
-                        "until the cause is fixed"
-                    }
-                )
+            (ClientError::Daemon { status: 503, message, .. }, Lang::Es) if message == "embedder_not_ready" => {
+                "el índice de memorias todavía está cargando su modelo de embeddings; \
+                 guardar ya funciona, y buscar va a funcionar en un minuto"
             }
-            other => other.to_string(),
-        }
+            (ClientError::Daemon { message, details, .. }, _) if message == "embedder_failed" => {
+                let detail = details.detail.as_deref().unwrap_or(no_cause(lang));
+                return match (lang, details.retryable == Some(true)) {
+                    (Lang::En, true) => format!(
+                        "the memory index could not load its embedding model ({detail}); search and \
+                         saving are unavailable until clawg's retry succeeds"
+                    ),
+                    (Lang::En, false) => format!(
+                        "the memory index could not load its embedding model ({detail}); search and \
+                         saving are unavailable until the cause is fixed"
+                    ),
+                    (Lang::Es, true) => format!(
+                        "el índice de memorias no pudo cargar su modelo de embeddings ({detail}); buscar y \
+                         guardar no están disponibles hasta que funcione el reintento de clawg"
+                    ),
+                    (Lang::Es, false) => format!(
+                        "el índice de memorias no pudo cargar su modelo de embeddings ({detail}); buscar y \
+                         guardar no están disponibles hasta que se arregle la causa"
+                    ),
+                };
+            }
+            (other, _) => return other.to_string(),
+        };
+        text.to_string()
     }
 
     /// What `save_memory` tells the model: `Ok` is a success result, `Err` an
     /// error result. Every id it names is one `delete_memory` takes with
     /// `kind: "memory"`.
-    fn save_outcome_text(result: Result<SaveOutcome, ClientError>) -> Result<String, String> {
+    fn save_outcome_text(lang: Lang, result: Result<SaveOutcome, ClientError>) -> Result<String, String> {
         let ids = |memories: &[crate::client::SavedMemory]| {
             memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
         };
         match result {
-            Ok(SaveOutcome::Saved { memories, redacted, related, replaced, key_dropped }) => {
-                let mut text = match memories.as_slice() {
-                    [one] if one.outcome == "reinforced" => format!(
+            Ok(SaveOutcome::Saved { memories, redacted, related, replaced, key_dropped, revision_candidate }) => {
+                let mut text = match (memories.as_slice(), lang) {
+                    ([one], Lang::En) if one.outcome == "reinforced" => format!(
                         "already stored as #{}; reinforced it instead of saving a copy \
                          (update_memory changes its importance or type)",
                         one.id
                     ),
-                    [one] => format!("saved #{}", one.id),
-                    many => format!(
+                    ([one], Lang::Es) if one.outcome == "reinforced" => format!(
+                        "ya estaba guardada como #{}; se reforzó en lugar de guardar una copia \
+                         (update_memory cambia su importancia o su tipo)",
+                        one.id
+                    ),
+                    ([one], Lang::En) => format!("saved #{}", one.id),
+                    ([one], Lang::Es) => format!("se guardó #{}", one.id),
+                    (many, Lang::En) => format!(
                         "saved as {} pieces: {}; read_memory with any of them returns the whole text",
+                        many.len(),
+                        ids(many)
+                    ),
+                    (many, Lang::Es) => format!(
+                        "se guardó en {} piezas: {}; read_memory con cualquiera de ellas devuelve el texto entero",
                         many.len(),
                         ids(many)
                     ),
                 };
                 if !redacted.is_empty() {
-                    text.push_str(&format!("; masked {} before storing it", redacted.join(", ")));
+                    let kinds = redacted.join(", ");
+                    text.push_str(&match lang {
+                        Lang::En => format!("; masked {kinds} before storing it"),
+                        Lang::Es => format!("; se enmascaró {kinds} antes de guardarla"),
+                    });
                 }
                 if !replaced.is_empty() {
                     let named: Vec<String> = replaced.iter().map(|r| format!("#{} \"{}\"", r.id, r.excerpt)).collect();
-                    text.push_str(&format!("; replaces {}", named.join(", ")));
+                    let named = named.join(", ");
+                    text.push_str(&match lang {
+                        Lang::En => format!("; replaces {named}"),
+                        Lang::Es => format!("; reemplaza {named}"),
+                    });
                 }
                 if key_dropped {
-                    text.push_str(
-                        "; the running clawg daemon predates topic_key, so this replaced nothing: restart it \
-                         with the installed clawg (`clawg stop`, then save again)",
-                    );
+                    text.push_str(match lang {
+                        Lang::En => {
+                            "; the running clawg daemon predates topic_key, so this replaced nothing: restart it \
+                             with the installed clawg (`clawg stop`, then save again)"
+                        }
+                        Lang::Es => {
+                            "; el daemon de clawg que corre es anterior a topic_key, así que esto no reemplazó nada: \
+                             reinícialo con el clawg instalado (`clawg stop`, y después guarda de nuevo)"
+                        }
+                    });
                 }
                 if !related.is_empty() {
-                    text.push_str(&related_text(&related));
+                    text.push_str(&related_text(lang, &related));
+                }
+                if let Some(id) = revision_candidate {
+                    text.push('\n');
+                    text.push_str(&topic_key_warning(lang, id));
                 }
                 Ok(text)
             }
             Ok(SaveOutcome::Queued { reason, operation_id, memories, detail }) => {
-                let accepted = match &operation_id {
-                    Some(id) => format!("accepted as operation {id}"),
-                    None => "accepted".to_string(),
+                let accepted = match (&operation_id, lang) {
+                    (Some(id), Lang::En) => format!("accepted as operation {id}"),
+                    (Some(id), Lang::Es) => format!("aceptado como la operación {id}"),
+                    (None, Lang::En) => "accepted".to_string(),
+                    (None, Lang::Es) => "aceptado".to_string(),
                 };
-                Ok(match reason.as_deref() {
-                    Some("retrying") => format!(
-                        "{accepted}; the embedding model could not take it ({}), and clawg keeps retrying \
-                         until it is stored (memory_status lists it if it fails)",
-                        detail.as_deref().unwrap_or("no cause given"),
+                let detail = detail.as_deref().unwrap_or(no_cause(lang));
+                Ok(match (reason.as_deref(), lang) {
+                    (Some("retrying"), Lang::En) => format!(
+                        "{accepted}; the embedding model could not take it ({detail}), and clawg keeps retrying \
+                         until it is stored (memory_status lists it if it fails)"
                     ),
-                    Some("partially_saved") => format!(
-                        "partially saved as {} ({}); the rest waits as operation {}, which clawg retries \
+                    (Some("retrying"), Lang::Es) => format!(
+                        "{accepted}; el modelo de embeddings no pudo tomarlo ({detail}), y clawg lo sigue \
+                         reintentando hasta guardarlo (memory_status lo lista si falla)"
+                    ),
+                    (Some("partially_saved"), Lang::En) => format!(
+                        "partially saved as {} ({detail}); the rest waits as operation {}, which clawg retries \
                          when the daemon next starts (memory_status lists it if it fails)",
                         ids(&memories),
-                        detail.as_deref().unwrap_or("no cause given"),
                         operation_id.as_deref().unwrap_or("unknown"),
                     ),
-                    Some("embedder_loading") => format!(
+                    (Some("partially_saved"), Lang::Es) => format!(
+                        "se guardó en parte como {} ({detail}); el resto espera como la operación {}, que clawg \
+                         reintenta en el próximo arranque del daemon (memory_status la lista si falla)",
+                        ids(&memories),
+                        operation_id.as_deref().unwrap_or("desconocida"),
+                    ),
+                    (Some("embedder_loading"), Lang::En) => format!(
                         "{accepted}; it will be stored once the embedding model finishes loading \
                          (memory_status lists it if it fails)"
                     ),
-                    Some("already_queued") => format!("{accepted} earlier and still waiting to be stored"),
-                    _ => format!(
+                    (Some("embedder_loading"), Lang::Es) => format!(
+                        "{accepted}; se va a guardar cuando el modelo de embeddings termine de cargar \
+                         (memory_status lo lista si falla)"
+                    ),
+                    (Some("already_queued"), Lang::En) => format!("{accepted} earlier and still waiting to be stored"),
+                    (Some("already_queued"), Lang::Es) => format!("{accepted} antes y todavía esperando a guardarse"),
+                    (_, Lang::En) => format!(
                         "{accepted} but not confirmed yet; memory_status lists it if it fails, \
                          list_memories shows it once stored"
+                    ),
+                    (_, Lang::Es) => format!(
+                        "{accepted} pero todavía sin confirmar; memory_status lo lista si falla, \
+                         list_memories lo muestra una vez guardado"
                     ),
                 })
             }
             Err(ClientError::Daemon { message, details, .. }) if message == "embedder_failed" => {
-                let mut text = format!(
-                    "not saved: the embedding model failed to load ({})",
-                    details.detail.as_deref().unwrap_or("no cause given")
-                );
+                let detail = details.detail.as_deref().unwrap_or(no_cause(lang));
+                let mut text = match lang {
+                    Lang::En => format!("not saved: the embedding model failed to load ({detail})"),
+                    Lang::Es => format!("no se guardó: el modelo de embeddings no pudo cargar ({detail})"),
+                };
                 if details.retryable == Some(true) {
-                    text.push_str("; clawg will retry");
+                    text.push_str(match lang {
+                        Lang::En => "; clawg will retry",
+                        Lang::Es => "; clawg va a reintentar",
+                    });
                 }
                 Err(text)
             }
             // The daemon's sentence says what was wrong with the call, an
             // unknown memory_type with the accepted ones among them.
-            Err(ClientError::Daemon { status: 400, message, .. }) => Err(format!("not saved: {message}")),
-            Err(ClientError::Daemon { message, .. }) if message == "ingest_queue_full" => {
-                Err("not saved: the ingest queue is full; try again shortly".into())
+            Err(ClientError::Daemon { status: 400, message, .. }) => Err(not_saved(lang, &message)),
+            Err(ClientError::Daemon { message, .. }) if message == "ingest_queue_full" => Err(match lang {
+                Lang::En => "not saved: the ingest queue is full; try again shortly",
+                Lang::Es => "no se guardó: la cola de ingesta está llena; prueba de nuevo en un momento",
             }
+            .into()),
             Err(ClientError::Daemon { message, details, .. })
                 if message == "ingest_failed" || message == "embedder_unavailable" =>
             {
-                let mut text = format!("not saved: {}", details.detail.unwrap_or(message));
+                let mut text = not_saved(lang, &details.detail.unwrap_or(message));
                 if !details.memories.is_empty() {
-                    text.push_str(&format!("; partially saved as {}", ids(&details.memories)));
+                    let saved = ids(&details.memories);
+                    text.push_str(&match lang {
+                        Lang::En => format!("; partially saved as {saved}"),
+                        Lang::Es => format!("; se guardó en parte como {saved}"),
+                    });
                 }
                 Err(text)
             }
-            Err(other) => Err(Self::explain(&other)),
+            Err(other) => Err(Self::explain(lang, &other)),
         }
     }
 
-    /// Which project a call is scoped to, registered with the daemon first so
-    /// rows saved under its legacy id are already under its id when the call
-    /// reads or writes.
+    /// The ids of the project a call is scoped to, registered with the daemon
+    /// first so rows saved under its legacy id, or under the id of another
+    /// clone of its remote, are already under its project when the call reads
+    /// or writes.
     ///
     /// Each root and legacy id is sent once per process, even when the call
     /// fails: a daemon that cannot register (an older version, say) must not
-    /// cost every tool call a round trip, and the scope is the same either way.
-    /// The exceptions are a call the daemon never got (a refused token or
-    /// connection), which is sent again, and a root whose id belongs to
-    /// another root: that is `Err`, because reading or writing under the id
-    /// would mix two projects, and it is asked again on the next call because
-    /// nothing in this process would notice it being resolved.
-    async fn project_for(
+    /// cost every tool call a round trip, and the ids derived from the root
+    /// are what such a daemon uses. The exceptions are a call the daemon
+    /// never got (a refused token or connection), which is sent again, and a
+    /// root whose id belongs to another root, which only a daemon from before
+    /// assigned ids answers: that is `Err`, because reading or writing under
+    /// the id would mix two projects, and it is asked again on the next call
+    /// because nothing in this process would notice it being resolved.
+    async fn ids_for(
         &self,
         client: &DaemonClient,
         project_path: Option<&str>,
         all_projects: bool,
-    ) -> Result<Option<String>, ClientError> {
+    ) -> Result<Option<ProjectIds>, ClientError> {
         let Some(project) = resolve_project(
             self.default_project.as_ref(),
             project_path,
@@ -706,32 +871,50 @@ impl ClawgMcp {
         ) else {
             return Ok(None);
         };
+        let key = (project.root.clone(), project.legacy_id.clone());
         let mut registered = self.registered.lock().await;
-        if registered.insert((project.root.clone(), project.legacy_id.clone())) {
-            let legacy: Vec<String> =
-                Some(project.legacy_id.clone()).filter(|l| *l != project.id).into_iter().collect();
-            let index_docs = indexes_docs(&project, self.docs_root.as_ref());
-            if let Err(e) = client.register_project(&project.root, &legacy, index_docs).await {
-                if is_root_collision(&e) {
-                    registered.remove(&(project.root.clone(), project.legacy_id.clone()));
-                    return Err(e);
-                }
+        if let Some(ids) = registered.get(&key) {
+            return Ok(Some(ids.clone()));
+        }
+        let legacy = project.legacy_ids();
+        let index_docs = indexes_docs(&project, self.docs_root.as_ref());
+        let ids = match client.register_project(&project.root, &legacy, index_docs).await {
+            Ok(given) => ProjectIds { project: given.project_id, root: given.root_id },
+            Err(e) if e.is_root_collision() => return Err(e),
+            Err(e) => {
                 log::warn!("could not register project {}: {e}", project.root.display());
+                let derived = ProjectIds { project: project.id.clone(), root: project.id.clone() };
                 // The daemon never saw it, so the one found after reading the
                 // files again must get it.
                 if on_failure(&e) == Next::Reresolve {
-                    registered.remove(&(project.root.clone(), project.legacy_id.clone()));
+                    return Ok(Some(derived));
                 }
+                derived
             }
-        }
-        Ok(Some(project.id))
+        };
+        registered.insert(key, ids.clone());
+        Ok(Some(ids))
+    }
+
+    /// Which project's memories a call reads and writes; see [`Self::ids_for`].
+    async fn project_for(
+        &self,
+        client: &DaemonClient,
+        project_path: Option<&str>,
+        all_projects: bool,
+    ) -> Result<Option<String>, ClientError> {
+        Ok(self.ids_for(client, project_path, all_projects).await?.map(|ids| ids.project))
     }
 
     /// The project a `save_memory` with `project_path` goes to, which is
     /// where a key it shows revises. Resolved without registering it: an
-    /// `all_projects` search registers nothing.
-    fn save_project(&self, project_path: Option<&str>) -> Option<String> {
-        resolve_project(self.default_project.as_ref(), project_path, false, ProjectIdentity::resolve).map(|p| p.id)
+    /// `all_projects` search registers nothing. A root not registered yet
+    /// reads as the id derived from it.
+    async fn save_project(&self, project_path: Option<&str>) -> Option<String> {
+        let project = resolve_project(self.default_project.as_ref(), project_path, false, ProjectIdentity::resolve)?;
+        let registered = self.registered.lock().await;
+        let given = registered.iter().find(|((root, _), _)| *root == project.root).map(|(_, ids)| ids.project.clone());
+        Some(given.unwrap_or(project.id))
     }
 
     // ── Implementations, testable without a Peer ────────────────────────────
@@ -742,7 +925,10 @@ impl ClawgMcp {
         args: SaveMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if args.content.trim().is_empty() {
-            return Self::failed("content must not be empty");
+            return Self::failed(match self.speaks() {
+                Lang::En => "content must not be empty",
+                Lang::Es => "content no puede estar vacío",
+            });
         }
         let args = &args;
         let result = self
@@ -772,7 +958,7 @@ impl ClawgMcp {
         // "saved" only when the daemon confirmed the rows exist: telling a
         // model otherwise invites it to search for something still in a
         // channel.
-        match Self::save_outcome_text(result) {
+        match Self::save_outcome_text(self.speaks(), result) {
             Ok(text) => Self::ok(text),
             Err(text) => Self::failed(text),
         }
@@ -789,21 +975,24 @@ impl ClawgMcp {
             .call(|client| async move {
                 let project_id = self.project_for(&client, args.project_path.as_deref(), all_projects).await?;
                 let save_project =
-                    if all_projects { self.save_project(args.project_path.as_deref()) } else { project_id.clone() };
+                    if all_projects { self.save_project(args.project_path.as_deref()).await } else { project_id.clone() };
                 client
                     .search(SearchArgs {
                         query: args.query.clone(),
                         agent_id: agent_id.to_string(),
                         project_id,
                         limit: args.limit,
+                        lang: self.language,
                     })
                     .await
                     .map(|found| (found, save_project))
             })
             .await;
         match result {
-            Ok(Ok((found, save_project))) => Self::ok(format_search(found, agent_id, save_project.as_deref())),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok((found, save_project))) => {
+                Self::ok(format_search(found, agent_id, save_project.as_deref(), self.language))
+            }
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -817,18 +1006,19 @@ impl ClawgMcp {
         let result = self
             .call(|client| async move {
                 let project_id = self.project_for(&client, args.project_path.as_deref(), false).await?;
-                client.context(&args.query, agent_id, project_id.as_deref(), args.budget).await
+                client.context(&args.query, agent_id, project_id.as_deref(), args.budget, self.language).await
             })
             .await;
         match result {
-            Ok(Ok(context)) => Self::ok(format_recall(&context)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok(context)) => Self::ok(format_recall(&context, self.language)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
 
-    /// Lists the calling agent's rows only, across all of its projects: the
-    /// agent is the visibility boundary, the project is not.
+    /// Lists every row the calling agent reaches, across all projects, or one
+    /// author's with `agent`. The project is no boundary here, as it is none
+    /// for the agent's search with `all_projects`.
     pub async fn list_memories_impl(
         &self,
         agent_id: &str,
@@ -844,20 +1034,23 @@ impl ClawgMcp {
                         memory_type: args.memory_type.clone(),
                         limit: args.limit,
                         offset: args.offset,
-                        agent: Some(agent_id.to_string()),
+                        reader: Some(agent_id.to_string()),
+                        agent: args.agent.clone(),
                         ..Default::default()
                     })
                     .await
             })
             .await;
         match result {
-            Ok(Ok(rows)) => Self::ok(format_rows(&rows)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok(rows)) => Self::ok(format_rows(self.speaks(), &rows, agent_id)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
 
-    /// Another agent's row is refused as missing, like an id that is not there.
+    /// A row the sharing policy hides from the agent is refused as missing,
+    /// like an id that is not there; any other the agent may delete, whoever
+    /// saved it.
     pub async fn delete_memory_impl(
         &self,
         agent_id: &str,
@@ -868,13 +1061,13 @@ impl ClawgMcp {
             .call(|client| async move { client.delete(&args.kind, args.id, Some(agent_id)).await })
             .await;
         match result {
-            Ok(Ok(deleted)) => Self::ok(format_delete(&deleted)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok(deleted)) => Self::ok(format_delete(self.speaks(), &deleted)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
 
-    /// Another agent's row is refused as missing, as in `delete_memory_impl`.
+    /// Reaches what `delete_memory_impl` reaches.
     pub async fn restore_memory_impl(
         &self,
         agent_id: &str,
@@ -885,13 +1078,14 @@ impl ClawgMcp {
             .call(|client| async move { client.restore(&args.kind, args.id, Some(agent_id)).await })
             .await;
         match result {
-            Ok(Ok(restored)) => Self::ok(format_restore(&restored)),
-            Ok(Err(e)) => Self::failed(Self::route_failure_text(&e, "restore a memory")),
+            Ok(Ok(restored)) => Self::ok(format_restore(self.speaks(), &restored)),
+            Ok(Err(e)) => Self::failed(Self::route_failure_text(self.speaks(), &e, Route::RestoreMemory)),
             Err(failure) => Ok(failure),
         }
     }
 
-    /// Another agent's save is refused as missing, as in `delete_memory_impl`.
+    /// Reaches what `delete_memory_impl` reaches; a piece the agent cannot
+    /// read is named as missing.
     pub async fn read_memory_impl(
         &self,
         agent_id: &str,
@@ -906,8 +1100,8 @@ impl ClawgMcp {
         match result {
             // `read_memory` names no project, so a save after it goes to the
             // bridge's own.
-            Ok(Ok(save)) => Self::ok(format_save(&save, self.save_project(None).as_deref())),
-            Ok(Err(e)) => Self::failed(Self::route_failure_text(&e, "read a save")),
+            Ok(Ok(save)) => Self::ok(format_save(self.speaks(), &save, self.save_project(None).await.as_deref())),
+            Ok(Err(e)) => Self::failed(Self::route_failure_text(self.speaks(), &e, Route::ReadSave)),
             Err(failure) => Ok(failure),
         }
     }
@@ -915,33 +1109,70 @@ impl ClawgMcp {
     /// A daemon older than the route answers its own bare 404, with no error
     /// text of the daemon's; telling the model the row is missing would be
     /// false.
-    fn route_failure_text(err: &ClientError, what: &str) -> String {
+    fn route_failure_text(lang: Lang, err: &ClientError, route: Route) -> String {
         match err {
             ClientError::Daemon { status: 404, message, .. } if message == "404 Not Found" => {
-                format!(
-                    "the running clawg daemon cannot {what}; restart it with the installed clawg \
-                     (`clawg stop`, then call again)"
-                )
+                let what = match (route, lang) {
+                    (Route::RestoreMemory, Lang::En) => "restore a memory",
+                    (Route::ReadSave, Lang::En) => "read a save",
+                    (Route::RestoreMemory, Lang::Es) => "restaurar una memoria",
+                    (Route::ReadSave, Lang::Es) => "leer un save",
+                };
+                match lang {
+                    Lang::En => format!(
+                        "the running clawg daemon cannot {what}; restart it with the installed clawg \
+                         (`clawg stop`, then call again)"
+                    ),
+                    Lang::Es => format!(
+                        "el daemon de clawg que corre no puede {what}; reinícialo con el clawg instalado \
+                         (`clawg stop`, y después llama de nuevo)"
+                    ),
+                }
             }
-            other => Self::explain(other),
+            other => Self::explain(lang, other),
         }
     }
 
-    /// Another agent's row is refused as missing, as in `delete_memory_impl`.
+    /// Reaches what `delete_memory_impl` reaches. A project to move to is
+    /// registered first, as any path a tool names; it must be a directory, so
+    /// a mistyped path does not send the memory where no search looks.
     pub async fn update_memory_impl(
         &self,
         agent_id: &str,
         args: UpdateMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let lang = self.speaks();
+        if args.to_project_path.is_some() && args.clear_project {
+            return Self::failed(match lang {
+                Lang::En => "pass to_project_path or clear_project, not both",
+                Lang::Es => "pasa to_project_path o clear_project, no los dos",
+            });
+        }
+        if let Some(path) = args.to_project_path.as_deref() {
+            let root = ProjectIdentity::resolve(std::path::Path::new(path)).root;
+            if !root.is_dir() {
+                return Self::failed(match lang {
+                    Lang::En => format!("{} is not a directory: name a directory of the project", root.display()),
+                    Lang::Es => format!("{} no es un directorio: nombra un directorio del proyecto", root.display()),
+                });
+            }
+        }
+        let moved = args.to_project_path.is_some() || args.clear_project;
         let args = &args;
         let result = self
             .call(|client| async move {
+                let project = match args.to_project_path.as_deref() {
+                    Some(path) => Some(self.project_for(&client, Some(path), false).await?),
+                    None if args.clear_project => Some(None),
+                    None => None,
+                };
                 client
                     .update(
                         &args.kind,
                         args.id,
                         args.importance,
                         args.memory_type.as_deref(),
+                        project.as_ref().map(|p| p.as_deref()),
                         args.user_answered,
                         Some(agent_id),
                     )
@@ -949,13 +1180,13 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(updated)) => Self::ok(format_update(&updated)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok(updated)) => Self::ok(format_update(lang, &updated, moved)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
 
-    /// Both rows must be the calling agent's, as in `delete_memory_impl`.
+    /// Both rows must be within the agent's reach, as in `delete_memory_impl`.
     pub async fn resolve_conflict_impl(
         &self,
         agent_id: &str,
@@ -970,14 +1201,22 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(resolution)) => Self::ok(format_resolution(&resolution)),
+            Ok(Ok(resolution)) => Self::ok(format_resolution(self.speaks(), &resolution)),
             // The daemon's own 404 names the row; a bare one is a daemon that
             // predates verdicts.
-            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => Self::failed(
-                "the running clawg daemon is older than this bridge and cannot take a verdict; \
-                 restart it with `clawg stop` and call the tool again",
-            ),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => {
+                Self::failed(match self.speaks() {
+                    Lang::En => {
+                        "the running clawg daemon is older than this bridge and cannot take a verdict; \
+                         restart it with `clawg stop` and call the tool again"
+                    }
+                    Lang::Es => {
+                        "el daemon de clawg que corre es más viejo que este puente y no puede tomar un veredicto; \
+                         reinícialo con `clawg stop` y vuelve a llamar a la herramienta"
+                    }
+                })
+            }
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -988,30 +1227,43 @@ impl ClawgMcp {
         let args = &args;
         let result = self
             .call(|client| async move {
-                let Some(project_id) = self.project_for(&client, args.project_path.as_deref(), false).await? else {
+                // A root's docs describe its checkout, so two clones of one
+                // project each search their own.
+                let Some(ids) = self.ids_for(&client, args.project_path.as_deref(), false).await? else {
                     return Ok(None);
                 };
-                client.search_docs(&project_id, &args.query, args.limit).await.map(Some)
+                client.search_docs(&ids.root, &args.query, args.limit).await.map(Some)
             })
             .await;
         match result {
-            Ok(Ok(Some(found))) => Self::ok(format_docs(&found)),
-            Ok(Ok(None)) => Self::failed("no project to search: pass project_path"),
+            Ok(Ok(Some(found))) => Self::ok(format_docs(self.speaks(), &found)),
+            Ok(Ok(None)) => Self::failed(match self.speaks() {
+                Lang::En => "no project to search: pass project_path",
+                Lang::Es => "no hay proyecto en el que buscar: pasa project_path",
+            }),
             // Already the sentence the model should act on: which root, and
             // the command the user runs to have it read.
             Ok(Err(ClientError::Daemon { status: 403, message, .. })) => Self::failed(message),
             // The daemon's own 404 names the project; a bare one is a daemon
             // that predates the route.
-            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => Self::failed(
-                "the running clawg daemon is older than this bridge and cannot search project docs; \
-                 restart it with `clawg stop` and call the tool again",
-            ),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Err(ClientError::Daemon { status: 404, message, .. })) if message.starts_with("404") => {
+                Self::failed(match self.speaks() {
+                    Lang::En => {
+                        "the running clawg daemon is older than this bridge and cannot search project docs; \
+                         restart it with `clawg stop` and call the tool again"
+                    }
+                    Lang::Es => {
+                        "el daemon de clawg que corre es más viejo que este puente y no puede buscar en la \
+                         documentación del proyecto; reinícialo con `clawg stop` y vuelve a llamar a la herramienta"
+                    }
+                })
+            }
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
 
-    /// Only the calling agent's memories, as in `list_memories_impl`.
+    /// Every memory of the project the calling agent reaches, whoever saved it.
     pub async fn synthesize_impl(
         &self,
         agent_id: &str,
@@ -1029,8 +1281,8 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            Ok(Ok(synthesis)) => Self::ok(format_synthesis(&synthesis)),
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Ok(synthesis)) => Self::ok(format_synthesis(self.speaks(), &synthesis)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -1045,21 +1297,29 @@ impl ClawgMcp {
                 // Read here rather than asked of the daemon: both read the same
                 // file in the same data directory, so this is what the next
                 // search will use.
-                let sharing = format_sharing(&sharing::load(client.base_dir()), &agent_id);
+                let lang = self.speaks();
+                let sharing = format_sharing(lang, &sharing::load(client.base_dir()), &agent_id);
+                // The file is read again here: a session keeps its language,
+                // and the user has to learn that a change waits for a new one.
+                let language = format_language(self.language, clawg_core::preferences::language_in(client.base_dir()));
                 // A daemon that predates the pair table has nothing to count,
                 // and a status must not fail over a line it can leave out.
-                let conflicts = client.open_disputes(&agent_id).await.map(|open| format_open_pairs(&open)).ok();
+                let project = self.save_project(None).await;
+                let conflicts =
+                    client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(lang, &open)).ok();
                 Self::ok(format_status(
+                    lang,
                     &health,
                     self.profile,
                     client.base_dir(),
                     &agent_id,
-                    source.describe(),
+                    source.describe(lang),
                     &sharing,
                     conflicts.as_deref(),
+                    language.as_deref(),
                 ))
             }
-            Ok(Err(e)) => Self::failed(Self::explain(&e)),
+            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -1094,7 +1354,8 @@ impl ClawgMcp {
         description = "Find stored memories related to a query. Use this first, before \
                        answering anything that depends on an earlier session. Matching is by \
                        meaning, so pass a full natural-language question, not keywords; it \
-                       finds memories written in other words or in another language. Returns a \
+                       finds memories written in other words, but often misses one written in \
+                       another language than the query. Returns a \
                        numbered list of the memories close in relevance to the best match (at \
                        least two), with their ids, kinds and relevance scores; a short list \
                        means the rest scored far lower, not that nothing else is stored. \
@@ -1130,9 +1391,11 @@ impl ClawgMcp {
     #[tool(
         name = "list_memories",
         description = "Browse what is stored, newest first, without searching. Use this to \
-                       show the user their memory inventory or to find an id to delete. \
-                       Returns one line per row: id, kind, type, tier, importance, access \
-                       count, status and a truncated summary."
+                       show the user their memory inventory or to find an id to delete. Lists \
+                       every memory you can read, yours and other agents'; `agent` lists one \
+                       agent's only. Returns one line per row: id, kind, type, tier, importance, \
+                       access count, status, `by <agent>` when another agent saved it, and a \
+                       truncated summary."
     )]
     async fn list_memories(
         &self,
@@ -1162,10 +1425,10 @@ impl ClawgMcp {
         name = "delete_memory",
         description = "Delete one stored memory by id and kind. Get the id from \
                        `search_memory`, `list_memories` or `recall_context` first — ids are \
-                       per-kind, so the same number exists in all three tables. Only your own \
-                       memories: one marked `by <agent>` was saved by another agent and is \
-                       read-only. Deleting the current memory of a `topic_key` makes the version \
-                       it replaced current again. `restore_memory` undoes it."
+                       per-kind, so the same number exists in all three tables. A memory marked \
+                       `by <agent>` was saved by another agent, and deleting it takes it from every \
+                       agent. Deleting the current memory of a `topic_key` makes the version it \
+                       replaced current again. `restore_memory` undoes it."
     )]
     async fn delete_memory(
         &self,
@@ -1177,12 +1440,11 @@ impl ClawgMcp {
 
     #[tool(
         name = "restore_memory",
-        description = "Undo a `delete_memory`: bring a memory you deleted back, with the id and \
-                       kind you deleted it with, when the user says the delete was a mistake. \
-                       Refused when the same text was saved again since, when a newer memory holds \
-                       its `topic_key`, or when the memory holds a secret. Names the memories saved \
-                       meanwhile that are close to it, to judge with `resolve_conflict`. Only your own \
-                       memories: one marked `by <agent>` is read-only."
+        description = "Undo a `delete_memory`: bring a deleted memory back, with the id and kind \
+                       it was deleted with, when the user says the delete was a mistake. Refused \
+                       when the same text was saved again since, when a newer memory holds its \
+                       `topic_key`, or when the memory holds a secret. Names the memories saved \
+                       meanwhile that are close to it, to judge with `resolve_conflict`."
     )]
     async fn restore_memory(
         &self,
@@ -1194,14 +1456,17 @@ impl ClawgMcp {
 
     #[tool(
         name = "update_memory",
-        description = "Correct the importance or the type of one stored memory, by id and kind, \
-                       when the user says it matters more or less than it was saved with, or \
-                       that it is a different kind of memory. Pass only what changes. Taking a \
-                       preference or a decision out of its type needs user_answered, set only \
-                       when the user said so. To change what a memory says, save the new text \
-                       and delete the old one instead. Returns the memory's importance, type and \
-                       tier after the change. Only your own memories: one marked `by <agent>` is \
-                       read-only."
+        description = "Correct the importance, the type or the project of one stored memory, by id \
+                       and kind, when the user says it matters more or less than it was saved \
+                       with, that it is a different kind of memory, or that it belongs to another \
+                       project (to_project_path) or to none (clear_project). Pass only what \
+                       changes. A memory moves with the rest of its save and topic history, and \
+                       does not move where the same text or topic key is live. Taking a \
+                       preference or a decision out of its type, or moving one, needs \
+                       user_answered, set only when the user said so. To change what a memory \
+                       says, save the new text and delete the old one instead. Returns the \
+                       memory's importance, type, tier and, after a move, its project, which \
+                       every agent that reads it sees."
     )]
     async fn update_memory(
         &self,
@@ -1218,8 +1483,8 @@ impl ClawgMcp {
                        one under ACTIVE CONFLICTS in `recall_context`, once the user has said \
                        which holds. A preference or a decision is superseded only on the user's \
                        word: judge it conflicts and ask, then call supersedes with user_answered \
-                       and their answer in reason. Returns the status of both memories. Only \
-                       your own memories: one marked `by <agent>` is read-only."
+                       and their answer in reason. Returns the status of both memories. Either \
+                       side may be another agent's."
     )]
     async fn resolve_conflict(
         &self,
@@ -1292,7 +1557,7 @@ impl ServerHandler for ClawgMcp {
         // the other.
         info.server_info =
             Implementation::new(self.profile.mcp_server_name(), clawg_core::build_info::version());
-        info.instructions = Some(opening(PROTOCOL));
+        info.instructions = Some(opening(&protocol::text(self.language)));
         info
     }
 
@@ -1310,6 +1575,7 @@ impl ServerHandler for ClawgMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1319,6 +1585,7 @@ mod tests {
 
     use crate::client::{ErrorDetails, ListArgs, ReplacedMemory, SaveArgs, SaveOutcome, SavedMemory};
     use crate::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, SAVE_CONFIRM_TIMEOUT};
+    use crate::mcp::protocol::PROTOCOL;
     use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
     /// Brings up an in-process daemon and returns a bridge pointed at it.
@@ -1351,6 +1618,7 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            metrics: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr: SocketAddr = listener.local_addr().expect("addr");
@@ -1371,8 +1639,11 @@ mod tests {
 
     /// The default project of [`bridge`]: a root that is already canonical, so
     /// there is no legacy id to move.
+    /// A project the daemon gives the id derived from its root, as it gives
+    /// any root that no other one holds.
     fn test_project() -> ProjectIdentity {
-        ProjectIdentity { id: "proj-test".into(), root: "/proj-test".into(), legacy_id: "proj-test".into() }
+        let id = clawg_core::memory::derive_project_id(std::path::Path::new("/proj-test"));
+        ProjectIdentity { id: id.clone(), root: "/proj-test".into(), legacy_id: id }
     }
 
     /// A bridge pointed at an address where nothing is listening.
@@ -1456,6 +1727,56 @@ mod tests {
 
         assert_eq!(rows_in(&b, &identity.id).await, 2);
         assert_eq!(rows_in(&b, &identity.legacy_id).await, 0);
+    }
+
+    /// Two clones of one remote, each with a README of its own.
+    fn two_clones() -> (tempfile::TempDir, ProjectIdentity, ProjectIdentity) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        let mut clones = Vec::new();
+        for (name, readme) in [("work", "# Work\nThe zanzibar branch."), ("review", "# Review\nThe quokka branch.")] {
+            let root = base.join(name).join("app");
+            std::fs::create_dir_all(root.join(".git")).expect(".git");
+            std::fs::write(root.join(".git").join("config"), "[remote \"origin\"]\n\turl = git@github.com:acme/app.git\n")
+                .expect("config");
+            std::fs::write(root.join("README.md"), readme).expect("readme");
+            clones.push(ProjectIdentity::resolve(&root));
+        }
+        let review = clones.pop().unwrap();
+        (dir, clones.pop().unwrap(), review)
+    }
+
+    #[tokio::test]
+    async fn two_clones_of_one_remote_share_their_memories() {
+        let (_dir, work, review) = two_clones();
+        let (a, _d) = bridge_at(Some(work), |r| r).await;
+        let client = a.client.get().await.expect("daemon");
+        let b = ClawgMcp::with_project(client, Profile::Dev, Some(review));
+        let search = |q: &str| SearchMemoryArgs { query: q.into(), limit: None, project_path: None, all_projects: None };
+
+        let saved = a.save_memory_impl("a", save_args("tests run with cargo nextest")).await.unwrap();
+        assert!(!is_error(&saved), "{}", text(&saved));
+        b.save_memory_impl("a", save_args("the socket is clawg.sock")).await.unwrap();
+
+        let from_review = text(&b.search_memory_impl("a", search("tests run with cargo nextest")).await.unwrap());
+        assert!(from_review.contains("tests run with cargo nextest"), "{from_review}");
+        let from_work = text(&a.search_memory_impl("a", search("the socket is clawg.sock")).await.unwrap());
+        assert!(from_work.contains("the socket is clawg.sock"), "{from_work}");
+    }
+
+    #[tokio::test]
+    async fn search_project_reads_the_docs_of_its_own_root() {
+        let (_dir, work, review) = two_clones();
+        let (a, _d) = bridge_at(Some(work), |r| r).await;
+        let client = a.client.get().await.expect("daemon");
+        let b = ClawgMcp::with_project(client, Profile::Dev, Some(review));
+        let docs = |q: &str| SearchProjectArgs { query: q.into(), limit: None, project_path: None };
+
+        let mine = text(&b.search_project_impl(docs("The quokka branch")).await.unwrap());
+        let theirs = text(&a.search_project_impl(docs("The quokka branch")).await.unwrap());
+
+        assert!(mine.contains("quokka") && !mine.contains("zanzibar"), "{mine}");
+        assert!(theirs.contains("zanzibar") && !theirs.contains("quokka"), "{theirs}");
     }
 
     #[tokio::test]
@@ -1586,20 +1907,53 @@ mod tests {
         assert_eq!(clawg_core::memory::project_docs::doc_count(&store, &other.id).await.unwrap(), 0);
     }
 
-    /// A bridge whose own root's id already belongs to `/elsewhere`, so the
-    /// daemon answers its registration with 409.
-    async fn colliding_bridge() -> (ClawgMcp, tempfile::TempDir, tempfile::TempDir, ProjectIdentity) {
+    /// A bridge whose daemon is one from before assigned ids, which answers
+    /// the registration of a root whose id belongs to `/elsewhere` with 409.
+    async fn colliding_bridge() -> (ClawgMcp, tempfile::TempDir, (tempfile::TempDir, Published), ProjectIdentity) {
         let (repo, identity) = repo_with_src();
-        let (b, d, store) = bridge_with_store(identity.clone()).await;
-        let id = identity.id.clone();
+        let data = tempfile::tempdir().expect("tempdir");
+        let detail = format!("{} gets the project id {}, which already belongs to /elsewhere", identity.root.display(), identity.id);
+        let daemon = Published::start_with(data.path(), "token", move |app| {
+            app.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let detail = detail.clone();
+                async move {
+                    if req.uri().path() == "/v1/projects" {
+                        let body = serde_json::json!({ "error": "project_root_collision", "detail": detail });
+                        return axum::response::IntoResponse::into_response((
+                            axum::http::StatusCode::CONFLICT,
+                            axum::Json(body),
+                        ));
+                    }
+                    next.run(req).await
+                }
+            }))
+        })
+        .await;
+        let client = DaemonClient::from_data_dir(data.path()).expect("files");
+        let b = ClawgMcp::with_project(client, Profile::Dev, Some(identity.clone()));
+        (b, repo, (data, daemon), identity)
+    }
+
+    #[tokio::test]
+    async fn a_colliding_root_gets_a_project_of_its_own() {
+        let (repo, identity) = repo_with_src();
+        let (b, _d, store) = bridge_with_store(identity.clone()).await;
+        let taken = identity.id.clone();
         store
             .conn
             .call(move |c| {
-                c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere', 0)", [id])
+                c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere', 0)", [taken])
             })
             .await
             .expect("seed a colliding project");
-        (b, repo, d, identity)
+
+        let saved = b.save_memory_impl("a", save_args("kept apart from /elsewhere")).await.unwrap();
+
+        assert!(!is_error(&saved), "{}", text(&saved));
+        assert_eq!(rows_in(&b, &identity.id).await, 0, "nothing under the other root's id");
+        let own = clawg_core::memory::identity::candidate_id(&identity.root, 1);
+        assert_eq!(rows_in(&b, &own).await, 1);
+        drop(repo);
     }
 
     #[tokio::test]
@@ -1840,7 +2194,7 @@ mod tests {
             .save(SaveArgs {
                 content: content.into(),
                 agent_id: "claude-code".into(),
-                project_id: Some("proj-test".into()),
+                project_id: Some(test_project().id),
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
@@ -1893,7 +2247,7 @@ mod tests {
             .save(SaveArgs {
                 content: "the release branch is cut on the first monday".into(),
                 agent_id: "claude-code".into(),
-                project_id: Some("proj-test".into()),
+                project_id: Some(test_project().id),
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
@@ -1902,8 +2256,9 @@ mod tests {
             })
             .await
             .expect("save");
-        let path = workspaces.workspace_path("claude-code", Some("proj-test"));
-        assert!(path.ends_with("claude-code/proj-test/workspace.md"), "the path must not move: {}", path.display());
+        let path = workspaces.workspace_path("claude-code", Some(&test_project().id));
+        let expected = format!("claude-code/{}/workspace.md", test_project().id);
+        assert!(path.ends_with(&expected), "the path must not move: {}", path.display());
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(
             &path,
@@ -1971,11 +2326,9 @@ mod tests {
             && span.split('_').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase()))
     }
 
-    #[test]
-    fn opening_joins_the_lines_of_each_paragraph() {
-        assert_eq!(opening("# T\n\nuno\ndos\n\ntres\n## S\ncuatro"), "uno dos\n\ntres");
-        assert_eq!(opening("# T\r\n\r\nuno\r\n  dos\r\n\r\n\r\ntres\r\n## S\r\n"), "uno dos\n\ntres");
-        assert_eq!(opening("# T\nsolo"), "solo");
+    /// The protocol without a preference and with each language.
+    fn every_protocol() -> Vec<String> {
+        [None, Some(Lang::En), Some(Lang::Es)].into_iter().map(|l| protocol::text(l).into_owned()).collect()
     }
 
     #[test]
@@ -1997,8 +2350,47 @@ mod tests {
     /// characters, and they are paid for in every session.
     #[test]
     fn the_instructions_fit_older_clients() {
-        let length = opening(PROTOCOL).chars().count();
-        assert!(length <= 2048, "the instructions are {length} characters");
+        for protocol in every_protocol() {
+            let length = opening(&protocol).chars().count();
+            assert!(length <= 2048, "the instructions are {length} characters: {}", opening(&protocol));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_instructions_follow_the_preferred_language() {
+        let (b, _d) = bridge().await;
+        let b = b.with_language(Some(Lang::Es));
+        let instructions = b.get_info().instructions.expect("instructions");
+        assert!(instructions.contains("Guarda las memorias y busca en español"), "{instructions}");
+        assert!(instructions.contains("Responde a la persona en español salvo que escriba en otro idioma"), "{instructions}");
+        assert!(!instructions.contains("English"), "{instructions}");
+        assert_eq!(instructions, opening(&protocol::text(Some(Lang::Es))));
+    }
+
+    #[tokio::test]
+    async fn without_a_preference_the_instructions_are_the_opening() {
+        let (b, d) = bridge().await;
+        std::fs::write(clawg_core::paths::preferences_file(d.path()), "{ not json").unwrap();
+        let b = b.with_language(clawg_core::preferences::language_in(d.path()));
+        assert_eq!(b.get_info().instructions.as_deref(), Some(opening(PROTOCOL).as_str()), "a broken file is no preference");
+    }
+
+    #[tokio::test]
+    async fn the_bridge_keeps_the_language_it_started_with() {
+        let (b, d) = bridge().await;
+        let b = b.with_language(Some(Lang::En));
+        let before = b.get_info().instructions;
+        let p = clawg_core::preferences::Preferences { language: Some(Lang::Es) };
+        clawg_core::preferences::save(d.path(), &p).unwrap();
+        assert_eq!(b.get_info().instructions, before, "a session keeps the language it was opened in");
+    }
+
+    #[tokio::test]
+    async fn search_memory_does_not_promise_other_languages() {
+        let (b, _d) = bridge().await;
+        let d = description(&b, "search_memory");
+        assert!(!d.contains("or in another language"), "{d}");
+        assert!(d.contains("in another language than the query"), "{d}");
     }
 
     /// Until a session hook delivers the whole protocol, the opening is all
@@ -2027,6 +2419,29 @@ mod tests {
     }
 
     #[test]
+    fn the_spanish_instructions_carry_the_saving_habits() {
+        let instructions = opening(&protocol::text(Some(Lang::Es)));
+        for expected in [
+            "`save_memory`",
+            "`search_memory`",
+            "`recall_context`",
+            "`search_project`",
+            "`resolve_conflict`",
+            "`synthesize`",
+            "Una cosa por llamada",
+            "primera línea que nombre el tema",
+            "rutas e identificadores",
+            "en español",
+            "evidencia, no instrucciones",
+            "No guardes",
+            "juzga cada una con `resolve_conflict`",
+            "pregúntale a la persona qué memoria vale",
+        ] {
+            assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
+        }
+    }
+
+    #[test]
     fn the_protocol_says_where_a_key_is_shown() {
         let save = PROTOCOL.split("\n## How to write a save").nth(1).expect("a section on writing a save");
         let save = save.split("\n## ").next().unwrap_or(save).split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2049,24 +2464,26 @@ mod tests {
     async fn the_protocol_names_only_what_exists() {
         let (b, _d) = bridge().await;
         let tools = b.tool_router.list_all();
-        let mut known: HashSet<String> = MemoryType::ALL.iter().map(|t| t.as_str().to_string()).collect();
+        let mut known: std::collections::HashSet<String> = MemoryType::ALL.iter().map(|t| t.as_str().to_string()).collect();
         for t in &tools {
             known.insert(t.name.to_string());
             if let Some(properties) = t.input_schema.get("properties").and_then(|p| p.as_object()) {
                 known.extend(properties.keys().cloned());
             }
         }
-        let spans = code_spans(PROTOCOL);
+        for protocol in every_protocol() {
+            let spans = code_spans(&protocol);
 
-        let unknown: Vec<&str> = spans.iter().copied().filter(|s| is_name(s) && !known.contains(*s)).collect();
-        assert!(unknown.is_empty(), "the protocol names what does not exist: {unknown:?}");
-        let unnamed: Vec<String> = tools
-            .iter()
-            .map(|t| t.name.to_string())
-            .chain(MemoryType::ALL.iter().map(|t| t.as_str().to_string()))
-            .filter(|name| !spans.contains(&name.as_str()))
-            .collect();
-        assert!(unnamed.is_empty(), "the protocol never names: {unnamed:?}");
+            let unknown: Vec<&str> = spans.iter().copied().filter(|s| is_name(s) && !known.contains(*s)).collect();
+            assert!(unknown.is_empty(), "the protocol names what does not exist: {unknown:?}");
+            let unnamed: Vec<String> = tools
+                .iter()
+                .map(|t| t.name.to_string())
+                .chain(MemoryType::ALL.iter().map(|t| t.as_str().to_string()))
+                .filter(|name| !spans.contains(&name.as_str()))
+                .collect();
+            assert!(unnamed.is_empty(), "the protocol never names: {unnamed:?}");
+        }
     }
 
     #[tokio::test]
@@ -2098,9 +2515,10 @@ mod tests {
     }
 
     /// The memory viewer (`clawg memories`) is for the person at the terminal.
-    /// Handing a model its filters by agent and project, or its text search over
-    /// every row, would let it read across agents; so the tool a model sees keeps
-    /// exactly its five arguments, and no other tool takes the viewer's filters.
+    /// A model lists what its agent reaches, and may narrow it to one author,
+    /// but never by the viewer's project filter or its text search over every
+    /// row, which `search_memory` does by meaning; so the tool keeps exactly
+    /// these six arguments, and no other tool takes the viewer's filters.
     #[tokio::test]
     async fn the_viewer_is_not_exposed_to_the_model() {
         let (b, _d) = bridge().await;
@@ -2136,7 +2554,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         properties.sort();
-        assert_eq!(properties, ["kind", "limit", "memory_type", "offset", "tier"]);
+        assert_eq!(properties, ["agent", "kind", "limit", "memory_type", "offset", "tier"]);
     }
 
     /// The model has to pick `memory_type` from the set the store recognises;
@@ -2203,7 +2621,7 @@ mod tests {
 
         let listed = text(&b.synthesize_impl("agent-mcp", SynthesizeArgs::default()).await.expect("synthesize"));
         assert!(listed.contains(&format!("#{} ", ids[0])), "{listed}");
-        assert!(!listed.contains(&format!("#{foreign} ")), "another agent's memory is not this one's to review: {listed}");
+        assert!(listed.contains(&format!("#{foreign} ")), "another agent's memory of the project is reviewed too: {listed}");
         assert!(!text(&recall().await.expect("recall")).contains("`synthesize`"), "the review turns the reminder off");
 
         let conclusion = SaveMemoryArgs {
@@ -2429,6 +2847,97 @@ mod tests {
         );
     }
 
+    const CONTRACT_ES_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp/agent_contract.es.json");
+    const BLESS_ES: &str = "CLAWG_BLESS=1 cargo test -p clawg-cli the_spanish_agent_contract_matches_its_file";
+
+    /// What a session in Spanish reads, pinned as the English one is.
+    #[tokio::test]
+    async fn the_spanish_agent_contract_matches_its_file() {
+        let (b, _d) = bridge().await;
+        let actual = agent_contract(&b.with_language(Some(Lang::Es)));
+        if std::env::var_os("CLAWG_BLESS").is_some_and(|v| v == "1") {
+            std::fs::write(CONTRACT_ES_PATH, render_contract(&actual)).expect("write the contract file");
+            panic!("agent contract updated: review the diff of {CONTRACT_ES_PATH} and run the tests again");
+        }
+        let text = std::fs::read_to_string(CONTRACT_ES_PATH)
+            .unwrap_or_else(|e| panic!("read {CONTRACT_ES_PATH}: {e}; create it with {BLESS_ES}"));
+        let expected: serde_json::Value = serde_json::from_str(&text).expect("the contract file is JSON");
+        let diff = contract_diff(&expected, &actual);
+        assert!(
+            diff.is_empty(),
+            "what the model sees in Spanish changed:\n{}\nif that is intended, run {BLESS_ES} and review the diff",
+            diff.join("\n")
+        );
+    }
+
+    /// Every description a tool carries, by tool and argument.
+    fn descriptions(b: &ClawgMcp) -> BTreeMap<(String, Option<String>), String> {
+        let mut out = BTreeMap::new();
+        for t in b.tool_router.list_all() {
+            out.insert((t.name.to_string(), None), t.description.clone().unwrap_or_default().into_owned());
+            if let Some(properties) = t.input_schema.get("properties").and_then(|p| p.as_object()) {
+                for (name, property) in properties {
+                    let text = property.get("description").and_then(|d| d.as_str()).unwrap_or_default();
+                    out.insert((t.name.to_string(), Some(name.clone())), text.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn the_spanish_table_covers_every_tool_and_argument() {
+        let (b, _d) = bridge().await;
+        let english: Vec<_> = descriptions(&b).into_keys().collect();
+        let mut table: Vec<_> = crate::mcp::tools_es::DESCRIPTIONS
+            .iter()
+            .map(|(tool, arg, _)| (tool.to_string(), arg.map(str::to_string)))
+            .collect();
+        table.sort();
+        let len = table.len();
+        table.dedup();
+        assert_eq!(table.len(), len, "an entry is listed twice");
+        assert_eq!(table, english, "one entry per tool and per argument, and no other");
+    }
+
+    #[tokio::test]
+    async fn the_spanish_descriptions_name_what_the_english_ones_name() {
+        let (b, _d) = bridge().await;
+        let english = descriptions(&b);
+        let spanish = descriptions(&b.with_language(Some(Lang::Es)));
+        for (key, en) in &english {
+            let es = &spanish[key];
+            assert_ne!(es, en, "{key:?} is not translated");
+            let names = |text: &str| text.split('`').skip(1).step_by(2).map(str::to_string).collect::<BTreeSet<_>>();
+            assert_eq!(names(es), names(en), "{key:?} names other things in Spanish: {es}");
+        }
+    }
+
+    /// The model calls a tool by its names and types, which stay what the
+    /// daemon reads whatever the language.
+    #[tokio::test]
+    async fn only_descriptions_change_with_the_language() {
+        let (b, _d) = bridge().await;
+        let strip = |b: &ClawgMcp| -> Vec<serde_json::Value> {
+            b.tool_router
+                .list_all()
+                .into_iter()
+                .map(|t| {
+                    let mut tool = serde_json::to_value(&t).expect("a tool serializes");
+                    tool["description"] = serde_json::Value::Null;
+                    if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+                        for property in properties.values_mut() {
+                            property["description"] = serde_json::Value::Null;
+                        }
+                    }
+                    tool
+                })
+                .collect()
+        };
+        let english = strip(&b);
+        assert_eq!(strip(&b.with_language(Some(Lang::Es))), english);
+    }
+
     /// An explicit save with no type is stored as `semantic_fact`
     /// (`NewMemoryRecord::from_event_and_chunk`). A schema that names another
     /// default teaches the model to pass a type it did not mean.
@@ -2552,6 +3061,7 @@ mod tests {
 
         let listed = b
             .list_memories_impl("agent-mcp", ListMemoriesArgs {
+                agent: None,
                 kind: Some("memory".into()),
                 tier: None,
                 memory_type: None,
@@ -2663,18 +3173,18 @@ mod tests {
 
     #[test]
     fn a_masked_save_tells_the_agent_what_was_masked() {
-        let text = |r| ClawgMcp::save_outcome_text(r);
+        let text = |r| ClawgMcp::save_outcome_text(Lang::En, r);
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "inserted")],
-                redacted: vec!["slack_token".into()], related: vec![], replaced: vec![], key_dropped: false
+                redacted: vec!["slack_token".into()], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None
             })),
             Ok("saved #57; masked slack_token before storing it".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "reinforced")],
-                redacted: vec!["github_token".into(), "jwt".into()], related: vec![], replaced: vec![], key_dropped: false
+                redacted: vec!["github_token".into(), "jwt".into()], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None
             })),
             Ok("already stored as #57; reinforced it instead of saving a copy \
                 (update_memory changes its importance or type); \
@@ -2685,20 +3195,20 @@ mod tests {
 
     #[test]
     fn save_outcome_text_covers_every_daemon_answer() {
-        let text = |r| ClawgMcp::save_outcome_text(r);
+        let text = |r| ClawgMcp::save_outcome_text(Lang::En, r);
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "inserted")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None })),
             Ok("saved #57".to_string())
         );
         assert_eq!(
             text(Ok(SaveOutcome::Saved {
                 memories: vec![saved(57, "inserted"), saved(58, "inserted"), saved(59, "reinforced")],
-                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false
+                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None
             })),
             Ok("saved as 3 pieces: #57, #58, #59; read_memory with any of them returns the whole text".to_string())
         );
         assert_eq!(
-            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false })),
+            text(Ok(SaveOutcome::Saved { memories: vec![saved(57, "reinforced")], redacted: vec![], related: vec![], replaced: vec![], key_dropped: false, revision_candidate: None })),
             Ok("already stored as #57; reinforced it instead of saving a copy \
                 (update_memory changes its importance or type)"
                 .to_string())
@@ -2805,11 +3315,11 @@ mod tests {
 
     #[test]
     fn a_daemon_that_did_not_start_points_at_status() {
-        let t = ClawgMcp::explain(&ClientError::StartTimeout(std::time::Duration::from_secs(30)));
+        let t = ClawgMcp::explain(Lang::En, &ClientError::StartTimeout(std::time::Duration::from_secs(30)));
         assert!(t.contains("clawg status"), "{t}");
         assert!(!t.contains("clawg serve"), "{t}");
 
-        let t = ClawgMcp::explain(&ClientError::NotRunning);
+        let t = ClawgMcp::explain(Lang::En, &ClientError::NotRunning);
         assert!(t.contains("clawg serve"), "{t}");
     }
 
@@ -2820,12 +3330,12 @@ mod tests {
             "embedder_failed",
             ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![] },
         );
-        let t = ClawgMcp::explain(&failed);
+        let t = ClawgMcp::explain(Lang::En, &failed);
         assert!(!t.contains("in a minute"), "{t}");
         assert!(t.contains("connection refused"), "{t}");
 
         let loading = daemon_error(503, "embedder_not_ready", ErrorDetails::default());
-        assert!(ClawgMcp::explain(&loading).contains("loading"));
+        assert!(ClawgMcp::explain(Lang::En, &loading).contains("loading"));
     }
 
     #[tokio::test]
@@ -2873,6 +3383,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_spanish_session_answers_in_spanish() {
+        let (b, _d) = bridge().await;
+        let b = b.with_language(Some(Lang::Es));
+        let empty = b.save_memory_impl("agent-mcp", save_args("  ")).await.expect("save");
+        assert_eq!(text(&empty), "content no puede estar vacío");
+        let saved = text(&b.save_memory_impl("agent-mcp", save_args("La rama se corta los jueves.")).await.expect("save"));
+        assert!(saved.starts_with("se guardó #"), "{saved}");
+        let listed = text(&b.list_memories_impl("agent-mcp", list_all()).await.expect("list"));
+        assert!(listed.contains(" semantic_fact t") && listed.contains("La rama se corta los jueves."), "{listed}");
+        let status = text(&b.memory_status_impl(b.agent_for(None)).await.expect("status"));
+        assert!(status.contains("\nperfil: dev\n") && status.contains("compartido: lee y cambia"), "{status}");
+        let moved = UpdateMemoryArgs {
+            kind: "memory".into(),
+            id: 1,
+            importance: None,
+            memory_type: None,
+            to_project_path: Some("/a".into()),
+            clear_project: true,
+            user_answered: false,
+        };
+        assert_eq!(text(&b.update_memory_impl("agent-mcp", moved).await.expect("update")), "pasa to_project_path o clear_project, no los dos");
+    }
+
+    #[tokio::test]
+    async fn search_memory_sends_the_bridges_language() {
+        let (b, _d) = bridge().await;
+        saved_id(&b, "agent-mcp", "The release branch is cut on thursdays, and it is tagged by the release script.").await;
+        let query = "¿Qué día se corta la rama de la versión?";
+        let plain = text(&b.search_memory_impl("agent-mcp", search_args(query)).await.expect("search"));
+        assert!(!plain.contains("still in"), "without a language the answer is as before: {plain}");
+
+        let b = b.with_language(Some(Lang::Es));
+        let r = b.search_memory_impl("agent-mcp", search_args(query)).await.expect("search");
+        assert!(text(&r).ends_with("busca de nuevo con la consulta en inglés."), "{}", text(&r));
+        let r = b.recall_context_impl("agent-mcp", RecallContextArgs { query: query.into(), project_path: None, budget: None }).await;
+        assert!(text(&r.expect("context")).contains("1 memoria de este ámbito sigue en inglés"));
+    }
+
+    #[tokio::test]
+    async fn memory_status_names_the_language_of_the_session() {
+        let (b, d) = bridge().await;
+        let status = |b: &ClawgMcp| {
+            let b = b.clone();
+            async move { text(&b.memory_status_impl(b.agent_for(None)).await.expect("status")) }
+        };
+        assert!(!status(&b).await.contains("language:"), "nothing without a preference");
+        let b = b.with_language(Some(Lang::Es));
+        assert!(status(&b).await.contains("idioma: español en esta sesión; preferences.json ahora no fija ninguno"));
+        clawg_core::preferences::save(d.path(), &clawg_core::preferences::Preferences { language: Some(Lang::Es) }).unwrap();
+        assert!(status(&b).await.contains("idioma: español (preferences.json)"));
+    }
+
+    #[tokio::test]
     async fn memory_status_reports_the_daemon_and_the_profile() {
         let (b, _d) = bridge().await;
         let r = b.memory_status_impl(b.agent_for(None)).await.expect("status");
@@ -2912,7 +3475,8 @@ mod tests {
         let t = status("agent-mcp").await;
         assert!(t.contains("conflict candidates: 1 for you to judge, 0 waiting for the user"), "{t}");
         assert!(t.contains(&format!("#{new} inferred close to #{old} inferred")), "two undeclared saves: {t}");
-        assert!(status("agent-other").await.ends_with("\nconflict candidates: none open"));
+        let other = status("agent-other").await;
+        assert!(other.contains("conflict candidates: 1 for you to judge"), "another agent judges it too: {other}");
     }
 
     #[tokio::test]
@@ -2990,12 +3554,13 @@ mod tests {
     #[test]
     fn save_outcome_text_names_related_memories() {
         let related = |id, escalated| RelatedMemory { id, escalated, excerpt: format!("claim {id}") };
-        let text = ClawgMcp::save_outcome_text(Ok(SaveOutcome::Saved {
+        let text = ClawgMcp::save_outcome_text(Lang::En, Ok(SaveOutcome::Saved {
             memories: vec![saved(57, "inserted")],
             redacted: vec![],
             related: vec![related(12, false), related(15, true)],
             replaced: vec![],
             key_dropped: false,
+            revision_candidate: None,
         }));
         assert_eq!(
             text,
@@ -3007,14 +3572,35 @@ mod tests {
     }
 
     #[test]
+    fn an_unkeyed_save_close_to_its_own_row_is_told_to_take_a_key() {
+        let text = ClawgMcp::save_outcome_text(Lang::En, Ok(SaveOutcome::Saved {
+            memories: vec![saved(57, "inserted")],
+            redacted: vec![],
+            related: vec![RelatedMemory { id: 412, escalated: false, excerpt: "Build tool".into() }],
+            replaced: vec![],
+            key_dropped: false,
+            revision_candidate: Some(412),
+        }))
+        .expect("a success");
+        let (first, warning) = text.rsplit_once('\n').expect("the warning has a line of its own");
+        assert!(first.starts_with("saved #57\nclose to earlier memories: #412 \"Build tool\""), "{text}");
+        assert_eq!(
+            warning,
+            "this save has no topic_key: if it revises #412, save it again under a topic_key naming their \
+             subject, so the next revision replaces it"
+        );
+    }
+
+    #[test]
     fn save_outcome_text_names_the_replaced_memories() {
         let replaced = |id| ReplacedMemory { id, excerpt: format!("claim {id}") };
-        let text = ClawgMcp::save_outcome_text(Ok(SaveOutcome::Saved {
+        let text = ClawgMcp::save_outcome_text(Lang::En, Ok(SaveOutcome::Saved {
             memories: vec![saved(57, "inserted")],
             redacted: vec![],
             related: vec![],
             replaced: vec![replaced(12), replaced(13)],
             key_dropped: false,
+            revision_candidate: None,
         }));
         assert_eq!(text, Ok("saved #57; replaces #12 \"claim 12\", #13 \"claim 13\"".to_string()));
     }
@@ -3111,7 +3697,7 @@ mod tests {
         let again = b.save_memory_impl("a", preference("Indent with two spaces", None)).await.unwrap();
         assert!(!text(&again).contains("replaces"), "{}", text(&again));
         assert_eq!(rows_in(&b, &other.id).await, 1);
-        assert_eq!(rows_in(&b, "proj-test").await, 1);
+        assert_eq!(rows_in(&b, &test_project().id).await, 1);
     }
 
     #[tokio::test]
@@ -3204,29 +3790,37 @@ mod tests {
     }
 
     fn list_all() -> ListMemoriesArgs {
-        ListMemoriesArgs { kind: None, tier: None, memory_type: None, limit: None, offset: None }
+        ListMemoriesArgs { agent: None, kind: None, tier: None, memory_type: None, limit: None, offset: None }
+    }
+
+    /// Takes every exclusion away.
+    fn share_all(dir: &tempfile::TempDir) {
+        sharing::save(dir.path(), &sharing::SharingPolicy::default()).expect("save policy");
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_delete_another_agents_memory() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_deletes_a_memory_unless_hidden() {
+        let (b, d) = bridge().await;
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
 
+        hide(&d, "agent-b", "agent-a");
         let r = b
             .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
             .await
             .expect("call");
-        assert!(is_error(&r), "another agent's memory must not be deletable: {}", text(&r));
-
+        assert!(is_error(&r), "a hidden author's memory must not be deletable: {}", text(&r));
         let listed = b.list_memories_impl("agent-a", list_all()).await.expect("list");
         assert!(text(&listed).contains(content), "the row must survive: {}", text(&listed));
 
+        share_all(&d);
         let r = b
-            .delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
             .await
             .expect("call");
-        assert!(!is_error(&r), "the owner deletes it: {}", text(&r));
+        assert!(!is_error(&r), "another agent deletes what it reaches: {}", text(&r));
+        let listed = b.list_memories_impl("agent-a", list_all()).await.expect("list");
+        assert!(!text(&listed).contains(content), "and its author sees it gone: {}", text(&listed));
     }
 
     fn restore_args(id: i64) -> RestoreMemoryArgs {
@@ -3254,18 +3848,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_restore_another_agents_memory() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_restores_a_memory_unless_hidden() {
+        let (b, d) = bridge().await;
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
         b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
 
+        hide(&d, "agent-b", "agent-a");
         let r = b.restore_memory_impl("agent-b", restore_args(id)).await.expect("call");
-
-        assert!(is_error(&r), "another agent's memory must not be restorable: {}", text(&r));
+        assert!(is_error(&r), "a hidden author's memory must not be restorable: {}", text(&r));
         assert!(!text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
-        let r = b.restore_memory_impl("agent-a", restore_args(id)).await.expect("call");
-        assert!(!is_error(&r), "the owner restores it: {}", text(&r));
+
+        share_all(&d);
+        let r = b.restore_memory_impl("agent-b", restore_args(id)).await.expect("call");
+        assert!(!is_error(&r), "another agent restores what it reaches: {}", text(&r));
+        assert!(text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
     }
 
     #[tokio::test]
@@ -3302,39 +3899,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_read_another_agents_save() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_reads_a_save_unless_hidden() {
+        let (b, d) = bridge().await;
         let id = saved_id(&b, "agent-a", "agent a keeps its release notes in the wiki").await;
 
         let other = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
-        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
+        assert_eq!(text(&other), format!("#{id}\nagent a keeps its release notes in the wiki"));
 
-        assert!(is_error(&other), "another agent's save must not be readable: {}", text(&other));
-        assert_eq!(text(&other).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
-        let own = b.read_memory_impl("agent-a", read_args(id)).await.expect("call");
-        assert_eq!(text(&own), format!("#{id}\nagent a keeps its release notes in the wiki"));
+        hide(&d, "agent-b", "agent-a");
+        let hidden = b.read_memory_impl("agent-b", read_args(id)).await.expect("call");
+        let missing = b.read_memory_impl("agent-b", read_args(999_999)).await.expect("call");
+        assert!(is_error(&hidden), "a hidden author's save must not be readable: {}", text(&hidden));
+        assert_eq!(text(&hidden).replace(&id.to_string(), "N"), text(&missing).replace("999999", "N"));
     }
 
     #[test]
     fn a_daemon_without_the_restore_route_is_named_as_such() {
         let old = daemon_error(404, "404 Not Found", ErrorDetails::default());
-        let text = ClawgMcp::route_failure_text(&old, "restore a memory");
+        let text = ClawgMcp::route_failure_text(Lang::En, &old, Route::RestoreMemory);
         assert!(text.contains("cannot restore a memory") && text.contains("restart"), "{text}");
         let missing = daemon_error(404, "no Memory row with id 7", ErrorDetails::default());
-        assert_eq!(ClawgMcp::route_failure_text(&missing, "restore a memory"), ClawgMcp::explain(&missing));
+        assert_eq!(ClawgMcp::route_failure_text(Lang::En, &missing, Route::RestoreMemory), ClawgMcp::explain(Lang::En, &missing));
     }
 
     #[test]
     fn a_daemon_without_the_save_route_is_named_as_such() {
         let old = daemon_error(404, "404 Not Found", ErrorDetails::default());
-        let text = ClawgMcp::route_failure_text(&old, "read a save");
+        let text = ClawgMcp::route_failure_text(Lang::En, &old, Route::ReadSave);
         assert!(text.contains("cannot read a save") && text.contains("restart"), "{text}");
         let missing = daemon_error(404, "no Memory row with id 7", ErrorDetails::default());
-        assert_eq!(ClawgMcp::route_failure_text(&missing, "read a save"), ClawgMcp::explain(&missing));
+        assert_eq!(ClawgMcp::route_failure_text(Lang::En, &missing, Route::ReadSave), ClawgMcp::explain(Lang::En, &missing));
     }
 
     fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {
-        UpdateMemoryArgs { id, kind: "memory".into(), importance, memory_type: memory_type.map(Into::into), user_answered: false }
+        UpdateMemoryArgs {
+            id,
+            kind: "memory".into(),
+            importance,
+            memory_type: memory_type.map(Into::into),
+            to_project_path: None,
+            clear_project: false,
+            user_answered: false,
+        }
+    }
+
+    async fn project_of(b: &ClawgMcp, id: i64) -> Option<String> {
+        let client = b.client.get().await.expect("daemon");
+        client.get("memory", id).await.expect("get").project_id
+    }
+
+    #[tokio::test]
+    async fn update_memory_moves_a_save_to_the_project_of_a_path() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the release job signs SHA256SUMS").await;
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let other = ProjectIdentity::resolve(repo.path());
+        let args = UpdateMemoryArgs { to_project_path: Some(repo.path().display().to_string()), ..update_args(id, None, None) };
+
+        let r = b.update_memory_impl("agent-a", args).await.expect("call");
+
+        assert!(!is_error(&r), "{}", text(&r));
+        assert!(text(&r).ends_with(&format!(", in project {}", other.id)), "{}", text(&r));
+        assert_eq!(project_of(&b, id).await, Some(other.id));
+    }
+
+    #[tokio::test]
+    async fn update_memory_clears_the_project() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the release job signs SHA256SUMS").await;
+        assert_eq!(project_of(&b, id).await.as_deref(), Some(test_project().id.as_str()));
+
+        let args = UpdateMemoryArgs { clear_project: true, ..update_args(id, None, None) };
+        let r = b.update_memory_impl("agent-a", args).await.expect("call");
+
+        assert!(!is_error(&r), "{}", text(&r));
+        assert!(text(&r).contains("in no project"), "{}", text(&r));
+        assert_eq!(project_of(&b, id).await, None);
+    }
+
+    #[tokio::test]
+    async fn update_memory_refuses_both_destinations_and_a_path_that_is_not_a_directory() {
+        let (b, _d) = bridge().await;
+        let id = saved_id(&b, "agent-a", "the release job signs SHA256SUMS").await;
+        let gone = tempfile::tempdir().expect("tempdir").path().join("gone");
+
+        for args in [
+            UpdateMemoryArgs { to_project_path: Some("/tmp".into()), clear_project: true, ..update_args(id, None, None) },
+            UpdateMemoryArgs { to_project_path: Some(gone.display().to_string()), ..update_args(id, None, None) },
+        ] {
+            let r = b.update_memory_impl("agent-a", args).await.expect("call");
+            assert!(is_error(&r), "{}", text(&r));
+        }
+        assert_eq!(project_of(&b, id).await.as_deref(), Some(test_project().id.as_str()));
     }
 
     #[tokio::test]
@@ -3407,33 +4064,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_update_another_agents_memory() {
-        let (b, _d) = bridge().await;
+    async fn another_agent_updates_a_memory_unless_hidden() {
+        let (b, d) = bridge().await;
         let id = saved_id(&b, "agent-a", "agent a reviews pull requests on mondays").await;
 
+        hide(&d, "agent-b", "agent-a");
         let r = b.update_memory_impl("agent-b", update_args(id, Some(9.5), None)).await.expect("call");
-
-        assert!(is_error(&r), "another agent's memory must not change: {}", text(&r));
+        assert!(is_error(&r), "a hidden author's memory must not change: {}", text(&r));
         let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
         assert!(listed.contains("imp=5.0"), "the row must stay as it was: {listed}");
+
+        share_all(&d);
+        let r = b.update_memory_impl("agent-b", update_args(id, Some(9.5), None)).await.expect("call");
+        assert!(!is_error(&r), "another agent changes what it reaches: {}", text(&r));
+        let listed = text(&b.list_memories_impl("agent-a", list_all()).await.expect("list"));
+        assert!(listed.contains("imp=9.5"), "and its author sees the change: {listed}");
     }
 
     #[tokio::test]
-    async fn an_agent_lists_only_its_own_memories() {
-        let (b, _d) = bridge().await;
-        saved_id(&b, "agent-a", "agent a prefers tabs over spaces").await;
-        saved_id(&b, "agent-b", "agent b prefers spaces over tabs").await;
+    async fn list_memories_names_other_authors_and_filters_by_agent() {
+        let (b, d) = bridge().await;
+        let a = saved_id(&b, "agent-a", "agent a prefers tabs over spaces").await;
+        let own = saved_id(&b, "agent-b", "agent b prefers spaces over tabs").await;
 
         let listed = text(&b.list_memories_impl("agent-b", list_all()).await.expect("list"));
+        let line = |id: i64| listed.lines().find(|l| l.starts_with(&format!("#{id} "))).unwrap_or_default().to_string();
+        assert!(line(a).contains(" by agent-a ") && line(a).contains("agent a prefers"), "{listed}");
+        assert!(!line(own).contains(" by "), "the agent's own rows name nobody: {listed}");
 
-        assert!(listed.contains("agent b prefers"), "{listed}");
-        assert!(!listed.contains("agent a prefers"), "another agent's memory leaked: {listed}");
+        let only_a = ListMemoriesArgs { agent: Some("agent-a".into()), ..list_all() };
+        let listed = text(&b.list_memories_impl("agent-b", only_a).await.expect("list"));
+        assert!(listed.contains("agent a prefers") && !listed.contains("agent b prefers"), "{listed}");
+
+        hide(&d, "agent-b", "agent-a");
+        let listed = text(&b.list_memories_impl("agent-b", list_all()).await.expect("list"));
+        assert!(!listed.contains("agent a prefers"), "a hidden author is not listed: {listed}");
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_resolve_another_agents_conflict() {
+    async fn another_agent_resolves_a_conflict_unless_hidden() {
         let mut store = None;
-        let (b, _d) = bridge_with(|runtime| {
+        let (b, d) = bridge_with(|runtime| {
             store = Some(runtime.store.clone());
             runtime
         })
@@ -3452,20 +4123,26 @@ mod tests {
             .await
             .expect("mark the dispute");
 
-        let r = b
-            .resolve_conflict_impl("agent-b", ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false })
-            .await
-            .expect("call");
+        let verdict = || ResolveConflictArgs { keep: new, other: old, verdict: "supersedes".into(), reason: None, user_answered: false };
+        let statuses = || async {
+            let client = b.client.get().await.expect("daemon");
+            let mut rows = client
+                .list(ListArgs { kind: Some("memory".into()), ..Default::default() })
+                .await
+                .expect("list");
+            rows.sort_by_key(|r| r.id);
+            rows.into_iter().map(|r| r.status).collect::<Vec<_>>()
+        };
 
-        assert!(is_error(&r), "another agent's conflict must not be resolvable: {}", text(&r));
-        let client = b.client.get().await.expect("daemon");
-        let mut rows = client
-            .list(ListArgs { kind: Some("memory".into()), ..Default::default() })
-            .await
-            .expect("list");
-        rows.sort_by_key(|r| r.id);
-        let statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
-        assert_eq!(statuses, ["active", "disputed"], "a refused resolution changes nothing");
+        hide(&d, "agent-b", "agent-a");
+        let r = b.resolve_conflict_impl("agent-b", verdict()).await.expect("call");
+        assert!(is_error(&r), "a hidden author's conflict must not be resolvable: {}", text(&r));
+        assert_eq!(statuses().await, ["active", "disputed"], "a refused resolution changes nothing");
+
+        share_all(&d);
+        let r = b.resolve_conflict_impl("agent-b", verdict()).await.expect("call");
+        assert!(!is_error(&r), "another agent judges a pair it reaches: {}", text(&r));
+        assert_eq!(statuses().await, ["superseded", "active"]);
     }
 
     // ── project scoping ─────────────────────────────────────────────────────
@@ -3627,30 +4304,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shared_memory_is_read_only() {
+    async fn a_shared_memory_is_changed_by_the_agent_that_found_it() {
         let (b, _d) = bridge().await;
         let content = "claude-code keeps the incident runbook in docs/runbook.md";
         let id = saved_id(&b, "claude-code", content).await;
         assert!(text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
 
-        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
-        assert!(is_error(&r), "a shared memory must not be deletable by its reader: {}", text(&r));
         let r = b.update_memory_impl("cursor", update_args(id, Some(9.5), None)).await.expect("call");
-        assert!(is_error(&r), "nor changed: {}", text(&r));
-
+        assert!(!is_error(&r), "the agent that found it changes it: {}", text(&r));
         let listed = text(&b.list_memories_impl("claude-code", list_all()).await.expect("list"));
-        assert!(listed.contains("imp=5.0") && listed.contains(&format!("#{id} ")), "the row stays as it was: {listed}");
-        assert!(!text(&b.list_memories_impl("cursor", list_all()).await.expect("list")).contains(content), "and is not listed as cursor's");
+        assert!(listed.contains("imp=9.5") && listed.contains(&format!("#{id} ")), "its author sees the change: {listed}");
+
+        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        assert!(!is_error(&r), "and deletes it: {}", text(&r));
+        assert!(!text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
     }
 
     #[tokio::test]
-    async fn tool_descriptions_say_shared_memories_are_read_only() {
+    async fn tool_descriptions_say_shared_memories_can_be_changed() {
         let (b, _d) = bridge().await;
-        for name in ["delete_memory", "update_memory", "resolve_conflict", "restore_memory"] {
-            let tool = b.tool_router.list_all().into_iter().find(|t| t.name == name).expect(name);
-            let description = tool.description.as_deref().unwrap_or_default();
-            assert!(description.contains("Only your own memories") && description.contains("read-only"), "{name}: {description}");
+        for name in ["delete_memory", "update_memory", "resolve_conflict", "restore_memory", "read_memory", "list_memories"] {
+            let description = description(&b, name);
+            assert!(!description.contains("Only your own") && !description.contains("read-only"), "{name}: {description}");
         }
+        assert!(description(&b, "list_memories").contains("`by <agent>`"));
     }
 
     #[tokio::test]
@@ -3660,12 +4337,12 @@ mod tests {
             let b = &b;
             async move { text(&b.memory_status_impl((agent.to_string(), AgentSource::Flag)).await.expect("status")) }
         };
-        assert!(status("cursor").await.contains("shared: reads every agent\n"));
+        assert!(status("cursor").await.contains("shared: reads and changes every agent's memories\n"));
         hide(&d, "cursor", "claude-code");
         hide(&d, "cursor", "codex");
-        assert!(status("cursor").await.contains("shared: reads every agent but claude-code, codex\n"));
+        assert!(status("cursor").await.contains("shared: reads and changes every agent's memories but claude-code's, codex's\n"));
         hide(&d, "cursor", "*");
-        assert!(status("cursor").await.contains("shared: none (reads no other agent)\n"));
+        assert!(status("cursor").await.contains("shared: none (reads and changes no other agent's memories)\n"));
         std::fs::write(clawg_core::paths::sharing_file(d.path()), "{").unwrap();
         let t = status("cursor").await;
         assert!(t.contains("shared: none (sharing.json is not valid"), "{t}");
@@ -3781,6 +4458,7 @@ mod tests {
                 shutdown,
                 save_timeout: SAVE_CONFIRM_TIMEOUT,
                 sessions: Default::default(),
+                metrics: Default::default(),
             });
             Self::serve(data_dir, token, wrap(router(ctx))).await.with_store(store)
         }

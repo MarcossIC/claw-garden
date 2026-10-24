@@ -10,14 +10,15 @@ use crate::client::{ClientError, DaemonClient};
 use crate::process::{Exit, Watched};
 
 /// How long `clawg stop` waits for the daemon to end. A shutdown goes through
-/// four phases, each with its own bound: the requests in flight
-/// ([`crate::daemon::serve::HTTP_GRACE`]), the drain of what is still queued
+/// five phases, each with its own bound: the requests in flight
+/// ([`crate::daemon::serve::HTTP_GRACE`]), the last minute of metrics
+/// ([`crate::daemon::serve::METRICS_CLOSE`]), the drain of what is still queued
 /// ([`clawg_core::runtime::DRAIN_DEADLINE`], leaving the rest in the outbox),
 /// the save in flight, the access flush and the checkpoint
 /// ([`clawg_core::runtime::AFTER_DRAIN`]), and the blocking tasks the process
 /// waits for before it exits ([`crate::daemon::serve::RUNTIME_TEARDOWN`]).
 /// With an idle daemon that is well under a second; this bound has to cover
-/// all four with room to spare, so the installer never replaces the binary
+/// all five with room to spare, so the installer never replaces the binary
 /// while the daemon is still writing.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -64,10 +65,10 @@ mod tests {
 
     #[test]
     fn every_phase_of_a_shutdown_fits_inside_the_stop_timeout() {
-        use crate::daemon::serve::{HTTP_GRACE, RUNTIME_TEARDOWN};
+        use crate::daemon::serve::{HTTP_GRACE, METRICS_CLOSE, RUNTIME_TEARDOWN};
         use clawg_core::runtime::{AFTER_DRAIN, DRAIN_DEADLINE};
 
-        let phases = HTTP_GRACE + DRAIN_DEADLINE + AFTER_DRAIN + RUNTIME_TEARDOWN;
+        let phases = HTTP_GRACE + METRICS_CLOSE + DRAIN_DEADLINE + AFTER_DRAIN + RUNTIME_TEARDOWN;
         assert!(
             phases + SLACK <= STOP_TIMEOUT,
             "a shutdown that uses every phase ({phases:?}) must end before `clawg stop` gives up on the process"
@@ -122,6 +123,7 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            metrics: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();

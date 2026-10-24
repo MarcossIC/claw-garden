@@ -15,14 +15,19 @@ use clawg_core::build_info::{self, DefaultPort, ServeFault};
 use clawg_core::memory::bootstrap::{
     run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, EmbedderDeps, LogSink,
 };
+use clawg_core::memory::embedder::E5_MODEL_ID;
 use clawg_core::memory::idle_embedder::{idle_after, DEFAULT_IDLE, IDLE_MINUTES_VAR};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
+use clawg_core::metrics::store::RunInfo;
+use clawg_core::metrics::Recorder;
 use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
 use clawg_core::private_dir::ensure_private_dir;
 use clawg_core::runtime::{MemoryRuntime, Workers};
 
-use super::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
+use super::api::{router_on, AppCtx, SAVE_CONFIRM_TIMEOUT};
+use super::metrics::{metrics_path, Transport, Writer, WriterTask, METRICS_VAR};
+use super::process::utc_offset_s;
 use super::socket::{bind_socket, serves_without_socket, Listener, SocketError};
 use super::lifecycle::{
     clear_state, generate_token, now_ms, write_state, write_token, DaemonState, LifecycleError,
@@ -76,6 +81,12 @@ pub const HTTP_GRACE: Duration = Duration::from_secs(3);
 /// them. Another of the phases `clawg stop`'s timeout covers.
 pub const RUNTIME_TEARDOWN: Duration = Duration::from_secs(2);
 
+/// How long the metrics writer may take to write the last minute and the end
+/// of the run once the servers stopped. Past it the run is left without an
+/// end, as a kill leaves it. Another of the phases `clawg stop`'s timeout
+/// covers.
+pub const METRICS_CLOSE: Duration = Duration::from_secs(1);
+
 /// Splits "someone else has the store" from every other reason opening it can
 /// fail; see [`ServeError::StoreInUse`].
 fn classify_open_error(err: MemoryError) -> ServeError {
@@ -92,6 +103,9 @@ fn classify_open_error(err: MemoryError) -> ServeError {
 /// port, and the real one is what gets published in `daemon.json`, so clients
 /// always dial where the listener actually is.
 pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> {
+    // First, before anything can fail: `serve.log` outlives binaries, since
+    // `update` starts the new one on the same file.
+    log::info!("{}", starting_line(profile, build_info::version(), build_info::dist_target()));
     let base_dir = data_dir(profile)?;
     ensure_private_dir(&base_dir).map_err(|source| ServeError::DataDir {
         path: base_dir.display().to_string(),
@@ -190,6 +204,21 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         },
     )?;
 
+    let metrics = Arc::new(Recorder::default());
+    let writer = {
+        let path = metrics_path(&base_dir, std::env::var(METRICS_VAR).ok().as_deref());
+        let run = run_info(profile, idle);
+        let (metrics, path) = (metrics.clone(), path.clone());
+        tokio::task::spawn_blocking(move || Writer::start(path.as_deref(), metrics, &run, now_ms() as i64))
+            .await
+            .map_err(|e| ServeError::Server(std::io::Error::other(e)))?
+    };
+    let resident = {
+        let embedder = runtime.embedder.clone();
+        move || embedder.get().map(|e| e.resident())
+    };
+    let writer = WriterTask::spawn(writer, resident);
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let ctx = Arc::new(AppCtx {
         runtime,
@@ -199,6 +228,7 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         shutdown: shutdown_tx,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
+        metrics,
     });
 
     log::info!(
@@ -215,9 +245,8 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         shutdown_signal(shutdown_rx).await;
         let _ = stopping_tx.send(true);
     });
-    let app = router(ctx.clone());
     let tcp_server = {
-        let (app, stopping) = (app.clone(), stopping.clone());
+        let (app, stopping) = (router_on(ctx.clone(), Transport::Tcp), stopping.clone());
         async move {
             match tcp {
                 Some((listener, _)) => axum::serve(listener, app).with_graceful_shutdown(stopped(stopping)).await,
@@ -226,7 +255,7 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         }
     };
     let socket_server = {
-        let (app, stopping) = (app, stopping.clone());
+        let (app, stopping) = (router_on(ctx.clone(), Transport::Unix), stopping.clone());
         async move {
             match socket {
                 Some(listener) => axum::serve(listener, app).with_graceful_shutdown(stopped(stopping)).await,
@@ -246,9 +275,17 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         }
     };
 
+    // No request comes in any more, so the last minute is complete.
+    writer.close(METRICS_CLOSE).await;
+
     // No request can queue a save any more, so whatever is queued now is all
     // there is to drain or spill.
-    ctx.runtime.shutdown(workers).await;
+    // After a shutdown that finished nothing else uses the connection, so the
+    // close runs at once; after one its bound cut, a call may still hold the
+    // connection, and the close would wait behind it past every bound.
+    if ctx.runtime.shutdown(workers).await {
+        ctx.runtime.close().await;
+    }
 
     // Always, on every exit path: a stale `daemon.json` sends the next client
     // to a port nothing is listening on, and the failure looks like a hang.
@@ -256,6 +293,22 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
     log::info!("clawg serve {} stopped", profile.as_str());
 
     result.map_err(ServeError::Server)
+}
+
+/// What this run records about itself in `metrics.db`.
+fn run_info(profile: Profile, idle: Option<Duration>) -> RunInfo {
+    RunInfo {
+        started_at_ms: now_ms() as i64,
+        version: build_info::version().to_string(),
+        dist_target: build_info::dist_target().map(str::to_string),
+        profile: profile.as_str().to_string(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        cpus: std::thread::available_parallelism().map_or(1, |n| n.get() as i64),
+        embedding_model: E5_MODEL_ID.to_string(),
+        idle_minutes: Some(idle.map_or(0, |d| (d.as_secs() / 60) as i64)),
+        utc_offset_s: utc_offset_s(),
+    }
 }
 
 /// How the daemon listens on loopback TCP.
@@ -313,6 +366,13 @@ fn bind_profile_socket(base_dir: &std::path::Path, explicit_port: bool) -> Resul
             Ok(None)
         }
         Err(e) => Err(ServeError::Socket(e)),
+    }
+}
+
+fn starting_line(profile: Profile, version: &str, dist_target: Option<&str>) -> String {
+    match dist_target {
+        Some(target) => format!("clawg serve {version} ({target}) starting, profile {}", profile.as_str()),
+        None => format!("clawg serve {version} starting, profile {}", profile.as_str()),
     }
 }
 
@@ -445,6 +505,15 @@ mod tests {
     }
 
     #[test]
+    fn the_starting_line_names_the_version_and_the_build() {
+        assert_eq!(
+            starting_line(Profile::Dev, "0.50.0", Some("x86_64-unknown-linux-gnu")),
+            "clawg serve 0.50.0 (x86_64-unknown-linux-gnu) starting, profile dev"
+        );
+        assert_eq!(starting_line(Profile::Prod, "0.50.0", None), "clawg serve 0.50.0 starting, profile prod");
+    }
+
+    #[test]
     fn the_start_line_names_every_listener() {
         let socket = std::path::Path::new("/d/clawg.sock");
         assert_eq!(listening_on(Some(1), Some(socket)), "127.0.0.1:1 and /d/clawg.sock");
@@ -457,10 +526,34 @@ mod tests {
 
     /// A port a child inherits stays open after the daemon lets it go: it
     /// takes connections nobody answers, reset when the child exits, and keeps
-    /// the next daemon off the port.
+    /// the next daemon off the port, for as long as the child lives. The port
+    /// is one below every system's ephemeral range (32768 on Linux, 49152 on
+    /// Windows): one of those, freed, can go at once to another test's
+    /// `bind(0)` or outgoing connection.
     #[tokio::test]
     async fn a_child_started_while_the_port_is_bound_does_not_keep_it() {
-        let (listener, port) = bind_tcp(0).await.expect("bind");
+        // A test run with its stdin closed hands fd 0 to the first file or
+        // socket it opens, and every child any test spawns meanwhile with
+        // the stdin it inherits gets that one as its own: the listener must
+        // not be it.
+        #[cfg(unix)]
+        loop {
+            use std::os::fd::AsRawFd;
+            let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+            if null.as_raw_fd() > 2 {
+                break;
+            }
+            std::mem::forget(null);
+        }
+        let first = 20_000 + (std::process::id() % 10_000) as u16;
+        let mut bound = None;
+        for k in 0..10_000 {
+            if let Ok(b) = bind_tcp(20_000 + (first - 20_000 + k) % 10_000).await {
+                bound = Some(b);
+                break;
+            }
+        }
+        let (listener, port) = bound.expect("a free port between 20000 and 30000");
         let mut command = if cfg!(windows) {
             let mut c = std::process::Command::new("ping");
             c.args(["-n", "30", "127.0.0.1"]);
@@ -470,10 +563,20 @@ mod tests {
             c.arg("30");
             c
         };
-        let mut child = command.stdout(std::process::Stdio::null()).spawn().expect("spawn a long-lived process");
+        // Nor any stdio of this process, which may be another test's socket.
+        let null = std::process::Stdio::null;
+        let mut child = command.stdin(null()).stdout(null()).stderr(null()).spawn().expect("spawn a long-lived process");
         drop(listener);
 
-        let rebound = std::net::TcpListener::bind(("127.0.0.1", port));
+        // Another test's spawn forks with a copy of every descriptor until it
+        // execs, a few milliseconds: only a copy that outlives that is kept.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let rebound = loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Err(_) if std::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(20)).await,
+                bound => break bound,
+            }
+        };
         let _ = child.kill();
         let _ = child.wait();
         rebound.expect("the port is free once the daemon lets it go");

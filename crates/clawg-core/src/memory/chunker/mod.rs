@@ -7,6 +7,17 @@ pub use chat::{ChatChunker, SaveSplit};
 
 use std::borrow::Cow;
 
+/// A tokenizer with no vocabulary but `[UNK]`, over a whitespace
+/// pre-tokenizer, so each word is one token: what a test puts where the
+/// model's tokenizer goes, to split by tokens without the model.
+#[cfg(any(test, feature = "testing"))]
+pub fn word_tokenizer() -> std::sync::Arc<tokenizers::Tokenizer> {
+    let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,
+        "pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,
+        "model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}}"#;
+    std::sync::Arc::new(json.parse().expect("the word tokenizer parses"))
+}
+
 use crate::models::chat::Role;
 
 /// Upper bound on a chunk's token count. Stays under the embedder's 512-token
@@ -23,10 +34,10 @@ pub(crate) const CHUNK_OVERLAP_TOKENS: usize = 64;
 /// Leading tokens of a save that go into the embedder with each piece after
 /// the first. A piece cut from the middle of a long text loses whatever the
 /// text named at its start (the crate, the decision, the bug), and so does
-/// its vector; the head puts that topic back. 48 tokens is a sentence or two:
-/// enough to carry a subject line, small enough to leave most of the window
-/// to the piece's own text.
-pub(crate) const SAVE_HEAD_TOKENS: usize = 48;
+/// its vector; the head puts that topic back. 32 tokens is about a sentence:
+/// enough to carry a subject line, and in rag-eval no long save lost to 48,
+/// while 16 began to.
+pub(crate) const SAVE_HEAD_TOKENS: usize = 32;
 
 /// Room for the separator, and for the tokens a tokenizer can add where two
 /// texts are joined: token counts are not additive across the seam.

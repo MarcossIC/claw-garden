@@ -33,8 +33,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Only pull requests run the suite: a push to main merges one whose run tested
+  # the same content.
   test:
     name: test (${{ matrix.os }})
+    if: github.event_name == 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -53,11 +56,11 @@ jobs:
         with:
           toolchain: 1.99.1
           components: clippy
-      # Pull requests read the cache and only main writes it, so what a build
-      # script of a pull request leaves there never reaches a run on main.
+      # Pull requests only read the cache, which cache.yml writes from main, so
+      # what a build script of a pull request leaves there never reaches main.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
       # Compiler warnings are errors; clippy's own lints are not enforced yet.
       # --locked everywhere: a Cargo.lock that trails Cargo.toml fails here
       # instead of in release.yml, after the merge.
@@ -68,5 +71,15 @@ jobs:
       # What release.yml builds: --workspace turns on clawg-core's `testing` and
       # `eval`, and without --all-targets no dev-dependency, so neither, is in.
       - run: cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings
-      # The build_info tests of a build without `testing`.
+      # The build_info tests of a build without `testing`. build_info has no
+      # platform code, so Linux alone runs them.
       - run: cargo test --locked -p clawg-core --lib build_info
+        if: runner.os == 'Linux'
+
+  # release.yml waits for a successful CI run of the push to main, and a run
+  # whose jobs were all skipped is not one.
+  merged:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "The pull request this push merged ran the suite."

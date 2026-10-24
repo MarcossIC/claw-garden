@@ -234,6 +234,22 @@ mod tests {
     }
 
     #[test]
+    fn a_long_section_is_not_cut_inside_a_word() {
+        use crate::memory::chunker::token_splitter::tests::{assert_cut_at_word_boundaries, subword_tokenizer, subword_words};
+        let text = format!("# Long\n{}\n", subword_words(1600).join(" "));
+        let splitter = TokenSplitter::with_tokenizer(subword_tokenizer());
+
+        let passages = chunk_markdown("a.md", &text, &splitter);
+
+        assert!(passages.len() > 1, "got {}", passages.len());
+        let bodies: Vec<&str> = passages.iter().map(|p| p.body.as_str()).collect();
+        assert_cut_at_word_boundaries(&text, &bodies);
+        for p in &passages {
+            assert!(splitter.count(&p.indexed_text()) <= CHUNK_MAX_TOKENS, "{}", splitter.count(&p.indexed_text()));
+        }
+    }
+
+    #[test]
     fn a_long_breadcrumb_keeps_its_nearest_headings() {
         let deep = "título ".repeat(60);
         let text = format!("# {deep}\n## Cerca\nbody\n");

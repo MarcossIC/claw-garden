@@ -7,7 +7,7 @@ Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de 
 ## Definiciones
 
 - **Feature `testing`:** la feature de clawg-core que compila los sustitutos de prueba (`crates/clawg-core/Cargo.toml:25`).
-- **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:23`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:73`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
+- **Build de test:** un binario compilado con `testing`. Es el que cargo arma para los tests de integración de clawg-cli (`CARGO_BIN_EXE_clawg`, `crates/clawg-cli/tests/binary.rs:26`), porque clawg-cli enciende la feature en sus `[dev-dependencies]` (`crates/clawg-cli/Cargo.toml:73`). `cargo build --release` no compila las dev-dependencies, así que el binario que se entrega no la tiene. Efecto aceptado: después de un `cargo test`, `target/debug/clawg` es un build de test. Sólo lee las variables si están puestas, y como build debug ya está limitado al perfil dev.
 - **Home de prueba:** el valor no vacío de `CLAWG_TEST_HOME` (`TEST_HOME_VAR`, `crates/clawg-core/src/paths.rs:169`).
 - **Embedder de prueba:** el valor de `CLAWG_TEST_EMBEDDER` (`TEST_EMBEDDER_VAR`, `crates/clawg-core/src/memory/bootstrap.rs:313`), `fake`, `stalled` o `blocked` (`TestEmbedder`, `bootstrap.rs:318`).
 
@@ -29,7 +29,7 @@ Se reemplaza el home y no el directorio de datos para que el perfil siga eligien
 - WHEN corre `clawg status --profile prod`
 - THEN sale con 1, el error dice que un build debug no abre prod, y no existe `<home>/.clawg`
 
-**Tests:** `a_test_home_replaces_the_system_home` y `an_unset_or_empty_test_home_keeps_the_system_home` (`paths.rs`, mod tests); `a_debug_binary_refuses_prod_even_with_a_test_home` (`binary.rs:471`).
+**Tests:** `a_test_home_replaces_the_system_home` y `an_unset_or_empty_test_home_keeps_the_system_home` (`paths.rs`, mod tests); `a_debug_binary_refuses_prod_even_with_a_test_home` (`binary.rs:707`).
 
 ## El embedder de prueba
 
@@ -65,7 +65,7 @@ El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la
 
 ## El binario sobrevive a lo que sólo ve un proceso
 
-`crates/clawg-cli/tests/binary.rs` MUST lanzar el build de test como proceso hijo y probar los escenarios de abajo. Cada prueba MUST correr en su propio home de prueba (`Sandbox`, `binary.rs:32`), con `fake` salvo que el escenario pida otro y con `--port 0`. El puerto y el token se leen de `daemon.json` y `token` cuando `daemon.json` nombra el pid del hijo (`published`, `binary.rs:297`), así que las pruebas corren en paralelo sin chocar. Un puente MUST arrancar en una carpeta vacía propia (`Sandbox::bridge`, `binary.rs:102`), porque registra su raíz con `index_docs` y si no, indexaría lo que haya. Cada línea del stdout de un puente MUST ser un mensaje JSON-RPC: otra cosa falla la prueba con la línea a la vista (`Bridge::reply`, `binary.rs:310`).
+`crates/clawg-cli/tests/binary.rs` MUST lanzar el build de test como proceso hijo y probar los escenarios de abajo. Cada prueba MUST correr en su propio home de prueba (`Sandbox`, `binary.rs:35`), con `fake` salvo que el escenario pida otro y con `--port 0`. El puerto y el token se leen de `daemon.json` y `token` cuando `daemon.json` nombra el pid del hijo (`published`, `binary.rs:327`), así que las pruebas corren en paralelo sin chocar. Un puente MUST arrancar en una carpeta vacía propia (`Sandbox::bridge`, `binary.rs:120`), porque registra su raíz con `index_docs` y si no, indexaría lo que haya. Cada línea del stdout de un puente MUST ser un mensaje JSON-RPC: otra cosa falla la prueba con la línea a la vista (`Bridge::reply`, `binary.rs:350`).
 
 #### Escenario: kill duro
 - GIVEN un daemon con `stalled` que respondió `202` a un save
@@ -107,7 +107,7 @@ El test MUST fallar con `manifiesto:línea` de cada hallazgo. Reconocerlos es la
 - WHEN el daemon se detiene con `clawg stop` y arranca otro, con otro token
 - THEN la herramienta siguiente responde sin error
 
-**Tests:** `a_save_accepted_before_a_hard_kill_is_stored_after_the_restart` (`binary.rs:400`), `a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_first` (`binary.rs:430`), `status_and_stop_follow_the_daemon_process` (`binary.rs:446`), `a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store` (`binary.rs:482`), `a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemon` (`binary.rs:520`), `a_bridge_on_real_stdio_serves_a_host_that_never_initializes` (`binary.rs:544`) y `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`binary.rs:564`).
+**Tests:** `a_save_accepted_before_a_hard_kill_is_stored_after_the_restart` (`binary.rs:426`), `a_second_daemon_on_the_same_data_directory_is_refused_and_names_the_first` (`binary.rs:506`), `status_and_stop_follow_the_daemon_process` (`binary.rs:547`), `a_restored_backup_brings_back_its_rows_and_keeps_the_replaced_store` (`binary.rs:718`), `a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemon` (`binary.rs:991`), `a_bridge_on_real_stdio_serves_a_host_that_never_initializes` (`binary.rs:1015`) y `a_bridge_left_open_reaches_the_daemon_after_a_restart` (`binary.rs:1035`).
 
 Un daemon que la suite no lanza con `--port` (el que autoarranca un puente, el que arranca `update`, los de las pruebas del socket) MUST NOT tomar el puerto del perfil de la máquina: cada hijo lleva `CLAWG_TEST_DEFAULT_PORT=off` en Unix y en Windows (`socket_only`, `binary.rs`), que un build con `testing` lee en lugar del puerto del perfil (`off`, o un número que lo reemplaza; `build_info::default_port_override`), y ese daemon escucha sólo en el socket de su home. Así el autoarranque se prueba a través del binario en los dos sistemas.
 
@@ -120,7 +120,7 @@ Un daemon que la suite no lanza con `--port` (el que autoarranca un puente, el q
 
 ## Ningún hijo sobrevive a su prueba
 
-Cada proceso que lanza la suite MUST terminarse por su propio handle cuando su prueba termina, también si la prueba entra en pánico. `Daemon` y `Bridge` matan y esperan a su hijo al soltarse (`binary.rs:290` y `binary.rs:366`). Un hilo cosecha cada daemon apenas sale (`Daemon::watch`, `binary.rs:163`): en Unix, un hijo sin cosechar queda zombi, y `clawg stop`, que pregunta por el pid, esperaría hasta su tope.
+Cada proceso que lanza la suite MUST terminarse por su propio handle cuando su prueba termina, también si la prueba entra en pánico. `Daemon` y `Bridge` matan y esperan a su hijo al soltarse (`binary.rs:310` y `binary.rs:392`). Un hilo cosecha cada daemon apenas sale (`Daemon::watch`, `binary.rs:196`): en Unix, un hijo sin cosechar queda zombi, y `clawg stop`, que pregunta por el pid, esperaría hasta su tope.
 
 La suite MUST NOT terminar procesos por nombre: un `clawg` que corre el editor del usuario tiene que sobrevivirla.
 
@@ -128,16 +128,16 @@ La suite MUST NOT terminar procesos por nombre: un `clawg` que corre el editor d
 - GIVEN una prueba que entra en pánico con su daemon corriendo
 - THEN otro daemon puede tomar el mismo directorio de datos enseguida
 
-**Test:** `a_test_that_fails_midway_leaves_no_daemon_holding_the_store` (`binary.rs:583`). Que no se termine nada por nombre no tiene test: se cumple por construcción, porque el repo no tiene ningún `taskkill`, `pkill`, `killall` ni `Stop-Process`.
+**Test:** `a_test_that_fails_midway_leaves_no_daemon_holding_the_store` (`binary.rs:1408`). Que no se termine nada por nombre no tiene test: se cumple por construcción, porque el repo no tiene ningún `taskkill`, `pkill`, `killall` ni `Stop-Process`.
 
 ## CI
 
-La CI MUST correr en cada pull request y en cada push a `main` que cambie algún archivo fuera de `docs/**`, `openspec/**`, `.claude/**`, `.cursor/**`, `.gemini/**`, `scripts/**`, `README.md` y `AGENTS.md` (`.github/workflows/ci.yml:5-26`). Un push que sólo cambia esas rutas MUST NOT correr CI y, por lo tanto, MUST NOT disparar `release.yml` ([`specs/release`](../release/spec.md), R4). En `ubuntu-latest` y `windows-latest` (`ci.yml:41`) las dos plataformas MUST correr hasta el final aunque una falle (`fail-fast: false`, `ci.yml:39`), y cada una MUST correr, todos con `--locked`, así un `Cargo.lock` atrasado respecto de `Cargo.toml` la pone roja en vez de reescribirse (C1):
+La CI MUST correr en cada pull request y en cada push a `main` que cambie algún archivo fuera de `docs/**`, `openspec/**`, `.claude/**`, `.cursor/**`, `.gemini/**`, `scripts/**`, `README.md` y `AGENTS.md` (`.github/workflows/ci.yml:5-26`). Un push que sólo cambia esas rutas MUST NOT correr CI y, por lo tanto, MUST NOT disparar `release.yml` ([`specs/release`](../release/spec.md), R4). La suite MUST correr sólo en los pull requests (`ci.yml:40`): un push a `main` mergea un PR cuya corrida ya probó ese contenido, y MUST correr sólo `merged` (`ci.yml:81-85`), un job que no compila nada y termina en verde, porque `release.yml` espera una CI exitosa de ese push y una corrida con todos sus jobs salteados no lo es. En `ubuntu-latest` y `windows-latest` (`ci.yml:44`) las dos plataformas MUST correr hasta el final aunque una falle (`fail-fast: false`, `ci.yml:42`), y cada una MUST correr, todos con `--locked`, así un `Cargo.lock` atrasado respecto de `Cargo.toml` la pone roja en vez de reescribirse (C1):
 
-- `cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings` (`ci.yml:64`), que hace fallar los warnings del compilador;
-- `cargo test --locked --workspace` (`ci.yml:67`), con las pruebas del binario incluidas;
-- `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` (`ci.yml:70`): sin `--all-targets` no entran las dev-dependencies y, con ellas, tampoco `testing`; es lo que construye `release.yml`, mientras `--workspace` une `testing` y `eval`;
-- `cargo test --locked -p clawg-core --lib build_info` (`ci.yml:72`): las pruebas de `build_info` en su variante `cfg(not(feature = "testing"))`.
+- `cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings` (`ci.yml:67`), que hace fallar los warnings del compilador;
+- `cargo test --locked --workspace` (`ci.yml:70`), con las pruebas del binario incluidas;
+- `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` (`ci.yml:73`): sin `--all-targets` no entran las dev-dependencies y, con ellas, tampoco `testing`; es lo que construye `release.yml`, mientras `--workspace` une `testing` y `eval`;
+- `cargo test --locked -p clawg-core --lib build_info` (`ci.yml:76-77`), sólo en Linux porque `build_info` no tiene código por plataforma: las pruebas de `build_info` en su variante `cfg(not(feature = "testing"))`.
 
 El job no descarga el modelo: la suite usa `fake`. La CI es el único disparador de `release.yml`: un release MUST NOT publicarse sin una CI exitosa por push a `main`, y la CI MUST NOT leer secretos, usar un `environment`, pedir `id-token` ni escribir contenidos. Sólo `ci.yml` MUST llamarse `CI`: `release.yml` espera un workflow con ese nombre.
 
@@ -163,19 +163,19 @@ La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests d
 - WHEN GitHub evalúa los workflows
 - THEN no corre la CI ni `release.yml`
 
-**Pruebas:** `the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms`, `the_ci_workflow_checks_the_locked_production_build` y `only_the_ci_workflow_gates_the_release` (convenciones sobre los workflows, `crates/clawg-cli/tests/conventions.rs`); el comportamiento en GitHub, en el workflow, fuera de la suite.
+**Pruebas:** `the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms`, `the_ci_workflow_checks_the_locked_production_build`, `the_ci_workflow_runs_the_suite_only_for_pull_requests` y `only_the_ci_workflow_gates_the_release` (convenciones sobre los workflows, `crates/clawg-cli/tests/conventions.rs`); el comportamiento en GitHub, en el workflow, fuera de la suite.
 
 **Verificación:** el workflow quedó en verde en las dos plataformas en el PR #32, el que lo agrega, y la suite pasó en Linux y en Windows al archivar ([verify](../../changes/archive/2026-10-16-install-smoke/verify.md)). Los pasos de producción y `--locked`, en el PR de ci-hardening ([verify](../../changes/archive/2026-10-19-ci-hardening/verify.md)).
 
 ### Acciones fijadas y caché (C2)
 
-Toda acción de terceros de todo workflow MUST estar fijada por un SHA completo de commit, con la etiqueta o rama que representa en un comentario al final de la línea. Todo `actions/checkout` MUST llevar `persist-credentials: false`, así el `GITHUB_TOKEN` no queda en `.git/config` mientras corre el build. `Swatinem/rust-cache` MUST llevar `save-if: ${{ github.ref == 'refs/heads/main' }}` (`ci.yml:58-60`): un PR lee la caché y sólo un push a `main` la escribe, así lo que el `build.rs` de un PR deja ahí no llega a una corrida de `main`. Efecto aceptado: el primer PR después de un cambio de dependencias compila de cero.
+Toda acción de terceros de todo workflow MUST estar fijada por un SHA completo de commit, con la etiqueta o rama que representa en un comentario al final de la línea. Todo `actions/checkout` MUST llevar `persist-credentials: false`, así el `GITHUB_TOKEN` no queda en `.git/config` mientras corre el build. En `ci.yml`, `Swatinem/rust-cache` MUST llevar `save-if: false` (`ci.yml:61-63`): un PR sólo lee la caché, así lo que el `build.rs` de un PR deja ahí no llega a `main`. La escribe `.github/workflows/cache.yml` (`Cache`), con `save-if: ${{ github.ref == 'refs/heads/main' }}`: en Linux y en Windows MUST compilar lo que prueba el job `test` de `ci.yml`, los mismos comandos con `--no-run` en cada `cargo test`, sin correr las pruebas, en un job que también MUST llamarse `test` y llevar el mismo entorno, porque rust-cache arma la clave con el id del job, el runner, el entorno `CARGO_`/`RUST` y el lock, nunca con el workflow. Corre en los push a `main` que cambian un `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `ci.yml` o `cache.yml`, dos veces por semana para que GitHub no desaloje una caché sin usar en siete días, y a pedido; MUST NOT correr en un PR, llamarse `CI` ni leer secretos. Efecto aceptado: los PR abiertos antes de que `Cache` termine tras un cambio de dependencias compilan de cero.
 
-**Pruebas:** `third_party_actions_are_pinned_to_a_commit`, `every_checkout_drops_the_token` y `the_ci_workflow_checks_the_locked_production_build`.
+**Pruebas:** `third_party_actions_are_pinned_to_a_commit`, `every_checkout_drops_the_token`, `the_ci_workflow_checks_the_locked_production_build` y `the_cache_workflow_builds_from_main_what_ci_tests`.
 
 ### Toolchain fijado (C3)
 
-`rust-toolchain.toml` MUST fijar `channel` a una versión exacta `X.Y.Z` (hoy 1.99.1) y pedir `clippy`; lo usan también los builds locales. Cada `dtolnay/rust-toolchain` de cada workflow MUST pasar esa misma versión en `toolchain:` (`ci.yml:54`, `release.yml:90`, `advisories.yml:43`). `[workspace.package] rust-version` MUST ser al menos 1.90, el mayor `rust-version` de los paquetes del lock (hoy `tree-sitter-language` 0.1.9, y `ort`, `ort-sys`, `rmcp`, `ignore` y otros piden 1.88), y no mayor que el toolchain; `cargo +1.90.0 check --locked --workspace --all-targets` compila. Subir el toolchain es un commit propio que cambia todos esos lugares; un lint nuevo del compilador no pone roja la CI sin un cambio del repositorio.
+`rust-toolchain.toml` MUST fijar `channel` a una versión exacta `X.Y.Z` (hoy 1.99.1) y pedir `clippy`; lo usan también los builds locales. Cada `dtolnay/rust-toolchain` de cada workflow MUST pasar esa misma versión en `toolchain:` (`ci.yml:57`, `cache.yml:48`, `release.yml:90`, `advisories.yml:43`). `[workspace.package] rust-version` MUST ser al menos 1.90, el mayor `rust-version` de los paquetes del lock (hoy `tree-sitter-language` 0.1.9, y `ort`, `ort-sys`, `rmcp`, `ignore` y otros piden 1.88), y no mayor que el toolchain; `cargo +1.90.0 check --locked --workspace --all-targets` compila. Subir el toolchain es un commit propio que cambia todos esos lugares; un lint nuevo del compilador no pone roja la CI sin un cambio del repositorio.
 
 #### Escenario: subir el toolchain
 - GIVEN `rust-toolchain.toml` sube a otra versión y un workflow queda con la anterior

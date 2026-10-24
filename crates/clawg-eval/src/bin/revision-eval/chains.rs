@@ -1,5 +1,5 @@
-//! What `chains` makes of its three arms, kept apart from the stores and the
-//! model so every rule here is testable without either.
+//! What `chains` makes of its arms, kept apart from the stores and the model
+//! so every rule here is testable without either.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -9,24 +9,32 @@ use serde::Serialize;
 use crate::set::{Chain, ChainSet, Change};
 use crate::stats::Rate;
 
-/// The three stores `chains` saves the set into.
+/// The stores `chains` saves the set into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm {
     /// Every version, without a key.
     NoKey,
     /// Every version, under its chain's key.
     Keyed,
+    /// The keyed arm without the vectors of the rows its revisions replaced:
+    /// what is left when those rows no longer take places in the KNN window.
+    KeyedBare,
+    /// The bare arm without the replaced rows' text in `memory_fts` either:
+    /// those rows are in no index.
+    KeyedUnindexed,
     /// Only the last version of each chain.
     Control,
 }
 
 impl Arm {
-    pub const ALL: [Arm; 3] = [Self::NoKey, Self::Keyed, Self::Control];
+    pub const ALL: [Arm; 5] = [Self::NoKey, Self::Keyed, Self::KeyedBare, Self::KeyedUnindexed, Self::Control];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NoKey => "no_key",
             Self::Keyed => "keyed",
+            Self::KeyedBare => "keyed_bare",
+            Self::KeyedUnindexed => "keyed_unindexed",
             Self::Control => "control",
         }
     }
@@ -34,7 +42,7 @@ impl Arm {
     fn key(self, chain: &Chain) -> Option<&str> {
         match self {
             Self::NoKey => None,
-            Self::Keyed | Self::Control => Some(&chain.topic_key),
+            Self::Keyed | Self::KeyedBare | Self::KeyedUnindexed | Self::Control => Some(&chain.topic_key),
         }
     }
 }
@@ -49,26 +57,24 @@ pub struct PlannedSave<'a> {
     pub topic_key: Option<&'a str>,
 }
 
-/// The saves of `arm`, in the order it makes them. The no-key and keyed arms
-/// save every first version, then every second, then every third, so other
+/// The saves of `arm`, in the order it makes them. Every arm but the control
+/// saves every first version, then every second, then every third, so other
 /// memories are saved between two versions of a topic, as in daily use. The
-/// control saves only the last version of each chain, under its key as the
-/// keyed arm does, so that the older versions are all that tells them apart.
+/// control saves only the last version of each chain, under its key and in
+/// the round the keyed arm saves it, so that the older versions are all that
+/// tells them apart.
 pub fn arm_saves(set: &ChainSet, arm: Arm) -> Vec<PlannedSave<'_>> {
     let planned = |index: usize, version: usize| {
         let chain = &set.chains[index];
         PlannedSave { index, chain, version, topic_key: arm.key(chain) }
     };
-    match arm {
-        Arm::Control => set.chains.iter().enumerate().map(|(i, c)| planned(i, c.versions.len() - 1)).collect(),
-        Arm::NoKey | Arm::Keyed => {
-            let rounds = set.chains.iter().map(|c| c.versions.len()).max().unwrap_or(0);
-            (0..rounds)
-                .flat_map(|v| (0..set.chains.len()).filter(move |&i| v < set.chains[i].versions.len()).map(move |i| (i, v)))
-                .map(|(i, v)| planned(i, v))
-                .collect()
-        }
-    }
+    let last = |index: usize| set.chains[index].versions.len() - 1;
+    let rounds = set.chains.iter().map(|c| c.versions.len()).max().unwrap_or(0);
+    (0..rounds)
+        .flat_map(|v| (0..set.chains.len()).filter(move |&i| v < set.chains[i].versions.len()).map(move |i| (i, v)))
+        .filter(|&(i, v)| arm != Arm::Control || v == last(i))
+        .map(|(i, v)| planned(i, v))
+        .collect()
 }
 
 /// The sentences of `spec` that state a requirement (they carry `MUST`), as
@@ -292,8 +298,8 @@ pub struct ChainView<'a> {
     pub shown: Shown,
 }
 
-/// How many chains may put their last version elsewhere than the control
-/// does: 38 of the set's 40 must match.
+/// How many chains may put their last version elsewhere than the reference
+/// arm does: 38 of the set's 40 must match.
 const MAX_MOVED: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -309,8 +315,8 @@ pub struct Condition {
     pub breaking: Vec<String>,
 }
 
-/// Condition (c) of M2: the last version where the control puts it, in both
-/// outputs.
+/// Condition (c) of M2: the last version where the reference arm puts it, in
+/// both outputs.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Placement {
     pub met: bool,
@@ -319,12 +325,12 @@ pub struct Placement {
     /// Chains whose last version shows in another place in either output.
     pub moved: Vec<String>,
     /// Chains whose last version shows more than one place lower in either
-    /// output, or not at all where the control shows it.
+    /// output, or not at all where the reference arm shows it.
     pub dropped: Vec<String>,
 }
 
-/// M2: whether a key hides every older version and leaves the last where it
-/// would be with no older version in the store.
+/// M2: whether a key hides every older version and leaves the last where the
+/// reference arm puts it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct M2 {
     pub verdict: Verdict,
@@ -333,24 +339,24 @@ pub struct M2 {
     /// (b) no older version in `search_memory` or in `recall_context`.
     pub no_old_version_shown: Condition,
     /// (c)
-    pub last_where_control: Placement,
+    pub last_where_reference: Placement,
     /// Every chain that breaks a condition, in the set's order.
     pub breaking: Vec<String>,
 }
 
-/// Judges the keyed arm against the control, chain by chain in the set's
-/// order, which both arms keep.
-pub fn m2(keyed: &[ChainView<'_>], control: &[ChainView<'_>]) -> M2 {
+/// Judges the keyed arm against a reference arm, chain by chain in the set's
+/// order, which every arm keeps.
+pub fn m2(keyed: &[ChainView<'_>], reference: &[ChainView<'_>]) -> M2 {
     let ids = |keep: &dyn Fn(&ChainView<'_>) -> bool| -> Vec<String> {
         keyed.iter().filter(|v| keep(v)).map(|v| v.chain.id.clone()).collect()
     };
-    let drops = |keyed: Option<usize>, control: Option<usize>| match (keyed, control) {
-        (Some(keyed), Some(control)) => keyed > control + 1,
+    let drops = |keyed: Option<usize>, reference: Option<usize>| match (keyed, reference) {
+        (Some(keyed), Some(reference)) => keyed > reference + 1,
         (None, Some(_)) => true,
         (_, None) => false,
     };
     let (mut moved, mut dropped) = (Vec::new(), Vec::new());
-    for (k, c) in keyed.iter().zip(control) {
+    for (k, c) in keyed.iter().zip(reference) {
         let ((ks, kc), (cs, cc)) = (k.shown.last(), c.shown.last());
         if (ks, kc) != (cs, cc) {
             moved.push(k.chain.id.clone());
@@ -373,7 +379,7 @@ pub fn m2(keyed: &[ChainView<'_>], control: &[ChainView<'_>]) -> M2 {
         verdict: if breaking.is_empty() { Verdict::Pass } else { Verdict::Fail },
         one_live_version: Condition { met: one_live.is_empty(), breaking: one_live },
         no_old_version_shown: Condition { met: old_shown.is_empty(), breaking: old_shown },
-        last_where_control: placement,
+        last_where_reference: placement,
         breaking,
     }
 }
@@ -638,8 +644,23 @@ mod tests {
         let set = set();
         let control = arm_saves(&set, Arm::Control);
         let saved: Vec<(&str, usize)> = control.iter().map(|s| (s.chain.id.as_str(), s.version)).collect();
-        assert_eq!(saved, [("a", 2), ("b", 1)]);
+        assert_eq!(saved, [("b", 1), ("a", 2)]);
         assert!(control.iter().all(|s| s.topic_key == Some(s.chain.topic_key.as_str())));
+    }
+
+    /// In another order the same live rows would have other ids and ages,
+    /// which the score's decay and the tie-break read, and the older versions
+    /// would no longer be all that tells the two arms apart.
+    #[test]
+    fn the_control_saves_each_last_version_in_the_keyed_arms_order() {
+        let set = set();
+        let control: Vec<(usize, usize)> = arm_saves(&set, Arm::Control).iter().map(|s| (s.index, s.version)).collect();
+        let keyed_lasts: Vec<(usize, usize)> = arm_saves(&set, Arm::Keyed)
+            .iter()
+            .filter(|s| s.version == s.chain.versions.len() - 1)
+            .map(|s| (s.index, s.version))
+            .collect();
+        assert_eq!(control, keyed_lasts);
     }
 
     /// Every first version before any second one: other memories are saved
@@ -656,6 +677,16 @@ mod tests {
         let keyed_order: Vec<(&str, usize)> = keyed.iter().map(|s| (s.chain.id.as_str(), s.version)).collect();
         assert_eq!(keyed_order, order);
         assert!(keyed.iter().all(|s| s.topic_key == Some(s.chain.topic_key.as_str())));
+    }
+
+    /// The bare arms differ from the keyed one only in what they drop from the
+    /// indexes once everything is saved.
+    #[test]
+    fn the_bare_arms_save_what_the_keyed_arm_saves() {
+        let set = set();
+        let plan = |arm: Arm| arm_saves(&set, arm).iter().map(|s| (s.index, s.version, s.topic_key)).collect::<Vec<_>>();
+        assert_eq!(plan(Arm::KeyedBare), plan(Arm::Keyed));
+        assert_eq!(plan(Arm::KeyedUnindexed), plan(Arm::Keyed));
     }
 
     #[test]
@@ -721,9 +752,9 @@ mod tests {
         let (keyed, control) = views(&set);
         let judged = m2(&keyed, &control);
         assert_eq!(judged.verdict, Verdict::Pass);
-        assert!(judged.one_live_version.met && judged.no_old_version_shown.met && judged.last_where_control.met);
-        assert_eq!(judged.last_where_control.matching, 40);
-        assert_eq!(judged.last_where_control.needed, 38);
+        assert!(judged.one_live_version.met && judged.no_old_version_shown.met && judged.last_where_reference.met);
+        assert_eq!(judged.last_where_reference.matching, 40);
+        assert_eq!(judged.last_where_reference.needed, 38);
         assert!(judged.breaking.is_empty());
     }
 
@@ -749,14 +780,14 @@ mod tests {
         let (mut keyed, control) = views(&set);
         *keyed[2].shown.search.last_mut().unwrap() = Some(5);
         let judged = m2(&keyed, &control);
-        assert_eq!(judged.last_where_control.matching, 39);
+        assert_eq!(judged.last_where_reference.matching, 39);
         assert_eq!(judged.verdict, Verdict::Fail, "the other 39 matching does not make up for it");
-        assert_eq!(judged.last_where_control.dropped, ["c2"]);
+        assert_eq!(judged.last_where_reference.dropped, ["c2"]);
 
         let (mut keyed, control) = views(&set);
         *keyed[3].shown.context.last_mut().unwrap() = None;
         let judged = m2(&keyed, &control);
-        assert_eq!(judged.last_where_control.dropped, ["c3"], "a last version gone where the control shows it dropped");
+        assert_eq!(judged.last_where_reference.dropped, ["c3"], "a last version gone where the control shows it dropped");
     }
 
     #[test]
@@ -767,14 +798,14 @@ mod tests {
             *keyed[i].shown.search.last_mut().unwrap() = Some(i % 3 + 2);
         }
         let two = m2(&keyed, &control);
-        assert_eq!((two.last_where_control.matching, two.verdict), (38, Verdict::Pass));
+        assert_eq!((two.last_where_reference.matching, two.verdict), (38, Verdict::Pass));
         assert!(two.breaking.is_empty(), "two chains moved one place are within the threshold");
 
         *keyed[9].shown.context.last_mut().unwrap() = Some(9 % 3 + 2);
         let three = m2(&keyed, &control);
-        assert_eq!((three.last_where_control.matching, three.verdict), (37, Verdict::Fail));
+        assert_eq!((three.last_where_reference.matching, three.verdict), (37, Verdict::Fail));
         assert_eq!(three.breaking, ["c0", "c1", "c9"]);
-        assert!(three.last_where_control.dropped.is_empty());
+        assert!(three.last_where_reference.dropped.is_empty());
     }
 
     #[test]

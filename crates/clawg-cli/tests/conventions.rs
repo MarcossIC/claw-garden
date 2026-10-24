@@ -781,11 +781,80 @@ fn the_ci_workflow_checks_the_locked_production_build() {
         assert!(commands.iter().any(|c| c == wanted), "ci.yml lacks `{wanted}`: {commands:?}");
     }
 
-    // Only main writes the cache, so nothing a pull request builds is restored
-    // into a run on main.
-    let steps = job(&jobs, "test").steps();
-    let cache = steps.iter().find(|s| s.iter().any(|l| l.contains("uses: Swatinem/rust-cache@"))).expect("ci.yml caches the build");
-    assert!(cache.iter().any(|l| l.trim() == "save-if: ${{ github.ref == 'refs/heads/main' }}"), "the cache is written from any ref: {cache:?}");
+    // Pull requests only read the cache, which cache.yml writes from main, so
+    // nothing a pull request builds is restored into a run on main.
+    let cache = rust_cache_step(job(&jobs, "test")).expect("ci.yml caches the build");
+    assert!(cache.iter().any(|l| l.trim() == "save-if: false"), "a pull request writes the cache: {cache:?}");
+}
+
+/// The `Swatinem/rust-cache` step of a job.
+fn rust_cache_step(job: &Job) -> Option<Vec<String>> {
+    job.steps().into_iter().find(|s| s.iter().any(|l| l.contains("uses: Swatinem/rust-cache@")))
+}
+
+/// The step of a job whose `run:` is `command`.
+fn step_running(job: &Job, command: &str) -> Vec<String> {
+    let wanted = format!("run: {command}");
+    job.steps()
+        .into_iter()
+        .find(|s| s.iter().any(|l| l.trim().trim_start_matches("- ") == wanted))
+        .unwrap_or_else(|| panic!("job `{}` does not run `{command}`", job.name))
+}
+
+#[test]
+fn the_ci_workflow_runs_the_suite_only_for_pull_requests() {
+    // A push to main merges a pull request whose run tested the same content.
+    // release.yml waits for a successful CI run of that push, which a run whose
+    // jobs were all skipped is not, so one job runs there and builds nothing.
+    let lines = workflow_code("ci.yml");
+    let jobs = jobs_of(&lines);
+    let test = job(&jobs, "test");
+    assert_eq!(test.key("if").as_deref(), Some("github.event_name == 'pull_request'"), "the suite runs for pull requests alone");
+    let merged = job(&jobs, "merged");
+    assert_eq!(merged.key("if").as_deref(), Some("github.event_name == 'push'"), "a push to main runs `merged`");
+    assert!(!merged.steps().is_empty(), "`merged` runs a step");
+    assert!(!merged.text().contains("cargo ") && !merged.text().contains("uses:"), "`merged` builds nothing");
+
+    let build_info = step_running(test, "cargo test --locked -p clawg-core --lib build_info");
+    assert!(build_info.iter().any(|l| l.trim() == "if: runner.os == 'Linux'"), "build_info has no platform code: {build_info:?}");
+}
+
+#[test]
+fn the_cache_workflow_builds_from_main_what_ci_tests() {
+    // rust-cache keys a cache by job id, runner, CARGO_/RUST environment and
+    // lock, never by workflow, so this `test` job writes the cache ci.yml's
+    // `test` job reads, building the same targets without running them.
+    let name = "cache.yml";
+    let lines = workflow_code(name);
+    for trigger in ["push:", "schedule:", "workflow_dispatch:"] {
+        assert!(lines.iter().any(|l| indent_of(l) == 2 && l.trim() == trigger), "{name} runs on `{trigger}`");
+    }
+    assert!(!lines.iter().any(|l| l.trim_start().starts_with("pull_request")), "{name} never runs for a pull request");
+    assert!(lines.iter().any(|l| l.trim() == "branches: [main]"), "{name} runs on main");
+    assert_reads_no_secret(name, &lines);
+
+    let ci_lines = workflow_code("ci.yml");
+    let ci_jobs = jobs_of(&ci_lines);
+    let ci = job(&ci_jobs, "test");
+    let jobs = jobs_of(&lines);
+    let cache = job(&jobs, "test");
+    assert_eq!(cache.key("runs-on"), ci.key("runs-on"));
+    let os = |job: &Job| job.lines.iter().find(|l| l.trim().starts_with("os: [")).map(|l| l.trim().to_string());
+    assert_eq!(os(cache), os(ci), "{name} builds on the platforms CI tests");
+    for key in ["CARGO_TERM_COLOR", "CARGO_INCREMENTAL"] {
+        assert_eq!(job_env(cache, key), job_env(ci, key), "{name}: `{key}` is part of the cache key");
+    }
+
+    let expected: Vec<String> = run_commands(ci)
+        .into_iter()
+        .map(|c| if c.starts_with("cargo test ") { format!("{c} --no-run") } else { c })
+        .collect();
+    assert_eq!(run_commands(cache), expected, "{name} builds what ci.yml tests");
+    let build_info = step_running(cache, "cargo test --locked -p clawg-core --lib build_info --no-run");
+    assert!(build_info.iter().any(|l| l.trim() == "if: runner.os == 'Linux'"), "{name} builds build_info where CI tests it");
+
+    let step = rust_cache_step(cache).expect("cache.yml caches the build");
+    assert!(step.iter().any(|l| l.trim() == "save-if: ${{ github.ref == 'refs/heads/main' }}"), "the cache is written from any ref: {step:?}");
 }
 
 #[test]

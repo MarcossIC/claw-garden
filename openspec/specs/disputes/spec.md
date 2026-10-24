@@ -1,6 +1,6 @@
 # disputes — Especificación
 
-Fuente de verdad del comportamiento actual de los pares que encuentra el detector de contradicciones y de las disputas entre memorias: qué pares anota el detector y cuáles le pregunta al usuario, cómo se juzga un par, qué pasa con los pares cuando una de sus filas se borra, se restaura, se reemplaza o se purga, la herramienta que usa el agente, el estado que ve el workspace y la exclusión de pedazos hermanos. El umbral, la banda y los cortes de escalamiento están en «Umbral y banda del detector» y se miden con `conflict-eval` y con los pares de contradicción del golden set ([`specs/eval`](../eval/spec.md)); el filtro de tipo no está acá. Qué agente puede juzgar qué par está en [`specs/visibility`](../visibility/spec.md) (su R3 y R4).
+Fuente de verdad del comportamiento actual de los pares que encuentra el detector de contradicciones y de las disputas entre memorias: qué pares anota el detector y cuáles le pregunta al usuario, cómo se juzga un par, qué pasa con los pares cuando una de sus filas se borra, se restaura, se reemplaza o se purga, la herramienta que usa el agente, el estado que ve el workspace y la exclusión de pedazos hermanos. El umbral, la banda y los cortes de escalamiento están en «Umbral y banda del detector» y se miden con `conflict-eval` y con los pares de contradicción del golden set ([`specs/eval`](../eval/spec.md)); el filtro de tipo no está acá. Cualquier agente juzga un par cuyas dos filas alcanza, sea de quien sea ([`specs/visibility`](../visibility/spec.md), R3 y R4).
 
 **Origen:**
 - [dispute-resolution](../../changes/archive/2026-10-13-dispute-resolution/proposal.md), archivado el 2026-10-13.
@@ -8,6 +8,7 @@ Fuente de verdad del comportamiento actual de los pares que encuentra el detecto
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (los pares de `memory_conflict`, el escalamiento, los veredictos, las candidatas en la respuesta del save y el paso de los pares por restore, purge y mantenimiento).
 - [topic-revisions](../../changes/archive/2026-10-18-topic-revisions/proposal.md), archivado el 2026-10-18 (sólo R9 y la restauración de una fila con clave en R4).
 - [protected-verdicts](../../changes/archive/2026-10-20-protected-verdicts/proposal.md), archivado el 2026-10-20 (la guarda de las filas protegidas y la declaración en R3, y lo que cambia en `conflicts`, R6 y «Datos de la versión anterior»).
+- [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: el detector compara con el alcance del que guarda, y los pares se juzgan y se cuentan por lector y proyecto (R6, «Umbral y banda del detector»).
 
 ## Definiciones
 
@@ -18,7 +19,7 @@ Fuente de verdad del comportamiento actual de los pares que encuentra el detecto
 - **Estado de reposo de una fila no reemplazada:** `disputed` si su `disputed_against` nombra al menos una fila viva; `active` si no.
 - **Fila protegida:** una `user_preference` o una `architectural_decision` (`MemoryType::is_protected`, `crates/clawg-core/src/memory/store_insert.rs:68`). Un tipo guardado que el parser no conoce no es protegido (`is_protected_name`, `store_insert.rs:76`).
 - **Declaración:** `user_answered: true` en el pedido de un veredicto: quien llama dice que el usuario contestó cuál vale, con su respuesta en `reason`. No autentica a nadie: el agente puede declararla sin preguntar, igual que `user_stated` ([`specs/provenance`](../provenance/spec.md)). Lo que la guarda pide es que reemplazar una fila protegida sea explícito y quede registrado en el par.
-- **Pedazos hermanos:** las filas que inserta un mismo evento de ingesta (un mismo save), una por pedazo (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:715`).
+- **Pedazos hermanos:** las filas que inserta un mismo evento de ingesta (un mismo save), una por pedazo (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:735`).
 
 `disputed_against` significa "disputas pendientes": cerrar una disputa saca el id de la otra fila. `last_disputed_at` no cambia al resolver. `superseded_by` guarda quién reemplazó a quién. Las columnas de `memory` son las de V1 (`crates/clawg-core/migrations/V1__init.sql`); V15 agrega la tabla de pares y no toca `memory`.
 
@@ -28,11 +29,11 @@ Cada fila que el detector encuentra en la banda ("Umbral y banda del detector") 
 
 Una candidata escala cuando `needs_user` (`contradiction.rs:103`), que es pura, devuelve verdadero: si la distancia no se conoce; si es menor que `ESCALATE_BELOW` y los dos lados son filas protegidas; o si es menor que `IDENTIFIER_ESCALATE_BELOW` y los dos textos comparten un identificador (`shares_identifier`, `contradiction.rs:115`, que usa `identifier_tokens` de `search.rs`). Dos `semantic_fact` cercanos que no llegan a ese corte no escalan, ni un hecho cerca de una preferencia o una decisión: los ve el agente en la respuesta del save y en `memory_status`. El agente no puede reemplazar una fila protegida sin declarar la respuesta del usuario, en ningún estado del par (R3), así que una decisión no se pierde porque su par no escaló.
 
-Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de cada save (`SaveKey`, `contradiction.rs:89`: el save de `memory_piece`, o la fila si no es un pedazo). Un save nuevo MUST anotar a lo sumo un par con cada save anterior: entre sus pedazos, gana el primero que encuentra a ese save (`worker.rs:891` y `:891`). Los pedazos hermanos siguen sin emparejarse (R8).
+Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de cada save (`SaveKey`, `contradiction.rs:89`: el save de `memory_piece`, o la fila si no es un pedazo). Un save nuevo MUST anotar a lo sumo un par con cada save anterior: entre sus pedazos, gana el primero que encuentra a ese save (`worker.rs:913` y `:913`). Los pedazos hermanos siguen sin emparejarse (R8).
 
 #### Escenario: hechos cercanos sin identificador común
 - GIVEN un `semantic_fact` guardado
-- WHEN se guarda otro `semantic_fact` del mismo agente en la banda, sin un identificador compartido
+- WHEN se guarda otro `semantic_fact` en la banda, del mismo agente o de otro que lo alcanza, sin un identificador compartido
 - THEN las dos filas quedan `active` y hay un par `pending` con su distancia
 
 #### Escenario: preferencia cercana
@@ -49,7 +50,7 @@ Dentro de un pedazo, el detector MUST quedarse con la candidata más cercana de 
 
 ## Las candidatas en la respuesta del save
 
-Un save confirmado cuyo detector anotó pares MUST listarlos en `related` (`SaveBody`, `crates/clawg-cli/src/daemon/api.rs:514`; cada uno `RelatedMemory`, `api.rs:570`, con `kind`, `id`, `escalated` y la primera línea de la candidata cortada a `EXCERPT_CHARS` = 80 caracteres, `contradiction.rs:73`), uno por fila vieja. Sin pares, MUST NOT llevar el campo. El texto de `save_memory` MUST sumar una línea `close to earlier memories: #id "<línea>"` (con `, asks the user` en las que escalan) que pide juzgarlas con `resolve_conflict`, sólo cuando hay alguna (`related_text`, `crates/clawg-cli/src/mcp/server.rs:332`). Un puente que no conoce el campo muestra el save igual.
+Un save confirmado cuyo detector anotó pares MUST listarlos en `related` (`SaveBody`, `crates/clawg-cli/src/daemon/api.rs:566`; cada uno `RelatedMemory`, `api.rs:628`, con `kind`, `id`, `escalated` y la primera línea de la candidata cortada a `EXCERPT_CHARS` = 80 caracteres, `contradiction.rs:73`), uno por fila vieja. Sin pares, MUST NOT llevar el campo. El texto de `save_memory` MUST sumar una línea `close to earlier memories: #id "<línea>"` (con `, asks the user` en las que escalan) que pide juzgarlas con `resolve_conflict`, sólo cuando hay alguna (`related_text`, `crates/clawg-cli/src/mcp/server.rs:345`). Un puente que no conoce el campo muestra el save igual.
 
 **Tests:** `a_confirmed_save_names_its_candidates` en `worker.rs`; `save_outcome_text_names_related_memories` en `server.rs`; `save_body_leaves_related_out_when_empty` en `api.rs`.
 
@@ -157,7 +158,7 @@ Cuando una fila X se borra (`delete_memory_core`, `crates/clawg-core/src/memory/
 
 Restaurar X (`restore_memory_core`, `admin.rs:609`; el resto del restore está en [`specs/restore`](../restore/spec.md)) MUST llevar a su estado de reposo a X y a toda fila cuyo `disputed_against` la nombra (`settle_row` y `settle_challengers`, `dispute.rs:211` y `dispute.rs:204`, llamadas en `admin.rs:698-699`): el par escalado vuelve con ella.
 
-Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene una fila viva de otro save (las demás piezas de su propio save no cuentan) (`RESTORE_TOPIC_HOLDER`, `admin.rs:479`; `RestoreError::TopicTaken`, `admin.rs:417`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1482`, el brazo del `409` en `api.rs:1496`), como con un gemelo vivo o un secreto.
+Restaurar una fila borrada que tenía `topic_key` MUST fallar sin cambiar nada cuando el alcance de su clave ya tiene una fila viva de otro save (las demás piezas de su propio save no cuentan) (`RESTORE_TOPIC_HOLDER`, `admin.rs:479`; `RestoreError::TopicTaken`, `admin.rs:417`). El error MUST nombrar la clave y la fila que la tiene, y la fila restaurada se queda borrada: restaurarla dejaría dos versiones vivas de un tema que una revisión mantiene en una. `POST /v1/memories/memory/{id}/restore` MUST responder `409` (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1750`, el brazo del `409` en `api.rs:1765`), como con un gemelo vivo o un secreto.
 
 Purgar X (`purge`, `crates/clawg-core/src/memory/secrets.rs:181`) MUST borrar los pares que la nombran (`secrets.rs:232`). El `reason` de un veredicto se guarda enmascarado ([`specs/secrets`](../secrets/spec.md) R7).
 
@@ -216,22 +217,22 @@ Cubre las huérfanas que dejaron las versiones que borraban sin liberar. La mism
 
 ## R6. HTTP y MCP
 
-Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:866-868`):
+Detrás del token, sobre filas de `memory` (rutas en `crates/clawg-cli/src/daemon/api.rs:1038-1040`):
 
-- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "user_answered": <bool, opcional, false por defecto>, "agent_id": <opcional>}` (`JudgeRequest`, `api.rs:822`; `judge_dispute`, `api.rs:1556`). Un cuerpo sin `user_answered` se lee sin la declaración.
+- `POST /v1/disputes/judge` MUST aceptar `{"keep": <id>, "other": <id>, "verdict": "supersedes" | "compatible" | "scoped" | "conflicts", "reason": <opcional>, "user_answered": <bool, opcional, false por defecto>, "agent_id": <opcional>}` (`JudgeRequest`, `api.rs:988`; `judge_dispute`, `api.rs:1826`). Un cuerpo sin `user_answered` se lee sin la declaración.
 - `POST /v1/disputes/resolve` MUST seguir aceptando `{"keep", "other", "keep_both": <bool, opcional, false por defecto>, "agent_id"}` para los puentes anteriores, y guardar `compatible` (con `keep_both`) o `supersedes` (`resolve_dispute_core`, `dispute.rs:303`). No tiene dónde declarar y juzga sin la declaración, así que un puente anterior nunca reemplaza una fila protegida.
-- `GET /v1/disputes?agent_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas del agente y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:846`), los más viejos primero (`open_pairs`, `dispute.rs:448`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
+- `GET /v1/disputes?agent_id=&project_id=` MUST devolver `{pending, escalated, pairs}`: los conteos de pares abiertos entre filas vivas que el agente alcanza, de cualquier autor, cuya fila nueva cumple el predicado de proyecto de la búsqueda (sin `project_id`, todo el store), y hasta 5 pares pendientes (`OPEN_PAIRS_SHOWN`, `api.rs:1017`), los más viejos primero (`open_pairs`, `dispute.rs:448`), cada lado con la marca de su origen (P4 de [`specs/provenance`](../provenance/spec.md)).
 
-Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1532`):
+Las dos rutas de veredicto responden igual (`resolve_error`, `api.rs:1801`):
 
 | Caso | Respuesta |
 |---|---|
 | Juzgado | `200` con el `id`, `status` y `superseded_by` de las dos filas, y el `pair` en que quedó (`judged` o `escalated`) |
 | `keep = other`, un veredicto desconocido (el error lista los cuatro), `scoped` sin motivo o la declaración sin `reason` | `400` |
-| Una fila no existe o está borrada (o, con `agent_id`, es de otro agente) | `404` |
+| Una fila no existe o está borrada (o, con `agent_id`, está fuera de su alcance) | `404` |
 | Par no enlazado, una reemplazada por una tercera, o `supersedes` cuyo `other` es protegida sin la declaración, en cualquier estado del par | `409` |
 
-El puente MCP MUST exponer `resolve_conflict` con `keep`, `other`, `verdict` (obligatorio, con el `enum` de los cuatro valores en el schema, `verdict_enum`, `server.rs:348`), `reason` y `user_answered` (booleano, opcional) (`ResolveConflictArgs`, `server.rs:354`), y mandar la declaración al daemon (`DaemonClient::judge`, `crates/clawg-cli/src/client.rs:1142`, siempre, porque un `JudgeRequest` anterior ignora los campos que no conoce); el agente es el del puente. Su descripción MUST decir que una preferencia o una decisión se reemplaza sólo con la palabra del usuario: juzgarla `conflicts`, preguntar y llamar `supersedes` con `user_answered` y su respuesta en `reason` ([`specs/mcp`](../mcp/spec.md), «Los conflictos en las herramientas»). Contra un daemon que contesta un 404 sin cuerpo en `/v1/disputes/judge`, MUST decir que se reinicie el daemon con `clawg stop` (`resolve_conflict_impl`, `server.rs:959`). `memory_status` MUST sumar una línea con los pares pendientes y escalados del agente, y los pendientes listados, citados por id, con cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:169`); contra un daemon sin la ruta, omite la línea. En cada par va primero el lado sin marca, y la marca va junto al id del otro; ACTIVE CONFLICTS marca cada lado sin reordenar (P4 de [`specs/provenance`](../provenance/spec.md)). El origen no cambia el estado de ningún par.
+El puente MCP MUST exponer `resolve_conflict` con `keep`, `other`, `verdict` (obligatorio, con el `enum` de los cuatro valores en el schema, `verdict_enum`, `server.rs:392`), `reason` y `user_answered` (booleano, opcional) (`ResolveConflictArgs`, `server.rs:398`), y mandar la declaración al daemon (`DaemonClient::judge`, `crates/clawg-cli/src/client.rs:1257`, siempre, porque un `JudgeRequest` anterior ignora los campos que no conoce); el agente es el del puente. Su descripción MUST decir que una preferencia o una decisión se reemplaza sólo con la palabra del usuario: juzgarla `conflicts`, preguntar y llamar `supersedes` con `user_answered` y su respuesta en `reason` ([`specs/mcp`](../mcp/spec.md), «Los conflictos en las herramientas»). Contra un daemon que contesta un 404 sin cuerpo en `/v1/disputes/judge`, MUST decir que se reinicie el daemon con `clawg stop` (`resolve_conflict_impl`, `server.rs:1166`). `memory_status` MUST sumar una línea con los pares pendientes y escalados que el agente alcanza en el proyecto del puente, y los pendientes listados, citados por id, con cómo juzgarlos (`format_open_pairs`, `crates/clawg-cli/src/mcp/tools.rs:255`); contra un daemon sin la ruta, omite la línea. En cada par va primero el lado sin marca, y la marca va junto al id del otro; ACTIVE CONFLICTS marca cada lado sin reordenar (P4 de [`specs/provenance`](../provenance/spec.md)). El origen no cambia el estado de ningún par.
 
 La NOTE de ACTIVE CONFLICTS (una vez por bloque; [`specs/retrieval`](../retrieval/spec.md)) MUST NOT afirmar que las memorias se contradicen, y MUST nombrar `resolve_conflict` y sus veredictos. La apertura del protocolo ([`specs/mcp`](../mcp/spec.md)) MUST pedir que se juzguen en la sesión las candidatas que nombra `save_memory`, que se pregunte al usuario por lo que lista ACTIVE CONFLICTS y que su respuesta se registre con `user_answered` y sus palabras en `reason`, sólo cuando el usuario contestó. Cada par del bloque imprime los ids de sus dos lados, que son los que recibe `resolve_conflict`.
 
@@ -240,7 +241,7 @@ La NOTE de ACTIVE CONFLICTS (una vez por bloque; [`specs/retrieval`](../retrieva
 - WHEN se llama `resolve_conflict` con `keep = N`, `other = O` y `verdict = supersedes`
 - THEN el texto dice que N queda y O queda reemplazada por N, y `list_memories` lo muestra
 
-**Test:** `resolve_supersedes_the_other_row`, `resolve_rejects_the_same_row`, `resolve_unknown_row_is_not_found`, `resolve_rows_without_a_dispute_conflict`, `judge_records_a_verdict`, `judge_refuses_scoped_without_reason`, `resolve_with_keep_both_still_works`, `disputes_lists_pending_pairs_of_the_agent` y `a_protected_verdict_without_the_answer_is_a_409` en `crates/clawg-cli/tests/api.rs`; `resolve_conflict_reports_the_outcome`, `resolve_conflict_against_an_older_daemon_asks_for_a_restart`, `resolve_conflict_sends_the_users_answer`, `memory_status_counts_pending_candidates`, `the_instructions_carry_the_saving_habits` y el conteo de herramientas en `crates/clawg-cli/src/mcp/server.rs`; `the_conflict_note_names_the_tool` y `the_conflict_note_does_not_claim_a_contradiction` en `crates/clawg-core/src/memory/prompt_builder.rs`.
+**Test:** `resolve_supersedes_the_other_row`, `resolve_rejects_the_same_row`, `resolve_unknown_row_is_not_found`, `resolve_rows_without_a_dispute_conflict`, `judge_records_a_verdict`, `judge_refuses_scoped_without_reason`, `resolve_with_keep_both_still_works`, `disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project` y `a_protected_verdict_without_the_answer_is_a_409` en `crates/clawg-cli/tests/api.rs`; `resolve_conflict_reports_the_outcome`, `resolve_conflict_against_an_older_daemon_asks_for_a_restart`, `resolve_conflict_sends_the_users_answer`, `memory_status_counts_pending_candidates`, `another_agent_resolves_a_conflict_unless_hidden`, `the_instructions_carry_the_saving_habits` y el conteo de herramientas en `crates/clawg-cli/src/mcp/server.rs`; `the_conflict_note_names_the_tool` y `the_conflict_note_does_not_claim_a_contradiction` en `crates/clawg-core/src/memory/prompt_builder.rs`.
 
 ## R7. El workspace no muestra filas reemplazadas
 
@@ -277,7 +278,7 @@ Desde [long-save-context](../../changes/archive/2026-10-14-long-save-context/pro
 
 El detector MUST NOT emparejar un pedazo nuevo con una fila viva del alcance de la `topic_key` del save: son las filas que ese mismo save va a dejar `superseded` al terminar ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»). Un par entre una versión y la siguiente nacería `pending` y quedaría muerto en la misma transacción que reemplaza a la vieja. Las demás filas se siguen emparejando, también las de otra clave.
 
-El worker suma las filas del alcance a los hermanos que ya pasa al detector (`siblings`, `worker.rs:886-888`), que `detect_contradiction` deja fuera como a los pedazos de R8 y a las fuentes de una conclusión.
+El worker suma las filas del alcance a los hermanos que ya pasa al detector (`siblings`, `worker.rs:908-910`), que `detect_contradiction` deja fuera como a los pedazos de R8 y a las fuentes de una conclusión.
 
 #### Escenario
 - GIVEN un `semantic_fact` guardado con la clave K, y otro `semantic_fact` cercano sin clave
@@ -288,7 +289,7 @@ El worker suma las filas del alcance a los hermanos que ya pasa al detector (`si
 
 ## Umbral y banda del detector
 
-El detector (`detect_contradiction`, `contradiction.rs:182`) MUST devolver como candidata una fila de `memory`, del mismo agente y de un tipo que afirma algo, cuya distancia L2 al vector nuevo (ambos unitarios) cae en la banda `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)` (`contradiction.rs:215-216`):
+El detector (`detect_contradiction`, `contradiction.rs:182`) MUST devolver como candidata una fila de `memory` que el que guarda alcanza, de cualquier autor o sin autor, de un tipo que afirma algo, cuya distancia L2 al vector nuevo (ambos unitarios) cae en la banda `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)` (`contradiction.rs:215-216`):
 
 | Constante | Valor | Qué separa |
 |---|---|---|
@@ -301,9 +302,9 @@ Los cuatro valores son de L2 sobre vectores del pooling mean del modelo ([`specs
 
 **Cómo se midieron.** Con el golden set de memorias (`docs/eval/golden.json`, 46 casos, 28 pares de contradicción), con pooling mean, el 2026-10-15: la curva del barrido de [`specs/eval`](../eval/spec.md) da 0 falsos positivos sobre los pares no contradictorios hasta L2 0,50, recall 0,8 en 0,40 y 0,9 en 0,45. Los pares escritos a mano como proxy (diez que se contradicen y diez compatibles) quedan en (0,350, 0,469]: la última contradicción en 0,350 y el primer par compatible en 0,469, así que 0,42 queda con margen por debajo de él y `ESCALATE_BELOW` = 0,40 entre los dos. `NEAR_DUPLICATE_FLOOR` sale del mismo proxy: el par de una oración y ella misma con un doble espacio queda a L2 0,097, y el piso lo deja justo por encima. Esa calibración mide la distancia sola; el detector entero (el filtro de tipo, el piso, el colapso por save y el escalamiento) lo mide `conflict-eval` ([`specs/eval`](../eval/spec.md)). Los dos cortes de escalamiento salen de ahí, el 2026-10-18: con un solo corte de 0,40 para todo, el 23,4 % de los saves de un flujo de hechos del mismo proyecto escalaba por compartir identificadores (`agent_id`, `memory_type`), con esos pares entre 0,34 y 0,40, y en un store real un hecho cerca de una nota de estado guardada como decisión escalaba igual que dos decisiones. Con `IDENTIFIER_ESCALATE_BELOW` = 0,30 y la regla de los dos lados protegidos, el flujo baja al 0,7 % y las contradicciones protegidas del set etiquetado siguen escalando 9 de 9.
 
-El detector sigue viendo sólo las filas del que guarda (`Reach::OwnOnly`, `contradiction.rs:178`, [`specs/sharing`](../sharing/spec.md)) y no consulta el canal léxico (`lexical: None`).
+El detector ve lo que alcanza el que guarda (`contradiction_search_scope`, con su `Reach`, [`specs/sharing`](../sharing/spec.md) R2): las filas de los demás agentes que no le oculta `sharing.json` y las sin autor. No consulta el canal léxico (`lexical: None`). Los umbrales se midieron con candidatas de un solo agente; `conflict-eval` sobre un flujo de varios agentes no se midió todavía.
 
-**Tests:** `contradiction_threshold_pins_the_shipped_value`, `near_duplicate_floor_pins_the_shipped_value`, `escalate_below_pins_the_shipped_value` e `identifier_escalate_below_pins_the_shipped_value` (fijan los literales), `hit_below_near_duplicate_floor_is_excluded`, `detect_contradiction_near_vector_returns_stored_id`, `detect_contradiction_far_vectors_returns_empty` y `user_preference_contradiction_detected_at_in_band_distance` en `crates/clawg-core/src/memory/contradiction.rs`.
+**Tests:** `contradiction_threshold_pins_the_shipped_value`, `near_duplicate_floor_pins_the_shipped_value`, `escalate_below_pins_the_shipped_value` e `identifier_escalate_below_pins_the_shipped_value` (fijan los literales), `hit_below_near_duplicate_floor_is_excluded`, `contradiction_probe_reaches_other_authors`, `a_save_is_paired_with_another_agents_row_and_a_row_no_agent_saved`, `a_hidden_author_is_never_a_candidate`, `detect_contradiction_near_vector_returns_stored_id`, `detect_contradiction_far_vectors_returns_empty` y `user_preference_contradiction_detected_at_in_band_distance` en `crates/clawg-core/src/memory/contradiction.rs`.
 
 ## Datos de la versión anterior
 

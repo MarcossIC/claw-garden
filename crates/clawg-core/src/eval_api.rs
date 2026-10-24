@@ -730,6 +730,65 @@ pub async fn row_distances(
         .map_err(|e: tokio_rusqlite::Error| EvalError::Search(e.to_string()))
 }
 
+/// Removes the vector of every `superseded` row and returns how many it
+/// removed. vec0 cuts its window before the status filter, so those vectors
+/// take places a live row could have had; without them the window holds what
+/// a filter inside the scan would leave. The rows, their text index and their
+/// links stay.
+pub async fn drop_superseded_vectors(runtime: &MemoryRuntime) -> Result<usize, EvalError> {
+    runtime
+        .store
+        .conn
+        .call(|c| -> rusqlite::Result<usize> {
+            let tx = c.transaction()?;
+            let ids: Vec<i64> = tx
+                .prepare("SELECT id FROM memory WHERE status = 'superseded'")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut dropped = 0;
+            {
+                let mut delete = tx.prepare(crate::memory::admin::DELETE_VEC_MEMORY)?;
+                for id in ids {
+                    dropped += delete.execute([id])?;
+                }
+            }
+            tx.commit()?;
+            Ok(dropped)
+        })
+        .await
+        .map_err(|e: tokio_rusqlite::Error| EvalError::Search(e.to_string()))
+}
+
+/// Takes every `superseded` row out of `memory_fts` and returns how many it
+/// took. bm25 weighs a term by how many indexed rows hold it, and those rows
+/// stay indexed until they are deleted, so they change which live rows the
+/// lexical channel proposes. Uses the `'delete'` command of the table's own
+/// triggers (`V8__memory_fts.sql`). Run it once per store, and delete none of
+/// those rows afterwards: their trigger would take them out a second time.
+pub async fn drop_superseded_text(runtime: &MemoryRuntime) -> Result<usize, EvalError> {
+    runtime
+        .store
+        .conn
+        .call(|c| -> rusqlite::Result<usize> {
+            let tx = c.transaction()?;
+            let superseded: usize = tx.query_row(
+                "SELECT COUNT(*) FROM memory WHERE status = 'superseded' AND deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO memory_fts(memory_fts, rowid, content, agent_id, project_id, memory_type)
+                 SELECT 'delete', id, content, agent_id, project_id, memory_type
+                 FROM memory WHERE status = 'superseded' AND deleted_at IS NULL",
+                [],
+            )?;
+            tx.commit()?;
+            Ok(superseded)
+        })
+        .await
+        .map_err(|e: tokio_rusqlite::Error| EvalError::Search(e.to_string()))
+}
+
 /// Joins the pieces of one save into its text the way `read_memory` does.
 pub fn join_pieces(pieces: &[&str]) -> String {
     crate::memory::pieces::join_pieces(pieces)
@@ -825,6 +884,19 @@ impl EvalTokenCounter {
             EvalTokenCounterInner::Fake => s.split_whitespace().count(),
         }
     }
+
+    /// The pieces the worker stores a save of `text` as, and the head each
+    /// piece after the first is embedded behind (`None` for a save of one
+    /// piece), cut by this counter's tokenizer; the fake one cuts by bytes,
+    /// as the worker does before the tokenizer loads.
+    pub fn split_save(&self, text: &str) -> (Vec<String>, Option<String>) {
+        let tokenizer = match &self.0 {
+            EvalTokenCounterInner::Real(tok) => Some(tok.clone()),
+            EvalTokenCounterInner::Fake => None,
+        };
+        let split = crate::memory::chunker::ChatChunker::from_tokenizer(tokenizer).split_save(text);
+        (split.pieces.into_iter().map(|c| c.text).collect(), split.head)
+    }
 }
 
 /// True iff the real embedding model is already cached at `base_dir` —
@@ -904,6 +976,11 @@ impl EvalDocIndex {
         let r = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root)
             .await
             .map_err(|e| EvalError::Insert(e.to_string()))?;
+        // A measurement without a doc measures another corpus, so a doc the
+        // daemon would skip and retry fails the run here.
+        if let Some(f) = r.failed.first() {
+            return Err(EvalError::Insert(format!("{} could not be indexed: {}", f.path, f.reason)));
+        }
         Ok(EvalDocReport { docs: r.docs, passages: r.passages, skipped: r.skipped })
     }
 
@@ -1583,6 +1660,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_the_superseded_vectors_leaves_every_live_row_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        let old = ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap().rows[0].0;
+        let new = ingest.save(keyed("the build runs on make", Some("build/tool"))).await.unwrap().rows[0].0;
+        let other = ingest.save(keyed("the tests run on nextest", None)).await.unwrap().rows[0].0;
+        let runtime = ingest.finish().await.unwrap();
+
+        assert_eq!(drop_superseded_vectors(&runtime).await.unwrap(), 1);
+
+        let with_vector: Vec<i64> = row_distances(&runtime, &[old, new, other], &[new])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(from, _, _)| from)
+            .collect();
+        assert_eq!(with_vector, vec![new, other], "only the superseded row lost its vector");
+        assert_eq!(drop_superseded_vectors(&runtime).await.unwrap(), 0, "nothing is left to drop");
+    }
+
+    async fn fts_rows(runtime: &MemoryRuntime, word: &'static str) -> Vec<i64> {
+        runtime
+            .store
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = c.prepare("SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?1 ORDER BY rowid")?;
+                let rows = stmt.query_map([word], |r| r.get(0))?.collect();
+                rows
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dropping_the_superseded_text_leaves_the_live_rows_matchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap();
+        let new = ingest.save(keyed("the build runs on make", Some("build/tool"))).await.unwrap().rows[0].0;
+        let runtime = ingest.finish().await.unwrap();
+
+        assert_eq!(drop_superseded_text(&runtime).await.unwrap(), 1);
+
+        assert!(fts_rows(&runtime, "cargo").await.is_empty(), "the superseded row is out of the index");
+        assert_eq!(fts_rows(&runtime, "make").await, vec![new]);
+        assert_eq!(fts_rows(&runtime, "build").await, vec![new], "a word both rows hold finds only the live one");
+    }
+
+    #[tokio::test]
     async fn ingest_runtime_is_rooted_at_the_given_base_dir() {
         let dir = tempfile::tempdir().unwrap();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
@@ -1651,6 +1777,39 @@ mod tests {
         assert_eq!(doc_paths(root.path()).unwrap(), ["README.md"]);
         assert!(is_code_path("src/lib.rs") && !is_code_path("README.md"));
         assert_eq!(hits[0], EvalDocHit { path: "README.md".into(), breadcrumb: "README.md > Guía > Uso".into() });
+    }
+
+    /// `FakeEmbedder`, except that a text holding `BROKEN` embeds to a
+    /// vector with a NaN in it.
+    struct Unusable;
+
+    #[async_trait::async_trait]
+    impl Embedder for Unusable {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            let mut v = FakeEmbedder::default().embed_with_role(text, role).await?;
+            if text.contains("BROKEN") {
+                v[0] = f32::NAN;
+            }
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "unusable" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    #[tokio::test]
+    async fn a_doc_the_index_could_not_embed_fails_the_measurement() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.md"), "# A\nBROKEN passage\n").unwrap();
+        std::fs::write(root.path().join("b.md"), "# B\nsound passage\n").unwrap();
+
+        let embedder = EvalEmbedder(Arc::new(Unusable));
+        let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path()).await.unwrap();
+        let result = index.index(root.path()).await;
+
+        assert!(matches!(result, Err(EvalError::Insert(ref e)) if e.contains("a.md")), "{result:?}");
     }
 
     #[tokio::test]

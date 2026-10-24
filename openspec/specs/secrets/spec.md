@@ -9,6 +9,7 @@ Fuente de verdad del comportamiento actual con secretos: el detector (formatos c
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19 (R5: la purga deja los enlaces que nombran la fila como fuente).
 - [secret-coverage](../../changes/archive/2026-10-19-secret-coverage/proposal.md), archivado el 2026-10-19 (R1: `credential`, `huggingface_token`, `slack_webhook` y las formas nuevas de Slack, Stripe y PGP; R4: los `reason` de los veredictos; R5: el outbox del propio save, la cabecera de un save largo y la revival; R6: los `workspace.md`; R7, R8 y R9 nuevos).
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (R6: un `workspace.md` guarda el texto en su forma cruda o en la copiada).
+- [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23 (CL3: la salida y las negativas de `secrets` y `purge` en el idioma del comando).
 
 ## Definiciones
 
@@ -145,9 +146,9 @@ Dos matches que se superponen MUST resolverse a favor del que empieza antes y, s
 
 ### R2. La ingesta enmascara antes de trocear
 
-El daemon MUST enmascarar el contenido de un save antes de escribir su fila en el outbox (`MemoryRuntime::accept`, `crates/clawg-core/src/runtime.rs:238`): la fila vive en `memory.db` y en cada snapshot mientras el save espera o queda `failed`, y guarda sólo el texto ya enmascarado ([`specs/ingest`](../ingest/spec.md), «Aceptar es durable»). El volcado de una versión anterior, que sí guardaba texto crudo, se enmascara al importarlo (`import_spill`, `runtime.rs:497`).
+El daemon MUST enmascarar el contenido de un save antes de escribir su fila en el outbox (`MemoryRuntime::accept`, `crates/clawg-core/src/runtime.rs:239`): la fila vive en `memory.db` y en cada snapshot mientras el save espera o queda `failed`, y guarda sólo el texto ya enmascarado ([`specs/ingest`](../ingest/spec.md), «Aceptar es durable»). El volcado de una versión anterior, que sí guardaba texto crudo, se enmascara al importarlo (`import_spill`, `runtime.rs:520`).
 
-El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualquier fuente, antes de elegir el chunker y de trocear (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:730`): sobre el texto de una fila del outbox ya no encuentra nada, porque `redact` es idempotente (R1), y es la pasada que enmascara un evento que ninguna fila respalda (los caminos en proceso de tests y evaluación). El hash de dedup, el embedding, el FTS y `memory.content` MUST calcularse sobre el texto enmascarado. `IngestReport.redacted` (`worker.rs:85`) MUST llevar los tipos que el worker enmascaró del evento en todos los caminos de salida, también cuando el evento falla después.
+El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualquier fuente, antes de elegir el chunker y de trocear (`ingest_pieces`, `crates/clawg-core/src/memory/worker.rs:751`): sobre el texto de una fila del outbox ya no encuentra nada, porque `redact` es idempotente (R1), y es la pasada que enmascara un evento que ninguna fila respalda (los caminos en proceso de tests y evaluación). El hash de dedup, el embedding, el FTS y `memory.content` MUST calcularse sobre el texto enmascarado. `IngestReport.redacted` (`worker.rs:86`) MUST llevar los tipos que el worker enmascaró del evento en todos los caminos de salida, también cuando el evento falla después.
 
 #### Escenario: el secreto no llega a la base
 - GIVEN un save `deploy uses ghp_<36 caracteres>`
@@ -168,13 +169,13 @@ El worker MUST seguir aplicando `redact` al contenido de cada evento, de cualqui
 
 ### R3. El save dice qué se enmascaró
 
-Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:524`; `save_response`, `api.rs:1003`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1071`; sólo un evento sin fila puede sumar algo en el worker):
+Una respuesta `201` de `POST /v1/memories` MUST incluir `redacted`, cada tipo una vez y en el orden en que se enmascaró, cuando no está vacía, y MUST omitirlo cuando lo está (`SaveBody.redacted`, `crates/clawg-cli/src/daemon/api.rs:576`; `save_response`, `api.rs:1183`). La lista une lo que el daemon enmascaró al aceptar el save con lo que el reporte del worker agrega (`masked_kinds`, `api.rs:1252`; sólo un evento sin fila puede sumar algo en el worker):
 
 ```json
 {"status": "saved", "memories": [{"kind": "memory", "id": 57, "outcome": "inserted"}], "redacted": ["github_token"]}
 ```
 
-`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:549`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:588`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:543`).
+`DaemonClient` MUST leerlo en `SaveOutcome::Saved.redacted` (`crates/clawg-cli/src/client.rs:581`), vacío si un daemon anterior no lo manda. `save_memory` MUST agregar al texto de éxito `; masked <tipos> before storing it` (`save_outcome_text`, `crates/clawg-cli/src/mcp/server.rs:688`). Las respuestas `202` no lo llevan, aunque el daemon ya haya enmascarado: su cuerpo es `status`, `reason` y `operation_id` (`SaveBody::queued`, `api.rs:600`).
 
 #### Escenario
 - GIVEN un daemon con el embedder listo
@@ -352,3 +353,20 @@ Todo `last_error` del outbox que lleva el texto de un error MUST pasar por `reda
 - THEN queda `failed` y su `last_error` no tiene el token
 
 **Tests:** `a_failure_is_stored_masked` (`outbox.rs`, mod tests).
+
+## El idioma de la salida
+
+### CL3. `secrets` y `purge` en el idioma del comando
+
+La salida de `clawg secrets` (`report`), la de `--mask-reasons` (`mask_report`), la de `clawg purge` (`purge_report`), las negativas sin `--yes` (`confirm`, `confirm_mask_reasons`) y la frase que enmarca un fallo al abrir el store (`explain`), todas en `crates/clawg-cli/src/secrets.rs`, MUST salir en el idioma del comando ([`specs/preferences`](../preferences/spec.md), CL1 a CL3); las frases citadas en R4, R5 y R8 son las de `en`, que sin preferencia no cambian. Los ids, los tipos de secreto, los estados (`live`, `deleted`), los `operation_id`, las rutas y los comandos MUST NOT cambiar, y la causa técnica de un fallo va tal cual. Una frase con un número MUST concordar con él en cada idioma (CL5).
+
+#### Escenario: una memoria y varias
+- WHEN `clawg secrets` encuentra una fila con un secreto, y después dos
+- THEN en `es` dice `1 memoria guarda un secreto` y `2 memorias guardan un secreto`, con el mismo `memory <id> <tipos> <estado>` que en inglés
+
+#### Escenario: el informe de un purge
+- GIVEN el idioma del comando `es`
+- WHEN `clawg purge 7 --yes` borra la fila y revive la #3
+- THEN la salida empieza por `se purgó la memoria #7` y nombra `#3`, con los mismos ids que en inglés
+
+**Tests:** `the_secrets_report_speaks_spanish` y `the_purge_report_speaks_spanish` (`crates/clawg-cli/src/secrets.rs`).

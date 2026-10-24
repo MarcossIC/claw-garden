@@ -1,0 +1,15 @@
+change: agent-authorship
+objective: "2, 4"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done  # las seis decisiones abiertas, cerradas con la opción recomendada
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Linux y el binario real en un home temporal; Windows queda al CI y el perfil dev con Claude Code no se corrió
+  archive: done
+updated: 2026-10-22
+main_spec: openspec/specs/visibility/spec.md, openspec/specs/sharing/spec.md, openspec/specs/disputes/spec.md, openspec/specs/ingest/spec.md, openspec/specs/restore/spec.md, openspec/specs/update/spec.md, openspec/specs/pieces/spec.md, openspec/specs/synthesis/spec.md, openspec/specs/mcp/spec.md, openspec/specs/retrieval/spec.md, openspec/specs/doctor/spec.md, openspec/specs/portability/spec.md, openspec/specs/storage/spec.md

@@ -458,6 +458,16 @@ fn mode_of(path: &Path) -> u32 {
     std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
 }
 
+#[tokio::test]
+async fn a_daemon_names_its_version_first() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+
+    let log = daemon.log_text();
+    let first = log.lines().next().unwrap_or_default();
+    assert!(first.contains(&format!("clawg serve {} starting, profile dev", env!("CARGO_PKG_VERSION"))), "{log}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_daemon_on_a_fresh_home_leaves_a_private_data_directory() {
@@ -596,6 +606,103 @@ async fn stop_ends_a_daemon_whose_model_load_never_returns() {
     assert!(exit.success(), "{exit}\n{}", daemon.log_text());
 }
 
+// ── Metrics ─────────────────────────────────────────────────────────────────
+
+fn metrics_report(sandbox: &Sandbox, args: &[&str]) -> Value {
+    let mut all = vec!["metrics", "report", "--profile", "dev"];
+    all.extend_from_slice(args);
+    let out = sandbox.run(&all);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    serde_json::from_slice(&out.stdout).expect("report prints JSON")
+}
+
+/// The run's `http.duration` count of `route` over `transport`, as
+/// `GET /v1/metrics` answers it.
+fn run_count(metrics: &Value, route: &str, transport: &str) -> u64 {
+    metrics["run"]["histograms"]
+        .as_array()
+        .expect("histograms")
+        .iter()
+        .filter(|h| h["name"] == "http.duration" && h["labels"]["route"] == route && h["labels"]["transport"] == transport)
+        .map(|h| h["count"].as_u64().unwrap_or(0))
+        .sum()
+}
+
+#[tokio::test]
+async fn a_daemon_records_its_requests_and_report_reads_them_after_stop() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let data_dir = sandbox.data_dir();
+    let port = state_of(&data_dir).and_then(|s| s["port"].as_u64()).expect("--port 0 serves TCP too");
+    let tcp = DaemonClient::new(format!("http://127.0.0.1:{port}"), daemon.token.clone(), data_dir.clone());
+
+    let save = json!({ "content": "the metrics smoke test saves this", "agent_id": "smoke" });
+    let search = json!({ "query": "metrics smoke test", "agent_id": "smoke" });
+    assert_eq!(daemon.post("/v1/memories", save.clone()).await.0, 201);
+    assert_eq!(daemon.post("/v1/search", search.clone()).await.0, 200);
+    for (path, body) in [("/v1/memories", &save), ("/v1/search", &search)] {
+        let call = Call::new(reqwest::Method::POST, path).json(body).expect("request body");
+        assert!(tcp.send(call).await.expect("over TCP").status.is_success());
+    }
+
+    let answer = daemon.client().send(Call::new(reqwest::Method::GET, "/v1/metrics")).await.expect("metrics");
+    assert_eq!(answer.status.as_u16(), 200);
+    let metrics: Value = serde_json::from_slice(&answer.body).expect("metrics JSON");
+    assert_eq!(metrics["writing"], true, "{metrics}");
+    assert_eq!(run_count(&metrics, "/v1/search", "unix"), 1, "{metrics}");
+    assert_eq!(run_count(&metrics, "/v1/search", "tcp"), 1, "{metrics}");
+    assert!(run_count(&metrics, "/v1/memories", "unix") >= 1, "{metrics}");
+
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stop.status.code(), Some(0), "{}", stderr_of(&stop));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+    assert!(data_dir.join("metrics.db").is_file());
+
+    let report = metrics_report(&sandbox, &["--metric", "http.duration", "--label", "route=/v1/search"]);
+    assert_eq!(report["groups"][0]["key"], clawg_core::build_info::version(), "{report}");
+    assert_eq!(report["groups"][0]["count"], 2, "both transports: {report}");
+    assert_eq!(report["groups"][0]["not_stopped"], 0, "{report}");
+    assert_eq!(report["runs"], json!({ "total": 1, "not_stopped": 0 }), "{report}");
+    let unix = metrics_report(&sandbox, &["--metric", "http.duration", "--label", "route=/v1/search", "--label", "transport=unix"]);
+    assert_eq!(unix["groups"][0]["count"], 1, "{unix}");
+    let memory = metrics_report(&sandbox, &["--metric", "process.rss_bytes", "--by", "day"]);
+    assert_eq!(memory["kind"], "gauge", "{memory}");
+    assert!(memory["groups"][0]["max"].as_f64().is_some_and(|b| b > 0.0) || !cfg!(any(target_os = "linux", windows)), "{memory}");
+}
+
+#[tokio::test]
+async fn a_killed_daemon_leaves_its_run_not_stopped() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+    drop(daemon);
+
+    let killed = sandbox.serve().await;
+    killed.kill();
+    drop(killed);
+
+    let report = metrics_report(&sandbox, &["--metric", "http.duration"]);
+    assert_eq!(report["runs"], json!({ "total": 2, "not_stopped": 1 }), "{report}");
+}
+
+#[tokio::test]
+async fn metrics_off_leaves_no_metrics_file() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve_as(&["serve", "--profile", "dev", "--port", "0"], &[("CLAWG_METRICS", "off")]).await;
+    let answer = daemon.client().send(Call::new(reqwest::Method::GET, "/v1/metrics")).await.expect("metrics");
+    let metrics: Value = serde_json::from_slice(&answer.body).expect("metrics JSON");
+    assert_eq!(metrics["writing"], false, "{metrics}");
+    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+
+    assert!(!sandbox.data_dir().join("metrics.db").exists());
+    let out = sandbox.run(&["metrics", "report", "--profile", "dev", "--metric", "http.duration"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr_of(&out).contains("CLAWG_METRICS=off"), "{}", stderr_of(&out));
+}
+
 #[tokio::test]
 async fn a_debug_binary_refuses_prod_even_with_a_test_home() {
     let sandbox = Sandbox::new();
@@ -681,6 +788,99 @@ async fn export_and_import_round_trip_through_the_binary() {
     assert_eq!(markdown.status.code(), Some(0), "{}", stderr_of(&markdown));
     let text = std::fs::read_to_string(&view).expect("the view");
     assert!(text.contains("> a second exported memory"), "{text}");
+}
+
+#[tokio::test]
+async fn an_engram_export_imports_through_the_binary() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let app = sandbox.home.join("app");
+    std::fs::create_dir_all(app.join(".git")).expect("repo");
+    let long = (0..700).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+    let observation = |id: i64, sync_id: &str, project: Option<&str>, title: &str, content: &str| {
+        json!({
+            "id": id, "sync_id": sync_id, "session_id": "s1", "type": "decision", "title": title, "content": content,
+            "project": project, "scope": "project", "revision_count": 1, "duplicate_count": 1,
+            "created_at": "2025-01-01 10:00:00", "updated_at": "2025-01-01 10:00:00",
+        })
+    };
+    let export = json!({
+        "version": "0.2.0",
+        "sessions": [{ "id": "s1", "project": "app", "started_at": "2025-01-01 09:00:00", "ended_at": "2025-01-01 12:00:00",
+                       "summary": "Wired the importer" }],
+        "observations": [
+            observation(1, "a", Some("app"), "Notes on clawg-ledger", &long),
+            observation(2, "b", None, "Port", "the daemon listens on 27380"),
+        ],
+        "prompts": [{ "id": 1, "sync_id": "p1", "session_id": "s1", "content": "how does the importer work?",
+                      "project": "app", "created_at": "2025-01-01 09:30:00" }],
+    });
+    let file = sandbox.home.join("engram.json");
+    std::fs::write(&file, export.to_string()).expect("the export");
+    let (file, map) = (file.to_string_lossy().into_owned(), format!("app={}", app.display()));
+    let import = |more: &[&str]| {
+        let mut argv = vec!["import", "--from", "engram", file.as_str(), "--project-map", map.as_str()];
+        argv.extend_from_slice(more);
+        argv.extend_from_slice(&["--profile", "dev"]);
+        sandbox.run(&argv)
+    };
+
+    let dry = import(&["--dry-run"]);
+    assert_eq!(dry.status.code(), Some(0), "{}", stderr_of(&dry));
+    assert!(stdout_of(&dry).starts_with("would import "), "{}", stdout_of(&dry));
+    assert!(stdout_of(&dry).contains("from engram 0.2.0: notes 4,"), "{}", stdout_of(&dry));
+    assert!(!daemon.list().await.contains("Wired the importer"), "a dry run writes nothing");
+
+    let done = import(&[]);
+    assert_eq!(done.status.code(), Some(0), "{}", stderr_of(&done));
+    assert!(stdout_of(&done).contains("`clawg restore` brings it back"), "{}", stdout_of(&done));
+    let rows = daemon.list().await;
+    assert!(rows.contains("Wired the importer") && rows.contains("\"agent_id\":\"migrated\""), "{rows}");
+
+    let again = import(&[]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr_of(&again));
+    assert!(stdout_of(&again).starts_with("imported 0 of "), "{}", stdout_of(&again));
+    assert!(stdout_of(&again).contains("notes already here, by the project they are in:"), "{}", stdout_of(&again));
+
+    let mixed = sandbox.run(&["import", "--from", "engram", &file, "--map-root", "/a=.", "--profile", "dev"]);
+    assert_eq!(mixed.status.code(), Some(2), "a map of a clawg export is a usage error: {}", stderr_of(&mixed));
+}
+
+#[tokio::test]
+async fn projects_move_moves_and_undoes_a_seeded_store() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    for content in ["an unfiled note about the parser", "an unfiled note about the lexer"] {
+        let (status, body) = daemon.post("/v1/memories", json!({ "content": content, "agent_id": "smoke" })).await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let repo = sandbox.home.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).expect("repo");
+    let to = repo.to_string_lossy().into_owned();
+    let run = |args: &[&str]| {
+        let mut argv = vec!["projects", "move"];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["--profile", "dev"]);
+        let output = sandbox.run(&argv);
+        assert_eq!(output.status.code(), Some(0), "{argv:?}: {}", stderr_of(&output));
+        stdout_of(&output)
+    };
+
+    let dry = run(&["--from-none", "--to", &to, "--dry-run"]);
+    assert!(dry.starts_with("would move 2 memories to project repo-"), "{dry}");
+    assert!(!daemon.list().await.contains("\"project_id\":\"repo-"), "a dry run moves nothing");
+
+    let moved = run(&["--from-none", "--to", &to]);
+    assert!(moved.starts_with("moved 2 memories to project repo-"), "{moved}");
+    assert!(moved.contains("-pre-move.db; `clawg restore` brings it back"), "{moved}");
+    assert!(moved.contains("this is move 1"), "{moved}");
+    assert_eq!(daemon.list().await.matches("\"project_id\":\"repo-").count(), 2);
+
+    let undone = run(&["--undo", "1"]);
+    assert!(undone.starts_with("moved 2 memories to no project"), "{undone}");
+    assert!(!daemon.list().await.contains("\"project_id\":\"repo-"));
 }
 
 // ── The data directory's socket ────────────────────────────────────────────
@@ -821,6 +1021,27 @@ async fn a_bridge_starts_its_daemon_through_the_binary() {
     assert!(state.get("port").is_none(), "{state}");
 }
 
+#[tokio::test]
+async fn an_autostart_rotates_a_full_serve_log() {
+    let sandbox = Sandbox::new();
+    let _stop = StopOnDrop { home: sandbox.home.clone() };
+    let logs = sandbox.data_dir().join("logs");
+    std::fs::create_dir_all(&logs).expect("logs dir");
+    let full = vec![b'x'; clawg_cli::serve_log::SERVE_LOG_LIMIT as usize + 1];
+    std::fs::write(logs.join("serve.log"), &full).expect("full log");
+    let mut bridge = sandbox.bridge_starting_its_daemon();
+
+    bridge.initialize();
+    let status = bridge.call(2, "memory_status", json!({}));
+
+    assert!(!tool_failed(&status), "{status}");
+    assert_eq!(std::fs::read(logs.join("serve.log.1")).expect("the old log moved aside"), full);
+    let log = std::fs::read_to_string(logs.join("serve.log")).expect("a new log");
+    let first = log.lines().next().unwrap_or_default();
+    let opening: String = first.chars().take(200).collect();
+    assert!(first.contains(&format!("clawg serve {} starting", env!("CARGO_PKG_VERSION"))), "{opening}");
+}
+
 // ── MCP over real stdio ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -915,6 +1136,24 @@ async fn a_hook_without_a_daemon_prints_nothing() {
 }
 
 #[tokio::test]
+async fn session_start_without_a_daemon_still_names_the_language() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let input = json!({ "cwd": sandbox.home, "source": "startup" }).to_string();
+
+    let out = hook(&sandbox, &["session-start", "--agent", "smoke", "--profile", "dev"], &input);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let printed: Value = serde_json::from_str(&stdout_of(&out)).expect("the hook's envelope");
+    let context = printed["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default();
+    assert!(context.starts_with("clawg: el idioma de la persona es el español."), "{printed}");
+    assert!(!sandbox.data_dir().join("daemon.json").exists(), "no daemon was started");
+
+    let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &input);
+    assert_eq!((out.status.code(), stdout_of(&out)), (Some(0), String::new()), "only the session's start names it");
+}
+
+#[tokio::test]
 async fn a_hook_with_input_that_is_not_json_prints_nothing() {
     let sandbox = Sandbox::new();
     let _daemon = sandbox.serve().await;
@@ -980,6 +1219,43 @@ async fn session_start_injects_the_saved_memories() {
     let out = hook(&sandbox, &["user-prompt-submit", "--agent", "smoke", "--profile", "dev"], &prompt.to_string());
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     assert_eq!(stdout_of(&out), "", "the session just started and a save just landed");
+}
+
+#[tokio::test]
+async fn two_clones_share_their_memories_through_a_real_daemon() {
+    let sandbox = Sandbox::new();
+    let clone = |name: &str| {
+        let root = sandbox.home.join(name).join("app");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[remote \"origin\"]\n\turl = git@github.com:acme/app.git\n")
+            .unwrap();
+        root
+    };
+    let (work, review) = (clone("work"), clone("review"));
+    let daemon = sandbox.serve().await;
+    let (status, registered) =
+        daemon.post("/v1/projects", json!({ "root_path": work.to_string_lossy(), "assigned": true })).await;
+    assert_eq!(status, 200, "{registered}");
+    let (status, body) = daemon
+        .post(
+            "/v1/memories",
+            json!({ "content": "the deploy script lives in ops/deploy.sh", "agent_id": "smoke", "project_id": registered["project_id"] }),
+        )
+        .await;
+    assert!(status == 201 || status == 202, "{body}");
+    daemon.wait_until_ingested().await;
+
+    let input = json!({ "session_id": "s", "cwd": review, "hook_event_name": "SessionStart", "source": "startup" });
+    let out = hook(&sandbox, &["session-start", "--agent", "smoke", "--profile", "dev"], &input.to_string());
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let reply: Value = serde_json::from_str(&stdout_of(&out)).expect("one JSON object");
+    let context = reply["hookSpecificOutput"]["additionalContext"].as_str().expect("context");
+    assert!(context.contains("ops/deploy.sh"), "the other clone's memory: {context}");
+
+    let listed = sandbox.command(&["memories", "list", "--here", "--profile", "dev"]).current_dir(&review).output().unwrap();
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr_of(&listed));
+    assert!(stdout_of(&listed).contains("ops/deploy.sh"), "{}", stdout_of(&listed));
 }
 
 #[tokio::test]
@@ -1086,6 +1362,106 @@ async fn doctor_reads_a_running_daemons_store_without_changing_it() {
     assert_eq!(findings(&report, "store.owner"), [("ok", "healthy")]);
     assert_eq!(findings(&report, "agents"), [("ok", "healthy")]);
     assert_eq!(store_files(&sandbox.data_dir()), before, "a stopped store gains no file and no byte");
+}
+
+#[tokio::test]
+async fn preferences_set_and_unset_write_the_profiles_file() {
+    let sandbox = Sandbox::new();
+    let file = sandbox.data_dir().join("preferences.json");
+    let shown = sandbox.run(&["preferences", "--profile", "dev"]);
+    assert_eq!((shown.status.code(), stdout_of(&shown).trim()), (Some(0), "no language preference: clawg uses English"));
+
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    assert!(stdout_of(&set).starts_with("Idioma: español."), "{}", stdout_of(&set));
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&file).expect("the file")).unwrap();
+    assert_eq!(written, json!({ "version": 1, "language": "es" }));
+    assert_eq!(stdout_of(&sandbox.run(&["preferences", "--profile", "dev"])).trim(), "idioma: español");
+
+    let unset = sandbox.run(&["preferences", "unset", "language", "--profile", "dev"]);
+    assert_eq!(unset.status.code(), Some(0), "{}", stderr_of(&unset));
+    assert!(stdout_of(&unset).starts_with("No language preference: clawg uses English."), "{}", stdout_of(&unset));
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&file).expect("the file")).unwrap();
+    assert_eq!(written, json!({ "version": 1 }));
+
+    let bad = sandbox.run(&["preferences", "set", "language", "fr", "--profile", "dev"]);
+    assert_ne!(bad.status.code(), Some(0), "an unknown language is a usage error");
+}
+
+#[tokio::test]
+async fn doctor_names_a_broken_preferences_file() {
+    let sandbox = Sandbox::new();
+    let (_, report) = doctor(&sandbox);
+    assert!(findings(&report, "preferences").is_empty(), "no file, no finding: {report}");
+
+    std::fs::create_dir_all(sandbox.data_dir()).expect("data dir");
+    std::fs::write(sandbox.data_dir().join("preferences.json"), r#"{"version":1,"language":"fr"}"#).expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "preferences"), [("warn", "invalid")]);
+    assert!(findings(&report, "protocol_block").is_empty(), "no preference to hold the block to: {report}");
+
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_ne!(set.status.code(), Some(0), "an invalid file is never overwritten");
+    std::fs::write(sandbox.data_dir().join("preferences.json"), r#"{"version":1,"language":"es"}"#).expect("write");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "preferences"), [("ok", "healthy")]);
+    assert_eq!(findings(&report, "protocol_block"), [("info", "not_installed")], "{report}");
+}
+
+/// Every finding but its message, so two reports of the same facts compare.
+fn without_messages(report: &Value) -> Vec<Value> {
+    let mut checks = report["checks"].as_array().expect("checks").clone();
+    for finding in &mut checks {
+        finding["message"] = Value::Null;
+    }
+    checks
+}
+
+#[tokio::test]
+async fn doctor_speaks_the_preferred_language() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.data_dir()).expect("data dir");
+    std::fs::write(sandbox.data_dir().join("preferences.json"), r#"{"version":1,"language":"en"}"#).expect("write");
+    let (en_output, en) = doctor(&sandbox);
+    std::fs::write(sandbox.data_dir().join("preferences.json"), r#"{"version":1,"language":"es"}"#).expect("write");
+    let (es_output, es) = doctor(&sandbox);
+
+    assert_eq!(es_output.status.code(), en_output.status.code());
+    assert_eq!(without_messages(&es), without_messages(&en), "only the messages change");
+    let message = |report: &Value, id: &str| {
+        let checks = report["checks"].as_array().unwrap();
+        checks.iter().find(|f| f["check_id"] == id).unwrap()["message"].as_str().unwrap().to_string()
+    };
+    assert_eq!(message(&en, "store.schema"), "there is no memory.db yet: the daemon creates it on its first start");
+    assert_eq!(message(&es, "store.schema"), "todavía no hay memory.db: el daemon lo crea la primera vez que arranca");
+    assert_eq!(message(&es, "preferences"), "las preferencias se pueden leer");
+}
+
+#[tokio::test]
+async fn stop_speaks_the_preferred_language() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+
+    let stopped = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stopped.status.code(), Some(0), "{}", stderr_of(&stopped));
+    assert!(stdout_of(&stopped).starts_with("se detuvo el daemon dev (pid "), "{}", stdout_of(&stopped));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+
+    let again = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(
+        stderr_of(&again).contains("clawg: no hay ningún daemon de clawg corriendo para el perfil dev"),
+        "{}",
+        stderr_of(&again)
+    );
+
+    std::fs::write(sandbox.data_dir().join("preferences.json"), "{ not json").expect("write");
+    let broken = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(broken.status.code(), Some(1), "a broken file changes no exit code");
+    assert!(stderr_of(&broken).contains("clawg: no clawg daemon is running for profile dev"), "{}", stderr_of(&broken));
 }
 
 #[tokio::test]

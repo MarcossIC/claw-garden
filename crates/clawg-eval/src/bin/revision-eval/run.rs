@@ -15,10 +15,11 @@ use clawg_cli::client::{ClientError, DaemonClient, ListArgs, MemoryRow, SearchAr
 use clawg_cli::daemon::api::{serve_ephemeral, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use clawg_cli::mcp::tools::{format_context, format_search};
 use clawg_core::eval_api::{
-    conflict_pairs, is_claim_type, row_distances, EvalEmbedder, EvalError, EvalIngest, EvalSave, EvalSaved,
-    EvalTokenCounter,
+    conflict_pairs, drop_superseded_text, drop_superseded_vectors, is_claim_type, row_distances, EvalEmbedder,
+    EvalError, EvalIngest, EvalSave, EvalSaved, EvalTokenCounter,
 };
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 use clawg_core::runtime::MemoryRuntime;
 use serde::Serialize;
 
@@ -29,6 +30,7 @@ use crate::chains::{
 use crate::cost::{self, CostError, Query, M4};
 use crate::set::ChainSet;
 use crate::store::{self, ReplayFile, Scored, StoreError};
+use crate::warned::{self, PickKind, ReplayRows, WarnedError, WarnedFile};
 
 /// The one agent that saves every arm.
 const AGENT: &str = "revision-eval";
@@ -68,6 +70,8 @@ pub enum RunError {
     Cost(#[from] CostError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Warned(#[from] WarnedError),
     #[error("could not read or write {}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -83,6 +87,7 @@ impl RunError {
     pub fn is_bad_input(&self) -> bool {
         match self {
             Self::Store(e) => !matches!(e, StoreError::Replay(_)),
+            Self::Warned(e) => !matches!(e, WarnedError::Replay(_)),
             Self::OutsideTemp(..) | Self::Refused(_) => true,
             _ => false,
         }
@@ -93,6 +98,7 @@ impl RunError {
     fn keeps_work(&self) -> bool {
         match self {
             Self::Store(e) => e.keeps_work(),
+            Self::Warned(e) => e.keeps_work(),
             Self::Refused(_) | Self::OutsideTemp(..) => true,
             _ => false,
         }
@@ -111,6 +117,9 @@ pub struct ChainsInput<'a> {
     /// Counts the tokens of M4; the same tokenizer the chunker loads for
     /// `--real`.
     pub counter: &'a EvalTokenCounter,
+    /// Saved in every arm before anything else, under the arm's agent and
+    /// project: the history of a real store the chains are saved on top of.
+    pub background: Option<&'a store::Background>,
 }
 
 /// A fresh scratch directory path under the system temp dir. Not created.
@@ -152,6 +161,12 @@ struct ArmRun<'a> {
     transitions: Vec<Transition<'a>>,
     /// What the router answered each chain's query, per chain.
     queries: Vec<Query>,
+    /// Vectors of `superseded` rows removed before the queries.
+    old_vectors_dropped: usize,
+    /// `superseded` rows taken out of `memory_fts` before the queries.
+    old_texts_dropped: usize,
+    /// Background saves stored before the distractors.
+    background_saves: usize,
 }
 
 /// How much one arm stored.
@@ -167,6 +182,14 @@ pub struct ArmReport {
     pub live_versions: usize,
     /// Chains with exactly one live version.
     pub chains_with_one_live_version: usize,
+    /// Vectors of `superseded` rows the arm removed before its queries; only
+    /// the bare arms remove any.
+    pub old_vectors_dropped: usize,
+    /// `superseded` rows the arm took out of `memory_fts` before its queries;
+    /// only the unindexed arm takes any.
+    pub old_texts_dropped: usize,
+    /// Background saves the arm stored before its distractors.
+    pub background_saves: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,9 +201,18 @@ pub struct ChainsReport {
     pub chains: usize,
     pub transitions: usize,
     pub distractors: usize,
+    /// What the background held, when the run had one.
+    pub background: Option<store::BackgroundCounts>,
     pub arms: BTreeMap<&'static str, ArmReport>,
     pub m1: M1,
+    /// The keyed arm against the unindexed one: the same store with the older
+    /// versions in no index, so they are all that tells the two apart. The
+    /// control also differs in the store's history (the superseded rows, the
+    /// pairs written against versions still live then, the rows' ages), which
+    /// orders hits that score almost the same.
     pub m2: M2,
+    /// The keyed arm against the control, kept as a reference.
+    pub m2_control: M2,
     /// What showing the key costs, over the keyed arm's queries.
     pub m4: M4,
     /// By arm and chain id, where each version shows for the chain's query.
@@ -233,9 +265,11 @@ async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
         chains: input.set.chains.len(),
         transitions: input.set.transitions(),
         distractors: input.distractors.len(),
+        background: input.background.map(|b| b.counts.clone()),
         arms: runs.iter().map(|(arm, run)| (arm.as_str(), arm_report(run))).collect(),
         m1: m1(&run_of(Arm::NoKey).transitions),
-        m2: m2(&views(run_of(Arm::Keyed)), &views(run_of(Arm::Control))),
+        m2: m2(&views(run_of(Arm::Keyed)), &views(run_of(Arm::KeyedUnindexed))),
+        m2_control: m2(&views(run_of(Arm::Keyed)), &views(run_of(Arm::Control))),
         m4,
         positions,
     })
@@ -247,6 +281,11 @@ async fn measure(input: &ChainsInput<'_>, scratch: &Path) -> Result<ChainsReport
 async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<ArmRun<'a>, RunError> {
     std::fs::create_dir_all(dir).map_err(|source| RunError::Scratch { path: dir.to_path_buf(), source })?;
     let ingest = EvalIngest::open(dir, input.embedder, input.tokenizer_dir).await?;
+    let background = input.background.map_or(&[][..], |b| b.saves.as_slice());
+    for older in background {
+        let topic_key = older.topic_key.as_deref();
+        ingest.save(EvalSave { importance: older.importance, ..save(&older.text, &older.memory_type, topic_key) }).await?;
+    }
     for distractor in input.distractors {
         ingest.save(save(distractor, "semantic_fact", None)).await?;
     }
@@ -262,6 +301,9 @@ async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<Ar
         .collect();
     let runtime = ingest.finish().await?;
     let outcomes = if arm == Arm::NoKey { read_outcomes(&runtime, input.set, &saved).await? } else { Vec::new() };
+    let bare = matches!(arm, Arm::KeyedBare | Arm::KeyedUnindexed);
+    let old_vectors_dropped = if bare { drop_superseded_vectors(&runtime).await? } else { 0 };
+    let old_texts_dropped = if arm == Arm::KeyedUnindexed { drop_superseded_text(&runtime).await? } else { 0 };
 
     let session = serve(runtime).await?;
     let read = read_router(&session.client, input.set, &own).await;
@@ -278,7 +320,17 @@ async fn run_arm<'a>(input: &ChainsInput<'a>, arm: Arm, dir: &Path) -> Result<Ar
             above: shown[index].above_at(to),
         })
         .collect();
-    Ok(ArmRun { saved, own, listed, shown, transitions, queries })
+    Ok(ArmRun {
+        saved,
+        own,
+        listed,
+        shown,
+        transitions,
+        queries,
+        old_vectors_dropped,
+        old_texts_dropped,
+        background_saves: background.len(),
+    })
 }
 
 /// Per chain, the versions with a row of their own the router lists live.
@@ -305,11 +357,12 @@ async fn read_router(
                 agent_id: AGENT.to_string(),
                 project_id: Some(PROJECT.to_string()),
                 limit: None,
+                lang: None,
             })
             .await?;
-        let search = format_search(found.clone(), AGENT, Some(PROJECT));
-        let prompt = client.context(&chain.query, AGENT, Some(PROJECT), None).await?.prompt;
-        let context = format_context(&prompt);
+        let search = format_search(found.clone(), AGENT, Some(PROJECT), None);
+        let prompt = client.context(&chain.query, AGENT, Some(PROJECT), None, None).await?.prompt;
+        let context = format_context(Lang::En, &prompt);
         shown.push(Shown { search: positions(own, &search_ids(&search)), context: positions(own, &context_ids(&context)) });
         queries.push(Query { found, prompt });
     }
@@ -358,6 +411,9 @@ fn arm_report(run: &ArmRun<'_>) -> ArmReport {
         rows: rows.len(),
         live_versions: live.iter().sum(),
         chains_with_one_live_version: live.iter().filter(|&&n| n == 1).count(),
+        old_vectors_dropped: run.old_vectors_dropped,
+        old_texts_dropped: run.old_texts_dropped,
+        background_saves: run.background_saves,
     }
 }
 
@@ -387,6 +443,7 @@ async fn serve(runtime: MemoryRuntime) -> Result<Session, RunError> {
         shutdown,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
+        metrics: Default::default(),
     });
     let (addr, server) = serve_ephemeral(app.clone()).await.map_err(RunError::Serve)?;
     let client = DaemonClient::new(format!("http://{addr}"), TOKEN, base_dir);
@@ -450,6 +507,7 @@ async fn remove_scratch(scratch: &Path) {
 
 const LABELS_FILE: &str = "labels.jsonl";
 const REPLAY_FILE: &str = "replay.json";
+const WARNED_FILE: &str = "warned.json";
 const REPLAY_STORE: &str = "replay";
 const WORK_DIR_PREFIX: &str = "revision-eval-";
 
@@ -503,6 +561,26 @@ fn write_new_file(path: &Path, text: &str) -> Result<(), RunError> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(io_error(path))?;
     file.write_all(text.as_bytes()).map_err(io_error(path))
+}
+
+/// Runs every arm on top of the export at `export`, which must sit in a
+/// `revision-eval-*` directory made directly under the system temp dir, and
+/// then removes that directory and the scratch one, whatever the outcome.
+pub async fn run_with_background(
+    input: &ChainsInput<'_>,
+    scratch: &Path,
+    export: &Path,
+) -> Result<ChainsReport, RunError> {
+    let dir = work_dir(export)?;
+    let measured = async {
+        let text = std::fs::read_to_string(export).map_err(io_error(export))?;
+        let background = store::background(store::read_export(&text)?);
+        drop(text);
+        run(&ChainsInput { background: Some(&background), ..*input }, scratch).await
+    }
+    .await;
+    remove_scratch(&dir).await;
+    measured
 }
 
 /// The first step: replays the export beside it, leaves `labels.jsonl` and
@@ -614,12 +692,23 @@ pub async fn store_score(
 ) -> Result<Scored, RunError> {
     let dir = work_dir(labels)?;
     let scored = read_and_score(&dir, labels, check);
+    settle(&dir, scored, write).await
+}
+
+/// What a second step does with its outcome: a result is written and the
+/// directory removed, whether or not the writing worked; an error removes the
+/// directory too, unless the labelling in it is what needs fixing.
+async fn settle<T>(
+    dir: &Path,
+    scored: Result<T, RunError>,
+    write: impl FnOnce(&T) -> Result<(), RunError>,
+) -> Result<T, RunError> {
     match &scored {
         Err(e) if e.keeps_work() => {}
-        Err(_) => remove_scratch(&dir).await,
+        Err(_) => remove_scratch(dir).await,
         Ok(scored) => {
             let written = write(scored);
-            remove_scratch(&dir).await;
+            remove_scratch(dir).await;
             written?;
         }
     }
@@ -636,6 +725,133 @@ fn read_and_score(
     check(&replay)?;
     let labels = store::parse_labels(&std::fs::read_to_string(labels).map_err(io_error(labels))?)?;
     Ok(store::score(&replay, &labels)?)
+}
+
+/// What the first step of `warned` reports: counts only, never a stored text.
+#[derive(Debug, Serialize)]
+pub struct WarnedSummary {
+    pub counts: warned::WindowCounts,
+    pub labelled_marked: usize,
+    pub labelled_rest: usize,
+    pub window_start_ms: i64,
+    pub seed: u64,
+}
+
+/// The first step of `warned`: reads the window of the export beside it,
+/// leaves `labels.jsonl` and `warned.json` in its directory and removes the
+/// replay store. Any error removes the directory with the export in it.
+pub async fn warned_replay(export: &Path, since_ms: i64, input: &ReplayInput<'_>) -> Result<WarnedSummary, RunError> {
+    let dir = work_dir(export)?;
+    let replayed = warned_replay_in(&dir, export, since_ms, input).await;
+    if replayed.is_err() {
+        remove_scratch(&dir).await;
+    }
+    replayed
+}
+
+async fn warned_replay_in(
+    dir: &Path,
+    export: &Path,
+    since_ms: i64,
+    input: &ReplayInput<'_>,
+) -> Result<WarnedSummary, RunError> {
+    let text = std::fs::read_to_string(export).map_err(io_error(export))?;
+    let selection = warned::select(&text, since_ms, input.seed)?;
+    drop(text);
+
+    let store_dir = dir.join(REPLAY_STORE);
+    std::fs::create_dir_all(&store_dir).map_err(|source| RunError::Scratch { path: store_dir.clone(), source })?;
+    let ingest = EvalIngest::open(&store_dir, input.embedder, input.tokenizer_dir).await?;
+    // Every save with an agent, in the order they were made: the rest is
+    // paired by the distances between the rows these leave.
+    let mut reports = Vec::with_capacity(selection.flow.len());
+    for &i in &selection.flow {
+        let save = &selection.saves[i];
+        reports.push(
+            ingest
+                .save(EvalSave {
+                    agent_id: save.agent.as_deref().expect("the flow holds the saves that have an agent"),
+                    project_id: save.project.as_deref(),
+                    content: &save.text,
+                    memory_type: &save.memory_type,
+                    importance: save.importance,
+                    topic_key: save.topic_key.as_deref(),
+                })
+                .await?,
+        );
+    }
+    let runtime = ingest.finish().await?;
+
+    let rows = ReplayRows::new(&selection.flow, &reports);
+    let mut found = Vec::with_capacity(selection.picks.len());
+    for pick in &selection.picks {
+        found.push(match &pick.kind {
+            PickKind::Marked { .. } => None,
+            PickKind::Rest { predecessors } => {
+                let distances = row_distances(&runtime, &rows.reported(pick.later), &rows.inserted(predecessors)).await?;
+                rows.nearest(&distances)
+            }
+        });
+    }
+    // Closing is awaited, as in `release`: Windows cannot delete the files
+    // of a store whose connection has not closed yet.
+    runtime.store.conn.clone().close().await.map_err(|e| RunError::Close(e.to_string()))?;
+    drop(runtime);
+    remove_scratch(&store_dir).await;
+
+    let labels = warned::build_labels(&selection, &found);
+    let mut counts = selection.counts.clone();
+    counts.rest_unpaired = labels.unpaired;
+    let file = WarnedFile {
+        export_format: selection.format.clone(),
+        export_version: selection.version,
+        model_contract: input.embedder.model_id().to_string(),
+        seed: input.seed,
+        fake: input.fake,
+        window_start_ms: selection.window_start_ms,
+        counts: counts.clone(),
+        warning_line_tokens: input.counter.count(cost::WARNING_LINE),
+        store_sizes: selection.store_sizes.clone(),
+        pairs: labels.pairs.clone(),
+    };
+    let lines: String =
+        labels.lines.iter().map(|l| serde_json::to_string(l).expect("a label line serializes") + "\n").collect();
+    write_new_file(&dir.join(LABELS_FILE), &lines)?;
+    let file_json = serde_json::to_string_pretty(&file).expect("the warned file serializes");
+    write_new_file(&dir.join(WARNED_FILE), &file_json)?;
+    Ok(WarnedSummary {
+        counts,
+        labelled_marked: labels.pairs.iter().filter(|p| p.marked).count(),
+        labelled_rest: labels.pairs.iter().filter(|p| !p.marked).count(),
+        window_start_ms: selection.window_start_ms,
+        seed: input.seed,
+    })
+}
+
+/// The second step of `warned`: reads the labels beside `labels` and the file
+/// the first step left, scores them, hands the result to `write` and removes
+/// the directory. A labels file the owner has not finished is refused and the
+/// directory stays, since the labelling is in it; every other error removes it.
+pub async fn warned_score(
+    labels: &Path,
+    check: impl FnOnce(&WarnedFile) -> Result<(), RunError>,
+    write: impl FnOnce(&warned::Scored) -> Result<(), RunError>,
+) -> Result<warned::Scored, RunError> {
+    let dir = work_dir(labels)?;
+    let scored = read_and_score_warned(&dir, labels, check);
+    settle(&dir, scored, write).await
+}
+
+fn read_and_score_warned(
+    dir: &Path,
+    labels: &Path,
+    check: impl FnOnce(&WarnedFile) -> Result<(), RunError>,
+) -> Result<warned::Scored, RunError> {
+    let path = dir.join(WARNED_FILE);
+    let file = warned::parse_warned(&std::fs::read_to_string(&path).map_err(io_error(&path))?)?;
+    check(&file)?;
+    let labels = warned::parse_labels(&std::fs::read_to_string(labels).map_err(io_error(labels))?)?;
+    Ok(warned::score(&file, &labels)?)
 }
 
 #[cfg(test)]
@@ -683,7 +899,7 @@ mod tests {
         let set = tiny_set();
         let scratch = scratch_dir();
         let embedder = EvalEmbedder::fake();
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake() };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
 
         let run = run_arm(&input, Arm::Keyed, &scratch.join(Arm::Keyed.as_str())).await;
         remove_scratch(&scratch).await;
@@ -716,7 +932,7 @@ mod tests {
         let set = tiny_set();
         let scratch = scratch_dir();
         let embedder = EvalEmbedder::fake();
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake() };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
 
         let report = run(&input, &scratch).await.expect("the run must succeed");
 
@@ -730,23 +946,35 @@ mod tests {
         assert_eq!((keyed.saves, keyed.live_versions, keyed.chains_with_one_live_version), (5, 2, 2));
         let control = arm("control");
         assert_eq!((control.saves, control.live_versions, control.chains_with_one_live_version), (2, 2, 2));
+        let bare = arm("keyed_bare");
+        assert_eq!((bare.saves, bare.live_versions, bare.chains_with_one_live_version), (5, 2, 2));
+        assert!(bare.old_vectors_dropped > 0, "the older versions' own rows lose their vectors");
+        assert!([&no_key, &keyed, &control].iter().all(|a| a.old_vectors_dropped == 0));
+        let unindexed = arm("keyed_unindexed");
+        assert_eq!((unindexed.saves, unindexed.live_versions, unindexed.chains_with_one_live_version), (5, 2, 2));
+        assert_eq!(unindexed.old_vectors_dropped, bare.old_vectors_dropped);
+        assert_eq!(unindexed.old_texts_dropped, bare.old_vectors_dropped, "the same rows leave the text index");
+        assert!([&no_key, &keyed, &bare, &control].iter().all(|a| a.old_texts_dropped == 0));
         let m1 = &report.m1.all;
         assert_eq!(m1.transitions, 3);
         assert_eq!(m1.escalated.k + m1.pending.k + m1.no_mark.k, 3);
         assert_eq!(m1.no_mark_reasons.below_floor.k, 0, "a row two versions share is never compared with itself");
 
-        for arm in ["no_key", "keyed", "control"] {
+        for arm in ["no_key", "keyed", "keyed_bare", "keyed_unindexed", "control"] {
             for chain in &set.chains {
                 let shown = &report.positions[arm][&chain.id];
                 assert_eq!((shown.search.len(), shown.context.len()), (chain.versions.len(), chain.versions.len()));
             }
         }
-        for arm in ["keyed", "control"] {
+        for arm in ["keyed", "keyed_bare", "keyed_unindexed", "control"] {
             let shown = &report.positions[arm]["a"];
             assert!(shown.search[2].is_some() && shown.context[2].is_some(), "{arm}: the last version shows: {shown:?}");
             assert_eq!((shown.search[..2].to_vec(), shown.context[..2].to_vec()), (vec![None, None], vec![None, None]));
         }
         assert!(report.m2.one_live_version.met && report.m2.no_old_version_shown.met, "{:?}", report.m2);
+        assert!(report.m2.last_where_reference.met, "the keyed arm places its last versions as the unindexed arm: {:?}", report.m2);
+        let m2_control = &report.m2_control;
+        assert!(m2_control.one_live_version.met && m2_control.no_old_version_shown.met, "{m2_control:?}");
         let m4 = &report.m4;
         assert_eq!((m4.search.outputs, m4.context.outputs), (2, 2));
         assert!(m4.search.total_byte_delta > 0, "the keyed arm's search shows the keys: {m4:?}");
@@ -760,7 +988,7 @@ mod tests {
         let set = tiny_set();
         let scratch = scratch_dir();
         let embedder = EvalEmbedder::fake();
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake() };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
         let run = run_arm(&input, Arm::Keyed, &scratch.join(Arm::Keyed.as_str())).await;
         remove_scratch(&scratch).await;
         let run = run.expect("the keyed arm must run");
@@ -808,7 +1036,7 @@ mod tests {
             .parent()
             .expect("the temp dir has a parent")
             .join(format!("revision-eval-must-not-be-created-{}", std::process::id()));
-        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &outside, counter: &EvalTokenCounter::fake() };
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &outside, counter: &EvalTokenCounter::fake(), background: None };
 
         match run(&input, &outside).await {
             Err(RunError::OutsideTemp(path, _)) => assert_eq!(path, outside),
@@ -848,6 +1076,45 @@ mod tests {
         assert!(!dir.join(REPLAY_STORE).exists(), "the replay store is removed at the end of the first step");
         assert!(export.exists());
         remove_scratch(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_fake_chains_run_stores_the_background_in_every_arm_and_removes_its_export() {
+        let set = tiny_set();
+        let scratch = scratch_dir();
+        let embedder = EvalEmbedder::fake();
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
+        let rows = small_export();
+        let (dir, export) = work_with(&rows);
+
+        let report = run_with_background(&input, &scratch, &export).await.expect("the run must succeed");
+
+        assert!(!dir.exists() && !scratch.exists(), "the export's directory and the scratch one are removed");
+        let background = report.background.as_ref().expect("the report says what the background held");
+        assert_eq!((background.saves, background.without_agent, background.gone), (5, 1, 0));
+        assert!(report.arms.values().all(|arm| arm.background_saves == 5), "{:?}", report.arms);
+        assert!(report.m2.one_live_version.met, "a background key never revises a chain: {:?}", report.m2);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(rows.iter().all(|r| !json.contains(&r.content)), "no background text reaches the result");
+        assert!(!json.contains("cache/layer"), "nor a background key");
+    }
+
+    #[tokio::test]
+    async fn a_background_outside_a_work_dir_is_refused_and_left_alone() {
+        let set = tiny_set();
+        let scratch = scratch_dir();
+        let embedder = EvalEmbedder::fake();
+        let input = ChainsInput { set: &set, distractors: &distractors(), embedder: &embedder, tokenizer_dir: &scratch, counter: &EvalTokenCounter::fake(), background: None };
+        let dir = std::env::temp_dir().join(format!("not-a-work-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let export = dir.join("export.jsonl");
+        std::fs::write(&export, "not read").unwrap();
+
+        let error = run_with_background(&input, &scratch, &export).await.unwrap_err();
+
+        assert!(matches!(error, RunError::Refused(_)), "{error}");
+        assert!(export.exists() && !scratch.exists(), "nothing is removed and no store is made");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
@@ -917,6 +1184,160 @@ mod tests {
         std::fs::remove_dir_all(&outside).unwrap();
         std::fs::remove_file(&loose).unwrap();
         remove_scratch(&inside).await;
+    }
+
+    use crate::store::fixtures::{at, header_filtered, warned_lines, work_with_lines};
+
+    async fn fake_warned(export: &Path, since: i64, seed: u64) -> Result<WarnedSummary, RunError> {
+        let embedder = EvalEmbedder::fake();
+        let counter = EvalTokenCounter::fake();
+        let no_tokenizer = scratch_dir();
+        warned_replay(export, since, &ReplayInput { embedder: &embedder, tokenizer_dir: &no_tokenizer, counter: &counter, seed, fake: true }).await
+    }
+
+    #[tokio::test]
+    async fn a_fake_warned_run_counts_and_labels_the_marked_pairs_and_the_rest_of_a_small_export() {
+        let (dir, export) = work_with_lines(&warned_lines());
+
+        let summary = fake_warned(&export, at(10), warned::DEFAULT_SEED).await.expect("the replay must succeed");
+
+        let c = &summary.counts;
+        assert_eq!((c.rows, c.saves, c.window_saves, c.window_saves_with_agent), (8, 8, 6, 5));
+        assert_eq!((c.marked, c.rest, c.rest_chosen, c.rest_unpaired), (2, 3, 3, 0));
+        assert_eq!((summary.labelled_marked, summary.labelled_rest, summary.window_start_ms), (2, 3, at(10)));
+
+        let labels = warned::parse_labels(&std::fs::read_to_string(dir.join(LABELS_FILE)).unwrap()).unwrap();
+        let file = warned::parse_warned(&std::fs::read_to_string(dir.join(WARNED_FILE)).unwrap()).unwrap();
+        assert_eq!((labels.len(), file.pairs.len()), (5, 5));
+        assert!(labels.iter().all(|l| l.a.is_none() && l.b.is_none() && l.c.is_none()));
+        assert!(file.fake && file.warning_line_tokens > 0 && file.model_contract == EvalEmbedder::fake().model_id());
+        assert_eq!((file.window_start_ms, file.store_sizes.len()), (at(10), 5));
+        assert_eq!(file.pairs.iter().filter(|p| p.marked).count(), 2);
+        let pair_of = |later: &str| {
+            let line = labels.iter().find(|l| l.later.starts_with(later)).expect("the pair is labelled");
+            (line.earlier.clone(), file.pairs[line.n - 1].clone())
+        };
+        let (earlier, thursdays) = pair_of("Deploys now go out on Thursdays");
+        assert_eq!(earlier, "Deploys go out on Tuesdays after the freeze.");
+        assert!(thursdays.marked && thursdays.actions == Some(warned::Actions::default()));
+        let (earlier, fourteen) = pair_of("The nightly backup keeps the last fourteen");
+        assert_eq!(earlier, "The nightly backup keeps the last seven snapshots.");
+        assert!(fourteen.marked && fourteen.actions.is_some_and(|a| a.followed && !a.hid && !a.reused));
+        assert!(!dir.join(REPLAY_STORE).exists(), "the replay store is removed at the end of the first step");
+        assert!(export.exists());
+        remove_scratch(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn the_same_seed_labels_the_same_pairs_in_the_same_order() {
+        let (dir_a, export_a) = work_with_lines(&warned_lines());
+        let (dir_b, export_b) = work_with_lines(&warned_lines());
+        fake_warned(&export_a, at(10), 3).await.unwrap();
+        fake_warned(&export_b, at(10), 3).await.unwrap();
+
+        let read = |dir: &Path| std::fs::read_to_string(dir.join(LABELS_FILE)).unwrap();
+
+        assert_eq!(read(&dir_a), read(&dir_b));
+        remove_scratch(&dir_a).await;
+        remove_scratch(&dir_b).await;
+    }
+
+    #[tokio::test]
+    async fn an_export_the_first_step_refuses_is_removed_with_its_directory() {
+        let lines = warned_lines();
+
+        // Made without the deleted rows.
+        let (dir, export) = work_with_lines(&lines);
+        let text = std::fs::read_to_string(&export).unwrap().replacen("\"include_deleted\":true", "\"include_deleted\":false", 1);
+        std::fs::write(&export, text).unwrap();
+        let error = fake_warned(&export, at(10), 1).await.unwrap_err();
+        assert!(matches!(error, RunError::Warned(WarnedError::WithoutDeleted)), "{error}");
+        assert!(error.is_bad_input());
+        assert!(!dir.exists(), "a failed first step removes the directory with the export in it");
+
+        // Limited to a project.
+        let (dir, export) = work_with_lines(&lines);
+        let filtered = crate::store::fixtures::export_with(header_filtered(1, serde_json::json!({"include_deleted": true, "project": "repo-1"})), &lines);
+        std::fs::write(&export, filtered).unwrap();
+        let error = fake_warned(&export, at(10), 1).await.unwrap_err();
+        assert!(matches!(error, RunError::Warned(WarnedError::Filtered(_))), "{error}");
+        assert!(!dir.exists());
+
+        // Outside a work directory: refused, and left alone.
+        let (inside, _) = work_with_lines(&[]);
+        let loose = inside.parent().unwrap().join(format!("loose-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&loose, "kept").unwrap();
+        let error = fake_warned(&loose, at(10), 1).await.unwrap_err();
+        assert!(matches!(error, RunError::Refused(_)), "{error}");
+        assert!(loose.exists() && inside.exists());
+        std::fs::remove_file(&loose).unwrap();
+        remove_scratch(&inside).await;
+    }
+
+    /// Fills every pass of the labels file with `label`.
+    fn fill(dir: &Path, label: &str) {
+        let path = dir.join(LABELS_FILE);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let filled = ["a", "b"].iter().fold(text, |text, pass| text.replace(&format!("\"{pass}\":null"), &format!("\"{pass}\":\"{label}\"")));
+        std::fs::write(path, filled).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_second_step_scores_the_labels_and_removes_the_directory() {
+        let (dir, export) = work_with_lines(&warned_lines());
+        fake_warned(&export, at(10), 1).await.unwrap();
+        fill(&dir, "revision");
+        let mut seen: Option<bool> = None;
+
+        let scored = warned_score(
+            &dir.join(LABELS_FILE),
+            |file: &WarnedFile| {
+                seen = Some(file.fake);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect("the labels score");
+
+        assert_eq!(seen, Some(true));
+        assert_eq!((scored.labelled.marked, scored.labelled.rest), (2, 3));
+        assert_eq!((scored.precision.k, scored.precision.n), (2, 2));
+        assert!(!dir.exists(), "the directory goes once the result is out");
+    }
+
+    #[tokio::test]
+    async fn a_labels_file_the_owner_has_not_finished_keeps_the_directory_of_the_second_step() {
+        let (dir, export) = work_with_lines(&warned_lines());
+        fake_warned(&export, at(10), 1).await.unwrap();
+
+        let error = warned_score(&dir.join(LABELS_FILE), |_| Ok(()), |_| Ok(())).await.unwrap_err();
+
+        assert!(matches!(error, RunError::Warned(WarnedError::EmptyLabel { n: 1, field: "a" })), "{error}");
+        assert!(error.is_bad_input());
+        assert!(dir.join(LABELS_FILE).exists() && dir.join(WARNED_FILE).exists());
+        let refused = warned_score(&dir.join(LABELS_FILE), |_| Err(RunError::Refused("taken".into())), |_| Ok(())).await;
+        assert!(matches!(refused, Err(RunError::Refused(_))));
+        assert!(dir.exists(), "a refusal before scoring leaves the labelling alone");
+        remove_scratch(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn the_second_step_removes_the_directory_when_the_replay_file_or_the_result_fails() {
+        let (dir, export) = work_with_lines(&warned_lines());
+        fake_warned(&export, at(10), 1).await.unwrap();
+        std::fs::write(dir.join(WARNED_FILE), "{").unwrap();
+        let error = warned_score(&dir.join(LABELS_FILE), |_| Ok(()), |_| Ok(())).await.unwrap_err();
+        assert!(matches!(error, RunError::Warned(WarnedError::Replay(_))), "{error}");
+        assert!(!error.is_bad_input(), "the owner did not write that file");
+        assert!(!dir.exists());
+
+        let (dir, export) = work_with_lines(&warned_lines());
+        fake_warned(&export, at(10), 1).await.unwrap();
+        fill(&dir, "other");
+        let refused = warned_score(&dir.join(LABELS_FILE), |_| Ok(()), |_| Err(RunError::Refused("no".into()))).await;
+        assert!(refused.is_err());
+        assert!(!dir.exists(), "the directory goes whether or not the result is written");
     }
 
     #[test]

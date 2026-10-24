@@ -8,6 +8,7 @@ use crate::memory::backup::{self, SchemaPlan};
 use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
+use crate::memory::sharing::{self, Reader};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
 
 // ---------------------------------------------------------------------------
@@ -161,6 +162,13 @@ pub struct MemoryStore {
     /// The data directory holding `memory.db`, where a second connection can
     /// open it. `None` for the in-memory test store, which has no file.
     dir: Option<PathBuf>,
+    /// Where `sharing.json` is read from when a save is compared with what
+    /// its agent reaches. The data directory; `None` for an in-memory store
+    /// no runtime placed, which shares everything.
+    sharing_dir: Option<PathBuf>,
+    /// The numbers of the imports this process is writing, shared with every
+    /// clone, which an undo refuses until they end.
+    pub(crate) importing: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
 }
 
 /// Bytes of WAL a checkpoint may leave on disk. A checkpoint rewinds the WAL
@@ -237,6 +245,8 @@ impl MemoryStore {
             knn_latency: Arc::new(KnnLatency::new()),
             _lock: Some(Arc::new(lock)),
             dir: Some(base_dir.to_path_buf()),
+            sharing_dir: Some(base_dir.to_path_buf()),
+            importing: Arc::default(),
         })
     }
 
@@ -258,7 +268,25 @@ impl MemoryStore {
             knn_latency: Arc::new(KnnLatency::new()),
             _lock: None,
             dir: None,
+            sharing_dir: None,
+            importing: Arc::default(),
         })
+    }
+
+    /// This in-memory store reading `sharing.json` from `dir`, as a runtime
+    /// over a real data directory does.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_sharing_dir(self, dir: PathBuf) -> Self {
+        Self { sharing_dir: Some(dir), ..self }
+    }
+
+    /// `agent_id` with what the sharing policy lets it reach, read now, so a
+    /// change to the policy counts from the next save on.
+    pub(crate) fn reader_for(&self, agent_id: &str) -> Reader {
+        match &self.sharing_dir {
+            Some(dir) => sharing::reader_in(dir, agent_id),
+            None => Reader::new(agent_id, sharing::SharingPolicy::default().reach_for(agent_id)),
+        }
     }
 
     /// Writes a snapshot of the store into `into` and returns its path.
@@ -676,7 +704,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 17);
+        assert_eq!(after.0, 26);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1317,6 +1345,492 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(17)).await;
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (content, indexes): (String, Vec<String>) = store
+            .conn
+            .call(|c| -> rusqlite::Result<(String, Vec<String>)> {
+                let content = c.query_row("SELECT content FROM memory WHERE agent_id = 'agent-seed'", [], |r| r.get(0))?;
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'memory' \
+                     AND name IN ('idx_memory_session_summary', 'idx_memory_agent_created') ORDER BY name",
+                )?;
+                let indexes = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok((content, indexes))
+            })
+            .await
+            .unwrap();
+        assert_eq!(content, "seeded on disk");
+        assert_eq!(indexes, ["idx_memory_agent_created", "idx_memory_session_summary"]);
+    }
+
+    #[tokio::test]
+    async fn a_store_from_before_project_scoped_rules_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(19)).await;
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        conn.call(|c| {
+            // Two agents holding one key and one text in project p, and a row
+            // no agent saved: what agent-scoped rules let live side by side.
+            for (id, agent, content, hash, key) in [
+                (10, Some("a"), "storage engine is sqlite", "h1", Some("storage/engine")),
+                (11, Some("b"), "storage engine is postgres", "h2", Some("storage/engine")),
+                (12, Some("a"), "the build uses cargo", "h3", None),
+                (13, Some("b"), "the build uses cargo", "h3", None),
+                (14, None, "a note nobody saved", "h4", None),
+            ] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status, content_hash, topic_key) \
+                     VALUES (?1, CASE WHEN ?2 IS NULL THEN 'project' ELSE 'agent' END, ?2, 'p', ?3, \
+                      'semantic_fact', 'explicit', ?1, 'agent', 'x', ?1, ?1, 5.0, 3, 'active', ?4, ?5)",
+                    rusqlite::params![id, agent, content, hash, key],
+                )?;
+            }
+            c.execute("INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('a', 'p', 5)", [])
+        })
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (rows, reviews, indexes): (Vec<(i64, Option<String>, String)>, i64, Vec<String>) = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                let mut stmt = c.prepare("SELECT id, agent_id, status FROM memory WHERE id >= 10 ORDER BY id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+                let reviews = c.query_row("SELECT COUNT(*) FROM synthesis_review", [], |r| r.get(0))?;
+                let mut stmt = c.prepare(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' \
+                     AND name IN ('idx_memory_dedup', 'idx_memory_topic') ORDER BY name",
+                )?;
+                let indexes = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok((rows, reviews, indexes))
+            })
+            .await
+            .unwrap();
+        let active = |id: i64, agent: Option<&str>| (id, agent.map(str::to_owned), "active".to_string());
+        assert_eq!(
+            rows,
+            vec![active(10, Some("a")), active(11, Some("b")), active(12, Some("a")), active(13, Some("b")), active(14, None)],
+            "migrating changes no row"
+        );
+        assert_eq!(reviews, 1, "the agent's review stays");
+        assert_eq!(indexes.len(), 2);
+        assert!(indexes[0].contains("(COALESCE(project_id, ''), content_hash, created_at)"), "{}", indexes[0]);
+        assert!(indexes[1].contains("(COALESCE(project_id, ''), topic_key)"), "{}", indexes[1]);
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
+    /// Nothing moved a row between projects before the move log, so a store
+    /// from before it opens with the log empty and every row where it was.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_an_empty_move_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(20)).await;
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        conn.call(|c| {
+            for (id, agent, project) in [(10, Some("a"), Some("p-1a2b")), (11, Some("b"), None), (12, None, None)] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES (?1, CASE WHEN ?2 IS NOT NULL THEN 'agent' WHEN ?3 IS NULL THEN 'global' ELSE 'project' END, \
+                      ?2, ?3, 'row ' || ?1, 'semantic_fact', 'explicit', ?1, 'agent', 'x', ?1, ?1, 5.0, 3, 'active')",
+                    rusqlite::params![id, agent, project],
+                )?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (rows, logged): (Vec<(i64, String, Option<String>, Option<String>)>, i64) = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                let mut stmt =
+                    c.prepare("SELECT id, scope, agent_id, project_id FROM memory WHERE id >= 10 ORDER BY id")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let logged = c.query_row("SELECT COUNT(*) FROM memory_move", [], |r| r.get(0))?;
+                Ok((rows, logged))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (10, "agent".to_string(), Some("a".to_string()), Some("p-1a2b".to_string())),
+                (11, "agent".to_string(), Some("b".to_string()), None),
+                (12, "global".to_string(), None, None),
+            ],
+            "migrating changes no row"
+        );
+        assert_eq!(logged, 0);
+    }
+
+    /// No row said its language before the column, so a store from before it
+    /// opens with every row as it was and the column empty, for the
+    /// maintenance pass to fill.
+    #[tokio::test]
+    async fn a_store_from_before_the_language_column_keeps_its_rows_and_gains_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(21)).await;
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        conn.call(|c| {
+            for (id, agent, content, status, deleted, key) in [
+                (10, Some("a"), "The daemon stores every memory in one transaction.", "active", None, Some("storage/engine")),
+                (11, Some("b"), "El daemon guarda cada memoria en una sola transacción.", "superseded", None, None),
+                (12, None, "Una nota que no guardó ningún agente.", "active", None, None),
+                (13, Some("a"), "A deleted row that can come back.", "active", Some(13), None),
+            ] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status, deleted_at, topic_key) \
+                     VALUES (?1, CASE WHEN ?2 IS NULL THEN 'project' ELSE 'agent' END, ?2, 'p', ?3, 'semantic_fact', \
+                      'explicit', ?1, 'agent', 'x', ?1, ?1, 5.0, 3, ?4, ?5, ?6)",
+                    rusqlite::params![id, agent, content, status, deleted, key],
+                )?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        type Row = (i64, Option<String>, String, String, Option<i64>, Option<String>, Option<String>);
+        let (rows, indexes): (Vec<Row>, Vec<String>) = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                let mut stmt = c.prepare(
+                    "SELECT id, agent_id, content, status, deleted_at, topic_key, lang FROM memory WHERE id >= 10 ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'memory' \
+                     AND name LIKE 'idx_memory_lang%' ORDER BY name",
+                )?;
+                let indexes = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok((rows, indexes))
+            })
+            .await
+            .unwrap();
+        let contents: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(contents.len(), 4, "migrating loses no row");
+        assert_eq!(rows[0].5.as_deref(), Some("storage/engine"));
+        assert_eq!((rows[1].3.as_str(), rows[3].4), ("superseded", Some(13)));
+        assert!(rows.iter().all(|r| r.6.is_none()), "no row is classified by the migration: {rows:?}");
+        assert_eq!(indexes, ["idx_memory_lang", "idx_memory_lang_unset"]);
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
+    /// No row knew the project it came from in another tool, so a store from
+    /// before the column opens with every row as it was and the column empty.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_no_origin_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(22)).await;
+        type Rows = (Vec<String>, Vec<Vec<rusqlite::types::Value>>);
+        // Every column, so a migration that rewrote any of them would show.
+        let whole_rows = |c: &mut rusqlite::Connection| -> rusqlite::Result<Rows> {
+            let mut stmt = c.prepare("SELECT * FROM memory WHERE id >= 10 ORDER BY id")?;
+            let names = stmt.column_names().into_iter().map(String::from).collect();
+            let n = stmt.column_count();
+            let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
+            Ok((names, rows))
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                for (id, agent, project, source, status, deleted, key) in [
+                    (10, Some("a"), Some("p"), "explicit", "active", None, Some("storage/engine")),
+                    (11, Some("b"), None, "explicit", "superseded", None, None),
+                    (12, None, Some("p"), "import", "active", None, None),
+                    (13, Some("b"), Some("p"), "import", "active", Some(13), None),
+                ] {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, deleted_at, topic_key) \
+                         VALUES (?1, CASE WHEN ?2 IS NULL THEN 'project' ELSE 'agent' END, ?2, ?3, 'A note ' || ?1, \
+                          'semantic_fact', ?4, ?1, 'agent', 'x', ?1, ?1, 5.0, 3, ?5, ?6, ?7)",
+                        rusqlite::params![id, agent, project, source, status, deleted, key],
+                    )?;
+                }
+                whole_rows(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let ((names, mut rows), indexes): (Rows, Vec<String>) = store
+            .conn
+            .call(move |c| {
+                let rows = whole_rows(c)?;
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'memory' \
+                     AND name IN ('idx_memory_origin_project', 'idx_memory_import_origin') ORDER BY name",
+                )?;
+                let indexes = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok::<_, rusqlite::Error>((rows, indexes))
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.1.len(), 4);
+        let origin = names.iter().position(|n| n == "origin_project").expect("the column exists");
+        let origins: Vec<_> = rows.iter_mut().map(|r| r.remove(origin)).collect();
+        assert!(origins.iter().all(|v| *v == rusqlite::types::Value::Null), "{origins:?}");
+        let mut other_names = names.clone();
+        other_names.remove(origin);
+        assert_eq!((other_names, rows), before, "migrating changes no row");
+        assert_eq!(indexes, ["idx_memory_import_origin", "idx_memory_origin_project"]);
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
+    /// No root knew its remote before V24, so a store from before it opens
+    /// with every row and every registered root as they were and nothing
+    /// joined.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_no_remote_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(23)).await;
+        let snapshot = |c: &mut rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, scope, agent_id, project_id, status, superseded_by, topic_key, content_hash) \
+                 FROM memory WHERE id >= 10 \
+                 UNION ALL SELECT json_array(id, root_path, created_at, index_docs) FROM project ORDER BY 1",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, root_path, created_at, index_docs) VALUES \
+                       ('app-1a2b', '/work/app', 1, 1), ('app-3c4d', '/review/app', 2, 0);",
+                )?;
+                for (id, project, key) in [(10, "app-1a2b", Some("storage/engine")), (11, "app-3c4d", Some("storage/engine")), (12, "app-3c4d", None)] {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, topic_key, content_hash) \
+                         VALUES (?1, 'agent', 'a', ?2, 'A note', 'semantic_fact', 'explicit', ?1, 'agent', 'x', \
+                          ?1, ?1, 5.0, 3, 'active', ?3, 'same-text')",
+                        rusqlite::params![id, project, key],
+                    )?;
+                }
+                snapshot(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, remotes, supersedes): (Vec<String>, i64, i64) = store
+            .conn
+            .call(move |c| {
+                let after = snapshot(c)?;
+                let remotes = c.query_row("SELECT COUNT(*) FROM project_remote", [], |r| r.get(0))?;
+                let supersedes = c.query_row("SELECT COUNT(*) FROM memory_move_supersede", [], |r| r.get(0))?;
+                Ok::<_, rusqlite::Error>((after, remotes, supersedes))
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 5);
+        assert_eq!(after, before, "migrating changes no row and no root");
+        assert_eq!((remotes, supersedes), (0, 0));
+    }
+
+    /// The import asks whether a row is here whatever its state, so the dedup
+    /// index holds every row from V25 on; rebuilding it changes no row.
+    #[tokio::test]
+    async fn a_store_from_before_the_unfiltered_dedup_index_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(24)).await;
+        let snapshot = |c: &mut rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, agent_id, project_id, status, content_hash, created_at, deleted_at) \
+                 FROM memory WHERE id >= 10 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                for (id, hash, deleted) in [(10, Some("live-text"), None), (11, Some("deleted-text"), Some(20)), (12, None, None)] {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, content_hash, deleted_at) \
+                         VALUES (?1, 'agent', 'a', 'p', 'A note', 'semantic_fact', 'explicit', ?1, 'agent', 'x', \
+                          ?1, ?1, 5.0, 3, 'active', ?2, ?3)",
+                        rusqlite::params![id, hash, deleted],
+                    )?;
+                }
+                snapshot(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, index, deleted): (Vec<String>, String, Result<Option<i64>, String>) = store
+            .conn
+            .call(move |c| {
+                let after = snapshot(c)?;
+                let index = c.query_row("SELECT sql FROM sqlite_master WHERE name = 'idx_memory_dedup'", [], |r| r.get(0))?;
+                // A partial index that does not hold the row is refused here
+                // with "no query solution".
+                let deleted = c
+                    .query_row(
+                        "SELECT id FROM memory INDEXED BY idx_memory_dedup \
+                         WHERE COALESCE(project_id, '') = 'p' AND content_hash = 'deleted-text' AND created_at = 11",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string());
+                Ok::<_, rusqlite::Error>((after, index, deleted))
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 3);
+        assert_eq!(after, before, "migrating changes no row");
+        assert!(index.contains("(COALESCE(project_id, ''), content_hash, created_at)"), "{index}");
+        assert!(!index.contains("WHERE"), "the index holds every row: {index}");
+        assert_eq!(deleted, Ok(Some(11)), "a deleted row is found by the index");
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
+    /// An import from before the journal has no number, and undoing one
+    /// starts from the imports after it: the tables come empty and no row
+    /// changes.
+    #[tokio::test]
+    async fn a_store_from_before_the_import_journal_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(25)).await;
+        let snapshot = |c: &mut rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, agent_id, project_id, status, source, created_by_ref, content_hash) \
+                 FROM memory ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status, content_hash) \
+                     VALUES (10, 'agent', 'migrated', NULL, 'An imported note', 'semantic_fact', 'import', 10, \
+                      'agent', 'engram:n1', 10, 10, 5.0, 3, 'active', 'imported-text')",
+                    [],
+                )?;
+                snapshot(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, journal): (Vec<String>, Vec<i64>) = store
+            .conn
+            .call(move |c| {
+                let after = snapshot(c)?;
+                let mut journal = Vec::new();
+                for table in ["memory_import", "memory_import_row", "memory_import_supersede", "memory_import_extra"] {
+                    journal.push(c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?);
+                }
+                Ok::<_, rusqlite::Error>((after, journal))
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(after, before, "migrating changes no row");
+        assert_eq!(journal, [0, 0, 0, 0], "the journal starts empty");
+    }
+
+    #[tokio::test]
+    async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        conn.call(|c| {
+            configured(crate::memory::migrations::runner())
+                .set_target(refinery::Target::Version(18))
+                .run(c)
+        })
+        .await
+        .unwrap();
+        conn.call(|c| {
+            for id in [1, 2] {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES (?1, 'agent', 'a', 'the build uses cargo ' || ?1, 'semantic_fact', 'explicit', \
+                      ?1, 'agent', 'a', 1, 1, 5.0, 3, 'active')",
+                    [id],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (2, 1, 0.2, 'pending', 2)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+
+        run_migrations(&conn).await.unwrap();
+
+        let pairs: Vec<(i64, i64, String, bool)> = conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT new_id, old_id, state, topic_key_warned FROM memory_conflict")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect();
+                rows
+            })
+            .await
+            .unwrap();
+        assert_eq!(pairs, vec![(2, 1, "pending".to_string(), false)]);
+    }
+
+    #[tokio::test]
     async fn a_runner_with_a_cap_migrates_no_further_than_it() {
         ensure_vec0_registered();
         for (cap, expected) in [(Some(7), 7), (None, backup::latest_known())] {
@@ -1735,7 +2249,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 17, "Expected exactly 17 applied migrations, got {}", count);
+        assert_eq!(count, 26, "Expected exactly 26 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2196,7 +2710,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 17);
+        assert_eq!(migration_count, 26);
     }
 
     // -----------------------------------------------------------------------

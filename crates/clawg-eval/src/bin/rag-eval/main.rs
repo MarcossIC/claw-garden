@@ -5,6 +5,7 @@ mod diff;
 mod docs;
 mod follow_up;
 mod golden;
+mod lang_detect;
 mod metrics;
 mod report;
 mod seed;
@@ -104,6 +105,19 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             return EXIT_OK;
         }
         Ok(cli::ParseOutcome::Diff { a, b, fail_on_regression }) => return run_diff(&a, &b, fail_on_regression),
+        Ok(cli::ParseOutcome::LangDetect { golden }) => {
+            return match golden::load(&golden) {
+                Ok(loaded) => {
+                    let report = lang_detect::report(&loaded.set.corpus);
+                    println!("{}", serde_json::to_string_pretty(&report).expect("counts serialize"));
+                    EXIT_OK
+                }
+                Err(e) => {
+                    eprintln!("golden set validation failed: {e}");
+                    EXIT_GOLDEN_INVALID
+                }
+            };
+        }
         Ok(cli::ParseOutcome::Run(cli)) => cli,
         Err(e) => {
             // Not one of the dedicated exit codes (0/2/3/4): a usage

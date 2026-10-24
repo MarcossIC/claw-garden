@@ -1,16 +1,18 @@
 # visibility — Especificación
 
-Fuente de verdad del comportamiento actual de la identidad del agente y de qué filas puede listar, borrar, cambiar o resolver cada agente. También define la ruta en disco del workspace de cada agente. Lo que la búsqueda y `recall_context` leen de otros agentes (por defecto todo, salvo lo que el usuario oculta en `sharing.json`) está en [`specs/sharing`](../sharing/spec.md): leer lo ajeno no da derecho a modificarlo, y para borrar, cambiar, resolver o leer un save, una fila ajena sigue siendo "no existe" (R3 y R4).
+Fuente de verdad del comportamiento actual de la identidad del agente y de qué filas puede listar, leer entera, borrar, cambiar, restaurar o resolver cada agente. También define la ruta en disco del workspace de cada agente. El `agent_id` de una fila dice quién la escribió, nunca quién puede leerla o cambiarla: cada agente alcanza lo que `sharing.json` le deja leer ([`specs/sharing`](../sharing/spec.md)), y lo que alcanza lo lee, lo cambia, lo borra, lo restaura y lo juzga, sea de quien sea (R3 y R4).
 
 **Origen:**
 - [visibility-policy](../../changes/archive/2026-10-12-visibility-policy/proposal.md), partes A y B, archivado el 2026-10-12.
 - [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo lo que dice de lo ajeno compartido en R3 y R4).
+- [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: R3 y R4 dejan la frontera por agente y pasan al alcance del lector.
+- [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22: el movimiento de un `PATCH` con lector (R4).
 
 ## Definiciones
 
 - **Agente del puente:** el `agent_id` con el que el puente MCP lee y escribe en una llamada.
-- **Fila del agente A:** fila de `memory`, `episodic_trajectory` o `procedural_skill` con `agent_id = A`.
-- **Llamada con scope:** una llamada al daemon que nombra un agente (`agent` en la query de `DELETE`/`PATCH` y de `GET /v1/memories/{kind}/{id}/save`, `agent_id` en el cuerpo de `POST /v1/disputes/resolve`, `agent` en `GET /v1/memories`).
+- **Fila del agente A:** fila de `memory`, `episodic_trajectory` o `procedural_skill` con `agent_id = A`; A es su autor.
+- **Lector:** el agente que nombra una llamada al daemon (`agent` en la query de `DELETE`/`PATCH`, de `GET /v1/memories/{kind}/{id}/save` y de `POST /v1/memories/memory/{id}/restore`, `agent_id` en el cuerpo de `POST /v1/disputes/judge`, `/v1/disputes/resolve` y `POST /v1/synthesis` y en la query de `GET /v1/disputes`, `reader` en `GET /v1/memories`), con lo que `sharing.json` le deja alcanzar ([`specs/sharing`](../sharing/spec.md), definición «Alcance»). Una llamada sin lector es del usuario.
 - **Segmento seguro:** un `agent_id` no vacío, sin `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`, `%` ni caracteres de control, que no termina en `.` ni en espacio (lo que también excluye `.` y `..`) y que no es un nombre de dispositivo de Windows.
 - **Nombre de dispositivo de Windows:** un `agent_id` cuya parte antes del primer `.`, sin espacios finales y sin distinguir mayúsculas, es `CON`, `PRN`, `AUX`, `NUL`, o `COM`/`LPT` seguido de un dígito o de `¹`, `²`, `³`.
 
@@ -54,58 +56,44 @@ El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mis
 
 **Test:** `memory_status_names_the_agent_and_where_it_came_from` en `server.rs`, `format_status_names_the_agent` en `crates/clawg-cli/src/mcp/tools.rs`.
 
-## R3. El puente sólo modifica y lista lo propio
+## R3. El puente lee y modifica todo lo que alcanza
 
-- `list_memories` MUST listar sólo filas del agente del puente, de todos sus proyectos.
-- `delete_memory` sobre una fila de otro agente MUST fallar como si el id no existiera, y MUST NOT tocar la fila, su vector ni las disputas que la nombran.
-- `update_memory` sobre una fila de otro agente MUST fallar como si el id no existiera, y MUST NOT cambiar su importancia, su tipo ni su tier ([`specs/update`](../update/spec.md), R5).
-- `resolve_conflict` con alguna de las dos filas de otro agente MUST fallar como si el id no existiera, y MUST NOT cambiar ninguna de las dos.
-- `read_memory` sobre una fila de otro agente, o sobre el save de una fila de otro agente, MUST fallar como si el id no existiera ([`specs/pieces`](../pieces/spec.md), R6). Su ruta de daemon, `GET /v1/memories/{kind}/{id}/save`, responde `404` con el mismo "no existe" (R4).
-- `restore_memory` sobre una fila borrada de otro agente MUST fallar como si el id no existiera, igual que sobre una fila viva o purgada, y MUST NOT cambiar la fila ([`specs/restore`](../restore/spec.md), R1).
-- Sobre filas propias, las seis se comportan igual que sin scope.
-- Que una fila ajena llegue al agente por `search_memory` o `recall_context` porque `specs/sharing` la comparte (marcada `by <autor>`) no cambia nada de lo anterior: para el agente que no es su autor, modificarla, resolverla o leer su save sigue siendo "no existe", y la fila queda intacta.
-
-#### Escenario: borrar lo ajeno
-- GIVEN una memoria de A
-- WHEN B llama `delete_memory` con su id
-- THEN la respuesta es un error, la fila sigue viva, y A la sigue encontrando con `search_memory`
+- `list_memories` MUST listar las filas que alcanza el agente del puente, de todos los proyectos, lo más nuevo primero, con ` by <autor>` en cada fila de otro agente ([`specs/mcp`](../mcp/spec.md)), y MUST aceptar un `agent` opcional que deja sólo las filas de ese autor.
+- `read_memory`, `update_memory`, `delete_memory`, `restore_memory` y `resolve_conflict` MUST tratar una fila de otro agente, o sin autor, que el agente alcanza como una propia.
+- Sobre una fila que `sharing.json` le oculta, cada una MUST fallar como si el id no existiera y MUST NOT tocar la fila, su vector, sus disputas ni su importancia, tipo o tier. `resolve_conflict` MUST fallar así si oculta cualquiera de las dos. `read_memory` MUST nombrar como faltante un pedazo del save que le oculta ([`specs/pieces`](../pieces/spec.md), R6).
+- El workspace, RECENT, la sesión registrada y el aviso del hook siguen siendo del agente ([`specs/sharing`](../sharing/spec.md) R5).
 
 #### Escenario: borrar lo compartido
 - GIVEN una memoria de A que B acaba de ver en `search_memory` marcada `by A`
 - WHEN B llama `delete_memory` con su id
-- THEN la respuesta es un error, la fila sigue viva y A la sigue encontrando ([`specs/sharing`](../sharing/spec.md) R5)
+- THEN la fila queda borrada, A deja de encontrarla, y `restore_memory` de cualquiera de los dos la trae de vuelta
+
+#### Escenario: lo oculto
+- GIVEN una memoria de A y `sharing.json` con `hide B A`
+- WHEN B llama `delete_memory`, `update_memory`, `read_memory` o `restore_memory` con su id
+- THEN la respuesta es un error de «no existe», la fila sigue igual y A la sigue encontrando
 
 #### Escenario: listar
 - GIVEN una memoria de A y una de B
 - WHEN B llama `list_memories`
-- THEN sólo aparece la de B
+- THEN aparecen las dos, la de A con ` by A`; con `agent: A`, sólo la de A
 
-#### Escenario: resolver lo ajeno
-- GIVEN una disputa entre dos filas de A
-- WHEN B llama `resolve_conflict` sobre el par
-- THEN la respuesta es un error y las dos filas siguen igual
+**Test:** `another_agent_deletes_a_memory_unless_hidden`, `another_agent_restores_a_memory_unless_hidden`, `another_agent_reads_a_save_unless_hidden`, `another_agent_updates_a_memory_unless_hidden`, `another_agent_resolves_a_conflict_unless_hidden`, `a_shared_memory_is_changed_by_the_agent_that_found_it` y `list_memories_names_other_authors_and_filters_by_agent` en `server.rs`.
 
-**Test:** `an_agent_cannot_delete_another_agents_memory`, `an_agent_cannot_update_another_agents_memory`, `an_agent_lists_only_its_own_memories`, `an_agent_cannot_resolve_another_agents_conflict` y `an_agent_cannot_read_another_agents_save` en `server.rs`; `a_shared_memory_is_read_only` en `server.rs` para lo compartido; `an_agent_cannot_restore_another_agents_memory` en `server.rs` para `restore_memory`.
+## R4. El lector en el daemon
 
-## R4. Scope opcional en el daemon
-
-- `DELETE` y `PATCH /v1/memories/{kind}/{id}` MUST aceptar `agent` en la query, y `POST /v1/memories/{kind}/{id}/restore` también (`restore_memory`, `crates/clawg-cli/src/daemon/api.rs:1482`); `GET /v1/memories/{kind}/{id}/save` MUST aceptar lo mismo; `POST /v1/disputes/resolve` MUST aceptar `agent_id` en el cuerpo.
-- Con scope, si la fila (o alguna de las dos, al resolver) es de otro agente, la respuesta MUST ser `404`, igual que un id inexistente, y MUST NOT cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`. En el `GET` del save, el scope se aplica a la fila pedida (si es ajena, 404) y a cada posición del save: un pedazo de otro agente, que el dedup dejó dentro de un save propio, figura como faltante con `ids` en `null` ([`specs/pieces`](../pieces/spec.md), R6).
-- La regla no depende de lo que el agente ve: una fila que `specs/sharing` le muestra en una búsqueda es igual de ajena para el scope. Lo mismo vale para `POST /v1/synthesis`, que con `agent_id` sólo mira filas de ese agente.
-- Sin scope, la operación MUST valer sobre cualquier fila, como antes de existir el scope.
+- `DELETE`, `PATCH` y `GET …/save` de `/v1/memories/{kind}/{id}` y `POST /v1/memories/memory/{id}/restore` MUST aceptar `agent` en la query, y `POST /v1/disputes/judge`, `POST /v1/disputes/resolve`, `POST /v1/synthesis` y `GET /v1/disputes` MUST aceptar `agent_id`, como antes: un puente anterior que los manda no recibe un 400. Nombran al lector, cuyo alcance el daemon lee de `sharing.json` en cada pedido (`sharing::reader_in`); un `sharing.json` que no se puede leer MUST dejarlo con sus filas y las sin autor.
+- Una fila fuera del alcance del lector (o alguna de las dos, al juzgar) MUST responderse `404`, igual que un id inexistente, sin cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`. En el `GET` del save, el alcance se aplica a la fila pedida y a cada posición: un pedazo fuera del alcance figura como faltante con `ids` en `null`.
+- Sin lector, la operación MUST valer sobre cualquier fila.
+- Un `PATCH` que mueve la fila de proyecto ([`specs/update`](../update/spec.md) R7) MUST rechazar, sin nombrarla, una unidad con una fila fuera del alcance del lector (`out_of_reach`), y MUST juzgar los choques en el destino sólo con las filas que el lector alcanza, como la dedup y la clave de un save. El lote de `POST /v1/memories/move` no tiene lector.
 - La misma regla vale para las tres tablas (`memory`, `episodic`, `procedural`), salvo el restore, que sólo existe para `memory`.
 
-#### Escenario: borrar con scope
+#### Escenario: otro agente borra
 - GIVEN una fila de `memory` de A con su vector
 - WHEN se llama `DELETE /v1/memories/memory/{id}?agent=B`
-- THEN responde `404`, y la fila y su vector siguen ahí
+- THEN responde `200` con `deleted = 1`; con `hide B A`, `404`, y la fila y su vector siguen ahí
 
-#### Escenario: sin scope
-- GIVEN la misma fila
-- WHEN se llama `DELETE /v1/memories/memory/{id}` sin `agent`
-- THEN responde `200` con `deleted = 1`
-
-**Test:** `delete_with_another_agent_is_404_and_keeps_the_row`, `patch_with_another_agent_is_404_and_keeps_the_importance`, `resolve_with_another_agent_is_404_and_changes_nothing` y `get_save_of_another_agent_is_404` en `crates/clawg-cli/tests/api.rs`; `an_owner_mismatch_deletes_nothing`, `an_owner_mismatch_changes_no_importance` en `crates/clawg-core/src/memory/admin.rs` y `a_pair_of_another_agent_is_not_found` en `crates/clawg-core/src/memory/dispute.rs`; para el restore, `restore_brings_a_deleted_memory_back_for_its_owner` (el `404` con otro agente) en `api.rs` y `restoring_needs_a_deleted_row_of_the_owner` en `admin.rs`.
+**Test:** `get_save_of_another_agent_reads_whole_unless_hidden`, `delete_with_a_hidden_author_is_404_and_another_agent_deletes_otherwise`, `patch_with_a_hidden_author_is_404_and_another_agent_patches_otherwise`, `resolve_with_a_hidden_author_is_404_and_another_agent_resolves_otherwise`, `restore_brings_a_deleted_memory_back_for_any_agent_that_reaches_it` y `an_unreadable_policy_leaves_an_agent_its_own_rows_and_the_authorless` en `crates/clawg-cli/tests/api.rs`; `a_hidden_authors_row_is_not_found_and_stays`, `another_agent_updates_a_row_it_reaches_but_not_a_hidden_one` y `restoring_needs_a_deleted_row_in_reach` en `crates/clawg-core/src/memory/admin.rs`; `another_agent_judges_a_pair_it_reaches` y `a_pair_with_a_hidden_side_is_not_found` en `crates/clawg-core/src/memory/dispute.rs`.
 
 ## R5. Ruta del workspace
 

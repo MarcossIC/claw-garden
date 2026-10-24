@@ -13,6 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::sharing_file;
+use crate::preferences::Lang;
 
 /// The only file format this build reads and writes.
 const VERSION: u32 = 1;
@@ -45,21 +46,51 @@ pub enum Reach {
     Own,
     /// Every agent's rows except these authors', and the rows no agent saved.
     AllBut(Vec<String>),
-    /// Its own rows alone, not even the ones no agent saved: what a save is
-    /// compared against, since an agent can only judge a pair it owns.
-    OwnOnly,
 }
 
 impl Reach {
     /// Whether `reader` may read a row `author` saved; `None` when no agent did.
     pub(crate) fn admits(&self, reader: &str, author: Option<&str>) -> bool {
         match (self, author) {
-            (Reach::OwnOnly, author) => author == Some(reader),
             (_, None) => true,
             (Reach::Own, Some(author)) => author == reader,
             (Reach::AllBut(hidden), Some(author)) => author == reader || !hidden.iter().any(|h| h == author),
         }
     }
+}
+
+/// An agent acting on the store, with what the policy lets it reach. What it
+/// reaches it reads whole, changes, deletes, restores and judges, whoever
+/// saved it; a call with no reader is the user's and reaches every row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reader {
+    pub agent_id: String,
+    pub reach: Reach,
+}
+
+impl Reader {
+    pub fn new(agent_id: impl Into<String>, reach: Reach) -> Self {
+        Self { agent_id: agent_id.into(), reach }
+    }
+
+    /// Whether this reader reaches a row `author` saved; `None` when no agent did.
+    pub fn admits(&self, author: Option<&str>) -> bool {
+        self.reach.admits(&self.agent_id, author)
+    }
+}
+
+/// `agent_id` as the policy in `base_dir` lets it reach. A policy that cannot
+/// be read shares nothing, so an exclusion the user wrote is never lost to a
+/// typo: the agent keeps its own rows and the ones no agent saved.
+pub fn reader_in(base_dir: &Path, agent_id: &str) -> Reader {
+    let reach = match load(base_dir) {
+        Ok(policy) => policy.reach_for(agent_id),
+        Err(e) => {
+            log::warn!("{e}; nothing is shared");
+            Reach::Own
+        }
+    };
+    Reader::new(agent_id, reach)
 }
 
 /// The file as written. `deny_unknown_fields` because a misspelled key
@@ -144,22 +175,30 @@ impl SharingPolicy {
         }
     }
 
-    /// One line per exclusion, or that everything is shared.
-    pub fn render(&self) -> String {
+    /// One line per exclusion, or that everything is shared, in `lang`.
+    pub fn render(&self, lang: Lang) -> String {
         let lines: Vec<String> = self
             .hides
             .iter()
             .flat_map(|(r, authors)| {
-                authors.iter().map(move |a| match (r.as_str(), a.as_str()) {
-                    (EVERY_AGENT, EVERY_AGENT) => "no agent reads another".to_owned(),
-                    (EVERY_AGENT, a) => format!("no agent reads {a}"),
-                    (r, EVERY_AGENT) => format!("{r} reads no other agent"),
-                    (r, a) => format!("{r} does not read {a}"),
+                authors.iter().map(move |a| match (r.as_str(), a.as_str(), lang) {
+                    (EVERY_AGENT, EVERY_AGENT, Lang::En) => "no agent reads another".to_owned(),
+                    (EVERY_AGENT, EVERY_AGENT, Lang::Es) => "ningún agente lee a otro".to_owned(),
+                    (EVERY_AGENT, a, Lang::En) => format!("no agent reads {a}"),
+                    (EVERY_AGENT, a, Lang::Es) => format!("ningún agente lee a {a}"),
+                    (r, EVERY_AGENT, Lang::En) => format!("{r} reads no other agent"),
+                    (r, EVERY_AGENT, Lang::Es) => format!("{r} no lee a ningún otro agente"),
+                    (r, a, Lang::En) => format!("{r} does not read {a}"),
+                    (r, a, Lang::Es) => format!("{r} no lee a {a}"),
                 })
             })
             .collect();
         if lines.is_empty() {
-            return "every agent reads every other agent".to_owned();
+            return match lang {
+                Lang::En => "every agent reads every other agent",
+                Lang::Es => "cada agente lee a todos los demás",
+            }
+            .to_owned();
         }
         lines.join("\n")
     }
@@ -216,8 +255,23 @@ mod tests {
         for reach in [Reach::Own, all_but(&[]), all_but(&["codex"]), nothing_shared] {
             assert!(reach.admits("cursor", None), "no exclusion names a row without an author: {reach:?}");
         }
-        assert!(!Reach::OwnOnly.admits("cursor", None), "a save is compared only against its agent's rows");
-        assert!(Reach::OwnOnly.admits("cursor", Some("cursor")) && !Reach::OwnOnly.admits("cursor", Some("codex")));
+    }
+
+    #[test]
+    fn a_reader_admits_what_its_reach_admits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = SharingPolicy::default();
+        p.hide("b", "a");
+        save(dir.path(), &p).unwrap();
+        let b = reader_in(dir.path(), "b");
+        assert!(b.admits(Some("b")) && b.admits(Some("c")) && b.admits(None));
+        assert!(!b.admits(Some("a")), "a hidden author is out of reach");
+        assert!(reader_in(dir.path(), "a").admits(Some("b")), "an exclusion has a direction");
+
+        std::fs::write(sharing_file(dir.path()), "{ not json").unwrap();
+        let b = reader_in(dir.path(), "b");
+        assert_eq!(b.reach, Reach::Own, "an unreadable policy shares nothing");
+        assert!(b.admits(None) && !b.admits(Some("c")));
     }
 
     #[test]
@@ -350,14 +404,17 @@ mod tests {
     #[test]
     fn render_lists_one_exclusion_per_line() {
         let mut p = SharingPolicy::default();
-        assert_eq!(p.render(), "every agent reads every other agent");
+        assert_eq!(p.render(Lang::En), "every agent reads every other agent");
+        assert_eq!(p.render(Lang::Es), "cada agente lee a todos los demás");
         p.hide("cursor", "codex");
         p.hide("*", "claude-code");
         p.hide("codex", "*");
-        assert_eq!(p.render(), "no agent reads claude-code\ncodex reads no other agent\ncursor does not read codex");
+        assert_eq!(p.render(Lang::En), "no agent reads claude-code\ncodex reads no other agent\ncursor does not read codex");
+        assert_eq!(p.render(Lang::Es), "ningún agente lee a claude-code\ncodex no lee a ningún otro agente\ncursor no lee a codex");
         let mut off = SharingPolicy::default();
         off.hide("*", "*");
-        assert_eq!(off.render(), "no agent reads another");
+        assert_eq!(off.render(Lang::En), "no agent reads another");
+        assert_eq!(off.render(Lang::Es), "ningún agente lee a otro");
     }
 
     #[cfg(unix)]

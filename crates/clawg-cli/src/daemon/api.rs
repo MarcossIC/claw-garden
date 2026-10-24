@@ -32,25 +32,32 @@ use clawg_core::memory::admin::{
 };
 use clawg_core::memory::backup::Reason;
 use clawg_core::memory::bootstrap::EmbedderStatus;
+use clawg_core::memory::chunker::ChatChunker;
 use clawg_core::memory::dispute::{judge_pair, open_pairs, resolve_dispute_core, OpenPairs, Outcome, Resolution, ResolveError, Verdict};
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshOutcome};
+use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshGuard};
 use clawg_core::memory::worker::{
     ChunkOutcome, IngestFailure, IngestReport, SavedChunk,
 };
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
-use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
-use clawg_core::memory::project::{register_project, RegisterError};
+use clawg_core::memory::language::count_saves_in;
+use clawg_core::memory::portability::timing::{Step, Timing};
+use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
+use clawg_core::memory::identity::origin_key;
+use clawg_core::memory::project::{register_project, RegisterError, Registration};
+use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
-use clawg_core::memory::sharing::{self, Reach};
+use clawg_core::memory::sharing::{self, Reach, Reader};
 use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
     conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
+use clawg_core::metrics::Recorder;
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
 use clawg_core::memory::redact::SecretKind;
 use clawg_core::memory::store_insert::MemoryType;
@@ -62,6 +69,7 @@ use crate::relevance::shown_hits;
 
 use super::guard::{admits, RefusalLog};
 use super::lifecycle::now_ms;
+use super::metrics::{metrics_body, prometheus_text, time_request, HttpMeter, Transport};
 use super::sessions::{check_session_id, SessionRegistry};
 
 /// Largest `limit` any search will honour. A retrieval request is a vector
@@ -91,6 +99,8 @@ pub struct AppCtx {
     /// The host session each agent works in, per project, that saves are
     /// stamped with.
     pub sessions: SessionRegistry,
+    /// The metrics of this run: every request, and what the writer samples.
+    pub metrics: Arc<Recorder>,
 }
 
 /// How long a save waits for the worker. Long enough for a multi-chunk save
@@ -244,17 +254,25 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
         kind.get_or_insert(MemoryKind::Memory);
     }
 
+    let no_project = q.no_project.unwrap_or(false);
+    if no_project && q.project.is_some() {
+        return Err(ApiError::bad_request("project and no_project cannot both be given: a row has one or none"));
+    }
+
     Ok(ListParams {
         kind,
         tier: q.tier,
         memory_type: q.memory_type,
         agent_id: q.agent,
         project_id: q.project,
+        no_project,
         status: q.status,
+        origin_project: q.origin_project,
         query: q.q,
         limit: q.limit,
         offset: q.offset,
         deleted,
+        ..Default::default()
     })
 }
 
@@ -391,6 +409,10 @@ pub struct SearchRequest {
     /// every ranked hit up to `limit` comes back.
     #[serde(default)]
     pub min_relative_score: Option<f64>,
+    /// The language the caller searches in, `en` or `es`. With it, the answer
+    /// counts the live saves of the scope in the other one.
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,6 +428,10 @@ pub struct ContextRequest {
     /// [`MAX_BUDGET`], that.
     #[serde(default)]
     pub budget: Option<usize>,
+    /// As in [`SearchRequest`], counted only when there is a query; with or
+    /// without one, the language of the notes the prompt adds.
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 /// `deny_unknown_fields` because every field here narrows the result: an
@@ -414,6 +440,10 @@ pub struct ContextRequest {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListQuery {
+    /// The agent the listing is for: it lists what that agent reaches, as a
+    /// call by id does ([`ReaderQuery`]). `agent` stays a filter by author.
+    #[serde(default)]
+    pub reader: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
@@ -424,6 +454,9 @@ pub struct ListQuery {
     pub agent: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
+    /// `true` lists only the rows saved in no project.
+    #[serde(default)]
+    pub no_project: Option<bool>,
     #[serde(default)]
     pub status: Option<String>,
     /// Free text over memory content.
@@ -436,6 +469,9 @@ pub struct ListQuery {
     /// `true` lists the deleted rows instead of the live ones.
     #[serde(default)]
     pub deleted: Option<bool>,
+    /// Only the rows that came from this project of another tool.
+    #[serde(default)]
+    pub origin_project: Option<String>,
 }
 
 /// Strict for the same reason as [`ListQuery`]: a misspelt filter would answer
@@ -449,13 +485,14 @@ pub struct StatsQuery {
     pub project: Option<String>,
 }
 
-/// Which agent a change acts for. Absent, the change is the store owner's and
-/// reaches any row; present, another agent's row is answered as missing.
-/// Strict for the same reason as [`ListQuery`]: a misspelt `agent` would
-/// quietly lift the scope.
+/// Which agent a call by id acts for: it reaches what `sharing.json` lets
+/// that agent read, whoever saved it, and a row out of its reach is answered
+/// as missing. Absent, the call is the user's and reaches any row. Strict for
+/// the same reason as [`ListQuery`]: a misspelt `agent` would quietly lift the
+/// reach.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OwnerQuery {
+pub struct ReaderQuery {
     #[serde(default)]
     pub agent: Option<String>,
 }
@@ -470,10 +507,28 @@ pub struct UpdateRequest {
     pub importance: Option<f64>,
     #[serde(default)]
     pub memory_type: Option<String>,
+    /// The project to move the row's save to; it must be registered.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Moves the row's save out of every project.
+    #[serde(default)]
+    pub no_project: bool,
     /// The caller declares the user answered, which taking a preference or a
-    /// decision out of its type needs.
+    /// decision out of its type, or out of its project, needs.
     #[serde(default)]
     pub user_answered: bool,
+}
+
+impl UpdateRequest {
+    /// Where the request moves the row, `Some(None)` out of every project.
+    pub fn destination(&self) -> ApiResult<Option<Option<String>>> {
+        match (&self.project_id, self.no_project) {
+            (Some(_), true) => Err(ApiError::bad_request("pass project_id or no_project, not both")),
+            (Some(p), false) => Ok(Some(Some(p.clone()))),
+            (None, true) => Ok(Some(None)),
+            (None, false) => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -528,6 +583,11 @@ pub struct SaveBody {
     /// The memories of the save's topic key it superseded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub replaced: Vec<ReplacedMemory>,
+    /// For a save without a topic key, the `memory` row of `related` in its
+    /// own agent and project it is closest to: if the save revises it, the
+    /// subject belongs under a key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_candidate: Option<i64>,
     /// The key the save was taken under. A bridge that sent one and finds it
     /// missing is talking to a daemon that ignored it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -548,6 +608,7 @@ impl SaveBody {
             redacted: Vec::new(),
             related: Vec::new(),
             replaced: Vec::new(),
+            revision_candidate: None,
             topic_key: None,
             detail: None,
             operation_id,
@@ -639,6 +700,8 @@ pub struct SearchBody {
     /// Hits the relevance cut kept back, so a caller handed none can tell
     /// "nothing came close" from "nothing is stored".
     pub withheld: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_language: Option<OtherLanguage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -651,6 +714,36 @@ pub struct ContextBody {
     /// reviewed for conclusions.
     pub conclusions_to_review: usize,
     pub retrieval: RetrievalState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_language: Option<OtherLanguage>,
+}
+
+/// How many live saves of the searched scope are in the language the caller
+/// did not search in, which a query in its own language is likely to miss.
+#[derive(Debug, Serialize)]
+pub struct OtherLanguage {
+    pub lang: Lang,
+    pub memories: usize,
+}
+
+/// The caller's language, or the 400 that lists the ones there are.
+fn check_lang(lang: Option<&str>) -> Result<Option<Lang>, ApiError> {
+    lang.map(|code| Lang::parse(code).ok_or_else(|| ApiError::bad_request(format!("lang must be one of: en, es (got {code:?})"))))
+        .transpose()
+}
+
+/// The other language's count for a search in `lang`, with the scope and the
+/// reach the search used. A count that fails is logged and left out: the
+/// search already answered.
+async fn other_language(app: &AppCtx, lang: Lang, project_id: Option<&str>, reader: &Reader) -> Option<OtherLanguage> {
+    let other = lang.other();
+    match count_saves_in(&app.runtime.store, other, project_id, reader).await {
+        Ok(memories) => Some(OtherLanguage { lang: other, memories }),
+        Err(e) => {
+            log::warn!("could not count the memories in {}: {e}", other.name());
+            None
+        }
+    }
 }
 
 /// Whether the context searched memories. Without it a prompt holding only
@@ -685,11 +778,11 @@ impl RetrievalState {
     }
 }
 
-/// Strict for the same reason as [`OwnerQuery`].
+/// Strict for the same reason as [`ReaderQuery`].
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SynthesisRequest {
-    /// Reviews only this agent's memories, as [`OwnerQuery`] scopes a change.
+    /// Reviews what this agent reaches, as [`ReaderQuery`] does.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// Absent: the whole store.
@@ -776,6 +869,82 @@ impl From<RestoredRow> for RestoredBody {
     }
 }
 
+/// A batch move: a selection and one target, or the number of a move to
+/// undo. Strict because every field narrows or aims it: a misspelt filter
+/// would move more than was meant.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoveRequest {
+    #[serde(default)]
+    pub ids: Vec<i64>,
+    #[serde(default)]
+    pub from_project: Option<String>,
+    #[serde(default)]
+    pub from_none: bool,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub memory_type: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Free text over memory content, as `GET /v1/memories` reads `q`.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// The project the rows had in the tool they were imported from, whole.
+    #[serde(default)]
+    pub origin_project: Option<String>,
+    #[serde(default)]
+    pub include_deleted: bool,
+    #[serde(default)]
+    pub to_project: Option<String>,
+    #[serde(default)]
+    pub to_none: bool,
+    #[serde(default)]
+    pub undo: Option<i64>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// What a [`MoveRequest`] asks for, once it is known to ask for one thing.
+#[derive(Debug, PartialEq)]
+pub enum MovePlan {
+    Move { filter: MoveFilter, target: Option<String> },
+    Undo(i64),
+}
+
+impl MoveRequest {
+    /// Pure, so each refusal is testable without a server.
+    pub fn plan(self) -> ApiResult<MovePlan> {
+        let from = match (self.from_project, self.from_none) {
+            (Some(_), true) => return Err(ApiError::bad_request("pass from_project or from_none, not both")),
+            (Some(p), false) => Some(ProjectFilter::Project(p)),
+            (None, true) => Some(ProjectFilter::None),
+            (None, false) => None,
+        };
+        let filter = MoveFilter {
+            ids: self.ids,
+            from,
+            agent_id: self.agent,
+            memory_type: self.memory_type,
+            source: self.source,
+            session_id: self.session_id,
+            query: self.q,
+            origin_project: self.origin_project,
+            include_deleted: self.include_deleted,
+        };
+        match (self.undo, self.to_project, self.to_none) {
+            (Some(id), None, false) if filter == MoveFilter::default() => Ok(MovePlan::Undo(id)),
+            (Some(_), None, false) => Err(ApiError::bad_request("undo names a move: it takes no selection")),
+            (None, Some(p), false) => Ok(MovePlan::Move { filter, target: Some(p) }),
+            (None, None, true) => Ok(MovePlan::Move { filter, target: None }),
+            (None, None, false) => Err(ApiError::bad_request("name a target: to_project or to_none, or a move to undo")),
+            _ => Err(ApiError::bad_request("pass one of to_project, to_none or undo")),
+        }
+    }
+}
+
 /// Names a save the daemon gave up on: its operation id, and its agent when
 /// another agent holds the same id.
 #[derive(Debug, Deserialize)]
@@ -812,7 +981,7 @@ pub struct ResolveRequest {
     /// Both rows stand instead of `other` being superseded by `keep`.
     #[serde(default)]
     pub keep_both: bool,
-    /// Scopes the resolution to this agent's rows, as [`OwnerQuery`] does.
+    /// The agent the resolution acts for, as in [`ReaderQuery`].
     #[serde(default)]
     pub agent_id: Option<String>,
 }
@@ -830,7 +999,7 @@ pub struct JudgeRequest {
     /// The caller declares the user answered, with the answer in `reason`.
     #[serde(default)]
     pub user_answered: bool,
-    /// Scopes the verdict to this agent's rows, as [`OwnerQuery`] does.
+    /// The agent the verdict acts for, as in [`ReaderQuery`].
     #[serde(default)]
     pub agent_id: Option<String>,
 }
@@ -838,8 +1007,13 @@ pub struct JudgeRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisputesQuery {
+    /// The agent that judges, as in [`ReaderQuery`].
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Only the pairs whose newer row this project reaches, as a search reads
+    /// it; absent, the whole store.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// How many pending pairs `GET /v1/disputes` names.
@@ -854,6 +1028,7 @@ const OPEN_PAIRS_SHOWN: usize = 5;
 pub fn router(app: Arc<AppCtx>) -> Router {
     let v1 = Router::new()
         .route("/memories", post(save_memory).get(list_memories))
+        .route("/memories/move", post(move_memories))
         .route("/search", post(search))
         .route("/context", post(context))
         .route("/sessions", post(register_session))
@@ -870,13 +1045,16 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/outbox/retry", post(retry_outbox))
         .route("/outbox/discard", post(discard_outbox))
         .route("/stats", get(stats))
+        .route("/metrics", get(metrics))
         .route("/backup", post(backup))
         .route("/import", post(import_memories).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
+        .route("/import/undo", post(undo_import))
         .route("/projects", post(register))
         .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
 
+    let meter = Arc::new(HttpMeter::new(app.metrics.clone()));
     Router::new()
         .route("/health", get(health))
         .nest("/v1", v1)
@@ -885,6 +1063,12 @@ pub fn router(app: Arc<AppCtx>) -> Router {
             Arc::new(RefusalLog::default()),
             admit_loopback,
         ))
+        .layer(axum::middleware::from_fn_with_state(meter, time_request))
+}
+
+/// [`router`] with its requests labelled as coming in on `transport`.
+pub fn router_on(app: Arc<AppCtx>, transport: Transport) -> Router {
+    router(app).layer(axum::Extension(transport))
 }
 
 /// Serves [`router`] on an OS-picked loopback port in a background task and
@@ -1029,6 +1213,7 @@ fn save_response(
                         .into_iter()
                         .map(|r| ReplacedMemory { kind: "memory", id: r.id, excerpt: r.excerpt })
                         .collect(),
+                    revision_candidate: report.revision_candidate,
                     topic_key: None,
                     detail: None,
                     operation_id,
@@ -1120,7 +1305,8 @@ async fn save_memory(
         ));
     }
     if !derived_from.is_empty() {
-        let existing = existing_memory_ids(&app.runtime.store, &derived_from, Some(&body.agent_id))
+        let saver = reader(&app, &body.agent_id);
+        let existing = existing_memory_ids(&app.runtime.store, &derived_from, Some(&saver))
             .await
             .map_err(ApiError::internal)?;
         let missing = missing_sources(&derived_from, &existing);
@@ -1130,7 +1316,7 @@ async fn save_memory(
                 "derived_from names memories that do not exist or were deleted: {ids}"
             )));
         }
-        let replaced = replaced_memory_ids(&app.runtime.store, &derived_from, Some(&body.agent_id))
+        let replaced = replaced_memory_ids(&app.runtime.store, &derived_from, Some(&saver))
             .await
             .map_err(ApiError::internal)?;
         if !replaced.is_empty() {
@@ -1242,6 +1428,7 @@ async fn search(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SearchRequest>,
 ) -> ApiResult<Json<SearchBody>> {
+    let lang = check_lang(body.lang.as_deref())?;
     // A distinct status rather than empty results: "nothing matched" and "I
     // cannot search yet" are different answers, and a client that conflated
     // them would cache an empty corpus for the life of the model download.
@@ -1254,9 +1441,10 @@ async fn search(
         .await
         .map_err(embed_failure)?;
 
+    let caller = reader(&app, &body.agent_id);
     let scope = SearchScope::all_default()
         .with_project(body.project_id.as_deref())
-        .with_reach(reach(&app, &body.agent_id));
+        .with_reach(caller.reach.clone());
     let mut hits = search_all_memories(
         &app.runtime.store,
         &embedding,
@@ -1280,22 +1468,29 @@ async fn search(
     app.runtime.access_tracker.record_hits(&hits);
 
     let withheld = found - hits.len();
-    Ok(Json(SearchBody { hits, withheld }))
+    let other_language = match lang {
+        Some(lang) => other_language(&app, lang, body.project_id.as_deref(), &caller).await,
+        None => None,
+    };
+    Ok(Json(SearchBody { hits, withheld, other_language }))
 }
 
-/// Whose memories `reader` may read, from the policy in the data directory,
-/// read on every call so a change counts from the next request on. A policy
-/// that cannot be read shares nothing, so an exclusion the user wrote is never
-/// lost to a typo: the agent keeps its own memories and the user finds the
-/// reason here and in `memory_status`.
-fn reach(app: &AppCtx, reader: &str) -> Reach {
-    match sharing::load(&app.runtime.base_dir) {
-        Ok(policy) => policy.reach_for(reader),
-        Err(e) => {
-            log::warn!("{e}; nothing is shared");
-            Reach::Own
-        }
-    }
+/// `agent` with what the policy in the data directory lets it reach, read on
+/// every call so a change counts from the next request on. A policy that
+/// cannot be read shares nothing (`sharing::reader_in`), and the user finds
+/// the reason in the log and in `memory_status`.
+fn reader(app: &AppCtx, agent: &str) -> Reader {
+    sharing::reader_in(&app.runtime.base_dir, agent)
+}
+
+/// The reader a call by id names, or `None` for the user's own call.
+fn named_reader(app: &AppCtx, agent: Option<&str>) -> Option<Reader> {
+    agent.map(|a| reader(app, a))
+}
+
+/// What `agent`'s searches reach.
+fn reach(app: &AppCtx, agent: &str) -> Reach {
+    reader(app, agent).reach
 }
 
 /// Builds the 4-block memory prefix for a query.
@@ -1308,8 +1503,10 @@ async fn context(
     Json(body): Json<ContextRequest>,
 ) -> ApiResult<Json<ContextBody>> {
     let budget = check_budget(body.budget)?;
+    let lang = check_lang(body.lang.as_deref())?;
     let workspace = app.runtime.workspaces();
     let project_id = body.project_id.as_deref();
+    let query = body.query.as_deref().filter(|q| !q.trim().is_empty());
 
     // Unconditional regen (~2-5 ms). A failure degrades to "no ids were
     // emitted", which can make the prompt repeat a row — a degraded prompt
@@ -1322,9 +1519,10 @@ async fn context(
             Default::default()
         });
 
-    let prompt = match body.query.as_deref().filter(|q| !q.trim().is_empty()) {
+    let prompt = match query {
         Some(query) => {
             build_memory_prompt(
+                lang.unwrap_or(Lang::En),
                 &app.runtime.store,
                 &workspace,
                 app.runtime.embedder.get().cloned(),
@@ -1340,25 +1538,41 @@ async fn context(
         }
         None => {
             let reach = reach(&app, &body.agent_id);
-            build_session_prompt(&app.runtime.store, &workspace, &body.agent_id, project_id, &reach, &emitted, budget).await
+            build_session_prompt(
+                lang.unwrap_or(Lang::En),
+                &app.runtime.store,
+                &workspace,
+                &body.agent_id,
+                project_id,
+                &reach,
+                &emitted,
+                budget,
+            )
+            .await
         }
     }
     .map_err(ApiError::internal)?;
 
     // Same degradation as the regen above: a reminder that cannot be counted
     // is a reminder skipped, not a failed request.
-    let unreviewed = unreviewed_count(&app.runtime.store, Some(&body.agent_id), project_id).await.unwrap_or_else(|e| {
+    let caller = reader(&app, &body.agent_id);
+    let unreviewed = unreviewed_count(&app.runtime.store, Some(&caller), project_id).await.unwrap_or_else(|e| {
         log::warn!("unreviewed count failed: {e}");
         0
     });
     let conclusions_to_review =
-        conclusions_to_review_count(&app.runtime.store, Some(&body.agent_id), project_id).await.unwrap_or_else(|e| {
+        conclusions_to_review_count(&app.runtime.store, Some(&caller), project_id).await.unwrap_or_else(|e| {
             log::warn!("conclusions to review count failed: {e}");
             0
         });
 
+    let other_language = match (lang, query) {
+        (Some(lang), Some(_)) => other_language(&app, lang, project_id, &caller).await,
+        _ => None,
+    };
+
     let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
-    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval }))
+    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval, other_language }))
 }
 
 /// Records the host session `agent_id` works in for `project_id`, as a hook
@@ -1376,7 +1590,8 @@ async fn synthesis(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SynthesisRequest>,
 ) -> ApiResult<Json<Synthesis>> {
-    let params = SynthesisParams { agent_id: body.agent_id, project_id: body.project_id, limit: body.limit };
+    let reader = named_reader(&app, body.agent_id.as_deref());
+    let params = SynthesisParams { reader, project_id: body.project_id, limit: body.limit };
     synthesis_core(&app.runtime.store, params, TimestampMs::now())
         .await
         .map(Json)
@@ -1387,7 +1602,9 @@ async fn list_memories(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<ListBody>> {
-    let items = list_memories_core(&app.runtime.store, list_params_from_query(q)?)
+    let reader = named_reader(&app, q.reader.as_deref());
+    let params = ListParams { reader, ..list_params_from_query(q)? };
+    let items = list_memories_core(&app.runtime.store, params)
         .await
         .map_err(ApiError::internal)?;
 
@@ -1395,6 +1612,28 @@ async fn list_memories(
 }
 
 /// Counts what is stored, optionally narrowed to an agent and/or project.
+#[derive(Debug, Deserialize)]
+struct MetricsQuery {
+    format: Option<String>,
+}
+
+/// What this run measured: the minute in progress and the whole run, as JSON
+/// or, with `format=prometheus`, as Prometheus text.
+async fn metrics(State(app): State<Arc<AppCtx>>, Query(q): Query<MetricsQuery>) -> ApiResult<Response> {
+    match q.format.as_deref() {
+        None | Some("json") => {
+            let started_at_ms = now_ms().saturating_sub(app.started_at.elapsed().as_millis() as u64);
+            Ok(Json(metrics_body(&app.metrics, clawg_core::build_info::version(), started_at_ms)).into_response())
+        }
+        Some("prometheus") => Ok((
+            [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            prometheus_text(&app.metrics),
+        )
+            .into_response()),
+        Some(other) => Err(ApiError::bad_request(format!("unknown format {other:?}; use json or prometheus"))),
+    }
+}
+
 async fn stats(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<StatsQuery>,
@@ -1422,15 +1661,16 @@ async fn get_memory(
     Ok(Json(ItemBody { item }))
 }
 
-/// The save the row is a piece of, scoped like the other routes by id: a
-/// row that is missing, deleted or another agent's is the same 404.
+/// The save the row is a piece of, as far as the reader reaches it: a row
+/// that is missing, deleted or out of reach is the same 404.
 async fn get_save(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
-    Query(owner): Query<OwnerQuery>,
+    Query(q): Query<ReaderQuery>,
 ) -> ApiResult<Json<SaveText>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let save = read_save_core(&app.runtime.store, kind, id, owner.agent.as_deref())
+    let reader = named_reader(&app, q.agent.as_deref());
+    let save = read_save_core(&app.runtime.store, kind, id, reader.as_ref())
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
@@ -1440,33 +1680,65 @@ async fn get_save(
 async fn update_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
-    Query(owner): Query<OwnerQuery>,
+    Query(q): Query<ReaderQuery>,
     Json(body): Json<UpdateRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref())
+    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref(), body.destination()?)
         .map_err(|e| ApiError::bad_request(e.to_string()))?
         .answered(body.user_answered);
     // The core answers `None` for "no such row", "already soft-deleted" and
-    // "another agent's" alike, and from the caller's side those are the same
+    // "out of reach" alike, and from the caller's side those are the same
     // fact: the row it named is not there to change.
-    let row = update_memory_core(&app.runtime.store, id, kind, &patch, owner.agent.as_deref())
+    let reader = named_reader(&app, q.agent.as_deref());
+    let row = update_memory_core(&app.runtime.store, id, kind, &patch, reader.as_ref())
         .await
         .map_err(|e| match e {
-            UpdateError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
+            UpdateError::NeedsUser { .. } | UpdateError::MoveNeedsUser { .. } => ApiError::conflict(e.to_string()),
+            UpdateError::Move(e) => move_error(e),
             UpdateError::Store(e) => ApiError::internal(e),
         })?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
     Ok(Json(UpdatedBody { updated: 1, row }))
 }
 
+/// The status a refused move answers with: a clash is a conflict, a target
+/// or a move that is not there is missing, a selection that cannot be read
+/// is the caller's mistake.
+fn move_error(e: MoveError) -> ApiError {
+    match e {
+        MoveError::Refused(_) => ApiError::conflict(e.to_string()),
+        MoveError::UnknownProject(_) | MoveError::UnknownMove(_) => ApiError::not_found(e.to_string()),
+        MoveError::NoSelection | MoveError::TextOnDeleted | MoveError::EmptyText => ApiError::bad_request(e.to_string()),
+        MoveError::Store(e) => ApiError::internal(e),
+    }
+}
+
+/// Moves memories between projects, or undoes a move, for the user: no
+/// reader, so a clash is judged against every row of the target. Needs no
+/// embedder.
+async fn move_memories(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<MoveRequest>,
+) -> ApiResult<Json<MoveReport>> {
+    let dry_run = body.dry_run;
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let store = &app.runtime.store;
+    let report = match body.plan()? {
+        MovePlan::Move { filter, target } => move_memories_core(store, &backups, &filter, target, dry_run).await,
+        MovePlan::Undo(id) => undo_move_core(store, &backups, id, dry_run).await,
+    };
+    report.map(Json).map_err(move_error)
+}
+
 async fn delete_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
-    Query(owner): Query<OwnerQuery>,
+    Query(q): Query<ReaderQuery>,
 ) -> ApiResult<Json<DeletedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let deleted = delete_memory_core(&app.runtime.store, id, kind, owner.agent.as_deref())
+    let reader = named_reader(&app, q.agent.as_deref());
+    let deleted = delete_memory_core(&app.runtime.store, id, kind, reader.as_ref())
         .await
         .map_err(ApiError::internal)?;
 
@@ -1482,14 +1754,15 @@ async fn delete_memory(
 async fn restore_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
-    Query(owner): Query<OwnerQuery>,
+    Query(q): Query<ReaderQuery>,
 ) -> ApiResult<Json<RestoredBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
     if kind != MemoryKind::Memory {
         return Err(ApiError::bad_request(RestoreError::OnlyMemory(kind).to_string()));
     }
     let embedder = ready_embedder(&app)?;
-    match restore_memory_core(&app.runtime.store, embedder.as_ref(), kind, id, owner.agent.as_deref()).await {
+    let reader = named_reader(&app, q.agent.as_deref());
+    match restore_memory_core(&app.runtime.store, embedder.as_ref(), kind, id, reader.as_ref()).await {
         Ok(row) => Ok(Json(row.into())),
         Err(e @ RestoreError::OnlyMemory(_)) => Err(ApiError::bad_request(e.to_string())),
         Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted {kind:?} row with id {id}"))),
@@ -1547,7 +1820,8 @@ async fn resolve_dispute(
     Json(body): Json<ResolveRequest>,
 ) -> ApiResult<Json<Resolution>> {
     let outcome = if body.keep_both { Outcome::KeepBoth } else { Outcome::Supersede };
-    resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome, body.agent_id.as_deref())
+    let reader = named_reader(&app, body.agent_id.as_deref());
+    resolve_dispute_core(&app.runtime.store, body.keep, body.other, outcome, reader.as_ref())
         .await
         .map(Json)
         .map_err(resolve_error)
@@ -1560,15 +1834,8 @@ async fn judge_dispute(
     let verdict: Verdict = body.verdict.parse().map_err(|e: clawg_core::memory::dispute::UnknownVerdict| {
         ApiError::bad_request(e.to_string())
     })?;
-    judge_pair(
-        &app.runtime.store,
-        body.keep,
-        body.other,
-        verdict,
-        body.reason,
-        body.user_answered,
-        body.agent_id.as_deref(),
-    )
+    let reader = named_reader(&app, body.agent_id.as_deref());
+    judge_pair(&app.runtime.store, body.keep, body.other, verdict, body.reason, body.user_answered, reader.as_ref())
         .await
         .map(Json)
         .map_err(resolve_error)
@@ -1579,7 +1846,8 @@ async fn disputes(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<DisputesQuery>,
 ) -> ApiResult<Json<OpenPairs>> {
-    open_pairs(&app.runtime.store, q.agent_id.as_deref(), OPEN_PAIRS_SHOWN)
+    let reader = named_reader(&app, q.agent_id.as_deref());
+    open_pairs(&app.runtime.store, reader.as_ref(), q.project_id.as_deref(), OPEN_PAIRS_SHOWN)
         .await
         .map(Json)
         .map_err(ApiError::internal)
@@ -1601,25 +1869,36 @@ const IMPORT_BODY_LIMIT: usize = 2 * MAX_IMPORT_BYTES;
 
 #[derive(Debug, Deserialize)]
 pub struct ImportRequest {
-    /// The export, as `clawg export` wrote it.
+    /// The export, as `clawg export` wrote it, or as another tool did.
     pub text: String,
+    /// The tool the export comes from: `clawg` when missing, or `engram`.
+    #[serde(default)]
+    pub from: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
     /// The agent every row that has one is stored under instead.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Exported project roots and the roots they have here.
+    /// Exported project roots and the roots they have here, for a clawg
+    /// export.
     #[serde(default)]
     pub map_roots: Vec<(String, String)>,
+    /// Project names of another tool and the roots they have here.
+    #[serde(default)]
+    pub project_map: Vec<(String, String)>,
 }
 
 /// Imports an export. The file is read before the embedder is asked for, so
 /// a file this binary cannot read is a 400 even while the model loads, and a
-/// dry run needs no model at all.
+/// dry run needs no model at all. Another tool's export is split by the
+/// model's tokenizer as a save of each note's text, so without it nothing is
+/// imported, not even a dry run: cut by bytes, the pieces would be others.
 async fn import_memories(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportReport>> {
+    let mut timings = ImportTimings::new(body.dry_run);
+    let read = Instant::now();
     if body.text.len() > MAX_IMPORT_BYTES {
         return Err(ApiError::bad_request(format!(
             "the file is {} bytes; at most {MAX_IMPORT_BYTES} are imported",
@@ -1630,16 +1909,77 @@ async fn import_memories(
         Some("") => return Err(ApiError::bad_request("agent must not be blank")),
         agent => agent.map(str::to_string),
     };
-    portability::format::parse(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let foreign = match body.from.as_deref() {
+        None | Some("clawg") => {
+            if !body.project_map.is_empty() {
+                return Err(ApiError::bad_request(
+                    "project_map maps the projects of another tool's export; name the tool in from",
+                ));
+            }
+            portability::format::parse(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            None
+        }
+        Some("engram") => {
+            if !body.map_roots.is_empty() {
+                return Err(ApiError::bad_request(
+                    "map_roots maps the roots of a clawg export; another tool's projects take project_map",
+                ));
+            }
+            let export = portability::engram::read(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            if app.runtime.tokenizer.get().is_none() {
+                return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "tokenizer_not_ready"));
+            }
+            Some(export)
+        }
+        Some(other) => return Err(ApiError::bad_request(format!("unknown source {other:?}; expected clawg or engram"))),
+    };
+    timings.record(Timing { elapsed: read.elapsed(), ..Timing::new(Step::Read) });
     let embedder = if body.dry_run { None } else { Some(ready_embedder(&app)?) };
-    let options = ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots };
+    let options =
+        ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map: body.project_map };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-    match portability::import(&app.runtime.store, embedder.as_deref(), &backups, &body.text, &options).await {
-        Ok(report) => Ok(Json(report)),
+    let store = &app.runtime.store;
+    let imported = match foreign {
+        None => portability::import(store, embedder.as_deref(), &backups, &body.text, &options, &mut timings).await,
+        Some(export) => {
+            let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
+            portability::import_foreign(store, embedder.as_deref(), chunker, &backups, export, &options, &mut timings).await
+        }
+    };
+    match imported {
+        Ok(report) => {
+            timings.finish();
+            Ok(Json(report))
+        }
         Err(ImportError::Format(e)) => Err(ApiError::bad_request(e.to_string())),
         Err(ImportError::NoEmbedder) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),
         Err(ImportError::Embed(e)) => Err(embed_failure(e)),
         Err(e @ ImportError::Store(_)) => Err(ApiError::internal(e)),
+    }
+}
+
+/// The body of `POST /v1/import/undo`. Strict, as a move's: a misspelt
+/// field must not undo an import as if it were not there.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoImportRequest {
+    pub import_id: i64,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Takes an import back for the user, keeping what changed since. Needs no
+/// embedder: it only removes rows and gives back links and states.
+async fn undo_import(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<UndoImportRequest>,
+) -> ApiResult<Json<UndoReport>> {
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    match portability::undo_import(&app.runtime.store, &backups, body.import_id, body.dry_run).await {
+        Ok(report) => Ok(Json(report)),
+        Err(e @ UndoError::UnknownImport(_)) => Err(ApiError::not_found(e.to_string())),
+        Err(e @ UndoError::Running(_)) => Err(ApiError::conflict(e.to_string())),
+        Err(e @ UndoError::Store(_)) => Err(ApiError::internal(e)),
     }
 }
 
@@ -1654,18 +1994,26 @@ pub struct RegisterRequest {
     /// caller that does not say only labels memories with the root.
     #[serde(default)]
     pub index_docs: bool,
+    /// The caller reads and writes under the ids this answer gives. False
+    /// when missing: a caller from before derives the id from the root.
+    #[serde(default)]
+    pub assigned: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RegisteredBody {
     pub project_id: String,
+    pub root_id: String,
     pub rekeyed: usize,
 }
 
-/// Records a project root and moves rows saved under its legacy ids onto it.
+/// Records a project root and joins into its project the rows saved under
+/// its legacy ids and, for a clone of a remote another root registered, its
+/// own.
 ///
-/// The id is derived here from `root_path` rather than taken from the caller,
-/// so the row in `project` can never name a root that does not hash to it.
+/// The ids are settled here from `root_path` and the remote its git
+/// directory names, never taken from the caller, so a row in `project` can
+/// never name a root it was not given to.
 async fn register(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<RegisterRequest>,
@@ -1677,37 +2025,55 @@ async fn register(
     if body.index_docs && !root.is_dir() {
         return Err(ApiError::bad_request(format!("{} is not a directory, so it has no files to index", body.root_path)));
     }
-    let outcome = register_project(
-        &app.runtime.store,
-        &app.runtime.workspaces(),
+    let remote = if body.assigned {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || origin_key(&root)).await.ok().flatten()
+    } else {
+        None
+    };
+    let registration = Registration {
         root,
-        &body.legacy_ids,
-        body.index_docs,
-    )
-    .await
-    .map_err(|e| match e {
-        RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
-        RegisterError::RootCollision { id, existing } => ApiError {
-            detail: Some(format!("{} gets the project id {id}, which already belongs to {existing}", root.display())),
-            ..ApiError::conflict("project_root_collision")
-        },
-        RegisterError::Store(_) => ApiError::internal(e),
-    })?;
+        remote: remote.as_deref(),
+        legacy_ids: &body.legacy_ids,
+        index_docs: body.index_docs,
+        assigned: body.assigned,
+    };
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration)
+        .await
+        .map_err(|e| match e {
+            RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
+            RegisterError::RootCollision { id, existing } => ApiError {
+                detail: Some(format!("{} gets the project id {id}, which already belongs to {existing}", root.display())),
+                ..ApiError::conflict("project_root_collision")
+            },
+            RegisterError::NoFreeId(_) => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("no_free_project_id") },
+            RegisterError::Store(_) => ApiError::internal(e),
+        })?;
+    if outcome.rekeyed > 0 {
+        log::info!(
+            "{} joined {} rows of its earlier ids into project {}{}{}",
+            root.display(),
+            outcome.rekeyed,
+            outcome.project_id,
+            outcome.move_id.map(|n| format!("; `clawg projects move --undo {n}` moves its memories back")).unwrap_or_default(),
+            outcome.snapshot.as_ref().map(|s| format!("; the store before is {}", s.display())).unwrap_or_default()
+        );
+    }
     // A bridge registers its root as its session starts, so the model that
     // went away while nobody worked starts loading before the first search.
     if let Some(embedder) = app.runtime.embedder.get() {
         embedder.wake();
     }
     if outcome.index_docs {
-        spawn_doc_refresh(app.clone(), outcome.project_id.clone());
+        spawn_doc_refresh(app.clone(), outcome.root_id.clone());
     }
-    Ok(Json(RegisteredBody { project_id: outcome.project_id, rekeyed: outcome.rekeyed }))
+    Ok(Json(RegisteredBody { project_id: outcome.project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
 }
 
 /// Refreshes the project's documentation index in the background, once the
 /// embedder has loaded: the bridge registers a root as its session starts,
-/// usually before the model is ready. Nobody waits on it, so a failure is
-/// logged and the next search tries again.
+/// usually before the model is ready.
 fn spawn_doc_refresh(app: Arc<AppCtx>, project_id: String) {
     tokio::spawn(async move {
         let mut status = app.runtime.embedder_status.subscribe();
@@ -1718,22 +2084,46 @@ fn spawn_doc_refresh(app: Arc<AppCtx>, project_id: String) {
             log::warn!("not indexing the docs of {project_id}: the embedder did not load");
             return;
         };
-        let tokenizer = app.runtime.tokenizer.get().cloned();
-        match app.runtime.project_docs.try_refresh(&app.runtime.store, embedder.as_ref(), tokenizer, &project_id).await {
-            Ok(RefreshOutcome::Refreshed(r)) => log::info!(
-                "indexed the docs of {project_id}: {} docs, {} reindexed, {} removed, {} skipped, {} passages",
-                r.docs, r.indexed, r.removed, r.skipped, r.passages
-            ),
-            Ok(RefreshOutcome::AlreadyRunning) => {}
-            Err(e) => log::warn!("could not index the docs of {project_id}: {e}"),
+        if let Some(guard) = app.runtime.project_docs.begin(&project_id) {
+            refresh_docs(&app, guard, embedder.as_ref(), &project_id).await;
         }
     });
+}
+
+/// Runs a claimed refresh in a task of its own, so it ends even when whoever
+/// started it stops waiting.
+fn refresh_docs_in_background(app: Arc<AppCtx>, guard: RefreshGuard, embedder: Arc<dyn Embedder>, project_id: String) {
+    tokio::spawn(async move { refresh_docs(&app, guard, embedder.as_ref(), &project_id).await });
+}
+
+/// Nobody waits on the outcome: a failure is logged and kept for the next
+/// search to name.
+async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder, project_id: &str) {
+    let tokenizer = app.runtime.tokenizer.get().cloned();
+    match guard.run(&app.runtime.store, embedder, tokenizer).await {
+        Ok(r) => {
+            log::info!(
+                "indexed the docs of {project_id}: {} docs, {} reindexed, {} removed, {} skipped, {} passages",
+                r.docs, r.indexed, r.removed, r.skipped, r.passages
+            );
+            for f in &r.failed {
+                log::warn!("left {} of {project_id} as it was: {}", f.path, f.reason);
+            }
+        }
+        Err(e) => log::warn!("could not index the docs of {project_id}: {e}"),
+    }
 }
 
 /// How long a search waits for a project's first index before answering
 /// with what there is. Longer than indexing a typical repository's docs takes,
 /// and short of what an MCP host waits for a tool.
 pub const FIRST_INDEX_WAIT: Duration = Duration::from_secs(20);
+
+/// How long a search waits for the refresh it started over an index that
+/// already holds docs before answering from it. About what one doc took in
+/// the one full reindex measured (a debug build), so an edit is usually found
+/// by the search that finds it, and a checkout costs that search no more.
+pub const REFRESH_GRACE: Duration = Duration::from_secs(3);
 
 async fn docs_in(store: &clawg_core::memory::MemoryStore, project_id: &str) -> ApiResult<usize> {
     project_docs::doc_count(store, project_id).await.map_err(ApiError::internal)
@@ -1748,7 +2138,7 @@ pub fn clamp_docs_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(DEFAULT_DOCS_LIMIT).clamp(1, MAX_DOCS_LIMIT)
 }
 
-/// Strict for the same reason as [`OwnerQuery`].
+/// Strict for the same reason as [`ReaderQuery`].
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocsSearchRequest {
@@ -1765,8 +2155,8 @@ pub struct DocsSearchBody {
     pub docs: usize,
     /// A refresh of the project is still running, so the hits may be partial.
     pub indexing: bool,
-    /// Why the refresh before this search failed; the hits come from what was
-    /// already indexed.
+    /// Why the project's last finished refresh failed, until one succeeds;
+    /// the hits come from what was already indexed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -1789,8 +2179,9 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
     )
 }
 
-/// Searches a registered project's documentation, refreshing its index first
-/// when the last refresh is older than [`project_docs::REFRESH_INTERVAL`].
+/// Searches a registered project's documentation. When the last refresh is
+/// older than [`project_docs::REFRESH_INTERVAL`] it starts one in the
+/// background and waits for it at most [`REFRESH_GRACE`].
 async fn search_docs(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<DocsSearchRequest>,
@@ -1806,22 +2197,21 @@ async fn search_docs(
     })?;
     let embedder = ready_embedder(&app)?;
     let index = &app.runtime.project_docs;
-    let mut warning = None;
-    if index.is_due(&body.project_id, Instant::now()) {
-        let tokenizer = app.runtime.tokenizer.get().cloned();
-        if let Err(e) = index.try_refresh(store, embedder.as_ref(), tokenizer, &body.project_id).await {
-            warning = Some(e.to_string());
-        }
+    // An empty index waits longer: answering from it would read as "the docs
+    // say nothing". The first index is usually started by the bridge's
+    // registration a moment before this search.
+    if let Some(guard) = index.begin_if_due(&body.project_id, Instant::now()) {
+        refresh_docs_in_background(app.clone(), guard, embedder.clone(), body.project_id.clone());
+        let limit = if docs_in(store, &body.project_id).await? == 0 { FIRST_INDEX_WAIT } else { REFRESH_GRACE };
+        index.wait_idle(&body.project_id, limit).await;
     } else if index.is_running(&body.project_id) && docs_in(store, &body.project_id).await? == 0 {
-        // The first index of a project is usually started by the bridge's
-        // registration a moment before this search; answering from an empty
-        // index would read as "the docs say nothing".
         index.wait_idle(&body.project_id, FIRST_INDEX_WAIT).await;
     }
     let hits = project_docs::search(store, embedder.as_ref(), &body.project_id, &body.query, clamp_docs_limit(body.limit))
         .await
         .map_err(ApiError::internal)?;
     let docs = docs_in(store, &body.project_id).await?;
+    let warning = index.last_error(&body.project_id);
     Ok(Json(DocsSearchBody { hits, docs, indexing: index.is_running(&body.project_id), warning }))
 }
 
@@ -1996,6 +2386,7 @@ mod tests {
             distance: 0.3,
             escalated: true,
             excerpt: "Ports".into(),
+            same_scope: true,
         };
         let (_, body) = save_response(
             Confirmation::Reported(IngestReport {
@@ -2009,6 +2400,23 @@ mod tests {
         .expect("a clean report is a success");
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["related"], serde_json::json!([{ "kind": "memory", "id": 12, "escalated": true, "excerpt": "Ports" }]));
+    }
+
+    #[test]
+    fn a_confirmed_save_names_its_revision_candidate_only_when_it_has_one() {
+        let report = |revision_candidate| IngestReport {
+            memories: vec![chunk(57, ChunkOutcome::Inserted)],
+            revision_candidate,
+            ..Default::default()
+        };
+        let (_, body) = save_response(Confirmation::Reported(report(Some(12))), "op-1".into(), &[])
+            .expect("a clean report is a success");
+        assert_eq!(serde_json::to_value(&body).unwrap()["revision_candidate"], 12);
+
+        let (_, body) = save_response(Confirmation::Reported(report(None)), "op-1".into(), &[])
+            .expect("a clean report is a success");
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("revision_candidate").is_none(), "{json}");
     }
 
     #[test]
@@ -2063,6 +2471,7 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            metrics: Default::default(),
         });
 
         let (addr, server) = serve_ephemeral(app).await.expect("bind an ephemeral loopback port");
@@ -2235,6 +2644,58 @@ mod tests {
         let params = list_params_from_query(query(|q| q.q = Some("deploy".into())))
             .expect("valid");
         assert_eq!(params.kind, Some(MemoryKind::Memory));
+    }
+
+    #[test]
+    fn a_move_asks_for_one_target_or_an_undo() {
+        let ids = |ids: Vec<i64>| MoveRequest { ids, ..MoveRequest::default() };
+        assert_eq!(
+            MoveRequest { to_project: Some("repo-1a2b".into()), ..ids(vec![3]) }.plan().expect("valid"),
+            MovePlan::Move {
+                filter: MoveFilter { ids: vec![3], ..MoveFilter::default() },
+                target: Some("repo-1a2b".into())
+            }
+        );
+        assert_eq!(
+            MoveRequest { from_none: true, to_none: true, ..MoveRequest::default() }.plan().expect("valid"),
+            MovePlan::Move { filter: MoveFilter { from: Some(ProjectFilter::None), ..MoveFilter::default() }, target: None }
+        );
+        assert_eq!(MoveRequest { undo: Some(4), ..MoveRequest::default() }.plan().expect("valid"), MovePlan::Undo(4));
+        for bad in [
+            ids(vec![3]),
+            MoveRequest { to_project: Some("repo-1a2b".into()), to_none: true, ..ids(vec![3]) },
+            MoveRequest { undo: Some(4), to_none: true, ..MoveRequest::default() },
+            MoveRequest { undo: Some(4), ..ids(vec![3]) },
+            MoveRequest { from_project: Some("a-0000".into()), from_none: true, to_none: true, ..MoveRequest::default() },
+        ] {
+            assert_eq!(bad.plan().expect_err("refused").status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn no_project_and_project_together_are_refused() {
+        assert!(list_params_from_query(query(|q| q.no_project = Some(true))).expect("valid").no_project);
+        let err = list_params_from_query(query(|q| {
+            q.no_project = Some(true);
+            q.project = Some("repo-1a2b".into());
+        }))
+        .expect_err("a row has one project or none");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_update_names_one_destination_at_most() {
+        let request = |project_id: Option<&str>, no_project| UpdateRequest {
+            importance: None,
+            memory_type: None,
+            project_id: project_id.map(str::to_string),
+            no_project,
+            user_answered: false,
+        };
+        assert_eq!(request(None, false).destination().expect("valid"), None);
+        assert_eq!(request(Some("repo-1a2b"), false).destination().expect("valid"), Some(Some("repo-1a2b".into())));
+        assert_eq!(request(None, true).destination().expect("valid"), Some(None));
+        assert_eq!(request(Some("repo-1a2b"), true).destination().expect_err("both").status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

@@ -9,9 +9,12 @@ use crate::memory::chunker::Chunk;
 use crate::memory::clock::TimestampMs;
 use crate::memory::contradiction::Candidate;
 use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::language;
 use crate::memory::vector::to_unit;
 use crate::memory::outbox::{apply_note, OutboxNote};
 use crate::memory::provenance::seal;
+use crate::memory::search::{reach_predicate, reader_bind};
+use crate::memory::sharing::Reader;
 use crate::memory::MemoryStore;
 use crate::models::chat::Role;
 use rusqlite::OptionalExtension;
@@ -297,31 +300,39 @@ pub enum MemoryStoreError {
 /// predicate — most importantly the `COALESCE(project_id,'')` that has to match
 /// `idx_memory_dedup`'s indexed expression byte-for-byte — moved production off
 /// the index while the test kept confirming the old copy still hit it.
-const REINFORCE_LOOKUP_SQL: &str = "SELECT id FROM memory \
-     WHERE agent_id = ?1 \
-       AND COALESCE(project_id, '') = COALESCE(?2, '') \
+///
+/// The text is the project's, not the agent's: a save reinforces the live row
+/// of its text in its project whoever saved it, so a shared brain keeps one
+/// row per text. `?1` is the saver's reach (`reach_bind`): a row whose author
+/// `sharing.json` hides from the saver is left alone, never written through.
+const REINFORCE_LOOKUP_SQL: &str = concat!(
+    "SELECT id FROM memory \
+     WHERE COALESCE(project_id, '') = COALESCE(?2, '') \
        AND content_hash = ?3 \
        AND content_hash IS NOT NULL \
        AND deleted_at IS NULL \
        AND status IN ('active', 'disputed') \
-     ORDER BY created_at ASC LIMIT 1";
+       AND ",
+    reach_predicate!("agent_id", "?1"),
+    " ORDER BY created_at ASC LIMIT 1"
+);
 
 impl MemoryStore {
     /// [`MemoryStore::reinforce_noting`] with nothing to note.
     #[cfg(test)]
     pub(crate) async fn reinforce_if_duplicate(
         &self,
-        agent_id: &str,
+        saver: &Reader,
         project_id: Option<&str>,
         content_hash: &str,
         derived_from: &[i64],
         now_ms: u64,
     ) -> Result<Option<i64>, MemoryStoreError> {
-        self.reinforce_noting(agent_id, project_id, content_hash, derived_from, now_ms, |_| None).await
+        self.reinforce_noting(saver, project_id, content_hash, derived_from, now_ms, |_| None).await
     }
 
-    /// Reinforces the existing active row matching `(agent_id,
-    /// COALESCE(project_id,''), content_hash)`, if any: `access_count += 1`,
+    /// Reinforces the existing active row matching `(COALESCE(project_id,''),
+    /// content_hash)` within `saver`'s reach, if any: `access_count += 1`,
     /// `last_accessed_at = MAX(last_accessed_at, now_ms)`, `tier` recomputed
     /// via `compute_tier`. Returns the reinforced row's id, or `None` on a
     /// miss.
@@ -361,14 +372,14 @@ impl MemoryStore {
     /// same transaction, so a replay never reinforces the row a second time.
     pub(crate) async fn reinforce_noting(
         &self,
-        agent_id: &str,
+        saver: &Reader,
         project_id: Option<&str>,
         content_hash: &str,
         derived_from: &[i64],
         now_ms: u64,
         note: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
     ) -> Result<Option<i64>, MemoryStoreError> {
-        let agent_id = agent_id.to_string();
+        let reach = reader_bind(Some(saver));
         let project_id = project_id.map(str::to_string);
         let content_hash = content_hash.to_string();
         let derived_from = derived_from.to_vec();
@@ -381,7 +392,7 @@ impl MemoryStore {
                 let existing_id: Option<i64> = tx
                     .query_row(
                         REINFORCE_LOOKUP_SQL,
-                        rusqlite::params![agent_id, project_id, content_hash],
+                        rusqlite::params![reach, project_id, content_hash],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -435,26 +446,28 @@ impl MemoryStore {
     }
 
     /// [`MemoryStore::insert_noting`] that first looks, in the same
-    /// transaction, for a live row of the same scope and text, and reinforces
-    /// it instead. The worker's own lookup runs before the embedding, and a
+    /// transaction, for a live row of the same project and text within
+    /// `saver`'s reach, and reinforces it instead. The worker's own lookup runs before the embedding, and a
     /// restore can bring the same text back to life in between: inserting
     /// then would leave two live copies that nothing collapses. `inserted`
     /// notes an insert, `absorbed` a reinforcement.
     pub(crate) async fn insert_unless_twin(
         &self,
+        saver: &Reader,
         record: NewMemoryRecord,
         embedding: Vec<f32>,
         inserted: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
         absorbed: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
     ) -> Result<Stored, MemoryStoreError> {
         let row = PreparedRow::new(record, &embedding)?;
+        let reach = reader_bind(Some(saver));
         self.conn
             .call(move |c| -> Result<Stored, rusqlite::Error> {
                 let tx = c.transaction()?;
                 let twin: Option<i64> = tx
                     .query_row(
                         REINFORCE_LOOKUP_SQL,
-                        rusqlite::params![row.record.agent_id, row.record.project_id, row.content_hash],
+                        rusqlite::params![reach, row.record.project_id, row.content_hash],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -516,6 +529,7 @@ struct PreparedRow {
     disputed_against: Option<String>,
     last_disputed_at: Option<TimestampMs>,
     content_hash: String,
+    lang: &'static str,
 }
 
 impl PreparedRow {
@@ -542,6 +556,9 @@ impl PreparedRow {
             // (worker.rs, before embed) — writing it here too keeps every row
             // dedup-eligible regardless of which producer inserted it.
             content_hash: crate::memory::dedup::content_hash(&record.content),
+            // The row's own text, already masked: a piece is long enough to
+            // tell, and the import and the maintenance pass see rows too.
+            lang: language::column_value(language::detect(&record.content)),
             record,
         })
     }
@@ -554,8 +571,8 @@ impl PreparedRow {
              (scope, agent_id, project_id, content, memory_type, source, \
               created_at, created_by_type, created_by_ref, \
               last_modified_at, last_accessed_at, access_count, importance, tier, \
-              status, disputed_against, last_disputed_at, content_hash, topic_key, source_session_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              status, disputed_against, last_disputed_at, content_hash, topic_key, source_session_id, lang) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
                 record.scope,
                 record.agent_id,
@@ -587,6 +604,7 @@ impl PreparedRow {
                 self.content_hash,
                 record.topic_key,
                 record.source_session_id,
+                self.lang,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -837,6 +855,12 @@ fn serialize_f32_vec(v: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use crate::memory::sharing::Reach;
+
+    /// `agent` as a policy that hides nothing lets it save.
+    fn shared(agent: &str) -> Reader {
+        Reader::new(agent, Reach::AllBut(Vec::new()))
+    }
     use super::*;
 
     #[test]
@@ -1274,6 +1298,31 @@ mod tests {
         assert_eq!(source, "explicit");
     }
 
+    #[tokio::test]
+    async fn a_save_records_the_language_of_each_row() {
+        let store = crate::memory::db::MemoryStore::new_for_test().await.unwrap();
+        let mut ids = Vec::new();
+        for content in [
+            "El daemon guarda cada memoria en una sola transacción, y la búsqueda las encuentra.",
+            "The daemon stores every memory in one transaction, and the search finds them.",
+            "`MemoryStore::open` in crates/clawg-core/src/memory/db.rs",
+        ] {
+            let record = NewMemoryRecord { content: content.to_string(), ..make_record("a", None) };
+            ids.push(store.insert_memory_with_vector(record, make_embedding_384()).await.unwrap());
+        }
+        let langs: Vec<Option<String>> = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                let mut stmt = c.prepare("SELECT lang FROM memory ORDER BY id")?;
+                let langs = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+                Ok(langs)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(langs, [Some("es".to_string()), Some("en".to_string()), Some("und".to_string())]);
+    }
+
     // ── INSERT writes status/disputed_against/last_disputed_at ──
 
     #[tokio::test]
@@ -1301,7 +1350,7 @@ mod tests {
     }
 
     fn candidate(id: i64, distance: f64, escalated: bool) -> Candidate {
-        Candidate { id, distance, escalated, excerpt: String::new() }
+        Candidate { id, distance, escalated, excerpt: String::new(), same_scope: true }
     }
 
     #[tokio::test]
@@ -1988,7 +2037,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = store.reinforce_if_duplicate("agent-r1", None, hash, &[], 2_000).await.unwrap();
+        let result = store.reinforce_if_duplicate(&shared("agent-r1"), None, hash, &[], 2_000).await.unwrap();
         assert_eq!(result, Some(id), "a matching active row must be reinforced");
 
         let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
@@ -1999,7 +2048,7 @@ mod tests {
     #[tokio::test]
     async fn reinforce_if_duplicate_miss_returns_none() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let result = store.reinforce_if_duplicate("agent-r2", None, "no-such-hash", &[], 1_000).await.unwrap();
+        let result = store.reinforce_if_duplicate(&shared("agent-r2"), None, "no-such-hash", &[], 1_000).await.unwrap();
         assert_eq!(result, None, "no matching row must return None");
     }
 
@@ -2009,7 +2058,7 @@ mod tests {
         let hash = "hash-reinforce-deleted";
         seed_hashed_row(&store, "agent-r3", None, hash, "active", Some(500), 1_000, 0).await;
 
-        let result = store.reinforce_if_duplicate("agent-r3", None, hash, &[], 2_000).await.unwrap();
+        let result = store.reinforce_if_duplicate(&shared("agent-r3"), None, hash, &[], 2_000).await.unwrap();
         assert_eq!(result, None, "a soft-deleted row must never be reinforced");
     }
 
@@ -2019,7 +2068,7 @@ mod tests {
         let hash = "hash-reinforce-superseded";
         seed_hashed_row(&store, "agent-r4", None, hash, "superseded", None, 1_000, 0).await;
 
-        let result = store.reinforce_if_duplicate("agent-r4", None, hash, &[], 2_000).await.unwrap();
+        let result = store.reinforce_if_duplicate(&shared("agent-r4"), None, hash, &[], 2_000).await.unwrap();
         assert_eq!(result, None, "a superseded row must never be reinforced");
     }
 
@@ -2031,10 +2080,10 @@ mod tests {
         let id_p2 = seed_hashed_row(&store, "agent-r5", Some("proj-2"), hash, "active", None, 1_000, 0).await;
         assert_ne!(id_p1, id_p2);
 
-        let hit_p1 = store.reinforce_if_duplicate("agent-r5", Some("proj-1"), hash, &[], 2_000).await.unwrap();
+        let hit_p1 = store.reinforce_if_duplicate(&shared("agent-r5"), Some("proj-1"), hash, &[], 2_000).await.unwrap();
         assert_eq!(hit_p1, Some(id_p1), "proj-1 lookup must reinforce only the proj-1 row");
 
-        let hit_p2 = store.reinforce_if_duplicate("agent-r5", Some("proj-2"), hash, &[], 2_000).await.unwrap();
+        let hit_p2 = store.reinforce_if_duplicate(&shared("agent-r5"), Some("proj-2"), hash, &[], 2_000).await.unwrap();
         assert_eq!(hit_p2, Some(id_p2), "proj-2 lookup must reinforce only the proj-2 row");
 
         let (ac_p1, _) = fetch_access_count_and_tier(&store, id_p1).await;
@@ -2049,38 +2098,39 @@ mod tests {
         let hash = "hash-reinforce-null-proj";
         let id = seed_hashed_row(&store, "agent-r6", None, hash, "active", None, 1_000, 0).await;
 
-        let result = store.reinforce_if_duplicate("agent-r6", None, hash, &[], 2_000).await.unwrap();
+        let result = store.reinforce_if_duplicate(&shared("agent-r6"), None, hash, &[], 2_000).await.unwrap();
         assert_eq!(result, Some(id), "NULL project_id on both sides must match via COALESCE");
     }
 
-    /// `agent_id` is the outermost column of `idx_memory_dedup` and the first
-    /// predicate of the lookup, but every other test in this block seeds and
-    /// queries under ONE agent in its own fresh in-memory store — so dropping
-    /// the `agent_id = ?1` clause entirely left the whole suite green
-    /// (mutation-verified). Identical text from two agents is the ordinary
-    /// case, not an exotic one: without this clause agent-b's chunk reinforces
-    /// agent-a's row, agent-b silently never gets the memory, and agent-a's
-    /// access_count (hence its tier) is inflated by traffic that was never its
-    /// own. Two agents, same hash, same store — the isolation is the assertion.
+    /// A shared brain keeps one row per text in a project: identical text from
+    /// another agent reinforces the row that is already there, whoever saved
+    /// it, and not a row the policy hides from the saver.
     #[tokio::test]
-    async fn reinforce_if_duplicate_other_agents_row_is_not_reinforced() {
+    async fn reinforce_if_duplicate_reinforces_another_agents_row() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let hash = "hash-reinforce-cross-agent";
+        let id_a = seed_hashed_row(&store, "agent-a", Some("p"), hash, "active", None, 1_000, 0).await;
+
+        let hit = store.reinforce_if_duplicate(&shared("agent-b"), Some("p"), hash, &[], 2_000).await.unwrap();
+        assert_eq!(hit, Some(id_a), "agent-b's save is agent-a's text in the same project");
+        let (ac_a, _) = fetch_access_count_and_tier(&store, id_a).await;
+        assert_eq!(ac_a, 1);
+
+        let elsewhere = store.reinforce_if_duplicate(&shared("agent-b"), Some("q"), hash, &[], 2_000).await.unwrap();
+        assert_eq!(elsewhere, None, "another project keeps its own row");
+    }
+
+    #[tokio::test]
+    async fn reinforce_if_duplicate_leaves_a_hidden_authors_row() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let hash = "hash-reinforce-hidden";
         let id_a = seed_hashed_row(&store, "agent-a", None, hash, "active", None, 1_000, 0).await;
 
-        let miss = store.reinforce_if_duplicate("agent-b", None, hash, &[], 2_000).await.unwrap();
-        assert_eq!(
-            miss, None,
-            "agent-b must not reinforce agent-a's row, even on an identical content hash"
-        );
-
-        let (ac_a, _) = fetch_access_count_and_tier(&store, id_a).await;
-        assert_eq!(ac_a, 0, "agent-a's access_count must be untouched by agent-b's lookup");
-
-        // And the same call under the owning agent still hits — proving the
-        // miss above came from the agent scope, not from a broken fixture.
-        let hit = store.reinforce_if_duplicate("agent-a", None, hash, &[], 2_000).await.unwrap();
-        assert_eq!(hit, Some(id_a), "the owning agent must still reinforce its own row");
+        let hidden = Reader::new("agent-b", Reach::AllBut(vec!["agent-a".into()]));
+        assert_eq!(store.reinforce_if_duplicate(&hidden, None, hash, &[], 2_000).await.unwrap(), None);
+        assert_eq!(fetch_access_count_and_tier(&store, id_a).await.0, 0, "a hidden author's row is never written through");
+        let own = Reader::new("agent-b", Reach::Own);
+        assert_eq!(store.reinforce_if_duplicate(&own, None, hash, &[], 2_000).await.unwrap(), None);
     }
 
     /// `idx_memory_dedup` indexes `COALESCE(project_id, '')`, so a NULL
@@ -2098,7 +2148,7 @@ mod tests {
         let hash = "hash-reinforce-empty-proj";
         let id = seed_hashed_row(&store, "agent-r8", Some(""), hash, "active", None, 1_000, 0).await;
 
-        let hit = store.reinforce_if_duplicate("agent-r8", None, hash, &[], 2_000).await.unwrap();
+        let hit = store.reinforce_if_duplicate(&shared("agent-r8"), None, hash, &[], 2_000).await.unwrap();
         assert_eq!(
             hit,
             Some(id),
@@ -2113,7 +2163,7 @@ mod tests {
         let older = seed_hashed_row(&store, "agent-r7", None, hash, "active", None, 1_000, 0).await;
         let _newer = seed_hashed_row(&store, "agent-r7", None, hash, "active", None, 2_000, 0).await;
 
-        let result = store.reinforce_if_duplicate("agent-r7", None, hash, &[], 3_000).await.unwrap();
+        let result = store.reinforce_if_duplicate(&shared("agent-r7"), None, hash, &[], 3_000).await.unwrap();
         assert_eq!(result, Some(older), "must deterministically pick the oldest row among legacy duplicates");
     }
 
@@ -2141,12 +2191,12 @@ mod tests {
         assert_eq!(access_count, 1, "insert must write access_count = 1");
         assert_eq!(tier, 2, "architectural_decision inserts at tier 2, below the promotion rule");
 
-        store.reinforce_if_duplicate(&agent_id, None, &hash, &[], 2_000).await.unwrap();
+        store.reinforce_if_duplicate(&shared(&agent_id), None, &hash, &[], 2_000).await.unwrap();
         let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
         assert_eq!(access_count, 2);
         assert_eq!(tier, 2, "one reinforcement is not enough to promote");
 
-        store.reinforce_if_duplicate(&agent_id, None, &hash, &[], 3_000).await.unwrap();
+        store.reinforce_if_duplicate(&shared(&agent_id), None, &hash, &[], 3_000).await.unwrap();
         let (access_count, tier) = fetch_access_count_and_tier(&store, id).await;
         assert_eq!(access_count, 3);
         assert_eq!(tier, 1, "the second reinforcement crosses access_count >= 3 and promotes to tier 1");
@@ -2169,7 +2219,7 @@ mod tests {
             .call(|c| -> rusqlite::Result<Vec<String>> {
                 let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {REINFORCE_LOOKUP_SQL}"))?;
                 let rows = stmt
-                    .query_map(rusqlite::params!["a", Option::<String>::None, "h"], |r| {
+                    .query_map(rusqlite::params![reader_bind(Some(&shared("a"))), Option::<String>::None, "h"], |r| {
                         r.get::<_, String>(3) // EXPLAIN QUERY PLAN's `detail` column
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2182,5 +2232,9 @@ mod tests {
             plan_text.contains("idx_memory_dedup"),
             "expected the planner to use idx_memory_dedup, got plan: {plan_text}"
         );
+        // Any index that hands the project its rows by `created_at` competes
+        // for `ORDER BY created_at ASC LIMIT 1`; the dedup index wins only while
+        // it gives the order too.
+        assert!(!plan_text.contains("TEMP B-TREE"), "the lookup sorts its rows: {plan_text}");
     }
 }

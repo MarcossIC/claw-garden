@@ -1,13 +1,20 @@
 //! Memories by row, out of a store and into another: the `clawg-memories`
 //! format, the export that writes it and the import that reads it.
 
+pub mod engram;
 pub mod export;
+pub mod foreign;
 pub mod format;
 pub mod import;
 pub mod markdown;
+pub mod timing;
+pub mod translate;
+pub mod undo;
 
 pub use export::{export, Export, ExportError, ExportFilter};
-pub use import::{import, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
+pub use import::{import, import_foreign, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
+pub use timing::ImportTimings;
+pub use undo::{undo_import, KeepReason, KeptRow, UndoError, UndoReport};
 
 #[cfg(test)]
 pub(crate) mod fixtures {

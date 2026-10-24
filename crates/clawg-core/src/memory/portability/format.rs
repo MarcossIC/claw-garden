@@ -94,6 +94,15 @@ pub struct MemoryLine {
     pub topic_key: Option<String>,
     #[serde(default)]
     pub revived_from: Option<i64>,
+    /// `en`, `es` or `und`, and `null` for a row not yet classified or a
+    /// store from before the column. An import reads the language from the
+    /// text again and never from here.
+    #[serde(default)]
+    pub lang: Option<String>,
+    /// The project the row had in the tool it was imported from, `null` for
+    /// any other row or a store from before the column.
+    #[serde(default)]
+    pub origin_project: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +135,9 @@ pub struct ConflictLine {
     pub created_at: i64,
     #[serde(default)]
     pub judged_at: Option<i64>,
+    /// The save without a key was warned that it may revise `old_id`.
+    #[serde(default)]
+    pub topic_key_warned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -291,13 +303,13 @@ pub(crate) mod tests {
         "\n",
         r#"{"kind":"project","id":"repo-1a2b","root_path":"/work/repo"}"#,
         "\n",
-        r#"{"kind":"memory","id":7,"scope":"agent","agent_id":"claude-code","project_id":"repo-1a2b","content":"Storage engine: SQLite with WAL","memory_type":"architectural_decision","source":"explicit","created_at":1750000000000,"created_by_type":"user","created_by_ref":"claude-code","source_session_id":"s-1","last_modified_at":1750000000000,"last_modified_by":null,"update_count":0,"last_accessed_at":1755000000000,"access_count":4,"importance":8.0,"tier":1,"status":"superseded","superseded_by":9,"supersede_cause":"revision","dispute_count":0,"disputed_against":[],"last_disputed_at":null,"deleted_at":null,"topic_key":"storage/engine","revived_from":null}"#,
+        r#"{"kind":"memory","id":7,"scope":"agent","agent_id":"claude-code","project_id":"repo-1a2b","content":"Storage engine: SQLite with WAL","memory_type":"architectural_decision","source":"explicit","created_at":1750000000000,"created_by_type":"user","created_by_ref":"claude-code","source_session_id":"s-1","last_modified_at":1750000000000,"last_modified_by":null,"update_count":0,"last_accessed_at":1755000000000,"access_count":4,"importance":8.0,"tier":1,"status":"superseded","superseded_by":9,"supersede_cause":"revision","dispute_count":0,"disputed_against":[],"last_disputed_at":null,"deleted_at":null,"topic_key":"storage/engine","revived_from":null,"lang":"und","origin_project":null}"#,
         "\n",
         r#"{"kind":"derivation","memory":9,"source":7,"created_at":1751000000000}"#,
         "\n",
         r#"{"kind":"piece","save":3,"piece":2,"memory":9,"context":"Storage engine"}"#,
         "\n",
-        r#"{"kind":"conflict","new_id":9,"old_id":7,"distance":0.31,"state":"judged","verdict":"compatible","reason":"different scopes","created_at":1751000000000,"judged_at":1752000000000}"#,
+        r#"{"kind":"conflict","new_id":9,"old_id":7,"distance":0.31,"state":"judged","verdict":"compatible","reason":"different scopes","created_at":1751000000000,"judged_at":1752000000000,"topic_key_warned":false}"#,
         "\n",
     );
 
@@ -324,6 +336,19 @@ pub(crate) mod tests {
         let headless = EXAMPLE.lines().skip(1).collect::<Vec<_>>().join("\n");
         assert!(matches!(parse(&headless).unwrap_err(), FormatError::NoHeader(_)));
         assert_eq!(parse("\n  \n").unwrap_err(), FormatError::Empty);
+    }
+
+    #[test]
+    fn a_conflict_line_without_the_mark_reads_unmarked() {
+        let older = EXAMPLE.replacen(",\"topic_key_warned\":false", "", 1);
+        assert_ne!(older, EXAMPLE);
+        let (_, parsed) = parse(&older).unwrap();
+        assert!(parsed.invalid.is_empty(), "{:?}", parsed.invalid);
+        assert!(!parsed.conflicts[0].1.topic_key_warned);
+
+        let marked = EXAMPLE.replacen("\"topic_key_warned\":false", "\"topic_key_warned\":true", 1);
+        let (_, parsed) = parse(&marked).unwrap();
+        assert!(parsed.conflicts[0].1.topic_key_warned);
     }
 
     #[test]

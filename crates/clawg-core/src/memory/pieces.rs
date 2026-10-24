@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use crate::memory::admin::{get_memory_core, MemoryKind};
 use crate::memory::error::MemoryError;
 use crate::memory::search::PiecePosition;
+use crate::memory::sharing::Reader;
 use crate::memory::MemoryStore;
 
 /// One piece the worker stored: the row that holds it and the head its
@@ -52,10 +53,12 @@ pub struct SaveText {
 }
 
 /// Shortest repeated text treated as the overlap between two neighbours;
-/// anything shorter is as likely a coincidence as a repeat.
-const MIN_OVERLAP_CHARS: usize = 16;
-/// Farthest back an overlap is looked for. The chunker repeats 64 tokens,
-/// well under this at any realistic token length.
+/// anything shorter is as likely a coincidence as a repeat. The chunker
+/// keeps at least this much between the pieces it cuts.
+pub(crate) const MIN_OVERLAP_CHARS: usize = 16;
+/// Farthest back an overlap is looked for. The chunker repeats at least 24
+/// tokens between the pieces of a save (64 between chunks), stretched back to
+/// where a word starts: well under this at any realistic token length.
 const MAX_OVERLAP_BYTES: usize = 2048;
 
 /// Joins neighbouring pieces, keeping once the longest end of each that the
@@ -91,21 +94,21 @@ fn overlap(a: &str, b: &str) -> Option<usize> {
         .map(str::len)
 }
 
-/// One position of a save: its row, and the row's content, owner and
+/// One position of a save: its row, and the row's content, author and
 /// deletion time, all `None` when the row is gone from `memory`.
 type Position = (i64, Option<String>, Option<String>, Option<i64>);
 
-/// Reads the save row `id` of `kind` is a piece of. `owner` scopes every
-/// position to that agent's rows. `None` when the row itself is missing,
-/// deleted or another agent's; a row with no link is a save of one piece.
+/// Reads the save row `id` of `kind` is a piece of, every position as far as
+/// `reader` reaches it. `None` when the row itself is missing, deleted or out
+/// of the reader's reach; a row with no link is a save of one piece.
 pub async fn read_save_core(
     store: &MemoryStore,
     kind: MemoryKind,
     id: i64,
-    owner: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<Option<SaveText>, MemoryError> {
-    let visible = |agent: Option<&str>, deleted_at: Option<i64>| {
-        deleted_at.is_none() && owner.map_or(true, |o| agent == Some(o))
+    let visible = |author: Option<&str>, deleted_at: Option<i64>| {
+        deleted_at.is_none() && reader.is_none_or(|r| r.admits(author))
     };
     let Some(row) = get_memory_core(store, kind, id).await? else {
         return Ok(None);
@@ -283,6 +286,12 @@ fn existing_save(c: &rusqlite::Connection, pieces: &[StoredPiece]) -> rusqlite::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::sharing::Reach;
+
+    /// `agent` as a policy that hides nothing lets it read.
+    fn shared(agent: &str) -> Reader {
+        Reader::new(agent, Reach::AllBut(Vec::new()))
+    }
 
     fn piece(memory_id: i64, context: &str) -> StoredPiece {
         StoredPiece { memory_id, context: context.to_string() }
@@ -357,6 +366,16 @@ mod tests {
         assert_eq!(join_pieces(&pieces), text);
     }
 
+    #[test]
+    fn the_pieces_of_a_subword_split_save_join_back_into_its_text() {
+        use crate::memory::chunker::token_splitter::tests::{subword_tokenizer, subword_words};
+        let text = subword_words(480).join(" ");
+        let split = crate::memory::chunker::ChatChunker::with_tokenizer(subword_tokenizer()).split_save(&text);
+        assert!(split.pieces.len() > 10, "the fixture is a long save");
+        let pieces: Vec<&str> = split.pieces.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(join_pieces(&pieces), text, "no line break where the text has none");
+    }
+
     async fn insert_row(store: &MemoryStore, agent: &str, content: &str) -> i64 {
         let (agent, content) = (agent.to_string(), content.to_string());
         store
@@ -376,7 +395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_save_lists_missing_pieces_and_skips_other_agents() {
+    async fn read_save_lists_missing_pieces_and_another_agent_reads_it_whole() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let texts = [
             "Notes on clawg-ledger: the retry budget",
@@ -397,7 +416,7 @@ mod tests {
             .await
             .unwrap();
 
-        let save = read_save_core(&store, MemoryKind::Memory, ids[1], Some("agent-a")).await.unwrap().unwrap();
+        let save = read_save_core(&store, MemoryKind::Memory, ids[1], Some(&shared("agent-a"))).await.unwrap().unwrap();
 
         assert_eq!(save.id, ids[1]);
         assert_eq!(save.piece, 2);
@@ -411,13 +430,48 @@ mod tests {
         let unscoped = read_save_core(&store, MemoryKind::Memory, ids[1], None).await.unwrap();
         assert_eq!(unscoped, Some(save));
 
-        assert_eq!(read_save_core(&store, MemoryKind::Memory, ids[1], Some("agent-b")).await.unwrap(), None);
-        assert_eq!(read_save_core(&store, MemoryKind::Memory, deleted, Some("agent-a")).await.unwrap(), None);
+        let by_another = read_save_core(&store, MemoryKind::Memory, ids[1], Some(&shared("agent-b"))).await.unwrap();
+        assert_eq!(by_another, unscoped, "another agent reads the save whole");
+        let hidden = Reader::new("agent-b", Reach::AllBut(vec!["agent-a".into()]));
+        assert_eq!(read_save_core(&store, MemoryKind::Memory, ids[1], Some(&hidden)).await.unwrap(), None);
+        assert_eq!(read_save_core(&store, MemoryKind::Memory, deleted, Some(&shared("agent-a"))).await.unwrap(), None);
         assert_eq!(read_save_core(&store, MemoryKind::Memory, 9_999, None).await.unwrap(), None);
 
-        let one = read_save_core(&store, MemoryKind::Memory, alone, Some("agent-a")).await.unwrap().unwrap();
+        let one = read_save_core(&store, MemoryKind::Memory, alone, Some(&shared("agent-a"))).await.unwrap().unwrap();
         assert_eq!((one.piece, one.pieces, one.ids, one.missing), (1, 1, vec![Some(alone)], vec![]));
         assert_eq!(one.text, "a save of one piece");
+    }
+
+    #[tokio::test]
+    async fn a_hidden_authors_piece_reads_as_missing() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = insert_row(&store, "agent-a", "Notes on clawg-ledger: the retry budget").await;
+        let second = insert_row(&store, "agent-c", "the retry budget was set to three attempts").await;
+        store.link_pieces(vec![piece(first, ""), piece(second, "")]).await.unwrap();
+        let nobodys = store
+            .conn
+            .call(|c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO memory (scope, project_id, content, memory_type, source, created_at, created_by_type, \
+                     created_by_ref, last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES ('project', 'p', 'a note no agent saved', 'semantic_fact', 'explicit', 1, 'user', 'x', 1, 1, \
+                     5.0, 3, 'active')",
+                    [],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+
+        let b = Reader::new("agent-b", Reach::AllBut(vec!["agent-c".into()]));
+        let save = read_save_core(&store, MemoryKind::Memory, first, Some(&b)).await.unwrap().unwrap();
+        assert_eq!((save.ids, save.missing), (vec![Some(first), None], vec![2]));
+        assert_eq!(save.text, "Notes on clawg-ledger: the retry budget");
+        assert_eq!(read_save_core(&store, MemoryKind::Memory, second, Some(&b)).await.unwrap(), None);
+
+        let own = Reader::new("agent-b", Reach::Own);
+        let note = read_save_core(&store, MemoryKind::Memory, nobodys, Some(&own)).await.unwrap().unwrap();
+        assert_eq!(note.text, "a note no agent saved", "every reader reaches a row no agent saved");
     }
 
     #[tokio::test]
@@ -436,7 +490,8 @@ mod tests {
             .await
             .unwrap();
 
-        let of = |id| read_save_core(&store, MemoryKind::Memory, id, Some("agent-a"));
+        let reader = shared("agent-a");
+        let of = |id| read_save_core(&store, MemoryKind::Memory, id, Some(&reader));
         assert_eq!(of(second).await.unwrap().unwrap().topic_key.as_deref(), Some("cli/export-format"));
         assert_eq!(of(alone).await.unwrap().unwrap().topic_key.as_deref(), Some("cli/alone"));
         let plain = insert_row(&store, "agent-a", "no key here").await;
@@ -497,9 +552,97 @@ mod tests {
         let found: Vec<(i64, i64)> = hits.iter().map(|h| (h.id, h.piece.expect("a linked row").pieces)).collect();
         assert_eq!(found, vec![(old_ids[0], old_pieces.len() as i64), (new_ids[0], new_pieces.len() as i64)]);
         for (ids, text) in [(&old_ids, &old_text), (&new_ids, &new_text)] {
-            let save = read_save_core(&store, MemoryKind::Memory, ids[1], Some("agent-a")).await.unwrap().unwrap();
+            let save = read_save_core(&store, MemoryKind::Memory, ids[1], Some(&shared("agent-a"))).await.unwrap().unwrap();
             assert_eq!(&save.text, text, "the save reads back whole, its overlap once");
         }
+    }
+
+    /// An embedder that keeps every text it is given and embeds it as the
+    /// fake one does.
+    struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for Recorder {
+        async fn embed_with_role(
+            &self,
+            text: &str,
+            role: crate::memory::embedder::EmbedRole,
+        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            self.0.lock().unwrap().push(text.to_string());
+            crate::memory::embedder::FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "recorder" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    /// A long save cut the way the splitter cut one before it looked for
+    /// word starts: 96 tokens every 72 and a head of the first 48, wherever
+    /// they fall.
+    fn cut_by_token_count(text: &str, tok: &tokenizers::Tokenizer) -> (Vec<String>, String) {
+        let offsets = tok.encode(text, false).expect("the fixture encodes").get_offsets().to_vec();
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        loop {
+            let end = (start + 96).min(offsets.len());
+            pieces.push(text[offsets[start].0..offsets[end - 1].1].to_string());
+            if end == offsets.len() {
+                return (pieces, text[..offsets[47].1].to_string());
+            }
+            start += 72;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_save_cut_inside_words_before_is_still_found_read_and_reembedded() {
+        use crate::memory::chunker::embedding_text;
+        use crate::memory::chunker::token_splitter::tests::{is_word_boundary, piece_ranges, subword_tokenizer, subword_words};
+        use crate::memory::search::{search_all_memories, SearchScope};
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tok = subword_tokenizer();
+        let words = subword_words(680);
+        let old_text = words[..340].join(" ");
+        let (old_pieces, old_head) = cut_by_token_count(&old_text, &tok);
+        let old_refs: Vec<&str> = old_pieces.iter().map(String::as_str).collect();
+        assert!(
+            piece_ranges(&old_text, &old_refs).iter().any(|&(s, _)| !is_word_boundary(&old_text, s)),
+            "some old piece starts inside a word"
+        );
+        assert!(!is_word_boundary(&old_text, old_head.len()), "the old head ends inside a word");
+        let new_text = words[340..].join(" ");
+        let new_split = crate::memory::chunker::ChatChunker::with_tokenizer(tok).split_save(&new_text);
+        let new_pieces: Vec<String> = new_split.pieces.into_iter().map(|c| c.text).collect();
+        let new_head = new_split.head.expect("a long save has a head");
+        assert_eq!((old_pieces.len(), new_pieces.len()), (12, 12), "two saves of 12 pieces");
+
+        let old_ids = store_save(&store, &old_pieces, &old_head, 1).await;
+        let new_ids = store_save(&store, &new_pieces, &new_head, 2).await;
+
+        let mut query = vec![0.0_f32; 384];
+        query[0] = 1.0;
+        let hits = search_all_memories(&store, &query, None, "agent-a", SearchScope::all_default(), 10).await.unwrap();
+        let found: Vec<(i64, i64)> = hits.iter().map(|h| (h.id, h.piece.expect("a linked row").pieces)).collect();
+        assert_eq!(found, vec![(old_ids[0], 12), (new_ids[0], 12)], "one hit per save");
+        for (ids, text) in [(&old_ids, &old_text), (&new_ids, &new_text)] {
+            let save = read_save_core(&store, MemoryKind::Memory, ids[5], Some(&shared("agent-a"))).await.unwrap().unwrap();
+            assert_eq!(&save.text, text, "the save reads back as it was saved");
+        }
+
+        let texts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plan = crate::memory::maintenance::ReInferPlan::new(std::sync::Arc::new(Recorder(texts.clone())));
+        crate::memory::maintenance::reembed_all(&store, crate::memory::maintenance::ReembedMode::ReInfer(plan)).await;
+        let mut embedded = texts.lock().unwrap().clone();
+        let mut expected: Vec<String> = [(&old_pieces, &old_head), (&new_pieces, &new_head)]
+            .into_iter()
+            .flat_map(|(pieces, head)| {
+                pieces.iter().enumerate().map(move |(i, p)| embedding_text(if i == 0 { "" } else { head }, p).into_owned())
+            })
+            .collect();
+        embedded.sort();
+        expected.sort();
+        assert_eq!(embedded, expected, "every piece is embedded again behind the head it was saved with");
     }
 
     /// A store left by the previous version holds a long save as unrelated
@@ -561,26 +704,10 @@ mod tests {
         assert!(hits.iter().any(|h| h.content == pieces[1]), "an unlinked piece is still found: {hits:?}");
         let piece_two = hits.iter().find(|h| h.content == pieces[1]).unwrap();
         assert_eq!(piece_two.piece, None);
-        let save = read_save_core(&store, MemoryKind::Memory, piece_two.id, Some("agent-seed")).await.unwrap().unwrap();
+        let save = read_save_core(&store, MemoryKind::Memory, piece_two.id, Some(&shared("agent-seed"))).await.unwrap().unwrap();
         assert_eq!((save.pieces, save.text.as_str()), (1, pieces[1]), "an unlinked row reads as a save of one piece");
 
         let texts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-        #[async_trait::async_trait]
-        impl Embedder for Recorder {
-            async fn embed_with_role(
-                &self,
-                text: &str,
-                role: EmbedRole,
-            ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
-                self.0.lock().unwrap().push(text.to_string());
-                FakeEmbedder::default().embed_with_role(text, role).await
-            }
-            fn dimensions(&self) -> usize { 384 }
-            fn model_id(&self) -> &str { "recorder" }
-            fn query_prefix(&self) -> &str { "" }
-            fn passage_prefix(&self) -> &str { "" }
-        }
         let plan = crate::memory::maintenance::ReInferPlan::new(std::sync::Arc::new(Recorder(texts.clone())));
         crate::memory::maintenance::reembed_all(&store, crate::memory::maintenance::ReembedMode::ReInfer(plan)).await;
         let texts = texts.lock().unwrap();

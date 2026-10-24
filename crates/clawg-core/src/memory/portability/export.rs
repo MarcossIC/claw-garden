@@ -75,6 +75,23 @@ pub fn export(base_dir: &Path, filter: &ExportFilter, now_ms: i64) -> Result<Exp
     read(&c, filter, now_ms)
 }
 
+/// The project id the root `root` (with the key of its remote, `remote`)
+/// reads and writes under in `<base_dir>/memory.db`, read without writing; the
+/// id derived from the root for a store from before roots were recorded.
+pub fn project_id_of(base_dir: &Path, root: &Path, remote: Option<&str>) -> Result<String, ExportError> {
+    let path = base_dir.join("memory.db");
+    if !path.exists() {
+        return Err(MemoryError::from(BackupError::NoStore { path }).into());
+    }
+    crate::memory::db::ensure_vec0_registered();
+    let c = open_for_probe(&path)?;
+    if !has_table(&c, "project")? {
+        return Ok(crate::memory::identity::derive_project_id(root));
+    }
+    let remote = if has_table(&c, "project_remote")? { remote } else { None };
+    Ok(crate::memory::project::project_id_in(&c, root, remote)?)
+}
+
 /// [`export`] over an open connection. A store from an older schema is read
 /// with the columns and tables it has, and what it lacks is `null`.
 pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result<Export, ExportError> {
@@ -118,10 +135,13 @@ pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result
         Vec::new()
     };
     let conflicts = if has_table(c, "memory_conflict")? {
+        let warned = if columns_of(c, "memory_conflict")?.contains("topic_key_warned") { "topic_key_warned" } else { "0" };
         collect(
             c,
-            "SELECT new_id, old_id, distance, state, verdict, reason, created_at, judged_at \
-             FROM memory_conflict ORDER BY new_id, old_id",
+            &format!(
+                "SELECT new_id, old_id, distance, state, verdict, reason, created_at, judged_at, {warned} \
+                 FROM memory_conflict ORDER BY new_id, old_id"
+            ),
             |r| {
                 Ok(ConflictLine {
                     new_id: r.get(0)?,
@@ -132,6 +152,7 @@ pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result
                     reason: r.get(5)?,
                     created_at: r.get(6)?,
                     judged_at: r.get(7)?,
+                    topic_key_warned: r.get(8)?,
                 })
             },
         )?
@@ -193,13 +214,15 @@ fn read_memories(c: &Connection, filter: &ExportFilter) -> rusqlite::Result<Vec<
         "SELECT id, scope, agent_id, project_id, content, memory_type, source, created_at, created_by_type, \
          created_by_ref, source_session_id, last_modified_at, last_modified_by, update_count, last_accessed_at, \
          access_count, importance, tier, status, superseded_by, {}, dispute_count, disputed_against, \
-         last_disputed_at, deleted_at, {}, {} \
+         last_disputed_at, deleted_at, {}, {}, {}, {} \
          FROM memory \
          WHERE (?1 IS NULL OR project_id = ?1) AND (?2 IS NULL OR agent_id = ?2) AND (?3 OR deleted_at IS NULL) \
          ORDER BY id",
         or_null("supersede_cause"),
         or_null("topic_key"),
         or_null("revived_from"),
+        or_null("lang"),
+        or_null("origin_project"),
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![filter.project_id, filter.agent, filter.include_deleted], |r| {
@@ -234,6 +257,8 @@ fn read_memories(c: &Connection, filter: &ExportFilter) -> rusqlite::Result<Vec<
             deleted_at: r.get(24)?,
             topic_key: r.get(25)?,
             revived_from: r.get(26)?,
+            lang: r.get(27)?,
+            origin_project: r.get(28)?,
         })
     })?;
     rows.collect()
@@ -326,6 +351,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_export_carries_the_language_of_each_row() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed(&store).await;
+        store.conn.call(|c| c.execute("UPDATE memory SET lang = 'es' WHERE id = 2", [])).await.unwrap();
+        let exported = store
+            .conn
+            .call(|c| Ok::<_, rusqlite::Error>(read(c, &ExportFilter::default(), 0)))
+            .await
+            .unwrap()
+            .unwrap();
+        let lang = |id: i64| exported.memories.iter().find(|m| m.id == id).unwrap().lang.clone();
+        assert_eq!((lang(2), lang(3)), (Some("es".to_string()), None), "a row not yet classified exports null");
+        let (_, parsed) = parse(&exported.to_jsonl()).unwrap();
+        assert_eq!(parsed.memories.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), exported.memories);
+    }
+
+    #[tokio::test]
+    async fn an_export_carries_the_origin_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed(&store).await;
+        store
+            .conn
+            .call(|c| c.execute("UPDATE memory SET origin_project = 'notes/app' WHERE id = 2", []))
+            .await
+            .unwrap();
+        let exported = store
+            .conn
+            .call(|c| Ok::<_, rusqlite::Error>(read(c, &ExportFilter::default(), 0)))
+            .await
+            .unwrap()
+            .unwrap();
+        let origin = |id: i64| exported.memories.iter().find(|m| m.id == id).unwrap().origin_project.clone();
+        assert_eq!((origin(2), origin(3)), (Some("notes/app".to_string()), None));
+        let text = exported.to_jsonl();
+        let memory_lines: Vec<&str> = text.lines().filter(|l| l.contains("\"kind\":\"memory\"")).collect();
+        assert!(!memory_lines.is_empty() && memory_lines.iter().all(|l| l.contains("\"origin_project\":")), "every line names it");
+        let (_, parsed) = parse(&text).unwrap();
+        assert_eq!(parsed.memories.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), exported.memories);
+    }
+
+    #[tokio::test]
+    async fn a_store_older_than_the_origin_column_exports_it_as_null() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed(&store).await;
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch("DROP INDEX idx_memory_origin_project; ALTER TABLE memory DROP COLUMN origin_project;")
+            })
+            .await
+            .unwrap();
+        let exported = store
+            .conn
+            .call(|c| Ok::<_, rusqlite::Error>(read(c, &ExportFilter::default(), 0)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!exported.memories.is_empty() && exported.memories.iter().all(|m| m.origin_project.is_none()));
+    }
+
+    #[tokio::test]
     async fn links_leave_only_with_the_rows_that_hold_them() {
         let live = seeded_export(ExportFilter { project_id: Some(project()), ..Default::default() }).await;
         let pairs: Vec<(i64, i64)> = live.conflicts.iter().map(|c| (c.new_id, c.old_id)).collect();
@@ -360,6 +446,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_from_before_the_warning_mark_exports_its_pairs_unmarked() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), Some(18)).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute_batch(
+            "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+              created_by_ref, last_modified_at, last_accessed_at, importance, tier, status) \
+             SELECT scope, agent_id, 'seeded again', memory_type, source, 1, created_by_type, created_by_ref, 1, 1, \
+              importance, tier, status FROM memory;
+             INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (2, 1, 0.2, 'pending', 1);",
+        )
+        .unwrap();
+        drop(c);
+
+        let exported = export(dir.path(), &ExportFilter::default(), 0).unwrap();
+
+        let pairs: Vec<(i64, i64, bool)> = exported.conflicts.iter().map(|p| (p.new_id, p.old_id, p.topic_key_warned)).collect();
+        assert_eq!(pairs, vec![(2, 1, false)]);
+    }
+
+    #[tokio::test]
     async fn a_newer_store_is_not_exported() {
         let dir = tempfile::tempdir().unwrap();
         seed_on_disk(dir.path(), None).await;
@@ -378,5 +485,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = export(dir.path(), &ExportFilter::default(), 0).unwrap_err();
         assert!(err.to_string().contains("no memory store"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn export_reads_the_project_id_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute_batch(
+            "INSERT INTO project (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 1), ('app-3c4d', '/review/app', 2);
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);",
+        )
+        .unwrap();
+        drop(c);
+        let of = |root: &str, remote: Option<&str>| project_id_of(dir.path(), Path::new(root), remote).unwrap();
+
+        assert_eq!(of("/review/app", Some("github.com/acme/app")), "app-1a2b", "the project its remote shares");
+        assert_eq!(of("/review/app", None), "app-3c4d", "its own id without a remote");
+        let free = Path::new("/fresh/app");
+        assert_eq!(of("/fresh/app", None), crate::memory::identity::derive_project_id(free));
+    }
+
+    #[tokio::test]
+    async fn a_store_from_before_roots_were_recorded_gives_the_derived_id() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), Some(8)).await;
+        let root = Path::new("/work/app");
+        assert_eq!(project_id_of(dir.path(), root, Some("github.com/acme/app")).unwrap(), crate::memory::identity::derive_project_id(root));
     }
 }

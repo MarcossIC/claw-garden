@@ -95,7 +95,7 @@ pub fn search_pair(found: &Found, reader: &str, project: &str, fallback: Option<
     for hit in &mut without.hits {
         hit.topic_key = None;
     }
-    (format_search(without, reader, Some(project)), format_search(with, reader, Some(project)))
+    (format_search(without, reader, Some(project), None), format_search(with, reader, Some(project), None))
 }
 
 /// What a set of outputs weighs without the keys and with them.
@@ -331,5 +331,10 @@ mod tests {
         assert!(m4.search_all_keyed.total_byte_delta == m4.search.total_byte_delta, "one hit, and it has a key");
         assert_eq!(m4.warning_line_tokens, counter.count(WARNING_LINE));
         assert!(m4.warning_line_tokens > 10);
+    }
+
+    #[test]
+    fn save_memory_ships_the_warning_line_that_was_measured() {
+        assert_eq!(clawg_cli::mcp::tools::topic_key_warning(clawg_core::preferences::Lang::En, 123), WARNING_LINE);
     }
 }

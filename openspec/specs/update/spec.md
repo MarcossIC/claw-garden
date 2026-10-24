@@ -2,7 +2,7 @@
 
 Fuente de verdad del comportamiento actual al corregir una memoria ya guardada: qué campos se pueden cambiar, cómo se valida el cambio, qué tier queda y qué exponen el daemon y el puente. El contenido no se cambia: para eso se guarda el texto nuevo y se borra el viejo, o se lo guarda bajo la misma `topic_key`, que reemplaza al anterior y lo deja en la historia ([`specs/ingest`](../ingest/spec.md), «Un save con clave reemplaza la fila viva de su clave»). Qué filas puede cambiar cada agente está en [`specs/visibility`](../visibility/spec.md) (R3 y R4).
 
-**Origen:** [memory-update-tool](../../changes/archive/2026-10-14-memory-update-tool/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec. [memory-protocol](../../changes/archive/2026-10-17-memory-protocol/proposal.md), archivado el 2026-10-17, sumó que el save y el cambio rechazan un tipo con el mismo mensaje y que el schema de `update_memory` declara los tipos. [protected-verdicts](../../changes/archive/2026-10-20-protected-verdicts/proposal.md), archivado el 2026-10-20, sumó que sacarle el tipo a una fila protegida pide la declaración (R1, R4 y R5).
+**Origen:** [memory-update-tool](../../changes/archive/2026-10-14-memory-update-tool/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec. [memory-protocol](../../changes/archive/2026-10-17-memory-protocol/proposal.md), archivado el 2026-10-17, sumó que el save y el cambio rechazan un tipo con el mismo mensaje y que el schema de `update_memory` declara los tipos. [protected-verdicts](../../changes/archive/2026-10-20-protected-verdicts/proposal.md), archivado el 2026-10-20, sumó que sacarle el tipo a una fila protegida pide la declaración (R1, R4 y R5). [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, cambió el «otro agente» de R3 y R5 por lo que el lector no alcanza. [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22, sumó que un cambio puede mover la fila a otro proyecto (R7).
 
 ## Definiciones
 
@@ -104,18 +104,18 @@ Un cambio válido sobre una fila viva (`deleted_at IS NULL`) MUST, en una sola t
 
 MUST NOT cambiar `status`, `access_count`, `last_accessed_at`, `superseded_by`, las disputas, la procedencia, el contenido ni el vector.
 
-Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene scope, MUST devolver "no existe" (`None`) sin escribir nada, tampoco `last_modified_at` ni `update_count` (la regla de [`specs/visibility`](../visibility/spec.md) R4). Vale igual para las tres tablas.
+Sobre una fila que no existe, borrada o fuera del alcance del lector, MUST devolver "no existe" (`None`) sin escribir nada, tampoco `last_modified_at` ni `update_count` (la regla de [`specs/visibility`](../visibility/spec.md) R4). Vale igual para las tres tablas.
 
 #### Escenario: cambiar los dos campos
 - GIVEN un `semantic_fact` con importancia 5, `update_count` 0 y `status = 'disputed'`
 - WHEN se cambia a `user_preference` con importancia 8
 - THEN la fila queda `user_preference`, 8, tier 1, `update_count` 1, `last_modified_at` nuevo y sigue `disputed`
 
-**Test:** `an_update_writes_what_was_asked_and_counts_itself`, `an_update_leaves_status_accesses_and_disputes_alone`, `lowering_importance_takes_away_the_tier_it_gave`, `update_with_high_importance_promotes_to_tier_1`, `update_on_episodic_has_no_type_rule_below_importance_9`, `update_on_procedural_keeps_the_tier_its_table_gives`, `update_on_a_missing_id_changes_nothing`, `update_on_a_soft_deleted_row_changes_nothing` y `an_owner_mismatch_changes_no_importance` en `admin.rs`.
+**Test:** `an_update_writes_what_was_asked_and_counts_itself`, `an_update_leaves_status_accesses_and_disputes_alone`, `lowering_importance_takes_away_the_tier_it_gave`, `update_with_high_importance_promotes_to_tier_1`, `update_on_episodic_has_no_type_rule_below_importance_9`, `update_on_procedural_keeps_the_tier_its_table_gives`, `update_on_a_missing_id_changes_nothing`, `update_on_a_soft_deleted_row_changes_nothing` y `another_agent_updates_a_row_it_reaches_but_not_a_hidden_one` en `admin.rs`.
 
 ## R4. HTTP
 
-`PATCH /v1/memories/{kind}/{id}` (`update_memory`, `crates/clawg-cli/src/daemon/api.rs:1440`) MUST aceptar el cuerpo `{importance?, memory_type?, user_answered?}` (`UpdateRequest`, `api.rs:468`; `user_answered` es booleano y falta como `false`) y la query `agent` de siempre.
+`PATCH /v1/memories/{kind}/{id}` (`update_memory`, `crates/clawg-cli/src/daemon/api.rs:1676`) MUST aceptar el cuerpo `{importance?, memory_type?, user_answered?}` (`UpdateRequest`, `api.rs:502`; `user_answered` es booleano y falta como `false`) y la query `agent` de siempre.
 
 - Un cambio inválido (R1) MUST responder 400 con el mensaje de la validación.
 - El descenso de una fila protegida sin la declaración (R1) MUST responder 409 con el mensaje de `UpdateError::NeedsUser`, y la fila MUST NOT cambiar.
@@ -123,7 +123,7 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 - "No existe" (R3) MUST responder 404.
 - Un cambio hecho MUST responder 200 con `updated = 1` y `importance`, `memory_type` y `tier` de la fila como quedó.
 
-`DaemonClient::update` (`crates/clawg-cli/src/client.rs:1097`) es el lado del cliente. Manda `user_answered` sólo cuando es `true` (`skip_serializing_if`, `client.rs:533`): un daemon anterior, cuyo `PATCH` rechaza los campos que no conoce, sigue aceptando el cambio de siempre de un puente nuevo, y con la declaración lo rechaza como a cualquier campo desconocido, con un 422 de axum que nombra el campo (un daemon anterior tampoco tiene la guarda).
+`DaemonClient::update` (`crates/clawg-cli/src/client.rs:1198`) es el lado del cliente. Manda `user_answered` sólo cuando es `true` (`skip_serializing_if`, `client.rs:563`): un daemon anterior, cuyo `PATCH` rechaza los campos que no conoce, sigue aceptando el cambio de siempre de un puente nuevo, y con la declaración lo rechaza como a cualquier campo desconocido, con un 422 de axum que nombra el campo (un daemon anterior tampoco tiene la guarda).
 
 #### Escenario
 - GIVEN una memoria guardada por HTTP
@@ -139,19 +139,19 @@ Sobre una fila que no existe, borrada o de otro agente cuando el cambio tiene sc
 - WHEN se manda `{"memory_type": "semantic_fact", "user_answered": true}`
 - THEN responde 200 con `memory_type = "semantic_fact"`
 
-**Test:** `patch_changes_importance_and_type_and_reports_the_row`, `an_invalid_patch_changes_nothing`, `patch_importance_updates_then_404s_on_a_missing_row`, `patch_with_another_agent_is_404_and_keeps_the_importance`, `an_unknown_kind_is_a_400_everywhere_it_appears` y `a_demotion_without_the_answer_is_a_409` en `crates/clawg-cli/tests/api.rs`.
+**Test:** `patch_changes_importance_and_type_and_reports_the_row`, `an_invalid_patch_changes_nothing`, `patch_importance_updates_then_404s_on_a_missing_row`, `patch_with_a_hidden_author_is_404_and_another_agent_patches_otherwise`, `an_unknown_kind_is_a_400_everywhere_it_appears` y `a_demotion_without_the_answer_is_a_409` en `crates/clawg-cli/tests/api.rs`.
 
 ## R5. Herramienta MCP `update_memory`
 
-El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional) y `memory_type` (opcional; su schema declara los tipos conocidos como `enum`, ver [`specs/mcp`](../mcp/spec.md), «El schema de `memory_type` declara los tipos») y `user_answered` (booleano, opcional) (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:308`), y MUST mandar siempre el agente que llama y la declaración (`update_memory_impl`, `server.rs:931`).
+El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional) y `memory_type` (opcional; su schema declara los tipos conocidos como `enum`, ver [`specs/mcp`](../mcp/spec.md), «El schema de `memory_type` declara los tipos») y `user_answered` (booleano, opcional) (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:311`), y MUST mandar siempre el agente que llama y la declaración (`update_memory_impl`, `server.rs:1115`).
 
 - Un descenso de una fila protegida sin la declaración MUST fallar con el mensaje del daemon, que nombra `user_answered`.
-- Sobre una fila propia, MUST devolver un texto que nombra el id y cómo quedaron importancia, tipo y tier (`format_update`, `crates/clawg-cli/src/mcp/tools.rs:220`): `updated #12 memory: user_preference, importance 8.0, tier 1`.
-- Sobre una fila de otro agente, MUST fallar como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3), y la fila MUST NOT cambiar.
+- Sobre una fila que el agente alcanza, propia o de otro agente, MUST devolver un texto que nombra el id y cómo quedaron importancia, tipo y tier (`format_update`, `crates/clawg-cli/src/mcp/tools.rs:338`): `updated #12 memory: user_preference, importance 8.0, tier 1`.
+- Sobre una fila que `sharing.json` le oculta, MUST fallar como si el id no existiera ([`specs/visibility`](../visibility/spec.md) R3), y la fila MUST NOT cambiar.
 - Un cambio inválido MUST fallar con el mensaje de la validación.
-- La descripción (`server.rs:1197-1204`) MUST decir que es para cuando el usuario corrige la importancia o el tipo, que sacarle el tipo a una preferencia o a una decisión pide `user_answered`, puesto sólo cuando el usuario lo dijo, y que para cambiar el contenido se guarda el nuevo y se borra el viejo.
+- La descripción (`server.rs:1433-1443`) MUST decir que es para cuando el usuario corrige la importancia o el tipo, que sacarle el tipo a una preferencia o a una decisión pide `user_answered`, puesto sólo cuando el usuario lo dijo, y que para cambiar el contenido se guarda el nuevo y se borra el viejo.
 
-`save_memory` MUST nombrar `update_memory`: en su descripción, junto a `delete_memory` (`server.rs:1074-1082`), y en la respuesta de un refuerzo, que ya dice el id (`save_outcome_text`, `server.rs:595-598`).
+`save_memory` MUST nombrar `update_memory`: en su descripción, junto a `delete_memory` (`server.rs:1308-1316`), y en la respuesta de un refuerzo, que ya dice el id (`save_outcome_text`, `server.rs:695-699`).
 
 `tools/list` MUST listar `update_memory` entre sus herramientas; el conteo vigente, doce, y la lista completa están en [`specs/mcp`](../mcp/spec.md).
 
@@ -163,12 +163,18 @@ El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional)
 #### Escenario: lo ajeno
 - GIVEN una memoria del agente A
 - WHEN B llama `update_memory` con su id
-- THEN la respuesta es un error y la fila no cambia
+- THEN la fila cambia y A la ve cambiada; con `hide B A`, la respuesta es un error y la fila no cambia
 
-**Test:** `update_memory_changes_an_own_memory_and_says_how_it_ended`, `an_agent_cannot_update_another_agents_memory` y `update_memory_sends_the_users_answer` en `crates/clawg-cli/src/mcp/server.rs`; el schema y la descripción, también en `the_agent_contract_matches_its_file` ([`specs/quality`](../quality/spec.md)); `format_update_names_the_fields_and_the_tier` en `crates/clawg-cli/src/mcp/tools.rs`; el refuerzo en `save_outcome_text_covers_every_daemon_answer` (`server.rs`); los conteos de `every_tool_is_registered_under_its_wire_name` (`server.rs`), `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working` y `a_session_without_initialize_lists_the_tools_in_name_order` (`crates/clawg-cli/src/mcp/handshake.rs`).
+**Test:** `update_memory_changes_an_own_memory_and_says_how_it_ended`, `another_agent_updates_a_memory_unless_hidden` y `update_memory_sends_the_users_answer` en `crates/clawg-cli/src/mcp/server.rs`; el schema y la descripción, también en `the_agent_contract_matches_its_file` ([`specs/quality`](../quality/spec.md)); `format_update_names_the_fields_and_the_tier` en `crates/clawg-cli/src/mcp/tools.rs`; el refuerzo en `save_outcome_text_covers_every_daemon_answer` (`server.rs`); los conteos de `every_tool_is_registered_under_its_wire_name` (`server.rs`), `a_bare_probe_and_its_cancellation_leave_the_legacy_handshake_working` y `a_session_without_initialize_lists_the_tools_in_name_order` (`crates/clawg-cli/src/mcp/handshake.rs`).
 
 ## R6. Datos de la versión anterior
 
 Filas sembradas con SQL directo como las dejaba la versión anterior (una de `memory` por cada combinación de R2) y como las escribía la app de escritorio (`episodic_trajectory` y `procedural_skill`, con tiers que ninguna regla da) MUST poder cambiarse, con las reglas de R1, y su tier MUST seguir R2.
 
 **Test:** `rows_from_the_previous_version_can_be_updated` en `admin.rs`.
+
+## R7. Un cambio puede mover la fila de proyecto
+
+`PATCH /v1/memories/memory/{id}` MUST aceptar `project_id` (un destino) o `no_project: true`, no los dos (400), solos o con `importance` y `memory_type`; un destino en `episodic` o `procedural` es un 400 (`PatchError::ProjectOnlyOnMemory`). El movimiento es el de [`specs/project`](../project/spec.md) R8 a R11, con el lector de `?agent=`, y MUST ir en la misma transacción que el resto del cambio: un rechazo de cualquiera no escribe nada. Una unidad rechazada es un 409 que nombra el motivo y las filas, un destino no registrado un 404, y una unidad con una fila protegida viva MUST pedir la declaración (`UpdateError::MoveNeedsUser`, 409). Un movimiento solo MUST NOT tocar `update_count` ni `last_modified_at`. La respuesta MUST sumar `project_id` (`null` sin proyecto) y, cuando movió, `move_id` y `pulled_in`. Funciona sin embedder.
+
+**Test:** `a_patch_needs_a_change_and_moves_only_memory_rows`, `a_move_alone_changes_the_project_and_nothing_it_says`, `a_move_and_a_change_of_importance_are_one_write`, `an_unregistered_project_is_not_a_place_to_move_to`, `a_protected_row_leaves_its_project_only_on_the_users_word` y `a_move_takes_the_rest_of_the_save_along` (`admin.rs`); `an_update_names_one_destination_at_most` (`api.rs`); `patch_moves_a_whole_save`, `patch_with_a_clash_is_409_and_changes_nothing`, `patch_with_both_destinations_is_400` y `patch_moves_while_the_embedder_loads` (`tests/api.rs`).

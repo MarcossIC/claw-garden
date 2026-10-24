@@ -10,9 +10,11 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::chunker::embedding_text;
 use crate::memory::contradiction::{detect_contradiction, excerpt, Candidate};
 use crate::memory::dispute::{add_dispute_in, release_challengers, settle_challengers, settle_row, SUPERSEDE_SQL};
+use crate::memory::relocate::{apply_one_in, plan_one_in, MoveError, MoveReport};
 use crate::memory::revival::{revive_after_delete, revive_after_delete_of_piece};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::search::{viewer_match_expression, RankedHit};
+use crate::memory::search::{reach_predicate, reader_bind, reader_predicate, viewer_match_expression, RankedHit};
+use crate::memory::sharing::{Reach, Reader};
 use crate::memory::store_insert::{MemoryType, UnknownMemoryType};
 use crate::memory::tier::retier;
 use crate::memory::topic::Replaced;
@@ -124,10 +126,11 @@ pub fn format_channel_attribution(dense: usize, lexical_only: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// update_memory — a correction of importance and/or type. The row is read and
-// written inside one transaction on the store's single connection: the new
-// tier depends on the old values (`tier::retier`), and no reader can see the
-// two statements apart.
+// update_memory — a correction of importance, type and/or project. The row is
+// read and written inside one transaction on the store's single connection:
+// the new tier depends on the old values (`tier::retier`), a move is decided
+// on what is stored (`relocate.rs`), and no reader can see the statements
+// apart.
 //
 // Outside `memory` the type is the table literal `store_insert.rs` writes at
 // INSERT time, so a tier recomputed here matches the one computed at ingest.
@@ -139,7 +142,7 @@ pub fn format_channel_attribution(dense: usize, lexical_only: usize) -> String {
 /// Why a requested change was refused before touching the store.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PatchError {
-    #[error("nothing to change: pass importance, memory_type or both")]
+    #[error("nothing to change: pass importance, memory_type, a project to move to, or none")]
     Empty,
     #[error("importance must be a number from 0 to 10, got {0}")]
     ImportanceOutOfScale(f64),
@@ -147,14 +150,19 @@ pub enum PatchError {
     UnknownType(#[from] UnknownMemoryType),
     #[error("memory_type can only be changed on memory rows, not on {0:?} rows")]
     TypeOnlyOnMemory(MemoryKind),
+    #[error("only memory rows move to another project, not {0:?} rows")]
+    ProjectOnlyOnMemory(MemoryKind),
 }
 
 /// A valid change to one row: at least one field, importance on the store's
-/// scale, and a type only where the table has one.
+/// scale, and a type or a project only where the table has one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryPatch {
     importance: Option<f64>,
     memory_type: Option<MemoryType>,
+    /// The project to move the row's save to, `Some(None)` for none; `None`
+    /// leaves it where it is.
+    project: Option<Option<String>>,
     user_answered: bool,
 }
 
@@ -162,9 +170,17 @@ impl MemoryPatch {
     /// Unlike a save, which clamps the estimate an agent makes in passing,
     /// an out-of-scale importance here is refused: a correction is explicit,
     /// and clamping it would report a value nobody asked for as done.
-    pub fn new(kind: MemoryKind, importance: Option<f64>, memory_type: Option<&str>) -> Result<Self, PatchError> {
-        if importance.is_none() && memory_type.is_none() {
+    pub fn new(
+        kind: MemoryKind,
+        importance: Option<f64>,
+        memory_type: Option<&str>,
+        project: Option<Option<String>>,
+    ) -> Result<Self, PatchError> {
+        if importance.is_none() && memory_type.is_none() && project.is_none() {
             return Err(PatchError::Empty);
+        }
+        if project.is_some() && kind != MemoryKind::Memory {
+            return Err(PatchError::ProjectOnlyOnMemory(kind));
         }
         if let Some(v) = importance {
             if !(0.0..=10.0).contains(&v) {
@@ -176,12 +192,12 @@ impl MemoryPatch {
             Some(_) if kind != MemoryKind::Memory => return Err(PatchError::TypeOnlyOnMemory(kind)),
             Some(raw) => Some(raw.parse::<MemoryType>()?),
         };
-        Ok(Self { importance, memory_type, user_answered: false })
+        Ok(Self { importance, memory_type, project, user_answered: false })
     }
 
     /// The caller declares the user answered, which taking a preference or a
-    /// decision out of its type needs. Nothing records it: the row keeps no
-    /// reason for a change.
+    /// decision out of its type, or out of its project, needs. Nothing records
+    /// it: the row keeps no reason for a change.
     pub fn answered(mut self, user_answered: bool) -> Self {
         self.user_answered = user_answered;
         self
@@ -195,6 +211,13 @@ pub enum UpdateError {
          then call again with `user_answered`"
     )]
     NeedsUser { id: i64, from: String },
+    #[error(
+        "memory {id} is a {from}, so it changes project only on the user's word: ask the user, \
+         then call again with `user_answered`"
+    )]
+    MoveNeedsUser { id: i64, from: String },
+    #[error(transparent)]
+    Move(#[from] MoveError),
     #[error(transparent)]
     Store(#[from] MemoryError),
 }
@@ -208,14 +231,31 @@ pub struct UpdatedRow {
     /// `Some` only for `kind == Memory`.
     pub memory_type: Option<String>,
     pub tier: i64,
+    /// The project the row is in after the change, `None` without one.
+    pub project_id: Option<String>,
+    /// The move that changed its project, when one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_id: Option<i64>,
+    /// The other rows of its save or topic history that moved with it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pulled_in: Vec<i64>,
 }
 
-const UPDATE_READ_MEMORY: &str = "SELECT tier, importance, memory_type, access_count FROM memory \
-     WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR agent_id = ?2)";
-const UPDATE_READ_EPISODIC: &str = "SELECT tier, importance, 'episodic_trajectory', access_count \
-     FROM episodic_trajectory WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR agent_id = ?2)";
-const UPDATE_READ_PROCEDURAL: &str = "SELECT tier, importance, 'procedural_skill', access_count \
-     FROM procedural_skill WHERE id = ?1 AND deleted_at IS NULL AND (?2 IS NULL OR agent_id = ?2)";
+const UPDATE_READ_MEMORY: &str = concat!(
+    "SELECT tier, importance, memory_type, access_count, project_id FROM memory \
+     WHERE id = ?1 AND deleted_at IS NULL AND ",
+    reader_predicate!("agent_id", "?2")
+);
+const UPDATE_READ_EPISODIC: &str = concat!(
+    "SELECT tier, importance, 'episodic_trajectory', access_count, project_id \
+     FROM episodic_trajectory WHERE id = ?1 AND deleted_at IS NULL AND ",
+    reader_predicate!("agent_id", "?2")
+);
+const UPDATE_READ_PROCEDURAL: &str = concat!(
+    "SELECT tier, importance, 'procedural_skill', access_count, project_id \
+     FROM procedural_skill WHERE id = ?1 AND deleted_at IS NULL AND ",
+    reader_predicate!("agent_id", "?2")
+);
 
 const UPDATE_WRITE_MEMORY: &str = "UPDATE memory \
      SET importance = ?1, memory_type = ?2, tier = ?3, last_modified_at = ?4, update_count = update_count + 1 \
@@ -228,14 +268,19 @@ const UPDATE_WRITE_PROCEDURAL: &str = "UPDATE procedural_skill \
      WHERE id = ?5";
 
 /// Applies `patch` to the live row `id` of `kind` and returns how it ended
-/// up, or `None` when there is no such live row (or, with `owner`, it is
-/// another agent's) — in which case nothing is written.
+/// up, or `None` when there is no such live row within `reader`'s reach — in
+/// which case nothing is written.
+///
+/// A new project moves the row's whole unit (`relocate.rs`), clashes judged
+/// within `reader`'s reach. Any refusal, of the type or of the move, writes
+/// nothing, and a move alone leaves `last_modified_at` and `update_count` as
+/// they were: it changes where a row is, not what it says.
 pub async fn update_memory_core(
     store: &MemoryStore,
     id: i64,
     kind: MemoryKind,
     patch: &MemoryPatch,
-    owner: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<Option<UpdatedRow>, UpdateError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -247,38 +292,61 @@ pub async fn update_memory_core(
         MemoryKind::Procedural => (UPDATE_READ_PROCEDURAL, UPDATE_WRITE_PROCEDURAL),
     };
     let patch = patch.clone();
-    let owner = owner.map(str::to_owned);
+    let reach = reader_bind(reader);
 
     store
         .conn
         .call(move |c| -> Result<Option<UpdatedRow>, UpdateError> {
             use rusqlite::OptionalExtension;
             let tx = c.transaction().map_err(MemoryError::Sqlite)?;
-            let current: Option<(i64, f64, String, i64)> = tx
-                .query_row(read_sql, rusqlite::params![id, owner], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            let current: Option<(i64, f64, String, i64, Option<String>)> = tx
+                .query_row(read_sql, rusqlite::params![id, reach], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })
                 .optional()
                 .map_err(MemoryError::Sqlite)?;
-            let Some((tier, importance, memory_type, access_count)) = current else {
+            let Some((tier, importance, memory_type, access_count, project_id)) = current else {
                 return Ok(None);
             };
             let demoted = patch.memory_type.is_some_and(|t| !t.is_protected());
             if demoted && MemoryType::is_protected_name(&memory_type) && !patch.user_answered {
                 return Err(UpdateError::NeedsUser { id, from: memory_type });
             }
+            let mut moved: Option<MoveReport> = match &patch.project {
+                Some(target) => Some(plan_one_in(&tx, id, target.as_deref(), reach.as_deref())?),
+                None => None,
+            };
+            if let Some(report) = &moved {
+                if let Some(skipped) = report.skipped.first() {
+                    return Err(MoveError::Refused(skipped.clone()).into());
+                }
+                let protected = report.moved.iter().find_map(|m| Some((m.id, m.protected.clone()?)));
+                if let (Some((row, from)), false) = (protected, patch.user_answered) {
+                    return Err(UpdateError::MoveNeedsUser { id: row, from });
+                }
+            }
             let new_importance = patch.importance.unwrap_or(importance);
             let new_type = patch.memory_type.map_or(memory_type.clone(), |t| t.as_str().to_string());
             let new_tier = retier(tier, access_count, (importance, &memory_type), (new_importance, &new_type));
-            tx.execute(write_sql, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])
-                .map_err(MemoryError::Sqlite)?;
+            if patch.importance.is_some() || patch.memory_type.is_some() {
+                tx.execute(write_sql, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])
+                    .map_err(MemoryError::Sqlite)?;
+            }
+            if let Some(report) = &mut moved {
+                apply_one_in(&tx, report, TimestampMs::from_unix_millis(now_ms)).map_err(MemoryError::Sqlite)?;
+            }
             tx.commit().map_err(MemoryError::Sqlite)?;
+            // Moved or already there, the row is in the target now.
+            let project_id = patch.project.clone().unwrap_or(project_id);
             Ok(Some(UpdatedRow {
                 id,
                 kind,
                 importance: new_importance,
                 memory_type: (kind == MemoryKind::Memory).then_some(new_type),
                 tier: new_tier,
+                project_id,
+                move_id: moved.as_ref().and_then(|r| r.move_id),
+                pulled_in: moved.map(|r| r.pulled_in).unwrap_or_default(),
             }))
         })
         .await
@@ -305,11 +373,14 @@ const DELETE_SQL_EPISODIC: &str =
 const DELETE_SQL_PROCEDURAL: &str =
     "UPDATE procedural_skill SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL";
 
-const OWNED_ELSEWHERE_MEMORY: &str = "SELECT 1 FROM memory WHERE id = ?1 AND agent_id IS NOT ?2";
-const OWNED_ELSEWHERE_EPISODIC: &str = "SELECT 1 FROM episodic_trajectory WHERE id = ?1 AND agent_id IS NOT ?2";
-const OWNED_ELSEWHERE_PROCEDURAL: &str = "SELECT 1 FROM procedural_skill WHERE id = ?1 AND agent_id IS NOT ?2";
+const OUT_OF_REACH_MEMORY: &str =
+    concat!("SELECT 1 FROM memory WHERE id = ?1 AND NOT ", reader_predicate!("agent_id", "?2"));
+const OUT_OF_REACH_EPISODIC: &str =
+    concat!("SELECT 1 FROM episodic_trajectory WHERE id = ?1 AND NOT ", reader_predicate!("agent_id", "?2"));
+const OUT_OF_REACH_PROCEDURAL: &str =
+    concat!("SELECT 1 FROM procedural_skill WHERE id = ?1 AND NOT ", reader_predicate!("agent_id", "?2"));
 
-const DELETE_VEC_MEMORY: &str = "DELETE FROM memory_vectors WHERE rowid = ?1";
+pub(crate) const DELETE_VEC_MEMORY: &str = "DELETE FROM memory_vectors WHERE rowid = ?1";
 const DELETE_VEC_EPISODIC: &str = "DELETE FROM episodic_vectors WHERE rowid = ?1";
 const DELETE_VEC_PROCEDURAL: &str = "DELETE FROM procedural_vectors WHERE rowid = ?1";
 
@@ -330,9 +401,9 @@ pub struct Deleted {
 /// exist in that table or was already deleted — idempotent), with what its
 /// delete brought back.
 ///
-/// With `owner`, a row that belongs to another agent is answered as missing
-/// and the transaction writes nothing, sweeps included: they would otherwise
-/// drop that agent's vector.
+/// A row out of `reader`'s reach is answered as missing and the transaction
+/// writes nothing, sweeps included: they would otherwise drop the vector of a
+/// row the reader cannot see.
 ///
 /// The vector DELETE runs unconditionally, never gated on the UPDATE's row
 /// count: a point delete on an absent rowid is a 0-row no-op, not an error,
@@ -343,7 +414,7 @@ pub async fn delete_memory_core(
     store: &MemoryStore,
     id: i64,
     kind: MemoryKind,
-    owner: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<Deleted, MemoryError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -352,21 +423,19 @@ pub async fn delete_memory_core(
     // Exhaustive match, not string interpolation: a new MemoryKind variant
     // without a table pair here is a compile error, never a runtime SQL
     // injection surface.
-    let (row_sql, vec_sql, elsewhere_sql) = match kind {
-        MemoryKind::Memory => (DELETE_SQL_MEMORY, DELETE_VEC_MEMORY, OWNED_ELSEWHERE_MEMORY),
-        MemoryKind::Episodic => (DELETE_SQL_EPISODIC, DELETE_VEC_EPISODIC, OWNED_ELSEWHERE_EPISODIC),
-        MemoryKind::Procedural => (DELETE_SQL_PROCEDURAL, DELETE_VEC_PROCEDURAL, OWNED_ELSEWHERE_PROCEDURAL),
+    let (row_sql, vec_sql, out_of_reach_sql) = match kind {
+        MemoryKind::Memory => (DELETE_SQL_MEMORY, DELETE_VEC_MEMORY, OUT_OF_REACH_MEMORY),
+        MemoryKind::Episodic => (DELETE_SQL_EPISODIC, DELETE_VEC_EPISODIC, OUT_OF_REACH_EPISODIC),
+        MemoryKind::Procedural => (DELETE_SQL_PROCEDURAL, DELETE_VEC_PROCEDURAL, OUT_OF_REACH_PROCEDURAL),
     };
-    let owner = owner.map(str::to_owned);
+    let reach = reader_bind(reader);
 
     store
         .conn
         .call(move |c| {
             let tx = c.transaction()?;
-            if let Some(owner) = &owner {
-                if tx.prepare(elsewhere_sql)?.exists(rusqlite::params![id, owner])? {
-                    return Ok(Deleted::default());
-                }
+            if reach.is_some() && tx.prepare(out_of_reach_sql)?.exists(rusqlite::params![id, reach])? {
+                return Ok(Deleted::default());
             }
             let affected = tx.execute(row_sql, rusqlite::params![now_ms, id])?;
             tx.execute(vec_sql, rusqlite::params![id])?;
@@ -407,8 +476,8 @@ pub async fn delete_memory_core(
 pub enum RestoreError {
     #[error("only memory rows can be restored, not {0:?} rows")]
     OnlyMemory(MemoryKind),
-    /// Missing, live, purged or, with an owner, another agent's: a scoped
-    /// caller learns nothing about ids it does not own.
+    /// Missing, live, purged or out of the reader's reach: a reader learns
+    /// nothing about ids the policy hides from it.
     #[error("no deleted memory row with id {0}")]
     NotFound(i64),
     #[error("memory #{id} was saved again as #{twin}, which is live; #{id} stays deleted so the text is not stored twice")]
@@ -448,7 +517,6 @@ pub struct RestoredRow {
 struct DeletedRow {
     content: String,
     context: Option<String>,
-    agent_id: Option<String>,
     project_id: Option<String>,
     memory_type: String,
 }
@@ -457,33 +525,42 @@ struct DeletedRow {
 /// embedded behind when it is a piece of a long save (as `select_reembed_batch`
 /// reads it), so the restored vector is the one the row was saved with, and
 /// what the detector needs to compare it with what was saved meanwhile.
-const RESTORE_READ: &str = "SELECT m.content, \
+const RESTORE_READ: &str = concat!(
+    "SELECT m.content, \
      (SELECT mp.context FROM memory_piece mp WHERE mp.memory_id = m.id AND mp.context <> '' \
       ORDER BY mp.save_id LIMIT 1), \
      m.agent_id, m.project_id, m.memory_type, m.deleted_at \
-     FROM memory m WHERE m.id = ?1 AND m.deleted_at IS NOT NULL AND (?2 IS NULL OR m.agent_id = ?2)";
+     FROM memory m WHERE m.id = ?1 AND m.deleted_at IS NOT NULL AND ",
+    reader_predicate!("m.agent_id", "?2")
+);
 
 /// The live row a save of the same text would reinforce instead of storing
-/// it again (`REINFORCE_LOOKUP_SQL` in `store_insert.rs`).
-const RESTORE_TWIN: &str = "SELECT t.id FROM memory m JOIN memory t \
-     ON t.agent_id IS m.agent_id AND COALESCE(t.project_id, '') = COALESCE(m.project_id, '') \
-     AND t.content_hash = m.content_hash \
+/// it again (`REINFORCE_LOOKUP_SQL` in `store_insert.rs`): the project's, of
+/// any author the restoring reader (`?2`) reaches.
+const RESTORE_TWIN: &str = concat!(
+    "SELECT t.id FROM memory m JOIN memory t \
+     ON COALESCE(t.project_id, '') = COALESCE(m.project_id, '') AND t.content_hash = m.content_hash \
      WHERE m.id = ?1 AND m.content_hash IS NOT NULL AND t.id <> m.id \
-     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') \
-     ORDER BY t.created_at ASC LIMIT 1";
+     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') AND ",
+    reader_predicate!("t.agent_id", "?2"),
+    " ORDER BY t.created_at ASC LIMIT 1"
+);
 
 /// The live row that holds the deleted row's topic key now, in the same scope
-/// as `SCOPE_ROWS_SQL` in `topic.rs`. The other pieces of the row's own save
-/// are not holders: a keyed long save gives its key to every piece. Nor is a
-/// row the deleted one's delete brought back: the restore takes it back.
-const RESTORE_TOPIC_HOLDER: &str = "SELECT m.topic_key, t.id FROM memory m JOIN memory t \
-     ON t.agent_id IS m.agent_id AND COALESCE(t.project_id, '') = COALESCE(m.project_id, '') \
-     AND t.topic_key = m.topic_key \
+/// as `SCOPE_ROWS_SQL` in `topic.rs`, with the restoring reader (`?2`) as the
+/// saver. The other pieces of the row's own save are not holders: a keyed
+/// long save gives its key to every piece. Nor is a row the deleted one's
+/// delete brought back: the restore takes it back.
+const RESTORE_TOPIC_HOLDER: &str = concat!(
+    "SELECT m.topic_key, t.id FROM memory m JOIN memory t \
+     ON COALESCE(t.project_id, '') = COALESCE(m.project_id, '') AND t.topic_key = m.topic_key \
      WHERE m.id = ?1 AND t.id <> m.id AND t.revived_from IS NOT m.id \
      AND NOT EXISTS (SELECT 1 FROM memory_piece a JOIN memory_piece b ON b.save_id = a.save_id \
                      WHERE a.memory_id = m.id AND b.memory_id = t.id) \
-     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') \
-     ORDER BY t.id LIMIT 1";
+     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') AND ",
+    reader_predicate!("t.agent_id", "?2"),
+    " ORDER BY t.id LIMIT 1"
+);
 
 const RESTORE_ROW: &str = "UPDATE memory SET deleted_at = NULL, last_modified_at = ?2, \
      update_count = update_count + 1 WHERE id = ?1 AND deleted_at IS NOT NULL";
@@ -506,19 +583,21 @@ const RESTORED_SQL: &str = "SELECT m.status, m.superseded_by, m.topic_key, \
 /// `unit`, before the restore's transaction: the row is not live yet, so it
 /// cannot find itself. The rows it already forms a pair with and the ones it
 /// will take back from a revival are left out and widen the pool, so they do
-/// not take the places of rows saved while it was deleted.
+/// not take the places of rows saved while it was deleted. The restoring
+/// reader is the saver; the user's own restore compares with every row.
 async fn restore_candidates(
     store: &MemoryStore,
     id: i64,
     unit: &[f32],
     content: &str,
-    agent_id: Option<String>,
+    reader: Option<&Reader>,
     project_id: Option<String>,
     memory_type: &str,
 ) -> Result<Vec<Candidate>, MemoryError> {
-    let (Some(agent_id), Some(memory_type)) = (agent_id, MemoryType::from_db_str(memory_type)) else {
+    let Some(memory_type) = MemoryType::from_db_str(memory_type) else {
         return Ok(Vec::new());
     };
+    let saver = reader.cloned().unwrap_or_else(|| Reader::new("", Reach::AllBut(Vec::new())));
     let siblings: Vec<i64> = store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<i64>> {
@@ -532,7 +611,7 @@ async fn restore_candidates(
         })
         .await
         .map_err(backend("restore_memory_core"))?;
-    Ok(detect_contradiction(store, unit, content, &agent_id, project_id.as_deref(), memory_type, &siblings)
+    Ok(detect_contradiction(store, unit, content, &saver, project_id.as_deref(), memory_type, &siblings)
         .await
         .into_iter()
         .map(|(_, candidate)| candidate)
@@ -600,7 +679,7 @@ fn take_back_revived(c: &rusqlite::Connection, id: i64, now: TimestampMs) -> rus
 }
 
 /// Brings back the deleted `memory` row `id` with its vector and text index
-/// entry. With `owner`, another agent's row is answered as missing.
+/// entry. A row out of `reader`'s reach is answered as missing.
 ///
 /// The vector is computed before the transaction, from the current embedder;
 /// inside it the row is read again, so a restore or a save that landed in
@@ -611,22 +690,21 @@ pub async fn restore_memory_core(
     embedder: &dyn Embedder,
     kind: MemoryKind,
     id: i64,
-    owner: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<RestoredRow, RestoreError> {
     if kind != MemoryKind::Memory {
         return Err(RestoreError::OnlyMemory(kind));
     }
-    let owner = owner.map(str::to_owned);
-    let read_owner = owner.clone();
+    let reach = reader_bind(reader);
+    let read_reach = reach.clone();
     let found = store
         .conn
         .call(move |c| {
             use rusqlite::OptionalExtension;
-            c.query_row(RESTORE_READ, rusqlite::params![id, read_owner], |r| {
+            c.query_row(RESTORE_READ, rusqlite::params![id, read_reach], |r| {
                 Ok(DeletedRow {
                     content: r.get(0)?,
                     context: r.get(1)?,
-                    agent_id: r.get(2)?,
                     project_id: r.get(3)?,
                     memory_type: r.get(4)?,
                 })
@@ -635,7 +713,7 @@ pub async fn restore_memory_core(
         })
         .await
         .map_err(backend("restore_memory_core"))?;
-    let Some(DeletedRow { content, context, agent_id, project_id, memory_type }) = found else {
+    let Some(DeletedRow { content, context, project_id, memory_type }) = found else {
         return Err(RestoreError::NotFound(id));
     };
 
@@ -652,7 +730,7 @@ pub async fn restore_memory_core(
     let unit = crate::memory::vector::to_unit(&vector)
         .map_err(|e| RestoreError::Embed(id, EmbedError::InferenceFailed(e.to_string())))?;
     let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let candidates = restore_candidates(store, id, &unit, &content, agent_id, project_id, &memory_type).await?;
+    let candidates = restore_candidates(store, id, &unit, &content, reader, project_id, &memory_type).await?;
     let now = TimestampMs::now();
 
     enum Outcome {
@@ -667,16 +745,17 @@ pub async fn restore_memory_core(
             use rusqlite::OptionalExtension;
             let tx = c.transaction()?;
             let Some(deleted_at) = tx
-                .query_row(RESTORE_READ, rusqlite::params![id, owner], |r| r.get::<_, i64>(5))
+                .query_row(RESTORE_READ, rusqlite::params![id, reach], |r| r.get::<_, i64>(5))
                 .optional()?
             else {
                 return Ok(Outcome::Gone);
             };
-            if let Some(twin) = tx.query_row(RESTORE_TWIN, [id], |r| r.get(0)).optional()? {
+            if let Some(twin) = tx.query_row(RESTORE_TWIN, rusqlite::params![id, reach], |r| r.get(0)).optional()? {
                 return Ok(Outcome::Twin(twin));
             }
-            if let Some((key, live)) =
-                tx.query_row(RESTORE_TOPIC_HOLDER, [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?
+            if let Some((key, live)) = tx
+                .query_row(RESTORE_TOPIC_HOLDER, rusqlite::params![id, reach], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?
             {
                 return Ok(Outcome::TopicTaken(key, live));
             }
@@ -801,16 +880,24 @@ pub struct MemoryAdminRow {
 /// non-`Memory` kinds, the only table with a text index. `agent_id`,
 /// `project_id` and `status` are exact matches applied to every table.
 ///
-/// Unlike retrieval, `agent_id` is not a visibility rule: this is the owner's
-/// inspection tool, so it filters instead of scoping.
+/// `agent_id` filters by author; `reader` is the agent the listing is for,
+/// which sees what the sharing policy lets it reach. Without one the listing
+/// is the user's and reaches every row.
 #[derive(Debug, Clone, Default)]
 pub struct ListParams {
+    pub reader: Option<Reader>,
     pub kind: Option<MemoryKind>,
     pub tier: Option<i64>,
     pub memory_type: Option<String>,
     pub agent_id: Option<String>,
     pub project_id: Option<String>,
+    /// Only the rows saved in no project, which a search reaches from every
+    /// project; the caller does not set `project_id` with it.
+    pub no_project: bool,
     pub status: Option<String>,
+    /// The project the row had in the tool it came from, compared whole; only
+    /// `memory` rows have one, so no other kind matches.
+    pub origin_project: Option<String>,
     /// Free text over `memory.content`: every token must match, each as a
     /// prefix, ignoring case and accents. A query with no token filters nothing.
     pub query: Option<String>,
@@ -832,11 +919,15 @@ pub fn query_has_tokens(query: &str) -> bool {
 /// the SQL builders. Every value reaches SQL as a bound parameter.
 #[derive(Default)]
 struct RowFilter {
+    /// The reader's reach as `reader_bind` binds it.
+    reach: Option<String>,
     tier: Option<i64>,
     memory_type: Option<String>,
     agent_id: Option<String>,
     project_id: Option<String>,
+    no_project: bool,
     status: Option<String>,
+    origin_project: Option<String>,
     match_expr: Option<String>,
     deleted: bool,
 }
@@ -862,6 +953,14 @@ fn push_filters(
     memory_table: bool,
 ) {
     use rusqlite::types::Value;
+    if let Some(reach) = &f.reach {
+        sql.push_str(concat!(" AND ", reach_predicate!("agent_id", "?")));
+        // `reach_predicate!` names its parameter four times; an anonymous `?`
+        // is a new parameter each time.
+        for _ in 0..4 {
+            params.push(Value::Text(reach.clone()));
+        }
+    }
     if let Some(t) = f.tier {
         sql.push_str(" AND tier = ?");
         params.push(Value::Integer(t));
@@ -874,6 +973,9 @@ fn push_filters(
         sql.push_str(" AND project_id = ?");
         params.push(Value::Text(p.clone()));
     }
+    if f.no_project {
+        sql.push_str(" AND project_id IS NULL");
+    }
     if let Some(s) = &f.status {
         sql.push_str(" AND status = ?");
         params.push(Value::Text(s.clone()));
@@ -884,6 +986,10 @@ fn push_filters(
     if let Some(mt) = &f.memory_type {
         sql.push_str(" AND memory_type = ?");
         params.push(Value::Text(mt.clone()));
+    }
+    if let Some(o) = &f.origin_project {
+        sql.push_str(" AND origin_project = ?");
+        params.push(Value::Text(o.clone()));
     }
     if let Some(expr) = &f.match_expr {
         // No LIMIT inside: a cap here would drop matches before the live,
@@ -909,11 +1015,14 @@ pub async fn list_memories_core(
     let offset = params.offset.unwrap_or(0) as i64;
     let kind = params.kind;
     let filter = RowFilter {
+        reach: reader_bind(params.reader.as_ref()),
         tier: params.tier,
         memory_type: params.memory_type,
         agent_id: params.agent_id,
         project_id: params.project_id,
+        no_project: params.no_project,
         status: params.status,
+        origin_project: params.origin_project,
         match_expr: params.query.as_deref().and_then(viewer_match_expression),
         deleted: params.deleted,
     };
@@ -923,8 +1032,9 @@ pub async fn list_memories_core(
         .conn
         .call(move |c| -> rusqlite::Result<Vec<MemoryAdminRow>> {
             let want_memory = matches!(kind, None | Some(MemoryKind::Memory));
-            let want_episodic = matches!(kind, None | Some(MemoryKind::Episodic));
-            let want_procedural = matches!(kind, None | Some(MemoryKind::Procedural));
+            let only_memory = filter.origin_project.is_some();
+            let want_episodic = !only_memory && matches!(kind, None | Some(MemoryKind::Episodic));
+            let want_procedural = !only_memory && matches!(kind, None | Some(MemoryKind::Procedural));
 
             // When merging across tables (`kind: None`) each table is queried
             // with LIMIT=offset+limit/OFFSET=0 so the post-merge global sort
@@ -1381,6 +1491,17 @@ pub async fn memory_stats_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::sharing::Reach;
+
+    /// `agent` as a policy that hides nothing lets it act.
+    fn shared(agent: &str) -> Reader {
+        Reader::new(agent, Reach::AllBut(Vec::new()))
+    }
+
+    /// `agent` with `author`'s rows hidden from it.
+    fn hiding(agent: &str, author: &str) -> Reader {
+        Reader::new(agent, Reach::AllBut(vec![author.to_string()]))
+    }
 
 
     // ── MemoryKind serde round-trip ─────────────────────
@@ -1622,7 +1743,7 @@ mod tests {
     }
 
     fn importance(v: f64) -> MemoryPatch {
-        MemoryPatch::new(MemoryKind::Memory, Some(v), None).unwrap()
+        MemoryPatch::new(MemoryKind::Memory, Some(v), None, None).unwrap()
     }
 
     async fn memory_columns(store: &MemoryStore, id: i64) -> (String, i64, i64, String, i64, i64) {
@@ -1642,36 +1763,159 @@ mod tests {
 
     #[test]
     fn a_change_needs_at_least_one_field() {
-        assert_eq!(MemoryPatch::new(MemoryKind::Memory, None, None), Err(PatchError::Empty));
+        assert_eq!(MemoryPatch::new(MemoryKind::Memory, None, None, None), Err(PatchError::Empty));
+    }
+
+    #[test]
+    fn a_patch_needs_a_change_and_moves_only_memory_rows() {
+        assert!(MemoryPatch::new(MemoryKind::Memory, None, None, Some(Some("q-1a2b".into()))).is_ok());
+        assert!(MemoryPatch::new(MemoryKind::Memory, None, None, Some(None)).is_ok(), "to no project");
+        for kind in [MemoryKind::Episodic, MemoryKind::Procedural] {
+            let err = MemoryPatch::new(kind, Some(5.0), None, Some(None)).unwrap_err();
+            assert_eq!(err, PatchError::ProjectOnlyOnMemory(kind));
+        }
+    }
+
+    async fn register_project_row(store: &MemoryStore, id: &str) {
+        let id = id.to_string();
+        store
+            .conn
+            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/work/' || ?1, 0)", [id]))
+            .await
+            .unwrap();
+    }
+
+    fn move_to(project: Option<&str>) -> MemoryPatch {
+        MemoryPatch::new(MemoryKind::Memory, None, None, Some(project.map(str::to_string))).unwrap()
+    }
+
+    async fn project_of(store: &MemoryStore, id: i64) -> Option<String> {
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT project_id FROM memory WHERE id = ?1", [id], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_move_alone_changes_the_project_and_nothing_it_says() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        register_project_row(&store, "q-1a2b").await;
+        let id = save(&store, "agent-a", "the parser is hand written").await;
+        let before = memory_columns(&store, id).await;
+
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &move_to(Some("q-1a2b")), None)
+            .await
+            .unwrap()
+            .expect("updated");
+
+        assert_eq!((row.project_id.as_deref(), row.move_id), (Some("q-1a2b"), Some(1)));
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("q-1a2b"));
+        assert_eq!(memory_columns(&store, id).await, before, "no update_count, no last_modified_at");
+    }
+
+    #[tokio::test]
+    async fn a_move_and_a_change_of_importance_are_one_write() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        register_project_row(&store, "q-1a2b").await;
+        let id = save(&store, "agent-a", "the parser is hand written").await;
+        let both = MemoryPatch::new(MemoryKind::Memory, Some(8.0), None, Some(Some("q-1a2b".into()))).unwrap();
+
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &both, None).await.unwrap().expect("updated");
+        assert_eq!((row.importance, row.project_id.as_deref()), (8.0, Some("q-1a2b")));
+
+        let other = save(&store, "agent-a", "the lexer is generated").await;
+        let twin = save(&store, "agent-a", "the lexer is generated").await;
+        assert_ne!(other, twin, "a twin in another project");
+        store.conn.call(move |c| c.execute("UPDATE memory SET project_id = 'q-1a2b' WHERE id = ?1", [twin])).await.unwrap();
+        let clash = MemoryPatch::new(MemoryKind::Memory, Some(1.0), None, Some(Some("q-1a2b".into()))).unwrap();
+
+        let err = update_memory_core(&store, other, MemoryKind::Memory, &clash, None).await.unwrap_err();
+
+        assert!(err.to_string().contains(&format!("#{twin}")), "{err}");
+        assert_eq!(memory_tier_importance(&store, other).await.1, 5.0, "the importance waits for the move");
+        assert_eq!(project_of(&store, other).await.as_deref(), Some("p"));
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_project_is_not_a_place_to_move_to() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let id = save(&store, "agent-a", "the parser is hand written").await;
+
+        let err = update_memory_core(&store, id, MemoryKind::Memory, &move_to(Some("typo-0000")), None).await.unwrap_err();
+
+        assert!(matches!(err, UpdateError::Move(MoveError::UnknownProject(_))), "{err:?}");
+        let row = update_memory_core(&store, id, MemoryKind::Memory, &move_to(None), None).await.unwrap().unwrap();
+        assert_eq!(row.project_id, None, "no project is always a place");
+    }
+
+    #[tokio::test]
+    async fn a_protected_row_leaves_its_project_only_on_the_users_word() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        register_project_row(&store, "q-1a2b").await;
+        let id = save(&store, "agent-a", "the store is SQLite").await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET memory_type = 'architectural_decision' WHERE id = ?1", [id]))
+            .await
+            .unwrap();
+
+        let err = update_memory_core(&store, id, MemoryKind::Memory, &move_to(Some("q-1a2b")), Some(&shared("agent-b")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpdateError::MoveNeedsUser { id: row, .. } if row == id), "{err:?}");
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("p"));
+
+        let answered = move_to(Some("q-1a2b")).answered(true);
+        update_memory_core(&store, id, MemoryKind::Memory, &answered, Some(&shared("agent-b"))).await.unwrap().unwrap();
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("q-1a2b"));
+    }
+
+    #[tokio::test]
+    async fn a_move_takes_the_rest_of_the_save_along() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        register_project_row(&store, "q-1a2b").await;
+        let head = save(&store, "agent-a", "the opening of a long save").await;
+        let tail = save(&store, "agent-a", "and the rest of it").await;
+        store
+            .conn
+            .call(move |c| c.execute("INSERT INTO memory_piece VALUES (1, 1, ?1, ''), (1, 2, ?2, 'the opening')", [head, tail]))
+            .await
+            .unwrap();
+
+        let row = update_memory_core(&store, tail, MemoryKind::Memory, &move_to(Some("q-1a2b")), None).await.unwrap().unwrap();
+
+        assert_eq!(row.pulled_in, vec![head]);
+        assert_eq!(project_of(&store, head).await.as_deref(), Some("q-1a2b"));
     }
 
     #[test]
     fn importance_outside_the_scale_is_refused() {
         for v in [-0.5, 10.5, 50.0, f64::NAN, f64::INFINITY] {
-            let err = MemoryPatch::new(MemoryKind::Memory, Some(v), None).unwrap_err();
+            let err = MemoryPatch::new(MemoryKind::Memory, Some(v), None, None).unwrap_err();
             assert!(matches!(err, PatchError::ImportanceOutOfScale(_)), "{v}: {err:?}");
             assert!(err.to_string().contains("importance"), "{err}");
         }
         for v in [0.0, 10.0, 7.5] {
-            assert!(MemoryPatch::new(MemoryKind::Memory, Some(v), None).is_ok(), "{v}");
+            assert!(MemoryPatch::new(MemoryKind::Memory, Some(v), None, None).is_ok(), "{v}");
         }
     }
 
     #[test]
     fn an_unknown_memory_type_is_refused() {
-        let err = MemoryPatch::new(MemoryKind::Memory, None, Some("preference")).unwrap_err();
+        let err = MemoryPatch::new(MemoryKind::Memory, None, Some("preference"), None).unwrap_err();
         assert_eq!(err, PatchError::UnknownType(UnknownMemoryType("preference".into())));
         assert!(err.to_string().contains("memory_type"), "{err}");
-        assert!(MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference")).is_ok());
+        assert!(MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference"), None).is_ok());
     }
 
     #[test]
     fn only_memory_rows_have_a_type_to_change() {
         for kind in [MemoryKind::Episodic, MemoryKind::Procedural] {
-            let err = MemoryPatch::new(kind, Some(5.0), Some("user_preference")).unwrap_err();
+            let err = MemoryPatch::new(kind, Some(5.0), Some("user_preference"), None).unwrap_err();
             assert_eq!(err, PatchError::TypeOnlyOnMemory(kind));
             assert!(err.to_string().contains("memory_type"), "{err}");
-            assert!(MemoryPatch::new(kind, Some(5.0), None).is_ok());
+            assert!(MemoryPatch::new(kind, Some(5.0), None, None).is_ok());
         }
     }
 
@@ -1707,7 +1951,7 @@ mod tests {
     async fn an_update_writes_what_was_asked_and_counts_itself() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "semantic_fact", 3, 5.0, false).await;
-        let patch = MemoryPatch::new(MemoryKind::Memory, Some(8.0), Some("user_preference")).unwrap();
+        let patch = MemoryPatch::new(MemoryKind::Memory, Some(8.0), Some("user_preference"), None).unwrap();
 
         let row = update_memory_core(&store, id, MemoryKind::Memory, &patch, None).await.unwrap();
 
@@ -1719,13 +1963,16 @@ mod tests {
                 importance: 8.0,
                 memory_type: Some("user_preference".into()),
                 tier: 1,
+                project_id: None,
+                move_id: None,
+                pulled_in: Vec::new(),
             })
         );
         let (memory_type, update_count, last_modified_at, ..) = memory_columns(&store, id).await;
         assert_eq!((memory_type.as_str(), update_count), ("user_preference", 1));
         assert!(last_modified_at > 0, "the seed wrote 0");
 
-        let type_only = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision")).unwrap();
+        let type_only = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision"), None).unwrap();
         let row = update_memory_core(&store, id, MemoryKind::Memory, &type_only, None).await.unwrap().unwrap();
         assert_eq!(row.importance, 8.0, "a field not asked for stays as it was");
         assert_eq!(memory_columns(&store, id).await.1, 2);
@@ -1736,7 +1983,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         for protected in ["user_preference", "architectural_decision"] {
             let id = seed_memory_row(&store, protected, 3, 5.0, false).await;
-            let demote = MemoryPatch::new(MemoryKind::Memory, Some(9.0), Some("semantic_fact")).unwrap();
+            let demote = MemoryPatch::new(MemoryKind::Memory, Some(9.0), Some("semantic_fact"), None).unwrap();
 
             let refused = update_memory_core(&store, id, MemoryKind::Memory, &demote, None).await;
 
@@ -1759,12 +2006,12 @@ mod tests {
     async fn promoting_or_changing_importance_needs_no_answer() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let fact = seed_memory_row(&store, "semantic_fact", 3, 5.0, false).await;
-        let promote = MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference")).unwrap();
+        let promote = MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference"), None).unwrap();
         assert!(update_memory_core(&store, fact, MemoryKind::Memory, &promote, None).await.unwrap().is_some());
 
         let preference = seed_memory_row(&store, "user_preference", 3, 5.0, false).await;
         assert!(update_memory_core(&store, preference, MemoryKind::Memory, &importance(2.0), None).await.unwrap().is_some());
-        let between = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision")).unwrap();
+        let between = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision"), None).unwrap();
         assert!(update_memory_core(&store, preference, MemoryKind::Memory, &between, None).await.unwrap().is_some());
     }
 
@@ -1798,7 +2045,7 @@ mod tests {
     async fn update_on_episodic_has_no_type_rule_below_importance_9() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_episodic_row(&store, 3, 5.0).await;
-        let patch = MemoryPatch::new(MemoryKind::Episodic, Some(7.0), None).unwrap();
+        let patch = MemoryPatch::new(MemoryKind::Episodic, Some(7.0), None, None).unwrap();
 
         let row = update_memory_core(&store, id, MemoryKind::Episodic, &patch, None).await.unwrap().unwrap();
 
@@ -1810,7 +2057,7 @@ mod tests {
     async fn update_on_procedural_keeps_the_tier_its_table_gives() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_procedural_row(&store, 1, 8.0).await;
-        let patch = MemoryPatch::new(MemoryKind::Procedural, Some(3.0), None).unwrap();
+        let patch = MemoryPatch::new(MemoryKind::Procedural, Some(3.0), None, None).unwrap();
 
         update_memory_core(&store, id, MemoryKind::Procedural, &patch, None).await.unwrap().unwrap();
 
@@ -1848,7 +2095,7 @@ mod tests {
         let epi = seed_episodic_row(&store, 1, 5.0).await;
         let pro = seed_procedural_row(&store, 2, 5.0).await;
 
-        let lower = |kind| MemoryPatch::new(kind, Some(2.0), None).unwrap();
+        let lower = |kind| MemoryPatch::new(kind, Some(2.0), None, None).unwrap();
         let tier_of = |row: Option<UpdatedRow>| row.expect("updated").tier;
         assert_eq!(tier_of(update_memory_core(&store, earned, MemoryKind::Memory, &lower(MemoryKind::Memory), None).await.unwrap()), 3);
         assert_eq!(tier_of(update_memory_core(&store, foreign, MemoryKind::Memory, &lower(MemoryKind::Memory), None).await.unwrap()), 1);
@@ -1952,10 +2199,11 @@ mod tests {
         assert_eq!(memory_status(&store, new).await, "disputed");
     }
 
-    /// Another agent's row is answered as missing, and nothing about it moves:
-    /// not the row, not its vector, not the disputes that name it.
+    /// A row the policy hides from the reader is answered as missing, and
+    /// nothing about it moves: not the row, not its vector, not the disputes
+    /// that name it. Another agent that reaches it deletes it.
     #[tokio::test]
-    async fn an_owner_mismatch_deletes_nothing() {
+    async fn a_hidden_authors_row_is_not_found_and_stays() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mem = seed_memory_row_with_vector(&store).await;
         let epi = seed_episodic_row_with_vector(&store).await;
@@ -1963,7 +2211,7 @@ mod tests {
         let challenger = seed_disputing(&store, &[mem]).await;
 
         for (id, kind) in [(mem, MemoryKind::Memory), (epi, MemoryKind::Episodic), (pro, MemoryKind::Procedural)] {
-            assert_eq!(delete_memory_core(&store, id, kind, Some("other-agent")).await.unwrap().deleted, 0);
+            assert_eq!(delete_memory_core(&store, id, kind, Some(&hiding("other-agent", "test-agent"))).await.unwrap().deleted, 0);
         }
 
         assert_eq!(memory_deleted_at(&store, mem).await, None);
@@ -1973,21 +2221,22 @@ mod tests {
         assert_eq!(vector_row_count(&store, "procedural_vectors", pro).await, 1);
         assert_eq!(memory_status(&store, challenger).await, "disputed");
 
-        assert_eq!(delete_memory_core(&store, mem, MemoryKind::Memory, Some("test-agent")).await.unwrap().deleted, 1);
+        assert_eq!(delete_memory_core(&store, mem, MemoryKind::Memory, Some(&shared("other-agent"))).await.unwrap().deleted, 1);
         assert_eq!(vector_row_count(&store, "memory_vectors", mem).await, 0);
         assert_eq!(memory_status(&store, challenger).await, "active");
     }
 
     #[tokio::test]
-    async fn an_owner_mismatch_changes_no_importance() {
+    async fn another_agent_updates_a_row_it_reaches_but_not_a_hidden_one() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mem = seed_memory_row(&store, "chat_message", 3, 5.0, false).await;
         let epi = seed_episodic_row(&store, 3, 5.0).await;
         let pro = seed_procedural_row(&store, 3, 5.0).await;
 
         for (id, kind) in [(mem, MemoryKind::Memory), (epi, MemoryKind::Episodic), (pro, MemoryKind::Procedural)] {
-            let patch = MemoryPatch::new(kind, Some(9.5), None).unwrap();
-            assert_eq!(update_memory_core(&store, id, kind, &patch, Some("other-agent")).await.unwrap(), None);
+            let patch = MemoryPatch::new(kind, Some(9.5), None, None).unwrap();
+            let hidden = hiding("other-agent", "test-agent");
+            assert_eq!(update_memory_core(&store, id, kind, &patch, Some(&hidden)).await.unwrap(), None);
         }
 
         assert_eq!(memory_tier_importance(&store, mem).await, (3, 5.0));
@@ -1995,8 +2244,10 @@ mod tests {
         assert_eq!(procedural_tier_importance(&store, pro).await, (3, 5.0));
         assert_eq!(memory_columns(&store, mem).await.1, 0, "update_count");
 
-        let row = update_memory_core(&store, mem, MemoryKind::Memory, &importance(9.5), Some("test-agent")).await.unwrap();
-        assert_eq!(row.map(|r| r.importance), Some(9.5));
+        let row = update_memory_core(&store, mem, MemoryKind::Memory, &importance(9.5), Some(&shared("other-agent")))
+            .await
+            .unwrap();
+        assert_eq!(row.map(|r| r.importance), Some(9.5), "another agent changes what it reaches");
     }
 
     #[tokio::test]
@@ -2737,6 +2988,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_list_reaches_what_its_reader_reaches() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mine = seed_memory_scoped(&store, "one", "agent-a", None, "active").await;
+        let theirs = seed_memory_scoped(&store, "two", "agent-b", None, "active").await;
+        let hidden = seed_memory_scoped(&store, "three", "agent-c", None, "active").await;
+        let list = |reader: Reader, agent: Option<&str>| {
+            let params = ListParams { reader: Some(reader), agent_id: agent.map(Into::into), kind: Some(MemoryKind::Memory), ..Default::default() };
+            list_memories_core(&store, params)
+        };
+
+        let rows = list(hiding("agent-a", "agent-c"), None).await.unwrap();
+        assert_eq!(ids_of(&rows), vec![mine, theirs], "every author it reaches, not the hidden one");
+        let rows = list(hiding("agent-a", "agent-c"), Some("agent-b")).await.unwrap();
+        assert_eq!(ids_of(&rows), vec![theirs], "`agent_id` filters by author within the reach");
+        let rows = list(shared("agent-a"), None).await.unwrap();
+        assert_eq!(ids_of(&rows), vec![mine, theirs, hidden]);
+    }
+
+    #[tokio::test]
     async fn list_filters_by_project() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let exact = seed_memory_scoped(&store, "one", "a", Some("proj"), "active").await;
@@ -2751,6 +3021,55 @@ mod tests {
         .unwrap();
 
         assert_eq!(ids_of(&rows), vec![exact], "project filter is equality, not prefix");
+    }
+
+    #[tokio::test]
+    async fn a_listing_of_rows_without_a_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_memory_scoped(&store, "one", "a", Some("proj"), "active").await;
+        let loose = seed_memory_scoped(&store, "two", "a", None, "active").await;
+
+        let rows = list_memories_core(&store, ListParams { no_project: true, ..Default::default() }).await.unwrap();
+
+        assert_eq!(ids_of(&rows), vec![loose]);
+    }
+
+    #[tokio::test]
+    async fn a_listing_filters_by_origin_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let from_a = seed_memory_scoped(&store, "one", "agent-a", None, "active").await;
+        let from_a_other = seed_memory_scoped(&store, "two", "agent-b", None, "active").await;
+        let from_b = seed_memory_scoped(&store, "three", "agent-a", None, "active").await;
+        seed_memory_scoped(&store, "four", "agent-a", None, "active").await;
+        seed_episodic_scoped(&store, "agent-a", "t1").await;
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<()> {
+                for (id, origin) in [(from_a, "a"), (from_a_other, "a"), (from_b, "b")] {
+                    c.execute("UPDATE memory SET origin_project = ?1 WHERE id = ?2", rusqlite::params![origin, id])?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let rows = list_memories_core(&store, ListParams { origin_project: Some("a".into()), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&rows), vec![from_a, from_a_other], "{rows:?}");
+
+        let rows = list_memories_core(
+            &store,
+            ListParams { origin_project: Some("a".into()), agent_id: Some("agent-a".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids_of(&rows), vec![from_a]);
+
+        let rows = list_memories_core(&store, ListParams { origin_project: Some("A".into()), ..Default::default() })
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "the name is compared whole: {rows:?}");
     }
 
     #[tokio::test]
@@ -3257,8 +3576,8 @@ mod tests {
             .unwrap()
     }
 
-    async fn restore(store: &MemoryStore, id: i64, owner: Option<&str>) -> Result<RestoredRow, RestoreError> {
-        restore_memory_core(store, &FakeEmbedder::default(), MemoryKind::Memory, id, owner).await
+    async fn restore(store: &MemoryStore, id: i64, reader: Option<&Reader>) -> Result<RestoredRow, RestoreError> {
+        restore_memory_core(store, &FakeEmbedder::default(), MemoryKind::Memory, id, reader).await
     }
 
     async fn stored_vector(store: &MemoryStore, id: i64) -> Option<Vec<f32>> {
@@ -3348,7 +3667,7 @@ mod tests {
         let id = save(&store, "a", content).await;
         delete(&store, id).await;
 
-        let row = restore(&store, id, Some("a")).await.unwrap();
+        let row = restore(&store, id, Some(&shared("a"))).await.unwrap();
 
         assert_eq!(row, RestoredRow { id, status: "active".into(), ..RestoredRow::default() });
         let query = passage(content).await;
@@ -3376,20 +3695,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restoring_needs_a_deleted_row_of_the_owner() {
+    async fn restoring_needs_a_deleted_row_in_reach() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let live = save(&store, "a", "a live row").await;
         let theirs = save(&store, "b", "another agent's row").await;
         delete(&store, theirs).await;
         let before = columns(&store, theirs).await;
 
-        for (id, owner) in [(live, Some("a")), (theirs, Some("a")), (999_999, None), (live, None)] {
-            let err = restore(&store, id, owner).await.unwrap_err();
+        let hidden = hiding("a", "b");
+        for (id, reader) in [(live, Some(&shared("a"))), (theirs, Some(&hidden)), (999_999, None), (live, None)] {
+            let err = restore(&store, id, reader).await.unwrap_err();
             assert!(matches!(err, RestoreError::NotFound(n) if n == id), "{id}: {err:?}");
         }
-        assert_eq!(columns(&store, theirs).await, before, "another agent's row is untouched");
+        assert_eq!(columns(&store, theirs).await, before, "a hidden author's row is untouched");
         assert_eq!(stored_vector(&store, theirs).await, None);
         assert!(text_index_is_whole(&store).await);
+
+        let row = restore(&store, theirs, Some(&shared("a"))).await.unwrap();
+        assert_eq!(row.status, "active", "another agent restores what it reaches");
+        assert!(stored_vector(&store, theirs).await.is_some());
     }
 
     #[tokio::test]
@@ -3413,7 +3737,7 @@ mod tests {
         delete(&store, first).await;
         let twin = save(&store, "a", "deploys go out on fridays").await;
 
-        let err = restore(&store, first, Some("a")).await.unwrap_err();
+        let err = restore(&store, first, Some(&shared("a"))).await.unwrap_err();
 
         assert!(matches!(err, RestoreError::LiveTwin { id, twin: t } if id == first && t == twin), "{err:?}");
         assert!(err.to_string().contains(&format!("#{twin}")), "{err}");
@@ -3438,10 +3762,8 @@ mod tests {
         delete(&store, first).await;
         let current = save(&store, "a", "storage engine moved to postgres").await;
         set_key(&store, current, "storage/engine").await;
-        let elsewhere = save(&store, "b", "storage engine is duckdb").await;
-        set_key(&store, elsewhere, "storage/engine").await;
 
-        let err = restore(&store, first, Some("a")).await.unwrap_err();
+        let err = restore(&store, first, Some(&shared("a"))).await.unwrap_err();
 
         assert!(
             matches!(err, RestoreError::TopicTaken { id, live, ref key } if id == first && live == current && key == "storage/engine"),
@@ -3452,7 +3774,35 @@ mod tests {
         assert_eq!(stored_vector(&store, first).await, None);
 
         delete(&store, current).await;
-        assert_eq!(restore(&store, first, Some("a")).await.unwrap().status, "active");
+        assert_eq!(restore(&store, first, Some(&shared("a"))).await.unwrap().status, "active");
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_key_another_agent_holds_is_not_restored() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = save(&store, "a", "storage engine is sqlite").await;
+        set_key(&store, first, "storage/engine").await;
+        delete(&store, first).await;
+        let theirs = save(&store, "b", "storage engine is duckdb").await;
+        set_key(&store, theirs, "storage/engine").await;
+
+        let err = restore(&store, first, Some(&shared("a"))).await.unwrap_err();
+        assert!(matches!(err, RestoreError::TopicTaken { live, .. } if live == theirs), "{err:?}");
+
+        let row = restore(&store, first, Some(&hiding("a", "b"))).await.unwrap();
+        assert_eq!(row.status, "active", "a holder the reader cannot see does not hold the key for it");
+    }
+
+    #[tokio::test]
+    async fn a_restore_finds_another_agents_twin() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let first = save(&store, "a", "the deploy runs on fridays").await;
+        delete(&store, first).await;
+        let twin = save(&store, "b", "the deploy runs on fridays").await;
+
+        let err = restore(&store, first, Some(&shared("a"))).await.unwrap_err();
+
+        assert!(matches!(err, RestoreError::LiveTwin { id, twin: t } if id == first && t == twin), "{err:?}");
     }
 
     #[tokio::test]
@@ -3461,7 +3811,7 @@ mod tests {
         let id = save(&store, "a", "the key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123").await;
         delete(&store, id).await;
 
-        let err = restore(&store, id, Some("a")).await.unwrap_err();
+        let err = restore(&store, id, Some(&shared("a"))).await.unwrap_err();
 
         assert!(matches!(&err, RestoreError::HoldsSecret { kinds, .. } if kinds == &["anthropic_key"]), "{err:?}");
         let message = err.to_string();
@@ -3619,7 +3969,7 @@ mod tests {
         let gap = crate::memory::read_save_core(&store, MemoryKind::Memory, first, None).await.unwrap().unwrap();
         assert_eq!(gap.missing, vec![2]);
 
-        restore(&store, second, Some("a")).await.unwrap();
+        restore(&store, second, Some(&shared("a"))).await.unwrap();
 
         let behind = crate::memory::chunker::embedding_text("Notes on clawg-ledger.", "the second piece of a long save");
         let expected = crate::memory::vector::to_unit(&passage(&behind).await).unwrap();
@@ -3646,7 +3996,7 @@ mod tests {
         let (first, second, third) = keyed_save(&store, "ledger/notes").await;
         delete(&store, second).await;
 
-        let row = restore(&store, second, Some("a")).await.unwrap();
+        let row = restore(&store, second, Some(&shared("a"))).await.unwrap();
 
         assert_eq!(
             row,
@@ -3672,7 +4022,7 @@ mod tests {
         }
 
         for id in [first, second, third] {
-            assert_eq!(restore(&store, id, Some("a")).await.unwrap().status, "active", "piece #{id}");
+            assert_eq!(restore(&store, id, Some(&shared("a"))).await.unwrap().status, "active", "piece #{id}");
         }
     }
 
@@ -3684,7 +4034,7 @@ mod tests {
         let other = save(&store, "a", "ledger notes were rewritten").await;
         set_key(&store, other, "ledger/notes").await;
 
-        let err = restore(&store, second, Some("a")).await.unwrap_err();
+        let err = restore(&store, second, Some(&shared("a"))).await.unwrap_err();
 
         assert!(matches!(err, RestoreError::TopicTaken { id, live, .. } if id == second && live == other), "{err:?}");
         assert!(columns(&store, second).await.0.is_some(), "the piece stays deleted");
@@ -3738,7 +4088,7 @@ mod tests {
     }
 
     async fn delete_reporting(store: &MemoryStore, id: i64) -> Deleted {
-        delete_memory_core(store, id, MemoryKind::Memory, Some("a")).await.unwrap()
+        delete_memory_core(store, id, MemoryKind::Memory, Some(&shared("a"))).await.unwrap()
     }
 
     #[tokio::test]
@@ -3860,12 +4210,12 @@ mod tests {
 
         assert_eq!(last.revived.iter().map(|r| r.id).collect::<Vec<_>>(), vec![older]);
         assert_eq!(lineage(&store, older).await, revived_by(first));
-        restore(&store, first, Some("a")).await.unwrap();
+        restore(&store, first, Some(&shared("a"))).await.unwrap();
         assert_eq!(lineage(&store, older).await, replaced_by(first, "revision"), "restoring the head takes it back");
     }
 
     #[tokio::test]
-    async fn a_revival_stays_in_its_scope() {
+    async fn deleting_another_agents_revision_revives_the_earlier_one() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let theirs = keyed(&store, "b", "api port is 8080", "api/port").await;
         let mine = keyed(&store, "a", "api port is 9090", "api/port").await;
@@ -3873,8 +4223,26 @@ mod tests {
 
         let outcome = delete_reporting(&store, mine).await;
 
+        assert_eq!(outcome.revived.iter().map(|r| r.id).collect::<Vec<_>>(), vec![theirs], "{outcome:?}");
+        assert_eq!(lineage(&store, theirs).await, revived_by(mine));
+    }
+
+    #[tokio::test]
+    async fn a_revival_stays_in_its_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let elsewhere = keyed(&store, "a", "api port is 8080", "api/port").await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET project_id = 'q' WHERE id = ?1", [elsewhere]))
+            .await
+            .unwrap();
+        let mine = keyed(&store, "a", "api port is 9090", "api/port").await;
+        supersede(&store, elsewhere, mine, "revision").await;
+
+        let outcome = delete_reporting(&store, mine).await;
+
         assert!(outcome.revived.is_empty(), "{outcome:?}");
-        assert_eq!(lineage(&store, theirs).await, replaced_by(mine, "revision"));
+        assert_eq!(lineage(&store, elsewhere).await, replaced_by(mine, "revision"));
     }
 
     #[tokio::test]
@@ -3905,7 +4273,7 @@ mod tests {
         supersede(&store, v1, v2, "revision").await;
         delete_reporting(&store, v2).await;
 
-        let row = restore(&store, v2, Some("a")).await.unwrap();
+        let row = restore(&store, v2, Some(&shared("a"))).await.unwrap();
 
         assert_eq!(
             row,
@@ -3931,7 +4299,7 @@ mod tests {
         let v3 = keyed(&store, "a", "Storage engine moved to DuckDB", "storage/engine").await;
         supersede(&store, v1, v3, "revision").await;
 
-        let err = restore(&store, v2, Some("a")).await.unwrap_err();
+        let err = restore(&store, v2, Some(&shared("a"))).await.unwrap_err();
 
         assert!(matches!(err, RestoreError::TopicTaken { id, live, .. } if id == v2 && live == v3), "{err:?}");
         assert_eq!(lineage(&store, v3).await, current());
@@ -3946,12 +4314,12 @@ mod tests {
         delete_reporting(&store, v1).await;
         delete_reporting(&store, v2).await;
 
-        let row = restore(&store, v1, Some("a")).await.unwrap();
+        let row = restore(&store, v1, Some(&shared("a"))).await.unwrap();
 
         assert_eq!((row.status.as_str(), row.superseded_by, row.superseded_by_deleted), ("active", None, false));
         assert_eq!(lineage(&store, v1).await, revived_by(v2));
 
-        restore(&store, v2, Some("a")).await.unwrap();
+        restore(&store, v2, Some(&shared("a"))).await.unwrap();
         assert_eq!(lineage(&store, v1).await, replaced_by(v2, "revision"), "restoring v2 takes it back");
     }
 
@@ -3964,7 +4332,7 @@ mod tests {
         delete_reporting(&store, loser).await;
         delete_reporting(&store, winner).await;
 
-        let row = restore(&store, loser, Some("a")).await.unwrap();
+        let row = restore(&store, loser, Some(&shared("a"))).await.unwrap();
 
         assert_eq!(
             row,
@@ -4051,7 +4419,7 @@ mod tests {
     }
 
     async fn restore_placed(store: &MemoryStore, id: i64) -> RestoredRow {
-        restore_memory_core(store, &PlacedEmbedder(placed(1, 0.0)), MemoryKind::Memory, id, Some("a")).await.unwrap()
+        restore_memory_core(store, &PlacedEmbedder(placed(1, 0.0)), MemoryKind::Memory, id, Some(&shared("a"))).await.unwrap()
     }
 
     #[tokio::test]
@@ -4163,8 +4531,8 @@ mod tests {
         link_save(&store, vec![(head_id, ""), (piece_id, "Notes on clawg-ledger.")]).await;
         assert!(text_matches(&store, "obsidian").await.is_empty());
 
-        restore(&store, alone_id, Some("a")).await.unwrap();
-        restore(&store, piece_id, Some("a")).await.unwrap();
+        restore(&store, alone_id, Some(&shared("a"))).await.unwrap();
+        restore(&store, piece_id, Some(&shared("a"))).await.unwrap();
 
         assert_eq!(text_matches(&store, "obsidian").await, vec![alone_id]);
         assert_eq!(text_matches(&store, "quartz").await, vec![piece_id]);

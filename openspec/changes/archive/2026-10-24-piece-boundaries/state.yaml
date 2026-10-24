@@ -1,0 +1,15 @@
+change: piece-boundaries
+objective: "1"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done  # the open decisions taken with the exploration's recommendation, except word boundaries from bytes and an overlap at the nearest word start, which replaced the first rule after it failed U2
+  spec: done
+  design: done
+  tasks: done
+  apply: done  # arm (b) adopted with a head of 32 tokens; arm (a) not adopted
+  verify: done  # Windows, Windows again on develop, and CI on Linux and Windows
+  archive: done
+main_spec: openspec/specs/pieces/spec.md
+updated: 2026-10-24

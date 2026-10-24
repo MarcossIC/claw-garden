@@ -12,26 +12,26 @@ Esta es la parte D de [data-preservation](../archive/2026-10-12-data-preservatio
 
 | Afirmación de entonces | Hoy |
 |---|---|
-| «Los saves siguen respondiendo `queued`, quedan retenidos y se descartan al parar» (riesgo 2) | **Falso.** Con el embedder `failed` el save responde `503 embedder_failed` sin encolar (`crates/clawg-cli/src/daemon/api.rs:702-707`). Un contrato distinto es un `failed` no reintentable (`crates/clawg-core/src/memory/bootstrap.rs:48-52`). El MCP dice `not saved` (`crates/clawg-cli/src/mcp/server.rs:391-402`). Spec: `specs/ingest`, «Embedder fallido». |
+| «Los saves siguen respondiendo `queued`, quedan retenidos y se descartan al parar» (riesgo 2) | **Falso.** Con el embedder `failed` el save responde `503 embedder_failed` sin encolar (`crates/clawg-cli/src/daemon/api.rs:1326-1331`). Un contrato distinto es un `failed` no reintentable (`crates/clawg-core/src/memory/bootstrap.rs:48-52`). El MCP dice `not saved` (`crates/clawg-cli/src/mcp/server.rs:803-816`). Spec: `specs/ingest`, «Embedder fallido». |
 | «No hay snapshot, ni backup, ni restore» (riesgo 3) | **Falso.** Existen `clawg backup`, `clawg restore`, el snapshot previo a migrar y la retención (`specs/storage`). |
-| El mensaje del contrato promete «search will work in a minute» (riesgo 6) | **Corregido.** `embedder_failed` tiene su propio texto (`server.rs:391-402`). Pero sigue sin decir **cómo** se arregla: no hay ningún comando que nombrar. |
+| El mensaje del contrato promete «search will work in a minute» (riesgo 6) | **Corregido.** `embedder_failed` tiene su propio texto (`server.rs:659-679`). Pero sigue sin decir **cómo** se arregla: no hay ningún comando que nombrar. |
 | «`reembed_all` (`maintenance.rs:442`) no tiene llamador» | **Ya no es cierto.** Está en `crates/clawg-core/src/memory/maintenance.rs:467` y lo llama `verify_or_reembed` en el arranque (`crates/clawg-core/src/memory/bootstrap.rs:296`), pero sólo para el caso de un cambio de pooling (ver «Qué repara hoy el arranque»). Para cualquier otro cambio de contrato, incluido un prefijo, sigue sin llamador. Sus tests están en `:1577-1764`. |
 | «V2 fija `float[384]`» | **Sigue siendo cierto** (`crates/clawg-core/migrations/V2__vectors.sql:7,10,13`). |
 | Prefijos e5 en `embedder.rs:109` | **Sigue siendo cierto.** `E5_PASSAGE_PREFIX = "query: "` (`crates/clawg-core/src/memory/embedder.rs:109`), igual que el de query (`:89`). |
 | «`reembed_all` era un comando de Tauri y se borró en `5678ded`» | No lo reverifiqué. No cambia nada de lo que sigue. |
 
-Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo. `POST /v1/search` responde 503 (`api.rs:756-761`), pero `POST /v1/context` cae a la recuperación léxica sin embedder. Eso lo dice `specs/ingest` (línea 128); no lo reverifiqué en el código.
+Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo. `POST /v1/search` responde 503 (`api.rs:1428-1431`), pero `POST /v1/context` cae a la recuperación léxica sin embedder. Eso lo dice `specs/ingest` (línea 128); no lo reverifiqué en el código.
 
 ## Problema (verificado)
 
 ### Dónde vive el contrato y qué ve el usuario
 
 - La tabla `embedding_contract` guarda una fila con `model_id`, `dim`, `query_prefix` y `passage_prefix` (`crates/clawg-core/migrations/V5__embedding_contract.sql`). También `metric` y `normalized`, que no se comparan.
-- `ensure_embedding_contract` la escribe si no existe y la compara byte a byte si existe (`crates/clawg-core/src/memory/db.rs:309-358`). Una diferencia da `Mismatch`.
+- `ensure_embedding_contract` la escribe si no existe y la compara byte a byte si existe (`crates/clawg-core/src/memory/db.rs:332-381`). Una diferencia da `Mismatch`.
 - La identidad la informa el embedder. Modelo y dimensión salen de literales en `FastEmbedLocal::from_bytes` (`embedder.rs:268-269`). Los prefijos salen de dos constantes (`embedder.rs:214-220`).
 - El bootstrap compara **después** de bajar y cargar el modelo (`bootstrap.rs:320-346`). Ante un mismatch deja la celda del embedder vacía y devuelve `BootstrapError::Mismatch`. No reintenta (`specs/ingest`, líneas 184-185).
 - **Lo que ve el usuario:**
-  - `/health` y `clawg status`: `embedder: "failed"`, `embedder_retryable: false` y el texto con los campos que difieren (`api.rs:610`; `differing_fields`, `db.rs:87`).
+  - `/health` y `clawg status`: `embedder: "failed"`, `embedder_retryable: false` y el texto con los campos que difieren (`api.rs:1147`; `differing_fields`, `db.rs:87`).
   - MCP: `search_memory` y `save_memory` fallan con «could not load its embedding model (…); search and saving are unavailable until the cause is fixed».
   - **Nada dice qué hacer.** No hay `clawg reembed`, ni una vuelta atrás documentada. La salida real es restaurar un snapshot y volver al binario anterior.
 
@@ -62,7 +62,7 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 ### Las tres tablas vec0 tienen la dimensión escrita
 
 - `memory_vectors`, `episodic_vectors` y `procedural_vectors` son `vec0(embedding float[384])` (`V2__vectors.sql:7,10,13`). La dimensión no se puede alterar: hay que recrear la tabla.
-- V2 está fijada por checksum (`crates/clawg-core/src/memory/migrations.rs:43-55`, `published_migration_checksums_are_pinned`). Se cambia con una migración **nueva**, nunca editando V2.
+- V2 está fijada por checksum (`crates/clawg-core/src/memory/migrations.rs:43-70`, `published_migration_checksums_are_pinned`). Se cambia con una migración **nueva**, nunca editando V2.
 - Cambiar la dimensión necesita, como mínimo:
   1. una tabla nueva por cada una de las tres, con la dimensión nueva;
   2. llenarlas re-infiriendo todo el texto (un vector de 384 no se convierte a otra dimensión);
@@ -79,9 +79,9 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 ### ¿Hay un test que fije el contrato de producción?
 
 - **Prefijos: sí.** `e5_prefix_constants_are_symmetric_with_the_load_bearing_trailing_space` (`embedder.rs:730-738`). Cambiarlos rompe un test.
-- **Modelo y dimensión de producción: no.** `FastEmbedLocal` sólo se construye con `from_bytes`, que necesita el modelo real. Los literales `384` y `"multilingual-e5-small"` (`embedder.rs:268-269`) no los verifica ningún test automático. Los tests de `db.rs:1816-1828` y `bootstrap.rs:889-1007` usan embedders simulados con valores escritos a mano, así que pasarían igual si el de producción cambiara. El único `384` que se afirma es el del `FakeEmbedder` (`embedder.rs:493-496`).
+- **Modelo y dimensión de producción: no.** `FastEmbedLocal` sólo se construye con `from_bytes`, que necesita el modelo real. Los literales `384` y `"multilingual-e5-small"` (`embedder.rs:268-269`) no los verifica ningún test automático. Los tests de `db.rs:2764-2892` y `bootstrap.rs:889-1007` usan embedders simulados con valores escritos a mano, así que pasarían igual si el de producción cambiara. El único `384` que se afirma es el del `FakeEmbedder` (`embedder.rs:493-496`).
 - **Nada compara la dimensión del embedder con la de V2.** Si alguien subiera `dimensions` a 768 sin migración, las bases existentes darían mismatch y, en una base nueva, los inserts fallarían contra `float[384]`.
-- El comportamiento del mismatch sí está probado (`db.rs:1923,1921,1941`; `bootstrap.rs:889,960`).
+- El comportamiento del mismatch sí está probado (`db.rs:2814,2839,2859`; `bootstrap.rs:889,960`).
 
 ### Opciones ante una fila que no se puede embeber
 

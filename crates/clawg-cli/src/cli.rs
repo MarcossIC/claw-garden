@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use clawg_core::memory::sharing;
 use clawg_core::paths::{Profile, ProfileError};
+use clawg_core::preferences::Lang;
+
+use crate::client::MoveRequest;
 
 /// `clawg` — local-first memory for coding agents.
 #[derive(Debug, Parser)]
@@ -101,22 +104,42 @@ pub enum Command {
         profile: ProfileArg,
     },
     /// Import a file `clawg export` wrote, keeping each memory's dates,
-    /// accesses, state and links. Needs a running daemon, which embeds each
-    /// memory again; the store is snapshotted first. Importing a file twice
-    /// adds nothing.
+    /// accesses, state and links, or the export of another memory tool, each
+    /// note split and masked as a save of its text. Needs a running daemon,
+    /// which embeds each memory again; the store is snapshotted first.
+    /// Importing a file twice adds nothing. `--undo N` takes import N back,
+    /// keeping what was saved, edited or judged since.
     Import {
-        /// The file `clawg export` wrote.
-        file: PathBuf,
-        /// Report what would be imported, and write nothing.
+        /// The file `clawg export` wrote, or the other tool's export (for
+        /// engram, `engram export --all`).
+        #[arg(required_unless_present = "undo")]
+        file: Option<PathBuf>,
+        /// Take back import N, the number its report gave: remove for good
+        /// the memories it inserted that are still as it left them, and give
+        /// back what it changed in the others. The store is snapshotted
+        /// first.
+        #[arg(long, value_name = "N", conflicts_with_all = ["file", "from", "agent", "map_root", "project_map"])]
+        undo: Option<i64>,
+        /// The tool the file comes from.
+        #[arg(long, value_enum, default_value_t = ImportSource::Clawg)]
+        from: ImportSource,
+        /// Report what would be imported, or undone, and write nothing.
         #[arg(long)]
         dry_run: bool,
         /// Store every memory that has an agent under this one instead.
         #[arg(long, value_parser = parse_agent)]
         agent: Option<String>,
         /// Store the memories of the exported project root OLD in the project
-        /// the directory NEW is in. Repeat it for each root that moved.
+        /// the directory NEW is in. Repeat it for each root that moved. Only
+        /// for a clawg export.
         #[arg(long = "map-root", value_name = "OLD=NEW", value_parser = parse_root_map)]
         map_root: Vec<RootMap>,
+        /// Store the notes of the other tool's project NAME in the project
+        /// the directory PATH is in. Repeat it for each project; the notes of
+        /// a project not named are stored in none, and `clawg projects move
+        /// --origin-project NAME` places them later.
+        #[arg(long = "project-map", value_name = "NAME=PATH", value_parser = parse_project_map)]
+        project_map: Vec<ProjectMap>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -171,6 +194,16 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Show the user's preferences, or change one with `set` and `unset`. The
+    /// language (`es` or `en`) is the one memories are saved and searched in
+    /// and the agent answers in. A change reaches the Claude Code sessions
+    /// opened after it; `clawg setup claude-code` rewrites the protocol block.
+    Preferences {
+        #[command(subcommand)]
+        action: Option<PreferencesAction>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Report which `clawg` executables the PATH resolves to and whether this
     /// one is the one a terminal runs. Exits 1 if shadowed or duplicated.
     Doctor {
@@ -192,6 +225,12 @@ pub enum Command {
     Projects {
         #[command(subcommand)]
         action: ProjectsAction,
+    },
+    /// Read what the daemon measured of itself, kept in `<data>/metrics.db`.
+    /// Read-only; works with the daemon running or stopped.
+    Metrics {
+        #[command(subcommand)]
+        action: MetricsAction,
     },
     /// Browse what the daemon has stored. Read-only; needs a running daemon.
     Memories {
@@ -260,6 +299,71 @@ fn parse_root_map(raw: &str) -> Result<RootMap, String> {
     }
 }
 
+/// The tool a file `clawg import` reads comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ImportSource {
+    /// A file `clawg export` wrote.
+    Clawg,
+    /// The JSON `engram export` writes.
+    Engram,
+}
+
+impl ImportSource {
+    /// As the daemon names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImportSource::Clawg => "clawg",
+            ImportSource::Engram => "engram",
+        }
+    }
+}
+
+/// A project name of another tool and the directory whose project takes its
+/// notes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMap {
+    pub name: String,
+    pub root: PathBuf,
+}
+
+/// `NAME=PATH`, split at the last `=`: a project name may hold one, a path
+/// here does not.
+fn parse_project_map(raw: &str) -> Result<ProjectMap, String> {
+    match raw.rsplit_once('=') {
+        Some((name, root)) if !name.is_empty() && !root.is_empty() => {
+            Ok(ProjectMap { name: name.to_string(), root: PathBuf::from(root) })
+        }
+        _ => Err(format!("{raw:?} is not NAME=PATH")),
+    }
+}
+
+impl Cli {
+    /// Parses `args` as clap does, then refuses what no single argument
+    /// tells clap: a map of the other kind of export than `--from` names.
+    pub fn parse_args<I, T>(args: I) -> Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let cli = Cli::try_parse_from(args)?;
+        if let Command::Import { from, map_root, project_map, .. } = &cli.command {
+            let refused = match from {
+                ImportSource::Clawg if !project_map.is_empty() => {
+                    Some("--project-map maps the projects of another tool's export; name the tool with --from")
+                }
+                ImportSource::Engram if !map_root.is_empty() => {
+                    Some("--map-root maps the roots of a clawg export; another tool's projects take --project-map")
+                }
+                _ => None,
+            };
+            if let Some(message) = refused {
+                return Err(<Cli as clap::CommandFactory>::command().error(clap::error::ErrorKind::ArgumentConflict, message));
+            }
+        }
+        Ok(cli)
+    }
+}
+
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ProjectsAction {
     /// Index the docs and code of the project PATH is in, so `search_project`
@@ -270,6 +374,159 @@ pub enum ProjectsAction {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Move memories to another project, or out of every project, through the
+    /// running daemon. Each one moves with its whole save and topic history; a
+    /// memory whose text or topic key is live in the target stays where it is.
+    Move(MoveOpts),
+}
+
+/// What `clawg projects move` moves, and where. Exactly one of `--to`,
+/// `--to-project`, `--to-none` and `--undo`.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[command(group(clap::ArgGroup::new("target").args(["to", "to_project", "to_none", "undo"]).required(true)))]
+pub struct MoveOpts {
+    /// A memory to move, by id; repeat it for several.
+    #[arg(long = "id", value_name = "ID")]
+    pub ids: Vec<i64>,
+    /// Only memories of this project id.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["from_none", "here"])]
+    pub from_project: Option<String>,
+    /// Only memories saved in no project.
+    #[arg(long, conflicts_with = "here")]
+    pub from_none: bool,
+    /// Only memories of the project of the current directory, as `clawg mcp`
+    /// would scope them.
+    #[arg(long)]
+    pub here: bool,
+    /// Only memories this agent saved.
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
+    /// Only memories of this type.
+    #[arg(long = "type", value_name = "T")]
+    pub memory_type: Option<String>,
+    /// Only memories of this source (`explicit`, `synthesis`, `imported`, ...).
+    #[arg(long, value_name = "S")]
+    pub source: Option<String>,
+    /// Only memories saved in this host session.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
+    /// Only memories that came from this project of the tool they were
+    /// imported from, by its exact name.
+    #[arg(long, value_name = "NAME")]
+    pub origin_project: Option<String>,
+    /// Only memories whose content matches every word, as `memories search`
+    /// reads them.
+    #[arg(long, value_name = "WORDS")]
+    pub text: Option<String>,
+    /// Select deleted memories too.
+    #[arg(long)]
+    pub include_deleted: bool,
+    /// Move to the project PATH is in, registered first as a bridge would.
+    #[arg(long, value_name = "PATH")]
+    pub to: Option<PathBuf>,
+    /// Move to this registered project id, for a root no longer on disk.
+    #[arg(long, value_name = "ID")]
+    pub to_project: Option<String>,
+    /// Move out of every project, where every project's searches reach them.
+    #[arg(long)]
+    pub to_none: bool,
+    /// Move back what move N moved and is still where it left it.
+    #[arg(
+        long,
+        value_name = "N",
+        conflicts_with_all = [
+            "ids", "from_project", "from_none", "here", "agent", "memory_type", "source", "session", "text",
+            "origin_project", "include_deleted",
+        ]
+    )]
+    pub undo: Option<i64>,
+    /// Report what would move without moving anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl MoveOpts {
+    /// The request to send, given the id of the project of the current
+    /// directory (for `--here`) and of `--to`'s path, both resolved by the
+    /// caller so this stays testable without a filesystem.
+    pub fn request(&self, here: Option<String>, to: Option<String>) -> MoveRequest {
+        MoveRequest {
+            ids: self.ids.clone(),
+            from_project: if self.here { here } else { self.from_project.clone() },
+            from_none: self.from_none,
+            agent: self.agent.clone(),
+            memory_type: self.memory_type.clone(),
+            source: self.source.clone(),
+            session_id: self.session.clone(),
+            q: self.text.clone(),
+            origin_project: self.origin_project.clone(),
+            include_deleted: self.include_deleted,
+            to_project: to.or_else(|| self.to_project.clone()),
+            to_none: self.to_none,
+            undo: self.undo,
+            dry_run: self.dry_run,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum MetricsAction {
+    /// Sum one metric by local day, by hour of the local day or by version,
+    /// and print its count, mean and percentiles (or, for a gauge, its
+    /// samples, mean and extremes) as JSON.
+    Report {
+        /// The metric, as `http.duration` or `process.rss_bytes`.
+        #[arg(long)]
+        metric: String,
+        /// Only the series with this label, as `route=/v1/search`. Repeat it
+        /// to ask for several.
+        #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
+        labels: Vec<(String, String)>,
+        #[arg(long, value_enum, default_value_t = ReportBy::Version)]
+        by: ReportBy,
+        /// How far back, in days (`30d`) or hours (`12h`).
+        #[arg(long, value_name = "AGE", value_parser = parse_since, default_value = "30d")]
+        since: std::time::Duration,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+/// What `clawg metrics report` groups by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReportBy {
+    /// The local date.
+    Day,
+    /// The hour of the local day, 00 to 23, across every day.
+    Hour,
+    /// The clawg version that recorded it.
+    Version,
+}
+
+/// `KEY=VALUE`, both sides trimmed and not empty.
+fn parse_label(raw: &str) -> Result<(String, String), String> {
+    let (key, value) = raw.split_once('=').ok_or_else(|| format!("{raw:?} is not KEY=VALUE"))?;
+    let (key, value) = (key.trim(), value.trim());
+    if key.is_empty() || value.is_empty() {
+        return Err(format!("{raw:?} is not KEY=VALUE"));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// `30d` or `12h`: a whole number of days or hours.
+fn parse_since(raw: &str) -> Result<std::time::Duration, String> {
+    let raw = raw.trim();
+    let invalid = || format!("{raw:?} is not an age such as 30d or 12h");
+    let (number, unit) = raw.split_at(raw.len().saturating_sub(1));
+    let n: u64 = number.parse().map_err(|_| invalid())?;
+    let hours = match unit {
+        "d" => n.checked_mul(24).ok_or_else(invalid)?,
+        "h" => n,
+        _ => return Err(invalid()),
+    };
+    Ok(std::time::Duration::from_secs(hours.checked_mul(3600).ok_or_else(invalid)?))
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -336,6 +593,59 @@ pub fn sharing_profile<'a>(action: Option<&'a SharingAction>, own: &'a ProfileAr
     action.map(SharingAction::profile).filter(|p| p.profile.is_some()).unwrap_or(own)
 }
 
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum PreferencesAction {
+    /// Set a preference: `language es` or `language en`.
+    Set(SetPreference),
+    /// Take a preference away, back to how clawg behaves without it.
+    Unset(UnsetPreference),
+}
+
+/// What a preference is about. One for now; the next preference is another
+/// value here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PreferenceKey {
+    Language,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct SetPreference {
+    pub key: PreferenceKey,
+    /// `es` or `en`.
+    #[arg(value_parser = parse_lang)]
+    pub value: Lang,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct UnsetPreference {
+    pub key: PreferenceKey,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+fn parse_lang(raw: &str) -> Result<Lang, String> {
+    Lang::parse(raw).ok_or_else(|| format!("{raw:?} is not a language clawg knows: use es or en"))
+}
+
+impl PreferencesAction {
+    /// The `--profile` the action was given, if any.
+    pub fn profile(&self) -> &ProfileArg {
+        match self {
+            PreferencesAction::Set(s) => &s.profile,
+            PreferencesAction::Unset(u) => &u.profile,
+        }
+    }
+}
+
+/// The `--profile` a `clawg preferences` run uses, by the rule of
+/// [`sharing_profile`]: a preference written to another profile's data
+/// directory would leave the user's sessions in the language they left.
+pub fn preferences_profile<'a>(action: Option<&'a PreferencesAction>, own: &'a ProfileArg) -> &'a ProfileArg {
+    action.map(PreferencesAction::profile).filter(|p| p.profile.is_some()).unwrap_or(own)
+}
+
 /// One directed exclusion: READER does not read what AUTHOR saved.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct Exclusion {
@@ -353,9 +663,12 @@ impl Exclusion {
     /// Refuses hiding an agent from itself: an agent always reads its own
     /// memories, and accepting it would tell the user something changed when
     /// nothing did. `* *` is not that: it means no agent reads another.
-    pub fn check(&self) -> Result<(), String> {
+    pub fn check(&self, lang: Lang) -> Result<(), String> {
         if self.reader == self.author && self.reader != sharing::EVERY_AGENT {
-            return Err(format!("{} always reads its own memories", self.reader));
+            return Err(match lang {
+                Lang::En => format!("{} always reads its own memories", self.reader),
+                Lang::Es => format!("{} siempre lee sus propias memorias", self.reader),
+            });
         }
         Ok(())
     }
@@ -498,6 +811,9 @@ pub struct Filters {
     /// Only memories in this lifecycle state.
     #[arg(long, value_enum)]
     pub status: Option<StatusArg>,
+    /// Only rows saved in no project, which every project's searches reach.
+    #[arg(long, conflicts_with_all = ["project", "here"])]
+    pub no_project: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
@@ -519,6 +835,10 @@ pub struct ListOpts {
     /// List the deleted rows instead, most recently deleted first.
     #[arg(long)]
     pub deleted: bool,
+    /// Only memories that came from this project of the tool they were
+    /// imported from, by its exact name (memory rows only).
+    #[arg(long, value_name = "NAME")]
+    pub origin_project: Option<String>,
     #[command(flatten)]
     pub profile: ProfileArg,
 }
@@ -699,18 +1019,79 @@ mod tests {
             ])
             .command,
             Command::Import {
-                file: PathBuf::from("m.jsonl"),
+                file: Some(PathBuf::from("m.jsonl")),
+                undo: None,
+                from: ImportSource::Clawg,
                 dry_run: true,
                 agent: Some("dev".into()),
                 map_root: vec![
                     RootMap { old: "/a/repo".into(), new: PathBuf::from(".") },
                     RootMap { old: "C:\\work".into(), new: PathBuf::from("D:\\work") },
                 ],
+                project_map: Vec::new(),
                 profile: ProfileArg { profile: None },
             }
         );
         for bad in ["/a/repo", "=.", "/a/repo="] {
             assert!(Cli::try_parse_from(["clawg", "import", "m.jsonl", "--map-root", bad]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn import_takes_a_file_or_an_undo() {
+        assert_eq!(
+            parse(&["clawg", "import", "--undo", "4", "--dry-run"]).command,
+            Command::Import {
+                file: None,
+                undo: Some(4),
+                from: ImportSource::Clawg,
+                dry_run: true,
+                agent: None,
+                map_root: Vec::new(),
+                project_map: Vec::new(),
+                profile: ProfileArg { profile: None },
+            }
+        );
+        for refused in [
+            &["clawg", "import"][..],
+            &["clawg", "import", "m.jsonl", "--undo", "4"],
+            &["clawg", "import", "--undo", "4", "--from", "engram"],
+            &["clawg", "import", "--undo", "4", "--agent", "dev"],
+            &["clawg", "import", "--undo", "4", "--map-root", "/a=."],
+            &["clawg", "import", "--undo", "4", "--project-map", "a=."],
+        ] {
+            assert!(Cli::parse_args(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn import_takes_a_source_and_project_maps() {
+        let args = ["clawg", "import", "--from", "engram", "e.json", "--project-map", "my=app=C:\\work\\app", "--project-map", "b=."];
+        assert_eq!(
+            Cli::parse_args(args).expect("parse").command,
+            Command::Import {
+                file: Some(PathBuf::from("e.json")),
+                undo: None,
+                from: ImportSource::Engram,
+                dry_run: false,
+                agent: None,
+                map_root: Vec::new(),
+                project_map: vec![
+                    ProjectMap { name: "my=app".into(), root: PathBuf::from("C:\\work\\app") },
+                    ProjectMap { name: "b".into(), root: PathBuf::from(".") },
+                ],
+                profile: ProfileArg { profile: None },
+            }
+        );
+        let parses = |args: &[&str]| Cli::parse_args(args).map(|_| ()).map_err(|e| e.kind());
+        assert_eq!(parses(&["clawg", "import", "--from", "clawg", "m.jsonl", "--map-root", "/a=."]), Ok(()));
+        let conflict = Err(clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(parses(&["clawg", "import", "--from", "engram", "e.json", "--map-root", "/a=."]), conflict);
+        assert_eq!(parses(&["clawg", "import", "m.jsonl", "--project-map", "a=."]), conflict);
+        assert_eq!(parses(&["clawg", "import", "--from", "clawg", "m.jsonl", "--project-map", "a=."]), conflict);
+        assert!(parses(&["clawg", "import", "--from", "notion", "n.json"]).is_err());
+        for bad in ["a", "=.", "a="] {
+            assert!(parses(&["clawg", "import", "--from", "engram", "e.json", "--project-map", bad]).is_err(), "{bad}");
         }
     }
 
@@ -871,6 +1252,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn preferences_parses_set_and_unset() {
+        assert_eq!(
+            parse(&["clawg", "preferences"]).command,
+            Command::Preferences { action: None, profile: ProfileArg { profile: None } }
+        );
+        let dev = ProfileArg { profile: Some("dev".into()) };
+        assert_eq!(
+            parse(&["clawg", "preferences", "set", "language", "es", "--profile", "dev"]).command,
+            Command::Preferences {
+                action: Some(PreferencesAction::Set(SetPreference {
+                    key: PreferenceKey::Language,
+                    value: Lang::Es,
+                    profile: dev.clone()
+                })),
+                profile: ProfileArg { profile: None },
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "preferences", "--profile", "dev", "unset", "language"]).command,
+            Command::Preferences {
+                action: Some(PreferencesAction::Unset(UnsetPreference {
+                    key: PreferenceKey::Language,
+                    profile: ProfileArg { profile: None }
+                })),
+                profile: dev,
+            }
+        );
+        for bad in [["clawg", "preferences", "set", "language", "fr"], ["clawg", "preferences", "set", "idioma", "es"]] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+        let Command::Preferences { action, profile } =
+            parse(&["clawg", "preferences", "set", "language", "en", "--profile", "dev"]).command
+        else {
+            panic!("expected preferences");
+        };
+        assert_eq!(preferences_profile(action.as_ref(), &profile).profile.as_deref(), Some("dev"));
+    }
+
     fn hide_of(args: &[&str]) -> Exclusion {
         let Command::Sharing { action: Some(SharingAction::Hide(e)), .. } = parse(args).command else {
             panic!("expected a hide");
@@ -883,7 +1303,7 @@ mod tests {
         assert!(Cli::try_parse_from(["clawg", "sharing", "hide", " ", "claude-code"]).is_err());
         assert!(Cli::try_parse_from(["clawg", "sharing", "hide", "cursor"]).is_err(), "both agents are needed");
         let e = hide_of(&["clawg", "sharing", "hide", "cursor", "cursor"]);
-        assert_eq!(e.check(), Err("cursor always reads its own memories".to_string()));
+        assert_eq!(e.check(Lang::En), Err("cursor always reads its own memories".to_string()));
     }
 
     #[test]
@@ -907,7 +1327,7 @@ mod tests {
     fn every_agent_is_accepted_on_either_side() {
         for args in [["*", "codex"], ["cursor", "*"], ["*", "*"]] {
             let e = hide_of(&["clawg", "sharing", "hide", args[0], args[1]]);
-            assert_eq!(e.check(), Ok(()), "{args:?}");
+            assert_eq!(e.check(Lang::En), Ok(()), "{args:?}");
         }
     }
 
@@ -975,6 +1395,46 @@ mod tests {
     }
 
     #[test]
+    fn metrics_report_takes_a_metric_labels_a_grouping_and_an_age() {
+        assert_eq!(
+            parse(&["clawg", "metrics", "report", "--metric", "http.duration"]).command,
+            Command::Metrics {
+                action: MetricsAction::Report {
+                    metric: "http.duration".into(),
+                    labels: vec![],
+                    by: ReportBy::Version,
+                    since: std::time::Duration::from_secs(30 * 86_400),
+                    profile: ProfileArg { profile: None },
+                }
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "clawg", "metrics", "report", "--metric", "http.duration", "--label", "route=/v1/search", "--label",
+                " transport = unix ", "--by", "hour", "--since", "12h", "--profile", "dev",
+            ])
+            .command,
+            Command::Metrics {
+                action: MetricsAction::Report {
+                    metric: "http.duration".into(),
+                    labels: vec![("route".into(), "/v1/search".into()), ("transport".into(), "unix".into())],
+                    by: ReportBy::Hour,
+                    since: std::time::Duration::from_secs(12 * 3600),
+                    profile: ProfileArg { profile: Some("dev".into()) },
+                }
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "metrics", "report"]).is_err(), "the metric is required");
+        for bad in ["route", "=x", "route=", "a"] {
+            assert!(parse_label(bad).is_err(), "{bad}");
+        }
+        for bad in ["30", "d", "3w", "-1d", "99999999999999999d"] {
+            assert!(parse_since(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_since("1d"), Ok(std::time::Duration::from_secs(86_400)));
+    }
+
+    #[test]
     fn projects_add_takes_a_path_and_a_profile() {
         assert_eq!(
             parse(&["clawg", "projects", "add", "/work/other", "--profile", "dev"]).command,
@@ -986,6 +1446,100 @@ mod tests {
             }
         );
         assert!(Cli::try_parse_from(["clawg", "projects", "add"]).is_err(), "the path is required");
+    }
+
+    fn move_opts(args: &[&str]) -> MoveOpts {
+        let mut argv = vec!["clawg", "projects", "move"];
+        argv.extend_from_slice(args);
+        match parse(&argv).command {
+            Command::Projects { action: ProjectsAction::Move(opts) } => opts,
+            other => panic!("not a move: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_takes_a_selection_and_one_target_or_an_undo() {
+        let opts = move_opts(&["--id", "3", "--id", "7", "--from-none", "--type", "semantic_fact", "--to-project", "repo-1a2b"]);
+        assert_eq!(
+            opts.request(None, None),
+            MoveRequest {
+                ids: vec![3, 7],
+                from_none: true,
+                memory_type: Some("semantic_fact".into()),
+                to_project: Some("repo-1a2b".into()),
+                ..MoveRequest::default()
+            }
+        );
+
+        let opts = move_opts(&["--here", "--text", "parser cache", "--to", "/work/other", "--dry-run"]);
+        assert_eq!(opts.to.as_deref(), Some(std::path::Path::new("/work/other")));
+        assert_eq!(
+            opts.request(Some("here-0000".into()), Some("other-1111".into())),
+            MoveRequest {
+                from_project: Some("here-0000".into()),
+                q: Some("parser cache".into()),
+                to_project: Some("other-1111".into()),
+                dry_run: true,
+                ..MoveRequest::default()
+            }
+        );
+
+        assert_eq!(move_opts(&["--undo", "4"]).request(None, None), MoveRequest { undo: Some(4), ..MoveRequest::default() });
+        assert_eq!(move_opts(&["--agent", "a", "--to-none"]).request(None, None).to_none, true);
+
+        for bad in [
+            vec!["--id", "3"],
+            vec!["--id", "3", "--to-none", "--to-project", "repo-1a2b"],
+            vec!["--undo", "4", "--id", "3"],
+            vec!["--from-none", "--here", "--to-none"],
+            vec!["--from-project", "a-0000", "--from-none", "--to-none"],
+        ] {
+            let mut argv = vec!["clawg", "projects", "move"];
+            argv.extend(bad.iter().copied());
+            assert!(Cli::try_parse_from(&argv).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn move_and_list_take_an_origin_project() {
+        let opts = move_opts(&["--origin-project", "my repo", "--to-project", "repo-1a2b"]);
+        assert_eq!(
+            opts.request(None, None),
+            MoveRequest {
+                origin_project: Some("my repo".into()),
+                to_project: Some("repo-1a2b".into()),
+                ..MoveRequest::default()
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["clawg", "projects", "move", "--origin-project", "a", "--undo", "4"]).is_err(),
+            "an undo takes no selection"
+        );
+
+        let Command::Memories { action: MemoriesAction::List(opts) } =
+            parse(&["clawg", "memories", "list", "--origin-project", "my repo"]).command
+        else {
+            panic!("not a list");
+        };
+        assert_eq!(opts.origin_project.as_deref(), Some("my repo"));
+        assert_eq!(crate::memories::list_args(&opts, None).origin_project.as_deref(), Some("my repo"));
+    }
+
+    #[test]
+    fn list_and_search_take_no_project() {
+        let Command::Memories { action: MemoriesAction::List(opts) } = parse(&["clawg", "memories", "list", "--no-project"]).command
+        else {
+            panic!("not a list");
+        };
+        assert!(opts.filters.no_project);
+        let Command::Memories { action: MemoriesAction::Search(opts) } =
+            parse(&["clawg", "memories", "search", "cache", "--no-project"]).command
+        else {
+            panic!("not a search");
+        };
+        assert!(opts.filters.no_project);
+        assert!(Cli::try_parse_from(["clawg", "memories", "list", "--no-project", "--project", "a-0000"]).is_err());
+        assert!(Cli::try_parse_from(["clawg", "memories", "list", "--no-project", "--here"]).is_err());
     }
 
     #[test]
@@ -1134,6 +1688,7 @@ mod tests {
                 offset: 0,
                 json: false,
                 deleted: false,
+                origin_project: None,
                 profile: ProfileArg { profile: None },
             })
         );
@@ -1163,11 +1718,13 @@ mod tests {
                     memory_type: Some("semantic_fact".into()),
                     tier: Some(2),
                     status: Some(StatusArg::Disputed),
+                    no_project: false,
                 },
                 limit: 5,
                 offset: 10,
                 json: true,
                 deleted: false,
+                origin_project: None,
                 profile: ProfileArg { profile: Some("dev".into()) },
             })
         );

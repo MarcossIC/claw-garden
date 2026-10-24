@@ -137,11 +137,25 @@ pub enum Reason {
     PreReembed,
     /// Before `clawg import` wrote rows from an export.
     PreImport,
+    /// Before `clawg projects move` moved rows to another project.
+    PreMove,
+    /// Before registering a root joined rows of other ids into its project.
+    PreRekey,
+    /// Before `clawg import --undo` took an import back.
+    PreUndo,
 }
 
 impl Reason {
-    const ALL: [Reason; 5] =
-        [Reason::PreMigration, Reason::PreRestore, Reason::Manual, Reason::PreReembed, Reason::PreImport];
+    const ALL: [Reason; 8] = [
+        Reason::PreMigration,
+        Reason::PreRestore,
+        Reason::Manual,
+        Reason::PreReembed,
+        Reason::PreImport,
+        Reason::PreMove,
+        Reason::PreRekey,
+        Reason::PreUndo,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -150,6 +164,9 @@ impl Reason {
             Reason::Manual => "manual",
             Reason::PreReembed => "pre-reembed",
             Reason::PreImport => "pre-import",
+            Reason::PreMove => "pre-move",
+            Reason::PreRekey => "pre-rekey",
+            Reason::PreUndo => "pre-undo",
         }
     }
 
@@ -240,7 +257,7 @@ pub fn parse_snapshot_time(name: &str) -> Option<i64> {
 
 /// A proleptic Gregorian (year, month, day) to days since 1970-01-01, the
 /// inverse of [`civil_from_days`]. Howard Hinnant's `days_from_civil`.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -266,8 +283,9 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// How many automatic snapshots (`pre-migration`, `pre-restore`, `pre-import`,
-/// `pre-reembed`) are kept. One is taken per upgrade that migrates, per
-/// restore or per re-embed, so five cover several in a row. A starting
+/// `pre-reembed`, `pre-move`) are kept. One is taken per upgrade that migrates,
+/// per restore, per import, per re-embed or per batch move, so five cover
+/// several in a row. A starting
 /// value, not measured.
 pub const AUTO_KEEP: usize = 5;
 

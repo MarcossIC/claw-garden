@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 use serde_json::{json, Value};
 
 use super::finding::{Finding, Severity};
@@ -19,7 +20,7 @@ pub enum Config {
 
 /// The finding for the profile's server in `config`, read from `path`.
 /// `exists` says whether an absolute command is there.
-pub fn mcp(path: &Path, config: &Config, profile: Profile, exe: &Path, exists: impl Fn(&Path) -> bool) -> Vec<Finding> {
+pub fn mcp(lang: Lang, path: &Path, config: &Config, profile: Profile, exe: &Path, exists: impl Fn(&Path) -> bool) -> Vec<Finding> {
     let name = profile.mcp_server_name();
     let setup = format!("clawg setup claude-code --profile {}", profile.as_str());
     let unreadable = |error: String| {
@@ -27,7 +28,10 @@ pub fn mcp(path: &Path, config: &Config, profile: Profile, exe: &Path, exists: i
             "mcp",
             Severity::Warn,
             "config_unreadable",
-            format!("{} cannot be read: {error}", path.display()),
+            match lang {
+                Lang::En => format!("{} cannot be read: {error}", path.display()),
+                Lang::Es => format!("no se puede leer {}: {error}", path.display()),
+            },
         )
         .evidence(json!({ "config": path, "error": error }))]
     };
@@ -36,7 +40,10 @@ pub fn mcp(path: &Path, config: &Config, profile: Profile, exe: &Path, exists: i
             "mcp",
             Severity::Info,
             "not_registered",
-            format!("Claude Code has no `{name}` server for this profile"),
+            match lang {
+                Lang::En => format!("Claude Code has no `{name}` server for this profile"),
+                Lang::Es => format!("Claude Code no tiene un servidor `{name}` para este perfil"),
+            },
         )
         .evidence(json!({ "config": path, "server": name }))
         .step(setup.clone())]
@@ -69,7 +76,10 @@ pub fn mcp(path: &Path, config: &Config, profile: Profile, exe: &Path, exists: i
                     "mcp",
                     Severity::Error,
                     "binary_missing",
-                    format!("Claude Code starts `{name}` with {command}, which does not exist"),
+                    match lang {
+                        Lang::En => format!("Claude Code starts `{name}` with {command}, which does not exist"),
+                        Lang::Es => format!("Claude Code arranca `{name}` con {command}, que no existe"),
+                    },
                 )
                 .evidence(evidence.clone())
                 .step(setup.clone()),
@@ -80,7 +90,10 @@ pub fn mcp(path: &Path, config: &Config, profile: Profile, exe: &Path, exists: i
                     "mcp",
                     Severity::Warn,
                     "other_binary",
-                    format!("Claude Code starts `{name}` with {command}, not with this binary"),
+                    match lang {
+                        Lang::En => format!("Claude Code starts `{name}` with {command}, not with this binary"),
+                        Lang::Es => format!("Claude Code arranca `{name}` con {command}, no con este binario"),
+                    },
                 )
                 .evidence(json!({ "config": path, "server": name, "command": command, "exe": exe })),
             );
@@ -92,14 +105,25 @@ pub fn mcp(path: &Path, config: &Config, profile: Profile, exe: &Path, exists: i
                 "mcp",
                 Severity::Warn,
                 "no_agent",
-                format!("`{name}` is started without --agent, so its memories go under whatever name the client reports"),
+                match lang {
+                    Lang::En => {
+                        format!("`{name}` is started without --agent, so its memories go under whatever name the client reports")
+                    }
+                    Lang::Es => format!(
+                        "`{name}` arranca sin --agent, así que sus memorias quedan bajo el nombre que dé el cliente"
+                    ),
+                },
             )
             .evidence(evidence.clone())
             .step(setup),
         );
     }
     if found.is_empty() {
-        found.push(Finding::ok("mcp", format!("Claude Code starts `{name}` with {command} and --agent")).evidence(evidence));
+        let message = match lang {
+            Lang::En => format!("Claude Code starts `{name}` with {command} and --agent"),
+            Lang::Es => format!("Claude Code arranca `{name}` con {command} y --agent"),
+        };
+        found.push(Finding::ok("mcp", message).evidence(evidence));
     }
     found
 }
@@ -130,7 +154,7 @@ mod tests {
     fn mcp_findings() {
         let here = exe("bin");
         let file = Path::new("/home/u/.claude.json");
-        let check = |config: &Config| mcp(file, config, Profile::Dev, &here, |p| p == here.as_path() || p == exe("old"));
+        let check = |config: &Config| mcp(Lang::En, file, config, Profile::Dev, &here, |p| p == here.as_path() || p == exe("old"));
 
         assert_eq!(kinds(&check(&config(&here, &AGENT))), [(Severity::Ok, "healthy")]);
         let missing = check(&Config::Missing);
@@ -154,5 +178,29 @@ mod tests {
             [(Severity::Ok, "healthy")],
             "a command by name is the PATH check's"
         );
+    }
+
+    #[test]
+    fn the_mcp_findings_are_the_same_in_both_languages_but_their_message() {
+        let here = exe("bin");
+        let file = Path::new("/home/u/.claude.json");
+        let configs = [
+            config(&here, &AGENT),
+            Config::Missing,
+            Config::Text("{".into()),
+            Config::Text(r#"{"mcpServers":{"clawg-dev":{}}}"#.into()),
+            Config::Unreadable("denied".into()),
+            config(&exe("gone"), &AGENT),
+            config(&exe("old"), &["mcp"]),
+        ];
+        for config in &configs {
+            let check = |lang| mcp(lang, file, config, Profile::Dev, &here, |p| p == here.as_path() || p == exe("old"));
+            let (en, es) = (check(Lang::En), check(Lang::Es));
+            assert_eq!(en.len(), es.len());
+            for (en, es) in en.iter().zip(&es) {
+                assert_ne!(en.message, es.message, "{} has one message in both languages", en.reason_code);
+                assert_eq!(Finding { message: String::new(), ..en.clone() }, Finding { message: String::new(), ..es.clone() });
+            }
+        }
     }
 }

@@ -20,6 +20,7 @@ use clawg_core::memory::sharing;
 use clawg_core::memory::spill::{REJECTED_FILE, SPILL_FILE};
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock};
 use clawg_core::paths::{PathsError, Profile};
+use clawg_core::preferences::{self, Lang};
 use serde::Serialize;
 
 use finding::{Finding, Summary};
@@ -144,37 +145,54 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     let analysis = analyze(&exe, &entries, name, |p| p.is_file());
     let data_dir = clawg_core::paths::data_dir(profile)?;
 
-    let mut found = checks::path(&analysis);
-    found.extend(checks::data_dir(&data_dir, dir_state(&data_dir)));
+    // Read first: every message is written in the language it names.
+    let preferences_path = clawg_core::paths::preferences_file(&data_dir);
+    let (state, language) = if !preferences_path.exists() {
+        (checks::PreferencesState::Missing, None)
+    } else {
+        match preferences::load(&data_dir) {
+            Ok(p) => (checks::PreferencesState::Readable, p.language),
+            Err(e) => (checks::PreferencesState::Invalid(e.to_string()), None),
+        }
+    };
+    let lang = language.unwrap_or(Lang::En);
+
+    let mut found = checks::path(lang, &analysis);
+    found.extend(checks::data_dir(lang, &data_dir, dir_state(&data_dir)));
     let socket = clawg_core::paths::socket_file(&data_dir);
-    found.extend(checks::socket(&socket, &crate::daemon::socket::check_socket_path(&socket)));
+    found.extend(checks::socket(lang, &socket, &crate::daemon::socket::check_socket_path(&socket)));
     let owner = StoreLock::current_owner(&data_dir);
-    found.extend(checks::store_owner(owner.as_ref()));
+    found.extend(checks::store_owner(lang, owner.as_ref()));
 
     let inspection = inspect(&data_dir);
-    found.extend(checks::schema(&inspection.schema, profile));
+    found.extend(checks::schema(lang, &inspection.schema, profile));
     if let Some(facts) = &inspection.facts {
-        found.extend(checks::contract(facts.contract.as_ref(), &clawg_core::memory::bootstrap::serving_contract()));
+        found.extend(checks::contract(lang, facts.contract.as_ref(), &clawg_core::memory::bootstrap::serving_contract()));
         let has_rows = facts.agents.iter().any(|a| a.total > 0);
         let backups = names_in(&clawg_core::paths::backups_dir(&data_dir));
-        found.extend(checks::backups(&backups, has_rows, now_ms(), profile));
+        found.extend(checks::backups(lang, &backups, has_rows, now_ms(), profile));
     }
     let rejected = present(&data_dir, REJECTED_FILE)
         .map(|path| (lines_in(&path), path));
     found.extend(checks::spill(
+        lang,
         present(&data_dir, SPILL_FILE).as_deref(),
         rejected.as_ref().map(|(lines, path)| (path.as_path(), *lines)),
     ));
     let sharing_error = sharing::load(&data_dir).err().map(|e| e.to_string());
-    found.extend(checks::sharing(sharing_error.as_deref(), profile));
+    found.extend(checks::sharing(lang, sharing_error.as_deref(), profile));
+    found.extend(checks::preferences(lang, &state, &preferences_path));
+    if let Some(language) = language {
+        found.extend(protocol_block(language, profile));
+    }
     if let Some(facts) = &inspection.facts {
         let daemon_running = owner.as_ref().is_some_and(|o| o.holder == StoreHolder::Daemon);
-        found.extend(checks::outbox(&facts.outbox, daemon_running, profile));
-        found.extend(checks::agents(&facts.agents));
-        found.extend(checks::projects(&facts.projects));
-        found.extend(checks::invariants(&facts.invariants));
+        found.extend(checks::outbox(lang, &facts.outbox, daemon_running, profile));
+        found.extend(checks::agents(lang, &facts.agents));
+        found.extend(checks::projects(lang, &facts.projects));
+        found.extend(checks::invariants(lang, &facts.invariants));
     }
-    found.extend(claude_code(profile, &exe));
+    found.extend(claude_code(lang, profile, &exe));
 
     let summary = Summary::of(&found);
     Ok(Report {
@@ -230,9 +248,31 @@ fn lines_in(path: &Path) -> usize {
     std::fs::read(path).map(|b| b.split(|&c| c == b'\n').filter(|l| !l.is_empty()).count()).unwrap_or(0)
 }
 
+/// The protocol block of the user `CLAUDE.md` `clawg setup claude-code`
+/// writes, against the one it would write for `language`.
+fn protocol_block(language: Lang, profile: Profile) -> Vec<Finding> {
+    let home = clawg_core::paths::home_dir();
+    let Ok((_, _, path)) = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")) else {
+        return Vec::new();
+    };
+    let state = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => checks::BlockState::Missing,
+        Err(e) => checks::BlockState::Unreadable(e.to_string()),
+        Ok(text) => {
+            let file = crate::setup::File { path: path.clone(), text: Some(text) };
+            match crate::setup::find_block(&file) {
+                Ok(Some((begin, end))) => checks::BlockState::Installed(file.text.unwrap_or_default()[begin..end].to_string()),
+                Ok(None) => checks::BlockState::Missing,
+                Err(e) => checks::BlockState::Unreadable(e.to_string()),
+            }
+        }
+    };
+    checks::protocol_block(language, &state, &crate::setup::block("\n", Some(language)), &path, profile)
+}
+
 /// Claude Code's registration of this profile's server, from the file
 /// `clawg setup claude-code` reads.
-fn claude_code(profile: Profile, exe: &Path) -> Vec<Finding> {
+fn claude_code(lang: Lang, profile: Profile, exe: &Path) -> Vec<Finding> {
     let home = clawg_core::paths::home_dir();
     let Ok((path, _, _)) = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")) else {
         return Vec::new();
@@ -242,7 +282,7 @@ fn claude_code(profile: Profile, exe: &Path) -> Vec<Finding> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => mcp::Config::Missing,
         Err(e) => mcp::Config::Unreadable(e.to_string()),
     };
-    mcp::mcp(&path, &config, profile, exe, Path::is_file)
+    mcp::mcp(lang, &path, &config, profile, exe, Path::is_file)
 }
 
 #[cfg(test)]
@@ -352,7 +392,7 @@ mod tests {
     #[test]
     fn the_report_serialises_the_documented_fields() {
         let analysis = analyze(&exe("new"), &dirs(&["old", "new"]), NAME, |_| true);
-        let found = checks::path(&analysis);
+        let found = checks::path(Lang::En, &analysis);
         let report = Report {
             exe: exe("new"),
             version: "0.1.0".into(),
@@ -376,7 +416,7 @@ mod tests {
     #[test]
     fn path_findings() {
         let kinds = |a: &Analysis| -> Vec<(finding::Severity, &'static str)> {
-            checks::path(a).iter().map(|f| (f.severity, f.reason_code)).collect()
+            checks::path(Lang::En, a).iter().map(|f| (f.severity, f.reason_code)).collect()
         };
         let healthy = analyze(&exe("new"), &dirs(&["new"]), NAME, present(&["new"]));
         assert_eq!(kinds(&healthy), [(finding::Severity::Ok, "healthy")]);
@@ -387,7 +427,7 @@ mod tests {
             kinds(&shadowed),
             [(finding::Severity::Error, "shadowed"), (finding::Severity::Error, "duplicate")]
         );
-        assert!(Summary::of(&checks::path(&shadowed)).fails(), "an unhealthy PATH still exits 1");
+        assert!(Summary::of(&checks::path(Lang::En, &shadowed)).fails(), "an unhealthy PATH still exits 1");
         let later = analyze(&exe("new"), &dirs(&["new", "old"]), NAME, present(&["old", "new"]));
         assert_eq!(kinds(&later), [(finding::Severity::Error, "duplicate")]);
     }

@@ -6,6 +6,8 @@
 //! format drifts, these parsers fail loudly instead of the metric silently
 //! describing something the agent no longer receives.
 
+use clawg_core::preferences::Lang;
+
 /// One numbered line of a search result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchLine {
@@ -26,12 +28,14 @@ pub enum ParseError {
     SearchLine(String),
 }
 
-/// Text the search tool prints when nothing matched.
-const NO_HITS: &str = "no memories found";
-
-/// Splits `format_search` output into its lines.
+/// Splits `format_search` output into its lines. The sentences of an empty
+/// answer are read in every language the tool speaks.
 pub fn parse_search_output(text: &str) -> Result<Vec<SearchLine>, ParseError> {
-    if text.trim() == NO_HITS || text.starts_with(clawg_cli::mcp::tools::NO_RELEVANT_MEMORIES) {
+    use clawg_cli::mcp::tools::{no_memories_found, no_relevant_memories};
+    let empty = [Lang::En, Lang::Es]
+        .into_iter()
+        .any(|lang| text.trim() == no_memories_found(lang) || text.starts_with(no_relevant_memories(lang)));
+    if empty {
         return Ok(Vec::new());
     }
     text.lines()
@@ -183,11 +187,27 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_answer_reads_as_empty_in_both_languages() {
+        for language in [None, Some(Lang::Es)] {
+            for withheld in [0, 3] {
+                let text = clawg_cli::mcp::tools::format_search(
+                    clawg_cli::client::Found { hits: Vec::new(), withheld, other_language: None },
+                    "agent",
+                    None,
+                    language,
+                );
+                assert!(parse_search_output(&text).unwrap().is_empty(), "{text}");
+            }
+        }
+        assert!(parse_search_output("no se encontraron memorias").unwrap().is_empty());
+    }
+
+    #[test]
     fn the_abstention_sentence_parses_to_no_lines() {
         let text = clawg_cli::mcp::tools::format_search(
-            clawg_cli::client::Found { hits: Vec::new(), withheld: 3 },
+            clawg_cli::client::Found { hits: Vec::new(), withheld: 3, other_language: None },
             "agent",
-            None,
+            None, None,
         );
         assert!(parse_search_output(&text).unwrap().is_empty(), "{text}");
     }

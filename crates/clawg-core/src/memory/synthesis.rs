@@ -8,13 +8,16 @@
 //!
 //! A scope is one project, or the whole store when no project is given. Rows
 //! without a project belong only to the whole store. Within a scope an agent
-//! sees only its own rows, as in search; without an agent the caller is the
-//! store owner and sees every agent's.
+//! sees every row it reaches, whoever saved it, and its review is the
+//! project's: once any agent looked, the reminder is off for every agent.
+//! Without an agent the caller is the user and sees every row.
 
 use serde::Serialize;
 
 use crate::memory::admin::{map_memory_row, MemoryAdminRow, SELECT_MEMORY};
 use crate::memory::clock::TimestampMs;
+use crate::memory::search::{reach_predicate, reader_bind, reader_predicate};
+use crate::memory::sharing::Reader;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// Pending memories returned when the caller does not say how many.
@@ -25,14 +28,13 @@ pub const MAX_PENDING_LIMIT: u32 = 100;
 /// to see what it already concluded without crowding out the memories.
 pub const CONCLUSIONS_LIMIT: u32 = 20;
 
-/// A live `memory` row that is not a conclusion and that no live conclusion
-/// of the same agent was drawn from. A deleted or superseded conclusion stops
-/// covering its sources, so they become pending again; one by another agent
-/// never covered them, since this agent cannot see it.
+/// A live `memory` row that is not a conclusion and that no live conclusion,
+/// of any author, was drawn from. A deleted or superseded conclusion stops
+/// covering its sources, so they become pending again.
 const PENDING: &str = "deleted_at IS NULL AND status <> 'superseded' \
      AND NOT EXISTS (SELECT 1 FROM memory_derivation d WHERE d.memory_id = memory.id) \
      AND NOT EXISTS (SELECT 1 FROM memory_derivation d JOIN memory c ON c.id = d.memory_id \
-                     WHERE d.source_id = memory.id AND c.agent_id IS memory.agent_id \
+                     WHERE d.source_id = memory.id \
                        AND c.deleted_at IS NULL AND c.status <> 'superseded')";
 
 const CONCLUSION: &str = "deleted_at IS NULL AND status <> 'superseded' \
@@ -105,8 +107,9 @@ pub struct ConclusionReview {
 
 #[derive(Debug, Clone, Default)]
 pub struct SynthesisParams {
-    /// `None` is the store owner, who reviews every agent's memories.
-    pub agent_id: Option<String>,
+    /// The agent that reviews, with what it reaches; `None` is the user, who
+    /// reviews every row.
+    pub reader: Option<Reader>,
     /// `None` reviews the whole store.
     pub project_id: Option<String>,
     pub limit: Option<u32>,
@@ -126,22 +129,29 @@ pub struct Synthesis {
 
 #[derive(Debug, Clone, Copy)]
 struct Scope<'a> {
-    agent: Option<&'a str>,
+    /// The reader's reach as `reader_bind` binds it.
+    reach: Option<&'a str>,
     project: Option<&'a str>,
 }
 
 impl Scope<'_> {
-    /// The `synthesis_review` key of the scope.
+    /// The `synthesis_review` key of the scope: the project's, `''` standing
+    /// for no agent in particular, whoever reviewed it. Rows V10 wrote under
+    /// an agent stay, and nothing reads them.
     fn key(&self) -> (&str, &str) {
-        (self.agent.unwrap_or(""), self.project.unwrap_or(""))
+        ("", self.project.unwrap_or(""))
     }
 
     /// The scope filter, appended to a `WHERE` that already holds one
-    /// condition. Agent and project are bound parameters.
+    /// condition. Reach and project are bound parameters.
     fn push(&self, sql: &mut String, params: &mut Vec<rusqlite::types::Value>) {
-        if let Some(a) = self.agent {
-            sql.push_str(" AND agent_id = ?");
-            params.push(rusqlite::types::Value::Text(a.to_string()));
+        if let Some(reach) = self.reach {
+            sql.push_str(concat!(" AND ", reach_predicate!("agent_id", "?")));
+            // `reach_predicate!` names its parameter four times; an anonymous
+            // `?` is a new parameter each time.
+            for _ in 0..4 {
+                params.push(rusqlite::types::Value::Text(reach.to_string()));
+            }
         }
         if let Some(p) = self.project {
             sql.push_str(" AND project_id = ?");
@@ -239,11 +249,12 @@ pub async fn synthesis_core(
     now: TimestampMs,
 ) -> Result<Synthesis, MemoryError> {
     let limit = params.limit.unwrap_or(DEFAULT_PENDING_LIMIT).clamp(1, MAX_PENDING_LIMIT);
+    let reach = reader_bind(params.reader.as_ref());
     store
         .conn
         .call(move |c| -> rusqlite::Result<Synthesis> {
             let tx = c.transaction()?;
-            let scope = Scope { agent: params.agent_id.as_deref(), project: params.project_id.as_deref() };
+            let scope = Scope { reach: reach.as_deref(), project: params.project_id.as_deref() };
             let to_review = to_review_condition();
             let found = Synthesis {
                 pending: rows(&tx, PENDING, scope, limit)?,
@@ -265,19 +276,20 @@ pub async fn synthesis_core(
         .map_err(backend("synthesis"))
 }
 
-/// How many pending memories of a scope arrived after its last review by the
-/// same agent; every pending memory when the scope was never reviewed.
+/// How many pending memories of a scope that `reader` reaches arrived after
+/// the scope's last review, by any agent; every pending memory when the scope
+/// was never reviewed.
 pub async fn unreviewed_count(
     store: &MemoryStore,
-    agent_id: Option<&str>,
+    reader: Option<&Reader>,
     project_id: Option<&str>,
 ) -> Result<usize, MemoryError> {
-    let agent_id = agent_id.map(str::to_owned);
+    let reach = reader_bind(reader);
     let project_id = project_id.map(str::to_owned);
     store
         .conn
         .call(move |c| -> rusqlite::Result<usize> {
-            let scope = Scope { agent: agent_id.as_deref(), project: project_id.as_deref() };
+            let scope = Scope { reach: reach.as_deref(), project: project_id.as_deref() };
             let after = reviewed_at(c, scope)?;
             count(c, PENDING, scope, after)
         })
@@ -285,23 +297,24 @@ pub async fn unreviewed_count(
         .map_err(backend("unreviewed count"))
 }
 
-/// How many conclusions of a scope lost a source after its last review by the
-/// same agent; every conclusion to review when the scope was never reviewed.
+/// How many conclusions of a scope that `reader` reaches lost a source after
+/// the scope's last review; every conclusion to review when the scope was
+/// never reviewed.
 ///
 /// A deleted source was lost at its `deleted_at`, a replaced one at its
 /// `last_modified_at`, which replacing it writes. A purged source counts only
 /// before the first review: nothing records when it was purged.
 pub async fn conclusions_to_review_count(
     store: &MemoryStore,
-    agent_id: Option<&str>,
+    reader: Option<&Reader>,
     project_id: Option<&str>,
 ) -> Result<usize, MemoryError> {
-    let agent_id = agent_id.map(str::to_owned);
+    let reach = reader_bind(reader);
     let project_id = project_id.map(str::to_owned);
     store
         .conn
         .call(move |c| -> rusqlite::Result<usize> {
-            let scope = Scope { agent: agent_id.as_deref(), project: project_id.as_deref() };
+            let scope = Scope { reach: reach.as_deref(), project: project_id.as_deref() };
             let mut params = Vec::new();
             let mut sql = match reviewed_at(c, scope)? {
                 None => format!("SELECT COUNT(*) FROM memory WHERE {}", to_review_condition()),
@@ -325,26 +338,27 @@ pub async fn conclusions_to_review_count(
 }
 
 /// The ids among `ids` that name a `memory` row not deleted but superseded,
-/// ascending, each with the row that replaced it. With an agent, another
-/// agent's row is left out, as in [`existing_memory_ids`].
+/// ascending, each with the row that replaced it. A row out of `reader`'s
+/// reach is left out, as in [`existing_memory_ids`].
 pub async fn replaced_memory_ids(
     store: &MemoryStore,
     ids: &[i64],
-    agent_id: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<Vec<(i64, Option<i64>)>, MemoryError> {
     let ids = ids.to_vec();
-    let agent_id = agent_id.map(str::to_owned);
+    let reach = reader_bind(reader);
     store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<(i64, Option<i64>)>> {
             use rusqlite::OptionalExtension;
-            let mut stmt = c.prepare_cached(
+            let mut stmt = c.prepare_cached(concat!(
                 "SELECT superseded_by FROM memory WHERE id = ?1 AND deleted_at IS NULL \
-                 AND status = 'superseded' AND (?2 IS NULL OR agent_id = ?2)",
-            )?;
+                 AND status = 'superseded' AND ",
+                reader_predicate!("agent_id", "?2")
+            ))?;
             let mut found = Vec::new();
             for id in ids {
-                if let Some(by) = stmt.query_row(rusqlite::params![id, agent_id], |r| r.get(0)).optional()? {
+                if let Some(by) = stmt.query_row(rusqlite::params![id, reach], |r| r.get(0)).optional()? {
                     found.push((id, by));
                 }
             }
@@ -356,26 +370,26 @@ pub async fn replaced_memory_ids(
         .map_err(backend("source lookup"))
 }
 
-/// The ids among `ids` that name a `memory` row not deleted, ascending. With
-/// an agent, another agent's row counts as missing, like an id that is not
-/// there.
+/// The ids among `ids` that name a `memory` row not deleted, ascending. A row
+/// out of `reader`'s reach counts as missing, like an id that is not there, so
+/// a refusal never confirms a row the policy hides.
 pub async fn existing_memory_ids(
     store: &MemoryStore,
     ids: &[i64],
-    agent_id: Option<&str>,
+    reader: Option<&Reader>,
 ) -> Result<Vec<i64>, MemoryError> {
     let ids = ids.to_vec();
-    let agent_id = agent_id.map(str::to_owned);
+    let reach = reader_bind(reader);
     store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<i64>> {
-            let mut stmt = c.prepare_cached(
-                "SELECT id FROM memory WHERE id = ?1 AND deleted_at IS NULL \
-                 AND (?2 IS NULL OR agent_id = ?2)",
-            )?;
+            let mut stmt = c.prepare_cached(concat!(
+                "SELECT id FROM memory WHERE id = ?1 AND deleted_at IS NULL AND ",
+                reader_predicate!("agent_id", "?2")
+            ))?;
             let mut found = Vec::new();
             for id in ids {
-                if stmt.exists(rusqlite::params![id, agent_id])? {
+                if stmt.exists(rusqlite::params![id, reach])? {
                     found.push(id);
                 }
             }
@@ -390,6 +404,11 @@ pub async fn existing_memory_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::sharing::Reach;
+
+    fn shared(agent: &str) -> Reader {
+        Reader::new(agent, Reach::AllBut(Vec::new()))
+    }
     use crate::memory::admin::{delete_memory_core, MemoryKind};
 
     async fn seed(store: &MemoryStore, project: Option<&str>, content: &str, created_at: i64) -> i64 {
@@ -521,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn another_agents_conclusion_does_not_cover_a_memory() {
+    async fn another_agents_conclusion_covers_a_memory() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mine = seed_as(&store, "a", Some("p"), "mine", 1).await;
         let theirs = seed_as(&store, "b", Some("p"), "their conclusion", 2).await;
@@ -535,11 +554,12 @@ mod tests {
             })
             .await
             .unwrap();
-        let as_a = SynthesisParams { agent_id: Some("a".into()), ..in_project("p") };
+        let as_a = SynthesisParams { reader: Some(shared("a")), ..in_project("p") };
 
         let found = synthesis_core(&store, as_a, TimestampMs::from_unix_millis(10)).await.unwrap();
 
-        assert_eq!(ids(&found.pending), vec![mine], "a conclusion the agent cannot see covers nothing for it");
+        assert!(!ids(&found.pending).contains(&mine), "a conclusion of any author covers its sources");
+        assert_eq!(ids(&found.conclusions), vec![theirs]);
     }
 
     #[tokio::test]
@@ -612,7 +632,8 @@ mod tests {
         let theirs = seed_as(&store, "b", None, "theirs", 4).await;
         supersede(&store, theirs, new, 4).await;
 
-        assert_eq!(replaced_memory_ids(&store, &[new, old, live, theirs], Some("a")).await.unwrap(), vec![(old, Some(new))]);
+        let hidden = Reader::new("a", Reach::AllBut(vec!["b".into()]));
+        assert_eq!(replaced_memory_ids(&store, &[new, old, live, theirs], Some(&hidden)).await.unwrap(), vec![(old, Some(new))]);
         assert_eq!(
             replaced_memory_ids(&store, &[old, theirs], None).await.unwrap(),
             vec![(old, Some(new)), (theirs, Some(new))]
@@ -620,12 +641,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_ids_leave_out_another_agents_rows() {
+    async fn existing_ids_follow_the_readers_reach() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mine = seed_as(&store, "a", None, "mine", 1).await;
         let theirs = seed_as(&store, "b", None, "theirs", 2).await;
 
-        assert_eq!(existing_memory_ids(&store, &[mine, theirs], Some("a")).await.unwrap(), vec![mine]);
+        let shared = Reader::new("a", Reach::AllBut(Vec::new()));
+        let hidden = Reader::new("a", Reach::AllBut(vec!["b".into()]));
+        assert_eq!(existing_memory_ids(&store, &[mine, theirs], Some(&shared)).await.unwrap(), vec![mine, theirs]);
+        assert_eq!(existing_memory_ids(&store, &[mine, theirs], Some(&hidden)).await.unwrap(), vec![mine]);
         assert_eq!(existing_memory_ids(&store, &[mine, theirs], None).await.unwrap(), vec![mine, theirs]);
     }
 
@@ -820,7 +844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn another_agents_conclusion_is_not_to_review() {
+    async fn another_agents_conclusion_is_to_review_unless_hidden() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let theirs = seed_as(&store, "b", Some("p"), "their memory", 1).await;
         let conclusion = seed_as(&store, "b", Some("p"), "their conclusion", 2).await;
@@ -835,32 +859,44 @@ mod tests {
             .await
             .unwrap();
         delete_memory_core(&store, theirs, MemoryKind::Memory, None).await.unwrap();
-        let as_a = SynthesisParams { agent_id: Some("a".into()), ..in_project("p") };
+        let as_a = |reach: Reach| SynthesisParams { reader: Some(Reader::new("a", reach)), ..in_project("p") };
 
-        let found = synthesis_core(&store, as_a, TimestampMs::from_unix_millis(10)).await.unwrap();
+        let found = synthesis_core(&store, as_a(Reach::AllBut(Vec::new())), TimestampMs::from_unix_millis(10)).await.unwrap();
+        assert_eq!(found.to_review.iter().map(|r| r.conclusion.id).collect::<Vec<_>>(), vec![conclusion]);
+        assert_eq!(found.to_review_total, 1);
 
-        assert!(found.to_review.is_empty());
-        assert_eq!(found.to_review_total, 0);
+        let hidden = synthesis_core(&store, as_a(Reach::AllBut(vec!["b".into()])), TimestampMs::from_unix_millis(10)).await.unwrap();
+        assert!(hidden.to_review.is_empty());
+        assert_eq!(hidden.to_review_total, 0);
     }
 
     #[tokio::test]
-    async fn synthesis_stays_with_its_agent() {
+    async fn synthesis_reaches_every_author_of_the_project() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mine = seed_as(&store, "a", Some("p"), "mine", 1).await;
         let theirs = seed_as(&store, "b", Some("p"), "theirs", 2).await;
-        let as_a = SynthesisParams { agent_id: Some("a".into()), ..in_project("p") };
 
+        let as_a = SynthesisParams { reader: Some(shared("a")), ..in_project("p") };
         let found = synthesis_core(&store, as_a, TimestampMs::from_unix_millis(10)).await.unwrap();
-        let owner = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
+        assert_eq!(ids(&found.pending), vec![theirs, mine]);
+        assert_eq!(found.pending_total, 2);
 
-        assert_eq!(ids(&found.pending), vec![mine]);
-        assert_eq!(found.pending_total, 1);
-        assert_eq!(ids(&owner.pending), vec![theirs, mine]);
-        assert_eq!(unreviewed_count(&store, Some("a"), Some("p")).await.unwrap(), 0);
-        assert_eq!(
-            unreviewed_count(&store, Some("b"), Some("p")).await.unwrap(),
-            1,
-            "one agent's review is not another's"
-        );
+        let hiding_b = SynthesisParams { reader: Some(Reader::new("a", Reach::AllBut(vec!["b".into()]))), ..in_project("p") };
+        let found = synthesis_core(&store, hiding_b, TimestampMs::from_unix_millis(10)).await.unwrap();
+        assert_eq!(ids(&found.pending), vec![mine], "a hidden author's memory is not listed");
+    }
+
+    #[tokio::test]
+    async fn a_review_is_the_projects() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        seed_as(&store, "a", Some("p"), "mine", 1).await;
+        seed_as(&store, "b", Some("p"), "theirs", 2).await;
+        assert_eq!(unreviewed_count(&store, Some(&shared("b")), Some("p")).await.unwrap(), 2);
+
+        let as_a = SynthesisParams { reader: Some(shared("a")), ..in_project("p") };
+        synthesis_core(&store, as_a, TimestampMs::from_unix_millis(10)).await.unwrap();
+
+        assert_eq!(unreviewed_count(&store, Some(&shared("a")), Some("p")).await.unwrap(), 0);
+        assert_eq!(unreviewed_count(&store, Some(&shared("b")), Some("p")).await.unwrap(), 0, "one agent's review is the project's");
     }
 }

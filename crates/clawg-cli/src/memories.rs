@@ -7,7 +7,9 @@
 
 use std::fmt::Write as _;
 
+use clawg_core::memory::portability::export::project_id_of;
 use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
 
 use crate::cli::{Filters, ListOpts, MemoriesAction, Scope, SearchOpts};
 use crate::client::{ClientError, Count, DaemonClient, ListArgs, MemoryRow, MemoryStats};
@@ -102,20 +104,28 @@ fn or_dash_num(value: Option<i64>) -> String {
 ///
 /// `limit` and `offset` are what was asked for: a page that came back full
 /// means there may be more, and the footer says where to continue.
-pub fn render_table(rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32) -> String {
+pub fn render_table(lang: Lang, rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32) -> String {
     if rows.is_empty() {
-        return "no memories match".to_string();
+        return match lang {
+            Lang::En => "no memories match",
+            Lang::Es => "ninguna memoria coincide",
+        }
+        .to_string();
     }
-    render_rows(rows, now_ms, limit, offset, Listing::Live)
+    render_rows(lang, rows, now_ms, limit, offset, Listing::Live)
 }
 
 /// The listing of deleted rows: the age column says how long ago each was
 /// deleted, and the footer how to bring one back.
-pub fn render_deleted_table(rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32) -> String {
+pub fn render_deleted_table(lang: Lang, rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32) -> String {
     if rows.is_empty() {
-        return "no deleted memories match".to_string();
+        return match lang {
+            Lang::En => "no deleted memories match",
+            Lang::Es => "ninguna memoria borrada coincide",
+        }
+        .to_string();
     }
-    render_rows(rows, now_ms, limit, offset, Listing::Deleted)
+    render_rows(lang, rows, now_ms, limit, offset, Listing::Deleted)
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +134,7 @@ enum Listing {
     Deleted,
 }
 
-fn render_rows(rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32, listing: Listing) -> String {
+fn render_rows(lang: Lang, rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32, listing: Listing) -> String {
     let mut header = COLUMNS.map(str::to_owned);
     if let Listing::Deleted = listing {
         header[2] = "DELETED".to_owned();
@@ -179,16 +189,25 @@ fn render_rows(rows: &[MemoryRow], now_ms: i64, limit: u32, offset: u32, listing
     }
 
     let shown = rows.len() as u64;
-    let order = match listing {
-        Listing::Live => "newest first",
-        Listing::Deleted => "most recently deleted first",
+    let (count, order) = match (listing, lang) {
+        (Listing::Live, Lang::En) => (plural(shown, "row", "rows"), "newest first"),
+        (Listing::Deleted, Lang::En) => (plural(shown, "row", "rows"), "most recently deleted first"),
+        (Listing::Live, Lang::Es) => (plural(shown, "fila", "filas"), "las más nuevas primero"),
+        (Listing::Deleted, Lang::Es) => (plural(shown, "fila", "filas"), "las borradas más recientemente primero"),
     };
-    let _ = write!(out, "{}, {order}.", plural(shown, "row", "rows"));
+    let _ = write!(out, "{count}, {order}.");
     if shown >= u64::from(limit) {
-        let _ = write!(out, " More: --offset {}", u64::from(offset) + shown);
+        let next = u64::from(offset) + shown;
+        let _ = match lang {
+            Lang::En => write!(out, " More: --offset {next}"),
+            Lang::Es => write!(out, " Más: --offset {next}"),
+        };
     }
     if matches!(listing, Listing::Deleted) && rows.iter().any(|r| r.kind == "memory") {
-        out.push_str(" Undo a memory row with 'clawg undelete <ID>'.");
+        out.push_str(match lang {
+            Lang::En => " Undo a memory row with 'clawg undelete <ID>'.",
+            Lang::Es => " Una fila memory vuelve con 'clawg undelete <ID>'.",
+        });
     }
     out
 }
@@ -252,37 +271,60 @@ pub fn render_detail(row: &MemoryRow, now_ms: i64) -> String {
 }
 
 /// Totals first, then each grouping on one line as `key count | key count`.
-pub fn render_stats(stats: &MemoryStats, now_ms: i64) -> String {
+pub fn render_stats(lang: Lang, stats: &MemoryStats, now_ms: i64) -> String {
     let t = &stats.totals;
     let live = t.memory + t.episodic + t.procedural;
-    let mut out = format!(
-        "{} (memory {}, episodic {}, procedural {}), {} deleted.",
-        plural(live, "live row", "live rows"),
-        t.memory,
-        t.episodic,
-        t.procedural,
-        t.deleted
-    );
+    let mut out = match lang {
+        Lang::En => format!(
+            "{} (memory {}, episodic {}, procedural {}), {} deleted.",
+            plural(live, "live row", "live rows"),
+            t.memory,
+            t.episodic,
+            t.procedural,
+            t.deleted
+        ),
+        Lang::Es => format!(
+            "{} (memory {}, episodic {}, procedural {}), {} {}.",
+            plural(live, "fila viva", "filas vivas"),
+            t.memory,
+            t.episodic,
+            t.procedural,
+            t.deleted,
+            if t.deleted == 1 { "borrada" } else { "borradas" }
+        ),
+    };
     if let Some(newest) = stats.newest_created_at {
-        let _ = write!(out, " Newest {} ago.", format_age(now_ms, newest));
+        let age = format_age(now_ms, newest);
+        let _ = match lang {
+            Lang::En => write!(out, " Newest {age} ago."),
+            Lang::Es => write!(out, " La más nueva, de hace {age}."),
+        };
     }
     out.push('\n');
 
+    let labels = match lang {
+        Lang::En => ["by type:", "by tier:", "by status:", "by agent:", "by project:"],
+        Lang::Es => ["por tipo:", "por tier:", "por estado:", "por agente:", "por proyecto:"],
+    };
+    let none = match lang {
+        Lang::En => "(none)",
+        Lang::Es => "(ninguno)",
+    };
     let sections: [(&str, &[Count]); 5] = [
-        ("by type:", &stats.by_type),
-        ("by tier:", &stats.by_tier),
-        ("by status:", &stats.by_status),
-        ("by agent:", &stats.by_agent),
-        ("by project:", &stats.by_project),
+        (labels[0], &stats.by_type),
+        (labels[1], &stats.by_tier),
+        (labels[2], &stats.by_status),
+        (labels[3], &stats.by_agent),
+        (labels[4], &stats.by_project),
     ];
-    let width = sections.iter().map(|(l, _)| l.len()).max().unwrap_or(0) + 1;
+    let width = sections.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) + 1;
     for (label, counts) in sections {
         let body = if counts.is_empty() {
             "-".to_string()
         } else {
             counts
                 .iter()
-                .map(|c| format!("{} {}", c.key.as_deref().unwrap_or("(none)"), c.count))
+                .map(|c| format!("{} {}", c.key.as_deref().unwrap_or(none), c.count))
                 .collect::<Vec<_>>()
                 .join(" | ")
         };
@@ -316,25 +358,32 @@ pub fn stats_json(stats: &MemoryStats) -> String {
 /// What to tell the user when a read could not be served.
 ///
 /// A viewer never starts a daemon, so "not running" has to say how to start one.
-pub fn explain_unavailable(err: &ClientError, profile: Profile) -> String {
-    match err {
-        ClientError::NotRunning => format!(
-            "no clawg daemon is running for profile {0}; start it with 'clawg serve --profile {0}'",
-            profile.as_str()
+pub fn explain_unavailable(lang: Lang, err: &ClientError, profile: Profile) -> String {
+    let profile = profile.as_str();
+    match (err, lang) {
+        (ClientError::NotRunning, Lang::En) => {
+            format!("no clawg daemon is running for profile {profile}; start it with 'clawg serve --profile {profile}'")
+        }
+        (ClientError::NotRunning, Lang::Es) => format!(
+            "no hay ningún daemon de clawg corriendo para el perfil {profile}; arráncalo con 'clawg serve --profile {profile}'"
         ),
-        other => other.to_string(),
+        (other, _) => other.to_string(),
     }
 }
 
 /// A warning when the daemon answering is not the version of this binary: the
 /// viewer reads columns an older daemon does not send, so its output would be
 /// thinner than it looks.
-pub fn version_warning(daemon_version: &str, cli_version: &str) -> Option<String> {
-    (daemon_version != cli_version).then(|| {
-        format!(
+pub fn version_warning(lang: Lang, daemon_version: &str, cli_version: &str) -> Option<String> {
+    (daemon_version != cli_version).then(|| match lang {
+        Lang::En => format!(
             "warning: the running daemon is version {daemon_version} but this clawg is \
              {cli_version}; run 'clawg stop' so the next start uses this version"
-        )
+        ),
+        Lang::Es => format!(
+            "aviso: el daemon que corre es la versión {daemon_version} pero este clawg es la \
+             {cli_version}; ejecuta 'clawg stop' para que el próximo arranque use esta versión"
+        ),
     })
 }
 
@@ -346,6 +395,7 @@ fn filter_args(filters: &Filters, project: Option<String>) -> ListArgs {
         memory_type: filters.memory_type.clone(),
         agent: filters.scope.agent.clone(),
         project,
+        no_project: filters.no_project,
         status: filters.status.map(|s| s.as_str().to_owned()),
         ..ListArgs::default()
     }
@@ -359,6 +409,7 @@ pub fn list_args(opts: &ListOpts, project: Option<String>) -> ListArgs {
         limit: Some(opts.limit),
         offset: Some(opts.offset),
         deleted: opts.deleted,
+        origin_project: opts.origin_project.clone(),
         ..filter_args(&opts.filters, project)
     }
 }
@@ -374,12 +425,17 @@ pub fn search_args(opts: &SearchOpts, project: Option<String>) -> ListArgs {
     }
 }
 
-fn resolve_project(scope: &Scope) -> Result<Option<String>, ClientError> {
+/// `--here` is the project of the working directory as the store records it,
+/// read without the daemon and without writing: a viewer registers nothing.
+fn resolve_project(client: &DaemonClient, scope: &Scope) -> Result<Option<String>, ClientError> {
     if !scope.here {
         return Ok(scope.project_id(None));
     }
     let cwd = std::env::current_dir().map_err(|e| ClientError::WorkingDir(e.to_string()))?;
-    Ok(scope.project_id(Some(clawg_core::memory::ProjectIdentity::resolve(&cwd).id)))
+    let identity = clawg_core::memory::ProjectIdentity::resolve(&cwd);
+    let remote = clawg_core::memory::identity::origin_key(&identity.root);
+    let recorded = project_id_of(client.base_dir(), &identity.root, remote.as_deref()).unwrap_or(identity.id);
+    Ok(scope.project_id(Some(recorded)))
 }
 
 // ── Running ─────────────────────────────────────────────────────────────────
@@ -390,34 +446,35 @@ fn resolve_project(scope: &Scope) -> Result<Option<String>, ClientError> {
 /// Warns on stderr, rather than failing, when the daemon is a different version
 /// than this binary.
 pub async fn run(
+    lang: Lang,
     client: &DaemonClient,
     action: MemoriesAction,
     now_ms: i64,
 ) -> Result<String, ClientError> {
     let health = client.health().await?;
-    if let Some(warning) = version_warning(&health.version, clawg_core::build_info::version()) {
+    if let Some(warning) = version_warning(lang, &health.version, clawg_core::build_info::version()) {
         eprintln!("{warning}");
     }
 
     match action {
         MemoriesAction::List(opts) => {
-            let args = list_args(&opts, resolve_project(&opts.filters.scope)?);
+            let args = list_args(&opts, resolve_project(client, &opts.filters.scope)?);
             let rows = client.list(args).await?;
             Ok(if opts.json {
                 rows_json(&rows)
             } else if opts.deleted {
-                render_deleted_table(&rows, now_ms, opts.limit, opts.offset)
+                render_deleted_table(lang, &rows, now_ms, opts.limit, opts.offset)
             } else {
-                render_table(&rows, now_ms, opts.limit, opts.offset)
+                render_table(lang, &rows, now_ms, opts.limit, opts.offset)
             })
         }
         MemoriesAction::Search(opts) => {
-            let args = search_args(&opts, resolve_project(&opts.filters.scope)?);
+            let args = search_args(&opts, resolve_project(client, &opts.filters.scope)?);
             let rows = client.list(args).await?;
             Ok(if opts.json {
                 rows_json(&rows)
             } else {
-                render_table(&rows, now_ms, opts.limit, opts.offset)
+                render_table(lang, &rows, now_ms, opts.limit, opts.offset)
             })
         }
         MemoriesAction::Show(opts) => {
@@ -429,14 +486,14 @@ pub async fn run(
             })
         }
         MemoriesAction::Stats(opts) => {
-            let project = resolve_project(&opts.scope)?;
+            let project = resolve_project(client, &opts.scope)?;
             let stats = client
                 .stats(opts.scope.agent.as_deref(), project.as_deref())
                 .await?;
             Ok(if opts.json {
                 stats_json(&stats)
             } else {
-                render_stats(&stats, now_ms)
+                render_stats(lang, &stats, now_ms)
             })
         }
     }
@@ -491,7 +548,7 @@ mod tests {
         let recent = MemoryRow { deleted_at: Some(NOW - 120_000), ..row(7, "memory", "the deploy runs on fridays") };
         let older = MemoryRow { deleted_at: Some(NOW - 3 * 86_400_000), ..row(3, "memory", "tabs in go") };
 
-        let out = render_deleted_table(&[recent, older], NOW, 20, 0);
+        let out = render_deleted_table(Lang::En, &[recent, older], NOW, 20, 0);
 
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("KIND") && lines[0].contains("DELETED"), "{out}");
@@ -499,14 +556,14 @@ mod tests {
         assert!(lines[1].contains(" 2m ") && lines[1].contains("fridays"), "{out}");
         assert!(lines[2].contains(" 3d ") && lines[2].contains("tabs in go"), "{out}");
         assert!(out.ends_with("2 rows, most recently deleted first. Undo a memory row with 'clawg undelete <ID>'."), "{out}");
-        assert_eq!(render_deleted_table(&[], NOW, 20, 0), "no deleted memories match");
+        assert_eq!(render_deleted_table(Lang::En, &[], NOW, 20, 0), "no deleted memories match");
     }
 
     #[test]
     fn deleted_episodes_alone_are_not_offered_an_undelete() {
         let episode = MemoryRow { deleted_at: Some(NOW - 60_000), ..row(4, "episodic", "ran the migration") };
 
-        let out = render_deleted_table(&[episode], NOW, 20, 0);
+        let out = render_deleted_table(Lang::En, &[episode], NOW, 20, 0);
 
         assert!(out.ends_with("1 row, most recently deleted first."), "{out}");
     }
@@ -514,7 +571,7 @@ mod tests {
     #[test]
     fn table_one_line_per_row_plus_header() {
         let rows = [row(2, "memory", "second"), row(1, "memory", "first")];
-        let out = render_table(&rows, NOW, 20, 0);
+        let out = render_table(Lang::En, &rows, NOW, 20, 0);
         let lines: Vec<&str> = out.lines().collect();
 
         assert_eq!(lines.len(), 4, "header, two rows, footer:\n{out}");
@@ -542,7 +599,7 @@ mod tests {
         c.agent_id = Some("plain".into());
         c.memory_type = None;
 
-        let out = render_table(&[a, b, c], NOW, 20, 0);
+        let out = render_table(Lang::En, &[a, b, c], NOW, 20, 0);
         let lines: Vec<&str> = out.lines().collect();
 
         let project = char_col(lines[0], "PROJECT");
@@ -563,7 +620,7 @@ mod tests {
 
     #[test]
     fn table_flattens_newlines() {
-        let out = render_table(
+        let out = render_table(Lang::En, 
             &[row(1, "memory", "line one\nline two\r\nline three")],
             NOW,
             20,
@@ -580,7 +637,7 @@ mod tests {
     #[test]
     fn table_truncates_long_content_by_chars() {
         let long = "é".repeat(100);
-        let out = render_table(&[row(1, "memory", &long)], NOW, 20, 0);
+        let out = render_table(Lang::En, &[row(1, "memory", &long)], NOW, 20, 0);
         let line = out.lines().nth(1).expect("row line");
         let shown = line.rsplit("  ").next().expect("content column");
         assert_eq!(
@@ -601,7 +658,7 @@ mod tests {
             status: "active".into(),
             ..Default::default()
         };
-        let out = render_table(&[bare], NOW, 20, 0);
+        let out = render_table(Lang::En, &[bare], NOW, 20, 0);
         let cells: Vec<&str> = out
             .lines()
             .nth(1)
@@ -619,25 +676,25 @@ mod tests {
 
     #[test]
     fn empty_says_so() {
-        assert_eq!(render_table(&[], NOW, 20, 0), "no memories match");
+        assert_eq!(render_table(Lang::En, &[], NOW, 20, 0), "no memories match");
     }
 
     #[test]
     fn a_full_page_points_at_the_next_one() {
         let rows = [row(5, "memory", "a"), row(4, "memory", "b")];
-        let out = render_table(&rows, NOW, 2, 4);
+        let out = render_table(Lang::En, &rows, NOW, 2, 4);
         assert!(
             out.ends_with("2 rows, newest first. More: --offset 6"),
             "{out}"
         );
 
-        let short = render_table(&rows, NOW, 3, 4);
+        let short = render_table(Lang::En, &rows, NOW, 3, 4);
         assert!(
             !short.contains("More"),
             "a short page is the last one: {short}"
         );
 
-        let one = render_table(&rows[..1], NOW, 20, 0);
+        let one = render_table(Lang::En, &rows[..1], NOW, 20, 0);
         assert!(one.ends_with("1 row, newest first."), "{one}");
     }
 
@@ -814,8 +871,41 @@ mod tests {
     }
 
     #[test]
+    fn the_viewer_speaks_spanish() {
+        assert_eq!(render_table(Lang::Es, &[], NOW, 20, 0), "ninguna memoria coincide");
+        assert_eq!(render_deleted_table(Lang::Es, &[], NOW, 20, 0), "ninguna memoria borrada coincide");
+        let mut gone = row(9, "memory", "bye");
+        gone.deleted_at = Some(NOW - 60_000);
+        let deleted = render_deleted_table(Lang::Es, &[gone], NOW, 1, 0);
+        assert!(deleted.starts_with("KIND"), "the columns are field names: {deleted}");
+        assert!(
+            deleted.ends_with(
+                "1 fila, las borradas más recientemente primero. Más: --offset 1 Una fila memory vuelve con 'clawg undelete <ID>'."
+            ),
+            "{deleted}"
+        );
+        let stats = render_stats(Lang::Es, &sample_stats(), NOW);
+        assert!(
+            stats.starts_with("43 filas vivas (memory 40, episodic 2, procedural 1), 3 borradas. La más nueva, de hace 12s.\n"),
+            "{stats}"
+        );
+        assert!(stats.contains("\npor proyecto: claw-garden-1a2b 25 | (ninguno) 15"), "{stats}");
+        assert_eq!(
+            explain_unavailable(Lang::Es, &ClientError::NotRunning, Profile::Dev),
+            "no hay ningún daemon de clawg corriendo para el perfil dev; arráncalo con 'clawg serve --profile dev'"
+        );
+        assert_eq!(
+            version_warning(Lang::Es, "0.1.0", "0.2.0").as_deref(),
+            Some(
+                "aviso: el daemon que corre es la versión 0.1.0 pero este clawg es la 0.2.0; ejecuta 'clawg stop' para \
+                 que el próximo arranque use esta versión"
+            )
+        );
+    }
+
+    #[test]
     fn stats_renders_sections() {
-        let out = render_stats(&sample_stats(), NOW);
+        let out = render_stats(Lang::En, &sample_stats(), NOW);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[0],
@@ -843,7 +933,7 @@ mod tests {
 
     #[test]
     fn stats_of_an_empty_store_says_so() {
-        let out = render_stats(&MemoryStats::default(), NOW);
+        let out = render_stats(Lang::En, &MemoryStats::default(), NOW);
         assert!(
             out.starts_with("0 live rows (memory 0, episodic 0, procedural 0), 0 deleted."),
             "{out}"
@@ -895,7 +985,7 @@ mod tests {
     #[test]
     fn explain_unavailable_names_profile_and_holder() {
         assert_eq!(
-            explain_unavailable(&ClientError::NotRunning, Profile::Dev),
+            explain_unavailable(Lang::En, &ClientError::NotRunning, Profile::Dev),
             "no clawg daemon is running for profile dev; start it with 'clawg serve --profile dev'"
         );
 
@@ -904,7 +994,7 @@ mod tests {
             pid: 4242,
             started_at_ms: 1,
         });
-        let msg = explain_unavailable(&held, Profile::Dev);
+        let msg = explain_unavailable(Lang::En, &held, Profile::Dev);
         assert_eq!(msg, held.to_string(), "the existing wording is reused");
         assert!(
             msg.contains("evaluation run") && msg.contains("4242"),
@@ -916,18 +1006,18 @@ mod tests {
             message: "no Memory row with id 1".into(),
             details: Default::default(),
         };
-        assert_eq!(explain_unavailable(&other, Profile::Dev), other.to_string());
+        assert_eq!(explain_unavailable(Lang::En, &other, Profile::Dev), other.to_string());
     }
 
     #[test]
     fn version_mismatch_is_reported() {
-        let warning = version_warning("0.1.0", "0.2.0").expect("they differ");
+        let warning = version_warning(Lang::En, "0.1.0", "0.2.0").expect("they differ");
         assert!(
             warning.contains("0.1.0") && warning.contains("0.2.0"),
             "{warning}"
         );
         assert!(warning.contains("clawg stop"), "{warning}");
-        assert_eq!(version_warning("0.2.0", "0.2.0"), None);
+        assert_eq!(version_warning(Lang::En, "0.2.0", "0.2.0"), None);
     }
 
     // ── request building ────────────────────────────────────────────────────
@@ -940,6 +1030,7 @@ mod tests {
             offset: 0,
             json: false,
             deleted: false,
+            origin_project: None,
             profile: ProfileArg { profile: None },
         }
     }
@@ -963,6 +1054,7 @@ mod tests {
                 memory_type: Some("preference".into()),
                 tier: Some(1),
                 status: Some(StatusArg::Superseded),
+                no_project: true,
             },
             limit: 7,
             offset: 14,
@@ -979,6 +1071,7 @@ mod tests {
         assert_eq!(args.memory_type.as_deref(), Some("preference"));
         assert_eq!(args.tier, Some(1));
         assert_eq!(args.status.as_deref(), Some("superseded"));
+        assert!(args.no_project);
         assert_eq!(args.q, None);
         assert_eq!((args.limit, args.offset), (Some(7), Some(14)));
     }
@@ -1022,7 +1115,7 @@ mod tests {
         )
         .await;
 
-        let out = run(&c, MemoriesAction::List(list_opts()), NOW)
+        let out = run(Lang::En, &c, MemoriesAction::List(list_opts()), NOW)
             .await
             .expect("run");
         assert!(out.starts_with("KIND"), "{out}");
@@ -1031,6 +1124,7 @@ mod tests {
         assert!(out.ends_with("1 row, newest first."), "{out}");
 
         let json = run(
+            Lang::En,
             &c,
             MemoriesAction::List(ListOpts {
                 json: true,
@@ -1058,7 +1152,7 @@ mod tests {
             json: false,
             profile: ProfileArg { profile: None },
         };
-        let out = run(&c, MemoriesAction::Search(opts), NOW)
+        let out = run(Lang::En, &c, MemoriesAction::Search(opts), NOW)
             .await
             .expect("run");
         assert!(out.contains("beta note about retry budgets"), "{out}");
@@ -1073,7 +1167,7 @@ mod tests {
             profile: ProfileArg { profile: None },
         };
         assert_eq!(
-            run(&c, MemoriesAction::Search(none), NOW)
+            run(Lang::En, &c, MemoriesAction::Search(none), NOW)
                 .await
                 .expect("run"),
             "no memories match"
@@ -1098,15 +1192,15 @@ mod tests {
             })
         };
 
-        let out = run(&c, show(id, false), NOW).await.expect("run");
+        let out = run(Lang::En, &c, show(id, false), NOW).await.expect("run");
         assert!(out.starts_with(&format!("memory #{id} [active]")), "{out}");
         assert!(out.contains("  show me\n  in full"), "{out}");
 
-        let json = run(&c, show(id, true), NOW).await.expect("run");
+        let json = run(Lang::En, &c, show(id, true), NOW).await.expect("run");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("json");
         assert_eq!(parsed["id"], id);
 
-        match run(&c, show(999_999, false), NOW)
+        match run(Lang::En, &c, show(999_999, false), NOW)
             .await
             .expect_err("no such row")
         {
@@ -1124,7 +1218,7 @@ mod tests {
             json: false,
             profile: ProfileArg { profile: None },
         });
-        let err = run(&c, action, NOW).await.expect_err("nothing is stored");
+        let err = run(Lang::En, &c, action, NOW).await.expect_err("nothing is stored");
         assert!(
             matches!(err, ClientError::Daemon { status: 404, .. }),
             "{err:?}"
@@ -1143,14 +1237,14 @@ mod tests {
                 profile: ProfileArg { profile: None },
             })
         };
-        let out = run(&c, action(false), NOW).await.expect("run");
+        let out = run(Lang::En, &c, action(false), NOW).await.expect("run");
         assert!(
             out.starts_with("1 live row (memory 1, episodic 0, procedural 0), 0 deleted."),
             "{out}"
         );
         assert!(out.contains("agent-s 1"), "{out}");
 
-        let json = run(&c, action(true), NOW).await.expect("run");
+        let json = run(Lang::En, &c, action(true), NOW).await.expect("run");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("json");
         assert_eq!(parsed["totals"]["memory"], 1);
     }

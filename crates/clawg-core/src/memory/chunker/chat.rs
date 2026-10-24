@@ -231,8 +231,38 @@ mod tests {
         let chunker = ChatChunker::with_fallback();
         let content = format!("Notes on clawg-ledger, the crate that settles balances. {}", "word ".repeat(1200));
         let head = chunker.split_save(&content).head.expect("a long text has a head");
-        assert_eq!(head, content[..48 * 4]);
+        assert_eq!(head, content[..SAVE_HEAD_TOKENS * 4]);
         assert!(head.contains("clawg-ledger"));
+    }
+
+    #[test]
+    fn the_head_ends_at_a_word_boundary() {
+        use crate::memory::chunker::token_splitter::tests::{subword_tokenizer, subword_words};
+        // Words of two and three tokens in turn: 480 of them are 1200 tokens,
+        // and the first k of them hold 5 * (k / 2) + 2 * (k % 2).
+        let words = subword_words(480);
+        let content = words.join(" ");
+        let tok = subword_tokenizer();
+        assert_eq!(tok.encode(content.as_str(), false).expect("the fixture encodes").len(), 1200);
+        let tokens_of = |k: usize| 5 * (k / 2) + 2 * (k % 2);
+        let whole = (0..words.len()).take_while(|&k| tokens_of(k) <= SAVE_HEAD_TOKENS).last().unwrap();
+
+        let head = ChatChunker::with_tokenizer(tok.clone()).split_save(&content).head.expect("a long text has a head");
+        assert_eq!(head, words[..whole].join(" "), "the head stops before the word it would cut");
+        assert!(TokenSplitter::with_tokenizer(tok).count(&head) <= SAVE_HEAD_TOKENS);
+    }
+
+    #[test]
+    fn no_piece_of_a_long_save_starts_inside_a_word() {
+        use crate::memory::chunker::token_splitter::tests::{assert_cut_at_word_boundaries, subword_tokenizer, subword_words};
+        let content = subword_words(480).join(" ");
+        let tok = subword_tokenizer();
+        let split = ChatChunker::with_tokenizer(tok.clone()).split_save(&content);
+        let pieces: Vec<&str> = split.pieces.iter().map(|c| c.text.as_str()).collect();
+        assert!(pieces.len() > 10, "a long save, {} pieces", pieces.len());
+        assert_cut_at_word_boundaries(&content, &pieces);
+        let splitter = TokenSplitter::with_tokenizer(tok);
+        assert!(pieces.iter().all(|p| splitter.count(p) <= PIECE_MAX_TOKENS), "a piece passed the cap");
     }
 
     #[test]

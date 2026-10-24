@@ -1,0 +1,15 @@
+change: import-linear
+objective: "1"
+depends_on: []
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # la única decisión con alternativas, el índice, está en la exploración (enfoques A y B) y en la propuesta
+  tasks: done
+  apply: done
+  verify: done  # Windows, el banco, la importación real en el perfil dev y el CI de Linux y Windows
+  archive: done
+updated: 2026-10-24
+main_spec: openspec/specs/portability/spec.md, openspec/specs/storage/spec.md

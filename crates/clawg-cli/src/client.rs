@@ -22,10 +22,12 @@ use std::time::Duration;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
-use clawg_core::memory::portability::ImportReport;
+use clawg_core::memory::portability::{ImportReport, UndoReport};
+use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
 use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
+use clawg_core::preferences::Lang;
 use clawg_core::private_dir::ensure_private_dir;
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +81,14 @@ pub enum ClientError {
     StoreHeld(StoreOwner),
     #[error(transparent)]
     DataDir(#[from] PathsError),
+}
+
+impl ClientError {
+    /// A daemon from before assigned ids refusing a root whose id belongs to
+    /// another root: reading or writing under it would mix two projects.
+    pub fn is_root_collision(&self) -> bool {
+        matches!(self, ClientError::Daemon { status: 409, message, .. } if message == "project_root_collision")
+    }
 }
 
 /// The parts of a daemon error body beyond its `error` code, kept so a caller
@@ -159,6 +169,19 @@ pub struct Found {
     /// count does not send it; its cut always left two hits standing.
     #[serde(default)]
     pub withheld: usize,
+    /// Live saves of the searched scope in the other language, when the
+    /// search named its own. A daemon that predates it never sends it.
+    #[serde(default)]
+    pub other_language: Option<OtherLanguage>,
+}
+
+/// How many memories a search in one language is likely to miss for being
+/// in the other. `lang` stays text, so a language this bridge does not know
+/// leaves the answer readable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OtherLanguage {
+    pub lang: String,
+    pub memories: usize,
 }
 
 /// One retrieval hit, as much of it as a caller formats.
@@ -290,6 +313,9 @@ pub struct Context {
     /// the field omits it, and then nothing can be said either way.
     #[serde(default)]
     pub retrieval: Option<Retrieval>,
+    /// As in [`Found`], for a context asked with a query and a language.
+    #[serde(default)]
+    pub other_language: Option<OtherLanguage>,
 }
 
 /// Whether `POST /v1/context` searched memories, and if not, why.
@@ -444,6 +470,13 @@ pub struct Updated {
     /// Only `memory` rows have one.
     pub memory_type: Option<String>,
     pub tier: i64,
+    /// The project the row is in after the change; a daemon that predates
+    /// moves sends none.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// The other rows of its save or topic history that moved with it.
+    #[serde(default)]
+    pub pulled_in: Vec<i64>,
 }
 
 /// A failed save taken back to pending. `queued` is false when the daemon's
@@ -528,6 +561,11 @@ struct UpdateBody<'a> {
     importance: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory_type: Option<&'a str>,
+    /// Left out when absent, like `user_answered`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    no_project: bool,
     /// Left out when false: a daemon that predates the field refuses any
     /// field it does not know.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -543,13 +581,16 @@ pub enum SaveOutcome {
     /// that predates the pair table sends none. `replaced` names the rows of
     /// the save's topic key it superseded, and `key_dropped` says the save
     /// named a key the daemon did not echo: one that predates topic keys
-    /// stored it as a new memory and replaced nothing.
+    /// stored it as a new memory and replaced nothing. `revision_candidate`
+    /// is the row of `related` a save without a key most likely revises; a
+    /// daemon that predates it sends none.
     Saved {
         memories: Vec<SavedMemory>,
         redacted: Vec<String>,
         related: Vec<RelatedMemory>,
         replaced: Vec<ReplacedMemory>,
         key_dropped: bool,
+        revision_candidate: Option<i64>,
     },
     /// Accepted but not confirmed; `reason` says why (`"unconfirmed"`,
     /// `"embedder_loading"`, `"already_queued"`, `"partially_saved"`), and
@@ -565,6 +606,11 @@ pub struct SearchArgs {
     pub agent_id: String,
     pub project_id: Option<String>,
     pub limit: Option<usize>,
+    /// The language the query is in; the answer then counts the memories in
+    /// the other one. Left out without it, as a daemon that predates it
+    /// expects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<Lang>,
 }
 
 /// The body of `POST /v1/search`: the caller's arguments plus the bridge's
@@ -586,11 +632,15 @@ fn search_request(args: &SearchArgs) -> SearchRequest<'_> {
 
 #[derive(Debug, Clone, Default)]
 pub struct ListArgs {
+    /// The agent the listing is for: the daemon lists what it reaches.
+    pub reader: Option<String>,
     pub kind: Option<String>,
     pub tier: Option<i64>,
     pub memory_type: Option<String>,
     pub agent: Option<String>,
     pub project: Option<String>,
+    /// Lists only the rows saved in no project.
+    pub no_project: bool,
     pub status: Option<String>,
     /// Free text over memory content; the daemon then lists `memory` rows only.
     pub q: Option<String>,
@@ -598,11 +648,47 @@ pub struct ListArgs {
     pub offset: Option<u32>,
     /// Lists the deleted rows instead of the live ones.
     pub deleted: bool,
+    /// Only the rows that came from this project of another tool.
+    pub origin_project: Option<String>,
 }
 
-/// The query of a scoped change: no pair at all when unscoped, because
-/// `?agent=` would reach the daemon as a scope to the empty agent.
-fn owner_query(agent: Option<&str>) -> Vec<(&'static str, &str)> {
+/// A batch move as `POST /v1/memories/move` takes it: a selection and one
+/// target, or a move to undo. Unset fields are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MoveRequest {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_project: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_none: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_project: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub include_deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_project: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub to_none: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+}
+
+/// The query of a call by id an agent makes: no pair at all for the user's
+/// own call, because `?agent=` would reach the daemon as the empty agent.
+fn reader_query(agent: Option<&str>) -> Vec<(&'static str, &str)> {
     agent.map(|a| ("agent", a)).into_iter().collect()
 }
 
@@ -714,6 +800,17 @@ fn classify_transport(is_connect: bool, is_timeout: bool, detail: String) -> Cli
 
 fn map_transport(e: reqwest::Error) -> ClientError {
     classify_transport(e.is_connect(), e.is_timeout(), e.to_string())
+}
+
+/// The ids `POST /v1/projects` gives a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registered {
+    /// Where its memories are read and written.
+    pub project_id: String,
+    /// Its own id, which its docs index uses.
+    pub root_id: String,
+    /// Rows the registration joined into the project.
+    pub rekeyed: usize,
 }
 
 /// A handle on one daemon: its address, its token, and a reusable HTTP client.
@@ -915,6 +1012,8 @@ impl DaemonClient {
             #[serde(default)]
             replaced: Vec<ReplacedMemory>,
             #[serde(default)]
+            revision_candidate: Option<i64>,
+            #[serde(default)]
             topic_key: Option<String>,
             #[serde(default)]
             operation_id: Option<String>,
@@ -931,6 +1030,7 @@ impl DaemonClient {
                 related: body.related,
                 replaced: body.replaced,
                 key_dropped: keyed && body.topic_key.is_none(),
+                revision_candidate: body.revision_candidate,
             },
             _ => SaveOutcome::Queued {
                 reason: body.reason,
@@ -948,13 +1048,15 @@ impl DaemonClient {
         read_response(answer)
     }
 
-    /// `budget: None` leaves the size to the daemon's default.
+    /// `budget: None` leaves the size to the daemon's default; `lang` is as
+    /// in [`SearchArgs`].
     pub async fn context(
         &self,
         query: &str,
         agent_id: &str,
         project_id: Option<&str>,
         budget: Option<usize>,
+        lang: Option<Lang>,
     ) -> Result<Context, ClientError> {
         let mut body = serde_json::json!({
             "query": query,
@@ -964,19 +1066,27 @@ impl DaemonClient {
         if let Some(budget) = budget {
             body["budget"] = budget.into();
         }
+        if let Some(lang) = lang {
+            body["lang"] = lang.as_str().into();
+        }
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/context").json(&body)?).await?;
         read_response(answer)
     }
 
     /// The context without a query: the workspace and the newest saves, as
-    /// a session starts. A daemon that predates it refuses the request.
+    /// a session starts, its notes in `lang`. A daemon that predates it
+    /// refuses the request.
     pub async fn recent_context(
         &self,
         agent_id: &str,
         project_id: Option<&str>,
         budget: usize,
+        lang: Option<Lang>,
     ) -> Result<Context, ClientError> {
-        let body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "budget": budget });
+        let mut body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "budget": budget });
+        if let Some(lang) = lang {
+            body["lang"] = lang.as_str().into();
+        }
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/context").json(&body)?).await?;
         read_response(answer)
     }
@@ -1022,6 +1132,9 @@ impl DaemonClient {
         // no query parameter at all — `?kind=` would reach the daemon as an
         // empty string and fail the kind parse.
         let mut query: Vec<(&'static str, String)> = Vec::new();
+        if let Some(r) = &args.reader {
+            query.push(("reader", r.clone()));
+        }
         if let Some(k) = &args.kind {
             query.push(("kind", k.clone()));
         }
@@ -1037,6 +1150,9 @@ impl DaemonClient {
         if let Some(p) = &args.project {
             query.push(("project", p.clone()));
         }
+        if args.no_project {
+            query.push(("no_project", "true".into()));
+        }
         if let Some(s) = &args.status {
             query.push(("status", s.clone()));
         }
@@ -1051,6 +1167,9 @@ impl DaemonClient {
         }
         if args.deleted {
             query.push(("deleted", "true".into()));
+        }
+        if let Some(o) = &args.origin_project {
+            query.push(("origin_project", o.clone()));
         }
 
         let answer = self.send(Call::new(reqwest::Method::GET, "/v1/memories").query(query)).await?;
@@ -1071,7 +1190,7 @@ impl DaemonClient {
     /// The save `id` belongs to. `agent` scopes it to that agent's rows:
     /// another agent's row is the daemon's 404, like a missing one.
     pub async fn read_save(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<SavedText, ClientError> {
-        let call = Call::new(reqwest::Method::GET, format!("/v1/memories/{kind}/{id}/save")).query(owner_query(agent));
+        let call = Call::new(reqwest::Method::GET, format!("/v1/memories/{kind}/{id}/save")).query(reader_query(agent));
         read_response(self.send(call).await?)
     }
 
@@ -1091,27 +1210,42 @@ impl DaemonClient {
         read_response(self.send(Call::new(reqwest::Method::GET, "/v1/stats").query(query)).await?)
     }
 
-    /// Changes a row's importance, type or both; the daemon refuses an empty
-    /// or invalid change. `agent` scopes the change to that agent's rows;
-    /// another agent's row comes back as not found.
+    /// Changes a row's importance, type or project; the daemon refuses an
+    /// empty or invalid change. `project` moves the row's save, `Some(None)`
+    /// out of every project. `agent` names the agent the change is for; a row
+    /// out of its reach comes back as not found.
     pub async fn update(
         &self,
         kind: &str,
         id: i64,
         importance: Option<f64>,
         memory_type: Option<&str>,
+        project: Option<Option<&str>>,
         user_answered: bool,
         agent: Option<&str>,
     ) -> Result<Updated, ClientError> {
+        let body = UpdateBody {
+            importance,
+            memory_type,
+            project_id: project.flatten(),
+            no_project: project == Some(None),
+            user_answered,
+        };
         let call = Call::new(reqwest::Method::PATCH, format!("/v1/memories/{kind}/{id}"))
-            .query(owner_query(agent))
-            .json(&UpdateBody { importance, memory_type, user_answered })?;
+            .query(reader_query(agent))
+            .json(&body)?;
+        read_response(self.send(call).await?)
+    }
+
+    /// Moves memories between projects, or undoes a move, as the user.
+    pub async fn move_memories(&self, request: &MoveRequest) -> Result<MoveReport, ClientError> {
+        let call = Call::new(reqwest::Method::POST, "/v1/memories/move").json(request)?;
         read_response(self.send(call).await?)
     }
 
     /// `agent` scopes the delete as in [`DaemonClient::update`].
     pub async fn delete(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<Deleted, ClientError> {
-        let call = Call::new(reqwest::Method::DELETE, format!("/v1/memories/{kind}/{id}")).query(owner_query(agent));
+        let call = Call::new(reqwest::Method::DELETE, format!("/v1/memories/{kind}/{id}")).query(reader_query(agent));
         read_response(self.send(call).await?)
     }
 
@@ -1119,7 +1253,7 @@ impl DaemonClient {
     /// [`DaemonClient::update`].
     pub async fn restore(&self, kind: &str, id: i64, agent: Option<&str>) -> Result<Restored, ClientError> {
         let call =
-            Call::new(reqwest::Method::POST, format!("/v1/memories/{kind}/{id}/restore")).query(owner_query(agent));
+            Call::new(reqwest::Method::POST, format!("/v1/memories/{kind}/{id}/restore")).query(reader_query(agent));
         read_response(self.send(call).await?)
     }
 
@@ -1157,8 +1291,11 @@ impl DaemonClient {
 
     /// The pairs `agent` has not judged yet. A daemon that predates the pair
     /// table answers a bare 404.
-    pub async fn open_disputes(&self, agent: &str) -> Result<OpenPairs, ClientError> {
-        let call = Call::new(reqwest::Method::GET, "/v1/disputes").query([("agent_id", agent)]);
+    /// The open pairs `agent` judges, in `project_id` when one is given.
+    pub async fn open_disputes(&self, agent: &str, project_id: Option<&str>) -> Result<OpenPairs, ClientError> {
+        let mut query = vec![("agent_id", agent)];
+        query.extend(project_id.map(|p| ("project_id", p)));
+        let call = Call::new(reqwest::Method::GET, "/v1/disputes").query(query);
         read_response(self.send(call).await?)
     }
 
@@ -1172,41 +1309,58 @@ impl DaemonClient {
         Ok(read_response::<Body>(answer)?.path)
     }
 
-    /// Imports the export `text`. `map_roots` pairs an exported root with
-    /// the root it has here, already resolved.
+    /// Imports the export `text` of the tool `from` (`clawg`, `engram`).
+    /// `map_roots` pairs an exported root with the root it has here, and
+    /// `project_map` a project name of another tool with one, both already
+    /// resolved.
     pub async fn import(
         &self,
         text: &str,
+        from: &str,
         dry_run: bool,
         agent: Option<&str>,
         map_roots: &[(String, String)],
+        project_map: &[(String, String)],
     ) -> Result<ImportReport, ClientError> {
-        let body = serde_json::json!({ "text": text, "dry_run": dry_run, "agent": agent, "map_roots": map_roots });
+        let body = serde_json::json!({
+            "text": text, "from": from, "dry_run": dry_run, "agent": agent,
+            "map_roots": map_roots, "project_map": project_map,
+        });
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/import").json(&body)?).await?)
     }
 
-    /// Records `root` as a project and moves rows saved under `legacy_ids`
-    /// onto it, letting the daemon read its files when `index_docs`. Returns
-    /// the id the daemon derived and how many rows moved.
+    /// Takes import `import_id` back, or says what that would do.
+    pub async fn undo_import(&self, import_id: i64, dry_run: bool) -> Result<UndoReport, ClientError> {
+        let body = serde_json::json!({ "import_id": import_id, "dry_run": dry_run });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/import/undo").json(&body)?).await?)
+    }
+
+    /// Records `root` as a project and joins into its project the rows saved
+    /// under `legacy_ids`, letting the daemon read its files when
+    /// `index_docs`. Returns the ids the daemon gave the root.
     pub async fn register_project(
         &self,
         root: &std::path::Path,
         legacy_ids: &[String],
         index_docs: bool,
-    ) -> Result<(String, usize), ClientError> {
+    ) -> Result<Registered, ClientError> {
         #[derive(Deserialize)]
         struct Body {
             project_id: String,
+            root_id: Option<String>,
             rekeyed: usize,
         }
         let body = serde_json::json!({
             "root_path": root.to_string_lossy(),
             "legacy_ids": legacy_ids,
             "index_docs": index_docs,
+            "assigned": true,
         });
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/projects").json(&body)?).await?;
         let body = read_response::<Body>(answer)?;
-        Ok((body.project_id, body.rekeyed))
+        // A daemon from before assigned ids keeps one id per root.
+        let root_id = body.root_id.unwrap_or_else(|| body.project_id.clone());
+        Ok(Registered { project_id: body.project_id, root_id, rekeyed: body.rekeyed })
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {
@@ -1272,14 +1426,12 @@ pub fn spawn_serve_at(
 
     // Both streams go to one appended log file. Appending, not truncating:
     // a daemon that died is exactly when the previous run's tail matters.
+    // Only a log past its limit is moved aside, whole.
     let log_dir = base_dir.join("logs");
     ensure_private_dir(&log_dir)
         .map_err(|e| ClientError::Spawn(format!("cannot create {}: {e}", log_dir.display())))?;
     let log_path = log_dir.join("serve.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
+    let log = crate::serve_log::open(&log_path)
         .map_err(|e| ClientError::Spawn(format!("cannot open {}: {e}", log_path.display())))?;
     let log_err = log
         .try_clone()
@@ -1480,6 +1632,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_search_answer_without_other_language_still_parses() {
+        let old: Found = serde_json::from_str(r#"{"hits":[],"withheld":0}"#).expect("a daemon that never said");
+        assert_eq!(old.other_language, None);
+        let old: Context = serde_json::from_str(r#"{"prompt":""}"#).expect("a daemon that never said");
+        assert_eq!(old.other_language, None);
+        let new: Found = serde_json::from_str(r#"{"hits":[],"other_language":{"lang":"en","memories":3}}"#).unwrap();
+        assert_eq!(new.other_language, Some(OtherLanguage { lang: "en".into(), memories: 3 }));
+        let newer: Found = serde_json::from_str(r#"{"hits":[],"other_language":{"lang":"fr","memories":3}}"#)
+            .expect("a language this bridge does not know still parses");
+        assert_eq!(newer.other_language.map(|o| o.lang), Some("fr".to_string()));
+    }
+
+    #[test]
+    fn a_search_names_its_language_only_when_it_has_one() {
+        let args = |lang| SearchArgs { query: "q".into(), agent_id: "a".into(), project_id: None, limit: None, lang };
+        let without = serde_json::to_value(search_request(&args(None))).unwrap();
+        assert!(without.get("lang").is_none(), "{without}");
+        let with = serde_json::to_value(search_request(&args(Some(Lang::Es)))).unwrap();
+        assert_eq!(with["lang"], "es", "{with}");
+    }
+
+    #[test]
     fn a_searched_context_without_counts_still_parses() {
         let old: Context =
             serde_json::from_str(r#"{"prompt":"","unreviewed":0,"retrieval":{"state":"searched"}}"#).expect("parses");
@@ -1534,6 +1708,7 @@ pub(crate) mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            metrics: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1772,6 +1947,7 @@ pub(crate) mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            metrics: Default::default(),
         });
         let listener = crate::daemon::socket::bind_socket(&dir.join("clawg.sock")).expect("bind the socket");
         tokio::spawn(async move {
@@ -1797,6 +1973,7 @@ pub(crate) mod tests {
             agent_id: "agent-socket".into(),
             project_id: None,
             limit: Some(5),
+            lang: None,
         })
         .await
         .expect("a call with a body");
@@ -1933,20 +2110,21 @@ pub(crate) mod tests {
                 agent_id: "agent-client".into(),
                 project_id: None,
                 limit: Some(5),
+                lang: None,
             })
             .await
             .expect("search")
             .hits;
         assert!(hits.iter().any(|h| h.id == id), "the saved row must be retrievable");
 
-        let context = c.context(content, "agent-client", None, None).await.expect("context");
+        let context = c.context(content, "agent-client", None, None, None).await.expect("context");
         assert_eq!(context.unreviewed, 1, "the one saved memory has not been reviewed yet");
 
         let synthesis = c.synthesis(&SynthesisArgs::default()).await.expect("synthesis");
         assert_eq!(synthesis.pending.iter().map(|r| r.id).collect::<Vec<_>>(), vec![id]);
         assert_eq!(synthesis.pending_total, 1);
 
-        assert_eq!(c.update("memory", id, Some(9.5), None, false, None).await.expect("patch").tier, 1);
+        assert_eq!(c.update("memory", id, Some(9.5), None, None, false, None).await.expect("patch").tier, 1);
         assert_eq!(c.delete("memory", id, None).await.expect("delete").deleted, 1);
     }
 
@@ -1957,6 +2135,7 @@ pub(crate) mod tests {
             agent_id: "a".into(),
             project_id: None,
             limit: Some(5),
+            lang: None,
         };
         let body = serde_json::to_value(search_request(&args)).expect("serializes");
         assert_eq!(body["min_relative_score"], serde_json::json!(crate::relevance::RELEVANCE_RATIO));
@@ -2028,7 +2207,8 @@ pub(crate) mod tests {
             second,
             SaveOutcome::Saved {
                 memories: vec![SavedMemory { kind: "memory".into(), id: memories[0].id, outcome: "reinforced".into() }],
-                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false
+                redacted: vec![], related: vec![], replaced: vec![], key_dropped: false,
+                revision_candidate: None
             }
         );
     }

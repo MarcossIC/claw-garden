@@ -17,6 +17,7 @@ use std::path::Path;
 
 use clawg_core::build_info;
 use clawg_core::paths::{data_dir, PathsError, Profile};
+use clawg_core::preferences::{language_in, Lang};
 
 use crate::client::{probe_running, ClientError, Probe};
 use crate::daemon::lifecycle::read_state;
@@ -79,10 +80,12 @@ pub fn exit_code(outcome: &CheckOutcome) -> u8 {
     }
 }
 
-pub fn report(installed: Version, outcome: &CheckOutcome) -> String {
-    match outcome {
-        CheckOutcome::UpToDate => format!("clawg {installed} is up to date"),
-        CheckOutcome::Available(newer) => format!("clawg {newer} is available (installed: {installed})"),
+pub fn report(lang: Lang, installed: Version, outcome: &CheckOutcome) -> String {
+    match (outcome, lang) {
+        (CheckOutcome::UpToDate, Lang::En) => format!("clawg {installed} is up to date"),
+        (CheckOutcome::UpToDate, Lang::Es) => format!("clawg {installed} está al día"),
+        (CheckOutcome::Available(newer), Lang::En) => format!("clawg {newer} is available (installed: {installed})"),
+        (CheckOutcome::Available(newer), Lang::Es) => format!("clawg {newer} está disponible (instalado: {installed})"),
     }
 }
 
@@ -105,6 +108,7 @@ pub async fn run(check: bool, profile: Profile) -> Result<(String, u8), UpdateEr
     // Held until the function returns. `--check` changes nothing, so it does
     // not wait for anyone and nobody waits for it.
     let base_dir = data_dir(profile)?;
+    let lang = language_in(&base_dir).unwrap_or(Lang::En);
     let _lock = if check { None } else { Some(UpdateLock::acquire(&base_dir)?) };
 
     let client = ReleaseClient::for_this_build();
@@ -112,16 +116,16 @@ pub async fn run(check: bool, profile: Profile) -> Result<(String, u8), UpdateEr
     let newest = choose(&listing)?;
     let found = outcome(installed, newest.as_ref());
     if check {
-        return Ok((report(installed, &found), exit_code(&found)));
+        return Ok((report(lang, installed, &found), exit_code(&found)));
     }
     let CheckOutcome::Available(_) = found else {
-        return Ok((report(installed, &found), EXIT_UP_TO_DATE));
+        return Ok((report(lang, installed, &found), EXIT_UP_TO_DATE));
     };
     let release = newest.expect("an available update comes from a release");
 
     let old = running_daemon(&base_dir).await?;
     remove_leftovers(&exe);
-    let installation = install(&exe, &base_dir, profile, installed, release, triple, client, old).await?;
+    let installation = install(lang, &exe, &base_dir, profile, installed, release, triple, client, old).await?;
     Ok((installation, EXIT_UP_TO_DATE))
 }
 
@@ -163,6 +167,7 @@ fn now_ms() -> i64 {
 }
 
 async fn install(
+    lang: Lang,
     exe: &Path,
     base_dir: &Path,
     profile: Profile,
@@ -190,7 +195,7 @@ async fn install(
     let mut installation = Installation::new(paths, profile, candidate, installed, old);
 
     match apply(&steps, &mut installation).await {
-        Outcome::Updated => Ok(report::success(&Updated {
+        Outcome::Updated => Ok(report::success(lang, &Updated {
             from: installed,
             to,
             aside: installation.set_aside_at().map(Path::to_path_buf).unwrap_or_default(),
@@ -208,7 +213,7 @@ async fn install(
                 had_daemon,
                 answering: installation.answering().await,
             };
-            Err(UpdateError::Failed(report::failure(&failure, &context)))
+            Err(UpdateError::Failed(report::failure(lang, &failure, &context)))
         }
     }
 }
@@ -247,9 +252,14 @@ mod check_outcome_cases {
     fn the_report_names_the_versions() {
         let installed = version("0.18.0");
 
-        assert_eq!(report(installed, &CheckOutcome::UpToDate), "clawg 0.18.0 is up to date");
+        assert_eq!(report(Lang::En, installed, &CheckOutcome::UpToDate), "clawg 0.18.0 is up to date");
+        assert_eq!(report(Lang::Es, installed, &CheckOutcome::UpToDate), "clawg 0.18.0 está al día");
         assert_eq!(
-            report(installed, &CheckOutcome::Available(version("0.19.0"))),
+            report(Lang::Es, installed, &CheckOutcome::Available(version("0.19.0"))),
+            "clawg 0.19.0 está disponible (instalado: 0.18.0)"
+        );
+        assert_eq!(
+            report(Lang::En, installed, &CheckOutcome::Available(version("0.19.0"))),
             "clawg 0.19.0 is available (installed: 0.18.0)"
         );
     }
