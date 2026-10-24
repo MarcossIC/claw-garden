@@ -1,14 +1,15 @@
 change: import-decision-pass
 objective: "1"
 depends_on: [import-linear]
-phase: explore
+phase: verify
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # las alternativas están en la exploración (A, B, C) y lo elegido en la propuesta
+  tasks: done
+  apply: done
+  verify: in_progress  # Linux hecho; faltan Windows, el CI y la importación real en el perfil dev (con autorización)
   archive: pending
-updated: 2026-10-23
+updated: 2026-10-24
+main_spec: openspec/specs/portability/spec.md
