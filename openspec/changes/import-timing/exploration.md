@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 (guardar memorias de forma eficiente) | S | — (antes del import en prod); se coordina con import-undo, import-job, pipeline-metrics y embed-throughput | exploración (borrador) |
+| 1 (guardar memorias de forma eficiente) | S | — (antes del import en prod); se coordina con import-undo, import-job, pipeline-metrics y embed-throughput | propuesta |
 
 **Tesis:** sabemos cuánto tarda una importación entera, pero no en qué se va ese tiempo. Las fases de las tres mediciones reales (51 min, 1.218 s y 1.362 s) se infirieron desde fuera, con una sonda cada 20-50 s, el total del dry run y la hora del snapshot `pre-import`. Por eso la diferencia de 144 s entre import-linear e import-decision-pass sólo pudo atribuirse a «embedding y escritura». El cambio hace que la importación registre en el log, al terminar cada fase, cuánto duró, cuántas filas y llamadas procesó y, en las fases que usan la conexión, cuánto de ese tiempo fue SQLite y cuánto espera en la cola. Va antes del import en prod porque esa corrida es la primera con un binario release (un build debug rechaza `prod`) y la única a escala completa. Sin esto, sus tiempos por fase se pierden.
 

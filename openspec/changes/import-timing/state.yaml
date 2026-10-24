@@ -1,14 +1,15 @@
 change: import-timing
 objective: "1"
 depends_on: []
-phase: explore
+phase: verify
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: skipped  # las alternativas están en la exploración (A, B, C, D) y lo elegido en la propuesta
+  tasks: done
+  apply: done
+  verify: in_progress  # Linux hecho; faltan el CI y la importación real en el perfil dev
   archive: pending
 updated: 2026-10-24
+main_spec: openspec/specs/portability/spec.md
