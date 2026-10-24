@@ -9,7 +9,7 @@ Suma requisitos a [`specs/portability`](../../specs/portability/spec.md) (HI2 y 
 - **Origen de una nota:** la fuente y el id estable de la nota en ella, escrito en `created_by_ref` como `engram:<sync_id>`; sin `sync_id`, `engram:observation:<id>` o `engram:prompt:<id>`; el resumen de una sesión, `engram:session:<id>`.
 - **Grupo de origen:** el proyecto y el scope que la nota tenía en la fuente (`personal` o no), y «sin proyecto» como un grupo más.
 - **Fecha del texto:** `updated_at` de la nota, o `created_at` sin él; en UTC.
-- **Destino de una nota:** el id que `derive_project_id` da a la raíz que el mapa le asigna a su proyecto de la fuente, o «sin proyecto».
+- **Destino de una nota:** el id de proyecto que un registro le daría a la raíz que el mapa le asigna a su proyecto de la fuente (R15 y R16 de [`specs/project`](../../specs/project/spec.md), como a una raíz de `--map-root`), o «sin proyecto». Dos clones de un remoto son un mismo destino.
 - **Fila viva:** `deleted_at IS NULL` y `status IN ('active', 'disputed')`.
 - **Fila protegida:** `memory_type` `user_preference` o `architectural_decision` ([`specs/disputes`](../../specs/disputes/spec.md)).
 
@@ -98,31 +98,41 @@ El texto de una nota MUST enmascararse entero (`redact`) antes de partirlo, y MU
 
 ## HI7. Autor, proyecto y origen
 
-Cada fila importada de una fuente MUST tener `scope = 'agent'`, `agent_id` `migrated` (o el de `--agent`), `source = 'import'`, `created_by_type` `user` para un prompt y `agent` para lo demás, su origen en `created_by_ref`, el nombre de su proyecto en la fuente en `origin_project` (NULL sin proyecto), y la sesión de la fuente en `source_session_id` cuando es de 1 a 128 caracteres ASCII visibles (otra se reporta). Su `project_id` MUST ser su destino: el de su nombre en el mapa; sin proyecto si el nombre no está en el mapa, si la nota no tiene proyecto o si es `personal`. Cada raíz del mapa MUST registrarse en `project` sin `index_docs`; si su id ya pertenece a otra raíz, las notas de ese nombre MUST reportarse y no importarse.
+Cada fila importada de una fuente MUST tener `scope = 'agent'`, `agent_id` `migrated` (o el de `--agent`), `source = 'import'`, `created_by_type` `user` para un prompt y `agent` para lo demás, su origen en `created_by_ref`, el nombre de su proyecto en la fuente en `origin_project` (NULL sin proyecto), y la sesión de la fuente en `source_session_id` cuando es de 1 a 128 caracteres ASCII visibles (otra se reporta). Su `project_id` MUST ser su destino: el de su nombre en el mapa; sin proyecto si el nombre no está en el mapa, si la nota no tiene proyecto o si es `personal`. Los ids de las raíces del mapa MUST planearse antes de traducir (`plan_ids_in`), porque las claves se distinguen por destino (HI8). Cada raíz del mapa MUST registrarse en `project` sin `index_docs`, y su remoto en `project_remote`, como las de `--map-root`. Si entre el plan y la escritura un registro le dio ese id a otra raíz, las notas de ese nombre MUST reportarse por su proyecto y no importarse.
 
 #### Escenario: el mapa
 - GIVEN notas de `a`, de `b` y sin proyecto, y una `personal` de `a`
 - WHEN se importa con `--project-map a=RUTA`
 - THEN las de `a` quedan en el proyecto de `RUTA`, las demás sin proyecto, y `origin_project` es `a`, `b`, NULL y `a`
 
-**Tests:** `the_project_map_places_notes_and_the_rest_have_none`, `every_row_carries_its_origin_and_author` (`translate.rs`); `a_mapped_root_of_another_project_is_reported_and_skipped` (`import.rs`).
+#### Escenario: el id de la raíz ya es de otra
+- GIVEN `project` con el id que `derive_project_id` da a `RUTA` para otra raíz
+- WHEN se importa con `--project-map a=RUTA`
+- THEN las notas de `a` quedan en el siguiente id libre de `RUTA`, y el reporte nombra ese proyecto
+
+**Tests:** `the_project_map_places_notes_and_the_rest_have_none`, `every_row_carries_its_origin_and_author` (`translate.rs`); `a_mapped_root_whose_id_is_taken_gets_its_own`, `a_project_taken_while_importing_is_told_by_its_notes` (`import.rs`).
 
 ## HI8. Claves de tema
 
 Una `topic_key` válida MUST conservarse. Una inválida MUST reescribirse en minúsculas, con cada carácter fuera de `[a-z0-9._-]` y `/` como `-` y sin segmentos vacíos; si eso la cambió o pasa de 80 caracteres, MUST terminar con `-` y los primeros 10 hex del SHA-256 de la original, cortando lo anterior para caber en 80. La misma original MUST dar siempre la misma clave.
 
-Si notas de más de un grupo de origen caen en un mismo destino con la misma clave, cada nota de ese grupo de claves MUST calificarse: su clave pasa a `<grupo>/<clave>`, donde `<grupo>` es el nombre del proyecto de la fuente reescrito como un segmento (`no-project` sin él) seguido de `.personal` para una `personal`, reescrita con la misma regla si no entra. Dos notas vivas de un mismo grupo de origen y destino con una clave MUST dejar viva la de fecha más nueva y la otra `superseded` por ella con causa `revision`. Una clave que en el destino tiene una fila viva que no vino de este import MUST seguir R5 de `specs/portability`: la nota entra `superseded` por esa fila.
+Si notas de más de un grupo de origen caen en un mismo destino con la misma clave, cada nota de ese grupo de claves MUST calificarse: su clave pasa a `<grupo>/<clave>`, reescrita con la misma regla si no entra. `<grupo>` es el nombre del proyecto de la fuente (`no-project` sin él) seguido de `.personal` para una `personal`; un nombre que no es un segmento válido, que es `no-project` o que termina en `.personal` MUST reescribirse como un segmento seguido de `-` y el hash de la original, así dos grupos nunca dan el mismo. Una clave calificada que cae sobre la de una nota de otro grupo en el mismo destino MUST calificarse otra vez, hasta que ningún destino tenga una clave de dos grupos. Dos notas vivas de un mismo grupo de origen y destino con una clave MUST dejar viva la de fecha más nueva y la otra `superseded` por ella con causa `revision`. Una clave que en el destino tiene una fila viva que no vino de este import MUST seguir R5 de `specs/portability`: la nota entra `superseded` por esa fila.
 
 #### Escenario: dos proyectos de la fuente, un destino
 - GIVEN una nota de `a` y una de `b` con la clave `sdd/x/proposal`, las dos mapeadas a la misma raíz
 - WHEN se importa
 - THEN quedan vivas las dos, con `a/sdd/x/proposal` y `b/sdd/x/proposal`
 
-**Tests:** `a_valid_key_is_kept_and_an_invalid_one_rewritten_stably`, `keys_of_two_origins_in_one_destination_are_qualified`, `two_notes_of_one_origin_and_key_leave_the_newest_live` (`translate.rs`); `a_key_held_here_supersedes_the_imported_note` (`import.rs`).
+#### Escenario: dos clones de un remoto
+- GIVEN una nota de `a` y una de `b` con la clave `sdd/x`, mapeadas a dos clones de un remoto que ya tiene proyecto
+- WHEN se importa
+- THEN quedan vivas las dos en el proyecto del remoto, con `a/sdd/x` y `b/sdd/x`
+
+**Tests:** `a_valid_key_is_kept_and_an_invalid_one_rewritten_stably`, `keys_of_two_origins_in_one_destination_are_qualified`, `a_qualified_key_that_takes_another_projects_key_is_qualified_again`, `keys_of_two_roots_of_one_project_here_are_qualified`, `two_notes_of_one_origin_and_key_leave_the_newest_live` (`translate.rs`); `a_key_held_here_supersedes_the_imported_note`, `notes_mapped_to_clones_of_one_remote_share_its_project` (`import.rs`).
 
 ## HI9. Fechas, accesos, importancia y tier
 
-`created_at` y `last_modified_at` MUST ser la fecha del texto; una fecha posterior al momento del import, o que no se puede leer, MUST pasar a ser ese momento y reportarse. `access_count` MUST ser `duplicate_count` (al menos 1), y `last_accessed_at` la última vez que la fuente vio la nota (`last_seen_at`, acotada igual), o la fecha del texto sin ella. La importancia MUST ser 5, o 9 para una nota fijada (`pinned`). El tier MUST ser `compute_tier(3, importancia, accesos, tipo)`.
+`created_at` y `last_modified_at` MUST ser la fecha del texto; una fecha posterior al momento del import, o que no se puede leer, MUST pasar a ser ese momento y reportarse. `access_count` MUST ser `duplicate_count` (al menos 1), y `last_accessed_at` la más nueva entre la fecha del texto y la última vez que la fuente vio la nota (`last_seen_at`, acotada igual): escribir una nota también es verla, y una fila nunca se lee antes de escribirse. La importancia MUST ser 5, o 9 para una nota fijada (`pinned`). El tier MUST ser `compute_tier(3, importancia, accesos, tipo)`.
 
 #### Escenario: una nota vista tres veces
 - GIVEN una `decision` con `duplicate_count` 3
@@ -133,7 +143,7 @@ Si notas de más de un grupo de origen caen en un mismo destino con la misma cla
 
 ## HI10. Notas de igual texto
 
-Notas vivas de un mismo grupo de origen cuyo texto enmascarado es igual MUST guardarse una vez: en la de fecha más vieja (y, a igual fecha, el origen menor), con `access_count` la suma de los de todas y `last_accessed_at` el más nuevo. El reporte MUST nombrar cada nota absorbida con la que la absorbió, y una relación a una absorbida MUST ir a la que la absorbió.
+Notas vivas de un mismo grupo de origen cuyo texto enmascarado es igual MUST guardarse una vez: en la de fecha más vieja (y, a igual fecha, el origen menor), con `access_count` la suma de los de todas, `last_accessed_at` el más nuevo e importancia 9 si alguna estaba fijada. El reporte MUST nombrar cada nota absorbida con la que la absorbió, y una relación a una absorbida MUST ir a la que la absorbió.
 
 **Test:** `notes_of_one_origin_with_the_same_text_store_once_with_every_access` (`translate.rs`).
 
@@ -150,7 +160,7 @@ Una nota cuyo origen tiene en el store una fila con su misma fecha del texto (`c
 
 ## HI12. Una nota que la fuente reescribió
 
-Una nota cuyo origen tiene filas no borradas, ninguna con su fecha del texto, MUST entrar como una revisión de la versión guardada más nueva: en el proyecto donde está, con la clave que tiene (la suya si no tiene). Si su fecha es más nueva, MUST entrar viva y dejar las filas vivas guardadas de su origen `superseded` por su primera fila, con causa `revision`, en la misma transacción, salvo las que comparte por ser del mismo texto. Si es más vieja, MUST entrar `superseded` por la primera fila viva guardada de su origen, con causa `revision`, o, sin filas vivas, con las reglas de siempre en ese proyecto. Una nota borrada en la fuente cuyo origen tiene filas MUST NOT cambiar nada y MUST reportarse.
+Una nota cuyo origen tiene filas no borradas, ninguna con su fecha del texto, MUST entrar como una revisión de la versión guardada más nueva: en el proyecto donde está, con la clave que tiene (la suya si no tiene). Si su fecha es más nueva, MUST entrar viva y dejar las filas vivas guardadas de su origen `superseded` por su primera fila, con causa `revision`, en la misma transacción, salvo las que comparte por ser del mismo texto. Si es más vieja, MUST entrar `superseded` por la primera fila viva guardada de su origen, con causa `revision`, o, sin filas vivas, con las reglas de siempre en ese proyecto. Una nota borrada en la fuente cuyo origen tiene filas MUST NOT cambiar nada, y MUST reportarse cuando alguna de esas filas no está borrada.
 
 #### Escenario: reescrita
 - GIVEN una nota importada, y el mismo origen con otro texto y una fecha posterior
@@ -161,7 +171,7 @@ Una nota cuyo origen tiene filas no borradas, ninguna con su fecha del texto, MU
 
 ## HI13. Escritura por nota
 
-Las filas de una nota, y lo que su revisión reemplaza, MUST escribirse en una sola transacción: las transacciones del import MUST cerrarse sólo entre dos notas. Los vínculos de piezas de una nota MUST escribirse salvo que una fila de su origen ya tenga uno; una fila fundida con otra nota MAY ser pieza de las dos, como la comparten dos saves.
+Las filas de una nota, y lo que su revisión reemplaza, MUST escribirse en una sola transacción: las transacciones del import MUST cerrarse sólo entre dos notas. Los vínculos de piezas de una nota MUST escribirse salvo que una de sus filas que es de su origen ya tenga uno, o que el texto de una de sus piezas ya no esté; una fila fundida con otra nota, o compartida con la versión que una revisión reemplaza, MAY ser pieza de las dos, como la comparten dos saves.
 
 **Tests:** `write_batches_never_split_a_note` (`import.rs`, puro); `links_lost_between_transactions_are_filled_by_importing_again` (`import.rs`, con una nota de otra fuente).
 
@@ -178,7 +188,7 @@ Una nota con `deleted_at` MUST entrar borrada en esa fecha, sin vector y fuera d
 | `supersedes` | juzgado `supersedes`: las filas vivas de la nota destino `superseded` por la primera fila de la nota fuente, con causa `verdict` |
 | `supersedes` sobre una nota protegida, sin `marked_by_kind` `human` | `escalated`, como `conflicts_with` |
 
-El motivo MUST guardarse enmascarado, con la evidencia debajo cuando la hay. Una relación `orphaned`, una con un extremo que no está en el archivo ni en el store, y una reemplazada por otra MUST contarse y no guardarse.
+El motivo MUST guardarse enmascarado, con la evidencia debajo cuando la hay. Una relación `orphaned`, una con un extremo que no da filas en el archivo, y una reemplazada por otra MUST contarse y no guardarse. Una relación entre dos notas que ya estaban MUST guardar su par sin cambiar el estado de sus filas.
 
 #### Escenario: un veredicto protegido
 - GIVEN una `decision` A y una nota B con la relación `B supersedes A` marcada por un agente
@@ -213,7 +223,7 @@ Un prompt con texto MUST guardarse como `chat_message` del usuario, y el `summar
 
 ## HI17. El reporte
 
-El reporte MUST traer, además de lo de R7 de `specs/portability`, las filas insertadas por idioma (`by_lang`, para los dos formatos) y, para otra fuente, en `foreign`: la fuente y su versión; notas por tipo de la fuente con su tipo de destino; notas por proyecto de la fuente con su destino; los nombres sin mapa y las entradas del mapa sin notas; cuántas filas y cuántas notas en más de una pieza; cuántas notas se enmascararon; las claves reescritas y las calificadas, de qué a qué; las notas reemplazadas por otra de su origen; las absorbidas por igual texto; las presentes por proyecto donde están; las revisadas y las versiones viejas; las fechas acotadas; las borradas; las relaciones guardadas por estado y las contadas por motivo; lo que no tiene lugar, por campo, también los que el adaptador no conoce; las notas que la fuente reescribió; las sesiones descartadas; y las notas sin texto. `clawg import` MUST imprimirlo en el idioma del comando (CL3).
+El reporte MUST traer, además de lo de R7 de `specs/portability`, las filas insertadas por idioma (`by_lang`, para los dos formatos) y, para otra fuente, en `foreign`: la fuente y su versión; notas por tipo de la fuente con su tipo de destino; notas por proyecto de la fuente con su destino; los nombres sin mapa y las entradas del mapa sin notas; cuántas filas y cuántas notas en más de una pieza; cuántas notas se enmascararon; las claves reescritas y las calificadas, de qué a qué; las notas reemplazadas por otra de su origen; las absorbidas por igual texto; las presentes por proyecto donde están; las revisadas y las versiones viejas; las fechas acotadas; las borradas; las relaciones guardadas por estado y las contadas por motivo; lo que no tiene lugar, por campo, también los que el adaptador no conoce; las notas que la fuente reescribió; las sesiones descartadas; y las notas sin texto. Lo que el reporte de R7 dice por línea del archivo (las filas fundidas con una de acá, las de clave tomada y las que no entraron) MUST ir, para otra fuente, en `foreign` por nota, nombrada por su origen, y las notas de un proyecto cuya raíz pertenece a otro, por ese proyecto: las líneas y los ids de la traducción no significan nada fuera de ella. `clawg import` MUST imprimirlo en el idioma del comando (CL3).
 
 **Tests:** `the_foreign_report_counts_what_the_import_did` (`import.rs`); `render_names_what_a_foreign_import_did` y `the_foreign_report_speaks_spanish` (`crates/clawg-cli/src/import.rs`).
 

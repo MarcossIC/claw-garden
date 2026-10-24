@@ -791,6 +791,63 @@ async fn export_and_import_round_trip_through_the_binary() {
 }
 
 #[tokio::test]
+async fn an_engram_export_imports_through_the_binary() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let app = sandbox.home.join("app");
+    std::fs::create_dir_all(app.join(".git")).expect("repo");
+    let long = (0..700).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+    let observation = |id: i64, sync_id: &str, project: Option<&str>, title: &str, content: &str| {
+        json!({
+            "id": id, "sync_id": sync_id, "session_id": "s1", "type": "decision", "title": title, "content": content,
+            "project": project, "scope": "project", "revision_count": 1, "duplicate_count": 1,
+            "created_at": "2025-01-01 10:00:00", "updated_at": "2025-01-01 10:00:00",
+        })
+    };
+    let export = json!({
+        "version": "0.2.0",
+        "sessions": [{ "id": "s1", "project": "app", "started_at": "2025-01-01 09:00:00", "ended_at": "2025-01-01 12:00:00",
+                       "summary": "Wired the importer" }],
+        "observations": [
+            observation(1, "a", Some("app"), "Notes on clawg-ledger", &long),
+            observation(2, "b", None, "Port", "the daemon listens on 27380"),
+        ],
+        "prompts": [{ "id": 1, "sync_id": "p1", "session_id": "s1", "content": "how does the importer work?",
+                      "project": "app", "created_at": "2025-01-01 09:30:00" }],
+    });
+    let file = sandbox.home.join("engram.json");
+    std::fs::write(&file, export.to_string()).expect("the export");
+    let (file, map) = (file.to_string_lossy().into_owned(), format!("app={}", app.display()));
+    let import = |more: &[&str]| {
+        let mut argv = vec!["import", "--from", "engram", file.as_str(), "--project-map", map.as_str()];
+        argv.extend_from_slice(more);
+        argv.extend_from_slice(&["--profile", "dev"]);
+        sandbox.run(&argv)
+    };
+
+    let dry = import(&["--dry-run"]);
+    assert_eq!(dry.status.code(), Some(0), "{}", stderr_of(&dry));
+    assert!(stdout_of(&dry).starts_with("would import "), "{}", stdout_of(&dry));
+    assert!(stdout_of(&dry).contains("from engram 0.2.0: notes 4,"), "{}", stdout_of(&dry));
+    assert!(!daemon.list().await.contains("Wired the importer"), "a dry run writes nothing");
+
+    let done = import(&[]);
+    assert_eq!(done.status.code(), Some(0), "{}", stderr_of(&done));
+    assert!(stdout_of(&done).contains("`clawg restore` brings it back"), "{}", stdout_of(&done));
+    let rows = daemon.list().await;
+    assert!(rows.contains("Wired the importer") && rows.contains("\"agent_id\":\"migrated\""), "{rows}");
+
+    let again = import(&[]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr_of(&again));
+    assert!(stdout_of(&again).starts_with("imported 0 of "), "{}", stdout_of(&again));
+    assert!(stdout_of(&again).contains("notes already here, by the project they are in:"), "{}", stdout_of(&again));
+
+    let mixed = sandbox.run(&["import", "--from", "engram", &file, "--map-root", "/a=.", "--profile", "dev"]);
+    assert_eq!(mixed.status.code(), Some(2), "a map of a clawg export is a usage error: {}", stderr_of(&mixed));
+}
+
+#[tokio::test]
 async fn projects_move_moves_and_undoes_a_seeded_store() {
     let sandbox = Sandbox::new();
     let daemon = sandbox.serve().await;

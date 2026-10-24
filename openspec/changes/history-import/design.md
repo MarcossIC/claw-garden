@@ -22,7 +22,7 @@ Después, `import.rs` sigue por las tres pasadas de 43 (`prepare`, `place`, `wri
 
 ## D2. Ids sintéticos en orden de fecha
 
-La traducción ordena las notas por fecha del texto y, a igual fecha, por origen, y numera sus filas desde 1 en ese orden: la primera fila de cada nota antes que las demás. `place` inserta por id del archivo, así que los ids de acá siguen las fechas, y el par de una relación tiene `new_id` en la nota más nueva, como lo escribe el detector. `write_links` escribe cada par como `(mayor, menor)` (`RECORD_PAIR_SQL`, `crates/clawg-core/src/memory/dispute.rs:300`), también para un archivo de clawg, donde ya vienen así salvo que un extremo estuviera presente con un id viejo.
+La traducción ordena las notas por fecha del texto y, a igual fecha, por origen, y numera sus filas desde 1 en ese orden: la primera fila de cada nota antes que las demás (`rows_are_numbered_by_the_date_of_their_note`). El número de línea de cada fila es su id, así el import lleva lo que dice por línea a la nota de esa fila. `place` inserta por id del archivo, así que los ids de acá siguen las fechas, y el par de una relación tiene `new_id` en la nota más nueva, como lo escribe el detector. `write_links` escribe cada par como `(mayor, menor)` (`RECORD_PAIR_SQL`, `crates/clawg-core/src/memory/dispute.rs:300`), también para un archivo de clawg, donde ya vienen así salvo que un extremo estuviera presente con un id viejo.
 
 Las filas de una nota llegan enmascaradas por la nota entera, así que `prepare` no las vuelve a enmascarar (`Row.redacted` sale de la nota). Volver a pasar `redact` por una pieza podría enmascarar lo que el texto entero no (una marca después de una comilla invertida que el corte dejó al principio), y la pieza dejaría de ser la de un save.
 
@@ -35,12 +35,12 @@ El origen va en `created_by_ref`, que el export de 43 ya lleva, y V23 lo indexa 
 | Lo que hay de su origen | Decisión |
 |---|---|
 | Nada | Nueva: las reglas de 43 en su destino |
-| Una fila con su fecha, o la fecha se acotó y hay alguna | Presente: cada fila va a la fila de su origen con su hash, o, si se fundió con otra nota, a la que le da `TWIN_SQL` |
+| Una fila con su fecha, o la fecha se acotó y hay alguna | Presente: cada fila va a la fila de su origen con su hash, o, si se fundió con otra nota, a la que le da `TWIN_SQL`, o a ninguna si su texto ya no está (una pieza purgada) |
 | Sólo filas borradas | Presente (el usuario la borró) |
-| Filas no borradas con otras fechas, y la nota borrada en la fuente | Presente, reportada |
+| Filas no borradas con otras fechas, y la nota borrada en la fuente | Presente |
 | Filas no borradas con otras fechas | Revisión de la más nueva: en su proyecto y con su clave; más nueva, viva y reemplaza a las vivas del origen que no comparte; más vieja, reemplazada por la primera viva |
 
-Para una revisión, la búsqueda del titular de la clave deja fuera las filas de su propio origen, que la revisión reemplaza en vez de ser reemplazada por ellas.
+Una nota borrada en la fuente que queda presente con alguna fila no borrada se reporta, tenga o no su fecha: la fuente la borró y acá sigue. Para una revisión, la búsqueda del titular de la clave deja fuera las filas de su propio origen, que la revisión reemplaza en vez de ser reemplazada por ellas. Un registro que le dio a otra raíz el id planeado deja afuera sólo las notas nuevas: una presente o una revisión va adonde ya están sus filas.
 
 | Alternativa | Por qué no |
 |---|---|
@@ -53,7 +53,7 @@ Para una revisión, la búsqueda del titular de la clave deja fuera las filas de
 
 El pase que escribe junta notas enteras hasta llegar a `WRITE_BATCH` filas (`note_batches`, pura), y cada lote es una transacción: una nota y lo que su revisión reemplaza nunca quedan partidos entre dos. Un corte entre lotes deja notas enteras, que el import siguiente reconoce como presentes. Los vínculos siguen en la última transacción, como en 43; si falta, el import siguiente los completa, porque una nota presente lleva sus filas a las de su origen.
 
-Los vínculos de piezas de una nota se escriben salvo que una fila de su origen ya tenga uno. La regla de 43 («ninguna de sus filas tiene una pieza») dejaría sin piezas a una nota que comparte una pieza con otra, cuando el worker deja que una fila sea pieza de dos saves.
+Los vínculos de piezas de una nota se escriben salvo que una de sus filas que es de su origen ya tenga uno, o que una de sus piezas no esté. La regla de 43 («ninguna de sus filas tiene una pieza») dejaría sin piezas a una nota que comparte una pieza con otra, o a una revisión que comparte piezas con la versión que reemplaza, cuando el worker deja que una fila sea pieza de dos saves. Para un archivo de clawg sigue la regla de 43.
 
 ## D5. Claves
 
@@ -61,11 +61,13 @@ Los vínculos de piezas de una nota se escriben salvo que una fila de su origen 
 
 La calificación se decide sobre el archivo entero: se agrupan las notas por destino y clave final; un grupo con más de un grupo de origen califica cada nota con `<grupo>/<clave>` y la vuelve a pasar por `rewrite_key`. Se califican todas y no sólo la segunda, así el resultado no depende del orden del archivo.
 
+El segmento de un grupo es el nombre tal cual cuando ya es un segmento válido, salvo que sea `no-project` o termine en `.personal`: esos dos se leerían como el grupo sin proyecto o como el `personal` de otro nombre, y un nombre que hubo que reescribir podría coincidir con otro. En los tres casos lleva `-` y el hash del nombre, con la misma regla que una clave. Una clave calificada todavía puede caer sobre la de una nota de otro grupo (`a` con la clave `b/k`, `b` con `k`), así que la calificación se repite hasta que ningún destino tenga una clave de dos grupos; cada pasada alarga las claves que toca, y un tope de ocho sólo asegura que el ciclo termine.
+
 Dos notas vivas del mismo grupo de origen y destino con una clave: la de fecha más nueva queda viva, y cada otra lleva en su línea `memory` `status` `superseded`, `superseded_by` la primera fila de la nueva y causa `revision`, que `write_links` ya traduce.
 
 ## D6. Notas de igual texto
 
-Se agrupan las notas vivas por grupo de origen y hash del texto enmascarado. La de fecha más vieja (y origen menor) queda con la suma de los `duplicate_count` y el `last_seen_at` más nuevo; las demás no dan filas, el reporte las nombra y sus relaciones van a ella. Un segundo import arma los mismos grupos, encuentra presente a la que quedó y no inserta las otras, con cualquier mapa. Por grupo de origen y no por destino: el destino cambia con el mapa, el grupo de origen no.
+Se agrupan las notas vivas por grupo de origen y hash del texto enmascarado. La de fecha más vieja (y origen menor) queda con la suma de los `duplicate_count`, el `last_seen_at` más nuevo y la marca `pinned` de cualquiera; las demás no dan filas, el reporte las nombra y sus relaciones van a ella. Un segundo import arma los mismos grupos, encuentra presente a la que quedó y no inserta las otras, con cualquier mapa. Por grupo de origen y no por destino: el destino cambia con el mapa, el grupo de origen no.
 
 ## D7. Fechas
 
@@ -73,7 +75,9 @@ Se agrupan las notas vivas por grupo de origen y hash del texto enmascarado. La 
 
 ## D8. Relaciones
 
-La tabla de HI14 es una función pura (`pair_for`). Los extremos son las primeras filas de las notas, después de los grupos de igual texto. Para `supersedes`, la nota destino lleva en sus filas vivas `superseded`, `superseded_by` la primera fila de la fuente y causa `verdict`, y el par va juzgado; para `conflicts_with` (y `supersedes` protegido), la primera fila de la nota más nueva lleva `disputed` y la otra en `disputed_against`, y el par va `escalated`. `write_links` ya activa una `disputed` sin par. Entre dos notas, vale la relación vigente más nueva; las reemplazadas se cuentan.
+La tabla de HI14 es una función pura (`pair_for`). Los extremos son las primeras filas de las notas, después de los grupos de igual texto. Para `supersedes`, la nota destino lleva en sus filas vivas `superseded`, `superseded_by` la primera fila de la fuente y causa `verdict`, y el par va juzgado; para `conflicts_with` (y `supersedes` protegido), la primera fila de la nota más nueva lleva `disputed` y la otra en `disputed_against`, y el par va `escalated`. `write_links` ya activa una `disputed` sin par. Entre dos notas, vale la relación vigente más nueva; las reemplazadas se cuentan. Un `supersedes` cuya fuente está borrada no reemplaza a la otra, y un par escalado disputa la fila nueva sólo si está viva.
+
+Un extremo que no da filas en el archivo no se busca en el store: el estado que un par les da a sus filas se escribe al insertarlas, y el import no reemplaza ni disputa una fila que ya estaba. Un export completo trae los dos extremos de cada relación. Por lo mismo, una relación nueva entre dos notas que ya estaban guarda su par y no cambia sus filas: `write_links` llena `superseded_by` sólo en una fila reemplazada y `disputed_against` sólo en una disputada, también para un archivo de clawg.
 
 | Alternativa | Por qué no |
 |---|---|
@@ -86,7 +90,7 @@ El daemon arma el chunker con `ChatChunker::from_cell(runtime.tokenizer)` (`crat
 
 ## D10. La ruta, el comando y el reporte
 
-`ImportRequest` suma `from` (un enum, `clawg` por defecto) y `project_map`. `ImportOptions` suma el mapa; `import_foreign(store, embedder, chunker, backups, text, options)` lee, traduce y sigue por el mismo camino que `import`. `ImportReport` suma `by_lang` y `foreign: Option<ForeignReport>`; un cliente anterior ignora los campos.
+`ImportRequest` suma `from` (un enum, `clawg` por defecto) y `project_map`. `ImportOptions` suma el mapa; `import_foreign(store, embedder, chunker, backups, export, options)` recibe el export que el daemon ya leyó con el adaptador de su fuente (lo lee antes de pedir el embedder, HI16, y así no lo lee dos veces, y `clawg-core` no elige adaptador), planea antes los ids de las raíces del mapa con `plan_ids_in`, como `import` los de sus líneas `project`, y se los da a la traducción en `TranslateOptions.project_map` (`MappedProject`: nombre, raíz y proyecto), porque la traducción distingue claves por destino y dos clones de un remoto son uno; lo traduce en `spawn_blocking`, porque enmascarar y partir miles de notas no debe frenar las demás rutas, y sigue por el mismo camino que `import`. `ImportReport` suma `by_lang` y `foreign: Option<ForeignReport>`; un cliente anterior ignora los campos. Con otra fuente, `merged`, `topic_taken` e `invalid` quedan vacíos y lo mismo va en `foreign` por nota, nombrada por su origen (`with_foreign`), y las notas de un proyecto cuyo id un registro le dio a otra raíz durante el import, por ese proyecto.
 
 En el CLI, `--from` es un `ValueEnum`; `--project-map NOMBRE=RUTA` se corta en el último `=` (un nombre de proyecto puede tener `=`, una ruta de Windows no) y `RUTA` se resuelve con `resolve_project_root`. clap rechaza `--map-root` con `--from engram` y `--project-map` sin él.
 

@@ -328,6 +328,20 @@ clawg import memorias.jsonl --agent claude-code --profile dev         # todas ba
 
 Importar dos veces el mismo archivo no agrega nada. Una memoria cuyo texto ya está vivo acá no se duplica, y una cuya `topic_key` ya tiene una versión viva acá queda reemplazada por esa. El reporte dice cuántas trajo por tipo, estado y proyecto, y cuáles no pudo traer y por qué.
 
+### Traer memorias de otra herramienta
+
+`clawg import --from` lee el export de otra herramienta de memoria y guarda cada nota como la guardaría un save de su texto: enmascarada entera, partida en las mismas piezas, con su tipo, sus fechas, sus accesos, su clave y las relaciones entre notas. Hoy lee el export de engram. Exportá todo (sin `--all`, las versiones nuevas exportan sólo el proyecto del directorio en que se corren) y a un archivo fuera del repo, porque lleva el texto de cada nota tal como está:
+
+```powershell
+engram export --all $HOME\engram.json
+clawg import --from engram $HOME\engram.json --dry-run --profile dev    # qué traería, por proyecto de la otra herramienta
+clawg import --from engram $HOME\engram.json --project-map claw-garden=C:\code\claw-garden --profile dev
+```
+
+`--project-map NOMBRE=RUTA` guarda las notas del proyecto `NOMBRE` de la otra herramienta en el proyecto de `RUTA`, que tiene que ser un directorio. Las de un proyecto que no nombrás, las que no tienen proyecto y las `personal` quedan sin proyecto: `clawg memories list --origin-project NOMBRE` las lista y `clawg projects move --origin-project NOMBRE --to RUTA` las acomoda después. Las notas quedan bajo el agente `migrated`, que sólo dice quién las escribió: cualquier agente las lee y las cambia como a las suyas.
+
+Importar otra vez el mismo export, o uno más nuevo, no duplica nada: cada nota se reconoce por su id en la otra herramienta, esté donde esté. Una que la otra herramienta reescribió entra como la versión nueva de la que ya está, en su proyecto y con su clave; una que borraste acá no vuelve. El reporte dice qué fue de cada nota y cuenta, por campo, lo que la otra herramienta guarda y clawg no tiene dónde poner.
+
 ## Conectarlo a Claude Code
 
 Con Claude Code instalado (`claude` en el PATH), un solo comando conecta clawg:
@@ -484,6 +498,7 @@ clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted
 clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)
 clawg export --out m.jsonl --profile dev  # las memorias, una fila por línea (--project, --agent, --include-deleted, --format markdown)
 clawg import m.jsonl --profile dev        # las trae a este perfil, con el daemon corriendo (--dry-run, --agent, --map-root OLD=NEW)
+clawg import --from engram e.json --profile dev   # las notas de otra herramienta (--project-map NOMBRE=RUTA)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
 clawg metrics report --metric http.duration --label route=/v1/search --by version   # latencias y memoria del daemon (--by day|hour, --since 7d)
 ```

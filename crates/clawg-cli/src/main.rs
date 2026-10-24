@@ -46,7 +46,6 @@ use clawg_core::memory::ProjectIdentity;
 use clawg_core::memory::secrets::{mask_reasons, purge, scan};
 use clawg_core::paths::data_dir;
 use clawg_core::preferences::{language_in, Lang};
-use clap::Parser;
 
 /// Exit code for "the command ran and failed", as opposed to clap's `2` for
 /// "the command was never valid".
@@ -55,7 +54,7 @@ const EXIT_FAILURE: u8 = 1;
 fn main() -> ExitCode {
     let hook = is_hook_invocation(std::env::args_os());
     let bare = is_bare_invocation(std::env::args_os());
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::parse_args(std::env::args_os()) {
         Ok(cli) => cli,
         // A client reads 2 from a hook as "block the session or the prompt".
         Err(e) if (hook || bare) && e.use_stderr() => {
@@ -235,7 +234,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Import { file, dry_run, agent, map_root, profile } => {
+        Command::Import { file, from, dry_run, agent, map_root, project_map, profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             // The daemon is the store's only writer and has the model that
             // embeds each row; with none running, nothing is started.
@@ -246,7 +245,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Probe::Running(client) => client,
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
-            let out = import::run(lang, &client, &file, dry_run, agent.as_deref(), &map_root).await.map_err(|e| match e {
+            let maps = import::Maps { roots: &map_root, projects: &project_map };
+            let out = import::run(lang, &client, &file, from, dry_run, agent.as_deref(), maps).await.map_err(|e| match e {
                 import::ImportError::Client(e) => unavailable(e),
                 other => other.to_string(),
             })?;

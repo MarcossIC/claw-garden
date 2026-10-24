@@ -3615,6 +3615,148 @@ async fn import_answers_400_for_an_unknown_version_before_the_embedder() {
     assert_eq!(status, 400, "{body}");
 }
 
+/// An engram export of format 0.2.0 holding `observations`.
+fn engram_export(observations: Vec<Value>) -> String {
+    json!({ "version": "0.2.0", "exported_at": "2025-03-01 10:00:00", "sessions": [], "observations": observations, "prompts": [] })
+        .to_string()
+}
+
+fn observation(sync_id: &str, project: Option<&str>, title: &str, content: &str) -> Value {
+    json!({
+        "id": 1, "sync_id": sync_id, "session_id": "s1", "type": "discovery", "title": title, "content": content,
+        "project": project, "scope": "project", "revision_count": 1, "duplicate_count": 1,
+        "created_at": "2025-01-01 10:00:00", "updated_at": "2025-01-01 10:00:00",
+    })
+}
+
+/// 700 distinct words, long enough to be split into pieces.
+fn long_note() -> String {
+    (0..700).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ")
+}
+
+impl Harness {
+    /// Gives the daemon a tokenizer, as loading the model does.
+    fn with_tokenizer(self) -> Self {
+        self.ctx.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+        self
+    }
+}
+
+#[tokio::test]
+async fn an_engram_import_stores_notes_and_a_dry_run_reports_the_same() {
+    let h = Harness::start().await.with_tokenizer();
+    let root = tempfile::tempdir().expect("tempdir");
+    let text = engram_export(vec![
+        observation("a", Some("app"), "Notes on clawg-ledger", &long_note()),
+        observation("b", None, "Port", "the daemon listens on 27380"),
+    ]);
+    let body = |dry_run| {
+        json!({ "text": text, "from": "engram", "dry_run": dry_run, "project_map": [["app", root.path().to_string_lossy()]] })
+    };
+
+    let (status, dry) = h.post_json("/v1/import", body(true)).await;
+    assert_eq!(status, 200, "{dry}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "a dry run writes nothing: {listed}");
+    let (status, report) = h.post_json("/v1/import", body(false)).await;
+    assert_eq!(status, 200, "{report}");
+
+    let unmarked = |mut r: Value| {
+        r["dry_run"] = Value::Null;
+        r["snapshot"] = Value::Null;
+        r
+    };
+    assert!(report["snapshot"].is_string(), "{report}");
+    assert_eq!(unmarked(dry), unmarked(report.clone()));
+    assert_eq!((report["foreign"]["source"].clone(), report["foreign"]["notes"].clone()), (json!("engram"), json!(2)));
+    assert_eq!(report["foreign"]["split_notes"], 1, "{report}");
+    let inserted = report["inserted"].as_u64().expect("inserted");
+    assert!(inserted > 2, "{report}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated&limit=100").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(inserted as usize), "{listed}");
+}
+
+#[tokio::test]
+async fn an_engram_export_without_notes_imports_nothing() {
+    let h = Harness::start().await.with_tokenizer();
+    let text = r#"{"version":"0.2.0","sessions":null,"observations":[],"prompts":null}"#;
+    let (status, report) = h.post_json("/v1/import", json!({ "text": text, "from": "engram" })).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!((report["rows"].clone(), report["inserted"].clone(), report["foreign"]["notes"].clone()), (json!(0), json!(0), json!(0)));
+    let (_, listed) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+}
+
+#[tokio::test]
+async fn import_refuses_an_unknown_source_or_a_mixed_map() {
+    let h = Harness::start().await.with_tokenizer();
+    let engram = engram_export(vec![observation("a", None, "Port", "the daemon listens on 27380")]);
+    let map = json!([["app", "/work/app"]]);
+    for (body, names) in [
+        (json!({ "text": engram, "from": "notion" }), "notion"),
+        (json!({ "text": export_file(1), "from": "clawg", "project_map": map }), "project_map"),
+        (json!({ "text": export_file(1), "project_map": map }), "project_map"),
+        (json!({ "text": engram, "from": "engram", "map_roots": [["/a", "/b"]] }), "map_roots"),
+    ] {
+        let (status, answer) = h.post_json("/v1/import", body).await;
+        assert_eq!(status, 400, "{answer}");
+        assert!(answer["error"].as_str().unwrap_or("").contains(names), "{answer}");
+    }
+    let (_, listed) = h.get_json("/v1/memories?kind=memory").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+}
+
+#[tokio::test]
+async fn an_engram_export_without_from_is_a_400() {
+    let h = Harness::start().await.with_tokenizer();
+    let engram = engram_export(vec![observation("a", None, "Port", "the daemon listens on 27380")]);
+    let (status, answer) = h.post_json("/v1/import", json!({ "text": engram })).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(answer["error"].as_str().unwrap_or("").contains("header"), "{answer}");
+}
+
+#[tokio::test]
+async fn a_foreign_import_without_the_tokenizer_is_a_503() {
+    let h = Harness::start_without_embedder().await;
+    for (text, names) in [("{not json", "not JSON"), (r#"{"version":"0.3.0"}"#, "0.3.0")] {
+        let (status, answer) = h.post_json("/v1/import", json!({ "text": text, "from": "engram" })).await;
+        assert_eq!(status, 400, "a file the adapter cannot read is refused first: {answer}");
+        assert!(answer["error"].as_str().unwrap_or("").contains(names), "{answer}");
+    }
+    let engram = engram_export(vec![observation("a", None, "Port", "the daemon listens on 27380")]);
+    for dry_run in [false, true] {
+        let (status, answer) = h.post_json("/v1/import", json!({ "text": engram, "from": "engram", "dry_run": dry_run })).await;
+        assert_eq!((status, answer["error"].clone()), (503, json!("tokenizer_not_ready")), "dry run {dry_run}: {answer}");
+    }
+
+    let h = h.with_tokenizer();
+    let (status, answer) = h.post_json("/v1/import", json!({ "text": engram, "from": "engram", "dry_run": true })).await;
+    assert_eq!(status, 200, "a dry run needs no model: {answer}");
+    let (status, answer) = h.post_json("/v1/import", json!({ "text": engram, "from": "engram" })).await;
+    assert_eq!((status, answer["error"].clone()), (503, json!("embedder_not_ready")), "{answer}");
+}
+
+#[tokio::test]
+async fn an_imported_long_note_reads_whole_and_changes_for_the_bridge_agent() {
+    let h = Harness::start().await.with_tokenizer();
+    let text = engram_export(vec![observation("a", None, "Notes on clawg-ledger", &long_note())]);
+    let (status, report) = h.post_json("/v1/import", json!({ "text": text, "from": "engram" })).await;
+    assert_eq!(status, 200, "{report}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated&limit=100").await;
+    let ids: Vec<i64> = listed["items"].as_array().expect("items").iter().filter_map(|m| m["id"].as_i64()).collect();
+    assert!(ids.len() > 1, "{listed}");
+    let id = ids[ids.len() / 2];
+
+    let (status, save) = h.get_json(&format!("/v1/memories/memory/{id}/save?agent=claude-code")).await;
+    assert_eq!(status, 200, "{save}");
+    assert_eq!(save["text"], format!("Notes on clawg-ledger\n{}", long_note()), "{save}");
+    let patch = h.http.patch(h.url(&format!("/v1/memories/memory/{id}?agent=claude-code"))).json(&json!({ "importance": 8.0 }));
+    let (status, patched) = h.send(patch).await;
+    assert_eq!(status, 200, "{patched}");
+    let (status, deleted) = h.send(h.http.delete(h.url(&format!("/v1/memories/memory/{id}?agent=claude-code")))).await;
+    assert_eq!(status, 200, "{deleted}");
+}
+
 #[tokio::test]
 async fn an_unkeyed_save_names_the_row_a_key_would_revise() {
     let vectors = vec![
