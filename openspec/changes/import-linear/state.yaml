@@ -1,14 +1,14 @@
 change: import-linear
 objective: "1"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: skipped  # la única decisión con alternativas, el índice, está en la exploración (enfoques A y B) y en la propuesta
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: in_progress  # Windows y el banco hechos; falta la importación real en el perfil dev (con autorización) y el CI
   archive: pending
 updated: 2026-10-24
