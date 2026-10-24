@@ -13,6 +13,9 @@ pub struct ProcessSample {
     /// Memory only this process holds: `RssAnon` on Linux, `PrivateUsage`
     /// (what Task Manager shows) on Windows.
     pub private_bytes: Option<u64>,
+    /// The most `private_bytes` ever reached, between two samples too:
+    /// `PeakPagefileUsage` on Windows. Linux keeps no peak of `RssAnon`.
+    pub private_peak_bytes: Option<u64>,
     pub threads: Option<u64>,
     pub open_files: Option<u64>,
     pub handles: Option<u64>,
@@ -102,6 +105,7 @@ fn os_sample() -> ProcessSample {
             sample.rss_bytes = Some(counters.WorkingSetSize as u64);
             sample.rss_peak_bytes = Some(counters.PeakWorkingSetSize as u64);
             sample.private_bytes = Some(counters.PrivateUsage as u64);
+            sample.private_peak_bytes = Some(counters.PeakPagefileUsage as u64);
         }
         let mut handles = 0u32;
         if GetProcessHandleCount(process, &mut handles) != 0 {
@@ -220,7 +224,9 @@ mod tests {
         assert!(sample.cpu.is_some(), "{sample:?}");
         if cfg!(windows) {
             assert!(sample.handles.is_some_and(|h| h > 0), "{sample:?}");
+            assert!(sample.private_peak_bytes >= sample.private_bytes, "{sample:?}");
         } else {
+            assert_eq!(sample.private_peak_bytes, None, "{sample:?}");
             assert!(sample.threads.is_some_and(|t| t > 0), "{sample:?}");
             assert!(sample.open_files.is_some_and(|f| f > 0), "{sample:?}");
         }
