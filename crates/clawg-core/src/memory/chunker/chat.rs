@@ -236,6 +236,36 @@ mod tests {
     }
 
     #[test]
+    fn the_head_ends_at_a_word_boundary() {
+        use crate::memory::chunker::token_splitter::tests::{subword_tokenizer, subword_words};
+        // Words of two and three tokens in turn: 480 of them are 1200 tokens,
+        // and token 48 is the second of the twentieth word, which opens at 47.
+        let words = subword_words(480);
+        let content = words.join(" ");
+        let tok = subword_tokenizer();
+        let offsets = tok.encode(content.as_str(), false).expect("the fixture encodes").get_offsets().to_vec();
+        assert_eq!(offsets.len(), 1200);
+        assert_eq!((offsets[47].0, offsets[48].0), (content.find(&words[19]).unwrap(), offsets[47].1), "token 48 is inside a word");
+
+        let head = ChatChunker::with_tokenizer(tok.clone()).split_save(&content).head.expect("a long text has a head");
+        assert_eq!(head, words[..19].join(" "), "the head stops before the word it would cut");
+        assert!(TokenSplitter::with_tokenizer(tok).count(&head) <= SAVE_HEAD_TOKENS);
+    }
+
+    #[test]
+    fn no_piece_of_a_long_save_starts_inside_a_word() {
+        use crate::memory::chunker::token_splitter::tests::{assert_cut_at_word_boundaries, subword_tokenizer, subword_words};
+        let content = subword_words(480).join(" ");
+        let tok = subword_tokenizer();
+        let split = ChatChunker::with_tokenizer(tok.clone()).split_save(&content);
+        let pieces: Vec<&str> = split.pieces.iter().map(|c| c.text.as_str()).collect();
+        assert!(pieces.len() > 10, "a long save, {} pieces", pieces.len());
+        assert_cut_at_word_boundaries(&content, &pieces);
+        let splitter = TokenSplitter::with_tokenizer(tok);
+        assert!(pieces.iter().all(|p| splitter.count(p) <= PIECE_MAX_TOKENS), "a piece passed the cap");
+    }
+
+    #[test]
     fn empty_content_returns_empty_vec() {
         let chunker = ChatChunker::with_fallback();
         let chunks = chunker.chunk("", 480);

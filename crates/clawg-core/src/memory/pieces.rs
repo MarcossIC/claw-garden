@@ -55,8 +55,9 @@ pub struct SaveText {
 /// Shortest repeated text treated as the overlap between two neighbours;
 /// anything shorter is as likely a coincidence as a repeat.
 const MIN_OVERLAP_CHARS: usize = 16;
-/// Farthest back an overlap is looked for. The chunker repeats 64 tokens,
-/// well under this at any realistic token length.
+/// Farthest back an overlap is looked for. The chunker repeats at least 24
+/// tokens between the pieces of a save (64 between chunks), stretched back to
+/// where a word starts: well under this at any realistic token length.
 const MAX_OVERLAP_BYTES: usize = 2048;
 
 /// Joins neighbouring pieces, keeping once the longest end of each that the
@@ -362,6 +363,16 @@ mod tests {
         assert!(split.pieces.len() > 2, "the fixture is a long save");
         let pieces: Vec<&str> = split.pieces.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(join_pieces(&pieces), text);
+    }
+
+    #[test]
+    fn the_pieces_of_a_subword_split_save_join_back_into_its_text() {
+        use crate::memory::chunker::token_splitter::tests::{subword_tokenizer, subword_words};
+        let text = subword_words(480).join(" ");
+        let split = crate::memory::chunker::ChatChunker::with_tokenizer(subword_tokenizer()).split_save(&text);
+        assert!(split.pieces.len() > 10, "the fixture is a long save");
+        let pieces: Vec<&str> = split.pieces.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(join_pieces(&pieces), text, "no line break where the text has none");
     }
 
     async fn insert_row(store: &MemoryStore, agent: &str, content: &str) -> i64 {

@@ -991,6 +991,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_long_note_is_not_cut_inside_a_word() {
+        use crate::memory::chunker::token_splitter::tests::{assert_cut_at_word_boundaries, subword_tokenizer, subword_words};
+        let content = subword_words(480).join(" ");
+        let chunker = ChatChunker::with_tokenizer(subword_tokenizer());
+        let t = translate(&export(vec![note("engram:long", "Notes", &content)]), &options(&[]), &chunker, NOW);
+
+        let text = format!("Notes\n{content}");
+        let long: Vec<&str> = rows(&t, "engram:long").iter().map(|m| m.content.as_str()).collect();
+        assert!(long.len() > 10, "a long note, {} rows", long.len());
+        assert_cut_at_word_boundaries(&text, &long);
+        let heads: Vec<&str> = t.parsed.pieces.iter().map(|(_, p)| p.context.as_str()).filter(|c| !c.is_empty()).collect();
+        assert!(!heads.is_empty() && heads.iter().all(|h| text.starts_with(h)));
+        assert_cut_at_word_boundaries(&text, &heads[..1]);
+    }
+
+    #[test]
     fn a_secret_across_a_piece_cut_is_masked_whole() {
         let key = format!("ghp_{}", "aB3".repeat(12));
         // The title, a line break and this put the key at byte 374: the first
