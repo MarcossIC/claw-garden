@@ -884,6 +884,19 @@ impl EvalTokenCounter {
             EvalTokenCounterInner::Fake => s.split_whitespace().count(),
         }
     }
+
+    /// The pieces the worker stores a save of `text` as, and the head each
+    /// piece after the first is embedded behind (`None` for a save of one
+    /// piece), cut by this counter's tokenizer; the fake one cuts by bytes,
+    /// as the worker does before the tokenizer loads.
+    pub fn split_save(&self, text: &str) -> (Vec<String>, Option<String>) {
+        let tokenizer = match &self.0 {
+            EvalTokenCounterInner::Real(tok) => Some(tok.clone()),
+            EvalTokenCounterInner::Fake => None,
+        };
+        let split = crate::memory::chunker::ChatChunker::from_tokenizer(tokenizer).split_save(text);
+        (split.pieces.into_iter().map(|c| c.text).collect(), split.head)
+    }
 }
 
 /// True iff the real embedding model is already cached at `base_dir` —
