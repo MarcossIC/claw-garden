@@ -1,7 +1,7 @@
 change: import-linear
 objective: "1"
 depends_on: []
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +9,7 @@ artifacts:
   design: skipped  # la única decisión con alternativas, el índice, está en la exploración (enfoques A y B) y en la propuesta
   tasks: done
   apply: done
-  verify: in_progress  # Windows, el banco y la importación real en el perfil dev hechos; falta el CI
-  archive: pending
+  verify: done  # Windows, el banco, la importación real en el perfil dev y el CI de Linux y Windows
+  archive: done
 updated: 2026-10-24
+main_spec: openspec/specs/portability/spec.md, openspec/specs/storage/spec.md

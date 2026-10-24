@@ -1,8 +1,8 @@
 # portability — Especificación
 
-Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`, también desde el export de otra herramienta de memoria (HI4 a HI18). Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
+Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`, también desde el export de otra herramienta de memoria (HI4 a HI18), y cómo escala la importación (IL1 e IL5). Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
 
-**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6). [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó el idioma de los informes de `export` e `import` (CL3). [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24, sumó el proyecto de origen al formato (HI2) y el import desde otra herramienta (HI4 a HI18); su V23 está en [`specs/storage`](../storage/spec.md) y el filtro `--origin-project` en [`specs/project`](../project/spec.md) (HI3).
+**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6). [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó el idioma de los informes de `export` e `import` (CL3). [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24, sumó el proyecto de origen al formato (HI2) y el import desde otra herramienta (HI4 a HI18); su V23 está en [`specs/storage`](../storage/spec.md) y el filtro `--origin-project` en [`specs/project`](../project/spec.md) (HI3). [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24, sumó que cada búsqueda de la importación llega a sus filas por índice (IL1) y que su tiempo crece con sus filas (IL5); su V25 está en [`specs/storage`](../storage/spec.md) (IL2 e IL3).
 
 ## Dónde está
 
@@ -353,3 +353,44 @@ El reporte MUST traer, además de lo de R7, las filas insertadas por idioma (`by
 Desde el agente del puente, una nota importada larga MUST leerse entera con `read_memory`, y `update_memory` y `delete_memory` MUST cambiarla, como cualquier fila que alcanza ([`specs/visibility`](../visibility/spec.md)).
 
 **Test:** `an_imported_long_note_reads_whole_and_changes_for_the_bridge_agent` (`crates/clawg-cli/tests/api.rs`).
+
+## IL1. Las búsquedas de la importación llegan a sus filas por índice
+
+Toda sentencia que la importación (`crates/clawg-core/src/memory/portability/import.rs`) ejecuta por fila o por save, y que busca por una columna o por el rowid, MUST tener en `EXPLAIN QUERY PLAN` una línea `SEARCH` que nombre su índice, y MUST NOT tener ninguna línea `SCAN` que recorra una tabla. `SCAN CONSTANT ROW`, la fila única de un `SELECT EXISTS (…)` sin `FROM`, no recorre ninguna tabla. Esto vale sin estadísticas del planificador. Ejecutada contra un store con filas, ninguna de esas sentencias MUST dar un paso de recorrido completo (`StatementStatus::FullscanStep` igual a 0). El índice que corresponde a cada una:
+
+| Sentencia | Índice |
+|---|---|
+| `ORIGIN_SQL` | `idx_memory_import_origin` |
+| `PRESENT_SQL`, con proyecto y sin él | `idx_memory_dedup` |
+| `TWIN_SQL`, con proyecto y sin él | `idx_memory_dedup` |
+| `TOPIC_HOLDERS_SQL` | `idx_memory_topic` |
+| `REVISED_SQL` | la clave primaria de `memory` (`INTEGER PRIMARY KEY`) |
+| `LINKED_SQL`, si la fila ya es una pieza (`write_links`) | `idx_memory_piece_memory` |
+| `NEXT_SAVE_SQL`, el próximo `save_id` (`write_links`) | la clave primaria de `memory_piece` |
+
+`PRESENT_SQL` MUST seguir encontrando la fila con el agente, el proyecto, el hash y la fecha dados, esté borrada o no: por eso `idx_memory_dedup` no tiene predicado ([`specs/storage`](../storage/spec.md) IL2).
+
+#### Escenario: la fila presente, por índice
+- GIVEN un store migrado y con filas
+- WHEN se pide el plan de `PRESENT_SQL` con un agente, un proyecto (o `NULL`), un hash y una fecha
+- THEN una línea es `SEARCH memory USING INDEX idx_memory_dedup (<expr>=? AND content_hash=? AND created_at=?)` y ninguna recorre una tabla
+- AND al ejecutarla no da ningún paso de recorrido completo
+
+#### Escenario: las demás búsquedas
+- GIVEN el mismo store
+- WHEN se pide el plan de cada una de las otras sentencias de la tabla y se la ejecuta
+- THEN cada plan nombra el índice de su fila de la tabla, ninguna línea recorre una tabla y ninguna ejecución da un paso de recorrido completo
+
+**Test:** `the_import_lookups_seek_an_index` (`import.rs`).
+
+## IL5. El tiempo de una importación crece con sus filas, no con su cuadrado
+
+Importar el doble de notas en un store vacío SHOULD tardar como mucho tres veces lo que tarda importar la mitad.
+
+#### Escenario
+- GIVEN dos stores vacíos
+- WHEN se importan N notas de una fila en el primero y 2N en el segundo, con el embedder falso
+- THEN las dos importaciones insertan todas sus notas
+- AND la segunda tarda como mucho tres veces lo que la primera
+
+**Test:** `twice_the_notes_import_in_at_most_three_times_the_time` (`import.rs`, `#[ignore]`). Depende de la máquina, así que queda fuera de CI, y sólo se comparan corridas de una misma compilación.
