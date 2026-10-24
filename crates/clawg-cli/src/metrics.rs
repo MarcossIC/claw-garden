@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use clawg_core::metrics::report::{report as group, By, Rows};
+use clawg_core::metrics::report::{report as group, since_for, By, Rows};
 use clawg_core::metrics::store::{MetricsDb, METRICS_FILE};
 
 use clawg_core::preferences::Lang;
@@ -37,7 +37,13 @@ pub fn report(
         Lang::Es => format!("no se pudo leer {}: {e}", path.display()),
     };
     let db = MetricsDb::open_read_only(&path).map_err(failed)?;
-    let since_ms = now_ms.saturating_sub(i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+    let by = match by {
+        ReportBy::Day => By::Day,
+        ReportBy::Hour => By::Hour,
+        ReportBy::Version => By::Version,
+        ReportBy::Minute => By::Minute,
+    };
+    let since_ms = since_for(by, now_ms.saturating_sub(i64::try_from(since.as_millis()).unwrap_or(i64::MAX)), now_ms);
 
     let names = db.names().map_err(failed)?;
     if !names.iter().any(|n| n == metric) {
@@ -59,11 +65,6 @@ pub fn report(
         Rows::Histograms(hists)
     };
     let runs = db.runs_since(since_ms).map_err(failed)?;
-    let by = match by {
-        ReportBy::Day => By::Day,
-        ReportBy::Hour => By::Hour,
-        ReportBy::Version => By::Version,
-    };
     let report = group(metric, rows, &runs, labels, by, since_ms);
     serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
 }
@@ -125,6 +126,19 @@ mod tests {
                 .unwrap();
         assert_eq!(gauge["kind"], "gauge");
         assert_eq!(gauge["groups"][0]["max"], 1024.0);
+    }
+
+    #[test]
+    fn a_report_by_minute_reads_the_minutes_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        seeded(dir.path());
+
+        let out = report(Lang::En, dir.path(), "process.rss_bytes", &[], ReportBy::Minute, Duration::from_secs(30 * 86_400), NOW).unwrap();
+
+        let json: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["by"], "minute");
+        assert_eq!(json["groups"][0]["key"], "2026-09-21 14:13");
+        assert_eq!(json["since_ms"], NOW - clawg_core::metrics::store::MINUTES_KEPT_MS + 2_800_000, "{json}");
     }
 
     #[test]

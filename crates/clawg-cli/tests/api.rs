@@ -272,6 +272,7 @@ impl Harness {
                     Arc::new(FakeEmbedder::default()),
                     reload,
                     Some(Duration::from_secs(600)),
+                    None,
                     &tokio::runtime::Handle::current(),
                 );
                 idle.unload().await;
@@ -3089,6 +3090,35 @@ async fn a_root_registered_without_its_docs_is_not_indexed() {
 
     assert_eq!(index_docs_of(&h, &label_id).await, Some(0));
     assert_eq!(clawg_core::memory::project_docs::doc_count(&h.ctx.runtime.store, &label_id).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn registering_an_accepted_root_without_asking_leaves_its_index_alone() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Readme\nindexed once\n").unwrap();
+    let root = dir.path().display().to_string();
+    let (_, body) = h.post_json("/v1/projects", json!({ "root_path": root, "index_docs": true })).await;
+    let id = body["project_id"].as_str().expect("project_id").to_string();
+    wait_for_docs(&h, &id, 1).await;
+    while h.ctx.runtime.project_docs.is_running(&id) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::write(dir.path().join("NOTES.md"), "# Notes\nwritten after\n").unwrap();
+    let other = tempfile::tempdir().expect("tempdir");
+    std::fs::write(other.path().join("README.md"), "# Readme\nread\n").unwrap();
+
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root })).await;
+    assert_eq!(status, 200, "{body}");
+    // Registered after, so once its docs are in, a refresh of the first root
+    // would have run too if the registration above had started one.
+    let (_, body) = h
+        .post_json("/v1/projects", json!({ "root_path": other.path().display().to_string(), "index_docs": true }))
+        .await;
+    wait_for_docs(&h, body["project_id"].as_str().expect("project_id"), 1).await;
+
+    assert_eq!(index_docs_of(&h, &id).await, Some(1), "the root stays accepted");
+    assert_eq!(clawg_core::memory::project_docs::doc_count(&h.ctx.runtime.store, &id).await.unwrap(), 1);
 }
 
 #[tokio::test]

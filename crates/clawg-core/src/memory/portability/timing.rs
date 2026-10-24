@@ -6,6 +6,8 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::metrics::{mib, MemoryProbe};
+
 /// A step of an import, in the order an import runs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -67,11 +69,13 @@ pub struct Timing {
     pub calls: Option<Calls>,
     /// The call that held the connection longest, or the slowest batch.
     pub slowest: Option<Duration>,
+    /// The private memory of the process as the step ended.
+    pub private_bytes: Option<u64>,
 }
 
 impl Timing {
     pub fn new(step: Step) -> Self {
-        Timing { step, elapsed: Duration::ZERO, rows: None, batches: None, calls: None, slowest: None }
+        Timing { step, elapsed: Duration::ZERO, rows: None, batches: None, calls: None, slowest: None, private_bytes: None }
     }
 
     /// Counts a call that took `waited` from being asked for to its answer,
@@ -119,6 +123,9 @@ impl fmt::Display for Timing {
         if let Some(slowest) = self.slowest {
             parts.push(format!("slowest {} ms", slowest.as_millis()));
         }
+        if let Some(bytes) = self.private_bytes {
+            parts.push(format!("private {}", mib(bytes)));
+        }
         write!(f, "{} {} s", self.step.name(), seconds(self.elapsed))?;
         if !parts.is_empty() {
             write!(f, " ({})", parts.join(", "))?;
@@ -133,15 +140,22 @@ pub struct ImportTimings {
     started: Instant,
     dry_run: bool,
     steps: Vec<Timing>,
+    memory: Option<MemoryProbe>,
 }
 
 impl ImportTimings {
     pub fn new(dry_run: bool) -> Self {
-        ImportTimings { started: Instant::now(), dry_run, steps: Vec::new() }
+        ImportTimings { started: Instant::now(), dry_run, steps: Vec::new(), memory: None }
+    }
+
+    /// Each step also logs the private memory `memory` reads as it ends.
+    pub fn with_memory(self, memory: MemoryProbe) -> Self {
+        ImportTimings { memory: Some(memory), ..self }
     }
 
     /// Logs a step that has just ended.
-    pub fn record(&mut self, timing: Timing) {
+    pub fn record(&mut self, mut timing: Timing) {
+        timing.private_bytes = self.memory.and_then(|read| read());
         log::info!("import: {timing}");
         self.steps.push(timing);
     }
@@ -210,6 +224,21 @@ mod tests {
         assert_eq!(links.to_string(), "links 0.0 s (1 call, 0.0 s in sqlite, 0.0 s queued, slowest 30 ms)");
 
         assert_eq!(timing(Step::Snapshot, 1_550).to_string(), "snapshot 1.6 s");
+        let embed = Timing { rows: Some(64), private_bytes: Some(851_443_712), ..timing(Step::Embed, 1_600) };
+        assert_eq!(embed.to_string(), "embed 1.6 s (64 rows, private 812.0 MiB)");
+    }
+
+    #[test]
+    fn each_step_carries_the_memory_as_it_ended_when_there_is_a_probe() {
+        let mut measured = ImportTimings::new(false).with_memory(|| Some(1_048_576));
+        measured.record(timing(Step::Read, 10));
+        measured.record(timing(Step::Plan, 0));
+        assert!(measured.steps().iter().all(|t| t.private_bytes == Some(1_048_576)), "{:?}", measured.steps());
+        assert_eq!(measured.steps()[0].to_string(), "read 0.0 s (private 1.0 MiB)");
+
+        let mut unmeasured = ImportTimings::new(false);
+        unmeasured.record(timing(Step::Read, 10));
+        assert_eq!(unmeasured.steps()[0].private_bytes, None);
     }
 
     #[test]
