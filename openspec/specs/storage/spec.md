@@ -299,7 +299,7 @@ La resolución es una función pura que recibe el home (`data_dir_in`, `paths.rs
 
 ### Migraciones atómicas
 
-Las migraciones pendientes de un arranque MUST aplicarse en una sola transacción junto con sus filas de historial (`configured`, `crates/clawg-core/src/memory/db.rs:394`, con `set_grouped(true)`). Si una falla, la base MUST quedar como estaba antes del arranque.
+Las migraciones pendientes de un arranque MUST aplicarse en una sola transacción junto con sus filas de historial (`configured`, `crates/clawg-core/src/memory/db.rs:417`, con `set_grouped(true)`). Si una falla, la base MUST quedar como estaba antes del arranque.
 
 #### Escenario: fallo a mitad
 - GIVEN una base vacía y la lista V1–V8 más una V9 cuyo SQL falla
@@ -360,7 +360,7 @@ Una base en V16 MUST abrir con V17 con cada fila igual, salvo `supersede_cause`,
 - WHEN se abre con la versión nueva
 - THEN la revisión queda `revision`, los dos veredictos `verdict`, la revisión deshecha `verdict`, y las demás filas sin causa ni `revived_from`
 
-**Tests:** `a_database_from_before_revivals_opens_with_its_supersede_causes` (`crates/clawg-core/src/memory/db.rs:1152`), que siembra V16 con SQL directo; el checksum de V17 en `published_migration_checksums_are_pinned` (`migrations.rs`). Que `clawg update` aplique V17 sobre una base en V16 con revisiones y veredictos, y que el daemon nuevo actúe según esas causas, está en [`specs/self-update`](../self-update/spec.md), S10, «Escenario: migración pendiente sobre filas sin causa de reemplazo».
+**Tests:** `a_database_from_before_revivals_opens_with_its_supersede_causes` (`crates/clawg-core/src/memory/db.rs:1175`), que siembra V16 con SQL directo; el checksum de V17 en `published_migration_checksums_are_pinned` (`migrations.rs`). Que `clawg update` aplique V17 sobre una base en V16 con revisiones y veredictos, y que el daemon nuevo actúe según esas causas, está en [`specs/self-update`](../self-update/spec.md), S10, «Escenario: migración pendiente sobre filas sin causa de reemplazo».
 
 #### Vuelta atrás de V17
 
@@ -386,7 +386,7 @@ Una base en V17 MUST abrir con V18 con cada fila igual y con los tres índices. 
 - WHEN se pide el plan de `REINFORCE_LOOKUP_SQL`
 - THEN nombra `idx_memory_dedup` y ninguna línea nombra `TEMP B-TREE`
 
-**Tests:** `a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them` (`crates/clawg-core/src/memory/db.rs:1320`), que abre con `MemoryStore::open`, así que pasa también por el snapshot `pre-migration`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs:2165`); el checksum de V18 en `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them` (`crates/clawg-core/src/memory/db.rs:1343`), que abre con `MemoryStore::open`, así que pasa también por el snapshot `pre-migration`; `reinforce_lookup_uses_dedup_index` (`store_insert.rs:2165`); el checksum de V18 en `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 #### Vuelta atrás de V18
 
@@ -416,7 +416,7 @@ Un binario anterior a V20 MUST NOT abrir una base en V20: la rechaza sin tocarla
 
 ### Verificación del esquema antes de migrar
 
-La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:409`, llamada en `db.rs:195`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
+La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:432`, llamada en `db.rs:200`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
 - GIVEN una base en la última versión del binario, N (hoy V22), con una fila N + 1 agregada en `refinery_schema_history`
@@ -431,7 +431,7 @@ La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST c
 
 ### Snapshot antes de migrar
 
-Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplicar la primera migración pendiente (`db.rs:229`). Si falla, MUST devolver `MemoryError::Backup` y MUST NOT migrar. Con `Fresh` y `UpToDate` MUST NOT hacer snapshot.
+Con plan `Pending`, `open` MUST hacer un snapshot `pre-migration` antes de aplicar la primera migración pendiente (`db.rs:234`). Si falla, MUST devolver `MemoryError::Backup` y MUST NOT migrar. Con `Fresh` y `UpToDate` MUST NOT hacer snapshot.
 
 #### Escenario
 - GIVEN una base migrada hasta V7, con filas
@@ -766,7 +766,7 @@ Después de cada snapshot automático, el directorio de backups MUST conservar l
 
 `clawg backup [--profile P]` (`crates/clawg-cli/src/main.rs:140`) MUST producir un snapshot `manual` e imprimir su ruta.
 
-- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1857`, ruta en `:1046`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/db.rs:271`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
+- Con el daemon andando, MUST pedirlo por `POST /v1/backup` (con el token; `crates/clawg-cli/src/daemon/api.rs:1857`, ruta en `:1046`), que lo hace en una conexión propia y corta, dentro de `spawn_blocking`, para que el `VACUUM INTO` no deje esperando detrás a cada llamada de la conexión del daemon (`MemoryStore::snapshot`, `crates/clawg-core/src/memory/db.rs:294`), y responde `{"path": "..."}`. El store en memoria de las pruebas, sin archivo, copia por su propia conexión.
 - Sin daemon, MUST tomar el lock del store con el titular `Maintenance` (`crates/clawg-core/src/memory/store_lock.rs:59`), copiar sin migrar y soltar el lock (`backup_offline`, `backup.rs:339`).
 - Sin `memory.db`, MUST decir que no hay base, sin crear el directorio de datos.
 

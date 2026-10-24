@@ -10,23 +10,23 @@
 
 | Premisa | Resultado |
 |---|---|
-| `REVISED_SQL` pone en `superseded` filas vivas del mismo origen | **Cierta, pero acotada.** Corre sólo cuando una nota ajena reescrita es más nueva que la última versión guardada (`Found::Revision { newer: true }`, `crates/clawg-core/src/memory/portability/import.rs:707-711`, `REVISED_SQL` en `:409-410`). Las filas que afecta salen de `ORIGIN_SQL` (`source = 'import' AND created_by_ref = ?1`, `:405-407`): son siempre filas de una importación anterior, nunca filas orgánicas. Un archivo de clawg no pasa por ahí: sin `notes`, `found` es `None` (`:667-675`). |
+| `REVISED_SQL` pone en `superseded` filas vivas del mismo origen | **Cierta, pero acotada.** Corre sólo cuando una nota ajena reescrita es más nueva que la última versión guardada (`Found::Revision { newer: true }`, `crates/clawg-core/src/memory/portability/import.rs:1183-1187`, `REVISED_SQL` en `:413-414`). Las filas que afecta salen de `ORIGIN_SQL` (`source = 'import' AND created_by_ref = ?1`, `:409-411`): son siempre filas de una importación anterior, nunca filas orgánicas. Un archivo de clawg no pasa por ahí: sin `notes`, `found` es `None` (`:1143-1151`). |
 | `Placement::Merged` toca la fila que ya estaba | **Falsa.** `place` devuelve `Merged` antes de cualquier escritura (`:563-565` y `:578-582`), y `write_links` salta las filas no propias (`:727-729`). No suma accesos: el informe lo documenta (`:104`). |
 | `write_links` rellena vínculos de filas ya presentes | **Cierta.** Una fila `Present` es propia (`owned`, `:342-344`) y recibe `superseded_by` donde era nulo y estaba `superseded` (`:734-738`), `revived_from` donde era nulo (`:749`), `disputed_against` donde era nulo y estaba `disputed` (`:770-773`), derivaciones con `INSERT OR IGNORE` (`:786-790`) y piezas (`:862-865`). Una `Present` puede ser una fila orgánica si el archivo es un export de este mismo store (`PRESENT_SQL`, `:494-497`, no mira `source`). |
 | Los pares `memory_conflict` de relaciones ajenas pueden tocar una fila previa | **Cierta, sin llegar a volverla `disputed`.** Un par se escribe si al menos un extremo es propio (`:800`), y el otro puede ser una fila previa a la que una fila del archivo se fusionó (`id_of` devuelve el id de la `Merged`, `:803`). `INSERT OR IGNORE` sobre `PRIMARY KEY (new_id, old_id)` (`migrations/V15__memory_conflict.sql:20`). El estado `disputed` y `disputed_against` se aplican en `translate` sobre la fila del archivo (`translate.rs:744-750`) y en `write_links` sólo sobre una fila propia (`:770-773`): una fila previa no cambia de estado, pero un par `escalated` con ella sí aparece en los conflictos activos. |
 | Una `supersedes` ajena reemplaza filas previas | **Falsa.** El veredicto edita las filas de la traducción (`translate.rs:752-762`), no las del store. |
-| `record_projects` toca algo más que filas nuevas | **Falsa.** `INSERT OR IGNORE` en `project` y `project_remote` (`import.rs:529-543`), `index_docs = 0`. Puede dejar una raíz que no existía. |
-| Las piezas, vectores e índice de texto de las filas insertadas son sólo de ellas | **Cierta, con un matiz.** El vector va en la misma transacción (`:639-641`); el índice de texto lo agrega el disparador de inserción (`migrations/V8__memory_fts.sql:63-66`) y una fila insertada ya borrada se quita con el disparador de borrado (`:73-78`, `:84-88`). Las piezas de un archivo clawg se enlazan con los ids de `placed`, **fusionadas incluidas** (`import.rs:847`): una fila previa fusionada puede recibir un enlace `memory_piece` si ninguna de las colocadas tiene uno. |
+| `record_projects` toca algo más que filas nuevas | **Falsa.** `INSERT OR IGNORE` en `project` y `project_remote` (`import.rs:1059-1069`), `index_docs = 0`. Puede dejar una raíz que no existía. |
+| Las piezas, vectores e índice de texto de las filas insertadas son sólo de ellas | **Cierta, con un matiz.** El vector va en la misma transacción (`:639-641`); el índice de texto lo agrega el disparador de inserción (`migrations/V8__memory_fts.sql:63-66`) y una fila insertada ya borrada se quita con el disparador de borrado (`:73-78`, `:84-88`). Las piezas de un archivo clawg se enlazan con los ids de `placed`, **fusionadas incluidas** (`import.rs:1297`): una fila previa fusionada puede recibir un enlace `memory_piece` si ninguna de las colocadas tiene uno. |
 | El informe trae un número de importación | **Falsa.** `ImportReport` (`:93-123`) sólo trae `snapshot: Option<String>` (`:114`, escrito en `:1037`). No hay tabla de diario: la última migración es V24 (`migrations.rs:68`). |
 | El deshacer de un movimiento se puede copiar tal cual | **Parcial.** `memory_move` y `memory_move_supersede` (V21, V24) guardan el estado previo y deshacer exige que la fila siga donde el movimiento la dejó (`relocate.rs:644-654`). Un movimiento no crea filas ni vínculos, una importación sí: el diario necesita además la lista de lo insertado y de lo agregado. |
 | Mantenimiento y refuerzo no alteran la fila | **Falsa para dos columnas.** `demote_sql` baja el `tier` y **estampa `last_modified_at`** (`maintenance.rs:43-50`); un guardado duplicado suma `access_count` y mueve `last_accessed_at` (`store_insert.rs:510-517`). Ninguna de las dos es una edición: `last_modified_at`, `tier` y los accesos no pueden entrar en el criterio. Una edición, en cambio, suma `update_count` (`admin.rs:261-267`) y restaurar también (`admin.rs:565-566`); un movimiento no (`relocate.rs:417`). |
-| Borrar una fila insertada con la ruta normal basta | **Falsa.** `delete_memory_core` pone `deleted_at`, quita el vector (`admin.rs:440-441`) y **dispara la reviviscencia** (`:450`, `revival.rs:140`), que traería de vuelta filas que ese borrado no tiene por qué tocar. Y una fila borrada sigue contando como presente: `find` devuelve `Present` si la versión está borrada (`import.rs:443-446`) y `PRESENT_SQL` no mira `deleted_at`. |
+| Borrar una fila insertada con la ruta normal basta | **Falsa.** `delete_memory_core` pone `deleted_at`, quita el vector (`admin.rs:440-441`) y **dispara la reviviscencia** (`:450`, `revival.rs:140`), que traería de vuelta filas que ese borrado no tiene por qué tocar. Y una fila borrada sigue contando como presente: `find` devuelve `Present` si la versión está borrada (`import.rs:943-946`) y `PRESENT_SQL` no mira `deleted_at`. |
 
 ## Problema (verificado contra el código)
 
 ### 1. Sólo existe el snapshot
 
-La importación escribe un snapshot `pre-import` antes de escribir (`import.rs:999`, `Reason::PreImport`, `backup.rs:139`) y devuelve su ruta (`:1037`). `clawg restore` reemplaza todo el store (CLAUDE.md, `clawg restore`): lo guardado después se pierde. Una importación grande se nota de inmediato o semanas después, y en el segundo caso el snapshot cuesta más de lo que protege. Además la poda conserva cinco automáticos y el más nuevo de cada motivo (`backup.rs:286-305`), de modo que el snapshot de una importación vieja puede haberse ido.
+La importación escribe un snapshot `pre-import` antes de escribir (`import.rs:1459`, `Reason::PreImport`, `backup.rs:139`) y devuelve su ruta (`:1037`). `clawg restore` reemplaza todo el store (CLAUDE.md, `clawg restore`): lo guardado después se pierde. Una importación grande se nota de inmediato o semanas después, y en el segundo caso el snapshot cuesta más de lo que protege. Además la poda conserva cinco automáticos y el más nuevo de cada motivo (`backup.rs:286-305`), de modo que el snapshot de una importación vieja puede haberse ido.
 
 ### 2. No queda registro de qué filas son de qué importación
 
@@ -49,9 +49,9 @@ Edición (`update_memory`: `update_count`), borrado, restauración, `purge` (fue
 
 - El patrón de V21/V24: tabla sin clave foránea («`purge` removes rows for good, and an old move must not stop it», `migrations/V21__memory_move.sql:10`), número `MAX(...)+1` (`relocate.rs:412`), deshacer en dos pasos (primero el estado previo de lo reemplazado, luego las filas que siguen como quedaron, `relocate.rs:644-666`), instantánea `pre-move` antes de escribir (`:581`) y `dry_run` por la misma ruta de decisión (`:568-580`).
 - `release_challengers` (`dispute.rs:197`) libera a quien disputaba una fila que se va; `purge` ya sabe quitar vector, pares y derivaciones de una fila (`secrets.rs:225-232`).
-- `ImportReport` ya es `Serialize/Deserialize` con `#[serde(default)]` para campos nuevos (`import.rs:116-122`).
+- `ImportReport` ya es `Serialize/Deserialize` con `#[serde(default)]` para campos nuevos (`import.rs:120-126`).
 - `write` ya tiene un único sitio donde se inserta (`INSERT_SQL`, `:602`), uno donde se reemplaza (`:709`), uno donde se registran proyectos (`:526`) y uno donde se escriben vínculos (`:720`).
-- `Reason` con su prueba de ida y vuelta de nombres (`backup.rs:680-693`) y la prueba de checksums fijados (`migrations.rs:43-81`).
+- `Reason` con su prueba de ida y vuelta de nombres (`backup.rs:680-693`) y la prueba de checksums fijados (`migrations.rs:43-82`).
 - El patrón de prueba «un store de la versión anterior conserva sus filas» (`db.rs:1625-1664`).
 
 ## Enfoques posibles
@@ -87,7 +87,7 @@ No cuentan, a propósito: `project_id`/`scope` (el movimiento posterior a import
 
 ### B. Borrado lógico en lugar de real
 
-Marcar `deleted_at` en las filas insertadas (la ruta de `delete_memory_core`) y dejar que `undelete` las traiga. **Problema que lo descarta como defecto:** una fila borrada cuenta como presente (`import.rs:443-446`, `PRESENT_SQL` sin `deleted_at`), así que el mismo archivo no se puede reimportar tras deshacerlo, y además dispara reviviscencia y deja el texto en el store, que es lo que quien deshace quiere sacar. Su ventaja real es la reversibilidad; la da mejor el snapshot que se toma justo antes de deshacer (ver B′).
+Marcar `deleted_at` en las filas insertadas (la ruta de `delete_memory_core`) y dejar que `undelete` las traiga. **Problema que lo descarta como defecto:** una fila borrada cuenta como presente (`import.rs:943-946`, `PRESENT_SQL` sin `deleted_at`), así que el mismo archivo no se puede reimportar tras deshacerlo, y además dispara reviviscencia y deja el texto en el store, que es lo que quien deshace quiere sacar. Su ventaja real es la reversibilidad; la da mejor el snapshot que se toma justo antes de deshacer (ver B′).
 
 ### B′. Snapshot antes de deshacer
 
@@ -113,7 +113,7 @@ Diario completo (A), borrado real y un snapshot `pre-undo` antes de escribir (B�
 | Opción | Razón técnica |
 |---|---|
 | Reemplazar el snapshot por el deshacer | Ya decidido: el snapshot cubre lo que el diario no (un diario corrupto, una fila purgada, una migración). El deshacer lo complementa. |
-| Borrado lógico (`deleted_at`) como mecanismo | Ver B: bloquea la reimportación (`import.rs:443-446`), dispara reviviscencia (`admin.rs:450`) y deja el texto. |
+| Borrado lógico (`deleted_at`) como mecanismo | Ver B: bloquea la reimportación (`import.rs:943-946`), dispara reviviscencia (`admin.rs:450`) y deja el texto. |
 | Comparar `last_modified_at` o `tier` para saber si la fila cambió | Mantenimiento los mueve sin intervención (`maintenance.rs:43-50`); todas las filas viejas fallarían el criterio. |
 | Exigir `project_id` igual al de la importación | `projects move --origin-project` es el paso previsto después de importar; el criterio bloquearía el caso de uso principal. |
 | Etiquetar `memory` con `import_id` | Migración de la tabla más grande, no cubre lo agregado a filas previas ni los archivos clawg (enfoque C). |
@@ -123,7 +123,7 @@ Diario completo (A), borrado real y un snapshot `pre-undo` antes de escribir (B�
 
 ## Interacciones
 
-- **import-linear (81).** Cambia los índices y la forma de `PRESENT_SQL`/`TWIN_SQL`; no cambia qué se inserta. El diario no depende de ellos. Si 81 agrega una migración, los números de migración se asignan por orden de llegada; esta exploración los llama «la siguiente libre» y la prueba de checksums fijados (`migrations.rs:44-69`) exige una fila por migración.
+- **import-linear (81).** Cambia los índices y la forma de `PRESENT_SQL`/`TWIN_SQL`; no cambia qué se inserta. El diario no depende de ellos. Si 81 agrega una migración, los números de migración se asignan por orden de llegada; esta exploración los llama «la siguiente libre» y la prueba de checksums fijados (`migrations.rs:44-70`) exige una fila por migración.
 - **import-decision-pass (82).** Reescribe `write`, `place` y `place_rows`. Condición para el diario: la escritura del diario va **junto a la inserción real** (`INSERT_SQL`, hoy `:602`) y a `REVISED_SQL` (hoy `:709`), no a la decisión. Hoy el pase de decisión corre en una transacción que se descarta (`:966-977`); si 82 la conserva, las escrituras del diario ahí se deshacen solas, pero cuestan, y si 82 la elimina deben ir detrás de la bandera de escritura. Si 82 pasa a inserciones por lote, el diario las sigue en la misma sentencia o transacción. El número de importación se asigna en la primera transacción de escritura, no en el pase de decisión.
 - **import-job (87).** El número de importación es el del trabajo: `memory_import` es la tabla que 87 extiende (estado, progreso) en lugar de crear otra. Esta exploración sólo agrega `started_at` y `finished_at`; no diseña el trabajo. Deshacer una importación **en curso** debe rechazarse (el daemon sabe cuáles corre); una cortada tiene `finished_at` nulo y se puede deshacer.
 - **import-pieces (83).** No cambia el esquema. Si cambia cómo se parten las notas, un deshacer de una importación hecha con el corte anterior sigue funcionando: el diario guarda ids, no textos.

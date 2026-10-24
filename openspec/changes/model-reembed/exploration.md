@@ -27,7 +27,7 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 ### Dónde vive el contrato y qué ve el usuario
 
 - La tabla `embedding_contract` guarda una fila con `model_id`, `dim`, `query_prefix` y `passage_prefix` (`crates/clawg-core/migrations/V5__embedding_contract.sql`). También `metric` y `normalized`, que no se comparan.
-- `ensure_embedding_contract` la escribe si no existe y la compara byte a byte si existe (`crates/clawg-core/src/memory/db.rs:309-358`). Una diferencia da `Mismatch`.
+- `ensure_embedding_contract` la escribe si no existe y la compara byte a byte si existe (`crates/clawg-core/src/memory/db.rs:332-381`). Una diferencia da `Mismatch`.
 - La identidad la informa el embedder. Modelo y dimensión salen de literales en `FastEmbedLocal::from_bytes` (`embedder.rs:268-269`). Los prefijos salen de dos constantes (`embedder.rs:214-220`).
 - El bootstrap compara **después** de bajar y cargar el modelo (`bootstrap.rs:320-346`). Ante un mismatch deja la celda del embedder vacía y devuelve `BootstrapError::Mismatch`. No reintenta (`specs/ingest`, líneas 184-185).
 - **Lo que ve el usuario:**
@@ -62,7 +62,7 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 ### Las tres tablas vec0 tienen la dimensión escrita
 
 - `memory_vectors`, `episodic_vectors` y `procedural_vectors` son `vec0(embedding float[384])` (`V2__vectors.sql:7,10,13`). La dimensión no se puede alterar: hay que recrear la tabla.
-- V2 está fijada por checksum (`crates/clawg-core/src/memory/migrations.rs:43-55`, `published_migration_checksums_are_pinned`). Se cambia con una migración **nueva**, nunca editando V2.
+- V2 está fijada por checksum (`crates/clawg-core/src/memory/migrations.rs:43-70`, `published_migration_checksums_are_pinned`). Se cambia con una migración **nueva**, nunca editando V2.
 - Cambiar la dimensión necesita, como mínimo:
   1. una tabla nueva por cada una de las tres, con la dimensión nueva;
   2. llenarlas re-infiriendo todo el texto (un vector de 384 no se convierte a otra dimensión);
@@ -79,9 +79,9 @@ Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo
 ### ¿Hay un test que fije el contrato de producción?
 
 - **Prefijos: sí.** `e5_prefix_constants_are_symmetric_with_the_load_bearing_trailing_space` (`embedder.rs:730-738`). Cambiarlos rompe un test.
-- **Modelo y dimensión de producción: no.** `FastEmbedLocal` sólo se construye con `from_bytes`, que necesita el modelo real. Los literales `384` y `"multilingual-e5-small"` (`embedder.rs:268-269`) no los verifica ningún test automático. Los tests de `db.rs:1816-1828` y `bootstrap.rs:889-1007` usan embedders simulados con valores escritos a mano, así que pasarían igual si el de producción cambiara. El único `384` que se afirma es el del `FakeEmbedder` (`embedder.rs:493-496`).
+- **Modelo y dimensión de producción: no.** `FastEmbedLocal` sólo se construye con `from_bytes`, que necesita el modelo real. Los literales `384` y `"multilingual-e5-small"` (`embedder.rs:268-269`) no los verifica ningún test automático. Los tests de `db.rs:2764-2892` y `bootstrap.rs:889-1007` usan embedders simulados con valores escritos a mano, así que pasarían igual si el de producción cambiara. El único `384` que se afirma es el del `FakeEmbedder` (`embedder.rs:493-496`).
 - **Nada compara la dimensión del embedder con la de V2.** Si alguien subiera `dimensions` a 768 sin migración, las bases existentes darían mismatch y, en una base nueva, los inserts fallarían contra `float[384]`.
-- El comportamiento del mismatch sí está probado (`db.rs:1923,1921,1941`; `bootstrap.rs:889,960`).
+- El comportamiento del mismatch sí está probado (`db.rs:2814,2839,2859`; `bootstrap.rs:889,960`).
 
 ### Opciones ante una fila que no se puede embeber
 
