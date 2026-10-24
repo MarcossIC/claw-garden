@@ -33,9 +33,9 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 - [x] Suite y clippy de `.claude/CLAUDE.md` en Linux.
 - [x] El banco de 81 con el diario y el tiempo de `--undo` de 20.000 notas, en `verify.md`.
-- [ ] Suite y clippy en Windows (`target-test`).
-- [ ] El CI en verde en Linux y Windows.
+- [x] Suite y clippy en Windows (`target-test`).
+- [x] El CI en verde en Linux y Windows.
 
 ## 7. Archive
 
-- [ ] `specs/portability` y `specs/storage` con IU1 a IU6; `git mv` a `changes/archive/AAAA-MM-DD-import-undo`; `state.yaml` archivado; la fila 84 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] `specs/portability` con IU1 a IU5 y `specs/storage` con IU6; `git mv` a `changes/archive/2026-10-24-import-undo`; `state.yaml` archivado; la fila 84 y el orden de ejecución del `README.md` de openspec; subir el minor. También se sumó a IU2 la prueba de índices del deshacer, que la spec del cambio no nombraba ([verify](verify.md#al-archivar-2026-10-24)).

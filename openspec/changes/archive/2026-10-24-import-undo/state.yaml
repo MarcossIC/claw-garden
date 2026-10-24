@@ -1,7 +1,7 @@
 change: import-undo
 objective: "1"
 depends_on: [import-linear, import-decision-pass]
-phase: verify
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,7 +9,7 @@ artifacts:
   design: skipped  # las alternativas están en la exploración (A, B, B′, C) y lo elegido en la propuesta
   tasks: done
   apply: done
-  verify: in_progress  # Linux hecho; faltan Windows y el CI
-  archive: pending
+  verify: done  # Linux, Windows y el CI de Linux y Windows
+  archive: done
 updated: 2026-10-24
 main_spec: openspec/specs/portability/spec.md

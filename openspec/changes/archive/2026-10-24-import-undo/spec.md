@@ -1,5 +1,7 @@
 # import-undo — Especificación
 
+Suma requisitos a [`specs/portability`](../../../specs/portability/spec.md), IU1 a IU5 con sus ids, y a [`specs/storage`](../../../specs/storage/spec.md), IU6.
+
 ## IU1. Cada import que escribe tiene un número y un diario
 
 Un import que escribe algo MUST quedar en `memory_import` con un número (`MAX + 1`), su inicio, su fuente (`clawg` o `engram`) y su snapshot `pre-import`, y su reporte MUST traer ese número en `import_id`. En la misma transacción que cada escritura MUST quedar en el diario:

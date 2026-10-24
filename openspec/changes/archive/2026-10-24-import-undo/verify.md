@@ -34,7 +34,17 @@ Con un test temporal que no se commiteó, en debug: importar notas de una fila d
 
 Lineal. Ninguna llamada a la conexión dura con el import: la carga va en llamadas de 256 búsquedas y el borrado en transacciones de 256 filas.
 
-## Pendiente
+## Windows (2026-10-24)
 
-- La suite y clippy en Windows (`target-test`).
-- El CI del pull request en Linux y Windows.
+En `30387e8`, la cabeza de `develop`, pasan la suite (`cargo test --locked --workspace --target-dir target-test`, con `target-test` limpio de los artefactos del workspace) y los dos clippy de `.claude/CLAUDE.md`. Su `crates/` es el de la cabeza del pull request (`7f9af3d`) más los commits del divisor de piece-boundaries (83), que entraron a `develop` por otro lado, así que la corrida cubre los dos cambios juntos. Quedan ignorados los dos bancos (`the_socket_is_not_slower_than_tcp` y el de 81) y los dos tests que piden el modelo real (`the_real_tokenizer_cuts_no_piece_inside_a_word` y `the_vectors_are_the_ones_fastembed_gave`).
+
+## CI
+
+El del pull request #90 (cabeza `7f9af3d`) pasó en `ubuntu-latest` y en `windows-latest`.
+
+## Al archivar (2026-10-24)
+
+- IU1 a IU5 pasan a [`specs/portability`](../../../specs/portability/spec.md) con sus ids, e IU6 a [`specs/storage`](../../../specs/storage/spec.md), «El diario de los imports», con la vuelta atrás de V26 que la spec del cambio no escribía. En `storage`, `pre-undo` se suma a los motivos de los que la poda conserva el más nuevo, que ya era lo que hacía `to_prune`, y las menciones de «hoy V25» pasan a V26.
+- La spec del cambio no nombraba `the_undo_lookups_seek_an_index`, la prueba de que cada lectura y cada borrado por fila del deshacer busca por un índice (arriba, **Índices**). IU2 la suma como requisito en `specs/portability`, junto con las llamadas de `LOAD_BATCH` y las transacciones de `WRITE_BATCH` de la decisión 7 de la propuesta.
+- «Dónde está» de `specs/portability` nombra el diario y el deshacer, y sus citas de `import.rs`, que este cambio corrió unas cien líneas, apuntan otra vez a cada símbolo.
+- Las citas `import.rs:N` de la exploración y de la propuesta quedan como estaban: describen el código contra el que se escribieron.

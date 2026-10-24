@@ -20,6 +20,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «El idioma de cada fila», LP4 y LP5 de esa spec). La preferencia y su archivo están en [`specs/preferences`](../preferences/spec.md).
 - [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (sólo «El proyecto de origen», HI1 de esa spec). Cómo se llena la columna está en [`specs/portability`](../portability/spec.md).
 - [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24 (sólo V25: IL2, su vuelta atrás e IL3). Que la importación llegue a sus filas por índice está en [`specs/portability`](../portability/spec.md) (IL1 e IL5).
+- [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24 (sólo V26, «El diario de los imports», IU6, y el motivo `pre-undo` en la poda). Qué escribe el diario y cómo se deshace un import está en [`specs/portability`](../portability/spec.md) (IU1 a IU5).
 
 ## Definiciones
 
@@ -316,7 +317,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V25) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V26) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -429,7 +430,7 @@ Una base en V24 MUST abrir con V25 con cada fila tal como estaba, después de la
 - AND una consulta `INDEXED BY idx_memory_dedup` encuentra la fila borrada por su proyecto, su hash y su fecha
 - AND en `backups` hay una copia `pre-migration`
 
-**Tests:** `a_store_from_before_the_unfiltered_dedup_index_keeps_its_rows` (`crates/clawg-core/src/memory/db.rs`), que abre con `MemoryStore::open`; el checksum de V25 en `published_migration_checksums_are_pinned` (`migrations.rs`); `a_v8_database_opens_unchanged_under_grouped_migrations`, `idempotent_migrations_second_open` y `e2e_store_smoke` (`db.rs`), que cuentan 25 migraciones.
+**Tests:** `a_store_from_before_the_unfiltered_dedup_index_keeps_its_rows` (`crates/clawg-core/src/memory/db.rs`), que abre con `MemoryStore::open`; el checksum de V25 en `published_migration_checksums_are_pinned` (`migrations.rs`); `a_v8_database_opens_unchanged_under_grouped_migrations`, `idempotent_migrations_second_open` y `e2e_store_smoke` (`db.rs`), que cuentan todas las migraciones.
 
 #### Vuelta atrás de V25
 
@@ -451,7 +452,7 @@ Un binario anterior a V25 MUST NOT abrir una base en V25: la rechaza sin tocarla
 La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:432`, llamada en `db.rs:200`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V25), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V26), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 
@@ -778,7 +779,7 @@ Un snapshot MUST incluir el outbox, y con él el texto enmascarado de los saves 
 
 ### Retención
 
-Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:241`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`, `pre-import`, `pre-move`, `pre-rekey`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:248`); el borrado es best-effort.
+Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:290`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`, `pre-import`, `pre-move`, `pre-rekey`, `pre-undo`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:297`); el borrado es best-effort.
 
 #### Escenario
 - GIVEN 7 snapshots automáticos, 2 manuales y un `notas.txt`
@@ -946,6 +947,32 @@ Un binario anterior a V23 MUST NOT abrir una base en V23: la rechaza sin tocarla
 V24 MUST crear `project_remote` (`remote` como clave primaria, `project_id`, `created_at`) y `memory_move_supersede` (`move_id`, `row_id`, `superseded_by`, `from_status`, `from_superseded_by`, `from_cause`, con un índice por `move_id`), y un índice de `project` por `root_path`, sin tocar ninguna fila. Una base en V23 MUST abrir con las dos tablas vacías y cada fila de `memory` y de `project` igual. La vuelta atrás del esquema es el snapshot `pre-migration`, o deshacer las uniones y `DROP INDEX idx_project_root; DROP TABLE memory_move_supersede; DROP TABLE project_remote; DELETE FROM refinery_schema_history WHERE version = 24;`. Un registro que une filas escribe antes el snapshot `pre-rekey` (`Reason::PreRekey`; [`specs/project`](../project/spec.md) R17).
 
 **Test:** `a_database_from_the_previous_version_opens_with_no_remote_recorded` (`db.rs`), `published_migration_checksums_are_pinned` (`migrations.rs`).
+
+## El diario de los imports
+
+### IU6. V26
+
+V26 (`crates/clawg-core/migrations/V26__import_journal.sql`) MUST agregar sólo las cuatro tablas del diario y sus índices por número, sin claves foráneas, y MUST NOT tocar ninguna fila. Sin claves foráneas porque `purge` borra filas para siempre sin pasar por el diario, y un import viejo no debe frenarlo:
+
+| Tabla | Columnas | Índice |
+|---|---|---|
+| `memory_import` | `import_id` (clave primaria), `started_at`, `finished_at`, `source`, `snapshot` | la clave primaria |
+| `memory_import_row` | `import_id`, `row_id`, `update_count`, `deleted_at`, `supersede_cause` | `idx_memory_import_row` (`import_id`, `row_id`) |
+| `memory_import_supersede` | `import_id`, `row_id`, `superseded_by`, `from_status`, `from_superseded_by`, `from_cause` | `idx_memory_import_supersede` (`import_id`) |
+| `memory_import_extra` | `import_id`, `kind` (`fill`, `pair`, `derivation`, `piece`, `project` o `remote`), `a`, `b`, `value` | `idx_memory_import_extra` (`import_id`) |
+
+Una base en V25 MUST abrir con V26 con cada fila de `memory` como estaba y las cuatro tablas vacías, después de la copia `pre-migration`. Qué escribe cada import en el diario y cómo lo lee el deshacer está en [`specs/portability`](../portability/spec.md) (IU1 a IU3). `pre-undo` (`Reason::PreUndo`) MUST ir y volver como nombre de snapshot: es el que escribe `clawg import --undo` antes de escribir (IU2), y la poda conserva el más nuevo como el de cada motivo automático.
+
+#### Escenario: un store anterior
+- GIVEN un `memory.db` migrado hasta V25, con una fila importada de otra herramienta
+- WHEN se abre con `MemoryStore::open`
+- THEN la fila tiene las mismas columnas que antes y las cuatro tablas del diario están vacías
+
+**Tests:** `a_store_from_before_the_import_journal_keeps_its_rows` (`crates/clawg-core/src/memory/db.rs`); la fila 26 de `published_migration_checksums_are_pinned` (`migrations.rs`); `snapshot_names_parse_back_to_their_reason` (`backup.rs`).
+
+#### Vuelta atrás de V26
+
+Un binario anterior a V26 MUST NOT abrir una base en V26: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`. Quitar V26 a mano no pierde ninguna fila de memoria, sólo el diario, y con él la forma de deshacer los imports hechos desde la migración, que quedan con su snapshot `pre-import`: `DROP TABLE memory_import_extra; DROP TABLE memory_import_supersede; DROP TABLE memory_import_row; DROP TABLE memory_import; DELETE FROM refinery_schema_history WHERE version = 26;`. Un deshacer se revierte con su snapshot `pre-undo`.
 
 ## El idioma de cada fila
 
