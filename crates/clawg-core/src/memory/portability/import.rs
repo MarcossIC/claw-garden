@@ -2444,4 +2444,29 @@ mod tests {
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
+
+    /// An import's time grows with its rows: twice the notes, of one row each,
+    /// take at most three times as long. Only runs of one build compare.
+    #[tokio::test]
+    #[ignore = "a benchmark: run it with `cargo test -p clawg-core --release --lib -- --ignored twice_the_notes --nocapture`"]
+    async fn twice_the_notes_import_in_at_most_three_times_the_time() {
+        const NOTES: usize = 10_000;
+        async fn timed(count: usize) -> (std::time::Duration, ImportReport) {
+            let store = MemoryStore::new_for_test().await.unwrap();
+            let notes = (0..count).map(|k| named(&format!("n{k}"), k as i64)).collect();
+            let started = std::time::Instant::now();
+            let (report, _) = run_foreign(&store, notes, ImportOptions::default()).await;
+            let elapsed = started.elapsed();
+            // The snapshot's path carries the time it was written; without it
+            // the report's hash is the same in every run that imports alike.
+            let report = ImportReport { snapshot: None, ..report };
+            println!("{count} notes in {elapsed:?}, report {}", content_hash(&serde_json::to_string(&report).unwrap()));
+            (elapsed, report)
+        }
+        let (once, small) = timed(NOTES).await;
+        let (twice, large) = timed(2 * NOTES).await;
+        assert_eq!((small.inserted, large.inserted), (NOTES, 2 * NOTES));
+        let ratio = twice.as_secs_f64() / once.as_secs_f64();
+        assert!(ratio <= 3.0, "{NOTES} notes in {once:?}, twice as many in {twice:?}: {ratio:.2} times");
+    }
 }
