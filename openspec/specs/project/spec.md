@@ -9,6 +9,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22 (R8 a R13: mover filas de `memory` a otro proyecto o a ninguno, con su unidad, su registro y su vuelta atrás).
 - [project-clone-identity](../../changes/archive/2026-10-23-project-clone-identity/proposal.md), archivado el 2026-10-23 (R14 a R19: el daemon asigna los ids, los clones de un remoto comparten el proyecto, y unir reconcilia; cambia R4 y R6).
 - [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (HI3: elegir y listar filas por su proyecto de origen).
+- [project-registry](../../changes/project-registry/proposal.md), entrega 0, publicada en 0.62.1 (R20: una fila de un camino sirve a una raíz sólo si su remoto no la contradice; cambia R15, R16 y R18).
 
 ## Definiciones
 
@@ -260,13 +261,13 @@ Cada fila que un movimiento cambia, por cualquier puerta, MUST dejar en `memory_
 
 ## R15. El registro asigna el id de raíz
 
-Con `assigned`, una raíz que ya está en `project` MUST conservar su id, y una que no MUST recibir el primero de sus candidatos que no es el id de otra raíz (`root_id_in`, `project.rs`). Ninguna raíz MUST quedar con el id de otra y ningún registro MUST fallar porque dos hashes choquen; con los 64 candidatos tomados, MUST fallar sin escribir (409 `no_free_project_id`).
+Con `assigned`, una raíz que ya está en `project` MUST conservar el id de la fila que su remoto elige (R20), y una que no MUST recibir el primero de sus candidatos que no es el id de otra fila (`root_id_in`, `project.rs`). Ninguna raíz MUST quedar con el id de otra y ningún registro MUST fallar porque dos hashes choquen; con los 64 candidatos tomados, MUST fallar sin escribir (409 `no_free_project_id`).
 
 **Tests:** `the_root_of_always_keeps_its_id`, `a_root_whose_id_is_taken_gets_the_next_free_one`, `a_root_keeps_the_id_it_was_given`, `every_id_taken_is_an_error_that_writes_nothing`, `the_candidates_of_a_root_keep_its_name_and_start_with_its_id` (`project.rs`, `identity.rs`); `registering_two_roots_that_collide_gives_each_its_own_id` (`tests/api.rs`); `a_colliding_root_gets_a_project_of_its_own` (`server.rs`).
 
 ## R16. Los clones de un remoto comparten el proyecto
 
-Con `assigned`, una raíz con clave MUST usar como id de proyecto el que `project_remote` (V24) da a su clave, y si no hay, MUST guardarle su id de raíz. Así la primera raíz que trae un remoto conserva su id y sus filas, un remoto nuevo de una raíz ya registrada no le cambia el proyecto, y una raíz cuyo remoto ya es de otro proyecto une a él sus filas (R4, R17). Dos remotos son dos proyectos (un fork lo es). Los docs siguen siendo de cada raíz (`specs/project-docs`).
+Con `assigned`, una raíz con clave MUST usar como id de proyecto el que `project_remote` (V24) da a su clave, y si no hay, MUST guardarle su id de raíz. Así la primera raíz que trae un remoto conserva su id y sus filas, un primer remoto de una raíz ya registrada no le cambia el proyecto, un remoto distinto del que ya tenía atado le da otro (R20), y una raíz cuyo remoto ya es de otro proyecto une a él sus filas (R4, R17). Dos remotos son dos proyectos (un fork lo es). Los docs siguen siendo de cada raíz (`specs/project-docs`).
 
 Los clientes MUST usar el id que responde el daemon: el puente (R6), los hooks ([`specs/hooks`](../hooks/spec.md) R6), `clawg projects add`, `projects move --to` y `--here`. `clawg memories --here` y `clawg export --project` MUST leerlo del store sin escribir (`project_id_of`, `crates/clawg-core/src/memory/portability/export.rs`), y el import lo planea igual ([`specs/portability`](../portability/spec.md) R4).
 
@@ -275,7 +276,7 @@ Los clientes MUST usar el id que responde el daemon: el puente (R6), los hooks (
 - WHEN se registra la segunda
 - THEN las dos filas están bajo el id de la primera, la segunda conserva su id de raíz, y `memory_move` lista la fila movida
 
-**Tests:** `a_second_clone_joins_the_project_of_the_first`, `a_clone_joins_with_one_live_row_per_text`, `a_new_remote_keeps_the_project_of_its_root`, `two_remotes_are_two_projects`, `a_caller_that_derives_its_id_joins_no_remote`, `a_clone_hands_its_workspace_to_the_shared_project`, `the_project_of_a_root_is_read_without_writing` (`project.rs`); `two_clones_of_one_remote_register_into_one_project` (`tests/api.rs`); `two_clones_of_one_remote_share_their_memories` y `search_project_reads_the_docs_of_its_own_root` (`server.rs`); `two_clones_share_their_memories_through_a_real_daemon` (`tests/binary.rs`: un hook en el segundo clone y `memories list --here` ven lo que se guardó en el primero).
+**Tests:** `a_second_clone_joins_the_project_of_the_first`, `a_clone_joins_with_one_live_row_per_text`, `a_first_remote_keeps_the_project_of_its_root`, `two_remotes_are_two_projects`, `a_caller_that_derives_its_id_joins_no_remote`, `a_clone_hands_its_workspace_to_the_shared_project`, `the_project_of_a_root_is_read_without_writing` (`project.rs`); `two_clones_of_one_remote_register_into_one_project` (`tests/api.rs`); `two_clones_of_one_remote_share_their_memories` y `search_project_reads_the_docs_of_its_own_root` (`server.rs`); `two_clones_share_their_memories_through_a_real_daemon` (`tests/binary.rs`: un hook en el segundo clone y `memories list --here` ven lo que se guardó en el primero).
 
 ## R17. Unir reconcilia, se registra y se deshace
 
@@ -290,12 +291,32 @@ Ninguna otra columna MUST cambiar. Cada reemplazo MUST quedar en `memory_move_su
 
 ## R18. Un cliente anterior conserva la regla de antes
 
-Un pedido sin `assigned` MUST recibir `derive_project_id(raíz)` como los dos ids, MUST NOT unirse por remoto, y MUST recibir 409 `project_root_collision` cuando ese id es de otra raíz o la raíz tiene otro id, para que un puente abierto antes de una actualización nunca escriba bajo el id de otro proyecto. Mientras ese puente siga abierto, lo que un cliente nuevo unió de su raíz a otro clone no lo ve; sigue en el store y el próximo registro nuevo une lo que ese puente guardó.
+Un pedido sin `assigned` MUST recibir `derive_project_id(raíz)` como los dos ids, MUST NOT unirse por remoto, y MUST recibir 409 `project_root_collision` cuando ese id es de otra raíz, cuando la fila que su remoto elige (R20) tiene otro id o cuando su camino está contradicho, para que un puente abierto antes de una actualización nunca escriba bajo el id de otro proyecto. Mientras ese puente siga abierto, lo que un cliente nuevo unió de su raíz a otro clone no lo ve; sigue en el store y el próximo registro nuevo une lo que ese puente guardó.
 
-**Tests:** `a_caller_that_derives_its_id_keeps_the_conflict` y `a_caller_that_derives_its_id_joins_no_remote` (`project.rs`); `registering_without_assigned_ids_keeps_the_old_answer` (`tests/api.rs`).
+**Tests:** `a_caller_that_derives_its_id_keeps_the_conflict`, `a_caller_that_derives_its_id_joins_no_remote` y `a_caller_that_derives_its_id_is_refused_another_repository_s_project` (`project.rs`); `registering_without_assigned_ids_keeps_the_old_answer` y `a_repository_cloned_where_another_was_registers_into_a_project_of_its_own` (`tests/api.rs`).
 
 ## R19. Datos de la versión anterior a los remotos
 
 Una base en V23 con filas en dos proyectos MUST abrir con V24 sin cambiar ninguna fila de `memory` ni de `project`, con `project_remote` y `memory_move_supersede` vacías ([`specs/storage`](../storage/spec.md), «Los remotos y lo que reemplaza una unión»).
 
 **Test:** `a_database_from_the_previous_version_opens_with_no_remote_recorded` (`crates/clawg-core/src/memory/db.rs`).
+
+## R20. Una fila de un camino sirve a una raíz sólo si su remoto no la contradice
+
+Un camino no es una identidad: otro repositorio puede clonarse donde estuvo uno. Un camino puede tener varias filas en `project`, una por repositorio; los remotos atados a una fila son las claves que `project_remote` da a su id. El registro MUST elegir la fila con una regla pura (`settle`, `crates/clawg-core/src/memory/project.rs`), y `project_id_in` y `plan_ids_in` MUST usar la misma sin escribir (en un lote, como si las raíces anteriores ya estuvieran escritas):
+
+1. sin clave actual, la más vieja: una clave que no se puede leer no contradice nada;
+2. con clave, la primera fila con esa clave atada; si no hay, la más vieja sin remotos atados (un primer remoto, que se ata a ella);
+3. si todas tienen remotos atados y ninguno es la clave, el camino está contradicho: la raíz MUST recibir el primero de sus candidatos que ninguna fila tiene, en una fila nueva, y su clave MUST atarse a ella cuando `project_remote` no la tenga.
+
+Los ids viejos del cliente salen del camino, así que son de su primer repositorio: el registro MUST unir sus filas sólo con un camino nuevo o con la fila más vieja, y MUST NOT tocar un id viejo que es el de cualquier otra fila de `project`. El daemon MUST leer la clave también para un pedido sin `assigned`, sin atarla (R18).
+
+Una fila sin remotos atados acepta un primer remoto: si el repositorio anterior del camino no tenía `origin`, el que llega con uno se queda con su fila. Un remoto renombrado en el mismo camino abre otro proyecto, porque sin el primer commit no se distingue de otro repositorio; `clawg projects move --from-project VIEJO --to-project NUEVO` los une y se deshace. `clawg doctor` nombra los proyectos que ya tienen dos remotos ([`specs/doctor`](../doctor/spec.md) R7).
+
+#### Escenario: otro repositorio en el camino de uno registrado
+- GIVEN `/work/app` registrado con `github.com/acme/a`, con una fila en su proyecto
+- WHEN se registra `/work/app` con `github.com/acme/b`
+- THEN recibe `candidate_id(/work/app, 1)`, nada se mueve, `github.com/acme/b` queda atado a ese id, y un clone de `github.com/acme/b` en otro camino se une a él
+- AND registrar otra vez cada uno da los ids de su primer registro, con dos filas en `project`
+
+**Tests:** `a_path_settles_on_the_row_its_remote_does_not_contradict` (pura), `a_repository_in_the_path_of_another_gets_a_project_of_its_own`, `a_repository_in_the_path_of_another_takes_none_of_its_rows`, `each_repository_in_one_path_returns_to_its_own_project`, `the_project_of_a_repository_in_another_s_path_is_read_alike_without_writing`, `a_first_remote_keeps_the_project_of_its_root`, `a_different_remote_in_a_registered_path_is_another_project` (`project.rs`); `a_repository_cloned_where_another_was_registers_into_a_project_of_its_own` (`tests/api.rs`).
