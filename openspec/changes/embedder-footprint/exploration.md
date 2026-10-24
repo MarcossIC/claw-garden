@@ -44,6 +44,8 @@ El tokenizer compartido (`Arc<Tokenizer>`, el mismo que usa el chunker) codifica
 
 (a) Si el patrón de memoria de ORT guarda un plan por forma de entrada, un daemon con `CLAWG_EMBEDDER_IDLE_MINUTES=0` (no suelta nunca el modelo) podría crecer con miles de formas. (b) La carga junta los bytes del onnx (~470 MB, cifra de 46) con la sesión en construcción; el pico de cada recarga es el máximo posible del proceso y nunca se leyó. (c) Una arena frente a dos y la latencia de búsqueda durante un refresco: falta el dato para saber si D6 de 46 tiene costo.
 
+**(a) y (b) pasaron a [ram-footprint (90)](../ram-footprint/exploration.md)**, que suma la medición en prod del 2026-10-24 (el modelo cargado el 73 al 81 % de los minutos y un máximo de 1.278 MiB sin dueño) y las mediciones con las que se atribuye cada pico. Sus filas de la tabla de la puerta se miden allá. (c) queda acá.
+
 ## Lo que ya existe y se reutiliza
 
 - `e5_golden` (`tests/e5_golden.rs`, 32 vectores, un lote de 17 en `:211-218`, textos de ~2.000 tokens y de 509 a 511): es la prueba de que los bits no se mueven; con `CLAWG_BLESS=1` reescribe la fixture (`:13-14`).
@@ -64,8 +66,8 @@ Necesita el modelo real (`CLAWG_E5_MODEL_DIR` para `e5_golden`; un perfil dev au
 | Hilos vivos del proceso con el modelo suelto | Contar hilos antes y después de unos cuantos guardados, con y sin `set_parallelism(false)` | Si `rayon` deja N hilos con el modelo suelto, C |
 | Tiempo de `split_save` y de la tanda, para un guardado del tamaño de 54 | Texto de 64 KiB y de 5.000 tokens; reloj en el worker | Si la triple pasada pasa de un umbral (decisión abierta), E |
 | Vectores | `e5_golden` en cada combinación, y `rag-eval --diff` si algún vector cambia | Cualquier combinación que mueva bits queda fuera salvo decisión expresa |
-| Memoria: máximo de `RssAnon` / privados durante la primera carga y una recarga | `/usr/bin/time -v clawg serve` (máximo residente) en Linux; muestreo de bytes privados en Windows | Fija el pico real de (b); si se acerca al pico de indexar, se anota y no se hace nada |
-| Memoria: tendencia tras miles de búsquedas e inferencias de largos distintos con `IDLE_MINUTES=0` | 5.000 consultas de 1 a 512 tokens, lectura cada 500 | Si crece sin aplanarse, se prueba `with_memory_pattern(false)` y se vuelve a medir |
+| Memoria: máximo de `RssAnon` / privados durante la primera carga y una recarga (se mide en 90) | `/usr/bin/time -v clawg serve` (máximo residente) en Linux; muestreo de bytes privados en Windows | Fija el pico real de (b); si se acerca al pico de indexar, se anota y no se hace nada |
+| Memoria: tendencia tras miles de búsquedas e inferencias de largos distintos con `IDLE_MINUTES=0` (se mide en 90) | 5.000 consultas de 1 a 512 tokens, lectura cada 500 | Si crece sin aplanarse, se prueba `with_memory_pattern(false)` y se vuelve a medir |
 | Una arena contra dos | Misma prueba de búsqueda durante un refresco, `MALLOC_ARENA_MAX=1` y `=2` | Si el p99 de búsqueda difiere más que el umbral, se reabre D6 de 46 |
 
 ## Enfoques posibles

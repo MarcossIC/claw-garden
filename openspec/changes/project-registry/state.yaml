@@ -1,0 +1,14 @@
+change: project-registry
+objective: "2"
+depends_on: [project-reassign, project-clone-identity]
+phase: propose
+artifacts:
+  exploration: done
+  proposal: draft
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-10-24
