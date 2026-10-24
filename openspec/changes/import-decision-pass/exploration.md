@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 (guardar y clasificar), importación de un historial grande | M | import-linear (el índice que vuelve lineal cada consulta del pase); se coordina con read-connections, shutdown-budget (archivado) e import-undo | exploración (borrador) |
+| 1 (guardar y clasificar), importación de un historial grande | M | import-linear (el índice que vuelve lineal cada consulta del pase); se coordina con read-connections, shutdown-budget (archivado) e import-undo | exploración cerrada; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** el pase de decisión de una importación recorre todas las filas del archivo dentro de **una sola** llamada a la conexión única del daemon (`crates/clawg-core/src/memory/portability/import.rs:966-977`), así que su duración crece con el archivo y todo lo demás queda detrás: un guardado, una búsqueda, el `/health` y el hook `session-start`, que tiene 3 s en total. Ese pase es además **sólo informativo**: abre una transacción, inserta filas en `memory` y la suelta sin confirmar (`:969-974`); lo único que sale de él es el `Ledger` (dónde cae cada fila). Ninguna de sus escrituras influye en el resultado salvo para que una fila vea a las anteriores del mismo archivo. El cambio quita al pase la conexión y la transacción: un **planificador en memoria** aplica las mismas reglas de `place()` sobre estado Rust que se carga con lecturas acotadas (cada una su propia llamada corta, que se intercala con el resto del tráfico) y que se actualiza al aceptar cada fila. La tabla y la transacción dejan de existir en el pase de decisión, y con ellas el riesgo que descarta partir el pase en lotes sobre una transacción abierta. Es de tamaño M: un asiento (trait) para que las reglas sigan siendo una sola, la carga acotada, la separación de `write_links` y un diseño de pruebas de equivalencia contra el pase actual. La alternativa de abrir otra conexión (C) se descarta como solución principal por lo que hace sin WAL y por lo que cuesta al `checkpoint`.
 
@@ -137,14 +137,14 @@ Un `spawn_blocking` abre `open_existing` con `query_only`, lee una instantánea 
 
 ## Decisiones abiertas
 
-Son del usuario.
+Cerradas en la [propuesta](proposal.md#decisiones), cada una con la opción recomendada.
 
-- [ ] **Un asiento o dos implementaciones.** Un trait que comparten el SQL y el planificador (recomendado: las reglas son una; el trait tiene dos implementaciones reales) o un planificador aparte con la prueba diferencial como única garantía (menos refactor, y las reglas se pueden separar con el tiempo).
-- [ ] **Forma de la carga.** Lotes con `IN` (o valores en fila) sobre el índice por hash de import-linear (recomendado: cada llamada es corta y no depende del tamaño del almacén), o una tabla TEMP de claves con una sola pasada (menos viajes; una llamada tan larga como el almacén).
-- [ ] **Tamaño del lote y umbral de salida.** Candidato: ninguna llamada de la carga por encima de ~300 ms (una décima del `HOOK_DEADLINE`) y el pase de decisión del banco de 15 047 filas en menos de la décima parte de los 16,4 s de hoy con el índice. Se fija leyendo la medición.
-- [ ] **Parada del planificador.** Indicador atómico leído cada N filas (recomendado) o dejarlo correr hasta el final, con el costo en el apagado.
-- [ ] **Qué hacer con un empate de `created_at` en `TWIN_SQL`.** El SQL no desempata (`:501-504`); el planificador toma el menor `id` (el orden del índice). ¿Se agrega `id` al `ORDER BY` de la consulta para que las dos fuentes coincidan por construcción (recomendado)?
-- [ ] **Si C queda como respaldo escrito** (con la condición de WAL y `query_only`) o se elimina del texto del diseño.
+- [x] **Un asiento o dos implementaciones.** Un trait que comparten el SQL y el planificador (recomendado: las reglas son una; el trait tiene dos implementaciones reales) o un planificador aparte con la prueba diferencial como única garantía (menos refactor, y las reglas se pueden separar con el tiempo).
+- [x] **Forma de la carga.** Lotes con `IN` (o valores en fila) sobre el índice por hash de import-linear (recomendado: cada llamada es corta y no depende del tamaño del almacén), o una tabla TEMP de claves con una sola pasada (menos viajes; una llamada tan larga como el almacén).
+- [x] **Tamaño del lote y umbral de salida.** Candidato: ninguna llamada de la carga por encima de ~300 ms (una décima del `HOOK_DEADLINE`) y el pase de decisión del banco de 15 047 filas en menos de la décima parte de los 16,4 s de hoy con el índice. Se fija leyendo la medición.
+- [x] **Parada del planificador.** Indicador atómico leído cada N filas (recomendado) o dejarlo correr hasta el final, con el costo en el apagado.
+- [x] **Qué hacer con un empate de `created_at` en `TWIN_SQL`.** El SQL no desempata (`:501-504`); el planificador toma el menor `id` (el orden del índice). ¿Se agrega `id` al `ORDER BY` de la consulta para que las dos fuentes coincidan por construcción (recomendado)?
+- [x] **Si C queda como respaldo escrito** (con la condición de WAL y `query_only`) o se elimina del texto del diseño.
 
 ## Cómo se mide
 
