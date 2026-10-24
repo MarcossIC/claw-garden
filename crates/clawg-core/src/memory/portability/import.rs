@@ -2858,9 +2858,9 @@ mod tests {
         );
     }
 
-    /// Each runs once per row or per save of a file, in the pass that decides
-    /// and again in the one that writes, so a scan makes an import grow with
-    /// the square of its rows.
+    /// Each runs once per row or per save of a file, when the pass that
+    /// decides loads the store or when the one that writes places its rows,
+    /// so a scan makes an import grow with the square of its rows.
     #[tokio::test]
     async fn the_import_lookups_seek_an_index() {
         use rusqlite::types::Value::{Integer, Null, Text};
