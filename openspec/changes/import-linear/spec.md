@@ -2,7 +2,7 @@
 
 ## R1. Las búsquedas de la importación llegan a sus filas por índice
 
-Toda sentencia que la importación (`crates/clawg-core/src/memory/portability/import.rs`) ejecuta por fila o por save, y que busca por una columna o por el rowid, MUST tener en `EXPLAIN QUERY PLAN` una línea `SEARCH` que nombre su índice, y MUST NOT tener ninguna línea que empiece por `SCAN`. Esto vale sin estadísticas del planificador. Ejecutada contra un store con filas, ninguna de esas sentencias MUST dar un paso de recorrido completo (`StatementStatus::FullscanStep` igual a 0). El índice que corresponde a cada una:
+Toda sentencia que la importación (`crates/clawg-core/src/memory/portability/import.rs`) ejecuta por fila o por save, y que busca por una columna o por el rowid, MUST tener en `EXPLAIN QUERY PLAN` una línea `SEARCH` que nombre su índice, y MUST NOT tener ninguna línea `SCAN` que recorra una tabla. `SCAN CONSTANT ROW`, la fila única de un `SELECT EXISTS (…)` sin `FROM`, no recorre ninguna tabla. Esto vale sin estadísticas del planificador. Ejecutada contra un store con filas, ninguna de esas sentencias MUST dar un paso de recorrido completo (`StatementStatus::FullscanStep` igual a 0). El índice que corresponde a cada una:
 
 | Sentencia | Índice |
 |---|---|
@@ -18,15 +18,15 @@ Toda sentencia que la importación (`crates/clawg-core/src/memory/portability/im
 #### Escenario: la fila presente, por índice
 - GIVEN un store migrado y con filas
 - WHEN se pide el plan de `PRESENT_SQL` con un agente, un proyecto (o `NULL`), un hash y una fecha
-- THEN una línea es `SEARCH memory USING INDEX idx_memory_dedup (<expr>=? AND content_hash=? AND created_at=?)` y ninguna empieza por `SCAN`
+- THEN una línea es `SEARCH memory USING INDEX idx_memory_dedup (<expr>=? AND content_hash=? AND created_at=?)` y ninguna recorre una tabla
 - AND al ejecutarla no da ningún paso de recorrido completo
 
 #### Escenario: las demás búsquedas
 - GIVEN el mismo store
 - WHEN se pide el plan de cada una de las otras sentencias de la tabla y se la ejecuta
-- THEN cada plan nombra el índice de su fila de la tabla, ninguna línea empieza por `SCAN` y ninguna ejecución da un paso de recorrido completo
+- THEN cada plan nombra el índice de su fila de la tabla, ninguna línea recorre una tabla y ninguna ejecución da un paso de recorrido completo
 
-**Test:** `the_import_lookups_seek_an_index` (`import.rs`, mod tests). Hoy falla en `PRESENT_SQL`: el plan es `SCAN memory` y su ejecución recorre toda la tabla.
+**Test:** `the_import_lookups_seek_an_index` (`import.rs`, mod tests). Antes del cambio fallaba sólo en `PRESENT_SQL`, con y sin proyecto: el plan era `SCAN memory` y su ejecución daba 16 pasos de recorrido completo sobre un store de 17 filas. Las demás sentencias ya buscaban por su índice.
 
 ## R2. Un store en V24 abre en V25 con todas sus filas
 

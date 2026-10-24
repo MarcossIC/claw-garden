@@ -50,7 +50,7 @@ El índice pasa a incluir también las filas borradas y las que no tienen hash. 
 
 Pruebas que fallan hoy (ver [spec](spec.md)), sin modelo real, sin red y sin perfil:
 
-- `the_import_lookups_seek_an_index` (`import.rs`): cada búsqueda que la importación hace por fila o por save nombra su índice en `EXPLAIN QUERY PLAN`, ninguna línea del plan empieza por `SCAN`, y al ejecutarla contra un store con filas no da ningún paso de recorrido completo (`StatementStatus::FullscanStep`). Hoy falla en `PRESENT_SQL`, cuyo plan es `SCAN memory`.
+- `the_import_lookups_seek_an_index` (`import.rs`): cada búsqueda que la importación hace por fila o por save nombra su índice en `EXPLAIN QUERY PLAN`, ninguna línea del plan recorre una tabla, y al ejecutarla contra un store con filas no da ningún paso de recorrido completo (`StatementStatus::FullscanStep`). Hoy falla en `PRESENT_SQL`, cuyo plan es `SCAN memory`.
 - `a_store_from_before_the_unfiltered_dedup_index_keeps_its_rows` (`db.rs`): un store en V24 abre en V25 con todas sus filas tal como estaban, el índice sin `WHERE` encuentra una fila borrada y queda la copia `pre-migration`. Hoy el esquema no llega a 25 y el índice conserva su `WHERE`.
 - `published_migration_checksums_are_pinned` gana la fila de V25, y las tres pruebas que cuentan migraciones pasan a 25.
 - Tienen que seguir pasando sin cambios `reinforce_lookup_uses_dedup_index`, `a_store_from_before_project_scoped_rules_keeps_its_rows`, las pruebas de plan de `topic.rs`, `language.rs`, `search.rs` y `prompt_builder.rs`, y todas las de la importación, `a_second_import_adds_nothing` entre ellas.
