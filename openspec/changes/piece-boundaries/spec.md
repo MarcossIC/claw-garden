@@ -10,16 +10,16 @@ Cambia dónde caen los bordes de los cortes del divisor de tokens (`TokenSplitte
 
 Con un tokenizador cargado, todo corte de `TokenSplitter::split`, salvo los dos extremos del texto, MUST caer en frontera de palabra cuando hay una dentro del rango que admite la ventana ([design D2](design.md#d2-el-plan-de-ventanas-con-marcas)). Si no hay ninguna, porque una palabra es más larga que el tope o el texto no tiene espacios, MUST cortar al token, como hoy. Ningún byte del texto MUST quedar fuera de todas las piezas.
 
-Cada pieza MUST tener a lo sumo `max_tokens` tokens según `TokenSplitter::count` (`token_splitter.rs:41`). Dos piezas vecinas MUST compartir al menos `overlap` tokens, salvo cuando la ventana anterior se cortó al token sin frontera disponible. La ventana siguiente MUST empezar en la última frontera que deja al menos ese solape ([design D3](design.md#d3-el-solape-crece-hasta-la-palabra-no-se-achica)).
+Cada pieza MUST tener a lo sumo `max_tokens` tokens según `TokenSplitter::count` (`token_splitter.rs`). La ventana siguiente MUST empezar en la frontera más cercana al token que deja `overlap` tokens compartidos, y, con `overlap > 0`, dos piezas vecinas MUST compartir al menos `MIN_OVERLAP_CHARS` caracteres, que es lo que busca `join_pieces` ([design D3](design.md#d3-el-solape-va-a-la-frontera-más-cercana)). Con `overlap == 0` las piezas MUST cubrir el texto sin repetirlo.
 
-Las marcas (`word_starts`) y el plan (`plan_word_windows`) MUST ser funciones puras. Cuando todo token abre una palabra, el plan MUST ser exactamente el de `plan_windows` (`token_splitter.rs:153`).
+Las marcas (`word_starts`), los caracteres por token (`char_spans`) y el plan (`plan_word_windows`) MUST ser funciones puras. Cuando todo token abre una palabra, el plan MUST avanzar exactamente `max - overlap` tokens por ventana, como antes de este cambio.
 
 #### Escenario: una pieza no empieza a mitad de palabra
 - GIVEN un texto de 600 palabras, cada una de dos o tres subtokens *(subpalabras)*
 - WHEN se parte con tope 96 y solape 24
 - THEN ninguna pieza empieza ni termina dentro de una palabra
 - AND cada pieza tiene a lo sumo 96 tokens
-- AND dos piezas vecinas comparten al menos 24 tokens
+- AND dos piezas vecinas comparten 24 tokens, uno más o uno menos, y al menos 16 caracteres
 
 #### Escenario: una palabra más larga que el tope
 - GIVEN un texto con una palabra de 150 subtokens entre palabras cortas *(subpalabras)*
@@ -30,14 +30,14 @@ Las marcas (`word_starts`) y el plan (`plan_word_windows`) MUST ser funciones pu
 #### Escenario: un texto sin espacios
 - GIVEN 300 caracteres CJK sin espacios
 - WHEN se parte con tope 96 y solape 24
-- THEN las piezas son las mismas que con `plan_windows`
+- THEN las piezas son las de antes de este cambio, una ventana cada 72 tokens
 
 #### Escenario: el tokenizador de palabras no cambia
 - GIVEN cualquier texto y el `word_tokenizer`
 - WHEN se parte con cualquier tope y solape
 - THEN las piezas son las mismas que antes de este cambio
 
-**Tests:** `word_starts_marks_tokens_after_or_on_whitespace`, `word_starts_takes_an_offset_that_holds_the_leading_space`, `plan_word_windows_with_every_start_marked_is_plan_windows`, `plan_word_windows_terminates_covers_and_never_nests` (barrido exhaustivo, como `plan_windows_terminates_and_every_window_is_bounded`, `token_splitter.rs:237`), `plan_word_windows_cuts_at_the_last_word_start_under_the_cap`, `plan_word_windows_cuts_a_word_longer_than_the_cap_by_token` y `plan_word_windows_keeps_at_least_the_overlap` (puros); `no_piece_starts_or_ends_inside_a_word` *(subpalabras)*, `a_word_longer_than_the_cap_is_cut_by_token_and_loses_no_byte` *(subpalabras)* y `a_text_without_spaces_is_cut_as_before` (`token_splitter.rs`). Los tests de hoy de `token_splitter.rs` y `chunker/chat.rs` siguen pasando sin cambios.
+**Tests:** `word_starts_marks_tokens_after_or_on_whitespace`, `word_starts_takes_an_offset_that_holds_the_leading_space`, `char_spans_count_the_characters_before_each_token`, `plan_word_windows_with_every_start_marked_keeps_a_fixed_stride`, `plan_word_windows_clamps_the_overlap_and_never_hangs`, `plan_word_windows_terminates_covers_and_never_nests` (barrido exhaustivo), `plan_word_windows_cuts_at_the_last_word_start_under_the_cap`, `plan_word_windows_cuts_a_word_longer_than_the_cap_by_token`, `plan_word_windows_starts_at_the_word_start_nearest_the_overlap` y `plan_word_windows_keeps_the_characters_join_pieces_needs` (puros); `no_piece_starts_or_ends_inside_a_word` *(subpalabras)*, `a_word_longer_than_the_cap_is_cut_by_token_and_loses_no_byte` *(subpalabras)* y `a_text_without_spaces_is_cut_as_before` (`token_splitter.rs`). Los tests que había de `token_splitter.rs` y `chunker/chat.rs` siguen pasando; los de `plan_windows` se fueron con ella, y sus propiedades quedan en los de `plan_word_windows` con todas las marcas.
 
 ## R2. Las piezas y la cabecera de un save largo terminan en frontera
 

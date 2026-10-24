@@ -1,14 +1,14 @@
 change: piece-boundaries
 objective: "1"
 depends_on: []
-phase: tasks
+phase: apply
 artifacts:
   exploration: done
-  proposal: done  # the open decisions taken with the exploration's recommendation, except word boundaries from bytes and an overlap that grows to the word
+  proposal: done  # the open decisions taken with the exploration's recommendation, except word boundaries from bytes and an overlap at the nearest word start, which replaced the first rule after it failed U2
   spec: done
   design: done
   tasks: done
-  apply: pending
+  apply: in_progress
   verify: pending
   archive: pending
 main_spec: openspec/specs/pieces/spec.md
