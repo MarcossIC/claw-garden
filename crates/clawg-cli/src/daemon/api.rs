@@ -2025,11 +2025,11 @@ async fn register(
     if body.index_docs && !root.is_dir() {
         return Err(ApiError::bad_request(format!("{} is not a directory, so it has no files to index", body.root_path)));
     }
-    let remote = if body.assigned {
+    // A caller that derives its id joins no remote, but the remote still tells
+    // whether the repository at the root is the one its row was given to.
+    let remote = {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || origin_key(&root)).await.ok().flatten()
-    } else {
-        None
     };
     let registration = Registration {
         root,
