@@ -9,6 +9,11 @@
 //! per key and per text (see [`merge_in`]); the other tables move row by row
 //! with `project_rekey`, whose undo SQL is in the migration that creates it.
 //! `memory_fts` needs nothing: it reads `project_id` from `memory`.
+//!
+//! A path is not an identity: another repository can be cloned where one
+//! was. So a recorded row serves a root only while the remote bound to it is
+//! the root's remote now (see [`settle`]); a root whose remote contradicts
+//! every row of its path gets a row of its own, and its remote is bound there.
 
 use std::path::{Path, PathBuf};
 
@@ -30,7 +35,8 @@ const OTHER_PROJECT_TABLES: [&str; 2] = ["episodic_trajectory", "procedural_skil
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration<'a> {
     pub root: &'a Path,
-    /// The key of the root's remote (`origin_key`), or none.
+    /// The key of the root's remote (`origin_key`), or none. A caller that
+    /// derives its id is never bound to it; it only settles the root's row.
     pub remote: Option<&'a str>,
     /// Ids the same project was saved under before.
     pub legacy_ids: &'a [String],
@@ -99,10 +105,49 @@ struct Plan {
     moves: bool,
 }
 
-/// The id `project` records for `root`, if any.
-fn recorded_id_in(c: &Connection, root: &str) -> rusqlite::Result<Option<String>> {
-    c.query_row("SELECT id FROM project WHERE root_path = ?1 ORDER BY created_at, id LIMIT 1", [root], |r| r.get(0))
-        .optional()
+/// Which of the rows `project` records for a path is the repository there
+/// now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// The row at this index, oldest first.
+    Row(usize),
+    /// The path has no row.
+    Fresh,
+    /// Every row of the path is bound to remotes and none is this one: another
+    /// repository took the path, and it gets a row of its own.
+    Contradicted,
+}
+
+/// Settles a path on one of its rows, given each row's remotes (oldest row
+/// first) and the key of the remote the root has now. A row is contradicted
+/// only when both are known and differ: the row bound to the remote wins,
+/// then the oldest row bound to none, which the remote is then bound to. An
+/// unknown remote contradicts nothing, so it keeps the oldest row.
+fn settle(rows: &[Vec<String>], remote: Option<&str>) -> Settled {
+    if rows.is_empty() {
+        return Settled::Fresh;
+    }
+    let Some(remote) = remote else {
+        return Settled::Row(0);
+    };
+    rows.iter()
+        .position(|bound| bound.iter().any(|r| r == remote))
+        .or_else(|| rows.iter().position(Vec::is_empty))
+        .map_or(Settled::Contradicted, Settled::Row)
+}
+
+/// The rows `project` records for `root`, oldest first, each with the
+/// remotes bound to its id.
+fn path_rows_in(c: &Connection, root: &str) -> rusqlite::Result<Vec<(String, Vec<String>)>> {
+    let mut stmt = c.prepare(
+        "SELECT p.id, (SELECT json_group_array(remote) FROM project_remote WHERE project_id = p.id) \
+         FROM project AS p WHERE p.root_path = ?1 ORDER BY p.created_at, p.id",
+    )?;
+    let rows = stmt.query_map([root], |r| {
+        let remotes: String = r.get(1)?;
+        Ok((r.get(0)?, serde_json::from_str(&remotes).unwrap_or_default()))
+    })?;
+    rows.collect()
 }
 
 /// The root `project` records for `id`, if any.
@@ -115,19 +160,57 @@ fn remote_project_in(c: &Connection, remote: &str) -> rusqlite::Result<Option<St
     c.query_row("SELECT project_id FROM project_remote WHERE remote = ?1", [remote], |r| r.get(0)).optional()
 }
 
-/// The id `root` has, or the first [`candidate_id`] no other root has.
-pub(crate) fn root_id_in(c: &Connection, root: &Path) -> Result<(String, bool), RegisterError> {
-    let root_path = root.to_string_lossy();
-    if let Some(id) = recorded_id_in(c, &root_path).map_err(MemoryError::Sqlite)? {
-        return Ok((id, false));
+/// The root id a registration settles on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootId {
+    pub id: String,
+    /// Whether `project` has no row with it yet.
+    pub new_row: bool,
+    /// Whether the ids the path had before roots were resolved are this
+    /// root's: they are the path's, so only its first repository, the one in
+    /// its oldest row, takes them.
+    pub owns_legacy: bool,
+}
+
+/// What a batch would have written before the root it settles now.
+#[derive(Debug, Default)]
+struct Pending {
+    /// Rows by path, in the order they would be written.
+    rows: Vec<(PathBuf, String)>,
+    /// Remote to project.
+    remotes: std::collections::HashMap<String, String>,
+    /// Every root id given so far.
+    claimed: Vec<String>,
+}
+
+/// The row of `root` its remote settles on (see [`settle`]), or the first
+/// [`candidate_id`] no row has and no earlier root of the batch took.
+fn settle_root_in(c: &Connection, root: &Path, remote: Option<&str>, pending: &Pending) -> Result<RootId, RegisterError> {
+    let sql = |e: rusqlite::Error| RegisterError::Store(MemoryError::Sqlite(e));
+    let mut rows = path_rows_in(c, &root.to_string_lossy()).map_err(sql)?;
+    rows.extend(pending.rows.iter().filter(|(path, _)| path == root).map(|(_, id)| (id.clone(), Vec::new())));
+    for (id, bound) in &mut rows {
+        bound.extend(pending.remotes.iter().filter(|(_, p)| *p == id).map(|(r, _)| r.clone()));
     }
+    let bound: Vec<Vec<String>> = rows.iter().map(|(_, remotes)| remotes.clone()).collect();
+    let owns_legacy = match settle(&bound, remote) {
+        Settled::Row(i) => return Ok(RootId { id: rows[i].0.clone(), new_row: false, owns_legacy: i == 0 }),
+        Settled::Fresh => true,
+        Settled::Contradicted => false,
+    };
     for n in 0..CANDIDATES {
         let id = candidate_id(root, n);
-        if root_of_in(c, &id).map_err(MemoryError::Sqlite)?.is_none() {
-            return Ok((id, true));
+        if !pending.claimed.contains(&id) && root_of_in(c, &id).map_err(sql)?.is_none() {
+            return Ok(RootId { id, new_row: true, owns_legacy });
         }
     }
     Err(RegisterError::NoFreeId(root.to_path_buf()))
+}
+
+/// The id `root` has, as its remote settles it, or the first
+/// [`candidate_id`] no other root has.
+pub(crate) fn root_id_in(c: &Connection, root: &Path, remote: Option<&str>) -> Result<RootId, RegisterError> {
+    settle_root_in(c, root, remote, &Pending::default())
 }
 
 /// The project id `root` reads and writes under, as the store says now and
@@ -137,8 +220,8 @@ pub fn project_id_in(c: &Connection, root: &Path, remote: Option<&str>) -> rusql
     if let Some(project) = remote.map(|r| remote_project_in(c, r)).transpose()?.flatten() {
         return Ok(project);
     }
-    match root_id_in(c, root) {
-        Ok((id, _)) => Ok(id),
+    match root_id_in(c, root, remote) {
+        Ok(settled) => Ok(settled.id),
         Err(RegisterError::Store(MemoryError::Sqlite(e))) => Err(e),
         Err(_) => Ok(derive_project_id(root)),
     }
@@ -146,34 +229,29 @@ pub fn project_id_in(c: &Connection, root: &Path, remote: Option<&str>) -> rusql
 
 /// The ids each of `roots` (with the key of its remote) would get, as
 /// [`register_project`] gives them, read without writing: a root later in the
-/// list never takes an id or a remote an earlier one was given. Each answer is
-/// `(root id, project id)`.
+/// list never takes an id or a remote an earlier one was given, and settles
+/// as if the earlier ones were written. Each answer is `(root id, project id)`.
 pub(crate) fn plan_ids_in(c: &Connection, roots: &[(PathBuf, Option<String>)]) -> rusqlite::Result<Vec<(String, String)>> {
-    let mut claimed: Vec<String> = Vec::new();
-    let mut remotes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut pending = Pending::default();
     let mut out = Vec::new();
     for (root, remote) in roots {
-        let root_id = match recorded_id_in(c, &root.to_string_lossy())? {
-            Some(id) => id,
-            None => {
-                let mut free = None;
-                for n in 0..CANDIDATES {
-                    let id = candidate_id(root, n);
-                    if !claimed.contains(&id) && root_of_in(c, &id)?.is_none() {
-                        free = Some(id);
-                        break;
-                    }
+        let root_id = match settle_root_in(c, root, remote.as_deref(), &pending) {
+            Ok(settled) => {
+                if settled.new_row {
+                    pending.rows.push((root.clone(), settled.id.clone()));
                 }
-                free.unwrap_or_else(|| derive_project_id(root))
+                settled.id
             }
+            Err(RegisterError::Store(MemoryError::Sqlite(e))) => return Err(e),
+            Err(_) => derive_project_id(root),
         };
-        claimed.push(root_id.clone());
+        pending.claimed.push(root_id.clone());
         let project_id = match remote {
-            Some(r) => match remotes.get(r) {
+            Some(r) => match pending.remotes.get(r) {
                 Some(p) => p.clone(),
                 None => {
                     let p = remote_project_in(c, r)?.unwrap_or_else(|| root_id.clone());
-                    remotes.insert(r.clone(), p.clone());
+                    pending.remotes.insert(r.clone(), p.clone());
                     p
                 }
             },
@@ -188,30 +266,47 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[(PathBuf, Option<String>)]) -
 fn plan_in(c: &Connection, reg: &Registration<'_>) -> Result<Plan, RegisterError> {
     let root_path = reg.root.to_string_lossy().into_owned();
     let sql = |e: rusqlite::Error| RegisterError::Store(MemoryError::Sqlite(e));
-    let (root_id, new_root, project_id) = if reg.assigned {
-        let (root_id, new_root) = root_id_in(c, reg.root)?;
+    let (root_id, new_root, owns_legacy, project_id) = if reg.assigned {
+        let settled = root_id_in(c, reg.root, reg.remote)?;
+        if settled.new_row && !settled.owns_legacy {
+            log::warn!(
+                "{} holds a repository whose remote {} is not the one recorded for the projects of that path; \
+                 it gets a project of its own, {}",
+                reg.root.display(),
+                reg.remote.unwrap_or_default(),
+                settled.id
+            );
+        }
         let shared = reg.remote.map(|r| remote_project_in(c, r)).transpose().map_err(sql)?.flatten();
-        let project_id = shared.unwrap_or_else(|| root_id.clone());
-        (root_id, new_root, project_id)
+        let project_id = shared.unwrap_or_else(|| settled.id.clone());
+        (settled.id, settled.new_row, settled.owns_legacy, project_id)
     } else {
         let id = derive_project_id(reg.root);
         let owner = root_of_in(c, &id).map_err(sql)?;
         if let Some(other) = owner.as_ref().filter(|o| **o != root_path) {
             return Err(RegisterError::RootCollision { id, existing: other.clone() });
         }
-        if recorded_id_in(c, &root_path).map_err(sql)?.is_some_and(|recorded| recorded != id) {
-            return Err(RegisterError::RootCollision { id, existing: root_path });
-        }
-        (id.clone(), owner.is_none(), id)
+        // The root settles on another row, or the repository there now is
+        // not the one its row is bound to: either way the id it derives is
+        // not its project.
+        let settled = match root_id_in(c, reg.root, reg.remote) {
+            Ok(settled) if settled.id == id => settled,
+            Ok(_) | Err(RegisterError::NoFreeId(_)) => {
+                return Err(RegisterError::RootCollision { id, existing: root_path });
+            }
+            Err(e) => return Err(e),
+        };
+        (id.clone(), owner.is_none(), settled.owns_legacy, id)
     };
     let mut legacy = Vec::new();
-    for id in reg.legacy_ids.iter().chain(std::iter::once(&root_id)) {
+    let legacy_ids: &[String] = if owns_legacy { reg.legacy_ids } else { &[] };
+    for id in legacy_ids.iter().chain(std::iter::once(&root_id)) {
         if *id == project_id || legacy.contains(id) {
             continue;
         }
         // A legacy id that is another root's own id would take that
-        // project's rows.
-        if root_of_in(c, id).map_err(sql)?.is_some_and(|other| other != root_path) {
+        // project's rows, even when both roots are one path.
+        if *id != root_id && root_of_in(c, id).map_err(sql)?.is_some() {
             log::warn!("{id} belongs to another registered project; its rows were not moved to {project_id}");
             continue;
         }
@@ -711,15 +806,161 @@ mod tests {
         assert_eq!(by, older);
     }
 
+    #[test]
+    fn a_path_settles_on_the_row_its_remote_does_not_contradict() {
+        let none: Vec<String> = Vec::new();
+        let a = vec!["github.com/acme/a".to_string()];
+        let b = vec!["github.com/acme/b".to_string()];
+
+        assert_eq!(settle(&[], Some("github.com/acme/a")), Settled::Fresh);
+        assert_eq!(settle(&[], None), Settled::Fresh);
+        assert_eq!(settle(&[a.clone()], None), Settled::Row(0), "an unknown remote contradicts nothing");
+        assert_eq!(settle(&[a.clone()], Some("github.com/acme/a")), Settled::Row(0));
+        assert_eq!(settle(&[none.clone()], Some("github.com/acme/a")), Settled::Row(0), "a first remote");
+        assert_eq!(settle(&[a.clone()], Some("github.com/acme/b")), Settled::Contradicted);
+        assert_eq!(settle(&[a.clone(), b.clone()], Some("github.com/acme/b")), Settled::Row(1));
+        assert_eq!(settle(&[a.clone(), b.clone()], Some("github.com/acme/c")), Settled::Contradicted);
+        assert_eq!(settle(&[a.clone(), none, b], Some("github.com/acme/c")), Settled::Row(1));
+    }
+
     #[tokio::test]
-    async fn a_new_remote_keeps_the_project_of_its_root() {
+    async fn a_repository_in_the_path_of_another_gets_a_project_of_its_own() {
+        let f = Fixture::new().await;
+        let path = Path::new("/work/app");
+        let a = f.register(cloned(path, "github.com/acme/a")).await.unwrap();
+        let theirs = f.memory(&a.project_id, "the parser of a", None, 1).await;
+
+        let b = f.register(cloned(path, "github.com/acme/b")).await.unwrap();
+
+        assert_ne!(b.project_id, a.project_id);
+        assert_ne!(b.root_id, a.root_id);
+        assert_eq!((b.project_id.as_str(), b.root_id.as_str()), (candidate_id(path, 1).as_str(), candidate_id(path, 1).as_str()));
+        assert_eq!((b.rekeyed, b.snapshot), (0, None));
+        assert_eq!(project_ids(&f.store).await, vec![("memory".into(), theirs, Some(a.project_id.clone()))]);
+        let bound: String = f
+            .store
+            .conn
+            .call(|c| c.query_row("SELECT project_id FROM project_remote WHERE remote = 'github.com/acme/b'", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(bound, b.project_id, "the newcomer's remote is bound to its own project");
+
+        let clone = f.register(cloned(Path::new("/review/b"), "github.com/acme/b")).await.unwrap();
+        assert_eq!(clone.project_id, b.project_id, "a later clone of its remote joins it");
+    }
+
+    #[tokio::test]
+    async fn a_repository_in_the_path_of_another_takes_none_of_its_rows() {
+        let f = Fixture::new().await;
+        let path = Path::new("/work/app");
+        let sub = derive_project_id(Path::new("/work/app/sub"));
+        let a = f.register(cloned(path, "github.com/acme/a")).await.unwrap();
+        let older = f.memory(&sub, "saved under the subfolder before roots were resolved", None, 1).await;
+        let mine = f.memory(&a.project_id, "the parser of a", None, 2).await;
+        f.register(cloned(Path::new("/else/w"), "github.com/acme/w")).await.unwrap();
+        let legacy = [sub.clone()];
+
+        let w = f
+            .register(Registration { remote: Some("github.com/acme/w"), ..reg(path, &legacy) })
+            .await
+            .unwrap();
+
+        assert_ne!(w.root_id, a.root_id);
+        assert_eq!((w.rekeyed, w.snapshot), (0, None));
+        assert_eq!(
+            project_ids(&f.store).await,
+            vec![("memory".into(), older, Some(sub)), ("memory".into(), mine, Some(a.project_id))]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_repository_in_one_path_returns_to_its_own_project() {
+        let f = Fixture::new().await;
+        let path = Path::new("/work/app");
+        let a = f.register(cloned(path, "github.com/acme/a")).await.unwrap();
+        let b = f.register(cloned(path, "github.com/acme/b")).await.unwrap();
+
+        let a_again = f.register(cloned(path, "github.com/acme/a")).await.unwrap();
+        let b_again = f.register(cloned(path, "github.com/acme/b")).await.unwrap();
+
+        assert_eq!((a_again.project_id, a_again.root_id), (a.project_id, a.root_id));
+        assert_eq!((b_again.project_id, b_again.root_id), (b.project_id, b.root_id));
+        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 2, "no third row");
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_remote").await, 2);
+    }
+
+    #[tokio::test]
+    async fn the_project_of_a_repository_in_another_s_path_is_read_alike_without_writing() {
+        let f = Fixture::new().await;
+        let path = Path::new("/work/app");
+        let a = f.register(cloned(path, "github.com/acme/a")).await.unwrap();
+
+        let (read, planned) = f
+            .store
+            .conn
+            .call(move |c| {
+                let read = project_id_in(c, path, Some("github.com/acme/b"))?;
+                let planned = plan_ids_in(
+                    c,
+                    &[(path.to_path_buf(), Some("github.com/acme/b".into())), (path.to_path_buf(), Some("github.com/acme/b".into()))],
+                )?;
+                Ok::<_, rusqlite::Error>((read, planned))
+            })
+            .await
+            .unwrap();
+        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 1, "reading writes nothing");
+        let b = f.register(cloned(path, "github.com/acme/b")).await.unwrap();
+
+        assert_ne!(read, a.project_id);
+        assert_eq!(read, b.project_id);
+        let ids = (b.root_id.clone(), b.project_id.clone());
+        assert_eq!(planned, vec![ids.clone(), ids], "one path and remote twice in a batch is one project");
+    }
+
+    #[tokio::test]
+    async fn a_first_remote_keeps_the_project_of_its_root() {
+        let f = Fixture::new().await;
+        let root = Path::new("/work/app");
+        let local = f.register(reg(root, &[])).await.unwrap();
+
+        let pushed = f.register(cloned(root, "github.com/acme/app")).await.unwrap();
+
+        assert_eq!((pushed.project_id, pushed.root_id), (local.project_id.clone(), local.root_id));
+        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 1);
+        let unknown = f.register(reg(root, &[])).await.unwrap();
+        assert_eq!(unknown.project_id, local.project_id, "a root whose remote cannot be read keeps its project");
+    }
+
+    #[tokio::test]
+    async fn a_different_remote_in_a_registered_path_is_another_project() {
         let f = Fixture::new().await;
         let root = Path::new("/work/app");
         let first = f.register(cloned(root, "github.com/acme/app")).await.unwrap();
 
         let moved = f.register(cloned(root, "gitlab.com/acme/app")).await.unwrap();
 
-        assert_eq!((moved.project_id, moved.rekeyed), (first.project_id, 0));
+        assert_ne!(moved.project_id, first.project_id);
+        assert_eq!(moved.rekeyed, 0);
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_derives_its_id_is_refused_another_repository_s_project() {
+        let f = Fixture::new().await;
+        let path = Path::new("/work/app");
+        let a = f.register(cloned(path, "github.com/acme/a")).await.unwrap();
+        f.memory(&a.project_id, "the parser of a", None, 1).await;
+        let before = project_ids(&f.store).await;
+
+        let err = f
+            .register(Registration { assigned: false, ..cloned(path, "github.com/acme/b") })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RegisterError::RootCollision { ref id, .. } if *id == a.root_id), "{err:?}");
+        assert_eq!(project_ids(&f.store).await, before);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 1);
+        let same = f.register(Registration { assigned: false, ..cloned(path, "github.com/acme/a") }).await.unwrap();
+        assert_eq!(same.project_id, a.project_id, "its own repository is still served");
     }
 
     #[tokio::test]

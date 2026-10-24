@@ -2867,6 +2867,39 @@ async fn registering_without_assigned_ids_keeps_the_old_answer() {
     assert_eq!(remotes, 0, "a caller that derives its id joins no remote");
 }
 
+fn set_origin(root: &std::path::Path, url: &str) {
+    let git = root.join(".git");
+    std::fs::create_dir_all(&git).unwrap();
+    std::fs::write(git.join("config"), format!("[remote \"origin\"]\n\turl = {url}\n")).unwrap();
+}
+
+#[tokio::test]
+async fn a_repository_cloned_where_another_was_registers_into_a_project_of_its_own() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("app");
+    set_origin(&root, "git@github.com:acme/a.git");
+    let register = |assigned: bool| {
+        h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": assigned }))
+    };
+    let (_, a) = register(true).await;
+
+    set_origin(&root, "git@github.com:acme/b.git");
+    let (status, old) = register(false).await;
+    assert_eq!(status, 409, "{old}");
+    assert_eq!(old["error"], "project_root_collision", "{old}");
+    let detail = old["detail"].as_str().expect("detail");
+    assert!(detail.contains("gives that root another"), "{detail}");
+    let (status, b) = register(true).await;
+
+    assert_eq!(status, 200, "{b}");
+    assert_ne!(b["project_id"], a["project_id"], "{a} {b}");
+    assert_ne!(b["root_id"], a["root_id"], "{a} {b}");
+    set_origin(&root, "git@github.com:acme/a.git");
+    let (_, back) = register(true).await;
+    assert_eq!(back["project_id"], a["project_id"], "the first repository keeps its project");
+}
+
 #[tokio::test]
 async fn registering_needs_the_token() {
     let h = Harness::start().await;
