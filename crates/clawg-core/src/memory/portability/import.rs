@@ -10,9 +10,11 @@
 //! whose origin is here already is found where its rows are, as the same
 //! version or as a rewrite of theirs that goes where they are.
 //!
-//! Three passes. The first places every row and link inside a transaction it
-//! then drops, so rows of one file see each other and a dry run is exactly
-//! that pass. The second embeds the rows to insert, outside any transaction.
+//! Three passes. The first places every row and link on what it loaded of
+//! the store in short calls, off the connection and writing nothing, so rows
+//! of one file see each other, a dry run is exactly that pass and every other
+//! call goes on meanwhile. The second embeds the rows to insert, outside any
+//! transaction.
 //! The third writes them in bounded transactions, placing each row again
 //! because the worker writes meanwhile, then writes the links. A row that is
 //! already there is never inserted again and its links are only filled where
@@ -20,9 +22,11 @@
 //! transactions, does no harm.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::convert::Infallible;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, Transaction};
@@ -349,7 +353,7 @@ impl Placement {
 }
 
 /// What the passes so far placed, by the file's row id.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 struct Ledger {
     placed: BTreeMap<i64, Placement>,
     /// The agent each row inserted here had in the file, so two agents'
@@ -368,7 +372,7 @@ struct Ledger {
 }
 
 /// A row here imported from the origin of a note.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct OriginRow {
     id: i64,
     project: Option<String>,
@@ -381,7 +385,7 @@ struct OriginRow {
 
 /// What the rows of its origin here make of a note, decided at its first
 /// row and kept for the others.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Found {
     /// Nothing of its origin is here.
     New,
@@ -433,8 +437,10 @@ enum Link<'a> {
     Save(&'a [(i64, i64, String)]),
 }
 
-/// What placing rows reads of the store and writes to it, so the rules are
-/// written once over whatever holds the store: [`SqlSeat`] is a transaction.
+/// What placing rows reads of the store and writes to it. The rules are
+/// written once over it: [`SqlSeat`] is the transaction that writes, and
+/// [`Planned`] what the pass that only decides loaded of the store, so that
+/// pass leaves the connection to every other call.
 trait Seat {
     type Error;
     /// The rows imported from `origin`, by id.
@@ -609,6 +615,314 @@ impl Seat for SqlSeat<'_, '_> {
     }
 }
 
+/// Lookups per call while [`Planned`] is loaded. Each is a seek in an index,
+/// so a call lasts a few milliseconds and what else waits on the connection
+/// waits no longer, however long the file.
+const LOAD_BATCH: usize = 256;
+
+/// The rows of `memory` the rules can read, filtered by `$filter`.
+macro_rules! known_rows {
+    ($filter:literal) => {
+        concat!(
+            "SELECT id, agent_id, project_id, content_hash, created_at, topic_key, deleted_at IS NOT NULL, status, \
+             CASE WHEN source = 'import' THEN created_by_ref END FROM memory WHERE ",
+            $filter
+        )
+    };
+}
+
+const ORIGIN_ROWS_SQL: &str = known_rows!("source = 'import' AND created_by_ref = ?1");
+/// Every row of a text in a project, deleted or not, as [`PRESENT_SQL`] and
+/// [`TWIN_SQL`] read them.
+const TEXT_ROWS_SQL: &str = known_rows!("COALESCE(project_id, '') = ?1 AND content_hash = ?2");
+/// The rows of a key in a project that [`TOPIC_HOLDERS_SQL`] can name.
+const KEY_ROWS_SQL: &str = known_rows!("COALESCE(project_id, '') = ?1 AND topic_key = ?2 AND deleted_at IS NULL");
+/// The id `AUTOINCREMENT` gives the next row: above every id `memory` ever
+/// had, not only the ones it has.
+const NEXT_ID_SQL: &str = "SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'memory'), 0), \
+     COALESCE((SELECT MAX(id) FROM memory), 0)) + 1";
+
+/// A row of `memory` as the rules read it.
+#[derive(Debug, Clone)]
+struct Known {
+    id: i64,
+    agent: Option<String>,
+    project: Option<String>,
+    hash: Option<String>,
+    created_at: i64,
+    key: Option<String>,
+    deleted: bool,
+    status: String,
+    /// `created_by_ref` of an imported row.
+    origin: Option<String>,
+}
+
+impl Known {
+    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Known {
+            id: r.get(0)?,
+            agent: r.get(1)?,
+            project: r.get(2)?,
+            hash: r.get(3)?,
+            created_at: r.get(4)?,
+            key: r.get(5)?,
+            deleted: r.get(6)?,
+            status: r.get(7)?,
+            origin: r.get(8)?,
+        })
+    }
+
+    fn live(&self) -> bool {
+        !self.deleted && matches!(self.status.as_str(), "active" | "disputed")
+    }
+
+    fn origin_row(&self) -> OriginRow {
+        OriginRow {
+            id: self.id,
+            project: self.project.clone(),
+            key: self.key.clone(),
+            created_at: self.created_at,
+            hash: self.hash.clone().unwrap_or_default(),
+            deleted: self.deleted,
+            live: self.live(),
+        }
+    }
+}
+
+/// A project as the SQL compares it, `COALESCE(project_id, '')`.
+fn scope(project: Option<&str>) -> String {
+    project.unwrap_or_default().to_owned()
+}
+
+/// What the rules can read of the store for one file, loaded beforehand,
+/// and what placing its rows adds to it. Each list of ids is in the order
+/// of the ids, as the SQL reads them.
+#[derive(Debug, Default)]
+struct Planned {
+    rows: HashMap<i64, Known>,
+    by_text: HashMap<(String, String), Vec<i64>>,
+    by_key: HashMap<(String, String), Vec<i64>>,
+    by_origin: HashMap<String, Vec<i64>>,
+    /// Rows that are a piece of a save.
+    linked: HashSet<i64>,
+    /// The root of each project id here.
+    roots: HashMap<String, String>,
+    next_id: i64,
+}
+
+impl Planned {
+    fn know(&mut self, row: Known) {
+        let project = scope(row.project.as_deref());
+        if let Some(hash) = &row.hash {
+            self.by_text.entry((project.clone(), hash.clone())).or_default().push(row.id);
+        }
+        if let Some(key) = &row.key {
+            self.by_key.entry((project, key.clone())).or_default().push(row.id);
+        }
+        if let Some(origin) = &row.origin {
+            self.by_origin.entry(origin.clone()).or_default().push(row.id);
+        }
+        self.rows.insert(row.id, row);
+    }
+
+    fn among<'a>(&'a self, ids: Option<&'a Vec<i64>>) -> impl Iterator<Item = &'a Known> {
+        ids.into_iter().flatten().map(|id| &self.rows[id])
+    }
+}
+
+impl Seat for Planned {
+    type Error = Infallible;
+
+    fn origin_rows(&mut self, origin: &str) -> Result<Vec<OriginRow>, Infallible> {
+        Ok(self.among(self.by_origin.get(origin)).map(Known::origin_row).collect())
+    }
+
+    fn present(&mut self, agent: Option<&str>, project: Option<&str>, hash: &str, created_at: i64) -> Result<Option<i64>, Infallible> {
+        let rows = self.among(self.by_text.get(&(scope(project), hash.to_owned())));
+        Ok(rows.filter(|k| k.agent.as_deref() == agent && k.created_at == created_at).map(|k| k.id).next())
+    }
+
+    fn twin(&mut self, project: Option<&str>, hash: &str) -> Result<Option<i64>, Infallible> {
+        let rows = self.among(self.by_text.get(&(scope(project), hash.to_owned())));
+        Ok(rows.filter(|k| k.live()).min_by_key(|k| (k.created_at, k.id)).map(|k| k.id))
+    }
+
+    fn holders(&mut self, project: Option<&str>, key: &str, origin: Option<&str>) -> Result<Vec<i64>, Infallible> {
+        let rows = self.among(self.by_key.get(&(scope(project), key.to_owned())));
+        Ok(rows.filter(|k| k.live() && !(origin.is_some() && k.origin.as_deref() == origin)).map(|k| k.id).collect())
+    }
+
+    fn insert(&mut self, new: &NewRow<'_>) -> Result<i64, Infallible> {
+        let (id, src) = (self.next_id, &new.row.src);
+        self.next_id += 1;
+        self.know(Known {
+            id,
+            agent: new.row.agent.clone(),
+            project: new.project.map(str::to_owned),
+            hash: Some(new.row.hash.clone()),
+            created_at: src.created_at,
+            key: new.key.map(str::to_owned),
+            deleted: src.deleted_at.is_some(),
+            status: new.status.to_owned(),
+            origin: (src.source == "import").then(|| src.created_by_ref.clone()),
+        });
+        Ok(id)
+    }
+
+    fn revise(&mut self, id: i64, _by: i64) -> Result<(), Infallible> {
+        if let Some(row) = self.rows.get_mut(&id).filter(|r| r.live()) {
+            row.status = "superseded".to_owned();
+        }
+        Ok(())
+    }
+
+    fn linked(&mut self, id: i64) -> Result<bool, Infallible> {
+        Ok(self.linked.contains(&id))
+    }
+
+    fn link(&mut self, link: Link<'_>) -> Result<(), Infallible> {
+        if let Link::Save(pieces) = link {
+            self.linked.extend(pieces.iter().map(|(_, id, _)| *id));
+        }
+        Ok(())
+    }
+}
+
+/// Runs `sql` once per set of `binds`, [`LOAD_BATCH`] to a call.
+async fn known(store: &MemoryStore, sql: &'static str, binds: Vec<Vec<String>>) -> Result<Vec<Known>, MemoryError> {
+    let mut rows = Vec::new();
+    for batch in binds.chunks(LOAD_BATCH) {
+        let batch = batch.to_vec();
+        let found = store
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<Known>> {
+                let mut stmt = c.prepare_cached(sql)?;
+                let mut rows = Vec::new();
+                for bind in &batch {
+                    let found = stmt.query_map(rusqlite::params_from_iter(bind), Known::read)?;
+                    for row in found {
+                        rows.push(row?);
+                    }
+                }
+                Ok(rows)
+            })
+            .await
+            .map_err(MemoryError::Connection)?;
+        rows.extend(found);
+    }
+    Ok(rows)
+}
+
+/// Loads what the rules can read of the store for `prepared`. The rows of
+/// each origin of the file come first: with the file's own, their projects
+/// and keys are every project and key the rules can ask about.
+async fn load(store: &MemoryStore, prepared: &Prepared) -> Result<Planned, MemoryError> {
+    let origins: BTreeSet<&str> = prepared.notes.iter().map(|n| n.origin.as_str()).collect();
+    let binds = origins.iter().map(|o| vec![o.to_string()]).collect();
+    let mut rows = known(store, ORIGIN_ROWS_SQL, binds).await?;
+
+    let mut reach: HashMap<&str, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new();
+    for row in &rows {
+        if let Some(origin) = row.origin.as_deref() {
+            let (projects, keys) = reach.entry(origin).or_default();
+            projects.insert(scope(row.project.as_deref()));
+            keys.extend(row.key.clone());
+        }
+    }
+    for row in &prepared.rows {
+        if let Some(note) = row.note {
+            let (projects, keys) = reach.entry(prepared.notes[note].origin.as_str()).or_default();
+            projects.insert(scope(row.project.as_deref()));
+            keys.extend(row.src.topic_key.clone());
+        }
+    }
+    let mut texts: BTreeSet<Vec<String>> = BTreeSet::new();
+    let mut keys: BTreeSet<Vec<String>> = BTreeSet::new();
+    for row in &prepared.rows {
+        let own = (BTreeSet::from([scope(row.project.as_deref())]), row.src.topic_key.iter().cloned().collect());
+        let (projects, row_keys) = match row.note {
+            Some(note) => &reach[prepared.notes[note].origin.as_str()],
+            None => &own,
+        };
+        for project in projects {
+            texts.insert(vec![project.clone(), row.hash.clone()]);
+            keys.extend(row_keys.iter().map(|key| vec![project.clone(), key.clone()]));
+        }
+    }
+    rows.extend(known(store, TEXT_ROWS_SQL, texts.into_iter().collect()).await?);
+    rows.extend(known(store, KEY_ROWS_SQL, keys.into_iter().collect()).await?);
+    rows.sort_by_key(|r| r.id);
+    rows.dedup_by_key(|r| r.id);
+
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let mut linked = HashSet::new();
+    for batch in ids.chunks(LOAD_BATCH) {
+        let batch = batch.to_vec();
+        let found = store
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = c.prepare_cached(LINKED_SQL)?;
+                let mut linked = Vec::new();
+                for id in batch {
+                    if stmt.query_row([id], |r| r.get(0))? {
+                        linked.push(id);
+                    }
+                }
+                Ok(linked)
+            })
+            .await
+            .map_err(MemoryError::Connection)?;
+        linked.extend(found);
+    }
+
+    let root_ids: Vec<String> = prepared.projects.iter().map(|p| p.root_id.clone()).collect();
+    let (roots, next_id) = store
+        .conn
+        .call(move |c| -> rusqlite::Result<(HashMap<String, String>, i64)> {
+            let mut roots = HashMap::new();
+            let mut stmt = c.prepare_cached(PROJECT_ROOT_SQL)?;
+            for id in root_ids {
+                if let Some(root) = stmt.query_row([&id], |r| r.get(0)).optional()? {
+                    roots.insert(id, root);
+                }
+            }
+            Ok((roots, c.query_row(NEXT_ID_SQL, [], |r| r.get(0))?))
+        })
+        .await
+        .map_err(MemoryError::Connection)?;
+
+    let mut planned = Planned { linked, roots, next_id, ..Default::default() };
+    for row in rows {
+        planned.know(row);
+    }
+    Ok(planned)
+}
+
+/// Decides where every row of `prepared` goes, as the writing pass would on
+/// the store `planned` holds, or nothing once `stop` is set.
+fn decide(mut planned: Planned, prepared: &Prepared, stop: &AtomicBool) -> Option<Ledger> {
+    let (taken, _) = taken_projects(&prepared.projects, &mut planned.roots);
+    let mut ledger = Ledger { taken, ..Default::default() };
+    for range in note_batches(&prepared.units(), WRITE_BATCH) {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Ok(()) = place_rows(&mut planned, prepared, range, &mut ledger, &HashMap::new(), false);
+    }
+    let Ok(()) = write_links(&mut planned, prepared, &mut ledger);
+    Some(ledger)
+}
+
+/// Stops [`decide`] when the import waiting for it is dropped, as a shutdown
+/// that cuts the request drops it.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// What the rows of `note`'s origin here make of it; `rows` are the note's.
 /// A note is the same version as a row of its origin with its date, the one
 /// a source gives a text when it writes or rewrites it.
@@ -683,7 +997,7 @@ const PRESENT_SQL: &str = "SELECT id FROM memory \
 
 /// The live row of the same text in the project, whoever saved it, as the
 /// worker's dedup finds it. An import is the user's, so no policy narrows it.
-/// Of two of the same date, the first.
+/// Of two of the same date the first, as [`Planned`] picks it.
 const TWIN_SQL: &str = "SELECT id FROM memory \
      WHERE COALESCE(project_id, '') = COALESCE(?1, '') \
        AND content_hash = ?2 AND deleted_at IS NULL AND status IN ('active', 'disputed') \
@@ -1015,12 +1329,17 @@ pub async fn import(
     text: &str,
     options: &ImportOptions,
 ) -> Result<ImportReport, ImportError> {
+    let prepared = prepare_file(store, text, options).await?;
+    let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
+    Ok(report(&prepared, &ledger, options.dry_run, snapshot))
+}
+
+/// A clawg export, worked out against the ids its roots would get here.
+async fn prepare_file(store: &MemoryStore, text: &str, options: &ImportOptions) -> Result<Arc<Prepared>, ImportError> {
     let (_, parsed) = parse(text)?;
     let roots = roots_here(&parsed, options);
     let ids = plan(store, &roots).await?;
-    let prepared = Arc::new(prepare(parsed, &roots, &ids, options, Texts::Raw));
-    let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
-    Ok(report(&prepared, &ledger, options.dry_run, snapshot))
+    Ok(Arc::new(prepare(parsed, &roots, &ids, options, Texts::Raw)))
 }
 
 /// Imports the notes of another tool's export as [`import`] imports a file:
@@ -1036,6 +1355,19 @@ pub async fn import_foreign(
     export: ForeignExport,
     options: &ImportOptions,
 ) -> Result<ImportReport, ImportError> {
+    let (prepared, foreign) = prepare_export(store, chunker, export, options).await?;
+    let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
+    Ok(with_foreign(report(&prepared, &ledger, options.dry_run, snapshot), foreign, &prepared.notes, &ledger))
+}
+
+/// Another tool's export translated into rows, with what the translation
+/// counted.
+async fn prepare_export(
+    store: &MemoryStore,
+    chunker: Arc<ChatChunker>,
+    export: ForeignExport,
+    options: &ImportOptions,
+) -> Result<(Arc<Prepared>, ForeignReport), ImportError> {
     // Planned before the translation, which tells keys apart by the project
     // each note goes to here.
     let mut seen = HashSet::new();
@@ -1061,9 +1393,7 @@ pub async fn import_foreign(
     })
     .await
     .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
-    let prepared = Arc::new(prepared);
-    let (ledger, snapshot) = write(store, embedder, backups, &prepared, options.dry_run).await?;
-    Ok(with_foreign(report(&prepared, &ledger, options.dry_run, snapshot), foreign, &prepared.notes, &ledger))
+    Ok((Arc::new(prepared), foreign))
 }
 
 /// The batches the rows are written in, one transaction each, from the rows
@@ -1097,19 +1427,14 @@ async fn write(
     dry_run: bool,
 ) -> Result<(Ledger, Option<String>), ImportError> {
     let now = TimestampMs::now().as_millis_i64();
-    let decide = prepared.clone();
-    let decided = store
-        .conn
-        .call(move |c| -> rusqlite::Result<Ledger> {
-            let tx = c.transaction()?;
-            let mut ledger = Ledger { taken: record_projects(&tx, &decide.projects, now)?, ..Default::default() };
-            place_rows(&mut SqlSeat(&tx), &decide, 0..decide.rows.len(), &mut ledger, &HashMap::new(), false)?;
-            write_links(&mut SqlSeat(&tx), &decide, &mut ledger)?;
-            // Dropped, never committed: this pass only finds out.
-            Ok(ledger)
-        })
+    let planned = load(store, prepared).await?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop = StopOnDrop(stop.clone());
+    let decide_from = prepared.clone();
+    let decided = tokio::task::spawn_blocking(move || decide(planned, &decide_from, &stop))
         .await
-        .map_err(MemoryError::Connection)?;
+        .map_err(|e| MemoryError::Internal(format!("could not plan the import: {e}")))?
+        .ok_or_else(|| MemoryError::Internal("the import was stopped".to_owned()))?;
 
     if dry_run {
         return Ok((decided, None));
@@ -1520,9 +1845,14 @@ mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
+        let sequence = "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'memory'), 0)";
+        let before = count(&dst, sequence).await;
         let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }).await.unwrap();
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert_eq!(count(&dst, "SELECT count(*) FROM project").await, 0);
+        assert_eq!(count(&dst, "SELECT count(*) FROM project_remote").await, 0);
+        assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts").await, 1);
+        assert_eq!(count(&dst, sequence).await, before);
         assert!(files_in(backups.path()).is_empty());
         let (real, _) = run(&dst, &file, ImportOptions::default()).await;
         assert_eq!(ImportReport { dry_run: false, snapshot: real.snapshot.clone(), ..dry }, real);
@@ -2547,6 +2877,11 @@ mod tests {
             ("REVISED_SQL", REVISED_SQL, vec![Integer(-1), Integer(-2)], "INTEGER PRIMARY KEY"),
             ("LINKED_SQL", LINKED_SQL, vec![Integer(5)], "idx_memory_piece_memory"),
             ("NEXT_SAVE_SQL", NEXT_SAVE_SQL, vec![], "PRIMARY KEY"),
+            ("ORIGIN_ROWS_SQL", ORIGIN_ROWS_SQL, vec![Text("engram:a".into())], "idx_memory_import_origin"),
+            ("TEXT_ROWS_SQL in a project", TEXT_ROWS_SQL, vec![Text(project()), hash()], "idx_memory_dedup"),
+            ("TEXT_ROWS_SQL without a project", TEXT_ROWS_SQL, vec![Text(String::new()), hash()], "idx_memory_dedup"),
+            ("KEY_ROWS_SQL", KEY_ROWS_SQL, vec![Text(project()), Text("storage/engine".into())], "idx_memory_topic"),
+            ("PROJECT_ROOT_SQL", PROJECT_ROOT_SQL, vec![Text(project())], "sqlite_autoindex_project_1"),
         ];
         let mut wrong = Vec::new();
         for (name, sql, binds, index) in cases {
@@ -2573,6 +2908,172 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    async fn file_of(store: &MemoryStore, text: &str, options: ImportOptions) -> Arc<Prepared> {
+        prepare_file(store, text, &options).await.unwrap()
+    }
+
+    async fn notes_of(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> Arc<Prepared> {
+        prepare_export(store, Arc::new(ChatChunker::with_fallback()), foreign_export(notes), &options).await.unwrap().0
+    }
+
+    /// What the pass that decided on the connection made of `prepared`: the
+    /// rules on a transaction that is dropped.
+    async fn decided_by_sql(store: &MemoryStore, prepared: &Arc<Prepared>) -> Ledger {
+        let prepared = prepared.clone();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<Ledger> {
+                let tx = c.transaction()?;
+                let mut ledger = Ledger { taken: record_projects(&tx, &prepared.projects, 0)?, ..Default::default() };
+                place_rows(&mut SqlSeat(&tx), &prepared, 0..prepared.rows.len(), &mut ledger, &HashMap::new(), false)?;
+                write_links(&mut SqlSeat(&tx), &prepared, &mut ledger)?;
+                Ok(ledger)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn decides_alike(store: &MemoryStore, prepared: Arc<Prepared>, case: &str) -> Ledger {
+        let by_sql = decided_by_sql(store, &prepared).await;
+        let planned = load(store, &prepared).await.unwrap();
+        let by_plan = decide(planned, &prepared, &AtomicBool::new(false)).unwrap();
+        assert_eq!(by_plan, by_sql, "{case}");
+        by_plan
+    }
+
+    #[tokio::test]
+    async fn the_planner_decides_as_the_sql_pass() {
+        let file = seeded_file().await;
+        let plain = ImportOptions::default;
+
+        let dst = destination().await;
+        decides_alike(&dst, file_of(&dst, &file, plain()).await, "a clawg file").await;
+        run(&dst, &file, plain()).await;
+        decides_alike(&dst, file_of(&dst, &file, plain()).await, "the same file again").await;
+        dst.conn
+            .call(|c| {
+                c.execute_batch(
+                    "UPDATE memory SET superseded_by = NULL, revived_from = NULL, disputed_against = NULL;
+                     DELETE FROM memory_piece; DELETE FROM memory_derivation; DELETE FROM memory_conflict;",
+                )
+            })
+            .await
+            .unwrap();
+        decides_alike(&dst, file_of(&dst, &file, plain()).await, "links lost between transactions").await;
+
+        let dst = destination().await;
+        insert_row(&dst, "cursor", Some(project()), "Storage engine: SQLite with WAL", None, 5).await;
+        let ledger = decides_alike(&dst, file_of(&dst, &file, plain()).await, "a live twin").await;
+        assert!(ledger.placed.values().any(|p| matches!(p, Placement::Merged(_))));
+
+        let dst = destination().await;
+        insert_row(&dst, "claude-code", Some(project()), "Storage engine: DuckDB", Some("storage/engine"), 5).await;
+        let ledger = decides_alike(&dst, file_of(&dst, &file, plain()).await, "a taken key").await;
+        assert!(ledger.placed.values().any(|p| matches!(p, Placement::TopicTaken { .. })));
+        let options = ImportOptions { agent: Some("dev".into()), ..Default::default() };
+        decides_alike(&dst, file_of(&dst, &file, options).await, "every row under one agent").await;
+
+        let dst = destination().await;
+        for _ in 0..2 {
+            insert_row(&dst, "cursor", Some(project()), "Storage engine: SQLite with WAL", None, 5).await;
+        }
+        decides_alike(&dst, file_of(&dst, &file, plain()).await, "two live rows of a text and a date").await;
+
+        let dst = destination().await;
+        let purged = insert_row(&dst, "cursor", None, "A row purged since", None, 2).await;
+        dst.conn.call(move |c| c.execute("DELETE FROM memory WHERE id = ?1", [purged])).await.unwrap();
+        decides_alike(&dst, file_of(&dst, &file, plain()).await, "a store whose last row was purged").await;
+
+        let dst = destination().await;
+        decides_alike(&dst, notes_of(&dst, sample_notes(), plain()).await, "notes of another tool").await;
+        run_foreign(&dst, sample_notes(), plain()).await;
+        decides_alike(&dst, notes_of(&dst, sample_notes(), plain()).await, "the same notes again").await;
+
+        let dst = destination().await;
+        let port = |content: &str, written: i64| ForeignNote { written: When::At(written), ..foreign_note("engram:port", "Port", content) };
+        run_foreign(&dst, vec![port("the daemon listens on 27380", T0)], plain()).await;
+        let cases = [
+            (vec![port("the daemon listens on 27390", T0 + 1000)], "a newer version"),
+            (vec![port("the daemon listens on 27370", T0 - 1000)], "an older version"),
+            (vec![ForeignNote { deleted: Some(When::At(T0 + 5)), ..port("the daemon listens on 27380", T0) }], "deleted at the source"),
+        ];
+        for (notes, case) in cases {
+            decides_alike(&dst, notes_of(&dst, notes, plain()).await, case).await;
+        }
+        let id = imported(&dst, "engram:port").await[0].id;
+        delete_memory_core(&dst, id, MemoryKind::Memory, None).await.unwrap();
+        decides_alike(&dst, notes_of(&dst, vec![port("the daemon listens on 27380", T0)], plain()).await, "deleted here").await;
+
+        let dst = destination().await;
+        let notes = vec![
+            named("a", 1),
+            ForeignNote { written: When::At(T0 + 2), ..foreign_note("engram:a", "a", "the note a, again") },
+            named("b", 3),
+            ForeignNote { written: When::At(T0 + 4), ..foreign_note("engram:c", "b", "the note b") },
+        ];
+        decides_alike(&dst, notes_of(&dst, notes, plain()).await, "two notes of an origin and a text twice").await;
+
+        let dst = destination().await;
+        let dir = tempfile::tempdir().unwrap();
+        let options = ImportOptions { project_map: vec![("a".into(), dir.path().to_string_lossy().into_owned())], ..Default::default() };
+        let prepared = notes_of(&dst, sample_notes(), options).await;
+        let root_id = prepared.projects[0].root_id.clone();
+        dst.conn
+            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/work/elsewhere', 0)", [root_id]))
+            .await
+            .unwrap();
+        let ledger = decides_alike(&dst, prepared, "a project another root took").await;
+        assert_eq!(ledger.taken.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_leaves_the_connection_to_other_calls() {
+        const NOTES: usize = 10_000;
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let notes = (0..NOTES).map(|k| named(&format!("n{k}"), k as i64)).collect();
+        let done = AtomicBool::new(false);
+        let import = async {
+            let imported = run_foreign(&store, notes, ImportOptions { dry_run: true, ..Default::default() }).await;
+            done.store(true, Ordering::Relaxed);
+            imported
+        };
+        let probe = async {
+            let mut worst = std::time::Duration::ZERO;
+            while !done.load(Ordering::Relaxed) {
+                let started = std::time::Instant::now();
+                store.conn.call(|c| c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))).await.unwrap();
+                worst = worst.max(started.elapsed());
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            worst
+        };
+        let ((report, _), worst) = tokio::join!(import, probe);
+        assert_eq!(report.inserted, NOTES);
+        assert!(worst < std::time::Duration::from_millis(300), "a call waited {worst:?} behind the dry run");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_planner_decides_nothing() {
+        let dst = destination().await;
+        let prepared = file_of(&dst, &seeded_file().await, ImportOptions::default()).await;
+        let planned = load(&dst, &prepared).await.unwrap();
+        assert!(decide(planned, &prepared, &AtomicBool::new(true)).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_after_a_purge_reports_the_ids_of_the_import() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        insert_row(&dst, "claude-code", Some(project()), "Storage engine: DuckDB", Some("storage/engine"), 5).await;
+        let purged = insert_row(&dst, "claude-code", None, "A row purged since", None, 6).await;
+        dst.conn.call(move |c| c.execute("DELETE FROM memory WHERE id = ?1", [purged])).await.unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }).await.unwrap();
+        assert!(dry.topic_taken.iter().all(|t| t.stored_as > purged) && !dry.topic_taken.is_empty(), "{dry:#?}");
+        let (real, _) = run(&dst, &file, ImportOptions::default()).await;
+        assert_eq!(ImportReport { dry_run: false, snapshot: real.snapshot.clone(), ..dry }, real);
     }
 
     /// An import's time grows with its rows: twice the notes, of one row each,
