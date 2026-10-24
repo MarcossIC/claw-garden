@@ -2043,6 +2043,13 @@ async fn register(
         .await
         .map_err(|e| match e {
             RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
+            RegisterError::RootCollision { id, existing } if existing == body.root_path => ApiError {
+                detail: Some(format!(
+                    "{} derives the project id {id}, but the daemon gives that root another one; a newer bridge uses it",
+                    root.display()
+                )),
+                ..ApiError::conflict("project_root_collision")
+            },
             RegisterError::RootCollision { id, existing } => ApiError {
                 detail: Some(format!("{} gets the project id {id}, which already belongs to {existing}", root.display())),
                 ..ApiError::conflict("project_root_collision")

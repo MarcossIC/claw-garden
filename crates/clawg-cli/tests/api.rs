@@ -2887,6 +2887,8 @@ async fn a_repository_cloned_where_another_was_registers_into_a_project_of_its_o
     let (status, old) = register(false).await;
     assert_eq!(status, 409, "{old}");
     assert_eq!(old["error"], "project_root_collision", "{old}");
+    let detail = old["detail"].as_str().expect("detail");
+    assert!(detail.contains("gives that root another"), "{detail}");
     let (status, b) = register(true).await;
 
     assert_eq!(status, 200, "{b}");
