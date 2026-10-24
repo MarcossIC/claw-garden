@@ -1748,7 +1748,7 @@ fn with_foreign(mut report: ImportReport, mut foreign: ForeignReport, notes: &[N
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::memory::admin::{delete_memory_core, restore_memory_core, MemoryKind};
     use crate::memory::db::seed_on_disk;
@@ -1765,13 +1765,13 @@ mod tests {
     use crate::memory::worker::save_for_test;
     use crate::models::chat::Role;
 
-    const EVERYTHING: ExportFilter = ExportFilter { project_id: None, agent: None, include_deleted: true };
+    pub(crate) const EVERYTHING: ExportFilter = ExportFilter { project_id: None, agent: None, include_deleted: true };
 
-    async fn dump(store: &MemoryStore, filter: ExportFilter) -> Export {
+    pub(crate) async fn dump(store: &MemoryStore, filter: ExportFilter) -> Export {
         store.conn.call(move |c| Ok::<_, rusqlite::Error>(read(c, &filter, 0))).await.unwrap().unwrap()
     }
 
-    async fn seeded_file() -> String {
+    pub(crate) async fn seeded_file() -> String {
         let store = MemoryStore::new_for_test().await.unwrap();
         seed(&store).await;
         dump(&store, EVERYTHING).await.to_jsonl()
@@ -1779,13 +1779,13 @@ mod tests {
 
     /// An empty store, but for one row of its own, so the ids the import
     /// assigns are not the file's by accident.
-    async fn destination() -> MemoryStore {
+    pub(crate) async fn destination() -> MemoryStore {
         let store = MemoryStore::new_for_test().await.unwrap();
         insert_row(&store, "claude-code", None, "A row that was here first", None, 1).await;
         store
     }
 
-    async fn insert_row(
+    pub(crate) async fn insert_row(
         store: &MemoryStore,
         agent: &'static str,
         project: Option<String>,
@@ -1810,7 +1810,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn run(store: &MemoryStore, text: &str, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+    pub(crate) async fn run(store: &MemoryStore, text: &str, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
         let backups = tempfile::tempdir().unwrap();
         let report = import(store, Some(&FakeEmbedder::default()), backups.path(), text, &options).await.unwrap();
         (report, backups)
@@ -2038,6 +2038,7 @@ mod tests {
 
         let (foreign, _) = run_foreign(&dst, sample_notes(), ImportOptions::default()).await;
         assert_eq!(foreign.import_id, Some(2));
+        assert!(dst.importing.lock().unwrap().is_empty(), "an import lets its number go once it ends");
         let (header, rows, _) = journal_of(&dst, 2).await;
         assert_eq!(header.map(|h| h.0), Some("engram".to_owned()));
         assert_eq!(rows.len(), foreign.inserted);
@@ -2330,11 +2331,11 @@ mod tests {
         assert_eq!(reasons, vec!["memory 15 was revived by deleting 16, which is not in the file"], "{report:#?}");
     }
 
-    async fn run_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+    pub(crate) async fn run_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
         run_export(store, foreign_export(notes), options).await
     }
 
-    async fn run_export(store: &MemoryStore, export: ForeignExport, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+    pub(crate) async fn run_export(store: &MemoryStore, export: ForeignExport, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
         let backups = tempfile::tempdir().unwrap();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let report =
@@ -2343,7 +2344,7 @@ mod tests {
     }
 
     /// `source` and `target` judged related by `verb`, by an agent.
-    fn relation(source: &str, target: &str, verb: &str) -> ForeignRelation {
+    pub(crate) fn relation(source: &str, target: &str, verb: &str) -> ForeignRelation {
         ForeignRelation {
             source: format!("engram:{source}"),
             target: format!("engram:{target}"),
@@ -2359,7 +2360,7 @@ mod tests {
     }
 
     /// The note `name`, written `k` ms after `T0`, so the ids here follow `k`.
-    fn named(name: &str, k: i64) -> ForeignNote {
+    pub(crate) fn named(name: &str, k: i64) -> ForeignNote {
         ForeignNote { written: When::At(T0 + k), ..foreign_note(&format!("engram:{name}"), name, &format!("the note {name}")) }
     }
 
@@ -2487,7 +2488,7 @@ mod tests {
 
     /// Notes of two projects of the source and of none: a long one, two under
     /// one key, and one the source deleted.
-    fn sample_notes() -> Vec<ForeignNote> {
+    pub(crate) fn sample_notes() -> Vec<ForeignNote> {
         let in_a = |origin: &str, title: &str, content: &str| ForeignNote { project: Some("a".into()), ..foreign_note(origin, title, content) };
         vec![
             in_a("engram:long", "Notes on clawg-ledger", &"one writer per store, ".repeat(150)),
