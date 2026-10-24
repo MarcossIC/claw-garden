@@ -53,7 +53,7 @@ El export se midió el 2026-10-22 con un script que imprime sólo nombres de cam
 
 ## Lo que ya existe y se reutiliza
 
-- El camino de 43 (`prepare`, `place`, `write_links`, `import.rs`): snapshot `pre-import`, enmascarado, dedup, re-embebido, `--dry-run` y su reporte ([`specs/portability`](../../specs/portability/spec.md)).
+- El camino de 43 (`prepare`, `place`, `write_links`, `import.rs`): snapshot `pre-import`, enmascarado, dedup, re-embebido, `--dry-run` y su reporte ([`specs/portability`](../../../specs/portability/spec.md)).
 - `split_save` y `SAVE_HEAD_TOKENS` (`chunker/mod.rs:29`): cada pieza después de la primera se embebe detrás de los primeros 48 tokens del save. Con el título en la primera línea, el tema viaja en el vector de cada pieza.
 - `redact` antes de partir, como el worker (`crates/clawg-core/src/memory/worker.rs:735`): así ningún corte de pieza parte un secreto.
 - `derive_project_id` (`crates/clawg-core/src/memory/identity.rs:11`) para la raíz que nombre el usuario, como hace `--map-root`.
@@ -88,7 +88,7 @@ El 2026-10-22, sobre las decisiones abiertas:
 Las resolvió la evidencia:
 
 - **Zona horaria:** UTC.
-- **Detector:** el import de 43 nunca lo corre (R3 de [`specs/portability`](../../specs/portability/spec.md)).
+- **Detector:** el import de 43 nunca lo corre (R3 de [`specs/portability`](../../../specs/portability/spec.md)).
 - **Orden respecto de 19, 24 y 27:** los tres están archivados.
 - **Dónde se traduce:** A1, porque sólo el daemon parte como un save y enmascara antes de partir.
 

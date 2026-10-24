@@ -1,6 +1,6 @@
 # history-import — Especificación
 
-Suma requisitos a [`specs/portability`](../../specs/portability/spec.md) (HI2 y HI4 a HI17), [`specs/storage`](../../specs/storage/spec.md) (HI1) y [`specs/project`](../../specs/project/spec.md) (HI3). Lo que no se nombra aquí sigue como está; en particular R1 a R7 de `specs/portability` siguen valiendo para un archivo `clawg-memories`.
+Suma requisitos a [`specs/portability`](../../../specs/portability/spec.md) (HI2 y HI4 a HI17), [`specs/storage`](../../../specs/storage/spec.md) (HI1) y [`specs/project`](../../../specs/project/spec.md) (HI3). Lo que no se nombra aquí sigue como está; en particular R1 a R7 de `specs/portability` siguen valiendo para un archivo `clawg-memories`.
 
 ## Definiciones
 
@@ -9,9 +9,9 @@ Suma requisitos a [`specs/portability`](../../specs/portability/spec.md) (HI2 y 
 - **Origen de una nota:** la fuente y el id estable de la nota en ella, escrito en `created_by_ref` como `engram:<sync_id>`; sin `sync_id`, `engram:observation:<id>` o `engram:prompt:<id>`; el resumen de una sesión, `engram:session:<id>`.
 - **Grupo de origen:** el proyecto y el scope que la nota tenía en la fuente (`personal` o no), y «sin proyecto» como un grupo más.
 - **Fecha del texto:** `updated_at` de la nota, o `created_at` sin él; en UTC.
-- **Destino de una nota:** el id de proyecto que un registro le daría a la raíz que el mapa le asigna a su proyecto de la fuente (R15 y R16 de [`specs/project`](../../specs/project/spec.md), como a una raíz de `--map-root`), o «sin proyecto». Dos clones de un remoto son un mismo destino.
+- **Destino de una nota:** el id de proyecto que un registro le daría a la raíz que el mapa le asigna a su proyecto de la fuente (R15 y R16 de [`specs/project`](../../../specs/project/spec.md), como a una raíz de `--map-root`), o «sin proyecto». Dos clones de un remoto son un mismo destino.
 - **Fila viva:** `deleted_at IS NULL` y `status IN ('active', 'disputed')`.
-- **Fila protegida:** `memory_type` `user_preference` o `architectural_decision` ([`specs/disputes`](../../specs/disputes/spec.md)).
+- **Fila protegida:** `memory_type` `user_preference` o `architectural_decision` ([`specs/disputes`](../../../specs/disputes/spec.md)).
 
 ## HI1. V23: el proyecto de origen
 
@@ -37,7 +37,7 @@ El export MUST escribir `origin_project` en cada línea `memory` (`null` cuando 
 
 ## HI3. Elegir filas por su proyecto de origen
 
-`clawg projects move` MUST aceptar `--origin-project NOMBRE`, que elige las filas cuyo `origin_project` es exactamente `NOMBRE`, y cuenta como filtro de selección (R12 de [`specs/project`](../../specs/project/spec.md)). `POST /v1/memories/move` MUST aceptar `origin_project` con el mismo efecto. `clawg memories list --origin-project NOMBRE` y `GET /v1/memories?origin_project=NOMBRE` MUST listar sólo esas filas, con los demás filtros.
+`clawg projects move` MUST aceptar `--origin-project NOMBRE`, que elige las filas cuyo `origin_project` es exactamente `NOMBRE`, y cuenta como filtro de selección (R12 de [`specs/project`](../../../specs/project/spec.md)). `POST /v1/memories/move` MUST aceptar `origin_project` con el mismo efecto. `clawg memories list --origin-project NOMBRE` y `GET /v1/memories?origin_project=NOMBRE` MUST listar sólo esas filas, con los demás filtros.
 
 #### Escenario: acomodar un proyecto de la fuente
 - GIVEN notas importadas sin proyecto de dos proyectos de origen, `a` y `b`
@@ -229,6 +229,6 @@ El reporte MUST traer, además de lo de R7 de `specs/portability`, las filas ins
 
 ## HI18. El agente lee y cambia lo importado
 
-Desde el agente del puente, una nota importada larga MUST leerse entera con `read_memory`, y `update_memory` y `delete_memory` MUST cambiarla, como cualquier fila que alcanza ([`specs/visibility`](../../specs/visibility/spec.md)).
+Desde el agente del puente, una nota importada larga MUST leerse entera con `read_memory`, y `update_memory` y `delete_memory` MUST cambiarla, como cualquier fila que alcanza ([`specs/visibility`](../../../specs/visibility/spec.md)).
 
 **Test:** `an_imported_long_note_reads_whole_and_changes_for_the_bridge_agent` (`crates/clawg-cli/tests/api.rs`).

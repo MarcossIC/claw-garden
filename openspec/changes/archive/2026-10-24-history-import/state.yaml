@@ -1,0 +1,15 @@
+change: history-import
+objective: "1, 2"
+depends_on: [memory-portability, agent-authorship, project-reassign, language-preference]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # Windows, Linux y el binario real con el modelo en un home temporal; el perfil dev con el export real no se corrió
+  archive: done
+updated: 2026-10-24
+main_spec: openspec/specs/portability/spec.md, openspec/specs/storage/spec.md, openspec/specs/project/spec.md

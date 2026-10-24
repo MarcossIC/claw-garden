@@ -18,6 +18,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [serve-log-rotation](../../changes/archive/2026-10-22-serve-log-rotation/proposal.md), archivado el 2026-10-22 («El log del daemon»).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 (sólo «Una base en V19 abre con los índices por proyecto» y su vuelta atrás).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «El idioma de cada fila», LP4 y LP5 de esa spec). La preferencia y su archivo están en [`specs/preferences`](../preferences/spec.md).
+- [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (sólo «El proyecto de origen», HI1 de esa spec). Cómo se llena la columna está en [`specs/portability`](../portability/spec.md).
 
 ## Definiciones
 
@@ -890,6 +891,23 @@ Un `clawg serve` lanzado a mano escribe donde lo redirija quien lo lanza, sin ro
 V21 MUST crear `memory_move` (`move_id`, `row_id`, `from_project`, `from_scope`, `to_project`, `to_scope`, `moved_at`) con un índice por `move_id`, sin clave foránea a `memory` (un `purge` no debe frenarse por un movimiento viejo) y sin tocar ninguna fila. Una base en V20 MUST abrir con el registro vacío y cada fila igual. La vuelta atrás del esquema es el snapshot `pre-migration`, o deshacer los movimientos y `DROP TABLE memory_move; DELETE FROM refinery_schema_history WHERE version = 21;`. El lote de [`specs/project`](../project/spec.md) R12 escribe antes el snapshot `pre-move` (`Reason::PreMove`).
 
 **Test:** `a_database_from_the_previous_version_opens_with_an_empty_move_log` (`db.rs`), `published_migration_checksums_are_pinned` (`migrations.rs`), `snapshot_names_parse_back_to_their_reason` (`backup.rs`).
+
+## El proyecto de origen
+
+### HI1. V23
+
+V23 MUST agregar a `memory` la columna nullable `origin_project`, un índice parcial sobre ella para las filas que la tienen, y un índice parcial sobre `created_by_ref` para las filas con `source = 'import'`. Migrar MUST NOT cambiar ninguna fila: toda fila anterior queda con `origin_project` NULL. Su checksum MUST quedar fijado con los demás.
+
+#### Escenario: un store anterior
+- GIVEN un store en V22 con filas de dos agentes, con y sin proyecto
+- WHEN se abre con este clawg
+- THEN cada fila tiene las mismas columnas que antes, `origin_project` es NULL y los dos índices existen
+
+**Test:** `a_database_from_the_previous_version_opens_with_no_origin_project` (`crates/clawg-core/src/memory/db.rs`); `published_migration_checksums_are_pinned` (`crates/clawg-core/src/memory/migrations.rs`).
+
+#### Vuelta atrás de V23
+
+Un binario anterior a V23 MUST NOT abrir una base en V23: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`. Quitar V23 a mano no pierde ninguna fila salvo el proyecto de origen de lo importado: `DROP INDEX idx_memory_origin_project; DROP INDEX idx_memory_import_origin; ALTER TABLE memory DROP COLUMN origin_project; DELETE FROM refinery_schema_history WHERE version = 23;` (`crates/clawg-core/migrations/V23__origin_project.sql`).
 
 ## Los remotos y lo que reemplaza una unión
 

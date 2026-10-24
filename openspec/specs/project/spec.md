@@ -8,6 +8,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (R6: la raíz del puente pide `index_docs` sólo si es un proyecto).
 - [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22 (R8 a R13: mover filas de `memory` a otro proyecto o a ninguno, con su unidad, su registro y su vuelta atrás).
 - [project-clone-identity](../../changes/archive/2026-10-23-project-clone-identity/proposal.md), archivado el 2026-10-23 (R14 a R19: el daemon asigna los ids, los clones de un remoto comparten el proyecto, y unir reconcilia; cambia R4 y R6).
+- [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (HI3: elegir y listar filas por su proyecto de origen).
 
 ## Definiciones
 
@@ -232,6 +233,17 @@ Cada fila que un movimiento cambia, por cualquier puerta, MUST dejar en `memory_
 `GET /v1/memories?no_project=true` MUST listar sólo las filas sin proyecto; con `project` es un 400. `clawg memories list` y `search` toman `--no-project`.
 
 **Test:** `a_listing_of_rows_without_a_project` (`admin.rs`), `no_project_and_project_together_are_refused` (`api.rs`), `the_listing_reaches_the_rows_without_a_project` (`tests/api.rs`), `list_and_search_take_no_project` (`cli.rs`).
+
+## HI3. Elegir filas por su proyecto de origen
+
+`clawg projects move` MUST aceptar `--origin-project NOMBRE`, que elige las filas cuyo `origin_project` es exactamente `NOMBRE`, y cuenta como filtro de selección (R12). `POST /v1/memories/move` MUST aceptar `origin_project` con el mismo efecto. `clawg memories list --origin-project NOMBRE` y `GET /v1/memories?origin_project=NOMBRE` MUST listar sólo esas filas, con los demás filtros.
+
+#### Escenario: acomodar un proyecto de la fuente
+- GIVEN notas importadas sin proyecto de dos proyectos de origen, `a` y `b`
+- WHEN se corre `clawg projects move --origin-project a --to RUTA`
+- THEN se mueven las de `a` con sus unidades y las de `b` quedan sin proyecto
+
+**Tests:** `a_batch_move_selects_by_origin_project` (`crates/clawg-core/src/memory/relocate.rs`); `a_listing_filters_by_origin_project` (`crates/clawg-core/src/memory/admin.rs`); `move_and_list_take_an_origin_project` (`crates/clawg-cli/src/cli.rs`); `move_and_list_select_by_origin_project` (`crates/clawg-cli/tests/api.rs`).
 
 ## R14. La clave de una raíz
 
