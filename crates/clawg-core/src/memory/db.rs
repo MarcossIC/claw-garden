@@ -699,7 +699,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 25);
+        assert_eq!(after.0, 26);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1728,6 +1728,58 @@ mod tests {
         assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
     }
 
+    /// An import from before the journal has no number, and undoing one
+    /// starts from the imports after it: the tables come empty and no row
+    /// changes.
+    #[tokio::test]
+    async fn a_store_from_before_the_import_journal_keeps_its_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(25)).await;
+        let snapshot = |c: &mut rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = c.prepare(
+                "SELECT json_array(id, agent_id, project_id, status, source, created_by_ref, content_hash) \
+                 FROM memory ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect();
+            rows
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status, content_hash) \
+                     VALUES (10, 'agent', 'migrated', NULL, 'An imported note', 'semantic_fact', 'import', 10, \
+                      'agent', 'engram:n1', 10, 10, 5.0, 3, 'active', 'imported-text')",
+                    [],
+                )?;
+                snapshot(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, journal): (Vec<String>, Vec<i64>) = store
+            .conn
+            .call(move |c| {
+                let after = snapshot(c)?;
+                let mut journal = Vec::new();
+                for table in ["memory_import", "memory_import_row", "memory_import_supersede", "memory_import_extra"] {
+                    journal.push(c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?);
+                }
+                Ok::<_, rusqlite::Error>((after, journal))
+            })
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(after, before, "migrating changes no row");
+        assert_eq!(journal, [0, 0, 0, 0], "the journal starts empty");
+    }
+
     #[tokio::test]
     async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
         ensure_vec0_registered();
@@ -2192,7 +2244,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 25, "Expected exactly 25 applied migrations, got {}", count);
+        assert_eq!(count, 26, "Expected exactly 26 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2653,7 +2705,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 25);
+        assert_eq!(migration_count, 26);
     }
 
     // -----------------------------------------------------------------------
