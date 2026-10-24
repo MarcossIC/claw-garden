@@ -34,7 +34,7 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 ## 7. Verificación
 
 - [x] Suite y clippy de `.claude/CLAUDE.md` en Linux.
-- [ ] El CI en verde en Linux y Windows (RF3 y la muestra de Windows sólo corren allá).
+- [x] El CI en verde en Linux y Windows (RF3 y la muestra de Windows sólo corren allá).
 - [ ] **[perfil con uso real, modelo real, con autorización]** Un día de uso normal con Claude Code: `metrics report --by minute` sobre `process.private_bytes`, `process.private_peak_bytes` y `embedder.resident`, contra las líneas de carga, descarga y refresco de `serve.log`. Las mismas lecturas que la exploración tomó en prod, ahora con A. Responde las cinco preguntas del problema.
 - [ ] `verify.md`.
 
