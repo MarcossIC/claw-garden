@@ -8,7 +8,7 @@ Este diseño resuelve la **entrega 1** de la [propuesta](proposal.md#1-el-regist
 - la integridad referencial (D7);
 - el nombre (D8).
 
-Las demás esperan a su entrega (al final). Los requisitos están en la [spec](spec.md).
+Las demás esperan a su entrega (al final). Los requisitos están en la [spec](spec.md). La [entrega 2a](#entrega-2a-unir-proyectos) (D15 a D25) está después de las decisiones de la entrega 1.
 
 ## El modelo
 
@@ -288,7 +288,161 @@ Lo que la entrega 3 suma encima:
 | El archivo marcador | Ninguna: sigue fuera de alcance |
 | Volver a importar un export de clawg después de un movimiento simple | 4 |
 | Una búsqueda cuando el cwd no resuelve a ningún proyecto | 3 |
-| Cómo responde el agente una sugerencia, y si unir exige `user_answered` | 3 (la respuesta por CLI es de la 2) |
-| Un save bajo el id de un proyecto borrado | 2 |
+| Cómo responde el agente una sugerencia, y si unir exige `user_answered` | 3 (la respuesta por CLI es de la 2a, D22) |
+| Un save bajo el id de un proyecto borrado | 2b |
 | Los tipos nuevos de `memory_import_extra` | 4 |
 | Los subproyectos de un monorepo y las carpetas sin VCS | 3 (D14) |
+
+# Entrega 2a: unir proyectos
+
+Esta parte resuelve la **entrega 2a** de la [propuesta](proposal.md#2-unir-revisar-y-borrar): unir con lápida y `--undo`, `canonical(id)`, las respuestas a las sugerencias por CLI y los hallazgos de `doctor`. Los requisitos están en la [spec](spec.md#entrega-2a-unir-proyectos) (PL11 a PL20).
+
+## D15. La lápida queda en `project`, y la unión tiene su propio diario
+
+X no se borra de `project`: queda con `merged_into`. Hay tres razones:
+
+- los puentes abiertos guardan sus ids toda la sesión (`server.rs:860-897`);
+- los exports viejos y los registros de historia (`memory_move`) nombran a X;
+- sin su fila, el próximo save bajo X lo volvería a crear vacío con el disparador de PL2, como `adopted`. Sería justo el duplicado que la unión quería quitar. Con la fila, el `WHERE NOT EXISTS` del disparador no hace nada.
+
+| Alternativa | Por qué no |
+|---|---|
+| Borrar X y guardar el desvío en una tabla `project_alias` | Es otra tabla que consultar para el mismo resultado, y sin la fila de X el disparador lo vuelve a adoptar |
+| Reescribir cada referencia a X | Los puentes abiertos y los exports no se pueden reescribir |
+
+**El diario.** `project_merge` guarda una fila por unión. `project_merge_change(merge_id, kind, a, b)` guarda cada cosa que la unión cambió, con lo que había antes, como `memory_import_extra` (`V26__import_journal.sql:55-60`). No lleva `CHECK` sobre `kind`, por lo que aprendió D6. Las filas de `memory` no van ahí: su diario es `memory_move` y `memory_move_supersede`, bajo el `move_id` de la unión.
+
+| `kind` | `a` | `b` |
+|---|---|---|
+| `tombstoned` | X, cuando la unión lo hizo lápida (una reparación no lo anota) | — |
+| `trajectory`, `skill` | el id de la fila | — |
+| `review` | el agente de una fila de `synthesis_review` de X | su `reviewed_at` |
+| `review_target` | el agente de la fila de Z que tocó | el `reviewed_at` que tenía, o NULL si no había |
+| `folder` | el id de una carpeta que apuntaba a X | — |
+| `remote` | un remoto que apuntaba a X | — |
+| `tombstone` | una lápida que apuntaba a X | — |
+| `suggestion` | el `rowid` de una sugerencia que la unión respondió | — |
+| `reviewed` | Z | su marca de revisado de antes |
+| `workspace` | el segmento del agente de una copia hecha | — |
+
+## D16. Cada lápida apunta a un proyecto vivo
+
+Unir B en C pasa a C las lápidas que apuntaban a B (PL13, paso 5). Así `canonical` es una sola lectura por clave primaria, y una cadena nunca tiene más de un salto. El `--undo` respeta ese orden: no se deshace A→B mientras B sea una lápida (`merged_later`), porque las filas de A ya no están en B sino en C.
+
+`MAX_MERGE_HOPS` y la detección de ciclos son una defensa para un store editado a mano o restaurado de un estado roto. En ese caso, `canonical` devuelve el id del que partió y `doctor` lo nombra (`broken_merge`), en lugar de fallar cada pedido.
+
+| Alternativa | Por qué no |
+|---|---|
+| Dejar cadenas largas y recorrerlas | Cada pedido paga el recorrido, y deshacer un eslabón del medio deja cadenas que apuntan a una lápida revivida |
+| Resolver en el SQL de cada lectura (`COALESCE((SELECT merged_into …), project_id)`) | Es una subconsulta por fila en la búsqueda. Además, el camino del `workspace.md` y las sesiones se resuelven en Rust de todos modos |
+
+## D17. `canonical` corre al entrar para leer, y en la transacción que escribe para escribir
+
+- **Lecturas** (buscar, contexto, listar, disputas, síntesis, sesiones): al entrar. Una lectura que se cruza con una unión lee antes o después, y las dos respuestas están bien.
+- **Escrituras que mueven** (`move`, `PATCH`, el `--undo` de un movimiento, el import y el registro): dentro de la transacción que escribe. El destino puede volverse una lápida entre la entrada y la escritura, y las filas quedarían bajo ella. `check_target_in` (`relocate.rs:427-438`) ya corre en esa transacción, y pasa a devolver el destino vivo.
+- **El worker:** al empezar a procesar un evento, y la unión no corre mientras haya un save pendiente para X o para Z. El worker lee el proyecto varias veces antes de la transacción que termina el save: las filas de la clave (`worker.rs:694`), la dedup (`:598`) y el detector (`:928`), cada una en su propia llamada a la conexión. Una unión entre dos de ellas partiría la decisión. La fila del outbox existe desde que el save se acepta (`runtime.rs:250`) hasta la transacción que lo termina de guardar. Por eso, si la transacción de la unión no ve filas pendientes de X ni de Z, ningún save de esos proyectos está entre esas llamadas. Un save aceptado con X justo antes de la unión, cuya fila se escribe después, llega al worker después de la unión, y su `canonical` da Z.
+
+`SAVES_WAIT` (5 s) evita que un save en curso haga fallar la unión: lo normal es que tarde milisegundos. Un save que espera el modelo puede tardar un minuto entre intentos (`worker.rs`), y entonces la unión responde `saves_pending` en lugar de esperar sin fin.
+
+| Alternativa | Por qué no |
+|---|---|
+| Un disparador que, después del insert, pase la fila a Z | Escribe cada fila dos veces y corre los disparadores de FTS dos veces. Además, la dedup, la clave y el detector ya habrían decidido contra X |
+| Pausar el worker durante la unión | El worker no tiene pausa, y una pausa mientras un save espera el modelo frenaría todos los saves |
+
+**Las sesiones** (`crates/clawg-cli/src/daemon/sessions.rs:33-43`) se registran y se buscan por `canonical`. Una que se registró bajo X antes de la unión no se encuentra bajo Z hasta que el hook la registra otra vez, y eso pasa en cada prompt (`hook.rs:246`).
+
+## D18. Unir pasa a Z todo lo que está bajo X
+
+`merge_in` (R17, `relocate.rs:885-906`) deja en su lugar una unidad que tiene filas en un tercer proyecto (`decide_merge`, `:688-699`). En un registro eso está bien: el id viejo sigue siendo un proyecto vivo, y sus filas se alcanzan con `all_projects`. En una unión, X pasa a ser una lápida. Una fila que quedara bajo X no estaría en ninguna lista ni en ninguna búsqueda. Por eso la unión pasa a Z la parte de la unidad que está en X. Una unidad que ya estaba partida entre X y W queda partida entre Z y W, y no queda peor que antes.
+
+`decide_merge` recibe la regla como argumento: lo que toca otro proyecto se deja (`Span::Keep`, el registro) o se lleva la parte de X (`Span::Carry`, la unión). `reconcile`, `supersede_in` y `apply_in` no cambian.
+
+| Alternativa | Por qué no |
+|---|---|
+| Rechazar la unión mientras haya una unidad partida | Ninguna herramienta junta una unidad partida: `projects move` también la deja (`spans_projects`). La unión quedaría bloqueada para siempre |
+| Llevar la unidad entera, también sus filas de W | Movería filas de un tercer proyecto que nadie nombró |
+
+## D19. `synthesis_review` queda con la revisión más vieja
+
+La propuesta pedía el máximo de `reviewed_at`. Esa fecha es el límite de lo que `context` cuenta como pendiente de `synthesize` (`unreviewed_count`, `synthesis.rs:282`; `conclusions_to_review_count`, `:307`).
+
+- Con el máximo, lo de X entre las dos fechas no se contaría nunca, y el aviso se perdería sin que nadie lo note.
+- Con el mínimo, lo de Z entre las dos fechas se cuenta otra vez. Eso da un aviso de más, que se responde con un `synthesize`.
+
+Perder un aviso es perder información, y un aviso de más cuesta una llamada. Por eso queda el mínimo.
+
+## D20. Los `workspace.md` se copian después de la transacción, como hace `adopt_legacy`
+
+La unión copia como `adopt_legacy` (`workspace.rs:57-98`): cuando Z no tiene archivo, copia el de X, y cuando tiene uno, deja los dos y los nombra. El de X nunca cambia. Un archivo no entra en una transacción de SQLite, así que se copia después de confirmarla y las copias se anotan en una segunda transacción corta. Si el proceso muere entre las dos, queda una copia sin anotar. El `--undo` no la borra, y ese es el lado seguro.
+
+`adopt_legacy` pasa a devolver lo que hizo (`Adopted { copied, kept_beside }`). El registro lo ignora, como ahora.
+
+El `--undo` borra una copia sólo si su parte del usuario sigue siendo la del archivo de X. La sección AUTO se regenera en cada `context` (`regenerate_auto_section`, `workspace.rs:108`), así que comparar el archivo entero conservaría casi todas las copias. La parte del usuario es lo único que escribe la persona.
+
+| Alternativa | Por qué no |
+|---|---|
+| Copiar antes de confirmar la transacción | Si la transacción falla, queda una copia sin unión |
+| Mover el archivo de X | Si Z ya tenía uno, se pierde uno de los dos. Y el `--undo` tendría que devolverlo |
+| Juntar las dos partes del usuario | La persona puede querer una sola. Por eso `adopt_legacy` no las junta |
+
+## D21. Un snapshot `pre-merge`, y `pre-undo` para deshacer
+
+La propuesta nombraba `pre-rekey`, que es el que escribe un registro (`project.rs:899`). Con un motivo propio, `Reason::PreMerge`, la persona encuentra el snapshot de la unión entre los backups. Además, como los automáticos se rotan por motivo (`AUTO_KEEP`, `backup.rs:289`), las uniones no desplazan los snapshots de los registros. El `--undo` usa `pre-undo`, como el de un import (`portability/undo.rs:829`).
+
+## D22. Las respuestas a las sugerencias
+
+- **Una unión** responde `merged` las sugerencias pendientes cuyos dos lados pasan a ser un solo proyecto.
+- **`keep-apart`** responde `apart`. Si no había ninguna sugerencia, graba un par con motivo `user`, y el índice único del par (V27) hace que el `INSERT OR IGNORE` del registro (`project.rs:770-772`) no lo vuelva a sugerir.
+- **Los lados se leen por `canonical`.** Después de unir X en Z, una sugerencia (X, W) es (Z, W). No se reescribe en el store por dos razones: el índice único podría chocar con un (Z, W) que ya existe, y el `--undo` tendría que volver a reescribirla. La lista junta las dos.
+- **Revisado.** `keep-apart` marca los dos proyectos, y la unión marca Z, como D11 dejó dicho.
+
+| Alternativa | Por qué no |
+|---|---|
+| Responder por el id de cada sugerencia | Las sugerencias no muestran un id: lo que la persona ve en `projects list` es el par |
+
+## D23. Lo que administra proyectos no sigue la lápida
+
+- **`rename`** de X después de la unión renombraría Z por su id viejo, y eso sorprende. El 409 nombra Z y deja que la persona decida.
+- **`keep-apart`** y **el destino de una unión**: la persona nombró un proyecto que ya no existe.
+- **`from_project`**: X ya no tiene filas, y seguirlo hasta Z movería todo Z.
+- **`projects move --undo`** del movimiento de una unión devolvería las filas a una lápida (`part_of_merge`).
+
+## D24. Un recorrido de texto del router
+
+El router es una sola función, con un `.route(…)` por camino (`crates/clawg-cli/src/daemon/api.rs:1029-1069`), y axum no lista sus rutas en tiempo de ejecución. Un test lee la fuente, como `tests/conventions.rs` lee los workflows, saca cada camino con sus métodos y lo compara con una tabla del test. La tabla dice el campo con el proyecto de cada ruta (`body.project_id`, `query.project`, …) o que no tiene ninguno. Una ruta que no está en la tabla hace fallar el test. El segundo test usa la misma tabla para mandar el id de una lápida a cada ruta que recibe uno.
+
+| Alternativa | Por qué no |
+|---|---|
+| Un extractor tipado `ProjectId` que resuelva la lápida | Los ids vienen dentro de cuerpos JSON y consultas de formas distintas, y serde no llega al store |
+| Un middleware que reescriba los cuerpos | Parsea cada cuerpo dos veces, y aun así tiene que conocer cada campo |
+
+## D25. Los hallazgos de `doctor`
+
+`inspect` suma hechos, cada uno leído sólo donde el esquema lo tiene (`Has`, `crates/clawg-core/src/memory/inspect.rs:190`):
+
+- los proyectos con su nombre, `created_at` y `merged_into`;
+- el primer commit, el remoto y el proyecto de cada carpeta;
+- los pares de sugerencias respondidas;
+- los ids con filas en cada una de las tres tablas.
+
+`same_first_commit` usa la regla de `fit` sobre el remoto: un fork (los dos con remoto, distintos) no es un duplicado (R16). El paso propone unir el más nuevo en el más viejo, que suele ser el que tiene la historia, y el mensaje dice que la otra dirección también sirve. Ningún paso pide confirmación, porque una unión en seco no escribe nada.
+
+## Costos en el camino caliente
+
+- Cada pedido que recibe un proyecto suma una lectura por clave primaria de `project`. El puente hace un pedido así en cada herramienta.
+- Cada save suma esa misma lectura en el worker.
+- Una unión lee y escribe en una transacción las filas de X y su diario. No necesita el modelo, así que no embebe nada.
+
+## Volver atrás de la entrega 2a
+
+- **El esquema.** Un binario anterior rechaza un store en V28 sin tocarlo (`SchemaNewer`), y la vuelta atrás es su snapshot `pre-migration`. Para quitar V28 a mano, primero hay que deshacer cada unión (`clawg projects merge --undo N`). Si no, cada lápida pasa a ser un proyecto vivo y vacío, sus filas siguen en Z y un puente con su id escribe bajo ella. Después, con un `sqlite3` 3.35 o más nuevo y el daemon parado:
+
+  ```sql
+  DROP TABLE project_merge_change;
+  DROP TABLE project_merge;
+  DROP INDEX idx_project_merged_into;
+  ALTER TABLE project DROP COLUMN merged_at;
+  ALTER TABLE project DROP COLUMN merged_into;
+  DELETE FROM refinery_schema_history WHERE version = 28;
+  ```
+- **Una unión.** Con `clawg projects merge --undo N`, o con su snapshot `pre-merge`.

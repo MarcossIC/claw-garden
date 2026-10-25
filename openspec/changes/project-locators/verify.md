@@ -35,7 +35,7 @@ Se usó el binario de `target-test` con `CLAWG_TEST_HOME`, `CLAWG_TEST_EMBEDDER=
 
 ### CI
 
-Pendiente: el pull request de la entrega todavía no se abrió.
+Pendiente para el pull request final del cambio. `project-locators` se publica entero, sin una release por entrega, así que no se abre un pull request de develop a main al cerrar cada una.
 
 ### Lo que no se corrió
 

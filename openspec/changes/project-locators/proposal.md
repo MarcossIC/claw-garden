@@ -82,7 +82,7 @@ Se tomaron el 2026-10-24 sobre las [decisiones abiertas](../archive/2026-10-25-p
 
 ## Entregas
 
-Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RED salen de [«Cómo se mide»](../archive/2026-10-25-project-registry/exploration.md#cómo-se-mide) de la exploración, más los que piden las decisiones de arriba. La spec, el diseño y las tareas se escriben por entrega, cuando le toca a cada una.
+Cada entrega se cierra sola, con commits atómicos y TDD estricto. El cambio se publica entero, al final, con un solo pull request a `main`. Los tests RED salen de [«Cómo se mide»](../archive/2026-10-25-project-registry/exploration.md#cómo-se-mide) de la exploración, más los que piden las decisiones de arriba. La spec, el diseño y las tareas se escriben por entrega, cuando le toca a cada una.
 
 ### 1. El registro (V27)
 
@@ -108,6 +108,13 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 - El test de la base en V26 (ver [Migración](#datos-guardados-migración-y-vuelta-atrás)).
 
 ### 2. Unir, revisar y borrar
+
+Se escribe e implementa en dos partes, cada una con su spec, su diseño, sus tareas y su migración. Se partió el 2026-10-25, porque son dos funciones con riesgos distintos:
+
+- **2a. Unir:** `merge` con su lápida y su `--undo`, `canonical(id)`, las respuestas a las sugerencias y los hallazgos de `doctor`.
+- **2b. Borrar:** `delete` en sus dos etapas con su `--undo`, y `purge --project-delete`.
+
+La etapa 1 de `delete` propone un `merge`, así que 2a va primero. Ninguna de las dos se publica sola: el cambio sale entero, con la versión 0.64.0.
 
 **Qué trae.**
 - **`clawg projects merge X --into Z [--dry-run] [--undo N]`**:
@@ -248,7 +255,7 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 | Un `--undo` de borrado choca con un proyecto que tomó el camino mientras tanto | El índice único parcial lo detecta: el `--undo` restaura las filas y deja el camino donde está, con una sugerencia de unión |
 | Leer el primer commit cuesta (historia larga, varios commits raíz, clone superficial, sin `git`) | Sólo se lee fuera del camino caliente, y sin huella si no se puede leer. El diseño elige cómo leerlo |
 | El contrato del modelo cambia | Los dos contratos se vuelven a bendecir, se revisa el diff y el argumento es opcional |
-| El tamaño (M–L) | Cuatro entregas publicables por separado, cada una con sus tests y commits atómicos |
+| El tamaño (M–L) | Cuatro entregas (la 2 en dos partes) que se cierran por separado, cada una con sus tests y commits atómicos |
 
 ## Abierto para el diseño
 

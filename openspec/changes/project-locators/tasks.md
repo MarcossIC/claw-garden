@@ -1,6 +1,6 @@
 # project-locators — Tareas
 
-Strict TDD: en cada tarea, el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite (`cargo test --workspace --target-dir target-test` en Windows) y clippy (`cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`). Antes de empezar una entrega: `cargo clean --workspace --target-dir target-test`. Las tareas de las entregas 2 a 4 se escriben cuando les toque.
+Strict TDD: en cada tarea, el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite (`cargo test --workspace --target-dir target-test` en Windows) y clippy (`cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`). Antes de empezar una entrega: `cargo clean --workspace --target-dir target-test`. Las tareas de las entregas 2b a 4 se escriben cuando les toque. Ninguna entrega sube la versión: el cambio sale entero en 0.64.0.
 
 ## Entrega 1. El registro (V27)
 
@@ -115,6 +115,128 @@ Requisitos en la [spec](spec.md) (PL1 a PL10) y decisiones en el [diseño](desig
   - otra en su camino viejo recibe uno propio;
   - `projects list` muestra la sugerencia de una copia y un proyecto cuya carpeta se borró;
   - `projects rename` conserva lo guardado.
-- [ ] El CI del pull request en Linux y Windows.
+- [ ] El CI en Linux y Windows, en el pull request final del cambio.
 - [ ] `verify.md`, sección «Entrega 1».
+- [ ] No queda otro directorio de build que `target` y `target-test`.
+
+## Entrega 2a. Unir proyectos (V28)
+
+Requisitos en la [spec](spec.md#entrega-2a-unir-proyectos) (PL11 a PL20) y decisiones en el [diseño](design.md#entrega-2a-unir-proyectos) (D15 a D25). Antes de la tarea 11: `cargo clean --workspace --target-dir target-test`.
+
+### 11. V28 y `canonical` (PL11, PL12; D15, D16)
+
+- [ ] RED:
+  - `a_database_from_the_previous_version_opens_with_every_project_live` (`db.rs`, sembrado con `seed_on_disk(dir, Some(27))` y el escenario de PL11);
+  - `canonical_follows_a_merge_and_leaves_any_other_id_as_it_is` y `a_cycle_or_a_chain_too_long_answers_the_id_itself` (`crates/clawg-core/src/memory/merge.rs`, con lápidas escritas a mano);
+  - la fila 28 en `published_migration_checksums_are_pinned` (`migrations.rs`).
+- [ ] GREEN:
+  - `crates/clawg-core/migrations/V28__project_merge.sql`: las dos columnas, el índice parcial, `project_merge` y `project_merge_change`;
+  - tocar `migrations.rs` en el mismo commit;
+  - `merge.rs` con `canonical_in(c, id)` y `MAX_MERGE_HOPS`.
+- Commit: `feat(core): add the tombstone of a merged project`
+
+### 12. Unir X en Z en el store (PL13; D17 a D21)
+
+- [ ] RED (`merge.rs`, sobre `MemoryStore::new_for_test()`):
+  - `merging_moves_every_row_and_locator_into_the_target`;
+  - `a_merge_keeps_the_newest_save_of_a_key_and_the_oldest_of_a_text`;
+  - `a_merge_moves_the_part_of_a_split_unit_it_holds`;
+  - `merging_a_target_repoints_its_tombstones`;
+  - `a_dry_run_merge_changes_nothing`;
+  - `a_merge_copies_a_workspace_only_where_the_target_has_none`;
+  - `a_merge_is_refused_while_a_save_of_its_projects_is_pending`, y `a_merge_of_a_tombstone_into_its_target_repairs_it`.
+- [ ] GREEN:
+  - `Span::{Keep, Carry}` en `decide_merge` (`relocate.rs`): el registro pasa `Keep`;
+  - `merge_core(store, workspaces, backups, source, target, dry_run)`: la pasada en seco, la espera de `SAVES_WAIT`, el snapshot, la transacción que vuelve a decidir y el diario;
+  - `MergeError` con `thiserror`;
+  - `Reason::PreMerge` (`backup.rs`);
+  - `adopt_legacy` devuelve `Adopted { copied, kept_beside }`, y el registro lo ignora.
+- Commit: `feat(core): merge one project into another`
+
+### 13. Deshacer una unión en el store (PL14; D20)
+
+- [ ] RED (`merge.rs`): `undoing_a_merge_leaves_the_store_as_it_was`, `undoing_a_merge_keeps_what_was_saved_after_it`, `a_merge_whose_target_was_merged_since_is_undone_after_that_one` y `a_workspace_edited_since_the_merge_is_kept`.
+- [ ] GREEN:
+  - el cuerpo de `undo_move_core` pasa a `undo_move_in(c, move_id, write)`, que la unión llama dentro de su transacción. `undo_move_core` sigue igual por fuera;
+  - `undo_merge_core`, con `pre-undo` y el borrado de copias por la parte del usuario.
+- Commit: `feat(core): undo a merge of projects`
+
+### 14. Los escritores siguen la lápida (PL12; D17)
+
+- [ ] RED:
+  - `a_save_retried_after_a_merge_lands_in_its_target` (`worker.rs`);
+  - `a_move_to_a_merged_project_lands_in_its_target` y `undoing_a_move_whose_origin_was_merged_returns_to_its_target` (`relocate.rs`);
+  - `a_root_whose_project_was_merged_registers_into_its_target`, también leyendo y planeando sin escribir (`project.rs`);
+  - `an_import_planned_before_a_merge_writes_into_its_target` (`import.rs`).
+- [ ] GREEN:
+  - `canonical_in` al empezar `process_tracked` (`worker.rs:676`);
+  - `check_target_in` devuelve el destino vivo, y el `--undo` de un movimiento resuelve el origen de cada fila;
+  - `plan_in` y `plan_ids_in` resuelven el proyecto que reciben, después de `project_of` y de una mudanza;
+  - el import resuelve el proyecto de cada fila en la transacción que la escribe.
+- Commit: `fix(core): write under the target of a merged project`
+
+### 15. Las entradas del daemon siguen la lápida (PL12, PL19; D23, D24)
+
+- [ ] RED (`tests/api.rs`, con una unión hecha en el store del `Harness`):
+  - `every_route_says_which_project_it_takes`, que lee `router()` de `api.rs`;
+  - `every_route_that_takes_a_project_follows_a_merge`;
+  - `a_bridge_opened_before_a_merge_reads_and_writes_its_target`;
+  - `a_move_from_a_merged_project_is_refused` y `the_move_of_a_merge_is_undone_only_with_its_merge`.
+- [ ] GREEN:
+  - un ayudante del daemon que resuelve un `Option<String>` de proyecto con `canonical_in`, en `save_memory`, `search`, `context`, `register_session`, `synthesis`, `disputes`, `list_memories` y `stats`;
+  - 409 `project_merged` para `rename` y `from_project`, y 409 `part_of_merge` para el `undo` de un movimiento.
+- Commit: `fix(daemon): follow a merged project at every entry that takes one`
+
+### 16. La lista y `keep-apart` en el store (PL15, PL16; D22)
+
+- [ ] RED:
+  - `a_merged_project_is_listed_under_its_target_and_frees_its_name` y `keeping_two_projects_apart_answers_their_suggestion_for_good` (`registry.rs`);
+  - `a_pair_kept_apart_is_not_suggested_again` (`project.rs`).
+- [ ] GREEN:
+  - `list_projects` sin lápidas, con `merged` y las sugerencias por `canonical`;
+  - `rename_project` con `RenameError::Merged`, y el nombre de una lápida libre;
+  - `keep_apart`.
+- Commit: `feat(core): list a merged project under its target and keep two projects apart`
+
+### 17. Unir y separar en el daemon (PL13, PL14, PL16)
+
+- [ ] RED (`tests/api.rs`): `merging_through_the_daemon_leaves_everything_under_the_target`, `a_merge_waits_for_the_saves_of_its_projects` y `the_listing_after_a_merge_shows_the_target_alone`. Las dos rutas nuevas entran a la tabla de `every_route_says_which_project_it_takes`.
+- [ ] GREEN: `POST /v1/projects/merge` y `POST /v1/projects/keep-apart` detrás del token, con el mapeo de `MergeError` y de los rechazos de PL13, PL14 y PL16.
+- Commit: `feat(daemon): merge projects and keep them apart`
+
+### 18. `clawg projects merge` y `clawg projects keep-apart` (PL17)
+
+- [ ] RED: `projects_merge_and_keep_apart_parse` (`cli.rs`); `a_merge_report_names_what_moved_and_the_way_back` y `a_listing_names_what_was_merged_into_a_project` (`projects.rs`, en español y en inglés).
+- [ ] GREEN: `ProjectsAction::Merge` y `ProjectsAction::KeepApart`, los métodos del cliente, `render_merge` y la línea de `render_list`, con una sentencia por `match` sobre `Lang`.
+- Commit: `feat(cli): add projects merge and keep-apart`
+
+### 19. Los hallazgos de `doctor` (PL18; D25)
+
+- [ ] RED: `the_duplicates_are_named_by_name_and_by_first_commit`, `a_pair_kept_apart_is_no_duplicate`, `an_id_without_a_project_is_named` y `rows_under_a_merged_project_and_a_broken_chain_are_named` (`checks.rs`); la lectura de los hechos nuevos en un store en V26, en V27 y en V28 (`inspect.rs`).
+- [ ] GREEN: los hechos en `inspect.rs`, los tres chequeos en `checks.rs` con sus mensajes en los dos idiomas, su llamada en `doctor/mod.rs` y su lugar en `every_finding`.
+- Commit: `feat(doctor): name duplicate projects, ids without a project and broken merges`
+
+### 20. Las specs y la documentación
+
+- [ ] `specs/project`: PL11 a PL20, y PL9 con lo que cambia PL15.
+- [ ] `specs/storage`: V28, su vuelta atrás y el motivo `pre-merge`.
+- [ ] `specs/doctor`: los tres chequeos.
+- [ ] `.claude/CLAUDE.md`:
+  - el párrafo del proyecto en «Data profiles»: la lápida y `canonical`;
+  - `clawg projects merge|keep-apart` en «Commands», y la lista de `projects list`;
+  - las dos rutas nuevas, `merged` en `GET /v1/projects` y los 409 nuevos en la API;
+  - los tres chequeos en `clawg doctor`.
+- [ ] El contrato del modelo no cambia: `the_agent_contract_matches_its_file` y su variante en español pasan sin bendecir.
+- Commit: `docs: record merging projects`
+
+### 21. Verificación
+
+- [ ] La suite y los dos clippy de `.claude/CLAUDE.md`, en `target-test` en Windows, con `--locked`.
+- [ ] El binario en un home temporal, con repositorios reales:
+  - dos carpetas registradas como proyectos distintos, con memorias, un remoto y un `workspace.md`, se unen; `projects list` muestra sólo el destino, con la lápida debajo;
+  - `memories list --here` desde la carpeta de la lápida lee el destino, y un save hecho con el id viejo cae en el destino;
+  - `projects merge --undo N` deja todo como estaba;
+  - `keep-apart` sobre una copia saca su sugerencia, y registrarla otra vez no la vuelve a crear;
+  - `doctor` nombra dos proyectos con el mismo nombre y propone la unión en seco.
+- [ ] `verify.md`, sección «Entrega 2a».
 - [ ] No queda otro directorio de build que `target` y `target-test`.
