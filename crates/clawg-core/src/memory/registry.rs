@@ -14,6 +14,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::identity::Ground;
+use crate::memory::merge::canonical_in;
 use crate::memory::project::is_project_id;
 use crate::memory::{MemoryError, MemoryStore};
 
@@ -239,6 +240,8 @@ pub enum RenameError {
     Name(#[from] NameError),
     #[error("{name:?} is already the name or the id of project {other}")]
     Taken { name: String, other: String },
+    #[error("project {id} was merged into {into}: rename {into} instead")]
+    Merged { id: String, into: String },
     #[error(transparent)]
     Store(#[from] MemoryError),
 }
@@ -276,6 +279,11 @@ pub async fn rename_project(store: &MemoryStore, id: &str, name: &str) -> Result
                 .optional()
                 .map_err(sql)?
                 .ok_or_else(|| RenameError::NotFound(id.clone()))?;
+            // Renaming the project it went into by an old id would surprise.
+            let into = canonical_in(&tx, &id).map_err(sql)?;
+            if into != id {
+                return Err(RenameError::Merged { id, into });
+            }
             let others: Vec<(String, String)> = {
                 let mut stmt = tx.prepare("SELECT id, name FROM project WHERE id <> ?1").map_err(sql)?;
                 let rows = stmt.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sql)?;

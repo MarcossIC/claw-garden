@@ -46,6 +46,7 @@ use clawg_core::memory::portability::timing::{Step, Timing};
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::identity::{Disk, Ground};
 use clawg_core::memory::project::{register_project, RegisterError, Registration};
+use clawg_core::memory::merge::canonical;
 use clawg_core::memory::registry::{list_projects, rename_project, ListedProject, Project, RenameError};
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
@@ -1338,12 +1339,13 @@ async fn save_memory(
         EmbedderStatus::Ready => true,
     };
 
+    let project_id = live_project(&app, body.project_id).await?;
     // Read now, not by the worker: a replay after a restart must keep the
     // session the save was accepted in.
-    let session_id = app.sessions.current(&body.agent_id, body.project_id.as_deref());
+    let session_id = app.sessions.current(&body.agent_id, project_id.as_deref());
     let event = MemoryEvent {
         agent_id: body.agent_id,
-        project_id: body.project_id,
+        project_id,
         // Not read for an explicit save: `provenance::seal` decides who
         // stated it.
         role: Role::User,
@@ -1444,8 +1446,9 @@ async fn search(
         .map_err(embed_failure)?;
 
     let caller = reader(&app, &body.agent_id);
+    let project_id = live_project(&app, body.project_id.clone()).await?;
     let scope = SearchScope::all_default()
-        .with_project(body.project_id.as_deref())
+        .with_project(project_id.as_deref())
         .with_reach(caller.reach.clone());
     let mut hits = search_all_memories(
         &app.runtime.store,
@@ -1471,10 +1474,21 @@ async fn search(
 
     let withheld = found - hits.len();
     let other_language = match lang {
-        Some(lang) => other_language(&app, lang, body.project_id.as_deref(), &caller).await,
+        Some(lang) => other_language(&app, lang, project_id.as_deref(), &caller).await,
         None => None,
     };
     Ok(Json(SearchBody { hits, withheld, other_language }))
+}
+
+/// The live project a request's `project` leads to: an open bridge keeps the
+/// id of a project merged since for its whole session, and old exports carry
+/// it. Every entry that reads under a project goes through it; the ones that
+/// write follow it again in the transaction that writes.
+async fn live_project(app: &AppCtx, project: Option<String>) -> ApiResult<Option<String>> {
+    match project {
+        Some(id) => canonical(&app.runtime.store, &id).await.map(Some).map_err(ApiError::internal),
+        None => Ok(None),
+    }
 }
 
 /// `agent` with what the policy in the data directory lets it reach, read on
@@ -1507,7 +1521,8 @@ async fn context(
     let budget = check_budget(body.budget)?;
     let lang = check_lang(body.lang.as_deref())?;
     let workspace = app.runtime.workspaces();
-    let project_id = body.project_id.as_deref();
+    let project_id = live_project(&app, body.project_id.clone()).await?;
+    let project_id = project_id.as_deref();
     let query = body.query.as_deref().filter(|q| !q.trim().is_empty());
 
     // Unconditional regen (~2-5 ms). A failure degrades to "no ids were
@@ -1584,7 +1599,8 @@ async fn register_session(
     Json(body): Json<SessionRequest>,
 ) -> ApiResult<StatusCode> {
     check_session_id(&body.session_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    app.sessions.register(&body.agent_id, body.project_id.as_deref(), &body.session_id);
+    let project_id = live_project(&app, body.project_id).await?;
+    app.sessions.register(&body.agent_id, project_id.as_deref(), &body.session_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1593,7 +1609,8 @@ async fn synthesis(
     Json(body): Json<SynthesisRequest>,
 ) -> ApiResult<Json<Synthesis>> {
     let reader = named_reader(&app, body.agent_id.as_deref());
-    let params = SynthesisParams { reader, project_id: body.project_id, limit: body.limit };
+    let project_id = live_project(&app, body.project_id).await?;
+    let params = SynthesisParams { reader, project_id, limit: body.limit };
     synthesis_core(&app.runtime.store, params, TimestampMs::now())
         .await
         .map(Json)
@@ -1605,7 +1622,8 @@ async fn list_memories(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<ListBody>> {
     let reader = named_reader(&app, q.reader.as_deref());
-    let params = ListParams { reader, ..list_params_from_query(q)? };
+    let mut params = ListParams { reader, ..list_params_from_query(q)? };
+    params.project_id = live_project(&app, params.project_id).await?;
     let items = list_memories_core(&app.runtime.store, params)
         .await
         .map_err(ApiError::internal)?;
@@ -1640,9 +1658,10 @@ async fn stats(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<StatsQuery>,
 ) -> ApiResult<Json<MemoryStats>> {
+    let project_id = live_project(&app, q.project).await?;
     let stats = memory_stats_core(
         &app.runtime.store,
-        StatsParams { agent_id: q.agent, project_id: q.project },
+        StatsParams { agent_id: q.agent, project_id },
     )
     .await
     .map_err(ApiError::internal)?;
@@ -1710,6 +1729,8 @@ async fn update_memory(
 fn move_error(e: MoveError) -> ApiError {
     match e {
         MoveError::Refused(_) => ApiError::conflict(e.to_string()),
+        MoveError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+        MoveError::PartOfMerge { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("part_of_merge") },
         MoveError::UnknownProject(_) | MoveError::UnknownMove(_) => ApiError::not_found(e.to_string()),
         MoveError::NoSelection | MoveError::TextOnDeleted | MoveError::EmptyText => ApiError::bad_request(e.to_string()),
         MoveError::Store(e) => ApiError::internal(e),
@@ -1849,7 +1870,8 @@ async fn disputes(
     Query(q): Query<DisputesQuery>,
 ) -> ApiResult<Json<OpenPairs>> {
     let reader = named_reader(&app, q.agent_id.as_deref());
-    open_pairs(&app.runtime.store, reader.as_ref(), q.project_id.as_deref(), OPEN_PAIRS_SHOWN)
+    let project_id = live_project(&app, q.project_id).await?;
+    open_pairs(&app.runtime.store, reader.as_ref(), project_id.as_deref(), OPEN_PAIRS_SHOWN)
         .await
         .map(Json)
         .map_err(ApiError::internal)
@@ -2110,6 +2132,7 @@ async fn rename(
         RenameError::NotFound(_) => ApiError::not_found(e.to_string()),
         RenameError::Name(_) => ApiError::bad_request(e.to_string()),
         RenameError::Taken { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("name_taken") },
+        RenameError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
         RenameError::Store(_) => ApiError::internal(e),
     })?;
     Ok(Json(renamed))

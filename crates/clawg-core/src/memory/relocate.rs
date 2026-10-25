@@ -119,6 +119,10 @@ pub enum MoveError {
     UnknownProject(String),
     #[error("no move {0}")]
     UnknownMove(i64),
+    #[error("project {id} was merged into {into}: its memories are there now")]
+    Merged { id: String, into: String },
+    #[error("move {move_id} is part of merge {merge_id}: undo it with `clawg projects merge --undo {merge_id}`")]
+    PartOfMerge { move_id: i64, merge_id: i64 },
     #[error(transparent)]
     Refused(#[from] Skipped),
     #[error(transparent)]
@@ -620,7 +624,16 @@ pub async fn move_memories_core(
     dry_run: bool,
 ) -> Result<MoveReport, MoveError> {
     let (sql, params) = filter.to_sql()?;
+    let from = filter.from.clone();
     run_batch(store, backups, dry_run, move |c, write| {
+        // The rows of a project merged since are all in the one it went into,
+        // with that project's own: following it would move those too.
+        if let Some(ProjectFilter::Project(id)) = &from {
+            let into = canonical_in(c, id)?;
+            if into != *id {
+                return Err(MoveError::Merged { id: id.clone(), into });
+            }
+        }
         let live = target_in(c, target.as_deref())?;
         let ids: Vec<i64> = {
             let mut stmt = c.prepare(&sql)?;
@@ -643,7 +656,18 @@ pub async fn undo_move_core(
     move_id: i64,
     dry_run: bool,
 ) -> Result<MoveReport, MoveError> {
-    run_batch(store, backups, dry_run, move |c, write| undo_move_in(c, move_id, write)).await
+    run_batch(store, backups, dry_run, move |c, write| {
+        // Its rows alone would leave the rest of the merge in its target, and
+        // the rows under a tombstone.
+        let merge: Option<i64> = c
+            .query_row("SELECT merge_id FROM project_merge WHERE ?1 IN (move_id, undo_move_id)", [move_id], |r| r.get(0))
+            .optional()?;
+        if let Some(merge_id) = merge {
+            return Err(MoveError::PartOfMerge { move_id, merge_id });
+        }
+        undo_move_in(c, move_id, write)
+    })
+    .await
 }
 
 /// [`undo_move_core`] inside the caller's transaction, which a merge's undo

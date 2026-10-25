@@ -4409,3 +4409,245 @@ async fn a_batch_without_a_selection_or_a_target_is_400() {
     let (status, answer) = h.post_json("/v1/memories/move", json!({ "undo": 9 })).await;
     assert_eq!(status, 404, "{answer}");
 }
+
+// ── Merged projects ─────────────────────────────────────────────────────────
+
+/// What each route of `router()` takes of a project, as `api.rs` writes the
+/// route: the field that holds a project id, which must lead past a merge's
+/// tombstone to the live project, or none. A route the router gains fails
+/// `every_route_says_which_project_it_takes` until it is here, and one that
+/// takes a project fails `every_route_that_takes_a_project_follows_a_merge`
+/// until that test checks it.
+const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
+    ("GET", "/health", None),
+    ("POST", "/memories", Some("body.project_id")),
+    ("GET", "/memories", Some("query.project")),
+    ("POST", "/memories/move", Some("body.to_project")),
+    ("POST", "/search", Some("body.project_id")),
+    ("POST", "/context", Some("body.project_id")),
+    ("POST", "/sessions", Some("body.project_id")),
+    ("GET", "/memories/{kind}/{id}", None),
+    ("PATCH", "/memories/{kind}/{id}", Some("body.project_id")),
+    ("DELETE", "/memories/{kind}/{id}", None),
+    ("GET", "/memories/{kind}/{id}/save", None),
+    ("POST", "/memories/{kind}/{id}/restore", None),
+    ("GET", "/disputes", Some("query.project_id")),
+    ("POST", "/disputes/resolve", None),
+    ("POST", "/disputes/judge", None),
+    ("POST", "/synthesis", Some("body.project_id")),
+    // The worker follows the project of the save it takes back.
+    ("POST", "/outbox/retry", None),
+    ("POST", "/outbox/discard", None),
+    ("GET", "/stats", Some("query.project")),
+    ("GET", "/metrics", None),
+    ("POST", "/backup", None),
+    // Roots, whose projects the plan and the writes follow.
+    ("POST", "/import", None),
+    ("POST", "/import/undo", None),
+    // A root, whose project the registration follows.
+    ("POST", "/projects", None),
+    ("GET", "/projects", None),
+    ("PATCH", "/projects/{id}", Some("path.id")),
+    // A folder's root id, which a merge does not change.
+    ("POST", "/projects/docs/search", None),
+    ("POST", "/shutdown", None),
+];
+
+/// `(method, path)` of every route `router()` declares, read from its source.
+fn routes_in_router() -> Vec<(String, String)> {
+    // A Windows checkout ends its lines with CRLF.
+    let source = include_str!("../src/daemon/api.rs").replace("\r\n", "\n");
+    let start = source.find("pub fn router(").expect("router() in api.rs");
+    let body = &source[start..];
+    let body = &body[..body.find("\n}\n").expect("the end of router()")];
+    let mut routes = Vec::new();
+    for segment in body.split(".route(").skip(1) {
+        let path = segment.split('"').nth(1).expect("a quoted path");
+        for method in ["get", "post", "patch", "delete", "put"] {
+            let call = format!("{method}(");
+            let called = segment
+                .match_indices(&call)
+                .any(|(at, _)| !segment[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+            if called {
+                routes.push((method.to_uppercase(), path.to_string()));
+            }
+        }
+    }
+    routes.sort();
+    routes
+}
+
+#[test]
+fn every_route_says_which_project_it_takes() {
+    let mut table: Vec<(String, String)> = PROJECT_INPUTS.iter().map(|(m, p, _)| (m.to_string(), p.to_string())).collect();
+    table.sort();
+    assert_eq!(routes_in_router(), table, "router() and PROJECT_INPUTS name different routes");
+}
+
+/// Merges `source` into `target` as `clawg projects merge` does.
+async fn merge_projects(h: &Harness, source: &str, target: &str) -> clawg_core::memory::merge::MergeReport {
+    let backups = clawg_core::paths::backups_dir(&h.ctx.runtime.base_dir);
+    clawg_core::memory::merge::merge_core(&h.ctx.runtime.store, &h.ctx.runtime.workspaces(), &backups, source, target, false)
+        .await
+        .expect("merge")
+}
+
+/// Saves `content` under `project` and answers its id.
+async fn save_in(h: &Harness, project: &str, content: &str) -> i64 {
+    let (status, body) =
+        h.post_json("/v1/memories", json!({ "agent_id": "agent-http", "content": content, "project_id": project })).await;
+    assert_eq!(status, 201, "{body}");
+    saved_ids(&body)[0]
+}
+
+fn ids_in(rows: &Value) -> Vec<i64> {
+    rows.as_array().expect("rows").iter().filter_map(|r| r["id"].as_i64()).collect()
+}
+
+#[tokio::test]
+async fn every_route_that_takes_a_project_follows_a_merge() {
+    let h = Harness::start().await;
+    let (app, web, other) =
+        (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
+    save_in(&h, &app, "the parser of app is written by hand").await;
+    let on_web = save_in(&h, &web, "the web server listens on port 8080").await;
+    save_in(&h, &other, "the other service is written in Go").await;
+    merge_projects(&h, &app, &web).await;
+
+    for (method, path, field) in PROJECT_INPUTS {
+        let Some(field) = field else { continue };
+        let route = format!("{method} {path} ({field})");
+        match (*method, *path) {
+            ("POST", "/memories") => {
+                let id = save_in(&h, &app, "a note saved after the merge").await;
+                assert_eq!(project_of(&h, id).await, json!(web), "{route}");
+            }
+            ("GET", "/memories") => {
+                let (status, body) = h.get_json(&format!("/v1/memories?project={app}")).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(ids_in(&body["items"]).contains(&on_web), "{route}: {body}");
+            }
+            ("POST", "/memories/move") => {
+                let row = save_in(&h, &other, "a note to move").await;
+                let (status, body) = h.post_json("/v1/memories/move", json!({ "ids": [row], "to_project": app })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert_eq!(project_of(&h, row).await, json!(web), "{route}");
+            }
+            ("POST", "/search") => {
+                let ask = json!({ "agent_id": "agent-http", "query": "web server port 8080", "project_id": app });
+                let (status, body) = h.post_json("/v1/search", ask).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(ids_in(&body["hits"]).contains(&on_web), "{route}: {body}");
+            }
+            ("POST", "/context") => {
+                // Without a query it lists the caller's recent saves of the
+                // project, which the fake embedder cannot rank.
+                let ask = json!({ "agent_id": "agent-http", "project_id": app });
+                let (status, body) = h.post_json("/v1/context", ask).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(body["prompt"].as_str().is_some_and(|p| p.contains("listens on port 8080")), "{route}: {body}");
+            }
+            ("POST", "/sessions") => {
+                let (status, body) = h
+                    .post_json("/v1/sessions", json!({ "agent_id": "agent-http", "project_id": app, "session_id": "s-merged" }))
+                    .await;
+                assert_eq!(status, 204, "{route}: {body}");
+                let id = save_in(&h, &web, "a note of that session").await;
+                assert_eq!(session_of(&h, id).await.as_deref(), Some("s-merged"), "{route}");
+            }
+            ("PATCH", "/memories/{kind}/{id}") => {
+                let row = save_in(&h, &other, "a note to patch").await;
+                let (status, body) = patch(&h, row, json!({ "project_id": app })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert_eq!(project_of(&h, row).await, json!(web), "{route}");
+            }
+            ("GET", "/disputes") => {
+                let older = save_in(&h, &web, "the port of the web server is 8080").await;
+                h.ctx
+                    .runtime
+                    .store
+                    .conn
+                    .call(move |c| {
+                        c.execute(
+                            "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
+                            [older, on_web],
+                        )
+                    })
+                    .await
+                    .expect("note the pair");
+                let pending = |project: String| {
+                    let h = &h;
+                    async move { h.get_json(&format!("/v1/disputes?agent_id=agent-http&project_id={project}")).await.1 }
+                };
+                let (from_app, from_web, from_other) = (pending(app.clone()).await, pending(web.clone()).await, pending(other.clone()).await);
+                assert_eq!(from_app, from_web, "{route}");
+                assert!(from_app["pending"].as_i64() > from_other["pending"].as_i64(), "{route}: {from_app} {from_other}");
+            }
+            ("POST", "/synthesis") => {
+                let (status, body) = h.post_json("/v1/synthesis", json!({ "project_id": app })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(ids_in(&body["pending"]).contains(&on_web), "{route}: {body}");
+            }
+            ("GET", "/stats") => {
+                let (_, from_app) = h.get_json(&format!("/v1/stats?project={app}")).await;
+                let (_, from_web) = h.get_json(&format!("/v1/stats?project={web}")).await;
+                assert_eq!(from_app, from_web, "{route}");
+            }
+            ("PATCH", "/projects/{id}") => {
+                let (status, body) = h.rename(&app, "App").await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+                assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route}: {body}");
+            }
+            _ => panic!("{route} takes a project and no check here follows it past a merge"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_bridge_opened_before_a_merge_reads_and_writes_its_target() {
+    let h = Harness::start().await;
+    // What the bridge registered at its start, and keeps.
+    let app = registered(&h, "/work/app").await;
+    let early = save_in(&h, &app, "the parser of app is written by hand").await;
+    let web = registered(&h, "/work/web").await;
+    merge_projects(&h, &app, &web).await;
+
+    let late = save_in(&h, &app, "the parser of app has a fuzz test").await;
+
+    assert_eq!((project_of(&h, early).await, project_of(&h, late).await), (json!(web), json!(web)));
+    let ask = json!({ "agent_id": "agent-http", "query": "parser of app", "project_id": app });
+    let (_, found) = h.post_json("/v1/search", ask).await;
+    let ids = ids_in(&found["hits"]);
+    assert!(ids.contains(&early) && ids.contains(&late), "{found}");
+    let (_, context) = h.post_json("/v1/context", json!({ "agent_id": "agent-http", "project_id": app })).await;
+    assert!(context["prompt"].as_str().is_some_and(|p| p.contains("has a fuzz test")), "{context}");
+}
+
+#[tokio::test]
+async fn a_move_from_a_merged_project_is_refused() {
+    let h = Harness::start().await;
+    let (app, web, other) =
+        (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
+    save_in(&h, &app, "the parser of app is written by hand").await;
+    merge_projects(&h, &app, &web).await;
+
+    let (status, body) = h.post_json("/v1/memories/move", json!({ "from_project": app, "to_project": other })).await;
+
+    assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{body}");
+    assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{body}");
+}
+
+#[tokio::test]
+async fn the_move_of_a_merge_is_undone_only_with_its_merge() {
+    let h = Harness::start().await;
+    let (app, web) = (registered(&h, "/work/app").await, registered(&h, "/work/web").await);
+    let row = save_in(&h, &app, "the parser of app is written by hand").await;
+    let merged = merge_projects(&h, &app, &web).await;
+
+    let (status, body) = h.post_json("/v1/memories/move", json!({ "undo": merged.move_id.expect("a move") })).await;
+
+    assert_eq!((status, body["error"].as_str()), (409, Some("part_of_merge")), "{body}");
+    let merge_id = merged.merge_id.expect("a merge").to_string();
+    assert!(body["detail"].as_str().is_some_and(|d| d.contains(&format!("--undo {merge_id}"))), "{body}");
+    assert_eq!(project_of(&h, row).await, json!(web), "nothing moved");
+}
