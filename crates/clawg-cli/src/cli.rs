@@ -11,7 +11,7 @@ use clawg_core::memory::sharing;
 use clawg_core::paths::{Profile, ProfileError};
 use clawg_core::preferences::Lang;
 
-use crate::client::MoveRequest;
+use crate::client::{MergeRequest, MoveRequest};
 
 /// `clawg` — local-first memory for coding agents.
 #[derive(Debug, Parser)]
@@ -396,6 +396,48 @@ pub enum ProjectsAction {
     /// running daemon. Each one moves with its whole save and topic history; a
     /// memory whose text or topic key is live in the target stays where it is.
     Move(MoveOpts),
+    /// Merge project SOURCE into TARGET through the running daemon: its
+    /// memories, folders, remotes and reviews go there, and SOURCE leaves the
+    /// listing while its id still leads to TARGET. `--undo N` takes merge N
+    /// back. A merge waits for the saves of both projects still being stored.
+    Merge(MergeOpts),
+    /// Answer that two projects are not one: no suggestion between them is
+    /// made again, and both are marked reviewed.
+    KeepApart {
+        /// One project's id, as `clawg projects list` shows it.
+        project_id: String,
+        /// The other's.
+        other_id: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+/// What `clawg projects merge` merges, or the merge it undoes: a source with
+/// `--into`, or `--undo`.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[command(group(clap::ArgGroup::new("merge").args(["source", "undo"]).required(true)))]
+pub struct MergeOpts {
+    /// The project to merge, by id, as `clawg projects list` shows it.
+    #[arg(requires = "into")]
+    pub source: Option<String>,
+    /// The project it goes into, by id.
+    #[arg(long, value_name = "TARGET", requires = "source")]
+    pub into: Option<String>,
+    /// Take merge N back instead, by the number the merge printed.
+    #[arg(long, value_name = "N", conflicts_with_all = ["source", "into"])]
+    pub undo: Option<i64>,
+    /// Say what it would do, and change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl MergeOpts {
+    pub fn request(&self) -> MergeRequest {
+        MergeRequest { source: self.source.clone(), target: self.into.clone(), undo: self.undo, dry_run: self.dry_run }
+    }
 }
 
 /// What `clawg projects move` moves, and where. Exactly one of `--to`,
@@ -1488,6 +1530,49 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["clawg", "projects", "rename", "app-1a2b"]).is_err(), "the name is required");
         assert!(Cli::try_parse_from(["clawg", "projects", "list", "extra"]).is_err(), "list takes no argument");
+    }
+
+    #[test]
+    fn projects_merge_and_keep_apart_parse() {
+        let merge = |args: &[&str]| {
+            let mut argv = vec!["clawg", "projects", "merge"];
+            argv.extend_from_slice(args);
+            match parse(&argv).command {
+                Command::Projects { action: ProjectsAction::Merge(opts) } => opts,
+                other => panic!("not a merge: {other:?}"),
+            }
+        };
+        assert_eq!(
+            merge(&["app-1a2b", "--into", "web-3c4d"]).request(),
+            MergeRequest { source: Some("app-1a2b".into()), target: Some("web-3c4d".into()), ..MergeRequest::default() }
+        );
+        let dry = merge(&["app-1a2b", "--into", "web-3c4d", "--dry-run", "--profile", "dev"]);
+        assert_eq!((dry.request().dry_run, dry.profile.profile.as_deref()), (true, Some("dev")));
+        assert_eq!(merge(&["--undo", "3"]).request(), MergeRequest { undo: Some(3), ..MergeRequest::default() });
+        let refused: [&[&str]; 5] = [
+            &[],
+            &["app-1a2b"],
+            &["--into", "web-3c4d"],
+            &["--undo", "3", "app-1a2b"],
+            &["--undo", "3", "--into", "web-3c4d"],
+        ];
+        for args in refused {
+            let mut argv = vec!["clawg", "projects", "merge"];
+            argv.extend_from_slice(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
+
+        assert_eq!(
+            parse(&["clawg", "projects", "keep-apart", "app-1a2b", "copia-3c4d"]).command,
+            Command::Projects {
+                action: ProjectsAction::KeepApart {
+                    project_id: "app-1a2b".into(),
+                    other_id: "copia-3c4d".into(),
+                    profile: ProfileArg::default()
+                }
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "projects", "keep-apart", "app-1a2b"]).is_err(), "it takes two projects");
     }
 
     fn move_opts(args: &[&str]) -> MoveOpts {

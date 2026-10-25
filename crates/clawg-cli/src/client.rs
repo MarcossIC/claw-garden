@@ -23,7 +23,8 @@ use std::time::Duration;
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::portability::{ImportReport, UndoReport};
-use clawg_core::memory::registry::{ListedProject, Project};
+use clawg_core::memory::merge::MergeReport;
+use clawg_core::memory::registry::{KeptApart, ListedProject, Project};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
@@ -651,6 +652,20 @@ pub struct ListArgs {
     pub deleted: bool,
     /// Only the rows that came from this project of another tool.
     pub origin_project: Option<String>,
+}
+
+/// A merge as `POST /v1/projects/merge` takes it: a source and a target, or a
+/// merge to undo. Unset fields are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MergeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 /// A batch move as `POST /v1/memories/move` takes it: a selection and one
@@ -1387,6 +1402,19 @@ impl DaemonClient {
     pub async fn rename_project(&self, id: &str, name: &str) -> Result<Project, ClientError> {
         let call = Call::new(reqwest::Method::PATCH, format!("/v1/projects/{}", path_segment(id)))
             .json(&serde_json::json!({ "name": name }))?;
+        read_response(self.send(call).await?)
+    }
+
+    /// Merges one project into another, or undoes a merge.
+    pub async fn merge_projects(&self, request: &MergeRequest) -> Result<MergeReport, ClientError> {
+        let call = Call::new(reqwest::Method::POST, "/v1/projects/merge").json(request)?;
+        read_response(self.send(call).await?)
+    }
+
+    /// Answers that projects `project_id` and `other_id` are not one.
+    pub async fn keep_apart(&self, project_id: &str, other_id: &str) -> Result<KeptApart, ClientError> {
+        let call = Call::new(reqwest::Method::POST, "/v1/projects/keep-apart")
+            .json(&serde_json::json!({ "project_id": project_id, "other_id": other_id }))?;
         read_response(self.send(call).await?)
     }
 
