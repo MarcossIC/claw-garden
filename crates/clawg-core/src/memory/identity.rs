@@ -245,6 +245,10 @@ pub const ROOT_COMMIT_WAIT: Duration = Duration::from_secs(1);
 /// --max-parents=0 --first-parent HEAD`: a history merged in later comes in
 /// through a second parent, so it adds no root. Blocks for up to
 /// [`ROOT_COMMIT_WAIT`].
+///
+/// git is given the git directory the root's `.git` names rather than left
+/// to find one: from a `.git` that is no repository it would go up and read
+/// the repository around the root.
 pub fn root_commit(root: &Path) -> RootCommit {
     let Some(marker) = read_marker(root) else {
         return RootCommit::Later;
@@ -252,8 +256,12 @@ pub fn root_commit(root: &Path) -> RootCommit {
     if git_config_dir(root, &marker).join("shallow").exists() {
         return RootCommit::Unknowable;
     }
+    let git_dir = match marker {
+        GitMarker::Dir => root.join(".git"),
+        GitMarker::Link { gitdir, .. } => gitdir,
+    };
     let mut command = git_in(root);
-    command.args(["rev-list", "--max-parents=0", "--first-parent", "HEAD"]);
+    command.arg("--git-dir").arg(git_dir).args(["rev-list", "--max-parents=0", "--first-parent", "HEAD"]);
     let Ok(mut child) = command.spawn() else {
         return RootCommit::Later;
     };

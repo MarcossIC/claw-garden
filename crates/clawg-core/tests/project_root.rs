@@ -238,7 +238,10 @@ fn the_first_commit_is_the_root_of_the_first_parent_chain() {
     git(&repo, &["merge", "--no-ff", "--allow-unrelated-histories", "-m", "merge the foreign history", "vendor"]);
 
     assert_eq!(git(&repo, &["rev-list", "--max-parents=0", "HEAD"]).lines().count(), 2, "the merge brought a second root");
-    assert_eq!(root_commit(&repo), RootCommit::Known(first));
+    assert_eq!(root_commit(&repo), RootCommit::Known(first.clone()));
+
+    git(&repo, &["worktree", "add", "-b", "topic", "../wt"]);
+    assert_eq!(root_commit(&base.join("wt")), RootCommit::Known(first), "a worktree reads through its .git file");
 }
 
 #[test]
@@ -255,6 +258,10 @@ fn a_shallow_or_empty_repository_has_no_first_commit_to_record() {
 
     assert_eq!(root_commit(&shallow), RootCommit::Unknowable, "the commit it ends in is not the first one");
     assert_eq!(root_commit(&base.join("empty")), RootCommit::Later, "there is no commit yet");
+
+    let broken = origin.join("vendored");
+    fs::create_dir_all(broken.join(".git")).expect("create a .git that is no repository");
+    assert_eq!(root_commit(&broken), RootCommit::Later, "not the first commit of the repository around it");
 }
 
 #[test]
