@@ -100,6 +100,13 @@ pub fn project_id_of(base_dir: &Path, root: &Path, ground: &dyn Ground) -> Resul
     if !has_table(&c, "project_remote")? {
         c.execute_batch("CREATE TEMP TABLE project_remote (remote TEXT PRIMARY KEY, project_id TEXT NOT NULL)")?;
     }
+    // The resolver follows `merged_into` (V28); before it no project was
+    // merged. A temporary view shadows `main.project` for the unqualified name.
+    let merges: bool =
+        c.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info('project') WHERE name = 'merged_into')", [], |r| r.get(0))?;
+    if !merges {
+        c.execute_batch("CREATE TEMP VIEW project AS SELECT id, NULL AS merged_into FROM main.project")?;
+    }
     Ok(crate::memory::project::project_id_in(&c, root, ground)?)
 }
 
@@ -510,10 +517,11 @@ mod tests {
     }
 
     /// The folders are in `project_path` from V27 on, and in `project` in a
-    /// store from before it, which an export reads without migrating.
+    /// store from before it, which an export reads without migrating; a store
+    /// from before V28 has no merge to follow.
     #[tokio::test]
     async fn export_reads_the_project_id_from_the_store() {
-        for (version, folders) in [(Some(26), "project"), (None, "project_path")] {
+        for (version, folders) in [(Some(26), "project"), (Some(27), "project_path"), (None, "project_path")] {
             let dir = tempfile::tempdir().unwrap();
             seed_on_disk(dir.path(), version).await;
             let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();

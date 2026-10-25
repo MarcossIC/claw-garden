@@ -686,6 +686,10 @@ async fn process_tracked(
     drain: DrainWatch<'_>,
 ) -> IngestReport {
     let row = track.as_ref().map(|t| t.row);
+    // A save its outbox held from before its project was merged names the
+    // tombstone: it is compared with, and stored in, the project it went into.
+    let followed = follow_merge(store, evt).await;
+    let evt = followed.as_ref().unwrap_or(evt);
     // Read once per event: the dedup, the detector and the key all compare
     // the save with what its agent reaches in its project.
     let saver = store.reader_for(&evt.agent_id);
@@ -728,6 +732,21 @@ async fn process_tracked(
         None => finish_save(store, pieces, revision, warned).await,
     };
     report
+}
+
+/// `evt` under the live project its project leads to, when that is another.
+/// A merge waits while a save of its projects is pending, so the project read
+/// here is the one every later step of the save reads.
+async fn follow_merge(store: &MemoryStore, evt: &MemoryEvent) -> Option<MemoryEvent> {
+    let project = evt.project_id.as_deref()?;
+    match crate::memory::merge::canonical(store, project).await {
+        Ok(live) if live != project => Some(MemoryEvent { project_id: Some(live), ..evt.clone() }),
+        Ok(_) => None,
+        Err(e) => {
+            log::warn!("could not follow the merges of project {project} (agent={}): {e}; the save stays under it", evt.agent_id);
+            None
+        }
+    }
 }
 
 /// Stores the pieces of `evt` and returns its report with the pieces to link,
@@ -3922,6 +3941,43 @@ mod tests {
             memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker).await;
         });
         (tx, handle)
+    }
+
+    /// An event the outbox held from before its project was merged names the
+    /// tombstone: it is stored in the project it went into, and revises the
+    /// key there.
+    #[tokio::test]
+    async fn a_save_retried_after_a_merge_lands_in_its_target() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, created_at) VALUES ('web-bbbb', 'web', 'root', 0);
+                     INSERT INTO project (id, name, born, created_at, merged_into, merged_at) \
+                       VALUES ('app-aaaa', 'app', 'root', 0, 'web-bbbb', 1);",
+                )
+            })
+            .await
+            .unwrap();
+        let under = |project: &str, content: &str, at: u64| MemoryEvent {
+            project_id: Some(project.into()),
+            timestamp_ms: at,
+            ..keyed(content, "storage/engine")
+        };
+        let old = save_for_test(&store, &under("web-bbbb", "Storage engine is SQLite", 10)).await.memories[0].id;
+
+        let report = save_for_test(&store, &under("app-aaaa", "Storage engine is SQLite with WAL", 20)).await;
+
+        assert_eq!(report.failure, None);
+        let new = report.memories[0].id;
+        let project: Option<String> = store
+            .conn
+            .call(move |c| c.query_row("SELECT project_id FROM memory WHERE id = ?1", [new], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(project.as_deref(), Some("web-bbbb"));
+        assert_eq!(revision_state(&store, old).await, ("superseded".into(), Some(new), Some("storage/engine".into())));
     }
 
     // ── Revisions by topic key ──────────────────────────────────────────────

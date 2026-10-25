@@ -31,6 +31,7 @@ use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
 use crate::memory::identity::{candidate_id, derive_project_id, Checkout, Ground, RootCommit, CANDIDATES};
 use crate::memory::registry::project_name;
+use crate::memory::merge::canonical_in;
 use crate::memory::relocate::{merge_in, Span};
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
@@ -552,6 +553,7 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground
             }
             None => shared.unwrap_or_else(|| root_id.clone()),
         };
+        let project_id = canonical_in(c, &project_id)?;
         if let Some(key) = &checkout.key {
             pending.remotes.entry(key.clone()).or_insert_with(|| project_id.clone());
         }
@@ -634,14 +636,21 @@ fn plan_in(
             }
             None => &[],
         };
+        // Every project named here is the live one a merge left it in.
+        let live = |id: &str| canonical_in(c, id).map_err(sql);
         let project_id = match moved(&sightings, gone) {
             Moved::To(project) => {
                 moved_from = sightings.into_iter().map(|s| s.path).collect();
-                project
+                live(&project)?
             }
             Moved::Apart(others) => {
-                let project_id = project_of(shared, &settled);
-                suggestions.extend(others.into_iter().filter(|o| *o != project_id).map(|o| (o, "root_commit")));
+                let project_id = live(&project_of(shared, &settled))?;
+                for other in others {
+                    let other = live(&other)?;
+                    if other != project_id && !suggestions.iter().any(|(o, _)| *o == other) {
+                        suggestions.push((other, "root_commit"));
+                    }
+                }
                 project_id
             }
         };
@@ -650,7 +659,7 @@ fn plan_in(
         // and maybe the same project.
         if let (true, RootCommit::Known(commit)) = (settled.contradicted(), &commit) {
             for folder in folders.iter().filter(|f| f.root_commit.as_ref() == Some(commit)) {
-                let other = folder_project_in(c, folder).map_err(sql)?;
+                let other = live(&folder_project_in(c, folder).map_err(sql)?)?;
                 if other != project_id && !suggestions.iter().any(|(o, _)| *o == other) {
                     suggestions.push((other, "remote_changed"));
                 }
@@ -1847,6 +1856,46 @@ mod tests {
         f.ground.put(lib, None, Some("t2"), known("c3"));
         let relocated = f.register(f.found(Path::new("/work/lib2"), None, "t1", known("c2"))).await.unwrap();
         assert_eq!(relocated.project_id, l.project_id, "another repository where it was recorded is not it");
+    }
+
+    /// A folder no registration since V27 recorded a project in leads to its
+    /// own id, and that id was merged since: the root gets the live project,
+    /// read, planned and registered alike.
+    #[tokio::test]
+    async fn a_root_whose_project_was_merged_registers_into_its_target() {
+        let f = Fixture::new().await;
+        let app = Path::new("/work/app");
+        let id = derive_project_id(app);
+        f.root(&id, "/work/app").await;
+        let tombstone = id.clone();
+        f.store
+            .conn
+            .call(move |c| {
+                c.execute_batch(&format!(
+                    "INSERT INTO project (id, name, born, created_at) VALUES ('web-bbbb', 'web', 'root', 0);
+                     INSERT INTO project (id, name, born, created_at, merged_into, merged_at) \
+                       VALUES ('{tombstone}', 'app', 'root', 0, 'web-bbbb', 1);"
+                ))
+            })
+            .await
+            .unwrap();
+        let ground = f.ground.clone();
+        let (read, planned) = f
+            .store
+            .conn
+            .call(move |c| {
+                let read = project_id_in(c, Path::new("/work/app"), &*ground)?;
+                let planned = plan_ids_in(c, &[PathBuf::from("/work/app")], &*ground)?.remove(0).project_id;
+                Ok::<_, rusqlite::Error>((read, planned))
+            })
+            .await
+            .unwrap();
+        assert_eq!((read.as_str(), planned.as_str()), ("web-bbbb", "web-bbbb"));
+
+        let registered = f.register(reg(app, &[])).await.unwrap();
+
+        assert_eq!((registered.project_id.as_str(), registered.root_id.as_str()), ("web-bbbb", id.as_str()));
+        assert_eq!(f.folders("/work/app").await[0].1.as_deref(), Some("web-bbbb"), "the folder records the live project");
     }
 
     #[tokio::test]

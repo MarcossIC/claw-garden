@@ -42,6 +42,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::dedup::content_hash;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::identity::{Ground, ReadAhead};
+use crate::memory::merge::canonical_in;
 use crate::memory::project::{plan_ids_in, RootPlan};
 use crate::memory::registry::project_name;
 use crate::memory::language;
@@ -593,8 +594,15 @@ trait Seat {
     fn link(&mut self, link: Link<'_>) -> Result<(), Self::Error>;
 }
 
-/// The rules over the transaction they write in, journaling each write.
+/// The rules over the transaction they write in, journaling each write. A
+/// project merged since the plan is read and written as the one it went into.
 struct SqlSeat<'t, 'c>(&'t Transaction<'c>, &'t mut Journal);
+
+impl SqlSeat<'_, '_> {
+    fn live(&self, project: Option<&str>) -> rusqlite::Result<Option<String>> {
+        project.map(|p| canonical_in(self.0, p)).transpose()
+    }
+}
 
 impl Seat for SqlSeat<'_, '_> {
     type Error = rusqlite::Error;
@@ -616,14 +624,17 @@ impl Seat for SqlSeat<'_, '_> {
     }
 
     fn present(&mut self, agent: Option<&str>, project: Option<&str>, hash: &str, created_at: i64) -> rusqlite::Result<Option<i64>> {
+        let project = self.live(project)?;
         self.0.prepare_cached(PRESENT_SQL)?.query_row(rusqlite::params![agent, project, hash, created_at], |r| r.get(0)).optional()
     }
 
     fn twin(&mut self, project: Option<&str>, hash: &str) -> rusqlite::Result<Option<i64>> {
+        let project = self.live(project)?;
         self.0.prepare_cached(TWIN_SQL)?.query_row(rusqlite::params![project, hash], |r| r.get(0)).optional()
     }
 
     fn holders(&mut self, project: Option<&str>, key: &str, origin: Option<&str>) -> rusqlite::Result<Vec<i64>> {
+        let project = self.live(project)?;
         let mut stmt = self.0.prepare_cached(TOPIC_HOLDERS_SQL)?;
         let holders = stmt.query_map(rusqlite::params![project, key, origin], |r| r.get(0))?.collect();
         holders
@@ -631,10 +642,11 @@ impl Seat for SqlSeat<'_, '_> {
 
     fn insert(&mut self, new: &NewRow<'_>) -> rusqlite::Result<i64> {
         let (row, src) = (new.row, &new.row.src);
+        let project = self.live(new.project)?;
         self.0.prepare_cached(INSERT_SQL)?.execute(rusqlite::params![
             src.scope,
             row.agent,
-            new.project,
+            project,
             row.content,
             src.memory_type,
             src.source,
@@ -1225,11 +1237,12 @@ fn record_projects(
     let (taken, remotes) = taken_projects(projects, &mut roots);
     for p in projects {
         // A folder without its project would be read under its own id, which
-        // is another project when the plan followed a move.
+        // is another project when the plan followed a move. A project merged
+        // since the plan leads to the one it went into.
         let added = tx.execute(
             "INSERT OR IGNORE INTO project_path (id, root_path, created_at, index_docs, project_id, remote, root_commit, git_stamp) \
              VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)",
-            rusqlite::params![p.root_id, p.root, now, p.project_id, p.remote, p.root_commit, p.git_stamp],
+            rusqlite::params![p.root_id, p.root, now, canonical_in(tx, &p.project_id)?, p.remote, p.root_commit, p.git_stamp],
         )?;
         if added == 1 {
             journal.extra(tx, "project", None, &p.root_id, None)?;
@@ -1244,7 +1257,7 @@ fn record_projects(
     for p in remotes {
         let added = tx.execute(
             "INSERT OR IGNORE INTO project_remote (remote, project_id, created_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![p.remote, p.project_id, now],
+            rusqlite::params![p.remote, canonical_in(tx, &p.project_id)?, now],
         )?;
         if let (1, Some(remote)) = (added, &p.remote) {
             journal.extra(tx, "remote", None, remote, None)?;
@@ -2331,6 +2344,90 @@ pub(crate) mod tests {
         let own = crate::memory::identity::candidate_id(Path::new(ROOT), 1);
         assert_eq!(report.by_project.get(&own), Some(&13));
         assert_eq!(report.by_project.get(&project()), None, "nothing goes to the other root's project");
+    }
+
+    /// Answers as the fake embedder does, after leaving `from` a tombstone of
+    /// `into` on its first call: the import was planned before that merge.
+    struct MergingEmbedder {
+        store: MemoryStore,
+        from: String,
+        into: String,
+        merged: std::sync::atomic::AtomicBool,
+        fake: FakeEmbedder,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for MergingEmbedder {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            if !self.merged.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let (from, into) = (self.from.clone(), self.into.clone());
+                self.store
+                    .conn
+                    .call(move |c| c.execute("UPDATE project SET merged_into = ?2, merged_at = 1 WHERE id = ?1", [from, into]))
+                    .await
+                    .unwrap();
+            }
+            self.fake.embed_with_role(text, role).await
+        }
+        fn dimensions(&self) -> usize {
+            self.fake.dimensions()
+        }
+        fn model_id(&self) -> &str {
+            self.fake.model_id()
+        }
+        fn query_prefix(&self) -> &str {
+            self.fake.query_prefix()
+        }
+        fn passage_prefix(&self) -> &str {
+            self.fake.passage_prefix()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_import_planned_before_a_merge_writes_into_its_target() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        let (planned, target) = (project(), "web-bbbb".to_string());
+        let (p, t) = (planned.clone(), target.clone());
+        dst.conn
+            .call(move |c| {
+                c.execute_batch(&format!(
+                    "INSERT INTO project (id, name, born, created_at) VALUES ('{p}', 'repo', 'root', 0), ('{t}', 'web', 'root', 0);"
+                ))
+            })
+            .await
+            .unwrap();
+        let embedder = MergingEmbedder {
+            store: dst.clone(),
+            from: planned.clone(),
+            into: target.clone(),
+            merged: std::sync::atomic::AtomicBool::new(false),
+            fake: FakeEmbedder::default(),
+        };
+        let backups = tempfile::tempdir().unwrap();
+
+        import(&dst, Some(&embedder), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false))
+            .await
+            .unwrap();
+
+        assert!(embedder.merged.load(std::sync::atomic::Ordering::SeqCst), "the merge came between the plan and the writes");
+        let rows = dst
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT project_id, COUNT(*) FROM memory GROUP BY project_id ORDER BY 1")?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap();
+        assert!(rows.iter().all(|(p, _)| p.as_deref() != Some(planned.as_str())), "nothing under the tombstone: {rows:?}");
+        assert!(rows.contains(&(Some(target.clone()), 13)), "{rows:?}");
+        let folder: Option<String> = dst
+            .conn
+            .call(|c| c.query_row("SELECT project_id FROM project_path WHERE root_path = ?1", [ROOT], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(folder, Some(target));
     }
 
     #[tokio::test]
