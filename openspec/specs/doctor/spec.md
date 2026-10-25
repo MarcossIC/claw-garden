@@ -7,6 +7,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: `memory.topic` y `memory.content_hash` agrupan por proyecto y nombran a los autores; el texto de `fallback_agent`.
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23: los chequeos `preferences` y `protocol_block` (LP14).
 - [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23: `message` en el idioma del comando (R1) y el resto del hallazgo igual en los dos idiomas (CL4).
+- [project-registry](../../changes/archive/2026-10-25-project-registry/proposal.md), archivado el 2026-10-25: el chequeo `project_remotes` (R7, su RG5).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 
@@ -169,10 +170,12 @@ Las reglas 1 y 4 agrupan por proyecto, como la clave de tema y el dedup ([`specs
 | `agents` | siempre que haya filas | `ok`, con cada agente y sus filas vivas y totales | — |
 | `agents` | filas vivas del agente de respaldo `mcp` | `warn` `fallback_agent`, con la cantidad: un cliente no dio `--agent` ni `clientInfo.name`; todo agente las lee y las cambia, pero el workspace y RECENT del agente real del cliente no las incluyen | — |
 | `projects` | una fila de `project` cuyo id no es ninguno de los que su raíz puede recibir (`candidate_id(root_path, 0..64)`, `is_candidate_for`) | `warn` `id_mismatch`, con el id y la ruta | — |
+| `project_remotes` | un proyecto con dos o más remotos atados en `project_remote`: lo que deja un repositorio clonado en el camino de otro con un clawg anterior a 0.63.0, o un remoto renombrado | `warn` `several_remotes`, con el id, sus remotos y cada raíz que lo usa (las filas con ese id y las raíces cuya clave actual, leída con `origin_key`, es uno de ellos) con su clave actual | — |
+| `project_remotes` | ninguno | `ok`, con cuántos remotos hay | — |
 
 Con filas `pending` y un daemon vivo no hay hallazgo: las está ingiriendo.
 
-**Tests:** `the_facts_name_agents_projects_the_outbox_and_the_contract` (`inspect.rs`); `outbox_findings`, `agent_findings`, `project_findings`, `a_project_id_assigned_to_its_root_is_ok`, `shell_words_are_quoted_only_when_a_shell_would_read_them` (`doctor`).
+**Tests:** `the_facts_name_agents_projects_the_outbox_and_the_contract`, `the_facts_name_the_remotes_of_each_project` (`inspect.rs`); `outbox_findings`, `agent_findings`, `project_findings`, `a_project_id_assigned_to_its_root_is_ok`, `project_remote_findings`, `shell_words_are_quoted_only_when_a_shell_would_read_them` (`doctor`).
 
 ## R8. El registro MCP de Claude Code
 

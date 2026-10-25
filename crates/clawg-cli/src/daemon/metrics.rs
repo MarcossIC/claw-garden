@@ -171,6 +171,7 @@ impl Writer {
             ("process.rss_bytes", process.rss_bytes),
             ("process.rss_peak_bytes", process.rss_peak_bytes),
             ("process.private_bytes", process.private_bytes),
+            ("process.private_peak_bytes", process.private_peak_bytes),
             ("process.threads", process.threads),
             ("process.open_files", process.open_files),
             ("process.handles", process.handles),
@@ -540,7 +541,12 @@ mod tests {
         assert!(writer.is_writing() && recorder.writing());
 
         recorder.observe("http.duration", Unit::Micros, &[("route", "/health")], 100);
-        let process = ProcessSample { rss_bytes: Some(4096), cpu: Some(Duration::from_secs(1)), ..Default::default() };
+        let process = ProcessSample {
+            rss_bytes: Some(4096),
+            private_peak_bytes: Some(8192),
+            cpu: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
         writer.sample(NOW, process, runtime(0), Some(true));
         writer.flush(NOW + MINUTE_MS);
         let process = ProcessSample { cpu: Some(Duration::from_secs(31)), ..process };
@@ -561,6 +567,8 @@ mod tests {
         assert_eq!(busy[0].gauge.last, 0.5, "a minute busy out of two workers' minutes");
         let resident = db.gauge_rows_since("embedder.resident", 0).unwrap();
         assert_eq!(resident.iter().map(|g| g.gauge.last).collect::<Vec<_>>(), vec![1.0, 0.0]);
+        let peak = db.gauge_rows_since("process.private_peak_bytes", 0).unwrap();
+        assert_eq!(peak.iter().map(|g| g.gauge.max).collect::<Vec<_>>(), vec![8192.0, 8192.0]);
         assert!(db.gauge_rows_since("process.handles", 0).unwrap().is_empty(), "an unknown value is left out");
     }
 

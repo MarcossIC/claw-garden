@@ -473,8 +473,8 @@ impl MoveOpts {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum MetricsAction {
-    /// Sum one metric by local day, by hour of the local day or by version,
-    /// and print its count, mean and percentiles (or, for a gauge, its
+    /// Sum one metric by local day, by hour of the local day, by local minute
+    /// or by version, and print its count, mean and percentiles (or, for a gauge, its
     /// samples, mean and extremes) as JSON.
     Report {
         /// The metric, as `http.duration` or `process.rss_bytes`.
@@ -503,6 +503,8 @@ pub enum ReportBy {
     Hour,
     /// The clawg version that recorded it.
     Version,
+    /// The local date and minute, over the 14 days kept by minute.
+    Minute,
 }
 
 /// `KEY=VALUE`, both sides trimmed and not empty.
@@ -1424,6 +1426,12 @@ mod tests {
                 }
             }
         );
+        let Command::Metrics { action: MetricsAction::Report { by, .. } } =
+            parse(&["clawg", "metrics", "report", "--metric", "process.private_bytes", "--by", "minute"]).command
+        else {
+            panic!("a report")
+        };
+        assert_eq!(by, ReportBy::Minute);
         assert!(Cli::try_parse_from(["clawg", "metrics", "report"]).is_err(), "the metric is required");
         for bad in ["route", "=x", "route=", "a"] {
             assert!(parse_label(bad).is_err(), "{bad}");

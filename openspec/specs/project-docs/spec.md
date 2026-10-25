@@ -8,6 +8,7 @@ Fuente de verdad del comportamiento actual del índice de la documentación y el
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (la raíz del puente se acepta sola sólo si es un proyecto, y la frase del 403).
 - [docs-refresh-background](../../changes/archive/2026-10-22-docs-refresh-background/proposal.md), archivado el 2026-10-22 (el refresco vencido corre en segundo plano y la búsqueda lo espera a lo sumo 3 s, el error del último refresco en `warning`, y un doc con un vector inservible no frena a los demás).
 - [piece-boundaries](../../changes/archive/2026-10-24-piece-boundaries/proposal.md), archivado el 2026-10-24 (PB3: un pasaje largo se corta en frontera de palabra). El divisor y su regla están en [`specs/pieces`](../pieces/spec.md) (PB1).
+- [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (RF1: sólo un registro que trae `index_docs: true` lanza el refresco de fondo, no uno que encuentra la raíz ya aceptada, como los de los hooks).
 
 ## Definiciones
 
@@ -302,18 +303,23 @@ El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory
 
 **Tests:** `fuse_adds_the_reciprocal_ranks_of_both_lists`, `fuse_breaks_ties_by_id_and_stops_at_the_limit`, `search_finds_a_passage_by_meaning`, `search_finds_an_identifier_lexically`, `search_never_crosses_projects`, `waiting_for_a_running_refresh_ends_when_it_does`, `a_refresh_is_due_again_only_after_the_interval` y `begin_if_due_claims_only_a_due_idle_project` en `crates/clawg-core/src/memory/project_docs/mod.rs`; `a_docs_search_returns_five_by_default_and_never_more_than_twenty` y `the_refusal_names_the_command_for_the_daemons_profile` (puro) en `crates/clawg-cli/src/daemon/api.rs` (mod tests); en `crates/clawg-cli/tests/api.rs`: `docs_search_indexes_on_first_use_and_answers`, `docs_search_takes_at_most_the_limit`, `docs_search_of_an_unregistered_project_is_404`, `searching_the_docs_of_a_root_that_was_not_accepted_is_forbidden`, `docs_search_with_an_empty_query_is_a_bad_request`, `docs_search_waits_for_the_embedder_like_any_search`, `docs_search_needs_a_token`, `a_root_that_vanished_still_answers_from_its_index`, `a_search_during_the_first_index_waits_for_it`, `a_search_answers_from_the_index_while_a_long_refresh_runs`, `a_small_edit_is_found_by_the_search_that_refreshes`, `the_refresh_outlives_the_search_that_started_it` y `a_background_refresh_that_failed_warns_the_next_search`.
 
-## Registrar una raíz aceptada la indexa en segundo plano
+## Un registro que lo pide indexa la raíz en segundo plano
 
-Cuando `POST /v1/projects` registra o confirma una raíz y, después del registro, la raíz está aceptada (`RegisterOutcome::index_docs`), el daemon MUST lanzar un refresco del índice de esa raíz (`RegisterOutcome::root_id`) en segundo plano. Ese refresco espera a que el embedder deje de estar en `loading` (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs:1974`; llamado en `register`, `:1965-1967`; corre el mismo `refresh_docs`, `:1998`, que el refresco de una búsqueda). Un registro que deja la raíz sólo registrada MUST NOT lanzarlo. La respuesta del registro MUST NOT esperar el refresco y MUST NOT cambiar de forma. Un refresco fallido, o un embedder que no cargó, MUST quedar en el log como warn y MUST NOT afectar el registro. El error de un refresco fallido MUST quedar además como el último del proyecto, que la búsqueda siguiente nombra en `warning`.
+Cuando `POST /v1/projects` trae `index_docs: true` y, después del registro, la raíz está aceptada (`RegisterOutcome::index_docs`), el daemon MUST lanzar un refresco del índice de esa raíz (`RegisterOutcome::root_id`) en segundo plano. Ese refresco espera a que el embedder deje de estar en `loading` (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs:2086`; llamado en `register`, `:2077-2079`; corre el mismo `refresh_docs`, `:2110`, que el refresco de una búsqueda). Un registro sin `index_docs`, o con `false`, MUST NOT lanzarlo, aunque la raíz ya estuviera aceptada: la marca se guarda igual y sólo sube ([`specs/project`](../project/spec.md), R4). Tampoco lo lanza un registro que deja la raíz sólo registrada. Los hooks registran la raíz en cada `session-start` y cada `user-prompt-submit` sin `index_docs`. Si cada registro refrescara, cada prompt recorrería y hashearía el índice entero, embebería lo que cambió y mantendría cargado el modelo. La frescura del índice queda a cargo de la búsqueda, que refresca un índice de más de `REFRESH_INTERVAL` ([«Búsqueda»](#búsqueda)). La respuesta del registro MUST NOT esperar el refresco y MUST NOT cambiar de forma. Un refresco fallido, o un embedder que no cargó, MUST quedar en el log como warn y MUST NOT afectar el registro. El error de un refresco fallido MUST quedar además como el último del proyecto, que la búsqueda siguiente nombra en `warning`.
 
-El puente registra su propia raíz antes de su primera herramienta, pidiendo indexarla cuando es un proyecto ([arriba](#el-puente-acepta-su-raíz-sola-sólo-si-es-un-proyecto); [`specs/project`](../project/spec.md), R6). Así, el primer indexado empieza con la sesión y no con la primera búsqueda.
+El puente registra su propia raíz antes de su primera herramienta, pidiendo indexarla cuando es un proyecto ([arriba](#el-puente-acepta-su-raíz-sola-sólo-si-es-un-proyecto); [`specs/project`](../project/spec.md), R6). Así, el primer indexado empieza con la sesión y no con la primera búsqueda. `clawg projects add` también lo pide ([abajo](#clawg-projects-add)).
 
-#### Escenario
+#### Escenario: un registro que lo pide
 - GIVEN una raíz con un `README.md`
 - WHEN se registra con `index_docs: true`
 - THEN la respuesta es 200 y, poco después, el índice del proyecto tiene ese doc
 
-**Tests:** `registering_a_root_indexes_its_docs_in_the_background` y `a_root_registered_without_its_docs_is_not_indexed` en `crates/clawg-cli/tests/api.rs`.
+#### Escenario: un hook registra una raíz ya aceptada
+- GIVEN una raíz registrada con `index_docs: true` cuyo índice tiene su `README.md`, y un `NOTES.md` que se escribió después
+- WHEN se registra otra vez sin `index_docs`
+- THEN la respuesta es 200, la raíz sigue aceptada y su índice sigue con un doc
+
+**Tests:** `registering_a_root_indexes_its_docs_in_the_background`, `a_root_registered_without_its_docs_is_not_indexed` y `registering_an_accepted_root_without_asking_leaves_its_index_alone` en `crates/clawg-cli/tests/api.rs`.
 
 ## `clawg projects add`
 
@@ -398,7 +404,7 @@ La apertura sigue la regla de [`specs/storage`](../storage/spec.md) (snapshot `p
 
 - La calidad de la búsqueda está medida, no exigida. `rag-eval --real --docs` sobre este repo (199 archivos, 10 preguntas de docs y 5 de código, e5-small con pooling mean, Linux, binario debug) dio Hit@3 0,27 y MRR@10 0,26 con docs y código juntos; los números de Windows no están tomados. Las preguntas y el criterio de acierto están en [`specs/eval`](../eval/spec.md).
 - El canal léxico une todos los tokens de la consulta con OR, palabras vacías incluidas, y eso empuja pasajes que sólo comparten "de", "el" o "the". Filtrarlo es una mejora posible; no cambia este contrato.
-- No hay watcher del filesystem ni herramienta `index_project`: el índice se pone al día al registrar una raíz aceptada y en la próxima búsqueda pasado el intervalo. Un doc editado aparece en la primera búsqueda pasados los 60 s si su refresco termina dentro de `REFRESH_GRACE`, y si no en la primera después de que termine. `REFRESH_GRACE` sale de la única medición que hay, un reindexado completo en un binario debug (unos 2,9 s por doc); en release no está medido.
+- No hay watcher del filesystem ni herramienta `index_project`: el índice se pone al día cuando un registro que trae `index_docs: true` deja la raíz aceptada (el puente al arrancar, `clawg projects add`) y en la próxima búsqueda pasado el intervalo. Un doc editado aparece en la primera búsqueda pasados los 60 s si su refresco termina dentro de `REFRESH_GRACE`, y si no en la primera después de que termine. `REFRESH_GRACE` sale de la única medición que hay, un reindexado completo en un binario debug (unos 2,9 s por doc); en release no está medido.
 - Un doc cuyo vector nunca sirve se vuelve a embeber en cada refresco, a lo sumo uno por minuto y sólo cuando alguien busca: no se recuerda la huella que falló.
 - Tras un cambio de modelo los docs se reemplazan de a uno, así que las búsquedas que responden mientras dura el refresco comparan contra vectores de dos modelos; `indexing: true` lo avisa.
 - La marca no es un límite contra quien tiene el `token`: cualquier cliente con él puede mandar `index_docs: true` por cualquier raíz, igual que puede registrarla. Lo que cierra es que el modelo, por medio de `project_path`, haga leer al daemon una carpeta que el usuario no eligió.

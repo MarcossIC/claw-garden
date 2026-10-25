@@ -272,6 +272,7 @@ impl Harness {
                     Arc::new(FakeEmbedder::default()),
                     reload,
                     Some(Duration::from_secs(600)),
+                    None,
                     &tokio::runtime::Handle::current(),
                 );
                 idle.unload().await;
@@ -2866,6 +2867,39 @@ async fn registering_without_assigned_ids_keeps_the_old_answer() {
     assert_eq!(remotes, 0, "a caller that derives its id joins no remote");
 }
 
+fn set_origin(root: &std::path::Path, url: &str) {
+    let git = root.join(".git");
+    std::fs::create_dir_all(&git).unwrap();
+    std::fs::write(git.join("config"), format!("[remote \"origin\"]\n\turl = {url}\n")).unwrap();
+}
+
+#[tokio::test]
+async fn a_repository_cloned_where_another_was_registers_into_a_project_of_its_own() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("app");
+    set_origin(&root, "git@github.com:acme/a.git");
+    let register = |assigned: bool| {
+        h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": assigned }))
+    };
+    let (_, a) = register(true).await;
+
+    set_origin(&root, "git@github.com:acme/b.git");
+    let (status, old) = register(false).await;
+    assert_eq!(status, 409, "{old}");
+    assert_eq!(old["error"], "project_root_collision", "{old}");
+    let detail = old["detail"].as_str().expect("detail");
+    assert!(detail.contains("gives that root another"), "{detail}");
+    let (status, b) = register(true).await;
+
+    assert_eq!(status, 200, "{b}");
+    assert_ne!(b["project_id"], a["project_id"], "{a} {b}");
+    assert_ne!(b["root_id"], a["root_id"], "{a} {b}");
+    set_origin(&root, "git@github.com:acme/a.git");
+    let (_, back) = register(true).await;
+    assert_eq!(back["project_id"], a["project_id"], "the first repository keeps its project");
+}
+
 #[tokio::test]
 async fn registering_needs_the_token() {
     let h = Harness::start().await;
@@ -3056,6 +3090,35 @@ async fn a_root_registered_without_its_docs_is_not_indexed() {
 
     assert_eq!(index_docs_of(&h, &label_id).await, Some(0));
     assert_eq!(clawg_core::memory::project_docs::doc_count(&h.ctx.runtime.store, &label_id).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn registering_an_accepted_root_without_asking_leaves_its_index_alone() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Readme\nindexed once\n").unwrap();
+    let root = dir.path().display().to_string();
+    let (_, body) = h.post_json("/v1/projects", json!({ "root_path": root, "index_docs": true })).await;
+    let id = body["project_id"].as_str().expect("project_id").to_string();
+    wait_for_docs(&h, &id, 1).await;
+    while h.ctx.runtime.project_docs.is_running(&id) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::write(dir.path().join("NOTES.md"), "# Notes\nwritten after\n").unwrap();
+    let other = tempfile::tempdir().expect("tempdir");
+    std::fs::write(other.path().join("README.md"), "# Readme\nread\n").unwrap();
+
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root })).await;
+    assert_eq!(status, 200, "{body}");
+    // Registered after, so once its docs are in, a refresh of the first root
+    // would have run too if the registration above had started one.
+    let (_, body) = h
+        .post_json("/v1/projects", json!({ "root_path": other.path().display().to_string(), "index_docs": true }))
+        .await;
+    wait_for_docs(&h, body["project_id"].as_str().expect("project_id"), 1).await;
+
+    assert_eq!(index_docs_of(&h, &id).await, Some(1), "the root stays accepted");
+    assert_eq!(clawg_core::memory::project_docs::doc_count(&h.ctx.runtime.store, &id).await.unwrap(), 1);
 }
 
 #[tokio::test]

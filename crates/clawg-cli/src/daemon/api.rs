@@ -1897,7 +1897,7 @@ async fn import_memories(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportReport>> {
-    let mut timings = ImportTimings::new(body.dry_run);
+    let mut timings = ImportTimings::new(body.dry_run).with_memory(super::process::private_bytes);
     let read = Instant::now();
     if body.text.len() > MAX_IMPORT_BYTES {
         return Err(ApiError::bad_request(format!(
@@ -2025,11 +2025,11 @@ async fn register(
     if body.index_docs && !root.is_dir() {
         return Err(ApiError::bad_request(format!("{} is not a directory, so it has no files to index", body.root_path)));
     }
-    let remote = if body.assigned {
+    // A caller that derives its id joins no remote, but the remote still tells
+    // whether the repository at the root is the one its row was given to.
+    let remote = {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || origin_key(&root)).await.ok().flatten()
-    } else {
-        None
     };
     let registration = Registration {
         root,
@@ -2043,6 +2043,13 @@ async fn register(
         .await
         .map_err(|e| match e {
             RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
+            RegisterError::RootCollision { id, existing } if existing == body.root_path => ApiError {
+                detail: Some(format!(
+                    "{} derives the project id {id}, but the daemon gives that root another one; a newer bridge uses it",
+                    root.display()
+                )),
+                ..ApiError::conflict("project_root_collision")
+            },
             RegisterError::RootCollision { id, existing } => ApiError {
                 detail: Some(format!("{} gets the project id {id}, which already belongs to {existing}", root.display())),
                 ..ApiError::conflict("project_root_collision")
@@ -2065,7 +2072,9 @@ async fn register(
     if let Some(embedder) = app.runtime.embedder.get() {
         embedder.wake();
     }
-    if outcome.index_docs {
+    // Only a caller that asks: the hooks register an accepted root on every
+    // prompt, and `search_project` already refreshes an index gone stale.
+    if body.index_docs && outcome.index_docs {
         spawn_doc_refresh(app.clone(), outcome.root_id.clone());
     }
     Ok(Json(RegisteredBody { project_id: outcome.project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
