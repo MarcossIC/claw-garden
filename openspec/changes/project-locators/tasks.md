@@ -144,7 +144,8 @@ Requisitos en la [spec](spec.md#entrega-2a-unir-proyectos) (PL11 a PL20) y decis
   - `merging_a_target_repoints_its_tombstones`;
   - `a_dry_run_merge_changes_nothing`;
   - `a_merge_copies_a_workspace_only_where_the_target_has_none`;
-  - `a_merge_is_refused_while_a_save_of_its_projects_is_pending`, y `a_merge_of_a_tombstone_into_its_target_repairs_it`.
+  - `a_merge_is_refused_while_a_save_of_its_projects_is_pending`, `a_merge_of_a_tombstone_into_its_target_repairs_it` y `a_merge_is_refused_for_an_unknown_the_same_or_a_merged_project`;
+  - la pura `decide_merge_carrying_takes_the_joined_part_of_a_unit_elsewhere` (`relocate.rs`).
 - [ ] GREEN:
   - `Span::{Keep, Carry}` en `decide_merge` (`relocate.rs`): el registro pasa `Keep`;
   - `merge_core(store, workspaces, backups, source, target, dry_run)`: la pasada en seco, la espera de `SAVES_WAIT`, el snapshot, la transacción que vuelve a decidir y el diario;
@@ -183,8 +184,9 @@ Requisitos en la [spec](spec.md#entrega-2a-unir-proyectos) (PL11 a PL20) y decis
   - `a_bridge_opened_before_a_merge_reads_and_writes_its_target`;
   - `a_move_from_a_merged_project_is_refused` y `the_move_of_a_merge_is_undone_only_with_its_merge`.
 - [ ] GREEN:
-  - un ayudante del daemon que resuelve un `Option<String>` de proyecto con `canonical_in`, en `save_memory`, `search`, `context`, `register_session`, `synthesis`, `disputes`, `list_memories` y `stats`;
-  - 409 `project_merged` para `rename` y `from_project`, y 409 `part_of_merge` para el `undo` de un movimiento.
+  - un ayudante del daemon que resuelve un `Option<String>` de proyecto con `canonical`, en `save_memory`, `search`, `context`, `register_session`, `synthesis`, `disputes`, `list_memories` y `stats`;
+  - en el core, para que valga para cualquier llamador: `MoveError::Merged` para un `from_project` que es una lápida, `MoveError::PartOfMerge` para el `--undo` del movimiento de una unión (`undo_move_core`) y `RenameError::Merged` para renombrar una lápida;
+  - el daemon los responde 409 `project_merged` y 409 `part_of_merge`.
 - Commit: `fix(daemon): follow a merged project at every entry that takes one`
 
 ### 16. La lista y `keep-apart` en el store (PL15, PL16; D22)
@@ -194,7 +196,7 @@ Requisitos en la [spec](spec.md#entrega-2a-unir-proyectos) (PL11 a PL20) y decis
   - `a_pair_kept_apart_is_not_suggested_again` (`project.rs`).
 - [ ] GREEN:
   - `list_projects` sin lápidas, con `merged` y las sugerencias por `canonical`;
-  - `rename_project` con `RenameError::Merged`, y el nombre de una lápida libre;
+  - el nombre de una lápida, libre para `rename_project`;
   - `keep_apart`.
 - Commit: `feat(core): list a merged project under its target and keep two projects apart`
 

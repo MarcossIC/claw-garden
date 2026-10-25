@@ -41,3 +41,65 @@ Pendiente para el pull request final del cambio. `project-locators` se publica e
 
 - **Linux en local:** sólo se corrió en Windows. Lo cubre el CI del pull request.
 - **El perfil dev:** no se tocó ningún perfil real.
+
+## Entrega 2a (0.64.0)
+
+### Windows
+
+- Después de `cargo clean --workspace --target-dir target-test` al empezar la entrega, `cargo test --workspace --locked --target-dir target-test` pasa, con `tests/binary.rs`. `cargo clippy --workspace --all-targets --locked -- -A clippy::all -D warnings` y `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` salen con 0, los dos en `target-test`.
+- `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin volver a bendecir (PL20).
+- `a_merge_waits_for_the_saves_of_its_projects` tarda unos 5 s, lo que espera `SAVES_WAIT` antes de responder `saves_pending`.
+
+### El binario real en un home temporal
+
+Se usó el binario de `target-test` con `CLAWG_TEST_HOME`, `CLAWG_TEST_EMBEDDER=fake`, `CLAWG_TEST_DEFAULT_PORT=off` y `clawg serve --profile dev --port 0`, con repositorios hechos con `git` y las memorias guardadas por HTTP con el token del perfil:
+
+1. `app`, sin `origin`, y `web`, con `origin` `github.com/acme/web`, se registraron con `projects add` como `app-3794` y `web-f452`, con una memoria cada uno y un `workspace.md` de `claude-code` en `app`.
+2. `projects merge app-3794 --into web-f452 --dry-run` dijo lo que iba a pasar, sin escribir. La unión de verdad pasó 1 memoria y la carpeta de `app`, copió el `workspace.md`, escribió el snapshot `pre-merge` y dio el número 1 con su `--undo`.
+3. `projects list` mostró sólo `web-f452`, con las dos carpetas, su remoto y la línea de `app-3794` unido, con el comando que lo deshace.
+4. `memories list --here` desde la carpeta de `app` leyó las dos memorias bajo `web-f452`. Un save con el id `app-3794` quedó bajo `web-f452`.
+5. `projects rename app-3794` y `projects merge web-f452 --into app-3794` se rechazaron con salida 1, nombrando `web-f452`. `projects move --from-project app-3794` también, pero sólo con el código (`daemon returned 409: project_merged`); se arregló después, en `move_refused` (ver abajo).
+6. `projects merge --undo 1` devolvió la memoria a `app-3794` y sacó la copia de `workspace.md`, con el snapshot `pre-undo`. El save hecho con el id viejo después de la unión siguió en `web-f452`, y los dos proyectos volvieron a estar sin revisar, como antes de la unión. La carpeta que la unión había creado para la copia quedó vacía: se arregló en `3df68b1`, y el test la comprueba.
+7. `git clone app copia` y `projects add copia` dejaron la sugerencia `root_commit` entre `copia` y `app`, y la lista terminó con los dos comandos que la responden. Después de `projects keep-apart copia-59b1 app-67e3`, y de registrar `copia` otra vez, la sugerencia ya no se listó. Este paso se repitió en un segundo home, porque en el primero el guion no encontró `rg`.
+8. Con otro repositorio llamado `app` registrado, `doctor` dio `project_duplicates` `same_name` con el paso `clawg projects merge app-bdb6 --into app-3794 --dry-run --profile dev`, y `project_orphans` y `project_merges` en `ok`. El par `app` y `copia`, con el mismo primer commit, no apareció, porque estaba respondido `apart`. `doctor` salió con 1 por `path` `shadowed`: en el PATH de esa máquina hay otro `clawg.exe` antes que el de la prueba.
+
+`clawg stop` terminó el daemon con salida 0.
+
+### Lo que la verificación hizo cambiar
+
+- **`3df68b1`:** el `--undo` dejaba vacía la carpeta que la unión había creado para la copia de `workspace.md`. Ahora `drop_adopted` la borra cuando no tiene nada más. `undoing_a_merge_leaves_the_store_as_it_was` falló con esa aserción antes del arreglo.
+- **`move_refused`:** un movimiento rechazado con una causa en `detail` (`project_merged`, `part_of_merge`) ahora la muestra. `projects_are_merged_and_kept_apart_through_the_daemon` no compilaba sin la función.
+
+### CI
+
+Pendiente para el pull request final del cambio, como el de la entrega 1.
+
+### Lo que no se corrió
+
+- **Linux en local:** sólo se corrió en Windows. Lo cubre el CI del pull request final.
+- **El perfil dev:** no se tocó ningún perfil real.
+
+### Qué se vio fallar antes de cada cambio
+
+- **Tarea 11:** los tests de `merge.rs` y `a_database_from_the_previous_version_opens_with_every_project_live` no compilaban, porque faltaban `canonical` y `MAX_MERGE_HOPS`. `published_migration_checksums_are_pinned` falló con el checksum 0, y se fijó el que imprimió. Los `*.sql` van con `eol=lf` (`.gitattributes`), así que el checksum es el mismo en Windows y en Linux. Tres tests de `db.rs` que fijan cuántas migraciones hay (27) fallaron con V28, y pasaron a 28.
+- **Tarea 12:** los tests se escribieron antes que el código, pero no se corrieron antes porque no compilaban sin `merge_core`. Después del cambio se comprobó que atrapan un error, rompiendo dos reglas a propósito:
+  - con `MAX` en lugar de `MIN` en `synthesis_review`, falla `merging_moves_every_row_and_locator_into_the_target`;
+  - con `Span::Keep` en lugar de `Span::Carry`, falla `a_merge_moves_the_part_of_a_split_unit_it_holds`.
+- **Tarea 13:** los cuatro tests de `merge.rs` se corrieron antes del cambio y no compilaban: faltaban `undo_merge_core`, las variantes `UnknownMerge`, `Undone` y `MergedLater`, y los campos `kept` y `removed`.
+- **Tarea 14:** los cinco tests fallaban antes del cambio, por la aserción:
+  - el save quedaba bajo la lápida;
+  - el movimiento y su `--undo` llevaban la fila a la lápida;
+  - el registro, la lectura y el plan daban el id de la lápida;
+  - el import escribía bajo el proyecto que se unió entre el plan y la escritura. Para eso, el test usa un embedder que marca la lápida en su primera llamada.
+
+  La suite entera encontró un caso más: `export_reads_the_project_id_from_the_store` falló con `no such column: merged_into`. `project_id_of` (`clawg memories --here`, `clawg export --project`) lee sin migrar stores de versiones anteriores, donde `project` no tiene esa columna. Se arregló con una vista temporal `project` sin lápidas, como las que ese código ya les prestaba, y el test pasó a cubrir también un store en V27.
+- **Tarea 15:** antes del cambio fallaban:
+  - `a_move_from_a_merged_project_is_refused` y `the_move_of_a_merge_is_undone_only_with_its_merge`, con 200 en lugar de 409;
+  - `a_bridge_opened_before_a_merge_reads_and_writes_its_target`, porque la búsqueda con el id de la lápida no encontraba nada;
+  - `every_route_that_takes_a_project_follows_a_merge`, en `GET /memories`.
+
+  `every_route_says_which_project_it_takes` falló primero por un error del propio test: el fuente de `api.rs` llega con CRLF en Windows. El chequeo de `POST /context` se reescribió después del cambio, sin consulta, porque con el embedder falso los hits de una consulta puntúan 0 y el contexto los deja afuera. Por eso se comprobó aparte que atrapa el error: sacando por un momento `live_project` del handler, fallan ese test y el del puente.
+- **Tarea 16:** los tres tests no compilaban antes del cambio: faltaban `keep_apart`, `KeptApart`, `KeepApartError`, `ListedMerged` y el campo `merged`. Después, `a_merged_project_is_listed_under_its_target_and_frees_its_name` falló por su propio fixture, que armaba la unión sin la fila `tombstoned` del diario que una unión real escribe.
+- **Tarea 17:** antes del cambio, los tres tests de las rutas y el recorrido del router fallaban con 405, y `every_route_says_which_project_it_takes` fallaba porque la tabla nombraba dos rutas que `router()` todavía no tenía.
+- **Tarea 18:** los tests de `cli.rs` y `projects.rs` no compilaban antes del cambio: faltaban `ProjectsAction::Merge`, `KeepApart`, `MergeRequest` y `render_merge`. `projects_are_merged_and_kept_apart_through_the_daemon` se agregó después, para cubrir el cliente contra un daemon real, y no se corrió antes.
+- **Tarea 19:** los tests de `checks.rs` y de `inspect.rs` no compilaban antes del cambio: faltaban los tres chequeos, `RegistryRow`, `FolderPrint`, `IdRows` y los campos nuevos de `StoreFacts`.

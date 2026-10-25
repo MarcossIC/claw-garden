@@ -1,7 +1,7 @@
 change: project-locators
 objective: "2"
 depends_on: [project-registry, project-reassign, project-clone-identity]
-phase: apply  # entrega 2a: spec, diseño y tareas escritos; sigue la tarea 11
+phase: spec  # sigue la entrega 2b: spec, diseño y tareas por escribir
 release: "0.64.0"  # sin publicar; el cambio sale entero, con un solo pull request a main al final
 artifacts:
   exploration: done  # la de project-registry (89), en su archivo
@@ -9,12 +9,12 @@ artifacts:
   spec: partial  # entrega 1 (PL1 a PL10) y 2a (PL11 a PL20); las entregas 2b a 4 suman las suyas
   design: partial  # entrega 1 (D1 a D14) y 2a (D15 a D25: la lápida, canonical, el diario de la unión)
   tasks: partial  # entrega 1 (1 a 10) y 2a (11 a 21)
-  apply: partial  # entrega 1, en 0.64.0
-  verify: partial  # entrega 1: Windows y el binario en un home temporal; el CI, en el pull request final
+  apply: partial  # entregas 1 y 2a, en 0.64.0
+  verify: partial  # entregas 1 y 2a: Windows y el binario en un home temporal; el CI, en el pull request final
   archive: pending  # cuando cierre la entrega 4
 deliveries:
   "1": done  # el registro (V27); el CI de Linux y Windows se ve en el pull request final
-  "2a": tasks  # unir: merge con lápida y --undo, canonical(id), responder sugerencias, doctor (V28)
+  "2a": done  # unir (V28): merge con lápida y --undo, canonical(id), keep-apart, doctor; el CI, en el pull request final
   "2b": pending  # borrar: delete en dos etapas con --undo, purge --project-delete
   "3": pending  # proyectos sin carpeta y el agente
   "4": pending  # exportar e importar
