@@ -1091,6 +1091,7 @@ mod tests {
         assert!(undone.snapshot.as_deref().is_some_and(|s| s.contains("pre-undo")), "{:?}", undone.snapshot);
         assert!(undone.move_id.is_some(), "the rows went back as a move of their own");
         assert!(!f.workspace("agent-a", B).exists(), "the copy the merge made is gone");
+        assert!(!f.workspace("agent-a", B).parent().unwrap().exists(), "and the folder it made for it");
         assert_eq!(std::fs::read_to_string(f.workspace("agent-a", A)).unwrap(), source);
         assert_eq!(canonical(&f.store, A).await.unwrap(), A);
         assert_eq!(canonical(&f.store, C).await.unwrap(), A);

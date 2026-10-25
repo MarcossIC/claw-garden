@@ -163,6 +163,11 @@ impl WorkspaceManager {
             }
             if write {
                 tokio::fs::remove_file(&to).await.map_err(|source| MemoryError::WorkspaceIo { path: to.clone(), source })?;
+                // The folder the copy was made in, which a removal of a
+                // folder that still holds anything refuses.
+                if let Some(dir) = to.parent() {
+                    let _ = tokio::fs::remove_dir(dir).await;
+                }
             }
             dropped.removed.push(to);
         }
