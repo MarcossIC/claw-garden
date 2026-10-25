@@ -1940,10 +1940,10 @@ async fn import_memories(
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let store = &app.runtime.store;
     let imported = match foreign {
-        None => portability::import(store, embedder.as_deref(), &backups, &body.text, &options, &mut timings).await,
+        None => portability::import(store, embedder.as_deref(), &backups, &body.text, &options, Arc::new(Disk), &mut timings).await,
         Some(export) => {
             let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
-            portability::import_foreign(store, embedder.as_deref(), chunker, &backups, export, &options, &mut timings).await
+            portability::import_foreign(store, embedder.as_deref(), chunker, &backups, export, &options, Arc::new(Disk), &mut timings).await
         }
     };
     match imported {

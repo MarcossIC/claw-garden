@@ -41,8 +41,9 @@ use crate::memory::chunker::{embedding_text, ChatChunker};
 use crate::memory::clock::TimestampMs;
 use crate::memory::dedup::content_hash;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::identity::{origin_key, Disk};
-use crate::memory::project::plan_ids_in;
+use crate::memory::identity::{Ground, ReadAhead};
+use crate::memory::project::{plan_ids_in, RootPlan};
+use crate::memory::registry::project_name;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
 use crate::memory::portability::format::{parse, ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
@@ -224,22 +225,19 @@ struct ProjectHere {
     root_id: String,
     remote: Option<String>,
     project_id: String,
+    /// The first commit and the git stamp a registration records in its folder.
+    root_commit: Option<String>,
+    git_stamp: Option<String>,
 }
 
-/// The root here of every project line, with the key of its remote.
-fn roots_here(parsed: &Parsed, options: &ImportOptions) -> Vec<(PathBuf, Option<String>)> {
+/// The root here of every project line.
+fn roots_here(parsed: &Parsed, options: &ImportOptions) -> Vec<PathBuf> {
     parsed
         .projects
         .iter()
         .map(|(_, p)| {
-            let root = options
-                .map_roots
-                .iter()
-                .find(|(old, _)| *old == p.root_path)
-                .map(|(_, new)| new.clone())
-                .unwrap_or_else(|| p.root_path.clone());
-            let remote = origin_key(Path::new(&root));
-            (PathBuf::from(root), remote)
+            let root = options.map_roots.iter().find(|(old, _)| *old == p.root_path).map_or(&p.root_path, |(_, new)| new);
+            PathBuf::from(root)
         })
         .collect()
 }
@@ -265,17 +263,47 @@ where
     Ok(value)
 }
 
-/// The ids a registration of each root would give it now, in order.
+/// How many times [`plan`] runs on the connection at most: it asks for the
+/// checkouts first, then for the first commits no folder recorded, then
+/// whether the checkouts a root may have moved from are still there. A store
+/// that changed in between may ask again, and the last pass decides without.
+const PLAN_PASSES: usize = 4;
+
+/// What a registration of each root would give it now, in order. What the
+/// plan needs of `ground` is read on a blocking thread between passes, since
+/// a `git` on the connection's thread would hold every other call.
 async fn plan(
     store: &MemoryStore,
-    roots: &[(PathBuf, Option<String>)],
+    roots: &[PathBuf],
+    ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
-) -> Result<Vec<(String, String)>, ImportError> {
+) -> Result<Vec<RootPlan>, ImportError> {
     let (clock, mut timing) = (Instant::now(), Timing::new(Step::Plan));
-    let planned: Vec<PathBuf> = roots.iter().map(|(root, _)| root.clone()).collect();
-    let ids = timed(store, &mut timing, move |c| plan_ids_in(c, &planned, &Disk)).await?;
+    let (mut ahead, mut passes) = (ReadAhead::default(), 1);
+    let plans = loop {
+        let planned = roots.to_vec();
+        let (plans, asked) = timed(store, &mut timing, move |c| {
+            let plans = plan_ids_in(c, &planned, &ahead)?;
+            Ok((plans, ahead))
+        })
+        .await?;
+        if passes == PLAN_PASSES {
+            break plans;
+        }
+        let ground = ground.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let mut ahead = asked;
+            let any = ahead.read(&*ground);
+            (ahead, any)
+        });
+        // Nothing asked, or a read that failed: the pass decided without it.
+        let Ok((read, true)) = read.await else {
+            break plans;
+        };
+        (ahead, passes) = (read, passes + 1);
+    };
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
-    Ok(ids)
+    Ok(plans)
 }
 
 /// What the texts of a file are.
@@ -287,24 +315,20 @@ enum Texts {
     Notes(Vec<NoteRows>),
 }
 
-/// `roots` are the roots here of the file's projects, in order, and `ids`
+/// `roots` are the roots here of the file's projects, in order, and `plans`
 /// what [`plan`] gave them.
-fn prepare(
-    mut parsed: Parsed,
-    roots: &[(PathBuf, Option<String>)],
-    ids: &[(String, String)],
-    options: &ImportOptions,
-    texts: Texts,
-) -> Prepared {
+fn prepare(mut parsed: Parsed, roots: &[PathBuf], plans: &[RootPlan], options: &ImportOptions, texts: Texts) -> Prepared {
     let mut project_ids: HashMap<String, String> = HashMap::new();
     let mut projects = Vec::new();
-    for (((_, p), (root, remote)), (root_id, project_id)) in parsed.projects.iter().zip(roots).zip(ids) {
-        project_ids.insert(p.id.clone(), project_id.clone());
+    for (((_, p), root), plan) in parsed.projects.iter().zip(roots).zip(plans) {
+        project_ids.insert(p.id.clone(), plan.project_id.clone());
         projects.push(ProjectHere {
             root: root.to_string_lossy().into_owned(),
-            root_id: root_id.clone(),
-            remote: remote.clone(),
-            project_id: project_id.clone(),
+            root_id: plan.root_id.clone(),
+            remote: plan.remote.clone(),
+            project_id: plan.project_id.clone(),
+            root_commit: plan.root_commit.clone(),
+            git_stamp: plan.git_stamp.clone(),
         });
     }
     if let Texts::Raw = texts {
@@ -1182,7 +1206,8 @@ fn taken_projects<'p>(
     (taken, remotes)
 }
 
-/// Records each project, journaling the ones it adds, and returns
+/// Records each project's folder as a registration would, journaling the
+/// ones it adds, and the project itself when it is not here, and returns
 /// [`taken_projects`].
 fn record_projects(
     tx: &Transaction<'_>,
@@ -1199,12 +1224,21 @@ fn record_projects(
     }
     let (taken, remotes) = taken_projects(projects, &mut roots);
     for p in projects {
+        // A folder without its project would be read under its own id, which
+        // is another project when the plan followed a move.
         let added = tx.execute(
-            "INSERT OR IGNORE INTO project_path (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, 0)",
-            rusqlite::params![p.root_id, p.root, now],
+            "INSERT OR IGNORE INTO project_path (id, root_path, created_at, index_docs, project_id, remote, root_commit, git_stamp) \
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)",
+            rusqlite::params![p.root_id, p.root, now, p.project_id, p.remote, p.root_commit, p.git_stamp],
         )?;
         if added == 1 {
             journal.extra(tx, "project", None, &p.root_id, None)?;
+        }
+        if !taken.contains_key(&p.project_id) {
+            tx.execute(
+                "INSERT OR IGNORE INTO project (id, name, born, reviewed, created_at) VALUES (?1, ?2, 'import', 0, ?3)",
+                rusqlite::params![p.project_id, project_name(&p.project_id), now],
+            )?;
         }
     }
     for p in remotes {
@@ -1477,9 +1511,10 @@ pub async fn import(
     backups: &Path,
     text: &str,
     options: &ImportOptions,
+    ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
-    let prepared = prepare_file(store, text, options, timings).await?;
+    let prepared = prepare_file(store, text, options, ground, timings).await?;
     let written = write(store, embedder, backups, &prepared, options.dry_run, "clawg", timings).await?;
     Ok(report(&prepared, &written, options.dry_run))
 }
@@ -1489,15 +1524,16 @@ async fn prepare_file(
     store: &MemoryStore,
     text: &str,
     options: &ImportOptions,
+    ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<Arc<Prepared>, ImportError> {
     let clock = Instant::now();
     let (_, parsed) = parse(text)?;
     let roots = roots_here(&parsed, options);
     let parsing = clock.elapsed();
-    let ids = plan(store, &roots, timings).await?;
+    let plans = plan(store, &roots, ground, timings).await?;
     let clock = Instant::now();
-    let prepared = prepare(parsed, &roots, &ids, options, Texts::Raw);
+    let prepared = prepare(parsed, &roots, &plans, options, Texts::Raw);
     timings.record(Timing {
         elapsed: parsing + clock.elapsed(),
         rows: Some(prepared.rows.len()),
@@ -1518,10 +1554,11 @@ pub async fn import_foreign(
     backups: &Path,
     export: ForeignExport,
     options: &ImportOptions,
+    ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
     let source = export.source;
-    let (prepared, foreign) = prepare_export(store, chunker, export, options, timings).await?;
+    let (prepared, foreign) = prepare_export(store, chunker, export, options, ground, timings).await?;
     let written = write(store, embedder, backups, &prepared, options.dry_run, source, timings).await?;
     Ok(with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger))
 }
@@ -1533,16 +1570,16 @@ async fn prepare_export(
     chunker: Arc<ChatChunker>,
     export: ForeignExport,
     options: &ImportOptions,
+    ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<(Arc<Prepared>, ForeignReport), ImportError> {
     // Planned before the translation, which tells keys apart by the project
     // each note goes to here.
     let mut seen = HashSet::new();
     let mapped: Vec<&str> = options.project_map.iter().map(|(_, root)| root.as_str()).filter(|root| seen.insert(*root)).collect();
-    let roots: Vec<(PathBuf, Option<String>)> =
-        mapped.iter().map(|root| (PathBuf::from(root), origin_key(Path::new(root)))).collect();
-    let ids = plan(store, &roots, timings).await?;
-    let project_of: HashMap<&str, &str> = mapped.iter().copied().zip(ids.iter().map(|(_, project_id)| project_id.as_str())).collect();
+    let roots: Vec<PathBuf> = mapped.iter().map(PathBuf::from).collect();
+    let plans = plan(store, &roots, ground, timings).await?;
+    let project_of: HashMap<&str, &str> = mapped.iter().copied().zip(plans.iter().map(|plan| plan.project_id.as_str())).collect();
     let translate_options = TranslateOptions {
         agent: options.agent.clone().unwrap_or_else(|| MIGRATED_AGENT.to_owned()),
         project_map: options
@@ -1557,7 +1594,7 @@ async fn prepare_export(
     // requests should not wait behind.
     let (prepared, foreign) = tokio::task::spawn_blocking(move || {
         let Translated { parsed, notes, report } = translate(&export, &translate_options, &chunker, now);
-        (prepare(parsed, &roots, &ids, &ImportOptions::default(), Texts::Notes(notes)), report)
+        (prepare(parsed, &roots, &plans, &ImportOptions::default(), Texts::Notes(notes)), report)
     })
     .await
     .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
@@ -1818,7 +1855,8 @@ pub(crate) mod tests {
     use crate::memory::embedder::FakeEmbedder;
     use crate::memory::events::{MemoryEvent, MemorySource};
     use crate::memory::portability::export::{read, Export, ExportFilter};
-    use crate::memory::portability::fixtures::{other_project, project, seed, ROOT};
+    use crate::memory::identity::{Disk, FakeGround, RootCommit};
+    use crate::memory::portability::fixtures::{other_project, project, seed, OTHER_ROOT, ROOT};
     use crate::memory::portability::foreign::{ForeignNote, ForeignRelation, NoteKind, When};
     use crate::memory::portability::format::tests::EXAMPLE;
     use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note, T0};
@@ -1874,8 +1912,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn run(store: &MemoryStore, text: &str, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+        run_on(store, text, options, Arc::new(Disk)).await
+    }
+
+    /// [`run`] with what `ground` finds at each root.
+    async fn run_on(store: &MemoryStore, text: &str, options: ImportOptions, ground: Arc<dyn Ground>) -> (ImportReport, tempfile::TempDir) {
         let backups = tempfile::tempdir().unwrap();
-        let report = import(store, Some(&FakeEmbedder::default()), backups.path(), text, &options, &mut ImportTimings::new(false)).await.unwrap();
+        let report = import(store, Some(&FakeEmbedder::default()), backups.path(), text, &options, ground, &mut ImportTimings::new(false))
+            .await
+            .unwrap();
         (report, backups)
     }
 
@@ -2039,7 +2084,7 @@ pub(crate) mod tests {
         let file = seeded_file().await.replacen("\"version\":1", "\"version\":2", 1);
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
-        let err = import(&dst, Some(&FakeEmbedder::default()), backups.path(), &file, &ImportOptions::default(), &mut ImportTimings::new(false)).await.unwrap_err();
+        let err = import(&dst, Some(&FakeEmbedder::default()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::Format(FormatError::UnknownVersion(2))), "{err}");
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert!(files_in(backups.path()).is_empty());
@@ -2052,7 +2097,7 @@ pub(crate) mod tests {
         let backups = tempfile::tempdir().unwrap();
         let sequence = "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'memory'), 0)";
         let before = count(&dst, sequence).await;
-        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, &mut ImportTimings::new(false)).await.unwrap();
+        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert_eq!(count(&dst, "SELECT count(*) FROM project_path").await, 0);
         assert_eq!(count(&dst, "SELECT count(*) FROM project_remote").await, 0);
@@ -2112,7 +2157,7 @@ pub(crate) mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
-        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, &mut ImportTimings::new(false)).await.unwrap();
+        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert_eq!(dry.import_id, None);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_import").await, 0);
         let (first, _) = run(&dst, &file, ImportOptions::default()).await;
@@ -2126,7 +2171,7 @@ pub(crate) mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
-        let err = import(&dst, None, backups.path(), &file, &ImportOptions::default(), &mut ImportTimings::new(false)).await.unwrap_err();
+        let err = import(&dst, None, backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::NoEmbedder));
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert!(files_in(backups.path()).is_empty());
@@ -2312,6 +2357,126 @@ pub(crate) mod tests {
         assert_eq!(report.by_project.get("app-1a2b"), Some(&13), "{:?}", report.by_project);
     }
 
+    /// A folder as `project_path` holds it: root, id, project, remote, first
+    /// commit and git stamp.
+    type FolderRow = (String, String, Option<String>, Option<String>, Option<String>, Option<String>);
+
+    #[tokio::test]
+    async fn an_import_records_its_folders_as_a_registration_would() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        let (old, other) = (crate::memory::identity::derive_project_id(Path::new("/old/repo")), other_project());
+        let (recorded, renamed_from) = (old.clone(), other.clone());
+        dst.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO project_path (id, root_path, created_at, project_id, root_commit, git_stamp) \
+                     VALUES (?1, '/old/repo', 0, ?1, 'c1', 's1')",
+                    [&recorded],
+                )?;
+                c.execute(
+                    "INSERT INTO project_path (id, root_path, created_at, project_id, remote, root_commit, git_stamp) \
+                     VALUES (?1, ?2, 0, ?1, 'github.com/acme/old-other', 'c2', 's2')",
+                    rusqlite::params![renamed_from, OTHER_ROOT],
+                )?;
+                c.execute(
+                    "INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/old-other', ?1, 0)",
+                    [&renamed_from],
+                )?;
+                c.execute(
+                    "INSERT INTO project (id, name, born, created_at) VALUES (?1, ?1, 'root', 0), (?2, ?2, 'root', 0)",
+                    [&recorded, &renamed_from],
+                )
+            })
+            .await
+            .unwrap();
+        // The checkout recorded at /old/repo is now at the file's root, and
+        // the other root holds a clone of its remote under a new name.
+        let ground = Arc::new(FakeGround::default());
+        ground.put(Path::new(ROOT), None, Some("s1"), RootCommit::Known("c1".into()));
+        ground.put(Path::new(OTHER_ROOT), Some("github.com/acme/other"), Some("s3"), RootCommit::Known("c2".into()));
+
+        let (report, _) = run_on(&dst, &file, ImportOptions::default(), ground).await;
+
+        let renamed = crate::memory::identity::candidate_id(Path::new(OTHER_ROOT), 1);
+        assert_eq!(report.by_project.get(&old), Some(&13), "the moved checkout keeps its project: {:?}", report.by_project);
+        assert_eq!(report.by_project.get(&renamed), Some(&1), "{:?}", report.by_project);
+        let s = |v: &str| Some(v.to_string());
+        let (folders, remotes, mut projects, suggested) = dst
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT root_path, id, project_id, remote, root_commit, git_stamp FROM project_path ORDER BY root_path, created_at",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
+                let folders = rows.collect::<rusqlite::Result<Vec<FolderRow>>>()?;
+                let mut stmt = c.prepare("SELECT remote, project_id FROM project_remote ORDER BY remote")?;
+                let remotes = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+                let mut stmt = c.prepare("SELECT id, born FROM project")?;
+                let projects = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+                let suggested: i64 = c.query_row("SELECT COUNT(*) FROM project_suggestion", [], |r| r.get(0))?;
+                Ok::<_, rusqlite::Error>((folders, remotes, projects, suggested))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            folders,
+            vec![
+                ("/old/repo".into(), old.clone(), s(&old), None, s("c1"), s("s1")),
+                (OTHER_ROOT.into(), other.clone(), s(&other), s("github.com/acme/old-other"), s("c2"), s("s2")),
+                (OTHER_ROOT.into(), renamed.clone(), s(&renamed), s("github.com/acme/other"), s("c2"), s("s3")),
+                (ROOT.into(), project(), s(&old), None, s("c1"), s("s1")),
+            ],
+            "each folder records its project and fingerprints"
+        );
+        assert_eq!(
+            remotes,
+            vec![("github.com/acme/old-other".into(), other.clone()), ("github.com/acme/other".into(), renamed.clone())]
+        );
+        projects.sort();
+        let mut expected = vec![(old, "root".to_string()), (other, "root".into()), (renamed, "import".into())];
+        expected.sort();
+        assert_eq!(projects, expected, "the project the import made is born of it");
+        assert_eq!(suggested, 0, "an import suggests nothing");
+    }
+
+    /// A disk that notes the thread each first commit is read on.
+    #[derive(Default)]
+    struct Watched {
+        disk: FakeGround,
+        threads: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+    }
+
+    impl Ground for Watched {
+        fn checkout(&self, root: &Path) -> crate::memory::identity::Checkout {
+            self.disk.checkout(root)
+        }
+
+        fn root_commit(&self, root: &Path) -> RootCommit {
+            self.threads.lock().unwrap().push(std::thread::current().id());
+            self.disk.root_commit(root)
+        }
+
+        fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
+            self.disk.recorded_checkout_present(path, stamp)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_import_reads_the_first_commit_off_the_store_s_thread() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        let ground = Arc::new(Watched::default());
+        ground.disk.put(Path::new(ROOT), None, Some("s1"), RootCommit::Known("c1".into()));
+
+        run_on(&dst, &file, ImportOptions::default(), ground.clone()).await;
+
+        let store_thread = dst.conn.call(|_| Ok::<_, rusqlite::Error>(std::thread::current().id())).await.unwrap();
+        let threads = ground.threads.lock().unwrap();
+        assert_eq!(threads.len(), 1, "the first commit is read once");
+        assert_ne!(threads[0], store_thread, "a `git` on the store's thread would hold every other call");
+    }
+
     #[tokio::test]
     async fn a_live_twin_absorbs_the_imported_row() {
         let file = seeded_file().await;
@@ -2402,7 +2567,7 @@ pub(crate) mod tests {
         let backups = tempfile::tempdir().unwrap();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let report =
-            import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options, &mut ImportTimings::new(false)).await.unwrap();
+            import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         (report, backups)
     }
 
@@ -2578,7 +2743,7 @@ pub(crate) mod tests {
         let backups = tempfile::tempdir().unwrap();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let dry_run = ImportOptions { dry_run: true, ..Default::default() };
-        let dry = import_foreign(&dst, None, chunker, backups.path(), foreign_export(notes.clone()), &dry_run, &mut ImportTimings::new(false)).await.unwrap();
+        let dry = import_foreign(&dst, None, chunker, backups.path(), foreign_export(notes.clone()), &dry_run, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert!(files_in(backups.path()).is_empty());
         let (report, _) = run_foreign(&dst, notes, ImportOptions::default()).await;
         assert_eq!(ImportReport { dry_run: false, snapshot: report.snapshot.clone(), import_id: report.import_id, ..dry }, report);
@@ -3175,11 +3340,11 @@ pub(crate) mod tests {
     }
 
     async fn file_of(store: &MemoryStore, text: &str, options: ImportOptions) -> Arc<Prepared> {
-        prepare_file(store, text, &options, &mut ImportTimings::new(false)).await.unwrap()
+        prepare_file(store, text, &options, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap()
     }
 
     async fn notes_of(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> Arc<Prepared> {
-        prepare_export(store, Arc::new(ChatChunker::with_fallback()), foreign_export(notes), &options, &mut ImportTimings::new(false)).await.unwrap().0
+        prepare_export(store, Arc::new(ChatChunker::with_fallback()), foreign_export(notes), &options, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap().0
     }
 
     /// What the pass that decided on the connection made of `prepared`: the
@@ -3335,7 +3500,7 @@ pub(crate) mod tests {
         let purged = insert_row(&dst, "claude-code", None, "A row purged since", None, 6).await;
         dst.conn.call(move |c| c.execute("DELETE FROM memory WHERE id = ?1", [purged])).await.unwrap();
         let backups = tempfile::tempdir().unwrap();
-        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, &mut ImportTimings::new(false)).await.unwrap();
+        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert!(dry.topic_taken.iter().all(|t| t.stored_as > purged) && !dry.topic_taken.is_empty(), "{dry:#?}");
         let (real, _) = run(&dst, &file, ImportOptions::default()).await;
         assert_eq!(ImportReport { dry_run: false, snapshot: real.snapshot.clone(), import_id: real.import_id, ..dry }, real);
@@ -3355,7 +3520,7 @@ pub(crate) mod tests {
         let options = ImportOptions { dry_run, ..Default::default() };
         let mut timings = ImportTimings::new(dry_run);
         let export = foreign_export(notes);
-        let report = import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options, &mut timings)
+        let report = import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options, Arc::new(Disk), &mut timings)
             .await
             .unwrap();
         (report, timings)
@@ -3365,7 +3530,7 @@ pub(crate) mod tests {
         let backups = tempfile::tempdir().unwrap();
         let mut timings = ImportTimings::new(false);
         let report =
-            import(store, Some(&FakeEmbedder::default()), backups.path(), file, &ImportOptions::default(), &mut timings)
+            import(store, Some(&FakeEmbedder::default()), backups.path(), file, &ImportOptions::default(), Arc::new(Disk), &mut timings)
                 .await
                 .unwrap();
         (report, timings)
@@ -3549,7 +3714,7 @@ pub(crate) mod tests {
         let export = engram::read(&std::fs::read_to_string(path("CLAWG_IMPORT_EXPORT")).unwrap()).unwrap();
         let store = MemoryStore::new_for_test().await.unwrap();
         let chunker = Arc::new(ChatChunker::with_tokenizer(tokenizer.clone()));
-        let (prepared, _) = prepare_export(&store, chunker, export, &ImportOptions::default(), &mut ImportTimings::new(true)).await.unwrap();
+        let (prepared, _) = prepare_export(&store, chunker, export, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(true)).await.unwrap();
         let planned = load(&store, &prepared, &mut Timing::new(Step::Load)).await.unwrap();
         let decided = decide(planned, &prepared, &AtomicBool::new(false)).unwrap();
         let rows = rows_to_embed(&prepared, &decided);

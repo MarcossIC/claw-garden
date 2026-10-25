@@ -495,15 +495,27 @@ fn settle_in(
 /// without writing: the one a registration with assigned ids would give it,
 /// from what `ground` finds at the root.
 pub fn project_id_in(c: &Connection, root: &Path, ground: &dyn Ground) -> rusqlite::Result<String> {
-    Ok(plan_ids_in(c, &[root.to_path_buf()], ground)?.remove(0).1)
+    Ok(plan_ids_in(c, &[root.to_path_buf()], ground)?.remove(0).project_id)
 }
 
-/// The ids each of `roots` would get, as [`register_project`] gives them,
-/// from what `ground` finds at each, read without writing: a root later in
-/// the list never takes an id or a remote an earlier one was given, and
-/// settles as if the earlier ones were written, fingerprints included. Each
-/// answer is `(root id, project id)`.
-pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground) -> rusqlite::Result<Vec<(String, String)>> {
+/// What a registration with assigned ids would give a root ([`plan_ids_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootPlan {
+    pub(crate) root_id: String,
+    pub(crate) project_id: String,
+    /// The key of the root's remote, which is bound to `project_id` and is
+    /// the remote of a new folder.
+    pub(crate) remote: Option<String>,
+    /// The first commit and the git stamp the root's folder records.
+    pub(crate) root_commit: Option<String>,
+    pub(crate) git_stamp: Option<String>,
+}
+
+/// What each of `roots` would get, as [`register_project`] gives it, from
+/// what `ground` finds at each, read without writing: a root later in the
+/// list never takes an id or a remote an earlier one was given, and settles
+/// as if the earlier ones were written, fingerprints included.
+pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground) -> rusqlite::Result<Vec<RootPlan>> {
     let mut pending = Pending::default();
     let mut out = Vec::new();
     for root in roots {
@@ -540,13 +552,15 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground
             }
             None => shared.unwrap_or_else(|| root_id.clone()),
         };
-        if let Some(key) = checkout.key {
-            pending.remotes.entry(key).or_insert_with(|| project_id.clone());
+        if let Some(key) = &checkout.key {
+            pending.remotes.entry(key.clone()).or_insert_with(|| project_id.clone());
         }
-        if let Some(settled) = &settled {
-            pending.write(root, settled.written(Some(&project_id)));
+        let written = settled.map(|settled| settled.written(Some(&project_id)));
+        let (root_commit, git_stamp) = written.as_ref().map_or((None, None), |f| (f.root_commit.clone(), f.git_stamp.clone()));
+        if let Some(folder) = written {
+            pending.write(root, folder);
         }
-        out.push((root_id, project_id));
+        out.push(RootPlan { root_id, project_id, remote: checkout.key, root_commit, git_stamp });
     }
     Ok(out)
 }
@@ -1466,7 +1480,7 @@ mod tests {
             .call(move |c| {
                 let read = project_id_in(c, path, &*ground)?;
                 let planned = plan_ids_in(c, &[path.to_path_buf(), path.to_path_buf()], &*ground)?;
-                Ok::<_, rusqlite::Error>((read, planned))
+                Ok::<_, rusqlite::Error>((read, planned.into_iter().map(|p| (p.root_id, p.project_id)).collect::<Vec<_>>()))
             })
             .await
             .unwrap();
@@ -1943,7 +1957,7 @@ mod tests {
             .call(move |c| {
                 let read = project_id_in(c, new, &*ground)?;
                 let planned = plan_ids_in(c, &[new.to_path_buf(), copy.to_path_buf()], &*ground)?;
-                Ok::<_, rusqlite::Error>((read, planned))
+                Ok::<_, rusqlite::Error>((read, planned.into_iter().map(|p| (p.root_id, p.project_id)).collect::<Vec<_>>()))
             })
             .await
             .unwrap();

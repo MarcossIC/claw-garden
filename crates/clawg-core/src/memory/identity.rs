@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -361,6 +363,88 @@ impl Ground for Disk {
 
     fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
         path.exists() && git_stamp(path).as_deref() == stamp
+    }
+}
+
+/// What was read of a disk before a plan ran, so that the plan decides on
+/// the store's connection without reading there: a `git` of up to
+/// [`ROOT_COMMIT_WAIT`] would hold every other call behind it. Asked what it
+/// does not hold, it answers as a decision without it is taken (no remote
+/// and no git directory, a first commit not read, a recorded checkout still
+/// there) and keeps the question, which [`ReadAhead::read`] answers before
+/// the plan runs again.
+#[derive(Default)]
+pub(crate) struct ReadAhead {
+    checkouts: HashMap<PathBuf, Checkout>,
+    commits: HashMap<PathBuf, RootCommit>,
+    present: HashMap<(PathBuf, Option<String>), bool>,
+    asked: Mutex<Asked>,
+}
+
+/// What a [`ReadAhead`] was asked and did not hold.
+#[derive(Default)]
+struct Asked {
+    checkouts: Vec<PathBuf>,
+    commits: Vec<PathBuf>,
+    present: Vec<(PathBuf, Option<String>)>,
+}
+
+impl ReadAhead {
+    /// Reads from `ground` what it was asked since the last read, and
+    /// whether it was asked anything.
+    pub(crate) fn read(&mut self, ground: &dyn Ground) -> bool {
+        let asked = std::mem::take(self.asked.get_mut().unwrap_or_else(|e| e.into_inner()));
+        let any = !(asked.checkouts.is_empty() && asked.commits.is_empty() && asked.present.is_empty());
+        for root in asked.checkouts {
+            let checkout = ground.checkout(&root);
+            self.checkouts.insert(root, checkout);
+        }
+        for root in asked.commits {
+            let commit = ground.root_commit(&root);
+            self.commits.insert(root, commit);
+        }
+        for (path, stamp) in asked.present {
+            let present = ground.recorded_checkout_present(&path, stamp.as_deref());
+            self.present.insert((path, stamp), present);
+        }
+        any
+    }
+
+    fn ask(&self, f: impl FnOnce(&mut Asked)) {
+        f(&mut self.asked.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+}
+
+impl Ground for ReadAhead {
+    fn checkout(&self, root: &Path) -> Checkout {
+        if let Some(checkout) = self.checkouts.get(root) {
+            return checkout.clone();
+        }
+        self.ask(|a| push_new(&mut a.checkouts, root.to_path_buf()));
+        Checkout::default()
+    }
+
+    fn root_commit(&self, root: &Path) -> RootCommit {
+        if let Some(commit) = self.commits.get(root) {
+            return commit.clone();
+        }
+        self.ask(|a| push_new(&mut a.commits, root.to_path_buf()));
+        RootCommit::Later
+    }
+
+    fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
+        let recorded = (path.to_path_buf(), stamp.map(str::to_string));
+        if let Some(present) = self.present.get(&recorded) {
+            return *present;
+        }
+        self.ask(|a| push_new(&mut a.present, recorded));
+        true
+    }
+}
+
+fn push_new<T: PartialEq>(list: &mut Vec<T>, item: T) {
+    if !list.contains(&item) {
+        list.push(item);
     }
 }
 
