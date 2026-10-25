@@ -446,6 +446,20 @@ pub async fn move_memories(lang: Lang, client: &DaemonClient, opts: &MoveOpts, c
     Ok(render_move(lang, &report))
 }
 
+/// What `clawg projects move` prints when the daemon refused it with a cause
+/// of its own beside the code (`project_merged`, `part_of_merge`); `None`
+/// otherwise, the refusal's message being that cause already.
+pub fn move_refused(lang: Lang, err: &ClientError) -> Option<String> {
+    let ClientError::Daemon { status: 409, details, .. } = err else {
+        return None;
+    };
+    let cause = details.detail.as_deref()?;
+    Some(match lang {
+        Lang::En => format!("could not move: {cause}"),
+        Lang::Es => format!("no se pudo mover: {cause}"),
+    })
+}
+
 /// Where a memory moves to, with the preposition Spanish fuses with it.
 fn place(lang: Lang, project: &Option<String>) -> String {
     match (project, lang) {
@@ -866,6 +880,20 @@ mod tests {
         let merged = merge(Lang::En, &c, &opts(&a, &b)).await.expect("merge");
         assert!(merged.starts_with(&format!("merged {a} into {b}: 0 memories\n")), "{merged}");
         assert!(merged.ends_with("`clawg projects merge --undo 1` takes it back"), "{merged}");
+
+        let from_tombstone = ["clawg", "projects", "move", "--from-project", a.as_str(), "--to-none"];
+        let moving = match <crate::cli::Cli as clap::Parser>::try_parse_from(from_tombstone).expect("parse").command {
+            crate::cli::Command::Projects { action: crate::cli::ProjectsAction::Move(opts) } => opts,
+            other => panic!("{other:?}"),
+        };
+        let AddError::Client(stopped) = move_memories(Lang::En, &c, &moving, one.path()).await.expect_err("from a tombstone") else {
+            panic!("a refusal of the daemon");
+        };
+        assert_eq!(
+            move_refused(Lang::En, &stopped),
+            Some(format!("could not move: project {a} was merged into {b}: its memories are there now")),
+            "the daemon's cause, not only its code"
+        );
 
         let refused = merge(Lang::Es, &c, &opts(&b, &a)).await.expect_err("into a tombstone");
         let said = merge_refused(Lang::Es, &refused).expect("a refusal");

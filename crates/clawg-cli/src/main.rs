@@ -417,7 +417,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             };
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
             let moved = projects::move_memories(lang, &client, &opts, &cwd).await.map_err(|e| match e {
-                projects::AddError::Client(e) => unavailable(e),
+                projects::AddError::Client(e) => projects::move_refused(lang, &e).unwrap_or_else(|| unavailable(e)),
                 other => other.to_string(),
             })?;
             println!("{moved}");
