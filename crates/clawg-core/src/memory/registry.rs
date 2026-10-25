@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::memory::identity::Ground;
 use crate::memory::project::is_project_id;
@@ -32,7 +32,7 @@ pub(crate) fn project_name(id: &str) -> &str {
 pub const MAX_NAME_CHARS: usize = 80;
 
 /// A project as `project` holds it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -48,7 +48,7 @@ fn project_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 }
 
 /// A folder of this machine that leads to a project.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListedFolder {
     pub root_id: String,
     pub root_path: String,
@@ -59,7 +59,7 @@ pub struct ListedFolder {
 }
 
 /// A suggestion nobody answered yet that a project may be the same as another.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListedSuggestion {
     pub other_id: String,
     /// The other's name, when it is still a project.
@@ -69,7 +69,7 @@ pub struct ListedSuggestion {
 }
 
 /// A project with what leads to it and what it holds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListedProject {
     #[serde(flatten)]
     pub project: Project,

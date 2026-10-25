@@ -1,14 +1,16 @@
+//! `clawg projects list`: every project, with what leads to it.
+//! `clawg projects rename`: name a project and mark it reviewed.
 //! `clawg projects add`: let the daemon read a project's files.
 //! `clawg projects move`: move memories to another project, or out of every
 //! project.
 //!
 //! A bridge only has its own root indexed; any other root the model names is
-//! a label for memories. This command is how the user, not the model, adds
-//! one. Registering and moving go through the running daemon, which owns the
-//! store.
+//! a label for memories. `add` is how the user, not the model, adds one.
+//! Everything goes through the running daemon, which owns the store.
 
 use std::path::{Path, PathBuf};
 
+use clawg_core::memory::registry::{ListedProject, ListedSuggestion};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::preferences::Lang;
@@ -22,6 +24,136 @@ pub enum AddError {
     NotADirectory(PathBuf),
     #[error(transparent)]
     Client(#[from] ClientError),
+}
+
+/// Every project the daemon has, as [`render_list`] prints it.
+pub async fn list(lang: Lang, client: &DaemonClient) -> Result<String, ClientError> {
+    Ok(render_list(lang, &client.list_projects().await?))
+}
+
+/// Names project `id` and marks it reviewed, and says so.
+pub async fn rename(lang: Lang, client: &DaemonClient, id: &str, name: &str) -> Result<String, ClientError> {
+    let project = client.rename_project(id, name).await?;
+    let (id, name) = (project.id, project.name);
+    Ok(match lang {
+        Lang::En => format!("project {id} is now named \"{name}\""),
+        Lang::Es => format!("el proyecto {id} ahora se llama \"{name}\""),
+    })
+}
+
+/// What `clawg projects rename` prints when the daemon refused the name or
+/// does not know the project, with the daemon's own sentence as it came;
+/// `None` for any other failure.
+pub fn rename_refused(lang: Lang, id: &str, err: &ClientError) -> Option<String> {
+    let ClientError::Daemon { status: 400 | 404 | 409, message, details } = err else {
+        return None;
+    };
+    let cause = details.detail.as_deref().unwrap_or(message);
+    Some(match lang {
+        Lang::En => format!("could not rename {id}: {cause}"),
+        Lang::Es => format!("no se pudo renombrar {id}: {cause}"),
+    })
+}
+
+/// How a project nobody reviewed started.
+fn born(lang: Lang, born: &str) -> &str {
+    match (born, lang) {
+        ("root", Lang::En) => "registered from a folder",
+        ("root", Lang::Es) => "registrado desde una carpeta",
+        ("adopted", Lang::En) => "adopted from a memory saved under its id",
+        ("adopted", Lang::Es) => "adoptado de una memoria guardada con su id",
+        ("import", Lang::En) => "created by an import",
+        ("import", Lang::Es) => "creado por un import",
+        ("migrated", Lang::En) => "from before projects",
+        ("migrated", Lang::Es) => "de antes de los proyectos",
+        (other, _) => other,
+    }
+}
+
+/// Why two projects may be one.
+fn reason(lang: Lang, suggestion: &ListedSuggestion) -> &str {
+    match (suggestion.reason.as_str(), lang) {
+        ("root_commit", Lang::En) => "they share their first commit",
+        ("root_commit", Lang::Es) => "comparten el primer commit",
+        ("remote_changed", Lang::En) => "the remote of one folder changed",
+        ("remote_changed", Lang::Es) => "cambió el remoto de una carpeta",
+        (other, _) => other,
+    }
+}
+
+/// What `clawg projects list` prints: each project with how many memories it
+/// holds and, when nobody reviewed it, what it started from; then its
+/// folders, marking those no longer there, its remotes and the suggestions
+/// nobody answered.
+pub fn render_list(lang: Lang, projects: &[ListedProject]) -> String {
+    if projects.is_empty() {
+        return match lang {
+            Lang::En => "no projects yet",
+            Lang::Es => "todavía no hay proyectos",
+        }
+        .to_string();
+    }
+    let mut lines = Vec::new();
+    for p in projects {
+        let (name, id, n) = (&p.project.name, &p.project.id, p.memories);
+        let memories = match (n == 1, lang) {
+            (true, Lang::En) => "1 memory".to_string(),
+            (false, Lang::En) => format!("{n} memories"),
+            (true, Lang::Es) => "1 memoria".to_string(),
+            (false, Lang::Es) => format!("{n} memorias"),
+        };
+        let born = born(lang, &p.project.born);
+        lines.push(match (p.project.reviewed, lang) {
+            (true, _) => format!("{name} ({id}): {memories}"),
+            (false, Lang::En) => format!("{name} ({id}): {memories}, not reviewed: {born}"),
+            (false, Lang::Es) => format!("{name} ({id}): {memories}, sin revisar: {born}"),
+        });
+        if p.folders.is_empty() {
+            lines.push(
+                match lang {
+                    Lang::En => "  no folder",
+                    Lang::Es => "  sin carpeta",
+                }
+                .to_string(),
+            );
+        }
+        for folder in &p.folders {
+            let path = &folder.root_path;
+            lines.push(match (folder.present, lang) {
+                (true, Lang::En) => format!("  folder {path}"),
+                (false, Lang::En) => format!("  folder {path}, no longer there"),
+                (true, Lang::Es) => format!("  carpeta {path}"),
+                (false, Lang::Es) => format!("  carpeta {path}, ya no está"),
+            });
+        }
+        for remote in &p.remotes {
+            lines.push(match lang {
+                Lang::En => format!("  remote {remote}"),
+                Lang::Es => format!("  remoto {remote}"),
+            });
+        }
+        for suggestion in &p.suggestions {
+            let other = match &suggestion.other_name {
+                Some(name) => format!("{name} ({})", suggestion.other_id),
+                None => suggestion.other_id.clone(),
+            };
+            let why = reason(lang, suggestion);
+            lines.push(match lang {
+                Lang::En => format!("  may be the same project as {other}: {why}"),
+                Lang::Es => format!("  puede ser el mismo proyecto que {other}: {why}"),
+            });
+        }
+    }
+    if projects.iter().any(|p| !p.project.reviewed || !p.suggestions.is_empty()) {
+        lines.push(
+            match lang {
+                Lang::En => "`clawg projects rename <ID> <NAME>` names a project and marks it reviewed",
+                Lang::Es => "`clawg projects rename <ID> <NOMBRE>` le pone nombre a un proyecto y lo marca revisado",
+            }
+            .to_string(),
+        );
+    }
+    lines.join("\n")
 }
 
 /// Registers the project `path` is in so the daemon may read its files, and
@@ -245,6 +377,88 @@ mod tests {
              este es el movimiento 3; `clawg projects move --undo 3` lo deshace"
         );
         assert_eq!(render_move(Lang::Es, &MoveReport { dry_run: true, ..MoveReport::default() }), "no se movería nada");
+    }
+
+    fn listing() -> Vec<ListedProject> {
+        let folder = |path: &str, present: bool| {
+            serde_json::json!({ "root_id": "x-0000", "root_path": path, "remote": null, "index_docs": false, "present": present })
+        };
+        let suggestion = |id: &str, name: &str| {
+            serde_json::json!({ "other_id": id, "other_name": name, "reason": "root_commit", "created_at": 1 })
+        };
+        serde_json::from_value(serde_json::json!([
+            {
+                "id": "app-1a2b", "name": "App web", "born": "root", "reviewed": true, "created_at": 1,
+                "folders": [folder("/work/app", true), folder("/work/app-old", false)],
+                "remotes": ["github.com/acme/app"], "memories": 12,
+                "suggestions": [suggestion("copia-3c4d", "copia")],
+            },
+            {
+                "id": "copia-3c4d", "name": "copia", "born": "root", "reviewed": false, "created_at": 2,
+                "folders": [folder("/work/copia", true)], "remotes": [], "memories": 0,
+                "suggestions": [suggestion("app-1a2b", "App web")],
+            },
+            {
+                "id": "loose-1a2b", "name": "loose", "born": "adopted", "reviewed": false, "created_at": 3,
+                "folders": [], "remotes": [], "memories": 1, "suggestions": [],
+            },
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_listing_marks_what_was_created_alone_and_the_suggestions() {
+        assert_eq!(
+            render_list(Lang::En, &listing()),
+            "App web (app-1a2b): 12 memories\n\
+             \x20 folder /work/app\n\
+             \x20 folder /work/app-old, no longer there\n\
+             \x20 remote github.com/acme/app\n\
+             \x20 may be the same project as copia (copia-3c4d): they share their first commit\n\
+             copia (copia-3c4d): 0 memories, not reviewed: registered from a folder\n\
+             \x20 folder /work/copia\n\
+             \x20 may be the same project as App web (app-1a2b): they share their first commit\n\
+             loose (loose-1a2b): 1 memory, not reviewed: adopted from a memory saved under its id\n\
+             \x20 no folder\n\
+             `clawg projects rename <ID> <NAME>` names a project and marks it reviewed"
+        );
+        assert_eq!(
+            render_list(Lang::Es, &listing()),
+            "App web (app-1a2b): 12 memorias\n\
+             \x20 carpeta /work/app\n\
+             \x20 carpeta /work/app-old, ya no está\n\
+             \x20 remoto github.com/acme/app\n\
+             \x20 puede ser el mismo proyecto que copia (copia-3c4d): comparten el primer commit\n\
+             copia (copia-3c4d): 0 memorias, sin revisar: registrado desde una carpeta\n\
+             \x20 carpeta /work/copia\n\
+             \x20 puede ser el mismo proyecto que App web (app-1a2b): comparten el primer commit\n\
+             loose (loose-1a2b): 1 memoria, sin revisar: adoptado de una memoria guardada con su id\n\
+             \x20 sin carpeta\n\
+             `clawg projects rename <ID> <NOMBRE>` le pone nombre a un proyecto y lo marca revisado"
+        );
+        assert_eq!(render_list(Lang::En, &[]), "no projects yet");
+        assert_eq!(render_list(Lang::Es, &[]), "todavía no hay proyectos");
+    }
+
+    #[tokio::test]
+    async fn projects_are_renamed_and_listed_through_the_daemon() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let id = c.register_project(repo.path(), &[], false).await.expect("register").project_id;
+
+        let renamed = rename(Lang::En, &c, &id, " App web ").await.expect("rename");
+
+        assert_eq!(renamed, format!("project {id} is now named \"App web\""));
+        let listed = list(Lang::En, &c).await.expect("list");
+        assert!(listed.starts_with(&format!("App web ({id}): 0 memories\n")), "{listed}");
+        let refused = rename(Lang::Es, &c, "a/b?c", "x").await.expect_err("no such project");
+        assert_eq!(
+            rename_refused(Lang::Es, "a/b?c", &refused).as_deref(),
+            Some("no se pudo renombrar a/b?c: no project has the id a/b?c"),
+            "the id travels as one segment: {refused:?}"
+        );
     }
 
     #[tokio::test]

@@ -220,8 +220,9 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
-    /// Let the daemon read a project's files besides the one each bridge is
-    /// started in. Needs a running daemon.
+    /// List and name the projects, let the daemon read a project's files
+    /// besides the one each bridge is started in, and move memories between
+    /// them. Needs a running daemon.
     Projects {
         #[command(subcommand)]
         action: ProjectsAction,
@@ -366,6 +367,23 @@ impl Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ProjectsAction {
+    /// List every project, with or without a folder: its folders, its
+    /// remotes, how many memories it holds and the suggestions nobody
+    /// answered, marking what was created on its own and not reviewed.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Give a project a name and mark it reviewed. Its id, and with it what
+    /// was saved under it, stays.
+    Rename {
+        /// The project's id, as `clawg projects list` shows it.
+        id: String,
+        /// Its new name, at most 80 characters.
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Index the docs and code of the project PATH is in, so `search_project`
     /// can search it from a bridge started anywhere.
     Add {
@@ -1454,6 +1472,22 @@ mod tests {
             }
         );
         assert!(Cli::try_parse_from(["clawg", "projects", "add"]).is_err(), "the path is required");
+    }
+
+    #[test]
+    fn projects_list_and_rename_parse() {
+        assert_eq!(
+            parse(&["clawg", "projects", "list", "--profile", "dev"]).command,
+            Command::Projects { action: ProjectsAction::List { profile: ProfileArg { profile: Some("dev".into()) } } }
+        );
+        assert_eq!(
+            parse(&["clawg", "projects", "rename", "app-1a2b", "App web"]).command,
+            Command::Projects {
+                action: ProjectsAction::Rename { id: "app-1a2b".into(), name: "App web".into(), profile: ProfileArg::default() }
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "projects", "rename", "app-1a2b"]).is_err(), "the name is required");
+        assert!(Cli::try_parse_from(["clawg", "projects", "list", "extra"]).is_err(), "list takes no argument");
     }
 
     fn move_opts(args: &[&str]) -> MoveOpts {

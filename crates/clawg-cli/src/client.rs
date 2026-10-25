@@ -23,6 +23,7 @@ use std::time::Duration;
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::portability::{ImportReport, UndoReport};
+use clawg_core::memory::registry::{ListedProject, Project};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
@@ -754,6 +755,14 @@ pub struct Answer {
     pub body: Vec<u8>,
 }
 
+/// `value` as one segment of a path: a `/`, `?` or `#` in an id the user
+/// typed would otherwise reach another route.
+fn path_segment(value: &str) -> String {
+    let mut url = reqwest::Url::parse("http://localhost/").expect("a URL that has a path");
+    url.path_segments_mut().expect("a URL that has a path").push(value);
+    url.path()[1..].to_string()
+}
+
 /// The URL of `call` under `base`. The query is encoded the way reqwest's
 /// `.query()` does it, and is absent when there are no pairs.
 fn call_url(base: &str, call: &Call) -> Result<reqwest::Url, ClientError> {
@@ -1361,6 +1370,24 @@ impl DaemonClient {
         // A daemon from before assigned ids keeps one id per root.
         let root_id = body.root_id.unwrap_or_else(|| body.project_id.clone());
         Ok(Registered { project_id: body.project_id, root_id, rekeyed: body.rekeyed })
+    }
+
+    /// Every project, with its folders, remotes, memories and the
+    /// suggestions about it nobody answered.
+    pub async fn list_projects(&self) -> Result<Vec<ListedProject>, ClientError> {
+        #[derive(Deserialize)]
+        struct Body {
+            projects: Vec<ListedProject>,
+        }
+        let answer = self.send(Call::new(reqwest::Method::GET, "/v1/projects")).await?;
+        Ok(read_response::<Body>(answer)?.projects)
+    }
+
+    /// Names project `id` and marks it reviewed.
+    pub async fn rename_project(&self, id: &str, name: &str) -> Result<Project, ClientError> {
+        let call = Call::new(reqwest::Method::PATCH, format!("/v1/projects/{}", path_segment(id)))
+            .json(&serde_json::json!({ "name": name }))?;
+        read_response(self.send(call).await?)
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {
