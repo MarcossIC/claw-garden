@@ -85,11 +85,26 @@ pub fn project_id_of(base_dir: &Path, root: &Path, remote: Option<&str>) -> Resu
     }
     crate::memory::db::ensure_vec0_registered();
     let c = open_for_probe(&path)?;
-    if !has_table(&c, "project")? {
-        return Ok(crate::memory::identity::derive_project_id(root));
+    match folder_table(&c)? {
+        None => return Ok(crate::memory::identity::derive_project_id(root)),
+        // The resolver reads `project_path`; a temporary view lends it the
+        // folders of a store from before V27 without writing the store.
+        Some("project") => c.execute_batch("CREATE TEMP VIEW project_path AS SELECT id, root_path, created_at FROM main.project")?,
+        Some(_) => {}
     }
     let remote = if has_table(&c, "project_remote")? { remote } else { None };
     Ok(crate::memory::project::project_id_in(&c, root, remote)?)
+}
+
+/// The table that holds the store's folders: `project_path` from V27,
+/// `project` before it, none before V9.
+fn folder_table(c: &Connection) -> rusqlite::Result<Option<&'static str>> {
+    for table in ["project_path", "project"] {
+        if has_table(c, table)? {
+            return Ok(Some(table));
+        }
+    }
+    Ok(None)
 }
 
 /// [`export`] over an open connection. A store from an older schema is read
@@ -104,15 +119,14 @@ pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result
     let ids: BTreeSet<i64> = memories.iter().map(|m| m.id).collect();
     let project_ids: BTreeSet<&str> = memories.iter().filter_map(|m| m.project_id.as_deref()).collect();
 
-    let projects = if has_table(c, "project")? {
-        collect(c, "SELECT id, root_path FROM project ORDER BY id", |r| {
+    let projects = match folder_table(c)? {
+        Some(table) => collect(c, &format!("SELECT id, root_path FROM {table} ORDER BY id"), |r| {
             Ok(ProjectLine { id: r.get(0)?, root_path: r.get(1)? })
         })?
         .into_iter()
         .filter(|p| project_ids.contains(p.id.as_str()))
-        .collect()
-    } else {
-        Vec::new()
+        .collect(),
+        None => Vec::new(),
     };
     let derivations = if has_table(c, "memory_derivation")? {
         collect(c, "SELECT memory_id, source_id, created_at FROM memory_derivation ORDER BY memory_id, source_id", |r| {
@@ -487,23 +501,30 @@ mod tests {
         assert!(err.to_string().contains("no memory store"), "{err}");
     }
 
+    /// The folders are in `project_path` from V27 on, and in `project` in a
+    /// store from before it, which an export reads without migrating.
     #[tokio::test]
     async fn export_reads_the_project_id_from_the_store() {
-        let dir = tempfile::tempdir().unwrap();
-        seed_on_disk(dir.path(), None).await;
-        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
-        c.execute_batch(
-            "INSERT INTO project (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 1), ('app-3c4d', '/review/app', 2);
-             INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);",
-        )
-        .unwrap();
-        drop(c);
-        let of = |root: &str, remote: Option<&str>| project_id_of(dir.path(), Path::new(root), remote).unwrap();
+        for (version, folders) in [(Some(26), "project"), (None, "project_path")] {
+            let dir = tempfile::tempdir().unwrap();
+            seed_on_disk(dir.path(), version).await;
+            let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+            c.execute_batch(&format!(
+                "INSERT INTO {folders} (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 1), ('app-3c4d', '/review/app', 2);
+                 INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
+                 UPDATE memory SET project_id = 'app-1a2b';"
+            ))
+            .unwrap();
+            drop(c);
+            let of = |root: &str, remote: Option<&str>| project_id_of(dir.path(), Path::new(root), remote).unwrap();
 
-        assert_eq!(of("/review/app", Some("github.com/acme/app")), "app-1a2b", "the project its remote shares");
-        assert_eq!(of("/review/app", None), "app-3c4d", "its own id without a remote");
-        let free = Path::new("/fresh/app");
-        assert_eq!(of("/fresh/app", None), crate::memory::identity::derive_project_id(free));
+            assert_eq!(of("/review/app", Some("github.com/acme/app")), "app-1a2b", "{folders}: the project its remote shares");
+            assert_eq!(of("/review/app", None), "app-3c4d", "{folders}: its own id without a remote");
+            let free = Path::new("/fresh/app");
+            assert_eq!(of("/fresh/app", None), crate::memory::identity::derive_project_id(free), "{folders}");
+            let exported = export(dir.path(), &ExportFilter::default(), 0).unwrap();
+            assert_eq!(exported.projects, vec![ProjectLine { id: "app-1a2b".into(), root_path: "/work/app".into() }], "{folders}");
+        }
     }
 
     #[tokio::test]

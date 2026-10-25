@@ -163,7 +163,11 @@ fn read_facts(c: &Connection) -> rusqlite::Result<StoreFacts> {
     Ok(StoreFacts {
         contract: if has.table("embedding_contract") { contract(c)? } else { None },
         agents: agents(c)?,
-        projects: if has.table("project") { projects(c)? } else { Vec::new() },
+        // The folders are in `project_path` from V27 and in `project` before.
+        projects: match ["project_path", "project"].into_iter().find(|t| has.table(t)) {
+            Some(folders) => projects(c, folders)?,
+            None => Vec::new(),
+        },
         remotes: if has.table("project_remote") { remotes(c)? } else { Vec::new() },
         outbox: if has.table("ingest_outbox") { outbox(c)? } else { OutboxFacts::default() },
         invariants: Invariants {
@@ -224,8 +228,8 @@ fn agents(c: &Connection) -> rusqlite::Result<Vec<AgentRows>> {
     rows.collect()
 }
 
-fn projects(c: &Connection) -> rusqlite::Result<Vec<ProjectRow>> {
-    let mut stmt = c.prepare("SELECT id, root_path FROM project ORDER BY id")?;
+fn projects(c: &Connection, folders: &str) -> rusqlite::Result<Vec<ProjectRow>> {
+    let mut stmt = c.prepare(&format!("SELECT id, root_path FROM {folders} ORDER BY id"))?;
     let rows = stmt.query_map([], |r| Ok(ProjectRow { id: r.get(0)?, root_path: r.get(1)? }))?;
     rows.collect()
 }
@@ -631,7 +635,7 @@ mod tests {
             insert(c, &row("one"));
             insert(c, &Row { deleted: true, ..row("two") });
             insert(c, &Row { agent: None, project: None, ..row("global") });
-            c.execute("INSERT INTO project (id, root_path, created_at) VALUES ('proj-1a2b', '/work/proj', 0)", []).unwrap();
+            c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES ('proj-1a2b', '/work/proj', 0)", []).unwrap();
             for (op, state) in [("op-1", "pending"), ("op-2", "failed")] {
                 c.execute(
                     "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, attempts, created_at, updated_at) \

@@ -108,7 +108,7 @@ pub(crate) mod fixtures {
                     }
                 }
                 tx.execute(
-                    "INSERT INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, 1, 1), (?3, ?4, 1, 0)",
+                    "INSERT INTO project_path (id, root_path, created_at, index_docs) VALUES (?1, ?2, 1, 1), (?3, ?4, 1, 0)",
                     rusqlite::params![p, ROOT, q, OTHER_ROOT],
                 )?;
                 tx.execute_batch(

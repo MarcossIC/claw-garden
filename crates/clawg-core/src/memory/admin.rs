@@ -1780,7 +1780,10 @@ mod tests {
         let id = id.to_string();
         store
             .conn
-            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/work/' || ?1, 0)", [id]))
+            .call(move |c| {
+                c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/work/' || ?1, 0)", [&id])?;
+                c.execute("INSERT INTO project (id, name, born, created_at) VALUES (?1, ?1, 'root', 0)", [&id])
+            })
             .await
             .unwrap();
     }

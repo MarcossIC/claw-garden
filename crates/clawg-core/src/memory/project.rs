@@ -1,13 +1,14 @@
 //! Registers a project's canonical root, gives it an id, and joins into its
 //! project the rows saved under the ids it had before.
 //!
-//! Each root keeps one id in `project` (its root id), which the docs index
-//! uses. Its memories live under its project id: the id the root's remote was
-//! first registered with (`project_remote`, V24), so the clones of one remote
-//! share them, or the root id without a remote. Rows of `memory` join through
-//! the move engine, which logs them in `memory_move` and leaves one live row
-//! per key and per text (see [`merge_in`]); the other tables move row by row
-//! with `project_rekey`, whose undo SQL is in the migration that creates it.
+//! Each root keeps one id in `project_path` (its root id), which the docs
+//! index uses. Its memories live under its project id, a row of `project`:
+//! the id the root's remote was first registered with (`project_remote`,
+//! V24), so the clones of one remote share them, or the root id without a
+//! remote. Rows of `memory` join through the move engine, which logs them in
+//! `memory_move` and leaves one live row per key and per text (see
+//! [`merge_in`]); the other tables move row by row with `project_rekey`,
+//! whose undo SQL is in the migration that creates it.
 //! `memory_fts` needs nothing: it reads `project_id` from `memory`.
 //!
 //! A path is not an identity: another repository can be cloned where one
@@ -22,6 +23,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
 use crate::memory::identity::{candidate_id, derive_project_id, CANDIDATES};
+use crate::memory::registry::project_name;
 use crate::memory::relocate::merge_in;
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
@@ -97,7 +99,7 @@ pub fn is_project_id(s: &str) -> bool {
 struct Plan {
     root_id: String,
     project_id: String,
-    /// Whether `project` has no row for the root yet.
+    /// Whether `project_path` has no row for the root yet.
     new_root: bool,
     /// Ids whose rows join the project.
     legacy: Vec<String>,
@@ -105,8 +107,8 @@ struct Plan {
     moves: bool,
 }
 
-/// Which of the rows `project` records for a path is the repository there
-/// now.
+/// Which of the rows `project_path` records for a path is the repository
+/// there now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settled {
     /// The row at this index, oldest first.
@@ -136,12 +138,12 @@ fn settle(rows: &[Vec<String>], remote: Option<&str>) -> Settled {
         .map_or(Settled::Contradicted, Settled::Row)
 }
 
-/// The rows `project` records for `root`, oldest first, each with the
+/// The rows `project_path` records for `root`, oldest first, each with the
 /// remotes bound to its id.
 fn path_rows_in(c: &Connection, root: &str) -> rusqlite::Result<Vec<(String, Vec<String>)>> {
     let mut stmt = c.prepare(
         "SELECT p.id, (SELECT json_group_array(remote) FROM project_remote WHERE project_id = p.id) \
-         FROM project AS p WHERE p.root_path = ?1 ORDER BY p.created_at, p.id",
+         FROM project_path AS p WHERE p.root_path = ?1 ORDER BY p.created_at, p.id",
     )?;
     let rows = stmt.query_map([root], |r| {
         let remotes: String = r.get(1)?;
@@ -150,9 +152,9 @@ fn path_rows_in(c: &Connection, root: &str) -> rusqlite::Result<Vec<(String, Vec
     rows.collect()
 }
 
-/// The root `project` records for `id`, if any.
+/// The root `project_path` records for `id`, if any.
 fn root_of_in(c: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
-    c.query_row("SELECT root_path FROM project WHERE id = ?1", [id], |r| r.get(0)).optional()
+    c.query_row("SELECT root_path FROM project_path WHERE id = ?1", [id], |r| r.get(0)).optional()
 }
 
 /// The project the clones of `remote` share, if one registered it.
@@ -164,7 +166,7 @@ fn remote_project_in(c: &Connection, remote: &str) -> rusqlite::Result<Option<St
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootId {
     pub id: String,
-    /// Whether `project` has no row with it yet.
+    /// Whether `project_path` has no row with it yet.
     pub new_row: bool,
     /// Whether the ids the path had before roots were resolved are this
     /// root's: they are the path's, so only its first repository, the one in
@@ -337,13 +339,19 @@ fn write_in(
     let root_path = reg.root.to_string_lossy().into_owned();
     if plan.new_root {
         c.execute(
-            "INSERT INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO project_path (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![plan.root_id, root_path, now, reg.index_docs],
         )?;
     }
-    let indexed: bool = c.query_row("SELECT index_docs FROM project WHERE id = ?1", [&plan.root_id], |r| r.get(0))?;
+    // A root nothing was saved in yet is a project too: a move may target it
+    // before its first save.
+    c.execute(
+        "INSERT OR IGNORE INTO project (id, name, born, reviewed, created_at) VALUES (?1, ?2, 'root', 0, ?3)",
+        rusqlite::params![plan.project_id, project_name(&plan.project_id), now],
+    )?;
+    let indexed: bool = c.query_row("SELECT index_docs FROM project_path WHERE id = ?1", [&plan.root_id], |r| r.get(0))?;
     if reg.index_docs && !indexed {
-        c.execute("UPDATE project SET index_docs = 1 WHERE id = ?1", [&plan.root_id])?;
+        c.execute("UPDATE project_path SET index_docs = 1 WHERE id = ?1", [&plan.root_id])?;
     }
     if let (true, Some(remote)) = (reg.assigned, reg.remote) {
         c.execute(
@@ -541,7 +549,7 @@ mod tests {
                 .conn
                 .call(move |c| {
                     c.execute(
-                        "INSERT INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, 0, 0)",
+                        "INSERT INTO project_path (id, root_path, created_at, index_docs) VALUES (?1, ?2, 0, 0)",
                         rusqlite::params![id, root],
                     )
                 })
@@ -592,12 +600,34 @@ mod tests {
         store
             .conn
             .call(move |c| {
-                let mut stmt = c.prepare("SELECT index_docs FROM project WHERE id = ?1")?;
+                let mut stmt = c.prepare("SELECT index_docs FROM project_path WHERE id = ?1")?;
                 let marks = stmt.query_map([id], |r| r.get(0))?.collect();
                 marks
             })
             .await
             .unwrap()
+    }
+
+    /// A move may target a root before anything is saved in it; a clone
+    /// joins the project of its remote and makes none.
+    #[tokio::test]
+    async fn a_registered_root_is_a_project_before_its_first_save() {
+        let f = Fixture::new().await;
+        let first = f.register(cloned(Path::new("/work/app"), "github.com/acme/app")).await.unwrap();
+        let clone = f.register(cloned(Path::new("/review/app"), "github.com/acme/app")).await.unwrap();
+
+        assert_eq!(clone.project_id, first.project_id);
+        let projects: Vec<(String, String, String, i64)> = f
+            .store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT id, name, born, reviewed FROM project")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                rows.collect::<rusqlite::Result<_>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(projects, vec![(first.project_id, "app".to_string(), "root".to_string(), 0)]);
     }
 
     #[tokio::test]
@@ -616,7 +646,7 @@ mod tests {
         assert!(ids.iter().any(|(_, _, p)| p.as_deref() == Some("other-9f9f")), "{ids:?}");
         assert_eq!(f.count("SELECT COUNT(*) FROM memory_move").await, 2, "memory rows are logged as a move");
         assert_eq!(f.count("SELECT COUNT(*) FROM project_rekey").await, 2, "the other tables in project_rekey");
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 1);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 1);
     }
 
     #[tokio::test]
@@ -748,7 +778,7 @@ mod tests {
         let again = f.register(reg(root, &[])).await.unwrap();
 
         assert_eq!(again.root_id, first.root_id);
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 2);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 2);
     }
 
     #[tokio::test]
@@ -762,7 +792,7 @@ mod tests {
         let err = f.register(reg(root, &[])).await.unwrap_err();
 
         assert!(matches!(err, RegisterError::NoFreeId(_)), "{err:?}");
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, i64::from(CANDIDATES));
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, i64::from(CANDIDATES));
     }
 
     #[tokio::test]
@@ -782,7 +812,7 @@ mod tests {
         let p = Some(first.project_id.clone());
         assert_eq!(project_ids(&f.store).await, vec![("memory".into(), ours, p.clone()), ("memory".into(), theirs, p)]);
         assert_eq!(f.count("SELECT COUNT(*) FROM memory_move WHERE row_id = 2").await, 1);
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 2);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 2);
     }
 
     #[tokio::test]
@@ -885,7 +915,7 @@ mod tests {
 
         assert_eq!((a_again.project_id, a_again.root_id), (a.project_id, a.root_id));
         assert_eq!((b_again.project_id, b_again.root_id), (b.project_id, b.root_id));
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 2, "no third row");
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 2, "no third row");
         assert_eq!(f.count("SELECT COUNT(*) FROM project_remote").await, 2);
     }
 
@@ -908,7 +938,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 1, "reading writes nothing");
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 1, "reading writes nothing");
         let b = f.register(cloned(path, "github.com/acme/b")).await.unwrap();
 
         assert_ne!(read, a.project_id);
@@ -926,7 +956,7 @@ mod tests {
         let pushed = f.register(cloned(root, "github.com/acme/app")).await.unwrap();
 
         assert_eq!((pushed.project_id, pushed.root_id), (local.project_id.clone(), local.root_id));
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 1);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 1);
         let unknown = f.register(reg(root, &[])).await.unwrap();
         assert_eq!(unknown.project_id, local.project_id, "a root whose remote cannot be read keeps its project");
     }
@@ -958,7 +988,7 @@ mod tests {
 
         assert!(matches!(err, RegisterError::RootCollision { ref id, .. } if *id == a.root_id), "{err:?}");
         assert_eq!(project_ids(&f.store).await, before);
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 1);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 1);
         let same = f.register(Registration { assigned: false, ..cloned(path, "github.com/acme/a") }).await.unwrap();
         assert_eq!(same.project_id, a.project_id, "its own repository is still served");
     }
@@ -1036,7 +1066,7 @@ mod tests {
 
         assert!(matches!(err, RegisterError::InvalidLegacyId(_)), "{err:?}");
         assert_eq!(project_ids(&f.store).await, before);
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 0);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 0);
     }
 
     #[tokio::test]
@@ -1108,6 +1138,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(ids, (first.project_id, derive_project_id(review), candidate_id(other, 1)));
-        assert_eq!(f.count("SELECT COUNT(*) FROM project").await, 2, "reading writes nothing");
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 2, "reading writes nothing");
     }
 }

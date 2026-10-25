@@ -2786,7 +2786,7 @@ async fn registering_a_root_whose_id_is_taken_by_another_is_a_conflict() {
         .store
         .conn
         .call(move |c| {
-            c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [id])
+            c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [id])
         })
         .await
         .expect("seed a colliding project");
@@ -2809,7 +2809,7 @@ async fn registering_two_roots_that_collide_gives_each_its_own_id() {
         .store
         .conn
         .call(move |c| {
-            c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [seeded])
+            c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [seeded])
         })
         .await
         .expect("seed a colliding project");
@@ -2932,7 +2932,7 @@ async fn project_with_docs(h: &Harness, docs: &[(&str, &str)]) -> (tempfile::Tem
         .runtime
         .store
         .conn
-        .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", [row_id, root]))
+        .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, ?2, 0)", [row_id, root]))
         .await
         .unwrap();
     (dir, id)
@@ -3065,7 +3065,7 @@ async fn index_docs_of(h: &Harness, id: &str) -> Option<i64> {
         .runtime
         .store
         .conn
-        .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project WHERE id = ?1)", [id], |r| r.get(0)))
+        .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project_path WHERE id = ?1)", [id], |r| r.get(0)))
         .await
         .unwrap()
 }

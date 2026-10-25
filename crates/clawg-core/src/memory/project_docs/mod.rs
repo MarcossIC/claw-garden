@@ -502,7 +502,7 @@ pub async fn root_of(store: &MemoryStore, project_id: &str) -> Result<PathBuf, D
         .conn
         .call(move |c| -> rusqlite::Result<_> {
             use rusqlite::OptionalExtension;
-            c.query_row("SELECT root_path, index_docs FROM project WHERE id = ?1", [&id], |r| {
+            c.query_row("SELECT root_path, index_docs FROM project_path WHERE id = ?1", [&id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .optional()
@@ -713,7 +713,7 @@ mod tests {
         let (id, root) = (project_id.to_string(), root.display().to_string());
         store
             .conn
-            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", [id, root]))
+            .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, ?2, 0)", [id, root]))
             .await
             .unwrap();
         store
@@ -1026,7 +1026,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a.md", "# A\na\n");
         let store = store_with_project("p", dir.path()).await;
-        store.conn.call(|c| c.execute("UPDATE project SET index_docs = 0 WHERE id = 'p'", [])).await.unwrap();
+        store.conn.call(|c| c.execute("UPDATE project_path SET index_docs = 0 WHERE id = 'p'", [])).await.unwrap();
         let index = Arc::new(DocIndex::default());
 
         let result = index.try_refresh(&store, &Counting::new("m1"), None, "p").await;
@@ -1174,7 +1174,7 @@ mod tests {
         let (id, root) = ("two".to_string(), two.path().display().to_string());
         store
             .conn
-            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", [id, root]))
+            .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, ?2, 0)", [id, root]))
             .await
             .unwrap();
         let index = Arc::new(DocIndex::default());

@@ -1831,7 +1831,7 @@ mod tests {
         let id = id.to_string();
         store
             .conn
-            .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project WHERE id = ?1)", [id], |r| r.get(0)))
+            .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project_path WHERE id = ?1)", [id], |r| r.get(0)))
             .await
             .expect("project")
     }
@@ -1942,7 +1942,7 @@ mod tests {
         store
             .conn
             .call(move |c| {
-                c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere', 0)", [taken])
+                c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere', 0)", [taken])
             })
             .await
             .expect("seed a colliding project");

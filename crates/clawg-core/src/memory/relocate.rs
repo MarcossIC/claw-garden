@@ -422,7 +422,8 @@ fn apply_in(c: &Connection, report: &MoveReport, now: TimestampMs) -> rusqlite::
     Ok(Some(move_id))
 }
 
-/// Refuses a target `project` does not know; no project is always a target.
+/// Refuses a target `project` does not know, whether or not a folder leads
+/// to it; no project is always a target.
 fn check_target_in(c: &Connection, target: Option<&str>) -> Result<(), MoveError> {
     let Some(target) = target else {
         return Ok(());
@@ -1059,9 +1060,10 @@ mod tests {
             .conn
             .call(move |c| {
                 c.execute(
-                    "INSERT INTO project (id, root_path, created_at, index_docs) VALUES (?1, '/work/' || ?1, 0, 0)",
-                    [id],
-                )
+                    "INSERT INTO project_path (id, root_path, created_at, index_docs) VALUES (?1, '/work/' || ?1, 0, 0)",
+                    [&id],
+                )?;
+                c.execute("INSERT INTO project (id, name, born, created_at) VALUES (?1, ?1, 'root', 0)", [&id])
             })
             .await
             .unwrap();
@@ -1618,6 +1620,27 @@ mod tests {
 
         assert!(matches!(refused, Err(MoveError::UnknownProject(ref p)) if p == "typo-0000"), "{refused:?}");
         assert_eq!(place(&store, id).await.0, None);
+    }
+
+    /// A project is a target because it is one, whether or not a folder of
+    /// this machine leads to it.
+    #[tokio::test]
+    async fn a_project_without_a_folder_is_a_target() {
+        let store = store().await;
+        save_one(&store, fact("a note saved under an id no folder has", Some("idea-1a2b"))).await;
+        let id = save_one(&store, fact("a note filed nowhere", None)).await;
+        let folders: i64 = store
+            .conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM project_path WHERE id = 'idea-1a2b'", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(folders, 0);
+        let backups = tempfile::tempdir().unwrap();
+
+        let moved = move_memories_core(&store, backups.path(), &ids(&[id]), Some("idea-1a2b".into()), false).await.unwrap();
+
+        assert_eq!(moved_ids(&moved), vec![id]);
+        assert_eq!(place(&store, id).await.0.as_deref(), Some("idea-1a2b"));
     }
 
     #[tokio::test]

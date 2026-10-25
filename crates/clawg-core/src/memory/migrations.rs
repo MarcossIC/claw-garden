@@ -68,6 +68,7 @@ mod tests {
             (24, "project_remote", 579166074213349048),
             (25, "dedup_index_all_rows", 10903318606938253393),
             (26, "import_journal", 15286911047364848905),
+            (27, "project_registry", 14271020849722783756),
         ];
         let mut actual: Vec<(i32, String, u64)> = runner()
             .get_migrations()

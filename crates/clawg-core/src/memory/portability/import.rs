@@ -1157,7 +1157,7 @@ const INSERT_SQL: &str = "INSERT INTO memory \
       lang, origin_project) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)";
 
-const PROJECT_ROOT_SQL: &str = "SELECT root_path FROM project WHERE id = ?1";
+const PROJECT_ROOT_SQL: &str = "SELECT root_path FROM project_path WHERE id = ?1";
 
 /// The project ids whose rows stay out, with the root that holds them (an id
 /// a registration gave another root since the ids were planned), and the
@@ -1200,7 +1200,7 @@ fn record_projects(
     let (taken, remotes) = taken_projects(projects, &mut roots);
     for p in projects {
         let added = tx.execute(
-            "INSERT OR IGNORE INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, 0)",
+            "INSERT OR IGNORE INTO project_path (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, 0)",
             rusqlite::params![p.root_id, p.root, now],
         )?;
         if added == 1 {
@@ -2054,7 +2054,7 @@ pub(crate) mod tests {
         let before = count(&dst, sequence).await;
         let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, &mut ImportTimings::new(false)).await.unwrap();
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
-        assert_eq!(count(&dst, "SELECT count(*) FROM project").await, 0);
+        assert_eq!(count(&dst, "SELECT count(*) FROM project_path").await, 0);
         assert_eq!(count(&dst, "SELECT count(*) FROM project_remote").await, 0);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts").await, 1);
         assert_eq!(count(&dst, sequence).await, before);
@@ -2263,7 +2263,7 @@ pub(crate) mod tests {
         let roots = dst
             .conn
             .call(|c| {
-                let mut stmt = c.prepare("SELECT id, root_path, index_docs FROM project ORDER BY root_path")?;
+                let mut stmt = c.prepare("SELECT id, root_path, index_docs FROM project_path ORDER BY root_path")?;
                 let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
@@ -2278,7 +2278,7 @@ pub(crate) mod tests {
         let dst = destination().await;
         let id = project();
         dst.conn
-            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/not/the/repo', 0)", [id]))
+            .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/not/the/repo', 0)", [id]))
             .await
             .unwrap();
         let (report, _) = run(&dst, &file, ImportOptions::default()).await;
@@ -2295,7 +2295,7 @@ pub(crate) mod tests {
         dst.conn
             .call(|c| {
                 c.execute_batch(
-                    "INSERT INTO project (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 0);
+                    "INSERT INTO project_path (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 0);
                      INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 0);",
                 )
             })
@@ -2542,7 +2542,8 @@ pub(crate) mod tests {
         store
             .conn
             .call(move |c| {
-                c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", rusqlite::params![recorded, root])
+                c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, ?2, 0)", rusqlite::params![recorded, root])?;
+                c.execute("INSERT INTO project (id, name, born, created_at) VALUES (?1, ?1, 'root', 0)", [&recorded])
             })
             .await
             .unwrap();
@@ -2647,7 +2648,7 @@ pub(crate) mod tests {
         let dst = destination().await;
         let id = crate::memory::identity::derive_project_id(Path::new(root));
         dst.conn
-            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/not/the/notes', 0)", [id]))
+            .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/not/the/notes', 0)", [id]))
             .await
             .unwrap();
         let in_a = |origin: &str, content: &str| ForeignNote { project: Some("a".into()), ..foreign_note(origin, "In a", content) };
@@ -2669,7 +2670,7 @@ pub(crate) mod tests {
         dst.conn
             .call(|c| {
                 c.execute_batch(
-                    "INSERT INTO project (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 0);
+                    "INSERT INTO project_path (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 0);
                      INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 0);",
                 )
             })
@@ -3144,7 +3145,7 @@ pub(crate) mod tests {
             ("TEXT_ROWS_SQL in a project", TEXT_ROWS_SQL, vec![Text(project()), hash()], "idx_memory_dedup"),
             ("TEXT_ROWS_SQL without a project", TEXT_ROWS_SQL, vec![Text(String::new()), hash()], "idx_memory_dedup"),
             ("KEY_ROWS_SQL", KEY_ROWS_SQL, vec![Text(project()), Text("storage/engine".into())], "idx_memory_topic"),
-            ("PROJECT_ROOT_SQL", PROJECT_ROOT_SQL, vec![Text(project())], "sqlite_autoindex_project_1"),
+            ("PROJECT_ROOT_SQL", PROJECT_ROOT_SQL, vec![Text(project())], "sqlite_autoindex_project_path_1"),
         ];
         let mut wrong = Vec::new();
         for (name, sql, binds, index) in cases {
@@ -3285,7 +3286,7 @@ pub(crate) mod tests {
         let prepared = notes_of(&dst, sample_notes(), options).await;
         let root_id = prepared.projects[0].root_id.clone();
         dst.conn
-            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/work/elsewhere', 0)", [root_id]))
+            .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/work/elsewhere', 0)", [root_id]))
             .await
             .unwrap();
         let ledger = decides_alike(&dst, prepared, "a project another root took").await;

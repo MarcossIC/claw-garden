@@ -674,7 +674,7 @@ async fn load(store: &MemoryStore, import_id: i64) -> Result<Facts, UndoError> {
     let roots: Vec<String> = extras.iter().filter_map(|e| if let Extra::Project(r) = e { Some(r.clone()) } else { None }).collect();
     let projects: HashMap<String, ProjectNow> = each(store, roots, |c, root: &String| {
         let index_docs: Option<bool> =
-            c.prepare_cached("SELECT index_docs FROM project WHERE id = ?1")?.query_row([root], |r| r.get(0)).optional()?;
+            c.prepare_cached("SELECT index_docs FROM project_path WHERE id = ?1")?.query_row([root], |r| r.get(0)).optional()?;
         let Some(index_docs) = index_docs else { return Ok(None) };
         let docs = c
             .prepare_cached("SELECT EXISTS (SELECT 1 FROM project_doc_file WHERE project_id = ?1)")?
@@ -695,7 +695,7 @@ async fn load(store: &MemoryStore, import_id: i64) -> Result<Facts, UndoError> {
         let Some(project_id) = project_id else { return Ok(None) };
         let rows = c.prepare_cached(PROJECT_ROWS_SQL)?.query_row([&project_id], |r| r.get(0))?;
         let root = c
-            .prepare_cached("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1)")?
+            .prepare_cached("SELECT EXISTS (SELECT 1 FROM project_path WHERE id = ?1)")?
             .query_row([&project_id], |r| r.get(0))?;
         Ok(Some((remote.clone(), RemoteNow { project_id, rows, root })))
     })
@@ -769,7 +769,7 @@ fn take_back_in(c: &Connection, import_id: i64, extra: &Extra) -> rusqlite::Resu
         Extra::Project(root) => (
             c.execute(
                 concat!(
-                    "DELETE FROM project WHERE id = ?1 AND index_docs = 0 AND ",
+                    "DELETE FROM project_path WHERE id = ?1 AND index_docs = 0 AND ",
                     no_rows!("?1"),
                     " AND NOT EXISTS (SELECT 1 FROM project_doc_file WHERE project_id = ?1) \
                      AND NOT EXISTS (SELECT 1 FROM project_remote WHERE project_id = ?1)"
@@ -1043,7 +1043,7 @@ mod tests {
                     "SELECT * FROM memory_piece ORDER BY save_id, piece",
                     "SELECT * FROM memory_derivation ORDER BY memory_id, source_id",
                     "SELECT * FROM memory_conflict ORDER BY new_id, old_id",
-                    "SELECT * FROM project ORDER BY id",
+                    "SELECT * FROM project_path ORDER BY id",
                     "SELECT * FROM project_remote ORDER BY remote",
                 ] {
                     let mut stmt = c.prepare(sql)?;
@@ -1261,7 +1261,13 @@ mod tests {
         sql(&dst, format!("UPDATE memory_conflict SET state = 'judged', verdict = 'compatible' WHERE new_id = {judged}")).await;
         let conclusion = insert_row(&dst, "claude-code", None, "A conclusion drawn since", None, 9).await;
         sql(&dst, format!("INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES ({conclusion}, {source}, 9)")).await;
-        sql(&dst, "INSERT INTO project (id, root_path, created_at) VALUES ('elsewhere', '/work/elsewhere', 0)".into()).await;
+        sql(
+            &dst,
+            "INSERT INTO project_path (id, root_path, created_at) VALUES ('elsewhere', '/work/elsewhere', 0);
+             INSERT INTO project (id, name, born, created_at) VALUES ('elsewhere', 'elsewhere', 'root', 0);"
+                .into(),
+        )
+        .await;
         let backups = tempfile::tempdir().unwrap();
         let filter = MoveFilter { ids: vec![moved], ..Default::default() };
         move_memories_core(&dst, backups.path(), &filter, Some("elsewhere".into()), false).await.unwrap();

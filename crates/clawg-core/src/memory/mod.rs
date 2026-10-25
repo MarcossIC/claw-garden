@@ -44,6 +44,7 @@ pub mod provenance;
 pub mod model_download;
 pub mod record;
 pub mod redact;
+pub(crate) mod registry;
 pub mod relocate;
 pub mod inspect;
 pub mod secrets;
