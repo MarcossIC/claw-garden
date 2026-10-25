@@ -640,41 +640,43 @@ pub async fn undo_move_core(
     move_id: i64,
     dry_run: bool,
 ) -> Result<MoveReport, MoveError> {
-    run_batch(store, backups, dry_run, move |c, write| {
-        let known: bool =
-            c.query_row("SELECT EXISTS (SELECT 1 FROM memory_move WHERE move_id = ?1)", [move_id], |r| r.get(0))?;
-        if !known {
-            return Err(MoveError::UnknownMove(move_id));
-        }
-        c.execute(
-            "UPDATE memory SET status = s.from_status, superseded_by = s.from_superseded_by, \
-             supersede_cause = s.from_cause FROM memory_move_supersede AS s \
-             WHERE s.move_id = ?1 AND s.row_id = memory.id \
-               AND memory.status = 'superseded' AND memory.superseded_by = s.superseded_by",
-            [move_id],
+    run_batch(store, backups, dry_run, move |c, write| undo_move_in(c, move_id, write)).await
+}
+
+/// [`undo_move_core`] inside the caller's transaction, which a merge's undo
+/// shares with the rest it takes back. The rows move only when `write`.
+pub(crate) fn undo_move_in(c: &Connection, move_id: i64, write: bool) -> Result<MoveReport, MoveError> {
+    let known: bool = c.query_row("SELECT EXISTS (SELECT 1 FROM memory_move WHERE move_id = ?1)", [move_id], |r| r.get(0))?;
+    if !known {
+        return Err(MoveError::UnknownMove(move_id));
+    }
+    c.execute(
+        "UPDATE memory SET status = s.from_status, superseded_by = s.from_superseded_by, \
+         supersede_cause = s.from_cause FROM memory_move_supersede AS s \
+         WHERE s.move_id = ?1 AND s.row_id = memory.id \
+           AND memory.status = 'superseded' AND memory.superseded_by = s.superseded_by",
+        [move_id],
+    )?;
+    let back: Vec<(i64, Option<String>)> = {
+        let mut stmt = c.prepare(
+            "SELECT m.row_id, m.from_project FROM memory_move m JOIN memory r ON r.id = m.row_id \
+             WHERE m.move_id = ?1 AND r.project_id IS m.to_project ORDER BY m.row_id",
         )?;
-        let back: Vec<(i64, Option<String>)> = {
-            let mut stmt = c.prepare(
-                "SELECT m.row_id, m.from_project FROM memory_move m JOIN memory r ON r.id = m.row_id \
-                 WHERE m.move_id = ?1 AND r.project_id IS m.to_project ORDER BY m.row_id",
-            )?;
-            let rows = stmt.query_map([move_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        let mut by_origin: BTreeMap<Option<String>, Vec<(i64, Option<String>)>> = BTreeMap::new();
-        for (id, from) in back {
-            by_origin.entry(from.clone()).or_default().push((id, from));
-        }
-        let mut report = MoveReport::default();
-        for seeds in by_origin.values() {
-            report.absorb(batch_in(c, seeds, false, TimestampMs::now())?);
-        }
-        if write {
-            report.move_id = apply_in(c, &report, TimestampMs::now())?;
-        }
-        Ok(report)
-    })
-    .await
+        let rows = stmt.query_map([move_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut by_origin: BTreeMap<Option<String>, Vec<(i64, Option<String>)>> = BTreeMap::new();
+    for (id, from) in back {
+        by_origin.entry(from.clone()).or_default().push((id, from));
+    }
+    let mut report = MoveReport::default();
+    for seeds in by_origin.values() {
+        report.absorb(batch_in(c, seeds, false, TimestampMs::now())?);
+    }
+    if write {
+        report.move_id = apply_in(c, &report, TimestampMs::now())?;
+    }
+    Ok(report)
 }
 
 /// A row joining two projects leaves superseded by `by`, which holds its key

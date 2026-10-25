@@ -28,6 +28,22 @@ pub struct Adopted {
     pub kept_beside: Vec<(PathBuf, PathBuf)>,
 }
 
+/// What [`WorkspaceManager::drop_adopted`] did, or would do without writing.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub removed: Vec<PathBuf>,
+    /// The copies edited since, which stay.
+    pub kept: Vec<PathBuf>,
+}
+
+/// What regenerating the AUTO section keeps of a file as it is: what comes
+/// before that section, and the USER section with what follows it. It is the
+/// part of the file the user writes.
+fn user_part(content: &str) -> (String, String, String) {
+    let sections = split_existing(content);
+    (sections.before_auto, sections.user_content, sections.after_user)
+}
+
 /// Stateless façade. Holds only the base directory under which all workspaces live.
 /// Trivially `Clone + Send + Sync`.
 #[derive(Debug, Clone)]
@@ -113,6 +129,46 @@ impl WorkspaceManager {
         adopted.copied.sort();
         adopted.kept_beside.sort();
         Ok(adopted)
+    }
+
+    /// Takes back the copies [`Self::adopt_legacy`] made of `legacy_id`'s
+    /// files into `project_id`, in the agent folders `agents` names: a copy
+    /// whose user's part is still the legacy file's is removed, and one the
+    /// user edited since stays. A folder name that is not one plain component
+    /// is skipped, as is a copy, or a legacy file, no longer there. Without
+    /// `write` it only says what it would do.
+    pub async fn drop_adopted(
+        &self,
+        legacy_id: &str,
+        project_id: &str,
+        agents: &[String],
+        write: bool,
+    ) -> Result<Dropped, MemoryError> {
+        let mut dropped = Dropped::default();
+        for agent in agents {
+            let mut parts = Path::new(agent).components();
+            if !matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None)) {
+                log::warn!("no workspace is taken back under {agent:?}: it is no folder name");
+                continue;
+            }
+            let dir = self.workspaces_root.join(agent);
+            let from = dir.join(project_segment(legacy_id).as_ref()).join("workspace.md");
+            let to = dir.join(project_segment(project_id).as_ref()).join("workspace.md");
+            let (Ok(legacy), Ok(copy)) = (tokio::fs::read_to_string(&from).await, tokio::fs::read_to_string(&to).await) else {
+                continue;
+            };
+            if user_part(&copy) != user_part(&legacy) {
+                dropped.kept.push(to);
+                continue;
+            }
+            if write {
+                tokio::fs::remove_file(&to).await.map_err(|source| MemoryError::WorkspaceIo { path: to.clone(), source })?;
+            }
+            dropped.removed.push(to);
+        }
+        dropped.removed.sort();
+        dropped.kept.sort();
+        Ok(dropped)
     }
 
     /// Regenerates the AUTO section from DB queries. USER section is preserved
