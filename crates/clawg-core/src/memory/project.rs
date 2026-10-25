@@ -1918,6 +1918,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pair_kept_apart_is_not_suggested_again() {
+        let f = Fixture::new().await;
+        let (app, copy) = (Path::new("/work/app"), Path::new("/work/copia"));
+        let a = f.register(f.found(app, None, "s1", known("c1"))).await.unwrap();
+        let c = f.register(f.found(copy, None, "s2", known("c1"))).await.unwrap();
+
+        crate::memory::registry::keep_apart(&f.store, &c.project_id, &a.project_id).await.unwrap();
+        f.register(f.found(copy, None, "s2", known("c1"))).await.unwrap();
+
+        let answered = (c.project_id.clone(), a.project_id.clone(), "root_commit".to_string(), Some("apart".to_string()));
+        assert_eq!(f.suggestions().await, vec![answered], "registering it again leaves the answer");
+    }
+
+    #[tokio::test]
     async fn a_checkout_two_projects_could_be_is_a_project_of_its_own() {
         let f = Fixture::new().await;
         let (one, two, three) = (Path::new("/work/one"), Path::new("/work/two"), Path::new("/work/three"));

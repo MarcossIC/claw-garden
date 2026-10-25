@@ -13,8 +13,9 @@ use std::sync::Arc;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::memory::clock::TimestampMs;
 use crate::memory::identity::Ground;
-use crate::memory::merge::canonical_in;
+use crate::memory::merge::{canonical_in, MAX_MERGE_HOPS};
 use crate::memory::project::is_project_id;
 use crate::memory::{MemoryError, MemoryStore};
 
@@ -69,6 +70,16 @@ pub struct ListedSuggestion {
     pub created_at: i64,
 }
 
+/// A project merged into a listed one: its tombstone, which is not listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedMerged {
+    pub id: String,
+    pub name: String,
+    /// The merge that made it a tombstone, which undoes it.
+    pub merge_id: Option<i64>,
+    pub merged_at: Option<i64>,
+}
+
 /// A project with what leads to it and what it holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListedProject {
@@ -80,6 +91,9 @@ pub struct ListedProject {
     /// Its rows of `memory` that are not deleted.
     pub memories: i64,
     pub suggestions: Vec<ListedSuggestion>,
+    /// The projects merged into it, which a daemon from before merges does not send.
+    #[serde(default)]
+    pub merged: Vec<ListedMerged>,
 }
 
 /// A folder as `project_path` records it.
@@ -94,7 +108,12 @@ struct StoredFolder {
 
 /// What [`list_projects`] reads of the store.
 struct Stored {
+    /// Tombstones too.
     projects: Vec<Project>,
+    /// The project each tombstone was merged into, and when.
+    merged_into: HashMap<String, (String, Option<i64>)>,
+    /// The merge that made each tombstone, by its id.
+    merges: HashMap<String, i64>,
     /// Oldest first.
     folders: Vec<StoredFolder>,
     /// Remote and project, by remote.
@@ -105,8 +124,18 @@ struct Stored {
 }
 
 fn stored_in(c: &Connection) -> rusqlite::Result<Stored> {
-    let mut stmt = c.prepare("SELECT id, name, born, reviewed, created_at FROM project")?;
-    let projects = stmt.query_map([], project_from)?.collect::<rusqlite::Result<_>>()?;
+    let mut stmt = c.prepare("SELECT id, name, born, reviewed, created_at, merged_into, merged_at FROM project")?;
+    let rows = stmt
+        .query_map([], |r| Ok((project_from(r)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<i64>>(6)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let merged_into = rows.iter().filter_map(|(p, into, at)| Some((p.id.clone(), (into.clone()?, *at)))).collect();
+    let projects = rows.into_iter().map(|(p, _, _)| p).collect();
+    let mut stmt = c.prepare(
+        "SELECT m.source, MIN(m.merge_id) FROM project_merge m \
+         JOIN project_merge_change ch ON ch.merge_id = m.merge_id AND ch.kind = 'tombstoned' \
+         WHERE m.undone_at IS NULL GROUP BY m.source",
+    )?;
+    let merges = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     let mut stmt =
         c.prepare("SELECT id, root_path, project_id, remote, index_docs, git_stamp FROM project_path ORDER BY created_at, id")?;
     let folders = stmt
@@ -131,7 +160,22 @@ fn stored_in(c: &Connection) -> rusqlite::Result<Stored> {
         "SELECT project_id, other_id, reason, created_at FROM project_suggestion WHERE answer IS NULL ORDER BY created_at, rowid",
     )?;
     let suggestions = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
-    Ok(Stored { projects, folders, remotes, memories, suggestions })
+    Ok(Stored { projects, merged_into, merges, folders, remotes, memories, suggestions })
+}
+
+/// The live project `id` leads to through `merged_into`, as
+/// [`canonical_in`] follows it in the store.
+fn follow(merged_into: &HashMap<String, (String, Option<i64>)>, id: &str) -> String {
+    let mut at = id;
+    let mut seen = vec![id];
+    while let Some((into, _)) = merged_into.get(at) {
+        if seen.contains(&into.as_str()) || seen.len() > MAX_MERGE_HOPS {
+            return id.to_string();
+        }
+        seen.push(into);
+        at = into;
+    }
+    at.to_string()
 }
 
 /// What the disk says of a folder: whether its checkout is still there, and
@@ -169,27 +213,31 @@ pub async fn list_projects(store: &MemoryStore, ground: Arc<dyn Ground>) -> Resu
 
 /// The listing of `stored`, with `found` for each of its folders in order.
 fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
+    let live = |id: &str| follow(&stored.merged_into, id);
     let mut listed: Vec<ListedProject> = stored
         .projects
         .iter()
+        .filter(|p| !stored.merged_into.contains_key(&p.id))
         .map(|p| ListedProject {
             project: p.clone(),
             folders: Vec::new(),
             remotes: Vec::new(),
             memories: stored.memories.get(&p.id).copied().unwrap_or(0),
             suggestions: Vec::new(),
+            merged: Vec::new(),
         })
         .collect();
-    let at: HashMap<&str, usize> = stored.projects.iter().enumerate().map(|(i, p)| (p.id.as_str(), i)).collect();
+    let at: HashMap<String, usize> = listed.iter().enumerate().map(|(i, l)| (l.project.id.clone(), i)).collect();
+    let names: HashMap<&str, &str> = stored.projects.iter().map(|p| (p.id.as_str(), p.name.as_str())).collect();
     let bound: HashMap<&str, &str> = stored.remotes.iter().map(|(r, p)| (r.as_str(), p.as_str())).collect();
     for (folder, found) in stored.folders.iter().zip(found) {
         let remote = folder.remote.as_deref().or(found.key.as_deref());
         // The one a registration recorded, else the one the clones of its
-        // remote share, else its own id. A folder that leads to no project
-        // (nothing was saved in it before V27) waits for a registration to
-        // make it one.
+        // remote share, else its own id, past any merge. A folder that leads
+        // to no project (nothing was saved in it before V27) waits for a
+        // registration to make it one.
         let project = folder.project_id.as_deref().or_else(|| remote.and_then(|r| bound.get(r).copied())).unwrap_or(&folder.id);
-        if let Some(&i) = at.get(project) {
+        if let Some(&i) = at.get(&live(project)) {
             listed[i].folders.push(ListedFolder {
                 root_id: folder.id.clone(),
                 root_path: folder.root_path.clone(),
@@ -200,14 +248,24 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
         }
     }
     for (remote, project) in &stored.remotes {
-        if let Some(&i) = at.get(project.as_str()) {
+        if let Some(&i) = at.get(&live(project)) {
             listed[i].remotes.push(remote.clone());
         }
     }
+    // A suggestion about a tombstone is about the project it went into: one
+    // whose sides became one project, or the same pair as an earlier one, is
+    // not listed again.
+    let mut pairs: Vec<(String, String)> = Vec::new();
     for (a, b, reason, created_at) in &stored.suggestions {
-        for (this, other) in [(a, b), (b, a)] {
-            if let Some(&i) = at.get(this.as_str()) {
-                let other_name = at.get(other.as_str()).map(|&o| stored.projects[o].name.clone());
+        let (a, b) = (live(a), live(b));
+        let pair = if a < b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+        if a == b || pairs.contains(&pair) {
+            continue;
+        }
+        pairs.push(pair);
+        for (this, other) in [(&a, &b), (&b, &a)] {
+            if let Some(&i) = at.get(this) {
+                let other_name = at.get(other).map(|&o| listed[o].project.name.clone());
                 listed[i].suggestions.push(ListedSuggestion {
                     other_id: other.clone(),
                     other_name,
@@ -216,6 +274,19 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
                 });
             }
         }
+    }
+    for (id, (_, merged_at)) in &stored.merged_into {
+        if let Some(&i) = at.get(&live(id)) {
+            listed[i].merged.push(ListedMerged {
+                id: id.clone(),
+                name: names.get(id.as_str()).map(|n| n.to_string()).unwrap_or_default(),
+                merge_id: stored.merges.get(id).copied(),
+                merged_at: *merged_at,
+            });
+        }
+    }
+    for l in &mut listed {
+        l.merged.sort_by(|a, b| (a.merged_at, &a.id).cmp(&(b.merged_at, &b.id)));
     }
     listed.sort_by_cached_key(|l| (l.project.name.to_lowercase(), l.project.id.clone()));
     listed
@@ -284,14 +355,19 @@ pub async fn rename_project(store: &MemoryStore, id: &str, name: &str) -> Result
             if into != id {
                 return Err(RenameError::Merged { id, into });
             }
-            let others: Vec<(String, String)> = {
-                let mut stmt = tx.prepare("SELECT id, name FROM project WHERE id <> ?1").map_err(sql)?;
+            // A tombstone's name is free: nobody chooses it any more. Its id
+            // still leads to the project it went into, so it stays taken.
+            let others: Vec<(String, Option<String>)> = {
+                let mut stmt = tx
+                    .prepare("SELECT id, CASE WHEN merged_into IS NULL THEN name END FROM project WHERE id <> ?1")
+                    .map_err(sql)?;
                 let rows = stmt.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sql)?;
                 rows.collect::<rusqlite::Result<_>>().map_err(sql)?
             };
             // In Rust, since SQLite's lower() folds ASCII alone.
             let wanted = name.to_lowercase();
-            if let Some((other, _)) = others.into_iter().find(|(o, n)| o.to_lowercase() == wanted || n.to_lowercase() == wanted) {
+            let holds = |(o, n): &(String, Option<String>)| o.to_lowercase() == wanted || n.as_ref().is_some_and(|n| n.to_lowercase() == wanted);
+            if let Some((other, _)) = others.into_iter().find(holds) {
                 return Err(RenameError::Taken { name, other });
             }
             tx.execute("UPDATE project SET name = ?2, reviewed = 1 WHERE id = ?1", rusqlite::params![id, name]).map_err(sql)?;
@@ -302,6 +378,92 @@ pub async fn rename_project(store: &MemoryStore, id: &str, name: &str) -> Result
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(e) => e,
             other => RenameError::Store(MemoryError::Backend(other.to_string())),
+        })
+}
+
+/// What [`keep_apart`] answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptApart {
+    pub project_id: String,
+    pub other_id: String,
+    /// How many suggestions pending between the two it answered.
+    pub answered: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum KeepApartError {
+    #[error("no project has the id {0}")]
+    NotFound(String),
+    #[error("project {0} cannot be kept apart from itself")]
+    Same(String),
+    #[error("project {id} was merged into {into}")]
+    Merged { id: String, into: String },
+    #[error(transparent)]
+    Store(#[from] MemoryError),
+}
+
+/// Answers `apart` every suggestion pending between projects `a` and `b`,
+/// read through the merges since it was made, and marks both reviewed. With
+/// none pending it records the pair answered, with reason `user`, which keeps
+/// a registration from suggesting it later: a suggestion is made once per
+/// pair.
+pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApart, KeepApartError> {
+    let (a, b) = (a.to_string(), b.to_string());
+    store
+        .conn
+        .call(move |c| {
+            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::Sqlite(e));
+            let tx = c.transaction().map_err(sql)?;
+            for id in [&a, &b] {
+                let known: bool =
+                    tx.query_row("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1)", [id], |r| r.get(0)).map_err(sql)?;
+                if !known {
+                    return Err(KeepApartError::NotFound(id.clone()));
+                }
+                let into = canonical_in(&tx, id).map_err(sql)?;
+                if into != *id {
+                    return Err(KeepApartError::Merged { id: id.clone(), into });
+                }
+            }
+            if a == b {
+                return Err(KeepApartError::Same(a));
+            }
+            let now = TimestampMs::now();
+            let open: Vec<(i64, String, String)> = {
+                let mut stmt = tx
+                    .prepare("SELECT rowid, project_id, other_id FROM project_suggestion WHERE answer IS NULL")
+                    .map_err(sql)?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(sql)?;
+                rows.collect::<rusqlite::Result<_>>().map_err(sql)?
+            };
+            let mut answered = 0;
+            for (rowid, one, other) in open {
+                let sides = (canonical_in(&tx, &one).map_err(sql)?, canonical_in(&tx, &other).map_err(sql)?);
+                if (sides.0 == a && sides.1 == b) || (sides.0 == b && sides.1 == a) {
+                    tx.execute(
+                        "UPDATE project_suggestion SET answer = 'apart', answered_at = ?2 WHERE rowid = ?1",
+                        rusqlite::params![rowid, now],
+                    )
+                    .map_err(sql)?;
+                    answered += 1;
+                }
+            }
+            if answered == 0 {
+                tx.execute(
+                    "INSERT OR IGNORE INTO project_suggestion (project_id, other_id, reason, created_at, answer, answered_at) \
+                     VALUES (?1, ?2, 'user', ?3, 'apart', ?3)",
+                    rusqlite::params![a, b, now],
+                )
+                .map_err(sql)?;
+            }
+            tx.execute("UPDATE project SET reviewed = 1 WHERE id IN (?1, ?2)", [&a, &b]).map_err(sql)?;
+            tx.commit().map_err(sql)?;
+            Ok(KeptApart { project_id: a, other_id: b, answered })
+        })
+        .await
+        .map_err(|e| match e {
+            tokio_rusqlite::Error::Error(e) => e,
+            other => KeepApartError::Store(MemoryError::Backend(other.to_string())),
         })
 }
 
@@ -543,5 +705,102 @@ mod tests {
             "the clone's folder goes by the remote its checkout has"
         );
         assert_eq!(listed[0].remotes, vec!["github.com/acme/app".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_merged_project_is_listed_under_its_target_and_frees_its_name() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('web-3c4d', 'web', 'root', 1, 1), ('api-5e6f', 'api', 'root', 1, 2);
+                     INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) \
+                       VALUES ('app-1a2b', 'app', 'root', 0, 1, 'web-3c4d', 9);
+                     INSERT INTO project_merge (source, target, merged_at) VALUES ('app-1a2b', 'web-3c4d', 9);
+                     INSERT INTO project_merge_change (merge_id, kind, a) VALUES (1, 'tombstoned', 'app-1a2b');
+                     INSERT INTO project_path (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 1);
+                     INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES \
+                       ('app-1a2b', 'api-5e6f', 'root_commit', 3), ('api-5e6f', 'web-3c4d', 'root_commit', 4), \
+                       ('app-1a2b', 'web-3c4d', 'root_commit', 5);",
+                )
+            })
+            .await
+            .unwrap();
+
+        let listed = list_projects(&store, Arc::new(FakeGround::default())).await.unwrap();
+
+        let ids: Vec<&str> = listed.iter().map(|l| l.project.id.as_str()).collect();
+        assert_eq!(ids, vec!["api-5e6f", "web-3c4d"], "a tombstone is not listed");
+        let web = &listed[1];
+        let merged = ListedMerged { id: "app-1a2b".into(), name: "app".into(), merge_id: Some(1), merged_at: Some(9) };
+        assert_eq!(web.merged, vec![merged]);
+        let folders: Vec<&str> = web.folders.iter().map(|f| f.root_id.as_str()).collect();
+        assert_eq!(folders, vec!["app-1a2b"], "a folder that led to the tombstone leads to its target");
+        // (app, api) is (web, api) now, the pair (api, web) already is; (app, web) is one project.
+        let others = |l: &ListedProject| l.suggestions.iter().map(|s| s.other_id.clone()).collect::<Vec<_>>();
+        assert_eq!((others(&listed[0]), others(web)), (vec!["web-3c4d".to_string()], vec!["api-5e6f".to_string()]));
+
+        rename_project(&store, "api-5e6f", "APP").await.expect("a tombstone's name is free");
+        let taken = rename_project(&store, "api-5e6f", "app-1a2b").await;
+        assert!(matches!(taken, Err(RenameError::Taken { .. })), "its id is not: {taken:?}");
+        let merged = rename_project(&store, "app-1a2b", "x").await;
+        assert!(matches!(&merged, Err(RenameError::Merged { into, .. }) if into == "web-3c4d"), "{merged:?}");
+    }
+
+    #[tokio::test]
+    async fn keeping_two_projects_apart_answers_their_suggestion_for_good() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('web-3c4d', 'web', 'root', 0, 1), ('api-5e6f', 'api', 'root', 0, 2), ('lib-7a8b', 'lib', 'root', 1, 3);
+                     INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) \
+                       VALUES ('app-1a2b', 'app', 'root', 0, 1, 'web-3c4d', 9);
+                     INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES \
+                       ('app-1a2b', 'api-5e6f', 'root_commit', 3), ('api-5e6f', 'web-3c4d', 'remote_changed', 4);",
+                )
+            })
+            .await
+            .unwrap();
+
+        let kept = keep_apart(&store, "api-5e6f", "web-3c4d").await.unwrap();
+
+        assert_eq!(kept, KeptApart { project_id: "api-5e6f".into(), other_id: "web-3c4d".into(), answered: 2 });
+        let rows = |sql: &'static str| {
+            let store = &store;
+            async move {
+                store
+                    .conn
+                    .call(move |c| {
+                        let mut stmt = c.prepare(sql)?;
+                        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>();
+                        rows
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(rows("SELECT answer FROM project_suggestion ORDER BY rowid").await, vec!["apart", "apart"]);
+        assert_eq!(project(&store, "api-5e6f").await.unwrap().2, 1, "both are reviewed");
+        assert_eq!(project(&store, "web-3c4d").await.unwrap().2, 1);
+        let listed = list_projects(&store, Arc::new(FakeGround::default())).await.unwrap();
+        assert!(listed.iter().all(|l| l.suggestions.is_empty()), "{listed:?}");
+
+        let without = keep_apart(&store, "lib-7a8b", "web-3c4d").await.unwrap();
+        assert_eq!(without.answered, 0);
+        assert_eq!(
+            rows("SELECT project_id || ' ' || other_id || ' ' || reason || ' ' || answer FROM project_suggestion WHERE rowid = 3").await,
+            vec!["lib-7a8b web-3c4d user apart"],
+            "a pair kept apart before any suggestion is recorded, so none is made later"
+        );
+
+        assert!(matches!(keep_apart(&store, "web-3c4d", "web-3c4d").await, Err(KeepApartError::Same(_))));
+        assert!(matches!(keep_apart(&store, "web-3c4d", "nobody-0000").await, Err(KeepApartError::NotFound(id)) if id == "nobody-0000"));
+        let merged = keep_apart(&store, "app-1a2b", "api-5e6f").await;
+        assert!(matches!(&merged, Err(KeepApartError::Merged { into, .. }) if into == "web-3c4d"), "{merged:?}");
     }
 }
