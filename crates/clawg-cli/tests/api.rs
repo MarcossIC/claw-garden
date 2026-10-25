@@ -4448,6 +4448,8 @@ const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
     ("POST", "/projects", None),
     ("GET", "/projects", None),
     ("PATCH", "/projects/{id}", Some("path.id")),
+    ("POST", "/projects/merge", Some("body.target")),
+    ("POST", "/projects/keep-apart", Some("body.project_id")),
     // A folder's root id, which a merge does not change.
     ("POST", "/projects/docs/search", None),
     ("POST", "/shutdown", None),
@@ -4598,6 +4600,15 @@ async fn every_route_that_takes_a_project_follows_a_merge() {
                 assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
                 assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route}: {body}");
             }
+            ("POST", "/projects/merge") => {
+                let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": other, "target": app })).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+                assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route}: {body}");
+            }
+            ("POST", "/projects/keep-apart") => {
+                let (status, body) = h.post_json("/v1/projects/keep-apart", json!({ "project_id": app, "other_id": other })).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+            }
             _ => panic!("{route} takes a project and no check here follows it past a merge"),
         }
     }
@@ -4650,4 +4661,112 @@ async fn the_move_of_a_merge_is_undone_only_with_its_merge() {
     let merge_id = merged.merge_id.expect("a merge").to_string();
     assert!(body["detail"].as_str().is_some_and(|d| d.contains(&format!("--undo {merge_id}"))), "{body}");
     assert_eq!(project_of(&h, row).await, json!(web), "nothing moved");
+}
+
+#[tokio::test]
+async fn merging_through_the_daemon_leaves_everything_under_the_target() {
+    let h = Harness::start().await;
+    let (app, web) = (registered(&h, "/work/app").await, registered(&h, "/work/web").await);
+    let row = save_in(&h, &app, "the parser of app is written by hand").await;
+
+    let (status, dry) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!((dry["dry_run"].as_bool(), dry["memories"].as_i64(), &dry["merge_id"]), (Some(true), Some(1), &Value::Null));
+    assert_eq!(project_of(&h, row).await, json!(app), "a dry run moves nothing");
+
+    let (status, merged) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
+    assert_eq!(status, 200, "{merged}");
+    let merge_id = merged["merge_id"].as_i64().expect("a merge");
+    assert!(merged["snapshot"].as_str().is_some_and(|s| s.contains("pre-merge")), "{merged}");
+    assert_eq!(project_of(&h, row).await, json!(web));
+
+    let refused = [
+        (json!({ "source": web, "target": app }), 409, "project_merged"),
+        (json!({ "source": "nowhere-9f9f", "target": web }), 404, "no project nowhere-9f9f"),
+        (json!({ "source": web, "target": web }), 400, "cannot be merged into itself"),
+        (json!({ "source": web }), 400, "name a source and a target"),
+        (json!({ "undo": merge_id, "source": web }), 400, "name a source and a target"),
+        (json!({ "undo": 99 }), 404, "no merge 99"),
+    ];
+    for (body, want, error) in refused {
+        let (status, answer) = h.post_json("/v1/projects/merge", body.clone()).await;
+        assert_eq!(status, want, "{body}: {answer}");
+        assert!(answer["error"].as_str().is_some_and(|e| e.contains(error)), "{body}: {answer}");
+    }
+
+    let (status, undone) = h.post_json("/v1/projects/merge", json!({ "undo": merge_id })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert!(undone["snapshot"].as_str().is_some_and(|s| s.contains("pre-undo")), "{undone}");
+    assert_eq!(project_of(&h, row).await, json!(app));
+    let (status, again) = h.post_json("/v1/projects/merge", json!({ "undo": merge_id })).await;
+    assert_eq!((status, again["error"].as_str()), (409, Some("merge_undone")), "{again}");
+
+    let (status, kept) = h.post_json("/v1/projects/keep-apart", json!({ "project_id": app, "other_id": web })).await;
+    assert_eq!(status, 200, "{kept}");
+    assert_eq!(kept, json!({ "project_id": app, "other_id": web, "answered": 0 }));
+    let (status, _) = h.post_json("/v1/projects/keep-apart", json!({ "project_id": app, "other_id": app })).await;
+    assert_eq!(status, 400);
+    let (status, _) = h.post_json("/v1/projects/keep-apart", json!({ "project_id": app, "other_id": "nowhere-9f9f" })).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn the_listing_after_a_merge_shows_the_target_alone() {
+    let h = Harness::start().await;
+    let (app, web) = (registered(&h, "/work/app").await, registered(&h, "/work/web").await);
+    save_in(&h, &app, "the parser of app is written by hand").await;
+    let (_, merged) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
+
+    let (status, body) = h.get_json("/v1/projects").await;
+
+    assert_eq!(status, 200, "{body}");
+    let projects = body["projects"].as_array().expect("projects");
+    assert_eq!(projects.len(), 1, "{body}");
+    assert_eq!((&projects[0]["id"], &projects[0]["memories"]), (&json!(web), &json!(1)));
+    assert_eq!(projects[0]["merged"][0]["id"], json!(app), "{body}");
+    assert_eq!(projects[0]["merged"][0]["merge_id"], merged["merge_id"], "{body}");
+    let folders: Vec<&Value> = projects[0]["folders"].as_array().expect("folders").iter().map(|f| &f["root_path"]).collect();
+    assert_eq!(folders, vec![&json!("/work/app"), &json!("/work/web")], "{body}");
+}
+
+/// Writes a save still in the outbox for `project`, as one the worker has not finished.
+async fn pending_save(h: &Harness, operation: &'static str, project: &str) {
+    let event = json!({ "agent_id": "agent-http", "project_id": project, "content": "" }).to_string();
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, created_at, updated_at) \
+                 VALUES (?1, 'agent-http', 'a save', ?2, 1, 1)",
+                [operation, event.as_str()],
+            )
+        })
+        .await
+        .expect("a pending save");
+}
+
+#[tokio::test]
+async fn a_merge_waits_for_the_saves_of_its_projects() {
+    let h = Harness::start().await;
+    let (app, web, other) =
+        (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
+    pending_save(&h, "op-1", &app).await;
+    let store = h.ctx.runtime.store.clone();
+    let finish = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        store.conn.call(|c| c.execute("DELETE FROM ingest_outbox", [])).await.expect("the save ends");
+    });
+    let started = Instant::now();
+
+    let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert!(started.elapsed() >= Duration::from_millis(300), "it waited for the save");
+    finish.await.unwrap();
+
+    pending_save(&h, "op-2", &web).await;
+    let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": web, "target": other })).await;
+    assert_eq!((status, body["error"].as_str(), body["retryable"].as_bool()), (409, Some("saves_pending"), Some(true)), "{body}");
 }

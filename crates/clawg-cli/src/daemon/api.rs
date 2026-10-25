@@ -46,8 +46,10 @@ use clawg_core::memory::portability::timing::{Step, Timing};
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::identity::{Disk, Ground};
 use clawg_core::memory::project::{register_project, RegisterError, Registration};
-use clawg_core::memory::merge::canonical;
-use clawg_core::memory::registry::{list_projects, rename_project, ListedProject, Project, RenameError};
+use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
+use clawg_core::memory::registry::{
+    keep_apart, list_projects, rename_project, KeepApartError, KeptApart, ListedProject, Project, RenameError,
+};
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach, Reader};
@@ -1053,6 +1055,8 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/import/undo", post(undo_import))
         .route("/projects", post(register).get(projects))
         .route("/projects/{id}", patch(rename))
+        .route("/projects/merge", post(merge_projects))
+        .route("/projects/keep-apart", post(keep_projects_apart))
         .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
@@ -2136,6 +2140,71 @@ async fn rename(
         RenameError::Store(_) => ApiError::internal(e),
     })?;
     Ok(Json(renamed))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergeRequest {
+    source: Option<String>,
+    target: Option<String>,
+    /// The number of a merge to undo, instead of a source and a target.
+    undo: Option<i64>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// The status a refused merge answers with: a project or a merge that is not
+/// there is missing, a merge of a project into itself is the caller's
+/// mistake, and a tombstone, an undo out of order or saves still being stored
+/// are conflicts, the last one worth trying again.
+fn merge_error(e: MergeError) -> ApiError {
+    let conflict = |code: &str, e: &MergeError| ApiError { detail: Some(e.to_string()), ..ApiError::conflict(code) };
+    match e {
+        MergeError::UnknownProject(_) | MergeError::UnknownMerge(_) => ApiError::not_found(e.to_string()),
+        MergeError::SameProject(_) => ApiError::bad_request(e.to_string()),
+        MergeError::Merged { .. } => conflict("project_merged", &e),
+        MergeError::SavesPending(_) => ApiError { retryable: Some(true), ..conflict("saves_pending", &e) },
+        MergeError::Undone(_) => conflict("merge_undone", &e),
+        MergeError::MergedLater { .. } => conflict("merged_later", &e),
+        MergeError::Store(e) => ApiError::internal(e),
+    }
+}
+
+/// Merges one project into another, or undoes a merge, for the user. Needs no
+/// embedder.
+async fn merge_projects(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<MergeRequest>,
+) -> ApiResult<Json<MergeReport>> {
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let (store, workspaces) = (&app.runtime.store, app.runtime.workspaces());
+    let report = match (body.undo, body.source, body.target) {
+        (Some(merge_id), None, None) => undo_merge_core(store, &workspaces, &backups, merge_id, body.dry_run).await,
+        (None, Some(source), Some(target)) => merge_core(store, &workspaces, &backups, &source, &target, body.dry_run).await,
+        _ => return Err(ApiError::bad_request("name a source and a target, or a merge to undo")),
+    };
+    report.map(Json).map_err(merge_error)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeepApartRequest {
+    project_id: String,
+    other_id: String,
+}
+
+/// The user's answer that two projects are not one: no suggestion between
+/// them is made again.
+async fn keep_projects_apart(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<KeepApartRequest>,
+) -> ApiResult<Json<KeptApart>> {
+    keep_apart(&app.runtime.store, &body.project_id, &body.other_id).await.map(Json).map_err(|e| match e {
+        KeepApartError::NotFound(_) => ApiError::not_found(e.to_string()),
+        KeepApartError::Same(_) => ApiError::bad_request(e.to_string()),
+        KeepApartError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+        KeepApartError::Store(_) => ApiError::internal(e),
+    })
 }
 
 /// Refreshes the project's documentation index in the background, once the
