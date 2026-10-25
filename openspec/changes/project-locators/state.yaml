@@ -1,18 +1,18 @@
 change: project-locators
 objective: "2"
 depends_on: [project-registry, project-reassign, project-clone-identity]
-phase: apply  # entrega 1: spec, diseño y tareas escritos; sigue implementarla
+phase: verify  # entrega 1: implementada y verificada en Windows; falta el CI del pull request
 artifacts:
   exploration: done  # la de project-registry (89), en su archivo
   proposal: done  # las decisiones de 89 del 2026-10-24, para las entregas 1 a 4
   spec: partial  # entrega 1 (PL1 a PL10); las entregas 2 a 4 suman las suyas
   design: partial  # entrega 1 (D1 a D14): project es la referencia, las carpetas en project_path
   tasks: partial  # entrega 1
-  apply: pending
-  verify: pending
+  apply: partial  # entrega 1, en 0.64.0
+  verify: partial  # entrega 1: Windows y el binario en un home temporal; falta el CI del pull request
   archive: pending  # cuando cierre la entrega 4
 deliveries:
-  "1": tasks  # el registro (V27)
+  "1": verify  # el registro (V27); sale en 0.64.0
   "2": pending  # unir, revisar y borrar
   "3": pending  # proyectos sin carpeta y el agente
   "4": pending  # exportar e importar
