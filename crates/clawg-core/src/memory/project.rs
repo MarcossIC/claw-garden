@@ -31,7 +31,7 @@ use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
 use crate::memory::identity::{candidate_id, derive_project_id, Checkout, Ground, RootCommit, CANDIDATES};
 use crate::memory::registry::project_name;
-use crate::memory::relocate::merge_in;
+use crate::memory::relocate::{merge_in, Span};
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
 
@@ -790,7 +790,7 @@ fn write_in(
     }
     let (mut moved, mut move_id) = (0, None);
     if !plan.legacy.is_empty() {
-        let merged = merge_in(c, &plan.legacy, &plan.project_id, now)?;
+        let merged = merge_in(c, &plan.legacy, &plan.project_id, Span::Keep, now)?;
         (moved, move_id) = (merged.moved.len(), merged.move_id);
         for legacy_id in &plan.legacy {
             for table in OTHER_PROJECT_TABLES {
@@ -906,7 +906,7 @@ pub async fn register_project(
     // After the commit and outside it: a file copy that fails must not undo
     // rows already moved, and the legacy file is still there for the next try.
     for legacy_id in &legacy {
-        if let Err(e) = workspaces.adopt_legacy(legacy_id, &outcome.project_id).await {
+        if let Err(e) = workspaces.adopt_legacy(legacy_id, &outcome.project_id, true).await {
             log::warn!("could not carry the workspace of {legacy_id} over to {}: {e}", outcome.project_id);
         }
     }

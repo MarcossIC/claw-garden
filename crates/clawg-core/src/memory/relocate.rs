@@ -86,6 +86,10 @@ pub struct MoveReport {
     /// stays live in its place.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub superseded: Vec<Supersede>,
+    /// The first row of each unit a merge took only part of: its rows in a
+    /// project the merge does not join stayed there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split: Vec<i64>,
 }
 
 impl MoveReport {
@@ -681,24 +685,38 @@ pub struct Supersede {
     pub by: i64,
 }
 
+/// What joining does with a unit that also has rows in a project it does not
+/// join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Span {
+    /// Leaves the unit where it is: the legacy ids a registration joins stay
+    /// live projects, where their rows are still found.
+    Keep,
+    /// Takes the unit's rows in the projects joined and leaves the others: a
+    /// project merged is a tombstone, and a row left under it would be in no
+    /// project anyone lists or searches.
+    Carry,
+}
+
 /// [`decide`] for joining the projects `origins` into `target`: a clash is
 /// no refusal, since [`reconcile`] settles it after the move, and a unit may
 /// already have rows in the target, which stay. A unit with a row anywhere
-/// else is left where it is.
-pub(crate) fn decide_merge(units: &[Unit], origins: &[String], target: &str) -> MoveReport {
+/// else is left where it is or split, as `span` says.
+pub(crate) fn decide_merge(units: &[Unit], origins: &[String], target: &str, span: Span) -> MoveReport {
     let mut report = MoveReport::default();
+    let joined = |r: &UnitRow| r.project_id.as_ref().is_some_and(|p| origins.contains(p));
     for unit in units {
         let first = unit.selected.first().copied().unwrap_or_default();
-        let elsewhere = unit
-            .rows
-            .iter()
-            .any(|r| r.project_id.as_deref() != Some(target) && !r.project_id.as_ref().is_some_and(|p| origins.contains(p)));
+        let elsewhere = unit.rows.iter().any(|r| r.project_id.as_deref() != Some(target) && !joined(r));
         if elsewhere {
-            report.skipped.push(Skipped { id: first, refusal: Refusal::SpansProjects });
-            continue;
+            if span == Span::Keep {
+                report.skipped.push(Skipped { id: first, refusal: Refusal::SpansProjects });
+                continue;
+            }
+            report.split.push(first);
         }
         let mut moved_any = false;
-        for r in unit.rows.iter().filter(|r| r.project_id.as_deref() != Some(target)) {
+        for r in unit.rows.iter().filter(|r| joined(r)) {
             moved_any = true;
             let protected = (r.live && MemoryType::is_protected_name(&r.memory_type)).then(|| r.memory_type.clone());
             report.protected += usize::from(protected.is_some());
@@ -879,10 +897,17 @@ fn supersede_in(c: &Connection, move_id: i64, supersedes: &[Supersede]) -> rusql
 
 /// Joins the projects `origins` into `target` inside the caller's
 /// transaction: every row of theirs, deleted ones too, moves with its unit as
-/// one logged move, and then the target keeps one live row per key and per
-/// text that a moved row touches (see [`reconcile`]). Nothing but `project_id`,
-/// `scope`, and the state of the rows replaced, changes.
-pub(crate) fn merge_in(c: &Connection, origins: &[String], target: &str, now: TimestampMs) -> rusqlite::Result<MoveReport> {
+/// one logged move (a unit that is also elsewhere as `span` says), and then
+/// the target keeps one live row per key and per text that a moved row
+/// touches (see [`reconcile`]). Nothing but `project_id`, `scope`, and the
+/// state of the rows replaced, changes.
+pub(crate) fn merge_in(
+    c: &Connection,
+    origins: &[String],
+    target: &str,
+    span: Span,
+    now: TimestampMs,
+) -> rusqlite::Result<MoveReport> {
     let seeds: Vec<(i64, Option<String>)> = {
         let ids = serde_json::to_string(origins).unwrap_or_default();
         let mut stmt = c.prepare(
@@ -892,7 +917,7 @@ pub(crate) fn merge_in(c: &Connection, origins: &[String], target: &str, now: Ti
         rows.map(|id| id.map(|id| (id, Some(target.to_string())))).collect::<rusqlite::Result<_>>()?
     };
     let units = read_units_in(c, &seeds, None)?;
-    let mut report = decide_merge(&units, origins, target);
+    let mut report = decide_merge(&units, origins, target, span);
     for skipped in &report.skipped {
         log::warn!("memory #{} stays where it is: {}", skipped.id, skipped.refusal);
     }
@@ -1784,10 +1809,26 @@ mod tests {
             ],
             &origins,
             B,
+            Span::Keep,
         );
         assert_eq!(moved_ids(&report), vec![1]);
         assert_eq!(report.skipped, vec![Skipped { id: 3, refusal: Refusal::SpansProjects }]);
         assert_eq!(report.unchanged, vec![5]);
+        assert_eq!(report.split, Vec::<i64>::new());
+    }
+
+    #[test]
+    fn decide_merge_carrying_takes_the_joined_part_of_a_unit_elsewhere() {
+        let origins = vec![A.to_string()];
+        let report = decide_merge(
+            &[unit(vec![row(3, Some(A)), row(4, Some("repo-cccc")), row(6, None)], &[3], Some(B))],
+            &origins,
+            B,
+            Span::Carry,
+        );
+        assert_eq!(moved_ids(&report), vec![3], "the rows elsewhere, or in no project, stay");
+        assert_eq!(report.split, vec![3]);
+        assert_eq!(report.skipped, Vec::<Skipped>::new());
     }
 
     async fn merge(store: &MemoryStore, from: &str, to: &str) -> MoveReport {
@@ -1796,7 +1837,7 @@ mod tests {
             .conn
             .call(move |c| {
                 let tx = c.transaction()?;
-                let report = merge_in(&tx, &from, &to, TimestampMs::now())?;
+                let report = merge_in(&tx, &from, &to, Span::Keep, TimestampMs::now())?;
                 tx.commit()?;
                 Ok::<_, rusqlite::Error>(report)
             })

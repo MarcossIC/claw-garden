@@ -4,9 +4,16 @@
 //! goes through [`canonical`] to reach the live one.
 
 use std::collections::HashSet;
+use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
+use crate::memory::backup::Reason;
+use crate::memory::clock::TimestampMs;
+use crate::memory::relocate::{merge_in, Span, Supersede};
+use crate::memory::workspace::{Adopted, WorkspaceManager};
 use crate::memory::{MemoryError, MemoryStore};
 
 /// How far [`canonical_in`] follows `merged_into`. A merge points every
@@ -46,6 +53,363 @@ pub(crate) fn canonical_in(c: &Connection, id: &str) -> rusqlite::Result<String>
 pub async fn canonical(store: &MemoryStore, id: &str) -> Result<String, MemoryError> {
     let id = id.to_string();
     store.conn.call(move |c| canonical_in(c, &id)).await.map_err(MemoryError::Connection)
+}
+
+/// How long a merge waits for the saves of its two projects still in the
+/// outbox: the worker reads a save's project more than once before it stores
+/// it, and a merge in between would split what it decides.
+pub const SAVES_WAIT: Duration = Duration::from_secs(5);
+
+const SAVES_POLL: Duration = Duration::from_millis(100);
+
+/// Why a merge was refused. Nothing is written.
+#[derive(Debug, thiserror::Error)]
+pub enum MergeError {
+    #[error("no project {0}")]
+    UnknownProject(String),
+    #[error("project {0} cannot be merged into itself")]
+    SameProject(String),
+    #[error("project {id} was merged into {into}")]
+    Merged { id: String, into: String },
+    #[error("{0} saves of these projects are still being stored; merge again in a moment")]
+    SavesPending(i64),
+    #[error(transparent)]
+    Store(#[from] MemoryError),
+}
+
+impl From<rusqlite::Error> for MergeError {
+    fn from(e: rusqlite::Error) -> Self {
+        MergeError::Store(MemoryError::Sqlite(e))
+    }
+}
+
+/// The `workspace.md` files of a merge, by path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceCopies {
+    /// The copies made in the target, or that a dry run would make.
+    pub copied: Vec<String>,
+    /// Each file of the source left beside the target's own, which differs.
+    pub kept_beside: Vec<[String; 2]>,
+    /// Why copying stopped, when it did; the merge stands.
+    pub failed: Vec<String>,
+}
+
+impl From<Adopted> for WorkspaceCopies {
+    fn from(adopted: Adopted) -> Self {
+        WorkspaceCopies {
+            copied: adopted.copied.iter().map(|(_, path)| path.display().to_string()).collect(),
+            kept_beside: adopted
+                .kept_beside
+                .iter()
+                .map(|(from, to)| [from.display().to_string(), to.display().to_string()])
+                .collect(),
+            failed: Vec::new(),
+        }
+    }
+}
+
+/// What a merge does, or would do on a dry run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeReport {
+    pub dry_run: bool,
+    /// The merge's number in `project_merge`; `None` when nothing was written.
+    pub merge_id: Option<i64>,
+    pub source: String,
+    pub target: String,
+    /// The move of its rows of `memory` in `memory_move`.
+    pub move_id: Option<i64>,
+    /// How many rows of `memory` went to the target.
+    pub memories: usize,
+    /// What the target keeps live in place of a row of the same key or text.
+    pub superseded: Vec<Supersede>,
+    /// The first row of each unit whose rows in another project stayed there.
+    pub split: Vec<i64>,
+    /// How many live preferences and decisions went to the target.
+    pub protected: usize,
+    pub trajectories: usize,
+    pub skills: usize,
+    /// How many reviews of `synthesize` went to the target.
+    pub reviews: usize,
+    /// The folders that lead to the target now, by id.
+    pub folders: Vec<String>,
+    pub remotes: Vec<String>,
+    /// The projects merged before into the source, which lead to the target now.
+    pub tombstones: Vec<String>,
+    /// How many suggestions it answered `merged`.
+    pub suggestions: usize,
+    pub workspaces: WorkspaceCopies,
+    /// The `pre-merge` snapshot taken before writing.
+    pub snapshot: Option<String>,
+}
+
+/// One row of `project_merge_change`: something a merge changed, with what
+/// it was before.
+struct Change {
+    kind: &'static str,
+    a: String,
+    b: Option<String>,
+}
+
+fn change(kind: &'static str, a: impl Into<String>, b: Option<String>) -> Change {
+    Change { kind, a: a.into(), b }
+}
+
+fn texts_in(c: &Connection, sql: &str, id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = c.prepare(sql)?;
+    let rows = stmt.query_map([id], |r| r.get(0))?.collect();
+    rows
+}
+
+/// Points the rows of `table` whose `column` is `from` at `to`, and returns
+/// their `key`s.
+fn repoint_in(c: &Connection, table: &str, key: &str, column: &str, from: &str, to: &str) -> rusqlite::Result<Vec<String>> {
+    let keys = texts_in(c, &format!("SELECT {key} FROM {table} WHERE {column} = ?1 ORDER BY {key}"), from)?;
+    c.execute(&format!("UPDATE {table} SET {column} = ?2 WHERE {column} = ?1"), [from, to])?;
+    Ok(keys)
+}
+
+/// Merges `source` into `target` inside the caller's transaction and
+/// journals it with `snapshot`. A source already merged into `target` is
+/// repaired: what is still under it moves, and it stays the tombstone it was.
+/// A report without `merge_id` changed nothing.
+fn merge_pass(
+    c: &Connection,
+    source: &str,
+    target: &str,
+    snapshot: Option<&str>,
+    now: TimestampMs,
+) -> Result<MergeReport, MergeError> {
+    if source == target {
+        return Err(MergeError::SameProject(source.to_string()));
+    }
+    let merged_into = |id: &str| -> Result<Option<String>, MergeError> {
+        c.query_row("SELECT merged_into FROM project WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| MergeError::UnknownProject(id.to_string()))
+    };
+    let source_into = merged_into(source)?;
+    if let Some(into) = merged_into(target)? {
+        return Err(MergeError::Merged { id: target.to_string(), into });
+    }
+    let repair = match source_into {
+        None => false,
+        Some(into) if into == target => true,
+        Some(into) => return Err(MergeError::Merged { id: source.to_string(), into }),
+    };
+    let pending: i64 = c.query_row(
+        "SELECT COUNT(*) FROM ingest_outbox \
+         WHERE state = 'pending' AND json_extract(event, '$.project_id') IN (?1, ?2)",
+        [source, target],
+        |r| r.get(0),
+    )?;
+    if pending > 0 {
+        return Err(MergeError::SavesPending(pending));
+    }
+
+    let moved = merge_in(c, &[source.to_string()], target, Span::Carry, now)?;
+    let mut report = MergeReport {
+        source: source.to_string(),
+        target: target.to_string(),
+        move_id: moved.move_id,
+        memories: moved.moved.len(),
+        superseded: moved.superseded,
+        split: moved.split,
+        protected: moved.protected,
+        ..MergeReport::default()
+    };
+    let mut changes = Vec::new();
+    for (table, kind) in [("episodic_trajectory", "trajectory"), ("procedural_skill", "skill")] {
+        let rows = texts_in(c, &format!("SELECT CAST(id AS TEXT) FROM {table} WHERE project_id = ?1 ORDER BY id"), source)?;
+        c.execute(&format!("UPDATE {table} SET project_id = ?2 WHERE project_id = ?1"), [source, target])?;
+        match kind {
+            "trajectory" => report.trajectories = rows.len(),
+            _ => report.skills = rows.len(),
+        }
+        changes.extend(rows.into_iter().map(|id| change(kind, id, None)));
+    }
+
+    let reviews: Vec<(String, i64)> = {
+        let mut stmt = c.prepare("SELECT agent_id, reviewed_at FROM synthesis_review WHERE scope_key = ?1 ORDER BY agent_id")?;
+        let rows = stmt.query_map([source], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (agent, at) in &reviews {
+        let had: Option<i64> = c
+            .query_row(
+                "SELECT reviewed_at FROM synthesis_review WHERE agent_id = ?1 AND scope_key = ?2",
+                [agent, target],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // The older review: one memory of either side left uncounted would
+        // never remind anyone to synthesize it.
+        c.execute(
+            "INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (agent_id, scope_key) DO UPDATE SET reviewed_at = MIN(reviewed_at, excluded.reviewed_at)",
+            rusqlite::params![agent, target, at],
+        )?;
+        changes.push(change("review", agent.as_str(), Some(at.to_string())));
+        changes.push(change("review_target", agent.as_str(), had.map(|h| h.to_string())));
+    }
+    c.execute("DELETE FROM synthesis_review WHERE scope_key = ?1", [source])?;
+    report.reviews = reviews.len();
+
+    report.folders = repoint_in(c, "project_path", "id", "project_id", source, target)?;
+    report.remotes = repoint_in(c, "project_remote", "remote", "project_id", source, target)?;
+    report.tombstones = repoint_in(c, "project", "id", "merged_into", source, target)?;
+    changes.extend(report.folders.iter().map(|id| change("folder", id.as_str(), None)));
+    changes.extend(report.remotes.iter().map(|remote| change("remote", remote.as_str(), None)));
+    changes.extend(report.tombstones.iter().map(|id| change("tombstone", id.as_str(), None)));
+
+    if !repair {
+        c.execute(
+            "UPDATE project SET merged_into = ?2, merged_at = ?3 WHERE id = ?1",
+            rusqlite::params![source, target, now],
+        )?;
+        changes.push(change("tombstoned", source, None));
+    }
+
+    let open: Vec<(i64, String, String)> = {
+        let mut stmt =
+            c.prepare("SELECT rowid, project_id, other_id FROM project_suggestion WHERE answer IS NULL ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (rowid, a, b) in open {
+        if canonical_in(c, &a)? == canonical_in(c, &b)? {
+            c.execute(
+                "UPDATE project_suggestion SET answer = 'merged', answered_at = ?2 WHERE rowid = ?1",
+                rusqlite::params![rowid, now],
+            )?;
+            changes.push(change("suggestion", rowid.to_string(), None));
+            report.suggestions += 1;
+        }
+    }
+
+    if report.move_id.is_none() && changes.is_empty() {
+        return Ok(report);
+    }
+    let reviewed: bool = c.query_row("SELECT reviewed FROM project WHERE id = ?1", [target], |r| r.get(0))?;
+    if !reviewed {
+        c.execute("UPDATE project SET reviewed = 1 WHERE id = ?1", [target])?;
+        changes.push(change("reviewed", target, Some("0".to_string())));
+    }
+    c.execute(
+        "INSERT INTO project_merge (source, target, move_id, snapshot, merged_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![source, target, report.move_id, snapshot, now],
+    )?;
+    let merge_id = c.last_insert_rowid();
+    let mut log = c.prepare_cached("INSERT INTO project_merge_change (merge_id, kind, a, b) VALUES (?1, ?2, ?3, ?4)")?;
+    for ch in &changes {
+        log.execute(rusqlite::params![merge_id, ch.kind, ch.a, ch.b])?;
+    }
+    report.merge_id = Some(merge_id);
+    Ok(report)
+}
+
+fn connection_error(e: tokio_rusqlite::Error<MergeError>) -> MergeError {
+    match e {
+        tokio_rusqlite::Error::Error(e) => e,
+        other => MergeError::Store(MemoryError::Backend(other.to_string())),
+    }
+}
+
+/// Runs [`merge_pass`] in a transaction it commits only when `write`, and
+/// again while saves of the two projects are pending, for up to
+/// [`SAVES_WAIT`].
+async fn pass(
+    store: &MemoryStore,
+    source: &str,
+    target: &str,
+    snapshot: Option<String>,
+    write: bool,
+) -> Result<MergeReport, MergeError> {
+    let deadline = tokio::time::Instant::now() + SAVES_WAIT;
+    loop {
+        let (s, t, snap) = (source.to_string(), target.to_string(), snapshot.clone());
+        let result = store
+            .conn
+            .call(move |c| -> Result<MergeReport, MergeError> {
+                let tx = c.transaction()?;
+                let report = merge_pass(&tx, &s, &t, snap.as_deref(), TimestampMs::now())?;
+                if write {
+                    tx.commit()?;
+                }
+                Ok(report)
+            })
+            .await
+            .map_err(connection_error);
+        match result {
+            Err(MergeError::SavesPending(_)) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(SAVES_POLL).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn record_copies(store: &MemoryStore, merge_id: i64, agents: Vec<String>) -> Result<(), MemoryError> {
+    store
+        .conn
+        .call(move |c| {
+            let tx = c.transaction()?;
+            for agent in &agents {
+                tx.execute(
+                    "INSERT INTO project_merge_change (merge_id, kind, a, b) VALUES (?1, 'workspace', ?2, NULL)",
+                    rusqlite::params![merge_id, agent],
+                )?;
+            }
+            tx.commit()
+        })
+        .await
+        .map_err(MemoryError::Connection)
+}
+
+/// Merges `source` into `target`: everything under `source` moves there and
+/// `source` is left a tombstone, after a `pre-merge` snapshot into `backups`,
+/// in one transaction that decides again what a first pass, which writes
+/// nothing, found. Then each agent's `workspace.md` of `source` is copied
+/// where `target` has none, and the copies are journaled. A dry run stops
+/// after the first pass and touches no file.
+pub async fn merge_core(
+    store: &MemoryStore,
+    workspaces: &WorkspaceManager,
+    backups: &Path,
+    source: &str,
+    target: &str,
+    dry_run: bool,
+) -> Result<MergeReport, MergeError> {
+    let found = pass(store, source, target, None, false).await?;
+    if found.merge_id.is_none() {
+        return Ok(MergeReport { dry_run, ..found });
+    }
+    if dry_run {
+        let workspaces = match workspaces.adopt_legacy(source, target, false).await {
+            Ok(adopted) => adopted.into(),
+            Err(e) => WorkspaceCopies { failed: vec![e.to_string()], ..WorkspaceCopies::default() },
+        };
+        return Ok(MergeReport { dry_run, merge_id: None, move_id: None, workspaces, ..found });
+    }
+    let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreMerge).await?.display().to_string();
+    let mut report = pass(store, source, target, Some(snapshot.clone()), true).await?;
+    report.snapshot = Some(snapshot);
+    let Some(merge_id) = report.merge_id else {
+        return Ok(report);
+    };
+    match workspaces.adopt_legacy(source, target, true).await {
+        Ok(adopted) => {
+            let agents: Vec<String> = adopted.copied.iter().map(|(agent, _)| agent.clone()).collect();
+            report.workspaces = adopted.into();
+            if let Err(e) = record_copies(store, merge_id, agents).await {
+                log::warn!("merge {merge_id} copied workspaces it could not journal: {e}");
+            }
+        }
+        Err(e) => {
+            log::warn!("merge {merge_id} could not copy the workspaces of {source}: {e}");
+            report.workspaces.failed.push(e.to_string());
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -109,5 +473,331 @@ mod tests {
             "a chain of MAX_MERGE_HOPS merges still ends in its project"
         );
         assert_eq!(canonical(&store, &starts[0]).await.unwrap(), "p0", "one merge more is too long");
+    }
+
+    // ── merging ─────────────────────────────────────────────────────────
+
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use crate::memory::events::{MemoryEvent, MemorySource};
+    use crate::memory::relocate::Supersede;
+    use crate::memory::workspace::WorkspaceManager;
+    use crate::memory::worker::save_for_test;
+    use crate::models::chat::Role;
+
+    const A: &str = "app-aaaa";
+    const B: &str = "web-bbbb";
+    const C: &str = "api-cccc";
+
+    struct Fixture {
+        store: Arc<MemoryStore>,
+        workspaces: WorkspaceManager,
+        backups: PathBuf,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    impl Fixture {
+        async fn new(projects: &[&str]) -> Self {
+            let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+            let (workspaces, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let fixture = Fixture {
+                store,
+                workspaces: WorkspaceManager::new(workspaces.path().to_path_buf()),
+                backups: backups.path().join("backups"),
+                _dirs: (workspaces, backups),
+            };
+            for id in projects {
+                fixture.sql(&format!(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('{id}', '{id}', 'root', 0, 1);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id) \
+                       VALUES ('{id}', '/work/{id}', 1, 0, '{id}');"
+                ))
+                .await;
+            }
+            fixture
+        }
+
+        async fn sql(&self, batch: &str) {
+            let batch = batch.to_string();
+            self.store.conn.call(move |c| c.execute_batch(&batch)).await.unwrap();
+        }
+
+        async fn rows<T: Send + 'static>(&self, sql: &str, row: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>) -> Vec<T> {
+            let sql = sql.to_string();
+            self.store
+                .conn
+                .call(move |c| {
+                    let mut stmt = c.prepare(&sql)?;
+                    let rows = stmt.query_map([], row)?.collect::<rusqlite::Result<Vec<T>>>();
+                    rows
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn save(&self, content: &str, project: &str, key: Option<&str>, at: u64) -> i64 {
+            let evt = MemoryEvent {
+                agent_id: "agent-a".into(),
+                project_id: Some(project.into()),
+                role: Role::User,
+                content: content.into(),
+                is_error: None,
+                source: MemorySource::Explicit,
+                timestamp_ms: at,
+                memory_type: Some("semantic_fact".into()),
+                importance: None,
+                derived_from: Vec::new(),
+                topic_key: key.map(str::to_string),
+                user_stated: false,
+                session_id: None,
+            };
+            let report = save_for_test(&self.store, &evt).await;
+            assert_eq!(report.failure, None);
+            report.memories[0].id
+        }
+
+        async fn merge(&self, source: &str, target: &str, dry_run: bool) -> Result<MergeReport, MergeError> {
+            merge_core(&self.store, &self.workspaces, &self.backups, source, target, dry_run).await
+        }
+
+        fn workspace(&self, agent: &str, project: &str) -> PathBuf {
+            self.workspaces.workspace_path(agent, Some(project))
+        }
+
+        fn write_workspace(&self, agent: &str, project: &str, user: &str) -> String {
+            let text = format!("<!-- AUTO-START -->\n<!-- AUTO-END -->\n<!-- USER-START -->\n{user}\n<!-- USER-END -->\n");
+            let path = self.workspace(agent, project);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &text).unwrap();
+            text
+        }
+
+        /// Every row a merge may touch, as text, to compare before and after.
+        async fn everything(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT json_array(id, project_id, scope, status, superseded_by, supersede_cause) FROM memory",
+                "SELECT json_array('trajectory', id, project_id) FROM episodic_trajectory",
+                "SELECT json_array('skill', id, project_id) FROM procedural_skill",
+                "SELECT json_array(id, name, reviewed, merged_into, merged_at) FROM project",
+                "SELECT json_array(id, project_id) FROM project_path",
+                "SELECT json_array(remote, project_id) FROM project_remote",
+                "SELECT json_array(project_id, other_id, answer) FROM project_suggestion",
+                "SELECT json_array(agent_id, scope_key, reviewed_at) FROM synthesis_review",
+                "SELECT json_array('merge', merge_id) FROM project_merge",
+                "SELECT json_array('move', move_id, row_id) FROM memory_move",
+            ] {
+                out.extend(self.rows(&format!("{sql} ORDER BY 1"), |r| r.get::<_, String>(0)).await);
+            }
+            out
+        }
+    }
+
+    fn ids(rows: &[(i64, Option<String>)]) -> Vec<i64> {
+        rows.iter().map(|r| r.0).collect()
+    }
+
+    #[tokio::test]
+    async fn merging_moves_every_row_and_locator_into_the_target() {
+        let f = Fixture::new(&[A, B]).await;
+        let note = f.save("the daemon listens on clawg.sock", A, None, 1).await;
+        f.sql(&format!(
+            "INSERT INTO episodic_trajectory \
+               (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+               VALUES ('agent', 'agent-a', '{A}', 's', 't', 1, 1, 1);
+             INSERT INTO procedural_skill \
+               (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
+               VALUES ('agent', 'agent-a', '{A}', 'k', 't', 1, '[]', 1, 1, 1);
+             INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', '{A}', 10), ('', '{B}', 20);
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', '{A}', 1);
+             INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('{B}', '{A}', 'root_commit', 1);"
+        ))
+        .await;
+        let workspace = f.write_workspace("agent-a", A, "a note of the user");
+
+        let report = f.merge(A, B, false).await.unwrap();
+
+        assert_eq!((report.source.as_str(), report.target.as_str(), report.dry_run), (A, B, false));
+        assert_eq!(report.merge_id, Some(1));
+        assert!(report.move_id.is_some());
+        assert_eq!(
+            (report.memories, report.trajectories, report.skills, report.reviews, report.suggestions),
+            (1, 1, 1, 1, 1)
+        );
+        assert_eq!((report.folders.clone(), report.remotes.clone()), (vec![A.to_string()], vec!["github.com/acme/app".to_string()]));
+        let snapshot = report.snapshot.clone().expect("a snapshot before writing");
+        assert!(snapshot.contains("pre-merge") && Path::new(&snapshot).exists(), "{snapshot}");
+
+        let rows = f.rows("SELECT id, project_id FROM memory WHERE id > 0 ORDER BY id", |r| Ok((r.get(0)?, r.get(1)?))).await;
+        assert_eq!(ids(&rows), vec![note]);
+        assert!(rows.iter().all(|r| r.1.as_deref() == Some(B)), "{rows:?}");
+        let other: Vec<String> = f
+            .rows(
+                "SELECT project_id FROM episodic_trajectory UNION ALL SELECT project_id FROM procedural_skill \
+                 UNION ALL SELECT project_id FROM project_path WHERE id = 'app-aaaa' \
+                 UNION ALL SELECT project_id FROM project_remote",
+                |r| r.get(0),
+            )
+            .await;
+        assert_eq!(other, vec![B; 4]);
+        let reviews: Vec<(String, i64)> =
+            f.rows("SELECT scope_key, reviewed_at FROM synthesis_review", |r| Ok((r.get(0)?, r.get(1)?))).await;
+        assert_eq!(reviews, vec![(B.to_string(), 10)], "the older review of the two");
+        let projects: Vec<(String, i64, Option<String>, bool)> = f
+            .rows("SELECT id, reviewed, merged_into, merged_at IS NOT NULL FROM project ORDER BY id", |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .await;
+        assert_eq!(projects, vec![(A.to_string(), 0, Some(B.to_string()), true), (B.to_string(), 1, None, false)]);
+        let answers: Vec<Option<String>> = f.rows("SELECT answer FROM project_suggestion", |r| r.get(0)).await;
+        assert_eq!(answers, vec![Some("merged".to_string())]);
+        assert_eq!(canonical(&f.store, A).await.unwrap(), B);
+
+        assert_eq!(std::fs::read_to_string(f.workspace("agent-a", A)).unwrap(), workspace, "the source's file is never changed");
+        assert_eq!(std::fs::read_to_string(f.workspace("agent-a", B)).unwrap(), workspace, "the target had none");
+        assert_eq!(report.workspaces.copied, vec![f.workspace("agent-a", B).display().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_merge_keeps_the_newest_save_of_a_key_and_the_oldest_of_a_text() {
+        let f = Fixture::new(&[A, B]).await;
+        let older = f.save("Storage engine is SQLite", A, Some("storage/engine"), 10).await;
+        let newer = f.save("Storage engine is SQLite with WAL", B, Some("storage/engine"), 20).await;
+        let first = f.save("the socket is clawg.sock", A, None, 5).await;
+        let second = f.save("the socket is clawg.sock", B, None, 9).await;
+
+        let report = f.merge(A, B, false).await.unwrap();
+
+        assert_eq!(report.superseded, vec![Supersede { row: older, by: newer }, Supersede { row: second, by: first }]);
+        let live: Vec<i64> = f
+            .rows("SELECT id FROM memory WHERE status = 'active' AND id > 0 ORDER BY id", |r| r.get(0))
+            .await;
+        assert_eq!(live, vec![newer, first]);
+    }
+
+    #[tokio::test]
+    async fn a_merge_moves_the_part_of_a_split_unit_it_holds() {
+        let f = Fixture::new(&[A, B, C]).await;
+        let old = f.save("Logs go to serve.log", A, Some("logging/target"), 10).await;
+        let new = f.save("Logs go to serve.log, rotated", A, Some("logging/target"), 20).await;
+        // Split before units moved whole: the older version went to C alone.
+        f.sql(&format!("UPDATE memory SET project_id = '{C}' WHERE id = {old}")).await;
+
+        let report = f.merge(A, B, false).await.unwrap();
+
+        assert_eq!(report.split, vec![new]);
+        let places: Vec<(i64, Option<String>)> =
+            f.rows("SELECT id, project_id FROM memory WHERE id > 0 ORDER BY id", |r| Ok((r.get(0)?, r.get(1)?))).await;
+        assert_eq!(places, vec![(old, Some(C.to_string())), (new, Some(B.to_string()))], "nothing is left under the tombstone");
+    }
+
+    #[tokio::test]
+    async fn merging_a_target_repoints_its_tombstones() {
+        let f = Fixture::new(&[A, B, C]).await;
+        f.merge(A, B, false).await.unwrap();
+
+        let report = f.merge(B, C, false).await.unwrap();
+
+        assert_eq!(report.tombstones, vec![A.to_string()]);
+        let merged: Vec<(String, Option<String>)> =
+            f.rows("SELECT id, merged_into FROM project ORDER BY id", |r| Ok((r.get(0)?, r.get(1)?))).await;
+        assert_eq!(merged, vec![(C.to_string(), None), (A.to_string(), Some(C.to_string())), (B.to_string(), Some(C.to_string()))]);
+        assert_eq!(canonical(&f.store, A).await.unwrap(), C);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_merge_changes_nothing() {
+        let f = Fixture::new(&[A, B]).await;
+        f.save("the daemon listens on clawg.sock", A, None, 1).await;
+        f.sql(&format!("INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', '{A}', 10);")).await;
+        f.write_workspace("agent-a", A, "a note of the user");
+        let before = f.everything().await;
+
+        let report = f.merge(A, B, true).await.unwrap();
+
+        assert!(report.dry_run);
+        assert_eq!((report.merge_id, report.move_id, report.snapshot.clone()), (None, None, None));
+        assert_eq!((report.memories, report.reviews, report.folders.clone()), (1, 1, vec![A.to_string()]));
+        assert_eq!(report.workspaces.copied, vec![f.workspace("agent-a", B).display().to_string()]);
+        assert_eq!(f.everything().await, before);
+        assert!(!f.workspace("agent-a", B).exists());
+        assert!(!f.backups.exists(), "no snapshot");
+    }
+
+    #[tokio::test]
+    async fn a_merge_copies_a_workspace_only_where_the_target_has_none() {
+        let f = Fixture::new(&[A, B]).await;
+        let only_source = f.write_workspace("agent-a", A, "kept by agent a");
+        let source = f.write_workspace("agent-b", A, "the source's notes");
+        let target = f.write_workspace("agent-b", B, "the target's notes");
+
+        let report = f.merge(A, B, false).await.unwrap();
+
+        assert_eq!(report.workspaces.copied, vec![f.workspace("agent-a", B).display().to_string()]);
+        assert_eq!(
+            report.workspaces.kept_beside,
+            vec![[f.workspace("agent-b", A).display().to_string(), f.workspace("agent-b", B).display().to_string()]]
+        );
+        assert_eq!(std::fs::read_to_string(f.workspace("agent-a", B)).unwrap(), only_source);
+        assert_eq!(std::fs::read_to_string(f.workspace("agent-b", A)).unwrap(), source);
+        assert_eq!(std::fs::read_to_string(f.workspace("agent-b", B)).unwrap(), target);
+        let journal: Vec<(String, String)> = f
+            .rows("SELECT kind, a FROM project_merge_change WHERE kind = 'workspace'", |r| Ok((r.get(0)?, r.get(1)?)))
+            .await;
+        assert_eq!(journal, vec![("workspace".to_string(), "agent-a".to_string())], "only the copy made is journaled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_merge_is_refused_while_a_save_of_its_projects_is_pending() {
+        let f = Fixture::new(&[A, B]).await;
+        for (operation, project) in [("op-a", A), ("op-b", B)] {
+            let event = format!(r#"{{"agent_id":"agent-a","project_id":"{project}","content":""}}"#);
+            f.sql(&format!(
+                "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, created_at, updated_at) \
+                 VALUES ('{operation}', 'agent-a', 'a save', '{event}', 1, 1);"
+            ))
+            .await;
+        }
+        let before = f.everything().await;
+
+        let refused = f.merge(A, B, false).await;
+
+        assert!(matches!(refused, Err(MergeError::SavesPending(2))), "{refused:?}");
+        assert_eq!(f.everything().await, before);
+        f.sql("UPDATE ingest_outbox SET state = 'failed'").await;
+        assert!(f.merge(A, B, false).await.is_ok(), "a failed save is not in flight");
+    }
+
+    #[tokio::test]
+    async fn a_merge_of_a_tombstone_into_its_target_repairs_it() {
+        let f = Fixture::new(&[A, B]).await;
+        f.merge(A, B, false).await.unwrap();
+        let merged_at: Vec<i64> = f.rows(&format!("SELECT merged_at FROM project WHERE id = '{A}'"), |r| r.get(0)).await;
+        // A row left under the tombstone, as a store edited by hand could hold.
+        let left = f.save("a note left behind", B, None, 1).await;
+        f.sql(&format!("UPDATE memory SET project_id = '{A}' WHERE id = {left}")).await;
+
+        let report = f.merge(A, B, false).await.unwrap();
+
+        assert_eq!((report.merge_id, report.memories), (Some(2), 1));
+        let after: Vec<(Option<String>, i64)> =
+            f.rows(&format!("SELECT merged_into, merged_at FROM project WHERE id = '{A}'"), |r| Ok((r.get(0)?, r.get(1)?))).await;
+        assert_eq!(after, vec![(Some(B.to_string()), merged_at[0])], "the tombstone stays the one it was");
+        let nothing = f.merge(A, B, false).await.unwrap();
+        assert_eq!((nothing.merge_id, nothing.snapshot), (None, None), "a repair with nothing to move writes nothing");
+    }
+
+    #[tokio::test]
+    async fn a_merge_is_refused_for_an_unknown_the_same_or_a_merged_project() {
+        let f = Fixture::new(&[A, B, C]).await;
+        assert!(matches!(f.merge("nowhere-9f9f", B, false).await, Err(MergeError::UnknownProject(id)) if id == "nowhere-9f9f"));
+        assert!(matches!(f.merge(A, A, false).await, Err(MergeError::SameProject(id)) if id == A));
+        f.merge(A, B, false).await.unwrap();
+        let into_tombstone = f.merge(C, A, false).await;
+        assert!(matches!(&into_tombstone, Err(MergeError::Merged { id, into }) if id == A && into == B), "{into_tombstone:?}");
+        let elsewhere = f.merge(A, C, false).await;
+        assert!(matches!(&elsewhere, Err(MergeError::Merged { id, into }) if id == A && into == B), "{elsewhere:?}");
     }
 }
