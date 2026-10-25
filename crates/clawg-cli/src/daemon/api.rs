@@ -23,7 +23,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use clawg_core::memory::admin::{
     Deleted, delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
@@ -46,6 +46,7 @@ use clawg_core::memory::portability::timing::{Step, Timing};
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::identity::{Disk, Ground};
 use clawg_core::memory::project::{register_project, RegisterError, Registration};
+use clawg_core::memory::registry::{list_projects, rename_project, ListedProject, Project, RenameError};
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach, Reader};
@@ -1049,7 +1050,8 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/backup", post(backup))
         .route("/import", post(import_memories).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
         .route("/import/undo", post(undo_import))
-        .route("/projects", post(register))
+        .route("/projects", post(register).get(projects))
+        .route("/projects/{id}", patch(rename))
         .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
@@ -2078,6 +2080,39 @@ async fn register(
         spawn_doc_refresh(app.clone(), outcome.root_id.clone());
     }
     Ok(Json(RegisteredBody { project_id: outcome.project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectsBody {
+    pub projects: Vec<ListedProject>,
+}
+
+/// Every project, with or without a folder, with what leads to it, how many
+/// memories it holds and the suggestions about it nobody answered.
+async fn projects(State(app): State<Arc<AppCtx>>) -> ApiResult<Json<ProjectsBody>> {
+    let projects = list_projects(&app.runtime.store, Arc::new(Disk)).await.map_err(ApiError::internal)?;
+    Ok(Json(ProjectsBody { projects }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameRequest {
+    pub name: String,
+}
+
+/// Names a project and marks it reviewed. Its id, and with it what was
+/// saved under it, stays.
+async fn rename(
+    State(app): State<Arc<AppCtx>>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameRequest>,
+) -> ApiResult<Json<Project>> {
+    let renamed = rename_project(&app.runtime.store, &id, &body.name).await.map_err(|e| match e {
+        RenameError::NotFound(_) => ApiError::not_found(e.to_string()),
+        RenameError::Name(_) => ApiError::bad_request(e.to_string()),
+        RenameError::Taken { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("name_taken") },
+        RenameError::Store(_) => ApiError::internal(e),
+    })?;
+    Ok(Json(renamed))
 }
 
 /// Refreshes the project's documentation index in the background, once the

@@ -2990,6 +2990,101 @@ async fn registering_needs_the_token() {
     assert_eq!(status.as_u16(), 401);
 }
 
+#[tokio::test]
+async fn the_projects_are_listed_with_their_folders_and_suggestions() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let (app, copy, gone) = (base.path().join("app"), base.path().join("copia"), base.path().join("gone"));
+    let register = |root: &std::path::Path| {
+        h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true }))
+    };
+    git(base.path(), &["init", "app"]);
+    git(&app, &["commit", "--allow-empty", "-m", "the first commit of app"]);
+    let (_, a) = register(&app).await;
+    // Its origin is a path, so no remote tells the clone from a copy.
+    git(base.path(), &["clone", "app", "copia"]);
+    let (_, c) = register(&copy).await;
+    std::fs::create_dir(&gone).expect("a folder");
+    let (_, g) = register(&gone).await;
+    std::fs::remove_dir(&gone).expect("remove the folder");
+    let (status, saved) =
+        h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": "loose-1a2b" })).await;
+    assert_eq!(status, 201, "{saved}");
+
+    let (status, body) = h.get_json("/v1/projects").await;
+
+    assert_eq!(status, 200, "{body}");
+    let listed = body["projects"].as_array().expect("projects");
+    let project = |id: &Value| listed.iter().find(|p| p["id"] == *id).cloned().unwrap_or_else(|| panic!("{id} in {body}"));
+    let folder = |p: &Value| {
+        let folders = p["folders"].as_array().expect("folders");
+        assert_eq!(folders.len(), 1, "{p}");
+        let f = &folders[0];
+        (f["root_id"].clone(), f["root_path"].clone(), f["remote"].clone(), f["index_docs"].clone(), f["present"].clone())
+    };
+    let suggestion = |p: &Value| {
+        let s = &p["suggestions"][0];
+        (s["other_id"].clone(), s["other_name"].clone(), s["reason"].clone(), s["created_at"].is_i64())
+    };
+    let (pa, pc, pg, loose) = (project(&a["project_id"]), project(&c["project_id"]), project(&g["project_id"]), project(&json!("loose-1a2b")));
+    assert_eq!((pa["name"].as_str(), pa["born"].as_str(), pa["reviewed"].as_bool()), (Some("app"), Some("root"), Some(false)), "{pa}");
+    assert_eq!(folder(&pa), (a["root_id"].clone(), json!(app.to_string_lossy()), Value::Null, json!(false), json!(true)));
+    assert_eq!(suggestion(&pa), (c["project_id"].clone(), json!("copia"), json!("root_commit"), true), "{pa}");
+    assert_eq!(suggestion(&pc), (a["project_id"].clone(), json!("app"), json!("root_commit"), true), "{pc}");
+    assert_eq!(folder(&pg).4, json!(false), "a folder that is gone: {pg}");
+    assert_eq!((loose["born"].as_str(), loose["memories"].as_i64()), (Some("adopted"), Some(1)), "{loose}");
+    assert_eq!(loose["folders"], json!([]), "a project without a folder: {loose}");
+    assert_eq!(pa["memories"], json!(0));
+}
+
+impl Harness {
+    async fn rename(&self, id: &str, name: &str) -> (u16, Value) {
+        self.send(self.http.patch(self.url(&format!("/v1/projects/{id}"))).json(&json!({ "name": name }))).await
+    }
+}
+
+#[tokio::test]
+async fn renaming_a_project_keeps_what_was_saved_under_it() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let (app, web) = (base.path().join("app"), base.path().join("web"));
+    let mut ids = Vec::new();
+    for root in [&app, &web] {
+        std::fs::create_dir(root).expect("a folder");
+        let (status, registered) =
+            h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true })).await;
+        assert_eq!(status, 200, "{registered}");
+        ids.push(registered["project_id"].as_str().expect("project_id").to_string());
+    }
+    let (project, other) = (ids[0].as_str(), ids[1].as_str());
+    let (status, saved) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": project })).await;
+    assert_eq!(status, 201, "{saved}");
+
+    let (status, renamed) = h.rename(project, "  App web ").await;
+
+    assert_eq!(status, 200, "{renamed}");
+    assert_eq!((renamed["id"].as_str(), renamed["name"].as_str(), renamed["reviewed"].as_bool()), (Some(project), Some("App web"), Some(true)));
+    let (_, body) = h.get_json("/v1/projects").await;
+    let listed = body["projects"].as_array().and_then(|l| l.iter().find(|p| p["id"] == project)).cloned().expect("listed");
+    assert_eq!((listed["name"].as_str(), listed["reviewed"].as_bool(), listed["memories"].as_i64()), (Some("App web"), Some(true), Some(1)));
+    let (_, list) = h.get_json(&format!("/v1/memories?kind=memory&project={project}")).await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "what was saved under it is found as before: {list}");
+    let (status, taken) = h.rename(other, "app WEB").await;
+    assert_eq!((status, taken["error"].as_str()), (409, Some("name_taken")), "{taken}");
+    let (status, blank) = h.rename(project, "   ").await;
+    assert_eq!(status, 400, "{blank}");
+}
+
+#[tokio::test]
+async fn renaming_an_unknown_project_is_404() {
+    let h = Harness::start().await;
+
+    let (status, body) = h.rename("nobody-0000", "anything").await;
+
+    assert_eq!(status, 404, "{body}");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("nobody-0000")), "the answer names the id: {body}");
+}
+
 // ── Project documentation ───────────────────────────────────────────────────
 
 /// Writes `docs` under a fresh directory and records it as a project, without

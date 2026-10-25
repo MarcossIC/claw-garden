@@ -341,7 +341,7 @@ pub trait Ground: Send + Sync {
     /// The first commit of the checkout at `root`.
     fn root_commit(&self, root: &Path) -> RootCommit;
     /// Whether the checkout recorded at `path` with `stamp` is still there:
-    /// the path exists and what it holds has that stamp.
+    /// the path exists and, when a stamp was recorded, what it holds has it.
     fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool;
 }
 
@@ -362,7 +362,7 @@ impl Ground for Disk {
     }
 
     fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
-        path.exists() && git_stamp(path).as_deref() == stamp
+        path.exists() && stamp.is_none_or(|stamp| git_stamp(path).as_deref() == Some(stamp))
     }
 }
 
@@ -487,7 +487,7 @@ impl Ground for FakeGround {
     }
 
     fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
-        self.roots.lock().unwrap().get(path).is_some_and(|(checkout, _)| checkout.stamp.as_deref() == stamp)
+        self.roots.lock().unwrap().get(path).is_some_and(|(checkout, _)| stamp.is_none() || checkout.stamp.as_deref() == stamp)
     }
 }
 
