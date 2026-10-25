@@ -22,7 +22,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24 (sólo V25: IL2, su vuelta atrás e IL3). Que la importación llegue a sus filas por índice está en [`specs/portability`](../portability/spec.md) (IL1 e IL5).
 - [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24 (sólo V26, «El diario de los imports», IU6, y el motivo `pre-undo` en la poda). Qué escribe el diario y cómo se deshace un import está en [`specs/portability`](../portability/spec.md) (IU1 a IU5).
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (sólo «Cada carga dice quién la pidió y cuánto costó», RF4 de esa spec). Las series de memoria con que se lee en uso real están en [`specs/metrics`](../metrics/spec.md) (R6 y R8).
-- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (sólo V27, «Los proyectos y sus carpetas», y su vuelta atrás). Qué hace el registro con las tablas nuevas está en [`specs/project`](../project/spec.md) (PL1 a PL10).
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (sólo V27, «Los proyectos y sus carpetas», y su vuelta atrás). Qué hace el registro con las tablas nuevas está en [`specs/project`](../project/spec.md) (PL1 a PL10). Su entrega 2a, en la misma versión: V28, «La lápida y el diario de las uniones», su vuelta atrás y el motivo `pre-merge`; qué hacen una unión y su deshacer está en `specs/project` (PL11 a PL20).
 
 ## Definiciones
 
@@ -806,7 +806,7 @@ Un snapshot MUST incluir el outbox, y con él el texto enmascarado de los saves 
 
 ### Retención
 
-Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:290`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`, `pre-import`, `pre-move`, `pre-rekey`, `pre-undo`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:297`); el borrado es best-effort.
+Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:290`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`, `pre-import`, `pre-move`, `pre-rekey`, `pre-undo`, `pre-merge`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:297`); el borrado es best-effort.
 
 #### Escenario
 - GIVEN 7 snapshots automáticos, 2 manuales y un `notas.txt`
@@ -1026,6 +1026,29 @@ MUST NOT cambiar ninguna fila de `memory`, `episodic_trajectory`, `procedural_sk
 #### Vuelta atrás de V27
 
 Un binario anterior a V27 MUST NOT abrir una base en V27: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`, que `clawg update` restaura en el proceso. Quitar V27 a mano conserva lo guardado después; con un `sqlite3` 3.35 o más nuevo y el daemon parado: `DROP TRIGGER memory_project_ai; DROP TRIGGER memory_project_au; DROP TABLE project_suggestion; DROP TABLE project; DROP INDEX idx_project_path_root_commit; ALTER TABLE project_path DROP COLUMN git_stamp; ALTER TABLE project_path DROP COLUMN root_commit; ALTER TABLE project_path DROP COLUMN remote; ALTER TABLE project_path DROP COLUMN project_id; ALTER TABLE project_path RENAME TO project; DELETE FROM refinery_schema_history WHERE version = 27;`. Se pierden los nombres que el usuario puso, las sugerencias y las huellas. Las carpetas que agregaron una mudanza o una contradicción son filas que un binario anterior lee como las de R20: una raíz vinculada por mudanza vuelve a leerse con su propio id, y sus memorias quedan bajo el proyecto viejo, que se alcanza con `all_projects` o con `clawg projects move`.
+
+## La lápida y el diario de las uniones
+
+### PL11. V28
+
+V28 (`crates/clawg-core/migrations/V28__project_merge.sql`) MUST:
+
+- agregar a `project` `merged_into` y `merged_at`, NULL por defecto, con el índice parcial `idx_project_merged_into` sobre las filas con `merged_into`;
+- crear `project_merge` (`merge_id` clave primaria, `source`, `target`, `move_id`, `snapshot`, `merged_at`, `undone_at`, `undo_move_id`), una fila por unión;
+- crear `project_merge_change` (`merge_id`, `kind`, `a`, `b`), con el índice `idx_project_merge_change` por `merge_id` y sin `CHECK` sobre `kind`, como aprendió V26: un `CHECK` no se amplía sin reconstruir la tabla.
+
+MUST NOT cambiar ninguna fila. Las filas de `memory` de una unión van en `memory_move` y `memory_move_supersede` bajo su `move_id`; el resto, con lo que había antes, en `project_merge_change` (`tombstoned`, `trajectory`, `skill`, `review`, `review_target`, `folder`, `remote`, `tombstone`, `suggestion`, `reviewed`, `workspace`). Su checksum MUST quedar fijado con los demás. Una unión escribe antes el snapshot `pre-merge` (`Reason::PreMerge`) y su deshacer, `pre-undo`; la poda conserva el más nuevo de cada uno.
+
+#### Escenario: un store anterior
+- GIVEN un store en V27 con proyectos, carpetas, remotos, sugerencias, revisiones de `synthesize` y filas en las tres tablas
+- WHEN se abre con este clawg
+- THEN hay una copia `pre-migration`, ninguna fila cambió, ningún proyecto tiene `merged_into` y los dos diarios están vacíos
+
+**Tests:** `a_database_from_the_previous_version_opens_with_every_project_live` (`crates/clawg-core/src/memory/db.rs`); la fila 28 de `published_migration_checksums_are_pinned` (`migrations.rs`).
+
+#### Vuelta atrás de V28
+
+Un binario anterior a V28 MUST NOT abrir una base en V28: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`. Para quitar V28 a mano conservando lo guardado después, primero hay que deshacer cada unión con `clawg projects merge --undo N`: si no, cada lápida pasa a ser un proyecto vivo y vacío, sus filas siguen en el destino y un puente con su id escribe bajo ella. Después, con un `sqlite3` 3.35 o más nuevo y el daemon parado: `DROP TABLE project_merge_change; DROP TABLE project_merge; DROP INDEX idx_project_merged_into; ALTER TABLE project DROP COLUMN merged_at; ALTER TABLE project DROP COLUMN merged_into; DELETE FROM refinery_schema_history WHERE version = 28;`. Una unión sola se revierte con su `--undo` o con su snapshot `pre-merge`.
 
 ## El idioma de cada fila
 

@@ -8,7 +8,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23: los chequeos `preferences` y `protocol_block` (LP14).
 - [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23: `message` en el idioma del comando (R1) y el resto del hallazgo igual en los dos idiomas (CL4).
 - [project-registry](../../changes/archive/2026-10-25-project-registry/proposal.md), archivado el 2026-10-25: el chequeo `project_remotes` (R7, su RG5).
-- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0: los chequeos `projects` y `project_remotes` leen las carpetas de `project_path` (V27), con los mismos hallazgos. Un store anterior a V27 se lee con la tabla que tiene.
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0: los chequeos `projects` y `project_remotes` leen las carpetas de `project_path` (V27), con los mismos hallazgos. Un store anterior a V27 se lee con la tabla que tiene. Su entrega 2a, en la misma versión: los chequeos `project_duplicates`, `project_orphans` y `project_merges` (R7).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 
@@ -173,10 +173,20 @@ Las reglas 1 y 4 agrupan por proyecto, como la clave de tema y el dedup ([`specs
 | `projects` | una carpeta de `project_path` cuyo id no es ninguno de los que su raíz puede recibir (`candidate_id(root_path, 0..64)`, `is_candidate_for`) | `warn` `id_mismatch`, con el id y la ruta | — |
 | `project_remotes` | un proyecto con dos o más remotos atados en `project_remote`: lo que deja un repositorio clonado en el camino de otro con un clawg anterior a 0.63.0, o un remoto renombrado | `warn` `several_remotes`, con el id, sus remotos y cada raíz que lo usa (las carpetas con ese id y las raíces cuya clave actual, leída con `origin_key`, es uno de ellos) con su clave actual | — |
 | `project_remotes` | ninguno | `ok`, con cuántos remotos hay | — |
+| `project_duplicates` | dos proyectos vivos con el mismo nombre, sin distinguir mayúsculas | `warn` `same_name`, con los dos ids y sus nombres | `clawg projects merge <el más nuevo> --into <el más viejo> --dry-run --profile P` |
+| `project_duplicates` | carpetas de dos proyectos vivos con el mismo primer commit que ningún par de remotos distingue (alguna sin remoto, o el mismo) | `warn` `same_first_commit`, con los dos ids, sus nombres y el commit | el mismo |
+| `project_duplicates` | ninguno, o sólo pares con una sugerencia respondida (`apart`, `merged`) | `ok`, con cuántos proyectos vivos hay | — |
+| `project_orphans` | un id con filas en `memory`, `episodic_trajectory` o `procedural_skill`, borradas incluidas, que `project` no tiene | `warn` `no_project`, con el id y las filas de cada tabla | — |
+| `project_orphans` | ninguno | `ok`, con cuántos ids tienen filas | — |
+| `project_merges` | filas bajo una lápida | `warn` `rows_under_merged`, con el id, su proyecto vivo y las filas de cada tabla | `clawg projects merge <la lápida> --into <su proyecto vivo> --dry-run --profile P` |
+| `project_merges` | una lápida cuya cadena no termina en un proyecto vivo: un ciclo, más de `MAX_MERGE_HOPS` uniones o un id que `project` no tiene | `warn` `broken_merge`, con el id y su `merged_into` | — |
+| `project_merges` | ninguno | `ok`, con cuántas lápidas hay | — |
+
+Los tres últimos chequeos corren desde V27, cuando `project` es la tabla de los proyectos (`StoreFacts::registry`); en un store anterior no aportan nada. Ningún paso pide confirmación: una unión en seco no escribe nada. La cadena de una lápida se sigue como la sigue `canonical` ([`specs/project`](../project/spec.md), PL12).
 
 Con filas `pending` y un daemon vivo no hay hallazgo: las está ingiriendo.
 
-**Tests:** `the_facts_name_agents_projects_the_outbox_and_the_contract`, `the_facts_name_the_remotes_of_each_project` (`inspect.rs`); `outbox_findings`, `agent_findings`, `project_findings`, `a_project_id_assigned_to_its_root_is_ok`, `project_remote_findings`, `shell_words_are_quoted_only_when_a_shell_would_read_them` (`doctor`).
+**Tests:** `the_facts_name_agents_projects_the_outbox_and_the_contract`, `the_facts_name_the_remotes_of_each_project`, `the_facts_name_the_projects_their_folders_answers_and_rows` (`inspect.rs`); `outbox_findings`, `agent_findings`, `project_findings`, `a_project_id_assigned_to_its_root_is_ok`, `project_remote_findings`, `shell_words_are_quoted_only_when_a_shell_would_read_them`, `the_duplicates_are_named_by_name_and_by_first_commit`, `a_pair_kept_apart_is_no_duplicate`, `an_id_without_a_project_is_named`, `rows_under_a_merged_project_and_a_broken_chain_are_named` (`doctor`).
 
 ## R8. El registro MCP de Claude Code
 

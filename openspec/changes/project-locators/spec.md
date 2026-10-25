@@ -279,7 +279,7 @@ Cubre la parte de unir de la [entrega 2](proposal.md#2-unir-revisar-y-borrar): `
 - **Lápida:** un proyecto con `merged_into`. No recibe nada: cada id que lo nombra lleva al proyecto en el que se unió. Queda porque los puentes abiertos guardan sus ids durante toda la sesión (`ids_for`, `crates/clawg-cli/src/mcp/server.rs:860-897`) y los exports viejos los llevan.
 - **Proyecto vivo:** uno sin `merged_into`.
 - **`canonical(id)`:** el proyecto vivo al que lleva una lápida. Para un proyecto vivo, o un id que `project` no conoce, el mismo id.
-- **Parte del usuario de un `workspace.md`:** lo que hay entre `<!-- USER-START -->` y `<!-- USER-END -->` (`crates/clawg-core/src/memory/workspace.rs:15-16`).
+- **Parte del usuario de un `workspace.md`:** lo que la regeneración de la sección AUTO conserva tal cual (`split_existing`, `crates/clawg-core/src/memory/workspace.rs`): lo que hay antes de `<!-- AUTO-START -->`, entre `<!-- USER-START -->` y `<!-- USER-END -->`, y después.
 
 ## PL11. V28 agrega la lápida y el diario de las uniones
 
@@ -336,7 +336,7 @@ Lo que administra proyectos MUST NOT seguir la lápida: responde 409 `project_me
 - WHEN X se une en Z y después se corre `clawg outbox retry` sobre ese save
 - THEN el save queda bajo Z
 
-**Tests:** `canonical_follows_a_merge_and_leaves_any_other_id_as_it_is` y `a_cycle_or_a_chain_too_long_answers_the_id_itself` (`crates/clawg-core/src/memory/merge.rs`); `a_save_retried_after_a_merge_lands_in_its_target` (`worker.rs`); `a_bridge_opened_before_a_merge_reads_and_writes_its_target`, `a_move_from_a_merged_project_is_refused` y `the_move_of_a_merge_is_undone_only_with_its_merge` (`crates/clawg-cli/tests/api.rs`).
+**Tests:** `canonical_follows_a_merge_and_leaves_any_other_id_as_it_is` y `a_cycle_or_a_chain_too_long_answers_the_id_itself` (`crates/clawg-core/src/memory/merge.rs`); `a_save_retried_after_a_merge_lands_in_its_target` (`worker.rs`); `a_move_to_a_merged_project_lands_in_its_target` y `undoing_a_move_whose_origin_was_merged_returns_to_its_target` (`relocate.rs`); `a_root_whose_project_was_merged_registers_into_its_target`, también leyendo y planeando sin escribir (`project.rs`); `an_import_planned_before_a_merge_writes_into_its_target` (`import.rs`); `a_bridge_opened_before_a_merge_reads_and_writes_its_target`, `a_move_from_a_merged_project_is_refused` y `the_move_of_a_merge_is_undone_only_with_its_merge` (`crates/clawg-cli/tests/api.rs`).
 
 ## PL13. `POST /v1/projects/merge` une X en Z
 
@@ -388,7 +388,7 @@ El informe tiene `dry_run`, `merge_id`, `source`, `target`, `move_id`, `memories
 - WHEN se une A en B con `dry_run`
 - THEN el informe dice lo que pasaría, y el store, los archivos y la carpeta de backups quedan como estaban
 
-**Tests:** `merging_moves_every_row_and_locator_into_the_target`, `a_merge_keeps_the_newest_save_of_a_key_and_the_oldest_of_a_text`, `a_merge_moves_the_part_of_a_split_unit_it_holds`, `merging_a_target_repoints_its_tombstones`, `a_dry_run_merge_changes_nothing` y `a_merge_copies_a_workspace_only_where_the_target_has_none` (`merge.rs`); `a_merge_waits_for_the_saves_of_its_projects` y `merging_through_the_daemon_leaves_everything_under_the_target` (`tests/api.rs`).
+**Tests:** `merging_moves_every_row_and_locator_into_the_target`, `a_merge_keeps_the_newest_save_of_a_key_and_the_oldest_of_a_text`, `a_merge_moves_the_part_of_a_split_unit_it_holds`, `merging_a_target_repoints_its_tombstones`, `a_dry_run_merge_changes_nothing`, `a_merge_copies_a_workspace_only_where_the_target_has_none`, `a_merge_is_refused_while_a_save_of_its_projects_is_pending`, `a_merge_of_a_tombstone_into_its_target_repairs_it` y `a_merge_is_refused_for_an_unknown_the_same_or_a_merged_project` (`merge.rs`); `decide_merge_carrying_takes_the_joined_part_of_a_unit_elsewhere` (`relocate.rs`); `a_merge_waits_for_the_saves_of_its_projects` y `merging_through_the_daemon_leaves_everything_under_the_target` (`tests/api.rs`).
 
 ## PL14. El `--undo` de una unión
 
@@ -469,9 +469,9 @@ Los tres MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el
 - el snapshot;
 - el número de la unión, con el comando que la deshace.
 
-Un rechazo nombra los ids y la causa del daemon tal como llegó. `saves_pending` dice que se vuelva a intentar. `clawg projects list` MUST nombrar debajo de cada proyecto las lápidas que apuntan a él, con el comando que deshace cada unión.
+Un rechazo nombra los ids y la causa del daemon tal como llegó. `saves_pending` dice que se vuelva a intentar. `clawg projects list` MUST nombrar debajo de cada proyecto las lápidas que apuntan a él, con el comando que deshace cada unión, y, cuando hay sugerencias pendientes, terminar con los dos comandos que las responden.
 
-**Tests:** `projects_merge_and_keep_apart_parse` (`cli.rs`); `a_merge_report_names_what_moved_and_the_way_back` y `a_listing_names_what_was_merged_into_a_project` (`crates/clawg-cli/src/projects.rs`, en los dos idiomas).
+**Tests:** `projects_merge_and_keep_apart_parse` (`cli.rs`); `a_merge_report_names_what_moved_and_the_way_back`, `a_listing_names_what_was_merged_into_a_project` y `a_listing_marks_what_was_created_alone_and_the_suggestions` (`crates/clawg-cli/src/projects.rs`, en los dos idiomas); `projects_are_merged_and_kept_apart_through_the_daemon` (`projects.rs`, contra un daemon real).
 
 ## PL18. `doctor` nombra los duplicados, los ids sin proyecto y las lápidas rotas
 

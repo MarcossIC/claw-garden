@@ -1,6 +1,6 @@
 # project — Especificación
 
-Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre cómo una ruta se resuelve a la raíz de su proyecto y cómo se deriva el `project_id`. También cómo las filas guardadas bajo un id viejo pasan al de la raíz sin perderse, qué marca el registro sobre si el daemon puede leer los archivos de la raíz (`index_docs`), y qué hace el puente cuando el id de una raíz ya pertenece a otra. Un proyecto es una fila de `project`, la referencia de cada tabla, y una carpeta (`project_path`) es una forma de llegar a él: cómo se reconoce un checkout por sus huellas, cómo una mudanza conserva su proyecto, qué sugerencias quedan y cómo se listan y se nombran los proyectos (PL1 a PL10). Qué raíces se indexan y cómo se buscan sus docs está en [`specs/project-docs`](../project-docs/spec.md).
+Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre cómo una ruta se resuelve a la raíz de su proyecto y cómo se deriva el `project_id`. También cómo las filas guardadas bajo un id viejo pasan al de la raíz sin perderse, qué marca el registro sobre si el daemon puede leer los archivos de la raíz (`index_docs`), y qué hace el puente cuando el id de una raíz ya pertenece a otra. Un proyecto es una fila de `project`, la referencia de cada tabla, y una carpeta (`project_path`) es una forma de llegar a él: cómo se reconoce un checkout por sus huellas, cómo una mudanza conserva su proyecto, qué sugerencias quedan y cómo se listan y se nombran los proyectos (PL1 a PL10). También cómo se une un proyecto en otro y se deshace la unión, la lápida que deja y que cada entrada sigue, cómo se responde una sugerencia y qué duplicados nombra `doctor` (PL11 a PL20). Qué raíces se indexan y cómo se buscan sus docs está en [`specs/project-docs`](../project-docs/spec.md).
 
 **Origen:**
 - [project-identity](../../changes/archive/2026-10-12-project-identity/proposal.md), archivado el 2026-10-12.
@@ -11,7 +11,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (HI3: elegir y listar filas por su proyecto de origen).
 - [project-registry](../../changes/archive/2026-10-25-project-registry/proposal.md), archivado el 2026-10-25 con su entrega 0, que sale en 0.63.0 (R20: una fila de un camino sirve a una raíz sólo si su remoto no la contradice; cambia R15, R16 y R18). Sus entregas 1 a 4 (el registro de proyectos, unir y borrar, los proyectos sin carpeta, el export por localizador) pasaron a [project-locators](../../changes/project-locators/proposal.md).
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (RF1: un registro lanza el refresco de docs sólo si trae `index_docs: true`; cambia la nota de R4).
-- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (PL1 a PL10: `project` es la referencia de cada proyecto y las carpetas pasan a `project_path`, el primer commit es la segunda huella de una carpeta, una mudanza conserva el proyecto, lo dudoso queda como sugerencia, y `clawg projects list` y `rename`; cambia R4, R10, R15, R16, R18 y R20). Sus entregas 2 a 4 siguen en el cambio.
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (PL1 a PL10: `project` es la referencia de cada proyecto y las carpetas pasan a `project_path`, el primer commit es la segunda huella de una carpeta, una mudanza conserva el proyecto, lo dudoso queda como sugerencia, y `clawg projects list` y `rename`; cambia R4, R10, R15, R16, R18 y R20), y su entrega 2a, en la misma versión (PL11 a PL20: `clawg projects merge` con su lápida y su `--undo`, `canonical` en cada entrada que recibe un proyecto, `clawg projects keep-apart` y los duplicados de `doctor`; cambia PL9). Sus entregas 2b a 4 siguen en el cambio.
 
 ## Definiciones
 
@@ -32,6 +32,10 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - **Huellas de una carpeta:** su remoto (`project_path.remote`; una carpeta de antes de V27 sin él usa los que `project_remote` ata a su id) y su primer commit.
 - **Proyecto de una carpeta:** el de `project_path.project_id`. Si es NULL, la carpeta no se registró desde V27, y su proyecto es el que da R16: el de su clave en `project_remote`, o si no su id.
 - **Checkout grabado de una carpeta:** su camino con la marca que guardó. **Ya no está** cuando el camino no existe o, si guardó una marca, la de lo que hay hoy en él es otra.
+- **Lápida:** un proyecto con `merged_into`, el que dejó una unión (PL13). No recibe nada: cada id que lo nombra lleva al proyecto en el que se unió. Queda porque los puentes abiertos guardan sus ids toda la sesión y los exports viejos los llevan.
+- **Proyecto vivo:** uno sin `merged_into`.
+- **`canonical(id)`:** el proyecto vivo al que lleva una lápida; para un proyecto vivo, o un id que `project` no conoce, el mismo id (`crates/clawg-core/src/memory/merge.rs`).
+- **Parte del usuario de un `workspace.md`:** lo que la regeneración de la sección AUTO conserva tal cual (`split_existing`, `crates/clawg-core/src/memory/workspace.rs`): lo de antes de `<!-- AUTO-START -->` y la sección USER con lo que la sigue.
 - **Candidatos de una raíz:** `candidate_id(raíz, n)` para `n` de 0 a 63: el id nuevo para 0, y para el resto el mismo formato con el hash de los bytes de la ruta seguidos de `#n` (`crates/clawg-core/src/memory/identity.rs`).
 
 ## R1. Resolución de la raíz
@@ -445,7 +449,7 @@ El destino de un movimiento (`POST /v1/memories/move`, `PATCH` con `project_id`,
 
 ## PL9. `clawg projects list` y `clawg projects rename`
 
-**`GET /v1/projects`** está detrás del token y MUST responder `{"projects": [...]}` con cada proyecto, tenga carpeta o no, por nombre sin distinguir mayúsculas y después por id (`list_projects`, `crates/clawg-core/src/memory/registry.rs`), con:
+**`GET /v1/projects`** está detrás del token y MUST responder `{"projects": [...]}` con cada proyecto vivo (las lápidas, como dice PL15), tenga carpeta o no, por nombre sin distinguir mayúsculas y después por id (`list_projects`, `crates/clawg-core/src/memory/registry.rs`), con:
 
 - `id`, `name`, `born`, `reviewed` y `created_at`;
 - `folders`, de cero a muchas: `root_id`, `root_path`, `remote`, `index_docs` y `present`, que dice si el checkout grabado sigue ahí (sin marca grabada, si el camino existe);
@@ -474,3 +478,86 @@ Una carpeta con `project_id` NULL MUST listarse en el proyecto que le da R16, le
 - El contrato del modelo (`agent_contract.json`, `agent_contract.es.json`) no cambia, y ninguna sugerencia llega al agente.
 
 **Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` (sin volver a bendecir), y los de R4, R6 y R14 a R20.
+
+## PL11. V28: la lápida y el diario de las uniones
+
+V28 MUST agregar a `project` `merged_into` y `merged_at` (NULL por defecto, con un índice parcial por `merged_into`) y crear `project_merge` (`merge_id`, `source`, `target`, `move_id`, `snapshot`, `merged_at`, `undone_at`, `undo_move_id`) y `project_merge_change` (`merge_id`, `kind`, `a`, `b`, sin `CHECK` sobre `kind`), sin cambiar ninguna fila. Un store en V27 abre con todos sus proyectos vivos, y `canonical` de cada id es el mismo id. El detalle de V28 está en [`specs/storage`](../storage/spec.md).
+
+**Tests:** `a_database_from_the_previous_version_opens_with_every_project_live` (`crates/clawg-core/src/memory/db.rs`); la fila 28 de `published_migration_checksums_are_pinned`.
+
+## PL12. Cada entrada que recibe un proyecto sigue la lápida
+
+Una unión deja cada lápida apuntando a un proyecto vivo (PL13), así que `canonical` da un salto. Aun así MUST seguir `merged_into` hasta `MAX_MERGE_HOPS` (8), y un ciclo, el tope o un id que `project` no tiene MUST devolver el id del que partió, con un `warn`; `doctor` lo nombra (PL18).
+
+`canonical` MUST correr:
+
+- al entrar, en `POST /v1/memories` (antes de buscar la sesión y de escribir el outbox), `POST /v1/search`, `POST /v1/context` (también para el camino del `workspace.md` y los conteos de `synthesize`), `POST /v1/sessions`, `POST /v1/synthesis`, `GET /v1/disputes`, `GET /v1/memories` y `GET /v1/stats` (`live_project`, `crates/clawg-cli/src/daemon/api.rs`);
+- en el worker, al empezar cada save (`follow_merge`, `crates/clawg-core/src/memory/worker.rs`), antes de leer nada del proyecto: cubre un save que estaba en el outbox, una reanudación y `clawg outbox retry`;
+- en la transacción que escribe: el destino de un movimiento o de un `PATCH` (`target_in`, `relocate.rs`), el origen de cada fila en el `--undo` de un movimiento, el proyecto que recibe una raíz al registrarla, leerla o planearla (`plan_in`, `plan_ids_in`) y el de cada fila y carpeta de un import (`SqlSeat`, `record_projects`).
+
+Lo que administra proyectos MUST NOT seguir la lápida y responde 409 `project_merged`, con `detail` que nombra el proyecto vivo: `PATCH /v1/projects/{id}`, cualquiera de los lados de `POST /v1/projects/keep-apart`, el destino de `POST /v1/projects/merge` (y su origen cuando es la lápida de otro proyecto) y `from_project` de `POST /v1/memories/move`. El `undo` de `POST /v1/memories/move` que es el movimiento de una unión, o el de su `--undo`, MUST responder 409 `part_of_merge` nombrando la unión.
+
+**Tests:** `canonical_follows_a_merge_and_leaves_any_other_id_as_it_is` y `a_cycle_or_a_chain_too_long_answers_the_id_itself` (`merge.rs`); `a_save_retried_after_a_merge_lands_in_its_target` (`worker.rs`); `a_move_to_a_merged_project_lands_in_its_target` y `undoing_a_move_whose_origin_was_merged_returns_to_its_target` (`relocate.rs`); `a_root_whose_project_was_merged_registers_into_its_target` (`project.rs`); `an_import_planned_before_a_merge_writes_into_its_target` (`import.rs`); `a_bridge_opened_before_a_merge_reads_and_writes_its_target`, `a_move_from_a_merged_project_is_refused` y `the_move_of_a_merge_is_undone_only_with_its_merge` (`tests/api.rs`).
+
+## PL13. Unir X en Z
+
+`POST /v1/projects/merge` con `{"source": X, "target": Z, "dry_run"}`, detrás del token (`merge_core`, `merge.rs`). Se rechaza sin escribir con 404 si X o Z no están en `project`, 400 si son el mismo id, 409 `project_merged` si Z es una lápida o X es la lápida de otro proyecto, y 409 `saves_pending`, `retryable`, si después de esperar hasta `SAVES_WAIT` (5 s) el outbox sigue con un save pendiente de X o de Z; la transacción que escribe lo comprueba de nuevo. Si X ya es una lápida de Z, la unión es una **reparación**: pasa a Z lo que siga bajo X, y X queda como estaba.
+
+Cuando hay algo que cambiar, MUST escribir un snapshot `pre-merge` y, en una transacción que vuelve a decidir lo que vio una pasada en seco:
+
+1. pasar a Z cada fila de `memory` bajo X, borradas incluidas, con la parte de su unidad que está en X (`merge_in` con `Span::Carry`): la parte de una unidad en otro proyecto queda ahí y se nombra en `split`. Después Z conserva el save más nuevo de cada `topic_key` y la fila más vieja de cada `content_hash` que toca una fila movida, y las demás quedan `superseded` con causa `revision`, como en R17, bajo un número de `memory_move`;
+2. pasar a Z las filas de `episodic_trajectory` y `procedural_skill` de X;
+3. pasar a Z cada fila de `synthesis_review` del alcance X, con el `reviewed_at` más viejo cuando Z ya tiene una;
+4. pasar a Z las carpetas, los remotos y las lápidas que llevaban a X;
+5. responder `merged` las sugerencias pendientes cuyos dos lados pasan a ser un proyecto;
+6. dejar X con `merged_into = Z` y `merged_at`, y Z revisado;
+7. anotar cada cambio con lo que había antes en `project_merge_change`.
+
+Después de la transacción, MUST copiar el `workspace.md` de X de cada agente donde Z no tiene uno, como `adopt_legacy`, sin cambiar nunca el de X; uno que Z ya tiene queda al lado y se nombra. Las copias se anotan en el diario; una que falla queda en el log y en el informe. La unión MUST NOT cambiar el texto, el vector, el índice de texto ni `last_modified_at` de ninguna fila, los pares de `memory_conflict`, los ids ni `index_docs` de las carpetas, ni el índice de docs, y no necesita el modelo. Con `dry_run` responde el mismo informe sin escribir, sin snapshot y sin tocar archivos. El informe tiene `dry_run`, `merge_id`, `source`, `target`, `move_id`, `memories`, `superseded`, `split`, `protected`, `trajectories`, `skills`, `reviews`, `folders`, `remotes`, `tombstones`, `suggestions`, `workspaces` (`copied`, `kept_beside`, `failed`) y `snapshot`.
+
+**Tests:** `merging_moves_every_row_and_locator_into_the_target`, `a_merge_keeps_the_newest_save_of_a_key_and_the_oldest_of_a_text`, `a_merge_moves_the_part_of_a_split_unit_it_holds`, `merging_a_target_repoints_its_tombstones`, `a_dry_run_merge_changes_nothing`, `a_merge_copies_a_workspace_only_where_the_target_has_none`, `a_merge_is_refused_while_a_save_of_its_projects_is_pending`, `a_merge_of_a_tombstone_into_its_target_repairs_it` y `a_merge_is_refused_for_an_unknown_the_same_or_a_merged_project` (`merge.rs`); `decide_merge_carrying_takes_the_joined_part_of_a_unit_elsewhere` (`relocate.rs`); `merging_through_the_daemon_leaves_everything_under_the_target` y `a_merge_waits_for_the_saves_of_its_projects` (`tests/api.rs`).
+
+## PL14. El `--undo` de una unión
+
+`POST /v1/projects/merge` con `{"undo": N, "dry_run"}` (`undo_merge_core`). Se rechaza sin escribir con 404 si la unión no existe, 409 `merge_undone` si ya se deshizo, 409 `merged_later` si su destino es ahora una lápida, nombrando la unión que hay que deshacer antes, y 409 `saves_pending` como en PL13.
+
+MUST escribir un snapshot `pre-undo` y, en una transacción, dejar X vivo otra vez, devolver las filas que la unión dejó `superseded` si siguen así, llevar de vuelta a X las de `memory` que siguen en Z como un movimiento propio (`undo_move_in`, el cuerpo de `undo_move_core`), y lo demás que la unión cambió y sigue apuntando a Z: trayectorias, habilidades, carpetas, remotos y lápidas. Las filas de `synthesis_review` de X vuelven, y la de Z vuelve a su valor de antes si sigue con el que escribió la unión. Las sugerencias que respondió `merged` vuelven a estar pendientes, y Z, a su marca de revisado de antes. Después, cada copia de `workspace.md` que hizo la unión MUST borrarse si su parte del usuario sigue siendo la del archivo de X; si no, queda y se nombra (`drop_adopted`). Lo guardado en Z después de la unión queda en Z, y una fila que se movió a otro lado queda donde está y se nombra en `kept`.
+
+**Tests:** `undoing_a_merge_leaves_the_store_as_it_was`, `undoing_a_merge_keeps_what_was_saved_after_it`, `a_merge_whose_target_was_merged_since_is_undone_after_that_one` y `a_workspace_edited_since_the_merge_is_kept` (`merge.rs`).
+
+## PL15. Lo que se ve de una lápida
+
+Cambia PL9. `GET /v1/projects` MUST NOT listar una lápida: cada proyecto vivo lista en `merged` las que apuntan a él, cada una con `id`, `name`, `merge_id` (la unión que la hizo) y `merged_at`. Una carpeta o un remoto que llevan a una lápida se listan en su proyecto vivo, y una sugerencia se lista con sus lados por `canonical`: una cuyos lados son un solo proyecto no se lista, y dos con el mismo par se listan una vez. El nombre de una lápida queda libre para `rename`; su id sigue tomado. Renombrar una lápida es 409 `project_merged` (PL12).
+
+**Tests:** `a_merged_project_is_listed_under_its_target_and_frees_its_name` (`registry.rs`); `the_listing_after_a_merge_shows_the_target_alone` (`tests/api.rs`).
+
+## PL16. Mantener dos proyectos separados
+
+`POST /v1/projects/keep-apart` con `{"project_id": A, "other_id": B}`, detrás del token (`keep_apart`, `registry.rs`), responde 404 si alguno no está en `project`, 400 si son el mismo y 409 `project_merged` si alguno es una lápida. MUST responder `apart` cada sugerencia pendiente cuyos lados son A y B por `canonical` y, si no había ninguna, grabar el par con motivo `user` y esa respuesta, para que ningún registro lo sugiera después. A y B quedan revisados. Responde `{"project_id", "other_id", "answered"}`.
+
+**Tests:** `keeping_two_projects_apart_answers_their_suggestion_for_good` (`registry.rs`); `a_pair_kept_apart_is_not_suggested_again` (`project.rs`).
+
+## PL17. `clawg projects merge` y `clawg projects keep-apart`
+
+`clawg projects merge <SOURCE> --into <TARGET> [--dry-run] [--profile P]`, `clawg projects merge --undo N [--dry-run] [--profile P]` y `clawg projects keep-apart <A> <B> [--profile P]` MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el idioma de la preferencia, con una sentencia por `match` sobre `Lang` (`render_merge`, `crates/clawg-cli/src/projects.rs`). El informe dice cuántas memorias pasaron y cuáles se reemplazaron, las unidades partidas, las preferencias y decisiones, lo que fue con ellas, las carpetas, los remotos y las lápidas, las copias de `workspace.md`, el snapshot y el número de la unión con el comando que la deshace. Un rechazo dice qué no se hizo con la causa del daemon como vino, y `saves_pending` dice que se puede volver a intentar. `clawg projects list` MUST nombrar debajo de cada proyecto los que se unieron en él, con el comando que deshace cada unión, y, cuando hay sugerencias, terminar con los dos comandos que las responden.
+
+**Tests:** `projects_merge_and_keep_apart_parse` (`cli.rs`); `a_merge_report_names_what_moved_and_the_way_back`, `a_listing_names_what_was_merged_into_a_project` y `a_listing_marks_what_was_created_alone_and_the_suggestions` (en los dos idiomas) y `projects_are_merged_and_kept_apart_through_the_daemon` (`projects.rs`).
+
+## PL18. `doctor` nombra los duplicados, los ids sin proyecto y las lápidas rotas
+
+Los chequeos `project_duplicates`, `project_orphans` y `project_merges`, desde V27, están en [`specs/doctor`](../doctor/spec.md) (R7).
+
+## PL19. Ninguna ruta nueva se olvida de la lápida
+
+`PROJECT_INPUTS` (`crates/clawg-cli/tests/api.rs`) dice, de cada ruta de `router()`, en qué campo recibe un proyecto o que no recibe ninguno. Un test MUST leer `router()` de su fuente y fallar cuando una ruta no está en la tabla, y otro MUST mandar el id de una lápida a cada ruta de la tabla que recibe un proyecto y comprobar que actúa sobre el proyecto vivo o responde `project_merged` donde PL12 lo pide.
+
+**Tests:** `every_route_says_which_project_it_takes` y `every_route_that_takes_a_project_follows_a_merge` (`tests/api.rs`).
+
+## PL20. Lo que no cambia con la unión
+
+- El contrato del modelo no cambia: el agente no une ni responde sugerencias.
+- `POST /v1/projects` responde con la misma forma, con el proyecto vivo en `project_id`.
+- Las uniones de un registro (R4, R17) siguen como estaban: su `merge_in` (`Span::Keep`) deja en su lugar la unidad que toca otro proyecto, porque el id viejo no queda como lápida.
+- El índice de docs, los ids de las carpetas e `index_docs`.
+
+**Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` (sin volver a bendecir), y los de R4, R17 y PL1 a PL10.
