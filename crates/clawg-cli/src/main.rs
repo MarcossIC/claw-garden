@@ -40,6 +40,7 @@ use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::memory::embedder::keep_one_malloc_arena;
+use clawg_core::memory::identity::Disk;
 use clawg_core::memory::portability::export::project_id_of;
 use clawg_core::memory::portability::ExportFilter;
 use clawg_core::memory::ProjectIdentity;
@@ -224,8 +225,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let project_id = match project {
                 Some(path) => {
                     let root = ProjectIdentity::resolve(&path).root;
-                    let remote = clawg_core::memory::identity::origin_key(&root);
-                    Some(project_id_of(&base_dir, &root, remote.as_deref()).map_err(|e| e.to_string())?)
+                    Some(project_id_of(&base_dir, &root, &Disk).map_err(|e| e.to_string())?)
                 }
                 None => None,
             };

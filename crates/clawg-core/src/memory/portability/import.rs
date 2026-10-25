@@ -41,7 +41,7 @@ use crate::memory::chunker::{embedding_text, ChatChunker};
 use crate::memory::clock::TimestampMs;
 use crate::memory::dedup::content_hash;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::identity::origin_key;
+use crate::memory::identity::{origin_key, Disk};
 use crate::memory::project::plan_ids_in;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
@@ -272,8 +272,8 @@ async fn plan(
     timings: &mut ImportTimings,
 ) -> Result<Vec<(String, String)>, ImportError> {
     let (clock, mut timing) = (Instant::now(), Timing::new(Step::Plan));
-    let planned = roots.to_vec();
-    let ids = timed(store, &mut timing, move |c| plan_ids_in(c, &planned)).await?;
+    let planned: Vec<PathBuf> = roots.iter().map(|(root, _)| root.clone()).collect();
+    let ids = timed(store, &mut timing, move |c| plan_ids_in(c, &planned, &Disk)).await?;
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
     Ok(ids)
 }

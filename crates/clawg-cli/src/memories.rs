@@ -7,6 +7,7 @@
 
 use std::fmt::Write as _;
 
+use clawg_core::memory::identity::Disk;
 use clawg_core::memory::portability::export::project_id_of;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
@@ -433,8 +434,7 @@ fn resolve_project(client: &DaemonClient, scope: &Scope) -> Result<Option<String
     }
     let cwd = std::env::current_dir().map_err(|e| ClientError::WorkingDir(e.to_string()))?;
     let identity = clawg_core::memory::ProjectIdentity::resolve(&cwd);
-    let remote = clawg_core::memory::identity::origin_key(&identity.root);
-    let recorded = project_id_of(client.base_dir(), &identity.root, remote.as_deref()).unwrap_or(identity.id);
+    let recorded = project_id_of(client.base_dir(), &identity.root, &Disk).unwrap_or(identity.id);
     Ok(scope.project_id(Some(recorded)))
 }
 

@@ -364,6 +364,44 @@ impl Ground for Disk {
     }
 }
 
+/// A disk for tests: each root holds the checkout a test put there, and the
+/// reads of a first commit are counted.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FakeGround {
+    roots: std::sync::Mutex<std::collections::HashMap<PathBuf, (Checkout, RootCommit)>>,
+    commit_reads: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl FakeGround {
+    /// Puts at `root` a checkout with `key` and `stamp` whose first commit is `commit`.
+    pub(crate) fn put(&self, root: &Path, key: Option<&str>, stamp: Option<&str>, commit: RootCommit) {
+        let checkout = Checkout { key: key.map(str::to_string), stamp: stamp.map(str::to_string) };
+        self.roots.lock().unwrap().insert(root.to_path_buf(), (checkout, commit));
+    }
+
+    pub(crate) fn commit_reads(&self) -> usize {
+        self.commit_reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Ground for FakeGround {
+    fn checkout(&self, root: &Path) -> Checkout {
+        self.roots.lock().unwrap().get(root).map(|(checkout, _)| checkout.clone()).unwrap_or_default()
+    }
+
+    fn root_commit(&self, root: &Path) -> RootCommit {
+        self.commit_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.roots.lock().unwrap().get(root).map_or(RootCommit::Later, |(_, commit)| commit.clone())
+    }
+
+    fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
+        self.roots.lock().unwrap().get(path).is_some_and(|(checkout, _)| checkout.stamp.as_deref() == stamp)
+    }
+}
+
 /// The directory whose `config` holds the remotes of the checkout at `dir`:
 /// the common git directory of a worktree, the git directory of a submodule.
 pub fn git_config_dir(dir: &Path, marker: &GitMarker) -> PathBuf {

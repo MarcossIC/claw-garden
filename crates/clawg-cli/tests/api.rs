@@ -2900,6 +2900,55 @@ async fn a_repository_cloned_where_another_was_registers_into_a_project_of_its_o
     assert_eq!(back["project_id"], a["project_id"], "the first repository keeps its project");
 }
 
+/// Runs the real `git` in `dir` apart from the caller's git: none of its
+/// `GIT_*` (a hook that started the tests would point it at the repository
+/// being tested), no global or system config, and a fixed author.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let mut command = std::process::Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"GIT_")) {
+            command.env_remove(key);
+        }
+    }
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let output = command
+        .current_dir(dir)
+        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("this test needs git on the PATH");
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[tokio::test]
+async fn a_repository_without_origin_replaced_in_its_path_registers_into_a_project_of_its_own() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("app");
+    let register = || h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true }));
+    git(base.path(), &["init", "app"]);
+    git(&root, &["commit", "--allow-empty", "-m", "the first commit of a"]);
+    let (status, a) = register().await;
+    assert_eq!(status, 200, "{a}");
+
+    std::fs::rename(&root, base.path().join("a")).expect("move the first repository aside");
+    git(base.path(), &["init", "app"]);
+    git(&root, &["commit", "--allow-empty", "-m", "the first commit of b"]);
+    let (status, b) = register().await;
+
+    assert_eq!(status, 200, "{b}");
+    assert_ne!(b["project_id"], a["project_id"], "{a} {b}");
+    assert_ne!(b["root_id"], a["root_id"], "{a} {b}");
+    let (_, again) = register().await;
+    assert_eq!(again["project_id"], b["project_id"], "{again}");
+}
+
 #[tokio::test]
 async fn registering_needs_the_token() {
     let h = Harness::start().await;

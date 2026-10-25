@@ -44,7 +44,7 @@ use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::language::count_saves_in;
 use clawg_core::memory::portability::timing::{Step, Timing};
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
-use clawg_core::memory::identity::origin_key;
+use clawg_core::memory::identity::{Disk, Ground};
 use clawg_core::memory::project::{register_project, RegisterError, Registration};
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
@@ -2025,21 +2025,21 @@ async fn register(
     if body.index_docs && !root.is_dir() {
         return Err(ApiError::bad_request(format!("{} is not a directory, so it has no files to index", body.root_path)));
     }
-    // A caller that derives its id joins no remote, but the remote still tells
-    // whether the repository at the root is the one its row was given to.
-    let remote = {
+    // A caller that derives its id joins no remote, but what is at the root
+    // still tells whether it is the repository its folder was given to.
+    let checkout = {
         let root = root.to_path_buf();
-        tokio::task::spawn_blocking(move || origin_key(&root)).await.ok().flatten()
+        tokio::task::spawn_blocking(move || Disk.checkout(&root)).await.unwrap_or_default()
     };
     let registration = Registration {
         root,
-        remote: remote.as_deref(),
+        checkout,
         legacy_ids: &body.legacy_ids,
         index_docs: body.index_docs,
         assigned: body.assigned,
     };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-    let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration)
+    let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration, Arc::new(Disk))
         .await
         .map_err(|e| match e {
             RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
