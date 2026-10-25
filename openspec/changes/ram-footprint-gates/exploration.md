@@ -22,6 +22,10 @@ Responde cinco preguntas:
 4. **¿Cuánto retiene el import por encima del modelo?** Se compara la memoria al terminar `embed` y `write` con la de `decide`. Decide D. Un día de uso normal puede no tener ningún import. En ese caso se mide con un import en el perfil dev, como import-timing (88), y se dice qué build se usó.
 5. **¿Se mueve el piso?** Es la mínima de los minutos con `embedder.resident = 0` a lo largo del día. Si deriva, va a 91 o es un hallazgo nuevo. Si no, cierra la duda que dejó 90.
 
+## La medición controlada: el crecimiento con el modelo cargado
+
+La pregunta (a) de 62 no sale del día. La pregunta 5 lee el piso con el modelo suelto, y un día de uso no junta miles de formas de entrada con el modelo siempre cargado. Se mide aparte, con autorización, en el perfil dev con el modelo real, como la define la tabla de la puerta de 62: un daemon con `CLAWG_EMBEDDER_IDLE_MINUTES=0`, 5.000 consultas de 1 a 512 tokens y una lectura de la memoria privada cada 500, en Linux y en Windows, diciendo qué build se usó. Si crece sin aplanarse, se prueba `with_memory_pattern(false)` (hoy nadie lo llama) y se vuelve a medir.
+
 ## Los brazos y sus puertas
 
 | Brazo | Qué | Puerta | Decisión previa |
@@ -36,7 +40,7 @@ Cada brazo que entre lleva un test que falla antes del cambio y repite la misma 
 ## Interacciones
 
 - **ram-footprint (90, archivado).** Aportó A y el paso 0, especificados en `specs/project-docs`, `specs/metrics` (R6 y R8), `specs/storage` («Cada carga dice quién la pidió y cuánto costó») y `specs/portability` (IT1).
-- **embedder-footprint (62).** Sus preguntas de memoria (a) y (b), el crecimiento con `IDLE_MINUTES=0` y el pico de la carga, se responden acá con las preguntas 3 y 5. A 62 le queda la CPU.
+- **embedder-footprint (62).** Sus preguntas de memoria (a) y (b) pasaron acá: el pico de la carga (b) lo responde la pregunta 3, y el crecimiento con `IDLE_MINUTES=0` y entradas de largo variable (a), la medición controlada, porque el día no lo responde. A 62 le queda la CPU.
 - **pipeline-metrics (73).** Lleva a `metrics.db`, de forma permanente, lo que las líneas de carga dejan en el log.
 - **perf-bench (74).** Un escenario de memoria a ritmo fijo, leído con `--by minute`, es la forma repetible de este día.
 - **embed-throughput (85).** Si adopta INT8, cambia cuánto ahorran B y C.

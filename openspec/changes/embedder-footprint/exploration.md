@@ -66,7 +66,7 @@ Necesita el modelo real (`CLAWG_E5_MODEL_DIR` para `e5_golden`; un perfil dev au
 | Hilos vivos del proceso con el modelo suelto | Contar hilos antes y después de unos cuantos guardados, con y sin `set_parallelism(false)` | Si `rayon` deja N hilos con el modelo suelto, C |
 | Tiempo de `split_save` y de la tanda, para un guardado del tamaño de 54 | Texto de 64 KiB y de 5.000 tokens; reloj en el worker | Si la triple pasada pasa de un umbral (decisión abierta), E |
 | Vectores | `e5_golden` en cada combinación, y `rag-eval --diff` si algún vector cambia | Cualquier combinación que mueva bits queda fuera salvo decisión expresa |
-| Memoria: máximo de `RssAnon` / privados durante la primera carga y una recarga (se mide en 90) | `/usr/bin/time -v clawg serve` (máximo residente) en Linux; muestreo de bytes privados en Windows | Fija el pico real de (b); si se acerca al pico de indexar, se anota y no se hace nada |
+| Memoria: máximo de `RssAnon` / privados durante la primera carga y una recarga (se mide en 90) | `/usr/bin/time -v clawg serve` (máximo residente) en Linux; `process.private_peak_bytes` (el máximo de la memoria privada desde que arrancó el proceso) en Windows | Fija el pico real de (b); si se acerca al pico de indexar, se anota y no se hace nada |
 | Memoria: tendencia tras miles de búsquedas e inferencias de largos distintos con `IDLE_MINUTES=0` (se mide en 90) | 5.000 consultas de 1 a 512 tokens, lectura cada 500 | Si crece sin aplanarse, se prueba `with_memory_pattern(false)` y se vuelve a medir |
 | Una arena contra dos | Misma prueba de búsqueda durante un refresco, `MALLOC_ARENA_MAX=1` y `=2` | Si el p99 de búsqueda difiere más que el umbral, se reabre D6 de 46 |
 
