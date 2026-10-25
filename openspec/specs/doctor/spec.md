@@ -8,6 +8,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23: los chequeos `preferences` y `protocol_block` (LP14).
 - [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23: `message` en el idioma del comando (R1) y el resto del hallazgo igual en los dos idiomas (CL4).
 - [project-registry](../../changes/archive/2026-10-25-project-registry/proposal.md), archivado el 2026-10-25: el chequeo `project_remotes` (R7, su RG5).
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0: los chequeos `projects` y `project_remotes` leen las carpetas de `project_path` (V27), con los mismos hallazgos. Un store anterior a V27 se lee con la tabla que tiene.
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 
@@ -169,8 +170,8 @@ Las reglas 1 y 4 agrupan por proyecto, como la clave de tema y el dedup ([`specs
 | `outbox` | una fila `failed` | `warn` `failed`, una por fila, con el `operation_id`, el agente y los intentos | `clawg outbox retry <OPERATION_ID> --agent <AGENT> --profile P` |
 | `agents` | siempre que haya filas | `ok`, con cada agente y sus filas vivas y totales | — |
 | `agents` | filas vivas del agente de respaldo `mcp` | `warn` `fallback_agent`, con la cantidad: un cliente no dio `--agent` ni `clientInfo.name`; todo agente las lee y las cambia, pero el workspace y RECENT del agente real del cliente no las incluyen | — |
-| `projects` | una fila de `project` cuyo id no es ninguno de los que su raíz puede recibir (`candidate_id(root_path, 0..64)`, `is_candidate_for`) | `warn` `id_mismatch`, con el id y la ruta | — |
-| `project_remotes` | un proyecto con dos o más remotos atados en `project_remote`: lo que deja un repositorio clonado en el camino de otro con un clawg anterior a 0.63.0, o un remoto renombrado | `warn` `several_remotes`, con el id, sus remotos y cada raíz que lo usa (las filas con ese id y las raíces cuya clave actual, leída con `origin_key`, es uno de ellos) con su clave actual | — |
+| `projects` | una carpeta de `project_path` cuyo id no es ninguno de los que su raíz puede recibir (`candidate_id(root_path, 0..64)`, `is_candidate_for`) | `warn` `id_mismatch`, con el id y la ruta | — |
+| `project_remotes` | un proyecto con dos o más remotos atados en `project_remote`: lo que deja un repositorio clonado en el camino de otro con un clawg anterior a 0.63.0, o un remoto renombrado | `warn` `several_remotes`, con el id, sus remotos y cada raíz que lo usa (las carpetas con ese id y las raíces cuya clave actual, leída con `origin_key`, es uno de ellos) con su clave actual | — |
 | `project_remotes` | ninguno | `ok`, con cuántos remotos hay | — |
 
 Con filas `pending` y un daemon vivo no hay hallazgo: las está ingiriendo.

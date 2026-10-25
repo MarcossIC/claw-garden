@@ -1,6 +1,6 @@
 # project — Especificación
 
-Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre cómo una ruta se resuelve a la raíz de su proyecto y cómo se deriva el `project_id`. También cómo las filas guardadas bajo un id viejo pasan al de la raíz sin perderse, qué marca el registro sobre si el daemon puede leer los archivos de la raíz (`index_docs`), y qué hace el puente cuando el id de una raíz ya pertenece a otra. Qué raíces se indexan y cómo se buscan sus docs está en [`specs/project-docs`](../project-docs/spec.md).
+Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre cómo una ruta se resuelve a la raíz de su proyecto y cómo se deriva el `project_id`. También cómo las filas guardadas bajo un id viejo pasan al de la raíz sin perderse, qué marca el registro sobre si el daemon puede leer los archivos de la raíz (`index_docs`), y qué hace el puente cuando el id de una raíz ya pertenece a otra. Un proyecto es una fila de `project`, la referencia de cada tabla, y una carpeta (`project_path`) es una forma de llegar a él: cómo se reconoce un checkout por sus huellas, cómo una mudanza conserva su proyecto, qué sugerencias quedan y cómo se listan y se nombran los proyectos (PL1 a PL10). Qué raíces se indexan y cómo se buscan sus docs está en [`specs/project-docs`](../project-docs/spec.md).
 
 **Origen:**
 - [project-identity](../../changes/archive/2026-10-12-project-identity/proposal.md), archivado el 2026-10-12.
@@ -11,6 +11,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (HI3: elegir y listar filas por su proyecto de origen).
 - [project-registry](../../changes/archive/2026-10-25-project-registry/proposal.md), archivado el 2026-10-25 con su entrega 0, que sale en 0.63.0 (R20: una fila de un camino sirve a una raíz sólo si su remoto no la contradice; cambia R15, R16 y R18). Sus entregas 1 a 4 (el registro de proyectos, unir y borrar, los proyectos sin carpeta, el export por localizador) pasaron a [project-locators](../../changes/project-locators/proposal.md).
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (RF1: un registro lanza el refresco de docs sólo si trae `index_docs: true`; cambia la nota de R4).
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (PL1 a PL10: `project` es la referencia de cada proyecto y las carpetas pasan a `project_path`, el primer commit es la segunda huella de una carpeta, una mudanza conserva el proyecto, lo dudoso queda como sugerencia, y `clawg projects list` y `rename`; cambia R4, R10, R15, R16, R18 y R20). Sus entregas 2 a 4 siguen en el cambio.
 
 ## Definiciones
 
@@ -20,8 +21,17 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - **Id nuevo:** `derive_project_id(raíz del proyecto)`. Mismo formato, `{basename}-{hash4}`.
 - **Tablas con proyecto:** `memory`, `episodic_trajectory` y `procedural_skill` (`crates/clawg-core/migrations/V1__init.sql`).
 - **Clave de una raíz:** el `origin` normalizado de su directorio git (R14), o ninguna.
-- **Id de raíz:** el id con que `project` guarda una raíz (R15). Lo usan el índice de docs y `index_docs`.
-- **Id de proyecto:** el id bajo el que se guardan y buscan las memorias de una raíz: el que `project_remote` da a su clave, o su id de raíz (R16).
+- **Proyecto:** una fila de `project`, la tabla de referencia. Tiene un id que no cambia, un nombre, cómo nació (`born`) y si el usuario ya lo revisó (`reviewed`). Las memorias, y cualquier tabla nueva, guardan este id. Un proyecto puede tener cero o más carpetas y cero o más remotos: sigue existiendo después de que se borró su carpeta.
+- **Carpeta:** una fila de `project_path` (la tabla `project` de antes de V27, renombrada): un camino de esta máquina, su id (el id de raíz), `index_docs`, el proyecto al que lleva y las huellas de lo que se encontró ahí. Es una forma de llegar a un proyecto, no el proyecto: se puede mover o desaparecer.
+- **Carpetas de un camino:** las de `project_path` con ese `root_path`, de la más vieja a la más nueva.
+- **Id de raíz:** el id de la carpeta con que `project_path` guarda una raíz (R15). Lo usan el índice de docs y `index_docs`.
+- **Id de proyecto:** el id del proyecto bajo el que se guardan y buscan las memorias de una raíz (R16).
+- **Checkout:** lo que hay hoy en una raíz: su clave, su **directorio git** (el que tiene el `config` de R14, `git_config_dir`) y su primer commit. Una raíz sin `.git` no tiene directorio git ni primer commit.
+- **Primer commit:** el commit sin padres en el que termina la cadena de primeros padres de `HEAD`.
+- **Marca del directorio git (`git_stamp`):** la fecha de creación del directorio git y, en Unix, también su dispositivo y su inodo. Cambia cuando el directorio git es otro (un clone nuevo, un `git init` nuevo, una copia), no con un `mv` dentro del mismo sistema de archivos.
+- **Huellas de una carpeta:** su remoto (`project_path.remote`; una carpeta de antes de V27 sin él usa los que `project_remote` ata a su id) y su primer commit.
+- **Proyecto de una carpeta:** el de `project_path.project_id`. Si es NULL, la carpeta no se registró desde V27, y su proyecto es el que da R16: el de su clave en `project_remote`, o si no su id.
+- **Checkout grabado de una carpeta:** su camino con la marca que guardó. **Ya no está** cuando el camino no existe o, si guardó una marca, la de lo que hay hoy en él es otra.
 - **Candidatos de una raíz:** `candidate_id(raíz, n)` para `n` de 0 a 63: el id nuevo para 0, y para el resto el mismo formato con el hash de los bytes de la ruta seguidos de `#n` (`crates/clawg-core/src/memory/identity.rs`).
 
 ## R1. Resolución de la raíz
@@ -90,10 +100,10 @@ El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el i
 
 `POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool>, "assigned": <bool> }` y responde `{ "project_id": "...", "root_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api.rs`; `register_project`, `crates/clawg-core/src/memory/project.rs`).
 
-- El daemon MUST decidir los ids él mismo, de `root_path` y de la clave que lee de su directorio git; no los recibe. Con `assigned` los asigna (R15, R16); sin él (un cliente anterior) el id de raíz y de proyecto es `derive_project_id(root_path)`, sin clave.
+- El daemon MUST decidir los ids él mismo, de `root_path` y de las huellas que lee de su checkout (PL3); no los recibe. Con `assigned` los asigna (R15, R16); sin él (un cliente anterior) el id de raíz y de proyecto es `derive_project_id(root_path)`, sin clave (R18).
 - `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api.rs:1920`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz cuando es un proyecto.
-- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project` (`api.rs:1941-1943`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
-- MUST guardar `(id de raíz, root_path, index_docs)` en `project` si la raíz no está.
+- Con `index_docs: true` y una `root_path` que no es un directorio, MUST responder 400 antes de tocar `project_path` (`register`, `api.rs`). Sin `index_docs`, la misma ruta se sigue registrando como siempre.
+- MUST guardar en `project_path` la carpeta de la raíz (su id de raíz, `root_path`, `index_docs`, su proyecto y sus huellas, PL4) cuando ninguna carpeta del camino le sirve, y crear en `project` su proyecto cuando no existe.
 - Si la fila existe con la misma raíz y el registro pide indexar, MUST pasar `index_docs` de 0 a 1. MUST NOT bajarlo de 1 a 0: un save en otra sesión no le quita a una raíz aceptada su índice (`project.rs:98-100`). El resultado (`RegisterOutcome::index_docs`) lleva el valor que quedó guardado.
 - Sin `assigned`, si `derive_project_id(root_path)` ya está registrado con **otra** `root_path`, o la raíz está guardada con otro id, MUST responder 409 sin mover ninguna fila y sin tocar la marca de la otra raíz. El cuerpo es `{ "error": "project_root_collision", "detail": "<raíz> gets the project id <id>, which already belongs to <otra raíz>" }`. Con `assigned` MUST NOT responder 409 por un choque.
 - Por cada id viejo distinto del de proyecto, y por el id de raíz cuando difiere de él, MUST unir al id de proyecto todas las filas que lo tengan, incluidas las borradas lógicamente, en **una** transacción: las de `memory` con R17, registradas en `memory_move`; las de `episodic_trajectory` y `procedural_skill` con una fila por fila movida en `project_rekey` (la tabla, el id de la fila, el id viejo, el nuevo y la fecha). Un id viejo que es el id de raíz de otra raíz MUST quedar como está.
@@ -107,7 +117,7 @@ El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el i
 - THEN la marca queda en 1 después de la segunda llamada y sigue en 1 después de la tercera
 
 #### Escenario: colisión con un cliente anterior
-- GIVEN `project` con el id de `/work/repo` registrado con la raíz `/elsewhere/repo` y `index_docs = 0`
+- GIVEN `project_path` con el id de `/work/repo` registrado con la raíz `/elsewhere/repo` y `index_docs = 0`
 - WHEN un pedido sin `assigned` registra `/work/repo` pidiendo indexar
 - THEN el registro falla con `RootCollision` (por HTTP, 409 `project_root_collision` con las dos raíces en `detail`), y la marca de `/elsewhere/repo` sigue en 0
 
@@ -143,7 +153,7 @@ Una base creada por la versión anterior, con filas en ids viejos, MUST abrir co
 
 **Test:** `a_database_from_the_previous_version_opens_with_its_project_ids_untouched` en `crates/clawg-core/src/memory/db.rs` (siembra con el runner hasta V8).
 
-La columna `index_docs` (V13) llega con 1 en cada fila de `project` que ya existía: [`specs/project-docs`](../project-docs/spec.md), «Datos de la versión anterior».
+La columna `index_docs` (V13) llega con 1 en cada fila de `project` que ya existía: [`specs/project-docs`](../project-docs/spec.md), «Datos de la versión anterior». Desde V27 esa tabla se llama `project_path`, y `project` es la de los proyectos (PL1).
 
 ## R6. El puente registra cada raíz una vez
 
@@ -214,9 +224,9 @@ Una unidad MUST quedarse donde está, sin escribir ninguna de sus filas, cuando 
 
 ## R10. El destino está registrado
 
-El daemon MUST rechazar con 404, sin escribir, un destino que no está en `project`; «sin proyecto» siempre es un destino. El puente (`to_project_path`) y `clawg projects move --to PATH` MUST registrar antes la raíz de la ruta, sin `index_docs`, y MUST rechazar una raíz que no es un directorio.
+El daemon MUST rechazar con 404, sin escribir, un destino que no está en `project`; un proyecto sin carpeta es un destino (PL8), y «sin proyecto» siempre lo es. El puente (`to_project_path`) y `clawg projects move --to PATH` MUST registrar antes la raíz de la ruta, sin `index_docs`, y MUST rechazar una raíz que no es un directorio.
 
-**Test:** `an_unregistered_target_is_refused` (`relocate.rs`), `a_move_to_an_unregistered_project_is_404` (`tests/api.rs`), `update_memory_refuses_both_destinations_and_a_path_that_is_not_a_directory` (`server.rs`).
+**Test:** `an_unregistered_target_is_refused` y `a_project_without_a_folder_is_a_target` (`relocate.rs`), `a_move_to_an_unregistered_project_is_404` (`tests/api.rs`), `update_memory_refuses_both_destinations_and_a_path_that_is_not_a_directory` (`server.rs`).
 
 ## R11. El registro y la vuelta atrás
 
@@ -262,15 +272,15 @@ Cada fila que un movimiento cambia, por cualquier puerta, MUST dejar en `memory_
 
 ## R15. El registro asigna el id de raíz
 
-Con `assigned`, una raíz que ya está en `project` MUST conservar el id de la fila que su remoto elige (R20), y una que no MUST recibir el primero de sus candidatos que no es el id de otra fila (`root_id_in`, `project.rs`). Ninguna raíz MUST quedar con el id de otra y ningún registro MUST fallar porque dos hashes choquen; con los 64 candidatos tomados, MUST fallar sin escribir (409 `no_free_project_id`).
+Con `assigned`, una raíz MUST conservar el id de la carpeta de su camino que sus huellas eligen (PL4), y una sin carpeta que le sirva MUST recibir el primero de sus candidatos que no es el id de otra carpeta (`settle_in`, `project.rs`). Ninguna raíz MUST quedar con el id de otra y ningún registro MUST fallar porque dos hashes choquen; con los 64 candidatos tomados, MUST fallar sin escribir (409 `no_free_project_id`).
 
 **Tests:** `the_root_of_always_keeps_its_id`, `a_root_whose_id_is_taken_gets_the_next_free_one`, `a_root_keeps_the_id_it_was_given`, `every_id_taken_is_an_error_that_writes_nothing`, `the_candidates_of_a_root_keep_its_name_and_start_with_its_id` (`project.rs`, `identity.rs`); `registering_two_roots_that_collide_gives_each_its_own_id` (`tests/api.rs`); `a_colliding_root_gets_a_project_of_its_own` (`server.rs`).
 
 ## R16. Los clones de un remoto comparten el proyecto
 
-Con `assigned`, una raíz con clave MUST usar como id de proyecto el que `project_remote` (V24) da a su clave, y si no hay, MUST guardarle su id de raíz. Así la primera raíz que trae un remoto conserva su id y sus filas, un primer remoto de una raíz ya registrada no le cambia el proyecto, un remoto distinto del que ya tenía atado le da otro (R20), y una raíz cuyo remoto ya es de otro proyecto une a él sus filas (R4, R17). Dos remotos son dos proyectos (un fork lo es). Los docs siguen siendo de cada raíz (`specs/project-docs`).
+Con `assigned`, el id de proyecto de una raíz MUST ser el primero que exista de estos: el que `project_remote` (V24) da a su clave; el del checkout que se mudó a ella (PL5); el que su carpeta guarda en `project_path.project_id`; o un proyecto nuevo con el id de su carpeta (PL4). Una clave que `project_remote` no tiene MUST atarse al proyecto que recibe la raíz. Así la primera raíz que trae un remoto conserva su id y sus filas, un primer remoto de una raíz ya registrada no le cambia el proyecto, un remoto distinto del que ya tenía atado le da otro (R20), y una raíz cuyo remoto ya es de otro proyecto une a él sus filas (R4, R17). Dos remotos son dos proyectos (un fork lo es, aunque comparta el primer commit). Los docs siguen siendo de cada carpeta (`specs/project-docs`).
 
-Los clientes MUST usar el id que responde el daemon: el puente (R6), los hooks ([`specs/hooks`](../hooks/spec.md) R6), `clawg projects add`, `projects move --to` y `--here`. `clawg memories --here` y `clawg export --project` MUST leerlo del store sin escribir (`project_id_of`, `crates/clawg-core/src/memory/portability/export.rs`), y el import lo planea igual ([`specs/portability`](../portability/spec.md) R4).
+Los clientes MUST usar el id que responde el daemon: el puente (R6), los hooks ([`specs/hooks`](../hooks/spec.md) R6), `clawg projects add`, `projects move --to` y `--here`. `clawg memories --here` y `clawg export --project` MUST leerlo del store sin escribir (`project_id_of`, `crates/clawg-core/src/memory/portability/export.rs`), y el import lo planea igual y graba sus carpetas como un registro (PL7; [`specs/portability`](../portability/spec.md) R4).
 
 #### Escenario: el segundo clone
 - GIVEN dos raíces con el mismo `origin`, cada una con una fila bajo su `derive_project_id`, la primera registrada
@@ -292,32 +302,175 @@ Ninguna otra columna MUST cambiar. Cada reemplazo MUST quedar en `memory_move_su
 
 ## R18. Un cliente anterior conserva la regla de antes
 
-Un pedido sin `assigned` MUST recibir `derive_project_id(raíz)` como los dos ids, MUST NOT unirse por remoto, y MUST recibir 409 `project_root_collision` cuando ese id es de otra raíz, cuando la fila que su remoto elige (R20) tiene otro id o cuando su camino está contradicho, para que un puente abierto antes de una actualización nunca escriba bajo el id de otro proyecto. Mientras ese puente siga abierto, lo que un cliente nuevo unió de su raíz a otro clone no lo ve; sigue en el store y el próximo registro nuevo une lo que ese puente guardó.
+Un pedido sin `assigned` MUST recibir `derive_project_id(raíz)` como los dos ids, MUST NOT unirse por remoto ni seguir una mudanza (PL7), y MUST recibir 409 `project_root_collision` cuando ese id es de otra raíz, cuando la carpeta que sus huellas eligen (PL4) tiene otro id o cuando su camino está contradicho, también por el primer commit, para que un puente abierto antes de una actualización nunca escriba bajo el id de otro proyecto. Graba las huellas sólo en su propia carpeta, y su proyecto sólo cuando la carpeta es nueva. Mientras ese puente siga abierto, lo que un cliente nuevo unió de su raíz a otro clone no lo ve; sigue en el store y el próximo registro nuevo une lo que ese puente guardó.
 
-**Tests:** `a_caller_that_derives_its_id_keeps_the_conflict`, `a_caller_that_derives_its_id_joins_no_remote` y `a_caller_that_derives_its_id_is_refused_another_repository_s_project` (`project.rs`); `registering_without_assigned_ids_keeps_the_old_answer` y `a_repository_cloned_where_another_was_registers_into_a_project_of_its_own` (`tests/api.rs`).
+**Tests:** `a_caller_that_derives_its_id_keeps_the_conflict`, `a_caller_that_derives_its_id_joins_no_remote`, `a_caller_that_derives_its_id_is_refused_another_repository_s_project`, `a_caller_that_derives_its_id_is_refused_a_repository_without_origin_in_its_path` y `a_caller_that_derives_its_id_never_follows_a_move` (`project.rs`); `registering_without_assigned_ids_keeps_the_old_answer` y `a_repository_cloned_where_another_was_registers_into_a_project_of_its_own` (`tests/api.rs`).
 
 ## R19. Datos de la versión anterior a los remotos
 
-Una base en V23 con filas en dos proyectos MUST abrir con V24 sin cambiar ninguna fila de `memory` ni de `project`, con `project_remote` y `memory_move_supersede` vacías ([`specs/storage`](../storage/spec.md), «Los remotos y lo que reemplaza una unión»).
+Una base en V23 con filas en dos proyectos MUST abrir con V24 sin cambiar ninguna fila de `memory` ni de `project` (desde V27, `project_path`), con `project_remote` y `memory_move_supersede` vacías ([`specs/storage`](../storage/spec.md), «Los remotos y lo que reemplaza una unión»).
 
 **Test:** `a_database_from_the_previous_version_opens_with_no_remote_recorded` (`crates/clawg-core/src/memory/db.rs`).
 
-## R20. Una fila de un camino sirve a una raíz sólo si su remoto no la contradice
+## R20. Una carpeta de un camino sirve a una raíz sólo si su remoto no la contradice
 
-Un camino no es una identidad: otro repositorio puede clonarse donde estuvo uno. Un camino puede tener varias filas en `project`, una por repositorio; los remotos atados a una fila son las claves que `project_remote` da a su id. El registro MUST elegir la fila con una regla pura (`settle`, `crates/clawg-core/src/memory/project.rs`), y `project_id_in` y `plan_ids_in` MUST usar la misma sin escribir (en un lote, como si las raíces anteriores ya estuvieran escritas):
+Un camino no es una identidad: otro repositorio puede clonarse donde estuvo uno. Un camino puede tener varias carpetas en `project_path`, una por repositorio; los remotos de una carpeta son el suyo o, para una de antes de V27, las claves que `project_remote` da a su id. El registro MUST elegir la carpeta con una regla pura, y `project_id_in` y `plan_ids_in` MUST usar la misma sin escribir (en un lote, como si las raíces anteriores ya estuvieran escritas). Esa regla es la de PL4, que compara también el primer commit. Por el remoto:
 
-1. sin clave actual, la más vieja: una clave que no se puede leer no contradice nada;
-2. con clave, la primera fila con esa clave atada; si no hay, la más vieja sin remotos atados (un primer remoto, que se ata a ella);
-3. si todas tienen remotos atados y ninguno es la clave, el camino está contradicho: la raíz MUST recibir el primero de sus candidatos que ninguna fila tiene, en una fila nueva, y su clave MUST atarse a ella cuando `project_remote` no la tenga.
+1. sin clave actual, el remoto no decide: una clave que no se puede leer no contradice nada, y decide el primer commit (PL4);
+2. con clave, la primera carpeta con esa clave; si no hay, la más vieja sin remotos que el primer commit no contradice (un primer remoto, que se graba en ella);
+3. si todas las carpetas están contradichas, el camino lo está: la raíz MUST recibir el primero de sus candidatos que ninguna carpeta tiene, en una carpeta nueva, y su clave MUST atarse a su proyecto cuando `project_remote` no la tenga.
 
-Los ids viejos del cliente salen del camino, así que son de su primer repositorio: el registro MUST unir sus filas sólo con un camino nuevo o con la fila más vieja, y MUST NOT tocar un id viejo que es el de cualquier otra fila de `project`. El daemon MUST leer la clave también para un pedido sin `assigned`, sin atarla (R18).
+Los ids viejos del cliente salen del camino, así que son de su primer repositorio: el registro MUST unir sus filas sólo con un camino nuevo o con la carpeta más vieja, y MUST NOT tocar un id viejo que es el de cualquier otra carpeta. El daemon MUST leer la clave también para un pedido sin `assigned`, sin atarla (R18).
 
-Una fila sin remotos atados acepta un primer remoto: si el repositorio anterior del camino no tenía `origin`, el que llega con uno se queda con su fila. Un remoto renombrado en el mismo camino abre otro proyecto, porque sin el primer commit no se distingue de otro repositorio; `clawg projects move --from-project VIEJO --to-project NUEVO` los une y se deshace. `clawg doctor` nombra los proyectos que ya tienen dos remotos ([`specs/doctor`](../doctor/spec.md) R7).
+Una carpeta sin remotos acepta un primer remoto: si el repositorio anterior del camino no tenía `origin`, el que llega con uno se queda con su carpeta, salvo que el primer commit lo contradiga. Un remoto renombrado en el mismo camino abre otro proyecto, y cuando el primer commit es el mismo queda una sugerencia `remote_changed` entre los dos (PL6); `clawg projects move --from-project VIEJO --to-project NUEVO` los une y se deshace. `clawg doctor` nombra los proyectos que ya tienen dos remotos ([`specs/doctor`](../doctor/spec.md) R7).
 
 #### Escenario: otro repositorio en el camino de uno registrado
 - GIVEN `/work/app` registrado con `github.com/acme/a`, con una fila en su proyecto
 - WHEN se registra `/work/app` con `github.com/acme/b`
 - THEN recibe `candidate_id(/work/app, 1)`, nada se mueve, `github.com/acme/b` queda atado a ese id, y un clone de `github.com/acme/b` en otro camino se une a él
-- AND registrar otra vez cada uno da los ids de su primer registro, con dos filas en `project`
+- AND registrar otra vez cada uno da los ids de su primer registro, con dos carpetas en `project_path`
 
 **Tests:** `a_path_settles_on_the_row_its_remote_does_not_contradict` (pura), `a_repository_in_the_path_of_another_gets_a_project_of_its_own`, `a_repository_in_the_path_of_another_takes_none_of_its_rows`, `each_repository_in_one_path_returns_to_its_own_project`, `the_project_of_a_repository_in_another_s_path_is_read_alike_without_writing`, `a_first_remote_keeps_the_project_of_its_root`, `a_different_remote_in_a_registered_path_is_another_project` (`project.rs`); `a_repository_cloned_where_another_was_registers_into_a_project_of_its_own` (`tests/api.rs`).
+
+## PL1. V27 hace de `project` la referencia y pasa las carpetas a `project_path`
+
+V27 MUST renombrar `project` a `project_path` sin cambiar ningún valor ni índice, agregarle `project_id`, `remote`, `root_commit` y `git_stamp` (NULL por defecto) con un índice parcial por `root_commit`, y crear `project` (`id` clave primaria, `name`, `born`, `reviewed`, `created_at`), `project_suggestion` (`project_id`, `other_id`, `reason`, `created_at`, `answer`, `answered_at`, con un índice único sobre el par sin orden) y los disparadores de PL2. El esquema, el relleno y la vuelta atrás están en [`specs/storage`](../storage/spec.md), «Los proyectos y sus carpetas».
+
+El relleno MUST crear un proyecto por cada id distinto que tenga una fila de `memory`, `episodic_trajectory` o `procedural_skill` (borradas incluidas) o una fila de `project_remote`, con:
+
+- `name`: el id sin su `-` y sus cuatro dígitos hex finales cuando tiene la forma de `is_project_id`; si no, el id entero;
+- `born = 'migrated'` y `reviewed = 1`: lo que ya estaba no se marca «sin revisar»;
+- `created_at`: el menor `created_at` de lo que lo nombra.
+
+En cada carpeta MUST poner en `project_id` su propio id cuando es un proyecto (NULL si no: la carpeta de un clone, cuyas memorias están bajo el proyecto de su remoto, y la carpeta donde nunca se guardó nada, que se resuelven en su primer registro), y en `remote` el remoto que `project_remote` ata a su id sólo cuando le ata exactamente uno. Un id que sólo nombra un registro de historia (`memory_move`, `project_rekey`, `memory_import_extra`, `synthesis_review`) MUST NOT recibir un proyecto, y V27 MUST NOT cambiar ninguna fila de las tres tablas ni de `project_remote`.
+
+**Tests:** `a_database_from_the_previous_version_opens_with_a_project_for_every_id_in_use` (`crates/clawg-core/src/memory/db.rs`); `published_migration_checksums_are_pinned` (`migrations.rs`).
+
+## PL2. Cada id que se escribe tiene su proyecto
+
+Cuando se inserta una fila de `memory` con un `project_id` que no está en `project`, o se le cambia el `project_id` a uno que no está, la misma escritura MUST crear el proyecto, con el nombre de PL1, `born = 'adopted'`, `reviewed = 0` y el `created_at` de la fila, sin rechazarla ni cambiar ninguna de sus columnas: un save, un import, un movimiento, su `--undo` o un `PATCH`. El nombre que da Rust (`project_name`, `crates/clawg-core/src/memory/registry.rs`) MUST ser el del disparador.
+
+#### Escenario: un movimiento de vuelta a un id de la historia
+- GIVEN un movimiento que llevó todas las filas de un id viejo a otro proyecto, y ese id sin proyecto
+- WHEN se deshace el movimiento
+- THEN las filas vuelven al id viejo, y ese id es un proyecto `adopted`
+
+**Tests:** `a_row_saved_under_an_unknown_project_adopts_it`, `a_row_moved_to_an_unknown_project_adopts_it` y `the_name_of_an_adopted_id_is_the_one_rust_gives` (`registry.rs`).
+
+## PL3. El primer commit se lee una vez por directorio git
+
+Cada registro MUST leer de la raíz su clave (R14) y la marca de su directorio git. El primer commit sólo se lee cuando ninguna carpeta del camino guardó esa misma marca: un camino nuevo, una carpeta de antes de V27, o un directorio git que no es el que se grabó. Si una carpeta guardó esa marca, el primer commit es el que guardó ella, también cuando guardó que no se pudo leer. Un camino grabado que se registra con el mismo directorio git MUST NOT correr `git`, y el daemon MUST correrlo en un hilo bloqueante, nunca en el de la conexión (`Ground`, `crates/clawg-core/src/memory/identity.rs`).
+
+La lectura (`root_commit`) MUST correr `git rev-list --max-parents=0 --first-parent HEAD` sobre el directorio git que nombra la raíz, sin las variables `GIT_*`, con la entrada cerrada y, en Windows, sin abrir una ventana; esperar como mucho `ROOT_COMMIT_WAIT` (1 s) y cortar el proceso después; y aceptar sólo una línea de 40 o 64 dígitos hex.
+
+| Resultado | Cuándo | Se graba |
+|---|---|---|
+| primer commit | `git` respondió a tiempo con un hash | el commit y la marca |
+| no se puede saber | el repositorio es superficial (su directorio git tiene `shallow`), o `git` no respondió a tiempo | NULL y la marca: no se vuelve a intentar hasta que cambie el directorio git |
+| más tarde | no hay directorio git, `git` no se pudo correr, o terminó con error (un repositorio sin commits) | nada: el próximo registro vuelve a intentar |
+
+**Tests:** `a_recorded_checkout_does_not_read_its_first_commit_again` (`project.rs`, con un `Ground` falso que cuenta las lecturas); `the_first_commit_is_the_root_of_the_first_parent_chain`, `a_shallow_or_empty_repository_has_no_first_commit_to_record`, `the_stamp_of_a_checkout_changes_when_it_is_cloned_again` (`crates/clawg-core/tests/project_root.rs`, con repositorios reales: necesitan `git` en el PATH); `a_command_that_does_not_end_in_time_is_stopped` (`identity.rs`).
+
+## PL4. Una carpeta sirve a una raíz sólo si sus huellas no la contradicen
+
+Cada carpeta del camino se compara con el checkout con una función pura (`fit`, `crates/clawg-core/src/memory/project.rs`):
+
+1. si el remoto de la carpeta y la clave del checkout se conocen los dos, la carpeta es **la misma** cuando el checkout tiene uno de sus remotos, y **contradicha** cuando no;
+2. si no, y los dos primeros commits se conocen, es la misma cuando son iguales y contradicha cuando no;
+3. si no, es **desconocida**.
+
+El registro MUST elegir la primera carpeta que es la misma; si no hay, la más vieja desconocida; si todas están contradichas, el camino lo está y la raíz recibe una carpeta nueva (R20.3, R15). En la carpeta elegida o nueva MUST grabar su remoto cuando no tiene ninguno (un primer remoto), el primer commit y la marca según PL3, y su proyecto en `project_path.project_id`, sin escribir nada cuando nada cambió: los hooks registran en cada evento. El proyecto de la raíz es el de R16; uno nuevo nace con el id de la carpeta, `born = 'root'` y `reviewed = 0`. El remoto decide antes que el primer commit: un checkout del mismo remoto con otro primer commit (una rama huérfana, una historia reescrita) es la misma carpeta.
+
+#### Escenario: un repositorio sin `origin` en el camino de otro
+- GIVEN `/work/app` registrado sin clave, con el primer commit `c1` grabado y una fila en su proyecto
+- WHEN se registra `/work/app` con la clave `github.com/acme/b` y el primer commit `c2`
+- THEN recibe la carpeta `candidate_id(/work/app, 1)` y un proyecto nuevo con ese id, nada se mueve, y `github.com/acme/b` se ata a ese proyecto
+- AND con los dos sin clave (`c1` y después `c2`) pasa lo mismo, sin remoto atado
+
+**Tests:** `a_checkout_settles_on_the_folder_its_fingerprints_do_not_contradict` (pura), `a_repository_without_origin_in_the_path_of_another_gets_a_project_of_its_own`, `two_repositories_without_origin_in_one_path_are_two_projects`, `a_remote_decides_before_the_first_commit`, `a_clone_folder_records_its_own_remote` (`project.rs`); `a_repository_without_origin_replaced_in_its_path_registers_into_a_project_of_its_own` (`tests/api.rs`, con repositorios reales).
+
+## PL5. Una mudanza conserva el proyecto
+
+Con un camino nuevo, un registro con `assigned` cuya clave no está en `project_remote` (o que no tiene clave) y cuyo primer commit se conoce MUST buscar las carpetas de otros caminos con ese primer commit que el remoto no contradice (PL4.1), y mirar en disco, en un hilo bloqueante, si el checkout grabado de cada una ya no está.
+
+- Si las carpetas encontradas son de **un solo proyecto** y el checkout grabado de todas ya no está, es una mudanza: la raíz MUST recibir una carpeta nueva, con su id (R15) y ese proyecto en `project_path.project_id`; sus ids viejos y el id de la carpeta MUST unirse a él (R4), y el log MUST nombrar el proyecto y el camino viejo.
+- Si no (el checkout grabado sigue en su lugar: una copia o un segundo checkout, o hay más de un proyecto), MUST abrir un proyecto propio y dejar una sugerencia `root_commit` con cada uno de esos proyectos (PL6).
+
+La carpeta vieja queda como está: es una forma más de llegar al proyecto, y si el checkout vuelve a ese camino, la usa otra vez. Ante la duda queda separado: unir se deshace, y lo fundido no se puede separar. Un camino donde antes hubo otro repositorio no es un camino nuevo: queda contradicho y recibe un proyecto propio. Una mudanza le da a la raíz su propia carpeta y su propio índice de docs ([`specs/project-docs`](../project-docs/spec.md)).
+
+#### Escenario: una carpeta sin `origin` que se mueve
+- GIVEN `/work/app`, sin clave, registrado con el primer commit `c1` y con filas en su proyecto
+- WHEN se mueve a `/work/app2` y se registra `/work/app2`
+- THEN su proyecto es el de `/work/app`, que ahora tiene dos carpetas, y lo que se guardó allí se encuentra desde `/work/app2`
+
+#### Escenario: una copia
+- GIVEN el mismo `/work/app`, que sigue en su lugar
+- WHEN se copia a `/work/copia` y se registra `/work/copia`
+- THEN recibe un proyecto propio y una sugerencia `root_commit` con el de `/work/app`
+- AND registrarla otra vez no agrega otra sugerencia
+
+**Tests:** `a_checkout_moved_without_origin_keeps_its_project`, `a_copy_of_a_checkout_is_a_project_of_its_own_with_a_suggestion`, `a_checkout_two_projects_could_be_is_a_project_of_its_own` (`project.rs`); `a_folder_moved_without_origin_registers_into_its_project` (`tests/api.rs`, con repositorios reales).
+
+## PL6. Un remoto cambiado en el mismo camino deja una sugerencia
+
+Cuando el camino queda contradicho por el remoto (PL4), una carpeta contradicha tiene el mismo primer commit que el checkout, y el proyecto que recibe la raíz es otro que el de esa carpeta, el registro MUST dejar una sugerencia `remote_changed` entre los dos proyectos. Sin el mismo primer commit no hay sugerencia (R20).
+
+Para las sugerencias de PL5 y PL6:
+
+- MUST haber una por par de proyectos, sin importar el orden: una que ya existe, con respuesta o sin ella, no se vuelve a crear (`INSERT OR IGNORE` sobre el índice único del par).
+- Sólo un registro con `assigned` las crea. Leer, planear, importar y un cliente sin `assigned` MUST NOT crearlas.
+- Crear una MUST NOT mover ninguna fila ni cambiar ninguno de los dos proyectos. El daemon MUST dejarla en el log con el comando que la lista.
+- Todavía no se responden: quedan pendientes (`answer` NULL), `projects list` las muestra (PL9) y el agente no las ve.
+
+#### Escenario: un remoto renombrado
+- GIVEN `/work/app` registrado con `github.com/acme/app` y el primer commit `c1`
+- WHEN se registra con `github.com/acme-org/app` y `c1`
+- THEN recibe otro proyecto, como en R20, y queda una sugerencia `remote_changed` con el anterior
+
+**Tests:** `a_renamed_remote_in_its_path_is_another_project_with_a_suggestion`, `a_suggestion_is_made_once_per_pair` (`project.rs`).
+
+## PL7. Leer, planear, importar y el cliente anterior eligen igual
+
+- `project_id_in` (`clawg memories --here`, `clawg export --project`) y `plan_ids_in` (el import) MUST elegir con PL3 a PL5 sin escribir. En un lote, una raíz MUST elegir como si las anteriores ya estuvieran escritas, con sus huellas.
+- El import MUST leer lo que su plan necesita del disco en un hilo bloqueante, entre pasadas del plan sobre la conexión (`ReadAhead`, `crates/clawg-core/src/memory/identity.rs`; `plan`, `crates/clawg-core/src/memory/portability/import.rs`). Las carpetas nuevas que escribe MUST llevar lo que grabaría un registro (`project_id`, `remote`, `root_commit` y `git_stamp`), y su proyecto MUST existir en `project`, con `born = 'import'` cuando lo crea el import. Una carpeta que ya estaba no se toca.
+- Un pedido sin `assigned` sigue R18: elige la carpeta con PL4 y nunca sigue una mudanza.
+
+**Tests:** `a_moved_checkout_is_read_and_planned_alike_without_writing`, `a_caller_that_derives_its_id_is_refused_a_repository_without_origin_in_its_path`, `a_caller_that_derives_its_id_never_follows_a_move` (`project.rs`); `an_import_records_its_folders_as_a_registration_would` y `an_import_reads_the_first_commit_off_the_store_s_thread` (`crates/clawg-core/src/memory/portability/import.rs`).
+
+## PL8. Un proyecto existe tenga carpeta o no
+
+El destino de un movimiento (`POST /v1/memories/move`, `PATCH` con `project_id`, `clawg projects move --to-project`) MUST aceptarse cuando está en `project`, tenga carpeta o no, y MUST seguir siendo un 404 sin escribir cuando no está (R10).
+
+**Tests:** `a_project_without_a_folder_is_a_target` (`crates/clawg-core/src/memory/relocate.rs`); `an_unregistered_target_is_refused` y `a_move_to_an_unregistered_project_is_404`.
+
+## PL9. `clawg projects list` y `clawg projects rename`
+
+**`GET /v1/projects`** está detrás del token y MUST responder `{"projects": [...]}` con cada proyecto, tenga carpeta o no, por nombre sin distinguir mayúsculas y después por id (`list_projects`, `crates/clawg-core/src/memory/registry.rs`), con:
+
+- `id`, `name`, `born`, `reviewed` y `created_at`;
+- `folders`, de cero a muchas: `root_id`, `root_path`, `remote`, `index_docs` y `present`, que dice si el checkout grabado sigue ahí (sin marca grabada, si el camino existe);
+- `remotes`, de `project_remote`;
+- `memories`: cuántas filas de `memory` no borradas tiene;
+- `suggestions`: las pendientes en las que aparece, de cualquiera de los dos lados, cada una con `other_id`, `other_name`, `reason` y `created_at`.
+
+Una carpeta con `project_id` NULL MUST listarse en el proyecto que le da R16, leyendo su clave en disco; la presencia y esa clave se leen en un hilo bloqueante. Una carpeta cuyo proyecto no está en `project` (una de antes de V27 donde nunca se guardó nada) no se lista hasta que un registro la hace proyecto.
+
+**`PATCH /v1/projects/{id}`** con `{"name": "..."}` MUST cambiar el nombre, sin los espacios a los lados, y marcar el proyecto revisado, y responder el proyecto. MUST NOT cambiar el id ni ninguna otra fila. Responde 404 si el proyecto no existe, con un error que nombra el id; 400 si el nombre queda vacío, pasa de 80 caracteres (`MAX_NAME_CHARS`) o tiene caracteres de control; y 409 `name_taken`, con `detail`, si el nombre es, sin distinguir mayúsculas (Unicode, no sólo ASCII), el nombre o el id de otro proyecto. Volver a poner el mismo nombre sólo lo marca revisado.
+
+**`clawg projects list [--profile P]`** y **`clawg projects rename <ID> <NOMBRE> [--profile P]`** MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el idioma de la preferencia, con una sentencia por `match` sobre `Lang` (`crates/clawg-cli/src/projects.rs`). La lista MUST marcar lo que nació solo y no se revisó (con cómo nació), los proyectos sin carpeta, las carpetas que ya no están y las sugerencias pendientes, y nombrar `rename` cuando hay algo para revisar. Un rechazo de `rename` MUST decir qué id no se renombró, con la causa del daemon como vino. El id viaja como un solo segmento del camino.
+
+#### Escenario: renombrar
+- GIVEN un proyecto `app-1a2b` con memorias, sin revisar
+- WHEN se corre `clawg projects rename app-1a2b "App web"`
+- THEN `projects list` lo muestra como `App web`, revisado y con el mismo id
+- AND lo que se guardó bajo él se encuentra como antes
+
+**Tests:** `renaming_keeps_the_id_and_marks_the_project_reviewed`, `a_name_another_project_holds_is_refused`, `a_name_is_trimmed_and_bounded`, `a_folder_no_registration_recorded_is_listed_in_the_project_of_its_remote` (`registry.rs`); `the_projects_are_listed_with_their_folders_and_suggestions`, `renaming_a_project_keeps_what_was_saved_under_it`, `renaming_an_unknown_project_is_404` (`tests/api.rs`); `projects_list_and_rename_parse` (`cli.rs`); `a_listing_marks_what_was_created_alone_and_the_suggestions` (en los dos idiomas) y `projects_are_renamed_and_listed_through_the_daemon` (`crates/clawg-cli/src/projects.rs`).
+
+## PL10. Los clientes no notan nada
+
+- `POST /v1/projects` MUST responder con la misma forma de antes (`project_id`, `root_id`, `rekeyed`).
+- El puente, los hooks, `projects add` y `projects move --to` no cambian.
+- El contrato del modelo (`agent_contract.json`, `agent_contract.es.json`) no cambia, y ninguna sugerencia llega al agente.
+
+**Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` (sin volver a bendecir), y los de R4, R6 y R14 a R20.

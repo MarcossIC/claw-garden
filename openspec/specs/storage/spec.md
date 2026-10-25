@@ -22,6 +22,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24 (sólo V25: IL2, su vuelta atrás e IL3). Que la importación llegue a sus filas por índice está en [`specs/portability`](../portability/spec.md) (IL1 e IL5).
 - [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24 (sólo V26, «El diario de los imports», IU6, y el motivo `pre-undo` en la poda). Qué escribe el diario y cómo se deshace un import está en [`specs/portability`](../portability/spec.md) (IU1 a IU5).
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (sólo «Cada carga dice quién la pidió y cuánto costó», RF4 de esa spec). Las series de memoria con que se lee en uso real están en [`specs/metrics`](../metrics/spec.md) (R6 y R8).
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (sólo V27, «Los proyectos y sus carpetas», y su vuelta atrás). Qué hace el registro con las tablas nuevas está en [`specs/project`](../project/spec.md) (PL1 a PL10).
 
 ## Definiciones
 
@@ -318,7 +319,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V26) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V27) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -453,7 +454,7 @@ Un binario anterior a V25 MUST NOT abrir una base en V25: la rechaza sin tocarla
 La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:432`, llamada en `db.rs:200`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V26), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V27), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 
@@ -999,6 +1000,32 @@ Una base en V25 MUST abrir con V26 con cada fila de `memory` como estaba y las c
 #### Vuelta atrás de V26
 
 Un binario anterior a V26 MUST NOT abrir una base en V26: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`. Quitar V26 a mano no pierde ninguna fila de memoria, sólo el diario, y con él la forma de deshacer los imports hechos desde la migración, que quedan con su snapshot `pre-import`: `DROP TABLE memory_import_extra; DROP TABLE memory_import_supersede; DROP TABLE memory_import_row; DROP TABLE memory_import; DELETE FROM refinery_schema_history WHERE version = 26;`. Un deshacer se revierte con su snapshot `pre-undo`.
+
+## Los proyectos y sus carpetas
+
+### PL1. V27
+
+V27 (`crates/clawg-core/migrations/V27__project_registry.sql`) MUST:
+
+- renombrar `project` a `project_path` sin cambiar ningún valor ni índice, y agregarle `project_id`, `remote`, `root_commit` y `git_stamp`, NULL por defecto, con el índice parcial `idx_project_path_root_commit` sobre las filas con `root_commit`;
+- crear `project` (`id` clave primaria, `name`, `born` sin `CHECK`, `reviewed` con 0 por defecto, `created_at`) y `project_suggestion` (`project_id`, `other_id`, `reason`, `created_at`, `answer`, `answered_at`), con el índice único `idx_project_suggestion_pair` sobre `(min(project_id, other_id), max(project_id, other_id))`;
+- rellenar `project` con un proyecto `migrated`, revisado, por cada id con filas en `memory`, `episodic_trajectory` o `procedural_skill` (borradas incluidas) o en `project_remote`, y las columnas nuevas de las carpetas, como dice [`specs/project`](../project/spec.md) PL1;
+- crear los disparadores `memory_project_ai` y `memory_project_au`, que dan un proyecto `adopted` a cada id nuevo que se escribe en `memory` (PL2). Usan `NOT EXISTS` y no `INSERT OR IGNORE`, porque la cláusula de conflicto de la sentencia que dispara reemplaza la de adentro.
+
+MUST NOT cambiar ninguna fila de `memory`, `episodic_trajectory`, `procedural_skill` ni `project_remote`. `born` no lleva `CHECK`: vienen otras formas de nacer, y un `CHECK` no se amplía sin reconstruir la tabla. Su checksum MUST quedar fijado con los demás.
+
+#### Escenario: un store anterior
+- GIVEN un store en V26 con dos raíces que comparten un remoto, dos raíces cuyo hash choca, un camino con dos carpetas, un proyecto con dos remotos atados, filas en las tres tablas, un `project_id` de `memory` sin carpeta y un id que sólo nombran `memory_move`, `project_rekey` y `synthesis_review`
+- WHEN se abre con este clawg
+- THEN hay una copia `pre-migration`, `project_path` tiene las filas de la `project` de antes con los mismos valores, y las filas de las tres tablas y de `project_remote` no cambian
+- AND cada id con filas o con remoto tiene un proyecto `migrated`, revisado y con el nombre de su id, y el id que sólo nombran los registros no tiene ninguno
+- AND `project_path.remote` está lleno sólo en las carpetas con un único remoto atado
+
+**Tests:** `a_database_from_the_previous_version_opens_with_a_project_for_every_id_in_use` (`crates/clawg-core/src/memory/db.rs`); la fila 27 de `published_migration_checksums_are_pinned` (`migrations.rs`).
+
+#### Vuelta atrás de V27
+
+Un binario anterior a V27 MUST NOT abrir una base en V27: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`, que `clawg update` restaura en el proceso. Quitar V27 a mano conserva lo guardado después; con un `sqlite3` 3.35 o más nuevo y el daemon parado: `DROP TRIGGER memory_project_ai; DROP TRIGGER memory_project_au; DROP TABLE project_suggestion; DROP TABLE project; DROP INDEX idx_project_path_root_commit; ALTER TABLE project_path DROP COLUMN git_stamp; ALTER TABLE project_path DROP COLUMN root_commit; ALTER TABLE project_path DROP COLUMN remote; ALTER TABLE project_path DROP COLUMN project_id; ALTER TABLE project_path RENAME TO project; DELETE FROM refinery_schema_history WHERE version = 27;`. Se pierden los nombres que el usuario puso, las sugerencias y las huellas. Las carpetas que agregaron una mudanza o una contradicción son filas que un binario anterior lee como las de R20: una raíz vinculada por mudanza vuelve a leerse con su propio id, y sus memorias quedan bajo el proyecto viejo, que se alcanza con `all_projects` o con `clawg projects move`.
 
 ## El idioma de cada fila
 

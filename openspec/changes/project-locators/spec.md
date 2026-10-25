@@ -20,7 +20,7 @@ Esta especificación cubre la **entrega 1, el registro (V27)**, de la [propuesta
 - **Marca del directorio git (`git_stamp`):** la fecha de creación del directorio git y, en Unix, también su dispositivo y su inodo. Cambia cuando el directorio git es otro: un clone nuevo, un `git init` nuevo o una copia. No cambia con un `mv` dentro del mismo sistema de archivos.
 - **Huellas de una carpeta:** su remoto y su primer commit. El **remoto de una carpeta** es `project_path.remote`. Una carpeta de antes de V27 que no lo tiene usa los remotos que `project_remote` ata a su id, como en R20.
 - **Proyecto de una carpeta:** el de `project_path.project_id`. Si es NULL, la carpeta no se registró desde V27, y su proyecto es el que da R16: el de su clave en `project_remote`, o si no su id.
-- **Checkout grabado de una carpeta:** su camino con la marca que guardó. **Ya no está** cuando el camino no existe o la marca de lo que hay hoy en él es otra.
+- **Checkout grabado de una carpeta:** su camino con la marca que guardó. **Ya no está** cuando el camino no existe o, si guardó una marca, la de lo que hay hoy en él es otra.
 
 ## PL1. V27 hace de `project` la referencia y pasa las carpetas a `project_path`
 
@@ -228,7 +228,7 @@ Cambia R10. El destino de un movimiento (`POST /v1/memories/move`, `PATCH` con `
 - cuántas filas de `memory` no borradas tiene;
 - sus sugerencias pendientes, cada una con el otro proyecto y su nombre, el motivo y la fecha.
 
-Una carpeta con `project_id` NULL MUST listarse en el proyecto que le da R16, leyendo su clave en disco.
+Una carpeta con `project_id` NULL MUST listarse en el proyecto que le da R16, leyendo su clave en disco. Una carpeta cuyo proyecto no está en `project` (una de antes de V27 donde nunca se guardó nada) no se lista hasta que un registro la hace proyecto.
 
 **`PATCH /v1/projects/{id}`** con `{"name": "..."}` MUST cambiar el nombre y marcar el proyecto revisado. MUST NOT cambiar el id ni ninguna fila guardada. Responde así:
 

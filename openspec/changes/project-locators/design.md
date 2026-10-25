@@ -30,7 +30,7 @@ Un proyecto puede tener **cero o más** carpetas y **cero o más** remotos. Ning
 | Un repositorio git con `origin` | su carpeta, y su remoto en cualquier otra carpeta o máquina | 1 |
 | Un repositorio git sin `origin` | su carpeta; si se mueve, su primer commit (PL5) | 1 |
 | Un clone | su remoto (R16): mismo proyecto | hoy |
-| Un fork | otro remoto, así que otro proyecto; el primer commit compartido sólo sugiere | hoy y 1 |
+| Un fork | otro remoto, así que otro proyecto (R16); el primer commit compartido no sugiere nada, porque el remoto lo contradice (PL5) | hoy |
 | Un remoto renombrado o que cambió de organización | otro proyecto y una sugerencia de unir (PL6) | 1 |
 | Una carpeta movida o en otra máquina | su remoto, o su primer commit si el checkout viejo ya no está | 1 |
 | Una carpeta borrada | el proyecto y sus memorias siguen; la carpeta figura como ausente | 1 |
