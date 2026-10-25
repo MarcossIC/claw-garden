@@ -289,7 +289,7 @@ Lo que la entrega 3 suma encima:
 | Volver a importar un export de clawg después de un movimiento simple | 4 |
 | Una búsqueda cuando el cwd no resuelve a ningún proyecto | 3 |
 | Cómo responde el agente una sugerencia, y si unir exige `user_answered` | 3 (la respuesta por CLI es de la 2a, D22) |
-| Un save bajo el id de un proyecto borrado | 2b |
+| Un save bajo el id de un proyecto borrado | 2b ([D27](#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)) |
 | Los tipos nuevos de `memory_import_extra` | 4 |
 | Los subproyectos de un monorepo y las carpetas sin VCS | 3 (D14) |
 
@@ -446,3 +446,214 @@ El router es una sola función, con un `.route(…)` por camino (`crates/clawg-c
   DELETE FROM refinery_schema_history WHERE version = 28;
   ```
 - **Una unión.** Con `clawg projects merge --undo N`, o con su snapshot `pre-merge`.
+
+# Entrega 2b: borrar proyectos
+
+Esta parte resuelve la **entrega 2b** de la [propuesta](proposal.md#2-unir-revisar-y-borrar): `delete` en dos etapas con su `--undo`, y `purge --project-delete`. Los requisitos están en la [spec](spec.md#entrega-2b-borrar-proyectos) (PL21 a PL31). La persona eligió tres cosas el 2026-10-25: que un proyecto borrado vuelva al usarse (D27), que la purga saque todo el conjunto (D34) y que el `--undo` deje borrado lo que `undelete` rechazaría (D33). Lo demás se le presentó y no lo objetó.
+
+## D26. Un proyecto borrado queda en `project`, con `deleted_at`
+
+La fila de X no se borra, por tres razones:
+
+- **Sus filas borradas siguen bajo su id.** Sin la fila de X, `doctor` las nombraría huérfanas, porque `project_orphans` cuenta también las borradas (`IdRows`, `crates/clawg-core/src/memory/inspect.rs:253`).
+- **`clawg undelete` dejaría una fila viva bajo un id sin proyecto.** Restaurar no dispara la adopción: `memory_project_au` sólo corre con `UPDATE OF project_id` (`V27__project_registry.sql:96`).
+- **El `--undo` tendría que volver a crear la fila**, con su nombre, su `born` y su `created_at`, que ya no estarían en ningún lado.
+
+La lápida de D15 ya mostró este camino: la fila queda, y lo que la nombra decide qué hacer con ella.
+
+| Alternativa | Por qué no |
+|---|---|
+| Borrar la fila de `project` | Las tres razones de arriba. Además, el próximo save desde un puente abierto la volvería a crear como `adopted`, sin nombre ni historia |
+| Borrarla después de la purga | Un borrado purgado todavía se nombra en el diario (`project_delete.project_id`). Y un save posterior la adoptaría como si nunca hubiera existido |
+
+## D27. Un proyecto borrado vuelve al usarse, por disparadores
+
+Lo eligió la persona. Un proyecto borrado no espera un comando para volver: vuelve, sin revisar, en cuanto recibe una fila viva. Es la misma regla de alta automática de la decisión 3 de la propuesta, y se cumple igual que la adopción de D7: con disparadores en `memory`, así vale para cualquier escritor.
+
+```sql
+-- memory_project_ai y memory_project_au conservan su INSERT … WHERE NOT EXISTS y suman:
+UPDATE project SET deleted_at = NULL, reviewed = 0
+ WHERE id = new.project_id AND deleted_at IS NOT NULL AND new.deleted_at IS NULL;
+
+CREATE TRIGGER memory_project_restored AFTER UPDATE OF deleted_at ON memory
+WHEN new.project_id IS NOT NULL AND old.deleted_at IS NOT NULL AND new.deleted_at IS NULL BEGIN
+    UPDATE project SET deleted_at = NULL, reviewed = 0
+     WHERE id = new.project_id AND deleted_at IS NOT NULL;
+END;
+```
+
+**Por qué las carpetas y los remotos siguen vinculados.** El mismo checkout tiene que llevar al mismo proyecto: eso es lo que dicen sus huellas (D4). Si el borrado los desvinculara, la carpeta caería en su propio id de raíz (`project_of`, `crates/clawg-core/src/memory/project.rs:408`). En el caso común, ese id es el de X (D13), y X está borrado. Habría que inventar una regla para darle otro.
+
+**Por qué registrar no lo revive.** Los hooks registran la raíz en cada prompt (`project_of`, `crates/clawg-cli/src/hook.rs:220`). Si registrar reviviera, abrir una sesión en la carpeta deshacería el borrado antes de que nadie guarde nada. En cambio, `write_in` sigue haciendo `INSERT OR IGNORE INTO project` (`project.rs:765`): la fila existe, así que no hace nada, y la respuesta nombra X. Las lecturas bajo X no encuentran filas vivas, y eso está bien.
+
+**Por qué el `--undo` pone `deleted_at` en NULL antes de restaurar filas.** Así el disparador encuentra a X vivo y no le toca `reviewed`: deshacer deja a X como estaba, no «sin revisar».
+
+| Alternativa | Por qué no |
+|---|---|
+| La carpeta empieza otro proyecto, que era lo que decía la propuesta | Hace falta una regla nueva para elegir un id que no sea el de la raíz. Un save con el id viejo recibiría 409 `project_deleted`, y el puente tendría que volver a registrar la raíz. Hasta entonces, en una misma sesión, el hook (que registra en cada prompt) y el puente apuntarían a proyectos distintos. Y el `--undo` dejaría dos proyectos para la misma carpeta, con una sugerencia de unión |
+| Rechazar los saves bajo un proyecto borrado | Un puente abierto fallaría en cada save hasta reiniciarse, y al reiniciar el registro tendría que dar algún proyecto: se vuelve a la alternativa de arriba |
+| Revivir en el código de cada escritor | Son el worker, el import, el `--undo` de un movimiento, el restore y el registro. Olvidar uno deja una fila viva bajo un proyecto que no se lista. Es justo lo que D7 evitó con un disparador |
+
+## D28. El diario del borrado, en tablas con tipos
+
+- `project_delete`: una fila por borrado.
+- `project_delete_row(delete_id, tbl, row_id, deleted_at)`: cada fila del conjunto, con el `deleted_at` que tenía antes. NULL quiere decir que la borró este borrado.
+- `project_delete_folder(delete_id, root_id)`: las carpetas a las que les bajó `index_docs`. Sólo se anotan las que lo tenían en 1, así que el `--undo` sabe a cuáles subírselo.
+
+La unión usa una tabla genérica (`project_merge_change`, D15), porque cambia una decena de cosas distintas. El borrado, en cambio, cambia filas, y el `--undo` y la purga las buscan por id. Con `a TEXT` cada búsqueda necesitaría un `CAST`, que no usa índices. El diario del import hizo lo mismo con `memory_import_row` (`V26__import_journal.sql`).
+
+`project` no lleva `delete_id`: el borrado abierto de X se encuentra por el índice de `project_delete.project_id`. Un proyecto puede borrarse, volver al usarse y borrarse otra vez, y entonces tiene varios borrados abiertos (D33).
+
+## D29. El código resume el conjunto y se recalcula en la transacción que escribe
+
+**La forma canónica.** El texto que se pasa por SHA-256 (`sha2`, que ya es dependencia de `clawg-core`) es:
+
+- el id de X;
+- los ids de raíz de sus carpetas, ordenados;
+- sus remotos, ordenados;
+- por cada tabla, en este orden (`memory`, `episodic_trajectory`, `procedural_skill`), y por cada fila ordenada por id: el id, el `status`, el `deleted_at` y el `update_count`.
+
+Todo va separado por saltos de línea. El código son los primeros 8 hex. No es un secreto: es una prueba de que la persona vio este conjunto. Dos conjuntos distintos con el mismo código tienen una probabilidad de 1 en 4.300 millones.
+
+**Qué lo cambia:**
+
+| Cambio | Qué campo lo hace cambiar |
+|---|---|
+| un save, un import o un movimiento que trae una fila | una fila nueva en el conjunto |
+| un movimiento que se lleva una fila | una fila menos |
+| un `PATCH` de importancia o tipo | `update_count` (`admin.rs:261-267`) |
+| un veredicto o un save bajo una clave | `status` |
+| borrar una fila suelta o restaurarla | `deleted_at` (restaurar también sube `update_count`, `admin.rs:566`) |
+| un registro que vincula una carpeta o un remoto | los localizadores |
+
+`last_modified_at` no entra: todo lo que lo cambia también cambia un campo de la lista. El texto tampoco entra: nada lo edita después de guardado, y hashear miles de textos cuesta.
+
+**Sin estado.** Las pasadas son las de la unión (`retrying`, `crates/clawg-core/src/memory/merge.rs:351`): una pasada en una transacción que no se confirma decide, después se escribe el snapshot, y una segunda pasada vuelve a decidir y escribe. El código se calcula en las dos. Si no coincide en la primera, responde `code_changed` sin snapshot. Si deja de coincidir entre el snapshot y la escritura, la transacción se deshace, y el snapshot queda para que lo rote la poda.
+
+| Alternativa | Por qué no |
+|---|---|
+| Un token guardado con vencimiento | Es estado que hay que limpiar, y aun así habría que recalcular el conjunto para saber si cambió |
+| Un código más largo o más corto | Más largo no se puede copiar a mano. Con 4 hex (1 en 65.536), dos conjuntos distintos se confundirían con facilidad |
+
+## D30. El conjunto se marca junto, y nada revive
+
+La transacción hace un `UPDATE … SET deleted_at = ?now WHERE project_id = X AND deleted_at IS NULL` por tabla, saca los vectores de esas filas y después corre `release_challengers` (`dispute.rs:197`) por cada fila de `memory` que borró.
+
+No llama a `delete_memory_core` (`admin.rs:413`) por fila. Esa función revive en cada borrado (`revive_after_delete_of_piece`), y `REPLACED_SQL` busca las filas vivas que la fila borrada reemplazó (`revival.rs:67-74`). Si se borra fila por fila, una versión vieja todavía sin marcar revive cuando se borra la nueva. En cambio, con todas marcadas antes, `REPLACED_SQL` no encuentra ninguna del proyecto. Lo que se saltea no cambia el resultado:
+
+- una fila de afuera que una fila del proyecto reemplazó por veredicto queda reemplazada, como en cualquier borrado (`hidden`);
+- una de afuera reemplazada con causa `revision` desde otro proyecto tampoco revive, porque `REPLACED_SQL` sólo la cuenta como revisión si está en el mismo proyecto.
+
+Saltear `revive_after_delete` da por eso el mismo resultado.
+
+| Alternativa | Por qué no |
+|---|---|
+| `delete_memory_core` fila por fila, de la más nueva a la más vieja | Depende del orden de las cadenas de versiones, que pueden cruzar saves. Es una transacción por fila, y revisa el alcance de un lector que acá no hay |
+
+## D31. Una respuesta que leyó el conjunto es un informe
+
+Las respuestas `not_empty` y `code_changed` tienen que traer los conteos, los candidatos y el código nuevo, en el idioma de la persona. En cambio, las frases de error del daemon están en inglés y la CLI las enmarca (`.claude/CLAUDE.md`, «the sentences the daemon returns in an error»), y `ErrorBody` (`crates/clawg-cli/src/daemon/api.rs:118`) no tiene lugar para un informe. Por eso las dos responden 200 con el informe y `refused`, y la CLI sale con 1. Los 409 quedan para lo que no lee el conjunto: una lápida, un proyecto ya borrado, saves pendientes y los estados del `--undo`.
+
+| Alternativa | Por qué no |
+|---|---|
+| 409 con el informe en un campo nuevo de `ErrorBody` | Es un campo que sólo usa una ruta, en el sobre de todas |
+| 409 con todo en `detail` | La CLI no podría armar los comandos con los ids de los candidatos sin parsear una frase en inglés |
+
+## D32. El índice de docs se quita, y la purga lo vuelve a quitar
+
+El índice de docs se deriva del disco, pero guarda pasajes de los archivos del proyecto. Un proyecto borrado no los necesita, y la purga promete que no queda nada de él.
+
+**Por qué bajar `index_docs`.** Si sólo se borraran las filas del índice, la próxima `search_project` de un puente abierto en esa carpeta lo reconstruiría: un índice de más de un minuto lanza un refresco (`POST /v1/projects/docs/search`). Con `index_docs` en 0, esa búsqueda responde 403 hasta que algo vuelva a pedirlo. Lo vuelven a pedir el `--undo` o un registro con `index_docs`: un puente que arranca en esa carpeta, o `projects add`.
+
+**La carrera.** Un refresco en curso escribe cada doc en su propia transacción (`replace_doc`, `crates/clawg-core/src/memory/project_docs/mod.rs`), y bajar `index_docs` no lo frena. Por eso la purga vuelve a sacar lo que haya bajo las raíces del borrado que siguen en 0. Hasta la purga, lo que un refresco haya escrito no se alcanza, porque una búsqueda con `index_docs` en 0 responde 403.
+
+Sacar el índice de una raíz es un `delete_doc` (`mod.rs:597`) por cada archivo de `project_doc_file` bajo ese id, en la transacción del borrado.
+
+| Alternativa | Por qué no |
+|---|---|
+| Esperar a que termine el refresco (`DocIndex::wait_idle`) | El core no tiene el `DocIndex`, y esperar no frena un refresco que empiece después |
+| Dejar el índice | Contradice la purga, y un proyecto borrado no lo usa |
+
+## D33. Deshacer recalcula los vectores antes de la transacción
+
+Restaurar quita el vector borrado y pide uno nuevo, igual que `undelete`, así que un `--undo` con filas necesita el modelo.
+
+- **Los vectores se calculan fuera de la transacción**, en tandas de 32 con `embed_batch`, como el import (`EMBED_BATCH`, `crates/clawg-core/src/memory/portability/import.rs:68`). El texto es el de cada tabla: `embedding_text(context, content)` para `memory`, `task` para una trayectoria y `skill_embedding_text` para una skill (`maintenance.rs:463`).
+- **Las filas se escriben en una transacción**, como la unión, que lleva todas las filas de un proyecto en una. Esa transacción vuelve a comprobar cada fila. Una que cambió entre el cálculo y la escritura queda en `kept`, y una que no tiene vector no vuelve.
+- **Las filas vuelven como estaban.** `undelete` sube `update_count` y `last_modified_at` porque es una edición de la persona (`RESTORE_ROW`, `admin.rs:565`). El `--undo` deshace, igual que el de una unión o el de un movimiento, así que no los toca.
+- **Las negativas son las de `undelete`.** Lo eligió la persona: `live_twin`, `topic_taken` y `holds_secret`. Además, `changed` para una fila que ya no está como la dejó N, y `tied` para que las piezas de un save queden juntas: son las mismas reglas de unidad que usa el `--undo` de un import.
+- **No corre el detector**, igual que el import, para no hacer una búsqueda KNN por fila. Los pares de la fila nunca se borraron, y los escalados vuelven con `settle_challengers`.
+- **`deleted_later`.** Si X se borró con N, volvió al usarse y se borró otra vez con M, las filas de N que siguen borradas están en el conjunto de M como «ya borradas». Deshacer N primero restauraría filas bajo un proyecto que M tiene borrado. Así que M se deshace primero, como `merged_later` en D16.
+- **El modelo sólo hace falta si hay filas que restaurar.** Las negativas son SQL y `redact`, así que una prueba en seco y el `--undo` de un proyecto vacío no lo necesitan.
+
+| Alternativa | Por qué no |
+|---|---|
+| `restore_memory_core` fila por fila | Es un embedding y una transacción por fila, sube `update_count` y corre el detector por fila. Y sólo sabe restaurar `memory` |
+| Devolver como `superseded` lo que quedaría borrado | La persona eligió lo de `undelete`. Además, hoy no hay código que restaure una fila como reemplazada |
+
+## D34. La purga de un borrado saca todo su conjunto
+
+Lo eligió la persona: «sacar de la memoria todo lo de un proyecto» incluye lo que ya estaba borrado antes de N. La purga va por las filas de `project_delete_row`, estén donde estén ahora. Si alguien movió una fila borrada a otro proyecto, sigue siendo del conjunto que la persona confirmó.
+
+Vive en `crates/clawg-core/src/memory/secrets.rs`, al lado de `purge`, para compartir `open_to_rewrite` (`:309`), `leave_no_old_copy` (`:326`) y la lectura de snapshots. En lugar de repetir `purge` por fila, hace:
+
+- **una transacción** con todas las filas;
+- **un solo `optimize`, un solo `VACUUM` y un solo vaciado del WAL**, al final;
+- **una sola pasada por los backups**: cada snapshot se abre una vez y se busca cualquiera de los ids con su texto. `backups_holding` (`:377`) mira un id por snapshot;
+- **una lectura por cada `workspace.md`**, buscando cualquiera de los textos (`workspaces_holding`, `crates/clawg-core/src/memory/workspace.rs:602`). Los del proyecto se nombran siempre, como pedía la propuesta.
+
+En `memory` hace con cada fila lo que hace `purge` con una fila borrada. No revive nada, porque las filas ya están borradas.
+
+| Alternativa | Por qué no |
+|---|---|
+| Sólo las filas que borró N, como decía la propuesta | Las que ya estaban borradas quedarían, y habría que purgarlas de a una con `clawg purge <ID>` |
+| Llamar a `purge` por cada fila | Un `VACUUM` y una pasada por todos los backups por fila |
+| Reusar `remove_in` del `--undo` de un import (`portability/undo.rs:710`) | Borra también los enlaces en los que la fila es fuente, y así la conclusión no sabría que perdió una. Tampoco hace `VACUUM` |
+
+## D35. Lo que administra proyectos no toma uno borrado
+
+Es el criterio de D23 aplicado a un proyecto borrado: la persona nombró un proyecto que no existe para ella.
+
+- **`rename`**, **`keep-apart`** y **los dos lados de una unión** responden 409 `project_deleted`. Unir un proyecto borrado dejaría sus filas borradas bajo Z, fuera del alcance de su `--undo`.
+- **El `--undo` de una unión cuyo destino está borrado** también se rechaza. Si no, devolvería al origen filas que el borrado anotó bajo Z, y el `--undo` del borrado ya no las encontraría donde las dejó.
+- **`to_project` de un movimiento y `project_id` de un `PATCH`** se rechazan en `target_in` (`crates/clawg-core/src/memory/relocate.rs:438`), que ya corre en la transacción que mueve.
+- **`from_project` sí acepta un proyecto borrado**: rescatar una memoria borrada antes de purgar es un uso legítimo.
+- **El `--undo` de un movimiento que le devuelve filas** no se rechaza: esas filas eran suyas, y el disparador lo revive (D27).
+
+## D36. Los candidatos para vaciarlo
+
+La regla de pares de D25 (mismo nombre, o mismo primer commit sin un remoto que los distinga, salteando los pares respondidos) vive hoy en la CLI, sobre los hechos de `inspect` (`project_duplicates`, `crates/clawg-cli/src/doctor/checks.rs:654`). Ahora el daemon la necesita para responder `not_empty`. Por eso pasa al core como una función pura sobre esos mismos hechos. `doctor` la llama, y el borrado le pasa los hechos que lee en su transacción. Así la regla queda en un solo lugar, y los candidatos de un borrado son los duplicados que nombraría `doctor`, más las sugerencias pendientes de X.
+
+## D37. `doctor`
+
+`inspect` suma dos hechos, leídos sólo donde el esquema los tiene (`Has`):
+
+- `deleted_at` en `RegistryRow`;
+- los conteos de filas vivas en `IdRows`, al lado de los de todas.
+
+`project_duplicates` saltea los borrados. `project_orphans` y `project_merges` no cambian: un proyecto borrado está en el registro y no tiene `merged_into`. `project_deletes` es un chequeo nuevo, sólo con `live_under_deleted`.
+
+## Costos en el camino caliente de la entrega 2b
+
+- Cada insert de una fila viva con proyecto suma, en su disparador, un `UPDATE` por clave primaria que no encuentra nada. Lo mismo cada cambio de proyecto y cada restauración.
+- Un borrado lee y escribe en una transacción las filas de X y su diario. No necesita el modelo.
+- Un `--undo` embebe sus filas, a lo que tarde el modelo por tanda, antes de su transacción.
+- Una purga hace un `VACUUM` del archivo entero, como `purge`, con el daemon parado.
+
+## Volver atrás de la entrega 2b
+
+- **El esquema.** Un binario anterior rechaza un store en V29 sin tocarlo (`SchemaNewer`), y la vuelta atrás es su snapshot `pre-migration`. Para quitar V29 a mano, primero hay que deshacer cada borrado abierto (`clawg projects delete --undo N`). Si no, un proyecto borrado vuelve a listarse, con sus filas borradas y su `index_docs` en 0. Un borrado purgado ya no se deshace: su proyecto vuelve a listarse vacío. Después, con un `sqlite3` 3.35 o más nuevo y el daemon parado:
+
+  ```sql
+  DROP TRIGGER memory_project_restored;
+  DROP TRIGGER memory_project_ai;
+  DROP TRIGGER memory_project_au;
+  -- volver a crear los dos disparadores de V27 con su texto (V27__project_registry.sql:86-104)
+  DROP TABLE project_delete_folder;
+  DROP TABLE project_delete_row;
+  DROP TABLE project_delete;
+  ALTER TABLE project DROP COLUMN deleted_at;
+  DELETE FROM refinery_schema_history WHERE version = 29;
+  ```
+- **Un borrado.** Con `clawg projects delete --undo N`, o con su snapshot `pre-delete`.
+- **Una purga.** Sólo con un snapshot, que guarda justo el texto que se quería sacar.

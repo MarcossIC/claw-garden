@@ -80,6 +80,11 @@ Se tomaron el 2026-10-24 sobre las [decisiones abiertas](../archive/2026-10-25-p
   - En contra: sólo se deshace con un snapshot, que guarda justo el texto que se quería sacar. Exige el daemon parado y reconstruir el archivo, como `purge`. Y junta en un mismo paso el doble chequeo de la etapa 2 con lo irreversible.
   - Con los pasos separados se mantiene la regla de hoy: un `delete` se deshace, y `purge` es lo único que no tiene vuelta.
 
+El diseño de la entrega 2b (2026-10-25) cambió dos puntos con la persona:
+
+- **Los localizadores no se desvinculan.** Un proyecto borrado vuelve, sin revisar, en cuanto recibe una fila viva: un save desde un puente abierto, un import o un `undelete` ([diseño, D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)). Así, el mismo checkout sigue llevando al mismo proyecto.
+- **`purge --project-delete N` saca todo el conjunto confirmado**, también las filas que ya estaban borradas antes de N ([D34](design.md#d34-la-purga-de-un-borrado-saca-todo-su-conjunto)).
+
 ## Entregas
 
 Cada entrega se cierra sola, con commits atómicos y TDD estricto. El cambio se publica entero, al final, con un solo pull request a `main`. Los tests RED salen de [«Cómo se mide»](../archive/2026-10-25-project-registry/exploration.md#cómo-se-mide) de la exploración, más los que piden las decisiones de arriba. La spec, el diseño y las tareas se escriben por entrega, cuando le toca a cada una.
@@ -252,7 +257,7 @@ La etapa 1 de `delete` propone un `merge`, así que 2a va primero. Ninguna de la
 | Los agentes crean duplicados con nombres parecidos | Búsqueda de parecidos antes de crear, sugerencias pendientes, índice único por remoto, `doctor` y un `merge` reversible |
 | Una sugerencia que vuelve en cada sesión cansa | Se pregunta hasta que se responde, y «separados» queda guardado |
 | La etapa 2 borra más de lo que el usuario vio | El código resume el conjunto exacto y se recalcula en la transacción que escribe. Las filas quedan restaurables hasta `purge` |
-| Un `--undo` de borrado choca con un proyecto que tomó el camino mientras tanto | El índice único parcial lo detecta: el `--undo` restaura las filas y deja el camino donde está, con una sugerencia de unión |
+| Un `--undo` de borrado choca con un proyecto que tomó el camino mientras tanto | No puede pasar: el borrado no desvincula sus carpetas, así que ningún otro proyecto toma el camino ([D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)). Lo guardado mientras estaba borrado queda, y el `--undo` deja borrada la fila que choca con eso, y la nombra ([D33](design.md#d33-deshacer-recalcula-los-vectores-antes-de-la-transacción)) |
 | Leer el primer commit cuesta (historia larga, varios commits raíz, clone superficial, sin `git`) | Sólo se lee fuera del camino caliente, y sin huella si no se puede leer. El diseño elige cómo leerlo |
 | El contrato del modelo cambia | Los dos contratos se vuelven a bendecir, se revisa el diff y el argumento es opcional |
 | El tamaño (M–L) | Cuatro entregas (la 2 en dos partes) que se cierran por separado, cada una con sus tests y commits atómicos |

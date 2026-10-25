@@ -505,3 +505,299 @@ Tres chequeos nuevos, que leen el store sin su lock, como los demás. En un stor
 - Borrar un proyecto, y un save bajo el id de uno borrado, son de la entrega 2b. Los nombres donde hoy van ids son de la entrega 3.
 
 **Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` (sin volver a bendecir), y los de R4, R17 y PL1 a PL10.
+
+## Entrega 2b: borrar proyectos
+
+Cubre la parte de borrar de la [entrega 2](proposal.md#2-unir-revisar-y-borrar): `projects delete` en sus dos etapas, con su `--undo`, y `purge --project-delete`. El diseño está en [D26 a D37](design.md#entrega-2b-borrar-proyectos). Las tres elecciones que hizo la persona el 2026-10-25 están en D27, D33 y D34.
+
+### Definiciones
+
+- **Filas de un proyecto:** las de `memory`, `episodic_trajectory` y `procedural_skill` cuyo `project_id` es el proyecto.
+- **Fila viva:** una con `deleted_at` NULL, cualquiera sea su `status`. Una fila `superseded` está viva.
+- **Proyecto vacío:** uno sin filas vivas. Puede tener filas borradas.
+- **Proyecto borrado:** uno con `deleted_at`. No se lista y su nombre queda libre, pero su id sigue siendo suyo.
+- **Borrado N:** una fila de `project_delete`. El de la etapa 1 borra un proyecto vacío (`with_memories` falso). El de la etapa 2 borra un proyecto con sus filas.
+- **Conjunto de un borrado:** el proyecto, los ids de raíz de sus carpetas (`project_path` con su `project_id`), sus remotos (`project_remote`) y cada fila del proyecto, viva o borrada, con su id, `status`, `deleted_at` y `update_count`.
+- **Código:** los primeros 8 caracteres hexadecimales, en minúscula, del SHA-256 de una forma canónica del conjunto (D29).
+- **Borrado abierto:** uno sin `undone_at` ni `purged_at`.
+- **Volver al usarse:** que un proyecto borrado deje de estarlo porque recibió una fila viva (PL22).
+
+## PL21. V29 agrega la marca de borrado, su diario y los disparadores que lo revierten
+
+V29 MUST:
+
+- agregar a `project` la columna `deleted_at`, NULL por defecto;
+- crear `project_delete`, una fila por borrado: `delete_id` (clave primaria), `project_id`, `with_memories`, `code`, `snapshot`, `deleted_at`, `undone_at` y `purged_at`, con un índice por `project_id`;
+- crear `project_delete_row`, una fila por cada fila del proyecto que estaba en el conjunto: `delete_id`, `tbl` (`memory`, `episodic_trajectory` o `procedural_skill`), `row_id` y `deleted_at`, que es el que tenía antes del borrado (NULL si la borró el borrado), con un índice por `delete_id`;
+- crear `project_delete_folder`, una fila por carpeta a la que el borrado le bajó `index_docs`: `delete_id` y `root_id`;
+- reemplazar `memory_project_ai` y `memory_project_au`, y crear `memory_project_restored` (PL22).
+
+V29 MUST NOT cambiar ninguna fila.
+
+#### Escenario: un store en V28 abre sin proyectos borrados
+- GIVEN un store en V28 con proyectos vivos, una lápida, carpetas, remotos y filas vivas y borradas en las tres tablas
+- WHEN se abre con V29
+- THEN ninguna fila cambió y ningún proyecto tiene `deleted_at`
+- AND un save bajo un id que `project` no conoce lo adopta como antes (PL2)
+- AND hay un snapshot `pre-migration`
+
+**Tests:** `a_database_from_the_previous_version_opens_with_no_project_deleted` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(28))`); la fila 29 en `published_migration_checksums_are_pinned` (`migrations.rs`).
+
+## PL22. Un proyecto borrado vuelve al usarse
+
+Un disparador de `memory` MUST dejar vivo, con `reviewed = 0`, al proyecto borrado que recibe una fila viva:
+
+- `memory_project_ai`, después de insertar una fila viva con `project_id`. Sigue adoptando un id que `project` no conoce (PL2);
+- `memory_project_au`, después de cambiar el `project_id` de una fila viva;
+- `memory_project_restored`, después de que una fila con `project_id` pasa de borrada a viva.
+
+Así vuelve con:
+
+- un save de un puente abierto, que guarda los ids de su raíz toda la sesión (`ids_for`, `crates/clawg-cli/src/mcp/server.rs:860`);
+- un save que estaba en el outbox, y `clawg outbox retry`;
+- un import;
+- `clawg undelete`;
+- el `--undo` de un movimiento que le devuelve filas vivas;
+- la unión de los ids viejos de un registro (R4).
+
+MUST NOT revivirlo lo que no deja una fila viva bajo su id: registrar una de sus carpetas (que sigue llevando a él), buscar, pedir contexto, registrar una sesión o insertar una fila ya borrada.
+
+Lo que lo revive MUST NOT tocar sus filas borradas, el `index_docs` de sus carpetas ni su borrado. El borrado sigue abierto, y su `--undo` (PL26) y su purga (PL28) siguen valiendo.
+
+`episodic_trajectory` y `procedural_skill` no llevan disparador: en producción nadie las escribe (`insert_episodic_trajectory` y `promote_to_procedural_skill`, `crates/clawg-core/src/memory/store_insert.rs`, sólo tienen llamadas en tests). `doctor` nombra una fila viva bajo un proyecto borrado (PL30).
+
+#### Escenario: un puente abierto después del borrado
+- GIVEN un puente que registró `/work/app`, y el proyecto A de esa carpeta borrado con sus memorias
+- WHEN el puente guarda con el id A
+- THEN la memoria queda bajo A, y A vuelve a listarse, sin revisar, con esa memoria sola
+- AND las memorias que borró el borrado siguen borradas, y el borrado sigue en `deletes` con `back`
+
+#### Escenario: un hook en la carpeta de un proyecto borrado
+- GIVEN el proyecto A de `/work/app`, borrado
+- WHEN corre `session-start` en `/work/app`
+- THEN el registro responde A, el contexto no trae memorias de A, y A sigue borrado
+
+**Tests:** `a_live_row_brings_a_deleted_project_back_unreviewed`, por un insert, por un cambio de proyecto y por una restauración, y `a_deleted_row_or_a_registration_leaves_it_deleted` (`crates/clawg-core/src/memory/project_delete.rs`); `a_bridge_opened_before_a_delete_brings_its_project_back` (`crates/clawg-cli/tests/api.rs`).
+
+## PL23. Borrar un proyecto vacío (etapa 1)
+
+`POST /v1/projects/delete` con `{"project_id": X}`, detrás del token. Se rechaza sin escribir:
+
+- 404 si X no está en `project`;
+- 409 `project_merged` si X es una lápida, con `detail` que nombra el proyecto vivo;
+- 409 `project_deleted` si X ya está borrado, con `detail` que nombra su borrado abierto;
+- 409 `saves_pending`, con su número y `retryable`, si después de esperar hasta `SAVES_WAIT` (5 s) sigue habiendo en el outbox un save pendiente para X o para una lápida de X. La transacción que escribe MUST comprobarlo de nuevo.
+
+Si X tiene filas vivas, MUST responder el informe de PL24 con `refused: "not_empty"` y sin escribir. El informe dice cuántas filas vivas tiene en cada tabla y nombra los candidatos para vaciarlo (D36):
+
+- los proyectos de sus sugerencias pendientes, con los lados por `canonical` y con su motivo;
+- los proyectos vivos con el mismo nombre, sin distinguir mayúsculas (`same_name`);
+- los proyectos vivos que tienen una carpeta con el mismo primer commit que una de X y cuyos remotos no la contradicen (`same_first_commit`), con la regla de PL18.
+
+Un par ya respondido (`apart` o `merged`) y un proyecto borrado MUST NOT ser candidatos.
+
+Si X está vacío, MUST hacer lo siguiente en una transacción, sin snapshot:
+
+1. anotar en `project_delete_row` cada fila del proyecto, todas borradas, con su `deleted_at`;
+2. bajar `index_docs` de cada carpeta de X que lo tenía, anotarla en `project_delete_folder` y sacar del índice de docs lo que haya bajo su id de raíz;
+3. dejar a X con `deleted_at`;
+4. escribir la fila de `project_delete` con `with_memories` falso.
+
+El borrado MUST NOT cambiar las carpetas (salvo `index_docs`), los remotos, las sugerencias, las lápidas que llevan a X, `synthesis_review` ni los `workspace.md`.
+
+#### Escenario: un proyecto que ya se vació
+- GIVEN un proyecto A cuyas memorias se movieron a B con `projects move`, con una memoria borrada y una carpeta con índice de docs
+- WHEN se borra A
+- THEN A no se lista, y `deletes` lo nombra con su número y una fila
+- AND su carpeta tiene `index_docs` en 0, y el índice de docs de su raíz está vacío
+
+#### Escenario: un proyecto con memorias
+- GIVEN un proyecto A con tres memorias vivas, y un proyecto B con el mismo nombre
+- WHEN se borra A
+- THEN no se escribe nada, y el informe cuenta las tres memorias y nombra a B con `same_name`
+
+**Tests:** `an_empty_project_is_deleted_and_its_docs_index_goes`, `a_project_with_live_rows_is_refused_with_its_candidates`, `a_delete_is_refused_for_an_unknown_a_merged_or_a_deleted_project` y `a_delete_waits_for_the_saves_of_its_project` (`project_delete.rs`).
+
+## PL24. El informe y el código (etapa 2, primer paso)
+
+`{"project_id": X, "with_memories": true}` MUST responder el informe del conjunto de X y su código, sin escribir nada y sin esperar al outbox. Se rechaza como en PL23, salvo por `saves_pending`: el informe cuenta los saves pendientes, y el segundo paso los espera.
+
+El informe (`DeleteReport`) tiene:
+
+- `project_id`, `name`, `with_memories`, `refused` (`not_empty`, `code_changed` o null), `code`, `delete_id` (cuando escribió) y `snapshot`;
+- `live` y `deleted`: cuántas filas vivas y cuántas borradas tiene en cada tabla (`memories`, `trajectories`, `skills`);
+- de sus filas vivas de `memory`: `by_type`, `by_author` (el `agent_id`, o `null` para las filas que no guardó ningún agente) y `by_status`;
+- `protected`: los ids de sus `user_preference` y `architectural_decision` vivas;
+- `split_pairs`: cuántos pares de `memory_conflict` unen una fila suya con una de otro proyecto o de ninguno. Quedan como están;
+- `conclusions`: los ids de las conclusiones vivas de otro proyecto, o de ninguno, que salen de una fila suya. Con el borrado pasan a `to_review` ([`specs/synthesis`](../../specs/synthesis/spec.md), R6);
+- `workspaces`: los `workspace.md` del proyecto, que no se tocan;
+- `folders`: los ids de raíz de las carpetas cuyo índice de docs se quita, y `remotes`: sus remotos, que siguen vinculados;
+- `pending`: cuántos saves del proyecto esperan en el outbox, y `failed`: cada save `failed` del proyecto, con su `operation_id` y su agente, porque reintentarlo lo haría volver;
+- `candidates`, como en PL23;
+- los campos del `--undo` (PL26): `restored` y `kept`.
+
+El código MUST resumir el conjunto exacto (D29), y MUST NOT guardarse antes del segundo paso.
+
+#### Escenario: el informe no escribe nada
+- GIVEN un proyecto A con memorias de dos agentes, una preferencia, un par con una memoria de B y una conclusión de B que sale de una memoria de A
+- WHEN se pide el informe de A
+- THEN cuenta las memorias por tipo, autor y estado, nombra la preferencia, cuenta el par, nombra la conclusión y da un código
+- AND el store, el índice de docs y la carpeta de backups quedan como estaban
+
+#### Escenario: lo que cambia el código
+- GIVEN el código de A
+- WHEN llega un save a A, se edita la importancia de una memoria de A, cambia su estado, se restaura una borrada, o A gana una carpeta o un remoto
+- THEN el código de A es otro
+
+**Tests:** `the_report_counts_by_type_author_and_status_and_writes_nothing` y `the_code_changes_with_a_save_an_edit_a_restore_or_a_locator`, y la pura `the_code_of_a_set_does_not_depend_on_its_order` (`project_delete.rs`).
+
+## PL25. Borrar con sus memorias (etapa 2, segundo paso)
+
+`{"project_id": X, "with_memories": true, "confirm": CÓDIGO}` se rechaza como en PL23, `saves_pending` incluido. Si el código no es el del conjunto de ahora, MUST responder el informe nuevo, con su código y `refused: "code_changed"`, sin escribir. La transacción que escribe MUST recalcularlo.
+
+Si el código coincide, MUST escribir un snapshot `pre-delete` y, en una transacción:
+
+1. marcar borradas a la vez, con el mismo `deleted_at`, todas las filas vivas del proyecto en las tres tablas, y sacar sus vectores. El índice de texto lo resta su disparador (V8);
+2. anotar en `project_delete_row` cada fila del conjunto: las que borró, con `deleted_at` NULL, y las que ya estaban borradas, con el suyo;
+3. llevar a su estado de reposo a cada fila de afuera que disputaba una fila borrada (`release_challengers`, `crates/clawg-core/src/memory/dispute.rs:197`);
+4. el índice de docs y `index_docs`, como en PL23;
+5. dejar a X con `deleted_at` y escribir la fila de `project_delete` con `with_memories`, el código y el snapshot.
+
+Como las filas se marcan juntas, MUST NOT revivir ninguna fila del proyecto (`REPLACED_SQL` sólo mira filas vivas, `crates/clawg-core/src/memory/revival.rs:67-74`). Una fila de afuera que una fila del proyecto reemplazó sigue reemplazada, como con cualquier borrado.
+
+El borrado MUST NOT cambiar el texto, el `status`, el `update_count` ni el `last_modified_at` de ninguna fila. Tampoco los pares de `memory_conflict`, los enlaces de `memory_derivation`, las carpetas (salvo `index_docs`), los remotos, las sugerencias, `synthesis_review`, los `workspace.md` ni el outbox. No necesita el modelo.
+
+#### Escenario: borrar A con sus memorias
+- GIVEN un proyecto A con memorias vivas y borradas, una clave con dos versiones, una memoria de B que una de A reemplazó por veredicto, una memoria de B que disputaba una de A, y un `workspace.md`
+- WHEN se borra A con el código de su informe
+- THEN todas las memorias de A están borradas y ninguna revivió, la de B reemplazada sigue así y la que disputaba vuelve a `active`
+- AND A no se lista, y `deletes` lo nombra con su número
+- AND el `workspace.md` de A sigue como estaba, y hay un snapshot `pre-delete`
+
+#### Escenario: un save entre los dos pasos
+- GIVEN el informe de A con su código
+- WHEN llega un save a A y después se confirma con ese código
+- THEN no se escribe nada, y la respuesta trae el informe con la memoria nueva y otro código
+
+**Tests:** `deleting_with_memories_marks_every_row_and_revives_none`, `a_delete_keeps_outside_rows_replaced_and_releases_their_disputes`, `a_stale_code_is_refused_with_the_new_report` y `a_delete_with_memories_waits_for_the_saves_of_its_project` (`project_delete.rs`); `deleting_through_the_daemon_takes_two_steps` (`tests/api.rs`).
+
+## PL26. El `--undo` de un borrado
+
+`{"undo": N, "dry_run": false}`. Se rechaza sin escribir:
+
+- 404 si el borrado N no existe;
+- 409 `delete_undone` si ya se deshizo, y 409 `delete_purged` si se purgó;
+- 409 `deleted_later` si el mismo proyecto tiene, después de N, otro borrado abierto, nombrándolo;
+- 409 `saves_pending`, como en PL23;
+- 503 `embedder_not_ready` o `embedder_failed` si hay filas que restaurar y el modelo no está listo. Una prueba en seco no lo necesita.
+
+Cuando hay algo que deshacer, MUST escribir un snapshot `pre-undo`, calcular antes los vectores de las filas que vuelven, y en una transacción:
+
+1. dejar vivo a X si sigue con el `deleted_at` de N. Si volvió al usarse, ya lo está;
+2. subir `index_docs` en las carpetas de `project_delete_folder` que siguen en 0. El próximo refresco reconstruye su índice;
+3. restaurar cada fila que N borró y sigue como N la dejó, en X y con el `deleted_at` de N. Vuelve con `deleted_at` en NULL, su vector y su entrada en el índice de texto, y con el `status`, el `update_count` y el `last_modified_at` de antes. Después se lleva a su estado de reposo a la fila y a las que la disputaban (`settle_row`, `settle_challengers`);
+4. dejar a N con `undone_at`.
+
+Una fila que N borró MUST quedar borrada, y se nombra en `kept` con su motivo, cuando:
+
+- `live_twin`: una fila viva de X, guardada después del borrado, tiene su texto (`content_hash`);
+- `topic_taken`: una fila viva de X, de otro save, tiene su `topic_key`;
+- `holds_secret`: `redact` encuentra en su texto un secreto con las reglas de hoy;
+- `changed`: ya no está como N la dejó (se restauró, se volvió a borrar sola o se movió);
+- `tied`: es una pieza de un save que tiene otra pieza que queda.
+
+Son las negativas de `undelete` ([`specs/restore`](../../specs/restore/spec.md), R1). Una fila que queda borrada deja como están las que reemplazó, como lo haría su borrado con la clave tomada. Las filas que ya estaban borradas antes de N MUST NOT restaurarse. El `--undo` no corre el detector: los pares que tenía siguen ahí, y no se calculan pares con lo guardado después, como en un import.
+
+#### Escenario: borrar y deshacer
+- GIVEN el proyecto A borrado con sus memorias, como en el escenario de PL25
+- WHEN se deshace el borrado
+- THEN el store está como antes de borrar: filas, estados, vectores, índice de texto, disputas, `index_docs`, y A en la lista
+- AND el próximo refresco reconstruye el índice de docs
+
+#### Escenario: lo guardado mientras estaba borrado
+- GIVEN A borrado con sus memorias. Después, un save en A con el mismo texto que una memoria borrada, y otro bajo una clave que tenía otra
+- WHEN se deshace el borrado
+- THEN los dos saves nuevos siguen vivos
+- AND las dos memorias viejas quedan borradas y se nombran, con `live_twin` y `topic_taken`, y las demás vuelven
+
+**Tests:** `undoing_a_delete_leaves_the_store_as_it_was`, `undoing_a_delete_keeps_what_was_saved_since`, `a_delete_followed_by_another_is_undone_after_it` y `undoing_an_empty_delete_needs_no_embedder` (`project_delete.rs`); `undoing_a_delete_needs_the_model` (`tests/api.rs`).
+
+## PL27. Lo que administra proyectos no toma uno borrado
+
+MUST responder 409 `project_deleted`, con `detail` que nombra el borrado abierto y su `--undo`:
+
+- `PATCH /v1/projects/{id}`;
+- cualquiera de los dos lados de `POST /v1/projects/keep-apart`;
+- el origen o el destino de `POST /v1/projects/merge`, y el `--undo` de una unión cuyo destino está borrado;
+- `to_project` de `POST /v1/memories/move`, y `project_id` de `PATCH /v1/memories/{kind}/{id}`.
+
+`from_project` de `POST /v1/memories/move` sí acepta un proyecto borrado: sus filas borradas se pueden sacar antes de purgarlo. El `--undo` de un movimiento que le devuelve filas a un proyecto borrado lo deja vivo (PL22), porque esas filas eran suyas.
+
+Lo que se ve, como con una lápida (PL15):
+
+- `GET /v1/projects` MUST NOT listar un proyecto borrado, ni sus carpetas, ni las lápidas que llevan a él, ni sus sugerencias. Una sugerencia con un lado borrado no se lista hasta que ese lado vuelva.
+- MUST responder también `deletes`: cada borrado abierto, con `delete_id`, `project_id`, `name`, `with_memories`, `deleted_at`, `rows` y `back`. `rows` son las filas de su conjunto que siguen borradas, lo que su purga sacaría; `back` dice si el proyecto volvió al usarse.
+- El nombre de un proyecto borrado queda libre para `rename`. Su id no.
+
+La tabla de PL19 suma `POST /projects/delete`, con el proyecto en `body.project_id`, que responde `project_merged` a una lápida. Un test MUST mandar a cada ruta de esa tabla que recibe un proyecto el id de un proyecto borrado, y comprobar que pasa una de tres cosas: lo lee vacío, lo hace volver con un save, o responde `project_deleted` donde este requisito lo pide.
+
+**Tests:** `a_deleted_project_is_refused_by_what_manages_projects` (`registry.rs`, `merge.rs` y `relocate.rs`); `a_deleted_project_is_listed_only_in_deletes_and_frees_its_name` (`registry.rs`); `every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule`, y la ruta nueva en `every_route_says_which_project_it_takes` y en `every_route_that_takes_a_project_follows_a_merge` (`tests/api.rs`).
+
+## PL28. `clawg purge --project-delete N`
+
+`clawg purge --project-delete N --yes [--profile P]` MUST seguir las reglas de `clawg purge <ID>` ([`specs/secrets`](../../specs/secrets/spec.md), R5): el daemon parado (toma el lock del store), sin migraciones pendientes, sin snapshot, y sin escribir nada antes de que pasen todos los chequeos. MUST:
+
+- rechazar, sin escribir, un borrado que no existe, uno deshecho y uno ya purgado;
+- en una transacción, sacar para siempre cada fila de N en `project_delete_row` que siga borrada, esté en el proyecto que esté, en las tres tablas: la fila y su vector y, en `memory`, lo que `purge` saca de una fila borrada (la cabeza en `memory_piece.context` si es la primera pieza, sus enlaces de `memory_derivation` en los que es conclusión, sus pares de `memory_conflict` y las filas del outbox con su texto y su agente);
+- sacar otra vez del índice de docs lo que haya bajo las carpetas de `project_delete_folder` que siguen con `index_docs` en 0, porque un refresco en curso pudo escribir después del borrado;
+- dejar a N con `purged_at`;
+- al final, una sola vez, el `optimize` del índice de texto, el `VACUUM` y el WAL vacío (`leave_no_old_copy`, `crates/clawg-core/src/memory/secrets.rs:326`).
+
+Una fila de N que está viva (se restauró después) MUST quedar, y la salida la nombra. El proyecto queda en `project` como está, borrado o vivo.
+
+La salida MUST decir cuántas filas sacó de cada tabla, qué filas del outbox sacó y cuáles quedaron vivas. También MUST nombrar los backups que todavía guardan alguno de sus textos (el snapshot `pre-delete` entre ellos), los `workspace.md` del proyecto y los demás que guardan alguno de sus textos, sin cambiar ninguno. `<ID>` y `--project-delete` se excluyen, y los dos piden `--yes`: sin él MUST negarse antes de abrir nada.
+
+#### Escenario: purgar un borrado
+- GIVEN A borrado con sus memorias, con memorias que ya estaban borradas antes, y el daemon parado
+- WHEN se corre `clawg purge --project-delete N --yes`
+- THEN ninguna memoria del conjunto de N está en el store, ni en su índice de texto, ni en el archivo
+- AND la salida nombra el snapshot `pre-delete` y el `workspace.md` de A
+
+**Tests:** `purging_a_delete_leaves_no_trace_of_its_rows`, `purging_a_delete_keeps_a_row_restored_since`, `a_purge_of_a_delete_undone_or_purged_is_refused_untouched` y `purging_a_delete_names_the_backups_and_workspaces_that_hold_its_text` (`crates/clawg-core/src/memory/secrets.rs`); `purge_takes_an_id_or_a_delete` (`cli.rs`); `the_purge_report_of_a_delete_names_what_went`, en los dos idiomas (`crates/clawg-cli/src/secrets.rs`); `a_deleted_project_is_purged_once_the_daemon_stops` (`crates/clawg-cli/tests/binary.rs`).
+
+## PL29. `clawg projects delete`
+
+- `clawg projects delete <ID> [--profile P]`
+- `clawg projects delete <ID> --with-memories [--confirm CÓDIGO] [--profile P]`
+- `clawg projects delete --undo N [--dry-run] [--profile P]`
+
+Los tres MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el idioma de la preferencia, con una sentencia por `match` sobre `Lang`:
+
+- **Un proyecto vacío borrado:** que se borró, su número y `clawg projects delete --undo N`. Si tiene memorias borradas, también `clawg purge --project-delete N --yes`.
+- **`not_empty`:** cuántas filas vivas tiene y cómo vaciarlo: `clawg projects merge X --into C --dry-run` por cada candidato, `clawg projects move --from-project X --to-project <ID>`, o borrarlo con `--with-memories`. Sale con 1.
+- **El informe:** lo de PL24, con cada save `failed` y su `clawg outbox discard <OPERATION_ID> --agent <AGENTE>`, terminado con el comando exacto `clawg projects delete X --with-memories --confirm CÓDIGO`. Sale con 0.
+- **`code_changed`:** lo dice, imprime el informe nuevo con su comando y sale con 1.
+- **Un borrado confirmado:** cuántas memorias borró, el snapshot, su número, `--undo N` y `clawg purge --project-delete N --yes`.
+- **Un `--undo`:** cuántas filas volvieron y cada una que quedó, con su motivo.
+
+`clawg projects list` MUST terminar con los borrados abiertos, cada uno con su `--undo N` y, si tiene filas, su purga. Uno cuyo proyecto volvió al usarse lo dice. Un rechazo nombra los ids y la causa del daemon tal como llegó, y `saves_pending` dice que se vuelva a intentar.
+
+**Tests:** `projects_delete_parses` (`cli.rs`); `a_delete_report_names_what_goes_and_the_exact_confirm`, `a_refused_delete_names_the_ways_to_empty_it` y `a_listing_ends_with_the_open_deletes`, en los dos idiomas (`crates/clawg-cli/src/projects.rs`); `a_project_is_deleted_and_undone_through_the_daemon` (`projects.rs`, contra un daemon real).
+
+## PL30. `doctor` y los proyectos borrados
+
+- `project_duplicates` MUST NOT tomar un proyecto borrado.
+- Para `project_orphans` y `project_merges`, un proyecto borrado es un proyecto: sus filas no son huérfanas, y una cadena de lápidas que termina en él no está rota.
+- Un chequeo nuevo, `project_deletes`, MUST nombrar con `warn` y `live_under_deleted` cada proyecto borrado que tiene filas vivas en alguna de las tres tablas. Sólo puede pasar en `episodic_trajectory` o `procedural_skill` (PL22), o en un store editado a mano. Su evidencia nombra el proyecto, su borrado abierto y los conteos, y no tiene paso. En un store anterior a V29 no corre.
+
+**Tests:** `a_deleted_project_is_no_duplicate_nor_orphan` y `live_rows_under_a_deleted_project_are_named` (`crates/clawg-cli/src/doctor/checks.rs`); la lectura de los hechos nuevos en un store en V28 y en V29 (`crates/clawg-core/src/memory/inspect.rs`); `the_findings_are_the_same_in_both_languages_but_their_message` sigue pasando.
+
+## PL31. Lo que no cambia en la entrega 2b
+
+- El contrato del modelo (`agent_contract.json`, `agent_contract.es.json`): ninguna herramienta borra un proyecto, ninguna llama a la ruta de PL23, y `delete_memory` sigue igual.
+- `clawg purge <ID>`. Y `clawg undelete <ID>`, que ahora además hace volver al proyecto de su fila (PL22).
+- Las uniones de antes: las lápidas que llevan a un proyecto borrado siguen llevando a él.
+- El índice de docs sigue por carpeta, y los ids de las carpetas no cambian.
+- El formato de export (entrega 4).
+
+**Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin volver a bendecir, y los de R4, R17 y PL1 a PL20.

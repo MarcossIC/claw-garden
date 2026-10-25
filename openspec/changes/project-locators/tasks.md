@@ -1,6 +1,6 @@
 # project-locators — Tareas
 
-Strict TDD: en cada tarea, el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite (`cargo test --workspace --target-dir target-test` en Windows) y clippy (`cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`). Antes de empezar una entrega: `cargo clean --workspace --target-dir target-test`. Las tareas de las entregas 2b a 4 se escriben cuando les toque. Ninguna entrega sube la versión: el cambio sale entero en 0.64.0.
+Strict TDD: en cada tarea, el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite (`cargo test --workspace --target-dir target-test` en Windows) y clippy (`cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`). Antes de empezar una entrega: `cargo clean --workspace --target-dir target-test`. Las tareas de las entregas 3 y 4 se escriben cuando les toque. Ninguna entrega sube la versión: el cambio sale entero en 0.64.0.
 
 ## Entrega 1. El registro (V27)
 
@@ -241,4 +241,151 @@ Requisitos en la [spec](spec.md#entrega-2a-unir-proyectos) (PL11 a PL20) y decis
   - `keep-apart` sobre una copia saca su sugerencia, y registrarla otra vez no la vuelve a crear;
   - `doctor` nombra dos proyectos con el mismo nombre y propone la unión en seco.
 - [ ] `verify.md`, sección «Entrega 2a».
+- [ ] No queda otro directorio de build que `target` y `target-test`.
+
+## Entrega 2b. Borrar proyectos (V29)
+
+Requisitos en la [spec](spec.md#entrega-2b-borrar-proyectos) (PL21 a PL31) y decisiones en el [diseño](design.md#entrega-2b-borrar-proyectos) (D26 a D37). Antes de la tarea 22: `cargo clean --workspace --target-dir target-test`.
+
+### 22. V29 y la vuelta al uso (PL21, PL22; D26, D27, D28)
+
+- [ ] RED:
+  - `a_database_from_the_previous_version_opens_with_no_project_deleted` (`db.rs`, sembrado con `seed_on_disk(dir, Some(28))` y el escenario de PL21);
+  - `a_live_row_brings_a_deleted_project_back_unreviewed` (por un insert, por un cambio de proyecto y por una restauración) y `a_deleted_row_or_a_registration_leaves_it_deleted` (`crates/clawg-core/src/memory/project_delete.rs`, con `deleted_at` escrito a mano);
+  - la fila 29 en `published_migration_checksums_are_pinned` (`migrations.rs`).
+- [ ] GREEN:
+  - `crates/clawg-core/migrations/V29__project_delete.sql`: la columna, las tres tablas con sus índices, los dos disparadores reemplazados y `memory_project_restored`;
+  - tocar `migrations.rs` en el mismo commit;
+  - el módulo `project_delete.rs`, registrado en `memory/mod.rs`.
+- Commit: `feat(core): add the mark and the journal of a deleted project`
+
+### 23. La regla de los duplicados pasa al core (D36)
+
+- [ ] RED: `duplicates_pair_by_name_and_by_first_commit_and_skip_answered_pairs` (`crates/clawg-core/src/memory/inspect.rs`), sobre los hechos de `inspect`.
+- [ ] GREEN: la función pura `duplicates(registry, folders, answered)` en `inspect.rs`. `project_duplicates` (`crates/clawg-cli/src/doctor/checks.rs`) la llama, y sus tests pasan sin cambios.
+- Commit: `refactor(core): move the rule of duplicate projects into the core`
+
+### 24. Borrar un proyecto vacío, el informe y el código (PL23, PL24; D29, D31, D32, D36)
+
+- [ ] RED (`project_delete.rs`, sobre `MemoryStore::new_for_test()`):
+  - `an_empty_project_is_deleted_and_its_docs_index_goes`;
+  - `a_project_with_live_rows_is_refused_with_its_candidates`;
+  - `a_delete_is_refused_for_an_unknown_a_merged_or_a_deleted_project` y `a_delete_waits_for_the_saves_of_its_project`;
+  - `the_report_counts_by_type_author_and_status_and_writes_nothing` y `the_code_changes_with_a_save_an_edit_a_restore_or_a_locator`;
+  - la pura `the_code_of_a_set_does_not_depend_on_its_order`.
+- [ ] GREEN:
+  - `delete_core(store, workspaces, backups, project_id, with_memories, confirm)`, con:
+    - la pasada que lee el conjunto (`set_in`);
+    - el código puro (`code_of`);
+    - los candidatos;
+    - la espera de `SAVES_WAIT` para X y sus lápidas;
+  - `DeleteReport`, y `DeleteError` con `thiserror`;
+  - `drop_root_index_in(tx, root_id)` en `project_docs/mod.rs`, sobre `delete_doc`;
+  - `WorkspaceManager::project_files(project_id)` (`workspace.rs`), con el recorrido de `adopt_legacy`.
+- Commit: `feat(core): delete an empty project and report what a project holds`
+
+### 25. Borrar con sus memorias (PL25; D29, D30)
+
+- [ ] RED (`project_delete.rs`): `deleting_with_memories_marks_every_row_and_revives_none`, `a_delete_keeps_outside_rows_replaced_and_releases_their_disputes`, `a_stale_code_is_refused_with_the_new_report` y `a_delete_with_memories_waits_for_the_saves_of_its_project`.
+- [ ] GREEN:
+  - `confirm` en `delete_core`: el código en las dos pasadas, el snapshot, el marcado conjunto con sus vectores, `release_challengers` y el diario;
+  - `Reason::PreDelete` (`backup.rs`, en `ALL`, `as_str` y los tests de la poda).
+- Commit: `feat(core): delete a project with its memories under a confirmed code`
+
+### 26. Deshacer un borrado (PL26; D33)
+
+- [ ] RED (`project_delete.rs`): `undoing_a_delete_leaves_the_store_as_it_was`, `undoing_a_delete_keeps_what_was_saved_since`, `a_delete_followed_by_another_is_undone_after_it` y `undoing_an_empty_delete_needs_no_embedder`.
+- [ ] GREEN:
+  - `undo_delete_core(store, embedder, backups, delete_id, dry_run)`, con el embedder como `Option`. Sin él, un `--undo` con filas que restaurar responde `DeleteError::NeedsModel`;
+  - la pasada que decide (negativas y unidades), las tandas de `embed_batch`, `pre-undo` y la transacción que vuelve a decidir;
+  - `RESTORE_TEXT_INDEX` (`admin.rs:573`) pasa a `pub(crate)`.
+- Commit: `feat(core): undo the delete of a project`
+
+### 27. Lo que administra proyectos no toma uno borrado, y la lista (PL27; D35)
+
+- [ ] RED:
+  - `a_deleted_project_is_refused_by_what_manages_projects`: `rename_project` y `keep_apart` (`registry.rs`), los dos lados de una unión y el `--undo` de una con el destino borrado (`merge.rs`), y un movimiento o un `PATCH` hacia él (`relocate.rs`);
+  - `a_deleted_project_is_listed_only_in_deletes_and_frees_its_name` (`registry.rs`).
+- [ ] GREEN:
+  - `RenameError::Deleted`, `MergeError::Deleted` y `MoveError::Deleted`, en `rename_project`, `keep_apart`, `merge_pass`, `undo_pass` y `target_in`;
+  - `list_projects` sin los borrados, con `deletes` (`ListedDelete`) y el nombre libre.
+- Commit: `feat(core): keep a deleted project out of what manages projects`
+
+### 28. Borrar y deshacer en el daemon (PL22 a PL27)
+
+- [ ] RED (`tests/api.rs`):
+  - `deleting_through_the_daemon_takes_two_steps` y `undoing_a_delete_needs_the_model`;
+  - `a_bridge_opened_before_a_delete_brings_its_project_back`;
+  - `every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule`;
+  - `POST /projects/delete` en la tabla de `every_route_says_which_project_it_takes`, y su brazo en `every_route_that_takes_a_project_follows_a_merge`.
+- [ ] GREEN:
+  - `POST /v1/projects/delete` detrás del token, con el mapeo de `DeleteError`. Para `NeedsModel`, el de `ready_embedder`;
+  - `deletes` en `GET /v1/projects`;
+  - el 409 `project_deleted` en `rename`, `keep_projects_apart`, `merge_projects`, `move_memories` y el `PATCH` de una memoria.
+- Commit: `feat(daemon): delete projects and undo their delete`
+
+### 29. `clawg projects delete` (PL29)
+
+- [ ] RED:
+  - `projects_delete_parses` (`cli.rs`);
+  - `a_delete_report_names_what_goes_and_the_exact_confirm`, `a_refused_delete_names_the_ways_to_empty_it` y `a_listing_ends_with_the_open_deletes` (`projects.rs`, en español y en inglés);
+  - `a_project_is_deleted_and_undone_through_the_daemon` (`projects.rs`).
+- [ ] GREEN: `ProjectsAction::Delete(DeleteOpts)`, el método del cliente, `render_delete`, `delete_refused` y el cierre de `render_list`, con una sentencia por `match` sobre `Lang`, y la salida 1 para `refused`.
+- Commit: `feat(cli): add projects delete`
+
+### 30. Purgar un borrado en el store (PL28; D34)
+
+- [ ] RED (`crates/clawg-core/src/memory/secrets.rs`): `purging_a_delete_leaves_no_trace_of_its_rows`, `purging_a_delete_keeps_a_row_restored_since`, `a_purge_of_a_delete_undone_or_purged_is_refused_untouched` y `purging_a_delete_names_the_backups_and_workspaces_that_hold_its_text`.
+- [ ] GREEN: `purge_delete(base_dir, delete_id) -> Result<PurgedDelete, MemoryError>`, con:
+  - `open_to_rewrite`;
+  - una transacción;
+  - una sola pasada por los backups y los `workspace.md`;
+  - `leave_no_old_copy`.
+- Commit: `feat(core): purge for good the rows a project delete left`
+
+### 31. `clawg purge --project-delete` (PL28)
+
+- [ ] RED:
+  - `purge_takes_an_id_or_a_delete` (`cli.rs`);
+  - `the_purge_report_of_a_delete_names_what_went` (`crates/clawg-cli/src/secrets.rs`, en los dos idiomas);
+  - `a_deleted_project_is_purged_once_the_daemon_stops` (`tests/binary.rs`): un daemon con `--port 0` y el embedder `fake`, un proyecto con memorias, el borrado en dos pasos, `clawg stop` y la purga.
+- [ ] GREEN: `Command::Purge` con `<ID>` o `--project-delete N` en un grupo requerido, `confirm` para los dos y `purge_delete_report`.
+- Commit: `feat(cli): purge what a project delete left`
+
+### 32. Los hallazgos de `doctor` (PL30; D37)
+
+- [ ] RED: `a_deleted_project_is_no_duplicate_nor_orphan` y `live_rows_under_a_deleted_project_are_named` (`checks.rs`); la lectura de los hechos nuevos en un store en V28 y en V29 (`inspect.rs`).
+- [ ] GREEN:
+  - `deleted_at` en `RegistryRow`, y los conteos de filas vivas en `IdRows`;
+  - `project_deletes` en `checks.rs`, con sus mensajes en los dos idiomas;
+  - su llamada en `doctor/mod.rs`, y su lugar en `every_finding`.
+- Commit: `feat(doctor): name live rows under a deleted project`
+
+### 33. Las specs y la documentación
+
+- [ ] `specs/project`: PL21 a PL31, y lo que cambia PL27 en PL9 y PL15.
+- [ ] `specs/storage`: V29, su vuelta atrás, el motivo `pre-delete` y la poda.
+- [ ] `specs/secrets`: R5 con `--project-delete`.
+- [ ] `specs/restore`: `undelete` hace volver al proyecto borrado de su fila.
+- [ ] `specs/doctor`: `project_deletes`, y lo que cambia en `project_duplicates`.
+- [ ] `.claude/CLAUDE.md`:
+  - el párrafo del proyecto en «Data profiles»: un proyecto borrado, su vuelta al uso y su diario;
+  - `clawg projects delete` y `clawg purge --project-delete` en «Commands», y el cierre de `projects list`;
+  - la ruta nueva, `deletes` en `GET /v1/projects` y el 409 `project_deleted` en la API;
+  - `project_deletes` en `clawg doctor`.
+- [ ] El contrato del modelo no cambia: `the_agent_contract_matches_its_file` y su variante en español pasan sin volver a bendecir.
+- Commit: `docs: record deleting projects`
+
+### 34. Verificación
+
+- [ ] La suite y los dos clippy de `.claude/CLAUDE.md`, en `target-test` en Windows, con `--locked`.
+- [ ] El binario en un home temporal, con repositorios reales:
+  - un proyecto vacío se borra, deja de listarse, y su `--undo` lo devuelve;
+  - uno con memorias se rechaza con sus candidatos;
+  - el informe da un código, un save entre los dos pasos lo cambia, y el código nuevo borra;
+  - un save desde un puente abierto en su carpeta lo hace volver, y lo borrado sigue borrado;
+  - `projects delete --undo N` restaura las memorias;
+  - con el daemon parado, `purge --project-delete N --yes` no deja sus textos en el archivo y nombra el snapshot `pre-delete`;
+  - `doctor` no marca nada nuevo.
+- [ ] `verify.md`, sección «Entrega 2b».
 - [ ] No queda otro directorio de build que `target` y `target-test`.
