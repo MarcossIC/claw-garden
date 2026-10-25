@@ -709,7 +709,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 27);
+        assert_eq!(after.0, 28);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -1988,6 +1988,98 @@ mod tests {
         assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
     }
 
+    /// Only a merge makes a project a tombstone, so a store from before V28
+    /// opens with every project live, every id its own canonical one, and no
+    /// row changed.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_every_project_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(27)).await;
+        type Whole = Vec<Vec<rusqlite::types::Value>>;
+        let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT * FROM memory ORDER BY id",
+                "SELECT * FROM episodic_trajectory ORDER BY id",
+                "SELECT * FROM procedural_skill ORDER BY id",
+                "SELECT id, name, born, reviewed, created_at FROM project ORDER BY id",
+                "SELECT * FROM project_path ORDER BY id",
+                "SELECT * FROM project_remote ORDER BY remote",
+                "SELECT * FROM project_suggestion ORDER BY project_id",
+                "SELECT * FROM synthesis_review ORDER BY scope_key",
+            ] {
+                let mut stmt = c.prepare(sql)?;
+                let n = stmt.column_count();
+                let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
+                out.push(rows);
+            }
+            Ok(out)
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('app-1a2b', 'app', 'root', 0, 1), ('copia-85a9', 'copia', 'root', 0, 2), ('idea', 'idea', 'adopted', 0, 3);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id, remote) VALUES \
+                       ('app-1a2b', '/work/app', 1, 1, 'app-1a2b', 'github.com/acme/app'), \
+                       ('copia-85a9', '/work/copia', 2, 0, 'copia-85a9', NULL);
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
+                     INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('copia-85a9', 'app-1a2b', 'root_commit', 2);
+                     INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', 'app-1a2b', 4);
+                     INSERT INTO episodic_trajectory \
+                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+                      VALUES ('agent', 'a', 'app-1a2b', 's', 't', 5, 5, 5);
+                     INSERT INTO procedural_skill \
+                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
+                      VALUES ('agent', 'a', 'idea', 'k', 't', 6, '[]', 6, 6, 6);",
+                )?;
+                for (id, project) in [(10, "app-1a2b"), (11, "copia-85a9"), (12, "idea")] {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status) \
+                         VALUES (?1, 'agent', 'a', ?2, 'note ' || ?1, 'semantic_fact', 'explicit', ?1, 'agent', 'x', \
+                          ?1, ?1, 5.0, 3, 'active')",
+                        rusqlite::params![id, project],
+                    )?;
+                }
+                whole(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, merged, journal): (Vec<Whole>, i64, (i64, i64)) = store
+            .conn
+            .call(move |c| {
+                let merged = c.query_row(
+                    "SELECT COUNT(*) FROM project WHERE merged_into IS NOT NULL OR merged_at IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let journal = (
+                    c.query_row("SELECT COUNT(*) FROM project_merge", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM project_merge_change", [], |r| r.get(0))?,
+                );
+                Ok::<_, rusqlite::Error>((whole(c)?, merged, journal))
+            })
+            .await
+            .unwrap();
+        assert_eq!(after, before, "migrating changes no row");
+        assert_eq!(merged, 0, "no project is a tombstone");
+        assert_eq!(journal, (0, 0), "the journal of merges starts empty");
+        for id in ["app-1a2b", "copia-85a9", "idea", "unknown-9f9f"] {
+            assert_eq!(crate::memory::merge::canonical(&store, id).await.unwrap(), id);
+        }
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
     #[tokio::test]
     async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
         ensure_vec0_registered();
@@ -2452,7 +2544,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 27, "Expected exactly 27 applied migrations, got {}", count);
+        assert_eq!(count, 28, "Expected exactly 28 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2913,7 +3005,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 27);
+        assert_eq!(migration_count, 28);
     }
 
     // -----------------------------------------------------------------------
