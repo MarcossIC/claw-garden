@@ -1,5 +1,8 @@
 use std::path::{Component, Path, PathBuf};
 use std::hash::{Hash, Hasher};
+use std::io::Read;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use siphasher::sip::SipHasher13;
 
 /// Derive a stable, human-readable project_id from a project path.
@@ -174,8 +177,183 @@ pub fn strip_verbatim(path: &Path) -> PathBuf {
 /// without an `origin`, or with one that is not a server.
 pub fn origin_key(root: &Path) -> Option<String> {
     let marker = read_marker(root)?;
-    let config = std::fs::read_to_string(git_config_dir(root, &marker).join("config")).ok()?;
+    key_in(&git_config_dir(root, &marker))
+}
+
+fn key_in(git_dir: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(git_dir.join("config")).ok()?;
     normalize_remote(&origin_url(&config)?)
+}
+
+/// What tells the git directory of `root` ([`git_config_dir`]) from another
+/// one at the same path: when it was created and, on Unix, its device and
+/// inode. A new clone, `git init` or copy changes it, a move within one
+/// filesystem does not. `None` without a git directory.
+pub fn git_stamp(root: &Path) -> Option<String> {
+    let marker = read_marker(root)?;
+    stamp_of(&git_config_dir(root, &marker))
+}
+
+fn stamp_of(git_dir: &Path) -> Option<String> {
+    let meta = std::fs::metadata(git_dir).ok()?;
+    let created = meta.created().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos());
+    stamp_from(&meta, created)
+}
+
+#[cfg(unix)]
+fn stamp_from(meta: &std::fs::Metadata, created: Option<u128>) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    // Some filesystems keep no creation date: device and inode still tell
+    // two directories apart while both exist.
+    let created = created.map(|c| c.to_string()).unwrap_or_default();
+    Some(format!("{}:{}:{created}", meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn stamp_from(_meta: &std::fs::Metadata, created: Option<u128>) -> Option<String> {
+    created.map(|c| c.to_string())
+}
+
+/// What a registration reads of a root every time: the key of its `origin`
+/// ([`origin_key`]) and the stamp of its git directory ([`git_stamp`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Checkout {
+    pub key: Option<String>,
+    pub stamp: Option<String>,
+}
+
+/// What reading the first commit of a checkout found ([`root_commit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootCommit {
+    /// The commit without parents that the first-parent chain of `HEAD` ends in.
+    Known(String),
+    /// Not to be known for this git directory: it is shallow, so its chain
+    /// ends before the first commit, or `git` did not answer within
+    /// [`ROOT_COMMIT_WAIT`]. Recorded as none beside the stamp, and not read
+    /// again until the git directory is another.
+    Unknowable,
+    /// Not now: there is no git directory, `git` could not be run, or it
+    /// ended in an error, as in a repository without commits. Nothing is
+    /// recorded, so the next registration reads it again.
+    Later,
+}
+
+/// How long `git` may take to give the first commit before it is stopped.
+pub const ROOT_COMMIT_WAIT: Duration = Duration::from_secs(1);
+
+/// The first commit of the checkout at `root`, from `git rev-list
+/// --max-parents=0 --first-parent HEAD`: a history merged in later comes in
+/// through a second parent, so it adds no root. Blocks for up to
+/// [`ROOT_COMMIT_WAIT`].
+pub fn root_commit(root: &Path) -> RootCommit {
+    let Some(marker) = read_marker(root) else {
+        return RootCommit::Later;
+    };
+    if git_config_dir(root, &marker).join("shallow").exists() {
+        return RootCommit::Unknowable;
+    }
+    let mut command = git_in(root);
+    command.args(["rev-list", "--max-parents=0", "--first-parent", "HEAD"]);
+    let Ok(mut child) = command.spawn() else {
+        return RootCommit::Later;
+    };
+    let Some(status) = wait_or_kill(&mut child, ROOT_COMMIT_WAIT) else {
+        return RootCommit::Unknowable;
+    };
+    let mut out = String::new();
+    let read = child.stdout.take().is_some_and(|mut stdout| stdout.read_to_string(&mut out).is_ok());
+    match first_commit_in(&out) {
+        Some(hash) if status.success() && read => RootCommit::Known(hash),
+        _ => RootCommit::Later,
+    }
+}
+
+/// `git` in `root` as the daemon runs it: without the `GIT_*` of whoever
+/// started it, which can point it at another repository or history, without
+/// prompts, optional locks or a filesystem monitor, with no input, and on
+/// Windows without a console, since the daemon is started detached from one
+/// and each `git` would open its own.
+fn git_in(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"GIT_")) {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(root)
+        .args(["-c", "core.fsmonitor=false"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// Waits for `child` until `wait` passes, then kills it. `None` when it had
+/// to be killed.
+fn wait_or_kill(child: &mut Child, wait: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// The hash in what `rev-list` printed, when that is one line of a SHA-1 or
+/// SHA-256 hash and nothing else.
+fn first_commit_in(stdout: &str) -> Option<String> {
+    let mut lines = stdout.lines();
+    let line = lines.next()?;
+    let hash = lines.next().is_none() && matches!(line.len(), 40 | 64) && line.bytes().all(|b| b.is_ascii_hexdigit());
+    hash.then(|| line.to_ascii_lowercase())
+}
+
+/// What a registration reads from the disk, kept apart from the decisions it
+/// feeds so those are tested without `git`. [`Disk`] reads the real one.
+pub trait Ground: Send + Sync {
+    /// The key and the stamp of what is at `root` today.
+    fn checkout(&self, root: &Path) -> Checkout;
+    /// The first commit of the checkout at `root`.
+    fn root_commit(&self, root: &Path) -> RootCommit;
+    /// Whether the checkout recorded at `path` with `stamp` is still there:
+    /// the path exists and what it holds has that stamp.
+    fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool;
+}
+
+/// The filesystem and `git` of this machine.
+pub struct Disk;
+
+impl Ground for Disk {
+    fn checkout(&self, root: &Path) -> Checkout {
+        let Some(marker) = read_marker(root) else {
+            return Checkout::default();
+        };
+        let git_dir = git_config_dir(root, &marker);
+        Checkout { key: key_in(&git_dir), stamp: stamp_of(&git_dir) }
+    }
+
+    fn root_commit(&self, root: &Path) -> RootCommit {
+        root_commit(root)
+    }
+
+    fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
+        path.exists() && git_stamp(path).as_deref() == stamp
+    }
 }
 
 /// The directory whose `config` holds the remotes of the checkout at `dir`:
@@ -472,5 +650,43 @@ mod tests {
         assert!(ids.iter().all(|id| id.starts_with("my-app-") && id.len() == "my-app-".len() + 4));
         assert!(is_candidate_for(root, &candidate_id(root, 7)));
         assert!(!is_candidate_for(root, "my-app-zzzz"));
+    }
+
+    #[test]
+    fn a_command_that_does_not_end_in_time_is_stopped() {
+        let mut command = if cfg!(windows) {
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a long-lived process");
+
+        let started = std::time::Instant::now();
+        assert_eq!(wait_or_kill(&mut child, Duration::from_millis(300)), None);
+        assert!(started.elapsed() >= Duration::from_millis(250), "it waited");
+        assert!(started.elapsed() < Duration::from_secs(10), "it did not wait for the command to end");
+        assert!(matches!(child.try_wait(), Ok(Some(_))), "the command was ended");
+    }
+
+    #[test]
+    fn only_one_line_of_a_hash_is_a_first_commit() {
+        let sha1 = "3f786850e387550fdab836ed7e6dc881de23001b";
+        let sha256 = "a".repeat(64);
+        assert_eq!(first_commit_in(&format!("{sha1}\n")).as_deref(), Some(sha1));
+        assert_eq!(first_commit_in(&format!("{}\r\n", sha1.to_uppercase())).as_deref(), Some(sha1));
+        assert_eq!(first_commit_in(&sha256).as_deref(), Some(sha256.as_str()));
+        let (longer, twice, not_hex) = (format!("{sha1}0"), format!("{sha1}\n{sha1}\n"), sha1.replace('3', "g"));
+        for answer in ["", "\n", &sha1[..39], longer.as_str(), twice.as_str(), not_hex.as_str()] {
+            assert_eq!(first_commit_in(answer), None, "{answer:?}");
+        }
     }
 }

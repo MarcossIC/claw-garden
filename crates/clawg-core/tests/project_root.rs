@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use clawg_core::memory::identity::{origin_key, resolve_project_root, strip_verbatim};
+use clawg_core::memory::identity::{
+    git_stamp, origin_key, resolve_project_root, root_commit, strip_verbatim, Disk, Ground, RootCommit,
+};
 use clawg_core::memory::{derive_project_id, ProjectIdentity};
 
 /// A temporary directory by its canonical name, so expected roots compare
@@ -179,4 +182,104 @@ fn a_root_without_origin_has_no_key() {
     assert_eq!(origin_key(&bare), None);
     assert_eq!(origin_key(&local), None);
     assert_eq!(origin_key(&plain), None);
+}
+
+/// Runs the real `git` in `dir` and returns what it printed, trimmed. It runs
+/// apart from the caller's git: none of its `GIT_*` (a hook that started the
+/// tests would point it at the repository being tested), no global or system
+/// config, and a fixed author.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"GIT_")) {
+            command.env_remove(key);
+        }
+    }
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let output = command
+        .current_dir(dir)
+        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("these tests need git on the PATH");
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).expect("git prints UTF-8").trim().to_string()
+}
+
+fn commit(repo: &Path, message: &str) -> String {
+    git(repo, &["commit", "--allow-empty", "-m", message]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+/// A `file://` URL, which `clone --depth` needs: a plain local path ignores the depth.
+fn file_url(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") }
+}
+
+#[test]
+fn the_first_commit_is_the_root_of_the_first_parent_chain() {
+    let (_tmp, base) = canonical_tempdir();
+    git(&base, &["init", "repo"]);
+    let repo = base.join("repo");
+    let first = commit(&repo, "first");
+    commit(&repo, "second");
+    git(&repo, &["checkout", "--orphan", "vendor"]);
+    fs::write(repo.join("vendor.txt"), "vendored\n").expect("write vendor.txt");
+    git(&repo, &["add", "vendor.txt"]);
+    git(&repo, &["commit", "-m", "a foreign history"]);
+    git(&repo, &["checkout", "main"]);
+    git(&repo, &["merge", "--no-ff", "--allow-unrelated-histories", "-m", "merge the foreign history", "vendor"]);
+
+    assert_eq!(git(&repo, &["rev-list", "--max-parents=0", "HEAD"]).lines().count(), 2, "the merge brought a second root");
+    assert_eq!(root_commit(&repo), RootCommit::Known(first));
+}
+
+#[test]
+fn a_shallow_or_empty_repository_has_no_first_commit_to_record() {
+    let (_tmp, base) = canonical_tempdir();
+    git(&base, &["init", "origin"]);
+    let origin = base.join("origin");
+    commit(&origin, "first");
+    commit(&origin, "second");
+    git(&base, &["clone", "--depth", "1", &file_url(&origin), "shallow"]);
+    let shallow = base.join("shallow");
+    assert!(shallow.join(".git").join("shallow").exists(), "the clone is shallow");
+    git(&base, &["init", "empty"]);
+
+    assert_eq!(root_commit(&shallow), RootCommit::Unknowable, "the commit it ends in is not the first one");
+    assert_eq!(root_commit(&base.join("empty")), RootCommit::Later, "there is no commit yet");
+}
+
+#[test]
+fn the_stamp_of_a_checkout_changes_when_it_is_cloned_again() {
+    let (_tmp, base) = canonical_tempdir();
+    git(&base, &["init", "app"]);
+    let app = base.join("app");
+    commit(&app, "first");
+    let recorded = Disk.checkout(&app).stamp.expect("a checkout has a stamp");
+
+    // The old checkout is moved aside rather than deleted: a deleted one
+    // frees its inode for the new clone, and a system without creation dates
+    // could then give both one stamp, a limit the registration accepts.
+    let moved = base.join("moved");
+    fs::rename(&app, &moved).expect("move the checkout");
+    assert_eq!(git_stamp(&moved).as_ref(), Some(&recorded), "a move keeps its git directory");
+    assert!(!Disk.recorded_checkout_present(&app, Some(&recorded)), "nothing is there");
+
+    git(&base, &["clone", "moved", "app"]);
+    let cloned = git_stamp(&app).expect("a clone has a stamp");
+    assert_ne!(cloned, recorded);
+    assert!(!Disk.recorded_checkout_present(&app, Some(&recorded)), "another checkout is there");
+    assert!(Disk.recorded_checkout_present(&app, Some(&cloned)));
+
+    let plain = base.join("plain");
+    fs::create_dir_all(&plain).expect("create plain dir");
+    assert_eq!(Disk.checkout(&plain).stamp, None, "outside git there is no git directory");
 }
