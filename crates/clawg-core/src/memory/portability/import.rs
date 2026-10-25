@@ -1626,11 +1626,7 @@ async fn write(
     }
     let embedder = embedder.ok_or(ImportError::NoEmbedder)?;
 
-    let to_embed: Vec<&Row> = prepared
-        .rows
-        .iter()
-        .filter(|r| r.src.deleted_at.is_none() && decided.placed.get(&r.src.id).is_some_and(|p| p.inserted()))
-        .collect();
+    let to_embed = rows_to_embed(prepared, &decided);
     let (clock, mut timing) = (Instant::now(), Timing { rows: Some(to_embed.len()), ..Timing::new(Step::Embed) });
     let mut vectors: HashMap<i64, Vec<u8>> = HashMap::with_capacity(to_embed.len());
     for batch in to_embed.chunks(EMBED_BATCH) {
@@ -1692,6 +1688,16 @@ async fn write(
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
     Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id })
+}
+
+/// The rows the import inserts and are not deleted, the only ones it embeds,
+/// in the order of the file.
+fn rows_to_embed<'p>(prepared: &'p Prepared, decided: &Ledger) -> Vec<&'p Row> {
+    prepared
+        .rows
+        .iter()
+        .filter(|r| r.src.deleted_at.is_none() && decided.placed.get(&r.src.id).is_some_and(|p| p.inserted()))
+        .collect()
 }
 
 fn report(prepared: &Prepared, written: &Written, dry_run: bool) -> ImportReport {
@@ -3457,5 +3463,230 @@ pub(crate) mod tests {
         assert_eq!((small.inserted, large.inserted), (NOTES, 2 * NOTES));
         let ratio = twice.as_secs_f64() / once.as_secs_f64();
         assert!(ratio <= 3.0, "{NOTES} notes in {once:?}, twice as many in {twice:?}: {ratio:.2} times");
+    }
+
+    /// Tokens the model runs over when rows of these lengths are embedded in
+    /// this order, as the import calls the embedder and the embedder cuts its
+    /// runs, against the tokens of the texts alone; and the same for the
+    /// attention, which grows with the square of a run's length.
+    fn padding(lens: &[usize]) -> (f64, f64) {
+        let (mut sent, mut real, mut sent_sq, mut real_sq) = (0usize, 0usize, 0usize, 0usize);
+        for call in lens.chunks(EMBED_BATCH) {
+            for run in call.chunks(crate::memory::embedder::EMBED_BATCH) {
+                let longest = run.iter().copied().max().unwrap_or(0);
+                sent += run.len() * longest;
+                sent_sq += run.len() * longest * longest;
+                real += run.iter().sum::<usize>();
+                real_sq += run.iter().map(|l| l * l).sum::<usize>();
+            }
+        }
+        (sent as f64 / real.max(1) as f64, sent_sq as f64 / real_sq.max(1) as f64)
+    }
+
+    #[test]
+    fn padding_counts_each_run_of_the_embedder_apart() {
+        assert_eq!(padding(&[4; 40]), (1.0, 1.0));
+        let mut lens = vec![1; 16];
+        lens[15] = 9;
+        assert_eq!(padding(&lens), (16.0 * 9.0 / 24.0, 16.0 * 81.0 / 96.0));
+        let (two_runs, _) = padding(&[[1; 16], [9; 16]].concat());
+        assert_eq!(two_runs, 1.0, "a run is padded to its own longest text");
+    }
+
+    /// What the embedding phase of an import of another tool's export is made
+    /// of, over the rows that export gives an empty store: how many tokens
+    /// each order of the rows sends to the model and, with the model, how long
+    /// each order takes, how much of it is tokenizing and pooling, and how far
+    /// a vector moves with the run it is embedded in.
+    ///
+    /// `CLAWG_E5_MODEL_DIR` is `<data dir>/models/multilingual-e5-small`, as
+    /// for `e5_golden`, and `CLAWG_IMPORT_EXPORT` a file `engram export --all`
+    /// wrote. `CLAWG_EMBED_ROWS` is how many rows, from the start of the file,
+    /// the model embeds (5000 by default; 0 measures the padding alone) and
+    /// `CLAWG_EMBED_RUNS` how many times each order embeds them (3 by default).
+    #[tokio::test]
+    #[ignore = "a measurement: needs CLAWG_E5_MODEL_DIR and CLAWG_IMPORT_EXPORT; run it with `cargo test -p clawg-core --lib -- --ignored the_embedding_phase --nocapture`"]
+    async fn the_embedding_phase_of_a_real_export() {
+        use crate::memory::embedder::{
+            apply_role_prefix, check_tokenizer, expected_contract, pad_right, pool_and_normalize, window_encodings, E5Embedder,
+        };
+        use crate::memory::model_download::{load_cached_model, load_verified_tokenizer, tokenizer_path};
+        use crate::memory::portability::engram;
+        use crate::memory::vector::EMBEDDING_DIM;
+        use std::time::Duration;
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        fn features() -> String {
+            format!(
+                "avx2 {}, avx512f {}, fma {}",
+                is_x86_feature_detected!("avx2"),
+                is_x86_feature_detected!("avx512f"),
+                is_x86_feature_detected!("fma")
+            )
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        fn features() -> String {
+            String::new()
+        }
+
+        let path = |name: &str| PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is not set")));
+        let count = |name: &str, default: usize| std::env::var(name).map_or(default, |v| v.parse().unwrap());
+        let model_dir = path("CLAWG_E5_MODEL_DIR");
+        let base = model_dir.parent().and_then(Path::parent).unwrap().to_path_buf();
+        assert_eq!(tokenizer_path(&base).parent(), Some(model_dir.as_path()), "CLAWG_E5_MODEL_DIR is <data dir>/models/multilingual-e5-small");
+        let (sample, runs) = (count("CLAWG_EMBED_ROWS", 5000), count("CLAWG_EMBED_RUNS", 3));
+        println!(
+            "build {}, {} {}, {} logical cpus, {}",
+            if cfg!(debug_assertions) { "debug" } else { "optimized" },
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::thread::available_parallelism().map_or(0, |n| n.get()),
+            features(),
+        );
+
+        let tokenizer = load_verified_tokenizer(&base).expect("the pinned tokenizer.json");
+        let export = engram::read(&std::fs::read_to_string(path("CLAWG_IMPORT_EXPORT")).unwrap()).unwrap();
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let chunker = Arc::new(ChatChunker::with_tokenizer(tokenizer.clone()));
+        let (prepared, _) = prepare_export(&store, chunker, export, &ImportOptions::default(), &mut ImportTimings::new(true)).await.unwrap();
+        let planned = load(&store, &prepared, &mut Timing::new(Step::Load)).await.unwrap();
+        let decided = decide(planned, &prepared, &AtomicBool::new(false)).unwrap();
+        let rows = rows_to_embed(&prepared, &decided);
+
+        let contract = expected_contract();
+        let texts: Vec<String> = rows.iter().map(|r| embedding_text(&r.context, &r.content).into_owned()).collect();
+        let prefixed: Vec<String> =
+            texts.iter().map(|t| apply_role_prefix(EmbedRole::Passage, t, &contract.query_prefix, &contract.passage_prefix)).collect();
+        let clock = Instant::now();
+        let mut tokens = Vec::with_capacity(rows.len());
+        for chunk in prefixed.chunks(256) {
+            let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            tokens.extend(window_encodings(&tokenizer, &refs).unwrap().iter().map(|e| e.len()));
+        }
+        let tokenizing = clock.elapsed();
+        let file: Vec<usize> = (0..rows.len()).collect();
+        let lens = |order: &[usize]| order.iter().map(|&k| tokens[k]).collect::<Vec<_>>();
+        let chars: Vec<usize> = texts.iter().map(|t| t.chars().count()).collect();
+        let orders = |indices: &[usize]| {
+            let by = |key: &dyn Fn(usize) -> usize| {
+                let mut order = indices.to_vec();
+                order.sort_by_key(|&k| Reverse(key(k)));
+                order
+            };
+            [
+                ("file", indices.to_vec()),
+                ("bytes", by(&|k| texts[k].len())),
+                ("chars", by(&|k| chars[k])),
+                ("tokens", by(&|k| tokens[k])),
+            ]
+        };
+        let report_padding = |what: &str, indices: &[usize]| {
+            for (name, order) in orders(indices) {
+                let (linear, attention) = padding(&lens(&order));
+                println!("{what}: order {name:>6}: {linear:.3}x the tokens, {attention:.3}x the attention");
+            }
+        };
+        let total: usize = tokens.iter().sum();
+        let bucket = |lo: usize, hi: usize| tokens.iter().filter(|&&t| t > lo && t <= hi).count();
+        println!(
+            "{} notes, {} rows to embed, {total} tokens ({:.1} a row), tokenized in {tokenizing:.2?}; rows of up to 64 tokens {}, 128 {}, 256 {}, 512 {}",
+            prepared.notes.len(),
+            rows.len(),
+            total as f64 / rows.len().max(1) as f64,
+            bucket(0, 64),
+            bucket(64, 128),
+            bucket(128, 256),
+            bucket(256, 512),
+        );
+        report_padding("all rows", &file);
+        let sample = sample.min(rows.len());
+        if sample == 0 {
+            return;
+        }
+        let first: Vec<usize> = (0..sample).collect();
+        report_padding(&format!("first {sample} rows"), &first);
+
+        let files = load_cached_model(&base).await.unwrap();
+        let pad_id = check_tokenizer(&tokenizer, &files.tokenizer).unwrap();
+        let embedder = E5Embedder::from_parts(&files.onnx, tokenizer.clone(), &files.tokenizer).unwrap();
+        let orders = orders(&first);
+        let embed = |order: &[usize]| {
+            let (texts, embedder) = (&texts, &embedder);
+            let order = order.to_vec();
+            async move {
+                let clock = Instant::now();
+                let mut vectors = vec![Vec::new(); texts.len()];
+                for call in order.chunks(EMBED_BATCH) {
+                    let batch: Vec<String> = call.iter().map(|&k| texts[k].clone()).collect();
+                    for (&k, vector) in call.iter().zip(embedder.embed_batch(&batch, EmbedRole::Passage).await.unwrap()) {
+                        vectors[k] = vector;
+                    }
+                }
+                (clock.elapsed(), vectors)
+            }
+        };
+        let mut took: Vec<Vec<Duration>> = vec![Vec::new(); orders.len()];
+        let mut vectors: Vec<Vec<Vec<f32>>> = vec![Vec::new(); orders.len()];
+        for run in 0..runs {
+            for (k, (name, order)) in orders.iter().enumerate() {
+                let (elapsed, embedded) = embed(order).await;
+                println!("run {run}: order {name:>6}: {elapsed:.2?}, {:.1} rows/s", sample as f64 / elapsed.as_secs_f64());
+                took[k].push(elapsed);
+                vectors[k] = embedded;
+            }
+        }
+        let median = |runs: &[Duration]| {
+            let mut runs = runs.to_vec();
+            runs.sort();
+            runs[runs.len() / 2]
+        };
+        let file_took = median(&took[0]);
+        for (k, (name, _)) in orders.iter().enumerate() {
+            let median = median(&took[k]);
+            println!(
+                "median of {runs}: order {name:>6}: {median:.2?}, {:.1} rows/s, {:.1}% less time than the file order",
+                sample as f64 / median.as_secs_f64(),
+                100.0 * (1.0 - median.as_secs_f64() / file_took.as_secs_f64())
+            );
+        }
+
+        let clock = Instant::now();
+        let mut pooling = Duration::ZERO;
+        for call in first.chunks(EMBED_BATCH) {
+            for run in call.chunks(crate::memory::embedder::EMBED_BATCH) {
+                let refs: Vec<&str> = run.iter().map(|&k| prefixed[k].as_str()).collect();
+                let batch = pad_right(&window_encodings(&tokenizer, &refs).unwrap(), pad_id);
+                let hidden = vec![0.5f32; batch.rows * batch.len * EMBEDDING_DIM];
+                let pooled = Instant::now();
+                pool_and_normalize(&hidden, &[batch.rows as i64, batch.len as i64, EMBEDDING_DIM as i64], &batch.mask).unwrap();
+                pooling += pooled.elapsed();
+            }
+        }
+        let tokenizing = clock.elapsed() - pooling;
+        let share = |part: Duration| 100.0 * part.as_secs_f64() / file_took.as_secs_f64();
+        println!(
+            "of the file order's {file_took:.2?}: tokenizing and padding {tokenizing:.2?} ({:.1}%), pooling {pooling:.2?} ({:.1}%), the rest is the session",
+            share(tokenizing),
+            share(pooling)
+        );
+
+        let difference = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let longest_first = &orders[orders.len() - 1].1;
+        let probes: Vec<usize> = longest_first.iter().step_by((sample / 64).max(1)).copied().collect();
+        let mut alone = HashMap::new();
+        for &k in &probes {
+            alone.insert(k, embedder.embed_with_role(&texts[k], EmbedRole::Passage).await.unwrap());
+        }
+        for (k, (name, _)) in orders.iter().enumerate() {
+            let against_file: Vec<f32> = first.iter().map(|&row| difference(&vectors[0][row], &vectors[k][row])).collect();
+            let against_alone = probes.iter().map(|row| difference(&alone[row], &vectors[k][*row])).fold(0f32, f32::max);
+            println!(
+                "order {name:>6}: {} of {sample} vectors the same bits as the file order, largest difference {:e}; \
+                 largest difference from {} texts embedded alone {against_alone:e}",
+                against_file.iter().filter(|&&d| d == 0.0).count(),
+                against_file.iter().copied().fold(0f32, f32::max),
+                probes.len(),
+            );
+        }
     }
 }
