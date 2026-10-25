@@ -16,6 +16,10 @@
 //! remote and the first commit it recorded, do not contradict the checkout
 //! there now (see [`fit`]); a root that contradicts every folder of its path
 //! gets a folder and a project of its own, and its remote is bound there.
+//! A checkout on a new path keeps its project when its first commit was
+//! recorded in another path whose checkout is gone (see [`moved`]); when
+//! that cannot be told, the root stays apart and the two projects are left
+//! as a suggestion in `project_suggestion`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -115,6 +119,10 @@ struct Plan {
     /// that changes nothing writes nothing, since the hooks register on
     /// every event.
     folder_changed: bool,
+    /// The paths the root's checkout was recorded in before it moved.
+    moved_from: Vec<PathBuf>,
+    /// The projects `project_id` may be the same as, each with why.
+    suggestions: Vec<(String, &'static str)>,
 }
 
 /// A folder of a path, as `project_path` records it.
@@ -204,24 +212,28 @@ fn recorded_commit(folders: &[Folder], stamp: Option<&str>) -> Option<RootCommit
     Some(folder.root_commit.clone().map_or(RootCommit::Unknowable, RootCommit::Known))
 }
 
+/// The columns of `project_path AS p` that [`folder_from`] reads, in its order.
+const FOLDER_COLUMNS: &str = "p.id, p.project_id, p.remote, p.root_commit, p.git_stamp, \
+     (SELECT json_group_array(remote) FROM project_remote WHERE project_id = p.id)";
+
+fn folder_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Folder> {
+    let bound: String = r.get(5)?;
+    Ok(Folder {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        remote: r.get(2)?,
+        bound: serde_json::from_str(&bound).unwrap_or_default(),
+        root_commit: r.get(3)?,
+        git_stamp: r.get(4)?,
+    })
+}
+
 /// The folders `project_path` records for `root`, oldest first.
 fn path_folders_in(c: &Connection, root: &str) -> rusqlite::Result<Vec<Folder>> {
-    let mut stmt = c.prepare(
-        "SELECT p.id, p.project_id, p.remote, p.root_commit, p.git_stamp, \
-                (SELECT json_group_array(remote) FROM project_remote WHERE project_id = p.id) \
-         FROM project_path AS p WHERE p.root_path = ?1 ORDER BY p.created_at, p.id",
-    )?;
-    let rows = stmt.query_map([root], |r| {
-        let bound: String = r.get(5)?;
-        Ok(Folder {
-            id: r.get(0)?,
-            project_id: r.get(1)?,
-            remote: r.get(2)?,
-            bound: serde_json::from_str(&bound).unwrap_or_default(),
-            root_commit: r.get(3)?,
-            git_stamp: r.get(4)?,
-        })
-    })?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT {FOLDER_COLUMNS} FROM project_path AS p WHERE p.root_path = ?1 ORDER BY p.created_at, p.id"
+    ))?;
+    let rows = stmt.query_map([root], folder_from)?;
     rows.collect()
 }
 
@@ -233,6 +245,108 @@ fn root_of_in(c: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
 /// The project the clones of `remote` share, if one registered it.
 fn remote_project_in(c: &Connection, remote: &str) -> rusqlite::Result<Option<String>> {
     c.query_row("SELECT project_id FROM project_remote WHERE remote = ?1", [remote], |r| r.get(0)).optional()
+}
+
+/// The project `folder` leads to: the one a registration recorded in it,
+/// else, for a folder none recorded one in since V27, the one the clones of
+/// its remote share, else its own id.
+fn folder_project_in(c: &Connection, folder: &Folder) -> rusqlite::Result<String> {
+    if let Some(project) = &folder.project_id {
+        return Ok(project.clone());
+    }
+    let shared = match &folder.remote {
+        Some(remote) => remote_project_in(c, remote)?,
+        None => None,
+    };
+    Ok(shared.unwrap_or_else(|| folder.id.clone()))
+}
+
+/// A checkout recorded at a path, by the stamp of its git directory.
+type Recorded = (PathBuf, Option<String>);
+
+/// A folder of another path recorded with the first commit of a root on a
+/// new path, which the root's remote does not contradict: the checkout
+/// recorded there may be the root's, moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sighting {
+    path: PathBuf,
+    stamp: Option<String>,
+    /// The project the folder leads to.
+    project: String,
+}
+
+impl Sighting {
+    fn recorded(&self) -> Recorded {
+        (self.path.clone(), self.stamp.clone())
+    }
+}
+
+/// What a root on a new path is, from where its first commit was recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Moved {
+    /// The checkout recorded for this project, moved.
+    To(String),
+    /// A root of its own, which may be the same as any of these projects.
+    Apart(Vec<String>),
+}
+
+/// Decides [`Moved`] from the `sightings` of a root's first commit, of which
+/// `gone` are the ones whose recorded checkout is no longer there: the root
+/// is that checkout, moved, only when every sighting leads to one project
+/// and none is there anymore. A checkout still in its place makes the root a
+/// copy or a second checkout, and two projects leave no way to choose, so
+/// the root stays apart: a join can be undone, a fusion cannot be split.
+fn moved(sightings: &[Sighting], gone: &[Recorded]) -> Moved {
+    let mut projects: Vec<String> = Vec::new();
+    for sighting in sightings {
+        if !projects.contains(&sighting.project) {
+            projects.push(sighting.project.clone());
+        }
+    }
+    let all_gone = sightings.iter().all(|s| gone.contains(&s.recorded()));
+    match projects.as_slice() {
+        [project] if all_gone => Moved::To(project.clone()),
+        _ => Moved::Apart(projects),
+    }
+}
+
+/// The [`Sighting`]s of `root`, whose checkout has the first commit `commit`,
+/// among the folders of other paths and those `pending` would write, oldest
+/// first. None unless the first commit is known and `looks`: the root's path
+/// has no folder and no project shares its remote, which would name its
+/// project already.
+fn sightings_in(
+    c: &Connection,
+    root: &Path,
+    checkout: &Checkout,
+    commit: &RootCommit,
+    looks: bool,
+    pending: &Pending,
+) -> rusqlite::Result<Vec<Sighting>> {
+    let (RootCommit::Known(commit), true) = (commit, looks) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = c.prepare(&format!(
+        "SELECT {FOLDER_COLUMNS}, p.root_path FROM project_path AS p \
+         WHERE p.root_commit = ?1 ORDER BY p.created_at, p.id"
+    ))?;
+    let rows = stmt.query_map([commit], |r| Ok((PathBuf::from(r.get::<_, String>(6)?), folder_from(r)?)))?;
+    let mut found = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (path, folder) in &pending.folders {
+        match found.iter_mut().find(|(_, f)| f.id == folder.id) {
+            Some(recorded) => *recorded = (path.clone(), folder.clone()),
+            None => found.push((path.clone(), folder.clone())),
+        }
+    }
+    let key = checkout.key.as_deref();
+    let mut sightings = Vec::new();
+    for (path, folder) in found {
+        let same = folder.root_commit.as_deref() == Some(commit.as_str()) && fit(&folder, key, Some(commit)) == Fit::Same;
+        if path != root && same {
+            sightings.push(Sighting { project: folder_project_in(c, &folder)?, path, stamp: folder.git_stamp });
+        }
+    }
+    Ok(sightings)
 }
 
 /// What a registration records in the folder it settles on.
@@ -263,6 +377,11 @@ impl Settlement {
     /// Whether every folder of the path was another repository.
     fn contradicted(&self) -> bool {
         self.new_row && !self.owns_legacy
+    }
+
+    /// Whether the path had no folder.
+    fn fresh(&self) -> bool {
+        self.new_row && self.owns_legacy
     }
 
     /// The folder as the registration leaves it, leading to `project_id`
@@ -334,7 +453,7 @@ fn folders_in(c: &Connection, root: &Path, pending: &Pending) -> rusqlite::Resul
 fn settle_in(
     c: &Connection,
     root: &Path,
-    folders: Vec<Folder>,
+    folders: &[Folder],
     checkout: &Checkout,
     commit: &RootCommit,
     pending: &Pending,
@@ -354,7 +473,7 @@ fn settle_in(
         remote: key.filter(|_| folder.remotes().is_empty()).map(str::to_string),
         prints: prints.clone(),
     };
-    let owns_legacy = match settle(&folders, key, known) {
+    let owns_legacy = match settle(folders, key, known) {
         Settled::Row(i) => {
             let folder = folders[i].clone();
             return Ok(Settlement { record: record(&folder), folder, new_row: false, owns_legacy: i == 0 });
@@ -391,7 +510,7 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground
         let checkout = ground.checkout(root);
         let folders = folders_in(c, root, &pending)?;
         let commit = recorded_commit(&folders, checkout.stamp.as_deref()).unwrap_or_else(|| ground.root_commit(root));
-        let settled = match settle_in(c, root, folders, &checkout, &commit, &pending) {
+        let settled = match settle_in(c, root, &folders, &checkout, &commit, &pending) {
             Ok(settled) => Some(settled),
             Err(RegisterError::Store(MemoryError::Sqlite(e))) => return Err(e),
             Err(_) => None,
@@ -406,7 +525,19 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground
             None => None,
         };
         let project_id = match &settled {
-            Some(settled) => project_of(shared, settled),
+            Some(settled) => {
+                let looks = shared.is_none() && settled.fresh();
+                let sightings = sightings_in(c, root, &checkout, &commit, looks, &pending)?;
+                let gone: Vec<Recorded> = sightings
+                    .iter()
+                    .filter(|s| !ground.recorded_checkout_present(&s.path, s.stamp.as_deref()))
+                    .map(Sighting::recorded)
+                    .collect();
+                match moved(&sightings, &gone) {
+                    Moved::To(project) => project,
+                    Moved::Apart(_) => project_of(shared, settled),
+                }
+            }
             None => shared.unwrap_or_else(|| root_id.clone()),
         };
         if let Some(key) = checkout.key {
@@ -420,23 +551,50 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground
     Ok(out)
 }
 
-/// Settles the ids of a registration inside the caller's transaction, or
-/// `None` to have the first commit of the root read first: no folder of its
-/// path recorded its git directory, `read` holds no commit read since, and
-/// `may_read` lets this pass stop for it. Without `may_read` it settles
-/// without the commit.
-fn plan_in(c: &Connection, reg: &Registration<'_>, read: Option<&RootCommit>, may_read: bool) -> Result<Option<Plan>, RegisterError> {
+/// What the passes of [`register_project`] read from the disk so far.
+#[derive(Debug, Clone, Default)]
+struct FromDisk {
+    /// The first commit of the root.
+    commit: Option<RootCommit>,
+    /// Of the recorded checkouts looked at, the ones no longer there. One
+    /// that was not looked at counts as there, which keeps the root apart.
+    gone: Option<Vec<Recorded>>,
+}
+
+/// What a pass of [`plan_in`] settles on, or what it needs from the disk first.
+enum Planned {
+    Plan(Plan),
+    /// The first commit of the root: no folder of its path recorded its git directory.
+    Commit,
+    /// Whether these checkouts are still where they were recorded: the root
+    /// may be one of them, moved.
+    Presence(Vec<Recorded>),
+}
+
+/// Settles the ids of a registration inside the caller's transaction from
+/// what `disk` read, or stops for what it still needs (see [`Planned`]) when
+/// `may_read` or `may_look` let it. A pass that may not stop settles without:
+/// a first commit not read contradicts nothing, and a checkout not looked at
+/// is there.
+fn plan_in(
+    c: &Connection,
+    reg: &Registration<'_>,
+    disk: &FromDisk,
+    may_read: bool,
+    may_look: bool,
+) -> Result<Planned, RegisterError> {
     let root_path = reg.root.to_string_lossy().into_owned();
     let sql = |e: rusqlite::Error| RegisterError::Store(MemoryError::Sqlite(e));
     let folders = folders_in(c, reg.root, &Pending::default()).map_err(sql)?;
-    let commit = match (recorded_commit(&folders, reg.checkout.stamp.as_deref()), read) {
+    let commit = match (recorded_commit(&folders, reg.checkout.stamp.as_deref()), &disk.commit) {
         (Some(recorded), _) => recorded,
         (None, Some(read)) => read.clone(),
-        (None, None) if may_read => return Ok(None),
+        (None, None) if may_read => return Ok(Planned::Commit),
         (None, None) => RootCommit::Later,
     };
-    let settled = settle_in(c, reg.root, folders, &reg.checkout, &commit, &Pending::default());
+    let settled = settle_in(c, reg.root, &folders, &reg.checkout, &commit, &Pending::default());
     let key = reg.checkout.key.as_deref();
+    let (mut moved_from, mut suggestions) = (Vec::new(), Vec::new());
     let (settled, project_id, folder) = if reg.assigned {
         let settled = settled?;
         if settled.contradicted() {
@@ -453,7 +611,37 @@ fn plan_in(c: &Connection, reg: &Registration<'_>, read: Option<&RootCommit>, ma
             );
         }
         let shared = key.map(|r| remote_project_in(c, r)).transpose().map_err(sql)?.flatten();
-        let project_id = project_of(shared, &settled);
+        let looks = shared.is_none() && settled.fresh();
+        let sightings = sightings_in(c, reg.root, &reg.checkout, &commit, looks, &Pending::default()).map_err(sql)?;
+        let gone = match &disk.gone {
+            Some(gone) => gone.as_slice(),
+            None if may_look && !sightings.is_empty() => {
+                return Ok(Planned::Presence(sightings.iter().map(Sighting::recorded).collect()));
+            }
+            None => &[],
+        };
+        let project_id = match moved(&sightings, gone) {
+            Moved::To(project) => {
+                moved_from = sightings.into_iter().map(|s| s.path).collect();
+                project
+            }
+            Moved::Apart(others) => {
+                let project_id = project_of(shared, &settled);
+                suggestions.extend(others.into_iter().filter(|o| *o != project_id).map(|o| (o, "root_commit")));
+                project_id
+            }
+        };
+        // A remote that changed in place, a rename or a new organization,
+        // keeps the first commit the path recorded: told apart by the remote,
+        // and maybe the same project.
+        if let (true, RootCommit::Known(commit)) = (settled.contradicted(), &commit) {
+            for folder in folders.iter().filter(|f| f.root_commit.as_ref() == Some(commit)) {
+                let other = folder_project_in(c, folder).map_err(sql)?;
+                if other != project_id && !suggestions.iter().any(|(o, _)| *o == other) {
+                    suggestions.push((other, "remote_changed"));
+                }
+            }
+        }
         let folder = settled.written(Some(&project_id));
         (settled, project_id, folder)
     } else {
@@ -503,7 +691,17 @@ fn plan_in(c: &Connection, reg: &Registration<'_>, read: Option<&RootCommit>, ma
         )
         .map_err(sql)?;
     let folder_changed = folder != settled.folder;
-    Ok(Some(Plan { root_id, project_id, new_root: settled.new_row, legacy, moves, folder, folder_changed }))
+    Ok(Planned::Plan(Plan {
+        root_id,
+        project_id,
+        new_root: settled.new_row,
+        legacy,
+        moves,
+        folder,
+        folder_changed,
+        moved_from,
+        suggestions,
+    }))
 }
 
 /// Writes `plan` inside the caller's transaction and returns how many rows
@@ -544,6 +742,28 @@ fn write_in(
         "INSERT OR IGNORE INTO project (id, name, born, reviewed, created_at) VALUES (?1, ?2, 'root', 0, ?3)",
         rusqlite::params![plan.project_id, project_name(&plan.project_id), now],
     )?;
+    if !plan.moved_from.is_empty() {
+        let paths: Vec<String> = plan.moved_from.iter().map(|p| p.display().to_string()).collect();
+        log::info!(
+            "{root_path} holds the checkout recorded at {} before it moved; it keeps project {}",
+            paths.join(", "),
+            plan.project_id
+        );
+    }
+    // A pair is suggested once whatever its order (the unique index), so an
+    // answer keeps it from coming back.
+    for (other, reason) in &plan.suggestions {
+        let made = c.execute(
+            "INSERT OR IGNORE INTO project_suggestion (project_id, other_id, reason, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![plan.project_id, other, reason, now],
+        )?;
+        if made > 0 {
+            log::info!(
+                "project {} of {root_path} may be the same as {other} ({reason}); `clawg projects list` lists the suggestion",
+                plan.project_id
+            );
+        }
+    }
     let indexed: bool = c.query_row("SELECT index_docs FROM project_path WHERE id = ?1", [&plan.root_id], |r| r.get(0))?;
     if reg.index_docs && !indexed {
         c.execute("UPDATE project_path SET index_docs = 1 WHERE id = ?1", [&plan.root_id])?;
@@ -583,6 +803,9 @@ enum Pass {
     /// The first commit of the root is needed: the caller reads it and runs
     /// the pass again.
     WouldRead,
+    /// The root may be one of these recorded checkouts, moved: the caller
+    /// looks whether each is still there and runs the pass again.
+    WouldLook(Vec<Recorded>),
     /// Rows would move: the caller snapshots and runs the pass again.
     WouldMove,
 }
@@ -591,9 +814,10 @@ enum Pass {
 /// each legacy id, soft-deleted rows included, then hands each legacy
 /// `workspace.md` to the project (see [`WorkspaceManager::adopt_legacy`]).
 /// When no folder of the root's path recorded its git directory, it first
-/// reads the first commit from `ground` on a blocking thread; when rows are
-/// to move it first snapshots the store as `pre-rekey` into `backups`. Each
-/// time it decides again after.
+/// reads the first commit from `ground` on a blocking thread, and when the
+/// root may be a checkout moved from another path it looks there the same
+/// way; when rows are to move it first snapshots the store as `pre-rekey`
+/// into `backups`. Each time it decides again after.
 ///
 /// `index_docs` only ever raises the stored mark: any tool that names a path
 /// registers its root, and such a call must not take an index away from a
@@ -612,13 +836,15 @@ pub async fn register_project(
     }
     let owned = (reg.root.to_path_buf(), reg.checkout.clone(), reg.legacy_ids.to_vec());
     let (index_docs, assigned) = (reg.index_docs, reg.assigned);
-    let pass = move |snapshot: Option<PathBuf>, read: Option<RootCommit>, may_read: bool| {
+    let pass = move |snapshot: Option<PathBuf>, disk: FromDisk, may_read: bool, may_look: bool| {
         let (root, checkout, legacy_ids) = owned.clone();
         move |c: &mut Connection| -> Result<Pass, RegisterError> {
             let reg = Registration { root: &root, checkout, legacy_ids: &legacy_ids, index_docs, assigned };
             let tx = c.transaction().map_err(MemoryError::Sqlite)?;
-            let Some(plan) = plan_in(&tx, &reg, read.as_ref(), may_read)? else {
-                return Ok(Pass::WouldRead);
+            let plan = match plan_in(&tx, &reg, &disk, may_read, may_look)? {
+                Planned::Plan(plan) => plan,
+                Planned::Commit => return Ok(Pass::WouldRead),
+                Planned::Presence(recorded) => return Ok(Pass::WouldLook(recorded)),
             };
             if plan.moves && snapshot.is_none() {
                 return Ok(Pass::WouldMove);
@@ -637,22 +863,30 @@ pub async fn register_project(
             Ok(Pass::Done(outcome, plan.legacy))
         }
     };
-    let mut read = None;
-    let mut outcome = store.conn.call(pass(None, None, true)).await.map_err(connection_error)?;
+    let mut disk = FromDisk::default();
+    let mut outcome = store.conn.call(pass(None, disk.clone(), true, true)).await.map_err(connection_error)?;
     if let Pass::WouldRead = outcome {
         // `git` may take up to ROOT_COMMIT_WAIT, which the connection's
         // thread must not spend.
-        let root = reg.root.to_path_buf();
+        let (root, ground) = (reg.root.to_path_buf(), ground.clone());
         let commit = tokio::task::spawn_blocking(move || ground.root_commit(&root)).await.unwrap_or(RootCommit::Later);
-        read = Some(commit);
-        outcome = store.conn.call(pass(None, read.clone(), false)).await.map_err(connection_error)?;
+        disk.commit = Some(commit);
+        outcome = store.conn.call(pass(None, disk.clone(), false, true)).await.map_err(connection_error)?;
+    }
+    if let Pass::WouldLook(recorded) = outcome {
+        // A look that fails finds nothing gone, which keeps the root apart.
+        let gone = tokio::task::spawn_blocking(move || {
+            recorded.into_iter().filter(|(path, stamp)| !ground.recorded_checkout_present(path, stamp.as_deref())).collect()
+        });
+        disk.gone = Some(gone.await.unwrap_or_default());
+        outcome = store.conn.call(pass(None, disk.clone(), false, false)).await.map_err(connection_error)?;
     }
     if let Pass::WouldMove = outcome {
         let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreRekey).await?;
-        outcome = store.conn.call(pass(Some(snapshot), read, false)).await.map_err(connection_error)?;
+        outcome = store.conn.call(pass(Some(snapshot), disk, false, false)).await.map_err(connection_error)?;
     }
     let Pass::Done(outcome, legacy) = outcome else {
-        unreachable!("only the first pass stops for the first commit, and a pass after the snapshot always writes");
+        unreachable!("a pass stops only for what no pass before it asked, and a pass after the snapshot always writes");
     };
 
     // After the commit and outside it: a file copy that fails must not undo
@@ -802,12 +1036,28 @@ mod tests {
             self.store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.unwrap()
         }
 
+        /// Each suggestion: the project made apart, the other, the reason and the answer.
+        async fn suggestions(&self) -> Vec<SuggestionRow> {
+            self.store
+                .conn
+                .call(|c| {
+                    let mut stmt = c.prepare(
+                        "SELECT project_id, other_id, reason, answer FROM project_suggestion ORDER BY project_id, other_id",
+                    )?;
+                    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                    rows.collect::<rusqlite::Result<_>>()
+                })
+                .await
+                .unwrap()
+        }
+
         async fn snapshots(&self) -> usize {
             std::fs::read_dir(&self.backups).map(|d| d.count()).unwrap_or(0)
         }
     }
 
     type FolderRow = (String, Option<String>, Option<String>, Option<String>, Option<String>);
+    type SuggestionRow = (String, String, String, Option<String>);
 
     fn reg<'a>(root: &'a Path, legacy: &'a [String]) -> Registration<'a> {
         Registration { root, checkout: Checkout::default(), legacy_ids: legacy, index_docs: true, assigned: true }
@@ -1550,5 +1800,179 @@ mod tests {
         assert_eq!(f.folders("/work/app").await, vec![recorded], "nothing written");
         let same = f.register(Registration { assigned: false, ..f.found(path, None, "s1", known("c1")) }).await.unwrap();
         assert_eq!(same.project_id, a.project_id, "its own repository is still served");
+    }
+
+    #[tokio::test]
+    async fn a_checkout_moved_without_origin_keeps_its_project() {
+        let f = Fixture::new().await;
+        let (old, new) = (Path::new("/work/app"), Path::new("/work/app2"));
+        let a = f.register(f.found(old, None, "s1", known("c1"))).await.unwrap();
+        let mine = f.memory(&a.project_id, "the parser of app", None, 1).await;
+        let stray = f.memory(&derive_project_id(new), "saved in app2 before it was registered", None, 2).await;
+        f.ground.remove(old);
+
+        let moved = f.register(f.found(new, None, "s1", known("c1"))).await.unwrap();
+
+        assert_eq!(moved.project_id, a.project_id);
+        assert_eq!(moved.root_id, derive_project_id(new), "the new path has a folder of its own");
+        assert_eq!(moved.rekeyed, 1, "the id of that folder joins the project");
+        assert!(moved.snapshot.is_some());
+        let p = Some(a.project_id.clone());
+        assert_eq!(project_ids(&f.store).await, vec![("memory".into(), mine, p.clone()), ("memory".into(), stray, p.clone())]);
+        assert_eq!(f.folders("/work/app2").await, vec![(moved.root_id.clone(), p.clone(), None, some("c1"), some("s1"))]);
+        let left = (a.root_id.clone(), p, None, some("c1"), some("s1"));
+        assert_eq!(f.folders("/work/app").await, vec![left], "the old folder stays as it was");
+        assert!(f.suggestions().await.is_empty());
+
+        f.ground.remove(new);
+        let back = f.register(f.found(old, None, "s1", known("c1"))).await.unwrap();
+        assert_eq!((back.project_id, back.root_id), (a.project_id.clone(), a.root_id), "back in its old path, it uses its old folder");
+
+        let lib = Path::new("/work/lib");
+        let l = f.register(f.found(lib, None, "t1", known("c2"))).await.unwrap();
+        f.ground.put(lib, None, Some("t2"), known("c3"));
+        let relocated = f.register(f.found(Path::new("/work/lib2"), None, "t1", known("c2"))).await.unwrap();
+        assert_eq!(relocated.project_id, l.project_id, "another repository where it was recorded is not it");
+    }
+
+    #[tokio::test]
+    async fn a_copy_of_a_checkout_is_a_project_of_its_own_with_a_suggestion() {
+        let f = Fixture::new().await;
+        let (app, copy) = (Path::new("/work/app"), Path::new("/work/copia"));
+        let a = f.register(f.found(app, None, "s1", known("c1"))).await.unwrap();
+        let row = f.memory(&a.project_id, "the parser of app", None, 1).await;
+
+        let c = f.register(f.found(copy, None, "s2", known("c1"))).await.unwrap();
+
+        let own = derive_project_id(copy);
+        assert_eq!((c.project_id.as_str(), c.root_id.as_str(), c.rekeyed), (own.as_str(), own.as_str(), 0));
+        let pending = (own, a.project_id.clone(), "root_commit".to_string(), None);
+        assert_eq!(f.suggestions().await, vec![pending.clone()]);
+        assert_eq!(project_ids(&f.store).await, vec![("memory".into(), row, Some(a.project_id.clone()))], "nothing moves");
+
+        f.register(f.found(copy, None, "s2", known("c1"))).await.unwrap();
+        assert_eq!(f.suggestions().await, vec![pending], "registering it again adds none");
+    }
+
+    #[tokio::test]
+    async fn a_checkout_two_projects_could_be_is_a_project_of_its_own() {
+        let f = Fixture::new().await;
+        let (one, two, three) = (Path::new("/work/one"), Path::new("/work/two"), Path::new("/work/three"));
+        let p1 = f.register(f.found(one, None, "s1", known("c1"))).await.unwrap();
+        let p2 = f.register(f.found(two, None, "s2", known("c1"))).await.unwrap();
+        f.ground.remove(one);
+        f.ground.remove(two);
+
+        let p3 = f.register(f.found(three, None, "s1", known("c1"))).await.unwrap();
+
+        assert_eq!(p3.project_id, derive_project_id(three));
+        let mut suggested: Vec<_> =
+            f.suggestions().await.into_iter().filter(|s| s.0 == p3.project_id).map(|s| (s.1, s.2)).collect();
+        suggested.sort();
+        let mut expected = vec![(p1.project_id, "root_commit".to_string()), (p2.project_id, "root_commit".to_string())];
+        expected.sort();
+        assert_eq!(suggested, expected);
+    }
+
+    #[tokio::test]
+    async fn a_renamed_remote_in_its_path_is_another_project_with_a_suggestion() {
+        let f = Fixture::new().await;
+        let path = Path::new("/work/app");
+        let a = f.register(f.found(path, Some("github.com/acme/app"), "s1", known("c1"))).await.unwrap();
+
+        let renamed = f.register(f.found(path, Some("github.com/acme-org/app"), "s1", known("c1"))).await.unwrap();
+
+        assert_ne!(renamed.project_id, a.project_id, "the remote tells them apart");
+        assert_eq!(f.ground.commit_reads(), 1, "the git directory is the one recorded");
+        let made = (renamed.project_id.clone(), a.project_id.clone(), "remote_changed".to_string(), None);
+        assert_eq!(f.suggestions().await, vec![made]);
+
+        let other = Path::new("/work/other");
+        f.register(f.found(other, Some("github.com/acme/x"), "t1", known("c5"))).await.unwrap();
+        f.register(f.found(other, Some("github.com/acme/y"), "t2", known("c6"))).await.unwrap();
+        assert_eq!(f.suggestions().await.len(), 1, "without the same first commit there is none");
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_is_made_once_per_pair() {
+        let f = Fixture::new().await;
+        let (app, twin, copy) = (Path::new("/work/app"), Path::new("/work/twin"), Path::new("/work/copia"));
+        let a = f.register(f.found(app, None, "s1", known("c1"))).await.unwrap();
+        let t = f.register(f.found(twin, None, "s2", known("c1"))).await.unwrap();
+        let answered = (a.project_id.clone(), derive_project_id(copy), "remote_changed".to_string(), some("apart"));
+        let row = answered.clone();
+        f.store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO project_suggestion (project_id, other_id, reason, created_at, answer, answered_at) \
+                     VALUES (?1, ?2, ?3, 0, ?4, 0)",
+                    rusqlite::params![row.0, row.1, row.2, row.3],
+                )
+            })
+            .await
+            .unwrap();
+
+        let c = f.register(f.found(copy, None, "s3", known("c1"))).await.unwrap();
+        f.register(f.found(copy, None, "s3", known("c1"))).await.unwrap();
+
+        assert_eq!(c.project_id, answered.1);
+        let mut expected = vec![
+            (t.project_id.clone(), a.project_id.clone(), "root_commit".to_string(), None),
+            answered,
+            (c.project_id.clone(), t.project_id.clone(), "root_commit".to_string(), None),
+        ];
+        expected.sort();
+        assert_eq!(f.suggestions().await, expected, "a pair already made, in either order and answered or not, is not made again");
+    }
+
+    #[tokio::test]
+    async fn a_moved_checkout_is_read_and_planned_alike_without_writing() {
+        let f = Fixture::new().await;
+        let (old, new, copy) = (Path::new("/work/app"), Path::new("/work/app2"), Path::new("/work/copia"));
+        let a = f.register(f.found(old, None, "s1", known("c1"))).await.unwrap();
+        f.ground.remove(old);
+        f.ground.put(new, None, Some("s1"), known("c1"));
+        f.ground.put(copy, None, Some("s2"), known("c1"));
+        let ground = f.ground.clone();
+        let written = f.count("SELECT total_changes()").await;
+
+        let (read, planned) = f
+            .store
+            .conn
+            .call(move |c| {
+                let read = project_id_in(c, new, &*ground)?;
+                let planned = plan_ids_in(c, &[new.to_path_buf(), copy.to_path_buf()], &*ground)?;
+                Ok::<_, rusqlite::Error>((read, planned))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(f.count("SELECT total_changes()").await, written, "reading writes nothing");
+        let moved = f.register(f.found(new, None, "s1", known("c1"))).await.unwrap();
+        let copied = f.register(f.found(copy, None, "s2", known("c1"))).await.unwrap();
+        assert_eq!(read, a.project_id);
+        assert_eq!(moved.project_id, a.project_id);
+        assert_eq!(
+            planned,
+            vec![(moved.root_id, moved.project_id), (copied.root_id, copied.project_id)],
+            "a copy sees the moved checkout an earlier root of the batch would record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_derives_its_id_never_follows_a_move() {
+        let f = Fixture::new().await;
+        let (old, new) = (Path::new("/work/app"), Path::new("/work/app2"));
+        let a = f.register(f.found(old, None, "s1", known("c1"))).await.unwrap();
+        f.ground.remove(old);
+
+        let derived = f.register(Registration { assigned: false, ..f.found(new, None, "s1", known("c1")) }).await.unwrap();
+
+        assert_eq!(derived.project_id, derive_project_id(new));
+        assert_ne!(derived.project_id, a.project_id);
+        assert!(f.suggestions().await.is_empty());
+        let own = (derived.root_id.clone(), Some(derived.project_id), None, some("c1"), some("s1"));
+        assert_eq!(f.folders("/work/app2").await, vec![own], "it records what it found in its own folder");
     }
 }

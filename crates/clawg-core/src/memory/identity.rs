@@ -381,6 +381,11 @@ impl FakeGround {
         self.roots.lock().unwrap().insert(root.to_path_buf(), (checkout, commit));
     }
 
+    /// Takes away whatever is at `root`, as a move or a delete does.
+    pub(crate) fn remove(&self, root: &Path) {
+        self.roots.lock().unwrap().remove(root);
+    }
+
     pub(crate) fn commit_reads(&self) -> usize {
         self.commit_reads.load(std::sync::atomic::Ordering::SeqCst)
     }

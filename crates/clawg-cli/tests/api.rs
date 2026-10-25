@@ -2950,6 +2950,33 @@ async fn a_repository_without_origin_replaced_in_its_path_registers_into_a_proje
 }
 
 #[tokio::test]
+async fn a_folder_moved_without_origin_registers_into_its_project() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let (old, new) = (base.path().join("app"), base.path().join("app2"));
+    let register = |root: &std::path::Path| {
+        h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true }))
+    };
+    git(base.path(), &["init", "app"]);
+    git(&old, &["commit", "--allow-empty", "-m", "the first commit of app"]);
+    let (status, a) = register(&old).await;
+    assert_eq!(status, 200, "{a}");
+    let (status, saved) =
+        h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": a["project_id"] })).await;
+    assert_eq!(status, 201, "{saved}");
+
+    std::fs::rename(&old, &new).expect("move the repository");
+    let (status, moved) = register(&new).await;
+
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(moved["project_id"], a["project_id"], "{a} {moved}");
+    assert_ne!(moved["root_id"], a["root_id"], "{a} {moved}");
+    let project = moved["project_id"].as_str().expect("project_id");
+    let (_, list) = h.get_json(&format!("/v1/memories?kind=memory&project={project}")).await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "what was saved there is found from the new path: {list}");
+}
+
+#[tokio::test]
 async fn registering_needs_the_token() {
     let h = Harness::start().await;
     let status = h
