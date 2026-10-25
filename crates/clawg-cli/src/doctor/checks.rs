@@ -12,7 +12,10 @@ use clawg_core::memory::bootstrap::is_pooling_upgrade;
 use clawg_core::memory::db::{EmbeddingIdentity, StoredContract};
 use clawg_core::memory::derive_project_id;
 use clawg_core::memory::identity::is_candidate_for;
-use clawg_core::memory::inspect::{AgentRows, Invariants, OutboxFacts, ProjectRow, RemoteRow};
+use clawg_core::memory::inspect::{
+    AgentRows, FolderPrint, IdRows, Invariants, OutboxFacts, ProjectRow, RegistryRow, RemoteRow,
+};
+use clawg_core::memory::merge::MAX_MERGE_HOPS;
 use clawg_core::memory::store_lock::StoreOwner;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
@@ -629,6 +632,194 @@ pub fn project_remotes(lang: Lang, remotes: &[RemoteRow], origins: &[(ProjectRow
     found
 }
 
+/// The live project `id` leads to through the merges of `registry`; `None`
+/// when `id` is no project or its chain ends in none (a cycle, one too long,
+/// an id `project` does not have).
+fn live_of<'a>(registry: &'a [RegistryRow], id: &str) -> Option<&'a RegistryRow> {
+    let mut at = registry.iter().find(|p| p.id == id)?;
+    for _ in 0..=MAX_MERGE_HOPS {
+        match &at.merged_into {
+            None => return Some(at),
+            Some(into) => at = registry.iter().find(|p| p.id == *into)?,
+        }
+    }
+    None
+}
+
+/// Two live projects that may be one: with the same name, in any case, or
+/// with folders of one first commit that no pair of remotes tells apart (a
+/// fork has a remote of its own). A pair someone answered is not one. The
+/// step merges the newer into the older, the one that usually has the
+/// history, as a dry run.
+pub fn project_duplicates(
+    lang: Lang,
+    registry: &[RegistryRow],
+    folders: &[FolderPrint],
+    answered: &[(String, String)],
+    profile: Profile,
+) -> Vec<Finding> {
+    let live: Vec<&RegistryRow> = registry.iter().filter(|p| p.merged_into.is_none()).collect();
+    let answered = |a: &str, b: &str| {
+        let (a, b) = if a < b { (a, b) } else { (b, a) };
+        answered.iter().any(|(x, y)| x == a && y == b)
+    };
+    let ordered = |a: &'_ RegistryRow, b: &'_ RegistryRow| if (a.created_at, &a.id) <= (b.created_at, &b.id) { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+    let mut pairs: Vec<(&'static str, RegistryRow, RegistryRow, Option<&str>)> = Vec::new();
+    for (i, a) in live.iter().enumerate() {
+        for b in &live[i + 1..] {
+            if a.name.to_lowercase() == b.name.to_lowercase() && !answered(&a.id, &b.id) {
+                let (older, newer) = ordered(a, b);
+                pairs.push(("same_name", older, newer, None));
+            }
+        }
+    }
+    let mut by_commit: std::collections::BTreeMap<&str, Vec<(&RegistryRow, Option<&str>)>> = std::collections::BTreeMap::new();
+    for f in folders {
+        let (Some(commit), Some(project)) = (f.root_commit.as_deref(), live_of(registry, f.project_id.as_deref().unwrap_or(&f.root_id)))
+        else {
+            continue;
+        };
+        by_commit.entry(commit).or_default().push((project, f.remote.as_deref()));
+    }
+    for (commit, sharing) in by_commit {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for (i, (a, a_remote)) in sharing.iter().enumerate() {
+            for (b, b_remote) in &sharing[i + 1..] {
+                let told_apart = matches!((a_remote, b_remote), (Some(x), Some(y)) if x != y);
+                if a.id == b.id || told_apart || answered(&a.id, &b.id) {
+                    continue;
+                }
+                let (older, newer) = ordered(a, b);
+                if seen.contains(&(older.id.clone(), newer.id.clone())) {
+                    continue;
+                }
+                seen.push((older.id.clone(), newer.id.clone()));
+                pairs.push(("same_first_commit", older, newer, Some(commit)));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for (reason, older, newer, commit) in pairs {
+        let (o, n, name) = (&older.id, &newer.id, &older.name);
+        let message = match (reason, lang) {
+            ("same_name", Lang::En) => format!(
+                "projects {o} and {n} are both named \"{name}\": they may be one project, and either can be merged into the other"
+            ),
+            ("same_name", Lang::Es) => format!(
+                "los proyectos {o} y {n} se llaman los dos \"{name}\": pueden ser uno solo, y cualquiera de los dos se puede unir en el otro"
+            ),
+            (_, Lang::En) => format!(
+                "projects {o} and {n} have folders with the same first commit and no remote that tells them apart: \
+                 they may be one project, and either can be merged into the other"
+            ),
+            (_, Lang::Es) => format!(
+                "los proyectos {o} y {n} tienen carpetas con el mismo primer commit y ningún remoto que los distinga: \
+                 pueden ser uno solo, y cualquiera de los dos se puede unir en el otro"
+            ),
+        };
+        let mut evidence = json!({ "project_ids": [o, n], "names": [older.name, newer.name] });
+        if let Some(commit) = commit {
+            evidence["root_commit"] = json!(commit);
+        }
+        found.push(
+            Finding::new("project_duplicates", Severity::Warn, reason, message)
+                .evidence(evidence)
+                .step(with_profile(&format!("clawg projects merge {n} --into {o} --dry-run"), profile)),
+        );
+    }
+    if found.is_empty() {
+        let message = match lang {
+            Lang::En => "no two projects look like one",
+            Lang::Es => "ningún par de proyectos parece ser uno solo",
+        };
+        found.push(Finding::ok("project_duplicates", message).evidence(json!({ "projects": live.len() })));
+    }
+    found
+}
+
+/// The ids rows are saved under that `project` does not have: V27's triggers
+/// adopt every id `memory` is written under, but not one of the other two
+/// tables.
+pub fn project_orphans(lang: Lang, registry: &[RegistryRow], rows: &[IdRows]) -> Vec<Finding> {
+    let mut found = Vec::new();
+    for r in rows.iter().filter(|r| !registry.iter().any(|p| p.id == r.project_id)) {
+        let (id, n) = (&r.project_id, r.memories + r.trajectories + r.skills);
+        let message = match (n == 1, lang) {
+            (true, Lang::En) => format!("1 row is saved under {id}, which is no project"),
+            (false, Lang::En) => format!("{n} rows are saved under {id}, which is no project"),
+            (true, Lang::Es) => format!("1 fila está guardada bajo {id}, que no es un proyecto"),
+            (false, Lang::Es) => format!("{n} filas están guardadas bajo {id}, que no es un proyecto"),
+        };
+        found.push(Finding::new("project_orphans", Severity::Warn, "no_project", message).evidence(json!({
+            "project_id": id,
+            "memories": r.memories,
+            "trajectories": r.trajectories,
+            "skills": r.skills,
+        })));
+    }
+    if found.is_empty() {
+        let message = match lang {
+            Lang::En => "every id rows are saved under is a project",
+            Lang::Es => "cada id con filas guardadas es un proyecto",
+        };
+        found.push(Finding::ok("project_orphans", message).evidence(json!({ "ids": rows.len() })));
+    }
+    found
+}
+
+/// Rows still under a project merged into another, which a merge again of
+/// the same two moves, and a merged project whose chain of merges ends in no
+/// live project, which nothing repairs on its own.
+pub fn project_merges(lang: Lang, registry: &[RegistryRow], rows: &[IdRows], profile: Profile) -> Vec<Finding> {
+    let mut found = Vec::new();
+    for r in rows {
+        let Some(tombstone) = registry.iter().find(|p| p.id == r.project_id && p.merged_into.is_some()) else {
+            continue;
+        };
+        let Some(live) = live_of(registry, &tombstone.id) else {
+            continue;
+        };
+        let (id, into, n) = (&tombstone.id, &live.id, r.memories + r.trajectories + r.skills);
+        let message = match (n == 1, lang) {
+            (true, Lang::En) => format!("1 row is still under {id}, which was merged into {into}"),
+            (false, Lang::En) => format!("{n} rows are still under {id}, which was merged into {into}"),
+            (true, Lang::Es) => format!("1 fila sigue bajo {id}, que se unió en {into}"),
+            (false, Lang::Es) => format!("{n} filas siguen bajo {id}, que se unió en {into}"),
+        };
+        found.push(
+            Finding::new("project_merges", Severity::Warn, "rows_under_merged", message)
+                .evidence(json!({
+                    "project_id": id,
+                    "merged_into": into,
+                    "memories": r.memories,
+                    "trajectories": r.trajectories,
+                    "skills": r.skills,
+                }))
+                .step(with_profile(&format!("clawg projects merge {id} --into {into} --dry-run"), profile)),
+        );
+    }
+    for tombstone in registry.iter().filter(|p| p.merged_into.is_some() && live_of(registry, &p.id).is_none()) {
+        let (id, into) = (&tombstone.id, tombstone.merged_into.as_deref().unwrap_or_default());
+        let message = match lang {
+            Lang::En => format!("project {id} was merged into {into}, which leads to no live project"),
+            Lang::Es => format!("el proyecto {id} se unió en {into}, que no lleva a ningún proyecto vivo"),
+        };
+        found.push(
+            Finding::new("project_merges", Severity::Warn, "broken_merge", message)
+                .evidence(json!({ "project_id": id, "merged_into": into })),
+        );
+    }
+    if found.is_empty() {
+        let message = match lang {
+            Lang::En => "no row is under a merged project, and every merge ends in a live one",
+            Lang::Es => "ninguna fila quedó bajo un proyecto unido, y cada unión termina en uno vivo",
+        };
+        let merged = registry.iter().filter(|p| p.merged_into.is_some()).count();
+        found.push(Finding::ok("project_merges", message).evidence(json!({ "merged": merged })));
+    }
+    found
+}
+
 /// One check per rule of `memory`, `ok` when nothing breaks it.
 pub fn invariants(lang: Lang, inv: &Invariants) -> Vec<Finding> {
     let mut found = Vec::new();
@@ -1083,6 +1274,132 @@ mod tests {
         assert_eq!(found[6].evidence["save_id"], 3);
     }
 
+    fn registered(rows: &[(&str, &str, i64, Option<&str>)]) -> Vec<RegistryRow> {
+        rows.iter()
+            .map(|(id, name, created_at, merged_into)| RegistryRow {
+                id: id.to_string(),
+                name: name.to_string(),
+                created_at: *created_at,
+                merged_into: merged_into.map(str::to_string),
+            })
+            .collect()
+    }
+
+    fn print(root_id: &str, project_id: &str, remote: Option<&str>, root_commit: &str) -> FolderPrint {
+        FolderPrint {
+            root_id: root_id.into(),
+            project_id: Some(project_id.into()),
+            remote: remote.map(str::to_string),
+            root_commit: Some(root_commit.into()),
+        }
+    }
+
+    fn id_rows(project_id: &str, memories: i64, trajectories: i64) -> IdRows {
+        IdRows { project_id: project_id.into(), memories, trajectories, skills: 0 }
+    }
+
+    /// Two that share a name, two whose folders share a first commit, two
+    /// forks and a tombstone of one of them.
+    fn lookalikes() -> (Vec<RegistryRow>, Vec<FolderPrint>) {
+        let registry = registered(&[
+            ("api-1a2b", "App", 1, None),
+            ("app-3c4d", "app", 5, None),
+            ("lib-5e6f", "lib", 2, None),
+            ("lib2-7a8b", "lib2", 6, None),
+            ("forka-0001", "forka", 3, None),
+            ("forkb-0002", "forkb", 4, None),
+            ("old-0003", "old", 0, Some("lib-5e6f")),
+        ]);
+        let prints = vec![
+            print("lib-5e6f", "lib-5e6f", Some("github.com/acme/lib"), "c1"),
+            print("lib2-7a8b", "lib2-7a8b", None, "c1"),
+            print("old-0003", "old-0003", None, "c1"),
+            print("forka-0001", "forka-0001", Some("github.com/acme/fork"), "c2"),
+            print("forkb-0002", "forkb-0002", Some("github.com/other/fork"), "c2"),
+        ];
+        (registry, prints)
+    }
+
+    #[test]
+    fn the_duplicates_are_named_by_name_and_by_first_commit() {
+        let (registry, prints) = lookalikes();
+
+        let found = project_duplicates(L, &registry, &prints, &[], P);
+
+        let named: Vec<(&str, &serde_json::Value, Option<&str>)> =
+            found.iter().map(|f| (f.reason_code, &f.evidence["project_ids"], f.safe_next_step.as_deref())).collect();
+        assert_eq!(
+            named,
+            vec![
+                (
+                    "same_name",
+                    &json!(["api-1a2b", "app-3c4d"]),
+                    Some("clawg projects merge app-3c4d --into api-1a2b --dry-run --profile dev")
+                ),
+                (
+                    "same_first_commit",
+                    &json!(["lib-5e6f", "lib2-7a8b"]),
+                    Some("clawg projects merge lib2-7a8b --into lib-5e6f --dry-run --profile dev")
+                ),
+            ],
+            "a fork, with a remote of its own, is not one; a tombstone is its target: {found:#?}"
+        );
+        assert!(found.iter().all(|f| f.severity == Severity::Warn && !f.requires_confirmation));
+        assert_eq!(found[1].evidence["root_commit"], "c1");
+        assert_eq!(project_duplicates(L, &registered(&[("a-0001", "a", 1, None)]), &[], &[], P)[0].reason_code, "healthy");
+    }
+
+    #[test]
+    fn a_pair_kept_apart_is_no_duplicate() {
+        let (registry, prints) = lookalikes();
+        let answered = [("lib-5e6f".to_string(), "lib2-7a8b".to_string())];
+
+        let found = project_duplicates(L, &registry, &prints, &answered, P);
+
+        let reasons: Vec<&str> = found.iter().map(|f| f.reason_code).collect();
+        assert_eq!(reasons, vec!["same_name"]);
+    }
+
+    #[test]
+    fn an_id_without_a_project_is_named() {
+        let registry = registered(&[("web-3c4d", "web", 1, None)]);
+
+        let found = project_orphans(L, &registry, &[id_rows("orphan-9f9f", 0, 1), id_rows("web-3c4d", 2, 0)]);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].reason_code, found[0].safe_next_step.as_deref()), ("no_project", None));
+        assert_eq!(found[0].evidence, json!({ "project_id": "orphan-9f9f", "memories": 0, "trajectories": 1, "skills": 0 }));
+        assert_eq!(project_orphans(L, &registry, &[id_rows("web-3c4d", 2, 0)])[0].reason_code, "healthy");
+    }
+
+    #[test]
+    fn rows_under_a_merged_project_and_a_broken_chain_are_named() {
+        let registry = registered(&[
+            ("web-3c4d", "web", 1, None),
+            ("app-1a2b", "app", 2, Some("web-3c4d")),
+            ("loop-0001", "loop", 3, Some("loop-0002")),
+            ("loop-0002", "loop", 4, Some("loop-0001")),
+            ("lost-0003", "lost", 5, Some("gone-0004")),
+        ]);
+
+        let found = project_merges(L, &registry, &[id_rows("app-1a2b", 1, 0), id_rows("web-3c4d", 3, 0)], P);
+
+        let named: Vec<(&str, &serde_json::Value)> = found.iter().map(|f| (f.reason_code, &f.evidence["project_id"])).collect();
+        assert_eq!(
+            named,
+            vec![
+                ("rows_under_merged", &json!("app-1a2b")),
+                ("broken_merge", &json!("loop-0001")),
+                ("broken_merge", &json!("loop-0002")),
+                ("broken_merge", &json!("lost-0003")),
+            ]
+        );
+        assert_eq!(found[0].evidence["merged_into"], "web-3c4d");
+        assert_eq!(found[0].safe_next_step.as_deref(), Some("clawg projects merge app-1a2b --into web-3c4d --dry-run --profile dev"));
+        assert_eq!(found[3].safe_next_step, None);
+        assert_eq!(project_merges(L, &registry[..2], &[id_rows("web-3c4d", 3, 0)], P)[0].reason_code, "healthy");
+    }
+
     /// Every finding a check can give, for the facts that give it.
     fn every_finding(lang: Lang) -> Vec<Finding> {
         let analysis = |shadowed, duplicates| Analysis {
@@ -1182,6 +1499,14 @@ mod tests {
         all.extend(project_remotes(lang, &[], &[]));
         all.extend(invariants(lang, &broken));
         all.extend(invariants(lang, &Invariants::default()));
+        let (lookalike, prints) = lookalikes();
+        all.extend(project_duplicates(lang, &lookalike, &prints, &[], P));
+        all.extend(project_duplicates(lang, &[], &[], &[], P));
+        let registry = registered(&[("web-3c4d", "web", 1, None), ("app-1a2b", "app", 2, Some("web-3c4d")), ("lost-0003", "lost", 5, Some("gone-0004"))]);
+        all.extend(project_orphans(lang, &registry, &[id_rows("orphan-9f9f", 1, 0), id_rows("other-9f9e", 2, 0)]));
+        all.extend(project_orphans(lang, &registry, &[]));
+        all.extend(project_merges(lang, &registry, &[id_rows("app-1a2b", 1, 0), id_rows("app-1a2b", 2, 0)], P));
+        all.extend(project_merges(lang, &registry[..1], &[], P));
         all
     }
 
@@ -1212,6 +1537,10 @@ mod tests {
             "2 saves aceptados esperan en el outbox",
             "1 agente tiene filas",
             "0 agentes tienen filas",
+            "1 fila está guardada bajo orphan-9f9f",
+            "2 filas están guardadas bajo other-9f9e",
+            "1 fila sigue bajo app-1a2b",
+            "2 filas siguen bajo app-1a2b",
         ] {
             assert!(messages.iter().any(|m| m.starts_with(expected)), "no message starts with {expected:?}: {messages:#?}");
         }

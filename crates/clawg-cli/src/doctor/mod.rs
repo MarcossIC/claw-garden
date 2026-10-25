@@ -196,6 +196,12 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
             .map(|p| (p.clone(), clawg_core::memory::identity::origin_key(Path::new(&p.root_path))))
             .collect();
         found.extend(checks::project_remotes(lang, &facts.remotes, &origins));
+        // Projects are a table of their own from V27.
+        if let Some(registry) = &facts.registry {
+            found.extend(checks::project_duplicates(lang, registry, &facts.folder_prints, &facts.answered_pairs, profile));
+            found.extend(checks::project_orphans(lang, registry, &facts.id_rows));
+            found.extend(checks::project_merges(lang, registry, &facts.id_rows, profile));
+        }
         found.extend(checks::invariants(lang, &facts.invariants));
     }
     found.extend(claude_code(lang, profile, &exe));

@@ -36,6 +36,43 @@ pub struct StoreFacts {
     pub remotes: Vec<RemoteRow>,
     pub outbox: OutboxFacts,
     pub invariants: Invariants,
+    /// The projects of `project`, tombstones too, by id; `None` before V27,
+    /// when `project` held folders.
+    pub registry: Option<Vec<RegistryRow>>,
+    /// What each folder of `project_path` recorded (V27), by id.
+    pub folder_prints: Vec<FolderPrint>,
+    /// The pairs of `project_suggestion` someone answered, each lesser id first.
+    pub answered_pairs: Vec<(String, String)>,
+    /// The ids rows of the three tables are saved under, with how many.
+    pub id_rows: Vec<IdRows>,
+}
+
+/// A project of `project`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryRow {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    /// The project a merge took it into (V28); `None` for a live one.
+    pub merged_into: Option<String>,
+}
+
+/// What a folder recorded: the project it leads to and its fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderPrint {
+    pub root_id: String,
+    pub project_id: Option<String>,
+    pub remote: Option<String>,
+    pub root_commit: Option<String>,
+}
+
+/// An id rows are saved under, deleted ones too, with how many of each table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdRows {
+    pub project_id: String,
+    pub memories: i64,
+    pub trajectories: i64,
+    pub skills: i64,
 }
 
 /// The rows of one agent; `agent_id` is `None` for the rows no agent saved.
@@ -178,13 +215,60 @@ fn read_facts(c: &Connection) -> rusqlite::Result<StoreFacts> {
             purged_headers: if has.table("memory_piece") { purged_headers(c)? } else { Vec::new() },
             lonely_disputes: lonely_disputes(c)?,
         },
+        // `project` is the reference of the projects from V27, when the
+        // folders moved to `project_path`.
+        registry: if has.table("project_path") { Some(registry(c, &has)?) } else { None },
+        folder_prints: if has.table("project_path") { folder_prints(c)? } else { Vec::new() },
+        answered_pairs: if has.table("project_suggestion") { answered_pairs(c)? } else { Vec::new() },
+        id_rows: id_rows(c)?,
     })
 }
 
-/// The tables and the columns of `memory` the store has.
+fn registry(c: &Connection, has: &Has) -> rusqlite::Result<Vec<RegistryRow>> {
+    let merged_into = if has.project_column("merged_into") { "merged_into" } else { "NULL" };
+    let mut stmt = c.prepare(&format!("SELECT id, name, created_at, {merged_into} FROM project ORDER BY id"))?;
+    let rows = stmt.query_map([], |r| {
+        Ok(RegistryRow { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, merged_into: r.get(3)? })
+    })?;
+    rows.collect()
+}
+
+fn folder_prints(c: &Connection) -> rusqlite::Result<Vec<FolderPrint>> {
+    let mut stmt = c.prepare("SELECT id, project_id, remote, root_commit FROM project_path ORDER BY id")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(FolderPrint { root_id: r.get(0)?, project_id: r.get(1)?, remote: r.get(2)?, root_commit: r.get(3)? })
+    })?;
+    rows.collect()
+}
+
+fn answered_pairs(c: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = c.prepare(
+        "SELECT min(project_id, other_id), max(project_id, other_id) FROM project_suggestion \
+         WHERE answer IS NOT NULL ORDER BY 1, 2",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+fn id_rows(c: &Connection) -> rusqlite::Result<Vec<IdRows>> {
+    let mut stmt = c.prepare(
+        "SELECT project_id, SUM(t = 'm'), SUM(t = 't'), SUM(t = 's') FROM ( \
+           SELECT project_id, 'm' AS t FROM memory \
+           UNION ALL SELECT project_id, 't' FROM episodic_trajectory \
+           UNION ALL SELECT project_id, 's' FROM procedural_skill) \
+         WHERE project_id IS NOT NULL GROUP BY project_id ORDER BY project_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(IdRows { project_id: r.get(0)?, memories: r.get(1)?, trajectories: r.get(2)?, skills: r.get(3)? })
+    })?;
+    rows.collect()
+}
+
+/// The tables, and the columns of `memory` and `project`, the store has.
 struct Has {
     tables: Vec<String>,
     memory_columns: Vec<String>,
+    project_columns: Vec<String>,
 }
 
 impl Has {
@@ -197,7 +281,12 @@ impl Has {
         Ok(Has {
             tables: names("SELECT name FROM sqlite_master WHERE type = 'table'")?,
             memory_columns: names("SELECT name FROM pragma_table_info('memory')")?,
+            project_columns: names("SELECT name FROM pragma_table_info('project')")?,
         })
+    }
+
+    fn project_column(&self, name: &str) -> bool {
+        self.project_columns.iter().any(|col| col == name)
     }
 
     fn table(&self, name: &str) -> bool {
@@ -694,6 +783,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_facts_name_the_projects_their_folders_answers_and_rows() {
+        let dir = store_with(|c| {
+            c.execute_batch(
+                "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                   ('web-3c4d', 'web', 'root', 1, 2), ('api-5e6f', 'Web', 'root', 1, 3);
+                 INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) \
+                   VALUES ('app-1a2b', 'app', 'root', 0, 1, 'web-3c4d', 9);
+                 INSERT INTO project_path (id, root_path, created_at, project_id, root_commit) \
+                   VALUES ('web-3c4d', '/work/web', 2, 'web-3c4d', 'c1');
+                 INSERT INTO project_suggestion (project_id, other_id, reason, created_at, answer) VALUES \
+                   ('web-3c4d', 'api-5e6f', 'user', 4, 'apart'), ('web-3c4d', 'app-1a2b', 'root_commit', 5, NULL);
+                 INSERT INTO episodic_trajectory \
+                   (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+                   VALUES ('agent', 'a', 'orphan-9f9f', 's', 't', 1, 1, 1);",
+            )
+            .unwrap();
+            for (content, project) in [("one", "web-3c4d"), ("two", "web-3c4d"), ("left", "app-1a2b")] {
+                insert(c, &Row { project: Some(project), ..row(content) });
+            }
+        })
+        .await;
+
+        let facts = inspect(dir.path()).facts.unwrap();
+
+        let project = |id: &str, name: &str, created_at, merged_into: Option<&str>| RegistryRow {
+            id: id.into(),
+            name: name.into(),
+            created_at,
+            merged_into: merged_into.map(str::to_string),
+        };
+        assert_eq!(
+            facts.registry,
+            Some(vec![project("api-5e6f", "Web", 3, None), project("app-1a2b", "app", 1, Some("web-3c4d")), project("web-3c4d", "web", 2, None)])
+        );
+        let print = FolderPrint { root_id: "web-3c4d".into(), project_id: Some("web-3c4d".into()), remote: None, root_commit: Some("c1".into()) };
+        assert_eq!(facts.folder_prints, vec![print]);
+        assert_eq!(facts.answered_pairs, vec![("api-5e6f".to_string(), "web-3c4d".to_string())], "a pending one is not answered");
+        let rows = |id: &str, memories, trajectories| IdRows { project_id: id.into(), memories, trajectories, skills: 0 };
+        assert_eq!(facts.id_rows, vec![rows("app-1a2b", 1, 0), rows("orphan-9f9f", 0, 1), rows("web-3c4d", 2, 0)]);
+
+        let older = tempfile::tempdir().unwrap();
+        seed_on_disk(older.path(), Some(27)).await;
+        let c = rusqlite::Connection::open(older.path().join("memory.db")).unwrap();
+        c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('web-3c4d', 'web', 'root', 1, 2)", [])
+            .unwrap();
+        drop(c);
+        let facts = inspect(older.path()).facts.unwrap();
+        assert_eq!(facts.registry, Some(vec![project("web-3c4d", "web", 2, None)]), "V27 merged nothing yet");
+    }
+
+    #[tokio::test]
     async fn inspecting_leaves_the_store_unchanged() {
         let dir = store_with(healthy).await;
         let before = files_in(dir.path());
@@ -731,6 +871,7 @@ mod tests {
         assert_eq!(facts.agents, [AgentRows { agent_id: Some("agent-seed".into()), live: 1, total: 1 }]);
         assert!(facts.invariants.is_empty());
         assert_eq!(facts.outbox, OutboxFacts::default(), "V14 is not applied");
+        assert_eq!((facts.registry, facts.folder_prints, facts.answered_pairs), (None, vec![], vec![]), "V27 is not applied");
         assert_eq!(files_in(dir.path()), before);
     }
 
