@@ -9,7 +9,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22 (R8 a R13: mover filas de `memory` a otro proyecto o a ninguno, con su unidad, su registro y su vuelta atrás).
 - [project-clone-identity](../../changes/archive/2026-10-23-project-clone-identity/proposal.md), archivado el 2026-10-23 (R14 a R19: el daemon asigna los ids, los clones de un remoto comparten el proyecto, y unir reconcilia; cambia R4 y R6).
 - [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24 (HI3: elegir y listar filas por su proyecto de origen).
-- [project-registry](../../changes/project-registry/proposal.md), entrega 0, publicada en 0.63.0 (R20: una fila de un camino sirve a una raíz sólo si su remoto no la contradice; cambia R15, R16 y R18).
+- [project-registry](../../changes/archive/2026-10-25-project-registry/proposal.md), archivado el 2026-10-25 con su entrega 0, que sale en 0.63.0 (R20: una fila de un camino sirve a una raíz sólo si su remoto no la contradice; cambia R15, R16 y R18). Sus entregas 1 a 4 (el registro de proyectos, unir y borrar, los proyectos sin carpeta, el export por localizador) pasaron a [project-locators](../../changes/project-locators/proposal.md).
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (RF1: un registro lanza el refresco de docs sólo si trae `index_docs: true`; cambia la nota de R4).
 
 ## Definiciones

@@ -1,0 +1,21 @@
+change: project-registry
+objective: "2"
+depends_on: [project-reassign, project-clone-identity]
+phase: archived
+artifacts:
+  exploration: done
+  proposal: done  # las cinco entregas; las 1 a 4 pasaron a project-locators (93) con sus decisiones
+  spec: done  # entrega 0 (RG1 a RG5), en specs/project R20 y specs/doctor R7
+  design: done  # entrega 0 (D1 a D5)
+  tasks: done  # entrega 0
+  apply: done  # entrega 0, 0.62.1, publicada en 0.63.0
+  verify: done  # Linux, el binario en un home de prueba y el CI del pull request #93 en Linux y Windows; el perfil dev no se corrió
+  archive: done
+deliveries:
+  "0": done  # el fundido; sale en 0.63.0
+  "1": moved  # a project-locators (93)
+  "2": moved
+  "3": moved
+  "4": moved
+updated: 2026-10-25
+main_spec: openspec/specs/project/spec.md, openspec/specs/doctor/spec.md

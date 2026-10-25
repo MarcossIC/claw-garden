@@ -1,0 +1,19 @@
+change: project-locators
+objective: "2"
+depends_on: [project-registry, project-reassign, project-clone-identity]
+phase: design  # sigue la spec y el diseño de la entrega 1
+artifacts:
+  exploration: done  # la de project-registry (89), en su archivo
+  proposal: done  # las decisiones de 89 del 2026-10-24, para las entregas 1 a 4
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending  # cuando cierre la entrega 4
+deliveries:
+  "1": pending  # el registro (V27)
+  "2": pending  # unir, revisar y borrar
+  "3": pending  # proyectos sin carpeta y el agente
+  "4": pending  # exportar e importar
+updated: 2026-10-25

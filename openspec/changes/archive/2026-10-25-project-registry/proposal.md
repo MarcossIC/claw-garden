@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2 | M–L, en cinco entregas (un parche S y cuatro M) | project-reassign (77) y project-clone-identity (30), archivados: se construye sobre R1–R19 de [`specs/project`](../../specs/project/spec.md) | ver [`state.yaml`](state.yaml) |
+| 2 | M–L, en cinco entregas (un parche S y cuatro M) | project-reassign (77) y project-clone-identity (30), archivados: se construye sobre R1–R19 de [`specs/project`](../../../specs/project/spec.md) | archivado el 2026-10-25 con la entrega 0; las entregas 1 a 4 pasaron a [project-locators](../../project-locators/proposal.md) (93) ([`state.yaml`](state.yaml)) |
 
 ## Problema
 
@@ -54,6 +54,8 @@ La decisión abierta de la entrega 0 (si el parche lleva una migración mínima)
 ## Entregas
 
 Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RED salen de [«Cómo se mide»](exploration.md#cómo-se-mide) de la exploración, más los que piden las decisiones de arriba.
+
+Al archivar (2026-10-25), el cambio se partió. La entrega 0 se cerró aquí y sale en 0.63.0. Las entregas 1 a 4, con las decisiones de arriba, pasaron a [project-locators](../../project-locators/proposal.md) (93). Esperarlas aquí dejaba abierto un cambio cuya parte publicada ya estaba en las specs, mientras lo que queda todavía no tiene diseño.
 
 ### 0. El fundido (versión patch, sin esquema nuevo)
 
@@ -174,7 +176,7 @@ La regla de `doctor` lee sin escribir el `origin` actual de cada `root_path` y l
   - `search`, `list` y `context` devuelven lo mismo que antes;
   - `doctor` no marca nada nuevo fuera del caso fundido.
 - **Las entregas 2 a 4** traen cada una su migración aditiva, con su test sembrado en la versión anterior.
-- **Volver atrás del esquema.** Un binario anterior rechaza un store más nuevo sin tocarlo (`SchemaNewer`, `db.rs:443`). `clawg update` restaura en el proceso el snapshot `pre-migration` cuando el binario viejo rechaza el store (`.claude/CLAUDE.md`, `clawg update`). A mano, con `clawg restore` de ese snapshot. Como las tablas nuevas sólo se agregan, el diseño deja también el SQL que las quita, como hizo [project-reassign](../archive/2026-10-22-project-reassign/proposal.md#datos-guardados).
+- **Volver atrás del esquema.** Un binario anterior rechaza un store más nuevo sin tocarlo (`SchemaNewer`, `db.rs:443`). `clawg update` restaura en el proceso el snapshot `pre-migration` cuando el binario viejo rechaza el store (`.claude/CLAUDE.md`, `clawg update`). A mano, con `clawg restore` de ese snapshot. Como las tablas nuevas sólo se agregan, el diseño deja también el SQL que las quita, como hizo [project-reassign](../2026-10-22-project-reassign/proposal.md#datos-guardados).
 - **Volver atrás de una operación.** Una unión con `projects merge --undo N` o su `pre-rekey`. Un borrado de etapa 2 con `projects delete --undo N` o su snapshot. Lo que se purgó, sólo con un snapshot.
 
 ## Compatibilidad
@@ -188,7 +190,7 @@ La regla de `doctor` lee sin escribir el `origin` actual de cada `root_path` y l
 
 ## Interacciones
 
-- **ranking-at-scale (86).** Las filas sin proyecto forman parte del fondo que mide, y colocarlas lo cambia. Este cambio va antes ([README](../../README.md)): se colocan antes de su línea base, y su informe dice si el fondo tenía filas sin proyecto.
+- **ranking-at-scale (86).** Las filas sin proyecto forman parte del fondo que mide, y colocarlas lo cambia. Este cambio va antes ([README](../../../README.md)): se colocan antes de su línea base, y su informe dice si el fondo tenía filas sin proyecto.
 - **import-job (87).** Un trabajo de importación que registre proyectos pasa por el mismo resolvedor y por el diario V26. `--project-map` gana el destino `project:ID|NOMBRE`. La forma del informe se coordina.
 - **project-reassign (77).** Mover sigue siendo «cambia el proyecto de una unidad entera y nada más» (R8). `check_target_in` consulta el registro y sigue la lápida.
 - **project-clone-identity (30).**

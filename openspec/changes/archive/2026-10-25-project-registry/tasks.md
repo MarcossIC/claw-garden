@@ -1,6 +1,6 @@
 # project-registry — Tareas
 
-Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite. Las tareas de las entregas 1 a 4 se escriben cuando les toque.
+Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite. Las tareas de las entregas 1 a 4 pasaron, sin escribir, a [project-locators](../../project-locators/proposal.md) (93).
 
 ## Entrega 0. El fundido (versión patch, sin esquema)
 
@@ -25,3 +25,14 @@ Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque 
 
 - [x] `0.62.0` → `0.62.1` (un parche: la entrega 0 se publica sola) y `cargo update --workspace`.
 - Commit: `chore: bump version to 0.62.1`
+- 0.62.1 no se publicó: al archivar ram-footprint la versión pasó a 0.63.0, que es la que trae la entrega 0.
+
+### 5. Verificación
+
+- [x] Suite y clippy de `.claude/CLAUDE.md` en Linux, y el binario en un home temporal.
+- [x] El CI del pull request #93 en verde en Linux y Windows.
+- [x] `verify.md`.
+
+### 6. Archive
+
+- [x] El «Origen» de `specs/project` y de `specs/doctor` apunta al archivo, y la fila `project_remotes` de `specs/doctor` dice 0.63.0. `git mv` a `changes/archive/2026-10-25-project-registry`, con `state.yaml` archivado. El cambio se partió: las entregas 1 a 4 pasaron a `changes/project-locators` (93). Se cambiaron las filas 89 y 93 y el orden de ejecución del `README.md` de openspec. La versión no sube ([verify](verify.md#al-archivar-2026-10-25)).

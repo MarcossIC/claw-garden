@@ -1,6 +1,6 @@
 # project-registry — Diseño
 
-Como la especificación, este diseño crece con cada entrega. Por ahora resuelve la **entrega 0** y la decisión abierta de la propuesta que le toca: [«El parche de la entrega 0 y la vuelta atrás»](proposal.md#abierto-para-el-diseño). Las demás quedan para la entrega que las necesita.
+Este diseño resuelve la **entrega 0** y la decisión abierta de la propuesta que le toca: [«El parche de la entrega 0 y la vuelta atrás»](proposal.md#abierto-para-el-diseño). Las demás pasaron, con las entregas 1 a 4, a [project-locators](../../project-locators/proposal.md) (93).
 
 ## D1. La huella valida la fila, en una función pura
 
@@ -42,7 +42,7 @@ Es la decisión abierta de la propuesta. Una migración mínima haría que un bi
 - `clawg update` ya restaura `pre-migration` cuando el binario viejo rechaza el store, y con una migración vacía esa vuelta atrás tiraría lo guardado después;
 - lo que haría el binario anterior es recuperable: la segunda fila del camino no la ve (resuelve a la más vieja), y si el remoto del repositorio nuevo ya está en `project_remote`, une a ese proyecto las filas del id de raíz viejo con un snapshot `pre-rekey` y un movimiento en `memory_move`, que `clawg projects move --undo N` devuelve; el log del daemon nombra el número.
 
-Así que se documenta: volver a una versión anterior a 0.62.1 en un store donde dos repositorios compartieron un camino puede volver a unirlos, y el `--undo` del movimiento que nombra el log lo deshace.
+Así que se documenta: volver a una versión anterior a 0.63.0 (0.62.1 no se publicó) en un store donde dos repositorios compartieron un camino puede volver a unirlos, y el `--undo` del movimiento que nombra el log lo deshace.
 
 ## Volver atrás
 
