@@ -16,13 +16,15 @@ use std::path::{Path, PathBuf};
 
 use clawg_core::memory::merge::MergeReport;
 use clawg_core::memory::project_delete::{Candidate, Counts, DeleteReport, KeepReason, Refusal};
-use clawg_core::memory::registry::{ListedDelete, ListedProject, ListedSuggestion};
+use clawg_core::memory::registry::{
+    Born, ListedDelete, ListedProject, ListedSuggestion, Refusal as ResolveRefusal, Resolution as ProjectResolution,
+};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::preferences::Lang;
 
 use crate::cli::{DeleteOpts, MergeOpts, MoveOpts};
-use crate::client::{ClientError, DaemonClient};
+use crate::client::{ClientError, DaemonClient, Located};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AddError {
@@ -111,6 +113,10 @@ fn born(lang: Lang, born: &str) -> &str {
         ("import", Lang::Es) => "creado por un import",
         ("migrated", Lang::En) => "from before projects",
         ("migrated", Lang::Es) => "de antes de los proyectos",
+        ("agent", Lang::En) => "created by an agent saving under its name",
+        ("agent", Lang::Es) => "creado por un agente que guardó con su nombre",
+        ("user", Lang::En) => "created with `clawg projects create`",
+        ("user", Lang::Es) => "creado con `clawg projects create`",
         (other, _) => other,
     }
 }
@@ -122,6 +128,8 @@ fn reason(lang: Lang, suggestion: &ListedSuggestion) -> &str {
         ("root_commit", Lang::Es) => "comparten el primer commit",
         ("remote_changed", Lang::En) => "the remote of one folder changed",
         ("remote_changed", Lang::Es) => "cambió el remoto de una carpeta",
+        ("folder_name", Lang::En) => "a folder has the name of the other, whose folders are gone",
+        ("folder_name", Lang::Es) => "una carpeta tiene el nombre del otro, cuyas carpetas ya no están",
         (other, _) => other,
     }
 }
@@ -827,6 +835,100 @@ pub fn render_merge(lang: Lang, report: &MergeReport, undo: bool) -> String {
         });
     }
     lines.join("\n")
+}
+
+/// Creates the project `name` without a folder, or finds the one that has
+/// it, and says which; answers whether it went through.
+pub async fn create(lang: Lang, client: &DaemonClient, name: &str, new: bool) -> Result<(String, bool), ClientError> {
+    let resolution = client.resolve_project(name, true, new, Born::User).await?;
+    Ok(render_created(lang, name, &resolution))
+}
+
+/// What `clawg projects create` prints: the project created, the one that
+/// already had the name, or the projects whose name is close and how to
+/// create one apart.
+pub fn render_created(lang: Lang, name: &str, resolution: &ProjectResolution) -> (String, bool) {
+    if let Some(id) = &resolution.project_id {
+        let text = match (resolution.created, lang) {
+            (true, Lang::En) => format!(
+                "created project {id} named \"{name}\"; it has no folder, and `clawg projects locate {id} PATH` gives it one"
+            ),
+            (true, Lang::Es) => format!(
+                "se creó el proyecto {id} llamado \"{name}\"; no tiene carpeta, y `clawg projects locate {id} CAMINO` le da una"
+            ),
+            (false, Lang::En) => format!("project {id} already has that name; nothing was created"),
+            (false, Lang::Es) => format!("el proyecto {id} ya tiene ese nombre; no se creó nada"),
+        };
+        return (text, true);
+    }
+    let mut lines = vec![match (resolution.refused, lang) {
+        (Some(ResolveRefusal::Ambiguous), Lang::En) => format!("nothing was created: more than one project is named \"{name}\":"),
+        (Some(ResolveRefusal::Ambiguous), Lang::Es) => format!("no se creó nada: hay más de un proyecto llamado \"{name}\":"),
+        (_, Lang::En) => format!("nothing was created: these projects have a name close to \"{name}\":"),
+        (_, Lang::Es) => format!("no se creó nada: estos proyectos tienen un nombre parecido a \"{name}\":"),
+    }];
+    for c in &resolution.candidates {
+        lines.push(match (c.deleted, c.delete_id, lang) {
+            (false, _, _) => format!("  {} \"{}\"", c.id, c.name),
+            (true, Some(n), Lang::En) => format!("  {} \"{}\", deleted: `clawg projects delete --undo {n}` brings it back", c.id, c.name),
+            (true, Some(n), Lang::Es) => format!("  {} \"{}\", borrado: `clawg projects delete --undo {n}` lo trae de vuelta", c.id, c.name),
+            (true, None, Lang::En) => format!("  {} \"{}\", deleted", c.id, c.name),
+            (true, None, Lang::Es) => format!("  {} \"{}\", borrado", c.id, c.name),
+        });
+    }
+    if resolution.refused == Some(ResolveRefusal::Similar) {
+        lines.push(match lang {
+            Lang::En => format!("`clawg projects create \"{name}\" --new` creates one apart"),
+            Lang::Es => format!("`clawg projects create \"{name}\" --new` crea uno aparte"),
+        });
+    }
+    (lines.join("\n"), false)
+}
+
+/// What `clawg projects create` prints when the daemon refused the name.
+pub fn create_refused(lang: Lang, err: &ClientError) -> Option<String> {
+    let (_, cause) = refusal(err)?;
+    Some(match lang {
+        Lang::En => format!("could not create the project: {cause}"),
+        Lang::Es => format!("no se pudo crear el proyecto: {cause}"),
+    })
+}
+
+/// Makes the folder `path` is in lead to `project`, and says what that took.
+pub async fn locate(lang: Lang, client: &DaemonClient, project: &str, path: &Path) -> Result<String, AddError> {
+    let identity = ProjectIdentity::resolve(path);
+    if !identity.root.is_dir() {
+        return Err(AddError::NotADirectory(identity.root));
+    }
+    let located = client.locate_project(project, &identity.root).await?;
+    Ok(render_located(lang, &identity.root, &located))
+}
+
+/// What `clawg projects locate` prints.
+pub fn render_located(lang: Lang, root: &Path, located: &Located) -> String {
+    let (root, id) = (root.display(), &located.project_id);
+    let merge = located.merge.as_ref().map(|m| (m.source.clone(), m.merge_id));
+    match (merge, lang) {
+        (Some((source, Some(n))), Lang::En) => format!(
+            "{root} leads to project {id} now: its project {source} was merged into it (merge {n}), and \
+             `clawg projects merge --undo {n}` takes that back"
+        ),
+        (Some((source, Some(n))), Lang::Es) => format!(
+            "{root} lleva ahora al proyecto {id}: su proyecto {source} se unió en él (unión {n}), y \
+             `clawg projects merge --undo {n}` lo deshace"
+        ),
+        (_, Lang::En) => format!("{root} already leads to project {id}; nothing changed"),
+        (_, Lang::Es) => format!("{root} ya lleva al proyecto {id}; no cambió nada"),
+    }
+}
+
+/// What `clawg projects locate` prints when the daemon refused it.
+pub fn locate_refused(lang: Lang, err: &ClientError) -> Option<String> {
+    let (_, cause) = refusal(err)?;
+    Some(match lang {
+        Lang::En => format!("could not locate the folder: {cause}"),
+        Lang::Es => format!("no se pudo ubicar la carpeta: {cause}"),
+    })
 }
 
 /// Registers the project `path` is in so the daemon may read its files, and
@@ -1717,5 +1819,47 @@ mod tests {
         assert!(ok && undone.starts_with("undid delete 1: 1 memory is back in"), "{undone}");
         let (again, _) = (delete_refused(Lang::En, true, &delete(Lang::En, &c, &opts(&["--undo", "1"])).await.expect_err("twice")), ());
         assert!(again.is_some_and(|s| s.starts_with("could not undo: ")));
+    }
+
+    #[test]
+    fn a_created_project_or_its_candidates_are_printed() {
+        use clawg_core::memory::registry::Candidate as Close;
+        let created = ProjectResolution { project_id: Some("ideas-1a2b".into()), created: true, ..ProjectResolution::default() };
+        let (en, done) = render_created(Lang::En, "ideas", &created);
+        assert_eq!(
+            (en.as_str(), done),
+            ("created project ideas-1a2b named \"ideas\"; it has no folder, and `clawg projects locate ideas-1a2b PATH` gives it one", true)
+        );
+        let (es, _) = render_created(Lang::Es, "ideas", &created);
+        assert_eq!(es, "se creó el proyecto ideas-1a2b llamado \"ideas\"; no tiene carpeta, y `clawg projects locate ideas-1a2b CAMINO` le da una");
+        let found = ProjectResolution { created: false, ..created };
+        assert_eq!(render_created(Lang::En, "ideas", &found), ("project ideas-1a2b already has that name; nothing was created".into(), true));
+
+        let close = |id: &str, name: &str, delete_id: Option<i64>| Close {
+            id: id.into(),
+            name: name.into(),
+            deleted: delete_id.is_some(),
+            delete_id,
+        };
+        let similar = ProjectResolution {
+            refused: Some(ResolveRefusal::Similar),
+            candidates: vec![close("mi-app-1a2b", "mi-app", None), close("miapp-3c4d", "MiApp", Some(4))],
+            ..ProjectResolution::default()
+        };
+        let (en, done) = render_created(Lang::En, "Mi App", &similar);
+        assert!(!done);
+        assert_eq!(
+            en,
+            "nothing was created: these projects have a name close to \"Mi App\":\n  mi-app-1a2b \"mi-app\"\n  miapp-3c4d \"MiApp\", \
+             deleted: `clawg projects delete --undo 4` brings it back\n`clawg projects create \"Mi App\" --new` creates one apart"
+        );
+        let (es, _) = render_created(Lang::Es, "Mi App", &similar);
+        assert_eq!(
+            es,
+            "no se creó nada: estos proyectos tienen un nombre parecido a \"Mi App\":\n  mi-app-1a2b \"mi-app\"\n  miapp-3c4d \"MiApp\", \
+             borrado: `clawg projects delete --undo 4` lo trae de vuelta\n`clawg projects create \"Mi App\" --new` crea uno aparte"
+        );
+        let ambiguous = ProjectResolution { refused: Some(ResolveRefusal::Ambiguous), ..similar };
+        assert!(!render_created(Lang::En, "api", &ambiguous).0.contains("--new"), "a name two projects hold is never created again");
     }
 }
