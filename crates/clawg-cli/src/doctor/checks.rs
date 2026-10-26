@@ -13,9 +13,9 @@ use clawg_core::memory::db::{EmbeddingIdentity, StoredContract};
 use clawg_core::memory::derive_project_id;
 use clawg_core::memory::identity::is_candidate_for;
 use clawg_core::memory::inspect::{
-    AgentRows, FolderPrint, IdRows, Invariants, OutboxFacts, ProjectRow, RegistryRow, RemoteRow,
+    duplicates, live_of, AgentRows, Duplicate, FolderPrint, IdRows, Invariants, OutboxFacts, ProjectRow, RegistryRow,
+    RemoteRow,
 };
-use clawg_core::memory::merge::MAX_MERGE_HOPS;
 use clawg_core::memory::store_lock::StoreOwner;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
@@ -632,25 +632,9 @@ pub fn project_remotes(lang: Lang, remotes: &[RemoteRow], origins: &[(ProjectRow
     found
 }
 
-/// The live project `id` leads to through the merges of `registry`; `None`
-/// when `id` is no project or its chain ends in none (a cycle, one too long,
-/// an id `project` does not have).
-fn live_of<'a>(registry: &'a [RegistryRow], id: &str) -> Option<&'a RegistryRow> {
-    let mut at = registry.iter().find(|p| p.id == id)?;
-    for _ in 0..=MAX_MERGE_HOPS {
-        match &at.merged_into {
-            None => return Some(at),
-            Some(into) => at = registry.iter().find(|p| p.id == *into)?,
-        }
-    }
-    None
-}
-
-/// Two live projects that may be one: with the same name, in any case, or
-/// with folders of one first commit that no pair of remotes tells apart (a
-/// fork has a remote of its own). A pair someone answered is not one. The
-/// step merges the newer into the older, the one that usually has the
-/// history, as a dry run.
+/// Each pair of live projects that may be one ([`duplicates`]). The step
+/// merges the newer into the older, the one that usually has the history, as
+/// a dry run.
 pub fn project_duplicates(
     lang: Lang,
     registry: &[RegistryRow],
@@ -658,48 +642,8 @@ pub fn project_duplicates(
     answered: &[(String, String)],
     profile: Profile,
 ) -> Vec<Finding> {
-    let live: Vec<&RegistryRow> = registry.iter().filter(|p| p.merged_into.is_none()).collect();
-    let answered = |a: &str, b: &str| {
-        let (a, b) = if a < b { (a, b) } else { (b, a) };
-        answered.iter().any(|(x, y)| x == a && y == b)
-    };
-    let ordered = |a: &'_ RegistryRow, b: &'_ RegistryRow| if (a.created_at, &a.id) <= (b.created_at, &b.id) { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
-    let mut pairs: Vec<(&'static str, RegistryRow, RegistryRow, Option<&str>)> = Vec::new();
-    for (i, a) in live.iter().enumerate() {
-        for b in &live[i + 1..] {
-            if a.name.to_lowercase() == b.name.to_lowercase() && !answered(&a.id, &b.id) {
-                let (older, newer) = ordered(a, b);
-                pairs.push(("same_name", older, newer, None));
-            }
-        }
-    }
-    let mut by_commit: std::collections::BTreeMap<&str, Vec<(&RegistryRow, Option<&str>)>> = std::collections::BTreeMap::new();
-    for f in folders {
-        let (Some(commit), Some(project)) = (f.root_commit.as_deref(), live_of(registry, f.project_id.as_deref().unwrap_or(&f.root_id)))
-        else {
-            continue;
-        };
-        by_commit.entry(commit).or_default().push((project, f.remote.as_deref()));
-    }
-    for (commit, sharing) in by_commit {
-        let mut seen: Vec<(String, String)> = Vec::new();
-        for (i, (a, a_remote)) in sharing.iter().enumerate() {
-            for (b, b_remote) in &sharing[i + 1..] {
-                let told_apart = matches!((a_remote, b_remote), (Some(x), Some(y)) if x != y);
-                if a.id == b.id || told_apart || answered(&a.id, &b.id) {
-                    continue;
-                }
-                let (older, newer) = ordered(a, b);
-                if seen.contains(&(older.id.clone(), newer.id.clone())) {
-                    continue;
-                }
-                seen.push((older.id.clone(), newer.id.clone()));
-                pairs.push(("same_first_commit", older, newer, Some(commit)));
-            }
-        }
-    }
     let mut found = Vec::new();
-    for (reason, older, newer, commit) in pairs {
+    for Duplicate { reason, older, newer, root_commit } in duplicates(registry, folders, answered) {
         let (o, n, name) = (&older.id, &newer.id, &older.name);
         let message = match (reason, lang) {
             ("same_name", Lang::En) => format!(
@@ -718,7 +662,7 @@ pub fn project_duplicates(
             ),
         };
         let mut evidence = json!({ "project_ids": [o, n], "names": [older.name, newer.name] });
-        if let Some(commit) = commit {
+        if let Some(commit) = root_commit {
             evidence["root_commit"] = json!(commit);
         }
         found.push(
@@ -732,7 +676,8 @@ pub fn project_duplicates(
             Lang::En => "no two projects look like one",
             Lang::Es => "ningún par de proyectos parece ser uno solo",
         };
-        found.push(Finding::ok("project_duplicates", message).evidence(json!({ "projects": live.len() })));
+        let live = registry.iter().filter(|p| p.merged_into.is_none()).count();
+        found.push(Finding::ok("project_duplicates", message).evidence(json!({ "projects": live })));
     }
     found
 }

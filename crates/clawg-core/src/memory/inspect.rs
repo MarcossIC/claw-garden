@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::memory::backup::{open_for_probe, probe, ProbeState, SchemaPlan, StoreProbe};
 use crate::memory::db::StoredContract;
+use crate::memory::merge::MAX_MERGE_HOPS;
 
 /// What [`inspect`] found.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +74,81 @@ pub struct IdRows {
     pub memories: i64,
     pub trajectories: i64,
     pub skills: i64,
+}
+
+/// Two live projects that may be one, the older first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Duplicate {
+    /// `same_name` or `same_first_commit`.
+    pub reason: &'static str,
+    pub older: RegistryRow,
+    pub newer: RegistryRow,
+    /// The first commit their folders share, for `same_first_commit`.
+    pub root_commit: Option<String>,
+}
+
+/// The live project `id` leads to through the merges of `registry`; `None`
+/// when `id` is no project or its chain ends in none (a cycle, one too long,
+/// an id `project` does not have).
+pub fn live_of<'a>(registry: &'a [RegistryRow], id: &str) -> Option<&'a RegistryRow> {
+    let mut at = registry.iter().find(|p| p.id == id)?;
+    for _ in 0..=MAX_MERGE_HOPS {
+        match &at.merged_into {
+            None => return Some(at),
+            Some(into) => at = registry.iter().find(|p| p.id == *into)?,
+        }
+    }
+    None
+}
+
+/// Two live projects that may be one: with the same name, in any case, or
+/// with folders of one first commit that no pair of remotes tells apart (a
+/// fork has a remote of its own). A pair someone answered is not one; the
+/// older of each pair, the one that usually has the history, comes first.
+pub fn duplicates(registry: &[RegistryRow], folders: &[FolderPrint], answered: &[(String, String)]) -> Vec<Duplicate> {
+    let live: Vec<&RegistryRow> = registry.iter().filter(|p| p.merged_into.is_none()).collect();
+    let answered = |a: &str, b: &str| {
+        let (a, b) = if a < b { (a, b) } else { (b, a) };
+        answered.iter().any(|(x, y)| x == a && y == b)
+    };
+    let pair = |reason, a: &RegistryRow, b: &RegistryRow, root_commit: Option<&str>| {
+        let (older, newer) = if (a.created_at, &a.id) <= (b.created_at, &b.id) { (a, b) } else { (b, a) };
+        Duplicate { reason, older: older.clone(), newer: newer.clone(), root_commit: root_commit.map(str::to_string) }
+    };
+    let mut found = Vec::new();
+    for (i, a) in live.iter().enumerate() {
+        for b in &live[i + 1..] {
+            if a.name.to_lowercase() == b.name.to_lowercase() && !answered(&a.id, &b.id) {
+                found.push(pair("same_name", a, b, None));
+            }
+        }
+    }
+    let mut by_commit: std::collections::BTreeMap<&str, Vec<(&RegistryRow, Option<&str>)>> = std::collections::BTreeMap::new();
+    for f in folders {
+        let (Some(commit), Some(project)) = (f.root_commit.as_deref(), live_of(registry, f.project_id.as_deref().unwrap_or(&f.root_id)))
+        else {
+            continue;
+        };
+        by_commit.entry(commit).or_default().push((project, f.remote.as_deref()));
+    }
+    for (commit, sharing) in by_commit {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for (i, (a, a_remote)) in sharing.iter().enumerate() {
+            for (b, b_remote) in &sharing[i + 1..] {
+                let told_apart = matches!((a_remote, b_remote), (Some(x), Some(y)) if x != y);
+                if a.id == b.id || told_apart || answered(&a.id, &b.id) {
+                    continue;
+                }
+                let found_pair = pair("same_first_commit", a, b, Some(commit));
+                let ids = (found_pair.older.id.clone(), found_pair.newer.id.clone());
+                if !seen.contains(&ids) {
+                    seen.push(ids);
+                    found.push(found_pair);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// The rows of one agent; `agent_id` is `None` for the rows no agent saved.
@@ -831,6 +907,58 @@ mod tests {
         drop(c);
         let facts = inspect(older.path()).facts.unwrap();
         assert_eq!(facts.registry, Some(vec![project("web-3c4d", "web", 2, None)]), "V27 merged nothing yet");
+    }
+
+    #[test]
+    fn duplicates_pair_by_name_and_by_first_commit_and_skip_answered_pairs() {
+        let project = |id: &str, name: &str, created_at, merged_into: Option<&str>| RegistryRow {
+            id: id.into(),
+            name: name.into(),
+            created_at,
+            merged_into: merged_into.map(str::to_string),
+        };
+        let print = |id: &str, remote: Option<&str>, commit: &str| FolderPrint {
+            root_id: id.into(),
+            project_id: Some(id.into()),
+            remote: remote.map(str::to_string),
+            root_commit: Some(commit.into()),
+        };
+        // Two that share a name, two whose folders share a first commit (one
+        // through a tombstone), and two forks with remotes of their own.
+        let registry = vec![
+            project("api-1a2b", "App", 1, None),
+            project("app-3c4d", "app", 5, None),
+            project("lib-5e6f", "lib", 2, None),
+            project("lib2-7a8b", "lib2", 6, None),
+            project("forka-0001", "forka", 3, None),
+            project("forkb-0002", "forkb", 4, None),
+            project("old-0003", "old", 0, Some("lib-5e6f")),
+        ];
+        let folders = vec![
+            print("lib-5e6f", Some("github.com/acme/lib"), "c1"),
+            print("lib2-7a8b", None, "c1"),
+            print("old-0003", None, "c1"),
+            print("forka-0001", Some("github.com/acme/fork"), "c2"),
+            print("forkb-0002", Some("github.com/other/fork"), "c2"),
+        ];
+        let pairs = |answered: &[(String, String)]| -> Vec<(&'static str, String, String, Option<String>)> {
+            duplicates(&registry, &folders, answered)
+                .into_iter()
+                .map(|d| (d.reason, d.older.id, d.newer.id, d.root_commit))
+                .collect()
+        };
+
+        assert_eq!(
+            pairs(&[]),
+            vec![
+                ("same_name", "api-1a2b".to_string(), "app-3c4d".to_string(), None),
+                ("same_first_commit", "lib-5e6f".to_string(), "lib2-7a8b".to_string(), Some("c1".to_string())),
+            ],
+            "the older first; a tombstone is its target, and a fork is no duplicate"
+        );
+        let answered = [("lib-5e6f".to_string(), "lib2-7a8b".to_string())];
+        assert_eq!(pairs(&answered), vec![("same_name", "api-1a2b".to_string(), "app-3c4d".to_string(), None)]);
+        assert_eq!(live_of(&registry, "old-0003").map(|p| p.id.as_str()), Some("lib-5e6f"));
     }
 
     #[tokio::test]
