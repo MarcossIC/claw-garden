@@ -201,6 +201,10 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
             found.extend(checks::project_duplicates(lang, registry, &facts.folder_prints, &facts.answered_pairs, profile));
             found.extend(checks::project_orphans(lang, registry, &facts.id_rows));
             found.extend(checks::project_merges(lang, registry, &facts.id_rows, profile));
+            // Projects can be deleted from V29.
+            if let Some(opens) = &facts.open_deletes {
+                found.extend(checks::project_deletes(lang, registry, &facts.id_rows, opens));
+            }
         }
         found.extend(checks::invariants(lang, &facts.invariants));
     }

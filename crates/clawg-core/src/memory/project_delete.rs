@@ -21,7 +21,7 @@ use crate::memory::admin::{RESTORE_TEXT_INDEX, RESTORE_TOPIC_HOLDER, RESTORE_TWI
 use crate::memory::chunker::embedding_text;
 use crate::memory::dispute::{release_challengers, settle_challengers, settle_row};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::memory::inspect::{answered_pairs, duplicates, folder_prints, RegistryRow};
+use crate::memory::inspect::{answered_pairs, duplicates, folder_prints, registry, Has, RegistryRow};
 use crate::memory::merge::{canonical_in, retrying, Retried};
 use crate::memory::maintenance::skill_embedding_text;
 use crate::memory::project_docs::drop_root_index_in;
@@ -391,16 +391,9 @@ fn outbox_in(c: &Connection, ids: &[String]) -> rusqlite::Result<(usize, Vec<Fai
 /// that include it, and the other side of its pending suggestions. A deleted
 /// project and a pair someone answered are neither.
 fn candidates_in(c: &Connection, project_id: &str) -> Result<Vec<Candidate>, DeleteError> {
-    // A deleted project is left out of the registry, so a tombstone that leads
-    // to one leads nowhere and gives no pair.
-    let registry: Vec<RegistryRow> = {
-        let mut stmt =
-            c.prepare("SELECT id, name, created_at, merged_into FROM project WHERE deleted_at IS NULL ORDER BY id")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(RegistryRow { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, merged_into: r.get(3)? })
-        })?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
+    // `duplicates` leaves out a deleted project and a tombstone that leads to
+    // one, so neither is a candidate.
+    let registry: Vec<RegistryRow> = registry(c, &Has::of(c)?)?;
     let answered = answered_pairs(c)?;
     let mut found: Vec<Candidate> = Vec::new();
     for pair in duplicates(&registry, &folder_prints(c)?, &answered) {
@@ -429,7 +422,7 @@ fn candidates_in(c: &Connection, project_id: &str) -> Result<Vec<Candidate>, Del
         if answered.iter().any(|(x, y)| x == lesser && y == greater) {
             continue;
         }
-        if let Some(live) = registry.iter().find(|p| p.id == other && p.merged_into.is_none()) {
+        if let Some(live) = registry.iter().find(|p| p.id == other && p.merged_into.is_none() && p.deleted_at.is_none()) {
             found.push(Candidate { project_id: live.id.clone(), name: live.name.clone(), reason });
         }
     }

@@ -46,6 +46,16 @@ pub struct StoreFacts {
     pub answered_pairs: Vec<(String, String)>,
     /// The ids rows of the three tables are saved under, with how many.
     pub id_rows: Vec<IdRows>,
+    /// The deletes nobody undid or purged (V29); `None` before the table
+    /// exists, when no project can be deleted.
+    pub open_deletes: Option<Vec<OpenDelete>>,
+}
+
+/// A delete nobody undid or purged, by the project it took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDelete {
+    pub project_id: String,
+    pub delete_id: i64,
 }
 
 /// A project of `project`.
@@ -56,6 +66,8 @@ pub struct RegistryRow {
     pub created_at: i64,
     /// The project a merge took it into (V28); `None` for a live one.
     pub merged_into: Option<String>,
+    /// When it was deleted (V29); `None` for one that is not.
+    pub deleted_at: Option<i64>,
 }
 
 /// What a folder recorded: the project it leads to and its fingerprints.
@@ -67,13 +79,17 @@ pub struct FolderPrint {
     pub root_commit: Option<String>,
 }
 
-/// An id rows are saved under, deleted ones too, with how many of each table.
+/// An id rows are saved under, deleted ones too, with how many of each table
+/// and how many of them are live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdRows {
     pub project_id: String,
     pub memories: i64,
     pub trajectories: i64,
     pub skills: i64,
+    pub live_memories: i64,
+    pub live_trajectories: i64,
+    pub live_skills: i64,
 }
 
 /// Two live projects that may be one, the older first.
@@ -87,9 +103,9 @@ pub struct Duplicate {
     pub root_commit: Option<String>,
 }
 
-/// The live project `id` leads to through the merges of `registry`; `None`
-/// when `id` is no project or its chain ends in none (a cycle, one too long,
-/// an id `project` does not have).
+/// The project `id` leads to through the merges of `registry`, deleted or
+/// not; `None` when `id` is no project or its chain ends in none (a cycle,
+/// one too long, an id `project` does not have).
 pub fn live_of<'a>(registry: &'a [RegistryRow], id: &str) -> Option<&'a RegistryRow> {
     let mut at = registry.iter().find(|p| p.id == id)?;
     for _ in 0..=MAX_MERGE_HOPS {
@@ -101,12 +117,13 @@ pub fn live_of<'a>(registry: &'a [RegistryRow], id: &str) -> Option<&'a Registry
     None
 }
 
-/// Two live projects that may be one: with the same name, in any case, or
-/// with folders of one first commit that no pair of remotes tells apart (a
-/// fork has a remote of its own). A pair someone answered is not one; the
-/// older of each pair, the one that usually has the history, comes first.
+/// Two projects, neither merged nor deleted, that may be one: with the same
+/// name, in any case, or with folders of one first commit that no pair of
+/// remotes tells apart (a fork has a remote of its own). A pair someone
+/// answered is not one; the older of each pair, the one that usually has the
+/// history, comes first.
 pub fn duplicates(registry: &[RegistryRow], folders: &[FolderPrint], answered: &[(String, String)]) -> Vec<Duplicate> {
-    let live: Vec<&RegistryRow> = registry.iter().filter(|p| p.merged_into.is_none()).collect();
+    let live: Vec<&RegistryRow> = registry.iter().filter(|p| p.merged_into.is_none() && p.deleted_at.is_none()).collect();
     let answered = |a: &str, b: &str| {
         let (a, b) = if a < b { (a, b) } else { (b, a) };
         answered.iter().any(|(x, y)| x == a && y == b)
@@ -125,8 +142,8 @@ pub fn duplicates(registry: &[RegistryRow], folders: &[FolderPrint], answered: &
     }
     let mut by_commit: std::collections::BTreeMap<&str, Vec<(&RegistryRow, Option<&str>)>> = std::collections::BTreeMap::new();
     for f in folders {
-        let (Some(commit), Some(project)) = (f.root_commit.as_deref(), live_of(registry, f.project_id.as_deref().unwrap_or(&f.root_id)))
-        else {
+        let project = live_of(registry, f.project_id.as_deref().unwrap_or(&f.root_id)).filter(|p| p.deleted_at.is_none());
+        let (Some(commit), Some(project)) = (f.root_commit.as_deref(), project) else {
             continue;
         };
         by_commit.entry(commit).or_default().push((project, f.remote.as_deref()));
@@ -297,15 +314,28 @@ fn read_facts(c: &Connection) -> rusqlite::Result<StoreFacts> {
         folder_prints: if has.table("project_path") { folder_prints(c)? } else { Vec::new() },
         answered_pairs: if has.table("project_suggestion") { answered_pairs(c)? } else { Vec::new() },
         id_rows: id_rows(c)?,
+        open_deletes: if has.table("project_delete") { Some(open_deletes(c)?) } else { None },
     })
 }
 
-fn registry(c: &Connection, has: &Has) -> rusqlite::Result<Vec<RegistryRow>> {
-    let merged_into = if has.project_column("merged_into") { "merged_into" } else { "NULL" };
-    let mut stmt = c.prepare(&format!("SELECT id, name, created_at, {merged_into} FROM project ORDER BY id"))?;
+/// The projects of `project`, tombstones and deleted ones too, with what the
+/// schema of the store has of them.
+pub(crate) fn registry(c: &Connection, has: &Has) -> rusqlite::Result<Vec<RegistryRow>> {
+    let column = |name| if has.project_column(name) { name } else { "NULL" };
+    let (merged_into, deleted_at) = (column("merged_into"), column("deleted_at"));
+    let mut stmt =
+        c.prepare(&format!("SELECT id, name, created_at, {merged_into}, {deleted_at} FROM project ORDER BY id"))?;
     let rows = stmt.query_map([], |r| {
-        Ok(RegistryRow { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, merged_into: r.get(3)? })
+        Ok(RegistryRow { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, merged_into: r.get(3)?, deleted_at: r.get(4)? })
     })?;
+    rows.collect()
+}
+
+fn open_deletes(c: &Connection) -> rusqlite::Result<Vec<OpenDelete>> {
+    let mut stmt = c.prepare(
+        "SELECT project_id, delete_id FROM project_delete WHERE undone_at IS NULL AND purged_at IS NULL ORDER BY delete_id",
+    )?;
+    let rows = stmt.query_map([], |r| Ok(OpenDelete { project_id: r.get(0)?, delete_id: r.get(1)? }))?;
     rows.collect()
 }
 
@@ -328,27 +358,36 @@ pub(crate) fn answered_pairs(c: &Connection) -> rusqlite::Result<Vec<(String, St
 
 fn id_rows(c: &Connection) -> rusqlite::Result<Vec<IdRows>> {
     let mut stmt = c.prepare(
-        "SELECT project_id, SUM(t = 'm'), SUM(t = 't'), SUM(t = 's') FROM ( \
-           SELECT project_id, 'm' AS t FROM memory \
-           UNION ALL SELECT project_id, 't' FROM episodic_trajectory \
-           UNION ALL SELECT project_id, 's' FROM procedural_skill) \
+        "SELECT project_id, SUM(t = 'm'), SUM(t = 't'), SUM(t = 's'), \
+                SUM(t = 'm' AND live), SUM(t = 't' AND live), SUM(t = 's' AND live) FROM ( \
+           SELECT project_id, 'm' AS t, deleted_at IS NULL AS live FROM memory \
+           UNION ALL SELECT project_id, 't', deleted_at IS NULL FROM episodic_trajectory \
+           UNION ALL SELECT project_id, 's', deleted_at IS NULL FROM procedural_skill) \
          WHERE project_id IS NOT NULL GROUP BY project_id ORDER BY project_id",
     )?;
     let rows = stmt.query_map([], |r| {
-        Ok(IdRows { project_id: r.get(0)?, memories: r.get(1)?, trajectories: r.get(2)?, skills: r.get(3)? })
+        Ok(IdRows {
+            project_id: r.get(0)?,
+            memories: r.get(1)?,
+            trajectories: r.get(2)?,
+            skills: r.get(3)?,
+            live_memories: r.get(4)?,
+            live_trajectories: r.get(5)?,
+            live_skills: r.get(6)?,
+        })
     })?;
     rows.collect()
 }
 
 /// The tables, and the columns of `memory` and `project`, the store has.
-struct Has {
+pub(crate) struct Has {
     tables: Vec<String>,
     memory_columns: Vec<String>,
     project_columns: Vec<String>,
 }
 
 impl Has {
-    fn of(c: &Connection) -> rusqlite::Result<Has> {
+    pub(crate) fn of(c: &Connection) -> rusqlite::Result<Has> {
         let names = |sql: &str| -> rusqlite::Result<Vec<String>> {
             let mut stmt = c.prepare(sql)?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -888,6 +927,7 @@ mod tests {
             name: name.into(),
             created_at,
             merged_into: merged_into.map(str::to_string),
+            deleted_at: None,
         };
         assert_eq!(
             facts.registry,
@@ -896,7 +936,15 @@ mod tests {
         let print = FolderPrint { root_id: "web-3c4d".into(), project_id: Some("web-3c4d".into()), remote: None, root_commit: Some("c1".into()) };
         assert_eq!(facts.folder_prints, vec![print]);
         assert_eq!(facts.answered_pairs, vec![("api-5e6f".to_string(), "web-3c4d".to_string())], "a pending one is not answered");
-        let rows = |id: &str, memories, trajectories| IdRows { project_id: id.into(), memories, trajectories, skills: 0 };
+        let rows = |id: &str, memories, trajectories| IdRows {
+            project_id: id.into(),
+            memories,
+            trajectories,
+            skills: 0,
+            live_memories: memories,
+            live_trajectories: trajectories,
+            live_skills: 0,
+        };
         assert_eq!(facts.id_rows, vec![rows("app-1a2b", 1, 0), rows("orphan-9f9f", 0, 1), rows("web-3c4d", 2, 0)]);
 
         let older = tempfile::tempdir().unwrap();
@@ -916,6 +964,7 @@ mod tests {
             name: name.into(),
             created_at,
             merged_into: merged_into.map(str::to_string),
+            deleted_at: None,
         };
         let print = |id: &str, remote: Option<&str>, commit: &str| FolderPrint {
             root_id: id.into(),
@@ -1026,5 +1075,80 @@ mod tests {
         assert_eq!(found.schema.state, ProbeState::Missing);
         assert_eq!(found.facts, None);
         assert!(!dir.path().join("memory.db").exists(), "no store is created");
+    }
+
+    #[tokio::test]
+    async fn the_facts_read_a_deleted_project_where_the_schema_has_one() {
+        let dir = store_with(|c| {
+            c.execute_batch(
+                "INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES \
+                   ('gone-1a2b', 'gone', 'root', 1, 1, NULL), ('web-3c4d', 'web', 'root', 1, 2, NULL);
+                 INSERT INTO project_delete (delete_id, project_id, with_memories, deleted_at, undone_at) VALUES \
+                   (1, 'gone-1a2b', 1, 3, 4), (2, 'gone-1a2b', 1, 5, NULL), (3, 'web-3c4d', 0, 6, 7);
+                 INSERT INTO episodic_trajectory \
+                   (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+                   VALUES ('agent', 'a', 'gone-1a2b', 's', 't', 1, 1, 1);",
+            )
+            .unwrap();
+            insert(c, &Row { project: Some("gone-1a2b"), deleted: true, ..row("one deleted") });
+            insert(c, &Row { project: Some("gone-1a2b"), ..row("one live") });
+            // After the rows: a live one under a deleted project brings it back.
+            c.execute("UPDATE project SET deleted_at = 5 WHERE id = 'gone-1a2b'", []).unwrap();
+        })
+        .await;
+
+        let facts = inspect(dir.path()).facts.unwrap();
+
+        let deleted: Vec<(&str, Option<i64>)> =
+            facts.registry.as_ref().unwrap().iter().map(|p| (p.id.as_str(), p.deleted_at)).collect();
+        assert_eq!(deleted, vec![("gone-1a2b", Some(5)), ("web-3c4d", None)]);
+        assert_eq!(
+            facts.id_rows,
+            vec![IdRows {
+                project_id: "gone-1a2b".into(),
+                memories: 2,
+                trajectories: 1,
+                skills: 0,
+                live_memories: 1,
+                live_trajectories: 1,
+                live_skills: 0
+            }]
+        );
+        assert_eq!(facts.open_deletes, Some(vec![OpenDelete { project_id: "gone-1a2b".into(), delete_id: 2 }]), "an undone one is not open");
+
+        // At V28 there is no column and no table: nothing is deleted, and nothing is read.
+        let older = tempfile::tempdir().unwrap();
+        seed_on_disk(older.path(), Some(28)).await;
+        let c = rusqlite::Connection::open(older.path().join("memory.db")).unwrap();
+        c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('web-3c4d', 'web', 'root', 1, 2)", [])
+            .unwrap();
+        drop(c);
+        let facts = inspect(older.path()).facts.unwrap();
+        assert_eq!(facts.registry.unwrap()[0].deleted_at, None);
+        assert_eq!(facts.open_deletes, None, "V29 is not applied");
+    }
+
+    #[test]
+    fn a_deleted_project_is_no_duplicate_and_leads_nowhere_for_a_tombstone() {
+        let project = |id: &str, name: &str, created_at, merged_into: Option<&str>, deleted_at| RegistryRow {
+            id: id.into(),
+            name: name.into(),
+            created_at,
+            merged_into: merged_into.map(str::to_string),
+            deleted_at,
+        };
+        let registry = vec![
+            project("web-3c4d", "web", 1, None, None),
+            project("app-1a2b", "Web", 2, None, Some(9)),
+            project("old-0003", "old", 0, Some("app-1a2b"), None),
+            project("lib2-7a8b", "lib2", 3, None, None),
+        ];
+        let folders = vec![
+            FolderPrint { root_id: "old-0003".into(), project_id: Some("old-0003".into()), remote: None, root_commit: Some("c1".into()) },
+            FolderPrint { root_id: "lib2-7a8b".into(), project_id: Some("lib2-7a8b".into()), remote: None, root_commit: Some("c1".into()) },
+        ];
+
+        assert_eq!(duplicates(&registry, &folders, &[]), vec![]);
+        assert_eq!(live_of(&registry, "old-0003").map(|p| p.id.as_str()), Some("app-1a2b"), "a chain ends in a project, deleted or not");
     }
 }
