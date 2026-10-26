@@ -5,7 +5,7 @@ phase: spec  # sigue la entrega 3: su spec, su diseño y sus tareas
 release: "0.64.0"  # sin publicar; el cambio sale entero, con un solo pull request a main al final
 artifacts:
   exploration: done  # la de project-registry (89), en su archivo
-  proposal: done  # las decisiones de 89 del 2026-10-24, para las entregas 1 a 4; la 2 partida en 2a y 2b; la 2b ajustada el 2026-10-25
+  proposal: done  # las decisiones de 89 del 2026-10-24, para las entregas 1 a 4; la 2 partida en 2a y 2b; la 2a y la 2b ajustadas el 2026-10-25; las secciones 3 y 4 con lo ya fijado y lo abierto, el 2026-10-26
   spec: partial  # entregas 1 (PL1 a PL10), 2a (PL11 a PL20) y 2b (PL21 a PL31); las entregas 3 y 4 suman las suyas
   design: partial  # entregas 1 (D1 a D14), 2a (D15 a D25) y 2b (D26 a D37: la marca de borrado, la vuelta al uso, el código, la purga)
   tasks: partial  # entregas 1 (1 a 10), 2a (11 a 21) y 2b (22 a 34)
@@ -18,4 +18,10 @@ deliveries:
   "2b": done  # borrar (V29): delete en dos etapas con --undo, la vuelta al uso, purge --project-delete, doctor; el CI, en el pull request final
   "3": pending  # proyectos sin carpeta y el agente
   "4": pending  # exportar e importar
+remaining:  # lo que falta para archivar el cambio
+  - "3: spec, diseño y tareas, y después apply y verify; lo abierto está en su sección de proposal.md"
+  - "4: spec, diseño y tareas, y después apply y verify; depende de la 3 por la resolución por nombre"
+  - "el CI de Linux y Windows, en el pull request final a main; Linux nunca se corrió en local"
+  - "después de la 3, el paso operativo: colocar las ~15.709 filas sin proyecto del perfil prod (pide autorización explícita) y contarlas antes de la línea base de 86"
+  - "a_merge_waits_for_the_saves_of_its_projects falla con la máquina cargada (verify.md, entrega 2b): puede romper el CI del pull request final"
 updated: 2026-10-26

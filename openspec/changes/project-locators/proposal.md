@@ -144,6 +144,12 @@ La etapa 1 de `delete` propone un `merge`, así que 2a va primero. Ninguna de la
 - Etapa 2, `--undo N`: restaura las filas (las vuelve a embeber) y sus localizadores.
 - `purge --project-delete N` borra para siempre y nombra los snapshots y los `workspace.md` que todavía guardan el texto.
 
+El diseño de la entrega 2a (2026-10-25) cambió tres puntos de esta sección:
+
+- **`synthesis_review` queda con la revisión más vieja**, no con el máximo de `reviewed_at`. Con el máximo, lo de X entre las dos fechas no se contaría nunca para `synthesize`, y el aviso se perdería sin que nadie lo note ([D19](design.md#d19-synthesis_review-queda-con-la-revisión-más-vieja)).
+- **El snapshot de una unión es `pre-merge`**, no `pre-rekey`, y el de su `--undo` es `pre-undo`. Así las uniones no hacen rotar los snapshots de los registros ([D21](design.md#d21-un-snapshot-pre-merge-y-pre-undo-para-deshacer)).
+- **Lo que administra proyectos no sigue la lápida.** `rename`, `keep-apart`, el destino de una unión y el `from_project` de un movimiento responden 409 `project_merged`, y el `--undo` del movimiento de una unión responde 409 `part_of_merge` ([D23](design.md#d23-lo-que-administra-proyectos-no-sigue-la-lápida)). `canonical` sigue corriendo en las entradas que leen o escriben bajo un proyecto ([D17](design.md#d17-canonical-corre-al-entrar-para-leer-y-en-la-transacción-que-escribe-para-escribir)).
+
 ### 3. Proyectos sin carpeta y el agente
 
 **Qué trae.**
@@ -166,6 +172,20 @@ La etapa 1 de `delete` propone un `merge`, así que 2a va primero. Ninguna de la
 - `search_project` sobre un proyecto sin carpeta responde su propio mensaje.
 - Un subproyecto declarado en `monorepo/apps/web` recibe lo que se guarda desde `monorepo/apps/web/src`. Lo que se guarda desde `monorepo/` sigue en el proyecto del monorepo, y un clone del monorepo en otra máquina llega a los dos.
 
+**Lo que ya fijaron las entregas anteriores.**
+- **`born`** suma los valores `agent` y `user`. La columna no lleva `CHECK`, así que no hay que reconstruir nada ([D6](design.md#d6-la-referencia-y-su-relleno)).
+- **Un nombre donde hoy va un id** se resuelve primero como id y después como nombre. El nombre no es único, así que uno que tienen dos proyectos es un error que los lista ([D8](design.md#d8-el-nombre-no-es-único-el-id-desambigua)).
+- **El id de una lápida** lleva a su proyecto vivo (PL12). El nombre de una lápida o de un proyecto borrado queda libre, pero su id no (PL15 y PL27 de la [spec](spec.md)).
+- **`project_suggestion.reason`** tiene hoy `root_commit`, `remote_changed` y `user`. Esta entrega suma los suyos: una carpeta con el nombre de un proyecto cuyo camino ya no existe, y un nombre parecido ([D10](design.md#d10-las-sugerencias), [D22](design.md#d22-las-respuestas-a-las-sugerencias)).
+- **La respuesta por CLI** a una sugerencia ya existe: `projects merge` y `projects keep-apart` (D22).
+- **La regla de los duplicados** ya es una función pura del core: `duplicates`, en `crates/clawg-core/src/memory/inspect.rs`. Junta el mismo nombre, o el mismo primer commit sin un remoto que los distinga, y saltea las lápidas, los borrados y los pares respondidos ([D36](design.md#d36-los-candidatos-para-vaciarlo)). La búsqueda de parecidos puede partir de ella.
+
+**Abierto para su diseño.**
+- **Una búsqueda cuando el cwd no resuelve a ningún proyecto:** sin alcance, como hoy, o un error.
+- **Cómo responde el agente una sugerencia:** con una herramienta nueva o con un argumento en una existente, y si unir exige `user_answered` con la respuesta del usuario.
+- **Un proyecto borrado en el argumento `project`.** Con su id, un save lo revive ([D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)), y falta decidir si el argumento nuevo hace lo mismo. Con su nombre, que quedó libre, se puede crear un proyecto nuevo con ese nombre o mostrar el borrado como candidato, para que el agente pregunte.
+- **La clave de `project_remote` para un subproyecto.** D14 la pasa a remoto más subcarpeta, pero `remote` es la clave primaria de la tabla (`V24__project_remote.sql:9`), y cambiar una clave primaria en SQLite obliga a reconstruir la tabla. Eso choca con la migración aditiva que promete [«Datos guardados»](#datos-guardados-migración-y-vuelta-atrás): hay que reconstruir `project_remote` o guardar la subcarpeta aparte.
+
 ### 4. Exportar e importar
 
 **Qué trae.**
@@ -177,6 +197,18 @@ La etapa 1 de `delete` propone un `merge`, así que 2a va primero. Ninguna de la
 - Un export hecho antes de una unión se importa en el destino sin crear el proyecto absorbido.
 - Un export de otra máquina con el mismo remoto cae en el proyecto local.
 - Un proyecto sin carpeta va y vuelve por nombre.
+
+**Depende de la entrega 3:** `--project-map NOMBRE=project:ID|NOMBRE` usa la resolución por nombre que trae la 3.
+
+**Lo que ya fijaron las entregas anteriores.**
+- **El import ya sigue la lápida** en la transacción que escribe cada fila ([D17](design.md#d17-canonical-corre-al-entrar-para-leer-y-en-la-transacción-que-escribe-para-escribir)).
+- **Una fila viva que el import escribe bajo un proyecto borrado lo revive**, sin revisar. Además, un borrado no desvincula sus carpetas ([D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)).
+- **El import no crea sugerencias**, porque el diario V26 no las puede anotar y un `--undo` las dejaría colgando. El proyecto que crea (`born = 'import'`) queda vacío después de su `--undo` ([D10](design.md#d10-las-sugerencias), [D12](design.md#d12-el-import-escribe-sus-carpetas-como-lo-haría-un-registro)).
+
+**Abierto para su diseño.**
+- **Volver a importar un export de clawg después de un movimiento simple.** Hoy inserta de nuevo las filas movidas, porque el proyecto del export ya no coincide. Se acepta, o se busca presencia en cualquier proyecto por `(agente, hash, created_at)`, con el riesgo de juntar un texto legítimo en dos proyectos.
+- **Las sugerencias y el proyecto que crea un import:** si el import pasa a crear sugerencias, y cómo anota su diario el proyecto que creó. Va junto con los tipos nuevos de `memory_import_extra`.
+- **Los proyectos borrados.** La línea `project` no lleva `deleted_at`, y falta decidir si viaja. También si un import que llega por una carpeta o un localizador a un proyecto borrado aquí puede revivirlo, y si un `project:ID` borrado en `--project-map` se rechaza con 409 `project_deleted`, como el destino de un movimiento ([D35](design.md#d35-lo-que-administra-proyectos-no-toma-uno-borrado)).
 
 ## Alcance
 
@@ -224,7 +256,7 @@ La etapa 1 de `delete` propone un `merge`, así que 2a va primero. Ninguna de la
   - Un binario anterior rechaza un store más nuevo sin tocarlo (`SchemaNewer`, `db.rs:443`).
   - `clawg update` restaura en el proceso el snapshot `pre-migration` cuando el binario viejo rechaza el store (`.claude/CLAUDE.md`, `clawg update`). A mano, se hace con `clawg restore` de ese snapshot.
   - El diseño deja también el SQL que deshace V27 a mano, conservando lo guardado después, como hizo [project-reassign](../archive/2026-10-22-project-reassign/proposal.md#datos-guardados) ([diseño, «Volver atrás»](design.md#volver-atrás)).
-- **Volver atrás de una operación.** Una unión, con `projects merge --undo N` o su `pre-rekey`. Un borrado de etapa 2, con `projects delete --undo N` o su snapshot. Lo que se purgó, sólo con un snapshot.
+- **Volver atrás de una operación.** Una unión, con `projects merge --undo N` o su `pre-merge`. Un borrado de etapa 2, con `projects delete --undo N` o su snapshot. Lo que se purgó, sólo con un snapshot.
 
 ## Compatibilidad
 
@@ -270,9 +302,15 @@ El [diseño de la entrega 1](design.md) resolvió:
 - `project_remote`: se conserva (D2);
 - cómo leer el primer commit (D3);
 - la integridad referencial (D7);
-- el nombre (D8).
+- el nombre (D8);
+- el archivo marcador: ninguna entrega lo trae, y sigue fuera de alcance.
 
-Lo demás espera a su entrega ([diseño, «Lo que espera a otra entrega»](design.md#lo-que-espera-a-otra-entrega)). La lista queda como se escribió:
+Los diseños de las entregas 2a y 2b resolvieron:
+
+- cómo se responde una sugerencia por CLI: `projects merge` o `projects keep-apart` ([D22](design.md#d22-las-respuestas-a-las-sugerencias)). Cómo la responde el agente sigue abierto, para la entrega 3;
+- un save bajo el id de un proyecto borrado: se acepta, y el proyecto vuelve sin revisar ([D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)).
+
+Lo demás espera a su entrega ([diseño, «Lo que espera a otra entrega»](design.md#lo-que-espera-a-otra-entrega)). Las secciones de las entregas 3 y 4 lo recogen, junto con lo que las entregas anteriores ya fijaron. La lista queda como se escribió:
 
 - **El localizador `path` frente a R20.** La propuesta pedía un índice único parcial sobre `(kind, value)` mientras el localizador siga vinculado. Desde 0.63.0, en cambio, un camino puede tener varias filas, una por repositorio, y `settle` elige entre ellas por el remoto. Un `path` único por identidad no puede representar eso. Hay tres opciones, y el diseño elige:
   - que el camino sólo sea único entre los localizadores sin remoto;
