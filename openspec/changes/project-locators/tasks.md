@@ -464,10 +464,11 @@ Requisitos en la [spec](spec.md#entrega-3a-proyectos-sin-carpeta-y-el-agente) (P
 
 ### 44. Verificación
 
-- [ ] La suite y los dos clippy de `.claude/CLAUDE.md`, en Linux.
-- [ ] El binario en un home temporal:
+- [x] La suite y los dos clippy de `.claude/CLAUDE.md`, en Linux.
+- [ ] El CI en Linux y Windows, en el pull request final del cambio.
+- [x] El binario en un home temporal:
   - un save con `project` crea un proyecto sin carpeta, y otro con un nombre parecido devuelve el candidato;
   - `projects create` y `projects locate` desde la CLI;
   - una carpeta sin VCS movida deja su sugerencia, `recall_context` y `session-start` la muestran, y `answer_suggestion` con `apart` la quita.
-- [ ] `verify.md`, sección «Entrega 3a».
-- [ ] No queda otro directorio de build que `target` y `target-test`.
+- [x] `verify.md`, sección «Entrega 3a».
+- [x] No queda otro directorio de build que `target` y `target-test`.

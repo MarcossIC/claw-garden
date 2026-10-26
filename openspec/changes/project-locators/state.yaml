@@ -1,7 +1,7 @@
 change: project-locators
 objective: "2"
 depends_on: [project-registry, project-reassign, project-clone-identity]
-phase: apply  # entrega 3a: spec, diseño y tareas escritos; sigue su apply
+phase: spec  # sigue la entrega 3b: su spec, su diseño y sus tareas
 release: "0.64.0"  # sin publicar; el cambio sale entero, con un solo pull request a main al final
 artifacts:
   exploration: done  # la de project-registry (89), en su archivo
@@ -9,21 +9,20 @@ artifacts:
   spec: partial  # entregas 1 (PL1 a PL10), 2a (PL11 a PL20), 2b (PL21 a PL31) y 3a (PL32 a PL42); las entregas 3b y 4 suman las suyas
   design: partial  # entregas 1 (D1 a D14), 2a (D15 a D25), 2b (D26 a D37: la marca de borrado, la vuelta al uso, el código, la purga) y 3a (D38 a D49)
   tasks: partial  # entregas 1 (1 a 10), 2a (11 a 21), 2b (22 a 34) y 3a (35 a 44)
-  apply: partial  # entregas 1, 2a y 2b, en 0.64.0
-  verify: partial  # entregas 1, 2a y 2b: Windows y el binario en un home temporal; el CI, en el pull request final
+  apply: partial  # entregas 1, 2a, 2b y 3a, en 0.64.0
+  verify: partial  # entregas 1, 2a y 2b en Windows, 3a en Linux, y el binario en un home temporal; el CI, en el pull request final
   archive: pending  # cuando cierre la entrega 4
 deliveries:
   "1": done  # el registro (V27); el CI de Linux y Windows se ve en el pull request final
   "2a": done  # unir (V28): merge con lápida y --undo, canonical(id), keep-apart, doctor; el CI, en el pull request final
   "2b": done  # borrar (V29): delete en dos etapas con --undo, la vuelta al uso, purge --project-delete, doctor; el CI, en el pull request final
-  "3a": pending  # proyectos sin carpeta y el agente, sin migración
+  "3a": done  # proyectos sin carpeta y el agente, sin migración; verificada en Linux, el CI en el pull request final
   "3b": pending  # los subproyectos de un monorepo, con su migración
   "4": pending  # exportar e importar
 remaining:  # lo que falta para archivar el cambio
-  - "3a: apply y verify (tareas 35 a 44)"
   - "3b: spec, diseño y tareas, y después apply y verify; lo que dejó fijado está en D14 y D49"
   - "4: spec, diseño y tareas, y después apply y verify; depende de la 3a por la resolución por nombre"
-  - "el CI de Linux y Windows, en el pull request final a main; Linux nunca se corrió en local"
+  - "el CI de Linux y Windows, en el pull request final a main; la suite en Linux se corrió en local por primera vez con la 3a (verify.md)"
   - "después de la 3a, el paso operativo: colocar las ~15.709 filas sin proyecto del perfil prod (pide autorización explícita) y contarlas antes de la línea base de 86"
   - "a_merge_waits_for_the_saves_of_its_projects falla con la máquina cargada (verify.md, entrega 2b): puede romper el CI del pull request final"
 updated: 2026-10-26
