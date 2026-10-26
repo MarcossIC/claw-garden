@@ -2476,3 +2476,61 @@ async fn setup_registers_through_a_fake_claude_and_remove_undoes_it() {
     assert_eq!(std::fs::read_to_string(config.join("CLAUDE.md")).unwrap(), "# Mine\n");
     assert_eq!(std::fs::read_to_string(config.join("settings.json")).unwrap(), "{}\n");
 }
+
+// ── purging a project delete ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_deleted_project_is_purged_once_the_daemon_stops() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let root = sandbox.home.join("work").join("app");
+    std::fs::create_dir_all(root.join(".git")).expect("repo");
+    let (status, registered) =
+        daemon.post("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true })).await;
+    assert_eq!(status, 200, "{registered}");
+    let project = registered["project_id"].as_str().expect("a project").to_string();
+    let (status, body) = daemon
+        .post(
+            "/v1/memories",
+            json!({ "content": "the vault passphrase is zebra-quokka-7741", "agent_id": "smoke", "project_id": project }),
+        )
+        .await;
+    assert!(status == 201 || status == 202, "{body}");
+    daemon.wait_until_ingested().await;
+    let run = |args: &[&str]| {
+        let mut argv = args.to_vec();
+        argv.extend_from_slice(&["--profile", "dev"]);
+        sandbox.run(&argv)
+    };
+
+    let report = run(&["projects", "delete", &project, "--with-memories"]);
+    assert_eq!(report.status.code(), Some(0), "{}", stderr_of(&report));
+    let text = stdout_of(&report);
+    let code = text.lines().last().and_then(|l| l.split("--confirm ").nth(1)).expect("the exact command").trim_end_matches('`');
+    let deleted = run(&["projects", "delete", &project, "--with-memories", "--confirm", code]);
+    assert_eq!(deleted.status.code(), Some(0), "{}", stderr_of(&deleted));
+    assert!(stdout_of(&deleted).contains("as delete 1") && stdout_of(&deleted).contains("pre-delete"), "{}", stdout_of(&deleted));
+
+    let without_yes = run(&["purge", "--project-delete", "1"]);
+    assert_eq!(without_yes.status.code(), Some(1));
+    assert!(stderr_of(&without_yes).contains("--yes"), "{}", stderr_of(&without_yes));
+    let running = run(&["purge", "--project-delete", "1", "--yes"]);
+    assert_eq!(running.status.code(), Some(1), "the daemon holds the store");
+    assert!(stderr_of(&running).contains("clawg stop"), "{}", stderr_of(&running));
+
+    assert_eq!(run(&["stop"]).status.code(), Some(0));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+    let purged = run(&["purge", "--project-delete", "1", "--yes"]);
+    assert_eq!(purged.status.code(), Some(0), "{}", stderr_of(&purged));
+    let said = stdout_of(&purged);
+    assert!(said.starts_with(&format!("purged delete 1 of project {project}: 1 memory removed for good")), "{said}");
+    assert!(said.contains("pre-delete"), "the snapshot that still holds it: {said}");
+    for name in ["memory.db", "memory.db-wal"] {
+        let bytes = std::fs::read(sandbox.data_dir().join(name)).unwrap_or_default();
+        assert!(!bytes.windows(6).any(|w| w == b"quokka"), "{name} still holds the text");
+    }
+    let again = run(&["purge", "--project-delete", "1", "--yes"]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(stderr_of(&again).contains("already purged"), "{}", stderr_of(&again));
+}

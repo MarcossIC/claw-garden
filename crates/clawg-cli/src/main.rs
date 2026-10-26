@@ -44,7 +44,7 @@ use clawg_core::memory::identity::Disk;
 use clawg_core::memory::portability::export::project_id_of;
 use clawg_core::memory::portability::ExportFilter;
 use clawg_core::memory::ProjectIdentity;
-use clawg_core::memory::secrets::{mask_reasons, purge, scan};
+use clawg_core::memory::secrets::{mask_reasons, purge, purge_delete, scan};
 use clawg_core::paths::data_dir;
 use clawg_core::preferences::{language_in, Lang};
 
@@ -278,13 +278,24 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Purge { id, yes, profile } => {
+        Command::Purge { id, project_delete, yes, profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let lang = language(&base_dir);
-            secrets::confirm(lang, id, yes)?;
-            let purged = purge(&base_dir, id).map_err(|e| secrets::explain(lang, e, secrets::Rewrite::Purge))?;
-            println!("{}", secrets::purge_report(lang, id, &purged));
+            match (id, project_delete) {
+                (Some(id), None) => {
+                    secrets::confirm(lang, id, yes)?;
+                    let purged = purge(&base_dir, id).map_err(|e| secrets::explain(lang, e, secrets::Rewrite::Purge))?;
+                    println!("{}", secrets::purge_report(lang, id, &purged));
+                }
+                (None, Some(delete_id)) => {
+                    secrets::confirm_delete(lang, delete_id, yes)?;
+                    let purged =
+                        purge_delete(&base_dir, delete_id).map_err(|e| secrets::explain(lang, e, secrets::Rewrite::Purge))?;
+                    println!("{}", secrets::purge_delete_report(lang, delete_id, &purged));
+                }
+                _ => return Err("name a memory to purge, or a delete with --project-delete".to_string()),
+            }
             Ok(ExitCode::SUCCESS)
         }
 

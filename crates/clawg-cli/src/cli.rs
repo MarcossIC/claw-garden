@@ -158,12 +158,19 @@ pub enum Command {
         profile: ProfileArg,
     },
     /// Remove one stored memory for good: its text, its vector and its index
-    /// terms. There is no way back, so it needs `--yes`. The daemon must be
+    /// terms, or, with `--project-delete N`, every row that delete N left
+    /// deleted. There is no way back, so it needs `--yes`. The daemon must be
     /// stopped.
     Purge {
         /// The memory's id, as `clawg secrets` or `clawg memories` show it.
-        id: i64,
-        /// Confirm that the memory is to be removed for good.
+        #[arg(required_unless_present = "project_delete", conflicts_with = "project_delete")]
+        id: Option<i64>,
+        /// Remove for good every row of project delete N that is still
+        /// deleted, as `clawg projects delete` and `clawg projects list` show
+        /// its number, instead of one memory.
+        #[arg(long, value_name = "N")]
+        project_delete: Option<i64>,
+        /// Confirm that it is to be removed for good.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
@@ -1752,17 +1759,35 @@ mod tests {
     }
 
     #[test]
-    fn purge_takes_an_id_a_yes_and_a_profile() {
+    fn purge_takes_an_id_or_a_delete() {
+        let purge = |args: &[&str]| {
+            let mut argv = vec!["clawg", "purge"];
+            argv.extend_from_slice(args);
+            parse(&argv).command
+        };
         assert_eq!(
-            parse(&["clawg", "purge", "57", "--yes", "--profile", "dev"]).command,
-            Command::Purge { id: 57, yes: true, profile: ProfileArg { profile: Some("dev".into()) } }
+            purge(&["57", "--yes", "--profile", "dev"]),
+            Command::Purge { id: Some(57), project_delete: None, yes: true, profile: ProfileArg { profile: Some("dev".into()) } }
         );
         assert_eq!(
-            parse(&["clawg", "purge", "57"]).command,
-            Command::Purge { id: 57, yes: false, profile: ProfileArg { profile: None } }
+            purge(&["57"]),
+            Command::Purge { id: Some(57), project_delete: None, yes: false, profile: ProfileArg { profile: None } }
         );
-        assert!(Cli::try_parse_from(["clawg", "purge"]).is_err(), "the id is required");
-        assert!(Cli::try_parse_from(["clawg", "purge", "memory"]).is_err(), "the id is a number");
+        assert_eq!(
+            purge(&["--project-delete", "4", "--yes"]),
+            Command::Purge { id: None, project_delete: Some(4), yes: true, profile: ProfileArg { profile: None } }
+        );
+        assert_eq!(
+            purge(&["--project-delete", "4"]),
+            Command::Purge { id: None, project_delete: Some(4), yes: false, profile: ProfileArg { profile: None } },
+            "without --yes it parses, and the command refuses before it opens anything"
+        );
+        let refused: [&[&str]; 4] = [&[], &["57", "--project-delete", "4"], &["memory"], &["--project-delete", "four"]];
+        for args in refused {
+            let mut argv = vec!["clawg", "purge"];
+            argv.extend_from_slice(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
     }
 
     #[test]
