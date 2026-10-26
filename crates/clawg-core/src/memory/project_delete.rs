@@ -149,6 +149,7 @@ pub struct Kept {
 
 /// Rows by table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Counts {
     pub memories: usize,
     pub trajectories: usize,
@@ -179,8 +180,10 @@ pub struct FailedSave {
     pub agent_id: String,
 }
 
-/// What a project holds and what deleting it does, or did.
+/// What a project holds and what deleting it does, or did. A reader accepts
+/// a report that lacks a field, as one from a daemon that knows less.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DeleteReport {
     pub project_id: String,
     pub name: String,

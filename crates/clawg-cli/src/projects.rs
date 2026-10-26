@@ -5,6 +5,8 @@
 //! project.
 //! `clawg projects merge`: merge one project into another, or undo a merge.
 //! `clawg projects keep-apart`: answer that two projects are not one.
+//! `clawg projects delete`: delete a project, with a report and a code when it
+//! takes its memories, or undo a delete.
 //!
 //! A bridge only has its own root indexed; any other root the model names is
 //! a label for memories. `add` is how the user, not the model, adds one.
@@ -13,12 +15,13 @@
 use std::path::{Path, PathBuf};
 
 use clawg_core::memory::merge::MergeReport;
-use clawg_core::memory::registry::{ListedProject, ListedSuggestion};
+use clawg_core::memory::project_delete::{Counts, DeleteReport, KeepReason, Refusal};
+use clawg_core::memory::registry::{ListedDelete, ListedProject, ListedSuggestion};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::preferences::Lang;
 
-use crate::cli::{MergeOpts, MoveOpts};
+use crate::cli::{DeleteOpts, MergeOpts, MoveOpts};
 use crate::client::{ClientError, DaemonClient};
 
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +34,46 @@ pub enum AddError {
 
 /// Every project the daemon has, as [`render_list`] prints it.
 pub async fn list(lang: Lang, client: &DaemonClient) -> Result<String, ClientError> {
-    Ok(render_list(lang, &client.list_projects().await?))
+    let listing = client.list_projects().await?;
+    Ok(render_listing(lang, &listing.projects, &listing.deletes))
+}
+
+/// [`render_list`], closed by the deletes nobody undid or purged: how to undo
+/// each, and, when it left deleted rows, how to purge it.
+pub fn render_listing(lang: Lang, projects: &[ListedProject], deletes: &[ListedDelete]) -> String {
+    let mut lines = vec![render_list(lang, projects)];
+    if deletes.is_empty() {
+        return lines.remove(0);
+    }
+    lines.push(
+        match lang {
+            Lang::En => "deleted projects:",
+            Lang::Es => "proyectos borrados:",
+        }
+        .to_string(),
+    );
+    for d in deletes {
+        let (name, id, n) = (&d.name, &d.project_id, d.delete_id);
+        let mut line = match lang {
+            Lang::En => format!("{name} ({id}), delete {n}: `clawg projects delete --undo {n}` brings it back"),
+            Lang::Es => format!("{name} ({id}), borrado {n}: `clawg projects delete --undo {n}` lo trae de vuelta"),
+        };
+        if d.rows > 0 {
+            let rows = d.rows;
+            line.push_str(&match lang {
+                Lang::En => format!("; `clawg purge --project-delete {n} --yes` removes its {rows} deleted rows for good"),
+                Lang::Es => format!("; `clawg purge --project-delete {n} --yes` saca para siempre sus {rows} filas borradas"),
+            });
+        }
+        if d.back {
+            line.push_str(match lang {
+                Lang::En => "; a memory saved since brought the project back into use",
+                Lang::Es => "; una memoria guardada después hizo que el proyecto volviera a usarse",
+            });
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
 }
 
 /// Names project `id` and marks it reviewed, and says so.
@@ -228,6 +270,373 @@ pub fn keep_apart_refused(lang: Lang, err: &ClientError) -> Option<String> {
         Lang::En => format!("could not keep them apart: {cause}"),
         Lang::Es => format!("no se pudieron mantener separados: {cause}"),
     })
+}
+
+/// Deletes a project, reports what deleting it takes, or undoes a delete, as
+/// `opts` asks. Answers what to print and whether it went through: a report
+/// that refused (a project with rows, a code that is no longer the set's)
+/// prints and fails.
+pub async fn delete(lang: Lang, client: &DaemonClient, opts: &DeleteOpts) -> Result<(String, bool), ClientError> {
+    let report = client.delete_projects(&opts.request()).await?;
+    Ok((render_delete(lang, &report, opts.undo.is_some()), delete_succeeded(&report)))
+}
+
+/// Whether the daemon did what was asked, and not only reported.
+pub fn delete_succeeded(report: &DeleteReport) -> bool {
+    report.refused.is_none()
+}
+
+/// What `clawg projects delete` prints when the daemon refused it, with its
+/// own sentence as it came; `None` for any other failure.
+pub fn delete_refused(lang: Lang, undo: bool, err: &ClientError) -> Option<String> {
+    let (code, cause) = refusal(err)?;
+    Some(match (code, undo, lang) {
+        ("saves_pending", false, Lang::En) => format!("could not delete now: {cause}"),
+        ("saves_pending", true, Lang::En) => format!("could not undo now: {cause}"),
+        ("saves_pending", false, Lang::Es) => format!("no se pudo borrar ahora: {cause}; se puede volver a intentar en un momento"),
+        ("saves_pending", true, Lang::Es) => format!("no se pudo deshacer ahora: {cause}; se puede volver a intentar en un momento"),
+        (_, false, Lang::En) => format!("could not delete: {cause}"),
+        (_, true, Lang::En) => format!("could not undo: {cause}"),
+        (_, false, Lang::Es) => format!("no se pudo borrar: {cause}"),
+        (_, true, Lang::Es) => format!("no se pudo deshacer: {cause}"),
+    })
+}
+
+/// The rows of each table, as a sentence part: `3 memories, 1 trajectory`.
+/// With `deleted`, the rows that were already deleted: `2 deleted memories`.
+fn row_counts(lang: Lang, c: &Counts, deleted: bool) -> String {
+    let part = |n: usize, en: (&str, &str), es: (&str, &str)| match (lang, deleted) {
+        (Lang::En, false) => counted(lang, n, en, es),
+        (Lang::En, true) => counted(lang, n, (&format!("deleted {}", en.0), &format!("deleted {}", en.1)), es),
+        (Lang::Es, false) => counted(lang, n, en, es),
+        (Lang::Es, true) => counted(lang, n, en, (&format!("{} borrada", es.0), &format!("{} borradas", es.1))),
+    };
+    let parts: Vec<String> = [
+        (c.memories, part(c.memories, ("memory", "memories"), ("memoria", "memorias"))),
+        (c.trajectories, part(c.trajectories, ("trajectory", "trajectories"), ("trayectoria", "trayectorias"))),
+        (c.skills, part(c.skills, ("skill", "skills"), ("habilidad", "habilidades"))),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(_, text)| text)
+    .collect();
+    parts.join(", ")
+}
+
+fn total(c: &Counts) -> usize {
+    c.memories + c.trajectories + c.skills
+}
+
+/// Why a project is offered to empty another into.
+fn candidate_reason(lang: Lang, reason: &str) -> String {
+    match (reason, lang) {
+        ("same_name", Lang::En) => "they have the same name".to_string(),
+        ("same_name", Lang::Es) => "tienen el mismo nombre".to_string(),
+        ("same_first_commit" | "root_commit", Lang::En) => "they share their first commit".to_string(),
+        ("same_first_commit" | "root_commit", Lang::Es) => "comparten el primer commit".to_string(),
+        ("remote_changed", Lang::En) => "the remote of one folder changed".to_string(),
+        ("remote_changed", Lang::Es) => "cambió el remoto de una carpeta".to_string(),
+        (other, _) => other.to_string(),
+    }
+}
+
+/// Why a row an undo leaves deleted stays so.
+fn keep_reason(lang: Lang, reason: KeepReason) -> &'static str {
+    match (reason, lang) {
+        (KeepReason::LiveTwin, Lang::En) => "a live memory has its text",
+        (KeepReason::LiveTwin, Lang::Es) => "una memoria viva tiene su texto",
+        (KeepReason::TopicTaken, Lang::En) => "a live memory holds its topic key",
+        (KeepReason::TopicTaken, Lang::Es) => "una memoria viva tiene su clave de tema",
+        (KeepReason::HoldsSecret, Lang::En) => "its text holds a secret",
+        (KeepReason::HoldsSecret, Lang::Es) => "su texto tiene un secreto",
+        (KeepReason::Changed, Lang::En) => "it is not as the delete left it",
+        (KeepReason::Changed, Lang::Es) => "ya no está como la dejó el borrado",
+        (KeepReason::Tied, Lang::En) => "it is a piece of a save with a piece that stays",
+        (KeepReason::Tied, Lang::Es) => "es una pieza de un save con una pieza que queda",
+    }
+}
+
+fn table_word(lang: Lang, table: &str) -> String {
+    match (table, lang) {
+        ("memory", Lang::En) => "memory".to_string(),
+        ("memory", Lang::Es) => "memoria".to_string(),
+        ("episodic_trajectory", Lang::En) => "trajectory".to_string(),
+        ("episodic_trajectory", Lang::Es) => "trayectoria".to_string(),
+        ("procedural_skill", Lang::En) => "skill".to_string(),
+        ("procedural_skill", Lang::Es) => "habilidad".to_string(),
+        (other, _) => other.to_string(),
+    }
+}
+
+/// What `clawg projects delete` prints for `report`, of a delete, of the
+/// report that comes before one with its memories, or, with `undo`, of an
+/// undo.
+pub fn render_delete(lang: Lang, report: &DeleteReport, undo: bool) -> String {
+    if undo {
+        return render_undo(lang, report);
+    }
+    let (name, id) = (&report.name, &report.project_id);
+    match (report.refused, report.delete_id) {
+        (Some(Refusal::NotEmpty), _) => {
+            let rows = row_counts(lang, &report.live, false);
+            let mut lines = vec![match lang {
+                Lang::En => format!("{name} ({id}) has live rows: {rows}, so it is not deleted. To empty it:"),
+                Lang::Es => format!("{name} ({id}) tiene filas vivas: {rows}, así que no se borra. Para vaciarlo:"),
+            }];
+            for c in &report.candidates {
+                let (other, other_name, why) = (&c.project_id, &c.name, candidate_reason(lang, &c.reason));
+                lines.push(match lang {
+                    Lang::En => format!(
+                        "`clawg projects merge {id} --into {other} --dry-run` joins it into {other_name} ({other}): {why}"
+                    ),
+                    Lang::Es => format!(
+                        "`clawg projects merge {id} --into {other} --dry-run` lo une a {other_name} ({other}): {why}"
+                    ),
+                });
+            }
+            lines.push(match lang {
+                Lang::En => format!("`clawg projects move --from-project {id} --to-project <ID>` moves its memories to another project"),
+                Lang::Es => format!("`clawg projects move --from-project {id} --to-project <ID>` mueve sus memorias a otro proyecto"),
+            });
+            lines.push(match lang {
+                Lang::En => format!("`clawg projects delete {id} --with-memories` shows what deleting it with its memories takes"),
+                Lang::Es => format!("`clawg projects delete {id} --with-memories` muestra lo que se lleva borrarlo con sus memorias"),
+            });
+            lines.join("\n")
+        }
+        (Some(Refusal::CodeChanged), _) => {
+            let said = match lang {
+                Lang::En => "the project changed since that report, so nothing was deleted; this is the new report:",
+                Lang::Es => "el proyecto cambió desde ese informe y no se borró nada; este es el nuevo informe:",
+            };
+            format!("{said}\n{}", render_set(lang, report))
+        }
+        (None, None) => render_set(lang, report),
+        (None, Some(n)) if !report.with_memories => {
+            let mut lines = vec![match lang {
+                Lang::En => format!("deleted project {name} ({id}) as delete {n}; `clawg projects delete --undo {n}` brings it back"),
+                Lang::Es => format!("se borró el proyecto {name} ({id}) como el borrado {n}; `clawg projects delete --undo {n}` lo trae de vuelta"),
+            }];
+            let left = total(&report.deleted);
+            if left > 0 {
+                let rows = row_counts(lang, &report.deleted, true);
+                lines.push(match (left == 1, lang) {
+                    (false, Lang::En) => format!("its {rows} stay; `clawg purge --project-delete {n} --yes` removes them for good"),
+                    (true, Lang::En) => format!("its {rows} stays; `clawg purge --project-delete {n} --yes` removes it for good"),
+                    (false, Lang::Es) => format!("sus {rows} quedan; `clawg purge --project-delete {n} --yes` las saca para siempre"),
+                    (true, Lang::Es) => format!("su {rows} queda; `clawg purge --project-delete {n} --yes` la saca para siempre"),
+                });
+            }
+            lines.join("\n")
+        }
+        (None, Some(n)) => {
+            let rows = row_counts(lang, &report.live, false);
+            let one = total(&report.live) == 1;
+            let mut lines = vec![match (one, lang) {
+                (_, Lang::En) => format!("deleted project {name} ({id}) with its {rows} as delete {n}"),
+                (false, Lang::Es) => format!("se borró el proyecto {name} ({id}) con sus {rows} como el borrado {n}"),
+                (true, Lang::Es) => format!("se borró el proyecto {name} ({id}) con su {rows} como el borrado {n}"),
+            }];
+            if let Some(snapshot) = &report.snapshot {
+                lines.push(match lang {
+                    Lang::En => format!("snapshot before the delete: {snapshot}; `clawg restore` brings it back"),
+                    Lang::Es => format!("snapshot de antes de borrar: {snapshot}; `clawg restore` lo trae de vuelta"),
+                });
+            }
+            lines.push(match (one, lang) {
+                (false, Lang::En) => format!(
+                    "`clawg projects delete --undo {n}` brings them back; `clawg purge --project-delete {n} --yes` removes them for good"
+                ),
+                (true, Lang::En) => format!(
+                    "`clawg projects delete --undo {n}` brings it back; `clawg purge --project-delete {n} --yes` removes it for good"
+                ),
+                (false, Lang::Es) => format!(
+                    "`clawg projects delete --undo {n}` las trae de vuelta; `clawg purge --project-delete {n} --yes` las saca para siempre"
+                ),
+                (true, Lang::Es) => format!(
+                    "`clawg projects delete --undo {n}` la trae de vuelta; `clawg purge --project-delete {n} --yes` la saca para siempre"
+                ),
+            });
+            lines.join("\n")
+        }
+    }
+}
+
+/// The set a delete with its memories would take, and the command that
+/// confirms it.
+fn render_set(lang: Lang, report: &DeleteReport) -> String {
+    let (name, id) = (&report.name, &report.project_id);
+    let mut lines = vec![match lang {
+        Lang::En => format!("deleting {name} ({id}) with its memories takes: {}", row_counts(lang, &report.live, false)),
+        Lang::Es => format!("borrar {name} ({id}) con sus memorias se lleva: {}", row_counts(lang, &report.live, false)),
+    }];
+    if total(&report.deleted) > 0 {
+        let rows = row_counts(lang, &report.deleted, false);
+        lines.push(match lang {
+            Lang::En => format!("already deleted: {rows}"),
+            Lang::Es => format!("ya borradas: {rows}"),
+        });
+    }
+    let tally = |pairs: Vec<(String, usize)>| pairs.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ");
+    if !report.by_type.is_empty() {
+        let list = tally(report.by_type.iter().map(|(k, n)| (k.clone(), *n)).collect());
+        lines.push(match lang {
+            Lang::En => format!("by type: {list}"),
+            Lang::Es => format!("por tipo: {list}"),
+        });
+    }
+    if !report.by_author.is_empty() {
+        let none = match lang {
+            Lang::En => "(none)",
+            Lang::Es => "(ninguno)",
+        };
+        let list = tally(report.by_author.iter().map(|a| (a.agent_id.clone().unwrap_or_else(|| none.to_string()), a.rows)).collect());
+        lines.push(match lang {
+            Lang::En => format!("by author: {list}"),
+            Lang::Es => format!("por autor: {list}"),
+        });
+    }
+    if !report.by_status.is_empty() {
+        let list = tally(report.by_status.iter().map(|(k, n)| (k.clone(), *n)).collect());
+        lines.push(match lang {
+            Lang::En => format!("by status: {list}"),
+            Lang::Es => format!("por estado: {list}"),
+        });
+    }
+    if !report.protected.is_empty() {
+        let ids = id_list(report.protected.iter().copied());
+        lines.push(match lang {
+            Lang::En => format!("preferences and decisions among them: {ids}"),
+            Lang::Es => format!("preferencias y decisiones entre ellas: {ids}"),
+        });
+    }
+    if report.split_pairs > 0 {
+        let n = report.split_pairs;
+        lines.push(match lang {
+            Lang::En => format!("pairs with a memory of another project, which stay as they are: {n}"),
+            Lang::Es => format!("pares con una memoria de otro proyecto, que quedan como están: {n}"),
+        });
+    }
+    if !report.conclusions.is_empty() {
+        let ids = id_list(report.conclusions.iter().copied());
+        lines.push(match lang {
+            Lang::En => format!("conclusions of other projects that lose a source and go to review: {ids}"),
+            Lang::Es => format!("conclusiones de otros proyectos que pierden una fuente y pasan a revisión: {ids}"),
+        });
+    }
+    if !report.workspaces.is_empty() {
+        let list = report.workspaces.join(", ");
+        lines.push(match lang {
+            Lang::En => format!("workspace.md files, which are not touched: {list}"),
+            Lang::Es => format!("archivos workspace.md, que no se tocan: {list}"),
+        });
+    }
+    if !report.folders.is_empty() {
+        let list = report.folders.join(", ");
+        lines.push(match lang {
+            Lang::En => format!("docs index removed from the folders: {list}"),
+            Lang::Es => format!("índice de docs que se quita de las carpetas: {list}"),
+        });
+    }
+    if !report.remotes.is_empty() {
+        let list = report.remotes.join(", ");
+        lines.push(match lang {
+            Lang::En => format!("remotes, which stay linked: {list}"),
+            Lang::Es => format!("remotos, que siguen vinculados: {list}"),
+        });
+    }
+    if report.pending > 0 {
+        let n = report.pending;
+        lines.push(match (n == 1, lang) {
+            (true, Lang::En) => "1 save of the project is waiting to be stored; confirming waits for it".to_string(),
+            (false, Lang::En) => format!("{n} saves of the project are waiting to be stored; confirming waits for them"),
+            (true, Lang::Es) => "1 save del proyecto espera para guardarse; la confirmación lo espera".to_string(),
+            (false, Lang::Es) => format!("{n} saves del proyecto esperan para guardarse; la confirmación los espera"),
+        });
+    }
+    for f in &report.failed {
+        let (op, agent) = (&f.operation_id, &f.agent_id);
+        lines.push(match lang {
+            Lang::En => format!(
+                "a save that failed would bring the project back if it were retried: {op} (agent {agent}); \
+                 `clawg outbox discard {op} --agent {agent}` drops it"
+            ),
+            Lang::Es => format!(
+                "un save que falló haría volver al proyecto si se reintentara: {op} (agente {agent}); \
+                 `clawg outbox discard {op} --agent {agent}` lo descarta"
+            ),
+        });
+    }
+    for c in &report.candidates {
+        let (other, why) = (&c.project_id, candidate_reason(lang, &c.reason));
+        let other_name = &c.name;
+        lines.push(match lang {
+            Lang::En => format!(
+                "it could be emptied into another project instead: `clawg projects merge {id} --into {other} --dry-run` ({other_name}: {why})"
+            ),
+            Lang::Es => format!(
+                "se podría vaciar en otro proyecto en cambio: `clawg projects merge {id} --into {other} --dry-run` ({other_name}: {why})"
+            ),
+        });
+    }
+    if let Some(code) = &report.code {
+        lines.push(match lang {
+            Lang::En => format!("to delete it with its memories: `clawg projects delete {id} --with-memories --confirm {code}`"),
+            Lang::Es => format!("para borrarlo con sus memorias: `clawg projects delete {id} --with-memories --confirm {code}`"),
+        });
+    }
+    lines.join("\n")
+}
+
+/// What an undo, or its dry run, did: the rows that came back and each one
+/// that stays deleted, with why.
+fn render_undo(lang: Lang, report: &DeleteReport) -> String {
+    let (name, id, dry) = (&report.name, &report.project_id, report.dry_run);
+    let n = report.delete_id.unwrap_or_default();
+    let back = total(&report.restored);
+    let rows = row_counts(lang, &report.restored, false);
+    let mut lines = vec![if back == 0 {
+        match (dry, lang) {
+            (true, Lang::En) => format!("would undo delete {n}: {name} ({id}) would be live again, with no rows to restore"),
+            (false, Lang::En) => format!("undid delete {n}: {name} ({id}) is live again, with no rows to restore"),
+            (true, Lang::Es) => format!("se desharía el borrado {n}: {name} ({id}) volvería a estar vivo, sin filas que restaurar"),
+            (false, Lang::Es) => format!("se deshizo el borrado {n}: {name} ({id}) vuelve a estar vivo, sin filas que restaurar"),
+        }
+    } else {
+        let one = back == 1;
+        match (dry, one, lang) {
+            (true, _, Lang::En) => format!("would undo delete {n}: {rows} would be back in {name} ({id})"),
+            (false, true, Lang::En) => format!("undid delete {n}: {rows} is back in {name} ({id})"),
+            (false, false, Lang::En) => format!("undid delete {n}: {rows} are back in {name} ({id})"),
+            (true, true, Lang::Es) => format!("se desharía el borrado {n}: {rows} volvería a {name} ({id})"),
+            (true, false, Lang::Es) => format!("se desharía el borrado {n}: {rows} volverían a {name} ({id})"),
+            (false, true, Lang::Es) => format!("se deshizo el borrado {n}: {rows} vuelve a {name} ({id})"),
+            (false, false, Lang::Es) => format!("se deshizo el borrado {n}: {rows} vuelven a {name} ({id})"),
+        }
+    }];
+    for k in &report.kept {
+        let (table, row, why) = (table_word(lang, &k.table), k.id, keep_reason(lang, k.reason));
+        lines.push(match lang {
+            Lang::En => format!("stays deleted: {table} #{row}: {why}"),
+            Lang::Es => format!("queda borrada: {table} #{row}: {why}"),
+        });
+    }
+    if !report.folders.is_empty() {
+        let list = report.folders.join(", ");
+        lines.push(match (dry, lang) {
+            (false, Lang::En) => format!("docs index turned on again for: {list}; the next refresh rebuilds it"),
+            (false, Lang::Es) => format!("índice de docs que se vuelve a activar en: {list}; el próximo refresco lo reconstruye"),
+            (true, Lang::En) => format!("docs index would be turned on again for: {list}"),
+            (true, Lang::Es) => format!("el índice de docs se volvería a activar en: {list}"),
+        });
+    }
+    if let Some(snapshot) = &report.snapshot {
+        lines.push(match lang {
+            Lang::En => format!("snapshot before the undo: {snapshot}; `clawg restore` brings it back"),
+            Lang::Es => format!("snapshot de antes de deshacer: {snapshot}; `clawg restore` lo trae de vuelta"),
+        });
+    }
+    lines.join("\n")
 }
 
 /// `n` of a thing, in the singular or the plural each language gives it.
@@ -988,5 +1397,282 @@ mod tests {
         let err = add(Lang::En, &c, &dir.path().join("gone")).await.expect_err("missing");
 
         assert!(matches!(err, AddError::NotADirectory(_)), "{err:?}");
+    }
+
+    // ── deleting ────────────────────────────────────────────────────────
+
+    fn delete_report(report: serde_json::Value) -> DeleteReport {
+        let mut whole = serde_json::json!({ "project_id": "app-1a2b", "name": "App web" });
+        whole.as_object_mut().unwrap().extend(report.as_object().unwrap().clone());
+        serde_json::from_value(whole).unwrap()
+    }
+
+    fn the_report() -> DeleteReport {
+        delete_report(serde_json::json!({
+            "with_memories": true, "code": "1a2b3c4d",
+            "live": { "memories": 3, "trajectories": 1, "skills": 0 },
+            "deleted": { "memories": 2, "trajectories": 0, "skills": 0 },
+            "by_type": { "semantic_fact": 2, "user_preference": 1 },
+            "by_author": [{ "agent_id": null, "rows": 1 }, { "agent_id": "agent-a", "rows": 2 }],
+            "by_status": { "active": 3 }, "protected": [2], "split_pairs": 1, "conclusions": [7],
+            "workspaces": ["/w/a/app-1a2b/workspace.md"], "folders": ["app-1a2b"], "remotes": ["github.com/acme/app"],
+            "pending": 1, "failed": [{ "operation_id": "op-1", "agent_id": "agent-a" }],
+            "candidates": [{ "project_id": "web-3c4d", "name": "web", "reason": "same_name" }],
+        }))
+    }
+
+    #[test]
+    fn a_delete_report_names_what_goes_and_the_exact_confirm() {
+        assert_eq!(
+            render_delete(Lang::En, &the_report(), false),
+            "deleting App web (app-1a2b) with its memories takes: 3 memories, 1 trajectory\n\
+             already deleted: 2 memories\n\
+             by type: semantic_fact 2, user_preference 1\n\
+             by author: (none) 1, agent-a 2\n\
+             by status: active 3\n\
+             preferences and decisions among them: #2\n\
+             pairs with a memory of another project, which stay as they are: 1\n\
+             conclusions of other projects that lose a source and go to review: #7\n\
+             workspace.md files, which are not touched: /w/a/app-1a2b/workspace.md\n\
+             docs index removed from the folders: app-1a2b\n\
+             remotes, which stay linked: github.com/acme/app\n\
+             1 save of the project is waiting to be stored; confirming waits for it\n\
+             a save that failed would bring the project back if it were retried: op-1 (agent agent-a); \
+             `clawg outbox discard op-1 --agent agent-a` drops it\n\
+             it could be emptied into another project instead: \
+             `clawg projects merge app-1a2b --into web-3c4d --dry-run` (web: they have the same name)\n\
+             to delete it with its memories: `clawg projects delete app-1a2b --with-memories --confirm 1a2b3c4d`"
+        );
+        let es = render_delete(Lang::Es, &the_report(), false);
+        for line in [
+            "borrar App web (app-1a2b) con sus memorias se lleva: 3 memorias, 1 trayectoria",
+            "ya borradas: 2 memorias",
+            "por autor: (ninguno) 1, agent-a 2",
+            "preferencias y decisiones entre ellas: #2",
+            "1 save del proyecto espera para guardarse; la confirmación lo espera",
+            "`clawg outbox discard op-1 --agent agent-a` lo descarta",
+            "(web: tienen el mismo nombre)",
+        ] {
+            assert!(es.contains(line), "{line}\n{es}");
+        }
+        assert!(
+            es.ends_with("para borrarlo con sus memorias: `clawg projects delete app-1a2b --with-memories --confirm 1a2b3c4d`"),
+            "{es}"
+        );
+
+        // A code that is no longer the set's: the same report, after saying so.
+        let stale = delete_report(serde_json::json!({ "with_memories": true, "code": "ffff0000", "refused": "code_changed" }));
+        let en = render_delete(Lang::En, &stale, false);
+        assert!(en.starts_with("the project changed since that report, so nothing was deleted; this is the new report:\n"), "{en}");
+        assert!(en.ends_with("--confirm ffff0000`"), "{en}");
+        assert!(render_delete(Lang::Es, &stale, false).starts_with("el proyecto cambió desde ese informe y no se borró nada; este es el nuevo informe:\n"));
+
+        // An empty project, and one deleted with its memories.
+        let empty = delete_report(serde_json::json!({
+            "delete_id": 4, "deleted": { "memories": 2, "trajectories": 0, "skills": 0 },
+        }));
+        assert_eq!(
+            render_delete(Lang::En, &empty, false),
+            "deleted project App web (app-1a2b) as delete 4; `clawg projects delete --undo 4` brings it back\n\
+             its 2 deleted memories stay; `clawg purge --project-delete 4 --yes` removes them for good"
+        );
+        assert_eq!(
+            render_delete(Lang::Es, &empty, false),
+            "se borró el proyecto App web (app-1a2b) como el borrado 4; `clawg projects delete --undo 4` lo trae de vuelta\n\
+             sus 2 memorias borradas quedan; `clawg purge --project-delete 4 --yes` las saca para siempre"
+        );
+        let done = delete_report(serde_json::json!({
+            "with_memories": true, "delete_id": 5, "code": "1a2b3c4d", "snapshot": "/b/memory-x-pre-delete.db",
+            "live": { "memories": 3, "trajectories": 0, "skills": 0 },
+        }));
+        assert_eq!(
+            render_delete(Lang::En, &done, false),
+            "deleted project App web (app-1a2b) with its 3 memories as delete 5\n\
+             snapshot before the delete: /b/memory-x-pre-delete.db; `clawg restore` brings it back\n\
+             `clawg projects delete --undo 5` brings them back; `clawg purge --project-delete 5 --yes` removes them for good"
+        );
+        assert_eq!(
+            render_delete(Lang::Es, &done, false),
+            "se borró el proyecto App web (app-1a2b) con sus 3 memorias como el borrado 5\n\
+             snapshot de antes de borrar: /b/memory-x-pre-delete.db; `clawg restore` lo trae de vuelta\n\
+             `clawg projects delete --undo 5` las trae de vuelta; `clawg purge --project-delete 5 --yes` las saca para siempre"
+        );
+        assert!(!delete_succeeded(&stale) && delete_succeeded(&done) && delete_succeeded(&the_report()));
+
+        // An undo, and what stayed.
+        let undone = delete_report(serde_json::json!({
+            "delete_id": 5, "snapshot": "/b/memory-x-pre-undo.db", "folders": ["app-1a2b"],
+            "restored": { "memories": 2, "trajectories": 1, "skills": 0 },
+            "kept": [{ "table": "memory", "id": 9, "reason": "live_twin" }, { "table": "memory", "id": 10, "reason": "tied" }],
+        }));
+        assert_eq!(
+            render_delete(Lang::En, &undone, true),
+            "undid delete 5: 2 memories, 1 trajectory are back in App web (app-1a2b)\n\
+             stays deleted: memory #9: a live memory has its text\n\
+             stays deleted: memory #10: it is a piece of a save with a piece that stays\n\
+             docs index turned on again for: app-1a2b; the next refresh rebuilds it\n\
+             snapshot before the undo: /b/memory-x-pre-undo.db; `clawg restore` brings it back"
+        );
+        let dry = delete_report(serde_json::json!({ "dry_run": true, "delete_id": 5, "restored": { "memories": 1, "trajectories": 0, "skills": 0 } }));
+        assert_eq!(render_delete(Lang::En, &dry, true), "would undo delete 5: 1 memory would be back in App web (app-1a2b)");
+        assert_eq!(render_delete(Lang::Es, &dry, true), "se desharía el borrado 5: 1 memoria volvería a App web (app-1a2b)");
+        let es = render_delete(Lang::Es, &undone, true);
+        assert!(es.starts_with("se deshizo el borrado 5: 2 memorias, 1 trayectoria vuelven a App web (app-1a2b)\n"), "{es}");
+        assert!(es.contains("queda borrada: memoria #9: una memoria viva tiene su texto"), "{es}");
+    }
+
+    #[test]
+    fn a_refused_delete_names_the_ways_to_empty_it() {
+        let report = delete_report(serde_json::json!({
+            "refused": "not_empty", "live": { "memories": 3, "trajectories": 1, "skills": 0 },
+            "candidates": [
+                { "project_id": "web-3c4d", "name": "web", "reason": "same_name" },
+                { "project_id": "copia-5e6f", "name": "copia", "reason": "root_commit" },
+            ],
+        }));
+        assert_eq!(
+            render_delete(Lang::En, &report, false),
+            "App web (app-1a2b) has live rows: 3 memories, 1 trajectory, so it is not deleted. To empty it:\n\
+             `clawg projects merge app-1a2b --into web-3c4d --dry-run` joins it into web (web-3c4d): they have the same name\n\
+             `clawg projects merge app-1a2b --into copia-5e6f --dry-run` joins it into copia (copia-5e6f): they share their first commit\n\
+             `clawg projects move --from-project app-1a2b --to-project <ID>` moves its memories to another project\n\
+             `clawg projects delete app-1a2b --with-memories` shows what deleting it with its memories takes"
+        );
+        assert_eq!(
+            render_delete(Lang::Es, &report, false),
+            "App web (app-1a2b) tiene filas vivas: 3 memorias, 1 trayectoria, así que no se borra. Para vaciarlo:\n\
+             `clawg projects merge app-1a2b --into web-3c4d --dry-run` lo une a web (web-3c4d): tienen el mismo nombre\n\
+             `clawg projects merge app-1a2b --into copia-5e6f --dry-run` lo une a copia (copia-5e6f): comparten el primer commit\n\
+             `clawg projects move --from-project app-1a2b --to-project <ID>` mueve sus memorias a otro proyecto\n\
+             `clawg projects delete app-1a2b --with-memories` muestra lo que se lleva borrarlo con sus memorias"
+        );
+        assert!(!delete_succeeded(&report));
+
+        // The daemon's own cause, as it came.
+        let daemon = |status, message: &str, detail: Option<&str>| ClientError::Daemon {
+            status,
+            message: message.into(),
+            details: crate::client::ErrorDetails { detail: detail.map(str::to_string), ..Default::default() },
+        };
+        let deleted = daemon(409, "project_deleted", Some("project app-1a2b is deleted, in delete 4: undo it with `clawg projects delete --undo 4`"));
+        assert_eq!(
+            delete_refused(Lang::En, false, &deleted).as_deref(),
+            Some("could not delete: project app-1a2b is deleted, in delete 4: undo it with `clawg projects delete --undo 4`")
+        );
+        assert_eq!(
+            delete_refused(Lang::Es, true, &deleted).as_deref(),
+            Some("no se pudo deshacer: project app-1a2b is deleted, in delete 4: undo it with `clawg projects delete --undo 4`")
+        );
+        let pending = daemon(409, "saves_pending", Some("2 saves of this project are still being stored; try again in a moment"));
+        assert_eq!(
+            delete_refused(Lang::En, false, &pending).as_deref(),
+            Some("could not delete now: 2 saves of this project are still being stored; try again in a moment")
+        );
+        assert_eq!(
+            delete_refused(Lang::Es, false, &pending).as_deref(),
+            Some("no se pudo borrar ahora: 2 saves of this project are still being stored; try again in a moment; se puede volver a intentar en un momento")
+        );
+        assert_eq!(delete_refused(Lang::En, false, &daemon(500, "boom", None)), None);
+    }
+
+    #[test]
+    fn a_listing_ends_with_the_open_deletes() {
+        let deletes: Vec<ListedDelete> = serde_json::from_value(serde_json::json!([
+            { "delete_id": 4, "project_id": "gone-1a2b", "name": "gone", "with_memories": true, "deleted_at": 5, "rows": 3, "back": false },
+            { "delete_id": 6, "project_id": "empty-3c4d", "name": "empty", "with_memories": false, "deleted_at": 7, "rows": 0, "back": false },
+            { "delete_id": 8, "project_id": "used-5e6f", "name": "used", "with_memories": true, "deleted_at": 9, "rows": 2, "back": true },
+        ]))
+        .unwrap();
+        let projects = listing();
+        let en = render_listing(Lang::En, &projects, &deletes);
+        assert!(en.starts_with(&render_list(Lang::En, &projects)), "{en}");
+        assert!(
+            en.ends_with(
+                "deleted projects:\n\
+                 gone (gone-1a2b), delete 4: `clawg projects delete --undo 4` brings it back; \
+                 `clawg purge --project-delete 4 --yes` removes its 3 deleted rows for good\n\
+                 empty (empty-3c4d), delete 6: `clawg projects delete --undo 6` brings it back\n\
+                 used (used-5e6f), delete 8: `clawg projects delete --undo 8` brings it back; \
+                 `clawg purge --project-delete 8 --yes` removes its 2 deleted rows for good; \
+                 a memory saved since brought the project back into use"
+            ),
+            "{en}"
+        );
+        let es = render_listing(Lang::Es, &projects, &deletes);
+        assert!(
+            es.ends_with(
+                "proyectos borrados:\n\
+                 gone (gone-1a2b), borrado 4: `clawg projects delete --undo 4` lo trae de vuelta; \
+                 `clawg purge --project-delete 4 --yes` saca para siempre sus 3 filas borradas\n\
+                 empty (empty-3c4d), borrado 6: `clawg projects delete --undo 6` lo trae de vuelta\n\
+                 used (used-5e6f), borrado 8: `clawg projects delete --undo 8` lo trae de vuelta; \
+                 `clawg purge --project-delete 8 --yes` saca para siempre sus 2 filas borradas; \
+                 una memoria guardada después hizo que el proyecto volviera a usarse"
+            ),
+            "{es}"
+        );
+        assert_eq!(render_listing(Lang::En, &projects, &[]), render_list(Lang::En, &projects), "no deletes, no closing");
+    }
+
+    #[tokio::test]
+    async fn a_project_is_deleted_and_undone_through_the_daemon() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let (one, two) = (tempfile::tempdir().expect("tempdir"), tempfile::tempdir().expect("tempdir"));
+        let gone = c.register_project(one.path(), &[], false).await.expect("register").project_id;
+        let empty = c.register_project(two.path(), &[], false).await.expect("register").project_id;
+        c.save(crate::client::SaveArgs {
+            content: "a note of the project to delete".into(),
+            agent_id: "agent-a".into(),
+            project_id: Some(gone.clone()),
+            memory_type: Some("semantic_fact".into()),
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        })
+        .await
+        .expect("save");
+        for _ in 0..40 {
+            if !c.list(crate::client::ListArgs::default()).await.expect("list").is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let opts = |args: &[&str]| -> DeleteOpts {
+            let mut argv = vec!["clawg", "projects", "delete"];
+            argv.extend_from_slice(args);
+            match <crate::cli::Cli as clap::Parser>::try_parse_from(&argv).expect("parse").command {
+                crate::cli::Command::Projects { action: crate::cli::ProjectsAction::Delete(opts) } => opts,
+                other => panic!("{other:?}"),
+            }
+        };
+
+        let (text, ok) = delete(Lang::En, &c, &opts(&[&gone])).await.expect("not empty");
+        assert!(!ok && text.contains("has live rows: 1 memory"), "{text}");
+        let (report, ok) = delete(Lang::En, &c, &opts(&[&gone, "--with-memories"])).await.expect("report");
+        assert!(ok, "{report}");
+        let confirm = report.lines().last().and_then(|l| l.split("--confirm ").nth(1)).expect("the exact command").trim_end_matches('`');
+        let (stale, ok) = delete(Lang::En, &c, &opts(&[&gone, "--with-memories", "--confirm", "00000000"])).await.expect("stale");
+        assert!(!ok && stale.starts_with("the project changed since that report"), "{stale}");
+        let (done, ok) = delete(Lang::En, &c, &opts(&[&gone, "--with-memories", "--confirm", confirm])).await.expect("delete");
+        assert!(ok && done.starts_with(&format!("deleted project ")) && done.contains("with its 1 memory as delete 1"), "{done}");
+        let (emptied, ok) = delete(Lang::En, &c, &opts(&[&empty])).await.expect("empty");
+        assert!(ok && emptied.contains("as delete 2;"), "{emptied}");
+
+        let listed = list(Lang::En, &c).await.expect("listing");
+        assert!(listed.contains("delete 1: `clawg projects delete --undo 1` brings it back"), "{listed}");
+        assert!(listed.contains("delete 2: `clawg projects delete --undo 2` brings it back"), "{listed}");
+
+        let refused = delete(Lang::En, &c, &opts(&[&gone])).await.expect_err("already deleted");
+        let said = delete_refused(Lang::En, false, &refused).expect("a refusal");
+        assert!(said.starts_with("could not delete: project ") && said.contains("--undo 1"), "{said}");
+        let (dry, ok) = delete(Lang::En, &c, &opts(&["--undo", "1", "--dry-run"])).await.expect("dry run");
+        assert!(ok && dry.starts_with("would undo delete 1: 1 memory would be back in"), "{dry}");
+        let (undone, ok) = delete(Lang::En, &c, &opts(&["--undo", "1"])).await.expect("undo");
+        assert!(ok && undone.starts_with("undid delete 1: 1 memory is back in"), "{undone}");
+        let (again, _) = (delete_refused(Lang::En, true, &delete(Lang::En, &c, &opts(&["--undo", "1"])).await.expect_err("twice")), ());
+        assert!(again.is_some_and(|s| s.starts_with("could not undo: ")));
     }
 }

@@ -440,6 +440,23 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
+        Command::Projects { action: ProjectsAction::Delete(opts) } => {
+            let profile = opts.profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let undo = opts.undo.is_some();
+            let (said, done) = projects::delete(lang, &client, &opts)
+                .await
+                .map_err(|e| projects::delete_refused(lang, undo, &e).unwrap_or_else(|| unavailable(e)))?;
+            println!("{said}");
+            Ok(if done { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+        }
+
         Command::Projects { action: ProjectsAction::KeepApart { project_id, other_id, profile } } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;

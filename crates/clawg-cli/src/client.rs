@@ -24,7 +24,8 @@ use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::portability::{ImportReport, UndoReport};
 use clawg_core::memory::merge::MergeReport;
-use clawg_core::memory::registry::{KeptApart, ListedProject, Project};
+use clawg_core::memory::project_delete::DeleteReport;
+use clawg_core::memory::registry::{KeptApart, ListedDelete, ListedProject, Project};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
@@ -666,6 +667,32 @@ pub struct MergeRequest {
     pub undo: Option<i64>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
+}
+
+/// A delete as `POST /v1/projects/delete` takes it: a project, with or
+/// without its rows and the code of the report that showed them, or a delete
+/// to undo. Unset fields are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DeleteRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub with_memories: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+}
+
+/// The answer of `GET /v1/projects`.
+#[derive(Debug, Deserialize)]
+pub struct ProjectListing {
+    pub projects: Vec<ListedProject>,
+    /// The open deletes, which a daemon from before deleting does not send.
+    #[serde(default)]
+    pub deletes: Vec<ListedDelete>,
 }
 
 /// A batch move as `POST /v1/memories/move` takes it: a selection and one
@@ -1389,13 +1416,9 @@ impl DaemonClient {
 
     /// Every project, with its folders, remotes, memories and the
     /// suggestions about it nobody answered.
-    pub async fn list_projects(&self) -> Result<Vec<ListedProject>, ClientError> {
-        #[derive(Deserialize)]
-        struct Body {
-            projects: Vec<ListedProject>,
-        }
+    pub async fn list_projects(&self) -> Result<ProjectListing, ClientError> {
         let answer = self.send(Call::new(reqwest::Method::GET, "/v1/projects")).await?;
-        Ok(read_response::<Body>(answer)?.projects)
+        read_response(answer)
     }
 
     /// Names project `id` and marks it reviewed.
@@ -1408,6 +1431,12 @@ impl DaemonClient {
     /// Merges one project into another, or undoes a merge.
     pub async fn merge_projects(&self, request: &MergeRequest) -> Result<MergeReport, ClientError> {
         let call = Call::new(reqwest::Method::POST, "/v1/projects/merge").json(request)?;
+        read_response(self.send(call).await?)
+    }
+
+    /// Deletes a project, reports what deleting it would take, or undoes a delete.
+    pub async fn delete_projects(&self, request: &DeleteRequest) -> Result<DeleteReport, ClientError> {
+        let call = Call::new(reqwest::Method::POST, "/v1/projects/delete").json(request)?;
         read_response(self.send(call).await?)
     }
 

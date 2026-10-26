@@ -11,7 +11,7 @@ use clawg_core::memory::sharing;
 use clawg_core::paths::{Profile, ProfileError};
 use clawg_core::preferences::Lang;
 
-use crate::client::{MergeRequest, MoveRequest};
+use crate::client::{DeleteRequest, MergeRequest, MoveRequest};
 
 /// `clawg` — local-first memory for coding agents.
 #[derive(Debug, Parser)]
@@ -401,6 +401,12 @@ pub enum ProjectsAction {
     /// listing while its id still leads to TARGET. `--undo N` takes merge N
     /// back. A merge waits for the saves of both projects still being stored.
     Merge(MergeOpts),
+    /// Delete a project through the running daemon. An empty project is
+    /// deleted at once. One with live rows is refused, with the ways to empty
+    /// it; `--with-memories` reports what deleting it with them takes and a
+    /// code, and `--with-memories --confirm CODE` deletes it. `--undo N`
+    /// takes delete N back.
+    Delete(DeleteOpts),
     /// Answer that two projects are not one: no suggestion between them is
     /// made again, and both are marked reviewed.
     KeepApart {
@@ -437,6 +443,42 @@ pub struct MergeOpts {
 impl MergeOpts {
     pub fn request(&self) -> MergeRequest {
         MergeRequest { source: self.source.clone(), target: self.into.clone(), undo: self.undo, dry_run: self.dry_run }
+    }
+}
+
+/// What `clawg projects delete` deletes, or the delete it undoes: a project,
+/// or `--undo`.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[command(group(clap::ArgGroup::new("delete").args(["project_id", "undo"]).required(true)))]
+pub struct DeleteOpts {
+    /// The project to delete, by id, as `clawg projects list` shows it.
+    pub project_id: Option<String>,
+    /// Delete it with its memories: without `--confirm`, report what that
+    /// takes and the code to confirm it with.
+    #[arg(long, requires = "project_id")]
+    pub with_memories: bool,
+    /// The code of the report, to confirm the delete with its memories.
+    #[arg(long, value_name = "CODE", requires = "with_memories")]
+    pub confirm: Option<String>,
+    /// Take delete N back instead, by the number the delete printed.
+    #[arg(long, value_name = "N", conflicts_with_all = ["project_id", "with_memories", "confirm"])]
+    pub undo: Option<i64>,
+    /// Say what the undo would do, and change nothing.
+    #[arg(long, conflicts_with_all = ["project_id", "with_memories", "confirm"])]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl DeleteOpts {
+    pub fn request(&self) -> DeleteRequest {
+        DeleteRequest {
+            project_id: self.project_id.clone(),
+            with_memories: self.with_memories,
+            confirm: self.confirm.clone(),
+            undo: self.undo,
+            dry_run: self.dry_run,
+        }
     }
 }
 
@@ -2032,5 +2074,56 @@ mod tests {
     fn resolve_absent_flag_matches_from_env() {
         let arg = ProfileArg { profile: None };
         assert_eq!(arg.resolve().ok(), Profile::from_env().ok());
+    }
+
+    #[test]
+    fn projects_delete_parses() {
+        let delete = |args: &[&str]| {
+            let mut argv = vec!["clawg", "projects", "delete"];
+            argv.extend_from_slice(args);
+            match parse(&argv).command {
+                Command::Projects { action: ProjectsAction::Delete(opts) } => opts,
+                other => panic!("not a delete: {other:?}"),
+            }
+        };
+        assert_eq!(
+            delete(&["app-1a2b"]).request(),
+            DeleteRequest { project_id: Some("app-1a2b".into()), ..DeleteRequest::default() }
+        );
+        assert_eq!(
+            delete(&["app-1a2b", "--with-memories"]).request(),
+            DeleteRequest { project_id: Some("app-1a2b".into()), with_memories: true, ..DeleteRequest::default() }
+        );
+        let confirmed = delete(&["app-1a2b", "--with-memories", "--confirm", "1a2b3c4d", "--profile", "dev"]);
+        assert_eq!(
+            confirmed.request(),
+            DeleteRequest {
+                project_id: Some("app-1a2b".into()),
+                with_memories: true,
+                confirm: Some("1a2b3c4d".into()),
+                ..DeleteRequest::default()
+            }
+        );
+        assert_eq!(confirmed.profile.profile.as_deref(), Some("dev"));
+        assert_eq!(delete(&["--undo", "3"]).request(), DeleteRequest { undo: Some(3), ..DeleteRequest::default() });
+        assert_eq!(
+            delete(&["--undo", "3", "--dry-run"]).request(),
+            DeleteRequest { undo: Some(3), dry_run: true, ..DeleteRequest::default() }
+        );
+        let refused: [&[&str]; 8] = [
+            &[],
+            &["app-1a2b", "--confirm", "1a2b3c4d"],
+            &["--undo", "3", "app-1a2b"],
+            &["--undo", "3", "--with-memories"],
+            &["--undo", "3", "--confirm", "1a2b3c4d"],
+            &["app-1a2b", "--dry-run"],
+            &["--with-memories"],
+            &["--undo", "three"],
+        ];
+        for args in refused {
+            let mut argv = vec!["clawg", "projects", "delete"];
+            argv.extend_from_slice(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
     }
 }
