@@ -270,21 +270,7 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
             listed[i].remotes.push(remote.clone());
         }
     }
-    // A suggestion about a tombstone is about the project it went into: one
-    // whose sides became one project, or the same pair as an earlier one, is
-    // not listed again.
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    for (a, b, reason, created_at) in &stored.suggestions {
-        let (a, b) = (live(a), live(b));
-        // Until the deleted side comes back, nobody is asked about it.
-        if stored.deleted.contains(&a) || stored.deleted.contains(&b) {
-            continue;
-        }
-        let pair = if a < b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
-        if a == b || pairs.contains(&pair) {
-            continue;
-        }
-        pairs.push(pair);
+    for (a, b, reason, created_at) in pending_pairs(&stored.suggestions, &stored.merged_into, &stored.deleted) {
         for (this, other) in [(&a, &b), (&b, &a)] {
             if let Some(&i) = at.get(this) {
                 let other_name = at.get(other).map(|&o| listed[o].project.name.clone());
@@ -292,7 +278,7 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
                     other_id: other.clone(),
                     other_name,
                     reason: reason.clone(),
-                    created_at: *created_at,
+                    created_at,
                 });
             }
         }
@@ -312,6 +298,93 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
     }
     listed.sort_by_cached_key(|l| (l.project.name.to_lowercase(), l.project.id.clone()));
     listed
+}
+
+/// The pending `suggestions` (project, other, reason, date, oldest first) as
+/// someone is asked them: each side the live project it leads to, one per
+/// pair, none whose sides became one project, and none with a deleted side
+/// until that side comes back.
+fn pending_pairs(
+    suggestions: &[(String, String, String, i64)],
+    merged_into: &HashMap<String, (String, Option<i64>)>,
+    deleted: &HashSet<String>,
+) -> Vec<(String, String, String, i64)> {
+    let mut pairs: Vec<(String, String, String, i64)> = Vec::new();
+    for (a, b, reason, created_at) in suggestions {
+        let (a, b) = (follow(merged_into, a), follow(merged_into, b));
+        if a == b || deleted.contains(&a) || deleted.contains(&b) {
+            continue;
+        }
+        if !pairs.iter().any(|(x, y, ..)| (*x == a && *y == b) || (*x == b && *y == a)) {
+            pairs.push((a, b, reason.clone(), *created_at));
+        }
+    }
+    pairs
+}
+
+/// The suggestions nobody answered about project `id`, read as
+/// [`list_projects`] lists them, each with the other project.
+pub async fn pending_suggestions(store: &MemoryStore, id: &str) -> Result<Vec<ListedSuggestion>, MemoryError> {
+    let id = id.to_string();
+    store.conn.call(move |c| pending_suggestions_in(c, &id)).await.map_err(MemoryError::Connection)
+}
+
+fn pending_suggestions_in(c: &Connection, id: &str) -> rusqlite::Result<Vec<ListedSuggestion>> {
+    let mut stmt = c.prepare("SELECT id, name, merged_into, merged_at, deleted_at IS NOT NULL FROM project")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, String, Option<String>, Option<i64>, bool)>>>()?;
+    let names: HashMap<&str, &str> = rows.iter().map(|(id, name, ..)| (id.as_str(), name.as_str())).collect();
+    let merged_into = rows.iter().filter_map(|(id, _, into, at, _)| Some((id.clone(), (into.clone()?, *at)))).collect();
+    let deleted = rows.iter().filter(|(.., deleted)| *deleted).map(|(id, ..)| id.clone()).collect();
+    let mut stmt = c.prepare(
+        "SELECT project_id, other_id, reason, created_at FROM project_suggestion WHERE answer IS NULL ORDER BY created_at, rowid",
+    )?;
+    let suggestions = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut found = Vec::new();
+    for (a, b, reason, created_at) in pending_pairs(&suggestions, &merged_into, &deleted) {
+        let other = if a == id { b } else if b == id { a } else { continue };
+        let other_name = names.get(other.as_str()).map(|n| n.to_string());
+        found.push(ListedSuggestion { other_id: other, other_name, reason, created_at });
+    }
+    Ok(found)
+}
+
+/// The suggestion nobody answered between projects `a` and `b`, read through
+/// the merges since it was made, after checking both as [`keep_apart`] does:
+/// each must be a live project, not a tombstone and not deleted.
+pub async fn suggestion_between(store: &MemoryStore, a: &str, b: &str) -> Result<Option<ListedSuggestion>, KeepApartError> {
+    let (a, b) = (a.to_string(), b.to_string());
+    store
+        .conn
+        .call(move |c| {
+            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::Sqlite(e));
+            for id in [&a, &b] {
+                let known: bool =
+                    c.query_row("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1)", [id], |r| r.get(0)).map_err(sql)?;
+                if !known {
+                    return Err(KeepApartError::NotFound(id.clone()));
+                }
+                let into = canonical_in(c, id).map_err(sql)?;
+                if into != *id {
+                    return Err(KeepApartError::Merged { id: id.clone(), into });
+                }
+                if let Some(deleted) = deleted_in(c, id).map_err(sql)? {
+                    return Err(KeepApartError::Deleted { id: id.clone(), delete_id: deleted.delete_id });
+                }
+            }
+            if a == b {
+                return Err(KeepApartError::Same(a));
+            }
+            Ok(pending_suggestions_in(c, &a).map_err(sql)?.into_iter().find(|s| s.other_id == b))
+        })
+        .await
+        .map_err(|e| match e {
+            tokio_rusqlite::Error::Error(e) => e,
+            other => KeepApartError::Store(MemoryError::Backend(other.to_string())),
+        })
 }
 
 /// Every delete nobody undid or purged, oldest first, with the project it
@@ -1421,6 +1494,65 @@ mod tests {
         assert!(first.created && id.starts_with("ideas-de-producto-"), "{id}");
         assert_eq!((again.project_id.as_deref(), again.created), (Some(id.as_str()), false));
         assert_eq!(count_projects(&store).await, 1);
+    }
+
+    /// `app` merged into `web`; `api`, `lib` and the deleted `gone` live; the
+    /// suggestions (app, api), (api, web), (web, lib) answered, (gone, web).
+    async fn suggested(store: &MemoryStore) {
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('web-3c4d', 'web', 'root', 0, 1), ('api-5e6f', 'api', 'root', 0, 2), ('lib-7a8b', 'lib', 'root', 0, 3);
+                     INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) \
+                       VALUES ('app-1a2b', 'app', 'root', 0, 1, 'web-3c4d', 9);
+                     INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES ('gone-9f9f', 'gone', 'root', 0, 1, 5);
+                     INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES \
+                       ('app-1a2b', 'api-5e6f', 'root_commit', 3), ('api-5e6f', 'web-3c4d', 'folder_name', 4), \
+                       ('gone-9f9f', 'web-3c4d', 'root_commit', 5);
+                     INSERT INTO project_suggestion (project_id, other_id, reason, created_at, answer, answered_at) \
+                       VALUES ('web-3c4d', 'lib-7a8b', 'remote_changed', 6, 'apart', 7);",
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_pending_suggestions_of_a_project_are_read_through_merges() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        suggested(&store).await;
+
+        let of = |id: &'static str| {
+            let store = &store;
+            async move {
+                pending_suggestions(store, id).await.unwrap().into_iter().map(|s| (s.other_id, s.other_name, s.reason)).collect::<Vec<_>>()
+            }
+        };
+
+        let api = ("api-5e6f".to_string(), Some("api".to_string()), "root_commit".to_string());
+        assert_eq!(of("web-3c4d").await, vec![api], "(app, api) is (web, api), once; a deleted side and an answer are none");
+        assert_eq!(of("api-5e6f").await, vec![("web-3c4d".to_string(), Some("web".to_string()), "root_commit".to_string())]);
+        assert!(of("lib-7a8b").await.is_empty() && of("gone-9f9f").await.is_empty());
+        let listed = list_projects(&store, Arc::new(FakeGround::default())).await.unwrap();
+        let web = listed.iter().find(|l| l.project.id == "web-3c4d").unwrap();
+        assert_eq!(web.suggestions, pending_suggestions(&store, "web-3c4d").await.unwrap(), "as the listing reads them");
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_is_answered_only_when_pending() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        suggested(&store).await;
+
+        let found = suggestion_between(&store, "api-5e6f", "web-3c4d").await.unwrap();
+        assert_eq!(found.map(|s| s.other_id), Some("web-3c4d".to_string()));
+        assert_eq!(suggestion_between(&store, "web-3c4d", "lib-7a8b").await.unwrap(), None, "an answered pair is not pending");
+        let merged = suggestion_between(&store, "app-1a2b", "api-5e6f").await;
+        assert!(matches!(&merged, Err(KeepApartError::Merged { into, .. }) if into == "web-3c4d"), "{merged:?}");
+        let deleted = suggestion_between(&store, "web-3c4d", "gone-9f9f").await;
+        assert!(matches!(&deleted, Err(KeepApartError::Deleted { .. })), "{deleted:?}");
+        assert!(matches!(suggestion_between(&store, "web-3c4d", "nobody-0000").await, Err(KeepApartError::NotFound(_))));
     }
 
     #[tokio::test]
