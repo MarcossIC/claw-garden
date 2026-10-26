@@ -10,6 +10,7 @@ Fuente de verdad del comportamiento actual con secretos: el detector (formatos c
 - [secret-coverage](../../changes/archive/2026-10-19-secret-coverage/proposal.md), archivado el 2026-10-19 (R1: `credential`, `huggingface_token`, `slack_webhook` y las formas nuevas de Slack, Stripe y PGP; R4: los `reason` de los veredictos; R5: el outbox del propio save, la cabecera de un save largo y la revival; R6: los `workspace.md`; R7, R8 y R9 nuevos).
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (R6: un `workspace.md` guarda el texto en su forma cruda o en la copiada).
 - [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23 (CL3: la salida y las negativas de `secrets` y `purge` en el idioma del comando).
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 2b, que sale en 0.64.0 (PL28: `clawg purge --project-delete N`, que saca todo el conjunto de un borrado de proyecto).
 
 ## Definiciones
 
@@ -280,6 +281,24 @@ MUST NOT hacer snapshot previo: sería una copia más de lo que se quiere sacar.
 - THEN la revisión del medio vuelve a estar `active`, la primera la sigue apuntando, la del veredicto sigue `superseded`, y `Purged` nombra la revivida y la escondida
 
 **Tests:** `purging_a_live_row_leaves_no_trace_of_its_text`, `purging_a_deleted_row_leaves_no_trace_of_its_text`, `purging_releases_the_rows_that_disputed_it`, `purge_refuses_while_the_daemon_holds_the_store`, `purge_refuses_an_unknown_id_untouched`, `purge_refuses_a_store_with_pending_migrations_untouched`, `purge_removes_the_text_from_the_outbox`, `purge_keeps_other_agents_and_longer_saves_in_the_outbox`, `purging_the_first_piece_empties_the_head_of_its_save`, `purging_the_current_revision_brings_the_previous_one_back` y `purging_keeps_the_links_that_name_the_row_as_a_source` (`crates/clawg-core/src/memory/secrets.rs`); `purge_needs_yes_before_it_opens_anything`, `a_purge_refused_by_the_daemon_says_to_stop_it` y `the_purge_report_names_what_came_back_and_what_went` (`crates/clawg-cli/src/secrets.rs`) y `purge_takes_an_id_a_yes_and_a_profile` (`cli.rs`).
+
+### R5b. `clawg purge --project-delete N` saca un borrado de proyecto para siempre
+
+`clawg purge --project-delete N --yes [--profile P]` (`Command::Purge` con `project_delete`, `crates/clawg-cli/src/cli.rs`; `purge_delete`, `crates/clawg-core/src/memory/secrets.rs`) es la otra forma de `clawg purge`: `<ID>` y `--project-delete` se excluyen y uno es obligatorio, y los dos piden `--yes`. Sin él MUST negarse antes de abrir nada, con un mensaje que dice que no hay vuelta atrás (`confirm_delete`). MUST seguir las reglas de R5: tomar el lock del store (con el daemon corriendo, fallar diciendo `clawg stop`), exigir un esquema al día, no hacer snapshot y no escribir nada antes de que pasen todos los chequeos. MUST rechazar, sin escribir, un borrado que no existe (`PurgeError::UnknownDelete`), uno deshecho (`DeleteUndone`) y uno ya purgado (`DeletePurged`).
+
+En una transacción MUST sacar para siempre cada fila de `project_delete_row` del borrado que siga borrada, esté en el proyecto que esté y sea cual sea su `deleted_at` anterior, en las tres tablas: la fila y su vector y, en `memory`, lo mismo que R5 saca de una fila borrada (`remove_in`, que `purge` comparte: la cabecera de los pedazos siguientes si es la primera pieza, sus enlaces de `memory_derivation` en los que es conclusión, sus pares de `memory_conflict` y las filas del outbox de su agente con su texto). Una fila del borrado que está viva (se restauró después) MUST quedar, y la salida la nombra; una que ya no existe se salta. Después MUST sacar otra vez del índice de docs lo que haya bajo las carpetas de `project_delete_folder` que siguen con `index_docs` en 0, porque un refresco en curso pudo escribir después del borrado, y dejar al borrado con `purged_at`. El proyecto queda en `project` como está, borrado o vivo.
+
+Al final, una sola vez, MUST compactar los dos índices de texto (`memory_fts` y `project_doc_fts`, que también guarda sus términos hasta un merge), hacer el `VACUUM` y vaciar el WAL (`leave_no_old_copy`).
+
+`PurgedDelete` MUST nombrar cuántas filas sacó de cada tabla, las filas del outbox que sacó (`operation_id`, agente y estado), las filas que quedaron vivas, los backups que todavía tienen alguna de las filas (una sola pasada: cada snapshot se abre una vez y se busca cualquiera de los ids con su texto, o una fila del outbox que se habría borrado; el `pre-delete` entre ellos; uno que no se puede leer se lista también), los `workspace.md` del proyecto, siempre, y los demás que guardan el texto de alguna fila (cada archivo se lee una vez). Ningún backup ni `workspace.md` cambia. La salida (`purge_delete_report`, `crates/clawg-cli/src/secrets.rs`, en los dos idiomas) dice cada grupo en su línea, sólo cuando no está vacío.
+
+#### Escenario: purgar un borrado
+- GIVEN A borrado con sus memorias, con memorias que ya estaban borradas antes, y el daemon parado
+- WHEN se corre `clawg purge --project-delete N --yes`
+- THEN ninguna memoria del conjunto de N está en el store, ni en su índice de texto, ni en el archivo
+- AND la salida nombra el snapshot `pre-delete` y el `workspace.md` de A
+
+**Tests:** `purging_a_delete_leaves_no_trace_of_its_rows`, `purging_a_delete_keeps_a_row_restored_since`, `a_purge_of_a_delete_undone_or_purged_is_refused_untouched` y `purging_a_delete_names_the_backups_and_workspaces_that_hold_its_text` (`crates/clawg-core/src/memory/secrets.rs`); `purge_takes_an_id_or_a_delete` (`cli.rs`); `the_purge_report_of_a_delete_names_what_went` (`crates/clawg-cli/src/secrets.rs`); `a_deleted_project_is_purged_once_the_daemon_stops` (`crates/clawg-cli/tests/binary.rs`).
 
 ### R6. La purga nombra los backups y los `workspace.md` que todavía tienen el texto
 

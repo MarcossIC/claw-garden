@@ -48,6 +48,8 @@ El vector MUST calcularse antes de la transacción, con el embedder vigente y el
 
 **Test:** `restoring_needs_a_deleted_row_in_reach`, `only_memory_rows_are_restored`, `a_live_twin_blocks_the_restore`, `a_restore_finds_another_agents_twin`, `a_row_whose_key_is_live_again_is_not_restored`, `a_row_whose_key_another_agent_holds_is_not_restored`, `a_piece_of_a_keyed_save_is_restored_beside_its_live_siblings`, `a_whole_keyed_save_is_restored_piece_by_piece`, `a_live_row_of_another_save_blocks_the_restore_of_a_piece`, `a_row_holding_a_secret_stays_deleted` y `a_failed_embedding_restores_nothing` en `crates/clawg-core/src/memory/admin.rs`. Ningún test pisa la ventana entre el vector y la transacción: la relectura dentro de la transacción la cubre sólo la lectura del código.
 
+Una fila que se restaura bajo un proyecto borrado ([`specs/project`](../project/spec.md), PL22) lo deja vivo y sin revisar: lo hace el disparador `memory_project_restored` de V29 ([`specs/storage`](../storage/spec.md)), sin código del restore. El borrado del proyecto sigue abierto, con `back`, y sus otras filas borradas siguen borradas. Las negativas de esta sección (gemela, titular de la clave, secreto) son también las del `--undo` de un borrado de proyecto, que las aplica a todas sus filas (PL26).
+
 ## R2. Qué escribe un restore
 
 Un restore aceptado MUST, en una sola transacción, y sólo si la fila sigue borrada, sin gemela y sin titular al abrirla (`admin.rs:668-713`):

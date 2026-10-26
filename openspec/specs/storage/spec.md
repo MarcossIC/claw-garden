@@ -22,7 +22,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24 (sólo V25: IL2, su vuelta atrás e IL3). Que la importación llegue a sus filas por índice está en [`specs/portability`](../portability/spec.md) (IL1 e IL5).
 - [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24 (sólo V26, «El diario de los imports», IU6, y el motivo `pre-undo` en la poda). Qué escribe el diario y cómo se deshace un import está en [`specs/portability`](../portability/spec.md) (IU1 a IU5).
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (sólo «Cada carga dice quién la pidió y cuánto costó», RF4 de esa spec). Las series de memoria con que se lee en uso real están en [`specs/metrics`](../metrics/spec.md) (R6 y R8).
-- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (sólo V27, «Los proyectos y sus carpetas», y su vuelta atrás). Qué hace el registro con las tablas nuevas está en [`specs/project`](../project/spec.md) (PL1 a PL10). Su entrega 2a, en la misma versión: V28, «La lápida y el diario de las uniones», su vuelta atrás y el motivo `pre-merge`; qué hacen una unión y su deshacer está en `specs/project` (PL11 a PL20).
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (sólo V27, «Los proyectos y sus carpetas», y su vuelta atrás). Qué hace el registro con las tablas nuevas está en [`specs/project`](../project/spec.md) (PL1 a PL10). Su entrega 2a, en la misma versión: V28, «La lápida y el diario de las uniones», su vuelta atrás y el motivo `pre-merge`; qué hacen una unión y su deshacer está en `specs/project` (PL11 a PL20). Su entrega 2b, en la misma versión: V29, «La marca de borrado y su diario», su vuelta atrás y el motivo `pre-delete`; qué hacen borrar un proyecto y su deshacer está en `specs/project` (PL21 a PL31).
 
 ## Definiciones
 
@@ -806,7 +806,7 @@ Un snapshot MUST incluir el outbox, y con él el texto enmascarado de los saves 
 
 ### Retención
 
-Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:290`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`, `pre-import`, `pre-move`, `pre-rekey`, `pre-undo`, `pre-merge`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:297`); el borrado es best-effort.
+Después de cada snapshot automático, el directorio de backups MUST conservar los 5 automáticos más nuevos (`AUTO_KEEP`, `backup.rs:290`) y, además, el más nuevo de cada motivo automático (`pre-migration`, `pre-restore`, `pre-reembed`, `pre-import`, `pre-move`, `pre-rekey`, `pre-undo`, `pre-merge`, `pre-delete`), de modo que una racha de restores o re-embeds no saque el `pre-migration` que es la vuelta atrás de una actualización; los demás automáticos se borran. Los `manual` MUST NOT borrarse nunca, y un archivo con otro nombre MUST NOT tocarse. La elección es pura (`to_prune`, `backup.rs:297`); el borrado es best-effort.
 
 #### Escenario
 - GIVEN 7 snapshots automáticos, 2 manuales y un `notas.txt`
@@ -1049,6 +1049,32 @@ MUST NOT cambiar ninguna fila. Las filas de `memory` de una unión van en `memor
 #### Vuelta atrás de V28
 
 Un binario anterior a V28 MUST NOT abrir una base en V28: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`. Para quitar V28 a mano conservando lo guardado después, primero hay que deshacer cada unión con `clawg projects merge --undo N`: si no, cada lápida pasa a ser un proyecto vivo y vacío, sus filas siguen en el destino y un puente con su id escribe bajo ella. Después, con un `sqlite3` 3.35 o más nuevo y el daemon parado: `DROP TABLE project_merge_change; DROP TABLE project_merge; DROP INDEX idx_project_merged_into; ALTER TABLE project DROP COLUMN merged_at; ALTER TABLE project DROP COLUMN merged_into; DELETE FROM refinery_schema_history WHERE version = 28;`. Una unión sola se revierte con su `--undo` o con su snapshot `pre-merge`.
+
+## La marca de borrado y su diario
+
+### PL21. V29
+
+V29 (`crates/clawg-core/migrations/V29__project_delete.sql`) MUST:
+
+- agregar a `project` `deleted_at`, NULL por defecto;
+- crear `project_delete` (`delete_id` clave primaria, `project_id`, `with_memories`, `code`, `snapshot`, `deleted_at`, `undone_at`, `purged_at`), una fila por borrado, con el índice `idx_project_delete_project`;
+- crear `project_delete_row` (`delete_id`, `tbl`, `row_id`, `deleted_at`), con el índice `idx_project_delete_row` por `delete_id`: cada fila del conjunto de un borrado con el `deleted_at` que tenía antes (NULL si la borró el borrado). Las columnas llevan tipos, a diferencia de `project_merge_change`, para que el `--undo` y la purga busquen por id con un índice y sin un `CAST`;
+- crear `project_delete_folder` (`delete_id`, `root_id`), con el índice `idx_project_delete_folder`: las carpetas a las que el borrado les bajó `index_docs`;
+- reemplazar los disparadores `memory_project_ai` y `memory_project_au`, que conservan su `INSERT … WHERE NOT EXISTS` de V27 y suman el `UPDATE project SET deleted_at = NULL, reviewed = 0` del proyecto borrado que recibe una fila viva, y crear `memory_project_restored`, `AFTER UPDATE OF deleted_at ON memory` cuando una fila con `project_id` pasa de borrada a viva (V8 no tiene un disparador para esa transición, y el `UPDATE OF project_id` de V27 no la ve).
+
+La fila de un proyecto borrado no se borra: sus filas borradas siguen bajo su id, `undelete` restaura en él sin que ningún disparador lo adopte, y el `--undo` necesita su nombre, su origen y su fecha. `project` no lleva `delete_id`: el borrado abierto de un proyecto se busca por el índice de `project_delete.project_id`, y un proyecto puede borrarse, volver al usarse y borrarse otra vez. MUST NOT cambiar ninguna fila: un store en V28 abre con todos sus proyectos sin `deleted_at` y los tres diarios vacíos, con una copia `pre-migration`. Su checksum MUST quedar fijado con los demás. Un borrado de proyecto con sus filas escribe antes el snapshot `pre-delete` (`Reason::PreDelete`) y su deshacer, `pre-undo`; la poda conserva el más nuevo de cada uno (`Reason::ALL`).
+
+#### Escenario: un store anterior
+- GIVEN un store en V28 con proyectos vivos, una lápida, carpetas, remotos y filas vivas y borradas en las tres tablas
+- WHEN se abre con este clawg
+- THEN hay una copia `pre-migration`, ninguna fila cambió y ningún proyecto tiene `deleted_at`
+- AND un save bajo un id que `project` no conoce lo adopta como antes
+
+**Tests:** `a_database_from_the_previous_version_opens_with_no_project_deleted` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(28))`); la fila 29 de `published_migration_checksums_are_pinned` (`migrations.rs`); los de los disparadores en `project_delete.rs`.
+
+#### Vuelta atrás de V29
+
+Un binario anterior a V29 MUST NOT abrir una base en V29: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`. Para quitar V29 a mano conservando lo guardado después, primero hay que deshacer cada borrado abierto con `clawg projects delete --undo N`: si no, un proyecto borrado vuelve a listarse, con sus filas borradas y su `index_docs` en 0; y un borrado ya purgado no se deshace, así que su proyecto vuelve a listarse vacío. Después, con un `sqlite3` 3.35 o más nuevo y el daemon parado: `DROP TRIGGER memory_project_restored; DROP TRIGGER memory_project_ai; DROP TRIGGER memory_project_au;` y volver a crear los dos disparadores de V27 con su texto (`V27__project_registry.sql`), `DROP TABLE project_delete_folder; DROP TABLE project_delete_row; DROP TABLE project_delete; ALTER TABLE project DROP COLUMN deleted_at; DELETE FROM refinery_schema_history WHERE version = 29;`. Un borrado solo se revierte con su `--undo` o con su snapshot `pre-delete`; una purga, sólo con un snapshot, que guarda justo el texto que se quería sacar.
 
 ## El idioma de cada fila
 
