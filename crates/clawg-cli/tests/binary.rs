@@ -1055,7 +1055,7 @@ async fn a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemo
     assert_eq!(init["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"), "{init}");
 
     let tools = bridge.request(2, "tools/list", json!({}));
-    assert_eq!(tool_names(&tools).len(), 12, "{tools}");
+    assert_eq!(tool_names(&tools).len(), 13, "{tools}");
 
     let status = bridge.call(3, "memory_status", json!({}));
     assert!(!tool_failed(&status), "{status}");
@@ -1079,7 +1079,7 @@ async fn a_bridge_on_real_stdio_serves_a_host_that_never_initializes() {
     assert!(versions.contains("2026-07-28") && versions.contains("2025-06-18"), "{discover}");
 
     let tools = bridge.request(2, "tools/list", modern_params());
-    assert_eq!(tool_names(&tools).len(), 12, "{tools}");
+    assert_eq!(tool_names(&tools).len(), 13, "{tools}");
 
     let mut params = modern_params();
     params["name"] = json!("memory_status");

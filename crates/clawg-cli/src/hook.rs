@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::cli::HookEvent;
 use crate::client::{Context, DaemonClient, Health, ListArgs};
-use crate::mcp::tools::{review_nudge, synthesis_nudge};
+use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
 
 /// The most a hook takes, from reading stdin to the answer: under the five
 /// seconds a hook is configured with, so the client never cancels one.
@@ -134,6 +134,7 @@ pub fn session_start_text(
     }
     parts.extend(synthesis_nudge(lang, context.unreviewed));
     parts.extend(review_nudge(lang, context.conclusions_to_review));
+    parts.extend(suggestion_note(lang, &context.suggestions));
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
@@ -350,6 +351,38 @@ mod tests {
     }
 
     #[test]
+    fn session_start_names_the_pending_suggestions() {
+        let suggestion = clawg_core::memory::registry::ListedSuggestion {
+            other_id: "notas-1a2b".into(),
+            other_name: Some("notas".into()),
+            reason: "folder_name".into(),
+            created_at: 1,
+        };
+        let pending = Context { suggestions: vec![suggestion], ..context("ctx", 0) };
+
+        let text = session_start_text(&pending, None, false, None).unwrap();
+        assert!(
+            text.ends_with(
+                "This project may be the same as notas (notas-1a2b). Ask the user, and record their answer with \
+                 `answer_suggestion`; `recall_context` says why."
+            ),
+            "{text}"
+        );
+        let text = session_start_text(&pending, None, false, Some(Lang::Es)).unwrap();
+        assert!(
+            text.ends_with(
+                "Este proyecto puede ser el mismo que notas (notas-1a2b). Pregúntale a la persona y registra su respuesta \
+                 con `answer_suggestion`; `recall_context` dice por qué."
+            ),
+            "{text}"
+        );
+        let many = Context { suggestions: vec![pending.suggestions[0].clone(); 5], ..context("ctx", 0) };
+        assert!(session_start_text(&many, None, false, None).unwrap().contains("notas (notas-1a2b), notas (notas-1a2b), 3 more."));
+        let alone = Context { suggestions: pending.suggestions.clone(), ..context("", 0) };
+        assert!(session_start_text(&alone, None, false, None).is_some(), "the suggestion comes on its own");
+    }
+
+    #[test]
     fn an_empty_context_prints_nothing() {
         assert_eq!(session_start_text(&context(" \n", 0), Some(&health("ready")), false, None), None);
     }
@@ -357,9 +390,16 @@ mod tests {
     #[test]
     fn what_the_hook_adds_stays_small() {
         let failed = Health { embedder_error: Some("e".repeat(200)), ..health("failed") };
-        let added = session_start_text(&context("x", 10_000), Some(&failed), true, Some(Lang::Es)).unwrap().len() - "x".len();
-        assert!(added < 1_000, "{added} bytes added");
-        assert!(SESSION_BUDGET + 1_000 <= 10_000, "the whole stays under what the client injects");
+        let suggestion = clawg_core::memory::registry::ListedSuggestion {
+            other_id: format!("{}-1a2b", "n".repeat(40)),
+            other_name: Some("n".repeat(80)),
+            reason: "folder_name".into(),
+            created_at: 1,
+        };
+        let full = Context { suggestions: vec![suggestion; 9], ..context("x", 10_000) };
+        let added = session_start_text(&full, Some(&failed), true, Some(Lang::Es)).unwrap().len() - "x".len();
+        assert!(added < 1_500, "{added} bytes added");
+        assert!(SESSION_BUDGET + 1_500 <= 10_000, "the whole stays under what the client injects");
     }
 
     const SPANISH_LINE: &str = "clawg: el idioma de la persona es el español. Respóndele en español salvo que escriba \

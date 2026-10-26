@@ -186,6 +186,11 @@ El diseño de la entrega 2a (2026-10-25) cambió tres puntos de esta sección:
 - **Un proyecto borrado en el argumento `project`.** Con su id, un save lo revive ([D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)), y falta decidir si el argumento nuevo hace lo mismo. Con su nombre, que quedó libre, se puede crear un proyecto nuevo con ese nombre o mostrar el borrado como candidato, para que el agente pregunte.
 - **La clave de `project_remote` para un subproyecto.** D14 la pasa a remoto más subcarpeta, pero `remote` es la clave primaria de la tabla (`V24__project_remote.sql:9`), y cambiar una clave primaria en SQLite obliga a reconstruir la tabla. Eso choca con la migración aditiva que promete [«Datos guardados»](#datos-guardados-migración-y-vuelta-atrás): hay que reconstruir `project_remote` o guardar la subcarpeta aparte.
 
+**Partida el 2026-10-26** en dos, como la 2, porque tienen riesgos distintos:
+
+- **3a. Proyectos sin carpeta y el agente:** el argumento `project`, crear por nombre con búsqueda de parecidos, los nombres en `--to-project` y `PATCH`, `projects create|locate`, las sugerencias en `session-start` y `recall_context` con su respuesta del agente, y la sugerencia por nombre de una carpeta movida. No toca el esquema. Su [diseño](design.md#entrega-3a-proyectos-sin-carpeta-y-el-agente) (D38 a D49) cierra las cuatro preguntas abiertas de arriba, con lo que eligió la persona: el agente responde con `answer_suggestion`, que pide `user_answered` para unir y para separar (D45); el id de un proyecto borrado lo hace volver con un save, y su nombre lo muestra como candidato (D42); `new_project` crea aparte aunque haya parecidos (D41); y una búsqueda sin proyecto sigue sin alcance (D44).
+- **3b. Los subproyectos de un monorepo:** la carpeta registrada más profunda, el camino crudo del cliente y la clave de `project_remote`, con su migración (D49).
+
 ### 4. Exportar e importar
 
 **Qué trae.**

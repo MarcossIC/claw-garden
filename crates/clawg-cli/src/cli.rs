@@ -391,6 +391,30 @@ pub enum ProjectsAction {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Create a project without a folder, by name, through the running
+    /// daemon. A name a live project has leads to that project; one close to
+    /// other projects' names is refused with them, unless `--new`.
+    Create {
+        /// Its name, at most 80 characters.
+        name: String,
+        /// Create it even when other projects have a close name.
+        #[arg(long)]
+        new: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Make the folder PATH is in lead to PROJECT, by id or name, through the
+    /// running daemon: the project the folder had, when this is its only
+    /// folder, is merged into PROJECT, and `clawg projects merge --undo N`
+    /// takes that back.
+    Locate {
+        /// The project, by id or by name.
+        project: String,
+        /// A directory of the folder; its root is found as for a bridge.
+        path: PathBuf,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Index the docs and code of the project PATH is in, so `search_project`
     /// can search it from a bridge started anywhere.
     Add {
@@ -1579,6 +1603,30 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["clawg", "projects", "rename", "app-1a2b"]).is_err(), "the name is required");
         assert!(Cli::try_parse_from(["clawg", "projects", "list", "extra"]).is_err(), "list takes no argument");
+    }
+
+    #[test]
+    fn projects_create_and_locate_parse() {
+        assert_eq!(
+            parse(&["clawg", "projects", "create", "ideas de producto"]).command,
+            Command::Projects {
+                action: ProjectsAction::Create { name: "ideas de producto".into(), new: false, profile: ProfileArg::default() }
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "projects", "create", "Mi App", "--new", "--profile", "dev"]).command,
+            Command::Projects {
+                action: ProjectsAction::Create { name: "Mi App".into(), new: true, profile: ProfileArg { profile: Some("dev".into()) } }
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "projects", "locate", "ideas", "/work/notes"]).command,
+            Command::Projects {
+                action: ProjectsAction::Locate { project: "ideas".into(), path: "/work/notes".into(), profile: ProfileArg::default() }
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "projects", "create"]).is_err(), "the name is required");
+        assert!(Cli::try_parse_from(["clawg", "projects", "locate", "ideas"]).is_err(), "the path is required");
     }
 
     #[test]

@@ -45,12 +45,13 @@ use clawg_core::memory::language::count_saves_in;
 use clawg_core::memory::portability::timing::{Step, Timing};
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
 use clawg_core::memory::identity::{Disk, Ground};
-use clawg_core::memory::project::{register_project, RegisterError, Registration};
+use clawg_core::memory::project::{register_project, RegisterError, RegisterOutcome, Registration};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
 use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
 use clawg_core::memory::registry::{
-    keep_apart, list_deletes, list_projects, rename_project, KeepApartError, KeptApart, ListedDelete, ListedProject, Project,
-    RenameError,
+    find_project, keep_apart, list_deletes, list_projects, pending_suggestions, rename_project, resolve_project, suggestion_between,
+    Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, Named, Project, RenameError,
+    Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
 };
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
@@ -722,6 +723,9 @@ pub struct ContextBody {
     pub retrieval: RetrievalState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub other_language: Option<OtherLanguage>,
+    /// The suggestions nobody answered that the project may be another one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<ListedSuggestion>,
 }
 
 /// How many live saves of the searched scope are in the language the caller
@@ -1060,6 +1064,9 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/projects/merge", post(merge_projects))
         .route("/projects/keep-apart", post(keep_projects_apart))
         .route("/projects/delete", post(delete_projects))
+        .route("/projects/resolve", post(resolve_projects))
+        .route("/projects/suggestions/answer", post(answer_suggestion))
+        .route("/projects/locate", post(locate_project))
         .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
@@ -1595,8 +1602,17 @@ async fn context(
         _ => None,
     };
 
+    // As the counts above: a line left out, not a failed request.
+    let suggestions = match project_id {
+        Some(project_id) => pending_suggestions(&app.runtime.store, project_id).await.unwrap_or_else(|e| {
+            log::warn!("pending suggestions failed: {e}");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+
     let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
-    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval, other_language }))
+    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval, other_language, suggestions }))
 }
 
 /// Records the host session `agent_id` works in for `project_id`, as a hook
@@ -1712,7 +1728,11 @@ async fn update_memory(
     Json(body): Json<UpdateRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref(), body.destination()?)
+    let destination = match body.destination()? {
+        Some(Some(target)) => Some(Some(target_named(&app, target).await?)),
+        other => other,
+    };
+    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref(), destination)
         .map_err(|e| ApiError::bad_request(e.to_string()))?
         .answered(body.user_answered);
     // The core answers `None` for "no such row", "already soft-deleted" and
@@ -1728,6 +1748,20 @@ async fn update_memory(
         })?
         .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
     Ok(Json(UpdatedBody { updated: 1, row }))
+}
+
+/// The project a target names: the id as given, else the one live project
+/// of that name. A name nobody holds goes on as given, and the move answers
+/// its 404 naming it; one two projects hold is refused, naming their ids.
+async fn target_named(app: &AppCtx, reference: String) -> ApiResult<String> {
+    match find_project(&app.runtime.store, &reference).await.map_err(ApiError::internal)? {
+        Named::Project(id) => Ok(id),
+        Named::Unknown => Ok(reference),
+        Named::Ambiguous(ids) => Err(ApiError {
+            detail: Some(format!("{reference:?} is the name of {}: name one of them by its id", ids.join(", "))),
+            ..ApiError::conflict("project_ambiguous")
+        }),
+    }
 }
 
 /// The status a refused move answers with: a clash is a conflict, a target
@@ -1755,7 +1789,11 @@ async fn move_memories(
     let dry_run = body.dry_run;
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let store = &app.runtime.store;
-    let report = match body.plan()? {
+    let plan = match body.plan()? {
+        MovePlan::Move { filter, target: Some(target) } => MovePlan::Move { filter, target: Some(target_named(&app, target).await?) },
+        plan => plan,
+    };
+    let report = match plan {
         MovePlan::Move { filter, target } => move_memories_core(store, &backups, &filter, target, dry_run).await,
         MovePlan::Undo(id) => undo_move_core(store, &backups, id, dry_run).await,
     };
@@ -2050,12 +2088,25 @@ async fn register(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<RegisterRequest>,
 ) -> ApiResult<Json<RegisteredBody>> {
-    if body.root_path.trim().is_empty() {
+    let outcome = register_root(&app, &body.root_path, &body.legacy_ids, body.index_docs, body.assigned).await?;
+    Ok(Json(RegisteredBody { project_id: outcome.project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
+}
+
+/// Registers `root_path` as [`register`] does, for it and for what places a
+/// folder in a project.
+async fn register_root(
+    app: &Arc<AppCtx>,
+    root_path: &str,
+    legacy_ids: &[String],
+    index_docs: bool,
+    assigned: bool,
+) -> ApiResult<RegisterOutcome> {
+    if root_path.trim().is_empty() {
         return Err(ApiError::bad_request("root_path must not be empty"));
     }
-    let root = std::path::Path::new(&body.root_path);
-    if body.index_docs && !root.is_dir() {
-        return Err(ApiError::bad_request(format!("{} is not a directory, so it has no files to index", body.root_path)));
+    let root = std::path::Path::new(root_path);
+    if index_docs && !root.is_dir() {
+        return Err(ApiError::bad_request(format!("{root_path} is not a directory, so it has no files to index")));
     }
     // A caller that derives its id joins no remote, but what is at the root
     // still tells whether it is the repository its folder was given to.
@@ -2063,19 +2114,13 @@ async fn register(
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || Disk.checkout(&root)).await.unwrap_or_default()
     };
-    let registration = Registration {
-        root,
-        checkout,
-        legacy_ids: &body.legacy_ids,
-        index_docs: body.index_docs,
-        assigned: body.assigned,
-    };
+    let registration = Registration { root, checkout, legacy_ids, index_docs, assigned };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration, Arc::new(Disk))
         .await
         .map_err(|e| match e {
             RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
-            RegisterError::RootCollision { id, existing } if existing == body.root_path => ApiError {
+            RegisterError::RootCollision { id, existing } if existing == root_path => ApiError {
                 detail: Some(format!(
                     "{} derives the project id {id}, but the daemon gives that root another one; a newer bridge uses it",
                     root.display()
@@ -2106,10 +2151,10 @@ async fn register(
     }
     // Only a caller that asks: the hooks register an accepted root on every
     // prompt, and `search_project` already refreshes an index gone stale.
-    if body.index_docs && outcome.index_docs {
+    if index_docs && outcome.index_docs {
         spawn_doc_refresh(app.clone(), outcome.root_id.clone());
     }
-    Ok(Json(RegisteredBody { project_id: outcome.project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
+    Ok(outcome)
 }
 
 #[derive(Debug, Serialize)]
@@ -2269,13 +2314,191 @@ async fn keep_projects_apart(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<KeepApartRequest>,
 ) -> ApiResult<Json<KeptApart>> {
-    keep_apart(&app.runtime.store, &body.project_id, &body.other_id).await.map(Json).map_err(|e| match e {
+    keep_apart(&app.runtime.store, &body.project_id, &body.other_id).await.map(Json).map_err(kept_apart_error)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectResolveRequest {
+    /// An id or a name.
+    project: String,
+    #[serde(default)]
+    create: bool,
+    #[serde(default)]
+    new_project: bool,
+    #[serde(default)]
+    born: Born,
+}
+
+/// What a reference to a project leads to, as an agent or the user names
+/// one, creating a project without a folder when asked and nothing has or
+/// resembles the name. An answer that read candidates is a 200, since they
+/// are what the caller asks the person about.
+async fn resolve_projects(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<ProjectResolveRequest>,
+) -> ApiResult<Json<ProjectResolution>> {
+    if body.new_project && !body.create {
+        return Err(ApiError::bad_request("new_project goes with create: it creates a project apart from the similar ones"));
+    }
+    let options = ResolveOptions { create: body.create, new_project: body.new_project, born: body.born };
+    resolve_project(&app.runtime.store, &body.project, options).await.map(Json).map_err(|e| match e {
+        ProjectResolveError::Name(_) => ApiError::bad_request(e.to_string()),
+        ProjectResolveError::NoFreeId(_) => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("no_free_project_id") },
+        ProjectResolveError::Store(_) => ApiError::internal(e),
+    })
+}
+
+/// The answers a suggestion takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionAnswer {
+    Merge,
+    Apart,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerRequest {
+    project_id: String,
+    other_id: String,
+    answer: String,
+    #[serde(default)]
+    user_answered: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnsweredBody {
+    pub project_id: String,
+    pub other_id: String,
+    pub answer: SuggestionAnswer,
+    /// The merge of `other_id` into `project_id`, which `--undo` takes back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeReport>,
+}
+
+/// The status of a refused check of two projects, as `keep-apart` answers it.
+fn kept_apart_error(e: KeepApartError) -> ApiError {
+    match e {
         KeepApartError::NotFound(_) => ApiError::not_found(e.to_string()),
         KeepApartError::Same(_) => ApiError::bad_request(e.to_string()),
         KeepApartError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
         KeepApartError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
         KeepApartError::Store(_) => ApiError::internal(e),
-    })
+    }
+}
+
+/// The person's answer to a pending suggestion, as an agent relays it:
+/// `apart` keeps the two from being suggested again, `merge` merges
+/// `other_id` into `project_id` as `POST /v1/projects/merge` does. Only a
+/// suggestion nobody answered is answered: an agent merges no projects
+/// nobody suggested.
+async fn answer_suggestion(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<AnswerRequest>,
+) -> ApiResult<Json<AnsweredBody>> {
+    let answer = match body.answer.as_str() {
+        "merge" => SuggestionAnswer::Merge,
+        "apart" => SuggestionAnswer::Apart,
+        other => return Err(ApiError::bad_request(format!("answer must be one of: merge, apart (got {other:?})"))),
+    };
+    if !body.user_answered || body.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "answering a suggestion is the user's call: send user_answered with the user's answer in reason",
+        ));
+    }
+    let store = &app.runtime.store;
+    let pending = suggestion_between(store, &body.project_id, &body.other_id).await.map_err(kept_apart_error)?;
+    if pending.is_none() {
+        return Err(ApiError {
+            detail: Some(format!("no suggestion is pending between {} and {}", body.project_id, body.other_id)),
+            ..ApiError::not_found("no_suggestion")
+        });
+    }
+    let merge = match answer {
+        SuggestionAnswer::Apart => {
+            keep_apart(store, &body.project_id, &body.other_id).await.map_err(kept_apart_error)?;
+            None
+        }
+        SuggestionAnswer::Merge => {
+            let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+            let merged = merge_core(store, &app.runtime.workspaces(), &backups, &body.other_id, &body.project_id, false).await;
+            Some(merged.map_err(merge_error)?)
+        }
+    };
+    Ok(Json(AnsweredBody { project_id: body.project_id, other_id: body.other_id, answer, merge }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocateRequest {
+    /// An id or a name.
+    project: String,
+    root_path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocatedBody {
+    /// The project the folder leads to now.
+    pub project_id: String,
+    pub root_id: String,
+    /// Whether it led there already, and nothing was done.
+    pub already: bool,
+    /// The merge of the folder's own project into it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeReport>,
+}
+
+/// Makes the root of `root_path` lead to a project: it is registered as a
+/// bridge registers it, and the project it gets, when that is another one
+/// and this is its only folder, is merged into the named one. A project
+/// with other folders would take them along, which nobody named.
+async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateRequest>) -> ApiResult<Json<LocatedBody>> {
+    if !std::path::Path::new(&body.root_path).is_dir() {
+        return Err(ApiError::bad_request(format!("{} is not a directory: name a directory of the project", body.root_path)));
+    }
+    let store = &app.runtime.store;
+    let target = match find_project(store, &body.project).await.map_err(ApiError::internal)? {
+        Named::Project(id) => id,
+        Named::Unknown => return Err(ApiError::not_found(format!("no project has the id or the name {:?}", body.project))),
+        Named::Ambiguous(ids) => {
+            return Err(ApiError {
+                detail: Some(format!("{:?} is the name of {}: name one of them by its id", body.project, ids.join(", "))),
+                ..ApiError::conflict("project_ambiguous")
+            })
+        }
+    };
+    let registered = register_root(&app, &body.root_path, &[], false, true).await?;
+    let (own, root_id) = (registered.project_id, registered.root_id);
+    if own == target {
+        return Ok(Json(LocatedBody { project_id: target, root_id, already: true, merge: None }));
+    }
+    let own2 = own.clone();
+    let folders: i64 = store
+        .conn
+        .call(move |c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM project_path WHERE project_id = ?1 OR (project_id IS NULL AND id = ?1)",
+                [own2],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    if folders > 1 {
+        return Err(ApiError {
+            detail: Some(format!(
+                "{} leads to project {own}, which has {folders} folders; `clawg projects merge {own} --into {target}` merges them all",
+                body.root_path
+            )),
+            ..ApiError::conflict("folder_shared")
+        });
+    }
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let merged = merge_core(store, &app.runtime.workspaces(), &backups, &own, &target, false).await.map_err(merge_error)?;
+    Ok(Json(LocatedBody { project_id: target, root_id, already: false, merge: Some(merged) }))
 }
 
 /// Refreshes the project's documentation index in the background, once the

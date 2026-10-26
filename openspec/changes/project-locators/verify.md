@@ -149,3 +149,48 @@ Pendiente para el pull request final del cambio, como el de las entregas 1 y 2a.
 - **Tarea 30:** los tests no compilaban: faltaban `purge_delete`, `LiveRow` y las tres variantes de `PurgeError`.
 - **Tarea 31:** los tests se escribieron antes que el código, pero no se corrieron por separado. No podían pasar sin el cambio, porque usan `--project-delete`, `confirm_delete` y `purge_delete_report`, que no existían.
 - **Tarea 32:** con `cargo test --no-run`, los tests no compilaban: faltaban `OpenDelete`, `project_deletes`, los conteos de filas vivas de `IdRows`, `RegistryRow::deleted_at` y `StoreFacts::open_deletes`. Después se corrigió el propio fixture: una fila viva insertada bajo un proyecto lo hace volver, así que el proyecto tiene que marcarse borrado después de las filas.
+
+## Entrega 3a (0.64.0)
+
+### Linux
+
+- `cargo test --workspace --locked --no-fail-fast` pasa en `1fdde90`, con `tests/binary.rs`: 19 binarios, ninguno con fallos. `cargo clippy --workspace --all-targets --locked -- -A clippy::all -D warnings` y `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` salen con 0. Es la primera vez que este cambio corre en Linux.
+- El entorno no alcanza `cdn.pyke.io`, de donde `ort-sys` baja ONNX Runtime al compilar. La biblioteca se tomó de la rueda `onnxruntime==1.24.2` de PyPI (la versión que pide `ort-sys` 2.0.0-rc.12), con `ORT_LIB_LOCATION`, `ORT_PREFER_DYNAMIC_LINK=1` y `LD_LIBRARY_PATH`: sólo cambia cómo se enlaza en esa máquina, no el repositorio. El build de release y el CI la siguen bajando como siempre.
+- `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` se volvieron a bendecir, y el diff sólo suma los argumentos de PL34 y la herramienta de PL37 (PL41).
+
+### El binario real en un home temporal
+
+Se usó el binario de `target/debug`, copiado fuera del directorio de build, con `CLAWG_TEST_HOME`, `CLAWG_TEST_EMBEDDER=fake`, `CLAWG_TEST_DEFAULT_PORT=off` y `clawg serve --profile dev --port 0`. El puente (`clawg mcp --no-autostart --agent claude-code`) se manejó por stdio real, desde una carpeta `notas` sin VCS.
+
+1. `save_memory` con `project: "ideas de producto"` creó `ideas-de-producto-2701` y guardó en él. Otro save con `Ideas-de-Producto` se negó sin guardar y nombró a ese proyecto como parecido, con `new_project`. `search_memory` con el nombre encontró la memoria, y `search_project` dijo que el proyecto no tiene carpeta.
+2. `projects create Roadmap` creó `roadmap-d258`, revisado. `projects create road-map` salió con 1, nombró a `Roadmap` y el `--new`. `projects locate Roadmap work/plan` registró la carpeta y unió su proyecto `plan-3c02` en `Roadmap` (unión 1), con su `--undo`.
+3. La carpeta `notas`, con una memoria, se movió a `archivo/notas`. `hook session-start` en la carpeta nueva terminó con la línea de la sugerencia. `recall_context` desde un puente en esa carpeta terminó con la línea `folder_name` que nombra a `notas-02f7`, y `projects list` mostró la sugerencia en los dos proyectos.
+4. `answer_suggestion` con `apart` respondió que siguen siendo dos proyectos, y el `recall_context` siguiente ya no nombró `answer_suggestion`.
+5. `doctor` dio 22 `ok`, 2 `info`, ningún `warn` ni `error`.
+
+`clawg stop` terminó el daemon.
+
+### Lo que la verificación hizo cambiar
+
+- **El tope del hook.** La línea de las sugerencias en `session-start` no entraba en los 1.000 bytes que el hook podía sumar: el peor caso de antes ya ocupaba 978. `session-start` da una sola línea, que nombra hasta dos proyectos, y el tope pasó a 1.500, que con los 8.000 del contexto sigue entrando en los 10.000 caracteres del host (D45). `what_the_hook_adds_stays_small` falló con 1.389 bytes antes del cambio.
+- **`locate` sin prueba en seco.** La raíz se registra antes de saber a qué proyecto lleva, y el `--undo` de la unión ya es la vuelta atrás (PL39).
+- **Una respuesta inválida.** `answer: "maybe"` daba el 422 de axum. Ahora es un 400 que nombra los valores, como las demás rutas.
+
+### CI
+
+Pendiente para el pull request final del cambio, como el de las entregas anteriores.
+
+### Lo que no se corrió
+
+- **Windows:** esta entrega se verificó sólo en Linux. Lo cubre el CI del pull request final.
+- **El perfil dev y el de producción:** no se tocó ningún perfil real. El paso operativo de colocar las filas sin proyecto de producción sigue pendiente y pide autorización.
+
+### Qué se vio fallar antes de cada cambio
+
+- **Tarea 35:** los tests no compilaban: faltaban `name_key`, `new_project_id`, `resolve_project` y sus tipos, y `find_project`.
+- **Tarea 36:** con `named_after_in` apagado, `a_folder_named_as_a_project_whose_folders_are_gone_is_suggested` falló sin la sugerencia, y `a_folder_named_as_a_project_still_there_is_not_suggested` pasó, como debe.
+- **Tarea 37:** los tests no compilaban: faltaban `pending_suggestions` y `suggestion_between`.
+- **Tarea 38:** con los tests escritos y sin las rutas, `a_name_two_projects_hold_is_refused_as_a_target` falló, y las demás de la tanda no tenían ruta que llamar.
+- **Tareas 39 y 41:** los tests del puente se escribieron después del código, en el mismo paso; los de los contratos, la lista de herramientas de `.claude/CLAUDE.md`, la tabla en español y el protocolo fallaron hasta que se completaron.
+- **Tarea 40:** `session_start_names_the_pending_suggestions` no compilaba sin la línea; después `what_the_hook_adds_stays_small` falló por el tope (arriba).
+- **Tarea 42:** los tests no compilaban: faltaban `ProjectsAction::Create`, `ProjectsAction::Locate` y `render_created`.

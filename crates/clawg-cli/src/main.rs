@@ -398,6 +398,39 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
+        Command::Projects { action: ProjectsAction::Create { name, new, profile } } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let (said, done) = projects::create(lang, &client, &name, new)
+                .await
+                .map_err(|e| projects::create_refused(lang, &e).unwrap_or_else(|| unavailable(e)))?;
+            println!("{said}");
+            Ok(if done { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+        }
+
+        Command::Projects { action: ProjectsAction::Locate { project, path, profile } } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let located = projects::locate(lang, &client, &project, &path).await.map_err(|e| match e {
+                projects::AddError::Client(e) => projects::locate_refused(lang, &e).unwrap_or_else(|| unavailable(e)),
+                other => other.to_string(),
+            })?;
+            println!("{located}");
+            Ok(ExitCode::SUCCESS)
+        }
+
         Command::Projects { action: ProjectsAction::Add { path, profile } } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             // The daemon owns the store and does the indexing; with none

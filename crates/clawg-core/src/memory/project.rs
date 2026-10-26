@@ -30,7 +30,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
 use crate::memory::identity::{candidate_id, derive_project_id, Checkout, Ground, RootCommit, CANDIDATES};
-use crate::memory::registry::project_name;
+use crate::memory::registry::{name_key, project_name};
 use crate::memory::merge::canonical_in;
 use crate::memory::relocate::{merge_in, Span};
 use crate::memory::workspace::WorkspaceManager;
@@ -350,6 +350,32 @@ fn sightings_in(
     Ok(sightings)
 }
 
+/// The live projects, other than `own`, named as the folder `root` is (by
+/// [`name_key`]), each with the checkouts its folders recorded; none unless
+/// `own`, the project the root would go to, is a new one. A project without
+/// a folder has nothing that moved, so it is left out.
+fn named_after_in(c: &Connection, root: &Path, own: &str) -> rusqlite::Result<Vec<(String, Vec<Recorded>)>> {
+    let key = root.file_name().map(|n| name_key(&n.to_string_lossy())).unwrap_or_default();
+    let exists: bool = c.query_row("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1)", [own], |r| r.get(0))?;
+    if key.is_empty() || exists {
+        return Ok(Vec::new());
+    }
+    let mut stmt = c.prepare("SELECT id, name FROM project WHERE merged_into IS NULL AND deleted_at IS NULL AND id <> ?1")?;
+    let projects = stmt.query_map([own], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut folders = c.prepare(
+        "SELECT root_path, git_stamp FROM project_path WHERE project_id = ?1 OR (project_id IS NULL AND id = ?1) ORDER BY created_at, id",
+    )?;
+    let mut named = Vec::new();
+    for (id, _) in projects.into_iter().filter(|(_, name)| name_key(name) == key) {
+        let recorded =
+            folders.query_map([&id], |r| Ok((PathBuf::from(r.get::<_, String>(0)?), r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        if !recorded.is_empty() {
+            named.push((id, recorded));
+        }
+    }
+    Ok(named)
+}
+
 /// What a registration records in the folder it settles on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Record {
@@ -629,10 +655,12 @@ fn plan_in(
         let shared = key.map(|r| remote_project_in(c, r)).transpose().map_err(sql)?.flatten();
         let looks = shared.is_none() && settled.fresh();
         let sightings = sightings_in(c, reg.root, &reg.checkout, &commit, looks, &Pending::default()).map_err(sql)?;
+        let named = if looks { named_after_in(c, reg.root, &project_of(shared.clone(), &settled)).map_err(sql)? } else { Vec::new() };
         let gone = match &disk.gone {
             Some(gone) => gone.as_slice(),
-            None if may_look && !sightings.is_empty() => {
-                return Ok(Planned::Presence(sightings.iter().map(Sighting::recorded).collect()));
+            None if may_look && (!sightings.is_empty() || !named.is_empty()) => {
+                let looked = sightings.iter().map(Sighting::recorded).chain(named.iter().flat_map(|(_, r)| r.iter().cloned()));
+                return Ok(Planned::Presence(looked.collect()));
             }
             None => &[],
         };
@@ -649,6 +677,14 @@ fn plan_in(
                     let other = live(&other)?;
                     if other != project_id && !suggestions.iter().any(|(o, _)| *o == other) {
                         suggestions.push((other, "root_commit"));
+                    }
+                }
+                // A folder that moved with nothing to tell it by but its name:
+                // the project of that name whose every folder is gone.
+                for (other, recorded) in &named {
+                    let all_gone = recorded.iter().all(|r| gone.contains(r));
+                    if all_gone && *other != project_id && !suggestions.iter().any(|(o, _)| o == other) {
+                        suggestions.push((other.clone(), "folder_name"));
                     }
                 }
                 project_id
@@ -1949,6 +1985,55 @@ mod tests {
         let mut expected = vec![(p1.project_id, "root_commit".to_string()), (p2.project_id, "root_commit".to_string())];
         expected.sort();
         assert_eq!(suggested, expected);
+    }
+
+    /// Puts at `root` a folder without a git directory, and the registration
+    /// the daemon would make of it.
+    fn plain<'a>(f: &Fixture, root: &'a Path) -> Registration<'a> {
+        f.ground.put(root, None, None, RootCommit::Later);
+        reg(root, &[])
+    }
+
+    #[tokio::test]
+    async fn a_folder_named_as_a_project_whose_folders_are_gone_is_suggested() {
+        let f = Fixture::new().await;
+        let (old, moved) = (Path::new("/work/notas"), Path::new("/archivo/Notas"));
+        let a = f.register(plain(&f, old)).await.unwrap();
+        f.memory(&a.project_id, "the notes of the week", None, 1).await;
+        f.ground.remove(old);
+
+        let b = f.register(plain(&f, moved)).await.unwrap();
+
+        assert_ne!(b.project_id, a.project_id, "a name is weak evidence: it stays apart");
+        assert_eq!(f.suggestions().await, vec![(b.project_id.clone(), a.project_id.clone(), "folder_name".to_string(), None)]);
+        f.register(plain(&f, moved)).await.unwrap();
+        assert_eq!(f.suggestions().await.len(), 1, "once per pair");
+    }
+
+    #[tokio::test]
+    async fn a_folder_named_as_a_project_still_there_is_not_suggested() {
+        let f = Fixture::new().await;
+        let (one, two) = (Path::new("/work/api"), Path::new("/other/api"));
+        f.register(plain(&f, one)).await.unwrap();
+
+        f.register(plain(&f, two)).await.unwrap();
+        assert!(f.suggestions().await.is_empty(), "two folders `api`, both there, are two projects");
+
+        // Nor one without a folder, nor a deleted one, nor the folder's own.
+        f.store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('ideas-1a2b', 'Ideas', 'agent', 0, 1);
+                     INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES ('web-3c4d', 'web', 'root', 1, 1, 2);
+                     INSERT INTO project_path (id, root_path, created_at, project_id) VALUES ('web-3c4d', '/gone/web', 1, 'web-3c4d');",
+                )
+            })
+            .await
+            .unwrap();
+        f.register(plain(&f, Path::new("/work/ideas"))).await.unwrap();
+        f.register(plain(&f, Path::new("/work/web"))).await.unwrap();
+        assert!(f.suggestions().await.is_empty(), "{:?}", f.suggestions().await);
     }
 
     #[tokio::test]
