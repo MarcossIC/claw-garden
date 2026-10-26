@@ -309,7 +309,7 @@ fn registry(c: &Connection, has: &Has) -> rusqlite::Result<Vec<RegistryRow>> {
     rows.collect()
 }
 
-fn folder_prints(c: &Connection) -> rusqlite::Result<Vec<FolderPrint>> {
+pub(crate) fn folder_prints(c: &Connection) -> rusqlite::Result<Vec<FolderPrint>> {
     let mut stmt = c.prepare("SELECT id, project_id, remote, root_commit FROM project_path ORDER BY id")?;
     let rows = stmt.query_map([], |r| {
         Ok(FolderPrint { root_id: r.get(0)?, project_id: r.get(1)?, remote: r.get(2)?, root_commit: r.get(3)? })
@@ -317,7 +317,7 @@ fn folder_prints(c: &Connection) -> rusqlite::Result<Vec<FolderPrint>> {
     rows.collect()
 }
 
-fn answered_pairs(c: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+pub(crate) fn answered_pairs(c: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
     let mut stmt = c.prepare(
         "SELECT min(project_id, other_id), max(project_id, other_id) FROM project_suggestion \
          WHERE answer IS NOT NULL ORDER BY 1, 2",

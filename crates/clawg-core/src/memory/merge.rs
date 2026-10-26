@@ -339,26 +339,40 @@ fn merge_pass(
     Ok(report)
 }
 
-fn connection_error(e: tokio_rusqlite::Error<MergeError>) -> MergeError {
-    match e {
-        tokio_rusqlite::Error::Error(e) => e,
-        other => MergeError::Store(MemoryError::Backend(other.to_string())),
+/// What [`retrying`] needs of the error of a pass: to tell the wait it
+/// repeats on from the rest, and to take a failure of the connection.
+pub(crate) trait Retried: From<rusqlite::Error> + Send + 'static {
+    fn saves_pending(&self) -> bool;
+    fn connection(e: tokio_rusqlite::Error<Self>) -> Self;
+}
+
+impl Retried for MergeError {
+    fn saves_pending(&self) -> bool {
+        matches!(self, MergeError::SavesPending(_))
+    }
+
+    fn connection(e: tokio_rusqlite::Error<MergeError>) -> MergeError {
+        match e {
+            tokio_rusqlite::Error::Error(e) => e,
+            other => MergeError::Store(MemoryError::Backend(other.to_string())),
+        }
     }
 }
 
 /// Runs `run` in a transaction it commits only when `write`, and again while
 /// saves of the projects it touches are pending, for up to [`SAVES_WAIT`].
-async fn retrying<T, F>(store: &MemoryStore, write: bool, run: F) -> Result<T, MergeError>
+pub(crate) async fn retrying<T, E, F>(store: &MemoryStore, write: bool, run: F) -> Result<T, E>
 where
     T: Send + 'static,
-    F: Fn(&Connection) -> Result<T, MergeError> + Clone + Send + 'static,
+    E: Retried,
+    F: Fn(&Connection) -> Result<T, E> + Clone + Send + 'static,
 {
     let deadline = tokio::time::Instant::now() + SAVES_WAIT;
     loop {
         let run = run.clone();
         let result = store
             .conn
-            .call(move |c| -> Result<T, MergeError> {
+            .call(move |c| -> Result<T, E> {
                 let tx = c.transaction()?;
                 let out = run(&tx)?;
                 if write {
@@ -367,9 +381,9 @@ where
                 Ok(out)
             })
             .await
-            .map_err(connection_error);
+            .map_err(E::connection);
         match result {
-            Err(MergeError::SavesPending(_)) if tokio::time::Instant::now() < deadline => {
+            Err(e) if e.saves_pending() && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(SAVES_POLL).await;
             }
             other => return other,

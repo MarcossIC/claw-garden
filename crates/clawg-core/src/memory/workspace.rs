@@ -131,6 +131,32 @@ impl WorkspaceManager {
         Ok(adopted)
     }
 
+    /// The `workspace.md` of every agent under `project_id`, by path. Reads
+    /// the folders of the agents and changes nothing.
+    pub async fn project_files(&self, project_id: &str) -> Result<Vec<PathBuf>, MemoryError> {
+        let io_err = |path: &std::path::Path| {
+            let path = path.to_path_buf();
+            move |source| MemoryError::WorkspaceIo { path, source }
+        };
+        let mut files = Vec::new();
+        let mut agents = match tokio::fs::read_dir(&self.workspaces_root).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(files),
+            Err(e) => return Err(io_err(&self.workspaces_root)(e)),
+        };
+        while let Some(agent) = agents.next_entry().await.map_err(io_err(&self.workspaces_root))? {
+            let file = agent.path().join(project_segment(project_id).as_ref()).join("workspace.md");
+            match tokio::fs::metadata(&file).await {
+                Ok(meta) if meta.is_file() => files.push(file),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err(&file)(e)),
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+
     /// Takes back the copies [`Self::adopt_legacy`] made of `legacy_id`'s
     /// files into `project_id`, in the agent folders `agents` names: a copy
     /// whose user's part is still the legacy file's is removed, and one the

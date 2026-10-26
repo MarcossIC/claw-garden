@@ -594,7 +594,20 @@ async fn remove_docs(store: &MemoryStore, project_id: &str, paths: Vec<String>) 
     Ok(())
 }
 
-fn delete_doc(tx: &rusqlite::Transaction<'_>, project_id: &str, path: &str) -> rusqlite::Result<()> {
+/// Takes everything indexed under the root `root_id` out of the index, in the
+/// caller's transaction.
+pub(crate) fn drop_root_index_in(c: &rusqlite::Connection, root_id: &str) -> rusqlite::Result<()> {
+    let paths: Vec<String> = c
+        .prepare("SELECT path FROM project_doc_file WHERE project_id = ?1")?
+        .query_map([root_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for path in paths {
+        delete_doc(c, root_id, &path)?;
+    }
+    Ok(())
+}
+
+fn delete_doc(tx: &rusqlite::Connection, project_id: &str, path: &str) -> rusqlite::Result<()> {
     let ids: Vec<i64> = tx
         .prepare("SELECT id FROM project_doc_chunk WHERE project_id = ?1 AND path = ?2")?
         .query_map([project_id, path], |r| r.get(0))?
