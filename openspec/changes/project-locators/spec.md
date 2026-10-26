@@ -1,11 +1,13 @@
 # project-locators — Especificación
 
-Esta especificación cubre dos entregas de la [propuesta](proposal.md):
+Esta especificación cubre cuatro entregas de la [propuesta](proposal.md):
 
 - la **entrega 1, el registro (V27)** (PL1 a PL10). Cambia R10, R16, R18 y R20 de [`specs/project`](../../specs/project/spec.md) y suma V27 a [`specs/storage`](../../specs/storage/spec.md);
-- la **entrega 2a, unir proyectos (V28)** (PL11 a PL20, [más abajo](#entrega-2a-unir-proyectos)). Cambia PL9 y suma V28 a `specs/storage` y tres hallazgos a [`specs/doctor`](../../specs/doctor/spec.md).
+- la **entrega 2a, unir proyectos (V28)** (PL11 a PL20, [más abajo](#entrega-2a-unir-proyectos)). Cambia PL9 y suma V28 a `specs/storage` y tres hallazgos a [`specs/doctor`](../../specs/doctor/spec.md);
+- la **entrega 2b, borrar proyectos (V29)** (PL21 a PL31, [más abajo](#entrega-2b-borrar-proyectos));
+- la **entrega 3a, proyectos sin carpeta y el agente** (PL32 a PL42, [más abajo](#entrega-3a-proyectos-sin-carpeta-y-el-agente)). Suma a `specs/project` y a [`specs/mcp`](../../specs/mcp/spec.md), sin migración.
 
-Lo que no se nombra aquí sigue como está. Las entregas 2b a 4 agregan sus requisitos a este archivo cuando les toque. El [diseño](design.md) dice cómo se cumple cada requisito y qué alternativas se descartaron.
+Lo que no se nombra aquí sigue como está. Las entregas 3b y 4 agregan sus requisitos a este archivo cuando les toque. El [diseño](design.md) dice cómo se cumple cada requisito y qué alternativas se descartaron.
 
 ## Definiciones
 
@@ -801,3 +803,159 @@ Los tres MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el
 - El formato de export (entrega 4).
 
 **Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin volver a bendecir, y los de R4, R17 y PL1 a PL20.
+
+## Entrega 3a: proyectos sin carpeta y el agente
+
+Cubre la primera parte de la [entrega 3](proposal.md#3-proyectos-sin-carpeta-y-el-agente): proyectos sin carpeta, el argumento `project` del contrato, los nombres donde hoy van ids, `projects create|locate`, las sugerencias que ve y responde el agente, y la sugerencia por nombre de carpeta. Los subproyectos de un monorepo son de la entrega 3b. El diseño está en [D38 a D49](design.md#entrega-3a-proyectos-sin-carpeta-y-el-agente). Las cuatro elecciones que hizo la persona el 2026-10-26 están en D41, D42, D45 y D49. No trae migración: `born` y `project_suggestion.reason` no llevan `CHECK` (D6, D10).
+
+### Definiciones
+
+- **Referencia a un proyecto:** un texto que el usuario o el agente da donde va un proyecto. Es un id o un nombre.
+- **Clave de un nombre (`name_key`):** el nombre en minúsculas de Unicode, sin nada que no sea letra o dígito. `Mi App`, `mi-app` y `mi_app` tienen la misma clave, `miapp`.
+- **Proyecto parecido a un nombre:** un proyecto vivo o borrado, que no es una lápida, cuya clave de nombre es la del nombre.
+- **Proyecto sin carpeta:** uno sin filas en `project_path` que lleven a él. Puede tener remotos.
+
+## PL32. Una referencia se resuelve primero como id y después como nombre
+
+`POST /v1/projects/resolve`, detrás del token, con `{"project": REF, "create": bool, "new_project": bool, "born": "agent"|"user"}`. MUST resolver así, y responder 200 en todos los casos que leen el registro:
+
+1. Si REF es el id de un proyecto, ese proyecto, por `canonical` (una lápida lleva a su proyecto vivo). Un proyecto borrado se resuelve a sí mismo, con `deleted: true`: un save bajo él lo hace volver (PL22).
+2. Si no, los proyectos vivos cuyo nombre es REF sin espacios a los lados, sin distinguir mayúsculas (en Rust, no con `lower()` de SQLite). Con uno, ese. Con dos o más, `refused: "ambiguous"` y los dos en `candidates`.
+3. Si no, los proyectos parecidos a REF, vivos y borrados, en `candidates` con `refused: "similar"`. Un candidato borrado lleva `deleted: true` y su borrado abierto.
+4. Si no hay ninguno y no se pidió `create`, `refused: "unknown"`.
+5. Si no hay ninguno y se pidió `create`, MUST crear el proyecto (PL33) y responderlo con `created: true`.
+
+Con `new_project: true` y `create`, el paso 3 MUST NOT impedir la creación: se crea aunque haya parecidos. El paso 2 sigue: un nombre que ya tiene un proyecto vivo responde ese proyecto, nunca uno nuevo con el mismo nombre.
+
+La respuesta resuelta trae `project_id`, `name`, `created`, `deleted` y sus carpetas (`root_id`, `index_docs`), las más viejas primero. Cada candidato trae `id`, `name`, `deleted` y, si está borrado, `delete_id`. Nada se escribe fuera del paso 5.
+
+Un REF vacío, de más de 80 caracteres o con caracteres de control es un 400 que no escribe nada.
+
+#### Escenario: un parecido no crea nada
+- GIVEN un proyecto `mi-app-1a2b` llamado `mi-app`
+- WHEN se resuelve `Mi App` con `create`
+- THEN no se crea nada, y la respuesta es `similar` con `mi-app-1a2b`
+- AND con `new_project` se crea un proyecto `Mi App`, sin carpeta
+
+#### Escenario: un nombre que nadie tiene
+- GIVEN ningún proyecto parecido a `ideas de producto`
+- WHEN se resuelve con `create`
+- THEN se crea un proyecto `ideas de producto` con un id `ideas-de-producto-XXXX`, `born = 'agent'` y sin revisar
+
+**Tests:** `a_reference_is_an_id_before_a_name`, `a_name_two_projects_hold_is_ambiguous`, `a_similar_name_creates_nothing_unless_asked`, `a_deleted_project_is_a_candidate_by_name_and_itself_by_id` y `a_reference_is_bounded` (`crates/clawg-core/src/memory/registry.rs`); `a_reference_resolves_through_the_daemon` (`crates/clawg-cli/tests/api.rs`).
+
+## PL33. Un proyecto nuevo sin carpeta
+
+Un proyecto que crea PL32 MUST tener:
+
+- `name`: REF sin espacios a los lados;
+- `id`: `slug-4hex`, con `is_project_id`. El slug es el nombre en minúsculas, con cada racha de lo que no es una letra ASCII o un dígito cambiada por un `-`, sin `-` a los lados y con 40 caracteres como mucho; `project` si queda vacío. Los cuatro hex salen de un hash del nombre, la hora y un contador, y el id MUST NOT ser el de otro proyecto ni el de una carpeta;
+- `born = 'agent'` con `reviewed = 0`, o `born = 'user'` con `reviewed = 1` cuando lo pide la CLI;
+- ninguna carpeta ni remoto.
+
+La transacción que lo crea MUST volver a mirar el paso 2 de PL32: si mientras tanto un proyecto vivo tomó ese nombre, responde ese.
+
+**Tests:** `a_new_project_gets_a_slug_and_four_hex_digits` (pura) y `a_project_is_created_once_by_name` (`registry.rs`).
+
+## PL34. El argumento `project` de las herramientas
+
+`save_memory`, `search_memory`, `recall_context`, `search_project` y `synthesize` MUST aceptar un argumento opcional `project`, un id o un nombre. `update_memory` MUST aceptar `to_project`. Con un `project_path` (o un `to_project_path`) a la vez, la herramienta MUST negarse sin llamar al daemon. Sin él, la herramienta MUST comportarse como hoy.
+
+- `save_memory` resuelve con `create` antes de guardar, así que el proyecto existe antes de que el save entre al outbox. Acepta además `new_project: true` (PL32), y sin `project` MUST negarse a tomarlo.
+- Las demás resuelven sin `create`: un nombre que no es de ningún proyecto MUST NOT crear nada.
+- Un rechazo de PL32 MUST responder, sin guardar ni buscar, una frase que nombra cada candidato con su id y su nombre (y los borrados como tales) y dice qué hacer: preguntarle a la persona, y después usar el id, o `new_project` para un proyecto aparte. Un borrado se trae de vuelta guardando con su id.
+- `search_project` MUST buscar en la carpeta con `index_docs` más vieja del proyecto, o en la más vieja. Un proyecto sin carpeta MUST responder su propio mensaje: no tiene archivos que buscar en esta máquina.
+- `all_projects` y `project` juntos: `all_projects` gana, como gana hoy sobre `project_path`.
+
+Cuando el directorio del puente no da ningún proyecto y la llamada no nombra uno, la búsqueda sigue sin alcance, como hoy.
+
+#### Escenario: guardar en una idea
+- GIVEN ningún proyecto parecido a `ideas de producto`
+- WHEN el agente guarda con `project: "ideas de producto"`
+- THEN se crea el proyecto y la memoria queda bajo él
+- AND `search_memory` con `project: "ideas de producto"` la encuentra, y desde la carpeta del puente no
+
+#### Escenario: sin el argumento
+- THEN cada herramienta hace lo de hoy, y los tests de hoy pasan sin cambios
+
+**Tests:** `saving_to_a_project_by_name_creates_it`, `a_similar_name_is_answered_with_its_candidates`, `project_and_project_path_are_refused_together`, `searching_the_docs_of_a_project_without_a_folder_says_so` (`crates/clawg-cli/src/mcp/server.rs`).
+
+## PL35. Nombres donde hoy van ids
+
+`to_project` de `POST /v1/memories/move` (`clawg projects move --to-project`) y `project_id` de `PATCH /v1/memories/{kind}/{id}` MUST aceptar un id o un nombre: primero como id, sin seguir la lápida (eso lo hace `target_in` en la transacción, PL12), y después como el nombre de un proyecto vivo, sin distinguir mayúsculas. No crean nada ni buscan parecidos. Un nombre de ninguno MUST seguir siendo el 404 de hoy, nombrándolo, y uno de dos o más MUST ser 409 `project_ambiguous` con `detail` que nombra sus ids.
+
+**Tests:** `a_move_and_a_patch_take_a_project_by_name` y `a_name_two_projects_hold_is_refused_as_a_target` (`tests/api.rs`).
+
+## PL36. Las sugerencias pendientes en el contexto
+
+`POST /v1/context`, con consulta y sin ella, MUST responder `suggestions`: las sugerencias pendientes del proyecto, leídas como las lista `GET /v1/projects` (los lados por `canonical`, sin las que tienen un lado borrado, una por par), cada una con `other_id`, `other_name`, `reason` y `created_at`. Sin proyecto, o sin sugerencias, el campo se omite.
+
+`recall_context` y `session-start` MUST terminar con una línea por sugerencia, en el idioma de la sesión, que nombra los dos proyectos, el motivo, y que hay que preguntarle a la persona y responder con `answer_suggestion`. Se muestran hasta que se responden. Un daemon que no manda el campo no muestra nada.
+
+**Tests:** `the_context_names_the_pending_suggestions_of_its_project` (`tests/api.rs`); `a_suggestion_is_shown_until_answered` (`crates/clawg-cli/src/mcp/tools.rs`, en los dos idiomas); `session_start_names_the_pending_suggestions` (`crates/clawg-cli/src/hook.rs`).
+
+## PL37. El agente responde una sugerencia
+
+`POST /v1/projects/suggestions/answer`, detrás del token, con `{"project_id": P, "other_id": O, "answer": "merge"|"apart", "user_answered": true, "reason": "..."}`. MUST:
+
+- responder 400 sin escribir cuando `user_answered` no es `true` o `reason` está vacío, como un veredicto que pide la respuesta de la persona;
+- responder 404 cuando P u O no existen, y 404 `no_suggestion` cuando no hay una sugerencia pendiente entre los dos, leída por `canonical`;
+- tratar a P y a O como lo que administra proyectos: 409 `project_merged` para una lápida y 409 `project_deleted` para un borrado (PL15, PL27);
+- con `apart`, hacer lo de `keep_apart` (PL16);
+- con `merge`, unir O en P como `POST /v1/projects/merge` (PL13), con su snapshot, su diario y su número, y responder su informe. `--undo` la deshace como a cualquier unión.
+
+La herramienta `answer_suggestion` (`project` opcional, por defecto el del puente; `other`, `answer`, `reason`, `user_answered`) MUST llamar a esa ruta y decir qué hizo: con una unión, su número y `clawg projects merge --undo N`.
+
+#### Escenario: responder «separados»
+- GIVEN una copia de `/work/app` en `/work/copia`, con su sugerencia `root_commit`
+- WHEN el agente responde `apart` con la respuesta de la persona
+- THEN la sugerencia queda `apart`, deja de mostrarse en `recall_context` y `session-start`, y registrar la copia otra vez no la vuelve a crear
+
+**Tests:** `answering_a_suggestion_needs_the_users_answer`, `answering_apart_keeps_the_pair_from_coming_back`, `answering_merge_merges_and_is_undone` y `answering_without_a_pending_suggestion_is_404` (`tests/api.rs`); `answer_suggestion_says_what_it_did` (`server.rs`).
+
+## PL38. Una carpeta con el nombre de un proyecto cuyas carpetas ya no están
+
+Un registro con `assigned` de un camino nuevo, que no se vincula por remoto ni por mudanza (PL5) y cuyo proyecto es uno nuevo, MUST buscar los proyectos vivos, distintos del suyo, cuya clave de nombre es la del nombre de la carpeta (el último componente de la raíz), que tienen al menos una carpeta y cuyos checkouts grabados ya no están, ninguno. Con cada uno MUST dejar una sugerencia `folder_name`, con las reglas de PL6: una por par, sin mover nada, y sólo un registro con `assigned`. El daemon mira en disco esos checkouts en la misma pasada que los de una mudanza posible.
+
+Un proyecto con una carpeta presente, uno sin carpetas, una lápida y un borrado MUST NOT recibir esta sugerencia.
+
+#### Escenario: una carpeta sin VCS que se mueve
+- GIVEN `/work/notas`, sin `.git`, registrado y con memorias en su proyecto `notas`
+- WHEN se mueve a `/archivo/notas` y se registra `/archivo/notas`
+- THEN recibe un proyecto propio y una sugerencia `folder_name` con `notas`
+- AND con `/work/notas` todavía ahí no hay sugerencia
+
+**Tests:** `a_folder_named_as_a_project_whose_folders_are_gone_is_suggested`, `a_folder_named_as_a_project_still_there_is_not_suggested` (`crates/clawg-core/src/memory/project.rs`); `a_folder_without_vcs_moved_is_suggested_and_shown_until_answered` (`tests/api.rs`).
+
+## PL39. `clawg projects create` y `clawg projects locate`
+
+- `clawg projects create <NOMBRE> [--new] [--profile P]` MUST resolver NOMBRE con `create` y `born = 'user'` (PL32), con `new_project` si se pasa `--new`. Imprime el proyecto creado, o el que ya tenía ese nombre, o los candidatos y que `--new` crea uno aparte (sale con 1).
+- `clawg projects locate <PROYECTO> <CAMINO> [--dry-run] [--profile P]` MUST hacer que la raíz de CAMINO lleve a PROYECTO (un id o un nombre, que no sigue la lápida). El daemon registra la raíz como un puente (`POST /v1/projects/locate`, con `{"project", "root_path", "dry_run"}`; CAMINO tiene que ser un directorio). Si su proyecto ya es PROYECTO, no hace nada. Si no, ese proyecto MUST tener esa carpeta sola, o la respuesta es 409 `folder_shared`, que nombra el proyecto y la unión que haría falta; y con una sola carpeta MUST unirlo en PROYECTO como `POST /v1/projects/merge` (PL13), con su `--undo`.
+
+Los dos MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el idioma de la preferencia, con una sentencia por `match` sobre `Lang`.
+
+**Tests:** `projects_create_and_locate_parse` (`cli.rs`); `a_created_project_or_its_candidates_are_printed` (`crates/clawg-cli/src/projects.rs`, en los dos idiomas); `locating_a_folder_merges_its_own_project_into_the_named_one` y `a_folder_shared_by_its_project_is_not_located` (`tests/api.rs`).
+
+## PL40. Ninguna ruta nueva se olvida de la lápida
+
+La tabla de PL19 suma:
+
+- `POST /projects/resolve`, con el proyecto en `body.project`, que lleva una lápida a su proyecto vivo;
+- `POST /projects/suggestions/answer`, con `body.project_id`, que responde `project_merged` a una lápida;
+- `POST /projects/locate`, con `body.project`, que responde `project_merged` a una lápida.
+
+**Tests:** las tres en `every_route_says_which_project_it_takes`, `every_route_that_takes_a_project_follows_a_merge` y `every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule` (`tests/api.rs`).
+
+## PL41. El contrato del modelo
+
+`agent_contract.json` y `agent_contract.es.json` MUST cambiar sólo por los argumentos de PL34 y la herramienta de PL37, y se vuelven a bendecir. `protocol.md` y `protocol.es.md` MUST decir, fuera de su apertura, cuándo usar `project` (un proyecto sin carpeta, como una idea, o uno que no es el del directorio), que un nombre con parecidos se pregunta, y que una sugerencia se le pregunta a la persona antes de `answer_suggestion`. La apertura de cada variante sigue en 2048 caracteres o menos.
+
+**Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` (vueltos a bendecir); los de `protocol.rs` y `tools_es.rs`.
+
+## PL42. Lo que no cambia en la entrega 3a
+
+- El esquema: ninguna migración.
+- La resolución de una raíz (R1, PL4, PL5): un subproyecto de un monorepo sigue siendo parte del repositorio (entrega 3b).
+- `POST /v1/projects` y los ids que da: el puente y los hooks siguen igual sin el argumento nuevo.
+- `rename`, `merge`, `keep-apart` y `delete` siguen tomando ids.
+- El import no crea sugerencias ni proyectos sin carpeta (entrega 4).

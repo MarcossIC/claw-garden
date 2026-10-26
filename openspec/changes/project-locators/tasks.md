@@ -389,3 +389,85 @@ Requisitos en la [spec](spec.md#entrega-2b-borrar-proyectos) (PL21 a PL31) y dec
   - `doctor` no marca nada nuevo.
 - [x] `verify.md`, sección «Entrega 2b».
 - [x] No queda otro directorio de build que `target` y `target-test`.
+
+## Entrega 3a. Proyectos sin carpeta y el agente
+
+Requisitos en la [spec](spec.md#entrega-3a-proyectos-sin-carpeta-y-el-agente) (PL32 a PL42) y decisiones en el [diseño](design.md#entrega-3a-proyectos-sin-carpeta-y-el-agente) (D38 a D49). Sin migración.
+
+### 35. Resolver una referencia y crear un proyecto en el store (PL32, PL33; D38 a D43)
+
+- [ ] RED (`registry.rs`):
+  - las puras `name_keys_join_what_people_write_alike` y `a_new_project_gets_a_slug_and_four_hex_digits`;
+  - `a_reference_is_an_id_before_a_name`, `a_name_two_projects_hold_is_ambiguous`, `a_similar_name_creates_nothing_unless_asked`, `a_deleted_project_is_a_candidate_by_name_and_itself_by_id`, `a_reference_is_bounded` y `a_project_is_created_once_by_name`.
+- [ ] GREEN: `name_key`, `new_project_id`, `resolve_project(store, reference, ResolveOptions)` con `Resolved` y sus candidatos, y `ResolveError` con `thiserror`.
+- Commit: `feat(core): resolve a project by id or name and create one without a folder`
+
+### 36. La sugerencia por nombre de carpeta (PL38; D46)
+
+- [ ] RED (`project.rs`): `a_folder_named_as_a_project_whose_folders_are_gone_is_suggested` y `a_folder_named_as_a_project_still_there_is_not_suggested`, con el `Ground` falso.
+- [ ] GREEN: en `plan_in`, los proyectos de la misma clave de nombre con sus checkouts grabados entran a `Planned::Presence`, y la sugerencia `folder_name` a `Plan::suggestions`.
+- Commit: `feat(core): suggest the project a moved folder is named after`
+
+### 37. Las sugerencias del contexto y su respuesta en el store (PL36, PL37; D45)
+
+- [ ] RED (`registry.rs`): `the_pending_suggestions_of_a_project_are_read_through_merges` y `a_suggestion_is_answered_only_when_pending`.
+- [ ] GREEN: `pending_suggestions(store, project_id)`, con la lectura de `listed`; `pending_between(store, a, b)`.
+- Commit: `feat(core): read the pending suggestions of a project`
+
+### 38. Las rutas del daemon (PL32, PL35 a PL37, PL39, PL40)
+
+- [ ] RED (`tests/api.rs`):
+  - `a_reference_resolves_through_the_daemon`;
+  - `a_move_and_a_patch_take_a_project_by_name` y `a_name_two_projects_hold_is_refused_as_a_target`;
+  - `the_context_names_the_pending_suggestions_of_its_project`;
+  - `answering_a_suggestion_needs_the_users_answer`, `answering_apart_keeps_the_pair_from_coming_back`, `answering_merge_merges_and_is_undone` y `answering_without_a_pending_suggestion_is_404`;
+  - `locating_a_folder_merges_its_own_project_into_the_named_one` y `a_folder_shared_by_its_project_is_not_located`;
+  - `a_folder_without_vcs_moved_is_suggested_and_shown_until_answered`;
+  - las tres rutas en la tabla de PL19 y en sus dos recorridos.
+- [ ] GREEN: `POST /v1/projects/resolve`, `POST /v1/projects/suggestions/answer` y `POST /v1/projects/locate`; los nombres en `move_memories` y en el `PATCH`; `suggestions` en `ContextBody`.
+- Commit: `feat(daemon): resolve, answer and locate projects`
+
+### 39. El cliente y el puente (PL34, PL36, PL37; D44, D45)
+
+- [ ] RED:
+  - `saving_to_a_project_by_name_creates_it`, `a_similar_name_is_answered_with_its_candidates`, `project_and_project_path_are_refused_together`, `searching_the_docs_of_a_project_without_a_folder_says_so` y `answer_suggestion_says_what_it_did` (`server.rs`);
+  - `a_suggestion_is_shown_until_answered`, en los dos idiomas (`tools.rs`).
+- [ ] GREEN: los métodos del cliente (`resolve_project`, `answer_suggestion`, `locate_project`), `suggestions` en `Context`; los argumentos `project`, `new_project` y `to_project`; la herramienta `answer_suggestion`; `suggestion_lines` en `format_recall`.
+- Commit: `feat(mcp): name a project by id or name and answer its suggestions`
+
+### 40. `session-start` muestra las sugerencias (PL36)
+
+- [ ] RED (`hook.rs`): `session_start_names_the_pending_suggestions`.
+- [ ] GREEN: las líneas de `suggestion_lines` en el texto de `session-start`.
+- Commit: `feat(hooks): name the pending suggestions of the project at session start`
+
+### 41. El contrato del modelo (PL41)
+
+- [ ] `tools_es.rs`: los argumentos nuevos y `answer_suggestion`.
+- [ ] `protocol.md` y `protocol.es.md`: una sección `## Projects` / `## Proyectos`, fuera de la apertura.
+- [ ] `CLAWG_BLESS=1` de los dos contratos, y revisar el diff.
+- Commit: `feat(mcp): describe projects by name to the model`
+
+### 42. `clawg projects create` y `clawg projects locate` (PL39)
+
+- [ ] RED: `projects_create_and_locate_parse` (`cli.rs`); `a_created_project_or_its_candidates_are_printed` (`projects.rs`, en los dos idiomas).
+- [ ] GREEN: `ProjectsAction::Create` y `ProjectsAction::Locate`, sus métodos del cliente y lo que imprimen, con una sentencia por `match` sobre `Lang`.
+- Commit: `feat(cli): add projects create and locate`
+
+### 43. Las specs y la documentación
+
+- [ ] `specs/project`: PL32 a PL40, y PL35 en R10.
+- [ ] `specs/mcp`: el argumento `project`, `to_project`, `new_project` y `answer_suggestion`.
+- [ ] `specs/hooks`: las sugerencias en `session-start`.
+- [ ] `.claude/CLAUDE.md`: los proyectos sin carpeta y la sugerencia `folder_name` en «Data profiles»; `projects create|locate` en «Commands»; las tres rutas, los nombres en `move` y `PATCH` y `suggestions` en la API; las herramientas MCP.
+- Commit: `docs: record projects without a folder and the agent`
+
+### 44. Verificación
+
+- [ ] La suite y los dos clippy de `.claude/CLAUDE.md`, en Linux.
+- [ ] El binario en un home temporal:
+  - un save con `project` crea un proyecto sin carpeta, y otro con un nombre parecido devuelve el candidato;
+  - `projects create` y `projects locate` desde la CLI;
+  - una carpeta sin VCS movida deja su sugerencia, `recall_context` y `session-start` la muestran, y `answer_suggestion` con `apart` la quita.
+- [ ] `verify.md`, sección «Entrega 3a».
+- [ ] No queda otro directorio de build que `target` y `target-test`.

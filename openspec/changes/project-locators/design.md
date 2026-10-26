@@ -8,7 +8,7 @@ Este diseño resuelve la **entrega 1** de la [propuesta](proposal.md#1-el-regist
 - la integridad referencial (D7);
 - el nombre (D8).
 
-Las demás esperan a su entrega (al final). Los requisitos están en la [spec](spec.md). La [entrega 2a](#entrega-2a-unir-proyectos) (D15 a D25) está después de las decisiones de la entrega 1.
+Las demás esperan a su entrega (al final). Los requisitos están en la [spec](spec.md). La [entrega 2a](#entrega-2a-unir-proyectos) (D15 a D25), la [2b](#entrega-2b-borrar-proyectos) (D26 a D37) y la [3a](#entrega-3a-proyectos-sin-carpeta-y-el-agente) (D38 a D49) están después de las decisiones de la entrega 1.
 
 ## El modelo
 
@@ -287,11 +287,11 @@ Lo que la entrega 3 suma encima:
 |---|---|
 | El archivo marcador | Ninguna: sigue fuera de alcance |
 | Volver a importar un export de clawg después de un movimiento simple | 4 |
-| Una búsqueda cuando el cwd no resuelve a ningún proyecto | 3 |
-| Cómo responde el agente una sugerencia, y si unir exige `user_answered` | 3 (la respuesta por CLI es de la 2a, D22) |
+| Una búsqueda cuando el cwd no resuelve a ningún proyecto | 3a ([D44](#d44-el-argumento-en-el-puente-y-las-búsquedas-sin-proyecto)) |
+| Cómo responde el agente una sugerencia, y si unir exige `user_answered` | 3a ([D45](#d45-el-agente-responde-una-sugerencia-con-answer_suggestion)); la respuesta por CLI es de la 2a, D22 |
 | Un save bajo el id de un proyecto borrado | 2b ([D27](#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)) |
 | Los tipos nuevos de `memory_import_extra` | 4 |
-| Los subproyectos de un monorepo y las carpetas sin VCS | 3 (D14) |
+| Los subproyectos de un monorepo y las carpetas sin VCS | las carpetas sin VCS, 3a (D46, D48); los subproyectos, 3b (D14, D49) |
 
 # Entrega 2a: unir proyectos
 
@@ -657,3 +657,119 @@ La regla de pares de D25 (mismo nombre, o mismo primer commit sin un remoto que 
   ```
 - **Un borrado.** Con `clawg projects delete --undo N`, o con su snapshot `pre-delete`.
 - **Una purga.** Sólo con un snapshot, que guarda justo el texto que se quería sacar.
+
+# Entrega 3a: proyectos sin carpeta y el agente
+
+Esta parte resuelve la **entrega 3a** de la [propuesta](proposal.md#3-proyectos-sin-carpeta-y-el-agente): el argumento `project` del contrato, crear un proyecto sin carpeta, los nombres donde hoy van ids, `projects create|locate`, las sugerencias que el agente ve y responde, y la sugerencia por nombre de carpeta. Los requisitos están en la [spec](spec.md#entrega-3a-proyectos-sin-carpeta-y-el-agente) (PL32 a PL42).
+
+La persona eligió cuatro cosas el 2026-10-26:
+
+- partir la entrega 3: los subproyectos de un monorepo van en una 3b con su propia migración (D49);
+- que el agente responda una sugerencia con una herramienta nueva, que pide la respuesta de la persona para unir y para separar (D45);
+- que el id de un proyecto borrado lo haga volver con un save, y que su nombre lo muestre como candidato (D42);
+- que el agente cree un proyecto aparte, aunque haya parecidos, con `new_project` (D41).
+
+## D38. Una referencia se resuelve en el daemon, en una ruta propia
+
+El puente no tiene el registro, y los hooks, la CLI y el puente tienen que resolver igual. Por eso `POST /v1/projects/resolve` resuelve y, si se pide, crea, en una transacción. El orden es el que fijó D8: id, después nombre. El id gana porque es único y porque un nombre como `release-2024` puede tener la forma de un id sin serlo.
+
+| Alternativa | Por qué no |
+|---|---|
+| Resolver en cada ruta que toma un proyecto (`/v1/memories`, `/v1/search`, …) | Cada ruta tendría que responder candidatos en su propia forma, y un save rechazado por un parecido ya habría pasado la validación del outbox. Con una ruta aparte, el save recibe un id, como hoy |
+| Resolver en el puente leyendo `GET /v1/projects` | Lee carpetas en disco por cada llamada, y crear quedaría fuera de la transacción que mira el nombre |
+
+## D39. Parecido es la misma clave de nombre
+
+La clave (`name_key`) es el nombre en minúsculas, sin nada que no sea letra o dígito. Junta lo que la gente escribe distinto para lo mismo (`Mi App`, `mi-app`, `MiApp`), y nada más.
+
+| Alternativa | Por qué no |
+|---|---|
+| Distancia de edición | `api` y `app`, o `web` y `wiki`, serían parecidos: el agente preguntaría por proyectos que no tienen nada que ver |
+| Sólo el nombre exacto, como `project_duplicates` (D25) | `Mi App` y `mi-app` crearían dos proyectos sin preguntar |
+| Comparar también con el nombre de cada carpeta | La carpeta ya da el nombre del proyecto que nace de ella (D6). Una carpeta renombrada a mano es justo lo que el usuario cambió |
+
+Los borrados entran como candidatos, marcados, y las lápidas no: el nombre de una lápida quedó libre (PL15) y su id lleva a otro proyecto, que ya está entre los vivos.
+
+## D40. El id de un proyecto nuevo
+
+`slug-4hex` (decisión 6 de la propuesta). El slug sigue la forma de los ids de hoy (`derive_project_id`), que nacen de un nombre de carpeta: minúsculas ASCII, dígitos y `-`. Un nombre sin letras ASCII (`проект`) da `project-XXXX`. El nombre conserva lo que escribió la persona.
+
+Los cuatro hex salen de SHA-256 sobre el nombre, la hora en milisegundos y un contador, y se prueban hasta 64 contadores contra `project` y `project_path`. No se derivan sólo del nombre: el nombre de un proyecto borrado queda libre (PL27), y un proyecto nuevo con ese nombre no puede tomar el id del borrado.
+
+## D41. Crear aparte, con `new_project`
+
+Cuando hay parecidos, el agente le pregunta a la persona. Si la persona dice que es otro proyecto, el agente vuelve a guardar con `new_project: true`. El nombre exacto de un proyecto vivo nunca crea otro: con `new_project` también resuelve a ese proyecto, porque dos proyectos vivos con el mismo nombre elegido son lo que D8 evita.
+
+`new_project` no deja una sugerencia con los parecidos: la persona ya respondió.
+
+| Alternativa | Por qué no |
+|---|---|
+| Sólo por CLI (`clawg projects create --new`) | La persona tendría que salir de la conversación para algo que ya contestó |
+
+## D42. Un proyecto borrado en el argumento `project`
+
+- **Por id:** se resuelve a sí mismo, y un save bajo él lo hace volver por el disparador de D27, como un save desde un puente abierto. Buscar bajo él no encuentra filas vivas, y eso está bien.
+- **Por nombre:** su nombre quedó libre, así que no resuelve. Aparece como candidato `deleted` con su borrado abierto, y el agente pregunta: volver a usarlo es guardar con su id; uno nuevo, `new_project`.
+
+## D43. Las respuestas que leen candidatos son 200
+
+Como en D31: una respuesta con candidatos es lo que el agente necesita para preguntar, y `ErrorBody` no tiene lugar para una lista. `refused` vale `ambiguous`, `similar` o `unknown`. Los 400 quedan para una referencia vacía o demasiado larga.
+
+## D44. El argumento en el puente, y las búsquedas sin proyecto
+
+`project` y `project_path` se excluyen: los dos dicen dónde. `project` se resuelve en cada llamada; el puente no lo guarda, porque un nombre puede pasar a otro proyecto con un `rename`, y la ruta cuesta una lectura por clave.
+
+Sólo `save_memory` crea, porque un save es lo único que necesita un proyecto donde quedar. Una búsqueda con un nombre que no existe no tiene nada que encontrar, y crear ahí dejaría proyectos vacíos. `update_memory` mueve a un proyecto que ya existe: para uno nuevo, primero se guarda en él o se crea con `clawg projects create`.
+
+`search_project` con `project` busca en la carpeta más vieja con `index_docs`, o en la más vieja si ninguna lo tiene (y entonces el daemon responde su 403 con el comando que la agrega). Un proyecto sin carpeta no tiene archivos, y lo dice.
+
+**Una búsqueda cuando el directorio del puente no da ningún proyecto** sigue sin alcance, como hoy (la decisión abierta de la propuesta). El caso es un puente sin directorio de trabajo, y ahí un error no ayudaría: `project` ya da la forma de nombrar uno.
+
+## D45. El agente responde una sugerencia con `answer_suggestion`
+
+Lo eligió la persona: una herramienta nueva, con `answer` (`merge` o `apart`), que pide `user_answered` y la respuesta en `reason` para los dos, como `resolve_conflict` con una preferencia. Unir mueve todo lo de un proyecto, y separar hace que el par no se vuelva a preguntar: las dos son decisiones de la persona.
+
+La ruta sólo responde una sugerencia pendiente (404 `no_suggestion` si no la hay): el agente no une proyectos que nadie sugirió. Unir pasa `other` a `project`, el del puente por defecto, con `merge_core` (D18 a D21), así que tiene su snapshot, su diario y su `--undo`. Como lo que administra proyectos (D23, D35), no sigue lápidas ni toma borrados: el contexto le muestra al agente los ids vivos.
+
+`reason` no se guarda: `project_suggestion` no tiene columna para eso, y la respuesta sólo dice unir o separar. Pedirla hace que el agente tenga que preguntar.
+
+| Alternativa | Por qué no |
+|---|---|
+| Un argumento en una herramienta existente (`update_memory`, `resolve_conflict`) | Ninguna trata de proyectos, y su descripción se volvería confusa |
+| Sólo separar desde el agente, unir por CLI | Unir se deshace con `--undo`, y es la respuesta más común a una copia o a una mudanza |
+
+## D46. La sugerencia por nombre de carpeta
+
+La decisión 3 de la propuesta: una carpeta con el nombre de un proyecto cuyo camino ya no existe es evidencia débil. Se aplica a una raíz que, después de PL4 y PL5, abre un proyecto nuevo: es la carpeta sin VCS (o con VCS sin primer commit) que se movió. La condición es que **todos** los checkouts grabados del otro proyecto ya no estén: si alguno sigue, es otro proyecto con el mismo nombre (dos carpetas `api`), y preguntar cansaría.
+
+El disco se mira en la misma pasada que las mudanzas (`Planned::Presence`, D9), sumando los checkouts de esos proyectos. Las sugerencias son las de PL6: una por par, que una respuesta guarda.
+
+## D47. Nombres en `--to-project` y en `PATCH`
+
+El daemon resuelve el nombre al entrar, antes de `target_in`, y no busca parecidos ni crea: quien mueve a mano nombra un proyecto que existe. El id va primero y sin seguir la lápida, porque `target_in` la sigue (o la rechaza) en la transacción, como hoy.
+
+## D48. `projects locate` une el proyecto de la carpeta en el nombrado
+
+«Esta carpeta es el proyecto X» quiere decir que lo guardado desde ella es de X. Cuando la carpeta ya tiene su proyecto P, con su única carpeta, eso es unir P en X: la unión lleva sus filas, su carpeta y sus remotos, y deja su diario y su `--undo`. Si P tiene otras carpetas, unirlo se llevaría también esas, que nadie nombró: `folder_shared` lo dice, y la persona decide con `projects merge`.
+
+| Alternativa | Por qué no |
+|---|---|
+| Reescribir `project_path.project_id` de la carpeta | Las filas guardadas desde ella quedarían en P, y no tendría `--undo` |
+| Rechazar si P tiene filas | Es el caso común: una carpeta movida que ya recibió saves antes de ubicarla |
+
+## D49. Lo que queda para la entrega 3b
+
+Los subproyectos de un monorepo cambian la resolución de una raíz (la carpeta registrada más profunda, con el camino crudo del cliente) y la clave de `project_remote` (remoto más subcarpeta), que es su clave primaria (`V24__project_remote.sql:9`). Eso pide reconstruir la tabla o guardar la subcarpeta aparte, y cambia `POST /v1/projects`, los hooks y el import. Es un riesgo distinto del de esta entrega, que no toca el esquema ni la resolución de raíces, así que va en la 3b, con su spec, su diseño y su migración.
+
+## Costos en el camino caliente de la entrega 3a
+
+- Una herramienta con `project` suma un pedido a `POST /v1/projects/resolve`: una lectura por clave, o una pasada por los nombres de `project` (decenas de filas).
+- Cada `context` suma la lectura de las sugerencias pendientes, por el índice del par.
+- Un registro de un camino nuevo que abre un proyecto suma la lectura de los nombres y, si alguno coincide, un `stat` por cada carpeta de ese proyecto.
+
+## Volver atrás de la entrega 3a
+
+- **El esquema.** No cambia.
+- **Un proyecto creado por nombre.** Es un proyecto como otro: se borra con `clawg projects delete` (vacío, o con sus memorias) o se une con `merge`.
+- **Una unión de `answer_suggestion` o de `locate`.** Con `clawg projects merge --undo N`.
+- **Una respuesta `apart`.** Como la de `keep-apart`: el par queda respondido. Para volver a preguntarlo, se borra su fila de `project_suggestion` a mano.
