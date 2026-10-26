@@ -40,6 +40,7 @@ pub mod outbox;
 pub mod portability;
 pub(crate) mod pieces;
 pub mod project;
+pub mod project_delete;
 pub mod project_docs;
 pub mod provenance;
 pub mod model_download;
