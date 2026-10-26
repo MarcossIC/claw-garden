@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use clawg_core::memory::merge::MergeReport;
-use clawg_core::memory::project_delete::{Counts, DeleteReport, KeepReason, Refusal};
+use clawg_core::memory::project_delete::{Candidate, Counts, DeleteReport, KeepReason, Refusal};
 use clawg_core::memory::registry::{ListedDelete, ListedProject, ListedSuggestion};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::ProjectIdentity;
@@ -340,6 +340,22 @@ fn candidate_reason(lang: Lang, reason: &str) -> String {
     }
 }
 
+/// The candidates of `report`, one per project, each with its reasons once:
+/// a duplicate by first commit is often also a pending suggestion of it, and
+/// both read the same.
+fn candidates(lang: Lang, report: &DeleteReport) -> Vec<(&Candidate, String)> {
+    let mut found: Vec<(&Candidate, Vec<String>)> = Vec::new();
+    for c in &report.candidates {
+        let why = candidate_reason(lang, &c.reason);
+        match found.iter_mut().find(|(seen, _)| seen.project_id == c.project_id) {
+            Some((_, whys)) if whys.contains(&why) => {}
+            Some((_, whys)) => whys.push(why),
+            None => found.push((c, vec![why])),
+        }
+    }
+    found.into_iter().map(|(c, whys)| (c, whys.join("; "))).collect()
+}
+
 /// Why a row an undo leaves deleted stays so.
 fn keep_reason(lang: Lang, reason: KeepReason) -> &'static str {
     match (reason, lang) {
@@ -383,8 +399,8 @@ pub fn render_delete(lang: Lang, report: &DeleteReport, undo: bool) -> String {
                 Lang::En => format!("{name} ({id}) has live rows: {rows}, so it is not deleted. To empty it:"),
                 Lang::Es => format!("{name} ({id}) tiene filas vivas: {rows}, así que no se borra. Para vaciarlo:"),
             }];
-            for c in &report.candidates {
-                let (other, other_name, why) = (&c.project_id, &c.name, candidate_reason(lang, &c.reason));
+            for (c, why) in candidates(lang, report) {
+                let (other, other_name) = (&c.project_id, &c.name);
                 lines.push(match lang {
                     Lang::En => format!(
                         "`clawg projects merge {id} --into {other} --dry-run` joins it into {other_name} ({other}): {why}"
@@ -567,9 +583,8 @@ fn render_set(lang: Lang, report: &DeleteReport) -> String {
             ),
         });
     }
-    for c in &report.candidates {
-        let (other, why) = (&c.project_id, candidate_reason(lang, &c.reason));
-        let other_name = &c.name;
+    for (c, why) in candidates(lang, report) {
+        let (other, other_name) = (&c.project_id, &c.name);
         lines.push(match lang {
             Lang::En => format!(
                 "it could be emptied into another project instead: `clawg projects merge {id} --into {other} --dry-run` ({other_name}: {why})"
@@ -1573,6 +1588,34 @@ mod tests {
             Some("no se pudo borrar ahora: 2 saves of this project are still being stored; try again in a moment; se puede volver a intentar en un momento")
         );
         assert_eq!(delete_refused(Lang::En, false, &daemon(500, "boom", None)), None);
+    }
+
+    #[test]
+    fn a_candidate_offered_for_two_reasons_is_named_once() {
+        // A duplicate by first commit is often also a pending suggestion of it.
+        let candidates = serde_json::json!([
+            { "project_id": "copia-5e6f", "name": "copia", "reason": "root_commit" },
+            { "project_id": "copia-5e6f", "name": "copia", "reason": "same_first_commit" },
+            { "project_id": "web-3c4d", "name": "App web", "reason": "root_commit" },
+            { "project_id": "web-3c4d", "name": "App web", "reason": "same_name" },
+        ]);
+        let refused = delete_report(serde_json::json!({
+            "refused": "not_empty", "live": { "memories": 1, "trajectories": 0, "skills": 0 }, "candidates": candidates,
+        }));
+        let merges: Vec<String> =
+            render_delete(Lang::En, &refused, false).lines().filter(|l| l.contains("projects merge")).map(str::to_string).collect();
+        assert_eq!(
+            merges,
+            vec![
+                "`clawg projects merge app-1a2b --into copia-5e6f --dry-run` joins it into copia (copia-5e6f): they share their first commit",
+                "`clawg projects merge app-1a2b --into web-3c4d --dry-run` joins it into App web (web-3c4d): \
+                 they share their first commit; they have the same name",
+            ]
+        );
+        let report = delete_report(serde_json::json!({ "code": "1a2b3c4d", "candidates": candidates }));
+        let es = render_delete(Lang::Es, &report, false);
+        assert_eq!(es.matches("--into copia-5e6f").count(), 1, "{es}");
+        assert!(es.contains("(App web: comparten el primer commit; tienen el mismo nombre)"), "{es}");
     }
 
     #[test]
