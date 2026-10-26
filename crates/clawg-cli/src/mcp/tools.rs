@@ -19,6 +19,7 @@ use std::path::Path;
 use clawg_core::memory::dispute::{OpenPairs, Resolution, ResolvedRow};
 use clawg_core::memory::prompt_builder::{display_author, shared_note};
 use clawg_core::memory::provenance::mark;
+use clawg_core::memory::registry::{ListedSuggestion, Refusal, Resolution as ProjectResolution};
 use clawg_core::memory::sharing::{Reach, SharingError, SharingPolicy};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
@@ -750,6 +751,124 @@ pub(crate) fn review_nudge(lang: Lang, conclusions: usize) -> Option<String> {
     })
 }
 
+/// Why a registration thought two projects may be one, in words.
+fn suggestion_reason(lang: Lang, reason: &str) -> String {
+    match (reason, lang) {
+        ("root_commit", Lang::En) => "a checkout with the same first commit".into(),
+        ("root_commit", Lang::Es) => "un checkout con el mismo primer commit".into(),
+        ("remote_changed", Lang::En) => "the remote of the same folder changed".into(),
+        ("remote_changed", Lang::Es) => "cambió el remoto de la misma carpeta".into(),
+        ("folder_name", Lang::En) => "a folder of the same name whose earlier folders are gone".into(),
+        ("folder_name", Lang::Es) => "una carpeta con el mismo nombre cuyas carpetas anteriores ya no están".into(),
+        (other, _) => other.to_string(),
+    }
+}
+
+/// One line per suggestion nobody answered that the project may be another
+/// one: `recall_context` and `session-start` show them until they are
+/// answered, as they show ACTIVE CONFLICTS.
+pub(crate) fn suggestion_lines(lang: Lang, suggestions: &[ListedSuggestion]) -> Vec<String> {
+    suggestions
+        .iter()
+        .map(|s| {
+            let other = match &s.other_name {
+                Some(name) => format!("{name} ({})", s.other_id),
+                None => s.other_id.clone(),
+            };
+            let why = suggestion_reason(lang, &s.reason);
+            match lang {
+                Lang::En => format!(
+                    "This project may be the same as project {other} ({why}). Ask the user whether they are one \
+                     project, then call `answer_suggestion` with other {}, answer merge or apart, user_answered and \
+                     their words in reason.",
+                    s.other_id
+                ),
+                Lang::Es => format!(
+                    "Este proyecto puede ser el mismo que el proyecto {other} ({why}). Pregúntale a la persona si son \
+                     un solo proyecto, y después llama a `answer_suggestion` con other {}, answer merge o apart, \
+                     user_answered y sus palabras en reason.",
+                    s.other_id
+                ),
+            }
+        })
+        .collect()
+}
+
+/// What a tool says when `reference` led to no project, without doing
+/// anything: the projects it may mean, and what to ask the user. `creates`
+/// is a save, which may make a project apart with `new_project`.
+pub fn format_refusal(lang: Lang, reference: &str, resolution: &ProjectResolution, creates: bool) -> String {
+    let named = resolution
+        .candidates
+        .iter()
+        .map(|c| match (c.deleted, lang) {
+            (false, _) => format!("{} \"{}\"", c.id, c.name),
+            (true, Lang::En) => format!("{} \"{}\" (deleted; saving under its id brings it back)", c.id, c.name),
+            (true, Lang::Es) => format!("{} \"{}\" (borrado; guardar con su id lo trae de vuelta)", c.id, c.name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match (resolution.refused, creates, lang) {
+        (Some(Refusal::Ambiguous), _, Lang::En) => format!(
+            "nothing done: more than one project is named \"{reference}\": {named}. Ask the user which one they mean \
+             and pass its id as project"
+        ),
+        (Some(Refusal::Ambiguous), _, Lang::Es) => format!(
+            "no se hizo nada: hay más de un proyecto llamado \"{reference}\": {named}. Pregúntale a la persona cuál \
+             es y pasa su id como project"
+        ),
+        (Some(Refusal::Similar), true, Lang::En) => format!(
+            "not saved: no project is named \"{reference}\", but these are close: {named}. Ask the user whether the \
+             memory belongs to one of them and pass its id as project, or, if it is another project, save again \
+             with new_project true"
+        ),
+        (Some(Refusal::Similar), true, Lang::Es) => format!(
+            "no se guardó: ningún proyecto se llama \"{reference}\", pero estos se parecen: {named}. Pregúntale a la \
+             persona si la memoria es de uno de ellos y pasa su id como project, o, si es otro proyecto, guarda de \
+             nuevo con new_project true"
+        ),
+        (Some(Refusal::Similar), false, Lang::En) => format!(
+            "nothing done: no project is named \"{reference}\", but these are close: {named}. Ask the user which one \
+             they mean and pass its id as project"
+        ),
+        (Some(Refusal::Similar), false, Lang::Es) => format!(
+            "no se hizo nada: ningún proyecto se llama \"{reference}\", pero estos se parecen: {named}. Pregúntale a \
+             la persona cuál es y pasa su id como project"
+        ),
+        (_, _, Lang::En) => format!(
+            "nothing done: no project has the id or the name \"{reference}\"; save_memory with project creates one"
+        ),
+        (_, _, Lang::Es) => format!(
+            "no se hizo nada: ningún proyecto tiene el id ni el nombre \"{reference}\"; save_memory con project crea uno"
+        ),
+    }
+}
+
+/// What `answer_suggestion` did.
+pub fn format_answered(lang: Lang, answered: &crate::client::AnsweredSuggestion) -> String {
+    let (project, other) = (&answered.project_id, &answered.other_id);
+    match (answered.merge.as_ref().and_then(|m| m.merge_id), lang) {
+        (Some(n), Lang::En) => format!(
+            "merged project {other} into {project} (merge {n}); everything saved under {other} is in {project} now, \
+             and `clawg projects merge --undo {n}` undoes it"
+        ),
+        (Some(n), Lang::Es) => format!(
+            "se unió el proyecto {other} en {project} (unión {n}); todo lo guardado bajo {other} está ahora en \
+             {project}, y `clawg projects merge --undo {n}` lo deshace"
+        ),
+        (None, Lang::En) => format!("{project} and {other} stay two projects, and will not be suggested again"),
+        (None, Lang::Es) => format!("{project} y {other} siguen siendo dos proyectos, y no se van a volver a sugerir"),
+    }
+}
+
+/// What `search_project` says of a project with no folder on this machine.
+pub fn no_folder(lang: Lang, project: &str) -> String {
+    match lang {
+        Lang::En => format!("project {project} has no folder on this machine, so it has no files to search"),
+        Lang::Es => format!("el proyecto {project} no tiene carpeta en esta máquina, así que no tiene archivos que buscar"),
+    }
+}
+
 /// Why the context holds no memory, said before it: a prompt holding only the
 /// workspace, or nothing, otherwise reads as "there are no memories".
 fn retrieval_notice(lang: Lang, retrieval: &Retrieval, has_context: bool) -> Option<String> {
@@ -826,6 +945,7 @@ pub fn format_recall(context: &Context, language: Option<Lang>) -> String {
     if let Some(Retrieval::Searched { hits, .. }) = &context.retrieval {
         out.extend(other_language_line(language, context.other_language.as_ref(), *hits));
     }
+    out.extend(suggestion_lines(lang, &context.suggestions));
     out.join("\n\n")
 }
 
@@ -2204,5 +2324,31 @@ mod tests {
              workspace está vacío; eso no significa que no haya memorias."
         );
         assert_eq!(format_sharing(Lang::Es, &Ok(SharingPolicy::default()), "a"), "compartido: lee y cambia las memorias de todos los agentes");
+    }
+
+    #[test]
+    fn a_suggestion_is_shown_until_answered() {
+        let suggestion = ListedSuggestion {
+            other_id: "notas-1a2b".into(),
+            other_name: Some("notas".into()),
+            reason: "folder_name".into(),
+            created_at: 1,
+        };
+        let pending = Context { prompt: "## WORKSPACE\nstuff".into(), suggestions: vec![suggestion], ..Default::default() };
+
+        let en = format_recall(&pending, None);
+        assert!(en.ends_with(
+            "This project may be the same as project notas (notas-1a2b) (a folder of the same name whose earlier folders \
+             are gone). Ask the user whether they are one project, then call `answer_suggestion` with other notas-1a2b, \
+             answer merge or apart, user_answered and their words in reason."
+        ), "{en}");
+        let es = format_recall(&pending, Some(Lang::Es));
+        assert!(es.ends_with(
+            "Este proyecto puede ser el mismo que el proyecto notas (notas-1a2b) (una carpeta con el mismo nombre cuyas \
+             carpetas anteriores ya no están). Pregúntale a la persona si son un solo proyecto, y después llama a \
+             `answer_suggestion` con other notas-1a2b, answer merge o apart, user_answered y sus palabras en reason."
+        ), "{es}");
+        let answered = Context { suggestions: Vec::new(), ..pending };
+        assert!(!format_recall(&answered, None).contains("answer_suggestion"), "an answered one is no longer pending");
     }
 }

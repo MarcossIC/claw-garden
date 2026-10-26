@@ -306,7 +306,7 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
         "update_memory",
         Some("clear_project"),
         "True para sacar esta memoria de todos los proyectos, así la encuentran las búsquedas de cualquier \
-         proyecto. No con to_project_path.",
+         proyecto. No con to_project_path ni con to_project.",
     ),
     (
         "update_memory",
@@ -340,5 +340,62 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
         Some("user_answered"),
         "True sólo cuando la persona te lo pidió: sacar una user_preference o una architectural_decision de su \
          tipo, o moverla a otro proyecto, lo necesita.",
+    ),
+    (
+        "answer_suggestion",
+        None,
+        "Registra la respuesta de la persona a una sugerencia de que este proyecto y otro pueden ser uno solo, \
+         como la nombra `recall_context`. Pregúntale antes: merge pasa el otro proyecto y todo lo guardado en él \
+         a este, y `clawg projects merge --undo` lo devuelve; apart los deja como dos proyectos y quita la \
+         sugerencia. Necesita user_answered y sus palabras en reason.",
+    ),
+    (
+        "answer_suggestion",
+        Some("other"),
+        "El id del otro proyecto, como lo nombra `recall_context`.",
+    ),
+    (
+        "answer_suggestion",
+        Some("answer"),
+        "merge: el otro proyecto y todo lo guardado en él pasan a este. apart: siguen siendo dos proyectos, y no \
+         se vuelven a sugerir.",
+    ),
+    ("answer_suggestion", Some("reason"), "La respuesta de la persona, con sus palabras."),
+    (
+        "answer_suggestion",
+        Some("user_answered"),
+        "True sólo cuando la persona respondió si son un solo proyecto.",
+    ),
+    (
+        "answer_suggestion",
+        Some("project"),
+        "Este proyecto por su id o su nombre. Por defecto, el directorio en el que arrancó este puente.",
+    ),
+    (
+        "save_memory",
+        Some("project"),
+        "El proyecto de esta memoria por su id o su nombre, para uno sin carpeta aquí, como una idea, o que no \
+         es el de este directorio. Un nombre que ningún proyecto tiene ni se le parece crea el proyecto. No con \
+         project_path.",
+    ),
+    (
+        "save_memory",
+        Some("new_project"),
+        "True sólo cuando la persona dijo que un nombre parecido al de otros proyectos es un proyecto aparte: lo \
+         crea aparte. Sólo con project.",
+    ),
+    ("search_memory", Some("project"), "Para uno sin carpeta aquí o que no es el de este directorio, el proyecto por su id o su nombre. No con \
+         project_path."),
+    ("recall_context", Some("project"), "Para uno sin carpeta aquí o que no es el de este directorio, el proyecto por su id o su nombre. No con \
+         project_path."),
+    ("search_project", Some("project"), "Para uno sin carpeta aquí o que no es el de este directorio, el proyecto por su id o su nombre. No con \
+         project_path."),
+    ("synthesize", Some("project"), "Para uno sin carpeta aquí o que no es el de este directorio, el proyecto por su id o su nombre. No con \
+         project_path."),
+    (
+        "update_memory",
+        Some("to_project"),
+        "El proyecto al que mover esta memoria, por su id o su nombre, como to_project_path lo hace por un \
+         directorio.",
     ),
 ];

@@ -25,7 +25,9 @@ use clawg_core::memory::outbox::OutboxSummary;
 use clawg_core::memory::portability::{ImportReport, UndoReport};
 use clawg_core::memory::merge::MergeReport;
 use clawg_core::memory::project_delete::DeleteReport;
-use clawg_core::memory::registry::{KeptApart, ListedDelete, ListedProject, Project};
+use clawg_core::memory::registry::{
+    Born, KeptApart, ListedDelete, ListedProject, ListedSuggestion, Project, Resolution as ProjectResolution,
+};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
@@ -319,6 +321,34 @@ pub struct Context {
     /// As in [`Found`], for a context asked with a query and a language.
     #[serde(default)]
     pub other_language: Option<OtherLanguage>,
+    /// The suggestions nobody answered that the project may be another one.
+    /// A daemon that predates them sends none.
+    #[serde(default)]
+    pub suggestions: Vec<ListedSuggestion>,
+}
+
+/// What `POST /v1/projects/suggestions/answer` answers.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AnsweredSuggestion {
+    pub project_id: String,
+    pub other_id: String,
+    /// `merge` or `apart`.
+    pub answer: String,
+    /// The merge of `other_id` into `project_id`.
+    #[serde(default)]
+    pub merge: Option<MergeReport>,
+}
+
+/// What `POST /v1/projects/locate` answers.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Located {
+    pub project_id: String,
+    pub root_id: String,
+    /// The folder led there already.
+    pub already: bool,
+    /// The merge of the folder's own project into it.
+    #[serde(default)]
+    pub merge: Option<MergeReport>,
 }
 
 /// Whether `POST /v1/context` searched memories, and if not, why.
@@ -1438,6 +1468,39 @@ impl DaemonClient {
     pub async fn delete_projects(&self, request: &DeleteRequest) -> Result<DeleteReport, ClientError> {
         let call = Call::new(reqwest::Method::POST, "/v1/projects/delete").json(request)?;
         read_response(self.send(call).await?)
+    }
+
+    /// What `reference`, an id or a name, leads to; with `create`, a name
+    /// nothing has or resembles becomes a project without a folder.
+    pub async fn resolve_project(&self, reference: &str, create: bool, new_project: bool, born: Born) -> Result<ProjectResolution, ClientError> {
+        let body = serde_json::json!({ "project": reference, "create": create, "new_project": new_project, "born": born });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/projects/resolve").json(&body)?).await?)
+    }
+
+    /// Relays the user's answer to the suggestion that `project_id` and
+    /// `other_id` are one project: `merge` merges `other_id` into it.
+    pub async fn answer_suggestion(
+        &self,
+        project_id: &str,
+        other_id: &str,
+        answer: &str,
+        reason: &str,
+        user_answered: bool,
+    ) -> Result<AnsweredSuggestion, ClientError> {
+        let body = serde_json::json!({
+            "project_id": project_id,
+            "other_id": other_id,
+            "answer": answer,
+            "reason": reason,
+            "user_answered": user_answered,
+        });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/projects/suggestions/answer").json(&body)?).await?)
+    }
+
+    /// Makes the root of `root` lead to `project`, an id or a name.
+    pub async fn locate_project(&self, project: &str, root: &std::path::Path) -> Result<Located, ClientError> {
+        let body = serde_json::json!({ "project": project, "root_path": root.to_string_lossy() });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/projects/locate").json(&body)?).await?)
     }
 
     /// Answers that projects `project_id` and `other_id` are not one.

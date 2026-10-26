@@ -83,7 +83,7 @@ The contradiction detector (`crates/clawg-core/src/memory/contradiction.rs`) mea
 
 Each save is sealed with who stated it (`crates/clawg-core/src/memory/provenance.rs`): `source = 'explicit'` and `created_by_type = 'agent'` unless the save declares `user_stated`, which makes it `user`, and `source = 'synthesis'` with `agent` when it names `derived_from`; `user_stated` with `derived_from` is a 400 before the outbox, as is a `derived_from` naming a memory that is missing, deleted, out of the saver's reach or `superseded` (the refusal names what replaced it), and an outbox row without the field is the agent's. Rows saved before the seal read `explicit` / `user` whoever stated them, so no reader claims a row is the user's: `memory_status`, ACTIVE CONFLICTS and `synthesize` mark only `inferred`, `conclusion` and `imported` (the value an import writes), and a pair in `memory_status` names first the side without a mark. The origin changes no pair, status or score.
 
-MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`, `recall_context`, `search_project`, `list_memories`, `read_memory`, `update_memory`, `delete_memory`, `restore_memory`, `resolve_conflict`, `synthesize`, `memory_status`.
+MCP tools (`crates/clawg-cli/src/mcp/server.rs`): `save_memory`, `search_memory`, `recall_context`, `search_project`, `list_memories`, `read_memory`, `update_memory`, `delete_memory`, `restore_memory`, `resolve_conflict`, `answer_suggestion`, `synthesize`, `memory_status`.
 
 `update_memory` also moves a memory, with its unit, to the project of `to_project_path` (a directory, registered first as any path a tool names) or out of every project with `clear_project`, through `PATCH`.
 
