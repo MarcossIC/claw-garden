@@ -890,9 +890,9 @@ Cuando el directorio del puente no da ningún proyecto y la llamada no nombra un
 
 `POST /v1/context`, con consulta y sin ella, MUST responder `suggestions`: las sugerencias pendientes del proyecto, leídas como las lista `GET /v1/projects` (los lados por `canonical`, sin las que tienen un lado borrado, una por par), cada una con `other_id`, `other_name`, `reason` y `created_at`. Sin proyecto, o sin sugerencias, el campo se omite.
 
-`recall_context` y `session-start` MUST terminar con una línea por sugerencia, en el idioma de la sesión, que nombra los dos proyectos, el motivo, y que hay que preguntarle a la persona y responder con `answer_suggestion`. Se muestran hasta que se responden. Un daemon que no manda el campo no muestra nada.
+`recall_context` MUST terminar con una línea por sugerencia, en el idioma de la sesión, que nombra el otro proyecto, el motivo, y que hay que preguntarle a la persona y responder con `answer_suggestion`. `session-start` MUST terminar con una sola línea que nombra hasta dos de los otros proyectos (y cuántos más hay), que hay que preguntar y responder con `answer_suggestion`, y que `recall_context` dice por qué: lo que suma el hook pasa a tener un tope de 1.500 bytes, y con los 8.000 del contexto sigue entrando en los 10.000 caracteres que inyecta el host (R4 de [`specs/hooks`](../../specs/hooks/spec.md)). Se muestran hasta que se responden. Un daemon que no manda el campo no muestra nada.
 
-**Tests:** `the_context_names_the_pending_suggestions_of_its_project` (`tests/api.rs`); `a_suggestion_is_shown_until_answered` (`crates/clawg-cli/src/mcp/tools.rs`, en los dos idiomas); `session_start_names_the_pending_suggestions` (`crates/clawg-cli/src/hook.rs`).
+**Tests:** `the_context_names_the_pending_suggestions_of_its_project` (`tests/api.rs`); `a_suggestion_is_shown_until_answered` (`crates/clawg-cli/src/mcp/tools.rs`, en los dos idiomas); `session_start_names_the_pending_suggestions` y `what_the_hook_adds_stays_small`, con nueve sugerencias (`crates/clawg-cli/src/hook.rs`).
 
 ## PL37. El agente responde una sugerencia
 

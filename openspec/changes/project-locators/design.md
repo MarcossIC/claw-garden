@@ -733,6 +733,8 @@ La ruta sólo responde una sugerencia pendiente (404 `no_suggestion` si no la ha
 
 `reason` no se guarda: `project_suggestion` no tiene columna para eso, y la respuesta sólo dice unir o separar. Pedirla hace que el agente tenga que preguntar.
 
+**Dónde se ve.** `recall_context` da una línea por sugerencia, con su motivo. `session-start` da una sola, que nombra hasta dos proyectos y manda a `recall_context` por el motivo: el hook tenía un tope de 1.000 bytes para lo que suma, y el peor caso de antes (la compactación, el modelo que no cargó con su causa, los dos avisos de síntesis) ya ocupaba 978. El tope pasa a 1.500, que con los 8.000 del contexto (`SESSION_BUDGET`) sigue entrando en los 10.000 caracteres que inyecta el host.
+
 | Alternativa | Por qué no |
 |---|---|
 | Un argumento en una herramienta existente (`update_memory`, `resolve_conflict`) | Ninguna trata de proyectos, y su descripción se volvería confusa |
