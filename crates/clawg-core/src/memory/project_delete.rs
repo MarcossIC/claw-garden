@@ -4,16 +4,20 @@
 //! deleted project's id brings it back unreviewed, by the triggers of V29.
 //!
 //! A project without live rows is deleted at once. One with them is only
-//! reported, with the code of the set the report read; a delete with its rows
-//! comes after the person has seen that set.
+//! reported, with the code of the set the report read; deleting it with its
+//! rows takes that code back, and a code that is no longer the set's gets the
+//! new report instead of a delete.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
+use crate::memory::dispute::release_challengers;
 use crate::memory::inspect::{answered_pairs, duplicates, folder_prints, RegistryRow};
 use crate::memory::merge::{canonical_in, retrying, Retried};
 use crate::memory::project_docs::drop_root_index_in;
@@ -399,13 +403,25 @@ fn report_of(c: &Connection, set: &Set, with_memories: bool) -> Result<DeleteRep
     Ok(report)
 }
 
-/// Deletes an empty project inside the caller's transaction: journals every
-/// row it holds, all deleted already, turns off the docs index of its
-/// folders and marks it. Returns the delete's number.
-fn write_empty(c: &Connection, set: &Set, now: TimestampMs) -> rusqlite::Result<i64> {
+/// The vector table of each table of rows.
+const VECTORS: [(&str, &str); 3] = [
+    ("memory", "memory_vectors"),
+    ("episodic_trajectory", "episodic_vectors"),
+    ("procedural_skill", "procedural_vectors"),
+];
+
+/// Deletes a project inside the caller's transaction and returns the delete's
+/// number. With `taken`, the code and the snapshot of a delete with its rows,
+/// every live row of the set is marked deleted at once and loses its vector,
+/// and each row of `memory` releases the rows that disputed it. Marking them
+/// together is what keeps the older version of a key from coming back when the
+/// newer one goes, which deleting row by row would do. Then the set is
+/// journaled with the `deleted_at` each row had (none for the ones deleted
+/// here), the docs index of its folders goes, and the project is marked.
+fn write_delete(c: &Connection, set: &Set, taken: Option<(&str, &str)>, now: TimestampMs) -> rusqlite::Result<i64> {
     c.execute(
-        "INSERT INTO project_delete (project_id, with_memories, code, snapshot, deleted_at) VALUES (?1, 0, NULL, NULL, ?2)",
-        rusqlite::params![set.project_id, now],
+        "INSERT INTO project_delete (project_id, with_memories, code, snapshot, deleted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![set.project_id, taken.is_some(), taken.map(|t| t.0), taken.map(|t| t.1), now],
     )?;
     let delete_id = c.last_insert_rowid();
     let mut journal =
@@ -413,6 +429,20 @@ fn write_empty(c: &Connection, set: &Set, now: TimestampMs) -> rusqlite::Result<
     for (table, rows) in [("memory", &set.memories), ("episodic_trajectory", &set.trajectories), ("procedural_skill", &set.skills)] {
         for row in rows {
             journal.execute(rusqlite::params![delete_id, table, row.id, row.deleted_at])?;
+        }
+    }
+    if taken.is_some() {
+        for ((table, vectors), rows) in VECTORS.iter().zip([&set.memories, &set.trajectories, &set.skills]) {
+            c.execute(
+                &format!("UPDATE {table} SET deleted_at = ?2 WHERE project_id = ?1 AND deleted_at IS NULL"),
+                rusqlite::params![set.project_id, now],
+            )?;
+            for row in rows.iter().filter(|r| r.is_live()) {
+                c.execute(&format!("DELETE FROM {vectors} WHERE rowid = ?1"), [row.id])?;
+            }
+        }
+        for row in set.memories.iter().filter(|r| r.is_live()) {
+            release_challengers(c, row.id, now)?;
         }
     }
     for folder in set.folders.iter().filter(|f| f.index_docs) {
@@ -427,11 +457,21 @@ fn write_empty(c: &Connection, set: &Set, now: TimestampMs) -> rusqlite::Result<
     Ok(delete_id)
 }
 
+/// What a pass does with the set it reads.
+#[derive(Clone)]
+enum Step {
+    /// Delete the project if it is empty, else report `not_empty`.
+    Empty,
+    /// Report the set and its code; waits for nothing and writes nothing.
+    Report,
+    /// Compare `code` with the set's. Without a `snapshot` (the first pass)
+    /// a match writes nothing; with one (the second) it deletes the set.
+    Confirm { code: String, snapshot: Option<String> },
+}
+
 /// One pass over `project_id` inside the caller's transaction. It reads the
-/// set and answers the report; an empty project asked for without its rows is
-/// also deleted. The report of a delete with its rows does not wait for the
-/// saves of the project, since it only counts them.
-fn delete_pass(c: &Connection, project_id: &str, with_memories: bool, now: TimestampMs) -> Result<DeleteReport, DeleteError> {
+/// set and answers the report, and deletes what its step says to.
+fn delete_pass(c: &Connection, project_id: &str, step: &Step, now: TimestampMs) -> Result<DeleteReport, DeleteError> {
     let (name, merged_into, deleted_at): (String, Option<String>, Option<i64>) = c
         .query_row("SELECT name, merged_into, deleted_at FROM project WHERE id = ?1", [project_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -452,20 +492,28 @@ fn delete_pass(c: &Connection, project_id: &str, with_memories: bool, now: Times
             .optional()?;
         return Err(DeleteError::Deleted { id: project_id.to_string(), delete_id });
     }
-    if !with_memories {
+    if !matches!(step, Step::Report) {
         let (pending, _) = outbox_in(c, &ids_of_in(c, project_id)?)?;
         if pending > 0 {
             return Err(DeleteError::SavesPending(pending as i64));
         }
     }
     let set = set_in(c, project_id, &name)?;
-    let mut report = report_of(c, &set, with_memories)?;
-    if with_memories {
-        report.code = Some(code_of(&set));
-    } else if !set.is_empty() {
-        report.refused = Some(Refusal::NotEmpty);
-    } else {
-        report.delete_id = Some(write_empty(c, &set, now)?);
+    let mut report = report_of(c, &set, !matches!(step, Step::Empty))?;
+    match step {
+        Step::Report => report.code = Some(code_of(&set)),
+        Step::Empty if !set.is_empty() => report.refused = Some(Refusal::NotEmpty),
+        Step::Empty => report.delete_id = Some(write_delete(c, &set, None, now)?),
+        Step::Confirm { code, snapshot } => {
+            let current = code_of(&set);
+            report.code = Some(current.clone());
+            if !code.trim().eq_ignore_ascii_case(&current) {
+                report.refused = Some(Refusal::CodeChanged);
+            } else if let Some(snapshot) = snapshot {
+                report.delete_id = Some(write_delete(c, &set, Some((&current, snapshot)), now)?);
+                report.snapshot = Some(snapshot.clone());
+            }
+        }
     }
     Ok(report)
 }
@@ -473,17 +521,41 @@ fn delete_pass(c: &Connection, project_id: &str, with_memories: bool, now: Times
 /// Deletes `project_id`, or reports what deleting it would take. Without
 /// `with_memories` a project with no live rows is deleted in one transaction,
 /// after waiting up to `SAVES_WAIT` for its saves in the outbox, and one with
-/// live rows is refused as `not_empty`. With it, the answer is the report of
-/// its set and the code of that set, and nothing is written.
+/// live rows is refused as `not_empty`; a `confirm` there is ignored. With
+/// `with_memories` and no `confirm`, the answer is the report of its set and
+/// the code of that set, and nothing is written. With both, the code is
+/// compared with the set's in a first pass that writes nothing, a `pre-delete`
+/// snapshot goes into `backups`, and a second pass compares it again and
+/// deletes the project with its rows in one transaction. A code that is not
+/// the set's answers the report of the set as it is, as `code_changed`, and
+/// writes nothing. A confirmed delete waits for the saves of the project as
+/// the one of an empty project does.
 pub async fn delete_core(
     store: &MemoryStore,
     workspaces: &WorkspaceManager,
+    backups: &Path,
     project_id: &str,
     with_memories: bool,
+    confirm: Option<&str>,
 ) -> Result<DeleteReport, DeleteError> {
-    let id = project_id.to_string();
-    let write = !with_memories;
-    let mut report = retrying(store, write, move |c| delete_pass(c, &id, with_memories, TimestampMs::now())).await?;
+    let pass = |step: Step, write: bool| {
+        let id = project_id.to_string();
+        async move { retrying(store, write, move |c| delete_pass(c, &id, &step, TimestampMs::now())).await }
+    };
+    let mut report = match (with_memories, confirm) {
+        (false, _) => pass(Step::Empty, true).await?,
+        (true, None) => pass(Step::Report, false).await?,
+        (true, Some(code)) => {
+            let code = code.to_string();
+            let found = pass(Step::Confirm { code: code.clone(), snapshot: None }, false).await?;
+            if found.refused.is_some() {
+                found
+            } else {
+                let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreDelete).await?.display().to_string();
+                pass(Step::Confirm { code, snapshot: Some(snapshot) }, true).await?
+            }
+        }
+    };
     match workspaces.project_files(project_id).await {
         Ok(files) => report.workspaces = files.iter().map(|f| f.display().to_string()).collect(),
         Err(e) if report.delete_id.is_some() => {
@@ -715,7 +787,7 @@ mod tests {
         }
 
         async fn delete(&self, id: &str, with_memories: bool) -> Result<DeleteReport, DeleteError> {
-            delete_core(&self.store, &self.workspaces, id, with_memories).await
+            delete_core(&self.store, &self.workspaces, &self.backups(), id, with_memories, None).await
         }
 
         fn workspace(&self, agent: &str, project: &str) -> PathBuf {
@@ -1051,5 +1123,224 @@ mod tests {
         assert_ne!(code_of(&set), code_of(&moved));
         let other = Set { project_id: B.to_string(), ..set.clone() };
         assert_ne!(code_of(&set), code_of(&other));
+    }
+
+    // ── deleting with the rows ──────────────────────────────────────────
+
+    impl Fixture {
+        async fn confirm(&self, id: &str, code: &str) -> Result<DeleteReport, DeleteError> {
+            delete_core(&self.store, &self.workspaces, &self.backups(), id, true, Some(code)).await
+        }
+
+        async fn code(&self, id: &str) -> String {
+            self.delete(id, true).await.unwrap().code.unwrap()
+        }
+
+        async fn vector(&self, table: &str, id: i64) {
+            let sql = format!("INSERT INTO {table}(rowid, embedding) VALUES (?1, ?2)");
+            self.store
+                .conn
+                .call(move |c| c.execute(&sql, rusqlite::params![id, vec![0u8; 384 * 4]]))
+                .await
+                .unwrap();
+        }
+
+        /// What a delete must leave in a row: everything but `deleted_at`.
+        async fn untouched(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT json_array(id, status, update_count, last_modified_at, content, superseded_by, disputed_against, topic_key) FROM memory",
+                "SELECT json_array('t', id, status, update_count, last_modified_at) FROM episodic_trajectory",
+                "SELECT json_array('s', id, status, update_count, last_modified_at) FROM procedural_skill",
+                "SELECT json_array(new_id, old_id, state) FROM memory_conflict",
+                "SELECT json_array(memory_id, source_id) FROM memory_derivation",
+                "SELECT json_array(id, project_id) FROM project_path",
+                "SELECT json_array(remote, project_id) FROM project_remote",
+                "SELECT json_array(project_id, other_id, answer) FROM project_suggestion",
+                "SELECT json_array(agent_id, scope_key, reviewed_at) FROM synthesis_review",
+                "SELECT json_array(operation_id, state) FROM ingest_outbox",
+            ] {
+                out.extend(self.rows(&format!("{sql} ORDER BY 1"), |r| r.get::<_, String>(0)).await);
+            }
+            out
+        }
+    }
+
+    impl Fixture {
+        fn backups(&self) -> PathBuf {
+            self.root.path().join("backups")
+        }
+    }
+
+    /// A with a key of two versions, a deleted row, a trajectory and a skill,
+    /// each with a vector, a folder with a docs index and a `workspace.md`;
+    /// B with a row a verdict of A's replaced and a row that disputed A's.
+    async fn project_with_its_rows(f: &Fixture) {
+        f.sql(&format!(
+            "UPDATE project_path SET index_docs = 1 WHERE id = '{A}';
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', '{A}', 1);
+             INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('{B}', '{A}', 'root_commit', 1);
+             INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', '{A}', 10);"
+        ))
+        .await;
+        f.row(1, A, Some("agent-a"), "semantic_fact", "superseded", None).await;
+        f.row(2, A, Some("agent-a"), "semantic_fact", "active", None).await;
+        f.row(3, A, Some("agent-a"), "semantic_fact", "active", Some(4)).await;
+        f.row(10, B, Some("agent-a"), "semantic_fact", "superseded", None).await;
+        f.row(11, B, Some("agent-a"), "semantic_fact", "disputed", None).await;
+        f.sql(
+            "UPDATE memory SET topic_key = 'storage/engine', superseded_by = 2, supersede_cause = 'revision', update_count = 2 WHERE id = 1;
+             UPDATE memory SET topic_key = 'storage/engine', update_count = 3, last_modified_at = 77 WHERE id = 2;
+             UPDATE memory SET superseded_by = 2, supersede_cause = 'verdict' WHERE id = 10;
+             UPDATE memory SET disputed_against = '[2]' WHERE id = 11;
+             INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (11, 2, 0.1, 'escalated', 1), (10, 2, 0.1, 'judged', 1);
+             INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES (11, 2, 1);",
+        )
+        .await;
+        f.sql(&format!(
+            "INSERT INTO episodic_trajectory (id, scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+               VALUES (50, 'agent', 'agent-a', '{A}', 's1', 't', 1, 1, 1);
+             INSERT INTO procedural_skill (id, scope, agent_id, project_id, skill_name, trigger, promoted_at, source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
+               VALUES (60, 'agent', 'agent-a', '{A}', 'k', 't', 1, '[]', 1, 1, 1);"
+        ))
+        .await;
+        f.vector("memory_vectors", 2).await;
+        f.vector("memory_vectors", 1).await;
+        f.vector("episodic_vectors", 50).await;
+        f.vector("procedural_vectors", 60).await;
+        f.docs(A, 900).await;
+        f.write_workspace("agent-a", A);
+    }
+
+    #[tokio::test]
+    async fn deleting_with_memories_marks_every_row_and_revives_none() {
+        let f = Fixture::new(&[A, B]).await;
+        project_with_its_rows(&f).await;
+        let code = f.code(A).await;
+        let before = f.untouched().await;
+        let workspace = std::fs::read_to_string(f.workspace("agent-a", A)).unwrap();
+
+        let report = f.confirm(A, &code).await.unwrap();
+
+        assert_eq!((report.refused, report.code.as_deref(), report.delete_id), (None, Some(code.as_str()), Some(1)));
+        assert_eq!((report.live, report.deleted), (Counts { memories: 2, trajectories: 1, skills: 1 }, Counts { memories: 1, ..Counts::default() }));
+        let snapshot = report.snapshot.clone().expect("a snapshot before writing");
+        assert!(snapshot.contains("pre-delete") && std::path::Path::new(&snapshot).exists(), "{snapshot}");
+
+        let marks: Vec<(i64, Option<i64>)> = f
+            .rows("SELECT id, deleted_at FROM memory WHERE project_id = 'app-aaaa' ORDER BY id", |r| Ok((r.get(0)?, r.get(1)?)))
+            .await;
+        assert_eq!(marks[2], (3, Some(4)), "a row deleted before keeps its date");
+        assert!(marks[0].1.is_some() && marks[0].1 == marks[1].1, "every live row is marked at once: {marks:?}");
+        let at = marks[0].1;
+        for table in ["episodic_trajectory", "procedural_skill"] {
+            let marked: Vec<Option<i64>> = f.rows(&format!("SELECT deleted_at FROM {table}"), |r| r.get(0)).await;
+            assert_eq!(marked, vec![at], "{table}");
+        }
+        let status: Vec<String> = f.rows("SELECT status FROM memory WHERE id = 1", |r| r.get(0)).await;
+        assert_eq!(status, vec!["superseded".to_string()], "the older version did not come back");
+        for table in ["memory_vectors", "episodic_vectors", "procedural_vectors"] {
+            assert_eq!(f.count(&format!("SELECT COUNT(*) FROM {table}")).await, 0, "{table}");
+        }
+        let indexed: Vec<i64> = f.rows("SELECT rowid FROM memory_fts WHERE memory_fts MATCH 'note' ORDER BY rowid", |r| r.get(0)).await;
+        assert_eq!(indexed, vec![3, 10, 11], "the rows deleted here left the text index; row 3 was inserted deleted, so it never did");
+
+        let journal: Vec<(i64, String, i64, i64, String, String)> = f
+            .rows(
+                "SELECT delete_id, project_id, with_memories, deleted_at IS NOT NULL, code, snapshot FROM project_delete",
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .await;
+        assert_eq!(journal, vec![(1, A.to_string(), 1, 1, code.clone(), snapshot)]);
+        let rows: Vec<(String, i64, Option<i64>)> = f
+            .rows("SELECT tbl, row_id, deleted_at FROM project_delete_row ORDER BY tbl, row_id", |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .await;
+        assert_eq!(
+            rows,
+            vec![
+                ("episodic_trajectory".to_string(), 50, None),
+                ("memory".to_string(), 1, None),
+                ("memory".to_string(), 2, None),
+                ("memory".to_string(), 3, Some(4)),
+                ("procedural_skill".to_string(), 60, None),
+            ]
+        );
+        let state: Vec<Option<i64>> = f.rows(&format!("SELECT deleted_at FROM project WHERE id = '{A}'"), |r| r.get(0)).await;
+        assert!(state[0].is_some());
+        let folders: Vec<String> = f.rows("SELECT root_id FROM project_delete_folder", |r| r.get(0)).await;
+        assert_eq!(folders, vec![A.to_string()]);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path WHERE index_docs = 1").await, 0);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_doc_file").await, 0);
+
+        let after = f.untouched().await;
+        let strip = |rows: &[String]| -> Vec<String> { rows.iter().filter(|r| !r.starts_with("[11,")).cloned().collect() };
+        assert_eq!(strip(&after), strip(&before), "no text, status, count, date, pair, link, locator or save changed");
+        assert_eq!(std::fs::read_to_string(f.workspace("agent-a", A)).unwrap(), workspace);
+    }
+
+    #[tokio::test]
+    async fn a_delete_keeps_outside_rows_replaced_and_releases_their_disputes() {
+        let f = Fixture::new(&[A, B]).await;
+        project_with_its_rows(&f).await;
+        let code = f.code(A).await;
+
+        f.confirm(A, &code).await.unwrap();
+
+        let outside: Vec<(i64, String, Option<i64>, Option<i64>)> = f
+            .rows("SELECT id, status, superseded_by, deleted_at FROM memory WHERE project_id = 'web-bbbb' ORDER BY id", |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .await;
+        assert_eq!(
+            outside,
+            vec![(10, "superseded".to_string(), Some(2), None), (11, "active".to_string(), None, None)],
+            "a verdict's replacement stays replaced, and the challenger rests"
+        );
+        let pairs: Vec<String> = f.rows("SELECT state FROM memory_conflict ORDER BY new_id", |r| r.get(0)).await;
+        assert_eq!(pairs, vec!["judged".to_string(), "escalated".to_string()], "the pairs stay as they were");
+    }
+
+    #[tokio::test]
+    async fn a_stale_code_is_refused_with_the_new_report() {
+        let f = Fixture::new(&[A, B]).await;
+        project_with_its_rows(&f).await;
+        let shown = f.code(A).await;
+        f.save("a save that arrives between the two steps", A, 20).await;
+        let before = f.everything().await;
+
+        let refused = f.confirm(A, &shown).await.unwrap();
+
+        assert_eq!(refused.refused, Some(Refusal::CodeChanged));
+        assert_eq!((refused.delete_id, refused.snapshot.clone()), (None, None));
+        let new = refused.code.clone().unwrap();
+        assert_ne!(new, shown);
+        assert_eq!(refused.live.memories, 3, "the report counts the save");
+        assert_eq!(f.everything().await, before, "nothing is written");
+        assert!(!f.backups().exists(), "and no snapshot");
+
+        let garbage = f.confirm(A, "nope").await.unwrap();
+        assert_eq!((garbage.refused, garbage.code), (Some(Refusal::CodeChanged), Some(new.clone())));
+        let done = f.confirm(A, &new.to_uppercase()).await.unwrap();
+        assert!(done.delete_id.is_some() && done.refused.is_none(), "the new code deletes, typed in any case");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_with_memories_waits_for_the_saves_of_its_project() {
+        let f = Fixture::new(&[A, B]).await;
+        f.live(1, A).await;
+        let code = f.code(A).await;
+        f.outbox("op-a", A, "pending").await;
+        let before = f.everything().await;
+
+        let refused = f.confirm(A, &code).await;
+
+        assert!(matches!(refused, Err(DeleteError::SavesPending(1))), "{refused:?}");
+        assert_eq!(f.everything().await, before);
+        assert!(!f.backups().exists(), "no snapshot while a save is in flight");
+
+        f.sql("UPDATE ingest_outbox SET state = 'failed'").await;
+        let report = f.confirm(A, &code).await.unwrap();
+        assert_eq!((report.refused, report.delete_id), (None, Some(1)));
+        assert_eq!(report.failed.len(), 1, "a save that gave up is in the report");
     }
 }
