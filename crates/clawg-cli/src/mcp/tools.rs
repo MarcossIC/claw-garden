@@ -794,6 +794,45 @@ pub(crate) fn suggestion_lines(lang: Lang, suggestions: &[ListedSuggestion]) -> 
         .collect()
 }
 
+/// How many of the projects a suggestion names `session-start` lists, in
+/// the little room the hook has.
+const NOTED_SUGGESTIONS: usize = 2;
+
+/// The one line `session-start` gives the pending suggestions: the other
+/// projects, and that `recall_context` and `answer_suggestion` take it from
+/// there.
+pub(crate) fn suggestion_note(lang: Lang, suggestions: &[ListedSuggestion]) -> Option<String> {
+    if suggestions.is_empty() {
+        return None;
+    }
+    let mut others: Vec<String> = suggestions
+        .iter()
+        .take(NOTED_SUGGESTIONS)
+        .map(|s| match &s.other_name {
+            Some(name) => format!("{name} ({})", s.other_id),
+            None => s.other_id.clone(),
+        })
+        .collect();
+    let more = suggestions.len().saturating_sub(NOTED_SUGGESTIONS);
+    if more > 0 {
+        others.push(match lang {
+            Lang::En => format!("{more} more"),
+            Lang::Es => format!("{more} más"),
+        });
+    }
+    let others = others.join(", ");
+    Some(match lang {
+        Lang::En => format!(
+            "This project may be the same as {others}. Ask the user, and record their answer with `answer_suggestion`; \
+             `recall_context` says why."
+        ),
+        Lang::Es => format!(
+            "Este proyecto puede ser el mismo que {others}. Pregúntale a la persona y registra su respuesta con \
+             `answer_suggestion`; `recall_context` dice por qué."
+        ),
+    })
+}
+
 /// What a tool says when `reference` led to no project, without doing
 /// anything: the projects it may mean, and what to ask the user. `creates`
 /// is a save, which may make a project apart with `new_project`.
