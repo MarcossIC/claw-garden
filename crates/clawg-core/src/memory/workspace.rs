@@ -623,26 +623,44 @@ pub(crate) fn sections_holding(file: &str, text: &str) -> Holding {
     }
 }
 
-/// Every `<root>/<agent>/<project>/workspace.md` that holds `text`, by path,
-/// in path order. Reads only; a file that cannot be read is skipped.
-pub(crate) fn workspaces_holding(root: &Path, text: &str) -> Vec<(PathBuf, Holding)> {
-    let dirs = |dir: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
-            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect())
-            .unwrap_or_default()
-    };
-    let mut holding: Vec<(PathBuf, Holding)> = dirs(root)
+/// The folders under `dir`.
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default()
+}
+
+/// Every `workspace.md` that holds any of `texts`, by path, in path order,
+/// with where it holds them. Each file is read once.
+pub(crate) fn workspaces_holding_any(root: &Path, texts: &[&str]) -> Vec<(PathBuf, Holding)> {
+    let mut holding: Vec<(PathBuf, Holding)> = subdirs(root)
         .iter()
-        .flat_map(|agent| dirs(agent))
+        .flat_map(|agent| subdirs(agent))
         .map(|project| project.join("workspace.md"))
         .filter_map(|path| {
             let bytes = std::fs::read(&path).ok()?;
-            let found = sections_holding(&String::from_utf8_lossy(&bytes), text);
+            let file = String::from_utf8_lossy(&bytes);
+            let found = texts.iter().map(|text| sections_holding(&file, text)).fold(
+                Holding { auto: false, user: false },
+                |all, one| Holding { auto: all.auto || one.auto, user: all.user || one.user },
+            );
             (found.auto || found.user).then_some((path, found))
         })
         .collect();
     holding.sort_by(|a, b| a.0.cmp(&b.0));
     holding
+}
+
+/// The `workspace.md` of every agent under `project_id` under `root`, by
+/// path, whatever they hold. Reads the folders only.
+pub(crate) fn project_workspaces(root: &Path, project_id: &str) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = subdirs(root)
+        .iter()
+        .map(|agent| agent.join(project_segment(project_id).as_ref()).join("workspace.md"))
+        .filter(|file| file.is_file())
+        .collect();
+    files.sort();
+    files
 }
 
 /// Parse the existing file content to find AUTO and USER sections.

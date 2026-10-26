@@ -17,7 +17,9 @@ use crate::memory::dispute::release_challengers;
 use crate::memory::redact::{redact, SecretKind};
 use crate::memory::revival::{revive_after_delete_of_piece, Revived};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
-use crate::memory::workspace::{workspaces_holding, Holding};
+use crate::memory::project_delete::Counts;
+use crate::memory::project_docs::drop_root_index_in;
+use crate::memory::workspace::{project_workspaces, workspaces_holding_any, Holding};
 use crate::memory::MemoryError;
 
 /// A `memory` row whose content holds at least one secret. Carries what the
@@ -103,6 +105,12 @@ fn has_table(c: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
 pub enum PurgeError {
     #[error("there is no memory #{0}")]
     NotFound(i64),
+    #[error("there is no delete #{0}")]
+    UnknownDelete(i64),
+    #[error("delete #{0} was undone: there is nothing of it to purge")]
+    DeleteUndone(i64),
+    #[error("delete #{0} was already purged")]
+    DeletePurged(i64),
     #[error("memory.db has migrations pending (V{from} to V{to}); start the daemon once so it \
              migrates them, stop it, and run this again")]
     Pending { from: i32, to: i32 },
@@ -205,6 +213,36 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
     } else {
         Revived::default()
     };
+    let (pieces, outbox) = remove_in(&tx, id, &held)?;
+    // After the delete, so the row no longer counts as live for them.
+    if live {
+        release_challengers(&tx, id, TimestampMs::now())?;
+    }
+    tx.commit()?;
+    // FTS5 records a removal as a new entry that carries the row's terms, and
+    // keeps the old segments until a merge: both still hold the text. A full
+    // merge rewrites the index without them.
+    c.execute("INSERT INTO memory_fts(memory_fts) VALUES ('optimize')", [])?;
+    leave_no_old_copy(c)?;
+    let backups = backups_holding(&crate::paths::backups_dir(base_dir), id, &held);
+    Ok(Purged {
+        revived: revived.revived.into_iter().map(|r| r.id).collect(),
+        hidden: revived.hidden,
+        pieces,
+        outbox,
+        backups,
+        workspaces: workspaces_holding_any(&base_dir.join("workspaces"), &[&content])
+            .into_iter()
+            .map(|(path, holding)| WorkspaceHolding { path, holding })
+            .collect(),
+    })
+}
+
+/// Removes the deleted `memory` row `id` for good inside the caller's
+/// transaction: its vector, its piece heads, its links as a conclusion, its
+/// pairs and the outbox rows `held` matches. Answers the other pieces of its
+/// save and the outbox rows removed.
+fn remove_in(tx: &rusqlite::Connection, id: i64, held: &OutboxMatch) -> rusqlite::Result<(Vec<i64>, Vec<OutboxRemoved>)> {
     let pieces: Vec<i64> = {
         let mut stmt = tx.prepare(
             "SELECT DISTINCT q.memory_id FROM memory_piece p \
@@ -242,28 +280,156 @@ pub fn purge(base_dir: &Path, id: i64) -> Result<Purged, MemoryError> {
         rows.collect::<rusqlite::Result<_>>()?
     };
     tx.execute(&format!("DELETE FROM ingest_outbox WHERE {OUTBOX_MATCH}"), held.params())?;
-    // After the delete, so the row no longer counts as live for them.
-    if live {
-        release_challengers(&tx, id, TimestampMs::now())?;
+    Ok((pieces, outbox))
+}
+
+/// A row of a delete that is live again, and so stays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRow {
+    /// `memory`, `episodic_trajectory` or `procedural_skill`.
+    pub table: String,
+    pub id: i64,
+}
+
+/// What [`purge_delete`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PurgedDelete {
+    pub project_id: String,
+    /// The rows removed for good, by table.
+    pub removed: Counts,
+    /// The rows of the delete that are live again, which stay.
+    pub live: Vec<LiveRow>,
+    /// The outbox rows removed with the texts of the rows.
+    pub outbox: Vec<OutboxRemoved>,
+    /// Snapshots in `<data>/backups` that still hold a row of the delete, by
+    /// name, the `pre-delete` one among them. None is changed.
+    pub backups: Vec<PathBuf>,
+    /// The project's own `workspace.md` files, whatever they hold. None is
+    /// changed.
+    pub project_workspaces: Vec<PathBuf>,
+    /// The other `workspace.md` files that hold a text of the rows. None is
+    /// changed.
+    pub workspaces: Vec<WorkspaceHolding>,
+}
+
+/// Removes for good every row of delete `delete_id` that is still deleted,
+/// wherever it is now, in the three tables: the row, its vector and, for a
+/// row of `memory`, what [`purge`] removes of a deleted row. The docs index
+/// under the folders the delete turned off is emptied again, since a refresh
+/// in flight may have written after it, and the delete is marked purged. The
+/// project stays as it is.
+///
+/// On a stopped store that is up to date, as [`purge`], with no snapshot first
+/// and nothing written before every check passes. The text index is merged,
+/// the file rebuilt and the WAL emptied once, at the end.
+pub fn purge_delete(base_dir: &Path, delete_id: i64) -> Result<PurgedDelete, MemoryError> {
+    let Some((_lock, mut c)) = open_to_rewrite(base_dir)? else {
+        return Err(PurgeError::UnknownDelete(delete_id).into());
+    };
+    let (project_id, undone, purged): (String, bool, bool) = c
+        .query_row(
+            "SELECT project_id, undone_at IS NOT NULL, purged_at IS NOT NULL FROM project_delete WHERE delete_id = ?1",
+            [delete_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(PurgeError::UnknownDelete(delete_id))?;
+    if undone {
+        return Err(PurgeError::DeleteUndone(delete_id).into());
     }
+    if purged {
+        return Err(PurgeError::DeletePurged(delete_id).into());
+    }
+
+    struct Gone {
+        id: i64,
+        content: String,
+        agent: Option<String>,
+        piece: bool,
+    }
+    let tx = c.transaction()?;
+    let journaled: Vec<(String, i64)> = {
+        let mut stmt = tx.prepare("SELECT tbl, row_id FROM project_delete_row WHERE delete_id = ?1 ORDER BY tbl, row_id")?;
+        let rows = stmt.query_map([delete_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut removed = Counts::default();
+    let mut live = Vec::new();
+    let mut gone: Vec<Gone> = Vec::new();
+    for (table, id) in journaled {
+        let vectors = match table.as_str() {
+            "memory" => "memory_vectors",
+            "episodic_trajectory" => "episodic_vectors",
+            "procedural_skill" => "procedural_vectors",
+            other => {
+                log::warn!("delete {delete_id} journaled a row of {other}, which no purge knows");
+                continue;
+            }
+        };
+        let state: Option<bool> =
+            tx.query_row(&format!("SELECT deleted_at IS NULL FROM {table} WHERE id = ?1"), [id], |r| r.get(0)).optional()?;
+        match state {
+            None => continue,
+            Some(true) => {
+                live.push(LiveRow { table, id });
+                continue;
+            }
+            Some(false) => {}
+        }
+        if table == "memory" {
+            let (content, agent, piece): (String, Option<String>, bool) = tx.query_row(
+                "SELECT content, agent_id, EXISTS (SELECT 1 FROM memory_piece WHERE memory_id = ?1) FROM memory WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            gone.push(Gone { id, content, agent, piece });
+            removed.memories += 1;
+        } else {
+            tx.execute(&format!("DELETE FROM {vectors} WHERE rowid = ?1"), [id])?;
+            tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [id])?;
+            if table == "episodic_trajectory" {
+                removed.trajectories += 1;
+            } else {
+                removed.skills += 1;
+            }
+        }
+    }
+    let mut outbox = Vec::new();
+    for g in &gone {
+        let held = OutboxMatch { agent: g.agent.as_deref(), content: &g.content, piece: g.piece };
+        outbox.extend(remove_in(&tx, g.id, &held)?.1);
+    }
+    let roots: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT f.root_id FROM project_delete_folder f JOIN project_path p ON p.id = f.root_id \
+             WHERE f.delete_id = ?1 AND p.index_docs = 0 ORDER BY f.root_id",
+        )?;
+        let rows = stmt.query_map([delete_id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for root in roots {
+        drop_root_index_in(&tx, &root)?;
+    }
+    tx.execute("UPDATE project_delete SET purged_at = ?2 WHERE delete_id = ?1", rusqlite::params![delete_id, TimestampMs::now()])?;
     tx.commit()?;
-    // FTS5 records a removal as a new entry that carries the row's terms, and
-    // keeps the old segments until a merge: both still hold the text. A full
-    // merge rewrites the index without them.
     c.execute("INSERT INTO memory_fts(memory_fts) VALUES ('optimize')", [])?;
+    // The docs index keeps its own terms until a merge too.
+    c.execute("INSERT INTO project_doc_fts(project_doc_fts) VALUES ('optimize')", [])?;
     leave_no_old_copy(c)?;
-    let backups = backups_holding(&crate::paths::backups_dir(base_dir), id, &held);
-    Ok(Purged {
-        revived: revived.revived.into_iter().map(|r| r.id).collect(),
-        hidden: revived.hidden,
-        pieces,
-        outbox,
-        backups,
-        workspaces: workspaces_holding(&base_dir.join("workspaces"), &content)
-            .into_iter()
-            .map(|(path, holding)| WorkspaceHolding { path, holding })
-            .collect(),
-    })
+
+    let held: Vec<OutboxMatch> =
+        gone.iter().map(|g| OutboxMatch { agent: g.agent.as_deref(), content: &g.content, piece: g.piece }).collect();
+    let rows: Vec<(i64, &OutboxMatch)> = gone.iter().map(|g| g.id).zip(held.iter()).collect();
+    let backups = backups_holding_any(&crate::paths::backups_dir(base_dir), &rows);
+    let workspaces_root = base_dir.join("workspaces");
+    let project_workspaces = project_workspaces(&workspaces_root, &project_id);
+    let texts: Vec<&str> = gone.iter().map(|g| g.content.as_str()).collect();
+    let workspaces = workspaces_holding_any(&workspaces_root, &texts)
+        .into_iter()
+        .filter(|(path, _)| !project_workspaces.contains(path))
+        .map(|(path, holding)| WorkspaceHolding { path, holding })
+        .collect();
+    Ok(PurgedDelete { project_id, removed, live, outbox, backups, project_workspaces, workspaces })
 }
 
 /// What [`mask_reasons`] did.
@@ -375,18 +541,26 @@ fn snapshots_in(dir: &Path) -> Vec<PathBuf> {
 /// an outbox row holding it, by name. One that cannot be read is listed too:
 /// it may hold the row.
 fn backups_holding(dir: &Path, id: i64, held: &OutboxMatch) -> Vec<PathBuf> {
+    backups_holding_any(dir, &[(id, held)])
+}
+
+/// [`backups_holding`] for several rows at once: each snapshot is opened one
+/// time and searched for any of them.
+fn backups_holding_any(dir: &Path, rows: &[(i64, &OutboxMatch)]) -> Vec<PathBuf> {
     let mut holding: Vec<PathBuf> = snapshots_in(dir)
         .into_iter()
         .filter(|p| {
             let Ok(c) = open_for_probe(p) else { return true };
-            let in_memory = c
-                .query_row(
-                    "SELECT count(*) FROM memory WHERE id = ?1 AND content = ?2",
-                    rusqlite::params![id, held.content],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map_or(true, |n| n > 0);
-            in_memory || outbox_holds(&c, held)
+            rows.iter().any(|(id, held)| {
+                let in_memory = c
+                    .query_row(
+                        "SELECT count(*) FROM memory WHERE id = ?1 AND content = ?2",
+                        rusqlite::params![id, held.content],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map_or(true, |n| n > 0);
+                in_memory || outbox_holds(&c, held)
+            })
         })
         .collect();
     holding.sort();
@@ -1056,5 +1230,243 @@ mod tests {
         let err = scan(dir.path()).unwrap_err();
         assert!(matches!(err, MemoryError::Backup(BackupError::NoStore { .. })), "{err}");
         assert!(files_in(dir.path()).is_empty(), "{:?}", files_in(dir.path()));
+    }
+
+    // ── purging a project delete ────────────────────────────────────────
+
+    use crate::memory::project_delete::{delete_core, Counts};
+    use crate::memory::workspace::WorkspaceManager;
+
+    const GONE: &str = "gone-aaaa";
+    const WEB: &str = "web-bbbb";
+
+    /// A project with a secret row, another live row, a row deleted before,
+    /// a trajectory, a docs index and a pending save, deleted with its
+    /// memories; and another project that links to it. The store is closed.
+    struct DeletedProject {
+        dir: tempfile::TempDir,
+        delete_id: i64,
+        secret: i64,
+        other: i64,
+        old: i64,
+        web: i64,
+    }
+
+    async fn insert_in(store: &MemoryStore, content: &str, project: &str) -> i64 {
+        let (content, project) = (content.to_string(), project.to_string());
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(INSERT_ROW, [content])?;
+                let id = c.last_insert_rowid();
+                c.execute("UPDATE memory SET project_id = ?2 WHERE id = ?1", rusqlite::params![id, project])?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn deleted_project() -> DeletedProject {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(&format!(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('{GONE}', 'gone', 'root', 1, 1), ('{WEB}', 'web', 'root', 1, 1);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id) \
+                       VALUES ('{GONE}', '/work/gone', 1, 1, '{GONE}');
+                     INSERT INTO project_doc_file (project_id, path, content_hash, model_id, chunks, indexed_at) \
+                       VALUES ('{GONE}', 'README.md', 'h', 'm', 1, 1);"
+                ))
+            })
+            .await
+            .unwrap();
+        let secret = insert_in(&store, SECRET, GONE).await;
+        let other = insert_in(&store, "another note of the gone project", GONE).await;
+        let old = insert_in(&store, "an older note of the gone project", GONE).await;
+        let web = insert_in(&store, "a note of the web project", WEB).await;
+        soft_delete(&store, old).await;
+        for (n, id) in [secret, other, web].into_iter().enumerate() {
+            add_vector(&store, id, n).await;
+        }
+        store
+            .conn
+            .call(move |c| {
+                c.execute_batch(&format!(
+                    "INSERT INTO episodic_trajectory (id, scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+                       VALUES (50, 'agent', 'agent-s', '{GONE}', 's1', 'a trajectory of the gone project', 1, 1, 1);
+                     INSERT INTO episodic_vectors (rowid, embedding) VALUES (50, zeroblob(1536));
+                     INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES ({web}, {secret}, 0.1, 'pending', 1);
+                     INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES ({web}, {secret}, 1), ({secret}, {other}, 1);
+                     INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, created_at, updated_at) \
+                       VALUES ('op-secret', 'agent-s', '{SECRET}', '{{}}', 'failed', 0, 0);"
+                ))
+            })
+            .await
+            .unwrap();
+        let workspaces = WorkspaceManager::new(dir.path().join("workspaces"));
+        let report = delete_core(&store, &workspaces, &crate::paths::backups_dir(dir.path()), GONE, true, None).await.unwrap();
+        let done =
+            delete_core(&store, &workspaces, &crate::paths::backups_dir(dir.path()), GONE, true, report.code.as_deref()).await.unwrap();
+        let delete_id = done.delete_id.expect("deleted");
+        store.conn.clone().close().await.unwrap();
+        drop(store);
+        DeletedProject { dir, delete_id, secret, other, old, web }
+    }
+
+    fn sql(dir: &Path, sql: &str) {
+        crate::memory::db::ensure_vec0_registered();
+        rusqlite::Connection::open(dir.join("memory.db")).unwrap().execute_batch(sql).unwrap();
+    }
+
+    fn total(dir: &Path, sql: &str) -> i64 {
+        crate::memory::db::ensure_vec0_registered();
+        let c = rusqlite::Connection::open(dir.join("memory.db")).unwrap();
+        c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn purging_a_delete_leaves_no_trace_of_its_rows() {
+        let d = deleted_project().await;
+        // A refresh in flight wrote to the docs index after the delete.
+        sql(
+            d.dir.path(),
+            &format!(
+                "INSERT INTO project_doc_file (project_id, path, content_hash, model_id, chunks, indexed_at) VALUES ('{GONE}', 'a.md', 'h', 'm', 1, 1);
+                 INSERT INTO project_doc_chunk (id, project_id, path, ordinal, breadcrumb, body) VALUES (900, '{GONE}', 'a.md', 0, 'a.md', 'quokka in the docs');
+                 INSERT INTO project_doc_fts (rowid, text, project_id) VALUES (900, 'quokka in the docs', '{GONE}');"
+            ),
+        );
+        assert!(bytes_mention(d.dir.path(), b"quokka"), "the fixture holds the secret");
+
+        let purged = purge_delete(d.dir.path(), d.delete_id).unwrap();
+
+        assert_eq!(purged.project_id, GONE);
+        assert_eq!(purged.removed, Counts { memories: 3, trajectories: 1, skills: 0 });
+        assert!(purged.live.is_empty());
+        assert_eq!(
+            purged.outbox,
+            vec![OutboxRemoved { operation_id: "op-secret".into(), agent_id: "agent-s".into(), state: "failed".into() }]
+        );
+        let dir = d.dir.path();
+        for table in ["memory", "episodic_trajectory"] {
+            assert_eq!(total(dir, &format!("SELECT count(*) FROM {table} WHERE project_id = '{GONE}'")), 0, "{table}");
+        }
+        assert_eq!(total(dir, "SELECT count(*) FROM memory_vectors WHERE rowid IN (1, 2, 3)"), 0, "the vectors went");
+        assert_eq!(total(dir, "SELECT count(*) FROM episodic_vectors WHERE rowid = 50"), 0);
+        assert_eq!(total(dir, "SELECT count(*) FROM memory_conflict"), 0, "its pairs went");
+        assert_eq!(
+            total(dir, &format!("SELECT count(*) FROM memory_derivation WHERE memory_id = {}", d.secret)),
+            0,
+            "a purged conclusion rests on nothing"
+        );
+        assert_eq!(
+            total(dir, &format!("SELECT count(*) FROM memory_derivation WHERE source_id = {}", d.secret)),
+            1,
+            "a conclusion elsewhere keeps the link that tells it lost a source"
+        );
+        assert_eq!(total(dir, "SELECT count(*) FROM ingest_outbox"), 0);
+        assert_eq!(total(dir, "SELECT count(*) FROM project_doc_file WHERE project_id = 'gone-aaaa'"), 0, "the docs index went again");
+        assert_eq!(total(dir, "SELECT count(*) FROM project_doc_chunk"), 0);
+        assert_eq!(total(dir, "SELECT count(*) FROM memory WHERE project_id = 'web-bbbb'"), 1, "other projects keep their rows");
+        assert_eq!(total(dir, &format!("SELECT count(*) FROM memory_vectors WHERE rowid = {}", d.web)), 1);
+        assert!(!bytes_mention(dir, b"quokka"), "the secret's bytes are still on disk");
+        assert_eq!(total(dir, "SELECT count(*) FROM project_delete WHERE purged_at IS NOT NULL"), 1);
+        assert_eq!(total(dir, "SELECT count(*) FROM project WHERE id = 'gone-aaaa' AND deleted_at IS NOT NULL"), 1, "the project stays as it is");
+        StoreLock::acquire(dir, StoreHolder::Daemon).expect("the lock was released");
+    }
+
+    #[tokio::test]
+    async fn purging_a_delete_keeps_a_row_restored_since() {
+        let d = deleted_project().await;
+        sql(d.dir.path(), &format!("UPDATE memory SET deleted_at = NULL WHERE id = {}", d.other));
+
+        let purged = purge_delete(d.dir.path(), d.delete_id).unwrap();
+
+        assert_eq!(purged.live, vec![LiveRow { table: "memory".into(), id: d.other }]);
+        assert_eq!(purged.removed, Counts { memories: 2, trajectories: 1, skills: 0 });
+        let dir = d.dir.path();
+        assert_eq!(total(dir, &format!("SELECT count(*) FROM memory WHERE id = {}", d.other)), 1);
+        assert_eq!(total(dir, &format!("SELECT count(*) FROM memory WHERE id IN ({}, {})", d.secret, d.old)), 0);
+        assert_eq!(total(dir, "SELECT count(*) FROM project_delete WHERE purged_at IS NOT NULL"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_purge_of_a_delete_undone_or_purged_is_refused_untouched() {
+        let d = deleted_project().await;
+        let dir = d.dir.path();
+        let before = std::fs::read(dir.join("memory.db")).unwrap();
+
+        let unknown = purge_delete(dir, 99).unwrap_err();
+        assert!(matches!(unknown, MemoryError::Purge(PurgeError::UnknownDelete(99))), "{unknown}");
+        assert_eq!(unknown.to_string(), "there is no delete #99");
+        assert_eq!(std::fs::read(dir.join("memory.db")).unwrap(), before);
+
+        {
+            let _daemon = StoreLock::acquire(dir, StoreHolder::Daemon).unwrap();
+            let held = purge_delete(dir, d.delete_id).unwrap_err();
+            assert!(matches!(held, MemoryError::StoreInUse { .. }), "{held}");
+        }
+
+        sql(dir, &format!("UPDATE project_delete SET undone_at = 5 WHERE delete_id = {}", d.delete_id));
+        let before = std::fs::read(dir.join("memory.db")).unwrap();
+        let undone = purge_delete(dir, d.delete_id).unwrap_err();
+        assert!(matches!(&undone, MemoryError::Purge(PurgeError::DeleteUndone(n)) if *n == d.delete_id), "{undone}");
+        assert_eq!(std::fs::read(dir.join("memory.db")).unwrap(), before, "nothing was written");
+        assert_eq!(total(dir, "SELECT count(*) FROM memory WHERE project_id = 'gone-aaaa'"), 3);
+
+        sql(dir, &format!("UPDATE project_delete SET undone_at = NULL WHERE delete_id = {}", d.delete_id));
+        purge_delete(dir, d.delete_id).unwrap();
+        let twice = purge_delete(dir, d.delete_id).unwrap_err();
+        assert!(matches!(&twice, MemoryError::Purge(PurgeError::DeletePurged(n)) if *n == d.delete_id), "{twice}");
+        StoreLock::acquire(dir, StoreHolder::Daemon).expect("the lock was released");
+    }
+
+    #[tokio::test]
+    async fn purging_a_delete_names_the_backups_and_workspaces_that_hold_its_text() {
+        use crate::memory::backup::backup_offline;
+        use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
+        let d = deleted_project().await;
+        let dir = d.dir.path();
+        let write = |agent: &str, project: &str, auto: &str, user: &str| {
+            let path = dir.join("workspaces").join(agent).join(project).join("workspace.md");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text = format!("{AUTO_START}\n{auto}\n{AUTO_END}\n{USER_START}\n{user}\n{USER_END}\n");
+            std::fs::write(&path, &text).unwrap();
+            (path, text)
+        };
+        let own = write("agent-s", GONE, "- nothing of it is written here", "");
+        let copy = write("agent-o", "default", "", &format!("copied: {SECRET}"));
+        let other = write("agent-s", WEB, "- a note of the web project", "");
+        let backups = crate::paths::backups_dir(dir);
+        let pre_delete = std::fs::read_dir(&backups)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_string_lossy().contains("pre-delete"))
+            .expect("the snapshot the delete took");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let manual = backup_offline(dir).unwrap();
+        let kept: Vec<Vec<u8>> = [&pre_delete, &manual].iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+        let purged = purge_delete(dir, d.delete_id).unwrap();
+
+        let mut named = purged.backups.clone();
+        named.sort();
+        let mut want = vec![pre_delete.clone(), manual.clone()];
+        want.sort();
+        assert_eq!(named, want, "both snapshots hold the rows");
+        assert_eq!(purged.project_workspaces, vec![own.0.clone()], "the project's own file is named whatever it holds");
+        assert_eq!(
+            purged.workspaces,
+            vec![WorkspaceHolding { path: copy.0.clone(), holding: Holding { auto: false, user: true } }],
+            "and the others that hold a text of it"
+        );
+        let now: Vec<Vec<u8>> = [&pre_delete, &manual].iter().map(|p| std::fs::read(p).unwrap()).collect();
+        assert_eq!(now, kept, "no backup was changed");
+        for (path, text) in [own, copy, other] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), text, "no workspace was changed");
+        }
     }
 }
