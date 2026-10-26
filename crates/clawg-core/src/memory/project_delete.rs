@@ -8,7 +8,7 @@
 //! rows takes that code back, and a code that is no longer the set's gets the
 //! new report instead of a delete.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -17,10 +17,16 @@ use sha2::{Digest, Sha256};
 
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
-use crate::memory::dispute::release_challengers;
+use crate::memory::admin::{RESTORE_TEXT_INDEX, RESTORE_TOPIC_HOLDER, RESTORE_TWIN};
+use crate::memory::chunker::embedding_text;
+use crate::memory::dispute::{release_challengers, settle_challengers, settle_row};
+use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::inspect::{answered_pairs, duplicates, folder_prints, RegistryRow};
 use crate::memory::merge::{canonical_in, retrying, Retried};
+use crate::memory::maintenance::skill_embedding_text;
 use crate::memory::project_docs::drop_root_index_in;
+use crate::memory::redact::redact;
+use crate::memory::vector::to_unit;
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
 
@@ -36,6 +42,18 @@ pub enum DeleteError {
     Deleted { id: String, delete_id: Option<i64> },
     #[error("{0} saves of this project are still being stored; try again in a moment")]
     SavesPending(i64),
+    #[error("no delete {0}")]
+    UnknownDelete(i64),
+    #[error("delete {0} was already undone")]
+    Undone(i64),
+    #[error("delete {0} was purged")]
+    Purged(i64),
+    #[error("project {project_id} was deleted again since, in delete {later}: undo that one first")]
+    DeletedLater { project_id: String, later: i64 },
+    #[error("the rows to restore need the embedding model, which is not ready")]
+    NeedsModel,
+    #[error(transparent)]
+    Embed(#[from] EmbedError),
     #[error(transparent)]
     Store(#[from] MemoryError),
 }
@@ -67,6 +85,31 @@ pub enum Refusal {
     NotEmpty,
     /// The code sent is not the one of the set as it is now.
     CodeChanged,
+}
+
+/// Why a row an undo would restore stays deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepReason {
+    /// A live row of the project saved since has its text.
+    LiveTwin,
+    /// A live row of the project, of another save, has its key.
+    TopicTaken,
+    /// Its text holds a secret by today's rules.
+    HoldsSecret,
+    /// It is not as the delete left it: restored, deleted again or moved.
+    Changed,
+    /// It is a piece of a save with a piece that stays deleted.
+    Tied,
+}
+
+/// A row an undo leaves deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Kept {
+    /// `memory`, `episodic_trajectory` or `procedural_skill`.
+    pub table: String,
+    pub id: i64,
+    pub reason: KeepReason,
 }
 
 /// Rows by table.
@@ -137,6 +180,15 @@ pub struct DeleteReport {
     pub pending: usize,
     pub failed: Vec<FailedSave>,
     pub candidates: Vec<Candidate>,
+    /// For an undo: nothing was written, this is what it would do.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// For an undo: the rows that came back, by table.
+    #[serde(default)]
+    pub restored: Counts,
+    /// For an undo: the rows that stay deleted, with why.
+    #[serde(default)]
+    pub kept: Vec<Kept>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,6 +618,336 @@ pub async fn delete_core(
     Ok(report)
 }
 
+/// Texts embedded per call.
+const EMBED_BATCH: usize = 32;
+
+/// The tables a delete takes rows from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Table {
+    Memory,
+    Trajectory,
+    Skill,
+}
+
+impl Table {
+    fn of(name: &str) -> Option<Table> {
+        match name {
+            "memory" => Some(Table::Memory),
+            "episodic_trajectory" => Some(Table::Trajectory),
+            "procedural_skill" => Some(Table::Skill),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Table::Memory => "memory",
+            Table::Trajectory => "episodic_trajectory",
+            Table::Skill => "procedural_skill",
+        }
+    }
+
+    fn vectors(self) -> &'static str {
+        match self {
+            Table::Memory => "memory_vectors",
+            Table::Trajectory => "episodic_vectors",
+            Table::Skill => "procedural_vectors",
+        }
+    }
+}
+
+/// What an undo decided: the rows that come back and the ones that stay
+/// deleted, with why.
+struct Plan {
+    project_id: String,
+    name: String,
+    with_memories: bool,
+    /// The `deleted_at` the delete gave the project and its rows.
+    at: i64,
+    restore: Vec<(Table, i64)>,
+    kept: Vec<Kept>,
+}
+
+impl Plan {
+    fn restored(&self) -> Counts {
+        let of = |table| self.restore.iter().filter(|(t, _)| *t == table).count();
+        Counts { memories: of(Table::Memory), trajectories: of(Table::Trajectory), skills: of(Table::Skill) }
+    }
+}
+
+/// The rows among `restoring` that stay deleted because a piece of their
+/// save does: a row comes back only with every piece of its save that is
+/// deleted. Dropping one can tie another, so it goes on until none is left.
+/// `siblings` are the other pieces of each row's saves, and `deleted` the
+/// ones among them that are deleted.
+fn tied(restoring: &[i64], siblings: &BTreeMap<i64, Vec<i64>>, deleted: &HashSet<i64>) -> BTreeSet<i64> {
+    let mut staying: BTreeSet<i64> = restoring.iter().copied().collect();
+    let mut tied = BTreeSet::new();
+    loop {
+        let next = staying
+            .iter()
+            .copied()
+            .find(|id| siblings.get(id).is_some_and(|s| s.iter().any(|p| deleted.contains(p) && !staying.contains(p))));
+        match next {
+            Some(id) => {
+                staying.remove(&id);
+                tied.insert(id);
+            }
+            None => return tied,
+        }
+    }
+}
+
+/// Decides delete `delete_id`'s undo in the caller's transaction.
+fn undo_plan_in(c: &Connection, delete_id: i64) -> Result<Plan, DeleteError> {
+    let (project_id, with_memories, at, undone, purged): (String, bool, i64, Option<i64>, Option<i64>) = c
+        .query_row(
+            "SELECT project_id, with_memories, deleted_at, undone_at, purged_at FROM project_delete WHERE delete_id = ?1",
+            [delete_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?
+        .ok_or(DeleteError::UnknownDelete(delete_id))?;
+    if undone.is_some() {
+        return Err(DeleteError::Undone(delete_id));
+    }
+    if purged.is_some() {
+        return Err(DeleteError::Purged(delete_id));
+    }
+    let later: Option<i64> = c
+        .query_row(
+            "SELECT delete_id FROM project_delete \
+             WHERE project_id = ?1 AND delete_id > ?2 AND undone_at IS NULL AND purged_at IS NULL ORDER BY delete_id LIMIT 1",
+            rusqlite::params![project_id, delete_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(later) = later {
+        return Err(DeleteError::DeletedLater { project_id, later });
+    }
+    let name: String = c
+        .query_row("SELECT name FROM project WHERE id = ?1", [&project_id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| DeleteError::UnknownProject(project_id.clone()))?;
+    let (pending, _) = outbox_in(c, &ids_of_in(c, &project_id)?)?;
+    if pending > 0 {
+        return Err(DeleteError::SavesPending(pending as i64));
+    }
+
+    let taken: Vec<(Table, i64)> = {
+        let mut stmt = c.prepare(
+            "SELECT tbl, row_id FROM project_delete_row WHERE delete_id = ?1 AND deleted_at IS NULL ORDER BY tbl, row_id",
+        )?;
+        let rows = stmt.query_map([delete_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut taken = Vec::new();
+        for row in rows {
+            let (tbl, id) = row?;
+            match Table::of(&tbl) {
+                Some(table) => taken.push((table, id)),
+                None => log::warn!("delete {delete_id} journaled a row of {tbl}, which no undo knows"),
+            }
+        }
+        taken.sort();
+        taken
+    };
+    let mut kept = Vec::new();
+    let mut restore = Vec::new();
+    for (table, id) in taken {
+        let kept_as = |reason| Kept { table: table.name().to_string(), id, reason };
+        let now: Option<(Option<String>, Option<i64>)> = c
+            .query_row(&format!("SELECT project_id, deleted_at FROM {} WHERE id = ?1", table.name()), [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        if now != Some((Some(project_id.clone()), Some(at))) {
+            kept.push(kept_as(KeepReason::Changed));
+            continue;
+        }
+        if table == Table::Memory {
+            let content: String = c.query_row("SELECT content FROM memory WHERE id = ?1", [id], |r| r.get(0))?;
+            let twin = c.query_row(RESTORE_TWIN, rusqlite::params![id, None::<String>], |r| r.get::<_, i64>(0)).optional()?;
+            let holder = c
+                .query_row(RESTORE_TOPIC_HOLDER, rusqlite::params![id, None::<String>], |r| r.get::<_, String>(0))
+                .optional()?;
+            let reason = if !redact(&content).kinds.is_empty() {
+                Some(KeepReason::HoldsSecret)
+            } else if twin.is_some() {
+                Some(KeepReason::LiveTwin)
+            } else if holder.is_some() {
+                Some(KeepReason::TopicTaken)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                kept.push(kept_as(reason));
+                continue;
+            }
+        }
+        restore.push((table, id));
+    }
+
+    let memories: Vec<i64> = restore.iter().filter(|(t, _)| *t == Table::Memory).map(|(_, id)| *id).collect();
+    let mut siblings: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    let mut deleted: HashSet<i64> = HashSet::new();
+    for id in &memories {
+        let mut stmt = c.prepare_cached(
+            "SELECT DISTINCT b.memory_id, m.deleted_at IS NOT NULL FROM memory_piece a \
+             JOIN memory_piece b ON b.save_id = a.save_id AND b.memory_id <> a.memory_id \
+             JOIN memory m ON m.id = b.memory_id WHERE a.memory_id = ?1",
+        )?;
+        let rows = stmt.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)))?;
+        for row in rows {
+            let (piece, is_deleted) = row?;
+            siblings.entry(*id).or_default().push(piece);
+            if is_deleted {
+                deleted.insert(piece);
+            }
+        }
+    }
+    let ties = tied(&memories, &siblings, &deleted);
+    restore.retain(|(table, id)| !(*table == Table::Memory && ties.contains(id)));
+    kept.extend(ties.into_iter().map(|id| Kept { table: Table::Memory.name().to_string(), id, reason: KeepReason::Tied }));
+    kept.sort_by(|a, b| (Table::of(&a.table), a.id).cmp(&(Table::of(&b.table), b.id)));
+    Ok(Plan { project_id, name, with_memories, at, restore, kept })
+}
+
+fn plan_report(delete_id: i64, plan: &Plan) -> DeleteReport {
+    DeleteReport {
+        project_id: plan.project_id.clone(),
+        name: plan.name.clone(),
+        with_memories: plan.with_memories,
+        delete_id: Some(delete_id),
+        restored: plan.restored(),
+        kept: plan.kept.clone(),
+        ..DeleteReport::default()
+    }
+}
+
+/// The text each row of `restore` was embedded from.
+fn embedding_texts_in(c: &Connection, restore: &[(Table, i64)]) -> rusqlite::Result<Vec<(Table, i64, String)>> {
+    let mut texts = Vec::with_capacity(restore.len());
+    for (table, id) in restore {
+        let text = match table {
+            Table::Memory => {
+                // The head the row's save was embedded behind, as a restore reads it.
+                let (content, context): (String, Option<String>) = c.query_row(
+                    "SELECT content, (SELECT mp.context FROM memory_piece mp WHERE mp.memory_id = memory.id \
+                     AND mp.context <> '' ORDER BY mp.save_id LIMIT 1) FROM memory WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                embedding_text(context.as_deref().unwrap_or(""), &content).into_owned()
+            }
+            Table::Trajectory => c.query_row("SELECT task FROM episodic_trajectory WHERE id = ?1", [id], |r| r.get(0))?,
+            Table::Skill => {
+                let (trigger, name): (String, String) =
+                    c.query_row("SELECT trigger, skill_name FROM procedural_skill WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                skill_embedding_text(&trigger, &name)
+            }
+        };
+        texts.push((*table, *id, text));
+    }
+    Ok(texts)
+}
+
+/// Takes delete `delete_id` back inside the caller's transaction: decides
+/// again what comes back, and puts it back with the vectors computed before.
+/// A row without one stays deleted, as one that changed since the first pass.
+fn undo_write_in(
+    c: &Connection,
+    delete_id: i64,
+    vectors: &HashMap<(Table, i64), Vec<u8>>,
+    now: TimestampMs,
+) -> Result<DeleteReport, DeleteError> {
+    let plan = undo_plan_in(c, delete_id)?;
+    let mut report = plan_report(delete_id, &plan);
+    report.restored = Counts::default();
+    // The project is live first, so the rows that come back find it so and
+    // leave it as it was.
+    c.execute("UPDATE project SET deleted_at = NULL WHERE id = ?1 AND deleted_at = ?2", rusqlite::params![plan.project_id, plan.at])?;
+    let roots: Vec<String> = {
+        let mut stmt = c.prepare("SELECT root_id FROM project_delete_folder WHERE delete_id = ?1 ORDER BY root_id")?;
+        let rows = stmt.query_map([delete_id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for root in roots {
+        if c.execute("UPDATE project_path SET index_docs = 1 WHERE id = ?1 AND index_docs = 0", [&root])? > 0 {
+            report.folders.push(root);
+        }
+    }
+    let mut memories = Vec::new();
+    for (table, id) in &plan.restore {
+        let Some(vector) = vectors.get(&(*table, *id)) else {
+            report.kept.push(Kept { table: table.name().to_string(), id: *id, reason: KeepReason::Changed });
+            continue;
+        };
+        c.execute(
+            &format!("UPDATE {} SET deleted_at = NULL WHERE id = ?1 AND project_id = ?2 AND deleted_at = ?3", table.name()),
+            rusqlite::params![id, plan.project_id, plan.at],
+        )?;
+        c.execute(&format!("DELETE FROM {} WHERE rowid = ?1", table.vectors()), [id])?;
+        c.execute(&format!("INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)", table.vectors()), rusqlite::params![id, vector])?;
+        match table {
+            Table::Memory => {
+                c.execute(RESTORE_TEXT_INDEX, [id])?;
+                memories.push(*id);
+                report.restored.memories += 1;
+            }
+            Table::Trajectory => report.restored.trajectories += 1,
+            Table::Skill => report.restored.skills += 1,
+        }
+    }
+    // The rows that disputed or were disputed come back to what is live now.
+    for id in memories {
+        settle_row(c, id, now)?;
+        settle_challengers(c, id, now)?;
+    }
+    report.kept.sort_by(|a, b| (Table::of(&a.table), a.id).cmp(&(Table::of(&b.table), b.id)));
+    c.execute("UPDATE project_delete SET undone_at = ?2 WHERE delete_id = ?1", rusqlite::params![delete_id, now])?;
+    Ok(report)
+}
+
+/// Takes delete `delete_id` back: the project is live again with its docs
+/// index turned on, and each row the delete deleted comes back as it was,
+/// with its vector and its entry in the text index, unless it stays deleted:
+/// a live row saved since has its text or its key (the refusals of
+/// `undelete`), it holds a secret by today's rules, it is not as the delete
+/// left it, or it is a piece of a save with a piece that stays. A row deleted
+/// before the delete never comes back. The vectors are computed with
+/// `embedder` before the transaction, so an undo with rows to restore and no
+/// embedder is `NeedsModel`; a dry run and an undo with nothing to restore
+/// need none. A `pre-undo` snapshot goes into `backups` before writing.
+pub async fn undo_delete_core(
+    store: &MemoryStore,
+    embedder: Option<&dyn Embedder>,
+    backups: &Path,
+    delete_id: i64,
+    dry_run: bool,
+) -> Result<DeleteReport, DeleteError> {
+    let plan = retrying(store, false, move |c| undo_plan_in(c, delete_id)).await?;
+    if dry_run {
+        return Ok(DeleteReport { dry_run: true, ..plan_report(delete_id, &plan) });
+    }
+    let mut vectors = HashMap::with_capacity(plan.restore.len());
+    if !plan.restore.is_empty() {
+        let embedder = embedder.ok_or(DeleteError::NeedsModel)?;
+        let restore = plan.restore.clone();
+        let texts = store.conn.call(move |c| embedding_texts_in(c, &restore)).await.map_err(MemoryError::Connection)?;
+        for batch in texts.chunks(EMBED_BATCH) {
+            let inputs: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
+            let embedded = embedder.embed_batch(&inputs, EmbedRole::Passage).await?;
+            for ((table, id, _), vector) in batch.iter().zip(embedded) {
+                let unit = to_unit(&vector).map_err(|e| EmbedError::InferenceFailed(e.to_string()))?;
+                vectors.insert((*table, *id), unit.iter().flat_map(|f| f.to_le_bytes()).collect());
+            }
+        }
+    }
+    let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreUndo).await?.display().to_string();
+    let mut report = retrying(store, true, move |c| undo_write_in(c, delete_id, &vectors, TimestampMs::now())).await?;
+    report.snapshot = Some(snapshot);
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +1110,14 @@ mod tests {
 
         /// A row of `memory` with every field a report reads.
         async fn row(&self, id: i64, project: &str, agent: Option<&str>, kind: &str, status: &str, deleted_at: Option<i64>) {
+            self.row_in(id, project, agent, kind, status, deleted_at, &format!("note {id}")).await;
+        }
+
+        async fn row_text(&self, id: i64, project: &str, content: &str) {
+            self.row_in(id, project, Some("agent-a"), "semantic_fact", "active", None, content).await;
+        }
+
+        async fn row_in(&self, id: i64, project: &str, agent: Option<&str>, kind: &str, status: &str, deleted_at: Option<i64>, content: &str) {
             let agent = agent.map_or("NULL".to_string(), |a| format!("'{a}'"));
             let scope = if agent == "NULL" { "project" } else { "agent" };
             let deleted_at = deleted_at.map_or("NULL".to_string(), |d| d.to_string());
@@ -735,7 +1125,7 @@ mod tests {
                 "INSERT INTO memory \
                  (id, scope, agent_id, project_id, content, memory_type, source, created_at, created_by_type, \
                   created_by_ref, last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
-                 VALUES ({id}, '{scope}', {agent}, '{project}', 'note {id}', '{kind}', 'explicit', {id}, 'agent', \
+                 VALUES ({id}, '{scope}', {agent}, '{project}', '{content}', '{kind}', 'explicit', {id}, 'agent', \
                   'x', {id}, {id}, 5.0, 3, '{status}', {deleted_at});"
             ))
             .await;
@@ -1342,5 +1732,207 @@ mod tests {
         let report = f.confirm(A, &code).await.unwrap();
         assert_eq!((report.refused, report.delete_id), (None, Some(1)));
         assert_eq!(report.failed.len(), 1, "a save that gave up is in the report");
+    }
+
+    // ── undoing ─────────────────────────────────────────────────────────
+
+    use crate::memory::embedder::{Embedder, FakeEmbedder};
+
+    impl Fixture {
+        async fn undo(&self, delete_id: i64, dry_run: bool, embedder: Option<&dyn Embedder>) -> Result<DeleteReport, DeleteError> {
+            undo_delete_core(&self.store, embedder, &self.backups(), delete_id, dry_run).await
+        }
+
+        /// What an undo must give back: rows, vectors, text index, project and
+        /// folders, without the journal.
+        async fn restored_state(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT json_array('m', id, project_id, status, deleted_at, update_count, last_modified_at, superseded_by, disputed_against) FROM memory",
+                "SELECT json_array('t', id, project_id, status, deleted_at, update_count, last_modified_at) FROM episodic_trajectory",
+                "SELECT json_array('s', id, project_id, status, deleted_at, update_count, last_modified_at) FROM procedural_skill",
+                "SELECT json_array('mv', rowid) FROM memory_vectors",
+                "SELECT json_array('ev', rowid) FROM episodic_vectors",
+                "SELECT json_array('pv', rowid) FROM procedural_vectors",
+                "SELECT json_array('fts', rowid) FROM memory_fts WHERE memory_fts MATCH 'note'",
+                "SELECT json_array('p', id, deleted_at, reviewed) FROM project",
+                "SELECT json_array('f', id, index_docs) FROM project_path",
+                "SELECT json_array('c', new_id, old_id, state) FROM memory_conflict",
+            ] {
+                out.extend(self.rows(&format!("{sql} ORDER BY 1"), |r| r.get::<_, String>(0)).await);
+            }
+            out
+        }
+
+        fn pre_undo_snapshots(&self) -> usize {
+            std::fs::read_dir(self.backups())
+                .map(|d| d.filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().contains("pre-undo")).count())
+                .unwrap_or(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn undoing_a_delete_leaves_the_store_as_it_was() {
+        let f = Fixture::new(&[A, B]).await;
+        project_with_its_rows(&f).await;
+        f.sql(&format!("UPDATE project SET reviewed = 1 WHERE id = '{A}';")).await;
+        let before = f.restored_state().await;
+        let code = f.code(A).await;
+        let n = f.confirm(A, &code).await.unwrap().delete_id.unwrap();
+        let deleted = f.restored_state().await;
+        assert_ne!(deleted, before);
+
+        let needs_a_model = f.undo(n, false, None).await;
+        assert!(matches!(needs_a_model, Err(DeleteError::NeedsModel)), "{needs_a_model:?}");
+        assert_eq!((f.restored_state().await, f.pre_undo_snapshots()), (deleted.clone(), 0), "nothing is written, no snapshot");
+
+        let dry = f.undo(n, true, None).await.unwrap();
+        assert!(dry.dry_run && dry.snapshot.is_none(), "a dry run needs no model and takes no snapshot");
+        assert_eq!(dry.restored, Counts { memories: 2, trajectories: 1, skills: 1 });
+        assert!(dry.kept.is_empty());
+        assert_eq!((f.restored_state().await, f.pre_undo_snapshots()), (deleted, 0));
+
+        let embedder = FakeEmbedder::default();
+        let undone = f.undo(n, false, Some(&embedder)).await.unwrap();
+
+        assert_eq!((undone.delete_id, undone.restored, undone.folders.clone()), (Some(n), dry.restored, vec![A.to_string()]));
+        assert!(undone.kept.is_empty() && !undone.dry_run);
+        let snapshot = undone.snapshot.clone().expect("a snapshot before writing");
+        assert!(snapshot.contains("pre-undo") && std::path::Path::new(&snapshot).exists(), "{snapshot}");
+        // The challenger outside the project was released by the delete and settled by the
+        // undo, which stamps its date; its status is what is compared.
+        let strip = |rows: Vec<String>| -> Vec<String> { rows.into_iter().filter(|r| !r.starts_with("[\"m\",11,")).collect() };
+        assert_eq!(
+            strip(f.restored_state().await),
+            strip(before),
+            "rows, statuses, dates, vectors, text index, disputes, project and folders"
+        );
+        let challenger: Vec<String> = f.rows("SELECT status FROM memory WHERE id = 11", |r| r.get(0)).await;
+        assert_eq!(challenger, vec!["disputed".to_string()], "the dispute is back");
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_doc_file").await, 0, "the next refresh rebuilds the docs index");
+        let journal: Vec<bool> = f.rows("SELECT undone_at IS NOT NULL FROM project_delete", |r| r.get(0)).await;
+        assert_eq!(journal, vec![true]);
+        let again = f.undo(n, false, Some(&embedder)).await;
+        assert!(matches!(again, Err(DeleteError::Undone(id)) if id == n), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn undoing_a_delete_keeps_what_was_saved_since() {
+        let f = Fixture::new(&[A, B]).await;
+        for id in [1, 2, 3, 5, 6, 8, 9] {
+            f.live(id, A).await;
+        }
+        f.row(4, A, Some("agent-a"), "semantic_fact", "active", Some(4)).await;
+        f.row_text(7, A, "connect to postgres://admin:hunter2pass@db.local/app").await;
+        f.sql(
+            "UPDATE memory SET content_hash = 'h1' WHERE id = 1;
+             UPDATE memory SET content_hash = 'h6' WHERE id = 6;
+             UPDATE memory SET topic_key = 'k' WHERE id = 2;
+             INSERT INTO memory_piece (save_id, piece, memory_id, context) VALUES (100, 0, 5, ''), (100, 1, 6, 'ctx');",
+        )
+        .await;
+        let code = f.code(A).await;
+        let n = f.confirm(A, &code).await.unwrap().delete_id.unwrap();
+
+        // Saved since: the text of row 1, the key of row 2, the text of row 6.
+        f.live(20, A).await;
+        f.live(21, A).await;
+        f.live(22, A).await;
+        f.sql(
+            "UPDATE memory SET content_hash = 'h1' WHERE id = 20;
+             UPDATE memory SET topic_key = 'k' WHERE id = 21;
+             UPDATE memory SET content_hash = 'h6' WHERE id = 22;
+             UPDATE memory SET deleted_at = NULL WHERE id = 8;
+             UPDATE memory SET project_id = 'web-bbbb' WHERE id = 9;",
+        )
+        .await;
+        let embedder = FakeEmbedder::default();
+
+        let undone = f.undo(n, false, Some(&embedder)).await.unwrap();
+
+        assert_eq!(undone.restored, Counts { memories: 1, ..Counts::default() });
+        let kept: Vec<(i64, KeepReason)> = undone.kept.iter().map(|k| (k.id, k.reason)).collect();
+        assert_eq!(
+            kept,
+            vec![
+                (1, KeepReason::LiveTwin),
+                (2, KeepReason::TopicTaken),
+                (5, KeepReason::Tied),
+                (6, KeepReason::LiveTwin),
+                (7, KeepReason::HoldsSecret),
+                (8, KeepReason::Changed),
+                (9, KeepReason::Changed),
+            ]
+        );
+        assert!(undone.kept.iter().all(|k| k.table == "memory"));
+        let live: Vec<i64> = f
+            .rows("SELECT id FROM memory WHERE project_id = 'app-aaaa' AND deleted_at IS NULL ORDER BY id", |r| r.get(0))
+            .await;
+        assert_eq!(live, vec![3, 8, 20, 21, 22], "the saves since stay, one old row comes back, the rest stay deleted");
+        let deleted_before: Vec<Option<i64>> = f.rows("SELECT deleted_at FROM memory WHERE id = 4", |r| r.get(0)).await;
+        assert_eq!(deleted_before, vec![Some(4)], "a row deleted before the delete never comes back");
+        assert_eq!(f.count("SELECT COUNT(*) FROM memory_vectors WHERE rowid = 3").await, 1);
+        assert_eq!(f.count("SELECT COUNT(*) FROM memory_vectors WHERE rowid IN (1, 2, 5, 6, 7)").await, 0);
+        let project: Vec<(Option<i64>, i64)> =
+            f.rows(&format!("SELECT deleted_at, reviewed FROM project WHERE id = '{A}'"), |r| Ok((r.get(0)?, r.get(1)?))).await;
+        assert_eq!(project, vec![(None, 0)], "a save brought it back unreviewed, and the undo leaves it so");
+    }
+
+    #[tokio::test]
+    async fn a_delete_followed_by_another_is_undone_after_it() {
+        let f = Fixture::new(&[A, B, C]).await;
+        f.live(1, A).await;
+        let first = f.confirm(A, &f.code(A).await).await.unwrap().delete_id.unwrap();
+        f.live(2, A).await;
+        let second = f.confirm(A, &f.code(A).await).await.unwrap().delete_id.unwrap();
+        assert_eq!((first, second), (1, 2));
+        let embedder = FakeEmbedder::default();
+        let before = f.restored_state().await;
+
+        let refused = f.undo(first, false, Some(&embedder)).await;
+
+        assert!(matches!(&refused, Err(DeleteError::DeletedLater { project_id, later }) if project_id == A && *later == second), "{refused:?}");
+        assert_eq!(f.restored_state().await, before);
+
+        let undone = f.undo(second, false, Some(&embedder)).await.unwrap();
+        assert_eq!(undone.restored, Counts { memories: 1, ..Counts::default() });
+        assert_eq!(f.count("SELECT COUNT(*) FROM memory WHERE id = 2 AND deleted_at IS NULL").await, 1);
+        assert_eq!(f.count("SELECT COUNT(*) FROM memory WHERE id = 1 AND deleted_at IS NULL").await, 0, "the earlier delete is still its own");
+        let undone = f.undo(first, false, Some(&embedder)).await.unwrap();
+        assert_eq!(undone.restored, Counts { memories: 1, ..Counts::default() });
+        assert_eq!(f.count("SELECT COUNT(*) FROM memory WHERE project_id = 'app-aaaa' AND deleted_at IS NULL").await, 2);
+
+        let unknown = f.undo(99, false, Some(&embedder)).await;
+        assert!(matches!(unknown, Err(DeleteError::UnknownDelete(99))), "{unknown:?}");
+        f.live(3, C).await;
+        let purged = f.confirm(C, &f.code(C).await).await.unwrap().delete_id.unwrap();
+        f.sql(&format!("UPDATE project_delete SET purged_at = 5 WHERE delete_id = {purged}")).await;
+        let gone = f.undo(purged, false, Some(&embedder)).await;
+        assert!(matches!(gone, Err(DeleteError::Purged(id)) if id == purged), "{gone:?}");
+    }
+
+    #[tokio::test]
+    async fn undoing_an_empty_delete_needs_no_embedder() {
+        let f = Fixture::new(&[A, B]).await;
+        f.sql(&format!("UPDATE project_path SET index_docs = 1 WHERE id = '{A}';")).await;
+        f.row(1, A, Some("agent-a"), "semantic_fact", "active", Some(4)).await;
+        f.docs(A, 900).await;
+        let n = f.delete(A, false).await.unwrap().delete_id.unwrap();
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path WHERE index_docs = 1").await, 0);
+
+        let dry = f.undo(n, true, None).await.unwrap();
+        assert!(dry.dry_run && dry.snapshot.is_none() && dry.restored == Counts::default());
+        let deleted: Vec<Option<i64>> = f.rows(&format!("SELECT deleted_at FROM project WHERE id = '{A}'"), |r| r.get(0)).await;
+        assert!(deleted[0].is_some(), "a dry run writes nothing");
+
+        let undone = f.undo(n, false, None).await.unwrap();
+
+        assert_eq!((undone.restored, undone.folders.clone()), (Counts::default(), vec![A.to_string()]));
+        assert!(undone.snapshot.as_deref().is_some_and(|s| s.contains("pre-undo")));
+        let state: Vec<Option<i64>> = f.rows(&format!("SELECT deleted_at FROM project WHERE id = '{A}'"), |r| r.get(0)).await;
+        assert_eq!(state, vec![None]);
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_path WHERE index_docs = 1").await, 1);
+        let row: Vec<Option<i64>> = f.rows("SELECT deleted_at FROM memory WHERE id = 1", |r| r.get(0)).await;
+        assert_eq!(row, vec![Some(4)], "a row deleted before stays deleted");
     }
 }
