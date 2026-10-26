@@ -17,7 +17,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::identity::Ground;
 use crate::memory::merge::{canonical_in, MAX_MERGE_HOPS};
 use crate::memory::project::is_project_id;
-use crate::memory::project_delete::deleted_in;
+use crate::memory::project_delete::{deleted_in, deleted_message};
 use crate::memory::{MemoryError, MemoryStore};
 
 /// The name a project has until someone gives it one: its id without the
@@ -371,7 +371,7 @@ pub enum RenameError {
     #[error("project {id} was merged into {into}: rename {into} instead")]
     Merged { id: String, into: String },
     /// `delete_id` is the open delete that took it.
-    #[error("project {id} is deleted")]
+    #[error("{}", deleted_message(.id, .delete_id))]
     Deleted { id: String, delete_id: Option<i64> },
     #[error(transparent)]
     Store(#[from] MemoryError),
@@ -462,7 +462,7 @@ pub enum KeepApartError {
     Same(String),
     #[error("project {id} was merged into {into}")]
     Merged { id: String, into: String },
-    #[error("project {id} is deleted")]
+    #[error("{}", deleted_message(.id, .delete_id))]
     Deleted { id: String, delete_id: Option<i64> },
     #[error(transparent)]
     Store(#[from] MemoryError),

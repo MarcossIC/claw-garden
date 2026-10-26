@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
 use crate::memory::merge::canonical_in;
-use crate::memory::project_delete::deleted_in;
+use crate::memory::project_delete::{deleted_in, deleted_message};
 use crate::memory::search::{reader_predicate, viewer_match_expression};
 use crate::memory::store_insert::MemoryType;
 use crate::memory::{MemoryError, MemoryStore};
@@ -123,7 +123,7 @@ pub enum MoveError {
     #[error("project {id} was merged into {into}: its memories are there now")]
     Merged { id: String, into: String },
     /// `delete_id` is the open delete that took it.
-    #[error("project {id} is deleted")]
+    #[error("{}", deleted_message(.id, .delete_id))]
     Deleted { id: String, delete_id: Option<i64> },
     #[error("move {move_id} is part of merge {merge_id}: undo it with `clawg projects merge --undo {merge_id}`")]
     PartOfMerge { move_id: i64, merge_id: i64 },

@@ -47,8 +47,10 @@ use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportRe
 use clawg_core::memory::identity::{Disk, Ground};
 use clawg_core::memory::project::{register_project, RegisterError, Registration};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
+use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
 use clawg_core::memory::registry::{
-    keep_apart, list_projects, rename_project, KeepApartError, KeptApart, ListedProject, Project, RenameError,
+    keep_apart, list_deletes, list_projects, rename_project, KeepApartError, KeptApart, ListedDelete, ListedProject, Project,
+    RenameError,
 };
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
@@ -1057,6 +1059,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/projects/{id}", patch(rename))
         .route("/projects/merge", post(merge_projects))
         .route("/projects/keep-apart", post(keep_projects_apart))
+        .route("/projects/delete", post(delete_projects))
         .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
@@ -2112,13 +2115,16 @@ async fn register(
 #[derive(Debug, Serialize)]
 pub struct ProjectsBody {
     pub projects: Vec<ListedProject>,
+    /// Every delete nobody undid or purged.
+    pub deletes: Vec<ListedDelete>,
 }
 
 /// Every project, with or without a folder, with what leads to it, how many
 /// memories it holds and the suggestions about it nobody answered.
 async fn projects(State(app): State<Arc<AppCtx>>) -> ApiResult<Json<ProjectsBody>> {
     let projects = list_projects(&app.runtime.store, Arc::new(Disk)).await.map_err(ApiError::internal)?;
-    Ok(Json(ProjectsBody { projects }))
+    let deletes = list_deletes(&app.runtime.store).await.map_err(ApiError::internal)?;
+    Ok(Json(ProjectsBody { projects, deletes }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2187,6 +2193,67 @@ async fn merge_projects(
         _ => return Err(ApiError::bad_request("name a source and a target, or a merge to undo")),
     };
     report.map(Json).map_err(merge_error)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteRequest {
+    project_id: Option<String>,
+    /// Delete the project with its rows: without `confirm` this answers the
+    /// report and its code.
+    #[serde(default)]
+    with_memories: bool,
+    /// The code of the report the person saw.
+    confirm: Option<String>,
+    /// The number of a delete to undo, instead of a project.
+    undo: Option<i64>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// The status a refused delete or undo answers with. A delete that needs the
+/// model for the vectors of the rows it restores answers as every route that
+/// needs it does.
+fn delete_error(app: &AppCtx, e: DeleteError) -> ApiError {
+    let conflict = |code: &str, e: &DeleteError| ApiError { detail: Some(e.to_string()), ..ApiError::conflict(code) };
+    match e {
+        DeleteError::UnknownProject(_) | DeleteError::UnknownDelete(_) => ApiError::not_found(e.to_string()),
+        DeleteError::Merged { .. } => conflict("project_merged", &e),
+        DeleteError::Deleted { .. } => conflict("project_deleted", &e),
+        DeleteError::SavesPending(_) => ApiError { retryable: Some(true), ..conflict("saves_pending", &e) },
+        DeleteError::Undone(_) => conflict("delete_undone", &e),
+        DeleteError::Purged(_) => conflict("delete_purged", &e),
+        DeleteError::DeletedLater { .. } => conflict("deleted_later", &e),
+        DeleteError::NeedsModel => ready_embedder(app).err().unwrap_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),
+        DeleteError::Embed(e) => embed_failure(e),
+        DeleteError::Store(_) => ApiError::internal(e),
+    }
+}
+
+/// Deletes a project, in two steps when it takes its rows, or undoes a
+/// delete, for the user. Deleting needs no embedder; an undo needs it only
+/// when it has rows to restore, so it is handed the model if there is one and
+/// asks for it only then.
+async fn delete_projects(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<DeleteRequest>,
+) -> ApiResult<Json<DeleteReport>> {
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let (store, workspaces) = (&app.runtime.store, app.runtime.workspaces());
+    let report = match body {
+        DeleteRequest { undo: Some(delete_id), project_id: None, with_memories: false, confirm: None, dry_run } => {
+            let embedder = app.runtime.embedder.get().cloned();
+            undo_delete_core(store, embedder.as_deref(), &backups, delete_id, dry_run).await
+        }
+        DeleteRequest { undo: None, project_id: Some(project_id), with_memories, confirm, dry_run: false } => {
+            if confirm.is_some() && !with_memories {
+                return Err(ApiError::bad_request("confirm goes with with_memories: it is the code of the report of a delete with its rows"));
+            }
+            delete_core(store, &workspaces, &backups, &project_id, with_memories, confirm.as_deref()).await
+        }
+        _ => return Err(ApiError::bad_request("name a project to delete, or a delete to undo (dry_run goes with undo)")),
+    };
+    report.map(Json).map_err(|e| delete_error(&app, e))
 }
 
 #[derive(Debug, Deserialize)]

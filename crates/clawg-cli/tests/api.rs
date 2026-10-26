@@ -4450,6 +4450,7 @@ const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
     ("PATCH", "/projects/{id}", Some("path.id")),
     ("POST", "/projects/merge", Some("body.target")),
     ("POST", "/projects/keep-apart", Some("body.project_id")),
+    ("POST", "/projects/delete", Some("body.project_id")),
     // A folder's root id, which a merge does not change.
     ("POST", "/projects/docs/search", None),
     ("POST", "/shutdown", None),
@@ -4608,6 +4609,11 @@ async fn every_route_that_takes_a_project_follows_a_merge() {
             ("POST", "/projects/keep-apart") => {
                 let (status, body) = h.post_json("/v1/projects/keep-apart", json!({ "project_id": app, "other_id": other })).await;
                 assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+            }
+            ("POST", "/projects/delete") => {
+                let (status, body) = h.post_json("/v1/projects/delete", json!({ "project_id": app })).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+                assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route}: {body}");
             }
             _ => panic!("{route} takes a project and no check here follows it past a merge"),
         }
@@ -4769,4 +4775,244 @@ async fn a_merge_waits_for_the_saves_of_its_projects() {
     pending_save(&h, "op-2", &web).await;
     let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": web, "target": other })).await;
     assert_eq!((status, body["error"].as_str(), body["retryable"].as_bool()), (409, Some("saves_pending"), Some(true)), "{body}");
+}
+
+// ── Deleted projects ────────────────────────────────────────────────────────
+
+/// Registers a root, saves a memory in it and deletes the project with it,
+/// as `clawg projects delete --with-memories` does. Answers the project, the
+/// memory and the delete's number.
+async fn deleted_project(h: &Harness, root: &str) -> (String, i64, i64) {
+    let id = registered(h, root).await;
+    let row = save_in(h, &id, &format!("the notes of {root} are kept in a file")).await;
+    let (status, report) = h.post_json("/v1/projects/delete", json!({ "project_id": id, "with_memories": true })).await;
+    assert_eq!(status, 200, "{report}");
+    let (status, done) =
+        h.post_json("/v1/projects/delete", json!({ "project_id": id, "with_memories": true, "confirm": report["code"] })).await;
+    assert_eq!(status, 200, "{done}");
+    (id, row, done["delete_id"].as_i64().expect("a delete"))
+}
+
+fn listed_ids(listing: &Value) -> Vec<&str> {
+    listing["projects"].as_array().expect("projects").iter().filter_map(|p| p["id"].as_str()).collect()
+}
+
+#[tokio::test]
+async fn deleting_through_the_daemon_takes_two_steps() {
+    let h = Harness::start().await;
+    let (gone, empty) = (registered(&h, "/work/gone").await, registered(&h, "/work/empty").await);
+    save_in(&h, &gone, "the notes of gone are kept in a file").await;
+
+    let (status, refused) = h.post_json("/v1/projects/delete", json!({ "project_id": gone })).await;
+    assert_eq!((status, refused["refused"].as_str(), refused["live"]["memories"].as_i64()), (200, Some("not_empty"), Some(1)), "{refused}");
+    assert_eq!(refused["delete_id"], Value::Null);
+    assert!(listed_ids(&h.get_json("/v1/projects").await.1).contains(&gone.as_str()), "nothing was written");
+
+    let (status, report) = h.post_json("/v1/projects/delete", json!({ "project_id": gone, "with_memories": true })).await;
+    assert_eq!(status, 200, "{report}");
+    let code = report["code"].as_str().expect("a code").to_string();
+    assert_eq!((&report["refused"], &report["delete_id"]), (&Value::Null, &Value::Null), "{report}");
+
+    save_in(&h, &gone, "a save between the two steps").await;
+    let (status, stale) =
+        h.post_json("/v1/projects/delete", json!({ "project_id": gone, "with_memories": true, "confirm": code })).await;
+    assert_eq!((status, stale["refused"].as_str(), stale["live"]["memories"].as_i64()), (200, Some("code_changed"), Some(2)), "{stale}");
+    let fresh = stale["code"].as_str().expect("the new code").to_string();
+    assert_ne!(fresh, code);
+    assert!(listed_ids(&h.get_json("/v1/projects").await.1).contains(&gone.as_str()), "a stale code writes nothing");
+
+    let (status, done) =
+        h.post_json("/v1/projects/delete", json!({ "project_id": gone, "with_memories": true, "confirm": fresh })).await;
+    assert_eq!(status, 200, "{done}");
+    assert!(done["delete_id"].as_i64().is_some() && done["snapshot"].as_str().is_some_and(|s| s.contains("pre-delete")), "{done}");
+    let (_, listing) = h.get_json("/v1/projects").await;
+    assert!(!listed_ids(&listing).contains(&gone.as_str()), "{listing}");
+    let deletes = listing["deletes"].as_array().expect("deletes");
+    assert_eq!((deletes.len(), &deletes[0]["project_id"], &deletes[0]["rows"], &deletes[0]["back"]), (1, &json!(gone), &json!(2), &json!(false)), "{listing}");
+
+    let (status, empty_done) = h.post_json("/v1/projects/delete", json!({ "project_id": empty })).await;
+    assert_eq!(status, 200, "{empty_done}");
+    assert!(empty_done["delete_id"].as_i64().is_some() && empty_done["refused"].is_null(), "{empty_done}");
+
+    let again = h.post_json("/v1/projects/delete", json!({ "project_id": gone })).await;
+    assert_eq!((again.0, again.1["error"].as_str()), (409, Some("project_deleted")), "{}", again.1);
+    assert!(again.1["detail"].as_str().is_some_and(|d| d.contains("--undo")), "{}", again.1);
+    let shapes = [
+        (json!({}), 400),
+        (json!({ "undo": 1, "project_id": gone }), 400),
+        (json!({ "project_id": gone, "dry_run": true }), 400),
+        (json!({ "project_id": "app-aaaa", "confirm": "abcd1234" }), 400),
+        (json!({ "project_id": "nowhere-9f9f" }), 404),
+        (json!({ "undo": 99 }), 404),
+    ];
+    for (body, want) in shapes {
+        let (status, answer) = h.post_json("/v1/projects/delete", body.clone()).await;
+        assert_eq!(status, want, "{body}: {answer}");
+    }
+    let (status, undone) = h.post_json("/v1/projects/delete", json!({ "undo": done["delete_id"] })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert_eq!(undone["restored"]["memories"], json!(2), "{undone}");
+    let (status, twice) = h.post_json("/v1/projects/delete", json!({ "undo": done["delete_id"] })).await;
+    assert_eq!((status, twice["error"].as_str()), (409, Some("delete_undone")), "{twice}");
+}
+
+#[tokio::test]
+async fn undoing_a_delete_needs_the_model() {
+    let h = Harness::start_serving_without_embedder().await;
+    // Saves are taken while the model reads as not loaded, only answered 202.
+    let gone = registered(&h, "/work/gone").await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http", "project_id": gone })).await;
+    h.wait_for_rows("memory", 1).await;
+    let (_, report) = h.post_json("/v1/projects/delete", json!({ "project_id": gone, "with_memories": true })).await;
+    let confirm = json!({ "project_id": gone, "with_memories": true, "confirm": report["code"] });
+    let (status, done) = h.post_json("/v1/projects/delete", confirm).await;
+    assert_eq!(status, 200, "{done}");
+    let with_rows = done["delete_id"].as_i64().expect("a delete");
+    let empty = registered(&h, "/work/empty").await;
+    let (_, emptied) = h.post_json("/v1/projects/delete", json!({ "project_id": empty })).await;
+
+    let (status, body) = h.post_json("/v1/projects/delete", json!({ "undo": with_rows })).await;
+    assert_eq!((status, body["error"].as_str()), (503, Some("embedder_not_ready")), "{body}");
+    let (_, listing) = h.get_json("/v1/projects").await;
+    assert_eq!(listing["deletes"].as_array().map(Vec::len), Some(2), "the refused undo left the delete open");
+
+    let (status, dry) = h.post_json("/v1/projects/delete", json!({ "undo": with_rows, "dry_run": true })).await;
+    assert_eq!((status, dry["dry_run"].as_bool(), dry["restored"]["memories"].as_i64()), (200, Some(true), Some(1)), "{dry}");
+    let (status, undone) = h.post_json("/v1/projects/delete", json!({ "undo": emptied["delete_id"] })).await;
+    assert_eq!(status, 200, "an undo with nothing to restore needs no model: {undone}");
+    assert!(undone["snapshot"].as_str().is_some_and(|s| s.contains("pre-undo")), "{undone}");
+}
+
+#[tokio::test]
+async fn a_bridge_opened_before_a_delete_brings_its_project_back() {
+    let h = Harness::start().await;
+    // What the bridge registered at its start, and keeps.
+    let (gone, old, delete_id) = deleted_project(&h, "/work/gone").await;
+
+    let late = save_in(&h, &gone, "a note from a bridge opened before the delete").await;
+
+    assert_eq!(project_of(&h, late).await, json!(gone));
+    let (_, listing) = h.get_json("/v1/projects").await;
+    let back = listing["projects"].as_array().unwrap().iter().find(|p| p["id"] == json!(gone)).expect("listed again");
+    assert_eq!((&back["reviewed"], &back["memories"]), (&json!(false), &json!(1)), "{listing}");
+    let deletes = listing["deletes"].as_array().unwrap();
+    assert_eq!((&deletes[0]["delete_id"], &deletes[0]["back"]), (&json!(delete_id), &json!(true)), "{listing}");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{old}")).await;
+    assert!(row["item"]["deleted_at"].as_i64().is_some() || row["item"].is_null(), "what the delete deleted stays deleted: {row}");
+    let live = h.get_json(&format!("/v1/memories?project={gone}")).await.1;
+    assert_eq!(ids_in(&live["items"]), vec![late], "{live}");
+}
+
+#[tokio::test]
+async fn every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule() {
+    let h = Harness::start().await;
+    let other = registered(&h, "/work/other").await;
+    let on_other = save_in(&h, &other, "the other service is written in Go").await;
+    let refused = |route: &str, status: u16, body: &Value| {
+        assert_eq!((status, body["error"].as_str()), (409, Some("project_deleted")), "{route}: {body}");
+        assert!(body["detail"].as_str().is_some_and(|d| d.contains("--undo")), "{route}: {body}");
+    };
+    let still_deleted = |id: String| {
+        let h = &h;
+        async move {
+            let (_, listing) = h.get_json("/v1/projects").await;
+            assert!(!listed_ids(&listing).contains(&id.as_str()), "{id} was brought back by what only reads it: {listing}");
+        }
+    };
+
+    for (method, path, field) in PROJECT_INPUTS {
+        let Some(field) = field else { continue };
+        let route = format!("{method} {path} ({field})");
+        let root = format!("/work/{}", route.replace(|c: char| !c.is_alphanumeric(), "-"));
+        let (gone, gone_row, _) = deleted_project(&h, &root).await;
+        match (*method, *path) {
+            ("POST", "/memories") => {
+                let id = save_in(&h, &gone, "a note saved after the delete").await;
+                assert_eq!(project_of(&h, id).await, json!(gone), "{route}");
+                let (_, listing) = h.get_json("/v1/projects").await;
+                assert!(listed_ids(&listing).contains(&gone.as_str()), "{route}: a save brings it back");
+                continue;
+            }
+            ("GET", "/memories") => {
+                let (status, body) = h.get_json(&format!("/v1/memories?project={gone}")).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(ids_in(&body["items"]).is_empty(), "{route}: {body}");
+            }
+            ("POST", "/memories/move") => {
+                let (status, body) = h.post_json("/v1/memories/move", json!({ "ids": [on_other], "to_project": gone })).await;
+                refused(&route, status, &body);
+                let from = json!({ "from_project": gone, "include_deleted": true, "to_project": other });
+                let (status, body) = h.post_json("/v1/memories/move", from).await;
+                assert_eq!(status, 200, "{route}: its deleted rows can be taken out: {body}");
+                assert_eq!(project_of(&h, gone_row).await, json!(other), "{route}");
+            }
+            ("POST", "/search") => {
+                let ask = json!({ "agent_id": "agent-http", "query": "notes kept in a file", "project_id": gone });
+                let (status, body) = h.post_json("/v1/search", ask).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(!ids_in(&body["hits"]).contains(&gone_row), "{route}: {body}");
+            }
+            ("POST", "/context") => {
+                let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "agent-http", "project_id": gone })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(body["prompt"].as_str().is_some_and(|p| !p.contains("kept in a file")), "{route}: {body}");
+            }
+            ("POST", "/sessions") => {
+                let (status, body) = h
+                    .post_json("/v1/sessions", json!({ "agent_id": "agent-http", "project_id": gone, "session_id": "s-gone" }))
+                    .await;
+                assert_eq!(status, 204, "{route}: {body}");
+            }
+            ("PATCH", "/memories/{kind}/{id}") => {
+                let (status, body) = patch(&h, on_other, json!({ "project_id": gone })).await;
+                refused(&route, status, &body);
+                assert_eq!(project_of(&h, on_other).await, json!(other), "{route}");
+            }
+            ("GET", "/disputes") => {
+                let (status, body) = h.get_json(&format!("/v1/disputes?agent_id=agent-http&project_id={gone}")).await;
+                assert_eq!(status, 200, "{route}: {body}");
+            }
+            ("POST", "/synthesis") => {
+                let (status, body) = h.post_json("/v1/synthesis", json!({ "project_id": gone })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(!ids_in(&body["pending"]).contains(&gone_row), "{route}: {body}");
+            }
+            ("GET", "/stats") => {
+                let (status, body) = h.get_json(&format!("/v1/stats?project={gone}")).await;
+                assert_eq!(status, 200, "{route}: {body}");
+            }
+            ("PATCH", "/projects/{id}") => {
+                let (status, body) = h.rename(&gone, "Gone").await;
+                refused(&route, status, &body);
+            }
+            ("POST", "/projects/merge") => {
+                for body in [json!({ "source": other, "target": gone }), json!({ "source": gone, "target": other })] {
+                    let (status, answer) = h.post_json("/v1/projects/merge", body).await;
+                    refused(&route, status, &answer);
+                }
+                // The undo of a merge whose target was deleted since.
+                let (a, b) = (registered(&h, &format!("{root}-a")).await, registered(&h, &format!("{root}-b")).await);
+                save_in(&h, &a, "a note of a project merged and then deleted").await;
+                let (_, merged) = h.post_json("/v1/projects/merge", json!({ "source": a, "target": b })).await;
+                let (_, report) = h.post_json("/v1/projects/delete", json!({ "project_id": b, "with_memories": true })).await;
+                h.post_json("/v1/projects/delete", json!({ "project_id": b, "with_memories": true, "confirm": report["code"] })).await;
+                let (status, answer) = h.post_json("/v1/projects/merge", json!({ "undo": merged["merge_id"] })).await;
+                refused(&route, status, &answer);
+            }
+            ("POST", "/projects/keep-apart") => {
+                for body in [json!({ "project_id": gone, "other_id": other }), json!({ "project_id": other, "other_id": gone })] {
+                    let (status, answer) = h.post_json("/v1/projects/keep-apart", body).await;
+                    refused(&route, status, &answer);
+                }
+            }
+            ("POST", "/projects/delete") => {
+                for body in [json!({ "project_id": gone }), json!({ "project_id": gone, "with_memories": true })] {
+                    let (status, answer) = h.post_json("/v1/projects/delete", body).await;
+                    refused(&route, status, &answer);
+                }
+            }
+            _ => panic!("{route} takes a project and no check here says what it does with a deleted one"),
+        }
+        still_deleted(gone).await;
+    }
 }

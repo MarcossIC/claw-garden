@@ -30,6 +30,15 @@ use crate::memory::vector::to_unit;
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
 
+/// What every refusal of a deleted project says: it is deleted, and, when the
+/// journal has an open delete for it, which one and how to undo it.
+pub fn deleted_message(id: &str, delete_id: &Option<i64>) -> String {
+    match delete_id {
+        Some(n) => format!("project {id} is deleted, in delete {n}: undo it with `clawg projects delete --undo {n}`"),
+        None => format!("project {id} is deleted"),
+    }
+}
+
 /// A project that is deleted, with the open delete that took it, when the
 /// journal has one.
 pub(crate) struct DeletedProject {
@@ -64,7 +73,7 @@ pub enum DeleteError {
     #[error("project {id} was merged into {into}")]
     Merged { id: String, into: String },
     /// `delete_id` is the open delete that took it, when the journal has one.
-    #[error("project {id} is already deleted")]
+    #[error("{}", deleted_message(.id, .delete_id))]
     Deleted { id: String, delete_id: Option<i64> },
     #[error("{0} saves of this project are still being stored; try again in a moment")]
     SavesPending(i64),

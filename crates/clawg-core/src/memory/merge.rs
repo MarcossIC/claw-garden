@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
-use crate::memory::project_delete::deleted_in;
+use crate::memory::project_delete::{deleted_in, deleted_message};
 use crate::memory::relocate::{merge_in, undo_move_in, MoveError, Span, Supersede};
 use crate::memory::workspace::{Adopted, Dropped, WorkspaceManager};
 use crate::memory::{MemoryError, MemoryStore};
@@ -73,7 +73,7 @@ pub enum MergeError {
     #[error("project {id} was merged into {into}")]
     Merged { id: String, into: String },
     /// `delete_id` is the open delete that took it.
-    #[error("project {id} is deleted")]
+    #[error("{}", deleted_message(.id, .delete_id))]
     Deleted { id: String, delete_id: Option<i64> },
     #[error("{0} saves of these projects are still being stored; try again in a moment")]
     SavesPending(i64),
