@@ -30,6 +30,32 @@ use crate::memory::vector::to_unit;
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
 
+/// A project that is deleted, with the open delete that took it, when the
+/// journal has one.
+pub(crate) struct DeletedProject {
+    pub delete_id: Option<i64>,
+}
+
+/// The open delete of project `id`: the latest one nobody undid or purged.
+fn open_delete_in(c: &Connection, id: &str) -> rusqlite::Result<Option<i64>> {
+    c.query_row(
+        "SELECT delete_id FROM project_delete \
+         WHERE project_id = ?1 AND undone_at IS NULL AND purged_at IS NULL ORDER BY delete_id DESC LIMIT 1",
+        [id],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Whether project `id` is deleted, for what manages projects to refuse it.
+pub(crate) fn deleted_in(c: &Connection, id: &str) -> rusqlite::Result<Option<DeletedProject>> {
+    let deleted: Option<bool> = c.query_row("SELECT deleted_at IS NOT NULL FROM project WHERE id = ?1", [id], |r| r.get(0)).optional()?;
+    if deleted != Some(true) {
+        return Ok(None);
+    }
+    Ok(Some(DeletedProject { delete_id: open_delete_in(c, id)? }))
+}
+
 /// Why a delete was refused. Nothing is written.
 #[derive(Debug, thiserror::Error)]
 pub enum DeleteError {
@@ -534,15 +560,7 @@ fn delete_pass(c: &Connection, project_id: &str, step: &Step, now: TimestampMs) 
         return Err(DeleteError::Merged { id: project_id.to_string(), into });
     }
     if deleted_at.is_some() {
-        let delete_id = c
-            .query_row(
-                "SELECT delete_id FROM project_delete \
-                 WHERE project_id = ?1 AND undone_at IS NULL AND purged_at IS NULL ORDER BY delete_id DESC LIMIT 1",
-                [project_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        return Err(DeleteError::Deleted { id: project_id.to_string(), delete_id });
+        return Err(DeleteError::Deleted { id: project_id.to_string(), delete_id: open_delete_in(c, project_id)? });
     }
     if !matches!(step, Step::Report) {
         let (pending, _) = outbox_in(c, &ids_of_in(c, project_id)?)?;

@@ -1734,6 +1734,7 @@ fn move_error(e: MoveError) -> ApiError {
     match e {
         MoveError::Refused(_) => ApiError::conflict(e.to_string()),
         MoveError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+        MoveError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
         MoveError::PartOfMerge { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("part_of_merge") },
         MoveError::UnknownProject(_) | MoveError::UnknownMove(_) => ApiError::not_found(e.to_string()),
         MoveError::NoSelection | MoveError::TextOnDeleted | MoveError::EmptyText => ApiError::bad_request(e.to_string()),
@@ -2137,6 +2138,7 @@ async fn rename(
         RenameError::Name(_) => ApiError::bad_request(e.to_string()),
         RenameError::Taken { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("name_taken") },
         RenameError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+        RenameError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
         RenameError::Store(_) => ApiError::internal(e),
     })?;
     Ok(Json(renamed))
@@ -2163,6 +2165,7 @@ fn merge_error(e: MergeError) -> ApiError {
         MergeError::UnknownProject(_) | MergeError::UnknownMerge(_) => ApiError::not_found(e.to_string()),
         MergeError::SameProject(_) => ApiError::bad_request(e.to_string()),
         MergeError::Merged { .. } => conflict("project_merged", &e),
+        MergeError::Deleted { .. } => conflict("project_deleted", &e),
         MergeError::SavesPending(_) => ApiError { retryable: Some(true), ..conflict("saves_pending", &e) },
         MergeError::Undone(_) => conflict("merge_undone", &e),
         MergeError::MergedLater { .. } => conflict("merged_later", &e),
@@ -2203,6 +2206,7 @@ async fn keep_projects_apart(
         KeepApartError::NotFound(_) => ApiError::not_found(e.to_string()),
         KeepApartError::Same(_) => ApiError::bad_request(e.to_string()),
         KeepApartError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+        KeepApartError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
         KeepApartError::Store(_) => ApiError::internal(e),
     })
 }

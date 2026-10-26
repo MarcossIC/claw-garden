@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
+use crate::memory::project_delete::deleted_in;
 use crate::memory::relocate::{merge_in, undo_move_in, MoveError, Span, Supersede};
 use crate::memory::workspace::{Adopted, Dropped, WorkspaceManager};
 use crate::memory::{MemoryError, MemoryStore};
@@ -71,6 +72,9 @@ pub enum MergeError {
     SameProject(String),
     #[error("project {id} was merged into {into}")]
     Merged { id: String, into: String },
+    /// `delete_id` is the open delete that took it.
+    #[error("project {id} is deleted")]
+    Deleted { id: String, delete_id: Option<i64> },
     #[error("{0} saves of these projects are still being stored; try again in a moment")]
     SavesPending(i64),
     #[error("no merge {0}")]
@@ -228,6 +232,11 @@ fn merge_pass(
         Some(into) if into == target => true,
         Some(into) => return Err(MergeError::Merged { id: source.to_string(), into }),
     };
+    for id in [source, target] {
+        if let Some(deleted) = deleted_in(c, id)? {
+            return Err(MergeError::Deleted { id: id.to_string(), delete_id: deleted.delete_id });
+        }
+    }
     let pending: i64 = c.query_row(
         "SELECT COUNT(*) FROM ingest_outbox \
          WHERE state = 'pending' AND json_extract(event, '$.project_id') IN (?1, ?2)",
@@ -434,6 +443,10 @@ fn undo_pass(c: &Connection, merge_id: i64, now: TimestampMs) -> Result<(MergeRe
             Some(later) => MergeError::MergedLater { target, later },
             None => MergeError::Merged { id: target, into },
         });
+    }
+    // Its rows would go back to the source while the delete journaled them in the target.
+    if let Some(deleted) = deleted_in(c, &target)? {
+        return Err(MergeError::Deleted { id: target, delete_id: deleted.delete_id });
     }
     let pending: i64 = c.query_row(
         "SELECT COUNT(*) FROM ingest_outbox \
@@ -1188,5 +1201,32 @@ mod tests {
         assert!(matches!(&into_tombstone, Err(MergeError::Merged { id, into }) if id == A && into == B), "{into_tombstone:?}");
         let elsewhere = f.merge(A, C, false).await;
         assert!(matches!(&elsewhere, Err(MergeError::Merged { id, into }) if id == A && into == B), "{elsewhere:?}");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_project_is_refused_by_what_manages_projects() {
+        let f = Fixture::new(&[A, B, C, "doc-dddd"]).await;
+        let mark = |id: &'static str, delete_id: i64| {
+            let f = &f;
+            async move {
+                f.sql(&format!(
+                    "UPDATE project SET deleted_at = 5 WHERE id = '{id}';
+                     INSERT INTO project_delete (delete_id, project_id, with_memories, deleted_at) VALUES ({delete_id}, '{id}', 0, 5);"
+                ))
+                .await
+            }
+        };
+        let merged = f.merge("doc-dddd", C, false).await.unwrap().merge_id.unwrap();
+        mark(B, 3).await;
+        mark(C, 4).await;
+        let before = f.everything().await;
+
+        for (source, target, deleted) in [(A, B, B), (B, A, B), (A, C, C)] {
+            let refused = f.merge(source, target, false).await;
+            assert!(matches!(&refused, Err(MergeError::Deleted { id, .. }) if id == deleted), "{source} into {target}: {refused:?}");
+        }
+        let undo = f.undo(merged, false).await;
+        assert!(matches!(&undo, Err(MergeError::Deleted { id, delete_id }) if id == C && *delete_id == Some(4)), "{undo:?}");
+        assert_eq!(f.everything().await, before, "nothing is written");
     }
 }

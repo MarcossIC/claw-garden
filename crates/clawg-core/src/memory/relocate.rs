@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
 use crate::memory::merge::canonical_in;
+use crate::memory::project_delete::deleted_in;
 use crate::memory::search::{reader_predicate, viewer_match_expression};
 use crate::memory::store_insert::MemoryType;
 use crate::memory::{MemoryError, MemoryStore};
@@ -121,6 +122,9 @@ pub enum MoveError {
     UnknownMove(i64),
     #[error("project {id} was merged into {into}: its memories are there now")]
     Merged { id: String, into: String },
+    /// `delete_id` is the open delete that took it.
+    #[error("project {id} is deleted")]
+    Deleted { id: String, delete_id: Option<i64> },
     #[error("move {move_id} is part of merge {merge_id}: undo it with `clawg projects merge --undo {merge_id}`")]
     PartOfMerge { move_id: i64, merge_id: i64 },
     #[error(transparent)]
@@ -441,7 +445,12 @@ fn target_in(c: &Connection, target: Option<&str>) -> Result<Option<String>, Mov
     };
     let known: bool = c.query_row("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1)", [target], |r| r.get(0))?;
     if known {
-        Ok(Some(canonical_in(c, target)?))
+        let live = canonical_in(c, target)?;
+        // Its rows would be out of reach of the undo of the delete.
+        if let Some(deleted) = deleted_in(c, &live)? {
+            return Err(MoveError::Deleted { id: live, delete_id: deleted.delete_id });
+        }
+        Ok(Some(live))
     } else {
         Err(MoveError::UnknownProject(target.to_string()))
     }
@@ -2022,5 +2031,44 @@ mod tests {
         undo_move_core(&store, backups.path(), report.move_id.unwrap(), false).await.unwrap();
 
         assert_eq!((states(&store).await, everything_else(&store).await), before);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_project_is_refused_by_what_manages_projects() {
+        let store = store().await;
+        let id = save_one(&store, fact("a note", Some(A))).await;
+        let theirs = save_one(&store, fact("a note of the project to delete", Some(B))).await;
+        let backups = tempfile::tempdir().unwrap();
+        let away = move_to(&store, &ids(&[theirs]), Some(A)).await.move_id.unwrap();
+        let gone = save_one(&store, fact("a note deleted with the project", Some(B))).await;
+        store.conn.call(move |c| c.execute("UPDATE memory SET deleted_at = 4 WHERE id = ?1", [gone])).await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "UPDATE project SET deleted_at = 5 WHERE id = 'repo-bbbb';
+                     INSERT INTO project_delete (delete_id, project_id, with_memories, deleted_at) VALUES (1, 'repo-bbbb', 0, 5);",
+                )
+            })
+            .await
+            .unwrap();
+
+        let moved = move_memories_core(&store, backups.path(), &ids(&[id]), Some(B.into()), false).await;
+        assert!(matches!(&moved, Err(MoveError::Deleted { id, delete_id }) if id == B && *delete_id == Some(1)), "{moved:?}");
+        let patched = store.conn.call(move |c| -> Result<MoveReport, MoveError> { plan_one_in(c, id, Some(B), None) }).await;
+        assert!(matches!(&patched, Err(tokio_rusqlite::Error::Error(MoveError::Deleted { id, .. })) if id == B), "{patched:?}");
+        assert_eq!(place(&store, id).await.0.as_deref(), Some(A));
+
+        // Its deleted rows can still be taken out before a purge.
+        let from = MoveFilter { from: Some(ProjectFilter::Project(B.into())), include_deleted: true, ..MoveFilter::default() };
+        let rescued = move_memories_core(&store, backups.path(), &from, Some(A.into()), false).await.unwrap();
+        assert_eq!(moved_ids(&rescued), vec![gone]);
+
+        // The undo of a move that gives a live row back brings it back, as any live row does.
+        undo_move_core(&store, backups.path(), away, false).await.unwrap();
+        assert_eq!(place(&store, theirs).await.0.as_deref(), Some(B));
+        let back: Option<i64> =
+            store.conn.call(|c| c.query_row("SELECT deleted_at FROM project WHERE id = 'repo-bbbb'", [], |r| r.get(0))).await.unwrap();
+        assert_eq!(back, None);
     }
 }

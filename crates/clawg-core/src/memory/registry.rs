@@ -6,7 +6,7 @@
 //! the same write, through the two triggers of V27, which name the project as
 //! [`project_name`] does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,6 +17,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::identity::Ground;
 use crate::memory::merge::{canonical_in, MAX_MERGE_HOPS};
 use crate::memory::project::is_project_id;
+use crate::memory::project_delete::deleted_in;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// The name a project has until someone gives it one: its id without the
@@ -80,6 +81,20 @@ pub struct ListedMerged {
     pub merged_at: Option<i64>,
 }
 
+/// A delete nobody undid or purged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedDelete {
+    pub delete_id: i64,
+    pub project_id: String,
+    pub name: String,
+    pub with_memories: bool,
+    pub deleted_at: i64,
+    /// The rows of its set that are still deleted: what its purge would remove.
+    pub rows: i64,
+    /// Whether the project is live again, brought back by a row saved in it.
+    pub back: bool,
+}
+
 /// A project with what leads to it and what it holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListedProject {
@@ -108,8 +123,9 @@ struct StoredFolder {
 
 /// What [`list_projects`] reads of the store.
 struct Stored {
-    /// Tombstones too.
+    /// Tombstones and deleted projects too.
     projects: Vec<Project>,
+    deleted: HashSet<String>,
     /// The project each tombstone was merged into, and when.
     merged_into: HashMap<String, (String, Option<i64>)>,
     /// The merge that made each tombstone, by its id.
@@ -124,12 +140,14 @@ struct Stored {
 }
 
 fn stored_in(c: &Connection) -> rusqlite::Result<Stored> {
-    let mut stmt = c.prepare("SELECT id, name, born, reviewed, created_at, merged_into, merged_at FROM project")?;
+    let mut stmt =
+        c.prepare("SELECT id, name, born, reviewed, created_at, merged_into, merged_at, deleted_at IS NOT NULL FROM project")?;
     let rows = stmt
-        .query_map([], |r| Ok((project_from(r)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<i64>>(6)?)))?
+        .query_map([], |r| Ok((project_from(r)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<i64>>(6)?, r.get::<_, bool>(7)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let merged_into = rows.iter().filter_map(|(p, into, at)| Some((p.id.clone(), (into.clone()?, *at)))).collect();
-    let projects = rows.into_iter().map(|(p, _, _)| p).collect();
+    let deleted = rows.iter().filter(|(_, _, _, deleted)| *deleted).map(|(p, ..)| p.id.clone()).collect();
+    let merged_into = rows.iter().filter_map(|(p, into, at, _)| Some((p.id.clone(), (into.clone()?, *at)))).collect();
+    let projects = rows.into_iter().map(|(p, ..)| p).collect();
     let mut stmt = c.prepare(
         "SELECT m.source, MIN(m.merge_id) FROM project_merge m \
          JOIN project_merge_change ch ON ch.merge_id = m.merge_id AND ch.kind = 'tombstoned' \
@@ -160,7 +178,7 @@ fn stored_in(c: &Connection) -> rusqlite::Result<Stored> {
         "SELECT project_id, other_id, reason, created_at FROM project_suggestion WHERE answer IS NULL ORDER BY created_at, rowid",
     )?;
     let suggestions = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
-    Ok(Stored { projects, merged_into, merges, folders, remotes, memories, suggestions })
+    Ok(Stored { projects, deleted, merged_into, merges, folders, remotes, memories, suggestions })
 }
 
 /// The live project `id` leads to through `merged_into`, as
@@ -217,7 +235,7 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
     let mut listed: Vec<ListedProject> = stored
         .projects
         .iter()
-        .filter(|p| !stored.merged_into.contains_key(&p.id))
+        .filter(|p| !stored.merged_into.contains_key(&p.id) && !stored.deleted.contains(&p.id))
         .map(|p| ListedProject {
             project: p.clone(),
             folders: Vec::new(),
@@ -258,6 +276,10 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
     let mut pairs: Vec<(String, String)> = Vec::new();
     for (a, b, reason, created_at) in &stored.suggestions {
         let (a, b) = (live(a), live(b));
+        // Until the deleted side comes back, nobody is asked about it.
+        if stored.deleted.contains(&a) || stored.deleted.contains(&b) {
+            continue;
+        }
         let pair = if a < b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
         if a == b || pairs.contains(&pair) {
             continue;
@@ -292,6 +314,41 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
     listed
 }
 
+/// Every delete nobody undid or purged, oldest first, with the project it
+/// took and whether a row saved since brought the project back.
+pub async fn list_deletes(store: &MemoryStore) -> Result<Vec<ListedDelete>, MemoryError> {
+    store
+        .conn
+        .call(|c| {
+            let mut stmt = c.prepare(
+                "SELECT d.delete_id, d.project_id, COALESCE(p.name, d.project_id), d.with_memories, d.deleted_at, \
+                   (SELECT COUNT(*) FROM project_delete_row r JOIN memory m ON r.tbl = 'memory' AND m.id = r.row_id \
+                     WHERE r.delete_id = d.delete_id AND m.deleted_at IS NOT NULL) \
+                 + (SELECT COUNT(*) FROM project_delete_row r JOIN episodic_trajectory m ON r.tbl = 'episodic_trajectory' AND m.id = r.row_id \
+                     WHERE r.delete_id = d.delete_id AND m.deleted_at IS NOT NULL) \
+                 + (SELECT COUNT(*) FROM project_delete_row r JOIN procedural_skill m ON r.tbl = 'procedural_skill' AND m.id = r.row_id \
+                     WHERE r.delete_id = d.delete_id AND m.deleted_at IS NOT NULL), \
+                   p.deleted_at IS NULL \
+                 FROM project_delete d LEFT JOIN project p ON p.id = d.project_id \
+                 WHERE d.undone_at IS NULL AND d.purged_at IS NULL ORDER BY d.delete_id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(ListedDelete {
+                    delete_id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    name: r.get(2)?,
+                    with_memories: r.get(3)?,
+                    deleted_at: r.get(4)?,
+                    rows: r.get(5)?,
+                    back: r.get(6)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(MemoryError::Connection)
+}
+
 /// Why a name may not be a project's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum NameError {
@@ -313,6 +370,9 @@ pub enum RenameError {
     Taken { name: String, other: String },
     #[error("project {id} was merged into {into}: rename {into} instead")]
     Merged { id: String, into: String },
+    /// `delete_id` is the open delete that took it.
+    #[error("project {id} is deleted")]
+    Deleted { id: String, delete_id: Option<i64> },
     #[error(transparent)]
     Store(#[from] MemoryError),
 }
@@ -355,11 +415,15 @@ pub async fn rename_project(store: &MemoryStore, id: &str, name: &str) -> Result
             if into != id {
                 return Err(RenameError::Merged { id, into });
             }
-            // A tombstone's name is free: nobody chooses it any more. Its id
-            // still leads to the project it went into, so it stays taken.
+            if let Some(deleted) = deleted_in(&tx, &id).map_err(sql)? {
+                return Err(RenameError::Deleted { id, delete_id: deleted.delete_id });
+            }
+            // The name of a tombstone or of a deleted project is free: nobody
+            // chooses it any more. Its id is not: it leads to the project it
+            // went into, or to the one that comes back.
             let others: Vec<(String, Option<String>)> = {
                 let mut stmt = tx
-                    .prepare("SELECT id, CASE WHEN merged_into IS NULL THEN name END FROM project WHERE id <> ?1")
+                    .prepare("SELECT id, CASE WHEN merged_into IS NULL AND deleted_at IS NULL THEN name END FROM project WHERE id <> ?1")
                     .map_err(sql)?;
                 let rows = stmt.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sql)?;
                 rows.collect::<rusqlite::Result<_>>().map_err(sql)?
@@ -398,6 +462,8 @@ pub enum KeepApartError {
     Same(String),
     #[error("project {id} was merged into {into}")]
     Merged { id: String, into: String },
+    #[error("project {id} is deleted")]
+    Deleted { id: String, delete_id: Option<i64> },
     #[error(transparent)]
     Store(#[from] MemoryError),
 }
@@ -423,6 +489,9 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
                 let into = canonical_in(&tx, id).map_err(sql)?;
                 if into != *id {
                     return Err(KeepApartError::Merged { id: id.clone(), into });
+                }
+                if let Some(deleted) = deleted_in(&tx, id).map_err(sql)? {
+                    return Err(KeepApartError::Deleted { id: id.clone(), delete_id: deleted.delete_id });
                 }
             }
             if a == b {
@@ -802,5 +871,115 @@ mod tests {
         assert!(matches!(keep_apart(&store, "web-3c4d", "nobody-0000").await, Err(KeepApartError::NotFound(id)) if id == "nobody-0000"));
         let merged = keep_apart(&store, "app-1a2b", "api-5e6f").await;
         assert!(matches!(&merged, Err(KeepApartError::Merged { into, .. }) if into == "web-3c4d"), "{merged:?}");
+    }
+
+    // ── deleted projects ────────────────────────────────────────────────
+
+    /// Marks project `id` as delete `delete_id` leaves it.
+    async fn mark_deleted(store: &MemoryStore, id: &str, delete_id: i64) {
+        let batch = format!(
+            "UPDATE project SET deleted_at = 5 WHERE id = '{id}';
+             INSERT INTO project_delete (delete_id, project_id, with_memories, deleted_at) VALUES ({delete_id}, '{id}', 0, 5);"
+        );
+        store.conn.call(move |c| c.execute_batch(&batch)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_deleted_project_is_refused_by_what_manages_projects() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('web-3c4d', 'web', 'root', 0, 1), ('api-5e6f', 'api', 'root', 0, 2);",
+                )
+            })
+            .await
+            .unwrap();
+        mark_deleted(&store, "api-5e6f", 7).await;
+
+        let renamed = rename_project(&store, "api-5e6f", "interfaces").await;
+        assert!(matches!(&renamed, Err(RenameError::Deleted { id, delete_id }) if id == "api-5e6f" && *delete_id == Some(7)), "{renamed:?}");
+        for (a, b) in [("api-5e6f", "web-3c4d"), ("web-3c4d", "api-5e6f")] {
+            let apart = keep_apart(&store, a, b).await;
+            assert!(matches!(&apart, Err(KeepApartError::Deleted { id, delete_id }) if id == "api-5e6f" && *delete_id == Some(7)), "{apart:?}");
+        }
+        assert_eq!(project(&store, "api-5e6f").await.unwrap().2, 0, "nothing was marked reviewed");
+        assert_eq!(project(&store, "web-3c4d").await.unwrap().2, 0);
+        let suggestions: i64 = store
+            .conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM project_suggestion", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(suggestions, 0, "and no pair was recorded");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_project_is_listed_only_in_deletes_and_frees_its_name() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('app-1a2b', 'app', 'root', 1, 1), ('web-3c4d', 'web', 'root', 1, 2);
+                     INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) \
+                       VALUES ('old-9f9f', 'old', 'root', 0, 1, 'app-1a2b', 9);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id) \
+                       VALUES ('app-1a2b', '/work/app', 1, 0, 'app-1a2b'), ('web-3c4d', '/work/web', 1, 0, 'web-3c4d');
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
+                     INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('app-1a2b', 'web-3c4d', 'root_commit', 3);",
+                )
+            })
+            .await
+            .unwrap();
+        let kept = save(&store, fact("a note that stays deleted", Some("app-1a2b"))).await;
+        let other = save(&store, fact("another note that stays deleted", Some("app-1a2b"))).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute_batch(&format!(
+                    "UPDATE memory SET deleted_at = 4 WHERE id IN ({kept}, {other});
+                     UPDATE project SET deleted_at = 5 WHERE id = 'app-1a2b';
+                     INSERT INTO project_delete (delete_id, project_id, with_memories, deleted_at) VALUES (1, 'app-1a2b', 1, 5);
+                     INSERT INTO project_delete_row (delete_id, tbl, row_id, deleted_at) VALUES (1, 'memory', {kept}, NULL), (1, 'memory', {other}, 3);"
+                ))
+            })
+            .await
+            .unwrap();
+
+        let listed = list_projects(&store, Arc::new(FakeGround::default())).await.unwrap();
+
+        let ids: Vec<&str> = listed.iter().map(|l| l.project.id.as_str()).collect();
+        assert_eq!(ids, vec!["web-3c4d"], "a deleted project is not listed");
+        let web = &listed[0];
+        assert!(web.suggestions.is_empty(), "nor a suggestion with a deleted side: {:?}", web.suggestions);
+        assert!(web.folders.iter().all(|f| f.root_id != "app-1a2b") && web.merged.is_empty() && web.remotes.is_empty());
+        let deletes = list_deletes(&store).await.unwrap();
+        assert_eq!(
+            deletes,
+            vec![ListedDelete {
+                delete_id: 1,
+                project_id: "app-1a2b".into(),
+                name: "app".into(),
+                with_memories: true,
+                deleted_at: 5,
+                rows: 2,
+                back: false
+            }]
+        );
+
+        rename_project(&store, "web-3c4d", "APP").await.expect("the name of a deleted project is free");
+        let taken = rename_project(&store, "web-3c4d", "app-1a2b").await;
+        assert!(matches!(taken, Err(RenameError::Taken { .. })), "its id is not: {taken:?}");
+
+        // A save brings it back, and the delete is still open.
+        save(&store, fact("a note saved after the delete", Some("app-1a2b"))).await;
+        let listed = list_projects(&store, Arc::new(FakeGround::default())).await.unwrap();
+        let app = listed.iter().find(|l| l.project.id == "app-1a2b").expect("listed again");
+        assert_eq!((app.project.reviewed, app.memories, app.folders.len(), app.remotes.len(), app.merged.len()), (false, 1, 1, 1, 1));
+        let deletes = list_deletes(&store).await.unwrap();
+        assert_eq!((deletes.len(), deletes[0].back, deletes[0].rows), (1, true, 2), "the rows it deleted stay deleted");
     }
 }
