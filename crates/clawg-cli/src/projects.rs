@@ -130,6 +130,10 @@ fn reason(lang: Lang, suggestion: &ListedSuggestion) -> &str {
         ("remote_changed", Lang::Es) => "cambió el remoto de una carpeta",
         ("folder_name", Lang::En) => "a folder has the name of the other, whose folders are gone",
         ("folder_name", Lang::Es) => "una carpeta tiene el nombre del otro, cuyas carpetas ya no están",
+        ("similar_name", Lang::En) => "an import brought a project with a name like the other's",
+        ("similar_name", Lang::Es) => "una importación trajo un proyecto con un nombre como el del otro",
+        ("merged_at_source", Lang::En) => "the store an import came from had merged them",
+        ("merged_at_source", Lang::Es) => "el store del que vino una importación los había unido",
         (other, _) => other,
     }
 }
@@ -374,6 +378,12 @@ fn candidate_reason(lang: Lang, reason: &str) -> String {
         ("same_first_commit" | "root_commit", Lang::Es) => "comparten el primer commit".to_string(),
         ("remote_changed", Lang::En) => "the remote of one folder changed".to_string(),
         ("remote_changed", Lang::Es) => "cambió el remoto de una carpeta".to_string(),
+        ("folder_name", Lang::En) => "a folder has the name of the other, whose folders are gone".to_string(),
+        ("folder_name", Lang::Es) => "una carpeta tiene el nombre del otro, cuyas carpetas ya no están".to_string(),
+        ("similar_name", Lang::En) => "an import brought a project with a name like the other's".to_string(),
+        ("similar_name", Lang::Es) => "una importación trajo un proyecto con un nombre como el del otro".to_string(),
+        ("merged_at_source", Lang::En) => "the store an import came from had merged them".to_string(),
+        ("merged_at_source", Lang::Es) => "el store del que vino una importación los había unido".to_string(),
         (other, _) => other.to_string(),
     }
 }
@@ -1956,6 +1966,19 @@ mod tests {
             Some("no se pudo borrar ahora: 2 saves of this project are still being stored; try again in a moment; se puede volver a intentar en un momento")
         );
         assert_eq!(delete_refused(Lang::En, false, &daemon(500, "boom", None)), None);
+    }
+
+    #[test]
+    fn the_reasons_of_an_import_are_worded() {
+        let listed = |why: &str| ListedSuggestion { other_id: "b-1111".into(), other_name: None, reason: why.into(), created_at: 0 };
+        for lang in [Lang::En, Lang::Es] {
+            for why in ["similar_name", "merged_at_source", "folder_name"] {
+                assert_ne!(reason(lang, &listed(why)), why, "{lang:?} {why}");
+                assert_ne!(candidate_reason(lang, why), why, "{lang:?} {why}");
+            }
+        }
+        assert_eq!(reason(Lang::Es, &listed("similar_name")), "una importación trajo un proyecto con un nombre como el del otro");
+        assert_eq!(candidate_reason(Lang::En, "merged_at_source"), "the store an import came from had merged them");
     }
 
     #[test]

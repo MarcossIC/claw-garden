@@ -760,6 +760,10 @@ fn suggestion_reason(lang: Lang, reason: &str) -> String {
         ("remote_changed", Lang::Es) => "cambió el remoto de la misma carpeta".into(),
         ("folder_name", Lang::En) => "a folder of the same name whose earlier folders are gone".into(),
         ("folder_name", Lang::Es) => "una carpeta con el mismo nombre cuyas carpetas anteriores ya no están".into(),
+        ("similar_name", Lang::En) => "an imported project with a name like this one".into(),
+        ("similar_name", Lang::Es) => "un proyecto importado con un nombre como este".into(),
+        ("merged_at_source", Lang::En) => "the store an import came from had merged them".into(),
+        ("merged_at_source", Lang::Es) => "el store del que vino una importación los había unido".into(),
         (other, _) => other.to_string(),
     }
 }
@@ -1161,6 +1165,16 @@ mod tests {
     use clawg_core::memory::outbox::{OutboxProblem, OutboxState, OutboxSummary};
     use clawg_core::memory::dispute::OpenPair;
     use crate::client::{RelatedMemory, ReplacedMemory};
+
+    #[test]
+    fn the_reasons_of_an_import_are_worded() {
+        for lang in [Lang::En, Lang::Es] {
+            for why in ["similar_name", "merged_at_source"] {
+                assert_ne!(suggestion_reason(lang, why), why, "{lang:?} {why}");
+            }
+        }
+        assert_eq!(suggestion_reason(Lang::Es, "merged_at_source"), "el store del que vino una importación los había unido");
+    }
 
     fn hit(id: i64, kind: &str, memory_type: &str, tier: i64, score: f64, content: &str) -> Hit {
         Hit {
