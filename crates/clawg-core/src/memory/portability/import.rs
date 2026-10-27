@@ -2413,7 +2413,7 @@ pub(crate) mod tests {
         (report, backups)
     }
 
-    async fn count(store: &MemoryStore, sql: &'static str) -> i64 {
+    pub(crate) async fn count(store: &MemoryStore, sql: &'static str) -> i64 {
         store.conn.call(move |c| c.query_row(sql, [], |r| r.get::<_, i64>(0))).await.unwrap()
     }
 
@@ -3070,7 +3070,7 @@ pub(crate) mod tests {
     }
 
     /// Runs `sql` on `store`.
-    async fn exec(store: &MemoryStore, sql: &'static str) {
+    pub(crate) async fn exec(store: &MemoryStore, sql: &'static str) {
         store.conn.call(move |c| c.execute_batch(sql)).await.unwrap();
     }
 
@@ -3579,7 +3579,7 @@ pub(crate) mod tests {
         assert_eq!(project_names(&dst).await.len(), 1, "nothing is created");
     }
 
-    const DELETED_HERE: &str = "INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES ('gone-1a2b', 'gone', 'agent', 1, 1, 50);
+    pub(crate) const DELETED_HERE: &str = "INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES ('gone-1a2b', 'gone', 'agent', 1, 1, 50);
          INSERT INTO project_delete (delete_id, project_id, with_memories, code, snapshot, deleted_at) VALUES (1, 'gone-1a2b', 1, 'abcd1234', NULL, 50);";
 
     async fn deleted_state(store: &MemoryStore, id: &'static str) -> (Option<i64>, bool) {
