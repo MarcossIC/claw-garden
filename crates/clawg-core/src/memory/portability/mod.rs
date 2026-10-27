@@ -13,10 +13,13 @@ pub mod translate;
 pub mod undo;
 
 pub use export::{export, Export, ExportError, ExportFilter};
-pub use import::{import, import_foreign, ImportError, ImportOptions, ImportReport, ImportedProject, ImportedSubfolder, ImportedSuggestion, MAX_IMPORT_BYTES};
+pub use import::{
+    import, import_foreign, map_project, ImportError, ImportOptions, ImportReport, ImportedProject, ImportedSubfolder, ImportedSuggestion,
+    MapProject, MapTarget, MAX_IMPORT_BYTES,
+};
 pub use projects::By;
 pub use timing::ImportTimings;
-pub use undo::{undo_import, KeepReason, KeptRow, UndoError, UndoReport};
+pub use undo::{undo_import, KeepReason, KeptEntry, KeptRow, RegistryKeep, RegistryUndo, UndoError, UndoReport};
 
 #[cfg(test)]
 pub(crate) mod fixtures {

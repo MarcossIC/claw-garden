@@ -42,7 +42,8 @@ pub struct TranslateOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedProject {
     pub name: String,
-    pub root: String,
+    /// None when the map names a project rather than a folder.
+    pub root: Option<String>,
     pub project_id: String,
 }
 
@@ -404,7 +405,7 @@ fn count_notes(drafts: &[Draft<'_>], options: &TranslateOptions, report: &mut Fo
     report.by_source_project = projects
         .into_iter()
         .map(|(group, (project_id, notes))| ProjectCount {
-            root: project_id.as_ref().and(group.project.as_deref()).and_then(|name| mapping(options, name)).map(|m| m.root.clone()),
+            root: project_id.as_ref().and(group.project.as_deref()).and_then(|name| mapping(options, name)).and_then(|m| m.root.clone()),
             project: group.project,
             personal: group.personal,
             project_id,
@@ -640,8 +641,9 @@ fn lines(drafts: &[Draft<'_>], options: &TranslateOptions, mut report: ForeignRe
     // the roots in that order and lines them up with these lines.
     let mut recorded = HashSet::new();
     for m in &options.project_map {
-        if recorded.insert(m.root.as_str()) {
-            parsed.projects.push((0, ProjectLine { id: m.project_id.clone(), root_path: Some(m.root.clone()), ..Default::default() }));
+        let Some(root) = m.root.as_deref() else { continue };
+        if recorded.insert(root) {
+            parsed.projects.push((0, ProjectLine { id: m.project_id.clone(), root_path: Some(root.to_owned()), ..Default::default() }));
         }
     }
     Translated { parsed, notes, report }
@@ -836,7 +838,7 @@ pub(crate) mod tests {
             agent: MIGRATED_AGENT.to_owned(),
             project_map: map
                 .iter()
-                .map(|(name, root)| MappedProject { name: name.to_string(), root: root.to_string(), project_id: id_of(root) })
+                .map(|(name, root)| MappedProject { name: name.to_string(), root: Some(root.to_string()), project_id: id_of(root) })
                 .collect(),
         }
     }
@@ -1194,7 +1196,7 @@ pub(crate) mod tests {
 
     #[test]
     fn keys_of_two_roots_of_one_project_here_are_qualified() {
-        let clone = |name: &str, root: &str| MappedProject { name: name.into(), root: root.into(), project_id: "app-1a2b".into() };
+        let clone = |name: &str, root: &str| MappedProject { name: name.into(), root: Some(root.into()), project_id: "app-1a2b".into() };
         let options = TranslateOptions { agent: MIGRATED_AGENT.into(), project_map: vec![clone("a", "/work/app"), clone("b", "/home/app")] };
         let notes = vec![keyed("engram:a", Some("a"), false, "sdd/x"), keyed("engram:b", Some("b"), false, "sdd/x")];
         let t = translate(&export(notes), &options, &ChatChunker::with_fallback(), NOW);

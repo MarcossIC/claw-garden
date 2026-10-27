@@ -45,7 +45,9 @@ use crate::memory::identity::{Ground, ReadAhead};
 use crate::memory::merge::canonical_in;
 use crate::memory::project::{plan_ids_in, RootPlan};
 use crate::memory::portability::projects::{self, file_projects, registry_in, By, FileProject, FolderHere, Placed, Prints, Registry};
-use crate::memory::registry::{new_project_id, project_name};
+use crate::memory::project_delete::{deleted_in, deleted_message};
+use crate::memory::registry::{find_project, new_project_id, project_name, Named};
+use crate::memory::subfolder::declared_in;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
 use crate::memory::portability::format::{parse, ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
@@ -78,10 +80,90 @@ pub struct ImportOptions {
     pub dry_run: bool,
     /// The agent every row that has one is stored under instead.
     pub agent: Option<String>,
-    /// An exported project root and the root it has here.
-    pub map_roots: Vec<(String, String)>,
-    /// A project name of another tool and the root it has here.
-    pub project_map: Vec<(String, String)>,
+    /// An exported project root and where it is here.
+    pub map_roots: Vec<(String, MapTarget)>,
+    /// A project name of another tool and where its notes go here.
+    pub project_map: Vec<(String, MapTarget)>,
+}
+
+/// Where a map sends a root of a clawg export or a project of another tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MapTarget {
+    /// A root here, as a client from before sends it.
+    Root(String),
+    /// A root here and the path the user named inside it, which a declared
+    /// subfolder leads to its project.
+    Folder {
+        root: String,
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// A project here: an id once the daemon resolved it.
+    Project { project: String },
+}
+
+impl MapTarget {
+    pub fn root(&self) -> Option<&str> {
+        match self {
+            MapTarget::Root(root) | MapTarget::Folder { root, .. } => Some(root),
+            MapTarget::Project { .. } => None,
+        }
+    }
+
+    fn path(&self) -> Option<&str> {
+        match self {
+            MapTarget::Folder { path, .. } => path.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+impl From<&str> for MapTarget {
+    fn from(root: &str) -> Self {
+        MapTarget::Root(root.to_owned())
+    }
+}
+
+impl From<String> for MapTarget {
+    fn from(root: String) -> Self {
+        MapTarget::Root(root)
+    }
+}
+
+/// The project a map names, as [`map_project`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapProject {
+    /// Its live id, past any merge.
+    Live(String),
+    Unknown,
+    /// The name of several live projects, by id.
+    Ambiguous(Vec<String>),
+}
+
+/// The project `reference` names, by id or by the name of one live project,
+/// for a map to send notes to: never created, and refused when deleted.
+pub async fn map_project(store: &MemoryStore, reference: &str) -> Result<MapProject, ImportError> {
+    let id = match find_project(store, reference).await? {
+        Named::Project(id) => id,
+        Named::Unknown => return Ok(MapProject::Unknown),
+        Named::Ambiguous(ids) => return Ok(MapProject::Ambiguous(ids)),
+    };
+    let live = store
+        .conn
+        .call(move |c| -> rusqlite::Result<Result<String, Option<i64>>> {
+            let live = canonical_in(c, &id)?;
+            Ok(match deleted_in(c, &live)? {
+                Some(deleted) => Err(deleted.delete_id),
+                None => Ok(live),
+            })
+        })
+        .await
+        .map_err(MemoryError::Connection)?;
+    match live {
+        Ok(id) => Ok(MapProject::Live(id)),
+        Err(delete_id) => Err(ImportError::ProjectDeleted { id: reference.trim().to_owned(), delete_id }),
+    }
 }
 
 /// A live row stored as the live row of the same text that was already here.
@@ -213,6 +295,9 @@ pub enum ImportError {
     NoEmbedder,
     #[error("could not embed the imported rows, nothing was imported: {0}")]
     Embed(#[from] EmbedError),
+    /// A project a map sends notes to was deleted.
+    #[error("{}", deleted_message(.id, .delete_id))]
+    ProjectDeleted { id: String, delete_id: Option<i64> },
     #[error(transparent)]
     Store(#[from] MemoryError),
 }
@@ -269,6 +354,9 @@ struct Prepared {
     deleted: HashSet<String>,
     /// The declarations of the file, with what becomes of each.
     subfolders: Vec<ImportedSubfolder>,
+    /// The projects a map sends notes to by name or id, which must not be
+    /// deleted when the import writes.
+    mapped_to: Vec<String>,
     parsed: Parsed,
     /// For another tool's export, the notes its rows came from, in the order
     /// of their rows; empty for a clawg file.
@@ -317,15 +405,18 @@ fn projects_of(parsed: &Parsed) -> Vec<FileProject> {
     file_projects(parsed.projects.iter().map(|(_, p)| p), &with_rows)
 }
 
-/// The root here of every folder of `projects`, in order, and whether
-/// `--map-root` named it.
-fn roots_here(projects: &[FileProject], options: &ImportOptions) -> Vec<(PathBuf, bool)> {
+/// The root here of every folder of `projects`, in order, whether
+/// `--map-root` named it, and the path it named inside that root.
+fn roots_here(projects: &[FileProject], options: &ImportOptions) -> Vec<(PathBuf, bool, Option<PathBuf>)> {
     projects
         .iter()
         .flat_map(|p| &p.folders)
-        .map(|f| match options.map_roots.iter().find(|(old, _)| *old == f.root_path) {
-            Some((_, new)) => (PathBuf::from(new), true),
-            None => (PathBuf::from(&f.root_path), false),
+        .map(|f| {
+            let mapped = options.map_roots.iter().find(|(old, _)| *old == f.root_path).map(|(_, new)| new);
+            match mapped.and_then(|new| new.root().map(|root| (root, new.path()))) {
+                Some((root, path)) => (PathBuf::from(root), true, path.map(PathBuf::from)),
+                None => (PathBuf::from(&f.root_path), false, None),
+            }
         })
         .collect()
 }
@@ -358,6 +449,9 @@ struct Planning {
     plans: Vec<RootPlan>,
     registry: Registry,
     present: Vec<bool>,
+    /// For each path asked about, the project a declared subfolder leads it
+    /// to inside its root, as a registration with that path answers.
+    declared: Vec<Option<String>>,
 }
 
 /// How many times [`plan`] runs on the connection at most: it asks for the
@@ -372,19 +466,25 @@ const PLAN_PASSES: usize = 4;
 async fn plan(
     store: &MemoryStore,
     roots: &[PathBuf],
+    paths: &[(usize, PathBuf)],
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<Planning, ImportError> {
     let (clock, mut timing) = (Instant::now(), Timing::new(Step::Plan));
     let (mut ahead, mut passes) = (ReadAhead::default(), 1);
     let plans = loop {
-        let planned = roots.to_vec();
+        let (planned, asks) = (roots.to_vec(), paths.to_vec());
         let (plans, asked) = timed(store, &mut timing, move |c| {
             let plans = plan_ids_in(c, &planned, &ahead, true)?;
             // Whether each root exists here, which tells a folder of this
             // machine from one of the source's.
             let present = planned.iter().map(|root| ahead.recorded_checkout_present(root, None)).collect();
-            Ok((Planning { plans, registry: registry_in(c)?, present }, ahead))
+            let mut declared = Vec::with_capacity(asks.len());
+            for (k, path) in &asks {
+                let subpath = ahead.subpath(&planned[*k], path);
+                declared.push(subpath.map(|s| declared_in(c, &plans[*k].project_id, &s)).transpose()?.flatten());
+            }
+            Ok((Planning { plans, registry: registry_in(c)?, present, declared }, ahead))
         })
         .await?;
         if passes == PLAN_PASSES {
@@ -448,12 +548,18 @@ fn free_id(id: &str, name: &str, registry: &Registry, taken: &HashSet<String>, n
 /// them and `row_projects` the project ids the file's rows name.
 fn settle_projects(
     projects: &[FileProject],
-    roots: &[(PathBuf, bool)],
+    roots: &[(PathBuf, bool, Option<PathBuf>)],
     planning: &Planning,
     row_projects: &BTreeSet<&str>,
     now: i64,
 ) -> Settled {
     let registry = &planning.registry;
+    // The project a mapped path in a declared subfolder leads to, by root.
+    let declared: HashMap<usize, &str> = (0..roots.len())
+        .filter(|&k| roots[k].2.is_some())
+        .zip(&planning.declared)
+        .filter_map(|(k, d)| Some((k, d.as_deref()?)))
+        .collect();
     let mut settled = Settled::default();
     settled.deleted = registry.projects.iter().filter(|(_, p)| p.deleted).map(|(id, _)| id.clone()).collect();
     let mut taken: HashSet<String> = HashSet::new();
@@ -468,11 +574,19 @@ fn settle_projects(
             .map(|(line, k)| FolderHere { line, mapped: roots[k].1, plan: &planning.plans[k], present: planning.present[k] })
             .collect();
         let name = project.name.clone().unwrap_or_else(|| project_name(&project.id).to_owned());
-        let (to, by) = match projects::place(project, &folders, registry) {
+        let (mut to, by) = match projects::place(project, &folders, registry) {
             Placed::Here(to, by) => (Some(to), Some(by)),
             Placed::New => (Some(free_id(&project.id, &name, registry, &taken, now)), Some(By::New)),
             Placed::Nowhere => (None, None),
         };
+        // Mapped to a path in a declared subfolder, its rows go to the
+        // subproject while its folders and remotes stay the repository's.
+        let mut home = None;
+        if by == Some(By::Map) {
+            if let Some(sub) = span.clone().find(|k| roots[*k].1).and_then(|k| declared.get(&k)) {
+                home = to.replace(registry.canonical(sub));
+            }
+        }
         let created = to.as_ref().is_some_and(|to| !registry.projects.contains_key(to) && taken.insert(to.clone()));
         settled.placed.push(ImportedProject { id: project.id.clone(), name: project.name.clone(), to: to.clone(), by, created, revived: false });
         let Some(to) = to else { continue };
@@ -480,6 +594,7 @@ fn settle_projects(
         if created {
             settled.creates.push((to.clone(), name));
         }
+        let home = home.unwrap_or_else(|| to.clone());
         let file = project.prints();
         for (folder, k) in folders.iter().zip(span) {
             let plan = folder.plan;
@@ -497,7 +612,7 @@ fn settle_projects(
                     root,
                     root_id: plan.root_id.clone(),
                     remote: plan.remote.clone(),
-                    project_id: to.clone(),
+                    project_id: home.clone(),
                     root_commit: plan.root_commit.clone(),
                     git_stamp: plan.git_stamp.clone(),
                 },
@@ -507,18 +622,18 @@ fn settle_projects(
                     root,
                     root_id: plan.root_id.clone(),
                     remote: folder.line.remote.clone(),
-                    project_id: to.clone(),
+                    project_id: home.clone(),
                     root_commit: folder.line.root_commit.clone(),
                     git_stamp: None,
                 },
             };
             if let Some(remote) = &here.remote {
-                settled.binds.push((remote.clone(), to.clone()));
+                settled.binds.push((remote.clone(), home.clone()));
             }
             settled.projects.push(here);
         }
         for remote in project.all_remotes() {
-            settled.binds.push((remote.to_owned(), to.clone()));
+            settled.binds.push((remote.to_owned(), home.clone()));
         }
     }
     // The declarations of each repository, with the projects here of both
@@ -618,12 +733,12 @@ fn settle_projects(
     settled
 }
 
-/// The projects of another tool's export, each the project a registration
-/// gives the root the map names: `roots` and `plans` are those roots.
-fn mapped_projects(parsed: &Parsed, roots: &[PathBuf], plans: &[RootPlan]) -> Settled {
+/// The folders of another tool's export: each root the map names, recorded
+/// as a registration records it. The rows carry the project the map sends
+/// them to already.
+fn mapped_projects(roots: &[PathBuf], plans: &[RootPlan]) -> Settled {
     let mut settled = Settled::default();
-    for (((_, p), root), plan) in parsed.projects.iter().zip(roots).zip(plans) {
-        settled.project_ids.insert(p.id.clone(), plan.project_id.clone());
+    for (root, plan) in roots.iter().zip(plans) {
         settled.projects.push(ProjectHere {
             root: root.to_string_lossy().into_owned(),
             root_id: plan.root_id.clone(),
@@ -689,7 +804,7 @@ fn prepare(mut parsed: Parsed, settled: Settled, options: &ImportOptions, texts:
             }
         })
         .collect();
-    Prepared { rows, projects, creates, binds, placed, suggestions, deleted, subfolders, parsed, notes }
+    Prepared { rows, projects, creates, binds, placed, suggestions, deleted, subfolders, mapped_to: Vec::new(), parsed, notes }
 }
 
 /// Where a row of the file ended up.
@@ -1965,8 +2080,9 @@ async fn prepare_file(
     let projects = projects_of(&parsed);
     let roots = roots_here(&projects, options);
     let parsing = clock.elapsed();
-    let planned: Vec<PathBuf> = roots.iter().map(|(root, _)| root.clone()).collect();
-    let planning = plan(store, &planned, ground, timings).await?;
+    let planned: Vec<PathBuf> = roots.iter().map(|(root, _, _)| root.clone()).collect();
+    let paths: Vec<(usize, PathBuf)> = roots.iter().enumerate().filter_map(|(k, (_, _, path))| Some((k, path.clone()?))).collect();
+    let planning = plan(store, &planned, &paths, ground, timings).await?;
     let clock = Instant::now();
     let row_projects: BTreeSet<&str> = parsed.memories.iter().filter_map(|(_, m)| m.project_id.as_deref()).collect();
     let settled = settle_projects(&projects, &roots, &planning, &row_projects, TimestampMs::now().as_millis_i64());
@@ -2013,26 +2129,46 @@ async fn prepare_export(
     // Planned before the translation, which tells keys apart by the project
     // each note goes to here.
     let mut seen = HashSet::new();
-    let mapped: Vec<&str> = options.project_map.iter().map(|(_, root)| root.as_str()).filter(|root| seen.insert(*root)).collect();
+    let mapped: Vec<&str> =
+        options.project_map.iter().filter_map(|(_, target)| target.root()).filter(|root| seen.insert(*root)).collect();
     let roots: Vec<PathBuf> = mapped.iter().map(PathBuf::from).collect();
-    let plans = plan(store, &roots, ground, timings).await?.plans;
-    let project_of: HashMap<&str, &str> = mapped.iter().copied().zip(plans.iter().map(|plan| plan.project_id.as_str())).collect();
-    let translate_options = TranslateOptions {
-        agent: options.agent.clone().unwrap_or_else(|| MIGRATED_AGENT.to_owned()),
-        project_map: options
-            .project_map
-            .iter()
-            .map(|(name, root)| MappedProject { name: name.clone(), root: root.clone(), project_id: project_of[root.as_str()].to_owned() })
-            .collect(),
-    };
+    let index: HashMap<&str, usize> = mapped.iter().enumerate().map(|(k, root)| (*root, k)).collect();
+    let asks: Vec<(usize, PathBuf)> = options
+        .project_map
+        .iter()
+        .filter_map(|(_, target)| Some((index[target.root()?], PathBuf::from(target.path()?))))
+        .collect();
+    let planning = plan(store, &roots, &asks, ground, timings).await?;
+    let mut declared = planning.declared.iter();
+    let project_map = options
+        .project_map
+        .iter()
+        .map(|(name, target)| {
+            let project_id = match target {
+                MapTarget::Project { project } => project.clone(),
+                _ => {
+                    let repository = &planning.plans[index[target.root().unwrap_or_default()]].project_id;
+                    let sub = target.path().and_then(|_| declared.next()).cloned().flatten();
+                    sub.unwrap_or_else(|| repository.clone())
+                }
+            };
+            MappedProject { name: name.clone(), root: target.root().map(str::to_owned), project_id }
+        })
+        .collect();
+    let mapped_to: Vec<String> =
+        options.project_map.iter().filter_map(|(_, t)| if let MapTarget::Project { project } = t { Some(project.clone()) } else { None }).collect();
+    let plans = planning.plans;
+    let translate_options = TranslateOptions { agent: options.agent.clone().unwrap_or_else(|| MIGRATED_AGENT.to_owned()), project_map };
     let now = TimestampMs::now().as_millis_i64();
     let clock = Instant::now();
     // Masking and splitting thousands of notes is work the daemon's other
     // requests should not wait behind.
     let (prepared, foreign) = tokio::task::spawn_blocking(move || {
         let Translated { parsed, notes, report } = translate(&export, &translate_options, &chunker, now);
-        let settled = mapped_projects(&parsed, &roots, &plans);
-        (prepare(parsed, settled, &ImportOptions::default(), Texts::Notes(notes)), report)
+        let settled = mapped_projects(&roots, &plans);
+        let mut prepared = prepare(parsed, settled, &ImportOptions::default(), Texts::Notes(notes));
+        prepared.mapped_to = mapped_to;
+        (prepared, report)
     })
     .await
     .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
@@ -2147,16 +2283,24 @@ async fn write(
         let (batch, vectors) = (prepared.clone(), vectors.clone());
         let mut placed = std::mem::take(&mut ledger);
         let mut logged = journal;
-        (ledger, journal) = timed(store, &mut timing, move |c| {
+        let written = timed(store, &mut timing, move |c| {
             let tx = c.transaction()?;
             if k == 0 {
+                // A project the map names that was deleted since the daemon
+                // resolved it would come back under the rows.
+                for id in &batch.mapped_to {
+                    if let Some(deleted) = deleted_in(&tx, &canonical_in(&tx, id)?)? {
+                        return Ok(Err((id.clone(), deleted.delete_id)));
+                    }
+                }
                 placed.taken = record_projects(&tx, &batch, now, &mut logged)?;
             }
             place_rows(&mut SqlSeat(&tx, &mut logged), &batch, range, &mut placed, &vectors, true)?;
             tx.commit()?;
-            Ok((placed, logged))
+            Ok(Ok((placed, logged)))
         })
         .await?;
+        (ledger, journal) = written.map_err(|(id, delete_id)| ImportError::ProjectDeleted { id, delete_id })?;
     }
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
@@ -2932,7 +3076,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(clone.path().join(".git")).unwrap();
         std::fs::write(clone.path().join(".git").join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
         let here = clone.path().to_string_lossy().into_owned();
-        let options = ImportOptions { map_roots: vec![(ROOT.into(), here)], ..Default::default() };
+        let options = ImportOptions { map_roots: vec![(ROOT.into(), here.into())], ..Default::default() };
 
         let (report, _) = run(&dst, &file, options).await;
 
@@ -4023,7 +4167,7 @@ pub(crate) mod tests {
             ..foreign_note(origin, "Proposal", content)
         };
         let notes = vec![keyed("engram:a", "a", "the proposal of a"), keyed("engram:b", "b", "the proposal of b")];
-        let options = ImportOptions { project_map: vec![("a".into(), root(&one)), ("b".into(), root(&two))], ..Default::default() };
+        let options = ImportOptions { project_map: vec![("a".into(), root(&one).into()), ("b".into(), root(&two).into())], ..Default::default() };
         let (report, _) = run_foreign(&dst, notes, options).await;
 
         assert_eq!(report.by_project, BTreeMap::from([("app-1a2b".to_string(), 2)]), "{report:#?}");
@@ -4050,6 +4194,76 @@ pub(crate) mod tests {
         let foreign = again.foreign.unwrap();
         assert_eq!(foreign.present, BTreeMap::from([(String::new(), 6)]), "counted where they are, not where the map puts them");
         assert!(foreign.revised.is_empty() && foreign.older_versions.is_empty() && foreign.merged.is_empty(), "{foreign:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_project_map_to_a_project_places_its_notes_there() {
+        let dst = destination().await;
+        exec(&dst, "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('notes-1111', 'Notes', 'user', 1, 1);").await;
+        let found = map_project(&dst, "notes").await.unwrap();
+        assert_eq!(found, MapProject::Live("notes-1111".into()));
+        let options = ImportOptions { project_map: vec![("a".into(), MapTarget::Project { project: "notes-1111".into() })], ..Default::default() };
+
+        let (report, _) = run_foreign(&dst, sample_notes(), options).await;
+
+        let rows = dump(&dst, EVERYTHING).await.memories;
+        let of_a: BTreeSet<Option<String>> = rows.iter().filter(|m| m.origin_project.as_deref() == Some("a")).map(|m| m.project_id.clone()).collect();
+        assert_eq!(of_a, BTreeSet::from([Some("notes-1111".to_owned())]));
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM project_path").await, 0, "no folder is recorded");
+        assert_eq!(report.by_project.get("notes-1111").copied().unwrap_or_default(), report.inserted - report.by_project.get("").copied().unwrap_or_default());
+
+        exec(&dst, "UPDATE project SET deleted_at = 5 WHERE id = 'notes-1111';").await;
+        assert!(matches!(map_project(&dst, "notes-1111").await, Err(ImportError::ProjectDeleted { .. })));
+        assert_eq!(map_project(&dst, "Notes").await.unwrap(), MapProject::Unknown, "a deleted name is free");
+        assert_eq!(map_project(&dst, "nothing").await.unwrap(), MapProject::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_project_map_path_in_a_declared_subfolder_goes_to_its_project() {
+        let dst = destination().await;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("apps/web/src")).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
+        let reg = crate::memory::project::Registration {
+            root: &root,
+            checkout: Disk.checkout(&root),
+            legacy_ids: &[],
+            index_docs: false,
+            assigned: true,
+            subpath: None,
+        };
+        let repository = crate::memory::project::register_project(&dst, &workspaces, home.path(), reg, Arc::new(Disk)).await.unwrap().project_id;
+        let repository_id = repository.clone();
+        dst.conn
+            .call(move |c| {
+                c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('web-1111', 'web', 'user', 1, 1)", [])?;
+                c.execute(
+                    "INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES (?1, 'apps/web', 'web-1111', 1)",
+                    [&repository_id],
+                )
+            })
+            .await
+            .unwrap();
+        let target = |path: Option<&Path>| MapTarget::Folder {
+            root: root.to_string_lossy().into_owned(),
+            path: path.map(|p| p.to_string_lossy().into_owned()),
+        };
+        let options = ImportOptions {
+            project_map: vec![("a".into(), target(Some(&root.join("apps/web/src")))), ("b".into(), target(None))],
+            ..Default::default()
+        };
+
+        run_foreign(&dst, sample_notes(), options).await;
+
+        let rows = dump(&dst, EVERYTHING).await.memories;
+        let of = |name: &str| -> BTreeSet<Option<String>> {
+            rows.iter().filter(|m| m.origin_project.as_deref() == Some(name)).map(|m| m.project_id.clone()).collect()
+        };
+        assert_eq!(of("a"), BTreeSet::from([Some("web-1111".to_owned())]));
+        assert_eq!(of("b"), BTreeSet::from([Some(repository)]), "the root alone is the repository's");
     }
 
     #[tokio::test]
@@ -4636,7 +4850,7 @@ pub(crate) mod tests {
 
         let dst = destination().await;
         let dir = tempfile::tempdir().unwrap();
-        let options = ImportOptions { project_map: vec![("a".into(), dir.path().to_string_lossy().into_owned())], ..Default::default() };
+        let options = ImportOptions { project_map: vec![("a".into(), dir.path().to_string_lossy().into_owned().into())], ..Default::default() };
         let prepared = notes_of(&dst, sample_notes(), options).await;
         let root_id = prepared.projects[0].root_id.clone();
         dst.conn
