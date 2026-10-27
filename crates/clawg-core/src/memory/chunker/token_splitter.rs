@@ -46,6 +46,15 @@ impl TokenSplitter {
         }
     }
 
+    /// [`TokenSplitter::count`] of each of `texts`, tokenized as one batch so
+    /// the tokenizer spreads it over the cores.
+    pub fn count_all(&self, texts: &[&str]) -> Vec<usize> {
+        match self.tokenizer.as_deref().map(|tok| tok.encode_batch(texts.to_vec(), false)) {
+            Some(Ok(encodings)) => encodings.iter().map(|enc| enc.get_offsets().len()).collect(),
+            _ => texts.iter().map(|text| self.count(text)).collect(),
+        }
+    }
+
     /// Split `text` so each output `Chunk` has `<= max_tokens` tokens, with at
     /// least `overlap` tokens repeated between adjacent chunks; `overlap == 0`
     /// tiles the text. With a tokenizer, every cut falls where a word starts
@@ -272,6 +281,16 @@ fn ceil_char_boundary(text: &str, index: usize) -> usize {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn counting_together_counts_each_text_as_alone() {
+        let texts = ["", "one", "two words", "  spaced   out  words here ", "caf\u{e9} \u{4e16}\u{754c} \u{1f600} done", "a longer text with several more words in it"];
+        for splitter in [TokenSplitter::with_tokenizer(crate::memory::chunker::word_tokenizer()), TokenSplitter::fallback()] {
+            let alone: Vec<usize> = texts.iter().map(|t| splitter.count(t)).collect();
+            assert_eq!(splitter.count_all(&texts), alone);
+            assert_eq!(splitter.count_all(&[]), Vec::<usize>::new());
+        }
+    }
 
     // ── word_starts and plan_word_windows: pure, no tokenizer needed ────────
 

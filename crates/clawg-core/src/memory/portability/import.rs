@@ -67,6 +67,10 @@ const WRITE_BATCH: usize = 256;
 /// Texts embedded per call.
 const EMBED_BATCH: usize = 32;
 
+/// Texts counted in one call to the tokenizer when ordering the rows to
+/// embed, so the encodings held at once stay small.
+const COUNT_BATCH: usize = 256;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportOptions {
     /// Place every row and report, writing nothing.
@@ -1521,6 +1525,7 @@ fn write_links<S: Seat>(seat: &mut S, prepared: &Prepared, ledger: &mut Ledger) 
 pub async fn import(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
+    chunker: Arc<ChatChunker>,
     backups: &Path,
     text: &str,
     options: &ImportOptions,
@@ -1528,7 +1533,7 @@ pub async fn import(
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
     let prepared = prepare_file(store, text, options, ground, timings).await?;
-    let written = write(store, embedder, backups, &prepared, options.dry_run, "clawg", timings).await?;
+    let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, "clawg", timings).await?;
     Ok(report(&prepared, &written, options.dry_run))
 }
 
@@ -1571,8 +1576,8 @@ pub async fn import_foreign(
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
     let source = export.source;
-    let (prepared, foreign) = prepare_export(store, chunker, export, options, ground, timings).await?;
-    let written = write(store, embedder, backups, &prepared, options.dry_run, source, timings).await?;
+    let (prepared, foreign) = prepare_export(store, chunker.clone(), export, options, ground, timings).await?;
+    let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, source, timings).await?;
     Ok(with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger))
 }
 
@@ -1650,6 +1655,7 @@ struct Written {
 async fn write(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
+    chunker: &Arc<ChatChunker>,
     backups: &Path,
     prepared: &Arc<Prepared>,
     dry_run: bool,
@@ -1676,14 +1682,16 @@ async fn write(
     }
     let embedder = embedder.ok_or(ImportError::NoEmbedder)?;
 
-    let to_embed = rows_to_embed(prepared, &decided);
-    let (clock, mut timing) = (Instant::now(), Timing { rows: Some(to_embed.len()), ..Timing::new(Step::Embed) });
-    let mut vectors: HashMap<i64, Vec<u8>> = HashMap::with_capacity(to_embed.len());
-    for batch in to_embed.chunks(EMBED_BATCH) {
+    let picked = rows_to_embed(prepared, &decided);
+    let (clock, mut timing) = (Instant::now(), Timing { rows: Some(picked.len()), ..Timing::new(Step::Embed) });
+    let order = embedding_order(prepared, picked, chunker).await?;
+    let mut vectors: HashMap<i64, Vec<u8>> = HashMap::with_capacity(order.len());
+    for batch in order.chunks(EMBED_BATCH) {
         let asked = Instant::now();
-        let texts: Vec<String> = batch.iter().map(|r| embedding_text(&r.context, &r.content).into_owned()).collect();
+        let rows: Vec<&Row> = batch.iter().map(|&k| &prepared.rows[k]).collect();
+        let texts: Vec<String> = rows.iter().map(|r| embedding_text(&r.context, &r.content).into_owned()).collect();
         let embedded = embedder.embed_batch(&texts, EmbedRole::Passage).await?;
-        for (row, vector) in batch.iter().zip(embedded) {
+        for (row, vector) in rows.iter().zip(embedded) {
             let unit = to_unit(&vector).map_err(|e| EmbedError::InferenceFailed(e.to_string()))?;
             vectors.insert(row.src.id, unit.iter().flat_map(|f| f.to_le_bytes()).collect());
         }
@@ -1740,14 +1748,42 @@ async fn write(
     Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id })
 }
 
-/// The rows the import inserts and are not deleted, the only ones it embeds,
-/// in the order of the file.
-fn rows_to_embed<'p>(prepared: &'p Prepared, decided: &Ledger) -> Vec<&'p Row> {
-    prepared
-        .rows
-        .iter()
-        .filter(|r| r.src.deleted_at.is_none() && decided.placed.get(&r.src.id).is_some_and(|p| p.inserted()))
+/// The indices in `prepared.rows` of the rows the import inserts and are not
+/// deleted, the only ones it embeds, in the order of the file.
+fn rows_to_embed(prepared: &Prepared, decided: &Ledger) -> Vec<usize> {
+    (0..prepared.rows.len())
+        .filter(|&k| {
+            let row = &prepared.rows[k];
+            row.src.deleted_at.is_none() && decided.placed.get(&row.src.id).is_some_and(|p| p.inserted())
+        })
         .collect()
+}
+
+/// `picked`, rows of `prepared`, from the one with the most tokens to embed
+/// to the one with the fewest, so the rows the embedder pads together are
+/// about as long as each other. Counted by the chunker, whose tokenizer is
+/// the embedder's, in a blocking task and `COUNT_BATCH` texts at a time.
+async fn embedding_order(prepared: &Arc<Prepared>, picked: Vec<usize>, chunker: &Arc<ChatChunker>) -> Result<Vec<usize>, MemoryError> {
+    let (prepared, chunker) = (prepared.clone(), chunker.clone());
+    tokio::task::spawn_blocking(move || {
+        let mut tokens = Vec::with_capacity(picked.len());
+        for group in picked.chunks(COUNT_BATCH) {
+            let texts: Vec<_> = group.iter().map(|&k| embedding_text(&prepared.rows[k].context, &prepared.rows[k].content)).collect();
+            let refs: Vec<&str> = texts.iter().map(|t| &**t).collect();
+            tokens.extend(chunker.count_all(&refs));
+        }
+        longest_first(&tokens).into_iter().map(|k| picked[k]).collect()
+    })
+    .await
+    .map_err(|e| MemoryError::Internal(format!("could not order the rows to embed: {e}")))
+}
+
+/// The indices of `tokens` from the largest count to the smallest, equal
+/// counts in the order they came.
+fn longest_first(tokens: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..tokens.len()).collect();
+    order.sort_by_key(|&k| Reverse(tokens[k]));
+    order
 }
 
 fn report(prepared: &Prepared, written: &Written, dry_run: bool) -> ImportReport {
@@ -1931,7 +1967,7 @@ pub(crate) mod tests {
     /// [`run`] with what `ground` finds at each root.
     async fn run_on(store: &MemoryStore, text: &str, options: ImportOptions, ground: Arc<dyn Ground>) -> (ImportReport, tempfile::TempDir) {
         let backups = tempfile::tempdir().unwrap();
-        let report = import(store, Some(&FakeEmbedder::default()), backups.path(), text, &options, ground, &mut ImportTimings::new(false))
+        let report = import(store, Some(&FakeEmbedder::default()), Arc::new(ChatChunker::with_fallback()), backups.path(), text, &options, ground, &mut ImportTimings::new(false))
             .await
             .unwrap();
         (report, backups)
@@ -2097,7 +2133,7 @@ pub(crate) mod tests {
         let file = seeded_file().await.replacen("\"version\":1", "\"version\":2", 1);
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
-        let err = import(&dst, Some(&FakeEmbedder::default()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
+        let err = import(&dst, Some(&FakeEmbedder::default()), Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::Format(FormatError::UnknownVersion(2))), "{err}");
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert!(files_in(backups.path()).is_empty());
@@ -2110,7 +2146,7 @@ pub(crate) mod tests {
         let backups = tempfile::tempdir().unwrap();
         let sequence = "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'memory'), 0)";
         let before = count(&dst, sequence).await;
-        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
+        let dry = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert_eq!(count(&dst, "SELECT count(*) FROM project_path").await, 0);
         assert_eq!(count(&dst, "SELECT count(*) FROM project_remote").await, 0);
@@ -2170,7 +2206,7 @@ pub(crate) mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
-        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
+        let dry = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert_eq!(dry.import_id, None);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_import").await, 0);
         let (first, _) = run(&dst, &file, ImportOptions::default()).await;
@@ -2184,7 +2220,7 @@ pub(crate) mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let backups = tempfile::tempdir().unwrap();
-        let err = import(&dst, None, backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
+        let err = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::NoEmbedder));
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
         assert!(files_in(backups.path()).is_empty());
@@ -2406,7 +2442,7 @@ pub(crate) mod tests {
         };
         let backups = tempfile::tempdir().unwrap();
 
-        import(&dst, Some(&embedder), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false))
+        import(&dst, Some(&embedder), Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false))
             .await
             .unwrap();
 
@@ -3597,7 +3633,7 @@ pub(crate) mod tests {
         let purged = insert_row(&dst, "claude-code", None, "A row purged since", None, 6).await;
         dst.conn.call(move |c| c.execute("DELETE FROM memory WHERE id = ?1", [purged])).await.unwrap();
         let backups = tempfile::tempdir().unwrap();
-        let dry = import(&dst, None, backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
+        let dry = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert!(dry.topic_taken.iter().all(|t| t.stored_as > purged) && !dry.topic_taken.is_empty(), "{dry:#?}");
         let (real, _) = run(&dst, &file, ImportOptions::default()).await;
         assert_eq!(ImportReport { dry_run: false, snapshot: real.snapshot.clone(), import_id: real.import_id, ..dry }, real);
@@ -3627,7 +3663,7 @@ pub(crate) mod tests {
         let backups = tempfile::tempdir().unwrap();
         let mut timings = ImportTimings::new(false);
         let report =
-            import(store, Some(&FakeEmbedder::default()), backups.path(), file, &ImportOptions::default(), Arc::new(Disk), &mut timings)
+            import(store, Some(&FakeEmbedder::default()), Arc::new(ChatChunker::with_fallback()), backups.path(), file, &ImportOptions::default(), Arc::new(Disk), &mut timings)
                 .await
                 .unwrap();
         (report, timings)
@@ -3728,6 +3764,157 @@ pub(crate) mod tests {
         assert!(ratio <= 3.0, "{NOTES} notes in {once:?}, twice as many in {twice:?}: {ratio:.2} times");
     }
 
+    #[test]
+    fn longest_first_puts_the_most_tokens_first_and_keeps_ties_in_order() {
+        assert_eq!(longest_first(&[3, 9, 3, 1, 9]), vec![1, 4, 0, 2, 3]);
+        assert_eq!(longest_first(&[]), Vec::<usize>::new());
+        assert_eq!(longest_first(&[5, 5, 5]), vec![0, 1, 2]);
+    }
+
+    /// Answers as the fake embedder does, noting the texts of every call.
+    struct Recording {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        fake: FakeEmbedder,
+    }
+
+    impl Recording {
+        fn new() -> Self {
+            Self { calls: std::sync::Mutex::default(), fake: FakeEmbedder::default() }
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.calls.lock().unwrap().iter().flatten().cloned().collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for Recording {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            self.fake.embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.calls.lock().unwrap().push(texts.to_vec());
+            self.fake.embed_batch(texts, role).await
+        }
+        fn dimensions(&self) -> usize {
+            self.fake.dimensions()
+        }
+        fn model_id(&self) -> &str {
+            self.fake.model_id()
+        }
+        fn query_prefix(&self) -> &str {
+            self.fake.query_prefix()
+        }
+        fn passage_prefix(&self) -> &str {
+            self.fake.passage_prefix()
+        }
+    }
+
+    fn word_chunker() -> Arc<ChatChunker> {
+        Arc::new(ChatChunker::with_tokenizer(crate::memory::chunker::word_tokenizer()))
+    }
+
+    /// `count` notes whose texts are `note<i>` and a few more words, of
+    /// lengths that repeat and differ.
+    fn word_notes(count: usize) -> Vec<ForeignNote> {
+        (0..count)
+            .map(|i| {
+                let words = 3 + (i * 5) % 11;
+                let body: Vec<String> = std::iter::once(format!("note{i}")).chain((1..words).map(|k| format!("x{k}"))).collect();
+                foreign_note(&format!("engram:n{i:03}"), "t", &body.join(" "))
+            })
+            .collect()
+    }
+
+    async fn import_notes_with(store: &MemoryStore, embedder: &dyn Embedder, notes: Vec<ForeignNote>) -> ImportReport {
+        let backups = tempfile::tempdir().unwrap();
+        import_foreign(
+            store,
+            Some(embedder),
+            word_chunker(),
+            backups.path(),
+            foreign_export(notes),
+            &ImportOptions::default(),
+            Arc::new(Disk),
+            &mut ImportTimings::new(false),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn assert_longest_first(embedder: &Recording) {
+        let calls = embedder.calls.lock().unwrap();
+        assert!(calls.iter().all(|c| c.len() <= EMBED_BATCH), "no call over {EMBED_BATCH} texts");
+        let texts: Vec<&str> = calls.iter().flatten().map(String::as_str).collect();
+        let counts = word_chunker().count_all(&texts);
+        assert!(counts.windows(2).all(|w| w[0] >= w[1]), "{counts:?}");
+    }
+
+    #[tokio::test]
+    async fn an_import_of_another_tool_embeds_its_rows_longest_first() {
+        let dst = destination().await;
+        let embedder = Recording::new();
+        let report = import_notes_with(&dst, &embedder, word_notes(40)).await;
+        assert_eq!(report.inserted, 40);
+        assert!(embedder.calls.lock().unwrap().len() >= 2, "more rows than one call takes");
+        assert_longest_first(&embedder);
+        let texts = embedder.texts();
+        assert_eq!(texts.len(), 40);
+        let counts = word_chunker().count_all(&texts.iter().map(String::as_str).collect::<Vec<_>>());
+        let file_index = |t: &String| t.split_whitespace().find_map(|w| w.strip_prefix("note")).unwrap().parse::<usize>().unwrap();
+        let mut ties = 0;
+        for k in 1..texts.len() {
+            if counts[k - 1] == counts[k] {
+                ties += 1;
+                assert!(file_index(&texts[k - 1]) < file_index(&texts[k]), "equal lengths keep the order of the file");
+            }
+        }
+        assert!(ties > 0);
+    }
+
+    #[tokio::test]
+    async fn a_clawg_import_embeds_its_rows_longest_first() {
+        let file = seeded_file().await;
+        let dst = destination().await;
+        let embedder = Recording::new();
+        let backups = tempfile::tempdir().unwrap();
+        import(&dst, Some(&embedder), word_chunker(), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false))
+            .await
+            .unwrap();
+        assert!(embedder.texts().len() > 1);
+        assert_longest_first(&embedder);
+    }
+
+    #[tokio::test]
+    async fn each_imported_row_keeps_the_vector_of_its_own_text() {
+        let long: Vec<String> = (0..700).map(|i| format!("w{i}")).collect();
+        let mut notes = word_notes(40);
+        notes.push(foreign_note("engram:long", "Long", &long.join(" ")));
+        let dst = destination().await;
+        import_notes_with(&dst, &Recording::new(), notes).await;
+        let stored = dst
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT m.content, COALESCE(p.context, ''), v.embedding FROM memory m \
+                     JOIN memory_vectors v ON v.rowid = m.id LEFT JOIN memory_piece p ON p.memory_id = m.id \
+                     WHERE m.source = 'import' AND m.deleted_at IS NULL",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap();
+        assert!(stored.len() > 41, "the long note is several rows: {}", stored.len());
+        assert!(stored.iter().any(|(_, context, _)| !context.is_empty()), "pieces behind a head");
+        let fake = FakeEmbedder::default();
+        for (content, context, bytes) in stored {
+            let vector = fake.embed_with_role(&embedding_text(&context, &content), EmbedRole::Passage).await.unwrap();
+            let expected: Vec<u8> = to_unit(&vector).unwrap().iter().flat_map(|f| f.to_le_bytes()).collect();
+            assert_eq!(bytes, expected, "the vector of {content:.30}");
+        }
+    }
+
     /// Tokens the model runs over when rows of these lengths are embedded in
     /// this order, as the import calls the embedder and the embedder cuts its
     /// runs, against the tokens of the texts alone; and the same for the
@@ -3811,10 +3998,10 @@ pub(crate) mod tests {
         let export = engram::read(&std::fs::read_to_string(path("CLAWG_IMPORT_EXPORT")).unwrap()).unwrap();
         let store = MemoryStore::new_for_test().await.unwrap();
         let chunker = Arc::new(ChatChunker::with_tokenizer(tokenizer.clone()));
-        let (prepared, _) = prepare_export(&store, chunker, export, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(true)).await.unwrap();
+        let (prepared, _) = prepare_export(&store, chunker.clone(), export, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(true)).await.unwrap();
         let planned = load(&store, &prepared, &mut Timing::new(Step::Load)).await.unwrap();
         let decided = decide(planned, &prepared, &AtomicBool::new(false)).unwrap();
-        let rows = rows_to_embed(&prepared, &decided);
+        let rows: Vec<&Row> = rows_to_embed(&prepared, &decided).into_iter().map(|k| &prepared.rows[k]).collect();
 
         let contract = expected_contract();
         let texts: Vec<String> = rows.iter().map(|r| embedding_text(&r.context, &r.content).into_owned()).collect();
@@ -3830,6 +4017,7 @@ pub(crate) mod tests {
         let file: Vec<usize> = (0..rows.len()).collect();
         let lens = |order: &[usize]| order.iter().map(|&k| tokens[k]).collect::<Vec<_>>();
         let chars: Vec<usize> = texts.iter().map(|t| t.chars().count()).collect();
+        let counted = chunker.count_all(&texts.iter().map(String::as_str).collect::<Vec<_>>());
         let orders = |indices: &[usize]| {
             let by = |key: &dyn Fn(usize) -> usize| {
                 let mut order = indices.to_vec();
@@ -3841,6 +4029,7 @@ pub(crate) mod tests {
                 ("bytes", by(&|k| texts[k].len())),
                 ("chars", by(&|k| chars[k])),
                 ("tokens", by(&|k| tokens[k])),
+                ("import", longest_first(&indices.iter().map(|&k| counted[k]).collect::<Vec<_>>()).into_iter().map(|k| indices[k]).collect()),
             ]
         };
         let report_padding = |what: &str, indices: &[usize]| {
@@ -3934,8 +4123,8 @@ pub(crate) mod tests {
         );
 
         let difference = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        let longest_first = &orders[orders.len() - 1].1;
-        let probes: Vec<usize> = longest_first.iter().step_by((sample / 64).max(1)).copied().collect();
+        let by_tokens = &orders.iter().find(|(name, _)| *name == "tokens").unwrap().1;
+        let probes: Vec<usize> = by_tokens.iter().step_by((sample / 64).max(1)).copied().collect();
         let mut alone = HashMap::new();
         for &k in &probes {
             alone.insert(k, embedder.embed_with_role(&texts[k], EmbedRole::Passage).await.unwrap());

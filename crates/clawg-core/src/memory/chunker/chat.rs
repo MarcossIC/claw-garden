@@ -121,6 +121,12 @@ impl ChatChunker {
         SaveSplit { pieces: splitter.split(content, PIECE_MAX_TOKENS, PIECE_OVERLAP_TOKENS), head }
     }
 
+    /// How many tokens each of `texts` is, as [`TokenSplitter::count_all`]
+    /// counts them.
+    pub(crate) fn count_all(&self, texts: &[&str]) -> Vec<usize> {
+        self.splitter().count_all(texts)
+    }
+
     /// Test-only: see `TokenSplitter::tokenizer_ptr`.
     #[cfg(test)]
     pub(crate) fn tokenizer_ptr(&self) -> Option<*const tokenizers::Tokenizer> {
