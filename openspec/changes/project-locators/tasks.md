@@ -598,8 +598,9 @@ Requisitos en la [spec](spec.md#entrega-3b-los-subproyectos-de-un-monorepo) (PL4
 
 ### 55. Verificación
 
-- [ ] La suite y los dos clippy de `.claude/CLAUDE.md`, en `target-test` en Windows y con `--locked`, y en Linux.
-- [ ] El binario en un home temporal, con un monorepo git real con un `origin` `https://…` y un clone del mismo remoto en otro camino:
+- [x] La suite y los dos clippy de `.claude/CLAUDE.md`, con `--locked`, en Linux.
+- [ ] Lo mismo en `target-test` en Windows.
+- [x] El binario en un home temporal, con un monorepo git real con un `origin` `https://…` y un clone del mismo remoto en otro camino:
   - `projects create web` y `projects locate web <monorepo>/apps/web --subfolder`, cuya salida nombra lo que quedó en el monorepo;
   - `session-start` desde `apps/web/src` lee `web`, un save desde ahí queda en `web`, y uno desde la raíz queda en el monorepo;
   - el clone llega a los dos, y un worktree del monorepo llega a `web` desde su `apps/web`;
@@ -607,8 +608,8 @@ Requisitos en la [spec](spec.md#entrega-3b-los-subproyectos-de-un-monorepo) (PL4
   - `projects locate <monorepo> <monorepo>/apps/web --subfolder` la quita, y lo guardado en `web` sigue allí;
   - `doctor` no marca nada nuevo.
 - [ ] El CI en Linux y Windows, en el pull request final del cambio.
-- [ ] `verify.md`, sección «Entrega 3b».
-- [ ] No queda otro directorio de build que `target` y `target-test`.
+- [x] `verify.md`, sección «Entrega 3b».
+- [x] No queda otro directorio de build que `target` y `target-test`.
 
 ## Entrega 4. Exportar e importar (V31)
 
