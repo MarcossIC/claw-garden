@@ -2481,6 +2481,10 @@ pub struct LocatedBody {
     /// For a subfolder: the repository's project was named, and its declaration went.
     #[serde(default)]
     pub removed: bool,
+    /// For a removed declaration: the project the subfolder led to, which
+    /// keeps what was saved there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
 }
 
 /// Makes the root of `root_path` lead to a project: it is registered as a
@@ -2516,6 +2520,7 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
         repository_id: None,
         subpath: None,
         removed: false,
+        previous: None,
     };
     if own == target {
         return Ok(Json(located(true, None)));
@@ -2589,6 +2594,7 @@ async fn declare(app: &Arc<AppCtx>, root: &str, subpath: &str, target: &str) -> 
         repository_id: Some(declared.repository_id),
         subpath: Some(declared.subpath),
         removed: declared.removed,
+        previous: declared.previous,
     })
 }
 

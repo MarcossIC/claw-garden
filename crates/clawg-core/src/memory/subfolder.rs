@@ -121,6 +121,9 @@ pub struct Declared {
     pub already: bool,
     /// The project named was the repository's: the declaration went.
     pub removed: bool,
+    /// Where the subfolder led before a removal, which keeps what was saved there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
     /// The merge of the project the subfolder led to before, which only it led to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge: Option<MergeReport>,
@@ -190,7 +193,15 @@ pub async fn declare_subfolder(
         Step::Done(declared) => Ok(declared),
         Step::Merge { other } => {
             let merge = merge_core(store, workspaces, backups, &other, &target, false).await?;
-            Ok(Declared { repository_id: parent, subpath, project_id: target, already: false, removed: false, merge: Some(merge) })
+            Ok(Declared {
+                repository_id: parent,
+                subpath,
+                project_id: target,
+                already: false,
+                removed: false,
+                previous: None,
+                merge: Some(merge),
+            })
         }
     }
 }
@@ -204,15 +215,22 @@ fn declare_in(c: &Connection, parent: &str, subpath: &str, target: &str, now: Ti
     if let Some(deleted) = deleted_in(c, target)? {
         return Err(SubfolderError::Deleted { id: target.to_string(), delete_id: deleted.delete_id });
     }
-    let done = |already: bool, removed: bool| {
+    let done = |already: bool, previous: Option<String>| {
         Step::Done(Declared {
             repository_id: parent.to_string(),
             subpath: subpath.to_string(),
             project_id: target.to_string(),
             already,
-            removed,
+            removed: previous.is_some(),
+            previous,
             merge: None,
         })
+    };
+    let mut exact = declarations_in(c, parent)?;
+    exact.retain(|d| d.subpath == subpath);
+    let leads = match deepest(&exact, parent, subpath) {
+        Some(d) => Some(canonical_in(c, &d.project_id)?),
+        None => None,
     };
     if target == parent {
         let removed = c.execute(
@@ -220,16 +238,10 @@ fn declare_in(c: &Connection, parent: &str, subpath: &str, target: &str, now: Ti
              AND (parent_id = ?1 OR parent_id IN (SELECT id FROM project WHERE merged_into = ?1))",
             rusqlite::params![parent, subpath],
         )?;
-        return Ok(done(removed == 0, removed > 0));
+        return Ok(if removed == 0 { done(true, None) } else { done(false, leads) });
     }
-    let mut exact = declarations_in(c, parent)?;
-    exact.retain(|d| d.subpath == subpath);
-    let leads = match deepest(&exact, parent, subpath) {
-        Some(d) => Some(canonical_in(c, &d.project_id)?),
-        None => None,
-    };
     match leads {
-        Some(other) if other == target => return Ok(done(true, false)),
+        Some(other) if other == target => return Ok(done(true, None)),
         Some(other) if other != parent => {
             return if reached_otherwise_in(c, &other, parent, subpath)? {
                 Err(SubfolderError::Shared { subpath: subpath.to_string(), other, target: target.to_string() })
@@ -244,7 +256,7 @@ fn declare_in(c: &Connection, parent: &str, subpath: &str, target: &str, now: Ti
          ON CONFLICT (parent_id, subpath) DO UPDATE SET project_id = excluded.project_id, created_at = excluded.created_at",
         rusqlite::params![parent, subpath, target, now],
     )?;
-    Ok(done(false, false))
+    Ok(done(false, None))
 }
 
 /// Whether anything but the declarations of `subpath` under `parent` leads
@@ -392,6 +404,7 @@ mod tests {
         let removed = f.declare("apps/web", "mono-1a2b").await.unwrap();
 
         assert_eq!((removed.removed, removed.already), (true, false));
+        assert_eq!(removed.previous.as_deref(), Some("web"), "what was saved there stays in it");
         assert!(f.rows().await.is_empty(), "the tombstone's went too");
         assert_eq!(f.leads("apps/web").await, None, "it leads to the repository again");
         assert!(f.declare("apps/web", "mono-1a2b").await.unwrap().already, "nothing left to remove");

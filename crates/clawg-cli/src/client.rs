@@ -358,6 +358,9 @@ pub struct Located {
     /// For a subfolder: the repository's project was named, and its declaration went.
     #[serde(default)]
     pub removed: bool,
+    /// For a removed declaration: the project the subfolder led to.
+    #[serde(default)]
+    pub previous: Option<String>,
 }
 
 /// Whether `POST /v1/context` searched memories, and if not, why.
