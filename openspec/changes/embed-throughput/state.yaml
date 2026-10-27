@@ -1,15 +1,15 @@
 change: embed-throughput
 objective: "transversal"
 depends_on: [piece-boundaries]
-phase: apply
+phase: archive
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in-progress
-  verify: pending
+  apply: done
+  verify: done
   archive: pending
-updated: 2026-10-24
+updated: 2026-10-27
 main_spec: openspec/specs/portability/spec.md
