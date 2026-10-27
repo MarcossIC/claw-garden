@@ -1,14 +1,15 @@
 # project-locators — Especificación
 
-Esta especificación cubre cinco entregas de la [propuesta](proposal.md):
+Esta especificación cubre seis entregas de la [propuesta](proposal.md):
 
 - la **entrega 1, el registro (V27)** (PL1 a PL10). Cambia R10, R16, R18 y R20 de [`specs/project`](../../specs/project/spec.md) y suma V27 a [`specs/storage`](../../specs/storage/spec.md);
 - la **entrega 2a, unir proyectos (V28)** (PL11 a PL20, [más abajo](#entrega-2a-unir-proyectos)). Cambia PL9 y suma V28 a `specs/storage` y tres hallazgos a [`specs/doctor`](../../specs/doctor/spec.md);
 - la **entrega 2b, borrar proyectos (V29)** (PL21 a PL31, [más abajo](#entrega-2b-borrar-proyectos));
 - la **entrega 3a, proyectos sin carpeta y el agente** (PL32 a PL42, [más abajo](#entrega-3a-proyectos-sin-carpeta-y-el-agente)). Suma a `specs/project` y a [`specs/mcp`](../../specs/mcp/spec.md), sin migración;
-- la **entrega 3b, los subproyectos de un monorepo (V30)** (PL43 a PL52, [más abajo](#entrega-3b-los-subproyectos-de-un-monorepo)). Suma V30 a `specs/storage`, un chequeo a `specs/doctor`, y el camino crudo a `specs/project`, [`specs/hooks`](../../specs/hooks/spec.md) y `specs/mcp`.
+- la **entrega 3b, los subproyectos de un monorepo (V30)** (PL43 a PL52, [más abajo](#entrega-3b-los-subproyectos-de-un-monorepo)). Suma V30 a `specs/storage`, un chequeo a `specs/doctor`, y el camino crudo a `specs/project`, [`specs/hooks`](../../specs/hooks/spec.md) y `specs/mcp`;
+- la **entrega 4, exportar e importar (V31)** (PL53 a PL65, [más abajo](#entrega-4-exportar-e-importar)). Cambia R1, R4, R5, IL1, HI7, HI16, IU1 e IU2 de [`specs/portability`](../../specs/portability/spec.md) y PL6, PL7 y PL47, y suma V31 a `specs/storage`.
 
-Lo que no se nombra aquí sigue como está. La entrega 4 agrega sus requisitos a este archivo cuando le toque. El [diseño](design.md) dice cómo se cumple cada requisito y qué alternativas se descartaron.
+Lo que no se nombra aquí sigue como está. El [diseño](design.md) dice cómo se cumple cada requisito y qué alternativas se descartaron.
 
 ## Definiciones
 
@@ -1159,3 +1160,289 @@ Un chequeo nuevo, `project_subfolders`, MUST nombrar con `warn` y `broken_subfol
 - `clawg projects add` y `clawg projects locate` sin `--subfolder`.
 
 **Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin volver a bendecir, y los de R1, R4, R6 y PL1 a PL42.
+
+## Entrega 4: exportar e importar
+
+Cubre la [entrega 4](proposal.md#4-exportar-e-importar): la línea `project` del formato lleva el nombre, los localizadores, la lápida y las declaraciones de un proyecto; el import decide adónde va cada proyecto del archivo por su remoto, su id y su nombre antes que por su camino, deja las sugerencias que pide su evidencia y anota en su diario lo que agrega al registro; y `--project-map` acepta un proyecto sin carpeta. El diseño está en [D60 a D70](design.md#entrega-4-exportar-e-importar). Trae V31, que crea una tabla y un índice. El formato sigue en la versión 1.
+
+Cambia lo que fijaron PL6 y PL7 («leer, planear e importar no crean sugerencias»), R4 de [`specs/portability`](../../specs/portability/spec.md) («el import no deja sugerencias»; la raíz antes que todo) y la última línea de PL47 y de PL52 (el import no manda el camino crudo).
+
+### Definiciones
+
+- **Proyecto del archivo:** las líneas `project` de un mismo `id` de un export. Su `id` es el del proyecto en el store de origen.
+- **Huellas de un proyecto del archivo:** sus remotos (`remotes`) y el remoto y el primer commit de cada una de sus carpetas (`folders`).
+- **Huellas de un proyecto de acá:** los remotos que `project_remote` le ata, y el remoto y el primer commit de cada carpeta de `project_path` que lleva a él.
+- **Contradecir:** un proyecto del archivo contradice a uno de acá cuando los dos conocen algún remoto y no comparten ninguno; o, si alguno de los dos no conoce remotos, cuando los dos conocen algún primer commit y no comparten ninguno. Es la regla de `fit` (PL4) sobre conjuntos: el remoto decide antes que el primer commit.
+- **Carpeta de otra máquina:** una carpeta de un proyecto del archivo cuyo camino (o el `NEW` que le da `--map-root`) no existe en esta máquina.
+- **Línea sin filas:** la de un proyecto del archivo al que no va ninguna línea `memory` del archivo: una lápida, el repositorio de una declaración o un subproyecto declarado.
+- **Lo que el import agregó al registro:** los proyectos que creó, los proyectos borrados que hizo volver, las sugerencias que dejó y las declaraciones que escribió. Las carpetas y los remotos ya se anotan en `memory_import_extra` (IU1 de `specs/portability`).
+
+## PL53. V31 agrega el diario del registro y un índice por fecha
+
+V31 MUST:
+
+- crear `memory_import_registry` (`import_id`, `kind`, `a`, `b`, `value`), sin `CHECK` sobre `kind`, con un índice por `import_id`;
+- crear `idx_memory_created_at` sobre `memory (created_at)`, sin predicado, porque la presencia de PL62 busca también las filas borradas.
+
+V31 MUST NOT cambiar ninguna fila ni ninguna otra tabla. `memory_import_extra` queda con su `CHECK` y sus filas, y sus tipos siguen diciendo lo mismo.
+
+#### Escenario: un store en V30 abre con sus imports como estaban
+- GIVEN un store en V30 con:
+  - un import anotado: filas insertadas, una reemplazada, un vínculo rellenado, una carpeta y un remoto en `memory_import_extra`;
+  - un proyecto borrado con su borrado abierto, una lápida y una declaración;
+  - filas vivas y borradas en las tres tablas
+- WHEN se abre con V31
+- THEN ninguna fila de ninguna tabla cambió, `memory_import_registry` existe vacía y `idx_memory_created_at` existe
+- AND `clawg import --undo N` de ese import retira lo que su diario anotó, como antes de V31
+- AND hay un snapshot `pre-migration`
+
+**Tests:** `a_database_from_the_previous_version_opens_with_its_imports_as_they_were` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(30))`); la fila 31 en `published_migration_checksums_are_pinned` (`migrations.rs`); los conteos de migraciones aplicadas de `db.rs`, que pasan de 30 a 31.
+
+## PL54. Una línea `project` por proyecto
+
+`clawg export` MUST escribir una línea `project` por proyecto, con:
+
+- `id`: el del proyecto, no el de una de sus carpetas;
+- `root_path`: el camino de su carpeta más vieja, para un lector de antes. Un proyecto sin carpeta no lo lleva;
+- `name`;
+- `folders`: cada carpeta que lleva a él, la más vieja primero, con su `root_path` y, si los grabó, su `remote` y su `root_commit`;
+- `remotes`: los que `project_remote` le ata, del más viejo al más nuevo;
+- `merged_into`, sólo en la línea de una lápida;
+- `subfolders`: las declaraciones de las que es el repositorio, cada una con `subpath` y el `project_id` al que lleva.
+
+Un campo vacío MUST NOT escribirse: la línea de un store anterior a V27 sale byte a byte como antes.
+
+MUST escribir la línea de:
+
+1. cada proyecto de una fila exportada;
+2. cada lápida que lleva a uno de ellos, con `merged_into` y sin carpetas ni remotos, que pasaron con la unión;
+3. cada repositorio con una declaración que lleva a uno de ellos;
+4. cada subproyecto al que lleva una declaración de uno de ellos.
+
+MUST NOT viajar: `deleted_at` (D61), `born`, `reviewed`, `created_at`, la marca `git_stamp` ni `index_docs`.
+
+Un store se lee sin migrar, con lo que tiene: antes de V27, una línea por carpeta cuyo id es el proyecto de una fila, sin `name` (como hoy, `crates/clawg-core/src/memory/portability/export.rs:136-142`); antes de V24, sin remotos; antes de V28, sin lápidas; antes de V30, sin declaraciones.
+
+La versión del formato sigue en 1. Un lector de antes lee `id` y `root_path` e ignora lo demás (R1 de `specs/portability`). A una línea sin `root_path` la reporta entre las líneas que no importó y deja las filas de ese proyecto con su id, que es lo que hacía antes de esta entrega.
+
+#### Escenario: un clone y una idea
+- GIVEN un proyecto `app` con dos carpetas (la suya y la de un clone del mismo remoto) y un proyecto `ideas de producto` sin carpeta, cada uno con filas
+- WHEN se exporta
+- THEN hay una línea de `app`, con su id, el camino de la carpeta más vieja en `root_path`, sus dos carpetas con sus huellas y su remoto, y una línea de `ideas de producto` sin `root_path`
+
+#### Escenario: un subproyecto
+- GIVEN un monorepo M con la declaración de `apps/web` hacia W, y filas sólo en W
+- WHEN se exporta con `--project` desde `apps/web`
+- THEN hay una línea de W y una de M con su declaración, y ninguna fila de M
+
+**Tests:** `an_export_writes_one_line_per_project_with_its_locators`, `an_export_of_a_subproject_carries_its_repository_and_declaration`, `a_deleted_project_exports_without_its_mark` y `a_store_from_before_the_registry_exports_its_folders_as_before`, este sembrado en V26 (`crates/clawg-core/src/memory/portability/export.rs`); `the_pinned_example_reads_and_writes_back_unchanged`, con una segunda línea `project` con los campos nuevos, y `a_project_line_carries_its_name_locators_and_subfolders` (`crates/clawg-core/src/memory/portability/format.rs`).
+
+## PL55. El import lee las líneas de antes y las de ahora
+
+- El import MUST leer una línea sin `root_path` y con los campos nuevos. Las líneas de un mismo `id` son un solo proyecto, con las carpetas de todas.
+- Un archivo de antes (una línea por carpeta, sin nombre ni huellas) MUST importarse como antes, salvo que su `id` se prueba antes que su camino (PL56).
+- Una fila cuyo `project_id` no tiene línea lo conserva, como antes (`crates/clawg-core/src/memory/portability/import.rs:370`). Si `project` no lo tiene, el import MUST crearlo él, con `born = 'import'` y el nombre que da el id, y anotarlo (PL63), en lugar de dejárselo al disparador de PL2.
+
+**Tests:** `a_project_line_without_a_folder_is_read` (`format.rs`); `lines_of_one_id_are_one_project` (`crates/clawg-core/src/memory/portability/projects.rs`, pura); `an_export_from_before_names_and_locators_imports_as_before` y `a_row_without_a_line_creates_its_project_as_the_import` (`import.rs`).
+
+## PL56. Adónde va cada proyecto del archivo
+
+Cada proyecto del archivo MUST ir al primero de estos:
+
+1. **El mapa.** `--map-root OLD=NEW` nombra una de sus carpetas: el proyecto que un registro le da a NEW, con su camino crudo (PL61).
+2. **Un remoto.** El primero de sus remotos, en el orden del archivo, que `project_remote` ata acá: ese proyecto, por `canonical`.
+3. **El id.** Su id es un proyecto de acá al que no contradice: ese, por `canonical`, así que una lápida lleva a su proyecto vivo. Uno borrado es él mismo (PL59).
+4. **El nombre.** Un solo proyecto vivo de acá tiene su nombre, sin distinguir mayúsculas (como el paso 2 de PL32), y ni ese proyecto ni el del archivo tienen huellas: ese. Con huellas de un solo lado, el nombre no decide, y queda la sugerencia de PL58.
+5. **El camino.** El camino de una de sus carpetas está grabado acá o existe acá, y no contradice el proyecto que un registro le daría (`plan_ids_in`): ese.
+6. **Uno nuevo** (PL57).
+
+Un proyecto del archivo sin nombre (de un archivo de antes) saltea el paso 4. Una línea sin filas MUST NOT crear un proyecto: va adonde la llevan los pasos 2 a 5, o a ninguno. La de una lápida sólo prueba el paso 3. La única excepción es el subproyecto al que lleva una declaración que el import escribe (PL60).
+
+Lo que decide MUST ser una función pura de los proyectos del archivo, del registro leído una vez por pasada del plan y de los planes de sus raíces. La transacción que escribe cada fila MUST seguir `canonical` otra vez (D17).
+
+#### Escenario: un export de antes de una unión
+- GIVEN un store con los proyectos X y Z, cada uno con una carpeta, un remoto y filas, y un export de X hecho antes de unir X en Z, con el camino de su carpeta cambiado por el de otra máquina
+- WHEN se importa después de la unión
+- THEN las filas quedan en Z, `project` tiene los mismos proyectos que antes y X sigue siendo una lápida
+- AND con el mismo export sin remotos, las filas también quedan en Z, por el id de X
+
+#### Escenario: un export de otra máquina con el mismo remoto
+- GIVEN un proyecto P con la carpeta `/work/app` y el remoto `github.com/acme/app`
+- WHEN se importa un export de otra máquina cuyo proyecto `app` tiene otro id, la carpeta `/home/otra/app` y ese remoto
+- THEN sus filas quedan en P, y no se crea ningún proyecto
+
+#### Escenario: un proyecto sin carpeta va y vuelve por nombre
+- GIVEN un store A con el proyecto `Ideas de producto`, sin carpeta y con filas, y un store B con el proyecto `ideas de producto`, de otro id
+- WHEN se exporta de A y se importa en B, y después se exporta de B y se importa en A
+- THEN en B las filas de A quedan en `ideas de producto`, y en A las de B quedan en `Ideas de producto`, sin ningún proyecto nuevo
+- AND en un store vacío, el export de A crea un proyecto `Ideas de producto` con el id de A
+
+#### Escenario: el mismo camino, otro repositorio
+- GIVEN acá `/work/api` con el remoto `github.com/acme/api-b` y filas en su proyecto L
+- WHEN se importa un export cuyo proyecto `api` tiene la carpeta `/work/api`, el mismo id que L y el remoto `github.com/acme/api-a`
+- THEN sus filas quedan en un proyecto nuevo, y L no recibe ninguna
+
+**Tests:** la pura `a_project_of_the_file_goes_by_map_remote_id_name_then_path` (`projects.rs`); `an_export_from_before_a_merge_lands_in_its_target`, `an_export_from_another_machine_lands_in_the_project_of_its_remote`, `a_project_without_a_folder_goes_and_comes_back_by_name` y `a_project_contradicted_here_is_another_project` (`import.rs`); `an_export_of_another_store_imports_by_remote_and_by_name` (`crates/clawg-cli/tests/api.rs`); `an_import_planned_before_a_merge_writes_into_its_target` y `an_import_into_a_clone_goes_to_the_project_of_its_remote` siguen pasando.
+
+## PL57. Lo que el import registra de cada proyecto
+
+- **Un proyecto nuevo** MUST llevar el id del archivo cuando ni `project` ni `project_path` lo tienen, y si no, `new_project_id` de su nombre (PL33). Su nombre es el del archivo, o el que da su id. Nace con `born = 'import'` y `reviewed = 0`, y queda anotado (PL63).
+- **Una carpeta de otra máquina** MUST grabarse en `project_path` sin `index_docs`, con el id que le da el plan, el proyecto al que fue su proyecto del archivo, y el `remote` y el `root_commit` que trae el archivo, sin marca. Una carpeta que existe acá MUST grabarse como lo haría un registro (PL7), salvo que su checkout contradiga a su proyecto del archivo: entonces no es suya y no se graba. Una carpeta ya grabada no cambia.
+- **Cada remoto** del proyecto del archivo que `project_remote` no ata MUST atarse al proyecto al que fue. Un remoto ya atado no cambia.
+- El import MUST NOT renombrar, marcar revisado, unir ni separar ningún proyecto de acá.
+
+#### Escenario: un checkout sin `origin`, después del import
+- GIVEN un export de otra máquina cuyo proyecto `notas` tiene una carpeta sin remoto, con el primer commit `c1`, importado en un store vacío
+- WHEN después se registra acá `/work/notas`, un checkout sin `origin` con ese primer commit
+- THEN es una mudanza (PL5): lleva al proyecto que creó el import, sin sugerencia
+
+#### Escenario: un id que ya está tomado
+- GIVEN acá una carpeta con el id `ideas-1a2b`
+- WHEN se importa un proyecto del archivo sin carpeta, con ese id y el nombre `ideas`
+- THEN se crea el proyecto `ideas` con otro id, y sus filas quedan en él
+
+**Tests:** `a_new_project_keeps_the_id_and_name_of_its_line`, `an_id_taken_here_gives_the_new_project_another`, `a_folder_of_another_machine_records_the_fingerprints_of_its_line` y `a_checkout_without_origin_registered_after_an_import_joins_its_project` (`import.rs`); `an_import_records_its_folders_as_a_registration_would` sigue pasando, con la sugerencia de PL58.
+
+## PL58. Las sugerencias de un import
+
+Cambia PL6 y PL7: un import con escritura MUST dejar, con las reglas de PL6 (una por par, sin mover nada, nunca otra vez para un par que ya tiene una):
+
+- las que dejaría un registro con `assigned` de cada carpeta que graba y existe acá: `root_commit` (PL5), `remote_changed` (PL6) y `folder_name` (PL38);
+- `similar_name`, entre el proyecto adonde fue un proyecto del archivo con nombre y cada proyecto vivo de acá cuya clave de nombre (`name_key`) es la de ese nombre, que no lo contradice y que no fue elegido. Entran también un nombre exacto que tienen dos proyectos de acá, y uno que el paso 4 de PL56 no eligió porque sólo un lado tiene huellas;
+- `merged_at_source`: la fuente tiene unidos dos proyectos que acá están separados. Pasa entre el proyecto adonde fue una lápida del archivo (paso 3) y el proyecto adonde fue su `merged_into`, cuando son dos proyectos vivos distintos; y entre los proyectos vivos de acá a los que llevan los remotos de un mismo proyecto del archivo.
+
+Cada una que el import inserta MUST anotarse (PL63). Una sugerencia que ya existía no se anota. Una prueba en seco MUST reportarlas sin escribirlas. Se muestran como las demás (PL36), y `recall_context`, `clawg projects list` y los candidatos de un borrado MUST decir sus motivos en los dos idiomas.
+
+#### Escenario: un nombre parecido
+- GIVEN acá el proyecto `mi-app`
+- WHEN se importa un proyecto del archivo sin carpeta llamado `Mi App`
+- THEN se crea `Mi App`, y queda una sugerencia `similar_name` entre los dos
+
+#### Escenario: una unión en la fuente
+- GIVEN acá X y Z separados, con filas, y un export de otro store en el que X se unió en Z
+- WHEN se importa
+- THEN queda una sugerencia `merged_at_source` entre X y Z, y ninguno de los dos cambia
+
+**Tests:** `an_import_leaves_the_suggestions_a_registration_would`, `a_project_named_like_one_here_is_suggested`, `a_merge_at_the_source_is_suggested_here` y `a_dry_run_reports_the_suggestions_and_writes_none` (`import.rs`); `an_import_records_its_folders_as_a_registration_would`, que ahora espera la sugerencia `remote_changed` de su segunda raíz (`import.rs`); `the_reasons_of_an_import_are_worded` (`crates/clawg-cli/src/projects.rs` y `crates/clawg-cli/src/mcp/tools.rs`, en los dos idiomas).
+
+## PL59. Un proyecto borrado
+
+- `deleted_at` no viaja (PL54).
+- Una fila que el import inserta viva bajo un proyecto borrado lo hace volver (PL22). El import MUST anotarlo como vuelto (PL63), con el `deleted_at` que tenía, y el reporte MUST nombrarlo.
+- Una fila que el import inserta borrada MUST NOT hacerlo volver. Hoy lo hace: el import inserta viva una fila borrada y después la marca, por el índice de texto (`crates/clawg-core/src/memory/portability/import.rs:675-681`), y el disparador de inserción la ve viva (`V29__project_delete.sql:63-64`). En la misma transacción, el import MUST dejar el proyecto con el `deleted_at` y el `reviewed` que tenía.
+- Por nombre, un proyecto borrado nunca se elige: su nombre quedó libre (PL27). Por remoto, por id y por camino, sí (D27).
+
+#### Escenario: lo borrado llega borrado
+- GIVEN acá el proyecto A borrado con sus memorias, y un export que trae una memoria borrada de A
+- WHEN se importa
+- THEN la memoria queda borrada bajo A, y A sigue borrado y fuera de la lista
+- AND con una memoria viva de A en el export, A vuelve sin revisar, el reporte lo dice y el `--undo` del import lo deja borrado otra vez
+
+**Tests:** `a_row_imported_deleted_leaves_its_deleted_project_deleted` y `a_live_row_imported_into_a_deleted_project_brings_it_back_and_says_so` (`import.rs`); `a_deleted_project_exports_without_its_mark` (`export.rs`).
+
+## PL60. Las declaraciones viajan
+
+Después de decidir adónde va cada proyecto del archivo, por cada declaración (`subpath`, W) de un proyecto del archivo P, con P en el proyecto P' de acá y W en W':
+
+- si P' y W' son distintos y `project_subfolder` no tiene (P', `subpath`), el import MUST escribir (P', `subpath`, W') y anotarla (PL63). Si W no fue a ningún proyecto, se crea, como manda PL57;
+- una declaración de acá con esa clave MUST quedar como está, aunque lleve a otro proyecto, y el reporte la nombra;
+- si P no fue a ningún proyecto, la declaración no se escribe y el reporte la nombra.
+
+Escribir una declaración MUST NOT unir proyectos ni mover filas (D56).
+
+#### Escenario: un monorepo en otra máquina
+- GIVEN un export de un monorepo M con el remoto `github.com/acme/mono` y la declaración de `apps/web` hacia W, y acá un clone de ese remoto registrado sin declaraciones
+- WHEN se importa, y después se registra el clone con el camino crudo `apps/web/src`
+- THEN W existe acá, la declaración lleva al proyecto del clone y a W, y el registro responde W
+
+**Tests:** `the_subfolders_of_a_repository_travel_with_it` y `a_declaration_here_is_kept_over_the_file` (`import.rs`).
+
+## PL61. `--project-map NOMBRE=project:REF` y los caminos crudos
+
+- **El CLI.** `--project-map NOMBRE=project:REF` MUST separarse en el último `=project:`, y si no lo hay, `NOMBRE=CAMINO` en el último `=`, como hoy (`crates/clawg-cli/src/cli.rs:339-346`).
+- **Una referencia.** REF es un id o un nombre, y el daemon MUST resolverla como el destino de un movimiento (PL35): primero como id, sin seguir la lápida, que se sigue en la transacción que escribe; después como el nombre de un solo proyecto vivo. No crea nada ni busca parecidos. Antes de leer el archivo, MUST responder 404 si no es ninguno, 409 `project_ambiguous` si es de dos o más, y 409 `project_deleted` si es un proyecto borrado (PL27), con el `detail` de siempre. La transacción que escribe MUST comprobar el borrado otra vez: las filas de un proyecto que se borró mientras tanto se reportan inválidas, sin hacerlo volver.
+- **Un camino.** Para `--project-map NOMBRE=CAMINO` y `--map-root OLD=NEW`, el CLI MUST mandar la raíz y el camino crudo, absoluto y canónico. El daemon MUST resolver la declaración más profunda como un registro (PL45): un CAMINO dentro de una subcarpeta declarada lleva a su subproyecto.
+- **El cuerpo.** Cada par de `project_map` y de `map_roots` MUST aceptar como destino un texto (una raíz, como hoy), `{"root", "path"}` o, sólo en `project_map`, `{"project"}`. El CLI MUST mandar siempre un objeto, así un daemon anterior rechaza el cuerpo, porque espera un texto, en lugar de leer un camino crudo como una raíz.
+- La tabla de PL19 MUST nombrar el proyecto de `POST /import` en `body.project_map[].project`, y los recorridos le mandan una lápida (las notas quedan en el proyecto vivo) y un borrado (409 `project_deleted`).
+
+#### Escenario: un proyecto sin carpeta como destino
+- GIVEN un export de engram con notas del proyecto `notas`, y acá el proyecto `ideas`, sin carpeta
+- WHEN se importa con `--project-map notas=project:ideas`
+- THEN las notas quedan en `ideas`, y ninguna carpeta se registra
+- AND con `ideas` borrado, la respuesta es 409 `project_deleted` y no se escribe nada
+
+**Tests:** `a_project_map_to_a_project_places_its_notes_there` y `a_project_map_path_in_a_declared_subfolder_goes_to_its_project` (`import.rs`); `a_project_map_to_a_deleted_ambiguous_or_unknown_project_is_refused`, `a_map_given_as_a_root_is_read_as_before` y el brazo de `/import` en `every_route_says_which_project_it_takes`, `every_route_that_takes_a_project_follows_a_merge` y `every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule` (`tests/api.rs`); `import_takes_a_project_map_to_a_project` (`cli.rs`); `the_maps_are_sent_with_their_raw_paths` (`crates/clawg-cli/src/import.rs`, contra un daemon de prueba).
+
+## PL62. Importar de nuevo después de un movimiento no duplica
+
+Una fila de un export de clawg que no está presente en su proyecto (R5 de `specs/portability`) MUST contarse como presente si acá hay, en cualquier proyecto y borrada o no, una fila con su agente, su hash enmascarado, su `created_at` y su `created_by_ref`. No se inserta, sus vínculos van a esa fila como los de una presente, y el reporte la cuenta en `present_elsewhere` por el proyecto donde está.
+
+MUST NOT valer para las filas de otra herramienta: a esas las encuentra su origen (HI11 de `specs/portability`). La búsqueda MUST ir por `idx_memory_created_at`, con su fila en la tabla de IL1 de `specs/portability`, y el planificador MUST decidir lo mismo que la pasada SQL (ID2).
+
+#### Escenario: exportar, mover e importar otra vez
+- GIVEN un store con su export, y después una memoria movida a otro proyecto con `projects move`
+- WHEN se importa el export
+- THEN no hay filas nuevas, y el reporte cuenta esa memoria como presente en el proyecto adonde se movió
+
+#### Escenario: dos notas iguales de otra herramienta
+- GIVEN un export de clawg con dos filas importadas de engram, en dos proyectos, con el mismo texto, el mismo agente y la misma fecha, y distinto origen
+- WHEN se importa en un store vacío
+- THEN quedan las dos, cada una en su proyecto
+
+**Tests:** `an_export_imported_again_after_a_move_adds_nothing` y `two_rows_alike_from_two_origins_stay_two` (`import.rs`); la fila de `PRESENT_ELSEWHERE_SQL` en `the_import_lookups_seek_an_index` y los casos nuevos de `the_planner_decides_as_the_sql_pass` (`import.rs`).
+
+## PL63. El diario y el `--undo`
+
+En la misma transacción que cada escritura, el import MUST anotar en `memory_import_registry`:
+
+| `kind` | `a` | `b` | `value` |
+|---|---|---|---|
+| `project` | el proyecto que creó | — | su nombre |
+| `revived` | el proyecto borrado que hizo volver | — | el `deleted_at` que tenía |
+| `suggestion` | `project_id` de la sugerencia que insertó | `other_id` | su motivo |
+| `subfolder` | el repositorio de la declaración que escribió | su subcamino | el proyecto al que la hizo llevar |
+
+`clawg import --undo N` MUST, después de retirar las filas, las carpetas y los remotos como hoy (IU2), y en la misma transacción:
+
+1. borrar cada declaración anotada que sigue llevando al proyecto que escribió N;
+2. borrar cada sugerencia anotada que sigue sin respuesta;
+3. dejar otra vez borrado, con su `deleted_at`, cada proyecto anotado como vuelto que sigue vivo, sin revisar y sin filas vivas en las tres tablas, cuyo borrado con ese `deleted_at` sigue abierto;
+4. borrar cada proyecto anotado como creado al que ya nada nombra: ninguna fila de las tres tablas en ningún estado, ninguna carpeta, remoto ni declaración, ninguna lápida que lleve a él, ninguna sugerencia, ningún diario de unión ni de borrado y ninguna fila de `synthesis_review`; que no es una lápida y sigue sin revisar.
+
+Lo que queda MUST nombrarse en el reporte con su motivo: `in_use` (lo nombra algo), `answered` (una sugerencia respondida), `reviewed` (un proyecto renombrado o revisado) o `changed` (una declaración que ya lleva a otro). Lo que se retiró sale del diario, y lo que quedó se vuelve a pesar en el próximo `--undo`, así un segundo `--undo` no cambia nada. Una prueba en seco MUST reportar lo mismo sin escribir. Un import anterior a V31 no tiene estas anotaciones: lo que agregó al registro queda, como antes.
+
+#### Escenario: importar y deshacer
+- GIVEN un store vacío y un export con un proyecto sin carpeta, un monorepo con su declaración, un nombre parecido a uno de acá y una lápida de la fuente
+- WHEN se importa y se deshace
+- THEN `project`, `project_path`, `project_remote`, `project_suggestion` y `project_subfolder` quedan como antes de importar
+
+#### Escenario: lo que se usó después
+- GIVEN el mismo import, y después un save en uno de los proyectos que creó, la respuesta `apart` a su sugerencia y el renombre de otro de sus proyectos
+- WHEN se deshace el import
+- THEN quedan el proyecto con el save (`in_use`), la sugerencia respondida (`answered`) y el renombrado (`reviewed`), y el reporte los nombra
+
+**Tests:** `undoing_an_import_takes_back_what_it_added_to_the_registry`, `what_an_import_added_to_the_registry_stays_once_used` y `undoing_an_import_deletes_again_the_project_it_brought_back` (`crates/clawg-core/src/memory/portability/undo.rs`); `an_undo_twice_changes_nothing_the_second_time` y `a_dry_run_undo_reports_without_writing` siguen pasando.
+
+## PL64. Lo que dicen `clawg export` y `clawg import`
+
+- El reporte de un import (`ImportReport`) MUST sumar, con `#[serde(default)]`:
+  - `projects`: cada proyecto del archivo, con su id, su nombre, el proyecto adonde fue, el paso de PL56 que lo decidió (`map`, `remote`, `id`, `name`, `path` o `new`), y si el import lo creó o lo hizo volver;
+  - `suggestions`, que dejó o dejaría;
+  - `subfolders`: las declaraciones escritas y las que no, con su motivo;
+  - `present_elsewhere`, por proyecto de acá (PL62).
+- El reporte de un `--undo` (`UndoReport`) MUST sumar `registry`: los proyectos borrados, los que volvieron a borrarse, las sugerencias y las declaraciones retiradas, y lo que quedó con su motivo (PL63).
+- `clawg import` y `clawg import --undo` MUST imprimirlos en el idioma de la preferencia, con una sentencia por `match` sobre `Lang`. Con proyectos nuevos o sugerencias, la salida MUST terminar con `clawg projects list`, que los muestra.
+- `clawg export` MUST contar en su salida los proyectos del archivo y decir cuántos van sin carpeta.
+
+**Tests:** `an_import_report_names_where_each_project_went` y `render_undo_names_what_it_took_back_from_the_registry`, en los dos idiomas (`crates/clawg-cli/src/import.rs`); `an_export_counts_its_projects` (`crates/clawg-cli/src/export.rs`).
+
+## PL65. Lo que no cambia en la entrega 4
+
+- La versión del formato, el encabezado y las líneas `memory`, `derivation`, `piece` y `conflict`. `--format markdown`.
+- Lo que hace el import con cada fila: el enmascarado, el texto vivo y la clave de su proyecto (R5 de `specs/portability`), sin detector, y las reglas de las notas de otra herramienta (HI11, HI12).
+- `memory_import_extra`, su `CHECK` y lo que retira su `--undo` (IU2 a IU4).
+- El import nunca une, separa ni renombra proyectos, ni mueve filas que ya estaban acá.
+- El contrato del modelo: ninguna herramienta, argumento ni descripción cambia.
+- `doctor`: ningún chequeo nuevo. Los proyectos que crea un import salen en `project_duplicates` por su nombre, como cualquier otro.
+
+**Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin volver a bendecir, y los de `specs/portability` y PL1 a PL52.

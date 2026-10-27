@@ -8,7 +8,7 @@ Este diseño resuelve la **entrega 1** de la [propuesta](proposal.md#1-el-regist
 - la integridad referencial (D7);
 - el nombre (D8).
 
-Las demás esperan a su entrega (al final). Los requisitos están en la [spec](spec.md). La [entrega 2a](#entrega-2a-unir-proyectos) (D15 a D25), la [2b](#entrega-2b-borrar-proyectos) (D26 a D37), la [3a](#entrega-3a-proyectos-sin-carpeta-y-el-agente) (D38 a D49) y la [3b](#entrega-3b-los-subproyectos-de-un-monorepo) (D50 a D59) están después de las decisiones de la entrega 1.
+Las demás esperan a su entrega (al final). Los requisitos están en la [spec](spec.md). La [entrega 2a](#entrega-2a-unir-proyectos) (D15 a D25), la [2b](#entrega-2b-borrar-proyectos) (D26 a D37), la [3a](#entrega-3a-proyectos-sin-carpeta-y-el-agente) (D38 a D49), la [3b](#entrega-3b-los-subproyectos-de-un-monorepo) (D50 a D59) y la [4](#entrega-4-exportar-e-importar) (D60 a D70) están después de las decisiones de la entrega 1.
 
 ## El modelo
 
@@ -286,11 +286,11 @@ Lo que la entrega 3 suma encima:
 | Decisión abierta de la propuesta | Entrega |
 |---|---|
 | El archivo marcador | Ninguna: sigue fuera de alcance |
-| Volver a importar un export de clawg después de un movimiento simple | 4 |
+| Volver a importar un export de clawg después de un movimiento simple | 4 ([D65](#d65-importar-otra-vez-después-de-un-movimiento-la-fila-está-en-cualquier-proyecto)) |
 | Una búsqueda cuando el cwd no resuelve a ningún proyecto | 3a ([D44](#d44-el-argumento-en-el-puente-y-las-búsquedas-sin-proyecto)) |
 | Cómo responde el agente una sugerencia, y si unir exige `user_answered` | 3a ([D45](#d45-el-agente-responde-una-sugerencia-con-answer_suggestion)); la respuesta por CLI es de la 2a, D22 |
 | Un save bajo el id de un proyecto borrado | 2b ([D27](#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)) |
-| Los tipos nuevos de `memory_import_extra` | 4 |
+| Los tipos nuevos de `memory_import_extra` | 4: una tabla nueva, `memory_import_registry` ([D69](#d69-v31-una-tabla-de-diario-nueva-y-un-índice-por-fecha)) |
 | Los subproyectos de un monorepo y las carpetas sin VCS | las carpetas sin VCS, 3a (D46, D48); los subproyectos, 3b ([D50 a D59](#entrega-3b-los-subproyectos-de-un-monorepo)) |
 
 # Entrega 2a: unir proyectos
@@ -985,3 +985,234 @@ Una fila de `memory` no guarda el camino desde el que se guardó: sólo su proye
   Desde ahí, lo que se guarde desde una subcarpeta va al proyecto del repositorio. Lo guardado en un subproyecto queda bajo su id: se alcanza con `project` o con `all_projects`, o se une con `projects merge`.
 - **Una declaración.** Se quita nombrando el proyecto del repositorio (D57). Lo guardado en el subproyecto queda ahí, y `projects merge X --into P` lo devuelve, con su `--undo`.
 - **Una declaración que unió un proyecto** (D57). Con `clawg projects merge --undo N`.
+
+# Entrega 4: exportar e importar
+
+Esta parte resuelve la **entrega 4** de la [propuesta](proposal.md#4-exportar-e-importar): la línea `project` con el nombre, los localizadores, la lápida y las declaraciones de un proyecto; el orden en que el import decide adónde va cada proyecto del archivo; `--project-map NOMBRE=project:REF`; las tres preguntas que la propuesta dejó abiertas, y el diario de lo que un import agrega al registro. Los requisitos están en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65). Depende de la 3b: V31 sigue a su V30, y el import usa su camino crudo.
+
+Lo que muestra el código cambia la propuesta en tres puntos:
+
+- **Hoy un proyecto puede viajar sin su línea.** El export escribe una línea por carpeta cuyo id es el proyecto de alguna fila exportada (`crates/clawg-core/src/memory/portability/export.rs:136-142`). Desde V27, el proyecto de un clone, el de un checkout movido, uno unido con otro y uno sin carpeta no tienen ninguna carpeta con su id. Sus filas viajan sólo con el id (`crates/clawg-core/src/memory/portability/import.rs:370`), y en el destino las adopta el disparador de PL2, con el nombre que da el id. Por eso la línea pasa a ser del proyecto y no de una carpeta (D60).
+- **El import hace volver un proyecto borrado con una fila borrada.** Inserta viva cada fila borrada y después la marca, por el índice de texto (`import.rs:675-681`), y el disparador de inserción de V29 la ve viva (`crates/clawg-core/migrations/V29__project_delete.sql:63-64`). PL22 dice que insertar una fila ya borrada no hace volver a nadie. Se arregla en el import (D66).
+- **Una sugerencia que el import no deja no aparece nunca.** PL5, PL6 y PL38 miran sólo un camino nuevo o contradicho (`plan_in`, `crates/clawg-core/src/memory/project.rs:656-703`). Una carpeta que grabó el import ya no es nueva para el próximo registro: la copia o el remoto cambiado que registra un import se quedan sin su sugerencia para siempre. Por eso el import pasa a dejarlas (D64).
+
+## D60. Una línea `project` por proyecto, en la versión 1 del formato
+
+```json
+{"kind":"project","id":"app-1a2b","root_path":"/work/app","name":"App web","folders":[{"root_path":"/work/app","remote":"github.com/acme/app","root_commit":"c1…"},{"root_path":"/review/app","remote":"github.com/acme/app","root_commit":"c1…"}],"remotes":["github.com/acme/app"]}
+{"kind":"project","id":"ideas-de-producto-3c4d","name":"Ideas de producto"}
+{"kind":"project","id":"app-old-9f8e","name":"app-old","merged_into":"app-1a2b"}
+{"kind":"project","id":"mono-5e6f","root_path":"/work/mono","name":"mono","folders":[…],"remotes":["github.com/acme/mono"],"subfolders":[{"subpath":"apps/web","project_id":"web-7a8b"}]}
+```
+
+- **`id` es el del proyecto.** Un lector de antes mapea las filas de ese id a lo que un registro le da a `root_path` (`prepare`, `import.rs:324-334`), así que lee mejor que hoy: hoy el proyecto de un clone no tenía línea.
+- **`root_path` es la carpeta más vieja**, la que registra un lector de antes. Un proyecto sin carpeta no lo lleva.
+- **Las huellas van por carpeta.** Un proyecto tiene varias carpetas y varios remotos (D2), y un camino puede tener varios repositorios (R20). `remotes` va aparte porque un remoto atado no siempre es el de una carpeta: el de una carpeta fundida de antes de V27 (D2) o el que entró con una unión.
+- **Lo que no viaja.** `git_stamp` e `index_docs` son de esta máquina. `born`, `reviewed` y `created_at` cuentan lo que pasó en el store de origen: acá el proyecto lo crea un import, sin revisar (D63). `deleted_at`, en D61.
+- **Lo vacío no se escribe** (`skip_serializing_if`). Así, el ejemplo fijado del formato (`crates/clawg-core/src/memory/portability/format.rs:301-314`) y la línea de un store anterior a V27 salen igual que hoy.
+
+**La versión.** R1 de `specs/portability` pide subir `version` ante un cambio que un lector de la versión 1 leería mal. Un lector de antes (0.63.0 o anterior) ignora los campos nuevos (`unknown_fields_are_ignored`, `format.rs:354-360`). Una línea sin `root_path` no la lee mal: la reporta entre las líneas que no importó (`read_line`, `format.rs:224-237`) y deja las filas de ese proyecto con su id, que es lo que hacía con un proyecto sin línea. Subir a 2 haría que ese lector rechace el archivo entero (`FormatError::UnknownVersion`, `format.rs:181-182`).
+
+| Alternativa | Por qué no |
+|---|---|
+| Subir el formato a la versión 2 | Un lector de antes rechaza el archivo entero, por no leer bien una línea que hoy ni siquiera existe |
+| Seguir con una línea por carpeta, y un tipo de línea nuevo para lo demás | El proyecto queda repartido en dos tipos de línea, y un lector de antes reporta igual el tipo nuevo (`unknown kind`, `format.rs:227-229`) |
+| Los proyectos en el encabezado | Un lector de antes los ignoraría sin reportar nada, pero el encabezado dice qué es el archivo (formato, versión, filtro), no el registro de un store con cientos de proyectos. Y el import lee las líneas, no el encabezado, para saber adónde va cada fila |
+| Una sola huella por proyecto (`remote`, `root_commit`), como decía la propuesta | Un clone y una unión le dan a un proyecto varias carpetas y varios remotos (D2). Una sola huella obligaría a elegir una sin regla |
+
+## D61. Qué proyectos llevan línea, y `deleted_at` no viaja
+
+La línea de un proyecto sale cuando alguna fila exportada es suya, y además en tres casos sin filas:
+
+- **Las lápidas que llevan a un proyecto exportado.** Un store que todavía tiene separados X y Z se entera de que la fuente los unió (D64). En un store sano no hay filas bajo una lápida (D17), así que su línea no lleva ninguna.
+- **El repositorio de una declaración que lleva a un proyecto exportado.** La declaración es un dato del repositorio (D51), y sin su línea, `clawg export --project` desde `apps/web` la perdería.
+- **El subproyecto de una declaración de un repositorio exportado.** Sin su línea, la declaración no tendría adónde llevar en el destino (D67).
+
+**`deleted_at` no viaja** (la tercera pregunta de la propuesta). Un borrado es un acto de este store, con su diario: `project_delete`, su código, su snapshot y las filas de su conjunto (D28). Un archivo no puede traer ese diario. Marcar borrado un proyecto sin él dejaría un borrado que `deletes` no lista, sin `--undo` ni purga. Las filas sí traen su propio `deleted_at`. Con `--include-deleted`, el destino recibe un proyecto vivo que sólo tiene filas borradas, o sea vacío (PL23), y `clawg projects delete` lo borra al momento.
+
+| Alternativa | Por qué no |
+|---|---|
+| Que `deleted_at` viaje y el import marque el proyecto borrado | Un borrado sin diario: `deletes` no lo lista, no tiene `--undo` ni purga, y `doctor` no lo puede nombrar |
+| Que `deleted_at` viaje y el import escriba un borrado propio | Un borrado que nadie confirmó, con el código de un conjunto que nadie vio (D29) |
+| Sólo las líneas de los proyectos con filas | No viajarían las lápidas ni las declaraciones de un monorepo |
+
+## D62. Adónde va cada proyecto del archivo: el mapa, el remoto, el id, el nombre y el camino
+
+Hoy el import decide sólo por el camino: registra en el plan la raíz de cada línea, o la de `--map-root` (`roots_here`, `import.rs:235-244`), y el plan lee el checkout de ese camino en este disco (`plan_ids_in`, `project.rs:549`). En otra máquina ese camino no existe, así que no hay remoto: un clone del mismo repositorio en otro camino abre un proyecto nuevo. Y en esta máquina, el mismo camino puede tener hoy otro repositorio (R20) y recibir las filas del de antes.
+
+El orden (PL56), con lo que justifica cada paso:
+
+1. **El mapa.** La persona nombra la carpeta de acá, como hoy. Un registro de NEW lee sus propios localizadores.
+2. **El remoto.** Es el localizador que vale en cualquier máquina (D2, R16).
+3. **El id.** Viene del mismo store, o es uno que ya viajó. Va por `canonical`, así que la lápida de una unión de acá lleva a su destino: es el test de la propuesta de un export hecho antes de una unión. Va antes que el camino porque el mismo camino puede tener otro repositorio mientras el id sigue nombrando el proyecto de antes.
+4. **El nombre**, sólo cuando ningún lado tiene huellas. Para un proyecto sin carpeta ni remoto, el nombre es todo lo que tiene (PL32). Pero los nombres que da una carpeta (`api`, `web`, `docs`) se repiten entre proyectos distintos (D8). Si un lado tiene huellas y el otro no, el nombre no alcanza para unirlos: queda separado, con la sugerencia de D64. Un proyecto borrado no se elige por nombre, porque su nombre quedó libre (PL27).
+5. **El camino**, el último, como hoy.
+6. **Uno nuevo** (D63).
+
+En los pasos 3 a 5, el proyecto del archivo no puede contradecir al de acá. La regla es la de `fit` (`project.rs:167-177`) sobre conjuntos, el remoto antes que el primer commit (D4). Una línea sin filas no crea proyectos: una lápida que no está acá no tiene nada que separar, y un repositorio sin filas sólo sirve para escribir su declaración.
+
+**Lo que decide es puro.** `place(proyecto del archivo, registro, planes)` vive en un módulo nuevo, `crates/clawg-core/src/memory/portability/projects.rs`, con la lectura del registro. Se lee una vez por pasada del plan, en la misma llamada que `plan_ids_in`, como lo lee `stored_in` para `projects list` (`crates/clawg-core/src/memory/registry.rs:142`): tres tablas chicas, cuatro con `project_subfolder`. IL1 de `specs/portability` pide índices para lo que se busca por fila o por proyecto, y esto es una lectura por import. La transacción que escribe sigue `canonical` en cada fila, como hoy (`SqlSeat::live`, `import.rs:602-604`).
+
+| Alternativa | Por qué no |
+|---|---|
+| El camino primero, como hoy (R4 de `specs/portability`) | En otra máquina el camino no existe, y en esta puede tener otro repositorio |
+| El id primero | Un id sale del hash de un camino (`derive_project_id`): el mismo id en dos stores puede ser el mismo camino con otro repositorio. El remoto dice cuál es |
+| El nombre aunque un lado tenga huellas | `api` de un repositorio y `api` de una carpeta sin git se unirían por un nombre que nadie eligió |
+| Unir por el primer commit | Un fork y una copia lo comparten (D1, decisión 7 de la propuesta). Sólo vincula una mudanza (PL5) |
+| Rechazar las filas de un proyecto que no se puede decidir | El import no puede preguntar. Separado y con una sugerencia, se arregla con una unión que tiene `--undo`; rechazado, obliga a editar el archivo |
+
+## D63. Lo que se registra de un proyecto del archivo
+
+- **Un proyecto nuevo conserva el id del archivo** cuando nadie lo tiene, ni en `project` ni en `project_path` (la comprobación de D40). Así, una vuelta por id sigue valiendo, y las filas que viajan sin línea (PL55) lo encuentran. Si el id está tomado, recibe `new_project_id` de su nombre. Su nombre es el del archivo. Hoy `record_projects` lo crea con el nombre que da el id (`import.rs:1251-1254`), y no lo anota en el diario.
+- **Una carpeta de otra máquina** se graba con las huellas que trae el archivo, sin marca, y lleva al proyecto que decidió D62. Hoy se graba con lo que el plan leyó en este disco (`record_projects`, `import.rs:1242-1249`), que para un camino que no existe es nada. Con su primer commit, un checkout sin `origin` del mismo repositorio que se registre acá después es una mudanza (PL5) y llega a su proyecto. Y `projects list` muestra dónde vive el proyecto en otra máquina: el `root_path` informativo de la propuesta.
+- **Una carpeta que existe acá** se graba como lo haría un registro (D12). Si su checkout contradice al proyecto del archivo, es otro repositorio y no se graba.
+- **Cada remoto** del proyecto del archivo que nadie ata acá se ata al proyecto al que fue, así un clone que llegue después cae en él (R16). Hoy `record_projects` sólo ata el remoto que leyó en este disco (`import.rs:1257-1265`).
+
+| Alternativa | Por qué no |
+|---|---|
+| No grabar las carpetas de otra máquina | Un checkout sin `origin` clonado acá después no tendría con qué llegar a su proyecto: PL5 necesita una carpeta con su primer commit cuyo checkout ya no está |
+| Grabarlas con el proyecto de su plan, como hoy | En otra máquina el plan no lee huellas, así que la carpeta llevaría a un proyecto nuevo con su propio id, distinto del que decidieron el remoto, el id o el nombre |
+| Un id nuevo para cada proyecto creado | La vuelta por id dejaría de valer, y las filas que viajan sin línea no lo encontrarían |
+
+## D64. El import deja sugerencias, y las anota
+
+La segunda pregunta de la propuesta. Cambia D10 y D12. D10 dejó afuera al import porque V26 no podía anotar sus sugerencias en su diario, y un `--undo` las habría dejado colgando. V31 las puede anotar (D69), y el `--undo` las retira mientras nadie las responda (D70).
+
+**Cuáles deja** (PL58):
+
+- **Las de un registro**, de cada carpeta que graba y existe acá: `root_commit`, `remote_changed` y `folder_name`. `plan_ids_in` (`project.rs:545-594`) pasa a devolver las que calcula `plan_in` (`project.rs:669-703`), con las mismas lecturas del disco: los checkouts grabados de los proyectos con ese nombre se miran por `ReadAhead`, como los de una mudanza.
+- **`similar_name`.** El nombre de un proyecto del archivo se parece al de uno de acá, y no decidió el paso 4 de D62. Es la evidencia débil de la decisión 3 de la propuesta, la misma que lleva a un agente a preguntar (PL32).
+- **`merged_at_source`.** La fuente tiene unidos dos proyectos que acá están separados: por una lápida del archivo, o por los remotos de un solo proyecto del archivo que acá llevan a dos.
+
+Los motivos son dos valores nuevos de `project_suggestion.reason`, que no lleva `CHECK` (`V27__project_registry.sql:40-47`). Se dicen con palabras en los tres lugares que hoy dicen los demás: `suggestion_reason` (`crates/clawg-cli/src/mcp/tools.rs:755-765`), `reason` (`crates/clawg-cli/src/projects.rs:125-135`) y `candidate_reason` (`projects.rs:339-349`). Este último tampoco dice hoy `folder_name` con palabras, y lo suma.
+
+| Alternativa | Por qué no |
+|---|---|
+| Que el import no deje sugerencias, como hoy | La copia o el remoto cambiado que registra un import se quedan sin sugerencia para siempre, y no se ven ni un nombre parecido ni una unión de la fuente |
+| Unir lo que la fuente unió | Es una decisión que la persona tomó en otro store. Acá puede tener razones para separarlos, y unir mueve un proyecto entero. «Ante la duda, separado» (decisión 3 de la propuesta) |
+| Sólo las sugerencias propias del import | El plan ya calcula las de un registro. Dejarlas afuera repite el hueco de hoy |
+
+## D65. Importar otra vez después de un movimiento: la fila está en cualquier proyecto
+
+La primera pregunta de la propuesta. Hoy una fila está presente si coinciden su agente, su proyecto, su hash y su fecha (`PRESENT_SQL`, `import.rs:1166-1169`). Después de `projects move`, el proyecto ya no coincide, y la fila entra otra vez en el proyecto de la línea.
+
+Se elige buscarla en cualquier proyecto, por agente, hash, fecha y `created_by_ref`, y sólo para las filas de un export de clawg:
+
+- **`created_by_ref`** es el agente que guardó la fila (`crates/clawg-core/src/memory/store_insert.rs:231`), y ni un movimiento ni una unión lo cambian. Una fila que vino de otra herramienta lleva su origen (`engram:<sync_id>`, HI7). Así se separa justo el caso que temía la propuesta: dos notas con el mismo texto y la misma fecha en dos proyectos de la fuente tienen dos orígenes.
+- **Sólo clawg**, porque a una nota de otra herramienta ya la encuentra su origen, donde esté (HI11).
+- **El índice** es `idx_memory_created_at`, sobre la fecha sola. Las filas que comparten un milisegundo son las piezas de un save, o notas de otra herramienta del mismo segundo, y lo demás se filtra encima. `idx_memory_agent_created` (`crates/clawg-core/migrations/V18__session_indexes.sql:13-15`) no sirve, porque es parcial y sólo tiene filas vivas: una fila movida y después borrada tiene que contar como presente, porque un import nunca trae de vuelta lo que el usuario borró (HI11).
+- **El planificador** carga esas filas por fecha, en llamadas de `LOAD_BATCH` como las demás (ID1), y decide lo mismo que la pasada SQL (ID2).
+
+**El riesgo** es una fila que la fuente tiene dos veces, con los cuatro campos iguales, en dos proyectos: acá queda una sola, en el primero. Hoy sólo el bug de esta pregunta produce esa forma. Importarla en otro store la arregla, y no pierde texto: la fila queda donde está.
+
+| Alternativa | Por qué no |
+|---|---|
+| Aceptarlo, como hoy | Cada vuelta de un export a un store donde algo se movió duplica esas memorias. Entre dos máquinas que se sincronizan, cada movimiento |
+| Buscar por el registro de movimientos de este store (`memory_move`) | No tiene falsos positivos, pero un movimiento hecho en el otro store duplica igual, y `memory_move` no tiene índice por proyecto de origen (`V21__memory_move.sql:21`) |
+| Buscar en cualquier proyecto sin `created_by_ref` | Dos notas de otra herramienta con el mismo texto y la misma fecha, en dos proyectos de la fuente, quedarían en una |
+| Un índice sobre `(content_hash, created_at)` | El hash ocupa 64 caracteres por fila, en cada save. La fecha sola ya deja pocas filas por clave |
+
+## D66. Un proyecto borrado: una fila viva lo hace volver, y una borrada no
+
+La tercera pregunta de la propuesta tiene tres partes:
+
+- **`deleted_at` no viaja** (D61).
+- **Una fila viva lo hace volver.** Si un proyecto del archivo llega por remoto, id o camino a un proyecto borrado de acá, sus filas vivas lo hacen volver, como cualquier escritor (D27): el mismo checkout lleva al mismo proyecto. El import lo anota (`revived`, D69) para que su `--undo` lo deje borrado otra vez, y su borrado sigue abierto con `back` mientras tanto (PL27).
+- **`--project-map NOMBRE=project:ID` de un proyecto borrado responde 409 `project_deleted`**, como el destino de un movimiento (D35): la persona nombró un proyecto que para ella no existe.
+
+Es la división que fijó la entrega 2b: nombrar un proyecto borrado se rechaza, usarlo lo hace volver.
+
+**El arreglo.** Una fila que llega borrada no hace volver a su proyecto. El disparador no puede saberlo: cuando se inserta la fila, todavía no está marcada. Y marcarla antes de insertarla deja su texto en el índice, porque el disparador de inserción de V8 no mira `deleted_at`, y después el de borrado definitivo no lo resta (`crates/clawg-core/migrations/V8__memory_fts.sql:58-66`). Por eso, `SqlSeat::insert` lee el `deleted_at` y el `reviewed` del proyecto antes de insertar una fila borrada, y los deja como estaban después de marcarla. Es el único escritor que inserta viva una fila para borrarla (`import.rs:675-681`). D27 eligió disparadores para hacer volver un proyecto, porque olvidarse de un escritor deja una fila viva fuera de toda lista. Este caso es al revés, y sólo hay un escritor que lo necesita.
+
+| Alternativa | Por qué no |
+|---|---|
+| Que una fila del import no haga volver un proyecto borrado | Las filas vivas del mismo checkout quedarían bajo un proyecto que no se lista. Es lo que D27 descartó |
+| Un proyecto nuevo cuando el de acá está borrado | Dos proyectos para el mismo remoto o la misma carpeta |
+| Arreglarlo en el disparador | Al insertar, la fila todavía no está marcada, y marcarla antes deja su texto en el índice (V8) |
+
+## D67. Las declaraciones viajan en la línea de su repositorio
+
+Una declaración es del proyecto del repositorio, no de un remoto (D51), así que viaja en su línea: (`subpath`, W). El import la escribe con los proyectos de acá, P' y W', cuando la clave (P', `subpath`) está libre, y la anota (D69). Una declaración de acá con la misma clave queda, aunque lleve a otro proyecto: la escribió la persona en esta máquina. Escribirla no une ni mueve nada (D56).
+
+El subproyecto W se crea si hace falta, aunque no traiga filas: es la única línea sin filas que crea un proyecto (D62), porque la declaración sin su destino no dice nada.
+
+Las declaraciones no pueden ir a `memory_import_extra`, porque su `CHECK` no tiene ese tipo (`crates/clawg-core/migrations/V26__import_journal.sql:60`).
+
+| Alternativa | Por qué no |
+|---|---|
+| Una línea propia por declaración | Un lector de antes reporta cada una como inválida, y una declaración es un dato del repositorio (D51) |
+| Reemplazar la declaración de acá | La escribió la persona en esta máquina, y reemplazarla cambia adónde va lo que se guarda desde esa carpeta |
+| La clave por remoto en el archivo | Lo descartó D51: un repositorio sin `origin`, o con el remoto cambiado, no tendría subproyectos |
+
+## D68. `--project-map NOMBRE=project:REF` y los caminos crudos
+
+**La referencia.** Se resuelve como el destino de un movimiento (D47), con `find_project` (`registry.rs:871-888`): primero como id, después como el nombre de un solo proyecto vivo. No crea nada ni busca parecidos. Lo que no es ninguno da 404, lo que tienen dos o más da 409 `project_ambiguous`, y uno borrado da 409 `project_deleted` (D66). Todo eso se comprueba antes de leer el archivo. La lápida se sigue en la transacción que escribe (`SqlSeat::live`), como la sigue `target_in` en un movimiento. `MappedProject::root` (`crates/clawg-core/src/memory/portability/translate.rs:43-47`) pasa a ser opcional, y la traducción sólo escribe una línea `project` por una raíz (`translate.rs:641-646`).
+
+**Los caminos crudos.** La 3b dejó el import como estaba: `--project-map NOMBRE=CAMINO` toma la raíz de CAMINO, y el import no manda el camino crudo (D59; PL47: «el import es de la entrega 4»). Se decide que lo mande, para `--project-map NOMBRE=CAMINO` y para `--map-root OLD=NEW`. `clawg projects move --to CAMINO` ya lleva a un subproyecto (PL47), y es raro que el mismo camino lleve a dos lugares según el comando. El CLI resuelve la raíz como hoy (`crates/clawg-cli/src/import.rs:60-62`) y manda las dos cosas.
+
+**El cuerpo.** `ImportRequest` (`crates/clawg-cli/src/daemon/api.rs:1940-1959`) espera pares de dos textos, y no rechaza los campos que no conoce. Un campo nuevo pasaría en silencio por un daemon anterior, que guardaría las notas sin proyecto. Y un camino crudo en lugar de la raíz lo registraría como una raíz. Con un objeto como destino (`{"root", "path"}` o `{"project"}`), un daemon anterior rechaza el cuerpo sin escribir nada. Uno nuevo acepta además un texto, de un CLI anterior.
+
+**Partir el argumento.** Por el último `=project:`, y si no lo hay, por el último `=`, como hoy (`crates/clawg-cli/src/cli.rs:339-346`). Un camino que contiene `=project:` se escribe con `./`.
+
+| Alternativa | Por qué no |
+|---|---|
+| Crear el proyecto si el nombre no existe | Un nombre mal escrito crearía un proyecto vacío. `clawg projects create` busca parecidos antes (PL39) |
+| Un campo nuevo en el cuerpo, al lado de `project_map` | Un daemon anterior lo ignora sin error y guarda las notas sin proyecto |
+| Seguir mandando la raíz de CAMINO | Un CAMINO dentro de una subcarpeta declarada iría al repositorio, mientras `projects move --to` con el mismo CAMINO va al subproyecto |
+| `project:` también en `--map-root` | Un proyecto del archivo ya va por su remoto, su id o su nombre (D62). El mapa es para la carpeta que cambió de lugar |
+
+## D69. V31: una tabla de diario nueva y un índice por fecha
+
+La pregunta de la propuesta sobre «los tipos nuevos de `memory_import_extra`». Se elige una tabla nueva, `memory_import_registry` (`import_id`, `kind`, `a`, `b`, `value`), sin `CHECK`, como `project_merge_change` (`crates/clawg-core/migrations/V28__project_merge.sql:32-37`). En `memory_import_extra`, el tipo `project` sigue queriendo decir «una carpeta que el import grabó» (D1), y `remote`, un remoto.
+
+Sus columnas son texto, porque lo que anota son ids de proyecto y subcaminos. En `memory_import_extra`, `a` es un entero (`V26__import_journal.sql:61`), porque guarda el id de una fila.
+
+V31 crea también `idx_memory_created_at` (D65). El test de la migración siembra un store en V30, con un import anotado, y comprueba que abre sin cambiar ninguna fila y que ese import se deshace como antes (PL53).
+
+| Alternativa | Por qué no |
+|---|---|
+| Reconstruir `memory_import_extra` sin el `CHECK` | No es aditiva: la migración copia el diario de cada import. Y su `a` es un entero, que no guarda un id de proyecto |
+| Una tabla por tipo, como `project_delete_row` (D28) | El `--undo` busca por import, no por fila. Serían cuatro tablas para unas pocas filas por import |
+| Anotar en `project_merge_change` | Es el diario de las uniones, y mezclaría los dos `--undo` |
+
+## D70. Lo que deshace `--undo`
+
+Va en la última transacción del `--undo`, después de las filas, las carpetas y los remotos (IU2), en este orden: las declaraciones, las sugerencias, los proyectos que volvieron y los que creó. Un proyecto que creó el import sólo queda libre cuando ya se fueron sus filas, sus carpetas, sus remotos, sus declaraciones y sus sugerencias.
+
+Cada cosa se retira sólo si sigue como la dejó el import (PL63):
+
+- **Una declaración**, si todavía lleva al proyecto que escribió el import. La persona puede haberla declarado otra vez.
+- **Una sugerencia**, si nadie la respondió. Una respuesta es de la persona.
+- **Un proyecto que volvió** se deja otra vez borrado si sigue vivo, sin revisar y sin filas vivas, y si su borrado con ese `deleted_at` sigue abierto. Si después se deshizo ese borrado, el proyecto tiene que quedar vivo.
+- **Un proyecto que creó** se borra si ya nada lo nombra y sigue sin revisar. Un `rename` lo marca revisado (D11).
+
+Un remoto que el import ató a un proyecto que ya estaba sigue la regla de IU2: se retira sólo si no quedan filas bajo su proyecto, porque un registro posterior puede depender de él.
+
+La decisión es pura, sobre lo que se leyó, como `decide` (`crates/clawg-core/src/memory/portability/undo.rs:284`). Lo que queda se nombra en el reporte, con su motivo.
+
+| Alternativa | Por qué no |
+|---|---|
+| Borrar siempre lo que creó el import | Se llevaría un proyecto que recibió saves después, o la respuesta de la persona a una sugerencia |
+| Dejar todo, como hoy (D12) | El `--undo` dejaría proyectos `import` vacíos y sugerencias colgando, que la sesión muestra (PL36) |
+
+## Costos en el camino caliente de la entrega 4
+
+- **Cada save** suma una entrada en `idx_memory_created_at`: la fecha y el rowid. Es el único costo fuera del export y del import.
+- **El export** lee el registro una vez: cuatro tablas chicas.
+- **El plan de un import** lee el registro una vez por pasada y decide en puro. Por cada carpeta que graba y existe acá, suma lo que ya lee un registro para sus sugerencias: un `stat` por checkout grabado de los proyectos con ese nombre o ese primer commit.
+- **Cada fila de un export de clawg** que no está en su proyecto suma una búsqueda por `idx_memory_created_at`. En un store vacío son todas, por índice.
+- **La migración** construye el índice una vez, con un recorrido de `memory`.
+
+## Volver atrás de la entrega 4
+
+- **El esquema.** Un binario anterior rechaza un store en V31 sin tocarlo (`SchemaNewer`), y la vuelta atrás es su snapshot `pre-migration`. Para quitar V31 a mano, con el daemon parado:
+
+  ```sql
+  DROP INDEX idx_memory_created_at;
+  DROP TABLE memory_import_registry;
+  DELETE FROM refinery_schema_history WHERE version = 31;
+  ```
+
+  Lo que un import agregó al registro queda, y el `--undo` de un binario anterior ya no lo retira: los proyectos que creó se borran con `clawg projects delete` (vacíos, al momento), y sus sugerencias se responden.
+- **Un import.** Con `clawg import --undo N`, o con su snapshot `pre-import`.
+- **El formato.** Un clawg anterior lee un archivo de esta versión: ignora los campos nuevos, reporta las líneas sin `root_path` y deja las filas de esos proyectos con su id, como antes.
