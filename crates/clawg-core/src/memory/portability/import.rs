@@ -2593,6 +2593,10 @@ pub(crate) mod tests {
         fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
             self.disk.recorded_checkout_present(path, stamp)
         }
+
+        fn subpath(&self, root: &Path, path: &Path) -> Option<String> {
+            self.disk.subpath(root, path)
+        }
     }
 
     #[tokio::test]

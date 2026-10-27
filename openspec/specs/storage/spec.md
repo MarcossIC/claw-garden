@@ -22,7 +22,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24 (sólo V25: IL2, su vuelta atrás e IL3). Que la importación llegue a sus filas por índice está en [`specs/portability`](../portability/spec.md) (IL1 e IL5).
 - [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24 (sólo V26, «El diario de los imports», IU6, y el motivo `pre-undo` en la poda). Qué escribe el diario y cómo se deshace un import está en [`specs/portability`](../portability/spec.md) (IU1 a IU5).
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (sólo «Cada carga dice quién la pidió y cuánto costó», RF4 de esa spec). Las series de memoria con que se lee en uso real están en [`specs/metrics`](../metrics/spec.md) (R6 y R8).
-- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (sólo V27, «Los proyectos y sus carpetas», y su vuelta atrás). Qué hace el registro con las tablas nuevas está en [`specs/project`](../project/spec.md) (PL1 a PL10). Su entrega 2a, en la misma versión: V28, «La lápida y el diario de las uniones», su vuelta atrás y el motivo `pre-merge`; qué hacen una unión y su deshacer está en `specs/project` (PL11 a PL20). Su entrega 2b, en la misma versión: V29, «La marca de borrado y su diario», su vuelta atrás y el motivo `pre-delete`; qué hacen borrar un proyecto y su deshacer está en `specs/project` (PL21 a PL31).
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 1, que sale en 0.64.0 (sólo V27, «Los proyectos y sus carpetas», y su vuelta atrás). Qué hace el registro con las tablas nuevas está en [`specs/project`](../project/spec.md) (PL1 a PL10). Su entrega 2a, en la misma versión: V28, «La lápida y el diario de las uniones», su vuelta atrás y el motivo `pre-merge`; qué hacen una unión y su deshacer está en `specs/project` (PL11 a PL20). Su entrega 2b, en la misma versión: V29, «La marca de borrado y su diario», su vuelta atrás y el motivo `pre-delete`; qué hacen borrar un proyecto y su deshacer está en `specs/project` (PL21 a PL31). Su entrega 3b, en la misma versión: V30, «Las subcarpetas declaradas», y su vuelta atrás; qué hacen las declaraciones está en `specs/project` (PL43 a PL52).
 
 ## Definiciones
 
@@ -1075,6 +1075,23 @@ La fila de un proyecto borrado no se borra: sus filas borradas siguen bajo su id
 #### Vuelta atrás de V29
 
 Un binario anterior a V29 MUST NOT abrir una base en V29: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`. Para quitar V29 a mano conservando lo guardado después, primero hay que deshacer cada borrado abierto con `clawg projects delete --undo N`: si no, un proyecto borrado vuelve a listarse, con sus filas borradas y su `index_docs` en 0; y un borrado ya purgado no se deshace, así que su proyecto vuelve a listarse vacío. Después, con un `sqlite3` 3.35 o más nuevo y el daemon parado: `DROP TRIGGER memory_project_restored; DROP TRIGGER memory_project_ai; DROP TRIGGER memory_project_au;` y volver a crear los dos disparadores de V27 con su texto (`V27__project_registry.sql`), `DROP TABLE project_delete_folder; DROP TABLE project_delete_row; DROP TABLE project_delete; ALTER TABLE project DROP COLUMN deleted_at; DELETE FROM refinery_schema_history WHERE version = 29;`. Un borrado solo se revierte con su `--undo` o con su snapshot `pre-delete`; una purga, sólo con un snapshot, que guarda justo el texto que se quería sacar.
+
+## Las subcarpetas declaradas
+
+### PL43. V30
+
+V30 (`crates/clawg-core/migrations/V30__project_subfolder.sql`) MUST crear `project_subfolder` (`parent_id`, `subpath`, `project_id`, `created_at`), con la clave primaria `(parent_id, subpath)` y el índice `idx_project_subfolder_project` por `project_id`. Una fila dice que, en el proyecto `parent_id` de un repositorio, lo que se trabaja dentro de `subpath` (relativo a la cima del checkout, con sus componentes unidos por `/`) va al proyecto `project_id`. Las dos columnas se leen por `canonical`, así que una unión no reescribe ninguna fila. MUST NOT cambiar ninguna fila ni ninguna otra tabla: `project_remote` y `project_path` quedan como están, y un store en V29 abre sin declaraciones, con una copia `pre-migration`. Su checksum MUST quedar fijado con los demás.
+
+#### Escenario: un store anterior
+- GIVEN un store en V29 con proyectos vivos, una lápida, un proyecto borrado con su borrado abierto, dos clones de un remoto, un camino con dos carpetas, filas vivas y borradas en las tres tablas y una sugerencia pendiente
+- WHEN se abre con este clawg
+- THEN hay una copia `pre-migration`, ninguna fila cambió y `project_subfolder` existe y está vacía
+
+**Tests:** `a_database_from_the_previous_version_opens_with_no_subfolder_declared` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(29))`); la fila 30 de `published_migration_checksums_are_pinned` (`migrations.rs`).
+
+#### Vuelta atrás de V30
+
+Un binario anterior a V30 MUST NOT abrir una base en V30: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`. Una declaración no movió filas, así que no hay nada que deshacer antes. Para quitar V30 a mano, con el daemon parado: `DROP TABLE project_subfolder; DELETE FROM refinery_schema_history WHERE version = 30;`. Desde ahí, lo que se guarde desde una subcarpeta va al proyecto del repositorio, y lo guardado en un subproyecto queda bajo su id: se alcanza con `project` o con `all_projects`, o se une con `clawg projects merge`.
 
 ## El idioma de cada fila
 

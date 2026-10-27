@@ -290,3 +290,39 @@ fn the_stamp_of_a_checkout_changes_when_it_is_cloned_again() {
     fs::create_dir_all(&plain).expect("create plain dir");
     assert_eq!(Disk.checkout(&plain).stamp, None, "outside git there is no git directory");
 }
+
+#[test]
+fn a_path_in_a_worktree_has_its_subpath_from_the_worktree() {
+    let (_tmp, base) = canonical_tempdir();
+    git(&base, &["init", "mono"]);
+    let mono = base.join("mono");
+    commit(&mono, "first");
+    git(&mono, &["worktree", "add", "-b", "topic", "../mono-wt"]);
+    let deep = base.join("mono-wt").join("apps").join("web").join("src");
+    fs::create_dir_all(&deep).expect("create apps/web/src");
+    fs::create_dir_all(mono.join("apps").join("web")).expect("create apps/web");
+
+    assert_eq!(Disk.subpath(&mono, &deep).as_deref(), Some("apps/web/src"));
+    assert_eq!(Disk.subpath(&mono, &mono.join("apps").join("web")).as_deref(), Some("apps/web"));
+    assert_eq!(Disk.subpath(&mono, &mono).as_deref(), Some(""), "the top of the checkout");
+    assert_eq!(Disk.subpath(&mono, &base.join("mono-wt")).as_deref(), Some(""), "the top of the worktree");
+    assert_eq!(ProjectIdentity::resolve(&deep).path, deep, "the path the root was found from");
+}
+
+#[test]
+fn a_path_that_does_not_lead_to_its_root_has_no_subpath() {
+    let (_tmp, base) = canonical_tempdir();
+    for repo in ["a", "b"] {
+        git(&base, &["init", repo]);
+    }
+    let src = base.join("b").join("src");
+    fs::create_dir_all(&src).expect("create b/src");
+    let plain = base.join("plain");
+    fs::create_dir_all(&plain).expect("create plain dir");
+
+    assert_eq!(Disk.subpath(&base.join("a"), &src), None, "a path of another repository");
+    assert_eq!(Disk.subpath(&base.join("b"), &src).as_deref(), Some("src"));
+    if resolve_project_root(&base) == base {
+        assert_eq!(Disk.subpath(&plain, &plain), None, "outside git there is no subpath");
+    }
+}

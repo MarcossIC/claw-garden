@@ -412,6 +412,11 @@ pub enum ProjectsAction {
         project: String,
         /// A directory of the folder; its root is found as for a bridge.
         path: PathBuf,
+        /// PATH itself, a subfolder of a repository, leads to PROJECT: what is
+        /// worked on inside it, in every clone, goes there. Naming the
+        /// repository's own project takes the declaration away.
+        #[arg(long)]
+        subfolder: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1622,11 +1627,31 @@ mod tests {
         assert_eq!(
             parse(&["clawg", "projects", "locate", "ideas", "/work/notes"]).command,
             Command::Projects {
-                action: ProjectsAction::Locate { project: "ideas".into(), path: "/work/notes".into(), profile: ProfileArg::default() }
+                action: ProjectsAction::Locate {
+                    project: "ideas".into(),
+                    path: "/work/notes".into(),
+                    subfolder: false,
+                    profile: ProfileArg::default()
+                }
             }
         );
         assert!(Cli::try_parse_from(["clawg", "projects", "create"]).is_err(), "the name is required");
         assert!(Cli::try_parse_from(["clawg", "projects", "locate", "ideas"]).is_err(), "the path is required");
+    }
+
+    #[test]
+    fn projects_locate_takes_subfolder() {
+        assert_eq!(
+            parse(&["clawg", "projects", "locate", "web", "/work/mono/apps/web", "--subfolder"]).command,
+            Command::Projects {
+                action: ProjectsAction::Locate {
+                    project: "web".into(),
+                    path: "/work/mono/apps/web".into(),
+                    subfolder: true,
+                    profile: ProfileArg::default()
+                }
+            }
+        );
     }
 
     #[test]

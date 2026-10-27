@@ -40,20 +40,24 @@ pub fn is_candidate_for(root: &Path, id: &str) -> bool {
 }
 
 /// A project as the store keys it: the root every path inside it resolves to,
-/// the id derived from that root, and the id the same path had before paths
-/// were resolved, which rows saved back then still carry.
+/// the id derived from that root, the id the same path had before paths were
+/// resolved, which rows saved back then still carry, and the path itself in
+/// the form the root was found from, which tells the daemon the subfolder of
+/// the checkout it is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectIdentity {
     pub id: String,
     pub root: PathBuf,
     pub legacy_id: String,
+    pub path: PathBuf,
 }
 
 impl ProjectIdentity {
     /// Resolves `path` to its project. Reads the filesystem (see [`resolve_project_root`]).
     pub fn resolve(path: &Path) -> Self {
-        let root = resolve_project_root(path);
-        Self { id: derive_project_id(&root), legacy_id: derive_project_id(path), root }
+        let canonical = canonical_form(path);
+        let root = root_above(&canonical);
+        Self { id: derive_project_id(&root), legacy_id: derive_project_id(path), root, path: canonical }
     }
 
     /// What a registration of this project names as its legacy ids: the id of
@@ -70,17 +74,45 @@ impl ProjectIdentity {
 /// A path that does not exist cannot be canonicalized or searched for `.git`,
 /// so it is only made absolute and normalized textually.
 pub fn resolve_project_root(path: &Path) -> PathBuf {
-    let canonical = match std::fs::canonicalize(path) {
+    root_above(&canonical_form(path))
+}
+
+/// `path` as [`resolve_project_root`] climbs from it: canonical, or only made
+/// absolute and normalized textually when it does not exist.
+fn canonical_form(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
         Ok(p) => strip_verbatim(&p),
-        Err(_) => {
-            let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-            return normalize_lexical(&absolute);
+        Err(_) => normalize_lexical(&std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())),
+    }
+}
+
+fn root_above(canonical: &Path) -> PathBuf {
+    top_above(canonical).map_or_else(|| canonical.to_path_buf(), |(top, marker)| root_from_marker(&top, &marker))
+}
+
+/// The top of the checkout `canonical` is in: the nearest ancestor holding a
+/// `.git`, with what that `.git` says. A path that does not exist has none,
+/// as it has no root but itself.
+fn top_above(canonical: &Path) -> Option<(PathBuf, GitMarker)> {
+    if !canonical.exists() {
+        return None;
+    }
+    canonical.ancestors().find_map(|dir| read_marker(dir).map(|marker| (dir.to_path_buf(), marker)))
+}
+
+/// `path` below `top`, its components joined by `/`: empty at `top` itself,
+/// `None` outside it or when a component is not valid Unicode.
+pub fn subpath_of(top: &Path, path: &Path) -> Option<String> {
+    let rest = path.strip_prefix(top).ok()?;
+    let mut parts = Vec::new();
+    for component in rest.components() {
+        match component {
+            Component::Normal(name) => parts.push(name.to_str()?),
+            Component::CurDir => {}
+            _ => return None,
         }
-    };
-    canonical
-        .ancestors()
-        .find_map(|dir| read_marker(dir).map(|marker| root_from_marker(dir, &marker)))
-        .unwrap_or(canonical)
+    }
+    Some(parts.join("/"))
 }
 
 fn read_marker(dir: &Path) -> Option<GitMarker> {
@@ -343,6 +375,9 @@ pub trait Ground: Send + Sync {
     /// Whether the checkout recorded at `path` with `stamp` is still there:
     /// the path exists and, when a stamp was recorded, what it holds has it.
     fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool;
+    /// `path` measured from the top of its checkout ([`subpath_of`]), when
+    /// that checkout's root is `root`; `None` outside git or under another root.
+    fn subpath(&self, root: &Path, path: &Path) -> Option<String>;
 }
 
 /// The filesystem and `git` of this machine.
@@ -364,6 +399,12 @@ impl Ground for Disk {
     fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
         path.exists() && stamp.is_none_or(|stamp| git_stamp(path).as_deref() == Some(stamp))
     }
+
+    fn subpath(&self, root: &Path, path: &Path) -> Option<String> {
+        let canonical = canonical_form(path);
+        let (top, marker) = top_above(&canonical)?;
+        (root_from_marker(&top, &marker) == root).then(|| subpath_of(&top, &canonical)).flatten()
+    }
 }
 
 /// What was read of a disk before a plan ran, so that the plan decides on
@@ -378,6 +419,7 @@ pub(crate) struct ReadAhead {
     checkouts: HashMap<PathBuf, Checkout>,
     commits: HashMap<PathBuf, RootCommit>,
     present: HashMap<(PathBuf, Option<String>), bool>,
+    subpaths: HashMap<(PathBuf, PathBuf), Option<String>>,
     asked: Mutex<Asked>,
 }
 
@@ -387,6 +429,7 @@ struct Asked {
     checkouts: Vec<PathBuf>,
     commits: Vec<PathBuf>,
     present: Vec<(PathBuf, Option<String>)>,
+    subpaths: Vec<(PathBuf, PathBuf)>,
 }
 
 impl ReadAhead {
@@ -394,7 +437,10 @@ impl ReadAhead {
     /// whether it was asked anything.
     pub(crate) fn read(&mut self, ground: &dyn Ground) -> bool {
         let asked = std::mem::take(self.asked.get_mut().unwrap_or_else(|e| e.into_inner()));
-        let any = !(asked.checkouts.is_empty() && asked.commits.is_empty() && asked.present.is_empty());
+        let any = !(asked.checkouts.is_empty()
+            && asked.commits.is_empty()
+            && asked.present.is_empty()
+            && asked.subpaths.is_empty());
         for root in asked.checkouts {
             let checkout = ground.checkout(&root);
             self.checkouts.insert(root, checkout);
@@ -406,6 +452,10 @@ impl ReadAhead {
         for (path, stamp) in asked.present {
             let present = ground.recorded_checkout_present(&path, stamp.as_deref());
             self.present.insert((path, stamp), present);
+        }
+        for (root, path) in asked.subpaths {
+            let subpath = ground.subpath(&root, &path);
+            self.subpaths.insert((root, path), subpath);
         }
         any
     }
@@ -439,6 +489,15 @@ impl Ground for ReadAhead {
         }
         self.ask(|a| push_new(&mut a.present, recorded));
         true
+    }
+
+    fn subpath(&self, root: &Path, path: &Path) -> Option<String> {
+        let asked = (root.to_path_buf(), path.to_path_buf());
+        if let Some(subpath) = self.subpaths.get(&asked) {
+            return subpath.clone();
+        }
+        self.ask(|a| push_new(&mut a.subpaths, asked));
+        None
     }
 }
 
@@ -488,6 +547,11 @@ impl Ground for FakeGround {
 
     fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
         self.roots.lock().unwrap().get(path).is_some_and(|(checkout, _)| stamp.is_none() || checkout.stamp.as_deref() == stamp)
+    }
+
+    /// A fake checkout has no worktrees: its top is its root.
+    fn subpath(&self, root: &Path, path: &Path) -> Option<String> {
+        subpath_of(root, path)
     }
 }
 
@@ -672,6 +736,22 @@ mod tests {
         );
         assert_eq!(parse_gitdir("ref: refs/heads/main", dir), None);
         assert_eq!(parse_gitdir("gitdir:   ", dir), None);
+    }
+
+    #[test]
+    fn the_subpath_is_measured_from_the_top_of_the_checkout() {
+        let top = Path::new("/work/mono-wt");
+        assert_eq!(subpath_of(top, Path::new("/work/mono-wt/apps/web/src")).as_deref(), Some("apps/web/src"));
+        assert_eq!(subpath_of(top, top).as_deref(), Some(""), "the top itself");
+        assert_eq!(subpath_of(top, Path::new("/work/mono-wt/./apps")).as_deref(), Some("apps"));
+        assert_eq!(subpath_of(top, Path::new("/work/mono")), None, "outside it");
+        assert_eq!(subpath_of(top, Path::new("/work/mono-wtx/apps")), None, "a sibling is outside it");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bad = top.join(std::ffi::OsStr::from_bytes(b"apps/w\xffb"));
+            assert_eq!(subpath_of(top, &bad), None, "a name that is not Unicode");
+        }
     }
 
     #[test]

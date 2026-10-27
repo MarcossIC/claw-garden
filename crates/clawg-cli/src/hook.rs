@@ -221,7 +221,7 @@ async fn read_input(input: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
 async fn project_of(client: &DaemonClient, cwd: &Path) -> Option<String> {
     let identity = ProjectIdentity::resolve(cwd);
     let legacy = identity.legacy_ids();
-    match client.register_project(&identity.root, &legacy, false).await {
+    match client.register_project(&identity.root, Some(&identity.path), &legacy, false).await {
         Ok(given) => Some(given.project_id),
         Err(e) if e.is_root_collision() => None,
         Err(_) => Some(identity.id),
@@ -437,6 +437,44 @@ mod tests {
         let (_writer, silent) = tokio::io::duplex(64);
         let out = respond(HookEvent::SessionStart, "a", dir.path(), silent, Duration::from_millis(100)).await;
         assert!(out.is_some_and(|o| o.contains("el idioma de la persona es el español")), "the deadline still leaves the line");
+    }
+
+    #[tokio::test]
+    async fn session_start_in_a_declared_subfolder_reads_its_project() {
+        use crate::client::tests::{publish, start_daemon};
+        let d = start_daemon().await;
+        publish(&d);
+        let client = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let repo = tempfile::tempdir().unwrap();
+        let mono = ProjectIdentity::resolve(repo.path()).root.join("mono");
+        for sub in [".git", "apps/web/src"] {
+            std::fs::create_dir_all(mono.join(sub)).unwrap();
+        }
+        let web = client.resolve_project("web", true, false, clawg_core::memory::registry::Born::User).await.unwrap().project_id.unwrap();
+        client.locate_project("web", &mono.join("apps").join("web"), true).await.expect("declare");
+        let save = |content: &str, project: String| crate::client::SaveArgs {
+            content: content.into(),
+            agent_id: "a".into(),
+            project_id: Some(project),
+            memory_type: Some("semantic_fact".into()),
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        };
+        let m = client.register_project(&mono, None, &[], false).await.unwrap().project_id;
+        client.save(save("The web app renders on the server", web)).await.expect("save");
+        client.save(save("The monorepo builds with one workspace", m)).await.expect("save");
+        let start = |cwd: &Path| {
+            let (stdin, dir) = (serde_json::json!({ "cwd": cwd, "source": "startup" }).to_string(), d.dir.path().to_path_buf());
+            async move { respond(HookEvent::SessionStart, "a", &dir, stdin.as_bytes(), HOOK_DEADLINE).await.unwrap_or_default() }
+        };
+
+        let inside = start(&mono.join("apps").join("web").join("src")).await;
+        let at_root = start(&mono).await;
+
+        assert!(inside.contains("renders on the server") && !inside.contains("one workspace"), "{inside}");
+        assert!(at_root.contains("one workspace") && !at_root.contains("renders on the server"), "{at_root}");
     }
 
     #[test]

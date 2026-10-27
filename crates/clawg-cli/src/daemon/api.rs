@@ -44,8 +44,9 @@ use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::language::count_saves_in;
 use clawg_core::memory::portability::timing::{Step, Timing};
 use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
-use clawg_core::memory::identity::{Disk, Ground};
+use clawg_core::memory::identity::{Disk, Ground, ProjectIdentity};
 use clawg_core::memory::project::{register_project, RegisterError, RegisterOutcome, Registration};
+use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
 use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
 use clawg_core::memory::registry::{
@@ -2068,6 +2069,10 @@ pub struct RegisterRequest {
     /// when missing: a caller from before derives the id from the root.
     #[serde(default)]
     pub assigned: bool,
+    /// The absolute path the caller works in, inside the root: a subfolder
+    /// declared there leads to another project. Only with `assigned`.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2088,15 +2093,21 @@ async fn register(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<RegisterRequest>,
 ) -> ApiResult<Json<RegisteredBody>> {
-    let outcome = register_root(&app, &body.root_path, &body.legacy_ids, body.index_docs, body.assigned).await?;
-    Ok(Json(RegisteredBody { project_id: outcome.project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
+    let path = body.path.as_deref().filter(|_| body.assigned);
+    let outcome = register_root(&app, &body.root_path, path, &body.legacy_ids, body.index_docs, body.assigned).await?;
+    let project_id = outcome.subproject.unwrap_or(outcome.project_id);
+    Ok(Json(RegisteredBody { project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
 }
 
 /// Registers `root_path` as [`register`] does, for it and for what places a
-/// folder in a project.
+/// folder in a project. `path`, where the caller works, is measured from the
+/// top of its checkout on the thread that reads the checkout; one that is not
+/// absolute or does not lead to `root_path` is left out, as a caller from
+/// before sends none.
 async fn register_root(
     app: &Arc<AppCtx>,
     root_path: &str,
+    path: Option<&str>,
     legacy_ids: &[String],
     index_docs: bool,
     assigned: bool,
@@ -2110,11 +2121,19 @@ async fn register_root(
     }
     // A caller that derives its id joins no remote, but what is at the root
     // still tells whether it is the repository its folder was given to.
-    let checkout = {
-        let root = root.to_path_buf();
-        tokio::task::spawn_blocking(move || Disk.checkout(&root)).await.unwrap_or_default()
+    let (checkout, subpath) = {
+        let (root, path) = (root.to_path_buf(), path.map(std::path::PathBuf::from));
+        tokio::task::spawn_blocking(move || {
+            let subpath = path.as_ref().filter(|p| p.is_absolute()).and_then(|p| Disk.subpath(&root, p));
+            (Disk.checkout(&root), subpath)
+        })
+        .await
+        .unwrap_or_default()
     };
-    let registration = Registration { root, checkout, legacy_ids, index_docs, assigned };
+    if let (Some(path), None) = (path, &subpath) {
+        log::info!("{path} is not in the checkout of {root_path}; it is registered as the root alone");
+    }
+    let registration = Registration { root, checkout, legacy_ids, index_docs, assigned, subpath: subpath.as_deref() };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration, Arc::new(Disk))
         .await
@@ -2437,6 +2456,10 @@ struct LocateRequest {
     /// An id or a name.
     project: String,
     root_path: String,
+    /// `root_path` is a subfolder of a repository, declared as the project,
+    /// rather than a folder whose root is located.
+    #[serde(default)]
+    subfolder: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2449,6 +2472,19 @@ pub struct LocatedBody {
     /// The merge of the folder's own project into it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merge: Option<MergeReport>,
+    /// For a subfolder: the project of its repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
+    /// For a subfolder: where it is in its checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
+    /// For a subfolder: the repository's project was named, and its declaration went.
+    #[serde(default)]
+    pub removed: bool,
+    /// For a removed declaration: the project the subfolder led to, which
+    /// keeps what was saved there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
 }
 
 /// Makes the root of `root_path` lead to a project: it is registered as a
@@ -2459,6 +2495,7 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
     if !std::path::Path::new(&body.root_path).is_dir() {
         return Err(ApiError::bad_request(format!("{} is not a directory: name a directory of the project", body.root_path)));
     }
+    let subfolder = if body.subfolder { Some(subfolder_of(&body.root_path).await?) } else { None };
     let store = &app.runtime.store;
     let target = match find_project(store, &body.project).await.map_err(ApiError::internal)? {
         Named::Project(id) => id,
@@ -2470,10 +2507,23 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
             })
         }
     };
-    let registered = register_root(&app, &body.root_path, &[], false, true).await?;
+    if let Some((root, subpath)) = subfolder {
+        return declare(&app, &root, &subpath, &target).await.map(Json);
+    }
+    let registered = register_root(&app, &body.root_path, None, &[], false, true).await?;
     let (own, root_id) = (registered.project_id, registered.root_id);
+    let located = |already: bool, merge: Option<MergeReport>| LocatedBody {
+        project_id: target.clone(),
+        root_id: root_id.clone(),
+        already,
+        merge,
+        repository_id: None,
+        subpath: None,
+        removed: false,
+        previous: None,
+    };
     if own == target {
-        return Ok(Json(LocatedBody { project_id: target, root_id, already: true, merge: None }));
+        return Ok(Json(located(true, None)));
     }
     let own2 = own.clone();
     let folders: i64 = store
@@ -2498,7 +2548,54 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
     }
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let merged = merge_core(store, &app.runtime.workspaces(), &backups, &own, &target, false).await.map_err(merge_error)?;
-    Ok(Json(LocatedBody { project_id: target, root_id, already: false, merge: Some(merged) }))
+    Ok(Json(located(false, Some(merged))))
+}
+
+/// The root of the checkout `path` is in and the subpath of `path` there,
+/// read on a blocking thread; a 400 for a path at the top of a checkout or
+/// outside one, which has no subfolder to declare.
+async fn subfolder_of(path: &str) -> ApiResult<(String, String)> {
+    let asked = std::path::PathBuf::from(path);
+    let found = tokio::task::spawn_blocking(move || {
+        let identity = ProjectIdentity::resolve(&asked);
+        let subpath = Disk.subpath(&identity.root, &identity.path);
+        (identity.root, subpath)
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    match found {
+        (root, Some(subpath)) if !subpath.is_empty() => Ok((root.to_string_lossy().into_owned(), subpath)),
+        _ => Err(ApiError::bad_request(format!(
+            "{path} is the top of a checkout or outside a repository, so it is no subfolder of one; \
+             `locate` without `subfolder` locates the folder's root"
+        ))),
+    }
+}
+
+/// Declares `subpath` of the repository at `root` as project `target`, after
+/// registering the root as a bridge does.
+async fn declare(app: &Arc<AppCtx>, root: &str, subpath: &str, target: &str) -> ApiResult<LocatedBody> {
+    let registered = register_root(app, root, None, &[], false, true).await?;
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let declared = declare_subfolder(&app.runtime.store, &app.runtime.workspaces(), &backups, &registered.project_id, subpath, target)
+        .await
+        .map_err(|e| match e {
+            SubfolderError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+            SubfolderError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
+            SubfolderError::Shared { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("folder_shared") },
+            SubfolderError::Merge(e) => merge_error(e),
+            SubfolderError::Store(_) => ApiError::internal(e),
+        })?;
+    Ok(LocatedBody {
+        project_id: declared.project_id,
+        root_id: registered.root_id,
+        already: declared.already,
+        merge: declared.merge,
+        repository_id: Some(declared.repository_id),
+        subpath: Some(declared.subpath),
+        removed: declared.removed,
+        previous: declared.previous,
+    })
 }
 
 /// Refreshes the project's documentation index in the background, once the

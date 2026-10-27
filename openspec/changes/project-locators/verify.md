@@ -215,3 +215,39 @@ Pendiente para el pull request final del cambio, como el de las entregas anterio
 - **Tareas 39 y 41:** los tests del puente se escribieron después del código, en el mismo paso; los de los contratos, la lista de herramientas de `.claude/CLAUDE.md`, la tabla en español y el protocolo fallaron hasta que se completaron.
 - **Tarea 40:** `session_start_names_the_pending_suggestions` no compilaba sin la línea; después `what_the_hook_adds_stays_small` falló por el tope (arriba).
 - **Tarea 42:** los tests no compilaban: faltaban `ProjectsAction::Create`, `ProjectsAction::Locate` y `render_created`.
+
+## Entrega 3b (0.64.0)
+
+### Linux
+
+- `cargo test --workspace --locked` pasa en `663e83d`, con `tests/binary.rs`: ningún binario con fallos. `cargo clippy --workspace --all-targets --locked -- -A clippy::all -D warnings`, `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` y `cargo test --locked -p clawg-core --lib build_info` salen con 0.
+- ONNX Runtime se enlazó con la rueda `onnxruntime==1.24.2` de PyPI, como en la 3a (`ORT_LIB_LOCATION`, `ORT_PREFER_DYNAMIC_LINK=1`, `LD_LIBRARY_PATH`), porque el entorno no alcanza `cdn.pyke.io`. No cambia nada del repositorio.
+- `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin volver a bendecir (PL52).
+
+### El binario real en un home temporal
+
+Se usó el binario de `target/debug`, copiado fuera del directorio de build, con `CLAWG_TEST_HOME`, `CLAWG_TEST_EMBEDDER=fake`, `CLAWG_TEST_DEFAULT_PORT=off` y `clawg serve --profile dev --port 0`, que sirvió por el socket y por TCP. Los repositorios se hicieron con `git`: un monorepo con `origin` `https://github.com/acme/monorepo.git`, un clone suyo en otro camino con el mismo `origin`, y un worktree del monorepo. El puente (`clawg mcp --no-autostart --agent claude-code`) se manejó por stdio real.
+
+1. `projects create web` creó `web-0680`. `projects locate web <monorepo>/apps/web --subfolder` dijo que la carpeta lleva a `web-0680` dentro del repositorio de `monorepo-58c9`, nombró el `projects move --from-project monorepo-58c9 --to-project web-0680 --text WORDS --dry-run` y que una sesión abierta antes sigue con `monorepo-58c9`.
+2. Un puente abierto en `apps/web/src` guardó en `web-0680`, y uno abierto en la raíz guardó en `monorepo-58c9` (`memories list`).
+3. `hook session-start` leyó la memoria de `web-0680` y no la del monorepo desde `apps/web/src`, desde el `apps/web/src` del clone y desde el `apps/web` del worktree; desde la raíz del monorepo y la del clone leyó la del monorepo y no la de `web`.
+4. `projects list` mostró la declaración bajo el monorepo (`subfolder apps/web leads to web`) y bajo `web`, con sus caminos en las dos carpetas del repositorio.
+5. `projects locate monorepo-58c9 <monorepo>/apps/web --subfolder` la quitó, nombró `clawg projects merge web-0680 --into monorepo-58c9 --dry-run`, y lo guardado en `web-0680` siguió allí. `session-start` desde `apps/web/src` volvió a leer el monorepo, y `projects list` mostró `web` sin carpeta.
+6. `doctor` dio `project_subfolders` `ok`, 22 `ok`, 2 `info` y un `warn` del entorno (`backup.age`: el home temporal no tiene snapshot). Nada nuevo.
+
+`clawg stop` respondió que el daemon seguía vivo después de 30 s. El log muestra `clawg serve dev stopped` en el mismo segundo del pedido, y no quedó ningún proceso: el script que manejaba la prueba esperaba al hijo `serve` recién después de `stop`, así que el pid seguía como zombi sin cosechar. No es del daemon.
+
+### CI
+
+Pendiente para el pull request final del cambio, como el de las entregas anteriores.
+
+### Lo que no se corrió
+
+- **Windows:** la suite, los clippy y el recorrido del binario de esta entrega no corrieron en Windows.
+- **El perfil dev y el de producción:** no se tocó ningún perfil real.
+
+### Qué se vio fallar antes de cada cambio
+
+- **Tarea 45:** sin V30, `a_database_from_the_previous_version_opens_with_no_subfolder_declared` y los tres conteos de migraciones fallaron; con el archivo y sin fijarlo, `published_migration_checksums_are_pinned`.
+- **Tareas 46 a 53:** los tests no compilaban sin `subpath_of`, `Ground::subpath`, `ProjectIdentity::path`, el módulo `subfolder`, `Registration::subpath`, `ListedSubfolder`, `DeleteReport::subfolders`, `RegisterRequest::path`, `LocateRequest::subfolder`, `--subfolder` y `DeclaredSubfolder`. Los de `render_list` fallaron una vez por el orden de las líneas, que quedó después de los remotos.
+

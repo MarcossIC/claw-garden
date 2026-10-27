@@ -33,6 +33,7 @@ use crate::memory::identity::{candidate_id, derive_project_id, Checkout, Ground,
 use crate::memory::registry::{name_key, project_name};
 use crate::memory::merge::canonical_in;
 use crate::memory::relocate::{merge_in, Span};
+use crate::memory::subfolder::declared_in;
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
 
@@ -56,6 +57,10 @@ pub struct Registration<'a> {
     /// The caller uses the ids the answer gives. One that does not derives
     /// the id from the root itself, so it keeps the rule it was written for.
     pub assigned: bool,
+    /// Where the caller works, measured from the top of the root's checkout
+    /// ([`Ground::subpath`]): a declared subfolder there leads to another
+    /// project. `None` or empty for the root itself.
+    pub subpath: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +78,9 @@ pub struct RegisterOutcome {
     pub move_id: Option<i64>,
     /// The `pre-rekey` snapshot taken before rows moved.
     pub snapshot: Option<PathBuf>,
+    /// The project a declared subfolder leads the caller's path to, read
+    /// after the root settled in `project_id`, where its legacy ids joined.
+    pub subproject: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -520,9 +528,15 @@ fn settle_in(
 
 /// The project id `root` reads and writes under, as the store says now and
 /// without writing: the one a registration with assigned ids would give it,
-/// from what `ground` finds at the root.
-pub fn project_id_in(c: &Connection, root: &Path, ground: &dyn Ground) -> rusqlite::Result<String> {
-    Ok(plan_ids_in(c, &[root.to_path_buf()], ground)?.remove(0).project_id)
+/// from what `ground` finds at the root, or the project a declared subfolder
+/// leads `path` to inside it.
+pub fn project_id_in(c: &Connection, root: &Path, path: Option<&Path>, ground: &dyn Ground) -> rusqlite::Result<String> {
+    let project = plan_ids_in(c, &[root.to_path_buf()], ground)?.remove(0).project_id;
+    let subpath = path.and_then(|p| ground.subpath(root, p));
+    Ok(match subpath {
+        Some(subpath) => declared_in(c, &project, &subpath)?.unwrap_or(project),
+        None => project,
+    })
 }
 
 /// What a registration with assigned ids would give a root ([`plan_ids_in`]).
@@ -893,12 +907,19 @@ pub async fn register_project(
     if let Some(bad) = reg.legacy_ids.iter().find(|id| !is_project_id(id)) {
         return Err(RegisterError::InvalidLegacyId(bad.clone()));
     }
-    let owned = (reg.root.to_path_buf(), reg.checkout.clone(), reg.legacy_ids.to_vec());
+    let owned = (reg.root.to_path_buf(), reg.checkout.clone(), reg.legacy_ids.to_vec(), reg.subpath.map(str::to_string));
     let (index_docs, assigned) = (reg.index_docs, reg.assigned);
     let pass = move |snapshot: Option<PathBuf>, disk: FromDisk, may_read: bool, may_look: bool| {
-        let (root, checkout, legacy_ids) = owned.clone();
+        let (root, checkout, legacy_ids, subpath) = owned.clone();
         move |c: &mut Connection| -> Result<Pass, RegisterError> {
-            let reg = Registration { root: &root, checkout, legacy_ids: &legacy_ids, index_docs, assigned };
+            let reg = Registration {
+                root: &root,
+                checkout,
+                legacy_ids: &legacy_ids,
+                index_docs,
+                assigned,
+                subpath: subpath.as_deref(),
+            };
             let tx = c.transaction().map_err(MemoryError::Sqlite)?;
             let plan = match plan_in(&tx, &reg, &disk, may_read, may_look)? {
                 Planned::Plan(plan) => plan,
@@ -910,6 +931,12 @@ pub async fn register_project(
             }
             let (rekeyed, move_id, index_docs) =
                 write_in(&tx, &reg, &plan, TimestampMs::now()).map_err(MemoryError::Sqlite)?;
+            // Only once the root settled and its ids joined there: a plan made
+            // for the subproject would join the repository's rows into it.
+            let subproject = match reg.subpath {
+                Some(subpath) if reg.assigned => declared_in(&tx, &plan.project_id, subpath).map_err(MemoryError::Sqlite)?,
+                _ => None,
+            };
             tx.commit().map_err(MemoryError::Sqlite)?;
             let outcome = RegisterOutcome {
                 project_id: plan.project_id,
@@ -918,6 +945,7 @@ pub async fn register_project(
                 index_docs,
                 move_id,
                 snapshot,
+                subproject,
             };
             Ok(Pass::Done(outcome, plan.legacy))
         }
@@ -1119,7 +1147,7 @@ mod tests {
     type SuggestionRow = (String, String, String, Option<String>);
 
     fn reg<'a>(root: &'a Path, legacy: &'a [String]) -> Registration<'a> {
-        Registration { root, checkout: Checkout::default(), legacy_ids: legacy, index_docs: true, assigned: true }
+        Registration { root, checkout: Checkout::default(), legacy_ids: legacy, index_docs: true, assigned: true, subpath: None }
     }
 
     fn keyed(remote: &str) -> Checkout {
@@ -1523,7 +1551,7 @@ mod tests {
             .store
             .conn
             .call(move |c| {
-                let read = project_id_in(c, path, &*ground)?;
+                let read = project_id_in(c, path, None, &*ground)?;
                 let planned = plan_ids_in(c, &[path.to_path_buf(), path.to_path_buf()], &*ground)?;
                 Ok::<_, rusqlite::Error>((read, planned.into_iter().map(|p| (p.root_id, p.project_id)).collect::<Vec<_>>()))
             })
@@ -1721,9 +1749,9 @@ mod tests {
             .conn
             .call(move |c| {
                 ground.put(review, Some("github.com/acme/app"), None, RootCommit::Later);
-                let shared = project_id_in(c, review, &*ground)?;
+                let shared = project_id_in(c, review, None, &*ground)?;
                 ground.put(review, None, None, RootCommit::Later);
-                Ok::<_, rusqlite::Error>((shared, project_id_in(c, review, &*ground)?, project_id_in(c, other, &*ground)?))
+                Ok::<_, rusqlite::Error>((shared, project_id_in(c, review, None, &*ground)?, project_id_in(c, other, None, &*ground)?))
             })
             .await
             .unwrap();
@@ -1920,7 +1948,7 @@ mod tests {
             .store
             .conn
             .call(move |c| {
-                let read = project_id_in(c, Path::new("/work/app"), &*ground)?;
+                let read = project_id_in(c, Path::new("/work/app"), None, &*ground)?;
                 let planned = plan_ids_in(c, &[PathBuf::from("/work/app")], &*ground)?.remove(0).project_id;
                 Ok::<_, rusqlite::Error>((read, planned))
             })
@@ -2103,7 +2131,7 @@ mod tests {
             .store
             .conn
             .call(move |c| {
-                let read = project_id_in(c, new, &*ground)?;
+                let read = project_id_in(c, new, None, &*ground)?;
                 let planned = plan_ids_in(c, &[new.to_path_buf(), copy.to_path_buf()], &*ground)?;
                 Ok::<_, rusqlite::Error>((read, planned.into_iter().map(|p| (p.root_id, p.project_id)).collect::<Vec<_>>()))
             })
@@ -2136,5 +2164,119 @@ mod tests {
         assert!(f.suggestions().await.is_empty());
         let own = (derived.root_id.clone(), Some(derived.project_id), None, some("c1"), some("s1"));
         assert_eq!(f.folders("/work/app2").await, vec![own], "it records what it found in its own folder");
+    }
+
+    impl Fixture {
+        /// A project with no folder, as `projects create` leaves it.
+        async fn project(&self, id: &str) {
+            let id = id.to_string();
+            self.store
+                .conn
+                .call(move |c| {
+                    c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, ?1, 'user', 1, 0)", [id])
+                })
+                .await
+                .unwrap();
+        }
+
+        /// Declares `subpath` of the repository of `parent` as `project`.
+        async fn declare(&self, parent: &str, subpath: &str, project: &str, created_at: i64) {
+            let (parent, subpath, project) = (parent.to_string(), subpath.to_string(), project.to_string());
+            self.store
+                .conn
+                .call(move |c| {
+                    c.execute(
+                        "INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![parent, subpath, project, created_at],
+                    )
+                })
+                .await
+                .unwrap();
+        }
+
+        /// The project a registration of `root` from `subpath` answers.
+        async fn reached(&self, reg: Registration<'_>, subpath: &str) -> String {
+            let outcome = self.register(Registration { subpath: Some(subpath), ..reg }).await.unwrap();
+            outcome.subproject.unwrap_or(outcome.project_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_subfolder_takes_what_is_saved_inside_it() {
+        let f = Fixture::new().await;
+        let (mono, other) = (Path::new("/work/monorepo"), Path::new("/other/monorepo"));
+        let m = f.register(cloned(mono, "github.com/acme/monorepo")).await.unwrap().project_id;
+        f.project("web").await;
+        f.declare(&m, "apps/web", "web", 1).await;
+
+        assert_eq!(f.reached(cloned(mono, "github.com/acme/monorepo"), "apps/web/src").await, "web");
+        assert_eq!(f.reached(cloned(mono, "github.com/acme/monorepo"), "apps/web").await, "web");
+        assert_eq!(f.reached(cloned(mono, "github.com/acme/monorepo"), "apps/webapp").await, m);
+        assert_eq!(f.reached(cloned(mono, "github.com/acme/monorepo"), "").await, m);
+        let root = f.register(cloned(mono, "github.com/acme/monorepo")).await.unwrap();
+        assert_eq!((root.project_id.as_str(), root.subproject), (m.as_str(), None), "without a path, the repository");
+        assert_eq!(f.reached(cloned(other, "github.com/acme/monorepo"), "apps/web/src").await, "web", "a clone reaches it");
+        assert_eq!(f.reached(cloned(other, "github.com/acme/monorepo"), "").await, m);
+        let derived = f.register(Registration { assigned: false, subpath: Some("apps/web"), ..cloned(mono, "github.com/acme/monorepo") });
+        assert_eq!(derived.await.unwrap().subproject, None, "a caller that derives its id keeps the rule of before");
+    }
+
+    #[tokio::test]
+    async fn a_declaration_follows_a_moved_checkout() {
+        let f = Fixture::new().await;
+        let (old, new) = (Path::new("/work/mono"), Path::new("/work/mono2"));
+        let m = f.register(f.found(old, None, "s1", known("c1"))).await.unwrap().project_id;
+        f.project("web").await;
+        f.declare(&m, "apps/web", "web", 1).await;
+        f.ground.remove(old);
+
+        let moved = f.register(Registration { subpath: Some("apps/web"), ..f.found(new, None, "s1", known("c1")) }).await.unwrap();
+
+        assert_eq!(moved.project_id, m, "the root keeps its project");
+        assert_eq!(moved.subproject.as_deref(), Some("web"));
+    }
+
+    #[tokio::test]
+    async fn a_declaration_is_read_through_merges() {
+        let f = Fixture::new().await;
+        let mono = Path::new("/work/monorepo");
+        let m = f.register(cloned(mono, "github.com/acme/monorepo")).await.unwrap().project_id;
+        for id in ["web", "zeta"] {
+            f.project(id).await;
+        }
+        f.declare(&m, "apps/web", "web", 1).await;
+        let reached = |subpath: &'static str| f.reached(cloned(mono, "github.com/acme/monorepo"), subpath);
+
+        crate::memory::merge::merge_core(&f.store, &f.ws, &f.backups, &m, "zeta", false).await.unwrap();
+        assert_eq!(reached("").await, "zeta", "the root leads to the project its own was merged into");
+        assert_eq!(reached("apps/web").await, "web", "and its declaration with it");
+
+        let merged = crate::memory::merge::merge_core(&f.store, &f.ws, &f.backups, "web", "zeta", false).await.unwrap();
+        assert_eq!(reached("apps/web").await, "zeta", "a declaration that leads to the repository answers it");
+        crate::memory::merge::undo_merge_core(&f.store, &f.ws, &f.backups, merged.merge_id.unwrap(), false).await.unwrap();
+        assert_eq!(reached("apps/web").await, "web", "undoing the merge gives it back");
+    }
+
+    #[tokio::test]
+    async fn resolving_a_subfolder_joins_nothing() {
+        let f = Fixture::new().await;
+        let (first, mono) = (Path::new("/work/first"), Path::new("/work/monorepo"));
+        let p = f.register(cloned(first, "github.com/acme/monorepo")).await.unwrap().project_id;
+        f.project("web").await;
+        f.declare(&p, "apps/web", "web", 1).await;
+        let legacy = vec![derive_project_id(&mono.join("apps").join("web"))];
+        f.memory(&legacy[0], "saved before roots were resolved", None, 1).await;
+        f.memory(&derive_project_id(mono), "saved under the folder's own id", None, 2).await;
+
+        let outcome = f
+            .register(Registration { subpath: Some("apps/web"), ..Registration { checkout: keyed("github.com/acme/monorepo"), ..reg(mono, &legacy) } })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.project_id, p, "the legacy and the folder's ids joined the repository's project");
+        assert_eq!(outcome.subproject.as_deref(), Some("web"));
+        assert_eq!(outcome.root_id, derive_project_id(mono), "the folder keeps its own id for its docs");
+        let projects: Vec<Option<String>> = project_ids(&f.store).await.into_iter().map(|(_, _, p)| p).collect();
+        assert_eq!(projects, vec![Some(p.clone()), Some(p)], "nothing went to the subproject");
     }
 }
