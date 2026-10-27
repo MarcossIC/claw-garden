@@ -709,7 +709,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 29);
+        assert_eq!(after.0, 30);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -2188,6 +2188,98 @@ mod tests {
         assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
     }
 
+    /// A declaration is written only by `projects locate --subfolder`, so a
+    /// store from before V30 opens with none and every row as it was.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_no_subfolder_declared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(29)).await;
+        type Whole = Vec<Vec<rusqlite::types::Value>>;
+        let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT * FROM memory ORDER BY id",
+                "SELECT * FROM episodic_trajectory ORDER BY id",
+                "SELECT * FROM procedural_skill ORDER BY id",
+                "SELECT * FROM project ORDER BY id",
+                "SELECT * FROM project_path ORDER BY id",
+                "SELECT * FROM project_remote ORDER BY remote",
+                "SELECT * FROM project_suggestion ORDER BY project_id",
+                "SELECT * FROM project_delete ORDER BY delete_id",
+                "SELECT * FROM project_delete_row ORDER BY delete_id, tbl, row_id",
+                "SELECT * FROM project_merge ORDER BY merge_id",
+            ] {
+                let mut stmt = c.prepare(sql)?;
+                let n = stmt.column_count();
+                let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
+                out.push(rows);
+            }
+            Ok(out)
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at, deleted_at) VALUES \
+                       ('app-1a2b', 'app', 'root', 1, 1, NULL, NULL, NULL), ('copia-85a9', 'copia', 'root', 0, 2, 'app-1a2b', 9, NULL), \
+                       ('idea', 'idea', 'adopted', 0, 3, NULL, NULL, NULL), ('gone', 'gone', 'agent', 0, 4, NULL, NULL, 12), \
+                       ('lib-77aa', 'lib', 'root', 0, 5, NULL, NULL, NULL);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id, remote) VALUES \
+                       ('app-1a2b', '/work/app', 1, 1, 'app-1a2b', 'github.com/acme/app'), \
+                       ('app-9c9c', '/other/app', 2, 0, 'app-1a2b', 'github.com/acme/app'), \
+                       ('lib-77aa', '/work/lib', 5, 1, 'lib-77aa', NULL), \
+                       ('lib-77ab', '/work/lib', 6, 1, 'lib-77aa', NULL);
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
+                     INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('idea', 'app-1a2b', 'folder_name', 7);
+                     INSERT INTO project_delete (delete_id, project_id, with_memories, code, snapshot, deleted_at) \
+                      VALUES (1, 'gone', 1, 'abcd1234', NULL, 12);
+                     INSERT INTO project_delete_row (delete_id, tbl, row_id, deleted_at) VALUES (1, 'memory', 13, NULL);
+                     INSERT INTO project_merge (merge_id, source, target, move_id, snapshot, merged_at) \
+                      VALUES (1, 'copia-85a9', 'app-1a2b', NULL, NULL, 9);
+                     INSERT INTO episodic_trajectory \
+                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at, deleted_at) \
+                      VALUES ('agent', 'a', 'app-1a2b', 's1', 't', 5, 5, 5, NULL), ('agent', 'a', 'app-1a2b', 's2', 'u', 5, 5, 5, 8);
+                     INSERT INTO procedural_skill \
+                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at, deleted_at) \
+                      VALUES ('agent', 'a', 'idea', 'k', 't', 6, '[]', 6, 6, 6, NULL), \
+                             ('agent', 'a', 'idea', 'l', 't', 6, '[]', 6, 6, 6, 8);",
+                )?;
+                for (id, project, deleted_at) in
+                    [(10, "app-1a2b", None), (11, "app-1a2b", Some(7)), (12, "idea", None), (13, "gone", Some(12))]
+                {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
+                         VALUES (?1, 'agent', 'a', ?2, 'note ' || ?1, 'semantic_fact', 'explicit', ?1, 'agent', 'x', \
+                          ?1, ?1, 5.0, 3, 'active', ?3)",
+                        rusqlite::params![id, project, deleted_at],
+                    )?;
+                }
+                whole(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, declared): (Vec<Whole>, i64) = store
+            .conn
+            .call(move |c| {
+                let declared = c.query_row("SELECT COUNT(*) FROM project_subfolder", [], |r| r.get(0))?;
+                Ok::<_, rusqlite::Error>((whole(c)?, declared))
+            })
+            .await
+            .unwrap();
+        assert_eq!(after, before, "migrating changes no row");
+        assert_eq!(declared, 0, "no subfolder is declared");
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
     #[tokio::test]
     async fn a_store_from_before_the_warning_mark_keeps_its_pairs_unmarked() {
         ensure_vec0_registered();
@@ -2652,7 +2744,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 29, "Expected exactly 29 applied migrations, got {}", count);
+        assert_eq!(count, 30, "Expected exactly 30 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -3113,7 +3205,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 29);
+        assert_eq!(migration_count, 30);
     }
 
     // -----------------------------------------------------------------------

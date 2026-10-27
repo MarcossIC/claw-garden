@@ -485,10 +485,11 @@ pub struct ClawgMcp {
     /// `default_project` when it is a project whose files the daemon may read
     /// without the user adding it (see [`own_root_to_index`]).
     docs_root: Option<ProjectIdentity>,
-    /// Roots (with the legacy id they were reached through) already sent to
-    /// `POST /v1/projects` by this process, with the ids it gave them. Shared
+    /// Roots, with the path inside each they were reached through, already
+    /// sent to `POST /v1/projects` by this process, with the ids it gave
+    /// them: a declared subfolder of a root leads to another project. Shared
     /// by every clone, because rmcp clones the server per call.
-    registered: Arc<tokio::sync::Mutex<HashMap<(PathBuf, String), ProjectIds>>>,
+    registered: Arc<tokio::sync::Mutex<HashMap<(PathBuf, PathBuf), ProjectIds>>>,
     profile: Profile,
     /// The user's preferred language when the bridge started, which this
     /// session's instructions, searches and answers keep.
@@ -903,7 +904,7 @@ impl ClawgMcp {
     /// clone of its remote, are already under its project when the call reads
     /// or writes.
     ///
-    /// Each root and legacy id is sent once per process, even when the call
+    /// Each root and path is sent once per process, even when the call
     /// fails: a daemon that cannot register (an older version, say) must not
     /// cost every tool call a round trip, and the ids derived from the root
     /// are what such a daemon uses. The exceptions are a call the daemon
@@ -926,14 +927,14 @@ impl ClawgMcp {
         ) else {
             return Ok(None);
         };
-        let key = (project.root.clone(), project.legacy_id.clone());
+        let key = (project.root.clone(), project.path.clone());
         let mut registered = self.registered.lock().await;
         if let Some(ids) = registered.get(&key) {
             return Ok(Some(ids.clone()));
         }
         let legacy = project.legacy_ids();
         let index_docs = indexes_docs(&project, self.docs_root.as_ref());
-        let ids = match client.register_project(&project.root, &legacy, index_docs).await {
+        let ids = match client.register_project(&project.root, Some(&project.path), &legacy, index_docs).await {
             Ok(given) => ProjectIds { project: given.project_id, root: given.root_id },
             Err(e) if e.is_root_collision() => return Err(e),
             Err(e) => {
@@ -968,7 +969,7 @@ impl ClawgMcp {
     async fn save_project(&self, project_path: Option<&str>) -> Option<String> {
         let project = resolve_project(self.default_project.as_ref(), project_path, false, ProjectIdentity::resolve)?;
         let registered = self.registered.lock().await;
-        let given = registered.iter().find(|((root, _), _)| *root == project.root).map(|(_, ids)| ids.project.clone());
+        let given = registered.get(&(project.root.clone(), project.path.clone())).map(|ids| ids.project.clone());
         Some(given.unwrap_or(project.id))
     }
 
@@ -1860,7 +1861,7 @@ mod tests {
     /// any root that no other one holds.
     fn test_project() -> ProjectIdentity {
         let id = clawg_core::memory::derive_project_id(std::path::Path::new("/proj-test"));
-        ProjectIdentity { id: id.clone(), root: "/proj-test".into(), legacy_id: id }
+        ProjectIdentity { id: id.clone(), root: "/proj-test".into(), legacy_id: id, path: "/proj-test".into() }
     }
 
     /// A bridge pointed at an address where nothing is listening.
@@ -4991,7 +4992,7 @@ mod tests {
     async fn answer_suggestion_says_what_it_did() {
         let (b, _d, store) = bridge_with_store(test_project()).await;
         let client = b.client.get().await.expect("daemon");
-        let own = client.register_project(&test_project().root, &[], false).await.expect("register").project_id;
+        let own = client.register_project(&test_project().root, None, &[], false).await.expect("register").project_id;
         b.save_memory_impl("a", SaveMemoryArgs { project: Some("copia".into()), ..save_args("The copy keeps its own config") }).await.unwrap();
         let copy = client.resolve_project("copia", false, false, Born::Agent).await.unwrap().project_id.expect("an id");
         let (one, two) = (own.clone(), copy.clone());
@@ -5023,5 +5024,82 @@ mod tests {
         assert_eq!(rows_in(&b, &own).await, 1, "what was saved in the other is here now");
         let again = b.answer_suggestion_impl(ask("apart", true)).await.unwrap();
         assert!(is_error(&again), "a tombstone has no suggestion left: {}", text(&again));
+    }
+    // ── the subfolders of a monorepo ────────────────────────────────────────
+
+    /// A repository with `apps/web/src` and `apps/webapp`, by canonical name.
+    fn monorepo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mono = strip_verbatim(&std::fs::canonicalize(dir.path()).expect("canonicalize")).join("mono");
+        for sub in [".git", "apps/web/src", "apps/webapp"] {
+            std::fs::create_dir_all(mono.join(sub)).expect("the checkout");
+        }
+        (dir, mono)
+    }
+
+    /// Declares `apps/web` of `mono` as the project `web`, and answers its id.
+    async fn declare_web(b: &ClawgMcp, mono: &std::path::Path) -> String {
+        let client = b.client.get().await.expect("daemon");
+        let web = client.resolve_project("web", true, false, Born::User).await.unwrap().project_id.expect("an id");
+        let declared = client.locate_project("web", &mono.join("apps").join("web"), true).await.expect("declare");
+        assert_eq!(declared.project_id, web);
+        web
+    }
+
+    async fn project_of_root(b: &ClawgMcp, mono: &std::path::Path) -> String {
+        let client = b.client.get().await.expect("daemon");
+        client.register_project(mono, None, &[], false).await.expect("register").project_id
+    }
+
+    #[tokio::test]
+    async fn a_bridge_in_a_declared_subfolder_saves_into_its_project() {
+        let (_repo, mono) = monorepo();
+        let (b, _d) = bridge_at(Some(ProjectIdentity::resolve(&mono.join("apps").join("web"))), |r| r).await;
+        let web = declare_web(&b, &mono).await;
+        let at_root = ClawgMcp::with_project(b.client.get().await.expect("daemon"), Profile::Dev, Some(ProjectIdentity::resolve(&mono)));
+
+        let saved = b.save_memory_impl("a", save_args("The web app renders on the server")).await.unwrap();
+        let other = at_root.save_memory_impl("a", save_args("The monorepo builds with one workspace")).await.unwrap();
+
+        assert!(!is_error(&saved) && !is_error(&other), "{} {}", text(&saved), text(&other));
+        let m = project_of_root(&b, &mono).await;
+        assert_eq!((rows_in(&b, &web).await, rows_in(&b, &m).await), (1, 1), "each in the project of where its bridge works");
+    }
+
+    #[tokio::test]
+    async fn a_project_path_in_a_declared_subfolder_goes_to_its_project() {
+        let (_repo, mono) = monorepo();
+        let (b, _d) = bridge_at(Some(ProjectIdentity::resolve(&mono)), |r| r).await;
+        let web = declare_web(&b, &mono).await;
+        let path = |sub: &str| Some(mono.join(sub).to_string_lossy().into_owned());
+
+        for (sub, content) in [("apps/web/src", "The web app renders on the server"), ("apps/webapp", "The web app shell is static")] {
+            let saved = b.save_memory_impl("a", SaveMemoryArgs { project_path: path(sub), ..save_args(content) }).await.unwrap();
+            assert!(!is_error(&saved), "{}", text(&saved));
+        }
+
+        let m = project_of_root(&b, &mono).await;
+        assert_eq!((rows_in(&b, &web).await, rows_in(&b, &m).await), (1, 1), "apps/webapp is not inside apps/web");
+    }
+
+    #[tokio::test]
+    async fn a_bridge_registers_each_path_of_a_root_once() {
+        let (_repo, mono) = monorepo();
+        let (b, _d) = bridge_at(Some(ProjectIdentity::resolve(&mono)), |r| r).await;
+        let web = declare_web(&b, &mono).await;
+        let m = project_of_root(&b, &mono).await;
+        let path = |sub: &str| Some(mono.join(sub).to_string_lossy().into_owned());
+        let save = |sub: &'static str, content: &'static str| {
+            b.save_memory_impl("a", SaveMemoryArgs { project_path: path(sub), ..save_args(content) })
+        };
+        save("apps/web", "The web app renders on the server").await.unwrap();
+        let client = b.client.get().await.expect("daemon");
+        client.locate_project(&m, &mono.join("apps").join("web"), true).await.expect("take the declaration away");
+
+        save("apps/web", "The web app caches its pages").await.unwrap();
+        save("apps/web/src", "The web app entry point is main.ts").await.unwrap();
+
+        assert_eq!(rows_in(&b, &web).await, 2, "the path was registered once, with the project it had then");
+        assert_eq!(rows_in(&b, &m).await, 1, "another path of the root is registered on its own");
     }
 }

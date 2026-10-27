@@ -224,8 +224,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let project_id = match project {
                 Some(path) => {
-                    let root = ProjectIdentity::resolve(&path).root;
-                    Some(project_id_of(&base_dir, &root, &Disk).map_err(|e| e.to_string())?)
+                    let identity = ProjectIdentity::resolve(&path);
+                    Some(project_id_of(&base_dir, &identity.root, Some(&identity.path), &Disk).map_err(|e| e.to_string())?)
                 }
                 None => None,
             };
@@ -414,7 +414,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(if done { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
 
-        Command::Projects { action: ProjectsAction::Locate { project, path, profile } } => {
+        Command::Projects { action: ProjectsAction::Locate { project, path, subfolder, profile } } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let lang = language(&base_dir);
@@ -423,7 +423,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Probe::Running(client) => client,
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
-            let located = projects::locate(lang, &client, &project, &path).await.map_err(|e| match e {
+            let located = projects::locate(lang, &client, &project, &path, subfolder).await.map_err(|e| match e {
                 projects::AddError::Client(e) => projects::locate_refused(lang, &e).unwrap_or_else(|| unavailable(e)),
                 other => other.to_string(),
             })?;

@@ -1022,7 +1022,7 @@ Con un subcamino S no vacío y la raíz asentada en el proyecto P, el registro M
 
 1. leer las declaraciones de P y de las lápidas que llevan a P;
 2. quedarse con las que contienen S;
-3. elegir la más profunda. A igual subcamino, la de P va antes que la de una lápida, y entre lápidas gana la más vieja;
+3. elegir la más profunda. A igual subcamino, la de P va antes que la de una lápida, y entre lápidas gana la declaración más vieja;
 4. responder como `project_id` el proyecto al que lleva la elegida por `canonical`, pasando las lápidas. Si lleva a P, responde P.
 
 Sin ninguna declaración, responde P. Un subproyecto borrado se responde a sí mismo: registrar no lo revive, y un save sí (PL22). Las declaraciones del subproyecto no se miran: no se encadenan.
@@ -1070,7 +1070,7 @@ Después registra la raíz como un puente (con `assigned` y sin `index_docs`) y 
 
 MUST NOT mover filas: lo guardado desde la subcarpeta antes de declararla queda en el proyecto al que iba. MUST NOT cambiar tampoco carpetas, remotos ni `index_docs`.
 
-La respuesta trae `project_id` (X), `root_id`, `repository_id` (P), `subpath` (S), `already`, `removed` y, cuando unió, `merge`.
+La respuesta trae `project_id` (X), `root_id`, `repository_id` (P), `subpath` (S), `already`, `removed`, cuando quitó una declaración `previous` (el proyecto al que llevaba, que conserva lo guardado allí) y, cuando unió, `merge`.
 
 #### Escenario: declarar y quitar
 - GIVEN `/work/monorepo` con memorias en M, algunas guardadas desde `apps/web`

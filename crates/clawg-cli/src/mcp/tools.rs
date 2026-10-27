@@ -2059,7 +2059,7 @@ mod tests {
     }
 
     fn identity(id: &str) -> ProjectIdentity {
-        ProjectIdentity { id: id.into(), root: format!("/{id}").into(), legacy_id: id.into() }
+        ProjectIdentity { id: id.into(), root: format!("/{id}").into(), legacy_id: id.into(), path: format!("/{id}").into() }
     }
 
     #[test]

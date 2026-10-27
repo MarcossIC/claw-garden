@@ -894,7 +894,7 @@ Con un subcamino S no vacío, después de asentar la raíz en el proyecto P (PL4
 
 1. Lee las declaraciones de P y las de las lápidas que llevan a P. Por D16, una lápida está a un salto, así que se encuentran por `idx_project_merged_into` (`V28__project_merge.sql:11-12`).
 2. Se queda con las que contienen S por componentes enteros: `apps/web` contiene `apps/web/src`, pero no `apps/webapp`.
-3. Elige la más profunda. A igual subcamino, la de P va antes que la de una lápida, y entre lápidas gana la más vieja.
+3. Elige la más profunda. A igual subcamino, la de P va antes que la de una lápida, y entre lápidas gana la declaración más vieja.
 4. Responde el proyecto al que lleva la elegida, por `canonical`.
 
 **Una unión no reescribe declaraciones.** Es la razón de D22 para las sugerencias: la clave primaria `(parent_id, subpath)` podría chocar con una declaración del destino, y el `--undo` tendría que volver a reescribirlas. Leídas por `canonical`:

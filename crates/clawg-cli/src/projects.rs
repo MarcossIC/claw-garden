@@ -146,6 +146,11 @@ pub fn render_list(lang: Lang, projects: &[ListedProject]) -> String {
         }
         .to_string();
     }
+    let names: std::collections::HashMap<&str, &str> = projects.iter().map(|p| (p.project.id.as_str(), p.project.name.as_str())).collect();
+    let named = |id: &str| match names.get(id) {
+        Some(name) => format!("{name} ({id})"),
+        None => id.to_string(),
+    };
     let mut lines = Vec::new();
     for p in projects {
         let (name, id, n) = (&p.project.name, &p.project.id, p.memories);
@@ -161,7 +166,8 @@ pub fn render_list(lang: Lang, projects: &[ListedProject]) -> String {
             (false, Lang::En) => format!("{name} ({id}): {memories}, not reviewed: {born}"),
             (false, Lang::Es) => format!("{name} ({id}): {memories}, sin revisar: {born}"),
         });
-        if p.folders.is_empty() {
+        let declared_as: Vec<_> = p.subfolders.iter().filter(|s| s.project_id == *id && s.repository_id != *id).collect();
+        if p.folders.is_empty() && declared_as.is_empty() {
             lines.push(
                 match lang {
                     Lang::En => "  no folder",
@@ -183,6 +189,30 @@ pub fn render_list(lang: Lang, projects: &[ListedProject]) -> String {
             lines.push(match lang {
                 Lang::En => format!("  remote {remote}"),
                 Lang::Es => format!("  remoto {remote}"),
+            });
+        }
+        for s in &declared_as {
+            let (subpath, repository) = (&s.subpath, named(&s.repository_id));
+            lines.push(match lang {
+                Lang::En => format!("  subfolder {subpath} of the repository of {repository}"),
+                Lang::Es => format!("  subcarpeta {subpath} del repositorio de {repository}"),
+            });
+            for path in &s.paths {
+                let at = &path.path;
+                lines.push(match (path.present, lang) {
+                    (true, _) => format!("    {at}"),
+                    (false, Lang::En) => format!("    {at}, no longer there"),
+                    (false, Lang::Es) => format!("    {at}, ya no está"),
+                });
+            }
+        }
+        for s in p.subfolders.iter().filter(|s| s.repository_id == *id) {
+            let (subpath, project) = (&s.subpath, named(&s.project_id));
+            lines.push(match (s.project_id == *id, lang) {
+                (true, Lang::En) => format!("  subfolder {subpath} leads to this project"),
+                (true, Lang::Es) => format!("  la subcarpeta {subpath} lleva a este proyecto"),
+                (false, Lang::En) => format!("  subfolder {subpath} leads to {project}"),
+                (false, Lang::Es) => format!("  la subcarpeta {subpath} lleva a {project}"),
             });
         }
         for merged in &p.merged {
@@ -569,6 +599,13 @@ fn render_set(lang: Lang, report: &DeleteReport) -> String {
             Lang::Es => format!("remotos, que siguen vinculados: {list}"),
         });
     }
+    for s in &report.subfolders {
+        let (subpath, repository) = (&s.subpath, &s.repository_id);
+        lines.push(match lang {
+            Lang::En => format!("subfolder {subpath} of {repository} stays declared as it; a save from there brings it back"),
+            Lang::Es => format!("la subcarpeta {subpath} de {repository} sigue declarada como él; un save desde allí lo hace volver"),
+        });
+    }
     if report.pending > 0 {
         let n = report.pending;
         lines.push(match (n == 1, lang) {
@@ -894,18 +931,23 @@ pub fn create_refused(lang: Lang, err: &ClientError) -> Option<String> {
     })
 }
 
-/// Makes the folder `path` is in lead to `project`, and says what that took.
-pub async fn locate(lang: Lang, client: &DaemonClient, project: &str, path: &Path) -> Result<String, AddError> {
+/// Makes the folder `path` is in lead to `project`, or with `subfolder` the
+/// folder `path` itself inside its repository, and says what that took.
+pub async fn locate(lang: Lang, client: &DaemonClient, project: &str, path: &Path, subfolder: bool) -> Result<String, AddError> {
     let identity = ProjectIdentity::resolve(path);
-    if !identity.root.is_dir() {
-        return Err(AddError::NotADirectory(identity.root));
+    let folder = if subfolder { identity.path } else { identity.root };
+    if !folder.is_dir() {
+        return Err(AddError::NotADirectory(folder));
     }
-    let located = client.locate_project(project, &identity.root).await?;
-    Ok(render_located(lang, &identity.root, &located))
+    let located = client.locate_project(project, &folder, subfolder).await?;
+    Ok(render_located(lang, &folder, &located))
 }
 
 /// What `clawg projects locate` prints.
 pub fn render_located(lang: Lang, root: &Path, located: &Located) -> String {
+    if let Some(repository) = &located.repository_id {
+        return render_declared(lang, root, repository, located);
+    }
     let (root, id) = (root.display(), &located.project_id);
     let merge = located.merge.as_ref().map(|m| (m.source.clone(), m.merge_id));
     match (merge, lang) {
@@ -920,6 +962,69 @@ pub fn render_located(lang: Lang, root: &Path, located: &Located) -> String {
         (_, Lang::En) => format!("{root} already leads to project {id}; nothing changed"),
         (_, Lang::Es) => format!("{root} ya lleva al proyecto {id}; no cambió nada"),
     }
+}
+
+/// What `clawg projects locate --subfolder` prints: where `path` leads now,
+/// and what stayed where it was, since a declaration moves no memory.
+fn render_declared(lang: Lang, path: &Path, repository: &str, located: &Located) -> String {
+    let (path, id) = (path.display(), &located.project_id);
+    if let Some(merge) = &located.merge {
+        let (source, n) = (&merge.source, merge.merge_id.unwrap_or_default());
+        return match lang {
+            Lang::En => format!(
+                "{path} leads to project {id} now: project {source}, which only it led to, was merged into it (merge {n}), \
+                 and `clawg projects merge --undo {n}` takes that back"
+            ),
+            Lang::Es => format!(
+                "{path} lleva ahora al proyecto {id}: el proyecto {source}, al que sólo llevaba ella, se unió en él (unión {n}), \
+                 y `clawg projects merge --undo {n}` lo deshace"
+            ),
+        };
+    }
+    if located.already {
+        return match lang {
+            Lang::En => format!("{path} already leads to project {id}; nothing changed"),
+            Lang::Es => format!("{path} ya lleva al proyecto {id}; no cambió nada"),
+        };
+    }
+    if located.removed {
+        let mut lines = vec![match lang {
+            Lang::En => format!("{path} leads to project {id} again, the project of its repository"),
+            Lang::Es => format!("{path} vuelve a llevar al proyecto {id}, el de su repositorio"),
+        }];
+        if let Some(previous) = located.previous.as_ref().filter(|p| *p != id) {
+            lines.push(match lang {
+                Lang::En => format!(
+                    "what was saved in {previous} stays there; `clawg projects merge {previous} --into {id} --dry-run` shows what joining it back takes"
+                ),
+                Lang::Es => format!(
+                    "lo guardado en {previous} sigue allí; `clawg projects merge {previous} --into {id} --dry-run` muestra lo que lleva volver a unirlo"
+                ),
+            });
+        }
+        return lines.join("\n");
+    }
+    [
+        match lang {
+            Lang::En => format!("{path} leads to project {id} now, inside the repository of project {repository}"),
+            Lang::Es => format!("{path} lleva ahora al proyecto {id}, dentro del repositorio del proyecto {repository}"),
+        },
+        match lang {
+            Lang::En => format!(
+                "what was saved from it before stays in {repository}; \
+                 `clawg projects move --from-project {repository} --to-project {id} --text WORDS --dry-run` finds it"
+            ),
+            Lang::Es => format!(
+                "lo guardado desde allí antes sigue en {repository}; \
+                 `clawg projects move --from-project {repository} --to-project {id} --text PALABRAS --dry-run` lo encuentra"
+            ),
+        },
+        match lang {
+            Lang::En => format!("a session opened there before keeps {repository} until it restarts"),
+            Lang::Es => format!("una sesión abierta allí antes sigue con {repository} hasta que se reinicia"),
+        },
+    ]
+    .join("\n")
 }
 
 /// What `clawg projects locate` prints when the daemon refused it.
@@ -939,7 +1044,7 @@ pub async fn add(lang: Lang, client: &DaemonClient, path: &Path) -> Result<Strin
         return Err(AddError::NotADirectory(project.root));
     }
     let legacy = project.legacy_ids();
-    let id = client.register_project(&project.root, &legacy, true).await?.project_id;
+    let id = client.register_project(&project.root, None, &legacy, true).await?.project_id;
     let root = project.root.display();
     Ok(match lang {
         Lang::En => format!("added {root} as project {id}; the daemon is indexing its files in the background"),
@@ -958,13 +1063,13 @@ pub async fn move_memories(lang: Lang, client: &DaemonClient, opts: &MoveOpts, c
                 return Err(AddError::NotADirectory(project.root));
             }
             let legacy = project.legacy_ids();
-            Some(client.register_project(&project.root, &legacy, false).await?.project_id)
+            Some(client.register_project(&project.root, Some(&project.path), &legacy, false).await?.project_id)
         }
         None => None,
     };
     let here = if opts.here {
         let project = ProjectIdentity::resolve(cwd);
-        Some(client.register_project(&project.root, &project.legacy_ids(), false).await?.project_id)
+        Some(client.register_project(&project.root, Some(&project.path), &project.legacy_ids(), false).await?.project_id)
     } else {
         None
     };
@@ -1196,6 +1301,99 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_names_the_subfolders() {
+        let declared = serde_json::json!({
+            "repository_id": "mono-1a2b", "subpath": "apps/web", "project_id": "web",
+            "paths": [{ "path": "/work/mono/apps/web", "present": true }, { "path": "/old/mono/apps/web", "present": false }],
+        });
+        let listing: Vec<ListedProject> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "mono-1a2b", "name": "mono", "born": "root", "reviewed": true, "created_at": 1,
+                "folders": [{ "root_id": "mono-1a2b", "root_path": "/work/mono", "remote": null, "index_docs": true, "present": true }],
+                "remotes": [], "memories": 3, "suggestions": [], "subfolders": [declared],
+            },
+            {
+                "id": "web", "name": "web", "born": "user", "reviewed": true, "created_at": 2,
+                "folders": [], "remotes": [], "memories": 1, "suggestions": [], "subfolders": [declared],
+            },
+        ]))
+        .unwrap();
+        assert_eq!(
+            render_list(Lang::En, &listing),
+            "mono (mono-1a2b): 3 memories\n\
+             \x20 folder /work/mono\n\
+             \x20 subfolder apps/web leads to web (web)\n\
+             web (web): 1 memory\n\
+             \x20 subfolder apps/web of the repository of mono (mono-1a2b)\n\
+             \x20   /work/mono/apps/web\n\
+             \x20   /old/mono/apps/web, no longer there"
+        );
+        assert_eq!(
+            render_list(Lang::Es, &listing),
+            "mono (mono-1a2b): 3 memorias\n\
+             \x20 carpeta /work/mono\n\
+             \x20 la subcarpeta apps/web lleva a web (web)\n\
+             web (web): 1 memoria\n\
+             \x20 subcarpeta apps/web del repositorio de mono (mono-1a2b)\n\
+             \x20   /work/mono/apps/web\n\
+             \x20   /old/mono/apps/web, ya no está"
+        );
+    }
+
+    #[test]
+    fn a_declared_subfolder_is_printed_with_what_stayed_behind() {
+        let located = |extra: serde_json::Value| -> Located {
+            let mut whole = serde_json::json!({
+                "project_id": "web", "root_id": "mono-1a2b", "already": false,
+                "repository_id": "mono-1a2b", "subpath": "apps/web",
+            });
+            whole.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(whole).unwrap()
+        };
+        let path = Path::new("/work/mono/apps/web");
+        let declared = located(serde_json::json!({}));
+        assert_eq!(
+            render_located(Lang::En, path, &declared),
+            "/work/mono/apps/web leads to project web now, inside the repository of project mono-1a2b\n\
+             what was saved from it before stays in mono-1a2b; \
+             `clawg projects move --from-project mono-1a2b --to-project web --text WORDS --dry-run` finds it\n\
+             a session opened there before keeps mono-1a2b until it restarts"
+        );
+        assert_eq!(
+            render_located(Lang::Es, path, &declared),
+            "/work/mono/apps/web lleva ahora al proyecto web, dentro del repositorio del proyecto mono-1a2b\n\
+             lo guardado desde allí antes sigue en mono-1a2b; \
+             `clawg projects move --from-project mono-1a2b --to-project web --text PALABRAS --dry-run` lo encuentra\n\
+             una sesión abierta allí antes sigue con mono-1a2b hasta que se reinicia"
+        );
+        let removed = located(serde_json::json!({ "project_id": "mono-1a2b", "removed": true, "previous": "web" }));
+        assert_eq!(
+            render_located(Lang::En, path, &removed),
+            "/work/mono/apps/web leads to project mono-1a2b again, the project of its repository\n\
+             what was saved in web stays there; `clawg projects merge web --into mono-1a2b --dry-run` shows what joining it back takes"
+        );
+        assert_eq!(
+            render_located(Lang::Es, path, &removed),
+            "/work/mono/apps/web vuelve a llevar al proyecto mono-1a2b, el de su repositorio\n\
+             lo guardado en web sigue allí; `clawg projects merge web --into mono-1a2b --dry-run` muestra lo que lleva volver a unirlo"
+        );
+        let already = located(serde_json::json!({ "already": true }));
+        assert_eq!(render_located(Lang::En, path, &already), "/work/mono/apps/web already leads to project web; nothing changed");
+        assert_eq!(render_located(Lang::Es, path, &already), "/work/mono/apps/web ya lleva al proyecto web; no cambió nada");
+        let merged = Located { merge: Some(merge_report(serde_json::json!({ "merge_id": 3, "source": "site", "target": "web" }))), ..declared };
+        assert_eq!(
+            render_located(Lang::En, path, &merged),
+            "/work/mono/apps/web leads to project web now: project site, which only it led to, was merged into it (merge 3), \
+             and `clawg projects merge --undo 3` takes that back"
+        );
+        assert_eq!(
+            render_located(Lang::Es, path, &merged),
+            "/work/mono/apps/web lleva ahora al proyecto web: el proyecto site, al que sólo llevaba ella, se unió en él (unión 3), \
+             y `clawg projects merge --undo 3` lo deshace"
+        );
+    }
+
+    #[test]
     fn a_listing_marks_what_was_created_alone_and_the_suggestions() {
         assert_eq!(
             render_list(Lang::En, &listing()),
@@ -1370,7 +1568,7 @@ mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
         let repo = tempfile::tempdir().expect("tempdir");
-        let id = c.register_project(repo.path(), &[], false).await.expect("register").project_id;
+        let id = c.register_project(repo.path(), None, &[], false).await.expect("register").project_id;
 
         let renamed = rename(Lang::En, &c, &id, " App web ").await.expect("rename");
 
@@ -1391,8 +1589,8 @@ mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
         let (one, two) = (tempfile::tempdir().expect("tempdir"), tempfile::tempdir().expect("tempdir"));
-        let a = c.register_project(one.path(), &[], false).await.expect("register").project_id;
-        let b = c.register_project(two.path(), &[], false).await.expect("register").project_id;
+        let a = c.register_project(one.path(), None, &[], false).await.expect("register").project_id;
+        let b = c.register_project(two.path(), None, &[], false).await.expect("register").project_id;
 
         let kept = keep_apart(Lang::En, &c, &a, &b).await.expect("keep apart");
         assert_eq!(kept, format!("{a} and {b} stay apart; no suggestion that they are one project is made again"));
@@ -1439,7 +1637,7 @@ mod tests {
         let root = ProjectIdentity::resolve(repo.path()).root;
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("README.md"), "# Other\nHow the other project ships.\n").unwrap();
-        let id = c.register_project(&root, &[], false).await.expect("register as a label").project_id;
+        let id = c.register_project(&root, None, &[], false).await.expect("register as a label").project_id;
         let refused = c.search_docs(&id, "How the other project ships", None).await.expect_err("not accepted");
         assert!(matches!(refused, ClientError::Daemon { status: 403, .. }), "{refused:?}");
 
@@ -1451,6 +1649,56 @@ mod tests {
         );
         let found = c.search_docs(&id, "How the other project ships", None).await.expect("search");
         assert_eq!(found.hits.first().map(|h| h.path.as_str()), Some("README.md"), "{:?}", found.hits);
+    }
+
+    #[tokio::test]
+    async fn moving_to_a_declared_subfolder_moves_into_its_project() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mono = ProjectIdentity::resolve(repo.path()).root.join("mono");
+        for sub in [".git", "apps/web/src"] {
+            std::fs::create_dir_all(mono.join(sub)).unwrap();
+        }
+        let web = c.resolve_project("web", true, false, clawg_core::memory::registry::Born::User).await.unwrap().project_id.expect("an id");
+        c.locate_project("web", &mono.join("apps").join("web"), true).await.expect("declare");
+        c.save(crate::client::SaveArgs {
+            content: "a note filed nowhere".into(),
+            agent_id: "agent-a".into(),
+            project_id: None,
+            memory_type: Some("semantic_fact".into()),
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        })
+        .await
+        .expect("save");
+        let mut rows = Vec::new();
+        for _ in 0..40 {
+            rows = c.list(crate::client::ListArgs::default()).await.expect("list");
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let id = rows.first().expect("the save landed").id.to_string();
+        let opts = |args: &[&str]| -> MoveOpts {
+            let mut argv = vec!["clawg", "projects", "move"];
+            argv.extend_from_slice(args);
+            match <crate::cli::Cli as clap::Parser>::try_parse_from(&argv).expect("parse").command {
+                crate::cli::Command::Projects { action: crate::cli::ProjectsAction::Move(opts) } => opts,
+                other => panic!("{other:?}"),
+            }
+        };
+        let src = mono.join("apps").join("web").join("src");
+        let src_arg = src.to_string_lossy().into_owned();
+
+        let moved = move_memories(Lang::En, &c, &opts(&["--id", &id, "--to", &src_arg]), repo.path()).await.expect("move");
+        assert!(moved.starts_with(&format!("moved 1 memory to project {web}")), "{moved}");
+        let here = move_memories(Lang::En, &c, &opts(&["--here", "--to-none", "--dry-run"]), &src).await.expect("dry run");
+        assert!(here.starts_with("would move 1 memory"), "--here is the project of the working directory: {here}");
     }
 
     #[tokio::test]
@@ -1536,6 +1784,24 @@ mod tests {
             "pending": 1, "failed": [{ "operation_id": "op-1", "agent_id": "agent-a" }],
             "candidates": [{ "project_id": "web-3c4d", "name": "web", "reason": "same_name" }],
         }))
+    }
+
+    #[test]
+    fn a_delete_report_names_its_subfolders() {
+        let report = delete_report(serde_json::json!({
+            "with_memories": true, "code": "1a2b3c4d",
+            "live": { "memories": 1, "trajectories": 0, "skills": 0 },
+            "subfolders": [{ "repository_id": "mono-9f9f", "subpath": "apps/web" }],
+        }));
+        let line = |lang: Lang| render_delete(lang, &report, false).lines().find(|l| l.contains("apps/web")).map(str::to_string);
+        assert_eq!(
+            line(Lang::En).as_deref(),
+            Some("subfolder apps/web of mono-9f9f stays declared as it; a save from there brings it back")
+        );
+        assert_eq!(
+            line(Lang::Es).as_deref(),
+            Some("la subcarpeta apps/web de mono-9f9f sigue declarada como él; un save desde allí lo hace volver")
+        );
     }
 
     #[test]
@@ -1765,8 +2031,8 @@ mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
         let (one, two) = (tempfile::tempdir().expect("tempdir"), tempfile::tempdir().expect("tempdir"));
-        let gone = c.register_project(one.path(), &[], false).await.expect("register").project_id;
-        let empty = c.register_project(two.path(), &[], false).await.expect("register").project_id;
+        let gone = c.register_project(one.path(), None, &[], false).await.expect("register").project_id;
+        let empty = c.register_project(two.path(), None, &[], false).await.expect("register").project_id;
         c.save(crate::client::SaveArgs {
             content: "a note of the project to delete".into(),
             agent_id: "agent-a".into(),

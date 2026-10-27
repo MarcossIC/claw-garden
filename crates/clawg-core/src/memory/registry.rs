@@ -95,6 +95,26 @@ pub struct ListedDelete {
     pub back: bool,
 }
 
+/// A folder of this machine a declared subfolder is in: a folder of its
+/// repository and the subpath.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedSubfolderPath {
+    pub path: String,
+    /// Whether that directory is there.
+    pub present: bool,
+}
+
+/// A subfolder of a repository declared as a project, listed under both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedSubfolder {
+    /// The live project of the repository.
+    pub repository_id: String,
+    pub subpath: String,
+    /// The live project it leads to.
+    pub project_id: String,
+    pub paths: Vec<ListedSubfolderPath>,
+}
+
 /// A project with what leads to it and what it holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListedProject {
@@ -109,6 +129,10 @@ pub struct ListedProject {
     /// The projects merged into it, which a daemon from before merges does not send.
     #[serde(default)]
     pub merged: Vec<ListedMerged>,
+    /// The subfolders declared as it and those of its repository, which a
+    /// daemon from before declarations does not send.
+    #[serde(default)]
+    pub subfolders: Vec<ListedSubfolder>,
 }
 
 /// A folder as `project_path` records it.
@@ -137,6 +161,8 @@ struct Stored {
     memories: HashMap<String, i64>,
     /// Project, other, reason and date of each suggestion not answered, oldest first.
     suggestions: Vec<(String, String, String, i64)>,
+    /// Repository, subpath and project of each declaration, oldest first.
+    subfolders: Vec<(String, String, String)>,
 }
 
 fn stored_in(c: &Connection) -> rusqlite::Result<Stored> {
@@ -178,7 +204,9 @@ fn stored_in(c: &Connection) -> rusqlite::Result<Stored> {
         "SELECT project_id, other_id, reason, created_at FROM project_suggestion WHERE answer IS NULL ORDER BY created_at, rowid",
     )?;
     let suggestions = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
-    Ok(Stored { projects, deleted, merged_into, merges, folders, remotes, memories, suggestions })
+    let mut stmt = c.prepare("SELECT parent_id, subpath, project_id FROM project_subfolder ORDER BY created_at, parent_id, subpath")?;
+    let subfolders = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    Ok(Stored { projects, deleted, merged_into, merges, folders, remotes, memories, suggestions, subfolders })
 }
 
 /// The live project `id` leads to through `merged_into`, as
@@ -203,34 +231,34 @@ struct Found {
     key: Option<String>,
 }
 
-/// Every project, with its folders, its remotes, how many memories it holds
-/// and the suggestions about it nobody answered, by name. Whether each
-/// recorded checkout is still there, and the remote of a folder no
-/// registration recorded a project in, are read from `ground` on a blocking
-/// thread.
+/// Every project, with its folders, its remotes, how many memories it holds,
+/// its declared subfolders and the suggestions about it nobody answered, by
+/// name. Whether each recorded checkout is still there, the remote of a folder
+/// no registration recorded a project in, and whether each path of a declared
+/// subfolder is there are read from the disk on a blocking thread.
 pub async fn list_projects(store: &MemoryStore, ground: Arc<dyn Ground>) -> Result<Vec<ListedProject>, MemoryError> {
     let stored = store.conn.call(|c| stored_in(c)).await.map_err(MemoryError::Connection)?;
-    let asked: Vec<(PathBuf, Option<String>, bool)> = stored
-        .folders
-        .iter()
-        .map(|f| (PathBuf::from(&f.root_path), f.git_stamp.clone(), f.project_id.is_none()))
-        .collect();
-    let found = tokio::task::spawn_blocking(move || {
-        asked
-            .into_iter()
-            .map(|(path, stamp, keyless)| Found {
-                present: ground.recorded_checkout_present(&path, stamp.as_deref()),
-                key: if keyless { ground.checkout(&path).key } else { None },
+    tokio::task::spawn_blocking(move || {
+        let found: Vec<Found> = stored
+            .folders
+            .iter()
+            .map(|f| {
+                let path = PathBuf::from(&f.root_path);
+                Found {
+                    present: ground.recorded_checkout_present(&path, f.git_stamp.as_deref()),
+                    key: if f.project_id.is_none() { ground.checkout(&path).key } else { None },
+                }
             })
-            .collect::<Vec<_>>()
+            .collect();
+        listed(&stored, &found, &|path| path.is_dir())
     })
     .await
-    .map_err(|e| MemoryError::Internal(format!("could not look at the project folders: {e}")))?;
-    Ok(listed(&stored, &found))
+    .map_err(|e| MemoryError::Internal(format!("could not look at the project folders: {e}")))
 }
 
-/// The listing of `stored`, with `found` for each of its folders in order.
-fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
+/// The listing of `stored`, with `found` for each of its folders in order and
+/// `is_dir` for the paths of its declared subfolders.
+fn listed(stored: &Stored, found: &[Found], is_dir: &dyn Fn(&std::path::Path) -> bool) -> Vec<ListedProject> {
     let live = |id: &str| follow(&stored.merged_into, id);
     let mut listed: Vec<ListedProject> = stored
         .projects
@@ -243,6 +271,7 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
             memories: stored.memories.get(&p.id).copied().unwrap_or(0),
             suggestions: Vec::new(),
             merged: Vec::new(),
+            subfolders: Vec::new(),
         })
         .collect();
     let at: HashMap<String, usize> = listed.iter().enumerate().map(|(i, l)| (l.project.id.clone(), i)).collect();
@@ -291,6 +320,25 @@ fn listed(stored: &Stored, found: &[Found]) -> Vec<ListedProject> {
                 merge_id: stored.merges.get(id).copied(),
                 merged_at: *merged_at,
             });
+        }
+    }
+    for (parent, subpath, project) in &stored.subfolders {
+        let (repository, project) = (live(parent), live(project));
+        let Some(&r) = at.get(&repository) else { continue };
+        let paths = listed[r]
+            .folders
+            .iter()
+            .map(|folder| {
+                let path = subpath.split('/').fold(PathBuf::from(&folder.root_path), |path, part| path.join(part));
+                ListedSubfolderPath { present: is_dir(&path), path: path.display().to_string() }
+            })
+            .collect();
+        let entry = ListedSubfolder { repository_id: repository.clone(), subpath: subpath.clone(), project_id: project.clone(), paths };
+        let sides = if project == repository { vec![r] } else { std::iter::once(r).chain(at.get(&project).copied()).collect() };
+        for i in sides {
+            if !listed[i].subfolders.iter().any(|s| s.repository_id == entry.repository_id && s.subpath == entry.subpath) {
+                listed[i].subfolders.push(entry.clone());
+            }
         }
     }
     for l in &mut listed {
@@ -752,12 +800,39 @@ fn named_in(all: &[(String, String, bool)], name: &str) -> Vec<String> {
 }
 
 /// The folders that lead to `project`, oldest first: those a registration
-/// recorded it in, and one from before V27 with its id.
+/// recorded it in, and one from before V27 with its id. A project with none
+/// of its own that a declared subfolder leads to has the folders of the
+/// repositories it is declared in, whose docs index holds its files.
 fn folders_of_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<ResolvedFolder>> {
+    let own = own_folders_in(c, project)?;
+    if !own.is_empty() {
+        return Ok(own);
+    }
+    let mut repositories: Vec<String> = Vec::new();
+    for declared in crate::memory::subfolder::leading_to_in(c, project)? {
+        if declared.repository_id != project && !repositories.contains(&declared.repository_id) {
+            repositories.push(declared.repository_id);
+        }
+    }
+    let mut folders: Vec<(i64, ResolvedFolder)> = Vec::new();
+    for repository in repositories {
+        folders.extend(own_folders_dated_in(c, &repository)?);
+    }
+    folders.sort_by(|a, b| (a.0, &a.1.root_id).cmp(&(b.0, &b.1.root_id)));
+    folders.dedup_by(|a, b| a.1 == b.1);
+    Ok(folders.into_iter().map(|(_, f)| f).collect())
+}
+
+fn own_folders_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<ResolvedFolder>> {
+    Ok(own_folders_dated_in(c, project)?.into_iter().map(|(_, f)| f).collect())
+}
+
+fn own_folders_dated_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<(i64, ResolvedFolder)>> {
     let mut stmt = c.prepare(
-        "SELECT id, index_docs FROM project_path WHERE project_id = ?1 OR (project_id IS NULL AND id = ?1) ORDER BY created_at, id",
+        "SELECT created_at, id, index_docs FROM project_path \
+         WHERE project_id = ?1 OR (project_id IS NULL AND id = ?1) ORDER BY created_at, id",
     )?;
-    let rows = stmt.query_map([project], |r| Ok(ResolvedFolder { root_id: r.get(0)?, index_docs: r.get(1)? }))?;
+    let rows = stmt.query_map([project], |r| Ok((r.get(0)?, ResolvedFolder { root_id: r.get(1)?, index_docs: r.get(2)? })))?;
     rows.collect()
 }
 
@@ -1125,6 +1200,86 @@ mod tests {
             "the clone's folder goes by the remote its checkout has"
         );
         assert_eq!(listed[0].remotes, vec!["github.com/acme/app".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_declaration_is_listed_on_both_sides_with_its_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mono, other) = (dir.path().join("mono"), dir.path().join("other"));
+        std::fs::create_dir_all(mono.join("apps").join("web")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (m, o) = (mono.display().to_string(), other.display().to_string());
+        store
+            .conn
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('mono-1a2b', 'mono', 'root', 1, 1), ('web', 'web', 'user', 1, 2);
+                     INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) \
+                       VALUES ('site', 'site', 'user', 1, 3, 'web', 4);
+                     INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES \
+                       ('mono-1a2b', 'apps/web', 'site', 5), ('mono-1a2b', 'apps/home', 'mono-1a2b', 6);",
+                )?;
+                c.execute(
+                    "INSERT INTO project_path (id, root_path, created_at, project_id) VALUES ('mono-1a2b', ?1, 1, 'mono-1a2b'), ('mono-0002', ?2, 2, 'mono-1a2b')",
+                    [m, o],
+                )
+            })
+            .await
+            .unwrap();
+
+        let listed = list_projects(&store, Arc::new(FakeGround::default())).await.unwrap();
+
+        let ids: Vec<&str> = listed.iter().map(|l| l.project.id.as_str()).collect();
+        assert_eq!(ids, vec!["mono-1a2b", "web"]);
+        let web_paths = vec![
+            ListedSubfolderPath { path: mono.join("apps").join("web").display().to_string(), present: true },
+            ListedSubfolderPath { path: other.join("apps").join("web").display().to_string(), present: false },
+        ];
+        let declared = ListedSubfolder {
+            repository_id: "mono-1a2b".into(),
+            subpath: "apps/web".into(),
+            project_id: "web".into(),
+            paths: web_paths,
+        };
+        assert_eq!(listed[1].subfolders, vec![declared.clone()], "under the project, through the tombstone it names");
+        assert!(listed[1].folders.is_empty());
+        let repository: Vec<(&str, &str)> = listed[0].subfolders.iter().map(|s| (s.subpath.as_str(), s.project_id.as_str())).collect();
+        assert_eq!(repository, vec![("apps/web", "web"), ("apps/home", "mono-1a2b")], "and under its repository");
+
+        let json = serde_json::to_value(&listed[1]).unwrap();
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove("subfolders");
+        let read: ListedProject = serde_json::from_value(old).unwrap();
+        assert!(read.subfolders.is_empty(), "a daemon from before declarations sends none");
+    }
+
+    #[tokio::test]
+    async fn a_subproject_resolves_to_the_folders_of_its_repository() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('mono-1a2b', 'mono', 'root', 1, 1), ('web', 'web', 'user', 1, 2), ('api', 'api', 'user', 1, 3);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id) VALUES \
+                       ('mono-1a2b', '/work/mono', 2, 1, 'mono-1a2b'), ('mono-0002', '/other/mono', 1, 0, 'mono-1a2b'), \
+                       ('api-9f9f', '/work/api', 1, 1, 'api');
+                     INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES \
+                       ('mono-1a2b', 'apps/web', 'web', 5), ('mono-1a2b', 'apps/api', 'api', 5);",
+                )
+            })
+            .await
+            .unwrap();
+
+        let web = resolve_project(&store, "web", AGENT).await.unwrap();
+        let folders: Vec<(&str, bool)> = web.folders.iter().map(|f| (f.root_id.as_str(), f.index_docs)).collect();
+        assert_eq!(folders, vec![("mono-0002", false), ("mono-1a2b", true)], "its repository's, oldest first");
+        let api = resolve_project(&store, "api", AGENT).await.unwrap();
+        let folders: Vec<&str> = api.folders.iter().map(|f| f.root_id.as_str()).collect();
+        assert_eq!(folders, vec!["api-9f9f"], "a folder of its own goes first and alone");
     }
 
     #[tokio::test]
