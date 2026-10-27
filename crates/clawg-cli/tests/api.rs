@@ -4633,6 +4633,11 @@ async fn every_route_that_takes_a_project_follows_a_merge() {
                     h.post_json("/v1/projects/locate", json!({ "project": app, "root_path": folder.path().to_string_lossy() })).await;
                 assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
                 assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route}: {body}");
+                let sub = checkout_with(folder.path(), "apps/web");
+                let ask = json!({ "project": app, "root_path": sub.to_string_lossy(), "subfolder": true });
+                let (status, body) = h.post_json("/v1/projects/locate", ask).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route} subfolder: {body}");
+                assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route} subfolder: {body}");
             }
             _ => panic!("{route} takes a project and no check here follows it past a merge"),
         }
@@ -5047,6 +5052,10 @@ async fn every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule() {
                 let (status, body) =
                     h.post_json("/v1/projects/locate", json!({ "project": gone, "root_path": folder.path().to_string_lossy() })).await;
                 refused(&route, status, &body);
+                let sub = checkout_with(folder.path(), "apps/web");
+                let ask = json!({ "project": gone, "root_path": sub.to_string_lossy(), "subfolder": true });
+                let (status, body) = h.post_json("/v1/projects/locate", ask).await;
+                refused(&route, status, &body);
             }
             _ => panic!("{route} takes a project and no check here says what it does with a deleted one"),
         }
@@ -5305,4 +5314,122 @@ async fn a_folder_without_vcs_moved_is_suggested_and_shown_until_answered() {
     assert_eq!(status, 200, "{body}");
     registered_dir(&h, &moved).await;
     assert_eq!(context_suggestions(&h, &after).await, Value::Null, "answered for good");
+}
+
+// ── the subfolders of a monorepo ────────────────────────────────────────────
+
+/// `dir` as a checkout (a `.git` directory, which is all a root needs) with
+/// `subpath` inside it, by its canonical name.
+fn checkout_with(dir: &std::path::Path, subpath: &str) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir.join(".git")).expect("a .git");
+    let sub = dir.join(subpath);
+    std::fs::create_dir_all(&sub).expect("the subfolder");
+    canonical(&sub)
+}
+
+fn canonical(path: &std::path::Path) -> std::path::PathBuf {
+    clawg_core::memory::identity::strip_verbatim(&std::fs::canonicalize(path).expect("canonicalize"))
+}
+
+async fn register_from(h: &Harness, root: &std::path::Path, path: &std::path::Path) -> Value {
+    let ask = json!({ "root_path": root.to_string_lossy(), "assigned": true, "path": path.to_string_lossy() });
+    let (status, body) = h.post_json("/v1/projects", ask).await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+async fn locate_subfolder(h: &Harness, project: &str, path: &std::path::Path) -> (u16, Value) {
+    h.post_json("/v1/projects/locate", json!({ "project": project, "root_path": path.to_string_lossy(), "subfolder": true })).await
+}
+
+#[tokio::test]
+async fn a_registration_without_a_path_or_with_one_elsewhere_answers_as_before() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let a = checkout_with(&base.path().join("a"), "src").parent().unwrap().to_path_buf();
+    let b_src = checkout_with(&base.path().join("b"), "src");
+    let plain = base.path().join("plain");
+    std::fs::create_dir(&plain).expect("a folder");
+    let before = registered_dir(&h, &a).await;
+
+    for path in [b_src.clone(), canonical(&plain), std::path::PathBuf::from("src"), a.join("src")] {
+        assert_eq!(register_from(&h, &a, &path).await, before, "{}", path.display());
+    }
+    let derived = json!({ "root_path": a.to_string_lossy(), "path": a.join("src").to_string_lossy() });
+    let (status, body) = h.post_json("/v1/projects", derived).await;
+    let (_, without) = h.post_json("/v1/projects", json!({ "root_path": a.to_string_lossy() })).await;
+    assert_eq!((status, body), (200, without), "a caller that derives its id ignores the path");
+}
+
+#[tokio::test]
+async fn a_declared_subfolder_takes_what_is_saved_inside_it_in_every_clone() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let base = canonical(base.path());
+    git(&base, &["init", "monorepo"]);
+    let mono = base.join("monorepo");
+    git(&mono, &["remote", "add", "origin", "https://github.com/acme/monorepo.git"]);
+    git(&mono, &["commit", "--allow-empty", "-m", "first"]);
+    git(&base, &["clone", "monorepo", "elsewhere"]);
+    let clone = base.join("elsewhere");
+    git(&clone, &["remote", "set-url", "origin", "https://github.com/acme/monorepo.git"]);
+    for root in [&mono, &clone] {
+        for sub in ["apps/web/src", "apps/webapp"] {
+            std::fs::create_dir_all(root.join(sub)).expect("the subfolders");
+        }
+    }
+    let m = registered_dir(&h, &mono).await["project_id"].as_str().unwrap().to_string();
+    let web = resolve(&h, json!({ "project": "web", "create": true })).await["project_id"].as_str().unwrap().to_string();
+
+    let (status, declared) = locate_subfolder(&h, "web", &mono.join("apps").join("web")).await;
+    assert_eq!(status, 200, "{declared}");
+    assert_eq!((declared["project_id"].as_str(), declared["repository_id"].as_str()), (Some(web.as_str()), Some(m.as_str())), "{declared}");
+    assert_eq!(declared["subpath"].as_str(), Some("apps/web"), "{declared}");
+
+    let inside = register_from(&h, &mono, &mono.join("apps").join("web").join("src")).await;
+    assert_eq!(inside["project_id"].as_str(), Some(web.as_str()), "{inside}");
+    let row = save_in(&h, inside["project_id"].as_str().unwrap(), "the web app renders on the server").await;
+    assert_eq!(project_of(&h, row).await, json!(web));
+    assert_eq!(register_from(&h, &mono, &mono).await["project_id"].as_str(), Some(m.as_str()));
+    assert_eq!(register_from(&h, &mono, &mono.join("apps").join("webapp")).await["project_id"].as_str(), Some(m.as_str()));
+    assert_eq!(inside["root_id"], registered_dir(&h, &mono).await["root_id"], "the root keeps its own id");
+
+    let cloned = register_from(&h, &clone, &clone.join("apps").join("web").join("src")).await;
+    assert_eq!(cloned["project_id"].as_str(), Some(web.as_str()), "a clone of the remote reaches it: {cloned}");
+    assert_eq!(register_from(&h, &clone, &clone).await["project_id"].as_str(), Some(m.as_str()));
+}
+
+#[tokio::test]
+async fn a_subfolder_is_declared_through_the_daemon_and_refused_at_a_root() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let web_dir = checkout_with(&base.path().join("mono"), "apps/web");
+    let mono = web_dir.parent().unwrap().parent().unwrap().to_path_buf();
+    let plain = base.path().join("plain");
+    std::fs::create_dir(&plain).expect("a folder");
+    resolve(&h, json!({ "project": "web", "create": true })).await;
+    let m = registered_dir(&h, &mono).await["project_id"].as_str().unwrap().to_string();
+
+    for refused in [mono.clone(), canonical(&plain), base.path().join("no-such-dir")] {
+        let (status, body) = locate_subfolder(&h, "web", &refused).await;
+        assert_eq!(status, 400, "{}: {body}", refused.display());
+    }
+    let (status, body) = locate_subfolder(&h, "web", &mono).await;
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("without `subfolder`")), "{status} {body}");
+    let (status, body) = locate_subfolder(&h, "nothing here", &web_dir).await;
+    assert_eq!(status, 404, "{body}");
+
+    let (status, declared) = locate_subfolder(&h, "web", &web_dir).await;
+    assert_eq!((status, declared["already"].as_bool(), declared["removed"].as_bool()), (200, Some(false), Some(false)), "{declared}");
+    let (_, again) = locate_subfolder(&h, "web", &web_dir).await;
+    assert_eq!(again["already"].as_bool(), Some(true), "{again}");
+    let (_, listing) = h.get_json("/v1/projects").await;
+    let web = listing["projects"].as_array().unwrap().iter().find(|p| p["name"] == "web").unwrap().clone();
+    let shown = &web["subfolders"][0];
+    assert_eq!((shown["repository_id"].as_str(), shown["subpath"].as_str()), (Some(m.as_str()), Some("apps/web")), "{web}");
+    assert_eq!(shown["paths"][0]["present"].as_bool(), Some(true), "{web}");
+
+    let (status, removed) = locate_subfolder(&h, &m, &web_dir).await;
+    assert_eq!((status, removed["removed"].as_bool(), removed["project_id"].as_str()), (200, Some(true), Some(m.as_str())), "{removed}");
+    assert_eq!(register_from(&h, &mono, &web_dir).await["project_id"].as_str(), Some(m.as_str()), "it leads to the repository again");
 }
