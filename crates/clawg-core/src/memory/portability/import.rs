@@ -146,6 +146,29 @@ pub struct ImportReport {
     /// The suggestions it left, or would leave on a dry run.
     #[serde(default)]
     pub suggestions: Vec<ImportedSuggestion>,
+    /// The subfolders the file declares, written here or not.
+    #[serde(default)]
+    pub subfolders: Vec<ImportedSubfolder>,
+}
+
+/// A subfolder a repository of the file declares as a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedSubfolder {
+    /// The repository and the project it leads to, by their ids in the file.
+    pub repository_id: String,
+    pub subpath: String,
+    pub project_id: String,
+    /// The projects here of both, when they went somewhere.
+    #[serde(default)]
+    pub repository_here: Option<String>,
+    #[serde(default)]
+    pub project_here: Option<String>,
+    /// Whether it is written here, or would be on a dry run.
+    pub written: bool,
+    /// Why not: `declared_here` (a declaration here keeps the subpath),
+    /// `no_repository` (its repository went nowhere) or `same_project`.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// A suggestion that two projects here may be one.
@@ -240,6 +263,8 @@ struct Prepared {
     suggestions: Vec<ImportedSuggestion>,
     /// The deleted projects here, as the plan read them.
     deleted: HashSet<String>,
+    /// The declarations of the file, with what becomes of each.
+    subfolders: Vec<ImportedSubfolder>,
     parsed: Parsed,
     /// For another tool's export, the notes its rows came from, in the order
     /// of their rows; empty for a clawg file.
@@ -398,10 +423,21 @@ struct Settled {
     placed: Vec<ImportedProject>,
     suggestions: Vec<ImportedSuggestion>,
     deleted: HashSet<String>,
+    subfolders: Vec<ImportedSubfolder>,
 }
 
 /// How many ids a new project of the file tries before it takes its first.
 const NEW_ID_TRIES: u32 = 64;
+
+/// The id a new project of the file takes: its own when nothing here and no
+/// other new project has it, else the first free one its name gives.
+fn free_id(id: &str, name: &str, registry: &Registry, taken: &HashSet<String>, now: i64) -> String {
+    let free = |id: &str| !registry.taken(id) && !taken.contains(id);
+    if free(id) {
+        return id.to_owned();
+    }
+    (0..NEW_ID_TRIES).map(|n| new_project_id(name, now, n)).find(|id| free(id)).unwrap_or_else(|| id.to_owned())
+}
 
 /// Settles the projects of a clawg file (see [`place`]); `roots` are the
 /// roots here of their folders, in order, `planning` what [`plan`] read of
@@ -430,18 +466,7 @@ fn settle_projects(
         let name = project.name.clone().unwrap_or_else(|| project_name(&project.id).to_owned());
         let (to, by) = match projects::place(project, &folders, registry) {
             Placed::Here(to, by) => (Some(to), Some(by)),
-            Placed::New => {
-                let mut id = project.id.clone();
-                let mut n = 0;
-                while registry.taken(&id) || taken.contains(&id) {
-                    if n == NEW_ID_TRIES {
-                        break;
-                    }
-                    id = new_project_id(&name, now, n);
-                    n += 1;
-                }
-                (Some(id), Some(By::New))
-            }
+            Placed::New => (Some(free_id(&project.id, &name, registry, &taken, now)), Some(By::New)),
             Placed::Nowhere => (None, None),
         };
         let created = to.as_ref().is_some_and(|to| !registry.projects.contains_key(to) && taken.insert(to.clone()));
@@ -490,6 +515,52 @@ fn settle_projects(
         }
         for remote in project.all_remotes() {
             settled.binds.push((remote.to_owned(), to.clone()));
+        }
+    }
+    // The declarations of each repository, with the projects here of both
+    // ends; a subproject no row took is made for the declaration to lead to.
+    for project in projects {
+        for declared in &project.subfolders {
+            let repository = settled.project_ids.get(&project.id).cloned();
+            let mut target = settled.project_ids.get(&declared.project_id).cloned();
+            if let (Some(_), None) = (&repository, &target) {
+                let line = projects.iter().find(|p| p.id == declared.project_id);
+                let name = line.and_then(|p| p.name.clone()).unwrap_or_else(|| project_name(&declared.project_id).to_owned());
+                let id = free_id(&declared.project_id, &name, registry, &taken, now);
+                taken.insert(id.clone());
+                settled.creates.push((id.clone(), name));
+                settled.project_ids.insert(declared.project_id.clone(), id.clone());
+                match settled.placed.iter_mut().find(|p| p.id == declared.project_id) {
+                    Some(placed) => (placed.to, placed.by, placed.created) = (Some(id.clone()), Some(By::New), true),
+                    None => settled.placed.push(ImportedProject {
+                        id: declared.project_id.clone(),
+                        name: None,
+                        to: Some(id.clone()),
+                        by: Some(By::New),
+                        created: true,
+                        revived: false,
+                    }),
+                }
+                target = Some(id);
+            }
+            let here = repository.as_deref().and_then(|r| {
+                registry.subfolders.iter().find(|(parent, subpath, _)| registry.canonical(parent) == r && *subpath == declared.subpath)
+            });
+            let reason = match (&repository, &target, here) {
+                (None, _, _) => Some("no_repository"),
+                (_, _, Some(_)) => Some("declared_here"),
+                (Some(r), Some(t), None) if r == t => Some("same_project"),
+                _ => None,
+            };
+            settled.subfolders.push(ImportedSubfolder {
+                repository_id: project.id.clone(),
+                subpath: declared.subpath.clone(),
+                project_id: declared.project_id.clone(),
+                repository_here: repository,
+                project_here: target,
+                written: reason.is_none(),
+                reason: reason.map(str::to_owned),
+            });
         }
     }
     let mut suggest = |a: &str, b: &str, reason: &str| {
@@ -567,7 +638,7 @@ fn mapped_projects(parsed: &Parsed, roots: &[PathBuf], plans: &[RootPlan]) -> Se
 
 /// The rows of `parsed` worked out, with the projects `settled` gave them.
 fn prepare(mut parsed: Parsed, settled: Settled, options: &ImportOptions, texts: Texts) -> Prepared {
-    let Settled { project_ids, projects, creates, binds, placed, suggestions, deleted } = settled;
+    let Settled { project_ids, projects, creates, binds, placed, suggestions, deleted, subfolders } = settled;
     if let Texts::Raw = texts {
         // The head of a save is stored with its pieces, so it is masked as
         // the text is.
@@ -614,7 +685,7 @@ fn prepare(mut parsed: Parsed, settled: Settled, options: &ImportOptions, texts:
             }
         })
         .collect();
-    Prepared { rows, projects, creates, binds, placed, suggestions, deleted, parsed, notes }
+    Prepared { rows, projects, creates, binds, placed, suggestions, deleted, subfolders, parsed, notes }
 }
 
 /// Where a row of the file ended up.
@@ -1530,6 +1601,20 @@ fn record_projects(tx: &Transaction<'_>, prepared: &Prepared, now: i64, journal:
             journal.registry(tx, "project", id, None, Some(name))?;
         }
     }
+    for d in prepared.subfolders.iter().filter(|d| d.written) {
+        let (Some(repository), Some(project)) = (&d.repository_here, &d.project_here) else { continue };
+        let (repository, project) = (canonical_in(tx, repository)?, canonical_in(tx, project)?);
+        if repository == project || taken.contains_key(&repository) || taken.contains_key(&project) {
+            continue;
+        }
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![repository, d.subpath, project, now],
+        )?;
+        if added == 1 {
+            journal.registry(tx, "subfolder", &repository, Some(&d.subpath), Some(&project))?;
+        }
+    }
     for s in &prepared.suggestions {
         if taken.contains_key(&s.project_id) || taken.contains_key(&s.other_id) {
             continue;
@@ -2098,6 +2183,7 @@ fn report(prepared: &Prepared, written: &Written, dry_run: bool) -> ImportReport
         import_id: written.import_id,
         projects: prepared.placed.clone(),
         suggestions: prepared.suggestions.clone(),
+        subfolders: prepared.subfolders.clone(),
         ..Default::default()
     };
     for project in &mut report.projects {
@@ -3202,6 +3288,86 @@ pub(crate) mod tests {
 
         assert_eq!(outcome.project_id, "notas-1a2b", "a move of the checkout the import recorded");
         assert_eq!(count(&dst, "SELECT COUNT(*) FROM project_suggestion").await, 0);
+    }
+
+    /// A repository here bound to the remote of the file's `mono-5e6f`.
+    const MONO_HERE: &str = "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('mono-here', 'mono', 'root', 1, 1);
+         INSERT INTO project_path (id, root_path, created_at, project_id, remote) \
+           VALUES ('mono-here', '/work/mono', 1, 'mono-here', 'github.com/acme/mono');
+         INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/mono', 'mono-here', 1);";
+
+    const MONO_LINES: [&str; 2] = [
+        r#"{"kind":"project","id":"mono-5e6f","name":"mono","folders":[{"root_path":"/elsewhere/mono","remote":"github.com/acme/mono"}],"remotes":["github.com/acme/mono"],"subfolders":[{"subpath":"apps/web","project_id":"web-9c0d"}]}"#,
+        r#"{"kind":"project","id":"web-9c0d","name":"Web"}"#,
+    ];
+
+    async fn subfolders_of(store: &MemoryStore) -> Vec<(String, String, String)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT parent_id, subpath, project_id FROM project_subfolder ORDER BY rowid")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_subfolders_of_a_repository_travel_with_it() {
+        let dst = destination().await;
+        exec(&dst, MONO_HERE).await;
+        let file = clawg_file(&MONO_LINES, &[(1, Some("mono-5e6f"), "A note of the monorepo")]);
+
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+
+        assert_eq!(went(&report, "mono-5e6f").to.as_deref(), Some("mono-here"));
+        let web = went(&report, "web-9c0d");
+        assert!(web.created, "the subproject no row took is made for its declaration");
+        let web = web.to.clone().unwrap();
+        assert_eq!(subfolders_of(&dst).await, vec![("mono-here".into(), "apps/web".into(), web.clone())]);
+        assert_eq!(report.subfolders.len(), 1);
+        assert!(report.subfolders[0].written);
+        assert_eq!(
+            count(&dst, "SELECT COUNT(*) FROM memory_import_registry WHERE kind = 'subfolder' AND a = 'mono-here' AND b = 'apps/web'").await,
+            1
+        );
+
+        let ground = Arc::new(FakeGround::default());
+        ground.put(Path::new("/work/mono"), Some("github.com/acme/mono"), Some("s1"), RootCommit::Known("c1".into()));
+        let home = tempfile::tempdir().unwrap();
+        let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
+        let reg = crate::memory::project::Registration {
+            root: Path::new("/work/mono"),
+            checkout: ground.checkout(Path::new("/work/mono")),
+            legacy_ids: &[],
+            index_docs: false,
+            assigned: true,
+            subpath: Some("apps/web/src"),
+        };
+        let outcome = crate::memory::project::register_project(&dst, &workspaces, home.path(), reg, ground).await.unwrap();
+
+        assert_eq!((outcome.project_id.as_str(), outcome.subproject), ("mono-here", Some(web)));
+    }
+
+    #[tokio::test]
+    async fn a_declaration_here_is_kept_over_the_file() {
+        let dst = destination().await;
+        exec(&dst, MONO_HERE).await;
+        exec(
+            &dst,
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('local-3333', 'local', 'user', 1, 2);
+             INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES ('mono-here', 'apps/web', 'local-3333', 2);",
+        )
+        .await;
+        let file = clawg_file(&MONO_LINES, &[(1, Some("mono-5e6f"), "A note of the monorepo")]);
+
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+
+        assert_eq!(subfolders_of(&dst).await, vec![("mono-here".into(), "apps/web".into(), "local-3333".into())]);
+        let declared = &report.subfolders[0];
+        assert_eq!((declared.written, declared.reason.as_deref()), (false, Some("declared_here")));
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM memory_import_registry WHERE kind = 'subfolder'").await, 0);
     }
 
     async fn suggestions_of(store: &MemoryStore) -> Vec<(String, String, String)> {
