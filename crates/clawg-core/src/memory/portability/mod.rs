@@ -7,12 +7,14 @@ pub mod foreign;
 pub mod format;
 pub mod import;
 pub mod markdown;
+pub mod projects;
 pub mod timing;
 pub mod translate;
 pub mod undo;
 
 pub use export::{export, Export, ExportError, ExportFilter};
-pub use import::{import, import_foreign, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
+pub use import::{import, import_foreign, ImportError, ImportOptions, ImportReport, ImportedProject, MAX_IMPORT_BYTES};
+pub use projects::By;
 pub use timing::ImportTimings;
 pub use undo::{undo_import, KeepReason, KeptRow, UndoError, UndoReport};
 
