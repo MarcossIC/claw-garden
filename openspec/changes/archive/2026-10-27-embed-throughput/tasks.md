@@ -29,4 +29,4 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 5. Archive
 
-- [ ] ET1 a ET3 en `specs/portability`; `git mv` a `changes/archive/2026-10-24-embed-throughput`; `state.yaml` archivado; la fila 85 y el orden de ejecución del `README.md` de openspec; subir el minor.
+- [x] ET1 a ET3 en `specs/portability`; `git mv` a `changes/archive/2026-10-27-embed-throughput`; `state.yaml` archivado; la fila 85 y el orden de ejecución del `README.md` de openspec; subir el minor. También se realinearon las citas de `import.rs` y `api.rs` en «Dónde está» ([verify](verify.md#al-archivar-2026-10-27)).

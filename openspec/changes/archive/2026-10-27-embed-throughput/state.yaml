@@ -1,7 +1,7 @@
 change: embed-throughput
 objective: "transversal"
 depends_on: [piece-boundaries]
-phase: archive
+phase: archived
 artifacts:
   exploration: done
   proposal: done
@@ -9,7 +9,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: done
-  archive: pending
+  verify: done  # Windows, con la suite, los dos clippy y la importación real en el perfil dev
+  archive: done
 updated: 2026-10-27
 main_spec: openspec/specs/portability/spec.md

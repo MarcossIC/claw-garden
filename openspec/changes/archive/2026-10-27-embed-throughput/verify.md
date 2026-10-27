@@ -13,6 +13,8 @@ Con autorización. Los dos binarios son builds debug con la feature `testing`, c
 - **Base:** `29d67c6`, el padre de `aab6993`, compilado desde un worktree que se borró al terminar.
 - **Cambio:** `aab6993`. La cabeza `e469539` sólo suma docs.
 
+Cargo puede dar por frescas las fuentes de un worktree compilado en el mismo directorio y dejar el mismo binario. Por eso, antes de medir se comprobó que fueran distintos: el log de la base compila `clawg-core` y `clawg-cli` desde la ruta del worktree, los dos binarios tienen otro sha256 y sólo el del cambio contiene el mensaje de error de `embedding_order` (`could not order the rows to embed`).
+
 Cada corrida usó su propio `CLAWG_TEST_HOME`, con un store vacío y una copia del modelo de `~/.clawg-dev/models`. De `~/.clawg-dev` sólo se leyó el modelo para copiarlo. El daemon se arrancó con `--port 0` y sirvió sólo por TCP, porque la ruta del socket mide 179 bytes. No hubo `--project-map`, así que todas las filas quedaron sin proyecto.
 
 El export fue un `engram export --all` nuevo, de engram 3.5.2, con 3.814 observaciones y 14 prompts. Son 14 observaciones más que en la medición de la [propuesta](proposal.md#problema), y por eso hay 54.386 filas para embeber y no 54.321. Las dos corridas usaron el mismo archivo y corrieron en serie, la base primero, una de cada una y sin otros clientes. Al terminar se borraron el export, los dos homes y los artefactos del workspace en `target-test`.
@@ -48,3 +50,9 @@ Un primer intento de la base no importó nada. El script esperaba `"embedder": "
 - **Contar los tokens queda dentro de `embed`, y no se midió aparte acá.** La propuesta lo midió en 5,4 s en debug para todas las filas, el 0,5 % de la fase.
 - **`translate` dio 12,3 s menos en el cambio, y el cambio no la toca.** Con una corrida por lado, esa diferencia no se le puede atribuir: import-timing vio 20 s entre dos corridas con el mismo trabajo. La diferencia de `embed`, 361,4 s, está muy por encima de eso.
 - **Es un build debug.** La sesión de ONNX Runtime es la misma en debug y en release, y es casi toda la fase (M2), así que la ganancia en release debería parecerse. Esa medida la va a dar el próximo import en prod.
+
+## Al archivar (2026-10-27)
+
+- ET1 a ET3 pasan a [`specs/portability`](../../../specs/portability/spec.md) con sus ids. ET1 suma el orden de embebido de una importación (más tokens primero, con los empates en el orden del archivo, la cuenta con el tokenizer del daemon en grupos y las llamadas de a 32); ET2, que el orden no cambia lo que se escribe, y ET3, la medición de la fase de embeddings.
+- «Dónde está» de `specs/portability` nombra el orden (`longest_first`, `embedding_order` y `rows_to_embed`), la cuenta (`count_all` de `TokenSplitter` y de `ChatChunker`) y el chunker que arma `import_memories`, y realinea sus citas de `import.rs` y `api.rs`, que cambiaron de líneas.
+- Las citas `import.rs:N` de la exploración, la propuesta y el diseño quedan como estaban: describen el código contra el que se escribieron.
