@@ -19,6 +19,31 @@ pub const USER_END: &str = "<!-- USER-END -->";
 pub(crate) const AUTO_TOKEN_CAP: usize = 1500;
 pub(crate) const AUTO_BYTE_CAP: usize = AUTO_TOKEN_CAP * 4;
 
+/// What [`WorkspaceManager::adopt_legacy`] did, or would do without writing.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Adopted {
+    /// The agent's folder on disk and the path of each copy.
+    pub copied: Vec<(String, PathBuf)>,
+    /// Each legacy file left beside the project's own, which differs from it.
+    pub kept_beside: Vec<(PathBuf, PathBuf)>,
+}
+
+/// What [`WorkspaceManager::drop_adopted`] did, or would do without writing.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub removed: Vec<PathBuf>,
+    /// The copies edited since, which stay.
+    pub kept: Vec<PathBuf>,
+}
+
+/// What regenerating the AUTO section keeps of a file as it is: what comes
+/// before that section, and the USER section with what follows it. It is the
+/// part of the file the user writes.
+fn user_part(content: &str) -> (String, String, String) {
+    let sections = split_existing(content);
+    (sections.before_auto, sections.user_content, sections.after_user)
+}
+
 /// Stateless façade. Holds only the base directory under which all workspaces live.
 /// Trivially `Clone + Send + Sync`.
 #[derive(Debug, Clone)]
@@ -53,15 +78,16 @@ impl WorkspaceManager {
     /// follows its rows. The legacy file is copied, never moved or changed: if
     /// the user keeps editing it, both copies still exist. When both already
     /// exist nothing is merged, only reported, because either could be the one
-    /// the user wants.
-    pub async fn adopt_legacy(&self, legacy_id: &str, project_id: &str) -> Result<(), MemoryError> {
+    /// the user wants. Without `write` it only says what it would do.
+    pub async fn adopt_legacy(&self, legacy_id: &str, project_id: &str, write: bool) -> Result<Adopted, MemoryError> {
         let io_err = |path: &std::path::Path| {
             let path = path.to_path_buf();
             move |source| MemoryError::WorkspaceIo { path, source }
         };
+        let mut adopted = Adopted::default();
         let mut agents = match tokio::fs::read_dir(&self.workspaces_root).await {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(adopted),
             Err(e) => return Err(io_err(&self.workspaces_root)(e)),
         };
         while let Some(agent) = agents.next_entry().await.map_err(io_err(&self.workspaces_root))? {
@@ -78,23 +104,102 @@ impl WorkspaceManager {
             match tokio::fs::read(&to).await {
                 Ok(current) => {
                     if current != legacy {
-                        log::warn!(
-                            "workspace {} was kept beside {}; merge them by hand if both matter",
-                            from.display(),
-                            to.display()
-                        );
+                        if write {
+                            log::warn!(
+                                "workspace {} was kept beside {}; merge them by hand if both matter",
+                                from.display(),
+                                to.display()
+                            );
+                        }
+                        adopted.kept_beside.push((from, to));
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if let Some(dir) = to.parent() {
-                        crate::private_dir::ensure_private_dir(dir).map_err(io_err(dir))?;
+                    if write {
+                        if let Some(dir) = to.parent() {
+                            crate::private_dir::ensure_private_dir(dir).map_err(io_err(dir))?;
+                        }
+                        write_atomically(&to, &legacy).await.map_err(io_err(&to))?;
                     }
-                    write_atomically(&to, &legacy).await.map_err(io_err(&to))?;
+                    adopted.copied.push((agent.file_name().to_string_lossy().into_owned(), to));
                 }
                 Err(e) => return Err(io_err(&to)(e)),
             }
         }
-        Ok(())
+        adopted.copied.sort();
+        adopted.kept_beside.sort();
+        Ok(adopted)
+    }
+
+    /// The `workspace.md` of every agent under `project_id`, by path. Reads
+    /// the folders of the agents and changes nothing.
+    pub async fn project_files(&self, project_id: &str) -> Result<Vec<PathBuf>, MemoryError> {
+        let io_err = |path: &std::path::Path| {
+            let path = path.to_path_buf();
+            move |source| MemoryError::WorkspaceIo { path, source }
+        };
+        let mut files = Vec::new();
+        let mut agents = match tokio::fs::read_dir(&self.workspaces_root).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(files),
+            Err(e) => return Err(io_err(&self.workspaces_root)(e)),
+        };
+        while let Some(agent) = agents.next_entry().await.map_err(io_err(&self.workspaces_root))? {
+            let file = agent.path().join(project_segment(project_id).as_ref()).join("workspace.md");
+            match tokio::fs::metadata(&file).await {
+                Ok(meta) if meta.is_file() => files.push(file),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err(&file)(e)),
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+
+    /// Takes back the copies [`Self::adopt_legacy`] made of `legacy_id`'s
+    /// files into `project_id`, in the agent folders `agents` names: a copy
+    /// whose user's part is still the legacy file's is removed, and one the
+    /// user edited since stays. A folder name that is not one plain component
+    /// is skipped, as is a copy, or a legacy file, no longer there. Without
+    /// `write` it only says what it would do.
+    pub async fn drop_adopted(
+        &self,
+        legacy_id: &str,
+        project_id: &str,
+        agents: &[String],
+        write: bool,
+    ) -> Result<Dropped, MemoryError> {
+        let mut dropped = Dropped::default();
+        for agent in agents {
+            let mut parts = Path::new(agent).components();
+            if !matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None)) {
+                log::warn!("no workspace is taken back under {agent:?}: it is no folder name");
+                continue;
+            }
+            let dir = self.workspaces_root.join(agent);
+            let from = dir.join(project_segment(legacy_id).as_ref()).join("workspace.md");
+            let to = dir.join(project_segment(project_id).as_ref()).join("workspace.md");
+            let (Ok(legacy), Ok(copy)) = (tokio::fs::read_to_string(&from).await, tokio::fs::read_to_string(&to).await) else {
+                continue;
+            };
+            if user_part(&copy) != user_part(&legacy) {
+                dropped.kept.push(to);
+                continue;
+            }
+            if write {
+                tokio::fs::remove_file(&to).await.map_err(|source| MemoryError::WorkspaceIo { path: to.clone(), source })?;
+                // The folder the copy was made in, which a removal of a
+                // folder that still holds anything refuses.
+                if let Some(dir) = to.parent() {
+                    let _ = tokio::fs::remove_dir(dir).await;
+                }
+            }
+            dropped.removed.push(to);
+        }
+        dropped.removed.sort();
+        dropped.kept.sort();
+        Ok(dropped)
     }
 
     /// Regenerates the AUTO section from DB queries. USER section is preserved
@@ -518,26 +623,44 @@ pub(crate) fn sections_holding(file: &str, text: &str) -> Holding {
     }
 }
 
-/// Every `<root>/<agent>/<project>/workspace.md` that holds `text`, by path,
-/// in path order. Reads only; a file that cannot be read is skipped.
-pub(crate) fn workspaces_holding(root: &Path, text: &str) -> Vec<(PathBuf, Holding)> {
-    let dirs = |dir: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
-            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect())
-            .unwrap_or_default()
-    };
-    let mut holding: Vec<(PathBuf, Holding)> = dirs(root)
+/// The folders under `dir`.
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default()
+}
+
+/// Every `workspace.md` that holds any of `texts`, by path, in path order,
+/// with where it holds them. Each file is read once.
+pub(crate) fn workspaces_holding_any(root: &Path, texts: &[&str]) -> Vec<(PathBuf, Holding)> {
+    let mut holding: Vec<(PathBuf, Holding)> = subdirs(root)
         .iter()
-        .flat_map(|agent| dirs(agent))
+        .flat_map(|agent| subdirs(agent))
         .map(|project| project.join("workspace.md"))
         .filter_map(|path| {
             let bytes = std::fs::read(&path).ok()?;
-            let found = sections_holding(&String::from_utf8_lossy(&bytes), text);
+            let file = String::from_utf8_lossy(&bytes);
+            let found = texts.iter().map(|text| sections_holding(&file, text)).fold(
+                Holding { auto: false, user: false },
+                |all, one| Holding { auto: all.auto || one.auto, user: all.user || one.user },
+            );
             (found.auto || found.user).then_some((path, found))
         })
         .collect();
     holding.sort_by(|a, b| a.0.cmp(&b.0));
     holding
+}
+
+/// The `workspace.md` of every agent under `project_id` under `root`, by
+/// path, whatever they hold. Reads the folders only.
+pub(crate) fn project_workspaces(root: &Path, project_id: &str) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = subdirs(root)
+        .iter()
+        .map(|agent| agent.join(project_segment(project_id).as_ref()).join("workspace.md"))
+        .filter(|file| file.is_file())
+        .collect();
+    files.sort();
+    files
 }
 
 /// Parse the existing file content to find AUTO and USER sections.
@@ -794,7 +917,7 @@ mod tests {
         let content = format!("{AUTO_START}\nauto\n{AUTO_END}\n{USER_START}\nwritten by hand\n{USER_END}\n");
         std::fs::write(&legacy, &content).unwrap();
 
-        ws.adopt_legacy("src-1a2b", "repo-3c4d").await.unwrap();
+        ws.adopt_legacy("src-1a2b", "repo-3c4d", true).await.unwrap();
 
         let adopted = ws.workspace_path("agent-a", Some("repo-3c4d"));
         assert_eq!(std::fs::read_to_string(&adopted).unwrap(), content);
@@ -811,7 +934,7 @@ mod tests {
             std::fs::write(&path, text).unwrap();
         }
 
-        ws.adopt_legacy("src-1a2b", "repo-3c4d").await.unwrap();
+        ws.adopt_legacy("src-1a2b", "repo-3c4d", true).await.unwrap();
 
         let read = |p| std::fs::read_to_string(ws.workspace_path("agent-a", Some(p))).unwrap();
         assert_eq!(read("repo-3c4d"), "current");
@@ -854,7 +977,7 @@ mod tests {
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "legacy").unwrap();
 
-        ws.adopt_legacy("src-1a2b", "../../planted").await.unwrap();
+        ws.adopt_legacy("src-1a2b", "../../planted", true).await.unwrap();
 
         assert!(!dir.path().join("planted").exists());
         let adopted = ws.workspace_path("agent-a", Some("../../planted"));
@@ -945,7 +1068,7 @@ mod tests {
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "notes").unwrap();
 
-        ws.adopt_legacy("src-1a2b", "repo-3c4d").await.unwrap();
+        ws.adopt_legacy("src-1a2b", "repo-3c4d", true).await.unwrap();
 
         let adopted = ws.workspace_path("team/bot", Some("repo-3c4d"));
         assert_eq!(std::fs::read_to_string(adopted).unwrap(), "notes");
@@ -955,7 +1078,7 @@ mod tests {
     async fn adopting_without_any_workspace_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
         let ws = WorkspaceManager::new(dir.path().join("never-created"));
-        ws.adopt_legacy("src-1a2b", "repo-3c4d").await.unwrap();
+        ws.adopt_legacy("src-1a2b", "repo-3c4d", true).await.unwrap();
         assert!(!dir.path().join("never-created").exists());
     }
 

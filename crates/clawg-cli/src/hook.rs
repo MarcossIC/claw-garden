@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::cli::HookEvent;
 use crate::client::{Context, DaemonClient, Health, ListArgs};
-use crate::mcp::tools::{review_nudge, synthesis_nudge};
+use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
 
 /// The most a hook takes, from reading stdin to the answer: under the five
 /// seconds a hook is configured with, so the client never cancels one.
@@ -134,6 +134,7 @@ pub fn session_start_text(
     }
     parts.extend(synthesis_nudge(lang, context.unreviewed));
     parts.extend(review_nudge(lang, context.conclusions_to_review));
+    parts.extend(suggestion_note(lang, &context.suggestions));
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
@@ -220,7 +221,7 @@ async fn read_input(input: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
 async fn project_of(client: &DaemonClient, cwd: &Path) -> Option<String> {
     let identity = ProjectIdentity::resolve(cwd);
     let legacy = identity.legacy_ids();
-    match client.register_project(&identity.root, &legacy, false).await {
+    match client.register_project(&identity.root, Some(&identity.path), &legacy, false).await {
         Ok(given) => Some(given.project_id),
         Err(e) if e.is_root_collision() => None,
         Err(_) => Some(identity.id),
@@ -350,6 +351,38 @@ mod tests {
     }
 
     #[test]
+    fn session_start_names_the_pending_suggestions() {
+        let suggestion = clawg_core::memory::registry::ListedSuggestion {
+            other_id: "notas-1a2b".into(),
+            other_name: Some("notas".into()),
+            reason: "folder_name".into(),
+            created_at: 1,
+        };
+        let pending = Context { suggestions: vec![suggestion], ..context("ctx", 0) };
+
+        let text = session_start_text(&pending, None, false, None).unwrap();
+        assert!(
+            text.ends_with(
+                "This project may be the same as notas (notas-1a2b). Ask the user, and record their answer with \
+                 `answer_suggestion`; `recall_context` says why."
+            ),
+            "{text}"
+        );
+        let text = session_start_text(&pending, None, false, Some(Lang::Es)).unwrap();
+        assert!(
+            text.ends_with(
+                "Este proyecto puede ser el mismo que notas (notas-1a2b). Pregúntale a la persona y registra su respuesta \
+                 con `answer_suggestion`; `recall_context` dice por qué."
+            ),
+            "{text}"
+        );
+        let many = Context { suggestions: vec![pending.suggestions[0].clone(); 5], ..context("ctx", 0) };
+        assert!(session_start_text(&many, None, false, None).unwrap().contains("notas (notas-1a2b), notas (notas-1a2b), 3 more."));
+        let alone = Context { suggestions: pending.suggestions.clone(), ..context("", 0) };
+        assert!(session_start_text(&alone, None, false, None).is_some(), "the suggestion comes on its own");
+    }
+
+    #[test]
     fn an_empty_context_prints_nothing() {
         assert_eq!(session_start_text(&context(" \n", 0), Some(&health("ready")), false, None), None);
     }
@@ -357,9 +390,16 @@ mod tests {
     #[test]
     fn what_the_hook_adds_stays_small() {
         let failed = Health { embedder_error: Some("e".repeat(200)), ..health("failed") };
-        let added = session_start_text(&context("x", 10_000), Some(&failed), true, Some(Lang::Es)).unwrap().len() - "x".len();
-        assert!(added < 1_000, "{added} bytes added");
-        assert!(SESSION_BUDGET + 1_000 <= 10_000, "the whole stays under what the client injects");
+        let suggestion = clawg_core::memory::registry::ListedSuggestion {
+            other_id: format!("{}-1a2b", "n".repeat(40)),
+            other_name: Some("n".repeat(80)),
+            reason: "folder_name".into(),
+            created_at: 1,
+        };
+        let full = Context { suggestions: vec![suggestion; 9], ..context("x", 10_000) };
+        let added = session_start_text(&full, Some(&failed), true, Some(Lang::Es)).unwrap().len() - "x".len();
+        assert!(added < 1_500, "{added} bytes added");
+        assert!(SESSION_BUDGET + 1_500 <= 10_000, "the whole stays under what the client injects");
     }
 
     const SPANISH_LINE: &str = "clawg: el idioma de la persona es el español. Respóndele en español salvo que escriba \
@@ -397,6 +437,44 @@ mod tests {
         let (_writer, silent) = tokio::io::duplex(64);
         let out = respond(HookEvent::SessionStart, "a", dir.path(), silent, Duration::from_millis(100)).await;
         assert!(out.is_some_and(|o| o.contains("el idioma de la persona es el español")), "the deadline still leaves the line");
+    }
+
+    #[tokio::test]
+    async fn session_start_in_a_declared_subfolder_reads_its_project() {
+        use crate::client::tests::{publish, start_daemon};
+        let d = start_daemon().await;
+        publish(&d);
+        let client = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let repo = tempfile::tempdir().unwrap();
+        let mono = ProjectIdentity::resolve(repo.path()).root.join("mono");
+        for sub in [".git", "apps/web/src"] {
+            std::fs::create_dir_all(mono.join(sub)).unwrap();
+        }
+        let web = client.resolve_project("web", true, false, clawg_core::memory::registry::Born::User).await.unwrap().project_id.unwrap();
+        client.locate_project("web", &mono.join("apps").join("web"), true).await.expect("declare");
+        let save = |content: &str, project: String| crate::client::SaveArgs {
+            content: content.into(),
+            agent_id: "a".into(),
+            project_id: Some(project),
+            memory_type: Some("semantic_fact".into()),
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        };
+        let m = client.register_project(&mono, None, &[], false).await.unwrap().project_id;
+        client.save(save("The web app renders on the server", web)).await.expect("save");
+        client.save(save("The monorepo builds with one workspace", m)).await.expect("save");
+        let start = |cwd: &Path| {
+            let (stdin, dir) = (serde_json::json!({ "cwd": cwd, "source": "startup" }).to_string(), d.dir.path().to_path_buf());
+            async move { respond(HookEvent::SessionStart, "a", &dir, stdin.as_bytes(), HOOK_DEADLINE).await.unwrap_or_default() }
+        };
+
+        let inside = start(&mono.join("apps").join("web").join("src")).await;
+        let at_root = start(&mono).await;
+
+        assert!(inside.contains("renders on the server") && !inside.contains("one workspace"), "{inside}");
+        assert!(at_root.contains("one workspace") && !at_root.contains("renders on the server"), "{at_root}");
     }
 
     #[test]

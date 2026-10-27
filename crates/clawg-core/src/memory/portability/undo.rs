@@ -76,6 +76,54 @@ pub struct UndoReport {
     pub remotes: Vec<String>,
     /// The `pre-undo` snapshot taken before writing.
     pub snapshot: Option<String>,
+    /// What it took back of what the import added to the registry of
+    /// projects, and what stays.
+    #[serde(default)]
+    pub registry: RegistryUndo,
+}
+
+/// Why something an import added to the registry of projects stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryKeep {
+    /// Something names it: a row, a folder, a remote, a declaration, a
+    /// suggestion, a merge, a delete or a review of its conclusions.
+    InUse,
+    /// A suggestion someone answered.
+    Answered,
+    /// A project someone renamed or reviewed.
+    Reviewed,
+    /// A declaration that leads elsewhere now, or a project whose delete was
+    /// undone.
+    Changed,
+}
+
+/// Something an import added to the registry that stays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptEntry {
+    /// `project`, `revived`, `suggestion` or `subfolder`.
+    pub kind: String,
+    /// The project, or the first project of a suggestion, or the repository
+    /// of a declaration.
+    pub id: String,
+    /// The other project of a suggestion, or the subpath of a declaration.
+    #[serde(default)]
+    pub other: Option<String>,
+    pub reason: RegistryKeep,
+}
+
+/// What an undo took back of what the import added to the registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryUndo {
+    /// Projects the import created, deleted.
+    pub projects: Vec<String>,
+    /// Projects the import brought back from a delete, deleted again.
+    pub deleted_again: Vec<String>,
+    /// Suggestions it left, as `(project_id, other_id)`, removed.
+    pub suggestions: Vec<(String, String)>,
+    /// Declarations it wrote, as `(repository_id, subpath)`, removed.
+    pub subfolders: Vec<(String, String)>,
+    pub kept: Vec<KeptEntry>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,6 +214,60 @@ impl Extra {
     }
 }
 
+/// What the import added to the registry of projects (V31).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Registered {
+    Project { id: String },
+    Revived { id: String, deleted_at: i64 },
+    Suggestion { project: String, other: String },
+    Subfolder { repository: String, subpath: String, project: String },
+}
+
+impl Registered {
+    /// The order an undo takes them back in: what names a project goes
+    /// before the project.
+    fn rank(&self) -> u8 {
+        match self {
+            Registered::Subfolder { .. } => 0,
+            Registered::Suggestion { .. } => 1,
+            Registered::Revived { .. } => 2,
+            Registered::Project { .. } => 3,
+        }
+    }
+
+    fn kept(&self, reason: RegistryKeep) -> KeptEntry {
+        let (kind, id, other) = match self {
+            Registered::Project { id } => ("project", id, None),
+            Registered::Revived { id, .. } => ("revived", id, None),
+            Registered::Suggestion { project, other } => ("suggestion", project, Some(other.clone())),
+            Registered::Subfolder { repository, subpath, .. } => ("subfolder", repository, Some(subpath.clone())),
+        };
+        KeptEntry { kind: kind.to_owned(), id: id.clone(), other, reason }
+    }
+}
+
+/// A project the import created or brought back, as it is now.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct RegistryProject {
+    pub reviewed: bool,
+    pub deleted_at: Option<i64>,
+    /// Rows of the three tables under it, in any state, and the live ones.
+    pub rows: i64,
+    pub live: i64,
+    /// The root ids of its folders.
+    pub folders: Vec<String>,
+    pub remotes: Vec<String>,
+    /// The declarations with it on a side, `(repository, subpath)`.
+    pub declarations: Vec<(String, String)>,
+    /// The suggestions with it on a side, as stored.
+    pub suggestions: Vec<(String, String)>,
+    /// A tombstone of it or leading to it, a merge, a delete or a review of
+    /// its conclusions names it.
+    pub named: bool,
+    /// The `deleted_at` of each delete of it nobody undid or purged.
+    pub open_deletes: Vec<i64>,
+}
+
 /// A row as the store holds it now.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Now {
@@ -247,6 +349,13 @@ pub(crate) struct Facts {
     pub saves: HashMap<i64, Vec<(i64, i64)>>,
     pub projects: HashMap<String, ProjectNow>,
     pub remotes: HashMap<String, RemoteNow>,
+    pub registered: Vec<Registered>,
+    /// The project each declaration the import wrote leads to now.
+    pub declarations: HashMap<(String, String), String>,
+    /// The answer of each suggestion the import left that is still here.
+    pub suggestions: HashMap<(String, String), Option<String>>,
+    /// The projects it created or brought back that are still here.
+    pub registry: HashMap<String, RegistryProject>,
 }
 
 /// What an undo writes.
@@ -263,6 +372,13 @@ pub(crate) struct Plan {
     pub links: Vec<Extra>,
     pub projects: Vec<String>,
     pub remotes: Vec<String>,
+    /// What the import added to the registry that goes, in the order it is
+    /// taken back.
+    pub take_back: Vec<Registered>,
+    /// Entries of the journal whose project, suggestion or declaration is
+    /// gone.
+    pub forget: Vec<Registered>,
+    pub registry_kept: Vec<KeptEntry>,
 }
 
 impl Plan {
@@ -273,6 +389,28 @@ impl Plan {
             && self.links.is_empty()
             && self.projects.is_empty()
             && self.remotes.is_empty()
+            && self.take_back.is_empty()
+            && self.forget.is_empty()
+    }
+
+    /// What the undo would take back of the registry, as a report says it.
+    fn registry(&self) -> RegistryUndo {
+        let mut undo = RegistryUndo { kept: self.registry_kept.clone(), ..Default::default() };
+        for entry in &self.take_back {
+            undo.record(entry);
+        }
+        undo
+    }
+}
+
+impl RegistryUndo {
+    fn record(&mut self, entry: &Registered) {
+        match entry {
+            Registered::Project { id } => self.projects.push(id.clone()),
+            Registered::Revived { id, .. } => self.deleted_again.push(id.clone()),
+            Registered::Suggestion { project, other } => self.suggestions.push((project.clone(), other.clone())),
+            Registered::Subfolder { repository, subpath, .. } => self.subfolders.push((repository.clone(), subpath.clone())),
+        }
     }
 }
 
@@ -412,7 +550,98 @@ pub(crate) fn decide(facts: &Facts) -> Plan {
             }
         }
     }
+    decide_registry(facts, &mut plan);
     plan
+}
+
+/// Decides what goes of what the import added to the registry, once the
+/// rows, folders and remotes the plan takes are gone: a declaration still
+/// leading where the import wrote it, a suggestion nobody answered, a
+/// project it brought back that nothing uses again, and a project it created
+/// that nothing names any more and nobody reviewed.
+fn decide_registry(facts: &Facts, plan: &mut Plan) {
+    let mut retired: HashMap<&str, (i64, i64)> = HashMap::new();
+    for id in &plan.retire {
+        let now = &facts.now[id];
+        if let Some(project) = now.project.as_deref() {
+            let (rows, live) = retired.entry(project).or_default();
+            *rows += 1;
+            *live += i64::from(now.deleted_at.is_none());
+        }
+    }
+    let (mut take_back, mut kept) = (Vec::new(), Vec::new());
+    let mut verdict = |entry: &Registered, reason: Option<RegistryKeep>| match reason {
+        Some(reason) => kept.push(entry.kept(reason)),
+        None => take_back.push(entry.clone()),
+    };
+    let mut forget = Vec::new();
+    let mut declarations = HashSet::new();
+    let mut suggestions = HashSet::new();
+    for entry in &facts.registered {
+        match entry {
+            Registered::Subfolder { repository, subpath, project } => {
+                let key = (repository.clone(), subpath.clone());
+                match facts.declarations.get(&key) {
+                    None => forget.push(entry.clone()),
+                    Some(now) if now != project => verdict(entry, Some(RegistryKeep::Changed)),
+                    Some(_) => {
+                        declarations.insert(key);
+                        verdict(entry, None);
+                    }
+                }
+            }
+            Registered::Suggestion { project, other } => {
+                let key = (project.clone(), other.clone());
+                match facts.suggestions.get(&key) {
+                    None => forget.push(entry.clone()),
+                    Some(Some(_)) => verdict(entry, Some(RegistryKeep::Answered)),
+                    Some(None) => {
+                        suggestions.insert(key);
+                        verdict(entry, None);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for entry in &facts.registered {
+        let (id, revived) = match entry {
+            Registered::Revived { id, deleted_at } => (id, Some(*deleted_at)),
+            Registered::Project { id } => (id, None),
+            _ => continue,
+        };
+        let Some(now) = facts.registry.get(id) else {
+            forget.push(entry.clone());
+            continue;
+        };
+        let (rows, live) = retired.get(id.as_str()).copied().unwrap_or_default();
+        let reason = match revived {
+            Some(_) if now.deleted_at.is_some() => {
+                forget.push(entry.clone());
+                continue;
+            }
+            Some(_) if now.live > live => Some(RegistryKeep::InUse),
+            Some(_) if now.reviewed => Some(RegistryKeep::Reviewed),
+            Some(at) if !now.open_deletes.contains(&at) => Some(RegistryKeep::Changed),
+            Some(_) => None,
+            None => {
+                let named = now.rows > rows
+                    || now.named
+                    || now.folders.iter().any(|f| !plan.projects.contains(f))
+                    || now.remotes.iter().any(|r| !plan.remotes.contains(r))
+                    || now.declarations.iter().any(|d| !declarations.contains(d))
+                    || now.suggestions.iter().any(|s| !suggestions.contains(s));
+                match (named, now.reviewed) {
+                    (true, _) => Some(RegistryKeep::InUse),
+                    (false, true) => Some(RegistryKeep::Reviewed),
+                    (false, false) => None,
+                }
+            }
+        };
+        verdict(entry, reason);
+    }
+    take_back.sort_by_key(Registered::rank);
+    (plan.take_back, plan.registry_kept, plan.forget) = (take_back, kept, forget);
 }
 
 /// Whether `extra` is still as the import wrote it.
@@ -485,6 +714,8 @@ const ROWS_SQL: &str = "SELECT row_id, row_id, update_count, deleted_at, superse
      WHERE import_id = ?1 AND row_id > ?2 ORDER BY row_id LIMIT ?3";
 const REPLACED_SQL: &str = "SELECT rowid, row_id, superseded_by, from_status, from_superseded_by, from_cause \
      FROM memory_import_supersede WHERE import_id = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3";
+const REGISTERED_SQL: &str = "SELECT rowid, kind, a, b, value FROM memory_import_registry \
+     WHERE import_id = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3";
 const EXTRAS_SQL: &str = "SELECT rowid, kind, a, b, value FROM memory_import_extra \
      WHERE import_id = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3";
 
@@ -512,6 +743,26 @@ const NOW_SQL: &str = "SELECT update_count, deleted_at, supersede_cause, project
 const PROJECT_ROWS_SQL: &str = "SELECT (SELECT COUNT(*) FROM memory WHERE project_id = ?1) \
      + (SELECT COUNT(*) FROM episodic_trajectory WHERE project_id = ?1) \
      + (SELECT COUNT(*) FROM procedural_skill WHERE project_id = ?1)";
+
+/// Live rows of every kind under a project id.
+const PROJECT_LIVE_SQL: &str = "SELECT (SELECT COUNT(*) FROM memory WHERE project_id = ?1 AND deleted_at IS NULL) \
+     + (SELECT COUNT(*) FROM episodic_trajectory WHERE project_id = ?1 AND deleted_at IS NULL) \
+     + (SELECT COUNT(*) FROM procedural_skill WHERE project_id = ?1 AND deleted_at IS NULL)";
+
+/// Nothing outside the registry tables an undo takes back from names the
+/// project `$id`: no tombstone of it or leading to it, merge, delete or
+/// review of its conclusions.
+macro_rules! not_named {
+    ($id:literal) => {
+        concat!(
+            "NOT EXISTS (SELECT 1 FROM project WHERE id = ", $id, " AND merged_into IS NOT NULL) \
+             AND NOT EXISTS (SELECT 1 FROM project WHERE merged_into = ", $id, ") \
+             AND NOT EXISTS (SELECT 1 FROM project_merge WHERE source = ", $id, " OR target = ", $id, ") \
+             AND NOT EXISTS (SELECT 1 FROM project_delete WHERE project_id = ", $id, ") \
+             AND NOT EXISTS (SELECT 1 FROM synthesis_review WHERE scope_key = ", $id, ")"
+        )
+    };
+}
 
 /// No row of any kind is under the project id `$id`.
 macro_rules! no_rows {
@@ -674,7 +925,7 @@ async fn load(store: &MemoryStore, import_id: i64) -> Result<Facts, UndoError> {
     let roots: Vec<String> = extras.iter().filter_map(|e| if let Extra::Project(r) = e { Some(r.clone()) } else { None }).collect();
     let projects: HashMap<String, ProjectNow> = each(store, roots, |c, root: &String| {
         let index_docs: Option<bool> =
-            c.prepare_cached("SELECT index_docs FROM project WHERE id = ?1")?.query_row([root], |r| r.get(0)).optional()?;
+            c.prepare_cached("SELECT index_docs FROM project_path WHERE id = ?1")?.query_row([root], |r| r.get(0)).optional()?;
         let Some(index_docs) = index_docs else { return Ok(None) };
         let docs = c
             .prepare_cached("SELECT EXISTS (SELECT 1 FROM project_doc_file WHERE project_id = ?1)")?
@@ -695,7 +946,7 @@ async fn load(store: &MemoryStore, import_id: i64) -> Result<Facts, UndoError> {
         let Some(project_id) = project_id else { return Ok(None) };
         let rows = c.prepare_cached(PROJECT_ROWS_SQL)?.query_row([&project_id], |r| r.get(0))?;
         let root = c
-            .prepare_cached("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1)")?
+            .prepare_cached("SELECT EXISTS (SELECT 1 FROM project_path WHERE id = ?1)")?
             .query_row([&project_id], |r| r.get(0))?;
         Ok(Some((remote.clone(), RemoteNow { project_id, rows, root })))
     })
@@ -704,7 +955,115 @@ async fn load(store: &MemoryStore, import_id: i64) -> Result<Facts, UndoError> {
     .flatten()
     .collect();
 
-    Ok(Facts { rows, replaced, extras, now, references, pairs, derivations, saves, projects, remotes })
+    let registered: Vec<Registered> = paged(store, import_id, REGISTERED_SQL, |r| {
+        let (kind, a, b, value): (String, Option<String>, Option<String>, Option<String>) = (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+        let (a, b) = (a.unwrap_or_default(), b.unwrap_or_default());
+        Ok(match kind.as_str() {
+            "project" => Some(Registered::Project { id: a }),
+            "revived" => value.and_then(|v| v.parse().ok()).map(|deleted_at| Registered::Revived { id: a, deleted_at }),
+            "suggestion" => Some(Registered::Suggestion { project: a, other: b }),
+            "subfolder" => value.map(|project| Registered::Subfolder { repository: a, subpath: b, project }),
+            _ => None,
+        })
+    })
+    .await?
+    .into_iter()
+    .flatten()
+    .collect();
+    let declared: Vec<(String, String)> = registered
+        .iter()
+        .filter_map(|e| if let Registered::Subfolder { repository, subpath, .. } = e { Some((repository.clone(), subpath.clone())) } else { None })
+        .collect();
+    let declarations = each(store, declared, |c, key: &(String, String)| {
+        c.prepare_cached("SELECT project_id FROM project_subfolder WHERE parent_id = ?1 AND subpath = ?2")?
+            .query_row([&key.0, &key.1], |r| r.get(0))
+            .optional()
+            .map(|project: Option<String>| project.map(|p| (key.clone(), p)))
+    })
+    .await?
+    .into_iter()
+    .flatten()
+    .collect();
+    let suggested: Vec<(String, String)> = registered
+        .iter()
+        .filter_map(|e| if let Registered::Suggestion { project, other } = e { Some((project.clone(), other.clone())) } else { None })
+        .collect();
+    let suggestions = each(store, suggested, |c, key: &(String, String)| {
+        c.prepare_cached("SELECT answer FROM project_suggestion WHERE project_id = ?1 AND other_id = ?2")?
+            .query_row([&key.0, &key.1], |r| r.get(0))
+            .optional()
+            .map(|answer: Option<Option<String>>| answer.map(|a| (key.clone(), a)))
+    })
+    .await?
+    .into_iter()
+    .flatten()
+    .collect();
+    let ids: BTreeSet<String> = registered
+        .iter()
+        .filter_map(|e| match e {
+            Registered::Project { id } | Registered::Revived { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let registry = each(store, ids.into_iter().collect(), registry_project_of).await?.into_iter().flatten().collect();
+
+    Ok(Facts {
+        rows,
+        replaced,
+        extras,
+        now,
+        references,
+        pairs,
+        derivations,
+        saves,
+        projects,
+        remotes,
+        registered,
+        declarations,
+        suggestions,
+        registry,
+    })
+}
+
+/// A project as [`decide_registry`] weighs it, when it is still here.
+fn registry_project_of(c: &Connection, id: &String) -> rusqlite::Result<Option<(String, RegistryProject)>> {
+    let row: Option<(bool, Option<i64>)> = c
+        .prepare_cached("SELECT reviewed, deleted_at FROM project WHERE id = ?1")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((reviewed, deleted_at)) = row else { return Ok(None) };
+    let strings = |sql: &str| -> rusqlite::Result<Vec<String>> {
+        let mut stmt = c.prepare_cached(sql)?;
+        let found = stmt.query_map([id], |r| r.get(0))?;
+        found.collect()
+    };
+    let pairs = |sql: &str| -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = c.prepare_cached(sql)?;
+        let found = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        found.collect()
+    };
+    let open_deletes = {
+        let mut stmt = c.prepare_cached(
+            "SELECT deleted_at FROM project_delete WHERE project_id = ?1 AND undone_at IS NULL AND purged_at IS NULL",
+        )?;
+        let found = stmt.query_map([id], |r| r.get(0))?;
+        found.collect::<rusqlite::Result<Vec<i64>>>()?
+    };
+    Ok(Some((
+        id.clone(),
+        RegistryProject {
+            reviewed,
+            deleted_at,
+            rows: c.prepare_cached(PROJECT_ROWS_SQL)?.query_row([id], |r| r.get(0))?,
+            live: c.prepare_cached(PROJECT_LIVE_SQL)?.query_row([id], |r| r.get(0))?,
+            folders: strings("SELECT id FROM project_path WHERE project_id = ?1")?,
+            remotes: strings("SELECT remote FROM project_remote WHERE project_id = ?1")?,
+            declarations: pairs("SELECT parent_id, subpath FROM project_subfolder WHERE parent_id = ?1 OR project_id = ?1")?,
+            suggestions: pairs("SELECT project_id, other_id FROM project_suggestion WHERE project_id = ?1 OR other_id = ?1")?,
+            named: c.prepare_cached(concat!("SELECT NOT (", not_named!("?1"), ")"))?.query_row([id], |r| r.get(0))?,
+            open_deletes,
+        },
+    )))
 }
 
 const REMOVE_SQL: [&str; 7] = [
@@ -769,7 +1128,7 @@ fn take_back_in(c: &Connection, import_id: i64, extra: &Extra) -> rusqlite::Resu
         Extra::Project(root) => (
             c.execute(
                 concat!(
-                    "DELETE FROM project WHERE id = ?1 AND index_docs = 0 AND ",
+                    "DELETE FROM project_path WHERE id = ?1 AND index_docs = 0 AND ",
                     no_rows!("?1"),
                     " AND NOT EXISTS (SELECT 1 FROM project_doc_file WHERE project_id = ?1) \
                      AND NOT EXISTS (SELECT 1 FROM project_remote WHERE project_id = ?1)"
@@ -795,6 +1154,59 @@ fn take_back_in(c: &Connection, import_id: i64, extra: &Extra) -> rusqlite::Resu
         rusqlite::params![import_id, kind, a, b],
     )?;
     Ok(changed > 0)
+}
+
+/// Takes back `entry` where it is still as [`decide_registry`] found it.
+/// Whether anything changed.
+fn take_back_registered_in(c: &Connection, entry: &Registered) -> rusqlite::Result<bool> {
+    let changed = match entry {
+        Registered::Subfolder { repository, subpath, project } => c.execute(
+            "DELETE FROM project_subfolder WHERE parent_id = ?1 AND subpath = ?2 AND project_id = ?3",
+            [repository, subpath, project],
+        )?,
+        Registered::Suggestion { project, other } => c.execute(
+            "DELETE FROM project_suggestion WHERE project_id = ?1 AND other_id = ?2 AND answer IS NULL",
+            [project, other],
+        )?,
+        Registered::Revived { id, deleted_at } => c.execute(
+            "UPDATE project SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL AND reviewed = 0 \
+               AND NOT EXISTS (SELECT 1 FROM memory WHERE project_id = ?1 AND deleted_at IS NULL) \
+               AND NOT EXISTS (SELECT 1 FROM episodic_trajectory WHERE project_id = ?1 AND deleted_at IS NULL) \
+               AND NOT EXISTS (SELECT 1 FROM procedural_skill WHERE project_id = ?1 AND deleted_at IS NULL) \
+               AND EXISTS (SELECT 1 FROM project_delete WHERE project_id = ?1 AND deleted_at = ?2 \
+                             AND undone_at IS NULL AND purged_at IS NULL)",
+            rusqlite::params![id, deleted_at],
+        )?,
+        Registered::Project { id } => c.execute(
+            concat!(
+                "DELETE FROM project WHERE id = ?1 AND reviewed = 0 AND ",
+                no_rows!("?1"),
+                " AND ",
+                not_named!("?1"),
+                " AND NOT EXISTS (SELECT 1 FROM project_path WHERE project_id = ?1) \
+                 AND NOT EXISTS (SELECT 1 FROM project_remote WHERE project_id = ?1) \
+                 AND NOT EXISTS (SELECT 1 FROM project_subfolder WHERE parent_id = ?1 OR project_id = ?1) \
+                 AND NOT EXISTS (SELECT 1 FROM project_suggestion WHERE project_id = ?1 OR other_id = ?1)"
+            ),
+            [id],
+        )?,
+    };
+    Ok(changed > 0)
+}
+
+/// Drops the journal entry of `entry`.
+fn forget_in(c: &Connection, import_id: i64, entry: &Registered) -> rusqlite::Result<()> {
+    let (kind, a, b) = match entry {
+        Registered::Project { id } => ("project", id, None),
+        Registered::Revived { id, .. } => ("revived", id, None),
+        Registered::Suggestion { project, other } => ("suggestion", project, Some(other)),
+        Registered::Subfolder { repository, subpath, .. } => ("subfolder", repository, Some(subpath)),
+    };
+    c.execute(
+        "DELETE FROM memory_import_registry WHERE import_id = ?1 AND kind = ?2 AND a = ?3 AND b IS ?4",
+        rusqlite::params![import_id, kind, a, b],
+    )?;
+    Ok(())
 }
 
 /// Takes import `import_id` back: removes for good the rows it inserted that
@@ -823,6 +1235,9 @@ pub async fn undo_import(store: &MemoryStore, backups: &Path, import_id: i64, dr
             report.links = plan.links.len();
             report.projects = plan.projects.clone();
             report.remotes = plan.remotes.clone();
+            report.registry = plan.registry();
+        } else {
+            report.registry.kept = plan.registry_kept.clone();
         }
         return Ok(report);
     }
@@ -889,9 +1304,10 @@ pub async fn undo_import(store: &MemoryStore, backups: &Path, import_id: i64, dr
 
     let (unfill, links, projects, remotes, gone) =
         (plan.unfill.clone(), plan.links.clone(), plan.projects.clone(), plan.remotes.clone(), plan.gone.clone());
-    let (restored, unfilled, removed_links, removed_projects, removed_remotes) = store
+    let (take_back, forget) = (plan.take_back.clone(), plan.forget.clone());
+    let (restored, unfilled, removed_links, removed_projects, removed_remotes, registry) = store
         .conn
-        .call(move |c| -> rusqlite::Result<(Vec<i64>, Vec<i64>, usize, Vec<String>, Vec<String>)> {
+        .call(move |c| -> rusqlite::Result<(Vec<i64>, Vec<i64>, usize, Vec<String>, Vec<String>, RegistryUndo)> {
             let tx = c.transaction()?;
             let mut restored = Vec::new();
             for r in &rest {
@@ -925,8 +1341,18 @@ pub async fn undo_import(store: &MemoryStore, backups: &Path, import_id: i64, dr
             for id in &gone {
                 tx.execute("DELETE FROM memory_import_row WHERE import_id = ?1 AND row_id = ?2", [import_id, *id])?;
             }
+            let mut registry = RegistryUndo::default();
+            for entry in &take_back {
+                if take_back_registered_in(&tx, entry)? {
+                    registry.record(entry);
+                    forget_in(&tx, import_id, entry)?;
+                }
+            }
+            for entry in &forget {
+                forget_in(&tx, import_id, entry)?;
+            }
             tx.commit()?;
-            Ok((restored, unfilled, links_removed, removed_projects, removed_remotes))
+            Ok((restored, unfilled, links_removed, removed_projects, removed_remotes, registry))
         })
         .await
         .map_err(MemoryError::Connection)?;
@@ -936,6 +1362,7 @@ pub async fn undo_import(store: &MemoryStore, backups: &Path, import_id: i64, dr
     report.links = removed_links;
     report.projects = removed_projects;
     report.remotes = removed_remotes;
+    report.registry = RegistryUndo { kept: plan.registry_kept.clone(), ..registry };
     report.kept = kept.into_iter().map(|(id, reason)| KeptRow { id, reason }).collect();
     Ok(report)
 }
@@ -952,9 +1379,10 @@ mod tests {
     use crate::memory::embedder::FakeEmbedder;
     use crate::memory::portability::foreign::{ForeignNote, When};
     use crate::memory::portability::import::tests::{
-        destination, dump, insert_row, relation, run, run_export, run_foreign, sample_notes, seeded_file, EVERYTHING,
+        clawg_file, count, destination, dump, exec, insert_row, relation, run, run_export, run_foreign, sample_notes, seeded_file,
+        DELETED_HERE, EVERYTHING,
     };
-    use crate::memory::portability::import::ImportOptions;
+    use crate::memory::portability::import::{ImportOptions, ImportReport};
     use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note, T0};
     use crate::memory::relocate::{move_memories_core, MoveFilter};
 
@@ -1043,7 +1471,7 @@ mod tests {
                     "SELECT * FROM memory_piece ORDER BY save_id, piece",
                     "SELECT * FROM memory_derivation ORDER BY memory_id, source_id",
                     "SELECT * FROM memory_conflict ORDER BY new_id, old_id",
-                    "SELECT * FROM project ORDER BY id",
+                    "SELECT * FROM project_path ORDER BY id",
                     "SELECT * FROM project_remote ORDER BY remote",
                 ] {
                     let mut stmt = c.prepare(sql)?;
@@ -1118,6 +1546,150 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The registry of projects, row by row, as text.
+    async fn registry_state(store: &MemoryStore) -> Vec<String> {
+        store
+            .conn
+            .call(|c| {
+                let mut out = Vec::new();
+                for sql in [
+                    "SELECT * FROM project ORDER BY id",
+                    "SELECT * FROM project_path ORDER BY id",
+                    "SELECT * FROM project_remote ORDER BY remote",
+                    "SELECT * FROM project_suggestion ORDER BY project_id, other_id",
+                    "SELECT * FROM project_subfolder ORDER BY parent_id, subpath",
+                ] {
+                    let mut stmt = c.prepare(sql)?;
+                    let width = stmt.column_count();
+                    let rows = stmt.query_map([], |r| {
+                        (0..width).map(|k| r.get::<_, rusqlite::types::Value>(k).map(|v| format!("{v:?}"))).collect::<rusqlite::Result<Vec<_>>>()
+                    })?;
+                    for row in rows {
+                        out.push(format!("{sql}: {}", row?.join(", ")));
+                    }
+                }
+                Ok::<_, rusqlite::Error>(out)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Here: `mi-app`, and `x` and `z` with their remotes. The file: a
+    /// project without a folder, a monorepo of another machine declaring a
+    /// subproject, one named like `mi-app`, and `x` merged into `z`.
+    async fn registry_import() -> (MemoryStore, Vec<String>, ImportReport) {
+        let dst = destination().await;
+        exec(
+            &dst,
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+               ('mi-app-1111', 'mi-app', 'agent', 1, 1), ('x-1111', 'x', 'root', 1, 1), ('z-2222', 'z', 'root', 1, 2);
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES \
+               ('github.com/acme/x', 'x-1111', 1), ('github.com/acme/z', 'z-2222', 2);",
+        )
+        .await;
+        insert_row(&dst, "claude-code", Some("x-1111".into()), "A note of x here", None, 10).await;
+        insert_row(&dst, "claude-code", Some("z-2222".into()), "A note of z here", None, 11).await;
+        let before = registry_state(&dst).await;
+        let lines = [
+            r#"{"kind":"project","id":"ideas-1a2b","name":"Ideas"}"#,
+            r#"{"kind":"project","id":"mono-5e6f","name":"mono","folders":[{"root_path":"/elsewhere/mono","remote":"github.com/acme/mono"}],"remotes":["github.com/acme/mono"],"subfolders":[{"subpath":"apps/web","project_id":"web-9c0d"}]}"#,
+            r#"{"kind":"project","id":"web-9c0d","name":"Web"}"#,
+            r#"{"kind":"project","id":"mi-app-9999","name":"Mi App"}"#,
+            r#"{"kind":"project","id":"x-1111","name":"x","merged_into":"z-2222"}"#,
+            r#"{"kind":"project","id":"z-2222","name":"z","remotes":["github.com/acme/z"]}"#,
+        ];
+        let rows = [
+            (1, Some("ideas-1a2b"), "An idea"),
+            (2, Some("mono-5e6f"), "A note of the monorepo"),
+            (3, Some("mi-app-9999"), "A note of the app"),
+            (4, Some("z-2222"), "A note of z there"),
+        ];
+        let (report, _) = run(&dst, &clawg_file(&lines, &rows), ImportOptions::default()).await;
+        assert_eq!(report.inserted, 4, "{report:#?}");
+        (dst, before, report)
+    }
+
+    #[tokio::test]
+    async fn undoing_an_import_takes_back_what_it_added_to_the_registry() {
+        let (dst, before, imported) = registry_import().await;
+        let created: BTreeSet<String> = imported.projects.iter().filter(|p| p.created).filter_map(|p| p.to.clone()).collect();
+        assert_eq!(created.len(), 4, "{:#?}", imported.projects);
+        assert_eq!(imported.suggestions.len(), 2, "{:#?}", imported.suggestions);
+        assert!(imported.subfolders[0].written);
+        let id = imported.import_id.unwrap();
+
+        let dry = undo_import(&dst, tempfile::tempdir().unwrap().path(), id, true).await.unwrap();
+        assert_ne!(registry_state(&dst).await, before, "a dry run writes nothing");
+        let (report, _) = undo(&dst, id).await;
+
+        assert_eq!(registry_state(&dst).await, before);
+        assert_eq!(report.registry, dry.registry);
+        assert_eq!(report.registry.projects.iter().cloned().collect::<BTreeSet<_>>(), created);
+        assert_eq!((report.registry.suggestions.len(), report.registry.subfolders.len()), (2, 1));
+        assert!(report.registry.kept.is_empty(), "{:#?}", report.registry);
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM memory_import_registry").await, 0);
+        let (again, _) = undo(&dst, id).await;
+        assert_eq!(again.registry, RegistryUndo::default());
+    }
+
+    #[tokio::test]
+    async fn what_an_import_added_to_the_registry_stays_once_used() {
+        let (dst, before, imported) = registry_import().await;
+        let to = |id: &str| imported.projects.iter().find(|p| p.id == id).and_then(|p| p.to.clone()).unwrap();
+        let (ideas, mono, app) = (to("ideas-1a2b"), to("mono-5e6f"), to("mi-app-9999"));
+        assert_eq!((ideas.as_str(), mono.as_str(), app.as_str()), ("ideas-1a2b", "mono-5e6f", "mi-app-9999"));
+        insert_row(&dst, "claude-code", Some(ideas.clone()), "An idea saved after the import", None, 20).await;
+        exec(&dst, "UPDATE project_suggestion SET answer = 'apart', answered_at = 30 WHERE other_id = 'mi-app-1111' OR project_id = 'mi-app-1111';").await;
+        exec(&dst, "UPDATE project SET name = 'Monorepo', reviewed = 1 WHERE id = 'mono-5e6f';").await;
+
+        let (report, _) = undo(&dst, imported.import_id.unwrap()).await;
+
+        let kept: BTreeSet<(String, String, RegistryKeep)> =
+            report.registry.kept.iter().map(|k| (k.kind.clone(), k.id.clone(), k.reason)).collect();
+        for expected in [
+            ("project".to_owned(), ideas.clone(), RegistryKeep::InUse),
+            ("project".to_owned(), mono.clone(), RegistryKeep::Reviewed),
+            ("project".to_owned(), app.clone(), RegistryKeep::InUse),
+        ] {
+            assert!(kept.contains(&expected), "{expected:?} in {kept:#?}");
+        }
+        assert!(report.registry.kept.iter().any(|k| k.kind == "suggestion" && k.reason == RegistryKeep::Answered), "{:#?}", report.registry);
+        assert_eq!(report.registry.projects, vec![to("web-9c0d")], "the subproject nothing names any more goes");
+        let state = registry_state(&dst).await;
+        assert!(state.len() > before.len());
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM project WHERE id IN ('ideas-1a2b', 'mono-5e6f', 'mi-app-9999')").await, 3);
+
+        let (again, _) = undo(&dst, imported.import_id.unwrap()).await;
+        assert_eq!((again.registry.kept.len(), again.registry.projects.len()), (report.registry.kept.len(), 0), "what stayed is weighed again");
+        assert_eq!(registry_state(&dst).await, state);
+    }
+
+    async fn deleted_at(store: &MemoryStore) -> Option<i64> {
+        let sql = "SELECT deleted_at FROM project WHERE id = 'gone-1a2b'";
+        store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn undoing_an_import_deletes_again_the_project_it_brought_back() {
+        let file = clawg_file(&[r#"{"kind":"project","id":"gone-1a2b","name":"gone"}"#], &[(1, Some("gone-1a2b"), "A live note of gone")]);
+
+        let dst = destination().await;
+        exec(&dst, DELETED_HERE).await;
+        let (imported, _) = run(&dst, &file, ImportOptions::default()).await;
+        assert_eq!(deleted_at(&dst).await, None);
+        let (report, _) = undo(&dst, imported.import_id.unwrap()).await;
+        assert_eq!(deleted_at(&dst).await, Some(50));
+        assert_eq!(report.registry.deleted_again, vec!["gone-1a2b".to_owned()]);
+
+        let undone = destination().await;
+        exec(&undone, DELETED_HERE).await;
+        let (imported, _) = run(&undone, &file, ImportOptions::default()).await;
+        exec(&undone, "UPDATE project_delete SET undone_at = 60;").await;
+        let (report, _) = undo(&undone, imported.import_id.unwrap()).await;
+        assert_eq!(deleted_at(&undone).await, None, "its delete was undone since");
+        assert_eq!(report.registry.kept[0].reason, RegistryKeep::Changed);
     }
 
     #[tokio::test]
@@ -1261,7 +1833,13 @@ mod tests {
         sql(&dst, format!("UPDATE memory_conflict SET state = 'judged', verdict = 'compatible' WHERE new_id = {judged}")).await;
         let conclusion = insert_row(&dst, "claude-code", None, "A conclusion drawn since", None, 9).await;
         sql(&dst, format!("INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES ({conclusion}, {source}, 9)")).await;
-        sql(&dst, "INSERT INTO project (id, root_path, created_at) VALUES ('elsewhere', '/work/elsewhere', 0)".into()).await;
+        sql(
+            &dst,
+            "INSERT INTO project_path (id, root_path, created_at) VALUES ('elsewhere', '/work/elsewhere', 0);
+             INSERT INTO project (id, name, born, created_at) VALUES ('elsewhere', 'elsewhere', 'root', 0);"
+                .into(),
+        )
+        .await;
         let backups = tempfile::tempdir().unwrap();
         let filter = MoveFilter { ids: vec![moved], ..Default::default() };
         move_memories_core(&dst, backups.path(), &filter, Some("elsewhere".into()), false).await.unwrap();

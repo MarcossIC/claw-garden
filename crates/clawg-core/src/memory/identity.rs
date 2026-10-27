@@ -1,5 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
+use std::io::Read;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use siphasher::sip::SipHasher13;
 
 /// Derive a stable, human-readable project_id from a project path.
@@ -35,20 +40,24 @@ pub fn is_candidate_for(root: &Path, id: &str) -> bool {
 }
 
 /// A project as the store keys it: the root every path inside it resolves to,
-/// the id derived from that root, and the id the same path had before paths
-/// were resolved, which rows saved back then still carry.
+/// the id derived from that root, the id the same path had before paths were
+/// resolved, which rows saved back then still carry, and the path itself in
+/// the form the root was found from, which tells the daemon the subfolder of
+/// the checkout it is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectIdentity {
     pub id: String,
     pub root: PathBuf,
     pub legacy_id: String,
+    pub path: PathBuf,
 }
 
 impl ProjectIdentity {
     /// Resolves `path` to its project. Reads the filesystem (see [`resolve_project_root`]).
     pub fn resolve(path: &Path) -> Self {
-        let root = resolve_project_root(path);
-        Self { id: derive_project_id(&root), legacy_id: derive_project_id(path), root }
+        let canonical = canonical_form(path);
+        let root = root_above(&canonical);
+        Self { id: derive_project_id(&root), legacy_id: derive_project_id(path), root, path: canonical }
     }
 
     /// What a registration of this project names as its legacy ids: the id of
@@ -65,17 +74,45 @@ impl ProjectIdentity {
 /// A path that does not exist cannot be canonicalized or searched for `.git`,
 /// so it is only made absolute and normalized textually.
 pub fn resolve_project_root(path: &Path) -> PathBuf {
-    let canonical = match std::fs::canonicalize(path) {
+    root_above(&canonical_form(path))
+}
+
+/// `path` as [`resolve_project_root`] climbs from it: canonical, or only made
+/// absolute and normalized textually when it does not exist.
+fn canonical_form(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
         Ok(p) => strip_verbatim(&p),
-        Err(_) => {
-            let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-            return normalize_lexical(&absolute);
+        Err(_) => normalize_lexical(&std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())),
+    }
+}
+
+fn root_above(canonical: &Path) -> PathBuf {
+    top_above(canonical).map_or_else(|| canonical.to_path_buf(), |(top, marker)| root_from_marker(&top, &marker))
+}
+
+/// The top of the checkout `canonical` is in: the nearest ancestor holding a
+/// `.git`, with what that `.git` says. A path that does not exist has none,
+/// as it has no root but itself.
+fn top_above(canonical: &Path) -> Option<(PathBuf, GitMarker)> {
+    if !canonical.exists() {
+        return None;
+    }
+    canonical.ancestors().find_map(|dir| read_marker(dir).map(|marker| (dir.to_path_buf(), marker)))
+}
+
+/// `path` below `top`, its components joined by `/`: empty at `top` itself,
+/// `None` outside it or when a component is not valid Unicode.
+pub fn subpath_of(top: &Path, path: &Path) -> Option<String> {
+    let rest = path.strip_prefix(top).ok()?;
+    let mut parts = Vec::new();
+    for component in rest.components() {
+        match component {
+            Component::Normal(name) => parts.push(name.to_str()?),
+            Component::CurDir => {}
+            _ => return None,
         }
-    };
-    canonical
-        .ancestors()
-        .find_map(|dir| read_marker(dir).map(|marker| root_from_marker(dir, &marker)))
-        .unwrap_or(canonical)
+    }
+    Some(parts.join("/"))
 }
 
 fn read_marker(dir: &Path) -> Option<GitMarker> {
@@ -174,8 +211,348 @@ pub fn strip_verbatim(path: &Path) -> PathBuf {
 /// without an `origin`, or with one that is not a server.
 pub fn origin_key(root: &Path) -> Option<String> {
     let marker = read_marker(root)?;
-    let config = std::fs::read_to_string(git_config_dir(root, &marker).join("config")).ok()?;
+    key_in(&git_config_dir(root, &marker))
+}
+
+fn key_in(git_dir: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(git_dir.join("config")).ok()?;
     normalize_remote(&origin_url(&config)?)
+}
+
+/// What tells the git directory of `root` ([`git_config_dir`]) from another
+/// one at the same path: when it was created and, on Unix, its device and
+/// inode. A new clone, `git init` or copy changes it, a move within one
+/// filesystem does not. `None` without a git directory.
+pub fn git_stamp(root: &Path) -> Option<String> {
+    let marker = read_marker(root)?;
+    stamp_of(&git_config_dir(root, &marker))
+}
+
+fn stamp_of(git_dir: &Path) -> Option<String> {
+    let meta = std::fs::metadata(git_dir).ok()?;
+    let created = meta.created().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos());
+    stamp_from(&meta, created)
+}
+
+#[cfg(unix)]
+fn stamp_from(meta: &std::fs::Metadata, created: Option<u128>) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    // Some filesystems keep no creation date: device and inode still tell
+    // two directories apart while both exist.
+    let created = created.map(|c| c.to_string()).unwrap_or_default();
+    Some(format!("{}:{}:{created}", meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn stamp_from(_meta: &std::fs::Metadata, created: Option<u128>) -> Option<String> {
+    created.map(|c| c.to_string())
+}
+
+/// What a registration reads of a root every time: the key of its `origin`
+/// ([`origin_key`]) and the stamp of its git directory ([`git_stamp`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Checkout {
+    pub key: Option<String>,
+    pub stamp: Option<String>,
+}
+
+/// What reading the first commit of a checkout found ([`root_commit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootCommit {
+    /// The commit without parents that the first-parent chain of `HEAD` ends in.
+    Known(String),
+    /// Not to be known for this git directory: it is shallow, so its chain
+    /// ends before the first commit, or `git` did not answer within
+    /// [`ROOT_COMMIT_WAIT`]. Recorded as none beside the stamp, and not read
+    /// again until the git directory is another.
+    Unknowable,
+    /// Not now: there is no git directory, `git` could not be run, or it
+    /// ended in an error, as in a repository without commits. Nothing is
+    /// recorded, so the next registration reads it again.
+    Later,
+}
+
+/// How long `git` may take to give the first commit before it is stopped.
+pub const ROOT_COMMIT_WAIT: Duration = Duration::from_secs(1);
+
+/// The first commit of the checkout at `root`, from `git rev-list
+/// --max-parents=0 --first-parent HEAD`: a history merged in later comes in
+/// through a second parent, so it adds no root. Blocks for up to
+/// [`ROOT_COMMIT_WAIT`].
+///
+/// git is given the git directory the root's `.git` names rather than left
+/// to find one: from a `.git` that is no repository it would go up and read
+/// the repository around the root.
+pub fn root_commit(root: &Path) -> RootCommit {
+    let Some(marker) = read_marker(root) else {
+        return RootCommit::Later;
+    };
+    if git_config_dir(root, &marker).join("shallow").exists() {
+        return RootCommit::Unknowable;
+    }
+    let git_dir = match marker {
+        GitMarker::Dir => root.join(".git"),
+        GitMarker::Link { gitdir, .. } => gitdir,
+    };
+    let mut command = git_in(root);
+    command.arg("--git-dir").arg(git_dir).args(["rev-list", "--max-parents=0", "--first-parent", "HEAD"]);
+    let Ok(mut child) = command.spawn() else {
+        return RootCommit::Later;
+    };
+    let Some(status) = wait_or_kill(&mut child, ROOT_COMMIT_WAIT) else {
+        return RootCommit::Unknowable;
+    };
+    let mut out = String::new();
+    let read = child.stdout.take().is_some_and(|mut stdout| stdout.read_to_string(&mut out).is_ok());
+    match first_commit_in(&out) {
+        Some(hash) if status.success() && read => RootCommit::Known(hash),
+        _ => RootCommit::Later,
+    }
+}
+
+/// `git` in `root` as the daemon runs it: without the `GIT_*` of whoever
+/// started it, which can point it at another repository or history, without
+/// prompts, optional locks or a filesystem monitor, with no input, and on
+/// Windows without a console, since the daemon is started detached from one
+/// and each `git` would open its own.
+fn git_in(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"GIT_")) {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(root)
+        .args(["-c", "core.fsmonitor=false"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// Waits for `child` until `wait` passes, then kills it. `None` when it had
+/// to be killed.
+fn wait_or_kill(child: &mut Child, wait: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// The hash in what `rev-list` printed, when that is one line of a SHA-1 or
+/// SHA-256 hash and nothing else.
+fn first_commit_in(stdout: &str) -> Option<String> {
+    let mut lines = stdout.lines();
+    let line = lines.next()?;
+    let hash = lines.next().is_none() && matches!(line.len(), 40 | 64) && line.bytes().all(|b| b.is_ascii_hexdigit());
+    hash.then(|| line.to_ascii_lowercase())
+}
+
+/// What a registration reads from the disk, kept apart from the decisions it
+/// feeds so those are tested without `git`. [`Disk`] reads the real one.
+pub trait Ground: Send + Sync {
+    /// The key and the stamp of what is at `root` today.
+    fn checkout(&self, root: &Path) -> Checkout;
+    /// The first commit of the checkout at `root`.
+    fn root_commit(&self, root: &Path) -> RootCommit;
+    /// Whether the checkout recorded at `path` with `stamp` is still there:
+    /// the path exists and, when a stamp was recorded, what it holds has it.
+    fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool;
+    /// `path` measured from the top of its checkout ([`subpath_of`]), when
+    /// that checkout's root is `root`; `None` outside git or under another root.
+    fn subpath(&self, root: &Path, path: &Path) -> Option<String>;
+}
+
+/// The filesystem and `git` of this machine.
+pub struct Disk;
+
+impl Ground for Disk {
+    fn checkout(&self, root: &Path) -> Checkout {
+        let Some(marker) = read_marker(root) else {
+            return Checkout::default();
+        };
+        let git_dir = git_config_dir(root, &marker);
+        Checkout { key: key_in(&git_dir), stamp: stamp_of(&git_dir) }
+    }
+
+    fn root_commit(&self, root: &Path) -> RootCommit {
+        root_commit(root)
+    }
+
+    fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
+        path.exists() && stamp.is_none_or(|stamp| git_stamp(path).as_deref() == Some(stamp))
+    }
+
+    fn subpath(&self, root: &Path, path: &Path) -> Option<String> {
+        let canonical = canonical_form(path);
+        let (top, marker) = top_above(&canonical)?;
+        (root_from_marker(&top, &marker) == root).then(|| subpath_of(&top, &canonical)).flatten()
+    }
+}
+
+/// What was read of a disk before a plan ran, so that the plan decides on
+/// the store's connection without reading there: a `git` of up to
+/// [`ROOT_COMMIT_WAIT`] would hold every other call behind it. Asked what it
+/// does not hold, it answers as a decision without it is taken (no remote
+/// and no git directory, a first commit not read, a recorded checkout still
+/// there) and keeps the question, which [`ReadAhead::read`] answers before
+/// the plan runs again.
+#[derive(Default)]
+pub(crate) struct ReadAhead {
+    checkouts: HashMap<PathBuf, Checkout>,
+    commits: HashMap<PathBuf, RootCommit>,
+    present: HashMap<(PathBuf, Option<String>), bool>,
+    subpaths: HashMap<(PathBuf, PathBuf), Option<String>>,
+    asked: Mutex<Asked>,
+}
+
+/// What a [`ReadAhead`] was asked and did not hold.
+#[derive(Default)]
+struct Asked {
+    checkouts: Vec<PathBuf>,
+    commits: Vec<PathBuf>,
+    present: Vec<(PathBuf, Option<String>)>,
+    subpaths: Vec<(PathBuf, PathBuf)>,
+}
+
+impl ReadAhead {
+    /// Reads from `ground` what it was asked since the last read, and
+    /// whether it was asked anything.
+    pub(crate) fn read(&mut self, ground: &dyn Ground) -> bool {
+        let asked = std::mem::take(self.asked.get_mut().unwrap_or_else(|e| e.into_inner()));
+        let any = !(asked.checkouts.is_empty()
+            && asked.commits.is_empty()
+            && asked.present.is_empty()
+            && asked.subpaths.is_empty());
+        for root in asked.checkouts {
+            let checkout = ground.checkout(&root);
+            self.checkouts.insert(root, checkout);
+        }
+        for root in asked.commits {
+            let commit = ground.root_commit(&root);
+            self.commits.insert(root, commit);
+        }
+        for (path, stamp) in asked.present {
+            let present = ground.recorded_checkout_present(&path, stamp.as_deref());
+            self.present.insert((path, stamp), present);
+        }
+        for (root, path) in asked.subpaths {
+            let subpath = ground.subpath(&root, &path);
+            self.subpaths.insert((root, path), subpath);
+        }
+        any
+    }
+
+    fn ask(&self, f: impl FnOnce(&mut Asked)) {
+        f(&mut self.asked.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+}
+
+impl Ground for ReadAhead {
+    fn checkout(&self, root: &Path) -> Checkout {
+        if let Some(checkout) = self.checkouts.get(root) {
+            return checkout.clone();
+        }
+        self.ask(|a| push_new(&mut a.checkouts, root.to_path_buf()));
+        Checkout::default()
+    }
+
+    fn root_commit(&self, root: &Path) -> RootCommit {
+        if let Some(commit) = self.commits.get(root) {
+            return commit.clone();
+        }
+        self.ask(|a| push_new(&mut a.commits, root.to_path_buf()));
+        RootCommit::Later
+    }
+
+    fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
+        let recorded = (path.to_path_buf(), stamp.map(str::to_string));
+        if let Some(present) = self.present.get(&recorded) {
+            return *present;
+        }
+        self.ask(|a| push_new(&mut a.present, recorded));
+        true
+    }
+
+    fn subpath(&self, root: &Path, path: &Path) -> Option<String> {
+        let asked = (root.to_path_buf(), path.to_path_buf());
+        if let Some(subpath) = self.subpaths.get(&asked) {
+            return subpath.clone();
+        }
+        self.ask(|a| push_new(&mut a.subpaths, asked));
+        None
+    }
+}
+
+fn push_new<T: PartialEq>(list: &mut Vec<T>, item: T) {
+    if !list.contains(&item) {
+        list.push(item);
+    }
+}
+
+/// A disk for tests: each root holds the checkout a test put there, and the
+/// reads of a first commit are counted.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FakeGround {
+    roots: std::sync::Mutex<std::collections::HashMap<PathBuf, (Checkout, RootCommit)>>,
+    commit_reads: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl FakeGround {
+    /// Puts at `root` a checkout with `key` and `stamp` whose first commit is `commit`.
+    pub(crate) fn put(&self, root: &Path, key: Option<&str>, stamp: Option<&str>, commit: RootCommit) {
+        let checkout = Checkout { key: key.map(str::to_string), stamp: stamp.map(str::to_string) };
+        self.roots.lock().unwrap().insert(root.to_path_buf(), (checkout, commit));
+    }
+
+    /// Takes away whatever is at `root`, as a move or a delete does.
+    pub(crate) fn remove(&self, root: &Path) {
+        self.roots.lock().unwrap().remove(root);
+    }
+
+    pub(crate) fn commit_reads(&self) -> usize {
+        self.commit_reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Ground for FakeGround {
+    fn checkout(&self, root: &Path) -> Checkout {
+        self.roots.lock().unwrap().get(root).map(|(checkout, _)| checkout.clone()).unwrap_or_default()
+    }
+
+    fn root_commit(&self, root: &Path) -> RootCommit {
+        self.commit_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.roots.lock().unwrap().get(root).map_or(RootCommit::Later, |(_, commit)| commit.clone())
+    }
+
+    fn recorded_checkout_present(&self, path: &Path, stamp: Option<&str>) -> bool {
+        self.roots.lock().unwrap().get(path).is_some_and(|(checkout, _)| stamp.is_none() || checkout.stamp.as_deref() == stamp)
+    }
+
+    /// A fake checkout has no worktrees: its top is its root.
+    fn subpath(&self, root: &Path, path: &Path) -> Option<String> {
+        subpath_of(root, path)
+    }
 }
 
 /// The directory whose `config` holds the remotes of the checkout at `dir`:
@@ -362,6 +739,22 @@ mod tests {
     }
 
     #[test]
+    fn the_subpath_is_measured_from_the_top_of_the_checkout() {
+        let top = Path::new("/work/mono-wt");
+        assert_eq!(subpath_of(top, Path::new("/work/mono-wt/apps/web/src")).as_deref(), Some("apps/web/src"));
+        assert_eq!(subpath_of(top, top).as_deref(), Some(""), "the top itself");
+        assert_eq!(subpath_of(top, Path::new("/work/mono-wt/./apps")).as_deref(), Some("apps"));
+        assert_eq!(subpath_of(top, Path::new("/work/mono")), None, "outside it");
+        assert_eq!(subpath_of(top, Path::new("/work/mono-wtx/apps")), None, "a sibling is outside it");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bad = top.join(std::ffi::OsStr::from_bytes(b"apps/w\xffb"));
+            assert_eq!(subpath_of(top, &bad), None, "a name that is not Unicode");
+        }
+    }
+
+    #[test]
     fn a_git_directory_makes_its_parent_the_root() {
         assert_eq!(root_from_marker(Path::new("/w/repo"), &GitMarker::Dir), PathBuf::from("/w/repo"));
     }
@@ -472,5 +865,43 @@ mod tests {
         assert!(ids.iter().all(|id| id.starts_with("my-app-") && id.len() == "my-app-".len() + 4));
         assert!(is_candidate_for(root, &candidate_id(root, 7)));
         assert!(!is_candidate_for(root, "my-app-zzzz"));
+    }
+
+    #[test]
+    fn a_command_that_does_not_end_in_time_is_stopped() {
+        let mut command = if cfg!(windows) {
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a long-lived process");
+
+        let started = std::time::Instant::now();
+        assert_eq!(wait_or_kill(&mut child, Duration::from_millis(300)), None);
+        assert!(started.elapsed() >= Duration::from_millis(250), "it waited");
+        assert!(started.elapsed() < Duration::from_secs(10), "it did not wait for the command to end");
+        assert!(matches!(child.try_wait(), Ok(Some(_))), "the command was ended");
+    }
+
+    #[test]
+    fn only_one_line_of_a_hash_is_a_first_commit() {
+        let sha1 = "3f786850e387550fdab836ed7e6dc881de23001b";
+        let sha256 = "a".repeat(64);
+        assert_eq!(first_commit_in(&format!("{sha1}\n")).as_deref(), Some(sha1));
+        assert_eq!(first_commit_in(&format!("{}\r\n", sha1.to_uppercase())).as_deref(), Some(sha1));
+        assert_eq!(first_commit_in(&sha256).as_deref(), Some(sha256.as_str()));
+        let (longer, twice, not_hex) = (format!("{sha1}0"), format!("{sha1}\n{sha1}\n"), sha1.replace('3', "g"));
+        for answer in ["", "\n", &sha1[..39], longer.as_str(), twice.as_str(), not_hex.as_str()] {
+            assert_eq!(first_commit_in(answer), None, "{answer:?}");
+        }
     }
 }

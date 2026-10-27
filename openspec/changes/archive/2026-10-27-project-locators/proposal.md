@@ -2,9 +2,9 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2 | M–L, en cuatro entregas M | project-registry (89), archivado: su entrega 0 sale en 0.63.0 (R20 de [`specs/project`](../../specs/project/spec.md)). Se construye sobre R1–R20, de project-reassign (77) y project-clone-identity (30) | ver [`state.yaml`](state.yaml) |
+| 2 | M–L, en cuatro entregas M | project-registry (89), archivado: su entrega 0 sale en 0.63.0 (R20 de [`specs/project`](../../../specs/project/spec.md)). Se construye sobre R1–R20, de project-reassign (77) y project-clone-identity (30) | ver [`state.yaml`](state.yaml) |
 
-Este cambio nació al partir [project-registry](../archive/2026-10-25-project-registry/proposal.md) (89) cuando se archivó. La entrega 0, el arreglo del fundido, quedó allí. Las entregas 1 a 4 y las decisiones que las ordenan pasaron aquí, con la numeración de entonces. La [exploración](../archive/2026-10-25-project-registry/exploration.md) sigue siendo la de 89: el mapa de dónde se deriva, se guarda y se consume un id de proyecto, los enfoques A a D y lo descartado. Las citas de esta propuesta apuntan al código de después de la entrega 0.
+Este cambio nació al partir [project-registry](../2026-10-25-project-registry/proposal.md) (89) cuando se archivó. La entrega 0, el arreglo del fundido, quedó allí. Las entregas 1 a 4 y las decisiones que las ordenan pasaron aquí, con la numeración de entonces. La [exploración](../2026-10-25-project-registry/exploration.md) sigue siendo la de 89: el mapa de dónde se deriva, se guarda y se consume un id de proyecto, los enfoques A a D y lo descartado. Las citas de esta propuesta apuntan al código de después de la entrega 0.
 
 ## Problema
 
@@ -13,10 +13,11 @@ Hoy un proyecto *es* una carpeta. Su id sale del camino (`derive_project_id`, `c
 1. **Los dos límites de R20.** Los dos salen de lo mismo: sin el primer commit, un camino no tiene otra huella que su remoto.
    - **Un repositorio en el camino de otro sigue fundiéndose cuando falta un remoto.** Una clave que no se puede leer no contradice nada, así que un repositorio sin `origin` se queda con la fila más vieja del camino (`settle`, `project.rs:130-132`). Además, una fila sin remotos atados acepta como primer remoto la clave del que llega (`:135`). Si al anterior o al recién llegado le falta `origin`, el recién llegado se queda con la fila del anterior y con sus memorias.
    - **Un remoto renombrado abre otro proyecto sin decir nada.** Si cambia el `origin` de una raíz ya registrada (el repositorio se renombró o cambió de organización), el camino queda contradicho y la raíz recibe una fila nueva (`settle_root_in`, `project.rs:188-208`). Sus memorias quedan bajo el id viejo, y sólo `doctor` (`project_remotes`) lo nombra. R16 perdió así la garantía de que un remoto nuevo conservaba el proyecto.
-2. **Una carpeta sin `origin` que se mueve o se renombra pierde su proyecto.** El camino nuevo no está grabado y recibe el primer candidato libre (`project.rs:201-206`). `legacy_ids` sólo cubre el camino por el que se llegó a la misma raíz (`identity.rs:54-58`). `doctor` no lo ve, porque el id viejo sigue siendo un candidato de su raíz vieja (`crates/clawg-cli/src/doctor/checks.rs:561-585`).
+2. **Una carpeta sin `origin` (o sin VCS) que se mueve o se renombra pierde su proyecto.** El camino nuevo no está grabado y recibe el primer candidato libre (`project.rs:201-206`). `legacy_ids` sólo cubre el camino por el que se llegó a la misma raíz (`identity.rs:54-58`). `doctor` no lo ve, porque el id viejo sigue siendo un candidato de su raíz vieja (`crates/clawg-cli/src/doctor/checks.rs:561-585`).
 3. **No existe un proyecto sin carpeta.**
    - `--to-project` exige una fila de `project` (`check_target_in`, `crates/clawg-core/src/memory/relocate.rs:426-436`), y esa fila sólo nace de una raíz.
    - Un `project_path` inventado se registra como una raíz normalizada a mano (`identity.rs:67-74`), así que su identidad es el hash de un camino que no existe.
+   - Un subproyecto de un monorepo tampoco puede ser un proyecto propio: la raíz sube hasta el primer `.git` (R1 de [`specs/project`](../../../specs/project/spec.md)).
    - Por eso no se pueden colocar sin inventar carpetas las 15.709 filas que el import dejó sin proyecto en el store de producción. La cifra se midió allí y no se releyó en este repo. Mientras tanto, esas filas compiten en la búsqueda de cada proyecto (`memory_project_predicate!`, `crates/clawg-core/src/memory/search.rs:107-113`).
 4. **No hay dónde unir, renombrar o borrar un proyecto.**
    - `merge_in` (`relocate.rs:884`) sólo lo dispara el registro (`project.rs:356`).
@@ -29,9 +30,15 @@ Objetivo 2: separar las memorias por proyecto y, a la vez, poder usarlas entre p
 
 ## Decisiones
 
-Se tomaron el 2026-10-24 sobre las [decisiones abiertas](../archive/2026-10-25-project-registry/exploration.md#decisiones-abiertas) de la exploración de 89, y se conservan sus números:
+Se tomaron el 2026-10-24 sobre las [decisiones abiertas](../2026-10-25-project-registry/exploration.md#decisiones-abiertas) de la exploración de 89, y se conservan sus números:
 
-1. **La identidad se separa de la ubicación (enfoque A).** Un registro de proyectos (id estable, nombre, lápida de unión) y localizadores (camino, remoto, primer commit) que apuntan a él. Un localizador sólo vincula si lo valida una huella que no depende del camino. Los ids que ya existen (`nombre-1a2b`) se conservan y **ninguna fila de `memory` cambia de `project_id`**. V27 es aditiva y se rellena desde cada tabla que guarda un id de proyecto.
+1. **La identidad se separa de la ubicación (enfoque A).**
+   - `project` pasa a ser la tabla de referencia de los proyectos: id estable, nombre y lápida de unión. Todas las tablas guardan su id.
+   - Las formas de llegar a un proyecto, sus **localizadores**, son opcionales, de cero a muchas: sus carpetas (`project_path`, que es la tabla `project` de hoy renombrada, con las huellas de cada una) y sus remotos (`project_remote`). El primer commit es una huella de la carpeta.
+   - Una carpeta sólo vincula si lo valida una huella que no depende del camino.
+   - Un proyecto puede no tener carpeta (una idea), haberla perdido (se borró o se movió), tener varias (clones, mudanzas) o ser una carpeta dentro de un monorepo.
+   - Los ids que ya existen (`nombre-1a2b`) se conservan y **ninguna fila de `memory` cambia de `project_id`**. V27 renombra la tabla de carpetas sin cambiar ningún valor, agrega lo nuevo y lo rellena desde las tablas que guardan un id de proyecto.
+   - El modelo se ajustó así el 2026-10-25, al escribir el [diseño](design.md#el-modelo) de la entrega 1.
 2. **El arreglo del fundido iba primero y solo.** Se cumplió: es la entrega 0 de 89 (R20), que sale en 0.63.0. Su límite conocido lo cierra la huella del primer commit en la entrega 1.
 3. **Alta automática.** Nada puede depender de que el usuario se acuerde de correr un comando.
    - Las carpetas se siguen registrando solas en su primer uso (`server.rs:881`, `crates/clawg-cli/src/hook.rs:220-228`).
@@ -73,14 +80,24 @@ Se tomaron el 2026-10-24 sobre las [decisiones abiertas](../archive/2026-10-25-p
   - En contra: sólo se deshace con un snapshot, que guarda justo el texto que se quería sacar. Exige el daemon parado y reconstruir el archivo, como `purge`. Y junta en un mismo paso el doble chequeo de la etapa 2 con lo irreversible.
   - Con los pasos separados se mantiene la regla de hoy: un `delete` se deshace, y `purge` es lo único que no tiene vuelta.
 
+El diseño de la entrega 2b (2026-10-25) cambió dos puntos con la persona:
+
+- **Los localizadores no se desvinculan.** Un proyecto borrado vuelve, sin revisar, en cuanto recibe una fila viva: un save desde un puente abierto, un import o un `undelete` ([diseño, D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)). Así, el mismo checkout sigue llevando al mismo proyecto.
+- **`purge --project-delete N` saca todo el conjunto confirmado**, también las filas que ya estaban borradas antes de N ([D34](design.md#d34-la-purga-de-un-borrado-saca-todo-su-conjunto)).
+
 ## Entregas
 
-Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RED salen de [«Cómo se mide»](../archive/2026-10-25-project-registry/exploration.md#cómo-se-mide) de la exploración, más los que piden las decisiones de arriba. La spec, el diseño y las tareas se escriben por entrega, cuando le toca a cada una.
+Cada entrega se cierra sola, con commits atómicos y TDD estricto. El cambio se publica entero, al final, con un solo pull request a `main`. Los tests RED salen de [«Cómo se mide»](../2026-10-25-project-registry/exploration.md#cómo-se-mide) de la exploración, más los que piden las decisiones de arriba. La spec, el diseño y las tareas se escriben por entrega, cuando le toca a cada una.
 
 ### 1. El registro (V27)
 
 **Qué trae.**
-- **V27, aditiva**: `project_identity` (id, nombre, cómo nació, si se revisó, `merged_into`), `project_locator` (`path`, `remote`, `root_commit`; un índice único parcial sobre `(kind, value)` mientras siga vinculado, que el diseño concilia con R20; ver [«Abierto para el diseño»](#abierto-para-el-diseño)) y `project_suggestion` (par, motivo, respuesta). El detalle está en [Migración](#datos-guardados-migración-y-vuelta-atrás).
+- **V27**:
+  - `project` pasa a ser la referencia: id, nombre, cómo nació y si se revisó;
+  - la tabla de carpetas de hoy pasa a `project_path`, con el proyecto al que lleva y sus huellas (remoto y primer commit);
+  - `project_suggestion` guarda el par, el motivo y la respuesta.
+
+  El detalle está en el [diseño](design.md) y en [Migración](#datos-guardados-migración-y-vuelta-atrás). `merged_into` llega con la entrega 2.
 - **El resolvedor puro `resolve_in(ubicación, huellas, registro)`**: primero el camino validado, después el remoto, después el primer commit. El primer commit vincula sólo si el camino viejo ya no existe; si no, abre un proyecto separado con una sugerencia. Si nada coincide, abre un proyecto nuevo. Absorbe a `settle` (R20), que hoy decide con el remoto solo.
 - **La lectura del primer commit, fuera del camino caliente**: sólo cuando el camino no está grabado o la huella lo contradice.
 - **`clawg projects list`**, que marca lo que se creó solo sin revisar y las sugerencias pendientes, y **`clawg projects rename`**.
@@ -96,6 +113,13 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 - El test de la base en V26 (ver [Migración](#datos-guardados-migración-y-vuelta-atrás)).
 
 ### 2. Unir, revisar y borrar
+
+Se escribe e implementa en dos partes, cada una con su spec, su diseño, sus tareas y su migración. Se partió el 2026-10-25, porque son dos funciones con riesgos distintos:
+
+- **2a. Unir:** `merge` con su lápida y su `--undo`, `canonical(id)`, las respuestas a las sugerencias y los hallazgos de `doctor`.
+- **2b. Borrar:** `delete` en sus dos etapas con su `--undo`, y `purge --project-delete`.
+
+La etapa 1 de `delete` propone un `merge`, así que 2a va primero. Ninguna de las dos se publica sola: el cambio sale entero, con la versión 0.64.0.
 
 **Qué trae.**
 - **`clawg projects merge X --into Z [--dry-run] [--undo N]`**:
@@ -120,6 +144,12 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 - Etapa 2, `--undo N`: restaura las filas (las vuelve a embeber) y sus localizadores.
 - `purge --project-delete N` borra para siempre y nombra los snapshots y los `workspace.md` que todavía guardan el texto.
 
+El diseño de la entrega 2a (2026-10-25) cambió tres puntos de esta sección:
+
+- **`synthesis_review` queda con la revisión más vieja**, no con el máximo de `reviewed_at`. Con el máximo, lo de X entre las dos fechas no se contaría nunca para `synthesize`, y el aviso se perdería sin que nadie lo note ([D19](design.md#d19-synthesis_review-queda-con-la-revisión-más-vieja)).
+- **El snapshot de una unión es `pre-merge`**, no `pre-rekey`, y el de su `--undo` es `pre-undo`. Así las uniones no hacen rotar los snapshots de los registros ([D21](design.md#d21-un-snapshot-pre-merge-y-pre-undo-para-deshacer)).
+- **Lo que administra proyectos no sigue la lápida.** `rename`, `keep-apart`, el destino de una unión y el `from_project` de un movimiento responden 409 `project_merged`, y el `--undo` del movimiento de una unión responde 409 `part_of_merge` ([D23](design.md#d23-lo-que-administra-proyectos-no-sigue-la-lápida)). `canonical` sigue corriendo en las entradas que leen o escriben bajo un proyecto ([D17](design.md#d17-canonical-corre-al-entrar-para-leer-y-en-la-transacción-que-escribe-para-escribir)).
+
 ### 3. Proyectos sin carpeta y el agente
 
 **Qué trae.**
@@ -127,6 +157,11 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 - **Las sugerencias pendientes en `session-start` y en `recall_context`**, y el camino para que el agente las responda.
 - **Nombres donde hoy van ids**: `--to-project` y `PATCH project_id` aceptan nombres.
 - **`clawg projects create|locate`**, para quien quiera crear o ubicar un proyecto a mano.
+- **Los subproyectos de un monorepo** ([diseño, D14](design.md#d14-lo-que-esta-entrega-deja-preparado-para-las-carpetas-opcionales)):
+  - una carpeta declarada dentro de un repositorio;
+  - la resolución elige la carpeta registrada más profunda que contiene el camino, para lo que el cliente manda también el camino crudo;
+  - en otra máquina, el remoto más la subcarpeta, lo que cambia la clave de `project_remote`.
+- **Una carpeta sin VCS que se mueve**: la sugerencia por nombre de la decisión 3, o `projects locate`.
 - **El contrato del modelo**: `agent_contract.json` y `.es.json` vueltos a bendecir, `protocol.md`, `protocol.es.md` y `tools_es.rs`.
 - **Después de esta entrega, un paso operativo** que no es código: colocar las filas sin proyecto de producción.
 
@@ -135,6 +170,26 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 - Una carpeta nueva con el nombre de un proyecto cuyo camino ya no existe abre un proyecto separado y deja una sugerencia. `session-start` y `recall_context` la muestran hasta que se responde, y responder «separados» la quita para siempre.
 - Los dos contratos cambian sólo por el argumento, y sin él el comportamiento es el de hoy.
 - `search_project` sobre un proyecto sin carpeta responde su propio mensaje.
+- Un subproyecto declarado en `monorepo/apps/web` recibe lo que se guarda desde `monorepo/apps/web/src`. Lo que se guarda desde `monorepo/` sigue en el proyecto del monorepo, y un clone del monorepo en otra máquina llega a los dos.
+
+**Lo que ya fijaron las entregas anteriores.**
+- **`born`** suma los valores `agent` y `user`. La columna no lleva `CHECK`, así que no hay que reconstruir nada ([D6](design.md#d6-la-referencia-y-su-relleno)).
+- **Un nombre donde hoy va un id** se resuelve primero como id y después como nombre. El nombre no es único, así que uno que tienen dos proyectos es un error que los lista ([D8](design.md#d8-el-nombre-no-es-único-el-id-desambigua)).
+- **El id de una lápida** lleva a su proyecto vivo (PL12). El nombre de una lápida o de un proyecto borrado queda libre, pero su id no (PL15 y PL27 de la [spec](spec.md)).
+- **`project_suggestion.reason`** tiene hoy `root_commit`, `remote_changed` y `user`. Esta entrega suma los suyos: una carpeta con el nombre de un proyecto cuyo camino ya no existe, y un nombre parecido ([D10](design.md#d10-las-sugerencias), [D22](design.md#d22-las-respuestas-a-las-sugerencias)).
+- **La respuesta por CLI** a una sugerencia ya existe: `projects merge` y `projects keep-apart` (D22).
+- **La regla de los duplicados** ya es una función pura del core: `duplicates`, en `crates/clawg-core/src/memory/inspect.rs`. Junta el mismo nombre, o el mismo primer commit sin un remoto que los distinga, y saltea las lápidas, los borrados y los pares respondidos ([D36](design.md#d36-los-candidatos-para-vaciarlo)). La búsqueda de parecidos puede partir de ella.
+
+**Abierto para su diseño.**
+- **Una búsqueda cuando el cwd no resuelve a ningún proyecto:** sin alcance, como hoy, o un error.
+- **Cómo responde el agente una sugerencia:** con una herramienta nueva o con un argumento en una existente, y si unir exige `user_answered` con la respuesta del usuario.
+- **Un proyecto borrado en el argumento `project`.** Con su id, un save lo revive ([D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)), y falta decidir si el argumento nuevo hace lo mismo. Con su nombre, que quedó libre, se puede crear un proyecto nuevo con ese nombre o mostrar el borrado como candidato, para que el agente pregunte.
+- **La clave de `project_remote` para un subproyecto.** D14 la pasa a remoto más subcarpeta, pero `remote` es la clave primaria de la tabla (`V24__project_remote.sql:9`), y cambiar una clave primaria en SQLite obliga a reconstruir la tabla. Eso choca con la migración aditiva que promete [«Datos guardados»](#datos-guardados-migración-y-vuelta-atrás): hay que reconstruir `project_remote` o guardar la subcarpeta aparte.
+
+**Partida el 2026-10-26** en dos, como la 2, porque tienen riesgos distintos:
+
+- **3a. Proyectos sin carpeta y el agente:** el argumento `project`, crear por nombre con búsqueda de parecidos, los nombres en `--to-project` y `PATCH`, `projects create|locate`, las sugerencias en `session-start` y `recall_context` con su respuesta del agente, y la sugerencia por nombre de una carpeta movida. No toca el esquema. Su [diseño](design.md#entrega-3a-proyectos-sin-carpeta-y-el-agente) (D38 a D49) cierra las cuatro preguntas abiertas de arriba, con lo que eligió la persona: el agente responde con `answer_suggestion`, que pide `user_answered` para unir y para separar (D45); el id de un proyecto borrado lo hace volver con un save, y su nombre lo muestra como candidato (D42); `new_project` crea aparte aunque haya parecidos (D41); y una búsqueda sin proyecto sigue sin alcance (D44).
+- **3b. Los subproyectos de un monorepo:** la carpeta registrada más profunda, el camino crudo del cliente y la clave de `project_remote`, con su migración (D49).
 
 ### 4. Exportar e importar
 
@@ -147,6 +202,18 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 - Un export hecho antes de una unión se importa en el destino sin crear el proyecto absorbido.
 - Un export de otra máquina con el mismo remoto cae en el proyecto local.
 - Un proyecto sin carpeta va y vuelve por nombre.
+
+**Depende de la entrega 3:** `--project-map NOMBRE=project:ID|NOMBRE` usa la resolución por nombre que trae la 3.
+
+**Lo que ya fijaron las entregas anteriores.**
+- **El import ya sigue la lápida** en la transacción que escribe cada fila ([D17](design.md#d17-canonical-corre-al-entrar-para-leer-y-en-la-transacción-que-escribe-para-escribir)).
+- **Una fila viva que el import escribe bajo un proyecto borrado lo revive**, sin revisar. Además, un borrado no desvincula sus carpetas ([D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)).
+- **El import no crea sugerencias**, porque el diario V26 no las puede anotar y un `--undo` las dejaría colgando. El proyecto que crea (`born = 'import'`) queda vacío después de su `--undo` ([D10](design.md#d10-las-sugerencias), [D12](design.md#d12-el-import-escribe-sus-carpetas-como-lo-haría-un-registro)).
+
+**Abierto para su diseño.**
+- **Volver a importar un export de clawg después de un movimiento simple.** Hoy inserta de nuevo las filas movidas, porque el proyecto del export ya no coincide. Se acepta, o se busca presencia en cualquier proyecto por `(agente, hash, created_at)`, con el riesgo de juntar un texto legítimo en dos proyectos.
+- **Las sugerencias y el proyecto que crea un import:** si el import pasa a crear sugerencias, y cómo anota su diario el proyecto que creó. Va junto con los tipos nuevos de `memory_import_extra`.
+- **Los proyectos borrados.** La línea `project` no lleva `deleted_at`, y falta decidir si viaja. También si un import que llega por una carpeta o un localizador a un proyecto borrado aquí puede revivirlo, y si un `project:ID` borrado en `--project-map` se rechaza con 409 `project_deleted`, como el destino de un movimiento ([D35](design.md#d35-lo-que-administra-proyectos-no-toma-uno-borrado)).
 
 ## Alcance
 
@@ -168,28 +235,33 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 
 ## Datos guardados: migración y vuelta atrás
 
-- **Entrega 1: V27, aditiva.**
+- **Entrega 1: V27.**
   - **Antes de migrar**, la apertura escribe el snapshot `pre-migration` (`crates/clawg-core/src/memory/db.rs:237`).
-  - **El relleno** crea una identidad por cada id distinto que aparece en estas tablas, para que ninguno quede sin identidad, ni siquiera los que no están en `project`:
-    - `project.id` y `project_remote.project_id`;
-    - `memory.project_id`, `episodic_trajectory.project_id` y `procedural_skill.project_id`;
-    - `memory_move.from_project` y `to_project`;
-    - `project_rekey.legacy_id` y `project_id`;
-    - `synthesis_review.scope_key` no vacío;
-    - `memory_import_extra` de tipo `project`.
+  - **El renombre.** La tabla `project` de hoy pasa a `project_path` sin cambiar ningún valor, y `project` se crea como la referencia ([diseño, D1](design.md#d1-project-es-la-referencia-y-las-carpetas-son-opcionales)).
+  - **El relleno** crea un proyecto por cada id que tiene filas en `memory`, `episodic_trajectory` o `procedural_skill`, o un remoto en `project_remote`. El diseño deja afuera los ids que sólo nombran los registros de historia, y las carpetas de clones donde nunca se guardó nada: serían proyectos vacíos ([D6](design.md#d6-la-referencia-y-su-relleno)). Si alguno vuelve a tener filas, lo recibe en esa escritura ([D7](design.md#d7-cada-id-que-se-escribe-se-adopta-con-un-disparador)).
   - **El nombre** es la parte anterior al último `-`.
-  - **Los localizadores**: `path` sale de cada fila de `project` y `remote` de `project_remote`. Desde 0.63.0 un camino puede tener varias filas (R20). Cada una es el camino de su propio repositorio y la distingue su remoto, así que el relleno no puede tomar el camino solo como clave única. Ver «Abierto para el diseño».
+  - **Las carpetas.** Cada una apunta a su propio id cuando ese id es un proyecto. Donde el store no puede saber a qué proyecto lleva (la carpeta de un clone), queda sin apuntar, y su primer registro lo graba. Desde 0.63.0 un camino puede tener varias carpetas (R20), y por eso el camino no es una clave única.
   - **Lo que crea el relleno no se marca «sin revisar».**
   - **Ninguna fila de `memory` cambia.**
 - **El test sembrado en V26.**
-  - El store tiene dos raíces que comparten remoto, una colisión de hash, filas en las tres tablas, `memory_move`, `project_rekey`, `synthesis_review`, un `project_id` sin fila en `project`, un caso fundido (dos remotos atados a un proyecto) y un camino con dos filas (R20).
-  - Se abre con V27 y se comprueba que ninguna fila cambió, que cada id tiene identidad, que `search`, `list` y `context` devuelven lo mismo que antes, y que `doctor` no marca nada nuevo fuera del caso fundido.
+  - El store tiene:
+    - dos raíces que comparten remoto y una colisión de hash;
+    - filas en las tres tablas;
+    - entradas en `memory_move`, `project_rekey` y `synthesis_review`;
+    - un `project_id` sin fila en `project`;
+    - un caso fundido (dos remotos atados a un proyecto);
+    - un camino con dos filas (R20).
+  - Se abre con V27 y se comprueba:
+    - que ninguna fila cambió y que las carpetas están en `project_path`;
+    - que cada id en uso tiene su proyecto;
+    - que `list` devuelve lo mismo que antes;
+    - que `doctor` no marca nada nuevo fuera del caso fundido.
 - **Las entregas 2 a 4** traen cada una su migración aditiva, con su test sembrado en la versión anterior.
 - **Volver atrás del esquema.**
   - Un binario anterior rechaza un store más nuevo sin tocarlo (`SchemaNewer`, `db.rs:443`).
   - `clawg update` restaura en el proceso el snapshot `pre-migration` cuando el binario viejo rechaza el store (`.claude/CLAUDE.md`, `clawg update`). A mano, se hace con `clawg restore` de ese snapshot.
-  - Como las tablas nuevas sólo se agregan, el diseño deja también el SQL que las quita, como hizo [project-reassign](../archive/2026-10-22-project-reassign/proposal.md#datos-guardados).
-- **Volver atrás de una operación.** Una unión, con `projects merge --undo N` o su `pre-rekey`. Un borrado de etapa 2, con `projects delete --undo N` o su snapshot. Lo que se purgó, sólo con un snapshot.
+  - El diseño deja también el SQL que deshace V27 a mano, conservando lo guardado después, como hizo [project-reassign](../2026-10-22-project-reassign/proposal.md#datos-guardados) ([diseño, «Volver atrás»](design.md#volver-atrás)).
+- **Volver atrás de una operación.** Una unión, con `projects merge --undo N` o su `pre-merge`. Un borrado de etapa 2, con `projects delete --undo N` o su snapshot. Lo que se purgó, sólo con un snapshot.
 
 ## Compatibilidad
 
@@ -198,12 +270,12 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 - **Hooks.** Tienen 3 s por evento: el primer commit nunca se lee para un camino grabado y sin contradicción.
 - **Export v1.** Los campos nuevos son opcionales y un lector ignora los que no conoce, así que la versión del formato no cambia.
 - **Contrato MCP.** El argumento es opcional y, sin él, el comportamiento es el de hoy. Se vuelven a bendecir los dos contratos, y la apertura de cada variante de `protocol` sigue en 2048 caracteres o menos.
-- **`doctor`, chequeo `projects`.** Compara cada fila de `project` con los candidatos de su raíz (`checks.rs:561-585`). Un proyecto sin carpeta no tiene fila en `project`, y la segunda fila de un camino es un candidato de su raíz, así que no se marca ninguno de los dos. `project_remotes` sigue leyendo `project_remote` mientras exista (ver «Abierto para el diseño»).
+- **`doctor`, chequeo `projects`.** Compara cada carpeta con los candidatos de su raíz (`checks.rs:561-585`), leyéndola de `project_path` desde V27. Un proyecto sin carpeta no tiene ninguna que comparar, y la segunda carpeta de un camino es un candidato de su raíz, así que no se marca ninguno de los dos. `project_remotes` sigue leyendo `project_remote`, que se conserva ([diseño, D2](design.md#d2-project_remote-sigue-siendo-una-tabla)).
 
 ## Interacciones
 
 - **project-registry (89), archivado.** R20 es la base. El resolvedor de la entrega 1 absorbe `settle` y agrega el primer commit como segunda huella. Los tests de R20 tienen que seguir pasando. `a_different_remote_in_a_registered_path_is_another_project` sigue dando otro proyecto, y con el mismo primer commit también una sugerencia (decisiones 3 y 7).
-- **ranking-at-scale (86).** Las filas sin proyecto forman parte del fondo que mide, y colocarlas lo cambia. Este cambio va antes ([README](../../README.md)): se colocan antes de su línea base, y su informe dice si el fondo tenía filas sin proyecto.
+- **ranking-at-scale (86).** Las filas sin proyecto forman parte del fondo que mide, y colocarlas lo cambia. Este cambio va antes ([README](../../../README.md)): se colocan antes de su línea base, y su informe dice si el fondo tenía filas sin proyecto.
 - **import-job (87).** Un trabajo de importación que registre proyectos pasa por el mismo resolvedor y por el diario V26. `--project-map` gana el destino `project:ID|NOMBRE`. La forma del informe se coordina.
 - **project-reassign (77).** Mover sigue siendo «cambia el proyecto de una unidad entera y nada más» (R8). `check_target_in` consulta el registro y sigue la lápida.
 - **project-clone-identity (30).**
@@ -222,12 +294,28 @@ Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RE
 | Los agentes crean duplicados con nombres parecidos | Búsqueda de parecidos antes de crear, sugerencias pendientes, índice único por remoto, `doctor` y un `merge` reversible |
 | Una sugerencia que vuelve en cada sesión cansa | Se pregunta hasta que se responde, y «separados» queda guardado |
 | La etapa 2 borra más de lo que el usuario vio | El código resume el conjunto exacto y se recalcula en la transacción que escribe. Las filas quedan restaurables hasta `purge` |
-| Un `--undo` de borrado choca con un proyecto que tomó el camino mientras tanto | El índice único parcial lo detecta: el `--undo` restaura las filas y deja el camino donde está, con una sugerencia de unión |
+| Un `--undo` de borrado choca con un proyecto que tomó el camino mientras tanto | No puede pasar: el borrado no desvincula sus carpetas, así que ningún otro proyecto toma el camino ([D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)). Lo guardado mientras estaba borrado queda, y el `--undo` deja borrada la fila que choca con eso, y la nombra ([D33](design.md#d33-deshacer-recalcula-los-vectores-antes-de-la-transacción)) |
 | Leer el primer commit cuesta (historia larga, varios commits raíz, clone superficial, sin `git`) | Sólo se lee fuera del camino caliente, y sin huella si no se puede leer. El diseño elige cómo leerlo |
 | El contrato del modelo cambia | Los dos contratos se vuelven a bendecir, se revisa el diff y el argumento es opcional |
-| El tamaño (M–L) | Cuatro entregas publicables por separado, cada una con sus tests y commits atómicos |
+| El tamaño (M–L) | Cuatro entregas (la 2 en dos partes) que se cierran por separado, cada una con sus tests y commits atómicos |
 
 ## Abierto para el diseño
+
+El [diseño de la entrega 1](design.md) resolvió:
+
+- el localizador `path`: la carpeta con sus huellas, en `project_path` (D1);
+- `project_remote`: se conserva (D2);
+- cómo leer el primer commit (D3);
+- la integridad referencial (D7);
+- el nombre (D8);
+- el archivo marcador: ninguna entrega lo trae, y sigue fuera de alcance.
+
+Los diseños de las entregas 2a y 2b resolvieron:
+
+- cómo se responde una sugerencia por CLI: `projects merge` o `projects keep-apart` ([D22](design.md#d22-las-respuestas-a-las-sugerencias)). Cómo la responde el agente sigue abierto, para la entrega 3;
+- un save bajo el id de un proyecto borrado: se acepta, y el proyecto vuelve sin revisar ([D27](design.md#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)).
+
+Lo demás espera a su entrega ([diseño, «Lo que espera a otra entrega»](design.md#lo-que-espera-a-otra-entrega)). Las secciones de las entregas 3 y 4 lo recogen, junto con lo que las entregas anteriores ya fijaron. La lista queda como se escribió:
 
 - **El localizador `path` frente a R20.** La propuesta pedía un índice único parcial sobre `(kind, value)` mientras el localizador siga vinculado. Desde 0.63.0, en cambio, un camino puede tener varias filas, una por repositorio, y `settle` elige entre ellas por el remoto. Un `path` único por identidad no puede representar eso. Hay tres opciones, y el diseño elige:
   - que el camino sólo sea único entre los localizadores sin remoto;

@@ -3,12 +3,12 @@
 
 use std::path::{Path, PathBuf};
 
-use clawg_core::memory::identity::resolve_project_root;
+use clawg_core::memory::ProjectIdentity;
 use clawg_core::memory::portability::translate::ForeignReport;
-use clawg_core::memory::portability::{ImportReport, KeepReason, UndoReport, MAX_IMPORT_BYTES};
+use clawg_core::memory::portability::{ImportReport, KeepReason, MapTarget, RegistryUndo, UndoReport, MAX_IMPORT_BYTES};
 use clawg_core::preferences::Lang;
 
-use crate::cli::{ImportSource, ProjectMap, RootMap};
+use crate::cli::{ImportSource, MapTo, ProjectMap, RootMap};
 use crate::client::{ClientError, DaemonClient};
 
 #[derive(Debug, thiserror::Error)]
@@ -48,8 +48,12 @@ pub async fn run(
     agent: Option<&str>,
     maps: Maps<'_>,
 ) -> Result<String, ImportError> {
-    if let Some(m) = maps.projects.iter().find(|m| !m.root.is_dir()) {
-        return Err(ImportError::NotADirectory { name: m.name.clone(), path: m.root.clone() });
+    for m in maps.projects {
+        if let MapTo::Path(path) = &m.to {
+            if !path.is_dir() {
+                return Err(ImportError::NotADirectory { name: m.name.clone(), path: path.clone() });
+            }
+        }
     }
     let read = |source| ImportError::Read { path: file.to_path_buf(), source };
     let size = std::fs::metadata(file).map_err(read)?.len();
@@ -57,11 +61,35 @@ pub async fn run(
         return Err(ImportError::TooLarge { path: file.to_path_buf(), size });
     }
     let text = std::fs::read_to_string(file).map_err(read)?;
-    let resolved = |path: &Path| resolve_project_root(path).to_string_lossy().into_owned();
-    let roots: Vec<(String, String)> = maps.roots.iter().map(|m| (m.old.clone(), resolved(&m.new))).collect();
-    let projects: Vec<(String, String)> = maps.projects.iter().map(|m| (m.name.clone(), resolved(&m.root))).collect();
+    let (roots, projects) = targets(maps);
     let report = client.import(&text, from.as_str(), dry_run, agent, &roots, &projects).await?;
     Ok(render(lang, &report))
+}
+
+/// What the maps send: each path as its root and the path itself, which a
+/// declared subfolder leads to its project, as a bridge resolves its own; a
+/// project by the reference given, which the daemon resolves.
+fn targets(maps: Maps<'_>) -> (Vec<(String, MapTarget)>, Vec<(String, MapTarget)>) {
+    let folder = |path: &Path| {
+        let identity = ProjectIdentity::resolve(path);
+        MapTarget::Folder {
+            root: identity.root.to_string_lossy().into_owned(),
+            path: Some(identity.path.to_string_lossy().into_owned()),
+        }
+    };
+    let roots = maps.roots.iter().map(|m| (m.old.clone(), folder(&m.new))).collect();
+    let projects = maps
+        .projects
+        .iter()
+        .map(|m| {
+            let target = match &m.to {
+                MapTo::Path(path) => folder(path),
+                MapTo::Project(reference) => MapTarget::Project { project: reference.clone() },
+            };
+            (m.name.clone(), target)
+        })
+        .collect();
+    (roots, projects)
 }
 
 fn counts<N: std::fmt::Display>(map: &std::collections::BTreeMap<String, N>, empty: &str) -> String {
@@ -99,6 +127,13 @@ pub fn render(lang: Lang, r: &ImportReport) -> String {
             Lang::Es => format!("ya estaban aquí: {}", r.present),
         });
     }
+    if !r.present_elsewhere.is_empty() {
+        lines.push(match lang {
+            Lang::En => format!("already here, moved to another project: {}", counts(&r.present_elsewhere, none)),
+            Lang::Es => format!("ya estaban aquí, movidas a otro proyecto: {}", counts(&r.present_elsewhere, none)),
+        });
+    }
+    render_projects(lang, r, &mut lines);
     let (line, memory) = match lang {
         Lang::En => ("line", "memory"),
         Lang::Es => ("línea", "memoria"),
@@ -180,7 +215,83 @@ pub fn render(lang: Lang, r: &ImportReport) -> String {
             Lang::Es => format!("esta es la importación {n}; `clawg import --undo {n}` la deshace y conserva lo que cambió desde entonces"),
         });
     }
+    if !r.dry_run && (r.projects.iter().any(|p| p.created) || !r.suggestions.is_empty()) {
+        lines.push(match lang {
+            Lang::En => "`clawg projects list` shows the new projects and the suggestions to answer".to_string(),
+            Lang::Es => "`clawg projects list` muestra los proyectos nuevos y las sugerencias por responder".to_string(),
+        });
+    }
     lines.join("\n")
+}
+
+/// The identifier serde gives `value`: a step, a reason.
+fn identifier<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()
+}
+
+/// Where each project of the file went, the suggestions it left and the
+/// subfolders it declared. The step that decided and the reasons stay the
+/// daemon's identifiers.
+fn render_projects(lang: Lang, r: &ImportReport, lines: &mut Vec<String>) {
+    let heading = match lang {
+        Lang::En => "projects of the file:",
+        Lang::Es => "proyectos del archivo:",
+    };
+    list(
+        lines,
+        heading,
+        r.projects.iter().map(|p| {
+            let name = p.name.as_ref().map(|n| format!(" ({n})")).unwrap_or_default();
+            let Some(to) = &p.to else {
+                return match lang {
+                    Lang::En => format!("{}{name}: to none, a merge of the source whose target is not here", p.id),
+                    Lang::Es => format!("{}{name}: a ninguno, una unión de la fuente cuyo destino no está aquí", p.id),
+                };
+            };
+            let by = p.by.as_ref().map(identifier).unwrap_or_default();
+            let mut line = match lang {
+                Lang::En => format!("{}{name} → {to} by {by}", p.id),
+                Lang::Es => format!("{}{name} → {to} por {by}", p.id),
+            };
+            if p.created {
+                line.push_str(match lang {
+                    Lang::En => ", created",
+                    Lang::Es => ", creado",
+                });
+            }
+            if p.revived {
+                line.push_str(match lang {
+                    Lang::En => ", deleted here and back in use",
+                    Lang::Es => ", borrado aquí y de nuevo en uso",
+                });
+            }
+            line
+        }),
+    );
+    let heading = match (r.dry_run, lang) {
+        (false, Lang::En) => "suggestions that two projects may be one:",
+        (true, Lang::En) => "suggestions it would leave that two projects may be one:",
+        (false, Lang::Es) => "sugerencias de que dos proyectos pueden ser uno:",
+        (true, Lang::Es) => "sugerencias que dejaría de que dos proyectos pueden ser uno:",
+    };
+    list(lines, heading, r.suggestions.iter().map(|s| format!("{} ~ {}: {}", s.project_id, s.other_id, s.reason)));
+    let heading = match lang {
+        Lang::En => "subfolders the file declares:",
+        Lang::Es => "subcarpetas que el archivo declara:",
+    };
+    list(
+        lines,
+        heading,
+        r.subfolders.iter().map(|d| {
+            let repository = d.repository_here.as_deref().unwrap_or(&d.repository_id);
+            let project = d.project_here.as_deref().unwrap_or(&d.project_id);
+            match (&d.reason, lang) {
+                (None, _) => format!("{repository} {} → {project}", d.subpath),
+                (Some(reason), Lang::En) => format!("{repository} {} → {project}: not declared, {reason}", d.subpath),
+                (Some(reason), Lang::Es) => format!("{repository} {} → {project}: no se declaró, {reason}", d.subpath),
+            }
+        }),
+    );
 }
 
 /// Asks the daemon to take import `import_id` back and says what it did.
@@ -202,7 +313,8 @@ pub fn render_undo(lang: Lang, r: &UndoReport) -> String {
         && r.unfilled.is_empty()
         && r.links == 0
         && r.projects.is_empty()
-        && r.remotes.is_empty();
+        && r.remotes.is_empty()
+        && r.registry == RegistryUndo::default();
     if nothing {
         return match lang {
             Lang::En => format!("nothing of import {n} is left to take back"),
@@ -250,6 +362,7 @@ pub fn render_undo(lang: Lang, r: &UndoReport) -> String {
             Lang::Es => format!("remotos que había registrado, quitados: {}", r.remotes.join(", ")),
         });
     }
+    render_registry(lang, &r.registry, &mut lines);
     if let Some(snapshot) = &r.snapshot {
         lines.push(match lang {
             Lang::En => format!("the store before the undo is in {snapshot}; `clawg restore` brings it back"),
@@ -261,7 +374,49 @@ pub fn render_undo(lang: Lang, r: &UndoReport) -> String {
 
 /// The identifier the daemon gives `reason`.
 fn reason(reason: KeepReason) -> String {
-    serde_json::to_value(reason).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()
+    identifier(&reason)
+}
+
+/// What an undo took back of the registry of projects, and what stayed with
+/// the daemon's reason.
+fn render_registry(lang: Lang, r: &RegistryUndo, lines: &mut Vec<String>) {
+    let pairs = |pairs: &[(String, String)], joint: &str| pairs.iter().map(|(a, b)| format!("{a}{joint}{b}")).collect::<Vec<_>>().join(", ");
+    if !r.projects.is_empty() {
+        lines.push(match lang {
+            Lang::En => format!("projects it had created, deleted: {}", r.projects.join(", ")),
+            Lang::Es => format!("proyectos que había creado, borrados: {}", r.projects.join(", ")),
+        });
+    }
+    if !r.deleted_again.is_empty() {
+        lines.push(match lang {
+            Lang::En => format!("deleted projects it had brought back, deleted again: {}", r.deleted_again.join(", ")),
+            Lang::Es => format!("proyectos borrados que había traído de vuelta, borrados de nuevo: {}", r.deleted_again.join(", ")),
+        });
+    }
+    if !r.suggestions.is_empty() {
+        lines.push(match lang {
+            Lang::En => format!("suggestions it had left, removed: {}", pairs(&r.suggestions, " ~ ")),
+            Lang::Es => format!("sugerencias que había dejado, quitadas: {}", pairs(&r.suggestions, " ~ ")),
+        });
+    }
+    if !r.subfolders.is_empty() {
+        lines.push(match lang {
+            Lang::En => format!("subfolders it had declared, removed: {}", pairs(&r.subfolders, " ")),
+            Lang::Es => format!("subcarpetas que había declarado, quitadas: {}", pairs(&r.subfolders, " ")),
+        });
+    }
+    let heading = match lang {
+        Lang::En => "kept in the registry, because something uses them or someone answered or reviewed them:",
+        Lang::Es => "se quedan en el registro, porque algo las usa o alguien las respondió o revisó:",
+    };
+    list(
+        lines,
+        heading,
+        r.kept.iter().map(|k| match &k.other {
+            Some(other) => format!("{} {} {other}: {}", k.kind, k.id, identifier(&k.reason)),
+            None => format!("{} {}: {}", k.kind, k.id, identifier(&k.reason)),
+        }),
+    );
 }
 
 /// `heading` and an indented line per item, unless there is none.
@@ -498,14 +653,24 @@ mod tests {
         let done = send(false).await.expect("import");
         assert!(done.starts_with("imported 1 of 1 memories in the file\n  by type: semantic_fact 1\n  by state: live 1\n"), "{done}");
         assert!(done.contains("-pre-import.db; `clawg restore` brings it back"), "{done}");
-        assert!(done.ends_with("\nthis is import 1; `clawg import --undo 1` takes it back and keeps what changed since"), "{done}");
+        assert!(done.contains(&format!("projects of the file:\n  repo-0000 → {project} by map, created\n")), "{done}");
+        assert!(
+            done.ends_with(
+                "\nthis is import 1; `clawg import --undo 1` takes it back and keeps what changed since\n\
+                 `clawg projects list` shows the new projects and the suggestions to answer"
+            ),
+            "{done}"
+        );
 
         let again = send(false).await.expect("again");
         assert!(again.starts_with("imported 0 of 1 memories in the file\nalready here: 1\n"), "{again}");
         assert!(!again.contains("--undo"), "an import that wrote nothing has no number: {again}");
 
         let would = undo(Lang::En, &client, 1, true).await.expect("dry undo");
-        assert_eq!(would, format!("would take back import 1: remove 1 memories\nroots it had recorded, removed: {project}"));
+        assert_eq!(
+            would,
+            format!("would take back import 1: remove 1 memories\nroots it had recorded, removed: {project}\nprojects it had created, deleted: {project}")
+        );
         let undone = undo(Lang::En, &client, 1, false).await.expect("undo");
         assert!(undone.starts_with("took back import 1: removed 1 memories\n"), "{undone}");
         assert!(undone.contains("-pre-undo.db; `clawg restore` brings it back"), "{undone}");
@@ -596,6 +761,157 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_maps_are_sent_with_their_raw_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join("apps/web")).unwrap();
+        let root = clawg_core::memory::identity::strip_verbatim(&std::fs::canonicalize(dir.path()).unwrap());
+        let roots = [RootMap { old: "/far/mono".into(), new: dir.path().to_path_buf() }];
+        let projects = [
+            ProjectMap { name: "web".into(), to: MapTo::Path(dir.path().join("apps/web")) },
+            ProjectMap { name: "ideas".into(), to: MapTo::Project("Ideas".into()) },
+        ];
+
+        let (roots, projects) = targets(Maps { roots: &roots, projects: &projects });
+
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        assert_eq!(
+            serde_json::to_value((roots, projects)).unwrap(),
+            serde_json::json!([
+                [["/far/mono", { "root": text(&root), "path": text(&root) }]],
+                [["web", { "root": text(&root), "path": text(&root.join("apps").join("web")) }], ["ideas", { "project": "Ideas" }]],
+            ])
+        );
+    }
+
+    fn placed_report() -> ImportReport {
+        use clawg_core::memory::portability::{By, ImportedProject, ImportedSubfolder, ImportedSuggestion};
+        let went = |id: &str, name: Option<&str>, to: Option<&str>, by: Option<By>, created, revived| ImportedProject {
+            id: id.into(),
+            name: name.map(str::to_owned),
+            to: to.map(str::to_owned),
+            by,
+            created,
+            revived,
+        };
+        ImportReport {
+            rows: 2,
+            inserted: 1,
+            present: 0,
+            present_elsewhere: [("other-3c4d".to_string(), 1)].into(),
+            by_type: [("semantic_fact".to_string(), 1)].into(),
+            by_state: [("live".to_string(), 1)].into(),
+            by_project: [("ideas-1a2b".to_string(), 1)].into(),
+            import_id: Some(4),
+            projects: vec![
+                went("app-0000", Some("app"), Some("app-1a2b"), Some(By::Remote), false, false),
+                went("ideas-1a2b", Some("Ideas"), Some("ideas-1a2b"), Some(By::New), true, false),
+                went("gone-5e6f", None, Some("gone-5e6f"), Some(By::Id), false, true),
+                went("x-7a8b", Some("x"), None, None, false, false),
+            ],
+            suggestions: vec![ImportedSuggestion { project_id: "ideas-1a2b".into(), other_id: "ideas-9c0d".into(), reason: "similar_name".into() }],
+            subfolders: vec![
+                ImportedSubfolder {
+                    repository_id: "mono-0000".into(),
+                    subpath: "apps/web".into(),
+                    project_id: "web-0000".into(),
+                    repository_here: Some("mono-1a2b".into()),
+                    project_here: Some("web-1a2b".into()),
+                    written: true,
+                    reason: None,
+                },
+                ImportedSubfolder {
+                    repository_id: "mono-0000".into(),
+                    subpath: "apps/api".into(),
+                    project_id: "api-0000".into(),
+                    repository_here: Some("mono-1a2b".into()),
+                    project_here: Some("api-1a2b".into()),
+                    written: false,
+                    reason: Some("declared_here".into()),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_import_report_names_where_each_project_went() {
+        assert_eq!(
+            render(Lang::En, &placed_report()),
+            "imported 1 of 2 memories in the file\n  by type: semantic_fact 1\n  by state: live 1\n  by project: ideas-1a2b 1\n\
+             already here, moved to another project: other-3c4d 1\n\
+             projects of the file:\n\
+             \x20 app-0000 (app) → app-1a2b by remote\n\
+             \x20 ideas-1a2b (Ideas) → ideas-1a2b by new, created\n\
+             \x20 gone-5e6f → gone-5e6f by id, deleted here and back in use\n\
+             \x20 x-7a8b (x): to none, a merge of the source whose target is not here\n\
+             suggestions that two projects may be one:\n  ideas-1a2b ~ ideas-9c0d: similar_name\n\
+             subfolders the file declares:\n  mono-1a2b apps/web → web-1a2b\n  mono-1a2b apps/api → api-1a2b: not declared, declared_here\n\
+             this is import 4; `clawg import --undo 4` takes it back and keeps what changed since\n\
+             `clawg projects list` shows the new projects and the suggestions to answer"
+        );
+        assert_eq!(
+            render(Lang::Es, &placed_report()),
+            "se importaron 1 de 2 memorias del archivo\n  por tipo: semantic_fact 1\n  por estado: live 1\n  por proyecto: ideas-1a2b 1\n\
+             ya estaban aquí, movidas a otro proyecto: other-3c4d 1\n\
+             proyectos del archivo:\n\
+             \x20 app-0000 (app) → app-1a2b por remote\n\
+             \x20 ideas-1a2b (Ideas) → ideas-1a2b por new, creado\n\
+             \x20 gone-5e6f → gone-5e6f por id, borrado aquí y de nuevo en uso\n\
+             \x20 x-7a8b (x): a ninguno, una unión de la fuente cuyo destino no está aquí\n\
+             sugerencias de que dos proyectos pueden ser uno:\n  ideas-1a2b ~ ideas-9c0d: similar_name\n\
+             subcarpetas que el archivo declara:\n  mono-1a2b apps/web → web-1a2b\n  mono-1a2b apps/api → api-1a2b: no se declaró, declared_here\n\
+             esta es la importación 4; `clawg import --undo 4` la deshace y conserva lo que cambió desde entonces\n\
+             `clawg projects list` muestra los proyectos nuevos y las sugerencias por responder"
+        );
+        let plain = ImportReport { rows: 1, inserted: 1, import_id: Some(3), ..Default::default() };
+        assert!(!render(Lang::En, &plain).contains("projects list"), "nothing new to show");
+        let dry = ImportReport { dry_run: true, import_id: None, ..placed_report() };
+        for lang in [Lang::En, Lang::Es] {
+            assert!(!render(lang, &dry).contains("projects list"), "a dry run creates and leaves nothing to list");
+        }
+    }
+
+    #[test]
+    fn render_undo_names_what_it_took_back_from_the_registry() {
+        use clawg_core::memory::portability::{KeptEntry, RegistryKeep};
+        let report = UndoReport {
+            import_id: 4,
+            registry: RegistryUndo {
+                projects: vec!["ideas-1a2b".into(), "web-1a2b".into()],
+                deleted_again: vec!["gone-5e6f".into()],
+                suggestions: vec![("ideas-1a2b".into(), "ideas-9c0d".into())],
+                subfolders: vec![("mono-1a2b".into(), "apps/web".into())],
+                kept: vec![
+                    KeptEntry { kind: "project".into(), id: "mono-1a2b".into(), other: None, reason: RegistryKeep::Reviewed },
+                    KeptEntry { kind: "suggestion".into(), id: "a-1111".into(), other: Some("b-2222".into()), reason: RegistryKeep::Answered },
+                ],
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            render_undo(Lang::En, &report),
+            "took back import 4: removed 0 memories\n\
+             projects it had created, deleted: ideas-1a2b, web-1a2b\n\
+             deleted projects it had brought back, deleted again: gone-5e6f\n\
+             suggestions it had left, removed: ideas-1a2b ~ ideas-9c0d\n\
+             subfolders it had declared, removed: mono-1a2b apps/web\n\
+             kept in the registry, because something uses them or someone answered or reviewed them:\n\
+             \x20 project mono-1a2b: reviewed\n  suggestion a-1111 b-2222: answered"
+        );
+        assert_eq!(
+            render_undo(Lang::Es, &report),
+            "se deshizo la importación 4: se quitaron 0 memorias\n\
+             proyectos que había creado, borrados: ideas-1a2b, web-1a2b\n\
+             proyectos borrados que había traído de vuelta, borrados de nuevo: gone-5e6f\n\
+             sugerencias que había dejado, quitadas: ideas-1a2b ~ ideas-9c0d\n\
+             subcarpetas que había declarado, quitadas: mono-1a2b apps/web\n\
+             se quedan en el registro, porque algo las usa o alguien las respondió o revisó:\n\
+             \x20 project mono-1a2b: reviewed\n  suggestion a-1111 b-2222: answered"
+        );
+    }
+
     #[tokio::test]
     async fn a_missing_file_is_named_before_the_daemon_is_asked() {
         let c = DaemonClient::new("http://127.0.0.1:1", "token", std::env::temp_dir());
@@ -611,8 +927,8 @@ mod tests {
         let not_a_dir = dir.path().join("notes.txt");
         std::fs::write(&not_a_dir, "notes").unwrap();
         let projects = [
-            ProjectMap { name: "app".into(), root: dir.path().to_path_buf() },
-            ProjectMap { name: "notes".into(), root: not_a_dir.clone() },
+            ProjectMap { name: "app".into(), to: MapTo::Path(dir.path().to_path_buf()) },
+            ProjectMap { name: "notes".into(), to: MapTo::Path(not_a_dir.clone()) },
         ];
         let maps = Maps { roots: &[], projects: &projects };
         let missing = Path::new("/no/such/export.json");

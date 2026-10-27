@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::memory::backup::{open_for_probe, probe, ProbeState, SchemaPlan, StoreProbe};
 use crate::memory::db::StoredContract;
+use crate::memory::merge::MAX_MERGE_HOPS;
 
 /// What [`inspect`] found.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +37,146 @@ pub struct StoreFacts {
     pub remotes: Vec<RemoteRow>,
     pub outbox: OutboxFacts,
     pub invariants: Invariants,
+    /// The projects of `project`, tombstones too, by id; `None` before V27,
+    /// when `project` held folders.
+    pub registry: Option<Vec<RegistryRow>>,
+    /// What each folder of `project_path` recorded (V27), by id.
+    pub folder_prints: Vec<FolderPrint>,
+    /// The pairs of `project_suggestion` someone answered, each lesser id first.
+    pub answered_pairs: Vec<(String, String)>,
+    /// The ids rows of the three tables are saved under, with how many.
+    pub id_rows: Vec<IdRows>,
+    /// The deletes nobody undid or purged (V29); `None` before the table
+    /// exists, when no project can be deleted.
+    pub open_deletes: Option<Vec<OpenDelete>>,
+    /// The subfolders declared as projects (V30), by repository and subpath;
+    /// `None` before the table exists, when none could be declared.
+    pub subfolders: Option<Vec<DeclaredSubfolder>>,
+}
+
+/// A row of `project_subfolder`, as it is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredSubfolder {
+    pub parent_id: String,
+    pub subpath: String,
+    pub project_id: String,
+}
+
+/// A delete nobody undid or purged, by the project it took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDelete {
+    pub project_id: String,
+    pub delete_id: i64,
+}
+
+/// A project of `project`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryRow {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    /// The project a merge took it into (V28); `None` for a live one.
+    pub merged_into: Option<String>,
+    /// When it was deleted (V29); `None` for one that is not.
+    pub deleted_at: Option<i64>,
+}
+
+/// What a folder recorded: the project it leads to and its fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderPrint {
+    pub root_id: String,
+    pub project_id: Option<String>,
+    pub remote: Option<String>,
+    pub root_commit: Option<String>,
+}
+
+/// An id rows are saved under, deleted ones too, with how many of each table
+/// and how many of them are live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdRows {
+    pub project_id: String,
+    pub memories: i64,
+    pub trajectories: i64,
+    pub skills: i64,
+    pub live_memories: i64,
+    pub live_trajectories: i64,
+    pub live_skills: i64,
+}
+
+/// Two live projects that may be one, the older first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Duplicate {
+    /// `same_name` or `same_first_commit`.
+    pub reason: &'static str,
+    pub older: RegistryRow,
+    pub newer: RegistryRow,
+    /// The first commit their folders share, for `same_first_commit`.
+    pub root_commit: Option<String>,
+}
+
+/// The project `id` leads to through the merges of `registry`, deleted or
+/// not; `None` when `id` is no project or its chain ends in none (a cycle,
+/// one too long, an id `project` does not have).
+pub fn live_of<'a>(registry: &'a [RegistryRow], id: &str) -> Option<&'a RegistryRow> {
+    let mut at = registry.iter().find(|p| p.id == id)?;
+    for _ in 0..=MAX_MERGE_HOPS {
+        match &at.merged_into {
+            None => return Some(at),
+            Some(into) => at = registry.iter().find(|p| p.id == *into)?,
+        }
+    }
+    None
+}
+
+/// Two projects, neither merged nor deleted, that may be one: with the same
+/// name, in any case, or with folders of one first commit that no pair of
+/// remotes tells apart (a fork has a remote of its own). A pair someone
+/// answered is not one; the older of each pair, the one that usually has the
+/// history, comes first.
+pub fn duplicates(registry: &[RegistryRow], folders: &[FolderPrint], answered: &[(String, String)]) -> Vec<Duplicate> {
+    let live: Vec<&RegistryRow> = registry.iter().filter(|p| p.merged_into.is_none() && p.deleted_at.is_none()).collect();
+    let answered = |a: &str, b: &str| {
+        let (a, b) = if a < b { (a, b) } else { (b, a) };
+        answered.iter().any(|(x, y)| x == a && y == b)
+    };
+    let pair = |reason, a: &RegistryRow, b: &RegistryRow, root_commit: Option<&str>| {
+        let (older, newer) = if (a.created_at, &a.id) <= (b.created_at, &b.id) { (a, b) } else { (b, a) };
+        Duplicate { reason, older: older.clone(), newer: newer.clone(), root_commit: root_commit.map(str::to_string) }
+    };
+    let mut found = Vec::new();
+    for (i, a) in live.iter().enumerate() {
+        for b in &live[i + 1..] {
+            if a.name.to_lowercase() == b.name.to_lowercase() && !answered(&a.id, &b.id) {
+                found.push(pair("same_name", a, b, None));
+            }
+        }
+    }
+    let mut by_commit: std::collections::BTreeMap<&str, Vec<(&RegistryRow, Option<&str>)>> = std::collections::BTreeMap::new();
+    for f in folders {
+        let project = live_of(registry, f.project_id.as_deref().unwrap_or(&f.root_id)).filter(|p| p.deleted_at.is_none());
+        let (Some(commit), Some(project)) = (f.root_commit.as_deref(), project) else {
+            continue;
+        };
+        by_commit.entry(commit).or_default().push((project, f.remote.as_deref()));
+    }
+    for (commit, sharing) in by_commit {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for (i, (a, a_remote)) in sharing.iter().enumerate() {
+            for (b, b_remote) in &sharing[i + 1..] {
+                let told_apart = matches!((a_remote, b_remote), (Some(x), Some(y)) if x != y);
+                if a.id == b.id || told_apart || answered(&a.id, &b.id) {
+                    continue;
+                }
+                let found_pair = pair("same_first_commit", a, b, Some(commit));
+                let ids = (found_pair.older.id.clone(), found_pair.newer.id.clone());
+                if !seen.contains(&ids) {
+                    seen.push(ids);
+                    found.push(found_pair);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// The rows of one agent; `agent_id` is `None` for the rows no agent saved.
@@ -163,7 +304,11 @@ fn read_facts(c: &Connection) -> rusqlite::Result<StoreFacts> {
     Ok(StoreFacts {
         contract: if has.table("embedding_contract") { contract(c)? } else { None },
         agents: agents(c)?,
-        projects: if has.table("project") { projects(c)? } else { Vec::new() },
+        // The folders are in `project_path` from V27 and in `project` before.
+        projects: match ["project_path", "project"].into_iter().find(|t| has.table(t)) {
+            Some(folders) => projects(c, folders)?,
+            None => Vec::new(),
+        },
         remotes: if has.table("project_remote") { remotes(c)? } else { Vec::new() },
         outbox: if has.table("ingest_outbox") { outbox(c)? } else { OutboxFacts::default() },
         invariants: Invariants {
@@ -174,17 +319,93 @@ fn read_facts(c: &Connection) -> rusqlite::Result<StoreFacts> {
             purged_headers: if has.table("memory_piece") { purged_headers(c)? } else { Vec::new() },
             lonely_disputes: lonely_disputes(c)?,
         },
+        // `project` is the reference of the projects from V27, when the
+        // folders moved to `project_path`.
+        registry: if has.table("project_path") { Some(registry(c, &has)?) } else { None },
+        folder_prints: if has.table("project_path") { folder_prints(c)? } else { Vec::new() },
+        answered_pairs: if has.table("project_suggestion") { answered_pairs(c)? } else { Vec::new() },
+        id_rows: id_rows(c)?,
+        open_deletes: if has.table("project_delete") { Some(open_deletes(c)?) } else { None },
+        subfolders: if has.table("project_subfolder") { Some(subfolders(c)?) } else { None },
     })
 }
 
-/// The tables and the columns of `memory` the store has.
-struct Has {
+fn subfolders(c: &Connection) -> rusqlite::Result<Vec<DeclaredSubfolder>> {
+    let mut stmt = c.prepare("SELECT parent_id, subpath, project_id FROM project_subfolder ORDER BY parent_id, subpath")?;
+    let rows = stmt.query_map([], |r| Ok(DeclaredSubfolder { parent_id: r.get(0)?, subpath: r.get(1)?, project_id: r.get(2)? }))?;
+    rows.collect()
+}
+
+/// The projects of `project`, tombstones and deleted ones too, with what the
+/// schema of the store has of them.
+pub(crate) fn registry(c: &Connection, has: &Has) -> rusqlite::Result<Vec<RegistryRow>> {
+    let column = |name| if has.project_column(name) { name } else { "NULL" };
+    let (merged_into, deleted_at) = (column("merged_into"), column("deleted_at"));
+    let mut stmt =
+        c.prepare(&format!("SELECT id, name, created_at, {merged_into}, {deleted_at} FROM project ORDER BY id"))?;
+    let rows = stmt.query_map([], |r| {
+        Ok(RegistryRow { id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)?, merged_into: r.get(3)?, deleted_at: r.get(4)? })
+    })?;
+    rows.collect()
+}
+
+fn open_deletes(c: &Connection) -> rusqlite::Result<Vec<OpenDelete>> {
+    let mut stmt = c.prepare(
+        "SELECT project_id, delete_id FROM project_delete WHERE undone_at IS NULL AND purged_at IS NULL ORDER BY delete_id",
+    )?;
+    let rows = stmt.query_map([], |r| Ok(OpenDelete { project_id: r.get(0)?, delete_id: r.get(1)? }))?;
+    rows.collect()
+}
+
+pub(crate) fn folder_prints(c: &Connection) -> rusqlite::Result<Vec<FolderPrint>> {
+    let mut stmt = c.prepare("SELECT id, project_id, remote, root_commit FROM project_path ORDER BY id")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(FolderPrint { root_id: r.get(0)?, project_id: r.get(1)?, remote: r.get(2)?, root_commit: r.get(3)? })
+    })?;
+    rows.collect()
+}
+
+pub(crate) fn answered_pairs(c: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = c.prepare(
+        "SELECT min(project_id, other_id), max(project_id, other_id) FROM project_suggestion \
+         WHERE answer IS NOT NULL ORDER BY 1, 2",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+fn id_rows(c: &Connection) -> rusqlite::Result<Vec<IdRows>> {
+    let mut stmt = c.prepare(
+        "SELECT project_id, SUM(t = 'm'), SUM(t = 't'), SUM(t = 's'), \
+                SUM(t = 'm' AND live), SUM(t = 't' AND live), SUM(t = 's' AND live) FROM ( \
+           SELECT project_id, 'm' AS t, deleted_at IS NULL AS live FROM memory \
+           UNION ALL SELECT project_id, 't', deleted_at IS NULL FROM episodic_trajectory \
+           UNION ALL SELECT project_id, 's', deleted_at IS NULL FROM procedural_skill) \
+         WHERE project_id IS NOT NULL GROUP BY project_id ORDER BY project_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(IdRows {
+            project_id: r.get(0)?,
+            memories: r.get(1)?,
+            trajectories: r.get(2)?,
+            skills: r.get(3)?,
+            live_memories: r.get(4)?,
+            live_trajectories: r.get(5)?,
+            live_skills: r.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// The tables, and the columns of `memory` and `project`, the store has.
+pub(crate) struct Has {
     tables: Vec<String>,
     memory_columns: Vec<String>,
+    project_columns: Vec<String>,
 }
 
 impl Has {
-    fn of(c: &Connection) -> rusqlite::Result<Has> {
+    pub(crate) fn of(c: &Connection) -> rusqlite::Result<Has> {
         let names = |sql: &str| -> rusqlite::Result<Vec<String>> {
             let mut stmt = c.prepare(sql)?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -193,7 +414,12 @@ impl Has {
         Ok(Has {
             tables: names("SELECT name FROM sqlite_master WHERE type = 'table'")?,
             memory_columns: names("SELECT name FROM pragma_table_info('memory')")?,
+            project_columns: names("SELECT name FROM pragma_table_info('project')")?,
         })
+    }
+
+    fn project_column(&self, name: &str) -> bool {
+        self.project_columns.iter().any(|col| col == name)
     }
 
     fn table(&self, name: &str) -> bool {
@@ -224,8 +450,8 @@ fn agents(c: &Connection) -> rusqlite::Result<Vec<AgentRows>> {
     rows.collect()
 }
 
-fn projects(c: &Connection) -> rusqlite::Result<Vec<ProjectRow>> {
-    let mut stmt = c.prepare("SELECT id, root_path FROM project ORDER BY id")?;
+fn projects(c: &Connection, folders: &str) -> rusqlite::Result<Vec<ProjectRow>> {
+    let mut stmt = c.prepare(&format!("SELECT id, root_path FROM {folders} ORDER BY id"))?;
     let rows = stmt.query_map([], |r| Ok(ProjectRow { id: r.get(0)?, root_path: r.get(1)? }))?;
     rows.collect()
 }
@@ -631,7 +857,7 @@ mod tests {
             insert(c, &row("one"));
             insert(c, &Row { deleted: true, ..row("two") });
             insert(c, &Row { agent: None, project: None, ..row("global") });
-            c.execute("INSERT INTO project (id, root_path, created_at) VALUES ('proj-1a2b', '/work/proj', 0)", []).unwrap();
+            c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES ('proj-1a2b', '/work/proj', 0)", []).unwrap();
             for (op, state) in [("op-1", "pending"), ("op-2", "failed")] {
                 c.execute(
                     "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, attempts, created_at, updated_at) \
@@ -690,6 +916,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_facts_name_the_projects_their_folders_answers_and_rows() {
+        let dir = store_with(|c| {
+            c.execute_batch(
+                "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                   ('web-3c4d', 'web', 'root', 1, 2), ('api-5e6f', 'Web', 'root', 1, 3);
+                 INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) \
+                   VALUES ('app-1a2b', 'app', 'root', 0, 1, 'web-3c4d', 9);
+                 INSERT INTO project_path (id, root_path, created_at, project_id, root_commit) \
+                   VALUES ('web-3c4d', '/work/web', 2, 'web-3c4d', 'c1');
+                 INSERT INTO project_suggestion (project_id, other_id, reason, created_at, answer) VALUES \
+                   ('web-3c4d', 'api-5e6f', 'user', 4, 'apart'), ('web-3c4d', 'app-1a2b', 'root_commit', 5, NULL);
+                 INSERT INTO episodic_trajectory \
+                   (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+                   VALUES ('agent', 'a', 'orphan-9f9f', 's', 't', 1, 1, 1);",
+            )
+            .unwrap();
+            for (content, project) in [("one", "web-3c4d"), ("two", "web-3c4d"), ("left", "app-1a2b")] {
+                insert(c, &Row { project: Some(project), ..row(content) });
+            }
+        })
+        .await;
+
+        let facts = inspect(dir.path()).facts.unwrap();
+
+        let project = |id: &str, name: &str, created_at, merged_into: Option<&str>| RegistryRow {
+            id: id.into(),
+            name: name.into(),
+            created_at,
+            merged_into: merged_into.map(str::to_string),
+            deleted_at: None,
+        };
+        assert_eq!(
+            facts.registry,
+            Some(vec![project("api-5e6f", "Web", 3, None), project("app-1a2b", "app", 1, Some("web-3c4d")), project("web-3c4d", "web", 2, None)])
+        );
+        let print = FolderPrint { root_id: "web-3c4d".into(), project_id: Some("web-3c4d".into()), remote: None, root_commit: Some("c1".into()) };
+        assert_eq!(facts.folder_prints, vec![print]);
+        assert_eq!(facts.answered_pairs, vec![("api-5e6f".to_string(), "web-3c4d".to_string())], "a pending one is not answered");
+        let rows = |id: &str, memories, trajectories| IdRows {
+            project_id: id.into(),
+            memories,
+            trajectories,
+            skills: 0,
+            live_memories: memories,
+            live_trajectories: trajectories,
+            live_skills: 0,
+        };
+        assert_eq!(facts.id_rows, vec![rows("app-1a2b", 1, 0), rows("orphan-9f9f", 0, 1), rows("web-3c4d", 2, 0)]);
+
+        let older = tempfile::tempdir().unwrap();
+        seed_on_disk(older.path(), Some(27)).await;
+        let c = rusqlite::Connection::open(older.path().join("memory.db")).unwrap();
+        c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('web-3c4d', 'web', 'root', 1, 2)", [])
+            .unwrap();
+        drop(c);
+        let facts = inspect(older.path()).facts.unwrap();
+        assert_eq!(facts.registry, Some(vec![project("web-3c4d", "web", 2, None)]), "V27 merged nothing yet");
+    }
+
+    #[test]
+    fn duplicates_pair_by_name_and_by_first_commit_and_skip_answered_pairs() {
+        let project = |id: &str, name: &str, created_at, merged_into: Option<&str>| RegistryRow {
+            id: id.into(),
+            name: name.into(),
+            created_at,
+            merged_into: merged_into.map(str::to_string),
+            deleted_at: None,
+        };
+        let print = |id: &str, remote: Option<&str>, commit: &str| FolderPrint {
+            root_id: id.into(),
+            project_id: Some(id.into()),
+            remote: remote.map(str::to_string),
+            root_commit: Some(commit.into()),
+        };
+        // Two that share a name, two whose folders share a first commit (one
+        // through a tombstone), and two forks with remotes of their own.
+        let registry = vec![
+            project("api-1a2b", "App", 1, None),
+            project("app-3c4d", "app", 5, None),
+            project("lib-5e6f", "lib", 2, None),
+            project("lib2-7a8b", "lib2", 6, None),
+            project("forka-0001", "forka", 3, None),
+            project("forkb-0002", "forkb", 4, None),
+            project("old-0003", "old", 0, Some("lib-5e6f")),
+        ];
+        let folders = vec![
+            print("lib-5e6f", Some("github.com/acme/lib"), "c1"),
+            print("lib2-7a8b", None, "c1"),
+            print("old-0003", None, "c1"),
+            print("forka-0001", Some("github.com/acme/fork"), "c2"),
+            print("forkb-0002", Some("github.com/other/fork"), "c2"),
+        ];
+        let pairs = |answered: &[(String, String)]| -> Vec<(&'static str, String, String, Option<String>)> {
+            duplicates(&registry, &folders, answered)
+                .into_iter()
+                .map(|d| (d.reason, d.older.id, d.newer.id, d.root_commit))
+                .collect()
+        };
+
+        assert_eq!(
+            pairs(&[]),
+            vec![
+                ("same_name", "api-1a2b".to_string(), "app-3c4d".to_string(), None),
+                ("same_first_commit", "lib-5e6f".to_string(), "lib2-7a8b".to_string(), Some("c1".to_string())),
+            ],
+            "the older first; a tombstone is its target, and a fork is no duplicate"
+        );
+        let answered = [("lib-5e6f".to_string(), "lib2-7a8b".to_string())];
+        assert_eq!(pairs(&answered), vec![("same_name", "api-1a2b".to_string(), "app-3c4d".to_string(), None)]);
+        assert_eq!(live_of(&registry, "old-0003").map(|p| p.id.as_str()), Some("lib-5e6f"));
+    }
+
+    #[tokio::test]
     async fn inspecting_leaves_the_store_unchanged() {
         let dir = store_with(healthy).await;
         let before = files_in(dir.path());
@@ -727,6 +1066,7 @@ mod tests {
         assert_eq!(facts.agents, [AgentRows { agent_id: Some("agent-seed".into()), live: 1, total: 1 }]);
         assert!(facts.invariants.is_empty());
         assert_eq!(facts.outbox, OutboxFacts::default(), "V14 is not applied");
+        assert_eq!((facts.registry, facts.folder_prints, facts.answered_pairs), (None, vec![], vec![]), "V27 is not applied");
         assert_eq!(files_in(dir.path()), before);
     }
 
@@ -753,5 +1093,105 @@ mod tests {
         assert_eq!(found.schema.state, ProbeState::Missing);
         assert_eq!(found.facts, None);
         assert!(!dir.path().join("memory.db").exists(), "no store is created");
+    }
+
+    #[tokio::test]
+    async fn the_facts_read_a_deleted_project_where_the_schema_has_one() {
+        let dir = store_with(|c| {
+            c.execute_batch(
+                "INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES \
+                   ('gone-1a2b', 'gone', 'root', 1, 1, NULL), ('web-3c4d', 'web', 'root', 1, 2, NULL);
+                 INSERT INTO project_delete (delete_id, project_id, with_memories, deleted_at, undone_at) VALUES \
+                   (1, 'gone-1a2b', 1, 3, 4), (2, 'gone-1a2b', 1, 5, NULL), (3, 'web-3c4d', 0, 6, 7);
+                 INSERT INTO episodic_trajectory \
+                   (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+                   VALUES ('agent', 'a', 'gone-1a2b', 's', 't', 1, 1, 1);",
+            )
+            .unwrap();
+            insert(c, &Row { project: Some("gone-1a2b"), deleted: true, ..row("one deleted") });
+            insert(c, &Row { project: Some("gone-1a2b"), ..row("one live") });
+            // After the rows: a live one under a deleted project brings it back.
+            c.execute("UPDATE project SET deleted_at = 5 WHERE id = 'gone-1a2b'", []).unwrap();
+        })
+        .await;
+
+        let facts = inspect(dir.path()).facts.unwrap();
+
+        let deleted: Vec<(&str, Option<i64>)> =
+            facts.registry.as_ref().unwrap().iter().map(|p| (p.id.as_str(), p.deleted_at)).collect();
+        assert_eq!(deleted, vec![("gone-1a2b", Some(5)), ("web-3c4d", None)]);
+        assert_eq!(
+            facts.id_rows,
+            vec![IdRows {
+                project_id: "gone-1a2b".into(),
+                memories: 2,
+                trajectories: 1,
+                skills: 0,
+                live_memories: 1,
+                live_trajectories: 1,
+                live_skills: 0
+            }]
+        );
+        assert_eq!(facts.open_deletes, Some(vec![OpenDelete { project_id: "gone-1a2b".into(), delete_id: 2 }]), "an undone one is not open");
+
+        // At V28 there is no column and no table: nothing is deleted, and nothing is read.
+        let older = tempfile::tempdir().unwrap();
+        seed_on_disk(older.path(), Some(28)).await;
+        let c = rusqlite::Connection::open(older.path().join("memory.db")).unwrap();
+        c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('web-3c4d', 'web', 'root', 1, 2)", [])
+            .unwrap();
+        drop(c);
+        let facts = inspect(older.path()).facts.unwrap();
+        assert_eq!(facts.registry.unwrap()[0].deleted_at, None);
+        assert_eq!(facts.open_deletes, None, "V29 is not applied");
+    }
+
+    #[tokio::test]
+    async fn the_facts_read_the_declared_subfolders_where_the_schema_has_them() {
+        let dir = store_with(|c| {
+            c.execute_batch(
+                "INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES \
+                   ('mono-1a2b', 'libs/ui', 'ui', 2), ('mono-1a2b', 'apps/web', 'web', 1);",
+            )
+            .unwrap();
+        })
+        .await;
+
+        let facts = inspect(dir.path()).facts.unwrap();
+
+        let declared = |subpath: &str, project: &str| DeclaredSubfolder {
+            parent_id: "mono-1a2b".into(),
+            subpath: subpath.into(),
+            project_id: project.into(),
+        };
+        assert_eq!(facts.subfolders, Some(vec![declared("apps/web", "web"), declared("libs/ui", "ui")]));
+
+        let older = tempfile::tempdir().unwrap();
+        seed_on_disk(older.path(), Some(29)).await;
+        assert_eq!(inspect(older.path()).facts.unwrap().subfolders, None, "V30 is not applied");
+    }
+
+    #[test]
+    fn a_deleted_project_is_no_duplicate_and_leads_nowhere_for_a_tombstone() {
+        let project = |id: &str, name: &str, created_at, merged_into: Option<&str>, deleted_at| RegistryRow {
+            id: id.into(),
+            name: name.into(),
+            created_at,
+            merged_into: merged_into.map(str::to_string),
+            deleted_at,
+        };
+        let registry = vec![
+            project("web-3c4d", "web", 1, None, None),
+            project("app-1a2b", "Web", 2, None, Some(9)),
+            project("old-0003", "old", 0, Some("app-1a2b"), None),
+            project("lib2-7a8b", "lib2", 3, None, None),
+        ];
+        let folders = vec![
+            FolderPrint { root_id: "old-0003".into(), project_id: Some("old-0003".into()), remote: None, root_commit: Some("c1".into()) },
+            FolderPrint { root_id: "lib2-7a8b".into(), project_id: Some("lib2-7a8b".into()), remote: None, root_commit: Some("c1".into()) },
+        ];
+
+        assert_eq!(duplicates(&registry, &folders, &[]), vec![]);
+        assert_eq!(live_of(&registry, "old-0003").map(|p| p.id.as_str()), Some("app-1a2b"), "a chain ends in a project, deleted or not");
     }
 }

@@ -23,7 +23,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use clawg_core::memory::admin::{
     Deleted, delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
@@ -43,9 +43,19 @@ use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::language::count_saves_in;
 use clawg_core::memory::portability::timing::{Step, Timing};
-use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
-use clawg_core::memory::identity::origin_key;
-use clawg_core::memory::project::{register_project, RegisterError, Registration};
+use clawg_core::memory::portability::{
+    self, ImportError, ImportOptions, ImportReport, ImportTimings, MapProject, MapTarget, UndoError, UndoReport, MAX_IMPORT_BYTES,
+};
+use clawg_core::memory::identity::{Disk, Ground, ProjectIdentity};
+use clawg_core::memory::project::{register_project, RegisterError, RegisterOutcome, Registration};
+use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
+use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
+use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
+use clawg_core::memory::registry::{
+    find_project, keep_apart, list_deletes, list_projects, pending_suggestions, rename_project, resolve_project, suggestion_between,
+    Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, Named, Project, RenameError,
+    Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
+};
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
 use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
 use clawg_core::memory::sharing::{self, Reach, Reader};
@@ -716,6 +726,9 @@ pub struct ContextBody {
     pub retrieval: RetrievalState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub other_language: Option<OtherLanguage>,
+    /// The suggestions nobody answered that the project may be another one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<ListedSuggestion>,
 }
 
 /// How many live saves of the searched scope are in the language the caller
@@ -1049,7 +1062,14 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/backup", post(backup))
         .route("/import", post(import_memories).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
         .route("/import/undo", post(undo_import))
-        .route("/projects", post(register))
+        .route("/projects", post(register).get(projects))
+        .route("/projects/{id}", patch(rename))
+        .route("/projects/merge", post(merge_projects))
+        .route("/projects/keep-apart", post(keep_projects_apart))
+        .route("/projects/delete", post(delete_projects))
+        .route("/projects/resolve", post(resolve_projects))
+        .route("/projects/suggestions/answer", post(answer_suggestion))
+        .route("/projects/locate", post(locate_project))
         .route("/projects/docs/search", post(search_docs))
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
@@ -1336,12 +1356,13 @@ async fn save_memory(
         EmbedderStatus::Ready => true,
     };
 
+    let project_id = live_project(&app, body.project_id).await?;
     // Read now, not by the worker: a replay after a restart must keep the
     // session the save was accepted in.
-    let session_id = app.sessions.current(&body.agent_id, body.project_id.as_deref());
+    let session_id = app.sessions.current(&body.agent_id, project_id.as_deref());
     let event = MemoryEvent {
         agent_id: body.agent_id,
-        project_id: body.project_id,
+        project_id,
         // Not read for an explicit save: `provenance::seal` decides who
         // stated it.
         role: Role::User,
@@ -1442,8 +1463,9 @@ async fn search(
         .map_err(embed_failure)?;
 
     let caller = reader(&app, &body.agent_id);
+    let project_id = live_project(&app, body.project_id.clone()).await?;
     let scope = SearchScope::all_default()
-        .with_project(body.project_id.as_deref())
+        .with_project(project_id.as_deref())
         .with_reach(caller.reach.clone());
     let mut hits = search_all_memories(
         &app.runtime.store,
@@ -1469,10 +1491,21 @@ async fn search(
 
     let withheld = found - hits.len();
     let other_language = match lang {
-        Some(lang) => other_language(&app, lang, body.project_id.as_deref(), &caller).await,
+        Some(lang) => other_language(&app, lang, project_id.as_deref(), &caller).await,
         None => None,
     };
     Ok(Json(SearchBody { hits, withheld, other_language }))
+}
+
+/// The live project a request's `project` leads to: an open bridge keeps the
+/// id of a project merged since for its whole session, and old exports carry
+/// it. Every entry that reads under a project goes through it; the ones that
+/// write follow it again in the transaction that writes.
+async fn live_project(app: &AppCtx, project: Option<String>) -> ApiResult<Option<String>> {
+    match project {
+        Some(id) => canonical(&app.runtime.store, &id).await.map(Some).map_err(ApiError::internal),
+        None => Ok(None),
+    }
 }
 
 /// `agent` with what the policy in the data directory lets it reach, read on
@@ -1505,7 +1538,8 @@ async fn context(
     let budget = check_budget(body.budget)?;
     let lang = check_lang(body.lang.as_deref())?;
     let workspace = app.runtime.workspaces();
-    let project_id = body.project_id.as_deref();
+    let project_id = live_project(&app, body.project_id.clone()).await?;
+    let project_id = project_id.as_deref();
     let query = body.query.as_deref().filter(|q| !q.trim().is_empty());
 
     // Unconditional regen (~2-5 ms). A failure degrades to "no ids were
@@ -1571,8 +1605,17 @@ async fn context(
         _ => None,
     };
 
+    // As the counts above: a line left out, not a failed request.
+    let suggestions = match project_id {
+        Some(project_id) => pending_suggestions(&app.runtime.store, project_id).await.unwrap_or_else(|e| {
+            log::warn!("pending suggestions failed: {e}");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+
     let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
-    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval, other_language }))
+    Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval, other_language, suggestions }))
 }
 
 /// Records the host session `agent_id` works in for `project_id`, as a hook
@@ -1582,7 +1625,8 @@ async fn register_session(
     Json(body): Json<SessionRequest>,
 ) -> ApiResult<StatusCode> {
     check_session_id(&body.session_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    app.sessions.register(&body.agent_id, body.project_id.as_deref(), &body.session_id);
+    let project_id = live_project(&app, body.project_id).await?;
+    app.sessions.register(&body.agent_id, project_id.as_deref(), &body.session_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1591,7 +1635,8 @@ async fn synthesis(
     Json(body): Json<SynthesisRequest>,
 ) -> ApiResult<Json<Synthesis>> {
     let reader = named_reader(&app, body.agent_id.as_deref());
-    let params = SynthesisParams { reader, project_id: body.project_id, limit: body.limit };
+    let project_id = live_project(&app, body.project_id).await?;
+    let params = SynthesisParams { reader, project_id, limit: body.limit };
     synthesis_core(&app.runtime.store, params, TimestampMs::now())
         .await
         .map(Json)
@@ -1603,7 +1648,8 @@ async fn list_memories(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<ListBody>> {
     let reader = named_reader(&app, q.reader.as_deref());
-    let params = ListParams { reader, ..list_params_from_query(q)? };
+    let mut params = ListParams { reader, ..list_params_from_query(q)? };
+    params.project_id = live_project(&app, params.project_id).await?;
     let items = list_memories_core(&app.runtime.store, params)
         .await
         .map_err(ApiError::internal)?;
@@ -1638,9 +1684,10 @@ async fn stats(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<StatsQuery>,
 ) -> ApiResult<Json<MemoryStats>> {
+    let project_id = live_project(&app, q.project).await?;
     let stats = memory_stats_core(
         &app.runtime.store,
-        StatsParams { agent_id: q.agent, project_id: q.project },
+        StatsParams { agent_id: q.agent, project_id },
     )
     .await
     .map_err(ApiError::internal)?;
@@ -1684,7 +1731,11 @@ async fn update_memory(
     Json(body): Json<UpdateRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
     let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref(), body.destination()?)
+    let destination = match body.destination()? {
+        Some(Some(target)) => Some(Some(target_named(&app, target).await?)),
+        other => other,
+    };
+    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref(), destination)
         .map_err(|e| ApiError::bad_request(e.to_string()))?
         .answered(body.user_answered);
     // The core answers `None` for "no such row", "already soft-deleted" and
@@ -1702,12 +1753,29 @@ async fn update_memory(
     Ok(Json(UpdatedBody { updated: 1, row }))
 }
 
+/// The project a target names: the id as given, else the one live project
+/// of that name. A name nobody holds goes on as given, and the move answers
+/// its 404 naming it; one two projects hold is refused, naming their ids.
+async fn target_named(app: &AppCtx, reference: String) -> ApiResult<String> {
+    match find_project(&app.runtime.store, &reference).await.map_err(ApiError::internal)? {
+        Named::Project(id) => Ok(id),
+        Named::Unknown => Ok(reference),
+        Named::Ambiguous(ids) => Err(ApiError {
+            detail: Some(format!("{reference:?} is the name of {}: name one of them by its id", ids.join(", "))),
+            ..ApiError::conflict("project_ambiguous")
+        }),
+    }
+}
+
 /// The status a refused move answers with: a clash is a conflict, a target
 /// or a move that is not there is missing, a selection that cannot be read
 /// is the caller's mistake.
 fn move_error(e: MoveError) -> ApiError {
     match e {
         MoveError::Refused(_) => ApiError::conflict(e.to_string()),
+        MoveError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+        MoveError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
+        MoveError::PartOfMerge { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("part_of_merge") },
         MoveError::UnknownProject(_) | MoveError::UnknownMove(_) => ApiError::not_found(e.to_string()),
         MoveError::NoSelection | MoveError::TextOnDeleted | MoveError::EmptyText => ApiError::bad_request(e.to_string()),
         MoveError::Store(e) => ApiError::internal(e),
@@ -1724,7 +1792,11 @@ async fn move_memories(
     let dry_run = body.dry_run;
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let store = &app.runtime.store;
-    let report = match body.plan()? {
+    let plan = match body.plan()? {
+        MovePlan::Move { filter, target: Some(target) } => MovePlan::Move { filter, target: Some(target_named(&app, target).await?) },
+        plan => plan,
+    };
+    let report = match plan {
         MovePlan::Move { filter, target } => move_memories_core(store, &backups, &filter, target, dry_run).await,
         MovePlan::Undo(id) => undo_move_core(store, &backups, id, dry_run).await,
     };
@@ -1847,7 +1919,8 @@ async fn disputes(
     Query(q): Query<DisputesQuery>,
 ) -> ApiResult<Json<OpenPairs>> {
     let reader = named_reader(&app, q.agent_id.as_deref());
-    open_pairs(&app.runtime.store, reader.as_ref(), q.project_id.as_deref(), OPEN_PAIRS_SHOWN)
+    let project_id = live_project(&app, q.project_id).await?;
+    open_pairs(&app.runtime.store, reader.as_ref(), project_id.as_deref(), OPEN_PAIRS_SHOWN)
         .await
         .map(Json)
         .map_err(ApiError::internal)
@@ -1879,13 +1952,51 @@ pub struct ImportRequest {
     /// The agent every row that has one is stored under instead.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Exported project roots and the roots they have here, for a clawg
-    /// export.
+    /// Exported project roots and where they are here, for a clawg export:
+    /// a root, or `{"root", "path"}` with the path the user named.
     #[serde(default)]
-    pub map_roots: Vec<(String, String)>,
-    /// Project names of another tool and the roots they have here.
+    pub map_roots: Vec<(String, MapTarget)>,
+    /// Project names of another tool and where their notes go here: a root,
+    /// `{"root", "path"}`, or `{"project"}`, an id or the name of one live
+    /// project. A daemon from before takes only a root, and refuses the
+    /// objects instead of storing the notes in no project.
     #[serde(default)]
-    pub project_map: Vec<(String, String)>,
+    pub project_map: Vec<(String, MapTarget)>,
+}
+
+/// The project each `{"project"}` of `map` names, by its live id, refused
+/// as a move refuses its target: none is a 404, two a 409
+/// `project_ambiguous`, a deleted one a 409 `project_deleted`.
+async fn resolve_map(app: &AppCtx, map: Vec<(String, MapTarget)>) -> ApiResult<Vec<(String, MapTarget)>> {
+    let mut resolved = Vec::with_capacity(map.len());
+    for (name, target) in map {
+        let target = match target {
+            MapTarget::Project { project } => match portability::map_project(&app.runtime.store, &project).await {
+                Ok(MapProject::Live(id)) => MapTarget::Project { project: id },
+                Ok(MapProject::Unknown) => return Err(ApiError::not_found(format!("no project {project:?}"))),
+                Ok(MapProject::Ambiguous(ids)) => {
+                    return Err(ApiError {
+                        detail: Some(format!("{project:?} is the name of {}: name one of them by its id", ids.join(", "))),
+                        ..ApiError::conflict("project_ambiguous")
+                    })
+                }
+                Err(e) => return Err(import_error(e)),
+            },
+            target => target,
+        };
+        resolved.push((name, target));
+    }
+    Ok(resolved)
+}
+
+fn import_error(e: ImportError) -> ApiError {
+    match e {
+        ImportError::Format(e) => ApiError::bad_request(e.to_string()),
+        ImportError::NoEmbedder => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready"),
+        ImportError::Embed(e) => embed_failure(e),
+        ImportError::ProjectDeleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
+        e @ ImportError::Store(_) => ApiError::internal(e),
+    }
 }
 
 /// Imports an export. The file is read before the embedder is asked for, so
@@ -1895,7 +2006,7 @@ pub struct ImportRequest {
 /// imported, not even a dry run: cut by bytes, the pieces would be others.
 async fn import_memories(
     State(app): State<Arc<AppCtx>>,
-    Json(body): Json<ImportRequest>,
+    Json(mut body): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportReport>> {
     let mut timings = ImportTimings::new(body.dry_run).with_memory(super::process::private_bytes);
     let read = Instant::now();
@@ -1909,9 +2020,13 @@ async fn import_memories(
         Some("") => return Err(ApiError::bad_request("agent must not be blank")),
         agent => agent.map(str::to_string),
     };
+    if body.map_roots.iter().any(|(_, target)| target.root().is_none()) {
+        return Err(ApiError::bad_request("map_roots maps a root to a root; a project of the file goes by its remote, id or name"));
+    }
+    let project_map = resolve_map(&app, std::mem::take(&mut body.project_map)).await?;
     let foreign = match body.from.as_deref() {
         None | Some("clawg") => {
-            if !body.project_map.is_empty() {
+            if !project_map.is_empty() {
                 return Err(ApiError::bad_request(
                     "project_map maps the projects of another tool's export; name the tool in from",
                 ));
@@ -1936,14 +2051,14 @@ async fn import_memories(
     timings.record(Timing { elapsed: read.elapsed(), ..Timing::new(Step::Read) });
     let embedder = if body.dry_run { None } else { Some(ready_embedder(&app)?) };
     let options =
-        ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map: body.project_map };
+        ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let store = &app.runtime.store;
+    let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
     let imported = match foreign {
-        None => portability::import(store, embedder.as_deref(), &backups, &body.text, &options, &mut timings).await,
+        None => portability::import(store, embedder.as_deref(), chunker, &backups, &body.text, &options, Arc::new(Disk), &mut timings).await,
         Some(export) => {
-            let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
-            portability::import_foreign(store, embedder.as_deref(), chunker, &backups, export, &options, &mut timings).await
+            portability::import_foreign(store, embedder.as_deref(), chunker, &backups, export, &options, Arc::new(Disk), &mut timings).await
         }
     };
     match imported {
@@ -1951,10 +2066,7 @@ async fn import_memories(
             timings.finish();
             Ok(Json(report))
         }
-        Err(ImportError::Format(e)) => Err(ApiError::bad_request(e.to_string())),
-        Err(ImportError::NoEmbedder) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),
-        Err(ImportError::Embed(e)) => Err(embed_failure(e)),
-        Err(e @ ImportError::Store(_)) => Err(ApiError::internal(e)),
+        Err(e) => Err(import_error(e)),
     }
 }
 
@@ -1998,6 +2110,10 @@ pub struct RegisterRequest {
     /// when missing: a caller from before derives the id from the root.
     #[serde(default)]
     pub assigned: bool,
+    /// The absolute path the caller works in, inside the root: a subfolder
+    /// declared there leads to another project. Only with `assigned`.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2018,32 +2134,53 @@ async fn register(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<RegisterRequest>,
 ) -> ApiResult<Json<RegisteredBody>> {
-    if body.root_path.trim().is_empty() {
+    let path = body.path.as_deref().filter(|_| body.assigned);
+    let outcome = register_root(&app, &body.root_path, path, &body.legacy_ids, body.index_docs, body.assigned).await?;
+    let project_id = outcome.subproject.unwrap_or(outcome.project_id);
+    Ok(Json(RegisteredBody { project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
+}
+
+/// Registers `root_path` as [`register`] does, for it and for what places a
+/// folder in a project. `path`, where the caller works, is measured from the
+/// top of its checkout on the thread that reads the checkout; one that is not
+/// absolute or does not lead to `root_path` is left out, as a caller from
+/// before sends none.
+async fn register_root(
+    app: &Arc<AppCtx>,
+    root_path: &str,
+    path: Option<&str>,
+    legacy_ids: &[String],
+    index_docs: bool,
+    assigned: bool,
+) -> ApiResult<RegisterOutcome> {
+    if root_path.trim().is_empty() {
         return Err(ApiError::bad_request("root_path must not be empty"));
     }
-    let root = std::path::Path::new(&body.root_path);
-    if body.index_docs && !root.is_dir() {
-        return Err(ApiError::bad_request(format!("{} is not a directory, so it has no files to index", body.root_path)));
+    let root = std::path::Path::new(root_path);
+    if index_docs && !root.is_dir() {
+        return Err(ApiError::bad_request(format!("{root_path} is not a directory, so it has no files to index")));
     }
-    // A caller that derives its id joins no remote, but the remote still tells
-    // whether the repository at the root is the one its row was given to.
-    let remote = {
-        let root = root.to_path_buf();
-        tokio::task::spawn_blocking(move || origin_key(&root)).await.ok().flatten()
+    // A caller that derives its id joins no remote, but what is at the root
+    // still tells whether it is the repository its folder was given to.
+    let (checkout, subpath) = {
+        let (root, path) = (root.to_path_buf(), path.map(std::path::PathBuf::from));
+        tokio::task::spawn_blocking(move || {
+            let subpath = path.as_ref().filter(|p| p.is_absolute()).and_then(|p| Disk.subpath(&root, p));
+            (Disk.checkout(&root), subpath)
+        })
+        .await
+        .unwrap_or_default()
     };
-    let registration = Registration {
-        root,
-        remote: remote.as_deref(),
-        legacy_ids: &body.legacy_ids,
-        index_docs: body.index_docs,
-        assigned: body.assigned,
-    };
+    if let (Some(path), None) = (path, &subpath) {
+        log::info!("{path} is not in the checkout of {root_path}; it is registered as the root alone");
+    }
+    let registration = Registration { root, checkout, legacy_ids, index_docs, assigned, subpath: subpath.as_deref() };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-    let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration)
+    let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration, Arc::new(Disk))
         .await
         .map_err(|e| match e {
             RegisterError::InvalidLegacyId(_) => ApiError::bad_request(e.to_string()),
-            RegisterError::RootCollision { id, existing } if existing == body.root_path => ApiError {
+            RegisterError::RootCollision { id, existing } if existing == root_path => ApiError {
                 detail: Some(format!(
                     "{} derives the project id {id}, but the daemon gives that root another one; a newer bridge uses it",
                     root.display()
@@ -2074,10 +2211,433 @@ async fn register(
     }
     // Only a caller that asks: the hooks register an accepted root on every
     // prompt, and `search_project` already refreshes an index gone stale.
-    if body.index_docs && outcome.index_docs {
+    if index_docs && outcome.index_docs {
         spawn_doc_refresh(app.clone(), outcome.root_id.clone());
     }
-    Ok(Json(RegisteredBody { project_id: outcome.project_id, root_id: outcome.root_id, rekeyed: outcome.rekeyed }))
+    Ok(outcome)
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectsBody {
+    pub projects: Vec<ListedProject>,
+    /// Every delete nobody undid or purged.
+    pub deletes: Vec<ListedDelete>,
+}
+
+/// Every project, with or without a folder, with what leads to it, how many
+/// memories it holds and the suggestions about it nobody answered.
+async fn projects(State(app): State<Arc<AppCtx>>) -> ApiResult<Json<ProjectsBody>> {
+    let projects = list_projects(&app.runtime.store, Arc::new(Disk)).await.map_err(ApiError::internal)?;
+    let deletes = list_deletes(&app.runtime.store).await.map_err(ApiError::internal)?;
+    Ok(Json(ProjectsBody { projects, deletes }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameRequest {
+    pub name: String,
+}
+
+/// Names a project and marks it reviewed. Its id, and with it what was
+/// saved under it, stays.
+async fn rename(
+    State(app): State<Arc<AppCtx>>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameRequest>,
+) -> ApiResult<Json<Project>> {
+    let renamed = rename_project(&app.runtime.store, &id, &body.name).await.map_err(|e| match e {
+        RenameError::NotFound(_) => ApiError::not_found(e.to_string()),
+        RenameError::Name(_) => ApiError::bad_request(e.to_string()),
+        RenameError::Taken { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("name_taken") },
+        RenameError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+        RenameError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
+        RenameError::Store(_) => ApiError::internal(e),
+    })?;
+    Ok(Json(renamed))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergeRequest {
+    source: Option<String>,
+    target: Option<String>,
+    /// The number of a merge to undo, instead of a source and a target.
+    undo: Option<i64>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// The status a refused merge answers with: a project or a merge that is not
+/// there is missing, a merge of a project into itself is the caller's
+/// mistake, and a tombstone, an undo out of order or saves still being stored
+/// are conflicts, the last one worth trying again.
+fn merge_error(e: MergeError) -> ApiError {
+    let conflict = |code: &str, e: &MergeError| ApiError { detail: Some(e.to_string()), ..ApiError::conflict(code) };
+    match e {
+        MergeError::UnknownProject(_) | MergeError::UnknownMerge(_) => ApiError::not_found(e.to_string()),
+        MergeError::SameProject(_) => ApiError::bad_request(e.to_string()),
+        MergeError::Merged { .. } => conflict("project_merged", &e),
+        MergeError::Deleted { .. } => conflict("project_deleted", &e),
+        MergeError::SavesPending(_) => ApiError { retryable: Some(true), ..conflict("saves_pending", &e) },
+        MergeError::Undone(_) => conflict("merge_undone", &e),
+        MergeError::MergedLater { .. } => conflict("merged_later", &e),
+        MergeError::Store(e) => ApiError::internal(e),
+    }
+}
+
+/// Merges one project into another, or undoes a merge, for the user. Needs no
+/// embedder.
+async fn merge_projects(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<MergeRequest>,
+) -> ApiResult<Json<MergeReport>> {
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let (store, workspaces) = (&app.runtime.store, app.runtime.workspaces());
+    let report = match (body.undo, body.source, body.target) {
+        (Some(merge_id), None, None) => undo_merge_core(store, &workspaces, &backups, merge_id, body.dry_run).await,
+        (None, Some(source), Some(target)) => merge_core(store, &workspaces, &backups, &source, &target, body.dry_run).await,
+        _ => return Err(ApiError::bad_request("name a source and a target, or a merge to undo")),
+    };
+    report.map(Json).map_err(merge_error)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteRequest {
+    project_id: Option<String>,
+    /// Delete the project with its rows: without `confirm` this answers the
+    /// report and its code.
+    #[serde(default)]
+    with_memories: bool,
+    /// The code of the report the person saw.
+    confirm: Option<String>,
+    /// The number of a delete to undo, instead of a project.
+    undo: Option<i64>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// The status a refused delete or undo answers with. A delete that needs the
+/// model for the vectors of the rows it restores answers as every route that
+/// needs it does.
+fn delete_error(app: &AppCtx, e: DeleteError) -> ApiError {
+    let conflict = |code: &str, e: &DeleteError| ApiError { detail: Some(e.to_string()), ..ApiError::conflict(code) };
+    match e {
+        DeleteError::UnknownProject(_) | DeleteError::UnknownDelete(_) => ApiError::not_found(e.to_string()),
+        DeleteError::Merged { .. } => conflict("project_merged", &e),
+        DeleteError::Deleted { .. } => conflict("project_deleted", &e),
+        DeleteError::SavesPending(_) => ApiError { retryable: Some(true), ..conflict("saves_pending", &e) },
+        DeleteError::Undone(_) => conflict("delete_undone", &e),
+        DeleteError::Purged(_) => conflict("delete_purged", &e),
+        DeleteError::DeletedLater { .. } => conflict("deleted_later", &e),
+        DeleteError::NeedsModel => ready_embedder(app).err().unwrap_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),
+        DeleteError::Embed(e) => embed_failure(e),
+        DeleteError::Store(_) => ApiError::internal(e),
+    }
+}
+
+/// Deletes a project, in two steps when it takes its rows, or undoes a
+/// delete, for the user. Deleting needs no embedder; an undo needs it only
+/// when it has rows to restore, so it is handed the model if there is one and
+/// asks for it only then.
+async fn delete_projects(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<DeleteRequest>,
+) -> ApiResult<Json<DeleteReport>> {
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let (store, workspaces) = (&app.runtime.store, app.runtime.workspaces());
+    let report = match body {
+        DeleteRequest { undo: Some(delete_id), project_id: None, with_memories: false, confirm: None, dry_run } => {
+            let embedder = app.runtime.embedder.get().cloned();
+            undo_delete_core(store, embedder.as_deref(), &backups, delete_id, dry_run).await
+        }
+        DeleteRequest { undo: None, project_id: Some(project_id), with_memories, confirm, dry_run: false } => {
+            if confirm.is_some() && !with_memories {
+                return Err(ApiError::bad_request("confirm goes with with_memories: it is the code of the report of a delete with its rows"));
+            }
+            delete_core(store, &workspaces, &backups, &project_id, with_memories, confirm.as_deref()).await
+        }
+        _ => return Err(ApiError::bad_request("name a project to delete, or a delete to undo (dry_run goes with undo)")),
+    };
+    report.map(Json).map_err(|e| delete_error(&app, e))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeepApartRequest {
+    project_id: String,
+    other_id: String,
+}
+
+/// The user's answer that two projects are not one: no suggestion between
+/// them is made again.
+async fn keep_projects_apart(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<KeepApartRequest>,
+) -> ApiResult<Json<KeptApart>> {
+    keep_apart(&app.runtime.store, &body.project_id, &body.other_id).await.map(Json).map_err(kept_apart_error)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectResolveRequest {
+    /// An id or a name.
+    project: String,
+    #[serde(default)]
+    create: bool,
+    #[serde(default)]
+    new_project: bool,
+    #[serde(default)]
+    born: Born,
+}
+
+/// What a reference to a project leads to, as an agent or the user names
+/// one, creating a project without a folder when asked and nothing has or
+/// resembles the name. An answer that read candidates is a 200, since they
+/// are what the caller asks the person about.
+async fn resolve_projects(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<ProjectResolveRequest>,
+) -> ApiResult<Json<ProjectResolution>> {
+    if body.new_project && !body.create {
+        return Err(ApiError::bad_request("new_project goes with create: it creates a project apart from the similar ones"));
+    }
+    let options = ResolveOptions { create: body.create, new_project: body.new_project, born: body.born };
+    resolve_project(&app.runtime.store, &body.project, options).await.map(Json).map_err(|e| match e {
+        ProjectResolveError::Name(_) => ApiError::bad_request(e.to_string()),
+        ProjectResolveError::NoFreeId(_) => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("no_free_project_id") },
+        ProjectResolveError::Store(_) => ApiError::internal(e),
+    })
+}
+
+/// The answers a suggestion takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionAnswer {
+    Merge,
+    Apart,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerRequest {
+    project_id: String,
+    other_id: String,
+    answer: String,
+    #[serde(default)]
+    user_answered: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnsweredBody {
+    pub project_id: String,
+    pub other_id: String,
+    pub answer: SuggestionAnswer,
+    /// The merge of `other_id` into `project_id`, which `--undo` takes back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeReport>,
+}
+
+/// The status of a refused check of two projects, as `keep-apart` answers it.
+fn kept_apart_error(e: KeepApartError) -> ApiError {
+    match e {
+        KeepApartError::NotFound(_) => ApiError::not_found(e.to_string()),
+        KeepApartError::Same(_) => ApiError::bad_request(e.to_string()),
+        KeepApartError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+        KeepApartError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
+        KeepApartError::Store(_) => ApiError::internal(e),
+    }
+}
+
+/// The person's answer to a pending suggestion, as an agent relays it:
+/// `apart` keeps the two from being suggested again, `merge` merges
+/// `other_id` into `project_id` as `POST /v1/projects/merge` does. Only a
+/// suggestion nobody answered is answered: an agent merges no projects
+/// nobody suggested.
+async fn answer_suggestion(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<AnswerRequest>,
+) -> ApiResult<Json<AnsweredBody>> {
+    let answer = match body.answer.as_str() {
+        "merge" => SuggestionAnswer::Merge,
+        "apart" => SuggestionAnswer::Apart,
+        other => return Err(ApiError::bad_request(format!("answer must be one of: merge, apart (got {other:?})"))),
+    };
+    if !body.user_answered || body.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "answering a suggestion is the user's call: send user_answered with the user's answer in reason",
+        ));
+    }
+    let store = &app.runtime.store;
+    let pending = suggestion_between(store, &body.project_id, &body.other_id).await.map_err(kept_apart_error)?;
+    if pending.is_none() {
+        return Err(ApiError {
+            detail: Some(format!("no suggestion is pending between {} and {}", body.project_id, body.other_id)),
+            ..ApiError::not_found("no_suggestion")
+        });
+    }
+    let merge = match answer {
+        SuggestionAnswer::Apart => {
+            keep_apart(store, &body.project_id, &body.other_id).await.map_err(kept_apart_error)?;
+            None
+        }
+        SuggestionAnswer::Merge => {
+            let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+            let merged = merge_core(store, &app.runtime.workspaces(), &backups, &body.other_id, &body.project_id, false).await;
+            Some(merged.map_err(merge_error)?)
+        }
+    };
+    Ok(Json(AnsweredBody { project_id: body.project_id, other_id: body.other_id, answer, merge }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocateRequest {
+    /// An id or a name.
+    project: String,
+    root_path: String,
+    /// `root_path` is a subfolder of a repository, declared as the project,
+    /// rather than a folder whose root is located.
+    #[serde(default)]
+    subfolder: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocatedBody {
+    /// The project the folder leads to now.
+    pub project_id: String,
+    pub root_id: String,
+    /// Whether it led there already, and nothing was done.
+    pub already: bool,
+    /// The merge of the folder's own project into it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeReport>,
+    /// For a subfolder: the project of its repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
+    /// For a subfolder: where it is in its checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
+    /// For a subfolder: the repository's project was named, and its declaration went.
+    #[serde(default)]
+    pub removed: bool,
+    /// For a removed declaration: the project the subfolder led to, which
+    /// keeps what was saved there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+}
+
+/// Makes the root of `root_path` lead to a project: it is registered as a
+/// bridge registers it, and the project it gets, when that is another one
+/// and this is its only folder, is merged into the named one. A project
+/// with other folders would take them along, which nobody named.
+async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateRequest>) -> ApiResult<Json<LocatedBody>> {
+    if !std::path::Path::new(&body.root_path).is_dir() {
+        return Err(ApiError::bad_request(format!("{} is not a directory: name a directory of the project", body.root_path)));
+    }
+    let subfolder = if body.subfolder { Some(subfolder_of(&body.root_path).await?) } else { None };
+    let store = &app.runtime.store;
+    let target = match find_project(store, &body.project).await.map_err(ApiError::internal)? {
+        Named::Project(id) => id,
+        Named::Unknown => return Err(ApiError::not_found(format!("no project has the id or the name {:?}", body.project))),
+        Named::Ambiguous(ids) => {
+            return Err(ApiError {
+                detail: Some(format!("{:?} is the name of {}: name one of them by its id", body.project, ids.join(", "))),
+                ..ApiError::conflict("project_ambiguous")
+            })
+        }
+    };
+    if let Some((root, subpath)) = subfolder {
+        return declare(&app, &root, &subpath, &target).await.map(Json);
+    }
+    let registered = register_root(&app, &body.root_path, None, &[], false, true).await?;
+    let (own, root_id) = (registered.project_id, registered.root_id);
+    let located = |already: bool, merge: Option<MergeReport>| LocatedBody {
+        project_id: target.clone(),
+        root_id: root_id.clone(),
+        already,
+        merge,
+        repository_id: None,
+        subpath: None,
+        removed: false,
+        previous: None,
+    };
+    if own == target {
+        return Ok(Json(located(true, None)));
+    }
+    let own2 = own.clone();
+    let folders: i64 = store
+        .conn
+        .call(move |c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM project_path WHERE project_id = ?1 OR (project_id IS NULL AND id = ?1)",
+                [own2],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    if folders > 1 {
+        return Err(ApiError {
+            detail: Some(format!(
+                "{} leads to project {own}, which has {folders} folders; `clawg projects merge {own} --into {target}` merges them all",
+                body.root_path
+            )),
+            ..ApiError::conflict("folder_shared")
+        });
+    }
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let merged = merge_core(store, &app.runtime.workspaces(), &backups, &own, &target, false).await.map_err(merge_error)?;
+    Ok(Json(located(false, Some(merged))))
+}
+
+/// The root of the checkout `path` is in and the subpath of `path` there,
+/// read on a blocking thread; a 400 for a path at the top of a checkout or
+/// outside one, which has no subfolder to declare.
+async fn subfolder_of(path: &str) -> ApiResult<(String, String)> {
+    let asked = std::path::PathBuf::from(path);
+    let found = tokio::task::spawn_blocking(move || {
+        let identity = ProjectIdentity::resolve(&asked);
+        let subpath = Disk.subpath(&identity.root, &identity.path);
+        (identity.root, subpath)
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    match found {
+        (root, Some(subpath)) if !subpath.is_empty() => Ok((root.to_string_lossy().into_owned(), subpath)),
+        _ => Err(ApiError::bad_request(format!(
+            "{path} is the top of a checkout or outside a repository, so it is no subfolder of one; \
+             `locate` without `subfolder` locates the folder's root"
+        ))),
+    }
+}
+
+/// Declares `subpath` of the repository at `root` as project `target`, after
+/// registering the root as a bridge does.
+async fn declare(app: &Arc<AppCtx>, root: &str, subpath: &str, target: &str) -> ApiResult<LocatedBody> {
+    let registered = register_root(app, root, None, &[], false, true).await?;
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let declared = declare_subfolder(&app.runtime.store, &app.runtime.workspaces(), &backups, &registered.project_id, subpath, target)
+        .await
+        .map_err(|e| match e {
+            SubfolderError::UnknownProject(_) => ApiError::not_found(e.to_string()),
+            SubfolderError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
+            SubfolderError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
+            SubfolderError::Shared { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("folder_shared") },
+            SubfolderError::Merge(e) => merge_error(e),
+            SubfolderError::Store(_) => ApiError::internal(e),
+        })?;
+    Ok(LocatedBody {
+        project_id: declared.project_id,
+        root_id: registered.root_id,
+        already: declared.already,
+        merge: declared.merge,
+        repository_id: Some(declared.repository_id),
+        subpath: Some(declared.subpath),
+        removed: declared.removed,
+        previous: declared.previous,
+    })
 }
 
 /// Refreshes the project's documentation index in the background, once the

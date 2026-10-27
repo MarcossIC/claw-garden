@@ -3,7 +3,7 @@
 //! in the user's language; ids, kinds and commands do not change.
 
 use clawg_core::memory::redact::SecretKind;
-use clawg_core::memory::secrets::{MaskedReasons, Purged, Scanned};
+use clawg_core::memory::secrets::{MaskedReasons, Purged, PurgedDelete, Scanned, WorkspaceHolding};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::preferences::Lang;
@@ -202,31 +202,131 @@ pub fn purge_report(lang: Lang, id: i64, purged: &Purged) -> String {
         });
     }
     lines.extend(backups_lines(lang, &purged.backups));
-    if !purged.workspaces.is_empty() {
-        let (title, auto, outside, by_hand) = match lang {
-            Lang::En => (
-                "these workspace files still hold it:",
-                "AUTO section, rewritten by the agent's next recall_context in that project",
-                "outside the AUTO section: edit it by hand",
-                "and outside it: edit it by hand",
-            ),
-            Lang::Es => (
-                "estos archivos de workspace todavía la guardan:",
-                "sección AUTO, que reescribe el próximo recall_context del agente en ese proyecto",
-                "fuera de la sección AUTO: edítalo a mano",
-                "y fuera de ella: edítalo a mano",
-            ),
-        };
-        lines.push(title.to_string());
-        for w in &purged.workspaces {
-            let section = match (w.holding.auto, w.holding.user) {
-                (true, true) => format!("{auto}; {by_hand}"),
-                (true, false) => auto.to_string(),
-                _ => outside.to_string(),
-            };
-            lines.push(format!("  {} ({section})", w.path.display()));
-        }
+    lines.extend(workspace_lines(lang, &purged.workspaces));
+    lines.join("\n")
+}
+
+/// The workspace files that still hold a purged text, each with where.
+fn workspace_lines(lang: Lang, held: &[WorkspaceHolding]) -> Vec<String> {
+    if held.is_empty() {
+        return Vec::new();
     }
+    let (title, auto, outside, by_hand) = match lang {
+        Lang::En => (
+            "these workspace files still hold it:",
+            "AUTO section, rewritten by the agent's next recall_context in that project",
+            "outside the AUTO section: edit it by hand",
+            "and outside it: edit it by hand",
+        ),
+        Lang::Es => (
+            "estos archivos de workspace todavía la guardan:",
+            "sección AUTO, que reescribe el próximo recall_context del agente en ese proyecto",
+            "fuera de la sección AUTO: edítalo a mano",
+            "y fuera de ella: edítalo a mano",
+        ),
+    };
+    let mut lines = vec![title.to_string()];
+    for w in held {
+        let section = match (w.holding.auto, w.holding.user) {
+            (true, true) => format!("{auto}; {by_hand}"),
+            (true, false) => auto.to_string(),
+            _ => outside.to_string(),
+        };
+        lines.push(format!("  {} ({section})", w.path.display()));
+    }
+    lines
+}
+
+/// `purge --project-delete` without `--yes` stops here, before anything is
+/// opened.
+pub fn confirm_delete(lang: Lang, delete_id: i64, yes: bool) -> Result<(), String> {
+    if yes {
+        return Ok(());
+    }
+    Err(match lang {
+        Lang::En => format!(
+            "clawg purge --project-delete removes for good every row that delete #{delete_id} left deleted: \
+             their text, vectors and index terms, with no backup of them. Run it again with --yes to do it"
+        ),
+        Lang::Es => format!(
+            "clawg purge --project-delete borra para siempre cada fila que dejó borrada el borrado #{delete_id}: \
+             su texto, sus vectores y sus términos del índice, sin ningún backup de ellas. \
+             Ejecútalo de nuevo con --yes para hacerlo"
+        ),
+    })
+}
+
+/// The lines printed after a project delete was purged: what went by table,
+/// what stayed because it is live again, the outbox rows removed, and, left
+/// alone, the backups and workspace files that still hold its texts.
+pub fn purge_delete_report(lang: Lang, delete_id: i64, purged: &PurgedDelete) -> String {
+    let project = &purged.project_id;
+    let c = &purged.removed;
+    let part = |n: usize, en: (&str, &str), es: (&str, &str)| match lang {
+        Lang::En => format!("{n} {}", if n == 1 { en.0 } else { en.1 }),
+        Lang::Es => format!("{n} {}", if n == 1 { es.0 } else { es.1 }),
+    };
+    let parts: Vec<String> = [
+        (c.memories, ("memory", "memories"), ("memoria", "memorias")),
+        (c.trajectories, ("trajectory", "trajectories"), ("trayectoria", "trayectorias")),
+        (c.skills, ("skill", "skills"), ("habilidad", "habilidades")),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, en, es)| part(n, en, es))
+    .collect();
+    let mut lines = vec![match (parts.is_empty(), lang) {
+        (true, Lang::En) => format!("purged delete {delete_id} of project {project}: no row was left to remove"),
+        (true, Lang::Es) => format!("se purgó el borrado {delete_id} del proyecto {project}: no quedaba ninguna fila por borrar"),
+        (false, Lang::En) => format!("purged delete {delete_id} of project {project}: {} removed for good", parts.join(", ")),
+        (false, Lang::Es) => {
+            format!("se purgó el borrado {delete_id} del proyecto {project}: {} borradas para siempre", parts.join(", "))
+        }
+    }];
+    if !purged.live.is_empty() {
+        let rows: Vec<String> = purged
+            .live
+            .iter()
+            .map(|r| {
+                let table = match (r.table.as_str(), lang) {
+                    ("memory", Lang::En) => "memory",
+                    ("memory", Lang::Es) => "memoria",
+                    ("episodic_trajectory", Lang::En) => "trajectory",
+                    ("episodic_trajectory", Lang::Es) => "trayectoria",
+                    ("procedural_skill", Lang::En) => "skill",
+                    ("procedural_skill", Lang::Es) => "habilidad",
+                    (other, _) => other,
+                };
+                format!("{table} #{}", r.id)
+            })
+            .collect();
+        let rows = rows.join(", ");
+        lines.push(match lang {
+            Lang::En => format!("live again, so they stay: {rows}"),
+            Lang::Es => format!("vuelven a estar vivas, así que quedan: {rows}"),
+        });
+    }
+    if !purged.outbox.is_empty() {
+        let removed: Vec<String> =
+            purged.outbox.iter().map(|o| format!("{} ({}, {})", o.operation_id, o.agent_id, o.state)).collect();
+        let removed = removed.join(", ");
+        lines.push(match lang {
+            Lang::En => format!("removed from the ingest outbox: {removed}"),
+            Lang::Es => format!("se quitó del outbox de ingesta: {removed}"),
+        });
+    }
+    lines.extend(backups_lines(lang, &purged.backups));
+    if !purged.project_workspaces.is_empty() {
+        lines.push(
+            match lang {
+                Lang::En => "the project's workspace files, which are not changed:",
+                Lang::Es => "los archivos de workspace del proyecto, que no se cambian:",
+            }
+            .to_string(),
+        );
+        lines.extend(purged.project_workspaces.iter().map(|path| format!("  {}", path.display())));
+    }
+    lines.extend(workspace_lines(lang, &purged.workspaces));
     lines.join("\n")
 }
 
@@ -475,5 +575,70 @@ mod tests {
         let msg = explain(Lang::Es, err, Rewrite::MaskReasons);
         assert!(msg.contains("the clawg daemon (pid 7)"), "the cause goes as it is: {msg}");
         assert!(msg.contains("ejecuta primero `clawg stop` y después enmascara las razones"), "{msg}");
+    }
+
+    #[test]
+    fn the_purge_report_of_a_delete_names_what_went() {
+        use clawg_core::memory::project_delete::Counts;
+        use clawg_core::memory::secrets::{LiveRow, OutboxRemoved, PurgedDelete, WorkspaceHolding};
+        use clawg_core::memory::workspace::Holding;
+        use std::path::PathBuf;
+        let purged = PurgedDelete {
+            project_id: "app-1a2b".into(),
+            removed: Counts { memories: 3, trajectories: 1, skills: 0 },
+            live: vec![LiveRow { table: "memory".into(), id: 9 }],
+            outbox: vec![OutboxRemoved { operation_id: "op-1".into(), agent_id: "agent-a".into(), state: "failed".into() }],
+            backups: vec![PathBuf::from("/b/memory-x-pre-delete.db")],
+            project_workspaces: vec![PathBuf::from("/w/a/app-1a2b/workspace.md")],
+            workspaces: vec![WorkspaceHolding {
+                path: PathBuf::from("/w/b/default/workspace.md"),
+                holding: Holding { auto: false, user: true },
+            }],
+        };
+        assert_eq!(
+            purge_delete_report(Lang::En, 4, &purged),
+            "purged delete 4 of project app-1a2b: 3 memories, 1 trajectory removed for good\n\
+             live again, so they stay: memory #9\n\
+             removed from the ingest outbox: op-1 (agent-a, failed)\n\
+             these backups still hold it; delete them if it must be gone everywhere:\n  \
+             /b/memory-x-pre-delete.db\n\
+             the project's workspace files, which are not changed:\n  \
+             /w/a/app-1a2b/workspace.md\n\
+             these workspace files still hold it:\n  \
+             /w/b/default/workspace.md (outside the AUTO section: edit it by hand)"
+        );
+        assert_eq!(
+            purge_delete_report(Lang::Es, 4, &purged),
+            "se purgó el borrado 4 del proyecto app-1a2b: 3 memorias, 1 trayectoria borradas para siempre\n\
+             vuelven a estar vivas, así que quedan: memoria #9\n\
+             se quitó del outbox de ingesta: op-1 (agent-a, failed)\n\
+             estos backups todavía la guardan; bórralos si tiene que desaparecer de todas partes:\n  \
+             /b/memory-x-pre-delete.db\n\
+             los archivos de workspace del proyecto, que no se cambian:\n  \
+             /w/a/app-1a2b/workspace.md\n\
+             estos archivos de workspace todavía la guardan:\n  \
+             /w/b/default/workspace.md (fuera de la sección AUTO: edítalo a mano)"
+        );
+        let nothing = PurgedDelete {
+            project_id: "app-1a2b".into(),
+            removed: Counts::default(),
+            live: vec![],
+            outbox: vec![],
+            backups: vec![],
+            project_workspaces: vec![],
+            workspaces: vec![],
+        };
+        assert_eq!(
+            purge_delete_report(Lang::En, 4, &nothing),
+            "purged delete 4 of project app-1a2b: no row was left to remove"
+        );
+        assert_eq!(
+            purge_delete_report(Lang::Es, 4, &nothing),
+            "se purgó el borrado 4 del proyecto app-1a2b: no quedaba ninguna fila por borrar"
+        );
+        let refused = confirm_delete(Lang::En, 4, false).unwrap_err();
+        assert!(refused.contains("delete #4") && refused.contains("--yes"), "{refused}");
+        assert!(confirm_delete(Lang::Es, 4, false).unwrap_err().contains("--yes"));
+        assert_eq!(confirm_delete(Lang::En, 4, true), Ok(()));
     }
 }

@@ -41,11 +41,48 @@ pub struct Filter {
     pub include_deleted: bool,
 }
 
-/// A registered project some exported row belongs to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A project of the source store: its id there, what it is called, what
+/// leads to it and the subfolders of its repository declared as projects.
+/// The lines of one id are one project. An empty field is not written, so a
+/// store from before names and locators writes the line it always wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectLine {
     pub id: String,
+    /// Its oldest folder, the one a reader from before records; none for a
+    /// project without a folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Every folder that leads to it, the oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<FolderLine>,
+    /// The remotes whose clones share it, the oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<String>,
+    /// The project a tombstone leads to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
+    /// The subfolders of its repository declared as other projects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subfolders: Vec<SubfolderLine>,
+}
+
+/// A folder of the source machine, with the fingerprints it recorded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderLine {
     pub root_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_commit: Option<String>,
+}
+
+/// A subfolder of the repository declared as the project `project_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubfolderLine {
+    pub subpath: String,
+    pub project_id: String,
 }
 
 /// One row of `memory`, every column but `content_hash`, which the import
@@ -303,6 +340,8 @@ pub(crate) mod tests {
         "\n",
         r#"{"kind":"project","id":"repo-1a2b","root_path":"/work/repo"}"#,
         "\n",
+        r#"{"kind":"project","id":"mono-5e6f","root_path":"/work/mono","name":"Mono","folders":[{"root_path":"/work/mono","remote":"github.com/acme/mono","root_commit":"c1"},{"root_path":"/review/mono"}],"remotes":["github.com/acme/mono","github.com/old/mono"],"merged_into":"main-7a8b","subfolders":[{"subpath":"apps/web","project_id":"web-9c0d"}]}"#,
+        "\n",
         r#"{"kind":"memory","id":7,"scope":"agent","agent_id":"claude-code","project_id":"repo-1a2b","content":"Storage engine: SQLite with WAL","memory_type":"architectural_decision","source":"explicit","created_at":1750000000000,"created_by_type":"user","created_by_ref":"claude-code","source_session_id":"s-1","last_modified_at":1750000000000,"last_modified_by":null,"update_count":0,"last_accessed_at":1755000000000,"access_count":4,"importance":8.0,"tier":1,"status":"superseded","superseded_by":9,"supersede_cause":"revision","dispute_count":0,"disputed_against":[],"last_disputed_at":null,"deleted_at":null,"topic_key":"storage/engine","revived_from":null,"lang":"und","origin_project":null}"#,
         "\n",
         r#"{"kind":"derivation","memory":9,"source":7,"created_at":1751000000000}"#,
@@ -317,9 +356,10 @@ pub(crate) mod tests {
     fn the_pinned_example_reads_and_writes_back_unchanged() {
         let (header, parsed) = parse(EXAMPLE).unwrap();
         assert!(parsed.invalid.is_empty(), "{:?}", parsed.invalid);
-        assert_eq!(parsed.memories[0].0, 3, "line numbers count from 1");
+        assert_eq!(parsed.memories[0].0, 4, "line numbers count from 1");
         let mut written = render(&Line::Header(header));
         written += &render(&Line::Project(parsed.projects[0].1.clone()));
+        written += &render(&Line::Project(parsed.projects[1].1.clone()));
         written += &render(&Line::Memory(parsed.memories[0].1.clone()));
         written += &render(&Line::Derivation(parsed.derivations[0].1.clone()));
         written += &render(&Line::Piece(parsed.pieces[0].1.clone()));
@@ -352,6 +392,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_project_line_carries_its_name_locators_and_subfolders() {
+        let (_, parsed) = parse(EXAMPLE).unwrap();
+        let mono = &parsed.projects[1].1;
+        assert_eq!(
+            mono,
+            &ProjectLine {
+                id: "mono-5e6f".into(),
+                root_path: Some("/work/mono".into()),
+                name: Some("Mono".into()),
+                folders: vec![
+                    FolderLine {
+                        root_path: "/work/mono".into(),
+                        remote: Some("github.com/acme/mono".into()),
+                        root_commit: Some("c1".into()),
+                    },
+                    FolderLine { root_path: "/review/mono".into(), ..Default::default() },
+                ],
+                remotes: vec!["github.com/acme/mono".into(), "github.com/old/mono".into()],
+                merged_into: Some("main-7a8b".into()),
+                subfolders: vec![SubfolderLine { subpath: "apps/web".into(), project_id: "web-9c0d".into() }],
+            }
+        );
+        let plain = &parsed.projects[0].1;
+        assert_eq!(plain, &ProjectLine { id: "repo-1a2b".into(), root_path: Some("/work/repo".into()), ..Default::default() });
+    }
+
+    #[test]
+    fn a_project_line_without_a_folder_is_read() {
+        let text = format!("{}{}\n", EXAMPLE.lines().next().unwrap().to_owned() + "\n", r#"{"kind":"project","id":"ideas-3c4d","name":"Ideas de producto"}"#);
+        let (_, parsed) = parse(&text).unwrap();
+        assert!(parsed.invalid.is_empty(), "{:?}", parsed.invalid);
+        let line = &parsed.projects[0].1;
+        assert_eq!((line.root_path.as_deref(), line.name.as_deref()), (None, Some("Ideas de producto")));
+        assert_eq!(render(&Line::Project(line.clone())), r#"{"kind":"project","id":"ideas-3c4d","name":"Ideas de producto"}"#.to_owned() + "\n");
+    }
+
+    #[test]
     fn unknown_fields_are_ignored() {
         let extra = EXAMPLE.replacen("\"tier\":1,", "\"tier\":1,\"weight\":3,", 1);
         let (_, parsed) = parse(&extra).unwrap();
@@ -361,7 +438,7 @@ pub(crate) mod tests {
 
     #[test]
     fn invalid_lines_are_reported_and_the_rest_imports() {
-        let memory = EXAMPLE.lines().nth(2).unwrap();
+        let memory = EXAMPLE.lines().nth(3).unwrap();
         let bad = [
             ("not json", "not JSON"),
             (r#"{"kind":"weather"}"#, "unknown kind"),
@@ -384,7 +461,7 @@ pub(crate) mod tests {
         assert_eq!(parsed.memories.len(), 1, "the good row stays");
         assert_eq!(parsed.invalid.len(), bad.len(), "{:#?}", parsed.invalid);
         for (i, (invalid, (_, why))) in parsed.invalid.iter().zip(bad.iter()).enumerate() {
-            assert_eq!(invalid.line, 7 + i);
+            assert_eq!(invalid.line, 8 + i);
             let reason = invalid.reason.to_lowercase();
             assert!(reason.contains(&why.to_lowercase()), "line {}: {reason}", invalid.line);
         }

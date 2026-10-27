@@ -6,7 +6,7 @@
 
 ## Problema
 
-La fase de embeddings es casi toda la importación. En prod, con el release 0.62.0, tomó 1.115,0 de los 1.146,9 s del import del historial (97,2 %, 54.436 filas, 48,8 filas/s). En el perfil dev, con un build debug, 1.289,1 s (91,3 %, 42,1 filas/s; [verify de import-timing](../archive/2026-10-24-import-timing/verify.md#la-importación-real-en-el-perfil-dev-windows-2026-10-24)). El release embebe sólo un 13,5 % más rápido que el debug, así que la fase es inferencia de ONNX Runtime, que llega precompilado en los dos.
+La fase de embeddings es casi toda la importación. En prod, con el release 0.62.0, tomó 1.115,0 de los 1.146,9 s del import del historial (97,2 %, 54.436 filas, 48,8 filas/s). En el perfil dev, con un build debug, 1.289,1 s (91,3 %, 42,1 filas/s; [verify de import-timing](../2026-10-24-import-timing/verify.md#la-importación-real-en-el-perfil-dev-windows-2026-10-24)). El release embebe sólo un 13,5 % más rápido que el debug, así que la fase es inferencia de ONNX Runtime, que llega precompilado en los dos.
 
 La [exploración](exploration.md) dejó la medición como primer paso. Se midió con `the_embedding_phase_of_a_real_export` (un test ignorado, ver [spec](spec.md#et3-la-medición-de-la-fase-de-embeddings)) sobre un `engram export --all` con las mismas 3.800 observaciones y 14 prompts del import en prod. Al store vacío le da 54.321 filas para embeber, con 7.025.016 tokens (129,3 por fila). Build debug, Windows x86_64, 16 CPUs lógicas, con AVX2, AVX-512F y FMA.
 

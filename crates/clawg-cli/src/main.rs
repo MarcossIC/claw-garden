@@ -40,10 +40,11 @@ use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::backup::{backup_offline, probe, restore};
 use clawg_core::memory::embedder::keep_one_malloc_arena;
+use clawg_core::memory::identity::Disk;
 use clawg_core::memory::portability::export::project_id_of;
 use clawg_core::memory::portability::ExportFilter;
 use clawg_core::memory::ProjectIdentity;
-use clawg_core::memory::secrets::{mask_reasons, purge, scan};
+use clawg_core::memory::secrets::{mask_reasons, purge, purge_delete, scan};
 use clawg_core::paths::data_dir;
 use clawg_core::preferences::{language_in, Lang};
 
@@ -223,9 +224,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let project_id = match project {
                 Some(path) => {
-                    let root = ProjectIdentity::resolve(&path).root;
-                    let remote = clawg_core::memory::identity::origin_key(&root);
-                    Some(project_id_of(&base_dir, &root, remote.as_deref()).map_err(|e| e.to_string())?)
+                    let identity = ProjectIdentity::resolve(&path);
+                    Some(project_id_of(&base_dir, &identity.root, Some(&identity.path), &Disk).map_err(|e| e.to_string())?)
                 }
                 None => None,
             };
@@ -278,13 +278,24 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Purge { id, yes, profile } => {
+        Command::Purge { id, project_delete, yes, profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let lang = language(&base_dir);
-            secrets::confirm(lang, id, yes)?;
-            let purged = purge(&base_dir, id).map_err(|e| secrets::explain(lang, e, secrets::Rewrite::Purge))?;
-            println!("{}", secrets::purge_report(lang, id, &purged));
+            match (id, project_delete) {
+                (Some(id), None) => {
+                    secrets::confirm(lang, id, yes)?;
+                    let purged = purge(&base_dir, id).map_err(|e| secrets::explain(lang, e, secrets::Rewrite::Purge))?;
+                    println!("{}", secrets::purge_report(lang, id, &purged));
+                }
+                (None, Some(delete_id)) => {
+                    secrets::confirm_delete(lang, delete_id, yes)?;
+                    let purged =
+                        purge_delete(&base_dir, delete_id).map_err(|e| secrets::explain(lang, e, secrets::Rewrite::Purge))?;
+                    println!("{}", secrets::purge_delete_report(lang, delete_id, &purged));
+                }
+                _ => return Err("name a memory to purge, or a delete with --project-delete".to_string()),
+            }
             Ok(ExitCode::SUCCESS)
         }
 
@@ -358,6 +369,68 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
+        Command::Projects { action: ProjectsAction::List { profile } } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            println!("{}", projects::list(lang, &client).await.map_err(unavailable)?);
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Projects { action: ProjectsAction::Rename { id, name, profile } } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let renamed = projects::rename(lang, &client, &id, &name)
+                .await
+                .map_err(|e| projects::rename_refused(lang, &id, &e).unwrap_or_else(|| unavailable(e)))?;
+            println!("{renamed}");
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Projects { action: ProjectsAction::Create { name, new, profile } } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let (said, done) = projects::create(lang, &client, &name, new)
+                .await
+                .map_err(|e| projects::create_refused(lang, &e).unwrap_or_else(|| unavailable(e)))?;
+            println!("{said}");
+            Ok(if done { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+        }
+
+        Command::Projects { action: ProjectsAction::Locate { project, path, subfolder, profile } } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let located = projects::locate(lang, &client, &project, &path, subfolder).await.map_err(|e| match e {
+                projects::AddError::Client(e) => projects::locate_refused(lang, &e).unwrap_or_else(|| unavailable(e)),
+                other => other.to_string(),
+            })?;
+            println!("{located}");
+            Ok(ExitCode::SUCCESS)
+        }
+
         Command::Projects { action: ProjectsAction::Add { path, profile } } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             // The daemon owns the store and does the indexing; with none
@@ -388,10 +461,59 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             };
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
             let moved = projects::move_memories(lang, &client, &opts, &cwd).await.map_err(|e| match e {
-                projects::AddError::Client(e) => unavailable(e),
+                projects::AddError::Client(e) => projects::move_refused(lang, &e).unwrap_or_else(|| unavailable(e)),
                 other => other.to_string(),
             })?;
             println!("{moved}");
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Projects { action: ProjectsAction::Merge(opts) } => {
+            let profile = opts.profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let merged = projects::merge(lang, &client, &opts)
+                .await
+                .map_err(|e| projects::merge_refused(lang, &e).unwrap_or_else(|| unavailable(e)))?;
+            println!("{merged}");
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Projects { action: ProjectsAction::Delete(opts) } => {
+            let profile = opts.profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let undo = opts.undo.is_some();
+            let (said, done) = projects::delete(lang, &client, &opts)
+                .await
+                .map_err(|e| projects::delete_refused(lang, undo, &e).unwrap_or_else(|| unavailable(e)))?;
+            println!("{said}");
+            Ok(if done { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+        }
+
+        Command::Projects { action: ProjectsAction::KeepApart { project_id, other_id, profile } } => {
+            let profile = profile.resolve().map_err(|e| e.to_string())?;
+            let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
+            let lang = language(&base_dir);
+            let unavailable = |e: ClientError| memories::explain_unavailable(lang, &e, profile);
+            let client = match probe_running(&base_dir, false).await.map_err(unavailable)? {
+                Probe::Running(client) => client,
+                Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
+            };
+            let kept = projects::keep_apart(lang, &client, &project_id, &other_id)
+                .await
+                .map_err(|e| projects::keep_apart_refused(lang, &e).unwrap_or_else(|| unavailable(e)))?;
+            println!("{kept}");
             Ok(ExitCode::SUCCESS)
         }
 

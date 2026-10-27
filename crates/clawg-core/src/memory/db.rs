@@ -626,6 +626,11 @@ mod tests {
             > 0
     }
 
+    /// The table of folders: `project` until V27 renamed it.
+    fn folders(c: &rusqlite::Connection) -> &'static str {
+        if table_exists(c, "project_path") { "project_path" } else { "project" }
+    }
+
     /// A kill between a migration's body and its history row would re-run it
     /// on the next start, and an `ADD COLUMN` re-run is "duplicate column" on
     /// every start after that. Applying a run's migrations in one transaction
@@ -704,7 +709,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 26);
+        assert_eq!(after.0, 31);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -769,7 +774,7 @@ mod tests {
         let (projects, rekeyed): (i64, i64) = conn
             .call(|c| {
                 c.query_row(
-                    "SELECT (SELECT COUNT(*) FROM project), (SELECT COUNT(*) FROM project_rekey)",
+                    "SELECT (SELECT COUNT(*) FROM project_path), (SELECT COUNT(*) FROM project_rekey)",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -887,12 +892,13 @@ mod tests {
         .unwrap();
 
         let rows = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
-            let mut stmt = c.prepare(
+            let mut stmt = c.prepare(&format!(
                 "SELECT json_array(id, project_id, content, tier, status) FROM memory \
                  UNION ALL SELECT json_array(memory_id, source_id) FROM memory_derivation \
                  UNION ALL SELECT json_array(agent_id, scope_key, reviewed_at) FROM synthesis_review \
-                 UNION ALL SELECT json_array(id, root_path) FROM project",
-            )?;
+                 UNION ALL SELECT json_array(id, root_path) FROM {}",
+                folders(c)
+            ))?;
             let rows = stmt.query_map([], |r| r.get(0))?.collect();
             rows
         };
@@ -961,12 +967,13 @@ mod tests {
         .unwrap();
 
         let rows = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
-            let mut stmt = c.prepare(
+            let mut stmt = c.prepare(&format!(
                 "SELECT json_array(id, project_id, content, tier, status) FROM memory \
-                 UNION ALL SELECT json_array(id, root_path, created_at) FROM project \
+                 UNION ALL SELECT json_array(id, root_path, created_at) FROM {} \
                  UNION ALL SELECT json_array(project_id, path, content_hash, chunks) FROM project_doc_file \
                  UNION ALL SELECT json_array(id, project_id, breadcrumb, body) FROM project_doc_chunk",
-            )?;
+                folders(c)
+            ))?;
             let rows = stmt.query_map([], |r| r.get(0))?.collect();
             rows
         };
@@ -977,7 +984,7 @@ mod tests {
         assert_eq!(conn.call(rows).await.unwrap(), before);
         let marks: Vec<(String, i64)> = conn
             .call(|c| {
-                let mut stmt = c.prepare("SELECT id, index_docs FROM project ORDER BY id")?;
+                let mut stmt = c.prepare("SELECT id, index_docs FROM project_path ORDER BY id")?;
                 let marks = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect();
                 marks
             })
@@ -1021,11 +1028,12 @@ mod tests {
         .unwrap();
 
         let rows = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
-            let mut stmt = c.prepare(
+            let mut stmt = c.prepare(&format!(
                 "SELECT json_array(id, project_id, content, tier, status) FROM memory \
                  UNION ALL SELECT json_array(save_id, piece, memory_id, context) FROM memory_piece \
-                 UNION ALL SELECT json_array(id, root_path, index_docs) FROM project",
-            )?;
+                 UNION ALL SELECT json_array(id, root_path, index_docs) FROM {}",
+                folders(c)
+            ))?;
             let rows = stmt.query_map([], |r| r.get(0))?.collect();
             rows
         };
@@ -1619,11 +1627,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         seed_on_disk(dir.path(), Some(23)).await;
         let snapshot = |c: &mut rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
-            let mut stmt = c.prepare(
+            let mut stmt = c.prepare(&format!(
                 "SELECT json_array(id, scope, agent_id, project_id, status, superseded_by, topic_key, content_hash) \
                  FROM memory WHERE id >= 10 \
-                 UNION ALL SELECT json_array(id, root_path, created_at, index_docs) FROM project ORDER BY 1",
-            )?;
+                 UNION ALL SELECT json_array(id, root_path, created_at, index_docs) FROM {} ORDER BY 1",
+                folders(c)
+            ))?;
             let rows = stmt.query_map([], |r| r.get(0))?.collect();
             rows
         };
@@ -1783,6 +1792,617 @@ mod tests {
         assert_eq!(before.len(), 2);
         assert_eq!(after, before, "migrating changes no row");
         assert_eq!(journal, [0, 0, 0, 0], "the journal starts empty");
+    }
+
+    /// Every id something is saved under, or a remote names, becomes a
+    /// project; the folders keep their values in `project_path` and point at
+    /// their own id when it is one. An id only the history names gets none.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_a_project_for_every_id_in_use() {
+        use crate::memory::admin::{list_memories_core, ListParams};
+        use crate::memory::identity::candidate_id;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(26)).await;
+        let id = |root: &str, n: u32| candidate_id(Path::new(root), n);
+        let (app, app_clone) = (id("/work/app", 0), id("/review/app", 0));
+        let (api, api_collided) = (id("/work/api", 0), id("/srv/api", 1));
+        let (mono_old, mono_new) = (id("/work/mono", 0), id("/work/mono", 1));
+        let fused = id("/work/fused", 0);
+        let folders = [
+            (app.clone(), "/work/app", 10, 1),
+            (app_clone.clone(), "/review/app", 20, 0),
+            (api.clone(), "/work/api", 30, 1),
+            (api_collided.clone(), "/srv/api", 31, 1),
+            (mono_old.clone(), "/work/mono", 40, 1),
+            (mono_new.clone(), "/work/mono", 41, 1),
+            (fused.clone(), "/work/fused", 50, 1),
+        ];
+        let remotes = [
+            ("github.com/acme/app", app.clone(), 12),
+            ("github.com/acme/b", mono_new.clone(), 41),
+            ("github.com/acme/old", fused.clone(), 5),
+            ("github.com/acme/new", fused.clone(), 51),
+        ];
+        // The clone saves under the project of its remote, so both rows of
+        // `app` came from different roots.
+        let memories: Vec<(i64, Option<String>, i64, Option<i64>)> = vec![
+            (10, Some(app.clone()), 100, None),
+            (11, Some(app.clone()), 101, None),
+            (12, Some(api.clone()), 102, None),
+            (13, Some(api_collided.clone()), 103, None),
+            (14, Some(mono_old.clone()), 104, None),
+            (15, Some(mono_new.clone()), 105, None),
+            (16, Some(fused.clone()), 106, None),
+            (17, Some("loose-1a2b".into()), 7, Some(8)),
+            (18, None, 108, None),
+            (19, Some("p".into()), 109, None),
+        ];
+        let rekeyed_to = app.clone();
+        type Whole = Vec<Vec<rusqlite::types::Value>>;
+        let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT * FROM memory ORDER BY id",
+                "SELECT * FROM episodic_trajectory ORDER BY id",
+                "SELECT * FROM procedural_skill ORDER BY id",
+                "SELECT * FROM project_remote ORDER BY remote",
+            ] {
+                let mut stmt = c.prepare(sql)?;
+                let n = stmt.column_count();
+                let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
+                out.push(rows);
+            }
+            Ok(out)
+        };
+        type Folder = (String, String, i64, i64);
+        let folders_in = |c: &rusqlite::Connection, table: &str| -> rusqlite::Result<Vec<Folder>> {
+            let mut stmt = c.prepare(&format!("SELECT id, root_path, created_at, index_docs FROM {table} ORDER BY id"))?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect()
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let (rows_before, folders_before) = conn
+            .call(move |c| {
+                for (id, root, created, index_docs) in &folders {
+                    c.execute(
+                        "INSERT INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![id, root, created, index_docs],
+                    )?;
+                }
+                for (remote, project, created) in &remotes {
+                    c.execute(
+                        "INSERT INTO project_remote (remote, project_id, created_at) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![remote, project, created],
+                    )?;
+                }
+                for (id, project, created, deleted) in memories {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
+                         VALUES (?1, 'agent', 'a', ?2, 'note ' || ?1, 'semantic_fact', 'explicit', ?3, 'agent', 'x', \
+                          ?3, ?3, 5.0, 3, 'active', ?4)",
+                        rusqlite::params![id, project, created, deleted],
+                    )?;
+                }
+                c.execute_batch(
+                    "INSERT INTO episodic_trajectory \
+                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+                      VALUES ('agent', 'a', 'traj-2b3c', 's', 't', 60, 60, 60);
+                     INSERT INTO procedural_skill \
+                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
+                      VALUES ('agent', 'a', 'skill-3c4d', 'k', 't', 70, '[]', 70, 70, 70);
+                     INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('a', 'old-9f9f', 1);
+                     INSERT INTO memory_import_extra (import_id, kind, a, b, value) VALUES (1, 'project', NULL, 'old-9f9f', NULL);",
+                )?;
+                c.execute(
+                    "INSERT INTO memory_move (move_id, row_id, from_project, from_scope, to_project, to_scope, moved_at) \
+                     VALUES (1, 10, 'old-9f9f', 'agent', ?1, 'agent', 1)",
+                    [&rekeyed_to],
+                )?;
+                c.execute(
+                    "INSERT INTO project_rekey (tbl, row_id, legacy_id, project_id, rekeyed_at) \
+                     VALUES ('memory', 11, 'old-9f9f', ?1, 1)",
+                    [&rekeyed_to],
+                )?;
+                Ok::<_, rusqlite::Error>((whole(c)?, folders_in(c, "project")?))
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        let facts_before = crate::memory::inspect::inspect(dir.path()).facts.expect("facts before");
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        type Project = (String, String, String, i64, i64);
+        type Pointer = (String, Option<String>, Option<String>, Option<String>, Option<String>);
+        let (rows_after, folders_after, projects, pointers): (Vec<Whole>, Vec<Folder>, Vec<Project>, Vec<Pointer>) = store
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare("SELECT id, name, born, reviewed, created_at FROM project ORDER BY id")?;
+                let projects = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let mut stmt = c.prepare("SELECT id, project_id, remote, root_commit, git_stamp FROM project_path ORDER BY id")?;
+                let pointers = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok::<_, rusqlite::Error>((whole(c)?, folders_in(c, "project_path")?, projects, pointers))
+            })
+            .await
+            .unwrap();
+        assert_eq!(folders_after, folders_before, "every folder keeps its values");
+        assert_eq!(rows_after, rows_before, "no row of the three tables or of project_remote changes");
+
+        let migrated = |id: &str, name: &str, created: i64| (id.to_string(), name.to_string(), "migrated".to_string(), 1, created);
+        let mut expected = vec![
+            migrated(&app, "app", 10),
+            migrated(&api, "api", 30),
+            migrated(&api_collided, "api", 31),
+            migrated(&mono_old, "mono", 40),
+            migrated(&mono_new, "mono", 41),
+            migrated(&fused, "fused", 5),
+            migrated("loose-1a2b", "loose", 7),
+            migrated("p", "p", 109),
+            migrated("traj-2b3c", "traj", 60),
+            migrated("skill-3c4d", "skill", 70),
+        ];
+        expected.sort();
+        assert_eq!(projects, expected, "no project for the clone's folder or for an id only the history names");
+
+        let pointer = |id: &str, project: Option<&str>, remote: Option<&str>| {
+            (id.to_string(), project.map(str::to_string), remote.map(str::to_string), None, None)
+        };
+        let mut expected = vec![
+            pointer(&app, Some(&app), Some("github.com/acme/app")),
+            pointer(&app_clone, None, None),
+            pointer(&api, Some(&api), None),
+            pointer(&api_collided, Some(&api_collided), None),
+            pointer(&mono_old, Some(&mono_old), None),
+            pointer(&mono_new, Some(&mono_new), Some("github.com/acme/b")),
+            pointer(&fused, Some(&fused), None),
+        ];
+        expected.sort();
+        assert_eq!(pointers, expected, "a fused folder is not given one of its remotes");
+
+        let listed = |project_id: Option<String>| {
+            let no_project = project_id.is_none();
+            let store = &store;
+            async move {
+                let rows = list_memories_core(store, ListParams { project_id, no_project, ..ListParams::default() }).await.unwrap();
+                let mut ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+                ids.sort_unstable();
+                ids
+            }
+        };
+        assert_eq!(listed(Some(app.clone())).await, vec![10, 11]);
+        assert_eq!(listed(Some(api_collided.clone())).await, vec![13]);
+        assert_eq!(listed(None).await, vec![1, 18]);
+
+        let facts_after = crate::memory::inspect::inspect(dir.path()).facts.expect("facts after");
+        assert_eq!((facts_after.projects, facts_after.remotes), (facts_before.projects, facts_before.remotes));
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
+    /// Only a merge makes a project a tombstone, so a store from before V28
+    /// opens with every project live, every id its own canonical one, and no
+    /// row changed.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_every_project_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(27)).await;
+        type Whole = Vec<Vec<rusqlite::types::Value>>;
+        let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT * FROM memory ORDER BY id",
+                "SELECT * FROM episodic_trajectory ORDER BY id",
+                "SELECT * FROM procedural_skill ORDER BY id",
+                "SELECT id, name, born, reviewed, created_at FROM project ORDER BY id",
+                "SELECT * FROM project_path ORDER BY id",
+                "SELECT * FROM project_remote ORDER BY remote",
+                "SELECT * FROM project_suggestion ORDER BY project_id",
+                "SELECT * FROM synthesis_review ORDER BY scope_key",
+            ] {
+                let mut stmt = c.prepare(sql)?;
+                let n = stmt.column_count();
+                let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
+                out.push(rows);
+            }
+            Ok(out)
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                       ('app-1a2b', 'app', 'root', 0, 1), ('copia-85a9', 'copia', 'root', 0, 2), ('idea', 'idea', 'adopted', 0, 3);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id, remote) VALUES \
+                       ('app-1a2b', '/work/app', 1, 1, 'app-1a2b', 'github.com/acme/app'), \
+                       ('copia-85a9', '/work/copia', 2, 0, 'copia-85a9', NULL);
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
+                     INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('copia-85a9', 'app-1a2b', 'root_commit', 2);
+                     INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', 'app-1a2b', 4);
+                     INSERT INTO episodic_trajectory \
+                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+                      VALUES ('agent', 'a', 'app-1a2b', 's', 't', 5, 5, 5);
+                     INSERT INTO procedural_skill \
+                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
+                      VALUES ('agent', 'a', 'idea', 'k', 't', 6, '[]', 6, 6, 6);",
+                )?;
+                for (id, project) in [(10, "app-1a2b"), (11, "copia-85a9"), (12, "idea")] {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status) \
+                         VALUES (?1, 'agent', 'a', ?2, 'note ' || ?1, 'semantic_fact', 'explicit', ?1, 'agent', 'x', \
+                          ?1, ?1, 5.0, 3, 'active')",
+                        rusqlite::params![id, project],
+                    )?;
+                }
+                whole(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, merged, journal): (Vec<Whole>, i64, (i64, i64)) = store
+            .conn
+            .call(move |c| {
+                let merged = c.query_row(
+                    "SELECT COUNT(*) FROM project WHERE merged_into IS NOT NULL OR merged_at IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let journal = (
+                    c.query_row("SELECT COUNT(*) FROM project_merge", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM project_merge_change", [], |r| r.get(0))?,
+                );
+                Ok::<_, rusqlite::Error>((whole(c)?, merged, journal))
+            })
+            .await
+            .unwrap();
+        assert_eq!(after, before, "migrating changes no row");
+        assert_eq!(merged, 0, "no project is a tombstone");
+        assert_eq!(journal, (0, 0), "the journal of merges starts empty");
+        for id in ["app-1a2b", "copia-85a9", "idea", "unknown-9f9f"] {
+            assert_eq!(crate::memory::merge::canonical(&store, id).await.unwrap(), id);
+        }
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
+    /// Only a delete marks a project, so a store from before V29 opens with
+    /// no project deleted, no row changed and the adoption of an unknown id
+    /// as it was.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_no_project_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(28)).await;
+        type Whole = Vec<Vec<rusqlite::types::Value>>;
+        let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT * FROM memory ORDER BY id",
+                "SELECT * FROM episodic_trajectory ORDER BY id",
+                "SELECT * FROM procedural_skill ORDER BY id",
+                "SELECT * FROM project ORDER BY id",
+                "SELECT * FROM project_path ORDER BY id",
+                "SELECT * FROM project_remote ORDER BY remote",
+                "SELECT * FROM project_suggestion ORDER BY project_id",
+            ] {
+                let mut stmt = c.prepare(sql)?;
+                let n = stmt.column_count();
+                let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
+                out.push(rows);
+            }
+            Ok(out)
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) VALUES \
+                       ('app-1a2b', 'app', 'root', 1, 1, NULL, NULL), ('copia-85a9', 'copia', 'root', 0, 2, 'app-1a2b', 9), \
+                       ('idea', 'idea', 'adopted', 0, 3, NULL, NULL);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id, remote) VALUES \
+                       ('app-1a2b', '/work/app', 1, 1, 'app-1a2b', 'github.com/acme/app'), \
+                       ('copia-85a9', '/work/copia', 2, 0, 'app-1a2b', NULL);
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
+                     INSERT INTO episodic_trajectory \
+                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at, deleted_at) \
+                      VALUES ('agent', 'a', 'app-1a2b', 's1', 't', 5, 5, 5, NULL), ('agent', 'a', 'app-1a2b', 's2', 'u', 5, 5, 5, 8);
+                     INSERT INTO procedural_skill \
+                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at, deleted_at) \
+                      VALUES ('agent', 'a', 'idea', 'k', 't', 6, '[]', 6, 6, 6, NULL), \
+                             ('agent', 'a', 'idea', 'l', 't', 6, '[]', 6, 6, 6, 8);",
+                )?;
+                for (id, project, deleted_at) in [(10, "app-1a2b", None), (11, "app-1a2b", Some(7)), (12, "idea", None)] {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
+                         VALUES (?1, 'agent', 'a', ?2, 'note ' || ?1, 'semantic_fact', 'explicit', ?1, 'agent', 'x', \
+                          ?1, ?1, 5.0, 3, 'active', ?3)",
+                        rusqlite::params![id, project, deleted_at],
+                    )?;
+                }
+                whole(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, deleted, journal, adopted): (Vec<Whole>, i64, (i64, i64, i64), (i64, Option<i64>)) = store
+            .conn
+            .call(move |c| {
+                let deleted = c.query_row("SELECT COUNT(*) FROM project WHERE deleted_at IS NOT NULL", [], |r| r.get(0))?;
+                let journal = (
+                    c.query_row("SELECT COUNT(*) FROM project_delete", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM project_delete_row", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM project_delete_folder", [], |r| r.get(0))?,
+                );
+                let after = whole(c)?;
+                c.execute(
+                    "INSERT INTO memory \
+                     (id, scope, agent_id, project_id, content, memory_type, source, \
+                      created_at, created_by_type, created_by_ref, \
+                      last_modified_at, last_accessed_at, importance, tier, status) \
+                     VALUES (20, 'agent', 'a', 'unknown-9f9f', 'new', 'semantic_fact', 'explicit', 20, 'agent', 'x', \
+                      20, 20, 5.0, 3, 'active')",
+                    [],
+                )?;
+                let adopted = c.query_row(
+                    "SELECT reviewed, deleted_at FROM project WHERE id = 'unknown-9f9f' AND born = 'adopted'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                Ok::<_, rusqlite::Error>((after, deleted, journal, adopted))
+            })
+            .await
+            .unwrap();
+        // V29 adds a column to `project`, so compare it by its V28 columns.
+        let trim = |w: Vec<Whole>| -> Vec<Whole> {
+            w.into_iter()
+                .enumerate()
+                .map(|(i, rows)| if i == 3 { rows.into_iter().map(|mut r| { r.truncate(7); r }).collect() } else { rows })
+                .collect()
+        };
+        assert_eq!(trim(after), trim(before), "migrating changes no row");
+        assert_eq!(deleted, 0, "no project is deleted");
+        assert_eq!(journal, (0, 0, 0), "the journal of deletes starts empty");
+        assert_eq!(adopted, (0, None), "an unknown id is adopted as before");
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
+    /// A declaration is written only by `projects locate --subfolder`, so a
+    /// store from before V30 opens with none and every row as it was.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_no_subfolder_declared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(29)).await;
+        type Whole = Vec<Vec<rusqlite::types::Value>>;
+        let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT * FROM memory ORDER BY id",
+                "SELECT * FROM episodic_trajectory ORDER BY id",
+                "SELECT * FROM procedural_skill ORDER BY id",
+                "SELECT * FROM project ORDER BY id",
+                "SELECT * FROM project_path ORDER BY id",
+                "SELECT * FROM project_remote ORDER BY remote",
+                "SELECT * FROM project_suggestion ORDER BY project_id",
+                "SELECT * FROM project_delete ORDER BY delete_id",
+                "SELECT * FROM project_delete_row ORDER BY delete_id, tbl, row_id",
+                "SELECT * FROM project_merge ORDER BY merge_id",
+            ] {
+                let mut stmt = c.prepare(sql)?;
+                let n = stmt.column_count();
+                let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
+                out.push(rows);
+            }
+            Ok(out)
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at, deleted_at) VALUES \
+                       ('app-1a2b', 'app', 'root', 1, 1, NULL, NULL, NULL), ('copia-85a9', 'copia', 'root', 0, 2, 'app-1a2b', 9, NULL), \
+                       ('idea', 'idea', 'adopted', 0, 3, NULL, NULL, NULL), ('gone', 'gone', 'agent', 0, 4, NULL, NULL, 12), \
+                       ('lib-77aa', 'lib', 'root', 0, 5, NULL, NULL, NULL);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id, remote) VALUES \
+                       ('app-1a2b', '/work/app', 1, 1, 'app-1a2b', 'github.com/acme/app'), \
+                       ('app-9c9c', '/other/app', 2, 0, 'app-1a2b', 'github.com/acme/app'), \
+                       ('lib-77aa', '/work/lib', 5, 1, 'lib-77aa', NULL), \
+                       ('lib-77ab', '/work/lib', 6, 1, 'lib-77aa', NULL);
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
+                     INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('idea', 'app-1a2b', 'folder_name', 7);
+                     INSERT INTO project_delete (delete_id, project_id, with_memories, code, snapshot, deleted_at) \
+                      VALUES (1, 'gone', 1, 'abcd1234', NULL, 12);
+                     INSERT INTO project_delete_row (delete_id, tbl, row_id, deleted_at) VALUES (1, 'memory', 13, NULL);
+                     INSERT INTO project_merge (merge_id, source, target, move_id, snapshot, merged_at) \
+                      VALUES (1, 'copia-85a9', 'app-1a2b', NULL, NULL, 9);
+                     INSERT INTO episodic_trajectory \
+                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at, deleted_at) \
+                      VALUES ('agent', 'a', 'app-1a2b', 's1', 't', 5, 5, 5, NULL), ('agent', 'a', 'app-1a2b', 's2', 'u', 5, 5, 5, 8);
+                     INSERT INTO procedural_skill \
+                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at, deleted_at) \
+                      VALUES ('agent', 'a', 'idea', 'k', 't', 6, '[]', 6, 6, 6, NULL), \
+                             ('agent', 'a', 'idea', 'l', 't', 6, '[]', 6, 6, 6, 8);",
+                )?;
+                for (id, project, deleted_at) in
+                    [(10, "app-1a2b", None), (11, "app-1a2b", Some(7)), (12, "idea", None), (13, "gone", Some(12))]
+                {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
+                         VALUES (?1, 'agent', 'a', ?2, 'note ' || ?1, 'semantic_fact', 'explicit', ?1, 'agent', 'x', \
+                          ?1, ?1, 5.0, 3, 'active', ?3)",
+                        rusqlite::params![id, project, deleted_at],
+                    )?;
+                }
+                whole(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, declared): (Vec<Whole>, i64) = store
+            .conn
+            .call(move |c| {
+                let declared = c.query_row("SELECT COUNT(*) FROM project_subfolder", [], |r| r.get(0))?;
+                Ok::<_, rusqlite::Error>((whole(c)?, declared))
+            })
+            .await
+            .unwrap();
+        assert_eq!(after, before, "migrating changes no row");
+        assert_eq!(declared, 0, "no subfolder is declared");
+        let snapshots = std::fs::read_dir(crate::paths::backups_dir(dir.path())).unwrap().count();
+        assert_eq!(snapshots, 1, "the pre-migration snapshot is the way back");
+    }
+
+    /// V31 only adds a journal and an index: an import journaled before it
+    /// keeps its journal as it was, and its undo takes back what it wrote.
+    #[tokio::test]
+    async fn a_database_from_the_previous_version_opens_with_its_imports_as_they_were() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_on_disk(dir.path(), Some(30)).await;
+        type Whole = Vec<Vec<rusqlite::types::Value>>;
+        let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT * FROM memory ORDER BY id",
+                "SELECT * FROM episodic_trajectory ORDER BY id",
+                "SELECT * FROM procedural_skill ORDER BY id",
+                "SELECT * FROM project ORDER BY id",
+                "SELECT * FROM project_path ORDER BY id",
+                "SELECT * FROM project_remote ORDER BY remote",
+                "SELECT * FROM project_subfolder ORDER BY parent_id, subpath",
+                "SELECT * FROM project_delete ORDER BY delete_id",
+                "SELECT * FROM project_delete_row ORDER BY delete_id, tbl, row_id",
+                "SELECT * FROM project_merge ORDER BY merge_id",
+                "SELECT * FROM memory_import ORDER BY import_id",
+                "SELECT * FROM memory_import_row ORDER BY import_id, row_id",
+                "SELECT * FROM memory_import_supersede ORDER BY import_id, row_id",
+                "SELECT * FROM memory_import_extra ORDER BY import_id, kind, b",
+            ] {
+                let mut stmt = c.prepare(sql)?;
+                let n = stmt.column_count();
+                let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
+                out.push(rows);
+            }
+            Ok(out)
+        };
+        let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
+        let before = conn
+            .call(move |c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at, deleted_at) VALUES \
+                       ('app-1a2b', 'app', 'root', 1, 1, NULL, NULL, NULL), ('copia-85a9', 'copia', 'root', 0, 2, 'app-1a2b', 9, NULL), \
+                       ('gone', 'gone', 'agent', 0, 4, NULL, NULL, 12), ('web-7a8b', 'web', 'agent', 0, 5, NULL, NULL, NULL), \
+                       ('imp-1111', 'imp', 'import', 0, 6, NULL, NULL, NULL);
+                     INSERT INTO project_path (id, root_path, created_at, index_docs, project_id, remote) VALUES \
+                       ('app-1a2b', '/work/app', 1, 1, 'app-1a2b', 'github.com/acme/app'), \
+                       ('imp-1111', '/far/imp', 6, 0, 'imp-1111', 'github.com/acme/imp');
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES \
+                       ('github.com/acme/app', 'app-1a2b', 1), ('github.com/acme/imp', 'imp-1111', 6);
+                     INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES ('app-1a2b', 'apps/web', 'web-7a8b', 5);
+                     INSERT INTO project_delete (delete_id, project_id, with_memories, code, snapshot, deleted_at) \
+                      VALUES (1, 'gone', 1, 'abcd1234', NULL, 12);
+                     INSERT INTO project_delete_row (delete_id, tbl, row_id, deleted_at) VALUES (1, 'memory', 13, NULL);
+                     INSERT INTO project_merge (merge_id, source, target, move_id, snapshot, merged_at) \
+                      VALUES (1, 'copia-85a9', 'app-1a2b', NULL, NULL, 9);
+                     INSERT INTO episodic_trajectory \
+                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at, deleted_at) \
+                      VALUES ('agent', 'a', 'app-1a2b', 's1', 't', 5, 5, 5, NULL), ('agent', 'a', 'app-1a2b', 's2', 'u', 5, 5, 5, 8);
+                     INSERT INTO procedural_skill \
+                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
+                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at, deleted_at) \
+                      VALUES ('agent', 'a', 'web-7a8b', 'k', 't', 6, '[]', 6, 6, 6, NULL), \
+                             ('agent', 'a', 'web-7a8b', 'l', 't', 6, '[]', 6, 6, 6, 8);",
+                )?;
+                for (id, project, deleted_at) in [
+                    (10, "app-1a2b", None),
+                    (11, "app-1a2b", Some(7)),
+                    (12, "app-1a2b", None),
+                    (13, "gone", Some(12)),
+                    (20, "app-1a2b", None),
+                    (21, "imp-1111", None),
+                ] {
+                    c.execute(
+                        "INSERT INTO memory \
+                         (id, scope, agent_id, project_id, content, memory_type, source, \
+                          created_at, created_by_type, created_by_ref, \
+                          last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
+                         VALUES (?1, 'agent', 'a', ?2, 'note ' || ?1, 'semantic_fact', 'explicit', ?1, 'agent', 'x', \
+                          ?1, ?1, 5.0, 3, 'active', ?3)",
+                        rusqlite::params![id, project, deleted_at],
+                    )?;
+                }
+                c.execute_batch(
+                    "UPDATE memory SET status = 'superseded', superseded_by = 20, supersede_cause = 'revision' WHERE id = 10;
+                     UPDATE memory SET revived_from = 20 WHERE id = 12;
+                     INSERT INTO memory_import (import_id, started_at, finished_at, source, snapshot) VALUES (1, 20, 21, 'clawg', NULL);
+                     INSERT INTO memory_import_row (import_id, row_id, update_count, deleted_at, supersede_cause) \
+                      VALUES (1, 20, 0, NULL, NULL), (1, 21, 0, NULL, NULL);
+                     INSERT INTO memory_import_supersede \
+                      (import_id, row_id, superseded_by, from_status, from_superseded_by, from_cause) VALUES (1, 10, 20, 'active', NULL, NULL);
+                     INSERT INTO memory_import_extra (import_id, kind, a, b, value) VALUES \
+                       (1, 'fill', 12, 'revived_from', '20'), (1, 'project', NULL, 'imp-1111', NULL), \
+                       (1, 'remote', NULL, 'github.com/acme/imp', NULL);",
+                )?;
+                whole(c)
+            })
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+
+        let (after, registry, indexed): (Vec<Whole>, i64, bool) = store
+            .conn
+            .call(move |c| {
+                let registry = c.query_row("SELECT COUNT(*) FROM memory_import_registry", [], |r| r.get(0))?;
+                let indexed = c.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_memory_created_at')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok::<_, rusqlite::Error>((whole(c)?, registry, indexed))
+            })
+            .await
+            .unwrap();
+        assert_eq!(after, before, "migrating changes no row");
+        assert_eq!(registry, 0, "the journal of the registry starts empty");
+        assert!(indexed, "rows are found by their date");
+        let backups = crate::paths::backups_dir(dir.path());
+        assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1, "the pre-migration snapshot is the way back");
+
+        let undone = crate::memory::portability::undo::undo_import(&store, &backups, 1, false).await.unwrap();
+        assert_eq!(undone.removed, vec![20, 21], "the rows it inserted go");
+        assert_eq!(undone.restored, vec![10], "the row it replaced comes back");
+        assert_eq!(undone.unfilled, vec![12], "the link it filled is emptied");
+        assert_eq!(undone.projects, vec!["imp-1111".to_owned()], "the folder it recorded goes");
+        assert_eq!(undone.remotes, vec!["github.com/acme/imp".to_owned()], "the remote it bound goes");
     }
 
     #[tokio::test]
@@ -2249,7 +2869,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 26, "Expected exactly 26 applied migrations, got {}", count);
+        assert_eq!(count, 31, "Expected exactly 31 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -2710,7 +3330,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 26);
+        assert_eq!(migration_count, 31);
     }
 
     // -----------------------------------------------------------------------

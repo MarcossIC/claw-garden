@@ -537,7 +537,7 @@ const RESTORE_READ: &str = concat!(
 /// The live row a save of the same text would reinforce instead of storing
 /// it again (`REINFORCE_LOOKUP_SQL` in `store_insert.rs`): the project's, of
 /// any author the restoring reader (`?2`) reaches.
-const RESTORE_TWIN: &str = concat!(
+pub(crate) const RESTORE_TWIN: &str = concat!(
     "SELECT t.id FROM memory m JOIN memory t \
      ON COALESCE(t.project_id, '') = COALESCE(m.project_id, '') AND t.content_hash = m.content_hash \
      WHERE m.id = ?1 AND m.content_hash IS NOT NULL AND t.id <> m.id \
@@ -551,7 +551,7 @@ const RESTORE_TWIN: &str = concat!(
 /// saver. The other pieces of the row's own save are not holders: a keyed
 /// long save gives its key to every piece. Nor is a row the deleted one's
 /// delete brought back: the restore takes it back.
-const RESTORE_TOPIC_HOLDER: &str = concat!(
+pub(crate) const RESTORE_TOPIC_HOLDER: &str = concat!(
     "SELECT m.topic_key, t.id FROM memory m JOIN memory t \
      ON COALESCE(t.project_id, '') = COALESCE(m.project_id, '') AND t.topic_key = m.topic_key \
      WHERE m.id = ?1 AND t.id <> m.id AND t.revived_from IS NOT m.id \
@@ -570,7 +570,7 @@ const RESTORE_ROW: &str = "UPDATE memory SET deleted_at = NULL, last_modified_at
 /// nothing undeleted a row; this statement is that missing half, and it runs
 /// only right after `RESTORE_ROW` turned a deleted row live, so every live row
 /// stays indexed exactly once.
-const RESTORE_TEXT_INDEX: &str = "INSERT INTO memory_fts(rowid, content, agent_id, project_id, memory_type) \
+pub(crate) const RESTORE_TEXT_INDEX: &str = "INSERT INTO memory_fts(rowid, content, agent_id, project_id, memory_type) \
      SELECT id, content, agent_id, project_id, memory_type FROM memory WHERE id = ?1";
 
 /// The restored row as it stands, with whether the row that replaces it is
@@ -1780,7 +1780,10 @@ mod tests {
         let id = id.to_string();
         store
             .conn
-            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/work/' || ?1, 0)", [id]))
+            .call(move |c| {
+                c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/work/' || ?1, 0)", [&id])?;
+                c.execute("INSERT INTO project (id, name, born, created_at) VALUES (?1, ?1, 'root', 0)", [&id])
+            })
             .await
             .unwrap();
     }

@@ -22,7 +22,12 @@ use std::time::Duration;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
-use clawg_core::memory::portability::{ImportReport, UndoReport};
+use clawg_core::memory::portability::{ImportReport, MapTarget, UndoReport};
+use clawg_core::memory::merge::MergeReport;
+use clawg_core::memory::project_delete::DeleteReport;
+use clawg_core::memory::registry::{
+    Born, KeptApart, ListedDelete, ListedProject, ListedSuggestion, Project, Resolution as ProjectResolution,
+};
 use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::store_lock::{StoreHolder, StoreLock, StoreOwner};
 use clawg_core::build_info;
@@ -316,6 +321,46 @@ pub struct Context {
     /// As in [`Found`], for a context asked with a query and a language.
     #[serde(default)]
     pub other_language: Option<OtherLanguage>,
+    /// The suggestions nobody answered that the project may be another one.
+    /// A daemon that predates them sends none.
+    #[serde(default)]
+    pub suggestions: Vec<ListedSuggestion>,
+}
+
+/// What `POST /v1/projects/suggestions/answer` answers.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AnsweredSuggestion {
+    pub project_id: String,
+    pub other_id: String,
+    /// `merge` or `apart`.
+    pub answer: String,
+    /// The merge of `other_id` into `project_id`.
+    #[serde(default)]
+    pub merge: Option<MergeReport>,
+}
+
+/// What `POST /v1/projects/locate` answers.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Located {
+    pub project_id: String,
+    pub root_id: String,
+    /// The folder led there already.
+    pub already: bool,
+    /// The merge of the folder's own project into it.
+    #[serde(default)]
+    pub merge: Option<MergeReport>,
+    /// For a subfolder: the project of its repository.
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    /// For a subfolder: where it is in its checkout.
+    #[serde(default)]
+    pub subpath: Option<String>,
+    /// For a subfolder: the repository's project was named, and its declaration went.
+    #[serde(default)]
+    pub removed: bool,
+    /// For a removed declaration: the project the subfolder led to.
+    #[serde(default)]
+    pub previous: Option<String>,
 }
 
 /// Whether `POST /v1/context` searched memories, and if not, why.
@@ -652,6 +697,46 @@ pub struct ListArgs {
     pub origin_project: Option<String>,
 }
 
+/// A merge as `POST /v1/projects/merge` takes it: a source and a target, or a
+/// merge to undo. Unset fields are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MergeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+}
+
+/// A delete as `POST /v1/projects/delete` takes it: a project, with or
+/// without its rows and the code of the report that showed them, or a delete
+/// to undo. Unset fields are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DeleteRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub with_memories: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+}
+
+/// The answer of `GET /v1/projects`.
+#[derive(Debug, Deserialize)]
+pub struct ProjectListing {
+    pub projects: Vec<ListedProject>,
+    /// The open deletes, which a daemon from before deleting does not send.
+    #[serde(default)]
+    pub deletes: Vec<ListedDelete>,
+}
+
 /// A batch move as `POST /v1/memories/move` takes it: a selection and one
 /// target, or a move to undo. Unset fields are left out.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -752,6 +837,14 @@ impl Call {
 pub struct Answer {
     pub status: reqwest::StatusCode,
     pub body: Vec<u8>,
+}
+
+/// `value` as one segment of a path: a `/`, `?` or `#` in an id the user
+/// typed would otherwise reach another route.
+fn path_segment(value: &str) -> String {
+    let mut url = reqwest::Url::parse("http://localhost/").expect("a URL that has a path");
+    url.path_segments_mut().expect("a URL that has a path").push(value);
+    url.path()[1..].to_string()
 }
 
 /// The URL of `call` under `base`. The query is encoded the way reqwest's
@@ -1310,17 +1403,18 @@ impl DaemonClient {
     }
 
     /// Imports the export `text` of the tool `from` (`clawg`, `engram`).
-    /// `map_roots` pairs an exported root with the root it has here, and
-    /// `project_map` a project name of another tool with one, both already
-    /// resolved.
+    /// `map_roots` pairs an exported root with where it is here, and
+    /// `project_map` a project name of another tool with where its notes go,
+    /// each root already resolved. A target is an object, which a daemon from
+    /// before refuses rather than storing the notes in no project.
     pub async fn import(
         &self,
         text: &str,
         from: &str,
         dry_run: bool,
         agent: Option<&str>,
-        map_roots: &[(String, String)],
-        project_map: &[(String, String)],
+        map_roots: &[(String, MapTarget)],
+        project_map: &[(String, MapTarget)],
     ) -> Result<ImportReport, ClientError> {
         let body = serde_json::json!({
             "text": text, "from": from, "dry_run": dry_run, "agent": agent,
@@ -1337,10 +1431,14 @@ impl DaemonClient {
 
     /// Records `root` as a project and joins into its project the rows saved
     /// under `legacy_ids`, letting the daemon read its files when
-    /// `index_docs`. Returns the ids the daemon gave the root.
+    /// `index_docs`. Returns the ids the daemon gave the root, and in
+    /// `project_id` the project of `path`, where the caller works inside it,
+    /// when a declared subfolder leads there. A daemon from before
+    /// declarations ignores `path` and answers the root's.
     pub async fn register_project(
         &self,
         root: &std::path::Path,
+        path: Option<&std::path::Path>,
         legacy_ids: &[String],
         index_docs: bool,
     ) -> Result<Registered, ClientError> {
@@ -1350,17 +1448,91 @@ impl DaemonClient {
             root_id: Option<String>,
             rekeyed: usize,
         }
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "root_path": root.to_string_lossy(),
             "legacy_ids": legacy_ids,
             "index_docs": index_docs,
             "assigned": true,
         });
+        if let Some(path) = path {
+            body["path"] = serde_json::Value::String(path.to_string_lossy().into_owned());
+        }
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/projects").json(&body)?).await?;
         let body = read_response::<Body>(answer)?;
         // A daemon from before assigned ids keeps one id per root.
         let root_id = body.root_id.unwrap_or_else(|| body.project_id.clone());
         Ok(Registered { project_id: body.project_id, root_id, rekeyed: body.rekeyed })
+    }
+
+    /// Every project, with its folders, remotes, memories and the
+    /// suggestions about it nobody answered.
+    pub async fn list_projects(&self) -> Result<ProjectListing, ClientError> {
+        let answer = self.send(Call::new(reqwest::Method::GET, "/v1/projects")).await?;
+        read_response(answer)
+    }
+
+    /// Names project `id` and marks it reviewed.
+    pub async fn rename_project(&self, id: &str, name: &str) -> Result<Project, ClientError> {
+        let call = Call::new(reqwest::Method::PATCH, format!("/v1/projects/{}", path_segment(id)))
+            .json(&serde_json::json!({ "name": name }))?;
+        read_response(self.send(call).await?)
+    }
+
+    /// Merges one project into another, or undoes a merge.
+    pub async fn merge_projects(&self, request: &MergeRequest) -> Result<MergeReport, ClientError> {
+        let call = Call::new(reqwest::Method::POST, "/v1/projects/merge").json(request)?;
+        read_response(self.send(call).await?)
+    }
+
+    /// Deletes a project, reports what deleting it would take, or undoes a delete.
+    pub async fn delete_projects(&self, request: &DeleteRequest) -> Result<DeleteReport, ClientError> {
+        let call = Call::new(reqwest::Method::POST, "/v1/projects/delete").json(request)?;
+        read_response(self.send(call).await?)
+    }
+
+    /// What `reference`, an id or a name, leads to; with `create`, a name
+    /// nothing has or resembles becomes a project without a folder.
+    pub async fn resolve_project(&self, reference: &str, create: bool, new_project: bool, born: Born) -> Result<ProjectResolution, ClientError> {
+        let body = serde_json::json!({ "project": reference, "create": create, "new_project": new_project, "born": born });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/projects/resolve").json(&body)?).await?)
+    }
+
+    /// Relays the user's answer to the suggestion that `project_id` and
+    /// `other_id` are one project: `merge` merges `other_id` into it.
+    pub async fn answer_suggestion(
+        &self,
+        project_id: &str,
+        other_id: &str,
+        answer: &str,
+        reason: &str,
+        user_answered: bool,
+    ) -> Result<AnsweredSuggestion, ClientError> {
+        let body = serde_json::json!({
+            "project_id": project_id,
+            "other_id": other_id,
+            "answer": answer,
+            "reason": reason,
+            "user_answered": user_answered,
+        });
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/projects/suggestions/answer").json(&body)?).await?)
+    }
+
+    /// Makes the root of `root` lead to `project`, an id or a name, or with
+    /// `subfolder` the folder `root` itself, declared inside its repository.
+    /// A daemon from before declarations refuses `subfolder` with a 400.
+    pub async fn locate_project(&self, project: &str, root: &std::path::Path, subfolder: bool) -> Result<Located, ClientError> {
+        let mut body = serde_json::json!({ "project": project, "root_path": root.to_string_lossy() });
+        if subfolder {
+            body["subfolder"] = serde_json::Value::Bool(true);
+        }
+        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/projects/locate").json(&body)?).await?)
+    }
+
+    /// Answers that projects `project_id` and `other_id` are not one.
+    pub async fn keep_apart(&self, project_id: &str, other_id: &str) -> Result<KeptApart, ClientError> {
+        let call = Call::new(reqwest::Method::POST, "/v1/projects/keep-apart")
+            .json(&serde_json::json!({ "project_id": project_id, "other_id": other_id }))?;
+        read_response(self.send(call).await?)
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {

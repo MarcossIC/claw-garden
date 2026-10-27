@@ -1,0 +1,26 @@
+change: project-locators
+objective: "2"
+depends_on: [project-registry, project-reassign, project-clone-identity]
+phase: archived
+release: "0.65.0"  # sin publicar; 0.64.0, la de la entrega 1, se absorbió en 0.65.0 al archivar embed-throughput
+artifacts:
+  exploration: done  # la de project-registry (89), en su archivo
+  proposal: done  # las decisiones de 89 del 2026-10-24, para las entregas 1 a 4; la 2 partida en 2a y 2b
+  spec: done  # entregas 1 (PL1 a PL10), 2a (PL11 a PL20), 2b (PL21 a PL31), 3a (PL32 a PL42), 3b (PL43 a PL52) y 4 (PL53 a PL65)
+  design: done  # entregas 1 (D1 a D14), 2a (D15 a D25), 2b (D26 a D37), 3a (D38 a D49), 3b (D50 a D59) y 4 (D60 a D70), aceptadas
+  tasks: done  # entregas 1 (1 a 10), 2a (11 a 21), 2b (22 a 34), 3a (35 a 44), 3b (45 a 55), 4 (56 a 67) y el archive (68)
+  apply: done  # entregas 1, 2a, 2b, 3a, 3b y 4
+  verify: done  # cada entrega en Windows, de la 3a a la 4 también en Linux, el binario en homes temporales, y el CI de los pull requests #95 a #97 en Linux y Windows
+  archive: done
+deliveries:
+  "1": done  # el registro (V27)
+  "2a": done  # unir (V28): merge con lápida y --undo, canonical(id), keep-apart, doctor
+  "2b": done  # borrar (V29): delete en dos etapas con --undo, la vuelta al uso, purge --project-delete, doctor
+  "3a": done  # proyectos sin carpeta y el agente, sin migración
+  "3b": done  # los subproyectos de un monorepo (V30)
+  "4": done  # exportar e importar por localizador (V31)
+after_archive:  # fuera del cambio
+  - "el paso operativo: ubicar las ~15.709 filas sin proyecto del perfil prod con 0.65.0 instalado (pide autorización explícita) y contar las que queden antes de la línea base de 86"
+  - "dos arreglos sueltos del backlog del README: el respaldo de canonical_form sin strip_verbatim, y --map-root comparado byte a byte"
+updated: 2026-10-27
+main_spec: openspec/specs/project/spec.md, openspec/specs/storage/spec.md, openspec/specs/portability/spec.md, openspec/specs/doctor/spec.md, openspec/specs/mcp/spec.md, openspec/specs/hooks/spec.md, openspec/specs/secrets/spec.md

@@ -2786,7 +2786,7 @@ async fn registering_a_root_whose_id_is_taken_by_another_is_a_conflict() {
         .store
         .conn
         .call(move |c| {
-            c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [id])
+            c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [id])
         })
         .await
         .expect("seed a colliding project");
@@ -2809,7 +2809,7 @@ async fn registering_two_roots_that_collide_gives_each_its_own_id() {
         .store
         .conn
         .call(move |c| {
-            c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [seeded])
+            c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [seeded])
         })
         .await
         .expect("seed a colliding project");
@@ -2900,6 +2900,82 @@ async fn a_repository_cloned_where_another_was_registers_into_a_project_of_its_o
     assert_eq!(back["project_id"], a["project_id"], "the first repository keeps its project");
 }
 
+/// Runs the real `git` in `dir` apart from the caller's git: none of its
+/// `GIT_*` (a hook that started the tests would point it at the repository
+/// being tested), no global or system config, and a fixed author.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let mut command = std::process::Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"GIT_")) {
+            command.env_remove(key);
+        }
+    }
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let output = command
+        .current_dir(dir)
+        .args(["-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("this test needs git on the PATH");
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[tokio::test]
+async fn a_repository_without_origin_replaced_in_its_path_registers_into_a_project_of_its_own() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("app");
+    let register = || h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true }));
+    git(base.path(), &["init", "app"]);
+    git(&root, &["commit", "--allow-empty", "-m", "the first commit of a"]);
+    let (status, a) = register().await;
+    assert_eq!(status, 200, "{a}");
+
+    std::fs::rename(&root, base.path().join("a")).expect("move the first repository aside");
+    git(base.path(), &["init", "app"]);
+    git(&root, &["commit", "--allow-empty", "-m", "the first commit of b"]);
+    let (status, b) = register().await;
+
+    assert_eq!(status, 200, "{b}");
+    assert_ne!(b["project_id"], a["project_id"], "{a} {b}");
+    assert_ne!(b["root_id"], a["root_id"], "{a} {b}");
+    let (_, again) = register().await;
+    assert_eq!(again["project_id"], b["project_id"], "{again}");
+}
+
+#[tokio::test]
+async fn a_folder_moved_without_origin_registers_into_its_project() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let (old, new) = (base.path().join("app"), base.path().join("app2"));
+    let register = |root: &std::path::Path| {
+        h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true }))
+    };
+    git(base.path(), &["init", "app"]);
+    git(&old, &["commit", "--allow-empty", "-m", "the first commit of app"]);
+    let (status, a) = register(&old).await;
+    assert_eq!(status, 200, "{a}");
+    let (status, saved) =
+        h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": a["project_id"] })).await;
+    assert_eq!(status, 201, "{saved}");
+
+    std::fs::rename(&old, &new).expect("move the repository");
+    let (status, moved) = register(&new).await;
+
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(moved["project_id"], a["project_id"], "{a} {moved}");
+    assert_ne!(moved["root_id"], a["root_id"], "{a} {moved}");
+    let project = moved["project_id"].as_str().expect("project_id");
+    let (_, list) = h.get_json(&format!("/v1/memories?kind=memory&project={project}")).await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "what was saved there is found from the new path: {list}");
+}
+
 #[tokio::test]
 async fn registering_needs_the_token() {
     let h = Harness::start().await;
@@ -2912,6 +2988,101 @@ async fn registering_needs_the_token() {
         .expect("request")
         .status();
     assert_eq!(status.as_u16(), 401);
+}
+
+#[tokio::test]
+async fn the_projects_are_listed_with_their_folders_and_suggestions() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let (app, copy, gone) = (base.path().join("app"), base.path().join("copia"), base.path().join("gone"));
+    let register = |root: &std::path::Path| {
+        h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true }))
+    };
+    git(base.path(), &["init", "app"]);
+    git(&app, &["commit", "--allow-empty", "-m", "the first commit of app"]);
+    let (_, a) = register(&app).await;
+    // Its origin is a path, so no remote tells the clone from a copy.
+    git(base.path(), &["clone", "app", "copia"]);
+    let (_, c) = register(&copy).await;
+    std::fs::create_dir(&gone).expect("a folder");
+    let (_, g) = register(&gone).await;
+    std::fs::remove_dir(&gone).expect("remove the folder");
+    let (status, saved) =
+        h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": "loose-1a2b" })).await;
+    assert_eq!(status, 201, "{saved}");
+
+    let (status, body) = h.get_json("/v1/projects").await;
+
+    assert_eq!(status, 200, "{body}");
+    let listed = body["projects"].as_array().expect("projects");
+    let project = |id: &Value| listed.iter().find(|p| p["id"] == *id).cloned().unwrap_or_else(|| panic!("{id} in {body}"));
+    let folder = |p: &Value| {
+        let folders = p["folders"].as_array().expect("folders");
+        assert_eq!(folders.len(), 1, "{p}");
+        let f = &folders[0];
+        (f["root_id"].clone(), f["root_path"].clone(), f["remote"].clone(), f["index_docs"].clone(), f["present"].clone())
+    };
+    let suggestion = |p: &Value| {
+        let s = &p["suggestions"][0];
+        (s["other_id"].clone(), s["other_name"].clone(), s["reason"].clone(), s["created_at"].is_i64())
+    };
+    let (pa, pc, pg, loose) = (project(&a["project_id"]), project(&c["project_id"]), project(&g["project_id"]), project(&json!("loose-1a2b")));
+    assert_eq!((pa["name"].as_str(), pa["born"].as_str(), pa["reviewed"].as_bool()), (Some("app"), Some("root"), Some(false)), "{pa}");
+    assert_eq!(folder(&pa), (a["root_id"].clone(), json!(app.to_string_lossy()), Value::Null, json!(false), json!(true)));
+    assert_eq!(suggestion(&pa), (c["project_id"].clone(), json!("copia"), json!("root_commit"), true), "{pa}");
+    assert_eq!(suggestion(&pc), (a["project_id"].clone(), json!("app"), json!("root_commit"), true), "{pc}");
+    assert_eq!(folder(&pg).4, json!(false), "a folder that is gone: {pg}");
+    assert_eq!((loose["born"].as_str(), loose["memories"].as_i64()), (Some("adopted"), Some(1)), "{loose}");
+    assert_eq!(loose["folders"], json!([]), "a project without a folder: {loose}");
+    assert_eq!(pa["memories"], json!(0));
+}
+
+impl Harness {
+    async fn rename(&self, id: &str, name: &str) -> (u16, Value) {
+        self.send(self.http.patch(self.url(&format!("/v1/projects/{id}"))).json(&json!({ "name": name }))).await
+    }
+}
+
+#[tokio::test]
+async fn renaming_a_project_keeps_what_was_saved_under_it() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let (app, web) = (base.path().join("app"), base.path().join("web"));
+    let mut ids = Vec::new();
+    for root in [&app, &web] {
+        std::fs::create_dir(root).expect("a folder");
+        let (status, registered) =
+            h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true })).await;
+        assert_eq!(status, 200, "{registered}");
+        ids.push(registered["project_id"].as_str().expect("project_id").to_string());
+    }
+    let (project, other) = (ids[0].as_str(), ids[1].as_str());
+    let (status, saved) = h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "a", "project_id": project })).await;
+    assert_eq!(status, 201, "{saved}");
+
+    let (status, renamed) = h.rename(project, "  App web ").await;
+
+    assert_eq!(status, 200, "{renamed}");
+    assert_eq!((renamed["id"].as_str(), renamed["name"].as_str(), renamed["reviewed"].as_bool()), (Some(project), Some("App web"), Some(true)));
+    let (_, body) = h.get_json("/v1/projects").await;
+    let listed = body["projects"].as_array().and_then(|l| l.iter().find(|p| p["id"] == project)).cloned().expect("listed");
+    assert_eq!((listed["name"].as_str(), listed["reviewed"].as_bool(), listed["memories"].as_i64()), (Some("App web"), Some(true), Some(1)));
+    let (_, list) = h.get_json(&format!("/v1/memories?kind=memory&project={project}")).await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "what was saved under it is found as before: {list}");
+    let (status, taken) = h.rename(other, "app WEB").await;
+    assert_eq!((status, taken["error"].as_str()), (409, Some("name_taken")), "{taken}");
+    let (status, blank) = h.rename(project, "   ").await;
+    assert_eq!(status, 400, "{blank}");
+}
+
+#[tokio::test]
+async fn renaming_an_unknown_project_is_404() {
+    let h = Harness::start().await;
+
+    let (status, body) = h.rename("nobody-0000", "anything").await;
+
+    assert_eq!(status, 404, "{body}");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("nobody-0000")), "the answer names the id: {body}");
 }
 
 // ── Project documentation ───────────────────────────────────────────────────
@@ -2932,7 +3103,7 @@ async fn project_with_docs(h: &Harness, docs: &[(&str, &str)]) -> (tempfile::Tem
         .runtime
         .store
         .conn
-        .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", [row_id, root]))
+        .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, ?2, 0)", [row_id, root]))
         .await
         .unwrap();
     (dir, id)
@@ -3065,7 +3236,7 @@ async fn index_docs_of(h: &Harness, id: &str) -> Option<i64> {
         .runtime
         .store
         .conn
-        .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project WHERE id = ?1)", [id], |r| r.get(0)))
+        .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project_path WHERE id = ?1)", [id], |r| r.get(0)))
         .await
         .unwrap()
 }
@@ -3782,6 +3953,105 @@ async fn an_engram_export_without_notes_imports_nothing() {
     assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
 }
 
+/// A clawg export of another store: `project_lines`, then one row of each
+/// project by its id in the file.
+fn export_with(project_lines: &[Value], rows: &[(&str, &str)]) -> String {
+    let header = json!({
+        "kind": "header", "format": "clawg-memories", "version": 1, "exported_at": 0, "clawg": "0.0.0",
+        "filter": {"project": null, "agent": null, "include_deleted": false},
+    });
+    let mut lines = vec![header];
+    lines.extend(project_lines.iter().cloned());
+    for (k, (project, content)) in rows.iter().enumerate() {
+        let id = k as i64 + 1;
+        lines.push(json!({
+            "kind": "memory", "id": id, "scope": "agent", "agent_id": "a", "project_id": project, "content": content,
+            "memory_type": "semantic_fact", "source": "explicit", "created_at": 1_000 + id,
+            "created_by_type": "agent", "last_modified_at": 1_000 + id, "last_accessed_at": 9_000,
+            "access_count": 1, "importance": 5.0, "tier": 2, "status": "active",
+        }));
+    }
+    lines.iter().map(|l| format!("{l}\n")).collect()
+}
+
+#[tokio::test]
+async fn an_export_of_another_store_imports_by_remote_and_by_name() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("app");
+    set_origin(&root, "git@github.com:acme/app.git");
+    let app = registered_dir(&h, &root).await["project_id"].as_str().expect("project_id").to_string();
+    let ideas = resolve(&h, json!({ "project": "Ideas", "create": true, "born": "user" })).await["project_id"]
+        .as_str()
+        .expect("a project")
+        .to_string();
+    let lines = [
+        json!({ "kind": "project", "id": "app-0000", "name": "app", "folders": [{ "root_path": "/far/app", "remote": "github.com/acme/app" }], "remotes": ["github.com/acme/app"] }),
+        json!({ "kind": "project", "id": "ideas-0000", "name": "ideas" }),
+    ];
+    let text = export_with(&lines, &[("app-0000", "the app of the other machine uses Rust"), ("ideas-0000", "an idea of the other machine")]);
+
+    let (status, report) = h.post_json("/v1/import", json!({ "text": text })).await;
+
+    assert_eq!(status, 200, "{report}");
+    let went: Vec<(Value, Value)> =
+        report["projects"].as_array().expect("projects").iter().map(|p| (p["to"].clone(), p["by"].clone())).collect();
+    assert_eq!(went, vec![(json!(app), json!("remote")), (json!(ideas), json!("name"))], "{report}");
+    assert_eq!(report["by_project"], json!({ app.clone(): 1, ideas.clone(): 1 }), "{report}");
+}
+
+#[tokio::test]
+async fn a_project_map_to_a_deleted_ambiguous_or_unknown_project_is_refused() {
+    let h = Harness::start().await.with_tokenizer();
+    let text = engram_export(vec![observation("a", Some("notes"), "Port", "the daemon listens on 27380")]);
+    let (gone, _, _) = deleted_project(&h, "/work/gone").await;
+    for name in ["twin-1111", "twin-2222"] {
+        h.ctx
+            .runtime
+            .store
+            .conn
+            .call(move |c| c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, 'Twin', 'user', 1, 1)", [name]))
+            .await
+            .unwrap();
+    }
+    for (project, status, error) in [(gone.as_str(), 409, "project_deleted"), ("twin", 409, "project_ambiguous"), ("nowhere", 404, "")] {
+        let ask = json!({ "text": text, "from": "engram", "project_map": [["notes", { "project": project }]] });
+        let (got, body) = h.post_json("/v1/import", ask).await;
+        assert_eq!(got, status, "{project}: {body}");
+        if !error.is_empty() {
+            assert_eq!(body["error"], json!(error), "{project}: {body}");
+        }
+    }
+    let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(1), "map_roots": [["/a", { "project": "twin-1111" }]] })).await;
+    assert_eq!(status, 400, "a root maps to a root: {body}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+}
+
+#[tokio::test]
+async fn a_map_given_as_a_root_is_read_as_before() {
+    let h = Harness::start().await.with_tokenizer();
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = canonical(root.path());
+    let text = engram_export(vec![observation("a", Some("notes"), "Port", "the daemon listens on 27380")]);
+    let as_text = json!({ "text": text, "from": "engram", "project_map": [["notes", root.to_string_lossy()]] });
+    let (status, before) = h.post_json("/v1/import", as_text).await;
+    assert_eq!(status, 200, "{before}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated").await;
+    let id = ids_in(&listed["items"])[0];
+    let project = project_of(&h, id).await;
+    assert!(project.is_string(), "{listed}");
+
+    let text = engram_export(vec![observation("b", Some("notes"), "Host", "the daemon binds 127.0.0.1")]);
+    let as_object = json!({ "text": text, "from": "engram", "project_map": [["notes", { "root": root.to_string_lossy() }]] });
+    let (status, after) = h.post_json("/v1/import", as_object).await;
+    assert_eq!(status, 200, "{after}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated").await;
+    for id in ids_in(&listed["items"]) {
+        assert_eq!(project_of(&h, id).await, project, "both forms lead to the root's project");
+    }
+}
+
 #[tokio::test]
 async fn import_refuses_an_unknown_source_or_a_mixed_map() {
     let h = Harness::start().await.with_tokenizer();
@@ -4237,4 +4507,1049 @@ async fn a_batch_without_a_selection_or_a_target_is_400() {
     }
     let (status, answer) = h.post_json("/v1/memories/move", json!({ "undo": 9 })).await;
     assert_eq!(status, 404, "{answer}");
+}
+
+// ── Merged projects ─────────────────────────────────────────────────────────
+
+/// What each route of `router()` takes of a project, as `api.rs` writes the
+/// route: the field that holds a project id, which must lead past a merge's
+/// tombstone to the live project, or none. A route the router gains fails
+/// `every_route_says_which_project_it_takes` until it is here, and one that
+/// takes a project fails `every_route_that_takes_a_project_follows_a_merge`
+/// until that test checks it.
+const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
+    ("GET", "/health", None),
+    ("POST", "/memories", Some("body.project_id")),
+    ("GET", "/memories", Some("query.project")),
+    ("POST", "/memories/move", Some("body.to_project")),
+    ("POST", "/search", Some("body.project_id")),
+    ("POST", "/context", Some("body.project_id")),
+    ("POST", "/sessions", Some("body.project_id")),
+    ("GET", "/memories/{kind}/{id}", None),
+    ("PATCH", "/memories/{kind}/{id}", Some("body.project_id")),
+    ("DELETE", "/memories/{kind}/{id}", None),
+    ("GET", "/memories/{kind}/{id}/save", None),
+    ("POST", "/memories/{kind}/{id}/restore", None),
+    ("GET", "/disputes", Some("query.project_id")),
+    ("POST", "/disputes/resolve", None),
+    ("POST", "/disputes/judge", None),
+    ("POST", "/synthesis", Some("body.project_id")),
+    // The worker follows the project of the save it takes back.
+    ("POST", "/outbox/retry", None),
+    ("POST", "/outbox/discard", None),
+    ("GET", "/stats", Some("query.project")),
+    ("GET", "/metrics", None),
+    ("POST", "/backup", None),
+    // Roots, whose projects the plan and the writes follow, and the
+    // projects another tool's projects are mapped to.
+    ("POST", "/import", Some("body.project_map[].project")),
+    ("POST", "/import/undo", None),
+    // A root, whose project the registration follows.
+    ("POST", "/projects", None),
+    ("GET", "/projects", None),
+    ("PATCH", "/projects/{id}", Some("path.id")),
+    ("POST", "/projects/merge", Some("body.target")),
+    ("POST", "/projects/keep-apart", Some("body.project_id")),
+    ("POST", "/projects/delete", Some("body.project_id")),
+    ("POST", "/projects/resolve", Some("body.project")),
+    ("POST", "/projects/suggestions/answer", Some("body.project_id")),
+    ("POST", "/projects/locate", Some("body.project")),
+    // A folder's root id, which a merge does not change.
+    ("POST", "/projects/docs/search", None),
+    ("POST", "/shutdown", None),
+];
+
+/// `(method, path)` of every route `router()` declares, read from its source.
+fn routes_in_router() -> Vec<(String, String)> {
+    // A Windows checkout ends its lines with CRLF.
+    let source = include_str!("../src/daemon/api.rs").replace("\r\n", "\n");
+    let start = source.find("pub fn router(").expect("router() in api.rs");
+    let body = &source[start..];
+    let body = &body[..body.find("\n}\n").expect("the end of router()")];
+    let mut routes = Vec::new();
+    for segment in body.split(".route(").skip(1) {
+        let path = segment.split('"').nth(1).expect("a quoted path");
+        for method in ["get", "post", "patch", "delete", "put"] {
+            let call = format!("{method}(");
+            let called = segment
+                .match_indices(&call)
+                .any(|(at, _)| !segment[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+            if called {
+                routes.push((method.to_uppercase(), path.to_string()));
+            }
+        }
+    }
+    routes.sort();
+    routes
+}
+
+#[test]
+fn every_route_says_which_project_it_takes() {
+    let mut table: Vec<(String, String)> = PROJECT_INPUTS.iter().map(|(m, p, _)| (m.to_string(), p.to_string())).collect();
+    table.sort();
+    assert_eq!(routes_in_router(), table, "router() and PROJECT_INPUTS name different routes");
+}
+
+/// Merges `source` into `target` as `clawg projects merge` does.
+async fn merge_projects(h: &Harness, source: &str, target: &str) -> clawg_core::memory::merge::MergeReport {
+    let backups = clawg_core::paths::backups_dir(&h.ctx.runtime.base_dir);
+    clawg_core::memory::merge::merge_core(&h.ctx.runtime.store, &h.ctx.runtime.workspaces(), &backups, source, target, false)
+        .await
+        .expect("merge")
+}
+
+/// Saves `content` under `project` and answers its id.
+async fn save_in(h: &Harness, project: &str, content: &str) -> i64 {
+    let (status, body) =
+        h.post_json("/v1/memories", json!({ "agent_id": "agent-http", "content": content, "project_id": project })).await;
+    assert_eq!(status, 201, "{body}");
+    saved_ids(&body)[0]
+}
+
+fn ids_in(rows: &Value) -> Vec<i64> {
+    rows.as_array().expect("rows").iter().filter_map(|r| r["id"].as_i64()).collect()
+}
+
+#[tokio::test]
+async fn every_route_that_takes_a_project_follows_a_merge() {
+    let h = Harness::start().await;
+    let (app, web, other) =
+        (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
+    save_in(&h, &app, "the parser of app is written by hand").await;
+    let on_web = save_in(&h, &web, "the web server listens on port 8080").await;
+    save_in(&h, &other, "the other service is written in Go").await;
+    merge_projects(&h, &app, &web).await;
+
+    for (method, path, field) in PROJECT_INPUTS {
+        let Some(field) = field else { continue };
+        let route = format!("{method} {path} ({field})");
+        match (*method, *path) {
+            ("POST", "/memories") => {
+                let id = save_in(&h, &app, "a note saved after the merge").await;
+                assert_eq!(project_of(&h, id).await, json!(web), "{route}");
+            }
+            ("GET", "/memories") => {
+                let (status, body) = h.get_json(&format!("/v1/memories?project={app}")).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(ids_in(&body["items"]).contains(&on_web), "{route}: {body}");
+            }
+            ("POST", "/memories/move") => {
+                let row = save_in(&h, &other, "a note to move").await;
+                let (status, body) = h.post_json("/v1/memories/move", json!({ "ids": [row], "to_project": app })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert_eq!(project_of(&h, row).await, json!(web), "{route}");
+            }
+            ("POST", "/search") => {
+                let ask = json!({ "agent_id": "agent-http", "query": "web server port 8080", "project_id": app });
+                let (status, body) = h.post_json("/v1/search", ask).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(ids_in(&body["hits"]).contains(&on_web), "{route}: {body}");
+            }
+            ("POST", "/context") => {
+                // Without a query it lists the caller's recent saves of the
+                // project, which the fake embedder cannot rank.
+                let ask = json!({ "agent_id": "agent-http", "project_id": app });
+                let (status, body) = h.post_json("/v1/context", ask).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(body["prompt"].as_str().is_some_and(|p| p.contains("listens on port 8080")), "{route}: {body}");
+            }
+            ("POST", "/sessions") => {
+                let (status, body) = h
+                    .post_json("/v1/sessions", json!({ "agent_id": "agent-http", "project_id": app, "session_id": "s-merged" }))
+                    .await;
+                assert_eq!(status, 204, "{route}: {body}");
+                let id = save_in(&h, &web, "a note of that session").await;
+                assert_eq!(session_of(&h, id).await.as_deref(), Some("s-merged"), "{route}");
+            }
+            ("PATCH", "/memories/{kind}/{id}") => {
+                let row = save_in(&h, &other, "a note to patch").await;
+                let (status, body) = patch(&h, row, json!({ "project_id": app })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert_eq!(project_of(&h, row).await, json!(web), "{route}");
+            }
+            ("GET", "/disputes") => {
+                let older = save_in(&h, &web, "the port of the web server is 8080").await;
+                h.ctx
+                    .runtime
+                    .store
+                    .conn
+                    .call(move |c| {
+                        c.execute(
+                            "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
+                            [older, on_web],
+                        )
+                    })
+                    .await
+                    .expect("note the pair");
+                let pending = |project: String| {
+                    let h = &h;
+                    async move { h.get_json(&format!("/v1/disputes?agent_id=agent-http&project_id={project}")).await.1 }
+                };
+                let (from_app, from_web, from_other) = (pending(app.clone()).await, pending(web.clone()).await, pending(other.clone()).await);
+                assert_eq!(from_app, from_web, "{route}");
+                assert!(from_app["pending"].as_i64() > from_other["pending"].as_i64(), "{route}: {from_app} {from_other}");
+            }
+            ("POST", "/synthesis") => {
+                let (status, body) = h.post_json("/v1/synthesis", json!({ "project_id": app })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(ids_in(&body["pending"]).contains(&on_web), "{route}: {body}");
+            }
+            ("GET", "/stats") => {
+                let (_, from_app) = h.get_json(&format!("/v1/stats?project={app}")).await;
+                let (_, from_web) = h.get_json(&format!("/v1/stats?project={web}")).await;
+                assert_eq!(from_app, from_web, "{route}");
+            }
+            ("PATCH", "/projects/{id}") => {
+                let (status, body) = h.rename(&app, "App").await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+                assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route}: {body}");
+            }
+            ("POST", "/projects/merge") => {
+                let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": other, "target": app })).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+                assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route}: {body}");
+            }
+            ("POST", "/projects/keep-apart") => {
+                let (status, body) = h.post_json("/v1/projects/keep-apart", json!({ "project_id": app, "other_id": other })).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+            }
+            ("POST", "/projects/delete") => {
+                let (status, body) = h.post_json("/v1/projects/delete", json!({ "project_id": app })).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+                assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route}: {body}");
+            }
+            ("POST", "/projects/resolve") => {
+                let (status, body) = h.post_json("/v1/projects/resolve", json!({ "project": app })).await;
+                assert_eq!((status, body["project_id"].as_str()), (200, Some(web.as_str())), "{route}: {body}");
+            }
+            ("POST", "/projects/suggestions/answer") => {
+                let answer = json!({ "project_id": app, "other_id": other, "answer": "apart", "user_answered": true, "reason": "two things" });
+                let (status, body) = h.post_json("/v1/projects/suggestions/answer", answer).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+            }
+            ("POST", "/projects/locate") => {
+                let folder = tempfile::tempdir().expect("tempdir");
+                let (status, body) =
+                    h.post_json("/v1/projects/locate", json!({ "project": app, "root_path": folder.path().to_string_lossy() })).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route}: {body}");
+                assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route}: {body}");
+                let sub = checkout_with(folder.path(), "apps/web");
+                let ask = json!({ "project": app, "root_path": sub.to_string_lossy(), "subfolder": true });
+                let (status, body) = h.post_json("/v1/projects/locate", ask).await;
+                assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route} subfolder: {body}");
+                assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route} subfolder: {body}");
+            }
+            ("POST", "/import") => {
+                h.ctx.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+                let text = engram_export(vec![observation("merged-map", Some("notes"), "Port", "the mapped service listens on 7070")]);
+                let ask = json!({ "text": text, "from": "engram", "project_map": [["notes", { "project": app }]] });
+                let (status, body) = h.post_json("/v1/import", ask).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated&limit=10").await;
+                let id = ids_in(&listed["items"])[0];
+                assert_eq!(project_of(&h, id).await, json!(web), "{route}");
+            }
+            _ => panic!("{route} takes a project and no check here follows it past a merge"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_bridge_opened_before_a_merge_reads_and_writes_its_target() {
+    let h = Harness::start().await;
+    // What the bridge registered at its start, and keeps.
+    let app = registered(&h, "/work/app").await;
+    let early = save_in(&h, &app, "the parser of app is written by hand").await;
+    let web = registered(&h, "/work/web").await;
+    merge_projects(&h, &app, &web).await;
+
+    let late = save_in(&h, &app, "the parser of app has a fuzz test").await;
+
+    assert_eq!((project_of(&h, early).await, project_of(&h, late).await), (json!(web), json!(web)));
+    let ask = json!({ "agent_id": "agent-http", "query": "parser of app", "project_id": app });
+    let (_, found) = h.post_json("/v1/search", ask).await;
+    let ids = ids_in(&found["hits"]);
+    assert!(ids.contains(&early) && ids.contains(&late), "{found}");
+    let (_, context) = h.post_json("/v1/context", json!({ "agent_id": "agent-http", "project_id": app })).await;
+    assert!(context["prompt"].as_str().is_some_and(|p| p.contains("has a fuzz test")), "{context}");
+}
+
+#[tokio::test]
+async fn a_move_from_a_merged_project_is_refused() {
+    let h = Harness::start().await;
+    let (app, web, other) =
+        (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
+    save_in(&h, &app, "the parser of app is written by hand").await;
+    merge_projects(&h, &app, &web).await;
+
+    let (status, body) = h.post_json("/v1/memories/move", json!({ "from_project": app, "to_project": other })).await;
+
+    assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{body}");
+    assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{body}");
+}
+
+#[tokio::test]
+async fn the_move_of_a_merge_is_undone_only_with_its_merge() {
+    let h = Harness::start().await;
+    let (app, web) = (registered(&h, "/work/app").await, registered(&h, "/work/web").await);
+    let row = save_in(&h, &app, "the parser of app is written by hand").await;
+    let merged = merge_projects(&h, &app, &web).await;
+
+    let (status, body) = h.post_json("/v1/memories/move", json!({ "undo": merged.move_id.expect("a move") })).await;
+
+    assert_eq!((status, body["error"].as_str()), (409, Some("part_of_merge")), "{body}");
+    let merge_id = merged.merge_id.expect("a merge").to_string();
+    assert!(body["detail"].as_str().is_some_and(|d| d.contains(&format!("--undo {merge_id}"))), "{body}");
+    assert_eq!(project_of(&h, row).await, json!(web), "nothing moved");
+}
+
+#[tokio::test]
+async fn merging_through_the_daemon_leaves_everything_under_the_target() {
+    let h = Harness::start().await;
+    let (app, web) = (registered(&h, "/work/app").await, registered(&h, "/work/web").await);
+    let row = save_in(&h, &app, "the parser of app is written by hand").await;
+
+    let (status, dry) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!((dry["dry_run"].as_bool(), dry["memories"].as_i64(), &dry["merge_id"]), (Some(true), Some(1), &Value::Null));
+    assert_eq!(project_of(&h, row).await, json!(app), "a dry run moves nothing");
+
+    let (status, merged) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
+    assert_eq!(status, 200, "{merged}");
+    let merge_id = merged["merge_id"].as_i64().expect("a merge");
+    assert!(merged["snapshot"].as_str().is_some_and(|s| s.contains("pre-merge")), "{merged}");
+    assert_eq!(project_of(&h, row).await, json!(web));
+
+    let refused = [
+        (json!({ "source": web, "target": app }), 409, "project_merged"),
+        (json!({ "source": "nowhere-9f9f", "target": web }), 404, "no project nowhere-9f9f"),
+        (json!({ "source": web, "target": web }), 400, "cannot be merged into itself"),
+        (json!({ "source": web }), 400, "name a source and a target"),
+        (json!({ "undo": merge_id, "source": web }), 400, "name a source and a target"),
+        (json!({ "undo": 99 }), 404, "no merge 99"),
+    ];
+    for (body, want, error) in refused {
+        let (status, answer) = h.post_json("/v1/projects/merge", body.clone()).await;
+        assert_eq!(status, want, "{body}: {answer}");
+        assert!(answer["error"].as_str().is_some_and(|e| e.contains(error)), "{body}: {answer}");
+    }
+
+    let (status, undone) = h.post_json("/v1/projects/merge", json!({ "undo": merge_id })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert!(undone["snapshot"].as_str().is_some_and(|s| s.contains("pre-undo")), "{undone}");
+    assert_eq!(project_of(&h, row).await, json!(app));
+    let (status, again) = h.post_json("/v1/projects/merge", json!({ "undo": merge_id })).await;
+    assert_eq!((status, again["error"].as_str()), (409, Some("merge_undone")), "{again}");
+
+    let (status, kept) = h.post_json("/v1/projects/keep-apart", json!({ "project_id": app, "other_id": web })).await;
+    assert_eq!(status, 200, "{kept}");
+    assert_eq!(kept, json!({ "project_id": app, "other_id": web, "answered": 0 }));
+    let (status, _) = h.post_json("/v1/projects/keep-apart", json!({ "project_id": app, "other_id": app })).await;
+    assert_eq!(status, 400);
+    let (status, _) = h.post_json("/v1/projects/keep-apart", json!({ "project_id": app, "other_id": "nowhere-9f9f" })).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn the_listing_after_a_merge_shows_the_target_alone() {
+    let h = Harness::start().await;
+    let (app, web) = (registered(&h, "/work/app").await, registered(&h, "/work/web").await);
+    save_in(&h, &app, "the parser of app is written by hand").await;
+    let (_, merged) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
+
+    let (status, body) = h.get_json("/v1/projects").await;
+
+    assert_eq!(status, 200, "{body}");
+    let projects = body["projects"].as_array().expect("projects");
+    assert_eq!(projects.len(), 1, "{body}");
+    assert_eq!((&projects[0]["id"], &projects[0]["memories"]), (&json!(web), &json!(1)));
+    assert_eq!(projects[0]["merged"][0]["id"], json!(app), "{body}");
+    assert_eq!(projects[0]["merged"][0]["merge_id"], merged["merge_id"], "{body}");
+    let folders: Vec<&Value> = projects[0]["folders"].as_array().expect("folders").iter().map(|f| &f["root_path"]).collect();
+    assert_eq!(folders, vec![&json!("/work/app"), &json!("/work/web")], "{body}");
+}
+
+/// Writes a save still in the outbox for `project`, as one the worker has not finished.
+async fn pending_save(h: &Harness, operation: &'static str, project: &str) {
+    let event = json!({ "agent_id": "agent-http", "project_id": project, "content": "" }).to_string();
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, created_at, updated_at) \
+                 VALUES (?1, 'agent-http', 'a save', ?2, 1, 1)",
+                [operation, event.as_str()],
+            )
+        })
+        .await
+        .expect("a pending save");
+}
+
+#[tokio::test]
+async fn a_merge_waits_for_the_saves_of_its_projects() {
+    let h = Harness::start().await;
+    let (app, web, other) =
+        (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
+    pending_save(&h, "op-1", &app).await;
+    let store = h.ctx.runtime.store.clone();
+    // Taken before the spawn: the task may start its sleep before this line runs.
+    let started = Instant::now();
+    let finish = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        store.conn.call(|c| c.execute("DELETE FROM ingest_outbox", [])).await.expect("the save ends");
+    });
+
+    let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
+
+    assert_eq!(status, 200, "{body}");
+    assert!(started.elapsed() >= Duration::from_millis(300), "it waited for the save");
+    finish.await.unwrap();
+
+    pending_save(&h, "op-2", &web).await;
+    let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": web, "target": other })).await;
+    assert_eq!((status, body["error"].as_str(), body["retryable"].as_bool()), (409, Some("saves_pending"), Some(true)), "{body}");
+}
+
+// ── Deleted projects ────────────────────────────────────────────────────────
+
+/// Registers a root, saves a memory in it and deletes the project with it,
+/// as `clawg projects delete --with-memories` does. Answers the project, the
+/// memory and the delete's number.
+async fn deleted_project(h: &Harness, root: &str) -> (String, i64, i64) {
+    let id = registered(h, root).await;
+    let row = save_in(h, &id, &format!("the notes of {root} are kept in a file")).await;
+    let (status, report) = h.post_json("/v1/projects/delete", json!({ "project_id": id, "with_memories": true })).await;
+    assert_eq!(status, 200, "{report}");
+    let (status, done) =
+        h.post_json("/v1/projects/delete", json!({ "project_id": id, "with_memories": true, "confirm": report["code"] })).await;
+    assert_eq!(status, 200, "{done}");
+    (id, row, done["delete_id"].as_i64().expect("a delete"))
+}
+
+fn listed_ids(listing: &Value) -> Vec<&str> {
+    listing["projects"].as_array().expect("projects").iter().filter_map(|p| p["id"].as_str()).collect()
+}
+
+#[tokio::test]
+async fn deleting_through_the_daemon_takes_two_steps() {
+    let h = Harness::start().await;
+    let (gone, empty) = (registered(&h, "/work/gone").await, registered(&h, "/work/empty").await);
+    save_in(&h, &gone, "the notes of gone are kept in a file").await;
+
+    let (status, refused) = h.post_json("/v1/projects/delete", json!({ "project_id": gone })).await;
+    assert_eq!((status, refused["refused"].as_str(), refused["live"]["memories"].as_i64()), (200, Some("not_empty"), Some(1)), "{refused}");
+    assert_eq!(refused["delete_id"], Value::Null);
+    assert!(listed_ids(&h.get_json("/v1/projects").await.1).contains(&gone.as_str()), "nothing was written");
+
+    let (status, report) = h.post_json("/v1/projects/delete", json!({ "project_id": gone, "with_memories": true })).await;
+    assert_eq!(status, 200, "{report}");
+    let code = report["code"].as_str().expect("a code").to_string();
+    assert_eq!((&report["refused"], &report["delete_id"]), (&Value::Null, &Value::Null), "{report}");
+
+    save_in(&h, &gone, "a save between the two steps").await;
+    let (status, stale) =
+        h.post_json("/v1/projects/delete", json!({ "project_id": gone, "with_memories": true, "confirm": code })).await;
+    assert_eq!((status, stale["refused"].as_str(), stale["live"]["memories"].as_i64()), (200, Some("code_changed"), Some(2)), "{stale}");
+    let fresh = stale["code"].as_str().expect("the new code").to_string();
+    assert_ne!(fresh, code);
+    assert!(listed_ids(&h.get_json("/v1/projects").await.1).contains(&gone.as_str()), "a stale code writes nothing");
+
+    let (status, done) =
+        h.post_json("/v1/projects/delete", json!({ "project_id": gone, "with_memories": true, "confirm": fresh })).await;
+    assert_eq!(status, 200, "{done}");
+    assert!(done["delete_id"].as_i64().is_some() && done["snapshot"].as_str().is_some_and(|s| s.contains("pre-delete")), "{done}");
+    let (_, listing) = h.get_json("/v1/projects").await;
+    assert!(!listed_ids(&listing).contains(&gone.as_str()), "{listing}");
+    let deletes = listing["deletes"].as_array().expect("deletes");
+    assert_eq!((deletes.len(), &deletes[0]["project_id"], &deletes[0]["rows"], &deletes[0]["back"]), (1, &json!(gone), &json!(2), &json!(false)), "{listing}");
+
+    let (status, empty_done) = h.post_json("/v1/projects/delete", json!({ "project_id": empty })).await;
+    assert_eq!(status, 200, "{empty_done}");
+    assert!(empty_done["delete_id"].as_i64().is_some() && empty_done["refused"].is_null(), "{empty_done}");
+
+    let again = h.post_json("/v1/projects/delete", json!({ "project_id": gone })).await;
+    assert_eq!((again.0, again.1["error"].as_str()), (409, Some("project_deleted")), "{}", again.1);
+    assert!(again.1["detail"].as_str().is_some_and(|d| d.contains("--undo")), "{}", again.1);
+    let shapes = [
+        (json!({}), 400),
+        (json!({ "undo": 1, "project_id": gone }), 400),
+        (json!({ "project_id": gone, "dry_run": true }), 400),
+        (json!({ "project_id": "app-aaaa", "confirm": "abcd1234" }), 400),
+        (json!({ "project_id": "nowhere-9f9f" }), 404),
+        (json!({ "undo": 99 }), 404),
+    ];
+    for (body, want) in shapes {
+        let (status, answer) = h.post_json("/v1/projects/delete", body.clone()).await;
+        assert_eq!(status, want, "{body}: {answer}");
+    }
+    let (status, undone) = h.post_json("/v1/projects/delete", json!({ "undo": done["delete_id"] })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert_eq!(undone["restored"]["memories"], json!(2), "{undone}");
+    let (status, twice) = h.post_json("/v1/projects/delete", json!({ "undo": done["delete_id"] })).await;
+    assert_eq!((status, twice["error"].as_str()), (409, Some("delete_undone")), "{twice}");
+}
+
+#[tokio::test]
+async fn undoing_a_delete_needs_the_model() {
+    let h = Harness::start_serving_without_embedder().await;
+    // Saves are taken while the model reads as not loaded, only answered 202.
+    let gone = registered(&h, "/work/gone").await;
+    h.post_json("/v1/memories", json!({ "content": CONTENT, "agent_id": "agent-http", "project_id": gone })).await;
+    h.wait_for_rows("memory", 1).await;
+    let (_, report) = h.post_json("/v1/projects/delete", json!({ "project_id": gone, "with_memories": true })).await;
+    let confirm = json!({ "project_id": gone, "with_memories": true, "confirm": report["code"] });
+    let (status, done) = h.post_json("/v1/projects/delete", confirm).await;
+    assert_eq!(status, 200, "{done}");
+    let with_rows = done["delete_id"].as_i64().expect("a delete");
+    let empty = registered(&h, "/work/empty").await;
+    let (_, emptied) = h.post_json("/v1/projects/delete", json!({ "project_id": empty })).await;
+
+    let (status, body) = h.post_json("/v1/projects/delete", json!({ "undo": with_rows })).await;
+    assert_eq!((status, body["error"].as_str()), (503, Some("embedder_not_ready")), "{body}");
+    let (_, listing) = h.get_json("/v1/projects").await;
+    assert_eq!(listing["deletes"].as_array().map(Vec::len), Some(2), "the refused undo left the delete open");
+
+    let (status, dry) = h.post_json("/v1/projects/delete", json!({ "undo": with_rows, "dry_run": true })).await;
+    assert_eq!((status, dry["dry_run"].as_bool(), dry["restored"]["memories"].as_i64()), (200, Some(true), Some(1)), "{dry}");
+    let (status, undone) = h.post_json("/v1/projects/delete", json!({ "undo": emptied["delete_id"] })).await;
+    assert_eq!(status, 200, "an undo with nothing to restore needs no model: {undone}");
+    assert!(undone["snapshot"].as_str().is_some_and(|s| s.contains("pre-undo")), "{undone}");
+}
+
+#[tokio::test]
+async fn a_bridge_opened_before_a_delete_brings_its_project_back() {
+    let h = Harness::start().await;
+    // What the bridge registered at its start, and keeps.
+    let (gone, old, delete_id) = deleted_project(&h, "/work/gone").await;
+
+    let late = save_in(&h, &gone, "a note from a bridge opened before the delete").await;
+
+    assert_eq!(project_of(&h, late).await, json!(gone));
+    let (_, listing) = h.get_json("/v1/projects").await;
+    let back = listing["projects"].as_array().unwrap().iter().find(|p| p["id"] == json!(gone)).expect("listed again");
+    assert_eq!((&back["reviewed"], &back["memories"]), (&json!(false), &json!(1)), "{listing}");
+    let deletes = listing["deletes"].as_array().unwrap();
+    assert_eq!((&deletes[0]["delete_id"], &deletes[0]["back"]), (&json!(delete_id), &json!(true)), "{listing}");
+    let (_, row) = h.get_json(&format!("/v1/memories/memory/{old}")).await;
+    assert!(row["item"]["deleted_at"].as_i64().is_some() || row["item"].is_null(), "what the delete deleted stays deleted: {row}");
+    let live = h.get_json(&format!("/v1/memories?project={gone}")).await.1;
+    assert_eq!(ids_in(&live["items"]), vec![late], "{live}");
+}
+
+#[tokio::test]
+async fn every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule() {
+    let h = Harness::start().await;
+    let other = registered(&h, "/work/other").await;
+    let on_other = save_in(&h, &other, "the other service is written in Go").await;
+    let refused = |route: &str, status: u16, body: &Value| {
+        assert_eq!((status, body["error"].as_str()), (409, Some("project_deleted")), "{route}: {body}");
+        assert!(body["detail"].as_str().is_some_and(|d| d.contains("--undo")), "{route}: {body}");
+    };
+    let still_deleted = |id: String| {
+        let h = &h;
+        async move {
+            let (_, listing) = h.get_json("/v1/projects").await;
+            assert!(!listed_ids(&listing).contains(&id.as_str()), "{id} was brought back by what only reads it: {listing}");
+        }
+    };
+
+    for (method, path, field) in PROJECT_INPUTS {
+        let Some(field) = field else { continue };
+        let route = format!("{method} {path} ({field})");
+        let root = format!("/work/{}", route.replace(|c: char| !c.is_alphanumeric(), "-"));
+        let (gone, gone_row, _) = deleted_project(&h, &root).await;
+        match (*method, *path) {
+            ("POST", "/memories") => {
+                let id = save_in(&h, &gone, "a note saved after the delete").await;
+                assert_eq!(project_of(&h, id).await, json!(gone), "{route}");
+                let (_, listing) = h.get_json("/v1/projects").await;
+                assert!(listed_ids(&listing).contains(&gone.as_str()), "{route}: a save brings it back");
+                continue;
+            }
+            ("GET", "/memories") => {
+                let (status, body) = h.get_json(&format!("/v1/memories?project={gone}")).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(ids_in(&body["items"]).is_empty(), "{route}: {body}");
+            }
+            ("POST", "/memories/move") => {
+                let (status, body) = h.post_json("/v1/memories/move", json!({ "ids": [on_other], "to_project": gone })).await;
+                refused(&route, status, &body);
+                let from = json!({ "from_project": gone, "include_deleted": true, "to_project": other });
+                let (status, body) = h.post_json("/v1/memories/move", from).await;
+                assert_eq!(status, 200, "{route}: its deleted rows can be taken out: {body}");
+                assert_eq!(project_of(&h, gone_row).await, json!(other), "{route}");
+            }
+            ("POST", "/search") => {
+                let ask = json!({ "agent_id": "agent-http", "query": "notes kept in a file", "project_id": gone });
+                let (status, body) = h.post_json("/v1/search", ask).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(!ids_in(&body["hits"]).contains(&gone_row), "{route}: {body}");
+            }
+            ("POST", "/context") => {
+                let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "agent-http", "project_id": gone })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(body["prompt"].as_str().is_some_and(|p| !p.contains("kept in a file")), "{route}: {body}");
+            }
+            ("POST", "/sessions") => {
+                let (status, body) = h
+                    .post_json("/v1/sessions", json!({ "agent_id": "agent-http", "project_id": gone, "session_id": "s-gone" }))
+                    .await;
+                assert_eq!(status, 204, "{route}: {body}");
+            }
+            ("PATCH", "/memories/{kind}/{id}") => {
+                let (status, body) = patch(&h, on_other, json!({ "project_id": gone })).await;
+                refused(&route, status, &body);
+                assert_eq!(project_of(&h, on_other).await, json!(other), "{route}");
+            }
+            ("GET", "/disputes") => {
+                let (status, body) = h.get_json(&format!("/v1/disputes?agent_id=agent-http&project_id={gone}")).await;
+                assert_eq!(status, 200, "{route}: {body}");
+            }
+            ("POST", "/synthesis") => {
+                let (status, body) = h.post_json("/v1/synthesis", json!({ "project_id": gone })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(!ids_in(&body["pending"]).contains(&gone_row), "{route}: {body}");
+            }
+            ("GET", "/stats") => {
+                let (status, body) = h.get_json(&format!("/v1/stats?project={gone}")).await;
+                assert_eq!(status, 200, "{route}: {body}");
+            }
+            ("PATCH", "/projects/{id}") => {
+                let (status, body) = h.rename(&gone, "Gone").await;
+                refused(&route, status, &body);
+            }
+            ("POST", "/projects/merge") => {
+                for body in [json!({ "source": other, "target": gone }), json!({ "source": gone, "target": other })] {
+                    let (status, answer) = h.post_json("/v1/projects/merge", body).await;
+                    refused(&route, status, &answer);
+                }
+                // The undo of a merge whose target was deleted since.
+                let (a, b) = (registered(&h, &format!("{root}-a")).await, registered(&h, &format!("{root}-b")).await);
+                save_in(&h, &a, "a note of a project merged and then deleted").await;
+                let (_, merged) = h.post_json("/v1/projects/merge", json!({ "source": a, "target": b })).await;
+                let (_, report) = h.post_json("/v1/projects/delete", json!({ "project_id": b, "with_memories": true })).await;
+                h.post_json("/v1/projects/delete", json!({ "project_id": b, "with_memories": true, "confirm": report["code"] })).await;
+                let (status, answer) = h.post_json("/v1/projects/merge", json!({ "undo": merged["merge_id"] })).await;
+                refused(&route, status, &answer);
+            }
+            ("POST", "/projects/keep-apart") => {
+                for body in [json!({ "project_id": gone, "other_id": other }), json!({ "project_id": other, "other_id": gone })] {
+                    let (status, answer) = h.post_json("/v1/projects/keep-apart", body).await;
+                    refused(&route, status, &answer);
+                }
+            }
+            ("POST", "/projects/delete") => {
+                for body in [json!({ "project_id": gone }), json!({ "project_id": gone, "with_memories": true })] {
+                    let (status, answer) = h.post_json("/v1/projects/delete", body).await;
+                    refused(&route, status, &answer);
+                }
+            }
+            ("POST", "/projects/resolve") => {
+                let (status, body) = h.post_json("/v1/projects/resolve", json!({ "project": gone, "create": true })).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert_eq!((body["project_id"].as_str(), body["deleted"].as_bool()), (Some(gone.as_str()), Some(true)), "{route}: {body}");
+            }
+            ("POST", "/projects/suggestions/answer") => {
+                for (one, two) in [(&gone, &other), (&other, &gone)] {
+                    let answer = json!({ "project_id": one, "other_id": two, "answer": "apart", "user_answered": true, "reason": "two things" });
+                    let (status, body) = h.post_json("/v1/projects/suggestions/answer", answer).await;
+                    refused(&route, status, &body);
+                }
+            }
+            ("POST", "/projects/locate") => {
+                let folder = tempfile::tempdir().expect("tempdir");
+                let (status, body) =
+                    h.post_json("/v1/projects/locate", json!({ "project": gone, "root_path": folder.path().to_string_lossy() })).await;
+                refused(&route, status, &body);
+                let sub = checkout_with(folder.path(), "apps/web");
+                let ask = json!({ "project": gone, "root_path": sub.to_string_lossy(), "subfolder": true });
+                let (status, body) = h.post_json("/v1/projects/locate", ask).await;
+                refused(&route, status, &body);
+            }
+            ("POST", "/import") => {
+                h.ctx.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+                let text = engram_export(vec![observation("deleted-map", Some("notes"), "Port", "a note for a deleted project")]);
+                for dry_run in [true, false] {
+                    let ask = json!({ "text": text, "from": "engram", "dry_run": dry_run, "project_map": [["notes", { "project": gone }]] });
+                    let (status, body) = h.post_json("/v1/import", ask).await;
+                    refused(&route, status, &body);
+                }
+            }
+            _ => panic!("{route} takes a project and no check here says what it does with a deleted one"),
+        }
+        still_deleted(gone).await;
+    }
+}
+
+// ── projects by name, their suggestions and their folders ───────────────────
+
+async fn resolve(h: &Harness, ask: Value) -> Value {
+    let (status, body) = h.post_json("/v1/projects/resolve", ask).await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn a_reference_resolves_through_the_daemon() {
+    let h = Harness::start().await;
+    let app = registered(&h, "/work/mi-app").await;
+
+    let similar = resolve(&h, json!({ "project": "Mi App", "create": true })).await;
+    assert_eq!((similar["refused"].as_str(), similar["candidates"][0]["id"].as_str()), (Some("similar"), Some(app.as_str())), "{similar}");
+    let unknown = resolve(&h, json!({ "project": "ideas de producto" })).await;
+    assert_eq!(unknown["refused"].as_str(), Some("unknown"), "{unknown}");
+
+    let created = resolve(&h, json!({ "project": "ideas de producto", "create": true })).await;
+    let ideas = created["project_id"].as_str().expect("created").to_string();
+    assert_eq!((created["created"].as_bool(), created["folders"].as_array().map(Vec::len)), (Some(true), Some(0)), "{created}");
+    let row = save_in(&h, &ideas, "a pricing page for teams").await;
+    assert_eq!(project_of(&h, row).await, json!(ideas));
+    let (_, listing) = h.get_json("/v1/projects").await;
+    let listed = listing["projects"].as_array().unwrap().iter().find(|p| p["id"] == json!(ideas)).cloned().expect("listed");
+    assert_eq!((listed["name"].as_str(), listed["born"].as_str(), listed["reviewed"].as_bool()), (Some("ideas de producto"), Some("agent"), Some(false)));
+
+    let user = resolve(&h, json!({ "project": "Roadmap", "create": true, "born": "user" })).await;
+    assert_eq!(user["created"].as_bool(), Some(true), "{user}");
+    let (status, body) = h.post_json("/v1/projects/resolve", json!({ "project": "  " })).await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = h.post_json("/v1/projects/resolve", json!({ "project": "x", "new_project": true })).await;
+    assert_eq!(status, 400, "new_project goes with create: {body}");
+}
+
+#[tokio::test]
+async fn a_move_and_a_patch_take_a_project_by_name() {
+    let h = Harness::start().await;
+    let (app, web) = (registered(&h, "/work/app").await, registered(&h, "/work/web").await);
+    let row = save_in(&h, &app, "the parser of app is written by hand").await;
+    let other = save_in(&h, &app, "the lexer of app is generated").await;
+
+    let (status, body) = h.post_json("/v1/memories/move", json!({ "ids": [row], "to_project": "WEB" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(project_of(&h, row).await, json!(web));
+    let (status, body) = patch(&h, other, json!({ "project_id": "web" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(project_of(&h, other).await, json!(web));
+    let (status, body) = h.post_json("/v1/memories/move", json!({ "ids": [row], "to_project": "nothing here" })).await;
+    assert_eq!(status, 404, "{body}");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("nothing here")), "{body}");
+}
+
+#[tokio::test]
+async fn a_name_two_projects_hold_is_refused_as_a_target() {
+    let h = Harness::start().await;
+    let (one, two) = (registered(&h, "/work/a/api").await, registered(&h, "/work/b/api").await);
+    let row = save_in(&h, &one, "the api of a answers in json").await;
+
+    let (status, body) = h.post_json("/v1/memories/move", json!({ "ids": [row], "to_project": "api" })).await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("project_ambiguous")), "{body}");
+    assert!(body["detail"].as_str().is_some_and(|d| d.contains(&one) && d.contains(&two)), "{body}");
+    let (status, body) = patch(&h, row, json!({ "project_id": "api" })).await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("project_ambiguous")), "{body}");
+    assert_eq!(project_of(&h, row).await, json!(one), "nothing moved");
+}
+
+/// Leaves a pending suggestion that `a` and `b` may be one project.
+async fn suggest(h: &Harness, a: &str, b: &str) {
+    let (a, b) = (a.to_string(), b.to_string());
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES (?1, ?2, 'root_commit', 1)",
+                [a, b],
+            )
+        })
+        .await
+        .expect("a suggestion");
+}
+
+async fn context_suggestions(h: &Harness, project: &str) -> Value {
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "agent-http", "project_id": project })).await;
+    assert_eq!(status, 200, "{body}");
+    body["suggestions"].clone()
+}
+
+#[tokio::test]
+async fn the_context_names_the_pending_suggestions_of_its_project() {
+    let h = Harness::start().await;
+    let (app, copy, other) = (registered(&h, "/work/app").await, registered(&h, "/work/copia").await, registered(&h, "/work/other").await);
+    suggest(&h, &copy, &app).await;
+
+    let named = context_suggestions(&h, &app).await;
+    assert_eq!(named[0]["other_id"].as_str(), Some(copy.as_str()), "{named}");
+    assert_eq!((named[0]["other_name"].as_str(), named[0]["reason"].as_str()), (Some("copia"), Some("root_commit")), "{named}");
+    assert_eq!(context_suggestions(&h, &copy).await[0]["other_id"].as_str(), Some(app.as_str()));
+    assert_eq!(context_suggestions(&h, &other).await, Value::Null, "none is left out");
+    let (_, query) = h.post_json("/v1/context", json!({ "agent_id": "agent-http", "project_id": app, "query": "the parser" })).await;
+    assert_eq!(query["suggestions"][0]["other_id"].as_str(), Some(copy.as_str()), "with a query too: {query}");
+}
+
+fn answer(project: &str, other: &str, answer: &str) -> Value {
+    json!({ "project_id": project, "other_id": other, "answer": answer, "user_answered": true, "reason": "they said so" })
+}
+
+#[tokio::test]
+async fn answering_a_suggestion_needs_the_users_answer() {
+    let h = Harness::start().await;
+    let (app, copy) = (registered(&h, "/work/app").await, registered(&h, "/work/copia").await);
+    suggest(&h, &copy, &app).await;
+
+    let asks = [
+        json!({ "project_id": app, "other_id": copy, "answer": "apart", "reason": "they said so" }),
+        json!({ "project_id": app, "other_id": copy, "answer": "apart", "user_answered": true }),
+        json!({ "project_id": app, "other_id": copy, "answer": "apart", "user_answered": true, "reason": "  " }),
+        json!({ "project_id": app, "other_id": copy, "answer": "maybe", "user_answered": true, "reason": "they said so" }),
+    ];
+    for ask in asks {
+        let (status, body) = h.post_json("/v1/projects/suggestions/answer", ask.clone()).await;
+        assert_eq!(status, 400, "{ask}: {body}");
+    }
+    assert_eq!(context_suggestions(&h, &app).await[0]["other_id"].as_str(), Some(copy.as_str()), "still pending");
+}
+
+#[tokio::test]
+async fn answering_apart_keeps_the_pair_from_coming_back() {
+    let h = Harness::start().await;
+    let (app, copy) = (registered(&h, "/work/app").await, registered(&h, "/work/copia").await);
+    suggest(&h, &copy, &app).await;
+
+    let (status, body) = h.post_json("/v1/projects/suggestions/answer", answer(&app, &copy, "apart")).await;
+
+    assert_eq!((status, body["answer"].as_str()), (200, Some("apart")), "{body}");
+    assert_eq!(context_suggestions(&h, &app).await, Value::Null);
+    let (status, body) = h.post_json("/v1/projects/suggestions/answer", answer(&app, &copy, "apart")).await;
+    assert_eq!((status, body["error"].as_str()), (404, Some("no_suggestion")), "answered once: {body}");
+}
+
+#[tokio::test]
+async fn answering_merge_merges_and_is_undone() {
+    let h = Harness::start().await;
+    let (app, copy) = (registered(&h, "/work/app").await, registered(&h, "/work/copia").await);
+    let row = save_in(&h, &copy, "the copy keeps its own config").await;
+    suggest(&h, &copy, &app).await;
+
+    let (status, body) = h.post_json("/v1/projects/suggestions/answer", answer(&app, &copy, "merge")).await;
+
+    assert_eq!((status, body["answer"].as_str()), (200, Some("merge")), "{body}");
+    assert_eq!(project_of(&h, row).await, json!(app), "the other goes into the project");
+    let merge_id = body["merge"]["merge_id"].as_i64().expect("a merge");
+    assert_eq!(context_suggestions(&h, &app).await, Value::Null, "a merge answers it");
+    let (status, undone) = h.post_json("/v1/projects/merge", json!({ "undo": merge_id })).await;
+    assert_eq!(status, 200, "{undone}");
+    assert_eq!(project_of(&h, row).await, json!(copy));
+}
+
+#[tokio::test]
+async fn answering_without_a_pending_suggestion_is_404() {
+    let h = Harness::start().await;
+    let (app, web) = (registered(&h, "/work/app").await, registered(&h, "/work/web").await);
+
+    for ask in [answer(&app, &web, "merge"), answer(&app, "nobody-0000", "apart")] {
+        let (status, body) = h.post_json("/v1/projects/suggestions/answer", ask.clone()).await;
+        assert_eq!(status, 404, "{ask}: {body}");
+    }
+    let (_, listing) = h.get_json("/v1/projects").await;
+    assert!(listed_ids(&listing).contains(&web.as_str()), "nothing was merged");
+}
+
+async fn registered_dir(h: &Harness, root: &std::path::Path) -> Value {
+    let (status, body) = h.post_json("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true })).await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn locating_a_folder_merges_its_own_project_into_the_named_one() {
+    let h = Harness::start().await;
+    let ideas = resolve(&h, json!({ "project": "ideas", "create": true })).await["project_id"].as_str().unwrap().to_string();
+    let base = tempfile::tempdir().expect("tempdir");
+    let notes = base.path().join("notes");
+    std::fs::create_dir(&notes).expect("a folder");
+    let own = registered_dir(&h, &notes).await["project_id"].as_str().unwrap().to_string();
+    let row = save_in(&h, &own, "the notes of the week").await;
+
+    let ask = json!({ "project": "Ideas", "root_path": notes.to_string_lossy() });
+    let (status, body) = h.post_json("/v1/projects/locate", ask.clone()).await;
+
+    assert_eq!((status, body["project_id"].as_str(), body["already"].as_bool()), (200, Some(ideas.as_str()), Some(false)), "{body}");
+    assert!(body["merge"]["merge_id"].as_i64().is_some(), "{body}");
+    assert_eq!(project_of(&h, row).await, json!(ideas));
+    assert_eq!(registered_dir(&h, &notes).await["project_id"].as_str(), Some(ideas.as_str()), "the folder leads to it now");
+    let (status, again) = h.post_json("/v1/projects/locate", ask).await;
+    assert_eq!((status, again["already"].as_bool()), (200, Some(true)), "{again}");
+    let (status, body) =
+        h.post_json("/v1/projects/locate", json!({ "project": "nothing here", "root_path": notes.to_string_lossy() })).await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = h.post_json("/v1/projects/locate", json!({ "project": "ideas", "root_path": "/no/such/dir" })).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn a_folder_shared_by_its_project_is_not_located() {
+    let h = Harness::start().await;
+    resolve(&h, json!({ "project": "ideas", "create": true })).await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let (one, two) = (base.path().join("one"), base.path().join("two"));
+    std::fs::create_dir(&one).expect("a folder");
+    std::fs::create_dir(&two).expect("a folder");
+    let own = registered_dir(&h, &one).await["project_id"].as_str().unwrap().to_string();
+    // A second folder of the same project, as a clone or a move leaves it.
+    let shared = registered_dir(&h, &two).await["root_id"].as_str().unwrap().to_string();
+    let (own2, shared2) = (own.clone(), shared.clone());
+    h.ctx
+        .runtime
+        .store
+        .conn
+        .call(move |c| c.execute("UPDATE project_path SET project_id = ?1 WHERE id = ?2", [own2, shared2]))
+        .await
+        .expect("share the project");
+
+    let (status, body) = h.post_json("/v1/projects/locate", json!({ "project": "ideas", "root_path": one.to_string_lossy() })).await;
+
+    assert_eq!((status, body["error"].as_str()), (409, Some("folder_shared")), "{body}");
+    assert!(body["detail"].as_str().is_some_and(|d| d.contains(&own) && d.contains("projects merge")), "{body}");
+}
+
+#[tokio::test]
+async fn a_folder_without_vcs_moved_is_suggested_and_shown_until_answered() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let (old, moved) = (base.path().join("notas"), base.path().join("archivo").join("notas"));
+    std::fs::create_dir(&old).expect("a folder");
+    let before = registered_dir(&h, &old).await["project_id"].as_str().unwrap().to_string();
+    save_in(&h, &before, "the notes of the week").await;
+    std::fs::create_dir(moved.parent().unwrap()).expect("a folder");
+    std::fs::rename(&old, &moved).expect("move the folder");
+
+    let after = registered_dir(&h, &moved).await["project_id"].as_str().unwrap().to_string();
+
+    assert_ne!(after, before, "a name alone does not join them");
+    let shown = context_suggestions(&h, &after).await;
+    assert_eq!((shown[0]["other_id"].as_str(), shown[0]["reason"].as_str()), (Some(before.as_str()), Some("folder_name")), "{shown}");
+    let (status, body) = h.post_json("/v1/projects/suggestions/answer", answer(&after, &before, "apart")).await;
+    assert_eq!(status, 200, "{body}");
+    registered_dir(&h, &moved).await;
+    assert_eq!(context_suggestions(&h, &after).await, Value::Null, "answered for good");
+}
+
+// ── the subfolders of a monorepo ────────────────────────────────────────────
+
+/// `dir` as a checkout (a `.git` directory, which is all a root needs) with
+/// `subpath` inside it, by its canonical name.
+fn checkout_with(dir: &std::path::Path, subpath: &str) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir.join(".git")).expect("a .git");
+    let sub = dir.join(subpath);
+    std::fs::create_dir_all(&sub).expect("the subfolder");
+    canonical(&sub)
+}
+
+fn canonical(path: &std::path::Path) -> std::path::PathBuf {
+    clawg_core::memory::identity::strip_verbatim(&std::fs::canonicalize(path).expect("canonicalize"))
+}
+
+async fn register_from(h: &Harness, root: &std::path::Path, path: &std::path::Path) -> Value {
+    let ask = json!({ "root_path": root.to_string_lossy(), "assigned": true, "path": path.to_string_lossy() });
+    let (status, body) = h.post_json("/v1/projects", ask).await;
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+async fn locate_subfolder(h: &Harness, project: &str, path: &std::path::Path) -> (u16, Value) {
+    h.post_json("/v1/projects/locate", json!({ "project": project, "root_path": path.to_string_lossy(), "subfolder": true })).await
+}
+
+#[tokio::test]
+async fn a_registration_without_a_path_or_with_one_elsewhere_answers_as_before() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let a = checkout_with(&base.path().join("a"), "src").parent().unwrap().to_path_buf();
+    let b_src = checkout_with(&base.path().join("b"), "src");
+    let plain = base.path().join("plain");
+    std::fs::create_dir(&plain).expect("a folder");
+    let before = registered_dir(&h, &a).await;
+
+    for path in [b_src.clone(), canonical(&plain), std::path::PathBuf::from("src"), a.join("src")] {
+        assert_eq!(register_from(&h, &a, &path).await, before, "{}", path.display());
+    }
+    let derived = json!({ "root_path": a.to_string_lossy(), "path": a.join("src").to_string_lossy() });
+    let (status, body) = h.post_json("/v1/projects", derived).await;
+    let (_, without) = h.post_json("/v1/projects", json!({ "root_path": a.to_string_lossy() })).await;
+    assert_eq!((status, body), (200, without), "a caller that derives its id ignores the path");
+}
+
+#[tokio::test]
+async fn a_declared_subfolder_takes_what_is_saved_inside_it_in_every_clone() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let base = canonical(base.path());
+    git(&base, &["init", "monorepo"]);
+    let mono = base.join("monorepo");
+    git(&mono, &["remote", "add", "origin", "https://github.com/acme/monorepo.git"]);
+    git(&mono, &["commit", "--allow-empty", "-m", "first"]);
+    git(&base, &["clone", "monorepo", "elsewhere"]);
+    let clone = base.join("elsewhere");
+    git(&clone, &["remote", "set-url", "origin", "https://github.com/acme/monorepo.git"]);
+    for root in [&mono, &clone] {
+        for sub in ["apps/web/src", "apps/webapp"] {
+            std::fs::create_dir_all(root.join(sub)).expect("the subfolders");
+        }
+    }
+    let m = registered_dir(&h, &mono).await["project_id"].as_str().unwrap().to_string();
+    let web = resolve(&h, json!({ "project": "web", "create": true })).await["project_id"].as_str().unwrap().to_string();
+
+    let (status, declared) = locate_subfolder(&h, "web", &mono.join("apps").join("web")).await;
+    assert_eq!(status, 200, "{declared}");
+    assert_eq!((declared["project_id"].as_str(), declared["repository_id"].as_str()), (Some(web.as_str()), Some(m.as_str())), "{declared}");
+    assert_eq!(declared["subpath"].as_str(), Some("apps/web"), "{declared}");
+
+    let inside = register_from(&h, &mono, &mono.join("apps").join("web").join("src")).await;
+    assert_eq!(inside["project_id"].as_str(), Some(web.as_str()), "{inside}");
+    let row = save_in(&h, inside["project_id"].as_str().unwrap(), "the web app renders on the server").await;
+    assert_eq!(project_of(&h, row).await, json!(web));
+    assert_eq!(register_from(&h, &mono, &mono).await["project_id"].as_str(), Some(m.as_str()));
+    assert_eq!(register_from(&h, &mono, &mono.join("apps").join("webapp")).await["project_id"].as_str(), Some(m.as_str()));
+    assert_eq!(inside["root_id"], registered_dir(&h, &mono).await["root_id"], "the root keeps its own id");
+
+    let cloned = register_from(&h, &clone, &clone.join("apps").join("web").join("src")).await;
+    assert_eq!(cloned["project_id"].as_str(), Some(web.as_str()), "a clone of the remote reaches it: {cloned}");
+    assert_eq!(register_from(&h, &clone, &clone).await["project_id"].as_str(), Some(m.as_str()));
+}
+
+#[tokio::test]
+async fn a_subfolder_is_declared_through_the_daemon_and_refused_at_a_root() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let web_dir = checkout_with(&base.path().join("mono"), "apps/web");
+    let mono = web_dir.parent().unwrap().parent().unwrap().to_path_buf();
+    let plain = base.path().join("plain");
+    std::fs::create_dir(&plain).expect("a folder");
+    resolve(&h, json!({ "project": "web", "create": true })).await;
+    let m = registered_dir(&h, &mono).await["project_id"].as_str().unwrap().to_string();
+
+    for refused in [mono.clone(), canonical(&plain), base.path().join("no-such-dir")] {
+        let (status, body) = locate_subfolder(&h, "web", &refused).await;
+        assert_eq!(status, 400, "{}: {body}", refused.display());
+    }
+    let (status, body) = locate_subfolder(&h, "web", &mono).await;
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("without `subfolder`")), "{status} {body}");
+    let (status, body) = locate_subfolder(&h, "nothing here", &web_dir).await;
+    assert_eq!(status, 404, "{body}");
+
+    let (status, declared) = locate_subfolder(&h, "web", &web_dir).await;
+    assert_eq!((status, declared["already"].as_bool(), declared["removed"].as_bool()), (200, Some(false), Some(false)), "{declared}");
+    let (_, again) = locate_subfolder(&h, "web", &web_dir).await;
+    assert_eq!(again["already"].as_bool(), Some(true), "{again}");
+    let (_, listing) = h.get_json("/v1/projects").await;
+    let web = listing["projects"].as_array().unwrap().iter().find(|p| p["name"] == "web").unwrap().clone();
+    let shown = &web["subfolders"][0];
+    assert_eq!((shown["repository_id"].as_str(), shown["subpath"].as_str()), (Some(m.as_str()), Some("apps/web")), "{web}");
+    assert_eq!(shown["paths"][0]["present"].as_bool(), Some(true), "{web}");
+
+    let (status, removed) = locate_subfolder(&h, &m, &web_dir).await;
+    assert_eq!((status, removed["removed"].as_bool(), removed["project_id"].as_str()), (200, Some(true), Some(m.as_str())), "{removed}");
+    assert_eq!(register_from(&h, &mono, &web_dir).await["project_id"].as_str(), Some(m.as_str()), "it leads to the repository again");
 }

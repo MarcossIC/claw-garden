@@ -11,7 +11,7 @@ use clawg_core::memory::sharing;
 use clawg_core::paths::{Profile, ProfileError};
 use clawg_core::preferences::Lang;
 
-use crate::client::MoveRequest;
+use crate::client::{DeleteRequest, MergeRequest, MoveRequest};
 
 /// `clawg` — local-first memory for coding agents.
 #[derive(Debug, Parser)]
@@ -135,10 +135,12 @@ pub enum Command {
         #[arg(long = "map-root", value_name = "OLD=NEW", value_parser = parse_root_map)]
         map_root: Vec<RootMap>,
         /// Store the notes of the other tool's project NAME in the project
-        /// the directory PATH is in. Repeat it for each project; the notes of
-        /// a project not named are stored in none, and `clawg projects move
-        /// --origin-project NAME` places them later.
-        #[arg(long = "project-map", value_name = "NAME=PATH", value_parser = parse_project_map)]
+        /// the directory PATH is in, a declared subfolder's when PATH is in
+        /// one, or with `NAME=project:REF` in the project REF, by id or by
+        /// the name of one live project. Repeat it for each project; the
+        /// notes of a project not named are stored in none, and `clawg
+        /// projects move --origin-project NAME` places them later.
+        #[arg(long = "project-map", value_name = "NAME=PATH|NAME=project:REF", value_parser = parse_project_map)]
         project_map: Vec<ProjectMap>,
         #[command(flatten)]
         profile: ProfileArg,
@@ -158,12 +160,19 @@ pub enum Command {
         profile: ProfileArg,
     },
     /// Remove one stored memory for good: its text, its vector and its index
-    /// terms. There is no way back, so it needs `--yes`. The daemon must be
+    /// terms, or, with `--project-delete N`, every row that delete N left
+    /// deleted. There is no way back, so it needs `--yes`. The daemon must be
     /// stopped.
     Purge {
         /// The memory's id, as `clawg secrets` or `clawg memories` show it.
-        id: i64,
-        /// Confirm that the memory is to be removed for good.
+        #[arg(required_unless_present = "project_delete", conflicts_with = "project_delete")]
+        id: Option<i64>,
+        /// Remove for good every row of project delete N that is still
+        /// deleted, as `clawg projects delete` and `clawg projects list` show
+        /// its number, instead of one memory.
+        #[arg(long, value_name = "N")]
+        project_delete: Option<i64>,
+        /// Confirm that it is to be removed for good.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
@@ -220,8 +229,9 @@ pub enum Command {
         #[command(flatten)]
         profile: ProfileArg,
     },
-    /// Let the daemon read a project's files besides the one each bridge is
-    /// started in. Needs a running daemon.
+    /// List and name the projects, let the daemon read a project's files
+    /// besides the one each bridge is started in, and move memories between
+    /// them. Needs a running daemon.
     Projects {
         #[command(subcommand)]
         action: ProjectsAction,
@@ -318,22 +328,36 @@ impl ImportSource {
     }
 }
 
-/// A project name of another tool and the directory whose project takes its
-/// notes.
+/// A project name of another tool and where its notes go here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectMap {
     pub name: String,
-    pub root: PathBuf,
+    pub to: MapTo,
 }
 
-/// `NAME=PATH`, split at the last `=`: a project name may hold one, a path
-/// here does not.
+/// The project a `--project-map` sends notes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapTo {
+    /// The project of the directory, or of the declared subfolder it is in.
+    Path(PathBuf),
+    /// A project by id or by name.
+    Project(String),
+}
+
+/// `NAME=project:REF` split at the last `=project:`, else `NAME=PATH` split
+/// at the last `=`: a project name may hold one, a path here does not. A
+/// path that holds `=project:` is written from `./`.
 fn parse_project_map(raw: &str) -> Result<ProjectMap, String> {
+    if let Some((name, reference)) = raw.rsplit_once("=project:") {
+        if !name.is_empty() && !reference.trim().is_empty() {
+            return Ok(ProjectMap { name: name.to_string(), to: MapTo::Project(reference.trim().to_string()) });
+        }
+    }
     match raw.rsplit_once('=') {
         Some((name, root)) if !name.is_empty() && !root.is_empty() => {
-            Ok(ProjectMap { name: name.to_string(), root: PathBuf::from(root) })
+            Ok(ProjectMap { name: name.to_string(), to: MapTo::Path(PathBuf::from(root)) })
         }
-        _ => Err(format!("{raw:?} is not NAME=PATH")),
+        _ => Err(format!("{raw:?} is not NAME=PATH or NAME=project:REF")),
     }
 }
 
@@ -366,6 +390,52 @@ impl Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ProjectsAction {
+    /// List every project, with or without a folder: its folders, its
+    /// remotes, how many memories it holds and the suggestions nobody
+    /// answered, marking what was created on its own and not reviewed.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Give a project a name and mark it reviewed. Its id, and with it what
+    /// was saved under it, stays.
+    Rename {
+        /// The project's id, as `clawg projects list` shows it.
+        id: String,
+        /// Its new name, at most 80 characters.
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Create a project without a folder, by name, through the running
+    /// daemon. A name a live project has leads to that project; one close to
+    /// other projects' names is refused with them, unless `--new`.
+    Create {
+        /// Its name, at most 80 characters.
+        name: String,
+        /// Create it even when other projects have a close name.
+        #[arg(long)]
+        new: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Make the folder PATH is in lead to PROJECT, by id or name, through the
+    /// running daemon: the project the folder had, when this is its only
+    /// folder, is merged into PROJECT, and `clawg projects merge --undo N`
+    /// takes that back.
+    Locate {
+        /// The project, by id or by name.
+        project: String,
+        /// A directory of the folder; its root is found as for a bridge.
+        path: PathBuf,
+        /// PATH itself, a subfolder of a repository, leads to PROJECT: what is
+        /// worked on inside it, in every clone, goes there. Naming the
+        /// repository's own project takes the declaration away.
+        #[arg(long)]
+        subfolder: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Index the docs and code of the project PATH is in, so `search_project`
     /// can search it from a bridge started anywhere.
     Add {
@@ -378,6 +448,90 @@ pub enum ProjectsAction {
     /// running daemon. Each one moves with its whole save and topic history; a
     /// memory whose text or topic key is live in the target stays where it is.
     Move(MoveOpts),
+    /// Merge project SOURCE into TARGET through the running daemon: its
+    /// memories, folders, remotes and reviews go there, and SOURCE leaves the
+    /// listing while its id still leads to TARGET. `--undo N` takes merge N
+    /// back. A merge waits for the saves of both projects still being stored.
+    Merge(MergeOpts),
+    /// Delete a project through the running daemon. An empty project is
+    /// deleted at once. One with live rows is refused, with the ways to empty
+    /// it; `--with-memories` reports what deleting it with them takes and a
+    /// code, and `--with-memories --confirm CODE` deletes it. `--undo N`
+    /// takes delete N back.
+    Delete(DeleteOpts),
+    /// Answer that two projects are not one: no suggestion between them is
+    /// made again, and both are marked reviewed.
+    KeepApart {
+        /// One project's id, as `clawg projects list` shows it.
+        project_id: String,
+        /// The other's.
+        other_id: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+/// What `clawg projects merge` merges, or the merge it undoes: a source with
+/// `--into`, or `--undo`.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[command(group(clap::ArgGroup::new("merge").args(["source", "undo"]).required(true)))]
+pub struct MergeOpts {
+    /// The project to merge, by id, as `clawg projects list` shows it.
+    #[arg(requires = "into")]
+    pub source: Option<String>,
+    /// The project it goes into, by id.
+    #[arg(long, value_name = "TARGET", requires = "source")]
+    pub into: Option<String>,
+    /// Take merge N back instead, by the number the merge printed.
+    #[arg(long, value_name = "N", conflicts_with_all = ["source", "into"])]
+    pub undo: Option<i64>,
+    /// Say what it would do, and change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl MergeOpts {
+    pub fn request(&self) -> MergeRequest {
+        MergeRequest { source: self.source.clone(), target: self.into.clone(), undo: self.undo, dry_run: self.dry_run }
+    }
+}
+
+/// What `clawg projects delete` deletes, or the delete it undoes: a project,
+/// or `--undo`.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[command(group(clap::ArgGroup::new("delete").args(["project_id", "undo"]).required(true)))]
+pub struct DeleteOpts {
+    /// The project to delete, by id, as `clawg projects list` shows it.
+    pub project_id: Option<String>,
+    /// Delete it with its memories: without `--confirm`, report what that
+    /// takes and the code to confirm it with.
+    #[arg(long, requires = "project_id")]
+    pub with_memories: bool,
+    /// The code of the report, to confirm the delete with its memories.
+    #[arg(long, value_name = "CODE", requires = "with_memories")]
+    pub confirm: Option<String>,
+    /// Take delete N back instead, by the number the delete printed.
+    #[arg(long, value_name = "N", conflicts_with_all = ["project_id", "with_memories", "confirm"])]
+    pub undo: Option<i64>,
+    /// Say what the undo would do, and change nothing.
+    #[arg(long, conflicts_with_all = ["project_id", "with_memories", "confirm"])]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub profile: ProfileArg,
+}
+
+impl DeleteOpts {
+    pub fn request(&self) -> DeleteRequest {
+        DeleteRequest {
+            project_id: self.project_id.clone(),
+            with_memories: self.with_memories,
+            confirm: self.confirm.clone(),
+            undo: self.undo,
+            dry_run: self.dry_run,
+        }
+    }
 }
 
 /// What `clawg projects move` moves, and where. Exactly one of `--to`,
@@ -1079,8 +1233,8 @@ mod tests {
                 agent: None,
                 map_root: Vec::new(),
                 project_map: vec![
-                    ProjectMap { name: "my=app".into(), root: PathBuf::from("C:\\work\\app") },
-                    ProjectMap { name: "b".into(), root: PathBuf::from(".") },
+                    ProjectMap { name: "my=app".into(), to: MapTo::Path(PathBuf::from("C:\\work\\app")) },
+                    ProjectMap { name: "b".into(), to: MapTo::Path(PathBuf::from(".")) },
                 ],
                 profile: ProfileArg { profile: None },
             }
@@ -1095,6 +1249,21 @@ mod tests {
         for bad in ["a", "=.", "a="] {
             assert!(parses(&["clawg", "import", "--from", "engram", "e.json", "--project-map", bad]).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn import_takes_a_project_map_to_a_project() {
+        let maps = |raw: &str| match Cli::parse_args(["clawg", "import", "--from", "engram", "e.json", "--project-map", raw]) {
+            Ok(Cli { command: Command::Import { project_map, .. }, .. }) => Ok(project_map),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.kind()),
+        };
+        let one = |name: &str, to: MapTo| Ok(vec![ProjectMap { name: name.into(), to }]);
+        assert_eq!(maps("notes=project:Ideas"), one("notes", MapTo::Project("Ideas".into())));
+        assert_eq!(maps("a=b=project:ideas-1a2b"), one("a=b", MapTo::Project("ideas-1a2b".into())));
+        assert_eq!(maps("notes=./project:x"), one("notes", MapTo::Path(PathBuf::from("./project:x"))));
+        assert_eq!(maps("notes=project:"), one("notes", MapTo::Path(PathBuf::from("project:"))), "an empty reference is a path");
+        assert!(maps("=project:x").is_err());
     }
 
     #[test]
@@ -1456,6 +1625,109 @@ mod tests {
         assert!(Cli::try_parse_from(["clawg", "projects", "add"]).is_err(), "the path is required");
     }
 
+    #[test]
+    fn projects_list_and_rename_parse() {
+        assert_eq!(
+            parse(&["clawg", "projects", "list", "--profile", "dev"]).command,
+            Command::Projects { action: ProjectsAction::List { profile: ProfileArg { profile: Some("dev".into()) } } }
+        );
+        assert_eq!(
+            parse(&["clawg", "projects", "rename", "app-1a2b", "App web"]).command,
+            Command::Projects {
+                action: ProjectsAction::Rename { id: "app-1a2b".into(), name: "App web".into(), profile: ProfileArg::default() }
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "projects", "rename", "app-1a2b"]).is_err(), "the name is required");
+        assert!(Cli::try_parse_from(["clawg", "projects", "list", "extra"]).is_err(), "list takes no argument");
+    }
+
+    #[test]
+    fn projects_create_and_locate_parse() {
+        assert_eq!(
+            parse(&["clawg", "projects", "create", "ideas de producto"]).command,
+            Command::Projects {
+                action: ProjectsAction::Create { name: "ideas de producto".into(), new: false, profile: ProfileArg::default() }
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "projects", "create", "Mi App", "--new", "--profile", "dev"]).command,
+            Command::Projects {
+                action: ProjectsAction::Create { name: "Mi App".into(), new: true, profile: ProfileArg { profile: Some("dev".into()) } }
+            }
+        );
+        assert_eq!(
+            parse(&["clawg", "projects", "locate", "ideas", "/work/notes"]).command,
+            Command::Projects {
+                action: ProjectsAction::Locate {
+                    project: "ideas".into(),
+                    path: "/work/notes".into(),
+                    subfolder: false,
+                    profile: ProfileArg::default()
+                }
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "projects", "create"]).is_err(), "the name is required");
+        assert!(Cli::try_parse_from(["clawg", "projects", "locate", "ideas"]).is_err(), "the path is required");
+    }
+
+    #[test]
+    fn projects_locate_takes_subfolder() {
+        assert_eq!(
+            parse(&["clawg", "projects", "locate", "web", "/work/mono/apps/web", "--subfolder"]).command,
+            Command::Projects {
+                action: ProjectsAction::Locate {
+                    project: "web".into(),
+                    path: "/work/mono/apps/web".into(),
+                    subfolder: true,
+                    profile: ProfileArg::default()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn projects_merge_and_keep_apart_parse() {
+        let merge = |args: &[&str]| {
+            let mut argv = vec!["clawg", "projects", "merge"];
+            argv.extend_from_slice(args);
+            match parse(&argv).command {
+                Command::Projects { action: ProjectsAction::Merge(opts) } => opts,
+                other => panic!("not a merge: {other:?}"),
+            }
+        };
+        assert_eq!(
+            merge(&["app-1a2b", "--into", "web-3c4d"]).request(),
+            MergeRequest { source: Some("app-1a2b".into()), target: Some("web-3c4d".into()), ..MergeRequest::default() }
+        );
+        let dry = merge(&["app-1a2b", "--into", "web-3c4d", "--dry-run", "--profile", "dev"]);
+        assert_eq!((dry.request().dry_run, dry.profile.profile.as_deref()), (true, Some("dev")));
+        assert_eq!(merge(&["--undo", "3"]).request(), MergeRequest { undo: Some(3), ..MergeRequest::default() });
+        let refused: [&[&str]; 5] = [
+            &[],
+            &["app-1a2b"],
+            &["--into", "web-3c4d"],
+            &["--undo", "3", "app-1a2b"],
+            &["--undo", "3", "--into", "web-3c4d"],
+        ];
+        for args in refused {
+            let mut argv = vec!["clawg", "projects", "merge"];
+            argv.extend_from_slice(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
+
+        assert_eq!(
+            parse(&["clawg", "projects", "keep-apart", "app-1a2b", "copia-3c4d"]).command,
+            Command::Projects {
+                action: ProjectsAction::KeepApart {
+                    project_id: "app-1a2b".into(),
+                    other_id: "copia-3c4d".into(),
+                    profile: ProfileArg::default()
+                }
+            }
+        );
+        assert!(Cli::try_parse_from(["clawg", "projects", "keep-apart", "app-1a2b"]).is_err(), "it takes two projects");
+    }
+
     fn move_opts(args: &[&str]) -> MoveOpts {
         let mut argv = vec!["clawg", "projects", "move"];
         argv.extend_from_slice(args);
@@ -1591,17 +1863,35 @@ mod tests {
     }
 
     #[test]
-    fn purge_takes_an_id_a_yes_and_a_profile() {
+    fn purge_takes_an_id_or_a_delete() {
+        let purge = |args: &[&str]| {
+            let mut argv = vec!["clawg", "purge"];
+            argv.extend_from_slice(args);
+            parse(&argv).command
+        };
         assert_eq!(
-            parse(&["clawg", "purge", "57", "--yes", "--profile", "dev"]).command,
-            Command::Purge { id: 57, yes: true, profile: ProfileArg { profile: Some("dev".into()) } }
+            purge(&["57", "--yes", "--profile", "dev"]),
+            Command::Purge { id: Some(57), project_delete: None, yes: true, profile: ProfileArg { profile: Some("dev".into()) } }
         );
         assert_eq!(
-            parse(&["clawg", "purge", "57"]).command,
-            Command::Purge { id: 57, yes: false, profile: ProfileArg { profile: None } }
+            purge(&["57"]),
+            Command::Purge { id: Some(57), project_delete: None, yes: false, profile: ProfileArg { profile: None } }
         );
-        assert!(Cli::try_parse_from(["clawg", "purge"]).is_err(), "the id is required");
-        assert!(Cli::try_parse_from(["clawg", "purge", "memory"]).is_err(), "the id is a number");
+        assert_eq!(
+            purge(&["--project-delete", "4", "--yes"]),
+            Command::Purge { id: None, project_delete: Some(4), yes: true, profile: ProfileArg { profile: None } }
+        );
+        assert_eq!(
+            purge(&["--project-delete", "4"]),
+            Command::Purge { id: None, project_delete: Some(4), yes: false, profile: ProfileArg { profile: None } },
+            "without --yes it parses, and the command refuses before it opens anything"
+        );
+        let refused: [&[&str]; 4] = [&[], &["57", "--project-delete", "4"], &["memory"], &["--project-delete", "four"]];
+        for args in refused {
+            let mut argv = vec!["clawg", "purge"];
+            argv.extend_from_slice(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
     }
 
     #[test]
@@ -1913,5 +2203,56 @@ mod tests {
     fn resolve_absent_flag_matches_from_env() {
         let arg = ProfileArg { profile: None };
         assert_eq!(arg.resolve().ok(), Profile::from_env().ok());
+    }
+
+    #[test]
+    fn projects_delete_parses() {
+        let delete = |args: &[&str]| {
+            let mut argv = vec!["clawg", "projects", "delete"];
+            argv.extend_from_slice(args);
+            match parse(&argv).command {
+                Command::Projects { action: ProjectsAction::Delete(opts) } => opts,
+                other => panic!("not a delete: {other:?}"),
+            }
+        };
+        assert_eq!(
+            delete(&["app-1a2b"]).request(),
+            DeleteRequest { project_id: Some("app-1a2b".into()), ..DeleteRequest::default() }
+        );
+        assert_eq!(
+            delete(&["app-1a2b", "--with-memories"]).request(),
+            DeleteRequest { project_id: Some("app-1a2b".into()), with_memories: true, ..DeleteRequest::default() }
+        );
+        let confirmed = delete(&["app-1a2b", "--with-memories", "--confirm", "1a2b3c4d", "--profile", "dev"]);
+        assert_eq!(
+            confirmed.request(),
+            DeleteRequest {
+                project_id: Some("app-1a2b".into()),
+                with_memories: true,
+                confirm: Some("1a2b3c4d".into()),
+                ..DeleteRequest::default()
+            }
+        );
+        assert_eq!(confirmed.profile.profile.as_deref(), Some("dev"));
+        assert_eq!(delete(&["--undo", "3"]).request(), DeleteRequest { undo: Some(3), ..DeleteRequest::default() });
+        assert_eq!(
+            delete(&["--undo", "3", "--dry-run"]).request(),
+            DeleteRequest { undo: Some(3), dry_run: true, ..DeleteRequest::default() }
+        );
+        let refused: [&[&str]; 8] = [
+            &[],
+            &["app-1a2b", "--confirm", "1a2b3c4d"],
+            &["--undo", "3", "app-1a2b"],
+            &["--undo", "3", "--with-memories"],
+            &["--undo", "3", "--confirm", "1a2b3c4d"],
+            &["app-1a2b", "--dry-run"],
+            &["--with-memories"],
+            &["--undo", "three"],
+        ];
+        for args in refused {
+            let mut argv = vec!["clawg", "projects", "delete"];
+            argv.extend_from_slice(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
     }
 }

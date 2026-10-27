@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
+use crate::memory::merge::canonical_in;
+use crate::memory::project_delete::{deleted_in, deleted_message};
 use crate::memory::search::{reader_predicate, viewer_match_expression};
 use crate::memory::store_insert::MemoryType;
 use crate::memory::{MemoryError, MemoryStore};
@@ -86,6 +88,10 @@ pub struct MoveReport {
     /// stays live in its place.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub superseded: Vec<Supersede>,
+    /// The first row of each unit a merge took only part of: its rows in a
+    /// project the merge does not join stayed there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split: Vec<i64>,
 }
 
 impl MoveReport {
@@ -114,6 +120,13 @@ pub enum MoveError {
     UnknownProject(String),
     #[error("no move {0}")]
     UnknownMove(i64),
+    #[error("project {id} was merged into {into}: its memories are there now")]
+    Merged { id: String, into: String },
+    /// `delete_id` is the open delete that took it.
+    #[error("{}", deleted_message(.id, .delete_id))]
+    Deleted { id: String, delete_id: Option<i64> },
+    #[error("move {move_id} is part of merge {merge_id}: undo it with `clawg projects merge --undo {merge_id}`")]
+    PartOfMerge { move_id: i64, merge_id: i64 },
     #[error(transparent)]
     Refused(#[from] Skipped),
     #[error(transparent)]
@@ -422,14 +435,22 @@ fn apply_in(c: &Connection, report: &MoveReport, now: TimestampMs) -> rusqlite::
     Ok(Some(move_id))
 }
 
-/// Refuses a target `project` does not know; no project is always a target.
-fn check_target_in(c: &Connection, target: Option<&str>) -> Result<(), MoveError> {
+/// The live project a move to `target` goes to, read in the transaction that
+/// moves, so a target merged meanwhile leaves no row under its tombstone.
+/// Refuses a target `project` does not know, whether or not a folder leads
+/// to it; no project is always a target.
+fn target_in(c: &Connection, target: Option<&str>) -> Result<Option<String>, MoveError> {
     let Some(target) = target else {
-        return Ok(());
+        return Ok(None);
     };
     let known: bool = c.query_row("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1)", [target], |r| r.get(0))?;
     if known {
-        Ok(())
+        let live = canonical_in(c, target)?;
+        // Its rows would be out of reach of the undo of the delete.
+        if let Some(deleted) = deleted_in(c, &live)? {
+            return Err(MoveError::Deleted { id: live, delete_id: deleted.delete_id });
+        }
+        Ok(Some(live))
     } else {
         Err(MoveError::UnknownProject(target.to_string()))
     }
@@ -443,8 +464,8 @@ pub(crate) fn plan_one_in(
     target: Option<&str>,
     reach: Option<&str>,
 ) -> Result<MoveReport, MoveError> {
-    check_target_in(c, target)?;
-    let units = read_units_in(c, &[(id, target.map(str::to_string))], reach)?;
+    let target = target_in(c, target)?;
+    let units = read_units_in(c, &[(id, target)], reach)?;
     let mut report = decide(&units);
     report.split_pairs = split_pairs_in(c, &report.moved, reach)?;
     Ok(report)
@@ -612,14 +633,23 @@ pub async fn move_memories_core(
     dry_run: bool,
 ) -> Result<MoveReport, MoveError> {
     let (sql, params) = filter.to_sql()?;
+    let from = filter.from.clone();
     run_batch(store, backups, dry_run, move |c, write| {
-        check_target_in(c, target.as_deref())?;
+        // The rows of a project merged since are all in the one it went into,
+        // with that project's own: following it would move those too.
+        if let Some(ProjectFilter::Project(id)) = &from {
+            let into = canonical_in(c, id)?;
+            if into != *id {
+                return Err(MoveError::Merged { id: id.clone(), into });
+            }
+        }
+        let live = target_in(c, target.as_deref())?;
         let ids: Vec<i64> = {
             let mut stmt = c.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let seeds: Vec<(i64, Option<String>)> = ids.into_iter().map(|id| (id, target.clone())).collect();
+        let seeds: Vec<(i64, Option<String>)> = ids.into_iter().map(|id| (id, live.clone())).collect();
         Ok(batch_in(c, &seeds, write, TimestampMs::now())?)
     })
     .await
@@ -636,40 +666,55 @@ pub async fn undo_move_core(
     dry_run: bool,
 ) -> Result<MoveReport, MoveError> {
     run_batch(store, backups, dry_run, move |c, write| {
-        let known: bool =
-            c.query_row("SELECT EXISTS (SELECT 1 FROM memory_move WHERE move_id = ?1)", [move_id], |r| r.get(0))?;
-        if !known {
-            return Err(MoveError::UnknownMove(move_id));
+        // Its rows alone would leave the rest of the merge in its target, and
+        // the rows under a tombstone.
+        let merge: Option<i64> = c
+            .query_row("SELECT merge_id FROM project_merge WHERE ?1 IN (move_id, undo_move_id)", [move_id], |r| r.get(0))
+            .optional()?;
+        if let Some(merge_id) = merge {
+            return Err(MoveError::PartOfMerge { move_id, merge_id });
         }
-        c.execute(
-            "UPDATE memory SET status = s.from_status, superseded_by = s.from_superseded_by, \
-             supersede_cause = s.from_cause FROM memory_move_supersede AS s \
-             WHERE s.move_id = ?1 AND s.row_id = memory.id \
-               AND memory.status = 'superseded' AND memory.superseded_by = s.superseded_by",
-            [move_id],
-        )?;
-        let back: Vec<(i64, Option<String>)> = {
-            let mut stmt = c.prepare(
-                "SELECT m.row_id, m.from_project FROM memory_move m JOIN memory r ON r.id = m.row_id \
-                 WHERE m.move_id = ?1 AND r.project_id IS m.to_project ORDER BY m.row_id",
-            )?;
-            let rows = stmt.query_map([move_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        let mut by_origin: BTreeMap<Option<String>, Vec<(i64, Option<String>)>> = BTreeMap::new();
-        for (id, from) in back {
-            by_origin.entry(from.clone()).or_default().push((id, from));
-        }
-        let mut report = MoveReport::default();
-        for seeds in by_origin.values() {
-            report.absorb(batch_in(c, seeds, false, TimestampMs::now())?);
-        }
-        if write {
-            report.move_id = apply_in(c, &report, TimestampMs::now())?;
-        }
-        Ok(report)
+        undo_move_in(c, move_id, write)
     })
     .await
+}
+
+/// [`undo_move_core`] inside the caller's transaction, which a merge's undo
+/// shares with the rest it takes back. The rows move only when `write`.
+pub(crate) fn undo_move_in(c: &Connection, move_id: i64, write: bool) -> Result<MoveReport, MoveError> {
+    let known: bool = c.query_row("SELECT EXISTS (SELECT 1 FROM memory_move WHERE move_id = ?1)", [move_id], |r| r.get(0))?;
+    if !known {
+        return Err(MoveError::UnknownMove(move_id));
+    }
+    c.execute(
+        "UPDATE memory SET status = s.from_status, superseded_by = s.from_superseded_by, \
+         supersede_cause = s.from_cause FROM memory_move_supersede AS s \
+         WHERE s.move_id = ?1 AND s.row_id = memory.id \
+           AND memory.status = 'superseded' AND memory.superseded_by = s.superseded_by",
+        [move_id],
+    )?;
+    let back: Vec<(i64, Option<String>)> = {
+        let mut stmt = c.prepare(
+            "SELECT m.row_id, m.from_project FROM memory_move m JOIN memory r ON r.id = m.row_id \
+             WHERE m.move_id = ?1 AND r.project_id IS m.to_project ORDER BY m.row_id",
+        )?;
+        let rows = stmt.query_map([move_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut by_origin: BTreeMap<Option<String>, Vec<(i64, Option<String>)>> = BTreeMap::new();
+    for (id, from) in back {
+        // A project the rows came from that was merged since is the one it went into.
+        let from = from.map(|p| canonical_in(c, &p)).transpose()?;
+        by_origin.entry(from.clone()).or_default().push((id, from));
+    }
+    let mut report = MoveReport::default();
+    for seeds in by_origin.values() {
+        report.absorb(batch_in(c, seeds, false, TimestampMs::now())?);
+    }
+    if write {
+        report.move_id = apply_in(c, &report, TimestampMs::now())?;
+    }
+    Ok(report)
 }
 
 /// A row joining two projects leaves superseded by `by`, which holds its key
@@ -680,24 +725,38 @@ pub struct Supersede {
     pub by: i64,
 }
 
+/// What joining does with a unit that also has rows in a project it does not
+/// join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Span {
+    /// Leaves the unit where it is: the legacy ids a registration joins stay
+    /// live projects, where their rows are still found.
+    Keep,
+    /// Takes the unit's rows in the projects joined and leaves the others: a
+    /// project merged is a tombstone, and a row left under it would be in no
+    /// project anyone lists or searches.
+    Carry,
+}
+
 /// [`decide`] for joining the projects `origins` into `target`: a clash is
 /// no refusal, since [`reconcile`] settles it after the move, and a unit may
 /// already have rows in the target, which stay. A unit with a row anywhere
-/// else is left where it is.
-pub(crate) fn decide_merge(units: &[Unit], origins: &[String], target: &str) -> MoveReport {
+/// else is left where it is or split, as `span` says.
+pub(crate) fn decide_merge(units: &[Unit], origins: &[String], target: &str, span: Span) -> MoveReport {
     let mut report = MoveReport::default();
+    let joined = |r: &UnitRow| r.project_id.as_ref().is_some_and(|p| origins.contains(p));
     for unit in units {
         let first = unit.selected.first().copied().unwrap_or_default();
-        let elsewhere = unit
-            .rows
-            .iter()
-            .any(|r| r.project_id.as_deref() != Some(target) && !r.project_id.as_ref().is_some_and(|p| origins.contains(p)));
+        let elsewhere = unit.rows.iter().any(|r| r.project_id.as_deref() != Some(target) && !joined(r));
         if elsewhere {
-            report.skipped.push(Skipped { id: first, refusal: Refusal::SpansProjects });
-            continue;
+            if span == Span::Keep {
+                report.skipped.push(Skipped { id: first, refusal: Refusal::SpansProjects });
+                continue;
+            }
+            report.split.push(first);
         }
         let mut moved_any = false;
-        for r in unit.rows.iter().filter(|r| r.project_id.as_deref() != Some(target)) {
+        for r in unit.rows.iter().filter(|r| joined(r)) {
             moved_any = true;
             let protected = (r.live && MemoryType::is_protected_name(&r.memory_type)).then(|| r.memory_type.clone());
             report.protected += usize::from(protected.is_some());
@@ -878,10 +937,17 @@ fn supersede_in(c: &Connection, move_id: i64, supersedes: &[Supersede]) -> rusql
 
 /// Joins the projects `origins` into `target` inside the caller's
 /// transaction: every row of theirs, deleted ones too, moves with its unit as
-/// one logged move, and then the target keeps one live row per key and per
-/// text that a moved row touches (see [`reconcile`]). Nothing but `project_id`,
-/// `scope`, and the state of the rows replaced, changes.
-pub(crate) fn merge_in(c: &Connection, origins: &[String], target: &str, now: TimestampMs) -> rusqlite::Result<MoveReport> {
+/// one logged move (a unit that is also elsewhere as `span` says), and then
+/// the target keeps one live row per key and per text that a moved row
+/// touches (see [`reconcile`]). Nothing but `project_id`, `scope`, and the
+/// state of the rows replaced, changes.
+pub(crate) fn merge_in(
+    c: &Connection,
+    origins: &[String],
+    target: &str,
+    span: Span,
+    now: TimestampMs,
+) -> rusqlite::Result<MoveReport> {
     let seeds: Vec<(i64, Option<String>)> = {
         let ids = serde_json::to_string(origins).unwrap_or_default();
         let mut stmt = c.prepare(
@@ -891,7 +957,7 @@ pub(crate) fn merge_in(c: &Connection, origins: &[String], target: &str, now: Ti
         rows.map(|id| id.map(|id| (id, Some(target.to_string())))).collect::<rusqlite::Result<_>>()?
     };
     let units = read_units_in(c, &seeds, None)?;
-    let mut report = decide_merge(&units, origins, target);
+    let mut report = decide_merge(&units, origins, target, span);
     for skipped in &report.skipped {
         log::warn!("memory #{} stays where it is: {}", skipped.id, skipped.refusal);
     }
@@ -1059,9 +1125,10 @@ mod tests {
             .conn
             .call(move |c| {
                 c.execute(
-                    "INSERT INTO project (id, root_path, created_at, index_docs) VALUES (?1, '/work/' || ?1, 0, 0)",
-                    [id],
-                )
+                    "INSERT INTO project_path (id, root_path, created_at, index_docs) VALUES (?1, '/work/' || ?1, 0, 0)",
+                    [&id],
+                )?;
+                c.execute("INSERT INTO project (id, name, born, created_at) VALUES (?1, ?1, 'root', 0)", [&id])
             })
             .await
             .unwrap();
@@ -1620,6 +1687,27 @@ mod tests {
         assert_eq!(place(&store, id).await.0, None);
     }
 
+    /// A project is a target because it is one, whether or not a folder of
+    /// this machine leads to it.
+    #[tokio::test]
+    async fn a_project_without_a_folder_is_a_target() {
+        let store = store().await;
+        save_one(&store, fact("a note saved under an id no folder has", Some("idea-1a2b"))).await;
+        let id = save_one(&store, fact("a note filed nowhere", None)).await;
+        let folders: i64 = store
+            .conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM project_path WHERE id = 'idea-1a2b'", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(folders, 0);
+        let backups = tempfile::tempdir().unwrap();
+
+        let moved = move_memories_core(&store, backups.path(), &ids(&[id]), Some("idea-1a2b".into()), false).await.unwrap();
+
+        assert_eq!(moved_ids(&moved), vec![id]);
+        assert_eq!(place(&store, id).await.0.as_deref(), Some("idea-1a2b"));
+    }
+
     #[tokio::test]
     async fn a_selection_needs_a_filter_and_text_only_over_live_rows() {
         let store = store().await;
@@ -1761,10 +1849,72 @@ mod tests {
             ],
             &origins,
             B,
+            Span::Keep,
         );
         assert_eq!(moved_ids(&report), vec![1]);
         assert_eq!(report.skipped, vec![Skipped { id: 3, refusal: Refusal::SpansProjects }]);
         assert_eq!(report.unchanged, vec![5]);
+        assert_eq!(report.split, Vec::<i64>::new());
+    }
+
+    #[test]
+    fn decide_merge_carrying_takes_the_joined_part_of_a_unit_elsewhere() {
+        let origins = vec![A.to_string()];
+        let report = decide_merge(
+            &[unit(vec![row(3, Some(A)), row(4, Some("repo-cccc")), row(6, None)], &[3], Some(B))],
+            &origins,
+            B,
+            Span::Carry,
+        );
+        assert_eq!(moved_ids(&report), vec![3], "the rows elsewhere, or in no project, stay");
+        assert_eq!(report.split, vec![3]);
+        assert_eq!(report.skipped, Vec::<Skipped>::new());
+    }
+
+    /// Leaves `id` a tombstone of `into`, as a merge does.
+    async fn merged_into(store: &MemoryStore, id: &str, into: &str) {
+        let (id, into) = (id.to_string(), into.to_string());
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO project (id, name, born, created_at) VALUES (?1, ?1, 'root', 0) \
+                     ON CONFLICT (id) DO NOTHING",
+                    [&id],
+                )?;
+                c.execute("UPDATE project SET merged_into = ?2, merged_at = 1 WHERE id = ?1", [&id, &into])
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_move_to_a_merged_project_lands_in_its_target() {
+        let store = store().await;
+        merged_into(&store, "gone-cccc", B).await;
+        let id = save_one(&store, fact("the parser is written by hand", Some(A))).await;
+        let backups = tempfile::tempdir().unwrap();
+
+        let filter = MoveFilter { ids: vec![id], ..MoveFilter::default() };
+        let report = move_memories_core(&store, backups.path(), &filter, Some("gone-cccc".into()), false).await.unwrap();
+
+        assert_eq!(report.moved.iter().map(|m| m.to_project.clone()).collect::<Vec<_>>(), vec![Some(B.to_string())]);
+        assert_eq!(place(&store, id).await.0.as_deref(), Some(B));
+    }
+
+    #[tokio::test]
+    async fn undoing_a_move_whose_origin_was_merged_returns_to_its_target() {
+        let store = store().await;
+        register(&store, "web-cccc").await;
+        let id = save_one(&store, fact("the parser is written by hand", Some(A))).await;
+        let backups = tempfile::tempdir().unwrap();
+        let filter = MoveFilter { ids: vec![id], ..MoveFilter::default() };
+        let moved = move_memories_core(&store, backups.path(), &filter, Some(B.into()), false).await.unwrap();
+        merged_into(&store, A, "web-cccc").await;
+
+        undo_move_core(&store, backups.path(), moved.move_id.unwrap(), false).await.unwrap();
+
+        assert_eq!(place(&store, id).await.0.as_deref(), Some("web-cccc"), "the project it came from is web-cccc now");
     }
 
     async fn merge(store: &MemoryStore, from: &str, to: &str) -> MoveReport {
@@ -1773,7 +1923,7 @@ mod tests {
             .conn
             .call(move |c| {
                 let tx = c.transaction()?;
-                let report = merge_in(&tx, &from, &to, TimestampMs::now())?;
+                let report = merge_in(&tx, &from, &to, Span::Keep, TimestampMs::now())?;
                 tx.commit()?;
                 Ok::<_, rusqlite::Error>(report)
             })
@@ -1881,5 +2031,44 @@ mod tests {
         undo_move_core(&store, backups.path(), report.move_id.unwrap(), false).await.unwrap();
 
         assert_eq!((states(&store).await, everything_else(&store).await), before);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_project_is_refused_by_what_manages_projects() {
+        let store = store().await;
+        let id = save_one(&store, fact("a note", Some(A))).await;
+        let theirs = save_one(&store, fact("a note of the project to delete", Some(B))).await;
+        let backups = tempfile::tempdir().unwrap();
+        let away = move_to(&store, &ids(&[theirs]), Some(A)).await.move_id.unwrap();
+        let gone = save_one(&store, fact("a note deleted with the project", Some(B))).await;
+        store.conn.call(move |c| c.execute("UPDATE memory SET deleted_at = 4 WHERE id = ?1", [gone])).await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "UPDATE project SET deleted_at = 5 WHERE id = 'repo-bbbb';
+                     INSERT INTO project_delete (delete_id, project_id, with_memories, deleted_at) VALUES (1, 'repo-bbbb', 0, 5);",
+                )
+            })
+            .await
+            .unwrap();
+
+        let moved = move_memories_core(&store, backups.path(), &ids(&[id]), Some(B.into()), false).await;
+        assert!(matches!(&moved, Err(MoveError::Deleted { id, delete_id }) if id == B && *delete_id == Some(1)), "{moved:?}");
+        let patched = store.conn.call(move |c| -> Result<MoveReport, MoveError> { plan_one_in(c, id, Some(B), None) }).await;
+        assert!(matches!(&patched, Err(tokio_rusqlite::Error::Error(MoveError::Deleted { id, .. })) if id == B), "{patched:?}");
+        assert_eq!(place(&store, id).await.0.as_deref(), Some(A));
+
+        // Its deleted rows can still be taken out before a purge.
+        let from = MoveFilter { from: Some(ProjectFilter::Project(B.into())), include_deleted: true, ..MoveFilter::default() };
+        let rescued = move_memories_core(&store, backups.path(), &from, Some(A.into()), false).await.unwrap();
+        assert_eq!(moved_ids(&rescued), vec![gone]);
+
+        // The undo of a move that gives a live row back brings it back, as any live row does.
+        undo_move_core(&store, backups.path(), away, false).await.unwrap();
+        assert_eq!(place(&store, theirs).await.0.as_deref(), Some(B));
+        let back: Option<i64> =
+            store.conn.call(|c| c.query_row("SELECT deleted_at FROM project WHERE id = 'repo-bbbb'", [], |r| r.get(0))).await.unwrap();
+        assert_eq!(back, None);
     }
 }

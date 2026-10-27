@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2 | M–L, en cinco entregas (un parche S y cuatro M) | project-reassign (77) y project-clone-identity (30), archivados: se construye sobre R1–R19 de [`specs/project`](../../../specs/project/spec.md) | archivado el 2026-10-25 con la entrega 0; las entregas 1 a 4 pasaron a [project-locators](../../project-locators/proposal.md) (93) ([`state.yaml`](state.yaml)) |
+| 2 | M–L, en cinco entregas (un parche S y cuatro M) | project-reassign (77) y project-clone-identity (30), archivados: se construye sobre R1–R19 de [`specs/project`](../../../specs/project/spec.md) | archivado el 2026-10-25 con la entrega 0; las entregas 1 a 4 pasaron a [project-locators](../2026-10-27-project-locators/proposal.md) (93) ([`state.yaml`](state.yaml)) |
 
 ## Problema
 
@@ -55,7 +55,7 @@ La decisión abierta de la entrega 0 (si el parche lleva una migración mínima)
 
 Cada entrega se publica sola, con commits atómicos y TDD estricto. Los tests RED salen de [«Cómo se mide»](exploration.md#cómo-se-mide) de la exploración, más los que piden las decisiones de arriba.
 
-Al archivar (2026-10-25), el cambio se partió. La entrega 0 se cerró aquí y sale en 0.63.0. Las entregas 1 a 4, con las decisiones de arriba, pasaron a [project-locators](../../project-locators/proposal.md) (93). Esperarlas aquí dejaba abierto un cambio cuya parte publicada ya estaba en las specs, mientras lo que queda todavía no tiene diseño.
+Al archivar (2026-10-25), el cambio se partió. La entrega 0 se cerró aquí y sale en 0.63.0. Las entregas 1 a 4, con las decisiones de arriba, pasaron a [project-locators](../2026-10-27-project-locators/proposal.md) (93). Esperarlas aquí dejaba abierto un cambio cuya parte publicada ya estaba en las specs, mientras lo que queda todavía no tiene diseño.
 
 ### 0. El fundido (versión patch, sin esquema nuevo)
 

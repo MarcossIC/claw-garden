@@ -1,6 +1,6 @@
 # project-registry — Diseño
 
-Este diseño resuelve la **entrega 0** y la decisión abierta de la propuesta que le toca: [«El parche de la entrega 0 y la vuelta atrás»](proposal.md#abierto-para-el-diseño). Las demás pasaron, con las entregas 1 a 4, a [project-locators](../../project-locators/proposal.md) (93).
+Este diseño resuelve la **entrega 0** y la decisión abierta de la propuesta que le toca: [«El parche de la entrega 0 y la vuelta atrás»](proposal.md#abierto-para-el-diseño). Las demás pasaron, con las entregas 1 a 4, a [project-locators](../2026-10-27-project-locators/proposal.md) (93).
 
 ## D1. La huella valida la fila, en una función pura
 

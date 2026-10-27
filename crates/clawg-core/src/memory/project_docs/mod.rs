@@ -502,7 +502,7 @@ pub async fn root_of(store: &MemoryStore, project_id: &str) -> Result<PathBuf, D
         .conn
         .call(move |c| -> rusqlite::Result<_> {
             use rusqlite::OptionalExtension;
-            c.query_row("SELECT root_path, index_docs FROM project WHERE id = ?1", [&id], |r| {
+            c.query_row("SELECT root_path, index_docs FROM project_path WHERE id = ?1", [&id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .optional()
@@ -594,7 +594,20 @@ async fn remove_docs(store: &MemoryStore, project_id: &str, paths: Vec<String>) 
     Ok(())
 }
 
-fn delete_doc(tx: &rusqlite::Transaction<'_>, project_id: &str, path: &str) -> rusqlite::Result<()> {
+/// Takes everything indexed under the root `root_id` out of the index, in the
+/// caller's transaction.
+pub(crate) fn drop_root_index_in(c: &rusqlite::Connection, root_id: &str) -> rusqlite::Result<()> {
+    let paths: Vec<String> = c
+        .prepare("SELECT path FROM project_doc_file WHERE project_id = ?1")?
+        .query_map([root_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for path in paths {
+        delete_doc(c, root_id, &path)?;
+    }
+    Ok(())
+}
+
+fn delete_doc(tx: &rusqlite::Connection, project_id: &str, path: &str) -> rusqlite::Result<()> {
     let ids: Vec<i64> = tx
         .prepare("SELECT id FROM project_doc_chunk WHERE project_id = ?1 AND path = ?2")?
         .query_map([project_id, path], |r| r.get(0))?
@@ -713,7 +726,7 @@ mod tests {
         let (id, root) = (project_id.to_string(), root.display().to_string());
         store
             .conn
-            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", [id, root]))
+            .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, ?2, 0)", [id, root]))
             .await
             .unwrap();
         store
@@ -1026,7 +1039,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a.md", "# A\na\n");
         let store = store_with_project("p", dir.path()).await;
-        store.conn.call(|c| c.execute("UPDATE project SET index_docs = 0 WHERE id = 'p'", [])).await.unwrap();
+        store.conn.call(|c| c.execute("UPDATE project_path SET index_docs = 0 WHERE id = 'p'", [])).await.unwrap();
         let index = Arc::new(DocIndex::default());
 
         let result = index.try_refresh(&store, &Counting::new("m1"), None, "p").await;
@@ -1174,7 +1187,7 @@ mod tests {
         let (id, root) = ("two".to_string(), two.path().display().to_string());
         store
             .conn
-            .call(move |c| c.execute("INSERT INTO project (id, root_path, created_at) VALUES (?1, ?2, 0)", [id, root]))
+            .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, ?2, 0)", [id, root]))
             .await
             .unwrap();
         let index = Arc::new(DocIndex::default());

@@ -7,14 +7,19 @@ pub mod foreign;
 pub mod format;
 pub mod import;
 pub mod markdown;
+pub mod projects;
 pub mod timing;
 pub mod translate;
 pub mod undo;
 
 pub use export::{export, Export, ExportError, ExportFilter};
-pub use import::{import, import_foreign, ImportError, ImportOptions, ImportReport, MAX_IMPORT_BYTES};
+pub use import::{
+    import, import_foreign, map_project, ImportError, ImportOptions, ImportReport, ImportedProject, ImportedSubfolder, ImportedSuggestion,
+    MapProject, MapTarget, MAX_IMPORT_BYTES,
+};
+pub use projects::By;
 pub use timing::ImportTimings;
-pub use undo::{undo_import, KeepReason, KeptRow, UndoError, UndoReport};
+pub use undo::{undo_import, KeepReason, KeptEntry, KeptRow, RegistryKeep, RegistryUndo, UndoError, UndoReport};
 
 #[cfg(test)]
 pub(crate) mod fixtures {
@@ -108,7 +113,7 @@ pub(crate) mod fixtures {
                     }
                 }
                 tx.execute(
-                    "INSERT INTO project (id, root_path, created_at, index_docs) VALUES (?1, ?2, 1, 1), (?3, ?4, 1, 0)",
+                    "INSERT INTO project_path (id, root_path, created_at, index_docs) VALUES (?1, ?2, 1, 1), (?3, ?4, 1, 0)",
                     rusqlite::params![p, ROOT, q, OTHER_ROOT],
                 )?;
                 tx.execute_batch(
