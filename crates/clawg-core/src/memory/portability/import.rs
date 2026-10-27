@@ -4222,9 +4222,10 @@ pub(crate) mod tests {
     async fn a_project_map_path_in_a_declared_subfolder_goes_to_its_project() {
         let dst = destination().await;
         let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = crate::memory::identity::strip_verbatim(&std::fs::canonicalize(dir.path()).unwrap());
+        let inside = root.join("apps").join("web").join("src");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(root.join("apps/web/src")).unwrap();
+        std::fs::create_dir_all(&inside).unwrap();
         let home = tempfile::tempdir().unwrap();
         let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
         let reg = crate::memory::project::Registration {
@@ -4252,7 +4253,7 @@ pub(crate) mod tests {
             path: path.map(|p| p.to_string_lossy().into_owned()),
         };
         let options = ImportOptions {
-            project_map: vec![("a".into(), target(Some(&root.join("apps/web/src")))), ("b".into(), target(None))],
+            project_map: vec![("a".into(), target(Some(&inside))), ("b".into(), target(None))],
             ..Default::default()
         };
 
