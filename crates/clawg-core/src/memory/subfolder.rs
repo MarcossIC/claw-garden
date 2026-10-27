@@ -132,6 +132,8 @@ pub struct Declared {
 /// Why a declaration was refused. Nothing is written.
 #[derive(Debug, thiserror::Error)]
 pub enum SubfolderError {
+    #[error("no project {0}")]
+    UnknownProject(String),
     #[error("project {id} was merged into {into}")]
     Merged { id: String, into: String },
     #[error("{}", deleted_message(.id, .delete_id))]
@@ -207,9 +209,11 @@ pub async fn declare_subfolder(
 }
 
 fn declare_in(c: &Connection, parent: &str, subpath: &str, target: &str, now: TimestampMs) -> Result<Step, SubfolderError> {
-    let into: Option<Option<String>> =
-        c.query_row("SELECT merged_into FROM project WHERE id = ?1", [target], |r| r.get(0)).optional()?;
-    if let Some(Some(_)) = into {
+    let into: Option<String> = c
+        .query_row("SELECT merged_into FROM project WHERE id = ?1", [target], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| SubfolderError::UnknownProject(target.to_string()))?;
+    if into.is_some() {
         return Err(SubfolderError::Merged { id: target.to_string(), into: canonical_in(c, target)? });
     }
     if let Some(deleted) = deleted_in(c, target)? {
@@ -442,7 +446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_declaration_into_a_merged_or_deleted_project_is_refused() {
+    async fn a_declaration_into_an_unknown_merged_or_deleted_project_is_refused() {
         let f = Fixture::new().await;
         f.sql(
             "INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) \
@@ -455,6 +459,8 @@ mod tests {
         assert!(matches!(&merged, SubfolderError::Merged { into, .. } if into == "site"), "{merged:?}");
         let deleted = f.declare("apps/web", "web").await.unwrap_err();
         assert!(matches!(deleted, SubfolderError::Deleted { .. }), "{deleted:?}");
+        let unknown = f.declare("apps/web", "nowhere-9f9f").await.unwrap_err();
+        assert!(matches!(&unknown, SubfolderError::UnknownProject(id) if id == "nowhere-9f9f"), "{unknown:?}");
         assert!(f.rows().await.is_empty());
     }
 }

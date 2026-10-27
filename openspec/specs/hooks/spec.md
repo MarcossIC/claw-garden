@@ -85,7 +85,7 @@ Antes de leer, los dos eventos MUST registrar la raíz de `cwd`, con `cwd` mismo
 
 ## R7. El idioma de la persona en `session-start`
 
-Con preferencia ([`specs/preferences`](../preferences/spec.md)), `session-start` MUST abrir con una línea que dice el idioma de la persona, que se le responda en él salvo que escriba en otro, y que se guarde y se busque en él (`language_line`, `crates/clawg-cli/src/hook.rs:62`; `session_start_text`, `hook.rs:76`). MUST imprimirla, sola en el sobre, aunque no haya daemon, falle, no responda a tiempo o el contexto no traiga nada (`respond`, `hook.rs:190-203`), y lo que el hook suma MUST seguir ocupando menos de 1.000 bytes. Sin preferencia, lo de R3 y R4 sin cambios. `user-prompt-submit` no imprime la línea: en qué idioma habla está en AL6.
+Con preferencia ([`specs/preferences`](../preferences/spec.md)), `session-start` MUST abrir con una línea que dice el idioma de la persona, que se le responda en él salvo que escriba en otro, y que se guarde y se busque en él (`language_line`, `crates/clawg-cli/src/hook.rs:62`; `session_start_text`, `hook.rs:76`). MUST imprimirla, sola en el sobre, aunque no haya daemon, falle, no responda a tiempo o el contexto no traiga nada (`respond`, `hook.rs:190-203`), y lo que el hook suma, con la línea, MUST seguir ocupando menos de los 1.500 bytes de R4. Sin preferencia, lo de R3 y R4 sin cambios. `user-prompt-submit` no imprime la línea: en qué idioma habla está en AL6.
 
 #### Escenario: sin daemon
 - GIVEN la preferencia `es` y ningún daemon

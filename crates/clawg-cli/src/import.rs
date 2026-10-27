@@ -215,7 +215,7 @@ pub fn render(lang: Lang, r: &ImportReport) -> String {
             Lang::Es => format!("esta es la importación {n}; `clawg import --undo {n}` la deshace y conserva lo que cambió desde entonces"),
         });
     }
-    if r.projects.iter().any(|p| p.created) || !r.suggestions.is_empty() {
+    if !r.dry_run && (r.projects.iter().any(|p| p.created) || !r.suggestions.is_empty()) {
         lines.push(match lang {
             Lang::En => "`clawg projects list` shows the new projects and the suggestions to answer".to_string(),
             Lang::Es => "`clawg projects list` muestra los proyectos nuevos y las sugerencias por responder".to_string(),
@@ -867,6 +867,10 @@ mod tests {
         );
         let plain = ImportReport { rows: 1, inserted: 1, import_id: Some(3), ..Default::default() };
         assert!(!render(Lang::En, &plain).contains("projects list"), "nothing new to show");
+        let dry = ImportReport { dry_run: true, import_id: None, ..placed_report() };
+        for lang in [Lang::En, Lang::Es] {
+            assert!(!render(lang, &dry).contains("projects list"), "a dry run creates and leaves nothing to list");
+        }
     }
 
     #[test]

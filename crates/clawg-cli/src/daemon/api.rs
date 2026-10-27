@@ -2621,6 +2621,7 @@ async fn declare(app: &Arc<AppCtx>, root: &str, subpath: &str, target: &str) -> 
     let declared = declare_subfolder(&app.runtime.store, &app.runtime.workspaces(), &backups, &registered.project_id, subpath, target)
         .await
         .map_err(|e| match e {
+            SubfolderError::UnknownProject(_) => ApiError::not_found(e.to_string()),
             SubfolderError::Merged { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_merged") },
             SubfolderError::Deleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
             SubfolderError::Shared { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("folder_shared") },

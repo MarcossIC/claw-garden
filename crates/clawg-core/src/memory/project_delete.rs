@@ -360,7 +360,7 @@ fn set_in(c: &Connection, project_id: &str, name: &str) -> rusqlite::Result<Set>
 
 /// The project and the tombstones that lead to it: the ids a save of the
 /// project may still carry.
-fn ids_of_in(c: &Connection, project_id: &str) -> Result<Vec<String>, DeleteError> {
+pub(crate) fn ids_of_in(c: &Connection, project_id: &str) -> rusqlite::Result<Vec<String>> {
     let mut ids = vec![project_id.to_string()];
     let tombstones: Vec<String> = {
         let mut stmt = c.prepare("SELECT id FROM project WHERE merged_into IS NOT NULL ORDER BY id")?;

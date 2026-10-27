@@ -846,7 +846,7 @@ fn own_folders_dated_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<(
 /// without a folder, in the same transaction that looked. Nothing else is
 /// written.
 pub async fn resolve_project(store: &MemoryStore, reference: &str, options: ResolveOptions) -> Result<Resolution, ResolveError> {
-    let reference = checked_name(reference)?.to_string();
+    let reference = reference.trim().to_string();
     store
         .conn
         .call(move |c| {
@@ -865,6 +865,8 @@ pub async fn resolve_project(store: &MemoryStore, reference: &str, options: Reso
                 let live = canonical_in(&tx, &reference).map_err(sql)?;
                 return resolved(live, false);
             }
+            // Only a name is bounded: an id keeps the whole name of its folder.
+            let reference = checked_name(&reference)?;
             let all = untombed_in(&tx).map_err(sql)?;
             let candidate = |id: &str, name: &str, deleted: bool| -> Result<Candidate, ResolveError> {
                 let delete_id = if deleted { deleted_in(&tx, id).map_err(sql)?.and_then(|d| d.delete_id) } else { None };
@@ -912,7 +914,7 @@ pub async fn resolve_project(store: &MemoryStore, reference: &str, options: Reso
                     break;
                 }
             }
-            let id = id.ok_or_else(|| ResolveError::NoFreeId(reference.clone()))?;
+            let id = id.ok_or_else(|| ResolveError::NoFreeId(reference.to_string()))?;
             tx.execute(
                 "INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![id, reference, options.born.as_str(), options.born == Born::User, now],
@@ -1630,6 +1632,26 @@ mod tests {
             assert!(matches!(err, ResolveError::Name(_)), "{bad:?}: {err}");
         }
         assert_eq!(count_projects(&store).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_id_longer_than_a_name_still_resolves() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        // derive_project_id keeps the whole name of its folder.
+        let long = format!("{}-1a2b", "x".repeat(MAX_NAME_CHARS));
+        let id = long.clone();
+        store
+            .conn
+            .call(move |c| c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, 'x', 'root', 1, 7)", [id]))
+            .await
+            .unwrap();
+
+        let by_id = resolve_project(&store, &format!(" {long} "), creating(true)).await.unwrap();
+
+        assert_eq!((by_id.project_id.as_deref(), by_id.created), (Some(long.as_str()), false));
+        let err = resolve_project(&store, &format!("{long}0"), creating(true)).await.unwrap_err();
+        assert!(matches!(err, ResolveError::Name(NameError::TooLong)), "a name is bounded: {err}");
+        assert_eq!(count_projects(&store).await, 1);
     }
 
     #[tokio::test]

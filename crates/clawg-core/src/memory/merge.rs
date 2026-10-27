@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
-use crate::memory::project_delete::{deleted_in, deleted_message};
+use crate::memory::project_delete::{deleted_in, deleted_message, ids_of_in};
 use crate::memory::relocate::{merge_in, undo_move_in, MoveError, Span, Supersede};
 use crate::memory::workspace::{Adopted, Dropped, WorkspaceManager};
 use crate::memory::{MemoryError, MemoryStore};
@@ -62,6 +62,23 @@ pub async fn canonical(store: &MemoryStore, id: &str) -> Result<String, MemoryEr
 pub const SAVES_WAIT: Duration = Duration::from_secs(5);
 
 const SAVES_POLL: Duration = Duration::from_millis(100);
+
+/// How many saves wait in the outbox under `projects` or a tombstone that
+/// leads to one, which a bridge opened before its merge may still send.
+fn pending_in(c: &Connection, projects: [&str; 2]) -> rusqlite::Result<i64> {
+    let mut ids: Vec<String> = Vec::new();
+    for project in projects {
+        for id in ids_of_in(c, project)? {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    let mut count = c.prepare_cached(
+        "SELECT COUNT(*) FROM ingest_outbox WHERE state = 'pending' AND json_extract(event, '$.project_id') = ?1",
+    )?;
+    ids.iter().map(|id| count.query_row([id], |r| r.get::<_, i64>(0))).sum()
+}
 
 /// Why a merge was refused. Nothing is written.
 #[derive(Debug, thiserror::Error)]
@@ -237,12 +254,7 @@ fn merge_pass(
             return Err(MergeError::Deleted { id: id.to_string(), delete_id: deleted.delete_id });
         }
     }
-    let pending: i64 = c.query_row(
-        "SELECT COUNT(*) FROM ingest_outbox \
-         WHERE state = 'pending' AND json_extract(event, '$.project_id') IN (?1, ?2)",
-        [source, target],
-        |r| r.get(0),
-    )?;
+    let pending = pending_in(c, [source, target])?;
     if pending > 0 {
         return Err(MergeError::SavesPending(pending));
     }
@@ -448,12 +460,7 @@ fn undo_pass(c: &Connection, merge_id: i64, now: TimestampMs) -> Result<(MergeRe
     if let Some(deleted) = deleted_in(c, &target)? {
         return Err(MergeError::Deleted { id: target, delete_id: deleted.delete_id });
     }
-    let pending: i64 = c.query_row(
-        "SELECT COUNT(*) FROM ingest_outbox \
-         WHERE state = 'pending' AND json_extract(event, '$.project_id') IN (?1, ?2)",
-        [&source, &target],
-        |r| r.get(0),
-    )?;
+    let pending = pending_in(c, [&source, &target])?;
     if pending > 0 {
         return Err(MergeError::SavesPending(pending));
     }
@@ -1034,6 +1041,40 @@ mod tests {
         assert_eq!(f.everything().await, before);
         f.sql("UPDATE ingest_outbox SET state = 'failed'").await;
         assert!(f.merge(A, B, false).await.is_ok(), "a failed save is not in flight");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_save_pending_under_a_tombstone_holds_a_merge_and_its_undo() {
+        const D: &str = "doc-dddd";
+        let f = Fixture::new(&[A, B, C, D]).await;
+        f.merge(C, A, false).await.unwrap();
+        f.merge(D, B, false).await.unwrap();
+        let queue = |operation: &'static str, project: &'static str| {
+            let f = &f;
+            async move {
+                let event = format!(r#"{{"agent_id":"agent-a","project_id":"{project}","content":""}}"#);
+                f.sql(&format!(
+                    "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, created_at, updated_at) \
+                     VALUES ('{operation}', 'agent-a', 'a save', '{event}', 1, 1);"
+                ))
+                .await
+            }
+        };
+        queue("op-c", C).await;
+        queue("op-d", D).await;
+        let before = f.everything().await;
+
+        let refused = f.merge(A, B, false).await;
+
+        assert!(matches!(refused, Err(MergeError::SavesPending(2))), "a bridge opened before may still save under either: {refused:?}");
+        assert_eq!(f.everything().await, before);
+        f.sql("UPDATE ingest_outbox SET state = 'failed'").await;
+        let merged = f.merge(A, B, false).await.unwrap().merge_id.unwrap();
+        queue("op-c-again", C).await;
+
+        let undo = f.undo(merged, false).await;
+
+        assert!(matches!(undo, Err(MergeError::SavesPending(1))), "{undo:?}");
     }
 
     #[tokio::test]
