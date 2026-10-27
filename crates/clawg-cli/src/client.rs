@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
-use clawg_core::memory::portability::{ImportReport, UndoReport};
+use clawg_core::memory::portability::{ImportReport, MapTarget, UndoReport};
 use clawg_core::memory::merge::MergeReport;
 use clawg_core::memory::project_delete::DeleteReport;
 use clawg_core::memory::registry::{
@@ -1403,17 +1403,18 @@ impl DaemonClient {
     }
 
     /// Imports the export `text` of the tool `from` (`clawg`, `engram`).
-    /// `map_roots` pairs an exported root with the root it has here, and
-    /// `project_map` a project name of another tool with one, both already
-    /// resolved.
+    /// `map_roots` pairs an exported root with where it is here, and
+    /// `project_map` a project name of another tool with where its notes go,
+    /// each root already resolved. A target is an object, which a daemon from
+    /// before refuses rather than storing the notes in no project.
     pub async fn import(
         &self,
         text: &str,
         from: &str,
         dry_run: bool,
         agent: Option<&str>,
-        map_roots: &[(String, String)],
-        project_map: &[(String, String)],
+        map_roots: &[(String, MapTarget)],
+        project_map: &[(String, MapTarget)],
     ) -> Result<ImportReport, ClientError> {
         let body = serde_json::json!({
             "text": text, "from": from, "dry_run": dry_run, "agent": agent,

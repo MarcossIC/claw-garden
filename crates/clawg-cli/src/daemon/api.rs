@@ -43,7 +43,9 @@ use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::language::count_saves_in;
 use clawg_core::memory::portability::timing::{Step, Timing};
-use clawg_core::memory::portability::{self, ImportError, ImportOptions, ImportReport, ImportTimings, UndoError, UndoReport, MAX_IMPORT_BYTES};
+use clawg_core::memory::portability::{
+    self, ImportError, ImportOptions, ImportReport, ImportTimings, MapProject, MapTarget, UndoError, UndoReport, MAX_IMPORT_BYTES,
+};
 use clawg_core::memory::identity::{Disk, Ground, ProjectIdentity};
 use clawg_core::memory::project::{register_project, RegisterError, RegisterOutcome, Registration};
 use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
@@ -1950,13 +1952,51 @@ pub struct ImportRequest {
     /// The agent every row that has one is stored under instead.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Exported project roots and the roots they have here, for a clawg
-    /// export.
+    /// Exported project roots and where they are here, for a clawg export:
+    /// a root, or `{"root", "path"}` with the path the user named.
     #[serde(default)]
-    pub map_roots: Vec<(String, String)>,
-    /// Project names of another tool and the roots they have here.
+    pub map_roots: Vec<(String, MapTarget)>,
+    /// Project names of another tool and where their notes go here: a root,
+    /// `{"root", "path"}`, or `{"project"}`, an id or the name of one live
+    /// project. A daemon from before takes only a root, and refuses the
+    /// objects instead of storing the notes in no project.
     #[serde(default)]
-    pub project_map: Vec<(String, String)>,
+    pub project_map: Vec<(String, MapTarget)>,
+}
+
+/// The project each `{"project"}` of `map` names, by its live id, refused
+/// as a move refuses its target: none is a 404, two a 409
+/// `project_ambiguous`, a deleted one a 409 `project_deleted`.
+async fn resolve_map(app: &AppCtx, map: Vec<(String, MapTarget)>) -> ApiResult<Vec<(String, MapTarget)>> {
+    let mut resolved = Vec::with_capacity(map.len());
+    for (name, target) in map {
+        let target = match target {
+            MapTarget::Project { project } => match portability::map_project(&app.runtime.store, &project).await {
+                Ok(MapProject::Live(id)) => MapTarget::Project { project: id },
+                Ok(MapProject::Unknown) => return Err(ApiError::not_found(format!("no project {project:?}"))),
+                Ok(MapProject::Ambiguous(ids)) => {
+                    return Err(ApiError {
+                        detail: Some(format!("{project:?} is the name of {}: name one of them by its id", ids.join(", "))),
+                        ..ApiError::conflict("project_ambiguous")
+                    })
+                }
+                Err(e) => return Err(import_error(e)),
+            },
+            target => target,
+        };
+        resolved.push((name, target));
+    }
+    Ok(resolved)
+}
+
+fn import_error(e: ImportError) -> ApiError {
+    match e {
+        ImportError::Format(e) => ApiError::bad_request(e.to_string()),
+        ImportError::NoEmbedder => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready"),
+        ImportError::Embed(e) => embed_failure(e),
+        ImportError::ProjectDeleted { .. } => ApiError { detail: Some(e.to_string()), ..ApiError::conflict("project_deleted") },
+        e @ ImportError::Store(_) => ApiError::internal(e),
+    }
 }
 
 /// Imports an export. The file is read before the embedder is asked for, so
@@ -1966,7 +2006,7 @@ pub struct ImportRequest {
 /// imported, not even a dry run: cut by bytes, the pieces would be others.
 async fn import_memories(
     State(app): State<Arc<AppCtx>>,
-    Json(body): Json<ImportRequest>,
+    Json(mut body): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportReport>> {
     let mut timings = ImportTimings::new(body.dry_run).with_memory(super::process::private_bytes);
     let read = Instant::now();
@@ -1980,9 +2020,13 @@ async fn import_memories(
         Some("") => return Err(ApiError::bad_request("agent must not be blank")),
         agent => agent.map(str::to_string),
     };
+    if body.map_roots.iter().any(|(_, target)| target.root().is_none()) {
+        return Err(ApiError::bad_request("map_roots maps a root to a root; a project of the file goes by its remote, id or name"));
+    }
+    let project_map = resolve_map(&app, std::mem::take(&mut body.project_map)).await?;
     let foreign = match body.from.as_deref() {
         None | Some("clawg") => {
-            if !body.project_map.is_empty() {
+            if !project_map.is_empty() {
                 return Err(ApiError::bad_request(
                     "project_map maps the projects of another tool's export; name the tool in from",
                 ));
@@ -2007,7 +2051,7 @@ async fn import_memories(
     timings.record(Timing { elapsed: read.elapsed(), ..Timing::new(Step::Read) });
     let embedder = if body.dry_run { None } else { Some(ready_embedder(&app)?) };
     let options =
-        ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map: body.project_map };
+        ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let store = &app.runtime.store;
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
@@ -2022,10 +2066,7 @@ async fn import_memories(
             timings.finish();
             Ok(Json(report))
         }
-        Err(ImportError::Format(e)) => Err(ApiError::bad_request(e.to_string())),
-        Err(ImportError::NoEmbedder) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "embedder_not_ready")),
-        Err(ImportError::Embed(e)) => Err(embed_failure(e)),
-        Err(e @ ImportError::Store(_)) => Err(ApiError::internal(e)),
+        Err(e) => Err(import_error(e)),
     }
 }
 

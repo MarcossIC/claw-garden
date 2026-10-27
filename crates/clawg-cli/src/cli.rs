@@ -135,10 +135,12 @@ pub enum Command {
         #[arg(long = "map-root", value_name = "OLD=NEW", value_parser = parse_root_map)]
         map_root: Vec<RootMap>,
         /// Store the notes of the other tool's project NAME in the project
-        /// the directory PATH is in. Repeat it for each project; the notes of
-        /// a project not named are stored in none, and `clawg projects move
-        /// --origin-project NAME` places them later.
-        #[arg(long = "project-map", value_name = "NAME=PATH", value_parser = parse_project_map)]
+        /// the directory PATH is in, a declared subfolder's when PATH is in
+        /// one, or with `NAME=project:REF` in the project REF, by id or by
+        /// the name of one live project. Repeat it for each project; the
+        /// notes of a project not named are stored in none, and `clawg
+        /// projects move --origin-project NAME` places them later.
+        #[arg(long = "project-map", value_name = "NAME=PATH|NAME=project:REF", value_parser = parse_project_map)]
         project_map: Vec<ProjectMap>,
         #[command(flatten)]
         profile: ProfileArg,
@@ -326,22 +328,36 @@ impl ImportSource {
     }
 }
 
-/// A project name of another tool and the directory whose project takes its
-/// notes.
+/// A project name of another tool and where its notes go here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectMap {
     pub name: String,
-    pub root: PathBuf,
+    pub to: MapTo,
 }
 
-/// `NAME=PATH`, split at the last `=`: a project name may hold one, a path
-/// here does not.
+/// The project a `--project-map` sends notes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapTo {
+    /// The project of the directory, or of the declared subfolder it is in.
+    Path(PathBuf),
+    /// A project by id or by name.
+    Project(String),
+}
+
+/// `NAME=project:REF` split at the last `=project:`, else `NAME=PATH` split
+/// at the last `=`: a project name may hold one, a path here does not. A
+/// path that holds `=project:` is written from `./`.
 fn parse_project_map(raw: &str) -> Result<ProjectMap, String> {
+    if let Some((name, reference)) = raw.rsplit_once("=project:") {
+        if !name.is_empty() && !reference.trim().is_empty() {
+            return Ok(ProjectMap { name: name.to_string(), to: MapTo::Project(reference.trim().to_string()) });
+        }
+    }
     match raw.rsplit_once('=') {
         Some((name, root)) if !name.is_empty() && !root.is_empty() => {
-            Ok(ProjectMap { name: name.to_string(), root: PathBuf::from(root) })
+            Ok(ProjectMap { name: name.to_string(), to: MapTo::Path(PathBuf::from(root)) })
         }
-        _ => Err(format!("{raw:?} is not NAME=PATH")),
+        _ => Err(format!("{raw:?} is not NAME=PATH or NAME=project:REF")),
     }
 }
 
@@ -1217,8 +1233,8 @@ mod tests {
                 agent: None,
                 map_root: Vec::new(),
                 project_map: vec![
-                    ProjectMap { name: "my=app".into(), root: PathBuf::from("C:\\work\\app") },
-                    ProjectMap { name: "b".into(), root: PathBuf::from(".") },
+                    ProjectMap { name: "my=app".into(), to: MapTo::Path(PathBuf::from("C:\\work\\app")) },
+                    ProjectMap { name: "b".into(), to: MapTo::Path(PathBuf::from(".")) },
                 ],
                 profile: ProfileArg { profile: None },
             }
@@ -1233,6 +1249,21 @@ mod tests {
         for bad in ["a", "=.", "a="] {
             assert!(parses(&["clawg", "import", "--from", "engram", "e.json", "--project-map", bad]).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn import_takes_a_project_map_to_a_project() {
+        let maps = |raw: &str| match Cli::parse_args(["clawg", "import", "--from", "engram", "e.json", "--project-map", raw]) {
+            Ok(Cli { command: Command::Import { project_map, .. }, .. }) => Ok(project_map),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.kind()),
+        };
+        let one = |name: &str, to: MapTo| Ok(vec![ProjectMap { name: name.into(), to }]);
+        assert_eq!(maps("notes=project:Ideas"), one("notes", MapTo::Project("Ideas".into())));
+        assert_eq!(maps("a=b=project:ideas-1a2b"), one("a=b", MapTo::Project("ideas-1a2b".into())));
+        assert_eq!(maps("notes=./project:x"), one("notes", MapTo::Path(PathBuf::from("./project:x"))));
+        assert_eq!(maps("notes=project:"), one("notes", MapTo::Path(PathBuf::from("project:"))), "an empty reference is a path");
+        assert!(maps("=project:x").is_err());
     }
 
     #[test]

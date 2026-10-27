@@ -617,21 +617,21 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
 
 ### 56. V31: el diario del registro y el índice por fecha (PL53; D69)
 
-- [ ] RED:
+- [x] RED:
   - `a_database_from_the_previous_version_opens_with_its_imports_as_they_were` (`db.rs`, sembrado con `seed_on_disk(dir, Some(30))` y el escenario de PL53: un import anotado en V30, que se deshace después de abrir);
   - la fila 31 en `published_migration_checksums_are_pinned` (`migrations.rs`);
   - los conteos de migraciones aplicadas de `db.rs` pasan de 30 a 31: `after.0` del test que siembra hasta V8, `Expected exactly 31 applied migrations` y `migration_count`.
-- [ ] GREEN:
+- [x] GREEN:
   - `crates/clawg-core/migrations/V31__import_registry.sql`: `memory_import_registry` sin `CHECK`, su índice por `import_id`, e `idx_memory_created_at` sobre `memory (created_at)`;
   - tocar `migrations.rs` en el mismo commit, para que se recompile.
 - Commit: `feat(core): add the journal of what an import registers and an index by date`
 
 ### 57. Una línea `project` por proyecto (PL54, PL55; D60, D61)
 
-- [ ] RED:
+- [x] RED:
   - en `format.rs`: `the_pinned_example_reads_and_writes_back_unchanged`, con una segunda línea `project` que lleva todos los campos nuevos; `a_project_line_carries_its_name_locators_and_subfolders`; `a_project_line_without_a_folder_is_read`;
   - en `export.rs`: `an_export_writes_one_line_per_project_with_its_locators` (un clone, un proyecto sin carpeta y una lápida que lleva a uno exportado), `an_export_of_a_subproject_carries_its_repository_and_declaration`, `a_deleted_project_exports_without_its_mark` y `a_store_from_before_the_registry_exports_its_folders_as_before` (sembrado en V26). `export_reads_the_project_id_from_the_store` pasa a esperar también el nombre y el remoto de la línea en un store en V27 o después; en V26, la línea de antes.
-- [ ] GREEN:
+- [x] GREEN:
   - `ProjectLine` con `root_path` opcional, y con `name`, `folders` (`FolderLine`), `remotes`, `merged_into` y `subfolders` (`SubfolderLine`), cada uno con `#[serde(default, skip_serializing_if = …)]`;
   - `read`, en `export.rs`: una línea por proyecto, leída con lo que tiene el store (`project` y `project_path` desde V27, `project_remote` desde V24, `merged_into` desde V28, `project_subfolder` desde V30), y las de un store anterior a V27 como hoy;
   - `prepare` deja con su id las filas de una línea sin `root_path`, como las de un proyecto sin línea, y `translate.rs` compila con `root_path` opcional, sin cambiar lo que hace.
@@ -639,7 +639,7 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
 
 ### 58. Adónde va cada proyecto del archivo (PL55 a PL57; D62, D63)
 
-- [ ] RED:
+- [x] RED:
   - las puras `lines_of_one_id_are_one_project` y `a_project_of_the_file_goes_by_map_remote_id_name_then_path` (`crates/clawg-core/src/memory/portability/projects.rs`): cada paso, uno que no decide porque lo contradicen, el nombre con huellas de un solo lado, una línea sin filas que no crea y una lápida que sólo prueba el id;
   - en `import.rs`, sobre `MemoryStore::new_for_test()` con el `Ground` falso:
     - `an_export_from_before_a_merge_lands_in_its_target`, con remoto y sin él;
@@ -652,7 +652,7 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
     - `a_folder_of_another_machine_records_the_fingerprints_of_its_line`;
     - `a_checkout_without_origin_registered_after_an_import_joins_its_project`, que registra después con `register_project`;
   - los casos nuevos de `the_planner_decides_as_the_sql_pass`: un proyecto que va por su remoto y uno que va por su nombre.
-- [ ] GREEN:
+- [x] GREEN:
   - el módulo `projects.rs`, registrado en `portability/mod.rs`: `FileProject` (las líneas de un id), `Registry` y `registry_in(c)` (una lectura de `project`, `project_path`, `project_remote` y `project_subfolder`), y la pura `place`, que devuelve el proyecto y el paso que lo decidió (`By`);
   - en `plan`, `registry_in` en la misma llamada que `plan_ids_in`; se planean las carpetas de cada proyecto del archivo, con `--map-root`;
   - `prepare` mapea cada id del archivo con `place`, y `ProjectHere` lleva el proyecto, las huellas del archivo y si la carpeta existe acá (`recorded_checkout_present(camino, None)`);
@@ -662,8 +662,8 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
 
 ### 59. Las sugerencias de un import (PL58; D64)
 
-- [ ] RED (`import.rs`): `an_import_leaves_the_suggestions_a_registration_would`, `a_project_named_like_one_here_is_suggested`, `a_merge_at_the_source_is_suggested_here` y `a_dry_run_reports_the_suggestions_and_writes_none`. `an_import_records_its_folders_as_a_registration_would` pasa a esperar la sugerencia `remote_changed` de su segunda raíz, en lugar de ninguna.
-- [ ] GREEN:
+- [x] RED (`import.rs`): `an_import_leaves_the_suggestions_a_registration_would`, `a_project_named_like_one_here_is_suggested`, `a_merge_at_the_source_is_suggested_here` y `a_dry_run_reports_the_suggestions_and_writes_none`. `an_import_records_its_folders_as_a_registration_would` pasa a esperar la sugerencia `remote_changed` de su segunda raíz, en lugar de ninguna.
+- [x] GREEN:
   - `RootPlan::suggestions`: `plan_ids_in` calcula las de `plan_in` (`root_commit`, `remote_changed` y `folder_name`) con lo que lee `ReadAhead`, incluidos los checkouts grabados de los proyectos con ese nombre;
   - `place` devuelve las de `similar_name` y `merged_at_source`;
   - `record_projects` las inserta (`INSERT OR IGNORE`) y anota las que insertó; `suggestions` en `ImportReport`.
@@ -671,39 +671,39 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
 
 ### 60. Un proyecto borrado (PL59; D66)
 
-- [ ] RED (`import.rs`): `a_row_imported_deleted_leaves_its_deleted_project_deleted` y `a_live_row_imported_into_a_deleted_project_brings_it_back_and_says_so`.
-- [ ] GREEN:
+- [x] RED (`import.rs`): `a_row_imported_deleted_leaves_its_deleted_project_deleted` y `a_live_row_imported_into_a_deleted_project_brings_it_back_and_says_so`.
+- [x] GREEN:
   - en `SqlSeat::insert`, antes de una fila borrada, el `deleted_at` y el `reviewed` de su proyecto, y los mismos otra vez después de marcarla;
   - la anotación `revived` cuando una fila viva hizo volver a su proyecto, y la marca en `projects` del reporte.
 - Commit: `fix(core): keep a deleted project deleted when an import brings one of its rows deleted`
 
 ### 61. Las declaraciones viajan (PL60; D67)
 
-- [ ] RED (`import.rs`): `the_subfolders_of_a_repository_travel_with_it`, que después registra el clone con el camino crudo, y `a_declaration_here_is_kept_over_the_file`.
-- [ ] GREEN: después de `place`, las declaraciones de cada proyecto del archivo con sus proyectos de acá; el subproyecto sin filas al que lleva una declaración; la escritura en `record_projects`, anotada como `subfolder`; `subfolders` en `ImportReport`.
+- [x] RED (`import.rs`): `the_subfolders_of_a_repository_travel_with_it`, que después registra el clone con el camino crudo, y `a_declaration_here_is_kept_over_the_file`.
+- [x] GREEN: después de `place`, las declaraciones de cada proyecto del archivo con sus proyectos de acá; el subproyecto sin filas al que lleva una declaración; la escritura en `record_projects`, anotada como `subfolder`; `subfolders` en `ImportReport`.
 - Commit: `feat(core): carry the subfolders a repository declares through export and import`
 
 ### 62. Importar otra vez después de un movimiento (PL62; D65)
 
-- [ ] RED (`import.rs`): `an_export_imported_again_after_a_move_adds_nothing` y `two_rows_alike_from_two_origins_stay_two`; la fila de `PRESENT_ELSEWHERE_SQL` en `the_import_lookups_seek_an_index`; el caso de una fila movida en `the_planner_decides_as_the_sql_pass`.
-- [ ] GREEN: `PRESENT_ELSEWHERE_SQL`, por `idx_memory_created_at`; `Seat::present_elsewhere`, en `SqlSeat` y en `Planned`, que carga esas filas por fecha en `load`; `place` la pregunta para una fila de un export de clawg que no está en su proyecto; `Placement::Elsewhere` y `present_elsewhere` en el reporte.
+- [x] RED (`import.rs`): `an_export_imported_again_after_a_move_adds_nothing` y `two_rows_alike_from_two_origins_stay_two`; la fila de `PRESENT_ELSEWHERE_SQL` en `the_import_lookups_seek_an_index`; el caso de una fila movida en `the_planner_decides_as_the_sql_pass`.
+- [x] GREEN: `PRESENT_ELSEWHERE_SQL`, por `idx_memory_created_at`; `Seat::present_elsewhere`, en `SqlSeat` y en `Planned`, que carga esas filas por fecha en `load`; `place` la pregunta para una fila de un export de clawg que no está en su proyecto; `Placement::Elsewhere` y `present_elsewhere` en el reporte.
 - Commit: `fix(core): find a moved row wherever it is when an export is imported again`
 
 ### 63. Deshacer lo que el import agregó al registro (PL63; D70)
 
-- [ ] RED (`undo.rs`): `undoing_an_import_takes_back_what_it_added_to_the_registry`, `what_an_import_added_to_the_registry_stays_once_used` y `undoing_an_import_deletes_again_the_project_it_brought_back`. `an_undo_twice_changes_nothing_the_second_time` y `a_dry_run_undo_reports_without_writing` siguen pasando.
-- [ ] GREEN: la carga de `memory_import_registry` y del estado de lo que nombra; la decisión pura de qué se retira y qué queda, con su motivo; la escritura en la última transacción, en el orden de D70; `registry` en `UndoReport`.
+- [x] RED (`undo.rs`): `undoing_an_import_takes_back_what_it_added_to_the_registry`, `what_an_import_added_to_the_registry_stays_once_used` y `undoing_an_import_deletes_again_the_project_it_brought_back`. `an_undo_twice_changes_nothing_the_second_time` y `a_dry_run_undo_reports_without_writing` siguen pasando.
+- [x] GREEN: la carga de `memory_import_registry` y del estado de lo que nombra; la decisión pura de qué se retira y qué queda, con su motivo; la escritura en la última transacción, en el orden de D70; `registry` en `UndoReport`.
 - Commit: `feat(core): take back what an import added to the registry of projects`
 
 ### 64. El daemon (PL56, PL61; D68)
 
-- [ ] RED:
+- [x] RED:
   - en `tests/api.rs`:
     - `an_export_of_another_store_imports_by_remote_and_by_name`;
     - `a_project_map_to_a_deleted_ambiguous_or_unknown_project_is_refused` y `a_map_given_as_a_root_is_read_as_before`;
     - el brazo de `/import` (`body.project_map[].project`) en `every_route_says_which_project_it_takes`, `every_route_that_takes_a_project_follows_a_merge` y `every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule`;
   - en `import.rs`: `a_project_map_to_a_project_places_its_notes_there` y `a_project_map_path_in_a_declared_subfolder_goes_to_its_project`.
-- [ ] GREEN:
+- [x] GREEN:
   - `MapTarget` (un texto, `{"root", "path"}` o `{"project"}`) en `ImportRequest::map_roots` y `project_map`, y su paso a `ImportOptions`;
   - la referencia resuelta con `find_project` antes de leer el archivo, con sus 404 y 409, y el borrado comprobado otra vez en la transacción que escribe;
   - `MappedProject::root` opcional; `plan_ids_in` con el camino crudo de cada raíz.
@@ -711,12 +711,12 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
 
 ### 65. `clawg import` y `clawg export` (PL61, PL64)
 
-- [ ] RED:
+- [x] RED:
   - `import_takes_a_project_map_to_a_project` (`cli.rs`);
   - `the_maps_are_sent_with_their_raw_paths`, y `an_import_report_names_where_each_project_went` y `render_undo_names_what_it_took_back_from_the_registry`, en español y en inglés (`crates/clawg-cli/src/import.rs`);
   - `an_export_counts_its_projects` (`crates/clawg-cli/src/export.rs`);
   - `the_reasons_of_an_import_are_worded`, en los dos idiomas (`projects.rs` y `tools.rs`).
-- [ ] GREEN:
+- [x] GREEN:
   - `ProjectMap` con un destino (un camino o un proyecto) y su parseo por el último `=project:`;
   - `DaemonClient::import`, que manda los objetos;
   - `render` y `render_undo` con las líneas nuevas, y la salida de un import que termina con `clawg projects list` cuando creó proyectos o dejó sugerencias;
@@ -727,20 +727,21 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
 
 ### 66. Las specs y la documentación
 
-- [ ] `specs/portability`: R1 (una línea `project` por proyecto, con sus campos), R4 (el orden de PL56, lo que se graba y las sugerencias), R5 (la fila presente en cualquier proyecto), IU1 e IU2 (`memory_import_registry` y lo que retira el `--undo`), IL1 (`PRESENT_ELSEWHERE_SQL`), y HI7 y HI16 (`--project-map NOMBRE=project:REF` y el camino crudo).
-- [ ] `specs/storage`: V31 y su vuelta atrás.
-- [ ] `specs/project`: PL53 a PL64, y lo que cambia en PL6, PL7 y PL47.
-- [ ] `.claude/CLAUDE.md`:
+- [x] `specs/portability`: R1 (una línea `project` por proyecto, con sus campos), R4 (el orden de PL56, lo que se graba y las sugerencias), R5 (la fila presente en cualquier proyecto), IU1 e IU2 (`memory_import_registry` y lo que retira el `--undo`), IL1 (`PRESENT_ELSEWHERE_SQL`), y HI7 y HI16 (`--project-map NOMBRE=project:REF` y el camino crudo).
+- [x] `specs/storage`: V31 y su vuelta atrás.
+- [x] `specs/project`: PL53 a PL64, y lo que cambia en PL6, PL7 y PL47.
+- [x] `.claude/CLAUDE.md`:
   - en el párrafo del proyecto de «Data profiles»: cómo decide el import, sus sugerencias y lo que hace con un proyecto borrado;
   - en «Commands»: `clawg export` (una línea por proyecto), `clawg import` (el orden, `--project-map NOMBRE=project:REF`, los caminos crudos, la fila presente en cualquier proyecto y lo que dice el reporte) y `clawg import --undo` (lo que retira del registro);
   - en la API: el cuerpo de `POST /v1/import` y el reporte del `--undo`.
-- [ ] El contrato del modelo no cambia: `the_agent_contract_matches_its_file` y su variante en español pasan sin volver a bendecir.
+- [x] El contrato del modelo no cambia: `the_agent_contract_matches_its_file` y su variante en español pasan sin volver a bendecir.
 - Commit: `docs: record how projects travel through export and import`
 
 ### 67. Verificación
 
-- [ ] La suite y los dos clippy de `.claude/CLAUDE.md`, en `target-test` en Windows y con `--locked`, y en Linux.
-- [ ] El binario en dos homes temporales, A y B, con un repositorio git real con un `origin` `https://…`, clonado en otro camino en cada home:
+- [x] La suite y los dos clippy de `.claude/CLAUDE.md`, con `--locked`, en Linux.
+- [ ] Lo mismo en `target-test` en Windows.
+- [x] El binario en dos homes temporales, A y B, con un repositorio git real con un `origin` `https://…`, clonado en otro camino en cada home:
   - en A: un proyecto sin carpeta creado con `projects create`, memorias en él y en el repositorio, y un monorepo con su declaración; después, `clawg export`;
   - en B: `clawg import`. Las memorias del repositorio quedan en el proyecto del clone de B, las del proyecto sin carpeta en uno con su nombre, y la declaración lleva al subproyecto;
   - otra vez `clawg import` en B, después de un `projects move`: no agrega nada;
@@ -748,5 +749,5 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
   - un export de engram con `--project-map NOMBRE=project:ideas`, y el 409 con un proyecto borrado;
   - `doctor` no marca nada nuevo.
 - [ ] El CI en Linux y Windows, en el pull request final del cambio.
-- [ ] `verify.md`, sección «Entrega 4».
-- [ ] No queda otro directorio de build que `target` y `target-test`.
+- [x] `verify.md`, sección «Entrega 4».
+- [x] No queda otro directorio de build que `target` y `target-test`.

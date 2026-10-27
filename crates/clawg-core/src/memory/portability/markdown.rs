@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 use crate::memory::backup::civil_from_days;
 use crate::memory::portability::export::Export;
-use crate::memory::portability::format::MemoryLine;
+use crate::memory::portability::format::{MemoryLine, ProjectLine};
 use crate::memory::store_insert::MemoryType;
 
 /// The rows of `export` by project, then by type, then by id.
@@ -36,7 +36,8 @@ pub fn render(export: &Export) -> String {
             "No project".to_string()
         } else {
             match export.projects.iter().find(|p| p.id == project_id) {
-                Some(p) => format!("{} — {}", p.id, p.root_path),
+                Some(ProjectLine { id, root_path: Some(root), .. }) => format!("{id} — {root}"),
+                Some(p) => p.name.clone().map_or_else(|| p.id.clone(), |name| format!("{} — {name}", p.id)),
                 None => project_id.clone(),
             }
         };

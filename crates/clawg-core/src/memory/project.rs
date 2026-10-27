@@ -531,7 +531,7 @@ fn settle_in(
 /// from what `ground` finds at the root, or the project a declared subfolder
 /// leads `path` to inside it.
 pub fn project_id_in(c: &Connection, root: &Path, path: Option<&Path>, ground: &dyn Ground) -> rusqlite::Result<String> {
-    let project = plan_ids_in(c, &[root.to_path_buf()], ground)?.remove(0).project_id;
+    let project = plan_ids_in(c, &[root.to_path_buf()], ground, false)?.remove(0).project_id;
     let subpath = path.and_then(|p| ground.subpath(root, p));
     Ok(match subpath {
         Some(subpath) => declared_in(c, &project, &subpath)?.unwrap_or(project),
@@ -550,13 +550,17 @@ pub(crate) struct RootPlan {
     /// The first commit and the git stamp the root's folder records.
     pub(crate) root_commit: Option<String>,
     pub(crate) git_stamp: Option<String>,
+    /// The projects `project_id` may be the same as, each with why, as a
+    /// registration would suggest them.
+    pub(crate) suggestions: Vec<(String, &'static str)>,
 }
 
 /// What each of `roots` would get, as [`register_project`] gives it, from
 /// what `ground` finds at each, read without writing: a root later in the
 /// list never takes an id or a remote an earlier one was given, and settles
-/// as if the earlier ones were written, fingerprints included.
-pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground) -> rusqlite::Result<Vec<RootPlan>> {
+/// as if the earlier ones were written, fingerprints included. With
+/// `suggest`, also the suggestions a registration of each would leave.
+pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground, suggest: bool) -> rusqlite::Result<Vec<RootPlan>> {
     let mut pending = Pending::default();
     let mut out = Vec::new();
     for root in roots {
@@ -577,6 +581,7 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground
             },
             None => None,
         };
+        let mut suggestions: Vec<(String, &'static str)> = Vec::new();
         let project_id = match &settled {
             Some(settled) => {
                 let looks = shared.is_none() && settled.fresh();
@@ -588,12 +593,36 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground
                     .collect();
                 match moved(&sightings, &gone) {
                     Moved::To(project) => project,
+                    Moved::Apart(others) if suggest => {
+                        let own = project_of(shared, settled);
+                        suggestions.extend(others.into_iter().map(|other| (other, "root_commit")));
+                        // As a registration tells a folder that moved by its name alone.
+                        let named = if looks { named_after_in(c, root, &own)? } else { Vec::new() };
+                        for (other, recorded) in named {
+                            if recorded.iter().all(|(path, stamp)| !ground.recorded_checkout_present(path, stamp.as_deref())) {
+                                suggestions.push((other, "folder_name"));
+                            }
+                        }
+                        own
+                    }
                     Moved::Apart(_) => project_of(shared, settled),
                 }
             }
             None => shared.unwrap_or_else(|| root_id.clone()),
         };
         let project_id = canonical_in(c, &project_id)?;
+        if let (true, Some(true), RootCommit::Known(commit)) = (suggest, settled.as_ref().map(Settlement::contradicted), &commit) {
+            for folder in folders.iter().filter(|f| f.root_commit.as_ref() == Some(commit)) {
+                suggestions.push((folder_project_in(c, folder)?, "remote_changed"));
+            }
+        }
+        let mut suggested: Vec<(String, &'static str)> = Vec::new();
+        for (other, reason) in suggestions {
+            let other = canonical_in(c, &other)?;
+            if other != project_id && !suggested.iter().any(|(o, _)| *o == other) {
+                suggested.push((other, reason));
+            }
+        }
         if let Some(key) = &checkout.key {
             pending.remotes.entry(key.clone()).or_insert_with(|| project_id.clone());
         }
@@ -602,7 +631,7 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground
         if let Some(folder) = written {
             pending.write(root, folder);
         }
-        out.push(RootPlan { root_id, project_id, remote: checkout.key, root_commit, git_stamp });
+        out.push(RootPlan { root_id, project_id, remote: checkout.key, root_commit, git_stamp, suggestions: suggested });
     }
     Ok(out)
 }
@@ -1552,7 +1581,7 @@ mod tests {
             .conn
             .call(move |c| {
                 let read = project_id_in(c, path, None, &*ground)?;
-                let planned = plan_ids_in(c, &[path.to_path_buf(), path.to_path_buf()], &*ground)?;
+                let planned = plan_ids_in(c, &[path.to_path_buf(), path.to_path_buf()], &*ground, false)?;
                 Ok::<_, rusqlite::Error>((read, planned.into_iter().map(|p| (p.root_id, p.project_id)).collect::<Vec<_>>()))
             })
             .await
@@ -1949,7 +1978,7 @@ mod tests {
             .conn
             .call(move |c| {
                 let read = project_id_in(c, Path::new("/work/app"), None, &*ground)?;
-                let planned = plan_ids_in(c, &[PathBuf::from("/work/app")], &*ground)?.remove(0).project_id;
+                let planned = plan_ids_in(c, &[PathBuf::from("/work/app")], &*ground, false)?.remove(0).project_id;
                 Ok::<_, rusqlite::Error>((read, planned))
             })
             .await
@@ -2132,7 +2161,7 @@ mod tests {
             .conn
             .call(move |c| {
                 let read = project_id_in(c, new, None, &*ground)?;
-                let planned = plan_ids_in(c, &[new.to_path_buf(), copy.to_path_buf()], &*ground)?;
+                let planned = plan_ids_in(c, &[new.to_path_buf(), copy.to_path_buf()], &*ground, false)?;
                 Ok::<_, rusqlite::Error>((read, planned.into_iter().map(|p| (p.root_id, p.project_id)).collect::<Vec<_>>()))
             })
             .await

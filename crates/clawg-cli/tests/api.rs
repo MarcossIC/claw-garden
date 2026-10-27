@@ -3953,6 +3953,105 @@ async fn an_engram_export_without_notes_imports_nothing() {
     assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
 }
 
+/// A clawg export of another store: `project_lines`, then one row of each
+/// project by its id in the file.
+fn export_with(project_lines: &[Value], rows: &[(&str, &str)]) -> String {
+    let header = json!({
+        "kind": "header", "format": "clawg-memories", "version": 1, "exported_at": 0, "clawg": "0.0.0",
+        "filter": {"project": null, "agent": null, "include_deleted": false},
+    });
+    let mut lines = vec![header];
+    lines.extend(project_lines.iter().cloned());
+    for (k, (project, content)) in rows.iter().enumerate() {
+        let id = k as i64 + 1;
+        lines.push(json!({
+            "kind": "memory", "id": id, "scope": "agent", "agent_id": "a", "project_id": project, "content": content,
+            "memory_type": "semantic_fact", "source": "explicit", "created_at": 1_000 + id,
+            "created_by_type": "agent", "last_modified_at": 1_000 + id, "last_accessed_at": 9_000,
+            "access_count": 1, "importance": 5.0, "tier": 2, "status": "active",
+        }));
+    }
+    lines.iter().map(|l| format!("{l}\n")).collect()
+}
+
+#[tokio::test]
+async fn an_export_of_another_store_imports_by_remote_and_by_name() {
+    let h = Harness::start().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("app");
+    set_origin(&root, "git@github.com:acme/app.git");
+    let app = registered_dir(&h, &root).await["project_id"].as_str().expect("project_id").to_string();
+    let ideas = resolve(&h, json!({ "project": "Ideas", "create": true, "born": "user" })).await["project_id"]
+        .as_str()
+        .expect("a project")
+        .to_string();
+    let lines = [
+        json!({ "kind": "project", "id": "app-0000", "name": "app", "folders": [{ "root_path": "/far/app", "remote": "github.com/acme/app" }], "remotes": ["github.com/acme/app"] }),
+        json!({ "kind": "project", "id": "ideas-0000", "name": "ideas" }),
+    ];
+    let text = export_with(&lines, &[("app-0000", "the app of the other machine uses Rust"), ("ideas-0000", "an idea of the other machine")]);
+
+    let (status, report) = h.post_json("/v1/import", json!({ "text": text })).await;
+
+    assert_eq!(status, 200, "{report}");
+    let went: Vec<(Value, Value)> =
+        report["projects"].as_array().expect("projects").iter().map(|p| (p["to"].clone(), p["by"].clone())).collect();
+    assert_eq!(went, vec![(json!(app), json!("remote")), (json!(ideas), json!("name"))], "{report}");
+    assert_eq!(report["by_project"], json!({ app.clone(): 1, ideas.clone(): 1 }), "{report}");
+}
+
+#[tokio::test]
+async fn a_project_map_to_a_deleted_ambiguous_or_unknown_project_is_refused() {
+    let h = Harness::start().await.with_tokenizer();
+    let text = engram_export(vec![observation("a", Some("notes"), "Port", "the daemon listens on 27380")]);
+    let (gone, _, _) = deleted_project(&h, "/work/gone").await;
+    for name in ["twin-1111", "twin-2222"] {
+        h.ctx
+            .runtime
+            .store
+            .conn
+            .call(move |c| c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, 'Twin', 'user', 1, 1)", [name]))
+            .await
+            .unwrap();
+    }
+    for (project, status, error) in [(gone.as_str(), 409, "project_deleted"), ("twin", 409, "project_ambiguous"), ("nowhere", 404, "")] {
+        let ask = json!({ "text": text, "from": "engram", "project_map": [["notes", { "project": project }]] });
+        let (got, body) = h.post_json("/v1/import", ask).await;
+        assert_eq!(got, status, "{project}: {body}");
+        if !error.is_empty() {
+            assert_eq!(body["error"], json!(error), "{project}: {body}");
+        }
+    }
+    let (status, body) = h.post_json("/v1/import", json!({ "text": export_file(1), "map_roots": [["/a", { "project": "twin-1111" }]] })).await;
+    assert_eq!(status, 400, "a root maps to a root: {body}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+}
+
+#[tokio::test]
+async fn a_map_given_as_a_root_is_read_as_before() {
+    let h = Harness::start().await.with_tokenizer();
+    let root = tempfile::tempdir().expect("tempdir");
+    let root = canonical(root.path());
+    let text = engram_export(vec![observation("a", Some("notes"), "Port", "the daemon listens on 27380")]);
+    let as_text = json!({ "text": text, "from": "engram", "project_map": [["notes", root.to_string_lossy()]] });
+    let (status, before) = h.post_json("/v1/import", as_text).await;
+    assert_eq!(status, 200, "{before}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated").await;
+    let id = ids_in(&listed["items"])[0];
+    let project = project_of(&h, id).await;
+    assert!(project.is_string(), "{listed}");
+
+    let text = engram_export(vec![observation("b", Some("notes"), "Host", "the daemon binds 127.0.0.1")]);
+    let as_object = json!({ "text": text, "from": "engram", "project_map": [["notes", { "root": root.to_string_lossy() }]] });
+    let (status, after) = h.post_json("/v1/import", as_object).await;
+    assert_eq!(status, 200, "{after}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated").await;
+    for id in ids_in(&listed["items"]) {
+        assert_eq!(project_of(&h, id).await, project, "both forms lead to the root's project");
+    }
+}
+
 #[tokio::test]
 async fn import_refuses_an_unknown_source_or_a_mixed_map() {
     let h = Harness::start().await.with_tokenizer();
@@ -4441,8 +4540,9 @@ const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
     ("GET", "/stats", Some("query.project")),
     ("GET", "/metrics", None),
     ("POST", "/backup", None),
-    // Roots, whose projects the plan and the writes follow.
-    ("POST", "/import", None),
+    // Roots, whose projects the plan and the writes follow, and the
+    // projects another tool's projects are mapped to.
+    ("POST", "/import", Some("body.project_map[].project")),
     ("POST", "/import/undo", None),
     // A root, whose project the registration follows.
     ("POST", "/projects", None),
@@ -4639,6 +4739,16 @@ async fn every_route_that_takes_a_project_follows_a_merge() {
                 assert_eq!((status, body["error"].as_str()), (409, Some("project_merged")), "{route} subfolder: {body}");
                 assert!(body["detail"].as_str().is_some_and(|d| d.contains(&web)), "{route} subfolder: {body}");
             }
+            ("POST", "/import") => {
+                h.ctx.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+                let text = engram_export(vec![observation("merged-map", Some("notes"), "Port", "the mapped service listens on 7070")]);
+                let ask = json!({ "text": text, "from": "engram", "project_map": [["notes", { "project": app }]] });
+                let (status, body) = h.post_json("/v1/import", ask).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated&limit=10").await;
+                let id = ids_in(&listed["items"])[0];
+                assert_eq!(project_of(&h, id).await, json!(web), "{route}");
+            }
             _ => panic!("{route} takes a project and no check here follows it past a merge"),
         }
     }
@@ -4784,11 +4894,12 @@ async fn a_merge_waits_for_the_saves_of_its_projects() {
         (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
     pending_save(&h, "op-1", &app).await;
     let store = h.ctx.runtime.store.clone();
+    // Taken before the spawn: the task may start its sleep before this line runs.
+    let started = Instant::now();
     let finish = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
         store.conn.call(|c| c.execute("DELETE FROM ingest_outbox", [])).await.expect("the save ends");
     });
-    let started = Instant::now();
 
     let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
 
@@ -5056,6 +5167,15 @@ async fn every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule() {
                 let ask = json!({ "project": gone, "root_path": sub.to_string_lossy(), "subfolder": true });
                 let (status, body) = h.post_json("/v1/projects/locate", ask).await;
                 refused(&route, status, &body);
+            }
+            ("POST", "/import") => {
+                h.ctx.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+                let text = engram_export(vec![observation("deleted-map", Some("notes"), "Port", "a note for a deleted project")]);
+                for dry_run in [true, false] {
+                    let ask = json!({ "text": text, "from": "engram", "dry_run": dry_run, "project_map": [["notes", { "project": gone }]] });
+                    let (status, body) = h.post_json("/v1/import", ask).await;
+                    refused(&route, status, &body);
+                }
             }
             _ => panic!("{route} takes a project and no check here says what it does with a deleted one"),
         }

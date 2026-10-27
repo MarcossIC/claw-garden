@@ -7,6 +7,7 @@
 use std::io::Write;
 use std::path::Path;
 
+use clawg_core::memory::portability::format::ProjectLine;
 use clawg_core::memory::portability::{export, markdown, Export, ExportFilter};
 use clawg_core::preferences::Lang;
 
@@ -64,6 +65,8 @@ fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
 pub struct Written {
     pub memories: usize,
     pub projects: usize,
+    /// Projects with neither a folder nor a root, but tombstones.
+    pub without_folder: usize,
     pub derivations: usize,
     pub pieces: usize,
     pub pairs: usize,
@@ -76,6 +79,7 @@ impl Written {
         Written {
             memories: exported.memories.len(),
             projects: exported.projects.len(),
+            without_folder: without_folder(&exported.projects),
             derivations: exported.derivations.len(),
             pieces: exported.pieces.len(),
             pairs: exported.conflicts.len(),
@@ -83,6 +87,12 @@ impl Written {
             legacy_rows: exported.legacy_rows,
         }
     }
+}
+
+/// The projects of `lines` with neither a folder nor a root, tombstones
+/// aside.
+fn without_folder(lines: &[ProjectLine]) -> usize {
+    lines.iter().filter(|p| p.folders.is_empty() && p.root_path.is_none() && p.merged_into.is_none()).count()
 }
 
 /// `n` and the noun that agrees with it.
@@ -119,6 +129,21 @@ pub fn report(lang: Lang, out: &Path, w: &Written, format: ExportFormat) -> Stri
             plural(w.memories, "memoria", "memorias"),
         ),
     }];
+    if format == ExportFormat::Jsonl && w.without_folder > 0 {
+        let one = w.without_folder == 1;
+        lines.push(match lang {
+            Lang::En => format!(
+                "{} without a folder, which an import places by {} id or {} name",
+                plural(w.without_folder, "project", "projects"),
+                if one { "its" } else { "their" },
+                if one { "its" } else { "their" },
+            ),
+            Lang::Es => format!(
+                "{} sin carpeta, que una importación ubica por su id o su nombre",
+                plural(w.without_folder, "proyecto", "proyectos"),
+            ),
+        });
+    }
     lines.push(
         match lang {
             Lang::En => "the file holds the text of these memories as stored; `clawg secrets` lists the ones that hold a secret",
@@ -196,8 +221,8 @@ mod tests {
     #[test]
     fn the_export_report_agrees_with_its_numbers_in_both_languages() {
         let out = Path::new("/x/m.jsonl");
-        let one = Written { memories: 1, projects: 1, derivations: 1, pieces: 1, pairs: 1, outbox_waiting: 1, legacy_rows: 1 };
-        let many = Written { memories: 2, projects: 0, derivations: 3, pieces: 4, pairs: 5, outbox_waiting: 2, legacy_rows: 2 };
+        let one = Written { memories: 1, projects: 1, without_folder: 0, derivations: 1, pieces: 1, pairs: 1, outbox_waiting: 1, legacy_rows: 1 };
+        let many = Written { memories: 2, projects: 0, without_folder: 0, derivations: 3, pieces: 4, pairs: 5, outbox_waiting: 2, legacy_rows: 2 };
         assert_eq!(
             report(Lang::En, out, &one, ExportFormat::Jsonl),
             "wrote 1 memory, 1 project, 1 derivation, 1 piece and 1 pair to /x/m.jsonl\n\
@@ -225,5 +250,26 @@ mod tests {
         std::fs::write(&taken, "mine").unwrap();
         let err = run(Lang::Es, dir.path(), &taken, &ExportFilter::default(), ExportFormat::Jsonl, 0).unwrap_err();
         assert!(err.ends_with("ya existe; export escribe un archivo nuevo"), "{err}");
+    }
+
+    #[test]
+    fn an_export_counts_its_projects() {
+        use clawg_core::memory::portability::format::FolderLine;
+        let out = Path::new("/x/m.jsonl");
+        let project = |id: &str| ProjectLine { id: id.into(), ..Default::default() };
+        let lines = [
+            ProjectLine { folders: vec![FolderLine { root_path: "/work/app".into(), ..Default::default() }], ..project("app-1a2b") },
+            ProjectLine { root_path: Some("/work/old".into()), ..project("old-0000") },
+            ProjectLine { name: Some("Ideas".into()), ..project("ideas-3c4d") },
+            ProjectLine { merged_into: Some("app-1a2b".into()), ..project("old-5e6f") },
+        ];
+        assert_eq!(without_folder(&lines), 1);
+        let written = Written { projects: 4, without_folder: 1, ..Written::default() };
+        let en = report(Lang::En, out, &written, ExportFormat::Jsonl);
+        assert!(en.starts_with("wrote 0 memories, 4 projects, "), "{en}");
+        assert!(en.contains("\n1 project without a folder, which an import places by its id or its name\n"), "{en}");
+        let es = report(Lang::Es, out, &Written { without_folder: 2, ..written }, ExportFormat::Jsonl);
+        assert!(es.contains("\n2 proyectos sin carpeta, que una importación ubica por su id o su nombre\n"), "{es}");
+        assert!(!report(Lang::En, out, &Written::default(), ExportFormat::Jsonl).contains("without a folder"));
     }
 }
