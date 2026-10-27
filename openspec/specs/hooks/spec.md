@@ -6,7 +6,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - [agent-lifecycle-hooks](../../changes/archive/2026-10-18-agent-lifecycle-hooks/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec: R1 vive en [`specs/retrieval`](../retrieval/spec.md) y acá están R2 a R5.
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo R6, que en esa spec es R5, y el campo `session_id` de R2). El registro del daemon y el sello en el save están en [`specs/ingest`](../ingest/spec.md), «La sesión del host».
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19 (sólo el aviso de revisión de R4).
-- [project-locators](../../changes/project-locators/proposal.md), su entrega 3a, que sale en 0.64.0 (sólo la línea de las sugerencias pendientes de R4), y su entrega 3b, en la misma versión (sólo el `cwd` como `path` del registro).
+- [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 3a, que sale en 0.65.0 (sólo la línea de las sugerencias pendientes de R4), y su entrega 3b, en la misma versión (sólo el `cwd` como `path` del registro).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (R7, LP12 de esa spec, y la excepción que suma a R3).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (AL6, y el idioma que suma a R4 y R5). Las notas que el daemon escribe en el contexto están en [`specs/retrieval`](../retrieval/spec.md), AL5.
 

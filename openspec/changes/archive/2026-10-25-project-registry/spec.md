@@ -1,6 +1,6 @@
 # project-registry — Especificación
 
-Esta especificación cubre la **entrega 0, el fundido**, de la [propuesta](proposal.md#entregas): cambia R15, R16 y R18 de [`specs/project`](../../../specs/project/spec.md) y suma una fila a R7 de [`specs/doctor`](../../../specs/doctor/spec.md). Lo que no se nombra aquí sigue como está. Las entregas 1 a 4 pasaron, al archivar, a [project-locators](../../project-locators/proposal.md) (93), que escribe sus requisitos.
+Esta especificación cubre la **entrega 0, el fundido**, de la [propuesta](proposal.md#entregas): cambia R15, R16 y R18 de [`specs/project`](../../../specs/project/spec.md) y suma una fila a R7 de [`specs/doctor`](../../../specs/doctor/spec.md). Lo que no se nombra aquí sigue como está. Las entregas 1 a 4 pasaron, al archivar, a [project-locators](../2026-10-27-project-locators/proposal.md) (93), que escribe sus requisitos.
 
 ## Definiciones
 

@@ -10,7 +10,7 @@ Fuente de verdad del comportamiento actual con secretos: el detector (formatos c
 - [secret-coverage](../../changes/archive/2026-10-19-secret-coverage/proposal.md), archivado el 2026-10-19 (R1: `credential`, `huggingface_token`, `slack_webhook` y las formas nuevas de Slack, Stripe y PGP; R4: los `reason` de los veredictos; R5: el outbox del propio save, la cabecera de un save largo y la revival; R6: los `workspace.md`; R7, R8 y R9 nuevos).
 - [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20 (R6: un `workspace.md` guarda el texto en su forma cruda o en la copiada).
 - [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23 (CL3: la salida y las negativas de `secrets` y `purge` en el idioma del comando).
-- [project-locators](../../changes/project-locators/proposal.md), su entrega 2b, que sale en 0.64.0 (PL28: `clawg purge --project-delete N`, que saca todo el conjunto de un borrado de proyecto).
+- [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 2b, que sale en 0.65.0 (PL28: `clawg purge --project-delete N`, que saca todo el conjunto de un borrado de proyecto).
 
 ## Definiciones
 

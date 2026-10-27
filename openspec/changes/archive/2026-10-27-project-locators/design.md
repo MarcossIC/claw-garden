@@ -78,7 +78,7 @@ Es el localizador que funciona en cualquier máquina: un remoto apunta a un proy
 | Juntarla con las carpetas en una tabla de localizadores | Ver D1 |
 | Copiar el remoto a la referencia | Un proyecto tiene varios remotos cuando lo renombraron o cuando se fundió (R7 de `doctor`). La tabla ya lo representa |
 
-Lo que cambia es el remoto **de cada carpeta** (`project_path.remote`). Hasta R20, los remotos de una carpeta eran los que `project_remote` ataba a su id. Por eso una carpeta que entró al proyecto de otra por su remoto no tenía remotos propios y nunca se contradecía, y el [diseño de 89](../archive/2026-10-25-project-registry/design.md#d1-la-huella-valida-la-fila-en-una-función-pura) aceptó ese costo. Desde V27 cada carpeta graba el suyo. Una carpeta de antes con un único remoto atado lo recibe en el relleno. Una fundida (dos o más) queda en NULL y se sigue eligiendo por sus remotos atados, como en R20: no se adivina cuál es el suyo.
+Lo que cambia es el remoto **de cada carpeta** (`project_path.remote`). Hasta R20, los remotos de una carpeta eran los que `project_remote` ataba a su id. Por eso una carpeta que entró al proyecto de otra por su remoto no tenía remotos propios y nunca se contradecía, y el [diseño de 89](../2026-10-25-project-registry/design.md#d1-la-huella-valida-la-fila-en-una-función-pura) aceptó ese costo. Desde V27 cada carpeta graba el suyo. Una carpeta de antes con un único remoto atado lo recibe en el relleno. Una fundida (dos o más) queda en NULL y se sigue eligiendo por sus remotos atados, como en R20: no se adivina cuál es el suyo.
 
 ## D3. El primer commit se lee con `git`, una vez por directorio git
 

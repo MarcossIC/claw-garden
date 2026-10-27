@@ -2,12 +2,12 @@
 
 Esta especificación cubre seis entregas de la [propuesta](proposal.md):
 
-- la **entrega 1, el registro (V27)** (PL1 a PL10). Cambia R10, R16, R18 y R20 de [`specs/project`](../../specs/project/spec.md) y suma V27 a [`specs/storage`](../../specs/storage/spec.md);
-- la **entrega 2a, unir proyectos (V28)** (PL11 a PL20, [más abajo](#entrega-2a-unir-proyectos)). Cambia PL9 y suma V28 a `specs/storage` y tres hallazgos a [`specs/doctor`](../../specs/doctor/spec.md);
+- la **entrega 1, el registro (V27)** (PL1 a PL10). Cambia R10, R16, R18 y R20 de [`specs/project`](../../../specs/project/spec.md) y suma V27 a [`specs/storage`](../../../specs/storage/spec.md);
+- la **entrega 2a, unir proyectos (V28)** (PL11 a PL20, [más abajo](#entrega-2a-unir-proyectos)). Cambia PL9 y suma V28 a `specs/storage` y tres hallazgos a [`specs/doctor`](../../../specs/doctor/spec.md);
 - la **entrega 2b, borrar proyectos (V29)** (PL21 a PL31, [más abajo](#entrega-2b-borrar-proyectos));
-- la **entrega 3a, proyectos sin carpeta y el agente** (PL32 a PL42, [más abajo](#entrega-3a-proyectos-sin-carpeta-y-el-agente)). Suma a `specs/project` y a [`specs/mcp`](../../specs/mcp/spec.md), sin migración;
-- la **entrega 3b, los subproyectos de un monorepo (V30)** (PL43 a PL52, [más abajo](#entrega-3b-los-subproyectos-de-un-monorepo)). Suma V30 a `specs/storage`, un chequeo a `specs/doctor`, y el camino crudo a `specs/project`, [`specs/hooks`](../../specs/hooks/spec.md) y `specs/mcp`;
-- la **entrega 4, exportar e importar (V31)** (PL53 a PL65, [más abajo](#entrega-4-exportar-e-importar)). Cambia R1, R4, R5, IL1, HI7, HI16, IU1 e IU2 de [`specs/portability`](../../specs/portability/spec.md) y PL6, PL7 y PL47, y suma V31 a `specs/storage`.
+- la **entrega 3a, proyectos sin carpeta y el agente** (PL32 a PL42, [más abajo](#entrega-3a-proyectos-sin-carpeta-y-el-agente)). Suma a `specs/project` y a [`specs/mcp`](../../../specs/mcp/spec.md), sin migración;
+- la **entrega 3b, los subproyectos de un monorepo (V30)** (PL43 a PL52, [más abajo](#entrega-3b-los-subproyectos-de-un-monorepo)). Suma V30 a `specs/storage`, un chequeo a `specs/doctor`, y el camino crudo a `specs/project`, [`specs/hooks`](../../../specs/hooks/spec.md) y `specs/mcp`;
+- la **entrega 4, exportar e importar (V31)** (PL53 a PL65, [más abajo](#entrega-4-exportar-e-importar)). Cambia R1, R4, R5, IL1, HI7, HI16, IU1 e IU2 de [`specs/portability`](../../../specs/portability/spec.md) y PL6, PL7 y PL47, y suma V31 a `specs/storage`.
 
 Lo que no se nombra aquí sigue como está. El [diseño](design.md) dice cómo se cumple cada requisito y qué alternativas se descartaron.
 
@@ -633,7 +633,7 @@ El informe (`DeleteReport`) tiene:
 - de sus filas vivas de `memory`: `by_type`, `by_author` (el `agent_id`, o `null` para las filas que no guardó ningún agente) y `by_status`;
 - `protected`: los ids de sus `user_preference` y `architectural_decision` vivas;
 - `split_pairs`: cuántos pares de `memory_conflict` unen una fila suya con una de otro proyecto o de ninguno. Quedan como están;
-- `conclusions`: los ids de las conclusiones vivas de otro proyecto, o de ninguno, que salen de una fila suya. Con el borrado pasan a `to_review` ([`specs/synthesis`](../../specs/synthesis/spec.md), R6);
+- `conclusions`: los ids de las conclusiones vivas de otro proyecto, o de ninguno, que salen de una fila suya. Con el borrado pasan a `to_review` ([`specs/synthesis`](../../../specs/synthesis/spec.md), R6);
 - `workspaces`: los `workspace.md` del proyecto, que no se tocan;
 - `folders`: los ids de raíz de las carpetas cuyo índice de docs se quita, y `remotes`: sus remotos, que siguen vinculados;
 - `pending`: cuántos saves del proyecto esperan en el outbox, y `failed`: cada save `failed` del proyecto, con su `operation_id` y su agente, porque reintentarlo lo haría volver;
@@ -710,7 +710,7 @@ Una fila que N borró MUST quedar borrada, y se nombra en `kept` con su motivo, 
 - `changed`: ya no está como N la dejó (se restauró, se volvió a borrar sola o se movió);
 - `tied`: es una pieza de un save que tiene otra pieza que queda.
 
-Son las negativas de `undelete` ([`specs/restore`](../../specs/restore/spec.md), R1). Una fila que queda borrada deja como están las que reemplazó, como lo haría su borrado con la clave tomada. Las filas que ya estaban borradas antes de N MUST NOT restaurarse. El `--undo` no corre el detector: los pares que tenía siguen ahí, y no se calculan pares con lo guardado después, como en un import.
+Son las negativas de `undelete` ([`specs/restore`](../../../specs/restore/spec.md), R1). Una fila que queda borrada deja como están las que reemplazó, como lo haría su borrado con la clave tomada. Las filas que ya estaban borradas antes de N MUST NOT restaurarse. El `--undo` no corre el detector: los pares que tenía siguen ahí, y no se calculan pares con lo guardado después, como en un import.
 
 #### Escenario: borrar y deshacer
 - GIVEN el proyecto A borrado con sus memorias, como en el escenario de PL25
@@ -749,7 +749,7 @@ La tabla de PL19 suma `POST /projects/delete`, con el proyecto en `body.project_
 
 ## PL28. `clawg purge --project-delete N`
 
-`clawg purge --project-delete N --yes [--profile P]` MUST seguir las reglas de `clawg purge <ID>` ([`specs/secrets`](../../specs/secrets/spec.md), R5): el daemon parado (toma el lock del store), sin migraciones pendientes, sin snapshot, y sin escribir nada antes de que pasen todos los chequeos. MUST:
+`clawg purge --project-delete N --yes [--profile P]` MUST seguir las reglas de `clawg purge <ID>` ([`specs/secrets`](../../../specs/secrets/spec.md), R5): el daemon parado (toma el lock del store), sin migraciones pendientes, sin snapshot, y sin escribir nada antes de que pasen todos los chequeos. MUST:
 
 - rechazar, sin escribir, un borrado que no existe, uno deshecho y uno ya purgado;
 - en una transacción, sacar para siempre cada fila de N en `project_delete_row` que siga borrada, esté en el proyecto que esté, en las tres tablas: la fila y su vector y, en `memory`, lo que `purge` saca de una fila borrada (la cabeza en `memory_piece.context` si es la primera pieza, sus enlaces de `memory_derivation` en los que es conclusión, sus pares de `memory_conflict` y las filas del outbox con su texto y su agente);
@@ -892,7 +892,7 @@ Cuando el directorio del puente no da ningún proyecto y la llamada no nombra un
 
 `POST /v1/context`, con consulta y sin ella, MUST responder `suggestions`: las sugerencias pendientes del proyecto, leídas como las lista `GET /v1/projects` (los lados por `canonical`, sin las que tienen un lado borrado, una por par), cada una con `other_id`, `other_name`, `reason` y `created_at`. Sin proyecto, o sin sugerencias, el campo se omite.
 
-`recall_context` MUST terminar con una línea por sugerencia, en el idioma de la sesión, que nombra el otro proyecto, el motivo, y que hay que preguntarle a la persona y responder con `answer_suggestion`. `session-start` MUST terminar con una sola línea que nombra hasta dos de los otros proyectos (y cuántos más hay), que hay que preguntar y responder con `answer_suggestion`, y que `recall_context` dice por qué: lo que suma el hook pasa a tener un tope de 1.500 bytes, y con los 8.000 del contexto sigue entrando en los 10.000 caracteres que inyecta el host (R4 de [`specs/hooks`](../../specs/hooks/spec.md)). Se muestran hasta que se responden. Un daemon que no manda el campo no muestra nada.
+`recall_context` MUST terminar con una línea por sugerencia, en el idioma de la sesión, que nombra el otro proyecto, el motivo, y que hay que preguntarle a la persona y responder con `answer_suggestion`. `session-start` MUST terminar con una sola línea que nombra hasta dos de los otros proyectos (y cuántos más hay), que hay que preguntar y responder con `answer_suggestion`, y que `recall_context` dice por qué: lo que suma el hook pasa a tener un tope de 1.500 bytes, y con los 8.000 del contexto sigue entrando en los 10.000 caracteres que inyecta el host (R4 de [`specs/hooks`](../../../specs/hooks/spec.md)). Se muestran hasta que se responden. Un daemon que no manda el campo no muestra nada.
 
 **Tests:** `the_context_names_the_pending_suggestions_of_its_project` (`tests/api.rs`); `a_suggestion_is_shown_until_answered` (`crates/clawg-cli/src/mcp/tools.rs`, en los dos idiomas); `session_start_names_the_pending_suggestions` y `what_the_hook_adds_stays_small`, con nueve sugerencias (`crates/clawg-cli/src/hook.rs`).
 
@@ -1165,7 +1165,7 @@ Un chequeo nuevo, `project_subfolders`, MUST nombrar con `warn` y `broken_subfol
 
 Cubre la [entrega 4](proposal.md#4-exportar-e-importar): la línea `project` del formato lleva el nombre, los localizadores, la lápida y las declaraciones de un proyecto; el import decide adónde va cada proyecto del archivo por su remoto, su id y su nombre antes que por su camino, deja las sugerencias que pide su evidencia y anota en su diario lo que agrega al registro; y `--project-map` acepta un proyecto sin carpeta. El diseño está en [D60 a D70](design.md#entrega-4-exportar-e-importar). Trae V31, que crea una tabla y un índice. El formato sigue en la versión 1.
 
-Cambia lo que fijaron PL6 y PL7 («leer, planear e importar no crean sugerencias»), R4 de [`specs/portability`](../../specs/portability/spec.md) («el import no deja sugerencias»; la raíz antes que todo) y la última línea de PL47 y de PL52 (el import no manda el camino crudo).
+Cambia lo que fijaron PL6 y PL7 («leer, planear e importar no crean sugerencias»), R4 de [`specs/portability`](../../../specs/portability/spec.md) («el import no deja sugerencias»; la raíz antes que todo) y la última línea de PL47 y de PL52 (el import no manda el camino crudo).
 
 ### Definiciones
 

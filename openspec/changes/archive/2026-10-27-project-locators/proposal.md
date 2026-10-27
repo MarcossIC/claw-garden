@@ -2,9 +2,9 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2 | M–L, en cuatro entregas M | project-registry (89), archivado: su entrega 0 sale en 0.63.0 (R20 de [`specs/project`](../../specs/project/spec.md)). Se construye sobre R1–R20, de project-reassign (77) y project-clone-identity (30) | ver [`state.yaml`](state.yaml) |
+| 2 | M–L, en cuatro entregas M | project-registry (89), archivado: su entrega 0 sale en 0.63.0 (R20 de [`specs/project`](../../../specs/project/spec.md)). Se construye sobre R1–R20, de project-reassign (77) y project-clone-identity (30) | ver [`state.yaml`](state.yaml) |
 
-Este cambio nació al partir [project-registry](../archive/2026-10-25-project-registry/proposal.md) (89) cuando se archivó. La entrega 0, el arreglo del fundido, quedó allí. Las entregas 1 a 4 y las decisiones que las ordenan pasaron aquí, con la numeración de entonces. La [exploración](../archive/2026-10-25-project-registry/exploration.md) sigue siendo la de 89: el mapa de dónde se deriva, se guarda y se consume un id de proyecto, los enfoques A a D y lo descartado. Las citas de esta propuesta apuntan al código de después de la entrega 0.
+Este cambio nació al partir [project-registry](../2026-10-25-project-registry/proposal.md) (89) cuando se archivó. La entrega 0, el arreglo del fundido, quedó allí. Las entregas 1 a 4 y las decisiones que las ordenan pasaron aquí, con la numeración de entonces. La [exploración](../2026-10-25-project-registry/exploration.md) sigue siendo la de 89: el mapa de dónde se deriva, se guarda y se consume un id de proyecto, los enfoques A a D y lo descartado. Las citas de esta propuesta apuntan al código de después de la entrega 0.
 
 ## Problema
 
@@ -17,7 +17,7 @@ Hoy un proyecto *es* una carpeta. Su id sale del camino (`derive_project_id`, `c
 3. **No existe un proyecto sin carpeta.**
    - `--to-project` exige una fila de `project` (`check_target_in`, `crates/clawg-core/src/memory/relocate.rs:426-436`), y esa fila sólo nace de una raíz.
    - Un `project_path` inventado se registra como una raíz normalizada a mano (`identity.rs:67-74`), así que su identidad es el hash de un camino que no existe.
-   - Un subproyecto de un monorepo tampoco puede ser un proyecto propio: la raíz sube hasta el primer `.git` (R1 de [`specs/project`](../../specs/project/spec.md)).
+   - Un subproyecto de un monorepo tampoco puede ser un proyecto propio: la raíz sube hasta el primer `.git` (R1 de [`specs/project`](../../../specs/project/spec.md)).
    - Por eso no se pueden colocar sin inventar carpetas las 15.709 filas que el import dejó sin proyecto en el store de producción. La cifra se midió allí y no se releyó en este repo. Mientras tanto, esas filas compiten en la búsqueda de cada proyecto (`memory_project_predicate!`, `crates/clawg-core/src/memory/search.rs:107-113`).
 4. **No hay dónde unir, renombrar o borrar un proyecto.**
    - `merge_in` (`relocate.rs:884`) sólo lo dispara el registro (`project.rs:356`).
@@ -30,7 +30,7 @@ Objetivo 2: separar las memorias por proyecto y, a la vez, poder usarlas entre p
 
 ## Decisiones
 
-Se tomaron el 2026-10-24 sobre las [decisiones abiertas](../archive/2026-10-25-project-registry/exploration.md#decisiones-abiertas) de la exploración de 89, y se conservan sus números:
+Se tomaron el 2026-10-24 sobre las [decisiones abiertas](../2026-10-25-project-registry/exploration.md#decisiones-abiertas) de la exploración de 89, y se conservan sus números:
 
 1. **La identidad se separa de la ubicación (enfoque A).**
    - `project` pasa a ser la tabla de referencia de los proyectos: id estable, nombre y lápida de unión. Todas las tablas guardan su id.
@@ -87,7 +87,7 @@ El diseño de la entrega 2b (2026-10-25) cambió dos puntos con la persona:
 
 ## Entregas
 
-Cada entrega se cierra sola, con commits atómicos y TDD estricto. El cambio se publica entero, al final, con un solo pull request a `main`. Los tests RED salen de [«Cómo se mide»](../archive/2026-10-25-project-registry/exploration.md#cómo-se-mide) de la exploración, más los que piden las decisiones de arriba. La spec, el diseño y las tareas se escriben por entrega, cuando le toca a cada una.
+Cada entrega se cierra sola, con commits atómicos y TDD estricto. El cambio se publica entero, al final, con un solo pull request a `main`. Los tests RED salen de [«Cómo se mide»](../2026-10-25-project-registry/exploration.md#cómo-se-mide) de la exploración, más los que piden las decisiones de arriba. La spec, el diseño y las tareas se escriben por entrega, cuando le toca a cada una.
 
 ### 1. El registro (V27)
 
@@ -260,7 +260,7 @@ El diseño de la entrega 2a (2026-10-25) cambió tres puntos de esta sección:
 - **Volver atrás del esquema.**
   - Un binario anterior rechaza un store más nuevo sin tocarlo (`SchemaNewer`, `db.rs:443`).
   - `clawg update` restaura en el proceso el snapshot `pre-migration` cuando el binario viejo rechaza el store (`.claude/CLAUDE.md`, `clawg update`). A mano, se hace con `clawg restore` de ese snapshot.
-  - El diseño deja también el SQL que deshace V27 a mano, conservando lo guardado después, como hizo [project-reassign](../archive/2026-10-22-project-reassign/proposal.md#datos-guardados) ([diseño, «Volver atrás»](design.md#volver-atrás)).
+  - El diseño deja también el SQL que deshace V27 a mano, conservando lo guardado después, como hizo [project-reassign](../2026-10-22-project-reassign/proposal.md#datos-guardados) ([diseño, «Volver atrás»](design.md#volver-atrás)).
 - **Volver atrás de una operación.** Una unión, con `projects merge --undo N` o su `pre-merge`. Un borrado de etapa 2, con `projects delete --undo N` o su snapshot. Lo que se purgó, sólo con un snapshot.
 
 ## Compatibilidad
@@ -275,7 +275,7 @@ El diseño de la entrega 2a (2026-10-25) cambió tres puntos de esta sección:
 ## Interacciones
 
 - **project-registry (89), archivado.** R20 es la base. El resolvedor de la entrega 1 absorbe `settle` y agrega el primer commit como segunda huella. Los tests de R20 tienen que seguir pasando. `a_different_remote_in_a_registered_path_is_another_project` sigue dando otro proyecto, y con el mismo primer commit también una sugerencia (decisiones 3 y 7).
-- **ranking-at-scale (86).** Las filas sin proyecto forman parte del fondo que mide, y colocarlas lo cambia. Este cambio va antes ([README](../../README.md)): se colocan antes de su línea base, y su informe dice si el fondo tenía filas sin proyecto.
+- **ranking-at-scale (86).** Las filas sin proyecto forman parte del fondo que mide, y colocarlas lo cambia. Este cambio va antes ([README](../../../README.md)): se colocan antes de su línea base, y su informe dice si el fondo tenía filas sin proyecto.
 - **import-job (87).** Un trabajo de importación que registre proyectos pasa por el mismo resolvedor y por el diario V26. `--project-map` gana el destino `project:ID|NOMBRE`. La forma del informe se coordina.
 - **project-reassign (77).** Mover sigue siendo «cambia el proyecto de una unidad entera y nada más» (R8). `check_target_in` consulta el registro y sigue la lápida.
 - **project-clone-identity (30).**

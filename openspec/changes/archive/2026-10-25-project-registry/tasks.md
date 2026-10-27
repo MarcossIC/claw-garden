@@ -1,6 +1,6 @@
 # project-registry — Tareas
 
-Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite. Las tareas de las entregas 1 a 4 pasaron, sin escribir, a [project-locators](../../project-locators/proposal.md) (93).
+Strict TDD: en cada tarea el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite. Las tareas de las entregas 1 a 4 pasaron, sin escribir, a [project-locators](../2026-10-27-project-locators/proposal.md) (93).
 
 ## Entrega 0. El fundido (versión patch, sin esquema)
 

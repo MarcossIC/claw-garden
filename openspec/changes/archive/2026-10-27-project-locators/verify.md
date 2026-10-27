@@ -35,7 +35,7 @@ Se usó el binario de `target-test` con `CLAWG_TEST_HOME`, `CLAWG_TEST_EMBEDDER=
 
 ### CI
 
-Pendiente para el pull request final del cambio. `project-locators` se publica entero, sin una release por entrega, así que no se abre un pull request de develop a main al cerrar cada una.
+Esta entrega no tuvo pull request propio. La cubre el CI de los pull requests #95, #96 y #97 (a `develop`), que pasó en Linux y Windows sobre lo unido hasta cada uno. `project-locators` se publica entero, sin una release por entrega, así que no se abre un pull request de develop a main al cerrar cada una.
 
 ### Lo que no se corrió
 
@@ -72,7 +72,7 @@ Se usó el binario de `target-test` con `CLAWG_TEST_HOME`, `CLAWG_TEST_EMBEDDER=
 
 ### CI
 
-Pendiente para el pull request final del cambio, como el de la entrega 1.
+Esta entrega no tuvo pull request propio. La cubre el CI de los pull requests #95, #96 y #97 (a `develop`), que pasó en Linux y Windows sobre lo unido hasta cada uno.
 
 ### Lo que no se corrió
 
@@ -132,7 +132,7 @@ Se usó el binario de `target-test`, copiado fuera del directorio de build, con 
 
 ### CI
 
-Pendiente para el pull request final del cambio, como el de las entregas 1 y 2a.
+Esta entrega no tuvo pull request propio. La cubre el CI de los pull requests #95, #96 y #97 (a `develop`), que pasó en Linux y Windows sobre lo unido hasta cada uno.
 
 ### Lo que no se corrió
 
@@ -199,7 +199,7 @@ Se usó el binario de `target-test`, copiado fuera del directorio de build, con 
 
 ### CI
 
-Pendiente para el pull request final del cambio, como el de las entregas anteriores.
+El CI del pull request #95 (a `develop`, en `a9a0cda`) pasó en Linux y Windows.
 
 ### Lo que no se corrió
 
@@ -237,13 +237,46 @@ Se usó el binario de `target/debug`, copiado fuera del directorio de build, con
 
 `clawg stop` respondió que el daemon seguía vivo después de 30 s. El log muestra `clawg serve dev stopped` en el mismo segundo del pedido, y no quedó ningún proceso: el script que manejaba la prueba esperaba al hijo `serve` recién después de `stop`, así que el pid seguía como zombi sin cosechar. No es del daemon.
 
+### Windows
+
+- Después de `cargo clean --workspace --target-dir target-test`, `cargo test --workspace --locked --no-fail-fast --target-dir target-test` pasa en `7cfe81b` (0.65.0, con la 3b y la 4 ya unidas en `develop`), con `tests/binary.rs`: ningún binario con fallos. `cargo clippy --workspace --all-targets --locked --target-dir target-test -- -A clippy::all -D warnings` y `cargo clippy --locked -p clawg-cli --target-dir target-test -- -A clippy::all -D warnings` salen con 0.
+- `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin volver a bendecir (PL52).
+- `a_merge_waits_for_the_saves_of_its_projects` pasó en la corrida completa.
+- `cargo clean --workspace` no saca los objetos de builds anteriores del workspace que quedan en `target-test/debug/deps` (`.rcgu.o`, `.exp` y `.lib` de `clawg*`, unos 674 MB), porque cargo no los registra. No cambian el resultado.
+
+### El binario real en un home temporal, en Windows
+
+Se usó el binario de `target-test`, copiado fuera del directorio de build, con `CLAWG_TEST_HOME`, `CLAWG_TEST_EMBEDDER=fake`, `CLAWG_TEST_DEFAULT_PORT=off` y `clawg serve --profile dev --port 0`. Sirvió sólo por TCP, porque el camino del socket en el home temporal (172 bytes) no entra en `sun_path`. Los repositorios se hicieron con `git`: un monorepo con `origin` `https://github.com/acme/mono.git`, un clone suyo en otro camino con el mismo `origin`, y un `git worktree` del monorepo, cuyo `.git` git escribió como `gitdir: C:/…/mono/.git/worktrees/wt-mono`. El puente (`clawg mcp --no-autostart --agent claude-code`) se manejó por stdio real.
+
+1. `projects create web` creó `web-0727`. `projects locate web <mono>\apps\web --subfolder` dijo que la carpeta lleva a `web-0727` dentro del repositorio de `mono-c05e`, nombró el `projects move … --dry-run` y dijo que una sesión abierta antes sigue con `mono-c05e`.
+2. Un puente abierto en `apps\web\src` guardó en `web-0727`, y uno abierto en la raíz guardó en `mono-c05e` (`memories list`).
+3. `hook session-start` leyó `web` desde el `apps\web\src` del monorepo y del clone, y desde el `apps\web` y el `apps\web\src` del worktree. Desde las tres raíces y desde `apps\api` leyó el monorepo.
+4. `projects list` mostró `subfolder apps/web leads to web (web-0727)` bajo el monorepo, y la declaración bajo `web`, con sus caminos en el monorepo y en el clone. El worktree no es una carpeta propia, como en Linux.
+5. `projects locate mono-c05e <mono>\apps\web --subfolder` la quitó y nombró `clawg projects merge web-0727 --into mono-c05e --dry-run`. Lo guardado en `web` siguió allí, los tres caminos de `web` volvieron a leer el monorepo, y `projects list` mostró `web` sin carpeta.
+6. `doctor` dio `project_subfolders` `ok`, con 20 `ok`, 2 `info`, 1 `warn` y 2 `error`. Todos son del entorno: `path` `shadowed` (en el PATH de esa máquina hay otro `clawg.exe` antes), `socket` `path_unusable`, `store.owner` y `mcp` (`info`), y `backup.age` (`warn`: el home temporal no tiene snapshot, como en Linux). Nada nuevo.
+
+En otro home se probaron las formas de escribir un camino en Windows, con la declaración `apps/web → web`:
+
+- `projects locate … --subfolder` respondió que la carpeta ya lleva a `web`, sin escribir nada, con cada una de estas formas: `apps\web` y `apps/web` relativos, `..\web` desde `apps\api`, barras `/`, la unidad en minúscula, el camino en mayúsculas, un `\` final, un camino `\\?\` bien formado, el camino corto 8.3 y el camino a través del worktree. La raíz del checkout y la del worktree salieron con 1 («top of a checkout»); un archivo o una carpeta que no existe, con «is not a directory».
+- `session-start` leyó `web` con cada una de esas formas como `cwd`, también relativa y con segmentos `..`. Los puentes abiertos con la unidad en minúscula, en mayúsculas o con el camino 8.3 guardaron en `web`.
+- Un registro por HTTP con la raíz del monorepo y un `path` con la unidad en minúscula, barras `/`, `\\?\` o mayúsculas respondió `web`. Uno relativo, o bajo otra raíz, respondió el monorepo, porque se deja fuera (PL44).
+
+`clawg stop` terminó el daemon con salida 0 cada vez.
+
+### Lo que la verificación encontró
+
+- **Un camino `\\?\` mal formado.** Con `{"cwd": "\\\\?\\C:\\…\\mono\\apps/web/src"}` (el prefijo verbatim con `/` después), `session-start` lee el monorepo en vez de `web`, y el monorepo queda con una segunda carpeta `\\?\C:\…\mono`.
+  - La causa: en un camino `\\?\` la `/` no separa, y `fs::canonicalize` falla. El respaldo de `canonical_form` (`crates/clawg-core/src/memory/identity.rs:82-87`), `normalize_lexical(absolute(path))`, sí llega al directorio, pero no llama a `strip_verbatim`. La raíz conserva el prefijo, se graba como otra carpeta y el subcamino queda fuera de ella.
+  - Lo mismo pasa con un cliente HTTP propio que manda una raíz con los separadores mezclados: `POST /v1/projects` toma `root_path` como llega, y cada forma se graba como otra carpeta. El puente, los hooks y la CLI mandan siempre la raíz canónica, y ni Claude Code ni una shell dan un `cwd` así.
+  - El respaldo es anterior al cambio (`a556e90`). Queda como arreglo suelto en el backlog del [README](../../../README.md#backlog-sin-spec-arreglos-sueltos).
+
 ### CI
 
-Pendiente para el pull request final del cambio, como el de las entregas anteriores.
+El CI del pull request #96 (a `develop`, en `420a36f`) pasó en Linux y Windows. El pull request de `develop` a `main` lo vuelve a correr, sobre el cambio entero, antes del release.
 
 ### Lo que no se corrió
 
-- **Windows:** la suite, los clippy y el recorrido del binario de esta entrega no corrieron en Windows.
+- **El socket en el recorrido de Windows:** el home temporal sirvió sólo por TCP. El socket en Windows lo cubren los tests de `tests/binary.rs`.
 - **El perfil dev y el de producción:** no se tocó ningún perfil real.
 
 ### Qué se vio fallar antes de cada cambio
@@ -271,15 +304,56 @@ Se usó el binario de `target/debug`, copiado fuera del directorio de build, con
 5. Un export de engram con `--project-map board=project:notas` dejó su nota en `notas`. Con `notas` borrado, el mismo import por su id respondió 409 `project_deleted`, y por su nombre 404, porque el nombre de un proyecto borrado queda libre (PL27).
 6. `doctor` dio un `error` `socket` `path_unusable` (el camino largo del home temporal) y dos `info` del entorno (`store.owner`, `mcp`). Nada nuevo.
 
+### Windows
+
+- La misma corrida de la 3b, en `7cfe81b`: la suite y los dos clippy pasan en `target-test`, y los contratos del modelo pasan sin volver a bendecir (PL65).
+
+### El binario real en dos homes temporales, en Windows
+
+Como en Linux, con el binario de `target-test` copiado fuera del directorio de build y los mismos `CLAWG_TEST_*`, por TCP solo. Los homes A y B corrieron uno después del otro. Los repositorios se hicieron con `git`: `app` y `mono`, con `origin` `https://github.com/acme/app.git` y `https://github.com/acme/mono.git`, y un clone de cada uno en otro camino para el home B.
+
+1. En A: `projects create ideas` (`ideas-7033`), `projects create web` (`web-136d`) y `projects locate web <monoA>\apps\web --subfolder`. Se guardaron cinco memorias: una en `ideas` por su nombre (`project: "ideas"`, desde el puente), dos en `app` desde un puente en su repositorio, una por HTTP después de registrar el camino crudo `<monoA>\apps\web\src` (que respondió `web-136d`) y una en `mono`. `clawg export` escribió 5 memorias y 4 proyectos y dijo «2 projects without a folder». Las líneas `project` llevaron el nombre, las carpetas con su `root_path` con `\`, su remoto y su primer commit, los remotos y la declaración de `mono` (`subfolders: [{apps/web, web-136d}]`).
+2. En B, con los clones registrados (`app-3eed`, `mono-3629`): `import --dry-run` e `import` dieron el mismo reporte, salvo la línea del snapshot y el número del import. Importaron 5 de 5; `app` y `mono` fueron `by remote`, `ideas` y `web` se crearon con su id y su nombre, y la declaración `apps/web → web-136d` se escribió en `mono-3629`. `projects list` la mostró en los dos lados, y el registro del clone con el camino crudo `…\apps\web\src` respondió `web-136d`.
+3. `projects move --id 3 --to-project ideas` (el movimiento 1) y otra vez `import`: «imported 0 of 5», 4 ya presentes y «already here, moved to another project: ideas-7033 1». `ideas` y `web` fueron `by id`, y la declaración quedó como estaba (`declared_here`).
+4. Después de `projects move --undo 1`, `import --undo 1` (su prueba en seco dio el mismo reporte) retiró las 5 memorias, las carpetas grabadas de A, los dos proyectos creados y la declaración. `projects list` quedó, byte a byte, como antes del import.
+5. Se usó un export de engram sintético (0.2.0): el proyecto `board`, con una observación `decision` y una sesión con su resumen. Con `--project-map board=project:notas`, sus dos filas quedaron en `notas-9039`, bajo `migrated`. Con `notas` borrado (`projects delete notas-9039 --with-memories` y su `--confirm`), el mismo import por su id respondió 409 `project_deleted`, cuyo `detail` nombra el borrado 1 y su `--undo`. Por su nombre respondió 404, desde la CLI y por HTTP (PL27).
+6. Las formas de un camino en Windows, con `web2` declarado en el clone de B: `--project-map board=<camino en apps\web\src>` llevó a `web2` con `\`, con `/`, con la unidad en minúscula y relativo desde el clone. `--map-root` llevó a NEW (`by map`) con `\`, con `/` o en mayúsculas.
+7. `doctor` dio 20 `ok`, 2 `info`, 1 `warn` y 2 `error` en A, y 21 `ok`, 2 `info` y 2 `error` en B, todos del entorno, como en la 3b. Nada nuevo.
+
+`clawg stop` terminó cada daemon con salida 0.
+
+### Lo que la verificación encontró
+
+- **`--map-root` compara OLD byte a byte.**
+  - `roots_here` (`crates/clawg-core/src/memory/portability/import.rs:415`) busca un OLD igual al `root_path` exportado. En Windows, `C:/…/mono`, `c:\…` o un `\` final no son `C:\…\mono`, y el mapa se ignora sin aviso: el proyecto cae `by remote`.
+  - Un OLD que no está en el archivo también se ignora sin aviso. `--project-map`, en cambio, nombra los nombres que ninguna nota tiene.
+  - Es anterior a la entrega 4 (`6424bca`). Queda como arreglo suelto en el backlog del [README](../../../README.md#backlog-sin-spec-arreglos-sueltos).
+- **Un `--map-root` hacia una subcarpeta declarada** hace lo que dice la spec: `--map-root <monoA>=<monoB>\apps\web\src` pone `mono` en `web2`. Después escribe la declaración del archivo como `web2 apps/web → web-136d`, cuyo lado del repositorio no tiene carpeta y nadie alcanza, y deja la sugerencia `similar_name` entre `web2` y `mono-3629`.
+
 ### CI
 
-Pendiente para el pull request final del cambio, como el de las entregas anteriores.
+El CI del pull request #97 (a `develop`) pasó en Linux y Windows en `9504600`. Antes hubo dos corridas que fallaron en Windows, y lo que cambiaron fueron dos tests, no el código:
+
+- **En `a14776b`:** `a_project_map_path_in_a_declared_subfolder_goes_to_its_project` armaba el camino del mapa con `/` sobre la raíz canónica, que en Windows lleva el prefijo `\\?\`. `6686947` le saca el prefijo con `strip_verbatim` y une los componentes con `join`. Es el camino mal formado del hallazgo de la 3b: se arregló el test, y el respaldo de `canonical_form` sigue como estaba.
+- **En `6686947`:** `a_merge_waits_for_the_saves_of_its_projects` falló con la máquina cargada, porque la tarea que termina el save podía empezar su espera antes de que el test tomara la hora. `9504600` toma la hora antes del `spawn`.
+
+El pull request de `develop` a `main` lo vuelve a correr, sobre el cambio entero, antes del release.
 
 ### Lo que no se corrió
 
-- **Windows:** la suite, los clippy y el recorrido del binario de esta entrega no corrieron en Windows.
+- **El socket en el recorrido de Windows:** los homes temporales sirvieron sólo por TCP, como en la 3b.
 - **El perfil dev y el de producción:** no se tocó ningún perfil real.
 
 ### Qué se vio fallar antes de cada cambio
 
 - **Tareas 56 a 65:** cada tanda de tests se escribió antes que su código, y no compilaba sin lo que nombra: V31 y su fila de checksum, los campos nuevos de `ProjectLine`, el módulo `projects.rs`, los campos nuevos de `ImportReport` y `UndoReport`, `Seat::present_elsewhere`, `MapTarget`, `MapTo` y `Written::without_folder`. `a_row_imported_deleted_leaves_its_deleted_project_deleted` falló antes de su arreglo: el proyecto borrado volvía.
+
+## Al archivar (2026-10-27)
+
+- Los requisitos ya estaban en las specs, cada uno consolidado con su entrega: PL1 a PL65 en [`specs/project`](../../../specs/project/spec.md), V27 a V31 en [`specs/storage`](../../../specs/storage/spec.md), y lo de cada entrega en `specs/portability`, `specs/doctor`, `specs/mcp`, `specs/hooks` y `specs/secrets`. Al archivar sólo cambió el «Origen» de esas siete specs, que ahora apunta aquí y dice 0.65.0.
+- **La versión no sube.** La entrega 1 subió la suya (0.64.0), que se absorbió en 0.65.0 al archivar embed-throughput, y 0.65.0 todavía no se publicó (el último tag es `v0.63.0`). Archivar no agrega código. Subir a 0.66.0 habría dejado falsas, sin ningún cambio de conducta, las notas que dicen que este cambio y embed-throughput salen en 0.65.0. Es la misma regla que se siguió al [archivar 89](../2026-10-25-project-registry/verify.md#al-archivar-2026-10-25). Los títulos de este documento conservan la versión con la que se verificó cada entrega.
+- **El CI.** Las entregas 1 a 2b no tuvieron pull request propio. La 3a, la 3b y la 4 sí (#95, #96 y #97, a `develop`), y su CI pasó en Linux y Windows. El del #97 corrió sobre todo el cambio unido en `develop`, así que cubre también las entregas 1 a 2b. El pull request de `develop` a `main` lo vuelve a correr antes del release.
+- **Lo que queda fuera del cambio:**
+  - el paso operativo de ubicar las 15.709 filas sin proyecto del import en prod: no es código, pide autorización explícita y corre con 0.65.0 instalado, porque un build de debug no abre prod. Las que queden sin proyecto se cuentan antes de la línea base de 86;
+  - los dos hallazgos de Windows (el respaldo de `canonical_form` sin `strip_verbatim`, y `--map-root` comparado byte a byte), anteriores al cambio, que quedan como arreglos sueltos en el backlog del [README](../../../README.md#backlog-sin-spec-arreglos-sueltos).
+- Las citas `ruta:línea` de la propuesta, la spec y el diseño que quedan aquí no cambian, porque describen el código contra el que se escribieron. Sólo se ajustaron los enlaces relativos que rompió el traslado a `archive/`.

@@ -22,7 +22,7 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo lo que el protocolo completo dice de LAST SESSION).
 - [protected-verdicts](../../changes/archive/2026-10-20-protected-verdicts/proposal.md), archivado el 2026-10-20 (sólo `user_answered` en «Los conflictos en las herramientas», la respuesta del usuario en la apertura y su largo).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (desde «LP8. La línea del otro idioma» hasta «LP11»). La preferencia está en [`specs/preferences`](../preferences/spec.md).
-- [project-locators](../../changes/project-locators/proposal.md), su entrega 3a, que sale en 0.64.0 (sólo «Un proyecto por su id o su nombre»), y su entrega 3b, en la misma versión (sólo el camino crudo y su clave en «Registro del proyecto»).
+- [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 3a, que sale en 0.65.0 (sólo «Un proyecto por su id o su nombre»), y su entrega 3b, en la misma versión (sólo el camino crudo y su clave en «Registro del proyecto»).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (desde «AL1. Sin preferencia o con `en`, lo de antes» hasta el final, el protocolo en español en «El protocolo de memoria» y sus apartados, y LP9 con `es`). Las notas del contexto y el parser de `rag-eval` en español están en [`specs/retrieval`](../retrieval/spec.md) (AL5, AL7), los hooks en [`specs/hooks`](../hooks/spec.md) (AL6) y el contrato en español en [`specs/quality`](../quality/spec.md).
 
 ## Definiciones

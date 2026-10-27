@@ -104,7 +104,7 @@ Requisitos en la [spec](spec.md) (PL1 a PL10) y decisiones en el [diseño](desig
 
 ### 9. La versión
 
-- [x] Si 0.63.0 ya se publicó: `0.63.0` → `0.64.0` (la entrega se publica sola y trae esquema y comandos nuevos), y `cargo update --workspace`. Si no se publicó, la entrega sale con la 0 de 89 en 0.63.0 y la versión no sube (como pasó al [archivar 89](../archive/2026-10-25-project-registry/tasks.md)).
+- [x] Si 0.63.0 ya se publicó: `0.63.0` → `0.64.0` (la entrega se publica sola y trae esquema y comandos nuevos), y `cargo update --workspace`. Si no se publicó, la entrega sale con la 0 de 89 en 0.63.0 y la versión no sube (como pasó al [archivar 89](../2026-10-25-project-registry/tasks.md)).
 - Commit: `chore: bump version to 0.64.0`
 
 ### 10. Verificación
@@ -115,7 +115,7 @@ Requisitos en la [spec](spec.md) (PL1 a PL10) y decisiones en el [diseño](desig
   - otra en su camino viejo recibe uno propio;
   - `projects list` muestra la sugerencia de una copia y un proyecto cuya carpeta se borró;
   - `projects rename` conserva lo guardado.
-- [ ] El CI en Linux y Windows, en el pull request final del cambio.
+- [x] El CI en Linux y Windows: el de los pull requests #95, #96 y #97 a `develop`, sobre lo unido hasta cada uno. El de `develop` a `main` lo vuelve a correr antes del release.
 - [x] `verify.md`, sección «Entrega 1».
 - [x] No queda otro directorio de build que `target` y `target-test`.
 
@@ -466,7 +466,7 @@ Requisitos en la [spec](spec.md#entrega-3a-proyectos-sin-carpeta-y-el-agente) (P
 
 - [x] La suite y los dos clippy de `.claude/CLAUDE.md`, en Linux.
 - [x] La suite y los dos clippy, en `target-test` en Windows, con `--locked`.
-- [ ] El CI en Linux y Windows, en el pull request final del cambio.
+- [x] El CI en Linux y Windows: el del pull request #95 a `develop`. El de `develop` a `main` lo vuelve a correr antes del release.
 - [x] El binario en un home temporal, en Linux y en Windows:
   - un save con `project` crea un proyecto sin carpeta, y otro con un nombre parecido devuelve el candidato;
   - `projects create` y `projects locate` desde la CLI;
@@ -599,7 +599,7 @@ Requisitos en la [spec](spec.md#entrega-3b-los-subproyectos-de-un-monorepo) (PL4
 ### 55. Verificación
 
 - [x] La suite y los dos clippy de `.claude/CLAUDE.md`, con `--locked`, en Linux.
-- [ ] Lo mismo en `target-test` en Windows.
+- [x] Lo mismo en `target-test` en Windows, con `--locked`, y el binario en un home temporal también en Windows.
 - [x] El binario en un home temporal, con un monorepo git real con un `origin` `https://…` y un clone del mismo remoto en otro camino:
   - `projects create web` y `projects locate web <monorepo>/apps/web --subfolder`, cuya salida nombra lo que quedó en el monorepo;
   - `session-start` desde `apps/web/src` lee `web`, un save desde ahí queda en `web`, y uno desde la raíz queda en el monorepo;
@@ -607,7 +607,7 @@ Requisitos en la [spec](spec.md#entrega-3b-los-subproyectos-de-un-monorepo) (PL4
   - `projects list` muestra la declaración en los dos lados;
   - `projects locate <monorepo> <monorepo>/apps/web --subfolder` la quita, y lo guardado en `web` sigue allí;
   - `doctor` no marca nada nuevo.
-- [ ] El CI en Linux y Windows, en el pull request final del cambio.
+- [x] El CI en Linux y Windows: el del pull request #96 a `develop`. El de `develop` a `main` lo vuelve a correr antes del release.
 - [x] `verify.md`, sección «Entrega 3b».
 - [x] No queda otro directorio de build que `target` y `target-test`.
 
@@ -740,7 +740,7 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
 ### 67. Verificación
 
 - [x] La suite y los dos clippy de `.claude/CLAUDE.md`, con `--locked`, en Linux.
-- [ ] Lo mismo en `target-test` en Windows.
+- [x] Lo mismo en `target-test` en Windows, con `--locked`, y el binario en dos homes temporales también en Windows.
 - [x] El binario en dos homes temporales, A y B, con un repositorio git real con un `origin` `https://…`, clonado en otro camino en cada home:
   - en A: un proyecto sin carpeta creado con `projects create`, memorias en él y en el repositorio, y un monorepo con su declaración; después, `clawg export`;
   - en B: `clawg import`. Las memorias del repositorio quedan en el proyecto del clone de B, las del proyecto sin carpeta en uno con su nombre, y la declaración lleva al subproyecto;
@@ -748,6 +748,15 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
   - `clawg import --undo N` deja `projects list` como estaba;
   - un export de engram con `--project-map NOMBRE=project:ideas`, y el 409 con un proyecto borrado;
   - `doctor` no marca nada nuevo.
-- [ ] El CI en Linux y Windows, en el pull request final del cambio.
+- [x] El CI en Linux y Windows: el del pull request #97 a `develop`, sobre todo el cambio. El de `develop` a `main` lo vuelve a correr antes del release.
 - [x] `verify.md`, sección «Entrega 4».
 - [x] No queda otro directorio de build que `target` y `target-test`.
+
+## Archive
+
+### 68. Archive
+
+- [x] Los requisitos ya estaban en las specs, consolidados con cada entrega. El «Origen» de `specs/project`, `specs/storage`, `specs/portability`, `specs/doctor`, `specs/mcp`, `specs/hooks` y `specs/secrets` apunta al archivo y dice 0.65.0.
+- [x] `git mv` a `changes/archive/2026-10-27-project-locators`, con `state.yaml` archivado y los enlaces relativos que rompió el traslado ajustados, también los del archivo de 89. Se cambiaron la fila 93 y el orden de ejecución del `README.md` de openspec, y el backlog suma los dos hallazgos de Windows.
+- [x] La versión no sube: 0.65.0 todavía no se publicó y ya trae el cambio ([verify](verify.md#al-archivar-2026-10-27)).
+- Commit: `docs(openspec): archive project locators and fold them into the specs`
