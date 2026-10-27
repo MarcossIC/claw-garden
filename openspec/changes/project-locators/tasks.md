@@ -1,6 +1,6 @@
 # project-locators — Tareas
 
-Strict TDD: en cada tarea, el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite (`cargo test --workspace --target-dir target-test` en Windows) y clippy (`cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`). Antes de empezar una entrega: `cargo clean --workspace --target-dir target-test`. Las tareas de las entregas 3 y 4 se escriben cuando les toque. Ninguna entrega sube la versión: el cambio sale entero en 0.64.0.
+Strict TDD: en cada tarea, el test va primero y falla, por la aserción o porque no compila. Cada tarea es un commit convencional que compila y pasa la suite (`cargo test --workspace --target-dir target-test` en Windows) y clippy (`cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`). Antes de empezar una entrega: `cargo clean --workspace --target-dir target-test`. Las tareas de la entrega 4 se escriben cuando le toque. Ninguna entrega sube la versión: el cambio sale entero en 0.64.0.
 
 ## Entrega 1. El registro (V27)
 
@@ -473,3 +473,139 @@ Requisitos en la [spec](spec.md#entrega-3a-proyectos-sin-carpeta-y-el-agente) (P
   - una carpeta sin VCS movida deja su sugerencia, `recall_context` y `session-start` la muestran, y `answer_suggestion` con `apart` la quita.
 - [x] `verify.md`, sección «Entrega 3a».
 - [x] No queda otro directorio de build que `target` y `target-test`.
+
+## Entrega 3b. Los subproyectos de un monorepo (V30)
+
+Requisitos en la [spec](spec.md#entrega-3b-los-subproyectos-de-un-monorepo) (PL43 a PL52) y decisiones en el [diseño](design.md#entrega-3b-los-subproyectos-de-un-monorepo) (D50 a D59). Antes de la tarea 45: `cargo clean --workspace --target-dir target-test`. La versión sigue en 0.64.0, que todavía no se publicó.
+
+### 45. V30: las declaraciones (PL43; D51)
+
+- [ ] RED:
+  - `a_database_from_the_previous_version_opens_with_no_subfolder_declared` (`db.rs`, sembrado con `seed_on_disk(dir, Some(29))` y el escenario de PL43);
+  - la fila 30 en `published_migration_checksums_are_pinned` (`migrations.rs`);
+  - los conteos de migraciones aplicadas de `db.rs` pasan de 29 a 30: `after.0` del test que siembra hasta V8, `Expected exactly 30 applied migrations` y `migration_count`.
+- [ ] GREEN:
+  - `crates/clawg-core/migrations/V30__project_subfolder.sql`: la tabla, su clave primaria `(parent_id, subpath)` y el índice por `project_id`;
+  - tocar `migrations.rs` en el mismo commit, para que se recompile.
+- Commit: `feat(core): add the subfolders a repository declares as other projects`
+
+### 46. El subcamino de un camino crudo (PL44; D53)
+
+- [ ] RED:
+  - la pura `the_subpath_is_measured_from_the_top_of_the_checkout` (`identity.rs`): un camino debajo de la cima, la cima misma (vacío), un camino fuera de ella y, en Unix, un componente que no es Unicode válido;
+  - `a_path_in_a_worktree_has_its_subpath_from_the_worktree` (con un `git worktree add` real) y `a_path_that_does_not_lead_to_its_root_has_no_subpath` (dos repositorios), en `crates/clawg-core/tests/project_root.rs`.
+- [ ] GREEN:
+  - `subpath_of`, pura;
+  - `Ground::subpath(root, path)`: en `Disk`, la cima que encuentra `read_marker` subiendo desde el camino canónico, y su raíz por `root_from_marker`; en `ReadAhead` y en `FakeGround`, lo que tienen;
+  - `ProjectIdentity::path`, el camino canónico desde el que sube `resolve_project_root`, y los literales de los tests de `tools.rs` y `server.rs`.
+- Commit: `feat(core): measure a path from the top of its checkout`
+
+### 47. La declaración más profunda decide, en el store (PL45; D54, D55)
+
+- [ ] RED:
+  - la pura `the_deepest_declared_subfolder_wins` (`crates/clawg-core/src/memory/subfolder.rs`): por componentes enteros, la más profunda, la de P antes que la de una lápida y la más vieja entre lápidas;
+  - sobre `MemoryStore::new_for_test()` con el `Ground` falso y declaraciones escritas a mano (`project.rs`):
+    - `a_declared_subfolder_takes_what_is_saved_inside_it`;
+    - `a_declaration_follows_a_moved_checkout`;
+    - `a_declaration_is_read_through_merges`;
+    - `resolving_a_subfolder_joins_nothing`: un id viejo y el id de la carpeta se unen en P, y `root_id` es el de la raíz.
+- [ ] GREEN:
+  - el módulo `subfolder.rs`, registrado en `memory/mod.rs`, con `deepest` y `declared_in(c, project, subpath)`, que lee las de P y de sus lápidas y sigue `canonical`;
+  - `Registration::subpath`, que el daemon lee en la tarea 50, y `RegisterOutcome::subproject`, leído en la pasada que escribe de `register_project`, después de `write_in`.
+- Commit: `feat(core): give a path in a declared subfolder the project it leads to`
+
+### 48. Declarar, cambiar y quitar en el store (PL46; D56, D57)
+
+- [ ] RED (`subfolder.rs`, sobre `MemoryStore::new_for_test()`): `declaring_a_subfolder_writes_one_row_and_moves_nothing`, `naming_the_repository_project_removes_the_declaration`, `declaring_again_merges_a_project_only_that_subfolder_led_to`, `a_project_reached_otherwise_is_not_merged_by_a_declaration` y `a_declaration_into_a_merged_or_deleted_project_is_refused`.
+- [ ] GREEN:
+  - `declare_subfolder(store, workspaces, backups, parent, subpath, target)`, que devuelve `Declared` (`repository_id`, `subpath`, `project_id`, `already`, `removed`, `merge`);
+  - `SubfolderError` con `thiserror`: `Merged`, `Deleted`, `Shared` y la unión;
+  - la unión de Q en X por `merge_core`.
+- Commit: `feat(core): declare a subfolder of a repository as another project`
+
+### 49. Lo que se ve, la unión y el borrado (PL49, PL50; D58, D59)
+
+- [ ] RED:
+  - `a_declaration_is_listed_on_both_sides_with_its_paths` y `a_subproject_resolves_to_the_folders_of_its_repository` (`registry.rs`);
+  - `merging_and_undoing_leave_the_declarations_as_they_were` (`merge.rs`);
+  - `a_delete_report_names_its_subfolders_and_a_declaration_changes_the_code` y la pura `the_code_of_a_project_without_subfolders_does_not_change` (`project_delete.rs`).
+- [ ] GREEN:
+  - `ListedSubfolder` y `ListedProject::subfolders`, con `#[serde(default)]`: leídas en `stored_in`, y sus caminos mirados en el hilo bloqueante de `list_projects`;
+  - `folders_of_in`, con las carpetas de los repositorios de un proyecto sin carpetas propias;
+  - las declaraciones en `Set`, su línea en `code_of` y `subfolders` en `DeleteReport`.
+- Commit: `feat(core): list, resolve and report the subfolders of a project`
+
+### 50. El daemon (PL44 a PL46, PL49)
+
+- [ ] RED (`tests/api.rs`):
+  - `a_registration_without_a_path_or_with_one_elsewhere_answers_as_before`;
+  - `a_declared_subfolder_takes_what_is_saved_inside_it_in_every_clone`, el test RED de la propuesta, con repositorios reales: un monorepo con un `origin` `https://…` puesto con `git remote add` (un remoto `file://` o un camino no tiene clave, R14) y un clone suyo en otro camino, con el mismo `origin`;
+  - `a_subfolder_is_declared_through_the_daemon_and_refused_at_a_root`;
+  - el brazo de `subfolder` en `every_route_that_takes_a_project_follows_a_merge` y en `every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule`. La tabla de PL19 no cambia: no hay ruta nueva.
+- [ ] GREEN:
+  - `RegisterRequest::path`, leído con el checkout en el mismo `spawn_blocking` de `register_root`, y el `project_id` del subproyecto en la respuesta;
+  - `LocateRequest::subfolder`, los campos nuevos de `LocatedBody` y el mapeo de `SubfolderError`;
+  - `subfolders` en `GET /v1/projects`.
+- Commit: `feat(daemon): resolve and declare the subfolders of a repository`
+
+### 51. Los clientes mandan el camino crudo (PL47)
+
+- [ ] RED:
+  - `session_start_in_a_declared_subfolder_reads_its_project` (`hook.rs`);
+  - `a_bridge_in_a_declared_subfolder_saves_into_its_project`, `a_project_path_in_a_declared_subfolder_goes_to_its_project` y `a_bridge_registers_each_path_of_a_root_once` (`server.rs`);
+  - `moving_to_a_declared_subfolder_moves_into_its_project` (`projects.rs`, contra un daemon real);
+  - `the_project_of_a_path_reads_the_declarations_without_writing` y `a_store_from_before_subfolders_reads_the_project_of_the_root` (`export.rs`, este último sembrado en V29).
+- [ ] GREEN:
+  - `DaemonClient::register_project` con `path`;
+  - `project_of` del hook;
+  - en el puente, `ids_for` con la clave (raíz, camino), y `save_project` con la misma;
+  - `move_memories` (`projects.rs`);
+  - `project_id_in` y `project_id_of` con el camino crudo, la tabla temporal para un store anterior a V30, y sus llamadores en `memories.rs` y `main.rs`.
+- Commit: `feat(cli): send the path a client works in along with its root`
+
+### 52. `clawg projects locate --subfolder`, la lista y el informe de un borrado (PL48 a PL50)
+
+- [ ] RED:
+  - `projects_locate_takes_subfolder` (`cli.rs`);
+  - `a_declared_subfolder_is_printed_with_what_stayed_behind`, `a_listing_names_the_subfolders` y `a_delete_report_names_its_subfolders`, en español y en inglés (`projects.rs`).
+- [ ] GREEN: `--subfolder` en `ProjectsAction::Locate`, el método del cliente, `render_located`, las líneas de `render_list` y de `render_delete`, con una sentencia por `match` sobre `Lang`.
+- Commit: `feat(cli): declare a subfolder with projects locate --subfolder`
+
+### 53. Los hallazgos de `doctor` (PL51; D58)
+
+- [ ] RED: `a_declaration_whose_projects_are_gone_is_named` (`checks.rs`); la lectura del hecho nuevo en un store en V29 y en V30 (`inspect.rs`).
+- [ ] GREEN:
+  - las declaraciones en `inspect.rs`, leídas sólo donde está la tabla (`Has`);
+  - `project_subfolders` en `checks.rs`, con sus mensajes en los dos idiomas;
+  - su llamada en `doctor/mod.rs`, y su lugar en `every_finding`.
+- Commit: `feat(doctor): name a subfolder declared for a project that is not there`
+
+### 54. Las specs y la documentación
+
+- [ ] `specs/project`: PL43 a PL51; R1 (una subcarpeta declarada no es una raíz), R3 (el camino crudo), R4 (`path`) y R6 (la clave raíz y camino).
+- [ ] `specs/storage`: V30 y su vuelta atrás.
+- [ ] `specs/doctor`: `project_subfolders`.
+- [ ] `specs/hooks`: el `cwd` como `path`.
+- [ ] `specs/mcp`: «Registro del proyecto», con el camino crudo y su clave.
+- [ ] `specs/portability`: `export --project` con el camino crudo, y el import sin cambios.
+- [ ] `.claude/CLAUDE.md`:
+  - las declaraciones en el párrafo del proyecto de «Data profiles»;
+  - `projects locate --subfolder`, y lo que imprimen `projects list` y `projects delete --with-memories`, en «Commands»;
+  - `path` en `POST /v1/projects`, `subfolder` en `POST /v1/projects/locate`, y `subfolders` en `GET /v1/projects` y en el informe de un borrado, en la API;
+  - `project_subfolders` en `clawg doctor`.
+- [ ] El contrato del modelo no cambia: `the_agent_contract_matches_its_file` y su variante en español pasan sin volver a bendecir.
+- Commit: `docs: record the subfolders of a monorepo`
+
+### 55. Verificación
+
+- [ ] La suite y los dos clippy de `.claude/CLAUDE.md`, en `target-test` en Windows y con `--locked`, y en Linux.
+- [ ] El binario en un home temporal, con un monorepo git real con un `origin` `https://…` y un clone del mismo remoto en otro camino:
+  - `projects create web` y `projects locate web <monorepo>/apps/web --subfolder`, cuya salida nombra lo que quedó en el monorepo;
+  - `session-start` desde `apps/web/src` lee `web`, un save desde ahí queda en `web`, y uno desde la raíz queda en el monorepo;
+  - el clone llega a los dos, y un worktree del monorepo llega a `web` desde su `apps/web`;
+  - `projects list` muestra la declaración en los dos lados;
+  - `projects locate <monorepo> <monorepo>/apps/web --subfolder` la quita, y lo guardado en `web` sigue allí;
+  - `doctor` no marca nada nuevo.
+- [ ] El CI en Linux y Windows, en el pull request final del cambio.
+- [ ] `verify.md`, sección «Entrega 3b».
+- [ ] No queda otro directorio de build que `target` y `target-test`.

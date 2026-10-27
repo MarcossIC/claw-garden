@@ -1,13 +1,14 @@
 # project-locators — Especificación
 
-Esta especificación cubre cuatro entregas de la [propuesta](proposal.md):
+Esta especificación cubre cinco entregas de la [propuesta](proposal.md):
 
 - la **entrega 1, el registro (V27)** (PL1 a PL10). Cambia R10, R16, R18 y R20 de [`specs/project`](../../specs/project/spec.md) y suma V27 a [`specs/storage`](../../specs/storage/spec.md);
 - la **entrega 2a, unir proyectos (V28)** (PL11 a PL20, [más abajo](#entrega-2a-unir-proyectos)). Cambia PL9 y suma V28 a `specs/storage` y tres hallazgos a [`specs/doctor`](../../specs/doctor/spec.md);
 - la **entrega 2b, borrar proyectos (V29)** (PL21 a PL31, [más abajo](#entrega-2b-borrar-proyectos));
-- la **entrega 3a, proyectos sin carpeta y el agente** (PL32 a PL42, [más abajo](#entrega-3a-proyectos-sin-carpeta-y-el-agente)). Suma a `specs/project` y a [`specs/mcp`](../../specs/mcp/spec.md), sin migración.
+- la **entrega 3a, proyectos sin carpeta y el agente** (PL32 a PL42, [más abajo](#entrega-3a-proyectos-sin-carpeta-y-el-agente)). Suma a `specs/project` y a [`specs/mcp`](../../specs/mcp/spec.md), sin migración;
+- la **entrega 3b, los subproyectos de un monorepo (V30)** (PL43 a PL52, [más abajo](#entrega-3b-los-subproyectos-de-un-monorepo)). Suma V30 a `specs/storage`, un chequeo a `specs/doctor`, y el camino crudo a `specs/project`, [`specs/hooks`](../../specs/hooks/spec.md) y `specs/mcp`.
 
-Lo que no se nombra aquí sigue como está. Las entregas 3b y 4 agregan sus requisitos a este archivo cuando les toque. El [diseño](design.md) dice cómo se cumple cada requisito y qué alternativas se descartaron.
+Lo que no se nombra aquí sigue como está. La entrega 4 agrega sus requisitos a este archivo cuando le toque. El [diseño](design.md) dice cómo se cumple cada requisito y qué alternativas se descartaron.
 
 ## Definiciones
 
@@ -959,3 +960,202 @@ La tabla de PL19 suma:
 - `POST /v1/projects` y los ids que da: el puente y los hooks siguen igual sin el argumento nuevo.
 - `rename`, `merge`, `keep-apart` y `delete` siguen tomando ids.
 - El import no crea sugerencias ni proyectos sin carpeta (entrega 4).
+
+## Entrega 3b: los subproyectos de un monorepo
+
+Cubre la segunda parte de la [entrega 3](proposal.md#3-proyectos-sin-carpeta-y-el-agente): declarar una subcarpeta de un repositorio como un proyecto propio, el camino crudo que manda el cliente y la resolución por la declaración más profunda. El diseño está en [D50 a D59](design.md#entrega-3b-los-subproyectos-de-un-monorepo). Trae V30, que sólo crea una tabla. La clave de una declaración es el proyecto del repositorio más el subcamino, no el remoto, y `project_remote` no cambia (D51).
+
+### Definiciones
+
+- **Camino crudo:** el directorio desde el que se trabaja (el `cwd` de un hook, el directorio de trabajo del puente, un `project_path`), absoluto y canónico, antes de subir a su raíz (R1).
+- **Cima de un checkout:** el directorio que tiene el `.git`, sea un directorio o un archivo. En un checkout común es su raíz. En un worktree es el directorio del worktree, y su raíz es la del repositorio principal (R1).
+- **Subcamino:** el camino crudo relativo a la cima de su checkout, con sus componentes unidos por `/`. Está vacío en la cima. No hay subcamino fuera de git, ni cuando la raíz de esa cima no es la que se registra.
+- **Contener:** un subcamino A contiene a B cuando B es A, o empieza con A seguido de `/`. Se compara por componentes enteros: `apps/web` contiene `apps/web/src`, pero no `apps/webapp`.
+- **Proyecto del repositorio:** el proyecto que recibe la raíz (PL4, PL5).
+- **Declaración:** una fila de `project_subfolder`. Tiene el proyecto de un repositorio (`parent_id`), un subcamino no vacío (`subpath`) y el proyecto al que va lo que se trabaja dentro de él (`project_id`).
+- **Subproyecto:** un proyecto al que lleva una declaración.
+
+## PL43. V30 agrega las declaraciones
+
+V30 MUST crear `project_subfolder` (`parent_id`, `subpath`, `project_id`, `created_at`), con la clave primaria `(parent_id, subpath)` y un índice por `project_id`. MUST NOT cambiar ninguna fila ni ninguna otra tabla: `project_remote` y `project_path` quedan como están.
+
+#### Escenario: un store en V29 abre sin declaraciones
+- GIVEN un store en V29 con:
+  - proyectos vivos, una lápida y un proyecto borrado con su borrado abierto;
+  - dos clones de un remoto en dos caminos, y un camino con dos carpetas (R20);
+  - filas vivas y borradas en las tres tablas, y una sugerencia pendiente
+- WHEN se abre con V30
+- THEN ninguna fila de ninguna tabla cambió, y `project_subfolder` existe y está vacía
+- AND hay un snapshot `pre-migration`
+
+**Tests:** `a_database_from_the_previous_version_opens_with_no_subfolder_declared` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(29))`); la fila 30 en `published_migration_checksums_are_pinned` (`migrations.rs`); los conteos de migraciones aplicadas de `db.rs`, que pasan de 29 a 30.
+
+## PL44. El registro recibe el camino crudo
+
+`POST /v1/projects` MUST aceptar un campo opcional `path`, un camino absoluto. Con `assigned` y `path`, el daemon MUST leer, en el mismo hilo bloqueante en el que lee el checkout, la cima del checkout de `path` y la raíz de esa cima. Toma el subcamino de `path` sólo si esa raíz es `root_path`. Si no lo es, o si `path` no está en un checkout, MUST ignorarlo, dejarlo en el log y responder como sin él.
+
+La respuesta MUST tener la forma de siempre (`project_id`, `root_id`, `rekeyed`):
+
+- `project_id` es el de PL45;
+- `root_id` MUST ser siempre el de la carpeta de la raíz.
+
+Sin `path`, con un subcamino vacío o sin `assigned`, MUST responder lo mismo que antes de V30 (R4, R18).
+
+El subcamino MUST salir de una función pura de la cima y el camino (`subpath_of`, `crates/clawg-core/src/memory/identity.rs`). No da nada cuando el camino sale de la cima o cuando uno de sus componentes no es Unicode válido. La lectura del disco va aparte, en `Ground`.
+
+#### Escenario: un worktree
+- GIVEN `/work/mono`, con un worktree en `/work/mono-wt`
+- WHEN se registra `/work/mono` con `path` `/work/mono-wt/apps/web/src`
+- THEN el subcamino es `apps/web/src`
+
+#### Escenario: un camino que no lleva a su raíz
+- GIVEN `/work/a` y `/work/b`, dos repositorios
+- WHEN se registra `/work/a` con `path` `/work/b/src`
+- THEN la respuesta es la de `/work/a` sin `path`, y el log lo dice
+
+**Tests:** la pura `the_subpath_is_measured_from_the_top_of_the_checkout` (`identity.rs`); `a_path_in_a_worktree_has_its_subpath_from_the_worktree` y `a_path_that_does_not_lead_to_its_root_has_no_subpath` (`crates/clawg-core/tests/project_root.rs`, con repositorios reales: necesitan `git` en el PATH); `a_registration_without_a_path_or_with_one_elsewhere_answers_as_before` (`crates/clawg-cli/tests/api.rs`).
+
+## PL45. La declaración más profunda decide
+
+Con un subcamino S no vacío y la raíz asentada en el proyecto P, el registro MUST:
+
+1. leer las declaraciones de P y de las lápidas que llevan a P;
+2. quedarse con las que contienen S;
+3. elegir la más profunda. A igual subcamino, la de P va antes que la de una lápida, y entre lápidas gana la más vieja;
+4. responder como `project_id` el proyecto al que lleva la elegida por `canonical`, pasando las lápidas. Si lleva a P, responde P.
+
+Sin ninguna declaración, responde P. Un subproyecto borrado se responde a sí mismo: registrar no lo revive, y un save sí (PL22). Las declaraciones del subproyecto no se miran: no se encadenan.
+
+Resolver una declaración MUST NOT:
+
+- unir nada al subproyecto. Los ids viejos y el id de la carpeta de la raíz se unen en P, como en R4 y R17;
+- cambiar `root_id`, `index_docs`, las carpetas ni los remotos;
+- escribir nada que no escribiría el registro sin `path`, ni crear sugerencias.
+
+#### Escenario: un subproyecto de un monorepo
+- GIVEN `/work/monorepo` con `origin` `github.com/acme/monorepo` y su proyecto M, y una declaración de `apps/web` hacia el proyecto W
+- WHEN se guarda desde `/work/monorepo/apps/web/src` y desde `/work/monorepo`
+- THEN la primera memoria queda en W y la segunda en M
+- AND `/work/monorepo/apps/webapp` lleva a M
+- AND un clone del mismo remoto en `/otra/monorepo` lleva a W desde `/otra/monorepo/apps/web/src` y a M desde `/otra/monorepo`. Es el caso de otra máquina: del clone, el store sólo tiene su camino y su remoto
+
+#### Escenario: un monorepo sin `origin` que se mueve
+- GIVEN el mismo monorepo sin `origin`, con su primer commit grabado y la misma declaración
+- WHEN se mueve a `/work/mono2` y se registra desde `/work/mono2/apps/web`
+- THEN lleva a W, porque la raíz conserva M (PL5)
+
+#### Escenario: después de una unión
+- GIVEN la declaración de `apps/web` hacia W
+- WHEN se une M en Z
+- THEN `apps/web` lleva a W, y la raíz a Z
+- AND cuando después se une W en Z, `apps/web` lleva a Z, y el `--undo` de esa unión la devuelve a W
+
+**Tests:** la pura `the_deepest_declared_subfolder_wins` (`crates/clawg-core/src/memory/subfolder.rs`); `a_declared_subfolder_takes_what_is_saved_inside_it`, `a_declaration_follows_a_moved_checkout`, `a_declaration_is_read_through_merges` y `resolving_a_subfolder_joins_nothing` (`project.rs`, con el `Ground` falso); `a_declared_subfolder_takes_what_is_saved_inside_it_in_every_clone` (`tests/api.rs`, con repositorios reales).
+
+## PL46. Declarar, cambiar y quitar una declaración
+
+`POST /v1/projects/locate` MUST aceptar `subfolder: true`. Con él, `root_path` es la carpeta misma, no la raíz que la contiene. Se rechaza sin escribir:
+
+- con 400 si `root_path` no es un directorio, o si su subcamino (PL44, leído de su propio checkout) está vacío o no existe: es la cima de un checkout, o está fuera de un repositorio. La frase lo dice, y dice que `locate` sin `subfolder` ubica una raíz;
+- con 404, o 409 `project_ambiguous`, por `project`, como en PL35;
+- con 409 `project_merged` si `project` es una lápida, y 409 `project_deleted` si está borrado (PL27).
+
+Después registra la raíz como un puente (con `assigned` y sin `index_docs`) y la asienta en P. Sea X el proyecto nombrado:
+
+- **X es P:** MUST borrar la declaración de S de P y de sus lápidas, y responder `removed: true`. Si no había ninguna, responde `already: true`.
+- **La declaración de S ya lleva a X:** responde `already: true` sin escribir.
+- **La declaración de S lleva a Q, que no es ni P ni X:** si Q no tiene carpeta, ni remoto, ni otra declaración que lleve a él, MUST unir Q en X como `POST /v1/projects/merge` (PL13), con su snapshot, su diario y su número, y responder su informe. Si no, MUST responder 409 `folder_shared`, con un `detail` que nombra Q y `clawg projects merge Q --into X`.
+- **No hay declaración de S, o la que hay lleva a P:** MUST escribir (P, S, X), en lugar de la que había.
+
+MUST NOT mover filas: lo guardado desde la subcarpeta antes de declararla queda en el proyecto al que iba. MUST NOT cambiar tampoco carpetas, remotos ni `index_docs`.
+
+La respuesta trae `project_id` (X), `root_id`, `repository_id` (P), `subpath` (S), `already`, `removed` y, cuando unió, `merge`.
+
+#### Escenario: declarar y quitar
+- GIVEN `/work/monorepo` con memorias en M, algunas guardadas desde `apps/web`
+- WHEN se declara `apps/web` hacia W, y después hacia M
+- THEN las memorias de M no se movieron en ninguno de los dos pasos
+- AND después del primero, lo que se guarda desde `apps/web` va a W; después del segundo, va a M, y lo guardado en W sigue en W
+
+#### Escenario: declarar otra vez hacia otro proyecto
+- GIVEN `apps/web` declarada hacia Q, y nada más que lleve a Q
+- WHEN se declara hacia X
+- THEN Q se une en X, la unión tiene número y `--undo`, y `apps/web` lleva a X
+
+**Tests:** `declaring_a_subfolder_writes_one_row_and_moves_nothing`, `naming_the_repository_project_removes_the_declaration`, `declaring_again_merges_a_project_only_that_subfolder_led_to`, `a_project_reached_otherwise_is_not_merged_by_a_declaration` y `a_declaration_into_a_merged_or_deleted_project_is_refused` (`subfolder.rs`); `a_subfolder_is_declared_through_the_daemon_and_refused_at_a_root` (`tests/api.rs`); el brazo de `subfolder` en `every_route_that_takes_a_project_follows_a_merge` y en `every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule` (`tests/api.rs`).
+
+## PL47. Los clientes mandan el camino crudo
+
+Cada cliente que registra con `assigned` MUST mandar `path`:
+
+- **`session-start` y `user-prompt-submit`:** el `cwd` de la entrada. Leen, y registran la sesión, bajo el proyecto que responde el daemon.
+- **El puente:** su directorio de trabajo para su proyecto por defecto, y el `project_path` o el `to_project_path` de una herramienta, absolutos. MUST registrar una vez por raíz y camino en el mismo proceso: cambia la clave de R6, que era la raíz y el id viejo. Lo que muestra la clave de una fila donde un save la revisaría (`revised_from`) MUST comparar con el proyecto de esa raíz y ese camino.
+- **`clawg projects move --to CAMINO` y `--here`:** CAMINO, y el directorio de trabajo.
+
+`clawg memories --here` y `clawg export --project CAMINO` MUST elegir el proyecto con el camino crudo, como un registro, sin escribir (`project_id_of`, `crates/clawg-core/src/memory/portability/export.rs`). En un store anterior a V30 MUST elegir como si no hubiera declaraciones.
+
+`clawg projects add`, `clawg projects locate` sin `--subfolder` y el import no mandan `path`. Los dos primeros tratan la raíz y su índice de docs, y el import es de la entrega 4.
+
+Contra un daemon que no conoce `path`, cada cliente MUST seguir funcionando, con el proyecto de la raíz.
+
+#### Escenario: un puente abierto en el subproyecto
+- GIVEN la declaración de `apps/web` hacia W
+- WHEN un puente arranca en `/work/monorepo/apps/web` y guarda sin `project_path`, y otro arranca en `/work/monorepo`
+- THEN la memoria del primero queda en W, y `recall_context` lee W en el primero y M en el segundo
+- AND `search_project` del primero busca en el índice de docs de `/work/monorepo`
+
+**Tests:** `session_start_in_a_declared_subfolder_reads_its_project` (`crates/clawg-cli/src/hook.rs`); `a_bridge_in_a_declared_subfolder_saves_into_its_project`, `a_project_path_in_a_declared_subfolder_goes_to_its_project` y `a_bridge_registers_each_path_of_a_root_once` (`crates/clawg-cli/src/mcp/server.rs`); `moving_to_a_declared_subfolder_moves_into_its_project` (`crates/clawg-cli/src/projects.rs`, contra un daemon real); `the_project_of_a_path_reads_the_declarations_without_writing` y `a_store_from_before_subfolders_reads_the_project_of_the_root` (`export.rs`).
+
+## PL48. `clawg projects locate --subfolder`
+
+`clawg projects locate <PROYECTO> <CAMINO> --subfolder [--profile P]` MUST mandar CAMINO absoluto con `subfolder` (PL46), sin subir a su raíz. MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el idioma de la preferencia, con una sentencia por `match` sobre `Lang`:
+
+- **Declarada:** que CAMINO lleva a X dentro de P; que lo guardado allí antes sigue en P, con `clawg projects move --from-project P --to-project X --text PALABRAS --dry-run`; y que una sesión abierta antes sigue con P hasta que se reinicia.
+- **Quitada:** que CAMINO vuelve a llevar a P, y que lo guardado en X sigue allí, con `clawg projects merge X --into P --dry-run`.
+- **Ya estaba**, y **una unión**, como en PL39.
+
+Un rechazo imprime la causa del daemon tal como llegó, y sale con 1.
+
+**Tests:** `projects_locate_takes_subfolder` (`cli.rs`); `a_declared_subfolder_is_printed_with_what_stayed_behind`, en los dos idiomas (`projects.rs`).
+
+## PL49. Lo que se ve de una declaración
+
+- **`GET /v1/projects`** MUST responder en cada proyecto `subfolders`: las declaraciones que llevan a él y las de su repositorio, leídas por `canonical`, cada una bajo cada lado que se lista. Cada una trae `repository_id`, `subpath`, `project_id` y `paths`: cada carpeta del repositorio en esta máquina más el subcamino, con `present` (si ese directorio existe). Un daemon que no manda el campo se lee como sin declaraciones.
+- **`clawg projects list`** MUST imprimir, bajo un subproyecto, dónde está declarado (el repositorio y el subcamino) con sus caminos, marcando los que no están. Bajo un repositorio, imprime cada declaración con su proyecto. Un proyecto sin carpeta propia y con declaraciones MUST NOT marcarse «sin carpeta».
+- **`POST /v1/projects/resolve`:** para un proyecto sin carpetas propias y con declaraciones, `folders` MUST ser las carpetas de sus repositorios, las más viejas primero. Así, `search_project` con `project` busca en los docs de su repositorio (PL34).
+
+**Tests:** `a_declaration_is_listed_on_both_sides_with_its_paths` y `a_subproject_resolves_to_the_folders_of_its_repository` (`registry.rs`); `a_listing_names_the_subfolders`, en los dos idiomas (`projects.rs`).
+
+## PL50. Unir, borrar y la lápida
+
+- Una unión y su `--undo`, un borrado y su `--undo`, y una purga MUST NOT cambiar `project_subfolder`. Una declaración se lee siempre por `canonical` (PL45, PL49).
+- El informe de un borrado (PL24) MUST nombrar en `subfolders` las declaraciones que llevan al proyecto, y `clawg projects delete --with-memories` las imprime.
+- El código (D29) MUST sumar, después de los remotos, una línea por cada declaración que lleva al proyecto, sólo si las hay. El código de un proyecto sin declaraciones es el de antes.
+- Un save desde una subcarpeta declarada hacia un proyecto borrado lo hace volver (PL22). Registrar desde ella no.
+
+#### Escenario: borrar un subproyecto
+- GIVEN W con memorias, y la declaración de `apps/web` hacia W
+- WHEN se pide el informe de W, se declara `libs/ui` hacia W, y se confirma con el código del informe
+- THEN no se borra nada, y la respuesta es `code_changed`
+- AND con el código nuevo W se borra, las dos declaraciones siguen, y un save desde `apps/web` lo hace volver
+
+**Tests:** `merging_and_undoing_leave_the_declarations_as_they_were` (`merge.rs`); `a_delete_report_names_its_subfolders_and_a_declaration_changes_the_code` y la pura `the_code_of_a_project_without_subfolders_does_not_change` (`project_delete.rs`); `a_delete_report_names_its_subfolders`, en los dos idiomas (`projects.rs`).
+
+## PL51. `doctor` y las declaraciones
+
+Un chequeo nuevo, `project_subfolders`, MUST nombrar con `warn` y `broken_subfolder` cada declaración cuyo repositorio o destino no está en `project`. Su evidencia es el repositorio, el subcamino y el destino, y no tiene paso. Sin hallazgos MUST dar `ok`, con cuántas declaraciones hay. Una declaración bajo una lápida, o hacia un proyecto borrado, no es un hallazgo. En un store anterior a V30 no corre.
+
+**Tests:** `a_declaration_whose_projects_are_gone_is_named` (`crates/clawg-cli/src/doctor/checks.rs`); la lectura del hecho nuevo en un store en V29 y en V30 (`crates/clawg-core/src/memory/inspect.rs`); `the_findings_are_the_same_in_both_languages_but_their_message` sigue pasando.
+
+## PL52. Lo que no cambia en la entrega 3b
+
+- `project_remote`, su clave y quienes lo leen. `project_path` guarda sólo raíces, y el índice de docs sigue por carpeta de raíz.
+- R1: la raíz de un camino sigue siendo la del primer `.git`. Un subproyecto no es una raíz, y un puente abierto en él busca docs en su repositorio.
+- La búsqueda de memorias: desde un subproyecto no se leen las del repositorio (`memory_project_predicate!`, `crates/clawg-core/src/memory/search.rs:107-114`). `project` y `all_projects` llegan a ellas.
+- Los ids viejos de un camino se unen en el proyecto del repositorio (R4).
+- El contrato del modelo: ninguna herramienta ni argumento cambia. `project_path` sigue siendo «Absolute path of the project», y uno dentro de una subcarpeta declarada lleva a su subproyecto.
+- Las sugerencias: declarar no crea ninguna.
+- El import y el formato de export (entrega 4). `--project-map NOMBRE=CAMINO` toma la raíz de CAMINO, y una fila de un subproyecto viaja con su id.
+- `clawg projects add` y `clawg projects locate` sin `--subfolder`.
+
+**Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin volver a bendecir, y los de R1, R4, R6 y PL1 a PL42.

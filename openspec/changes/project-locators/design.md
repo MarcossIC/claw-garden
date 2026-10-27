@@ -8,7 +8,7 @@ Este diseño resuelve la **entrega 1** de la [propuesta](proposal.md#1-el-regist
 - la integridad referencial (D7);
 - el nombre (D8).
 
-Las demás esperan a su entrega (al final). Los requisitos están en la [spec](spec.md). La [entrega 2a](#entrega-2a-unir-proyectos) (D15 a D25), la [2b](#entrega-2b-borrar-proyectos) (D26 a D37) y la [3a](#entrega-3a-proyectos-sin-carpeta-y-el-agente) (D38 a D49) están después de las decisiones de la entrega 1.
+Las demás esperan a su entrega (al final). Los requisitos están en la [spec](spec.md). La [entrega 2a](#entrega-2a-unir-proyectos) (D15 a D25), la [2b](#entrega-2b-borrar-proyectos) (D26 a D37), la [3a](#entrega-3a-proyectos-sin-carpeta-y-el-agente) (D38 a D49) y la [3b](#entrega-3b-los-subproyectos-de-un-monorepo) (D50 a D59) están después de las decisiones de la entrega 1.
 
 ## El modelo
 
@@ -291,7 +291,7 @@ Lo que la entrega 3 suma encima:
 | Cómo responde el agente una sugerencia, y si unir exige `user_answered` | 3a ([D45](#d45-el-agente-responde-una-sugerencia-con-answer_suggestion)); la respuesta por CLI es de la 2a, D22 |
 | Un save bajo el id de un proyecto borrado | 2b ([D27](#d27-un-proyecto-borrado-vuelve-al-usarse-por-disparadores)) |
 | Los tipos nuevos de `memory_import_extra` | 4 |
-| Los subproyectos de un monorepo y las carpetas sin VCS | las carpetas sin VCS, 3a (D46, D48); los subproyectos, 3b (D14, D49) |
+| Los subproyectos de un monorepo y las carpetas sin VCS | las carpetas sin VCS, 3a (D46, D48); los subproyectos, 3b ([D50 a D59](#entrega-3b-los-subproyectos-de-un-monorepo)) |
 
 # Entrega 2a: unir proyectos
 
@@ -775,3 +775,213 @@ Los subproyectos de un monorepo cambian la resolución de una raíz (la carpeta 
 - **Un proyecto creado por nombre.** Es un proyecto como otro: se borra con `clawg projects delete` (vacío, o con sus memorias) o se une con `merge`.
 - **Una unión de `answer_suggestion` o de `locate`.** Con `clawg projects merge --undo N`.
 - **Una respuesta `apart`.** Como la de `keep-apart`: el par queda respondido. Para volver a preguntarlo, se borra su fila de `project_suggestion` a mano.
+
+# Entrega 3b: los subproyectos de un monorepo
+
+Esta parte resuelve la **entrega 3b** de la [propuesta](proposal.md#3-proyectos-sin-carpeta-y-el-agente): declarar una subcarpeta de un repositorio como un proyecto propio, el camino crudo que manda el cliente, la resolución por la declaración más profunda y su migración. Los requisitos están en la [spec](spec.md#entrega-3b-los-subproyectos-de-un-monorepo) (PL43 a PL52).
+
+D14 y D49 dejaron escrito cómo sería esta entrega. Por lo que muestra el código, eso cambia en tres puntos, y cada uno tiene su decisión:
+
+- **La clave no es el remoto.** D14 pedía remoto más subcarpeta, lo que obligaba a reconstruir `project_remote`, cuya clave primaria es `remote` (`V24__project_remote.sql:9`), o a guardar la subcarpeta aparte. Se guarda aparte, pero con el proyecto del repositorio en lugar del remoto, y `project_remote` no cambia (D51).
+- **Sólo cuentan las subcarpetas declaradas.** Leída sobre todas las carpetas de `project_path`, «la carpeta registrada más profunda» de D14 metería en el proyecto del directorio del usuario cada carpeta sin git que haya debajo (D52).
+- **`project_path` sigue guardando raíces.** Una declaración no deja una carpeta por checkout, así que ningún lector de `project_path` cambia (D52).
+
+## D50. Una subcarpeta se declara a mano, con `projects locate --subfolder`
+
+El registro automático no puede adivinar un subproyecto (D14). Un monorepo tiene un manifiesto por paquete (`apps/web/package.json`, `libs/ui/package.json`), y casi ninguno es un proyecto aparte para la persona. Por eso se declara, una vez por subproyecto, con `clawg projects locate <PROYECTO> <CAMINO> --subfolder`.
+
+3a fijó `locate` como «esta carpeta es el proyecto X» (D48). Sin la marca, `locate` sube de CAMINO a su raíz (`locate`, `crates/clawg-cli/src/projects.rs:898-905`). Con ella, la carpeta es CAMINO mismo. La ruta es la misma, `POST /v1/projects/locate`, con `subfolder: true`. Su cuerpo rechaza los campos que no conoce (`#[serde(deny_unknown_fields)]`, `crates/clawg-cli/src/daemon/api.rs:2435`), así que un daemon sin subcarpetas responde 400 en lugar de ubicar la raíz entera, que uniría el proyecto del monorepo.
+
+PROYECTO tiene que existir. Uno nuevo se crea antes con `clawg projects create`, que busca parecidos (PL39).
+
+**El agente no declara.** Una declaración cambia adónde va lo que guarda cualquier agente desde esa carpeta, en cada sesión y en cada clone, y se hace una vez. El agente ya puede guardar en un proyecto por nombre (`project`, PL34). El contrato del modelo no cambia.
+
+| Alternativa | Por qué no |
+|---|---|
+| Detectar los subproyectos solos, por manifiesto | Cada paquete tiene el suyo, y casi ninguno es un proyecto aparte. Una sesión en un paquete leería sólo sus memorias, sin que nadie lo haya pedido |
+| Un comando propio (`clawg projects subfolder`) | Es otra palabra para «esta carpeta es X», que ya es `locate` |
+| Una herramienta del agente | Cambia el contrato, y necesitaría la respuesta de la persona, como `answer_suggestion` (D45), para algo que se hace una vez |
+| Que `--subfolder` cree el proyecto si no existe | Un nombre mal escrito crearía un proyecto vacío sin preguntar |
+
+## D51. La declaración es del proyecto del repositorio, no del remoto
+
+Una declaración dice: en el proyecto P de un repositorio, lo que se trabaja dentro del subcamino S va al proyecto X. Se guarda en una tabla nueva, `project_subfolder(parent_id, subpath, project_id, created_at)`, con la clave primaria `(parent_id, subpath)`. `parent_id` es P, no un remoto.
+
+D14 pedía el remoto más la subcarpeta para que un clone en otra máquina llegara al subproyecto. Pero un clone ya llega a P por su remoto (R16; `remote_project_in`, `crates/clawg-core/src/memory/project.rs:247-249`). Con la declaración atada a P, llega también a X, sin un segundo mecanismo. Lo mismo vale para todo lo que ya lleva a P:
+
+- un checkout sin `origin` que se movió y conserva su proyecto por el primer commit (PL5). Con el remoto como clave, no tendría subproyectos;
+- un worktree, cuya raíz es la del repositorio principal (`root_from_marker`, `crates/clawg-core/src/memory/identity.rs:118-127`);
+- el store abierto en otra máquina (un `clawg restore`, o el directorio de datos copiado). La declaración no guarda caminos de esta máquina, así que sirve igual allí;
+- un repositorio cuyo remoto cambió y se unió con su proyecto viejo (PL6 y `projects merge`): la declaración se lee a través de la lápida (D54). Con el remoto como clave, el remoto nuevo no la encontraría nunca.
+
+`project_remote` no cambia. Su clave primaria es `remote` (`V24__project_remote.sql:9`), que no admite el mismo remoto dos veces. Sumarle una columna `subpath` no alcanza, y cambiar la clave obliga a reconstruir la tabla. V30 sólo crea una tabla, como promete la propuesta en [«Datos guardados»](proposal.md#datos-guardados-migración-y-vuelta-atrás).
+
+| Alternativa | Por qué no |
+|---|---|
+| Reconstruir `project_remote` con la clave `(remote, subpath)` | No es aditiva. Además, cada `WHERE remote = ?1` de hoy pasaría a encontrar dos filas y tendría que sumar `subpath = ''`: `remote_project_in` (`project.rs:248`), el `--undo` de un import (`crates/clawg-core/src/memory/portability/undo.rs:694`) y el de una unión (`crates/clawg-core/src/memory/merge.rs:514`). Uno que se olvide elige mal, sin error |
+| Una tabla aparte con la clave `(remote, subpath)`, como pedía D14 | Es aditiva, pero un repositorio sin `origin` no tendría subproyectos, uno movido sin `origin` los perdería, y uno con el remoto renombrado también. Esos casos necesitarían otra regla, por carpeta: dos mecanismos para lo mismo |
+| El subcamino dentro del texto del remoto (`github.com/acme/mono//apps/web`) | No cambia el esquema, pero cada lector de remotos (`projects list`, `doctor`, el código de un borrado) tendría que partir el texto |
+
+Lo que cuesta: una declaración vale para todo lo que lleva a P, también para otro repositorio que la persona unió en P (D18). Eso es lo que dijo al unirlos: que son uno.
+
+## D52. Sólo cuentan las subcarpetas declaradas, y `project_path` sigue guardando raíces
+
+D14 decía que la resolución elegiría «la carpeta registrada más profunda que contiene al camino», y que una carpeta de `project_path` podría ser cualquier directorio. Leído sobre todas las carpetas, eso cambia lo de hoy:
+
+- **El directorio del usuario.** Fuera de git, la raíz de un camino es el camino mismo (`resolve_project_root`, `identity.rs:72-84`). Los hooks y el puente registran la raíz de su directorio sin filtrarla (`project_of`, `crates/clawg-cli/src/hook.rs:221-228`; `ids_for`, `crates/clawg-cli/src/mcp/server.rs:915-952`), así que una sesión abierta en el directorio del usuario lo deja registrado. Con la carpeta más profunda, cada carpeta sin git que haya debajo caería en ese proyecto.
+- **Las carpetas viejas de un camino.** Dentro de un repositorio, una carpeta de `project_path` en un camino que hoy tiene otro repositorio (R20) llevaría a un proyecto que las huellas ya contradicen.
+
+Por eso sólo cuentan las declaraciones, y sólo dentro del checkout del camino: una declaración nunca sube por encima de su cima.
+
+Una declaración tampoco deja una carpeta en `project_path` por cada checkout. Así, ningún lector de `project_path` tiene que distinguir una raíz de una subcarpeta:
+
+- `path_folders_in` (`project.rs:233-239`);
+- `sightings_in` (`:330-333`), donde una subcarpeta con el primer commit del repositorio parecería un checkout movido de otro proyecto;
+- `named_after_in` (`:365-367`);
+- `folders_of_in` (`crates/clawg-core/src/memory/registry.rs:756-762`);
+- `set_in` (`crates/clawg-core/src/memory/project_delete.rs:330-350`);
+- el índice de docs (`root_of`, `crates/clawg-core/src/memory/project_docs/mod.rs:505`).
+
+| Alternativa | Por qué no |
+|---|---|
+| Que cuente toda carpeta registrada, como decía D14 | El directorio del usuario y las carpetas viejas de un camino, arriba |
+| Una carpeta de `project_path` por subcarpeta y checkout, marcada con su padre | Cada lector de arriba tendría que saltearla. `index_docs` vale 1 por defecto (`V13__project_index_docs.sql:6`), así que un insert que olvide la columna indexaría la subcarpeta. Y si su id es el de un proyecto con filas, el export la escribiría como una línea `project` (`crates/clawg-core/src/memory/portability/export.rs:136-144`), que el import registraría como una raíz |
+
+**El índice de docs** sigue por carpeta de raíz, como fija la propuesta en «Fuera de alcance». Un subproyecto no tiene índice propio: sus docs son los de su repositorio (D59).
+
+## D53. El subcamino se mide desde la cima del checkout, y lo calcula el daemon
+
+El cliente manda en `POST /v1/projects`, además de `root_path`, el camino crudo: `path`, absoluto. En el mismo hilo bloqueante en el que hoy lee el checkout (`register_root`, `crates/clawg-cli/src/daemon/api.rs:2113-2116`), el daemon lee la cima del checkout de `path` (el directorio con su `.git`) y comprueba que la raíz de esa cima sea `root_path`. El subcamino es `path` relativo a esa cima. Si la raíz es otra, o `path` no está en un checkout, el daemon ignora `path`, lo deja en el log y responde como sin él.
+
+**Desde la cima, no desde la raíz.** En un worktree, la raíz es la del repositorio principal (R1; `root_from_marker`, `identity.rs:118-127`), y el camino crudo no está debajo de ella: `/work/mono-wt/apps/web/src` tiene la raíz `/work/mono`. Medido desde la cima, `/work/mono-wt`, da `apps/web/src`, el mismo subcamino que en el checkout principal.
+
+**El daemon, no el cliente.** El daemon decide los ids con lo que lee él (R4, D3). Además, un `project_path` relativo se resuelve contra el directorio del puente, que no es el del daemon. Por eso el cliente lo manda absoluto, en la forma canónica desde la que sube `resolve_project_root`. `ProjectIdentity` guarda ese camino (`path`) al lado de `root` y `legacy_id` (`identity.rs:45-57`).
+
+La parte que decide es pura. `subpath_of(cima, camino)` une con `/` los componentes de `camino` que están debajo de `cima`, y no da nada si el camino sale de la cima o si un componente no es Unicode válido. La lectura del disco entra por `Ground::subpath(root, path)`, al lado de `checkout` (`identity.rs:338-346`), así que `FakeGround` la responde en los tests y `ReadAhead` en lo que planea sin escribir.
+
+**Los anteriores.**
+
+- Un cliente que no manda `path` recibe el proyecto del repositorio, como hoy.
+- Un daemon anterior ignora el campo y responde el proyecto de la raíz. En v0.63.0, `RegisterRequest` no rechaza campos que no conoce (`git show v0.63.0:crates/clawg-cli/src/daemon/api.rs`, líneas 1986-1987).
+- Un pedido sin `assigned` ignora `path`, porque deriva sus ids de la raíz (R18).
+
+**Qué manda cada uno:**
+
+| Quién | `path` |
+|---|---|
+| `session-start` y `user-prompt-submit` | el `cwd` de la entrada |
+| el puente, para su proyecto por defecto | su directorio de trabajo al arrancar (`ClawgMcp::pending`, `server.rs:528-533`) |
+| el puente, con `project_path` o `to_project_path` | ese camino |
+| `projects move --to CAMINO` y `--here` | CAMINO, y el directorio de trabajo |
+| `memories --here` y `export --project CAMINO` | el directorio de trabajo y CAMINO, a `project_id_of`, que lee sin escribir |
+| `projects add` | nada: agrega la raíz y su índice de docs |
+| `projects locate` sin `--subfolder` | nada: ubica la raíz, como en 3a |
+| el import | nada (D59) |
+
+`project_id_of` abre stores de versiones anteriores sin migrarlos. A uno anterior a V30 le presta una tabla temporal vacía, como hace con `project_remote` (`export.rs:100-102`).
+
+El puente registra una vez por raíz y camino, y no por raíz e id viejo (`registered`, `server.rs:491`, con la clave de `ids_for`, `:929`). Dos caminos con el mismo nombre de carpeta pueden dar el mismo id viejo, porque el hash tiene cuatro dígitos (`derive_project_id`, `identity.rs:16-20`). `save_project` (`server.rs:968-973`), que dice dónde revisa una clave, busca la entrada por raíz y camino.
+
+| Alternativa | Por qué no |
+|---|---|
+| Que el cliente mande el subcamino | El daemon dejaría de decidir con lo que lee, y cada cliente repetiría la cuenta del worktree |
+| Medir desde la raíz | Un worktree no llegaría nunca a sus subproyectos |
+| Responder 400 a un `path` que no lleva a su raíz | Los hooks no pueden fallar por eso, porque un 400 deja la sesión sin contexto. Ignorarlo da el proyecto del repositorio, que es lo de hoy |
+
+## D54. Gana la declaración más profunda, leída por `canonical`
+
+Con un subcamino S no vacío, después de asentar la raíz en el proyecto P (PL4, PL5), el registro hace esto:
+
+1. Lee las declaraciones de P y las de las lápidas que llevan a P. Por D16, una lápida está a un salto, así que se encuentran por `idx_project_merged_into` (`V28__project_merge.sql:11-12`).
+2. Se queda con las que contienen S por componentes enteros: `apps/web` contiene `apps/web/src`, pero no `apps/webapp`.
+3. Elige la más profunda. A igual subcamino, la de P va antes que la de una lápida, y entre lápidas gana la más vieja.
+4. Responde el proyecto al que lleva la elegida, por `canonical`.
+
+**Una unión no reescribe declaraciones.** Es la razón de D22 para las sugerencias: la clave primaria `(parent_id, subpath)` podría chocar con una declaración del destino, y el `--undo` tendría que volver a reescribirlas. Leídas por `canonical`:
+
+- unir P en Z lleva sus declaraciones a Z;
+- unir X en Z hace que lleven a Z;
+- el `--undo` de cualquiera de las dos las devuelve solo, sin diario.
+
+**Una declaración que lleva a P** (porque X se unió en P) responde P. Al unirlo, la persona dijo que esa subcarpeta es el repositorio. Si la unión se deshace, vuelve a llevar a X.
+
+**Un subproyecto borrado** se responde a sí mismo, como cualquier proyecto borrado (D27): registrar no lo revive, y un save desde la subcarpeta sí.
+
+**No se encadena.** Sólo se mira el proyecto del repositorio, nunca las declaraciones de X. Por eso una cadena no puede hacer un ciclo.
+
+La decisión es pura: `deepest(declaraciones, S)` recibe las declaraciones ya leídas y el subcamino. Vive en un módulo nuevo, `crates/clawg-core/src/memory/subfolder.rs`, con la lectura y la escritura de las declaraciones.
+
+| Alternativa | Por qué no |
+|---|---|
+| Reapuntar las declaraciones en la unión, con su diario | El choque de la clave y el `--undo`, como en D22. Además, `merge.rs` sumaría dos tipos a su diario para algo que la lectura ya resuelve |
+| Que una declaración que lleva a P ceda ante una menos profunda | Una subcarpeta que la persona volvió a unir al repositorio terminaría en otro subproyecto |
+
+## D55. Resolver una subcarpeta no une nada
+
+El registro asienta la raíz como hoy, con sus uniones (R4, R17), y sólo después cambia el proyecto de la respuesta. Esto evita un riesgo concreto. El plan une en su proyecto los ids viejos y el id de la carpeta de la raíz cuando no son ese proyecto (`plan_in`, `project.rs:727-741`). Si el proyecto del plan fuera X, el id de la carpeta del monorepo entraría en esa lista, y como ese id suele ser el del proyecto del monorepo (D13), `merge_in` llevaría todo el monorepo a X.
+
+Por eso `RegisterOutcome` conserva el proyecto de la raíz y suma `subproject`:
+
+- los ids viejos de un camino crudo se unen en P, como hoy (R4). Son filas guardadas antes de que existiera la resolución de raíces;
+- `adopt_legacy` copia los `workspace.md` viejos a P (`register_project`, `project.rs:951-957`);
+- `root_id` sigue siendo el de la carpeta de la raíz, porque el índice de docs es suyo;
+- la respuesta da `project_id` = X.
+
+## D56. Lo guardado antes de declarar se queda donde estaba
+
+Una fila de `memory` no guarda el camino desde el que se guardó: sólo su proyecto (`V1__init.sql:4-29`, más las columnas que sumaron V6, V16, V17, V22 y V23). Nada distingue lo que se guardó desde `apps/web` de lo que se guardó desde la raíz. Por eso declarar no mueve nada. La salida de `--subfolder` nombra el camino a mano: `clawg projects move --from-project P --to-project X --text PALABRAS --dry-run`, o con `--session ID` o `--id N` (R8).
+
+| Alternativa | Por qué no |
+|---|---|
+| Mover por sesión (`source_session_id`) | Una sesión abierta en el monorepo trabaja en todas sus carpetas |
+| Dejar una sugerencia entre P y X | Una sugerencia une proyectos, no filas: responderla con `merge` llevaría todo el monorepo a X |
+| Mover las filas cuyo texto nombra la carpeta | Es adivinar fila por fila, y la propuesta lo deja fuera de alcance |
+
+## D57. Declarar otra vez, quitar, y las sesiones abiertas
+
+- **Otra vez, hacia otro proyecto.** Si S ya lleva a Q y la persona nombra X, vale lo de D48: lo guardado desde la subcarpeta es de X. Cuando lo único que lleva a Q es esa declaración (Q no tiene carpeta, ni remoto, ni otra declaración), se une Q en X con `merge_core`, con su snapshot, su diario y su `--undo`. La fila sigue nombrando a Q, y por `canonical` lleva a X. Si algo más lleva a Q, la respuesta es 409 `folder_shared` con la unión que haría falta, como en 3a.
+- **Hacia P, o una que lleva a P.** Si la declaración de S lleva a P (D54), se la trata como si no hubiera ninguna: nombrar X la reemplaza, sin unir nada.
+- **Quitar.** Nombrar el proyecto del repositorio (`clawg projects locate P CAMINO --subfolder`) borra la declaración de S, la de P y las de sus lápidas, y la carpeta vuelve a llevar a lo que lleva su padre. Lo guardado en X se queda en X. No hace falta diario: una declaración no mueve filas, y la vuelta atrás es declararla otra vez.
+- **Las sesiones abiertas.** Un puente guarda los ids de cada raíz y camino toda la sesión (R6). Uno abierto antes de declarar sigue con P hasta que se reinicia. En cambio, los hooks registran en cada evento (`hook.rs:242`) y ya leen X. La salida de `--subfolder` lo dice.
+
+| Alternativa | Por qué no |
+|---|---|
+| Un `--remove` aparte | Es otra forma de decir «esta carpeta es P» |
+| Reapuntar la fila de Q a X sin unir | Lo guardado desde la subcarpeta quedaría en Q, contra lo que dice `locate` en D48 |
+| Que el puente vuelva a registrar en cada herramienta | R6 lo evita a propósito: sería un pedido más por herramienta, para algo que pasa una vez |
+
+## D58. Unir, borrar, la lápida y `doctor`
+
+- **Unir.** No toca `project_subfolder` (D54), y el informe de una unión no cambia.
+- **Lo que administra proyectos.** Declarar hacia una lápida responde 409 `project_merged`, y hacia un proyecto borrado, 409 `project_deleted` (D23, D35). El proyecto del repositorio sí puede estar borrado: la declaración se escribe bajo él, porque el registro sigue llevando a él (D27).
+- **Borrar.** Un borrado no toca las declaraciones, como no desvincula carpetas ni remotos (D27). El informe (PL24) nombra las que llevan al proyecto, porque un save desde esas subcarpetas lo hace volver. El código (D29) suma una línea por cada una, después de los remotos, y sólo si las hay, así que el código de un proyecto sin declaraciones no cambia. Una purga tampoco las toca: no guardan texto.
+- **`doctor`.** Un chequeo nuevo, `project_subfolders`, nombra con `warn` y `broken_subfolder` una declaración cuyo repositorio o destino no está en `project`. Sólo pasa en un store editado a mano. Una declaración bajo una lápida o hacia un proyecto borrado no es un hallazgo. `project_merges` cuenta filas, no declaraciones, así que no cambia. En un store anterior a V30, `inspect` no lee la tabla (`Has`, `crates/clawg-core/src/memory/inspect.rs:383`).
+- **Las sugerencias.** Declarar no crea ninguna. La sugerencia por nombre de carpeta (D46) saltea un proyecto sin carpetas (`named_after_in`, `project.rs:372`), y un subproyecto puede no tener ninguna.
+
+## D59. Lo que se ve, los docs y el import
+
+- **`GET /v1/projects`.** Cada proyecto suma `subfolders`: las declaraciones que llevan a él y las de su repositorio, leídas por `canonical`. Cada una trae `repository_id`, `subpath`, `project_id` y sus caminos en esta máquina (cada carpeta del repositorio más el subcamino, con `present`). Los caminos se miran en el mismo hilo bloqueante que la presencia de las carpetas (`list_projects`, `registry.rs:211-230`). Un subproyecto sin carpeta propia y con declaraciones no se marca «sin carpeta».
+- **Los docs.** El índice sigue por carpeta de raíz. Un puente en una subcarpeta recibe el `root_id` de su repositorio (D55), así que `search_project` busca en todo el monorepo. Con `project` (PL34), un proyecto sin carpetas propias y con declaraciones busca en las carpetas de sus repositorios: `POST /v1/projects/resolve` se las da en `folders` (`folders_of_in`, `registry.rs:756-762`).
+- **La búsqueda de memorias** no cambia (`memory_project_predicate!`, `crates/clawg-core/src/memory/search.rs:107-114`). Desde un subproyecto se leen sus filas, las que no tienen proyecto y las `user_preference`, pero no las del repositorio. Leer también las del padre cambiaría ese predicado, y la propuesta lo deja fuera de alcance. `project` y `all_projects` llegan a ellas.
+- **El import** no cambia. Una fila de un subproyecto viaja con su id y lo conserva aquí (`crates/clawg-core/src/memory/portability/import.rs:370`). `--project-map NOMBRE=CAMINO` sigue tomando la raíz de CAMINO (`crates/clawg-cli/src/import.rs:60-62`). La entrega 4 trae `project:ID|NOMBRE`, que puede nombrar un subproyecto, y decide si la línea `project` lleva las declaraciones.
+
+## Costos en el camino caliente de la entrega 3b
+
+- **Un registro con `path`** suma, en el hilo bloqueante que ya lee el checkout, un `canonicalize` y la subida hasta el `.git` del camino crudo: lo mismo que ya hizo el cliente. No corre `git`.
+- **Con un subcamino no vacío** suma una lectura de `project_subfolder` por el prefijo de su clave, para P y sus lápidas, y un `canonical` de la elegida. Si el repositorio no tiene declaraciones, la lectura vuelve vacía.
+- **No escribe nada.** Una declaración no deja una fila por checkout, así que un hook sigue sin escribir en cada evento.
+- **El puente** registra una vez por raíz y camino, como antes lo hacía por raíz e id viejo.
+- **`GET /v1/projects`** suma un `stat` por cada declaración y cada carpeta de su repositorio.
+
+## Volver atrás de la entrega 3b
+
+- **El esquema.** Un binario anterior rechaza un store en V30 sin tocarlo (`SchemaNewer`), y la vuelta atrás es su snapshot `pre-migration`. Una declaración no movió filas, así que antes no hay nada que deshacer. Para quitar V30 a mano, con el daemon parado:
+
+  ```sql
+  DROP TABLE project_subfolder;
+  DELETE FROM refinery_schema_history WHERE version = 30;
+  ```
+
+  Desde ahí, lo que se guarde desde una subcarpeta va al proyecto del repositorio. Lo guardado en un subproyecto queda bajo su id: se alcanza con `project` o con `all_projects`, o se une con `projects merge`.
+- **Una declaración.** Se quita nombrando el proyecto del repositorio (D57). Lo guardado en el subproyecto queda ahí, y `projects merge X --into P` lo devuelve, con su `--undo`.
+- **Una declaración que unió un proyecto** (D57). Con `clawg projects merge --undo N`.
