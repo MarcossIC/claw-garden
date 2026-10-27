@@ -170,6 +170,27 @@ Se usó el binario de `target/debug`, copiado fuera del directorio de build, con
 
 `clawg stop` terminó el daemon.
 
+### Windows
+
+- Después de `cargo clean --workspace --target-dir target-test`, `cargo test --workspace --locked --no-fail-fast --target-dir target-test` pasa en `6ba4c52`, con la 3a ya unida en `develop` y con `tests/binary.rs`: 19 binarios, ninguno con fallos. `cargo clippy --workspace --all-targets --locked -- -A clippy::all -D warnings` y `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` salen con 0, los dos en `target-test`.
+- `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan con los archivos bendecidos en Linux, sin volver a bendecir (PL41).
+- `a_merge_waits_for_the_saves_of_its_projects` pasó en la corrida completa.
+
+### El binario real en un home temporal, en Windows
+
+Se usó el binario de `target-test`, copiado fuera del directorio de build, con `CLAWG_TEST_HOME`, `CLAWG_TEST_EMBEDDER=fake`, `CLAWG_TEST_DEFAULT_PORT=off` y `clawg serve --profile dev --port 0`. Sirvió sólo por TCP, porque el camino del home temporal (175 bytes) no entra en un socket. El puente (`clawg mcp --no-autostart --agent claude-code`) se manejó por stdio real: primero desde una carpeta `notas` sin VCS, y después desde esa misma carpeta movida.
+
+1. `save_memory` con `project: "ideas de producto"` creó `ideas-de-producto-c510` y guardó en él. Otro save con `Ideas-de-Producto` se negó sin guardar, nombró a ese proyecto como parecido y ofreció `new_project`. `search_project` con el nombre dijo que el proyecto no tiene carpeta en esta máquina. Un save sin `project` quedó en el proyecto de la carpeta, `notas-e91b`.
+2. `search_memory` con el nombre del proyecto respondió `no relevant memories for this query: 1 searched`. Buscó en el proyecto, que tenía una memoria, pero con el embedder falso un hit sin identificador puntúa 0. Con una memoria que nombra `weekly_digest_job`, la misma búsqueda, por nombre y por id, la encontró como `exact`. Desde la carpeta y sin `project`, respondió `no memories found`.
+3. `projects create Roadmap` creó `roadmap-65d0`. `projects create road-map` salió con 1 y nombró a `Roadmap` y el `--new`. `projects locate Roadmap work/plan` (un repositorio hecho con `git`) registró la carpeta y unió su proyecto `plan-d754` en `Roadmap` (unión 1), con su `--undo`.
+4. La carpeta `notas` se movió a `archivo/notas` con el puente ya cerrado, porque en Windows no se puede mover la carpeta de trabajo de un proceso vivo. `hook session-start` en la carpeta nueva dio la línea de la sugerencia, que nombra a `notas-e91b`. `projects list` mostró la sugerencia `folder_name` en los dos proyectos, y la carpeta vieja como ausente.
+5. `recall_context` desde un puente en `archivo/notas` terminó con la línea que nombra a `notas-e91b` y a `answer_suggestion`. `answer_suggestion` con `apart` respondió que siguen siendo dos proyectos. El `recall_context` siguiente ya no la nombró, y `projects list` mostró los dos proyectos revisados y sin la sugerencia.
+6. `doctor` dio 20 `ok`, 2 `info` y ningún `warn`. Salió con 1 por dos hallazgos del entorno, como en la 2a y la 2b:
+   - `path` `shadowed`: en el PATH de esa máquina hay otro `clawg.exe` antes;
+   - `socket` `path_unusable`: el camino del home temporal es demasiado largo.
+
+`clawg stop` terminó el daemon con salida 0, las dos veces.
+
 ### Lo que la verificación hizo cambiar
 
 - **El tope del hook.** La línea de las sugerencias en `session-start` no entraba en los 1.000 bytes que el hook podía sumar: el peor caso de antes ya ocupaba 978. `session-start` da una sola línea, que nombra hasta dos proyectos, y el tope pasó a 1.500, que con los 8.000 del contexto sigue entrando en los 10.000 caracteres del host (D45). `what_the_hook_adds_stays_small` falló con 1.389 bytes antes del cambio.
@@ -182,7 +203,7 @@ Pendiente para el pull request final del cambio, como el de las entregas anterio
 
 ### Lo que no se corrió
 
-- **Windows:** esta entrega se verificó sólo en Linux. Lo cubre el CI del pull request final.
+- **El socket en el recorrido de Windows:** el home temporal sirvió sólo por TCP. El socket en Windows lo cubren los tests de `tests/binary.rs`.
 - **El perfil dev y el de producción:** no se tocó ningún perfil real. El paso operativo de colocar las filas sin proyecto de producción sigue pendiente y pide autorización.
 
 ### Qué se vio fallar antes de cada cambio

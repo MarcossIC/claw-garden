@@ -465,8 +465,9 @@ Requisitos en la [spec](spec.md#entrega-3a-proyectos-sin-carpeta-y-el-agente) (P
 ### 44. Verificación
 
 - [x] La suite y los dos clippy de `.claude/CLAUDE.md`, en Linux.
+- [x] La suite y los dos clippy, en `target-test` en Windows, con `--locked`.
 - [ ] El CI en Linux y Windows, en el pull request final del cambio.
-- [x] El binario en un home temporal:
+- [x] El binario en un home temporal, en Linux y en Windows:
   - un save con `project` crea un proyecto sin carpeta, y otro con un nombre parecido devuelve el candidato;
   - `projects create` y `projects locate` desde la CLI;
   - una carpeta sin VCS movida deja su sugerencia, `recall_context` y `session-start` la muestran, y `answer_suggestion` con `apart` la quita.
