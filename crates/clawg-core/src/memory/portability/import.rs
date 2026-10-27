@@ -238,6 +238,8 @@ struct Prepared {
     placed: Vec<ImportedProject>,
     /// The suggestions to leave, none of which has a pair here yet.
     suggestions: Vec<ImportedSuggestion>,
+    /// The deleted projects here, as the plan read them.
+    deleted: HashSet<String>,
     parsed: Parsed,
     /// For another tool's export, the notes its rows came from, in the order
     /// of their rows; empty for a clawg file.
@@ -395,6 +397,7 @@ struct Settled {
     binds: Vec<(String, String)>,
     placed: Vec<ImportedProject>,
     suggestions: Vec<ImportedSuggestion>,
+    deleted: HashSet<String>,
 }
 
 /// How many ids a new project of the file tries before it takes its first.
@@ -412,6 +415,7 @@ fn settle_projects(
 ) -> Settled {
     let registry = &planning.registry;
     let mut settled = Settled::default();
+    settled.deleted = registry.projects.iter().filter(|(_, p)| p.deleted).map(|(id, _)| id.clone()).collect();
     let mut taken: HashSet<String> = HashSet::new();
     let mut at = 0;
     for project in projects {
@@ -563,7 +567,7 @@ fn mapped_projects(parsed: &Parsed, roots: &[PathBuf], plans: &[RootPlan]) -> Se
 
 /// The rows of `parsed` worked out, with the projects `settled` gave them.
 fn prepare(mut parsed: Parsed, settled: Settled, options: &ImportOptions, texts: Texts) -> Prepared {
-    let Settled { project_ids, projects, creates, binds, placed, suggestions } = settled;
+    let Settled { project_ids, projects, creates, binds, placed, suggestions, deleted } = settled;
     if let Texts::Raw = texts {
         // The head of a save is stored with its pieces, so it is masked as
         // the text is.
@@ -610,7 +614,7 @@ fn prepare(mut parsed: Parsed, settled: Settled, options: &ImportOptions, texts:
             }
         })
         .collect();
-    Prepared { rows, projects, creates, binds, placed, suggestions, parsed, notes }
+    Prepared { rows, projects, creates, binds, placed, suggestions, deleted, parsed, notes }
 }
 
 /// Where a row of the file ended up.
@@ -747,11 +751,21 @@ struct Journal {
     /// The store's imports in progress, which hold this one's number until
     /// the journal is dropped.
     running: Arc<std::sync::Mutex<HashSet<i64>>>,
+    /// The deleted projects a live row it inserted brought back.
+    revived: BTreeSet<String>,
 }
 
 impl Journal {
     fn new(store: &MemoryStore, source: &'static str, started_at: i64, snapshot: Option<String>) -> Self {
-        Journal { id: None, source, started_at, snapshot, inserted: HashSet::new(), running: store.importing.clone() }
+        Journal {
+            id: None,
+            source,
+            started_at,
+            snapshot,
+            inserted: HashSet::new(),
+            running: store.importing.clone(),
+            revived: BTreeSet::new(),
+        }
     }
 
     fn number(&mut self, c: &rusqlite::Connection) -> rusqlite::Result<i64> {
@@ -883,6 +897,16 @@ impl Seat for SqlSeat<'_, '_> {
     fn insert(&mut self, new: &NewRow<'_>) -> rusqlite::Result<i64> {
         let (row, src) = (new.row, &new.row.src);
         let project = self.live(new.project)?;
+        // A deleted project stays deleted under a row that comes deleted, which
+        // the insert trigger sees live; a live row brings it back.
+        let was: Option<(Option<i64>, bool)> = match &project {
+            Some(p) => self
+                .0
+                .prepare_cached("SELECT deleted_at, reviewed FROM project WHERE id = ?1")?
+                .query_row([p], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?,
+            None => None,
+        };
         self.0.prepare_cached(INSERT_SQL)?.execute(rusqlite::params![
             src.scope,
             row.agent,
@@ -918,10 +942,20 @@ impl Seat for SqlSeat<'_, '_> {
             // restore can add it back exactly once.
             Some(at) => {
                 self.0.execute("UPDATE memory SET deleted_at = ?2 WHERE id = ?1", rusqlite::params![id, at])?;
+                if let (Some(p), Some((Some(deleted_at), reviewed))) = (&project, was) {
+                    self.0.execute(
+                        "UPDATE project SET deleted_at = ?2, reviewed = ?3 WHERE id = ?1",
+                        rusqlite::params![p, deleted_at, reviewed],
+                    )?;
+                }
             }
             None => {
                 if let Some(bytes) = new.vector {
                     self.0.execute("INSERT INTO memory_vectors (rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
+                }
+                if let (Some(p), Some((Some(deleted_at), _))) = (&project, was) {
+                    self.1.registry(self.0, "revived", p, None, Some(&deleted_at.to_string()))?;
+                    self.1.revived.insert(p.clone());
                 }
             }
         }
@@ -1905,6 +1939,8 @@ struct Written {
     snapshot: Option<String>,
     /// The import's number in `memory_import`, when it wrote anything.
     import_id: Option<i64>,
+    /// The deleted projects a live row brought back, or would on a dry run.
+    revived: BTreeSet<String>,
 }
 
 /// Places every row and link of `prepared` and, unless this is a dry run,
@@ -1936,7 +1972,14 @@ async fn write(
     timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..Timing::new(Step::Decide) });
 
     if dry_run {
-        return Ok(Written { ledger: decided, snapshot: None, import_id: None });
+        let revived = prepared
+            .rows
+            .iter()
+            .filter(|r| r.src.deleted_at.is_none() && decided.placed.get(&r.src.id).is_some_and(|p| p.inserted()))
+            .filter_map(|r| r.project.clone())
+            .filter(|p| prepared.deleted.contains(p))
+            .collect();
+        return Ok(Written { ledger: decided, snapshot: None, import_id: None, revived });
     }
     let embedder = embedder.ok_or(ImportError::NoEmbedder)?;
 
@@ -1991,7 +2034,7 @@ async fn write(
 
     let (clock, mut timing) = (Instant::now(), Timing::new(Step::Links));
     let links = prepared.clone();
-    let (ledger, journal) = timed(store, &mut timing, move |c| {
+    let (ledger, mut journal) = timed(store, &mut timing, move |c| {
         let tx = c.transaction()?;
         write_links(&mut SqlSeat(&tx, &mut journal), &links, &mut ledger)?;
         if let Some(id) = journal.id {
@@ -2003,7 +2046,8 @@ async fn write(
     .await?;
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
-    Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id })
+    let revived = std::mem::take(&mut journal.revived);
+    Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id, revived })
 }
 
 /// The indices in `prepared.rows` of the rows the import inserts and are not
@@ -2056,6 +2100,9 @@ fn report(prepared: &Prepared, written: &Written, dry_run: bool) -> ImportReport
         suggestions: prepared.suggestions.clone(),
         ..Default::default()
     };
+    for project in &mut report.projects {
+        project.revived = project.to.as_ref().is_some_and(|to| written.revived.contains(to));
+    }
     report.invalid.extend(ledger.invalid.iter().cloned());
     report.invalid.sort_by_key(|i| i.line);
     report.dropped_links = ledger.dropped.clone();
@@ -3280,6 +3327,57 @@ pub(crate) mod tests {
         assert_eq!(project_names(&dst).await.len(), 1, "nothing is created");
     }
 
+    const DELETED_HERE: &str = "INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES ('gone-1a2b', 'gone', 'agent', 1, 1, 50);
+         INSERT INTO project_delete (delete_id, project_id, with_memories, code, snapshot, deleted_at) VALUES (1, 'gone-1a2b', 1, 'abcd1234', NULL, 50);";
+
+    async fn deleted_state(store: &MemoryStore, id: &'static str) -> (Option<i64>, bool) {
+        store.conn.call(move |c| c.query_row("SELECT deleted_at, reviewed FROM project WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_row_imported_deleted_leaves_its_deleted_project_deleted() {
+        let dst = destination().await;
+        exec(&dst, DELETED_HERE).await;
+        let file = clawg_file(&[r#"{"kind":"project","id":"gone-1a2b","name":"gone"}"#], &[(1, Some("gone-1a2b"), "A note deleted at the source")])
+            .replace("\"deleted_at\":null", "\"deleted_at\":1760000000000");
+
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+
+        assert_eq!(report.inserted, 1);
+        let gone = went(&report, "gone-1a2b");
+        assert_eq!((gone.to.as_deref(), gone.by, gone.revived), (Some("gone-1a2b"), Some(By::Id), false));
+        assert_eq!(deleted_state(&dst, "gone-1a2b").await, (Some(50), true), "it stays deleted, as it was");
+        let row: (String, Option<i64>) = dst
+            .conn
+            .call(|c| c.query_row("SELECT project_id, deleted_at FROM memory WHERE content = 'A note deleted at the source'", [], |r| Ok((r.get(0)?, r.get(1)?))))
+            .await
+            .unwrap();
+        assert_eq!(row, ("gone-1a2b".to_owned(), Some(1_760_000_000_000)));
+        assert_eq!(count(&dst, "SELECT COUNT(*) FROM memory_import_registry").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_live_row_imported_into_a_deleted_project_brings_it_back_and_says_so() {
+        let dst = destination().await;
+        exec(&dst, DELETED_HERE).await;
+        let file = clawg_file(&[r#"{"kind":"project","id":"gone-1a2b","name":"gone"}"#], &[(1, Some("gone-1a2b"), "A live note of gone")]);
+
+        let (dry, _) = run(&dst, &file, ImportOptions { dry_run: true, ..Default::default() }).await;
+        assert!(went(&dry, "gone-1a2b").revived, "a dry run says it too");
+        assert_eq!(deleted_state(&dst, "gone-1a2b").await, (Some(50), true));
+
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+
+        assert!(went(&report, "gone-1a2b").revived, "{report:#?}");
+        assert_eq!(deleted_state(&dst, "gone-1a2b").await, (None, false), "back, unreviewed");
+        let journaled: (String, Option<String>) = dst
+            .conn
+            .call(|c| c.query_row("SELECT a, value FROM memory_import_registry WHERE kind = 'revived'", [], |r| Ok((r.get(0)?, r.get(1)?))))
+            .await
+            .unwrap();
+        assert_eq!(journaled, ("gone-1a2b".to_owned(), Some("50".to_owned())));
+    }
+
     #[tokio::test]
     async fn an_import_reads_the_first_commit_off_the_store_s_thread() {
         let file = seeded_file().await;
@@ -4173,7 +4271,7 @@ pub(crate) mod tests {
             .conn
             .call(move |c| -> rusqlite::Result<Ledger> {
                 let tx = c.transaction()?;
-                let mut journal = Journal { id: None, source: "clawg", started_at: 0, snapshot: None, inserted: HashSet::new(), running: Arc::default() };
+                let mut journal = Journal { id: None, source: "clawg", started_at: 0, snapshot: None, inserted: HashSet::new(), running: Arc::default(), revived: BTreeSet::new() };
                 let mut ledger = Ledger { taken: record_projects(&tx, &prepared, 0, &mut journal)?, ..Default::default() };
                 place_rows(&mut SqlSeat(&tx, &mut journal), &prepared, 0..prepared.rows.len(), &mut ledger, &HashMap::new(), false)?;
                 write_links(&mut SqlSeat(&tx, &mut journal), &prepared, &mut ledger)?;
