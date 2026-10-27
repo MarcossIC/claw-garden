@@ -1860,7 +1860,7 @@ mod tests {
     /// any root that no other one holds.
     fn test_project() -> ProjectIdentity {
         let id = clawg_core::memory::derive_project_id(std::path::Path::new("/proj-test"));
-        ProjectIdentity { id: id.clone(), root: "/proj-test".into(), legacy_id: id }
+        ProjectIdentity { id: id.clone(), root: "/proj-test".into(), legacy_id: id, path: "/proj-test".into() }
     }
 
     /// A bridge pointed at an address where nothing is listening.
