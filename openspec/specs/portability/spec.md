@@ -101,7 +101,7 @@ Cada fila de un proyecto con línea `project` MUST quedar con el id de proyecto 
 
 **Tests:** `map_root_gives_the_destination_project_id`, `an_import_gives_a_colliding_root_its_own_id`, `an_import_into_a_clone_goes_to_the_project_of_its_remote` (`crates/clawg-core/src/memory/portability/import.rs`).
 
-`clawg export --project PATH` MUST tomar el id de proyecto de la raíz de PATH del store, sin escribir: el de su remoto, si no el de su raíz en `project`, si no el que recibiría (`project_id_of`, `crates/clawg-core/src/memory/portability/export.rs`); en un store sin `project`, `derive_project_id`.
+`clawg export --project PATH` MUST tomar el id de proyecto de la raíz de PATH del store, sin escribir: el de su remoto, si no el de su raíz en `project`, si no el que recibiría (`project_id_of`, `crates/clawg-core/src/memory/portability/export.rs`); en un store sin `project`, `derive_project_id`. Elige con PATH como camino crudo, como un registro: dentro de una subcarpeta declarada, el proyecto al que lleva ([`specs/project`](../project/spec.md) PL47); en un store anterior a V30, como si no hubiera declaraciones. El import no manda camino crudo y no cambia.
 
 **Tests:** `export_reads_the_project_id_from_the_store`, `a_store_from_before_roots_were_recorded_gives_the_derived_id` (`export.rs`).
 

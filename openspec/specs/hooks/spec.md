@@ -6,7 +6,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - [agent-lifecycle-hooks](../../changes/archive/2026-10-18-agent-lifecycle-hooks/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec: R1 vive en [`specs/retrieval`](../retrieval/spec.md) y acá están R2 a R5.
 - [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19 (sólo R6, que en esa spec es R5, y el campo `session_id` de R2). El registro del daemon y el sello en el save están en [`specs/ingest`](../ingest/spec.md), «La sesión del host».
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19 (sólo el aviso de revisión de R4).
-- [project-locators](../../changes/project-locators/proposal.md), su entrega 3a, que sale en 0.64.0 (sólo la línea de las sugerencias pendientes de R4).
+- [project-locators](../../changes/project-locators/proposal.md), su entrega 3a, que sale en 0.64.0 (sólo la línea de las sugerencias pendientes de R4), y su entrega 3b, en la misma versión (sólo el `cwd` como `path` del registro).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (R7, LP12 de esa spec, y la excepción que suma a R3).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (AL6, y el idioma que suma a R4 y R5). Las notas que el daemon escribe en el contexto están en [`specs/retrieval`](../retrieval/spec.md), AL5.
 
@@ -79,7 +79,7 @@ Registran los dos eventos, y no sólo el inicio: un daemon que arrancó después
 - WHEN corre `clawg hook session-start --agent a` con `session_id` `s1` y el `cwd` del proyecto, y después `a` guarda en ese proyecto
 - THEN la fila lleva `s1`; después de un `user-prompt-submit` con `s2`, el save siguiente lleva `s2`
 
-Antes de leer, los dos eventos MUST registrar la raíz de `cwd` (`POST /v1/projects` con `assigned` y sin `index_docs`; `project_of`, `hook.rs`) y usar el id de proyecto que responde, así una sesión en un clone recibe lo que guardó el otro ([`specs/project`](../project/spec.md) R16). Si el registro falla, MUST usar `derive_project_id(raíz)`; ante un 409 `project_root_collision` (un daemon anterior), MUST NOT escribir el contexto. El registro despierta el modelo, como el del puente.
+Antes de leer, los dos eventos MUST registrar la raíz de `cwd`, con `cwd` mismo como `path` (`POST /v1/projects` con `assigned` y sin `index_docs`; `project_of`, `hook.rs`), y usar el id de proyecto que responde, que es el de su subcarpeta declarada cuando `cwd` está en una ([`specs/project`](../project/spec.md) PL47), así una sesión en un clone recibe lo que guardó el otro ([`specs/project`](../project/spec.md) R16). Si el registro falla, MUST usar `derive_project_id(raíz)`; ante un 409 `project_root_collision` (un daemon anterior), MUST NOT escribir el contexto. El registro despierta el modelo, como el del puente.
 
 **Tests:** `the_hook_input_tolerates_unknown_and_missing_fields` (`hook.rs`, que lee `session_id`); `a_hook_registers_the_session_of_the_saves` y `two_clones_share_their_memories_through_a_real_daemon` (`tests/binary.rs`, con el binario real). Con Claude Code sobre el perfil dev, dos sesiones seguidas guardaron con el `session_id` que el host les mandó ([verify](../../changes/archive/2026-10-19-session-handoff/verify.md#claude-code-sobre-el-perfil-dev-2026-10-19)).
 
