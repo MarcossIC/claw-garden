@@ -13,8 +13,8 @@ use clawg_core::memory::db::{EmbeddingIdentity, StoredContract};
 use clawg_core::memory::derive_project_id;
 use clawg_core::memory::identity::is_candidate_for;
 use clawg_core::memory::inspect::{
-    duplicates, live_of, AgentRows, Duplicate, FolderPrint, IdRows, Invariants, OpenDelete, OutboxFacts, ProjectRow,
-    RegistryRow, RemoteRow,
+    duplicates, live_of, AgentRows, DeclaredSubfolder, Duplicate, FolderPrint, IdRows, Invariants, OpenDelete, OutboxFacts,
+    ProjectRow, RegistryRow, RemoteRow,
 };
 use clawg_core::memory::store_lock::StoreOwner;
 use clawg_core::paths::Profile;
@@ -806,6 +806,35 @@ pub fn project_deletes(lang: Lang, registry: &[RegistryRow], rows: &[IdRows], op
     found
 }
 
+/// Each declared subfolder whose repository or project is not in `project`,
+/// which only a store edited by hand has: the subfolder leads to an id no
+/// project answers. A tombstone or a deleted project on either side is one,
+/// as a merge and a delete leave declarations as they were. There is no step.
+pub fn project_subfolders(lang: Lang, registry: &[RegistryRow], declared: &[DeclaredSubfolder]) -> Vec<Finding> {
+    let known = |id: &str| registry.iter().any(|p| p.id == id);
+    let mut found = Vec::new();
+    for d in declared.iter().filter(|d| !known(&d.parent_id) || !known(&d.project_id)) {
+        let (subpath, parent, project) = (&d.subpath, &d.parent_id, &d.project_id);
+        let message = match lang {
+            Lang::En => format!("subfolder {subpath} of {parent} is declared as {project}, and one of them is no project"),
+            Lang::Es => format!("la subcarpeta {subpath} de {parent} está declarada como {project}, y uno de los dos no es un proyecto"),
+        };
+        found.push(Finding::new("project_subfolders", Severity::Warn, "broken_subfolder", message).evidence(json!({
+            "repository_id": parent,
+            "subpath": subpath,
+            "project_id": project,
+        })));
+    }
+    if found.is_empty() {
+        let message = match lang {
+            Lang::En => "every declared subfolder leads from a project to a project",
+            Lang::Es => "cada subcarpeta declarada lleva de un proyecto a un proyecto",
+        };
+        found.push(Finding::ok("project_subfolders", message).evidence(json!({ "declared": declared.len() })));
+    }
+    found
+}
+
 /// One check per rule of `memory`, `ok` when nothing breaks it.
 pub fn invariants(lang: Lang, inv: &Invariants) -> Vec<Finding> {
     let mut found = Vec::new();
@@ -1506,6 +1535,9 @@ mod tests {
         let opens = [OpenDelete { project_id: "gone-1a2b".into(), delete_id: 4 }];
         all.extend(project_deletes(lang, &[gone.clone()], &[id_rows("gone-1a2b", 1, 0)], &opens));
         all.extend(project_deletes(lang, &[gone], &[], &opens));
+        let lost = DeclaredSubfolder { parent_id: "web-3c4d".into(), subpath: "apps/web".into(), project_id: "nowhere-9f9f".into() };
+        all.extend(project_subfolders(lang, &registry, &[lost]));
+        all.extend(project_subfolders(lang, &registry, &[]));
         all
     }
 
@@ -1597,5 +1629,31 @@ mod tests {
         assert_eq!(without[0].evidence["delete_id"], serde_json::Value::Null, "a deleted project with no open delete");
         let healthy = project_deletes(L, &registry, &[id_rows("web-3c4d", 2, 0)], &opens);
         assert_eq!((healthy[0].reason_code, &healthy[0].evidence), ("healthy", &json!({ "deleted": 2 })));
+    }
+
+    #[test]
+    fn a_declaration_whose_projects_are_gone_is_named() {
+        let mut registry = registered(&[("mono-1a2b", "mono", 1, None), ("old-0002", "old", 2, Some("mono-1a2b"))]);
+        registry.push(deleted("web-3c4d", "web", 3, None));
+        let declared = |parent: &str, subpath: &str, project: &str| DeclaredSubfolder {
+            parent_id: parent.into(),
+            subpath: subpath.into(),
+            project_id: project.into(),
+        };
+        let all = [
+            declared("mono-1a2b", "apps/web", "web-3c4d"),
+            declared("old-0002", "apps/api", "mono-1a2b"),
+            declared("mono-1a2b", "libs/ui", "ui-9f9f"),
+            declared("gone-0004", "docs", "mono-1a2b"),
+        ];
+
+        let found = project_subfolders(L, &registry, &all);
+
+        assert_eq!(found.len(), 2, "a tombstone or a deleted project on a side is no finding: {found:?}");
+        assert_eq!((found[0].reason_code, found[0].severity, found[0].safe_next_step.as_deref()), ("broken_subfolder", Severity::Warn, None));
+        assert_eq!(found[0].evidence, json!({ "repository_id": "mono-1a2b", "subpath": "libs/ui", "project_id": "ui-9f9f" }));
+        assert_eq!(found[1].evidence["repository_id"], "gone-0004");
+        let healthy = project_subfolders(L, &registry, &all[..2]);
+        assert_eq!((healthy[0].reason_code, &healthy[0].evidence), ("healthy", &json!({ "declared": 2 })));
     }
 }

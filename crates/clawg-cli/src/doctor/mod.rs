@@ -205,6 +205,10 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
             if let Some(opens) = &facts.open_deletes {
                 found.extend(checks::project_deletes(lang, registry, &facts.id_rows, opens));
             }
+            // Subfolders can be declared from V30.
+            if let Some(declared) = &facts.subfolders {
+                found.extend(checks::project_subfolders(lang, registry, declared));
+            }
         }
         found.extend(checks::invariants(lang, &facts.invariants));
     }

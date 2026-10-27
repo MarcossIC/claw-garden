@@ -49,6 +49,17 @@ pub struct StoreFacts {
     /// The deletes nobody undid or purged (V29); `None` before the table
     /// exists, when no project can be deleted.
     pub open_deletes: Option<Vec<OpenDelete>>,
+    /// The subfolders declared as projects (V30), by repository and subpath;
+    /// `None` before the table exists, when none could be declared.
+    pub subfolders: Option<Vec<DeclaredSubfolder>>,
+}
+
+/// A row of `project_subfolder`, as it is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredSubfolder {
+    pub parent_id: String,
+    pub subpath: String,
+    pub project_id: String,
 }
 
 /// A delete nobody undid or purged, by the project it took.
@@ -315,7 +326,14 @@ fn read_facts(c: &Connection) -> rusqlite::Result<StoreFacts> {
         answered_pairs: if has.table("project_suggestion") { answered_pairs(c)? } else { Vec::new() },
         id_rows: id_rows(c)?,
         open_deletes: if has.table("project_delete") { Some(open_deletes(c)?) } else { None },
+        subfolders: if has.table("project_subfolder") { Some(subfolders(c)?) } else { None },
     })
+}
+
+fn subfolders(c: &Connection) -> rusqlite::Result<Vec<DeclaredSubfolder>> {
+    let mut stmt = c.prepare("SELECT parent_id, subpath, project_id FROM project_subfolder ORDER BY parent_id, subpath")?;
+    let rows = stmt.query_map([], |r| Ok(DeclaredSubfolder { parent_id: r.get(0)?, subpath: r.get(1)?, project_id: r.get(2)? }))?;
+    rows.collect()
 }
 
 /// The projects of `project`, tombstones and deleted ones too, with what the
@@ -1126,6 +1144,31 @@ mod tests {
         let facts = inspect(older.path()).facts.unwrap();
         assert_eq!(facts.registry.unwrap()[0].deleted_at, None);
         assert_eq!(facts.open_deletes, None, "V29 is not applied");
+    }
+
+    #[tokio::test]
+    async fn the_facts_read_the_declared_subfolders_where_the_schema_has_them() {
+        let dir = store_with(|c| {
+            c.execute_batch(
+                "INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES \
+                   ('mono-1a2b', 'libs/ui', 'ui', 2), ('mono-1a2b', 'apps/web', 'web', 1);",
+            )
+            .unwrap();
+        })
+        .await;
+
+        let facts = inspect(dir.path()).facts.unwrap();
+
+        let declared = |subpath: &str, project: &str| DeclaredSubfolder {
+            parent_id: "mono-1a2b".into(),
+            subpath: subpath.into(),
+            project_id: project.into(),
+        };
+        assert_eq!(facts.subfolders, Some(vec![declared("apps/web", "web"), declared("libs/ui", "ui")]));
+
+        let older = tempfile::tempdir().unwrap();
+        seed_on_disk(older.path(), Some(29)).await;
+        assert_eq!(inspect(older.path()).facts.unwrap().subfolders, None, "V30 is not applied");
     }
 
     #[test]
