@@ -4894,11 +4894,12 @@ async fn a_merge_waits_for_the_saves_of_its_projects() {
         (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
     pending_save(&h, "op-1", &app).await;
     let store = h.ctx.runtime.store.clone();
+    // Taken before the spawn: the task may start its sleep before this line runs.
+    let started = Instant::now();
     let finish = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
         store.conn.call(|c| c.execute("DELETE FROM ingest_outbox", [])).await.expect("the save ends");
     });
-    let started = Instant::now();
 
     let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
 
