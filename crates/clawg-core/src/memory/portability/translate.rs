@@ -641,7 +641,7 @@ fn lines(drafts: &[Draft<'_>], options: &TranslateOptions, mut report: ForeignRe
     let mut recorded = HashSet::new();
     for m in &options.project_map {
         if recorded.insert(m.root.as_str()) {
-            parsed.projects.push((0, ProjectLine { id: m.project_id.clone(), root_path: m.root.clone() }));
+            parsed.projects.push((0, ProjectLine { id: m.project_id.clone(), root_path: Some(m.root.clone()), ..Default::default() }));
         }
     }
     Translated { parsed, notes, report }
@@ -1071,7 +1071,7 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!((t.report.unmapped.as_slice(), t.report.unused_map.as_slice()), (&["b".to_owned()][..], &["c".to_owned()][..]));
-        let projects: Vec<(String, String)> = t.parsed.projects.iter().map(|(_, p)| (p.id.clone(), p.root_path.clone())).collect();
+        let projects: Vec<(String, String)> = t.parsed.projects.iter().map(|(_, p)| (p.id.clone(), p.root_path.clone().unwrap_or_default())).collect();
         assert_eq!(projects, vec![(a, "/work/a".into()), (c, "/work/c".into())], "every root of the map is recorded");
     }
 
@@ -1205,7 +1205,7 @@ pub(crate) mod tests {
         };
         assert_eq!(placed("engram:a"), ("app-1a2b".into(), "a/sdd/x".into(), "active".into()));
         assert_eq!(placed("engram:b"), ("app-1a2b".into(), "b/sdd/x".into(), "active".into()));
-        let projects: Vec<(String, String)> = t.parsed.projects.iter().map(|(_, p)| (p.id.clone(), p.root_path.clone())).collect();
+        let projects: Vec<(String, String)> = t.parsed.projects.iter().map(|(_, p)| (p.id.clone(), p.root_path.clone().unwrap_or_default())).collect();
         let recorded = vec![("app-1a2b".into(), "/work/app".into()), ("app-1a2b".into(), "/home/app".into())];
         assert_eq!(projects, recorded, "each root is recorded");
     }

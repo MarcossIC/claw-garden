@@ -47,7 +47,7 @@ use crate::memory::project::{plan_ids_in, RootPlan};
 use crate::memory::registry::project_name;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
-use crate::memory::portability::format::{parse, ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
+use crate::memory::portability::format::{parse, ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine, ProjectLine};
 use crate::memory::portability::timing::{ImportTimings, Step, Timing};
 use crate::memory::portability::translate::{
     translate, ForeignReport, LeftOut, MappedProject, MergedNote, NoteRows, TakenKey, TakenProject, TranslateOptions,
@@ -235,13 +235,16 @@ struct ProjectHere {
     git_stamp: Option<String>,
 }
 
-/// The root here of every project line.
+/// The project lines that name a folder, the only ones a root is planned for.
+fn rooted(parsed: &Parsed) -> impl Iterator<Item = (&ProjectLine, &str)> {
+    parsed.projects.iter().filter_map(|(_, p)| Some((p, p.root_path.as_deref()?)))
+}
+
+/// The root here of every project line that names a folder, in order.
 fn roots_here(parsed: &Parsed, options: &ImportOptions) -> Vec<PathBuf> {
-    parsed
-        .projects
-        .iter()
-        .map(|(_, p)| {
-            let root = options.map_roots.iter().find(|(old, _)| *old == p.root_path).map_or(&p.root_path, |(_, new)| new);
+    rooted(parsed)
+        .map(|(_, root_path)| {
+            let root = options.map_roots.iter().find(|(old, _)| old == root_path).map_or(root_path, |(_, new)| new.as_str());
             PathBuf::from(root)
         })
         .collect()
@@ -325,7 +328,7 @@ enum Texts {
 fn prepare(mut parsed: Parsed, roots: &[PathBuf], plans: &[RootPlan], options: &ImportOptions, texts: Texts) -> Prepared {
     let mut project_ids: HashMap<String, String> = HashMap::new();
     let mut projects = Vec::new();
-    for (((_, p), root), plan) in parsed.projects.iter().zip(roots).zip(plans) {
+    for (((p, _), root), plan) in rooted(&parsed).zip(roots).zip(plans) {
         project_ids.insert(p.id.clone(), plan.project_id.clone());
         projects.push(ProjectHere {
             root: root.to_string_lossy().into_owned(),

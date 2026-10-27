@@ -4,7 +4,7 @@
 //! written, so it works beside a running daemon. What it reads is what the
 //! store committed; saves still waiting in the outbox are only counted.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -12,8 +12,11 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::memory::backup::{known_migrations, open_for_probe, read_history, schema_plan, BackupError, SchemaPlan};
 use crate::memory::identity::Ground;
 use crate::memory::portability::format::{
-    ConflictLine, DerivationLine, Filter, Header, Line, MemoryLine, PieceLine, ProjectLine, FORMAT, VERSION,
+    ConflictLine, DerivationLine, Filter, FolderLine, Header, Line, MemoryLine, PieceLine, ProjectLine, SubfolderLine, FORMAT,
+    VERSION,
 };
+use crate::memory::merge::MAX_MERGE_HOPS;
+use crate::memory::registry::project_name;
 use crate::memory::MemoryError;
 
 /// Which rows an export takes.
@@ -140,8 +143,9 @@ pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result
     let project_ids: BTreeSet<&str> = memories.iter().filter_map(|m| m.project_id.as_deref()).collect();
 
     let projects = match folder_table(c)? {
+        Some("project_path") => project_lines(c, &project_ids)?,
         Some(table) => collect(c, &format!("SELECT id, root_path FROM {table} ORDER BY id"), |r| {
-            Ok(ProjectLine { id: r.get(0)?, root_path: r.get(1)? })
+            Ok(ProjectLine { id: r.get(0)?, root_path: Some(r.get(1)?), ..Default::default() })
         })?
         .into_iter()
         .filter(|p| project_ids.contains(p.id.as_str()))
@@ -241,6 +245,92 @@ pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result
     })
 }
 
+/// One line per project of `exported`, from a store with the registry
+/// (V27): its name, its folders, its remotes and its declared subfolders,
+/// read with what the store has. The tombstones that lead to one of them,
+/// the repositories whose declarations lead to one and the projects a
+/// declaration of one leads to get a line too, without rows of their own.
+fn project_lines(c: &Connection, exported: &BTreeSet<&str>) -> rusqlite::Result<Vec<ProjectLine>> {
+    let merges = columns_of(c, "project")?.contains("merged_into");
+    let merged = if merges { "merged_into" } else { "NULL" };
+    let projects: BTreeMap<String, (String, Option<String>)> =
+        collect(c, &format!("SELECT id, name, {merged} FROM project"), |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+            .into_iter()
+            .collect();
+    let live = |id: &str| -> String {
+        let mut at = id.to_owned();
+        let mut seen = BTreeSet::from([at.clone()]);
+        while let Some((_, Some(into))) = projects.get(&at) {
+            if !seen.insert(into.clone()) || seen.len() > MAX_MERGE_HOPS + 1 {
+                return id.to_owned();
+            }
+            at = into.clone();
+        }
+        at
+    };
+    let bound: Vec<(String, String)> =
+        collect(c, "SELECT remote, project_id FROM project_remote ORDER BY created_at, remote", |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let folders: Vec<(String, FolderLine)> = collect(
+        c,
+        "SELECT id, project_id, remote, root_path, root_commit FROM project_path ORDER BY created_at, id",
+        |r| {
+            let (id, project, remote): (String, Option<String>, Option<String>) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            Ok((id, project, FolderLine { root_path: r.get(3)?, remote, root_commit: r.get(4)? }))
+        },
+    )?
+    .into_iter()
+    .map(|(id, project, folder)| {
+        // The one a registration recorded, else the one the clones of its
+        // remote share, else its own id, as the registry lists it.
+        let by_remote = || folder.remote.as_ref().and_then(|r| bound.iter().find(|(b, _)| b == r)).map(|(_, p)| p.clone());
+        (live(&project.or_else(by_remote).unwrap_or(id)), folder)
+    })
+    .collect();
+    let subfolders: Vec<(String, String, String)> = if has_table(c, "project_subfolder")? {
+        collect(c, "SELECT parent_id, subpath, project_id FROM project_subfolder ORDER BY created_at, parent_id, subpath", |r| {
+            Ok((live(&r.get::<_, String>(0)?), r.get(1)?, live(&r.get::<_, String>(2)?)))
+        })?
+    } else {
+        Vec::new()
+    };
+
+    let reached: BTreeSet<String> = exported.iter().map(|id| live(id)).collect();
+    let mut lines: BTreeSet<String> = exported.iter().map(|id| id.to_string()).collect();
+    lines.extend(projects.keys().filter(|id| projects[*id].1.is_some() && reached.contains(&live(id))).cloned());
+    for (parent, _, project) in &subfolders {
+        if reached.contains(project) {
+            lines.insert(parent.clone());
+        }
+        if reached.contains(parent) {
+            lines.insert(project.clone());
+        }
+    }
+    Ok(lines
+        .into_iter()
+        .map(|id| {
+            let name = projects.get(&id).map_or_else(|| project_name(&id).to_owned(), |(name, _)| name.clone());
+            let merged_into = projects.get(&id).and_then(|(_, into)| into.as_ref()).map(|_| live(&id)).filter(|to| *to != id);
+            if merged_into.is_some() {
+                return ProjectLine { id, name: Some(name), merged_into, ..Default::default() };
+            }
+            let folders: Vec<FolderLine> = folders.iter().filter(|(p, _)| *p == id).map(|(_, f)| f.clone()).collect();
+            ProjectLine {
+                root_path: folders.first().map(|f| f.root_path.clone()),
+                name: Some(name),
+                folders,
+                remotes: bound.iter().filter(|(_, p)| live(p) == id).map(|(r, _)| r.clone()).collect(),
+                merged_into: None,
+                subfolders: subfolders
+                    .iter()
+                    .filter(|(parent, _, project)| *parent == id && *project != id)
+                    .map(|(_, subpath, project)| SubfolderLine { subpath: subpath.clone(), project_id: project.clone() })
+                    .collect(),
+                id,
+            }
+        })
+        .collect())
+}
+
 fn read_memories(c: &Connection, filter: &ExportFilter) -> rusqlite::Result<Vec<MemoryLine>> {
     let columns = columns_of(c, "memory")?;
     let or_null = |name: &str| if columns.contains(name) { name.to_string() } else { format!("NULL AS {name}") };
@@ -323,7 +413,7 @@ mod tests {
     use super::*;
     use crate::memory::db::seed_on_disk;
     use crate::memory::identity::{FakeGround, RootCommit};
-    use crate::memory::portability::fixtures::{other_project, project, seed};
+    use crate::memory::portability::fixtures::{other_project, project, seed, OTHER_ROOT};
     use crate::memory::portability::format::parse;
     use crate::memory::MemoryStore;
 
@@ -361,7 +451,14 @@ mod tests {
 
         let codex = seeded_export(ExportFilter { agent: Some("codex".into()), ..Default::default() }).await;
         assert_eq!(ids(&codex), vec![14]);
-        assert_eq!(codex.projects, vec![ProjectLine { id: other_project(), root_path: "/work/other".into() }]);
+        let folder = FolderLine { root_path: OTHER_ROOT.into(), ..Default::default() };
+        let line = ProjectLine {
+            root_path: Some(OTHER_ROOT.into()),
+            name: Some(project_name(&other_project()).to_owned()),
+            folders: vec![folder],
+            ..ProjectLine { id: other_project(), ..Default::default() }
+        };
+        assert_eq!(codex.projects, vec![line]);
         assert_eq!(codex.outbox_waiting, 0, "only the exported agent's saves are counted");
     }
 
@@ -549,8 +646,169 @@ mod tests {
             let free = Path::new("/fresh/app");
             assert_eq!(of("/fresh/app", None), crate::memory::identity::derive_project_id(free), "{folders}");
             let exported = export(dir.path(), &ExportFilter::default(), 0).unwrap();
-            assert_eq!(exported.projects, vec![ProjectLine { id: "app-1a2b".into(), root_path: "/work/app".into() }], "{folders}");
+            let before = ProjectLine { id: "app-1a2b".into(), root_path: Some("/work/app".into()), ..Default::default() };
+            let line = match folders {
+                "project" => before,
+                _ => ProjectLine {
+                    name: Some("app".into()),
+                    folders: vec![FolderLine { root_path: "/work/app".into(), ..Default::default() }],
+                    remotes: vec!["github.com/acme/app".into()],
+                    ..before
+                },
+            };
+            assert_eq!(exported.projects, vec![line], "{folders}");
         }
+    }
+
+    /// A store with the registry, its rows written in `projects`.
+    async fn registry_store(sql: &'static str, rows: &'static [(i64, &'static str, bool)]) -> MemoryStore {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .conn
+            .call(move |c| {
+                c.execute_batch(sql)?;
+                for (id, project, deleted) in rows {
+                    c.execute(
+                        "INSERT INTO memory (id, scope, agent_id, project_id, content, memory_type, source, created_at, \
+                          created_by_type, created_by_ref, last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
+                         VALUES (?1, 'agent', 'a', ?2, 'note ' || ?1, 'semantic_fact', 'explicit', ?1, 'agent', 'a', ?1, ?1, 5.0, 3, \
+                          'active', CASE WHEN ?3 THEN 99 END)",
+                        rusqlite::params![id, project, deleted],
+                    )?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        store
+    }
+
+    async fn lines_of(store: &MemoryStore, filter: ExportFilter) -> Vec<ProjectLine> {
+        store.conn.call(move |c| Ok::<_, rusqlite::Error>(read(c, &filter, 0))).await.unwrap().unwrap().projects
+    }
+
+    fn folder(root_path: &str, remote: Option<&str>, root_commit: Option<&str>) -> FolderLine {
+        FolderLine { root_path: root_path.into(), remote: remote.map(Into::into), root_commit: root_commit.map(Into::into) }
+    }
+
+    #[tokio::test]
+    async fn an_export_writes_one_line_per_project_with_its_locators() {
+        let store = registry_store(
+            "INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) VALUES \
+               ('app-1a2b', 'App web', 'root', 1, 1, NULL, NULL), ('ideas-3c4d', 'Ideas de producto', 'agent', 1, 2, NULL, NULL), \
+               ('app-old-9f8e', 'app-old', 'root', 0, 3, 'app-1a2b', 9), ('lonely-0000', 'lonely', 'agent', 0, 4, NULL, NULL);
+             INSERT INTO project_path (id, root_path, created_at, index_docs, project_id, remote, root_commit) VALUES \
+               ('app-1a2b', '/work/app', 1, 1, 'app-1a2b', 'github.com/acme/app', 'c1'), \
+               ('app-7777', '/review/app', 2, 0, 'app-1a2b', 'github.com/acme/app', 'c1'), \
+               ('app-old-9f8e', '/old/app', 3, 0, 'app-old-9f8e', 'github.com/acme/app-old', NULL);
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES \
+               ('github.com/acme/app', 'app-1a2b', 1), ('github.com/acme/app-old', 'app-old-9f8e', 3);",
+            &[(1, "app-1a2b", false), (2, "ideas-3c4d", false), (3, "lonely-0000", true)],
+        )
+        .await;
+
+        let lines = lines_of(&store, ExportFilter::default()).await;
+
+        let app = ProjectLine {
+            id: "app-1a2b".into(),
+            root_path: Some("/work/app".into()),
+            name: Some("App web".into()),
+            folders: vec![
+                folder("/work/app", Some("github.com/acme/app"), Some("c1")),
+                folder("/review/app", Some("github.com/acme/app"), Some("c1")),
+                folder("/old/app", Some("github.com/acme/app-old"), None),
+            ],
+            remotes: vec!["github.com/acme/app".into(), "github.com/acme/app-old".into()],
+            ..Default::default()
+        };
+        let tombstone = ProjectLine {
+            id: "app-old-9f8e".into(),
+            name: Some("app-old".into()),
+            merged_into: Some("app-1a2b".into()),
+            ..Default::default()
+        };
+        let ideas = ProjectLine { id: "ideas-3c4d".into(), name: Some("Ideas de producto".into()), ..Default::default() };
+        assert_eq!(lines, vec![app, tombstone, ideas], "a deleted row's project stays out without it");
+        let text = dump_text(&store, ExportFilter::default()).await;
+        assert!(text.contains(r#"{"kind":"project","id":"ideas-3c4d","name":"Ideas de producto"}"#), "{text}");
+    }
+
+    async fn dump_text(store: &MemoryStore, filter: ExportFilter) -> String {
+        store.conn.call(move |c| Ok::<_, rusqlite::Error>(read(c, &filter, 0))).await.unwrap().unwrap().to_jsonl()
+    }
+
+    #[tokio::test]
+    async fn an_export_of_a_subproject_carries_its_repository_and_declaration() {
+        let store = registry_store(
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+               ('mono-5e6f', 'mono', 'root', 1, 1), ('web-7a8b', 'web', 'agent', 1, 2), ('docs-1111', 'docs', 'agent', 1, 3);
+             INSERT INTO project_path (id, root_path, created_at, index_docs, project_id, remote) VALUES \
+               ('mono-5e6f', '/work/mono', 1, 1, 'mono-5e6f', 'github.com/acme/mono');
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/mono', 'mono-5e6f', 1);
+             INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES \
+               ('mono-5e6f', 'apps/web', 'web-7a8b', 4), ('mono-5e6f', 'docs', 'docs-1111', 5);",
+            &[(1, "web-7a8b", false), (2, "mono-5e6f", false)],
+        )
+        .await;
+
+        let only_web = ExportFilter { project_id: Some("web-7a8b".into()), ..Default::default() };
+        let lines = lines_of(&store, only_web.clone()).await;
+
+        let declared = |subpath: &str, project: &str| SubfolderLine { subpath: subpath.into(), project_id: project.into() };
+        let mono = ProjectLine {
+            id: "mono-5e6f".into(),
+            root_path: Some("/work/mono".into()),
+            name: Some("mono".into()),
+            folders: vec![folder("/work/mono", Some("github.com/acme/mono"), None)],
+            remotes: vec!["github.com/acme/mono".into()],
+            subfolders: vec![declared("apps/web", "web-7a8b"), declared("docs", "docs-1111")],
+            ..Default::default()
+        };
+        let web = ProjectLine { id: "web-7a8b".into(), name: Some("web".into()), ..Default::default() };
+        assert_eq!(lines, vec![mono.clone(), web.clone()]);
+        let rows = store.conn.call(move |c| Ok::<_, rusqlite::Error>(read(c, &only_web, 0))).await.unwrap().unwrap().memories;
+        assert_eq!(rows.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1], "no row of the repository travels");
+
+        let only_mono = ExportFilter { project_id: Some("mono-5e6f".into()), ..Default::default() };
+        let docs = ProjectLine { id: "docs-1111".into(), name: Some("docs".into()), ..Default::default() };
+        assert_eq!(lines_of(&store, only_mono).await, vec![docs, mono, web], "every subproject it declares travels");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_project_exports_without_its_mark() {
+        let store = registry_store(
+            "INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES ('gone-1a2b', 'gone', 'agent', 1, 1, 50);",
+            &[(1, "gone-1a2b", true)],
+        )
+        .await;
+        store.conn.call(|c| c.execute("UPDATE project SET deleted_at = 50, reviewed = 1", [])).await.unwrap();
+
+        let lines = lines_of(&store, ExportFilter { include_deleted: true, ..Default::default() }).await;
+
+        assert_eq!(lines, vec![ProjectLine { id: "gone-1a2b".into(), name: Some("gone".into()), ..Default::default() }]);
+        let text = dump_text(&store, ExportFilter { include_deleted: true, ..Default::default() }).await;
+        let line = text.lines().find(|l| l.contains("\"kind\":\"project\"")).unwrap();
+        assert!(!line.contains("deleted") && !line.contains("reviewed") && !line.contains("born"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_store_from_before_the_registry_exports_its_folders_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), Some(26)).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute_batch(
+            "INSERT INTO project (id, root_path, created_at) VALUES ('app-1a2b', '/work/app', 1), ('lib-3c4d', '/work/lib', 2);
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
+             UPDATE memory SET project_id = 'app-1a2b';",
+        )
+        .unwrap();
+        drop(c);
+
+        let exported = export(dir.path(), &ExportFilter::default(), 0).unwrap();
+
+        let text = exported.to_jsonl();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("\"kind\":\"project\"")).collect();
+        assert_eq!(lines, vec![r#"{"kind":"project","id":"app-1a2b","root_path":"/work/app"}"#]);
     }
 
     #[tokio::test]
