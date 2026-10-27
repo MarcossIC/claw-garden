@@ -2114,7 +2114,7 @@ async fn register_root(
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || Disk.checkout(&root)).await.unwrap_or_default()
     };
-    let registration = Registration { root, checkout, legacy_ids, index_docs, assigned };
+    let registration = Registration { root, checkout, legacy_ids, index_docs, assigned, subpath: None };
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let outcome = register_project(&app.runtime.store, &app.runtime.workspaces(), &backups, registration, Arc::new(Disk))
         .await

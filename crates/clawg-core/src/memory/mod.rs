@@ -51,6 +51,7 @@ pub mod relocate;
 pub mod inspect;
 pub mod secrets;
 pub mod sharing;
+pub mod subfolder;
 
 pub use contradiction::Candidate;
 pub use db::MemoryStore;
