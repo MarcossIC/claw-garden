@@ -739,8 +739,9 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
 
 ### 67. Verificación
 
-- [ ] La suite y los dos clippy de `.claude/CLAUDE.md`, en `target-test` en Windows y con `--locked`, y en Linux.
-- [ ] El binario en dos homes temporales, A y B, con un repositorio git real con un `origin` `https://…`, clonado en otro camino en cada home:
+- [x] La suite y los dos clippy de `.claude/CLAUDE.md`, con `--locked`, en Linux.
+- [ ] Lo mismo en `target-test` en Windows.
+- [x] El binario en dos homes temporales, A y B, con un repositorio git real con un `origin` `https://…`, clonado en otro camino en cada home:
   - en A: un proyecto sin carpeta creado con `projects create`, memorias en él y en el repositorio, y un monorepo con su declaración; después, `clawg export`;
   - en B: `clawg import`. Las memorias del repositorio quedan en el proyecto del clone de B, las del proyecto sin carpeta en uno con su nombre, y la declaración lleva al subproyecto;
   - otra vez `clawg import` en B, después de un `projects move`: no agrega nada;
@@ -748,5 +749,5 @@ Requisitos en la [spec](spec.md#entrega-4-exportar-e-importar) (PL53 a PL65) y d
   - un export de engram con `--project-map NOMBRE=project:ideas`, y el 409 con un proyecto borrado;
   - `doctor` no marca nada nuevo.
 - [ ] El CI en Linux y Windows, en el pull request final del cambio.
-- [ ] `verify.md`, sección «Entrega 4».
-- [ ] No queda otro directorio de build que `target` y `target-test`.
+- [x] `verify.md`, sección «Entrega 4».
+- [x] No queda otro directorio de build que `target` y `target-test`.

@@ -251,3 +251,35 @@ Pendiente para el pull request final del cambio, como el de las entregas anterio
 - **Tarea 45:** sin V30, `a_database_from_the_previous_version_opens_with_no_subfolder_declared` y los tres conteos de migraciones fallaron; con el archivo y sin fijarlo, `published_migration_checksums_are_pinned`.
 - **Tareas 46 a 53:** los tests no compilaban sin `subpath_of`, `Ground::subpath`, `ProjectIdentity::path`, el módulo `subfolder`, `Registration::subpath`, `ListedSubfolder`, `DeleteReport::subfolders`, `RegisterRequest::path`, `LocateRequest::subfolder`, `--subfolder` y `DeclaredSubfolder`. Los de `render_list` fallaron una vez por el orden de las líneas, que quedó después de los remotos.
 
+
+## Entrega 4 (0.64.0)
+
+### Linux
+
+- `cargo test --workspace --locked` pasa en `9098632`, con `tests/binary.rs`: ningún binario con fallos. `cargo clippy --workspace --all-targets --locked -- -A clippy::all -D warnings`, `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings` y `cargo test --locked -p clawg-core --lib build_info` salen con 0.
+- ONNX Runtime se bajó de `cdn.pyke.io` al compilar, sin rueda de PyPI.
+- `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin volver a bendecir (PL65).
+
+### El binario real en dos homes temporales
+
+Se usó el binario de `target/debug`, copiado fuera del directorio de build, con `CLAWG_TEST_HOME`, `CLAWG_TEST_EMBEDDER=fake`, `CLAWG_TEST_DEFAULT_PORT=off` y `clawg serve --profile dev --port 0`. El camino del home temporal no entra en `sun_path`, así que el daemon sirvió por TCP solo. Los repositorios se hicieron con `git`: `app` con `origin` `https://github.com/acme/app.git` y `mono` con `https://github.com/acme/mono.git`, copiados en otro camino para el home B, con el mismo primer commit. Los saves y los registros se mandaron por HTTP con el token.
+
+1. En A: `projects create ideas`, `projects create web` y `projects locate web <mono>/apps/web --subfolder`; un save en `ideas`, dos en `app`, uno en `web` (registrado con el camino crudo `apps/web/src`) y uno en `mono`. `clawg export` escribió 5 memorias y 4 proyectos, dijo «2 projects without a folder», y las líneas `project` llevaron nombre, carpetas con remoto y primer commit, remotos y la declaración de `mono`.
+2. En B, con los clones registrados: `import --dry-run` y `import` dieron el mismo reporte; `app` y `mono` fueron a los proyectos de los clones `by remote`, `ideas` y `web` se crearon con su id y su nombre, y la declaración `apps/web → web` se escribió. `projects list` la mostró en los dos lados, y el registro del clone con el camino crudo `apps/web/src` respondió `web`.
+3. `projects move --id 2 --to-project ideas` y otra vez `import`: «imported 0 of 5», 4 ya presentes y «already here, moved to another project: ideas 1»; `ideas` y `web` fueron `by id`, y la declaración quedó como estaba (`declared_here`).
+4. Después de `projects move --undo 1`, `import --undo 1` retiró las 5 memorias, las carpetas grabadas de A, los dos proyectos creados y la declaración; `projects list` quedó como antes del import.
+5. Un export de engram con `--project-map board=project:notas` dejó su nota en `notas`. Con `notas` borrado, el mismo import por su id respondió 409 `project_deleted`, y por su nombre 404, porque el nombre de un proyecto borrado queda libre (PL27).
+6. `doctor` dio un `error` `socket` `path_unusable` (el camino largo del home temporal) y dos `info` del entorno (`store.owner`, `mcp`). Nada nuevo.
+
+### CI
+
+Pendiente para el pull request final del cambio, como el de las entregas anteriores.
+
+### Lo que no se corrió
+
+- **Windows:** la suite, los clippy y el recorrido del binario de esta entrega no corrieron en Windows.
+- **El perfil dev y el de producción:** no se tocó ningún perfil real.
+
+### Qué se vio fallar antes de cada cambio
+
+- **Tareas 56 a 65:** cada tanda de tests se escribió antes que su código, y no compilaba sin lo que nombra: V31 y su fila de checksum, los campos nuevos de `ProjectLine`, el módulo `projects.rs`, los campos nuevos de `ImportReport` y `UndoReport`, `Seat::present_elsewhere`, `MapTarget`, `MapTo` y `Written::without_folder`. `a_row_imported_deleted_leaves_its_deleted_project_deleted` falló antes de su arreglo: el proyecto borrado volvía.
