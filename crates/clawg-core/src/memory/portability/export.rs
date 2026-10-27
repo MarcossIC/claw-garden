@@ -77,10 +77,10 @@ pub fn export(base_dir: &Path, filter: &ExportFilter, now_ms: i64) -> Result<Exp
 }
 
 /// The project id the root `root` reads and writes under in
-/// `<base_dir>/memory.db`, from what `ground` finds at it, read without
-/// writing; the id derived from the root for a store from before roots were
-/// recorded.
-pub fn project_id_of(base_dir: &Path, root: &Path, ground: &dyn Ground) -> Result<String, ExportError> {
+/// `<base_dir>/memory.db`, from what `ground` finds at it, or the one a
+/// declared subfolder leads `inside` to in it, read without writing; the id
+/// derived from the root for a store from before roots were recorded.
+pub fn project_id_of(base_dir: &Path, root: &Path, inside: Option<&Path>, ground: &dyn Ground) -> Result<String, ExportError> {
     let path = base_dir.join("memory.db");
     if !path.exists() {
         return Err(MemoryError::from(BackupError::NoStore { path }).into());
@@ -107,7 +107,13 @@ pub fn project_id_of(base_dir: &Path, root: &Path, ground: &dyn Ground) -> Resul
     if !merges {
         c.execute_batch("CREATE TEMP VIEW project AS SELECT id, NULL AS merged_into FROM main.project")?;
     }
-    Ok(crate::memory::project::project_id_in(&c, root, ground)?)
+    // Before V30 no subfolder was declared.
+    if !has_table(&c, "project_subfolder")? {
+        c.execute_batch(
+            "CREATE TEMP TABLE project_subfolder (parent_id TEXT, subpath TEXT, project_id TEXT, created_at INTEGER)",
+        )?;
+    }
+    Ok(crate::memory::project::project_id_in(&c, root, inside, ground)?)
 }
 
 /// The table that holds the store's folders: `project_path` from V27,
@@ -535,7 +541,7 @@ mod tests {
             let of = |root: &str, remote: Option<&str>| {
                 let ground = FakeGround::default();
                 ground.put(Path::new(root), remote, None, RootCommit::Later);
-                project_id_of(dir.path(), Path::new(root), &ground).unwrap()
+                project_id_of(dir.path(), Path::new(root), None, &ground).unwrap()
             };
 
             assert_eq!(of("/review/app", Some("github.com/acme/app")), "app-1a2b", "{folders}: the project its remote shares");
@@ -554,6 +560,56 @@ mod tests {
         let root = Path::new("/work/app");
         let ground = FakeGround::default();
         ground.put(root, Some("github.com/acme/app"), None, RootCommit::Later);
-        assert_eq!(project_id_of(dir.path(), root, &ground).unwrap(), crate::memory::identity::derive_project_id(root));
+        assert_eq!(project_id_of(dir.path(), root, None, &ground).unwrap(), crate::memory::identity::derive_project_id(root));
+    }
+
+    #[tokio::test]
+    async fn the_project_of_a_path_reads_the_declarations_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute_batch(
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('mono-1a2b', 'mono', 'root', 1, 1), ('web', 'web', 'user', 1, 2);
+             INSERT INTO project_path (id, root_path, created_at, project_id) VALUES ('mono-1a2b', '/work/mono', 1, 'mono-1a2b');
+             INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES ('mono-1a2b', 'apps/web', 'web', 3);",
+        )
+        .unwrap();
+        drop(c);
+        let changes = || std::fs::read(dir.path().join("memory.db")).unwrap();
+        let before = changes();
+        let ground = FakeGround::default();
+        let root = Path::new("/work/mono");
+        ground.put(root, None, None, RootCommit::Later);
+        let of = |path: &str| project_id_of(dir.path(), root, Some(Path::new(path)), &ground).unwrap();
+
+        assert_eq!(of("/work/mono/apps/web/src"), "web");
+        assert_eq!(of("/work/mono/apps/webapp"), "mono-1a2b");
+        assert_eq!(of("/work/mono"), "mono-1a2b");
+        assert_eq!(project_id_of(dir.path(), root, None, &ground).unwrap(), "mono-1a2b");
+        assert_eq!(changes(), before, "reading writes nothing");
+    }
+
+    #[tokio::test]
+    async fn a_store_from_before_subfolders_reads_the_project_of_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_on_disk(dir.path(), Some(29)).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute_batch(
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('mono-1a2b', 'mono', 'root', 1, 1);
+             INSERT INTO project_path (id, root_path, created_at, project_id) VALUES ('mono-1a2b', '/work/mono', 1, 'mono-1a2b');",
+        )
+        .unwrap();
+        drop(c);
+        let ground = FakeGround::default();
+        let root = Path::new("/work/mono");
+        ground.put(root, None, None, RootCommit::Later);
+
+        let read = project_id_of(dir.path(), root, Some(Path::new("/work/mono/apps/web")), &ground).unwrap();
+
+        assert_eq!(read, "mono-1a2b");
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        let tables: i64 =
+            c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'project_subfolder'", [], |r| r.get(0)).unwrap();
+        assert_eq!(tables, 0, "the store stays at its version");
     }
 }

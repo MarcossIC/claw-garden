@@ -224,8 +224,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
             let project_id = match project {
                 Some(path) => {
-                    let root = ProjectIdentity::resolve(&path).root;
-                    Some(project_id_of(&base_dir, &root, &Disk).map_err(|e| e.to_string())?)
+                    let identity = ProjectIdentity::resolve(&path);
+                    Some(project_id_of(&base_dir, &identity.root, Some(&identity.path), &Disk).map_err(|e| e.to_string())?)
                 }
                 None => None,
             };

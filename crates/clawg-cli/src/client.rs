@@ -349,6 +349,15 @@ pub struct Located {
     /// The merge of the folder's own project into it.
     #[serde(default)]
     pub merge: Option<MergeReport>,
+    /// For a subfolder: the project of its repository.
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    /// For a subfolder: where it is in its checkout.
+    #[serde(default)]
+    pub subpath: Option<String>,
+    /// For a subfolder: the repository's project was named, and its declaration went.
+    #[serde(default)]
+    pub removed: bool,
 }
 
 /// Whether `POST /v1/context` searched memories, and if not, why.
@@ -1418,10 +1427,14 @@ impl DaemonClient {
 
     /// Records `root` as a project and joins into its project the rows saved
     /// under `legacy_ids`, letting the daemon read its files when
-    /// `index_docs`. Returns the ids the daemon gave the root.
+    /// `index_docs`. Returns the ids the daemon gave the root, and in
+    /// `project_id` the project of `path`, where the caller works inside it,
+    /// when a declared subfolder leads there. A daemon from before
+    /// declarations ignores `path` and answers the root's.
     pub async fn register_project(
         &self,
         root: &std::path::Path,
+        path: Option<&std::path::Path>,
         legacy_ids: &[String],
         index_docs: bool,
     ) -> Result<Registered, ClientError> {
@@ -1431,12 +1444,15 @@ impl DaemonClient {
             root_id: Option<String>,
             rekeyed: usize,
         }
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "root_path": root.to_string_lossy(),
             "legacy_ids": legacy_ids,
             "index_docs": index_docs,
             "assigned": true,
         });
+        if let Some(path) = path {
+            body["path"] = serde_json::Value::String(path.to_string_lossy().into_owned());
+        }
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/projects").json(&body)?).await?;
         let body = read_response::<Body>(answer)?;
         // A daemon from before assigned ids keeps one id per root.
@@ -1497,9 +1513,14 @@ impl DaemonClient {
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/projects/suggestions/answer").json(&body)?).await?)
     }
 
-    /// Makes the root of `root` lead to `project`, an id or a name.
-    pub async fn locate_project(&self, project: &str, root: &std::path::Path) -> Result<Located, ClientError> {
-        let body = serde_json::json!({ "project": project, "root_path": root.to_string_lossy() });
+    /// Makes the root of `root` lead to `project`, an id or a name, or with
+    /// `subfolder` the folder `root` itself, declared inside its repository.
+    /// A daemon from before declarations refuses `subfolder` with a 400.
+    pub async fn locate_project(&self, project: &str, root: &std::path::Path, subfolder: bool) -> Result<Located, ClientError> {
+        let mut body = serde_json::json!({ "project": project, "root_path": root.to_string_lossy() });
+        if subfolder {
+            body["subfolder"] = serde_json::Value::Bool(true);
+        }
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/projects/locate").json(&body)?).await?)
     }
 

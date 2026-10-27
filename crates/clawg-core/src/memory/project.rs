@@ -528,9 +528,15 @@ fn settle_in(
 
 /// The project id `root` reads and writes under, as the store says now and
 /// without writing: the one a registration with assigned ids would give it,
-/// from what `ground` finds at the root.
-pub fn project_id_in(c: &Connection, root: &Path, ground: &dyn Ground) -> rusqlite::Result<String> {
-    Ok(plan_ids_in(c, &[root.to_path_buf()], ground)?.remove(0).project_id)
+/// from what `ground` finds at the root, or the project a declared subfolder
+/// leads `path` to inside it.
+pub fn project_id_in(c: &Connection, root: &Path, path: Option<&Path>, ground: &dyn Ground) -> rusqlite::Result<String> {
+    let project = plan_ids_in(c, &[root.to_path_buf()], ground)?.remove(0).project_id;
+    let subpath = path.and_then(|p| ground.subpath(root, p));
+    Ok(match subpath {
+        Some(subpath) => declared_in(c, &project, &subpath)?.unwrap_or(project),
+        None => project,
+    })
 }
 
 /// What a registration with assigned ids would give a root ([`plan_ids_in`]).
@@ -1545,7 +1551,7 @@ mod tests {
             .store
             .conn
             .call(move |c| {
-                let read = project_id_in(c, path, &*ground)?;
+                let read = project_id_in(c, path, None, &*ground)?;
                 let planned = plan_ids_in(c, &[path.to_path_buf(), path.to_path_buf()], &*ground)?;
                 Ok::<_, rusqlite::Error>((read, planned.into_iter().map(|p| (p.root_id, p.project_id)).collect::<Vec<_>>()))
             })
@@ -1743,9 +1749,9 @@ mod tests {
             .conn
             .call(move |c| {
                 ground.put(review, Some("github.com/acme/app"), None, RootCommit::Later);
-                let shared = project_id_in(c, review, &*ground)?;
+                let shared = project_id_in(c, review, None, &*ground)?;
                 ground.put(review, None, None, RootCommit::Later);
-                Ok::<_, rusqlite::Error>((shared, project_id_in(c, review, &*ground)?, project_id_in(c, other, &*ground)?))
+                Ok::<_, rusqlite::Error>((shared, project_id_in(c, review, None, &*ground)?, project_id_in(c, other, None, &*ground)?))
             })
             .await
             .unwrap();
@@ -1942,7 +1948,7 @@ mod tests {
             .store
             .conn
             .call(move |c| {
-                let read = project_id_in(c, Path::new("/work/app"), &*ground)?;
+                let read = project_id_in(c, Path::new("/work/app"), None, &*ground)?;
                 let planned = plan_ids_in(c, &[PathBuf::from("/work/app")], &*ground)?.remove(0).project_id;
                 Ok::<_, rusqlite::Error>((read, planned))
             })
@@ -2125,7 +2131,7 @@ mod tests {
             .store
             .conn
             .call(move |c| {
-                let read = project_id_in(c, new, &*ground)?;
+                let read = project_id_in(c, new, None, &*ground)?;
                 let planned = plan_ids_in(c, &[new.to_path_buf(), copy.to_path_buf()], &*ground)?;
                 Ok::<_, rusqlite::Error>((read, planned.into_iter().map(|p| (p.root_id, p.project_id)).collect::<Vec<_>>()))
             })

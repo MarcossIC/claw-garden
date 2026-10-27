@@ -434,7 +434,7 @@ fn resolve_project(client: &DaemonClient, scope: &Scope) -> Result<Option<String
     }
     let cwd = std::env::current_dir().map_err(|e| ClientError::WorkingDir(e.to_string()))?;
     let identity = clawg_core::memory::ProjectIdentity::resolve(&cwd);
-    let recorded = project_id_of(client.base_dir(), &identity.root, &Disk).unwrap_or(identity.id);
+    let recorded = project_id_of(client.base_dir(), &identity.root, Some(&identity.path), &Disk).unwrap_or(identity.id);
     Ok(scope.project_id(Some(recorded)))
 }
 

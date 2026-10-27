@@ -900,7 +900,7 @@ pub async fn locate(lang: Lang, client: &DaemonClient, project: &str, path: &Pat
     if !identity.root.is_dir() {
         return Err(AddError::NotADirectory(identity.root));
     }
-    let located = client.locate_project(project, &identity.root).await?;
+    let located = client.locate_project(project, &identity.root, false).await?;
     Ok(render_located(lang, &identity.root, &located))
 }
 
@@ -939,7 +939,7 @@ pub async fn add(lang: Lang, client: &DaemonClient, path: &Path) -> Result<Strin
         return Err(AddError::NotADirectory(project.root));
     }
     let legacy = project.legacy_ids();
-    let id = client.register_project(&project.root, &legacy, true).await?.project_id;
+    let id = client.register_project(&project.root, None, &legacy, true).await?.project_id;
     let root = project.root.display();
     Ok(match lang {
         Lang::En => format!("added {root} as project {id}; the daemon is indexing its files in the background"),
@@ -958,13 +958,13 @@ pub async fn move_memories(lang: Lang, client: &DaemonClient, opts: &MoveOpts, c
                 return Err(AddError::NotADirectory(project.root));
             }
             let legacy = project.legacy_ids();
-            Some(client.register_project(&project.root, &legacy, false).await?.project_id)
+            Some(client.register_project(&project.root, Some(&project.path), &legacy, false).await?.project_id)
         }
         None => None,
     };
     let here = if opts.here {
         let project = ProjectIdentity::resolve(cwd);
-        Some(client.register_project(&project.root, &project.legacy_ids(), false).await?.project_id)
+        Some(client.register_project(&project.root, Some(&project.path), &project.legacy_ids(), false).await?.project_id)
     } else {
         None
     };
@@ -1370,7 +1370,7 @@ mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
         let repo = tempfile::tempdir().expect("tempdir");
-        let id = c.register_project(repo.path(), &[], false).await.expect("register").project_id;
+        let id = c.register_project(repo.path(), None, &[], false).await.expect("register").project_id;
 
         let renamed = rename(Lang::En, &c, &id, " App web ").await.expect("rename");
 
@@ -1391,8 +1391,8 @@ mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
         let (one, two) = (tempfile::tempdir().expect("tempdir"), tempfile::tempdir().expect("tempdir"));
-        let a = c.register_project(one.path(), &[], false).await.expect("register").project_id;
-        let b = c.register_project(two.path(), &[], false).await.expect("register").project_id;
+        let a = c.register_project(one.path(), None, &[], false).await.expect("register").project_id;
+        let b = c.register_project(two.path(), None, &[], false).await.expect("register").project_id;
 
         let kept = keep_apart(Lang::En, &c, &a, &b).await.expect("keep apart");
         assert_eq!(kept, format!("{a} and {b} stay apart; no suggestion that they are one project is made again"));
@@ -1439,7 +1439,7 @@ mod tests {
         let root = ProjectIdentity::resolve(repo.path()).root;
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("README.md"), "# Other\nHow the other project ships.\n").unwrap();
-        let id = c.register_project(&root, &[], false).await.expect("register as a label").project_id;
+        let id = c.register_project(&root, None, &[], false).await.expect("register as a label").project_id;
         let refused = c.search_docs(&id, "How the other project ships", None).await.expect_err("not accepted");
         assert!(matches!(refused, ClientError::Daemon { status: 403, .. }), "{refused:?}");
 
@@ -1451,6 +1451,56 @@ mod tests {
         );
         let found = c.search_docs(&id, "How the other project ships", None).await.expect("search");
         assert_eq!(found.hits.first().map(|h| h.path.as_str()), Some("README.md"), "{:?}", found.hits);
+    }
+
+    #[tokio::test]
+    async fn moving_to_a_declared_subfolder_moves_into_its_project() {
+        let d = start_daemon().await;
+        publish(&d);
+        let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mono = ProjectIdentity::resolve(repo.path()).root.join("mono");
+        for sub in [".git", "apps/web/src"] {
+            std::fs::create_dir_all(mono.join(sub)).unwrap();
+        }
+        let web = c.resolve_project("web", true, false, clawg_core::memory::registry::Born::User).await.unwrap().project_id.expect("an id");
+        c.locate_project("web", &mono.join("apps").join("web"), true).await.expect("declare");
+        c.save(crate::client::SaveArgs {
+            content: "a note filed nowhere".into(),
+            agent_id: "agent-a".into(),
+            project_id: None,
+            memory_type: Some("semantic_fact".into()),
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        })
+        .await
+        .expect("save");
+        let mut rows = Vec::new();
+        for _ in 0..40 {
+            rows = c.list(crate::client::ListArgs::default()).await.expect("list");
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let id = rows.first().expect("the save landed").id.to_string();
+        let opts = |args: &[&str]| -> MoveOpts {
+            let mut argv = vec!["clawg", "projects", "move"];
+            argv.extend_from_slice(args);
+            match <crate::cli::Cli as clap::Parser>::try_parse_from(&argv).expect("parse").command {
+                crate::cli::Command::Projects { action: crate::cli::ProjectsAction::Move(opts) } => opts,
+                other => panic!("{other:?}"),
+            }
+        };
+        let src = mono.join("apps").join("web").join("src");
+        let src_arg = src.to_string_lossy().into_owned();
+
+        let moved = move_memories(Lang::En, &c, &opts(&["--id", &id, "--to", &src_arg]), repo.path()).await.expect("move");
+        assert!(moved.starts_with(&format!("moved 1 memory to project {web}")), "{moved}");
+        let here = move_memories(Lang::En, &c, &opts(&["--here", "--to-none", "--dry-run"]), &src).await.expect("dry run");
+        assert!(here.starts_with("would move 1 memory"), "--here is the project of the working directory: {here}");
     }
 
     #[tokio::test]
@@ -1765,8 +1815,8 @@ mod tests {
         publish(&d);
         let c = DaemonClient::from_data_dir(d.dir.path()).expect("client");
         let (one, two) = (tempfile::tempdir().expect("tempdir"), tempfile::tempdir().expect("tempdir"));
-        let gone = c.register_project(one.path(), &[], false).await.expect("register").project_id;
-        let empty = c.register_project(two.path(), &[], false).await.expect("register").project_id;
+        let gone = c.register_project(one.path(), None, &[], false).await.expect("register").project_id;
+        let empty = c.register_project(two.path(), None, &[], false).await.expect("register").project_id;
         c.save(crate::client::SaveArgs {
             content: "a note of the project to delete".into(),
             agent_id: "agent-a".into(),
