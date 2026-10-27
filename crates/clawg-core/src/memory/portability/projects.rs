@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory::merge::MAX_MERGE_HOPS;
 use crate::memory::portability::format::{FolderLine, ProjectLine, SubfolderLine};
 use crate::memory::project::RootPlan;
+use crate::memory::registry::name_key;
 
 /// The lines of one id of a file: one project of the source store.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -151,6 +152,16 @@ pub(crate) struct Registry {
     pub remotes: Vec<(String, String)>,
     /// Repository, subpath and project of each declaration, as written.
     pub subfolders: Vec<(String, String, String)>,
+    /// The pairs that have a suggestion, answered or not, each in order.
+    pub suggested: HashSet<(String, String)>,
+}
+
+/// A pair of projects as `project_suggestion` keys it, in either order.
+pub(crate) fn pair(a: &str, b: &str) -> (String, String) {
+    match a <= b {
+        true => (a.to_owned(), b.to_owned()),
+        false => (b.to_owned(), a.to_owned()),
+    }
 }
 
 /// Reads the registry: four small tables.
@@ -174,7 +185,11 @@ pub(crate) fn registry_in(c: &Connection) -> rusqlite::Result<Registry> {
         .collect::<rusqlite::Result<_>>()?;
     let mut stmt = c.prepare("SELECT parent_id, subpath, project_id FROM project_subfolder ORDER BY created_at, parent_id, subpath")?;
     let subfolders = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-    Ok(Registry { projects, folders, remotes, subfolders })
+    let mut stmt = c.prepare("SELECT project_id, other_id FROM project_suggestion")?;
+    let suggested = stmt
+        .query_map([], |r| Ok(pair(&r.get::<_, String>(0)?, &r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Registry { projects, folders, remotes, subfolders, suggested })
 }
 
 impl Registry {
@@ -336,6 +351,37 @@ pub(crate) fn place(project: &FileProject, folders: &[FolderHere<'_>], registry:
     }
 }
 
+/// The live projects here other than `to` whose name has the key of the
+/// name of `project`, which went to `to`, and that it does not contradict:
+/// a name alike is weak evidence, which a person settles.
+pub(crate) fn similar(project: &FileProject, to: &str, prints: &Prints, registry: &Registry) -> Vec<String> {
+    let Some(key) = project.name.as_deref().map(name_key).filter(|k| !k.is_empty()) else {
+        return Vec::new();
+    };
+    let mut similar: Vec<String> = registry
+        .live()
+        .filter(|(id, name)| *id != to && name_key(name) == key && !prints.contradicts(&registry.prints(id)))
+        .map(|(id, _)| id.to_owned())
+        .collect();
+    similar.sort();
+    similar
+}
+
+/// The live projects here the remotes of `project` lead to, in the order of
+/// its remotes: two or more are what the source holds as one.
+pub(crate) fn bound_apart(project: &FileProject, registry: &Registry) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for remote in project.all_remotes() {
+        let Some((_, owner)) = registry.remotes.iter().find(|(r, _)| r == remote) else { continue };
+        let live = registry.canonical(owner);
+        let alive = registry.projects.get(&live).is_some_and(|p| !p.deleted);
+        if alive && !found.contains(&live) {
+            found.push(live);
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +401,7 @@ mod tests {
             remote: remote.map(Into::into),
             root_commit: commit.map(Into::into),
             git_stamp: None,
+            suggestions: Vec::new(),
         }
     }
 
@@ -416,7 +463,7 @@ mod tests {
                 folder("api", "/work/api", Some("github.com/acme/api-b"), None),
             ],
             remotes: vec![("github.com/acme/app".into(), "app".into()), ("github.com/acme/api-b".into(), "api".into())],
-            subfolders: Vec::new(),
+            ..Default::default()
         }
     }
 

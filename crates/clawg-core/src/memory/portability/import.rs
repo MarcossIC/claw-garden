@@ -143,6 +143,18 @@ pub struct ImportReport {
     /// Each project of the file and where it went here.
     #[serde(default)]
     pub projects: Vec<ImportedProject>,
+    /// The suggestions it left, or would leave on a dry run.
+    #[serde(default)]
+    pub suggestions: Vec<ImportedSuggestion>,
+}
+
+/// A suggestion that two projects here may be one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedSuggestion {
+    pub project_id: String,
+    pub other_id: String,
+    /// `root_commit`, `remote_changed`, `folder_name`, `similar_name` or `merged_at_source`.
+    pub reason: String,
 }
 
 /// A project of the file and the project it went to here.
@@ -224,6 +236,8 @@ struct Prepared {
     binds: Vec<(String, String)>,
     /// Where each project of the file went.
     placed: Vec<ImportedProject>,
+    /// The suggestions to leave, none of which has a pair here yet.
+    suggestions: Vec<ImportedSuggestion>,
     parsed: Parsed,
     /// For another tool's export, the notes its rows came from, in the order
     /// of their rows; empty for a clawg file.
@@ -335,7 +349,7 @@ async fn plan(
     let plans = loop {
         let planned = roots.to_vec();
         let (plans, asked) = timed(store, &mut timing, move |c| {
-            let plans = plan_ids_in(c, &planned, &ahead)?;
+            let plans = plan_ids_in(c, &planned, &ahead, true)?;
             // Whether each root exists here, which tells a folder of this
             // machine from one of the source's.
             let present = planned.iter().map(|root| ahead.recorded_checkout_present(root, None)).collect();
@@ -380,6 +394,7 @@ struct Settled {
     creates: Vec<(String, String)>,
     binds: Vec<(String, String)>,
     placed: Vec<ImportedProject>,
+    suggestions: Vec<ImportedSuggestion>,
 }
 
 /// How many ids a new project of the file tries before it takes its first.
@@ -473,6 +488,47 @@ fn settle_projects(
             settled.binds.push((remote.to_owned(), to.clone()));
         }
     }
+    let mut suggest = |a: &str, b: &str, reason: &str| {
+        let key = projects::pair(a, b);
+        if a != b && !registry.suggested.contains(&key) && !settled.suggestions.iter().any(|s| projects::pair(&s.project_id, &s.other_id) == key) {
+            settled.suggestions.push(ImportedSuggestion { project_id: a.to_owned(), other_id: b.to_owned(), reason: reason.to_owned() });
+        }
+    };
+    let mut at = 0;
+    for (project, placed) in projects.iter().zip(&settled.placed.clone()) {
+        let span = at..at + project.folders.len();
+        at = span.end;
+        let Some(to) = placed.to.as_deref() else { continue };
+        let folders: Vec<FolderHere<'_>> = project
+            .folders
+            .iter()
+            .zip(span.clone())
+            .map(|(line, k)| FolderHere { line, mapped: roots[k].1, plan: &planning.plans[k], present: planning.present[k] })
+            .collect();
+        // What a registration of each folder that exists here would leave.
+        for folder in folders.iter().filter(|f| f.present) {
+            if settled.projects.iter().any(|p| p.root_id == folder.plan.root_id) {
+                for (other, reason) in &folder.plan.suggestions {
+                    suggest(to, other, reason);
+                }
+            }
+        }
+        if project.merged_into.is_none() {
+            let prints = projects::seen_prints(project, &folders);
+            for other in projects::similar(project, to, &prints, registry) {
+                suggest(to, &other, "similar_name");
+            }
+            let apart = projects::bound_apart(project, registry);
+            for other in apart.iter().skip(1) {
+                suggest(&apart[0], other, "merged_at_source");
+            }
+        } else if let Some(into) = project.merged_into.as_deref().and_then(|m| settled.project_ids.get(m)) {
+            let alive = |id: &str| registry.projects.get(id).is_none_or(|p| !p.deleted && p.merged_into.is_none());
+            if alive(into) && alive(to) {
+                suggest(into, to, "merged_at_source");
+            }
+        }
+    }
     // A row whose project has no line keeps its id, and the import makes it
     // the project a save under it would.
     for id in row_projects {
@@ -507,7 +563,7 @@ fn mapped_projects(parsed: &Parsed, roots: &[PathBuf], plans: &[RootPlan]) -> Se
 
 /// The rows of `parsed` worked out, with the projects `settled` gave them.
 fn prepare(mut parsed: Parsed, settled: Settled, options: &ImportOptions, texts: Texts) -> Prepared {
-    let Settled { project_ids, projects, creates, binds, placed } = settled;
+    let Settled { project_ids, projects, creates, binds, placed, suggestions } = settled;
     if let Texts::Raw = texts {
         // The head of a save is stored with its pieces, so it is masked as
         // the text is.
@@ -554,7 +610,7 @@ fn prepare(mut parsed: Parsed, settled: Settled, options: &ImportOptions, texts:
             }
         })
         .collect();
-    Prepared { rows, projects, creates, binds, placed, parsed, notes }
+    Prepared { rows, projects, creates, binds, placed, suggestions, parsed, notes }
 }
 
 /// Where a row of the file ended up.
@@ -1440,6 +1496,18 @@ fn record_projects(tx: &Transaction<'_>, prepared: &Prepared, now: i64, journal:
             journal.registry(tx, "project", id, None, Some(name))?;
         }
     }
+    for s in &prepared.suggestions {
+        if taken.contains_key(&s.project_id) || taken.contains_key(&s.other_id) {
+            continue;
+        }
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO project_suggestion (project_id, other_id, reason, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![s.project_id, s.other_id, s.reason, now],
+        )?;
+        if added == 1 {
+            journal.registry(tx, "suggestion", &s.project_id, Some(&s.other_id), Some(&s.reason))?;
+        }
+    }
     for (remote, project) in &prepared.binds {
         if taken.contains_key(project) {
             continue;
@@ -1985,6 +2053,7 @@ fn report(prepared: &Prepared, written: &Written, dry_run: bool) -> ImportReport
         snapshot: written.snapshot.clone(),
         import_id: written.import_id,
         projects: prepared.placed.clone(),
+        suggestions: prepared.suggestions.clone(),
         ..Default::default()
     };
     report.invalid.extend(ledger.invalid.iter().cloned());
@@ -2747,7 +2816,9 @@ pub(crate) mod tests {
                 let remotes = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<(String, String)>>>()?;
                 let mut stmt = c.prepare("SELECT id, born FROM project")?;
                 let projects = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<(String, String)>>>()?;
-                let suggested: i64 = c.query_row("SELECT COUNT(*) FROM project_suggestion", [], |r| r.get(0))?;
+                let mut stmt = c.prepare("SELECT project_id, other_id, reason FROM project_suggestion")?;
+                let suggested =
+                    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<Vec<(String, String, String)>>>()?;
                 Ok::<_, rusqlite::Error>((folders, remotes, projects, suggested))
             })
             .await
@@ -2767,10 +2838,10 @@ pub(crate) mod tests {
             vec![("github.com/acme/old-other".into(), other.clone()), ("github.com/acme/other".into(), renamed.clone())]
         );
         projects.sort();
-        let mut expected = vec![(old, "root".to_string()), (other, "root".into()), (renamed, "import".into())];
+        let mut expected = vec![(old, "root".to_string()), (other.clone(), "root".into()), (renamed.clone(), "import".into())];
         expected.sort();
         assert_eq!(projects, expected, "the project the import made is born of it");
-        assert_eq!(suggested, 0, "an import suggests nothing");
+        assert_eq!(suggested, vec![(renamed.clone(), other.clone(), "remote_changed".to_owned())], "the remote changed in place");
     }
 
     /// A disk that notes the thread each first commit is read on.
@@ -3084,6 +3155,129 @@ pub(crate) mod tests {
 
         assert_eq!(outcome.project_id, "notas-1a2b", "a move of the checkout the import recorded");
         assert_eq!(count(&dst, "SELECT COUNT(*) FROM project_suggestion").await, 0);
+    }
+
+    async fn suggestions_of(store: &MemoryStore) -> Vec<(String, String, String)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT project_id, other_id, reason FROM project_suggestion ORDER BY rowid")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn journaled_suggestions(store: &MemoryStore) -> Vec<(String, String, String)> {
+        store
+            .conn
+            .call(|c| {
+                let mut stmt = c.prepare("SELECT a, b, value FROM memory_import_registry WHERE kind = 'suggestion' ORDER BY rowid")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap()
+    }
+
+    fn suggested(report: &ImportReport) -> Vec<(String, String, String)> {
+        report.suggestions.iter().map(|s| (s.project_id.clone(), s.other_id.clone(), s.reason.clone())).collect()
+    }
+
+    #[tokio::test]
+    async fn an_import_leaves_the_suggestions_a_registration_would() {
+        let dst = destination().await;
+        exec(
+            &dst,
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('first-1111', 'first', 'root', 1, 1);
+             INSERT INTO project_path (id, root_path, created_at, project_id, root_commit, git_stamp) \
+               VALUES ('first-1111', '/work/first', 1, 'first-1111', 'c1', 's1');",
+        )
+        .await;
+        // A second checkout of the same history, the first still in its place.
+        let ground = Arc::new(FakeGround::default());
+        ground.put(Path::new("/work/first"), None, Some("s1"), RootCommit::Known("c1".into()));
+        ground.put(Path::new("/work/second"), None, Some("s2"), RootCommit::Known("c1".into()));
+        let line = r#"{"kind":"project","id":"second-2222","root_path":"/work/second","name":"second"}"#;
+        let file = clawg_file(&[line], &[(1, Some("second-2222"), "A note of the second checkout")]);
+
+        let (report, _) = run_on(&dst, &file, ImportOptions::default(), ground).await;
+
+        let to = went(&report, "second-2222").to.clone().unwrap();
+        let expected = vec![(to, "first-1111".to_owned(), "root_commit".to_owned())];
+        assert_eq!(suggested(&report), expected);
+        assert_eq!(suggestions_of(&dst).await, expected);
+        assert_eq!(journaled_suggestions(&dst).await, expected);
+    }
+
+    #[tokio::test]
+    async fn a_project_named_like_one_here_is_suggested() {
+        let dst = destination().await;
+        exec(&dst, "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('mi-app-1111', 'mi-app', 'agent', 1, 1);").await;
+        let file = clawg_file(&[r#"{"kind":"project","id":"mi-app-9999","name":"Mi App"}"#], &[(1, Some("mi-app-9999"), "A note")]);
+
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+
+        let made = went(&report, "mi-app-9999");
+        assert_eq!((made.by, made.created), (Some(By::New), true));
+        assert_eq!(project_names(&dst).await["mi-app-9999"], ("Mi App".to_owned(), "import".to_owned()));
+        let expected = vec![("mi-app-9999".to_owned(), "mi-app-1111".to_owned(), "similar_name".to_owned())];
+        assert_eq!(suggestions_of(&dst).await, expected);
+
+        let again = destination().await;
+        exec(&again, "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('mi-app-1111', 'mi-app', 'agent', 1, 1);").await;
+        exec(&again, "INSERT INTO project_suggestion (project_id, other_id, reason, created_at, answer, answered_at) VALUES ('mi-app-1111', 'mi-app-9999', 'user', 1, 'apart', 1);").await;
+        let (report, _) = run(&again, &file, ImportOptions::default()).await;
+        assert!(report.suggestions.is_empty(), "never again for a pair that has one");
+        assert_eq!(journaled_suggestions(&again).await, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn a_merge_at_the_source_is_suggested_here() {
+        let dst = destination().await;
+        exec(
+            &dst,
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('x-1111', 'x', 'root', 1, 1), ('z-2222', 'z', 'root', 1, 2);
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/x', 'x-1111', 1), ('github.com/acme/z', 'z-2222', 2);",
+        )
+        .await;
+        insert_row(&dst, "claude-code", Some("x-1111".into()), "A note of x here", None, 10).await;
+        insert_row(&dst, "claude-code", Some("z-2222".into()), "A note of z here", None, 11).await;
+        let tombstone = r#"{"kind":"project","id":"x-1111","name":"x","merged_into":"z-2222"}"#;
+        let target = r#"{"kind":"project","id":"z-2222","name":"z","remotes":["github.com/acme/z"]}"#;
+        let file = clawg_file(&[tombstone, target], &[(1, Some("z-2222"), "A note of z there")]);
+        let before = project_names(&dst).await;
+
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+
+        assert_eq!(suggestions_of(&dst).await, vec![("z-2222".to_owned(), "x-1111".to_owned(), "merged_at_source".to_owned())]);
+        assert_eq!(project_names(&dst).await, before, "neither changes");
+        assert_eq!(went(&report, "x-1111").to.as_deref(), Some("x-1111"));
+
+        let fused = destination().await;
+        exec(
+            &fused,
+            "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('x-1111', 'x', 'root', 1, 1), ('z-2222', 'z', 'root', 1, 2);
+             INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/x', 'x-1111', 1), ('github.com/acme/z', 'z-2222', 2);",
+        )
+        .await;
+        let one = r#"{"kind":"project","id":"z-9999","name":"z","remotes":["github.com/acme/z","github.com/acme/x"]}"#;
+        run(&fused, &clawg_file(&[one], &[(1, Some("z-9999"), "A note of both")]), ImportOptions::default()).await;
+        assert_eq!(suggestions_of(&fused).await, vec![("z-2222".to_owned(), "x-1111".to_owned(), "merged_at_source".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_reports_the_suggestions_and_writes_none() {
+        let dst = destination().await;
+        exec(&dst, "INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('mi-app-1111', 'mi-app', 'agent', 1, 1);").await;
+        let file = clawg_file(&[r#"{"kind":"project","id":"mi-app-9999","name":"Mi App"}"#], &[(1, Some("mi-app-9999"), "A note")]);
+
+        let (report, _) = run(&dst, &file, ImportOptions { dry_run: true, ..Default::default() }).await;
+
+        assert_eq!(suggested(&report), vec![("mi-app-9999".to_owned(), "mi-app-1111".to_owned(), "similar_name".to_owned())]);
+        assert!(suggestions_of(&dst).await.is_empty());
+        assert_eq!(project_names(&dst).await.len(), 1, "nothing is created");
     }
 
     #[tokio::test]
