@@ -83,6 +83,32 @@ pub(crate) fn declared_in(c: &Connection, parent: &str, subpath: &str) -> rusqli
     Ok(Some(project).filter(|p| p != parent))
 }
 
+/// A subfolder declared as a project, by the repository it is in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SubfolderOf {
+    /// The live project of the repository.
+    pub repository_id: String,
+    pub subpath: String,
+}
+
+/// The subfolders whose declaration leads to `project`, through merges on
+/// both sides, by repository and subpath.
+pub(crate) fn leading_to_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<SubfolderOf>> {
+    let mut stmt = c.prepare(
+        "SELECT parent_id, subpath FROM project_subfolder \
+         WHERE project_id = ?1 OR project_id IN (SELECT id FROM project WHERE merged_into = ?1)",
+    )?;
+    let rows = stmt.query_map([project], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (parent, subpath) = row?;
+        out.push(SubfolderOf { repository_id: canonical_in(c, &parent)?, subpath });
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// What [`declare_subfolder`] did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Declared {

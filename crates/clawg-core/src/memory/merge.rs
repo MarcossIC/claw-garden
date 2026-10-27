@@ -1128,6 +1128,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merging_and_undoing_leave_the_declarations_as_they_were() {
+        let f = Fixture::new(&[A, B, C]).await;
+        f.two_projects().await;
+        f.sql(&format!(
+            "INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES \
+               ('{A}', 'apps/web', '{B}', 1), ('{B}', 'libs/ui', '{A}', 2), ('{C}', 'docs', '{B}', 3);"
+        ))
+        .await;
+        let declared = || f.rows("SELECT parent_id || ' ' || subpath || ' ' || project_id FROM project_subfolder ORDER BY 1", |r| r.get::<_, String>(0));
+        let before = declared().await;
+
+        let merged = f.merge(A, B, false).await.unwrap();
+        assert_eq!(declared().await, before, "a merge rewrites no declaration");
+        f.undo(merged.merge_id.unwrap(), false).await.unwrap();
+        assert_eq!(declared().await, before, "nor does its undo");
+    }
+
+    #[tokio::test]
     async fn undoing_a_merge_keeps_what_was_saved_after_it() {
         let f = Fixture::new(&[A, B, C]).await;
         let gone = f.save("tests run with cargo nextest", A, None, 1).await;

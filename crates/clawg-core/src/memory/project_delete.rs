@@ -26,6 +26,7 @@ use crate::memory::merge::{canonical_in, retrying, Retried};
 use crate::memory::maintenance::skill_embedding_text;
 use crate::memory::project_docs::drop_root_index_in;
 use crate::memory::redact::redact;
+use crate::memory::subfolder::{leading_to_in, SubfolderOf};
 use crate::memory::vector::to_unit;
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
@@ -214,6 +215,9 @@ pub struct DeleteReport {
     pub folders: Vec<String>,
     /// Its remotes, which stay linked.
     pub remotes: Vec<String>,
+    /// The subfolders declared as it, which stay declared: a save from one
+    /// brings it back.
+    pub subfolders: Vec<SubfolderOf>,
     /// How many saves of the project, or of a project merged into it, wait.
     pub pending: usize,
     pub failed: Vec<FailedSave>,
@@ -259,6 +263,7 @@ struct Set {
     name: String,
     folders: Vec<Folder>,
     remotes: Vec<String>,
+    subfolders: Vec<SubfolderOf>,
     memories: Vec<SetRow>,
     trajectories: Vec<SetRow>,
     skills: Vec<SetRow>,
@@ -296,6 +301,9 @@ fn code_of(set: &Set) -> String {
     let mut remotes: Vec<&str> = set.remotes.iter().map(String::as_str).collect();
     remotes.sort_unstable();
     lines.extend(remotes.into_iter().map(|remote| format!("remote {remote}")));
+    let mut subfolders: Vec<&SubfolderOf> = set.subfolders.iter().collect();
+    subfolders.sort_unstable();
+    lines.extend(subfolders.into_iter().map(|s| format!("subfolder {} {}", s.repository_id, s.subpath)));
     for (table, rows) in [("memory", &set.memories), ("episodic_trajectory", &set.trajectories), ("procedural_skill", &set.skills)] {
         let mut rows: Vec<&SetRow> = rows.iter().collect();
         rows.sort_unstable_by_key(|r| r.id);
@@ -343,6 +351,7 @@ fn set_in(c: &Connection, project_id: &str, name: &str) -> rusqlite::Result<Set>
         name: name.to_string(),
         folders,
         remotes,
+        subfolders: leading_to_in(c, project_id)?,
         memories: rows_in(c, "memory", project_id)?,
         trajectories: rows_in(c, "episodic_trajectory", project_id)?,
         skills: rows_in(c, "procedural_skill", project_id)?,
@@ -467,6 +476,7 @@ fn report_of(c: &Connection, set: &Set, with_memories: bool) -> Result<DeleteRep
         conclusions: conclusions_in(c, &set.project_id)?,
         folders: set.folders.iter().filter(|f| f.index_docs).map(|f| f.root_id.clone()).collect(),
         remotes: set.remotes.clone(),
+        subfolders: set.subfolders.clone(),
         pending,
         failed,
         candidates: candidates_in(c, &set.project_id)?,
@@ -1517,6 +1527,10 @@ mod tests {
             name: "app".into(),
             folders: vec![Folder { root_id: "a".into(), index_docs: true }, Folder { root_id: "b".into(), index_docs: false }],
             remotes: vec!["github.com/x/y".into(), "github.com/x/z".into()],
+            subfolders: vec![
+                SubfolderOf { repository_id: "mono".into(), subpath: "apps/web".into() },
+                SubfolderOf { repository_id: "mono".into(), subpath: "libs/ui".into() },
+            ],
             memories: vec![row(1, "active", None), row(2, "superseded", Some(5)), row(3, "active", None)],
             trajectories: vec![row(1, "active", None), row(4, "active", None)],
             skills: vec![row(9, "active", None)],
@@ -1524,6 +1538,7 @@ mod tests {
         let shuffled = Set {
             folders: set.folders.iter().rev().cloned().collect(),
             remotes: set.remotes.iter().rev().cloned().collect(),
+            subfolders: set.subfolders.iter().rev().cloned().collect(),
             memories: vec![set.memories[2].clone(), set.memories[0].clone(), set.memories[1].clone()],
             trajectories: set.trajectories.iter().rev().cloned().collect(),
             ..set.clone()
@@ -1536,6 +1551,60 @@ mod tests {
         assert_ne!(code_of(&set), code_of(&moved));
         let other = Set { project_id: B.to_string(), ..set.clone() };
         assert_ne!(code_of(&set), code_of(&other));
+    }
+
+    /// A store from before declarations confirms a delete with the code its
+    /// report gave then.
+    #[test]
+    fn the_code_of_a_project_without_subfolders_does_not_change() {
+        let set = Set {
+            project_id: A.to_string(),
+            name: "app".into(),
+            folders: vec![Folder { root_id: A.into(), index_docs: true }],
+            remotes: vec!["github.com/acme/app".into()],
+            subfolders: Vec::new(),
+            memories: vec![SetRow {
+                id: 1,
+                status: "active".into(),
+                deleted_at: None,
+                update_count: 0,
+                agent_id: Some("agent-a".into()),
+                memory_type: Some("semantic_fact".into()),
+            }],
+            trajectories: Vec::new(),
+            skills: Vec::new(),
+        };
+        assert_eq!(code_of(&set), "9461170e", "the code a report gave before declarations");
+        let declared = Set { subfolders: vec![SubfolderOf { repository_id: B.into(), subpath: "apps/web".into() }], ..set.clone() };
+        assert_ne!(code_of(&declared), code_of(&set));
+    }
+
+    #[tokio::test]
+    async fn a_delete_report_names_its_subfolders_and_a_declaration_changes_the_code() {
+        let f = Fixture::new(&[A, B]).await;
+        f.live(1, B).await;
+        f.sql(&format!(
+            "INSERT INTO project (id, name, born, reviewed, created_at, merged_into, merged_at) VALUES ('old-eeee', 'old', 'root', 0, 1, '{A}', 2);
+             INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES ('old-eeee', 'apps/web', '{B}', 1);"
+        ))
+        .await;
+
+        let report = f.delete(B, true).await.unwrap();
+        assert_eq!(report.subfolders, vec![SubfolderOf { repository_id: A.into(), subpath: "apps/web".into() }], "read through the tombstone");
+        let code = report.code.unwrap();
+        f.sql(&format!("INSERT INTO project_subfolder (parent_id, subpath, project_id, created_at) VALUES ('{A}', 'libs/ui', '{B}', 3);"))
+            .await;
+
+        let changed = f.confirm(B, &code).await.unwrap();
+        assert_eq!(changed.refused, Some(Refusal::CodeChanged), "a declaration made between the two steps");
+        assert_eq!(f.count(&format!("SELECT COUNT(*) FROM memory WHERE project_id = '{B}' AND deleted_at IS NULL")).await, 1);
+
+        let deleted = f.confirm(B, &changed.code.unwrap()).await.unwrap();
+        assert_eq!((deleted.refused, deleted.delete_id.is_some()), (None, true));
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_subfolder").await, 2, "a delete leaves the declarations");
+        let saved = f.save("saved from apps/web after the delete", B, 30).await;
+        assert!(saved > 0);
+        assert_eq!(f.count(&format!("SELECT COUNT(*) FROM project WHERE id = '{B}' AND deleted_at IS NULL")).await, 1, "a save brings it back");
     }
 
     // ── deleting with the rows ──────────────────────────────────────────
