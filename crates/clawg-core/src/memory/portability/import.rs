@@ -119,6 +119,10 @@ pub struct ImportReport {
     pub by_project: BTreeMap<String, usize>,
     /// Rows already here, which were neither inserted nor reinforced.
     pub present: usize,
+    /// Rows of a clawg export already here in another project, as a move
+    /// leaves them, by that project (`""` for none).
+    #[serde(default)]
+    pub present_elsewhere: BTreeMap<String, usize>,
     pub merged: Vec<Merged>,
     pub topic_taken: Vec<TopicTaken>,
     /// Inserted rows whose text held a secret, stored masked.
@@ -694,6 +698,8 @@ enum Placement {
     Inserted(i64),
     /// The same row was already here.
     Present(i64),
+    /// The same row was already here, in another project.
+    Elsewhere(i64),
     /// A live row of the same text was already here.
     Merged(i64),
     /// Inserted superseded by the live row holding its topic key.
@@ -706,7 +712,7 @@ enum Placement {
 impl Placement {
     fn id(self) -> i64 {
         match self {
-            Placement::Inserted(id) | Placement::Present(id) | Placement::Merged(id) => id,
+            Placement::Inserted(id) | Placement::Present(id) | Placement::Elsewhere(id) | Placement::Merged(id) => id,
             Placement::TopicTaken { id, .. } | Placement::Older { id, .. } => id,
         }
     }
@@ -738,6 +744,8 @@ struct Ledger {
     /// Rows of notes that are here whose text is not stored any more: there
     /// is nothing to place, and no link to write or drop.
     absent: HashSet<i64>,
+    /// The project of each row found in another project, by its id here.
+    elsewhere: BTreeMap<i64, Option<String>>,
 }
 
 /// A row here imported from the origin of a note.
@@ -907,6 +915,8 @@ trait Seat {
     fn origin_rows(&mut self, origin: &str) -> Result<Vec<OriginRow>, Self::Error>;
     /// [`PRESENT_SQL`].
     fn present(&mut self, agent: Option<&str>, project: Option<&str>, hash: &str, created_at: i64) -> Result<Option<i64>, Self::Error>;
+    /// [`PRESENT_ELSEWHERE_SQL`]: the row and its project.
+    fn present_elsewhere(&mut self, agent: Option<&str>, hash: &str, created_at: i64, by_ref: &str) -> Result<Option<(i64, Option<String>)>, Self::Error>;
     /// [`TWIN_SQL`].
     fn twin(&mut self, project: Option<&str>, hash: &str) -> Result<Option<i64>, Self::Error>;
     /// [`TOPIC_HOLDERS_SQL`].
@@ -951,6 +961,11 @@ impl Seat for SqlSeat<'_, '_> {
     fn present(&mut self, agent: Option<&str>, project: Option<&str>, hash: &str, created_at: i64) -> rusqlite::Result<Option<i64>> {
         let project = self.live(project)?;
         self.0.prepare_cached(PRESENT_SQL)?.query_row(rusqlite::params![agent, project, hash, created_at], |r| r.get(0)).optional()
+    }
+
+    fn present_elsewhere(&mut self, agent: Option<&str>, hash: &str, created_at: i64, by_ref: &str) -> rusqlite::Result<Option<(i64, Option<String>)>> {
+        let mut stmt = self.0.prepare_cached(PRESENT_ELSEWHERE_SQL)?;
+        stmt.query_row(rusqlite::params![created_at, agent, hash, by_ref], |r| Ok((r.get(0)?, r.get(1)?))).optional()
     }
 
     fn twin(&mut self, project: Option<&str>, hash: &str) -> rusqlite::Result<Option<i64>> {
@@ -1146,7 +1161,7 @@ macro_rules! known_rows {
     ($filter:literal) => {
         concat!(
             "SELECT id, agent_id, project_id, content_hash, created_at, topic_key, deleted_at IS NOT NULL, status, \
-             CASE WHEN source = 'import' THEN created_by_ref END FROM memory WHERE ",
+             CASE WHEN source = 'import' THEN created_by_ref END, created_by_ref FROM memory WHERE ",
             $filter
         )
     };
@@ -1158,6 +1173,8 @@ const ORIGIN_ROWS_SQL: &str = known_rows!("source = 'import' AND created_by_ref 
 const TEXT_ROWS_SQL: &str = known_rows!("COALESCE(project_id, '') = ?1 AND content_hash = ?2");
 /// The rows of a key in a project that [`TOPIC_HOLDERS_SQL`] can name.
 const KEY_ROWS_SQL: &str = known_rows!("COALESCE(project_id, '') = ?1 AND topic_key = ?2 AND deleted_at IS NULL");
+/// The rows of a date, in any project, as [`PRESENT_ELSEWHERE_SQL`] reads them.
+const DATE_ROWS_SQL: &str = known_rows!("created_at = ?1");
 /// The id `AUTOINCREMENT` gives the next row: above every id `memory` ever
 /// had, not only the ones it has.
 const NEXT_ID_SQL: &str = "SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'memory'), 0), \
@@ -1176,6 +1193,7 @@ struct Known {
     status: String,
     /// `created_by_ref` of an imported row.
     origin: Option<String>,
+    by_ref: String,
 }
 
 impl Known {
@@ -1190,6 +1208,7 @@ impl Known {
             deleted: r.get(6)?,
             status: r.get(7)?,
             origin: r.get(8)?,
+            by_ref: r.get(9)?,
         })
     }
 
@@ -1224,6 +1243,7 @@ struct Planned {
     by_text: HashMap<(String, String), Vec<i64>>,
     by_key: HashMap<(String, String), Vec<i64>>,
     by_origin: HashMap<String, Vec<i64>>,
+    by_date: HashMap<i64, Vec<i64>>,
     /// Rows that are a piece of a save.
     linked: HashSet<i64>,
     /// The root of each project id here.
@@ -1243,6 +1263,7 @@ impl Planned {
         if let Some(origin) = &row.origin {
             self.by_origin.entry(origin.clone()).or_default().push(row.id);
         }
+        self.by_date.entry(row.created_at).or_default().push(row.id);
         self.rows.insert(row.id, row);
     }
 
@@ -1261,6 +1282,12 @@ impl Seat for Planned {
     fn present(&mut self, agent: Option<&str>, project: Option<&str>, hash: &str, created_at: i64) -> Result<Option<i64>, Infallible> {
         let rows = self.among(self.by_text.get(&(scope(project), hash.to_owned())));
         Ok(rows.filter(|k| k.agent.as_deref() == agent && k.created_at == created_at).map(|k| k.id).next())
+    }
+
+    fn present_elsewhere(&mut self, agent: Option<&str>, hash: &str, created_at: i64, by_ref: &str) -> Result<Option<(i64, Option<String>)>, Infallible> {
+        let mut rows = self.among(self.by_date.get(&created_at));
+        let found = rows.find(|k| k.agent.as_deref() == agent && k.hash.as_deref() == Some(hash) && k.by_ref == by_ref);
+        Ok(found.map(|k| (k.id, k.project.clone())))
     }
 
     fn twin(&mut self, project: Option<&str>, hash: &str) -> Result<Option<i64>, Infallible> {
@@ -1286,6 +1313,7 @@ impl Seat for Planned {
             deleted: src.deleted_at.is_some(),
             status: new.status.to_owned(),
             origin: (src.source == "import").then(|| src.created_by_ref.clone()),
+            by_ref: src.created_by_ref.clone(),
         });
         Ok(id)
     }
@@ -1310,10 +1338,10 @@ impl Seat for Planned {
 }
 
 /// Runs `sql` once per set of `binds`, [`LOAD_BATCH`] to a call.
-async fn known(
+async fn known<B: rusqlite::ToSql + Clone + Send + 'static>(
     store: &MemoryStore,
     sql: &'static str,
-    binds: Vec<Vec<String>>,
+    binds: Vec<Vec<B>>,
     timing: &mut Timing,
 ) -> Result<Vec<Known>, MemoryError> {
     let mut rows = Vec::new();
@@ -1374,6 +1402,8 @@ async fn load(store: &MemoryStore, prepared: &Prepared, timing: &mut Timing) -> 
     }
     rows.extend(known(store, TEXT_ROWS_SQL, texts.into_iter().collect(), timing).await?);
     rows.extend(known(store, KEY_ROWS_SQL, keys.into_iter().collect(), timing).await?);
+    let dates: BTreeSet<i64> = prepared.rows.iter().filter(|r| r.note.is_none()).map(|r| r.src.created_at).collect();
+    rows.extend(known(store, DATE_ROWS_SQL, dates.into_iter().map(|d| vec![d]).collect(), timing).await?);
     rows.sort_by_key(|r| r.id);
     rows.dedup_by_key(|r| r.id);
     timing.rows = Some(rows.len());
@@ -1511,6 +1541,13 @@ fn target<'a>(row: &'a Row, found: Option<&'a Found>) -> (Option<&'a str>, Optio
 const PRESENT_SQL: &str = "SELECT id FROM memory \
      WHERE agent_id IS ?1 AND COALESCE(project_id, '') = COALESCE(?2, '') \
        AND content_hash = ?3 AND created_at = ?4 \
+     ORDER BY id LIMIT 1";
+
+/// The same row in any project, deleted or not, as a move leaves it. Its
+/// `created_by_ref` keeps apart two notes of another tool with one text and
+/// date in two projects of the source.
+const PRESENT_ELSEWHERE_SQL: &str = "SELECT id, project_id FROM memory \
+     WHERE created_at = ?1 AND agent_id IS ?2 AND content_hash = ?3 AND created_by_ref = ?4 \
      ORDER BY id LIMIT 1";
 
 /// The live row of the same text in the project, whoever saved it, as the
@@ -1667,6 +1704,12 @@ fn place<S: Seat>(
     };
     if let Some(id) = seat.present(row.agent.as_deref(), project, &row.hash, row.src.created_at)? {
         return Ok(Some(Placement::Present(id)));
+    }
+    if row.note.is_none() {
+        if let Some((id, at)) = seat.present_elsewhere(row.agent.as_deref(), &row.hash, row.src.created_at, &row.src.created_by_ref)? {
+            ledger.elsewhere.insert(id, at);
+            return Ok(Some(Placement::Elsewhere(id)));
+        }
     }
     let mut topic_holder = None;
     if under.is_none() && row.live() {
@@ -2200,6 +2243,10 @@ fn report(prepared: &Prepared, written: &Written, dry_run: bool) -> ImportReport
         }
         match ledger.placed.get(&row.src.id) {
             Some(Placement::Present(_)) => report.present += 1,
+            Some(Placement::Elsewhere(id)) => {
+                let at = ledger.elsewhere.get(id).cloned().flatten().unwrap_or_default();
+                *report.present_elsewhere.entry(at).or_default() += 1;
+            }
             Some(Placement::Merged(into)) => report.merged.push(Merged { line: row.line, id: row.src.id, into: *into }),
             Some(placement @ (Placement::Inserted(_) | Placement::TopicTaken { .. } | Placement::Older { .. })) => {
                 let (project, key) = target(row, prepared.found(row, ledger));
@@ -3370,6 +3417,45 @@ pub(crate) mod tests {
         assert_eq!(count(&dst, "SELECT COUNT(*) FROM memory_import_registry WHERE kind = 'subfolder'").await, 0);
     }
 
+    #[tokio::test]
+    async fn an_export_imported_again_after_a_move_adds_nothing() {
+        let dst = destination().await;
+        let line = r#"{"kind":"project","id":"notes-1a2b","name":"notes"}"#;
+        let file = clawg_file(&[line], &[(1, Some("notes-1a2b"), "A note that moves"), (2, Some("notes-1a2b"), "A note that stays")]);
+        run(&dst, &file, ImportOptions::default()).await;
+        exec(&dst, "UPDATE memory SET project_id = 'other-3c4d' WHERE content = 'A note that moves';").await;
+        let before = dump(&dst, EVERYTHING).await;
+
+        let (report, _) = run(&dst, &file, ImportOptions::default()).await;
+
+        assert_eq!((report.inserted, report.present), (0, 1));
+        assert_eq!(report.present_elsewhere, BTreeMap::from([("other-3c4d".to_owned(), 1)]));
+        assert_eq!(dump(&dst, EVERYTHING).await, before);
+    }
+
+    #[tokio::test]
+    async fn two_rows_alike_from_two_origins_stay_two() {
+        let dst = destination().await;
+        let mut lines: Vec<String> = clawg_file(&[], &[(1, Some("a-1111"), "One text"), (2, Some("b-2222"), "One text")])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        for (line, origin) in lines[1..].iter_mut().zip(["engram:a", "engram:b"]) {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            row["source"] = "import".into();
+            row["created_by_ref"] = origin.into();
+            row["created_at"] = 1_750_000_000_000i64.into();
+            *line = row.to_string();
+        }
+
+        let (report, _) = run(&dst, &(lines.join("\n") + "\n"), ImportOptions::default()).await;
+
+        assert_eq!((report.inserted, report.present_elsewhere.len()), (2, 0));
+        let rows = dump(&dst, EVERYTHING).await.memories.into_iter().filter(|m| m.content == "One text");
+        let projects: Vec<Option<String>> = rows.map(|m| m.project_id).collect();
+        assert_eq!(projects, vec![Some("a-1111".to_owned()), Some("b-2222".to_owned())]);
+    }
+
     async fn suggestions_of(store: &MemoryStore) -> Vec<(String, String, String)> {
         store
             .conn
@@ -4392,6 +4478,8 @@ pub(crate) mod tests {
             ("TEXT_ROWS_SQL in a project", TEXT_ROWS_SQL, vec![Text(project()), hash()], "idx_memory_dedup"),
             ("TEXT_ROWS_SQL without a project", TEXT_ROWS_SQL, vec![Text(String::new()), hash()], "idx_memory_dedup"),
             ("KEY_ROWS_SQL", KEY_ROWS_SQL, vec![Text(project()), Text("storage/engine".into())], "idx_memory_topic"),
+            ("PRESENT_ELSEWHERE_SQL", PRESENT_ELSEWHERE_SQL, vec![Integer(1), Text("claude-code".into()), hash(), Text("claude-code".into())], "idx_memory_created_at"),
+            ("DATE_ROWS_SQL", DATE_ROWS_SQL, vec![Integer(1)], "idx_memory_created_at"),
             ("PROJECT_ROOT_SQL", PROJECT_ROOT_SQL, vec![Text(project())], "sqlite_autoindex_project_path_1"),
         ];
         let mut wrong = Vec::new();
@@ -4510,6 +4598,12 @@ pub(crate) mod tests {
         assert_eq!(ids, vec![Some("z-2222"), Some("ideas-9a9a"), Some("z-2222")]);
         let ledger = decides_alike(&dst, prepared, "projects by their remote and by their name").await;
         assert!(ledger.placed.values().any(|p| matches!(p, Placement::Present(_))), "the row is found in the project of the remote");
+
+        let dst = destination().await;
+        run(&dst, &file, plain()).await;
+        exec(&dst, "UPDATE memory SET project_id = 'moved-1111' WHERE id = (SELECT MIN(row_id) FROM memory_import_row)").await;
+        let ledger = decides_alike(&dst, file_of(&dst, &file, plain()).await, "a row moved since").await;
+        assert!(ledger.placed.values().any(|p| matches!(p, Placement::Elsewhere(_))));
 
         let dst = destination().await;
         decides_alike(&dst, notes_of(&dst, sample_notes(), plain()).await, "notes of another tool").await;
@@ -4691,7 +4785,7 @@ pub(crate) mod tests {
 
         let load = timing_of(&timings, Step::Load);
         let texts = ROWS.div_ceil(LOAD_BATCH);
-        assert_eq!(load.calls.map(|c| c.count), Some(texts + 1), "the texts, then the roots");
+        assert_eq!(load.calls.map(|c| c.count), Some(texts + texts + 1), "the texts, the dates, then the roots");
         let write = timing_of(&timings, Step::Write);
         assert_eq!(write.calls.map(|c| c.count), Some(note_batches(&[1; ROWS], WRITE_BATCH).len()));
         for timing in [load, write] {
