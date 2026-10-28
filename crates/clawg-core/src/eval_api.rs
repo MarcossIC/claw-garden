@@ -320,7 +320,7 @@ impl EvalStore {
         scoring: EvalScoringConfig,
         query_text: Option<&str>,
     ) -> Result<Vec<EvalHit>, EvalError> {
-        let hits = search_all_memories_with_scoring(
+        let (hits, _memory_pool) = search_all_memories_with_scoring(
             &self.0,
             embedding,
             query_text,
