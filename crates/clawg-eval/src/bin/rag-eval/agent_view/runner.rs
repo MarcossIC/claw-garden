@@ -10,7 +10,10 @@ use std::time::Instant;
 use clawg_cli::client::{ClientError, DaemonClient, SearchArgs};
 use clawg_cli::daemon::api::{serve_ephemeral, AppCtx, SAVE_CONFIRM_TIMEOUT};
 use clawg_cli::mcp::tools::{format_context, format_search};
-use clawg_core::eval_api::{EvalEmbedder, EvalError, EvalIngest, EvalTokenCounter};
+use clawg_core::eval_api::{
+    copy_background, EvalCaseRef, EvalEmbedder, EvalError, EvalIngest, EvalResolveError, EvalResolved,
+    EvalTokenCounter,
+};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 
@@ -41,6 +44,9 @@ pub enum RunError {
     Close(String),
     #[error(transparent)]
     Eval(#[from] EvalError),
+    /// A case names a project or an origin the background does not hold.
+    #[error(transparent)]
+    Golden(#[from] EvalResolveError),
     #[error("the daemon API answered with an error: {0}")]
     Client(#[from] ClientError),
     #[error("could not read the search output for '{query}': {source}")]
@@ -59,6 +65,28 @@ pub struct AgentViewInput<'a> {
     /// Where the chunker looks for `tokenizer.json`: the profile directory for
     /// `--real`, so chunk boundaries match a real daemon's.
     pub tokenizer_dir: &'a Path,
+    /// A snapshot the corpus is saved on top of, copied into the scratch
+    /// directory and only read where it is.
+    pub background: Option<&'a Path>,
+}
+
+/// What a run over a background found in it before the corpus went in.
+struct Over {
+    background: crate::report::Background,
+    /// Each case's project and cited saves, in the order of the cases.
+    resolved: Vec<EvalResolved>,
+}
+
+/// The search a case asks the daemon for, under the background's own id of
+/// the project it names.
+fn search_request(query: &str, project_id: Option<&str>) -> SearchArgs {
+    SearchArgs {
+        query: query.to_string(),
+        agent_id: AGENT_ID.to_string(),
+        project_id: project_id.map(str::to_string),
+        limit: None,
+        lang: None,
+    }
 }
 
 /// A fresh scratch directory path under the system temp dir. Not created.
@@ -77,6 +105,7 @@ struct Session {
     /// The server's state, kept past the server so that releasing the session
     /// can close the store.
     app: std::sync::Arc<AppCtx>,
+    over: Option<Over>,
 }
 
 /// Ingests the corpus through the real pipeline and serves the result.
@@ -88,7 +117,42 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
     std::fs::create_dir_all(scratch)
         .map_err(|source| RunError::Scratch { path: scratch.to_path_buf(), source })?;
 
+    let copied = match input.background {
+        Some(snapshot) => Some((snapshot, copy_background(snapshot, scratch, input.embedder)?)),
+        None => None,
+    };
     let ingest = EvalIngest::open(scratch, input.embedder, input.tokenizer_dir).await?;
+    let over = match copied {
+        Some((snapshot, copied)) => {
+            let cases: Vec<EvalCaseRef> = input
+                .golden_set
+                .retrieval_cases
+                .iter()
+                .map(|c| EvalCaseRef { id: c.query.clone(), project: c.project.clone(), origins: c.expected_origins.clone() })
+                .collect();
+            let resolved = ingest.resolve_cases(&cases).await?;
+            let composition = ingest.composition().await?;
+            let texts = input.golden_set.corpus.iter().map(|r| r.content.clone()).collect();
+            let mut golden_twins: Vec<String> = ingest
+                .holding(texts)
+                .await?
+                .into_iter()
+                .map(|i| input.golden_set.corpus[i].ref_.clone())
+                .collect();
+            golden_twins.sort();
+            let background = crate::report::Background {
+                path: snapshot.to_string_lossy().to_string(),
+                sha256: copied.sha256,
+                contract: copied.contract,
+                schema: crate::report::SchemaSpan { from: copied.schema_from, to: copied.schema_to },
+                searched_at_ms: crate::now_ms(),
+                composition,
+                golden_twins,
+            };
+            Some(Over { background, resolved })
+        }
+        None => None,
+    };
     for row in &input.golden_set.corpus {
         ingest.send(AGENT_ID, &row.content, &row.memory_type, row.importance, age_ms(row.age_days)).await?;
     }
@@ -113,7 +177,7 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
     });
     let (addr, server) = serve_ephemeral(app.clone()).await.map_err(RunError::Serve)?;
     let client = DaemonClient::new(format!("http://{addr}"), TOKEN, scratch.to_path_buf());
-    Ok(Session { client, server, app })
+    Ok(Session { client, server, app, over })
 }
 
 fn elapsed_ms(since: Instant) -> f64 {
@@ -130,30 +194,24 @@ async fn answer_cases(
     let ambiguous = corpus.ambiguous_refs();
     let lang_by_ref = crate::row_langs(&input.golden_set.corpus);
     let mut views = Vec::with_capacity(input.golden_set.retrieval_cases.len());
-    for case in &input.golden_set.retrieval_cases {
+    for (i, case) in input.golden_set.retrieval_cases.iter().enumerate() {
+        let resolution = session.over.as_ref().and_then(|o| o.resolved.get(i));
+        let project_id = resolution.and_then(|r| r.project_id.as_deref());
+        let expected: Vec<String> = case.expected_refs.iter().chain(&case.expected_origins).cloned().collect();
         let started = Instant::now();
-        let found = session
-            .client
-            .search(SearchArgs {
-                query: case.query.clone(),
-                agent_id: AGENT_ID.to_string(),
-                project_id: None,
-                limit: None,
-                lang: None,
-            })
-            .await?;
+        let found = session.client.search(search_request(&case.query, project_id)).await?;
         let search_text = format_search(found, AGENT_ID, None, None);
         let search_ms = elapsed_ms(started);
         let count_tokens = |line: &str| input.counter.count(line);
-        let search_read = read_search(&search_text, &count_tokens, &case.expected_refs, corpus)
+        let search_read = read_search(&search_text, &count_tokens, &expected, corpus)
             .map_err(|source| RunError::Parse { query: case.query.clone(), source })?;
         let search_lines_printed = search_read.lines.len();
 
         let started = Instant::now();
-        let prompt = session.client.context(&case.query, AGENT_ID, None, None, None).await?.prompt;
+        let prompt = session.client.context(&case.query, AGENT_ID, project_id, None, None).await?.prompt;
         let context_text = format_context(Lang::En, &prompt);
         let context_ms = elapsed_ms(started);
-        let context_found = read_context(&context_text, &case.expected_refs, corpus);
+        let context_found = read_context(&context_text, &expected, corpus);
 
         let answer = match case.answer.as_deref() {
             None => None,
@@ -173,14 +231,9 @@ async fn answer_cases(
 
         views.push(CaseView {
             query: case.query.clone(),
-            expected_refs: case.expected_refs.clone(),
             status: case.status,
-            ambiguous_refs: case
-                .expected_refs
-                .iter()
-                .filter(|r| ambiguous.contains(r.as_str()))
-                .cloned()
-                .collect(),
+            ambiguous_refs: expected.iter().filter(|r| ambiguous.contains(r.as_str())).cloned().collect(),
+            expected_refs: expected,
             search: SearchOutcome {
                 found: !search_read.found_refs.is_empty(),
                 found_refs: search_read.found_refs,
@@ -202,7 +255,10 @@ async fn answer_cases(
             answer,
             abstained: (case.subset == CaseSubset::Unanswerable).then_some(search_lines_printed == 0),
             query_lang: case.query_lang.clone(),
-            row_lang: crate::case_lang(&case.expected_refs, &lang_by_ref),
+            row_lang: match resolution.and_then(|r| r.expected.first()) {
+                Some(save) => Some(save.lang.clone()),
+                None => crate::case_lang(&case.expected_refs, &lang_by_ref),
+            },
         });
     }
     Ok(views)
@@ -221,7 +277,7 @@ async fn read_save_text(client: &DaemonClient, id: i64) -> Result<Option<String>
 /// Stops the server and closes the store, returning once neither holds a file
 /// in the scratch directory.
 async fn release(session: Session) -> Result<(), RunError> {
-    let Session { client, server, app } = session;
+    let Session { client, server, app, .. } = session;
     client.shutdown().await?;
     drop(client);
     server
@@ -242,8 +298,12 @@ async fn stop(session: Session, scratch: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Runs the whole measurement inside `scratch`, then removes it.
-pub async fn run(input: &AgentViewInput<'_>, scratch: &Path) -> Result<AgentViewResults, RunError> {
+/// Runs the whole measurement inside `scratch`, then removes it. Over a
+/// background, it also hands back what the background held.
+pub async fn run(
+    input: &AgentViewInput<'_>,
+    scratch: &Path,
+) -> Result<(AgentViewResults, Option<crate::report::Background>), RunError> {
     let session = match start(input, scratch).await {
         Ok(session) => session,
         Err(e) => {
@@ -253,8 +313,17 @@ pub async fn run(input: &AgentViewInput<'_>, scratch: &Path) -> Result<AgentView
             return Err(e);
         }
     };
-    let corpus =
-        Corpus::new(input.golden_set.corpus.iter().map(|r| (r.ref_.as_str(), r.content.as_str())));
+    // A save cited by origin is matched by its joined text, so a fragment of
+    // any of its pieces finds it.
+    let cited: std::collections::BTreeMap<&str, &str> = session
+        .over
+        .iter()
+        .flat_map(|o| o.resolved.iter().flat_map(|r| r.expected.iter()))
+        .map(|save| (save.origin.as_str(), save.text.as_str()))
+        .collect();
+    let corpus = Corpus::new(
+        input.golden_set.corpus.iter().map(|r| (r.ref_.as_str(), r.content.as_str())).chain(cited.into_iter()),
+    );
 
     let measured = async {
         let stored_rows = session.client.stats(Some(AGENT_ID), None).await?.totals.memory;
@@ -263,10 +332,11 @@ pub async fn run(input: &AgentViewInput<'_>, scratch: &Path) -> Result<AgentView
     }
     .await;
 
+    let background = session.over.as_ref().map(|o| o.background.clone());
     let stopped = stop(session, scratch).await;
     let results = measured?;
     stopped?;
-    Ok(results)
+    Ok((results, background))
 }
 
 #[cfg(test)]
@@ -308,6 +378,15 @@ mod tests {
     }
 
     #[test]
+    fn the_search_of_a_case_names_its_project() {
+        let asked = search_request("which pier", Some("app-1111"));
+
+        assert_eq!(asked.project_id.as_deref(), Some("app-1111"));
+        assert_eq!((asked.query.as_str(), asked.agent_id.as_str()), ("which pier", AGENT_ID));
+        assert_eq!(search_request("which pier", None).project_id, None);
+    }
+
+    #[test]
     fn the_scratch_dir_is_unique_and_under_the_system_temp_dir() {
         let (a, b) = (scratch_dir(), scratch_dir());
         assert_ne!(a, b);
@@ -322,6 +401,7 @@ mod tests {
             embedder: &EvalEmbedder::fake(),
             counter: &EvalTokenCounter::fake(),
             tokenizer_dir: Path::new("."),
+            background: None,
         };
         // Derived from the temp dir itself, not the working directory: a checkout
         // can live under the temp dir, and then the cwd is not "outside" at all.
@@ -346,9 +426,10 @@ mod tests {
             embedder: &EvalEmbedder::fake(),
             counter: &EvalTokenCounter::fake(),
             tokenizer_dir: &scratch,
+            background: None,
         };
 
-        let results = run(&input, &scratch).await.expect("the run must succeed");
+        let (results, _) = run(&input, &scratch).await.expect("the run must succeed");
 
         assert_eq!(results.corpus_size, 3);
         assert_eq!(results.stored_rows, 3, "short rows are neither split nor merged");
@@ -371,6 +452,7 @@ mod tests {
             embedder: &EvalEmbedder::fake(),
             counter: &EvalTokenCounter::fake(),
             tokenizer_dir: &scratch,
+            background: None,
         };
         let session = start(&input, &scratch).await.expect("start");
 
@@ -388,9 +470,10 @@ mod tests {
             embedder: &EvalEmbedder::fake(),
             counter: &EvalTokenCounter::fake(),
             tokenizer_dir: &scratch,
+            background: None,
         };
 
-        let results = run(&input, &scratch).await.expect("the run must succeed");
+        let (results, _) = run(&input, &scratch).await.expect("the run must succeed");
 
         assert_eq!(results.search.active.n_cases, 2);
         assert_eq!(results.search.known_red.n_cases, 1);
@@ -423,9 +506,10 @@ mod tests {
             embedder: &EvalEmbedder::fake(),
             counter: &EvalTokenCounter::fake(),
             tokenizer_dir: &scratch,
+            background: None,
         };
 
-        let results = run(&input, &scratch).await.expect("the run must succeed");
+        let (results, _) = run(&input, &scratch).await.expect("the run must succeed");
 
         assert!(results.stored_rows > 1, "the row must be split for the case to mean anything");
         let answer = results.per_case[0].answer.expect("a case with an answer is scored on it");
@@ -445,6 +529,7 @@ mod tests {
             embedder: &EvalEmbedder::fake(),
             counter: &EvalTokenCounter::fake(),
             tokenizer_dir: &scratch,
+            background: None,
         };
         let session = start(&input, &scratch).await.expect("start");
         let corpus = Corpus::new(golden.corpus.iter().map(|r| (r.ref_.as_str(), r.content.as_str())));

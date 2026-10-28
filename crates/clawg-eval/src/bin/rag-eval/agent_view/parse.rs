@@ -29,25 +29,29 @@ pub enum ParseError {
 }
 
 /// Splits `format_search` output into its lines. The sentences of an empty
-/// answer are read in every language the tool speaks.
+/// answer, and the note that closes an answer with a row another agent saved,
+/// are read in every language the tool speaks.
 pub fn parse_search_output(text: &str) -> Result<Vec<SearchLine>, ParseError> {
     use clawg_cli::mcp::tools::{no_memories_found, no_relevant_memories};
-    let empty = [Lang::En, Lang::Es]
+    use clawg_core::memory::prompt_builder::shared_note;
+    let languages = [Lang::En, Lang::Es];
+    let empty = languages
         .into_iter()
         .any(|lang| text.trim() == no_memories_found(lang) || text.starts_with(no_relevant_memories(lang)));
     if empty {
         return Ok(Vec::new());
     }
     text.lines()
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !line.trim().is_empty() && !languages.into_iter().any(|lang| *line == shared_note(lang)))
         .map(|line| parse_search_line(line).ok_or_else(|| ParseError::SearchLine(line.to_string())))
         .collect()
 }
 
 /// `{rank}. #{id} [{kind}/{type}/t{tier} score={score}] {content}`, with
-/// `piece={k}/{n}` before the score for a piece of a long save. The first `]`
-/// closes the metadata because nothing inside it can contain one; content is
-/// free to.
+/// `piece={k}/{n}` before the score for a piece of a long save and `by
+/// {author}` after it for a row another agent saved. The first `]` closes the
+/// metadata because nothing inside it can contain one (an author's brackets
+/// are shown as parentheses); content is free to.
 fn parse_search_line(line: &str) -> Option<SearchLine> {
     let (rank, rest) = line.split_once(". #")?;
     let rank = rank.parse().ok()?;
@@ -57,7 +61,7 @@ fn parse_search_line(line: &str) -> Option<SearchLine> {
     }
     let id = id.parse().ok()?;
     let (meta, after) = rest.split_once(']')?;
-    let score = meta.split_once(" score=")?.1.parse().ok()?;
+    let score = meta.split_once(" score=")?.1.split(' ').next()?.parse().ok()?;
     let content = match after.strip_prefix(' ') {
         Some(content) => content,
         None if after.is_empty() => after,
@@ -184,6 +188,21 @@ mod tests {
     #[test]
     fn the_empty_result_sentence_parses_to_no_lines() {
         assert!(parse_search_output("no memories found").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_hit_another_agent_saved_parses() {
+        let line = "1. #10 [Memory/semantic_fact/t3 piece=7/14 score=0.88 by migrated] the pier opens at dawn";
+
+        for lang in [Lang::En, Lang::Es] {
+            let text = format!("{line}\n{}", clawg_core::memory::prompt_builder::shared_note(lang));
+
+            let parsed = parse_search_output(&text).unwrap();
+
+            assert_eq!(parsed.len(), 1, "the note on shared rows is not a hit");
+            assert_eq!((parsed[0].rank, parsed[0].id, parsed[0].score), (1, 10, 0.88));
+            assert_eq!(parsed[0].content, "the pier opens at dawn");
+        }
     }
 
     #[test]

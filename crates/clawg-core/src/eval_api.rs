@@ -788,6 +788,44 @@ impl EvalIngest {
         })
     }
 
+    /// [`EvalStore::resolve_cases`] over this store.
+    pub async fn resolve_cases(&self, cases: &[EvalCaseRef]) -> Result<Vec<EvalResolved>, EvalResolveError> {
+        resolve_cases_in(&self.runtime.store, cases).await
+    }
+
+    /// [`EvalStore::composition`] over this store.
+    pub async fn composition(&self) -> Result<EvalComposition, EvalError> {
+        self.runtime.store.conn.call(|c| composition_in(c)).await.map_err(|e| EvalError::Read(e.to_string()))
+    }
+
+    /// The positions in `texts` of those a live row already holds, hashed as a
+    /// save of each would hash it: asked before a corpus goes in, the texts
+    /// the ingest would merge into a row that was there.
+    pub async fn holding(&self, texts: Vec<String>) -> Result<Vec<usize>, EvalError> {
+        let hashes: Vec<String> = texts
+            .iter()
+            .map(|t| crate::memory::dedup::content_hash(&crate::memory::redact::redact(t).text))
+            .collect();
+        self.runtime
+            .store
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<usize>> {
+                let mut stmt = c.prepare(
+                    "SELECT EXISTS (SELECT 1 FROM memory WHERE content_hash = ?1 \
+                     AND deleted_at IS NULL AND status IN ('active', 'disputed'))",
+                )?;
+                let mut held = Vec::new();
+                for (i, hash) in hashes.iter().enumerate() {
+                    if stmt.query_row([hash], |r| r.get::<_, bool>(0))? {
+                        held.push(i);
+                    }
+                }
+                Ok(held)
+            })
+            .await
+            .map_err(|e| EvalError::Read(e.to_string()))
+    }
+
     /// Closes the queue and waits for the worker to finish it. The worker only
     /// ends once every sender is gone, so this is the one "everything queued
     /// is now stored" signal the pipeline has.
@@ -1944,6 +1982,22 @@ mod tests {
         assert_eq!(created.len(), 2);
         let gap = created[0] - created[1];
         assert!((gap - (300 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
+    }
+
+    #[tokio::test]
+    async fn an_ingest_names_the_texts_a_live_row_already_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        ingest.save(keyed("a note already in the store", None)).await.unwrap();
+
+        let held = ingest
+            .holding(vec!["a new note".to_string(), "  a note already in the store ".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(held, vec![1], "a text is held as a save of it would hash it");
+        assert!(ingest.composition().await.unwrap().rows >= 1);
+        assert!(ingest.resolve_cases(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -134,7 +134,7 @@ pub enum CliError {
     LexicalOnlyWithOtherMode,
     #[error("--fail-on-regression is only meaningful with --diff")]
     FailOnRegressionWithoutDiff,
-    #[error("--background is mutually exclusive with --docs, --lang-detect, --fts-tokenizer, --follow-up, --audit, --lexical-only and --agent-view")]
+    #[error("--background is mutually exclusive with --docs, --lang-detect, --fts-tokenizer, --follow-up, --audit and --lexical-only")]
     BackgroundWithOtherMode,
 }
 
@@ -225,8 +225,9 @@ OPTIONS:
                          results name the snapshot (path, sha256, contract, schema, the time of
                          the search and its rows by type, agent, language, source and project)
                          and fold bg-<first 8 hex of its sha256> into the tag. Mutually exclusive
-                         with --docs, --lang-detect, --fts-tokenizer, --follow-up, --audit,
-                         --lexical-only and --agent-view; the sweep flags are accepted.
+                         with --docs, --lang-detect, --fts-tokenizer, --follow-up, --audit and
+                         --lexical-only; the sweep flags are accepted, and with --agent-view the
+                         corpus is saved through the ingest on top of the copy.
     --lang-detect       Print as JSON how clawg's language detector labels the corpus rows
                          that carry a lang (en or es): by label, in total and for the rows
                          of eight words or more, with the share right, crossed and
@@ -405,9 +406,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         }
     }
 
-    if background.is_some()
-        && (docs || lang_detect || fts_tokenizer.is_some() || follow_up || audit || lexical_only || agent_view)
-    {
+    if background.is_some() && (docs || lang_detect || fts_tokenizer.is_some() || follow_up || audit || lexical_only) {
         return Err(CliError::BackgroundWithOtherMode);
     }
     if lang_detect {
@@ -525,6 +524,8 @@ mod tests {
         let swept = run_cli(&["--real", "--background", "snap.db", "--sweep-cos-floor", "0.8", "--sweep-lexical", "0"]);
         assert_eq!(swept.sweep_cos_floor, vec![0.8]);
         assert_eq!(parse(argv(&["--fake", "--background"])), Err(CliError::MissingValue("--background".to_string())));
+        let viewed = run_cli(&["--fake", "--agent-view", "--background", "snap.db"]);
+        assert!(viewed.agent_view && viewed.background.is_some(), "agent-view measures over a background too");
     }
 
     #[test]
@@ -536,7 +537,6 @@ mod tests {
             &["--follow-up"],
             &["--audit"],
             &["--lexical-only"],
-            &["--agent-view"],
         ] {
             let args: Vec<&str> = ["--fake", "--background", "snap.db"].iter().chain(other).copied().collect();
             assert_eq!(parse(argv(&args)), Err(CliError::BackgroundWithOtherMode), "{other:?}");

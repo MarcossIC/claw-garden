@@ -881,9 +881,14 @@ async fn run_agent_view(
             cli::Mode::Real => base_dir,
             cli::Mode::Fake => &scratch,
         },
+        background: cli.background.as_deref(),
     };
-    let view = match agent_view::runner::run(&input, &scratch).await {
-        Ok(view) => view,
+    let (view, background) = match agent_view::runner::run(&input, &scratch).await {
+        Ok(measured) => measured,
+        Err(agent_view::runner::RunError::Golden(e)) => {
+            eprintln!("golden set validation failed: {e}");
+            return EXIT_GOLDEN_INVALID;
+        }
         Err(e) => {
             eprintln!("agent-view run failed: {e}");
             return EXIT_RUNTIME_FAILURE;
@@ -893,7 +898,7 @@ async fn run_agent_view(
 
     // Only the agent-view summary is printed: the ordinary report would show
     // an empty retrieval block, as if the ranking had been scored and failed.
-    let results = build_agent_view_run_results(cli, loaded_golden, embedder, view);
+    let results = build_agent_view_run_results(cli, loaded_golden, embedder, view, background);
     match report::write_json(&results, &cli.out_dir, cli.force) {
         Ok(path) => {
             println!("results written to {}", path.display());
@@ -919,16 +924,18 @@ fn build_agent_view_run_results(
     loaded_golden: &golden::LoadedGolden,
     embedder: &EvalEmbedder,
     view: agent_view::AgentViewResults,
+    background: Option<report::Background>,
 ) -> report::RunResults {
     let golden_set = &loaded_golden.set;
     let mode = match cli.mode {
         cli::Mode::Fake => report::Mode::Fake,
         cli::Mode::Real => report::Mode::Real,
     };
+    let tag = fold_tag(cli.tag.as_deref(), Some("agent-view"));
     report::RunResults {
         date: current_date_string(),
         mode,
-        tag: fold_tag(cli.tag.as_deref(), Some("agent-view")),
+        tag: fold_tag(tag.as_deref(), background.as_ref().map(background_slug).as_deref()),
         model_id: embedder.model_id().to_string(),
         git_sha: report::git_sha(),
         k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: K_POOL.lexical },
@@ -950,7 +957,7 @@ fn build_agent_view_run_results(
         audit: None,
         similarity: None,
         agent_view: Some(view),
-        background: None,
+        background,
     }
 }
 
@@ -1934,6 +1941,75 @@ mod tests {
         assert_eq!(case["project"], "App");
         assert_eq!(case["expected_type"], "session_summary");
         assert_eq!(case["expected_is_last_summary"], true, "{case}");
+    }
+
+    /// The results of `--fake --agent-view` on `golden_json` over `snapshot`,
+    /// which it removes.
+    async fn agent_view_over(golden_json: &str, snapshot: PathBuf, tag: &str) -> serde_json::Value {
+        let golden_path = temp_path(&format!("{tag}-golden.json"));
+        std::fs::write(&golden_path, golden_json).unwrap();
+        let out_dir = temp_path(&format!("{tag}-out"));
+        let args = [
+            "rag-eval",
+            "--fake",
+            "--agent-view",
+            "--golden",
+            &golden_path.to_string_lossy(),
+            "--out",
+            &out_dir.to_string_lossy(),
+            "--tag",
+            tag,
+            "--background",
+            &snapshot.to_string_lossy(),
+        ]
+        .map(str::to_string);
+        assert_eq!(run(args.into_iter()).await, EXIT_OK);
+        let (_, _, json) = only_results(&out_dir);
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+        json
+    }
+
+    #[tokio::test]
+    async fn agent_view_sends_the_case_project_to_search_and_context() {
+        const SUMMARY: &str = "the last session moved the ferry timetable to the harbour office by the north pier";
+        let imports = [Imported { origin: "engram:last", project: Some("app-1111"), memory_type: "session_summary", text: SUMMARY }];
+        let snapshot = background_with(&background_notes(5), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(
+            r#"{"query": "which colour was chosen for the dashboard", "expected_origins": ["engram:last"], "project": "App"}"#,
+        );
+
+        let json = agent_view_over(&golden, snapshot, "view-project").await;
+
+        let case = &json["agent_view"]["per_case"][0];
+        assert!(
+            case["context"]["sections"].get("LAST SESSION").is_some(),
+            "only a context asked for the project opens with its last session: {case}"
+        );
+        assert_eq!(json["background"]["composition"]["rows"], 6);
+    }
+
+    #[tokio::test]
+    async fn an_origin_case_is_found_in_any_piece_of_its_save() {
+        let long: String = (0..60)
+            .map(|i| match i {
+                30 => "the spare keys of the pier are kept under ZQXPIER42 in the harbour office. ".to_string(),
+                _ => format!("sentence {i} of the long harbour note says the pier opens at dawn. "),
+            })
+            .collect();
+        let long: &'static str = Box::leak(long.into_boxed_str());
+        let imports = [Imported { origin: "engram:long", project: Some("app-1111"), memory_type: "semantic_fact", text: long }];
+        let snapshot = background_with(&background_notes(3), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(
+            r#"{"query": "where are the keys of ZQXPIER42", "expected_origins": ["engram:long"], "project": "App"}"#,
+        );
+
+        let json = agent_view_over(&golden, snapshot, "view-piece").await;
+
+        let case = &json["agent_view"]["per_case"][0];
+        assert_eq!(case["expected_refs"], serde_json::json!(["engram:long"]));
+        assert_eq!(case["search"]["found"], true, "a fragment of the piece shown is a fragment of the save: {case}");
     }
 
     #[test]
