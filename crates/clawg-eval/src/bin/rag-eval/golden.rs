@@ -196,6 +196,11 @@ impl RefMap {
     pub fn ref_of(&self, id: i64) -> Option<&str> {
         self.to_ref.get(&id).map(String::as_str)
     }
+
+    /// Every seeded id, in no particular order.
+    pub fn ids(&self) -> Vec<i64> {
+        self.to_ref.keys().copied().collect()
+    }
 }
 
 /// Everything that can make a golden set unusable, each carrying the exact

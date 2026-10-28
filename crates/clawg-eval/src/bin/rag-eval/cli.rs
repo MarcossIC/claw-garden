@@ -82,6 +82,11 @@ pub struct Cli {
     /// no vectors), as a floor the full ranking has to beat. Mutually
     /// exclusive with the other arms and every sweep flag.
     pub lexical_only: bool,
+    /// `--background <snapshot>`: a snapshot `clawg backup` wrote, copied and
+    /// measured under the golden corpus. The sweep flags vary the ranking over
+    /// it; the modes that measure the golden corpus alone, and a tokenizer
+    /// swap that would empty its text index, are refused with it.
+    pub background: Option<PathBuf>,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -129,6 +134,8 @@ pub enum CliError {
     LexicalOnlyWithOtherMode,
     #[error("--fail-on-regression is only meaningful with --diff")]
     FailOnRegressionWithoutDiff,
+    #[error("--background is mutually exclusive with --docs, --lang-detect, --fts-tokenizer, --follow-up, --audit, --lexical-only and --agent-view")]
+    BackgroundWithOtherMode,
 }
 
 pub const HELP_TEXT: &str = "\
@@ -207,6 +214,19 @@ OPTIONS:
                          floor for the full ranking; writes {date}-{mode}-lexical-only.json,
                          which --diff compares with any other run. Mutually exclusive with
                          --agent-view, --follow-up, --docs and every sweep flag.
+    --background <snapshot>
+                         Measure over a copy of a snapshot `clawg backup` wrote, with the golden
+                         corpus seeded on top and every search reaching every agent's rows, as
+                         the daemon does. The snapshot is only read; the copy, in the system temp
+                         directory, is migrated if its schema is older and removed when the run
+                         ends. A snapshot with commits in a -wal beside it, damaged, of a newer
+                         or diverged schema, or embedded by another model is refused with exit 1.
+                         A hit from the snapshot keeps its place in ranked_refs as bg, and the
+                         results name the snapshot (path, sha256, contract, schema, the time of
+                         the search and its rows by type, agent, language, source and project)
+                         and fold bg-<first 8 hex of its sha256> into the tag. Mutually exclusive
+                         with --docs, --lang-detect, --fts-tokenizer, --follow-up, --audit,
+                         --lexical-only and --agent-view; the sweep flags are accepted.
     --lang-detect       Print as JSON how clawg's language detector labels the corpus rows
                          that carry a lang (en or es): by label, in total and for the rows
                          of eight words or more, with the share right, crossed and
@@ -282,6 +302,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut fail_on_regression = false;
     let mut lexical_only = false;
     let mut lang_detect = false;
+    let mut background: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -374,10 +395,21 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
                     .ok_or_else(|| CliError::MissingValue("--fts-tokenizer".to_string()))?;
                 fts_tokenizer = Some(value);
             }
+            "--background" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--background".to_string()))?;
+                background = Some(PathBuf::from(value));
+            }
             other => return Err(CliError::UnknownFlag(other.to_string())),
         }
     }
 
+    if background.is_some()
+        && (docs || lang_detect || fts_tokenizer.is_some() || follow_up || audit || lexical_only || agent_view)
+    {
+        return Err(CliError::BackgroundWithOtherMode);
+    }
     if lang_detect {
         return Ok(ParseOutcome::LangDetect { golden: golden_path.unwrap_or_else(default_golden_path) });
     }
@@ -453,6 +485,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         docs,
         docs_root: docs_root.unwrap_or_else(default_docs_root),
         lexical_only,
+        background,
     }))
 }
 
@@ -482,6 +515,31 @@ mod tests {
             ParseOutcome::Help => panic!("expected Run, got Help"),
             ParseOutcome::Diff { a, b, .. } => panic!("expected Run, got Diff({a:?}, {b:?})"),
             ParseOutcome::LangDetect { golden } => panic!("expected Run, got LangDetect({golden:?})"),
+        }
+    }
+
+    #[test]
+    fn background_parses() {
+        assert_eq!(run_cli(&["--fake", "--background", "snap.db"]).background, Some(PathBuf::from("snap.db")));
+        assert_eq!(run_cli(&["--fake"]).background, None);
+        let swept = run_cli(&["--real", "--background", "snap.db", "--sweep-cos-floor", "0.8", "--sweep-lexical", "0"]);
+        assert_eq!(swept.sweep_cos_floor, vec![0.8]);
+        assert_eq!(parse(argv(&["--fake", "--background"])), Err(CliError::MissingValue("--background".to_string())));
+    }
+
+    #[test]
+    fn background_with_docs_is_a_usage_error() {
+        for other in [
+            &["--docs"][..],
+            &["--lang-detect"],
+            &["--fts-tokenizer", "trigram"],
+            &["--follow-up"],
+            &["--audit"],
+            &["--lexical-only"],
+            &["--agent-view"],
+        ] {
+            let args: Vec<&str> = ["--fake", "--background", "snap.db"].iter().chain(other).copied().collect();
+            assert_eq!(parse(argv(&args)), Err(CliError::BackgroundWithOtherMode), "{other:?}");
         }
     }
 

@@ -246,6 +246,8 @@ pub enum EvalError {
     RecreateFts(String),
     #[error("failed to read the store: {0}")]
     Read(String),
+    #[error("failed to close the store: {0}")]
+    Close(String),
     #[error("cannot measure over the snapshot: {0}")]
     Background(#[from] BackgroundRefusal),
 }
@@ -374,6 +376,34 @@ impl EvalStore {
     /// What the live rows of the store are, in counts and names.
     pub async fn composition(&self) -> Result<EvalComposition, EvalError> {
         self.0.conn.call(|c| composition_in(c)).await.map_err(|e| EvalError::Read(e.to_string()))
+    }
+
+    /// Of the rows `seeded`, those whose text a live row outside them also
+    /// holds, by `content_hash`.
+    pub async fn twins(&self, seeded: Vec<i64>) -> Result<Vec<i64>, EvalError> {
+        let seeded = serde_json::to_string(&seeded).map_err(|e| EvalError::Read(e.to_string()))?;
+        self.0
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = c.prepare(
+                    "SELECT DISTINCT a.id FROM memory a JOIN memory b ON b.content_hash = a.content_hash \
+                     WHERE a.id IN (SELECT value FROM json_each(?1)) \
+                       AND b.id NOT IN (SELECT value FROM json_each(?1)) \
+                       AND b.deleted_at IS NULL AND b.status IN ('active', 'disputed') \
+                     ORDER BY a.id",
+                )?;
+                let ids = stmt.query_map([&seeded], |r| r.get(0))?.collect();
+                ids
+            })
+            .await
+            .map_err(|e| EvalError::Read(e.to_string()))
+    }
+
+    /// Closes the store and returns once its connection let the files go:
+    /// dropping it only signals the connection's thread, and on Windows a
+    /// file still open cannot be deleted.
+    pub async fn close(self) -> Result<(), EvalError> {
+        self.0.conn.clone().close().await.map_err(|e| EvalError::Close(e.to_string()))
     }
 
     /// The project and the expected saves of each case in this store, read

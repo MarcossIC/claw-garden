@@ -21,7 +21,7 @@ use super::{
     AnswerView, CaseView, ContextOutcome, SearchOutcome,
 };
 use crate::golden::{CaseSubset, GoldenSet};
-use crate::seed::{age_ms, AGENT_ID};
+use crate::seed::{age_ms, remove_scratch, AGENT_ID};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -240,21 +240,6 @@ async fn stop(session: Session, scratch: &Path) -> Result<(), RunError> {
     release(session).await?;
     remove_scratch(scratch).await;
     Ok(())
-}
-
-/// Removal is still retried: on Windows another process (a virus scanner, the
-/// search indexer) can hold a file it has just seen written for a moment, and a
-/// directory holding an open file cannot be deleted. Failing to delete is
-/// reported, not fatal: the measurement itself is already complete.
-async fn remove_scratch(scratch: &Path) {
-    for _ in 0..40 {
-        match std::fs::remove_dir_all(scratch) {
-            Ok(()) => return,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-        }
-    }
-    eprintln!("warning: could not remove the scratch directory {}", scratch.display());
 }
 
 /// Runs the whole measurement inside `scratch`, then removes it.

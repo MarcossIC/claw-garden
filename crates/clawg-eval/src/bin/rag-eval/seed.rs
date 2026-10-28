@@ -64,6 +64,17 @@ pub async fn seed(
     if let Some(tokenizer) = fts_tokenizer {
         store.recreate_fts_with_tokenizer(tokenizer).await?;
     }
+    seed_onto(store, store_path, corpus, embedder).await
+}
+
+/// Inserts every row of `corpus` into `store`, open at `store_path`, which
+/// may already hold rows: a background the corpus is measured among.
+pub async fn seed_onto(
+    store: EvalStore,
+    store_path: PathBuf,
+    corpus: &[CorpusRow],
+    embedder: &EvalEmbedder,
+) -> Result<SeedResult, EvalError> {
     let mut refs = RefMap::new();
     let mut norms: Vec<f64> = Vec::with_capacity(corpus.len());
     let mut vectors: Vec<(String, Vec<f32>)> = Vec::with_capacity(corpus.len());
@@ -99,8 +110,23 @@ pub(crate) fn age_ms(age_days: f64) -> u64 {
 /// that may not reproduce it. `tempfile` (which would auto-delete) is a
 /// dev-dependency in this crate and does not reach `[[bin]]` targets at all,
 /// which makes this a constraint as much as a choice.
-fn unique_store_path() -> PathBuf {
+pub(crate) fn unique_store_path() -> PathBuf {
     std::env::temp_dir().join(format!("rag-eval-{}", uuid::Uuid::new_v4()))
+}
+
+/// Removal is retried: on Windows another process (a virus scanner, the
+/// search indexer) can hold a file it has just seen written for a moment, and
+/// a directory holding an open file cannot be deleted. Failing to delete is
+/// reported, not fatal: the measurement itself is already complete.
+pub(crate) async fn remove_scratch(scratch: &std::path::Path) {
+    for _ in 0..40 {
+        match std::fs::remove_dir_all(scratch) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    eprintln!("warning: could not remove the scratch directory {}", scratch.display());
 }
 
 fn l2_norm(v: &[f32]) -> f64 {

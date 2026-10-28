@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use clawg_core::eval_api::EvalScoringConfig;
+use clawg_core::eval_api::{EvalComposition, EvalContract, EvalScoringConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::golden::{CaseStatus, CaseSubset};
@@ -472,6 +472,35 @@ pub struct RunResults {
     /// earlier results file reads as a run that never measured it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_view: Option<crate::agent_view::AgentViewResults>,
+    /// Present only for a run over `--background`, absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<Background>,
+}
+
+/// The snapshot a run measured over, in names and counts alone: never a text,
+/// a row id or a key of it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Background {
+    /// As it was given.
+    pub path: String,
+    pub sha256: String,
+    pub contract: EvalContract,
+    pub schema: SchemaSpan,
+    /// When the searches ran: decay reads the clock, so two runs over one
+    /// background compare only from the same day.
+    pub searched_at_ms: i64,
+    /// Its live rows before the golden corpus was seeded on top.
+    pub composition: EvalComposition,
+    /// The golden refs whose text a live row of the background also holds,
+    /// which the ranking never credits.
+    pub golden_twins: Vec<String>,
+}
+
+/// The schema of a snapshot, and the one its copy was migrated to.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SchemaSpan {
+    pub from: i32,
+    pub to: i32,
 }
 
 impl RetrievalResults {
@@ -1444,6 +1473,7 @@ mod tests {
             audit: None,
             similarity: None,
             agent_view: None,
+            background: None,
         }
     }
 

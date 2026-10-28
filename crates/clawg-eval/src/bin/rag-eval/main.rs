@@ -16,9 +16,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use clawg_core::eval_api::{
-    compose_query_context, model_is_cached, query_budget_tokens,
-    EmbedRole, EvalEmbedder, EvalScope, EvalScoringConfig, EvalTokenCounter, MIGRATION_FTS_TOKENIZER,
-    EMBED_MAX_TOKENS, SPECIAL_TOKEN_RESERVE,
+    compose_query_context, copy_background, model_is_cached, query_budget_tokens,
+    EmbedRole, EvalEmbedder, EvalError, EvalScope, EvalScoringConfig, EvalStore, EvalTokenCounter,
+    MIGRATION_FTS_TOKENIZER, EMBED_MAX_TOKENS, SPECIAL_TOKEN_RESERVE,
 };
 
 use golden::{CaseStatus, CaseSubset, PairLabel};
@@ -99,6 +99,11 @@ async fn load_embedder(mode: cli::Mode, base_dir: &std::path::Path) -> Result<Ev
 /// number someone will quote later, and a partially-computed one is worse
 /// than none, because nothing downstream can tell the two apart.
 async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
+    run_with_scratch(args, seed::unique_store_path()).await
+}
+
+/// [`run`], copying the snapshot of a run over `--background` into `scratch`.
+async fn run_with_scratch<I: Iterator<Item = String>>(args: I, scratch: PathBuf) -> i32 {
     let cli = match cli::parse(args) {
         Ok(cli::ParseOutcome::Help) => {
             println!("{}", cli::HELP_TEXT);
@@ -205,20 +210,115 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         return run_agent_view(&cli, &loaded_golden, &embedder, &counter, &base_dir).await;
     }
 
-    let seeded = match seed::seed(&golden_set.corpus, &embedder, cli.fts_tokenizer.as_deref()).await {
-        Ok(s) => s,
+    let Some(snapshot) = &cli.background else {
+        let seeded = match seed::seed(&golden_set.corpus, &embedder, cli.fts_tokenizer.as_deref()).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("seeding failed: {e}");
+                return EXIT_RUNTIME_FAILURE;
+            }
+        };
+        // The temp store is left on disk on purpose: when a number in the
+        // results JSON looks wrong, the database that produced it is still
+        // there to be opened. Printing the path is what makes that
+        // recoverable — a per-run uuid directory nobody was told about is not
+        // a forensic trace.
+        println!("seeded {} rows into {}", golden_set.corpus.len(), seeded.store_path.display());
+        return measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, None).await;
+    };
+
+    // A copy of a snapshot is removed whatever the run gives: it weighs as
+    // much as the store it copies, holds its text, and the snapshot is still
+    // there to measure again.
+    let (seeded, background) = match seed_over_background(snapshot, &scratch, &golden_set.corpus, &embedder).await {
+        Ok(over) => over,
         Err(e) => {
-            eprintln!("seeding failed: {e}");
+            eprintln!("{}: {e}", snapshot.display());
+            seed::remove_scratch(&scratch).await;
             return EXIT_RUNTIME_FAILURE;
         }
     };
+    println!(
+        "seeded {} rows over a copy of {} in {}",
+        golden_set.corpus.len(),
+        snapshot.display(),
+        seeded.store_path.display()
+    );
+    let code = measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, Some(background)).await;
+    if let Err(e) = seeded.store.close().await {
+        eprintln!("warning: {e}");
+    }
+    seed::remove_scratch(&scratch).await;
+    code
+}
 
-    // The temp store is left on disk on purpose: when a number in the results
-    // JSON looks wrong, the database that produced it is still there to be
-    // opened. Printing the path is what makes that recoverable — a per-run
-    // uuid directory nobody was told about is not a forensic trace.
-    println!("seeded {} rows into {}", golden_set.corpus.len(), seeded.store_path.display());
+/// Copies `snapshot` into `scratch`, refusing one that cannot be measured over
+/// before anything opens the copy for writing, opens the copy (which migrates
+/// an older schema), reads what it holds and seeds `corpus` on top.
+async fn seed_over_background(
+    snapshot: &std::path::Path,
+    scratch: &std::path::Path,
+    corpus: &[golden::CorpusRow],
+    embedder: &EvalEmbedder,
+) -> Result<(seed::SeedResult, report::Background), EvalError> {
+    std::fs::create_dir_all(scratch).map_err(|e| EvalError::Open(format!("{}: {e}", scratch.display())))?;
+    let copied = copy_background(snapshot, scratch, embedder)?;
+    let store = EvalStore::open(scratch).await?;
+    let composition = store.composition().await?;
+    let seeded = seed::seed_onto(store, scratch.to_path_buf(), corpus, embedder).await?;
+    let mut twins: Vec<String> = seeded
+        .store
+        .twins(seeded.refs.ids())
+        .await?
+        .into_iter()
+        .filter_map(|id| seeded.refs.ref_of(id).map(str::to_string))
+        .collect();
+    twins.sort();
+    let background = report::Background {
+        path: snapshot.to_string_lossy().to_string(),
+        sha256: copied.sha256,
+        contract: copied.contract,
+        schema: report::SchemaSpan { from: copied.schema_from, to: copied.schema_to },
+        // The searches follow once the cases are embedded.
+        searched_at_ms: now_ms(),
+        composition,
+        golden_twins: twins,
+    };
+    Ok((seeded, background))
+}
 
+/// The tag segment that names the snapshot a run measured over: two runs of
+/// one day, with and without it, write two files.
+fn background_slug(background: &report::Background) -> String {
+    format!("bg-{}", &background.sha256[..8])
+}
+
+/// A hit outside the golden corpus, which only a background holds: it keeps
+/// its place in the ranking, unnamed, so no expected row climbs past it.
+const BACKGROUND_HIT: &str = "bg";
+
+/// The refs of `ids`, in their order. Without a background every hit is a
+/// golden row; with one, a hit that is not keeps its place as `bg`.
+fn rank_refs(ids: &[i64], refs: &golden::RefMap, background: bool) -> Vec<String> {
+    ids.iter()
+        .filter_map(|id| match refs.ref_of(*id) {
+            Some(r) => Some(r.to_string()),
+            None => background.then(|| BACKGROUND_HIT.to_string()),
+        })
+        .collect()
+}
+
+/// Scores the golden cases over the seeded store and writes the results.
+async fn measure(
+    cli: &cli::Cli,
+    loaded_golden: &golden::LoadedGolden,
+    embedder: &EvalEmbedder,
+    counter: &EvalTokenCounter,
+    budget: usize,
+    seeded: &seed::SeedResult,
+    background: Option<report::Background>,
+) -> i32 {
+    let golden_set = &loaded_golden.set;
     let lang_by_ref = row_langs(&golden_set.corpus);
 
     // Every query embedded exactly once, up front — shared unchanged across
@@ -366,6 +466,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     // just below the grid, where it used to live) because the `--follow-up`
     // branch needs it too and returns before the grid is ever built.
     let run_tag = fold_tag(cli.tag.as_deref(), tokenizer_slug(cli.fts_tokenizer.as_deref()).as_deref());
+    let run_tag = fold_tag(run_tag.as_deref(), background.as_ref().map(background_slug).as_deref());
     // Recorded as the tokenizer actually in effect, never as "the flag was
     // absent": a results file exists to answer what produced its numbers, and
     // the absence of a flag is a fact about a command line, not about an index.
@@ -375,9 +476,9 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     if cli.follow_up {
         return run_follow_up(FollowUpRunContext {
             golden_set,
-            embedder: &embedder,
-            seeded: &seeded,
-            counter: &counter,
+            embedder,
+            seeded,
+            counter,
             budget,
             lang_by_ref: &lang_by_ref,
             date,
@@ -442,8 +543,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                     }
                 }
             };
-            let ranked_refs: Vec<String> =
-                ids.iter().filter_map(|id| seeded.refs.ref_of(*id)).map(|r| r.to_string()).collect();
+            let ranked_refs = rank_refs(&ids, &seeded.refs, background.is_some());
             let expected: HashSet<String> = ec.expected_refs.iter().cloned().collect();
 
             let recall_1 = metrics::recall_at_k(&ranked_refs, &expected, 1);
@@ -536,6 +636,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             audit: audit_report,
             similarity: similarity_results.clone(),
             agent_view: None,
+            background: background.clone(),
         };
 
         report::print_stdout(&results);
@@ -700,6 +801,7 @@ fn build_agent_view_run_results(
         audit: None,
         similarity: None,
         agent_view: Some(view),
+        background: None,
     }
 }
 
@@ -928,6 +1030,7 @@ fn build_follow_up_run_results(
         audit: None,
         similarity: None,
         agent_view: None,
+        background: None,
     }
 }
 
@@ -1311,10 +1414,14 @@ fn current_date_string() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clawg_core::eval_api::production_lexical_budget;
+    use clawg_core::eval_api::{production_lexical_budget, sha256_hex, EvalIngest};
 
     #[test]
     fn civil_from_days_matches_known_reference_dates() {
@@ -1379,6 +1486,194 @@ mod tests {
 
     fn with_extra_case(golden: &str, case: &str) -> String {
         golden.replacen(r#""retrieval_cases": ["#, &format!(r#""retrieval_cases": [{case},"#), 1)
+    }
+
+    /// `memory.db` of a store holding `texts`, saved through the ingest under
+    /// one agent and closed so the file stands alone, as `clawg backup` leaves
+    /// a snapshot.
+    async fn background_snapshot(texts: &[String]) -> PathBuf {
+        let dir = temp_path("background");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ingest = EvalIngest::open(&dir, &EvalEmbedder::fake(), &dir).await.unwrap();
+        for text in texts {
+            ingest.send("background-agent", text, "semantic_fact", 3.0, 0).await.unwrap();
+        }
+        let runtime = ingest.finish().await.unwrap();
+        runtime.store.conn.clone().close().await.unwrap();
+        dir.join("memory.db")
+    }
+
+    fn background_notes(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("background note {i} on the harbour timetable")).collect()
+    }
+
+    fn sha_of(path: &std::path::Path) -> String {
+        sha256_hex(&std::fs::read(path).unwrap())
+    }
+
+    /// Runs `--fake --background snapshot` on `golden_json` under `tag`,
+    /// writing to `out_dir` and copying the snapshot into `scratch`.
+    async fn run_over(golden_json: &str, snapshot: &std::path::Path, tag: &str, out_dir: &std::path::Path, scratch: &std::path::Path) -> i32 {
+        let golden_path = temp_path(&format!("{tag}-golden.json"));
+        std::fs::write(&golden_path, golden_json).unwrap();
+        let args = [
+            "rag-eval",
+            "--fake",
+            "--golden",
+            &golden_path.to_string_lossy(),
+            "--out",
+            &out_dir.to_string_lossy(),
+            "--tag",
+            tag,
+            "--background",
+            &snapshot.to_string_lossy(),
+        ]
+        .map(str::to_string);
+        let code = run_with_scratch(args.into_iter(), scratch.to_path_buf()).await;
+        std::fs::remove_file(&golden_path).ok();
+        code
+    }
+
+    /// The one results file in `out_dir`, as written and as parsed.
+    fn only_results(out_dir: &std::path::Path) -> (String, String, serde_json::Value) {
+        let files: Vec<PathBuf> = std::fs::read_dir(out_dir).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let raw = std::fs::read_to_string(&files[0]).unwrap();
+        let name = files[0].file_name().unwrap().to_string_lossy().to_string();
+        let json = serde_json::from_str(&raw).unwrap();
+        (name, raw, json)
+    }
+
+    #[tokio::test]
+    async fn a_background_run_leaves_the_snapshot_byte_identical() {
+        let snapshot = background_snapshot(&background_notes(200)).await;
+        let before = sha_of(&snapshot);
+        let (out_dir, scratch) = (temp_path("bg-identical-out"), temp_path("bg-identical-scratch"));
+
+        let code = run_over(sweep_golden_json(), &snapshot, "bg-identical", &out_dir, &scratch).await;
+
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(sha_of(&snapshot), before);
+        assert!(!scratch.exists(), "the copy is removed when the run ends");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn the_background_copy_is_removed_even_when_the_run_fails() {
+        let snapshot = background_snapshot(&background_notes(20)).await;
+        let out_dir = temp_path("bg-fails-out");
+        let first = temp_path("bg-fails-first");
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-fails", &out_dir, &first).await, EXIT_OK);
+
+        let second = temp_path("bg-fails-second");
+        let code = run_over(sweep_golden_json(), &snapshot, "bg-fails", &out_dir, &second).await;
+
+        assert_eq!(code, EXIT_RESULTS_EXISTS, "the second run finds the first one's file after measuring");
+        assert!(!second.exists(), "the copy is removed when the run fails");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_refused_background_exits_with_one_naming_its_cause() {
+        let snapshot = background_snapshot(&background_notes(5)).await;
+        let wal = snapshot.with_file_name("memory.db-wal");
+        std::fs::write(&wal, b"commits the file alone does not have").unwrap();
+        let before = (sha_of(&snapshot), sha_of(&wal));
+        let (out_dir, scratch) = (temp_path("bg-refused-out"), temp_path("bg-refused-scratch"));
+
+        let code = run_over(sweep_golden_json(), &snapshot, "bg-refused", &out_dir, &scratch).await;
+
+        assert_eq!(code, EXIT_RUNTIME_FAILURE);
+        assert_eq!((sha_of(&snapshot), sha_of(&wal)), before);
+        assert!(!scratch.exists());
+        assert!(!out_dir.exists(), "nothing is measured over a refused snapshot");
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_run_without_background_measures_as_before() {
+        let json = run_fake(sweep_golden_json(), "no-background").await;
+
+        assert!(json.get("background").is_none(), "{json}");
+        for case in json["retrieval"]["per_case"].as_array().unwrap() {
+            assert!(case["ranked_refs"].as_array().unwrap().iter().all(|r| r != "bg"), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_report_describes_the_background_without_text() {
+        let snapshot = background_snapshot(&background_notes(200)).await;
+        let (out_dir, scratch) = (temp_path("bg-report-out"), temp_path("bg-report-scratch"));
+
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-report", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, raw, json) = only_results(&out_dir);
+        let background = &json["background"];
+        assert_eq!(background["path"], snapshot.to_string_lossy().as_ref());
+        assert_eq!(background["sha256"], sha_of(&snapshot));
+        assert_eq!(background["contract"]["model_id"], "fake-embedder");
+        assert_eq!(background["schema"]["from"], background["schema"]["to"]);
+        assert!(background["searched_at_ms"].as_i64().unwrap() > 0, "{background}");
+        assert_eq!(background["composition"]["rows"], 200);
+        assert_eq!(background["composition"]["by_agent"], serde_json::json!([{"value": "background-agent", "rows": 200}]));
+        assert_eq!(background["golden_twins"], serde_json::json!([]));
+        assert!(!raw.contains("harbour timetable"), "no text of the background reaches the results");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_golden_row_also_in_the_background_is_named_a_twin() {
+        let mut texts = background_notes(20);
+        texts.push("the retrieval decay term compares milliseconds against seconds".to_string());
+        let snapshot = background_snapshot(&texts).await;
+        let (out_dir, scratch) = (temp_path("bg-twin-out"), temp_path("bg-twin-scratch"));
+
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-twin", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, _, json) = only_results(&out_dir);
+        assert_eq!(json["background"]["golden_twins"], serde_json::json!(["c1"]));
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn the_results_file_with_a_background_holds_no_stored_text() {
+        let snapshot = background_snapshot(&background_notes(30)).await;
+        let (out_dir, scratch) = (temp_path("bg-file-out"), temp_path("bg-file-scratch"));
+
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-file", &out_dir, &scratch).await, EXIT_OK);
+
+        let (name, raw, json) = only_results(&out_dir);
+        assert!(name.contains(&format!("bg-file-bg-{}", &sha_of(&snapshot)[..8])), "{name}");
+        assert!(!raw.contains("harbour timetable"));
+        for case in json["retrieval"]["per_case"].as_array().unwrap() {
+            for r in case["ranked_refs"].as_array().unwrap() {
+                assert!(["c1", "c2", "c3", "bg"].contains(&r.as_str().unwrap()), "a ranked ref is a golden ref or bg: {r}");
+            }
+        }
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_background_hit_ranked_first_keeps_its_place() {
+        let mut texts = background_notes(20);
+        texts.push("the retrieval decay term compares milliseconds against seconds".to_string());
+        let snapshot = background_snapshot(&texts).await;
+        let (out_dir, scratch) = (temp_path("bg-first-out"), temp_path("bg-first-scratch"));
+
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-first", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, _, json) = only_results(&out_dir);
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["ranked_refs"][0], "bg", "{case}");
+        assert_eq!(case["ranked_refs"][1], "c1", "{case}");
+        assert_eq!(case["recall@1"], 0.0);
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
     }
 
     #[tokio::test]
