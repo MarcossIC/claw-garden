@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
@@ -35,9 +36,15 @@ use crate::memory::embedder::{E5Embedder, Embedder, FakeEmbedder};
 /// without reaching into the private `memory` module tree.
 pub use crate::memory::embedder::EmbedRole;
 use crate::memory::events::{MemoryEvent, MemorySource};
-use crate::memory::merge::canonical;
+use crate::memory::language;
+use crate::memory::merge::{canonical, canonical_in};
 use crate::memory::model_download;
+use crate::memory::pieces::read_links;
 use crate::memory::project_docs;
+use crate::memory::prompt_builder::LAST_SESSION_SQL;
+use crate::memory::registry::{
+    resolve_project, Refusal as ResolveRefusal, ResolveError as RegistryResolveError, ResolveOptions,
+};
 use crate::memory::score::{ImportanceFactor, ScoringConfig};
 use crate::memory::search::{lexical_channel_only, search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
@@ -367,6 +374,12 @@ impl EvalStore {
     /// What the live rows of the store are, in counts and names.
     pub async fn composition(&self) -> Result<EvalComposition, EvalError> {
         self.0.conn.call(|c| composition_in(c)).await.map_err(|e| EvalError::Read(e.to_string()))
+    }
+
+    /// The project and the expected saves of each case in this store, read
+    /// once before anything is measured.
+    pub async fn resolve_cases(&self, cases: &[EvalCaseRef]) -> Result<Vec<EvalResolved>, EvalResolveError> {
+        resolve_cases_in(&self.0, cases).await
     }
 
     /// Row ids for `query_text` ranked by the lexical channel alone (bm25 over
@@ -1270,12 +1283,178 @@ fn composition_in(c: &rusqlite::Connection) -> rusqlite::Result<EvalComposition>
     })
 }
 
+/// A case of a golden set as a store reads it: the project it names, by id
+/// or by the name of one live project, and the saves it expects, by the
+/// origin an import recorded in `created_by_ref`. Ids and pieces change from
+/// one import of an export to the next; the origin and the name do not.
+#[derive(Debug, Clone)]
+pub struct EvalCaseRef {
+    pub id: String,
+    pub project: Option<String>,
+    pub origins: Vec<String>,
+}
+
+/// What a case's references are in one store.
+#[derive(Debug, Clone)]
+pub struct EvalResolved {
+    /// This store's own id of the project the case names, past its merges.
+    pub project_id: Option<String>,
+    /// One per origin, in the case's order.
+    pub expected: Vec<EvalExpectedSave>,
+}
+
+/// The live rows an import of one origin wrote. A hit on any of them finds
+/// the save.
+#[derive(Debug, Clone)]
+pub struct EvalExpectedSave {
+    pub origin: String,
+    /// By save, then by piece.
+    pub rows: Vec<i64>,
+    pub memory_type: String,
+    /// `memory.lang` of its first piece, or what the detector reads in its
+    /// text when the maintenance pass has not classified it yet.
+    pub lang: String,
+    /// Its pieces joined as `read_memory` joins them.
+    pub text: String,
+    /// Whether it is the summary LAST SESSION opens a context of the case's
+    /// project with.
+    pub is_last_summary: bool,
+}
+
+/// Why a golden set does not hold over a store.
+#[derive(Debug, thiserror::Error)]
+pub enum EvalResolveError {
+    #[error("case {case}: no live project is named {name:?}")]
+    UnknownProject { case: String, name: String },
+    #[error("case {case}: {name:?} names more than one live project ({})", .candidates.join(", "))]
+    AmbiguousProject { case: String, name: String, candidates: Vec<String> },
+    #[error("case {case}: {name:?} leads to a deleted project")]
+    DeletedProject { case: String, name: String },
+    #[error("case {case}: no live row was imported from {origin}")]
+    NoLiveRow { case: String, origin: String },
+    #[error("case {case}: rows imported from {origin} are outside the project {project}")]
+    OutsideProject { case: String, origin: String, project: String },
+    #[error("failed to read the store: {0}")]
+    Store(String),
+}
+
+async fn resolve_cases_in(store: &MemoryStore, cases: &[EvalCaseRef]) -> Result<Vec<EvalResolved>, EvalResolveError> {
+    let mut resolved = Vec::with_capacity(cases.len());
+    for case in cases {
+        let project_id = match &case.project {
+            Some(name) => Some(case_project(store, &case.id, name).await?),
+            None => None,
+        };
+        let mut expected = Vec::with_capacity(case.origins.len());
+        for origin in &case.origins {
+            let (id, origin, project) = (case.id.clone(), origin.clone(), project_id.clone());
+            let save = store
+                .conn
+                .call(move |c| Ok(expected_save_in(c, &id, &origin, project.as_deref())))
+                .await
+                .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| EvalResolveError::Store(e.to_string()))??;
+            expected.push(save);
+        }
+        resolved.push(EvalResolved { project_id, expected });
+    }
+    Ok(resolved)
+}
+
+/// The project `name` leads to, as the `project` argument of a tool reads it,
+/// without creating one.
+async fn case_project(store: &MemoryStore, case: &str, name: &str) -> Result<String, EvalResolveError> {
+    let unknown = || EvalResolveError::UnknownProject { case: case.to_string(), name: name.to_string() };
+    let resolution = match resolve_project(store, name, ResolveOptions::default()).await {
+        Ok(resolution) => resolution,
+        Err(RegistryResolveError::Name(_)) => return Err(unknown()),
+        Err(e) => return Err(EvalResolveError::Store(e.to_string())),
+    };
+    match (resolution.refused, resolution.project_id) {
+        (Some(ResolveRefusal::Ambiguous), _) => Err(EvalResolveError::AmbiguousProject {
+            case: case.to_string(),
+            name: name.to_string(),
+            candidates: resolution.candidates.into_iter().map(|c| c.id).collect(),
+        }),
+        (Some(_), _) | (None, None) => Err(unknown()),
+        (None, Some(_)) if resolution.deleted => {
+            Err(EvalResolveError::DeletedProject { case: case.to_string(), name: name.to_string() })
+        }
+        (None, Some(id)) => Ok(id),
+    }
+}
+
+/// The live rows an import of `origin` wrote, which a search can return, and
+/// whether they are within what a search under `project` reads: its own
+/// rows, the rows without one and every `user_preference`.
+fn expected_save_in(
+    c: &rusqlite::Connection,
+    case: &str,
+    origin: &str,
+    project: Option<&str>,
+) -> Result<EvalExpectedSave, EvalResolveError> {
+    let store = |e: rusqlite::Error| EvalResolveError::Store(e.to_string());
+    type Row = (i64, Option<String>, String, Option<String>, String);
+    let mut stmt = c
+        .prepare(
+            "SELECT id, project_id, memory_type, lang, content FROM memory \
+             WHERE source = 'import' AND created_by_ref = ?1 \
+               AND deleted_at IS NULL AND status IN ('active', 'disputed')",
+        )
+        .map_err(store)?;
+    let mut rows: Vec<Row> = stmt
+        .query_map([origin], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .map_err(store)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(store)?;
+    if rows.is_empty() {
+        return Err(EvalResolveError::NoLiveRow { case: case.to_string(), origin: origin.to_string() });
+    }
+    if let Some(project) = project {
+        for (_, row_project, memory_type, ..) in &rows {
+            let Some(row_project) = row_project else { continue };
+            if memory_type != "user_preference" && canonical_in(c, row_project).map_err(store)? != project {
+                return Err(EvalResolveError::OutsideProject {
+                    case: case.to_string(),
+                    origin: origin.to_string(),
+                    project: project.to_string(),
+                });
+            }
+        }
+    }
+
+    let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let links = read_links(c, &ids).map_err(store)?;
+    let save = |id: i64| links.get(&id).map_or((false, id), |l| (true, l.save_id));
+    rows.sort_by_key(|r| (save(r.0), links.get(&r.0).map_or(1, |l| l.position.piece)));
+    let text = rows
+        .chunk_by(|a, b| save(a.0) == save(b.0))
+        .map(|pieces| crate::memory::pieces::join_pieces(&pieces.iter().map(|r| r.4.as_str()).collect::<Vec<_>>()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let memory_type = rows[0].2.clone();
+    let lang = rows[0].3.clone().unwrap_or_else(|| language::column_value(language::detect(&text)).to_string());
+    let is_last_summary = memory_type == "session_summary"
+        && c.query_row(LAST_SESSION_SQL, [project], |r| r.get::<_, i64>(0))
+            .optional()
+            .map_err(store)?
+            .is_some_and(|last| ids.contains(&last));
+    Ok(EvalExpectedSave {
+        origin: origin.to_string(),
+        rows: rows.iter().map(|r| r.0).collect(),
+        memory_type,
+        lang,
+        text,
+        is_last_summary,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::backup::{latest_known, read_history};
     use crate::memory::db::{seed_on_disk, StoredContract};
     use crate::memory::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
+    use crate::memory::pieces::StoredPiece;
 
     #[test]
     fn into_search_scope_maps_lexical_through_unchanged() {
@@ -2428,6 +2607,150 @@ mod tests {
         let refused = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await;
 
         assert!(matches!(&refused, Err(EvalError::Open(e)) if e.contains("placed-by-first-word")), "{:?}", refused.err());
+    }
+
+    // --- resolve_cases ----------------------------------------------------
+
+    fn case(project: Option<&str>, origins: &[&str]) -> EvalCaseRef {
+        EvalCaseRef {
+            id: "c1".to_string(),
+            project: project.map(str::to_string),
+            origins: origins.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    async fn run_sql(store: &EvalStore, statements: String) {
+        store.0.conn.call(move |c| c.execute_batch(&statements)).await.unwrap();
+    }
+
+    /// Marks `ids` as the rows an import of `origin` wrote.
+    async fn imported_from(store: &EvalStore, origin: &str, ids: &[i64]) {
+        let ids = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+        run_sql(store, format!("UPDATE memory SET source = 'import', created_by_ref = '{origin}' WHERE id IN ({ids})"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_project_name_resolves_to_each_backgrounds_own_id() {
+        for id in ["app-1111", "app-2222"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = EvalStore::open(dir.path()).await.unwrap();
+            put_row(&store, Some("a"), Some(id), MemoryType::SemanticFact, "a row of the app", at_cosine(0.9)).await;
+            run_sql(&store, format!("UPDATE project SET name = 'App' WHERE id = '{id}'")).await;
+
+            let resolved = store.resolve_cases(&[case(Some("app"), &[])]).await.unwrap();
+
+            assert_eq!(resolved[0].project_id.as_deref(), Some(id));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_or_unknown_project_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        for id in ["app-1111", "app-2222", "gone-3333"] {
+            put_row(&store, Some("a"), Some(id), MemoryType::SemanticFact, &format!("a row of {id}"), at_cosine(0.9)).await;
+        }
+        run_sql(
+            &store,
+            "UPDATE project SET name = 'App' WHERE id IN ('app-1111', 'app-2222'); \
+             UPDATE project SET deleted_at = 1 WHERE id = 'gone-3333';"
+                .to_string(),
+        )
+        .await;
+
+        let ambiguous = store.resolve_cases(&[case(Some("APP"), &[])]).await.unwrap_err();
+        assert!(matches!(&ambiguous, EvalResolveError::AmbiguousProject { case, .. } if case == "c1"), "{ambiguous:?}");
+        let unknown = store.resolve_cases(&[case(Some("nowhere"), &[])]).await.unwrap_err();
+        assert!(matches!(unknown, EvalResolveError::UnknownProject { .. }), "{unknown:?}");
+        let deleted = store.resolve_cases(&[case(Some("gone-3333"), &[])]).await.unwrap_err();
+        assert!(matches!(deleted, EvalResolveError::DeletedProject { .. }), "{deleted:?}");
+        assert!(deleted.to_string().contains("c1"), "{deleted}");
+    }
+
+    #[tokio::test]
+    async fn an_origin_resolves_to_every_live_piece_of_its_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let texts = [
+            "The ferry to the island leaves at nine in the morning from the north pier, and the return is at six.",
+            "and the return is at six in the evening, but on the weekends there is a second one that leaves at noon.",
+            "that leaves at noon and comes back with the last of the tourists who stayed for the market in the square.",
+        ];
+        let mut pieces = Vec::new();
+        for text in texts {
+            pieces.push(put_row(&store, Some("migrated"), Some("p"), MemoryType::SemanticFact, text, at_cosine(0.9)).await);
+        }
+        store
+            .0
+            .link_pieces(pieces.iter().map(|&memory_id| StoredPiece { memory_id, context: String::new() }).collect())
+            .await
+            .unwrap();
+        imported_from(&store, "engram:ferry", &pieces).await;
+        let native = put_row(&store, Some("claude-code"), Some("p"), MemoryType::SemanticFact, "a native row", at_cosine(0.8)).await;
+        run_sql(&store, format!("UPDATE memory SET created_by_ref = 'engram:ferry' WHERE id = {native}")).await;
+
+        let resolved = store.resolve_cases(&[case(Some("p"), &["engram:ferry"])]).await.unwrap();
+
+        let save = &resolved[0].expected[0];
+        assert_eq!(save.rows, pieces);
+        assert_eq!(save.memory_type, "semantic_fact");
+        assert_eq!(save.text, join_pieces(&texts));
+        assert_eq!(save.lang, "en");
+        assert!(!save.is_last_summary);
+    }
+
+    #[tokio::test]
+    async fn an_origin_without_a_live_row_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let replaced = put_row(&store, Some("migrated"), None, MemoryType::SemanticFact, "an older note", at_cosine(0.9)).await;
+        imported_from(&store, "engram:old", &[replaced]).await;
+        run_sql(&store, format!("UPDATE memory SET status = 'superseded' WHERE id = {replaced}")).await;
+
+        for origin in ["engram:missing", "engram:old"] {
+            let refused = store.resolve_cases(&[case(None, &[origin])]).await.unwrap_err();
+
+            assert!(matches!(&refused, EvalResolveError::NoLiveRow { origin: o, .. } if o == origin), "{refused:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expected_save_outside_the_case_project_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let fact = MemoryType::SemanticFact;
+        put_row(&store, Some("a"), Some("p"), fact, "a row of p", at_cosine(0.9)).await;
+        let in_q = put_row(&store, Some("migrated"), Some("q"), fact, "a row of q", at_cosine(0.9)).await;
+        let preference =
+            put_row(&store, Some("migrated"), Some("q"), MemoryType::UserPreference, "a preference of q", at_cosine(0.9)).await;
+        let unscoped = put_row(&store, Some("migrated"), None, fact, "a row of none", at_cosine(0.9)).await;
+        imported_from(&store, "engram:q", &[in_q]).await;
+        imported_from(&store, "engram:preference", &[preference]).await;
+        imported_from(&store, "engram:none", &[unscoped]).await;
+
+        let refused = store.resolve_cases(&[case(Some("p"), &["engram:q"])]).await.unwrap_err();
+        assert!(matches!(refused, EvalResolveError::OutsideProject { .. }), "{refused:?}");
+
+        let read = store.resolve_cases(&[case(Some("p"), &["engram:preference", "engram:none"])]).await.unwrap();
+        assert_eq!(read[0].expected.len(), 2);
+        assert!(store.resolve_cases(&[case(None, &["engram:q"])]).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_resolved_save_says_whether_it_is_the_last_summary_of_its_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let summary = MemoryType::SessionSummary;
+        let older = put_row(&store, Some("migrated"), Some("p"), summary, "the older session", at_cosine(0.9)).await;
+        let newer = put_row(&store, Some("migrated"), Some("p"), summary, "the newer session", at_cosine(0.9)).await;
+        imported_from(&store, "engram:older", &[older]).await;
+        imported_from(&store, "engram:newer", &[newer]).await;
+        run_sql(&store, format!("UPDATE memory SET created_at = created_at - 86400000 WHERE id = {older}")).await;
+
+        let resolved = store.resolve_cases(&[case(Some("p"), &["engram:older", "engram:newer"])]).await.unwrap();
+
+        assert_eq!(resolved[0].expected.iter().map(|s| s.is_last_summary).collect::<Vec<_>>(), vec![false, true]);
     }
 
     #[tokio::test]

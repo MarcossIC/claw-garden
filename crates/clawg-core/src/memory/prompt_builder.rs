@@ -857,7 +857,7 @@ fn format_conflict_block(lang: Lang, pairs: &[ConflictPair], hit_positions: &Has
 /// not this project's last session. Authors are checked by the caller, which
 /// stops at the first readable row. `IS` rather than an `OR` of the value and
 /// the NULL case, which the planner does not take to `idx_memory_session_summary`.
-const LAST_SESSION_SQL: &str = "
+pub(crate) const LAST_SESSION_SQL: &str = "
     SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key, project_id
     FROM memory
     WHERE memory_type = 'session_summary'
