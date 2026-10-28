@@ -496,19 +496,26 @@ pub fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The `-wal` beside `path` when it holds commits, read from its size alone:
+/// the file it sits beside lacks them, so a copy of that file alone is not the
+/// store that wrote them.
+pub(crate) fn wal_with_commits(path: &Path) -> Option<PathBuf> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0).then_some(wal)
+}
+
 /// Whether `path` is a whole clawg store this binary can open, read without
-/// writing to it.
-fn check_restorable(path: &Path) -> Result<(), BackupError> {
+/// writing to it, and what opening it would do to its schema.
+pub(crate) fn check_restorable(path: &Path) -> Result<SchemaPlan, BackupError> {
     let unusable = |reason: String| BackupError::Unusable { path: path.to_path_buf(), reason };
     if !path.is_file() {
         return Err(unusable("there is no such file".into()));
     }
     // Opened here, the file reads with its WAL folded in, but only the file is
     // copied in: what the WAL holds would pass every check and then be gone.
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    let wal = PathBuf::from(wal);
-    if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+    if let Some(wal) = wal_with_commits(path) {
         return Err(unusable(format!(
             "{} beside it holds commits the file alone does not have, and only the file is restored; \
              restore a snapshot `clawg backup` wrote, or copy the store again with nothing using it",
@@ -536,7 +543,7 @@ fn check_restorable(path: &Path) -> Result<(), BackupError> {
         SchemaPlan::Diverged { version } => Err(unusable(format!(
             "its migration V{version} does not match this clawg build"
         ))),
-        SchemaPlan::UpToDate | SchemaPlan::Pending { .. } => Ok(()),
+        plan @ (SchemaPlan::UpToDate | SchemaPlan::Pending { .. }) => Ok(plan),
     }
 }
 

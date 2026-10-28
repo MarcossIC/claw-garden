@@ -433,7 +433,7 @@ impl Has {
 
 const LIVE: &str = "deleted_at IS NULL AND status <> 'superseded'";
 
-fn contract(c: &Connection) -> rusqlite::Result<Option<StoredContract>> {
+pub(crate) fn contract(c: &Connection) -> rusqlite::Result<Option<StoredContract>> {
     c.query_row(
         "SELECT model_id, dim, query_prefix, passage_prefix FROM embedding_contract WHERE id = 1",
         [],

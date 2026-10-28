@@ -17,7 +17,7 @@
 //! Compiled only when the `eval` feature is enabled, so the shipped
 //! application's public surface is unchanged by this module's existence.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -25,7 +25,9 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
 use crate::memory::access::AccessTracker;
-use crate::memory::db::MemoryStore;
+use crate::memory::backup::{check_restorable, known_migrations, open_for_probe, wal_with_commits, BackupError, SchemaPlan};
+use crate::memory::bootstrap::is_pooling_upgrade;
+use crate::memory::db::{differing_fields, ContractStatus, EmbeddingIdentity, MemoryStore, StoredContract};
 use crate::memory::chunker::token_splitter::TokenSplitter;
 use crate::memory::embedder::{E5Embedder, Embedder, FakeEmbedder};
 
@@ -235,6 +237,10 @@ pub enum EvalError {
     UnknownTokenizer(String),
     #[error("failed to recreate memory_fts: {0}")]
     RecreateFts(String),
+    #[error("failed to read the store: {0}")]
+    Read(String),
+    #[error("cannot measure over the snapshot: {0}")]
+    Background(#[from] BackgroundRefusal),
 }
 
 /// Tokenizer strings [`EvalStore::recreate_fts_with_tokenizer`] accepts — an
@@ -356,6 +362,11 @@ impl EvalStore {
                 distance: h.distance,
             })
             .collect())
+    }
+
+    /// What the live rows of the store are, in counts and names.
+    pub async fn composition(&self) -> Result<EvalComposition, EvalError> {
+        self.0.conn.call(|c| composition_in(c)).await.map_err(|e| EvalError::Read(e.to_string()))
     }
 
     /// Row ids for `query_text` ranked by the lexical channel alone (bm25 over
@@ -581,6 +592,19 @@ impl EvalIngest {
             .await
             .map_err(|e| EvalError::Open(e.to_string()))?;
         let _ = runtime.embedder.set(embedder.0.clone());
+        // Written as the daemon writes it when its model loads, so a store
+        // made here serves as a snapshot; one of another model is refused.
+        let status = runtime
+            .store
+            .ensure_embedding_contract(EmbeddingIdentity::of(embedder.0.as_ref()))
+            .await
+            .map_err(|e| EvalError::Open(e.to_string()))?;
+        if let ContractStatus::Mismatch { stored, actual } = status {
+            return Err(EvalError::Open(format!(
+                "its vectors are of another model ({})",
+                differing_fields(&stored, &actual).join("; ")
+            )));
+        }
         runtime.access_tracker = Arc::new(AccessTracker::inert());
 
         let (tx, rx) = tokio::sync::mpsc::channel(INGEST_QUEUE_CAPACITY);
@@ -1032,18 +1056,226 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     h.update(bytes);
-    let out = h.finalize();
-    let mut s = String::with_capacity(out.len() * 2);
-    for b in out {
+    hex(&h.finalize())
+}
+
+fn hex(digest: &[u8]) -> String {
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
     }
     s
 }
 
+/// Why a snapshot cannot be measured over. Each is decided before anything
+/// opens its copy for writing, so neither the snapshot nor the copy changed.
+#[derive(Debug, thiserror::Error)]
+pub enum BackgroundRefusal {
+    #[error(
+        "{} beside it holds commits the file alone does not have; measure a snapshot `clawg backup` wrote",
+        .0.display()
+    )]
+    WalWithCommits(PathBuf),
+    #[error("{0}")]
+    Unusable(String),
+    #[error("it has no embedding contract, so nothing says which model made its vectors")]
+    NoContract,
+    #[error("{}", contract_refusal(.differing, *.pooling_upgrade))]
+    Contract { differing: Vec<String>, pooling_upgrade: bool },
+}
+
+fn contract_refusal(differing: &[String], pooling_upgrade: bool) -> String {
+    if pooling_upgrade {
+        "its vectors were pooled by CLS; open it once with the daemon, which embeds them again by mean, \
+         and back it up again"
+            .to_string()
+    } else {
+        format!("its vectors are of another model ({})", differing.join("; "))
+    }
+}
+
+/// The embedding contract a snapshot was written under.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalContract {
+    pub model_id: String,
+    pub dim: i64,
+    pub query_prefix: String,
+    pub passage_prefix: String,
+}
+
+/// A snapshot copied for a measurement: its digest, the schema opening the
+/// copy migrates it from and to, and the contract of its vectors.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalBackground {
+    pub sha256: String,
+    pub schema_from: i32,
+    pub schema_to: i32,
+    pub contract: EvalContract,
+}
+
+/// Copies the snapshot `snapshot` to `dir/memory.db` and decides, before
+/// anything opens the copy for writing, whether it can be measured over: no
+/// `-wal` with commits beside it, a whole clawg store this binary opens (the
+/// rule of `clawg restore`) and vectors of `embedder`'s model. The snapshot
+/// itself is only read as a file, since a read-only connection still creates
+/// files beside a store in WAL mode. Nothing refused is repaired or embedded
+/// again; a store of an older schema is migrated when the copy is opened, as
+/// the daemon would migrate it.
+pub fn copy_background(snapshot: &Path, dir: &Path, embedder: &EvalEmbedder) -> Result<EvalBackground, EvalError> {
+    if let Some(wal) = wal_with_commits(snapshot) {
+        return Err(BackgroundRefusal::WalWithCommits(wal).into());
+    }
+    let copy = dir.join("memory.db");
+    let sha256 =
+        copy_hashing(snapshot, &copy).map_err(|e| BackgroundRefusal::Unusable(format!("it could not be copied: {e}")))?;
+    let plan = check_restorable(&copy).map_err(|e| {
+        BackgroundRefusal::Unusable(match e {
+            BackupError::Unusable { reason, .. } => reason,
+            other => other.to_string(),
+        })
+    })?;
+    let binary = known_migrations().iter().map(|m| m.version).max().unwrap_or(0);
+    let (schema_from, schema_to) = match plan {
+        SchemaPlan::Pending { from, to } => (from, to),
+        _ => (binary, binary),
+    };
+    let stored = stored_contract(&copy).map_err(|e| BackgroundRefusal::Unusable(e.to_string()))?;
+    let contract = background_contract(stored.as_ref(), &EmbeddingIdentity::of(embedder.0.as_ref()))?;
+    Ok(EvalBackground {
+        sha256,
+        schema_from,
+        schema_to,
+        contract: EvalContract {
+            model_id: contract.model_id.clone(),
+            dim: contract.dim,
+            query_prefix: contract.query_prefix.clone(),
+            passage_prefix: contract.passage_prefix.clone(),
+        },
+    })
+}
+
+/// Copies `from` to the new file `to` in one read, hashing what it copies.
+fn copy_hashing(from: &Path, to: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::{Read, Write};
+    let mut input = std::fs::File::open(from)?;
+    let mut output = std::fs::File::create_new(to)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        output.write_all(&buf[..n])?;
+    }
+    output.sync_all()?;
+    Ok(hex(&hasher.finalize()))
+}
+
+/// The contract of the store at `path`, read without writing; none for a
+/// store from before the table.
+fn stored_contract(path: &Path) -> rusqlite::Result<Option<StoredContract>> {
+    let c = open_for_probe(path)?;
+    let has_table: bool = c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_contract')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_table {
+        crate::memory::inspect::contract(&c)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether vectors stored under `stored` are `actual`'s. A store the daemon
+/// would embed again by mean is named as such, since opening it once with the
+/// daemon is the way to measure it.
+fn background_contract<'a>(
+    stored: Option<&'a StoredContract>,
+    actual: &EmbeddingIdentity,
+) -> Result<&'a StoredContract, BackgroundRefusal> {
+    let stored = stored.ok_or(BackgroundRefusal::NoContract)?;
+    let differing = differing_fields(stored, actual);
+    if differing.is_empty() {
+        Ok(stored)
+    } else {
+        Err(BackgroundRefusal::Contract { pooling_upgrade: is_pooling_upgrade(stored, actual), differing })
+    }
+}
+
+/// How many live rows of a store hold one value of a column, NULL first.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalCount {
+    pub value: Option<String>,
+    pub rows: u64,
+}
+
+/// Where the live rows another tool's project gave are: the name of the
+/// project they are in, none for the rows without one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalPlacement {
+    pub origin_project: String,
+    pub project: Option<String>,
+    pub rows: u64,
+}
+
+/// The live rows of a store (those a search can return) in counts and names
+/// alone, never a text, a row id or a key.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalComposition {
+    pub rows: u64,
+    pub by_type: Vec<EvalCount>,
+    pub by_agent: Vec<EvalCount>,
+    pub by_lang: Vec<EvalCount>,
+    pub by_source: Vec<EvalCount>,
+    /// By the name of the project, the rows without one under none.
+    pub by_project: Vec<EvalCount>,
+    pub placement: Vec<EvalPlacement>,
+}
+
+const LIVE_ROW: &str = "m.deleted_at IS NULL AND m.status IN ('active', 'disputed')";
+const PROJECT_NAME: &str = "CASE WHEN m.project_id IS NULL THEN NULL ELSE COALESCE(p.name, m.project_id) END";
+
+fn composition_in(c: &rusqlite::Connection) -> rusqlite::Result<EvalComposition> {
+    let by = |column: &str| -> rusqlite::Result<Vec<EvalCount>> {
+        let mut stmt = c.prepare(&format!(
+            "SELECT {column}, COUNT(*) FROM memory m LEFT JOIN project p ON p.id = m.project_id \
+             WHERE {LIVE_ROW} GROUP BY 1 ORDER BY 1"
+        ))?;
+        let counts = stmt.query_map([], |r| Ok(EvalCount { value: r.get(0)?, rows: r.get::<_, i64>(1)? as u64 }))?;
+        counts.collect()
+    };
+    let by_type = by("m.memory_type")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT m.origin_project, {PROJECT_NAME}, COUNT(*) FROM memory m LEFT JOIN project p ON p.id = m.project_id \
+         WHERE {LIVE_ROW} AND m.origin_project IS NOT NULL GROUP BY 1, 2 ORDER BY 1, 2"
+    ))?;
+    let placement = stmt
+        .query_map([], |r| {
+            Ok(EvalPlacement { origin_project: r.get(0)?, project: r.get(1)?, rows: r.get::<_, i64>(2)? as u64 })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(EvalComposition {
+        rows: by_type.iter().map(|c| c.rows).sum(),
+        by_type,
+        by_agent: by("m.agent_id")?,
+        by_lang: by("m.lang")?,
+        by_source: by("m.source")?,
+        by_project: by(PROJECT_NAME)?,
+        placement,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::backup::{latest_known, read_history};
+    use crate::memory::db::{seed_on_disk, StoredContract};
+    use crate::memory::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
 
     #[test]
     fn into_search_scope_maps_lexical_through_unchanged() {
@@ -1990,6 +2222,212 @@ mod tests {
         for (d, o) in daemons.iter().zip(&own) {
             assert!((d.score - o.score).abs() < 1e-9, "{} scored {} and {}", d.id, d.score, o.score);
         }
+    }
+
+    // --- copy_background --------------------------------------------------
+
+    fn fake_identity() -> EmbeddingIdentity {
+        EmbeddingIdentity::of(EvalEmbedder::fake().0.as_ref())
+    }
+
+    /// `memory.db` in `dir`, migrated up to `target` with one row and the
+    /// embedding contract of `identity`, standing alone as a snapshot does.
+    async fn snapshot_in(dir: &Path, target: Option<i32>, identity: Option<&EmbeddingIdentity>) -> PathBuf {
+        seed_on_disk(dir, target).await;
+        let path = dir.join("memory.db");
+        if let Some(id) = identity {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO embedding_contract \
+                     (id, model_id, dim, metric, normalized, query_prefix, passage_prefix, created_at) \
+                     VALUES (1, ?1, ?2, 'cosine', 1, ?3, ?4, 0)",
+                    rusqlite::params![id.model_id, id.dim as i64, id.query_prefix, id.passage_prefix],
+                )
+                .unwrap();
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_with_a_nonempty_wal_is_refused_untouched() {
+        let at = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_in(at.path(), None, Some(&fake_identity())).await;
+        let wal = at.path().join("memory.db-wal");
+        std::fs::write(&wal, b"commits the file alone does not have").unwrap();
+        let before = (std::fs::read(&snapshot).unwrap(), std::fs::read(&wal).unwrap());
+        let copy = tempfile::tempdir().unwrap();
+
+        let refused = copy_background(&snapshot, copy.path(), &EvalEmbedder::fake()).unwrap_err();
+
+        assert!(
+            matches!(&refused, EvalError::Background(BackgroundRefusal::WalWithCommits(p)) if *p == wal),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().contains("memory.db-wal"), "{refused}");
+        assert_eq!((std::fs::read(&snapshot).unwrap(), std::fs::read(&wal).unwrap()), before);
+        assert!(!copy.path().join("memory.db").exists());
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_of_another_embedding_contract_is_refused_untouched() {
+        let other = EmbeddingIdentity { model_id: "another-model".to_string(), ..fake_identity() };
+        for (identity, cause) in [(Some(other), "another-model"), (None, "no embedding contract")] {
+            let at = tempfile::tempdir().unwrap();
+            let snapshot = snapshot_in(at.path(), None, identity.as_ref()).await;
+            let before = std::fs::read(&snapshot).unwrap();
+            let copy = tempfile::tempdir().unwrap();
+
+            let refused = copy_background(&snapshot, copy.path(), &EvalEmbedder::fake()).unwrap_err();
+
+            assert!(matches!(refused, EvalError::Background(_)), "{refused:?}");
+            assert!(refused.to_string().contains(cause), "{refused}");
+            assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+            assert_eq!(std::fs::read(copy.path().join("memory.db")).unwrap(), before, "the copy was written to");
+        }
+    }
+
+    #[test]
+    fn background_contract_names_a_cls_store_and_what_differs() {
+        let actual = EmbeddingIdentity {
+            model_id: E5_MODEL_ID.to_string(),
+            dim: 384,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+        let stored = |model_id: &str, dim: i64| StoredContract {
+            model_id: model_id.to_string(),
+            dim,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+
+        assert!(background_contract(Some(&stored(E5_MODEL_ID, 384)), &actual).is_ok());
+        let cls = background_contract(Some(&stored(LEGACY_CLS_MODEL_ID, 384)), &actual).unwrap_err();
+        assert!(matches!(cls, BackgroundRefusal::Contract { pooling_upgrade: true, .. }), "{cls:?}");
+        assert!(cls.to_string().contains("CLS") && cls.to_string().contains("daemon"), "{cls}");
+        let other = background_contract(Some(&stored("another", 768)), &actual).unwrap_err();
+        assert!(
+            matches!(&other, BackgroundRefusal::Contract { pooling_upgrade: false, differing } if differing.len() == 2),
+            "{other:?}"
+        );
+        assert!(matches!(background_contract(None, &actual), Err(BackgroundRefusal::NoContract)));
+    }
+
+    #[tokio::test]
+    async fn a_newer_schema_snapshot_is_refused() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let damaged = elsewhere.path().join("notes.db");
+        std::fs::write(&damaged, "not a database at all, just some words").unwrap();
+        let foreign = elsewhere.path().join("foreign.db");
+        rusqlite::Connection::open(&foreign).unwrap().execute_batch("CREATE TABLE x (y)").unwrap();
+        let newer_dir = tempfile::tempdir().unwrap();
+        let newer = snapshot_in(newer_dir.path(), None, Some(&fake_identity())).await;
+        rusqlite::Connection::open(&newer)
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES ({}, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                latest_known() + 1
+            ))
+            .unwrap();
+
+        for (file, cause) in [(&damaged, "not a database"), (&foreign, "no clawg migration history"), (&newer, "newer than")] {
+            let before = std::fs::read(file).unwrap();
+            let copy = tempfile::tempdir().unwrap();
+
+            let refused = copy_background(file, copy.path(), &EvalEmbedder::fake()).unwrap_err();
+
+            assert!(matches!(refused, EvalError::Background(BackgroundRefusal::Unusable(_))), "{refused:?}");
+            assert!(refused.to_string().contains(cause), "{refused}");
+            assert_eq!(std::fs::read(file).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_schema_snapshot_is_migrated_in_the_copy() {
+        let at = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_in(at.path(), Some(26), Some(&fake_identity())).await;
+        let before = std::fs::read(&snapshot).unwrap();
+        let copy = tempfile::tempdir().unwrap();
+
+        let background = copy_background(&snapshot, copy.path(), &EvalEmbedder::fake()).unwrap();
+
+        assert_eq!((background.schema_from, background.schema_to), (26, latest_known()));
+        assert_eq!(background.sha256, sha256_hex(&before));
+        assert_eq!(background.contract.model_id, fake_identity().model_id);
+        let store = EvalStore::open(copy.path()).await.unwrap();
+        let applied = store.0.conn.call(|c| -> rusqlite::Result<_> { read_history(c) }).await.unwrap();
+        assert_eq!(applied.iter().map(|m| m.version).max(), Some(latest_known()));
+        assert_eq!(store.composition().await.unwrap().rows, 1);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+    }
+
+    fn counts(of: &[EvalCount]) -> Vec<(Option<&str>, u64)> {
+        of.iter().map(|c| (c.value.as_deref(), c.rows)).collect()
+    }
+
+    #[tokio::test]
+    async fn the_composition_counts_rows_without_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let fact = MemoryType::SemanticFact;
+        put_row(&store, Some("a"), Some("p"), fact, "private alpha", at_cosine(0.9)).await;
+        put_row(&store, Some("a"), None, MemoryType::SessionSummary, "private beta", at_cosine(0.8)).await;
+        let placed = put_row(&store, Some("migrated"), Some("p"), fact, "private gamma", at_cosine(0.7)).await;
+        let unplaced = put_row(&store, Some("migrated"), None, fact, "private delta", at_cosine(0.6)).await;
+        let deleted = put_row(&store, None, None, fact, "private epsilon", at_cosine(0.5)).await;
+        store
+            .0
+            .conn
+            .call(move |c| -> rusqlite::Result<()> {
+                c.execute(
+                    "UPDATE memory SET source = 'import', origin_project = 'engram-app' WHERE id IN (?1, ?2)",
+                    [placed, unplaced],
+                )?;
+                c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [deleted])?;
+                c.execute("UPDATE project SET name = 'App' WHERE id = 'p'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let composition = store.composition().await.unwrap();
+
+        let json = serde_json::to_string(&composition).unwrap();
+        assert!(!json.contains("private"), "{json}");
+        assert_eq!(composition.rows, 4);
+        assert_eq!(counts(&composition.by_type), vec![(Some("semantic_fact"), 3), (Some("session_summary"), 1)]);
+        assert_eq!(counts(&composition.by_agent), vec![(Some("a"), 2), (Some("migrated"), 2)]);
+        assert_eq!(counts(&composition.by_source), vec![(Some("chat"), 2), (Some("import"), 2)]);
+        assert_eq!(counts(&composition.by_project), vec![(None, 2), (Some("App"), 2)]);
+        assert_eq!(composition.by_lang.iter().map(|c| c.rows).sum::<u64>(), 4);
+        assert_eq!(
+            composition.placement,
+            vec![
+                EvalPlacement { origin_project: "engram-app".to_string(), project: None, rows: 1 },
+                EvalPlacement { origin_project: "engram-app".to_string(), project: Some("App".to_string()), rows: 1 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_evaluation_ingest_records_and_checks_its_embedding_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        let runtime = ingest.finish().await.unwrap();
+        let stored = runtime
+            .store
+            .conn
+            .call(|c| -> rusqlite::Result<_> { crate::memory::inspect::contract(c) })
+            .await
+            .unwrap();
+        assert_eq!(stored.map(|s| s.model_id), Some(fake_identity().model_id));
+        drop(runtime);
+
+        let refused = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await;
+
+        assert!(matches!(&refused, Err(EvalError::Open(e)) if e.contains("placed-by-first-word")), "{:?}", refused.err());
     }
 
     #[tokio::test]
