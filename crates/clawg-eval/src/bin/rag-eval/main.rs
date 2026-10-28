@@ -17,8 +17,8 @@ use std::path::PathBuf;
 
 use clawg_core::eval_api::{
     compose_query_context, copy_background, model_is_cached, query_budget_tokens,
-    EmbedRole, EvalEmbedder, EvalError, EvalScope, EvalScoringConfig, EvalStore, EvalTokenCounter,
-    MIGRATION_FTS_TOKENIZER, EMBED_MAX_TOKENS, SPECIAL_TOKEN_RESERVE,
+    EmbedRole, EvalCaseRef, EvalEmbedder, EvalError, EvalResolveError, EvalResolved, EvalScope, EvalScoringConfig,
+    EvalStore, EvalTokenCounter, MIGRATION_FTS_TOKENIZER, EMBED_MAX_TOKENS, SPECIAL_TOKEN_RESERVE,
 };
 
 use golden::{CaseStatus, CaseSubset, PairLabel};
@@ -177,6 +177,12 @@ async fn run_with_scratch<I: Iterator<Item = String>>(args: I, scratch: PathBuf)
         }
     };
     let golden_set = &loaded_golden.set;
+    if cli.background.is_none() {
+        if let Some(query) = golden::needs_background(golden_set) {
+            eprintln!("golden set validation failed: {}", golden::GoldenError::NeedsBackground(query.to_string()));
+            return EXIT_GOLDEN_INVALID;
+        }
+    }
 
     let embedder = match load_embedder(cli.mode, &base_dir).await {
         Ok(e) => e,
@@ -224,27 +230,42 @@ async fn run_with_scratch<I: Iterator<Item = String>>(args: I, scratch: PathBuf)
         // recoverable — a per-run uuid directory nobody was told about is not
         // a forensic trace.
         println!("seeded {} rows into {}", golden_set.corpus.len(), seeded.store_path.display());
-        return measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, None).await;
+        return measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, None, &[]).await;
     };
 
     // A copy of a snapshot is removed whatever the run gives: it weighs as
     // much as the store it copies, holds its text, and the snapshot is still
     // there to measure again.
-    let (seeded, background) = match seed_over_background(snapshot, &scratch, &golden_set.corpus, &embedder).await {
-        Ok(over) => over,
-        Err(e) => {
-            eprintln!("{}: {e}", snapshot.display());
-            seed::remove_scratch(&scratch).await;
-            return EXIT_RUNTIME_FAILURE;
-        }
-    };
+    let cases: Vec<EvalCaseRef> = golden_set
+        .retrieval_cases
+        .iter()
+        .map(|c| EvalCaseRef { id: c.query.clone(), project: c.project.clone(), origins: c.expected_origins.clone() })
+        .collect();
+    let (seeded, background, resolved) =
+        match seed_over_background(snapshot, &scratch, &cases, &golden_set.corpus, &embedder).await {
+            Ok(over) => over,
+            Err(failure) => {
+                seed::remove_scratch(&scratch).await;
+                return match failure {
+                    OverFailure::Store(e) => {
+                        eprintln!("{}: {e}", snapshot.display());
+                        EXIT_RUNTIME_FAILURE
+                    }
+                    OverFailure::Golden(e) => {
+                        eprintln!("golden set validation failed: {e}");
+                        EXIT_GOLDEN_INVALID
+                    }
+                };
+            }
+        };
     println!(
         "seeded {} rows over a copy of {} in {}",
         golden_set.corpus.len(),
         snapshot.display(),
         seeded.store_path.display()
     );
-    let code = measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, Some(background)).await;
+    let code =
+        measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, Some(background), &resolved).await;
     if let Err(e) = seeded.store.close().await {
         eprintln!("warning: {e}");
     }
@@ -252,18 +273,41 @@ async fn run_with_scratch<I: Iterator<Item = String>>(args: I, scratch: PathBuf)
     code
 }
 
+/// Why a run over a background stopped before measuring.
+enum OverFailure {
+    /// The snapshot, or its copy, could not be used.
+    Store(EvalError),
+    /// A case names a project or an origin the background does not hold.
+    Golden(EvalResolveError),
+}
+
+impl From<EvalError> for OverFailure {
+    fn from(e: EvalError) -> Self {
+        OverFailure::Store(e)
+    }
+}
+
 /// Copies `snapshot` into `scratch`, refusing one that cannot be measured over
 /// before anything opens the copy for writing, opens the copy (which migrates
-/// an older schema), reads what it holds and seeds `corpus` on top.
+/// an older schema), resolves each case's project and origins in it, reads
+/// what it holds and seeds `corpus` on top.
 async fn seed_over_background(
     snapshot: &std::path::Path,
     scratch: &std::path::Path,
+    cases: &[EvalCaseRef],
     corpus: &[golden::CorpusRow],
     embedder: &EvalEmbedder,
-) -> Result<(seed::SeedResult, report::Background), EvalError> {
+) -> Result<(seed::SeedResult, report::Background, Vec<EvalResolved>), OverFailure> {
     std::fs::create_dir_all(scratch).map_err(|e| EvalError::Open(format!("{}: {e}", scratch.display())))?;
     let copied = copy_background(snapshot, scratch, embedder)?;
     let store = EvalStore::open(scratch).await?;
+    let resolved = match store.resolve_cases(cases).await {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            store.close().await?;
+            return Err(OverFailure::Golden(e));
+        }
+    };
     let composition = store.composition().await?;
     let seeded = seed::seed_onto(store, scratch.to_path_buf(), corpus, embedder).await?;
     let mut twins: Vec<String> = seeded
@@ -284,7 +328,7 @@ async fn seed_over_background(
         composition,
         golden_twins: twins,
     };
-    Ok((seeded, background))
+    Ok((seeded, background, resolved))
 }
 
 /// The tag segment that names the snapshot a run measured over: two runs of
@@ -298,17 +342,26 @@ fn background_slug(background: &report::Background) -> String {
 const BACKGROUND_HIT: &str = "bg";
 
 /// The refs of `ids`, in their order. Without a background every hit is a
-/// golden row; with one, a hit that is not keeps its place as `bg`.
-fn rank_refs(ids: &[i64], refs: &golden::RefMap, background: bool) -> Vec<String> {
+/// golden row; with one, a hit on a row of a save the case cites is its
+/// origin, the first time it shows, and any other keeps its place as `bg`.
+fn rank_refs(ids: &[i64], refs: &golden::RefMap, background: bool, cited: &HashMap<i64, String>) -> Vec<String> {
+    let mut shown = HashSet::new();
     ids.iter()
-        .filter_map(|id| match refs.ref_of(*id) {
-            Some(r) => Some(r.to_string()),
-            None => background.then(|| BACKGROUND_HIT.to_string()),
+        .filter_map(|id| {
+            if let Some(r) = refs.ref_of(*id) {
+                return Some(r.to_string());
+            }
+            match cited.get(id) {
+                Some(origin) if shown.insert(origin.as_str()) => Some(origin.clone()),
+                _ => background.then(|| BACKGROUND_HIT.to_string()),
+            }
         })
         .collect()
 }
 
 /// Scores the golden cases over the seeded store and writes the results.
+/// `resolved` holds each case's project and cited saves in a background, in
+/// the order of the cases; it is empty without one.
 async fn measure(
     cli: &cli::Cli,
     loaded_golden: &golden::LoadedGolden,
@@ -317,6 +370,7 @@ async fn measure(
     budget: usize,
     seeded: &seed::SeedResult,
     background: Option<report::Background>,
+    resolved: &[EvalResolved],
 ) -> i32 {
     let golden_set = &loaded_golden.set;
     let lang_by_ref = row_langs(&golden_set.corpus);
@@ -326,7 +380,7 @@ async fn measure(
     // the same case N times. Search itself (the part that actually varies
     // per point) happens later, inside the grid loop.
     let mut embedded_cases: Vec<EmbeddedCase> = Vec::with_capacity(golden_set.retrieval_cases.len());
-    for case in &golden_set.retrieval_cases {
+    for (i, case) in golden_set.retrieval_cases.iter().enumerate() {
         // `history` is chronological oldest-first, as a human writes it;
         // `compose_query_context` wants newest-first, hence the reverse.
         // Empty history (every case in the current golden.json) makes this
@@ -347,15 +401,21 @@ async fn measure(
                 return EXIT_RUNTIME_FAILURE;
             }
         };
+        let resolution = resolved.get(i);
         embedded_cases.push(EmbeddedCase {
             query: case.query.clone(),
             expected_refs: case.expected_refs.clone(),
+            expected_origins: case.expected_origins.clone(),
             corpus_refs: case.corpus_refs.clone(),
             status: case.status,
             query_lang: case.query_lang.clone(),
             lang: case_lang(&case.expected_refs, &lang_by_ref),
             subset: case.subset,
             stale_refs: case.stale_refs.clone(),
+            project_id: resolution.and_then(|r| r.project_id.clone()),
+            cited: resolution
+                .map(|r| r.expected.iter().flat_map(|s| s.rows.iter().map(|id| (*id, s.origin.clone()))).collect())
+                .unwrap_or_default(),
             embedding,
         });
     }
@@ -369,7 +429,10 @@ async fn measure(
     let similarity_results = if cli.mode == cli::Mode::Real {
         let sim_sources: Vec<SimCaseSource> = embedded_cases
             .iter()
-            .filter(|c| c.status != CaseStatus::KnownRed && c.subset != CaseSubset::Unanswerable)
+            // A case by origin has no vector of the corpus to rank.
+            .filter(|c| {
+                c.status != CaseStatus::KnownRed && c.subset != CaseSubset::Unanswerable && c.expected_origins.is_empty()
+            })
             .map(|c| SimCaseSource {
                 query: c.query.clone(),
                 expected_refs: c.expected_refs.clone(),
@@ -533,7 +596,15 @@ async fn measure(
             } else {
                 match seeded
                     .store
-                    .search(&ec.embedding, seed::AGENT_ID, scope, None, K_FINAL, point.scoring, Some(&ec.query))
+                    .search(
+                        &ec.embedding,
+                        seed::AGENT_ID,
+                        scope,
+                        ec.project_id.as_deref(),
+                        K_FINAL,
+                        point.scoring,
+                        Some(&ec.query),
+                    )
                     .await
                 {
                     Ok(h) => h.iter().map(|h| h.id).collect(),
@@ -543,8 +614,9 @@ async fn measure(
                     }
                 }
             };
-            let ranked_refs = rank_refs(&ids, &seeded.refs, background.is_some());
-            let expected: HashSet<String> = ec.expected_refs.iter().cloned().collect();
+            let ranked_refs = rank_refs(&ids, &seeded.refs, background.is_some(), &ec.cited);
+            let expected_refs: Vec<String> = ec.expected_refs.iter().chain(&ec.expected_origins).cloned().collect();
+            let expected: HashSet<String> = expected_refs.iter().cloned().collect();
 
             let recall_1 = metrics::recall_at_k(&ranked_refs, &expected, 1);
             let recall_5 = metrics::recall_at_k(&ranked_refs, &expected, 5);
@@ -557,7 +629,7 @@ async fn measure(
                 .then(|| metrics::fresh_first(&ranked_refs, &ec.expected_refs[0], &ec.stale_refs));
             let result = report::CaseResult {
                 query: ec.query.clone(),
-                expected_refs: ec.expected_refs.clone(),
+                expected_refs,
                 ranked_refs,
                 recall_1,
                 recall_5,
@@ -1066,12 +1138,17 @@ fn write_follow_up_arm_results(
 struct EmbeddedCase {
     query: String,
     expected_refs: Vec<String>,
+    expected_origins: Vec<String>,
     corpus_refs: Vec<String>,
     status: CaseStatus,
     query_lang: Option<String>,
     lang: Option<String>,
     subset: CaseSubset,
     stale_refs: Vec<String>,
+    /// The background's own id of the case's project.
+    project_id: Option<String>,
+    /// Every live row of the saves the case cites, with its origin.
+    cited: HashMap<i64, String>,
     embedding: Vec<f32>,
 }
 
@@ -1421,7 +1498,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clawg_core::eval_api::{production_lexical_budget, sha256_hex, EvalIngest};
+    use clawg_core::eval_api::{production_lexical_budget, sha256_hex, EvalIngest, EvalSave};
 
     #[test]
     fn civil_from_days_matches_known_reference_dates() {
@@ -1492,15 +1569,218 @@ mod tests {
     /// one agent and closed so the file stands alone, as `clawg backup` leaves
     /// a snapshot.
     async fn background_snapshot(texts: &[String]) -> PathBuf {
+        background_with(texts, &[], &[]).await
+    }
+
+    /// A save of a background that an import of `origin` wrote.
+    struct Imported {
+        origin: &'static str,
+        project: Option<&'static str>,
+        memory_type: &'static str,
+        text: &'static str,
+    }
+
+    /// [`background_snapshot`] of `notes`, plus `imports` saved under the
+    /// agent an import uses and marked as an import of their origin writes
+    /// them, with each project of `names` given its name.
+    async fn background_with(notes: &[String], imports: &[Imported], names: &[(&str, &str)]) -> PathBuf {
         let dir = temp_path("background");
         std::fs::create_dir_all(&dir).unwrap();
         let ingest = EvalIngest::open(&dir, &EvalEmbedder::fake(), &dir).await.unwrap();
-        for text in texts {
+        for text in notes {
             ingest.send("background-agent", text, "semantic_fact", 3.0, 0).await.unwrap();
         }
+        let mut marks: Vec<(String, Vec<i64>)> = Vec::new();
+        for imported in imports {
+            let saved = ingest
+                .save(EvalSave {
+                    agent_id: "migrated",
+                    project_id: imported.project,
+                    content: imported.text,
+                    memory_type: imported.memory_type,
+                    importance: 3.0,
+                    topic_key: None,
+                })
+                .await
+                .unwrap();
+            marks.push((imported.origin.to_string(), saved.rows.iter().map(|(id, _)| *id).collect()));
+        }
         let runtime = ingest.finish().await.unwrap();
+        let names: Vec<(String, String)> = names.iter().map(|(id, name)| (id.to_string(), name.to_string())).collect();
+        runtime
+            .store
+            .conn
+            .call(move |c| {
+                for (origin, ids) in &marks {
+                    for id in ids {
+                        c.execute(
+                            "UPDATE memory SET source = 'import', created_by_ref = ?1 WHERE id = ?2",
+                            (origin.as_str(), *id),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
+                for (id, name) in &names {
+                    c.execute("UPDATE project SET name = ?1 WHERE id = ?2", (name.as_str(), id.as_str()))
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok::<(), String>(())
+            })
+            .await
+            .unwrap();
         runtime.store.conn.clone().close().await.unwrap();
         dir.join("memory.db")
+    }
+
+    const FERRY: &str = "the ferry to the island leaves from the north pier at nine";
+
+    /// A golden of one case over a background, besides the corpus of
+    /// [`sweep_golden_json`].
+    fn golden_with_case(case: &str) -> String {
+        sweep_golden_json().replacen(r#""retrieval_cases": ["#, &format!(r#""retrieval_cases": [{case},"#), 1)
+    }
+
+    /// The exit code of `--fake` on `golden_json`, over `snapshot` when given.
+    async fn exit_of(golden_json: &str, tag: &str, snapshot: Option<&std::path::Path>) -> i32 {
+        let out_dir = temp_path(&format!("{tag}-out"));
+        let scratch = temp_path(&format!("{tag}-scratch"));
+        let code = match snapshot {
+            Some(snapshot) => run_over(golden_json, snapshot, tag, &out_dir, &scratch).await,
+            None => {
+                let golden_path = temp_path(&format!("{tag}-golden.json"));
+                std::fs::write(&golden_path, golden_json).unwrap();
+                let args = ["rag-eval", "--fake", "--golden", &golden_path.to_string_lossy(), "--out", &out_dir.to_string_lossy()]
+                    .map(str::to_string);
+                let code = run_with_scratch(args.into_iter(), scratch.clone()).await;
+                std::fs::remove_file(&golden_path).ok();
+                code
+            }
+        };
+        assert!(!scratch.exists(), "the copy is removed whatever the run gives");
+        std::fs::remove_dir_all(&out_dir).ok();
+        code
+    }
+
+    #[tokio::test]
+    async fn an_origin_case_finds_its_save_in_the_background() {
+        let imports = [Imported { origin: "engram:ferry", project: Some("app-1111"), memory_type: "semantic_fact", text: FERRY }];
+        let snapshot = background_with(&background_notes(20), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(&format!(r#"{{"query": "{FERRY}", "expected_origins": ["engram:ferry"], "project": "App"}}"#));
+        let (out_dir, scratch) = (temp_path("origin-found-out"), temp_path("origin-found-scratch"));
+
+        assert_eq!(run_over(&golden, &snapshot, "origin-found", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, _, json) = only_results(&out_dir);
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["expected_refs"], serde_json::json!(["engram:ferry"]), "{case}");
+        assert_eq!(case["ranked_refs"][0], "engram:ferry", "{case}");
+        assert_eq!(case["recall@1"], 1.0);
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_origin_without_a_row_fails_validation() {
+        let snapshot = background_snapshot(&background_notes(5)).await;
+        let golden = golden_with_case(r#"{"query": "anything", "expected_origins": ["engram:no-such-note"]}"#);
+
+        assert_eq!(exit_of(&golden, "origin-missing", Some(&snapshot)).await, EXIT_GOLDEN_INVALID);
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_origin_case_without_background_fails_validation() {
+        let golden = golden_with_case(r#"{"query": "anything", "expected_origins": ["engram:ferry"]}"#);
+
+        assert_eq!(exit_of(&golden, "origin-no-background", None).await, EXIT_GOLDEN_INVALID);
+    }
+
+    #[tokio::test]
+    async fn project_without_background_fails_validation() {
+        let golden = golden_with_case(r#"{"query": "anything", "corpus_refs": ["c1"], "expected_refs": ["c1"], "project": "App"}"#);
+
+        assert_eq!(exit_of(&golden, "project-no-background", None).await, EXIT_GOLDEN_INVALID);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_or_unknown_project_name_fails_validation() {
+        let imports = [
+            Imported { origin: "engram:one", project: Some("app-1111"), memory_type: "semantic_fact", text: "one app note" },
+            Imported { origin: "engram:two", project: Some("app-2222"), memory_type: "semantic_fact", text: "another app note" },
+        ];
+        let snapshot = background_with(&[], &imports, &[("app-1111", "App"), ("app-2222", "APP")]).await;
+
+        for (project, tag) in [("app", "project-ambiguous"), ("nowhere", "project-unknown")] {
+            let golden = golden_with_case(&format!(r#"{{"query": "anything", "subset": "unanswerable", "project": "{project}"}}"#));
+            assert_eq!(exit_of(&golden, tag, Some(&snapshot)).await, EXIT_GOLDEN_INVALID, "{project}");
+        }
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_expected_save_outside_the_case_project_fails_validation() {
+        let imports = [
+            Imported { origin: "engram:app", project: Some("app-1111"), memory_type: "semantic_fact", text: "an app note" },
+            Imported { origin: "engram:other", project: Some("other-2222"), memory_type: "semantic_fact", text: "a note of another project" },
+        ];
+        let snapshot = background_with(&[], &imports, &[("app-1111", "App"), ("other-2222", "Other")]).await;
+        let golden = golden_with_case(r#"{"query": "anything", "expected_origins": ["engram:other"], "project": "App"}"#);
+
+        assert_eq!(exit_of(&golden, "origin-outside", Some(&snapshot)).await, EXIT_GOLDEN_INVALID);
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_case_may_name_a_project() {
+        let imports = [Imported { origin: "engram:app", project: Some("app-1111"), memory_type: "semantic_fact", text: "an app note" }];
+        let snapshot = background_with(&background_notes(5), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(r#"{"query": "a question nobody answered", "subset": "unanswerable", "project": "App"}"#);
+        let (out_dir, scratch) = (temp_path("unanswerable-project-out"), temp_path("unanswerable-project-scratch"));
+
+        assert_eq!(run_over(&golden, &snapshot, "unanswerable-project", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, _, json) = only_results(&out_dir);
+        assert_eq!(json["retrieval"]["unanswerable"].as_array().unwrap().len(), 1);
+        assert_eq!(json["retrieval"]["abstention"]["n_cases"], 1);
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_hit_on_any_piece_of_the_cited_save_counts() {
+        let mut refs = golden::RefMap::new();
+        refs.insert("c1", 100);
+        let cited: HashMap<i64, String> = [(7, "engram:long"), (8, "engram:long"), (9, "engram:long")]
+            .into_iter()
+            .map(|(id, origin)| (id, origin.to_string()))
+            .collect();
+
+        assert_eq!(rank_refs(&[8, 100], &refs, true, &cited), ["engram:long", "c1"]);
+        assert_eq!(rank_refs(&[9], &refs, true, &cited), ["engram:long"]);
+    }
+
+    #[test]
+    fn a_background_hit_not_cited_never_counts() {
+        let refs = golden::RefMap::new();
+        let cited: HashMap<i64, String> = [(7, "engram:a".to_string()), (20, "engram:a".to_string())].into_iter().collect();
+
+        assert_eq!(
+            rank_refs(&[3, 7, 20, 4], &refs, true, &cited),
+            ["bg", "engram:a", "bg", "bg"],
+            "a second live save of one origin counts once"
+        );
+        assert_eq!(rank_refs(&[3, 7], &refs, false, &HashMap::new()), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_golden_without_origins_measures_exactly_as_before() {
+        let json = run_fake(sweep_golden_json(), "no-origins").await;
+
+        let retrieval = &json["retrieval"];
+        assert_eq!(retrieval["per_case"][0]["expected_refs"], serde_json::json!(["c1"]));
+        assert_eq!(retrieval["per_case"][0]["ranked_refs"][0], "c1");
+        assert_eq!(retrieval["aggregate"]["recall@1"], 1.0);
+        assert_eq!(json["golden_set"]["content_sha256"], sha256_hex(sweep_golden_json().as_bytes()));
     }
 
     fn background_notes(n: usize) -> Vec<String> {
