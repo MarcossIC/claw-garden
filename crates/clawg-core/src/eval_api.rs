@@ -33,6 +33,7 @@ use crate::memory::embedder::{E5Embedder, Embedder, FakeEmbedder};
 /// without reaching into the private `memory` module tree.
 pub use crate::memory::embedder::EmbedRole;
 use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::merge::canonical;
 use crate::memory::model_download;
 use crate::memory::project_docs;
 use crate::memory::score::{ImportanceFactor, ScoringConfig};
@@ -97,17 +98,15 @@ pub struct EvalScope {
 }
 
 impl EvalScope {
+    /// The pools alone: the project and the reach are the search's, which
+    /// [`EvalStore::search`] sets as the daemon does.
     fn into_search_scope(self) -> SearchScope {
         SearchScope {
             memory: self.memory,
             episodic: self.episodic,
             procedural: self.procedural,
-            // rag-eval never carries a project — its whole corpus is one
-            // unscoped pool, so this keeps every query bit-identical to
-            // retrieval before project scoping existed.
             project_id: None,
             lexical: self.lexical,
-            // One agent's corpus: nothing to share.
             reach: crate::memory::sharing::Reach::Own,
         }
     }
@@ -311,21 +310,36 @@ impl EvalStore {
     /// hit shape. `query_text` is the lexical half of the question — fed
     /// through untouched to `search_all_memories_with_scoring`, mirroring
     /// production's own `embedding`/`query_text` pairing (`search.rs`).
+    ///
+    /// The scope is the daemon's: `agent_id` reaches what the sharing policy
+    /// of the store's directory lets it (every agent without one), and
+    /// `project`, followed past its merges, reads its own rows, the rows
+    /// without one and every `user_preference`. One agent's corpus without a
+    /// project ranks as it did under the agent's own reach.
     pub async fn search(
         &self,
         embedding: &[f32],
         agent_id: &str,
         scope: EvalScope,
+        project: Option<&str>,
         k_final: usize,
         scoring: EvalScoringConfig,
         query_text: Option<&str>,
     ) -> Result<Vec<EvalHit>, EvalError> {
+        let project = match project {
+            Some(id) => Some(canonical(&self.0, id).await.map_err(|e| EvalError::Search(e.to_string()))?),
+            None => None,
+        };
+        let scope = scope
+            .into_search_scope()
+            .with_project(project.as_deref())
+            .with_reach(self.0.reader_for(agent_id).reach);
         let (hits, _memory_pool) = search_all_memories_with_scoring(
             &self.0,
             embedding,
             query_text,
             agent_id,
-            scope.into_search_scope(),
+            scope,
             k_final,
             &scoring.into_scoring_config(),
         )
@@ -1094,7 +1108,7 @@ mod tests {
         let scoring = EvalScoringConfig::default();
 
         let with_text = store
-            .search(&on_axis, agent, scope, 10, scoring, Some("ZQXIDENT42"))
+            .search(&on_axis, agent, scope, None, 10, scoring, Some("ZQXIDENT42"))
             .await
             .unwrap();
         assert!(
@@ -1104,7 +1118,7 @@ mod tests {
             with_text.iter().map(|h| h.id).collect::<Vec<_>>()
         );
 
-        let without_text = store.search(&on_axis, agent, scope, 10, scoring, None).await.unwrap();
+        let without_text = store.search(&on_axis, agent, scope, None, 10, scoring, None).await.unwrap();
         assert!(
             !without_text.iter().any(|h| h.id == m_id),
             "the control must miss M — otherwise the assertion above proves nothing about the \
@@ -1835,6 +1849,116 @@ mod tests {
         };
         let gap = created(fresh).await - created(old).await;
         assert!((gap - (30 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
+    }
+
+    /// A row of `agent` (none for a row no agent saved) in `project`.
+    async fn put_row(
+        store: &EvalStore,
+        agent: Option<&str>,
+        project: Option<&str>,
+        memory_type: MemoryType,
+        content: &str,
+        embedding: Vec<f32>,
+    ) -> i64 {
+        let record = NewMemoryRecord {
+            scope: match (agent, project) {
+                (Some(_), _) => "agent",
+                (None, Some(_)) => "project",
+                (None, None) => "global",
+            },
+            agent_id: agent.map(str::to_string),
+            project_id: project.map(str::to_string),
+            content: content.to_string(),
+            memory_type,
+            source: MemorySource::Chat,
+            created_by_type: CreatedByType::System,
+            created_by_ref: "rag-eval".to_string(),
+            importance: 5.0,
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            candidates: Vec::new(),
+            derived_from: Vec::new(),
+            topic_key: None,
+            source_session_id: None,
+        };
+        store.0.insert_memory_with_vector(record, embedding).await.unwrap()
+    }
+
+    fn at_cosine(cos: f32) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 384];
+        v[0] = cos;
+        v[1] = (1.0 - cos * cos).sqrt();
+        v
+    }
+
+    const MEMORY_ONLY: EvalScope = EvalScope { memory: Some(30), episodic: None, procedural: None, lexical: None };
+
+    #[tokio::test]
+    async fn production_reach_reads_other_agents_and_unowned_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let own = put_row(&store, Some("a"), None, MemoryType::SemanticFact, "own row", at_cosine(0.99)).await;
+        let other = put_row(&store, Some("b"), None, MemoryType::SemanticFact, "other row", at_cosine(0.98)).await;
+        let unowned = put_row(&store, None, None, MemoryType::SemanticFact, "unowned row", at_cosine(0.97)).await;
+
+        let hits = store.search(&at_cosine(1.0), "a", MEMORY_ONLY, None, 10, EvalScoringConfig::default(), None).await;
+        let mut ids: Vec<i64> = hits.unwrap().iter().map(|h| h.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![own, other, unowned]);
+
+        let (own_reach, _) = search_all_memories_with_scoring(
+            &store.0, &at_cosine(1.0), None, "a", MEMORY_ONLY.into_search_scope(), 10, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+        assert!(!own_reach.iter().any(|h| h.id == other), "the agent's own reach must not read b's row");
+    }
+
+    #[tokio::test]
+    async fn a_project_search_reads_its_own_unowned_and_every_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let fact = MemoryType::SemanticFact;
+        let in_p = put_row(&store, Some("a"), Some("p"), fact, "row of p", at_cosine(0.99)).await;
+        let in_q = put_row(&store, Some("a"), Some("q"), fact, "row of q", at_cosine(0.98)).await;
+        let unscoped = put_row(&store, Some("a"), None, fact, "row of none", at_cosine(0.97)).await;
+        let preference =
+            put_row(&store, Some("a"), Some("q"), MemoryType::UserPreference, "preference of q", at_cosine(0.96)).await;
+
+        let hits =
+            store.search(&at_cosine(1.0), "a", MEMORY_ONLY, Some("p"), 10, EvalScoringConfig::default(), None).await;
+        let mut ids: Vec<i64> = hits.unwrap().iter().map(|h| h.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![in_p, unscoped, preference]);
+        assert!(!ids.contains(&in_q));
+    }
+
+    #[tokio::test]
+    async fn a_one_agent_store_ranks_the_same_under_the_daemons_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        for i in 0..12 {
+            let cos = 0.99 - i as f32 * 0.01;
+            put_row(&store, Some("a"), None, MemoryType::SemanticFact, &format!("row {i}"), at_cosine(cos)).await;
+        }
+        let scope = EvalScope { lexical: Some(20), ..MEMORY_ONLY };
+
+        let daemons = store
+            .search(&at_cosine(1.0), "a", scope, None, 10, EvalScoringConfig::default(), Some("row"))
+            .await
+            .unwrap();
+        let (own, _) = search_all_memories_with_scoring(
+            &store.0, &at_cosine(1.0), Some("row"), "a", scope.into_search_scope(), 10, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(daemons.iter().map(|h| h.id).collect::<Vec<_>>(), own.iter().map(|h| h.id).collect::<Vec<_>>());
+        for (d, o) in daemons.iter().zip(&own) {
+            assert!((d.score - o.score).abs() < 1e-9, "{} scored {} and {}", d.id, d.score, o.score);
+        }
     }
 
     #[tokio::test]

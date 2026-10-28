@@ -432,7 +432,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             } else {
                 match seeded
                     .store
-                    .search(&ec.embedding, seed::AGENT_ID, scope, K_FINAL, point.scoring, Some(&ec.query))
+                    .search(&ec.embedding, seed::AGENT_ID, scope, None, K_FINAL, point.scoring, Some(&ec.query))
                     .await
                 {
                     Ok(h) => h.iter().map(|h| h.id).collect(),
@@ -852,7 +852,7 @@ async fn score_follow_up_arm<'a>(
         let hits = match ctx
             .seeded
             .store
-            .search(&embedding, seed::AGENT_ID, K_POOL, K_FINAL, EvalScoringConfig::default(), Some(&arm.lexical))
+            .search(&embedding, seed::AGENT_ID, K_POOL, None, K_FINAL, EvalScoringConfig::default(), Some(&arm.lexical))
             .await
         {
             Ok(h) => h,
