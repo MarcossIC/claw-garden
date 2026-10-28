@@ -187,8 +187,11 @@ OPTIONS:
                          over the cases with that pair in both files; the pair rows are
                          informative and never enter primary: nor --fail-on-regression.
                          Ends with whether each primary metric (recall@5, search.found)
-                         moved distinguishably at p < 0.05. Needs neither --fake/--real nor
-                         a golden set; short-circuits like --help.
+                         moved distinguishably at p < 0.05. When a file was measured over
+                         --background it names each side's snapshot and search time, and warns
+                         when both searched one snapshot more than a day apart (the exit code
+                         stays the metrics'). Needs neither --fake/--real nor a golden set;
+                         short-circuits like --help.
     --fail-on-regression With --diff, on either side of it: exit 6 when a primary metric
                          (retrieval recall@5, agent_view search.found) gets worse with
                          p < 0.05. The informative metrics never fail the run.

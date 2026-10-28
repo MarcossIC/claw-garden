@@ -140,6 +140,68 @@ pub struct RunDiff {
     pub abstention: Option<MetricDiff>,
     /// `fresh_first` of the `update` cases both files scored.
     pub freshness: Option<MetricDiff>,
+    pub backgrounds: Backgrounds,
+}
+
+/// The background a results file was measured over, as its `background`
+/// block names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundSide {
+    pub sha256: String,
+    pub searched_at_ms: i64,
+}
+
+/// The background of each side of a diff, none for a run without one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Backgrounds {
+    pub first: Option<BackgroundSide>,
+    pub second: Option<BackgroundSide>,
+}
+
+/// Two searches of one background further apart than this read different
+/// ages for every row decay has not yet brought to its floor.
+const SAME_DAY_MS: i64 = 24 * 3_600_000;
+
+impl Backgrounds {
+    fn of(a: &Value, b: &Value) -> Self {
+        let side = |value: &Value| {
+            Some(BackgroundSide {
+                sha256: value.pointer("/background/sha256")?.as_str()?.to_string(),
+                searched_at_ms: value.pointer("/background/searched_at_ms")?.as_i64()?,
+            })
+        };
+        Self { first: side(a), second: side(b) }
+    }
+
+    /// Said when both runs read the same background more than a day apart:
+    /// the search reads the clock, so the two compare more than the change.
+    /// Nothing can force runs onto one day, so this only warns; the exit
+    /// code stays the metrics'.
+    pub fn warning(&self) -> Option<String> {
+        let (first, second) = (self.first.as_ref()?, self.second.as_ref()?);
+        let apart = (second.searched_at_ms - first.searched_at_ms).abs();
+        (first.sha256 == second.sha256 && apart > SAME_DAY_MS).then(|| {
+            format!(
+                "both runs searched background {} {:.0} hours apart ({} and {}); decay reads the clock when it \
+                 searches, so compare runs over one background taken the same day",
+                short_sha(&first.sha256),
+                apart as f64 / 3_600_000.0,
+                utc_minute(first.searched_at_ms),
+                utc_minute(second.searched_at_ms),
+            )
+        })
+    }
+}
+
+fn short_sha(sha256: &str) -> &str {
+    &sha256[..sha256.len().min(8)]
+}
+
+/// `ms` since the epoch as `YYYY-MM-DD HH:MM UTC`.
+fn utc_minute(ms: i64) -> String {
+    let (days, minute_of_day) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000) / 60_000);
+    let (y, m, d) = crate::civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", minute_of_day / 60, minute_of_day % 60)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -241,6 +303,7 @@ pub fn diff_values(a: &Value, a_path: &Path, b: &Value, b_path: &Path) -> Result
         freshness: diff_freshness(&a_retrieval, &b_retrieval),
         agent_view,
         abstention,
+        backgrounds: Backgrounds::of(a, b),
     })
 }
 
@@ -445,6 +508,18 @@ pub fn print_stdout(diff: &RunDiff) {
 /// text can be checked.
 fn render(diff: &RunDiff) -> String {
     let mut out = String::from("rag-eval diff\n");
+    let backgrounds = &diff.backgrounds;
+    if backgrounds.first.is_some() || backgrounds.second.is_some() {
+        let side = |name: &str, side: &Option<BackgroundSide>| match side {
+            Some(b) => format!("  {name}: {} searched {}\n", b.sha256, utc_minute(b.searched_at_ms)),
+            None => format!("  {name}: no background\n"),
+        };
+        out.push_str(&side("first", &backgrounds.first));
+        out.push_str(&side("second", &backgrounds.second));
+        if let Some(warning) = backgrounds.warning() {
+            out.push_str(&format!("  warning: {warning}\n"));
+        }
+    }
     render_block(&mut out, "retrieval", &diff.retrieval, &diff.retrieval_by_pair);
     render_block(&mut out, "similarity", &diff.similarity, &diff.similarity_by_pair);
     if let Some(av) = &diff.agent_view {
@@ -578,6 +653,53 @@ mod tests {
 
     fn moved(better: usize, worse: usize) -> MetricDiff {
         MetricDiff { better, worse, net: better as i64 - worse as i64, ci: None }
+    }
+
+    fn over_background(mut value: Value, sha256: &str, searched_at_ms: i64) -> Value {
+        value["background"] = serde_json::json!({"sha256": sha256, "searched_at_ms": searched_at_ms});
+        value
+    }
+
+    /// 2027-01-15 08:00 UTC.
+    const SEARCHED_AT_MS: i64 = 1_800_000_000_000;
+
+    #[test]
+    fn diff_compares_an_anchor_run_with_and_without_background() {
+        let without = reference_value();
+        let mut with = over_background(reference_value(), "ab12cd34ef", SEARCHED_AT_MS);
+        with["retrieval"]["per_case"][0]["ranked_refs"] = serde_json::json!(["bg", "c2"]);
+        with["retrieval"]["per_case"][0]["recall@5"] = serde_json::json!(0.0);
+
+        let d = diff_values(&without, &reference_results_path(), &with, &reference_results_path()).unwrap();
+
+        assert_eq!((d.retrieval.recall_5.better, d.retrieval.recall_5.worse), (0, 1));
+        assert_eq!(d.backgrounds.first, None);
+        assert_eq!(
+            d.backgrounds.second,
+            Some(BackgroundSide { sha256: "ab12cd34ef".to_string(), searched_at_ms: SEARCHED_AT_MS })
+        );
+        let text = render(&d);
+        assert!(text.contains("first: no background") && text.contains("second: ab12cd34ef"), "{text}");
+        assert!(text.contains("2027-01-15 08:00 UTC"), "{text}");
+        assert!(d.backgrounds.warning().is_none(), "two backgrounds, or none, are not one read twice");
+    }
+
+    #[test]
+    fn a_diff_over_one_background_a_day_apart_warns() {
+        let first = over_background(reference_value(), "ab12cd34ef", SEARCHED_AT_MS);
+        let later = over_background(reference_value(), "ab12cd34ef", SEARCHED_AT_MS + 30 * 3_600_000);
+        let same_day = over_background(reference_value(), "ab12cd34ef", SEARCHED_AT_MS + 3 * 3_600_000);
+
+        let d = diff_values(&first, &reference_results_path(), &later, &reference_results_path()).unwrap();
+
+        let text = render(&d);
+        assert!(
+            text.contains("warning:") && text.contains("2027-01-15 08:00 UTC") && text.contains("2027-01-16 14:00 UTC"),
+            "{text}"
+        );
+        assert!(!regressed(&d), "the warning leaves the exit code to the metrics");
+        let d = diff_values(&first, &reference_results_path(), &same_day, &reference_results_path()).unwrap();
+        assert!(d.backgrounds.warning().is_none());
     }
 
     #[test]
