@@ -97,7 +97,7 @@ pub async fn seed_onto(
     Ok(SeedResult { store, refs, store_path, mean_norm, max_norm_deviation, vectors })
 }
 
-const DAY_MS: f64 = 86_400_000.0;
+pub(crate) const DAY_MS: f64 = 86_400_000.0;
 
 /// A row's `age_days` as the whole milliseconds the store backdates it by.
 pub(crate) fn age_ms(age_days: f64) -> u64 {

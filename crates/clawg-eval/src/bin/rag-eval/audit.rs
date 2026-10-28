@@ -496,6 +496,7 @@ mod tests {
             subset: crate::golden::CaseSubset::Natural,
             abstained: None,
             fresh_first: None,
+            scale: Default::default(),
         }
     }
 

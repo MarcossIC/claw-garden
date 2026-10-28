@@ -218,6 +218,36 @@ pub struct EvalHit {
     pub tier: i64,
     pub score: f64,
     pub distance: f64,
+    pub memory_type: String,
+    /// It holds every identifier of the query.
+    pub exact: bool,
+}
+
+/// What the `memory` KNN of a search asked for and handed to the ranking,
+/// before the collapse to one hit per save and the cut.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalPool {
+    pub requested: usize,
+    pub rows: usize,
+    pub saves: usize,
+    pub passes: usize,
+    /// The eligible rows, counted up to the window when the first one came
+    /// back short; none when it came back full.
+    pub eligible: Option<usize>,
+    pub ids: Vec<i64>,
+}
+
+/// A search's hits, best first, and its `memory` pool.
+#[derive(Debug, Clone)]
+pub struct EvalSearch {
+    pub hits: Vec<EvalHit>,
+    pub pool: EvalPool,
+}
+
+/// The cosine a search reads from the L2 distance of two unit vectors, the
+/// function the score itself uses, so a measurement never reads a copy.
+pub fn cosine_from_distance(distance: f64) -> f64 {
+    crate::memory::score::cosine_from_l2_unit(distance)
 }
 
 /// Errors surfaced by [`EvalStore`]. Its own type rather than a re-export of
@@ -340,7 +370,7 @@ impl EvalStore {
         k_final: usize,
         scoring: EvalScoringConfig,
         query_text: Option<&str>,
-    ) -> Result<Vec<EvalHit>, EvalError> {
+    ) -> Result<EvalSearch, EvalError> {
         let project = match project {
             Some(id) => Some(canonical(&self.0, id).await.map_err(|e| EvalError::Search(e.to_string()))?),
             None => None,
@@ -349,7 +379,7 @@ impl EvalStore {
             .into_search_scope()
             .with_project(project.as_deref())
             .with_reach(self.0.reader_for(agent_id).reach);
-        let (hits, _memory_pool) = search_all_memories_with_scoring(
+        let (hits, pool) = search_all_memories_with_scoring(
             &self.0,
             embedding,
             query_text,
@@ -361,16 +391,47 @@ impl EvalStore {
         .await
         .map_err(|e| EvalError::Search(e.to_string()))?;
 
-        Ok(hits
-            .into_iter()
-            .map(|h| EvalHit {
-                id: h.id,
-                kind: h.kind.into(),
-                tier: h.tier,
-                score: h.score,
-                distance: h.distance,
+        Ok(EvalSearch {
+            hits: hits
+                .into_iter()
+                .map(|h| EvalHit {
+                    id: h.id,
+                    kind: h.kind.into(),
+                    tier: h.tier,
+                    score: h.score,
+                    distance: h.distance,
+                    memory_type: h.memory_type,
+                    exact: h.exact,
+                })
+                .collect(),
+            pool: EvalPool {
+                requested: pool.requested,
+                rows: pool.rows,
+                saves: pool.saves,
+                passes: pool.passes,
+                eligible: pool.eligible,
+                ids: pool.ids,
+            },
+        })
+    }
+
+    /// `last_accessed_at` of each of the `memory` rows `ids` that exists, in
+    /// the order of `ids`: the instant the decay of a hit is measured from.
+    pub async fn last_accessed(&self, ids: Vec<i64>) -> Result<Vec<(i64, i64)>, EvalError> {
+        self.0
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<(i64, i64)>> {
+                let mut stmt = c.prepare_cached("SELECT last_accessed_at FROM memory WHERE id = ?1")?;
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(at) = stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()? {
+                        out.push((id, at));
+                    }
+                }
+                Ok(out)
             })
-            .collect())
+            .await
+            .map_err(|e| EvalError::Read(e.to_string()))
     }
 
     /// What the live rows of the store are, in counts and names.
@@ -1559,15 +1620,15 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            with_text.iter().any(|h| h.id == m_id),
+            with_text.hits.iter().any(|h| h.id == m_id),
             "M is reachable only through the lexical channel, so its absence means the query \
              text never reached it: {:?}",
-            with_text.iter().map(|h| h.id).collect::<Vec<_>>()
+            with_text.hits.iter().map(|h| h.id).collect::<Vec<_>>()
         );
 
         let without_text = store.search(&on_axis, agent, scope, None, 10, scoring, None).await.unwrap();
         assert!(
-            !without_text.iter().any(|h| h.id == m_id),
+            !without_text.hits.iter().any(|h| h.id == m_id),
             "the control must miss M — otherwise the assertion above proves nothing about the \
              lexical channel"
         );
@@ -2376,7 +2437,7 @@ mod tests {
         let unowned = put_row(&store, None, None, MemoryType::SemanticFact, "unowned row", at_cosine(0.97)).await;
 
         let hits = store.search(&at_cosine(1.0), "a", MEMORY_ONLY, None, 10, EvalScoringConfig::default(), None).await;
-        let mut ids: Vec<i64> = hits.unwrap().iter().map(|h| h.id).collect();
+        let mut ids: Vec<i64> = hits.unwrap().hits.iter().map(|h| h.id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![own, other, unowned]);
 
@@ -2401,7 +2462,7 @@ mod tests {
 
         let hits =
             store.search(&at_cosine(1.0), "a", MEMORY_ONLY, Some("p"), 10, EvalScoringConfig::default(), None).await;
-        let mut ids: Vec<i64> = hits.unwrap().iter().map(|h| h.id).collect();
+        let mut ids: Vec<i64> = hits.unwrap().hits.iter().map(|h| h.id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![in_p, unscoped, preference]);
         assert!(!ids.contains(&in_q));
@@ -2427,10 +2488,32 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(daemons.iter().map(|h| h.id).collect::<Vec<_>>(), own.iter().map(|h| h.id).collect::<Vec<_>>());
-        for (d, o) in daemons.iter().zip(&own) {
+        assert_eq!(daemons.hits.iter().map(|h| h.id).collect::<Vec<_>>(), own.iter().map(|h| h.id).collect::<Vec<_>>());
+        for (d, o) in daemons.hits.iter().zip(&own) {
             assert!((d.score - o.score).abs() < 1e-9, "{} scored {} and {}", d.id, d.score, o.score);
         }
+    }
+
+    #[tokio::test]
+    async fn a_search_hands_back_its_pool_with_each_hits_type_and_last_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let fact = put_row(&store, Some("a"), None, MemoryType::SemanticFact, "a fact", at_cosine(0.99)).await;
+        let summary = put_row(&store, Some("a"), None, MemoryType::SessionSummary, "a summary", at_cosine(0.98)).await;
+
+        let found = store.search(&at_cosine(1.0), "a", MEMORY_ONLY, None, 10, EvalScoringConfig::default(), None).await.unwrap();
+
+        assert_eq!(found.hits.iter().map(|h| (h.id, h.memory_type.as_str())).collect::<Vec<_>>(), [
+            (fact, "semantic_fact"),
+            (summary, "session_summary")
+        ]);
+        assert!(found.hits.iter().all(|h| !h.exact));
+        let pool = &found.pool;
+        assert_eq!((pool.requested, pool.rows, pool.saves, pool.passes, pool.eligible), (30, 2, 2, 1, Some(2)));
+        let accessed = store.last_accessed(vec![fact, summary]).await.unwrap();
+        assert_eq!(accessed.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [fact, summary]);
+        assert!((cosine_from_distance(0.0) - 1.0).abs() < 1e-12);
+        assert!((cosine_from_distance(found.hits[0].distance) - 0.99).abs() < 1e-3);
     }
 
     // --- copy_background --------------------------------------------------

@@ -10,7 +10,7 @@
 mod matcher;
 mod parse;
 pub mod runner;
-mod stats;
+pub(crate) mod stats;
 
 use std::collections::{BTreeMap, HashSet};
 

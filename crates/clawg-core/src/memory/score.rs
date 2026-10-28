@@ -206,7 +206,7 @@ impl Default for ScoringConfig {
 /// Clamped to 0.0: cos ranges [-1, 1], so a distance past sqrt(2) would
 /// otherwise go negative — `max(0.0)` keeps every KNN hit's similarity
 /// factor inside [0, 1] instead of dragging the whole score product negative.
-fn cosine_from_l2_unit(distance: f64) -> f64 {
+pub(crate) fn cosine_from_l2_unit(distance: f64) -> f64 {
     (1.0 - distance * distance / 2.0).max(0.0)
 }
 

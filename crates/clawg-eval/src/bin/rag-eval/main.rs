@@ -16,9 +16,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use clawg_core::eval_api::{
-    compose_query_context, copy_background, model_is_cached, query_budget_tokens,
-    EmbedRole, EvalCaseRef, EvalEmbedder, EvalError, EvalResolveError, EvalResolved, EvalScope, EvalScoringConfig,
-    EvalStore, EvalTokenCounter, MIGRATION_FTS_TOKENIZER, EMBED_MAX_TOKENS, SPECIAL_TOKEN_RESERVE,
+    compose_query_context, copy_background, cosine_from_distance, model_is_cached, query_budget_tokens,
+    EmbedRole, EvalCaseRef, EvalEmbedder, EvalError, EvalKind, EvalResolveError, EvalResolved, EvalScope,
+    EvalScoringConfig, EvalSearch, EvalStore, EvalTokenCounter, MIGRATION_FTS_TOKENIZER, EMBED_MAX_TOKENS,
+    SPECIAL_TOKEN_RESERVE,
 };
 
 use golden::{CaseStatus, CaseSubset, PairLabel};
@@ -359,6 +360,50 @@ fn rank_refs(ids: &[i64], refs: &golden::RefMap, background: bool, cited: &HashM
         .collect()
 }
 
+/// What one case's search over a background shows beside its metrics.
+async fn case_scale(
+    ec: &EmbeddedCase,
+    found: &EvalSearch,
+    seeded: &seed::SeedResult,
+    expected: &HashSet<String>,
+) -> Result<report::CaseScale, EvalError> {
+    let top5 = &found.hits[..found.hits.len().min(5)];
+    let memory_ids = top5.iter().filter(|h| h.kind == EvalKind::Memory).map(|h| h.id).collect();
+    let accessed: HashMap<i64, i64> = seeded.store.last_accessed(memory_ids).await?.into_iter().collect();
+    let now = now_ms();
+    let pool = report::PoolSurvival {
+        requested: found.pool.requested,
+        saves: found.pool.saves,
+        eligible: found.pool.eligible,
+        expected_in_pool: (ec.subset != CaseSubset::Unanswerable).then(|| {
+            found.pool.ids.iter().any(|id| {
+                ec.cited.contains_key(id) || seeded.refs.ref_of(*id).is_some_and(|r| expected.contains(r))
+            })
+        }),
+    };
+    let cause = report::short_pool_cause(&pool);
+    let scores: Vec<f64> = found.hits.iter().map(|h| h.score).collect();
+    Ok(report::CaseScale {
+        project: ec.project.clone(),
+        expected_type: ec.expected_type.clone(),
+        expected_is_last_summary: ec.expected_is_last_summary,
+        top5_types: top5.iter().map(|h| h.memory_type.clone()).collect(),
+        decay_age_days: top5
+            .iter()
+            .map(|h| match h.kind {
+                EvalKind::Memory => accessed.get(&h.id).map(|at| (now - at) as f64 / seed::DAY_MS),
+                _ => None,
+            })
+            .collect(),
+        best_cosine: found.hits.iter().filter(|h| !h.exact).map(|h| cosine_from_distance(h.distance)).reduce(f64::max),
+        score_gap_1_10: report::score_gap_1_10(&scores),
+        passes: Some(found.pool.passes),
+        pool_survival: Some(pool),
+        short_pool: Some(cause.is_some()),
+        short_pool_cause: cause,
+    })
+}
+
 /// Scores the golden cases over the seeded store and writes the results.
 /// `resolved` holds each case's project and cited saves in a background, in
 /// the order of the cases; it is empty without one.
@@ -374,6 +419,8 @@ async fn measure(
 ) -> i32 {
     let golden_set = &loaded_golden.set;
     let lang_by_ref = row_langs(&golden_set.corpus);
+    let type_by_ref: HashMap<&str, &str> =
+        golden_set.corpus.iter().map(|r| (r.ref_.as_str(), r.memory_type.as_str())).collect();
 
     // Every query embedded exactly once, up front — shared unchanged across
     // every grid point's search below, so an N-point sweep never re-embeds
@@ -402,6 +449,7 @@ async fn measure(
             }
         };
         let resolution = resolved.get(i);
+        let cited_save = resolution.and_then(|r| r.expected.first());
         embedded_cases.push(EmbeddedCase {
             query: case.query.clone(),
             expected_refs: case.expected_refs.clone(),
@@ -409,9 +457,20 @@ async fn measure(
             corpus_refs: case.corpus_refs.clone(),
             status: case.status,
             query_lang: case.query_lang.clone(),
-            lang: case_lang(&case.expected_refs, &lang_by_ref),
+            lang: match cited_save {
+                Some(save) => Some(save.lang.clone()),
+                None => case_lang(&case.expected_refs, &lang_by_ref),
+            },
             subset: case.subset,
             stale_refs: case.stale_refs.clone(),
+            project: case.project.clone(),
+            expected_type: match cited_save {
+                Some(save) => Some(save.memory_type.clone()),
+                None => case.expected_refs.first().and_then(|r| type_by_ref.get(r.as_str())).map(|t| t.to_string()),
+            },
+            expected_is_last_summary: cited_save
+                .filter(|save| save.memory_type == "session_summary")
+                .map(|save| save.is_last_summary),
             project_id: resolution.and_then(|r| r.project_id.clone()),
             cited: resolution
                 .map(|r| r.expected.iter().flat_map(|s| s.rows.iter().map(|id| (*id, s.origin.clone()))).collect())
@@ -591,8 +650,8 @@ async fn measure(
         let mut blocked = Vec::new();
         let mut unanswerable = Vec::new();
         for ec in &embedded_cases {
-            let ids: Vec<i64> = if cli.lexical_only {
-                seeded.store.lexical_search(&ec.query, seed::AGENT_ID, K_FINAL).await
+            let found = if cli.lexical_only {
+                None
             } else {
                 match seeded
                     .store
@@ -607,16 +666,30 @@ async fn measure(
                     )
                     .await
                 {
-                    Ok(h) => h.iter().map(|h| h.id).collect(),
+                    Ok(found) => Some(found),
                     Err(e) => {
                         eprintln!("search failed for query '{}': {e}", ec.query);
                         return EXIT_RUNTIME_FAILURE;
                     }
                 }
             };
+            let ids: Vec<i64> = match &found {
+                Some(found) => found.hits.iter().map(|h| h.id).collect(),
+                None => seeded.store.lexical_search(&ec.query, seed::AGENT_ID, K_FINAL).await,
+            };
             let ranked_refs = rank_refs(&ids, &seeded.refs, background.is_some(), &ec.cited);
             let expected_refs: Vec<String> = ec.expected_refs.iter().chain(&ec.expected_origins).cloned().collect();
             let expected: HashSet<String> = expected_refs.iter().cloned().collect();
+            let scale = match (&background, &found) {
+                (Some(_), Some(found)) => match case_scale(ec, found, seeded, &expected).await {
+                    Ok(scale) => scale,
+                    Err(e) => {
+                        eprintln!("failed to read the hits of '{}': {e}", ec.query);
+                        return EXIT_RUNTIME_FAILURE;
+                    }
+                },
+                _ => report::CaseScale::default(),
+            };
 
             let recall_1 = metrics::recall_at_k(&ranked_refs, &expected, 1);
             let recall_5 = metrics::recall_at_k(&ranked_refs, &expected, 5);
@@ -642,6 +715,7 @@ async fn measure(
                 subset: ec.subset,
                 abstained,
                 fresh_first,
+                scale,
             };
 
             if abstained.is_some() {
@@ -659,7 +733,10 @@ async fn measure(
             }
         }
 
-        let retrieval = report::RetrievalResults::from_cases(per_case, blocked, unanswerable);
+        let mut retrieval = report::RetrievalResults::from_cases(per_case, blocked, unanswerable);
+        retrieval.scale = background
+            .as_ref()
+            .map(|b| report::scale_of(&retrieval.per_case, &retrieval.unanswerable, &b.composition.by_type));
         let aggregate = retrieval.aggregate;
         let per_case = &retrieval.per_case;
         // Computed unconditionally, not gated behind `cli.audit`: a sweep's
@@ -1029,7 +1106,7 @@ async fn score_follow_up_arm<'a>(
             .search(&embedding, seed::AGENT_ID, K_POOL, None, K_FINAL, EvalScoringConfig::default(), Some(&arm.lexical))
             .await
         {
-            Ok(h) => h,
+            Ok(found) => found.hits,
             Err(e) => {
                 eprintln!("search failed for '{}': {e}", case.query);
                 return Err(EXIT_RUNTIME_FAILURE);
@@ -1060,6 +1137,7 @@ async fn score_follow_up_arm<'a>(
             subset: case.subset,
             abstained: None,
             fresh_first: None,
+            scale: Default::default(),
         });
     }
     Ok(per_case)
@@ -1145,6 +1223,10 @@ struct EmbeddedCase {
     lang: Option<String>,
     subset: CaseSubset,
     stale_refs: Vec<String>,
+    /// The case's project, as the case names it.
+    project: Option<String>,
+    expected_type: Option<String>,
+    expected_is_last_summary: Option<bool>,
     /// The background's own id of the case's project.
     project_id: Option<String>,
     /// Every live row of the saves the case cites, with its origin.
@@ -1349,6 +1431,7 @@ fn build_similarity_results(
             subset: src.subset,
             abstained: None,
             fresh_first: None,
+            scale: Default::default(),
         });
 
         // Query-anchored rivals: every OTHER corpus vector, not just this
@@ -1744,6 +1827,113 @@ mod tests {
         assert_eq!(json["retrieval"]["abstention"]["n_cases"], 1);
         std::fs::remove_dir_all(&out_dir).ok();
         std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    /// The results of `--fake` on `golden_json` over `snapshot`, which it removes.
+    async fn results_over(golden_json: &str, snapshot: PathBuf, tag: &str) -> (String, serde_json::Value) {
+        let (out_dir, scratch) = (temp_path(&format!("{tag}-out")), temp_path(&format!("{tag}-scratch")));
+        assert_eq!(run_over(golden_json, &snapshot, tag, &out_dir, &scratch).await, EXIT_OK);
+        let (_, raw, json) = only_results(&out_dir);
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+        (raw, json)
+    }
+
+    #[tokio::test]
+    async fn a_case_reports_the_type_of_each_top5_hit() {
+        let (_, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "top5").await;
+
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["expected_type"], "chat_message");
+        assert_eq!(
+            case["top5_types"],
+            serde_json::json!(["chat_message", "semantic_fact", "semantic_fact", "semantic_fact", "semantic_fact"]),
+            "the identical golden row first, then the background by id: {case}"
+        );
+    }
+
+    #[tokio::test]
+    async fn best_cosine_of_an_identical_row_is_one() {
+        let (_, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "cosine").await;
+
+        let best = json["retrieval"]["per_case"][0]["best_cosine"].as_f64().unwrap();
+        assert!((best - 1.0).abs() < 1e-6, "{best}");
+        assert!(json["retrieval"]["per_case"][0]["score_gap_1_10"].as_f64().unwrap() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_case_reports_passes_pool_survival_and_decay_age() {
+        let (_, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "pool").await;
+
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["passes"], 1);
+        assert_eq!(
+            case["pool_survival"],
+            serde_json::json!({"requested": 30, "saves": 23, "eligible": 23, "expected_in_pool": true}),
+            "{case}"
+        );
+        let ages = case["decay_age_days"].as_array().unwrap();
+        assert_eq!(ages.len(), 5);
+        assert!(ages.iter().all(|a| a.as_f64().unwrap() < 1.0), "{ages:?}");
+    }
+
+    #[tokio::test]
+    async fn a_case_whose_pool_returns_fewer_than_thirty_saves_is_a_short_pool() {
+        let (_, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "short").await;
+
+        let retrieval = &json["retrieval"];
+        assert_eq!(retrieval["per_case"][0]["short_pool"], true);
+        assert_eq!(retrieval["per_case"][0]["short_pool_cause"], "scope");
+        assert_eq!(retrieval["scale"]["short_pool_cases"], serde_json::json!({"scope": 2, "crowded": 0}));
+        assert_eq!(retrieval["scale"]["top3_by_type"]["n_cases"], 0, "a short pool stays out of the weight aggregates");
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_case_reports_its_distribution_apart() {
+        let golden = golden_with_case(r#"{"query": "a question nobody answered", "subset": "unanswerable"}"#);
+
+        let (_, json) = results_over(&golden, background_snapshot(&background_notes(40)).await, "unanswerable-scale").await;
+
+        let retrieval = &json["retrieval"];
+        assert_eq!(retrieval["per_case"].as_array().unwrap().len(), 2);
+        let unanswered = &retrieval["unanswerable"][0];
+        assert_eq!(unanswered["top5_types"].as_array().unwrap().len(), 5, "{unanswered}");
+        assert!(unanswered.get("best_cosine").is_some(), "{unanswered}");
+        assert!(unanswered["pool_survival"].get("expected_in_pool").is_none(), "{unanswered}");
+        let cells = retrieval["scale"]["distributions"].as_array().unwrap();
+        assert!(cells.iter().any(|d| d["answered"] == false), "{cells:?}");
+    }
+
+    #[tokio::test]
+    async fn the_per_case_report_holds_no_stored_text_or_row_id() {
+        let (raw, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "no-text").await;
+
+        assert!(!raw.contains("harbour timetable"));
+        let mut keys: Vec<String> = json["retrieval"]["per_case"][0].as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "best_cosine", "decay_age_days", "expected_refs", "expected_type", "lang", "mrr", "ndcg@10", "passes",
+                "pool_survival", "query", "ranked_refs", "recall@1", "recall@10", "recall@5", "score_gap_1_10",
+                "short_pool", "short_pool_cause", "status", "subset", "top5_types"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_case_expecting_a_summary_says_whether_it_is_the_last_one() {
+        const SUMMARY: &str = "the last session moved the ferry timetable to the harbour office";
+        let imports = [Imported { origin: "engram:last", project: Some("app-1111"), memory_type: "session_summary", text: SUMMARY }];
+        let snapshot = background_with(&background_notes(5), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(&format!(r#"{{"query": "{SUMMARY}", "expected_origins": ["engram:last"], "project": "App"}}"#));
+
+        let (_, json) = results_over(&golden, snapshot, "last-summary").await;
+
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["project"], "App");
+        assert_eq!(case["expected_type"], "session_summary");
+        assert_eq!(case["expected_is_last_summary"], true, "{case}");
     }
 
     #[test]
