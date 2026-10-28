@@ -1,14 +1,14 @@
 change: ranking-at-scale
 objective: "1"
 depends_on: [history-import, piece-boundaries]
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: in-progress
   verify: pending
   archive: pending
-updated: 2026-10-23
+updated: 2026-10-28
