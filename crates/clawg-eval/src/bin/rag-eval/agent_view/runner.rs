@@ -21,7 +21,7 @@ use super::{
     AnswerView, CaseView, ContextOutcome, SearchOutcome,
 };
 use crate::golden::{CaseSubset, GoldenSet};
-use crate::seed::AGENT_ID;
+use crate::seed::{age_ms, AGENT_ID};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -90,7 +90,7 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
 
     let ingest = EvalIngest::open(scratch, input.embedder, input.tokenizer_dir).await?;
     for row in &input.golden_set.corpus {
-        ingest.send(AGENT_ID, &row.content, &row.memory_type, row.importance).await?;
+        ingest.send(AGENT_ID, &row.content, &row.memory_type, row.importance, age_ms(row.age_days)).await?;
     }
     let runtime = ingest.finish().await?;
     // The context endpoint writes a workspace file under the runtime's base

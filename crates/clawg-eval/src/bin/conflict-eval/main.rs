@@ -206,8 +206,8 @@ async fn measure_all<'a>(
     for pair in pairs {
         let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let ingest = EvalIngest::open(dir.path(), embedder, tokenizer_dir).await.map_err(|e| e.to_string())?;
-        ingest.send(AGENT, &pair.old, &pair.memory_type, 5.0).await.map_err(|e| e.to_string())?;
-        ingest.send(AGENT, &pair.new, &pair.memory_type, 5.0).await.map_err(|e| e.to_string())?;
+        ingest.send(AGENT, &pair.old, &pair.memory_type, 5.0, 0).await.map_err(|e| e.to_string())?;
+        ingest.send(AGENT, &pair.new, &pair.memory_type, 5.0, 0).await.map_err(|e| e.to_string())?;
         let runtime = ingest.finish().await.map_err(|e| e.to_string())?;
         let found = conflict_pairs(&runtime).await.map_err(|e| e.to_string())?;
         let outcome = PairOutcome { candidate: !found.is_empty(), escalated: found.iter().any(|p| p.escalated) };
@@ -218,7 +218,7 @@ async fn measure_all<'a>(
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let ingest = EvalIngest::open(dir.path(), embedder, tokenizer_dir).await.map_err(|e| e.to_string())?;
     for save in flow {
-        ingest.send(AGENT, &save.content, &save.memory_type, 5.0).await.map_err(|e| e.to_string())?;
+        ingest.send(AGENT, &save.content, &save.memory_type, 5.0, 0).await.map_err(|e| e.to_string())?;
     }
     let runtime = ingest.finish().await.map_err(|e| e.to_string())?;
     let flow_pairs: Vec<(i64, bool)> = conflict_pairs(&runtime)

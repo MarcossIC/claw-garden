@@ -517,7 +517,8 @@ pub struct EvalCandidate {
     pub escalated: bool,
 }
 
-/// The event an explicit save enters the worker as.
+/// The event an explicit save enters the worker as, `age_ms` before now: the
+/// worker stores a save at the instant of its event.
 fn explicit_event(
     agent_id: &str,
     project_id: Option<&str>,
@@ -525,11 +526,13 @@ fn explicit_event(
     memory_type: &str,
     importance: f64,
     topic_key: Option<&str>,
+    age_ms: u64,
 ) -> MemoryEvent {
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .saturating_sub(age_ms);
     MemoryEvent {
         agent_id: agent_id.to_string(),
         project_id: project_id.map(str::to_string),
@@ -600,16 +603,18 @@ impl EvalIngest {
     ///
     /// Waits for room when the queue is full: a measurement loads its whole
     /// set before reading, and refusing a row would measure a smaller set.
+    /// `age_ms` backdates the save from now, as [`EvalStore::insert`] does.
     pub async fn send(
         &self,
         agent_id: &str,
         content: &str,
         memory_type: &str,
         importance: f64,
+        age_ms: u64,
     ) -> Result<(), EvalError> {
         parse_memory_type(memory_type)?;
         self.tx
-            .send(explicit_event(agent_id, None, content, memory_type, importance, None).into())
+            .send(explicit_event(agent_id, None, content, memory_type, importance, None, age_ms).into())
             .await
             .map_err(|_| EvalError::Insert("the ingest worker has stopped".to_string()))
     }
@@ -632,6 +637,7 @@ impl EvalIngest {
             save.memory_type,
             save.importance,
             save.topic_key,
+            0,
         );
         self.tx
             .send(IngestRequest { event, reply: Some(reply), outbox: None })
@@ -1399,7 +1405,7 @@ mod tests {
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         for i in 0..5 {
             ingest
-                .send("agent-ingest", &format!("distinct memory number {i} about the ingest drain"), "chat_message", 3.0)
+                .send("agent-ingest", &format!("distinct memory number {i} about the ingest drain"), "chat_message", 3.0, 0)
                 .await
                 .unwrap();
         }
@@ -1414,10 +1420,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eval_ingest_backdates_created_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        const DAY_MS: u64 = 86_400_000;
+        ingest.send("agent-ingest", "a fresh note about the ferry", "semantic_fact", 3.0, 0).await.unwrap();
+        ingest.send("agent-ingest", "an old note about the harbour", "semantic_fact", 3.0, 300 * DAY_MS).await.unwrap();
+
+        let runtime = ingest.finish().await.unwrap();
+
+        let created: Vec<i64> = runtime
+            .store
+            .conn
+            .call(|c| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = c.prepare("SELECT created_at FROM memory ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 2);
+        let gap = created[0] - created[1];
+        assert!((gap - (300 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
+    }
+
+    #[tokio::test]
     async fn ingest_honours_the_declared_type_and_importance() {
         let dir = tempfile::tempdir().unwrap();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
-        ingest.send("agent-ingest", "always answer in rioplatense spanish", "user_preference", 9.5).await.unwrap();
+        ingest.send("agent-ingest", "always answer in rioplatense spanish", "user_preference", 9.5, 0).await.unwrap();
 
         let runtime = ingest.finish().await.unwrap();
 
@@ -1433,7 +1464,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
-        match ingest.send("agent-ingest", "content", "not_a_real_type", 3.0).await {
+        match ingest.send("agent-ingest", "content", "not_a_real_type", 3.0, 0).await {
             Err(EvalError::UnknownMemoryType(t)) => assert_eq!(t, "not_a_real_type"),
             other => panic!("expected UnknownMemoryType, got {other:?}"),
         }
@@ -1744,7 +1775,7 @@ mod tests {
     async fn ingest_runtime_never_records_access() {
         let dir = tempfile::tempdir().unwrap();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
-        ingest.send("agent-ingest", "a single row whose access count must not move", "chat_message", 3.0).await.unwrap();
+        ingest.send("agent-ingest", "a single row whose access count must not move", "chat_message", 3.0, 0).await.unwrap();
         let runtime = ingest.finish().await.unwrap();
         let id: i64 = runtime
             .store

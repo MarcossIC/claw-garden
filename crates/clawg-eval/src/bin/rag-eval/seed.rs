@@ -89,7 +89,7 @@ pub async fn seed(
 const DAY_MS: f64 = 86_400_000.0;
 
 /// A row's `age_days` as the whole milliseconds the store backdates it by.
-fn age_ms(age_days: f64) -> u64 {
+pub(crate) fn age_ms(age_days: f64) -> u64 {
     (age_days * DAY_MS).round() as u64
 }
 
