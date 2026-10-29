@@ -61,13 +61,18 @@ pub async fn seed(
 ) -> Result<SeedResult, EvalError> {
     let store = EvalStore::open(store_path).await?;
     if let Some(tokenizer) = fts_tokenizer {
-        store.recreate_fts_with_tokenizer(tokenizer).await?;
+        if let Err(e) = store.recreate_fts_with_tokenizer(tokenizer).await {
+            close_after_failure(store).await;
+            return Err(e);
+        }
     }
     seed_onto(store, store_path.to_path_buf(), corpus, embedder).await
 }
 
 /// Inserts every row of `corpus` into `store`, open at `store_path`, which
-/// may already hold rows: a background the corpus is measured among.
+/// may already hold rows: a background the corpus is measured among. A
+/// failure closes `store` before it is returned, since this call took the
+/// only handle the caller could close it with.
 pub async fn seed_onto(
     store: EvalStore,
     store_path: PathBuf,
@@ -78,22 +83,40 @@ pub async fn seed_onto(
     let mut norms: Vec<f64> = Vec::with_capacity(corpus.len());
     let mut vectors: Vec<(String, Vec<f32>)> = Vec::with_capacity(corpus.len());
 
-    for row in corpus {
-        // Passage: corpus rows are the stored side of the space — this must
-        // match production's worker.rs role, or the harness seeds a space
-        // production never writes to.
-        let embedding = embedder.embed_with_role(&row.content, EmbedRole::Passage).await?;
-        norms.push(l2_norm(&embedding));
-        vectors.push((row.ref_.clone(), embedding.clone()));
-        let id = store
-            .insert(AGENT_ID, &row.content, &row.memory_type, row.importance, embedding, age_ms(row.age_days))
-            .await?;
-        refs.insert(row.ref_.clone(), id);
+    let inserted = async {
+        for row in corpus {
+            // Passage: corpus rows are the stored side of the space — this must
+            // match production's worker.rs role, or the harness seeds a space
+            // production never writes to.
+            let embedding = embedder.embed_with_role(&row.content, EmbedRole::Passage).await?;
+            norms.push(l2_norm(&embedding));
+            vectors.push((row.ref_.clone(), embedding.clone()));
+            let id = store
+                .insert(AGENT_ID, &row.content, &row.memory_type, row.importance, embedding, age_ms(row.age_days))
+                .await?;
+            refs.insert(row.ref_.clone(), id);
+        }
+        Ok::<_, EvalError>(())
+    }
+    .await;
+    if let Err(e) = inserted {
+        close_after_failure(store).await;
+        return Err(e);
     }
 
     let (mean_norm, max_norm_deviation) = norm_stats(&norms);
 
     Ok(SeedResult { store, refs, store_path, mean_norm, max_norm_deviation, vectors })
+}
+
+/// Closes `store` on a path that already failed. The failure that stopped the
+/// run is the one to report, so one in closing is only a warning; the close is
+/// still awaited, since the directory is removed next and on Windows a file
+/// still open cannot be deleted.
+pub(crate) async fn close_after_failure(store: EvalStore) {
+    if let Err(e) = store.close().await {
+        eprintln!("warning: {e}");
+    }
 }
 
 pub(crate) const DAY_MS: f64 = 86_400_000.0;
@@ -259,6 +282,19 @@ mod tests {
             Err(other) => panic!("expected UnknownMemoryType, got {other}"),
             Ok(_) => panic!("unknown memory_type must fail the whole seed"),
         }
+    }
+
+    /// The store is the seed's to close once it took it: a caller that
+    /// removes the directory after a failure must find nothing held.
+    #[tokio::test]
+    async fn a_failed_seed_lets_go_of_its_store() {
+        let corpus = vec![row("c1", "content", "not_a_real_type", 3.0)];
+        let embedder = EvalEmbedder::fake();
+        let store = temp_path("seed-failed-close");
+
+        assert!(seed(&store, &corpus, &embedder, None).await.is_err());
+
+        std::fs::remove_dir_all(&store).expect("the store must come off at the first attempt");
     }
 
     #[tokio::test]

@@ -316,22 +316,28 @@ async fn seed_over_background(
     std::fs::create_dir_all(scratch).map_err(|e| EvalError::Open(format!("{}: {e}", scratch.display())))?;
     let copied = copy_background(snapshot, scratch, embedder)?;
     let store = EvalStore::open(scratch).await?;
-    let resolved = match store.resolve_cases(cases).await {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            store.close().await?;
-            return Err(OverFailure::Golden(e));
+    let read = async {
+        let resolved = store.resolve_cases(cases).await.map_err(OverFailure::Golden)?;
+        let composition = store.composition().await?;
+        Ok::<_, OverFailure>((resolved, composition))
+    }
+    .await;
+    let (resolved, composition) = match read {
+        Ok(read) => read,
+        Err(failure) => {
+            seed::close_after_failure(store).await;
+            return Err(failure);
         }
     };
-    let composition = store.composition().await?;
     let seeded = seed::seed_onto(store, scratch.to_path_buf(), corpus, embedder).await?;
-    let mut twins: Vec<String> = seeded
-        .store
-        .twins(seeded.refs.ids())
-        .await?
-        .into_iter()
-        .filter_map(|id| seeded.refs.ref_of(id).map(str::to_string))
-        .collect();
+    let twins = seeded.store.twins(seeded.refs.ids()).await;
+    let mut twins: Vec<String> = match twins {
+        Ok(ids) => ids.into_iter().filter_map(|id| seeded.refs.ref_of(id).map(str::to_string)).collect(),
+        Err(e) => {
+            seed::close_after_failure(seeded.store).await;
+            return Err(e.into());
+        }
+    };
     twins.sort();
     let background = report::Background {
         path: snapshot.to_string_lossy().to_string(),

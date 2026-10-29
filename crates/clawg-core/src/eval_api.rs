@@ -840,8 +840,21 @@ impl EvalIngest {
     pub async fn finish(self) -> Result<MemoryRuntime, EvalError> {
         let Self { tx, worker, runtime } = self;
         drop(tx);
-        worker.await.map_err(|e| EvalError::Insert(format!("the ingest worker failed: {e}")))?;
+        if let Err(e) = worker.await {
+            runtime.close().await;
+            return Err(EvalError::Insert(format!("the ingest worker failed: {e}")));
+        }
         Ok(runtime)
+    }
+
+    /// Stops the worker and closes the store, for a run that ends before
+    /// [`finish`](Self::finish) hands the runtime on: dropping it only signals
+    /// the connection's thread, and on Windows a file still open cannot be
+    /// deleted.
+    pub async fn close(self) {
+        if let Ok(runtime) = self.finish().await {
+            runtime.close().await;
+        }
     }
 }
 

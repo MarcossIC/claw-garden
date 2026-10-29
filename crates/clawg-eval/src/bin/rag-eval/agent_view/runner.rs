@@ -122,45 +122,59 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
         None => None,
     };
     let ingest = EvalIngest::open(scratch, input.embedder, input.tokenizer_dir).await?;
-    let over = match copied {
-        Some((snapshot, copied)) => {
-            let cases: Vec<EvalCaseRef> = input
-                .golden_set
-                .retrieval_cases
-                .iter()
-                .map(|c| EvalCaseRef { id: c.query.clone(), project: c.project.clone(), origins: c.expected_origins.clone() })
-                .collect();
-            let resolved = ingest.resolve_cases(&cases).await?;
-            let composition = ingest.composition().await?;
-            let texts = input.golden_set.corpus.iter().map(|r| r.content.clone()).collect();
-            let mut golden_twins: Vec<String> = ingest
-                .holding(texts)
-                .await?
-                .into_iter()
-                .map(|i| input.golden_set.corpus[i].ref_.clone())
-                .collect();
-            golden_twins.sort();
-            let background = crate::report::Background {
-                path: snapshot.to_string_lossy().to_string(),
-                sha256: copied.sha256,
-                contract: copied.contract,
-                schema: crate::report::SchemaSpan { from: copied.schema_from, to: copied.schema_to },
-                searched_at_ms: crate::now_ms(),
-                composition,
-                golden_twins,
-            };
-            Some(Over { background, resolved })
+    let fed = async {
+        let over = match copied {
+            Some((snapshot, copied)) => {
+                let cases: Vec<EvalCaseRef> = input
+                    .golden_set
+                    .retrieval_cases
+                    .iter()
+                    .map(|c| EvalCaseRef { id: c.query.clone(), project: c.project.clone(), origins: c.expected_origins.clone() })
+                    .collect();
+                let resolved = ingest.resolve_cases(&cases).await?;
+                let composition = ingest.composition().await?;
+                let texts = input.golden_set.corpus.iter().map(|r| r.content.clone()).collect();
+                let mut golden_twins: Vec<String> = ingest
+                    .holding(texts)
+                    .await?
+                    .into_iter()
+                    .map(|i| input.golden_set.corpus[i].ref_.clone())
+                    .collect();
+                golden_twins.sort();
+                let background = crate::report::Background {
+                    path: snapshot.to_string_lossy().to_string(),
+                    sha256: copied.sha256,
+                    contract: copied.contract,
+                    schema: crate::report::SchemaSpan { from: copied.schema_from, to: copied.schema_to },
+                    searched_at_ms: crate::now_ms(),
+                    composition,
+                    golden_twins,
+                };
+                Some(Over { background, resolved })
+            }
+            None => None,
+        };
+        for row in &input.golden_set.corpus {
+            ingest.send(AGENT_ID, &row.content, &row.memory_type, row.importance, age_ms(row.age_days)).await?;
         }
-        None => None,
-    };
-    for row in &input.golden_set.corpus {
-        ingest.send(AGENT_ID, &row.content, &row.memory_type, row.importance, age_ms(row.age_days)).await?;
+        Ok::<_, RunError>(over)
     }
+    .await;
+    // The caller removes the scratch directory on a failure, which only works
+    // once nothing holds the store.
+    let over = match fed {
+        Ok(over) => over,
+        Err(e) => {
+            ingest.close().await;
+            return Err(e);
+        }
+    };
     let runtime = ingest.finish().await?;
     // The context endpoint writes a workspace file under the runtime's base
     // directory; checking the directory the runtime reports, not the one that
     // was asked for, is what makes "nothing outside temp is written" hold.
     if !runtime.base_dir.starts_with(&temp) {
+        runtime.close().await;
         return Err(RunError::OutsideTemp(runtime.base_dir.clone(), temp));
     }
 
@@ -175,7 +189,13 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
         sessions: Default::default(),
         metrics: Default::default(),
     });
-    let (addr, server) = serve_ephemeral(app.clone()).await.map_err(RunError::Serve)?;
+    let (addr, server) = match serve_ephemeral(app.clone()).await {
+        Ok(served) => served,
+        Err(e) => {
+            app.runtime.close().await;
+            return Err(RunError::Serve(e));
+        }
+    };
     let client = DaemonClient::new(format!("http://{addr}"), TOKEN, scratch.to_path_buf());
     Ok(Session { client, server, app, over })
 }
@@ -457,6 +477,34 @@ mod tests {
         let session = start(&input, &scratch).await.expect("start");
 
         release(session).await.expect("release");
+
+        std::fs::remove_dir_all(&scratch).expect("the scratch directory must come off at the first attempt");
+    }
+
+    /// The ingest refuses a corpus row of an unknown type once the store is
+    /// open, so the start fails while the store and its worker still hold it.
+    #[tokio::test]
+    async fn a_start_that_fails_after_opening_the_store_holds_no_file_in_the_scratch_directory() {
+        let golden: GoldenSet = serde_json::from_value(serde_json::json!({
+            "corpus": [{"ref": "c1", "content": A, "memory_type": "not_a_real_type", "importance": 3.0}],
+            "retrieval_cases": [],
+            "contradiction_pairs": []
+        }))
+        .expect("golden fixture must deserialize");
+        let scratch = scratch();
+        let input = AgentViewInput {
+            golden_set: &golden,
+            embedder: &EvalEmbedder::fake(),
+            counter: &EvalTokenCounter::fake(),
+            tokenizer_dir: &scratch,
+            background: None,
+        };
+
+        match start(&input, &scratch).await {
+            Err(RunError::Eval(EvalError::UnknownMemoryType(_))) => {}
+            Err(other) => panic!("expected UnknownMemoryType, got {other}"),
+            Ok(_) => panic!("a corpus row of an unknown type must stop the start"),
+        }
 
         std::fs::remove_dir_all(&scratch).expect("the scratch directory must come off at the first attempt");
     }
