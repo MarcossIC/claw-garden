@@ -615,12 +615,14 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         let mut names = conn.prepare("SELECT DISTINCT name FROM gauge_minute").unwrap();
         let names: Vec<String> = names.query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        // The gauges `sample` writes for this input; a system that cannot read a
+        // value leaves its gauge out, so the file may hold fewer, never others.
+        const WRITTEN: [&str; 5] =
+            ["process.private_bytes", "process.private_peak_bytes", "embedder.resident", "rt.alive_tasks", "rt.global_queue_depth"];
         assert!(
-            names.iter().all(|name| !name.contains("load")),
-            "the peak a load reaches goes to the log alone: {names:?}"
+            names.iter().all(|name| WRITTEN.contains(&name.as_str())),
+            "the peak a load reaches goes to the log alone, and no other gauge joins the minute: {names:?}"
         );
-        let peaks = names.iter().filter(|name| name.contains("peak")).count();
-        assert!(peaks <= 2, "only the process peaks of the minute are written: {names:?}");
     }
 
     fn rusqlite_drop_tables(path: &Path) {
