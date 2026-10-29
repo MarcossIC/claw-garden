@@ -96,11 +96,11 @@ Revisado: ni `agent_contract.json` ni `agent_contract.es.json` cambian (ninguna 
 
 ## 6. `test(embedder): pin the embedding contract together with its model id` (D7; RM4)
 
-- [ ] Test primero (`crates/clawg-core/src/memory/embedder.rs`, `mod tests`): `the_embedding_contract_is_pinned`, una tabla de literales: `E5_MODEL_ID` (`:135`), `E5_QUERY_PREFIX` (`:109`), `E5_PASSAGE_PREFIX` (`:130`), `EMBED_MAX_TOKENS` (`:166`), `EMBEDDING_DIM` (`vector.rs:8`), `MODEL_SHA256`, `TOKENIZER_JSON_SHA256`, `CONFIG_JSON_SHA256`, `SPECIAL_TOKENS_MAP_SHA256` y `TOKENIZER_CONFIG_SHA256` (`model_download.rs:62-71`), el sufijo `/mean` del id y los bits de `pool_and_normalize` (`:290`) sobre la entrada `[1, 3, 2]` con máscara `[1, 1, 0]`, escritos como literales desde el código de hoy.
-- [ ] Cada aserción lleva un mensaje que pregunta si `E5_MODEL_ID` tiene que subir. Como este test pasa de entrada (fija lo que existe), comprobar a mano que falla: cambiar un literal, ver el mensaje y deshacerlo, antes de commitear.
-- [ ] Los literales de `:1119`, `:1176` y `:1492` se quedan.
-- [ ] Sin cambios en `.claude/CLAUDE.md`. Entra antes que el 7.
-- [ ] Verificación: suite y clippy.
+- [x] Test primero (`crates/clawg-core/src/memory/embedder.rs`, `mod tests`): `the_embedding_contract_is_pinned`, una tabla de literales: `E5_MODEL_ID` (`:135`), `E5_QUERY_PREFIX` (`:109`), `E5_PASSAGE_PREFIX` (`:130`), `EMBED_MAX_TOKENS` (`:166`), `EMBEDDING_DIM` (`vector.rs:8`), `MODEL_SHA256`, `TOKENIZER_JSON_SHA256`, `CONFIG_JSON_SHA256`, `SPECIAL_TOKENS_MAP_SHA256` y `TOKENIZER_CONFIG_SHA256` (`model_download.rs:62-71`), el sufijo `/mean` del id y los bits de `pool_and_normalize` (`:290`) sobre la entrada `[1, 3, 2]` con máscara `[1, 1, 0]`, escritos como literales desde el código de hoy.
+- [x] Cada aserción lleva un mensaje que pregunta si `E5_MODEL_ID` tiene que subir. Como este test pasa de entrada (fija lo que existe), comprobar a mano que falla: cambiar un literal, ver el mensaje y deshacerlo, antes de commitear.
+- [x] Los literales de `:1119`, `:1176` y `:1492` se quedan.
+- [x] Sin cambios en `.claude/CLAUDE.md`. Entra antes que el 7.
+- [x] Verificación: suite y clippy.
 
 ## 7. `perf(docs): a refresh keeps the vector of every passage whose text the index holds` (D6; RM5)
 

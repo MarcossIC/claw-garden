@@ -1544,4 +1544,52 @@ mod tests {
         );
         assert_ne!(E5_QUERY_PREFIX, "query:", "the trailing space is load-bearing");
     }
+
+    /// Everything that decides which vector a text gets, written as literals.
+    /// Stored vectors are reused under the id of this contract, so a change to
+    /// any of them that keeps the id would leave vectors of two spaces side by
+    /// side.
+    #[test]
+    fn the_embedding_contract_is_pinned() {
+        use crate::memory::model_download as md;
+        let ask = "does E5_MODEL_ID have to change, so that stored vectors are embedded again?";
+
+        assert_eq!(E5_MODEL_ID, "multilingual-e5-small/mean", "{ask}");
+        assert!(E5_MODEL_ID.ends_with("/mean"), "the pooling is part of the id: {ask}");
+        assert_eq!(E5_QUERY_PREFIX, "query: ", "{ask}");
+        assert_eq!(E5_PASSAGE_PREFIX, "query: ", "{ask}");
+        assert_eq!(EMBED_MAX_TOKENS, 512, "{ask}");
+        assert_eq!(crate::memory::vector::EMBEDDING_DIM, 384, "{ask}");
+        assert_eq!(
+            md::MODEL_SHA256,
+            "ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665",
+            "{ask}"
+        );
+        assert_eq!(
+            md::TOKENIZER_JSON_SHA256,
+            "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+            "{ask}"
+        );
+        assert_eq!(
+            md::CONFIG_JSON_SHA256,
+            "69137736cab8b8903a07fe8afaafdda25aac55415a12a55d1bffa9f581abf959",
+            "{ask}"
+        );
+        assert_eq!(
+            md::SPECIAL_TOKENS_MAP_SHA256,
+            "d05497f1da52c5e09554c0cd874037a083e1dc1b9cfd48034d1c717f1afc07a7",
+            "{ask}"
+        );
+        assert_eq!(
+            md::TOKENIZER_CONFIG_SHA256,
+            "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
+            "{ask}"
+        );
+
+        // Two tokens count, the third is masked out: mean [2, 3], then L2.
+        let hidden = [1.0f32, 2.0, 3.0, 4.0, 100.0, 200.0];
+        let pooled = pool_and_normalize(&hidden, &[1, 3, 2], &[1, 1, 0]).unwrap();
+        let bits: Vec<u32> = pooled[0].iter().map(|x| x.to_bits()).collect();
+        assert_eq!(bits, vec![0x3f0e00d5, 0x3f550140], "pooling and normalization changed: {ask}");
+    }
 }
