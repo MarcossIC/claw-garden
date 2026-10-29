@@ -91,3 +91,5 @@ No hay herramienta de cobertura instalada (`cargo llvm-cov`, `cargo tarpaulin`).
 ## Veredicto
 
 Pasa con advertencias. RM1 a RM5 se cumplen en Windows, y la puerta dejó `View` con lo medido. Antes de archivar faltan la frase del pico en `.claude/CLAUDE.md` (W1), la marca de `tasks.md:118` (W3) y el CI del pull request en Linux. W2 queda aceptado.
+
+Después de la verificación, W1 se cerró con `43771c6`: la frase de la recarga en `.claude/CLAUDE.md` dice ahora que en Windows cada carga nombra el pico privado que alcanzó, o que siguió donde lo dejó otra carga, y que eso no suma nada a `metrics.db`. W3 se cerró marcando `tasks.md:118`. Queda el CI del pull request en Linux.
