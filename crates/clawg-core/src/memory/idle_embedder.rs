@@ -21,7 +21,7 @@ use futures::future::BoxFuture;
 use tokio::time::Instant;
 
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::metrics::{mib, MemoryProbe};
+use crate::metrics::{mib, MemoryProbes};
 
 /// Loads the model again: the same files and the same load the bootstrap used.
 pub type ReloadFn =
@@ -81,15 +81,29 @@ enum Cause {
 }
 
 /// The line a load logs: who asked, how long it took and the private memory
-/// around it, when the daemon gave a way to read it.
-fn load_line(cause: Cause, took: Duration, memory: Option<(u64, u64)>) -> String {
+/// around it and the process's private peak before and after, when the daemon
+/// gave a way to read them. The peak is the process's in the load's window,
+/// so a task running meanwhile may be the one that raised it.
+fn load_line(cause: Cause, took: Duration, memory: Option<(u64, u64)>, peak: Option<(u64, u64)>) -> String {
     let asked = match cause {
         Cause::Wake => "for a wake",
         Cause::Call => "for a call that embeds",
         Cause::Recovery => "for a call that found its worker gone",
     };
     let memory = memory.map(|(before, after)| format!("; private memory {} before, {} after", mib(before), mib(after)));
-    format!("embedding model loaded again in {} ms {asked}{}", took.as_millis(), memory.unwrap_or_default())
+    let peak = peak.map(|(before, after)| {
+        if after > before {
+            format!("; private peak rose to {}", mib(after))
+        } else {
+            format!("; private peak stayed at {}, set before this load", mib(before))
+        }
+    });
+    format!(
+        "embedding model loaded again in {} ms {asked}{}{}",
+        took.as_millis(),
+        memory.unwrap_or_default(),
+        peak.unwrap_or_default()
+    )
 }
 
 /// What the sweeper did when the model went.
@@ -122,7 +136,7 @@ struct Shared {
     /// Read by health without waiting on a load that holds `model`.
     resident: AtomicBool,
     reload: ReloadFn,
-    memory: Option<MemoryProbe>,
+    memory: Option<MemoryProbes>,
     dimensions: usize,
     model_id: String,
     query_prefix: String,
@@ -164,7 +178,8 @@ impl Shared {
             slot.recovering = false;
             slot.last_recovery = Some(now);
         }
-        let before = self.memory.and_then(|read| read());
+        let before = self.memory.and_then(|probes| (probes.private)());
+        let peak_before = self.memory.and_then(|probes| (probes.private_peak)());
         let started = std::time::Instant::now();
         let model = match (self.reload)().await.and_then(|model| self.same_model(model)) {
             Ok(model) => model,
@@ -176,8 +191,9 @@ impl Shared {
             }
         };
         let took = started.elapsed();
-        let after = self.memory.and_then(|read| read());
-        log::info!("{}", load_line(cause, took, before.zip(after)));
+        let after = self.memory.and_then(|probes| (probes.private)());
+        let peak_after = self.memory.and_then(|probes| (probes.private_peak)());
+        log::info!("{}", load_line(cause, took, before.zip(after), peak_before.zip(peak_after)));
         slot.model = Some(model.clone());
         slot.woken_at = (cause == Cause::Wake).then(Instant::now);
         self.resident.store(true, Ordering::Release);
@@ -257,12 +273,12 @@ impl IdleEmbedder {
     /// `runtime` the sweeper that unloads it once it sat `idle` unused. The
     /// sweeper ends when the embedder is dropped. With no `idle` there is no
     /// sweeper and the model only goes when its worker does. Each load logs
-    /// the private memory `memory` reads before and after it.
+    /// the private memory and peak `memory` reads before and after it.
     pub fn new(
         loaded: Arc<dyn Embedder>,
         reload: ReloadFn,
         idle: Option<Duration>,
-        memory: Option<MemoryProbe>,
+        memory: Option<MemoryProbes>,
         runtime: &tokio::runtime::Handle,
     ) -> Self {
         let shared = Arc::new(Shared {
@@ -634,11 +650,49 @@ mod tests {
     #[test]
     fn a_load_names_who_asked_and_the_memory_around_it() {
         assert_eq!(
-            load_line(Cause::Wake, Duration::from_millis(9_234), Some((297_795_584, 775_946_240))),
+            load_line(Cause::Wake, Duration::from_millis(9_234), Some((297_795_584, 775_946_240)), None),
             "embedding model loaded again in 9234 ms for a wake; private memory 284.0 MiB before, 740.0 MiB after"
         );
-        assert_eq!(load_line(Cause::Call, Duration::from_millis(12), None), "embedding model loaded again in 12 ms for a call that embeds");
-        assert!(load_line(Cause::Recovery, Duration::ZERO, None).ends_with("for a call that found its worker gone"));
+        assert_eq!(load_line(Cause::Call, Duration::from_millis(12), None, None), "embedding model loaded again in 12 ms for a call that embeds");
+        assert!(load_line(Cause::Recovery, Duration::ZERO, None, None).ends_with("for a call that found its worker gone"));
+    }
+
+    const MIB: u64 = 1_048_576;
+
+    #[test]
+    fn a_load_line_names_the_peak_when_the_load_raised_it() {
+        let line = load_line(
+            Cause::Wake,
+            Duration::from_millis(9_234),
+            Some((297_795_584, 775_946_240)),
+            Some((1_000 * MIB, 1_600 * MIB)),
+        );
+        assert_eq!(
+            line,
+            "embedding model loaded again in 9234 ms for a wake; private memory 284.0 MiB before, 740.0 MiB after; private peak rose to 1600.0 MiB"
+        );
+    }
+
+    #[test]
+    fn a_load_line_says_when_the_load_did_not_pass_the_peak() {
+        let line = load_line(
+            Cause::Call,
+            Duration::from_millis(1_102),
+            Some((300 * MIB, 760 * MIB)),
+            Some((1_622 * MIB, 1_622 * MIB)),
+        );
+        assert!(line.ends_with("; private peak stayed at 1622.0 MiB, set before this load"), "{line}");
+    }
+
+    #[test]
+    fn a_load_line_without_a_peak_probe_is_unchanged() {
+        let memory = Some((297_795_584, 775_946_240));
+        let today = "embedding model loaded again in 9234 ms for a wake; private memory 284.0 MiB before, 740.0 MiB after";
+        assert_eq!(load_line(Cause::Wake, Duration::from_millis(9_234), memory, None), today);
+        assert_eq!(
+            load_line(Cause::Call, Duration::from_millis(12), None, None),
+            "embedding model loaded again in 12 ms for a call that embeds"
+        );
     }
 
     #[tokio::test(start_paused = true)]

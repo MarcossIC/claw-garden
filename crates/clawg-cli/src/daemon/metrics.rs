@@ -597,6 +597,32 @@ mod tests {
         assert!(!writer.is_writing() && !recorder.writing());
     }
 
+    #[test]
+    fn the_peak_is_not_written_to_the_metrics_file() {
+        let probes = clawg_core::metrics::MemoryProbes {
+            private: super::super::process::private_bytes,
+            private_peak: super::super::process::private_peak_bytes,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(METRICS_FILE);
+        let recorder = Arc::new(Recorder::default());
+        let mut writer = Writer::start(Some(&path), recorder.clone(), &run_info(), NOW);
+        let process = ProcessSample { private_bytes: (probes.private)(), private_peak_bytes: (probes.private_peak)(), ..Default::default() };
+        writer.sample(NOW, process, runtime(0), Some(true));
+        writer.flush(NOW + MINUTE_MS);
+        writer.stop(NOW + MINUTE_MS + 10);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut names = conn.prepare("SELECT DISTINCT name FROM gauge_minute").unwrap();
+        let names: Vec<String> = names.query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(
+            names.iter().all(|name| !name.contains("load")),
+            "the peak a load reaches goes to the log alone: {names:?}"
+        );
+        let peaks = names.iter().filter(|name| name.contains("peak")).count();
+        assert!(peaks <= 2, "only the process peaks of the minute are written: {names:?}");
+    }
+
     fn rusqlite_drop_tables(path: &Path) {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch("DROP TABLE hist_minute; DROP TABLE gauge_minute;").unwrap();

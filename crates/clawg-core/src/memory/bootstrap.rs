@@ -447,7 +447,7 @@ pub fn unloading_when_idle(
     load: LoadEmbedderFn,
     base_dir: std::path::PathBuf,
     idle: Option<Duration>,
-    memory: Option<crate::metrics::MemoryProbe>,
+    memory: Option<crate::metrics::MemoryProbes>,
     runtime: tokio::runtime::Handle,
 ) -> LoadEmbedderFn {
     let repairing = Arc::new(std::sync::atomic::AtomicBool::new(false));

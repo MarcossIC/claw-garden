@@ -14,6 +14,14 @@ pub use recorder::{Gauge, Recorder, SeriesKey, Window};
 /// what logs memory.
 pub type MemoryProbe = fn() -> Option<u64>;
 
+/// The two readings a model load logs around itself: the private memory of
+/// the process and the highest it has ever been.
+#[derive(Clone, Copy)]
+pub struct MemoryProbes {
+    pub private: MemoryProbe,
+    pub private_peak: MemoryProbe,
+}
+
 /// `bytes` in MiB with one decimal, as the log lines print memory.
 pub fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / 1_048_576.0)

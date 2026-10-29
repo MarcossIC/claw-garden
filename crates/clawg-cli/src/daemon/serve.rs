@@ -150,7 +150,10 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         load,
         base_dir.clone(),
         idle,
-        Some(super::process::private_bytes),
+        Some(clawg_core::metrics::MemoryProbes {
+            private: super::process::private_bytes,
+            private_peak: super::process::private_peak_bytes,
+        }),
         tokio::runtime::Handle::current(),
     );
     tokio::spawn(run_embedder_bootstrap_with_retry(

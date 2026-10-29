@@ -36,6 +36,12 @@ pub fn private_bytes() -> Option<u64> {
     os_sample().private_bytes
 }
 
+/// The highest private memory this process has reached, `None` where the
+/// system keeps no such peak.
+pub fn private_peak_bytes() -> Option<u64> {
+    os_sample().private_peak_bytes
+}
+
 /// The fields of `/proc/self/status` this module uses, in bytes and counts.
 pub fn parse_proc_status(text: &str) -> ProcessSample {
     let mut sample = ProcessSample::default();
