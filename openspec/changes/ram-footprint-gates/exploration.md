@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | S (la medición); B, C, D y F, S–M cada uno y con puerta | 90, archivado (su paso 0 sale en 0.63.0); se coordina con 62, 73, 74, 85, 87 y 91 | exploración: primera pasada medida en prod sin hooks; falta la segunda, con hooks |
+| transversal | S (la medición); B, C, D y F, S–M cada uno y con puerta | 90, archivado (su paso 0 sale en 0.63.0); se coordina con 62, 73, 74, 85, 87 y 91 | exploración: primera pasada medida en prod sin hooks, C aceptada y la puerta de F medida (pasa); falta la segunda, con hooks |
 
 **Tesis:** ram-footprint (90) sacó el refresco del índice de docs que corría en cada prompt (A) y dejó con qué atribuir cada pico de memoria (su paso 0). Quedan los brazos que dependen de una medición: despertar el modelo sólo al empezar una sesión (B), cargar el ONNX sin el `Vec` de 470 MB (C), embeber el import por tanda (D) y bajar el tiempo de ocio por defecto (E). La primera pasada sumó uno: que el refresco de docs reutilice el vector de cada pasaje cuyo texto no cambió (F). Las alternativas de B a E, analizadas contra el código, están en la [exploración de 90](../archive/2026-10-24-ram-footprint/exploration.md#enfoques-posibles). Acá están la medición que las decide y sus puertas. Este cambio nació al partir 90 cuando se archivó.
 
@@ -116,7 +116,7 @@ No hubo ningún import con 0.63.0 ni con 0.65.0. Se lee por minuto el de 0.62.0 
 | C | La carga es el máximo del proceso | **Pasa.** Una carga llega a unos 1,6 GiB. Lo siguiente en tamaño es el refresco más grande, con 1,17 GiB, y el modelo quieto ocupa 0,76 GiB |
 | D | Los vectores y las filas preparadas pesan frente al modelo | **No pasa.** Son unos 80 MiB de vectores en un import de 54.000 filas, y hubo un import en seis días |
 | E | Después de B, si el modelo sigue cargado la mayor parte del día | **Con el número, sin la decisión.** Repetir el día con 5 minutos de ocio baja un 42 % los minutos con el modelo cargado (de 720 a 421) a cambio de 16 cargas más en 4,28 días (+35 %), de alrededor de 1 s cada una. Con 3 minutos, −59 % y 21 cargas más. Se decide con la segunda pasada: con hooks, cada prompt después de una descarga vuelve a cargar el modelo, y un ocio más corto multiplica esas cargas |
-| F | En los archivos que el refresco vuelve a indexar, la mayoría de los pasajes tiene el mismo texto que el índice | **Por medir.** Ver «F» abajo |
+| F | En los archivos que el refresco vuelve a indexar, la mayoría de los pasajes tiene el mismo texto que el índice | **Pasa.** En los 62 intervalos entre refrescos reales de prod, F habría embebido 28.716 pasajes en lugar de 90.935 (−68 %), y en los archivos de 100 pasajes o más se repite el 83,5 %. Ver «F» abajo |
 
 **La ventana de C.** Hoy la verificación y la carga leen los mismos bytes: `read_verified` lee `model.onnx` entero a un `Vec`, le calcula el SHA-256 y le pasa ese mismo `Vec` a `commit_from_memory` (`crates/clawg-core/src/memory/model_download.rs:605-613`, `crates/clawg-core/src/memory/embedder.rs:524`). Lo que se verificó es exactamente lo que se cargó. Con C, el SHA-256 se calcula leyendo el archivo de a partes, y después ONNX Runtime lo vuelve a abrir por su ruta. Entre las dos lecturas, alguien que pueda escribir en `<data>/models/` podría cambiar el archivo, y se cargaría un modelo que nadie verificó. Esa es la ventana. Sólo la abre quien ya puede escribir en el directorio de datos, que también puede cambiar `token`, `memory.db` o el binario. En Windows se puede cerrar: el archivo se abre sin compartir escritura ni borrado (`share_mode` de `std::os::windows::fs::OpenOptionsExt`) y queda abierto desde la verificación hasta que la sesión está armada, así que nadie puede escribirlo, renombrarlo ni borrarlo mientras tanto. Falta comprobar, al implementarlo, que ONNX Runtime abre el archivo compartiendo la lectura. En Unix el directorio es `0700`. Que C de verdad baje el pico se confirma con la medición que C ya tiene: diez cargas con `commit_from_memory` y diez con `commit_from_file`. Si ONNX Runtime lee el archivo entero a un buffer propio, C no ahorra nada y se cierra sin cambio.
 
@@ -124,7 +124,27 @@ No hubo ningún import con 0.63.0 ni con 0.65.0. Se lee por minuto el de 0.62.0 
 
 **Qué.** Al volver a indexar un archivo, cada pasaje cuyo `indexed_text` ya está en el índice de ese archivo, con el mismo `model_id`, conserva su vector. Sólo se embeben los pasajes nuevos o cambiados. Un pasaje es determinista dado su texto y el modelo, así que el vector guardado vale lo mismo que uno nuevo. **A favor:** el refresco de un inicio de sesión pasa de minutos a lo que realmente cambió, y con eso baja el tiempo que el proceso pasa en 1,16 GiB y la CPU. **En contra:** no baja el pico de una tanda (16 pasajes de hasta 512 tokens siguen siendo la misma matriz de atención), y suma una consulta por archivo para leer los pasajes guardados.
 
-**Puerta.** Se mide sin el modelo y sin tocar un perfil: sobre el historial de git del repositorio, para cada par de versiones consecutivas de cada archivo indexable que cambió, se trocean las dos con el tokenizer del modelo y se cuentan los pasajes de la nueva con el mismo `indexed_text` que alguno de la vieja. F entra si, en los archivos con más pasajes, la mayoría de los pasajes se repite.
+**Puerta.** F entra si, en los archivos con más pasajes, la mayoría de los pasajes se repite. Se mide sin el modelo y sin tocar un perfil.
+
+**Cómo se midió (2026-10-29).** Los intervalos son los de prod: los que hay entre dos refrescos consecutivos de `claw-garden-0c70` en `serve.log`, 63 refrescos del 2026-10-15 al 2026-10-29 y 62 intervalos. El árbol de cada refresco sale del reflog del repositorio (`HEAD@{fecha}`). Para cada archivo indexable que cambió en git entre dos refrescos, se troceó la versión vieja y la nueva con el troceador del índice, como lo hace `refresh`: `redact` y después `chunk_markdown`, `chunk_manifest` o `chunk_code`. El tokenizer fue el `tokenizer.json` fijado del modelo, bajado de Hugging Face y comprobado contra `TOKENIZER_JSON_SHA256`. Se contaron los pasajes de la nueva con el mismo `indexed_text` que alguno de la vieja. Lo corrió un test temporal en `project_docs`, que no quedó en el repositorio.
+
+La medición sólo ve lo commiteado: un cambio sin commitear al momento de un refresco no está. Aun así, la simulación da 90.935 pasajes reembebidos contra los 86.146 que dice el log (106 %). En 25 de los 59 intervalos con pasajes, coincide con el log a menos de un 2 %.
+
+**Lo medido.**
+
+| Archivos reembebidos | Pasajes | Se reutilizan con F |
+|---|---|---|
+| Todos (1.382 modificados y 673 nuevos) | 90.935 | 68,4 % (67,8 % de los tokens) |
+| Sólo los modificados | 79.928 | 77,8 % (76,2 % de los tokens) |
+| Modificados con 100 pasajes o más (255) | 39.182 | 83,5 % (mediana por archivo, 90 %) |
+| Modificados con 50 a 99 pasajes (312) | 22.397 | 74,4 % |
+| Modificados con 10 a 49 pasajes (661) | 17.637 | 70,6 % |
+| Los de los 25 intervalos que coinciden con el log | 41.790 | 69,0 % |
+
+- **Pasa la puerta.** En los archivos con más pasajes se repite el 83,5 %. El código y el Markdown dan lo mismo: 78,0 y 77,8 % en los modificados. Los archivos nuevos son el 12 % de lo reembebido, y F no les cambia nada.
+- **Por refresco.** La mediana de lo que F ahorra es el 73 %, y el peor caso, el 38 %. Los 24 refrescos de más de 1.700 pasajes tienen una mediana de 2.300 y un máximo de 6.041. Con F, la mediana baja a 647 y el máximo a 2.973. Si la duración de un refresco sigue a los pasajes que embebe, los 2 a 6,5 min que el proceso pasaba en 1,16 GiB bajan a alrededor de un tercio.
+- **Dónde reutiliza menos.** `.claude/CLAUDE.md` reutiliza el 57 % y `openspec/README.md`, el 73 %. Sus secciones son párrafos largos que el troceador parte en ventanas de tokens, y una edición al principio de una sección corre todas las ventanas que siguen. Un manifiesto es un solo pasaje y reutiliza el 41 %.
+- **Lo que no cambia.** El pico de una tanda sigue igual. Un archivo movido o renombrado tampoco se reutiliza, porque la ruta está en el `indexed_text`.
 
 **Con qué se coordina.** El orden por largo de las tandas del índice de docs es de 62. Se complementa con F: F embebe menos pasajes, y el orden rellena menos los que quedan.
 
@@ -149,10 +169,10 @@ La primera pasada vio que el piso sube de 1,3 a 2,1 MiB por carga en uso real. S
 | Brazo | Qué | Puerta | Decisión previa |
 |---|---|---|---|
 | B | Despertar el modelo sólo al empezar una sesión | Más de la mitad de las cargas de un día son de un `wake` que nadie usó (pregunta 2) | B1 (`user-prompt-submit` manda `wake: false`), B2 (sólo despierta el primer registro de una raíz) o B3 (ningún registro despierta y la primera búsqueda paga la carga) |
-| C | Verificar el SHA-256 leyendo de a partes y cargar con `commit_from_file` en lugar de `commit_from_memory` | La carga es el máximo del proceso (pregunta 3) | Leer el archivo dos veces por carga, con la ventana entre la verificación y la carga cerrada en Windows por el archivo abierto sin compartir escritura |
+| C | Verificar el SHA-256 leyendo de a partes y cargar con `commit_from_file` en lugar de `commit_from_memory` | La carga es el máximo del proceso (pregunta 3) | Leer el archivo dos veces por carga, con la ventana entre la verificación y la carga cerrada en Windows por el archivo abierto sin compartir escritura. Aceptada el 2026-10-29 |
 | D | Embeber y escribir el import por tanda, con import-job (87) | Los vectores y las filas preparadas pesan frente al modelo (pregunta 4) | Aceptar que un import cortado quede parcial y se pueda deshacer con `import --undo` |
 | E | Bajar el `CLAWG_EMBEDDER_IDLE_MINUTES` por defecto | Después de B, si el modelo sigue cargado la mayor parte del día (pregunta 1) | Es una decisión de producto: cuánto espera la primera búsqueda después de una pausa |
-| F | Reutilizar en el refresco de docs el vector de cada pasaje que no cambió | La mayoría de los pasajes de un archivo reindexado se repite (medido sobre el historial de git) | Entra en este cambio o va aparte |
+| F | Reutilizar en el refresco de docs el vector de cada pasaje que no cambió | La mayoría de los pasajes de un archivo reindexado se repite (medido sobre el historial de git). Pasó: −68 % de pasajes por refresco | Entra en este cambio o va aparte |
 
 Cada brazo que entre lleva un test que falla antes del cambio y repite la misma lectura después. Si la medición dice que ninguno vale la pena, el cambio cierra con lo medido, y ese es un resultado válido.
 
@@ -168,13 +188,13 @@ Cada brazo que entre lleva un test que falla antes del cambio y repite la misma 
 
 ## Decisiones abiertas
 
-Son del usuario.
+Son del usuario. El orden acordado el 2026-10-29 es: medir la puerta de F, C, F si pasó, y después los hooks y la segunda pasada, que decide B y E.
 
 - [ ] **B.** Se decide con la segunda pasada. ¿B1, B2 o B3? ¿El umbral es más de la mitad de las cargas de un día?
-- [ ] **C.** ¿Se acepta leer el archivo dos veces, con la ventana cerrada en Windows por el archivo abierto sin compartir escritura?
+- [x] **C.** Se acepta (2026-10-29) leer el archivo dos veces, con la ventana cerrada en Windows por el archivo abierto sin compartir escritura ni borrado hasta que la sesión está armada.
 - [ ] **D.** No pasó su puerta. ¿Se cierra con lo medido y queda para 87?
 - [ ] **E.** ¿Se decide con la segunda pasada, después de B?
-- [ ] **F.** ¿Se mide su puerta? Si pasa, ¿entra en este cambio o va aparte?
+- [ ] **F.** Pasó su puerta: −68 % de pasajes por refresco. ¿Entra en este cambio o va aparte?
 - [ ] **El piso.** ¿Se mide aparte, en release y con autorización?
 
 ## Riesgos
