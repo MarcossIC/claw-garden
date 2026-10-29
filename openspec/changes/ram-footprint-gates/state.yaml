@@ -1,13 +1,13 @@
 change: ram-footprint-gates
 objective: "transversal"
 depends_on: [ram-footprint]
-phase: propose
+phase: tasks
 artifacts:
   exploration: done  # la segunda pasada, con hooks, se agrega después de C y F
-  proposal: draft
-  spec: pending
-  design: pending
-  tasks: pending
+  proposal: done  # revisada: C pasa a C′ (vista mapeada + commit_from_memory)
+  spec: done  # RM1 a RM5 en spec.md
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
