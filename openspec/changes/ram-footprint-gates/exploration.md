@@ -194,7 +194,7 @@ Son del usuario. El orden acordado el 2026-10-29 es: medir la puerta de F, C, F 
 - [x] **C.** Se acepta (2026-10-29) leer el archivo dos veces, con la ventana cerrada en Windows por el archivo abierto sin compartir escritura ni borrado hasta que la sesión está armada.
 - [ ] **D.** No pasó su puerta. ¿Se cierra con lo medido y queda para 87?
 - [ ] **E.** ¿Se decide con la segunda pasada, después de B?
-- [ ] **F.** Pasó su puerta: −68 % de pasajes por refresco. ¿Entra en este cambio o va aparte?
+- [x] **F.** Pasó su puerta: −68 % de pasajes por refresco. Entra en este cambio, con C (2026-10-29).
 - [ ] **El piso.** ¿Se mide aparte, en release y con autorización?
 
 ## Riesgos
