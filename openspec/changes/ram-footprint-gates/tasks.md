@@ -119,7 +119,8 @@ Revisado: ni `agent_contract.json` ni `agent_contract.es.json` cambian (ninguna 
 
 ## Al cerrar
 
-- [ ] `sdd-verify`: contra RM1 a RM5 y la puerta, con la suite y clippy de Windows; Linux queda para el CI del pull request (RM1 en Windows, RM3 y la parte de Windows de RM2 sólo corren allá).
+- [x] `sdd-verify`: contra RM1 a RM5 y la puerta, con la suite y clippy de Windows; Linux queda para el CI del pull request (RM1 en Windows, RM3 y la parte de Windows de RM2 sólo corren allá).
+- Pasa con advertencias (`verify.md`): falta la frase del pico en `.claude/CLAUDE.md` (W1), la conexión del pico en `Shared::load` no tiene test (W2, aceptado) y `tasks.md:118` quedó sin marcar (W3).
 - [ ] Consolidar la spec al archivar en `openspec/specs/storage/spec.md` (RM1, RM2, RM3 y RM4) y en `openspec/specs/project-docs/spec.md` (RM5), y realinear las citas que este cambio movió, incluidas las que la spec notó viejas: `E5_MODEL_ID` figura como `embedder.rs:133` en el `storage` actual y el código está en `:135`, y `serve.rs:153` (la sonda de memoria privada, línea 708 de ese spec).
 - [ ] Actualizar la fila 92 de `openspec/README.md` (y las filas que citan este cambio) al archivar, y mover el cambio con `git mv` a `changes/archive/`.
 - [ ] Subir el minor de `[workspace.package] version` del `Cargo.toml` raíz, `cargo update --workspace`, y commitear ambos como `chore: bump version to X.Y.Z`. Nunca tag ni release a mano.
