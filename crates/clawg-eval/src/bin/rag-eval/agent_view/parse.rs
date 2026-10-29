@@ -152,10 +152,11 @@ fn joined(segments: Vec<Vec<&str>>) -> Vec<String> {
 }
 
 /// The text after a hit header, `[YYYY-MM-DD #id type] `, where the type is
-/// one word and may be absent, and a piece of a long save adds `piece={k}/{n}`.
+/// one word and may be absent, a piece of a long save adds `piece={k}/{n}`
+/// and a row another agent saved ends with `by {author}`.
 fn hit_text(line: &str) -> Option<&str> {
     let (header, text) = line.strip_prefix('[')?.split_once("] ")?;
-    let header = without_piece(header);
+    let header = without_piece(without_author(header));
     let (date, rest) = header.split_once(" #")?;
     let id = rest.split_once(' ').map_or(rest, |(id, kind)| {
         if kind.is_empty() || kind.contains(' ') { "" } else { id }
@@ -167,6 +168,12 @@ fn hit_text(line: &str) -> Option<&str> {
         && b[..4].iter().chain(&b[5..7]).chain(&b[8..]).all(u8::is_ascii_digit);
     let is_id = !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit());
     (is_date && is_id).then_some(text)
+}
+
+/// `header` up to its ` by {author}` mark. Nothing before the mark can hold
+/// ` by `, while the author, shown through `display_author`, may hold spaces.
+fn without_author(header: &str) -> &str {
+    header.split_once(" by ").map_or(header, |(before, _)| before)
 }
 
 /// `header` without a trailing ` piece={k}/{n}`, or as it came.
@@ -321,6 +328,17 @@ mod tests {
     fn a_context_hit_with_a_piece_is_one_segment() {
         let text = "=== LONG-TERM KNOWLEDGE ===\n[2026-10-15 #58 semantic_fact piece=2/4] the retry budget was set\n";
         assert_eq!(context_segments(text), vec!["the retry budget was set".to_string()]);
+    }
+
+    #[test]
+    fn a_context_hit_another_agent_saved_is_one_segment() {
+        let text = "=== LONG-TERM KNOWLEDGE ===\n\
+                    [2026-07-27 #10 semantic_fact piece=7/14 by migrated] the pier opens at dawn\n\
+                    [2026-07-26 #11 architectural_decision by a (b) c] the gate stays shut\n";
+        assert_eq!(
+            context_segments(text),
+            vec!["the pier opens at dawn".to_string(), "the gate stays shut".to_string()]
+        );
     }
 
     #[test]
