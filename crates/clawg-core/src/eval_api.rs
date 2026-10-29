@@ -1176,6 +1176,12 @@ impl EvalDocIndex {
             .map_err(|e| EvalError::Search(e.to_string()))?;
         Ok(hits.into_iter().map(|h| EvalDocHit { path: h.path, breadcrumb: h.breadcrumb }).collect())
     }
+
+    /// Closes the index's store as [`EvalStore::close`] does, so its
+    /// directory can be removed on Windows.
+    pub async fn close(self) -> Result<(), EvalError> {
+        self.store.conn.clone().close().await.map_err(|e| EvalError::Close(e.to_string()))
+    }
 }
 
 /// Whether the index takes the file at `path` as source code.

@@ -1876,7 +1876,7 @@ mod tests {
     fn an_unmeasured_run_omits_the_similarity_key_entirely() {
         // Absent, not null: a reader must be able to tell "this run predates
         // the similarity instrument" from "it was computed and found nothing".
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Fake);
         let path = write_json(&results, &out_dir, false).expect("write must succeed");
         let written = std::fs::read_to_string(&path).expect("must read back");
@@ -1934,7 +1934,7 @@ mod tests {
 
     #[test]
     fn a_measured_run_serializes_the_similarity_block_with_both_prefixes() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let mut results = minimal_results("2026-07-27", Mode::Real);
         results.similarity = Some(minimal_similarity_results());
         let path = write_json(&results, &out_dir, false).expect("write must succeed");
@@ -1957,7 +1957,7 @@ mod tests {
 
     #[test]
     fn scoring_config_is_always_serialized_and_round_trips_every_field() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let mut results = minimal_results("2026-07-27", Mode::Real);
         results.scoring_config = EvalScoringConfig {
             importance_base: 0.7,
@@ -1984,7 +1984,7 @@ mod tests {
     fn scoring_config_is_present_even_at_default_values() {
         // The zero point of a sweep is not "nothing to report" — it is the
         // one config every non-sweep run has always scored with.
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Fake);
         let path = write_json(&results, &out_dir, false).expect("write must succeed");
         let written = std::fs::read_to_string(&path).expect("must read back");
@@ -2006,7 +2006,7 @@ mod tests {
     fn an_unaudited_run_omits_the_audit_key_entirely() {
         // Serializing it as `null` would read as "audited, found nothing",
         // which is a different claim from "never audited".
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Fake);
         let path = write_json(&results, &out_dir, false).expect("write must succeed");
         let written = std::fs::read_to_string(&path).expect("must read back");
@@ -2017,7 +2017,7 @@ mod tests {
 
     #[test]
     fn write_json_creates_the_out_dir_and_writes_the_expected_filename() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Fake);
         let path = write_json(&results, &out_dir, false).expect("first write must succeed");
         assert_eq!(path, out_dir.join("2026-07-27-fake.json"));
@@ -2029,7 +2029,7 @@ mod tests {
 
     #[test]
     fn write_json_refuses_to_overwrite_without_force() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Real);
         write_json(&results, &out_dir, false).expect("first write must succeed");
 
@@ -2045,7 +2045,7 @@ mod tests {
 
     #[test]
     fn write_json_overwrites_when_force_is_set() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let mut results = minimal_results("2026-07-27", Mode::Fake);
         write_json(&results, &out_dir, false).expect("first write must succeed");
 
@@ -2124,7 +2124,7 @@ mod tests {
 
     #[test]
     fn write_sweep_index_writes_the_expected_filename() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-sweep-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("sweep");
         let index = SweepIndex {
             date: "2026-08-16".to_string(),
             mode: Mode::Real,

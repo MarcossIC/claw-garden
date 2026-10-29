@@ -87,6 +87,9 @@ pub struct Cli {
     /// it; the modes that measure the golden corpus alone, and a tokenizer
     /// swap that would empty its text index, are refused with it.
     pub background: Option<PathBuf>,
+    /// `--keep-store`: leave the store a run seeds on disk and name it, to
+    /// open the database behind a number. Without it the run removes it.
+    pub keep_store: bool,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -136,6 +139,8 @@ pub enum CliError {
     FailOnRegressionWithoutDiff,
     #[error("--background is mutually exclusive with --docs, --lang-detect, --fts-tokenizer, --follow-up, --audit and --lexical-only")]
     BackgroundWithOtherMode,
+    #[error("--keep-store is mutually exclusive with --background, --agent-view and --docs, which always remove their store")]
+    KeepStoreWithOtherMode,
 }
 
 pub const HELP_TEXT: &str = "\
@@ -176,6 +181,10 @@ OPTIONS:
                          records the tokenizer in the file, so two runs differing only
                          in this flag stay comparable side by side.
     --force             Allow overwriting an existing results file for the same date+config
+    --keep-store        Leave the store a run seeds in the system temp directory and print
+                         its path, to open the database behind a number. Without it the run
+                         removes the store when it ends, passed or failed. Mutually exclusive
+                         with --background, --agent-view and --docs, which always remove theirs.
     --diff <a.json> <b.json>
                          Compare two existing results files' retrieval.per_case and
                          similarity.per_case, joined on query, reporting better/worse/net
@@ -307,6 +316,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut lexical_only = false;
     let mut lang_detect = false;
     let mut background: Option<PathBuf> = None;
+    let mut keep_store = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -347,6 +357,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
             }
             "--check-only" => check_only = true,
             "--force" => force = true,
+            "--keep-store" => keep_store = true,
             "--audit" => audit = true,
             "--golden" => {
                 let value = args
@@ -411,6 +422,9 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
 
     if background.is_some() && (docs || lang_detect || fts_tokenizer.is_some() || follow_up || audit || lexical_only) {
         return Err(CliError::BackgroundWithOtherMode);
+    }
+    if keep_store && (background.is_some() || agent_view || docs) {
+        return Err(CliError::KeepStoreWithOtherMode);
     }
     if lang_detect {
         return Ok(ParseOutcome::LangDetect { golden: golden_path.unwrap_or_else(default_golden_path) });
@@ -488,6 +502,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         docs_root: docs_root.unwrap_or_else(default_docs_root),
         lexical_only,
         background,
+        keep_store,
     }))
 }
 
@@ -543,6 +558,20 @@ mod tests {
         ] {
             let args: Vec<&str> = ["--fake", "--background", "snap.db"].iter().chain(other).copied().collect();
             assert_eq!(parse(argv(&args)), Err(CliError::BackgroundWithOtherMode), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn keep_store_parses() {
+        assert!(run_cli(&["--fake", "--keep-store"]).keep_store);
+        assert!(!run_cli(&["--fake"]).keep_store, "a run removes the store it seeds unless asked to keep it");
+    }
+
+    #[test]
+    fn keep_store_with_a_mode_that_always_removes_its_store_is_a_usage_error() {
+        for other in [&["--background", "snap.db"][..], &["--agent-view"], &["--docs"]] {
+            let args: Vec<&str> = ["--fake", "--keep-store"].iter().chain(other).copied().collect();
+            assert_eq!(parse(argv(&args)), Err(CliError::KeepStoreWithOtherMode), "{other:?}");
         }
     }
 

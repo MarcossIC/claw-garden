@@ -11,6 +11,8 @@ mod report;
 mod seed;
 mod similarity;
 mod stats;
+#[cfg(test)]
+mod test_temp;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -103,7 +105,8 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     run_with_scratch(args, seed::unique_store_path()).await
 }
 
-/// [`run`], copying the snapshot of a run over `--background` into `scratch`.
+/// [`run`], with the store the run seeds, or the copy of its `--background`,
+/// in `scratch`.
 async fn run_with_scratch<I: Iterator<Item = String>>(args: I, scratch: PathBuf) -> i32 {
     let cli = match cli::parse(args) {
         Ok(cli::ParseOutcome::Help) => {
@@ -218,20 +221,21 @@ async fn run_with_scratch<I: Iterator<Item = String>>(args: I, scratch: PathBuf)
     }
 
     let Some(snapshot) = &cli.background else {
-        let seeded = match seed::seed(&golden_set.corpus, &embedder, cli.fts_tokenizer.as_deref()).await {
+        let seeded = match seed::seed(&scratch, &golden_set.corpus, &embedder, cli.fts_tokenizer.as_deref()).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("seeding failed: {e}");
+                release_seeded(&scratch, cli.keep_store).await;
                 return EXIT_RUNTIME_FAILURE;
             }
         };
-        // The temp store is left on disk on purpose: when a number in the
-        // results JSON looks wrong, the database that produced it is still
-        // there to be opened. Printing the path is what makes that
-        // recoverable — a per-run uuid directory nobody was told about is not
-        // a forensic trace.
-        println!("seeded {} rows into {}", golden_set.corpus.len(), seeded.store_path.display());
-        return measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, None, &[]).await;
+        println!("seeded {} rows", golden_set.corpus.len());
+        let code = measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, None, &[]).await;
+        if let Err(e) = seeded.store.close().await {
+            eprintln!("warning: {e}");
+        }
+        release_seeded(&scratch, cli.keep_store).await;
+        return code;
     };
 
     // A copy of a snapshot is removed whatever the run gives: it weighs as
@@ -272,6 +276,16 @@ async fn run_with_scratch<I: Iterator<Item = String>>(args: I, scratch: PathBuf)
     }
     seed::remove_scratch(&scratch).await;
     code
+}
+
+/// Removes the store a run seeded in `scratch`, or names it when `keep` asks
+/// for it to stay.
+async fn release_seeded(scratch: &std::path::Path, keep: bool) {
+    if keep {
+        println!("kept the seeded store in {}", scratch.display());
+    } else {
+        seed::remove_scratch(scratch).await;
+    }
 }
 
 /// Why a run over a background stopped before measuring.
@@ -1624,8 +1638,21 @@ mod tests {
         assert_eq!(case_lang(&[], &lang_by_ref), None, "no expected rows, nothing to attribute");
     }
 
-    fn temp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("rag-eval-main-test-{tag}-{}", uuid::Uuid::new_v4()))
+    use crate::test_temp::{temp_path, TempPath};
+
+    /// The `memory.db` of a background, in a directory removed when the test
+    /// that made it ends.
+    struct Snapshot {
+        file: PathBuf,
+        _dir: TempPath,
+    }
+
+    impl std::ops::Deref for Snapshot {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.file
+        }
     }
 
     /// Runs `--fake` on `golden_json` under `tag` and returns the results file.
@@ -1658,7 +1685,7 @@ mod tests {
     /// `memory.db` of a store holding `texts`, saved through the ingest under
     /// one agent and closed so the file stands alone, as `clawg backup` leaves
     /// a snapshot.
-    async fn background_snapshot(texts: &[String]) -> PathBuf {
+    async fn background_snapshot(texts: &[String]) -> Snapshot {
         background_with(texts, &[], &[]).await
     }
 
@@ -1673,7 +1700,7 @@ mod tests {
     /// [`background_snapshot`] of `notes`, plus `imports` saved under the
     /// agent an import uses and marked as an import of their origin writes
     /// them, with each project of `names` given its name.
-    async fn background_with(notes: &[String], imports: &[Imported], names: &[(&str, &str)]) -> PathBuf {
+    async fn background_with(notes: &[String], imports: &[Imported], names: &[(&str, &str)]) -> Snapshot {
         let dir = temp_path("background");
         std::fs::create_dir_all(&dir).unwrap();
         let ingest = EvalIngest::open(&dir, &EvalEmbedder::fake(), &dir).await.unwrap();
@@ -1719,7 +1746,7 @@ mod tests {
             .await
             .unwrap();
         runtime.store.conn.clone().close().await.unwrap();
-        dir.join("memory.db")
+        Snapshot { file: dir.join("memory.db"), _dir: dir }
     }
 
     const FERRY: &str = "the ferry to the island leaves from the north pier at nine";
@@ -1741,7 +1768,7 @@ mod tests {
                 std::fs::write(&golden_path, golden_json).unwrap();
                 let args = ["rag-eval", "--fake", "--golden", &golden_path.to_string_lossy(), "--out", &out_dir.to_string_lossy()]
                     .map(str::to_string);
-                let code = run_with_scratch(args.into_iter(), scratch.clone()).await;
+                let code = run_with_scratch(args.into_iter(), scratch.to_path_buf()).await;
                 std::fs::remove_file(&golden_path).ok();
                 code
             }
@@ -1837,7 +1864,7 @@ mod tests {
     }
 
     /// The results of `--fake` on `golden_json` over `snapshot`, which it removes.
-    async fn results_over(golden_json: &str, snapshot: PathBuf, tag: &str) -> (String, serde_json::Value) {
+    async fn results_over(golden_json: &str, snapshot: Snapshot, tag: &str) -> (String, serde_json::Value) {
         let (out_dir, scratch) = (temp_path(&format!("{tag}-out")), temp_path(&format!("{tag}-scratch")));
         assert_eq!(run_over(golden_json, &snapshot, tag, &out_dir, &scratch).await, EXIT_OK);
         let (_, raw, json) = only_results(&out_dir);
@@ -1945,7 +1972,7 @@ mod tests {
 
     /// The results of `--fake --agent-view` on `golden_json` over `snapshot`,
     /// which it removes.
-    async fn agent_view_over(golden_json: &str, snapshot: PathBuf, tag: &str) -> serde_json::Value {
+    async fn agent_view_over(golden_json: &str, snapshot: Snapshot, tag: &str) -> serde_json::Value {
         let golden_path = temp_path(&format!("{tag}-golden.json"));
         std::fs::write(&golden_path, golden_json).unwrap();
         let out_dir = temp_path(&format!("{tag}-out"));
@@ -2119,6 +2146,61 @@ mod tests {
         assert!(!second.exists(), "the copy is removed when the run fails");
         std::fs::remove_dir_all(&out_dir).ok();
         std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    /// [`run_over`] without a background: the corpus is seeded into `scratch`,
+    /// created beforehand so a run that leaves it behind is seen.
+    async fn run_seeded(tag: &str, out_dir: &std::path::Path, scratch: &std::path::Path, extra: &[&str]) -> i32 {
+        let golden_path = temp_path(&format!("{tag}-golden.json"));
+        std::fs::write(&golden_path, sweep_golden_json()).unwrap();
+        std::fs::create_dir_all(scratch).unwrap();
+        let (golden, out) = (golden_path.to_string_lossy().to_string(), out_dir.to_string_lossy().to_string());
+        let args: Vec<String> = ["rag-eval", "--fake", "--golden", &golden, "--out", &out, "--tag", tag]
+            .iter()
+            .chain(extra)
+            .map(|a| a.to_string())
+            .collect();
+        let code = run_with_scratch(args.into_iter(), scratch.to_path_buf()).await;
+        std::fs::remove_file(&golden_path).ok();
+        code
+    }
+
+    #[tokio::test]
+    async fn a_run_removes_the_store_it_seeded() {
+        let (out_dir, scratch) = (temp_path("seeded-out"), temp_path("seeded-scratch"));
+
+        let code = run_seeded("seeded", &out_dir, &scratch, &[]).await;
+
+        assert_eq!(code, EXIT_OK);
+        assert!(!scratch.exists(), "the store a run seeds is removed when it ends");
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_run_that_fails_after_seeding_removes_its_store_too() {
+        let out_dir = temp_path("seeded-fails-out");
+        let first = temp_path("seeded-fails-first");
+        assert_eq!(run_seeded("seeded-fails", &out_dir, &first, &[]).await, EXIT_OK);
+        let second = temp_path("seeded-fails-second");
+
+        let code = run_seeded("seeded-fails", &out_dir, &second, &[]).await;
+
+        assert_eq!(code, EXIT_RESULTS_EXISTS, "the second run finds the first one's file after measuring");
+        assert!(!second.exists(), "the store is removed when the run fails");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(&first).ok();
+    }
+
+    #[tokio::test]
+    async fn keep_store_leaves_the_seeded_store_on_disk() {
+        let (out_dir, scratch) = (temp_path("kept-out"), temp_path("kept-scratch"));
+
+        let code = run_seeded("kept", &out_dir, &scratch, &["--keep-store"]).await;
+
+        assert_eq!(code, EXIT_OK);
+        assert!(scratch.join("memory.db").exists(), "asked for, the store stays to be opened");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[tokio::test]

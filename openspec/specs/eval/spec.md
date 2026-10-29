@@ -303,6 +303,16 @@ Con `--audit`, el reporte MUST incluir `top_intruders` (`audit.rs:101`): para ca
 
 **Tests:** `a_row_in_the_top_five_of_half_the_cases_is_the_subsets_intruder`, `the_expected_row_is_never_its_own_cases_intruder`, `a_row_expected_by_one_case_still_intrudes_on_another` y `the_audit_carries_the_intruders_without_changing_the_verdict` (`audit.rs`, mod tests); `the_audit_names_an_intruder_for_every_generated_subset` (`synth_roundtrip.rs`).
 
+## El store de una corrida
+
+Una corrida siembra el corpus en un store nuevo del temporal del sistema (`unique_store_path`, `seed.rs`). MUST borrarlo al terminar, salga bien o mal, después de cerrar su conexión: en Windows un archivo abierto no se puede borrar.
+
+`--keep-store` MUST dejar el store en disco e imprimir su ruta, para abrir la base detrás de un número. Junto a `--background`, `--agent-view` o `--docs`, que siempre borran el suyo, es un error de uso (salida 1). `--docs` cierra su índice antes de borrarlo.
+
+Los tests de `rag-eval` escriben en rutas que se borran cuando el test termina, pase o falle (`TempPath`, `test_temp.rs`). `CLAWG_KEEP_TEST_FILES` las conserva y nombra cada una por stderr.
+
+**Tests:** `keep_store_parses` y `keep_store_with_a_mode_that_always_removes_its_store_is_a_usage_error` (`cli.rs`); `a_run_removes_the_store_it_seeded`, `a_run_that_fails_after_seeding_removes_its_store_too` y `keep_store_leaves_the_seeded_store_on_disk` (`main.rs`); `a_docs_run_removes_its_index` (`docs.rs`); `a_temp_path_is_removed_when_its_test_passes`, `a_temp_path_is_removed_when_its_test_panics` y `a_kept_temp_path_stays` (`test_temp.rs`).
+
 ## Comparar dos corridas (`--diff`)
 
 ```

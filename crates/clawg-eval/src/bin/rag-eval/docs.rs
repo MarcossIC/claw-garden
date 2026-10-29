@@ -196,8 +196,14 @@ pub async fn run(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path) -> i32 {
     }
 
     let scratch = std::env::temp_dir().join(format!("rag-eval-docs-{}", uuid::Uuid::new_v4()));
-    let code = measure(cli, embedder, base_dir, &cases, &scratch).await;
-    let _ = std::fs::remove_dir_all(&scratch);
+    run_in(cli, embedder, base_dir, &cases, &scratch).await
+}
+
+/// Measures `cases` with an index built in `scratch`, which is removed when
+/// the measurement ends, passed or failed.
+async fn run_in(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path, cases: &[DocsCase], scratch: &Path) -> i32 {
+    let code = measure(cli, embedder, base_dir, cases, scratch).await;
+    crate::seed::remove_scratch(scratch).await;
     code
 }
 
@@ -219,6 +225,15 @@ async fn measure(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path, cases: &[D
             return EXIT_RUNTIME_FAILURE;
         }
     };
+    let code = measure_with(cli, &index, cases).await;
+    if let Err(e) = index.close().await {
+        eprintln!("warning: {e}");
+    }
+    code
+}
+
+/// Indexes the root into `index`, asks it every question and prints the report.
+async fn measure_with(cli: &Cli, index: &EvalDocIndex, cases: &[DocsCase]) -> i32 {
     let started = Instant::now();
     let report = match index.index(&cli.docs_root).await {
         Ok(report) => report,
@@ -259,6 +274,24 @@ mod tests {
 
     fn expect(path: &str, heading: Option<&str>) -> ExpectedDoc {
         ExpectedDoc { path: path.to_string(), heading: heading.map(str::to_string) }
+    }
+
+    #[tokio::test]
+    async fn a_docs_run_removes_its_index() {
+        let root = crate::test_temp::temp_path("docs-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("README.md"), "# Proyecto\n## Apagado\nEl daemon se detiene con clawg stop.\n").unwrap();
+        let args = ["rag-eval", "--fake", "--docs", "--root", &root.to_string_lossy()].map(str::to_string);
+        let Ok(crate::cli::ParseOutcome::Run(cli)) = crate::cli::parse(args.into_iter()) else {
+            panic!("the docs arguments parse");
+        };
+        let cases = parse(r#"[{"id": "q1", "question": "daemon stop", "expected": [{"path": "README.md"}]}]"#).unwrap();
+        let scratch = crate::test_temp::temp_path("docs-scratch");
+
+        let code = run_in(&cli, &EvalEmbedder::fake(), &root, &cases, &scratch).await;
+
+        assert_eq!(code, EXIT_OK);
+        assert!(!scratch.exists(), "the index is removed when the run ends");
     }
 
     #[test]
