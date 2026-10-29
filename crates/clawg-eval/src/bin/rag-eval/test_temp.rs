@@ -12,11 +12,19 @@ const KEEP_VAR: &str = "CLAWG_KEEP_TEST_FILES";
 pub struct TempPath {
     path: PathBuf,
     keep: bool,
+    /// Removals tried, 50 ms apart, before the test is failed.
+    attempts: u32,
 }
 
 /// A fresh path for `tag`, not created.
 pub fn temp_path(tag: &str) -> TempPath {
-    TempPath { path: fresh(tag), keep: std::env::var_os(KEEP_VAR).is_some() }
+    TempPath::new(tag, std::env::var_os(KEEP_VAR).is_some())
+}
+
+impl TempPath {
+    fn new(tag: &str, keep: bool) -> Self {
+        TempPath { path: fresh(tag), keep, attempts: 40 }
+    }
 }
 
 fn fresh(tag: &str) -> PathBuf {
@@ -33,18 +41,30 @@ impl Drop for TempPath {
         }
         // On Windows a store's connection thread can hold its files for a
         // moment after the store is dropped, and an open file cannot be deleted.
-        for _ in 0..40 {
+        let mut last = None;
+        for _ in 0..self.attempts {
             let removed = match std::fs::symlink_metadata(&self.path) {
                 Err(_) => return,
                 Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&self.path),
                 Ok(_) => std::fs::remove_file(&self.path),
             };
-            if removed.is_ok() {
-                return;
+            match removed {
+                Ok(()) => return,
+                Err(e) => last = Some(e),
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        eprintln!("warning: could not remove the test path {}", self.path.display());
+        let Some(e) = last else { return };
+        let held = format!(
+            "the test path {} is still held: close what holds it before the test ends ({e})",
+            self.path.display()
+        );
+        // A second panic while a failed test unwinds would abort the run.
+        if std::thread::panicking() {
+            eprintln!("warning: {held}");
+        } else {
+            panic!("{held}");
+        }
     }
 }
 
@@ -67,7 +87,7 @@ mod tests {
     use super::*;
 
     fn removed_path(tag: &str) -> TempPath {
-        TempPath { path: fresh(tag), keep: false }
+        TempPath::new(tag, false)
     }
 
     #[test]
@@ -98,9 +118,30 @@ mod tests {
         assert!(!path.exists(), "removed while the failed test unwound");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_temp_path_still_held_fails_its_test() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let mut file = removed_path("held");
+        file.attempts = 2;
+        std::fs::write(&file, "rows").unwrap();
+        let path = file.to_path_buf();
+
+        // Opened without letting it be deleted, as SQLite opens a store's files.
+        let held = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let open = std::fs::OpenOptions::new().read(true).share_mode(0).open(&*file).unwrap();
+            drop(file);
+            drop(open);
+        }));
+
+        assert!(held.is_err(), "a path still held when its test ends fails the test");
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[test]
     fn a_kept_temp_path_stays() {
-        let dir = TempPath { path: fresh("kept"), keep: true };
+        let dir = TempPath::new("kept", true);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.to_path_buf();
 

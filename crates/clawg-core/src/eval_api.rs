@@ -1979,6 +1979,7 @@ mod tests {
             5,
             "finish() is the drained signal: every queued event must already be a row when it returns"
         );
+        runtime.close().await;
     }
 
     #[tokio::test]
@@ -2004,6 +2005,7 @@ mod tests {
         assert_eq!(created.len(), 2);
         let gap = created[0] - created[1];
         assert!((gap - (300 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
+        runtime.close().await;
     }
 
     #[tokio::test]
