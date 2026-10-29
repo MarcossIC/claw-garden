@@ -1734,6 +1734,26 @@ mod tests {
         assert!(matches!(load_cached_from(tmp.path(), &specs).await, Err(DownloadError::Busy { .. })));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_held_file_wins_over_a_missing_one() {
+        let tmp = TestDir::new("open-busy-and-missing");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let files = fixture_files();
+        write_all_to_cache(&cache_dir, &files);
+        let specs = fixture_specs(&files);
+        std::fs::remove_file(cache_dir.join(specs[0].path)).expect("remove a file");
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+        let _held = held_without_sharing(&cache_dir.join(specs[1].path));
+        let server = mockito::Server::new_async().await;
+
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None).await;
+        assert!(matches!(res, Err(DownloadError::Busy { .. })), "{res:?}");
+        assert!(collect_partials(&cache_dir).is_empty(), "nothing was downloaded");
+        let cached = load_cached_from(tmp.path(), &specs).await;
+        assert!(matches!(cached, Err(DownloadError::Busy { .. })), "{cached:?}");
+    }
+
     #[tokio::test]
     async fn the_cached_model_never_touches_the_network() {
         let tmp = TestDir::new("cache-only");
