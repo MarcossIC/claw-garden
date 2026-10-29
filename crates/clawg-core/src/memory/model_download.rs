@@ -178,6 +178,10 @@ where
             log::warn!("tokenizer.json not readable at {} ({e}); chunking by bytes", path.display());
             return None;
         }
+        Err(Unusable::Busy(e)) => {
+            log::warn!("tokenizer.json at {} is held by another program ({e}); chunking by bytes", path.display());
+            return None;
+        }
         Err(Unusable::Altered) => {
             log::warn!("tokenizer.json at {} is not the pinned file; chunking by bytes", path.display());
             return None;
@@ -346,6 +350,12 @@ pub enum DownloadError {
     BaseUrl(String),
     #[error("the model files in the cache do not verify: {}", files.join(", "))]
     NotCached { files: Vec<String> },
+    #[error("{file} of the model is held by another program: {source}")]
+    Busy {
+        file: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("{file} is larger than {limit_mb} MB, more than any file of the model")]
     TooLarge { file: String, limit_mb: u64 },
     #[error("sha-256 mismatch for {file}: expected {expected}, got {actual}")]
@@ -457,6 +467,9 @@ async fn fetch(
     // takes this branch, and emitting progress here would flash a download UI
     // for work that never happens.
     let mut cached = check_cache_off_runtime(&cache_dir, source.files).await?;
+    if let Some(busy) = cached.busy_error() {
+        return Err(busy);
+    }
     if cached.missing.is_empty() {
         return Ok(cached.into_model_files());
     }
@@ -518,7 +531,10 @@ pub async fn load_cached_model(base_dir: &Path) -> Result<ModelFiles, DownloadEr
 }
 
 pub(crate) async fn load_cached_from(base_dir: &Path, files: &[FileSpec]) -> Result<ModelFiles, DownloadError> {
-    let cached = check_cache_off_runtime(&cache_dir_of(base_dir), files).await?;
+    let mut cached = check_cache_off_runtime(&cache_dir_of(base_dir), files).await?;
+    if let Some(busy) = cached.busy_error() {
+        return Err(busy);
+    }
     if !cached.missing.is_empty() {
         return Err(DownloadError::NotCached {
             files: cached.missing.iter().map(|spec| spec.path.to_string()).collect(),
@@ -544,9 +560,21 @@ async fn check_cache_off_runtime(cache_dir: &Path, files: &[FileSpec]) -> Result
 struct CacheCheck {
     found: Vec<(FileKind, Vec<u8>)>,
     missing: Vec<FileSpec>,
+    /// Files another program kept open past the retries: neither found nor
+    /// missing, so nothing is downloaded over them.
+    busy: Vec<(String, std::io::Error)>,
 }
 
 impl CacheCheck {
+    /// The error for the first file that stayed busy, when one did.
+    fn busy_error(&mut self) -> Option<DownloadError> {
+        if self.busy.is_empty() {
+            return None;
+        }
+        let (file, source) = self.busy.swap_remove(0);
+        Some(DownloadError::Busy { file, source })
+    }
+
     fn into_model_files(self) -> ModelFiles {
         let mut onnx = Vec::new();
         let mut tokenizer = TokenizerFiles {
@@ -570,10 +598,11 @@ impl CacheCheck {
 
 /// Reads every file of `files` once, keeping the bytes of those that pass.
 fn check_cache(cache_dir: &Path, files: &[FileSpec]) -> CacheCheck {
-    let mut check = CacheCheck { found: Vec::new(), missing: Vec::new() };
+    let mut check = CacheCheck { found: Vec::new(), missing: Vec::new(), busy: Vec::new() };
     for spec in files {
         match read_verified(&cache_dir.join(spec.path), spec.sha256) {
             Ok(bytes) => check.found.push((spec.kind, bytes)),
+            Err(Unusable::Busy(e)) => check.busy.push((spec.path.to_string(), e)),
             Err(_) => check.missing.push(spec.clone()),
         }
     }
@@ -585,14 +614,55 @@ fn check_cache(cache_dir: &Path, files: &[FileSpec]) -> CacheCheck {
 /// check [`ensure_model`] makes.
 #[cfg(feature = "eval")]
 pub(crate) fn model_is_cached(base_dir: &Path) -> bool {
-    check_cache(&cache_dir_of(base_dir), &ALL_FILES).missing.is_empty()
+    let check = check_cache(&cache_dir_of(base_dir), &ALL_FILES);
+    check.missing.is_empty() && check.busy.is_empty()
 }
 
 /// Why a file on disk cannot be used.
 #[derive(Debug)]
 enum Unusable {
     Unreadable(std::io::Error),
+    /// Another program holds the file past the retries of [`read_retrying`].
+    Busy(std::io::Error),
     Altered,
+}
+
+/// How long [`read_retrying`] waits between attempts to read a file another
+/// program holds: 1.9 s in all, short enough for a request to wait on.
+const OPEN_RETRY_WAITS_MS: [u64; 7] = [15, 30, 60, 120, 240, 480, 960];
+
+/// Whether the OS error `raw` says another program holds the file: access
+/// denied, sharing violation or lock violation on Windows, where an antivirus
+/// scanning the file gives any of them. Never read from `ErrorKind`: Rust
+/// leaves the sharing violation `Uncategorized`.
+fn is_sharing_conflict(raw: Option<i32>) -> bool {
+    #[cfg(windows)]
+    {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        matches!(raw, Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = raw;
+        false
+    }
+}
+
+/// `std::fs::read`, trying again over [`OPEN_RETRY_WAITS_MS`] while another
+/// program holds the file. Sleeps, so it runs on a blocking thread.
+fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut waits = OPEN_RETRY_WAITS_MS.iter();
+    loop {
+        match std::fs::read(path) {
+            Err(e) if is_sharing_conflict(e.raw_os_error()) => match waits.next() {
+                Some(ms) => std::thread::sleep(std::time::Duration::from_millis(*ms)),
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
 }
 
 /// Every file [`read_verified`] read and hashed, so a test can count the reads of its own
@@ -603,7 +673,13 @@ static READS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new())
 /// The bytes of `path` when their SHA-256 is `expected_sha`: the one place the
 /// cache is read and checked.
 fn read_verified(path: &Path, expected_sha: &str) -> Result<Vec<u8>, Unusable> {
-    let bytes = std::fs::read(path).map_err(Unusable::Unreadable)?;
+    let bytes = read_retrying(path).map_err(|e| {
+        if is_sharing_conflict(e.raw_os_error()) {
+            Unusable::Busy(e)
+        } else {
+            Unusable::Unreadable(e)
+        }
+    })?;
     #[cfg(test)]
     READS.lock().unwrap_or_else(|e| e.into_inner()).push(path.to_path_buf());
     if sha256_hex(&bytes) != expected_sha {
@@ -1596,6 +1672,66 @@ mod tests {
             expected.sort();
             assert_eq!(reads, expected, "with {damaged} missing, each cached file read once and the downloaded one never");
         }
+    }
+
+    #[test]
+    fn the_wait_for_an_open_is_bounded_and_only_windows_sharing_errors_count() {
+        let total: u64 = OPEN_RETRY_WAITS_MS.iter().sum();
+        assert!(total <= 2_000, "the retries wait {total} ms");
+        for raw in [5, 32, 33] {
+            assert_eq!(is_sharing_conflict(Some(raw)), cfg!(windows), "os error {raw}");
+        }
+        for raw in [Some(2), Some(3), Some(13), Some(0), None] {
+            assert!(!is_sharing_conflict(raw), "{raw:?}");
+        }
+    }
+
+    /// Holds `path` open without sharing, for the length of the guard.
+    #[cfg(windows)]
+    fn held_without_sharing(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).share_mode(0).open(path).expect("hold the file")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_sharing_violation_on_open_is_retried_within_the_wait() {
+        let tmp = TestDir::new("open-retried");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let files = fixture_files();
+        write_all_to_cache(&cache_dir, &files);
+        let specs = fixture_specs(&files);
+        let held = held_without_sharing(&cache_dir.join(specs[1].path));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+
+        let check = check_cache(&cache_dir, &specs);
+        release.join().unwrap();
+        assert!(check.missing.is_empty() && check.busy.is_empty(), "missing {:?}", check.missing);
+        assert_eq!(check.found.len(), specs.len());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_persistent_sharing_violation_is_not_a_missing_file_at_start() {
+        let tmp = TestDir::new("open-busy");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let files = fixture_files();
+        write_all_to_cache(&cache_dir, &files);
+        let specs = fixture_specs(&files);
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+        let _held = held_without_sharing(&cache_dir.join(specs[1].path));
+        let server = mockito::Server::new_async().await;
+
+        let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None).await;
+        match res {
+            Err(DownloadError::Busy { file, .. }) => assert_eq!(file, specs[1].path),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        assert!(collect_partials(&cache_dir).is_empty(), "nothing was downloaded");
+        assert!(matches!(load_cached_from(tmp.path(), &specs).await, Err(DownloadError::Busy { .. })));
     }
 
     #[tokio::test]

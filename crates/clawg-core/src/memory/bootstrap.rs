@@ -461,6 +461,7 @@ pub fn unloading_when_idle(
                 let started = std::time::Instant::now();
                 let files = match cached(base_dir.clone()).await {
                     Ok(files) => files,
+                    Err(e) if !needs_repair(&e) => return Err(e.to_string()),
                     Err(e) => {
                         repair_in_background(&runtime, ensure, base_dir, repairing);
                         return Err(format!("{e}; the model is being downloaded again in the background"));
@@ -483,6 +484,13 @@ pub fn unloading_when_idle(
         let loaded = load(files)?;
         Ok(Arc::new(IdleEmbedder::new(loaded, reload.clone(), idle, memory, &runtime)) as Arc<dyn Embedder>)
     })
+}
+
+/// Whether a cache that failed to read with `e` needs files downloaded again.
+/// A file another program holds is not missing, and downloading over it would
+/// only fight that program for it.
+fn needs_repair(e: &DownloadError) -> bool {
+    !matches!(e, DownloadError::Busy { .. })
 }
 
 /// Starts `ensure` on `runtime` unless a repair is already running.
@@ -1107,6 +1115,53 @@ mod tests {
             .expect("the repaired cache loads");
         assert!(embedder.resident());
         assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_a_busy_file_spares_the_repair() {
+        let busy = DownloadError::Busy { file: "onnx/model.onnx".into(), source: std::io::Error::from_raw_os_error(32) };
+        assert!(!needs_repair(&busy));
+        assert!(needs_repair(&DownloadError::NotCached { files: vec!["config.json".into()] }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_persistent_sharing_violation_answers_not_ready_without_a_repair() {
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let cached: CachedModelFn = Arc::new(|_base| {
+            Box::pin(async {
+                Err(DownloadError::Busy {
+                    file: "onnx/model.onnx".into(),
+                    source: std::io::Error::from_raw_os_error(32),
+                })
+            })
+        });
+        let ensure: EnsureModelFn = {
+            let downloads = downloads.clone();
+            Arc::new(move |_base, _progress| {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(empty_model_files()) })
+            })
+        };
+        let load: LoadEmbedderFn = Arc::new(|_files| Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>));
+        let wrapped = unloading_when_idle(
+            cached,
+            ensure,
+            load,
+            std::path::PathBuf::from("unused"),
+            Some(Duration::from_secs(600)),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+        let embedder = wrapped(empty_model_files()).expect("first load");
+        tokio::time::sleep(Duration::from_secs(1200)).await;
+        assert!(!embedder.resident());
+
+        for _ in 0..2 {
+            let answer = embedder.embed_with_role("a text", crate::memory::embedder::EmbedRole::Query).await;
+            assert!(matches!(answer, Err(crate::memory::embedder::EmbedError::NotReady)), "{answer:?}");
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(downloads.load(Ordering::SeqCst), 0, "a file another program holds is not downloaded again");
     }
 
     fn tiny_tokenizer() -> tokenizers::Tokenizer {
