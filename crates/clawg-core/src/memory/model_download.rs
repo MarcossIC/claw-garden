@@ -580,6 +580,7 @@ async fn fetch(
             progress,
             &mut bytes_downloaded_running,
             &source.lock,
+            MAX_FILE_BYTES,
         )
         .await?;
         if spec.kind == FileKind::Onnx {
@@ -901,6 +902,7 @@ async fn download_one(
     progress: Option<&UnboundedSender<DownloadProgress>>,
     bytes_downloaded_running: &mut u64,
     lock: &CacheLock,
+    cap: u64,
 ) -> Result<Option<Vec<u8>>, DownloadError> {
     use futures::StreamExt;
     use sha2::Digest;
@@ -962,9 +964,9 @@ async fn download_one(
         // total (not per file), so a multi-file run yields a smooth progress
         // ramp without spamming the channel.
         let content_length = resp.content_length().unwrap_or(0);
-        if content_length > MAX_FILE_BYTES {
+        if content_length > cap {
             let _ = std::fs::remove_file(&partial);
-            return Err(too_large(spec));
+            return Err(too_large(spec, cap));
         }
         let bytes_total_hint = *bytes_downloaded_running + content_length;
         let mut next_emit_threshold = *bytes_downloaded_running + CHUNK_PROGRESS_BYTES;
@@ -980,8 +982,8 @@ async fn download_one(
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    if received + bytes.len() as u64 > MAX_FILE_BYTES {
-                        fatal = Some(too_large(spec));
+                    if received + bytes.len() as u64 > cap {
+                        fatal = Some(too_large(spec, cap));
                         break;
                     }
                     if let Err(e) = file.write_all(&bytes) {
@@ -1090,10 +1092,10 @@ async fn download_one(
 /// free.
 const MAX_FILE_BYTES: u64 = MIN_FREE_BYTES;
 
-fn too_large(spec: &FileSpec) -> DownloadError {
+fn too_large(spec: &FileSpec, cap: u64) -> DownloadError {
     DownloadError::TooLarge {
         file: spec.path.into(),
-        limit_mb: MAX_FILE_BYTES / (1024 * 1024),
+        limit_mb: cap / (1024 * 1024),
     }
 }
 
@@ -1872,7 +1874,7 @@ mod tests {
         let url = server.url();
 
         for spec in &specs {
-            let body = download_one(&client, &cache_dir, spec, &url, &ZeroBackoff, None, &mut running, &lock)
+            let body = download_one(&client, &cache_dir, spec, &url, &ZeroBackoff, None, &mut running, &lock, MAX_FILE_BYTES)
                 .await
                 .expect("downloads");
             assert_eq!(body.is_some(), spec.kind != FileKind::Onnx, "{}: what the run keeps", spec.path);
@@ -2108,7 +2110,7 @@ mod tests {
         let client = reqwest::Client::new();
         let mut running = 0;
         let url = server.url();
-        let repair = download_one(&client, &cache_dir, &specs[0], &url, &ZeroBackoff, None, &mut running, &lock);
+        let repair = download_one(&client, &cache_dir, &specs[0], &url, &ZeroBackoff, None, &mut running, &lock, MAX_FILE_BYTES);
         tokio::pin!(repair);
 
         let waiting = tokio::time::timeout(std::time::Duration::from_millis(400), &mut repair).await;
@@ -2181,9 +2183,10 @@ mod tests {
     async fn a_body_that_outgrows_the_cap_while_streaming_is_refused() {
         use std::io::{Read, Write};
         let tmp = TestDir::new("dl-streams-too-much");
+        const CAP: u64 = 1 << 20;
         let files = fixture_files();
         let specs = fixture_specs(&files);
-        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         // No Content-Length: only the count of received bytes can stop it.
@@ -2201,18 +2204,31 @@ mod tests {
             }
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
             let block = vec![0u8; 1 << 20];
-            for _ in 0..(MAX_FILE_BYTES / (1 << 20) + 8) {
+            for _ in 0..(2 * CAP / (1 << 20)) {
                 if stream.write_all(&block).is_err() {
                     return;
                 }
             }
         });
 
-        match ensure_model_from(tmp.path(), &source(&url, &oracle, &specs), None).await {
+        let spec = specs.iter().find(|s| s.kind == FileKind::Onnx).expect("an onnx spec");
+        let result = download_one(
+            &reqwest::Client::new(),
+            &cache_dir,
+            spec,
+            &url,
+            &ZeroBackoff,
+            None,
+            &mut 0,
+            &CacheLock::new(),
+            CAP,
+        )
+        .await;
+        match result {
             Err(DownloadError::TooLarge { file, .. }) => assert_eq!(file, "onnx/model.onnx"),
             other => panic!("expected TooLarge, got {other:?}"),
         }
-        assert!(collect_partials(&tmp.path().join("models").join("multilingual-e5-small")).is_empty());
+        assert!(collect_partials(&cache_dir).is_empty());
     }
 
     // ---------- The cause of a failure ----------
