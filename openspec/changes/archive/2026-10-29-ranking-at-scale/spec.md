@@ -1,6 +1,6 @@
 # ranking-at-scale — Especificación
 
-Suma RS1 a RS12 (paso 1, entero) a [`specs/eval`](../../specs/eval/spec.md), y RS13 y RS14 (condicionales) a [`specs/retrieval`](../../specs/retrieval/spec.md). Origen: [proposal](proposal.md), decisiones del 2026-10-28.
+Suma RS1 a RS12 (paso 1, entero) a [`specs/eval`](../../../specs/eval/spec.md), y RS13 y RS14 (condicionales) a [`specs/retrieval`](../../../specs/retrieval/spec.md). Origen: [proposal](proposal.md), decisiones del 2026-10-28.
 
 Las salidas de `rag-eval` que se citan son las de `main.rs:49-59`: 1 fallo de ejecución o de uso (`EXIT_RUNTIME_FAILURE`), 2 golden inválido (`EXIT_GOLDEN_INVALID`), 3 sin modelo, 4 archivo de resultados existente, 5 golden no apto, 6 regresión. Un fondo inservible es una entrada que no se puede leer, así que sale con 1: no se suma un código nuevo.
 

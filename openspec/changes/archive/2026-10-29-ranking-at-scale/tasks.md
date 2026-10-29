@@ -245,11 +245,11 @@ Escrito para la forma por defecto: C1, en el daemon y en el núcleo. Si la puert
 
 ### 24. `verify.md`
 
-- [ ] Informar que la suite pasa (nunca cuántos tests), cada métrica de `rag-eval` que el cambio toca, las puertas con sus datos y lo decidido en cada una. Si el paso 3 pasó a otro cambio, decirlo.
+- [x] Informar que la suite pasa (nunca cuántos tests), cada métrica de `rag-eval` que el cambio toca, las puertas con sus datos y lo decidido en cada una. Si el paso 3 pasó a otro cambio, decirlo.
 
 ### 25. Archive
 
-- [ ] RS1 a RS12 en `specs/eval`, y RS13 y RS14 en `specs/retrieval` sólo si entraron (`specs/mcp` sólo si cambió el contrato que ve el modelo). Después, `git mv` a `changes/archive/<fecha>-ranking-at-scale`, `state.yaml` archivado, y la fila 86 y el orden de ejecución del `README.md` de openspec.
-- [ ] Subir el minor de `[workspace.package] version` y correr `cargo update --workspace`. El commit es `chore: bump version to X.Y.Z`.
+- [x] RS1 a RS12 en `specs/eval`, y RS13 y RS14 en `specs/retrieval` sólo si entraron (`specs/mcp` sólo si cambió el contrato que ve el modelo). Después, `git mv` a `changes/archive/<fecha>-ranking-at-scale`, `state.yaml` archivado, y la fila 86 y el orden de ejecución del `README.md` de openspec.
+- [x] Subir el minor de `[workspace.package] version` y correr `cargo update --workspace`. El commit es `chore: bump version to X.Y.Z`.
 
 La ubicación de las filas sin proyecto del import en prod (la precondición de la propuesta) no es una tarea de este cambio.

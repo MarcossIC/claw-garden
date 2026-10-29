@@ -109,7 +109,7 @@ El delta de `specs/eval` en el paso 1; `specs/retrieval` en los pasos 2 y 3, y `
 
 ## Precondición fuera del cambio
 
-El [orden de ejecución](../../README.md#orden-de-ejecución-de-lo-pendiente) deja un paso operativo, que no es código: ubicar las ~15.709 filas sin proyecto del import en prod con `clawg projects move --origin-project NOMBRE --to-project PROYECTO`, con 0.65.0 instalado y con autorización. Es condición de leer en prod lo que este cambio mida. No lo es de la medición, que corre sobre los snapshots del perfil dev y del home aislado. Este cambio no lo ejecuta.
+El [orden de ejecución](../../../README.md#orden-de-ejecución-de-lo-pendiente) deja un paso operativo, que no es código: ubicar las ~15.709 filas sin proyecto del import en prod con `clawg projects move --origin-project NOMBRE --to-project PROYECTO`, con 0.65.0 instalado y con autorización. Es condición de leer en prod lo que este cambio mida. No lo es de la medición, que corre sobre los snapshots del perfil dev y del home aislado. Este cambio no lo ejecuta.
 
 ## Cómo se mide
 

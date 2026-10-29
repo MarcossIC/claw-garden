@@ -1,6 +1,6 @@
 # eval — Especificación
 
-Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md)) y la baseline medida.
+Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md)), `rag-eval --background` (medir sobre la copia de un snapshot real, con casos que citan su save por origen y nombran su proyecto) y la baseline medida.
 
 **Origen:**
 - [eval-golden-expansion](../../changes/archive/2026-10-12-eval-golden-expansion/proposal.md), archivado el 2026-10-12.
@@ -13,6 +13,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [revision-eval](../../changes/archive/2026-10-21-revision-eval/proposal.md), archivado el 2026-10-21 (sólo «`revision-eval`: revisiones por clave» y su baseline).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «`rag-eval --lang-detect`», LP15 de esa spec).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo la línea del aviso en español en «`chains`: lo que cuesta la clave (M4)»; el parser que lee las respuestas vacías en los dos idiomas, AL7 de esa spec, está en [`specs/retrieval`](../retrieval/spec.md), y la paridad español contra inglés y el store mezclado, sus M1 y M2, no se midieron: piden el golden pareado y el modelo real).
+- [ranking-at-scale](../../changes/archive/2026-10-29-ranking-at-scale/proposal.md), archivado el 2026-10-29 (sólo el paso 1: «`rag-eval --background`: medir a escala» y «A escala» en la baseline; el peso de los resúmenes y la puerta de abstención se cerraron sin código en sus puertas).
 
 ## Definiciones
 
@@ -678,6 +679,146 @@ La barra con la que se aceptó el detector: al menos 95 % de aciertos y a lo sum
 
 **Test:** `lang_detect_counts_by_label` y `lang_detect_prints_no_text` (`lang_detect.rs`).
 
+## `rag-eval --background`: medir a escala
+
+```
+rag-eval (--fake | --real) --background <snapshot> [--agent-view] [--golden <path>] [--tag <slug>] [--sweep-*]
+```
+
+Mide la búsqueda sobre un store real, con el golden encima. Las salidas son las de siempre (`main.rs`): un fondo inservible es una entrada que no se puede leer y sale con 1, sin un código propio.
+
+### El fondo
+
+`--background` MUST tomar la ruta de un snapshot de `clawg backup`, copiarlo como `memory.db` a un directorio nuevo del temporal del sistema y trabajar sólo sobre la copia (`copy_background`, `eval_api.rs`). El original MUST NOT abrirse ni escribirse, y la copia MUST borrarse al terminar, también ante un error. El corpus del golden, si lo hay, se siembra encima.
+
+Antes de abrir la copia, en sólo lectura, MUST rehusar con salida 1 y la causa nombrada, sin escribir nada en el original ni en la copia:
+
+- un snapshot con un `-wal` no vacío al lado, como `restore`;
+- uno dañado o sin historia de clawg;
+- uno de un esquema más nuevo que el del binario, o divergente (la regla de `clawg restore`);
+- uno sin contrato de embeddings, o con un contrato que no es el del embedder de la corrida. `--fake` rehúsa así todo snapshot del modelo real.
+
+No lo repara ni lo re-embebe: un store CLS se rehúsa diciendo que hay que abrirlo una vez con el daemon y respaldarlo de nuevo. Un snapshot de un esquema más viejo MUST migrarse en la copia, como lo abre el daemon.
+
+`--background` junto a `--docs`, `--lang-detect`, `--fts-tokenizer`, `--follow-up`, `--audit` o `--lexical-only` MUST ser un error de uso (salida 1). `--fts-tokenizer` vacía `memory_fts` sin rellenarla, y las filas del fondo saldrían del canal léxico. Los `--sweep-*` MUST aceptarse, y `--agent-view` guarda el corpus por la ingesta encima de la copia.
+
+Un hit del fondo MUST conservar su puesto en la lista ordenada, escrito `bg` y sin su id. Si se descartara, la esperada subiría por encima de cada hit del fondo. Sin `--background`, todo MUST medir igual que sin la bandera.
+
+**Tests:** `background_parses` y `background_with_docs_is_a_usage_error`, con los otros modos (`cli.rs`); `a_background_run_leaves_the_snapshot_byte_identical`, `the_background_copy_is_removed_even_when_the_run_fails`, `a_run_without_background_measures_as_before`, `a_refused_background_exits_with_one_naming_its_cause` y `a_background_hit_ranked_first_keeps_its_place` (`main.rs`); `a_snapshot_with_a_nonempty_wal_is_refused_untouched`, `a_snapshot_of_another_embedding_contract_is_refused_untouched`, que cubre también uno CLS y uno sin contrato, `a_newer_schema_snapshot_is_refused`, que cubre también uno dañado y uno sin historia, `an_older_schema_snapshot_is_migrated_in_the_copy` y `an_evaluation_ingest_records_and_checks_its_embedding_contract` (`eval_api.rs`).
+
+### Lo que el informe dice del fondo
+
+El informe MUST llevar un bloque `background` con:
+
+- la ruta dada y el sha256 del archivo;
+- el contrato de embeddings;
+- el esquema de y a (`schema`);
+- la hora de la búsqueda (`searched_at_ms`);
+- la composición de las filas vivas: por tipo, por agente, por idioma (`memory.lang`, con `null`), por `source`, con o sin proyecto, por proyecto (`by_project`, por nombre) y su ubicación (`placement`: cada `origin_project` con el nombre del proyecto en que quedó, o `null`, y sus filas). Sin `placement`, la ubicación de dos cortes no se puede comparar;
+- en `golden_twins`, las refs del golden cuyo `content_hash` también está en el fondo. En agent-view se comparan antes de sembrar, porque la ingesta fusiona el gemelo con la fila del fondo (`EvalIngest::holding`).
+
+Sin `--background`, el bloque MUST NOT aparecer.
+
+El archivo de resultados MUST NOT llevar texto de filas del fondo, ids de fila ni `topic_key`. Los fondos, los casos y los resultados se escriben en `docs/eval/`, fuera de git. El tag del archivo MUST llevar los 8 primeros hex del sha256 del fondo (`bg-<8 hex>`), así que el ancla con y sin fondo del mismo día no chocan. Un archivo existente MUST NOT pisarse (salida 4).
+
+**Tests:** `the_composition_counts_rows_without_text` (`eval_api.rs`); `the_report_describes_the_background_without_text`, `a_golden_row_also_in_the_background_is_named_a_twin` y `the_results_file_with_a_background_holds_no_stored_text` (`main.rs`).
+
+### El alcance de producción
+
+La búsqueda de evaluación MUST usar el alcance del daemon sin `sharing.json`: todos los agentes legibles (`Reach::AllBut` sin ocultos) y, si el caso lo nombra, su proyecto bajo el predicado de producción. Con proyecto, MUST leer las filas de ese proyecto, las sin proyecto y toda `user_preference`, y MUST NOT leer las de otro proyecto. Agent-view MUST mandar el proyecto del caso a `search` y a `context`. Sin `project` en el caso, la búsqueda va sin proyecto, como el ancla. Con un solo agente, el alcance del daemon ordena igual que `Reach::Own`.
+
+Sobre un fondo, casi todo lo guardó otro agente, y la salida lo marca con `by <autor>`. Agent-view MUST reconocer esa marca en las líneas de `search_memory` (`parse_search_line`, que salta también la nota de filas compartidas en los dos idiomas) y en los encabezados de los hits de `recall_context` (`hit_text`, `agent_view/parse.rs`). Si no la reconociera, perdería esos hits.
+
+**Tests:** `production_reach_reads_other_agents_and_unowned_rows`, `a_project_search_reads_its_own_unowned_and_every_preference` y `a_one_agent_store_ranks_the_same_under_the_daemons_reach` (`eval_api.rs`); `agent_view_sends_the_case_project_to_search_and_context` (`main.rs`); `a_hit_another_agent_saved_parses` y `a_context_hit_another_agent_saved_is_one_segment` (`agent_view/parse.rs`).
+
+### La edad de una fila en agent-view
+
+`EvalIngest::send` MUST tomar la edad de la fila (`age_days`) como `EvalStore::insert`. Una fila con `age_days` 300 queda con `created_at` 300 días antes de la corrida, no con la hora de la corrida.
+
+**Test:** `eval_ingest_backdates_created_at` (`eval_api.rs`).
+
+### Casos que citan su save por origen
+
+`RetrievalCase` MUST aceptar `expected_origins`, opcional: una lista de `created_by_ref` (`engram:<sync_id>`). Se resuelve sólo entre las filas vivas con `source = 'import'`, porque una save nativa guarda ahí el id de su agente. La resolución MUST correr una vez por fondo, antes de medir (`resolve_cases`, `eval_api.rs`). Toma todas las piezas vivas de la save, su tipo, su idioma (`detect` si `lang` es NULL), su texto unido y si es el último resumen de su proyecto.
+
+Un hit en cualquier pieza de la save citada MUST contar como esa esperada, y un hit del fondo que no está citado MUST NOT contar nunca. Agent-view encuentra la save por su texto unido, en cualquiera de sus piezas.
+
+Reglas del caso:
+
+- Un caso con `expected_origins` MUST tener `corpus_refs` y `expected_refs` vacías o ausentes, y MUST NOT tener `stale_refs`.
+- Un caso `unanswerable` MUST tener `expected_origins` vacía. Uno de otra clase MUST tener `expected_refs` o `expected_origins` no vacía.
+- La validación MUST fallar con salida 2 cuando un caso cita un origen sin `--background`, cuando un origen no tiene fila viva en el fondo (también si una reimportación dejó su save `superseded`) y cuando la lista mezcla esperadas por ref y por origen.
+- Una clave desconocida sigue siendo error de parseo.
+- Un golden sin `expected_origins` MUST medir igual que sin la clave, con el mismo `content_sha256`.
+
+El bloque de similitud deja fuera los casos por origen.
+
+**Tests:** `a_case_may_cite_its_expected_save_by_origin` y `an_origin_case_cannot_also_carry_corpus_refs` (`golden.rs`); `an_origin_without_a_row_fails_validation`, `an_origin_case_without_background_fails_validation`, `a_hit_on_any_piece_of_the_cited_save_counts`, `a_background_hit_not_cited_never_counts`, `a_golden_without_origins_measures_exactly_as_before` y `an_origin_case_is_found_in_any_piece_of_its_save` (`main.rs`); `an_origin_resolves_to_every_live_piece_of_its_save` y `an_origin_without_a_live_row_is_refused` (`eval_api.rs`).
+
+### El proyecto de un caso
+
+`RetrievalCase` MUST aceptar `project`, opcional: el nombre de un proyecto. `rag-eval` lo resuelve en cada fondo con `resolve_project`, sin crear: primero como id y después como el nombre de un único proyecto vivo, sin distinguir mayúsculas. Usa el id que resulte en ese fondo, pasado por `canonical`. El nombre es lo único que sirve para los casos sin fila esperada, y es el mismo en dos cortes que ubiquen las filas bajo el mismo proyecto. Los ids, en cambio, pueden diferir entre cortes.
+
+El golden MUST ser inválido (salida 2) cuando:
+
+- el nombre no lleva a ningún proyecto, o lleva a dos (ambiguo);
+- lleva a un proyecto borrado;
+- hay `project` sin `--background`;
+- la save citada tiene filas fuera del alcance del proyecto del caso, de otro proyecto salvo `user_preference`.
+
+Sin `project`, la búsqueda va sin proyecto. Un caso `unanswerable` puede llevar `project` igual que uno con respuesta, y entonces busca bajo ese proyecto.
+
+**Tests:** `a_project_name_resolves_to_each_backgrounds_own_id`, `an_ambiguous_or_unknown_project_name_is_refused` y `an_expected_save_outside_the_case_project_is_refused` (`eval_api.rs`); `an_ambiguous_or_unknown_project_name_fails_validation`, `project_without_background_fails_validation`, `an_expected_save_outside_the_case_project_fails_validation` y `an_unanswerable_case_may_name_a_project` (`main.rs`).
+
+### Informe por caso
+
+Cada caso activo de `per_case` de una corrida con `--background` MUST llevar estos campos, sin cambiar el ranking. Salen sólo con fondo.
+
+- `project`, el nombre que dio el caso, y `expected_type`, el `memory_type` de la save esperada. Si la esperada es un `session_summary`, también `expected_is_last_summary`.
+- `top5_types`: el `memory_type` de cada hit del top 5.
+- `decay_age_days`: alineada con `top5_types`, la edad que lee el decaimiento de cada hit, desde `last_accessed_at`.
+- `best_cosine`: el máximo coseno crudo 1 − d²/2 entre los hits no exactos devueltos (`cosine_from_l2_unit`), sin decaimiento ni importancia. Vale 1 si una fila es igual a la consulta, y falta si todos son exactos.
+- `score_gap_1_10`: el score del 1º menos el del 10º. Falta con menos de 10 hits.
+- La pareja de idioma: el `query_lang` del caso y el `memory.lang` de la save esperada, o el detector si es NULL.
+- `passes`: 1 o 2.
+- `pool_survival`, `{requested, saves, eligible, expected_in_pool}`: lo que se pidió al pool de `memory`, las saves distintas que devolvió, las filas elegibles cuando la ventana volvió corta y si una fila de la save esperada estaba en el pool. `expected_in_pool` falta en un `unanswerable` y es falso si la esperada sólo llegó por el canal léxico.
+- `short_pool`, con su causa.
+
+Un caso `unanswerable` MUST llevar `best_cosine`, `score_gap_1_10` y `top5_types` en `retrieval.unanswerable`, sin entrar en las métricas ordenadas. Ningún campo lleva texto, ids de fila ni claves.
+
+**Tests:** `a_case_reports_the_type_of_each_top5_hit`, `best_cosine_of_an_identical_row_is_one`, `a_case_reports_passes_pool_survival_and_decay_age`, `an_unanswerable_case_reports_its_distribution_apart`, `the_per_case_report_holds_no_stored_text_or_row_id` y `a_case_expecting_a_summary_says_whether_it_is_the_last_one` (`main.rs`); `the_gap_is_first_minus_tenth` (`report.rs`); `a_resolved_save_says_whether_it_is_the_last_summary_of_its_project` (`eval_api.rs`).
+
+### Pool corto
+
+El pool de KNN de `memory` pide 30 saves distintas (`SearchScope::all_default`). Un caso cuyo pool vuelve con menos, después de su reintento, MUST llevar `short_pool: true`. Ese caso MUST quedar fuera de los agregados de abajo, contado aparte en `short_pool_cases` por causa, y MUST seguir en `per_case` y en las métricas generales.
+
+`short_pool_cause` MUST ser:
+
+- `scope`, cuando las filas elegibles del alcance son menos de 30;
+- `crowded`, cuando no lo son pero la ventana de vec0 volvió tapada.
+
+Se cuenta el pool devuelto y no las saves alcanzables por una razón: todo proyecto lee las filas sin proyecto y toda `user_preference`, así que ningún alcance de un fondo real baja de 30 saves alcanzables. Contadas así nunca dispararía, y el crowding pasaría sin verse. El pool devuelto sale del `KnnOutcome`, que `search_all_memories_with_scoring` entrega como dato (`MemoryPool`), sin ninguna consulta de más.
+
+**Tests:** `the_memory_pool_counts_saves_and_reports_its_eligible_rows` (`search.rs`); `a_case_whose_pool_returns_fewer_than_thirty_saves_is_a_short_pool` (`main.rs`); `a_crowded_window_is_told_apart_from_a_small_scope` y `short_pool_cases_stay_out_of_the_weight_aggregates` (`report.rs`).
+
+### Agregados
+
+`retrieval.scale` MUST agregar, sobre los casos que no son `short_pool` y como lógica pura sobre `per_case`:
+
+- en los casos que no piden un resumen, los lugares del top 3 por tipo (`top3_by_type`), junto a la proporción de filas de cada tipo;
+- las distribuciones de `best_cosine` y de `score_gap_1_10` (n, p5, p25, p50, p75, p95), con y sin respuesta, por pareja de idioma y por partición;
+- `short_pool_cases`.
+
+**Tests:** `top3_places_by_type_against_row_share` y `distributions_split_by_answered_pair_and_partition` (`report.rs`).
+
+### `--diff` sobre un fondo
+
+`--diff` MUST comparar una corrida con `--background` y otra sin, e informar los casos movidos por pareja como siempre. Un golden de otra corrida, con distinto `content_sha256`, sigue sin ser comparable.
+
+El decaimiento lee el reloj al buscar, así que las dos corridas de una comparación sobre un mismo fondo deben ser del mismo día. Nada lo fuerza, pero `--diff` MUST imprimir el sha256 y `searched_at_ms` de cada lado. Si los dos leyeron el mismo fondo con más de 24 h entre medio, MUST imprimir además un aviso que nombra las dos horas. El aviso no cambia el código de salida: `--fail-on-regression` sigue mirando sólo las métricas.
+
+**Tests:** `diff_compares_an_anchor_run_with_and_without_background` y `a_diff_over_one_background_a_day_apart_warns` (`diff.rs`).
+
 ## Baseline medida
 
 Estas cifras no son tests de `cargo`: se miden a mano con `rag-eval --real`, que necesita el modelo. La medición completa está en el [`verify.md` archivado](../../changes/archive/2026-10-12-eval-golden-expansion/verify.md#medición-rag-eval---real). Las cifras de la semilla 7 de abajo son de antes de [long-save-context](../../changes/archive/2026-10-14-long-save-context/proposal.md); el set actual tiene 1.040 filas y 124 casos. Todas son, además, de antes del pooling mean ([`specs/storage`](../storage/spec.md)): los vectores eran CLS y el piso de coseno 0,8793, así que no se reproducen con el embedder de hoy.
@@ -797,6 +938,18 @@ Sobre el cambio tal como se mezcló (`e041ee6`), el flujo de las specs daba 23,4
   - La prevalencia es del 38,1 %, con cota inferior de 36,2 %, y el aviso cuesta 13,19 tokens de media por save.
   - Las etiquetas son del dueño del store en 5 de los 204 pares, y de un agente en los demás. Con una lectura estricta de la regla, el agente dio 32 revisiones en vez de 80.
   - El veredicto del aviso es provisional hasta que se compruebe en casos reales con el criterio de la propuesta de topic-key-warning (68), fijado en revision-recheck (70) antes de etiquetar. Se mide sobre los pares que el producto marca al disparar (`memory_conflict.topic_key_warned`), porque un save que siguió el aviso ya no se distingue en el export de uno que nació con clave. El umbral es relativo a la prevalencia (razón de verosimilitud positiva ≥ 2), con tres salidas sobre la cota de Wilson y hasta 200 pares marcados.
+
+### A escala
+
+Medido con el modelo real el 2026-10-28 y el 2026-10-29, sobre dos cortes del mismo historial (`docs/eval/backgrounds/`, fuera de git): `old-cut.db`, un respaldo del perfil dev (`b7edae9d…`, 51.998 filas vivas, V24 migrado a V31 en la copia), y `new-cut.db`, una reimportación de `engram export --all` en un home aislado (`180b9862…`, 54.731 filas, V31). El detalle está en el [verify](../../changes/archive/2026-10-29-ranking-at-scale/verify.md) del cambio.
+
+- **El ancla de 46 a escala:** R@5 0,652 sin fondo, 0,348 sobre el corte viejo y 0,326 sobre el nuevo. En los dos casos, 14 y 15 casos empeoran y ninguno mejora (p = 0,0001).
+- **El set minado** (`docs/eval/golden-mined.json`, fuera de git): 89 consultas en español con respuesta (`es>es` 47, `es>en` 42), que citan su save por origen, y 23 sin respuesta. Se validaron una por una con el dueño del historial.
+  - Sobre el corte nuevo y el viejo, R@5 da 0,517 y 0,528, y en agent-view `search.found` da 0,629 y 0,663, y `context.found`, 0,629 y 0,640. `--diff` no distingue los cortes.
+  - Ninguna búsqueda sin respuesta devolvió una lista vacía (0/23).
+  - Hay 13 y 26 casos de pool `crowded`.
+- **Los resúmenes de sesión no inundan cuando hay respuesta.** En calibración, sobre el corte nuevo, ocupan el 7,1 % del top 3 en los casos que no piden un resumen, contra el 11,7 % de las filas. En los casos sin respuesta ocupan el 33,3 %.
+- **Ni el coseno del mejor hit ni el hueco separan las consultas con y sin respuesta.** Las sin respuesta van de 0,854 a 0,891 de coseno, y las con respuesta arrancan en 0,851. Abstener en 15 de 18 sin respuesta cuesta 19 de 63 con respuesta.
 
 ## Invariantes
 
