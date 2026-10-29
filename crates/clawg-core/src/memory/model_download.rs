@@ -2177,6 +2177,44 @@ mod tests {
         assert!(collect_partials(&tmp.path().join("models").join("multilingual-e5-small")).is_empty());
     }
 
+    #[tokio::test]
+    async fn a_body_that_outgrows_the_cap_while_streaming_is_refused() {
+        use std::io::{Read, Write};
+        let tmp = TestDir::new("dl-streams-too-much");
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // No Content-Length: only the count of received bytes can stop it.
+        // Not joined: on this runtime the client's socket closes only after the test
+        // yields, and the writer ends when it does.
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            let block = vec![0u8; 1 << 20];
+            for _ in 0..(MAX_FILE_BYTES / (1 << 20) + 8) {
+                if stream.write_all(&block).is_err() {
+                    return;
+                }
+            }
+        });
+
+        match ensure_model_from(tmp.path(), &source(&url, &oracle, &specs), None).await {
+            Err(DownloadError::TooLarge { file, .. }) => assert_eq!(file, "onnx/model.onnx"),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        assert!(collect_partials(&tmp.path().join("models").join("multilingual-e5-small")).is_empty());
+    }
+
     // ---------- The cause of a failure ----------
 
     #[tokio::test]
