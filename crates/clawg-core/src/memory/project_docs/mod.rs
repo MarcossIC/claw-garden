@@ -69,7 +69,7 @@ pub enum DocIndexError {
     Store(#[from] tokio_rusqlite::Error),
 }
 
-/// What one refresh did, counted in docs except for `passages`.
+/// What one refresh did, counted in docs except for `passages` and `reused`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshReport {
     /// Docs on disk that were read.
@@ -81,6 +81,9 @@ pub struct RefreshReport {
     pub skipped: usize,
     /// Passages written by this refresh.
     pub passages: usize,
+    /// Of `passages`, those whose vector was kept from the doc's earlier
+    /// version instead of embedded again.
+    pub reused: usize,
     /// Docs left as they were because a vector of theirs was unusable; the
     /// next refresh tries them again.
     pub failed: Vec<FailedDoc>,
@@ -427,6 +430,7 @@ pub(crate) async fn refresh(
         ..Default::default()
     };
     let files: HashMap<&str, &DocFile> = scan.docs.iter().map(|d| (d.file.path.as_str(), &d.file)).collect();
+    let indexed_before: HashSet<&str> = stored.iter().map(|f| f.path.as_str()).collect();
     for path in &plan.index {
         let file = files[path.as_str()].clone();
         let kind = file.kind;
@@ -443,7 +447,16 @@ pub(crate) async fn refresh(
             DocKind::Manifest => chunk_manifest(path, &masked, splitter),
             DocKind::Code(lang) => chunk_code(path, &masked, lang, splitter),
         };
-        let vectors = match embed_passages(embedder, path, &passages).await {
+        // A new doc has nothing stored to reuse, so it does not ask.
+        let kept = if indexed_before.contains(path.as_str()) {
+            stored_vectors(store, project_id, path, &model_id).await?
+        } else {
+            HashMap::new()
+        };
+        let reuse = reuse_plan(&passages, &kept);
+        let to_embed: Vec<String> = reuse.to_embed.iter().map(|&i| passages[i].indexed_text()).collect();
+        let reused = passages.len() - to_embed.len();
+        let new = match embed_passages(embedder, path, to_embed).await {
             Ok(vectors) => vectors,
             Err(DocIndexError::Vector { path, reason }) => {
                 report.failed.push(FailedDoc { path, reason });
@@ -451,7 +464,9 @@ pub(crate) async fn refresh(
             }
             Err(e) => return Err(e),
         };
+        let vectors = fill(reuse, new);
         report.passages += passages.len();
+        report.reused += reused;
         let doc = IndexedDoc { path: path.clone(), hash, model_id: model_id.clone(), passages, vectors };
         replace_doc(store, project_id, doc).await?;
         report.indexed += 1;
@@ -461,15 +476,79 @@ pub(crate) async fn refresh(
     Ok(report)
 }
 
+/// Which vectors of a doc's new passages come from its stored version and
+/// which passages are left to embed.
+#[derive(Debug, PartialEq, Eq)]
+struct Reuse {
+    /// Per passage, the stored blob of its text, if there is one.
+    vectors: Vec<Option<Vec<u8>>>,
+    /// The passages with no stored blob, in order.
+    to_embed: Vec<usize>,
+}
+
+/// Matches each passage to the vector stored for its whole `indexed_text`, so a
+/// text that repeats takes the same blob in every passage that has it.
+fn reuse_plan(passages: &[Passage], stored: &HashMap<String, Vec<u8>>) -> Reuse {
+    let mut reuse = Reuse { vectors: Vec::with_capacity(passages.len()), to_embed: Vec::new() };
+    for (i, passage) in passages.iter().enumerate() {
+        let blob = stored.get(&passage.indexed_text()).cloned();
+        if blob.is_none() {
+            reuse.to_embed.push(i);
+        }
+        reuse.vectors.push(blob);
+    }
+    reuse
+}
+
+/// The vectors of a doc in the order of its passages: the reused ones where
+/// they were, `new` (one per `to_embed`, in order) in the rest.
+fn fill(reuse: Reuse, new: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut slots = reuse.vectors;
+    for (i, vector) in reuse.to_embed.into_iter().zip(new) {
+        slots[i] = Some(vector);
+    }
+    slots.into_iter().flatten().collect()
+}
+
+/// The vector of each passage a doc has in the index, by its `indexed_text`,
+/// when the doc was embedded by `model_id`; nothing otherwise. Read by value:
+/// `replace_doc` gives the passages new row ids.
+async fn stored_vectors(
+    store: &MemoryStore,
+    project_id: &str,
+    path: &str,
+    model_id: &str,
+) -> Result<HashMap<String, Vec<u8>>, DocIndexError> {
+    let (project_id, path, model_id) = (project_id.to_string(), path.to_string(), model_id.to_string());
+    Ok(store
+        .conn
+        .call(move |c| -> rusqlite::Result<_> {
+            let mut stmt = c.prepare(
+                "SELECT c.breadcrumb, c.body, v.embedding                  FROM project_doc_chunk c JOIN project_doc_vectors v ON v.rowid = c.id                  WHERE c.project_id = ?1 AND c.path = ?2                    AND EXISTS (SELECT 1 FROM project_doc_file f                                WHERE f.project_id = ?1 AND f.path = ?2 AND f.model_id = ?3)                  ORDER BY c.ordinal",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![project_id, path, model_id], |r| {
+                Ok((Passage { ordinal: 0, breadcrumb: r.get(0)?, body: r.get(1)? }, r.get::<_, Vec<u8>>(2)?))
+            })?;
+            let mut by_text = HashMap::new();
+            for row in rows {
+                let (passage, blob) = row?;
+                by_text.entry(passage.indexed_text()).or_insert(blob);
+            }
+            Ok(by_text)
+        })
+        .await?)
+}
+
+/// Embeds `texts`, one blob per text; without texts the embedder is not
+/// called.
 async fn embed_passages(
     embedder: &dyn Embedder,
     path: &str,
-    passages: &[Passage],
+    texts: Vec<String>,
 ) -> Result<Vec<Vec<u8>>, DocIndexError> {
-    if passages.is_empty() {
+    if texts.is_empty() {
         return Ok(Vec::new());
     }
-    let texts: Vec<String> = passages.iter().map(Passage::indexed_text).collect();
     let vectors = embedder
         .embed_batch(&texts, EmbedRole::Passage)
         .await
@@ -1072,6 +1151,351 @@ mod tests {
             .unwrap();
         assert!(indexed.iter().all(|t| !t.contains(&token)));
         assert!(bodies.iter().all(|(_, _, b)| !b.contains(&token)));
+    }
+
+    /// `FakeEmbedder` that records the texts it is asked for. `salt` shifts
+    /// every vector without changing the model id, so a vector kept from an
+    /// earlier refresh can be told from one embedded again.
+    struct Recording {
+        model: &'static str,
+        salt: AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+        texts: Mutex<Vec<String>>,
+    }
+
+    impl Recording {
+        fn new(model: &'static str) -> Self {
+            Self {
+                model,
+                salt: AtomicUsize::new(0),
+                fail: std::sync::atomic::AtomicBool::new(false),
+                texts: Mutex::new(Vec::new()),
+            }
+        }
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.texts.lock().unwrap())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for Recording {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(EmbedError::InferenceFailed("boom".into()));
+            }
+            self.texts.lock().unwrap().push(text.to_string());
+            let mut v = FakeEmbedder::default().embed_with_role(text, role).await?;
+            v[7] += 5.0 * self.salt.load(Ordering::SeqCst) as f32;
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { self.model }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    const GUIDE: &str = "# Guide\n## Install\nrun the installer\n## Usage\nrun it daily\n## Limits\nnone known\n";
+
+    /// Everything a doc holds in the index but its row ids and dates: per
+    /// passage its place, text, vector and indexed text, then the doc's row.
+    type Dump = (Vec<(String, i64, String, String, Vec<u8>, String)>, Vec<(String, String, String, i64)>);
+
+    async fn dump(store: &MemoryStore) -> Dump {
+        store
+            .conn
+            .call(|c| -> rusqlite::Result<Dump> {
+                let passages = c
+                    .prepare(
+                        "SELECT c.path, c.ordinal, c.breadcrumb, c.body, v.embedding, \
+                                (SELECT f.text FROM project_doc_fts f WHERE f.rowid = c.id) \
+                         FROM project_doc_chunk c JOIN project_doc_vectors v ON v.rowid = c.id \
+                         ORDER BY c.path, c.ordinal",
+                    )?
+                    .query_map([], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                let files = c
+                    .prepare("SELECT path, content_hash, model_id, chunks FROM project_doc_file ORDER BY path")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok((passages, files))
+            })
+            .await
+            .unwrap()
+    }
+
+    fn vector_of(dump: &Dump, breadcrumb_ends_with: &str) -> Vec<u8> {
+        let hits: Vec<_> = dump.0.iter().filter(|p| p.2.ends_with(breadcrumb_ends_with)).collect();
+        assert_eq!(hits.len(), 1, "one passage under {breadcrumb_ends_with}");
+        hits[0].4.clone()
+    }
+
+    #[tokio::test]
+    async fn an_edited_doc_embeds_only_the_passages_that_changed() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", GUIDE);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let embedder = Recording::new("rec");
+        refreshed(&index, &store, &embedder, "p").await;
+        assert_eq!(embedder.take().len(), 3);
+
+        write(dir.path(), "a.md", &GUIDE.replace("run it daily", "run it hourly"));
+        let report = refreshed(&index, &store, &embedder, "p").await;
+
+        assert_eq!(embedder.take(), ["a.md > Guide > Usage\n\nrun it hourly"]);
+        assert_eq!((report.indexed, report.passages, report.reused), (1, 3, 2));
+    }
+
+    /// Two passages with one body under different headings, two edits around a
+    /// reused one: the places a wrong match or a wrong order would show.
+    const NOTES: &str = "# Notes
+## A
+same
+## B
+same
+## C
+first
+## D
+second
+";
+
+    #[tokio::test]
+    async fn a_partly_reused_doc_equals_a_full_reindex() {
+        let edited = NOTES.replace("## A
+same", "## A
+other").replace("first", "third");
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", NOTES);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let embedder = Recording::new("rec");
+        refreshed(&index, &store, &embedder, "p").await;
+        embedder.take();
+        write(dir.path(), "a.md", &edited);
+        let report = refreshed(&index, &store, &embedder, "p").await;
+        assert_eq!((report.passages, report.reused, embedder.take().len()), (4, 2, 2));
+
+        let fresh_dir = crate::test_dir::test_dir();
+        write(fresh_dir.path(), "a.md", &edited);
+        let fresh = store_with_project("p", fresh_dir.path()).await;
+        refreshed(&Arc::new(DocIndex::default()), &fresh, &Recording::new("rec"), "p").await;
+
+        assert_eq!(dump(&store).await, dump(&fresh).await);
+        assert_eq!(index_sizes(&store).await, (1, 4, 4, 4));
+    }
+
+    #[tokio::test]
+    async fn a_reused_vector_is_the_stored_blob() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", GUIDE);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let embedder = Recording::new("rec");
+        embedder.salt.store(1, Ordering::SeqCst);
+        refreshed(&index, &store, &embedder, "p").await;
+        let before = dump(&store).await;
+
+        embedder.salt.store(2, Ordering::SeqCst);
+        write(dir.path(), "a.md", &GUIDE.replace("run it daily", "run it hourly"));
+        refreshed(&index, &store, &embedder, "p").await;
+        let after = dump(&store).await;
+
+        assert_eq!(vector_of(&after, "Install"), vector_of(&before, "Install"), "kept, not embedded again");
+        assert_eq!(vector_of(&after, "Limits"), vector_of(&before, "Limits"));
+        let salted = embedder
+            .embed_with_role("a.md > Guide > Usage\n\nrun it hourly", EmbedRole::Passage)
+            .await
+            .unwrap();
+        let salted = le_bytes(&to_unit(&salted).unwrap());
+        assert_eq!(vector_of(&after, "Usage"), salted, "the changed passage is embedded with the new salt");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_text_is_reused_in_all_its_passages() {
+        let doc = "# Guide\n## Same\nthe same words\n## Same\nthe same words\n## Other\nold\n";
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", doc);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let embedder = Recording::new("rec");
+        refreshed(&index, &store, &embedder, "p").await;
+        let before = dump(&store).await;
+        embedder.take();
+
+        write(dir.path(), "a.md", &doc.replace("old", "new"));
+        let report = refreshed(&index, &store, &embedder, "p").await;
+
+        assert_eq!(embedder.take(), ["a.md > Guide > Other\n\nnew"]);
+        assert_eq!((report.passages, report.reused), (3, 2));
+        let after = dump(&store).await;
+        assert_eq!(after.0[0].4, before.0[0].4);
+        assert_eq!(after.0[1].4, before.0[1].4);
+        assert_eq!(after.0[0].4, after.0[1].4, "both passages hold the one vector");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_text_takes_the_blob_of_its_first_passage() {
+        let doc = "# Guide
+## Same
+the same words
+## Same
+the same words
+## Other
+old
+";
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", doc);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let embedder = Recording::new("rec");
+        refreshed(&index, &store, &embedder, "p").await;
+        let first = dump(&store).await.0[0].4.clone();
+        let odd = embedder.embed_with_role("somewhere else", EmbedRole::Passage).await.unwrap();
+        let odd = le_bytes(&to_unit(&odd).unwrap());
+        assert_ne!(first, odd);
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<()> {
+                let id: i64 = c.query_row(
+                    "SELECT id FROM project_doc_chunk WHERE breadcrumb LIKE '%Same' ORDER BY ordinal DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                c.execute("DELETE FROM project_doc_vectors WHERE rowid = ?1", [id])?;
+                c.execute(
+                    "INSERT INTO project_doc_vectors (rowid, project_id, embedding) VALUES (?1, 'p', ?2)",
+                    rusqlite::params![id, odd],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        write(dir.path(), "a.md", &doc.replace("old", "new"));
+        refreshed(&index, &store, &embedder, "p").await;
+
+        let after = dump(&store).await;
+        assert_eq!((&after.0[0].4, &after.0[1].4), (&first, &first), "the first passage's blob wins");
+    }
+
+    #[tokio::test]
+    async fn reused_counts_passages_not_distinct_texts() {
+        let doc = "# Guide\n## Same\nx\n## Same\nx\n## Same\nx\n## Other\nold\n";
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", doc);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let embedder = Recording::new("rec");
+        refreshed(&index, &store, &embedder, "p").await;
+
+        write(dir.path(), "a.md", &doc.replace("old", "new"));
+        let report = refreshed(&index, &store, &embedder, "p").await;
+
+        assert_eq!((report.passages, report.reused), (4, 3));
+    }
+
+    #[tokio::test]
+    async fn a_doc_of_another_model_reuses_nothing() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", GUIDE);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        refreshed(&index, &store, &Recording::new("m1"), "p").await;
+
+        write(dir.path(), "a.md", &GUIDE.replace("run it daily", "run it hourly"));
+        let other = Recording::new("m2");
+        let report = refreshed(&index, &store, &other, "p").await;
+
+        assert_eq!(other.take().len(), 3, "every passage is embedded by the new model");
+        assert_eq!((report.passages, report.reused), (3, 0));
+    }
+
+    #[tokio::test]
+    async fn a_moved_file_reuses_nothing() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", GUIDE);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let embedder = Recording::new("rec");
+        refreshed(&index, &store, &embedder, "p").await;
+        embedder.take();
+
+        std::fs::remove_file(dir.path().join("a.md")).unwrap();
+        write(dir.path(), "docs/a.md", GUIDE);
+        let report = refreshed(&index, &store, &embedder, "p").await;
+
+        assert_eq!(embedder.take().len(), 3);
+        assert_eq!((report.indexed, report.removed, report.passages, report.reused), (1, 1, 3, 0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_embedding_of_the_rest_keeps_the_doc_as_it_was() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", GUIDE);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let embedder = Recording::new("rec");
+        refreshed(&index, &store, &embedder, "p").await;
+        let before = dump(&store).await;
+
+        write(dir.path(), "a.md", &GUIDE.replace("run it daily", "run it hourly"));
+        embedder.fail.store(true, Ordering::SeqCst);
+        let failed = index.try_refresh(&store, &embedder, None, "p").await;
+
+        assert!(matches!(failed, Err(DocIndexError::Embed { ref path, .. }) if path == "a.md"), "{failed:?}");
+        assert_eq!(dump(&store).await, before);
+
+        embedder.fail.store(false, Ordering::SeqCst);
+        let retried = refreshed(&index, &store, &embedder, "p").await;
+        assert_eq!((retried.indexed, retried.reused), (1, 2), "the next refresh picks the doc up again");
+    }
+
+    /// Needs the real model: `CLAWG_E5_MODEL_DIR` is the directory that holds
+    /// it, `<data dir>/models/multilingual-e5-small`. Run by hand with
+    /// `cargo test -p clawg-core --lib --target-dir target-test project_docs -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs the real model in CLAWG_E5_MODEL_DIR (<data dir>/models/multilingual-e5-small)"]
+    async fn a_partly_reused_doc_matches_a_full_reindex_within_tolerance() {
+        let model_dir = PathBuf::from(
+            std::env::var_os("CLAWG_E5_MODEL_DIR").expect("CLAWG_E5_MODEL_DIR is not set: this test needs the real model"),
+        );
+        let base = model_dir.parent().and_then(Path::parent).expect("a model directory two levels under the data dir");
+        let files = crate::memory::model_download::ensure_model(base, None, &crate::memory::model_download::CacheLock::new())
+            .await
+            .expect("the model is cached");
+        let tokenizer = crate::memory::model_download::parse_verified_tokenizer(&files.tokenizer.tokenizer_file).unwrap();
+        let embedder =
+            crate::memory::embedder::E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer).unwrap();
+
+        let edited = GUIDE.replace("run it daily", "run it hourly");
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", GUIDE);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        refreshed(&index, &store, &embedder, "p").await;
+        write(dir.path(), "a.md", &edited);
+        let report = refreshed(&index, &store, &embedder, "p").await;
+        assert_eq!(report.reused, 2);
+
+        let fresh_dir = crate::test_dir::test_dir();
+        write(fresh_dir.path(), "a.md", &edited);
+        let fresh = store_with_project("p", fresh_dir.path()).await;
+        refreshed(&Arc::new(DocIndex::default()), &fresh, &embedder, "p").await;
+
+        let (partly, full) = (dump(&store).await, dump(&fresh).await);
+        assert_eq!(partly.0.len(), full.0.len());
+        for (a, b) in partly.0.iter().zip(&full.0) {
+            assert_eq!((&a.0, a.1, &a.2, &a.3), (&b.0, b.1, &b.2, &b.3));
+            let decode = |blob: &[u8]| -> Vec<f32> {
+                blob.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            };
+            let (x, y) = (decode(&a.4), decode(&b.4));
+            let cosine: f32 = x.iter().zip(&y).map(|(p, q)| p * q).sum();
+            let widest = x.iter().zip(&y).map(|(p, q)| (p - q).abs()).fold(0.0, f32::max);
+            assert!(widest <= 1e-5 || cosine >= 1.0 - 1e-6, "{}: widest {widest}, cosine {cosine}", a.2);
+        }
     }
 
     /// Places a text on one axis per topic it mentions, so a test decides

@@ -2665,16 +2665,22 @@ fn refresh_docs_in_background(app: Arc<AppCtx>, guard: RefreshGuard, embedder: A
     tokio::spawn(async move { refresh_docs(&app, guard, embedder.as_ref(), &project_id).await });
 }
 
+/// What the log says a refresh did; `reused` counts the passages whose vector
+/// was kept instead of embedded again.
+fn refresh_line(project_id: &str, r: &project_docs::RefreshReport) -> String {
+    format!(
+        "indexed the docs of {project_id}: {} docs, {} reindexed, {} removed, {} skipped, {} passages, {} reused",
+        r.docs, r.indexed, r.removed, r.skipped, r.passages, r.reused
+    )
+}
+
 /// Nobody waits on the outcome: a failure is logged and kept for the next
 /// search to name.
 async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder, project_id: &str) {
     let tokenizer = app.runtime.tokenizer.get().cloned();
     match guard.run(&app.runtime.store, embedder, tokenizer).await {
         Ok(r) => {
-            log::info!(
-                "indexed the docs of {project_id}: {} docs, {} reindexed, {} removed, {} skipped, {} passages",
-                r.docs, r.indexed, r.removed, r.skipped, r.passages
-            );
+            log::info!("{}", refresh_line(project_id, &r));
             for f in &r.failed {
                 log::warn!("left {} of {project_id} as it was: {}", f.path, f.reason);
             }
@@ -2799,6 +2805,23 @@ mod tests {
 
     fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
         SavedChunk { id, outcome }
+    }
+
+    #[test]
+    fn the_docs_log_line_shows_the_reused_passages() {
+        let report = project_docs::RefreshReport {
+            docs: 4,
+            indexed: 2,
+            removed: 1,
+            skipped: 3,
+            passages: 9,
+            reused: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            refresh_line("p", &report),
+            "indexed the docs of p: 4 docs, 2 reindexed, 1 removed, 3 skipped, 9 passages, 7 reused"
+        );
     }
 
     #[test]
