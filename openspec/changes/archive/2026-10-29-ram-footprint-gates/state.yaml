@@ -1,0 +1,24 @@
+change: ram-footprint-gates
+objective: "transversal"
+depends_on: [ram-footprint]
+phase: archived
+release: "0.67.0"
+artifacts:
+  exploration: done  # la segunda pasada, con hooks, se agrega después de C y F
+  proposal: done  # revisada: C pasa a C′ (vista mapeada + commit_from_memory)
+  spec: done  # RM1 a RM5; RM1 a RM4 en specs/storage y RM5 en specs/project-docs
+  design: done
+  tasks: done  # la segunda pasada no se hizo; la revisión externa no está en el repositorio
+  apply: done  # commits 1 a 7; la puerta de C dio View, así que queda C′
+  verify: done  # verify.md: pasa con W2 aceptado; W1 y W3 cerradas por 43771c6 y 205f2f6
+  archive: done
+gates:
+  "C": closed  # View: la vista mapeada (C′) queda; File no pasa y Revert no aplica
+  "D": closed  # no pasó su puerta en la primera pasada; va con import-job (87)
+  "B": pending  # segunda pasada con hooks, decide B: necesita autorización
+  "E": pending  # segunda pasada con hooks, decide E: necesita autorización
+after_archive:  # fuera del cambio
+  - "la segunda pasada, con los hooks instalados, decide B y E: necesita autorización explícita (instalar los hooks y leer metrics.db y serve.log de prod)"
+  - "la revisión externa que adoptó la propuesta no está en el repositorio"
+updated: 2026-10-29
+main_spec: openspec/specs/storage/spec.md, openspec/specs/project-docs/spec.md

@@ -1,6 +1,6 @@
 # ram-footprint-gates — Especificación
 
-RM1 cambia «Un hash por archivo, fuera de los hilos del runtime» de [`specs/storage`](../../specs/storage/spec.md). RM2 se suma a `specs/storage`, junto a ese requisito. RM3 amplía «Cada carga dice quién la pidió y cuánto costó» de `specs/storage`. RM4 se suma a `specs/storage`, junto al id del modelo en el contrato de embedding. RM5 cambia «Refresco incremental» de [`specs/project-docs`](../../specs/project-docs/spec.md), que conserva sin cambios «Sólo MUST correr un refresco por proyecto a la vez».
+RM1 cambia «Un hash por archivo, fuera de los hilos del runtime» de [`specs/storage`](../../../specs/storage/spec.md). RM2 se suma a `specs/storage`, junto a ese requisito. RM3 amplía «Cada carga dice quién la pidió y cuánto costó» de `specs/storage`. RM4 se suma a `specs/storage`, junto al id del modelo en el contrato de embedding. RM5 cambia «Refresco incremental» de [`specs/project-docs`](../../../specs/project-docs/spec.md), que conserva sin cambios «Sólo MUST correr un refresco por proyecto a la vez».
 
 Lo que dicen de ONNX Runtime y de protobuf [`proposal.md`](proposal.md) y la revisión que adoptó es una predicción del código de ONNX Runtime 1.24.2, sin medir. Ningún requisito depende de ella: la puerta de más abajo la decide.
 

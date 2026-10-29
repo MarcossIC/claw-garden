@@ -9,6 +9,7 @@ Fuente de verdad del comportamiento actual del índice de la documentación y el
 - [docs-refresh-background](../../changes/archive/2026-10-22-docs-refresh-background/proposal.md), archivado el 2026-10-22 (el refresco vencido corre en segundo plano y la búsqueda lo espera a lo sumo 3 s, el error del último refresco en `warning`, y un doc con un vector inservible no frena a los demás).
 - [piece-boundaries](../../changes/archive/2026-10-24-piece-boundaries/proposal.md), archivado el 2026-10-24 (PB3: un pasaje largo se corta en frontera de palabra). El divisor y su regla están en [`specs/pieces`](../pieces/spec.md) (PB1).
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (RF1: sólo un registro que trae `index_docs: true` lanza el refresco de fondo, no uno que encuentra la raíz ya aceptada, como los de los hooks).
+- [ram-footprint-gates](../../changes/archive/2026-10-29-ram-footprint-gates/proposal.md), archivado el 2026-10-29, que sale en 0.67.0 (RM5: el refresco reutiliza el vector de cada pasaje cuyo texto indexado no cambió, en «Refresco incremental» y «RM5»). La vista de sólo lectura del ONNX y la carga que no se pisa con la reparación están en [`specs/storage`](../storage/spec.md) (RM1 y RM2).
 
 ## Definiciones
 
@@ -23,8 +24,8 @@ Fuente de verdad del comportamiento actual del índice de la documentación y el
 - **Breadcrumb:** la ruta relativa seguida de los encabezados (o, en código, las cabeceras de definición) que contienen al pedazo, del más externo al propio, unidos con ` > `. El del preámbulo y el de un manifiesto es sólo la ruta relativa.
 - **Pasaje:** una fila de `project_doc_chunk`: el breadcrumb, el texto de un pedazo de un doc, su vector y su entrada léxica.
 - **Texto indexado:** `breadcrumb + "\n\n" + cuerpo` (`Passage::indexed_text`, `crates/clawg-core/src/memory/project_docs/chunk.rs:28`). Es lo que se embebe y lo que entra al índice léxico.
-- **Huella de un doc:** el sha256 de sus bytes en el disco y el id del modelo que embebió sus pasajes (`Fingerprint`, `crates/clawg-core/src/memory/project_docs/mod.rs:104`).
-- **Refresco:** la pasada que deja el índice de un proyecto igual a sus docs en el disco (`refresh`, `mod.rs:407`).
+- **Huella de un doc:** el sha256 de sus bytes en el disco y el id del modelo que embebió sus pasajes (`Fingerprint`, `crates/clawg-core/src/memory/project_docs/mod.rs:107`).
+- **Refresco:** la pasada que deja el índice de un proyecto igual a sus docs en el disco (`refresh`, `mod.rs:410`).
 
 El índice vive en cuatro tablas propias (`project_doc_file`, `project_doc_chunk`, `project_doc_vectors`, `project_doc_fts`; `crates/clawg-core/migrations/V12__project_docs.sql`). `project_doc_vectors` es un `vec0` de 384 dimensiones con `project_id` como partition key, así que el filtro por proyecto se aplica dentro del KNN; `project_doc_fts` guarda su propio texto. Ninguna sentencia del índice nombra una tabla de memorias, y no hay access tracker, tiers ni decaimiento: un doc no "se usa", está en el disco.
 
@@ -32,7 +33,7 @@ El índice vive en cuatro tablas propias (`project_doc_file`, `project_doc_chunk
 
 El daemon MUST leer los archivos sólo de una raíz aceptada. Una raíz queda aceptada cuando la registra el puente que arrancó en ella y es un proyecto que se indexa solo ([abajo](#el-puente-acepta-su-raíz-sola-sólo-si-es-un-proyecto)), o cuando el usuario la agrega con `clawg projects add` (más abajo). Cualquier otra raíz, la del puente que no es un proyecto o una que el modelo nombre en `project_path`, queda sólo registrada. La marca se guarda en `project.index_docs` y sólo sube ([`specs/project`](../project/spec.md), R4 y R6).
 
-La guarda está junto a la lectura, no en quien la pide. `root_of` (`crates/clawg-core/src/memory/project_docs/mod.rs:499`) lee `root_path` e `index_docs`. Con una raíz sólo registrada MUST devolver `DocIndexError::NotAccepted` (`mod.rs:51`), un error distinto de `UnknownProject`. Todo refresco pasa por `RefreshGuard::run`, que pide la raíz a `root_of` antes de recorrer nada (`mod.rs:190`). Así ningún camino lee el disco de una raíz sólo registrada, aunque quien llame no mire la marca.
+La guarda está junto a la lectura, no en quien la pide. `root_of` (`crates/clawg-core/src/memory/project_docs/mod.rs:578`) lee `root_path` e `index_docs`. Con una raíz sólo registrada MUST devolver `DocIndexError::NotAccepted` (`mod.rs:51`), un error distinto de `UnknownProject`. Todo refresco pasa por `RefreshGuard::run`, que pide la raíz a `root_of` antes de recorrer nada (`mod.rs:186`). Así ningún camino lee el disco de una raíz sólo registrada, aunque quien llame no mire la marca.
 
 #### Escenario: registrada sin indexar
 - GIVEN una raíz con un `README.md`
@@ -178,23 +179,23 @@ Un pasaje ya guardado MUST NOT volver a partirse mientras su archivo no cambie d
 
 ## Refresco incremental
 
-`refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:407`) MUST dejar en el índice del proyecto exactamente los docs del disco, y:
+`refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:410`) MUST dejar en el índice del proyecto exactamente los docs del disco, y:
 
 - un doc cuya huella coincide con la guardada MUST NOT re-leerse en pasajes ni re-embeberse;
-- un doc nuevo o cambiado (otro sha256, u otro modelo) MUST reemplazar todos sus pasajes, vectores y entradas léxicas en **una** transacción por doc (`replace_doc`, `mod.rs:544`), así una búsqueda nunca ve medio doc. El embedding se hace antes de pedir la conexión, para no bloquear los saves mientras tanto;
-- un doc que ya no está en el corpus MUST perder todos sus pasajes y su huella (`remove_docs`, `mod.rs:579`);
+- un doc nuevo o cambiado (otro sha256, u otro modelo) MUST reemplazar todos sus pasajes, vectores y entradas léxicas en **una** transacción por doc (`replace_doc`, `mod.rs:623`), así una búsqueda nunca ve medio doc. El embedding de los pasajes sin vector reutilizable (RM5) se hace antes de pedir la conexión, para no bloquear los saves mientras tanto;
+- un doc que ya no está en el corpus MUST perder todos sus pasajes y su huella (`remove_docs`, `mod.rs:658`);
 - un doc vacío o sin secciones con texto MUST guardar su huella sin pasajes;
 - si la raíz no existe o no es un directorio, MUST NOT borrar nada y MUST devolver el error: el recorrido falla antes de leer las huellas guardadas, así que un disco "vacío" por error no arma un plan que borre todo;
 - si el embedder falla en un doc (`DocIndexError::Embed`) o devuelve otra cantidad de vectores que de pasajes (`DocIndexError::VectorCount`), ese doc MUST quedar como estaba, el refresco MUST terminar con el error y el siguiente MUST reintentarlo: la huella vieja no coincide con el disco;
-- si un vector de un doc no sirve (`to_unit` lo rechaza por su dimensión, un valor no finito o norma cero; `DocIndexError::Vector`), ese doc MUST quedar como estaba y anotarse en `RefreshReport::failed` con su ruta y la causa, y el refresco MUST seguir con los demás docs del plan y con `remove_docs`. El siguiente MUST reintentarlo. El daemon MUST dejar cada doc salteado en el log como `warn`, y `rag-eval --docs` (`EvalDocIndex::index`, `crates/clawg-core/src/eval_api.rs:962`) MUST fallar nombrándolo, porque una medición sin un doc mide otro corpus;
+- si un vector de un doc no sirve (`to_unit` lo rechaza por su dimensión, un valor no finito o norma cero; `DocIndexError::Vector`), ese doc MUST quedar como estaba y anotarse en `RefreshReport::failed` con su ruta y la causa, y el refresco MUST seguir con los demás docs del plan y con `remove_docs`. El siguiente MUST reintentarlo. El daemon MUST dejar cada doc salteado en el log como `warn`, y `rag-eval --docs` (`EvalDocIndex::index`, `crates/clawg-core/src/eval_api.rs:1279`) MUST fallar nombrándolo, porque una medición sin un doc mide otro corpus;
 - MUST NOT leer ni escribir `memory`, `episodic_trajectory`, `procedural_skill`, sus vectores, su FTS ni el access tracker;
 - MUST devolver cuántos docs vio, reindexó, dejó igual, quitó y salteó, cuántos pasajes escribió y qué docs dejó como estaban por un vector inservible (`RefreshReport`).
 
-La huella se toma de los bytes que se leyeron para trocear, sin enmascarar, así un cambio en un secreto también reindexa. La decisión de qué hacer con cada doc MUST ser una función pura de las huellas del disco y las guardadas (`plan_refresh`, `mod.rs:121`). El `model_id` de cada doc es el del embedder: un cambio de modelo, o del pooling que su id nombra ([`specs/storage`](../storage/spec.md), «Pooling mean y re-embebido al arrancar»), reindexa todo sin código extra.
+La huella se toma de los bytes que se leyeron para trocear, sin enmascarar, así un cambio en un secreto también reindexa. La decisión de qué hacer con cada doc MUST ser una función pura de las huellas del disco y las guardadas (`plan_refresh`, `mod.rs:124`). El `model_id` de cada doc es el del embedder: un cambio de modelo, o del pooling que su id nombra ([`specs/storage`](../storage/spec.md), «Pooling mean y re-embebido al arrancar»), reindexa todo sin código extra.
 
-Sólo MUST correr un refresco por proyecto a la vez: un pedido de refresco mientras otro corre MUST volver enseguida diciendo que ya hay uno en curso, sin esperar (`DocIndex::begin`, `begin_if_due` y `try_refresh`, `mod.rs:209`, `:223` y `:278`). La marca se suelta también si el refresco falla o su tarea se cancela.
+Sólo MUST correr un refresco por proyecto a la vez: un pedido de refresco mientras otro corre MUST volver enseguida diciendo que ya hay uno en curso, sin esperar (`DocIndex::begin`, `begin_if_due` y `try_refresh`, `mod.rs:212`, `:226` y `:281`). La marca se suelta también si el refresco falla o su tarea se cancela.
 
-`DocIndex` MUST guardar, por proyecto, el error del último refresco que terminó, lanzado por una búsqueda o por un registro (`RefreshGuard::run`, `mod.rs:183`; `last_error`, `mod.rs:265`), escrito antes de soltar la marca, y MUST borrarlo cuando un refresco termina bien. Un refresco que no corrió porque había otro en curso, o que se canceló, MUST NOT cambiarlo. La raíz y su `index_docs` se leen de `project` en cada refresco (`root_of`, arriba). Si un nuevo registro cambia la raíz, el próximo refresco usa la nueva. Una raíz sólo registrada no se refresca: el refresco falla con `NotAccepted` antes de recorrer el disco.
+`DocIndex` MUST guardar, por proyecto, el error del último refresco que terminó, lanzado por una búsqueda o por un registro (`RefreshGuard::run`, `mod.rs:186`; `last_error`, `mod.rs:268`), escrito antes de soltar la marca, y MUST borrarlo cuando un refresco termina bien. Un refresco que no corrió porque había otro en curso, o que se canceló, MUST NOT cambiarlo. La raíz y su `index_docs` se leen de `project` en cada refresco (`root_of`, arriba). Si un nuevo registro cambia la raíz, el próximo refresco usa la nueva. Una raíz sólo registrada no se refresca: el refresco falla con `NotAccepted` antes de recorrer el disco.
 
 #### Escenario: nada cambió
 - GIVEN un proyecto ya indexado
@@ -233,9 +234,43 @@ Sólo MUST correr un refresco por proyecto a la vez: un pedido de refresco mient
 
 **Tests:** en `crates/clawg-core/src/memory/project_docs/mod.rs`: `plan_keeps_what_did_not_change_and_rewrites_what_did`, `plan_rewrites_every_doc_embedded_by_another_model` y `plan_of_an_empty_tree_drops_everything` (puros); `an_unchanged_project_embeds_nothing`, `a_changed_doc_replaces_its_passages_and_a_deleted_one_loses_them`, `another_model_reindexes_every_doc`, `a_missing_root_deletes_nothing`, `a_failed_embedding_keeps_the_doc_as_it_was`, `an_unusable_vector_skips_its_doc_and_the_rest_go_on`, `a_short_batch_still_aborts_the_refresh`, `the_last_error_lasts_until_a_refresh_succeeds`, `a_second_refresh_does_not_wait_for_the_first`, `an_unregistered_project_is_refused`, `a_root_that_was_not_accepted_is_not_read` y `refreshing_never_touches_memories`, contra un store en memoria y un directorio temporal; `a_doc_the_index_could_not_embed_fails_the_measurement` en `crates/clawg-core/src/eval_api.rs`.
 
+### RM5. El refresco reutiliza los vectores de los pasajes que no cambiaron
+
+Cuando un doc cambia (otro sha256), `refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:410`) MUST reutilizar el vector guardado de cada pasaje cuyo `indexed_text` entero (`breadcrumb`, `"\n\n"` y `body`; `crates/clawg-core/src/memory/project_docs/chunk.rs:28`) está entre los pasajes guardados de ese mismo doc, siempre que el `model_id` guardado del doc sea el del refresco (leído una vez, `mod.rs:423`, y con los vectores en la misma sentencia, `stored_vectors`, `mod.rs:516`). MUST embeber sólo los demás pasajes: `reuse_plan` (`mod.rs:491`) los separa, y `embed_passages` (`mod.rs:544`) recibe sólo esos, sin llamar al embebedor si no hay ninguno.
+
+- **Por valor.** MUST leer pares de texto y bytes del vector, nunca ids de fila (`replace_doc` borra y vuelve a insertar con ids nuevos). Un texto repetido en el doc MUST reutilizar en todos sus pasajes, y el vector es el de su primer pasaje.
+- **Todo o nada.** El doc MUST seguir reemplazándose entero en **una** transacción (`replace_doc`, `mod.rs:623`); lo ya dicho sobre un embedder que falla, un vector inservible y la cuenta distinta no cambia.
+- **Qué no reutiliza.** Un doc guardado con otro `model_id` MUST NOT reutilizar nada. Un archivo movido MUST NOT reutilizar nada, porque su ruta está en el `indexed_text`. Un doc que no cambió sigue sin re-embeberse.
+- **`reused`.** `RefreshReport` (`mod.rs:74`) MUST llevar `reused`, los pasajes reutilizados (no los textos distintos). La línea `indexed the docs of …` (`refresh_line`, `crates/clawg-cli/src/daemon/api.rs:2670`) MUST mostrarlo.
+- **Equivalencia.** El doc que queda MUST ser equivalente al de un reindexado completo: los mismos pasajes y, con un embebedor falso determinista, los mismos vectores byte a byte. Con el modelo real, fuera de CI, MUST coincidir con tolerancia de 1e-5 por componente o coseno ≥ 1 − 1e-6 (`a_partly_reused_doc_matches_a_full_reindex_within_tolerance`, `#[ignore]`).
+- **Deriva.** Un pasaje sin cambios conserva su vector hasta que cambie el `model_id` o se reindexe. Si el contrato cambia sin que cambie el id, esa deriva también alcanza a los pasajes sin cambios de un doc cambiado, como hoy alcanza a un doc que no cambia (`plan_refresh`, `mod.rs:124`). El contrato y su id los fija un test ([`specs/storage`](../storage/spec.md), RM4).
+- **Un refresco a la vez.** No cambia. `DocIndex::begin` (`mod.rs:212`) ya impide que otro refresco cambie lo leído antes de que se escriba, y `same_model` (`crates/clawg-core/src/memory/idle_embedder.rs:234`) rechaza una recarga con otro id, así que no hace falta descartar lo reutilizado si la sesión cambia.
+
+#### Escenario: se edita una sección
+- GIVEN un doc indexado de varios pasajes y un embebedor falso que anota los textos que le piden
+- WHEN se edita una sección y se refresca
+- THEN el embebedor recibe sólo los pasajes que cambiaron, cada vector reutilizado es el blob que estaba guardado, `reused` cuenta los demás pasajes, y el doc es idéntico byte a byte al de un reindexado completo con el mismo embebedor
+
+#### Escenario: un texto repetido
+- GIVEN un doc con dos pasajes de igual `indexed_text`, que cambia en otra sección
+- WHEN se refresca
+- THEN ninguno de los dos se embebe y `reused` los cuenta a los dos
+
+#### Escenario: otro modelo, o un archivo movido
+- GIVEN un doc indexado con el modelo `m1`
+- WHEN se refresca con `m2`, o el mismo contenido aparece bajo otra ruta
+- THEN se embeben todos sus pasajes y `reused` es 0
+
+#### Escenario: el embebedor falla
+- GIVEN un doc cambiado con pasajes reutilizables y un embebedor que falla en los demás
+- WHEN se refresca
+- THEN el doc queda como estaba y el siguiente refresco lo reintenta
+
+**Tests:** `an_edited_doc_embeds_only_the_passages_that_changed`, `a_partly_reused_doc_equals_a_full_reindex`, `a_reused_vector_is_the_stored_blob`, `a_repeated_text_is_reused_in_all_its_passages`, `a_repeated_text_takes_the_blob_of_its_first_passage`, `a_doc_of_another_model_reuses_nothing`, `a_moved_file_reuses_nothing`, `a_failed_embedding_of_the_rest_keeps_the_doc_as_it_was` y `reused_counts_passages_not_distinct_texts` (`project_docs/mod.rs`); `the_docs_log_line_shows_the_reused_passages` (`crates/clawg-cli/src/daemon/api.rs`). Se conservan `an_unchanged_project_embeds_nothing`, `another_model_reindexes_every_doc` y `a_second_refresh_does_not_wait_for_the_first`. `plan_refresh` no cambia.
+
 ## Secretos
 
-El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory/redact.rs:207`; `project_docs/mod.rs:440`) antes de trocearse. Ningún pasaje, vector ni entrada léxica MUST contener un secreto que reconozca el detector de [`specs/secrets`](../secrets/spec.md) (R1); una marca privada abierta en un doc enmascara, en el índice, hasta el próximo cierre o el final del archivo. La huella usa los bytes del disco, sin enmascarar.
+El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory/redact.rs:235`; `project_docs/mod.rs:444`) antes de trocearse. Ningún pasaje, vector ni entrada léxica MUST contener un secreto que reconozca el detector de [`specs/secrets`](../secrets/spec.md) (R1); una marca privada abierta en un doc enmascara, en el índice, hasta el próximo cierre o el final del archivo. La huella usa los bytes del disco, sin enmascarar.
 
 #### Escenario
 - GIVEN `docs/setup.md` con una clave `sk-ant-…` de formato válido
@@ -246,17 +281,17 @@ El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory
 
 ## Búsqueda
 
-`POST /v1/projects/docs/search` (`search_docs`, `crates/clawg-cli/src/daemon/api.rs:2082`; ruta en `:1049`), con token, recibe `{ "project_id": "...", "query": "...", "limit": n }` (`deny_unknown_fields`) y responde `{ "hits": [{ "path", "breadcrumb", "text", "score" }], "docs": <n>, "indexing": <bool>, "warning"?: "..." }`. `docs` es cuántos docs tiene el índice del proyecto.
+`POST /v1/projects/docs/search` (`search_docs`, `crates/clawg-cli/src/daemon/api.rs:2760`; ruta en `:1073`), con token, recibe `{ "project_id": "...", "query": "...", "limit": n }` (`deny_unknown_fields`) y responde `{ "hits": [{ "path", "breadcrumb", "text", "score" }], "docs": <n>, "indexing": <bool>, "warning"?: "..." }`. `docs` es cuántos docs tiene el índice del proyecto.
 
 - En este orden: una `query` vacía o sólo de espacios MUST dar 400; un `project_id` sin raíz registrada MUST dar 404; una raíz sólo registrada MUST dar 403, sin refrescar ni buscar.
-- El `error` del 403 (`not_accepted`, `api.rs:2065`) MUST decir qué raíces lee el daemon y nombrar la raíz y el comando con que el usuario la acepta. Cuando el perfil del daemon no es `prod`, el comando lleva su `--profile`: «clawg reads the files of the projects the user added, and of the one a bridge was started in when that folder has a .git or a manifest and is not the home directory or a filesystem root; `<raíz>` is neither. Ask the user to run ``clawg projects add "<raíz>" --profile dev`` if they want it searched, then call again». Lo arma el daemon, que sabe su perfil, así que también lo lee bien un puente de una versión anterior.
+- El `error` del 403 (`not_accepted`, `api.rs:2743`) MUST decir qué raíces lee el daemon y nombrar la raíz y el comando con que el usuario la acepta. Cuando el perfil del daemon no es `prod`, el comando lleva su `--profile`: «clawg reads the files of the projects the user added, and of the one a bridge was started in when that folder has a .git or a manifest and is not the home directory or a filesystem root; `<raíz>` is neither. Ask the user to run ``clawg projects add "<raíz>" --profile dev`` if they want it searched, then call again». Lo arma el daemon, que sabe su perfil, así que también lo lee bien un puente de una versión anterior.
 - Con el embedder sin cargar o fallado MUST responder como `POST /v1/search` (503 con el mismo cuerpo, [`specs/ingest`](../ingest/spec.md)). Se comprueba después del 404 y del 403.
-- `limit` MUST tomar 5 si falta (`DEFAULT_DOCS_LIMIT`, `api.rs:2032`) y MUST quedar entre 1 y 20 (`clamp_docs_limit`, `api.rs:2034`; `MAX_DOCS_LIMIT`, `api.rs:2030`): 0 vale 1.
-- Si el último refresco del proyecto empezó hace 60 s o más (`REFRESH_INTERVAL`, `mod.rs:32`) o nunca empezó, y no hay uno en curso, MUST tomar la marca (`begin_if_due`, `needs_refresh`) y lanzar el refresco en una tarea propia (`refresh_docs_in_background`, `api.rs:1992`), que MUST seguir hasta el final aunque la petición se cancele. MUST esperarlo a lo sumo 3 s (`REFRESH_GRACE`, `api.rs:2023`), o 20 s si el índice del proyecto está vacío (`FIRST_INDEX_WAIT`, `api.rs:2017`), y después buscar en lo que haya indexado.
+- `limit` MUST tomar 5 si falta (`DEFAULT_DOCS_LIMIT`, `api.rs:2710`) y MUST quedar entre 1 y 20 (`clamp_docs_limit`, `api.rs:2712`; `MAX_DOCS_LIMIT`, `api.rs:2708`): 0 vale 1.
+- Si el último refresco del proyecto empezó hace 60 s o más (`REFRESH_INTERVAL`, `mod.rs:32`) o nunca empezó, y no hay uno en curso, MUST tomar la marca (`begin_if_due`, `needs_refresh`) y lanzar el refresco en una tarea propia (`refresh_docs_in_background`, `api.rs:2664`), que MUST seguir hasta el final aunque la petición se cancele. MUST esperarlo a lo sumo 3 s (`REFRESH_GRACE`, `api.rs:2701`), o 20 s si el índice del proyecto está vacío (`FIRST_INDEX_WAIT`, `api.rs:2695`), y después buscar en lo que haya indexado.
 - Si hay un refresco del proyecto en curso que no lanzó esta búsqueda y el índice del proyecto está vacío (el primero, que suele lanzar el registro del puente un momento antes), MUST esperarlo hasta `FIRST_INDEX_WAIT` antes de buscar, para no contestar "los docs no dicen nada" mientras se arman. Con un índice ya armado no espera: contesta con lo que hay.
 - Un refresco fallido MUST NOT impedir la búsqueda sobre lo que ya está indexado. Mientras el proyecto tenga guardado el error de su último refresco ([«Refresco incremental»](#refresco-incremental)), sea de la búsqueda o de uno en segundo plano, la respuesta MUST traerlo en `warning`.
 - `indexing` MUST ser `true` si un refresco del proyecto está en curso al responder.
-- La búsqueda (`search`, `mod.rs:320`) MUST combinar dos listas, cada una de hasta 50 pasajes del proyecto (`CANDIDATES_PER_CHANNEL`, `mod.rs:37`): los vecinos más cercanos al vector de la consulta (rol `Query`) y los mejores por BM25 de FTS5 con la misma expresión de consulta que usa la búsqueda léxica de memorias (`fts_match_expression` con `MAX_LEXICAL_TOKENS`, `crates/clawg-core/src/memory/search.rs:687` y `:661`). MUST fusionarlas por rango recíproco (`fuse`, `mod.rs:305`: `1 / (60 + rango)`, rango desde 1, sumado si un pasaje está en las dos; `RRF_K`, `mod.rs:42`), ordenar por puntaje y desempatar por id de pasaje menor. Usa rangos y no el piso de coseno ni el bono léxico de las memorias, que se calibraron sobre otro corpus.
+- La búsqueda (`search`, `mod.rs:323`) MUST combinar dos listas, cada una de hasta 50 pasajes del proyecto (`CANDIDATES_PER_CHANNEL`, `mod.rs:37`): los vecinos más cercanos al vector de la consulta (rol `Query`) y los mejores por BM25 de FTS5 con la misma expresión de consulta que usa la búsqueda léxica de memorias (`fts_match_expression` con `MAX_LEXICAL_TOKENS`, `crates/clawg-core/src/memory/search.rs:687` y `:661`). MUST fusionarlas por rango recíproco (`fuse`, `mod.rs:308`: `1 / (60 + rango)`, rango desde 1, sumado si un pasaje está en las dos; `RRF_K`, `mod.rs:42`), ordenar por puntaje y desempatar por id de pasaje menor. Usa rangos y no el piso de coseno ni el bono léxico de las memorias, que se calibraron sobre otro corpus.
 - MUST NOT devolver pasajes de otro proyecto.
 - `text` MUST ser el cuerpo del pasaje, sin el breadcrumb repetido.
 
@@ -305,7 +340,7 @@ El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory
 
 ## Un registro que lo pide indexa la raíz en segundo plano
 
-Cuando `POST /v1/projects` trae `index_docs: true` y, después del registro, la raíz está aceptada (`RegisterOutcome::index_docs`), el daemon MUST lanzar un refresco del índice de esa raíz (`RegisterOutcome::root_id`) en segundo plano. Ese refresco espera a que el embedder deje de estar en `loading` (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs:2086`; llamado en `register`, `:2077-2079`; corre el mismo `refresh_docs`, `:2110`, que el refresco de una búsqueda). Un registro sin `index_docs`, o con `false`, MUST NOT lanzarlo, aunque la raíz ya estuviera aceptada: la marca se guarda igual y sólo sube ([`specs/project`](../project/spec.md), R4). Tampoco lo lanza un registro que deja la raíz sólo registrada. Los hooks registran la raíz en cada `session-start` y cada `user-prompt-submit` sin `index_docs`. Si cada registro refrescara, cada prompt recorrería y hashearía el índice entero, embebería lo que cambió y mantendría cargado el modelo. La frescura del índice queda a cargo de la búsqueda, que refresca un índice de más de `REFRESH_INTERVAL` ([«Búsqueda»](#búsqueda)). La respuesta del registro MUST NOT esperar el refresco y MUST NOT cambiar de forma. Un refresco fallido, o un embedder que no cargó, MUST quedar en el log como warn y MUST NOT afectar el registro. El error de un refresco fallido MUST quedar además como el último del proyecto, que la búsqueda siguiente nombra en `warning`.
+Cuando `POST /v1/projects` trae `index_docs: true` y, después del registro, la raíz está aceptada (`RegisterOutcome::index_docs`), el daemon MUST lanzar un refresco del índice de esa raíz (`RegisterOutcome::root_id`) en segundo plano. Ese refresco espera a que el embedder deje de estar en `loading` (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs:2646`; llamado en `register`, `:2214-2215`; corre el mismo `refresh_docs`, `:2679`, que el refresco de una búsqueda). Un registro sin `index_docs`, o con `false`, MUST NOT lanzarlo, aunque la raíz ya estuviera aceptada: la marca se guarda igual y sólo sube ([`specs/project`](../project/spec.md), R4). Tampoco lo lanza un registro que deja la raíz sólo registrada. Los hooks registran la raíz en cada `session-start` y cada `user-prompt-submit` sin `index_docs`. Si cada registro refrescara, cada prompt recorrería y hashearía el índice entero, embebería lo que cambió y mantendría cargado el modelo. La frescura del índice queda a cargo de la búsqueda, que refresca un índice de más de `REFRESH_INTERVAL` ([«Búsqueda»](#búsqueda)). La respuesta del registro MUST NOT esperar el refresco y MUST NOT cambiar de forma. Un refresco fallido, o un embedder que no cargó, MUST quedar en el log como warn y MUST NOT afectar el registro. El error de un refresco fallido MUST quedar además como el último del proyecto, que la búsqueda siguiente nombra en `warning`.
 
 El puente registra su propia raíz antes de su primera herramienta, pidiendo indexarla cuando es un proyecto ([arriba](#el-puente-acepta-su-raíz-sola-sólo-si-es-un-proyecto); [`specs/project`](../project/spec.md), R6). Así, el primer indexado empieza con la sesión y no con la primera búsqueda. `clawg projects add` también lo pide ([abajo](#clawg-projects-add)).
 

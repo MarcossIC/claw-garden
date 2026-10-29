@@ -58,11 +58,11 @@ Transversal: que una carga y un refresco no pidan más memoria ni más tiempo qu
    - la dependencia `memmap2`.
 2. F: la reutilización por `indexed_text` y `model_id`, el test del contrato, y `reused` en el reporte y en el log.
 3. Los cambios de spec:
-   - [`specs/storage`](../../specs/storage/spec.md):
+   - [`specs/storage`](../../../specs/storage/spec.md):
      - «Un hash por archivo, fuera de los hilos del runtime». La exigencia de que la carga reciba los mismos bytes que se hashearon se queda. Se suma que esos bytes pueden ser una vista de sólo lectura, nunca copy-on-write, y cómo se guarda en cada sistema. Cambia la frase sobre el archivo bajado que queda en memoria.
      - «Cada carga dice quién la pidió y cuánto costó», con el pico.
      - Un requisito nuevo, para que carga y reparación no se pisen.
-   - [`specs/project-docs`](../../specs/project-docs/spec.md), «Refresco incremental»:
+   - [`specs/project-docs`](../../../specs/project-docs/spec.md), «Refresco incremental»:
      - la regla de reutilización, por valor y de a doc entero;
      - `reused`;
      - que el resultado es equivalente a un reindexado;
