@@ -510,7 +510,7 @@ impl Inference {
 /// as the machine has. The thread count is not a detail: it sets how ONNX
 /// Runtime splits and sums the work, so another one could move the last bits
 /// of a vector.
-fn build_session(onnx: &[u8]) -> Result<Session, EmbedError> {
+pub(crate) fn build_session(onnx: &[u8]) -> Result<Session, EmbedError> {
     let failed = |e: String| EmbedError::LoadFailed(e);
     let threads = std::thread::available_parallelism().map_err(|e| failed(e.to_string()))?.get();
     Session::builder()
@@ -523,6 +523,31 @@ fn build_session(onnx: &[u8]) -> Result<Session, EmbedError> {
         .map_err(|e| failed(e.to_string()))?
         .commit_from_memory(onnx)
         .map_err(|e| failed(e.to_string()))
+}
+
+/// The smallest model ONNX Runtime accepts: one `Identity` node from `x` to
+/// `y`, a float vector of one element.
+#[cfg(test)]
+pub(crate) fn minimal_onnx() -> Vec<u8> {
+    fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag, payload.len() as u8];
+        out.extend_from_slice(payload);
+        out
+    }
+    fn value_info(name: &str) -> Vec<u8> {
+        let dim = field(0x0a, &[0x08, 1]);
+        let tensor = [&[0x08, 1][..], &field(0x12, &dim)].concat();
+        [field(0x0a, name.as_bytes()), field(0x12, &field(0x0a, &tensor))].concat()
+    }
+    let node = [field(0x0a, b"x"), field(0x12, b"y"), field(0x22, b"Identity")].concat();
+    let graph = [
+        field(0x0a, &node),
+        field(0x12, b"g"),
+        field(0x5a, &value_info("x")),
+        field(0x62, &value_info("y")),
+    ]
+    .concat();
+    [vec![0x08, 8], field(0x42, &[0x10, 13]), field(0x3a, &graph)].concat()
 }
 
 impl E5Embedder {
@@ -828,6 +853,23 @@ impl Embedder for FakeEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_is_built_from_the_verified_view() {
+        let dir = crate::test_dir::test_dir();
+        let onnx = minimal_onnx();
+        let path = dir.path().join("model.onnx");
+        std::fs::write(&path, &onnx).unwrap();
+        let sha = crate::memory::model_download::sha256_hex(&onnx);
+        let lock = crate::memory::model_download::CacheLock::new();
+
+        let view = crate::memory::model_download::verified_onnx(&path, &sha, lock.read_now()).expect("the model verifies");
+        let session = build_session(&view).expect("the session is built from the view");
+        assert_eq!(session.inputs().iter().map(|i| i.name()).collect::<Vec<_>>(), ["x"]);
+        assert_eq!(session.outputs().iter().map(|o| o.name()).collect::<Vec<_>>(), ["y"]);
+        drop(view);
+        drop(session);
+    }
 
     // ---------- inference pieces, against fastembed's own formulas ----------
 

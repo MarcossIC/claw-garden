@@ -26,7 +26,7 @@ use crate::memory::embedder::{E5Embedder, Embedder, E5_MODEL_ID, LEGACY_CLS_MODE
 use crate::memory::idle_embedder::{IdleEmbedder, ReloadFn};
 use crate::memory::maintenance::{reembed_all, ReInferPlan, ReembedMode};
 use crate::memory::model_download::{
-    ensure_model, load_cached_model, parse_verified_tokenizer, DownloadError, DownloadProgress, ModelFiles,
+    ensure_model, load_cached_model, parse_verified_tokenizer, CacheLock, DownloadError, DownloadProgress, ModelFiles,
     TokenizerFiles,
 };
 use crate::memory::MemoryStore;
@@ -291,10 +291,18 @@ pub fn production_deps(
     backups: std::path::PathBuf,
     tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
 ) -> EmbedderDeps {
-    let ensure: EnsureModelFn = Arc::new(|base_dir, progress| {
-        Box::pin(async move { ensure_model(&base_dir, progress).await })
+    let lock = CacheLock::new();
+    let ensure: EnsureModelFn = Arc::new({
+        let lock = lock.clone();
+        move |base_dir, progress| {
+            let lock = lock.clone();
+            Box::pin(async move { ensure_model(&base_dir, progress, &lock).await })
+        }
     });
-    let cached: CachedModelFn = Arc::new(|base_dir| Box::pin(async move { load_cached_model(&base_dir).await }));
+    let cached: CachedModelFn = Arc::new(move |base_dir| {
+        let lock = lock.clone();
+        Box::pin(async move { load_cached_model(&base_dir, &lock).await })
+    });
     let load = model_loader(tokenizer, parse_verified_tokenizer, |onnx, tokenizer, files| {
         E5Embedder::from_parts(onnx, tokenizer, files)
             .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
@@ -354,7 +362,7 @@ impl TestEmbedder {
             Self::Fake | Self::Blocked => Arc::new(|_base_dir, _progress| {
                 Box::pin(async {
                     Ok(crate::memory::model_download::ModelFiles {
-                        onnx: Vec::new(),
+                        onnx: crate::memory::model_download::OnnxFile::in_memory(Vec::new()),
                         tokenizer: crate::memory::model_download::TokenizerFiles {
                             tokenizer_file: Vec::new(),
                             config_file: Vec::new(),
@@ -885,7 +893,7 @@ mod tests {
     // asserted in-process without a host runtime.
 
     use crate::memory::embedder::FakeEmbedder;
-    use crate::memory::model_download::{DownloadError, ModelFiles};
+    use crate::memory::model_download::{DownloadError, ModelFiles, OnnxFile};
     use crate::memory::model_download::TokenizerFiles;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -920,7 +928,7 @@ mod tests {
 
     fn empty_model_files() -> ModelFiles {
         ModelFiles {
-            onnx: Vec::new(),
+            onnx: OnnxFile::in_memory(Vec::new()),
             tokenizer: empty_tokenizer(),
         }
     }

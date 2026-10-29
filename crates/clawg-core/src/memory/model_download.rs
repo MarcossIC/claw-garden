@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::OwnedRwLockReadGuard;
 
 /// The four tokenizer-side files of the model, as the bytes read from disk.
 pub struct TokenizerFiles {
@@ -302,8 +303,72 @@ impl BackoffPolicy for ZeroBackoff {
 
 /// Bytes returned from a successful `ensure_model` call.
 pub struct ModelFiles {
-    pub onnx: Vec<u8>,
+    pub onnx: OnnxFile,
     pub tokenizer: TokenizerFiles,
+}
+
+/// What keeps a load and a repair of the model cache from meeting on
+/// `model.onnx`: a load reads under it for as long as it holds the file, a
+/// repair writes under it while it renames the new file into place. One per
+/// model directory and process; clones share it.
+#[derive(Clone, Default)]
+pub struct CacheLock(Arc<tokio::sync::RwLock<()>>);
+
+impl CacheLock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn read(&self) -> OwnedRwLockReadGuard<()> {
+        self.0.clone().read_owned().await
+    }
+
+    /// The read side without waiting, for a caller that is not async and
+    /// holds no other lock.
+    #[cfg(any(test, feature = "eval"))]
+    pub(crate) fn read_now(&self) -> OwnedRwLockReadGuard<()> {
+        self.0.clone().try_read_owned().expect("nothing writes while a check reads")
+    }
+}
+
+/// `model.onnx` as it was hashed: a read-only view of the file, held open.
+pub struct OnnxFile(View);
+
+enum View {
+    // Field order is drop order: unmap, close the handle, and only then let a
+    // waiting repair rename over the file.
+    Mapped {
+        map: memmap2::Mmap,
+        _file: std::fs::File,
+        _cache: OwnedRwLockReadGuard<()>,
+    },
+    #[cfg(any(test, feature = "testing"))]
+    InMemory(Vec<u8>),
+}
+
+impl OnnxFile {
+    /// Bytes no file backs, for a stand-in model that never reads them.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn in_memory(bytes: Vec<u8>) -> Self {
+        OnnxFile(View::InMemory(bytes))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_view(&self) -> bool {
+        matches!(self.0, View::Mapped { .. })
+    }
+}
+
+impl std::ops::Deref for OnnxFile {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match &self.0 {
+            View::Mapped { map, .. } => map,
+            #[cfg(any(test, feature = "testing"))]
+            View::InMemory(bytes) => bytes,
+        }
+    }
 }
 
 impl std::fmt::Debug for ModelFiles {
@@ -384,6 +449,7 @@ pub(crate) struct ModelSource<'a> {
     pub backoff: &'a dyn BackoffPolicy,
     pub timeouts: Timeouts,
     pub files: &'a [FileSpec],
+    pub lock: CacheLock,
 }
 
 /// How long one attempt may wait on the network.
@@ -406,6 +472,7 @@ pub(crate) const DOWNLOAD_TIMEOUTS: Timeouts = Timeouts {
 pub async fn ensure_model(
     base_dir: &Path,
     progress: Option<UnboundedSender<DownloadProgress>>,
+    lock: &CacheLock,
 ) -> Result<ModelFiles, DownloadError> {
     let url = match base_url_from(std::env::var(BASE_URL_VAR).ok().as_deref()) {
         Ok(url) => url,
@@ -423,6 +490,7 @@ pub async fn ensure_model(
         backoff: &RealBackoff,
         timeouts: DOWNLOAD_TIMEOUTS,
         files: &ALL_FILES,
+        lock: lock.clone(),
     };
     ensure_model_from(base_dir, &source, progress).await
 }
@@ -466,12 +534,12 @@ async fn fetch(
     // (1) Cache-hit fast path: NO events emitted. Every startup after the first
     // takes this branch, and emitting progress here would flash a download UI
     // for work that never happens.
-    let mut cached = check_cache_off_runtime(&cache_dir, source.files).await?;
+    let mut cached = check_cache_off_runtime(&cache_dir, source.files, &source.lock).await?;
     if let Some(busy) = cached.busy_error() {
         return Err(busy);
     }
     if cached.missing.is_empty() {
-        return Ok(cached.into_model_files());
+        return cached.into_model_files();
     }
 
     // (2) Disk pre-flight: fail before the first byte rather than half a
@@ -501,6 +569,7 @@ async fn fetch(
 
     // (4) Download every missing or mismatched file.
     let mut bytes_downloaded_running: u64 = 0;
+    let mut downloaded_onnx = None;
     for spec in std::mem::take(&mut cached.missing) {
         let bytes = download_one(
             &client,
@@ -510,9 +579,28 @@ async fn fetch(
             source.backoff,
             progress,
             &mut bytes_downloaded_running,
+            &source.lock,
         )
         .await?;
-        cached.found.push((spec.kind, bytes));
+        if spec.kind == FileKind::Onnx {
+            // The model is loaded from the cache it was renamed into, as a
+            // reload does: that takes the read side of the lock and maps the
+            // file, so no copy of it in memory ever reaches the load.
+            drop(bytes);
+            downloaded_onnx = Some(spec);
+        } else {
+            cached.found.push((spec.kind, bytes));
+        }
+    }
+    if let Some(spec) = downloaded_onnx {
+        let mut again = check_cache_off_runtime(&cache_dir, std::slice::from_ref(&spec), &source.lock).await?;
+        if let Some(busy) = again.busy_error() {
+            return Err(busy);
+        }
+        if !again.missing.is_empty() {
+            return Err(DownloadError::NotCached { files: vec![spec.path.to_string()] });
+        }
+        cached.onnx = again.onnx;
     }
 
     // `Verify` but never `Done`: `Done` means "the embedder is ready to use",
@@ -521,17 +609,21 @@ async fn fetch(
     if let Some(tx) = progress {
         let _ = tx.send(DownloadProgress::Verify);
     }
-    Ok(cached.into_model_files())
+    cached.into_model_files()
 }
 
 /// The model from the cache alone: a missing or altered file is an error and
 /// nothing is downloaded. What a reload of the idle model reads.
-pub async fn load_cached_model(base_dir: &Path) -> Result<ModelFiles, DownloadError> {
-    load_cached_from(base_dir, &ALL_FILES).await
+pub async fn load_cached_model(base_dir: &Path, lock: &CacheLock) -> Result<ModelFiles, DownloadError> {
+    load_cached_from(base_dir, &ALL_FILES, lock).await
 }
 
-pub(crate) async fn load_cached_from(base_dir: &Path, files: &[FileSpec]) -> Result<ModelFiles, DownloadError> {
-    let mut cached = check_cache_off_runtime(&cache_dir_of(base_dir), files).await?;
+pub(crate) async fn load_cached_from(
+    base_dir: &Path,
+    files: &[FileSpec],
+    lock: &CacheLock,
+) -> Result<ModelFiles, DownloadError> {
+    let mut cached = check_cache_off_runtime(&cache_dir_of(base_dir), files, lock).await?;
     if let Some(busy) = cached.busy_error() {
         return Err(busy);
     }
@@ -540,14 +632,21 @@ pub(crate) async fn load_cached_from(base_dir: &Path, files: &[FileSpec]) -> Res
             files: cached.missing.iter().map(|spec| spec.path.to_string()).collect(),
         });
     }
-    Ok(cached.into_model_files())
+    cached.into_model_files()
 }
 
 /// [`check_cache`] on a blocking thread: reading and hashing half a gigabyte
-/// would hold up every other task of the runtime thread it ran on.
-async fn check_cache_off_runtime(cache_dir: &Path, files: &[FileSpec]) -> Result<CacheCheck, DownloadError> {
+/// would hold up every other task of the runtime thread it ran on. The read
+/// side of `lock` is taken first, here, so the wait for a repair that is
+/// renaming the model never holds a blocking thread.
+async fn check_cache_off_runtime(
+    cache_dir: &Path,
+    files: &[FileSpec],
+    lock: &CacheLock,
+) -> Result<CacheCheck, DownloadError> {
+    let guard = lock.read().await;
     let (dir, files) = (cache_dir.to_path_buf(), files.to_vec());
-    tokio::task::spawn_blocking(move || check_cache(&dir, &files))
+    tokio::task::spawn_blocking(move || check_cache(&dir, &files, guard))
         .await
         .map_err(|e| DownloadError::Io {
             file: cache_dir.display().to_string(),
@@ -559,6 +658,8 @@ async fn check_cache_off_runtime(cache_dir: &Path, files: &[FileSpec]) -> Result
 /// the files that are missing or do not.
 struct CacheCheck {
     found: Vec<(FileKind, Vec<u8>)>,
+    /// `model.onnx` when it verified: the view its hash was taken on.
+    onnx: Option<OnnxFile>,
     missing: Vec<FileSpec>,
     /// Files another program kept open past the retries: neither found nor
     /// missing, so nothing is downloaded over them.
@@ -575,8 +676,10 @@ impl CacheCheck {
         Some(DownloadError::Busy { file, source })
     }
 
-    fn into_model_files(self) -> ModelFiles {
-        let mut onnx = Vec::new();
+    fn into_model_files(self) -> Result<ModelFiles, DownloadError> {
+        let onnx = self
+            .onnx
+            .ok_or_else(|| DownloadError::NotCached { files: vec!["onnx/model.onnx".to_string()] })?;
         let mut tokenizer = TokenizerFiles {
             tokenizer_file: Vec::new(),
             config_file: Vec::new(),
@@ -585,23 +688,34 @@ impl CacheCheck {
         };
         for (kind, bytes) in self.found {
             match kind {
-                FileKind::Onnx => onnx = bytes,
+                FileKind::Onnx => unreachable!("the model is kept as a view, never as bytes"),
                 FileKind::TokenizerJson => tokenizer.tokenizer_file = bytes,
                 FileKind::ConfigJson => tokenizer.config_file = bytes,
                 FileKind::SpecialTokensMap => tokenizer.special_tokens_map_file = bytes,
                 FileKind::TokenizerConfig => tokenizer.tokenizer_config_file = bytes,
             }
         }
-        ModelFiles { onnx, tokenizer }
+        Ok(ModelFiles { onnx, tokenizer })
     }
 }
 
-/// Reads every file of `files` once, keeping the bytes of those that pass.
-fn check_cache(cache_dir: &Path, files: &[FileSpec]) -> CacheCheck {
-    let mut check = CacheCheck { found: Vec::new(), missing: Vec::new(), busy: Vec::new() };
+/// Reads every file of `files` once, keeping the bytes of those that pass and,
+/// for the model, the view they were hashed on, which takes `guard` with it.
+/// A guard the model does not keep is released when the check ends.
+fn check_cache(cache_dir: &Path, files: &[FileSpec], guard: OwnedRwLockReadGuard<()>) -> CacheCheck {
+    let mut check = CacheCheck { found: Vec::new(), onnx: None, missing: Vec::new(), busy: Vec::new() };
+    let mut guard = Some(guard);
     for spec in files {
-        match read_verified(&cache_dir.join(spec.path), spec.sha256) {
-            Ok(bytes) => check.found.push((spec.kind, bytes)),
+        let path = cache_dir.join(spec.path);
+        let checked = match spec.kind {
+            FileKind::Onnx => match guard.take() {
+                Some(guard) => verified_onnx(&path, spec.sha256, guard).map(|view| check.onnx = Some(view)),
+                None => Err(Unusable::Altered),
+            },
+            kind => read_verified(&path, spec.sha256).map(|bytes| check.found.push((kind, bytes))),
+        };
+        match checked {
+            Ok(()) => {}
             Err(Unusable::Busy(e)) => check.busy.push((spec.path.to_string(), e)),
             Err(_) => check.missing.push(spec.clone()),
         }
@@ -614,13 +728,13 @@ fn check_cache(cache_dir: &Path, files: &[FileSpec]) -> CacheCheck {
 /// check [`ensure_model`] makes.
 #[cfg(feature = "eval")]
 pub(crate) fn model_is_cached(base_dir: &Path) -> bool {
-    let check = check_cache(&cache_dir_of(base_dir), &ALL_FILES);
+    let check = check_cache(&cache_dir_of(base_dir), &ALL_FILES, CacheLock::new().read_now());
     check.missing.is_empty() && check.busy.is_empty()
 }
 
 /// Why a file on disk cannot be used.
 #[derive(Debug)]
-enum Unusable {
+pub(crate) enum Unusable {
     Unreadable(std::io::Error),
     /// Another program holds the file past the retries of [`read_retrying`].
     Busy(std::io::Error),
@@ -650,12 +764,12 @@ fn is_sharing_conflict(raw: Option<i32>) -> bool {
     }
 }
 
-/// `std::fs::read`, trying again over [`OPEN_RETRY_WAITS_MS`] while another
-/// program holds the file. Sleeps, so it runs on a blocking thread.
-fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
+/// `attempt`, run again over [`OPEN_RETRY_WAITS_MS`] while another program
+/// holds the file. Sleeps, so it runs on a blocking thread.
+fn retrying<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     let mut waits = OPEN_RETRY_WAITS_MS.iter();
     loop {
-        match std::fs::read(path) {
+        match attempt() {
             Err(e) if is_sharing_conflict(e.raw_os_error()) => match waits.next() {
                 Some(ms) => std::thread::sleep(std::time::Duration::from_millis(*ms)),
                 None => return Err(e),
@@ -665,21 +779,73 @@ fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Every file [`read_verified`] read and hashed, so a test can count the reads of its own
-/// directory whatever thread did them.
+/// `std::fs::read` under [`retrying`].
+fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
+    retrying(|| std::fs::read(path))
+}
+
+fn unusable(e: std::io::Error) -> Unusable {
+    if is_sharing_conflict(e.raw_os_error()) {
+        Unusable::Busy(e)
+    } else {
+        Unusable::Unreadable(e)
+    }
+}
+
+/// `path` opened for reading. On Windows it shares reading and nothing else,
+/// so no handle can write, truncate, rename or delete the file while this one
+/// lives: the constant is Win32's `FILE_SHARE_READ`.
+fn open_shared_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        options.share_mode(FILE_SHARE_READ);
+    }
+    options.open(path)
+}
+
+/// `model.onnx` mapped read-only, when the SHA-256 of the mapped bytes is
+/// `expected_sha`: the same bytes the load receives. The guard of the cache
+/// lock goes into the view and is released with it, or here when the file does
+/// not verify; the map and the handle are always closed first.
+pub(crate) fn verified_onnx(
+    path: &Path,
+    expected_sha: &str,
+    guard: OwnedRwLockReadGuard<()>,
+) -> Result<OnnxFile, Unusable> {
+    let file = retrying(|| open_shared_read(path)).map_err(unusable)?;
+    // No model file is empty, and mapping nothing is not the same call on
+    // every system.
+    if file.metadata().map_err(unusable)?.len() == 0 {
+        return Err(Unusable::Altered);
+    }
+    // SAFETY: read-only mapping that lives no longer than `file`. On Windows
+    // `file` shares neither writing nor deletion, so no handle can write,
+    // truncate, rename or delete it while the view exists; on Unix the data
+    // directory is 0700 and clawg never writes model.onnx in place, it
+    // downloads to `.partial` and renames. Without probing the handle, the
+    // mapping is `PAGE_READONLY` / `FILE_MAP_READ` on Windows.
+    let map = unsafe { memmap2::MmapOptions::new().no_probe_handle().map(&file) }.map_err(unusable)?;
+    #[cfg(test)]
+    READS.lock().unwrap_or_else(|e| e.into_inner()).push(path.to_path_buf());
+    if sha256_hex(&map) != expected_sha {
+        return Err(Unusable::Altered);
+    }
+    Ok(OnnxFile(View::Mapped { map, _file: file, _cache: guard }))
+}
+
+/// Every file whose bytes were hashed, read from the cache or as they arrived,
+/// so a test can count the hashes of its own directory whatever thread did them.
 #[cfg(test)]
 static READS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// The bytes of `path` when their SHA-256 is `expected_sha`: the one place the
 /// cache is read and checked.
 fn read_verified(path: &Path, expected_sha: &str) -> Result<Vec<u8>, Unusable> {
-    let bytes = read_retrying(path).map_err(|e| {
-        if is_sharing_conflict(e.raw_os_error()) {
-            Unusable::Busy(e)
-        } else {
-            Unusable::Unreadable(e)
-        }
-    })?;
+    let bytes = read_retrying(path).map_err(unusable)?;
     #[cfg(test)]
     READS.lock().unwrap_or_else(|e| e.into_inner()).push(path.to_path_buf());
     if sha256_hex(&bytes) != expected_sha {
@@ -689,7 +855,7 @@ fn read_verified(path: &Path, expected_sha: &str) -> Result<Vec<u8>, Unusable> {
 }
 
 /// Hex-lowercase SHA-256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex_digest(sha2::Sha256::digest(bytes).as_slice())
 }
@@ -735,6 +901,7 @@ async fn download_one(
     backoff: &dyn BackoffPolicy,
     progress: Option<&UnboundedSender<DownloadProgress>>,
     bytes_downloaded_running: &mut u64,
+    lock: &CacheLock,
 ) -> Result<Vec<u8>, DownloadError> {
     use futures::StreamExt;
     use sha2::Digest;
@@ -865,6 +1032,8 @@ async fn download_one(
 
         // Hashed as the bytes arrived: the file is never read back.
         let got = hex_digest(digest.finalize().as_slice());
+        #[cfg(test)]
+        READS.lock().unwrap_or_else(|e| e.into_inner()).push(target.clone());
         if got != spec.sha256 {
             // Return immediately, do NOT retry: a checksum mismatch is not a
             // transient fault, so the retry budget would buy nothing.
@@ -879,10 +1048,15 @@ async fn download_one(
         // Syncing half a gigabyte can take seconds: not on a runtime thread.
         let committed = {
             let (partial, target) = (partial.clone(), target.clone());
+            // A load holds `model.onnx` open without sharing deletion: the
+            // rename waits for it, after the sync so that a load never waits
+            // for half a gigabyte to reach the disk.
+            let lock = (spec.kind == FileKind::Onnx).then(|| lock.clone());
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                 file.flush()?;
                 file.sync_all()?;
                 drop(file);
+                let _write = lock.as_ref().map(|lock| lock.0.blocking_write());
                 commit_file(&partial, &target)
             })
             .await
@@ -1015,7 +1189,7 @@ mod tests {
     }
 
     fn source<'a>(base_url: &'a str, oracle: &'a dyn DiskOracle, files: &'a [FileSpec]) -> ModelSource<'a> {
-        ModelSource { base_url, oracle, backoff: &ZeroBackoff, timeouts: DOWNLOAD_TIMEOUTS, files }
+        ModelSource { base_url, oracle, backoff: &ZeroBackoff, timeouts: DOWNLOAD_TIMEOUTS, files, lock: CacheLock::new() }
     }
 
     // ---------- Disk pre-flight ----------
@@ -1663,14 +1837,19 @@ mod tests {
 
             let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None).await;
             let model = res.unwrap_or_else(|e| panic!("{damaged}: {e}"));
-            assert_eq!(model.onnx, files[0].bytes, "{damaged}");
+            assert_eq!(&*model.onnx, &files[0].bytes[..], "{damaged}");
 
             let mut reads = reads_under(&cache_dir);
             reads.sort();
-            let mut expected: Vec<String> =
-                files.iter().map(|f| f.path.to_string()).filter(|p| p != damaged).collect();
+            let mut expected: Vec<String> = files.iter().map(|f| f.path.to_string()).collect();
+            if damaged == "onnx/model.onnx" {
+                expected.push(damaged.to_string());
+            }
             expected.sort();
-            assert_eq!(reads, expected, "with {damaged} missing, each cached file read once and the downloaded one never");
+            assert_eq!(
+                reads, expected,
+                "with {damaged} missing, every file hashed once and the downloaded model a second time, from the cache"
+            );
         }
     }
 
@@ -1707,10 +1886,10 @@ mod tests {
             drop(held);
         });
 
-        let check = check_cache(&cache_dir, &specs);
+        let check = check_cache(&cache_dir, &specs, CacheLock::new().read_now());
         release.join().unwrap();
         assert!(check.missing.is_empty() && check.busy.is_empty(), "missing {:?}", check.missing);
-        assert_eq!(check.found.len(), specs.len());
+        assert_eq!(check.found.len() + usize::from(check.onnx.is_some()), specs.len());
     }
 
     #[cfg(windows)]
@@ -1731,7 +1910,7 @@ mod tests {
             other => panic!("expected Busy, got {other:?}"),
         }
         assert!(collect_partials(&cache_dir).is_empty(), "nothing was downloaded");
-        assert!(matches!(load_cached_from(tmp.path(), &specs).await, Err(DownloadError::Busy { .. })));
+        assert!(matches!(load_cached_from(tmp.path(), &specs, &CacheLock::new()).await, Err(DownloadError::Busy { .. })));
     }
 
     #[cfg(windows)]
@@ -1750,7 +1929,7 @@ mod tests {
         let res = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None).await;
         assert!(matches!(res, Err(DownloadError::Busy { .. })), "{res:?}");
         assert!(collect_partials(&cache_dir).is_empty(), "nothing was downloaded");
-        let cached = load_cached_from(tmp.path(), &specs).await;
+        let cached = load_cached_from(tmp.path(), &specs, &CacheLock::new()).await;
         assert!(matches!(cached, Err(DownloadError::Busy { .. })), "{cached:?}");
     }
 
@@ -1762,18 +1941,152 @@ mod tests {
         let specs = fixture_specs(&files);
         write_all_to_cache(&cache_dir, &files);
 
-        let model = load_cached_from(tmp.path(), &specs).await.expect("a good cache loads");
-        assert_eq!(model.onnx, files[0].bytes);
+        let model = load_cached_from(tmp.path(), &specs, &CacheLock::new()).await.expect("a good cache loads");
+        assert_eq!(&*model.onnx, &files[0].bytes[..]);
 
         std::fs::remove_file(cache_dir.join("tokenizer_config.json")).unwrap();
         std::fs::write(cache_dir.join("config.json"), b"altered").unwrap();
-        match load_cached_from(tmp.path(), &specs).await {
+        match load_cached_from(tmp.path(), &specs, &CacheLock::new()).await {
             Err(DownloadError::NotCached { files }) => {
                 assert_eq!(files, ["config.json", "tokenizer_config.json"]);
             }
             other => panic!("expected NotCached, got {other:?}"),
         }
         assert!(collect_partials(&cache_dir).is_empty());
+    }
+
+    // ---------- The model as a read-only view ----------
+
+    #[tokio::test]
+    async fn the_cache_check_hands_the_onnx_over_as_a_read_only_view() {
+        let tmp = TestDir::new("onnx-view");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        write_all_to_cache(&cache_dir, &files);
+        let lock = CacheLock::new();
+
+        let model = load_cached_from(tmp.path(), &specs, &lock).await.expect("a good cache loads");
+        assert!(model.onnx.is_view(), "the model is a view of the file, not a copy");
+        assert_eq!(&*model.onnx, &files[0].bytes[..]);
+        assert!(lock.0.try_write().is_err(), "the view holds the cache lock");
+        drop(model);
+        assert!(lock.0.try_write().is_ok(), "the lock goes with the view");
+    }
+
+    #[test]
+    fn a_view_of_a_changed_onnx_is_refused() {
+        let tmp = TestDir::new("onnx-changed");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        write_all_to_cache(&cache_dir, &files);
+        let path = cache_dir.join(specs[0].path);
+        let lock = CacheLock::new();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] = bytes[0].wrapping_add(1);
+        std::fs::write(&path, &bytes).unwrap();
+        let refused = verified_onnx(&path, specs[0].sha256, lock.read_now());
+        assert!(matches!(refused, Err(Unusable::Altered)));
+        assert!(lock.0.try_write().is_ok(), "a refused file keeps no lock");
+        let check = check_cache(&cache_dir, &specs, lock.read_now());
+        assert!(check.onnx.is_none() && check.missing.iter().any(|spec| spec.path == specs[0].path));
+
+        std::fs::write(&path, b"").unwrap();
+        let empty = verified_onnx(&path, specs[0].sha256, lock.read_now());
+        assert!(matches!(empty, Err(Unusable::Altered)), "an empty file is not mapped");
+        std::fs::remove_file(&path).expect("a refused file is closed");
+    }
+
+    /// The OS error number of a failed call.
+    #[cfg(windows)]
+    fn raw_error<T>(result: std::io::Result<T>) -> Option<i32> {
+        result.err().and_then(|e| e.raw_os_error())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_load_holds_the_model_file_against_writes_until_the_session_returns() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = TestDir::new("carga-\u{f1}and\u{fa}");
+        let onnx = crate::memory::embedder::minimal_onnx();
+        let path = tmp.path().join("model.onnx");
+        let other = tmp.path().join("other.partial");
+        let moved = tmp.path().join("moved.onnx");
+        std::fs::write(&path, &onnx).unwrap();
+        std::fs::write(&other, b"another file").unwrap();
+        let lock = CacheLock::new();
+
+        let view = verified_onnx(&path, &sha256_hex(&onnx), lock.read_now()).expect("the model verifies");
+        let refused = |raw: Option<i32>| matches!(raw, Some(5 | 32));
+        let write = std::fs::OpenOptions::new().write(true).open(&path);
+        assert!(refused(raw_error(write)), "writing");
+        let truncate = std::fs::OpenOptions::new().write(true).truncate(true).open(&path);
+        assert!(refused(raw_error(truncate)), "truncating");
+        assert!(refused(raw_error(std::fs::rename(&other, &path))), "renaming another file over it");
+        assert!(refused(raw_error(std::fs::rename(&path, &moved))), "renaming it");
+        assert!(refused(raw_error(std::fs::remove_file(&path))), "deleting it");
+        let read = std::fs::OpenOptions::new().read(true).share_mode(0x1).open(&path);
+        assert!(read.is_ok(), "a reader that shares reading opens it");
+        drop(read);
+
+        let session = crate::memory::embedder::build_session(&view).expect("the session is built from the view");
+        drop(view);
+        std::fs::OpenOptions::new().write(true).open(&path).expect("writable again");
+        std::fs::rename(&other, &path).expect("renamed over again");
+        std::fs::remove_file(&path).expect("deleted again");
+        drop(session);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_model_file_is_free_again_after_a_failed_load() {
+        let tmp = TestDir::new("carga-fallida-\u{f1}");
+        let garbage = b"not an onnx model".to_vec();
+        let path = tmp.path().join("model.onnx");
+        let other = tmp.path().join("other.partial");
+        std::fs::write(&path, &garbage).unwrap();
+        std::fs::write(&other, b"another file").unwrap();
+        let lock = CacheLock::new();
+
+        let view = verified_onnx(&path, &sha256_hex(&garbage), lock.read_now()).expect("the bytes verify");
+        let failed = crate::memory::embedder::build_session(&view);
+        assert!(failed.is_err(), "garbage is not a model");
+        drop(view);
+        assert!(lock.0.try_write().is_ok(), "the lock went with the view");
+        std::fs::rename(&other, &path).expect("renamed over after the failure");
+        std::fs::remove_file(&path).expect("deleted after the failure");
+    }
+
+    #[tokio::test]
+    async fn a_repair_waits_for_a_load_to_release_the_model_file() {
+        let tmp = TestDir::new("repair-waits");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        write_all_to_cache(&cache_dir, &files);
+        let lock = CacheLock::new();
+        let load = load_cached_from(tmp.path(), &specs, &lock).await.expect("a good cache loads");
+
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mount_all(&mut server, &files, 200).await;
+        let client = reqwest::Client::new();
+        let mut running = 0;
+        let url = server.url();
+        let repair = download_one(&client, &cache_dir, &specs[0], &url, &ZeroBackoff, None, &mut running, &lock);
+        tokio::pin!(repair);
+
+        let waiting = tokio::time::timeout(std::time::Duration::from_millis(400), &mut repair).await;
+        assert!(waiting.is_err(), "the repair renamed the model while a load held it");
+        assert_eq!(&*load.onnx, &files[0].bytes[..], "the loaded bytes are still the ones hashed");
+
+        drop(load);
+        let repaired = tokio::time::timeout(std::time::Duration::from_secs(30), &mut repair)
+            .await
+            .expect("the repair goes on once the load lets go");
+        repaired.expect("the repair finishes");
+        assert_eq!(std::fs::read(cache_dir.join(specs[0].path)).unwrap(), files[0].bytes);
     }
 
     // ---------- CLAWG_HF_BASE_URL ----------

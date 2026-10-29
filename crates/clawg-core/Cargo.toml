@@ -36,6 +36,7 @@ uuid.workspace = true
 log.workspace = true
 dirs.workspace = true
 sha2.workspace = true
+memmap2.workspace = true
 unicode-normalization.workspace = true
 once_cell.workspace = true
 

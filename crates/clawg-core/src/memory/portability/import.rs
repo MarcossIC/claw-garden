@@ -5329,7 +5329,7 @@ pub(crate) mod tests {
         let first: Vec<usize> = (0..sample).collect();
         report_padding(&format!("first {sample} rows"), &first);
 
-        let files = load_cached_model(&base).await.unwrap();
+        let files = load_cached_model(&base, &crate::memory::model_download::CacheLock::new()).await.unwrap();
         let pad_id = check_tokenizer(&tokenizer, &files.tokenizer).unwrap();
         let embedder = E5Embedder::from_parts(&files.onnx, tokenizer.clone(), &files.tokenizer).unwrap();
         let orders = orders(&first);

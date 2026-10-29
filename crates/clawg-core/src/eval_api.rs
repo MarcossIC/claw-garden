@@ -558,7 +558,7 @@ impl EvalEmbedder {
     /// first if it is not already cached. See [`model_is_cached`] to check
     /// readiness without paying for a download.
     pub async fn real(base_dir: &Path) -> Result<Self, EvalError> {
-        let files = model_download::ensure_model(base_dir, None)
+        let files = model_download::ensure_model(base_dir, None, &model_download::CacheLock::new())
             .await
             .map_err(|e| EvalError::ModelLoad(e.to_string()))?;
         // The evaluation tools are not the daemon: they parse their own copy.
