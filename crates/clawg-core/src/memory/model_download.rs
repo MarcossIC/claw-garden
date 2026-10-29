@@ -586,9 +586,8 @@ async fn fetch(
             // The model is loaded from the cache it was renamed into, as a
             // reload does: that takes the read side of the lock and maps the
             // file, so no copy of it in memory ever reaches the load.
-            drop(bytes);
             downloaded_onnx = Some(spec);
-        } else {
+        } else if let Some(bytes) = bytes {
             cached.found.push((spec.kind, bytes));
         }
     }
@@ -902,7 +901,7 @@ async fn download_one(
     progress: Option<&UnboundedSender<DownloadProgress>>,
     bytes_downloaded_running: &mut u64,
     lock: &CacheLock,
-) -> Result<Vec<u8>, DownloadError> {
+) -> Result<Option<Vec<u8>>, DownloadError> {
     use futures::StreamExt;
     use sha2::Digest;
     use std::io::Write;
@@ -970,7 +969,10 @@ async fn download_one(
         let bytes_total_hint = *bytes_downloaded_running + content_length;
         let mut next_emit_threshold = *bytes_downloaded_running + CHUNK_PROGRESS_BYTES;
 
-        let mut body = Vec::with_capacity(content_length as usize);
+        // The model is written to `.partial` and nowhere else; only the small
+        // files are kept, to hand them to the load.
+        let mut body = (spec.kind != FileKind::Onnx).then(|| Vec::with_capacity(content_length as usize));
+        let mut received: u64 = 0;
         let mut digest = sha2::Sha256::new();
         let mut stream = resp.bytes_stream();
         let mut fatal: Option<DownloadError> = None;
@@ -978,7 +980,7 @@ async fn download_one(
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    if (body.len() + bytes.len()) as u64 > MAX_FILE_BYTES {
+                    if received + bytes.len() as u64 > MAX_FILE_BYTES {
                         fatal = Some(too_large(spec));
                         break;
                     }
@@ -990,7 +992,10 @@ async fn download_one(
                         break;
                     }
                     digest.update(&bytes);
-                    body.extend_from_slice(&bytes);
+                    if let Some(body) = body.as_mut() {
+                        body.extend_from_slice(&bytes);
+                    }
+                    received += bytes.len() as u64;
                     *bytes_downloaded_running += bytes.len() as u64;
                     if let Some(tx) = progress {
                         if *bytes_downloaded_running >= next_emit_threshold {
@@ -1082,7 +1087,7 @@ async fn download_one(
 }
 
 /// Larger than any file of the model: what the disk pre-flight asks to have
-/// free. The bytes are held in memory to hand them to the load unread.
+/// free.
 const MAX_FILE_BYTES: u64 = MIN_FREE_BYTES;
 
 fn too_large(spec: &FileSpec) -> DownloadError {
@@ -1851,6 +1856,35 @@ mod tests {
                 "with {damaged} missing, every file hashed once and the downloaded model a second time, from the cache"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_downloaded_onnx_is_not_kept_in_memory_and_is_loaded_from_the_cache() {
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        let tmp = TestDir::new("onnx-not-kept");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = mount_all(&mut server, &files, 200).await;
+        let client = reqwest::Client::new();
+        let lock = CacheLock::new();
+        let mut running = 0;
+        let url = server.url();
+
+        for spec in &specs {
+            let body = download_one(&client, &cache_dir, spec, &url, &ZeroBackoff, None, &mut running, &lock)
+                .await
+                .expect("downloads");
+            assert_eq!(body.is_some(), spec.kind != FileKind::Onnx, "{}: what the run keeps", spec.path);
+        }
+
+        let tmp = TestDir::new("onnx-loaded-from-cache");
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+        let model = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
+            .await
+            .expect("a fresh run downloads and loads");
+        assert!(model.onnx.is_view(), "the model came from the cache, not from memory");
+        assert_eq!(&*model.onnx, &files[0].bytes[..]);
     }
 
     #[test]
