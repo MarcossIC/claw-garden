@@ -1208,7 +1208,7 @@ mod tests {
     }
 
     async fn move_to(store: &MemoryStore, filter: &MoveFilter, target: Option<&str>) -> MoveReport {
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         move_memories_core(store, backups.path(), filter, target.map(str::to_string), false).await.unwrap()
     }
 
@@ -1534,7 +1534,7 @@ mod tests {
             MemoryEvent { memory_type: Some("session_summary".into()), ..fact("Goal: wire the cache", None) },
         )
         .await;
-        let workspaces = tempfile::tempdir().unwrap();
+        let workspaces = crate::test_dir::test_dir();
         let workspaces = WorkspaceManager::new(workspaces.path().into());
         let (reach, emitted) = (Reach::AllBut(Vec::new()), EmittedIds::default());
         let prompt = |project: &'static str| {
@@ -1621,7 +1621,7 @@ mod tests {
     async fn a_dry_run_reports_what_a_move_does_and_writes_nothing() {
         let store = store().await;
         let pieces = save(&store, fact(&long_text("dry"), None)).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let filter = MoveFilter { from: Some(ProjectFilter::None), ..MoveFilter::default() };
 
         let dry = move_memories_core(&store, backups.path(), &filter, Some(B.into()), true).await.unwrap();
@@ -1644,7 +1644,7 @@ mod tests {
         let store = store().await;
         let loose = save_one(&store, fact("an unfiled note", None)).await;
         let filed = save_one(&store, fact("a note filed in A", Some(A))).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
 
         let done = move_to(&store, &ids(&[loose, filed]), Some(B)).await;
 
@@ -1665,7 +1665,7 @@ mod tests {
     async fn undoing_leaves_a_row_that_moved_again() {
         let store = store().await;
         let id = save_one(&store, fact("a note moved twice", None)).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let first = move_to(&store, &ids(&[id]), Some(B)).await.move_id.unwrap();
         move_to(&store, &ids(&[id]), Some(A)).await;
 
@@ -1679,7 +1679,7 @@ mod tests {
     async fn an_unregistered_target_is_refused() {
         let store = store().await;
         let id = save_one(&store, fact("a note", None)).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
 
         let refused = move_memories_core(&store, backups.path(), &ids(&[id]), Some("typo-0000".into()), false).await;
 
@@ -1700,7 +1700,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(folders, 0);
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
 
         let moved = move_memories_core(&store, backups.path(), &ids(&[id]), Some("idea-1a2b".into()), false).await.unwrap();
 
@@ -1711,7 +1711,7 @@ mod tests {
     #[tokio::test]
     async fn a_selection_needs_a_filter_and_text_only_over_live_rows() {
         let store = store().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let run = |filter: MoveFilter| {
             let (store, backups) = (store.clone(), backups.path().to_path_buf());
             async move { move_memories_core(&store, &backups, &filter, None, true).await }
@@ -1768,7 +1768,7 @@ mod tests {
         assert!(a_pieces.len() > 1, "{a_pieces:?}");
 
         let alone = MoveFilter { origin_project: Some("a".into()), ..MoveFilter::default() };
-        let dry = move_memories_core(&store, tempfile::tempdir().unwrap().path(), &alone, Some(B.into()), true).await.unwrap();
+        let dry = move_memories_core(&store, crate::test_dir::test_dir().path(), &alone, Some(B.into()), true).await.unwrap();
         assert!(!dry.moved.is_empty(), "origin_project alone is a selection");
 
         let report = move_to(&store, &alone, Some(B)).await;
@@ -1893,7 +1893,7 @@ mod tests {
         let store = store().await;
         merged_into(&store, "gone-cccc", B).await;
         let id = save_one(&store, fact("the parser is written by hand", Some(A))).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
 
         let filter = MoveFilter { ids: vec![id], ..MoveFilter::default() };
         let report = move_memories_core(&store, backups.path(), &filter, Some("gone-cccc".into()), false).await.unwrap();
@@ -1907,7 +1907,7 @@ mod tests {
         let store = store().await;
         register(&store, "web-cccc").await;
         let id = save_one(&store, fact("the parser is written by hand", Some(A))).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let filter = MoveFilter { ids: vec![id], ..MoveFilter::default() };
         let moved = move_memories_core(&store, backups.path(), &filter, Some(B.into()), false).await.unwrap();
         merged_into(&store, A, "web-cccc").await;
@@ -2027,7 +2027,7 @@ mod tests {
         let report = merge(&store, A, B).await;
         assert_eq!(report.superseded.len(), 2);
         assert!(moved_ids(&report).contains(&a_key) && moved_ids(&report).contains(&deleted));
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         undo_move_core(&store, backups.path(), report.move_id.unwrap(), false).await.unwrap();
 
         assert_eq!((states(&store).await, everything_else(&store).await), before);
@@ -2038,7 +2038,7 @@ mod tests {
         let store = store().await;
         let id = save_one(&store, fact("a note", Some(A))).await;
         let theirs = save_one(&store, fact("a note of the project to delete", Some(B))).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let away = move_to(&store, &ids(&[theirs]), Some(A)).await.move_id.unwrap();
         let gone = save_one(&store, fact("a note deleted with the project", Some(B))).await;
         store.conn.call(move |c| c.execute("UPDATE memory SET deleted_at = 4 WHERE id = ?1", [gone])).await.unwrap();

@@ -778,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unchanged_project_embeds_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "README.md", "# Readme\nhello\n## Usage\nrun it\n");
         write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
         let store = store_with_project("p", dir.path()).await;
@@ -798,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_changed_doc_replaces_its_passages_and_a_deleted_one_loses_them() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "a.md", "# A\nold text\n## Two\nmore old text\n");
         write(dir.path(), "b.md", "# B\nb text\n");
         let store = store_with_project("p", dir.path()).await;
@@ -817,7 +817,7 @@ mod tests {
 
     #[tokio::test]
     async fn another_model_reindexes_every_doc() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "a.md", "# A\na\n");
         write(dir.path(), "b.md", "# B\nb\n");
         let store = store_with_project("p", dir.path()).await;
@@ -832,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_root_deletes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let root = dir.path().join("repo");
         write(&root, "a.md", "# A\na\n");
         let store = store_with_project("p", &root).await;
@@ -848,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_embedding_keeps_the_doc_as_it_was() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "a.md", "# A\nfirst\n");
         let store = store_with_project("p", dir.path()).await;
         let index = Arc::new(DocIndex::default());
@@ -907,7 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unusable_vector_skips_its_doc_and_the_rest_go_on() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "gone.md", "# Gone\nsoon deleted\n");
         let store = store_with_project("p", dir.path()).await;
         let index = Arc::new(DocIndex::default());
@@ -931,7 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_short_batch_still_aborts_the_refresh() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "a.md", "# A\na\n");
         write(dir.path(), "b.md", "# B\nb\n");
         let store = store_with_project("p", dir.path()).await;
@@ -945,7 +945,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_last_error_lasts_until_a_refresh_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "a.md", "# A\na\n");
         let store = store_with_project("p", dir.path()).await;
         let index = Arc::new(DocIndex::default());
@@ -966,7 +966,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_refresh_does_not_wait_for_the_first() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "a.md", "# A\na\n");
         let store = store_with_project("p", dir.path()).await;
         let index = Arc::new(DocIndex::default());
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_root_that_was_not_accepted_is_not_read() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "a.md", "# A\na\n");
         let store = store_with_project("p", dir.path()).await;
         store.conn.call(|c| c.execute("UPDATE project_path SET index_docs = 0 WHERE id = 'p'", [])).await.unwrap();
@@ -1051,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn a_secret_in_a_doc_never_reaches_the_index() {
         let token = format!("ghp_{}", "a1B2".repeat(9));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "docs/setup.md", &format!("# Setup\nexport GITHUB_TOKEN={token}\n"));
         let store = store_with_project("p", dir.path()).await;
         let index = Arc::new(DocIndex::default());
@@ -1097,8 +1097,8 @@ mod tests {
         fn passage_prefix(&self) -> &str { "" }
     }
 
-    async fn indexed(docs: &[(&str, &str)]) -> (tempfile::TempDir, MemoryStore) {
-        let dir = tempfile::tempdir().unwrap();
+    async fn indexed(docs: &[(&str, &str)]) -> (crate::test_dir::TestDir, MemoryStore) {
+        let dir = crate::test_dir::test_dir();
         for (path, text) in docs {
             write(dir.path(), path, text);
         }
@@ -1179,8 +1179,8 @@ mod tests {
 
     #[tokio::test]
     async fn search_never_crosses_projects() {
-        let one = tempfile::tempdir().unwrap();
-        let two = tempfile::tempdir().unwrap();
+        let one = crate::test_dir::test_dir();
+        let two = crate::test_dir::test_dir();
         write(one.path(), "README.md", "# Readme\nthe port is chosen at start\n");
         write(two.path(), "README.md", "# Readme\nthe port is chosen at start\n# Elsewhere\nport port port\n");
         let store = store_with_project("one", one.path()).await;
@@ -1209,7 +1209,7 @@ mod tests {
         use crate::memory::{search_all_memories, SearchScope};
         use crate::models::chat::Role;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "README.md", "# Port\nthe daemon port is 27381\n# Shutdown\nthe daemon spills the queue\n");
         let store = store_with_project("p", dir.path()).await;
         for content in ["the daemon port is 27381", "the daemon spills the queue on stop"] {
@@ -1257,7 +1257,7 @@ mod tests {
         use crate::memory::store_insert::NewMemoryRecord;
         use crate::models::chat::Role;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         write(dir.path(), "README.md", "# Readme\nthe daemon listens on loopback\n");
         let store = store_with_project("p", dir.path()).await;
         let evt = MemoryEvent {

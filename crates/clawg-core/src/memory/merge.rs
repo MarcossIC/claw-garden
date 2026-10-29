@@ -767,13 +767,13 @@ mod tests {
         store: Arc<MemoryStore>,
         workspaces: WorkspaceManager,
         backups: PathBuf,
-        _dirs: (tempfile::TempDir, tempfile::TempDir),
+        _dirs: (crate::test_dir::TestDir, crate::test_dir::TestDir),
     }
 
     impl Fixture {
         async fn new(projects: &[&str]) -> Self {
             let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
-            let (workspaces, backups) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (workspaces, backups) = (crate::test_dir::test_dir(), crate::test_dir::test_dir());
             let fixture = Fixture {
                 store,
                 workspaces: WorkspaceManager::new(workspaces.path().to_path_buf()),

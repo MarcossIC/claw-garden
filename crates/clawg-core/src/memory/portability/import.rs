@@ -2544,13 +2544,13 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    pub(crate) async fn run(store: &MemoryStore, text: &str, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+    pub(crate) async fn run(store: &MemoryStore, text: &str, options: ImportOptions) -> (ImportReport, crate::test_dir::TestDir) {
         run_on(store, text, options, Arc::new(Disk)).await
     }
 
     /// [`run`] with what `ground` finds at each root.
-    async fn run_on(store: &MemoryStore, text: &str, options: ImportOptions, ground: Arc<dyn Ground>) -> (ImportReport, tempfile::TempDir) {
-        let backups = tempfile::tempdir().unwrap();
+    async fn run_on(store: &MemoryStore, text: &str, options: ImportOptions, ground: Arc<dyn Ground>) -> (ImportReport, crate::test_dir::TestDir) {
+        let backups = crate::test_dir::test_dir();
         let report = import(store, Some(&FakeEmbedder::default()), Arc::new(ChatChunker::with_fallback()), backups.path(), text, &options, ground, &mut ImportTimings::new(false))
             .await
             .unwrap();
@@ -2716,7 +2716,7 @@ pub(crate) mod tests {
     async fn an_unknown_version_writes_nothing() {
         let file = seeded_file().await.replacen("\"version\":1", "\"version\":2", 1);
         let dst = destination().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let err = import(&dst, Some(&FakeEmbedder::default()), Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::Format(FormatError::UnknownVersion(2))), "{err}");
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
@@ -2727,7 +2727,7 @@ pub(crate) mod tests {
     async fn a_dry_run_reports_without_writing() {
         let file = seeded_file().await;
         let dst = destination().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let sequence = "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'memory'), 0)";
         let before = count(&dst, sequence).await;
         let dry = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
@@ -2789,7 +2789,7 @@ pub(crate) mod tests {
     async fn a_dry_run_and_an_import_that_adds_nothing_have_no_number() {
         let file = seeded_file().await;
         let dst = destination().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let dry = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert_eq!(dry.import_id, None);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_import").await, 0);
@@ -2803,7 +2803,7 @@ pub(crate) mod tests {
     async fn without_an_embedder_nothing_is_written() {
         let file = seeded_file().await;
         let dst = destination().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let err = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::NoEmbedder));
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
@@ -3033,7 +3033,7 @@ pub(crate) mod tests {
             merged: std::sync::atomic::AtomicBool::new(false),
             fake: FakeEmbedder::default(),
         };
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
 
         import(&dst, Some(&embedder), Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false))
             .await
@@ -3072,7 +3072,7 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
-        let clone = tempfile::tempdir().unwrap();
+        let clone = crate::test_dir::test_dir();
         std::fs::create_dir_all(clone.path().join(".git")).unwrap();
         std::fs::write(clone.path().join(".git").join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
         let here = clone.path().to_string_lossy().into_owned();
@@ -3464,7 +3464,7 @@ pub(crate) mod tests {
         run(&dst, &file, ImportOptions::default()).await;
         let ground = Arc::new(FakeGround::default());
         ground.put(Path::new("/work/notas"), None, Some("s1"), RootCommit::Known("c1".into()));
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
         let reg = crate::memory::project::Registration {
             root: Path::new("/work/notas"),
@@ -3526,7 +3526,7 @@ pub(crate) mod tests {
 
         let ground = Arc::new(FakeGround::default());
         ground.put(Path::new("/work/mono"), Some("github.com/acme/mono"), Some("s1"), RootCommit::Known("c1".into()));
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
         let reg = crate::memory::project::Registration {
             root: Path::new("/work/mono"),
@@ -3871,12 +3871,12 @@ pub(crate) mod tests {
         assert_eq!(reasons, vec!["memory 15 was revived by deleting 16, which is not in the file"], "{report:#?}");
     }
 
-    pub(crate) async fn run_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+    pub(crate) async fn run_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> (ImportReport, crate::test_dir::TestDir) {
         run_export(store, foreign_export(notes), options).await
     }
 
-    pub(crate) async fn run_export(store: &MemoryStore, export: ForeignExport, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
-        let backups = tempfile::tempdir().unwrap();
+    pub(crate) async fn run_export(store: &MemoryStore, export: ForeignExport, options: ImportOptions) -> (ImportReport, crate::test_dir::TestDir) {
+        let backups = crate::test_dir::test_dir();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let report =
             import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
@@ -4052,7 +4052,7 @@ pub(crate) mod tests {
         let content = format!("{}{}", words.join(" "), " word".repeat(600));
         let dst = destination().await;
         let notes = vec![foreign_note("engram:long", title, &content)];
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let dry_run = ImportOptions { dry_run: true, ..Default::default() };
         let dry = import_foreign(&dst, None, chunker, backups.path(), foreign_export(notes.clone()), &dry_run, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
@@ -4154,13 +4154,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let clone = || {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_dir::test_dir();
             std::fs::create_dir_all(dir.path().join(".git")).unwrap();
             std::fs::write(dir.path().join(".git").join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
             dir
         };
         let (one, two) = (clone(), clone());
-        let root = |dir: &tempfile::TempDir| dir.path().to_string_lossy().into_owned();
+        let root = |dir: &crate::test_dir::TestDir| dir.path().to_string_lossy().into_owned();
         let keyed = |origin: &str, project: &str, content: &str| ForeignNote {
             project: Some(project.into()),
             topic_key: Some("sdd/x".into()),
@@ -4221,12 +4221,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_project_map_path_in_a_declared_subfolder_goes_to_its_project() {
         let dst = destination().await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let root = crate::memory::identity::strip_verbatim(&std::fs::canonicalize(dir.path()).unwrap());
         let inside = root.join("apps").join("web").join("src");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(&inside).unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
         let reg = crate::memory::project::Registration {
             root: &root,
@@ -4272,7 +4272,7 @@ pub(crate) mod tests {
         let dst = destination().await;
         run_foreign(&dst, sample_notes(), ImportOptions::default()).await;
         let moved_to = register(&dst, "/work/moved").await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let filter = MoveFilter { origin_project: Some("a".into()), include_deleted: true, ..Default::default() };
         let moved = move_memories_core(&dst, backups.path(), &filter, Some(moved_to.clone()), false).await.unwrap();
         assert!(!moved.moved.is_empty());
@@ -4324,7 +4324,7 @@ pub(crate) mod tests {
         let first = vec![proposal("a", "the proposal of a", T0), proposal("b", "the proposal of b", T0), long("closing", T0)];
         run_foreign(&dst, first, ImportOptions::default()).await;
         let elsewhere = register(&dst, "/work/elsewhere").await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let filter = MoveFilter { origin_project: Some("a".into()), ..Default::default() };
         move_memories_core(&dst, backups.path(), &filter, Some(elsewhere.clone()), false).await.unwrap();
 
@@ -4656,7 +4656,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_store_from_v16_travels_whole() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(16)).await;
         let exported = crate::memory::portability::export(dir.path(), &ExportFilter::default(), 0).unwrap();
         let dst = destination().await;
@@ -4850,7 +4850,7 @@ pub(crate) mod tests {
         decides_alike(&dst, notes_of(&dst, notes, plain()).await, "two notes of an origin and a text twice").await;
 
         let dst = destination().await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let options = ImportOptions { project_map: vec![("a".into(), dir.path().to_string_lossy().into_owned().into())], ..Default::default() };
         let prepared = notes_of(&dst, sample_notes(), options).await;
         let root_id = prepared.projects[0].root_id.clone();
@@ -4903,7 +4903,7 @@ pub(crate) mod tests {
         insert_row(&dst, "claude-code", Some(project()), "Storage engine: DuckDB", Some("storage/engine"), 5).await;
         let purged = insert_row(&dst, "claude-code", None, "A row purged since", None, 6).await;
         dst.conn.call(move |c| c.execute("DELETE FROM memory WHERE id = ?1", [purged])).await.unwrap();
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let dry = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert!(dry.topic_taken.iter().all(|t| t.stored_as > purged) && !dry.topic_taken.is_empty(), "{dry:#?}");
         let (real, _) = run(&dst, &file, ImportOptions::default()).await;
@@ -4919,7 +4919,7 @@ pub(crate) mod tests {
     }
 
     async fn timed_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, dry_run: bool) -> (ImportReport, ImportTimings) {
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let options = ImportOptions { dry_run, ..Default::default() };
         let mut timings = ImportTimings::new(dry_run);
@@ -4931,7 +4931,7 @@ pub(crate) mod tests {
     }
 
     async fn timed_file(store: &MemoryStore, file: &str) -> (ImportReport, ImportTimings) {
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let mut timings = ImportTimings::new(false);
         let report =
             import(store, Some(&FakeEmbedder::default()), Arc::new(ChatChunker::with_fallback()), backups.path(), file, &ImportOptions::default(), Arc::new(Disk), &mut timings)
@@ -5098,7 +5098,7 @@ pub(crate) mod tests {
     }
 
     async fn import_notes_with(store: &MemoryStore, embedder: &dyn Embedder, notes: Vec<ForeignNote>) -> ImportReport {
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         import_foreign(
             store,
             Some(embedder),
@@ -5148,7 +5148,7 @@ pub(crate) mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let embedder = Recording::new();
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         import(&dst, Some(&embedder), word_chunker(), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false))
             .await
             .unwrap();

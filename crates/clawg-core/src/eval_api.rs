@@ -698,16 +698,19 @@ impl EvalIngest {
         let _ = runtime.embedder.set(embedder.0.clone());
         // Written as the daemon writes it when its model loads, so a store
         // made here serves as a snapshot; one of another model is refused.
-        let status = runtime
-            .store
-            .ensure_embedding_contract(EmbeddingIdentity::of(embedder.0.as_ref()))
-            .await
-            .map_err(|e| EvalError::Open(e.to_string()))?;
-        if let ContractStatus::Mismatch { stored, actual } = status {
-            return Err(EvalError::Open(format!(
+        // A refusal closes the store first: the runtime's workers hold it open
+        // until the process ends otherwise.
+        let refusal = match runtime.store.ensure_embedding_contract(EmbeddingIdentity::of(embedder.0.as_ref())).await {
+            Err(e) => Some(EvalError::Open(e.to_string())),
+            Ok(ContractStatus::Mismatch { stored, actual }) => Some(EvalError::Open(format!(
                 "its vectors are of another model ({})",
                 differing_fields(&stored, &actual).join("; ")
-            )));
+            ))),
+            Ok(_) => None,
+        };
+        if let Some(refusal) = refusal {
+            runtime.close().await;
+            return Err(refusal);
         }
         runtime.access_tracker = Arc::new(AccessTracker::inert());
 
@@ -1620,7 +1623,7 @@ mod tests {
     /// its way into the top 10 on importance, which the 30 fillers give up.
     #[tokio::test]
     async fn search_feeds_query_text_to_the_lexical_channel() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         let agent = "agent-query-text-wiring";
 
@@ -1682,11 +1685,11 @@ mod tests {
 
     #[tokio::test]
     async fn recreate_fts_with_tokenizer_same_tokenizer_matches_the_migrated_schema_byte_for_byte() {
-        let dir_a = tempfile::tempdir().unwrap();
+        let dir_a = crate::test_dir::test_dir();
         let store_a = EvalStore::open(dir_a.path()).await.expect("open must succeed");
         let migrated_sql = store_a.fts_schema_sql().await;
 
-        let dir_b = tempfile::tempdir().unwrap();
+        let dir_b = crate::test_dir::test_dir();
         let store_b = EvalStore::open(dir_b.path()).await.expect("open must succeed");
         store_b
             .recreate_fts_with_tokenizer("unicode61 remove_diacritics 2")
@@ -1702,11 +1705,11 @@ mod tests {
 
     #[tokio::test]
     async fn recreate_fts_with_tokenizer_trigram_differs_only_in_the_tokenize_clause() {
-        let dir_a = tempfile::tempdir().unwrap();
+        let dir_a = crate::test_dir::test_dir();
         let store_a = EvalStore::open(dir_a.path()).await.expect("open must succeed");
         let migrated_sql = store_a.fts_schema_sql().await;
 
-        let dir_c = tempfile::tempdir().unwrap();
+        let dir_c = crate::test_dir::test_dir();
         let store_c = EvalStore::open(dir_c.path()).await.expect("open must succeed");
         store_c.recreate_fts_with_tokenizer("trigram").await.expect("recreate with trigram must succeed");
         let rebuilt_trigram_sql = store_c.fts_schema_sql().await;
@@ -1721,7 +1724,7 @@ mod tests {
 
     #[tokio::test]
     async fn recreate_fts_with_tokenizer_rejects_an_unlisted_tokenizer() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         match store.recreate_fts_with_tokenizer("porter").await {
             Err(EvalError::UnknownTokenizer(t)) => assert_eq!(t, "porter"),
@@ -1734,7 +1737,7 @@ mod tests {
         // Confirms no backfill is needed: the AFTER INSERT
         // trigger must survive the DROP TABLE, so a row inserted after the
         // swap is still lexically findable with no extra step.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         store.recreate_fts_with_tokenizer("trigram").await.expect("recreate must succeed");
 
@@ -1947,7 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_finish_returns_only_after_every_event_is_stored() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         for i in 0..5 {
             ingest
@@ -1967,7 +1970,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_ingest_backdates_created_at() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         const DAY_MS: u64 = 86_400_000;
         ingest.send("agent-ingest", "a fresh note about the ferry", "semantic_fact", 3.0, 0).await.unwrap();
@@ -1992,7 +1995,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_ingest_names_the_texts_a_live_row_already_holds() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         ingest.save(keyed("a note already in the store", None)).await.unwrap();
 
@@ -2004,11 +2007,12 @@ mod tests {
         assert_eq!(held, vec![1], "a text is held as a save of it would hash it");
         assert!(ingest.composition().await.unwrap().rows >= 1);
         assert!(ingest.resolve_cases(&[]).await.unwrap().is_empty());
+        ingest.finish().await.unwrap().close().await;
     }
 
     #[tokio::test]
     async fn ingest_honours_the_declared_type_and_importance() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         ingest.send("agent-ingest", "always answer in rioplatense spanish", "user_preference", 9.5, 0).await.unwrap();
 
@@ -2023,18 +2027,19 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_rejects_an_unknown_memory_type_before_queueing_anything() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
         match ingest.send("agent-ingest", "content", "not_a_real_type", 3.0, 0).await {
             Err(EvalError::UnknownMemoryType(t)) => assert_eq!(t, "not_a_real_type"),
             other => panic!("expected UnknownMemoryType, got {other:?}"),
         }
+        ingest.finish().await.unwrap().close().await;
     }
 
     #[tokio::test]
     async fn conflict_pairs_reads_the_table() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         let runtime = ingest.finish().await.unwrap();
         assert!(conflict_pairs(&runtime).await.unwrap().is_empty());
@@ -2117,7 +2122,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_stores_under_the_agent_project_and_key_it_is_given() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
         let saved = ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap();
@@ -2143,7 +2148,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_save_under_the_same_key_reports_the_first_as_replaced() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
         let first = ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap();
@@ -2151,11 +2156,12 @@ mod tests {
 
         assert!(first.replaced.is_empty());
         assert_eq!(second.replaced, vec![first.rows[0].0]);
+        ingest.finish().await.unwrap().close().await;
     }
 
     #[tokio::test]
     async fn save_reports_the_candidates_the_detector_paired() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await.unwrap();
 
         let older = ingest.save(keyed("base the build runs on cargo", None)).await.unwrap();
@@ -2167,11 +2173,12 @@ mod tests {
         assert_eq!(candidate.id, older.rows[0].0);
         assert!((candidate.distance - 0.2).abs() < 0.01, "distance was {}", candidate.distance);
         assert!(!candidate.escalated, "two facts are never put to the user");
+        ingest.finish().await.unwrap().close().await;
     }
 
     #[tokio::test]
     async fn save_with_an_invalid_key_fails() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
         match ingest.save(keyed("content", Some("Not A Key"))).await {
@@ -2184,7 +2191,7 @@ mod tests {
 
     #[tokio::test]
     async fn joined_pieces_equal_the_text_read_memory_returns() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         let text: String = (0..900).map(|i| format!("word{i} ")).collect();
         let saved = ingest.save(keyed(&text, None)).await.unwrap();
@@ -2224,7 +2231,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_distances_equal_the_knn_distance() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await.unwrap();
         let base = ingest.save(keyed("base the build runs on cargo", None)).await.unwrap().rows[0].0;
         let near = ingest.save(keyed("near the build runs on make", None)).await.unwrap().rows[0].0;
@@ -2255,7 +2262,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_distances_of_nothing_is_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let runtime = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path())
             .await
             .unwrap()
@@ -2268,7 +2275,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_superseded_vectors_leaves_every_live_row_its_own() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         let old = ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap().rows[0].0;
         let new = ingest.save(keyed("the build runs on make", Some("build/tool"))).await.unwrap().rows[0].0;
@@ -2302,7 +2309,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_superseded_text_leaves_the_live_rows_matchable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap();
         let new = ingest.save(keyed("the build runs on make", Some("build/tool"))).await.unwrap().rows[0].0;
@@ -2317,7 +2324,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_runtime_is_rooted_at_the_given_base_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
         let runtime = ingest.finish().await.unwrap();
@@ -2335,7 +2342,7 @@ mod tests {
     /// needed to tell the two apart.
     #[tokio::test]
     async fn ingest_runtime_never_records_access() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         ingest.send("agent-ingest", "a single row whose access count must not move", "chat_message", 3.0, 0).await.unwrap();
         let runtime = ingest.finish().await.unwrap();
@@ -2371,8 +2378,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_doc_index_answers_from_the_root_it_indexed() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
         std::fs::write(root.path().join("README.md"), "# Guía\n## Instalación\nCompilá con cargo build.\n## Uso\nArrancá el daemon.\n").unwrap();
         std::fs::write(root.path().join("notes.txt"), "not a doc").unwrap();
 
@@ -2407,8 +2414,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_doc_the_index_could_not_embed_fails_the_measurement() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
         std::fs::write(root.path().join("a.md"), "# A\nBROKEN passage\n").unwrap();
         std::fs::write(root.path().join("b.md"), "# B\nsound passage\n").unwrap();
 
@@ -2421,7 +2428,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_insert_backdates_created_at() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         let mut embedding = vec![0.0; 384];
         embedding[0] = 1.0;
@@ -2490,7 +2497,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_reach_reads_other_agents_and_unowned_rows() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         let own = put_row(&store, Some("a"), None, MemoryType::SemanticFact, "own row", at_cosine(0.99)).await;
         let other = put_row(&store, Some("b"), None, MemoryType::SemanticFact, "other row", at_cosine(0.98)).await;
@@ -2511,7 +2518,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_project_search_reads_its_own_unowned_and_every_preference() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         let fact = MemoryType::SemanticFact;
         let in_p = put_row(&store, Some("a"), Some("p"), fact, "row of p", at_cosine(0.99)).await;
@@ -2530,7 +2537,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_one_agent_store_ranks_the_same_under_the_daemons_reach() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         for i in 0..12 {
             let cos = 0.99 - i as f32 * 0.01;
@@ -2556,7 +2563,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_search_hands_back_its_pool_with_each_hits_type_and_last_access() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         let fact = put_row(&store, Some("a"), None, MemoryType::SemanticFact, "a fact", at_cosine(0.99)).await;
         let summary = put_row(&store, Some("a"), None, MemoryType::SessionSummary, "a summary", at_cosine(0.98)).await;
@@ -2603,12 +2610,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_snapshot_with_a_nonempty_wal_is_refused_untouched() {
-        let at = tempfile::tempdir().unwrap();
+        let at = crate::test_dir::test_dir();
         let snapshot = snapshot_in(at.path(), None, Some(&fake_identity())).await;
         let wal = at.path().join("memory.db-wal");
         std::fs::write(&wal, b"commits the file alone does not have").unwrap();
         let before = (std::fs::read(&snapshot).unwrap(), std::fs::read(&wal).unwrap());
-        let copy = tempfile::tempdir().unwrap();
+        let copy = crate::test_dir::test_dir();
 
         let refused = copy_background(&snapshot, copy.path(), &EvalEmbedder::fake()).unwrap_err();
 
@@ -2625,10 +2632,10 @@ mod tests {
     async fn a_snapshot_of_another_embedding_contract_is_refused_untouched() {
         let other = EmbeddingIdentity { model_id: "another-model".to_string(), ..fake_identity() };
         for (identity, cause) in [(Some(other), "another-model"), (None, "no embedding contract")] {
-            let at = tempfile::tempdir().unwrap();
+            let at = crate::test_dir::test_dir();
             let snapshot = snapshot_in(at.path(), None, identity.as_ref()).await;
             let before = std::fs::read(&snapshot).unwrap();
-            let copy = tempfile::tempdir().unwrap();
+            let copy = crate::test_dir::test_dir();
 
             let refused = copy_background(&snapshot, copy.path(), &EvalEmbedder::fake()).unwrap_err();
 
@@ -2668,12 +2675,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_newer_schema_snapshot_is_refused() {
-        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = crate::test_dir::test_dir();
         let damaged = elsewhere.path().join("notes.db");
         std::fs::write(&damaged, "not a database at all, just some words").unwrap();
         let foreign = elsewhere.path().join("foreign.db");
         rusqlite::Connection::open(&foreign).unwrap().execute_batch("CREATE TABLE x (y)").unwrap();
-        let newer_dir = tempfile::tempdir().unwrap();
+        let newer_dir = crate::test_dir::test_dir();
         let newer = snapshot_in(newer_dir.path(), None, Some(&fake_identity())).await;
         rusqlite::Connection::open(&newer)
             .unwrap()
@@ -2686,7 +2693,7 @@ mod tests {
 
         for (file, cause) in [(&damaged, "not a database"), (&foreign, "no clawg migration history"), (&newer, "newer than")] {
             let before = std::fs::read(file).unwrap();
-            let copy = tempfile::tempdir().unwrap();
+            let copy = crate::test_dir::test_dir();
 
             let refused = copy_background(file, copy.path(), &EvalEmbedder::fake()).unwrap_err();
 
@@ -2698,10 +2705,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_older_schema_snapshot_is_migrated_in_the_copy() {
-        let at = tempfile::tempdir().unwrap();
+        let at = crate::test_dir::test_dir();
         let snapshot = snapshot_in(at.path(), Some(26), Some(&fake_identity())).await;
         let before = std::fs::read(&snapshot).unwrap();
-        let copy = tempfile::tempdir().unwrap();
+        let copy = crate::test_dir::test_dir();
 
         let background = copy_background(&snapshot, copy.path(), &EvalEmbedder::fake()).unwrap();
 
@@ -2721,7 +2728,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_composition_counts_rows_without_text() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         let fact = MemoryType::SemanticFact;
         put_row(&store, Some("a"), Some("p"), fact, "private alpha", at_cosine(0.9)).await;
@@ -2765,7 +2772,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_evaluation_ingest_records_and_checks_its_embedding_contract() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         let runtime = ingest.finish().await.unwrap();
         let stored = runtime
@@ -2775,6 +2782,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.map(|s| s.model_id), Some(fake_identity().model_id));
+        runtime.close().await;
         drop(runtime);
 
         let refused = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await;
@@ -2806,7 +2814,7 @@ mod tests {
     #[tokio::test]
     async fn a_project_name_resolves_to_each_backgrounds_own_id() {
         for id in ["app-1111", "app-2222"] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_dir::test_dir();
             let store = EvalStore::open(dir.path()).await.unwrap();
             put_row(&store, Some("a"), Some(id), MemoryType::SemanticFact, "a row of the app", at_cosine(0.9)).await;
             run_sql(&store, format!("UPDATE project SET name = 'App' WHERE id = '{id}'")).await;
@@ -2819,7 +2827,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_ambiguous_or_unknown_project_name_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         for id in ["app-1111", "app-2222", "gone-3333"] {
             put_row(&store, Some("a"), Some(id), MemoryType::SemanticFact, &format!("a row of {id}"), at_cosine(0.9)).await;
@@ -2843,7 +2851,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_origin_resolves_to_every_live_piece_of_its_save() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         let texts = [
             "The ferry to the island leaves at nine in the morning from the north pier, and the return is at six.",
@@ -2875,7 +2883,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_origin_without_a_live_row_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         let replaced = put_row(&store, Some("migrated"), None, MemoryType::SemanticFact, "an older note", at_cosine(0.9)).await;
         imported_from(&store, "engram:old", &[replaced]).await;
@@ -2890,7 +2898,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_expected_save_outside_the_case_project_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         let fact = MemoryType::SemanticFact;
         put_row(&store, Some("a"), Some("p"), fact, "a row of p", at_cosine(0.9)).await;
@@ -2912,7 +2920,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_resolved_save_says_whether_it_is_the_last_summary_of_its_project() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.unwrap();
         let summary = MemoryType::SessionSummary;
         let older = put_row(&store, Some("migrated"), Some("p"), summary, "the older session", at_cosine(0.9)).await;
@@ -2928,7 +2936,7 @@ mod tests {
 
     #[tokio::test]
     async fn lexical_search_ranks_by_bm25_without_vectors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         let mut query = vec![0.0_f32; 384];
         query[0] = 1.0;

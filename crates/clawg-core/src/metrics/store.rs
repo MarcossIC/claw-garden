@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn a_run_is_recorded_open_and_closed_on_stop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         let mut db = MetricsDb::open(&path, NOW).unwrap();
         let first = db.start_run(&run_info(NOW)).unwrap();
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn a_minute_is_written_with_its_series() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         let mut db = MetricsDb::open(&path, NOW).unwrap();
         let run = db.start_run(&run_info(NOW)).unwrap();
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_file_is_set_aside_and_recreated() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         let garbage = vec![0x42u8; 8192];
         std::fs::write(&path, &garbage).unwrap();
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn a_newer_schema_is_refused_untouched() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         Connection::open(&path).unwrap().pragma_update(None, "user_version", 9).unwrap();
         assert!(matches!(MetricsDb::open(&path, NOW), Err(MetricsError::Newer(9))));
@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn the_file_is_private_to_its_owner() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         MetricsDb::open(&path, NOW).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn old_minutes_fold_into_their_hour() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let mut db = MetricsDb::open(&dir.path().join(METRICS_FILE), NOW).unwrap();
         let old = NOW - MINUTES_KEPT_MS - DAY_MS;
         let hour_start = old.div_euclid(3_600_000) * 3_600_000;
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn hours_past_the_retention_are_dropped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let mut db = MetricsDb::open(&dir.path().join(METRICS_FILE), NOW).unwrap();
         let ancient = NOW - HOURS_KEPT_MS - DAY_MS;
         let gone = db.start_run(&run_info(ancient)).unwrap();

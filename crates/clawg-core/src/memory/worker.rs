@@ -2928,7 +2928,7 @@ mod tests {
              the chunker split them, which changes what the rest of this test measures"
         );
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let prompt = build_memory_prompt(
             crate::preferences::Lang::En,
@@ -4299,7 +4299,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_key_leaves_a_hidden_authors_holder() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let mut policy = crate::memory::sharing::SharingPolicy::default();
         policy.hide("agent-other", "agent-test");
         crate::memory::sharing::save(dir.path(), &policy).unwrap();

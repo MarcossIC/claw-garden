@@ -1489,8 +1489,8 @@ mod tests {
             .unwrap()
     }
 
-    async fn undo(store: &MemoryStore, id: i64) -> (UndoReport, tempfile::TempDir) {
-        let backups = tempfile::tempdir().unwrap();
+    async fn undo(store: &MemoryStore, id: i64) -> (UndoReport, crate::test_dir::TestDir) {
+        let backups = crate::test_dir::test_dir();
         (undo_import(store, backups.path(), id, false).await.unwrap(), backups)
     }
 
@@ -1620,7 +1620,7 @@ mod tests {
         assert!(imported.subfolders[0].written);
         let id = imported.import_id.unwrap();
 
-        let dry = undo_import(&dst, tempfile::tempdir().unwrap().path(), id, true).await.unwrap();
+        let dry = undo_import(&dst, crate::test_dir::test_dir().path(), id, true).await.unwrap();
         assert_ne!(registry_state(&dst).await, before, "a dry run writes nothing");
         let (report, _) = undo(&dst, id).await;
 
@@ -1840,7 +1840,7 @@ mod tests {
                 .into(),
         )
         .await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let filter = MoveFilter { ids: vec![moved], ..Default::default() };
         move_memories_core(&dst, backups.path(), &filter, Some("elsewhere".into()), false).await.unwrap();
         sql(&dst, format!("UPDATE memory SET access_count = access_count + 1, last_accessed_at = 9 WHERE id = {accessed}")).await;
@@ -1915,7 +1915,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_or_running_import_is_refused() {
         let dst = destination().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let err = undo_import(&dst, backups.path(), 99, false).await.unwrap_err();
         assert!(matches!(err, UndoError::UnknownImport(99)), "{err}");
         sql(&dst, "INSERT INTO memory_import (import_id, started_at, source) VALUES (5, 0, 'clawg')".into()).await;
@@ -1935,7 +1935,7 @@ mod tests {
         let kept = id_of(&dst, "Codex keeps notes in English").await;
         sql(&dst, format!("UPDATE memory SET update_count = update_count + 1 WHERE id = {kept}")).await;
         let before = state(&dst).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let dry = undo_import(&dst, backups.path(), id, true).await.unwrap();
         assert_eq!(state(&dst).await, before);
         assert_eq!(std::fs::read_dir(backups.path()).unwrap().count(), 0);

@@ -1272,7 +1272,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_newer_database_is_refused_untouched() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         tamper(
             dir.path(),
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_diverged_database_is_refused_untouched() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         tamper(dir.path(), "UPDATE refinery_schema_history SET checksum = '1' WHERE version = 3");
         let before = std::fs::read(dir.path().join("memory.db")).unwrap();
@@ -1329,7 +1329,7 @@ mod tests {
 
     #[tokio::test]
     async fn opening_an_older_database_snapshots_it_before_migrating() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(7)).await;
 
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
@@ -1354,7 +1354,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_from_before_the_session_indexes_keeps_its_rows_and_gains_them() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(17)).await;
 
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
@@ -1378,7 +1378,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_from_before_project_scoped_rules_keeps_its_rows() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(19)).await;
         let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
         conn.call(|c| {
@@ -1442,7 +1442,7 @@ mod tests {
     /// from before it opens with the log empty and every row where it was.
     #[tokio::test]
     async fn a_database_from_the_previous_version_opens_with_an_empty_move_log() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(20)).await;
         let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
         conn.call(|c| {
@@ -1495,7 +1495,7 @@ mod tests {
     /// maintenance pass to fill.
     #[tokio::test]
     async fn a_store_from_before_the_language_column_keeps_its_rows_and_gains_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(21)).await;
         let conn = Connection::open(dir.path().join("memory.db")).await.unwrap();
         conn.call(|c| {
@@ -1556,7 +1556,7 @@ mod tests {
     /// before the column opens with every row as it was and the column empty.
     #[tokio::test]
     async fn a_database_from_the_previous_version_opens_with_no_origin_project() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(22)).await;
         type Rows = (Vec<String>, Vec<Vec<rusqlite::types::Value>>);
         // Every column, so a migration that rewrote any of them would show.
@@ -1624,7 +1624,7 @@ mod tests {
     /// joined.
     #[tokio::test]
     async fn a_database_from_the_previous_version_opens_with_no_remote_recorded() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(23)).await;
         let snapshot = |c: &mut rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
             let mut stmt = c.prepare(&format!(
@@ -1681,7 +1681,7 @@ mod tests {
     /// index holds every row from V25 on; rebuilding it changes no row.
     #[tokio::test]
     async fn a_store_from_before_the_unfiltered_dedup_index_keeps_its_rows() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(24)).await;
         let snapshot = |c: &mut rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
             let mut stmt = c.prepare(
@@ -1747,7 +1747,7 @@ mod tests {
     /// changes.
     #[tokio::test]
     async fn a_store_from_before_the_import_journal_keeps_its_rows() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(25)).await;
         let snapshot = |c: &mut rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
             let mut stmt = c.prepare(
@@ -1802,7 +1802,7 @@ mod tests {
         use crate::memory::admin::{list_memories_core, ListParams};
         use crate::memory::identity::candidate_id;
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(26)).await;
         let id = |root: &str, n: u32| candidate_id(Path::new(root), n);
         let (app, app_clone) = (id("/work/app", 0), id("/review/app", 0));
@@ -1993,7 +1993,7 @@ mod tests {
     /// row changed.
     #[tokio::test]
     async fn a_database_from_the_previous_version_opens_with_every_project_live() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(27)).await;
         type Whole = Vec<Vec<rusqlite::types::Value>>;
         let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
@@ -2085,7 +2085,7 @@ mod tests {
     /// as it was.
     #[tokio::test]
     async fn a_database_from_the_previous_version_opens_with_no_project_deleted() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(28)).await;
         type Whole = Vec<Vec<rusqlite::types::Value>>;
         let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
@@ -2192,7 +2192,7 @@ mod tests {
     /// store from before V30 opens with none and every row as it was.
     #[tokio::test]
     async fn a_database_from_the_previous_version_opens_with_no_subfolder_declared() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(29)).await;
         type Whole = Vec<Vec<rusqlite::types::Value>>;
         let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
@@ -2284,7 +2284,7 @@ mod tests {
     /// keeps its journal as it was, and its undo takes back what it wrote.
     #[tokio::test]
     async fn a_database_from_the_previous_version_opens_with_its_imports_as_they_were() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(30)).await;
         type Whole = Vec<Vec<rusqlite::types::Value>>;
         let whole = |c: &rusqlite::Connection| -> rusqlite::Result<Vec<Whole>> {
@@ -2471,7 +2471,7 @@ mod tests {
 
     #[tokio::test]
     async fn opening_a_current_database_takes_no_snapshot() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
 
         let _store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
@@ -2481,14 +2481,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_database_takes_no_snapshot() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         let _store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         assert!(files_in(&dir.path().join("backups")).is_empty());
     }
 
     #[tokio::test]
     async fn a_failed_snapshot_stops_the_migration() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(7)).await;
         std::fs::write(dir.path().join("backups"), b"in the way").unwrap();
 
@@ -2756,7 +2756,7 @@ mod tests {
     /// is a no-op that returns the current limit).
     #[tokio::test]
     async fn limit_variable_number_in_open_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let limit: i32 = store
             .conn
@@ -2804,7 +2804,7 @@ mod tests {
     /// WAL-1 — production open() path reports journal_mode "wal" on read-back.
     #[tokio::test]
     async fn open_sets_journal_mode_wal() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let mode: String = store
             .conn
@@ -2817,7 +2817,7 @@ mod tests {
     /// WAL-2 — production open() path sets synchronous=NORMAL (value 1).
     #[tokio::test]
     async fn open_sets_synchronous_normal() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let synchronous: i64 = store
             .conn
@@ -2830,7 +2830,7 @@ mod tests {
     /// WAL-4 — production open() caps the WAL a checkpoint leaves on disk.
     #[tokio::test]
     async fn open_limits_the_wal_left_after_a_checkpoint() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let limit: i64 = store
             .conn
@@ -3578,7 +3578,7 @@ mod tests {
     /// is exactly what the holder is entitled to do alone.
     #[tokio::test]
     async fn open_refuses_a_held_store_and_never_creates_memory_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         let _holder = StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("holder");
 
         let err = MemoryStore::open(dir.path(), StoreHolder::Eval)
@@ -3600,7 +3600,7 @@ mod tests {
     /// clone is gone, not the first.
     #[tokio::test]
     async fn the_lock_lives_as_long_as_any_clone_of_the_store() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         let a = MemoryStore::open(dir.path(), StoreHolder::Daemon).await.expect("open a");
         let b = a.clone();
 
@@ -3623,7 +3623,7 @@ mod tests {
     /// The in-memory test store has nothing to exclude anybody from.
     #[tokio::test]
     async fn new_for_test_takes_no_lock() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_dir::test_dir();
         let _t = MemoryStore::new_for_test().await.expect("test store");
         StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("nothing to collide with");
     }
@@ -3632,7 +3632,7 @@ mod tests {
     #[tokio::test]
     async fn opening_a_store_makes_its_directory_private() {
         use std::os::unix::fs::PermissionsExt;
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let fresh = home.path().join(".clawg-dev");
         let open = home.path().join(".clawg");
         std::fs::create_dir(&open).unwrap();
@@ -3647,7 +3647,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_data_directory_that_cannot_be_created_is_an_error() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let file = home.path().join("not-a-directory");
         std::fs::write(&file, b"").unwrap();
         let base = file.join(".clawg-dev");

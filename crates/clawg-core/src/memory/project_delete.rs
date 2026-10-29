@@ -1094,14 +1094,14 @@ mod tests {
     struct Fixture {
         store: Arc<MemoryStore>,
         workspaces: WorkspaceManager,
-        root: tempfile::TempDir,
+        root: crate::test_dir::TestDir,
     }
 
     impl Fixture {
         /// Projects named after their ids without the suffix, each with a
         /// folder of its own.
         async fn new(projects: &[&str]) -> Self {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_dir::test_dir();
             let f = Fixture {
                 store: Arc::new(MemoryStore::new_for_test().await.unwrap()),
                 workspaces: WorkspaceManager::new(root.path().join("workspaces")),

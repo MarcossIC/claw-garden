@@ -1206,7 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn build_memory_prompt_embeds_the_user_query_with_role_query() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let recording = Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
         let embedder: Arc<dyn Embedder> = recording.clone();
@@ -1998,7 +1998,7 @@ mod tests {
     #[tokio::test]
     async fn a_conflict_on_a_workspace_row_reaches_the_prompt() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let (old_id, _) = disputed_pair(&store, "agent-x", "user_preference", 9.0).await;
         store.conn.call(move |c| -> Result<(), rusqlite::Error> {
@@ -2076,7 +2076,7 @@ mod tests {
     async fn build_memory_prompt_accepts_none_access_tracker() {
         use crate::memory::access::AccessTracker;
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         // 7th argument `None::<&AccessTracker>` — must compile once the parameter exists.
@@ -2111,7 +2111,7 @@ mod tests {
     #[tokio::test]
     async fn the_retrieval_outcome_names_each_silence() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let recall = |embedder: Option<Arc<dyn Embedder>>| {
             let (store, wm) = (&store, &wm);
@@ -2133,7 +2133,7 @@ mod tests {
     #[tokio::test]
     async fn all_empty_returns_empty_string() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
@@ -2143,7 +2143,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_only_returns_workspace_block() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         // Pre-write a workspace file
@@ -2158,9 +2158,9 @@ mod tests {
     }
 
     /// Writes `content` as agent-1's workspace file and returns the prompt.
-    async fn prompt_over_workspace(content: &str) -> (String, std::path::PathBuf, tempfile::TempDir) {
+    async fn prompt_over_workspace(content: &str) -> (String, std::path::PathBuf, crate::test_dir::TestDir) {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
@@ -2204,7 +2204,7 @@ mod tests {
     #[tokio::test]
     async fn embedder_none_skips_retrieval_no_panic() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await;
@@ -2216,7 +2216,7 @@ mod tests {
     #[tokio::test]
     async fn embedder_none_emits_workspace_only_if_present() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let path = wm.workspace_path("agent-1", None);
@@ -2232,7 +2232,7 @@ mod tests {
     #[tokio::test]
     async fn a_conflict_on_rows_nobody_was_shown_is_left_out() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         disputed_pair(&store, "agent-x", "semantic_fact", 8.0).await;
 
@@ -2243,7 +2243,7 @@ mod tests {
     #[tokio::test]
     async fn no_disputed_rows_omits_conflicts_block() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-1", None, &Reach::Own, QueryTexts::single_shot("query"), &EmittedIds::default(), None, DEFAULT_BUDGET).await.unwrap().text;
@@ -2263,7 +2263,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
 
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
@@ -2481,7 +2481,7 @@ mod tests {
     #[tokio::test]
     async fn the_production_retrieval_call_site_feeds_the_user_query_to_the_lexical_channel() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
         let agent = "agent-lexical-wiring";
@@ -2555,7 +2555,7 @@ mod tests {
     #[tokio::test]
     async fn the_lexical_channel_never_sees_the_composed_context() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
         let agent = "agent-composed-context-lexical";
@@ -2610,7 +2610,7 @@ mod tests {
     #[tokio::test]
     async fn the_dense_channel_embeds_the_composed_text() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let recording = Arc::new(RecordingEmbedder { calls: std::sync::Mutex::new(Vec::new()) });
         let embedder: Arc<dyn Embedder> = recording.clone();
@@ -2642,7 +2642,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
 
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
         let content = "prefiere ejecutar los tests antes de commitear";
@@ -2673,7 +2673,7 @@ mod tests {
         use crate::memory::store_insert::{CreatedByType, NewEpisodicTrajectoryRecord, NewProceduralSkillRecord};
 
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
         let query = "cómo arreglo un test roto";
@@ -2750,7 +2750,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
 
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
         let query = "algo sobre el proyecto";
@@ -2885,7 +2885,7 @@ mod tests {
         use crate::memory::store_insert::NewProceduralSkillRecord;
 
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
         let agent = "agent-id-collision";
@@ -2946,7 +2946,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_memory_hit_is_recorded_by_the_access_tracker() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
         let agent = "agent-access-control";
@@ -2982,7 +2982,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn recall_leaves_out_hits_that_did_not_score() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
         let agent = "agent-zero-access";
@@ -3022,7 +3022,7 @@ mod tests {
     #[tokio::test]
     async fn a_hit_that_did_not_score_brings_no_conflict() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>;
         let agent = "agent-unrelated-conflict";
@@ -3067,7 +3067,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hit_cut_by_the_budget_is_not_counted_as_accessed() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let agent = "agent-cut-access";
 
@@ -3107,7 +3107,7 @@ mod tests {
     #[tokio::test]
     async fn a_store_of_long_rows_fits_the_budget() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let agent = "agent-long-rows";
         let mut like_query = vec![0.0_f32; 384];
@@ -3158,7 +3158,7 @@ mod tests {
     #[tokio::test]
     async fn a_mature_store_still_shows_the_hit_of_the_query() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let agent = "agent-mature";
         write_workspace(&wm, agent, Some("proj-a"), &"- a standing preference of the user\n".repeat(140));
@@ -3221,7 +3221,7 @@ mod tests {
         use crate::memory::embedder::FakeEmbedder;
 
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         let embedder = Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>;
@@ -3384,7 +3384,7 @@ mod tests {
     #[tokio::test]
     async fn the_shared_note_appears_only_with_shared_hits() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let embedder = || Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>);
         let mut near = vec![0.0_f32; 384];
@@ -3411,7 +3411,7 @@ mod tests {
     #[tokio::test]
     async fn the_workspace_stays_own_and_conflicts_are_shared() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let mut near = vec![0.0_f32; 384];
         near[0] = 1.0;
@@ -3499,7 +3499,7 @@ mod tests {
     }
 
     async fn session_prompt_reaching(store: &MemoryStore, agent_id: &str, project_id: Option<&str>, reach: &Reach) -> MemoryPrompt {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         build_session_prompt(Lang::En, store, &wm, agent_id, project_id, reach, &EmittedIds::default(), DEFAULT_BUDGET).await.unwrap()
     }
@@ -3611,7 +3611,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let emitted = wm.regenerate_auto_section("agent-1", None, &store).await.unwrap();
         assert!(emitted.contains(TableKind::Memory, shown), "the fixture needs the workspace to print #{shown}");
@@ -3639,7 +3639,7 @@ mod tests {
     #[tokio::test]
     async fn the_last_session_block_shows_the_newest_summary() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let mut near = vec![0.0_f32; 384];
         near[0] = 1.0;
@@ -3748,7 +3748,7 @@ mod tests {
     #[tokio::test]
     async fn the_last_session_block_is_not_repeated_as_a_hit() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let mut near = vec![0.0_f32; 384];
         near[0] = 1.0;
@@ -3802,7 +3802,7 @@ mod tests {
     #[tokio::test]
     async fn a_context_without_a_query_keeps_the_last_session_over_its_saves() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         write_workspace(&wm, "agent-1", Some("proj-a"), &"- a standing preference of the user\n".repeat(110));
         let summary = seed_summary(&store, "agent-1", Some("proj-a"), &format!("Goal: the last session. {}", "Next steps: more work. ".repeat(130)), 1).await;

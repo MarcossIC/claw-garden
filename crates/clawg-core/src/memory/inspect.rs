@@ -676,8 +676,8 @@ mod tests {
 
     /// A store at this binary's schema, written by `fill` and closed, so the
     /// inspection reads the file alone.
-    async fn store_with(fill: impl FnOnce(&rusqlite::Connection) + Send + 'static) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    async fn store_with(fill: impl FnOnce(&rusqlite::Connection) + Send + 'static) -> crate::test_dir::TestDir {
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         store
             .conn
@@ -965,7 +965,7 @@ mod tests {
         };
         assert_eq!(facts.id_rows, vec![rows("app-1a2b", 1, 0), rows("orphan-9f9f", 0, 1), rows("web-3c4d", 2, 0)]);
 
-        let older = tempfile::tempdir().unwrap();
+        let older = crate::test_dir::test_dir();
         seed_on_disk(older.path(), Some(27)).await;
         let c = rusqlite::Connection::open(older.path().join("memory.db")).unwrap();
         c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('web-3c4d', 'web', 'root', 1, 2)", [])
@@ -1035,7 +1035,7 @@ mod tests {
         assert!(inspect(dir.path()).facts.is_some());
         assert_eq!(files_in(dir.path()), before, "a stopped store gains no file and no byte");
 
-        let live = tempfile::tempdir().unwrap();
+        let live = crate::test_dir::test_dir();
         let store = MemoryStore::open(live.path(), StoreHolder::Daemon).await.unwrap();
         store
             .conn
@@ -1057,7 +1057,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_at_an_older_schema_is_read_with_what_it_has() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(10)).await;
         let before = files_in(dir.path());
         let found = inspect(dir.path());
@@ -1072,7 +1072,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_newer_store_is_not_read_past_its_history() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         c.execute(
@@ -1088,7 +1088,7 @@ mod tests {
 
     #[test]
     fn a_missing_store_has_no_facts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let found = inspect(dir.path());
         assert_eq!(found.schema.state, ProbeState::Missing);
         assert_eq!(found.facts, None);
@@ -1135,7 +1135,7 @@ mod tests {
         assert_eq!(facts.open_deletes, Some(vec![OpenDelete { project_id: "gone-1a2b".into(), delete_id: 2 }]), "an undone one is not open");
 
         // At V28 there is no column and no table: nothing is deleted, and nothing is read.
-        let older = tempfile::tempdir().unwrap();
+        let older = crate::test_dir::test_dir();
         seed_on_disk(older.path(), Some(28)).await;
         let c = rusqlite::Connection::open(older.path().join("memory.db")).unwrap();
         c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES ('web-3c4d', 'web', 'root', 1, 2)", [])
@@ -1166,7 +1166,7 @@ mod tests {
         };
         assert_eq!(facts.subfolders, Some(vec![declared("apps/web", "web"), declared("libs/ui", "ui")]));
 
-        let older = tempfile::tempdir().unwrap();
+        let older = crate::test_dir::test_dir();
         seed_on_disk(older.path(), Some(29)).await;
         assert_eq!(inspect(older.path()).facts.unwrap().subfolders, None, "V30 is not applied");
     }

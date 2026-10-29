@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn a_missing_directory_and_its_parents_are_created_private() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         set_mode(home.path(), 0o755);
         let data = home.path().join(".clawg-dev");
         let nested = data.join("workspaces").join("agent");
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn an_open_directory_is_tightened_and_the_rest_left_alone() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         set_mode(home.path(), 0o755);
         let data = home.path().join(".clawg-dev");
         std::fs::create_dir(&data).unwrap();
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn a_private_directory_is_left_as_it_is() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let data = home.path().join(".clawg-dev");
         std::fs::create_dir(&data).unwrap();
         set_mode(&data, 0o500);

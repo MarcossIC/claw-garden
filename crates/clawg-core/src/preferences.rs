@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_no_preference() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         assert_eq!(load(dir.path()).unwrap(), Preferences::default());
         assert_eq!(language_in(dir.path()), None);
     }
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn an_invalid_file_reads_as_no_preference() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         std::fs::write(preferences_file(dir.path()), "{ not json").unwrap();
         assert!(matches!(load(dir.path()), Err(PreferencesError::Json(_))));
         assert_eq!(language_in(dir.path()), None);
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn saving_goes_through_a_temporary_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let data = dir.path().join("data");
         save(&data, &Preferences { language: Some(Lang::En) }).unwrap();
         assert_eq!(language_in(&data), Some(Lang::En));

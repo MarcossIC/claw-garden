@@ -2083,7 +2083,7 @@ mod tests {
     #[tokio::test]
     async fn cls_vectors_are_snapshotted_then_reembedded_by_mean() {
         let store = store_with_contract(LEGACY_CLS_MODEL_ID, 384).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
 
         let status = verify_or_reembed(
             &store,
@@ -2103,7 +2103,7 @@ mod tests {
     #[tokio::test]
     async fn any_other_mismatch_is_left_as_it_is() {
         let store = store_with_contract("another-model", 384).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
 
         let status = verify_or_reembed(
             &store,
@@ -2121,7 +2121,7 @@ mod tests {
     #[tokio::test]
     async fn a_store_that_matches_is_not_touched() {
         let store = store_with_contract(E5_MODEL_ID, 384).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
 
         let status = verify_or_reembed(
             &store,

@@ -571,8 +571,8 @@ mod tests {
     use tokio::sync::mpsc::error::TrySendError;
     use crate::models::chat::Role;
 
-    fn tmp_base() -> tempfile::TempDir {
-        tempfile::tempdir().expect("tempdir")
+    fn tmp_base() -> crate::test_dir::TestDir {
+        crate::test_dir::test_dir()
     }
 
     fn chat_event(content: &str) -> MemoryEvent {
@@ -616,6 +616,7 @@ mod tests {
             .await
             .expect("vec_version");
         assert!(!version.is_empty());
+        rt.close().await;
     }
 
     /// `VACUUM INTO` reads the whole file, and every call queued behind it on
@@ -649,6 +650,7 @@ mod tests {
             .expect("snapshot");
         let bytes = std::fs::read(&path).expect("the snapshot exists");
         assert!(bytes.starts_with(b"SQLite format 3\0"), "a whole SQLite database");
+        rt.close().await;
     }
 
     /// The snapshot's own connection must still read what the store's
@@ -682,6 +684,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM memory WHERE content = 'only in the WAL'", [], |r| r.get(0))
             .expect("count");
         assert_eq!(rows, 1, "the snapshot must include what is still in the WAL");
+        rt.close().await;
     }
 
     /// Production `open()` must NOT fill the embedder cell: the 470 MB
@@ -696,6 +699,7 @@ mod tests {
         assert!(!rt.embedder_ready());
         assert_eq!(rt.embedder_status(), EmbedderStatus::Loading);
         assert!(rt.tokenizer.get().is_none());
+        rt.close().await;
     }
 
     /// The returned sender and receiver must be two ends of ONE channel, and
@@ -710,6 +714,7 @@ mod tests {
         rt.memory_tx.try_send(chat_event("hello").into()).expect("send");
         let req = rx.recv().await.expect("event");
         assert_eq!(req.event.content, "hello");
+        rt.close().await;
     }
 
     /// The flush worker is spawned inside `AccessTracker::new` during `open`,
@@ -723,6 +728,7 @@ mod tests {
             .expect("open");
         rt.access_tracker.record(vec![1, 2, 3]);
         rt.access_tracker.record(vec![]); // empty is a no-op, not an error
+        rt.close().await;
     }
 
     #[tokio::test]
@@ -739,6 +745,7 @@ mod tests {
                 .join("default")
                 .join("workspace.md")
         );
+        rt.close().await;
     }
 
     #[tokio::test]

@@ -633,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn recording_a_row_leaves_the_store_on_normal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), crate::memory::store_lock::StoreHolder::Eval).await.unwrap();
         new_row(&store, "op-1", "a save").await;
         store.outbox_import(vec![event("a", "an old one")]).await.unwrap();

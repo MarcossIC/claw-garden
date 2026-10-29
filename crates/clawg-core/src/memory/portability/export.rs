@@ -565,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn a_store_from_v12_or_v16_exports_with_null_for_what_it_lacks() {
         for version in [12, 16] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_dir::test_dir();
             seed_on_disk(dir.path(), Some(version)).await;
             let exported = export(dir.path(), &ExportFilter::default(), 0).unwrap();
             assert_eq!(exported.memories.len(), 1, "V{version}");
@@ -579,7 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_from_before_the_warning_mark_exports_its_pairs_unmarked() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(18)).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         c.execute_batch(
@@ -600,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_newer_store_is_not_exported() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         c.execute(
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn a_missing_store_is_named() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let err = export(dir.path(), &ExportFilter::default(), 0).unwrap_err();
         assert!(err.to_string().contains("no memory store"), "{err}");
     }
@@ -625,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn export_reads_the_project_id_from_the_store() {
         for (version, folders) in [(Some(26), "project"), (Some(27), "project_path"), (None, "project_path")] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_dir::test_dir();
             seed_on_disk(dir.path(), version).await;
             let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
             c.execute_batch(&format!(
@@ -793,7 +793,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_from_before_the_registry_exports_its_folders_as_before() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(26)).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         c.execute_batch(
@@ -813,7 +813,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_from_before_roots_were_recorded_gives_the_derived_id() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(8)).await;
         let root = Path::new("/work/app");
         let ground = FakeGround::default();
@@ -823,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_project_of_a_path_reads_the_declarations_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         c.execute_batch(
@@ -849,7 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_from_before_subfolders_reads_the_project_of_the_root() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(29)).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         c.execute_batch(
