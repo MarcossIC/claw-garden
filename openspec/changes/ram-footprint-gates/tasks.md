@@ -88,11 +88,11 @@ Revisado: ni `agent_contract.json` ni `agent_contract.es.json` cambian (ninguna 
 
 ### 5b. Puerta: PARAR y pedir autorización
 
-- [ ] **STOP.** Preguntar al usuario y esperar. Hace falta autorización para: un build release de `clawg-eval` (`cargo run -p clawg-eval --release --target-dir target-test --bin load-eval -- gate`), la descarga del modelo (~470 MB) a un `load-eval-<uuid>` del temporal, y usar Windows. No toca ningún perfil. No continuar ni suponer la respuesta. No matar ningún `clawg.exe`.
-- [ ] Correr la puerta con la autorización, leer `decision` y guardar el JSON en `docs/eval/results/` (fuera de git). Limpiar los builds release de `target-test` al terminar.
-- [ ] Resultado `View` (queda C′, lo previsto): seguir con el commit 6. Anotar lo medido en `exploration.md`.
-- [ ] Resultado `File`: un commit propio cambia el mecanismo a `commit_from_file`, con la ruta que sale del handle y la comparación de `FILE_ID_INFO`, y RM1 se reescribe en `spec.md` y en la línea de `.claude/CLAUDE.md` del commit 3 (tests nuevos primero, como arriba).
-- [ ] Resultado `Revert`: revertir los commits 4 y 3 (en ese orden, con `git revert`, cada uno atómico). El 2 y el 1 se quedan. El arnés queda para el seguimiento de datos externos. El cambio se cierra con lo medido.
+- [x] **STOP.** Preguntar al usuario y esperar. Hace falta autorización para: un build release de `clawg-eval` (`cargo run -p clawg-eval --release --target-dir target-test --bin load-eval -- gate`), la descarga del modelo (~470 MB) a un `load-eval-<uuid>` del temporal, y usar Windows. No toca ningún perfil. No continuar ni suponer la respuesta. No matar ningún `clawg.exe`.
+- [x] Correr la puerta con la autorización, leer `decision` y guardar el JSON en `docs/eval/results/` (fuera de git). Limpiar los builds release de `target-test` al terminar.
+- [x] Resultado `View` (queda C′, lo previsto): seguir con el commit 6. Anotar lo medido en `exploration.md`.
+- [x] No aplica (salió `View`). Resultado `File`: un commit propio cambia el mecanismo a `commit_from_file`, con la ruta que sale del handle y la comparación de `FILE_ID_INFO`, y RM1 se reescribe en `spec.md` y en la línea de `.claude/CLAUDE.md` del commit 3 (tests nuevos primero, como arriba).
+- [x] No aplica (salió `View`). Resultado `Revert`: revertir los commits 4 y 3 (en ese orden, con `git revert`, cada uno atómico). El 2 y el 1 se quedan. El arnés queda para el seguimiento de datos externos. El cambio se cierra con lo medido.
 
 ## 6. `test(embedder): pin the embedding contract together with its model id` (D7; RM4)
 

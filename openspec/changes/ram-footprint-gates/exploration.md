@@ -178,6 +178,20 @@ La primera pasada vio que el piso sube de 1,3 a 2,1 MiB por carga en uso real. S
 
 Cada brazo que entre lleva un test que falla antes del cambio y repite la misma lectura después. Si la medición dice que ninguno vale la pena, el cambio cierra con lo medido, y ese es un resultado válido.
 
+### La puerta de C′: lo medido (2026-10-29)
+
+`load-eval gate` en Windows, build release de clawg 0.66.0, modelo real bajado a un `load-eval-<uuid>` del temporal (borrado al terminar), once rondas con la 0 de calentamiento descartada y diez cargas por brazo, cada una en su proceso. El pico es `PeakProcessMemoryUsed` del job (memoria comprometida); el resultado está en `docs/eval/results/2026-10-29-real-load-eval.json`, fuera de git.
+
+| Brazo | Mediana del pico | Baja contra `Vec` | Peor carga | Mediana del tiempo total | Verificar / sesión |
+|---|---|---|---|---|---|
+| `Vec` (la carga de antes) | 1.285,7 MiB | — | 1.285,8 MiB (la mejor, 1.285,4) | 555 ms | ~307 / ~247 ms |
+| `File` (`commit_from_file`) | 1.013,4 MiB | 272,3 MiB: no llega a 300 | 1.013,6 MiB | 687 ms (+132 ms) | ~262 / ~425 ms |
+| `View` (C′) | 837,1 MiB | 448,6 MiB | 837,4 MiB | 623 ms (+68 ms, +12 %) | ~371 / ~251 ms |
+
+Decisión: `View`. Es el único brazo que pasa las tres reglas; `File` cumple la peor carga y el tiempo, pero baja menos de 300 MiB. Las diez cargas de cada brazo caen dentro de 1 MiB entre sí. Lo que `View` gana en memoria lo paga en la verificación, unos 64 ms más que leer el archivo entero, porque hashear el mapeo trae las páginas del disco una por una; la sesión tarda lo mismo.
+
+El pico del conjunto de trabajo (`rss_peak_bytes`) de `View` queda donde el de `Vec`, unos 1.299 MiB, porque cuenta las páginas del archivo mapeado. Esas páginas son del archivo, limpias y compartibles, y el sistema las suelta bajo presión sin escribirlas; lo que baja es la memoria comprometida, que es lo que la puerta mide. `File` tiene el conjunto de trabajo más bajo, unos 850 MiB.
+
 ## Interacciones
 
 - **ram-footprint (90, archivado).** Aportó A y el paso 0, especificados en `specs/project-docs`, `specs/metrics` (R6 y R8), `specs/storage` («Cada carga dice quién la pidió y cuánto costó») y `specs/portability` (IT1).
