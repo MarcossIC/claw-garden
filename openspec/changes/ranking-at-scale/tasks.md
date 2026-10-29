@@ -24,6 +24,7 @@ Al implementar el paso 1 cambió además:
 | Fondos de los tests de `rag-eval` | un export `clawg-memories` importado por el router en proceso | saves de un `EvalIngest` falso, marcadas como importadas sobre la conexión de su propio store y cerradas limpias | Conservan piezas, origen y proyecto sin escribir un export a mano ni sumar `rusqlite` a `clawg-eval` |
 | `golden_twins` en agent-view | D5: agent-view no distingue un gemelo | `EvalIngest::holding` compara, antes de sembrar, el `content_hash` que tendría cada fila del corpus con las filas vivas del fondo | Así RS3 se cumple también en agent-view, donde la ingesta fusiona el gemelo con la fila del fondo |
 | Parser de agent-view | — | `parse_search_line` lee el score antes de `by <author>`, y la salida salta la nota de filas compartidas (`shared_note`, en los dos idiomas) | Sobre un fondo real casi todo lo guardó otro agente (`migrated`), y el parser rechazaba esas líneas |
+| Parser del contexto de agent-view | — | `hit_text` (`agent_view/parse.rs`) quita la marca `by <autor>` del encabezado de un hit, con `a_context_hit_another_agent_saved_is_one_segment` | El arreglo de `parse_search_line` no llegó al contexto, que descartaba todo hit de otro agente: la primera corrida del set minado dio 0 en context en los dos cortes |
 | La observable de `agent_view_sends_the_case_project_to_search_and_context` | que el contexto encuentre la save | la búsqueda se arma con la pura `search_request`, y el contexto abre con `LAST SESSION` sólo si recibió el proyecto | `read_context` no lee esa sección, y cambiarlo movería el ancla |
 
 ## Paso 1: medir a escala
@@ -154,28 +155,30 @@ Necesita el modelo real y autorización para leer `~/.clawg-dev` en el momento. 
 ### 12. Suite y CI
 
 - [x] La suite y los dos clippy de `.claude/CLAUDE.md` en Windows, en `target-test`.
-- [ ] El CI del pull request en verde en Linux y en Windows.
+- [x] El CI del pull request en verde en Linux y en Windows.
 
 ### 13. Los dos snapshots (D10) **[autorización, modelo real]**
 
-- [ ] Corte viejo: `clawg backup --profile dev`, copiado como `old-cut.db` en el temporal. Una corrida con el ancla da su `placement` y su `by_source`. Si `by_source` no tiene filas `import`, el corte viejo sólo atribuye con el ancla (riesgo del diseño).
-- [ ] Corte nuevo: en un home aislado, los mismos proyectos por nombre. Después `engram export --all` y `clawg import --from engram … --project-map "<origin>=project:<nombre>"`, y un backup copiado como `new-cut.db`. Al final se borran el home y el export.
-- [ ] Comprobar que el `placement` de `new-cut.db` es el del viejo, salvo las notas que engram sumó o borró.
+- [x] Corte viejo: `clawg backup --profile dev`, copiado como `old-cut.db` en el temporal. Una corrida con el ancla da su `placement` y su `by_source`. Si `by_source` no tiene filas `import`, el corte viejo sólo atribuye con el ancla (riesgo del diseño).
+- [x] Corte nuevo: en un home aislado, los mismos proyectos por nombre. Después `engram export --all` y `clawg import --from engram … --project-map "<origin>=project:<nombre>"`, y un backup copiado como `new-cut.db`. Al final se borran el home y el export.
+- [x] Comprobar que el `placement` de `new-cut.db` es el del viejo, salvo las notas que engram sumó o borró.
 
 ### 14. El set minado **[usuario]**
 
-- [ ] Minar del historial al menos 80 casos con respuesta y 20 sin respuesta, con las 12 búsquedas de validación como semilla, en las parejas `es>es`, `en>en` y `es>en`. Cada uno lleva `expected_origins` (salvo los sin respuesta) y `project` por nombre.
-- [ ] Validarlos uno por uno con el usuario. Los que no validan en los dos cortes (`NoLiveRow`, `OutsideProject`) se sacan y se cuentan.
+- [x] Minar del historial al menos 80 casos con respuesta y 20 sin respuesta, con las 12 búsquedas de validación como semilla, en las parejas `es>es` y `es>en`. La persona le pregunta al agente en español y espera la respuesta en español, así que una consulta en inglés no es de su uso: las 36 de la primera tanda se descartaron, y `en>en` la sigue midiendo el ancla de 46. Cada uno lleva `expected_origins` (salvo los sin respuesta) y `project` por nombre.
+- [x] Validarlos uno por uno con el usuario. Los que no validan en los dos cortes (`NoLiveRow`, `OutsideProject`) se sacan y se cuentan.
+- Quedaron en `docs/eval/golden-mined.json` 89 con respuesta (`es>es` 47, `es>en` 42) y 23 sin respuesta, de 156 en borrador; se descartaron 44 (las 36 en inglés y 8 `es>es`). Ninguno falla en los dos cortes. La partición por hash deja 5 sin respuesta en prueba, así que U3 (16 de 20 en prueba, tarea 23) no se puede medir con este set: se decide en la puerta 2.
 
 ### 15. Línea base
 
-- [ ] El ancla de 46 sin fondo y con cada corte, comparada con `rag-eval --diff` (RS12): el costo de la escala.
-- [ ] El set minado en los dos cortes, en la ruta ordenada y en agent-view: por tipo, pareja y partición, con `scale.top3_by_type`, las distribuciones y `short_pool_cases`.
-- [ ] Los resultados en `docs/eval/results/`, y en `verify.md` las cifras y las cuentas, sin texto.
+- [x] El ancla de 46 sin fondo y con cada corte, comparada con `rag-eval --diff` (RS12): el costo de la escala.
+- [x] El set minado en los dos cortes, en la ruta ordenada y en agent-view: por tipo, pareja y partición, con `scale.top3_by_type`, las distribuciones y `short_pool_cases`.
+- [x] Los resultados en `docs/eval/results/`, y en `verify.md` las cifras y las cuentas, sin texto.
 
 ### 16. Puerta 1
 
-- [ ] Leer `scale.top3_by_type` del corte nuevo, en calibración, contra U1. Si `session_summary` ocupa ≤ 25 % de los lugares en los casos que no lo piden, el paso 2 se cierra sin código.
+- [x] Leer `scale.top3_by_type` del corte nuevo, en calibración, contra U1. Si `session_summary` ocupa ≤ 25 % de los lugares en los casos que no lo piden, el paso 2 se cierra sin código.
+- Ocupa el 7,1 %, menos que su proporción de filas: el paso 2 se cierra sin código y las tareas 17 a 19 no se hacen. En los casos sin respuesta ocupa el 33,3 % (`verify.md`).
 - [ ] Si abre, presentar al usuario los datos de las tres elecciones de la decisión 6 de la propuesta y escribir lo decidido en `verify.md`. La excepción la deciden los casos con `expected_type` `session_summary` y `expected_is_last_summary` falso. La forma es B1 por defecto. B3 entra según los `decay_age_days` de los resúmenes del top 3 frente a los 209 días. Si la elección no es la de por defecto, las tareas 17 a 19 se reescriben antes de empezar.
 
 ## Paso 2 (sólo si abre la puerta 1)
@@ -209,7 +212,8 @@ Escrito para la forma por defecto: B1 con la excepción (iii).
 
 Corre aunque la puerta 1 haya cerrado el paso 2.
 
-- [ ] Leer las distribuciones de `best_cosine` (C1) y de `score_gap_1_10` (C2), con y sin respuesta, por pareja y en calibración. La pregunta es si separan con la cota de Wilson de U3 (0,584 para 16 de 20). Si no separan, el paso 3 se cierra dejando escritos los casos y las distribuciones.
+- [x] Leer las distribuciones de `best_cosine` (C1) y de `score_gap_1_10` (C2), con y sin respuesta, por pareja y en calibración. La pregunta es si separan con la cota de Wilson de U3 (0,584 para 16 de 20). Si no separan, el paso 3 se cierra dejando escritos los casos y las distribuciones.
+- No separan, ni C1, ni C2, ni C3: el paso 3 se cierra y las tareas 21 a 23 no se hacen (`verify.md`).
 - [ ] Si el 1 y el 2 tardaron, el paso 3 pasa a un cambio propio (decisión 5 de la propuesta).
 
 ## Paso 3 (sólo si abre la puerta 2)
