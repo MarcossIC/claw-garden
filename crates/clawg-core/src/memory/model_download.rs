@@ -516,7 +516,7 @@ pub(crate) async fn ensure_model_from(
     }
 }
 
-fn cache_dir_of(base_dir: &Path) -> PathBuf {
+pub(crate) fn cache_dir_of(base_dir: &Path) -> PathBuf {
     base_dir.join("models").join("multilingual-e5-small")
 }
 
@@ -859,7 +859,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_digest(sha2::Sha256::digest(bytes).as_slice())
 }
 
-fn hex_digest(digest: &[u8]) -> String {
+pub(crate) fn hex_digest(digest: &[u8]) -> String {
     let mut s = String::with_capacity(digest.len() * 2);
     for b in digest {
         use std::fmt::Write as _;

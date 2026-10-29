@@ -48,3 +48,14 @@ uuid.workspace = true
 log.workspace = true
 # `conflict-eval` gives every labelled pair a store of its own.
 tempfile.workspace = true
+
+# Measures the memory peak and the time of loading the model, by arm, one
+# process per load.
+[[bin]]
+name = "load-eval"
+path = "src/bin/load-eval/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+# The job object that reports the peak commit of one load. Same version as
+# `clawg-cli`, so the lock gains no package.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

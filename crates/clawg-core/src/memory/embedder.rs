@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{builder::{GraphOptimizationLevel, SessionBuilder}, Session};
 use ort::value::Tensor;
 use tokio::sync::{mpsc, oneshot};
 
@@ -510,7 +510,7 @@ impl Inference {
 /// as the machine has. The thread count is not a detail: it sets how ONNX
 /// Runtime splits and sums the work, so another one could move the last bits
 /// of a vector.
-pub(crate) fn build_session(onnx: &[u8]) -> Result<Session, EmbedError> {
+pub(crate) fn session_builder() -> Result<SessionBuilder, EmbedError> {
     let failed = |e: String| EmbedError::LoadFailed(e);
     let threads = std::thread::available_parallelism().map_err(|e| failed(e.to_string()))?.get();
     Session::builder()
@@ -520,9 +520,13 @@ pub(crate) fn build_session(onnx: &[u8]) -> Result<Session, EmbedError> {
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| failed(e.to_string()))?
         .with_intra_threads(threads)
-        .map_err(|e| failed(e.to_string()))?
-        .commit_from_memory(onnx)
         .map_err(|e| failed(e.to_string()))
+}
+
+pub(crate) fn build_session(onnx: &[u8]) -> Result<Session, EmbedError> {
+    session_builder()?
+        .commit_from_memory(onnx)
+        .map_err(|e| EmbedError::LoadFailed(e.to_string()))
 }
 
 /// The smallest model ONNX Runtime accepts: one `Identity` node from `x` to

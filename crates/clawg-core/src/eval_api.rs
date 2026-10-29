@@ -1109,6 +1109,108 @@ pub fn model_is_cached(base_dir: &Path) -> bool {
     model_download::model_is_cached(base_dir)
 }
 
+/// How the model file reaches the ONNX session: the arms `load-eval` compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadArm {
+    /// Read into a `Vec`, hashed, built with `commit_from_memory`.
+    Vec,
+    /// Hashed in blocks through a handle that stays open, built by path.
+    File,
+    /// The read-only view production loads from.
+    View,
+}
+
+/// Where one load spent its time, in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LoadTiming {
+    /// Reading and hashing `model.onnx`.
+    pub verify_ms: u64,
+    /// Building the session from it.
+    pub session_ms: u64,
+}
+
+/// The size of the blocks the `File` arm hashes in.
+const HASH_BLOCK: usize = 1024 * 1024;
+
+/// Loads the model under `model_dir` once, by `arm`, and drops the session.
+/// The files must already be there ([`fetch_model`]); nothing is downloaded.
+/// The caller measures the process, so a measured load runs in a process of
+/// its own.
+pub fn load_once(model_dir: &Path, arm: LoadArm) -> Result<LoadTiming, EvalError> {
+    use std::time::Instant;
+
+    let failed = |e: String| EvalError::ModelLoad(e);
+    let path = model_download::cache_dir_of(model_dir).join("onnx").join("model.onnx");
+    let mismatch = || EvalError::ModelLoad(format!("{} does not verify", path.display()));
+    let built = |at: Instant| at.elapsed().as_millis() as u64;
+    let start = Instant::now();
+    match arm {
+        LoadArm::Vec => {
+            let bytes = std::fs::read(&path).map_err(|e| failed(e.to_string()))?;
+            if model_download::sha256_hex(&bytes) != model_download::MODEL_SHA256 {
+                return Err(mismatch());
+            }
+            let verify_ms = built(start);
+            let start = Instant::now();
+            crate::memory::embedder::build_session(&bytes).map_err(|e| failed(e.to_string()))?;
+            Ok(LoadTiming { verify_ms, session_ms: built(start) })
+        }
+        LoadArm::File => {
+            use sha2::Digest;
+            use std::io::Read;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_SHARE_READ: u32 = 0x1;
+                options.share_mode(FILE_SHARE_READ);
+            }
+            let mut file = options.open(&path).map_err(|e| failed(e.to_string()))?;
+            let mut hasher = sha2::Sha256::new();
+            let mut block = vec![0u8; HASH_BLOCK];
+            loop {
+                let n = file.read(&mut block).map_err(|e| failed(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&block[..n]);
+            }
+            drop(block);
+            if model_download::hex_digest(hasher.finalize().as_slice()) != model_download::MODEL_SHA256 {
+                return Err(mismatch());
+            }
+            let verify_ms = built(start);
+            let start = Instant::now();
+            // `file` is still open: the handle outlives the build, as a held view would.
+            crate::memory::embedder::session_builder()
+                .map_err(|e| failed(e.to_string()))?
+                .commit_from_file(&path)
+                .map_err(|e| failed(e.to_string()))?;
+            drop(file);
+            Ok(LoadTiming { verify_ms, session_ms: built(start) })
+        }
+        LoadArm::View => {
+            let guard = model_download::CacheLock::new().read_now();
+            let view = model_download::verified_onnx(&path, model_download::MODEL_SHA256, guard)
+                .map_err(|e| failed(format!("{}: {e:?}", path.display())))?;
+            let verify_ms = built(start);
+            let start = Instant::now();
+            crate::memory::embedder::build_session(&view).map_err(|e| failed(e.to_string()))?;
+            Ok(LoadTiming { verify_ms, session_ms: built(start) })
+        }
+    }
+}
+
+/// Downloads the model into `dir` (`models/multilingual-e5-small` under it)
+/// unless it is already there and verifies. `CLAWG_HF_BASE_URL` names a mirror.
+pub async fn fetch_model(dir: &Path) -> Result<(), EvalError> {
+    model_download::ensure_model(dir, None, &model_download::CacheLock::new())
+        .await
+        .map(drop)
+        .map_err(|e| EvalError::ModelLoad(e.to_string()))
+}
+
 /// Cosine similarity of two vectors, computed directly rather than recovered
 /// from an L2 distance. The single definition shared by every binary that
 /// compares embeddings offline: `golden-mine` uses it to mine hard
