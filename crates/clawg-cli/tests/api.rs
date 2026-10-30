@@ -4406,7 +4406,35 @@ async fn accepting_a_real_job_wakes_the_embedder_and_a_dry_run_does_not() {
 async fn accepting_a_job_reloads_a_released_model_before_embedding() {
     let h = Harness::start_unloaded(false).await;
     let dir = tempfile::tempdir().expect("tempdir");
+
+    // The job cannot plan while the store's one connection is held, so it
+    // stays short of embedding and a load can only be the acceptance's.
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let store = h.ctx.runtime.store.clone();
+    let hold = tokio::spawn(async move {
+        store
+            .conn
+            .call(move |_| {
+                entered.send(()).ok();
+                released.recv_timeout(Duration::from_secs(30)).ok();
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+    });
+    held.await.expect("the connection is held");
+
     let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(3), json!({})).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.reloads.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the model did not load before the job reached embedding");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, job) = h.get_json(&format!("/v1/imports/{id}")).await;
+    assert_ne!(job["phase"], "embedding", "{job}");
+
+    release.send(()).ok();
+    hold.await.expect("hold task").expect("hold call");
     let done = h.finished_job(id).await;
     assert_eq!((done["phase"].as_str(), done["report"]["inserted"].clone()), (Some("done"), json!(3)), "{done}");
     assert_eq!(h.reloads.load(Ordering::SeqCst), 1, "the wake and the embedding share one load");
