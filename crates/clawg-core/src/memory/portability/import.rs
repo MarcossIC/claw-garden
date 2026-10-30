@@ -50,6 +50,7 @@ use crate::memory::registry::{find_project, new_project_id, project_name, Named}
 use crate::memory::subfolder::declared_in;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
+use crate::memory::portability::control::ImportControl;
 use crate::memory::portability::format::{parse, ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
 use crate::memory::portability::timing::{ImportTimings, Step, Timing};
 use crate::memory::portability::translate::{
@@ -469,8 +470,9 @@ async fn plan(
     paths: &[(usize, PathBuf)],
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
+    control: &ImportControl,
 ) -> Result<Planning, ImportError> {
-    let (clock, mut timing) = (Instant::now(), Timing::new(Step::Plan));
+    let (clock, mut timing) = control.begin(Step::Plan);
     let (mut ahead, mut passes) = (ReadAhead::default(), 1);
     let plans = loop {
         let (planned, asks) = (roots.to_vec(), paths.to_vec());
@@ -2062,36 +2064,68 @@ pub async fn import(
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
-    let prepared = prepare_file(store, text, options, ground, timings).await?;
-    let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, "clawg", timings).await?;
-    Ok(report(&prepared, &written, options.dry_run))
+    let (_, parsed) = parse(text)?;
+    let input = ImportInput::Clawg(parsed);
+    import_parsed(store, embedder, chunker, backups, input, options, ground, timings, &ImportControl::default()).await
 }
 
-/// A clawg export, worked out against the ids its roots would get here.
-async fn prepare_file(
+/// What an import reads, already parsed: the caller has done that once and
+/// the import never sees the text.
+pub enum ImportInput {
+    Clawg(Parsed),
+    Foreign(ForeignExport),
+}
+
+/// [`import`] and [`import_foreign`] over an input that is parsed already,
+/// with `control` showing where it is as it runs.
+pub async fn import_parsed(
     store: &MemoryStore,
-    text: &str,
+    embedder: Option<&dyn Embedder>,
+    chunker: Arc<ChatChunker>,
+    backups: &Path,
+    input: ImportInput,
     options: &ImportOptions,
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
+    control: &ImportControl,
+) -> Result<ImportReport, ImportError> {
+    match input {
+        ImportInput::Clawg(parsed) => {
+            let prepared = prepare_parsed(store, parsed, options, ground, timings, control).await?;
+            let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, "clawg", timings, control).await?;
+            Ok(report(&prepared, &written, options.dry_run))
+        }
+        ImportInput::Foreign(export) => {
+            let source = export.source;
+            let (prepared, foreign) = prepare_export(store, chunker.clone(), export, options, ground, timings, control).await?;
+            let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, source, timings, control).await?;
+            Ok(with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger))
+        }
+    }
+}
+
+/// A parsed clawg export, worked out against the ids its roots would get here.
+async fn prepare_parsed(
+    store: &MemoryStore,
+    parsed: Parsed,
+    options: &ImportOptions,
+    ground: Arc<dyn Ground>,
+    timings: &mut ImportTimings,
+    control: &ImportControl,
 ) -> Result<Arc<Prepared>, ImportError> {
     let clock = Instant::now();
-    let (_, parsed) = parse(text)?;
     let projects = projects_of(&parsed);
     let roots = roots_here(&projects, options);
-    let parsing = clock.elapsed();
+    let listing = clock.elapsed();
     let planned: Vec<PathBuf> = roots.iter().map(|(root, _, _)| root.clone()).collect();
     let paths: Vec<(usize, PathBuf)> = roots.iter().enumerate().filter_map(|(k, (_, _, path))| Some((k, path.clone()?))).collect();
-    let planning = plan(store, &planned, &paths, ground, timings).await?;
-    let clock = Instant::now();
+    let planning = plan(store, &planned, &paths, ground, timings, control).await?;
+    let (clock, timing) = control.begin(Step::Prepare);
     let row_projects: BTreeSet<&str> = parsed.memories.iter().filter_map(|(_, m)| m.project_id.as_deref()).collect();
     let settled = settle_projects(&projects, &roots, &planning, &row_projects, TimestampMs::now().as_millis_i64());
     let prepared = prepare(parsed, settled, options, Texts::Raw);
-    timings.record(Timing {
-        elapsed: parsing + clock.elapsed(),
-        rows: Some(prepared.rows.len()),
-        ..Timing::new(Step::Prepare)
-    });
+    timings.record(Timing { elapsed: listing + clock.elapsed(), rows: Some(prepared.rows.len()), ..timing });
+    control.count(|c| (c.rows, c.notes) = (prepared.rows.len(), prepared.units().len()));
     Ok(Arc::new(prepared))
 }
 
@@ -2110,10 +2144,7 @@ pub async fn import_foreign(
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
-    let source = export.source;
-    let (prepared, foreign) = prepare_export(store, chunker.clone(), export, options, ground, timings).await?;
-    let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, source, timings).await?;
-    Ok(with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger))
+    import_parsed(store, embedder, chunker, backups, ImportInput::Foreign(export), options, ground, timings, &ImportControl::default()).await
 }
 
 /// Another tool's export translated into rows, with what the translation
@@ -2125,6 +2156,7 @@ async fn prepare_export(
     options: &ImportOptions,
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
+    control: &ImportControl,
 ) -> Result<(Arc<Prepared>, ForeignReport), ImportError> {
     // Planned before the translation, which tells keys apart by the project
     // each note goes to here.
@@ -2138,7 +2170,7 @@ async fn prepare_export(
         .iter()
         .filter_map(|(_, target)| Some((index[target.root()?], PathBuf::from(target.path()?))))
         .collect();
-    let planning = plan(store, &roots, &asks, ground, timings).await?;
+    let planning = plan(store, &roots, &asks, ground, timings, control).await?;
     let mut declared = planning.declared.iter();
     let project_map = options
         .project_map
@@ -2160,7 +2192,7 @@ async fn prepare_export(
     let plans = planning.plans;
     let translate_options = TranslateOptions { agent: options.agent.clone().unwrap_or_else(|| MIGRATED_AGENT.to_owned()), project_map };
     let now = TimestampMs::now().as_millis_i64();
-    let clock = Instant::now();
+    let (clock, timing) = control.begin(Step::Translate);
     // Masking and splitting thousands of notes is work the daemon's other
     // requests should not wait behind.
     let (prepared, foreign) = tokio::task::spawn_blocking(move || {
@@ -2172,7 +2204,8 @@ async fn prepare_export(
     })
     .await
     .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
-    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..Timing::new(Step::Translate) });
+    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..timing });
+    control.count(|c| (c.rows, c.notes) = (prepared.rows.len(), prepared.units().len()));
     Ok((Arc::new(prepared), foreign))
 }
 
@@ -2194,6 +2227,22 @@ fn note_batches(units: &[usize], limit: usize) -> Vec<Range<usize>> {
         batches.push(start..end);
     }
     batches
+}
+
+/// The notes of each of `batches`, which `note_batches` made of whole units.
+fn batch_notes(units: &[usize], batches: &[Range<usize>]) -> Vec<usize> {
+    let (mut unit, mut at) = (0, 0);
+    batches
+        .iter()
+        .map(|batch| {
+            let first = unit;
+            while unit < units.len() && at < batch.end {
+                at += units[unit];
+                unit += 1;
+            }
+            unit - first
+        })
+        .collect()
 }
 
 /// Where every row went, and what the writing left behind.
@@ -2219,13 +2268,14 @@ async fn write(
     dry_run: bool,
     source: &'static str,
     timings: &mut ImportTimings,
+    control: &ImportControl,
 ) -> Result<Written, ImportError> {
     let now = TimestampMs::now().as_millis_i64();
-    let (clock, mut timing) = (Instant::now(), Timing::new(Step::Load));
+    let (clock, mut timing) = control.begin(Step::Load);
     let planned = load(store, prepared, &mut timing).await?;
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
-    let clock = Instant::now();
+    let (clock, timing) = control.begin(Step::Decide);
     let stop = Arc::new(AtomicBool::new(false));
     let _stop = StopOnDrop(stop.clone());
     let decide_from = prepared.clone();
@@ -2233,7 +2283,7 @@ async fn write(
         .await
         .map_err(|e| MemoryError::Internal(format!("could not plan the import: {e}")))?
         .ok_or_else(|| MemoryError::Internal("the import was stopped".to_owned()))?;
-    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..Timing::new(Step::Decide) });
+    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..timing });
 
     if dry_run {
         let revived = prepared
@@ -2248,7 +2298,9 @@ async fn write(
     let embedder = embedder.ok_or(ImportError::NoEmbedder)?;
 
     let picked = rows_to_embed(prepared, &decided);
-    let (clock, mut timing) = (Instant::now(), Timing { rows: Some(picked.len()), ..Timing::new(Step::Embed) });
+    let (clock, timing) = control.begin(Step::Embed);
+    let mut timing = Timing { rows: Some(picked.len()), ..timing };
+    control.count(|c| c.rows_to_embed = picked.len());
     let order = embedding_order(prepared, picked, chunker).await?;
     let mut vectors: HashMap<i64, Vec<u8>> = HashMap::with_capacity(order.len());
     for batch in order.chunks(EMBED_BATCH) {
@@ -2260,27 +2312,31 @@ async fn write(
             let unit = to_unit(&vector).map_err(|e| EmbedError::InferenceFailed(e.to_string()))?;
             vectors.insert(row.src.id, unit.iter().flat_map(|f| f.to_le_bytes()).collect());
         }
+        control.count(|c| c.rows_embedded += rows.len());
         timing.batch(asked.elapsed());
     }
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
-    let clock = Instant::now();
+    let (clock, timing) = control.begin(Step::Snapshot);
     let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreImport).await?.display().to_string();
-    timings.record(Timing { elapsed: clock.elapsed(), ..Timing::new(Step::Snapshot) });
+    timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
     let vectors = Arc::new(vectors);
     let mut ledger = Ledger::default();
     // A transaction a cut leaves unwritten journals nothing, and the number
     // is the first write's, so an import that adds nothing has none.
     let mut journal = Journal::new(store, source, now, Some(snapshot.clone()));
-    let mut batches = note_batches(&prepared.units(), WRITE_BATCH);
+    let units = prepared.units();
+    let mut batches = note_batches(&units, WRITE_BATCH);
     if batches.is_empty() {
         // The projects are recorded even when there is no row.
         batches.push(0..0);
     }
-    let (clock, mut timing) = (Instant::now(), Timing { rows: Some(prepared.rows.len()), ..Timing::new(Step::Write) });
+    let notes = batch_notes(&units, &batches);
+    let (clock, timing) = control.begin(Step::Write);
+    let mut timing = Timing { rows: Some(prepared.rows.len()), ..timing };
     for (k, range) in batches.into_iter().enumerate() {
-        let (batch, vectors) = (prepared.clone(), vectors.clone());
+        let (batch, vectors, rows) = (prepared.clone(), vectors.clone(), range.len());
         let mut placed = std::mem::take(&mut ledger);
         let mut logged = journal;
         let written = timed(store, &mut timing, move |c| {
@@ -2301,10 +2357,15 @@ async fn write(
         })
         .await?;
         (ledger, journal) = written.map_err(|(id, delete_id)| ImportError::ProjectDeleted { id, delete_id })?;
+        control.numbered(journal.id);
+        control.count(|c| {
+            c.rows_written += rows;
+            c.notes_written += notes[k];
+        });
     }
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
-    let (clock, mut timing) = (Instant::now(), Timing::new(Step::Links));
+    let (clock, mut timing) = control.begin(Step::Links);
     let links = prepared.clone();
     let (ledger, mut journal) = timed(store, &mut timing, move |c| {
         let tx = c.transaction()?;
@@ -2489,6 +2550,7 @@ pub(crate) mod tests {
     use crate::memory::events::{MemoryEvent, MemorySource};
     use crate::memory::portability::export::{read, Export, ExportFilter};
     use crate::memory::identity::{Disk, FakeGround, RootCommit};
+    use crate::memory::portability::control::Counters;
     use crate::memory::portability::fixtures::{other_project, project, seed, OTHER_ROOT, ROOT};
     use crate::memory::portability::foreign::{ForeignNote, ForeignRelation, NoteKind, When};
     use crate::memory::portability::format::tests::EXAMPLE;
@@ -4725,11 +4787,11 @@ pub(crate) mod tests {
     }
 
     async fn file_of(store: &MemoryStore, text: &str, options: ImportOptions) -> Arc<Prepared> {
-        prepare_file(store, text, &options, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap()
+        prepare_parsed(store, parsed(text), &options, Arc::new(Disk), &mut ImportTimings::new(false), &ImportControl::default()).await.unwrap()
     }
 
     async fn notes_of(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> Arc<Prepared> {
-        prepare_export(store, Arc::new(ChatChunker::with_fallback()), foreign_export(notes), &options, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap().0
+        prepare_export(store, Arc::new(ChatChunker::with_fallback()), foreign_export(notes), &options, Arc::new(Disk), &mut ImportTimings::new(false), &ImportControl::default()).await.unwrap().0
     }
 
     /// What the pass that decided on the connection made of `prepared`: the
@@ -5269,7 +5331,7 @@ pub(crate) mod tests {
         let export = engram::read(&std::fs::read_to_string(path("CLAWG_IMPORT_EXPORT")).unwrap()).unwrap();
         let store = MemoryStore::new_for_test().await.unwrap();
         let chunker = Arc::new(ChatChunker::with_tokenizer(tokenizer.clone()));
-        let (prepared, _) = prepare_export(&store, chunker.clone(), export, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(true)).await.unwrap();
+        let (prepared, _) = prepare_export(&store, chunker.clone(), export, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(true), &ImportControl::default()).await.unwrap();
         let planned = load(&store, &prepared, &mut Timing::new(Step::Load)).await.unwrap();
         let decided = decide(planned, &prepared, &AtomicBool::new(false)).unwrap();
         let rows: Vec<&Row> = rows_to_embed(&prepared, &decided).into_iter().map(|k| &prepared.rows[k]).collect();
@@ -5411,5 +5473,70 @@ pub(crate) mod tests {
                 probes.len(),
             );
         }
+    }
+
+    fn parsed(text: &str) -> Parsed {
+        parse(text).unwrap().1
+    }
+
+    /// An import of `input` into `store` with a control of its own, and the
+    /// counters the control ended with.
+    async fn counted(store: &MemoryStore, input: ImportInput) -> (ImportReport, Counters, crate::test_dir::TestDir) {
+        let backups = crate::test_dir::test_dir();
+        let control = ImportControl::default();
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let report = import_parsed(store, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
+            .await
+            .unwrap();
+        (report, control.progress().counters, backups)
+    }
+
+    #[tokio::test]
+    async fn a_clawg_file_is_parsed_once_for_a_job() {
+        let file = seeded_file().await;
+        let (by_text, _) = run(&destination().await, &file, ImportOptions::default()).await;
+        let (by_parsed, _, _) = counted(&destination().await, ImportInput::Clawg(parsed(&file))).await;
+        assert_eq!(ImportReport { snapshot: None, ..by_parsed }, ImportReport { snapshot: None, ..by_text });
+
+        let (by_text, _) = run_foreign(&destination().await, sample_notes(), ImportOptions::default()).await;
+        let (by_parsed, _, _) = counted(&destination().await, ImportInput::Foreign(foreign_export(sample_notes()))).await;
+        assert_eq!(ImportReport { snapshot: None, ..by_parsed }, ImportReport { snapshot: None, ..by_text });
+    }
+
+    #[tokio::test]
+    async fn the_counters_do_not_depend_on_the_batch_sizes() {
+        for rows in [31, 32, 33, 255, 256, 257] {
+            let contents: Vec<String> = (1..=rows).map(|k| format!("the row {k} of the file")).collect();
+            let list: Vec<(i64, Option<&str>, &str)> = contents.iter().enumerate().map(|(k, c)| (k as i64 + 1, None, c.as_str())).collect();
+            let store = MemoryStore::new_for_test().await.unwrap();
+            let (report, counters, _) = counted(&store, ImportInput::Clawg(parsed(&clawg_file(&[], &list)))).await;
+            assert_eq!(report.inserted, rows);
+            let all = Counters { rows, notes: rows, rows_to_embed: rows, rows_embedded: rows, rows_written: rows, notes_written: rows };
+            assert_eq!(counters, all, "a file of {rows} rows");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_counters_of_a_finished_import_match_its_report() {
+        let (report, counters, _) = counted(&destination().await, ImportInput::Clawg(parsed(&seeded_file().await))).await;
+        assert_eq!((counters.rows_embedded, counters.rows_written, counters.notes_written), (counters.rows_to_embed, report.rows, counters.notes));
+        assert_eq!((counters.rows, counters.notes), (report.rows, report.rows), "a clawg file has a note for each row");
+
+        let (report, counters, _) = counted(&destination().await, ImportInput::Foreign(foreign_export(sample_notes()))).await;
+        assert_eq!((counters.rows_embedded, counters.rows_written, counters.notes_written), (counters.rows_to_embed, report.rows, counters.notes));
+        assert_eq!(counters.rows, report.rows);
+        assert!(counters.rows > counters.notes, "a long note is several rows: {counters:?}");
+        assert!(counters.rows_to_embed < counters.rows, "a note the source deleted is not embedded: {counters:?}");
+    }
+
+    #[test]
+    fn batch_notes_counts_the_notes_of_each_write_batch() {
+        let units = [1, 1, 1, 1, 1];
+        assert_eq!(batch_notes(&units, &note_batches(&units, 2)), vec![2, 2, 1]);
+        let units = [3, 1, 2, 5, 1];
+        let batches = note_batches(&units, 4);
+        assert_eq!(batches, vec![0..4, 4..6, 6..11, 11..12]);
+        assert_eq!(batch_notes(&units, &batches), vec![2, 1, 1, 1]);
+        assert_eq!(batch_notes(&[], &[0..0]), vec![0], "the batch that only records the projects");
     }
 }

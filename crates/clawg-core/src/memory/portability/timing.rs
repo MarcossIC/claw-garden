@@ -33,7 +33,7 @@ pub enum Step {
 }
 
 impl Step {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Step::Read => "read",
             Step::Plan => "plan",
