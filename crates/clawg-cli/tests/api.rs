@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use clawg_cli::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, REFRESH_GRACE, SAVE_CONFIRM_TIMEOUT};
 use clawg_core::memory::bootstrap::EmbedderStatus;
-use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
+use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder, Gate, GatedEmbedder};
 use clawg_core::memory::idle_embedder::{IdleEmbedder, ReloadFn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use clawg_core::memory::worker::{IngestFailure, IngestReport, IngestRequest};
@@ -56,6 +56,9 @@ enum EmbedderState {
     /// Queries embed as the fake model does; passages wait for a gate to
     /// open, and may then fail.
     Docs(DocsEmbedder),
+    /// Queries and single texts embed as the fake model does; a batch waits
+    /// for its gate.
+    Gated(GatedEmbedder),
 }
 
 /// `FakeEmbedder` under the same model id, except that a passage waits until
@@ -233,6 +236,12 @@ impl Harness {
         Self::start_with(EmbedderState::LoadingWithoutWorker, capacity).await
     }
 
+    /// Daemon whose embedder holds every batch until the returned gate lets it through.
+    async fn start_gated() -> (Self, Gate) {
+        let (embedder, gate) = GatedEmbedder::new();
+        (Self::start_inner(EmbedderState::Gated(embedder)).await, gate)
+    }
+
     async fn start_inner(embedder: EmbedderState) -> Self {
         Self::start_with(embedder, INGEST_QUEUE_CAPACITY).await
     }
@@ -314,6 +323,12 @@ impl Harness {
                 (runtime, None)
             }
             EmbedderState::Docs(embedder) => {
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
+                runtime.embedder.set(Arc::new(embedder) as Arc<dyn Embedder>).ok();
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+                (runtime, None)
+            }
+            EmbedderState::Gated(embedder) => {
                 let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
                 runtime.embedder.set(Arc::new(embedder) as Arc<dyn Embedder>).ok();
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
@@ -3856,6 +3871,41 @@ async fn an_import_stores_rows_with_their_state_and_a_dry_run_stores_none() {
     );
     let (_, found) = h.post_json("/v1/search", json!({ "query": "Imported port is 4000", "agent_id": "b" })).await;
     assert_eq!(found["hits"][0]["id"], live["id"], "{found}");
+}
+
+/// Closing the client of a synchronous import cuts the import: the request's
+/// future, which holds the embedding batch, is dropped with the connection.
+#[tokio::test]
+async fn the_synchronous_import_still_cancels_when_the_client_goes() {
+    let (h, gate) = Harness::start_gated().await;
+    let client = {
+        let (http, url, token) = (h.http.clone(), h.url("/v1/import"), h.token.clone());
+        tokio::spawn(async move {
+            http.post(url).bearer_auth(token).json(&json!({ "text": export_file(1) })).send().await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the import reached the embedder");
+    let in_flight = || h.ctx.runtime.metrics.minute().gauges.iter().find(|(key, _)| key.name == "http.in_flight").map(|(_, g)| g.last);
+    assert_eq!(in_flight(), Some(1.0), "the import is the one request in flight");
+
+    client.abort();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while in_flight() != Some(0.0) {
+        assert!(Instant::now() < deadline, "the request outlived its client: {:?}", in_flight());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=a").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+    let journaled: i64 = h
+        .ctx
+        .runtime
+        .store
+        .conn
+        .call(|c| c.query_row("SELECT COUNT(*) FROM memory_import", [], |r| r.get(0)))
+        .await
+        .expect("count imports");
+    assert_eq!(journaled, 0, "nothing was written before the batch was let go");
 }
 
 #[tokio::test]

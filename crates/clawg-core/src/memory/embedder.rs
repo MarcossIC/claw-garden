@@ -886,6 +886,82 @@ impl Embedder for FakeEmbedder {
     }
 }
 
+/// What a test holds of a [`GatedEmbedder`]: it learns that a batch arrived and
+/// lets batches through.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone)]
+pub struct Gate(Arc<GateState>);
+
+#[cfg(any(test, feature = "testing"))]
+struct GateState {
+    entered: tokio::sync::Notify,
+    permits: tokio::sync::Semaphore,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl Gate {
+    /// Waits until a batch has reached the embedder. Arrivals are remembered,
+    /// so one that came before the call still counts.
+    pub async fn entered(&self) {
+        self.0.entered.notified().await;
+    }
+
+    /// Lets `batches` batches through, the ones waiting now or arriving later.
+    pub fn release(&self, batches: usize) {
+        self.0.permits.add_permits(batches);
+    }
+}
+
+/// `FakeEmbedder` whose batches wait for the [`Gate`] to let them through, so a
+/// test decides what happens while an import is embedding. Single texts are
+/// not held.
+#[cfg(any(test, feature = "testing"))]
+pub struct GatedEmbedder {
+    gate: Gate,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl GatedEmbedder {
+    pub fn new() -> (Self, Gate) {
+        let gate = Gate(Arc::new(GateState {
+            entered: tokio::sync::Notify::new(),
+            permits: tokio::sync::Semaphore::new(0),
+        }));
+        (Self { gate: gate.clone() }, gate)
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+#[async_trait]
+impl Embedder for GatedEmbedder {
+    async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+        FakeEmbedder::default().embed_with_role(text, role).await
+    }
+
+    async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.gate.0.entered.notify_one();
+        let permit = self.gate.0.permits.acquire().await.expect("the gate's semaphore is never closed");
+        permit.forget();
+        FakeEmbedder::default().embed_batch(texts, role).await
+    }
+
+    fn dimensions(&self) -> usize {
+        384
+    }
+
+    fn model_id(&self) -> &str {
+        "fake-embedder"
+    }
+
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+
+    fn passage_prefix(&self) -> &str {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
