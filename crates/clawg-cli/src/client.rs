@@ -94,6 +94,14 @@ impl ClientError {
     pub fn is_root_collision(&self) -> bool {
         matches!(self, ClientError::Daemon { status: 409, message, .. } if message == "project_root_collision")
     }
+
+    /// An answer that says the daemon a call was made to is not there any more:
+    /// the connection is refused, the token is another one (a new daemon) or
+    /// the daemon does not know a job it was following (it restarted). Any other
+    /// error can pass while the daemon goes on.
+    pub fn means_daemon_gone(&self) -> bool {
+        matches!(self, ClientError::NotRunning | ClientError::Unauthorized | ClientError::Daemon { status: 404, .. })
+    }
 }
 
 /// The parts of a daemon error body beyond its `error` code, kept so a caller
@@ -2232,6 +2240,18 @@ pub(crate) mod tests {
             ClientError::Http(message) => assert_eq!(message, "reset by peer"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn only_a_refused_connection_a_new_token_or_an_unknown_job_mean_the_daemon_went_away() {
+        let daemon = |status| ClientError::Daemon { status, message: "e".into(), details: ErrorDetails::default() };
+        assert!(ClientError::NotRunning.means_daemon_gone());
+        assert!(ClientError::Unauthorized.means_daemon_gone());
+        assert!(daemon(404).means_daemon_gone());
+        assert!(!ClientError::Http("reset by peer".into()).means_daemon_gone());
+        assert!(!daemon(500).means_daemon_gone());
+        assert!(!daemon(503).means_daemon_gone());
+        assert!(!daemon(409).means_daemon_gone());
     }
 
     #[tokio::test]

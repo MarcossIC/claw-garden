@@ -19,6 +19,10 @@ use crate::memories::version_warning;
 /// How often a job is asked how far it got.
 pub const POLL_EVERY: Duration = Duration::from_secs(1);
 
+/// How many answers in a row may fail in passing before the command stops
+/// asking.
+pub const MAX_UNANSWERED: u32 = 5;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
     #[error("--project-map {name}={}: not a directory", .path.display())]
@@ -76,6 +80,9 @@ pub enum Event {
     Interrupt,
     /// The daemon could not be asked: it went away, or no longer knows the job.
     Lost,
+    /// The daemon could not be asked this time, with the cause as it came; it
+    /// may well be running.
+    Unanswered(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,27 +100,44 @@ pub enum Next {
 /// The decisions of following a job, apart from asking the daemon.
 pub struct Follow {
     asked_to_stop: bool,
+    /// The DELETE has not been answered yet.
+    cancel_pending: bool,
+    /// Answers in a row that failed in passing.
+    unanswered: u32,
     last: ImportJob,
 }
 
 impl Follow {
     pub fn new(first: ImportJob) -> Self {
-        Self { asked_to_stop: false, last: first }
+        Self { asked_to_stop: false, cancel_pending: false, unanswered: 0, last: first }
     }
 
     pub fn on(&mut self, lang: Lang, event: Event) -> Next {
         match event {
             Event::Polled(job) => {
+                self.unanswered = 0;
+                self.cancel_pending = false;
                 let next = if is_final(&job.phase) { finished(lang, &job, self.asked_to_stop) } else { Next::Poll };
                 self.last = job;
                 next
             }
             Event::Interrupt if !self.asked_to_stop => {
                 self.asked_to_stop = true;
+                self.cancel_pending = true;
                 Next::Cancel
             }
             Event::Interrupt => Next::Leave(leaving(lang, &self.last)),
             Event::Lost => Next::Fail(gone(lang, &self.last)),
+            Event::Unanswered(cause) => {
+                self.unanswered += 1;
+                if self.unanswered >= MAX_UNANSWERED {
+                    Next::Fail(not_answering(lang, &self.last, self.unanswered, &cause))
+                } else if self.cancel_pending {
+                    Next::Cancel
+                } else {
+                    Next::Poll
+                }
+            }
         }
     }
 }
@@ -276,6 +300,25 @@ fn gone(lang: Lang, last: &ImportJob) -> String {
     format!("{head}; {tail}")
 }
 
+/// The daemon kept failing to answer, and nothing says it is gone: the job may
+/// still be running and writing.
+fn not_answering(lang: Lang, last: &ImportJob, times: u32, cause: &str) -> String {
+    let (id, phase) = (last.job_id, last.phase.as_str());
+    match lang {
+        Lang::En => format!(
+            "could not ask the daemon about import job {id}, last seen in {phase}, {times} times in a row: {cause}; the import may still be running: `clawg status` shows it"
+        ),
+        Lang::Es => format!(
+            "no pude preguntarle al daemon por el trabajo de importación {id}, visto por última vez en {phase}, {times} veces seguidas: {cause}; la importación puede seguir corriendo: `clawg status` la muestra"
+        ),
+    }
+}
+
+/// What a failed call to the daemon means for following a job.
+fn lost_or_passing(e: &ClientError) -> Event {
+    if e.means_daemon_gone() { Event::Lost } else { Event::Unanswered(e.to_string()) }
+}
+
 /// Another job holds the daemon's one slot.
 fn running(lang: Lang, job_id: Option<u64>) -> String {
     match (lang, job_id) {
@@ -391,14 +434,27 @@ async fn follow(
         if let Event::Polled(job) = &event {
             show(job);
         }
+        let failed_in_passing = matches!(event, Event::Unanswered(_));
         match state.on(lang, event) {
             Next::End(done) => return Ok(done),
             Next::Fail(message) => return Err(ImportError::Failed(message)),
             Next::Leave(message) => return Ok(Finished { out: message, note: None, ok: false }),
             Next::Cancel => {
+                // A DELETE that did not land waits a tick, or it would be sent
+                // again at once, however briefly the daemon is failing.
+                if failed_in_passing {
+                    tokio::select! {
+                        biased;
+                        Some(()) = interrupts.recv() => {
+                            event = Event::Interrupt;
+                            continue;
+                        }
+                        () = tokio::time::sleep(watch.every) => {}
+                    }
+                }
                 event = match client.cancel_import(id).await {
                     Ok(job) => Event::Polled(job),
-                    Err(_) => Event::Lost,
+                    Err(e) => lost_or_passing(&e),
                 };
             }
             Next::Poll => {
@@ -407,7 +463,7 @@ async fn follow(
                     Some(()) = interrupts.recv() => Event::Interrupt,
                     () = tokio::time::sleep(watch.every) => match client.import_job(id).await {
                         Ok(job) => Event::Polled(job),
-                        Err(_) => Event::Lost,
+                        Err(e) => lost_or_passing(&e),
                     },
                 };
             }
@@ -1718,6 +1774,76 @@ mod tests {
         }
     }
 
+    fn unanswered() -> Event {
+        Event::Unanswered("transport error talking to the daemon: reset by peer".into())
+    }
+
+    #[test]
+    fn a_passing_error_asks_again_and_a_view_resets_the_count() {
+        let mut follow = Follow::new(job("embedding"));
+        for round in 0..3 {
+            for _ in 1..MAX_UNANSWERED {
+                assert_eq!(follow.on(Lang::En, unanswered()), Next::Poll, "round {round}");
+            }
+            assert_eq!(follow.on(Lang::En, Event::Polled(job("embedding"))), Next::Poll);
+        }
+    }
+
+    #[test]
+    fn the_limit_of_passing_errors_fails_without_claiming_the_daemon_went_away() {
+        let last = at("writing", |j| j.import_id = Some(7));
+        let ends = |lang| {
+            let mut follow = Follow::new(job("loading"));
+            follow.on(lang, Event::Polled(last.clone()));
+            for _ in 1..MAX_UNANSWERED {
+                assert_eq!(follow.on(lang, unanswered()), Next::Poll);
+            }
+            match follow.on(lang, unanswered()) {
+                Next::Fail(message) => message,
+                other => panic!("{other:?}"),
+            }
+        };
+        let cause = "transport error talking to the daemon: reset by peer";
+        assert_eq!(
+            ends(Lang::En),
+            format!("could not ask the daemon about import job 1, last seen in writing, 5 times in a row: {cause}; the import may still be running: `clawg status` shows it")
+        );
+        assert_eq!(
+            ends(Lang::Es),
+            format!("no pude preguntarle al daemon por el trabajo de importación 1, visto por última vez en writing, 5 veces seguidas: {cause}; la importación puede seguir corriendo: `clawg status` la muestra")
+        );
+        for message in [ends(Lang::En), ends(Lang::Es)] {
+            assert!(!message.contains("nothing was written") && !message.contains("went away"), "{message}");
+            assert!(!message.contains("no se escribió") && !message.contains("desapareció"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_delete_that_meets_a_passing_error_is_sent_again() {
+        let mut follow = Follow::new(job("writing"));
+        assert_eq!(follow.on(Lang::En, Event::Interrupt), Next::Cancel);
+        assert_eq!(follow.on(Lang::En, unanswered()), Next::Cancel, "the cancel did not land");
+        assert_eq!(follow.on(Lang::En, unanswered()), Next::Cancel);
+        match follow.on(Lang::En, Event::Interrupt) {
+            Next::Leave(message) => assert!(message.contains("job 1"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+
+        let mut landed = Follow::new(job("writing"));
+        landed.on(Lang::En, Event::Interrupt);
+        landed.on(Lang::En, unanswered());
+        let stopping = at("writing", |j| j.stopping = Some("cancel".into()));
+        assert_eq!(landed.on(Lang::En, Event::Polled(stopping)), Next::Poll);
+        assert_eq!(landed.on(Lang::En, unanswered()), Next::Poll, "once it landed, the job is only asked about");
+
+        let mut limit = Follow::new(job("writing"));
+        limit.on(Lang::En, Event::Interrupt);
+        for _ in 1..MAX_UNANSWERED {
+            assert_eq!(limit.on(Lang::En, unanswered()), Next::Cancel);
+        }
+        assert!(matches!(limit.on(Lang::En, unanswered()), Next::Fail(_)));
+    }
+
     #[test]
     fn a_stop_without_a_report_says_nothing_was_written() {
         for (phase, step) in [("cancelled", "plan"), ("cancelled", "embed"), ("interrupted", "decide")] {
@@ -1816,6 +1942,37 @@ mod tests {
             ImportError::Failed(message) => assert!(message.contains("import 7") && message.contains("`clawg import --undo 7`"), "{message}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_fails_a_poll_and_goes_on_does_not_end_the_import() {
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let view = |State(polls): State<Arc<std::sync::atomic::AtomicUsize>>| async move {
+            if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < MAX_UNANSWERED as usize - 1 {
+                (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({ "error": "busy" })))
+            } else {
+                let report = ImportReport { rows: 3, ..Default::default() };
+                let view = serde_json::json!({
+                    "job_id": 1, "phase": "done", "rows": 3, "notes": 3, "rows_to_embed": 3,
+                    "rows_embedded": 3, "rows_written": 3, "notes_written": 3, "report": report,
+                });
+                (StatusCode::OK, axum::Json(view))
+            }
+        };
+        let app = axum::Router::new().route("/v1/imports/{id}", get(view)).with_state(polls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = DaemonClient::new(format!("http://{}", listener.local_addr().unwrap()), "token", std::env::temp_dir());
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let (_signals, mut interrupts) = mpsc::unbounded_channel();
+
+        let done = follow(&client, Lang::En, job("writing"), &mut interrupts, QUIET, |_| {}).await.expect("the import ends done");
+
+        assert!(done.ok, "{done:?}");
+        assert_eq!(done.out, render(Lang::En, &ImportReport { rows: 3, ..Default::default() }));
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), MAX_UNANSWERED as usize);
     }
 
     #[tokio::test]
