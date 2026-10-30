@@ -24,6 +24,7 @@
 pub mod backup;
 pub mod bootstrap;
 pub mod chunker;
+pub mod conn_probe;
 pub mod db;
 pub mod embedder;
 pub mod events;
