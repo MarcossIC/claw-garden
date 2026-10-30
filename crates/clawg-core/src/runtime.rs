@@ -819,6 +819,36 @@ mod tests {
         assert!(b.metrics.minute().is_empty());
     }
 
+    #[tokio::test]
+    async fn an_accepted_save_records_its_stages_its_pieces_and_how_long_it_took() {
+        use crate::metrics::SeriesKey;
+        let tmp = tmp_base();
+        let (rt, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+        let (drain, drain_rx) = watch::channel(None);
+        let workers = Workers {
+            ingest: tokio::spawn(rt.ingest_worker(rx, drain_rx)),
+            maintenance: tokio::spawn(rt.maintenance_worker()),
+            drain,
+        };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        rt.accept(chat_event("the deploy script lives in ops"), None, Some(reply)).await.unwrap();
+        let report = answer.await.unwrap();
+        assert!(report.failure.is_none());
+
+        let run = rt.metrics.run();
+        for stage in ["split", "gate", "embed", "store", "link"] {
+            assert_eq!(run.get(&SeriesKey::new("ingest.stage", &[("stage", stage)])).map(|h| h.count()), Some(1), "{stage}");
+        }
+        assert_eq!(run[&SeriesKey::new("ingest.end_to_end", &[])].count(), 1, "the save had an outbox row");
+        let gauges = rt.metrics.minute().gauges;
+        assert_eq!(gauges[&SeriesKey::new("ingest.outcome", &[("outcome", "stored")])].count, 1);
+        assert_eq!(gauges[&SeriesKey::new("ingest.pieces", &[])].last, 1.0);
+        assert_eq!(gauges[&SeriesKey::new("ingest.queue_depth", &[])].last, 0.0);
+
+        assert!(rt.shutdown(workers).await);
+        rt.close().await;
+    }
+
     /// The maintenance loop never returns, so what is actually assertable is
     /// that its future satisfies the bounds every executor demands.
     #[tokio::test]

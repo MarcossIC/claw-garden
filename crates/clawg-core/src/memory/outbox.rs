@@ -134,8 +134,9 @@ pub enum Recorded {
 /// What taking a row found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Claimed {
-    /// Ingest it, after the pieces already stored.
-    Process { progress: Vec<NotedPiece> },
+    /// Ingest it, after the pieces already stored. `created_at` is when the
+    /// save was accepted.
+    Process { progress: Vec<NotedPiece>, created_at: TimestampMs },
     /// Gone (finished, forgotten) or failed: nothing to do.
     Skip,
     /// Given up just now.
@@ -303,12 +304,19 @@ impl MemoryStore {
                 let tx = c.transaction()?;
                 let found = tx
                     .query_row(
-                        "SELECT state, attempts, progress FROM ingest_outbox WHERE id = ?1",
+                        "SELECT state, attempts, progress, created_at FROM ingest_outbox WHERE id = ?1",
                         [row],
-                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, TimestampMs>(3)?,
+                            ))
+                        },
                     )
                     .optional()?;
-                let Some((state, attempts, progress)) = found else { return Ok(Claimed::Skip) };
+                let Some((state, attempts, progress, created_at)) = found else { return Ok(Claimed::Skip) };
                 if OutboxState::parse(&state) == OutboxState::Failed {
                     return Ok(Claimed::Skip);
                 }
@@ -332,7 +340,7 @@ impl MemoryStore {
                         // Progress the code wrote itself; one that does not
                         // parse is treated as none, and the dedup gate takes
                         // over the pieces it named.
-                        Claimed::Process { progress: serde_json::from_str(&progress).unwrap_or_default() }
+                        Claimed::Process { progress: serde_json::from_str(&progress).unwrap_or_default(), created_at }
                     }
                 };
                 tx.commit()?;
@@ -598,6 +606,14 @@ mod tests {
         }
     }
 
+    async fn row_created_at(store: &MemoryStore, row: i64) -> TimestampMs {
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT created_at FROM ingest_outbox WHERE id = ?1", [row], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
     async fn row_state(store: &MemoryStore, row: i64) -> Option<(String, i64, Option<String>, String)> {
         store
             .conn
@@ -724,8 +740,9 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let row = new_row(&store, "op-1", "x").await;
 
+        let accepted = row_created_at(&store, row).await;
         for spent in 1..=MAX_ATTEMPTS {
-            assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::Process { progress: vec![] });
+            assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::Process { progress: vec![], created_at: accepted });
             assert_eq!(row_state(&store, row).await.unwrap().1, spent);
         }
         assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::GaveUp);
@@ -752,7 +769,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::Process { progress: vec![noted(0, 10)] });
+        let created_at = row_created_at(&store, row).await;
+        assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::Process { progress: vec![noted(0, 10)], created_at });
     }
 
     #[tokio::test]

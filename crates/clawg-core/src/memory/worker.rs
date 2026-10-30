@@ -25,7 +25,9 @@ use crate::memory::redact::{redact, SecretKind};
 use crate::memory::sharing::Reader;
 use crate::memory::store_insert::{NewMemoryRecord, Stored as Insert};
 use crate::memory::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
+use crate::memory::clock::TimestampMs;
 use crate::memory::MemoryStore;
+use crate::metrics::{Recorder, Unit};
 
 /// What happened to one chunk that reached the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +339,7 @@ pub async fn memory_worker(
         // Read after recv: this is the backlog still waiting, which is what
         // "falling behind" means.
         let depth = rx.len();
+        store.metrics().gauge("ingest.queue_depth", &[], depth as f64);
         match queue_depth_transition(depth, queue_over_depth) {
             Some(QueueDepthEdge::Rising) => {
                 queue_over_depth = true;
@@ -366,10 +369,11 @@ pub async fn memory_worker(
             let track = match outbox {
                 None => None,
                 Some(row) => match take_row(&store, row).await {
-                    Some(progress) => Some(Track { row, progress }),
+                    Some((progress, accepted)) => Some(Track { row, progress, accepted }),
                     None => break,
                 },
             };
+            let accepted = track.as_ref().map(|t| t.accepted);
             let watch = DrainWatch { deadline, signal: drain.as_ref() };
             let report = process_tracked(
                 &evt,
@@ -381,6 +385,7 @@ pub async fn memory_worker(
                 watch,
             )
             .await;
+            record_outcome(store.metrics(), &report, outbox.is_some(), accepted);
             if let Some(row) = outbox.filter(|_| report.paused) {
                 if let Err(e) = store.outbox_pause(row).await {
                     log::warn!("could not hand back the attempt of paused outbox row {row}: {e}");
@@ -530,12 +535,12 @@ async fn wait_to_retry(
     }
 }
 
-/// Takes outbox `row` for this run: its progress, or `None` when there is
+/// Takes outbox `row` for this run: its progress and when it was accepted, or `None` when there is
 /// nothing to ingest (taken already in this run, finished, failed, given up
 /// just now, or unreadable, which leaves it for the next start).
-async fn take_row(store: &Arc<MemoryStore>, row: i64) -> Option<Vec<NotedPiece>> {
+async fn take_row(store: &Arc<MemoryStore>, row: i64) -> Option<(Vec<NotedPiece>, TimestampMs)> {
     match store.outbox_claim(row).await {
-        Ok(Claimed::Process { progress }) => Some(progress),
+        Ok(Claimed::Process { progress, created_at }) => Some((progress, created_at)),
         Ok(Claimed::Skip) => None,
         Ok(Claimed::GaveUp) => {
             log::warn!("gave up outbox row {row}: the daemon stopped every time it ingested it");
@@ -627,6 +632,7 @@ async fn absorb_duplicate(
 struct Track {
     row: i64,
     progress: Vec<NotedPiece>,
+    accepted: TimestampMs,
 }
 
 /// The note a store write of `position` records for `track`, built from the
@@ -722,6 +728,7 @@ async fn process_tracked(
     });
     report.revision_candidate = unkeyed_revision(evt.topic(), &report.related);
     let warned = report.revision_candidate;
+    let started = Instant::now();
     report.replaced = match row {
         // A failure here leaves the row with every piece noted: the next start
         // only finishes it.
@@ -731,7 +738,47 @@ async fn process_tracked(
         }),
         None => finish_save(store, pieces, revision, warned).await,
     };
+    record_stage(store.metrics(), "link", started);
     report
+}
+
+/// Records under `ingest.stage` how long `stage` of a save took since
+/// `started`.
+fn record_stage(metrics: &Recorder, stage: &'static str, started: Instant) {
+    metrics.observe("ingest.stage", Unit::Micros, &[("stage", stage)], micros(started.elapsed()));
+}
+
+fn micros(took: std::time::Duration) -> u64 {
+    u64::try_from(took.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// How a take of a save ended, as `ingest.outcome` names it; `None` for one
+/// a drain paused, which the next start resumes.
+fn outcome_of(report: &IngestReport, has_row: bool) -> Option<&'static str> {
+    if report.paused {
+        return None;
+    }
+    Some(match &report.failure {
+        None => "stored",
+        Some(IngestFailure::EmbedderUnavailable) if has_row => "retrying",
+        Some(_) if !report.memories.is_empty() => "partially_saved",
+        Some(_) => "failed",
+    })
+}
+
+/// Records how a take of a save ended and, for one stored, its pieces and,
+/// with its outbox row, how long it took since it was accepted.
+fn record_outcome(metrics: &Recorder, report: &IngestReport, has_row: bool, accepted: Option<TimestampMs>) {
+    let Some(outcome) = outcome_of(report, has_row) else { return };
+    metrics.gauge("ingest.outcome", &[("outcome", outcome)], 1.0);
+    if outcome != "stored" {
+        return;
+    }
+    metrics.gauge("ingest.pieces", &[], report.memories.len() as f64);
+    if let Some(accepted) = accepted {
+        let waited = TimestampMs::now().as_millis_i64().saturating_sub(accepted.as_millis_i64()).max(0);
+        metrics.observe("ingest.end_to_end", Unit::Micros, &[], (waited as u64).saturating_mul(1_000));
+    }
 }
 
 /// `evt` under the live project its project leads to, when that is another.
@@ -910,7 +957,10 @@ async fn ingest_pieces(
     earlier: &[i64],
     drain: DrainWatch<'_>,
 ) -> (IngestReport, Vec<StoredPiece>) {
+    let metrics = store.metrics();
+    let started = Instant::now();
     let (redacted, split) = split_event(evt, chat_chunker);
+    record_stage(metrics, "split", started);
     let Some(SaveSplit { pieces: chunks, head }) = split else {
         return (IngestReport { redacted, ..Default::default() }, Vec::new());
     };
@@ -931,7 +981,9 @@ async fn ingest_pieces(
     };
 
     let head = head.as_deref();
+    let started = Instant::now();
     let mut gated = gate_pieces(evt, saver, store, absorbed, track.as_ref(), chunks).await;
+    record_stage(metrics, "gate", started);
     let report = |gated: &Gated, failure| IngestReport {
         memories: gated.stored.iter().flatten().copied().collect(),
         failure,
@@ -945,13 +997,19 @@ async fn ingest_pieces(
         return (report(&gated, None), gated.pieces());
     }
 
-    let vectors = match embed_pieces(embedder.as_ref(), &gated.survivors, head).await {
+    let started = Instant::now();
+    let embedded = embed_pieces(embedder.as_ref(), &gated.survivors, head).await;
+    record_stage(metrics, "embed", started);
+    let vectors = match embedded {
         Ok(vectors) => vectors,
         Err(failure) => return (report(&gated, Some(failure)), Vec::new()),
     };
 
     let to_store = PieceStore { evt, saver, store, track: track.as_ref(), earlier, drain, head };
-    match store_pieces(&to_store, absorbed, &mut gated, vectors).await {
+    let started = Instant::now();
+    let stored = store_pieces(&to_store, absorbed, &mut gated, vectors).await;
+    record_stage(metrics, "store", started);
+    match stored {
         Stored::Done { related } => (IngestReport { related, ..report(&gated, None) }, gated.pieces()),
         Stored::Paused => (IngestReport { paused: true, ..report(&gated, None) }, Vec::new()),
         Stored::Failed(failure) => (report(&gated, Some(failure)), Vec::new()),
@@ -1224,7 +1282,7 @@ mod tests {
 
         let beta = crate::memory::dedup::content_hash("beta");
         let progress = vec![NotedPiece { position: 1, hash: beta, id: 77, inserted: true, context: "head".into() }];
-        let track = Track { row: 1, progress };
+        let track = Track { row: 1, progress, accepted: TimestampMs::now() };
         let gated = gate_pieces(&evt, &saver, &store, &mut absorbed, Some(&track), chunks(&["alpha", "beta"])).await;
         assert_eq!(gated.stored[1], Some(SavedChunk { id: 77, outcome: ChunkOutcome::Inserted }));
         assert_eq!(gated.contexts[1], "head", "a resumed piece keeps the head it was embedded behind");
@@ -1299,7 +1357,7 @@ mod tests {
             noted: Vec::new(),
         };
         let vectors = |n: usize| vec![vec![0.1_f32; 384]; n];
-        let track = Track { row: 1, progress: Vec::new() };
+        let track = Track { row: 1, progress: Vec::new(), accepted: TimestampMs::now() };
         let mut absorbed = 0;
 
         let to = PieceStore {
@@ -1318,6 +1376,19 @@ mod tests {
         let paused = store_pieces(&PieceStore { drain: due, ..to }, &mut absorbed, &mut gated, vectors(2)).await;
         assert!(matches!(paused, Stored::Paused));
         assert_eq!(gated.stored.iter().flatten().count(), 1, "a take stores one piece before it may pause");
+    }
+
+    #[test]
+    fn a_take_is_named_by_how_it_ended() {
+        let saved = |n: usize| (0..n).map(|id| SavedChunk { id: id as i64, outcome: ChunkOutcome::Inserted }).collect();
+        let report = |memories, failure| IngestReport { memories, failure, ..Default::default() };
+        let failed = || Some(IngestFailure::Failed("disk full".into()));
+        assert_eq!(outcome_of(&report(saved(2), None), true), Some("stored"));
+        assert_eq!(outcome_of(&report(saved(0), Some(IngestFailure::EmbedderUnavailable)), true), Some("retrying"));
+        assert_eq!(outcome_of(&report(saved(0), Some(IngestFailure::EmbedderUnavailable)), false), Some("failed"), "only a row is tried again");
+        assert_eq!(outcome_of(&report(saved(1), failed()), true), Some("partially_saved"));
+        assert_eq!(outcome_of(&report(saved(0), failed()), true), Some("failed"));
+        assert_eq!(outcome_of(&IngestReport { paused: true, ..report(saved(1), None) }, true), None, "a paused save resumes");
     }
 
     // ── Worker spawn returns a join handle usable for shutdown/panic detection ──
