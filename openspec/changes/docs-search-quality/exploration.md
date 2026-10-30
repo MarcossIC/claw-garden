@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 3 | M | eval-rigor (33; todavía sin carpeta). El paso 1 no lo necesita y puede ir antes. 22 empuja la prioridad; 34 comparte `fts_match_expression` (ver «Interacciones») | exploración (borrador) |
+| 3 | M | eval-rigor (33) y memory-rank-fusion (34), los dos archivados desde que se escribió. El paso 1 no los necesita. 22 empuja la prioridad; 34 comparte `fts_match_expression` (ver «Interacciones») | exploración cerrada; las decisiones abiertas se cierran en la [propuesta](proposal.md#decisiones), que también actualiza las citas que se movieron |
 
 **Tesis:** `search_project` pone el pasaje correcto entre los tres primeros en poco más de una de cada cuatro preguntas (Hit@3 0,27 en `rag-eval --real --docs`). Casi todo lo barato está en dos lugares que no necesitan un modelo nuevo: el canal léxico, que hoy une con OR todas las palabras de la pregunta (vacías incluidas) tomando las primeras 16 por posición, y cómo se etiquetan y parten los identificadores. Antes de eso hay que arreglar la regla con la que se mide, porque `rag-eval --docs` indexa un archivo que cita sus propias preguntas y lo pone primero en 7 de 11 fallas. Cada paso se mide solo; un reranker o un modelo de embedding mayor quedan para si los pasos baratos no alcanzan. Es un ajuste que sube el objetivo 3 (que la IA entienda cómo funciona cada proyecto), y sube de prioridad cuanto más empuje el protocolo de memoria a `search_project`.
 
@@ -186,7 +186,7 @@ Reglas de `config.yaml` que aplican: un cambio del contrato de embedding lleva u
 
 ## Decisiones abiertas
 
-Son del usuario.
+Son del usuario. Cerradas en la [propuesta](proposal.md#decisiones), cada una con la opción que recomienda esta exploración.
 
 - [ ] **Alcance de la expresión léxica.** ¿Sólo docs (recomendado) o compartida con las memorias, midiendo las dos y coordinando con 34?
 - [ ] **Forma del paso 1.** ¿Excluir por contenido (cubre docs futuros) o por lista de rutas (más simple)?
