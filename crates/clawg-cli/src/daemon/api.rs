@@ -82,7 +82,7 @@ use tokio::sync::oneshot;
 use crate::relevance::shown_hits;
 
 use super::guard::{admits, RefusalLog};
-use super::imports::{End, ImportJobs, JobView, Meta};
+use super::imports::{Busy, End, ImportJobs, JobView, Meta};
 use super::lifecycle::now_ms;
 use super::metrics::{metrics_body, prometheus_text, time_request, HttpMeter, Transport};
 use super::sessions::{check_session_id, SessionRegistry};
@@ -2275,11 +2275,7 @@ async fn accept_job(app: Arc<AppCtx>, request: ImportJobRequest, control: Import
         return Err(ApiError::bad_request("path must be absolute"));
     }
     let Asked { source, options } = checked_fields(&app, ImportFields { from, dry_run, agent, map_roots, project_map }).await?;
-    let reservation = app.imports.reserve().map_err(|busy| ApiError {
-        detail: Some(format!("import job {} is running; try again when it ends", busy.job_id)),
-        job_id: Some(busy.job_id),
-        ..ApiError::conflict("import_running")
-    })?;
+    let reservation = app.imports.reserve().map_err(job_refused)?;
     let input = tokio::task::spawn_blocking(move || read_export(&path, source)).await.map_err(ApiError::internal)??;
     tokenizer_for(&app, &input)?;
     let mut timings = ImportTimings::new(dry_run).with_memory(super::process::private_bytes);
@@ -2292,11 +2288,30 @@ async fn accept_job(app: Arc<AppCtx>, request: ImportJobRequest, control: Import
 
     let id = reservation.id();
     let meta = Meta { dry_run, from: source.name(), started_at_ms: TimestampMs::now().as_millis_i64() };
-    reservation.run(meta, control.clone());
-    let view = app.imports.view(id).ok_or_else(|| ApiError::internal("the import job is gone"))?;
+    let job = Job { input, options, source, embedder, timings, started, control: control.clone() };
+    let task_app = app.clone();
+    let view = reservation
+        .run(meta, control, move || tokio::spawn(run_job(task_app, id, job)).abort_handle())
+        .map_err(job_refused)?;
     log::info!("import job {id} accepted: {} from {}", if dry_run { "dry run" } else { "import" }, source.name());
-    tokio::spawn(run_job(app, id, Job { input, options, source, embedder, timings, started, control }));
     Ok(view)
+}
+
+/// What a request for a job is told when the slot is not free: the job that
+/// holds it, or that the daemon is going away.
+fn job_refused(busy: Busy) -> ApiError {
+    match busy {
+        Busy::Running(job_id) => ApiError {
+            detail: Some(format!("import job {job_id} is running; try again when it ends")),
+            job_id: Some(job_id),
+            ..ApiError::conflict("import_running")
+        },
+        Busy::Closing => ApiError {
+            detail: Some("the daemon is shutting down; try again when it is back".into()),
+            retryable: Some(true),
+            ..ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "shutting_down")
+        },
+    }
 }
 
 /// Ends job `id` as failed if its task goes away before it says how the job
@@ -3117,6 +3132,7 @@ async fn shutdown(State(app): State<Arc<AppCtx>>) -> (StatusCode, Json<QueuedBod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawg_core::memory::embedder::GatedEmbedder;
 
     fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
         SavedChunk { id, outcome }
@@ -3182,8 +3198,21 @@ mod tests {
     /// A daemon over an in-memory store and the directory it keeps its
     /// snapshots in.
     async fn daemon_for_jobs() -> (Arc<AppCtx>, tempfile::TempDir) {
+        daemon_embedding_with(None).await
+    }
+
+    /// The same daemon, embedding with `embedder` when there is one.
+    async fn daemon_embedding_with(embedder: Option<Arc<dyn Embedder>>) -> (Arc<AppCtx>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, _rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
+        let runtime = match embedder {
+            Some(embedder) => {
+                let cell = Arc::new(once_cell::sync::OnceCell::<Arc<dyn Embedder>>::new());
+                cell.set(embedder).ok();
+                MemoryRuntime { embedder: cell, ..runtime }
+            }
+            None => runtime,
+        };
         let (shutdown, _) = tokio::sync::watch::channel(false);
         let app = Arc::new(AppCtx {
             runtime,
@@ -3232,19 +3261,29 @@ mod tests {
             .to_string()
     }
 
-    /// Accepts a job over `text` with `control`, waits for it to end and
-    /// answers its state as `GET /v1/imports/{id}` shows it.
-    async fn job_over(app: &Arc<AppCtx>, dir: &std::path::Path, text: &str, fields: serde_json::Value, control: ImportControl) -> serde_json::Value {
+    /// Accepts a job over `text` with `control` and answers its number.
+    async fn accepted(app: &Arc<AppCtx>, dir: &std::path::Path, text: &str, fields: serde_json::Value, control: ImportControl) -> u64 {
         let path = dir.join("export.jsonl");
         std::fs::write(&path, text).expect("an export file");
         let mut body = fields;
         body["path"] = serde_json::json!(path);
         let request: ImportJobRequest = serde_json::from_value(body).expect("a request");
         let accepted = accept_job(app.clone(), request, control).await.expect("the job is accepted");
-        let id = serde_json::to_value(&*accepted).expect("a view")["job_id"].as_u64().expect("a job id");
+        serde_json::to_value(&*accepted).expect("a view")["job_id"].as_u64().expect("a job id")
+    }
+
+    /// The state of job `id` as `GET /v1/imports/{id}` shows it.
+    fn job_state(app: &AppCtx, id: u64) -> serde_json::Value {
+        serde_json::to_value(&*app.imports.view(id).expect("the job")).expect("a view")
+    }
+
+    /// Accepts a job over `text` with `control`, waits for it to end and
+    /// answers its state as `GET /v1/imports/{id}` shows it.
+    async fn job_over(app: &Arc<AppCtx>, dir: &std::path::Path, text: &str, fields: serde_json::Value, control: ImportControl) -> serde_json::Value {
+        let id = accepted(app, dir, text, fields, control).await;
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                let view = serde_json::to_value(&*app.imports.view(id).expect("the job")).expect("a view");
+                let view = job_state(app, id);
                 if ["done", "failed", "cancelled", "interrupted"].contains(&view["phase"].as_str().unwrap_or("")) {
                     return view;
                 }
@@ -3271,6 +3310,23 @@ mod tests {
         app.runtime.store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
     }
 
+    /// How many notes have rows, and how many different numbers of rows a
+    /// note has: one, when every note was written whole.
+    async fn notes_stored(app: &AppCtx) -> (i64, i64) {
+        app.runtime
+            .store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT COUNT(DISTINCT created_by_ref), COUNT(DISTINCT n) FROM (SELECT created_by_ref, COUNT(*) AS n FROM memory GROUP BY created_by_ref)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .expect("rows by note")
+    }
+
     #[tokio::test]
     async fn a_job_stopped_in_writing_counts_exactly_the_committed_batches() {
         let (app, dir) = daemon_for_jobs().await;
@@ -3295,19 +3351,7 @@ mod tests {
         assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str()), (Some("cancelled"), Some("write")), "{job}");
         let (written, notes) = (job["notes_written"].as_i64().unwrap(), job["notes"].as_i64().unwrap());
         assert!(0 < written && written < notes, "a batch of whole notes was written and not all of them: {job}");
-        let (stored, sizes): (i64, i64) = app
-            .runtime
-            .store
-            .conn
-            .call(|c| {
-                c.query_row(
-                    "SELECT COUNT(DISTINCT created_by_ref), COUNT(DISTINCT n) FROM (SELECT created_by_ref, COUNT(*) AS n FROM memory GROUP BY created_by_ref)",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-            })
-            .await
-            .expect("rows by note");
+        let (stored, sizes) = notes_stored(&app).await;
         assert_eq!((stored, sizes), (written, 1), "every note written has all its rows: {job}");
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, job["rows_written"].as_i64().unwrap());
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import WHERE finished_at IS NULL").await, 1, "the journal stays open");
@@ -3353,6 +3397,117 @@ mod tests {
         assert!(job.get("report").is_none() && job.get("import_id").is_none(), "{job}");
         assert_eq!((job["rows"].clone(), job["rows_embedded"].clone()), (serde_json::json!(3), serde_json::json!(0)), "{job}");
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import").await, 0);
+    }
+
+    const GRACE: Duration = super::super::serve::HTTP_GRACE;
+
+    #[tokio::test]
+    async fn shutdown_stops_a_job_in_embedding_within_the_grace() {
+        let (embedder, gate) = GatedEmbedder::new();
+        let (app, dir) = daemon_embedding_with(Some(Arc::new(embedder))).await;
+        let id = accepted(&app, dir.path(), &rows_file(3), serde_json::json!({}), ImportControl::default()).await;
+        gate.entered().await;
+
+        app.imports.close();
+
+        tokio::time::timeout(GRACE, app.imports.settled()).await.expect("the job ends within the grace");
+        let job = job_state(&app, id);
+        assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str()), (Some("interrupted"), Some("embed")), "{job}");
+        assert!(job.get("abandoned").is_none() && job.get("report").is_none(), "{job}");
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, 0);
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import").await, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_a_job_in_writing_between_whole_notes() {
+        let (app, dir) = daemon_for_jobs().await;
+        app.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+        let control = ImportControl::default();
+        control.on_step({
+            let app = app.clone();
+            move |step| {
+                if step == Step::Write {
+                    app.imports.close();
+                }
+            }
+        });
+        let id = accepted(&app, dir.path(), &long_notes_file(40), serde_json::json!({ "from": "engram" }), control).await;
+
+        tokio::time::timeout(GRACE, app.imports.settled()).await.expect("the job ends within the grace");
+        let job = job_state(&app, id);
+        assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str()), (Some("interrupted"), Some("write")), "{job}");
+        assert!(job.get("abandoned").is_none(), "{job}");
+        let (written, notes) = (job["notes_written"].as_i64().unwrap(), job["notes"].as_i64().unwrap());
+        assert!(0 < written && written < notes, "a batch of whole notes was written and not all of them: {job}");
+        assert_eq!(notes_stored(&app).await, (written, 1), "every note written has all its rows: {job}");
+        assert!(job["report"]["inserted"].as_i64().unwrap() > 0, "{job}");
+    }
+
+    // The clock is paused so the grace runs out without the test waiting for
+    // it; the connection's thread is a real one, which the clock does not see.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_job_sends_nothing_to_the_connection() {
+        let (embedder, gate) = GatedEmbedder::new();
+        let (app, dir) = daemon_embedding_with(Some(Arc::new(embedder))).await;
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(Some(held));
+        let control = ImportControl::default();
+        let queue = app.runtime.store.clone();
+        control.on_step(move |step| {
+            if step != Step::Snapshot {
+                return;
+            }
+            if let Some(held) = held.lock().unwrap().take() {
+                // The snapshot queues behind this call, which holds the
+                // connection until the test lets go; polling it once sends it.
+                let hold = move |_: &mut rusqlite::Connection| {
+                    let _ = held.recv();
+                    Ok::<_, rusqlite::Error>(())
+                };
+                let mut call = Box::pin(queue.conn.call(hold));
+                let _ = std::future::Future::poll(call.as_mut(), &mut std::task::Context::from_waker(std::task::Waker::noop()));
+            }
+        });
+        let id = accepted(&app, dir.path(), &rows_file(3), serde_json::json!({}), control.clone()).await;
+        gate.entered().await;
+        gate.release(1);
+        while control.progress().step != Some(Step::Snapshot) {
+            tokio::task::yield_now().await;
+        }
+
+        // No stop is raised, so only the abort keeps this job from writing:
+        // one asked to stop would end by itself after the snapshot.
+        assert!(tokio::time::timeout(GRACE, app.imports.settled()).await.is_err(), "the held connection keeps the job past the grace");
+        app.imports.abandon(TimestampMs::now().as_millis_i64());
+
+        let job = job_state(&app, id);
+        assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str(), job["abandoned"].as_bool()), (Some("interrupted"), Some("snapshot"), Some(true)), "{job}");
+        release.send(()).unwrap();
+
+        // The snapshot already sent ran before this call and answered before
+        // it did, so a job that was not cut off has been woken by now and
+        // sends its first batch while the test yields.
+        count(&app, "SELECT COUNT(*) FROM memory").await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, 0);
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import").await, 0);
+        assert_eq!(job_state(&app, id)["phase"], "interrupted", "the task ending changes nothing");
+    }
+
+    #[tokio::test]
+    async fn a_job_import_during_shutdown_is_refused_with_a_retryable_503() {
+        let (app, dir) = daemon_for_jobs().await;
+        app.imports.close();
+        let path = dir.path().join("export.jsonl");
+        std::fs::write(&path, rows_file(1)).expect("an export file");
+        let request: ImportJobRequest = serde_json::from_value(serde_json::json!({ "path": path })).expect("a request");
+
+        let refused = accept_job(app.clone(), request, ImportControl::default()).await.err().expect("refused");
+
+        assert_eq!((refused.status, refused.message.as_str(), refused.retryable), (StatusCode::SERVICE_UNAVAILABLE, "shutting_down", Some(true)));
+        assert!(refused.job_id.is_none());
     }
 
     #[test]

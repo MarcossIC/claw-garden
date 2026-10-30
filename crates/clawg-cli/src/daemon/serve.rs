@@ -253,10 +253,13 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
     let (stopping_tx, stopping) = tokio::sync::watch::channel(false);
     let signalled = Arc::new(std::sync::OnceLock::new());
     tokio::spawn({
-        let signalled = signalled.clone();
+        let (signalled, ctx) = (signalled.clone(), ctx.clone());
         async move {
             shutdown_signal(shutdown_rx).await;
             let _ = signalled.set(Instant::now());
+            // Before the servers are told, so no job is accepted in between
+            // and the running one is asked to stop as the grace starts.
+            ctx.imports.close();
             let _ = stopping_tx.send(true);
         }
     });
@@ -278,14 +281,25 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
             }
         }
     };
-    let servers = async { tokio::try_join!(tcp_server, socket_server).map(drop) };
+    // Waits for the signal first: it must outlast a job that ends before the
+    // shutdown, not return with it.
+    let import_job = {
+        let (ctx, stopping) = (ctx.clone(), stopping.clone());
+        async move {
+            stopped(stopping).await;
+            ctx.imports.settled().await;
+            Ok::<(), std::io::Error>(())
+        }
+    };
+    let servers = async { tokio::try_join!(tcp_server, socket_server, import_job).map(drop) };
     let result = match within_grace(servers, stopped(stopping), HTTP_GRACE).await {
         Some(result) => result,
         None => {
             log::warn!(
-                "requests were still in flight {} s after the shutdown began; they were cut",
+                "requests or an import job were still running {} s after the shutdown began; they were cut",
                 HTTP_GRACE.as_secs()
             );
+            ctx.imports.abandon(now_ms() as i64);
             Ok(())
         }
     };

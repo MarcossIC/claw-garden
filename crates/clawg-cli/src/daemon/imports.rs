@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use clawg_core::memory::portability::timing::Step;
 use clawg_core::memory::portability::{Counters, ImportControl, ImportReport, StopCause, Stopped};
 use serde::Serialize;
+use tokio::sync::watch;
+use tokio::task::AbortHandle;
 
 /// How a job ended.
 pub enum End {
@@ -15,10 +17,13 @@ pub enum End {
     Failed { error: String, detail: Option<String> },
 }
 
-/// Refused because a job holds the slot.
+/// Why a job cannot take the slot.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Busy {
-    pub job_id: u64,
+pub enum Busy {
+    /// A job holds it, or a request is about to.
+    Running(u64),
+    /// The daemon is shutting down and takes no more jobs.
+    Closing,
 }
 
 /// What a job was asked to do.
@@ -47,6 +52,10 @@ pub struct JobView {
     stopping: Option<StopCause>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stopped_in: Option<&'static str>,
+    /// The shutdown cut the job off in `stopped_in`: a call that step had
+    /// already sent may have been confirmed, and `memory_import` says what was.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    abandoned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     report: Option<ImportReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,6 +84,7 @@ struct Running {
     id: u64,
     meta: Meta,
     control: ImportControl,
+    task: AbortHandle,
 }
 
 impl Running {
@@ -91,6 +101,7 @@ impl Running {
             import_id: progress.import_id,
             stopping: self.control.cause(),
             stopped_in: None,
+            abandoned: false,
             report: None,
             error: None,
             detail: None,
@@ -121,9 +132,33 @@ impl Running {
             import_id: progress.import_id,
             stopping: None,
             stopped_in,
+            abandoned: false,
             report,
             error,
             detail,
+        }
+    }
+
+    /// The job's task is aborted and its end is not known: it was in the step
+    /// it was in, and nothing it has not sent will be.
+    fn abandoned(self, now_ms: i64) -> JobView {
+        self.task.abort();
+        let progress = self.control.progress();
+        JobView {
+            job_id: self.id,
+            phase: "interrupted",
+            dry_run: self.meta.dry_run,
+            from: self.meta.from,
+            started_at_ms: self.meta.started_at_ms,
+            phase_started_at_ms: now_ms,
+            counters: progress.counters,
+            import_id: progress.import_id,
+            stopping: None,
+            stopped_in: progress.step.map(Step::name),
+            abandoned: true,
+            report: None,
+            error: None,
+            detail: None,
         }
     }
 }
@@ -143,18 +178,27 @@ struct Jobs {
     next_id: u64,
     slot: Slot,
     last: Option<Arc<JobView>>,
+    /// Set by the shutdown: no job is accepted from then on.
+    closing: bool,
 }
 
 impl Jobs {
     fn reserve(&mut self) -> Result<u64, Busy> {
+        if self.closing {
+            return Err(Busy::Closing);
+        }
         match &self.slot {
             Slot::Idle => {
                 self.next_id += 1;
                 self.slot = Slot::Reserved(self.next_id);
                 Ok(self.next_id)
             }
-            Slot::Reserved(job_id) | Slot::Running(Running { id: job_id, .. }) => Err(Busy { job_id: *job_id }),
+            Slot::Reserved(job_id) | Slot::Running(Running { id: job_id, .. }) => Err(Busy::Running(*job_id)),
         }
+    }
+
+    fn is_idle(&self) -> bool {
+        matches!(self.slot, Slot::Idle)
     }
 
     fn release(&mut self, id: u64) {
@@ -163,16 +207,48 @@ impl Jobs {
         }
     }
 
-    fn run(&mut self, id: u64, meta: Meta, control: ImportControl) {
-        if matches!(self.slot, Slot::Reserved(held) if held == id) {
-            self.slot = Slot::Running(Running { id, meta, control });
+    /// Starts job `id`: `spawn` launches its task here, with the slot still
+    /// held, so the task cannot end before the registry knows it.
+    fn run(&mut self, id: u64, meta: Meta, control: ImportControl, spawn: impl FnOnce() -> AbortHandle) -> Result<Arc<JobView>, Busy> {
+        if self.closing {
+            self.release(id);
+            return Err(Busy::Closing);
         }
+        // A reservation the shutdown abandoned is not the slot's any more.
+        if !matches!(self.slot, Slot::Reserved(held) if held == id) {
+            return Err(Busy::Closing);
+        }
+        let running = Running { id, meta, control, task: spawn() };
+        let view = Arc::new(running.view());
+        self.slot = Slot::Running(running);
+        Ok(view)
     }
 
     fn finish(&mut self, id: u64, end: End, now_ms: i64) {
         match std::mem::take(&mut self.slot) {
             Slot::Running(running) if running.id == id => self.last = Some(Arc::new(running.ended(end, now_ms))),
             other => self.slot = other,
+        }
+    }
+
+    fn close(&mut self) {
+        self.closing = true;
+        if let Slot::Running(running) = &self.slot {
+            running.control.stop(StopCause::Shutdown);
+        }
+    }
+
+    /// Gives the slot back whatever holds it: the running task is aborted
+    /// and its job is the last one, interrupted. Anything it sent the
+    /// connection before is already queued ahead of the close that follows.
+    fn abandon(&mut self, now_ms: i64) -> Option<Arc<JobView>> {
+        match std::mem::take(&mut self.slot) {
+            Slot::Running(running) => {
+                let view = Arc::new(running.abandoned(now_ms));
+                self.last = Some(view.clone());
+                Some(view)
+            }
+            Slot::Reserved(_) | Slot::Idle => None,
         }
     }
 
@@ -188,6 +264,8 @@ impl Jobs {
 #[derive(Default)]
 pub struct ImportJobs {
     state: Mutex<Jobs>,
+    /// `true` from a reservation until its job ends or it is released.
+    busy: watch::Sender<bool>,
 }
 
 /// The slot, held by a request that has not accepted its job yet: it frees
@@ -204,17 +282,24 @@ impl Reservation<'_> {
         self.id
     }
 
-    /// The job starts, and the slot is its until it ends.
-    pub fn run(mut self, meta: Meta, control: ImportControl) {
+    /// The job starts, and the slot is its until it ends. `spawn` launches
+    /// its task; it is not called when the daemon is closing, and the
+    /// reservation is released.
+    pub fn run(mut self, meta: Meta, control: ImportControl, spawn: impl FnOnce() -> AbortHandle) -> Result<Arc<JobView>, Busy> {
         self.accepted = true;
-        self.jobs.lock().run(self.id, meta, control);
+        let mut jobs = self.jobs.lock();
+        let started = jobs.run(self.id, meta, control, spawn);
+        self.jobs.busy.send_replace(!jobs.is_idle());
+        started
     }
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         if !self.accepted {
-            self.jobs.lock().release(self.id);
+            let mut jobs = self.jobs.lock();
+            jobs.release(self.id);
+            self.jobs.busy.send_replace(!jobs.is_idle());
         }
     }
 }
@@ -227,13 +312,43 @@ impl ImportJobs {
     /// Takes the slot, or names the job that holds it: checking and taking
     /// are one step, so two requests never both win.
     pub fn reserve(&self) -> Result<Reservation<'_>, Busy> {
-        let id = self.lock().reserve()?;
+        let mut jobs = self.lock();
+        let id = jobs.reserve()?;
+        self.busy.send_replace(true);
         Ok(Reservation { jobs: self, id, accepted: false })
     }
 
     /// Ends job `id`, if it is the one running.
     pub fn finish(&self, id: u64, end: End, now_ms: i64) {
-        self.lock().finish(id, end, now_ms);
+        let mut jobs = self.lock();
+        jobs.finish(id, end, now_ms);
+        self.busy.send_replace(!jobs.is_idle());
+    }
+
+    /// The shutdown begins: no job is accepted from now on and the one that
+    /// runs is asked to stop.
+    pub fn close(&self) {
+        self.lock().close();
+    }
+
+    /// Resolves once no job holds the slot.
+    pub async fn settled(&self) {
+        let _ = self.busy.subscribe().wait_for(|busy| !*busy).await;
+    }
+
+    /// Cuts the running job off: its task is aborted and it is remembered as
+    /// interrupted in the step it was in.
+    pub fn abandon(&self, now_ms: i64) {
+        let mut jobs = self.lock();
+        let abandoned = jobs.abandon(now_ms);
+        self.busy.send_replace(!jobs.is_idle());
+        if let Some(view) = abandoned {
+            log::warn!(
+                "import job {} was cut off in {}; what it had already sent the store may have been confirmed, and `memory_import` says what was",
+                view.job_id,
+                view.stopped_in.unwrap_or("its start"),
+            );
+        }
     }
 
     /// The job that runs or the last one that ended, if it is `id`.
@@ -244,6 +359,8 @@ impl ImportJobs {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use clawg_core::memory::portability::timing::Step;
     use clawg_core::memory::portability::{ImportControl, ImportReport, Stopped, StopCause};
 
@@ -253,20 +370,25 @@ mod tests {
         Meta { dry_run: false, from: "clawg", started_at_ms: 1_000 }
     }
 
+    /// A task that never ends on its own, for a job to own.
+    fn pending_task() -> AbortHandle {
+        tokio::spawn(std::future::pending::<()>()).abort_handle()
+    }
+
     /// A job that was accepted and runs.
     fn running(jobs: &ImportJobs) -> (u64, ImportControl) {
         let reservation = jobs.reserve().expect("a free slot");
         let (id, control) = (reservation.id(), ImportControl::default());
-        reservation.run(meta(), control.clone());
+        reservation.run(meta(), control.clone(), pending_task).expect("the registry is open");
         (id, control)
     }
 
-    #[test]
-    fn a_reservation_is_atomic_and_released_when_dropped() {
+    #[tokio::test]
+    async fn a_reservation_is_atomic_and_released_when_dropped() {
         let jobs = ImportJobs::default();
         let first = jobs.reserve().expect("the first reservation");
         let busy = jobs.reserve().err().expect("the slot is held");
-        assert_eq!(busy.job_id, first.id(), "the refusal names the job that holds the slot");
+        assert_eq!(busy, Busy::Running(first.id()), "the refusal names the job that holds the slot");
 
         drop(first);
         let again = jobs.reserve().expect("a dropped reservation frees the slot");
@@ -274,8 +396,8 @@ mod tests {
 
         let control = ImportControl::default();
         let id = again.id();
-        again.run(meta(), control);
-        assert_eq!(jobs.reserve().err().map(|busy| busy.job_id), Some(id), "a running job holds the slot");
+        again.run(meta(), control, pending_task).expect("the registry is open");
+        assert_eq!(jobs.reserve().err(), Some(Busy::Running(id)), "a running job holds the slot");
 
         let contested = ImportJobs::default();
         let wins = std::thread::scope(|scope| {
@@ -287,8 +409,8 @@ mod tests {
         assert_eq!(wins, 1, "of many reservations at once exactly one wins");
     }
 
-    #[test]
-    fn a_reserved_id_that_is_never_accepted_is_a_404() {
+    #[tokio::test]
+    async fn a_reserved_id_that_is_never_accepted_is_a_404() {
         let jobs = ImportJobs::default();
         // Dropped by a handler that failed before it accepted anything.
         let reservation = jobs.reserve().expect("a slot");
@@ -302,8 +424,8 @@ mod tests {
         assert!(jobs.view(id).is_some());
     }
 
-    #[test]
-    fn only_the_last_finished_job_is_kept() {
+    #[tokio::test]
+    async fn only_the_last_finished_job_is_kept() {
         let jobs = ImportJobs::default();
         let (first, _) = running(&jobs);
         jobs.finish(first, End::Done(ImportReport::default()), 2_000);
@@ -316,8 +438,8 @@ mod tests {
         assert_eq!(jobs.view(second).expect("the last finished").phase_started_at_ms, 3_000);
     }
 
-    #[test]
-    fn a_finish_for_a_job_that_is_not_running_changes_nothing() {
+    #[tokio::test]
+    async fn a_finish_for_a_job_that_is_not_running_changes_nothing() {
         let jobs = ImportJobs::default();
         jobs.finish(7, End::Done(ImportReport::default()), 1);
         assert!(jobs.view(7).is_none());
@@ -327,8 +449,8 @@ mod tests {
         assert_eq!(jobs.view(id).expect("still running").phase, "planning");
     }
 
-    #[test]
-    fn a_running_job_shows_what_was_asked_of_it() {
+    #[tokio::test]
+    async fn a_running_job_shows_what_was_asked_of_it() {
         let jobs = ImportJobs::default();
         let (id, control) = running(&jobs);
         let view = jobs.view(id).expect("running");
@@ -344,8 +466,8 @@ mod tests {
         assert_eq!(json["rows_embedded"], 0, "the counters sit beside the rest: {json}");
     }
 
-    #[test]
-    fn a_finished_job_says_how_it_ended() {
+    #[tokio::test]
+    async fn a_finished_job_says_how_it_ended() {
         let stopped = |cause, report| End::Stopped(Stopped { cause, step: Step::Embed, report });
         let failed = End::Failed { error: "embedder_not_ready".into(), detail: Some("the model files are gone".into()) };
         let ended = [
@@ -371,6 +493,108 @@ mod tests {
         jobs.finish(id, End::Failed { error: "project_deleted".into(), detail: Some("deleted".into()) }, 1);
         let view = jobs.view(id).expect("failed");
         assert_eq!((view.error.as_deref(), view.detail.as_deref()), (Some("project_deleted"), Some("deleted")));
+    }
+
+    #[tokio::test]
+    async fn a_closed_registry_refuses_to_reserve() {
+        let jobs = ImportJobs::default();
+        jobs.close();
+        assert_eq!(jobs.reserve().err(), Some(Busy::Closing));
+
+        // A request that reserved before the close does not start its job.
+        let jobs = ImportJobs::default();
+        let reservation = jobs.reserve().expect("a free slot");
+        jobs.close();
+        let spawned = std::cell::Cell::new(false);
+        let refused = reservation.run(meta(), ImportControl::default(), || {
+            spawned.set(true);
+            pending_task()
+        });
+        assert_eq!(refused.err(), Some(Busy::Closing));
+        assert!(!spawned.get(), "no task is launched into a closed registry");
+        tokio::time::timeout(Duration::from_secs(5), jobs.settled()).await.expect("the refused reservation freed the slot");
+
+        // The job that runs is asked to stop for the shutdown.
+        let jobs = ImportJobs::default();
+        let (id, control) = running(&jobs);
+        jobs.close();
+        assert_eq!(control.cause(), Some(StopCause::Shutdown));
+        assert_eq!(jobs.view(id).and_then(|view| view.stopping), Some(StopCause::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn closing_after_a_cancel_keeps_the_first_cause() {
+        let jobs = ImportJobs::default();
+        let (_, control) = running(&jobs);
+        control.stop(StopCause::Cancel);
+        jobs.close();
+        assert_eq!(control.cause(), Some(StopCause::Cancel));
+    }
+
+    #[tokio::test]
+    async fn settled_waits_for_the_slot_to_be_free() {
+        let jobs = Arc::new(ImportJobs::default());
+        tokio::time::timeout(Duration::from_secs(5), jobs.settled()).await.expect("nothing to wait for");
+
+        let (id, _) = running(&jobs);
+        let waiting = tokio::spawn({
+            let jobs = jobs.clone();
+            async move { jobs.settled().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "a running job is waited for");
+        jobs.finish(id, End::Done(ImportReport::default()), 2_000);
+        tokio::time::timeout(Duration::from_secs(5), waiting).await.expect("ended").expect("joined");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_job_is_interrupted_and_named() {
+        let jobs = ImportJobs::default();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let reservation = jobs.reserve().expect("a free slot");
+        let id = reservation.id();
+        reservation.run(meta(), ImportControl::default(), || task.abort_handle()).expect("the registry is open");
+
+        jobs.abandon(7_000);
+
+        assert!(task.await.expect_err("the task was aborted").is_cancelled());
+        let view = jobs.view(id).expect("the last finished");
+        assert_eq!((view.phase, view.abandoned, view.report.is_none(), view.phase_started_at_ms), ("interrupted", true, true, 7_000));
+        assert!(view.stopping.is_none());
+        let json = serde_json::to_value(&*view).expect("serializes");
+        assert_eq!(json["abandoned"], true, "{json}");
+        tokio::time::timeout(Duration::from_secs(5), jobs.settled()).await.expect("the slot is free");
+        assert!(jobs.reserve().is_ok());
+
+        let other = ImportJobs::default();
+        let (other_id, _) = running(&other);
+        let json = serde_json::to_value(&*other.view(other_id).expect("running")).expect("serializes");
+        assert!(json.get("abandoned").is_none(), "only an abandoned job says so: {json}");
+    }
+
+    #[tokio::test]
+    async fn abandoning_nothing_changes_nothing() {
+        let jobs = ImportJobs::default();
+        jobs.abandon(1);
+        assert!(jobs.view(1).is_none());
+
+        let reservation = jobs.reserve().expect("a free slot");
+        jobs.abandon(2);
+        drop(reservation);
+        assert!(jobs.reserve().is_ok(), "a reservation that was abandoned frees the slot once");
+    }
+
+    #[tokio::test]
+    async fn a_finish_after_abandon_changes_nothing() {
+        let jobs = ImportJobs::default();
+        let (id, _) = running(&jobs);
+        jobs.abandon(7_000);
+
+        jobs.finish(id, End::Failed { error: "the import task ended without a result".into(), detail: None }, 8_000);
+
+        let view = jobs.view(id).expect("the last finished");
+        assert_eq!((view.phase, view.abandoned, view.phase_started_at_ms), ("interrupted", true, 7_000));
+        assert!(view.error.is_none());
     }
 
     #[test]
