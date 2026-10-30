@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: in_progress  # suite y clippy en Linux; faltan el CI en Linux y Windows y el sobrecoste con el modelo real
+  verify: done  # verify.md: suite y clippy en Linux, CI en verde en Linux y Windows (#100, #101); el sobrecoste con el modelo real queda sin medir
   archive: pending
 updated: 2026-10-30
