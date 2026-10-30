@@ -524,7 +524,12 @@ async fn stored_vectors(
         .conn
         .call(move |c| -> rusqlite::Result<_> {
             let mut stmt = c.prepare(
-                "SELECT c.breadcrumb, c.body, v.embedding                  FROM project_doc_chunk c JOIN project_doc_vectors v ON v.rowid = c.id                  WHERE c.project_id = ?1 AND c.path = ?2                    AND EXISTS (SELECT 1 FROM project_doc_file f                                WHERE f.project_id = ?1 AND f.path = ?2 AND f.model_id = ?3)                  ORDER BY c.ordinal",
+                "SELECT c.breadcrumb, c.body, v.embedding \
+                 FROM project_doc_chunk c JOIN project_doc_vectors v ON v.rowid = c.id \
+                 WHERE c.project_id = ?1 AND c.path = ?2 \
+                   AND EXISTS (SELECT 1 FROM project_doc_file f \
+                               WHERE f.project_id = ?1 AND f.path = ?2 AND f.model_id = ?3) \
+                 ORDER BY c.ordinal",
             )?;
             let rows = stmt.query_map(rusqlite::params![project_id, path, model_id], |r| {
                 Ok((Passage { ordinal: 0, breadcrumb: r.get(0)?, body: r.get(1)? }, r.get::<_, Vec<u8>>(2)?))
