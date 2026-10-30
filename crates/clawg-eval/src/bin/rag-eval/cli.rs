@@ -202,7 +202,7 @@ OPTIONS:
                          stays the metrics'). Needs neither --fake/--real nor a golden set;
                          short-circuits like --help.
     --fail-on-regression With --diff, on either side of it: exit 6 when a primary metric
-                         (retrieval recall@5, agent_view search.found) gets worse with
+                         (retrieval recall@5, agent_view search.found, docs hit@3) gets worse with
                          p < 0.05. The informative metrics never fail the run.
     --follow-up          Run the synthetic Ceiling/Floor/Treatment arms instead of the
                          normal single-arm pass, measuring whether conversational context
@@ -217,9 +217,14 @@ OPTIONS:
     --docs              Index a project's documentation (Markdown and manifests) into a
                          temporary store and score the questions of the docs golden set
                          (crates/clawg-eval/golden/project-docs.json unless --golden says
-                         otherwise): Hit@1/3/5 and MRR@10, printed. Writes no results file.
-                         Mutually exclusive with --audit, --follow-up, --agent-view and
-                         every sweep flag.
+                         otherwise): Hit@1/3/5 and MRR@10. Leaves out of the index, and
+                         names, every doc that quotes a question; an expected doc that does
+                         is a golden set error. With --real writes {date}-real-docs.json
+                         ({date}-real-docs-{tag}.json with --tag), which --diff compares with
+                         another docs run: Hit@1/3/5 and mrr@10 for all questions, docs and
+                         code, the questions that entered or left the top 3, and hit@3 as
+                         the primary metric. --fake only prints. Mutually exclusive with
+                         --audit, --follow-up, --agent-view and every sweep flag.
     --root <dir>        With --docs: the project to index (default: this workspace)
     --lexical-only      Rank every case by the lexical channel alone: the same FTS5 match and
                          bm25 order the full search uses, with no vectors and no scoring. A
@@ -1048,5 +1053,6 @@ mod tests {
     fn the_help_text_documents_docs() {
         assert!(HELP_TEXT.contains("--docs"));
         assert!(HELP_TEXT.contains("--root <dir>"));
+        assert!(HELP_TEXT.contains("{date}-real-docs.json"));
     }
 }

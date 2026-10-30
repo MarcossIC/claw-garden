@@ -555,7 +555,7 @@ fn render(diff: &RunDiff) -> String {
     out
 }
 
-const METRIC_HEADER: &str = "    metric          better  worse     net       p\n";
+pub const METRIC_HEADER: &str = "    metric          better  worse     net       p\n";
 
 /// A block's global rows, the cases its pair cut left out, then one block of
 /// the same rows per pair.
@@ -599,7 +599,7 @@ fn pairs_left_out<B>(cut: &PairCut<B>) -> String {
     out
 }
 
-fn metric_line(name: &str, m: &MetricDiff) -> String {
+pub fn metric_line(name: &str, m: &MetricDiff) -> String {
     let ci = m
         .ci
         .map(|c| format!("  mean {:+.4} [{:+.4}, {:+.4}]", c.mean, c.lo, c.hi))

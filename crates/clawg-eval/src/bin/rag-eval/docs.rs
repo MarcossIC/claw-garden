@@ -1,15 +1,18 @@
 //! `--docs`: index a project's documentation and score how well it answers
 //! the questions of a golden set written about it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clawg_core::eval_api::{doc_paths, is_code_path, EvalDocHit, EvalDocIndex, EvalDocReport, EvalEmbedder};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::cli::Cli;
+use crate::diff::{metric_line, verdict, MetricDiff, METRIC_HEADER};
 use crate::report::{Mode, ReportError};
+use crate::stats::{paired_bootstrap_ci, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED};
 use crate::{EXIT_GOLDEN_INVALID, EXIT_OK, EXIT_RESULTS_EXISTS, EXIT_RUNTIME_FAILURE};
 
 /// How deep each question's ranking is read: MRR counts a first hit up to here.
@@ -333,6 +336,194 @@ pub fn write_results(results: &DocsResults, out_dir: &Path, force: bool) -> Resu
     let json = serde_json::to_string_pretty(results)?;
     std::fs::write(&path, json).map_err(|e| ReportError::Write { path: path.clone(), source: e })?;
     Ok(path)
+}
+
+/// What a diff reads of a docs results file.
+#[derive(Deserialize)]
+struct DocsFile {
+    golden_sha256: String,
+    corpus: LeftOut,
+    per_case: Vec<CaseRank>,
+}
+
+#[derive(Deserialize)]
+struct LeftOut {
+    left_out: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DocsDiffError {
+    #[error("failed to read '{}': {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("'{}' is not valid JSON: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("not a docs results file: {0}")]
+    Shape(serde_json::Error),
+    #[error("one file is a docs run and the other is not; a docs run compares only with another")]
+    Mixed,
+}
+
+/// The paired movement of the four scores over the questions both runs asked.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ScoreDiff {
+    pub joined: usize,
+    pub hit_1: MetricDiff,
+    pub hit_3: MetricDiff,
+    pub hit_5: MetricDiff,
+    pub mrr: MetricDiff,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocsDiff {
+    pub all: ScoreDiff,
+    /// Absent when neither run asked a question of that kind.
+    pub docs: Option<ScoreDiff>,
+    pub code: Option<ScoreDiff>,
+    pub entered_top_3: Vec<String>,
+    pub left_top_3: Vec<String>,
+    pub one_file_only: Vec<String>,
+    /// Why the two runs may not have measured the same thing.
+    pub warnings: Vec<String>,
+}
+
+fn is_docs(value: &Value) -> bool {
+    value.get("kind").and_then(Value::as_str) == Some(DOCS_KIND)
+}
+
+fn within(rank: Option<usize>, k: usize) -> bool {
+    rank.is_some_and(|r| r <= k)
+}
+
+fn reciprocal(rank: Option<usize>) -> f64 {
+    rank.map_or(0.0, |r| 1.0 / r as f64)
+}
+
+fn tally(m: &mut MetricDiff, a: f64, b: f64) {
+    if b > a {
+        m.better += 1;
+    } else if b < a {
+        m.worse += 1;
+    }
+    m.net = m.better as i64 - m.worse as i64;
+}
+
+fn score_diff(pairs: &[(&CaseRank, &CaseRank)]) -> ScoreDiff {
+    let mut d = ScoreDiff { joined: pairs.len(), ..Default::default() };
+    let flag = |f: bool| if f { 1.0 } else { 0.0 };
+    for (a, b) in pairs {
+        tally(&mut d.hit_1, flag(within(a.rank, 1)), flag(within(b.rank, 1)));
+        tally(&mut d.hit_3, flag(within(a.rank, 3)), flag(within(b.rank, 3)));
+        tally(&mut d.hit_5, flag(within(a.rank, 5)), flag(within(b.rank, 5)));
+        tally(&mut d.mrr, reciprocal(a.rank), reciprocal(b.rank));
+    }
+    let deltas: Vec<f64> = pairs.iter().map(|(a, b)| reciprocal(b.rank) - reciprocal(a.rank)).collect();
+    d.mrr.ci = Some(paired_bootstrap_ci(&deltas, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED));
+    d
+}
+
+/// Diffs two results files when they are docs runs; `None` when neither is,
+/// so the caller diffs them as memory runs.
+pub fn diff_files(a_path: &Path, b_path: &Path) -> Result<Option<DocsDiff>, DocsDiffError> {
+    let read = |path: &Path| -> Result<Value, DocsDiffError> {
+        let text = std::fs::read_to_string(path).map_err(|e| DocsDiffError::Read { path: path.to_path_buf(), source: e })?;
+        serde_json::from_str(&text).map_err(|e| DocsDiffError::Parse { path: path.to_path_buf(), source: e })
+    };
+    diff_values(&read(a_path)?, &read(b_path)?)
+}
+
+/// Joins the questions of two docs runs by id, the second run against the first.
+pub fn diff_values(a: &Value, b: &Value) -> Result<Option<DocsDiff>, DocsDiffError> {
+    match (is_docs(a), is_docs(b)) {
+        (false, false) => return Ok(None),
+        (true, true) => {}
+        _ => return Err(DocsDiffError::Mixed),
+    }
+    let a: DocsFile = serde_json::from_value(a.clone()).map_err(DocsDiffError::Shape)?;
+    let b: DocsFile = serde_json::from_value(b.clone()).map_err(DocsDiffError::Shape)?;
+    let in_b: HashMap<&str, &CaseRank> = b.per_case.iter().map(|c| (c.id.as_str(), c)).collect();
+    let in_a: HashSet<&str> = a.per_case.iter().map(|c| c.id.as_str()).collect();
+    let pairs: Vec<(&CaseRank, &CaseRank)> =
+        a.per_case.iter().filter_map(|c| in_b.get(c.id.as_str()).map(|other| (c, *other))).collect();
+    let part = |code: bool| {
+        let part: Vec<_> = pairs.iter().copied().filter(|(_, b)| b.code == code).collect();
+        (!part.is_empty()).then(|| score_diff(&part))
+    };
+    let mut warnings = Vec::new();
+    if a.golden_sha256 != b.golden_sha256 {
+        warnings.push(format!(
+            "the golden sets differ ({} and {}); only the questions both asked are joined",
+            a.golden_sha256, b.golden_sha256
+        ));
+    }
+    if a.corpus.left_out != b.corpus.left_out {
+        warnings.push(format!(
+            "the docs left out differ ([{}] and [{}]), so the runs searched different corpora",
+            a.corpus.left_out.join(", "),
+            b.corpus.left_out.join(", ")
+        ));
+    }
+    let ids = |keep: &dyn Fn(&CaseRank, &CaseRank) -> bool| -> Vec<String> {
+        pairs.iter().filter(|(a, b)| keep(a, b)).map(|(a, _)| a.id.clone()).collect()
+    };
+    Ok(Some(DocsDiff {
+        all: score_diff(&pairs),
+        docs: part(false),
+        code: part(true),
+        entered_top_3: ids(&|a, b| !within(a.rank, 3) && within(b.rank, 3)),
+        left_top_3: ids(&|a, b| within(a.rank, 3) && !within(b.rank, 3)),
+        one_file_only: a
+            .per_case
+            .iter()
+            .filter(|c| !in_b.contains_key(c.id.as_str()))
+            .chain(b.per_case.iter().filter(|c| !in_a.contains(c.id.as_str())))
+            .map(|c| c.id.clone())
+            .collect(),
+        warnings,
+    }))
+}
+
+/// Hit@3 got worse by more than chance explains.
+pub fn regressed(diff: &DocsDiff) -> bool {
+    let m = &diff.all.hit_3;
+    m.worse > m.better && m.p_value() < crate::stats::ALPHA
+}
+
+pub fn render_diff(diff: &DocsDiff) -> String {
+    let mut out = String::from("rag-eval diff (docs)\n");
+    for w in &diff.warnings {
+        out.push_str(&format!("  warning: {w}\n"));
+    }
+    let rows = |out: &mut String, name: &str, d: &ScoreDiff| {
+        out.push_str(&format!("  {name} ({} joined):\n{METRIC_HEADER}", d.joined));
+        for (metric, m) in [("hit@1", &d.hit_1), ("hit@3", &d.hit_3), ("hit@5", &d.hit_5), ("mrr@10", &d.mrr)] {
+            out.push_str(&metric_line(metric, m));
+        }
+    };
+    rows(&mut out, "all", &diff.all);
+    if let Some(d) = &diff.docs {
+        rows(&mut out, "docs", d);
+    }
+    if let Some(d) = &diff.code {
+        rows(&mut out, "code", d);
+    }
+    let list = |out: &mut String, what: &str, ids: &[String]| {
+        if !ids.is_empty() {
+            out.push_str(&format!("  {what}: {}\n", ids.join(", ")));
+        }
+    };
+    list(&mut out, "entered the top 3", &diff.entered_top_3);
+    list(&mut out, "left the top 3", &diff.left_top_3);
+    list(&mut out, "in one file only, counted in no row", &diff.one_file_only);
+    out.push_str(&format!("  primary:\n    {}\n", verdict("docs hit@3", &diff.all.hit_3)));
+    out
 }
 
 /// Runs `--docs` end to end and returns the exit code.
@@ -706,6 +897,66 @@ mod tests {
         results.tag = Some("lex2".into());
         assert_eq!(results_path(&out, &results.date, results.mode, results.tag.as_deref()), out.join("2026-10-30-real-docs-lex2.json"));
         assert_eq!(write_results(&results, &out, false).unwrap(), out.join("2026-10-30-real-docs-lex2.json"));
+    }
+
+    fn docs_file(sha: &str, left_out: &[&str], ranks: &[(&str, bool, Option<usize>)]) -> serde_json::Value {
+        let cases: Vec<_> = ranks
+            .iter()
+            .map(|(id, code, rank)| serde_json::json!({"id": id, "code": code, "rank": rank, "top": null}))
+            .collect();
+        serde_json::json!({"kind": "docs", "golden_sha256": sha, "corpus": {"left_out": left_out}, "per_case": cases})
+    }
+
+    #[test]
+    fn a_docs_diff_counts_moves_and_names_the_top_3_changes() {
+        let a = docs_file("g", &[], &[("q1", false, Some(1)), ("q2", false, Some(4)), ("q3", false, None), ("q9", false, Some(1))]);
+        let b = docs_file("g", &[], &[("q1", false, Some(5)), ("q2", false, Some(2)), ("q3", false, Some(8))]);
+
+        let diff = diff_values(&a, &b).unwrap().expect("two docs files");
+
+        assert_eq!((diff.all.hit_3.better, diff.all.hit_3.worse), (1, 1));
+        assert_eq!(diff.all.hit_3.p_value(), 1.0);
+        assert_eq!((diff.all.hit_1.better, diff.all.hit_1.worse), (0, 1));
+        assert_eq!((diff.all.hit_5.better, diff.all.hit_5.worse), (0, 0), "q1 and q2 stay within 5, q3 stays out");
+        assert_eq!((diff.all.mrr.better, diff.all.mrr.worse), (2, 1));
+        assert!(diff.all.mrr.ci.is_some());
+        assert_eq!(diff.entered_top_3, ["q2"]);
+        assert_eq!(diff.left_top_3, ["q1"]);
+        assert_eq!(diff.one_file_only, ["q9"]);
+        assert!(diff.warnings.is_empty());
+        let text = render_diff(&diff);
+        assert!(text.contains("entered the top 3: q2\n") && text.contains("left the top 3: q1\n"), "{text}");
+        assert!(text.contains("in one file only, counted in no row: q9\n"), "{text}");
+        assert!(text.contains("docs hit@3: not distinguishable"), "{text}");
+    }
+
+    #[test]
+    fn a_docs_diff_splits_docs_and_code() {
+        let a = docs_file("g", &[], &[("d1", false, Some(1)), ("c1", true, None)]);
+        let b = docs_file("g", &[], &[("d1", false, Some(1)), ("c1", true, Some(2))]);
+
+        let diff = diff_values(&a, &b).unwrap().unwrap();
+
+        assert_eq!(diff.docs.map(|d| (d.joined, d.hit_3.better)), Some((1, 0)));
+        assert_eq!(diff.code.map(|c| (c.joined, c.hit_3.better)), Some((1, 1)));
+        assert!(render_diff(&diff).contains("  code (1 joined):\n"));
+
+        let only_docs = docs_file("g", &[], &[("d1", false, Some(1))]);
+        let diff = diff_values(&only_docs, &only_docs).unwrap().unwrap();
+        assert!(diff.code.is_none(), "no code question, no code row");
+    }
+
+    #[test]
+    fn a_docs_diff_warns_when_the_corpus_differs() {
+        let a = docs_file("g1", &[], &[("q1", false, Some(1))]);
+        let b = docs_file("g2", &["notes/verify.md"], &[("q1", false, Some(1))]);
+
+        let diff = diff_values(&a, &b).unwrap().unwrap();
+
+        assert_eq!(diff.warnings.len(), 2, "{:?}", diff.warnings);
+        assert!(render_diff(&diff).contains("warning: the docs left out differ"));
+        assert!(diff_values(&serde_json::json!({"retrieval": {}}), &serde_json::json!({})).unwrap().is_none(), "two memory runs are not docs runs");
+        assert!(matches!(diff_values(&a, &serde_json::json!({})), Err(DocsDiffError::Mixed)));
     }
 
     #[test]
