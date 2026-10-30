@@ -38,3 +38,23 @@ Un fallo de cualquiera de las tres partes deja fuera sólo sus series, con un `d
 ## D5. Eventos en `metrics.db` (P9)
 
 **Elegido:** una tabla `event` en `metrics.db`, `user_version = 2`, con `kind` de un conjunto cerrado y `detail` JSON de números y valores cerrados. Se escribe con el minuto, desde una cola del `Recorder`, así los eventos no abren otra escritura. La migración es `CREATE TABLE IF NOT EXISTS` y subir `user_version`: aditiva, y un binario anterior rechaza el fichero sin tocarlo, como ya hace con un esquema más nuevo.
+
+## D6. El `Recorder` vive en el store (P5 a P8)
+
+**Elegido:** `MemoryStore` lleva el `Arc<Recorder>`, compartido por cada clon, y `MemoryRuntime::metrics` es ese mismo; `AppCtx` deja de tener uno propio y el daemon escribe y sirve el del runtime. La búsqueda, el worker, el outbox, los snapshots y la carga del modelo ya reciben el store, así que ninguna firma pública cambia por medir. Cumple D3: un runtime de test lleva el suyo y dos runtimes de un proceso no se mezclan.
+
+## D7. Un recuento es un gauge de 1 (P5, P6, P8)
+
+**Elegido:** lo que cuenta ocurrencias (`search.knn_retry`, `context.retrieval_state`, `context.cut`, `ingest.outcome`) y lo que no es tiempo ni bytes (`search.hits`, `ingest.pieces`, `embedder.batch`, `embedder.batch_tokens`, `docs.refresh.files`) son gauges: el recuento es `samples` de `metrics report`.
+
+| Alternativa | Por qué no |
+|---|---|
+| Una unidad `count` para histogramas | Un binario anterior no la reconoce: al plegar los minutos lee cada fila y falla en la primera de una unidad que no conoce, y deja de escribir métricas. Volver atrás dejaría de ser sólo cambiar el binario |
+
+## D8. El último minuto se escribe después del drain (P9)
+
+**Elegido:** el apagado cierra el escritor de métricas tras el drain, no antes, para que el evento `shutdown` (con lo que tardó el drain) y las series de lo que el drain ingirió caigan en el último minuto. Los plazos de cada fase no cambian, así que su suma frente a `STOP_TIMEOUT` tampoco.
+
+## D9. Lo que el modelo falso no mide (P7, P10)
+
+`embedder.batch`, `embedder.batch_tokens` y `embedder.wait` salen del canal de inferencia de `E5Embedder`, que el embedder falso no tiene; el test de punta a punta no los pide y los cubren los tests del embedder. `embedder.load{phase=verify}` mide las lecturas de la caché (las recargas); el primer arranque pasa por `ensure`, cuyo hash va junto con una posible descarga, y queda fuera.

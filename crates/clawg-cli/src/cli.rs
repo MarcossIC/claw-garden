@@ -629,11 +629,16 @@ impl MoveOpts {
 pub enum MetricsAction {
     /// Sum one metric by local day, by hour of the local day, by local minute
     /// or by version, and print its count, mean and percentiles (or, for a gauge, its
-    /// samples, mean and extremes) as JSON.
+    /// samples, mean and extremes) as JSON; or, with `--events`, list the
+    /// events of each run.
     Report {
         /// The metric, as `http.duration` or `process.rss_bytes`.
-        #[arg(long)]
-        metric: String,
+        #[arg(long, required_unless_present = "events")]
+        metric: Option<String>,
+        /// List the events (model loads, backups, imports, shutdowns...) by
+        /// run instead of a metric.
+        #[arg(long, conflicts_with_all = ["metric", "labels", "by"])]
+        events: bool,
         /// Only the series with this label, as `route=/v1/search`. Repeat it
         /// to ask for several.
         #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
@@ -1571,7 +1576,8 @@ mod tests {
             parse(&["clawg", "metrics", "report", "--metric", "http.duration"]).command,
             Command::Metrics {
                 action: MetricsAction::Report {
-                    metric: "http.duration".into(),
+                    metric: Some("http.duration".into()),
+                    events: false,
                     labels: vec![],
                     by: ReportBy::Version,
                     since: std::time::Duration::from_secs(30 * 86_400),
@@ -1587,7 +1593,8 @@ mod tests {
             .command,
             Command::Metrics {
                 action: MetricsAction::Report {
-                    metric: "http.duration".into(),
+                    metric: Some("http.duration".into()),
+                    events: false,
                     labels: vec![("route".into(), "/v1/search".into()), ("transport".into(), "unix".into())],
                     by: ReportBy::Hour,
                     since: std::time::Duration::from_secs(12 * 3600),
@@ -1602,6 +1609,16 @@ mod tests {
         };
         assert_eq!(by, ReportBy::Minute);
         assert!(Cli::try_parse_from(["clawg", "metrics", "report"]).is_err(), "the metric is required");
+        let Command::Metrics { action: MetricsAction::Report { metric, events, since, .. } } =
+            parse(&["clawg", "metrics", "report", "--events", "--since", "2d"]).command
+        else {
+            panic!("a report")
+        };
+        assert_eq!((metric, events, since), (None, true, std::time::Duration::from_secs(2 * 86_400)));
+        for both in [&["--events", "--metric", "m"][..], &["--events", "--by", "day"], &["--events", "--label", "a=b"]] {
+            let args = [&["clawg", "metrics", "report"][..], both].concat();
+            assert!(Cli::try_parse_from(args).is_err(), "{both:?}");
+        }
         for bad in ["route", "=x", "route=", "a"] {
             assert!(parse_label(bad).is_err(), "{bad}");
         }

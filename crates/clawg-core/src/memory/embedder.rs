@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::memory::db::EmbeddingIdentity;
 use crate::memory::model_download::TokenizerFiles;
 use crate::memory::vector::EMBEDDING_DIM;
+use crate::metrics::{Recorder, Unit};
 use tokenizers::{Encoding, Tokenizer};
 
 /// Which side of an asymmetric embedding model a text plays: the thing being
@@ -34,6 +35,16 @@ pub enum EmbedRole {
     Query,
     /// The text is something being searched THROUGH (a stored chunk/document).
     Passage,
+}
+
+impl EmbedRole {
+    /// The role as a metric label names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmbedRole::Query => "query",
+            EmbedRole::Passage => "passage",
+        }
+    }
 }
 
 /// Async embedder contract. All embedder impls are `Send + Sync` so they can
@@ -405,12 +416,17 @@ pub(crate) fn check_tokenizer(tokenizer: &Tokenizer, files: &TokenizerFiles) -> 
 pub(crate) struct EmbedRequest {
     pub(crate) texts: Vec<String>,
     pub(crate) resp: oneshot::Sender<Result<Vec<Vec<f32>>, EmbedError>>,
+    pub(crate) role: EmbedRole,
+    /// When the request was sent, so the worker can tell how long it waited.
+    pub(crate) queued: std::time::Instant,
 }
 
 pub struct E5Embedder {
     req_tx: mpsc::UnboundedSender<EmbedRequest>,
     dimensions: usize,
     model_id: &'static str,
+    /// Where each batch is measured, shared with the worker thread.
+    metrics: Arc<Recorder>,
 }
 
 #[async_trait]
@@ -422,8 +438,10 @@ impl Embedder for E5Embedder {
                 .map(|t| apply_role_prefix(role, t, self.query_prefix(), self.passage_prefix()))
                 .collect();
             let expected = prefixed.len();
+            self.metrics.gauge("embedder.batch", &[("role", role.as_str())], expected as f64);
             let (resp_tx, resp_rx) = oneshot::channel();
-            self.req_tx.send(EmbedRequest { texts: prefixed, resp: resp_tx })
+            let queued = std::time::Instant::now();
+            self.req_tx.send(EmbedRequest { texts: prefixed, resp: resp_tx, role, queued })
                 .map_err(|_| EmbedError::WorkerGone)?;
             // Map the oneshot RecvError (sender dropped) to WorkerGone; otherwise
             // unwrap the inner Result the worker placed inside.
@@ -475,17 +493,20 @@ struct Inference {
     wants_token_type_ids: bool,
     /// The output holding the embeddings, picked when the session was built.
     output: String,
+    metrics: Arc<Recorder>,
 }
 
 impl Inference {
     /// One inference run over `texts`, already prefixed: the window, the
     /// padding, the session, then pooling and normalization.
-    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn embed(&mut self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
         let failed = |e: ort::Error| EmbedError::InferenceFailed(e.to_string());
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let encodings = window_encodings(&self.tokenizer, &refs)?;
         let batch = pad_right(&encodings, self.pad_id);
         let shape = [batch.rows, batch.len];
+        // What the session runs over, padding included.
+        self.metrics.gauge("embedder.batch_tokens", &[("role", role.as_str())], (batch.rows * batch.len) as f64);
 
         let mut inputs = ort::inputs![
             "input_ids" => Tensor::from_array((shape, batch.ids)).map_err(failed)?,
@@ -569,23 +590,28 @@ impl E5Embedder {
     /// After load succeeds, a single `std::thread` named `"embedder-worker"`
     /// takes ownership of the session for its entire lifetime. All callers
     /// route through the request channel; the session never crosses threads.
+    ///
+    /// Every batch is measured into `metrics`.
     pub fn from_parts(
         onnx: &[u8],
         tokenizer: Arc<Tokenizer>,
         files: &TokenizerFiles,
+        metrics: Arc<Recorder>,
     ) -> Result<Self, EmbedError> {
         let pad_id = check_tokenizer(&tokenizer, files)?;
         let session = build_session(onnx)?;
         let wants_token_type_ids = session.inputs().iter().any(|input| input.name() == "token_type_ids");
         let names: Vec<&str> = session.outputs().iter().map(|output| output.name()).collect();
         let output = names[pick_output(&names)?].to_string();
-        let mut inference = Inference { session, tokenizer, pad_id, wants_token_type_ids, output };
+        let mut inference =
+            Inference { session, tokenizer, pad_id, wants_token_type_ids, output, metrics: metrics.clone() };
+        let waits = metrics.clone();
 
         let (req_tx, req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
         std::thread::Builder::new()
             .name("embedder-worker".into())
             .spawn(move || {
-                serve_requests(req_rx, |texts| inference.embed(texts));
+                serve_requests(req_rx, &waits, |texts, role| inference.embed(texts, role));
                 drop(inference.session);
                 return_freed_memory();
             })
@@ -595,26 +621,31 @@ impl E5Embedder {
             req_tx,
             dimensions: EMBEDDING_DIM,
             model_id: E5_MODEL_ID,
+            metrics,
         })
     }
 }
 
 /// The worker thread's loop: answers each request with `infer` until every
-/// sender is gone or an inference panics.
+/// sender is gone or an inference panics, recording in `metrics` how long each
+/// waited to be taken.
 ///
 /// A panic is answered to its caller and ends the loop, so the session that
 /// panicked is never run again; the requests still queued lose their reply,
 /// which their callers see as [`EmbedError::WorkerGone`].
 fn serve_requests(
     mut req_rx: mpsc::UnboundedReceiver<EmbedRequest>,
-    mut infer: impl FnMut(&[String]) -> Result<Vec<Vec<f32>>, EmbedError>,
+    metrics: &Recorder,
+    mut infer: impl FnMut(&[String], EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError>,
 ) {
     // block_on bridges tokio's receiver into a thread outside the runtime.
-    while let Some(EmbedRequest { texts, resp }) = futures::executor::block_on(req_rx.recv()) {
+    while let Some(EmbedRequest { texts, resp, role, queued }) = futures::executor::block_on(req_rx.recv()) {
+        let waited = u64::try_from(queued.elapsed().as_micros()).unwrap_or(u64::MAX);
+        metrics.observe("embedder.wait", Unit::Micros, &[("role", role.as_str())], waited);
         if resp.is_closed() {
             continue;
         }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| infer(&texts))) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| infer(&texts, role))) {
             Ok(reply) => {
                 // A caller that left during the inference drops the reply.
                 let _ = resp.send(reply);
@@ -691,6 +722,7 @@ impl E5Embedder {
             req_tx,
             dimensions: 384,
             model_id: "mock-embedder",
+            metrics: Arc::default(),
         }
     }
 }
@@ -1280,6 +1312,30 @@ mod tests {
     // ---------- E5Embedder worker plumbing ----------
 
     #[tokio::test]
+    async fn every_batch_records_its_texts_by_role_and_the_worker_its_wait() {
+        use crate::metrics::SeriesKey;
+        let (req_tx, req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
+        let waits = Arc::new(Recorder::default());
+        let worker_waits = waits.clone();
+        std::thread::spawn(move || {
+            serve_requests(req_rx, &worker_waits, |texts, _| Ok(vec![vec![0.5_f32; 384]; texts.len()]));
+        });
+        let local = E5Embedder::from_mock_worker(req_tx);
+
+        let texts: Vec<String> = (0..EMBED_BATCH + 3).map(|i| format!("text {i}")).collect();
+        local.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
+        local.embed_with_role("a query", EmbedRole::Query).await.unwrap();
+
+        let gauges = local.metrics.minute().gauges;
+        let passage = gauges[&SeriesKey::new("embedder.batch", &[("role", "passage")])];
+        assert_eq!((passage.count, passage.max, passage.last), (2, EMBED_BATCH as f64, 3.0), "one sample per batch");
+        assert_eq!(gauges[&SeriesKey::new("embedder.batch", &[("role", "query")])].last, 1.0);
+        let run = waits.run();
+        assert_eq!(run[&SeriesKey::new("embedder.wait", &[("role", "passage")])].count(), 2);
+        assert_eq!(run[&SeriesKey::new("embedder.wait", &[("role", "query")])].count(), 1);
+    }
+
+    #[tokio::test]
     async fn embed_request_round_trip_through_channel() {
         // Hand-rolled mock worker: spawn a thread that receives EmbedRequest
         // and replies with a canned 384-dim vector.
@@ -1287,7 +1343,7 @@ mod tests {
         let canned: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
         let canned_for_worker = canned.clone();
         std::thread::spawn(move || {
-            while let Some(EmbedRequest { texts: _, resp }) =
+            while let Some(EmbedRequest { resp, .. }) =
                 futures::executor::block_on(req_rx.recv())
             {
                 let _ = resp.send(Ok(vec![canned_for_worker.clone()]));
@@ -1323,7 +1379,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_worker = captured.clone();
         std::thread::spawn(move || {
-            while let Some(EmbedRequest { texts, resp }) =
+            while let Some(EmbedRequest { texts, resp, .. }) =
                 futures::executor::block_on(req_rx.recv())
             {
                 captured_for_worker.lock().unwrap().push(texts.clone());
@@ -1361,7 +1417,7 @@ mod tests {
         let sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
         let sizes_for_worker = sizes.clone();
         std::thread::spawn(move || {
-            while let Some(EmbedRequest { texts, resp }) =
+            while let Some(EmbedRequest { texts, resp, .. }) =
                 futures::executor::block_on(req_rx.recv())
             {
                 sizes_for_worker.lock().unwrap().push(texts.len());
@@ -1391,7 +1447,7 @@ mod tests {
     async fn e5_embedder_rejects_reply_with_wrong_vector_count() {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
         std::thread::spawn(move || {
-            while let Some(EmbedRequest { texts: _, resp }) =
+            while let Some(EmbedRequest { resp, .. }) =
                 futures::executor::block_on(req_rx.recv())
             {
                 // Reply with only 1 vector for however many texts were sent.
@@ -1412,7 +1468,7 @@ mod tests {
     async fn a_panicking_inference_answers_its_caller_and_ends_the_worker() {
         let (req_tx, req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
         let worker = std::thread::spawn(move || {
-            serve_requests(req_rx, |_| panic!("the session broke"));
+            serve_requests(req_rx, &Recorder::default(), |_, _| panic!("the session broke"));
         });
         let local = E5Embedder::from_mock_worker(req_tx);
 
@@ -1436,12 +1492,19 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel::<EmbedRequest>();
         let (gone_tx, gone_rx) = oneshot::channel();
         drop(gone_rx);
-        req_tx.send(EmbedRequest { texts: vec!["nobody waits".into()], resp: gone_tx }).unwrap();
+        req_tx
+            .send(EmbedRequest {
+                texts: vec!["nobody waits".into()],
+                resp: gone_tx,
+                role: EmbedRole::Passage,
+                queued: std::time::Instant::now(),
+            })
+            .unwrap();
 
         let inferred = Arc::new(AtomicUsize::new(0));
         let counted = inferred.clone();
         std::thread::spawn(move || {
-            serve_requests(req_rx, |texts| {
+            serve_requests(req_rx, &Recorder::default(), |texts, _| {
                 counted.fetch_add(1, Ordering::SeqCst);
                 Ok(texts.iter().map(|_| vec![0.0; 384]).collect())
             });
@@ -1476,7 +1539,7 @@ mod tests {
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let captured_for_worker = captured.clone();
         std::thread::spawn(move || {
-            while let Some(EmbedRequest { texts, resp }) =
+            while let Some(EmbedRequest { texts, resp, .. }) =
                 futures::executor::block_on(req_rx.recv())
             {
                 *captured_for_worker.lock().unwrap() = texts.first().cloned();

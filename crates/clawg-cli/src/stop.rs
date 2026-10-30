@@ -123,7 +123,6 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
-            metrics: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();

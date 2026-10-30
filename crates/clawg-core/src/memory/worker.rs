@@ -23,9 +23,11 @@ use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::redact::{redact, SecretKind};
 use crate::memory::sharing::Reader;
-use crate::memory::store_insert::{NewMemoryRecord, Stored};
+use crate::memory::store_insert::{NewMemoryRecord, Stored as Insert};
 use crate::memory::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
+use crate::memory::clock::TimestampMs;
 use crate::memory::MemoryStore;
+use crate::metrics::{Recorder, Unit};
 
 /// What happened to one chunk that reached the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +339,7 @@ pub async fn memory_worker(
         // Read after recv: this is the backlog still waiting, which is what
         // "falling behind" means.
         let depth = rx.len();
+        store.metrics().gauge("ingest.queue_depth", &[], depth as f64);
         match queue_depth_transition(depth, queue_over_depth) {
             Some(QueueDepthEdge::Rising) => {
                 queue_over_depth = true;
@@ -366,10 +369,11 @@ pub async fn memory_worker(
             let track = match outbox {
                 None => None,
                 Some(row) => match take_row(&store, row).await {
-                    Some(progress) => Some(Track { row, progress }),
+                    Some((progress, accepted)) => Some(Track { row, progress, accepted }),
                     None => break,
                 },
             };
+            let accepted = track.as_ref().map(|t| t.accepted);
             let watch = DrainWatch { deadline, signal: drain.as_ref() };
             let report = process_tracked(
                 &evt,
@@ -381,6 +385,7 @@ pub async fn memory_worker(
                 watch,
             )
             .await;
+            record_outcome(store.metrics(), &report, outbox.is_some(), accepted);
             if let Some(row) = outbox.filter(|_| report.paused) {
                 if let Err(e) = store.outbox_pause(row).await {
                     log::warn!("could not hand back the attempt of paused outbox row {row}: {e}");
@@ -530,12 +535,12 @@ async fn wait_to_retry(
     }
 }
 
-/// Takes outbox `row` for this run: its progress, or `None` when there is
+/// Takes outbox `row` for this run: its progress and when it was accepted, or `None` when there is
 /// nothing to ingest (taken already in this run, finished, failed, given up
 /// just now, or unreadable, which leaves it for the next start).
-async fn take_row(store: &Arc<MemoryStore>, row: i64) -> Option<Vec<NotedPiece>> {
+async fn take_row(store: &Arc<MemoryStore>, row: i64) -> Option<(Vec<NotedPiece>, TimestampMs)> {
     match store.outbox_claim(row).await {
-        Ok(Claimed::Process { progress }) => Some(progress),
+        Ok(Claimed::Process { progress, created_at }) => Some((progress, created_at)),
         Ok(Claimed::Skip) => None,
         Ok(Claimed::GaveUp) => {
             log::warn!("gave up outbox row {row}: the daemon stopped every time it ingested it");
@@ -627,6 +632,7 @@ async fn absorb_duplicate(
 struct Track {
     row: i64,
     progress: Vec<NotedPiece>,
+    accepted: TimestampMs,
 }
 
 /// The note a store write of `position` records for `track`, built from the
@@ -722,6 +728,7 @@ async fn process_tracked(
     });
     report.revision_candidate = unkeyed_revision(evt.topic(), &report.related);
     let warned = report.revision_candidate;
+    let started = Instant::now();
     report.replaced = match row {
         // A failure here leaves the row with every piece noted: the next start
         // only finishes it.
@@ -731,7 +738,47 @@ async fn process_tracked(
         }),
         None => finish_save(store, pieces, revision, warned).await,
     };
+    record_stage(store.metrics(), "link", started);
     report
+}
+
+/// Records under `ingest.stage` how long `stage` of a save took since
+/// `started`.
+fn record_stage(metrics: &Recorder, stage: &'static str, started: Instant) {
+    metrics.observe("ingest.stage", Unit::Micros, &[("stage", stage)], micros(started.elapsed()));
+}
+
+fn micros(took: std::time::Duration) -> u64 {
+    u64::try_from(took.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// How a take of a save ended, as `ingest.outcome` names it; `None` for one
+/// a drain paused, which the next start resumes.
+fn outcome_of(report: &IngestReport, has_row: bool) -> Option<&'static str> {
+    if report.paused {
+        return None;
+    }
+    Some(match &report.failure {
+        None => "stored",
+        Some(IngestFailure::EmbedderUnavailable) if has_row => "retrying",
+        Some(_) if !report.memories.is_empty() => "partially_saved",
+        Some(_) => "failed",
+    })
+}
+
+/// Records how a take of a save ended and, for one stored, its pieces and,
+/// with its outbox row, how long it took since it was accepted.
+fn record_outcome(metrics: &Recorder, report: &IngestReport, has_row: bool, accepted: Option<TimestampMs>) {
+    let Some(outcome) = outcome_of(report, has_row) else { return };
+    metrics.gauge("ingest.outcome", &[("outcome", outcome)], 1.0);
+    if outcome != "stored" {
+        return;
+    }
+    metrics.gauge("ingest.pieces", &[], report.memories.len() as f64);
+    if let Some(accepted) = accepted {
+        let waited = TimestampMs::now().as_millis_i64().saturating_sub(accepted.as_millis_i64()).max(0);
+        metrics.observe("ingest.end_to_end", Unit::Micros, &[], (waited as u64).saturating_mul(1_000));
+    }
 }
 
 /// `evt` under the live project its project leads to, when that is another.
@@ -749,83 +796,78 @@ async fn follow_merge(store: &MemoryStore, evt: &MemoryEvent) -> Option<MemoryEv
     }
 }
 
-/// Stores the pieces of `evt` and returns its report with the pieces to link,
-/// in order, each with the head its vector was embedded behind.
-async fn ingest_pieces(
-    evt: &MemoryEvent,
-    saver: &Reader,
-    store: &Arc<MemoryStore>,
-    embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
-    chat_chunker: &Arc<ChatChunker>,
-    absorbed: &mut u64,
-    track: Option<Track>,
-    earlier: &[i64],
-    drain: DrainWatch<'_>,
-) -> (IngestReport, Vec<StoredPiece>) {
-    // Masked before anything else reads the text, so the chunker, the dedup
-    // hash, the embedding, the full-text index and the stored row all see the
-    // same masked content, and the secret reaches none of them. An event from
-    // the outbox was masked before it was recorded, and this pass finds
-    // nothing more.
+/// Masks `evt` and splits it into the pieces a save stores, with the head
+/// every piece after the first is embedded behind. `None` when the event
+/// stores nothing: a skipped role, or no text left after the chunker's rules.
+///
+/// Masked before anything else reads the text, so the chunker, the dedup
+/// hash, the embedding, the full-text index and the stored row all see the
+/// same masked content, and the secret reaches none of them. An event from
+/// the outbox was masked before it was recorded, and this pass finds nothing
+/// more.
+fn split_event(evt: &MemoryEvent, chat_chunker: &ChatChunker) -> (Vec<SecretKind>, Option<SaveSplit>) {
     let masked = redact(&evt.content);
-    let redacted = masked.kinds;
-    let content = masked.text;
     // Source-first: Compaction-sourced events bypass select_chunker (and thus
     // the Role::System→Skip rule that ordinarily drops system-authored
     // content from ingestion) entirely — they always chunk via ChatChunker,
     // because a compaction summary is deliberately synthesized content worth
     // keeping regardless of which role produced the text it summarizes. All
     // other sources keep the existing role-based routing.
-    let SaveSplit { pieces: chunks, head } = if evt.source == MemorySource::Compaction {
-        chat_chunker.split_save(&content)
-    } else {
-        let kind = select_chunker(evt.role.clone(), evt.is_error, &content);
-        match kind {
-            ChunkerKind::Chat => chat_chunker.split_save(&content),
-            ChunkerKind::Skip => return (IngestReport { redacted, ..Default::default() }, Vec::new()),
-        }
+    let kind = match evt.source {
+        MemorySource::Compaction => ChunkerKind::Chat,
+        _ => select_chunker(evt.role.clone(), evt.is_error, &masked.text),
     };
+    let split = match kind {
+        ChunkerKind::Chat => Some(chat_chunker.split_save(&masked.text)),
+        ChunkerKind::Skip => None,
+    };
+    // Content that was all-whitespace or empty after chunker policy is not an
+    // error.
+    (masked.kinds, split.filter(|split| !split.pieces.is_empty()))
+}
 
-    if chunks.is_empty() {
-        // Content was all-whitespace or empty after chunker policy. Not an error.
-        return (IngestReport { redacted, ..Default::default() }, Vec::new());
+/// What the dedup gate left of a save: what each position already became,
+/// the head each of those was embedded behind, the pieces still to embed and
+/// the progress noted so far.
+struct Gated {
+    stored: Vec<Option<SavedChunk>>,
+    contexts: Vec<String>,
+    survivors: Vec<(usize, PendingChunk)>,
+    noted: Vec<NotedPiece>,
+}
+
+/// The head a piece at `position` is embedded behind: none for the first,
+/// which already starts with it.
+fn head_for(head: Option<&str>, position: usize) -> &str {
+    match head {
+        Some(head) if position > 0 => head,
+        _ => "",
     }
+}
 
-    // `memory_worker` holds events until the embedder is loaded, so this only
-    // fires for a caller that skips that wait. Drop the whole event rather
-    // than embedding some of its chunks: a half-embedded event could not be
-    // told apart from a finished one later.
-    let Some(embedder) = embedder_cell.get().cloned() else {
-        log::debug!(
-            "embedder NotReady; dropping {} chunks for agent={}",
-            chunks.len(),
-            evt.agent_id
-        );
-        let report =
-            IngestReport { failure: Some(IngestFailure::EmbedderUnavailable), redacted, ..Default::default() };
-        return (report, Vec::new());
-    };
-
-    // Stage 1 — gate. Every chunk passes the hash gate before anything is
-    // embedded; a collapsed entry absorbed by the gate is charged once per
+/// Runs every piece of a save through the dedup gate before anything is
+/// embedded, taking what an earlier attempt of `track` stored as it was.
+async fn gate_pieces(
+    evt: &MemoryEvent,
+    saver: &Reader,
+    store: &Arc<MemoryStore>,
+    absorbed: &mut u64,
+    track: Option<&Track>,
+    chunks: Vec<Chunk>,
+) -> Gated {
+    // A collapsed entry absorbed by the gate is charged once per
     // copy it stood for, which is what the same copies arriving one at a
     // time would have done.
     // `stored[i]` is what the i-th collapsed chunk became, so the report keeps
     // chunk order even though absorbed chunks are settled before the rest.
     let pending_chunks = collapse_duplicate_chunks(chunks);
-    // The head goes into the embedder with every piece after the first; the
-    // first already starts with it.
-    let context = |position: usize| match &head {
-        Some(head) if position > 0 => head.as_str(),
-        _ => "",
-    };
     // What an earlier attempt already stored is taken as it was: reinforcing
     // it again would count an access nobody made, and its link keeps the head
     // it was embedded behind.
     let hashes: Vec<&str> = pending_chunks.iter().map(|p| p.content_hash.as_str()).collect();
     let mut resumed: Vec<Option<NotedPiece>> = vec![None; pending_chunks.len()];
     let mut noted: Vec<NotedPiece> = Vec::new();
-    if let Some(track) = &track {
+    if let Some(track) = track {
         match resume_positions(&track.progress, &hashes) {
             Some(by_position) => {
                 resumed = by_position;
@@ -847,7 +889,7 @@ async fn ingest_pieces(
             contexts[position] = done.context;
             continue;
         }
-        let note = note_for(track.as_ref(), &noted, position, &pending.content_hash, false, "");
+        let note = note_for(track, &noted, position, &pending.content_hash, false, "");
         if let Some(id) = absorb_duplicate(store, evt, saver, &pending.content_hash, absorbed, note).await {
             if track.is_some() {
                 noted.push(NotedPiece {
@@ -866,8 +908,84 @@ async fn ingest_pieces(
         }
         survivors.push((position, pending));
     }
-    let report = |stored: &[Option<SavedChunk>], failure| IngestReport {
-        memories: stored.iter().flatten().copied().collect(),
+    Gated { stored, contexts, survivors, noted }
+}
+
+/// Embeds the pieces the gate left, each behind the head its position takes,
+/// in one inference call for the whole save. Passage: a stored piece is the
+/// thing being searched THROUGH. Each vector feeds both the insert and the
+/// contradiction KNN probe with no second inference call, so both sides of
+/// `contradiction.rs`'s comparison live in the same Passage space
+/// `CONTRADICTION_THRESHOLD` was tuned against.
+async fn embed_pieces(
+    embedder: &dyn Embedder,
+    survivors: &[(usize, PendingChunk)],
+    head: Option<&str>,
+) -> Result<Vec<Vec<f32>>, IngestFailure> {
+    let texts: Vec<String> = survivors
+        .iter()
+        .map(|(position, p)| embedding_text(head_for(head, *position), &p.chunk.text).into_owned())
+        .collect();
+    let vectors = match embedder.embed_batch(&texts, EmbedRole::Passage).await {
+        Ok(v) => v,
+        Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => return Err(IngestFailure::EmbedderUnavailable),
+        Err(e) => return Err(IngestFailure::Failed(format!("embed failed: {e}"))),
+    };
+    if vectors.len() != survivors.len() {
+        // Zipping a short reply would pair chunks with other chunks'
+        // vectors and store the mismatch as fact. Dropping the event is
+        // recoverable; a silently mislabeled memory is not.
+        return Err(IngestFailure::Failed(format!(
+            "embedder returned {} vectors for {} chunks",
+            vectors.len(),
+            survivors.len()
+        )));
+    }
+    Ok(vectors)
+}
+
+/// Stores the pieces of `evt` and returns its report with the pieces to link,
+/// in order, each with the head its vector was embedded behind.
+async fn ingest_pieces(
+    evt: &MemoryEvent,
+    saver: &Reader,
+    store: &Arc<MemoryStore>,
+    embedder_cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
+    chat_chunker: &Arc<ChatChunker>,
+    absorbed: &mut u64,
+    track: Option<Track>,
+    earlier: &[i64],
+    drain: DrainWatch<'_>,
+) -> (IngestReport, Vec<StoredPiece>) {
+    let metrics = store.metrics();
+    let started = Instant::now();
+    let (redacted, split) = split_event(evt, chat_chunker);
+    record_stage(metrics, "split", started);
+    let Some(SaveSplit { pieces: chunks, head }) = split else {
+        return (IngestReport { redacted, ..Default::default() }, Vec::new());
+    };
+
+    // `memory_worker` holds events until the embedder is loaded, so this only
+    // fires for a caller that skips that wait. Drop the whole event rather
+    // than embedding some of its chunks: a half-embedded event could not be
+    // told apart from a finished one later.
+    let Some(embedder) = embedder_cell.get().cloned() else {
+        log::debug!(
+            "embedder NotReady; dropping {} chunks for agent={}",
+            chunks.len(),
+            evt.agent_id
+        );
+        let report =
+            IngestReport { failure: Some(IngestFailure::EmbedderUnavailable), redacted, ..Default::default() };
+        return (report, Vec::new());
+    };
+
+    let head = head.as_deref();
+    let started = Instant::now();
+    let mut gated = gate_pieces(evt, saver, store, absorbed, track.as_ref(), chunks).await;
+    record_stage(metrics, "gate", started);
+    let report = |gated: &Gated, failure| IngestReport {
+        memories: gated.stored.iter().flatten().copied().collect(),
         failure,
         redacted: redacted.clone(),
         related: Vec::new(),
@@ -875,55 +993,66 @@ async fn ingest_pieces(
         revision_candidate: None,
         paused: false,
     };
-    let pieces = |stored: &[Option<SavedChunk>], contexts: &[String]| -> Vec<StoredPiece> {
-        stored
-            .iter()
-            .zip(contexts)
-            .filter_map(|(saved, context)| saved.map(|s| StoredPiece { memory_id: s.id, context: context.clone() }))
-            .collect()
-    };
-    if survivors.is_empty() {
-        return (report(&stored, None), pieces(&stored, &contexts));
+    if gated.survivors.is_empty() {
+        return (report(&gated, None), gated.pieces());
     }
 
-    // Stage 2 — one inference call for the whole event. Passage: a stored
-    // chunk is the thing being searched THROUGH. Each vector produced here
-    // feeds BOTH consumers below — insert and the contradiction KNN probe —
-    // with no second inference call, so both sides of `contradiction.rs`'s
-    // comparison live in the same Passage space `CONTRADICTION_THRESHOLD`
-    // was tuned against.
-    let texts: Vec<String> =
-        survivors.iter().map(|(position, p)| embedding_text(context(*position), &p.chunk.text).into_owned()).collect();
-    let vectors = match embedder.embed_batch(&texts, EmbedRole::Passage).await {
-        Ok(v) => v,
-        Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => {
-            return (report(&stored, Some(IngestFailure::EmbedderUnavailable)), Vec::new());
-        }
-        Err(e) => {
-            return (report(&stored, Some(IngestFailure::Failed(format!("embed failed: {e}")))), Vec::new());
-        }
+    let started = Instant::now();
+    let embedded = embed_pieces(embedder.as_ref(), &gated.survivors, head).await;
+    record_stage(metrics, "embed", started);
+    let vectors = match embedded {
+        Ok(vectors) => vectors,
+        Err(failure) => return (report(&gated, Some(failure)), Vec::new()),
     };
-    if vectors.len() != survivors.len() {
-        // Zipping a short reply would pair chunks with other chunks'
-        // vectors and store the mismatch as fact. Dropping the event is
-        // recoverable; a silently mislabeled memory is not.
-        let failure = IngestFailure::Failed(format!(
-            "embedder returned {} vectors for {} chunks",
-            vectors.len(),
-            survivors.len()
-        ));
-        return (report(&stored, Some(failure)), Vec::new());
-    }
 
-    // Stage 3 — sequential, one chunk at a time: chunk N's contradiction
-    // probe is a KNN search over rows already in the store, so chunk N-1 of
-    // this same event is already there when it runs. An explicit save
+    let to_store = PieceStore { evt, saver, store, track: track.as_ref(), earlier, drain, head };
+    let started = Instant::now();
+    let stored = store_pieces(&to_store, absorbed, &mut gated, vectors).await;
+    record_stage(metrics, "store", started);
+    match stored {
+        Stored::Done { related } => (IngestReport { related, ..report(&gated, None) }, gated.pieces()),
+        Stored::Paused => (IngestReport { paused: true, ..report(&gated, None) }, Vec::new()),
+        Stored::Failed(failure) => (report(&gated, Some(failure)), Vec::new()),
+    }
+}
+
+/// What storing a save's pieces needs besides the gate's result.
+#[derive(Clone, Copy)]
+struct PieceStore<'a> {
+    evt: &'a MemoryEvent,
+    saver: &'a Reader,
+    store: &'a Arc<MemoryStore>,
+    track: Option<&'a Track>,
+    /// The earlier rows of the save's topic key.
+    earlier: &'a [i64],
+    drain: DrainWatch<'a>,
+    head: Option<&'a str>,
+}
+
+/// How storing a save's pieces ended.
+enum Stored {
+    /// Every piece is in the store, with the rows the detector paired them with.
+    Done { related: Vec<Candidate> },
+    /// A drain was due: the pieces stored so far are noted in the row.
+    Paused,
+    Failed(IngestFailure),
+}
+
+/// Stores the pieces the gate left, each with its vector, writing what each
+/// became into `gated`.
+async fn store_pieces(to: &PieceStore<'_>, absorbed: &mut u64, gated: &mut Gated, vectors: Vec<Vec<f32>>) -> Stored {
+    // Sequential, one chunk at a time: chunk N's contradiction probe is a KNN
+    // search over rows already in the store, so chunk N-1 of this same event
+    // is already there when it runs. An explicit save
     // carries a claim-bearing type, so a long one reaches the probe once per
     // chunk; the chunks this event already inserted are passed as siblings,
     // because two parts of one save are one claim by one author and must not
     // dispute each other. The rows a conclusion was drawn from are passed the
     // same way: it restates them, it does not contradict them. So are the
     // earlier rows of the save's topic key: it replaces them once it finishes.
+    let PieceStore { evt, saver, store, track, earlier, drain, head } = *to;
+    let context = |position: usize| head_for(head, position);
+    let Gated { stored, contexts, survivors, noted } = gated;
     let mut siblings: Vec<i64> = evt.sources().to_vec();
     siblings.extend_from_slice(earlier);
     siblings.extend(stored.iter().flatten().filter(|s| s.outcome == ChunkOutcome::Inserted).map(|s| s.id));
@@ -933,9 +1062,9 @@ async fn ingest_pieces(
     let mut related: Vec<Candidate> = Vec::new();
     // Every take stores at least one piece before it may pause, so the embed
     // it paid for is not thrown away whole and a save always moves forward.
-    for (taken, ((position, pending), vec)) in survivors.into_iter().zip(vectors).enumerate() {
+    for (taken, ((position, pending), vec)) in std::mem::take(survivors).into_iter().zip(vectors).enumerate() {
         if taken > 0 && track.is_some() && pause_due(Instant::now(), drain.deadline()) {
-            return (IngestReport { paused: true, ..report(&stored, None) }, Vec::new());
+            return Stored::Paused;
         }
         let PendingChunk { chunk, content_hash, multiplicity } = pending;
         // The contradiction hook runs between embed and insert: it needs the
@@ -952,11 +1081,11 @@ async fn ingest_pieces(
         .map(|(_, candidate)| candidate)
         .collect();
         let candidates = record.candidates.clone();
-        let note = note_for(track.as_ref(), &noted, position, &content_hash, true, context(position));
-        let absorbed_note = note_for(track.as_ref(), &noted, position, &content_hash, false, "");
+        let note = note_for(track, &noted, position, &content_hash, true, context(position));
+        let absorbed_note = note_for(track, &noted, position, &content_hash, false, "");
         let id = match store.insert_unless_twin(saver, record, vec, note, absorbed_note).await {
-            Ok(Stored::Inserted(id)) => id,
-            Ok(Stored::Absorbed(id)) => {
+            Ok(Insert::Inserted(id)) => id,
+            Ok(Insert::Absorbed(id)) => {
                 *absorbed += 1;
                 log::debug!("ingest absorbed a twin that came back while the save was embedded (memory_id={id})");
                 if track.is_some() {
@@ -969,8 +1098,7 @@ async fn ingest_pieces(
                 continue;
             }
             Err(e) => {
-                let failure = IngestFailure::Failed(format!("store insert failed: {e}"));
-                return (report(&stored, Some(failure)), Vec::new());
+                return Stored::Failed(IngestFailure::Failed(format!("store insert failed: {e}")));
             }
         };
         if track.is_some() {
@@ -992,7 +1120,19 @@ async fn ingest_pieces(
             absorb_duplicate(store, evt, saver, &content_hash, absorbed, |_| None).await;
         }
     }
-    (IngestReport { related, ..report(&stored, None) }, pieces(&stored, &contexts))
+    Stored::Done { related }
+}
+
+impl Gated {
+    /// The pieces stored, in order, each with the head its vector was
+    /// embedded behind.
+    fn pieces(&self) -> Vec<StoredPiece> {
+        self.stored
+            .iter()
+            .zip(&self.contexts)
+            .filter_map(|(saved, context)| saved.map(|s| StoredPiece { memory_id: s.id, context: context.clone() }))
+            .collect()
+    }
 }
 
 /// Finishes a save that no outbox row stands for: links its pieces when there
@@ -1101,6 +1241,154 @@ mod tests {
             .await
             .expect("worker must exit within timeout after sender dropped")
             .expect("worker must not panic");
+    }
+
+    // ── The stages of a save ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_split_masks_the_text_and_leaves_out_what_stores_nothing() {
+        let chunker = ChatChunker::with_fallback();
+        let (redacted, split) = split_event(&make_event(Role::User, "password=hunter2abc and more", None, 1), &chunker);
+        assert_eq!(redacted, [SecretKind::Password]);
+        let split = split.expect("a user's text is stored");
+        assert_eq!(split.pieces.len(), 1);
+        assert!(!split.pieces[0].text.contains("hunter2abc"), "{}", split.pieces[0].text);
+
+        assert!(split_event(&make_event(Role::System, "you are a helpful agent", None, 1), &chunker).1.is_none());
+        assert!(split_event(&make_event(Role::User, "", None, 1), &chunker).1.is_none());
+        let compaction = MemoryEvent { source: MemorySource::Compaction, ..make_event(Role::System, "the summary", None, 1) };
+        assert!(split_event(&compaction, &chunker).1.is_some(), "a compaction is kept whoever wrote it");
+
+        let long = "word ".repeat(4_000);
+        let split = split_event(&make_event(Role::User, &long, None, 1), &chunker).1.unwrap();
+        assert!(split.pieces.len() > 1 && split.head.is_some(), "a long save is pieces behind a head");
+    }
+
+    #[tokio::test]
+    async fn the_gate_absorbs_a_stored_piece_and_takes_a_resumed_one_as_it_was() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = make_event(Role::User, "alpha", None, 1);
+        let first = save_for_test(&store, &evt).await.memories[0].id;
+        let saver = store.reader_for(&evt.agent_id);
+        let chunks = |texts: &[&str]| texts.iter().map(|t| Chunk { text: t.to_string() }).collect::<Vec<_>>();
+        let mut absorbed = 0;
+
+        let gated = gate_pieces(&evt, &saver, &store, &mut absorbed, None, chunks(&["alpha", "beta", "beta"])).await;
+        assert_eq!(gated.stored[0], Some(SavedChunk { id: first, outcome: ChunkOutcome::Reinforced }));
+        assert_eq!(gated.stored[1], None);
+        assert_eq!(gated.survivors.iter().map(|(p, c)| (*p, c.multiplicity)).collect::<Vec<_>>(), [(1, 2)]);
+        assert_eq!(absorbed, 1);
+        assert!(gated.noted.is_empty(), "nothing is noted without a row");
+
+        let beta = crate::memory::dedup::content_hash("beta");
+        let progress = vec![NotedPiece { position: 1, hash: beta, id: 77, inserted: true, context: "head".into() }];
+        let track = Track { row: 1, progress, accepted: TimestampMs::now() };
+        let gated = gate_pieces(&evt, &saver, &store, &mut absorbed, Some(&track), chunks(&["alpha", "beta"])).await;
+        assert_eq!(gated.stored[1], Some(SavedChunk { id: 77, outcome: ChunkOutcome::Inserted }));
+        assert_eq!(gated.contexts[1], "head", "a resumed piece keeps the head it was embedded behind");
+        assert!(gated.survivors.is_empty());
+        assert_eq!(gated.noted.len(), 2, "the progress so far, and the piece the gate absorbed now");
+    }
+
+    #[tokio::test]
+    async fn the_embed_puts_the_head_before_every_piece_but_the_first_and_names_its_failure() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = RecordingEmbedder { calls: calls.clone() };
+        let pending = |text: &str| PendingChunk {
+            chunk: Chunk { text: text.to_string() },
+            content_hash: crate::memory::dedup::content_hash(text),
+            multiplicity: 1,
+        };
+        let survivors = vec![(0, pending("first")), (2, pending("third"))];
+
+        let vectors = embed_pieces(&recording, &survivors, Some("HEAD")).await.unwrap();
+        assert_eq!(vectors.len(), 2);
+        let texts: Vec<String> = calls.lock().unwrap().iter().map(|(role, text)| {
+            assert_eq!(*role, EmbedRole::Passage);
+            text.clone()
+        }).collect();
+        assert_eq!(texts[0], "first");
+        assert_eq!(texts[1], embedding_text("HEAD", "third").into_owned());
+
+        struct Answering(Result<usize, EmbedError>);
+        #[async_trait::async_trait]
+        impl Embedder for Answering {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                unreachable!()
+            }
+            async fn embed_batch(&self, _texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+                match &self.0 {
+                    Ok(n) => Ok(vec![vec![0.1; 384]; *n]),
+                    Err(EmbedError::NotReady) => Err(EmbedError::NotReady),
+                    Err(_) => Err(EmbedError::WorkerGone),
+                }
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "answering" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+        for (answer, failure) in [
+            (Err(EmbedError::NotReady), IngestFailure::EmbedderUnavailable),
+            (Err(EmbedError::WorkerGone), IngestFailure::EmbedderUnavailable),
+            (Ok(1), IngestFailure::Failed("embedder returned 1 vectors for 2 chunks".into())),
+        ] {
+            assert_eq!(embed_pieces(&Answering(answer), &survivors, None).await.unwrap_err(), failure);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_store_writes_each_piece_notes_it_and_pauses_when_a_drain_is_due() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = make_event(Role::User, "two pieces", None, 1);
+        let saver = store.reader_for(&evt.agent_id);
+        let gate = |texts: &[&str]| Gated {
+            stored: vec![None; texts.len()],
+            contexts: vec![String::new(); texts.len()],
+            survivors: texts
+                .iter()
+                .enumerate()
+                .map(|(position, text)| {
+                    let chunk = Chunk { text: text.to_string() };
+                    let content_hash = crate::memory::dedup::content_hash(text);
+                    (position, PendingChunk { chunk, content_hash, multiplicity: 1 })
+                })
+                .collect(),
+            noted: Vec::new(),
+        };
+        let vectors = |n: usize| vec![vec![0.1_f32; 384]; n];
+        let track = Track { row: 1, progress: Vec::new(), accepted: TimestampMs::now() };
+        let mut absorbed = 0;
+
+        let to = PieceStore {
+            evt: &evt, saver: &saver, store: &store, track: Some(&track), earlier: &[], drain: DrainWatch::default(),
+            head: Some("HEAD"),
+        };
+        let mut gated = gate(&["first piece", "second piece"]);
+        assert!(matches!(store_pieces(&to, &mut absorbed, &mut gated, vectors(2)).await, Stored::Done { .. }));
+        assert!(gated.stored.iter().all(|s| s.is_some_and(|s| s.outcome == ChunkOutcome::Inserted)), "{:?}", gated.stored);
+        assert_eq!(gated.contexts, ["", "HEAD"], "only the pieces after the first are embedded behind the head");
+        assert_eq!(gated.noted.len(), 2);
+        assert_eq!(gated.pieces().len(), 2);
+
+        let due = DrainWatch { deadline: Some(Instant::now()), signal: None };
+        let mut gated = gate(&["third piece", "fourth piece"]);
+        let paused = store_pieces(&PieceStore { drain: due, ..to }, &mut absorbed, &mut gated, vectors(2)).await;
+        assert!(matches!(paused, Stored::Paused));
+        assert_eq!(gated.stored.iter().flatten().count(), 1, "a take stores one piece before it may pause");
+    }
+
+    #[test]
+    fn a_take_is_named_by_how_it_ended() {
+        let saved = |n: usize| (0..n).map(|id| SavedChunk { id: id as i64, outcome: ChunkOutcome::Inserted }).collect();
+        let report = |memories, failure| IngestReport { memories, failure, ..Default::default() };
+        let failed = || Some(IngestFailure::Failed("disk full".into()));
+        assert_eq!(outcome_of(&report(saved(2), None), true), Some("stored"));
+        assert_eq!(outcome_of(&report(saved(0), Some(IngestFailure::EmbedderUnavailable)), true), Some("retrying"));
+        assert_eq!(outcome_of(&report(saved(0), Some(IngestFailure::EmbedderUnavailable)), false), Some("failed"), "only a row is tried again");
+        assert_eq!(outcome_of(&report(saved(1), failed()), true), Some("partially_saved"));
+        assert_eq!(outcome_of(&report(saved(0), failed()), true), Some("failed"));
+        assert_eq!(outcome_of(&IngestReport { paused: true, ..report(saved(1), None) }, true), None, "a paused save resumes");
     }
 
     // ── Worker spawn returns a join handle usable for shutdown/panic detection ──

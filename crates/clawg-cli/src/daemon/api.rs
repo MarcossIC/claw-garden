@@ -57,14 +57,16 @@ use clawg_core::memory::registry::{
     Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
 };
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
-use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
+use clawg_core::memory::prompt_builder::{
+    build_memory_prompt, build_session_prompt, PromptBlock, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET,
+};
 use clawg_core::memory::sharing::{self, Reach, Reader};
 use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
     conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
-use clawg_core::metrics::Recorder;
+use clawg_core::metrics::{EventKind, Recorder, Unit};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
@@ -109,8 +111,6 @@ pub struct AppCtx {
     /// The host session each agent works in, per project, that saves are
     /// stamped with.
     pub sessions: SessionRegistry,
-    /// The metrics of this run: every request, and what the writer samples.
-    pub metrics: Arc<Recorder>,
 }
 
 /// How long a save waits for the worker. Long enough for a multi-chunk save
@@ -774,6 +774,17 @@ pub enum RetrievalState {
 }
 
 impl RetrievalState {
+    /// The state as the answer names it.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Searched { .. } => "searched",
+            Self::Recent { .. } => "recent",
+            Self::EmbedderNotReady => "embedder_not_ready",
+            Self::EmbedderFailed { .. } => "embedder_failed",
+            Self::SearchFailed { .. } => "search_failed",
+        }
+    }
+
     /// Reads a missing embedder from `status`, as [`ready_embedder`] does for
     /// a search, so the two never disagree on why memories cannot be reached.
     fn of(retrieval: Retrieval, status: EmbedderStatus) -> Self {
@@ -1074,7 +1085,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
 
-    let meter = Arc::new(HttpMeter::new(app.metrics.clone()));
+    let meter = Arc::new(HttpMeter::new(app.runtime.metrics.clone()));
     Router::new()
         .route("/health", get(health))
         .nest("/v1", v1)
@@ -1490,6 +1501,8 @@ async fn search(
     app.runtime.access_tracker.record_hits(&hits);
 
     let withheld = found - hits.len();
+    app.runtime.metrics.gauge("search.hits", &[], hits.len() as f64);
+    app.runtime.metrics.gauge("search.withheld", &[], withheld as f64);
     let other_language = match lang {
         Some(lang) => other_language(&app, lang, project_id.as_deref(), &caller).await,
         None => None,
@@ -1615,7 +1628,18 @@ async fn context(
     };
 
     let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
+    record_context(&app.runtime.metrics, &retrieval, prompt.text.len(), &prompt.cut);
     Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval, other_language, suggestions }))
+}
+
+/// Records how a context went: whether it searched, how big its prompt is
+/// and which blocks the budget cut. Counts are gauges of 1, one sample each.
+fn record_context(metrics: &Recorder, retrieval: &RetrievalState, prompt_bytes: usize, cut: &[PromptBlock]) {
+    metrics.gauge("context.retrieval_state", &[("state", retrieval.name())], 1.0);
+    metrics.observe("context.prompt_bytes", Unit::Bytes, &[], prompt_bytes as u64);
+    for block in cut {
+        metrics.gauge("context.cut", &[("block", block.as_str())], 1.0);
+    }
 }
 
 /// Records the host session `agent_id` works in for `project_id`, as a hook
@@ -1669,11 +1693,11 @@ async fn metrics(State(app): State<Arc<AppCtx>>, Query(q): Query<MetricsQuery>) 
     match q.format.as_deref() {
         None | Some("json") => {
             let started_at_ms = now_ms().saturating_sub(app.started_at.elapsed().as_millis() as u64);
-            Ok(Json(metrics_body(&app.metrics, clawg_core::build_info::version(), started_at_ms)).into_response())
+            Ok(Json(metrics_body(&app.runtime.metrics, clawg_core::build_info::version(), started_at_ms)).into_response())
         }
         Some("prometheus") => Ok((
             [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-            prometheus_text(&app.metrics),
+            prometheus_text(&app.runtime.metrics),
         )
             .into_response()),
         Some(other) => Err(ApiError::bad_request(format!("unknown format {other:?}; use json or prometheus"))),
@@ -2055,6 +2079,7 @@ async fn import_memories(
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let store = &app.runtime.store;
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
+    let source = if foreign.is_some() { "engram" } else { "clawg" };
     let imported = match foreign {
         None => portability::import(store, embedder.as_deref(), chunker, &backups, &body.text, &options, Arc::new(Disk), &mut timings).await,
         Some(export) => {
@@ -2064,6 +2089,15 @@ async fn import_memories(
     match imported {
         Ok(report) => {
             timings.finish();
+            let detail = [
+                ("source", source.into()),
+                ("dry_run", report.dry_run.into()),
+                ("ms", micros(read.elapsed()).div_ceil(1_000).into()),
+                ("rows", report.rows.into()),
+                ("inserted", report.inserted.into()),
+                ("present", report.present.into()),
+            ];
+            app.runtime.metrics.event(EventKind::Import, &detail);
             Ok(Json(report))
         }
         Err(e) => Err(import_error(e)),
@@ -2678,7 +2712,10 @@ fn refresh_line(project_id: &str, r: &project_docs::RefreshReport) -> String {
 /// search to name.
 async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder, project_id: &str) {
     let tokenizer = app.runtime.tokenizer.get().cloned();
-    match guard.run(&app.runtime.store, embedder, tokenizer).await {
+    let started = Instant::now();
+    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer).await;
+    record_refresh(&app.runtime.metrics, started.elapsed(), refreshed.as_ref().ok());
+    match refreshed {
         Ok(r) => {
             log::info!("{}", refresh_line(project_id, &r));
             for f in &r.failed {
@@ -2687,6 +2724,23 @@ async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder
         }
         Err(e) => log::warn!("could not index the docs of {project_id}: {e}"),
     }
+}
+
+/// Records how long a refresh took and, when it finished, how many files it
+/// indexed, found unchanged, removed and left as they were.
+fn record_refresh(metrics: &Recorder, took: Duration, report: Option<&project_docs::RefreshReport>) {
+    metrics.observe("docs.refresh.duration", Unit::Micros, &[], micros(took));
+    if let Some(r) = report {
+        for (state, files) in
+            [("indexed", r.indexed), ("unchanged", r.unchanged), ("removed", r.removed), ("failed", r.failed.len())]
+        {
+            metrics.gauge("docs.refresh.files", &[("state", state)], files as f64);
+        }
+    }
+}
+
+fn micros(took: Duration) -> u64 {
+    u64::try_from(took.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// How long a search waits for a project's first index before answering
@@ -2775,12 +2829,18 @@ async fn search_docs(
     // An empty index waits longer: answering from it would read as "the docs
     // say nothing". The first index is usually started by the bridge's
     // registration a moment before this search.
-    if let Some(guard) = index.begin_if_due(&body.project_id, Instant::now()) {
+    let wait = if let Some(guard) = index.begin_if_due(&body.project_id, Instant::now()) {
         refresh_docs_in_background(app.clone(), guard, embedder.clone(), body.project_id.clone());
-        let limit = if docs_in(store, &body.project_id).await? == 0 { FIRST_INDEX_WAIT } else { REFRESH_GRACE };
-        index.wait_idle(&body.project_id, limit).await;
+        Some(if docs_in(store, &body.project_id).await? == 0 { FIRST_INDEX_WAIT } else { REFRESH_GRACE })
     } else if index.is_running(&body.project_id) && docs_in(store, &body.project_id).await? == 0 {
-        index.wait_idle(&body.project_id, FIRST_INDEX_WAIT).await;
+        Some(FIRST_INDEX_WAIT)
+    } else {
+        None
+    };
+    if let Some(limit) = wait {
+        let started = Instant::now();
+        index.wait_idle(&body.project_id, limit).await;
+        app.runtime.metrics.observe("docs.search.inline_wait", Unit::Micros, &[], micros(started.elapsed()));
     }
     let hits = project_docs::search(store, embedder.as_ref(), &body.project_id, &body.query, clamp_docs_limit(body.limit))
         .await
@@ -3063,7 +3123,6 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
-            metrics: Default::default(),
         });
 
         let (addr, server) = serve_ephemeral(app).await.expect("bind an ephemeral loopback port");

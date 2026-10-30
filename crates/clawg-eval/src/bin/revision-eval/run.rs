@@ -443,7 +443,6 @@ async fn serve(runtime: MemoryRuntime) -> Result<Session, RunError> {
         shutdown,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
-        metrics: Default::default(),
     });
     let (addr, server) = serve_ephemeral(app.clone()).await.map_err(RunError::Serve)?;
     let client = DaemonClient::new(format!("http://{addr}"), TOKEN, base_dir);

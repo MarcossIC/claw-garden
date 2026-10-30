@@ -10,6 +10,7 @@ use crate::memory::score::{score as compute_score, RawHit, ScoringConfig};
 use crate::memory::sharing::{Reach, Reader};
 use crate::memory::vector::to_unit;
 use crate::memory::{MemoryError, MemoryStore, TableKind};
+use crate::metrics::{Recorder, Unit};
 
 /// Per-table k_pool selection. `None` means "skip this table entirely".
 ///
@@ -1287,8 +1288,14 @@ async fn search_all_memories_inner(
     // Run before the dense arms, not beside them: the bonus has to be in each
     // row's score before `knn_one` trims a widened window back to k. All arms
     // share one connection, so nothing ran in parallel to lose.
+    let metrics = store.metrics();
     let lexical_matches = match (scope.lexical, query_text) {
-        (Some(k), Some(q)) => identifier_matches(store, q, agents, project_id, k).await,
+        (Some(k), Some(q)) => {
+            let started = Instant::now();
+            let matches = identifier_matches(store, q, agents, project_id, k).await;
+            record_arm(metrics, "identifiers", started);
+            matches
+        }
         _ => HashSet::new(),
     };
     // Ids are per table and only `memory` has a lexical index.
@@ -1298,7 +1305,11 @@ async fn search_all_memories_inner(
         async {
             match scope.memory {
                 Some(k) => {
-                    knn_one(store, KNN_MEMORY, &q_bytes, agents, project_id, k, scoring, now, &lexical_matches).await
+                    let started = Instant::now();
+                    let outcome =
+                        knn_one(store, KNN_MEMORY, &q_bytes, agents, project_id, k, scoring, now, &lexical_matches).await;
+                    record_arm(metrics, "knn_memory", started);
+                    outcome
                 }
                 None => Ok(KnnOutcome::skipped()),
             }
@@ -1306,7 +1317,11 @@ async fn search_all_memories_inner(
         async {
             match scope.episodic {
                 Some(k) => {
-                    knn_one(store, KNN_EPISODIC, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await
+                    let started = Instant::now();
+                    let outcome =
+                        knn_one(store, KNN_EPISODIC, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await;
+                    record_arm(metrics, "knn_episodic", started);
+                    outcome
                 }
                 None => Ok(KnnOutcome::skipped()),
             }
@@ -1314,7 +1329,11 @@ async fn search_all_memories_inner(
         async {
             match scope.procedural {
                 Some(k) => {
-                    knn_one(store, KNN_PROCEDURAL, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await
+                    let started = Instant::now();
+                    let outcome =
+                        knn_one(store, KNN_PROCEDURAL, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await;
+                    record_arm(metrics, "knn_skill", started);
+                    outcome
                 }
                 None => Ok(KnnOutcome::skipped()),
             }
@@ -1328,12 +1347,23 @@ async fn search_all_memories_inner(
             // no query text to match — and collapse into the same empty
             // result as a sanitizer that yielded zero tokens.
             let ids = match (scope.lexical, query_text) {
-                (Some(k), Some(q)) => lexical_candidates(store, q, agents, project_id, k).await,
-                _ => Vec::new(),
+                (Some(k), Some(q)) => {
+                    let started = Instant::now();
+                    let ids = lexical_candidates(store, q, agents, project_id, k).await;
+                    Some((ids, started.elapsed()))
+                }
+                _ => None,
             };
-            Ok::<Vec<i64>, MemoryError>(ids)
+            Ok::<_, MemoryError>(ids)
         },
     )?;
+    for (outcome, table) in [(&mem, "memory"), (&epi, "episodic"), (&pro, "skill")] {
+        if outcome.retried() {
+            metrics.gauge("search.knn_retry", &[("table", table)], 1.0);
+        }
+    }
+    let (lex_ids, lexical_took) = lex_ids.unzip();
+    let lex_ids = lex_ids.unwrap_or_default();
 
     // Differenced against memory-kind hits ONLY, never the merged 3-table
     // pool: `memory`, `episodic_trajectory` and `procedural_skill` each keep
@@ -1360,11 +1390,16 @@ async fn search_all_memories_inner(
     // can. Both halves of the channel had to be infallible for that to be
     // true — a fail-soft candidate query feeding a fallible scoring query is
     // a channel that still breaks retrieval, just later.
+    let scoring_started = Instant::now();
     let lex_hits = if leftover.is_empty() {
         Vec::new()
     } else {
         score_lexical_candidates(store, &q_bytes, agents, project_id, &leftover, scoring, now, &lexical_matches).await
     };
+    // The arm is its candidates and the scoring of those the dense arm missed.
+    if let Some(took) = lexical_took {
+        record_micros(metrics, "lexical", took + scoring_started.elapsed());
+    }
 
     // Built before the merge below consumes the per-table hits, which is also
     // what lets a test assemble it from real outcomes instead of from numbers
@@ -1408,6 +1443,7 @@ async fn search_all_memories_inner(
     // window empty while debug logging is off and reporting `warming` for a
     // long time after someone turns it on.
     store.knn_latency().record(elapsed);
+    record_micros(metrics, "total", elapsed);
 
     // Tier-per-hit, pool-survival and channel-attribution logging — appended
     // to the existing retrieval debug line via pure, unit-tested helpers.
@@ -1425,6 +1461,15 @@ async fn search_all_memories_inner(
     );
 
     Ok((all, telemetry, memory_pool))
+}
+
+/// Records under `search.duration` how long `arm` took since `started`.
+fn record_arm(metrics: &Recorder, arm: &'static str, started: Instant) {
+    record_micros(metrics, arm, started.elapsed());
+}
+
+fn record_micros(metrics: &Recorder, arm: &'static str, took: std::time::Duration) {
+    metrics.observe("search.duration", Unit::Micros, &[("arm", arm)], u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
 }
 
 /// Top-level KNN orchestrator. Returns up to `k_final` hits sorted DESC by score.
@@ -5367,6 +5412,67 @@ mod tests {
         .unwrap();
 
         assert_eq!(ids_and_pieces(&hits), vec![(save[0], Some((1, 3))), (others[0], None), (others[1], None)]);
+    }
+
+    /// The arms of one search, by the label each records under.
+    fn arms_recorded(store: &MemoryStore) -> Vec<String> {
+        let run = store.metrics().run();
+        let mut arms: Vec<String> = run
+            .iter()
+            .filter(|(key, h)| key.name == "search.duration" && h.count() > 0)
+            .flat_map(|(key, _)| key.label_pairs().into_iter().map(|(_, v)| v.to_string()).collect::<Vec<_>>())
+            .collect();
+        arms.sort();
+        arms
+    }
+
+    #[tokio::test]
+    async fn a_search_records_how_long_each_arm_took() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-arms";
+        bulk_insert_memory_rows(&store, agent, None, 3, unit_basis_embedding()).await;
+
+        search_all_memories(&store, &unit_basis_vec(), Some("vector arms"), agent, SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            arms_recorded(&store),
+            ["identifiers", "knn_episodic", "knn_memory", "knn_skill", "lexical", "total"],
+            "every arm that ran, and the whole search"
+        );
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let only_memory =
+            SearchScope { episodic: None, procedural: None, lexical: None, ..SearchScope::all_default() };
+        search_all_memories(&store, &unit_basis_vec(), Some("vector arms"), agent, only_memory, 10).await.unwrap();
+        assert_eq!(arms_recorded(&store), ["knn_memory", "total"], "an arm the scope switched off did not run");
+        let gauges = store.metrics().minute().gauges;
+        assert!(
+            !gauges.keys().any(|k| k.name == "search.knn_retry"),
+            "a window that came back full was not widened: {gauges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_widened_window_is_counted_by_its_table() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-widened";
+        bulk_insert_memory_rows(&store, agent, Some("P2"), 30, unit_basis_embedding()).await;
+        bulk_insert_memory_rows(&store, agent, Some("P1"), 40, off_axis_embedding()).await;
+        let scope = SearchScope { lexical: None, ..SearchScope::all_default() }.with_project(Some("P1"));
+
+        search_all_memories(&store, &unit_basis_vec(), None, agent, scope, 10).await.unwrap();
+
+        let gauges = store.metrics().minute().gauges;
+        let retried: Vec<&str> = gauges
+            .iter()
+            .filter(|(k, _)| k.name == "search.knn_retry")
+            .flat_map(|(k, g)| {
+                assert_eq!(g.count, 1);
+                k.label_pairs().into_iter().map(|(_, v)| v)
+            })
+            .collect();
+        assert_eq!(retried, ["memory"], "only the crowded table was searched again");
     }
 
     #[tokio::test]

@@ -153,7 +153,6 @@ async fn test_app(dir: &Path) -> std::sync::Arc<crate::daemon::api::AppCtx> {
         shutdown,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
-        metrics: Default::default(),
     })
 }
 
