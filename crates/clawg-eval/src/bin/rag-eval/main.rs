@@ -988,6 +988,22 @@ fn build_agent_view_run_results(
 /// touched, so a failure here is reported as a generic runtime failure rather
 /// than overloading a more specific code with a meaning it does not have.
 fn run_diff(a_path: &std::path::Path, b_path: &std::path::Path, fail_on_regression: bool) -> i32 {
+    match docs::diff_files(a_path, b_path) {
+        Ok(Some(d)) => {
+            print!("{}", docs::render_diff(&d));
+            return if fail_on_regression && docs::regressed(&d) {
+                eprintln!("docs hit@3 got worse with p < 0.05");
+                EXIT_REGRESSION
+            } else {
+                EXIT_OK
+            };
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_RUNTIME_FAILURE;
+        }
+    }
     match diff::diff_files(a_path, b_path) {
         Ok(d) => {
             diff::print_stdout(&d);
@@ -2419,6 +2435,36 @@ mod tests {
 
         std::fs::remove_file(&golden_path).ok();
         std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_docs_hit_at_3_regression_fails_the_run() {
+        let file = |rank: usize| {
+            let cases: Vec<_> = (0..6).map(|i| serde_json::json!({"id": format!("q{i}"), "code": false, "rank": rank, "top": null})).collect();
+            serde_json::json!({"kind": "docs", "golden_sha256": "g", "corpus": {"left_out": []}, "per_case": cases})
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        std::fs::write(&a, file(1).to_string()).expect("write a");
+        std::fs::write(&b, file(4).to_string()).expect("write b");
+        let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let argv = |extra: &[&str]| {
+            ["rag-eval", "--diff", a.as_str(), b.as_str()].iter().chain(extra).map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+
+        assert_eq!(run(argv(&[]).into_iter()).await, EXIT_OK);
+        assert_eq!(run(argv(&["--fail-on-regression"]).into_iter()).await, EXIT_REGRESSION);
+    }
+
+    #[tokio::test]
+    async fn a_docs_file_against_a_memory_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        std::fs::write(&a, r#"{"kind": "docs", "golden_sha256": "g", "corpus": {"left_out": []}, "per_case": []}"#).expect("write a");
+        std::fs::write(&b, r#"{"retrieval": {"per_case": []}}"#).expect("write b");
+        let argv = ["rag-eval", "--diff", &a.to_string_lossy(), &b.to_string_lossy()].map(|s| s.to_string());
+
+        assert_eq!(run(argv.into_iter()).await, EXIT_RUNTIME_FAILURE);
     }
 
     #[tokio::test]

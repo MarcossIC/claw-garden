@@ -1,14 +1,18 @@
 change: docs-search-quality
 objective: "3"
-depends_on: [eval-rigor]
-phase: explore
+depends_on: [eval-rigor, memory-rank-fusion]
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
+  exploration: done
+  proposal: done  # las decisiones abiertas cerradas con la opción recomendada de la exploración
+  spec: done  # DQ1 a DQ5 entran; DQ6 a DQ9 detrás de su puerta
+  design: done
+  tasks: done
+  apply: in_progress  # tareas 1 a 3 (paso 1, sin el modelo real); la 4 y siguientes necesitan el modelo real
   verify: pending
   archive: pending
-updated: 2026-10-15
+gates:
+  "2": pending  # expresión léxica de docs: ninguna pregunta sale del top 3 y +2 en Hit@3
+  "3": pending  # identificadores partidos, misma puerta
+  "4": pending  # prefijo de docs, misma puerta
+updated: 2026-10-30

@@ -1276,8 +1276,11 @@ impl EvalDocIndex {
         Ok(Self { store, embedder: embedder.0.clone(), splitter })
     }
 
-    pub async fn index(&self, root: &Path) -> Result<EvalDocReport, EvalError> {
-        let r = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root)
+    /// Indexes the docs under `root` but those at the relative paths in
+    /// `left_out`, which the index never sees.
+    pub async fn index(&self, root: &Path, left_out: &[String]) -> Result<EvalDocReport, EvalError> {
+        let left_out: std::collections::HashSet<String> = left_out.iter().cloned().collect();
+        let r = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root, &left_out)
             .await
             .map_err(|e| EvalError::Insert(e.to_string()))?;
         // A measurement without a doc measures another corpus, so a doc the
@@ -2501,7 +2504,7 @@ mod tests {
         std::fs::write(root.path().join("notes.txt"), "not a doc").unwrap();
 
         let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
-        let report = index.index(root.path()).await.unwrap();
+        let report = index.index(root.path(), &[]).await.unwrap();
         let hits = index.search("daemon", 5).await.unwrap();
 
         assert_eq!(report, EvalDocReport { docs: 1, passages: 2, skipped: 0 });
@@ -2538,7 +2541,7 @@ mod tests {
 
         let embedder = EvalEmbedder(Arc::new(Unusable));
         let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path()).await.unwrap();
-        let result = index.index(root.path()).await;
+        let result = index.index(root.path(), &[]).await;
 
         assert!(matches!(result, Err(EvalError::Insert(ref e)) if e.contains("a.md")), "{result:?}");
     }
