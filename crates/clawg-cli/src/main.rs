@@ -362,10 +362,15 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::from(code))
         }
 
-        Command::Metrics { action: MetricsAction::Report { metric, labels, by, since, profile } } => {
+        Command::Metrics { action: MetricsAction::Report { metric, events, labels, by, since, profile } } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            println!("{}", metrics::report(language(&base_dir), &base_dir, &metric, &labels, by, since, now_ms() as i64)?);
+            let (lang, now) = (language(&base_dir), now_ms() as i64);
+            let printed = match metric {
+                Some(metric) if !events => metrics::report(lang, &base_dir, &metric, &labels, by, since, now)?,
+                _ => metrics::events(lang, &base_dir, since, now)?,
+            };
+            println!("{printed}");
             Ok(ExitCode::SUCCESS)
         }
 
