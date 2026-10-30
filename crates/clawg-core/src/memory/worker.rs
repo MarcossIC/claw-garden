@@ -779,6 +779,91 @@ fn split_event(evt: &MemoryEvent, chat_chunker: &ChatChunker) -> (Vec<SecretKind
     (masked.kinds, split.filter(|split| !split.pieces.is_empty()))
 }
 
+/// What the dedup gate left of a save: what each position already became,
+/// the head each of those was embedded behind, the pieces still to embed and
+/// the progress noted so far.
+struct Gated {
+    stored: Vec<Option<SavedChunk>>,
+    contexts: Vec<String>,
+    survivors: Vec<(usize, PendingChunk)>,
+    noted: Vec<NotedPiece>,
+}
+
+/// The head a piece at `position` is embedded behind: none for the first,
+/// which already starts with it.
+fn head_for(head: Option<&str>, position: usize) -> &str {
+    match head {
+        Some(head) if position > 0 => head,
+        _ => "",
+    }
+}
+
+/// Runs every piece of a save through the dedup gate before anything is
+/// embedded, taking what an earlier attempt of `track` stored as it was.
+async fn gate_pieces(
+    evt: &MemoryEvent,
+    saver: &Reader,
+    store: &Arc<MemoryStore>,
+    absorbed: &mut u64,
+    track: Option<&Track>,
+    chunks: Vec<Chunk>,
+) -> Gated {
+    // A collapsed entry absorbed by the gate is charged once per
+    // copy it stood for, which is what the same copies arriving one at a
+    // time would have done.
+    // `stored[i]` is what the i-th collapsed chunk became, so the report keeps
+    // chunk order even though absorbed chunks are settled before the rest.
+    let pending_chunks = collapse_duplicate_chunks(chunks);
+    // What an earlier attempt already stored is taken as it was: reinforcing
+    // it again would count an access nobody made, and its link keeps the head
+    // it was embedded behind.
+    let hashes: Vec<&str> = pending_chunks.iter().map(|p| p.content_hash.as_str()).collect();
+    let mut resumed: Vec<Option<NotedPiece>> = vec![None; pending_chunks.len()];
+    let mut noted: Vec<NotedPiece> = Vec::new();
+    if let Some(track) = track {
+        match resume_positions(&track.progress, &hashes) {
+            Some(by_position) => {
+                resumed = by_position;
+                noted = track.progress.clone();
+            }
+            None => log::warn!(
+                "outbox row {} was noted for a different split of its text; the dedup gate takes over its pieces",
+                track.row
+            ),
+        }
+    }
+    let mut stored: Vec<Option<SavedChunk>> = vec![None; pending_chunks.len()];
+    let mut contexts: Vec<String> = vec![String::new(); pending_chunks.len()];
+    let mut survivors: Vec<(usize, PendingChunk)> = Vec::new();
+    for (position, pending) in pending_chunks.into_iter().enumerate() {
+        if let Some(done) = resumed[position].take() {
+            let outcome = if done.inserted { ChunkOutcome::Inserted } else { ChunkOutcome::Reinforced };
+            stored[position] = Some(SavedChunk { id: done.id, outcome });
+            contexts[position] = done.context;
+            continue;
+        }
+        let note = note_for(track, &noted, position, &pending.content_hash, false, "");
+        if let Some(id) = absorb_duplicate(store, evt, saver, &pending.content_hash, absorbed, note).await {
+            if track.is_some() {
+                noted.push(NotedPiece {
+                    position,
+                    hash: pending.content_hash.clone(),
+                    id,
+                    inserted: false,
+                    context: String::new(),
+                });
+            }
+            for _ in 1..pending.multiplicity {
+                absorb_duplicate(store, evt, saver, &pending.content_hash, absorbed, |_| None).await;
+            }
+            stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Reinforced });
+            continue;
+        }
+        survivors.push((position, pending));
+    }
+    Gated { stored, contexts, survivors, noted }
+}
+
 /// Stores the pieces of `evt` and returns its report with the pieces to link,
 /// in order, each with the head its vector was embedded behind.
 async fn ingest_pieces(
@@ -817,66 +902,10 @@ async fn ingest_pieces(
         return (report, Vec::new());
     };
 
-    // Stage 1 — gate. Every chunk passes the hash gate before anything is
-    // embedded; a collapsed entry absorbed by the gate is charged once per
-    // copy it stood for, which is what the same copies arriving one at a
-    // time would have done.
-    // `stored[i]` is what the i-th collapsed chunk became, so the report keeps
-    // chunk order even though absorbed chunks are settled before the rest.
-    let pending_chunks = collapse_duplicate_chunks(chunks);
-    // The head goes into the embedder with every piece after the first; the
-    // first already starts with it.
-    let context = |position: usize| match &head {
-        Some(head) if position > 0 => head.as_str(),
-        _ => "",
-    };
-    // What an earlier attempt already stored is taken as it was: reinforcing
-    // it again would count an access nobody made, and its link keeps the head
-    // it was embedded behind.
-    let hashes: Vec<&str> = pending_chunks.iter().map(|p| p.content_hash.as_str()).collect();
-    let mut resumed: Vec<Option<NotedPiece>> = vec![None; pending_chunks.len()];
-    let mut noted: Vec<NotedPiece> = Vec::new();
-    if let Some(track) = &track {
-        match resume_positions(&track.progress, &hashes) {
-            Some(by_position) => {
-                resumed = by_position;
-                noted = track.progress.clone();
-            }
-            None => log::warn!(
-                "outbox row {} was noted for a different split of its text; the dedup gate takes over its pieces",
-                track.row
-            ),
-        }
-    }
-    let mut stored: Vec<Option<SavedChunk>> = vec![None; pending_chunks.len()];
-    let mut contexts: Vec<String> = vec![String::new(); pending_chunks.len()];
-    let mut survivors: Vec<(usize, PendingChunk)> = Vec::new();
-    for (position, pending) in pending_chunks.into_iter().enumerate() {
-        if let Some(done) = resumed[position].take() {
-            let outcome = if done.inserted { ChunkOutcome::Inserted } else { ChunkOutcome::Reinforced };
-            stored[position] = Some(SavedChunk { id: done.id, outcome });
-            contexts[position] = done.context;
-            continue;
-        }
-        let note = note_for(track.as_ref(), &noted, position, &pending.content_hash, false, "");
-        if let Some(id) = absorb_duplicate(store, evt, saver, &pending.content_hash, absorbed, note).await {
-            if track.is_some() {
-                noted.push(NotedPiece {
-                    position,
-                    hash: pending.content_hash.clone(),
-                    id,
-                    inserted: false,
-                    context: String::new(),
-                });
-            }
-            for _ in 1..pending.multiplicity {
-                absorb_duplicate(store, evt, saver, &pending.content_hash, absorbed, |_| None).await;
-            }
-            stored[position] = Some(SavedChunk { id, outcome: ChunkOutcome::Reinforced });
-            continue;
-        }
-        survivors.push((position, pending));
-    }
+    let head = head.as_deref();
+    let context = |position: usize| head_for(head, position);
+    let Gated { mut stored, mut contexts, survivors, mut noted } =
+        gate_pieces(evt, saver, store, absorbed, track.as_ref(), chunks).await;
     let report = |stored: &[Option<SavedChunk>], failure| IngestReport {
         memories: stored.iter().flatten().copied().collect(),
         failure,
@@ -1133,6 +1162,32 @@ mod tests {
         let long = "word ".repeat(4_000);
         let split = split_event(&make_event(Role::User, &long, None, 1), &chunker).1.unwrap();
         assert!(split.pieces.len() > 1 && split.head.is_some(), "a long save is pieces behind a head");
+    }
+
+    #[tokio::test]
+    async fn the_gate_absorbs_a_stored_piece_and_takes_a_resumed_one_as_it_was() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = make_event(Role::User, "alpha", None, 1);
+        let first = save_for_test(&store, &evt).await.memories[0].id;
+        let saver = store.reader_for(&evt.agent_id);
+        let chunks = |texts: &[&str]| texts.iter().map(|t| Chunk { text: t.to_string() }).collect::<Vec<_>>();
+        let mut absorbed = 0;
+
+        let gated = gate_pieces(&evt, &saver, &store, &mut absorbed, None, chunks(&["alpha", "beta", "beta"])).await;
+        assert_eq!(gated.stored[0], Some(SavedChunk { id: first, outcome: ChunkOutcome::Reinforced }));
+        assert_eq!(gated.stored[1], None);
+        assert_eq!(gated.survivors.iter().map(|(p, c)| (*p, c.multiplicity)).collect::<Vec<_>>(), [(1, 2)]);
+        assert_eq!(absorbed, 1);
+        assert!(gated.noted.is_empty(), "nothing is noted without a row");
+
+        let beta = crate::memory::dedup::content_hash("beta");
+        let progress = vec![NotedPiece { position: 1, hash: beta, id: 77, inserted: true, context: "head".into() }];
+        let track = Track { row: 1, progress };
+        let gated = gate_pieces(&evt, &saver, &store, &mut absorbed, Some(&track), chunks(&["alpha", "beta"])).await;
+        assert_eq!(gated.stored[1], Some(SavedChunk { id: 77, outcome: ChunkOutcome::Inserted }));
+        assert_eq!(gated.contexts[1], "head", "a resumed piece keeps the head it was embedded behind");
+        assert!(gated.survivors.is_empty());
+        assert_eq!(gated.noted.len(), 2, "the progress so far, and the piece the gate absorbed now");
     }
 
     // ── Worker spawn returns a join handle usable for shutdown/panic detection ──
