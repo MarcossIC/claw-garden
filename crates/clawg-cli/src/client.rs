@@ -1798,6 +1798,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_client_reads_a_health_with_an_import_block() {
+        let busy = r#"{"status":"ok","version":"0.30.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3,"import":{"job_id":2,"phase":"embedding","rows_embedded":10}}"#;
+        let h: Health = serde_json::from_str(busy).expect("a daemon with a job running");
+        assert_eq!((h.status.as_str(), h.pid), ("ok", 1));
+    }
+
+    #[test]
     fn a_search_answer_without_withheld_still_parses() {
         let old: Found = serde_json::from_str(r#"{"hits":[]}"#).expect("a daemon that never said");
         assert_eq!(old.withheld, 0);

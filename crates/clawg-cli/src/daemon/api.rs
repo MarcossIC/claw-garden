@@ -82,7 +82,7 @@ use tokio::sync::oneshot;
 use crate::relevance::shown_hits;
 
 use super::guard::{admits, RefusalLog};
-use super::imports::{Busy, End, ImportJobs, JobView, Meta};
+use super::imports::{Busy, Cancel, End, ImportJobs, JobView, Meta};
 use super::lifecycle::now_ms;
 use super::metrics::{metrics_body, prometheus_text, time_request, HttpMeter, Transport};
 use super::sessions::{check_session_id, SessionRegistry};
@@ -578,6 +578,10 @@ pub struct HealthBody {
     /// health must not hang behind a busy writer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingest: Option<OutboxSummary>,
+    /// The import job that runs, if one does. Read from memory, so it is
+    /// there when the store is too busy to answer `ingest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<JobView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1084,7 +1088,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/import", post(import_memories).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
         .route("/import/undo", post(undo_import))
         .route("/imports", post(start_import_job))
-        .route("/imports/{id}", get(import_job))
+        .route("/imports/{id}", get(import_job).delete(cancel_import_job))
         .route("/projects", post(register).get(projects))
         .route("/projects/{id}", patch(rename))
         .route("/projects/merge", post(merge_projects))
@@ -1212,6 +1216,7 @@ async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
         embedder_resident: app.runtime.embedder.get().map(|e| e.resident()),
         uptime_s: app.started_at.elapsed().as_secs(),
         ingest,
+        import: app.imports.active(),
     })
 }
 
@@ -2374,6 +2379,16 @@ async fn import_job(State(app): State<Arc<AppCtx>>, Path(id): Path<u64>) -> ApiR
     Ok(Json(&*view).into_response())
 }
 
+/// Asks job `id` to stop at the next safe point of its step: `202` with the
+/// job, which says it is stopping. A job that ended is answered as it is, `200`.
+async fn cancel_import_job(State(app): State<Arc<AppCtx>>, Path(id): Path<u64>) -> ApiResult<Response> {
+    match app.imports.cancel(id) {
+        Some(Cancel::Asked(view)) => Ok((StatusCode::ACCEPTED, Json(&*view)).into_response()),
+        Some(Cancel::Over(view)) => Ok(Json(&*view).into_response()),
+        None => Err(ApiError::not_found(format!("no import job {id}"))),
+    }
+}
+
 /// The body of `POST /v1/import/undo`. Strict, as a move's: a misspelt
 /// field must not undo an import as if it were not there.
 #[derive(Debug, Deserialize)]
@@ -3397,6 +3412,44 @@ mod tests {
         assert!(job.get("report").is_none() && job.get("import_id").is_none(), "{job}");
         assert_eq!((job["rows"].clone(), job["rows_embedded"].clone()), (serde_json::json!(3), serde_json::json!(0)), "{job}");
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import").await, 0);
+    }
+
+    /// A control whose job 1 is cancelled through the registry, as a `DELETE`
+    /// does, as `step` begins.
+    fn deleted_in(app: &Arc<AppCtx>, step: Step) -> ImportControl {
+        let (control, app) = (ImportControl::default(), app.clone());
+        control.on_step(move |entered| {
+            if entered == step {
+                assert!(matches!(app.imports.cancel(1), Some(Cancel::Asked(_))), "the job is active");
+            }
+        });
+        control
+    }
+
+    #[tokio::test]
+    async fn a_delete_during_links_ends_done() {
+        let (app, dir) = daemon_for_jobs().await;
+        let job = job_over(&app, dir.path(), &rows_file(3), serde_json::json!({}), deleted_in(&app, Step::Links)).await;
+
+        assert_eq!(job["phase"], "done", "{job}");
+        assert!(job.get("stopped_in").is_none() && job.get("stopping").is_none(), "{job}");
+        assert_eq!((job["report"]["inserted"].clone(), job["rows_written"].clone()), (serde_json::json!(3), serde_json::json!(3)), "{job}");
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, 3);
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import WHERE finished_at IS NOT NULL").await, 1, "the links were written");
+    }
+
+    #[tokio::test]
+    async fn a_delete_during_snapshot_ends_cancelled_with_the_snapshot_and_no_rows() {
+        let (app, dir) = daemon_for_jobs().await;
+        let job = job_over(&app, dir.path(), &rows_file(3), serde_json::json!({}), deleted_in(&app, Step::Snapshot)).await;
+
+        assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str()), (Some("cancelled"), Some("snapshot")), "{job}");
+        assert!(job.get("report").is_none() && job.get("import_id").is_none(), "{job}");
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, 0);
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import").await, 0);
+        let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+        let snapshots: Vec<_> = std::fs::read_dir(&backups).expect("the backups directory").flatten().map(|e| e.file_name()).collect();
+        assert!(snapshots.iter().any(|name| name.to_string_lossy().ends_with("-pre-import.db")), "{snapshots:?}");
     }
 
     const GRACE: Duration = super::super::serve::HTTP_GRACE;

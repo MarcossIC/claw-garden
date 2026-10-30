@@ -396,6 +396,12 @@ impl Harness {
         (status, r.json().await.unwrap_or(Value::Null))
     }
 
+    async fn delete_json(&self, path: &str) -> (u16, Value) {
+        let r = self.authed(self.http.delete(self.url(path))).send().await.expect("request");
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap_or(Value::Null))
+    }
+
     async fn post_json(&self, path: &str, body: Value) -> (u16, Value) {
         let r = self
             .authed(self.http.post(self.url(path)))
@@ -4221,6 +4227,126 @@ async fn a_job_import_refuses_what_the_synchronous_import_refuses() {
     }
 }
 
+/// How many files the daemon's backups directory holds.
+fn snapshots_of(h: &Harness) -> usize {
+    std::fs::read_dir(clawg_core::paths::backups_dir(&h.ctx.runtime.base_dir)).map(|d| d.count()).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn deleting_a_job_in_embedding_leaves_no_row_no_journal_and_no_snapshot() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(5), json!({})).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+
+    let (status, asked) = h.delete_json(&format!("/v1/imports/{id}")).await;
+    assert_eq!((status, asked["stopping"].as_str(), asked["job_id"].as_u64()), (202, Some("cancel"), Some(id)), "{asked}");
+
+    // The batch the gate holds is never released: the stop does not wait for it.
+    let job = h.finished_job(id).await;
+    assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str()), (Some("cancelled"), Some("embed")), "{job}");
+    assert!(job.get("stopping").is_none() && job.get("report").is_none() && job.get("import_id").is_none(), "{job}");
+    assert_eq!(h.count_of("SELECT COUNT(*) FROM memory").await, 0);
+    assert_eq!(h.count_of("SELECT COUNT(*) FROM memory_import").await, 0);
+    assert_eq!(snapshots_of(&h), 0, "the snapshot comes after the embedding");
+}
+
+#[tokio::test]
+async fn a_delete_on_a_finished_job_changes_nothing() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stopped = h.accepted_job(dir.path(), "one.jsonl", &rows_export(2), json!({})).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+    assert_eq!(h.delete_json(&format!("/v1/imports/{stopped}")).await.0, 202);
+    let cancelled = h.finished_job(stopped).await;
+
+    let (status, again) = h.delete_json(&format!("/v1/imports/{stopped}")).await;
+    assert_eq!((status, &again), (200, &cancelled), "a cancelled job is told as it is, not asked again");
+
+    let finished = h.accepted_job(dir.path(), "two.jsonl", &rows_export(2), json!({ "dry_run": true })).await;
+    let done = h.finished_job(finished).await;
+    let (status, told) = h.delete_json(&format!("/v1/imports/{finished}")).await;
+    assert_eq!((status, &told), (200, &done), "a job that is done is told as it is");
+    assert_eq!(h.finished_job(finished).await, done, "and nothing about it changed");
+
+    let (status, unknown) = h.delete_json("/v1/imports/99").await;
+    assert_eq!(status, 404, "{unknown}");
+    assert!(unknown["error"].as_str().is_some_and(|e| e.contains("99")), "the daemon's own 404 carries a body: {unknown}");
+}
+
+#[tokio::test]
+async fn a_job_outlives_the_client_that_accepted_it() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = file_in(dir.path(), "export.jsonl", &rows_export(3));
+    let id = {
+        // A client of its own, gone as soon as it has its answer.
+        let client = reqwest::Client::new();
+        let accepted = client.post(h.url("/v1/imports")).bearer_auth(&h.token).json(&json!({ "path": path })).send().await.expect("request");
+        assert_eq!(accepted.status(), 202);
+        accepted.json::<Value>().await.expect("json")["job_id"].as_u64().expect("a job id")
+    };
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+    assert_eq!(h.get_json(&format!("/v1/imports/{id}")).await.1["phase"], "embedding");
+
+    gate.release(10);
+    let done = h.finished_job(id).await;
+    assert_eq!((done["phase"].as_str(), done["report"]["inserted"].clone()), (Some("done"), json!(3)), "{done}");
+}
+
+#[tokio::test]
+async fn health_carries_the_active_jobs_import_block_without_the_connection() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(4), json!({})).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+
+    // The store's one connection is held by a call that does not return until told to.
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let store = h.ctx.runtime.store.clone();
+    let hold = tokio::spawn(async move {
+        store
+            .conn
+            .call(move |_| {
+                entered.send(()).ok();
+                released.recv_timeout(Duration::from_secs(30)).ok();
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+    });
+    held.await.expect("the connection is held");
+
+    let started = Instant::now();
+    let r = h.http.get(h.url("/health")).send().await.expect("request");
+    let waited = started.elapsed();
+    assert_eq!(r.status(), 200);
+    let health: Value = r.json().await.expect("json");
+    assert!(waited < Duration::from_secs(5), "health did not wait for the connection: {waited:?}");
+    assert!(health.get("ingest").is_none(), "the outbox counts need the connection: {health}");
+    let block = &health["import"];
+    assert_eq!((block["job_id"].as_u64(), block["phase"].as_str(), block["rows_to_embed"].clone()), (Some(id), Some("embedding"), json!(4)), "{health}");
+    assert!(block.get("report").is_none(), "{health}");
+
+    release.send(()).ok();
+    hold.await.expect("joined").expect("the held call ended");
+    gate.release(10);
+    h.finished_job(id).await;
+}
+
+#[tokio::test]
+async fn health_has_no_import_block_without_an_active_job() {
+    let h = Harness::start().await;
+    let (_, idle) = h.get_json("/health").await;
+    assert!(idle.get("import").is_none(), "{idle}");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(2), json!({ "dry_run": true })).await;
+    h.finished_job(id).await;
+    let (_, after) = h.get_json("/health").await;
+    assert!(after.get("import").is_none(), "a job that ended is not active: {after}");
+}
+
 #[tokio::test]
 async fn a_second_import_job_while_one_runs_is_refused_with_its_id() {
     let (h, gate) = Harness::start_gated().await;
@@ -4430,7 +4556,7 @@ async fn the_job_routes_require_the_guard_and_the_token() {
     let body = json!({ "path": file_in(dir.path(), "export.jsonl", &export_file(1)), "dry_run": true });
     let foreign = format!("evil.example:{}", h.addr.port());
     let requests = |http: &reqwest::Client| {
-        [http.post(h.url("/v1/imports")).json(&body), http.get(h.url("/v1/imports/1"))]
+        [http.post(h.url("/v1/imports")).json(&body), http.get(h.url("/v1/imports/1")), http.delete(h.url("/v1/imports/1"))]
     };
 
     for request in requests(&h.http) {
@@ -5098,6 +5224,7 @@ const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
     // The same, for the file at a path, which a job imports.
     ("POST", "/imports", Some("body.project_map[].project")),
     ("GET", "/imports/{id}", None),
+    ("DELETE", "/imports/{id}", None),
     // A root, whose project the registration follows.
     ("POST", "/projects", None),
     ("GET", "/projects", None),

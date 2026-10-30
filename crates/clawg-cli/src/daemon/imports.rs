@@ -26,6 +26,14 @@ pub enum Busy {
     Closing,
 }
 
+/// What a request to cancel a job found.
+pub enum Cancel {
+    /// The job runs and was asked to stop; its view says why.
+    Asked(Arc<JobView>),
+    /// The job ended already: this is how, and nothing was asked of it.
+    Over(Arc<JobView>),
+}
+
 /// What a job was asked to do.
 pub struct Meta {
     pub dry_run: bool,
@@ -258,6 +266,24 @@ impl Jobs {
             _ => self.last.clone().filter(|last| last.job_id == id),
         }
     }
+
+    fn active(&self) -> Option<JobView> {
+        match &self.slot {
+            Slot::Running(running) => Some(running.view()),
+            Slot::Reserved(_) | Slot::Idle => None,
+        }
+    }
+
+    fn cancel(&self, id: u64) -> Option<Cancel> {
+        match &self.slot {
+            Slot::Running(running) if running.id == id => {
+                // The first cause stays: a shutdown that came first is still the one.
+                running.control.stop(StopCause::Cancel);
+                Some(Cancel::Asked(Arc::new(running.view())))
+            }
+            _ => self.last.clone().filter(|last| last.job_id == id).map(Cancel::Over),
+        }
+    }
 }
 
 /// One import job at a time, and the last one that ended.
@@ -354,6 +380,17 @@ impl ImportJobs {
     /// The job that runs or the last one that ended, if it is `id`.
     pub fn view(&self, id: u64) -> Option<Arc<JobView>> {
         self.lock().view(id)
+    }
+
+    /// The job that runs, read from memory alone: health calls it without
+    /// touching the store.
+    pub fn active(&self) -> Option<JobView> {
+        self.lock().active()
+    }
+
+    /// Asks job `id` to stop, if it runs.
+    pub fn cancel(&self, id: u64) -> Option<Cancel> {
+        self.lock().cancel(id)
     }
 }
 
@@ -493,6 +530,46 @@ mod tests {
         jobs.finish(id, End::Failed { error: "project_deleted".into(), detail: Some("deleted".into()) }, 1);
         let view = jobs.view(id).expect("failed");
         assert_eq!((view.error.as_deref(), view.detail.as_deref()), (Some("project_deleted"), Some("deleted")));
+    }
+
+    #[tokio::test]
+    async fn cancelling_asks_the_running_job_and_tells_a_finished_one() {
+        let jobs = ImportJobs::default();
+        assert!(jobs.cancel(1).is_none(), "no such job");
+
+        let (id, control) = running(&jobs);
+        let Some(Cancel::Asked(asked)) = jobs.cancel(id) else { panic!("a running job is asked") };
+        assert_eq!(asked.stopping, Some(StopCause::Cancel), "the answer already says it is stopping");
+        assert_eq!(control.cause(), Some(StopCause::Cancel));
+        assert!(jobs.cancel(id + 1).is_none(), "another id is no job");
+
+        jobs.finish(id, End::Stopped(Stopped { cause: StopCause::Cancel, step: Step::Embed, report: None }), 4_000);
+        let Some(Cancel::Over(over)) = jobs.cancel(id) else { panic!("a finished job is told as it is") };
+        assert_eq!((over.phase, over.stopped_in), ("cancelled", Some("embed")));
+        assert!(jobs.cancel(id + 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_a_shutdown_keeps_its_cause() {
+        let jobs = ImportJobs::default();
+        let (id, control) = running(&jobs);
+        jobs.close();
+        let Some(Cancel::Asked(asked)) = jobs.cancel(id) else { panic!("still running") };
+        assert_eq!((asked.stopping, control.cause()), (Some(StopCause::Shutdown), Some(StopCause::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn only_a_running_job_is_active() {
+        let jobs = ImportJobs::default();
+        assert!(jobs.active().is_none());
+        let reservation = jobs.reserve().expect("a free slot");
+        assert!(jobs.active().is_none(), "a reservation is not a job yet");
+        let (id, control) = (reservation.id(), ImportControl::default());
+        reservation.run(meta(), control, pending_task).expect("the registry is open");
+        assert_eq!(jobs.active().map(|view| view.job_id), Some(id));
+
+        jobs.finish(id, End::Done(ImportReport::default()), 2_000);
+        assert!(jobs.active().is_none(), "the last finished job is not active");
     }
 
     #[tokio::test]
