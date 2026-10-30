@@ -2,14 +2,15 @@
 //! the questions of a golden set written about it.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clawg_core::eval_api::{doc_paths, is_code_path, EvalDocHit, EvalDocIndex, EvalDocReport, EvalEmbedder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::cli::{Cli, Mode};
-use crate::{EXIT_GOLDEN_INVALID, EXIT_OK, EXIT_RUNTIME_FAILURE};
+use crate::cli::Cli;
+use crate::report::{Mode, ReportError};
+use crate::{EXIT_GOLDEN_INVALID, EXIT_OK, EXIT_RESULTS_EXISTS, EXIT_RUNTIME_FAILURE};
 
 /// How deep each question's ranking is read: MRR counts a first hit up to here.
 const RANKED: usize = 10;
@@ -126,7 +127,7 @@ pub fn first_rank(hits: &[EvalDocHit], expected: &[ExpectedDoc]) -> Option<usize
     hits.iter().position(|h| expected.iter().any(|e| matches(h, e))).map(|i| i + 1)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct DocsScore {
     pub hit_at_1: f64,
     pub hit_at_3: f64,
@@ -213,18 +214,163 @@ pub fn render(report: &EvalDocReport, took: Duration, left_out: &[String], resul
     out
 }
 
+/// Which run produced a results file.
+pub struct RunStamp {
+    pub date: String,
+    pub mode: Mode,
+    pub tag: Option<String>,
+    pub model_id: String,
+    pub git_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DocsCorpus {
+    pub docs: usize,
+    pub passages: usize,
+    pub skipped: usize,
+    /// The docs that quote a question, which the index never saw.
+    pub left_out: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DocsAggregate {
+    pub all: DocsScore,
+    /// Absent when no question is of that kind.
+    pub docs: Option<DocsScore>,
+    pub code: Option<DocsScore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaseRank {
+    pub id: String,
+    pub code: bool,
+    /// From 1, `None` past the depth MRR reads.
+    pub rank: Option<usize>,
+    pub top: Option<String>,
+}
+
+/// A docs run as its results file holds it: ranks, counts and paths, never a
+/// question's or a passage's text.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DocsResults {
+    pub kind: &'static str,
+    pub date: String,
+    pub mode: Mode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub model_id: String,
+    pub git_sha: String,
+    pub golden_sha256: String,
+    pub cases: usize,
+    pub corpus: DocsCorpus,
+    pub index_seconds: f64,
+    pub aggregate: DocsAggregate,
+    pub per_case: Vec<CaseRank>,
+}
+
+pub const DOCS_KIND: &str = "docs";
+
+impl DocsResults {
+    pub fn new(
+        stamp: RunStamp,
+        golden_sha256: String,
+        report: &EvalDocReport,
+        left_out: &[String],
+        took: Duration,
+        results: &[CaseResult<'_>],
+    ) -> Self {
+        let score_of = |code: Option<bool>| {
+            let ranks: Vec<Option<usize>> =
+                results.iter().filter(|r| code.is_none_or(|c| r.code == c)).map(|r| r.rank).collect();
+            (!ranks.is_empty()).then(|| score(&ranks))
+        };
+        Self {
+            kind: DOCS_KIND,
+            date: stamp.date,
+            mode: stamp.mode,
+            tag: stamp.tag,
+            model_id: stamp.model_id,
+            git_sha: stamp.git_sha,
+            golden_sha256,
+            cases: results.len(),
+            corpus: DocsCorpus {
+                docs: report.docs,
+                passages: report.passages,
+                skipped: report.skipped,
+                left_out: left_out.to_vec(),
+            },
+            index_seconds: took.as_secs_f64(),
+            aggregate: DocsAggregate {
+                all: score_of(None).unwrap_or(score(&[])),
+                docs: score_of(Some(false)),
+                code: score_of(Some(true)),
+            },
+            per_case: results
+                .iter()
+                .map(|r| CaseRank { id: r.case.id.clone(), code: r.code, rank: r.rank, top: r.top.clone() })
+                .collect(),
+        }
+    }
+}
+
+/// `{out_dir}/{date}-{mode}-docs[-{tag}].json`, apart from a memory run's
+/// file of the same day.
+pub fn results_path(out_dir: &Path, date: &str, mode: Mode, tag: Option<&str>) -> PathBuf {
+    let tag = match tag {
+        Some(tag) => format!("{DOCS_KIND}-{tag}"),
+        None => DOCS_KIND.to_string(),
+    };
+    out_dir.join(crate::report::results_filename(date, mode, Some(&tag)))
+}
+
+/// Writes `results`, refusing an existing file unless `force`.
+pub fn write_results(results: &DocsResults, out_dir: &Path, force: bool) -> Result<PathBuf, ReportError> {
+    std::fs::create_dir_all(out_dir).map_err(|e| ReportError::CreateDir { path: out_dir.to_path_buf(), source: e })?;
+    let path = results_path(out_dir, &results.date, results.mode, results.tag.as_deref());
+    if path.exists() && !force {
+        return Err(ReportError::AlreadyExists { path });
+    }
+    let json = serde_json::to_string_pretty(results)?;
+    std::fs::write(&path, json).map_err(|e| ReportError::Write { path: path.clone(), source: e })?;
+    Ok(path)
+}
+
 /// Runs `--docs` end to end and returns the exit code.
 pub async fn run(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path) -> i32 {
-    let cases = match std::fs::read_to_string(&cli.golden_path)
+    let golden = match std::fs::read_to_string(&cli.golden_path)
         .map_err(|e| DocsGoldenError::Read(cli.golden_path.display().to_string(), e))
-        .and_then(|text| parse(&text))
     {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("docs golden set validation failed: {e}");
+            return EXIT_GOLDEN_INVALID;
+        }
+    };
+    let cases = match parse(&golden) {
         Ok(cases) => cases,
         Err(e) => {
             eprintln!("docs golden set validation failed: {e}");
             return EXIT_GOLDEN_INVALID;
         }
     };
+    // Only a real run writes a file: the fake embedder measures plumbing,
+    // and a file of its numbers would only mislead a later diff. Checked
+    // before indexing, which takes minutes with the real model.
+    let stamp = (cli.mode == crate::cli::Mode::Real).then(|| RunStamp {
+        date: crate::current_date_string(),
+        mode: Mode::Real,
+        tag: cli.tag.clone(),
+        model_id: embedder.model_id().to_string(),
+        git_sha: crate::report::git_sha(),
+    });
+    if let Some(stamp) = &stamp {
+        let path = results_path(&cli.out_dir, &stamp.date, stamp.mode, stamp.tag.as_deref());
+        if path.exists() && !cli.force {
+            println!("results file already exists: {}", path.display());
+            return EXIT_RESULTS_EXISTS;
+        }
+    }
+    let output = Output { stamp, golden_sha256: clawg_core::eval_api::sha256_hex(golden.as_bytes()) };
     let corpus = match doc_paths(&cli.docs_root) {
         Ok(paths) => paths,
         Err(e) => {
@@ -244,7 +390,7 @@ pub async fn run(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path) -> i32 {
     }
 
     let scratch = std::env::temp_dir().join(format!("rag-eval-docs-{}", uuid::Uuid::new_v4()));
-    run_in(cli, embedder, base_dir, &cases, &left_out, &scratch).await
+    run_in(cli, embedder, base_dir, &cases, &left_out, output, &scratch).await
 }
 
 /// Measures `cases` with an index built in `scratch`, which is removed when
@@ -255,9 +401,10 @@ async fn run_in(
     base_dir: &Path,
     cases: &[DocsCase],
     left_out: &[String],
+    output: Output,
     scratch: &Path,
 ) -> i32 {
-    let code = measure(cli, embedder, base_dir, cases, left_out, scratch).await;
+    let code = measure(cli, embedder, base_dir, cases, left_out, output, scratch).await;
     crate::seed::remove_scratch(scratch).await;
     code
 }
@@ -268,6 +415,7 @@ async fn measure(
     base_dir: &Path,
     cases: &[DocsCase],
     left_out: &[String],
+    output: Output,
     scratch: &Path,
 ) -> i32 {
     if let Err(e) = std::fs::create_dir_all(scratch) {
@@ -277,8 +425,8 @@ async fn measure(
     // Passages are capped by the tokenizer of the model that embeds them,
     // as in the daemon; the fake embedder has none and caps them by bytes.
     let tokenizer_dir = match cli.mode {
-        Mode::Real => base_dir,
-        Mode::Fake => scratch,
+        crate::cli::Mode::Real => base_dir,
+        crate::cli::Mode::Fake => scratch,
     };
     let index = match EvalDocIndex::open(scratch, embedder, tokenizer_dir).await {
         Ok(index) => index,
@@ -287,16 +435,29 @@ async fn measure(
             return EXIT_RUNTIME_FAILURE;
         }
     };
-    let code = measure_with(cli, &index, cases, left_out).await;
+    let code = measure_with(cli, &index, cases, left_out, output).await;
     if let Err(e) = index.close().await {
         eprintln!("warning: {e}");
     }
     code
 }
 
-/// Indexes the root but `left_out` into `index`, asks it every question and
-/// prints the report.
-async fn measure_with(cli: &Cli, index: &EvalDocIndex, cases: &[DocsCase], left_out: &[String]) -> i32 {
+/// Where a run's results go besides stdout.
+struct Output {
+    /// Set for a run that writes a results file.
+    stamp: Option<RunStamp>,
+    golden_sha256: String,
+}
+
+/// Indexes the root but `left_out` into `index`, asks it every question,
+/// prints the report and writes the results file when `output` asks for one.
+async fn measure_with(
+    cli: &Cli,
+    index: &EvalDocIndex,
+    cases: &[DocsCase],
+    left_out: &[String],
+    output: Output,
+) -> i32 {
     let started = Instant::now();
     let report = match index.index(&cli.docs_root, left_out).await {
         Ok(report) => report,
@@ -324,7 +485,24 @@ async fn measure_with(cli: &Cli, index: &EvalDocIndex, cases: &[DocsCase], left_
         });
     }
     print!("{}", render(&report, took, left_out, &results));
-    EXIT_OK
+    let Some(stamp) = output.stamp else {
+        return EXIT_OK;
+    };
+    let file = DocsResults::new(stamp, output.golden_sha256, &report, left_out, took, &results);
+    match write_results(&file, &cli.out_dir, cli.force) {
+        Ok(path) => {
+            println!("results written to {}", path.display());
+            EXIT_OK
+        }
+        Err(ReportError::AlreadyExists { path }) => {
+            println!("results file already exists: {}", path.display());
+            EXIT_RESULTS_EXISTS
+        }
+        Err(e) => {
+            eprintln!("failed to write results: {e}");
+            EXIT_RUNTIME_FAILURE
+        }
+    }
 }
 
 #[cfg(test)]
@@ -351,7 +529,8 @@ mod tests {
         let cases = parse(r#"[{"id": "q1", "question": "daemon stop", "expected": [{"path": "README.md"}]}]"#).unwrap();
         let scratch = crate::test_temp::temp_path("docs-scratch");
 
-        let code = run_in(&cli, &EvalEmbedder::fake(), &root, &cases, &[], &scratch).await;
+        let output = Output { stamp: None, golden_sha256: String::new() };
+        let code = run_in(&cli, &EvalEmbedder::fake(), &root, &cases, &[], output, &scratch).await;
 
         assert_eq!(code, EXIT_OK);
         assert!(!scratch.exists(), "the index is removed when the run ends");
@@ -459,6 +638,74 @@ mod tests {
         assert!(none.contains("\nleft out 0 docs quoting a question\n"), "{none}");
         assert!(one.contains("\nleft out 1 doc quoting a question: notes/verify.md\n"), "{one}");
         assert!(two.contains("\nleft out 2 docs quoting a question: a/x.md, b/y.md\n"), "{two}");
+    }
+
+    fn two_results<'a>(cases: &'a [DocsCase]) -> DocsResults {
+        let results = [
+            CaseResult { case: &cases[0], rank: Some(2), top: Some("a.md > Otro".into()), code: false },
+            CaseResult { case: &cases[1], rank: None, top: Some("src/b.rs".into()), code: true },
+        ];
+        DocsResults::new(
+            RunStamp { date: "2026-10-30".into(), mode: Mode::Real, tag: None, model_id: "m1".into(), git_sha: "abc1234".into() },
+            "f00d".into(),
+            &EvalDocReport { docs: 2, passages: 5, skipped: 1 },
+            &["notes/verify.md".to_string()],
+            Duration::from_millis(2500),
+            &results,
+        )
+    }
+
+    fn two_cases() -> Vec<DocsCase> {
+        parse(
+            r#"[{"id": "q1", "question": "first?", "expected": [{"path": "a.md"}]},
+                {"id": "q2", "question": "second?", "expected": [{"path": "src/b.rs"}]}]"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn docs_results_carry_ranks_and_no_text() {
+        let cases = two_cases();
+        let json = serde_json::to_value(two_results(&cases)).unwrap();
+
+        assert_eq!(json["kind"], "docs");
+        assert_eq!(json["mode"], "real");
+        assert_eq!(json["golden_sha256"], "f00d");
+        assert_eq!(json["cases"], 2);
+        assert_eq!(json["corpus"], serde_json::json!({"docs": 2, "passages": 5, "skipped": 1, "left_out": ["notes/verify.md"]}));
+        assert_eq!(json["index_seconds"], 2.5);
+        assert_eq!(json["aggregate"]["all"]["hit_at_3"], 0.5);
+        assert_eq!(json["aggregate"]["docs"]["mrr"], 0.5);
+        assert_eq!(json["aggregate"]["code"]["hit_at_5"], 0.0);
+        assert_eq!(
+            json["per_case"],
+            serde_json::json!([
+                {"id": "q1", "code": false, "rank": 2, "top": "a.md > Otro"},
+                {"id": "q2", "code": true, "rank": null, "top": "src/b.rs"}
+            ])
+        );
+        assert!(json.get("tag").is_none());
+        let text = json.to_string();
+        assert!(!text.contains("first?"), "no question text: {text}");
+    }
+
+    #[test]
+    fn docs_results_name_their_file_and_refuse_to_overwrite() {
+        let cases = two_cases();
+        let out = crate::test_temp::temp_path("docs-results");
+        let mut results = two_results(&cases);
+
+        let path = write_results(&results, &out, false).unwrap();
+        assert_eq!(path, out.join("2026-10-30-real-docs.json"));
+        assert!(matches!(
+            write_results(&results, &out, false),
+            Err(crate::report::ReportError::AlreadyExists { .. })
+        ));
+        assert!(write_results(&results, &out, true).is_ok(), "--force overwrites");
+
+        results.tag = Some("lex2".into());
+        assert_eq!(results_path(&out, &results.date, results.mode, results.tag.as_deref()), out.join("2026-10-30-real-docs-lex2.json"));
+        assert_eq!(write_results(&results, &out, false).unwrap(), out.join("2026-10-30-real-docs-lex2.json"));
     }
 
     #[test]
