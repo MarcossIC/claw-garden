@@ -27,6 +27,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
+use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,7 +51,7 @@ use crate::memory::registry::{find_project, new_project_id, project_name, Named}
 use crate::memory::subfolder::declared_in;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
-use crate::memory::portability::control::ImportControl;
+use crate::memory::portability::control::{ImportControl, StopCause};
 use crate::memory::portability::format::{parse, ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
 use crate::memory::portability::timing::{ImportTimings, Step, Timing};
 use crate::memory::portability::translate::{
@@ -2066,7 +2067,15 @@ pub async fn import(
 ) -> Result<ImportReport, ImportError> {
     let (_, parsed) = parse(text)?;
     let input = ImportInput::Clawg(parsed);
-    import_parsed(store, embedder, chunker, backups, input, options, ground, timings, &ImportControl::default()).await
+    finished(import_parsed(store, embedder, chunker, backups, input, options, ground, timings, &ImportControl::default()).await?)
+}
+
+/// The report of an import nobody can stop.
+fn finished(imported: Imported) -> Result<ImportReport, ImportError> {
+    match imported {
+        Imported::Done(report) => Ok(report),
+        Imported::Stopped(_) => Err(MemoryError::Internal("the import was stopped".to_owned()).into()),
+    }
 }
 
 /// What an import reads, already parsed: the caller has done that once and
@@ -2076,8 +2085,63 @@ pub enum ImportInput {
     Foreign(ForeignExport),
 }
 
+/// How an import ended.
+pub enum Imported {
+    Done(ImportReport),
+    Stopped(Stopped),
+}
+
+/// An import that stopped because its control asked it to.
+pub struct Stopped {
+    pub cause: StopCause,
+    /// The step it was in when it stopped.
+    pub step: Step,
+    /// What the write batches that were committed did; only after one was.
+    /// Before the first, nothing was recorded, and a report would name
+    /// projects and suggestions that were planned and not written.
+    pub report: Option<ImportReport>,
+}
+
+/// Where a step ended other than by finishing.
+#[derive(Debug)]
+enum Cut {
+    Stopped(Step, StopCause),
+    Failed(ImportError),
+}
+
+impl<E: Into<ImportError>> From<E> for Cut {
+    fn from(e: E) -> Self {
+        Cut::Failed(e.into())
+    }
+}
+
+impl Cut {
+    fn into_result(self) -> Result<Imported, ImportError> {
+        match self {
+            Cut::Stopped(step, cause) => Ok(Imported::Stopped(Stopped { cause, step, report: None })),
+            Cut::Failed(e) => Err(e),
+        }
+    }
+}
+
+/// `work`, or the stop if it was raised first: dropping `work` is how a step
+/// stops at its next `.await`. A stop already raised wins over work that is
+/// ready in the same poll.
+async fn or_stop<T>(control: &ImportControl, step: Step, work: impl Future<Output = T>) -> Result<T, Cut> {
+    tokio::select! {
+        biased;
+        cause = control.raised() => Err(Cut::Stopped(step, cause)),
+        out = work => Ok(out),
+    }
+}
+
+/// The stop raised while `step` ran, for a step that cannot be interrupted.
+fn stopped_after(control: &ImportControl, step: Step) -> Result<(), Cut> {
+    control.cause().map_or(Ok(()), |cause| Err(Cut::Stopped(step, cause)))
+}
+
 /// [`import`] and [`import_foreign`] over an input that is parsed already,
-/// with `control` showing where it is as it runs.
+/// with `control` showing where it is as it runs and asking it to stop.
 pub async fn import_parsed(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
@@ -2088,19 +2152,41 @@ pub async fn import_parsed(
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
     control: &ImportControl,
-) -> Result<ImportReport, ImportError> {
+) -> Result<Imported, ImportError> {
     match input {
         ImportInput::Clawg(parsed) => {
-            let prepared = prepare_parsed(store, parsed, options, ground, timings, control).await?;
-            let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, "clawg", timings, control).await?;
-            Ok(report(&prepared, &written, options.dry_run))
+            let prepared = match prepare_parsed(store, parsed, options, ground, timings, control).await {
+                Ok(prepared) => prepared,
+                Err(cut) => return cut.into_result(),
+            };
+            let written = match write(store, embedder, &chunker, backups, &prepared, options.dry_run, "clawg", timings, control).await {
+                Ok(written) => written,
+                Err(cut) => return cut.into_result(),
+            };
+            Ok(ended(report(&prepared, &written, options.dry_run), written.cut))
         }
         ImportInput::Foreign(export) => {
             let source = export.source;
-            let (prepared, foreign) = prepare_export(store, chunker.clone(), export, options, ground, timings, control).await?;
-            let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, source, timings, control).await?;
-            Ok(with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger))
+            let (prepared, foreign) = match prepare_export(store, chunker.clone(), export, options, ground, timings, control).await {
+                Ok(prepared) => prepared,
+                Err(cut) => return cut.into_result(),
+            };
+            let written = match write(store, embedder, &chunker, backups, &prepared, options.dry_run, source, timings, control).await {
+                Ok(written) => written,
+                Err(cut) => return cut.into_result(),
+            };
+            let report = with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger);
+            Ok(ended(report, written.cut))
         }
+    }
+}
+
+/// `report` as the result of a write that `cut` stopped between batches, or
+/// as the end of one that finished.
+fn ended(report: ImportReport, cut: Option<StopCause>) -> Imported {
+    match cut {
+        None => Imported::Done(report),
+        Some(cause) => Imported::Stopped(Stopped { cause, step: Step::Write, report: Some(report) }),
     }
 }
 
@@ -2112,20 +2198,21 @@ async fn prepare_parsed(
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
     control: &ImportControl,
-) -> Result<Arc<Prepared>, ImportError> {
+) -> Result<Arc<Prepared>, Cut> {
     let clock = Instant::now();
     let projects = projects_of(&parsed);
     let roots = roots_here(&projects, options);
     let listing = clock.elapsed();
     let planned: Vec<PathBuf> = roots.iter().map(|(root, _, _)| root.clone()).collect();
     let paths: Vec<(usize, PathBuf)> = roots.iter().enumerate().filter_map(|(k, (_, _, path))| Some((k, path.clone()?))).collect();
-    let planning = plan(store, &planned, &paths, ground, timings, control).await?;
+    let planning = or_stop(control, Step::Plan, plan(store, &planned, &paths, ground, timings, control)).await??;
     let (clock, timing) = control.begin(Step::Prepare);
     let row_projects: BTreeSet<&str> = parsed.memories.iter().filter_map(|(_, m)| m.project_id.as_deref()).collect();
     let settled = settle_projects(&projects, &roots, &planning, &row_projects, TimestampMs::now().as_millis_i64());
     let prepared = prepare(parsed, settled, options, Texts::Raw);
     timings.record(Timing { elapsed: listing + clock.elapsed(), rows: Some(prepared.rows.len()), ..timing });
     control.count(|c| (c.rows, c.notes) = (prepared.rows.len(), prepared.units().len()));
+    stopped_after(control, Step::Prepare)?;
     Ok(Arc::new(prepared))
 }
 
@@ -2144,7 +2231,7 @@ pub async fn import_foreign(
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
-    import_parsed(store, embedder, chunker, backups, ImportInput::Foreign(export), options, ground, timings, &ImportControl::default()).await
+    finished(import_parsed(store, embedder, chunker, backups, ImportInput::Foreign(export), options, ground, timings, &ImportControl::default()).await?)
 }
 
 /// Another tool's export translated into rows, with what the translation
@@ -2157,7 +2244,7 @@ async fn prepare_export(
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
     control: &ImportControl,
-) -> Result<(Arc<Prepared>, ForeignReport), ImportError> {
+) -> Result<(Arc<Prepared>, ForeignReport), Cut> {
     // Planned before the translation, which tells keys apart by the project
     // each note goes to here.
     let mut seen = HashSet::new();
@@ -2170,7 +2257,7 @@ async fn prepare_export(
         .iter()
         .filter_map(|(_, target)| Some((index[target.root()?], PathBuf::from(target.path()?))))
         .collect();
-    let planning = plan(store, &roots, &asks, ground, timings, control).await?;
+    let planning = or_stop(control, Step::Plan, plan(store, &roots, &asks, ground, timings, control)).await??;
     let mut declared = planning.declared.iter();
     let project_map = options
         .project_map
@@ -2195,15 +2282,16 @@ async fn prepare_export(
     let (clock, timing) = control.begin(Step::Translate);
     // Masking and splitting thousands of notes is work the daemon's other
     // requests should not wait behind.
-    let (prepared, foreign) = tokio::task::spawn_blocking(move || {
+    let translating = tokio::task::spawn_blocking(move || {
         let Translated { parsed, notes, report } = translate(&export, &translate_options, &chunker, now);
         let settled = mapped_projects(&roots, &plans);
         let mut prepared = prepare(parsed, settled, &ImportOptions::default(), Texts::Notes(notes));
         prepared.mapped_to = mapped_to;
         (prepared, report)
-    })
-    .await
-    .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
+    });
+    let (prepared, foreign) = or_stop(control, Step::Translate, translating)
+        .await?
+        .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
     timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..timing });
     control.count(|c| (c.rows, c.notes) = (prepared.rows.len(), prepared.units().len()));
     Ok((Arc::new(prepared), foreign))
@@ -2254,6 +2342,9 @@ struct Written {
     import_id: Option<i64>,
     /// The deleted projects a live row brought back, or would on a dry run.
     revived: BTreeSet<String>,
+    /// Why the write stopped between two batches, leaving the ledger of those
+    /// it committed and the journal open.
+    cut: Option<StopCause>,
 }
 
 /// Places every row and link of `prepared` and, unless this is a dry run,
@@ -2269,18 +2360,19 @@ async fn write(
     source: &'static str,
     timings: &mut ImportTimings,
     control: &ImportControl,
-) -> Result<Written, ImportError> {
+) -> Result<Written, Cut> {
     let now = TimestampMs::now().as_millis_i64();
     let (clock, mut timing) = control.begin(Step::Load);
-    let planned = load(store, prepared, &mut timing).await?;
+    let planned = or_stop(control, Step::Load, load(store, prepared, &mut timing)).await??;
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
     let (clock, timing) = control.begin(Step::Decide);
     let stop = Arc::new(AtomicBool::new(false));
     let _stop = StopOnDrop(stop.clone());
     let decide_from = prepared.clone();
-    let decided = tokio::task::spawn_blocking(move || decide(planned, &decide_from, &stop))
-        .await
+    let deciding = tokio::task::spawn_blocking(move || decide(planned, &decide_from, &stop));
+    let decided = or_stop(control, Step::Decide, deciding)
+        .await?
         .map_err(|e| MemoryError::Internal(format!("could not plan the import: {e}")))?
         .ok_or_else(|| MemoryError::Internal("the import was stopped".to_owned()))?;
     timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..timing });
@@ -2293,7 +2385,7 @@ async fn write(
             .filter_map(|r| r.project.clone())
             .filter(|p| prepared.deleted.contains(p))
             .collect();
-        return Ok(Written { ledger: decided, snapshot: None, import_id: None, revived });
+        return Ok(Written { ledger: decided, snapshot: None, import_id: None, revived, cut: None });
     }
     let embedder = embedder.ok_or(ImportError::NoEmbedder)?;
 
@@ -2301,13 +2393,15 @@ async fn write(
     let (clock, timing) = control.begin(Step::Embed);
     let mut timing = Timing { rows: Some(picked.len()), ..timing };
     control.count(|c| c.rows_to_embed = picked.len());
-    let order = embedding_order(prepared, picked, chunker).await?;
+    let order = or_stop(control, Step::Embed, embedding_order(prepared, picked, chunker)).await??;
     let mut vectors: HashMap<i64, Vec<u8>> = HashMap::with_capacity(order.len());
     for batch in order.chunks(EMBED_BATCH) {
         let asked = Instant::now();
         let rows: Vec<&Row> = batch.iter().map(|&k| &prepared.rows[k]).collect();
         let texts: Vec<String> = rows.iter().map(|r| embedding_text(&r.context, &r.content).into_owned()).collect();
-        let embedded = embedder.embed_batch(&texts, EmbedRole::Passage).await?;
+        // A batch the embedder still holds is let go: its thread drops the
+        // answer, and nothing it computes is written.
+        let embedded = or_stop(control, Step::Embed, embedder.embed_batch(&texts, EmbedRole::Passage)).await??;
         for (row, vector) in rows.iter().zip(embedded) {
             let unit = to_unit(&vector).map_err(|e| EmbedError::InferenceFailed(e.to_string()))?;
             vectors.insert(row.src.id, unit.iter().flat_map(|f| f.to_le_bytes()).collect());
@@ -2316,10 +2410,12 @@ async fn write(
         timing.batch(asked.elapsed());
     }
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
+    stopped_after(control, Step::Embed)?;
 
     let (clock, timing) = control.begin(Step::Snapshot);
     let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreImport).await?.display().to_string();
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
+    stopped_after(control, Step::Snapshot)?;
 
     let vectors = Arc::new(vectors);
     let mut ledger = Ledger::default();
@@ -2335,7 +2431,17 @@ async fn write(
     let notes = batch_notes(&units, &batches);
     let (clock, timing) = control.begin(Step::Write);
     let mut timing = Timing { rows: Some(prepared.rows.len()), ..timing };
+    let mut cut = None;
     for (k, range) in batches.into_iter().enumerate() {
+        // Only between batches: a transaction that was sent commits whatever
+        // the caller does, and its ledger and journal come back with it. The
+        // first batch always runs, so a write that stopped has a report.
+        if k > 0 {
+            cut = control.cause();
+            if cut.is_some() {
+                break;
+            }
+        }
         let (batch, vectors, rows) = (prepared.clone(), vectors.clone(), range.len());
         let mut placed = std::mem::take(&mut ledger);
         let mut logged = journal;
@@ -2364,6 +2470,12 @@ async fn write(
         });
     }
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
+    if cut.is_some() {
+        // The journal ends here without `finished_at`, and its drop lets the
+        // import's number go.
+        let revived = std::mem::take(&mut journal.revived);
+        return Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id, revived, cut });
+    }
 
     let (clock, mut timing) = control.begin(Step::Links);
     let links = prepared.clone();
@@ -2380,7 +2492,7 @@ async fn write(
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
     let revived = std::mem::take(&mut journal.revived);
-    Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id, revived })
+    Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id, revived, cut: None })
 }
 
 /// The indices in `prepared.rows` of the rows the import inserts and are not
@@ -2550,7 +2662,9 @@ pub(crate) mod tests {
     use crate::memory::events::{MemoryEvent, MemorySource};
     use crate::memory::portability::export::{read, Export, ExportFilter};
     use crate::memory::identity::{Disk, FakeGround, RootCommit};
-    use crate::memory::portability::control::Counters;
+    use crate::memory::embedder::GatedEmbedder;
+    use crate::memory::portability::control::{Counters, StopCause};
+    use futures::FutureExt;
     use crate::memory::portability::fixtures::{other_project, project, seed, OTHER_ROOT, ROOT};
     use crate::memory::portability::foreign::{ForeignNote, ForeignRelation, NoteKind, When};
     use crate::memory::portability::format::tests::EXAMPLE;
@@ -5485,9 +5599,12 @@ pub(crate) mod tests {
         let backups = crate::test_dir::test_dir();
         let control = ImportControl::default();
         let chunker = Arc::new(ChatChunker::with_fallback());
-        let report = import_parsed(store, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
+        let Imported::Done(report) = import_parsed(store, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("nothing raised a stop");
+        };
         (report, control.progress().counters, backups)
     }
 
@@ -5538,5 +5655,175 @@ pub(crate) mod tests {
         assert_eq!(batches, vec![0..4, 4..6, 6..11, 11..12]);
         assert_eq!(batch_notes(&units, &batches), vec![2, 1, 1, 1]);
         assert_eq!(batch_notes(&[], &[0..0]), vec![0], "the batch that only records the projects");
+    }
+
+    /// A clawg file of `rows` rows, in as many write batches as `WRITE_BATCH` makes.
+    fn rows_file(rows: usize) -> String {
+        let contents: Vec<String> = (1..=rows).map(|k| format!("the row {k} of the file")).collect();
+        let list: Vec<(i64, Option<&str>, &str)> = contents.iter().enumerate().map(|(k, c)| (k as i64 + 1, None, c.as_str())).collect();
+        clawg_file(&[], &list)
+    }
+
+    /// What an import of `input` left after `Cancel` was raised as it entered
+    /// `step`: its result, the store, the directory of its snapshots and its
+    /// control.
+    async fn cancelled_at(step: Step, input: ImportInput) -> (Imported, MemoryStore, crate::test_dir::TestDir, ImportControl) {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let backups = crate::test_dir::test_dir();
+        let control = ImportControl::default();
+        let raise = control.clone();
+        control.on_step(move |entered| {
+            if entered == step {
+                raise.stop(StopCause::Cancel);
+            }
+        });
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let imported = import_parsed(&store, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
+            .await
+            .unwrap();
+        (imported, store, backups, control)
+    }
+
+    /// The rows of `memory` and of `memory_import`, and the files in `backups`.
+    async fn left_by(store: &MemoryStore, backups: &crate::test_dir::TestDir) -> (usize, usize, usize) {
+        let (rows, imports): (usize, usize) = store
+            .conn
+            .call(|c| {
+                Ok::<_, rusqlite::Error>((
+                    c.query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM memory_import", [], |r| r.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        (rows, imports, std::fs::read_dir(backups.path()).unwrap().count())
+    }
+
+    #[tokio::test]
+    async fn each_step_of_an_import_stops_where_the_table_says() {
+        let rows = WRITE_BATCH + 1;
+        // Raised on entering the first step; where it stops; the rows, the
+        // journaled imports and the snapshots it leaves; whether it reports.
+        let table = [
+            (Step::Plan, Step::Plan, (0, 0, 0), false),
+            (Step::Prepare, Step::Prepare, (0, 0, 0), false),
+            (Step::Load, Step::Load, (0, 0, 0), false),
+            (Step::Decide, Step::Decide, (0, 0, 0), false),
+            (Step::Embed, Step::Embed, (0, 0, 0), false),
+            (Step::Snapshot, Step::Snapshot, (0, 0, 1), false),
+            (Step::Write, Step::Write, (WRITE_BATCH, 1, 1), true),
+        ];
+        for (raised, stops_in, left, reports) in table {
+            let (imported, store, backups, _) = cancelled_at(raised, ImportInput::Clawg(parsed(&rows_file(rows)))).await;
+            let Imported::Stopped(stopped) = imported else { panic!("{raised:?} did not stop the import") };
+            assert_eq!((stopped.cause, stopped.step), (StopCause::Cancel, stops_in), "raised in {raised:?}");
+            assert_eq!(stopped.report.is_some(), reports, "the report after {raised:?}");
+            assert_eq!(left_by(&store, &backups).await, left, "left by a stop in {raised:?}");
+        }
+
+        let (imported, store, backups, _) = cancelled_at(Step::Translate, ImportInput::Foreign(foreign_export(sample_notes()))).await;
+        let Imported::Stopped(stopped) = imported else { panic!("the translation was not stopped") };
+        assert_eq!((stopped.cause, stopped.step, stopped.report.is_none()), (StopCause::Cancel, Step::Translate, true));
+        assert_eq!(left_by(&store, &backups).await, (0, 0, 0));
+
+        let (imported, store, backups, _) = cancelled_at(Step::Links, ImportInput::Clawg(parsed(&rows_file(rows)))).await;
+        let Imported::Done(report) = imported else { panic!("the links are not a place to stop") };
+        assert_eq!((report.inserted, left_by(&store, &backups).await), (rows, (rows, 1, 1)));
+        let finished: Option<i64> = store.conn.call(|c| c.query_row("SELECT finished_at FROM memory_import", [], |r| r.get(0))).await.unwrap();
+        assert!(finished.is_some(), "an import stopped in its links ends");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_embedding_batch_does_not_block_the_stop() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let backups = crate::test_dir::test_dir();
+        let (embedder, gate) = GatedEmbedder::new();
+        let control = ImportControl::default();
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let input = ImportInput::Clawg(parsed(&rows_file(3)));
+        let (options, mut timings) = (ImportOptions::default(), ImportTimings::new(false));
+        let import = import_parsed(&store, Some(&embedder), chunker, backups.path(), input, &options, Arc::new(Disk), &mut timings, &control);
+        let stop = async {
+            gate.entered().await;
+            control.stop(StopCause::Cancel);
+        };
+        let (imported, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async { tokio::join!(import, stop) })
+            .await
+            .expect("the stop waited for the batch the embedder holds");
+        let Imported::Stopped(stopped) = imported.unwrap() else { panic!("the import finished") };
+        assert_eq!((stopped.cause, stopped.step, stopped.report.is_none()), (StopCause::Cancel, Step::Embed, true));
+        assert_eq!(left_by(&store, &backups).await, (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_stop_between_write_batches_returns_the_committed_ledger() {
+        let (imported, store, _backups, control) = cancelled_at(Step::Write, ImportInput::Clawg(parsed(&rows_file(WRITE_BATCH + 1)))).await;
+        let Imported::Stopped(stopped) = imported else { panic!("the write was not stopped") };
+        assert_eq!((stopped.cause, stopped.step), (StopCause::Cancel, Step::Write));
+        let report = stopped.report.expect("a batch was committed");
+
+        let (journaled, finished_at): (usize, Option<i64>) = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM memory_import_row WHERE import_id = i.import_id), i.finished_at FROM memory_import i",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!((report.inserted, journaled), (WRITE_BATCH, WRITE_BATCH));
+        assert_eq!(report.rows, WRITE_BATCH + 1, "the rows of the file, not the committed ones");
+        assert!(report.import_id.is_some() && finished_at.is_none(), "the journal stays open for an undo");
+        assert!(store.importing.lock().unwrap().is_empty(), "a stopped import lets its number go");
+        assert_eq!(control.progress().counters.rows_written, WRITE_BATCH);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_import_sends_nothing_after_its_cut() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let backups = crate::test_dir::test_dir();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(Some(held));
+        let control = ImportControl::default();
+        let queue = store.clone();
+        control.on_step(move |step| {
+            if step != Step::Write {
+                return;
+            }
+            if let Some(held) = held.lock().unwrap().take() {
+                // The batches queue behind this call, which holds the
+                // connection until the test lets go; polling it once sends it.
+                let hold = move |_: &mut rusqlite::Connection| {
+                    let _ = held.recv();
+                    Ok::<_, rusqlite::Error>(())
+                };
+                let _ = queue.conn.call(hold).now_or_never();
+            }
+        });
+        let task = tokio::spawn({
+            let (store, control) = (store.clone(), control.clone());
+            let (backups, input) = (backups.path().to_path_buf(), ImportInput::Clawg(parsed(&rows_file(WRITE_BATCH + 1))));
+            async move {
+                let chunker = Arc::new(ChatChunker::with_fallback());
+                import_parsed(&store, Some(&FakeEmbedder::default()), chunker, &backups, input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control).await
+            }
+        });
+        while control.progress().step != Some(Step::Write) {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        assert!(matches!(task.await, Err(e) if e.is_cancelled()));
+        release.send(()).unwrap();
+
+        // Whatever was queued ran before this call; nothing was queued after.
+        let (rows, finished_at): (usize, Option<i64>) = store
+            .conn
+            .call(|c| Ok::<_, rusqlite::Error>((c.query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))?, c.query_row("SELECT finished_at FROM memory_import", [], |r| r.get(0))?)))
+            .await
+            .unwrap();
+        assert_eq!(rows, WRITE_BATCH, "the batch already sent committed and no other was sent");
+        assert!(finished_at.is_none(), "the links were never sent");
     }
 }
