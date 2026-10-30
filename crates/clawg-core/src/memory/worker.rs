@@ -749,6 +749,36 @@ async fn follow_merge(store: &MemoryStore, evt: &MemoryEvent) -> Option<MemoryEv
     }
 }
 
+/// Masks `evt` and splits it into the pieces a save stores, with the head
+/// every piece after the first is embedded behind. `None` when the event
+/// stores nothing: a skipped role, or no text left after the chunker's rules.
+///
+/// Masked before anything else reads the text, so the chunker, the dedup
+/// hash, the embedding, the full-text index and the stored row all see the
+/// same masked content, and the secret reaches none of them. An event from
+/// the outbox was masked before it was recorded, and this pass finds nothing
+/// more.
+fn split_event(evt: &MemoryEvent, chat_chunker: &ChatChunker) -> (Vec<SecretKind>, Option<SaveSplit>) {
+    let masked = redact(&evt.content);
+    // Source-first: Compaction-sourced events bypass select_chunker (and thus
+    // the Role::System→Skip rule that ordinarily drops system-authored
+    // content from ingestion) entirely — they always chunk via ChatChunker,
+    // because a compaction summary is deliberately synthesized content worth
+    // keeping regardless of which role produced the text it summarizes. All
+    // other sources keep the existing role-based routing.
+    let kind = match evt.source {
+        MemorySource::Compaction => ChunkerKind::Chat,
+        _ => select_chunker(evt.role.clone(), evt.is_error, &masked.text),
+    };
+    let split = match kind {
+        ChunkerKind::Chat => Some(chat_chunker.split_save(&masked.text)),
+        ChunkerKind::Skip => None,
+    };
+    // Content that was all-whitespace or empty after chunker policy is not an
+    // error.
+    (masked.kinds, split.filter(|split| !split.pieces.is_empty()))
+}
+
 /// Stores the pieces of `evt` and returns its report with the pieces to link,
 /// in order, each with the head its vector was embedded behind.
 async fn ingest_pieces(
@@ -767,29 +797,10 @@ async fn ingest_pieces(
     // same masked content, and the secret reaches none of them. An event from
     // the outbox was masked before it was recorded, and this pass finds
     // nothing more.
-    let masked = redact(&evt.content);
-    let redacted = masked.kinds;
-    let content = masked.text;
-    // Source-first: Compaction-sourced events bypass select_chunker (and thus
-    // the Role::System→Skip rule that ordinarily drops system-authored
-    // content from ingestion) entirely — they always chunk via ChatChunker,
-    // because a compaction summary is deliberately synthesized content worth
-    // keeping regardless of which role produced the text it summarizes. All
-    // other sources keep the existing role-based routing.
-    let SaveSplit { pieces: chunks, head } = if evt.source == MemorySource::Compaction {
-        chat_chunker.split_save(&content)
-    } else {
-        let kind = select_chunker(evt.role.clone(), evt.is_error, &content);
-        match kind {
-            ChunkerKind::Chat => chat_chunker.split_save(&content),
-            ChunkerKind::Skip => return (IngestReport { redacted, ..Default::default() }, Vec::new()),
-        }
-    };
-
-    if chunks.is_empty() {
-        // Content was all-whitespace or empty after chunker policy. Not an error.
+    let (redacted, split) = split_event(evt, chat_chunker);
+    let Some(SaveSplit { pieces: chunks, head }) = split else {
         return (IngestReport { redacted, ..Default::default() }, Vec::new());
-    }
+    };
 
     // `memory_worker` holds events until the embedder is loaded, so this only
     // fires for a caller that skips that wait. Drop the whole event rather
@@ -1101,6 +1112,27 @@ mod tests {
             .await
             .expect("worker must exit within timeout after sender dropped")
             .expect("worker must not panic");
+    }
+
+    // ── The stages of a save ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_split_masks_the_text_and_leaves_out_what_stores_nothing() {
+        let chunker = ChatChunker::with_fallback();
+        let (redacted, split) = split_event(&make_event(Role::User, "password=hunter2abc and more", None, 1), &chunker);
+        assert_eq!(redacted, [SecretKind::Password]);
+        let split = split.expect("a user's text is stored");
+        assert_eq!(split.pieces.len(), 1);
+        assert!(!split.pieces[0].text.contains("hunter2abc"), "{}", split.pieces[0].text);
+
+        assert!(split_event(&make_event(Role::System, "you are a helpful agent", None, 1), &chunker).1.is_none());
+        assert!(split_event(&make_event(Role::User, "", None, 1), &chunker).1.is_none());
+        let compaction = MemoryEvent { source: MemorySource::Compaction, ..make_event(Role::System, "the summary", None, 1) };
+        assert!(split_event(&compaction, &chunker).1.is_some(), "a compaction is kept whoever wrote it");
+
+        let long = "word ".repeat(4_000);
+        let split = split_event(&make_event(Role::User, &long, None, 1), &chunker).1.unwrap();
+        assert!(split.pieces.len() > 1 && split.head.is_some(), "a long save is pieces behind a head");
     }
 
     // ── Worker spawn returns a join handle usable for shutdown/panic detection ──
