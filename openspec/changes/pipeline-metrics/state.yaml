@@ -1,14 +1,14 @@
 change: pipeline-metrics
 objective: "transversal"
 depends_on: [usage-metrics]
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: in_progress  # tramo 1 (SQLite y outbox) hecho; tramos 2 a 7 pendientes
   verify: pending
   archive: pending
-updated: 2026-10-22
+updated: 2026-10-30
