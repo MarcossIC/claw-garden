@@ -106,9 +106,11 @@ pub enum Command {
     /// Import a file `clawg export` wrote, keeping each memory's dates,
     /// accesses, state and links, or the export of another memory tool, each
     /// note split and masked as a save of its text. Needs a running daemon,
-    /// which embeds each memory again; the store is snapshotted first.
-    /// Importing a file twice adds nothing. `--undo N` takes import N back,
-    /// keeping what was saved, edited or judged since.
+    /// which reads the file, embeds each memory again and keeps going if this
+    /// command is killed; the store is snapshotted first. Ctrl-C asks the
+    /// daemon to stop the import and waits for it. Importing a file twice
+    /// adds nothing. `--undo N` takes import N back, keeping what was saved,
+    /// edited or judged since.
     Import {
         /// The file `clawg export` wrote, or the other tool's export (for
         /// engram, `engram export --all`).
@@ -126,6 +128,10 @@ pub enum Command {
         /// Report what would be imported, or undone, and write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Write the phases of the import to stderr even when it is not a
+        /// terminal, which gets them anyway. The report stays on stdout.
+        #[arg(long, conflicts_with = "undo")]
+        follow: bool,
         /// Store every memory that has an agent under this one instead.
         #[arg(long, value_parser = parse_agent)]
         agent: Option<String>,
@@ -1184,6 +1190,7 @@ mod tests {
                 undo: None,
                 from: ImportSource::Clawg,
                 dry_run: true,
+                follow: false,
                 agent: Some("dev".into()),
                 map_root: vec![
                     RootMap { old: "/a/repo".into(), new: PathBuf::from(".") },
@@ -1207,6 +1214,7 @@ mod tests {
                 undo: Some(4),
                 from: ImportSource::Clawg,
                 dry_run: true,
+                follow: false,
                 agent: None,
                 map_root: Vec::new(),
                 project_map: Vec::new(),
@@ -1226,6 +1234,20 @@ mod tests {
     }
 
     #[test]
+    fn follow_conflicts_with_undo() {
+        let follows = |args: &[&str]| match Cli::parse_args(args) {
+            Ok(Cli { command: Command::Import { follow, .. }, .. }) => Ok(follow),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.kind()),
+        };
+        assert_eq!(follows(&["clawg", "import", "m.jsonl", "--follow"]), Ok(true));
+        assert_eq!(follows(&["clawg", "import", "m.jsonl", "--follow", "--dry-run"]), Ok(true));
+        assert_eq!(follows(&["clawg", "import", "m.jsonl"]), Ok(false));
+        let conflict = Err(clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(follows(&["clawg", "import", "--undo", "4", "--follow"]), conflict);
+    }
+
+    #[test]
     fn import_takes_a_source_and_project_maps() {
         let args = ["clawg", "import", "--from", "engram", "e.json", "--project-map", "my=app=C:\\work\\app", "--project-map", "b=."];
         assert_eq!(
@@ -1235,6 +1257,7 @@ mod tests {
                 undo: None,
                 from: ImportSource::Engram,
                 dry_run: false,
+                follow: false,
                 agent: None,
                 map_root: Vec::new(),
                 project_map: vec![

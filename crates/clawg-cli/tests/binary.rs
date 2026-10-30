@@ -966,6 +966,207 @@ async fn a_job_import_ends_done_with_the_report_of_the_synchronous_import() {
     assert!(job.list().await.contains("exported while the daemon runs"));
 }
 
+// ── clawg import follows its job ────────────────────────────────────────────
+
+/// A clawg export of `rows` memories, each saying something of its own.
+fn export_of(sandbox: &Sandbox, rows: usize) -> PathBuf {
+    let mut text = String::from(r#"{"kind":"header","format":"clawg-memories","version":1,"exported_at":0,"clawg":"0.0.0"}"#);
+    text.push('\n');
+    for i in 1..=rows {
+        let at = 10 + i;
+        text.push_str(&format!(
+            r#"{{"kind":"memory","id":{i},"scope":"agent","agent_id":"a","content":"Deploys of service number {i} go out on Tuesdays","memory_type":"semantic_fact","source":"explicit","created_at":{at},"created_by_type":"agent","last_modified_at":{at},"last_accessed_at":{at},"access_count":0,"importance":5.0,"tier":3,"status":"active"}}"#
+        ));
+        text.push('\n');
+    }
+    let file = sandbox.home.join(format!("export-{rows}.jsonl"));
+    std::fs::write(&file, text).expect("the export");
+    file
+}
+
+/// The phases of a job, in the order of the steps they show.
+const PHASES: [&str; 10] =
+    ["planning", "preparing", "translating", "loading", "deciding", "embedding", "snapshot", "writing", "linking", "done"];
+
+/// The phase each stderr line starts with, in the order they came.
+fn phases_in(stderr: &str) -> Vec<&'static str> {
+    stderr
+        .lines()
+        .filter_map(|line| PHASES.iter().copied().find(|phase| line.split([':', ' ']).next() == Some(phase)))
+        .collect()
+}
+
+/// Until job `id` of `daemon` is in `phase`.
+async fn wait_for_job(daemon: &Daemon, id: u64, phase: &str) -> Value {
+    let deadline = Instant::now() + START_BUDGET;
+    loop {
+        let (status, state) = daemon.get(&format!("/v1/imports/{id}")).await;
+        if status == 200 && state["phase"] == phase {
+            return state;
+        }
+        assert!(Instant::now() < deadline, "job {id} never was {phase}: {status} {state}\n{}", daemon.log_text());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `--follow` writes the phases to stderr, in order, and leaves stdout as it
+/// was: the report of the import, which a script reads.
+#[tokio::test]
+async fn follow_prints_the_phases_in_order_on_stderr_and_the_same_report_on_stdout() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let file = export_of(&sandbox, 40).to_string_lossy().into_owned();
+
+    let plain = sandbox.run(&["import", &file, "--dry-run", "--profile", "dev"]);
+    let followed = sandbox.run(&["import", &file, "--dry-run", "--follow", "--profile", "dev"]);
+    assert_eq!(plain.status.code(), Some(0), "{}", stderr_of(&plain));
+    assert_eq!(followed.status.code(), Some(0), "{}", stderr_of(&followed));
+    assert!(stdout_of(&plain).starts_with("would import 40 of 40 memories"), "{}", stdout_of(&plain));
+    assert_eq!(stdout_of(&followed), stdout_of(&plain), "the report is the same with or without --follow");
+    assert_eq!(phases_in(&stderr_of(&plain)), Vec::<&str>::new(), "no terminal and no --follow: no progress");
+
+    let seen = phases_in(&stderr_of(&followed));
+    assert_eq!(seen.first(), Some(&"planning"), "{}", stderr_of(&followed));
+    assert_eq!(seen.last(), Some(&"done"), "{}", stderr_of(&followed));
+    let order: Vec<usize> = seen.iter().map(|seen| PHASES.iter().position(|phase| phase == seen).expect("a phase")).collect();
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "each phase once, in the order of the steps: {seen:?}");
+
+    let real = sandbox.run(&["import", &file, "--follow", "--profile", "dev"]);
+    assert_eq!(real.status.code(), Some(0), "{}", stderr_of(&real));
+    assert!(stdout_of(&real).starts_with("imported 40 of 40 memories in the file"), "{}", stdout_of(&real));
+    assert_eq!(phases_in(&stderr_of(&real)).last(), Some(&"done"), "{}", stderr_of(&real));
+}
+
+/// The daemon holds the job, not the command that follows it.
+#[tokio::test]
+async fn killing_clawg_import_does_not_stop_the_job() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let file = export_of(&sandbox, 2000).to_string_lossy().into_owned();
+    let mut child = sandbox
+        .command(&["import", &file, "--follow", "--profile", "dev"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn clawg import");
+
+    let deadline = Instant::now() + START_BUDGET;
+    while daemon.get("/v1/imports/1").await.0 != 200 {
+        assert!(Instant::now() < deadline, "the daemon never accepted the job:\n{}", daemon.log_text());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // It asks again only after a second, so it is still following.
+    assert!(child.try_wait().expect("try_wait").is_none(), "the command ended before it was killed");
+    child.kill().expect("kill the command");
+    let _ = child.wait();
+
+    let done = wait_for_job(&daemon, 1, "done").await;
+    assert_eq!(done["report"]["inserted"], 2000, "{done}");
+}
+
+/// A daemon that answers `/health` and, for everything else, what an axum
+/// router does with a route it does not have: a `404` with no body. It notes
+/// each request it gets.
+struct DaemonWithoutJobs {
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl DaemonWithoutJobs {
+    async fn publish(sandbox: &Sandbox, version: &str) -> Self {
+        use axum::extract::{Request, State};
+        use axum::middleware::{from_fn_with_state, Next};
+        use axum::response::Response;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        async fn note(State(requests): State<Arc<Mutex<Vec<(String, String)>>>>, request: Request, next: Next) -> Response {
+            let (parts, body) = request.into_parts();
+            let body = axum::body::to_bytes(body, 1 << 20).await.expect("the request body");
+            let line = format!("{} {}", parts.method, parts.uri.path());
+            requests.lock().expect("requests").push((line, String::from_utf8_lossy(&body).into_owned()));
+            next.run(Request::from_parts(parts, axum::body::Body::from(body))).await
+        }
+        let health = json!({ "status": "ok", "version": version, "profile": "dev", "pid": 1, "embedder": "ready", "uptime_s": 1 });
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(move || { let health = health.clone(); async move { axum::Json(health) } }))
+            .layer(from_fn_with_state(requests.clone(), note));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let data_dir = sandbox.data_dir();
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let state = clawg_cli::daemon::lifecycle::DaemonState {
+            pid: std::process::id(),
+            port: Some(port),
+            unix_socket: false,
+            profile: "dev".into(),
+            version: version.into(),
+            started_at_ms: 0,
+        };
+        clawg_cli::daemon::lifecycle::write_state(&data_dir, &state).expect("daemon.json");
+        clawg_cli::daemon::lifecycle::write_token(&data_dir, "0123456789abcdef0123456789abcdef").expect("token");
+        Self { requests }
+    }
+
+    fn requests(&self) -> Vec<(String, String)> {
+        self.requests.lock().expect("requests").clone()
+    }
+}
+
+// The stand-in daemon runs on a worker while the test waits for the command.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_against_a_daemon_without_the_job_route_exits_1_without_sending_the_file() {
+    let sandbox = Sandbox::new();
+    let daemon = DaemonWithoutJobs::publish(&sandbox, "0.0.1").await;
+    let file = export_of(&sandbox, 3).to_string_lossy().into_owned();
+
+    let import = sandbox.run(&["import", &file, "--profile", "dev"]);
+
+    assert_eq!(import.status.code(), Some(1), "{}", stderr_of(&import));
+    assert!(stdout_of(&import).is_empty(), "{}", stdout_of(&import));
+    let said = stderr_of(&import);
+    assert!(said.contains("older than this clawg") && said.contains("0.0.1") && said.contains("'clawg stop'"), "{said}");
+    let requests = daemon.requests();
+    let asked: Vec<&str> = requests.iter().map(|(line, _)| line.as_str()).collect();
+    assert_eq!(asked, ["GET /health", "POST /v1/imports", "GET /health"], "nothing else is asked");
+    let body = &requests[1].1;
+    assert!(body.contains("export-3.jsonl") && !body.contains("Deploys of service"), "the path went, not the file: {body}");
+}
+
+/// Ctrl-C asks the daemon to stop the job, waits for it and says what was
+/// written.
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_c_sends_the_delete_and_prints_what_was_written() {
+    use std::io::Read;
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let file = export_of(&sandbox, 50_000).to_string_lossy().into_owned();
+    let mut child = sandbox
+        .command(&["import", &file, "--follow", "--profile", "dev"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clawg import");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let mut first = String::new();
+    stderr.read_line(&mut first).expect("the first phase");
+    assert!(first.starts_with("planning"), "{first}");
+    let pid = libc::pid_t::try_from(child.id()).expect("pid");
+
+    // SAFETY: plain FFI call on this test's own child.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+
+    let status = child.wait().expect("the command ends");
+    let (mut out, mut rest) = (String::new(), String::new());
+    child.stdout.take().expect("stdout").read_to_string(&mut out).expect("stdout text");
+    stderr.read_to_string(&mut rest).expect("stderr text");
+    assert_eq!(status.code(), Some(1), "{out}\n{rest}");
+    assert!(out.contains("nothing was written") || out.contains("`clawg import --undo "), "{out}\n{rest}");
+    wait_for_job(&daemon, 1, "cancelled").await;
+}
+
 #[tokio::test]
 async fn an_engram_export_imports_through_the_binary() {
     let sandbox = Sandbox::new();

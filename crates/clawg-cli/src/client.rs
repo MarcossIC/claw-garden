@@ -750,6 +750,8 @@ pub struct ImportJobRequest {
 pub struct ImportJob {
     pub job_id: u64,
     pub phase: String,
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(flatten)]
     pub counters: Counters,
     /// The import's number in the store, once it wrote.
@@ -1449,27 +1451,6 @@ impl DaemonClient {
         }
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/backup")).await?;
         Ok(read_response::<Body>(answer)?.path)
-    }
-
-    /// Imports the export `text` of the tool `from` (`clawg`, `engram`).
-    /// `map_roots` pairs an exported root with where it is here, and
-    /// `project_map` a project name of another tool with where its notes go,
-    /// each root already resolved. A target is an object, which a daemon from
-    /// before refuses rather than storing the notes in no project.
-    pub async fn import(
-        &self,
-        text: &str,
-        from: &str,
-        dry_run: bool,
-        agent: Option<&str>,
-        map_roots: &[(String, MapTarget)],
-        project_map: &[(String, MapTarget)],
-    ) -> Result<ImportReport, ClientError> {
-        let body = serde_json::json!({
-            "text": text, "from": from, "dry_run": dry_run, "agent": agent,
-            "map_roots": map_roots, "project_map": project_map,
-        });
-        read_response(self.send(Call::new(reqwest::Method::POST, "/v1/import").json(&body)?).await?)
     }
 
     /// Starts the import of the export at `request.path`, which the daemon
