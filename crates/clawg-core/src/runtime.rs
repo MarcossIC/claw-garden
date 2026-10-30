@@ -40,6 +40,7 @@ use crate::memory::spill;
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestReport, IngestRequest, Replay};
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
+use crate::metrics::Recorder;
 
 /// How many saves the ingest queue holds before a producer is refused.
 ///
@@ -155,6 +156,10 @@ pub struct MemoryRuntime {
     /// Which projects' documentation indexes are being refreshed, and when
     /// each last was, so the daemon never refreshes one project twice at once.
     pub project_docs: Arc<DocIndex>,
+    /// Where the search, the ingest and the embedder measure what they do;
+    /// the store's, so every clone of it measures into the same one. The
+    /// daemon serves and keeps it beside its own series.
+    pub metrics: Arc<Recorder>,
 }
 
 impl MemoryRuntime {
@@ -186,6 +191,7 @@ impl MemoryRuntime {
         Ok((
             Self {
                 base_dir,
+                metrics: store.metrics().clone(),
                 store,
                 memory_tx,
                 embedder: Arc::new(OnceCell::new()),
@@ -434,6 +440,7 @@ impl MemoryRuntime {
         (
             Self {
                 base_dir,
+                metrics: store.metrics().clone(),
                 store,
                 memory_tx,
                 embedder: Arc::new(embedder),
@@ -797,6 +804,21 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    /// Two runtimes in one process measure apart, and what the store records
+    /// is what the runtime serves.
+    #[tokio::test]
+    async fn a_test_runtime_carries_its_own_recorder() {
+        let (a_dir, b_dir) = (tmp_base(), tmp_base());
+        let (a, _a_rx) = MemoryRuntime::new_for_test(a_dir.path().to_path_buf()).await;
+        let (b, _b_rx) = MemoryRuntime::new_for_test(b_dir.path().to_path_buf()).await;
+        assert!(!Arc::ptr_eq(&a.metrics, &b.metrics));
+        assert!(Arc::ptr_eq(&a.metrics, a.store.clone().metrics()), "every clone of the store measures into the runtime's");
+
+        a.store.metrics().gauge("probe", &[], 1.0);
+        assert_eq!(a.metrics.minute().gauges.len(), 1);
+        assert!(b.metrics.minute().is_empty());
+    }
+
     /// The maintenance loop never returns, so what is actually assertable is
     /// that its future satisfies the bounds every executor demands.
     #[tokio::test]
@@ -824,6 +846,7 @@ mod tests {
             tokenizer,
             access_tracker: _,
             project_docs: _,
+            metrics: _,
         } = rt;
 
         let worker = tokio::spawn(ingest_worker_future(

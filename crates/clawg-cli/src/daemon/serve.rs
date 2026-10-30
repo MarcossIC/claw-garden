@@ -20,7 +20,6 @@ use clawg_core::memory::idle_embedder::{idle_after, DEFAULT_IDLE, IDLE_MINUTES_V
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::metrics::store::RunInfo;
-use clawg_core::metrics::Recorder;
 use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
 use clawg_core::private_dir::ensure_private_dir;
 use clawg_core::runtime::{MemoryRuntime, Workers};
@@ -208,11 +207,12 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         },
     )?;
 
-    let metrics = Arc::new(Recorder::default());
     let writer = {
         let path = metrics_path(&base_dir, std::env::var(METRICS_VAR).ok().as_deref());
         let run = run_info(profile, idle);
-        let (metrics, path) = (metrics.clone(), path.clone());
+        // The runtime's, so what the search, the ingest and the embedder
+        // measure is written with the daemon's own series.
+        let (metrics, path) = (runtime.metrics.clone(), path.clone());
         tokio::task::spawn_blocking(move || Writer::start(path.as_deref(), metrics, &run, now_ms() as i64))
             .await
             .map_err(|e| ServeError::Server(std::io::Error::other(e)))?
@@ -232,10 +232,9 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         shutdown: shutdown_tx,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
-        metrics,
     });
 
-    let store_probe = super::store_probe::spawn(ctx.runtime.store.clone(), base_dir.clone(), ctx.metrics.clone());
+    let store_probe = super::store_probe::spawn(ctx.runtime.store.clone(), base_dir.clone(), ctx.runtime.metrics.clone());
 
     log::info!(
         "clawg serve {} listening on {}, data dir {}",

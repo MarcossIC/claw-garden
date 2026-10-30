@@ -348,7 +348,6 @@ impl Harness {
             shutdown,
             save_timeout,
             sessions: Default::default(),
-            metrics: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4155,6 +4154,7 @@ async fn an_unkeyed_save_names_the_row_a_key_would_revise() {
 /// The `http.duration` series of the run, as label strings with their count.
 fn http_durations(h: &Harness) -> Vec<(String, u64)> {
     h.ctx
+        .runtime
         .metrics
         .run()
         .iter()
@@ -4181,14 +4181,14 @@ async fn every_request_is_timed_by_route_status_and_transport() {
     assert_eq!(count_of(&series, "method=POST,route=/v1/search,status=2xx,transport=tcp"), 1, "{series:?}");
     assert_eq!(count_of(&series, "method=GET,route=/v1/memories/{kind}/{id},status=4xx,transport=tcp"), 1, "{series:?}");
 
-    let run = h.ctx.metrics.run();
+    let run = h.ctx.runtime.metrics.run();
     let bytes = run
         .iter()
         .find(|(key, _)| key.name == "http.request_bytes" && key.labels == "method=POST,route=/v1/search")
         .map(|(_, histogram)| histogram.clone())
         .expect("the size of the search is recorded");
     assert!(bytes.max() > 0, "the size comes from Content-Length");
-    let minute = h.ctx.metrics.minute();
+    let minute = h.ctx.runtime.metrics.minute();
     let in_flight = minute.gauges.iter().find(|(key, _)| key.name == "http.in_flight").expect("in flight").1;
     assert!(in_flight.max >= 1.0 && in_flight.last == 0.0, "{in_flight:?}");
 }
@@ -4235,7 +4235,7 @@ async fn no_label_comes_from_the_request() {
         .await
         .expect("request");
 
-    let labels: Vec<String> = h.ctx.metrics.run().keys().map(|key| key.labels.clone()).collect();
+    let labels: Vec<String> = h.ctx.runtime.metrics.run().keys().map(|key| key.labels.clone()).collect();
     for label in &labels {
         for leaked in ["424242", "secretagent", "zebra", "qwerty", "nowhere", "BREW"] {
             assert!(!label.contains(leaked), "{label} carries {leaked}");

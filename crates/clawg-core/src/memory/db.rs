@@ -10,6 +10,7 @@ use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
 use crate::memory::sharing::{self, Reader};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
+use crate::metrics::Recorder;
 
 // ---------------------------------------------------------------------------
 // Embedding contract
@@ -151,6 +152,9 @@ pub struct MemoryStore {
     /// database, so they belong to one latency series instead of each
     /// keeping a private slice too short to mean anything.
     knn_latency: Arc<KnnLatency>,
+    /// Where what the store does is measured, shared with every clone and
+    /// with the runtime that opened it.
+    metrics: Arc<Recorder>,
     /// Exclusive ownership of `<base_dir>/memory.db`, shared with every clone.
     ///
     /// Never read: the guard is the value. Behind an `Arc` so the store stays
@@ -243,6 +247,7 @@ impl MemoryStore {
         Ok(Self {
             conn,
             knn_latency: Arc::new(KnnLatency::new()),
+            metrics: Arc::default(),
             _lock: Some(Arc::new(lock)),
             dir: Some(base_dir.to_path_buf()),
             sharing_dir: Some(base_dir.to_path_buf()),
@@ -266,6 +271,7 @@ impl MemoryStore {
         Ok(Self {
             conn,
             knn_latency: Arc::new(KnnLatency::new()),
+            metrics: Arc::default(),
             _lock: None,
             dir: None,
             sharing_dir: None,
@@ -319,6 +325,11 @@ impl MemoryStore {
     /// field doc comment for why that sharing is intended, not accidental.
     pub(crate) fn knn_latency(&self) -> &KnnLatency {
         &self.knn_latency
+    }
+
+    /// The recorder every clone of this store measures into.
+    pub fn metrics(&self) -> &Arc<Recorder> {
+        &self.metrics
     }
 
     /// Write-if-absent, verify-if-present bootstrap for the single-row

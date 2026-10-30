@@ -64,7 +64,6 @@ use clawg_core::memory::synthesis::{
     conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
-use clawg_core::metrics::Recorder;
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
@@ -109,8 +108,6 @@ pub struct AppCtx {
     /// The host session each agent works in, per project, that saves are
     /// stamped with.
     pub sessions: SessionRegistry,
-    /// The metrics of this run: every request, and what the writer samples.
-    pub metrics: Arc<Recorder>,
 }
 
 /// How long a save waits for the worker. Long enough for a multi-chunk save
@@ -1074,7 +1071,7 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/shutdown", post(shutdown))
         .layer(axum::middleware::from_fn_with_state(app.clone(), require_bearer));
 
-    let meter = Arc::new(HttpMeter::new(app.metrics.clone()));
+    let meter = Arc::new(HttpMeter::new(app.runtime.metrics.clone()));
     Router::new()
         .route("/health", get(health))
         .nest("/v1", v1)
@@ -1669,11 +1666,11 @@ async fn metrics(State(app): State<Arc<AppCtx>>, Query(q): Query<MetricsQuery>) 
     match q.format.as_deref() {
         None | Some("json") => {
             let started_at_ms = now_ms().saturating_sub(app.started_at.elapsed().as_millis() as u64);
-            Ok(Json(metrics_body(&app.metrics, clawg_core::build_info::version(), started_at_ms)).into_response())
+            Ok(Json(metrics_body(&app.runtime.metrics, clawg_core::build_info::version(), started_at_ms)).into_response())
         }
         Some("prometheus") => Ok((
             [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-            prometheus_text(&app.metrics),
+            prometheus_text(&app.runtime.metrics),
         )
             .into_response()),
         Some(other) => Err(ApiError::bad_request(format!("unknown format {other:?}; use json or prometheus"))),
@@ -3063,7 +3060,6 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
-            metrics: Default::default(),
         });
 
         let (addr, server) = serve_ephemeral(app).await.expect("bind an ephemeral loopback port");
