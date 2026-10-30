@@ -57,13 +57,16 @@ use clawg_core::memory::registry::{
     Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
 };
 use clawg_core::memory::relocate::{move_memories_core, undo_move_core, MoveError, MoveFilter, MoveReport, ProjectFilter};
-use clawg_core::memory::prompt_builder::{build_memory_prompt, build_session_prompt, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET};
+use clawg_core::memory::prompt_builder::{
+    build_memory_prompt, build_session_prompt, PromptBlock, QueryTexts, Retrieval, DEFAULT_BUDGET, MAX_BUDGET,
+};
 use clawg_core::memory::sharing::{self, Reach, Reader};
 use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
     conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
+use clawg_core::metrics::{Recorder, Unit};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
@@ -771,6 +774,17 @@ pub enum RetrievalState {
 }
 
 impl RetrievalState {
+    /// The state as the answer names it.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Searched { .. } => "searched",
+            Self::Recent { .. } => "recent",
+            Self::EmbedderNotReady => "embedder_not_ready",
+            Self::EmbedderFailed { .. } => "embedder_failed",
+            Self::SearchFailed { .. } => "search_failed",
+        }
+    }
+
     /// Reads a missing embedder from `status`, as [`ready_embedder`] does for
     /// a search, so the two never disagree on why memories cannot be reached.
     fn of(retrieval: Retrieval, status: EmbedderStatus) -> Self {
@@ -1614,7 +1628,18 @@ async fn context(
     };
 
     let retrieval = RetrievalState::of(prompt.retrieval, app.runtime.embedder_status());
+    record_context(&app.runtime.metrics, &retrieval, prompt.text.len(), &prompt.cut);
     Ok(Json(ContextBody { prompt: prompt.text, unreviewed, conclusions_to_review, retrieval, other_language, suggestions }))
+}
+
+/// Records how a context went: whether it searched, how big its prompt is
+/// and which blocks the budget cut. Counts are gauges of 1, one sample each.
+fn record_context(metrics: &Recorder, retrieval: &RetrievalState, prompt_bytes: usize, cut: &[PromptBlock]) {
+    metrics.gauge("context.retrieval_state", &[("state", retrieval.name())], 1.0);
+    metrics.observe("context.prompt_bytes", Unit::Bytes, &[], prompt_bytes as u64);
+    for block in cut {
+        metrics.gauge("context.cut", &[("block", block.as_str())], 1.0);
+    }
 }
 
 /// Records the host session `agent_id` works in for `project_id`, as a hook

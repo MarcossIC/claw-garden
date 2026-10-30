@@ -128,6 +128,28 @@ pub enum Retrieval {
 pub struct MemoryPrompt {
     pub text: String,
     pub retrieval: Retrieval,
+    /// The blocks the budget took something out of, in [`PromptBlock`] order.
+    pub cut: Vec<PromptBlock>,
+}
+
+/// A block of the prompt the budget may cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PromptBlock {
+    Recent,
+    LongTerm,
+    LastSession,
+    Conflicts,
+}
+
+impl PromptBlock {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptBlock::Recent => "recent",
+            PromptBlock::LongTerm => "long_term",
+            PromptBlock::LastSession => "last_session",
+            PromptBlock::Conflicts => "conflicts",
+        }
+    }
 }
 
 struct ConflictPair {
@@ -273,7 +295,7 @@ pub async fn build_memory_prompt(
         tracker.record_hits(&fitted.shown);
     }
 
-    Ok(MemoryPrompt { text: fitted.text, retrieval })
+    Ok(MemoryPrompt { text: fitted.text, retrieval, cut: fitted.cut })
 }
 
 /// The prompt of a context asked for without a query, as a session starts:
@@ -308,7 +330,7 @@ pub async fn build_session_prompt(
     // are only the newest, not what anything asked for.
     let reader = Reader::new(agent_id, reach.clone());
     let fitted = assemble(lang, store, &workspace_content, last_session, hits, emitted, &reader, budget, 0).await;
-    Ok(MemoryPrompt { text: fitted.text, retrieval })
+    Ok(MemoryPrompt { text: fitted.text, retrieval, cut: fitted.cut })
 }
 
 /// Only its content reaches the model: no markers, no empty headings. A
@@ -411,6 +433,7 @@ struct Cut {
 struct Fitted {
     text: String,
     shown: Vec<RankedHit>,
+    cut: Vec<PromptBlock>,
 }
 
 /// Renders `parts` in at most `budget` bytes.
@@ -440,29 +463,42 @@ struct Fitted {
 fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
     let full = render(&parts, None);
     if full.len() <= budget {
-        return Fitted { text: full, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
+        return Fitted { text: full, shown: parts.recent.into_iter().chain(parts.longterm).collect(), cut: Vec::new() };
     }
+    let mut blocks = Vec::new();
     let printed =
         parts.last_session.iter().chain(&parts.recent).chain(&parts.longterm).map(|h| (h.kind, h.id)).collect();
     let mut cut = Cut { budget, full: full.len(), printed, left_out: Vec::new(), shortened: Vec::new(), workspace_over: false };
     loop {
         let text = render(&parts, Some(&cut));
         let Some(over) = text.len().checked_sub(budget).filter(|&over| over > 0) else {
-            return Fitted { text, shown: parts.recent.into_iter().chain(parts.longterm).collect() };
+            blocks.sort();
+            return Fitted { text, shown: parts.recent.into_iter().chain(parts.longterm).collect(), cut: blocks };
         };
         let hits_over = hit_bytes(&parts).saturating_sub(parts.hit_room);
         let (block, at, by) = match next_to_cut(&parts.recent, &parts.longterm) {
-            Some((bucket, at)) if hits_over > 0 => (hits_in(&mut parts, bucket), at, over.min(hits_over)),
-            _ if !parts.last_session.is_empty() => (&mut parts.last_session, 0, over),
+            Some((bucket, at)) if hits_over > 0 => {
+                cut_from(&mut blocks, bucket.block());
+                (hits_in(&mut parts, bucket), at, over.min(hits_over))
+            }
+            _ if !parts.last_session.is_empty() => {
+                cut_from(&mut blocks, PromptBlock::LastSession);
+                (&mut parts.last_session, 0, over)
+            }
             _ if !parts.conflicts.is_empty() => {
+                cut_from(&mut blocks, PromptBlock::Conflicts);
                 parts.conflicts.pop();
                 parts.conflicts_omitted += 1;
                 continue;
             }
-            Some((bucket, at)) => (hits_in(&mut parts, bucket), at, over),
+            Some((bucket, at)) => {
+                cut_from(&mut blocks, bucket.block());
+                (hits_in(&mut parts, bucket), at, over)
+            }
             None => {
                 cut.workspace_over = true;
-                return Fitted { text: render(&parts, Some(&cut)), shown: Vec::new() };
+                    blocks.sort();
+                return Fitted { text: render(&parts, Some(&cut)), shown: Vec::new(), cut: blocks };
             }
         };
         if block.len() == 1 {
@@ -488,6 +524,12 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
     }
 }
 
+fn cut_from(blocks: &mut Vec<PromptBlock>, block: PromptBlock) {
+    if !blocks.contains(&block) {
+        blocks.push(block);
+    }
+}
+
 /// What RECENT and LONG-TERM take of the text: each block with its
 /// separator, its lines and the blank line that opens it.
 fn hit_bytes(parts: &PromptParts<'_>) -> usize {
@@ -510,6 +552,15 @@ fn hits_in<'p>(parts: &'p mut PromptParts<'_>, bucket: Bucket) -> &'p mut Vec<Ra
 enum Bucket {
     Recent,
     LongTerm,
+}
+
+impl Bucket {
+    fn block(&self) -> PromptBlock {
+        match self {
+            Bucket::Recent => PromptBlock::Recent,
+            Bucket::LongTerm => PromptBlock::LongTerm,
+        }
+    }
 }
 
 /// Where the hit the budget cuts next sits, if RECENT or LONG-TERM has one:
@@ -1703,6 +1754,38 @@ mod tests {
             .expect("some budget leaves no hit, the largest is checked");
         assert!(block(&session_gone, SEP_CONFLICTS).is_some(), "the conflicts outlast it: {session_gone}");
         assert!(block(&session_gone, SEP_BUDGET).unwrap().contains("Left out: #9, #1, #2, #3."), "{session_gone}");
+    }
+
+    #[test]
+    fn the_fit_names_each_block_it_cut() {
+        let with_session = || PromptParts {
+            last_session: vec![sized_hit(9, 1_000)],
+            ..parts("", &[(1, 1_000), (2, 1_000)], &[(3, 1_000)], vec![pair(301, 302)])
+        };
+        assert!(fit_to_budget(with_session(), MAX_BUDGET).cut.is_empty(), "a context that fits cuts nothing");
+
+        let hits_gone = fit_to_budget(with_session(), 1_900);
+        assert_eq!(hits_gone.cut, [PromptBlock::Recent, PromptBlock::LongTerm], "{}", hits_gone.text);
+
+        let session_gone = (300..700)
+            .rev()
+            .map(|budget| fit_to_budget(with_session(), budget))
+            .find(|fitted| header_ids(&fitted.text).is_empty())
+            .expect("some budget leaves no hit");
+        assert_eq!(
+            session_gone.cut,
+            [PromptBlock::Recent, PromptBlock::LongTerm, PromptBlock::LastSession],
+            "{}",
+            session_gone.text
+        );
+
+        let conflicts_gone = fit_to_budget(ten_long_hits(), 200);
+        assert!(conflicts_gone.cut.contains(&PromptBlock::Conflicts), "{}", conflicts_gone.text);
+        assert_eq!(
+            [PromptBlock::Recent, PromptBlock::LongTerm, PromptBlock::LastSession, PromptBlock::Conflicts]
+                .map(PromptBlock::as_str),
+            ["recent", "long_term", "last_session", "conflicts"]
+        );
     }
 
     #[test]

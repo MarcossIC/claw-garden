@@ -1559,8 +1559,12 @@ async fn a_search_with_a_language_counts_the_other_one() {
 async fn a_search_without_a_language_has_no_count() {
     let h = Harness::start().await;
     save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let total = clawg_core::metrics::SeriesKey::new("search.duration", &[("arm", "total")]);
+    let searches = || h.ctx.runtime.metrics.run().get(&total).map_or(0, |h| h.count());
+    let before = searches();
     let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a" })).await;
     assert_eq!(status, 200, "{body}");
+    assert_eq!(searches(), before + 1, "the store's search measures into the daemon's recorder");
     assert!(body.get("other_language").is_none(), "{body}");
     let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "lang": "es" })).await;
     assert_eq!(status, 200, "{body}");
@@ -4210,6 +4214,37 @@ async fn a_search_records_its_arms_its_hits_and_what_it_withheld() {
     let withheld = body["withheld"].as_f64().unwrap();
     assert_eq!(gauge_of(&h, "search.hits", &[]), Some((1, shown)));
     assert_eq!(gauge_of(&h, "search.withheld", &[]), Some((1, withheld)));
+}
+
+#[tokio::test]
+async fn a_context_records_its_state_its_size_and_the_blocks_it_cut() {
+    let h = Harness::start().await;
+    for n in 0..3 {
+        let content = format!("Note {n}: {}", "the deploy script lives in ops and runs after every merge. ".repeat(6));
+        save_id(&h, json!({ "content": content, "agent_id": "a" })).await;
+    }
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "budget": 600 })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"]["state"], "recent", "{body}");
+    let (_, body_searched) = h.post_json("/v1/context", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(body_searched["retrieval"]["state"], "searched", "{body_searched}");
+
+    assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "recent")]), Some((1, 1.0)));
+    assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "searched")]), Some((1, 1.0)));
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "recent")]), Some((1, 1.0)), "only the first context was cut");
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term")]), None);
+
+    let run = h.ctx.runtime.metrics.run();
+    let bytes = &run[&clawg_core::metrics::SeriesKey::new("context.prompt_bytes", &[])];
+    assert_eq!(bytes.count(), 2);
+    assert_eq!(
+        bytes.max(),
+        [&body, &body_searched].iter().map(|b| b["prompt"].as_str().unwrap().len() as u64).max().unwrap()
+    );
+
+    let h = Harness::start_without_embedder().await;
+    h.post_json("/v1/context", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "embedder_not_ready")]), Some((1, 1.0)));
 }
 
 #[tokio::test]
