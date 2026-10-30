@@ -109,12 +109,12 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 - [x] `cargo test --workspace --target-dir target-test` en verde (nunca se anota cuántas pruebas).
 - [x] La medición de memoria de D10, una sola vez y nunca en paralelo con otra corrida de modelo real: `by_body` y `by_path`, una por proceso, con
   `cargo test -p clawg-cli --test import_memory --target-dir target-test -- --ignored --exact by_body --nocapture` y lo mismo con `by_path`; los números van a mano a `verify.md`.
-- [ ] El CI en verde en Linux y Windows.
+- [ ] El CI en verde en Linux y Windows: corre en el pull request que archiva el cambio, el primero desde `develop` con este código. En local no se pudo correr en Linux: el build de `ort-sys` baja ONNX Runtime de `cdn.pyke.io`, que la red del entorno no alcanza.
 - [x] Ningún directorio de build fuera de `target` y `target-test` al terminar.
 
 ## 12. Archive
 
-- [ ] Los deltas a `specs/portability` (IJ1 a IJ11 y IJ15 a IJ17, y R3 y HI16 modificados), `specs/daemon-access` (IJ12 a IJ14) y `specs/storage` (IJ18, «Cada fase del apagado tiene tope»); `git mv` a `changes/archive/<fecha>-import-job`; `state.yaml` archivado.
+- [x] Los deltas a `specs/portability` (IJ1 a IJ11 y IJ15 a IJ17, y R3 y HI16 modificados), `specs/daemon-access` (IJ12 a IJ14) y `specs/storage` (IJ18, «Cada fase del apagado tiene tope»); `git mv` a `changes/archive/<fecha>-import-job`; `state.yaml` archivado. El escenario de IJ16 pasó a decir que el daemon recibe la ruta y nada del contenido, como pedía la verificación, y las citas `path:línea` que el código ya movió quedaron como el nombre de la función. IJ19, transversal, queda sólo en la spec del cambio.
 - [ ] Subir el minor de `[workspace.package] version` del `Cargo.toml` raíz, `cargo update --workspace`, y commit de los dos archivos: `chore: bump version to X.Y.Z`.
 
 ## Cobertura IJ → tarea
