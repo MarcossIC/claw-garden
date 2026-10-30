@@ -4213,18 +4213,43 @@ async fn a_job_import_refuses_what_the_synchronous_import_refuses() {
     for (name, fields, text, model, tokenizer) in cases {
         let h = if model { Harness::start().await } else { Harness::start_without_embedder().await };
         let h = if tokenizer { h.with_tokenizer() } else { h };
-        let (mut by_body, mut by_path) = (fields.clone(), fields);
-        by_body["text"] = json!(text);
-        by_path["path"] = json!(file_in(dir.path(), "case.jsonl", &text));
-
-        let (sync_status, sync_body) = h.post_json("/v1/import", by_body).await;
-        let (job_status, job_body) = h.post_json("/v1/imports", by_path).await;
-
-        assert!(sync_status >= 400, "{name}: the synchronous import refuses it: {sync_status} {sync_body}");
-        assert_eq!((job_status, &job_body["error"]), (sync_status, &sync_body["error"]), "{name}: {job_body} / {sync_body}");
-        let id = h.accepted_job(dir.path(), "after.jsonl", &export_file(1), json!({ "dry_run": true })).await;
-        assert_eq!(h.finished_job(id).await["phase"], "done", "{name}: a refusal leaves no job and no reservation");
+        both_routes_refuse(&h, dir.path(), name, fields, &text).await;
     }
+
+    let h = Harness::start().await.with_tokenizer();
+    for id in ["twin-1111", "twin-2222"] {
+        h.ctx
+            .runtime
+            .store
+            .conn
+            .call(move |c| c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, 'Twin', 'user', 1, 1)", [id]))
+            .await
+            .unwrap();
+    }
+    let ambiguous = json!({ "from": "engram", "project_map": [["app", { "project": "twin" }]] });
+    let (status, error) = both_routes_refuse(&h, dir.path(), "a name two projects hold", ambiguous, &engram).await;
+    assert_eq!((status, error.as_str()), (409, Some("project_ambiguous")));
+
+    let h = Harness::start_failed("disk full", false).await;
+    let (status, error) = both_routes_refuse(&h, dir.path(), "a model that failed to load", json!({}), &export_file(1)).await;
+    assert_eq!((status, error.as_str()), (503, Some("embedder_failed")));
+}
+
+/// Sends the same request to both routes, expects one refusal from both and
+/// that it leaves the slot free; answers its status and error.
+async fn both_routes_refuse(h: &Harness, dir: &std::path::Path, name: &str, fields: Value, text: &str) -> (u16, Value) {
+    let (mut by_body, mut by_path) = (fields.clone(), fields);
+    by_body["text"] = json!(text);
+    by_path["path"] = json!(file_in(dir, "case.jsonl", text));
+
+    let (sync_status, sync_body) = h.post_json("/v1/import", by_body).await;
+    let (job_status, job_body) = h.post_json("/v1/imports", by_path).await;
+
+    assert!(sync_status >= 400, "{name}: the synchronous import refuses it: {sync_status} {sync_body}");
+    assert_eq!((job_status, &job_body["error"]), (sync_status, &sync_body["error"]), "{name}: {job_body} / {sync_body}");
+    let id = h.accepted_job(dir, "after.jsonl", &export_file(1), json!({ "dry_run": true })).await;
+    assert_eq!(h.finished_job(id).await["phase"], "done", "{name}: a refusal leaves no job and no reservation");
+    (sync_status, sync_body["error"].clone())
 }
 
 /// How many files the daemon's backups directory holds.
