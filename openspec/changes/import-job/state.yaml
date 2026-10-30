@@ -3,7 +3,7 @@ objective: "1"
 depends_on: [import-linear, import-decision-pass, import-undo]
 phase: explore
 artifacts:
-  exploration: draft
+  exploration: done
   proposal: pending
   spec: pending
   design: pending
