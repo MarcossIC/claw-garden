@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use clawg_core::memory::dispute::{OpenPairs, Resolution};
 use clawg_core::memory::outbox::OutboxSummary;
-use clawg_core::memory::portability::{ImportReport, MapTarget, UndoReport};
+use clawg_core::memory::portability::{Counters, ImportReport, MapTarget, UndoReport};
 use clawg_core::memory::merge::MergeReport;
 use clawg_core::memory::project_delete::DeleteReport;
 use clawg_core::memory::registry::{
@@ -106,6 +106,9 @@ pub struct ErrorDetails {
     pub retryable: Option<bool>,
     #[serde(default)]
     pub memories: Vec<SavedMemory>,
+    /// The import job that holds the slot a new one asked for.
+    #[serde(default)]
+    pub job_id: Option<u64>,
 }
 
 /// Builds the error for a non-success answer from its JSON body, if it had
@@ -728,6 +731,44 @@ pub struct DeleteRequest {
     pub dry_run: bool,
 }
 
+/// An import as `POST /v1/imports` takes it: the path of the export where
+/// `POST /v1/import` takes its text, and the same maps.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportJobRequest {
+    pub path: String,
+    pub from: String,
+    pub dry_run: bool,
+    pub agent: Option<String>,
+    pub map_roots: Vec<(String, MapTarget)>,
+    pub project_map: Vec<(String, MapTarget)>,
+}
+
+/// An import job as the daemon shows it. The phase, the stop and the step it
+/// stopped in stay the daemon's text, so one this client does not know prints
+/// as it came.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ImportJob {
+    pub job_id: u64,
+    pub phase: String,
+    #[serde(flatten)]
+    pub counters: Counters,
+    /// The import's number in the store, once it wrote.
+    #[serde(default)]
+    pub import_id: Option<i64>,
+    #[serde(default)]
+    pub stopping: Option<String>,
+    #[serde(default)]
+    pub stopped_in: Option<String>,
+    #[serde(default)]
+    pub abandoned: bool,
+    #[serde(default)]
+    pub report: Option<ImportReport>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
 /// The answer of `GET /v1/projects`.
 #[derive(Debug, Deserialize)]
 pub struct ProjectListing {
@@ -944,6 +985,14 @@ pub fn endpoint(state: &DaemonState, base_dir: &Path, tcp_only: bool) -> Option<
 /// configured or system proxy must never see them.
 fn loopback_http() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().expect("build the daemon HTTP client")
+}
+
+/// Whether a `404` is the route being absent, as against the daemon answering
+/// about something it does not have. The daemon's own `404` always carries
+/// `{"error": …}`; the one a router without the route gives has no body.
+pub fn route_missing(status: reqwest::StatusCode, body: &[u8]) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND
+        && !serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v.get("error").is_some_and(|e| e.is_string()))
 }
 
 /// A transport whose every connection goes to the socket at `path`; no proxy
@@ -1421,6 +1470,29 @@ impl DaemonClient {
             "map_roots": map_roots, "project_map": project_map,
         });
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/import").json(&body)?).await?)
+    }
+
+    /// Starts the import of the export at `request.path`, which the daemon
+    /// reads. `None` is a daemon without the route: the one answer that is
+    /// not a failure, since an older daemon has to be told apart.
+    pub async fn start_import(&self, request: &ImportJobRequest) -> Result<Option<ImportJob>, ClientError> {
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/imports").json(request)?).await?;
+        if route_missing(answer.status, &answer.body) {
+            return Ok(None);
+        }
+        read_response(answer).map(Some)
+    }
+
+    /// Where import job `id` is. Without a deadline: a job runs for as long as
+    /// the file takes, and the reader decides when it has waited enough.
+    pub async fn import_job(&self, id: u64) -> Result<ImportJob, ClientError> {
+        read_response(self.send(Call::new(reqwest::Method::GET, format!("/v1/imports/{id}"))).await?)
+    }
+
+    /// Asks job `id` to stop and answers its state, which is its final one when
+    /// it had ended already.
+    pub async fn cancel_import(&self, id: u64) -> Result<ImportJob, ClientError> {
+        read_response(self.send(Call::new(reqwest::Method::DELETE, format!("/v1/imports/{id}"))).await?)
     }
 
     /// Takes import `import_id` back, or says what that would do.
@@ -1974,6 +2046,127 @@ pub(crate) mod tests {
         let health = &health[..health.find("\n    }").expect("end")];
         assert_eq!(all, 1, "a timeout outside `health` would let a repeated call reach the daemon twice");
         assert!(health.contains("tokio::time::timeout(HEALTH_TIMEOUT, self.send(call))"), "{health}");
+    }
+
+    // ── Import jobs ─────────────────────────────────────────────────────────
+
+    fn job_request(path: &Path, dry_run: bool) -> ImportJobRequest {
+        ImportJobRequest {
+            path: path.to_string_lossy().into_owned(),
+            from: "clawg".into(),
+            dry_run,
+            agent: None,
+            map_roots: Vec::new(),
+            project_map: Vec::new(),
+        }
+    }
+
+    const EXPORT: &str = concat!(
+        r#"{"kind":"header","format":"clawg-memories","version":1,"exported_at":0,"clawg":"0.0.0"}"#,
+        "\n",
+        r#"{"kind":"memory","id":4,"scope":"agent","agent_id":"a","content":"Deploys go out on Tuesdays","memory_type":"semantic_fact","source":"explicit","created_at":10,"created_by_type":"agent","last_modified_at":10,"last_accessed_at":20,"access_count":3,"importance":5.0,"tier":3,"status":"active"}"#,
+        "\n",
+    );
+
+    #[test]
+    fn the_client_sends_a_path_and_not_the_file() {
+        let body = serde_json::to_value(job_request(Path::new("/exports/memories.jsonl"), true)).expect("body");
+        assert_eq!(body["path"], "/exports/memories.jsonl");
+        assert!(body.get("text").is_none(), "the file travels as a path: {body}");
+        assert_eq!(body["dry_run"], true);
+    }
+
+    #[test]
+    fn route_missing_tells_a_bodyless_404_from_the_daemons_own() {
+        let not_found = reqwest::StatusCode::NOT_FOUND;
+        assert!(route_missing(not_found, b""), "axum's fallback has no body");
+        assert!(route_missing(not_found, b"<html>not found</html>"), "a body that is not JSON");
+        assert!(route_missing(not_found, br#"{"message":"gone"}"#), "JSON without `error`");
+        assert!(route_missing(not_found, br#"{"error":7}"#), "an `error` that is not text");
+        assert!(route_missing(not_found, b"[]"), "JSON that is not an object");
+        assert!(!route_missing(not_found, br#"{"error":"no project \"x\""}"#), "the daemon's own 404");
+        let conflict = reqwest::StatusCode::CONFLICT;
+        assert!(!route_missing(conflict, b""), "only a 404 is a missing route");
+        assert!(!route_missing(reqwest::StatusCode::OK, b""));
+    }
+
+    #[test]
+    fn a_job_view_reads_what_a_daemon_sends_and_what_it_leaves_out() {
+        let job: ImportJob = serde_json::from_str(
+            r#"{"job_id":3,"phase":"writing","dry_run":false,"from":"clawg","started_at_ms":1,"phase_started_at_ms":2,
+                "rows":10,"notes":10,"rows_to_embed":9,"rows_embedded":9,"rows_written":4,"notes_written":4,
+                "import_id":7,"stopping":"cancel"}"#,
+        )
+        .expect("a view");
+        assert_eq!((job.job_id, job.phase.as_str(), job.import_id), (3, "writing", Some(7)));
+        assert_eq!((job.counters.rows, job.counters.rows_written), (10, 4));
+        assert_eq!((job.stopping.as_deref(), job.stopped_in, job.abandoned, job.report), (Some("cancel"), None, false, None));
+        let newer: ImportJob = serde_json::from_str(
+            r#"{"job_id":3,"phase":"thinking","rows":0,"notes":0,"rows_to_embed":0,"rows_embedded":0,"rows_written":0,"notes_written":0,"extra":1}"#,
+        )
+        .expect("a phase from a newer daemon is not a broken answer");
+        assert_eq!(newer.phase, "thinking");
+    }
+
+    #[test]
+    fn the_job_poll_lives_outside_the_client_and_sets_no_timeout() {
+        let source = include_str!("client.rs");
+        let code = &source[..source.find("#[cfg(test)]").expect("test module")];
+        for name in ["start_import", "import_job", "cancel_import"] {
+            let at = code.find(&format!("pub async fn {name}")).expect(name);
+            let body = &code[at..];
+            let body = &body[..body.find("\n    }").expect("end")];
+            assert!(!body.contains("timeout"), "{name} would let a long job fail by its clock:\n{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_is_started_read_and_cancelled_through_the_client() {
+        let d = start_daemon().await;
+        publish(&d);
+        let client = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let file = d.dir.path().join("memories.jsonl");
+        std::fs::write(&file, EXPORT).unwrap();
+
+        let started = client.start_import(&job_request(&file, true)).await.expect("start").expect("this daemon has the route");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let done = loop {
+            let job = client.import_job(started.job_id).await.expect("read");
+            if job.phase == "done" {
+                break job;
+            }
+            assert!(Instant::now() < deadline, "the job never ended: {job:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(done.report.as_ref().is_some_and(|r| r.dry_run && r.rows == 1), "the report comes with done: {done:?}");
+
+        let again = client.cancel_import(started.job_id).await.expect("a finished job answers its state");
+        assert_eq!((again.phase.as_str(), again.stopping), ("done", None));
+
+        match client.import_job(started.job_id + 1).await {
+            Err(ClientError::Daemon { status: 404, message, .. }) => assert!(message.contains("no import job"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        let relative = client.start_import(&job_request(Path::new("relative.jsonl"), true)).await;
+        assert!(matches!(relative, Err(ClientError::Daemon { status: 400, .. })), "{relative:?}");
+    }
+
+    #[test]
+    fn a_conflict_keeps_the_id_of_the_job_that_holds_the_slot() {
+        let details: ErrorDetails =
+            serde_json::from_str(r#"{"error":"import_running","job_id":5}"#).expect("the body of a 409");
+        assert_eq!(details.job_id, Some(5));
+        assert_eq!(ErrorDetails::default().job_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_without_the_route_is_none_and_not_an_error() {
+        let app = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = DaemonClient::new(format!("http://{}", listener.local_addr().unwrap()), "token", std::env::temp_dir());
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let started = client.start_import(&job_request(Path::new("/exports/memories.jsonl"), false)).await;
+        assert!(matches!(started, Ok(None)), "{started:?}");
     }
 
     // ── The funnel's pure parts ─────────────────────────────────────────────

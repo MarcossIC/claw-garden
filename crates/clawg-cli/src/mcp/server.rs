@@ -3501,7 +3501,7 @@ mod tests {
             text(Err(daemon_error(
                 503,
                 "embedder_failed",
-                ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![] },
+                ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![], ..Default::default() },
             ))),
             Err("not saved: the embedding model failed to load (connection refused); clawg will retry".to_string())
         );
@@ -3509,7 +3509,7 @@ mod tests {
             text(Err(daemon_error(
                 503,
                 "embedder_failed",
-                ErrorDetails { detail: Some("contract mismatch".into()), retryable: Some(false), memories: vec![] },
+                ErrorDetails { detail: Some("contract mismatch".into()), retryable: Some(false), memories: vec![], ..Default::default() },
             ))),
             Err("not saved: the embedding model failed to load (contract mismatch)".to_string())
         );
@@ -3521,6 +3521,7 @@ mod tests {
                     detail: Some("store insert failed: disk full".into()),
                     retryable: None,
                     memories: vec![saved(57, "inserted")],
+                    ..Default::default()
                 },
             ))),
             Err("not saved: store insert failed: disk full; partially saved as #57".to_string())
@@ -3557,7 +3558,7 @@ mod tests {
         let failed = daemon_error(
             503,
             "embedder_failed",
-            ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![] },
+            ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![], ..Default::default() },
         );
         let t = ClawgMcp::explain(Lang::En, &failed);
         assert!(!t.contains("in a minute"), "{t}");
