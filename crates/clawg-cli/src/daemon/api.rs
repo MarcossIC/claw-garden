@@ -1487,6 +1487,8 @@ async fn search(
     app.runtime.access_tracker.record_hits(&hits);
 
     let withheld = found - hits.len();
+    app.runtime.metrics.gauge("search.hits", &[], hits.len() as f64);
+    app.runtime.metrics.gauge("search.withheld", &[], withheld as f64);
     let other_language = match lang {
         Some(lang) => other_language(&app, lang, project_id.as_deref(), &caller).await,
         None => None,

@@ -4193,6 +4193,25 @@ async fn every_request_is_timed_by_route_status_and_transport() {
     assert!(in_flight.max >= 1.0 && in_flight.last == 0.0, "{in_flight:?}");
 }
 
+/// The samples and the last value of a gauge of the minute in progress.
+fn gauge_of(h: &Harness, name: &str, labels: &[(&str, &str)]) -> Option<(u64, f64)> {
+    let key = clawg_core::metrics::SeriesKey::new(name, labels);
+    h.ctx.runtime.metrics.minute().gauges.get(&key).map(|g| (g.count, g.last))
+}
+
+#[tokio::test]
+async fn a_search_records_its_arms_its_hits_and_what_it_withheld() {
+    let h = Harness::start().await;
+    save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    let shown = body["hits"].as_array().unwrap().len() as f64;
+    let withheld = body["withheld"].as_f64().unwrap();
+    assert_eq!(gauge_of(&h, "search.hits", &[]), Some((1, shown)));
+    assert_eq!(gauge_of(&h, "search.withheld", &[]), Some((1, withheld)));
+}
+
 #[tokio::test]
 async fn a_server_marked_unix_labels_its_requests_so() {
     let h = Harness::start().await;
