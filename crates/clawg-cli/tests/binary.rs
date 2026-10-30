@@ -707,6 +707,95 @@ async fn a_daemon_probes_its_store_without_being_asked() {
     assert!(!text.contains("clawg_outbox_oldest_pending_s"), "no row waits:\n{text}");
 }
 
+/// Every stage the daemon measures, read from a real one: a save of several
+/// pieces, a search, a context, a docs index, a backup and its stop. The fake
+/// model has no session to batch, so `embedder.batch`, `embedder.batch_tokens`
+/// and `embedder.wait` are left to the tests of the embedder.
+#[tokio::test]
+async fn a_daemon_measures_its_pipeline_and_keeps_its_events() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    let words: Vec<String> = (0..700).map(|i| format!("word{i}")).collect();
+    let (status, saved) = daemon.post("/v1/memories", json!({ "content": words.join(" "), "agent_id": "smoke" })).await;
+    assert_eq!(status, 201, "{saved}");
+    assert!(saved["memories"].as_array().is_some_and(|m| m.len() > 1), "a save of several pieces: {saved}");
+    assert_eq!(daemon.post("/v1/search", json!({ "query": "word1 word2", "agent_id": "smoke" })).await.0, 200);
+    assert_eq!(daemon.post("/v1/context", json!({ "query": "word3", "agent_id": "smoke" })).await.0, 200);
+
+    let root = sandbox.home.join("docs-project");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("README.md"), "# Docs\nThe pipeline is measured.\n").unwrap();
+    let (status, registered) = daemon
+        .post("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true, "index_docs": true }))
+        .await;
+    assert_eq!(status, 200, "{registered}");
+    let (status, found) =
+        daemon.post("/v1/projects/docs/search", json!({ "project_id": registered["root_id"], "query": "pipeline" })).await;
+    assert_eq!(status, 200, "{found}");
+    assert_eq!(daemon.post("/v1/backup", json!({})).await.0, 200);
+
+    let mut text = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let answer = daemon
+            .client()
+            .send(Call::new(reqwest::Method::GET, "/v1/metrics?format=prometheus"))
+            .await
+            .expect("metrics");
+        text = String::from_utf8(answer.body.to_vec()).expect("text");
+        if text.contains("clawg_docs_refresh_duration_seconds_count") && text.contains("clawg_db_cache_used_bytes") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for series in [
+        "clawg_db_probe_wait_seconds_count ",
+        "clawg_db_cache_used_bytes ",
+        "clawg_db_file_bytes{file=\"db\"} ",
+        "clawg_outbox_pending ",
+        "clawg_search_duration_seconds_count{arm=\"total\"} ",
+        "clawg_search_duration_seconds_count{arm=\"knn_memory\"} ",
+        "clawg_search_hits ",
+        "clawg_search_withheld ",
+        "clawg_context_retrieval_state{state=\"searched\"} ",
+        "clawg_context_prompt_bytes_count ",
+        "clawg_ingest_stage_seconds_count{stage=\"embed\"} ",
+        "clawg_ingest_stage_seconds_count{stage=\"link\"} ",
+        "clawg_ingest_end_to_end_seconds_count ",
+        "clawg_ingest_outcome{outcome=\"stored\"} ",
+        "clawg_ingest_pieces ",
+        "clawg_ingest_queue_depth ",
+        "clawg_embedder_load_seconds_count{phase=\"session\"} ",
+        "clawg_docs_refresh_duration_seconds_count ",
+        "clawg_docs_refresh_files{state=\"indexed\"} ",
+    ] {
+        assert!(text.contains(series), "{series} in:\n{text}");
+    }
+    let answer = daemon.client().send(Call::new(reqwest::Method::GET, "/v1/metrics")).await.expect("metrics");
+    let metrics: Value = serde_json::from_slice(&answer.body).expect("metrics JSON");
+    let kinds: Vec<&str> = metrics["run"]["events"].as_array().unwrap().iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert!(kinds.contains(&"model_load") && kinds.contains(&"backup"), "{metrics}");
+
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stop.status.code(), Some(0), "{}", stderr_of(&stop));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+
+    let report = metrics_report(&sandbox, &["--events"]);
+    let events = report["runs"][0]["events"].as_array().expect("the run's events");
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
+    for kind in ["model_load", "backup", "shutdown"] {
+        assert!(kinds.contains(&kind), "{kind} in {report}");
+    }
+    let shutdown = events.iter().find(|e| e["kind"] == "shutdown").unwrap();
+    assert_eq!(shutdown["detail"]["within_bounds"], "yes", "{report}");
+    let load = events.iter().find(|e| e["kind"] == "model_load").unwrap();
+    assert_eq!((load["detail"]["cause"].as_str(), load["detail"]["outcome"].as_str()), (Some("start"), Some("loaded")));
+    let stage = metrics_report(&sandbox, &["--metric", "ingest.stage", "--label", "stage=store"]);
+    assert!(stage["groups"][0]["count"].as_u64().is_some_and(|n| n >= 1), "{stage}");
+}
+
 #[tokio::test]
 async fn a_killed_daemon_leaves_its_run_not_stopped() {
     let sandbox = Sandbox::new();
