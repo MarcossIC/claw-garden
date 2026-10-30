@@ -2125,6 +2125,49 @@ mod tests {
         assert_eq!(std::fs::read(cache_dir.join(specs[0].path)).unwrap(), files[0].bytes);
     }
 
+    /// A loaded model must not keep the file view: with the idle timeout off
+    /// the model is never dropped, and a repair would wait for it forever.
+    #[test]
+    fn a_loaded_model_leaves_the_cache_free_for_a_repair() {
+        use crate::memory::embedder::{Embedder, FakeEmbedder};
+        use tokenizers::models::wordlevel::WordLevel;
+
+        let tmp = TestDir::new("loader-lets-go");
+        let onnx = crate::memory::embedder::minimal_onnx();
+        let path = tmp.path().join("model.onnx");
+        std::fs::write(&path, &onnx).unwrap();
+        let lock = CacheLock::new();
+        let view = verified_onnx(&path, &sha256_hex(&onnx), lock.read_now()).expect("the model verifies");
+        assert!(lock.0.try_write().is_err(), "the view holds the cache lock");
+        let files = ModelFiles {
+            onnx: view,
+            tokenizer: TokenizerFiles {
+                tokenizer_file: Vec::new(),
+                config_file: Vec::new(),
+                special_tokens_map_file: Vec::new(),
+                tokenizer_config_file: Vec::new(),
+            },
+        };
+
+        let parse = |_: &[u8]| {
+            let vocab = [("uno".to_string(), 0u32)].into_iter().collect();
+            Ok(tokenizers::Tokenizer::new(WordLevel::builder().vocab(vocab).build().expect("a word-level model")))
+        };
+        let expected = onnx.clone();
+        let load = crate::memory::bootstrap::model_loader(
+            Arc::new(once_cell::sync::OnceCell::new()),
+            parse,
+            move |bytes, _tokenizer, _files| {
+                assert_eq!(bytes, &expected[..], "the session is built from the verified view");
+                Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>)
+            },
+        );
+        let embedder = load(files).expect("the model loads");
+
+        assert!(lock.0.try_write().is_ok(), "a repair can write while the loaded model lives");
+        drop(embedder);
+    }
+
     // ---------- CLAWG_HF_BASE_URL ----------
 
     #[test]
