@@ -96,6 +96,12 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 - [x] `.claude/CLAUDE.md`: revisar que `clawg import`, las rutas de la API del daemon (`POST/GET/DELETE /v1/imports`, `job_id` del error, `503 shutting_down`), `GET /health` y el párrafo del apagado de `clawg serve` dicen lo que hace el código final; los cambios por comportamiento ya entraron en los commits 5 a 8, esta tarea sólo cierra lo que falte. Un commit sólo si quedó algo: `docs: describe the import job`.
 - [x] La fila 87 de `openspec/README.md`.
 
+## 10b. Lo que dejó la verificación
+
+- [x] Las dos pruebas que la verificación encontró flojas: `accepting_a_job_reloads_a_released_model_before_embedding` mira la carga antes de `embedding` y muere sin `wake()` (IJ9), y la tabla de IJ2 suma `409 project_ambiguous` y `503 embedder_failed`. Commits: `test(daemon): an accepted job loads the model before it embeds` y `test(daemon): both import routes refuse an ambiguous project and a failed model alike`.
+- [x] Un error pasajero del sondeo o del `DELETE` ya no se lee como un daemon que se fue (IJ15, escenario «un error pasajero»): `ClientError::means_daemon_gone`, `Event::Unanswered`, `MAX_UNANSWERED`. Tests primero, rojos por no compilar. Commit: `fix(cli): clawg import asks again before it says the daemon went away`; `.claude/CLAUDE.md` en el mismo.
+- [x] `README.md`: el progreso, Ctrl-C y que cerrar o matar el comando deja la importación corriendo. Commit: `docs(readme): say what clawg import shows and how to stop it`.
+
 ## 11. Verificación
 
 - [x] `cargo clean --workspace --target-dir target-test` antes de probar esta versión (`.claude/CLAUDE.md`, «Build directories»); durante el ciclo de un commit el directorio se reusa.
