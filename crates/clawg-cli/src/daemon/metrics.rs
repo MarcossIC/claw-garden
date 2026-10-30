@@ -197,13 +197,17 @@ impl Writer {
         }
     }
 
-    /// Writes the minute so far as the minute it began in, and folds the
-    /// old minutes once an hour. A failure turns writing off with one `warn`.
+    /// Writes the minute so far as the minute it began in, with the events
+    /// recorded meanwhile, and folds the old minutes once an hour. A failure turns writing off with one `warn`.
     pub fn flush(&mut self, now_ms: i64) {
         let window = self.recorder.take_minute();
+        let events = self.recorder.take_events();
         let started = std::mem::replace(&mut self.minute_start_ms, now_ms);
         let Some(sink) = self.sink.as_mut() else { return };
         let mut result = sink.db.write_minute(sink.run_id, started, &window);
+        if result.is_ok() {
+            result = sink.db.write_events(sink.run_id, &events);
+        }
         if result.is_ok() && now_ms - self.last_prune_ms >= HOUR_MS {
             self.last_prune_ms = now_ms;
             result = sink.db.prune(now_ms).map(drop);
@@ -299,6 +303,14 @@ pub struct MetricsBody {
     pub run: RunBody,
 }
 
+/// An event of the run, as `GET /v1/metrics` lists the latest.
+#[derive(Debug, Serialize)]
+pub struct EventBody {
+    pub at_ms: i64,
+    pub kind: &'static str,
+    pub detail: serde_json::Value,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MinuteBody {
     pub histograms: Vec<HistogramBody>,
@@ -308,6 +320,8 @@ pub struct MinuteBody {
 #[derive(Debug, Serialize)]
 pub struct RunBody {
     pub histograms: Vec<HistogramBody>,
+    /// The run's latest events, oldest first.
+    pub events: Vec<EventBody>,
 }
 
 #[derive(Debug, Serialize)]
@@ -387,7 +401,18 @@ pub fn metrics_body(recorder: &Recorder, version: &str, started_at_ms: u64) -> M
             histograms: minute.histograms.iter().map(|(k, h)| histogram_body(k, h)).collect(),
             gauges: minute.gauges.iter().map(|(k, g)| gauge_body(k, g)).collect(),
         },
-        run: RunBody { histograms: recorder.run().iter().map(|(k, h)| histogram_body(k, h)).collect() },
+        run: RunBody {
+            histograms: recorder.run().iter().map(|(k, h)| histogram_body(k, h)).collect(),
+            events: recorder
+                .run_events()
+                .iter()
+                .map(|e| EventBody {
+                    at_ms: e.at_ms,
+                    kind: e.kind.as_str(),
+                    detail: serde_json::from_str(&e.detail_json()).unwrap_or_default(),
+                })
+                .collect(),
+        },
     }
 }
 
@@ -486,6 +511,7 @@ fn content_length(headers: &HeaderMap) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawg_core::metrics::EventKind;
 
     fn run_info() -> RunInfo {
         RunInfo {
@@ -570,6 +596,25 @@ mod tests {
         let peak = db.gauge_rows_since("process.private_peak_bytes", 0).unwrap();
         assert_eq!(peak.iter().map(|g| g.gauge.max).collect::<Vec<_>>(), vec![8192.0, 8192.0]);
         assert!(db.gauge_rows_since("process.handles", 0).unwrap().is_empty(), "an unknown value is left out");
+    }
+
+    #[test]
+    fn the_events_of_a_minute_are_kept_with_it_and_served_with_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(METRICS_FILE);
+        let recorder = Arc::new(Recorder::default());
+        let mut writer = Writer::start(Some(&path), recorder.clone(), &run_info(), NOW);
+        recorder.event(EventKind::Backup, &[("ms", 7u64.into())]);
+        writer.flush(NOW + MINUTE_MS);
+        recorder.event(EventKind::Shutdown, &[("http_ms", 2u64.into())]);
+        writer.stop(NOW + 2 * MINUTE_MS);
+
+        let db = MetricsDb::open_read_only(&path).unwrap();
+        let events = db.events_since(0).unwrap();
+        assert_eq!(events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["backup", "shutdown"]);
+        let body = serde_json::to_value(metrics_body(&recorder, "0.1.0", 0)).unwrap();
+        assert_eq!(body["run"]["events"][0]["kind"], "backup");
+        assert_eq!(body["run"]["events"][0]["detail"], serde_json::json!({ "ms": 7 }));
     }
 
     #[test]

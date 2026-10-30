@@ -26,35 +26,44 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 - [x] `.claude/CLAUDE.md`: las series de la sonda.
 - Commit: `docs: describe the store probe metrics`
 
-## Tramo 2: búsqueda y contexto (P5, D3)
+## Tramo 2: búsqueda y contexto (P5, D3, D6)
 
-- [ ] El `Recorder` en `MemoryRuntime` y el mismo en `AppCtx`; un test de que un runtime de test lleva el suyo.
-- [ ] Tests primero de `search.duration{arm}`, `search.knn_retry{table}`, `search.hits`, `search.withheld`; luego la búsqueda.
-- [ ] Tests primero de `context.retrieval_state`, `context.prompt_bytes`, `context.cut{block}`; luego el contexto.
+- [x] El `Recorder` en `MemoryRuntime` (el del store) y el mismo en el daemon; `a_test_runtime_carries_its_own_recorder`.
+- Commit: `feat(core): give the memory runtime the recorder the daemon serves`
+- [x] Tests primero de `search.duration{arm}`, `search.knn_retry{table}`, `search.hits`, `search.withheld`; luego la búsqueda.
+- Commit: `feat(search): record each arm's duration, the widened windows, the hits and the withheld`
+- [x] Tests primero de `context.retrieval_state`, `context.prompt_bytes`, `context.cut{block}`; luego el contexto.
+- Commit: `feat(context): record its retrieval state, its size and the blocks the budget cut`
 
 ## Tramo 3: ingest (P6, D4)
 
-- [ ] Partir `ingest_pieces` por etapa, un commit por etapa con sus tests, sin cambiar lo que guarda.
-- [ ] Tests primero de `ingest.stage`, `ingest.pieces`, `ingest.end_to_end`, `ingest.outcome`, `ingest.queue_depth`; luego el worker.
+- [x] Partir `ingest_pieces` por etapa (`split_event`, `gate_pieces`, `embed_pieces`, `store_pieces`), un commit por etapa con sus tests, sin cambiar lo que guarda.
+- [x] Tests primero de `ingest.stage`, `ingest.pieces`, `ingest.end_to_end`, `ingest.outcome`, `ingest.queue_depth`; luego el worker.
+- Commit: `feat(worker): record each stage of a save, how it ended, its pieces and the queue`
 
 ## Tramo 4: embedder (P7)
 
-- [ ] Tests primero de `embedder.batch`, `embedder.batch_tokens`, `embedder.wait`, `embedder.load`; luego el canal de inferencia y la carga.
+- [x] Tests primero de `embedder.batch`, `embedder.batch_tokens`, `embedder.wait`, `embedder.load`; luego el canal de inferencia y la carga.
+- Commit: `feat(embedder): record each batch, its padded tokens, its wait and each load`
 
 ## Tramo 5: docs (P8)
 
-- [ ] Tests primero de `docs.refresh.duration`, `docs.refresh.files`, `docs.search.inline_wait`; luego el refresco y `search_docs`.
+- [x] Tests primero de `docs.refresh.duration`, `docs.refresh.files`, `docs.search.inline_wait`; luego el refresco y `search_docs`.
+- Commit: `feat(docs): record each refresh of a docs index and how long a search waited for it`
 
-## Tramo 6: eventos (P9, D5)
+## Tramo 6: eventos (P9, D5, D8)
 
-- [ ] Test primero: un `metrics.db` del esquema 1 sembrado sube al 2 con sus filas.
-- [ ] La tabla `event`, su poda y su escritura con el minuto.
-- [ ] Un test y un evento por tipo.
-- [ ] `clawg metrics report --events`.
+- [x] Test primero: un `metrics.db` del esquema 1 sembrado sube al 2 con sus filas.
+- [x] La tabla `event`, su poda y su escritura con el minuto; `GET /v1/metrics` lista los últimos.
+- Commit: `feat(metrics): keep a run's events in metrics.db`
+- [x] Un test y un evento por tipo.
+- Commits: `feat(metrics): record model loads, unloads, recoveries, maintenance, backups, imports and failed saves as events`, `feat(metrics): record a model download and the shutdown as events`
+- [x] `clawg metrics report --events`.
+- Commit: `feat(cli): list the events of each run with metrics report --events`
 
 ## Tramo 7: cierre
 
-- [ ] P10 en `binary.rs`.
-- [ ] `.claude/CLAUDE.md` con lo que quede.
+- [x] P10 en `binary.rs`: `a_daemon_measures_its_pipeline_and_keeps_its_events`.
+- [x] `.claude/CLAUDE.md` con lo que quede.
 - [ ] Verificación: suite y clippy en Linux; el CI en verde en Linux y Windows; el sobrecoste con el modelo real cuando haya autorización.
 - [ ] Archive: `specs/metrics`; `git mv` a `changes/archive/`; `state.yaml`; fila 73 del `README.md` de openspec; subir el minor.

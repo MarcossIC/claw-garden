@@ -272,7 +272,7 @@ impl Harness {
                     Arc::new(FakeEmbedder::default()),
                     reload,
                     Some(Duration::from_secs(600)),
-                    None,
+                    Default::default(),
                     &tokio::runtime::Handle::current(),
                 );
                 idle.unload().await;
@@ -348,7 +348,6 @@ impl Harness {
             shutdown,
             save_timeout,
             sessions: Default::default(),
-            metrics: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1560,8 +1559,12 @@ async fn a_search_with_a_language_counts_the_other_one() {
 async fn a_search_without_a_language_has_no_count() {
     let h = Harness::start().await;
     save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let total = clawg_core::metrics::SeriesKey::new("search.duration", &[("arm", "total")]);
+    let searches = || h.ctx.runtime.metrics.run().get(&total).map_or(0, |h| h.count());
+    let before = searches();
     let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a" })).await;
     assert_eq!(status, 200, "{body}");
+    assert_eq!(searches(), before + 1, "the store's search measures into the daemon's recorder");
     assert!(body.get("other_language").is_none(), "{body}");
     let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "lang": "es" })).await;
     assert_eq!(status, 200, "{body}");
@@ -3136,6 +3139,26 @@ async fn docs_search_indexes_on_first_use_and_answers() {
 }
 
 #[tokio::test]
+async fn a_docs_search_records_the_refresh_and_how_long_it_waited_for_it() {
+    let h = Harness::start().await;
+    let (_dir, id) = project_with_docs(&h, &[("README.md", "# Claw\nLocal memory.\n"), ("b.md", "# B\nb\n")]).await;
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "memory" })).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "memory" })).await;
+    assert_eq!(status, 200);
+
+    let run = h.ctx.runtime.metrics.run();
+    let count = |name: &str| run.get(&clawg_core::metrics::SeriesKey::new(name, &[])).map_or(0, |h| h.count());
+    assert_eq!(count("docs.refresh.duration"), 1, "the second search found a fresh index");
+    assert_eq!(count("docs.search.inline_wait"), 1, "only the search that started a refresh waited for it");
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "indexed")]), Some((1, 2.0)));
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "unchanged")]), Some((1, 0.0)));
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "removed")]), Some((1, 0.0)));
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "failed")]), Some((1, 0.0)));
+}
+
+#[tokio::test]
 async fn docs_search_takes_at_most_the_limit() {
     let h = Harness::start().await;
     let (_dir, id) = project_with_docs(&h, &[("a.md", "# A\na\n# B\nb\n# C\nc\n")]).await;
@@ -3836,6 +3859,24 @@ async fn an_import_stores_rows_with_their_state_and_a_dry_run_stores_none() {
 }
 
 #[tokio::test]
+async fn an_import_and_its_snapshot_are_events_of_the_run() {
+    let h = Harness::start().await;
+    let (status, _) = h.post_json("/v1/import", json!({ "text": export_file(1), "dry_run": true })).await;
+    assert_eq!(status, 200);
+    let (status, _) = h.post_json("/v1/import", json!({ "text": export_file(1) })).await;
+    assert_eq!(status, 200);
+
+    let events = h.ctx.runtime.metrics.run_events();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(kinds, ["import", "backup", "import"], "the real import writes its snapshot first");
+    let label = |l: &'static str| clawg_core::metrics::DetailValue::Label(l);
+    assert_eq!(events[0].detail["dry_run"], label("yes"));
+    assert_eq!(events[0].detail["source"], label("clawg"));
+    assert_eq!(events[1].detail["reason"], label("pre-import"));
+    assert_eq!(events[2].detail["inserted"], clawg_core::metrics::DetailValue::Number(2.0));
+}
+
+#[tokio::test]
 async fn an_import_is_undone_by_its_number() {
     let h = Harness::start().await;
     let (status, report) = h.post_json("/v1/import", json!({ "text": export_file(1) })).await;
@@ -4155,6 +4196,7 @@ async fn an_unkeyed_save_names_the_row_a_key_would_revise() {
 /// The `http.duration` series of the run, as label strings with their count.
 fn http_durations(h: &Harness) -> Vec<(String, u64)> {
     h.ctx
+        .runtime
         .metrics
         .run()
         .iter()
@@ -4181,16 +4223,66 @@ async fn every_request_is_timed_by_route_status_and_transport() {
     assert_eq!(count_of(&series, "method=POST,route=/v1/search,status=2xx,transport=tcp"), 1, "{series:?}");
     assert_eq!(count_of(&series, "method=GET,route=/v1/memories/{kind}/{id},status=4xx,transport=tcp"), 1, "{series:?}");
 
-    let run = h.ctx.metrics.run();
+    let run = h.ctx.runtime.metrics.run();
     let bytes = run
         .iter()
         .find(|(key, _)| key.name == "http.request_bytes" && key.labels == "method=POST,route=/v1/search")
         .map(|(_, histogram)| histogram.clone())
         .expect("the size of the search is recorded");
     assert!(bytes.max() > 0, "the size comes from Content-Length");
-    let minute = h.ctx.metrics.minute();
+    let minute = h.ctx.runtime.metrics.minute();
     let in_flight = minute.gauges.iter().find(|(key, _)| key.name == "http.in_flight").expect("in flight").1;
     assert!(in_flight.max >= 1.0 && in_flight.last == 0.0, "{in_flight:?}");
+}
+
+/// The samples and the last value of a gauge of the minute in progress.
+fn gauge_of(h: &Harness, name: &str, labels: &[(&str, &str)]) -> Option<(u64, f64)> {
+    let key = clawg_core::metrics::SeriesKey::new(name, labels);
+    h.ctx.runtime.metrics.minute().gauges.get(&key).map(|g| (g.count, g.last))
+}
+
+#[tokio::test]
+async fn a_search_records_its_arms_its_hits_and_what_it_withheld() {
+    let h = Harness::start().await;
+    save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    let shown = body["hits"].as_array().unwrap().len() as f64;
+    let withheld = body["withheld"].as_f64().unwrap();
+    assert_eq!(gauge_of(&h, "search.hits", &[]), Some((1, shown)));
+    assert_eq!(gauge_of(&h, "search.withheld", &[]), Some((1, withheld)));
+}
+
+#[tokio::test]
+async fn a_context_records_its_state_its_size_and_the_blocks_it_cut() {
+    let h = Harness::start().await;
+    for n in 0..3 {
+        let content = format!("Note {n}: {}", "the deploy script lives in ops and runs after every merge. ".repeat(6));
+        save_id(&h, json!({ "content": content, "agent_id": "a" })).await;
+    }
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "budget": 600 })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"]["state"], "recent", "{body}");
+    let (_, body_searched) = h.post_json("/v1/context", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(body_searched["retrieval"]["state"], "searched", "{body_searched}");
+
+    assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "recent")]), Some((1, 1.0)));
+    assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "searched")]), Some((1, 1.0)));
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "recent")]), Some((1, 1.0)), "only the first context was cut");
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term")]), None);
+
+    let run = h.ctx.runtime.metrics.run();
+    let bytes = &run[&clawg_core::metrics::SeriesKey::new("context.prompt_bytes", &[])];
+    assert_eq!(bytes.count(), 2);
+    assert_eq!(
+        bytes.max(),
+        [&body, &body_searched].iter().map(|b| b["prompt"].as_str().unwrap().len() as u64).max().unwrap()
+    );
+
+    let h = Harness::start_without_embedder().await;
+    h.post_json("/v1/context", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "embedder_not_ready")]), Some((1, 1.0)));
 }
 
 #[tokio::test]
@@ -4235,7 +4327,7 @@ async fn no_label_comes_from_the_request() {
         .await
         .expect("request");
 
-    let labels: Vec<String> = h.ctx.metrics.run().keys().map(|key| key.labels.clone()).collect();
+    let labels: Vec<String> = h.ctx.runtime.metrics.run().keys().map(|key| key.labels.clone()).collect();
     for label in &labels {
         for leaked in ["424242", "secretagent", "zebra", "qwerty", "nowhere", "BREW"] {
             assert!(!label.contains(leaked), "{label} carries {leaked}");

@@ -1,14 +1,14 @@
 change: pipeline-metrics
 objective: "transversal"
 depends_on: [usage-metrics]
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in_progress  # tramo 1 (SQLite y outbox) hecho; tramos 2 a 7 pendientes
-  verify: pending
+  apply: done
+  verify: in_progress  # suite y clippy en Linux; faltan el CI en Linux y Windows y el sobrecoste con el modelo real
   archive: pending
 updated: 2026-10-30

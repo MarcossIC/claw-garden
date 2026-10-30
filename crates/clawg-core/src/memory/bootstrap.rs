@@ -23,13 +23,14 @@ use tokio::sync::watch;
 use crate::memory::backup::{self, Reason};
 use crate::memory::db::{ContractStatus, EmbeddingIdentity, StoredContract};
 use crate::memory::embedder::{E5Embedder, Embedder, E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
-use crate::memory::idle_embedder::{IdleEmbedder, ReloadFn};
+use crate::memory::idle_embedder::{IdleEmbedder, LoadWatch, ReloadFn};
 use crate::memory::maintenance::{reembed_all, ReInferPlan, ReembedMode};
 use crate::memory::model_download::{
     ensure_model, load_cached_model, parse_verified_tokenizer, CacheLock, DownloadError, DownloadProgress, ModelFiles,
     TokenizerFiles,
 };
 use crate::memory::MemoryStore;
+use crate::metrics::{EventKind, Recorder, Unit};
 use crate::models::chat::StreamEvent;
 
 /// Whether the embedder can be used, as hosts report it.
@@ -303,12 +304,104 @@ pub fn production_deps(
         let lock = lock.clone();
         Box::pin(async move { load_cached_model(&base_dir, &lock).await })
     });
-    let load = model_loader(tokenizer, parse_verified_tokenizer, |onnx, tokenizer, files| {
-        E5Embedder::from_parts(onnx, tokenizer, files)
-            .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
-            .map_err(|e| e.to_string())
+    let metrics = store.metrics().clone();
+    let load = model_loader(tokenizer, parse_verified_tokenizer, {
+        let metrics = metrics.clone();
+        move |onnx, tokenizer, files| {
+            E5Embedder::from_parts(onnx, tokenizer, files, metrics.clone())
+                .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
+                .map_err(|e| e.to_string())
+        }
     });
-    EmbedderDeps { ensure, cached, load, verify: contract_verifier(store, backups) }
+    EmbedderDeps {
+        ensure: recorded_download(ensure, metrics.clone()),
+        cached: timed_cache_read(cached, metrics.clone()),
+        load: timed_load(load, metrics),
+        verify: contract_verifier(store, backups),
+    }
+}
+
+/// `ensure` recording a `model_download` event when it downloaded: whether it
+/// ended with the files, the bytes it received and how long it took. A cache
+/// that verified downloads nothing and records nothing. The progress reaches
+/// the caller as it did.
+fn recorded_download(ensure: EnsureModelFn, metrics: Arc<Recorder>) -> EnsureModelFn {
+    Arc::new(move |base_dir, progress| {
+        let (ensure, metrics) = (ensure.clone(), metrics.clone());
+        Box::pin(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let forward = tokio::spawn(async move {
+                let mut seen = Downloaded::default();
+                while let Some(event) = rx.recv().await {
+                    seen.note(&event);
+                    if let Some(progress) = &progress {
+                        let _ = progress.send(event);
+                    }
+                }
+                seen
+            });
+            let started = std::time::Instant::now();
+            let files = ensure(base_dir, Some(tx)).await;
+            let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let seen = forward.await.unwrap_or_default();
+            if seen.started {
+                let result = if files.is_ok() { "ok" } else { "failed" };
+                metrics.event(EventKind::ModelDownload, &[("result", result.into()), ("bytes", seen.bytes.into()), ("ms", ms.into())]);
+            }
+            files
+        })
+    })
+}
+
+/// What the progress of a call to `ensure` said.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Downloaded {
+    started: bool,
+    /// The bytes received over every file.
+    bytes: u64,
+}
+
+impl Downloaded {
+    fn note(&mut self, event: &DownloadProgress) {
+        match event {
+            DownloadProgress::Start { .. } => self.started = true,
+            DownloadProgress::Chunk { bytes_downloaded, .. } => self.bytes = self.bytes.max(*bytes_downloaded),
+            DownloadProgress::Verify | DownloadProgress::Done | DownloadProgress::Error { .. } => {}
+        }
+    }
+}
+
+/// `cached` recording under `embedder.load{phase=verify}` how long a read of
+/// the cache took, its hashes included, when it gave the files.
+fn timed_cache_read(cached: CachedModelFn, metrics: Arc<Recorder>) -> CachedModelFn {
+    Arc::new(move |base_dir| {
+        let (cached, metrics) = (cached.clone(), metrics.clone());
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let files = cached(base_dir).await;
+            if files.is_ok() {
+                record_load(&metrics, "verify", started.elapsed());
+            }
+            files
+        })
+    })
+}
+
+/// `load` recording under `embedder.load{phase=session}` how long building the
+/// embedder took, when it was built.
+fn timed_load(load: LoadEmbedderFn, metrics: Arc<Recorder>) -> LoadEmbedderFn {
+    Arc::new(move |files| {
+        let started = std::time::Instant::now();
+        let embedder = load(files);
+        if embedder.is_ok() {
+            record_load(&metrics, "session", started.elapsed());
+        }
+        embedder
+    })
+}
+
+fn record_load(metrics: &Recorder, phase: &'static str, took: std::time::Duration) {
+    metrics.observe("embedder.load", Unit::Micros, &[("phase", phase)], u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
 }
 
 /// Env var that, in a build with the `testing` feature, replaces the model
@@ -357,6 +450,7 @@ impl TestEmbedder {
         backups: std::path::PathBuf,
         tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     ) -> EmbedderDeps {
+        let metrics = store.metrics().clone();
         let verify = contract_verifier(store, backups);
         let ensure: EnsureModelFn = match self {
             Self::Fake | Self::Blocked => Arc::new(|_base_dir, _progress| {
@@ -390,7 +484,14 @@ impl TestEmbedder {
             let ensure = ensure.clone();
             Arc::new(move |base_dir| ensure(base_dir, None))
         };
-        EmbedderDeps { ensure, cached, load, verify }
+        // Measured as the real model's load is, so a test of the binary sees
+        // the series.
+        EmbedderDeps {
+            ensure,
+            cached: timed_cache_read(cached, metrics.clone()),
+            load: timed_load(load, metrics),
+            verify,
+        }
     }
 }
 
@@ -455,7 +556,7 @@ pub fn unloading_when_idle(
     load: LoadEmbedderFn,
     base_dir: std::path::PathBuf,
     idle: Option<Duration>,
-    memory: Option<crate::metrics::MemoryProbes>,
+    watch: LoadWatch,
     runtime: tokio::runtime::Handle,
 ) -> LoadEmbedderFn {
     let repairing = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -489,8 +590,12 @@ pub fn unloading_when_idle(
         })
     };
     Arc::new(move |files| {
-        let loaded = load(files)?;
-        Ok(Arc::new(IdleEmbedder::new(loaded, reload.clone(), idle, memory, &runtime)) as Arc<dyn Embedder>)
+        let started = std::time::Instant::now();
+        let loaded = load(files);
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let outcome = if loaded.is_ok() { "loaded" } else { "failed" };
+        watch.metrics.event(EventKind::ModelLoad, &[("cause", "start".into()), ("outcome", outcome.into()), ("ms", ms.into())]);
+        Ok(Arc::new(IdleEmbedder::new(loaded?, reload.clone(), idle, watch.clone(), &runtime)) as Arc<dyn Embedder>)
     })
 }
 
@@ -933,6 +1038,60 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_load_records_how_long_it_verified_and_built_and_a_failure_records_nothing() {
+        use crate::memory::embedder::FakeEmbedder;
+        use crate::metrics::SeriesKey;
+        let metrics = Arc::new(Recorder::default());
+        let counts = |metrics: &Recorder| {
+            let run = metrics.run();
+            ["verify", "session"].map(|phase| run.get(&SeriesKey::new("embedder.load", &[("phase", phase)])).map_or(0, |h| h.count()))
+        };
+
+        let cached: CachedModelFn = Arc::new(|_| Box::pin(async { Ok(empty_model_files()) }));
+        let load: LoadEmbedderFn = Arc::new(|_| Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>));
+        let files = timed_cache_read(cached, metrics.clone())(std::path::PathBuf::new()).await.unwrap();
+        assert!(timed_load(load, metrics.clone())(files).is_ok());
+        assert_eq!(counts(&metrics), [1, 1]);
+
+        let cached: CachedModelFn = Arc::new(|_| Box::pin(async { Err(DownloadError::NotCached { files: vec!["model.onnx".into()] }) }));
+        let load: LoadEmbedderFn = Arc::new(|_| Err("no session".to_string()));
+        assert!(timed_cache_read(cached, metrics.clone())(std::path::PathBuf::new()).await.is_err());
+        assert!(timed_load(load, metrics.clone())(empty_model_files()).is_err());
+        assert_eq!(counts(&metrics), [1, 1], "a load that did not happen took no time");
+    }
+
+    #[tokio::test]
+    async fn a_download_is_an_event_and_a_verified_cache_is_none() {
+        let metrics = Arc::new(Recorder::default());
+        let downloading: EnsureModelFn = Arc::new(|_, progress| {
+            Box::pin(async move {
+                let progress = progress.expect("the wrapper always listens");
+                let _ = progress.send(DownloadProgress::Start { bytes_total: 0 });
+                let _ = progress.send(DownloadProgress::Chunk { bytes_downloaded: 600, bytes_total: 0 });
+                let _ = progress.send(DownloadProgress::Chunk { bytes_downloaded: 900, bytes_total: 0 });
+                let _ = progress.send(DownloadProgress::Done);
+                Ok(empty_model_files())
+            })
+        });
+        let (caller, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        recorded_download(downloading, metrics.clone())(std::path::PathBuf::new(), Some(caller)).await.unwrap();
+        let mut forwarded = 0;
+        while heard.try_recv().is_ok() {
+            forwarded += 1;
+        }
+        assert_eq!(forwarded, 4, "the caller hears every step");
+        let events = metrics.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::ModelDownload);
+        assert_eq!(events[0].detail["result"], crate::metrics::DetailValue::Label("ok"));
+        assert_eq!(events[0].detail["bytes"], crate::metrics::DetailValue::Number(900.0));
+
+        let cache_hit: EnsureModelFn = Arc::new(|_, _| Box::pin(async { Ok(empty_model_files()) }));
+        recorded_download(cache_hit, metrics.clone())(std::path::PathBuf::new(), None).await.unwrap();
+        assert!(metrics.take_events().is_empty(), "nothing was downloaded");
+    }
+
     /// Count `phase == "done"` occurrences across recorded `StreamEvent`s.
     fn count_done_phases(events: &[StreamEvent]) -> usize {
         events
@@ -980,7 +1139,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             Some(Duration::from_secs(600)),
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
 
@@ -1038,7 +1197,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             None,
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
 
@@ -1093,7 +1252,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             Some(Duration::from_secs(600)),
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
         let embedder = wrapped(empty_model_files()).expect("first load");
@@ -1157,7 +1316,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             Some(Duration::from_secs(600)),
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
         let embedder = wrapped(empty_model_files()).expect("first load");
@@ -1257,7 +1416,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             Some(Duration::from_secs(600)),
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
 

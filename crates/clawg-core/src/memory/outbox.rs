@@ -12,6 +12,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::memory::clock::TimestampMs;
+use crate::metrics::EventKind;
 use crate::memory::error::MemoryError;
 use crate::memory::events::MemoryEvent;
 use crate::memory::pieces::{link_in, StoredPiece};
@@ -134,8 +135,9 @@ pub enum Recorded {
 /// What taking a row found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Claimed {
-    /// Ingest it, after the pieces already stored.
-    Process { progress: Vec<NotedPiece> },
+    /// Ingest it, after the pieces already stored. `created_at` is when the
+    /// save was accepted.
+    Process { progress: Vec<NotedPiece>, created_at: TimestampMs },
     /// Gone (finished, forgotten) or failed: nothing to do.
     Skip,
     /// Given up just now.
@@ -303,12 +305,19 @@ impl MemoryStore {
                 let tx = c.transaction()?;
                 let found = tx
                     .query_row(
-                        "SELECT state, attempts, progress FROM ingest_outbox WHERE id = ?1",
+                        "SELECT state, attempts, progress, created_at FROM ingest_outbox WHERE id = ?1",
                         [row],
-                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, TimestampMs>(3)?,
+                            ))
+                        },
                     )
                     .optional()?;
-                let Some((state, attempts, progress)) = found else { return Ok(Claimed::Skip) };
+                let Some((state, attempts, progress, created_at)) = found else { return Ok(Claimed::Skip) };
                 if OutboxState::parse(&state) == OutboxState::Failed {
                     return Ok(Claimed::Skip);
                 }
@@ -332,7 +341,7 @@ impl MemoryStore {
                         // Progress the code wrote itself; one that does not
                         // parse is treated as none, and the dedup gate takes
                         // over the pieces it named.
-                        Claimed::Process { progress: serde_json::from_str(&progress).unwrap_or_default() }
+                        Claimed::Process { progress: serde_json::from_str(&progress).unwrap_or_default(), created_at }
                     }
                 };
                 tx.commit()?;
@@ -340,6 +349,12 @@ impl MemoryStore {
             })
             .await
             .map_err(backend("outbox_claim"))
+            .inspect(|claimed| {
+                if *claimed == Claimed::GaveUp {
+                    let attempts = MAX_ATTEMPTS.into();
+                    self.metrics().event(EventKind::OutboxFailed, &[("cause", "gave_up".into()), ("attempts", attempts)]);
+                }
+            })
     }
 
     /// Notes why `row` stopped. See [`after_failure`].
@@ -348,22 +363,28 @@ impl MemoryStore {
         // The cause is a library's error text and reaches `/health`; nothing
         // stops one from quoting its input.
         let error = redact(&error).text;
-        self.conn
-            .call(move |c| -> rusqlite::Result<()> {
+        let failed = self
+            .conn
+            .call(move |c| -> rusqlite::Result<Option<i64>> {
                 let tx = c.transaction()?;
                 let attempts: Option<i64> = tx
                     .query_row("SELECT attempts FROM ingest_outbox WHERE id = ?1", [row], |r| r.get(0))
                     .optional()?;
-                let Some(attempts) = attempts else { return Ok(()) };
+                let Some(attempts) = attempts else { return Ok(None) };
                 let (attempts, state) = after_failure(attempts, transient);
                 tx.execute(
                     "UPDATE ingest_outbox SET attempts = ?2, state = ?3, last_error = ?4, updated_at = ?5 WHERE id = ?1",
                     rusqlite::params![row, attempts, state.as_str(), error, now],
                 )?;
-                tx.commit()
+                tx.commit()?;
+                Ok((state == OutboxState::Failed).then_some(attempts))
             })
             .await
-            .map_err(backend("outbox_fail"))
+            .map_err(backend("outbox_fail"))?;
+        if let Some(attempts) = failed {
+            self.metrics().event(EventKind::OutboxFailed, &[("cause", "failure".into()), ("attempts", attempts.into())]);
+        }
+        Ok(())
     }
 
     /// Hands back the attempt taking `row` spent, keeping its cause: a save a
@@ -490,8 +511,9 @@ impl MemoryStore {
     /// longer parses is given up with that cause instead of blocking the rest.
     pub(crate) async fn outbox_pending(&self) -> Result<Vec<(i64, MemoryEvent)>, MemoryError> {
         let now = TimestampMs::now();
-        self.conn
-            .call(move |c| -> rusqlite::Result<Vec<(i64, MemoryEvent)>> {
+        let (pending, unparsable) = self
+            .conn
+            .call(move |c| -> rusqlite::Result<(Vec<(i64, MemoryEvent)>, usize)> {
                 let tx = c.transaction()?;
                 let rows: Vec<(i64, String, String)> = {
                     let mut stmt = tx.prepare(
@@ -501,6 +523,7 @@ impl MemoryStore {
                     rows.collect::<Result<_, _>>()?
                 };
                 let mut pending = Vec::with_capacity(rows.len());
+                let mut unparsable = 0;
                 for (row, content, event) in rows {
                     match serde_json::from_str::<MemoryEvent>(&event) {
                         Ok(mut event) => {
@@ -512,14 +535,19 @@ impl MemoryStore {
                                 "UPDATE ingest_outbox SET state = 'failed', last_error = ?2, updated_at = ?3 WHERE id = ?1",
                                 rusqlite::params![row, redact(&format!("the saved event does not parse: {e}")).text, now],
                             )?;
+                            unparsable += 1;
                         }
                     }
                 }
                 tx.commit()?;
-                Ok(pending)
+                Ok((pending, unparsable))
             })
             .await
-            .map_err(backend("outbox_pending"))
+            .map_err(backend("outbox_pending"))?;
+        for _ in 0..unparsable {
+            self.metrics().event(EventKind::OutboxFailed, &[("cause", "unparsable".into())]);
+        }
+        Ok(pending)
     }
 
     /// How many rows wait and failed, and the latest causes.
@@ -596,6 +624,14 @@ mod tests {
             Recorded::New { row } => row,
             other => panic!("expected a new row, got {other:?}"),
         }
+    }
+
+    async fn row_created_at(store: &MemoryStore, row: i64) -> TimestampMs {
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT created_at FROM ingest_outbox WHERE id = ?1", [row], |r| r.get(0)))
+            .await
+            .unwrap()
     }
 
     async fn row_state(store: &MemoryStore, row: i64) -> Option<(String, i64, Option<String>, String)> {
@@ -724,8 +760,9 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let row = new_row(&store, "op-1", "x").await;
 
+        let accepted = row_created_at(&store, row).await;
         for spent in 1..=MAX_ATTEMPTS {
-            assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::Process { progress: vec![] });
+            assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::Process { progress: vec![], created_at: accepted });
             assert_eq!(row_state(&store, row).await.unwrap().1, spent);
         }
         assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::GaveUp);
@@ -734,6 +771,31 @@ mod tests {
         assert_eq!(error.as_deref(), Some("the daemon stopped 3 times while ingesting this save"));
         assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::Skip);
         assert_eq!(store.outbox_claim(row + 100).await.unwrap(), Claimed::Skip);
+    }
+
+    #[tokio::test]
+    async fn a_row_that_turns_failed_is_an_event_with_its_cause() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let causes = || {
+            store.metrics().take_events().iter().map(|e| (e.kind, e.detail.get("cause").copied())).collect::<Vec<_>>()
+        };
+        let label = |l: &'static str| Some(crate::metrics::DetailValue::Label(l));
+
+        let row = new_row(&store, "op-1", "x").await;
+        for _ in 0..MAX_ATTEMPTS {
+            store.outbox_claim(row).await.unwrap();
+        }
+        store.outbox_fail(row, "embed failed".into(), true).await.unwrap();
+        assert!(causes().is_empty(), "a transient failure hands its attempt back");
+        store.outbox_claim(row).await.unwrap();
+        store.outbox_fail(row, "embed failed".into(), false).await.unwrap();
+        assert_eq!(causes(), [(EventKind::OutboxFailed, label("failure"))]);
+
+        let row = new_row(&store, "op-2", "y").await;
+        for _ in 0..=MAX_ATTEMPTS {
+            store.outbox_claim(row).await.unwrap();
+        }
+        assert_eq!(causes(), [(EventKind::OutboxFailed, label("gave_up"))]);
     }
 
     #[tokio::test]
@@ -752,7 +814,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::Process { progress: vec![noted(0, 10)] });
+        let created_at = row_created_at(&store, row).await;
+        assert_eq!(store.outbox_claim(row).await.unwrap(), Claimed::Process { progress: vec![noted(0, 10)], created_at });
     }
 
     #[tokio::test]

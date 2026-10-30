@@ -1474,7 +1474,8 @@ old
             .expect("the model is not cached or does not verify in CLAWG_E5_MODEL_DIR; this test never downloads it");
         let tokenizer = crate::memory::model_download::parse_verified_tokenizer(&files.tokenizer.tokenizer_file).unwrap();
         let embedder =
-            crate::memory::embedder::E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer).unwrap();
+            crate::memory::embedder::E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer, Arc::default())
+                .unwrap();
 
         let edited = GUIDE.replace("run it daily", "run it hourly");
         let dir = crate::test_dir::test_dir();

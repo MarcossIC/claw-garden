@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use clawg_core::metrics::report::{report as group, since_for, By, Rows};
-use clawg_core::metrics::store::{MetricsDb, METRICS_FILE};
+use clawg_core::metrics::store::{MetricsDb, MetricsError, METRICS_FILE};
 
 use clawg_core::preferences::Lang;
 
@@ -22,6 +22,43 @@ pub fn report(
     since: Duration,
     now_ms: i64,
 ) -> Result<String, String> {
+    let (db, failed) = open(lang, base_dir)?;
+    let path = base_dir.join(METRICS_FILE);
+    let by = match by {
+        ReportBy::Day => By::Day,
+        ReportBy::Hour => By::Hour,
+        ReportBy::Version => By::Version,
+        ReportBy::Minute => By::Minute,
+    };
+    let since_ms = since_for(by, now_ms.saturating_sub(i64::try_from(since.as_millis()).unwrap_or(i64::MAX)), now_ms);
+
+    let names = db.names().map_err(&failed)?;
+    if !names.iter().any(|n| n == metric) {
+        let (path, names) = (path.display(), names.join(", "));
+        return Err(match lang {
+            Lang::En => format!("{path} has no metric named {metric:?}; it has {names}"),
+            Lang::Es => format!("{path} no tiene ninguna métrica llamada {metric:?}; tiene {names}"),
+        });
+    }
+    let hists = db.hist_rows_since(metric, since_ms).map_err(&failed)?;
+    let rows = if hists.is_empty() {
+        let gauges = db.gauge_rows_since(metric, since_ms).map_err(&failed)?;
+        if gauges.is_empty() && is_histogram(&db, metric).map_err(&failed)? {
+            Rows::Histograms(hists)
+        } else {
+            Rows::Gauges(gauges)
+        }
+    } else {
+        Rows::Histograms(hists)
+    };
+    let runs = db.runs_since(since_ms).map_err(&failed)?;
+    let report = group(metric, rows, &runs, labels, by, since_ms);
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+/// `metrics.db` of `base_dir` open to read, and how a failure to read it is
+/// said in `lang`; or why it is not there.
+fn open(lang: Lang, base_dir: &Path) -> Result<(MetricsDb, impl Fn(MetricsError) -> String), String> {
     let path = base_dir.join(METRICS_FILE);
     if !path.is_file() {
         return Err(match lang {
@@ -32,41 +69,42 @@ pub fn report(
             ),
         });
     }
-    let failed = |e: clawg_core::metrics::store::MetricsError| match lang {
+    let failed = move |e: MetricsError| match lang {
         Lang::En => format!("could not read {}: {e}", path.display()),
         Lang::Es => format!("no se pudo leer {}: {e}", path.display()),
     };
-    let db = MetricsDb::open_read_only(&path).map_err(failed)?;
-    let by = match by {
-        ReportBy::Day => By::Day,
-        ReportBy::Hour => By::Hour,
-        ReportBy::Version => By::Version,
-        ReportBy::Minute => By::Minute,
-    };
-    let since_ms = since_for(by, now_ms.saturating_sub(i64::try_from(since.as_millis()).unwrap_or(i64::MAX)), now_ms);
+    let db = MetricsDb::open_read_only(&base_dir.join(METRICS_FILE)).map_err(&failed)?;
+    Ok((db, failed))
+}
 
-    let names = db.names().map_err(failed)?;
-    if !names.iter().any(|n| n == metric) {
-        let (path, names) = (path.display(), names.join(", "));
-        return Err(match lang {
-            Lang::En => format!("{path} has no metric named {metric:?}; it has {names}"),
-            Lang::Es => format!("{path} no tiene ninguna métrica llamada {metric:?}; tiene {names}"),
-        });
-    }
-    let hists = db.hist_rows_since(metric, since_ms).map_err(failed)?;
-    let rows = if hists.is_empty() {
-        let gauges = db.gauge_rows_since(metric, since_ms).map_err(failed)?;
-        if gauges.is_empty() && is_histogram(&db, metric).map_err(failed)? {
-            Rows::Histograms(hists)
-        } else {
-            Rows::Gauges(gauges)
-        }
-    } else {
-        Rows::Histograms(hists)
-    };
-    let runs = db.runs_since(since_ms).map_err(failed)?;
-    let report = group(metric, rows, &runs, labels, by, since_ms);
-    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+/// The events of `base_dir`'s `metrics.db` from `since` ago, by run, as
+/// pretty JSON: each run with its version, start and stop, and its events
+/// oldest first.
+pub fn events(lang: Lang, base_dir: &Path, since: Duration, now_ms: i64) -> Result<String, String> {
+    let (db, failed) = open(lang, base_dir)?;
+    let since_ms = now_ms.saturating_sub(i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+    let events = db.events_since(since_ms).map_err(&failed)?;
+    let runs = db.runs_since(i64::MIN / 2).map_err(&failed)?;
+    let listed: Vec<serde_json::Value> = runs
+        .iter()
+        .filter_map(|run| {
+            let of_run: Vec<serde_json::Value> = events
+                .iter()
+                .filter(|e| e.run_id == run.id)
+                .map(|e| serde_json::json!({ "at_ms": e.at_ms, "kind": e.kind, "detail": e.detail }))
+                .collect();
+            (!of_run.is_empty()).then(|| {
+                serde_json::json!({
+                    "run": run.id,
+                    "version": run.version,
+                    "started_at_ms": run.started_at_ms,
+                    "stopped_at_ms": run.stopped_at_ms,
+                    "events": of_run,
+                })
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "since_ms": since_ms, "runs": listed })).map_err(|e| e.to_string())
 }
 
 /// Whether `metric` was ever stored as a histogram, so a window without rows
@@ -79,7 +117,7 @@ fn is_histogram(db: &MetricsDb, metric: &str) -> Result<bool, clawg_core::metric
 mod tests {
     use super::*;
     use clawg_core::metrics::store::RunInfo;
-    use clawg_core::metrics::{Recorder, Unit};
+    use clawg_core::metrics::{EventKind, Recorder, Unit};
     use serde_json::Value;
 
     const NOW: i64 = 1_790_000_000_000;
@@ -151,6 +189,32 @@ mod tests {
                 .unwrap();
         assert_eq!(json["kind"], "histogram");
         assert_eq!(json["groups"], Value::Array(vec![]));
+    }
+
+    #[test]
+    fn the_events_are_listed_by_run() {
+        let dir = tempfile::tempdir().unwrap();
+        seeded(dir.path());
+        let mut db = MetricsDb::open(&dir.path().join(METRICS_FILE), NOW).unwrap();
+        let event = |at_ms, kind| clawg_core::metrics::Event {
+            at_ms,
+            kind,
+            detail: std::collections::BTreeMap::from([("ms", 5u64.into())]),
+        };
+        db.write_events(1, &[event(NOW - 10 * 86_400_000, EventKind::Backup), event(NOW - 500, EventKind::Shutdown)]).unwrap();
+        drop(db);
+
+        let json: Value = serde_json::from_str(&events(Lang::En, dir.path(), Duration::from_secs(86_400), NOW).unwrap()).unwrap();
+        let runs = json["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["version"], "0.49.0");
+        assert_eq!(runs[0]["stopped_at_ms"], Value::Null);
+        assert_eq!(runs[0]["events"], serde_json::json!([{ "at_ms": NOW - 500, "kind": "shutdown", "detail": { "ms": 5 } }]));
+
+        let older: Value = serde_json::from_str(&events(Lang::En, dir.path(), Duration::from_secs(30 * 86_400), NOW).unwrap()).unwrap();
+        assert_eq!(older["runs"][0]["events"].as_array().map(Vec::len), Some(2));
+        let empty = tempfile::tempdir().unwrap();
+        assert!(events(Lang::Es, empty.path(), Duration::from_secs(60), NOW).unwrap_err().contains("no existe"));
     }
 
     #[test]
