@@ -314,10 +314,60 @@ pub fn production_deps(
         }
     });
     EmbedderDeps {
-        ensure,
+        ensure: recorded_download(ensure, metrics.clone()),
         cached: timed_cache_read(cached, metrics.clone()),
         load: timed_load(load, metrics),
         verify: contract_verifier(store, backups),
+    }
+}
+
+/// `ensure` recording a `model_download` event when it downloaded: whether it
+/// ended with the files, the bytes it received and how long it took. A cache
+/// that verified downloads nothing and records nothing. The progress reaches
+/// the caller as it did.
+fn recorded_download(ensure: EnsureModelFn, metrics: Arc<Recorder>) -> EnsureModelFn {
+    Arc::new(move |base_dir, progress| {
+        let (ensure, metrics) = (ensure.clone(), metrics.clone());
+        Box::pin(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let forward = tokio::spawn(async move {
+                let mut seen = Downloaded::default();
+                while let Some(event) = rx.recv().await {
+                    seen.note(&event);
+                    if let Some(progress) = &progress {
+                        let _ = progress.send(event);
+                    }
+                }
+                seen
+            });
+            let started = std::time::Instant::now();
+            let files = ensure(base_dir, Some(tx)).await;
+            let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let seen = forward.await.unwrap_or_default();
+            if seen.started {
+                let result = if files.is_ok() { "ok" } else { "failed" };
+                metrics.event(EventKind::ModelDownload, &[("result", result.into()), ("bytes", seen.bytes.into()), ("ms", ms.into())]);
+            }
+            files
+        })
+    })
+}
+
+/// What the progress of a call to `ensure` said.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Downloaded {
+    started: bool,
+    /// The bytes received over every file.
+    bytes: u64,
+}
+
+impl Downloaded {
+    fn note(&mut self, event: &DownloadProgress) {
+        match event {
+            DownloadProgress::Start { .. } => self.started = true,
+            DownloadProgress::Chunk { bytes_downloaded, .. } => self.bytes = self.bytes.max(*bytes_downloaded),
+            DownloadProgress::Verify | DownloadProgress::Done | DownloadProgress::Error { .. } => {}
+        }
     }
 }
 
@@ -1009,6 +1059,37 @@ mod tests {
         assert!(timed_cache_read(cached, metrics.clone())(std::path::PathBuf::new()).await.is_err());
         assert!(timed_load(load, metrics.clone())(empty_model_files()).is_err());
         assert_eq!(counts(&metrics), [1, 1], "a load that did not happen took no time");
+    }
+
+    #[tokio::test]
+    async fn a_download_is_an_event_and_a_verified_cache_is_none() {
+        let metrics = Arc::new(Recorder::default());
+        let downloading: EnsureModelFn = Arc::new(|_, progress| {
+            Box::pin(async move {
+                let progress = progress.expect("the wrapper always listens");
+                let _ = progress.send(DownloadProgress::Start { bytes_total: 0 });
+                let _ = progress.send(DownloadProgress::Chunk { bytes_downloaded: 600, bytes_total: 0 });
+                let _ = progress.send(DownloadProgress::Chunk { bytes_downloaded: 900, bytes_total: 0 });
+                let _ = progress.send(DownloadProgress::Done);
+                Ok(empty_model_files())
+            })
+        });
+        let (caller, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        recorded_download(downloading, metrics.clone())(std::path::PathBuf::new(), Some(caller)).await.unwrap();
+        let mut forwarded = 0;
+        while heard.try_recv().is_ok() {
+            forwarded += 1;
+        }
+        assert_eq!(forwarded, 4, "the caller hears every step");
+        let events = metrics.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::ModelDownload);
+        assert_eq!(events[0].detail["result"], crate::metrics::DetailValue::Label("ok"));
+        assert_eq!(events[0].detail["bytes"], crate::metrics::DetailValue::Number(900.0));
+
+        let cache_hit: EnsureModelFn = Arc::new(|_, _| Box::pin(async { Ok(empty_model_files()) }));
+        recorded_download(cache_hit, metrics.clone())(std::path::PathBuf::new(), None).await.unwrap();
+        assert!(metrics.take_events().is_empty(), "nothing was downloaded");
     }
 
     /// Count `phase == "done"` occurrences across recorded `StreamEvent`s.
