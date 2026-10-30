@@ -26,6 +26,8 @@ Requisitos en la [spec](spec.md) (DQ1 a DQ9) y decisiones en el [diseño](design
 
 ### 4. Línea base nueva (necesita el modelo real)
 
+Con el embedder falso (sólo comprueba la tubería, sus números no miden nada), sobre este repo el 2026-10-30: `indexed 726 docs into 14068 passages (2 skipped)` y `left out 1 doc quoting a question: openspec/changes/archive/2026-10-15-project-indexing/verify.md`, el único que cita las preguntas.
+
 - [ ] `rag-eval --real --docs` sobre el commit anterior a la tarea 1 y sobre la tarea 3: anotar en `verify.md` Hit@1/3/5 y MRR@10 de docs y código, cuántos docs se dejaron fuera y cuáles, y el tiempo de indexado. El primer número no tiene archivo (la tarea 2 no existía); se anota de stdout.
 
 ## Golden ampliado (DQ5)
