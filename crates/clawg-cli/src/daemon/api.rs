@@ -2702,7 +2702,10 @@ fn refresh_line(project_id: &str, r: &project_docs::RefreshReport) -> String {
 /// search to name.
 async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder, project_id: &str) {
     let tokenizer = app.runtime.tokenizer.get().cloned();
-    match guard.run(&app.runtime.store, embedder, tokenizer).await {
+    let started = Instant::now();
+    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer).await;
+    record_refresh(&app.runtime.metrics, started.elapsed(), refreshed.as_ref().ok());
+    match refreshed {
         Ok(r) => {
             log::info!("{}", refresh_line(project_id, &r));
             for f in &r.failed {
@@ -2711,6 +2714,23 @@ async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder
         }
         Err(e) => log::warn!("could not index the docs of {project_id}: {e}"),
     }
+}
+
+/// Records how long a refresh took and, when it finished, how many files it
+/// indexed, found unchanged, removed and left as they were.
+fn record_refresh(metrics: &Recorder, took: Duration, report: Option<&project_docs::RefreshReport>) {
+    metrics.observe("docs.refresh.duration", Unit::Micros, &[], micros(took));
+    if let Some(r) = report {
+        for (state, files) in
+            [("indexed", r.indexed), ("unchanged", r.unchanged), ("removed", r.removed), ("failed", r.failed.len())]
+        {
+            metrics.gauge("docs.refresh.files", &[("state", state)], files as f64);
+        }
+    }
+}
+
+fn micros(took: Duration) -> u64 {
+    u64::try_from(took.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// How long a search waits for a project's first index before answering
@@ -2799,12 +2819,18 @@ async fn search_docs(
     // An empty index waits longer: answering from it would read as "the docs
     // say nothing". The first index is usually started by the bridge's
     // registration a moment before this search.
-    if let Some(guard) = index.begin_if_due(&body.project_id, Instant::now()) {
+    let wait = if let Some(guard) = index.begin_if_due(&body.project_id, Instant::now()) {
         refresh_docs_in_background(app.clone(), guard, embedder.clone(), body.project_id.clone());
-        let limit = if docs_in(store, &body.project_id).await? == 0 { FIRST_INDEX_WAIT } else { REFRESH_GRACE };
-        index.wait_idle(&body.project_id, limit).await;
+        Some(if docs_in(store, &body.project_id).await? == 0 { FIRST_INDEX_WAIT } else { REFRESH_GRACE })
     } else if index.is_running(&body.project_id) && docs_in(store, &body.project_id).await? == 0 {
-        index.wait_idle(&body.project_id, FIRST_INDEX_WAIT).await;
+        Some(FIRST_INDEX_WAIT)
+    } else {
+        None
+    };
+    if let Some(limit) = wait {
+        let started = Instant::now();
+        index.wait_idle(&body.project_id, limit).await;
+        app.runtime.metrics.observe("docs.search.inline_wait", Unit::Micros, &[], micros(started.elapsed()));
     }
     let hits = project_docs::search(store, embedder.as_ref(), &body.project_id, &body.query, clamp_docs_limit(body.limit))
         .await

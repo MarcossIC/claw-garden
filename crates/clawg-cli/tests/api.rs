@@ -3139,6 +3139,26 @@ async fn docs_search_indexes_on_first_use_and_answers() {
 }
 
 #[tokio::test]
+async fn a_docs_search_records_the_refresh_and_how_long_it_waited_for_it() {
+    let h = Harness::start().await;
+    let (_dir, id) = project_with_docs(&h, &[("README.md", "# Claw\nLocal memory.\n"), ("b.md", "# B\nb\n")]).await;
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "memory" })).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "memory" })).await;
+    assert_eq!(status, 200);
+
+    let run = h.ctx.runtime.metrics.run();
+    let count = |name: &str| run.get(&clawg_core::metrics::SeriesKey::new(name, &[])).map_or(0, |h| h.count());
+    assert_eq!(count("docs.refresh.duration"), 1, "the second search found a fresh index");
+    assert_eq!(count("docs.search.inline_wait"), 1, "only the search that started a refresh waited for it");
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "indexed")]), Some((1, 2.0)));
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "unchanged")]), Some((1, 0.0)));
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "removed")]), Some((1, 0.0)));
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "failed")]), Some((1, 0.0)));
+}
+
+#[tokio::test]
 async fn docs_search_takes_at_most_the_limit() {
     let h = Harness::start().await;
     let (_dir, id) = project_with_docs(&h, &[("a.md", "# A\na\n# B\nb\n# C\nc\n")]).await;
