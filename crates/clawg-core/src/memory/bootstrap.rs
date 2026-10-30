@@ -30,6 +30,7 @@ use crate::memory::model_download::{
     TokenizerFiles,
 };
 use crate::memory::MemoryStore;
+use crate::metrics::{Recorder, Unit};
 use crate::models::chat::StreamEvent;
 
 /// Whether the embedder can be used, as hosts report it.
@@ -303,12 +304,54 @@ pub fn production_deps(
         let lock = lock.clone();
         Box::pin(async move { load_cached_model(&base_dir, &lock).await })
     });
-    let load = model_loader(tokenizer, parse_verified_tokenizer, |onnx, tokenizer, files| {
-        E5Embedder::from_parts(onnx, tokenizer, files)
-            .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
-            .map_err(|e| e.to_string())
+    let metrics = store.metrics().clone();
+    let load = model_loader(tokenizer, parse_verified_tokenizer, {
+        let metrics = metrics.clone();
+        move |onnx, tokenizer, files| {
+            E5Embedder::from_parts(onnx, tokenizer, files, metrics.clone())
+                .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
+                .map_err(|e| e.to_string())
+        }
     });
-    EmbedderDeps { ensure, cached, load, verify: contract_verifier(store, backups) }
+    EmbedderDeps {
+        ensure,
+        cached: timed_cache_read(cached, metrics.clone()),
+        load: timed_load(load, metrics),
+        verify: contract_verifier(store, backups),
+    }
+}
+
+/// `cached` recording under `embedder.load{phase=verify}` how long a read of
+/// the cache took, its hashes included, when it gave the files.
+fn timed_cache_read(cached: CachedModelFn, metrics: Arc<Recorder>) -> CachedModelFn {
+    Arc::new(move |base_dir| {
+        let (cached, metrics) = (cached.clone(), metrics.clone());
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let files = cached(base_dir).await;
+            if files.is_ok() {
+                record_load(&metrics, "verify", started.elapsed());
+            }
+            files
+        })
+    })
+}
+
+/// `load` recording under `embedder.load{phase=session}` how long building the
+/// embedder took, when it was built.
+fn timed_load(load: LoadEmbedderFn, metrics: Arc<Recorder>) -> LoadEmbedderFn {
+    Arc::new(move |files| {
+        let started = std::time::Instant::now();
+        let embedder = load(files);
+        if embedder.is_ok() {
+            record_load(&metrics, "session", started.elapsed());
+        }
+        embedder
+    })
+}
+
+fn record_load(metrics: &Recorder, phase: &'static str, took: std::time::Duration) {
+    metrics.observe("embedder.load", Unit::Micros, &[("phase", phase)], u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
 }
 
 /// Env var that, in a build with the `testing` feature, replaces the model
@@ -357,6 +400,7 @@ impl TestEmbedder {
         backups: std::path::PathBuf,
         tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     ) -> EmbedderDeps {
+        let metrics = store.metrics().clone();
         let verify = contract_verifier(store, backups);
         let ensure: EnsureModelFn = match self {
             Self::Fake | Self::Blocked => Arc::new(|_base_dir, _progress| {
@@ -390,7 +434,14 @@ impl TestEmbedder {
             let ensure = ensure.clone();
             Arc::new(move |base_dir| ensure(base_dir, None))
         };
-        EmbedderDeps { ensure, cached, load, verify }
+        // Measured as the real model's load is, so a test of the binary sees
+        // the series.
+        EmbedderDeps {
+            ensure,
+            cached: timed_cache_read(cached, metrics.clone()),
+            load: timed_load(load, metrics),
+            verify,
+        }
     }
 }
 
@@ -931,6 +982,29 @@ mod tests {
             onnx: OnnxFile::in_memory(Vec::new()),
             tokenizer: empty_tokenizer(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_load_records_how_long_it_verified_and_built_and_a_failure_records_nothing() {
+        use crate::memory::embedder::FakeEmbedder;
+        use crate::metrics::SeriesKey;
+        let metrics = Arc::new(Recorder::default());
+        let counts = |metrics: &Recorder| {
+            let run = metrics.run();
+            ["verify", "session"].map(|phase| run.get(&SeriesKey::new("embedder.load", &[("phase", phase)])).map_or(0, |h| h.count()))
+        };
+
+        let cached: CachedModelFn = Arc::new(|_| Box::pin(async { Ok(empty_model_files()) }));
+        let load: LoadEmbedderFn = Arc::new(|_| Ok(Arc::new(FakeEmbedder::default()) as Arc<dyn Embedder>));
+        let files = timed_cache_read(cached, metrics.clone())(std::path::PathBuf::new()).await.unwrap();
+        assert!(timed_load(load, metrics.clone())(files).is_ok());
+        assert_eq!(counts(&metrics), [1, 1]);
+
+        let cached: CachedModelFn = Arc::new(|_| Box::pin(async { Err(DownloadError::NotCached { files: vec!["model.onnx".into()] }) }));
+        let load: LoadEmbedderFn = Arc::new(|_| Err("no session".to_string()));
+        assert!(timed_cache_read(cached, metrics.clone())(std::path::PathBuf::new()).await.is_err());
+        assert!(timed_load(load, metrics.clone())(empty_model_files()).is_err());
+        assert_eq!(counts(&metrics), [1, 1], "a load that did not happen took no time");
     }
 
     /// Count `phase == "done"` occurrences across recorded `StreamEvent`s.

@@ -564,7 +564,7 @@ impl EvalEmbedder {
         // The evaluation tools are not the daemon: they parse their own copy.
         let tokenizer = model_download::parse_verified_tokenizer(&files.tokenizer.tokenizer_file)
             .map_err(EvalError::ModelLoad)?;
-        let inner = E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer)
+        let inner = E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer, Arc::default())
             .map_err(|e| EvalError::ModelLoad(e.to_string()))?;
         Ok(EvalEmbedder(Arc::new(inner)))
     }
