@@ -195,7 +195,7 @@ impl RefreshGuard {
                 Some(tok) => TokenSplitter::with_tokenizer(tok),
                 None => TokenSplitter::fallback(),
             };
-            refresh(store, embedder, &splitter, &self.project_id, &root).await
+            refresh(store, embedder, &splitter, &self.project_id, &root, &HashSet::new()).await
         }
         .await;
         let mut projects = self.index.projects.lock().unwrap_or_else(|e| e.into_inner());
@@ -389,10 +389,10 @@ struct Scan {
     skipped: usize,
 }
 
-fn scan(root: &Path) -> Result<Scan, CorpusError> {
+fn scan(root: &Path, left_out: &HashSet<String>) -> Result<Scan, CorpusError> {
     let walk = corpus::walk(root)?;
     let mut scan = Scan { docs: Vec::with_capacity(walk.docs.len()), skipped: walk.skipped };
-    for file in walk.docs {
+    for file in walk.docs.into_iter().filter(|f| !left_out.contains(&f.path)) {
         match corpus::read(&file) {
             Some((_, hash)) => scan.docs.push(ScannedDoc { file, hash }),
             None => scan.skipped += 1,
@@ -407,17 +407,20 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
 }
 
+/// Brings the index of `project_id` up to the docs under `root`, treating the
+/// relative paths in `left_out` as absent. The daemon leaves none out.
 pub(crate) async fn refresh(
     store: &MemoryStore,
     embedder: &dyn Embedder,
     splitter: &TokenSplitter,
     project_id: &str,
     root: &Path,
+    left_out: &HashSet<String>,
 ) -> Result<RefreshReport, DocIndexError> {
     // Walked before anything is read from the index: a root that is gone must
     // fail here, not read as an empty tree whose plan drops every doc.
-    let root_buf = root.to_path_buf();
-    let scan = blocking(move || scan(&root_buf)).await?;
+    let (root_buf, left_out) = (root.to_path_buf(), left_out.clone());
+    let scan = blocking(move || scan(&root_buf, &left_out)).await?;
     let stored = fingerprints(store, project_id).await?;
     let disk: Vec<(String, String)> = scan.docs.iter().map(|d| (d.file.path.clone(), d.hash.clone())).collect();
     let model_id = embedder.model_id().to_string();
@@ -912,6 +915,22 @@ mod tests {
 
         assert_eq!((report.indexed, report.unchanged), (2, 0));
         assert_eq!(index_sizes(&store).await, (2, 2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn a_doc_left_out_is_neither_indexed_nor_counted() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", "# A\na\n");
+        write(dir.path(), "notes/b.md", "# B\nb\n");
+        let store = store_with_project("p", dir.path()).await;
+        let left_out = HashSet::from(["notes/b.md".to_string()]);
+
+        let report = refresh(&store, &Counting::new("m1"), &TokenSplitter::fallback(), "p", dir.path(), &left_out)
+            .await
+            .unwrap();
+
+        assert_eq!(report, RefreshReport { docs: 1, indexed: 1, passages: 1, ..Default::default() });
+        assert_eq!(passages(&store, "p").await, [("a.md".into(), "a.md > A".into(), "a".into())]);
     }
 
     #[tokio::test]

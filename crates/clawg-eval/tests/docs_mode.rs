@@ -63,3 +63,37 @@ fn docs_mode_refuses_a_golden_set_naming_a_doc_the_root_lacks() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("docs/gone.md"));
 }
+
+#[test]
+fn docs_mode_leaves_out_a_doc_that_quotes_a_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    project(&root);
+    write(&root, "notes/verify.md", "| q1 | daemon stop | 1 |\n");
+    let golden = dir.path().join("golden.json");
+    std::fs::write(&golden, r#"[{"id": "q1", "question": "daemon stop", "expected": [{"path": "README.md", "heading": "Apagado"}]}]"#)
+        .unwrap();
+
+    let out = rag_eval_docs(&root, &golden);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.starts_with("indexed 4 docs into 5 passages (0 skipped)"), "{stdout}");
+    assert!(stdout.contains("\nleft out 1 doc quoting a question: notes/verify.md\n"), "{stdout}");
+}
+
+#[test]
+fn docs_mode_refuses_an_expected_doc_that_quotes_a_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    project(&root);
+    let golden = dir.path().join("golden.json");
+    std::fs::write(&golden, r#"[{"id": "q1", "question": "snapshot antes de tocar", "expected": [{"path": "docs/backups.md"}]}]"#)
+        .unwrap();
+
+    let out = rag_eval_docs(&root, &golden);
+
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("q1") && stderr.contains("docs/backups.md"), "{stderr}");
+}

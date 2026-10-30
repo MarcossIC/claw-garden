@@ -48,6 +48,8 @@ pub enum DocsGoldenError {
     NoExpected(String),
     #[error("question '{id}' expects {path}, which the root has no doc at")]
     MissingDoc { id: String, path: String },
+    #[error("question '{id}' expects {path}, which quotes a question of the golden set")]
+    ExpectedQuotes { id: String, path: String },
 }
 
 /// Parses a golden set and checks it on its own terms.
@@ -78,6 +80,37 @@ pub fn check_corpus(cases: &[DocsCase], corpus: &[String]) -> Result<(), DocsGol
     for case in cases {
         if let Some(missing) = case.expected.iter().find(|e| !corpus.contains(e.path.as_str())) {
             return Err(DocsGoldenError::MissingDoc { id: case.id.clone(), path: missing.path.clone() });
+        }
+    }
+    Ok(())
+}
+
+/// Lower case with every run of whitespace folded to one space, so a quote
+/// that a table or a wrapped line split still reads as one.
+fn folded(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// The paths, in the order given, of the docs that quote a question of
+/// `cases`. Such a doc shares every word of the question by construction, so
+/// it would rank first and measure the copy rather than the answer.
+pub fn quoting_docs(cases: &[DocsCase], docs: &[(String, String)]) -> Vec<String> {
+    let questions: Vec<String> = cases.iter().map(|c| folded(&c.question)).collect();
+    docs.iter()
+        .filter(|(_, text)| {
+            let text = folded(text);
+            questions.iter().any(|q| text.contains(q.as_str()))
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// Fails on an expected doc that quotes a question: leaving it out would
+/// leave the question without its answer, and keeping it would score a copy.
+pub fn check_quotes(cases: &[DocsCase], left_out: &[String]) -> Result<(), DocsGoldenError> {
+    for case in cases {
+        if let Some(quoting) = case.expected.iter().find(|e| left_out.contains(&e.path)) {
+            return Err(DocsGoldenError::ExpectedQuotes { id: case.id.clone(), path: quoting.path.clone() });
         }
     }
     Ok(())
@@ -135,14 +168,23 @@ fn score_line(results: &[&CaseResult<'_>]) -> String {
     )
 }
 
-pub fn render(report: &EvalDocReport, took: Duration, results: &[CaseResult<'_>]) -> String {
+fn left_out_line(left_out: &[String]) -> String {
+    match left_out.len() {
+        0 => "left out 0 docs quoting a question\n".to_string(),
+        1 => format!("left out 1 doc quoting a question: {}\n", left_out[0]),
+        n => format!("left out {n} docs quoting a question: {}\n", left_out.join(", ")),
+    }
+}
+
+pub fn render(report: &EvalDocReport, took: Duration, left_out: &[String], results: &[CaseResult<'_>]) -> String {
     let all: Vec<&CaseResult<'_>> = results.iter().collect();
     let mut out = format!(
-        "indexed {} docs into {} passages ({} skipped) in {:.1} s\n{}",
+        "indexed {} docs into {} passages ({} skipped) in {:.1} s\n{}{}",
         report.docs,
         report.passages,
         report.skipped,
         took.as_secs_f64(),
+        left_out_line(left_out),
         score_line(&all),
     );
     let (code, docs): (Vec<_>, Vec<_>) = all.iter().partition(|r| r.code);
@@ -190,24 +232,44 @@ pub async fn run(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path) -> i32 {
             return EXIT_RUNTIME_FAILURE;
         }
     };
-    if let Err(e) = check_corpus(&cases, &corpus) {
+    // A doc that is not UTF-8 quotes nothing: the index skips it as well.
+    let texts: Vec<(String, String)> = corpus
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(cli.docs_root.join(path)).ok().map(|text| (path.clone(), text)))
+        .collect();
+    let left_out = quoting_docs(&cases, &texts);
+    if let Err(e) = check_corpus(&cases, &corpus).and_then(|()| check_quotes(&cases, &left_out)) {
         eprintln!("docs golden set validation failed: {e}");
         return EXIT_GOLDEN_INVALID;
     }
 
     let scratch = std::env::temp_dir().join(format!("rag-eval-docs-{}", uuid::Uuid::new_v4()));
-    run_in(cli, embedder, base_dir, &cases, &scratch).await
+    run_in(cli, embedder, base_dir, &cases, &left_out, &scratch).await
 }
 
 /// Measures `cases` with an index built in `scratch`, which is removed when
 /// the measurement ends, passed or failed.
-async fn run_in(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path, cases: &[DocsCase], scratch: &Path) -> i32 {
-    let code = measure(cli, embedder, base_dir, cases, scratch).await;
+async fn run_in(
+    cli: &Cli,
+    embedder: &EvalEmbedder,
+    base_dir: &Path,
+    cases: &[DocsCase],
+    left_out: &[String],
+    scratch: &Path,
+) -> i32 {
+    let code = measure(cli, embedder, base_dir, cases, left_out, scratch).await;
     crate::seed::remove_scratch(scratch).await;
     code
 }
 
-async fn measure(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path, cases: &[DocsCase], scratch: &Path) -> i32 {
+async fn measure(
+    cli: &Cli,
+    embedder: &EvalEmbedder,
+    base_dir: &Path,
+    cases: &[DocsCase],
+    left_out: &[String],
+    scratch: &Path,
+) -> i32 {
     if let Err(e) = std::fs::create_dir_all(scratch) {
         eprintln!("cannot create {}: {e}", scratch.display());
         return EXIT_RUNTIME_FAILURE;
@@ -225,17 +287,18 @@ async fn measure(cli: &Cli, embedder: &EvalEmbedder, base_dir: &Path, cases: &[D
             return EXIT_RUNTIME_FAILURE;
         }
     };
-    let code = measure_with(cli, &index, cases).await;
+    let code = measure_with(cli, &index, cases, left_out).await;
     if let Err(e) = index.close().await {
         eprintln!("warning: {e}");
     }
     code
 }
 
-/// Indexes the root into `index`, asks it every question and prints the report.
-async fn measure_with(cli: &Cli, index: &EvalDocIndex, cases: &[DocsCase]) -> i32 {
+/// Indexes the root but `left_out` into `index`, asks it every question and
+/// prints the report.
+async fn measure_with(cli: &Cli, index: &EvalDocIndex, cases: &[DocsCase], left_out: &[String]) -> i32 {
     let started = Instant::now();
-    let report = match index.index(&cli.docs_root).await {
+    let report = match index.index(&cli.docs_root, left_out).await {
         Ok(report) => report,
         Err(e) => {
             eprintln!("indexing {} failed: {e}", cli.docs_root.display());
@@ -260,7 +323,7 @@ async fn measure_with(cli: &Cli, index: &EvalDocIndex, cases: &[DocsCase]) -> i3
             code: is_code_path(&case.expected[0].path),
         });
     }
-    print!("{}", render(&report, took, &results));
+    print!("{}", render(&report, took, left_out, &results));
     EXIT_OK
 }
 
@@ -288,7 +351,7 @@ mod tests {
         let cases = parse(r#"[{"id": "q1", "question": "daemon stop", "expected": [{"path": "README.md"}]}]"#).unwrap();
         let scratch = crate::test_temp::temp_path("docs-scratch");
 
-        let code = run_in(&cli, &EvalEmbedder::fake(), &root, &cases, &scratch).await;
+        let code = run_in(&cli, &EvalEmbedder::fake(), &root, &cases, &[], &scratch).await;
 
         assert_eq!(code, EXIT_OK);
         assert!(!scratch.exists(), "the index is removed when the run ends");
@@ -345,6 +408,60 @@ mod tests {
     }
 
     #[test]
+    fn a_doc_quotes_a_question_across_lines_and_case() {
+        let cases = parse(r#"[{"id": "q1", "question": "¿Qué pasa con los saves si paro el daemon?", "expected": [{"path": "a.md"}]}]"#)
+            .unwrap();
+        let quoted = |text: &str| !quoting_docs(&cases, &[("x.md".to_string(), text.to_string())]).is_empty();
+
+        assert!(quoted("| q1 | ¿qué pasa con los saves si paro el daemon? | 4 |"));
+        assert!(quoted("La pregunta era ¿Qué pasa con los\n  saves si paro\tel daemon? y no salió."));
+        assert!(!quoted("¿Qué pasa con los saves?"), "a part of the question is not a quote");
+        assert!(!quoted("Los saves pendientes se vuelcan al apagar el daemon."));
+    }
+
+    #[test]
+    fn quoting_docs_names_only_the_docs_that_quote() {
+        let cases = parse(
+            r#"[{"id": "q1", "question": "how do I stop it?", "expected": [{"path": "README.md"}]},
+                {"id": "q2", "question": "where is the data?", "expected": [{"path": "README.md"}]}]"#,
+        )
+        .unwrap();
+        let docs = [
+            ("README.md".to_string(), "# Stop\nRun clawg stop.\n".to_string()),
+            ("notes/verify.md".to_string(), "| q2 | Where is the data? | - |\n".to_string()),
+            ("notes/other.md".to_string(), "how do I stop\nit?\n".to_string()),
+        ];
+
+        assert_eq!(quoting_docs(&cases, &docs), ["notes/verify.md", "notes/other.md"]);
+    }
+
+    #[test]
+    fn an_expected_doc_that_quotes_a_question_fails_validation() {
+        let cases = parse(r#"[{"id": "q1", "question": "x?", "expected": [{"path": "a.md"}, {"path": "notes.md"}]}]"#).unwrap();
+
+        match check_quotes(&cases, &["notes.md".to_string()]) {
+            Err(DocsGoldenError::ExpectedQuotes { id, path }) => assert_eq!((id.as_str(), path.as_str()), ("q1", "notes.md")),
+            other => panic!("expected ExpectedQuotes, got {other:?}"),
+        }
+        assert!(check_quotes(&cases, &["other.md".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn the_report_names_the_docs_it_left_out() {
+        let cases = parse(r#"[{"id": "q1", "question": "first?", "expected": [{"path": "a.md"}]}]"#).unwrap();
+        let results = [CaseResult { case: &cases[0], rank: Some(1), top: None, code: false }];
+        let report = EvalDocReport { docs: 1, passages: 1, skipped: 0 };
+
+        let none = render(&report, Duration::ZERO, &[], &results);
+        let one = render(&report, Duration::ZERO, &["notes/verify.md".to_string()], &results);
+        let two = render(&report, Duration::ZERO, &["a/x.md".to_string(), "b/y.md".to_string()], &results);
+
+        assert!(none.contains("\nleft out 0 docs quoting a question\n"), "{none}");
+        assert!(one.contains("\nleft out 1 doc quoting a question: notes/verify.md\n"), "{one}");
+        assert!(two.contains("\nleft out 2 docs quoting a question: a/x.md, b/y.md\n"), "{two}");
+    }
+
+    #[test]
     fn the_score_counts_hits_within_each_depth_and_the_reciprocal_rank() {
         let s = score(&[Some(1), Some(3), Some(5), None]);
         assert_eq!(s.hit_at_1, 0.25);
@@ -366,7 +483,7 @@ mod tests {
         ];
         let report = EvalDocReport { docs: 2, passages: 7, skipped: 1 };
 
-        let text = render(&report, Duration::from_millis(1500), &results);
+        let text = render(&report, Duration::from_millis(1500), &[], &results);
 
         assert!(text.starts_with("indexed 2 docs into 7 passages (1 skipped) in 1.5 s\n"), "{text}");
         assert!(text.contains("Hit@1 0.50  Hit@3 0.50  Hit@5 0.50  MRR@10 0.50  over 2 questions"), "{text}");
@@ -388,7 +505,7 @@ mod tests {
             CaseResult { case: &cases[2], rank: Some(2), top: None, code: true },
         ];
 
-        let text = render(&EvalDocReport { docs: 3, passages: 3, skipped: 0 }, Duration::ZERO, &results);
+        let text = render(&EvalDocReport { docs: 3, passages: 3, skipped: 0 }, Duration::ZERO, &[], &results);
 
         assert!(text.contains("  docs  Hit@1 0.00  Hit@3 0.00  Hit@5 0.00  MRR@10 0.00  over 1 questions\n"), "{text}");
         assert!(text.contains("  code  Hit@1 0.50  Hit@3 1.00  Hit@5 1.00  MRR@10 0.75  over 2 questions\n"), "{text}");
@@ -398,8 +515,14 @@ mod tests {
     fn the_shipped_golden_set_names_docs_this_workspace_has() {
         let text = std::fs::read_to_string(crate::cli::default_docs_golden_path()).unwrap();
         let cases = parse(&text).unwrap();
-        let corpus = doc_paths(&crate::cli::default_docs_root()).unwrap();
+        let root = crate::cli::default_docs_root();
+        let corpus = doc_paths(&root).unwrap();
         check_corpus(&cases, &corpus).unwrap();
+        let texts: Vec<(String, String)> = corpus
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(root.join(p)).ok().map(|t| (p.clone(), t)))
+            .collect();
+        check_quotes(&cases, &quoting_docs(&cases, &texts)).unwrap();
         assert_eq!(cases.len(), 15);
     }
 }
