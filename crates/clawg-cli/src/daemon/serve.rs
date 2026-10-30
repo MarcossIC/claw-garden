@@ -16,7 +16,7 @@ use clawg_core::memory::bootstrap::{
     run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, EmbedderDeps, LogSink,
 };
 use clawg_core::memory::embedder::E5_MODEL_ID;
-use clawg_core::memory::idle_embedder::{idle_after, DEFAULT_IDLE, IDLE_MINUTES_VAR};
+use clawg_core::memory::idle_embedder::{idle_after, LoadWatch, DEFAULT_IDLE, IDLE_MINUTES_VAR};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::metrics::store::RunInfo;
@@ -149,10 +149,13 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         load,
         base_dir.clone(),
         idle,
-        Some(clawg_core::metrics::MemoryProbes {
-            private: super::process::private_bytes,
-            private_peak: super::process::private_peak_bytes,
-        }),
+        LoadWatch {
+            memory: Some(clawg_core::metrics::MemoryProbes {
+                private: super::process::private_bytes,
+                private_peak: super::process::private_peak_bytes,
+            }),
+            metrics: runtime.metrics.clone(),
+        },
         tokio::runtime::Handle::current(),
     );
     tokio::spawn(run_embedder_bootstrap_with_retry(

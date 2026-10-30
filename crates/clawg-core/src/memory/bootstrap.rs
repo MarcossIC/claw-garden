@@ -23,14 +23,14 @@ use tokio::sync::watch;
 use crate::memory::backup::{self, Reason};
 use crate::memory::db::{ContractStatus, EmbeddingIdentity, StoredContract};
 use crate::memory::embedder::{E5Embedder, Embedder, E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
-use crate::memory::idle_embedder::{IdleEmbedder, ReloadFn};
+use crate::memory::idle_embedder::{IdleEmbedder, LoadWatch, ReloadFn};
 use crate::memory::maintenance::{reembed_all, ReInferPlan, ReembedMode};
 use crate::memory::model_download::{
     ensure_model, load_cached_model, parse_verified_tokenizer, CacheLock, DownloadError, DownloadProgress, ModelFiles,
     TokenizerFiles,
 };
 use crate::memory::MemoryStore;
-use crate::metrics::{Recorder, Unit};
+use crate::metrics::{EventKind, Recorder, Unit};
 use crate::models::chat::StreamEvent;
 
 /// Whether the embedder can be used, as hosts report it.
@@ -506,7 +506,7 @@ pub fn unloading_when_idle(
     load: LoadEmbedderFn,
     base_dir: std::path::PathBuf,
     idle: Option<Duration>,
-    memory: Option<crate::metrics::MemoryProbes>,
+    watch: LoadWatch,
     runtime: tokio::runtime::Handle,
 ) -> LoadEmbedderFn {
     let repairing = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -540,8 +540,12 @@ pub fn unloading_when_idle(
         })
     };
     Arc::new(move |files| {
-        let loaded = load(files)?;
-        Ok(Arc::new(IdleEmbedder::new(loaded, reload.clone(), idle, memory, &runtime)) as Arc<dyn Embedder>)
+        let started = std::time::Instant::now();
+        let loaded = load(files);
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let outcome = if loaded.is_ok() { "loaded" } else { "failed" };
+        watch.metrics.event(EventKind::ModelLoad, &[("cause", "start".into()), ("outcome", outcome.into()), ("ms", ms.into())]);
+        Ok(Arc::new(IdleEmbedder::new(loaded?, reload.clone(), idle, watch.clone(), &runtime)) as Arc<dyn Embedder>)
     })
 }
 
@@ -1054,7 +1058,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             Some(Duration::from_secs(600)),
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
 
@@ -1112,7 +1116,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             None,
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
 
@@ -1167,7 +1171,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             Some(Duration::from_secs(600)),
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
         let embedder = wrapped(empty_model_files()).expect("first load");
@@ -1231,7 +1235,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             Some(Duration::from_secs(600)),
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
         let embedder = wrapped(empty_model_files()).expect("first load");
@@ -1331,7 +1335,7 @@ mod tests {
             load,
             std::path::PathBuf::from("unused"),
             Some(Duration::from_secs(600)),
-            None,
+            LoadWatch::default(),
             tokio::runtime::Handle::current(),
         );
 

@@ -272,7 +272,7 @@ impl Harness {
                     Arc::new(FakeEmbedder::default()),
                     reload,
                     Some(Duration::from_secs(600)),
-                    None,
+                    Default::default(),
                     &tokio::runtime::Handle::current(),
                 );
                 idle.unload().await;
@@ -3856,6 +3856,24 @@ async fn an_import_stores_rows_with_their_state_and_a_dry_run_stores_none() {
     );
     let (_, found) = h.post_json("/v1/search", json!({ "query": "Imported port is 4000", "agent_id": "b" })).await;
     assert_eq!(found["hits"][0]["id"], live["id"], "{found}");
+}
+
+#[tokio::test]
+async fn an_import_and_its_snapshot_are_events_of_the_run() {
+    let h = Harness::start().await;
+    let (status, _) = h.post_json("/v1/import", json!({ "text": export_file(1), "dry_run": true })).await;
+    assert_eq!(status, 200);
+    let (status, _) = h.post_json("/v1/import", json!({ "text": export_file(1) })).await;
+    assert_eq!(status, 200);
+
+    let events = h.ctx.runtime.metrics.run_events();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(kinds, ["import", "backup", "import"], "the real import writes its snapshot first");
+    let label = |l: &'static str| clawg_core::metrics::DetailValue::Label(l);
+    assert_eq!(events[0].detail["dry_run"], label("yes"));
+    assert_eq!(events[0].detail["source"], label("clawg"));
+    assert_eq!(events[1].detail["reason"], label("pre-import"));
+    assert_eq!(events[2].detail["inserted"], clawg_core::metrics::DetailValue::Number(2.0));
 }
 
 #[tokio::test]

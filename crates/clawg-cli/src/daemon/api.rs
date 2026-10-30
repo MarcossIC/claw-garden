@@ -66,7 +66,7 @@ use clawg_core::memory::synthesis::{
     conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
-use clawg_core::metrics::{Recorder, Unit};
+use clawg_core::metrics::{EventKind, Recorder, Unit};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
@@ -2079,6 +2079,7 @@ async fn import_memories(
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let store = &app.runtime.store;
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
+    let source = if foreign.is_some() { "engram" } else { "clawg" };
     let imported = match foreign {
         None => portability::import(store, embedder.as_deref(), chunker, &backups, &body.text, &options, Arc::new(Disk), &mut timings).await,
         Some(export) => {
@@ -2088,6 +2089,15 @@ async fn import_memories(
     match imported {
         Ok(report) => {
             timings.finish();
+            let detail = [
+                ("source", source.into()),
+                ("dry_run", report.dry_run.into()),
+                ("ms", micros(read.elapsed()).div_ceil(1_000).into()),
+                ("rows", report.rows.into()),
+                ("inserted", report.inserted.into()),
+                ("present", report.present.into()),
+            ];
+            app.runtime.metrics.event(EventKind::Import, &detail);
             Ok(Json(report))
         }
         Err(e) => Err(import_error(e)),

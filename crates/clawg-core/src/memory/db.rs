@@ -10,7 +10,7 @@ use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
 use crate::memory::sharing::{self, Reader};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
-use crate::metrics::Recorder;
+use crate::metrics::{EventKind, Recorder};
 
 // ---------------------------------------------------------------------------
 // Embedding contract
@@ -303,6 +303,17 @@ impl MemoryStore {
     /// this one keeps writing. The in-memory test store has no file for a
     /// second connection and copies through its own.
     pub async fn snapshot(&self, into: PathBuf, reason: backup::Reason) -> Result<PathBuf, MemoryError> {
+        let started = std::time::Instant::now();
+        let written = self.snapshot_into(into, reason).await;
+        if let Ok(path) = &written {
+            let bytes = std::fs::metadata(path).map_or(0, |m| m.len());
+            let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.metrics.event(EventKind::Backup, &[("reason", reason.as_str().into()), ("ms", ms.into()), ("bytes", bytes.into())]);
+        }
+        written
+    }
+
+    async fn snapshot_into(&self, into: PathBuf, reason: backup::Reason) -> Result<PathBuf, MemoryError> {
         let Some(dir) = self.dir.clone() else {
             return self
                 .conn
@@ -528,6 +539,18 @@ pub(crate) async fn seed_on_disk(dir: &Path, target: Option<i32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_snapshot_is_an_event_with_its_reason_and_size() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let dir = crate::test_dir::test_dir();
+        store.snapshot(dir.path().to_path_buf(), backup::Reason::Manual).await.unwrap();
+        let events = store.metrics().take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::Backup);
+        assert_eq!(events[0].detail["reason"], crate::metrics::DetailValue::Label("manual"));
+        assert!(matches!(events[0].detail["bytes"], crate::metrics::DetailValue::Number(n) if n > 0.0));
+    }
     use rusqlite::params;
 
     // -----------------------------------------------------------------------
