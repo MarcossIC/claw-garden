@@ -1880,6 +1880,7 @@ pub(crate) mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            imports: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -2118,6 +2119,7 @@ pub(crate) mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            imports: Default::default(),
         });
         let listener = crate::daemon::socket::bind_socket(&dir.join("clawg.sock")).expect("bind the socket");
         tokio::spawn(async move {

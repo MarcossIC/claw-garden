@@ -187,6 +187,7 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
         shutdown,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
+        imports: Default::default(),
     });
     let (addr, server) = match serve_ephemeral(app.clone()).await {
         Ok(served) => served,

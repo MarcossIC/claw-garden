@@ -37,7 +37,8 @@ pub struct Progress {
 }
 
 /// Why an import was asked to stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopCause {
     /// Its caller no longer wants it.
     Cancel,

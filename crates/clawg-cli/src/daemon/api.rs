@@ -19,6 +19,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
@@ -81,6 +82,7 @@ use tokio::sync::oneshot;
 use crate::relevance::shown_hits;
 
 use super::guard::{admits, RefusalLog};
+use super::imports::{End, ImportJobs, JobView, Meta};
 use super::lifecycle::now_ms;
 use super::metrics::{metrics_body, prometheus_text, time_request, HttpMeter, Transport};
 use super::sessions::{check_session_id, SessionRegistry};
@@ -112,6 +114,8 @@ pub struct AppCtx {
     /// The host session each agent works in, per project, that saves are
     /// stamped with.
     pub sessions: SessionRegistry,
+    /// The import job that runs and the last one that ended.
+    pub imports: ImportJobs,
 }
 
 /// How long a save waits for the worker. Long enough for a multi-chunk save
@@ -131,6 +135,9 @@ struct ErrorBody {
     /// What a failed save stored before it stopped.
     #[serde(skip_serializing_if = "Option::is_none")]
     memories: Option<Vec<SavedMemory>>,
+    /// The import job that keeps a new one out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<u64>,
 }
 
 /// Every failure this API can answer with, rendered as
@@ -146,11 +153,12 @@ pub struct ApiError {
     detail: Option<String>,
     retryable: Option<bool>,
     memories: Option<Vec<SavedMemory>>,
+    job_id: Option<u64>,
 }
 
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into(), detail: None, retryable: None, memories: None }
+        Self { status, message: message.into(), detail: None, retryable: None, memories: None, job_id: None }
     }
     /// The embedder will not load (or not yet, if `retryable`), so nothing
     /// that needs it can be served. `message` is a code a client branches on
@@ -187,6 +195,7 @@ impl IntoResponse for ApiError {
             detail: self.detail,
             retryable: self.retryable,
             memories: self.memories,
+            job_id: self.job_id,
         };
         (self.status, Json(body)).into_response()
     }
@@ -1074,6 +1083,8 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/backup", post(backup))
         .route("/import", post(import_memories).layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
         .route("/import/undo", post(undo_import))
+        .route("/imports", post(start_import_job))
+        .route("/imports/{id}", get(import_job))
         .route("/projects", post(register).get(projects))
         .route("/projects/{id}", patch(rename))
         .route("/projects/merge", post(merge_projects))
@@ -2161,21 +2172,191 @@ async fn import_memories(
     match imported {
         Ok(Imported::Done(report)) => {
             timings.finish();
-            let detail = [
-                ("source", source.name().into()),
-                ("dry_run", report.dry_run.into()),
-                ("ms", micros(read.elapsed()).div_ceil(1_000).into()),
-                ("rows", report.rows.into()),
-                ("inserted", report.inserted.into()),
-                ("present", report.present.into()),
-            ];
-            app.runtime.metrics.event(EventKind::Import, &detail);
+            record_import(&app, source, &report, read);
             Ok(Json(report))
         }
         // Nothing here holds the control, so nothing can raise a stop.
         Ok(Imported::Stopped(_)) => Err(ApiError::internal("the import was stopped")),
         Err(e) => Err(import_error(e)),
     }
+}
+
+/// The `import` event of an import that ended, `started` being when its
+/// request began.
+fn record_import(app: &AppCtx, source: Source, report: &ImportReport, started: Instant) {
+    let detail = [
+        ("source", source.name().into()),
+        ("dry_run", report.dry_run.into()),
+        ("ms", micros(started.elapsed()).div_ceil(1_000).into()),
+        ("rows", report.rows.into()),
+        ("inserted", report.inserted.into()),
+        ("present", report.present.into()),
+    ];
+    app.runtime.metrics.event(EventKind::Import, &detail);
+}
+
+/// The body of `POST /v1/imports`: that of `POST /v1/import` with the path of
+/// the export where its text would be. Strict, as a move's, so a misspelt field
+/// imports nothing; it is read from the bytes because the `Json` extractor
+/// answers an unknown field with a 422 in plain text.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportJobRequest {
+    /// An absolute path to the export, a regular file this daemon can read.
+    pub path: String,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub map_roots: Vec<(String, MapTarget)>,
+    #[serde(default)]
+    pub project_map: Vec<(String, MapTarget)>,
+}
+
+/// The export at `path` as `source` writes it. The text is read and parsed in
+/// one call, so it lives no longer than that: the job keeps what was parsed.
+fn read_export(path: &std::path::Path, source: Source) -> ApiResult<ImportInput> {
+    use std::io::Read;
+    let unreadable = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => ApiError::bad_request("no such file"),
+        _ => ApiError::bad_request(format!("the file cannot be read: {e}")),
+    };
+    // Looked at before it is opened, so a named pipe is never waited on.
+    let meta = std::fs::metadata(path).map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err(ApiError::bad_request("not a regular file"));
+    }
+    if meta.len() > MAX_IMPORT_BYTES as u64 {
+        return Err(too_large(usize::try_from(meta.len()).unwrap_or(usize::MAX)));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    // One more byte than the limit, so a file that grew since it was measured is refused too.
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_IMPORT_BYTES as u64 + 1).read_to_end(&mut bytes))
+        .map_err(unreadable)?;
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return Err(too_large(bytes.len()));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| ApiError::bad_request("the file is not UTF-8 text"))?;
+    parse_input(source, &text)
+}
+
+/// What a job runs with once it is accepted.
+struct Job {
+    input: ImportInput,
+    options: ImportOptions,
+    source: Source,
+    embedder: Option<Arc<dyn Embedder>>,
+    timings: ImportTimings,
+    started: Instant,
+    control: ImportControl,
+}
+
+/// Imports the export at a path as a job: answers `202` with the job once the
+/// file is read and checked, and imports in the background. The request is
+/// refused, whatever else is wrong with it, before a job exists.
+async fn start_import_job(State(app): State<Arc<AppCtx>>, body: Bytes) -> ApiResult<Response> {
+    let request = serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let view = accept_job(app, request, ImportControl::default()).await?;
+    Ok((StatusCode::ACCEPTED, Json(&*view)).into_response())
+}
+
+/// The checks of `POST /v1/import` in its order, with the slot taken after
+/// what only reads the request and before the file is opened, so two requests
+/// never read a file at once.
+async fn accept_job(app: Arc<AppCtx>, request: ImportJobRequest, control: ImportControl) -> ApiResult<Arc<JobView>> {
+    let started = Instant::now();
+    let ImportJobRequest { path, from, dry_run, agent, map_roots, project_map } = request;
+    let path = std::path::PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(ApiError::bad_request("path must be absolute"));
+    }
+    let Asked { source, options } = checked_fields(&app, ImportFields { from, dry_run, agent, map_roots, project_map }).await?;
+    let reservation = app.imports.reserve().map_err(|busy| ApiError {
+        detail: Some(format!("import job {} is running; try again when it ends", busy.job_id)),
+        job_id: Some(busy.job_id),
+        ..ApiError::conflict("import_running")
+    })?;
+    let input = tokio::task::spawn_blocking(move || read_export(&path, source)).await.map_err(ApiError::internal)??;
+    tokenizer_for(&app, &input)?;
+    let mut timings = ImportTimings::new(dry_run).with_memory(super::process::private_bytes);
+    timings.record(Timing { elapsed: started.elapsed(), ..Timing::new(Step::Read) });
+    let embedder = embedder_for(&app, dry_run)?;
+    // A model let go for being idle loads while the job plans and decides.
+    if let Some(embedder) = &embedder {
+        embedder.wake();
+    }
+
+    let id = reservation.id();
+    let meta = Meta { dry_run, from: source.name(), started_at_ms: TimestampMs::now().as_millis_i64() };
+    reservation.run(meta, control.clone());
+    let view = app.imports.view(id).ok_or_else(|| ApiError::internal("the import job is gone"))?;
+    log::info!("import job {id} accepted: {} from {}", if dry_run { "dry run" } else { "import" }, source.name());
+    tokio::spawn(run_job(app, id, Job { input, options, source, embedder, timings, started, control }));
+    Ok(view)
+}
+
+/// Ends job `id` as failed if its task goes away before it says how the job
+/// ended, so a panic does not leave the slot held for good.
+struct Ending {
+    app: Arc<AppCtx>,
+    id: u64,
+    end: Option<End>,
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        let end = self.end.take().unwrap_or(End::Failed { error: "the import task ended without a result".into(), detail: None });
+        self.app.imports.finish(self.id, end, TimestampMs::now().as_millis_i64());
+    }
+}
+
+async fn run_job(app: Arc<AppCtx>, id: u64, job: Job) {
+    let mut ending = Ending { app: app.clone(), id, end: None };
+    ending.end = Some(import_as_job(&app, id, job).await);
+}
+
+async fn import_as_job(app: &AppCtx, id: u64, mut job: Job) -> End {
+    let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+    let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
+    let imported = portability::import_parsed(
+        &app.runtime.store,
+        job.embedder.as_deref(),
+        chunker,
+        &backups,
+        job.input,
+        &job.options,
+        Arc::new(Disk),
+        &mut job.timings,
+        &job.control,
+    )
+    .await;
+    match imported {
+        Ok(Imported::Done(report)) => {
+            job.timings.finish();
+            record_import(app, job.source, &report, job.started);
+            log::info!("import job {id} ended: done");
+            End::Done(report)
+        }
+        Ok(Imported::Stopped(stopped)) => {
+            log::info!("import job {id} ended: stopped in {}", stopped.step.name());
+            End::Stopped(stopped)
+        }
+        Err(e) => {
+            let failed = import_error(e);
+            log::warn!("import job {id} ended: failed with {}", failed.message);
+            End::Failed { error: failed.message, detail: failed.detail }
+        }
+    }
+}
+
+/// The state of import job `id`, which is the job that runs or the last that ended.
+async fn import_job(State(app): State<Arc<AppCtx>>, Path(id): Path<u64>) -> ApiResult<Response> {
+    let view = app.imports.view(id).ok_or_else(|| ApiError::not_found(format!("no import job {id}")))?;
+    Ok(Json(&*view).into_response())
 }
 
 /// The body of `POST /v1/import/undo`. Strict, as a move's: a misspelt
@@ -2995,6 +3176,185 @@ mod tests {
         assert_eq!(Source::Engram.name(), "engram");
     }
 
+    /// The rows an import writes in one batch.
+    const WRITE_BATCH: usize = 256;
+
+    /// A daemon over an in-memory store and the directory it keeps its
+    /// snapshots in.
+    async fn daemon_for_jobs() -> (Arc<AppCtx>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (runtime, _rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let app = Arc::new(AppCtx {
+            runtime,
+            token: "job-token".to_string(),
+            profile: Profile::Dev,
+            started_at: Instant::now(),
+            shutdown,
+            save_timeout: SAVE_CONFIRM_TIMEOUT,
+            sessions: Default::default(),
+            imports: Default::default(),
+        });
+        (app, dir)
+    }
+
+    /// A clawg export of `rows` rows.
+    fn rows_file(rows: usize) -> String {
+        let header = serde_json::json!({
+            "kind": "header", "format": "clawg-memories", "version": 1, "exported_at": 0, "clawg": "0.0.0",
+            "filter": {"project": null, "agent": null, "include_deleted": false},
+        });
+        let row = |id: usize| {
+            serde_json::json!({
+                "kind": "memory", "id": id, "scope": "agent", "agent_id": "a", "content": format!("the row {id} of the file"),
+                "memory_type": "semantic_fact", "source": "explicit", "created_at": 1_000 + id,
+                "created_by_type": "agent", "last_modified_at": 1_000 + id, "last_accessed_at": 9_000,
+                "access_count": 1, "importance": 5.0, "tier": 2, "status": "active",
+            })
+        };
+        std::iter::once(header).chain((1..=rows).map(row)).map(|line| format!("{line}\n")).collect()
+    }
+
+    /// An export of another tool with `notes` notes of 700 words each, which
+    /// the daemon splits into pieces.
+    fn long_notes_file(notes: usize) -> String {
+        let observation = |k: usize| {
+            // Words of its own, so no piece of a note is another note's.
+            let words: Vec<String> = (0..700).map(|i| format!("n{k}w{i}")).collect();
+            serde_json::json!({
+                "id": k, "sync_id": format!("n{k}"), "session_id": "s1", "type": "discovery", "title": format!("Note {k}"),
+                "content": words.join(" "), "project": null, "scope": "project", "revision_count": 1,
+                "duplicate_count": 1, "created_at": "2025-01-01 10:00:00", "updated_at": "2025-01-01 10:00:00",
+            })
+        };
+        let observations: Vec<_> = (0..notes).map(observation).collect();
+        serde_json::json!({ "version": "0.2.0", "exported_at": "2025-03-01 10:00:00", "sessions": [], "observations": observations, "prompts": [] })
+            .to_string()
+    }
+
+    /// Accepts a job over `text` with `control`, waits for it to end and
+    /// answers its state as `GET /v1/imports/{id}` shows it.
+    async fn job_over(app: &Arc<AppCtx>, dir: &std::path::Path, text: &str, fields: serde_json::Value, control: ImportControl) -> serde_json::Value {
+        let path = dir.join("export.jsonl");
+        std::fs::write(&path, text).expect("an export file");
+        let mut body = fields;
+        body["path"] = serde_json::json!(path);
+        let request: ImportJobRequest = serde_json::from_value(body).expect("a request");
+        let accepted = accept_job(app.clone(), request, control).await.expect("the job is accepted");
+        let id = serde_json::to_value(&*accepted).expect("a view")["job_id"].as_u64().expect("a job id");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let view = serde_json::to_value(&*app.imports.view(id).expect("the job")).expect("a view");
+                if ["done", "failed", "cancelled", "interrupted"].contains(&view["phase"].as_str().unwrap_or("")) {
+                    return view;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job ended")
+    }
+
+    /// A control that is asked to stop as `step` begins.
+    fn cancelled_in(step: Step) -> ImportControl {
+        let control = ImportControl::default();
+        let raise = control.clone();
+        control.on_step(move |entered| {
+            if entered == step {
+                raise.stop(portability::StopCause::Cancel);
+            }
+        });
+        control
+    }
+
+    async fn count(app: &AppCtx, sql: &'static str) -> i64 {
+        app.runtime.store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
+    }
+
+    #[tokio::test]
+    async fn a_job_stopped_in_writing_counts_exactly_the_committed_batches() {
+        let (app, dir) = daemon_for_jobs().await;
+        let job = job_over(&app, dir.path(), &rows_file(WRITE_BATCH + 1), serde_json::json!({}), cancelled_in(Step::Write)).await;
+
+        assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str()), (Some("cancelled"), Some("write")), "{job}");
+        let report = &job["report"];
+        assert_eq!((report["inserted"].clone(), report["rows"].clone()), (serde_json::json!(WRITE_BATCH), serde_json::json!(WRITE_BATCH + 1)), "{job}");
+        assert_eq!((job["rows_written"].clone(), job["notes_written"].clone()), (serde_json::json!(WRITE_BATCH), serde_json::json!(WRITE_BATCH)), "{job}");
+        assert_eq!((job["rows"].clone(), job["notes"].clone()), (serde_json::json!(WRITE_BATCH + 1), serde_json::json!(WRITE_BATCH + 1)), "{job}");
+        assert_eq!(job["import_id"], report["import_id"], "{job}");
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, WRITE_BATCH as i64);
+    }
+
+    #[tokio::test]
+    async fn a_job_stopped_in_writing_leaves_whole_notes_and_frees_its_number() {
+        let (app, dir) = daemon_for_jobs().await;
+        app.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+        let fields = serde_json::json!({ "from": "engram" });
+        let job = job_over(&app, dir.path(), &long_notes_file(40), fields, cancelled_in(Step::Write)).await;
+
+        assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str()), (Some("cancelled"), Some("write")), "{job}");
+        let (written, notes) = (job["notes_written"].as_i64().unwrap(), job["notes"].as_i64().unwrap());
+        assert!(0 < written && written < notes, "a batch of whole notes was written and not all of them: {job}");
+        let (stored, sizes): (i64, i64) = app
+            .runtime
+            .store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT COUNT(DISTINCT created_by_ref), COUNT(DISTINCT n) FROM (SELECT created_by_ref, COUNT(*) AS n FROM memory GROUP BY created_by_ref)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .expect("rows by note");
+        assert_eq!((stored, sizes), (written, 1), "every note written has all its rows: {job}");
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, job["rows_written"].as_i64().unwrap());
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import WHERE finished_at IS NULL").await, 1, "the journal stays open");
+
+        let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+        let undone = portability::undo_import(&app.runtime.store, &backups, job["import_id"].as_i64().unwrap(), false).await;
+        assert!(undone.is_ok(), "its number is free: {:?}", undone.err());
+    }
+
+    #[tokio::test]
+    async fn importing_again_finishes_a_stopped_job() {
+        let (app, dir) = daemon_for_jobs().await;
+        let text = rows_file(WRITE_BATCH + 1);
+        let stopped = job_over(&app, dir.path(), &text, serde_json::json!({}), cancelled_in(Step::Write)).await;
+        assert_eq!(stopped["phase"], "cancelled", "{stopped}");
+
+        let again = job_over(&app, dir.path(), &text, serde_json::json!({}), ImportControl::default()).await;
+
+        assert_eq!(again["phase"], "done", "{again}");
+        assert_eq!((again["report"]["present"].clone(), again["report"]["inserted"].clone()), (serde_json::json!(WRITE_BATCH), serde_json::json!(1)), "{again}");
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, WRITE_BATCH as i64 + 1);
+    }
+
+    #[tokio::test]
+    async fn undoing_a_stopped_job_works() {
+        let (app, dir) = daemon_for_jobs().await;
+        let stopped = job_over(&app, dir.path(), &rows_file(WRITE_BATCH + 1), serde_json::json!({}), cancelled_in(Step::Write)).await;
+        let import_id = stopped["import_id"].as_i64().expect("a number");
+
+        let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
+        let undone = portability::undo_import(&app.runtime.store, &backups, import_id, false).await.expect("an undo, not a refusal to touch a running import");
+
+        assert_eq!(undone.removed.len(), WRITE_BATCH);
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_job_stopped_before_its_first_write_has_no_report() {
+        let (app, dir) = daemon_for_jobs().await;
+        let job = job_over(&app, dir.path(), &rows_file(3), serde_json::json!({}), cancelled_in(Step::Embed)).await;
+
+        assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str()), (Some("cancelled"), Some("embed")), "{job}");
+        assert!(job.get("report").is_none() && job.get("import_id").is_none(), "{job}");
+        assert_eq!((job["rows"].clone(), job["rows_embedded"].clone()), (serde_json::json!(3), serde_json::json!(0)), "{job}");
+        assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import").await, 0);
+    }
+
     #[test]
     fn a_docs_search_returns_five_by_default_and_never_more_than_twenty() {
         assert_eq!(clamp_docs_limit(None), 5);
@@ -3227,6 +3587,7 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            imports: Default::default(),
         });
 
         let (addr, server) = serve_ephemeral(app).await.expect("bind an ephemeral loopback port");

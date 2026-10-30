@@ -236,6 +236,7 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         shutdown: shutdown_tx,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
+        imports: Default::default(),
     });
 
     let store_probe = super::store_probe::spawn(ctx.runtime.store.clone(), base_dir.clone(), ctx.runtime.metrics.clone());

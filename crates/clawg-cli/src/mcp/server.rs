@@ -1836,6 +1836,7 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
+            imports: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr: SocketAddr = listener.local_addr().expect("addr");
@@ -4693,6 +4694,7 @@ mod tests {
                 shutdown,
                 save_timeout: SAVE_CONFIRM_TIMEOUT,
                 sessions: Default::default(),
+                imports: Default::default(),
             });
             Self::serve(data_dir, token, wrap(router(ctx))).await.with_store(store)
         }

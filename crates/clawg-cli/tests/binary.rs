@@ -251,6 +251,11 @@ impl Daemon {
         (answer.status.as_u16(), serde_json::from_slice(&answer.body).unwrap_or(Value::Null))
     }
 
+    async fn get(&self, path: &str) -> (u16, Value) {
+        let answer = self.client().send(Call::new(reqwest::Method::GET, path)).await.expect("request");
+        (answer.status.as_u16(), serde_json::from_slice(&answer.body).unwrap_or(Value::Null))
+    }
+
     async fn list(&self) -> String {
         let call = Call::new(reqwest::Method::GET, "/v1/memories").query([("limit", "100")]);
         let answer = self.client().send(call).await.expect("list");
@@ -913,6 +918,52 @@ async fn export_and_import_round_trip_through_the_binary() {
     assert_eq!(markdown.status.code(), Some(0), "{}", stderr_of(&markdown));
     let text = std::fs::read_to_string(&view).expect("the view");
     assert!(text.contains("> a second exported memory"), "{text}");
+}
+
+/// A job reads the file at its path, and ends with the report the synchronous
+/// import gives for the same export.
+#[tokio::test]
+async fn a_job_import_ends_done_with_the_report_of_the_synchronous_import() {
+    let source = Sandbox::new();
+    let daemon = source.serve().await;
+    daemon.wait_until_ready().await;
+    for content in ["exported while the daemon runs", "a second exported memory"] {
+        let (status, body) = daemon.post("/v1/memories", json!({ "content": content, "agent_id": "smoke" })).await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let file = source.home.join("memories.jsonl");
+    let exported = source.run(&["export", "--out", &file.to_string_lossy(), "--profile", "dev"]);
+    assert_eq!(exported.status.code(), Some(0), "{}", stderr_of(&exported));
+
+    let (by_body, by_path) = (Sandbox::new(), Sandbox::new());
+    let (synchronous, job) = (by_body.serve().await, by_path.serve().await);
+    synchronous.wait_until_ready().await;
+    job.wait_until_ready().await;
+    let text = std::fs::read_to_string(&file).expect("the export");
+    let (status, expected) = synchronous.post("/v1/import", json!({ "text": text, "agent": "moved" })).await;
+    assert_eq!(status, 200, "{expected}");
+
+    let (status, accepted) = job.post("/v1/imports", json!({ "path": file.to_string_lossy(), "agent": "moved" })).await;
+    assert_eq!(status, 202, "{accepted}");
+    let id = accepted["job_id"].as_u64().expect("a job id");
+    let deadline = Instant::now() + START_BUDGET;
+    let done = loop {
+        let (status, state) = job.get(&format!("/v1/imports/{id}")).await;
+        assert_eq!(status, 200, "{state}");
+        if state["phase"] == "done" {
+            break state;
+        }
+        assert!(Instant::now() < deadline, "the job never ended: {state}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let unmarked = |mut report: Value| {
+        report["snapshot"] = Value::Null;
+        report["import_id"] = Value::Null;
+        report
+    };
+    assert_eq!(unmarked(done["report"].clone()), unmarked(expected), "{done}");
+    assert!(job.list().await.contains("exported while the daemon runs"));
 }
 
 #[tokio::test]
