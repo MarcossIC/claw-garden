@@ -23,7 +23,7 @@ use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::redact::{redact, SecretKind};
 use crate::memory::sharing::Reader;
-use crate::memory::store_insert::{NewMemoryRecord, Stored};
+use crate::memory::store_insert::{NewMemoryRecord, Stored as Insert};
 use crate::memory::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
 use crate::memory::MemoryStore;
 
@@ -931,11 +931,9 @@ async fn ingest_pieces(
     };
 
     let head = head.as_deref();
-    let context = |position: usize| head_for(head, position);
-    let Gated { mut stored, mut contexts, survivors, mut noted } =
-        gate_pieces(evt, saver, store, absorbed, track.as_ref(), chunks).await;
-    let report = |stored: &[Option<SavedChunk>], failure| IngestReport {
-        memories: stored.iter().flatten().copied().collect(),
+    let mut gated = gate_pieces(evt, saver, store, absorbed, track.as_ref(), chunks).await;
+    let report = |gated: &Gated, failure| IngestReport {
+        memories: gated.stored.iter().flatten().copied().collect(),
         failure,
         redacted: redacted.clone(),
         related: Vec::new(),
@@ -943,31 +941,60 @@ async fn ingest_pieces(
         revision_candidate: None,
         paused: false,
     };
-    let pieces = |stored: &[Option<SavedChunk>], contexts: &[String]| -> Vec<StoredPiece> {
-        stored
-            .iter()
-            .zip(contexts)
-            .filter_map(|(saved, context)| saved.map(|s| StoredPiece { memory_id: s.id, context: context.clone() }))
-            .collect()
-    };
-    if survivors.is_empty() {
-        return (report(&stored, None), pieces(&stored, &contexts));
+    if gated.survivors.is_empty() {
+        return (report(&gated, None), gated.pieces());
     }
 
-    let vectors = match embed_pieces(embedder.as_ref(), &survivors, head).await {
+    let vectors = match embed_pieces(embedder.as_ref(), &gated.survivors, head).await {
         Ok(vectors) => vectors,
-        Err(failure) => return (report(&stored, Some(failure)), Vec::new()),
+        Err(failure) => return (report(&gated, Some(failure)), Vec::new()),
     };
 
-    // Stage 3 — sequential, one chunk at a time: chunk N's contradiction
-    // probe is a KNN search over rows already in the store, so chunk N-1 of
-    // this same event is already there when it runs. An explicit save
+    let to_store = PieceStore { evt, saver, store, track: track.as_ref(), earlier, drain, head };
+    match store_pieces(&to_store, absorbed, &mut gated, vectors).await {
+        Stored::Done { related } => (IngestReport { related, ..report(&gated, None) }, gated.pieces()),
+        Stored::Paused => (IngestReport { paused: true, ..report(&gated, None) }, Vec::new()),
+        Stored::Failed(failure) => (report(&gated, Some(failure)), Vec::new()),
+    }
+}
+
+/// What storing a save's pieces needs besides the gate's result.
+#[derive(Clone, Copy)]
+struct PieceStore<'a> {
+    evt: &'a MemoryEvent,
+    saver: &'a Reader,
+    store: &'a Arc<MemoryStore>,
+    track: Option<&'a Track>,
+    /// The earlier rows of the save's topic key.
+    earlier: &'a [i64],
+    drain: DrainWatch<'a>,
+    head: Option<&'a str>,
+}
+
+/// How storing a save's pieces ended.
+enum Stored {
+    /// Every piece is in the store, with the rows the detector paired them with.
+    Done { related: Vec<Candidate> },
+    /// A drain was due: the pieces stored so far are noted in the row.
+    Paused,
+    Failed(IngestFailure),
+}
+
+/// Stores the pieces the gate left, each with its vector, writing what each
+/// became into `gated`.
+async fn store_pieces(to: &PieceStore<'_>, absorbed: &mut u64, gated: &mut Gated, vectors: Vec<Vec<f32>>) -> Stored {
+    // Sequential, one chunk at a time: chunk N's contradiction probe is a KNN
+    // search over rows already in the store, so chunk N-1 of this same event
+    // is already there when it runs. An explicit save
     // carries a claim-bearing type, so a long one reaches the probe once per
     // chunk; the chunks this event already inserted are passed as siblings,
     // because two parts of one save are one claim by one author and must not
     // dispute each other. The rows a conclusion was drawn from are passed the
     // same way: it restates them, it does not contradict them. So are the
     // earlier rows of the save's topic key: it replaces them once it finishes.
+    let PieceStore { evt, saver, store, track, earlier, drain, head } = *to;
+    let context = |position: usize| head_for(head, position);
+    let Gated { stored, contexts, survivors, noted } = gated;
     let mut siblings: Vec<i64> = evt.sources().to_vec();
     siblings.extend_from_slice(earlier);
     siblings.extend(stored.iter().flatten().filter(|s| s.outcome == ChunkOutcome::Inserted).map(|s| s.id));
@@ -977,9 +1004,9 @@ async fn ingest_pieces(
     let mut related: Vec<Candidate> = Vec::new();
     // Every take stores at least one piece before it may pause, so the embed
     // it paid for is not thrown away whole and a save always moves forward.
-    for (taken, ((position, pending), vec)) in survivors.into_iter().zip(vectors).enumerate() {
+    for (taken, ((position, pending), vec)) in std::mem::take(survivors).into_iter().zip(vectors).enumerate() {
         if taken > 0 && track.is_some() && pause_due(Instant::now(), drain.deadline()) {
-            return (IngestReport { paused: true, ..report(&stored, None) }, Vec::new());
+            return Stored::Paused;
         }
         let PendingChunk { chunk, content_hash, multiplicity } = pending;
         // The contradiction hook runs between embed and insert: it needs the
@@ -996,11 +1023,11 @@ async fn ingest_pieces(
         .map(|(_, candidate)| candidate)
         .collect();
         let candidates = record.candidates.clone();
-        let note = note_for(track.as_ref(), &noted, position, &content_hash, true, context(position));
-        let absorbed_note = note_for(track.as_ref(), &noted, position, &content_hash, false, "");
+        let note = note_for(track, &noted, position, &content_hash, true, context(position));
+        let absorbed_note = note_for(track, &noted, position, &content_hash, false, "");
         let id = match store.insert_unless_twin(saver, record, vec, note, absorbed_note).await {
-            Ok(Stored::Inserted(id)) => id,
-            Ok(Stored::Absorbed(id)) => {
+            Ok(Insert::Inserted(id)) => id,
+            Ok(Insert::Absorbed(id)) => {
                 *absorbed += 1;
                 log::debug!("ingest absorbed a twin that came back while the save was embedded (memory_id={id})");
                 if track.is_some() {
@@ -1013,8 +1040,7 @@ async fn ingest_pieces(
                 continue;
             }
             Err(e) => {
-                let failure = IngestFailure::Failed(format!("store insert failed: {e}"));
-                return (report(&stored, Some(failure)), Vec::new());
+                return Stored::Failed(IngestFailure::Failed(format!("store insert failed: {e}")));
             }
         };
         if track.is_some() {
@@ -1036,7 +1062,19 @@ async fn ingest_pieces(
             absorb_duplicate(store, evt, saver, &content_hash, absorbed, |_| None).await;
         }
     }
-    (IngestReport { related, ..report(&stored, None) }, pieces(&stored, &contexts))
+    Stored::Done { related }
+}
+
+impl Gated {
+    /// The pieces stored, in order, each with the head its vector was
+    /// embedded behind.
+    fn pieces(&self) -> Vec<StoredPiece> {
+        self.stored
+            .iter()
+            .zip(&self.contexts)
+            .filter_map(|(saved, context)| saved.map(|s| StoredPiece { memory_id: s.id, context: context.clone() }))
+            .collect()
+    }
 }
 
 /// Finishes a save that no outbox row stands for: links its pieces when there
@@ -1239,6 +1277,47 @@ mod tests {
         ] {
             assert_eq!(embed_pieces(&Answering(answer), &survivors, None).await.unwrap_err(), failure);
         }
+    }
+
+    #[tokio::test]
+    async fn the_store_writes_each_piece_notes_it_and_pauses_when_a_drain_is_due() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let evt = make_event(Role::User, "two pieces", None, 1);
+        let saver = store.reader_for(&evt.agent_id);
+        let gate = |texts: &[&str]| Gated {
+            stored: vec![None; texts.len()],
+            contexts: vec![String::new(); texts.len()],
+            survivors: texts
+                .iter()
+                .enumerate()
+                .map(|(position, text)| {
+                    let chunk = Chunk { text: text.to_string() };
+                    let content_hash = crate::memory::dedup::content_hash(text);
+                    (position, PendingChunk { chunk, content_hash, multiplicity: 1 })
+                })
+                .collect(),
+            noted: Vec::new(),
+        };
+        let vectors = |n: usize| vec![vec![0.1_f32; 384]; n];
+        let track = Track { row: 1, progress: Vec::new() };
+        let mut absorbed = 0;
+
+        let to = PieceStore {
+            evt: &evt, saver: &saver, store: &store, track: Some(&track), earlier: &[], drain: DrainWatch::default(),
+            head: Some("HEAD"),
+        };
+        let mut gated = gate(&["first piece", "second piece"]);
+        assert!(matches!(store_pieces(&to, &mut absorbed, &mut gated, vectors(2)).await, Stored::Done { .. }));
+        assert!(gated.stored.iter().all(|s| s.is_some_and(|s| s.outcome == ChunkOutcome::Inserted)), "{:?}", gated.stored);
+        assert_eq!(gated.contexts, ["", "HEAD"], "only the pieces after the first are embedded behind the head");
+        assert_eq!(gated.noted.len(), 2);
+        assert_eq!(gated.pieces().len(), 2);
+
+        let due = DrainWatch { deadline: Some(Instant::now()), signal: None };
+        let mut gated = gate(&["third piece", "fourth piece"]);
+        let paused = store_pieces(&PieceStore { drain: due, ..to }, &mut absorbed, &mut gated, vectors(2)).await;
+        assert!(matches!(paused, Stored::Paused));
+        assert_eq!(gated.stored.iter().flatten().count(), 1, "a take stores one piece before it may pause");
     }
 
     // ── Worker spawn returns a join handle usable for shutdown/panic detection ──
