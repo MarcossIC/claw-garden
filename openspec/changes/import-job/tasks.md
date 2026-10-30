@@ -98,13 +98,13 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 11. Verificación
 
-- [ ] `cargo clean --workspace --target-dir target-test` antes de probar esta versión (`.claude/CLAUDE.md`, «Build directories»); durante el ciclo de un commit el directorio se reusa.
-- [ ] `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings` en verde.
-- [ ] `cargo test --workspace --target-dir target-test` en verde (nunca se anota cuántas pruebas).
-- [ ] La medición de memoria de D10, una sola vez y nunca en paralelo con otra corrida de modelo real: `by_body` y `by_path`, una por proceso, con
+- [x] `cargo clean --workspace --target-dir target-test` antes de probar esta versión (`.claude/CLAUDE.md`, «Build directories»); durante el ciclo de un commit el directorio se reusa.
+- [x] `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings` en verde.
+- [x] `cargo test --workspace --target-dir target-test` en verde (nunca se anota cuántas pruebas).
+- [x] La medición de memoria de D10, una sola vez y nunca en paralelo con otra corrida de modelo real: `by_body` y `by_path`, una por proceso, con
   `cargo test -p clawg-cli --test import_memory --target-dir target-test -- --ignored --exact by_body --nocapture` y lo mismo con `by_path`; los números van a mano a `verify.md`.
 - [ ] El CI en verde en Linux y Windows.
-- [ ] Ningún directorio de build fuera de `target` y `target-test` al terminar.
+- [x] Ningún directorio de build fuera de `target` y `target-test` al terminar.
 
 ## 12. Archive
 
