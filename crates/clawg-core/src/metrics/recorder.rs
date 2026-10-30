@@ -6,7 +6,11 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use super::event::{DetailValue, Event, EventKind};
 use super::histogram::{Histogram, Unit};
+
+/// How many of the run's latest events `GET /v1/metrics` can show.
+pub const RUN_EVENTS_KEPT: usize = 100;
 
 /// A series: a metric name and its labels, written `k=v` sorted by key and
 /// joined by `,`, so one set of labels is one series whatever order the
@@ -96,6 +100,10 @@ struct State {
     minute: Window,
     run: BTreeMap<SeriesKey, Histogram>,
     latest: BTreeMap<SeriesKey, f64>,
+    /// The events the writer has not kept yet.
+    events: Vec<Event>,
+    /// The run's latest events, at most [`RUN_EVENTS_KEPT`].
+    run_events: std::collections::VecDeque<Event>,
 }
 
 /// The metrics of one run of the daemon. A plain mutex: a few dozen series
@@ -124,6 +132,30 @@ impl Recorder {
             }
         }
         state.latest.insert(key, value);
+    }
+
+    /// Records that `kind` happened now, with `detail`.
+    pub fn event(&self, kind: EventKind, detail: &[(&'static str, DetailValue)]) {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let event = Event { at_ms, kind, detail: detail.iter().copied().collect() };
+        let mut state = self.lock();
+        if state.run_events.len() == RUN_EVENTS_KEPT {
+            state.run_events.pop_front();
+        }
+        state.run_events.push_back(event.clone());
+        state.events.push(event);
+    }
+
+    /// The events not kept yet, leaving none.
+    pub fn take_events(&self) -> Vec<Event> {
+        std::mem::take(&mut self.lock().events)
+    }
+
+    /// The run's latest events, oldest first.
+    pub fn run_events(&self) -> Vec<Event> {
+        self.lock().run_events.iter().cloned().collect()
     }
 
     /// The minute so far, leaving it empty; the run keeps its histograms.
@@ -184,6 +216,24 @@ mod tests {
         assert_eq!(health.count(), 2, "the run keeps what the minute gave away");
         assert_eq!(r.take_minute().histograms.values().next().unwrap().count(), 1);
         assert_eq!(r.latest_gauges()[&SeriesKey::new("process.rss_bytes", &[])], 10.0);
+    }
+
+    #[test]
+    fn events_wait_for_the_writer_and_the_run_keeps_the_latest() {
+        let r = Recorder::default();
+        r.event(EventKind::Backup, &[("ms", 3u64.into())]);
+        r.event(EventKind::Import, &[]);
+        let taken = r.take_events();
+        assert_eq!(taken.iter().map(|e| e.kind).collect::<Vec<_>>(), [EventKind::Backup, EventKind::Import]);
+        assert!(taken[0].at_ms > 0);
+        assert!(r.take_events().is_empty(), "an event is kept once");
+
+        for _ in 0..RUN_EVENTS_KEPT {
+            r.event(EventKind::Maintenance, &[]);
+        }
+        let run = r.run_events();
+        assert_eq!(run.len(), RUN_EVENTS_KEPT);
+        assert!(run.iter().all(|e| e.kind == EventKind::Maintenance), "the oldest give way");
     }
 
     #[test]
