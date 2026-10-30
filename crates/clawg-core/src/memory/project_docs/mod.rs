@@ -302,6 +302,16 @@ pub struct DocHit {
     pub score: f64,
 }
 
+/// The passages of the doc at `path`, from its masked text, split as its
+/// kind is.
+pub(crate) fn passages(kind: DocKind, path: &str, masked: &str, splitter: &TokenSplitter) -> Vec<Passage> {
+    match kind {
+        DocKind::Markdown => chunk_markdown(path, masked, splitter),
+        DocKind::Manifest => chunk_manifest(path, masked, splitter),
+        DocKind::Code(lang) => chunk_code(path, masked, lang, splitter),
+    }
+}
+
 /// Reciprocal rank fusion of two ranked id lists: each list adds
 /// `1 / (RRF_K + rank)` to an id, rank from 1. Highest total first, ties by
 /// lower id, at most `limit`.
@@ -445,11 +455,7 @@ pub(crate) async fn refresh(
             continue;
         };
         let masked = redact(&text).text;
-        let passages = match kind {
-            DocKind::Markdown => chunk_markdown(path, &masked, splitter),
-            DocKind::Manifest => chunk_manifest(path, &masked, splitter),
-            DocKind::Code(lang) => chunk_code(path, &masked, lang, splitter),
-        };
+        let passages = passages(kind, path, &masked, splitter);
         // A new doc has nothing stored to reuse, so it does not ask.
         let kept = if indexed_before.contains(path.as_str()) {
             stored_vectors(store, project_id, path, &model_id).await?

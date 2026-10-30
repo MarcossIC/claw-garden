@@ -276,6 +276,8 @@ pub enum EvalError {
     RecreateFts(String),
     #[error("failed to read the store: {0}")]
     Read(String),
+    #[error("cannot split the doc {0}")]
+    Doc(String),
     #[error("failed to close the store: {0}")]
     Close(String),
     #[error("cannot measure over the snapshot: {0}")]
@@ -1296,6 +1298,16 @@ impl EvalDocIndex {
             .await
             .map_err(|e| EvalError::Search(e.to_string()))?;
         Ok(hits.into_iter().map(|h| EvalDocHit { path: h.path, breadcrumb: h.breadcrumb }).collect())
+    }
+
+    /// The breadcrumbs of the passages a refresh would make of the doc at
+    /// `path` under `root`, read, masked and split as it does, without
+    /// embedding or storing anything.
+    pub fn breadcrumbs(&self, root: &Path, path: &str) -> Result<Vec<String>, EvalError> {
+        let kind = project_docs::corpus::classify(path).ok_or_else(|| EvalError::Doc(format!("{path}: not a doc")))?;
+        let text = std::fs::read_to_string(root.join(path)).map_err(|e| EvalError::Doc(format!("{path}: {e}")))?;
+        let masked = crate::memory::redact::redact(&text).text;
+        Ok(project_docs::passages(kind, path, &masked, &self.splitter).into_iter().map(|p| p.breadcrumb).collect())
     }
 
     /// Closes the index's store as [`EvalStore::close`] does, so its
@@ -2511,6 +2523,30 @@ mod tests {
         assert_eq!(doc_paths(root.path()).unwrap(), ["README.md"]);
         assert!(is_code_path("src/lib.rs") && !is_code_path("README.md"));
         assert_eq!(hits[0], EvalDocHit { path: "README.md".into(), breadcrumb: "README.md > Guía > Uso".into() });
+    }
+
+    #[tokio::test]
+    async fn a_doc_index_names_a_docs_breadcrumbs_without_indexing_it() {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        std::fs::write(
+            root.path().join("README.md"),
+            "# Guía\n## Instalación\n### Windows\nUsá el instalador.\n## Uso\nArrancá el daemon.\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("notes.txt"), "not a doc").unwrap();
+
+        let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
+        let crumbs = index.breadcrumbs(root.path(), "README.md");
+        let not_a_doc = index.breadcrumbs(root.path(), "notes.txt");
+        let missing = index.breadcrumbs(root.path(), "gone.md");
+        let hits = index.search("daemon", 5).await.unwrap();
+        index.close().await.unwrap();
+
+        assert_eq!(crumbs.unwrap(), ["README.md > Guía > Instalación > Windows", "README.md > Guía > Uso"]);
+        assert!(matches!(not_a_doc, Err(EvalError::Doc(ref e)) if e.contains("notes.txt")), "{not_a_doc:?}");
+        assert!(matches!(missing, Err(EvalError::Doc(ref e)) if e.contains("gone.md")), "{missing:?}");
+        assert!(hits.is_empty(), "naming the breadcrumbs indexes nothing");
     }
 
     /// `FakeEmbedder`, except that a text holding `BROKEN` embeds to a

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clawg_core::eval_api::{doc_paths, is_code_path, EvalDocHit, EvalDocIndex, EvalDocReport, EvalEmbedder};
+use clawg_core::eval_api::{doc_paths, is_code_path, EvalDocHit, EvalDocIndex, EvalDocReport, EvalEmbedder, EvalError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -54,6 +54,8 @@ pub enum DocsGoldenError {
     MissingDoc { id: String, path: String },
     #[error("question '{id}' expects {path}, which quotes a question of the golden set")]
     ExpectedQuotes { id: String, path: String },
+    #[error("question '{id}' expects {path} > {heading}, which no passage of that doc ends in")]
+    MissingHeading { id: String, path: String, heading: String },
 }
 
 /// Parses a golden set and checks it on its own terms.
@@ -120,9 +122,51 @@ pub fn check_quotes(cases: &[DocsCase], left_out: &[String]) -> Result<(), DocsG
     Ok(())
 }
 
+/// Fails on an expected heading that no passage of its doc ends in. A heading
+/// renamed since, or one whose section holds only subsections, leaves the
+/// question no passage that can answer it and lowers the measurement in
+/// silence. `crumbs` holds, by path, the breadcrumbs of each doc expected
+/// under a heading.
+pub fn check_headings(cases: &[DocsCase], crumbs: &HashMap<String, Vec<String>>) -> Result<(), DocsGoldenError> {
+    for case in cases {
+        for expected in &case.expected {
+            let Some(heading) = &expected.heading else { continue };
+            let ends_in = |crumb: &String| leaf(crumb) == Some(heading.as_str());
+            if !crumbs.get(&expected.path).is_some_and(|c| c.iter().any(ends_in)) {
+                return Err(DocsGoldenError::MissingHeading {
+                    id: case.id.clone(),
+                    path: expected.path.clone(),
+                    heading: heading.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The breadcrumbs of every doc a case expects under a heading, as `index`
+/// splits it.
+fn expected_breadcrumbs(
+    index: &EvalDocIndex,
+    root: &Path,
+    cases: &[DocsCase],
+) -> Result<HashMap<String, Vec<String>>, EvalError> {
+    let mut crumbs = HashMap::new();
+    for expected in cases.iter().flat_map(|c| &c.expected).filter(|e| e.heading.is_some()) {
+        if !crumbs.contains_key(&expected.path) {
+            crumbs.insert(expected.path.clone(), index.breadcrumbs(root, &expected.path)?);
+        }
+    }
+    Ok(crumbs)
+}
+
+/// The heading a passage sits directly under: the last part of its breadcrumb.
+fn leaf(breadcrumb: &str) -> Option<&str> {
+    breadcrumb.rsplit(" > ").next()
+}
+
 pub fn matches(hit: &EvalDocHit, expected: &ExpectedDoc) -> bool {
-    hit.path == expected.path
-        && expected.heading.as_deref().map_or(true, |h| hit.breadcrumb.rsplit(" > ").next() == Some(h))
+    hit.path == expected.path && expected.heading.as_deref().map_or(true, |h| leaf(&hit.breadcrumb) == Some(h))
 }
 
 /// The rank, from 1, of the first hit that answers the question.
@@ -649,6 +693,19 @@ async fn measure_with(
     left_out: &[String],
     output: Output,
 ) -> i32 {
+    // Checked before indexing, which with the real model takes minutes.
+    let checked = match expected_breadcrumbs(index, &cli.docs_root, cases) {
+        Ok(crumbs) => check_headings(cases, &crumbs),
+        Err(e) => {
+            eprintln!("{e}");
+            return EXIT_RUNTIME_FAILURE;
+        }
+    };
+    if let Err(e) = checked {
+        eprintln!("docs golden set validation failed: {e}");
+        return EXIT_GOLDEN_INVALID;
+    }
+
     let started = Instant::now();
     let report = match index.index(&cli.docs_root, left_out).await {
         Ok(report) => report,
@@ -814,6 +871,24 @@ mod tests {
             other => panic!("expected ExpectedQuotes, got {other:?}"),
         }
         assert!(check_quotes(&cases, &["other.md".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn an_expected_heading_no_passage_ends_in_fails_validation() {
+        let cases = parse(
+            r#"[{"id": "q1", "question": "a?", "expected": [{"path": "a.md", "heading": "Uso"}, {"path": "src/b.rs"}]},
+                {"id": "q2", "question": "b?", "expected": [{"path": "a.md", "heading": "Uso"}, {"path": "a.md", "heading": "Guía"}]}]"#,
+        )
+        .unwrap();
+        let crumbs = HashMap::from([("a.md".to_string(), vec!["a.md > Guía > Uso".to_string()])]);
+
+        assert!(check_headings(&cases[..1], &crumbs).is_ok(), "an expected doc without a heading is not looked up");
+        match check_headings(&cases, &crumbs) {
+            Err(DocsGoldenError::MissingHeading { id, path, heading }) => {
+                assert_eq!((id.as_str(), path.as_str(), heading.as_str()), ("q2", "a.md", "Guía"))
+            }
+            other => panic!("expected MissingHeading, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1009,8 +1084,8 @@ mod tests {
         assert!(text.contains("  code  Hit@1 0.50  Hit@3 1.00  Hit@5 1.00  MRR@10 0.75  over 2 questions\n"), "{text}");
     }
 
-    #[test]
-    fn the_shipped_golden_set_names_docs_this_workspace_has() {
+    #[tokio::test]
+    async fn the_shipped_golden_set_names_docs_this_workspace_has() {
         let text = std::fs::read_to_string(crate::cli::default_docs_golden_path()).unwrap();
         let cases = parse(&text).unwrap();
         let root = crate::cli::default_docs_root();
@@ -1021,6 +1096,13 @@ mod tests {
             .filter_map(|p| std::fs::read_to_string(root.join(p)).ok().map(|t| (p.clone(), t)))
             .collect();
         check_quotes(&cases, &quoting_docs(&cases, &texts)).unwrap();
+
+        let store = crate::test_temp::temp_path("shipped-golden");
+        std::fs::create_dir_all(&store).unwrap();
+        let index = EvalDocIndex::open(&store, &EvalEmbedder::fake(), &store).await.unwrap();
+        let crumbs = expected_breadcrumbs(&index, &root, &cases);
+        index.close().await.unwrap();
+        check_headings(&cases, &crumbs.unwrap()).unwrap();
         assert_eq!(cases.len(), 15);
     }
 }

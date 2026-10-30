@@ -65,6 +65,25 @@ fn docs_mode_refuses_a_golden_set_naming_a_doc_the_root_lacks() {
 }
 
 #[test]
+fn docs_mode_refuses_an_expected_heading_no_passage_ends_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    project(&root);
+    let golden = dir.path().join("golden.json");
+    // `Proyecto` is a heading of README.md, but its section holds only
+    // subsections, so no passage ends in it.
+    std::fs::write(&golden, r#"[{"id": "q1", "question": "cómo se instala", "expected": [{"path": "README.md", "heading": "Proyecto"}]}]"#)
+        .unwrap();
+
+    let out = rag_eval_docs(&root, &golden);
+
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("q1") && stderr.contains("README.md > Proyecto"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("indexed"), "the golden set is refused before indexing");
+}
+
+#[test]
 fn docs_mode_leaves_out_a_doc_that_quotes_a_question() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("repo");

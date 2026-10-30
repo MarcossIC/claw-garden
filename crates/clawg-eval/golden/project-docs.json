@@ -26,7 +26,6 @@
     "id": "d05",
     "question": "which folder and port does each environment use, and can a debug binary reach the production data?",
     "expected": [
-      {"path": "AGENTS.md", "heading": "Data profiles"},
       {"path": ".claude/CLAUDE.md", "heading": "Data profiles"},
       {"path": ".gemini/GEMINI.md", "heading": "Data profiles"},
       {"path": "README.md", "heading": "Perfiles y datos"}
@@ -53,7 +52,7 @@
   {
     "id": "d09",
     "question": "si cierro el servidor mientras todavía procesa lo recibido, ¿se pierde algo?",
-    "expected": [{"path": "openspec/specs/storage/spec.md", "heading": "Ningún evento aceptado se pierde en un apagado ordenado"}]
+    "expected": [{"path": "openspec/specs/storage/spec.md", "heading": "Ningún save aceptado se pierde en un apagado ordenado"}]
   },
   {
     "id": "d10",
@@ -73,7 +72,7 @@
   {
     "id": "c03",
     "question": "¿qué guarda en disco lo que no alcanzó a procesarse al apagar, para retomarlo en el próximo arranque?",
-    "expected": [{"path": "crates/clawg-core/src/memory/spill.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/outbox.rs"}]
   },
   {
     "id": "c04",
