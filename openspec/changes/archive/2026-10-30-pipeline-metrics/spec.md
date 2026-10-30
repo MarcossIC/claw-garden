@@ -1,6 +1,6 @@
 # pipeline-metrics — Especificación
 
-Delta sobre [`specs/metrics`](../../specs/metrics/spec.md). Las series se registran en el `Recorder` de R2 de esa spec, se guardan por minuto en `metrics.db` (R3, R4) y se leen por `GET /v1/metrics` (R7) y `clawg metrics report` (R8) sin cambio en ninguno de ellos, salvo P9.
+Delta sobre [`specs/metrics`](../../../specs/metrics/spec.md). Las series se registran en el `Recorder` de R2 de esa spec, se guardan por minuto en `metrics.db` (R3, R4) y se leen por `GET /v1/metrics` (R7) y `clawg metrics report` (R8) sin cambio en ninguno de ellos, salvo P9.
 
 Toda etiqueta de este cambio MUST venir de un conjunto cerrado escrito en el código; ninguna MUST venir del texto de una memoria, de una consulta, de una ruta de fichero, de un id o de un `agent_id`. Ninguna serie cambia lo que el daemon hace ni lo que contesta.
 

@@ -59,4 +59,4 @@ El sobrecoste se mide como en 71: un `SELECT`-sin-SQL cada 10 s en la cola de la
 
 ## Datos y vuelta atrás
 
-`memory.db` no cambia: ni esquema, ni identificadores, ni estados, ni contrato de embedding. `metrics.db` sube a `user_version = 2` con una tabla nueva (`event`), aditiva. Un binario anterior rechaza un esquema más nuevo sin tocarlo y no escribe métricas hasta el próximo arranque (R3 de [`specs/metrics`](../../specs/metrics/spec.md)); sirve igual. Volver atrás es volver al binario anterior y, para que vuelva a escribir métricas, borrar `metrics.db`, que sólo pierde su historia. Los tramos 1 a 5 no tocan el esquema.
+`memory.db` no cambia: ni esquema, ni identificadores, ni estados, ni contrato de embedding. `metrics.db` sube a `user_version = 2` con una tabla nueva (`event`), aditiva. Un binario anterior rechaza un esquema más nuevo sin tocarlo y no escribe métricas hasta el próximo arranque (R3 de [`specs/metrics`](../../../specs/metrics/spec.md)); sirve igual. Volver atrás es volver al binario anterior y, para que vuelva a escribir métricas, borrar `metrics.db`, que sólo pierde su historia. Los tramos 1 a 5 no tocan el esquema.

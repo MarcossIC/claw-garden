@@ -1,0 +1,18 @@
+change: pipeline-metrics
+objective: "transversal"
+depends_on: [usage-metrics]
+phase: archived
+release: "0.67.0"
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done  # P1 a P9 son R10 a R18 de specs/metrics; P10 entra en R9
+  design: done
+  tasks: done
+  apply: done  # tramo 1 en el pull request #100, tramos 2 a 7 en el #101
+  verify: done  # verify.md: suite y clippy en Linux, CI en verde en Linux y Windows (#100, #101)
+  archive: done
+after_archive:  # fuera del cambio
+  - "el sobrecoste con el modelo real (p95 de http.duration{route=/v1/search} con y sin la sonda) pide autorización para el perfil dev con el modelo y un build sin la sonda, porque nada la apaga"
+updated: 2026-10-30
+main_spec: openspec/specs/metrics/spec.md

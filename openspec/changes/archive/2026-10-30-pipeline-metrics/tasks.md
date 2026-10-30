@@ -66,4 +66,4 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 - [x] P10 en `binary.rs`: `a_daemon_measures_its_pipeline_and_keeps_its_events`.
 - [x] `.claude/CLAUDE.md` con lo que quede.
 - [x] Verificación ([verify](verify.md)): suite y clippy en Linux; el CI en verde en Linux y Windows (pull requests #100 y #101). El sobrecoste con el modelo real no se midió: pide autorización para el perfil dev y un build sin la sonda.
-- [ ] Archive: `specs/metrics`; `git mv` a `changes/archive/`; `state.yaml`; fila 73 del `README.md` de openspec; subir el minor.
+- [x] Archive: `specs/metrics` (R10 a R18; R2, R3, R4, R7, R8 y R9); `git mv` a `changes/archive/`; `state.yaml`; fila 73 del `README.md` de openspec. El minor no sube: 0.67.0 no se publicó y ya trae el código.
