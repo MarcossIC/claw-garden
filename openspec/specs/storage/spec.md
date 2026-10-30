@@ -24,6 +24,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (sólo «Cada carga dice quién la pidió y cuánto costó», RF4 de esa spec). Las series de memoria con que se lee en uso real están en [`specs/metrics`](../metrics/spec.md) (R6 y R8).
 - [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 1, que sale en 0.65.0 (sólo V27, «Los proyectos y sus carpetas», y su vuelta atrás). Qué hace el registro con las tablas nuevas está en [`specs/project`](../project/spec.md) (PL1 a PL10). Su entrega 2a, en la misma versión: V28, «La lápida y el diario de las uniones», su vuelta atrás y el motivo `pre-merge`; qué hacen una unión y su deshacer está en `specs/project` (PL11 a PL20). Su entrega 2b, en la misma versión: V29, «La marca de borrado y su diario», su vuelta atrás y el motivo `pre-delete`; qué hacen borrar un proyecto y su deshacer está en `specs/project` (PL21 a PL31). Su entrega 3b, en la misma versión: V30, «Las subcarpetas declaradas», y su vuelta atrás; qué hacen las declaraciones está en `specs/project` (PL43 a PL52). Su entrega 4, en la misma versión: V31, «El diario del registro de un import», y su vuelta atrás; qué anota un import y qué retira su `--undo` está en `specs/project` (PL53 a PL65).
 - [ram-footprint-gates](../../changes/archive/2026-10-29-ram-footprint-gates/proposal.md), archivado el 2026-10-29, que sale en 0.67.0 (RM1 a RM4: la vista de sólo lectura del ONNX en la carga, la carga y la reparación que no se pisan, el pico privado de cada carga en Windows y el contrato de embedding fijado por un test). Lo que el refresco de docs reutiliza está en [`specs/project-docs`](../project-docs/spec.md) (RM5).
+- [import-job](../../changes/archive/2026-10-30-import-job/proposal.md), archivado el 2026-10-30, que sale en 0.68.0 (sólo IJ18: el apagado con un trabajo de importación activo, que cambia «Cada fase del apagado tiene tope»). Qué es un trabajo de importación está en [`specs/portability`](../portability/spec.md) (IJ1 a IJ11).
 
 ## Definiciones
 
@@ -251,11 +252,12 @@ En Unix el daemon MUST tratar SIGTERM como Ctrl-C (`shutdown_signal` y `terminat
 
 ### Cada fase del apagado tiene tope
 
-Un apagado ordenado tiene cuatro fases, y cada una MUST tener su tope en el código que la espera:
+Un apagado ordenado tiene cuatro fases, más una con un trabajo de importación activo, y cada una MUST tener su tope en el código que la espera:
 
 | Fase | Tope | Dónde | Al vencer |
 |---|---|---|---|
 | Las peticiones en vuelo | `HTTP_GRACE`, 3 s después de la señal | `within_grace`, `serve.rs` | el servidor se abandona y se registra un warn |
+| Un trabajo de importación activo | `HTTP_GRACE`, dentro de la misma ventana que las peticiones | el registro de trabajos (`ImportJobs`, `crates/clawg-cli/src/daemon/imports.rs`) | la tarea se aborta y el trabajo queda `interrupted` (IJ18, abajo) |
 | El drenaje | `DRAIN_DEADLINE`, 10 s | el worker de ingest | lo no empezado queda en el outbox |
 | El save en curso, el flush de accesos, el fin del mantenimiento y el checkpoint | `AFTER_DRAIN`, 7 s después del plazo de drenaje (`crates/clawg-core/src/runtime.rs`) | `shutdown_by` | se aborta el mantenimiento, se registra un warn y no se hace el checkpoint: el save en curso queda en su fila y el WAL se repite al abrir |
 | Las tareas bloqueantes que el proceso espera, una carga del modelo incluida | `RUNTIME_TEARDOWN`, 2 s | `shutdown_timeout` en `main.rs`, sólo para `clawg serve` | se abandonan y el proceso sale |
@@ -278,6 +280,29 @@ En operación normal, sin señal, ninguna petición tiene tope por esto: un back
 - THEN sale con 0 y el proceso del daemon terminó
 
 **Tests:** `a_server_that_does_not_finish_is_left_after_the_grace`, `a_server_that_finishes_in_time_gives_its_result` y `without_a_shutdown_the_server_has_no_deadline` (`serve.rs`, tiempo pausado); `shutdown_gives_up_on_a_worker_that_never_ends` (`crates/clawg-core/tests/shutdown.rs`, tiempo pausado); `stop_ends_a_daemon_whose_model_load_never_returns` (`binary.rs`, con `CLAWG_TEST_EMBEDDER=blocked`, cuya carga no vuelve).
+
+### IJ18. El apagado con un trabajo de importación activo
+
+Con un trabajo activo, el apagado MUST levantar la señal con causa apagado en el momento en que se observa la orden de parar (`crates/clawg-cli/src/daemon/serve.rs`, que cierra el registro con `close`) y MUST esperar al trabajo junto a los servidores, dentro de la misma ventana de `HTTP_GRACE` que `within_grace` cuenta desde esa orden (el trabajo es el tercer futuro de su `try_join!`, por `ImportJobs::settled`). Si la ventana se agota con el trabajo vivo, el registro MUST abortar su tarea y marcarlo `interrupted` con `abandoned: true` y `stopped_in` en el paso que corría: `interrupted` no afirma que nada se confirmó, dice que el proceso se fue antes de que el trabajo informara su final, y `abandoned` nombra que la llamada que ese paso ya había mandado puede haberse confirmado después (`memory_import` es el registro); una línea de log lo dice. Un trabajo parado por el apagado antes de la gracia (la señal con causa apagado, sin aborto) termina `interrupted` sin `abandoned`. Después siguen, sin cambios, `store_probe.abort`, `writer.close`, `runtime.shutdown` y `runtime.close`; abandonado el trabajo, MUST NOT mandarse nada más a la conexión, y la llamada que el trabajo ya mandó (un lote de escritura confirma notas enteras) termina antes del drenaje y del cierre. La suma `HTTP_GRACE + METRICS_CLOSE + DRAIN_DEADLINE + AFTER_DRAIN + RUNTIME_TEARDOWN` MUST NOT ganar ningún término (`crates/clawg-cli/src/stop.rs`). Como `serve::run` no corre en pruebas, parar, esperar y abandonar MUST ser funciones del registro de trabajos, probadas sin él.
+
+#### Escenario: el lote de embedding que no vuelve
+- GIVEN un trabajo en `embedding` cuyo lote no vuelve y el tiempo pausado
+- WHEN llega la orden de apagado
+- THEN el trabajo queda `interrupted` dentro de `HTTP_GRACE`, sin filas nuevas ni snapshot
+
+#### Escenario: el aborto se nombra
+- GIVEN un trabajo en `embedding` cuyo lote no vuelve y una gracia que vence
+- WHEN el registro lo abandona
+- THEN su vista es `interrupted` con `abandoned: true` y `stopped_in: embed`
+
+#### Escenario: el apagado en writing
+- GIVEN un trabajo en `writing` con varias notas
+- WHEN llega la orden de apagado
+- THEN queda `interrupted` con notas enteras, `finished_at` nulo, y tras abandonarlo no se manda nada a la conexión
+
+**Tests:** `shutdown_stops_a_job_in_embedding_within_the_grace`, `shutdown_stops_a_job_in_writing_between_whole_notes` y `an_abandoned_job_sends_nothing_to_the_connection` (en `mod tests` de `crates/clawg-cli/src/daemon/api.rs`, que arma un `AppCtx`; la segunda con tiempo real y la tercera con tiempo pausado, porque con el reloj pausado `HTTP_GRACE` vence mientras el lote está en el hilo de la conexión), más `an_abandoned_job_is_interrupted_and_named` (unidad del registro, `crates/clawg-cli/src/daemon/imports.rs`: `abandon` deja `abandoned: true` y el paso) y `a_finish_after_abandon_changes_nothing`. **Guarda:** `every_phase_of_a_shutdown_fits_inside_the_stop_timeout` (`crates/clawg-cli/src/stop.rs`) sigue verde sin cambios. Los embedders `stalled` y `blocked` no sirven para esta prueba: nunca llenan la celda del modelo y una importación real sin modelo es `503` antes del `202`; el embedder de prueba del registro es uno que retiene el lote.
+
+**Riesgo señalado:** abortar durante `snapshot` o `linking` marca `interrupted` un trabajo cuya última llamada igual puede confirmarse antes del cierre (el `links` es una transacción); el estado queda en el proceso que muere, y lo que vale es `memory_import`.
 
 ### Las fases caben en `STOP_TIMEOUT`
 

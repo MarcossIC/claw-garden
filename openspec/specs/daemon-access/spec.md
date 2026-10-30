@@ -7,6 +7,7 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 - [local-isolation](../../changes/archive/2026-10-19-local-isolation/proposal.md), archivado el 2026-10-19: agrega R6 y cambia el `Límite` y R5.
 - [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20: agrega R7 a R9 (el socket del directorio de datos, TCP a su lado y el cliente) y cambia el `Límite` y R3. Por qué el chequeo de uid además del directorio, la marca en `daemon.json` en lugar de la ruta y TCP no fatal sin `--port`, en su [diseño](../../changes/archive/2026-10-20-local-transport/design.md); la medición con dos cuentas, en su [verify](../../changes/archive/2026-10-20-local-transport/verify.md). Por qué el directorio y no cada archivo, sin `umask`, y por qué no poder apretar no detiene a clawg, en su [diseño](../../changes/archive/2026-10-19-local-isolation/design.md); la medición con dos cuentas, `memory.lock` incluido, en su [verify](../../changes/archive/2026-10-19-local-isolation/verify.md).
 - [windows-socket](../../changes/archive/2026-10-20-windows-socket/proposal.md), archivado el 2026-10-20: lleva R7 a R9 a Windows con AF_UNIX nativo y agrega R10 a R13 (el ACL del archivo del socket, sin AF_UNIX, la barra de rendimiento y la segunda cuenta). Por qué AF_UNIX y no la named pipe, socket2 con un hilo de `accept` y un conector propio de hyper en el cliente, en su [diseño](../../changes/archive/2026-10-20-windows-socket/design.md) y su [exploración](../../changes/archive/2026-10-20-windows-socket/exploration.md); la barra medida y lo que corrió el CI, en su [verify](../../changes/archive/2026-10-20-windows-socket/verify.md).
+- [import-job](../../changes/archive/2026-10-30-import-job/proposal.md), archivado el 2026-10-30, que sale en 0.68.0: agrega IJ12 a IJ14 (el bloque `import` de `/health`, las rutas de trabajos en `PROJECT_INPUTS` y detrás del guardia y el token). Qué hace un trabajo de importación está en [`specs/portability`](../portability/spec.md) (IJ1 a IJ11 e IJ15 a IJ17).
 
 ## Definiciones
 
@@ -229,3 +230,31 @@ Con una segunda cuenta local estándar y el daemon real, conectar al socket MUST
 - THEN recibe 10013 la primera y acceso denegado las otras dos
 
 **Verificación:** manual; el CI no tiene dos cuentas. No se corrió al archivar: lo que está probado es el mecanismo (R10). Los pasos, en el [verify](../../changes/archive/2026-10-20-windows-socket/verify.md).
+
+## IJ12. `/health` gana un bloque `import`, de memoria
+
+`GET /health` MUST llevar, mientras haya un trabajo activo, un bloque `import` con su id, su fase y sus contadores, sacado de la memoria del proceso sin mandar ninguna llamada a la conexión del store. Sin trabajo activo MUST estar ausente. El campo es aditivo: el cliente lee `Health` sin rechazar campos que no conoce (`Health`, `crates/clawg-cli/src/client.rs`). Que `status: ok` se diga con la conexión ocupada por un lote queda fuera de este requisito, y MUST NOT cambiar con él.
+
+#### Escenario: la conexión ocupada
+- GIVEN un trabajo activo y la conexión del store ocupada por otra llamada
+- WHEN se pide `/health`
+- THEN contesta dentro de `HEALTH_INGEST_WAIT` con el bloque `import` y sin `ingest`
+
+**Tests:** `health_carries_the_active_jobs_import_block_without_the_connection` y `health_has_no_import_block_without_an_active_job` (`crates/clawg-cli/tests/api.rs`); `a_client_reads_a_health_with_an_import_block` (`crates/clawg-cli/src/client.rs`).
+
+## IJ13. `PROJECT_INPUTS` clasifica las rutas nuevas y los recorridos cubren `POST /imports`
+
+`PROJECT_INPUTS` (`crates/clawg-cli/tests/api.rs`) MUST ganar `("POST", "/imports", Some("body.project_map[].project"))`, `("GET", "/imports/{id}", None)` y `("DELETE", "/imports/{id}", None)`; sin ellas `every_route_says_which_project_it_takes` falla. Los dos recorridos de campos MUST ganar su brazo para `POST /imports`, porque panican con un campo que no comprueban: `every_route_that_takes_a_project_follows_a_merge`: tras una fusión el trabajo termina y la fila queda en el proyecto vivo; `every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule`: con un proyecto borrado es `409 project_deleted` antes del `202`, en seco y real.
+
+#### Escenario: un `project_map` a un proyecto fusionado o borrado
+- GIVEN un `project_map` con `{"project"}` que nombra un proyecto fusionado, y otro que nombra uno borrado
+- WHEN se manda `POST /v1/imports`
+- THEN el primero termina `done` con las filas en el proyecto vivo; el segundo es `409 project_deleted` sin trabajo
+
+**Tests:** las tres filas y los dos brazos en `crates/clawg-cli/tests/api.rs`: sin una fila, `router()` y la tabla nombran rutas distintas, y sin un brazo el recorrido panica.
+
+## IJ14. El router de trabajos
+
+Las rutas `POST /v1/imports`, `GET /v1/imports/{id}` y `DELETE /v1/imports/{id}` MUST estar detrás del guardia y del token como todo `/v1`, y se miden como cualquier ruta por su plantilla.
+
+**Test:** `the_job_routes_require_the_guard_and_the_token` (`crates/clawg-cli/tests/api.rs`, con `Host` ajeno y sin token).
