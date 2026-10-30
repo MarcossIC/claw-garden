@@ -864,6 +864,39 @@ async fn gate_pieces(
     Gated { stored, contexts, survivors, noted }
 }
 
+/// Embeds the pieces the gate left, each behind the head its position takes,
+/// in one inference call for the whole save. Passage: a stored piece is the
+/// thing being searched THROUGH. Each vector feeds both the insert and the
+/// contradiction KNN probe with no second inference call, so both sides of
+/// `contradiction.rs`'s comparison live in the same Passage space
+/// `CONTRADICTION_THRESHOLD` was tuned against.
+async fn embed_pieces(
+    embedder: &dyn Embedder,
+    survivors: &[(usize, PendingChunk)],
+    head: Option<&str>,
+) -> Result<Vec<Vec<f32>>, IngestFailure> {
+    let texts: Vec<String> = survivors
+        .iter()
+        .map(|(position, p)| embedding_text(head_for(head, *position), &p.chunk.text).into_owned())
+        .collect();
+    let vectors = match embedder.embed_batch(&texts, EmbedRole::Passage).await {
+        Ok(v) => v,
+        Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => return Err(IngestFailure::EmbedderUnavailable),
+        Err(e) => return Err(IngestFailure::Failed(format!("embed failed: {e}"))),
+    };
+    if vectors.len() != survivors.len() {
+        // Zipping a short reply would pair chunks with other chunks'
+        // vectors and store the mismatch as fact. Dropping the event is
+        // recoverable; a silently mislabeled memory is not.
+        return Err(IngestFailure::Failed(format!(
+            "embedder returned {} vectors for {} chunks",
+            vectors.len(),
+            survivors.len()
+        )));
+    }
+    Ok(vectors)
+}
+
 /// Stores the pieces of `evt` and returns its report with the pieces to link,
 /// in order, each with the head its vector was embedded behind.
 async fn ingest_pieces(
@@ -877,11 +910,6 @@ async fn ingest_pieces(
     earlier: &[i64],
     drain: DrainWatch<'_>,
 ) -> (IngestReport, Vec<StoredPiece>) {
-    // Masked before anything else reads the text, so the chunker, the dedup
-    // hash, the embedding, the full-text index and the stored row all see the
-    // same masked content, and the secret reaches none of them. An event from
-    // the outbox was masked before it was recorded, and this pass finds
-    // nothing more.
     let (redacted, split) = split_event(evt, chat_chunker);
     let Some(SaveSplit { pieces: chunks, head }) = split else {
         return (IngestReport { redacted, ..Default::default() }, Vec::new());
@@ -926,34 +954,10 @@ async fn ingest_pieces(
         return (report(&stored, None), pieces(&stored, &contexts));
     }
 
-    // Stage 2 — one inference call for the whole event. Passage: a stored
-    // chunk is the thing being searched THROUGH. Each vector produced here
-    // feeds BOTH consumers below — insert and the contradiction KNN probe —
-    // with no second inference call, so both sides of `contradiction.rs`'s
-    // comparison live in the same Passage space `CONTRADICTION_THRESHOLD`
-    // was tuned against.
-    let texts: Vec<String> =
-        survivors.iter().map(|(position, p)| embedding_text(context(*position), &p.chunk.text).into_owned()).collect();
-    let vectors = match embedder.embed_batch(&texts, EmbedRole::Passage).await {
-        Ok(v) => v,
-        Err(EmbedError::NotReady) | Err(EmbedError::WorkerGone) => {
-            return (report(&stored, Some(IngestFailure::EmbedderUnavailable)), Vec::new());
-        }
-        Err(e) => {
-            return (report(&stored, Some(IngestFailure::Failed(format!("embed failed: {e}")))), Vec::new());
-        }
+    let vectors = match embed_pieces(embedder.as_ref(), &survivors, head).await {
+        Ok(vectors) => vectors,
+        Err(failure) => return (report(&stored, Some(failure)), Vec::new()),
     };
-    if vectors.len() != survivors.len() {
-        // Zipping a short reply would pair chunks with other chunks'
-        // vectors and store the mismatch as fact. Dropping the event is
-        // recoverable; a silently mislabeled memory is not.
-        let failure = IngestFailure::Failed(format!(
-            "embedder returned {} vectors for {} chunks",
-            vectors.len(),
-            survivors.len()
-        ));
-        return (report(&stored, Some(failure)), Vec::new());
-    }
 
     // Stage 3 — sequential, one chunk at a time: chunk N's contradiction
     // probe is a KNN search over rows already in the store, so chunk N-1 of
@@ -1188,6 +1192,53 @@ mod tests {
         assert_eq!(gated.contexts[1], "head", "a resumed piece keeps the head it was embedded behind");
         assert!(gated.survivors.is_empty());
         assert_eq!(gated.noted.len(), 2, "the progress so far, and the piece the gate absorbed now");
+    }
+
+    #[tokio::test]
+    async fn the_embed_puts_the_head_before_every_piece_but_the_first_and_names_its_failure() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = RecordingEmbedder { calls: calls.clone() };
+        let pending = |text: &str| PendingChunk {
+            chunk: Chunk { text: text.to_string() },
+            content_hash: crate::memory::dedup::content_hash(text),
+            multiplicity: 1,
+        };
+        let survivors = vec![(0, pending("first")), (2, pending("third"))];
+
+        let vectors = embed_pieces(&recording, &survivors, Some("HEAD")).await.unwrap();
+        assert_eq!(vectors.len(), 2);
+        let texts: Vec<String> = calls.lock().unwrap().iter().map(|(role, text)| {
+            assert_eq!(*role, EmbedRole::Passage);
+            text.clone()
+        }).collect();
+        assert_eq!(texts[0], "first");
+        assert_eq!(texts[1], embedding_text("HEAD", "third").into_owned());
+
+        struct Answering(Result<usize, EmbedError>);
+        #[async_trait::async_trait]
+        impl Embedder for Answering {
+            async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+                unreachable!()
+            }
+            async fn embed_batch(&self, _texts: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+                match &self.0 {
+                    Ok(n) => Ok(vec![vec![0.1; 384]; *n]),
+                    Err(EmbedError::NotReady) => Err(EmbedError::NotReady),
+                    Err(_) => Err(EmbedError::WorkerGone),
+                }
+            }
+            fn dimensions(&self) -> usize { 384 }
+            fn model_id(&self) -> &str { "answering" }
+            fn query_prefix(&self) -> &str { "" }
+            fn passage_prefix(&self) -> &str { "" }
+        }
+        for (answer, failure) in [
+            (Err(EmbedError::NotReady), IngestFailure::EmbedderUnavailable),
+            (Err(EmbedError::WorkerGone), IngestFailure::EmbedderUnavailable),
+            (Ok(1), IngestFailure::Failed("embedder returned 1 vectors for 2 chunks".into())),
+        ] {
+            assert_eq!(embed_pieces(&Answering(answer), &survivors, None).await.unwrap_err(), failure);
+        }
     }
 
     // ── Worker spawn returns a join handle usable for shutdown/panic detection ──
