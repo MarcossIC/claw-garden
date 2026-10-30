@@ -1457,19 +1457,21 @@ old
         assert_eq!((retried.indexed, retried.reused), (1, 2), "the next refresh picks the doc up again");
     }
 
-    /// Needs the real model: `CLAWG_E5_MODEL_DIR` is the directory that holds
-    /// it, `<data dir>/models/multilingual-e5-small`. Run by hand with
+    /// Needs the real model, already cached and verified: `CLAWG_E5_MODEL_DIR`
+    /// is the directory that holds it, `<data dir>/models/multilingual-e5-small`.
+    /// It only reads that directory and never downloads or repairs anything.
+    /// Run by hand with
     /// `cargo test -p clawg-core --lib --target-dir target-test project_docs -- --ignored`.
     #[tokio::test]
-    #[ignore = "needs the real model in CLAWG_E5_MODEL_DIR (<data dir>/models/multilingual-e5-small)"]
+    #[ignore = "needs the real model cached in CLAWG_E5_MODEL_DIR (<data dir>/models/multilingual-e5-small); only reads it"]
     async fn a_partly_reused_doc_matches_a_full_reindex_within_tolerance() {
         let model_dir = PathBuf::from(
             std::env::var_os("CLAWG_E5_MODEL_DIR").expect("CLAWG_E5_MODEL_DIR is not set: this test needs the real model"),
         );
         let base = model_dir.parent().and_then(Path::parent).expect("a model directory two levels under the data dir");
-        let files = crate::memory::model_download::ensure_model(base, None, &crate::memory::model_download::CacheLock::new())
+        let files = crate::memory::model_download::load_cached_model(base, &crate::memory::model_download::CacheLock::new())
             .await
-            .expect("the model is cached");
+            .expect("the model is not cached or does not verify in CLAWG_E5_MODEL_DIR; this test never downloads it");
         let tokenizer = crate::memory::model_download::parse_verified_tokenizer(&files.tokenizer.tokenizer_file).unwrap();
         let embedder =
             crate::memory::embedder::E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer).unwrap();
