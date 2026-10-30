@@ -52,7 +52,9 @@ use crate::memory::subfolder::declared_in;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
 use crate::memory::portability::control::{ImportControl, StopCause};
-use crate::memory::portability::format::{parse, ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
+#[cfg(test)]
+use crate::memory::portability::format::parse;
+use crate::memory::portability::format::{ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
 use crate::memory::portability::timing::{ImportTimings, Step, Timing};
 use crate::memory::portability::translate::{
     translate, ForeignReport, LeftOut, MappedProject, MergedNote, NoteRows, TakenKey, TakenProject, TranslateOptions,
@@ -2055,6 +2057,7 @@ fn write_links<S: Seat>(seat: &mut S, prepared: &Prepared, ledger: &mut Ledger) 
 /// Reads `text` and imports it into `store`, writing the `pre-import`
 /// snapshot into `backups` first, each step logged in `timings` as it ends.
 /// A dry run writes nothing and needs no embedder.
+#[cfg(test)]
 pub async fn import(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
@@ -2071,6 +2074,7 @@ pub async fn import(
 }
 
 /// The report of an import nobody can stop.
+#[cfg(test)]
 fn finished(imported: Imported) -> Result<ImportReport, ImportError> {
     match imported {
         Imported::Done(report) => Ok(report),
@@ -2140,8 +2144,10 @@ fn stopped_after(control: &ImportControl, step: Step) -> Result<(), Cut> {
     control.cause().map_or(Ok(()), |cause| Err(Cut::Stopped(step, cause)))
 }
 
-/// [`import`] and [`import_foreign`] over an input that is parsed already,
+/// Imports an input that is parsed already, writing the `pre-import`
+/// snapshot into `backups` first, each step logged in `timings` as it ends,
 /// with `control` showing where it is as it runs and asking it to stop.
+/// A dry run writes nothing and needs no embedder.
 pub async fn import_parsed(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
@@ -2221,6 +2227,7 @@ async fn prepare_parsed(
 /// text would store, under the agent of `options` or [`MIGRATED_AGENT`], in
 /// the project a registration gives the root `options.project_map` names for
 /// its project, or in none.
+#[cfg(test)]
 pub async fn import_foreign(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,

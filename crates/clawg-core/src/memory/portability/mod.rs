@@ -16,7 +16,7 @@ pub mod undo;
 pub use control::{Counters, ImportControl, Progress, StopCause};
 pub use export::{export, Export, ExportError, ExportFilter};
 pub use import::{
-    import, import_foreign, import_parsed, map_project, ImportError, ImportInput, ImportOptions, ImportReport, Imported, ImportedProject,
+    import_parsed, map_project, ImportError, ImportInput, ImportOptions, ImportReport, Imported, ImportedProject,
     ImportedSubfolder, ImportedSuggestion, MapProject, MapTarget, Stopped, MAX_IMPORT_BYTES,
 };
 pub use projects::By;

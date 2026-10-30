@@ -44,7 +44,8 @@ use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::language::count_saves_in;
 use clawg_core::memory::portability::timing::{Step, Timing};
 use clawg_core::memory::portability::{
-    self, ImportError, ImportOptions, ImportReport, ImportTimings, MapProject, MapTarget, UndoError, UndoReport, MAX_IMPORT_BYTES,
+    self, ImportControl, ImportError, ImportInput, ImportOptions, ImportReport, ImportTimings, Imported, MapProject, MapTarget, UndoError,
+    UndoReport, MAX_IMPORT_BYTES,
 };
 use clawg_core::memory::identity::{Disk, Ground, ProjectIdentity};
 use clawg_core::memory::project::{register_project, RegisterError, RegisterOutcome, Registration};
@@ -2023,74 +2024,145 @@ fn import_error(e: ImportError) -> ApiError {
     }
 }
 
-/// Imports an export. The file is read before the embedder is asked for, so
-/// a file this binary cannot read is a 400 even while the model loads, and a
-/// dry run needs no model at all. Another tool's export is split by the
-/// model's tokenizer as a save of each note's text, so without it nothing is
-/// imported, not even a dry run: cut by bytes, the pieces would be others.
-async fn import_memories(
-    State(app): State<Arc<AppCtx>>,
-    Json(mut body): Json<ImportRequest>,
-) -> ApiResult<Json<ImportReport>> {
-    let mut timings = ImportTimings::new(body.dry_run).with_memory(super::process::private_bytes);
-    let read = Instant::now();
-    if body.text.len() > MAX_IMPORT_BYTES {
-        return Err(ApiError::bad_request(format!(
-            "the file is {} bytes; at most {MAX_IMPORT_BYTES} are imported",
-            body.text.len()
-        )));
+/// What `POST /v1/import` takes of the request besides the export itself.
+struct ImportFields {
+    from: Option<String>,
+    dry_run: bool,
+    agent: Option<String>,
+    map_roots: Vec<(String, MapTarget)>,
+    project_map: Vec<(String, MapTarget)>,
+}
+
+/// The tool an export comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Clawg,
+    Engram,
+}
+
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Source::Clawg => "clawg",
+            Source::Engram => "engram",
+        }
     }
-    let agent = match body.agent.as_deref().map(str::trim) {
+}
+
+/// The fields of an import request once checked: where the export comes from
+/// and what to do with it.
+struct Asked {
+    source: Source,
+    options: ImportOptions,
+}
+
+fn too_large(len: usize) -> ApiError {
+    ApiError::bad_request(format!("the file is {len} bytes; at most {MAX_IMPORT_BYTES} are imported"))
+}
+
+/// Everything about an import request that needs neither the export nor the
+/// embedder: the agent, the maps, and the source they go with.
+async fn checked_fields(app: &AppCtx, fields: ImportFields) -> ApiResult<Asked> {
+    let ImportFields { from, dry_run, agent, map_roots, project_map } = fields;
+    let agent = match agent.as_deref().map(str::trim) {
         Some("") => return Err(ApiError::bad_request("agent must not be blank")),
         agent => agent.map(str::to_string),
     };
-    if body.map_roots.iter().any(|(_, target)| target.root().is_none()) {
+    if map_roots.iter().any(|(_, target)| target.root().is_none()) {
         return Err(ApiError::bad_request("map_roots maps a root to a root; a project of the file goes by its remote, id or name"));
     }
-    let project_map = resolve_map(&app, std::mem::take(&mut body.project_map)).await?;
-    let foreign = match body.from.as_deref() {
+    let project_map = resolve_map(app, project_map).await?;
+    let source = match from.as_deref() {
         None | Some("clawg") => {
             if !project_map.is_empty() {
                 return Err(ApiError::bad_request(
                     "project_map maps the projects of another tool's export; name the tool in from",
                 ));
             }
-            portability::format::parse(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
-            None
+            Source::Clawg
         }
         Some("engram") => {
-            if !body.map_roots.is_empty() {
+            if !map_roots.is_empty() {
                 return Err(ApiError::bad_request(
                     "map_roots maps the roots of a clawg export; another tool's projects take project_map",
                 ));
             }
-            let export = portability::engram::read(&body.text).map_err(|e| ApiError::bad_request(e.to_string()))?;
-            if app.runtime.tokenizer.get().is_none() {
-                return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "tokenizer_not_ready"));
-            }
-            Some(export)
+            Source::Engram
         }
         Some(other) => return Err(ApiError::bad_request(format!("unknown source {other:?}; expected clawg or engram"))),
     };
+    Ok(Asked { source, options: ImportOptions { dry_run, agent, map_roots, project_map } })
+}
+
+/// The export `text` as `source` writes it, parsed once.
+fn parse_input(source: Source, text: &str) -> ApiResult<ImportInput> {
+    match source {
+        Source::Clawg => {
+            let (_, parsed) = portability::format::parse(text).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            Ok(ImportInput::Clawg(parsed))
+        }
+        Source::Engram => {
+            portability::engram::read(text).map(ImportInput::Foreign).map_err(|e| ApiError::bad_request(e.to_string()))
+        }
+    }
+}
+
+/// Another tool's export is split by the model's tokenizer as a save of each
+/// note's text, so without it nothing is imported, not even a dry run: cut by
+/// bytes, the pieces would be others.
+fn tokenizer_for(app: &AppCtx, input: &ImportInput) -> ApiResult<()> {
+    if matches!(input, ImportInput::Foreign(_)) && app.runtime.tokenizer.get().is_none() {
+        return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "tokenizer_not_ready"));
+    }
+    Ok(())
+}
+
+/// The embedder a real import writes with; a dry run needs none.
+fn embedder_for(app: &AppCtx, dry_run: bool) -> ApiResult<Option<Arc<dyn Embedder>>> {
+    if dry_run {
+        return Ok(None);
+    }
+    ready_embedder(app).map(Some)
+}
+
+/// Imports an export. The file is read before the embedder is asked for, so
+/// a file this binary cannot read is a 400 even while the model loads, and a
+/// dry run needs no model at all.
+async fn import_memories(
+    State(app): State<Arc<AppCtx>>,
+    Json(body): Json<ImportRequest>,
+) -> ApiResult<Json<ImportReport>> {
+    let ImportRequest { text, from, dry_run, agent, map_roots, project_map } = body;
+    let mut timings = ImportTimings::new(dry_run).with_memory(super::process::private_bytes);
+    let read = Instant::now();
+    if text.len() > MAX_IMPORT_BYTES {
+        return Err(too_large(text.len()));
+    }
+    let Asked { source, options } = checked_fields(&app, ImportFields { from, dry_run, agent, map_roots, project_map }).await?;
+    let input = parse_input(source, &text)?;
+    tokenizer_for(&app, &input)?;
     timings.record(Timing { elapsed: read.elapsed(), ..Timing::new(Step::Read) });
-    let embedder = if body.dry_run { None } else { Some(ready_embedder(&app)?) };
-    let options =
-        ImportOptions { dry_run: body.dry_run, agent, map_roots: body.map_roots, project_map };
+    let embedder = embedder_for(&app, dry_run)?;
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let store = &app.runtime.store;
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
-    let source = if foreign.is_some() { "engram" } else { "clawg" };
-    let imported = match foreign {
-        None => portability::import(store, embedder.as_deref(), chunker, &backups, &body.text, &options, Arc::new(Disk), &mut timings).await,
-        Some(export) => {
-            portability::import_foreign(store, embedder.as_deref(), chunker, &backups, export, &options, Arc::new(Disk), &mut timings).await
-        }
-    };
+    let imported = portability::import_parsed(
+        store,
+        embedder.as_deref(),
+        chunker,
+        &backups,
+        input,
+        &options,
+        Arc::new(Disk),
+        &mut timings,
+        &ImportControl::default(),
+    )
+    .await;
     match imported {
-        Ok(report) => {
+        Ok(Imported::Done(report)) => {
             timings.finish();
             let detail = [
-                ("source", source.into()),
+                ("source", source.name().into()),
                 ("dry_run", report.dry_run.into()),
                 ("ms", micros(read.elapsed()).div_ceil(1_000).into()),
                 ("rows", report.rows.into()),
@@ -2100,6 +2172,8 @@ async fn import_memories(
             app.runtime.metrics.event(EventKind::Import, &detail);
             Ok(Json(report))
         }
+        // Nothing here holds the control, so nothing can raise a stop.
+        Ok(Imported::Stopped(_)) => Err(ApiError::internal("the import was stopped")),
         Err(e) => Err(import_error(e)),
     }
 }
@@ -2889,6 +2963,36 @@ mod tests {
         let root = std::path::Path::new("/work/other");
         assert!(not_accepted(root, Profile::Prod).contains("`clawg projects add \"/work/other\"`"));
         assert!(not_accepted(root, Profile::Dev).contains("`clawg projects add \"/work/other\" --profile dev`"));
+    }
+
+    #[test]
+    fn too_large_names_the_size_and_the_limit() {
+        let refused = too_large(MAX_IMPORT_BYTES + 1);
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused.message, format!("the file is {} bytes; at most {MAX_IMPORT_BYTES} are imported", MAX_IMPORT_BYTES + 1));
+    }
+
+    #[test]
+    fn parse_input_reads_both_sources() {
+        let clawg = serde_json::json!({
+            "kind": "header", "format": "clawg-memories", "version": 1, "exported_at": 0, "clawg": "0.0.0",
+            "filter": {"project": null, "agent": null, "include_deleted": false},
+        })
+        .to_string();
+        let engram = serde_json::json!({ "version": "0.2.0", "exported_at": "2025-03-01 10:00:00", "sessions": [], "observations": [], "prompts": [] }).to_string();
+
+        assert!(matches!(parse_input(Source::Clawg, &clawg), Ok(ImportInput::Clawg(_))));
+        assert!(matches!(parse_input(Source::Engram, &engram), Ok(ImportInput::Foreign(_))));
+        for (source, text) in [(Source::Clawg, &engram), (Source::Engram, &clawg)] {
+            let refused = parse_input(source, text).err().expect("a file of the other tool is refused");
+            assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_source_is_named_as_the_import_event_logs_it() {
+        assert_eq!(Source::Clawg.name(), "clawg");
+        assert_eq!(Source::Engram.name(), "engram");
     }
 
     #[test]
