@@ -672,6 +672,42 @@ async fn a_daemon_records_its_requests_and_report_reads_them_after_stop() {
 }
 
 #[tokio::test]
+async fn a_daemon_probes_its_store_without_being_asked() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    // The gauges of the minute go to the writer at the turn of the minute,
+    // and Prometheus text keeps each one's last value whatever minute it was.
+    let mut text = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let answer = daemon
+            .client()
+            .send(Call::new(reqwest::Method::GET, "/v1/metrics?format=prometheus"))
+            .await
+            .expect("metrics");
+        assert_eq!(answer.status.as_u16(), 200);
+        text = String::from_utf8(answer.body.to_vec()).expect("text");
+        if text.contains("clawg_db_probe_wait_seconds_count") && text.contains("clawg_outbox_pending") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for series in [
+        "clawg_db_probe_wait_seconds_count ",
+        "clawg_db_cache_used_bytes ",
+        "clawg_db_file_bytes{file=\"db\"} ",
+        "clawg_db_file_bytes{file=\"wal\"} ",
+        "clawg_outbox_pending 0",
+        "clawg_outbox_failed 0",
+    ] {
+        assert!(text.contains(series), "{series} in:\n{text}");
+    }
+    assert!(!text.contains("clawg_outbox_oldest_pending_s"), "no row waits:\n{text}");
+}
+
+#[tokio::test]
 async fn a_killed_daemon_leaves_its_run_not_stopped() {
     let sandbox = Sandbox::new();
     let daemon = sandbox.serve().await;

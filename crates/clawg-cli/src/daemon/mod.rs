@@ -9,3 +9,4 @@ pub mod process;
 pub mod serve;
 pub mod sessions;
 pub mod socket;
+mod store_probe;
