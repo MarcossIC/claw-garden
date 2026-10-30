@@ -1,14 +1,14 @@
 change: import-job
 objective: "1"
 depends_on: [import-linear, import-decision-pass, import-undo, embed-throughput]
-phase: tasks
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done
+  verify: in_progress  # suite, clippy y la medición de memoria en Windows; falta el CI en Linux y Windows
   archive: pending
-updated: 2026-10-29
+updated: 2026-10-30
