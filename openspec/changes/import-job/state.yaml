@@ -1,10 +1,10 @@
 change: import-job
 objective: "1"
-depends_on: [import-linear, import-decision-pass, import-undo]
-phase: explore
+depends_on: [import-linear, import-decision-pass, import-undo, embed-throughput]
+phase: propose
 artifacts:
   exploration: done
-  proposal: pending
+  proposal: done
   spec: pending
   design: pending
   tasks: pending
