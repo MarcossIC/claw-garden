@@ -235,6 +235,8 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         metrics,
     });
 
+    let store_probe = super::store_probe::spawn(ctx.runtime.store.clone(), base_dir.clone(), ctx.metrics.clone());
+
     log::info!(
         "clawg serve {} listening on {}, data dir {}",
         profile.as_str(),
@@ -278,6 +280,10 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
             Ok(())
         }
     };
+
+    // Before the drain and the close, so no probe waits in the queue the
+    // close empties.
+    store_probe.abort();
 
     // No request comes in any more, so the last minute is complete.
     writer.close(METRICS_CLOSE).await;
