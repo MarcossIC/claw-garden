@@ -1,0 +1,18 @@
+change: native-memory-import
+objective: "1, 4"
+depends_on: [history-import, import-undo]
+phase: archived
+release: "0.72.0"
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done  # NM1 a NM6 en specs/portability, NM7 en specs/doctor
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # PASS (verify.md)
+  archive: done
+after_archive:  # fuera del cambio
+  - "apagar la memoria nativa (parte B) espera a que agent-eval compare clawg contra ella"
+updated: 2026-10-31
+main_spec: openspec/specs/portability/spec.md

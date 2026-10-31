@@ -351,6 +351,15 @@ clawg import --from engram $HOME\engram.json --project-map claw-garden=C:\code\c
 
 Importar otra vez el mismo export, o uno más nuevo, no duplica nada: cada nota se reconoce por su id en la otra herramienta, esté donde esté. Una que la otra herramienta reescribió entra como la versión nueva de la que ya está, en su proyecto y con su clave; una que borraste acá no vuelve. El reporte dice qué fue de cada nota y cuenta, por campo, lo que la otra herramienta guarda y clawg no tiene dónde poner.
 
+También trae la memoria propia de Claude Code, la que el cliente escribe solo en `~/.claude/projects/<proyecto>/memory/`: cada archivo de memoria es una nota, con su nombre, su descripción, su fecha y su tipo (`user` y `feedback` quedan como preferencias; el resto, como hechos). Los proyectos se llaman como el directorio del cliente, la ruta del repo con guiones:
+
+```powershell
+clawg import --from claude-code $HOME\.claude\projects --dry-run --profile dev
+clawg import --from claude-code $HOME\.claude\projects --project-map C--code-claw-garden=C:\code\claw-garden --profile dev
+```
+
+`clawg doctor` avisa (`native_memory`) mientras haya memoria de Claude Code que clawg no importó. La memoria del cliente sigue encendida: clawg no la apaga.
+
 ## Conectarlo a Claude Code
 
 Con Claude Code instalado (`claude` en el PATH), un solo comando conecta clawg:
@@ -508,6 +517,7 @@ clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el d
 clawg export --out m.jsonl --profile dev  # las memorias, una fila por línea (--project, --agent, --include-deleted, --format markdown)
 clawg import m.jsonl --profile dev        # las trae a este perfil, con el daemon corriendo (--dry-run, --agent, --map-root OLD=NEW, --follow)
 clawg import --from engram e.json --profile dev   # las notas de otra herramienta (--project-map NOMBRE=RUTA)
+clawg import --from claude-code ~/.claude/projects --profile dev   # la memoria propia de Claude Code
 clawg import --undo 3 --profile dev       # deshace la importación 3 y conserva lo que cambió desde entonces (--dry-run)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
 clawg metrics report --metric http.duration --label route=/v1/search --by version   # latencias y memoria del daemon (--by day|hour, --since 7d)

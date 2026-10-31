@@ -182,7 +182,7 @@ Una investigación posterior, sobre la integración con Claude Code, dejó tres 
 | ¿Un resumen del cliente (`compact_summary`) sirve tanto como uno del agente para retomar? | 99, parte C | Tareas R con dos siembras de LAST SESSION, una con cada resumen. Segunda tanda |
 | ¿Los subagentes llaman a las herramientas de clawg? | 99, parte D | Llamadas a `search_memory` y `search_project` dentro de un subagente. Piloto, sin costo extra |
 | ¿Un aviso `changed=RUTA` hace que el agente compruebe el código antes de usar la memoria? | [memory-anchors](../memory-anchors/exploration.md) (98), paso 2 | Una tarea S con una memoria anclada a un archivo que la tarea cambió, con y sin el aviso. Segunda tanda, después del paso 2 de 98 |
-| ¿Clawg agrega algo sobre la memoria nativa con los mismos hechos? | [native-memory-import](../native-memory-import/exploration.md) (100), parte B | Es A3 contra A4, la pregunta de producto de P1: 100 no recomienda apagar la memoria nativa hasta tenerla |
+| ¿Clawg agrega algo sobre la memoria nativa con los mismos hechos? | [native-memory-import](../archive/2026-10-31-native-memory-import/exploration.md) (100), parte B | Es A3 contra A4, la pregunta de producto de P1: 100 no recomienda apagar la memoria nativa hasta tenerla |
 | ¿Buscar en `UserPromptSubmit` y mostrar hasta 3 entradas compactas ayuda más que lo que cuesta? | «Ideas evaluadas» del [README](../../README.md) | Un brazo de diagnóstico más, A3 con ese hook, sólo si el piloto muestra muchas tareas K sin ninguna búsqueda. No entra en el piloto |
 
 ## Hallazgos laterales

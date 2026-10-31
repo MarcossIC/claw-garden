@@ -9,6 +9,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23: `message` en el idioma del comando (R1) y el resto del hallazgo igual en los dos idiomas (CL4).
 - [project-registry](../../changes/archive/2026-10-25-project-registry/proposal.md), archivado el 2026-10-25: el chequeo `project_remotes` (R7, su RG5).
 - [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 1, que sale en 0.65.0: los chequeos `projects` y `project_remotes` leen las carpetas de `project_path` (V27), con los mismos hallazgos. Un store anterior a V27 se lee con la tabla que tiene. Su entrega 2a, en la misma versión: los chequeos `project_duplicates`, `project_orphans` y `project_merges` (R7). Su entrega 2b: el chequeo `project_deletes`, y un proyecto borrado ni es un duplicado ni deja huérfanas a sus filas (R7). Su entrega 3b: el chequeo `project_subfolders` (R7).
+- [native-memory-import](../../changes/archive/2026-10-31-native-memory-import/proposal.md), archivado el 2026-10-31, que sale en 0.72.0: el chequeo `native_memory` (NM7). Cómo se importa esa memoria está en [`specs/portability`](../portability/spec.md) (NM1 a NM6).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 
@@ -208,3 +209,16 @@ Con filas `pending` y un daemon vivo no hay hallazgo: las está ingiriendo.
 La decisión MUST ser una función pura del texto del archivo, el perfil, el binario que corre y un predicado `exists`.
 
 **Tests:** `mcp_findings` (`doctor`).
+
+## NM7. La memoria propia de Claude Code
+
+`native_memory` MUST listar los archivos de tema (NM1 de [`specs/portability`](../portability/spec.md)) de cada `memory/` bajo `<dir de Claude Code>/projects` (el dir es `$CLAUDE_CONFIG_DIR` o `~/.claude`) sin leer su texto, y compararlos por origen (`claude-code:<proyecto>/<archivo>`) con los `created_by_ref` de las filas `source = 'import'`, borradas o no (`StoreFacts::claude_code_imports`). Sólo cuando el `.claude.json` de R8 registra el servidor del perfil (`mcp::registered`):
+
+| Estado | Severidad | `reason_code` | Siguiente paso |
+|---|---|---|---|
+| algún archivo sin importar | `info` | `not_imported`, con `dir`, `projects`, `files` y `not_imported` | `clawg import --from claude-code <dir> --dry-run --profile P` |
+| todos importados | `ok` | `healthy`, con lo mismo | — |
+
+Sin el servidor registrado o sin archivos de tema MUST NOT haber hallazgo. Un archivo reescrito después de importarlo no se nombra (su origen ya está); un segundo import lo trae como versión nueva. La decisión MUST ser una función pura del directorio, los archivos, los orígenes importados, el registro y el perfil.
+
+**Tests:** `native_memory_is_named_until_every_file_is_imported`, `a_server_is_registered_when_the_config_names_it` (`doctor`); `the_facts_name_the_origins_imported_from_claude_code` (`inspect.rs`); `doctor_names_native_memory_not_imported` (`crates/clawg-cli/tests/binary.rs`).
