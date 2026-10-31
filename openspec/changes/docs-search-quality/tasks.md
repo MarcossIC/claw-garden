@@ -77,7 +77,7 @@ El set de 15 tenía casos rotos en silencio, porque `check_corpus` mira la ruta 
 
 ### 13. Experimento
 
-- [ ] En un worktree descartable con `E5_PASSAGE_PREFIX = "passage: "`, `--real --docs` contra la línea vigente. Se anota y se borra el worktree y su directorio de build. Sólo si pasa la puerta se abre la tarea de productivizarlo.
+- [x] En un worktree descartable con `E5_PASSAGE_PREFIX = "passage: "`, `--real --docs` contra la línea vigente. Se anota y se borra el worktree y su directorio de build. Sólo si pasa la puerta se abre la tarea de productivizarlo. Se midió en este worktree, con la constante sin commitear y restaurada después, contra `dq-base3` (`5136a4e`): Hit@3 −1, con c14 fuera del top 3 y ninguna pregunta de docs movida. No se productiviza.
 
 ## Cierre
 

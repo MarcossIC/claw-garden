@@ -118,3 +118,21 @@ Cada pregunta del golden se escribió sin las palabras del pasaje que la respond
 - 2d cambia las palabras que entran en el tope, como 2b, en 18 preguntas.
 
 Lo que el golden mide es el canal denso. Medir el léxico necesita preguntas que nombren lo que el pasaje dice (un identificador, una ruta, un término propio), y este golden las excluye por construcción. Sin las palabras vacías, el canal léxico favorece pasajes densos en palabras de contenido sueltas por encima de la respuesta. El primer hit de d01 pasa a ser `openspec/changes/archive/2026-10-21-query-plans/verify.md > … > Linux (2026-10-21)`, el de d02 `crates/clawg-cli/src/setup.rs > mod tests` y el de c14 `crates/clawg-cli/src/daemon/metrics.rs > mod tests > fn each_minute_and_the_stop_are_written()`.
+
+## Paso 4: prefijo de docs
+
+### Línea base (`5136a4e`, `2026-10-31-real-docs-dq-base3.json`)
+
+Entre `dba0bd2` y `5136a4e` entró el merge de perf-bench. 762 docs y 18646 pasajes; indexado en 74,8 s, con 18418 vectores del memo y 228 embebidos. Da exactamente lo mismo que `dq-base2`, pregunta por pregunta.
+
+### `E5_PASSAGE_PREFIX = "passage: "` (`2026-10-31-real-docs-dq-prefix.json`): no pasa la puerta
+
+Se midió en este worktree, con la constante cambiada sin commitear y restaurada con `git checkout` después, y no en un worktree descartable: así no se repite el build de todas las dependencias ni se arriesga la memoria, que ya cortó una corrida. El corpus es el de `dq-base3` salvo esa línea. Otro prefijo es otro contrato del memo, así que los 18646 pasajes se embebieron otra vez: 1802,0 s de indexado, 1730,5 s de ellos de embed. El memo de ese contrato se borró después.
+
+| | Hit@1 | Hit@3 | Hit@5 | MRR@10 | preguntas |
+|---|---|---|---|---|---|
+| todas | 0,050 | 0,075 | 0,100 | 0,071 | 40 |
+| docs | 0,100 | 0,100 | 0,100 | 0,100 | 20 |
+| código | 0,000 | 0,050 | 0,100 | 0,041 | 20 |
+
+`--diff dq-base3 dq-prefix`: Hit@1 da 0 mejor y 1 peor, Hit@3 0 y 1, Hit@5 no cambia, y MRR@10 da 0 y 3, con media −0,020 [−0,053, +0,000]. Sólo se mueve código: c02 del 1 al 2, c04 del 7 al 8 y c14 del 2 al 5. Ninguna pregunta de docs cambia de puesto. c14 sale del top 3, así que el prefijo no se productiviza y no queda código.
