@@ -62,7 +62,7 @@ rules:
     - No new dependency, visibility or abstraction without a real use.
   tasks:
     - Strict TDD - each implementation task is preceded by its failing test.
-    - Each task maps to one atomic conventional commit that compiles and passes the suite.
+    - Each task maps to one atomic conventional commit, checked with the tests of the files it changes. The full suite and both clippy run once, on the last commit of the change, never on every commit.
   apply:
     - Run tests and clippy in target-test on Windows (cargo test --workspace --target-dir target-test), never in another target dir.
     - Before testing a new version run cargo clean --workspace --target-dir target-test; after rustup update or a dependency change, cargo clean --target-dir target-test. Delete any comparison build dir before the task ends.

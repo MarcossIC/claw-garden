@@ -261,7 +261,7 @@ Nada de esto entra en un build de producción salvo los tipos de D1 y D2, la lí
 
 ## Orden de commits
 
-Cada commit compila, pasa la suite y los dos clippy, y empieza por su test que falla.
+Cada commit empieza por su test que falla y se comprueba con las pruebas de los archivos que cambia. La suite completa y los dos clippy se corren una vez, sobre el último commit, no en cada uno.
 
 1. `feat(docs): time each phase of a refresh` (D1 a D3, IC1): `a_refresh_times_each_phase_of_every_doc`, `timing_does_not_change_what_a_refresh_writes`, `an_unchanged_refresh_has_no_doc_timings`; `refresh_docs` y `EvalDocIndex::index` leen `.report`.
 2. `feat(daemon): log where a docs refresh spent its time` (D4, IC2): `the_docs_timing_line_names_every_phase`.

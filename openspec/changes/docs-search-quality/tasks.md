@@ -1,6 +1,6 @@
 # docs-search-quality — Tareas
 
-Strict TDD: en cada tarea con conducta nueva el test va primero y falla, por la aserción o porque no compila. Cada tarea de código es un commit convencional que compila y pasa la suite (`cargo test --workspace`, o `--target-dir target-test` en Windows) y los dos clippy de `.claude/CLAUDE.md`. Ningún test necesita el modelo real ni un perfil de datos; las mediciones `--real` sí, y se anotan en `verify.md`.
+Strict TDD: en cada tarea con conducta nueva el test va primero y falla, por la aserción o porque no compila. Cada tarea de código es un commit convencional atómico, que se comprueba con las pruebas de los archivos que cambia. La suite completa (`cargo test --workspace`, o `--target-dir target-test` en Windows) y los dos clippy de `.claude/CLAUDE.md` se corren una vez, sobre el último commit del cambio, nunca en cada commit. Ningún test necesita el modelo real ni un perfil de datos; las mediciones `--real` sí, y se anotan en `verify.md`.
 
 Requisitos en la [spec](spec.md) (DQ1 a DQ9) y decisiones en el [diseño](design.md) (D1 a D5).
 

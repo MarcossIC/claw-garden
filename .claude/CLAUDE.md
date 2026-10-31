@@ -112,7 +112,7 @@ While a store holds both languages, `memory.lang` (V22: `en`, `es`, `und`, NULL 
 
 - Code, comments, test names, error messages and commit messages never reference plans, phases or work packages.
 - Everything committed is written for whoever clones the repository. A step says what it needs to run (an OS, the real model, the gitignored golden set in `docs/eval/`, a data profile), not whose machine it runs on; a decision says what was chosen and why, not who chose it. No person's name, username or home path in docs, code, tests or commit messages.
-- Commits: conventional commits, atomic (each one compiles and passes the suite). No `Co-Authored-By` and no AI attribution.
+- Commits: conventional commits, atomic (one coherent change each). Each commit is checked with the tests of the files it changes; the full suite and both clippy run once, on the last commit of a series, never on every commit. No `Co-Authored-By` and no AI attribution.
 - `docs/migration-plan.md` is a working log and is NEVER committed. Stage by explicit path; never `git add -A`, `git add .` or `git add -u`.
 - Do not run release builds, installs, or touch the real data profiles (`~/.clawg*`) without explicit authorization.
 - Do not kill running `clawg.exe` processes; they may be the editor's own MCP.
