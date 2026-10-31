@@ -8,14 +8,14 @@ artifacts:
   spec: done  # sólo A1 (IS1 a IS5); A2 se especifica con A1 medido
   design: done  # sólo A1 (D1 a D7)
   tasks: done  # parte 1 sin modelo; parte 2 con modelo real y autorización
-  apply: in_progress
-  verify: pending  # verify.md anota las puertas leídas en D y R (2026-10-31)
+  apply: in_progress  # A1 hecho y adoptado; falta A2
+  verify: in_progress  # puertas, bits (0 movidos) y «se queda si» de A1 en verify.md
   archive: pending
 gates:
   "0": open  # R: embed 1935,0 s y 0,992 de index_seconds; abre A1, A2 y E, y S no pasa delante de A1
   C: closed  # D: 0,051 < 0,25 (R/D 0,218 cumple, pero la puerta pide las dos); sin variante ni línea en specs/eval
   W: closed  # R: write 0,0015 < 0,10
-  A1: open  # R: 0,171 >= 0,10, y 330,0 s >= 3,9 s; es el paso que se implementa ahora
+  A1: kept  # R: 0,171 >= 0,10, y 330,0 s >= 3,9 s; se queda: embed -12,6 % y -12,7 % en los pares limpios, 0 bits, --diff sin movimientos
   S: closed  # R (W no abre): 0,0083 < 0,15
   A2: open  # R: 0,162 >= 0,15; se diseña después de medir A1
   E: waiting  # la puerta 0 abre, pero falta el docs_contract que docs-search-quality no hizo

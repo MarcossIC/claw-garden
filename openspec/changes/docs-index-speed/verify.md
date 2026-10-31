@@ -63,3 +63,60 @@ Corridas autorizadas, una por vez y sin otra compilación en marcha. Las dos usa
 
 - **La decisión 4 se cumple con diferencia 0, en esta CPU.** No hay que reescribir vectores. Como no se movió ningún bit, la memoria de `docs/eval/cache/` sigue siendo exacta en esta máquina, y la tarea 2c no la vacía. Las corridas de 2d usan `--no-cache` de todas formas. En otra CPU, `e5_golden` compara con 1e-6, como antes.
 - **El tiempo de 2b no decide «se queda si».** Es una corrida por orden, sin alternar, en debug, y la varianza entre corridas de esta máquina llegó al 26,8 %. Hay una salvedad. Todo el ahorro de tokens está en los docs de más de una tanda: `(padded − padded_sorted_in_doc) / multi_batch_padded` de R da 1 443 810 / 6 652 055 = 0,217. Este subconjunto es justo de esos docs, y aun así el reloj bajó un 8,6 %, menos que el −10 % que pide «se queda si». La prueba no imprime el relleno de su muestra, así que no se sabe si la muestra rellena como el corpus entero. Decide la tarea 2d, con corridas alternadas de `rag-eval`.
+
+### Suite y clippy
+
+Sobre `604dc03`, el último commit de la serie, salen con 0 la suite (`cargo test --workspace --target-dir target-test`) y los dos clippy (`--workspace --all-targets` y `--locked -p clawg-cli`). Terminaron antes de que entrara a `develop` el merge `eafcb8a` (native-memory-import y la versión 0.72.0), que no toca `project_docs`, el embedder, el chunker, `eval_api` ni `clawg-eval`.
+
+## A1: «se queda si» (2026-10-31)
+
+Seis corridas autorizadas de `rag-eval --real --docs --no-cache`, en release, con `CLAWG_PROFILE=dev` y el modelo real, una detrás de otra y sin otra compilación ni prueba en marcha. Alternan la base y el paso: base, paso, base, paso, base, paso.
+
+- **Base:** `ad22dad`, el commit anterior al cambio de conducta, compilado en un worktree descartable con su propio directorio de build.
+- **Paso:** `eafcb8a`, compilado en `target-test` después de `cargo clean --workspace` (la versión subió a 0.72.0).
+- **Corpus:** las dos ramas indexan el mismo, congelado en un worktree de `eafcb8a`. Usan `--root`, `--golden` y `--out` explícitos, porque los valores por omisión de `rag-eval` salen de `CARGO_MANIFEST_DIR` al compilar (`crates/clawg-eval/src/bin/rag-eval/cli.rs:287-320`). Son 772 docs, 18 885 pasajes y 2 saltados, con el golden de 40 preguntas. Los dos worktrees y el build de la base se borraron al terminar.
+- **Resultados (fuera de git):** `docs/eval/results/2026-10-31-real-docs-a1-{base,step}-{1,2,3}.json`.
+
+| corrida | empieza | `index_seconds` | `phases.embed` | `phases.split` | `tokens.padded_ran` |
+|---|---|---|---|---|---|
+| base-1 | 13:50 | 2033,4 | 2015,76 | 13,07 | 8 765 221 |
+| paso-1 | 14:24 | 1777,8 | 1760,55 | 12,64 | 7 282 905 |
+| base-2 | 14:54 | 2064,0 | 2046,79 | 12,55 | 8 765 221 |
+| paso-2 | 15:29 | 1454,2 | 1433,82 | 9,36 | 7 282 905 |
+| base-3 | 15:53 | 1258,3 | 1246,35 | 8,53 | 8 765 221 |
+| paso-3 | 16:14 | 1101,1 | 1088,82 | 8,84 | 7 282 905 |
+
+Los tokens son iguales en las seis corridas: `real` 5 845 797, `padded` 8 765 221, `padded_sorted_in_doc` 7 282 905 y `padded_sorted_all` 5 849 005. El paso rellena un 16,9 % menos.
+
+**La máquina cambió de régimen a mitad de la medición.** `split` es CPU pura y hace el mismo trabajo en las dos ramas. Bajó de unos 12,6 s a unos 8,7 s entre base-2 y base-3, y todas las fases bajaron con él. Paso-2 quedó a caballo: su `split` es de 9,36 s, y su `read`, de 7,88 s, unas 25 veces el de las otras corridas. Ninguna corrida registra la carga del sistema. Por eso las medianas por rama mezclarían dos máquinas, y se comparan corridas vecinas del mismo régimen:
+
+| comparación | `phases.embed` |
+|---|---|
+| par 1, régimen lento (base-1 → paso-1) | **−12,7 %** |
+| par 3, régimen rápido (base-3 → paso-3) | **−12,6 %** |
+| paso-1 contra el promedio de base-1 y base-2 | −13,3 % |
+| paso-2 contra el promedio de base-2 y base-3 | −12,9 % |
+| par 2 (base-2 → paso-2), cruza el cambio | −29,9 %, no se usa |
+
+Por área (`by_area`), en los dos pares limpios. Los conteos son iguales en las seis corridas: docs 64 docs, 2713 pasajes y 43 de más de una tanda; code 200, 8282 y 105; archive 508, 7890 y 150.
+
+| área | par 1: `embed` base → paso | | par 3: `embed` base → paso | |
+|---|---|---|---|---|
+| docs | 301,97 → 220,51 s | −27,0 % | 187,08 → 137,54 s | −26,5 % |
+| code | 843,96 → 761,20 s | −9,8 % | 540,27 → 472,06 s | −12,6 % |
+| archive | 869,83 → 778,84 s | −10,5 % | 519,00 → 479,22 s | −7,7 % |
+
+Donde más gana es en los docs de Markdown, que mezclan secciones de una línea con secciones largas. Los pedazos de código tienen un tope de caracteres (`CODE_CHUNK_MAX_CHARS`), así que sus largos se parecen más y rellenan menos de entrada.
+
+Los dos pares limpios dan lo mismo, uno en cada régimen, y los promedios de las corridas vecinas coinciden con ellos. El reloj baja alrededor de tres cuartos de lo que bajan los tokens rellenados (−12,7 % contra −16,9 %). Eso es lo esperable: parte del costo de cada tanda no depende del relleno. El −8,6 % de la prueba de bits en debug (2b), con una sola corrida por orden, quedó dentro de ese ruido.
+
+### Las condiciones de «se queda si»
+
+| condición | resultado | |
+|---|---|---|
+| `phases.embed` baja ≥ 10 % | −12,6 % y −12,7 % en los pares limpios; entre −12,9 % y −13,3 % contra los vecinos | ✅ |
+| `tokens.padded_ran` = `tokens.padded_sorted_in_doc` | 7 282 905 = 7 282 905 en las tres corridas del paso, y ningún aviso (en la base, `padded_ran` = `padded` = 8 765 221) | ✅ |
+| `--diff` no mueve ninguna pregunta | base-n contra paso-n, en los tres pares: 0 mejores y 0 peores en Hit@1, Hit@3, Hit@5 y MRR@10, en todas, docs y código (p = 1). Las seis corridas dan Hit@1 0,05, Hit@3 0,10, Hit@5 0,10 y MRR@10 0,08 | ✅ |
+| decisión 4 de la propuesta | 0 bits movidos (arriba) | ✅ |
+
+**A1 se queda.** Lo que sigue es A2, que se especifica y se diseña con esta corrida como base. Su puerta es (`padded_sorted_in_doc` − `padded_sorted_all`) / `padded`: 0,162 en R y (7 282 905 − 5 849 005) / 8 765 221 = 0,164 en este corpus. Su «se queda si» compara contra corridas del paso de A1, en las mismas condiciones.
