@@ -1,15 +1,15 @@
 change: docs-index-cost
 objective: "3"
 depends_on: []
-phase: apply
+phase: archive
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: in_progress  # tareas 1 a 9 (sin el modelo real); la 10 necesita el modelo real y un build release
-  verify: in_progress  # código PASS WITH WARNINGS (verify.md); faltan las corridas D y R
-  archive: pending
+  apply: done  # tareas 1 a 10; D y R corridas el 2026-10-31
+  verify: done  # PASS WITH WARNINGS (verify.md): A5, B4 y la cota de tamaño de --help (WARNING 7)
+  archive: pending  # al archivar: IC7 «menos scan y la remoción», la cota de IC4 y de design.md:243
 gates: {}
-updated: 2026-10-30
+updated: 2026-10-31

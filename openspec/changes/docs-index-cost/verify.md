@@ -1,6 +1,6 @@
 # docs-index-cost — Verificación
 
-Verifica los grupos 1 a 9 de [tasks.md](tasks.md) (commits `21ca2b9..15ce920`) contra la [spec](spec.md) (IC1 a IC8) y el [diseño](design.md) (D1 a D14). El grupo 10, las corridas D y R con el modelo real, no se corrió: necesita autorización (ver «Corridas reales»).
+Verifica los grupos 1 a 9 de [tasks.md](tasks.md) (commits `21ca2b9..15ce920`) contra la [spec](spec.md) (IC1 a IC8) y el [diseño](design.md) (D1 a D14). Las corridas D y R del grupo 10, con el modelo real, se corrieron el 2026-10-31 con autorización y están en «Corridas reales».
 
 ## Windows (2026-10-31)
 
@@ -10,7 +10,7 @@ Verifica los grupos 1 a 9 de [tasks.md](tasks.md) (commits `21ca2b9..15ce920`) c
   - `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`;
   - `cargo clippy --locked -p clawg-cli --target-dir target-test -- -A clippy::all -D warnings`, lo que compila el release, sin `testing` ni `eval`.
 - Cada prueba que nombran la spec y las tareas aparece `ok` en la corrida, con su nombre exacto.
-- Las tres pruebas `#[ignore]` de la suite son las de antes (`import_memory.rs` y `transport_bar.rs`).
+- Las ocho pruebas que la suite ignora son de antes, y el rango no agrega ningún `#[ignore]`. Son tres de `crates/clawg-cli/tests` (`import_memory.rs` y `transport_bar.rs`), dos de `crates/clawg-core/tests/e5_golden.rs` y tres de la biblioteca de `clawg-core`, en `memory::portability::import` y `memory::project_docs`. Las cinco últimas necesitan el modelo real o son mediciones.
 - `docs/eval/cache/` no existe después de las cuatro corridas de la suite: ninguna prueba escribe en la carpeta real de la memoria. En el temporal del sistema no quedó ningún `rag-eval-test-*`. Sí hay un `rag-eval-docs-3ae147e5-…` de 59 MB, creado el 2026-10-30 a las 14:32 y escrito hasta las 15:13. Por el nombre lo hizo `docs::run`, no una prueba (las pruebas usan `TempPath`), y el `memory.lock` que conserva dice que el proceso murió antes de `remove_scratch`. No es de este cambio ni de esta verificación, y no se tocó.
 - Al terminar, `git status` está limpio y `git diff 15ce920 -- crates Cargo.toml Cargo.lock` no da nada. Las mutaciones se revirtieron con `git restore` de los archivos mutados, que estaban limpios.
 
@@ -179,17 +179,130 @@ D1 a D14 se siguen. Sobre los nueve desvíos que anotó la aplicación:
 - `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`: salida 0.
 - `cargo clippy --locked -p clawg-cli --target-dir target-test -- -A clippy::all -D warnings`: salida 0.
 - Ninguna métrica de `rag-eval` cambia en este rango: sin el modelo no hay corrida que medir, y las corridas D y R (abajo) dan los números.
+- Después de las corridas D y R, sobre `0f09b2b` (el commit que las registra sólo toca `openspec/`) y con `target-test` recién limpiado, los tres comandos salen con 0: la suite (3984 pruebas pasan, 0 fallan, 8 ignoradas) y los dos clippy.
 
 ## Veredicto
 
 **Actualización tras el cierre de huecos (`5f44ffc`, `b0623f8`, `891e28d`):** muerden A6, C1, C2 y C5, y W2 queda cubierto (la redacción de IC7 se corrige al archivar). Siguen abiertos sólo A5 (carrera sin costura) y B4 en `docs.rs` (`rag-eval` no puede construir un embedder que falle); ninguno es un defecto del código. El veredicto sigue en PASS WITH WARNINGS por esos dos.
 
+**Actualización tras las corridas D y R (2026-10-31):** pasan las cinco puertas del grupo 10: las fases suman `index_seconds`, `padded == padded_ran` (que cierra la SUGGESTION 4), `memo.embedded == corpus.passages` en D, `memo.used = false` en R con la carpeta intacta, y el `--diff` no mueve ninguna pregunta. Aparece un WARNING 7: la cota de tamaño que da `--help` ya no se cumple con el corpus de hoy. El veredicto sigue en PASS WITH WARNINGS.
+
 **PASS WITH WARNINGS.** La suite y los dos clippy pasan en Windows. Los ocho requisitos tienen prueba, 41 de 44 escenarios cumplen enteros y ninguno queda sin prueba. La producción sólo gana la línea del log. De las 16 mutaciones, nueve muerden. Muerden en todo lo de más riesgo: la clave, el decorador, `--no-cache`, `padded_ran`, el área, los valores no finitos y la remoción dentro de `write`. Siete no muerden. Una se esperaba, porque necesita el modelo (C6). Las otras seis son los WARNING 1 (A5 y A6), 3, 4, 5 y 6: la entrada de un doc fallado en los tiempos, `finish` en una corrida que falla, no reescribir sin novedades, un archivo por contrato y la ventana de 512. El WARNING 2 es un invariante de IC7 que el código no cumple con `remove > 0`. Ninguno cambia un número que lean las puertas de `docs-index-speed`, salvo el WARNING 2, por la remoción, que en `rag-eval` es casi cero.
 
 ## Corridas reales
 
-**Pendiente.** Faltan las corridas D (build debug, memoria vacía) y R (build release en `target-test`, `--no-cache`, con `CLAWG_PROFILE=dev`) del grupo 10 de [tasks.md](tasks.md). Necesitan el modelo real del perfil dev y una autorización explícita, y en esta verificación no se corrió ninguna. Las completa otro paso con:
+Corridas del 2026-10-31, una detrás de otra y nunca en paralelo, sobre `0f09b2b` con el árbol limpio, desde la raíz del repo y en Windows. Usan el modelo real de `~/.clawg-dev/models` (`multilingual-e5-small`), que `ensure_model` sólo verificó: estaba entero y no se descargó ni se escribió nada.
 
-- de D y de R: `index_seconds`, `index.build`, `index.machine`, `memo.*`, `phases.*`, `tokens.*` y `by_area.*`;
-- los cocientes que leen las puertas de `docs-index-speed`;
-- las puertas: la suma de `index.phases` dentro del 5 % de `index_seconds`, `tokens.padded == tokens.padded_ran`, `memo.embedded == corpus.passages` en D, `memo.used = false` en R y el `--diff` de D contra R sin preguntas movidas.
+Preparación: `cargo clean --workspace --target-dir target-test` borró 15 788 archivos (18,1 GiB). `docs/eval/cache` ya no existía antes de D. Había dos `clawg.exe` vivos, los dos de la instalación (`AppData\Local\Programs\clawg`) y ninguno de `target-test`, y no se tocaron.
+
+| | D | R |
+|---|---|---|
+| comando | `CLAWG_PROFILE=dev cargo run -p clawg-eval --target-dir target-test --bin rag-eval -- --real --docs --tag cost-d` | `CLAWG_PROFILE=dev cargo run -p clawg-eval --release --target-dir target-test --bin rag-eval -- --real --docs --no-cache --tag cost-r` |
+| archivo (fuera de git) | `docs/eval/results/2026-10-31-real-docs-cost-d.json` | `docs/eval/results/2026-10-31-real-docs-cost-r.json` |
+| build de `rag-eval` | 2 min 09 s | 2 min 27 s |
+| salida | 0 | 0 |
+
+En D, `CLAWG_PROFILE=dev` no cambia nada, porque un build debug ya elige `dev`. Se pasó igual para que los dos comandos lean el mismo perfil a la vista.
+
+### Lo que dio cada corrida
+
+| campo | D | R |
+|---|---|---|
+| `corpus` | 740 docs, 18 249 pasajes, 2 saltados, 1 fuera | igual |
+| `index_seconds` | 1601,499 | 1951,200 |
+| `index.build` | `debug` | `release` |
+| `index.machine` | `windows`, `x86_64`, avx2, avx512f, fma; 16 hilos | igual |
+| `memo.used` | `false` | `false` |
+| `memo.from_memo` | 0 | 0 |
+| `memo.embedded` | 18 249 | 18 249 |
+| `memo.seconds` | 1,349 | 0 |
+| `phases.scan` | 0,406 | 0,056 |
+| `phases.read` | 0,701 | 0,285 |
+| `phases.mask` | 14,087 | 0,798 |
+| `phases.split` | 56,509 | 12,001 |
+| `phases.lookup` | 0,028 | 0,017 |
+| `phases.embed` | 1526,319 | 1935,034 |
+| `phases.write` | 3,448 | 3,010 |
+| `tokens.real` | 5 645 075 | igual |
+| `tokens.padded` | 8 467 287 | igual |
+| `tokens.padded_ran` | 8 467 287 | igual |
+| `tokens.padded_sorted_in_doc` | 7 023 477 | igual |
+| `tokens.padded_sorted_all` | 5 648 371 | igual |
+| `tokens.count_seconds` | 7,196 | 1,933 |
+
+El doc que quedó fuera es `openspec/changes/archive/2026-10-15-project-indexing/verify.md`, el que cita las preguntas. Los tiempos están en segundos.
+
+Por área (`by_area`). Los conteos y los tokens son iguales en D y en R; las fases van D / R:
+
+| área | docs | pasajes | `multi_batch_docs` | `tokens.real` | `tokens.padded` | `multi_batch_real` | `multi_batch_padded` | read | mask | split | lookup | embed | write |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| docs | 61 | 2730 | 44 | 816 169 | 1 292 781 | 777 609 | 1 223 056 | 0,07 / 0,03 | 3,11 / 0,19 | 6,75 / 1,58 | 0,00 / 0,00 | 262,14 / 308,05 | 0,44 / 0,39 |
+| code | 195 | 8093 | 103 | 2 704 093 | 3 898 057 | 2 434 789 | 3 512 734 | 0,26 / 0,07 | 4,29 / 0,18 | 30,13 / 5,64 | 0,01 / 0,01 | 620,07 / 798,24 | 1,25 / 1,06 |
+| archive | 484 | 7426 | 141 | 2 124 813 | 3 276 449 | 1 305 151 | 1 916 265 | 0,36 / 0,18 | 6,69 / 0,43 | 19,63 / 4,78 | 0,01 / 0,01 | 644,11 / 828,75 | 1,76 / 1,56 |
+
+En R, lo archivado se lleva el 42,8 % de `phases.embed`, el código el 41,3 % y los docs el 15,9 %.
+
+### Las puertas de este cambio
+
+| puerta | D | R | |
+|---|---|---|---|
+| la suma de `index.phases` dentro del 5 % de `index_seconds` | 1601,498 frente a 1601,499 (0,00 %) | 1951,199 frente a 1951,200 (0,00 %) | ✅ |
+| `tokens.padded == tokens.padded_ran` | 8 467 287 = 8 467 287 | 8 467 287 = 8 467 287 | ✅ |
+| `memo.embedded == corpus.passages` en D | 18 249 = 18 249, y `memo.used = false` | — | ✅ |
+| `memo.used = false` y `from_memo = 0` en R | — | `false`, 0; el informe dice `vector memo: not used (--no-cache)` | ✅ |
+| la carpeta de la memoria, sin tocar por R | — | `docs-vectors-ec3ab4decf12361b.bin`: el mismo SHA-256 (`68a8db9c…53f6c`), el mismo tamaño (28 608 248 bytes) y la misma fecha de modificación antes y después de R; sigue siendo el único archivo | ✅ |
+| `--diff` de D contra R | ninguna pregunta se mueve en Hit@1, Hit@3, Hit@5 ni MRR@10, en todas, en docs ni en código (p = 1 en las doce filas) | | ✅ |
+
+Por pregunta, D y R coinciden en el puesto y también en el primer hit de las 40. D pasa por el decorador de la memoria, que esa vez estaba vacía, y R indexa sin él. Así, esta igualdad es además la prueba con el modelo real de que el decorador no cambia qué vector va con qué pasaje.
+
+`padded == padded_ran` cierra la SUGGESTION 4 (mutación C6). Con el recorder del embedder real perdido, `padded_ran` sería 0 y las dos corridas habrían avisado.
+
+D llenó `docs/eval/cache/` con un archivo de 28 608 248 bytes. Eso es exactamente 18 245 entradas de 1568 bytes más los 88 de la cabecera y el SHA final (56 + 32, `design.md:128`): 18 249 pasajes con 4 textos repetidos. **Supera la cota que da `--help`**, «at most about 27.6 MB per model contract» (`crates/clawg-eval/src/bin/rag-eval/cli.rs:241`). La repiten `spec.md:130`, `design.md:243` y `proposal.md:27`. Esa cota se calculó con el corpus de la propuesta (17 584 pasajes), y no es una cota: crece con el corpus y, como la memoria no se purga, con cada corrida que embebe textos nuevos (ver «Lo que queda abierto»). En el temporal del sistema no quedó ningún `rag-eval-*`. Tampoco está ya el `rag-eval-docs-3ae147e5-…` que encontró la verificación, que esta tarea no borró.
+
+### Los cocientes que leen las puertas de `docs-index-speed`
+
+Los umbrales son los de `openspec/changes/docs-index-speed/state.yaml`, fijados antes de estas corridas. Las puertas se deciden en ese cambio. Aquí sólo se anota el número contra su umbral.
+
+| puerta | cociente | valor | umbral |
+|---|---|---|---|
+| 0 | `phases.embed` de R | 1935,0 s | ≥ 120 s: cumple |
+| 0 | `phases.embed / index_seconds` de R | 0,992 | ≥ 0,5: cumple |
+| C | `(scan+mask+split+lookup+write+count_seconds) / index_seconds` de D | 81,67 s / 1601,5 = 0,051 | ≥ 0,25: **no cumple** |
+| C | esa suma en R frente a D | 17,81 s / 81,67 s = 0,218 | ≤ 0,5: cumple |
+| W | `phases.write / index_seconds` de R | 0,0015 | ≥ 0,10: **no cumple** |
+| A1 | `(padded − padded_sorted_in_doc) / padded` de R | 0,171 | ≥ 0,10: cumple |
+| A1 | ese ahorro × `phases.embed` frente a `2 × count_seconds` de R | 330,0 s frente a 3,87 s | cumple |
+| S | `(read+mask+split+lookup+write) / index_seconds` de R (W no se abre) | 16,11 s / 1951,2 = 0,0083 | ≥ 0,15: **no cumple** |
+| S | lo mismo en D, como referencia | 74,77 s / 1601,5 = 0,047 | |
+| A2 | `(padded_sorted_in_doc − padded_sorted_all) / padded` de R | 0,162 | ≥ 0,15: cumple |
+| E | base: `tokens.real` y `phases.embed` de R | 5 645 075 tokens, 1935,0 s | la puerta 0 abre E |
+
+El relleno es la mitad de lo que se embebe: `padded / real` da 1,500. Ordenar por largo dentro de cada doc lo baja a 1,244, y ordenar en toda la corrida a 1,0006.
+
+### Lo que hay que saber antes de leer estos tiempos
+
+**`phases.embed` de R fue un 26,8 % más lento que el de D** (1935,0 s frente a 1526,3 s), aunque R es release. El resto de las fases sí bajó como se espera de un build optimizado: mask de 14,09 a 0,80 s, split de 56,51 a 12,00 s y count de 7,20 a 1,93 s. La inferencia corre dentro de ONNX Runtime, que es la misma biblioteca nativa en los dos builds. Así que el build no explica una inferencia más lenta, y lo más probable es la carga de la máquina durante R: otro proceso, la temperatura o el plan de energía. Eso no se midió: ninguna de las dos corridas registra la carga del sistema. La consecuencia para `docs-index-speed` es concreta. Entre dos corridas sueltas de esta máquina, `phases.embed` varió más que el −10 % que pide E, así que la puerta E y el `ahorro × phases.embed` de A1 conviene leerlos con corridas repetidas o alternadas en las mismas condiciones, no contra este R. Los tokens, en cambio, no dependen del reloj. Los cocientes de A1 y A2 (0,171 y 0,162) valen tal cual, y A1 cumple aunque `phases.embed` fuera la mitad.
+
+**El ahorro esperado de la memoria.** En D, `phases.embed / index_seconds` es 0,953. Una segunda corrida debug sobre el mismo commit, con la memoria llena, embebería 0 pasajes. Su `index_seconds` bajaría a unos 75 s (las otras fases de D) más la lectura de la memoria, que en D tardó 1,35 s.
+
+### La línea base del golden ampliado (tarea 5 de `docs-search-quality`)
+
+D da la primera medición del golden de 40 preguntas (sha256 `20701930f824f5867f53a5f0af0cc26df0811c083f75df74d82fe0ea77fdefcc`), con el doc que cita las preguntas fuera del índice. R da los mismos números.
+
+| | Hit@1 | Hit@3 | Hit@5 | MRR@10 | preguntas |
+|---|---|---|---|---|---|
+| todas | 0,075 | 0,10 | 0,10 | 0,098 | 40 |
+| docs | 0,10 | 0,10 | 0,10 | 0,113 | 20 |
+| código | 0,05 | 0,10 | 0,10 | 0,083 | 20 |
+
+Por pregunta (puesto, `-` fuera de los 10 primeros): d01 1, d03 1, d05 6, d20 10, c02 1, c04 6, c14 2; las otras 33, `-`. De esas 33, 15 tienen como primer hit un doc de `openspec/changes/archive/` y 4 otro doc de `openspec/`.
+
+Las 15 preguntas que ya estaban en la línea base de `docs-search-quality` (`openspec/changes/docs-search-quality/verify.md`, antes del filtro) caen donde caían: d03 1, d05 6, c02 1 y c04 6. d01 pasa de 2 a 1, porque ya no tiene delante la copia de las preguntas. El tiempo de indexado no se compara con aquel (2407,1 s): el corpus creció de 727 docs y 17 584 pasajes a 740 docs y 18 249 pasajes.
+
+### Lo que queda abierto
+
+**WARNING 7. La cota de tamaño de `--help` es falsa.** «At most about 27.6 MB per model contract» (`crates/clawg-eval/src/bin/rag-eval/cli.rs:241`, que fija la prueba de `--help` de la tarea 9) es el tamaño de la memoria de un corpus de 17 584 pasajes. D escribió 28,6 MB con el corpus de hoy. La memoria guarda una entrada de 1568 bytes por texto distinto que alguna corrida embebió y nunca purga, así que crece con el corpus y con cada cambio de los docs. **Arreglo:** que la ayuda dé el costo por texto («about 1.5 KB per passage text, some 28 MB for this repository today») y que diga que crece, no un «at most». Al archivar, el mismo cambio va en IC4 (`spec.md:130`) y en `design.md:243`.
+
+**La varianza de `phases.embed` entre corridas** (+26,8 % de D a R, en sentido contrario al del build). No es un defecto del código, pero afecta a cómo `docs-index-speed` lee sus puertas de tiempo (E y el producto de A1). Lo explica «Lo que hay que saber antes de leer estos tiempos».
+
+A5 y B4 siguen como en el veredicto.
