@@ -120,6 +120,16 @@
     ]
   },
   {
+    "id": "d21",
+    "question": "if what the assistant gets pulled up includes things a different coding program saved, how are those entries tagged, and what warning keeps the assistant from obeying them?",
+    "expected": [
+      {"path": "openspec/specs/sharing/spec.md", "heading": "R4. Lo ajeno se presenta como dato"},
+      {"path": "openspec/changes/archive/2026-10-14-agent-sharing/spec.md", "heading": "R4. Lo ajeno se presenta como dato"},
+      {"path": "README.md", "heading": "Compartir memorias entre agentes"},
+      {"path": "openspec/specs/mcp/spec.md", "heading": "Lo compartido en las herramientas"}
+    ]
+  },
+  {
     "id": "c01",
     "question": "¿dónde se elige el entorno de datos a partir de la línea de comandos, una variable y si el binario es de depuración?",
     "expected": [{"path": "crates/clawg-core/src/paths.rs"}]
