@@ -348,3 +348,194 @@ Son 19 218 pasajes. P son los tokens rellenados, B las tandas, Q las filas × el
 | 4096 | 0,9775 | 0,9837 | 0,9796 | 0,2053 | no (17,2 MiB) | |
 
 **`QUEUE_PASSAGES` = 512.** Es el menor tope con previsto ≥ 0,18 y H ≤ 16 MiB. El corpus de `0c9d49a` elige el mismo: previsto 0,1905 con c = 512 y 0,1713 con c = 256. A2 sigue a la Parte 6, el código de producción. Su «se queda si» lo deciden las corridas alternadas de la Parte 7, no esta cuenta.
+
+## A2: verificación del código (2026-10-31)
+
+Verifica el código de A2: `e8169b4` (la cuenta ignorada y la pieza de la cola, entonces dentro de `tests`) y `17678e0`, `efadede` y `7be1fad` (producción y evaluación), es decir `git show e8169b4` más `git diff 2f92e17..HEAD -- crates docs/reference`. Se compara con la [spec](spec.md) («Paso A2», IS6 a IS17), el [diseño](design.md) («Paso A2», D8 a D15), la Parte 6 de [tasks.md](tasks.md) con sus cinco desviaciones y `QUEUE_PASSAGES` = 512 de «A2: el tope de la cola». No se corrió nada con el modelo real: IS16 e IS17 son de la Parte 7.
+
+- **El árbol.** `HEAD` es `f3de23f` en `develop`, con el árbol limpio. Los cuatro commits de código no tocan `openspec/`, y ninguno cambia `Cargo.toml`, `Cargo.lock`, `tests/e5_golden.rs` ni su fixture.
+- **El build.** Sólo `target-test`, sin limpiar: es el mismo cambio que acaba de compilar la aplicación. No hubo build release, ni modelo real, ni `CLAWG_BLESS`, ni pruebas `#[ignore]`, ni acceso a `~/.clawg*`.
+- **Las mutaciones.** Cada una se aplicó sobre el árbol limpio y se revirtió con `git restore` antes de la siguiente. Se corrieron con `cargo test -p clawg-core --features eval --target-dir target-test --lib --no-fail-fast`. Las que tocan la cola o la evaluación se corrieron también con `cargo test -p clawg-eval --target-dir target-test --bin rag-eval --no-fail-fast`, porque `index_cost` usa `queue_groups` de `clawg-core`. Sólo se juntaron mutaciones de archivos distintos (`embed_shares` con `index_cost.rs` o con `eval_api.rs`, y M6 con M7, que no muerden ninguna de las dos), y cada falla se atribuyó por la prueba y por el mensaje. M18 y M19 tocan la misma función: se corrieron juntas y después M19 sola.
+
+### Las mutaciones
+
+Las líneas son las de `f3de23f`, en `crates/clawg-core/src/memory/project_docs/mod.rs` salvo donde se indica.
+
+| # | Mutación | Prueba que falla | Resultado |
+|---|---|---|---|
+| M1 | el límite no se duplica: `EMBED_BATCH.min(cap)` (`Queue::limit`, `:589`) | `the_queue_limit_starts_at_one_batch_and_doubles_up_to_the_cap` (`:2884`), `a_doc_over_the_limit_is_a_flush_of_its_own` (`:2899`: «the limit grew once per flush»), `small_docs_share_one_call_to_the_embedder` (`:2975`), `each_passage_of_a_shared_call_keeps_its_own_vector` (`:3027`), `no_call_holds_more_passages_than_the_cap_unless_it_is_one_doc` (`:2997`: todas las llamadas de 30), `queue_groups_are_the_calls_a_refresh_makes` (`eval_api.rs:2947`) | muerde |
+| M2 | el límite se duplica sin tope (`:589` sin `.min(cap)`) | sólo las puras: `the_queue_limit_starts_…` (`:2882`), `the_queue_flushes_before_…` (`:2891`), `a_doc_over_the_limit_…` (`:2904`: `[[0], [1], [2, 3], [4, 5, 6]]`) | muerde, pero ninguna prueba de refresco (WARNING 2) |
+| M3 | nunca vacía antes de un doc que pasaría el límite (`:601`) | `the_queue_flushes_before_…` (`:2891`), `a_doc_over_the_limit_…` (`:2898`), `a_doc_over_the_cap_goes_alone` (`:3012`), `queue_groups_are_the_calls_…` | muerde |
+| M4 | sólo vacía al terminar el plan (`:601` y `:606` siempre falsos) | once: las cuatro puras, `small_docs_share_…`, `no_call_holds_…`, `a_doc_over_the_cap_…`, `each_passage_…`, `an_embedder_error_keeps_the_docs_of_its_call_as_they_were`, `queue_groups_are_the_calls_…` y `what_a_run_embedded_before_the_index_failed_is_kept` (`eval_api/vector_memo.rs:969`) | muerde |
+| M5 | un doc más grande que el límite se suma a los de la cola (`:601` con `&& passages <= limit`) | `a_doc_over_the_limit_…` (`:2898`), `a_doc_over_the_cap_…` (`:3012`), `queue_groups_are_the_calls_…` | muerde |
+| M6 | sin la vuelta temprana de un doc sin pasajes (`:598-600`) | ninguna | **no muerde**: mutante equivalente |
+| M7 | el límite sin `.min(16)` en el corrimiento (`:589`) | ninguna | **no muerde** (SUGGESTION 1) |
+| M8 | `refresh` arma la cola con `Queue::new(usize::MAX)` (`:516`) | ninguna | **no muerde** (WARNING 2) |
+| M9 | una llamada de varios docs va sin ordenar (`:821`, `None` con más de un dueño) | `small_docs_share_…` (`:2977`: «longest first») | muerde |
+| M10 | se ordena dentro de cada doc y no sobre la lista entera (`:821`) | `small_docs_share_…` (`:2977`) | muerde |
+| M11 | los vectores de una llamada compartida, corridos en uno (`rotate_left(1)` antes de `:840`) | `each_passage_…` (`:3032`), `an_unusable_vector_in_a_shared_call_skips_only_its_doc`, `an_unusable_vector_skips_its_doc_and_the_rest_go_on`, `a_refresh_times_a_doc_whose_vector_is_unusable`, `search_finds_a_passage_by_meaning`, `search_finds_an_identifier_lexically` y `a_doc_the_index_could_not_embed_fails_the_measurement` (`eval_api.rs`) | muerde |
+| M12 | el reparto por dueño, al revés (`:841-851` sobre `owners.iter().rev()`) | `each_passage_…` (`:3032`) y las demás de M11 salvo `an_unusable_vector_in_a_shared_call_…`, que sólo mira rutas y cuentas | muerde |
+| M13 | un vector inutilizable hace fallar a todos los docs de la llamada (`:840`) | `an_unusable_vector_in_a_shared_call_…` (`:3048`), `an_unusable_vector_skips_its_doc_…`, `a_refresh_times_a_doc_whose_vector_is_unusable` | muerde |
+| M14 | el doc que sigue a un vector inutilizable toma el resto de los vectores de ese doc: `take(n).collect::<Result<…>>()` sin la colección intermedia (`:846-849`), el riesgo que nombra el comentario de `:844-845` | ninguna | **no muerde** (WARNING 3) |
+| M15 | las escrituras esperan al final del refresco (`replace_doc` de `:778` diferido hasta después del último vaciado) | `an_embedder_error_keeps_…` (`:3097`: «only the docs of the earlier call») | muerde |
+| M16 | ante un error del embedder, los docs de esa llamada se escriben igual, con su huella y sin pasajes (`:752`) | `an_embedder_error_keeps_…`, `a_failed_embedding_keeps_the_doc_as_it_was`, `a_failed_embedding_of_the_rest_keeps_the_doc_as_it_was`, `a_short_batch_still_aborts_the_refresh` | muerde |
+| M17 | los docs de un vaciado se escriben al revés (`:756` con `.rev()`) | `a_shared_call_writes_its_docs_in_plan_order` (`:3080`: «row ids grow with the path and the ordinal») | muerde |
+| M18 | `Embed` y `VectorCount` nombran al último dueño (`:819`) | `an_embedder_error_keeps_…` (`:3094`: `d.md`), `a_short_batch_still_aborts_…` (`:1496`: `b.md`) | muerde |
+| M19 | `VectorCount.passages` cuenta los textos del primer doc y no los de la llamada (`:834`) | ninguna: la única aserción sobre `VectorCount` (`:1496`) usa `..` | **no muerde** (SUGGESTION 2) |
+| M20 | la cola cuenta sólo los textos a embeber y no los pasajes reutilizados (`:546`, `to_embed.len()`) | ninguna | **no muerde** (WARNING 4) |
+| M21 | `embed_shares` pierde el resto (`:799`) | `embed_shares_split_the_time_by_texts_and_add_up_to_it` (`:3107`: «the rest goes to the last») | muerde |
+| M22 | `embed_shares` reparte en partes iguales (`:796`) | `embed_shares_split_…` (`:3106`) | muerde |
+| M23 | `embed_shares` le da tiempo a un doc sin textos (peso n + 1, `:796`) | `embed_shares_split_…` (`:3108`: «a doc with no texts gets none») | muerde |
+| M24 | el resto va al último doc y no al último con textos (`:798`) | ninguna | **no muerde** (SUGGESTION 3) |
+| M25 | `eval_api::queue_groups` con la mitad del tope (`eval_api.rs:1208`) | ninguna | **no muerde** (SUGGESTION 4) |
+| M26 | `eval_api::queue_groups` con tope `EMBED_BATCH` (`eval_api.rs:1208`) | `queue_groups_are_the_calls_…` (`eval_api.rs:2947`) | muerde |
+| M27 | `project_docs::queue_groups` no usa la decisión de la cola: cada doc es su grupo (`:620`) | `queue_groups_are_the_calls_…`, `a_doc_with_no_passages_moves_no_flush` (`:2912`), `padded_sorted_queue_sorts_each_group_of_docs_together` (`crates/clawg-eval/src/bin/rag-eval/index_cost.rs:432`) | muerde |
+| M28 | `padding_warning` vuelve a comparar `padded_sorted_in_doc` (`index_cost.rs:171`) | `the_padding_warning_compares_with_the_queue_padding` (`index_cost.rs:455`: «the model ran the queue's padding»), `a_mismatch_between_computed_and_ran_padding_warns_only_when_nothing_came_from_the_memo` (`:480`) | muerde |
+| M29 | `padded_sorted_queue` se calcula doc por doc (`index_cost.rs:132`) | `padded_sorted_queue_sorts_each_group_…` (`:432`) | muerde |
+| M30 | el mensaje del aviso nombra `padded_sorted_in_doc` (`index_cost.rs:174`) | `the_padding_warning_names_both_numbers` (`:468`), `the_padding_warning_compares_…` (`:456`), `a_mismatch_…` (`:478`) | muerde |
+
+De las 30 mutaciones, 22 muerden. Todas las pruebas nuevas de refresco muerden al menos una: `small_docs_share_…` (M1, M4, M9, M10), `each_passage_…` (M1, M4, M11, M12), `an_unusable_vector_in_a_shared_call_…` (M11, M13), `a_shared_call_writes_…` (M17), `an_embedder_error_keeps_…` (M4, M15, M16, M18), `a_doc_over_the_cap_goes_alone` (M3, M4, M5) y `no_call_holds_…` (M1, M4). La de `rag-eval`, `padded_sorted_queue_sorts_each_group_…`, no ve M1, M4 ni M26: sus tres docs dan los mismos grupos con límite 16 o con una sola llamada. Esas mutaciones las ve `queue_groups_are_the_calls_…` del lado de `clawg-core`.
+
+**Las que no muerden, y cuánto importa.**
+- **M6 es equivalente.** Después de cada `admit` la cola retiene menos que su límite, porque si llega a él se vacía. Un doc de 0 pasajes no puede entonces disparar ni el vaciado de antes ni el de después. La vuelta temprana sólo documenta la intención.
+- **M7 importa con muchos vaciados.** `EMBED_BATCH << 60` da 0 en `usize`. Sin el `.min(16)`, del vaciado 60 al 63 el límite valdría 0, y cada doc iría solo. En debug, el vaciado 64 entraría en pánico. Con 512 pasajes por vaciado, este repositorio queda en unas decenas de vaciados (19 218 pasajes, «A2: el tope de la cola»), y uno algo más grande pasa de 60. Ninguna prueba hace más de unos pocos vaciados.
+- **M8, M14 y M20** son WARNING 2, 3 y 4. **M19, M24 y M25** son SUGGESTION 2, 3 y 4.
+
+### La conducta que cuida el diseño
+
+- **`RefreshReport`, igual para las mismas entradas.** Sus campos son sumas. `failed` sigue el orden del plan, porque los vaciados van en ese orden y `write_queued` recorre sus docs en el orden en que entraron (`:756`). Lo fijan `a_shared_call_writes_…` (`:3068`, contra el informe literal de un refresco doc por doc), `timing_does_not_change_what_a_refresh_writes` y `a_reordered_doc_writes_what_an_unordered_one_wrote` (`:2422`). Ninguna prueba tiene dos docs en `failed` en una llamada, así que el orden de `failed` dentro de un vaciado sólo lo cubre, de paso, M17, por los ids.
+- **Los ids de fila y los empates del ranking (D11).** Cada doc se escribe con su propio `replace_doc`, en el orden del plan (`:778`), así que la secuencia de `INSERT` es la de antes de la cola, y `fuse` desempata por id (`:392`). Lo fija `a_shared_call_writes_…` (M17). Un doc de un vaciado que falla por el embedder ya no queda escrito aunque vaya antes del texto que falló. Es lo que elige D10 y no cambia el informe, porque el resultado es un `Err`.
+- **Los tiempos siguen sumando `index_seconds`.** Cada `lap` empieza donde terminó el anterior. `embed_shares` reparte el `lap` del vaciado entero (M21 a M23). Un vaciado sin textos deja el tiempo en la marca, y lo toma el `lap` siguiente: la escritura del primer doc, la lectura del doc siguiente o `remove`. Es la desviación (2). Un doc que no se pudo leer anota su tiempo en el momento (`:529`). La línea del daemon (`refresh_timing_line`, `crates/clawg-cli/src/daemon/api.rs:3029-3042`, IC2) no cambió, y `the_docs_timing_line_names_every_phase` (`api.rs:3207`) pasa.
+- **`timing.docs`, ahora en el orden en que terminan los docs.** Ningún consumidor depende del orden del plan:
+  - `api.rs:3030` sólo suma, con `RefreshTiming::phases`.
+  - `eval_api.rs:1519-1536` copia la lista en el mismo orden a `EvalIndexRun::docs`.
+  - En `rag-eval`, `Phases::of` suma (`index_cost.rs:22-35`) y `ByArea::of` agrupa por ruta y suma (`:261-300`). El bloque `index` no guarda una lista por doc (`IndexBlock::new`, `:324-342`).
+  - Las pruebas ordenan antes de comparar (`mod.rs:1296`, `:1478`, `eval_api.rs:2876`, `:2941`).
+- **La memoria (D13), por inspección.**
+  - Un doc en cola retiene lo que dice D13 (`QueuedDoc`, `:721-732`): ruta, tipo y hash, sus pasajes, el plan de reutilización con los blobs reutilizados, los textos a embeber y sus fases. El texto leído y el enmascarado se sueltan al terminar la vuelta del bucle.
+  - Los textos se mueven sin copiarse: `mem::take` en `:750` y `slots[k].take()` en `:824-825`.
+  - Lo que H no cuenta es el WARNING 5.
+
+### Cumplimiento de la spec
+
+Cada escenario contra la prueba que lo sostiene, en la corrida final. ✅ cumple; ⚠️ parcial; ➖ no aplica; ⏳ pendiente de la Parte 7.
+
+| Requisito | Escenario | Prueba | |
+|---|---|---|---|
+| IS6 | un tope cumple | `padding_and_batches_by_queue_cap` (`mod.rs:2803`, ignorada; se corrió con autorización, «A2: el tope de la cola»): c = 512. Desde `17678e0` usa la pieza de producción (`queue_calls` llama a `queue_groups`, que pasó a producción) | ✅ |
+| IS6 | ninguno cumple | no aplica: c = 512 cumple (Parte 5d) | ➖ |
+| IS7 | el límite crece | `the_queue_limit_starts_…` (`:2877`): 16, 32, 64, 64 (M1, M2, M4) | ✅ |
+| IS7 | vaciar antes y al llegar | `the_queue_flushes_before_…` (`:2888`, con tope 16: M2, M3, M4) | ✅ |
+| IS7 | un doc vacío | `a_doc_with_no_passages_moves_no_flush` (`:2908`, M4 y M27; M6 es equivalente) | ✅ |
+| IS7 | (texto) los pasajes reutilizados cuentan contra el límite | ninguna (M20, WARNING 4) | ⚠️ |
+| IS8 | un doc grande | `a_doc_over_the_limit_is_a_flush_of_its_own` (`:2896`, 3 y 40 con límite 16) y `a_doc_over_the_cap_goes_alone` (`:3001`) (M3, M5). El escenario usa un doc de 40, más del doble del límite. Uno de entre 17 y 31 no va solo (WARNING 1) | ✅ |
+| IS8 | el tope se respeta | `no_call_holds_…` (`:2982`): con 20 docs de 30, las llamadas son 30, 30, 60, 120, 240 y 120. El límite nunca llega a 512, y la prueba pasa sin tope (M8, WARNING 2) | ⚠️ |
+| IS9 | docs chicos | `small_docs_share_…` (`:2957`, con la desviación (1): un doc de 16 antes) (M1, M9, M10) | ✅ |
+| IS10 | una llamada, tres docs | `each_passage_…` (`:3016`: 18 textos reordenados entre tres docs, y cada blob es el de su texto) (M11, M12) | ✅ |
+| IS11 | el del medio | `an_unusable_vector_in_a_shared_call_…` (`:3037`) (M13). No mira los vectores del tercer doc, que con M14 se escribe con el vector del segundo (WARNING 3) | ⚠️ |
+| IS12 | falla el segundo vaciado | `an_embedder_error_keeps_…` (`:3085`) (M15, M16, M18). `VectorCount.passages` no se afirma (M19, SUGGESTION 2) | ✅ |
+| IS13 | ids por ruta | `a_shared_call_writes_…` (`:3057`, también el informe) (M17) | ✅ |
+| IS14 | el reparto suma | `embed_shares_split_…` (`:3104`) (M21 a M23; M24 no, SUGGESTION 3) | ✅ |
+| IS14 | todo doc con textos tiene `embed` | `every_doc_of_a_shared_call_has_embed_time` (`:3123`) | ✅ |
+| IS14 | (texto) la línea del daemon no cambia de forma | `the_docs_timing_line_names_every_phase` (`api.rs:3207`); `api.rs` no cambió | ✅ |
+| IS15 | coinciden | `the_padding_warning_compares_with_the_queue_padding` (`index_cost.rs:447`) (M28) | ✅ |
+| IS15 | difieren | la misma y `the_padding_warning_names_both_numbers` (`:463`) (M28, M30) | ✅ |
+| IS15 | (texto) sin aviso con `from_memo > 0` | la misma (`from_memo = 30`) y `a_mismatch_…` (`:472`) | ✅ |
+| IS15 | los grupos son las llamadas | `queue_groups_are_the_calls_…` (`eval_api.rs:2924`, `[3, 20, 5, 0, 5]`) (M1, M3, M4, M5, M26, M27; M25 no, SUGGESTION 4) | ✅ |
+| IS15 | (texto) `padded_sorted_queue` por grupo; los archivos viejos se leen con `--diff` | `padded_sorted_queue_sorts_each_group_…` (`index_cost.rs:432`) (M27, M29); `a_results_file_with_an_index_block_still_diffs_against_an_old_one` y `…without_an_index_block…` (`docs.rs:1117`, `:1130`). La comparación sólo lee `golden_sha256`, `corpus.left_out` y `per_case` (`docs.rs:410-420`), y `padded` y `padded_sorted_in_doc` no cambian de nombre | ✅ |
+| IS16 | el informe | Parte 7a y 7b, sin escribir | ⏳ |
+| IS17 | el pico | Parte 7d | ⏳ |
+
+**De los 15 escenarios de producción (IS7 a IS15), 13 cumplen enteros y 2 en parte** («el tope se respeta» y «el del medio»). Ninguno queda sin prueba. Hay además una regla del texto de IS7 que no sostiene ninguna prueba (los pasajes reutilizados cuentan). IS6 cumple con su corrida. IS16 e IS17 esperan a la Parte 7.
+
+**TDD.** No hay un artefacto `apply-progress`: la evidencia de TDD es la de `tasks.md` (RED, GREEN y comprobación por grupo), y cada commit lleva su código con sus pruebas, como en A1. Las pruebas que `tasks.md` nombra existen y pasan. Que muerden lo prueban las mutaciones de arriba.
+
+### El diseño
+
+| Decisión | ¿Se siguió? | Notas |
+|---|---|---|
+| D8. La cola | ⚠️ | Una pieza pura (`Queue`, `:573-612`) que recorren `refresh` (`:546`) y `queue_groups` (`:616-633`). El tope cuenta los pasajes retenidos, y los vectores vuelven por posición. El caso de un doc más grande que el límite difiere en la rampa (WARNING 1), y la regla de los reutilizados no tiene prueba (WARNING 4) |
+| D9. El tope | ✅ | La cuenta de `e8169b4` usa la misma pieza, que desde `17678e0` es la de producción. `QUEUE_PASSAGES` = 512 (`:564`) |
+| D10. Fallos | ✅ | Un vector inutilizable devuelve el error de su doc (`:841-851`), que va a `failed` (`:760-764`). `Embed` y `VectorCount` nombran al primer doc, con `passages` = textos del vaciado (`:819`, `:832-835`). Un fallo del store en `replace_doc` corta con los anteriores escritos (`:778`) |
+| D11. Escritura y latencia | ✅ | Una transacción por doc, en el orden del plan. El límite empieza en 16 y se duplica |
+| D12. Tiempos | ✅ | `embed_shares` (`:790-802`) en nanosegundos, con el resto al último doc con textos. Hay una desviación justificada, la (2) |
+| D13. Memoria | ⚠️ | Lo retenido por doc y los textos movidos, como dice. La cota H no cubre todo lo que tiene el vaciado (WARNING 5) |
+| D14. La evaluación | ✅ | `eval_api::queue_groups` (`eval_api.rs:1207-1209`) delega en la pieza con el tope de producción. Están `padded_sorted_queue`, el aviso (`index_cost.rs:170-177`), `Tokens::line` y los comentarios. Hay un detalle en el de `padded` (SUGGESTION 6) |
+| D15. Bits | ➖ | No hay caso nuevo en `e5_golden` ni cambió su tolerancia. El tercer orden de `sorting_across_docs_…` es la Parte 7a |
+
+Las desviaciones de `tasks.md` se sostienen. (1) Con límite 16, cuatro docs de 5 no caben en una llamada. (2) Ver arriba. (3) `what_a_run_embedded_before_the_index_failed_is_kept` necesita que el primer doc vaya solo, y M4 la hace fallar. (4) `queue_groups` tras `cfg(any(test, feature = "eval"))`. (5) Los tamaños 16 y 6 de la llamada que falla.
+
+### `.claude/CLAUDE.md` y las reglas
+
+- **Nada prohibido en el rango.** No hay `#[allow]`, ni código comentado, ni `TODO`. Los comentarios nuevos dicen un porqué:
+  - por qué un vaciado sin textos no reparte (`:753-754`);
+  - por qué se junta cada doc antes de recolectar sus resultados (`:844-845`);
+  - por qué el primer doc va solo en las dos pruebas que lo necesitan (`vector_memo.rs:972-973`, `index_cost.rs:433-434`).
+- **El comentario de «one changed doc in memory at a time» ya no está.** El de `:521-524` dice ahora que el refresco retiene sólo los docs de su cola, que acota `QUEUE_PASSAGES` («a doc past it goes alone»), y no el árbol. Es cierto: un doc con más pasajes que el tope siempre va solo.
+- **Sin referencias al plan.** En las líneas agregadas no aparecen IS, D, A1, A2, paso, `openspec` ni spec. Los cinco commits (`e8169b4`, `17678e0`, `efadede`, `7be1fad` y `f3de23f`) son convencionales, sin cuerpo y sin atribución. Los de código no tocan `openspec/`.
+- **Visibilidad.**
+  - `QUEUE_PASSAGES` es `pub(crate)`: lo usan `refresh` y `eval_api`.
+  - `project_docs::queue_groups` es `pub(crate)` tras `cfg(any(test, feature = "eval"))`. Lo llaman `eval_api::queue_groups` (con `eval`) y la cuenta ignorada (con `test`). Sin ninguno de los dos no se compila, así que no es código muerto, y el clippy de `clawg-cli` sin `eval` pasa.
+  - `eval_api::queue_groups` es `pub`. La usa `rag-eval` (`index_cost.rs:132`), y `eval_api` sólo existe con `eval` (`crates/clawg-core/src/lib.rs:22-23`).
+  - `Queue`, `Flush`, `Target`, `QueuedDoc`, `write_queued` y `embed_shares` son privados. `Target` agrupa las cinco referencias que necesita `write_queued`.
+- **Puro e I/O.** `Queue`, `queue_groups` y `embed_shares` son puras. No hay dependencias nuevas.
+- **Temporales.**
+  - Al terminar apareció un `.tmp*` nuevo en el temporal del sistema, con un `memory.db` de 2 MiB y un `memory.lock` vacío. Se creó durante la corrida de `cargo test --workspace`. Tiene la forma de los que encontró la verificación de A1: un store en disco de alguna prueba que no lo suelta.
+  - Las pruebas de refresco de A2 usan `MemoryStore::new_for_test`, en memoria, y la de `eval_api` usa `test_dir()` y `close`. Así que no parece de este cambio.
+  - Se borró, porque lo creó esta verificación. Las demás entradas nuevas del temporal (nombres UUID `.tmp`, fuentes, video, un log) son de otros programas.
+  - `docs/eval/cache/` ya tenía un `docs-vectors-*.bin` de antes. No se tocó: es la Parte 7f.
+- **`docs/reference/daemon.md`** describe la cola, el tope, el límite que crece, la escritura en el orden del plan, los fallos y el reparto del tiempo. Tiene dos detalles: WARNING 1 y SUGGESTION 5.
+
+### Lo que encontró la verificación
+
+**CRITICAL:** ninguno.
+
+**WARNING:**
+
+1. **Un doc de más pasajes que el límite no siempre va solo.** IS8, D8, el comentario de `QUEUE_PASSAGES` (`mod.rs:562-563`) y `daemon.md` dicen que va solo.
+   - **Qué hace el código.** `Queue::admit` (`:597-611`) vacía antes, y con eso duplica el límite. Después compara al doc con el límite nuevo. Con límite 16 y 3 pasajes en cola, un doc de 20 vacía los 3. Queda solo con límite 32, no llega, y el doc siguiente se le suma.
+   - **Dónde pasa.** Sólo durante la rampa, con la cola no vacía, para docs de entre límite + 1 y 2 × límite − 1 pasajes. En el tope el límite ya no crece, así que un doc de más de 512 siempre va solo. Lo de IS8 «el tope se respeta» vale siempre, porque cada doc que se suma cabe en un límite que no pasa del tope.
+   - **Qué no cambia.** La cuenta de IS6 y `queue_groups` usan la misma pieza, así que la tabla, la evaluación y el refresco coinciden.
+   - **Arreglo:** corregir el texto, que es lo más barato y deja válida la tabla de IS6: «un doc con más pasajes que el límite que rige después del vaciado anterior va solo», en IS8, D8, `:562-563` y `daemon.md`. La alternativa es que `admit` recuerde `passages > limit()` antes de vaciar y vacíe también después. Eso cambia levemente los grupos de la rampa que midió la tabla.
+2. **Ninguna prueba de refresco llega al tope** (M2 y M8). En `no_call_holds_…` (`:2982`), los 600 pasajes reparten las llamadas en 30, 30, 60, 120, 240 y 120: el límite no llega a 512, y la prueba pasa aunque `refresh` arme la cola sin tope. Sólo las pruebas puras, con tope 64 o 16, ven el tope, y el valor 512 lo sostiene sólo `assert!(QUEUE_PASSAGES < 600)`. **Arreglo:** que los docs sumen bastante más que 16 + 32 + … + 512 = 1008 (por ejemplo, 60 docs de 30 pasajes) y que la prueba afirme también que alguna llamada pasa de `QUEUE_PASSAGES / 2`. Con el tope, las llamadas llegan a 510. Con M8, la última llevaría 810 pasajes de 27 docs, y la prueba fallaría.
+3. **Un vector inutilizable no debe correr los vectores del doc siguiente** (M14). Si el doc con el vector malo tiene más textos después de él, cortar la colección en el primer error deja el resto al doc que sigue. Ese doc se escribiría con vectores ajenos, sin error. Hoy el código lo evita (`:846-849`), y el comentario lo dice, pero `an_unusable_vector_in_a_shared_call_…` sólo mira rutas y cuentas. **Arreglo:** que esa prueba compare el blob de `c.md` con el de `FakeEmbedder` para su texto, como `each_passage_…` (`:3030-3033`). El vector malo de `b.md` va primero en su doc, así que con M14 fallaría.
+4. **Que los pasajes reutilizados cuenten contra el límite no lo sostiene ninguna prueba** (M20; IS7, D8 «qué cuenta el tope»). Es la regla que acota la memoria de un refresco incremental que reutiliza casi todo. **Arreglo:** una prueba que indexe dos docs de 16 pasajes y después cambie uno de cada uno. El segundo refresco tiene que hacer dos llamadas de un texto, porque cada doc llena el límite de 16 con sus pasajes. Contando sólo los textos, haría una de dos.
+5. **La cota H de D13 no acota lo que retiene un vaciado.** Es por inspección, sin medir. H = Σ (3 × bytes del texto + 1536) deja fuera dos cosas:
+   - **Las codificaciones del tokenizer.** `passage_order` cuenta toda la llamada de una vez. `passage_token_counts` → `window_encodings` (`crates/clawg-core/src/memory/embedder.rs:249-279`) arma un `tokenizers::Encoding` por texto, y todos coexisten. Cada uno guarda por token ids, type_ids, el token como `String`, words, offsets y dos máscaras: unos 70 a 80 B por token. Con 512 pasajes de unos cientos de tokens son del orden de 10 MiB, varias veces los 2,2 MiB de H. En el peor caso, 512 pasajes de 512 tokens, unos 20 MB, más que los 16 MiB de D13. A1 ya hacía lo mismo con el doc más grande (278 pasajes en este corpus). A2 lo lleva al mayor entre 512 y ese doc.
+   - **Los vectores en dos copias.** En `embed_passages` los vectores f32 viven hasta el final, mientras se arman los blobs (`:836-851`): son 3072 B por texto, no 1536.
+
+   IS17 mide el pico real y sigue siendo la puerta. **Arreglo:** contar en tandas de `EMBED_BATCH` dentro de `passage_token_counts`, guardando sólo los largos, como ya hace `lengths_by_doc` (`eval_api.rs:1426-1433`), y recorrer `vectors` con `into_iter` al armar los blobs. Así H vuelve a ser una cota.
+
+**SUGGESTION:**
+
+1. **El `.min(16)` de `Queue::limit` (`:589`) no lo fija ninguna prueba** (M7). Basta una prueba pura con más de 64 vaciados, por ejemplo `queue_groups(QUEUE_PASSAGES, &[QUEUE_PASSAGES; 80])`: tiene que dar 80 grupos de uno, sin pánico.
+2. **`VectorCount.passages` = textos del vaciado** (IS12, MUST) no se afirma (M19). Basta afirmar `passages: 2` en `a_short_batch_still_aborts_the_refresh` (`:1496`), cuyos dos docs comparten la llamada.
+3. **«El resto al último doc con textos» no se prueba** (M24). Ningún caso de `embed_shares_split_…` termina en un doc sin textos con resto. Basta un caso como `embed_shares(ns(10), &[1, 1, 1, 0])`, que tiene que dar `[3, 3, 4, 0]`.
+4. **`queue_groups_are_the_calls_…` no distingue 512 de 256 ni de 1024** (M25). Sus 33 pasajes no pasan del límite 32. Con el arreglo del WARNING 2 aplicado a esa prueba (un árbol que llegue al tope), la igualdad con las llamadas de `refresh` fijaría también que la evaluación usa el tope de producción.
+5. **`daemon.md`, una frase vieja.** «With that many or fewer, without a tokenizer, or when counting fails, they go in the passages' order» quedó repetida después de la frase de los fallos. Su versión nueva («…in the order of the plan») ya está antes. Hay que borrar la vieja.
+6. **El comentario de `Tokens::padded`** (`index_cost.rs:106-107`) dice «what the model would run if a refresh did not sort them». Con la cola, un refresco sin tokenizer junta docs en una llamada, así que eso ya no es `padded`, que sigue siendo doc por doc. Basta decir «doc by doc, in the order of each doc's passages, as a refresh ran before it sorted or queued».
+
+### Resultado de la suite y de clippy
+
+Sobre `f3de23f` (`HEAD`), con el árbol limpio, después de revertir M1 a M30:
+
+- `cargo test --workspace --no-fail-fast --target-dir target-test`: pasa (salida 0). Las ignoradas son las de antes más `padding_and_batches_by_queue_cap`.
+- `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`: salida 0.
+- `cargo clippy --locked -p clawg-cli --target-dir target-test -- -A clippy::all -D warnings`: salida 0.
+- M20 se aplicó y se revirtió después de esa corrida. Al terminar, `git status` sólo muestra este archivo y `git diff HEAD -- crates` no da nada, así que la suite corrió sobre los mismos bytes que quedan.
+- Sólo quedan `target` y `target-test`. No se volvió a medir ninguna métrica de `rag-eval`: es la Parte 7.
+
+### Veredicto
+
+**PASS WITH WARNINGS.** La suite y los dos clippy pasan. De las 30 mutaciones muerden 22, y cada prueba nueva de refresco muerde al menos una. Muerden el límite que crece y su tope en las pruebas puras, las tres causas de vaciado, el doc grande, el orden sobre la llamada entera, la vuelta de cada vector a su doc y a su pasaje, el vector inutilizable que omite sólo su doc, el error del embedder (qué queda escrito, qué se vuelve a planear y a quién nombra), el orden de escritura, el reparto del tiempo y la evaluación (los grupos, el campo, el aviso y su mensaje).
+
+No muerden ocho:
+- una equivalente (M6);
+- tres que dejan sin prueba reglas de la spec: el tope en un refresco real (M8), los vectores del doc que sigue a uno inutilizable (M14) y los pasajes reutilizados que cuentan (M20), que son los WARNING 2 a 4;
+- cuatro de detalle (M7, M19, M24 y M25), que son SUGGESTION.
+
+13 de los 15 escenarios de producción cumplen enteros y 2 en parte.
+
+El código no lo contradice ningún escenario, pero hay dos puntos donde el texto y el código difieren. Un doc de más pasajes que el límite se suma a los siguientes durante la rampa (WARNING 1, que se arregla en el texto). La cota de memoria de D13 no cuenta las codificaciones del tokenizer ni la doble copia de los vectores (WARNING 5), y así el pico de IS17 es la única puerta de memoria.
+
+IS16 e IS17 esperan a la Parte 7. Ningún hallazgo cambia lo que el refresco escribe ni un número de la tabla de IS6.
