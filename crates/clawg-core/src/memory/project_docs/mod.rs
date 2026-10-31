@@ -8,6 +8,7 @@
 pub mod chunk;
 pub mod code;
 pub mod corpus;
+mod lexical;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,7 +19,6 @@ use crate::memory::chunker::token_splitter::TokenSplitter;
 use crate::memory::clock::TimestampMs;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::redact::redact;
-use crate::memory::search::{fts_match_expression, MAX_LEXICAL_TOKENS};
 use crate::memory::vector::to_unit;
 use crate::memory::MemoryStore;
 
@@ -407,7 +407,7 @@ pub async fn search(
         .map_err(|e| DocIndexError::Query(e.to_string()))?;
     let vector = to_unit(&vector).map_err(|e| DocIndexError::Query(e.to_string()))?;
     let bytes = le_bytes(&vector);
-    let expression = fts_match_expression(query, MAX_LEXICAL_TOKENS);
+    let expression = lexical::docs_match_expression(query);
     let project_id = project_id.to_string();
     Ok(store
         .conn
@@ -1851,6 +1851,23 @@ old
 
         assert_eq!(crumbs(&dense_only).last(), Some(&"chunker.md > Cap"), "by meaning it is the farthest");
         assert_eq!(crumbs(&hits)[0], "chunker.md > Cap");
+    }
+
+    #[tokio::test]
+    async fn rare_words_beat_stopwords_in_the_lexical_channel() {
+        let (_dir, store) = indexed(&[
+            ("a.md", "# Uno\nde el the de el the\n"),
+            ("b.md", "# Dos\nTombstone, fingerprint, port.\n"),
+            ("c.md", "# Tres\nnada aquí\n"),
+            ("d.md", "# Cuatro\notra cosa\n"),
+        ])
+        .await;
+
+        let dense_only = search(&store, &Topical, "p", "zzz", 5).await.unwrap();
+        let hits = search(&store, &Topical, "p", "¿de dónde sale el tombstone y the fingerprint?", 5).await.unwrap();
+
+        assert_eq!(crumbs(&dense_only).last(), Some(&"b.md > Dos"), "by meaning it is the farthest");
+        assert_eq!(crumbs(&hits)[0], "b.md > Dos", "{:?}", crumbs(&hits));
     }
 
     #[tokio::test]

@@ -902,7 +902,7 @@ pub(crate) fn identifier_tokens(query_text: &str) -> Vec<&str> {
     out
 }
 
-fn is_identifier(token: &str) -> bool {
+pub(crate) fn is_identifier(token: &str) -> bool {
     let has_letter = token.chars().any(char::is_alphabetic);
     let has_digit = token.chars().any(char::is_numeric);
     let has_hump = token.chars().zip(token.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase());
