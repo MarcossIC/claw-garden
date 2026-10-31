@@ -1,14 +1,14 @@
 change: agent-eval
 objective: "1, 5"
 depends_on: []
-phase: explore
+phase: apply
 artifacts:
   exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
+  proposal: done  # el arnés sin gasto; el piloto y su fixture quedan fuera
+  spec: done  # AE1 a AE6
+  design: skipped  # las decisiones están en la propuesta
+  tasks: done
+  apply: done  # grupos 1 a 4
   verify: pending
   archive: pending
 updated: 2026-10-31
