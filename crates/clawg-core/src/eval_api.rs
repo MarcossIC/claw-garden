@@ -51,6 +51,7 @@ use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, ChunkOutcome, IngestRequest};
 use crate::memory::TableKind;
+use crate::metrics::Recorder;
 use crate::models::chat::Role;
 use crate::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
 
@@ -543,9 +544,16 @@ fn parse_memory_type(raw: &str) -> Result<MemoryType, EvalError> {
 /// discipline as [`EvalStore`]: the concrete implementation is boxed behind
 /// this module's own type, so neither the `Embedder` trait nor either of its
 /// implementations is ever named outside this file.
-pub struct EvalEmbedder(Arc<dyn Embedder>);
+pub struct EvalEmbedder {
+    inner: Arc<dyn Embedder>,
+    metrics: Arc<Recorder>,
+}
 
 impl EvalEmbedder {
+    fn of(inner: Arc<dyn Embedder>, metrics: Arc<Recorder>) -> Self {
+        EvalEmbedder { inner, metrics }
+    }
+
     /// A deterministic double: the same text always yields the same vector,
     /// with no model to load and no network involved. Its vectors are NOT
     /// L2-normalized (`‖v‖ ≈ 11.3` rather than 1.0), so distances measured
@@ -553,7 +561,7 @@ impl EvalEmbedder {
     /// the real model — a run against this embedder validates plumbing and
     /// metric code, not retrieval quality.
     pub fn fake() -> Self {
-        EvalEmbedder(Arc::new(FakeEmbedder::default()))
+        EvalEmbedder::of(Arc::new(FakeEmbedder::default()), Arc::default())
     }
 
     /// Loads the real embedding model rooted at `base_dir`, downloading it
@@ -566,13 +574,14 @@ impl EvalEmbedder {
         // The evaluation tools are not the daemon: they parse their own copy.
         let tokenizer = model_download::parse_verified_tokenizer(&files.tokenizer.tokenizer_file)
             .map_err(EvalError::ModelLoad)?;
-        let inner = E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer, Arc::default())
+        let metrics = Arc::<Recorder>::default();
+        let inner = E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer, metrics.clone())
             .map_err(|e| EvalError::ModelLoad(e.to_string()))?;
-        Ok(EvalEmbedder(Arc::new(inner)))
+        Ok(EvalEmbedder::of(Arc::new(inner), metrics))
     }
 
     pub async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EvalError> {
-        self.0
+        self.inner
             .embed_with_role(text, role)
             .await
             .map_err(|e| EvalError::Embed(e.to_string()))
@@ -581,26 +590,39 @@ impl EvalEmbedder {
     /// One vector per text, in input order, through the embedder's batch path:
     /// a real model cuts the texts into the batches production cuts.
     pub async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EvalError> {
-        self.0
+        self.inner
             .embed_batch(texts, role)
             .await
             .map_err(|e| EvalError::Embed(e.to_string()))
     }
 
     pub fn dimensions(&self) -> usize {
-        self.0.dimensions()
+        self.inner.dimensions()
     }
 
     pub fn model_id(&self) -> &str {
-        self.0.model_id()
+        self.inner.model_id()
     }
 
     pub fn query_prefix(&self) -> &str {
-        self.0.query_prefix()
+        self.inner.query_prefix()
     }
 
     pub fn passage_prefix(&self) -> &str {
-        self.0.passage_prefix()
+        self.inner.passage_prefix()
+    }
+
+    /// The tokens, padding included, that the session has run over for
+    /// passages since this handle was made. The recorder stays a private
+    /// field so a caller can read this one number and nothing else of it.
+    pub fn passage_tokens_ran(&self) -> f64 {
+        self.metrics
+            .minute()
+            .gauges
+            .iter()
+            .filter(|(key, _)| key.name == "embedder.batch_tokens" && key.label_pairs().contains(&("role", "passage")))
+            .map(|(_, gauge)| gauge.sum)
+            .sum()
     }
 }
 
@@ -697,12 +719,12 @@ impl EvalIngest {
         let (mut runtime, _) = MemoryRuntime::open(base_dir.to_path_buf(), StoreHolder::Eval)
             .await
             .map_err(|e| EvalError::Open(e.to_string()))?;
-        let _ = runtime.embedder.set(embedder.0.clone());
+        let _ = runtime.embedder.set(embedder.inner.clone());
         // Written as the daemon writes it when its model loads, so a store
         // made here serves as a snapshot; one of another model is refused.
         // A refusal closes the store first: the runtime's workers hold it open
         // until the process ends otherwise.
-        let refusal = match runtime.store.ensure_embedding_contract(EmbeddingIdentity::of(embedder.0.as_ref())).await {
+        let refusal = match runtime.store.ensure_embedding_contract(EmbeddingIdentity::of(embedder.inner.as_ref())).await {
             Err(e) => Some(EvalError::Open(e.to_string())),
             Ok(ContractStatus::Mismatch { stored, actual }) => Some(EvalError::Open(format!(
                 "its vectors are of another model ({})",
@@ -1275,7 +1297,7 @@ impl EvalDocIndex {
             Some(tok) => TokenSplitter::with_tokenizer(tok),
             None => TokenSplitter::fallback(),
         };
-        Ok(Self { store, embedder: embedder.0.clone(), splitter })
+        Ok(Self { store, embedder: embedder.inner.clone(), splitter })
     }
 
     /// Indexes the docs under `root` but those at the relative paths in
@@ -1423,7 +1445,7 @@ pub fn copy_background(snapshot: &Path, dir: &Path, embedder: &EvalEmbedder) -> 
         _ => (binary, binary),
     };
     let stored = stored_contract(&copy).map_err(|e| BackgroundRefusal::Unusable(e.to_string()))?;
-    let contract = background_contract(stored.as_ref(), &EmbeddingIdentity::of(embedder.0.as_ref()))?;
+    let contract = background_contract(stored.as_ref(), &EmbeddingIdentity::of(embedder.inner.as_ref()))?;
     Ok(EvalBackground {
         sha256,
         schema_from,
@@ -1724,6 +1746,55 @@ mod tests {
     use crate::memory::db::{seed_on_disk, StoredContract};
     use crate::memory::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
     use crate::memory::pieces::StoredPiece;
+
+    struct Measuring(Arc<crate::metrics::Recorder>);
+
+    #[async_trait::async_trait]
+    impl Embedder for Measuring {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, crate::memory::embedder::EmbedError> {
+            let label = match role {
+                EmbedRole::Passage => "passage",
+                EmbedRole::Query => "query",
+            };
+            self.0.gauge("embedder.batch_tokens", &[("role", label)], 10.0 * texts.len() as f64);
+            let mut out = Vec::new();
+            for text in texts {
+                out.push(self.embed_with_role(text, role).await?);
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "measuring" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    #[tokio::test]
+    async fn padded_ran_sums_only_passage_batches() {
+        let recorder = Arc::new(crate::metrics::Recorder::default());
+        let embedder = EvalEmbedder::of(Arc::new(Measuring(recorder.clone())), recorder);
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        embedder.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
+        embedder.embed_batch(&texts[..2], EmbedRole::Query).await.unwrap();
+        embedder.embed_batch(&texts[..1], EmbedRole::Passage).await.unwrap();
+
+        assert_eq!(embedder.passage_tokens_ran(), 40.0);
+    }
+
+    #[test]
+    fn the_real_embedder_keeps_its_recorder() {
+        let recorder = Arc::new(crate::metrics::Recorder::default());
+        let embedder = EvalEmbedder::of(Arc::new(FakeEmbedder::default()), recorder.clone());
+        assert_eq!(embedder.passage_tokens_ran(), 0.0);
+
+        recorder.gauge("embedder.batch_tokens", &[("role", "passage")], 7.0);
+        assert_eq!(embedder.passage_tokens_ran(), 7.0, "what the session writes is what the handle reads");
+        assert_eq!(EvalEmbedder::fake().passage_tokens_ran(), 0.0);
+    }
 
     #[test]
     fn into_search_scope_maps_lexical_through_unchanged() {
@@ -2239,7 +2310,7 @@ mod tests {
     }
 
     fn placed_embedder() -> EvalEmbedder {
-        EvalEmbedder(Arc::new(PlacedByFirstWord))
+        EvalEmbedder::of(Arc::new(PlacedByFirstWord), Arc::default())
     }
 
     fn keyed<'a>(content: &'a str, key: Option<&'a str>) -> EvalSave<'a> {
@@ -2576,7 +2647,7 @@ mod tests {
         std::fs::write(root.path().join("a.md"), "# A\nBROKEN passage\n").unwrap();
         std::fs::write(root.path().join("b.md"), "# B\nsound passage\n").unwrap();
 
-        let embedder = EvalEmbedder(Arc::new(Unusable));
+        let embedder = EvalEmbedder::of(Arc::new(Unusable), Arc::default());
         let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path()).await.unwrap();
         let result = index.index(root.path(), &[]).await;
 
@@ -2743,7 +2814,7 @@ mod tests {
     // --- copy_background --------------------------------------------------
 
     fn fake_identity() -> EmbeddingIdentity {
-        EmbeddingIdentity::of(EvalEmbedder::fake().0.as_ref())
+        EmbeddingIdentity::of(EvalEmbedder::fake().inner.as_ref())
     }
 
     /// `memory.db` in `dir`, migrated up to `target` with one row and the
