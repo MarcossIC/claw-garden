@@ -351,7 +351,7 @@ clawg import --from engram $HOME\engram.json --project-map claw-garden=C:\code\c
 
 Importar otra vez el mismo export, o uno más nuevo, no duplica nada: cada nota se reconoce por su id en la otra herramienta, esté donde esté. Una que la otra herramienta reescribió entra como la versión nueva de la que ya está, en su proyecto y con su clave; una que borraste acá no vuelve. El reporte dice qué fue de cada nota y cuenta, por campo, lo que la otra herramienta guarda y clawg no tiene dónde poner.
 
-También trae la memoria propia de Claude Code, la que el cliente escribe solo en `~/.claude/projects/<proyecto>/memory/`: cada archivo de memoria es una nota, con su nombre, su descripción, su fecha y su tipo (`user` y `feedback` quedan como preferencias; el resto, como hechos). Los proyectos se llaman como el directorio del cliente, la ruta del repo con guiones:
+También trae la memoria propia de Claude Code, la que el cliente escribe solo en `~/.claude/projects/<proyecto>/memory/`: cada archivo de tema es una nota, con su nombre, su descripción, su fecha y su tipo (`user` y `feedback` quedan como preferencias; el resto, como hechos). `MEMORY.md` es el índice de esos archivos y no se importa como nota. Los proyectos se llaman como el directorio del cliente, la ruta del repo con guiones:
 
 ```powershell
 clawg import --from claude-code $HOME\.claude\projects --dry-run --profile dev
