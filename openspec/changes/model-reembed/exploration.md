@@ -22,6 +22,15 @@ Esta es la parte D de [data-preservation](../archive/2026-10-12-data-preservatio
 
 Un punto que ese texto no cubría: la memoria apagada no es «vacía» para todo. `POST /v1/search` responde 503 (`api.rs:1428-1431`), pero `POST /v1/context` cae a la recuperación léxica sin embedder. Eso lo dice `specs/ingest` (línea 128); no lo reverifiqué en el código.
 
+## Qué cambió desde 2026-10-19 (revisado en 0.68.0, `6afce36`)
+
+- **El alcance A está hecho en parte.** `the_embedding_contract_is_pinned` fija el id, los dos prefijos, la ventana, la dimensión y los SHA-256 del modelo (`crates/clawg-core/src/memory/embedder.rs:1699`, RM4 de [ram-footprint-gates](../archive/2026-10-29-ram-footprint-gates/proposal.md), 92), y `expected_contract` da el contrato sin cargar el modelo (`embedder.rs:155-163`). Quedan los puntos 3 a 6 del alcance A.
+- **La poda ya no saca al `pre-migration`:** conserva el más nuevo de cada motivo (`to_prune`, `crates/clawg-core/src/memory/backup.rs:298-311`). La decisión abierta sobre la retención del `pre-reembed` pierde la mitad de su motivo; sigue el costo de un snapshot por arranque fallido.
+- **Las líneas citadas abajo se movieron:** `reembed_all` está en `crates/clawg-core/src/memory/maintenance.rs:584` y `compute_new_embedding`, que sigue infiriendo fila por fila, en `:694`; `is_pooling_upgrade` y `verify_or_reembed` en `crates/clawg-core/src/memory/bootstrap.rs:641,655`. El comportamiento descrito no cambió.
+- **Hay un dato de costo:** el import del export completo embebió a 65,9 filas/s en 825,8 s, ordenando por largo y en llamadas de a 32 ([embed-throughput](../archive/2026-10-27-embed-throughput/verify.md), 85). `reembed_all` no ordena ni agrupa, así que el camino B tardaría más sobre un store de ese tamaño; agruparlo como el import es parte de B.
+- **El índice de docs no mezcla espacios:** se reindexa al cambiar `model_id` (`crates/clawg-core/src/memory/project_docs/mod.rs:188-194`) y la reutilización de vectores de 92 los busca por ese `model_id` (`:533`).
+- **Ya hay de dónde puede salir un modelo destino:** [embedder-bakeoff](../embedder-bakeoff/exploration.md) (97) mide e5-small contra candidatos de 384 dimensiones con un umbral fijado antes. Si un candidato lo pasa, este cambio sube de urgencia y su alcance suma lo que 97 lista en «Qué costaría adoptarlo»: el pooling CLS, la salida declarada por modelo, un manifiesto de descarga que deje de ser fijo y la recalibración de las constantes ajustadas a los cosenos de e5. Con 384, el camino es B; con 768, C. Si ninguno pasa, la urgencia sigue baja.
+
 ## Problema (verificado)
 
 ### Dónde vive el contrato y qué ve el usuario
