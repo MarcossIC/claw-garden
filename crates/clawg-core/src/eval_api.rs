@@ -55,6 +55,9 @@ use crate::metrics::Recorder;
 use crate::models::chat::Role;
 use crate::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
 
+mod vector_memo;
+pub use vector_memo::{EvalMemo, EvalMemoReport};
+
 /// Opaque handle to a memory store. Every operation available on it is a
 /// method below — the wrapped store itself is never reachable.
 pub struct EvalStore(MemoryStore);
