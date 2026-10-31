@@ -292,3 +292,59 @@ En el último par, 5261 de 5261 vectores dan los mismos bits en los dos órdenes
 - **La explicación más probable no está medida.** Ordenar entre docs no sólo rellena menos: también llena las tandas. Hoy cada doc de 16 pasajes o menos corre su propia tanda incompleta, y entre docs las tandas son de 16. Así el modelo corre menos veces, y cada corrida tiene un costo que no depende del relleno. El diseño de A2 tiene que contar las tandas además del relleno.
 - **Una cola acotada recupera menos que este techo.** El diseño de A2 elige el tope con números que no necesitan el modelo: el relleno y las tandas que daría cada tope sobre el corpus. «Se queda si» de A2 se decide después con corridas de `rag-eval` como las de A1.
 - **La decisión 4 se cumple también para A2 en esta CPU:** 0 bits movidos.
+
+## A2: el tope de la cola (2026-10-31)
+
+`padding_and_batches_by_queue_cap` (commit `e8169b4`, prueba ignorada) se corrió con autorización.
+
+- **Qué lee:** sólo el tokenizer verificado del perfil dev, sin sesión de ONNX ni inferencia.
+- **Dos corridas:**
+  - Sobre este repositorio en `478f59f`.
+  - Con `CLAWG_DOCS_ROOT` apuntando a un worktree descartable de `0c9d49a`, el commit de la corrida del techo. Corrió el mismo binario, porque el partidor no cambió entre los dos commits. El worktree se borró al terminar.
+
+### La validación de la muestra del techo
+
+Sobre el árbol de `0c9d49a`, la muestra tiene 197 docs y 5261 pasajes, como la del techo.
+
+| | P | B | Q |
+|---|---|---|---|
+| en cada doc | **1 998 461** | 423 | 850 335 781 |
+| todo junto | **1 614 977** | 329 | 606 730 453 |
+
+Los dos P son los de la corrida del techo, así que la cuenta reproduce esa muestra. Las 423 tandas en cada doc son el número que esa corrida no imprimió. Las 329 de todo junto coinciden con ⌈5261/16⌉.
+
+### La cuenta sobre el corpus de `478f59f`
+
+Son 19 218 pasajes. P son los tokens rellenados, B las tandas, Q las filas × el largo al cuadrado, y H los bytes que retiene el vaciado más grande.
+
+| orden | P | B | Q | llamada mayor | H |
+|---|---|---|---|---|---|
+| pasajes | 8 915 741 | 1571 | 4 196 844 517 | 278 | 1,2 MiB |
+| en cada doc | 7 414 472 | 1571 | 3 171 559 180 | 278 | 1,2 MiB |
+| cola 64 | 6 736 330 | 1322 | 2 722 211 078 | 278 | 1,2 MiB |
+| cola 128 | 6 435 252 | 1276 | 2 531 996 006 | 278 | 1,2 MiB |
+| cola 256 | 6 225 527 | 1241 | 2 405 565 215 | 278 | 1,3 MiB |
+| cola 512 | 6 093 004 | 1220 | 2 328 582 506 | 512 | 2,2 MiB |
+| cola 1024 | 6 029 953 | 1213 | 2 292 949 921 | 1023 | 4,4 MiB |
+| cola 2048 | 6 002 502 | 1211 | 2 277 673 308 | 2041 | 8,6 MiB |
+| cola 4096 | 5 990 423 | 1208 | 2 270 940 879 | 4088 | 17,2 MiB |
+| todo junto | 5 957 676 | 1202 | 2 252 185 608 | 19 218 | 78,4 MiB |
+
+### La regla de D9
+
+- **Las reducciones ρ_X.**
+  - Corpus de `478f59f`: P 0,1965, B 0,2349 y Q 0,2899.
+  - Muestra del techo (árbol de `0c9d49a`): P 0,1919, B 0,2222 y Q 0,2865.
+  - Cocientes corpus/muestra: 1,024, 1,057 y 1,012. El factor min(1, …) vale **1**.
+
+| c | R_P | R_B | R_Q | previsto(c) | H ≤ 16 MiB | |
+|---|---|---|---|---|---|---|
+| 64 | 0,4655 | 0,6748 | 0,4888 | 0,0978 | sí | no |
+| 128 | 0,6722 | 0,7995 | 0,6957 | 0,1412 | sí | no |
+| 256 | 0,8161 | 0,8943 | 0,8332 | 0,1714 | sí | no |
+| **512** | 0,9071 | 0,9512 | 0,9169 | **0,1905** | sí (2,2 MiB) | **el menor que cumple** |
+| 1024 | 0,9504 | 0,9702 | 0,9557 | 0,1996 | sí | |
+| 2048 | 0,9692 | 0,9756 | 0,9723 | 0,2035 | sí | |
+| 4096 | 0,9775 | 0,9837 | 0,9796 | 0,2053 | no (17,2 MiB) | |
+
+**`QUEUE_PASSAGES` = 512.** Es el menor tope con previsto ≥ 0,18 y H ≤ 16 MiB. El corpus de `0c9d49a` elige el mismo: previsto 0,1905 con c = 512 y 0,1713 con c = 256. A2 sigue a la Parte 6, el código de producción. Su «se queda si» lo deciden las corridas alternadas de la Parte 7, no esta cuenta.
