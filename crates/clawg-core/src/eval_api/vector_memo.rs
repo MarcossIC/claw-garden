@@ -724,6 +724,8 @@ mod tests {
         WrongLength,
         /// A NaN in the vector of every text holding `BROKEN`.
         NotFinite,
+        /// One vector fewer, only for a batch that holds `BROKEN`.
+        ShortWhenBroken,
     }
 
     /// An embedder that writes down each call it gets, with the model, the
@@ -786,7 +788,8 @@ mod tests {
         async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
             self.calls.lock().unwrap().push((role, texts.to_vec()));
             let mut out: Vec<Vec<f32>> = texts.iter().map(|t| self.vector(t)).collect();
-            if self.fault == Some(Fault::Short) {
+            let broken = texts.iter().any(|t| t.contains("BROKEN"));
+            if self.fault == Some(Fault::Short) || (self.fault == Some(Fault::ShortWhenBroken) && broken) {
                 out.pop();
             }
             Ok(out)
@@ -966,6 +969,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_that_adds_nothing_does_not_touch_the_file() {
+        let cache = crate::test_dir::test_dir();
+        let first = Recording::new();
+        let memo = memo_over(&first, cache.path(), "sha");
+        memo.embedder().embed_batch(&texts(&["same"]), EmbedRole::Passage).await.unwrap();
+        let file = cache.path().join(memo.finish().file);
+        let long_ago = std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(long_ago).unwrap();
+
+        let second = Recording::new();
+        let memo = memo_over(&second, cache.path(), "sha");
+        memo.embedder().embed_batch(&texts(&["same"]), EmbedRole::Passage).await.unwrap();
+        let run = memo.finish();
+
+        assert_eq!((run.from_memo, run.embedded), (1, 0));
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), long_ago, "the file was written again");
+    }
+
+    #[tokio::test]
+    async fn what_a_run_embedded_before_the_index_failed_is_kept() {
+        let root = crate::test_dir::test_dir();
+        let cache = crate::test_dir::test_dir();
+        write_doc(root.path(), "a.md", 3, &[]);
+        write_doc(root.path(), "b.md", 3, &[(1, "BROKEN")]);
+        let recording = Recording::faulty(Fault::ShortWhenBroken);
+        let memo = memo_over(&recording, cache.path(), "sha");
+
+        let store_dir = crate::test_dir::test_dir();
+        let embedder = memo.embedder();
+        let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path()).await.unwrap();
+        let failed = index.index(root.path(), &[]).await;
+        index.close().await.unwrap();
+        let run = memo.finish();
+
+        assert!(failed.is_err(), "the second doc comes back short");
+        assert_eq!(recording.calls().len(), 2, "the first doc was embedded before the failure");
+        let bytes = std::fs::read(cache.path().join(&run.file)).unwrap();
+        assert_eq!(decode(&bytes, &contract_for(&recording, "sha")).unwrap().len(), 3, "the sound doc's passages");
+    }
+
+    #[tokio::test]
     async fn questions_never_go_through_the_memo() {
         let cache = crate::test_dir::test_dir();
         let recording = Recording::new();
@@ -1001,6 +1045,7 @@ mod tests {
                 Fault::Short => assert_ne!(got.len(), asked.len(), "the count is wrong, as without the memo"),
                 Fault::WrongLength => assert_ne!(got[1].len(), 384),
                 Fault::NotFinite => assert!(got[1][0].is_nan()),
+                Fault::ShortWhenBroken => unreachable!("not one of the faults this test goes through"),
             }
             let file = std::fs::read(cache.path().join(&run.file));
             let stored = file.map_or(0, |bytes| decode(&bytes, &contract_for(&recording, "sha")).unwrap().len());
@@ -1049,6 +1094,14 @@ mod tests {
             assert_eq!((run.used, run.from_memo, run.embedded), (false, 0, 3), "{name}");
             assert_eq!(recording.passages(), asked, "{name}");
         }
+
+        assert_eq!(folder_bytes(cache.path()).len(), 5, "one file per contract");
+        let back = Recording::new();
+        let memo = memo_over(&back, cache.path(), "sha1");
+        memo.embedder().embed_batch(&asked, EmbedRole::Passage).await.unwrap();
+        let run = memo.finish();
+        assert_eq!((run.used, run.from_memo, run.embedded), (true, 3, 0), "the first contract kept its memo");
+        assert!(back.calls().is_empty());
     }
 
     #[tokio::test]
