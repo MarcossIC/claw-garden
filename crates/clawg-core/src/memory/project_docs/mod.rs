@@ -841,7 +841,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::memory::embedder::FakeEmbedder;
+    use crate::memory::embedder::{FakeEmbedder, EMBED_MAX_TOKENS};
 
     #[test]
     fn production_never_names_the_archive() {
@@ -2024,15 +2024,21 @@ old
         assert_eq!(store.conn.call(memories).await.unwrap(), before);
         assert_eq!(index_sizes(&store).await, (1, 1, 1, 1));
     }
+
     /// `FakeEmbedder` that notes each batch it is handed, and gives a text
-    /// holding `BROKEN` a vector with a NaN in it.
+    /// holding `BROKEN` a vector with a NaN in it. It asks for `prefix` on
+    /// passages.
     struct Batches {
         calls: Mutex<Vec<Vec<String>>>,
+        prefix: &'static str,
     }
 
     impl Batches {
         fn new() -> Self {
-            Self { calls: Mutex::new(Vec::new()) }
+            Self::prefixed("")
+        }
+        fn prefixed(prefix: &'static str) -> Self {
+            Self { calls: Mutex::new(Vec::new()), prefix }
         }
         fn take(&self) -> Vec<Vec<String>> {
             std::mem::take(&mut *self.calls.lock().unwrap())
@@ -2059,7 +2065,7 @@ old
         fn dimensions(&self) -> usize { 384 }
         fn model_id(&self) -> &str { "batches" }
         fn query_prefix(&self) -> &str { "" }
-        fn passage_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { self.prefix }
     }
 
     /// A doc with one passage per entry of `words`, `S0`, `S1`..., each as
@@ -2075,6 +2081,12 @@ old
     /// Twenty lengths with ties and no order.
     fn twenty() -> Vec<usize> {
         (0..20).map(|i| 1 + (i * 7) % 11).collect()
+    }
+
+    /// Forty lengths with ties and no order: more passages than a sort that
+    /// is not stable keeps the order of.
+    fn forty() -> Vec<usize> {
+        (0..40).map(|i| 1 + (i * 7) % 11).collect()
     }
 
     /// The words of the body of an embedded text, and the number after its `S`.
@@ -2131,25 +2143,90 @@ old
         assert_eq!(passage_order(None, &embedder, &seventeen), None, "without a tokenizer nothing is counted");
     }
 
+    /// Fifteen one-word texts and then `pair`, of as many words as each says.
+    fn after_fifteen(pair: [usize; 2]) -> Vec<String> {
+        let text = |n: usize| vec!["word"; n].join(" ");
+        std::iter::repeat_with(|| text(1)).take(15).chain(pair.map(text)).collect()
+    }
+
+    #[test]
+    fn the_order_counts_the_passage_prefix() {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let texts = after_fifteen([EMBED_MAX_TOKENS - 1, EMBED_MAX_TOKENS]);
+
+        let plain = passage_order(Some(&*tokenizer), &Batches::new(), &texts).unwrap();
+        let prefixed = passage_order(Some(&*tokenizer), &Batches::prefixed("pfx "), &texts).unwrap();
+
+        assert_eq!(plain[..2], [16, 15], "511 and 512 tokens differ without the prefix");
+        assert_eq!(prefixed[..2], [15, 16], "the prefix takes both to the window, and they tie");
+    }
+
+    #[test]
+    fn the_order_counts_no_more_than_the_window() {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let texts = after_fifteen([EMBED_MAX_TOKENS + 88, EMBED_MAX_TOKENS + 188]);
+
+        let order = passage_order(Some(&*tokenizer), &Batches::new(), &texts).unwrap();
+
+        assert_eq!(order[..2], [15, 16], "both are cut to the window, and they tie");
+        assert_eq!(order[2..], (0..15).collect::<Vec<_>>());
+    }
+
     #[tokio::test]
     async fn a_doc_over_a_batch_reaches_the_embedder_longest_first() {
         let dir = crate::test_dir::test_dir();
-        write(dir.path(), "a.md", &sections(&twenty()));
+        write(dir.path(), "a.md", &sections(&forty()));
         let store = store_with_project("p", dir.path()).await;
         let embedder = Batches::new();
 
         let report = refreshed_with(&Arc::new(DocIndex::default()), &store, &embedder, words()).await;
 
         let calls = embedder.take();
-        assert_eq!((report.indexed, report.passages), (1, 20));
+        assert_eq!((report.indexed, report.passages), (1, 40));
         assert_eq!(calls.len(), 1, "one call for the doc");
         let seen: Vec<(usize, usize)> = calls[0].iter().map(|t| body_words_and_section(t)).collect();
-        assert_eq!(seen.len(), 20);
+        assert_eq!(seen.len(), 40);
         for pair in seen.windows(2) {
             let ((a, i), (b, j)) = (pair[0], pair[1]);
             assert!(a > b || (a == b && i < j), "{pair:?} is out of order");
         }
-        assert_ne!(sections_of(&calls[0]), (0..20).collect::<Vec<_>>());
+        assert_ne!(sections_of(&calls[0]), (0..40).collect::<Vec<_>>());
+    }
+
+    /// The rows times the longest text of each run of `EMBED_BATCH` the
+    /// embedder is handed, which is what the model pads to, in tokens.
+    fn padded_tokens(calls: &[Vec<String>]) -> usize {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        calls
+            .iter()
+            .flat_map(|call| call.chunks(EMBED_BATCH))
+            .map(|run| {
+                let counts = passage_token_counts(&tokenizer, &Batches::new(), run).unwrap();
+                run.len() * counts.iter().max().unwrap()
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_doc_reaches_the_embedder_with_less_padding_than_in_its_passage_order() {
+        let dir = crate::test_dir::test_dir();
+        let alternating: Vec<usize> = (0..20).map(|i| if i % 2 == 0 { 10 } else { 100 }).collect();
+        write(dir.path(), "a.md", &sections(&alternating));
+        let store = store_with_project("p", dir.path()).await;
+        let embedder = Batches::new();
+
+        refreshed_with(&Arc::new(DocIndex::default()), &store, &embedder, words()).await;
+
+        let calls = embedder.take();
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let counts = passage_token_counts(&tokenizer, &embedder, &calls[0]).unwrap();
+        let by_words = |n: usize| -> usize {
+            let of_that_size = calls[0].iter().zip(&counts).filter(|(t, _)| body_words_and_section(t).0 == n);
+            *of_that_size.map(|(_, c)| c).max().unwrap()
+        };
+        let (long, short) = (by_words(100), by_words(10));
+        assert_eq!(padded_tokens(&calls), 16 * long + 4 * short, "ten long texts and six short ones, then four short ones");
+        assert!(padded_tokens(&calls) < 20 * long, "the passage order pads every run to the long texts");
     }
 
     #[tokio::test]
@@ -2252,6 +2329,7 @@ old
         assert_eq!(stored.iter().filter(|p| p.0 == "b.md").count(), 20);
         assert_eq!(stored.iter().filter(|p| p.0 == "a.md").count(), 0);
     }
+
     /// Embeds real passages of the docs of this repository in the order of
     /// their doc and in the order a refresh uses, and reports how many vectors
     /// keep their bits. `CLAWG_E5_MODEL_DIR` is `<data dir>/models/multilingual-e5-small`;
