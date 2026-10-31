@@ -1,0 +1,24 @@
+change: docs-index-speed
+objective: "3"
+depends_on: [docs-index-cost]
+phase: propose
+artifacts:
+  exploration: done
+  proposal: done  # umbrales fijados antes de leer las corridas D y R de docs-index-cost
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+gates:
+  "0": pending  # R: index.phases.embed >= 120 s y >= 0,5 de index_seconds; abre A1, A2 y E (bajo 0,5, S va antes de A1 y se relee)
+  C: pending  # D: (scan+mask+split+lookup+write+tokens.count_seconds)/index_seconds >= 0,25 y esa suma en R <= la mitad de la de D
+  W: pending  # R: phases.write/index_seconds >= 0,10 (prepare_cached en replace_doc y delete_doc)
+  A1: pending  # R: (tokens.padded - padded_sorted_in_doc)/padded >= 0,10 y ese ahorro x phases.embed >= 2 x count_seconds
+  S: pending  # corrida de W (o R): (read+mask+split+lookup+write)/index_seconds >= 0,15
+  A2: pending  # R: (padded_sorted_in_doc - padded_sorted_all)/padded >= 0,15
+  E: pending  # puerta 0 abierta en la última corrida; experimento (solape 32): tokens.real y phases.embed -10 % y ninguna pregunta sale del top 3
+  B: dropped  # EMBED_BATCH: ningún campo de docs-index-cost lo decide y alcanza a todo el embedder
+  D: dropped  # openspec/changes/archive/ sigue en el índice (decisión 1)
+updated: 2026-10-30

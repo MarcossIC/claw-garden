@@ -1,0 +1,15 @@
+change: docs-index-cost
+objective: "3"
+depends_on: []
+phase: propose
+artifacts:
+  exploration: done
+  proposal: done
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+gates: {}
+updated: 2026-10-30
