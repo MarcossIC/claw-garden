@@ -1,9 +1,9 @@
 # quality — Especificación
 
-Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servidor MCP, los docs que enumeran sus herramientas y la convención de no esconder código muerto, y de dónde están documentados esos chequeos. Ninguno cambia el comportamiento de un comando, una ruta o una herramienta. Lo que hace cada herramienta está en [`specs/mcp`](../mcp/spec.md).
+Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servidor MCP y la convención de no esconder código muerto, y de dónde están documentados esos chequeos. Ninguno cambia el comportamiento de un comando, una ruta o una herramienta. Lo que hace cada herramienta está en [`specs/mcp`](../mcp/spec.md).
 
 **Origen:**
-- [quality-guards](../../changes/archive/2026-10-15-quality-guards/proposal.md), archivado el 2026-10-15. Los ids de requisito son los de esa spec. R5 (borrar el código sin llamador que escondían los `allow`) fue un arreglo de una vez y no queda como requisito: lo que impide que vuelva es R4 y el comando de `clippy` de R6.
+- [quality-guards](../../changes/archive/2026-10-15-quality-guards/proposal.md), archivado el 2026-10-15. Los ids de requisito son los de esa spec. R5 (borrar el código sin llamador que escondían los `allow`) fue un arreglo de una vez y no queda como requisito: lo que impide que vuelva es R4 y el comando de `clippy` de R6. R3 (que la línea `MCP tools` de `.claude/CLAUDE.md` nombrara las herramientas registradas) se quitó: ningún test lee un archivo de instrucciones para agentes (R6).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo el contrato de una sesión en español en R1 y R2; qué lee esa sesión está en [`specs/mcp`](../mcp/spec.md), AL2 a AL4).
 
 ## Definiciones
@@ -48,24 +48,6 @@ El archivo MUST escribirse con las claves de cada objeto ordenadas (y por lo tan
 
 **Test:** `render_contract_is_stable_and_sorted` (puro, `server.rs:2668`). Bendecir se comprueba a mano: un test que escribe el archivo versionado no puede correr en la suite.
 
-## R3. El inventario de `.claude/CLAUDE.md` es el registrado
-
-El conjunto de nombres entre comillas invertidas que siguen al `): ` de la primera línea que empieza con `MCP tools (` en `.claude/CLAUDE.md` (hoy `.claude/CLAUDE.md:78`) MUST ser igual al conjunto de herramientas registradas. Si difieren, el test MUST fallar nombrando las que faltan en el documento y las que el documento nombra sin estar registradas.
-
-Extraer los nombres de esa línea MUST ser una función pura sobre el texto del documento (`tool_names_in_doc`, `server.rs:2683`).
-
-#### Escenario: herramienta nueva sin documentar
-- GIVEN `.claude/CLAUDE.md` con las doce herramientas
-- WHEN se registra una herramienta nueva sin nombrarla en el documento
-- THEN el test falla y nombra la herramienta que falta
-
-#### Escenario: el documento nombra una que no existe
-- GIVEN `.claude/CLAUDE.md` sin `restore_memory` y con `forget_all`
-- WHEN corre el test
-- THEN falla con `missing ["restore_memory"], not registered ["forget_all"]`
-
-**Test:** `the_claude_md_tool_list_is_the_registered_one` (`server.rs:2700`) y el puro `tool_names_in_doc_reads_the_mcp_tools_line` (`server.rs:2690`).
-
 ## R4. Ninguna fuente esconde código muerto
 
 Ningún archivo `.rs` bajo `crates/*/src` ni `crates/*/tests`, en cualquier subdirectorio, MUST tener un atributo `allow` o `expect`, interno o externo, también dentro de `cfg_attr`, que nombre `dead_code`, `unused` o un lint `unused_*`. El test MUST fallar con `ruta:línea` de cada hallazgo, la ruta relativa a `crates/`. Otros lints (por ejemplo `clippy::too_many_arguments` o `clippy::unused_io_amount`) MUST NOT contar.
@@ -87,6 +69,7 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
 ## R6. Los docs dicen dónde están las convenciones y cómo se chequean
 
 - `AGENTS.md` MUST mandar a `.claude/CLAUDE.md` y MUST NOT repetir su contenido; `README.md` MUST mandar a `.claude/CLAUDE.md` para las convenciones (`README.md:412`).
+- Ningún test MUST leer un archivo de instrucciones para agentes (`.claude/`, `.cursor/`, `.gemini/`, `AGENTS.md`): son texto para el modelo y cambian sin que cambie el comportamiento. Los tests de `clawg setup` y `doctor` que escriben o leen el `CLAUDE.md` de un usuario en un directorio temporal prueban el producto y no cuentan.
 - `.claude/CLAUDE.md`, sección Testing, MUST dar el comando de `clippy` que hace fallar los warnings del compilador, `dead_code` y `unused` incluidos (`.claude/CLAUDE.md:145`), y cómo bendecir el contrato (`.claude/CLAUDE.md:150`). Ese comando MUST terminar con código 0:
 
   ```
@@ -96,4 +79,4 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
   Los lints propios de `clippy` quedan afuera con `-A clippy::all` hasta que se arreglen los que hay; están en el backlog de [`openspec/README.md`](../../README.md#backlog-sin-spec-arreglos-sueltos).
 - `README.md` MUST NOT dar un número de versión como ejemplo de la salida de `clawg --version`.
 
-**Test:** R3 cubre la lista de herramientas. El comando de `clippy` y el resto se comprueban a mano; terminó con código 0 al archivar, en Linux y en Windows.
+**Test:** ninguno, por la regla de arriba. El comando de `clippy` y el resto se comprueban a mano; terminó con código 0 al archivar, en Linux y en Windows.
