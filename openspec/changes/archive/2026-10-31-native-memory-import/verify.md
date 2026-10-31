@@ -12,7 +12,7 @@
 | Requisito | Qué lo prueba |
 |---|---|
 | NM1, el directorio | Los tres tipos de DIR dan la misma nota; un directorio sin memoria, un archivo y uno que no existe se rechazan, también por `POST /v1/imports` antes de crear el trabajo; un `.md` que no es UTF-8, otro archivo y un subdirectorio se listan sin leerse y se cuentan como `entry`; el límite de bytes; `POST /v1/import` con el documento |
-| NM2, el frontmatter | `type` arriba y anidado en `metadata`, el de arriba gana; comillas simples y dobles, bloques `|` y `>-`, un valor plano en dos líneas; claves desconocidas, una lista y una clave anidada desconocida contadas; un frontmatter sin cierre es cuerpo y se cuenta |
+| NM2, el frontmatter | `type` arriba y anidado en `metadata`, el de arriba gana; comillas simples y dobles, bloques `\|` y `>-`, un valor plano en dos líneas; claves desconocidas, una lista y una clave anidada desconocida contadas; un frontmatter sin cierre es cuerpo y se cuenta |
 | NM3, la nota | Origen, título (de `name` o del archivo), contenido (descripción y cuerpo), fecha (`modified`, `metadata.modified` con zona, una fecha ilegible que cae a la hora del archivo, ninguna) |
 | NM4, los tipos | `user` y `feedback` → `user_preference`; `project`, `reference`, `decision`, `preference` y sin tipo → `semantic_fact`; los de engram sin cambio (`each_source_type_lands_on_its_memory_type` sigue pasando) |
 | NM5, el índice | Dos líneas sin archivo contadas; un encabezado y las líneas que enlazan (con `./` y `#ancla`) no |
