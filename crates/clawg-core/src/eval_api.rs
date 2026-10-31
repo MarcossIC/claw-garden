@@ -1201,6 +1201,13 @@ pub fn passage_order(embedder: &EvalEmbedder, counter: &EvalTokenCounter, texts:
     project_docs::passage_order(tokenizer, embedder.inner.as_ref(), texts).unwrap_or_else(|| (0..texts.len()).collect())
 }
 
+/// The docs, by position, that share each call a docs refresh makes to the
+/// embedder when `passages_per_doc` are the passages of the docs it indexes, in
+/// the order of the plan: the flushes of production's own queue, with its cap.
+pub fn queue_groups(passages_per_doc: &[usize]) -> Vec<Vec<usize>> {
+    project_docs::queue_groups(project_docs::QUEUE_PASSAGES, passages_per_doc)
+}
+
 /// True iff the real embedding model is already cached at `base_dir` —
 /// never triggers a download. Delegates to the module that owns the
 /// cache-dir layout and the on-disk verification, so this check can never
@@ -2886,6 +2893,59 @@ second
         fn model_id(&self) -> &str { "prefixed" }
         fn query_prefix(&self) -> &str { "" }
         fn passage_prefix(&self) -> &str { "pfx " }
+    }
+
+    /// `FakeEmbedder` that notes how many texts each call holds.
+    #[derive(Default)]
+    struct CallSizes {
+        sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for CallSizes {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, crate::memory::embedder::EmbedError> {
+            self.sizes.lock().unwrap().push(texts.len());
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                out.push(self.embed_with_role(text, role).await?);
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "call-sizes" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    #[tokio::test]
+    async fn queue_groups_are_the_calls_a_refresh_makes() {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        for (name, passages) in [("a.md", 3), ("b.md", 20), ("c.md", 5), ("d.md", 0), ("e.md", 5)] {
+            let doc = if passages == 0 { "# Empty
+".to_string() } else { format!("# T
+{}", ladder(passages)) };
+            std::fs::write(root.path().join(name), doc).unwrap();
+        }
+        let recording = Arc::new(CallSizes::default());
+        let embedder = EvalEmbedder::of(recording.clone(), Arc::default());
+        let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path()).await.unwrap();
+
+        let run = index.index(root.path(), &[]).await.unwrap();
+        index.close().await.unwrap();
+
+        let mut docs: Vec<(&str, usize)> = run.docs.iter().map(|d| (d.path.as_str(), d.passages)).collect();
+        docs.sort();
+        let per_doc: Vec<usize> = docs.iter().map(|d| d.1).collect();
+        assert_eq!(per_doc, [3, 20, 5, 0, 5]);
+        let groups = queue_groups(&per_doc);
+        assert_eq!(groups.concat(), [0, 1, 2, 3, 4], "every doc is in a group, in the order of the plan");
+        let sizes: Vec<usize> = groups.iter().map(|g| g.iter().map(|&k| per_doc[k]).sum()).collect();
+        assert_eq!(sizes, [3, 30]);
+        assert_eq!(*recording.sizes.lock().unwrap(), sizes, "the calls the refresh made");
     }
 
     /// A doc of `n` sections whose section `i` has `i` words.
