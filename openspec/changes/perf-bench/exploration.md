@@ -48,8 +48,8 @@ Estables en CI, pero sin Windows ni E/S. Sólo si aparece una regresión algorí
 
 ## Decisiones abiertas
 
-- [ ] **Tamaños del store.** 100 000 filas con el embedder falso tardan en sembrarse; ¿se siembra por SQL directo (como 56 midió los planes) o por el worker?
-- [ ] **Umbral.** ¿Qué empeoramiento de p95 por escenario es una regresión? Candidato: el que el bootstrap separa de cero con 95 % y supera el 20 %.
+- [x] **Tamaños del store.** 100 000 filas con el embedder falso tardan en sembrarse; ¿se siembra por SQL directo (como 56 midió los planes) o por el worker? Ni uno ni otro: por `POST /v1/import`, el camino de producción que escribe en lotes ([propuesta](proposal.md), decisión 2).
+- [x] **Umbral.** ¿Qué empeoramiento de p95 por escenario es una regresión? Candidato: el que el bootstrap separa de cero con 95 % y supera el 20 %. Elegido el candidato, más los fallos nuevos ([propuesta](proposal.md), decisión 7).
 
 ## Cómo se mide
 
