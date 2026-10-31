@@ -1,13 +1,13 @@
 change: docs-index-cost
 objective: "3"
 depends_on: []
-phase: propose
+phase: apply
 artifacts:
   exploration: done
   proposal: done
-  spec: pending
-  design: pending
-  tasks: pending
+  spec: done
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
