@@ -2257,4 +2257,94 @@ old
         assert_eq!(stored.iter().filter(|p| p.0 == "b.md").count(), 20);
         assert_eq!(stored.iter().filter(|p| p.0 == "a.md").count(), 0);
     }
+    /// Embeds real passages of the docs of this repository in the order of
+    /// their doc and in the order a refresh uses, and reports how many vectors
+    /// keep their bits. `CLAWG_E5_MODEL_DIR` is `<data dir>/models/multilingual-e5-small`;
+    /// `CLAWG_EMBED_PASSAGES` caps the passages (5000 by default) and
+    /// `CLAWG_EMBED_RUNS` how many times each order embeds them (3 by default).
+    #[tokio::test]
+    #[ignore = "a measurement: needs CLAWG_E5_MODEL_DIR; run it with `cargo test -p clawg-core --lib -- --ignored docs_passages_keep_their_bits --nocapture`"]
+    async fn docs_passages_keep_their_bits_in_either_order() {
+        use crate::memory::model_download::{load_cached_model, load_verified_tokenizer, tokenizer_path};
+        use std::time::Duration;
+
+        let count = |name: &str, default: usize| std::env::var(name).map_or(default, |v| v.parse().unwrap());
+        let model_dir = PathBuf::from(std::env::var_os("CLAWG_E5_MODEL_DIR").expect("CLAWG_E5_MODEL_DIR is not set"));
+        let base = model_dir.parent().and_then(Path::parent).unwrap().to_path_buf();
+        assert_eq!(tokenizer_path(&base).parent(), Some(model_dir.as_path()), "CLAWG_E5_MODEL_DIR is <data dir>/models/multilingual-e5-small");
+        let (limit, runs) = (count("CLAWG_EMBED_PASSAGES", 5000), count("CLAWG_EMBED_RUNS", 3));
+
+        let tokenizer = load_verified_tokenizer(&base).expect("the pinned tokenizer.json");
+        let splitter = TokenSplitter::with_tokenizer(tokenizer.clone());
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut docs: Vec<(String, Vec<String>)> = Vec::new();
+        for file in corpus::walk(&root).unwrap().docs {
+            let Some((text, _)) = corpus::read(&file) else { continue };
+            let found = super::passages(file.kind, &file.path, &redact(&text).text, &splitter);
+            if found.len() > EMBED_BATCH {
+                docs.push((file.path, found.iter().map(Passage::indexed_text).collect()));
+            }
+        }
+        let available: usize = docs.iter().map(|d| d.1.len()).sum();
+        let stride = available.div_ceil(limit).max(1);
+        let mut taken = 0;
+        let docs: Vec<(String, Vec<String>)> = docs
+            .into_iter()
+            .step_by(stride)
+            .take_while(|d| {
+                taken += d.1.len();
+                taken <= limit
+            })
+            .collect();
+        let passages: usize = docs.iter().map(|d| d.1.len()).sum();
+        assert!(passages > 0, "no doc of this repository has more than {EMBED_BATCH} passages");
+
+        let files = load_cached_model(&base, &crate::memory::model_download::CacheLock::new()).await.unwrap();
+        let embedder = crate::memory::embedder::E5Embedder::from_parts(&files.onnx, tokenizer.clone(), &files.tokenizer, Arc::default()).unwrap();
+        let embed_all = |sorted: bool| {
+            let (docs, embedder, tokenizer) = (&docs, &embedder, &tokenizer);
+            async move {
+                let clock = Instant::now();
+                let mut blobs = Vec::with_capacity(passages);
+                for (path, texts) in docs {
+                    let counting = if sorted { Some(&**tokenizer) } else { None };
+                    blobs.extend(embed_passages(embedder, counting, path, texts.clone()).await.unwrap());
+                }
+                (clock.elapsed(), blobs)
+            }
+        };
+        let names = ["passage order", "longest first"];
+        let mut took: [Vec<Duration>; 2] = [Vec::new(), Vec::new()];
+        let mut blobs: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+        for run in 0..runs {
+            for turn in 0..2 {
+                let k = (run + turn) % 2;
+                let (elapsed, embedded) = embed_all(k == 1).await;
+                println!("run {run}: {}: {elapsed:.2?}, {:.1} passages/s", names[k], passages as f64 / elapsed.as_secs_f64());
+                took[k].push(elapsed);
+                blobs[k] = embedded;
+            }
+        }
+        let median = |runs: &[Duration]| {
+            let mut runs = runs.to_vec();
+            runs.sort();
+            runs[runs.len() / 2]
+        };
+        for k in 0..2 {
+            println!("median of {runs}: {}: {:.2?}", names[k], median(&took[k]));
+        }
+
+        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
+        let differences: Vec<f32> = blobs[0]
+            .iter()
+            .zip(&blobs[1])
+            .map(|(a, b)| floats(a).iter().zip(floats(b)).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max))
+            .collect();
+        println!(
+            "{} docs of more than {EMBED_BATCH} passages: {} of {passages} vectors with the same bits in either order, largest difference {:e}",
+            docs.len(),
+            differences.iter().filter(|&&d| d == 0.0).count(),
+            differences.iter().copied().fold(0f32, f32::max),
+        );
+    }
 }
