@@ -49,6 +49,27 @@ fn ok(output: &Output) {
     assert!(output.status.success(), "stdout: {}\nstderr: {}", stdout(output), String::from_utf8_lossy(&output.stderr));
 }
 
+fn files_below(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files_below(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+// A replayed Edit names the exact text of a fixture, so a checkout that
+// turned its line endings into CRLF would make the replay miss it.
+#[test]
+fn the_task_data_keeps_lf_line_endings_on_every_system() {
+    let mut files = Vec::new();
+    files_below(&data(), &mut files);
+    let with_cr: Vec<_> = files.iter().filter(|p| std::fs::read(p).unwrap().contains(&b'\r')).collect();
+    assert!(with_cr.is_empty(), "files with CR: {with_cr:?}");
+}
+
 #[test]
 fn the_example_tasks_are_valid_and_leak_no_tracer() {
     let output = agent_eval(&["tasks"]);
