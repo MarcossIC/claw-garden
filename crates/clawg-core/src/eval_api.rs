@@ -1083,7 +1083,7 @@ pub const EMBED_BATCH: usize = crate::memory::embedder::EMBED_BATCH;
 /// The indices of `tokens` from the largest count to the smallest, equal
 /// counts in the order they came: the order an import embeds its rows in.
 pub fn longest_first(tokens: &[usize]) -> Vec<usize> {
-    crate::memory::portability::import::longest_first(tokens)
+    crate::memory::embedder::longest_first(tokens)
 }
 
 /// The token window the live embedder truncates to — re-exported so the eval
