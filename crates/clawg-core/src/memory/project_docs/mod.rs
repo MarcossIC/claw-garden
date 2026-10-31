@@ -512,18 +512,21 @@ pub(crate) async fn refresh(
     let files: HashMap<&str, &DocFile> = scan.docs.iter().map(|d| (d.file.path.as_str(), &d.file)).collect();
     let indexed_before: HashSet<&str> = stored.iter().map(|f| f.path.as_str()).collect();
     let mut timing = RefreshTiming { scan: lap(&mut mark), ..Default::default() };
+    let target = Target { store, embedder, tokenizer: splitter.tokenizer(), project_id, model_id: &model_id };
+    let mut queue = Queue::new(QUEUE_PASSAGES);
+    let mut waiting: Vec<QueuedDoc> = Vec::new();
     for path in &plan.index {
         let file = files[path.as_str()].clone();
         let kind = file.kind;
-        // Read again rather than kept from the scan, so a refresh holds one
-        // changed doc in memory at a time, not the whole tree. The hash stored
-        // is the one of the bytes actually indexed.
+        // Read again rather than kept from the scan, so a refresh holds only
+        // the docs of its queue, which `QUEUE_PASSAGES` bounds (a doc past it
+        // goes alone), not the whole tree. The hash stored is the one of the
+        // bytes actually indexed.
         let read = blocking(move || corpus::read(&file)).await;
         let mut phases = DocPhases { read: lap(&mut mark), ..Default::default() };
-        let timed = |passages, phases| DocTiming { path: path.clone(), kind, passages, phases };
         let Some((text, hash)) = read else {
             report.skipped += 1;
-            timing.docs.push(timed(0, phases));
+            timing.docs.push(DocTiming { path: path.clone(), kind, passages: 0, phases });
             continue;
         };
         let masked = redact(&text).text;
@@ -540,31 +543,93 @@ pub(crate) async fn refresh(
         let to_embed: Vec<String> = reuse.to_embed.iter().map(|&i| passages[i].indexed_text()).collect();
         let reused = passages.len() - to_embed.len();
         phases.lookup = lap(&mut mark);
-        let embedded = embed_passages(embedder, splitter.tokenizer(), path, to_embed).await;
-        phases.embed = lap(&mut mark);
-        let new = match embedded {
-            Ok(vectors) => vectors,
-            Err(DocIndexError::Vector { path, reason }) => {
-                report.failed.push(FailedDoc { path, reason });
-                timing.docs.push(timed(0, phases));
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        let vectors = fill(reuse, new);
-        report.passages += passages.len();
-        report.reused += reused;
-        let written = passages.len();
-        let doc = IndexedDoc { path: path.clone(), hash, model_id: model_id.clone(), passages, vectors };
-        replace_doc(store, project_id, doc).await?;
-        report.indexed += 1;
-        phases.write = lap(&mut mark);
-        timing.docs.push(timed(written, phases));
+        let flush = queue.admit(passages.len());
+        if flush.before {
+            write_queued(&target, std::mem::take(&mut waiting), &mut report, &mut timing, &mut mark).await?;
+        }
+        waiting.push(QueuedDoc { path: path.clone(), kind, hash, passages, reuse, to_embed, reused, phases });
+        if flush.after {
+            write_queued(&target, std::mem::take(&mut waiting), &mut report, &mut timing, &mut mark).await?;
+        }
     }
+    write_queued(&target, waiting, &mut report, &mut timing, &mut mark).await?;
     remove_docs(store, project_id, plan.remove.clone()).await?;
     report.removed = plan.remove.len();
     timing.remove = lap(&mut mark);
     Ok(RefreshRun { report, timing })
+}
+
+/// The most passages the queue of a refresh holds before it embeds them. A
+/// doc with more passages than the queue's limit goes alone.
+pub(crate) const QUEUE_PASSAGES: usize = 512;
+
+/// What the queue of a refresh decides about a doc that arrives.
+#[derive(Debug, PartialEq, Eq)]
+struct Flush {
+    before: bool,
+    after: bool,
+}
+
+/// The passages a queue holds and the flushes it has made: all it needs to
+/// say when to flush. Its limit starts at one batch and doubles with each
+/// flush up to `cap`, so the first docs of a first index become searchable
+/// after one batch instead of after the first `cap` passages.
+struct Queue {
+    cap: usize,
+    held: usize,
+    flushes: usize,
+}
+
+impl Queue {
+    fn new(cap: usize) -> Self {
+        Queue { cap, held: 0, flushes: 0 }
+    }
+
+    fn limit(&self) -> usize {
+        (EMBED_BATCH << self.flushes.min(16)).min(self.cap)
+    }
+
+    fn flush(&mut self) {
+        self.held = 0;
+        self.flushes += 1;
+    }
+
+    fn admit(&mut self, passages: usize) -> Flush {
+        if passages == 0 {
+            return Flush { before: false, after: false };
+        }
+        let before = self.held > 0 && self.held + passages > self.limit();
+        if before {
+            self.flush();
+        }
+        self.held += passages;
+        let after = self.held >= self.limit();
+        if after {
+            self.flush();
+        }
+        Flush { before, after }
+    }
+}
+
+/// The docs, by position, that share each call of a queue with `cap`.
+#[cfg(any(test, feature = "eval"))]
+pub(crate) fn queue_groups(cap: usize, passages_per_doc: &[usize]) -> Vec<Vec<usize>> {
+    let mut queue = Queue::new(cap);
+    let (mut groups, mut open) = (Vec::new(), Vec::new());
+    for (k, &n) in passages_per_doc.iter().enumerate() {
+        let flush = queue.admit(n);
+        if flush.before {
+            groups.push(std::mem::take(&mut open));
+        }
+        open.push(k);
+        if flush.after {
+            groups.push(std::mem::take(&mut open));
+        }
+    }
+    if !open.is_empty() {
+        groups.push(open);
+    }
+    groups
 }
 
 /// The time since `mark`, which moves to now: consecutive laps leave no work
@@ -642,40 +707,148 @@ async fn stored_vectors(
         .await?)
 }
 
-/// Embeds `texts`, one blob per text in the order of `texts`; without texts the
-/// embedder is not called. More than one batch of them go to the embedder
-/// longest first (see [`passage_order`]).
+/// What a refresh writes to and embeds with, apart from its docs.
+struct Target<'a> {
+    store: &'a MemoryStore,
+    embedder: &'a dyn Embedder,
+    tokenizer: Option<&'a Tokenizer>,
+    project_id: &'a str,
+    model_id: &'a str,
+}
+
+/// A doc read, split and matched with its stored vectors, waiting in the queue
+/// for the embedder.
+struct QueuedDoc {
+    path: String,
+    kind: DocKind,
+    hash: String,
+    passages: Vec<Passage>,
+    reuse: Reuse,
+    /// The texts of `reuse.to_embed`; the flush takes them.
+    to_embed: Vec<String>,
+    reused: usize,
+    /// Everything but `embed` and `write`, which come with the flush.
+    phases: DocPhases,
+}
+
+/// Embeds the texts of the queued docs in one call, then writes each doc in
+/// the order it was queued, so row ids and the report come out as if each doc
+/// had been written on its own. A doc with an unusable vector goes to
+/// `report.failed`; an embedder error ends the refresh with none of these docs
+/// written.
+async fn write_queued(
+    target: &Target<'_>,
+    mut docs: Vec<QueuedDoc>,
+    report: &mut RefreshReport,
+    timing: &mut RefreshTiming,
+    mark: &mut Instant,
+) -> Result<(), DocIndexError> {
+    if docs.is_empty() {
+        return Ok(());
+    }
+    let counts: Vec<usize> = docs.iter().map(|d| d.to_embed.len()).collect();
+    let texts: Vec<String> = docs.iter_mut().flat_map(|d| std::mem::take(&mut d.to_embed)).collect();
+    let owners: Vec<(&str, usize)> = docs.iter().map(|d| d.path.as_str()).zip(counts.iter().copied()).collect();
+    let results = embed_passages(target.embedder, target.tokenizer, &owners, texts).await?;
+    // With nothing embedded there is nothing to charge: the time stays in the
+    // mark for the next lap.
+    let shares = if counts.iter().any(|&n| n > 0) { embed_shares(lap(mark), &counts) } else { vec![Duration::ZERO; docs.len()] };
+    for ((mut doc, result), share) in docs.into_iter().zip(results).zip(shares) {
+        doc.phases.embed = share;
+        let new = match result {
+            Ok(vectors) => vectors,
+            Err(DocIndexError::Vector { path, reason }) => {
+                report.failed.push(FailedDoc { path, reason });
+                timing.docs.push(DocTiming { path: doc.path, kind: doc.kind, passages: 0, phases: doc.phases });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let vectors = fill(doc.reuse, new);
+        let written = doc.passages.len();
+        report.passages += written;
+        report.reused += doc.reused;
+        let indexed = IndexedDoc {
+            path: doc.path.clone(),
+            hash: doc.hash,
+            model_id: target.model_id.to_string(),
+            passages: doc.passages,
+            vectors,
+        };
+        replace_doc(target.store, target.project_id, indexed).await?;
+        report.indexed += 1;
+        doc.phases.write = lap(mark);
+        timing.docs.push(DocTiming { path: doc.path, kind: doc.kind, passages: written, phases: doc.phases });
+    }
+    Ok(())
+}
+
+/// `total` split among docs by how many texts each had to embed, in whole
+/// nanoseconds, so the shares add up to `total`: the rest goes to the last doc
+/// with texts, and a doc with none gets nothing. Nothing is split when no doc
+/// has texts.
+fn embed_shares(total: Duration, texts: &[usize]) -> Vec<Duration> {
+    let all: u128 = texts.iter().map(|&n| n as u128).sum();
+    let mut shares = vec![0u128; texts.len()];
+    if all > 0 {
+        let nanos = total.as_nanos();
+        for (share, &n) in shares.iter_mut().zip(texts) {
+            *share = nanos * n as u128 / all;
+        }
+        let last = texts.iter().rposition(|&n| n > 0).expect("some doc has texts");
+        shares[last] += nanos - shares.iter().sum::<u128>();
+    }
+    shares.into_iter().map(|n| Duration::new((n / 1_000_000_000) as u64, (n % 1_000_000_000) as u32)).collect()
+}
+
+/// Embeds `texts`, which are the texts of `owners` one after the other (each
+/// owner is a path and how many texts it has), in one call: one blob per
+/// text, handed back per owner, or the owner's unusable-vector error. Without
+/// texts the embedder is not called. More than one batch of them go to the
+/// embedder longest first (see [`passage_order`]). An embedder error, or
+/// another number of vectors, fails the whole call, and names the first owner.
 async fn embed_passages(
     embedder: &dyn Embedder,
     tokenizer: Option<&Tokenizer>,
-    path: &str,
+    owners: &[(&str, usize)],
     texts: Vec<String>,
-) -> Result<Vec<Vec<u8>>, DocIndexError> {
+) -> Result<Vec<Result<Vec<Vec<u8>>, DocIndexError>>, DocIndexError> {
     if texts.is_empty() {
-        return Ok(Vec::new());
+        return Ok(owners.iter().map(|_| Ok(Vec::new())).collect());
     }
+    let first = owners.first().map_or_else(String::new, |(path, _)| path.to_string());
     let count = texts.len();
     let order = passage_order(tokenizer, embedder, &texts);
     let sent = match &order {
-        Some(order) => order.iter().map(|&k| texts[k].clone()).collect(),
+        Some(order) => {
+            let mut slots: Vec<Option<String>> = texts.into_iter().map(Some).collect();
+            order.iter().map(|&k| slots[k].take().expect("each text is sent once")).collect()
+        }
         None => texts,
     };
     let vectors = embedder
         .embed_batch(&sent, EmbedRole::Passage)
         .await
-        .map_err(|source| DocIndexError::Embed { path: path.to_string(), source })?;
+        .map_err(|source| DocIndexError::Embed { path: first.clone(), source })?;
     if vectors.len() != count {
-        return Err(DocIndexError::VectorCount { path: path.to_string(), vectors: vectors.len(), passages: count });
+        return Err(DocIndexError::VectorCount { path: first, vectors: vectors.len(), passages: count });
     }
     let vectors = match order {
         Some(order) => in_passage_order(&order, vectors),
         None => vectors,
     };
-    vectors
+    let mut units = vectors.iter().map(|v| to_unit(v).map(|u| le_bytes(&u)).map_err(|e| e.to_string()));
+    Ok(owners
         .iter()
-        .map(|v| to_unit(v).map(|u| le_bytes(&u)))
-        .collect::<Result<_, _>>()
-        .map_err(|e| DocIndexError::Vector { path: path.to_string(), reason: e.to_string() })
+        .map(|&(path, n)| {
+            // Taken whole before collecting, so a bad vector does not leave
+            // the rest of its doc to the next one.
+            let own: Vec<_> = units.by_ref().take(n).collect();
+            own.into_iter()
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(|reason| DocIndexError::Vector { path: path.to_string(), reason })
+        })
+        .collect())
 }
 
 /// The order in which to hand `texts` to the embedder, as indices into them,
@@ -2410,7 +2583,7 @@ old
                 let mut blobs = Vec::with_capacity(passages);
                 for (path, texts) in docs {
                     let counting = if sorted { Some(&**tokenizer) } else { None };
-                    blobs.extend(embed_passages(embedder, counting, path, texts.clone()).await.unwrap());
+                    blobs.extend(embed_passages(embedder, counting, &[(path, texts.len())], texts.clone()).await.unwrap().remove(0).unwrap());
                 }
                 (clock.elapsed(), blobs)
             }
@@ -2494,7 +2667,7 @@ old
             let clock = Instant::now();
             let mut blobs = Vec::with_capacity(passages);
             for (path, doc) in &docs {
-                blobs.extend(embed_passages(&embedder, Some(&*tokenizer), path, doc.clone()).await.unwrap());
+                blobs.extend(embed_passages(&embedder, Some(&*tokenizer), &[(path, doc.len())], doc.clone()).await.unwrap().remove(0).unwrap());
             }
             (clock.elapsed(), blobs)
         };
@@ -2533,73 +2706,6 @@ old
             differences.iter().filter(|&&d| d == 0.0).count(),
             differences.iter().copied().fold(0f32, f32::max),
         );
-    }
-
-    /// What the queue of a refresh decides about a doc that arrives.
-    #[derive(Debug, PartialEq, Eq)]
-    struct Flush {
-        before: bool,
-        after: bool,
-    }
-
-    /// The passages a queue holds and the flushes it has made: all it needs to
-    /// say when to flush. Its limit starts at one batch and doubles with each
-    /// flush up to `cap`.
-    struct Queue {
-        cap: usize,
-        held: usize,
-        flushes: usize,
-    }
-
-    impl Queue {
-        fn new(cap: usize) -> Self {
-            Queue { cap, held: 0, flushes: 0 }
-        }
-
-        fn limit(&self) -> usize {
-            (EMBED_BATCH << self.flushes.min(16)).min(self.cap)
-        }
-
-        fn flush(&mut self) {
-            self.held = 0;
-            self.flushes += 1;
-        }
-
-        fn admit(&mut self, passages: usize) -> Flush {
-            if passages == 0 {
-                return Flush { before: false, after: false };
-            }
-            let before = self.held > 0 && self.held + passages > self.limit();
-            if before {
-                self.flush();
-            }
-            self.held += passages;
-            let after = self.held >= self.limit();
-            if after {
-                self.flush();
-            }
-            Flush { before, after }
-        }
-    }
-
-    /// The docs, by position, that share each call of a queue with `cap`.
-    fn queue_groups(cap: usize, passages_per_doc: &[usize]) -> Vec<Vec<usize>> {
-        let mut queue = Queue::new(cap);
-        let (mut groups, mut open) = (Vec::new(), Vec::new());
-        for (k, &n) in passages_per_doc.iter().enumerate() {
-            let flush = queue.admit(n);
-            if flush.before {
-                groups.push(std::mem::take(&mut open));
-            }
-            open.push(k);
-            if flush.after {
-                groups.push(std::mem::take(&mut open));
-            }
-        }
-        if !open.is_empty() {
-            groups.push(open);
-        }
-        groups
     }
 
     /// A passage as a call sees it: its tokens and the bytes of its text.
@@ -2804,5 +2910,230 @@ old
         assert_eq!(decision_after(&mut queue, &[10, 0]), [(false, false), (false, false)]);
         assert_eq!(queue.admit(6), Flush { before: false, after: true }, "the queue still held 10");
         assert_eq!(queue_groups(EMBED_BATCH, &[10, 0, 6]), [vec![0, 1, 2]]);
+    }
+
+    /// `Batches` that notes the size of every call, and fails the second one.
+    struct SecondCallFails {
+        sizes: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for SecondCallFails {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EmbedError> {
+            let call = {
+                let mut sizes = self.sizes.lock().unwrap();
+                sizes.push(texts.len());
+                sizes.len()
+            };
+            if call == 2 {
+                return Err(EmbedError::InferenceFailed("boom".into()));
+            }
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                out.push(self.embed_with_role(text, role).await?);
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "batches" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    /// A doc of one batch of passages, which fills the first limit of the
+    /// queue and so is embedded alone, then the docs named, one passage per
+    /// entry of each list.
+    fn after_a_full_batch(dir: &Path, docs: &[(&str, &[usize])]) {
+        write(dir, "a.md", &sections(&[3; EMBED_BATCH]));
+        for (name, lengths) in docs {
+            write(dir, name, &sections(lengths));
+        }
+    }
+
+    #[tokio::test]
+    async fn small_docs_share_one_call_to_the_embedder() {
+        let dir = crate::test_dir::test_dir();
+        after_a_full_batch(
+            dir.path(),
+            &[
+                ("b.md", &[9, 2, 5, 7, 1]),
+                ("c.md", &[4, 8, 3, 6, 2]),
+                ("d.md", &[5, 10, 1, 4, 6]),
+                ("e.md", &[7, 3, 9, 2, 8]),
+            ],
+        );
+        let store = store_with_project("p", dir.path()).await;
+        let embedder = Batches::new();
+
+        let report = refreshed_with(&Arc::new(DocIndex::default()), &store, &embedder, words()).await;
+
+        let calls = embedder.take();
+        assert_eq!((report.indexed, report.passages), (5, 36));
+        assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), [16, 20], "the batch alone, then the four docs together");
+        let sent: Vec<usize> = calls[1].iter().map(|t| body_words_and_section(t).0).collect();
+        assert!(sent.windows(2).all(|w| w[0] >= w[1]), "longest first: {sent:?}");
+        assert_ne!(sections_of(&calls[1]), [0, 1, 2, 3, 4].repeat(4), "not in the order of the plan");
+    }
+
+    #[tokio::test]
+    async fn no_call_holds_more_passages_than_the_cap_unless_it_is_one_doc() {
+        let dir = crate::test_dir::test_dir();
+        for k in 0..20 {
+            write(dir.path(), &format!("d{k:02}.md"), &sections(&[2; 30]));
+        }
+        let store = store_with_project("p", dir.path()).await;
+        let embedder = Batches::new();
+
+        let report = refreshed_with(&Arc::new(DocIndex::default()), &store, &embedder, words()).await;
+
+        let sizes: Vec<usize> = embedder.take().iter().map(Vec::len).collect();
+        assert!(QUEUE_PASSAGES < 20 * 30, "the docs add up to more than the cap");
+        assert_eq!((report.indexed, report.passages), (20, 600));
+        assert_eq!(sizes.iter().sum::<usize>(), 600);
+        assert!(sizes.iter().all(|&n| n <= QUEUE_PASSAGES || n == 30), "{sizes:?}");
+        assert!(sizes.iter().any(|&n| n > 30), "docs share calls: {sizes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_doc_over_the_cap_goes_alone() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", &sections(&[2; 3]));
+        write(dir.path(), "b.md", &sections(&[2; QUEUE_PASSAGES + 8]));
+        write(dir.path(), "c.md", &sections(&[2; 3]));
+        let store = store_with_project("p", dir.path()).await;
+        let embedder = Batches::new();
+
+        refreshed_with(&Arc::new(DocIndex::default()), &store, &embedder, words()).await;
+
+        let sizes: Vec<usize> = embedder.take().iter().map(Vec::len).collect();
+        assert_eq!(sizes, [3, QUEUE_PASSAGES + 8, 3]);
+    }
+
+    #[tokio::test]
+    async fn each_passage_of_a_shared_call_keeps_its_own_vector() {
+        let dir = crate::test_dir::test_dir();
+        after_a_full_batch(
+            dir.path(),
+            &[("b.md", &[9, 2, 5, 7, 1, 6, 3]), ("c.md", &[4, 8, 3, 6, 2, 9]), ("d.md", &[5, 10, 1, 4, 6])],
+        );
+        let store = store_with_project("p", dir.path()).await;
+        let embedder = Batches::new();
+
+        refreshed_with(&Arc::new(DocIndex::default()), &store, &embedder, words()).await;
+
+        assert_eq!(embedder.take().iter().map(Vec::len).collect::<Vec<_>>(), [16, 18], "three docs in one call");
+        let stored = dump(&store).await.0;
+        assert_eq!(stored.len(), 16 + 7 + 6 + 5);
+        for (path, _, _, _, blob, text) in &stored {
+            let own = FakeEmbedder::default().embed_with_role(text, EmbedRole::Passage).await.unwrap();
+            assert_eq!(blob, &le_bytes(&to_unit(&own).unwrap()), "{path}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_vector_in_a_shared_call_skips_only_its_doc() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", "# A\nsound one\n");
+        write(dir.path(), "b.md", "# B\nBROKEN passage\n## More\nfine\n");
+        write(dir.path(), "c.md", "# C\nsound three\n");
+        let store = store_with_project("p", dir.path()).await;
+        let embedder = Batches::new();
+
+        let report = refreshed_with(&Arc::new(DocIndex::default()), &store, &embedder, words()).await;
+
+        assert_eq!(embedder.take().iter().map(Vec::len).collect::<Vec<_>>(), [4], "one call for the three docs");
+        assert_eq!((report.indexed, report.passages), (2, 2), "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].path, "b.md");
+        assert!(report.failed[0].reason.contains("finite"), "{report:?}");
+        let paths: Vec<String> = passages(&store, "p").await.into_iter().map(|p| p.0).collect();
+        assert_eq!(paths, ["a.md", "c.md"]);
+    }
+
+    #[tokio::test]
+    async fn a_shared_call_writes_its_docs_in_plan_order() {
+        let dir = crate::test_dir::test_dir();
+        for (name, n) in [("a.md", 2), ("b.md", 3), ("c.md", 1), ("d.md", 4)] {
+            write(dir.path(), name, &sections(&vec![2; n]));
+        }
+        let store = store_with_project("p", dir.path()).await;
+        let embedder = Batches::new();
+
+        let report = refreshed_with(&Arc::new(DocIndex::default()), &store, &embedder, words()).await;
+
+        assert_eq!(embedder.take().iter().map(Vec::len).collect::<Vec<_>>(), [10], "the four docs share a call");
+        assert_eq!(report, RefreshReport { docs: 4, indexed: 4, passages: 10, ..Default::default() });
+        let by_row: Vec<(String, i64)> = store
+            .conn
+            .call(|c| -> rusqlite::Result<_> {
+                c.prepare("SELECT path, ordinal FROM project_doc_chunk ORDER BY id")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect()
+            })
+            .await
+            .unwrap();
+        let mut by_path = by_row.clone();
+        by_path.sort();
+        assert_eq!(by_row, by_path, "row ids grow with the path and the ordinal");
+        assert_eq!(by_row.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn an_embedder_error_keeps_the_docs_of_its_call_as_they_were() {
+        let dir = crate::test_dir::test_dir();
+        after_a_full_batch(dir.path(), &[("b.md", &[2, 3]), ("c.md", &[4, 5]), ("d.md", &[6, 7])]);
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let failing = SecondCallFails { sizes: Mutex::new(Vec::new()) };
+
+        let failed = index.try_refresh(&store, &failing, words(), "p").await;
+
+        assert!(matches!(failed, Err(DocIndexError::Embed { ref path, .. }) if path == "b.md"), "{failed:?}");
+        assert_eq!(*failing.sizes.lock().unwrap(), [16, 6], "the failing call held the three docs");
+        let written: Vec<String> = passages(&store, "p").await.into_iter().map(|p| p.0).collect();
+        assert!(written.iter().all(|p| p == "a.md") && written.len() == 16, "only the docs of the earlier call: {written:?}");
+
+        let retried = refreshed_with(&index, &store, &Batches::new(), words()).await;
+        assert_eq!((retried.indexed, retried.unchanged), (3, 1), "the next refresh plans the rest");
+    }
+
+    #[test]
+    fn embed_shares_split_the_time_by_texts_and_add_up_to_it() {
+        let ns = Duration::from_nanos;
+        assert_eq!(embed_shares(ns(10), &[3, 1, 6]), [ns(3), ns(1), ns(6)]);
+        assert_eq!(embed_shares(ns(10), &[1, 1, 1]), [ns(3), ns(3), ns(4)], "the rest goes to the last");
+        assert_eq!(embed_shares(ns(10), &[0, 2, 0]), [ns(0), ns(10), ns(0)], "a doc with no texts gets none");
+        assert_eq!(embed_shares(ns(7), &[5]), [ns(7)]);
+        for total in [0u64, 1, 9, 1_000_003, u64::MAX / 3] {
+            for counts in [vec![1, 2, 3], vec![7, 0, 11, 5], vec![1; 9], vec![0, 4]] {
+                let shares = embed_shares(ns(total), &counts);
+                assert_eq!(shares.iter().sum::<Duration>(), ns(total), "{total} over {counts:?}");
+                for (share, &count) in shares.iter().zip(&counts) {
+                    assert!(count > 0 || share.is_zero(), "{counts:?}: {shares:?}");
+                }
+            }
+        }
+        assert_eq!(embed_shares(ns(10), &[0, 0]), [ns(0), ns(0)], "no texts, no share: the time stays with whoever follows");
+    }
+
+    #[tokio::test]
+    async fn every_doc_of_a_shared_call_has_embed_time() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", &sections(&[2; 2]));
+        write(dir.path(), "b.md", &sections(&[2; 1]));
+        write(dir.path(), "c.md", &sections(&[2; 3]));
+        let store = store_with_project("p", dir.path()).await;
+        let embedder = Batches::new();
+
+        let run = refresh(&store, &embedder, &TokenSplitter::fallback(), "p", dir.path(), &HashSet::new()).await.unwrap();
+
+        assert_eq!(embedder.take().iter().map(Vec::len).collect::<Vec<_>>(), [6], "one call for the three docs");
+        assert_eq!(run.timing.docs.len(), 3);
+        for doc in &run.timing.docs {
+            assert!(doc.phases.embed > Duration::ZERO, "{doc:?}");
+        }
     }
 }

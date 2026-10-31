@@ -969,7 +969,10 @@ mod tests {
     async fn what_a_run_embedded_before_the_index_failed_is_kept() {
         let root = crate::test_dir::test_dir();
         let cache = crate::test_dir::test_dir();
-        write_doc(root.path(), "a.md", 3, &[]);
+        // A batch of passages fills the first limit of the queue, so the
+        // first doc is embedded in a call of its own, before the second.
+        let batch = crate::memory::embedder::EMBED_BATCH;
+        write_doc(root.path(), "a.md", batch, &[]);
         write_doc(root.path(), "b.md", 3, &[(1, "BROKEN")]);
         let recording = Recording::faulty(Fault::ShortWhenBroken);
         let memo = memo_over(&recording, cache.path(), "sha");
@@ -984,7 +987,7 @@ mod tests {
         assert!(failed.is_err(), "the second doc comes back short");
         assert_eq!(recording.calls().len(), 2, "the first doc was embedded before the failure");
         let bytes = std::fs::read(cache.path().join(&run.file)).unwrap();
-        assert_eq!(decode(&bytes, &contract_for(&recording, "sha")).unwrap().len(), 3, "the sound doc's passages");
+        assert_eq!(decode(&bytes, &contract_for(&recording, "sha")).unwrap().len(), batch, "the sound doc's passages");
     }
 
     #[tokio::test]
