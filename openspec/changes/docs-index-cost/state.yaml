@@ -9,7 +9,7 @@ artifacts:
   design: done
   tasks: done
   apply: in_progress  # tareas 1 a 9 (sin el modelo real); la 10 necesita el modelo real y un build release
-  verify: pending
+  verify: in_progress  # código PASS WITH WARNINGS (verify.md); faltan las corridas D y R
   archive: pending
 gates: {}
 updated: 2026-10-30
