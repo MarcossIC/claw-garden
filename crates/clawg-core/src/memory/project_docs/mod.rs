@@ -16,13 +16,13 @@ use std::time::{Duration, Instant};
 
 use crate::memory::chunker::token_splitter::TokenSplitter;
 use crate::memory::clock::TimestampMs;
-use crate::memory::embedder::{apply_role_prefix, longest_first, window_encodings, EmbedError, EmbedRole, Embedder, EMBED_BATCH};
+use crate::memory::embedder::{longest_first, passage_token_counts, EmbedError, EmbedRole, Embedder, EMBED_BATCH};
 use crate::memory::redact::redact;
 use crate::memory::search::{fts_match_expression, MAX_LEXICAL_TOKENS};
 use crate::memory::vector::to_unit;
 use crate::memory::MemoryStore;
 
-use tokenizers::{Encoding, Tokenizer};
+use tokenizers::Tokenizer;
 
 use chunk::{chunk_manifest, chunk_markdown, Passage};
 use code::chunk_code;
@@ -689,12 +689,7 @@ pub(crate) fn passage_order(tokenizer: Option<&Tokenizer>, embedder: &dyn Embedd
     if texts.len() <= EMBED_BATCH {
         return None;
     }
-    let prefixed: Vec<String> = texts
-        .iter()
-        .map(|t| apply_role_prefix(EmbedRole::Passage, t, embedder.query_prefix(), embedder.passage_prefix()))
-        .collect();
-    let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-    let lengths: Vec<usize> = window_encodings(tokenizer?, &refs).ok()?.iter().map(Encoding::len).collect();
+    let lengths = passage_token_counts(tokenizer?, embedder, texts).ok()?;
     Some(longest_first(&lengths))
 }
 

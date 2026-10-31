@@ -263,6 +263,21 @@ pub(crate) fn window_encodings(tokenizer: &Tokenizer, texts: &[&str]) -> Result<
         .collect()
 }
 
+/// The tokens of each passage as the model receives it: under the embedder's
+/// passage prefix and cut to the window.
+pub(crate) fn passage_token_counts<S: AsRef<str>>(
+    tokenizer: &Tokenizer,
+    embedder: &dyn Embedder,
+    texts: &[S],
+) -> Result<Vec<usize>, EmbedError> {
+    let prefixed: Vec<String> = texts
+        .iter()
+        .map(|t| apply_role_prefix(EmbedRole::Passage, t.as_ref(), embedder.query_prefix(), embedder.passage_prefix()))
+        .collect();
+    let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+    Ok(window_encodings(tokenizer, &refs)?.iter().map(Encoding::len).collect())
+}
+
 /// Lays the encodings out as one rectangle, padding every text on the right to
 /// the longest with `pad_id`, attention mask 0 and token type 0.
 pub(crate) fn pad_right(encodings: &[Encoding], pad_id: u32) -> PaddedBatch {

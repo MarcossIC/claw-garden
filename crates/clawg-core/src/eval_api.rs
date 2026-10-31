@@ -1402,11 +1402,12 @@ pub struct EvalPassageLengths {
     pub count_seconds: f64,
 }
 
-/// The tokens of each text inside the model's window, grouped by doc (a doc's
+/// The tokens of each text as the model receives it, grouped by doc (a doc's
 /// texts come together) and counted in runs of [`EMBED_BATCH`], as the
-/// embedder takes them, with the time the tokenizer took.
+/// embedder takes them, with the time counting took.
 fn lengths_by_doc(
     tokenizer: &tokenizers::Tokenizer,
+    embedder: &dyn Embedder,
     texts: &[(String, String)],
 ) -> Result<(Vec<EvalDocLengths>, std::time::Duration), EvalError> {
     let mut docs: Vec<EvalDocLengths> = Vec::new();
@@ -1416,12 +1417,12 @@ fn lengths_by_doc(
         let end = texts[start..].iter().position(|(path, _)| *path != texts[start].0).map_or(texts.len(), |n| start + n);
         let mut lengths = Vec::with_capacity(end - start);
         for run in texts[start..end].chunks(EMBED_BATCH) {
-            let refs: Vec<&str> = run.iter().map(|(_, text)| text.as_str()).collect();
+            let run: Vec<&str> = run.iter().map(|(_, text)| text.as_str()).collect();
             let counting = std::time::Instant::now();
-            let encodings = crate::memory::embedder::window_encodings(tokenizer, &refs)
+            let counts = crate::memory::embedder::passage_token_counts(tokenizer, embedder, &run)
                 .map_err(|e| EvalError::Embed(e.to_string()))?;
             took += counting.elapsed();
-            lengths.extend(encodings.iter().map(tokenizers::Encoding::len));
+            lengths.extend(counts);
         }
         docs.push(EvalDocLengths { path: texts[start].0.clone(), lengths });
         start = end;
@@ -1465,8 +1466,8 @@ impl EvalDocIndex {
     /// them: the text of the stored passage under the embedder's passage
     /// prefix, cut to the model's window, by doc in path order and within a
     /// doc in the order of its passages, which is not the order a refresh
-    /// embedded them in. `None` without a
-    /// tokenizer, which only the real model brings.
+    /// embedded them in. `None` without a tokenizer, which only the real model
+    /// brings.
     pub async fn passage_lengths(&self) -> Result<Option<EvalPassageLengths>, EvalError> {
         let Some(tokenizer) = &self.tokenizer else { return Ok(None) };
         let rows = self
@@ -1489,17 +1490,9 @@ impl EvalDocIndex {
             .map_err(|e| EvalError::Doc(e.to_string()))?;
         let texts: Vec<(String, String)> = rows
             .into_iter()
-            .map(|(path, passage)| {
-                let text = crate::memory::embedder::apply_role_prefix(
-                    EmbedRole::Passage,
-                    &passage.indexed_text(),
-                    self.embedder.query_prefix(),
-                    self.embedder.passage_prefix(),
-                );
-                (path, text)
-            })
+            .map(|(path, passage)| (path, passage.indexed_text()))
             .collect();
-        let (docs, took) = lengths_by_doc(tokenizer, &texts)?;
+        let (docs, took) = lengths_by_doc(tokenizer, self.embedder.as_ref(), &texts)?;
         Ok(Some(EvalPassageLengths { docs, count_seconds: took.as_secs_f64() }))
     }
 
@@ -2942,13 +2935,13 @@ second
             .chain([("b.md".to_string(), "x y".to_string())])
             .collect();
 
-        let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
+        let (docs, _) = lengths_by_doc(&tokenizer, &FakeEmbedder::default(), &texts).unwrap();
 
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0].path, "a.md");
         assert_eq!(docs[0].lengths, (1..=19).collect::<Vec<usize>>());
         assert_eq!((docs[1].path.as_str(), docs[1].lengths.clone()), ("b.md", vec![2]));
-        assert_eq!(lengths_by_doc(&tokenizer, &[]).unwrap().0, Vec::<EvalDocLengths>::new());
+        assert_eq!(lengths_by_doc(&tokenizer, &FakeEmbedder::default(), &[]).unwrap().0, Vec::<EvalDocLengths>::new());
     }
 
     #[test]
@@ -2957,7 +2950,7 @@ second
         let long = vec!["w"; EMBED_MAX_TOKENS + 188].join(" ");
         let texts = vec![("a.md".to_string(), long), ("a.md".to_string(), "x y".to_string())];
 
-        let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
+        let (docs, _) = lengths_by_doc(&tokenizer, &FakeEmbedder::default(), &texts).unwrap();
 
         assert_eq!(docs[0].lengths, vec![EMBED_MAX_TOKENS, 2]);
     }
