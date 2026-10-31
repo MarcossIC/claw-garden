@@ -1,6 +1,6 @@
 # perf-bench — Especificación
 
-Suma una sección a [`specs/eval`](../../../specs/eval/spec.md): «Banco de rendimiento del daemon». Ninguna otra spec cambia: el daemon, `metrics.db` y lo guardado quedan como están. Origen: [proposal](proposal.md).
+Suma una sección a [`specs/eval`](../../../../specs/eval/spec.md): «Banco de rendimiento del daemon». Ninguna otra spec cambia: el daemon, `metrics.db` y lo guardado quedan como están. Origen: [proposal](proposal.md).
 
 Los tests de PB1 a PB6 están en `crates/clawg-cli/tests/perf_bench.rs` y corren con la suite (sin modelo, sin red, sin dejar nada en el temporal); los de PB7 y PB8, en `crates/clawg-eval/src/bin/perf-bench/`. El banco mismo (`bench`) es `#[ignore]`.
 

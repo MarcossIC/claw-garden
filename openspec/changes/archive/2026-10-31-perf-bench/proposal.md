@@ -10,7 +10,7 @@ Las métricas de uso (71, 73) dicen qué pasó en una ejecución, pero son obser
 
 - **El único banco que arranca el binario es de transporte.** `crates/clawg-cli/tests/transport_bar.rs` (`#![cfg(windows)]`, `:11`; `#[ignore]`, `:308`) mide `/health` y una lista contra un store de 60 filas (`seed_and_calibrate`, `:176-206`), con un cliente que espera cada respuesta antes de mandar la siguiente (`run`, `:222-295`): no mide búsquedas, contextos ni saves, y un daemon que se traba esconde cuántas peticiones habrían esperado detrás.
 - **`rag-eval --agent-view` da p50 y p99 sobre 46 casos** (`crates/clawg-eval/src/bin/rag-eval/agent_view/stats.rs:28-29`), en proceso, sin carga concurrente ni guardados.
-- **Las puertas de 57 y 62 piden mediciones que nadie produce**: la espera de un save, de `session-start` y de una búsqueda detrás de un refresco de docs o de un save largo ([read-connections](../read-connections/exploration.md)), y la CPU en reposo y bajo carga ([embedder-footprint](../embedder-footprint/exploration.md)).
+- **Las puertas de 57 y 62 piden mediciones que nadie produce**: la espera de un save, de `session-start` y de una búsqueda detrás de un refresco de docs o de un save largo ([read-connections](../../read-connections/exploration.md)), y la CPU en reposo y bajo carga ([embedder-footprint](../../embedder-footprint/exploration.md)).
 - **No hay con qué comparar dos corridas de latencia.** `rag-eval --diff` compara casos pareados (`crates/clawg-eval/src/bin/rag-eval/diff.rs:283`); dos corridas de un banco mandan peticiones distintas en instantes distintos, así que se comparan distribuciones.
 
 ## Objetivo

@@ -1,6 +1,6 @@
 # perf-bench — Exploración
 
-Objetivo transversal. Las métricas de uso de [usage-metrics](../archive/2026-10-22-usage-metrics/exploration.md) (71) y [pipeline-metrics](../archive/2026-10-30-pipeline-metrics/exploration.md) (73) dicen qué pasa, pero son observacionales: entre dos versiones cambian también el tamaño del store, las consultas, la carga de la máquina y la hora. Un banco reproducible por versión fija todo eso y permite afirmar que una versión es más lenta. Es la propuesta M10 de una propuesta de medición escrita sobre 0.26.0.
+Objetivo transversal. Las métricas de uso de [usage-metrics](../2026-10-22-usage-metrics/exploration.md) (71) y [pipeline-metrics](../2026-10-30-pipeline-metrics/exploration.md) (73) dicen qué pasa, pero son observacionales: entre dos versiones cambian también el tamaño del store, las consultas, la carga de la máquina y la hora. Un banco reproducible por versión fija todo eso y permite afirmar que una versión es más lenta. Es la propuesta M10 de una propuesta de medición escrita sobre 0.26.0.
 
 ## Premisas que se verificaron y cuáles no eran del todo ciertas
 

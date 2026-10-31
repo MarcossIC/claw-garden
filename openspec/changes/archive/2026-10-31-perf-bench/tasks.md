@@ -35,6 +35,6 @@ Un test de integración es un crate propio: una función que sólo usa el banco 
 
 ## 5. Archivo
 
-- [ ] La sección «Banco de rendimiento del daemon» en `specs/eval`; el cambio a `changes/archive/`; el mapa de `openspec/README.md`.
+- [x] La sección «Banco de rendimiento del daemon» en `specs/eval`; el cambio a `changes/archive/`; el mapa de `openspec/README.md`.
 - Commit: `docs(openspec): archive perf-bench and fold it into the specs`
-- [ ] Subir el minor, `cargo update --workspace`. Commit: `chore: bump version to 0.70.0`
+- [x] Subir el minor, `cargo update --workspace`. Commit: `chore: bump version to 0.70.0`

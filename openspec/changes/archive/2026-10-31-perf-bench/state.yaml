@@ -1,7 +1,8 @@
 change: perf-bench
 objective: "transversal"
 depends_on: [usage-metrics, pipeline-metrics]
-phase: verify
+phase: archived
+release: "0.70.0"
 artifacts:
   exploration: done
   proposal: done
@@ -10,5 +11,8 @@ artifacts:
   tasks: done
   apply: done
   verify: done  # PASS WITH WARNINGS (verify.md): el mínimo de muestras subió a 40; sin modelo real ni release
-  archive: pending
+  archive: done
+after_archive:  # fuera del cambio
+  - "las puertas de 57 y 62 corren el banco con el modelo real y --release, con autorización"
 updated: 2026-10-31
+main_spec: openspec/specs/eval/spec.md
