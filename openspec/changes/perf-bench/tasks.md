@@ -28,8 +28,9 @@ Un test de integración es un crate propio: una función que sólo usa el banco 
 
 ## 4. Verificación (PB8)
 
-- [ ] Suite completa y los dos clippy sobre el último commit.
-- [ ] Dos corridas del banco (debug, embedder falso, 10 000 filas) sobre el mismo commit y su `diff`; una tercera con 50 ms de espera inyectados en `POST /v1/search` (sin commitear) y su `diff` contra la primera. Los números, en `verify.md`.
+- [x] Suite completa y los dos clippy sobre el último commit.
+- [x] Dos corridas del banco (debug, embedder falso, 10 000 filas) sobre el mismo commit y su `diff`; una tercera con 50 ms de espera inyectados en `POST /v1/search` (sin commitear) y su `diff` contra la primera. Los números, en `verify.md`.
+- [x] El falso `slower` de las dos corridas del mismo commit sube el mínimo de muestras a 40. RED: `the_verdict_needs_the_threshold_and_an_interval_without_zero` con 39 y 40 muestras. Commit: `fix(eval): decide a bench p95 only with 40 samples a side`
 - Commit: `docs(openspec): record the verification of perf-bench`
 
 ## 5. Archivo

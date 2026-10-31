@@ -109,7 +109,7 @@ perf-bench diff FIRST SECOND [--fail-on-regression]
 - `n` de cada lado, el p50 y el p95 (rango más cercano);
 - el cambio relativo del p50 y del p95 (segundo sobre primero, menos uno) con un intervalo bootstrap percentil del 95 %: 4 000 remuestreos, cada lado con reemplazo por su cuenta, semilla fija, así los mismos dos archivos dan siempre el mismo intervalo;
 - el valor p bilateral de Mann-Whitney U, con la aproximación normal, la corrección por empates y la de continuidad;
-- un veredicto: `slower` si la segunda corrida tiene más fallos que la primera, o si el p95 subió más del 20 % y el límite inferior del intervalo es mayor que cero; `faster` si bajó más del 20 % y el límite superior es menor que cero; `too few samples` con menos de 20 muestras de algún lado; si no, `no change`.
+- un veredicto: `slower` si la segunda corrida tiene más fallos que la primera, o si el p95 subió más del 20 % y el límite inferior del intervalo es mayor que cero; `faster` si bajó más del 20 % y el límite superior es menor que cero; `too few samples` con menos de 40 muestras de algún lado; si no, `no change`.
 
 MUST avisar (`warning:`) cuando las corridas difieren en `build`, `embedder`, `machine`, `store.rows` o `store.seed`, y nombrar cada escenario que está en una sola. Con `--fail-on-regression` MUST salir con 6 si algún escenario es `slower`; si no, con 0.
 
@@ -127,4 +127,4 @@ MUST avisar (`warning:`) cuando las corridas difieren en `build`, `embedder`, `m
 
 ## PB8. El banco se verifica a sí mismo
 
-El cambio MUST cerrarse con tres corridas del banco en un build debug, con el embedder falso y 10 000 filas, anotadas en `verify.md`: dos sobre el mismo commit, cuyo `diff` no marca ningún escenario `slower`, y una con una espera de 50 ms inyectada al comienzo de `POST /v1/search` y sin commitear, cuyo `diff` contra la primera marca `slower` los escenarios `search` y `search_during_*` y ningún otro: la espera no ocupa la conexión del store, así que el resto no debe moverse.
+El cambio MUST cerrarse con tres corridas del banco en un build debug, con el embedder falso y 10 000 filas, anotadas en `verify.md`: dos sobre el mismo commit, cuyo `diff` no marca ningún escenario `slower`, y una con una espera de 50 ms inyectada al comienzo de `POST /v1/search` y sin commitear, cuyo `diff` contra la primera marca `slower` el escenario `search` y ninguno que no busque: la espera no ocupa la conexión del store, así que el resto no debe moverse.

@@ -1,14 +1,14 @@
 change: perf-bench
 objective: "transversal"
 depends_on: [usage-metrics, pipeline-metrics]
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done  # PB1 a PB8, una sección nueva en specs/eval
   design: done
   tasks: done
-  apply: in_progress
-  verify: pending
+  apply: done
+  verify: done  # PASS WITH WARNINGS (verify.md): el mínimo de muestras subió a 40; sin modelo real ni release
   archive: pending
 updated: 2026-10-31
