@@ -64,16 +64,33 @@ pub fn apply(current: Option<&str>, edit: &FileEdit) -> Result<String, String> {
     }
 }
 
+/// Refuses `path` unless it, or its nearest existing ancestor when it does
+/// not exist, resolves inside `root`, a canonical path: the check of
+/// [`file_edits`] reads the path's text, and a link in the working directory
+/// can still lead out of it.
+fn resolves_inside(root: &Path, path: &Path) -> Result<(), String> {
+    let existing = path.ancestors().find(|p| p.symlink_metadata().is_ok()).unwrap_or(path);
+    let resolved = std::fs::canonicalize(existing).map_err(|e| format!("cannot resolve {}: {e}", existing.display()))?;
+    if resolved.starts_with(root) {
+        Ok(())
+    } else {
+        Err(format!("the replayed change of {} resolves outside the working directory", path.display()))
+    }
+}
+
 /// Makes the changes `stream` records in `cwd`, then prints `stream`.
 pub fn run(stream: &Path, cwd: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(stream).map_err(|e| format!("cannot read {}: {e}", stream.display()))?;
+    let root = std::fs::canonicalize(cwd).map_err(|e| format!("cannot resolve {}: {e}", cwd.display()))?;
     for edit in file_edits(&parse(&text))? {
         let path = cwd.join(edit.path());
+        resolves_inside(&root, &path)?;
         let current = std::fs::read_to_string(&path).ok();
         let after = apply(current.as_deref(), &edit)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
+        resolves_inside(&root, &path)?;
         std::fs::write(&path, after).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     }
     std::io::stdout().write_all(text.as_bytes()).map_err(|e| format!("cannot print the stream: {e}"))
@@ -136,5 +153,35 @@ mod tests {
         run(&recorded, dir.path()).unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("a.py")).unwrap(), "x = 2\n");
         assert_eq!(std::fs::read_to_string(dir.path().join("sub/b.py")).unwrap(), "y");
+    }
+
+    #[test]
+    fn a_change_must_resolve_inside_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let root = std::fs::canonicalize(&cwd).unwrap();
+        assert!(resolves_inside(&root, &cwd.join("new").join("a.py")).is_ok());
+        assert!(resolves_inside(&root, &dir.path().join("b.py")).unwrap_err().contains("outside the working directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_refuses_a_change_a_link_leads_out_of_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cwd, outside) = (dir.path().join("cwd"), dir.path().join("outside"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f.py"), "x = 1\n").unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("dir")).unwrap();
+        std::os::unix::fs::symlink(outside.join("f.py"), cwd.join("f.py")).unwrap();
+        let recorded = dir.path().join("s.jsonl");
+        for path in ["dir/a.py", "f.py"] {
+            let call = format!(r#"{{"type":"tool_use","id":"1","name":"Write","input":{{"file_path":"{path}","content":"y"}}}}"#);
+            std::fs::write(&recorded, format!(r#"{{"type":"assistant","message":{{"content":[{call}]}}}}"#)).unwrap();
+            assert!(run(&recorded, &cwd).unwrap_err().contains("outside the working directory"), "{path}");
+        }
+        assert!(!outside.join("a.py").exists());
+        assert_eq!(std::fs::read_to_string(outside.join("f.py")).unwrap(), "x = 1\n");
     }
 }
