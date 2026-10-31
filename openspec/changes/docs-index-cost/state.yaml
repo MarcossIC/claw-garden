@@ -8,7 +8,7 @@ artifacts:
   spec: done
   design: done
   tasks: done
-  apply: pending
+  apply: in_progress  # tareas 1 a 9 (sin el modelo real); la 10 necesita el modelo real y un build release
   verify: pending
   archive: pending
 gates: {}
