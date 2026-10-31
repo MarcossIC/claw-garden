@@ -264,18 +264,23 @@ pub(crate) fn window_encodings(tokenizer: &Tokenizer, texts: &[&str]) -> Result<
 }
 
 /// The tokens of each passage as the model receives it: under the embedder's
-/// passage prefix and cut to the window.
+/// passage prefix and cut to the window. Counted one batch at a time, so the
+/// encodings alive together are a batch's, however many texts there are.
 pub(crate) fn passage_token_counts<S: AsRef<str>>(
     tokenizer: &Tokenizer,
     embedder: &dyn Embedder,
     texts: &[S],
 ) -> Result<Vec<usize>, EmbedError> {
-    let prefixed: Vec<String> = texts
-        .iter()
-        .map(|t| apply_role_prefix(EmbedRole::Passage, t.as_ref(), embedder.query_prefix(), embedder.passage_prefix()))
-        .collect();
-    let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-    Ok(window_encodings(tokenizer, &refs)?.iter().map(Encoding::len).collect())
+    let mut counts = Vec::with_capacity(texts.len());
+    for batch in texts.chunks(EMBED_BATCH) {
+        let prefixed: Vec<String> = batch
+            .iter()
+            .map(|t| apply_role_prefix(EmbedRole::Passage, t.as_ref(), embedder.query_prefix(), embedder.passage_prefix()))
+            .collect();
+        let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+        counts.extend(window_encodings(tokenizer, &refs)?.iter().map(Encoding::len));
+    }
+    Ok(counts)
 }
 
 /// Lays the encodings out as one rectangle, padding every text on the right to

@@ -837,7 +837,7 @@ async fn embed_passages(
         Some(order) => in_passage_order(&order, vectors),
         None => vectors,
     };
-    let mut units = vectors.iter().map(|v| to_unit(v).map(|u| le_bytes(&u)).map_err(|e| e.to_string()));
+    let mut units = vectors.into_iter().map(|v| to_unit(&v).map(|u| le_bytes(&u)).map_err(|e| e.to_string()));
     Ok(owners
         .iter()
         .map(|&(path, n)| {
