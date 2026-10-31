@@ -221,17 +221,29 @@ Hay dos reglas del texto de IS1 que ninguna prueba muerde: contar «con el prefi
 **WARNING:**
 
 1. **Ninguna prueba de la suite mide el relleno de las tandas que manda el refresco** (escenario «relleno menor» de IS1). El 1640 frente a 2000 lo prueba la fórmula de `rag-eval` (`index_cost.rs:351`). Que el refresco mande ese orden lo prueba `a_doc_over_a_batch_…`. Que una secuencia que no crece rellene `padded_sorted` es aritmética. La medición la dio la corrida real (`padded_ran` = `padded_sorted_in_doc`). **Arreglo:** un `Batches` que, con el tokenizer de palabras, sume filas × el largo mayor de cada tanda de `EMBED_BATCH` que recibe, y un doc de 20 pasajes que alternan 10 y 100 palabras, que tiene que dar 1640.
+
+   **Cerrado en `b97d97a`:** `a_doc_reaches_the_embedder_with_less_padding_than_in_its_passage_order` suma filas × el largo mayor de cada tanda de 16 que recibe el embedder, con un doc de 20 pasajes que alternan 10 y 100 palabras: da 16 × L100 + 4 × L10 (con L medido con el tokenizer, breadcrumb incluido) y menos que 20 × L100, lo que rellenaría el orden de los pasajes. Con `passage_order` siempre `None` (M1) falla.
 2. **La clave «con el prefijo de pasaje, cortada a la ventana» de IS1 no la sostiene ninguna prueba** (`mod.rs:692-697`; mutaciones M5, M6 y M7). Por lo de arriba, no cambia el relleno con ningún tokenizer que cuente el prefijo siempre igual, y la corrida real mostró la igualdad. Pero la regla está en el requisito y se podría perder sin que nada fallara. **Arreglo:** un caso puro en `passage_order_is_none_up_to_one_batch_and_longest_first_above_it`, con el tokenizer de palabras, que ya tiene ventana de 512 y no agrega tokens especiales.
+
+   **Cerrado en `b97d97a`:** `the_order_counts_the_passage_prefix` (511 y 512 palabras, con prefijo de una palabra empatan y quedan en el orden de los pasajes) y `the_order_counts_no_more_than_the_window` (600 y 700 empatan en 512). Mutaciones: M5 (sin prefijo) falla la primera (y `passage_lengths_follow_the_stored_passages_in_ordinal_order`); M6 (sin ventana) falla las dos y `a_passage_longer_than_the_window_counts_the_window`; M7 (`count_all` crudo) falla las dos. Lo único que cambia a la verificación original: el conteo ahora es una sola función, así que M5 y M6 también muerden en `eval_api`.
    - Con un embedder de prefijo de una palabra (el `Prefixed` de `eval_api.rs:2885` u otro igual), dos textos de 511 y 512 palabras empatan en la ventana y tienen que quedar en el orden de los pasajes. Sin prefijo, el de 512 pasaría delante.
    - Dos textos de 600 y 700 palabras también empatan en 512. Sin ventana, el de 700 pasaría delante.
 
 **SUGGESTION:**
 
 1. **Las pruebas de empates de A1 no ven un `sort_unstable`** (M11). Con este toolchain, el orden inestable deja los empates en su lugar con 20 elementos o menos, y todas las pruebas de A1 ordenan 20 o menos. Lo detecta una prueba de la importación con más filas, y como `longest_first` es compartida, la regla queda cubierta. Si se quiere que lo vea el refresco, `a_doc_over_a_batch_…` puede usar un doc de más de 20 pasajes con empates.
+
+   **Cerrado en `b97d97a`:** `a_doc_over_a_batch_reaches_the_embedder_longest_first` usa un doc de 40 pasajes con empates. Con `sort_unstable_by_key` en `longest_first` falla (junto a la de la importación).
 2. **El escenario «el caso falta» de IS4 nombra una prueba que no falla por eso.** `the_vectors_are_the_ones_fastembed_gave` lee los textos de la fixture (`e5_golden.rs:328-366`), así que un caso que falta no lo hace fallar. La que falla es `a_batch_longest_first_stays_within_the_tolerance_of_the_batch_in_order` (`:137`). Al archivar, conviene que la spec nombre esa. Por la misma razón, la fixture fija el orden de producción del momento del bless. Ninguna prueba de la suite compara ese orden con el `passage_order` de hoy, porque hace falta el tokenizer real.
 3. **`passage_order` arma las copias con prefijo antes de mirar si hay tokenizer** (`mod.rs:692-697`). Sin tokenizer y con más de 16 textos, copia todos para nada. Basta con poner `let tokenizer = tokenizer?;` antes de la línea 692. Además, `passage_order` y `EvalDocIndex::passage_lengths` (`eval_api.rs:1490-1502`) arman la clave cada uno por su lado, y la igualdad de D2 depende de que coincidan. Una sola función para las dos haría que `a_passage_longer_than_the_window_counts_the_window` (`eval_api.rs:2955`) cubriera también la de producción, y cerraría el WARNING 2 de paso.
+
+   **Cerrado en `102feda`:** `embedder::passage_token_counts` (prefijo, `window_encodings`, `Encoding::len`) la usan `passage_order` y `EvalDocIndex::passage_lengths`; `passage_order` vuelve antes de armar copias si no hay tokenizer. `count_seconds` ahora incluye el armado del prefijo, que es parte de contar.
 4. **`docs/reference/daemon.md`** dice «so the order changes no row, id or report». Con el modelo real, los últimos bits de un vector pueden moverse según con qué textos comparte tanda (IS1). En esta CPU se movieron 0, pero en otra pueden moverse. Tampoco dice que un conteo fallido deja el orden de los pasajes. Son dos frases.
+
+   **Cerrado en `02355b4`:** el párrafo dice que los últimos bits de un vector pueden moverse y que, si el conteo falla, los textos van en el orden de los pasajes.
 5. **Detalles de forma.** El comentario de `passage_lengths` quedó mal partido después de la edición («`None` without a» / «tokenizer, which only the real model brings», `eval_api.rs:1468-1469`). También falta una línea en blanco entre ítems de prueba en `mod.rs:2031-2032` y en `:2259-2260`.
+
+   **Cerrado en `102feda` (el comentario de `passage_lengths`) y `b97d97a` (las líneas en blanco de `mod.rs`).**
 6. **`3d7ae94` mezcla.** Es un commit `test(embedder)` que también marca casillas de `tasks.md`. Ese cambio era su propio commit de `docs(openspec)`.
 
 ### Resultado de la suite y de clippy
