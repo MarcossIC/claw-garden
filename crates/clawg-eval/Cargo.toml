@@ -35,6 +35,11 @@ path = "src/bin/conflict-eval/main.rs"
 name = "revision-eval"
 path = "src/bin/revision-eval/main.rs"
 
+# Compares two result files of the daemon bench in `clawg-cli`'s tests.
+[[bin]]
+name = "perf-bench"
+path = "src/bin/perf-bench/main.rs"
+
 [dependencies]
 clawg-core = { workspace = true, features = ["eval"] }
 # Only `rag-eval --agent-view` and `revision-eval` use it: they serve the daemon's
