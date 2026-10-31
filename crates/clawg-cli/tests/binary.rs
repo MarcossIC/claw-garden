@@ -1812,6 +1812,38 @@ async fn doctor_reads_a_running_daemons_store_without_changing_it() {
 }
 
 #[tokio::test]
+async fn doctor_names_native_memory_not_imported() {
+    let sandbox = Sandbox::new();
+    let projects = claude_code_memory(&sandbox, "-sandbox-app");
+    let (_, report) = doctor(&sandbox);
+    assert!(findings(&report, "native_memory").is_empty(), "no server registered, no finding: {report}");
+
+    let servers = json!({ "mcpServers": { "clawg-dev": { "type": "stdio", "command": BIN, "args": ["mcp", "--profile", "dev"] } } });
+    std::fs::write(sandbox.home.join(".claude.json"), servers.to_string()).expect(".claude.json");
+    let (output, report) = doctor(&sandbox);
+    assert_eq!(output.status.code(), Some(0), "an info finding does not fail: {report}");
+    assert_eq!(findings(&report, "native_memory"), [("info", "not_imported")], "{report}");
+    let finding = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "native_memory").unwrap();
+    assert_eq!(finding["evidence"]["files"], 3, "{finding}");
+    assert_eq!(finding["evidence"]["not_imported"], 3, "{finding}");
+    assert_eq!(finding["evidence"]["dir"].as_str().map(PathBuf::from), Some(projects.clone()), "{finding}");
+    let step = finding["safe_next_step"].as_str().expect("a step");
+    assert!(step.starts_with("clawg import --from claude-code ") && step.ends_with(" --dry-run --profile dev"), "{step}");
+    assert!(!stdout_of(&output).contains("Indent Makefiles"), "doctor reads no memory's text");
+
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let import = sandbox.run(&["import", "--from", "claude-code", &projects.to_string_lossy(), "--profile", "dev"]);
+    assert_eq!(import.status.code(), Some(0), "{}", stderr_of(&import));
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "native_memory"), [("ok", "healthy")], "{report}");
+
+    std::fs::write(projects.join("-sandbox-app").join("memory").join("new.md"), "A memory written since.").expect("new file");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "native_memory"), [("info", "not_imported")], "a new memory is named again: {report}");
+}
+
+#[tokio::test]
 async fn preferences_set_and_unset_write_the_profiles_file() {
     let sandbox = Sandbox::new();
     let file = sandbox.data_dir().join("preferences.json");
