@@ -1,14 +1,21 @@
 change: embedder-footprint
 objective: "transversal"
 depends_on: []
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
+  exploration: done
+  proposal: done
+  spec: done  # EF1, delta sobre specs/storage («Los mismos vectores que fastembed»)
+  design: skipped  # sin decisión de arquitectura: el respaldo es una función pura y la puerta es medición
+  tasks: done
+  apply: partial  # tarea 1 hecha; la puerta (tarea 2) y lo que abra (tarea 3) pendientes
   verify: pending
   archive: pending
-updated: 2026-10-24
+gates:
+  C: pending  # 2.1: hilos de rayon vivos con el modelo suelto
+  A: pending  # 2.2 y 2.3: CPU en reposo y CPU total con y sin espera activa
+  B: pending  # 2.3 y 2.4: CPU, pared y p99 de búsqueda con menos hilos
+  E: pending  # 2.5: tiempo de la triple codificación de split_save
+  arena: pending  # 2.4: p99 de búsqueda con 1 y 2 arenas de malloc
+  D: dropped  # pasó a docs-index-speed
+updated: 2026-10-31
