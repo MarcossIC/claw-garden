@@ -667,8 +667,8 @@ impl EvalCpu {
 }
 
 /// The intra-op threads the embedding session is built with.
-pub fn session_threads() -> Result<usize, EvalError> {
-    crate::memory::embedder::session_threads().map_err(|e| EvalError::Embed(e.to_string()))
+pub fn session_threads() -> usize {
+    crate::memory::embedder::session_threads()
 }
 
 /// One save for [`EvalIngest::save`].
@@ -1967,7 +1967,7 @@ mod tests {
 
     #[test]
     fn session_threads_is_the_count_the_session_builds_with() {
-        assert_eq!(session_threads().unwrap(), std::thread::available_parallelism().unwrap().get());
+        assert_eq!(session_threads(), std::thread::available_parallelism().unwrap().get());
     }
 
     struct Measuring(Arc<crate::metrics::Recorder>);

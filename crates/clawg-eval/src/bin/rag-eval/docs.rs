@@ -733,11 +733,7 @@ async fn index_block(
     if let Some(warning) = tokens.as_ref().and_then(|t| padding_warning(t, from_memo)) {
         eprintln!("{warning}");
     }
-    let threads = session_threads().map_err(|e| {
-        eprintln!("{e}");
-        EXIT_RUNTIME_FAILURE
-    })?;
-    Ok(IndexBlock::new(run, lengths.as_ref(), memo, EvalCpu::this(), threads, cfg!(debug_assertions), tokens))
+    Ok(IndexBlock::new(run, lengths.as_ref(), memo, EvalCpu::this(), session_threads(), cfg!(debug_assertions), tokens))
 }
 
 /// Indexes the root but `left_out` into `index`, asks it every question,

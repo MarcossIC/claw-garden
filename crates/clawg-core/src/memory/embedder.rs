@@ -526,21 +526,33 @@ impl Inference {
     }
 }
 
+/// The intra-op threads when the machine cannot say how many it has. The
+/// standard library documents that the count can fail; one thread would slow
+/// every load and refresh for a failure that is rare.
+pub(crate) const FALLBACK_SESSION_THREADS: usize = 2;
+
+/// The intra-op threads for what `available_parallelism` reported.
+fn threads_from(reported: std::io::Result<std::num::NonZeroUsize>) -> usize {
+    reported.map_or(FALLBACK_SESSION_THREADS, |n| n.get())
+}
+
 /// The intra-op threads a session is built with.
-pub(crate) fn session_threads() -> Result<usize, EmbedError> {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .map_err(|e| EmbedError::LoadFailed(e.to_string()))
+pub(crate) fn session_threads() -> usize {
+    let reported = std::thread::available_parallelism();
+    if let Err(e) = &reported {
+        log::warn!("the machine's parallelism is unknown ({e}); the embedder uses {FALLBACK_SESSION_THREADS} threads");
+    }
+    threads_from(reported)
 }
 
 /// The session options the embeddings were always made with: the CPU provider
 /// without its arena, graph optimization level 3 and as many intra-op threads
-/// as the machine has. The thread count is not a detail: it sets how ONNX
-/// Runtime splits and sums the work, so another one could move the last bits
-/// of a vector.
+/// as the machine has. On a 4-thread Linux x86-64 machine with AVX-512F, 1, 2
+/// and 4 threads gave the same bits for every `e5_golden` vector; other
+/// machines are not measured, so eval memos still record the count.
 pub(crate) fn session_builder() -> Result<SessionBuilder, EmbedError> {
     let failed = |e: String| EmbedError::LoadFailed(e);
-    let threads = session_threads()?;
+    let threads = session_threads();
     Session::builder()
         .map_err(|e| failed(e.to_string()))?
         .with_execution_providers(vec![cpu_provider().build()])
@@ -972,6 +984,19 @@ impl Embedder for GatedEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_takes_every_thread_the_machine_reports() {
+        let reported = std::num::NonZeroUsize::new(12).unwrap();
+        assert_eq!(threads_from(Ok(reported)), 12);
+    }
+
+    #[test]
+    fn an_unknown_parallelism_falls_back_to_two_threads() {
+        let unknown = Err(std::io::Error::other("no cpu count"));
+        assert_eq!(threads_from(unknown), FALLBACK_SESSION_THREADS);
+        assert_eq!(FALLBACK_SESSION_THREADS, 2);
+    }
 
     #[test]
     fn a_session_is_built_from_the_verified_view() {

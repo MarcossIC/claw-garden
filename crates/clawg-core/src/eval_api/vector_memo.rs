@@ -371,7 +371,7 @@ pub struct EvalMemo {
     decorator: Arc<MemoEmbedder>,
     metrics: Arc<Recorder>,
     /// None when the run neither reads nor writes a file.
-    file: Option<PathBuf>,
+    file: PathBuf,
     used: bool,
     warnings: Vec<String>,
     read_seconds: f64,
@@ -380,48 +380,25 @@ pub struct EvalMemo {
 impl EvalMemo {
     /// Reads the memo of `embedder`'s contract in `dir`. It never fails: a file
     /// that cannot be used is a warning and an empty memo that the run's own
-    /// vectors replace, and without the session's thread count, which the
-    /// contract needs, nothing is read or written.
+    /// vectors replace.
     pub fn open(embedder: &EvalEmbedder, dir: &Path) -> Self {
-        let contract = |threads| MemoContract {
+        let contract = MemoContract {
             model_id: embedder.model_id().to_string(),
             dimensions: embedder.dimensions(),
             query_prefix: embedder.query_prefix().to_string(),
             passage_prefix: embedder.passage_prefix().to_string(),
             model_sha256: MODEL_SHA256.to_string(),
             cpu: EvalCpu::this(),
-            threads,
+            threads: super::session_threads(),
         };
-        match super::session_threads() {
-            Ok(threads) => Self::with_contract(embedder, dir, contract(threads)),
-            Err(e) => Self::assemble(
-                embedder,
-                contract(0),
-                None,
-                Loaded {
-                    entries: HashMap::new(),
-                    used: false,
-                    warning: Some(format!("the vector memo is not used: the session's threads are unknown ({e})")),
-                },
-                0.0,
-            ),
-        }
+        Self::with_contract(embedder, dir, contract)
     }
 
     fn with_contract(embedder: &EvalEmbedder, dir: &Path, contract: MemoContract) -> Self {
-        let path = dir.join(memo_file_name(&contract));
+        let file = dir.join(memo_file_name(&contract));
         let started = Instant::now();
-        let loaded = load_memo(&path, &contract);
-        Self::assemble(embedder, contract, Some(path), loaded, started.elapsed().as_secs_f64())
-    }
-
-    fn assemble(
-        embedder: &EvalEmbedder,
-        contract: MemoContract,
-        file: Option<PathBuf>,
-        loaded: Loaded,
-        read_seconds: f64,
-    ) -> Self {
+        let loaded = load_memo(&file, &contract);
+        let read_seconds = started.elapsed().as_secs_f64();
         let decorator = Arc::new(MemoEmbedder {
             inner: embedder.inner.clone(),
             contract,
@@ -458,7 +435,8 @@ impl EvalMemo {
             let mut tally = self.decorator.tally.lock().expect("the tally is never held across a panic");
             (tally.from_memo, tally.embedded, std::mem::take(&mut tally.fresh))
         };
-        if let (Some(path), false) = (&self.file, fresh.is_empty()) {
+        if !fresh.is_empty() {
+            let path = &self.file;
             let mut all: BTreeMap<Key, Vec<f32>> =
                 self.decorator.known.iter().map(|(k, v)| (*k, v.clone())).collect();
             all.extend(fresh);
@@ -467,7 +445,7 @@ impl EvalMemo {
             }
         }
         EvalMemoReport {
-            file: self.file.as_deref().map(file_name_of).unwrap_or_default(),
+            file: file_name_of(&self.file),
             used: self.used,
             from_memo,
             embedded,

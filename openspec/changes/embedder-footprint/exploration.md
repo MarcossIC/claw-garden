@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | S–M | — (se coordina con 54, 17, 20 y 61; ver «Interacciones») | exploración (borrador) |
+| transversal | S–M | — (se coordina con 54, 17, 20 y 61; ver «Interacciones») | exploración cerrada; ver [propuesta](proposal.md) |
 
 **Tesis:** el daemon es un proceso de fondo y no debería quitarle todos los núcleos al IDE y al compilador del usuario mientras indexa o re-embebe, ni guardar memoria que no necesita. Hoy el embedder pide un hilo de cálculo por núcleo lógico, deja los hilos de ONNX Runtime con su espera activa por defecto, arranca sin saberlo un segundo grupo de hilos (el de `rayon`, por el tokenizer) que vive hasta que el proceso termina, rellena con padding hasta el texto más largo de cada tanda, y tokeniza tres veces un guardado largo dentro del worker asíncrono. Además hay tres preguntas de memoria que nadie midió. El cambio es de **medición primero**: nada que mueva vectores o sume complejidad se hace si la medición no muestra que importa. Una corrección barata sí va sin puerta: si `available_parallelism()` falla, hoy el modelo no carga nunca. Con la puerta, el resultado correcto puede ser cerrar con una sola línea de código y un registro de lo medido (enfoque F).
 
@@ -145,13 +145,13 @@ Si ninguna medición pasa su umbral, se cierra con el arreglo de `available_para
 
 Son del usuario.
 
-- [ ] **Valor de reemplazo del paso 0.** ¿1 o 2 hilos? Candidato: 2, porque 1 alarga todo y la falla es rara.
+- [x] **Valor de reemplazo del paso 0.** 2 hilos, porque 1 alarga todo y la falla es rara ([propuesta](proposal.md), decisión 1).
 - [ ] **Umbrales de la puerta.** ¿Cuánta CPU de proceso justifica A o B (por ejemplo, 20 % menos de CPU total) y cuánta pared se paga por ella (por ejemplo, hasta 25 % más)? ¿Qué p99 de búsqueda durante un refresco es aceptable?
 - [ ] **Bits.** Si D o B mueven algún bit: ¿se reescribe la fixture o se acepta la tolerancia de 1e-6? Por defecto, nada que mueva bits entra sin decisión.
 - [ ] **Variable de entorno para hilos.** ¿Una variable `CLAWG_EMBEDDER_THREADS` o sólo la constante?
 - [ ] **E y el tamaño.** ¿`spawn_blocking` sobre qué tamaño de texto?
 - [ ] **`MALLOC_ARENA_MAX` del usuario.** ¿Se respeta si está definida (en vez de pisarla con `mallopt`) o se mantiene la garantía de 46?
-- [ ] **Máquinas de medición.** ¿Qué Linux y Windows se usan, con cuántos hilos?
+- [ ] **Máquinas de medición.** ¿Qué Linux y Windows se usan, con cuántos hilos? Una de las dos con 8 hilos lógicos o más y SMT: una de 4 hilos sin SMT repite lo que ya midió 46.
 
 ## Cómo se mide
 
