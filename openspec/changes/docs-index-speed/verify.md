@@ -259,3 +259,36 @@ Sobre `67914fc` (`HEAD`), con el árbol limpio y después de revertir las mutaci
 ### Veredicto
 
 **PASS WITH WARNINGS.** La suite y los dos clippy pasan. De las 19 mutaciones, 16 muerden, y entre ellas las cinco pruebas de refresco de IS1, que la aplicación sólo había visto pasar de no compilar a pasar. Muerden también el umbral (16 y 8), la vuelta al orden de los pasajes (quitada o invertida), la llamada única por doc, el sentido y los empates de `longest_first`, el aviso y su mensaje, la puerta de `eval_api`, el tokenizer del partidor y la fixture (el caso que falta y el vector que se mueve). No muerden las tres que cambian la clave (M5, M6 y M7, WARNING 2). Por construcción, no pueden cambiar el relleno con un tokenizer que cuente el prefijo igual para todos los textos, y la igualdad `padded_ran` = `padded_sorted_in_doc` del modelo real cubre el caso que la suite no ve. 12 de 13 escenarios cumplen enteros, y el del relleno menor cumple en parte, cerrado por la corrida real (WARNING 1). Ningún hallazgo cambia la conducta del daemon ni un número de las puertas.
+
+## A2: el techo, antes del código (2026-10-31)
+
+### Por qué se midió antes de diseñar
+
+A1 bajó los tokens rellenados un 16,9 % y `phases.embed` un 12,6–12,7 %: el reloj bajó unos 0,75 de lo que bajaron los tokens. Con esa conversión, ni un orden perfecto entre docs llegaba a «se queda si» de A2. Desde la corrida de A1, los tokens bajan un 19,7 % (7 282 905 → 5 849 005), lo que proyectaba −14,7 % frente al −15 % pedido. Antes de escribir código de producción se midió ese techo.
+
+### La medición
+
+`sorting_across_docs_against_sorting_in_each_doc` (`crates/clawg-core/src/memory/project_docs/mod.rs`, commit `0c9d49a`) es una prueba ignorada.
+
+- **Corrida:** autorizada, con el modelo real del perfil dev en esta máquina, en build debug en `target-test` y sin otra compilación en marcha. Variables: `CLAWG_EMBED_PASSAGES=5000` y `CLAWG_EMBED_RUNS=3`.
+- **Muestra:** uno de cada 4 docs de este repositorio, ordenados por ruta y de todos los tamaños. Son 197 docs y 5261 pasajes, 77 de esos docs con más de 16 pasajes.
+- **Dos órdenes, alternados en el mismo proceso.** El de hoy, que ordena cada doc (`embed_passages`). Y el techo de A2: toda la muestra ordenada una vez por `passage_token_counts` y mandada junta. Cada uno cuenta sus propios tokens dentro de su tiempo.
+
+| | en cada doc | entre docs | entre / en cada doc |
+|---|---|---|---|
+| tokens reales | 1 611 676 | 1 611 676 | |
+| tokens rellenados | 1 998 461 | 1 614 977 | 0,808 |
+| par 0 | 308,95 s | 244,05 s | 0,790 |
+| par 1 | 265,53 s | 217,56 s | 0,819 |
+| par 2 | 269,38 s | 212,84 s | 0,790 |
+| mediana de los pares | | | **0,790** |
+
+En el último par, 5261 de 5261 vectores dan los mismos bits en los dos órdenes, con diferencia mayor 0.
+
+### Qué se concluye
+
+- **La muestra es representativa en tokens.** Baja un 19,2 %, y el corpus entero un 19,7 %.
+- **El techo de A2 es −21 % de tiempo de embeber**, por encima del −15 % de «se queda si». La proyección de arriba era falsa. Suponía una conversión fija de tokens a tiempo, y acá el tiempo bajó más que los tokens (21,0 % frente a 19,2 %).
+- **La explicación más probable no está medida.** Ordenar entre docs no sólo rellena menos: también llena las tandas. Hoy cada doc de 16 pasajes o menos corre su propia tanda incompleta, y entre docs las tandas son de 16. Así el modelo corre menos veces, y cada corrida tiene un costo que no depende del relleno. El diseño de A2 tiene que contar las tandas además del relleno.
+- **Una cola acotada recupera menos que este techo.** El diseño de A2 elige el tope con números que no necesitan el modelo: el relleno y las tandas que daría cada tope sobre el corpus. «Se queda si» de A2 se decide después con corridas de `rag-eval` como las de A1.
+- **La decisión 4 se cumple también para A2 en esta CPU:** 0 bits movidos.
