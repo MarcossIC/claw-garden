@@ -2920,6 +2920,17 @@ second
     }
 
     #[test]
+    fn a_passage_longer_than_the_window_counts_the_window() {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let long = vec!["w"; EMBED_MAX_TOKENS + 188].join(" ");
+        let texts = vec![("a.md".to_string(), long), ("a.md".to_string(), "x y".to_string())];
+
+        let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
+
+        assert_eq!(docs[0].lengths, vec![EMBED_MAX_TOKENS, 2]);
+    }
+
+    #[test]
     fn longest_first_is_stable_and_descending() {
         assert_eq!(longest_first(&[3, 9, 3, 1, 9]), vec![1, 4, 0, 2, 3]);
         assert_eq!(longest_first(&[]), Vec::<usize>::new());

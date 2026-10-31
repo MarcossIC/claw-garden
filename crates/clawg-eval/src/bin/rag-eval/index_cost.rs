@@ -505,6 +505,23 @@ mod tests {
     }
 
     #[test]
+    fn the_removal_of_docs_is_in_the_total_write_and_in_no_area() {
+        let mut run = run_of(vec![
+            timing("docs/a.md", false, 1, [0, 0, 0, 0, 0, 750]),
+            timing("crates/x/src/lib.rs", true, 1, [0, 0, 0, 0, 0, 250]),
+        ]);
+        run.remove = std::time::Duration::from_millis(400);
+        let lengths = lengths_for(&[("docs/a.md", vec![3]), ("crates/x/src/lib.rs", vec![4])]);
+
+        let block = block_of(&run, &lengths);
+        let areas = [&block.by_area.docs, &block.by_area.code, &block.by_area.archive];
+        let written: f64 = areas.iter().map(|a| a.phases.write).sum();
+
+        assert!((written - 1.0).abs() < 1e-9, "{written}");
+        assert!((block.phases.write - (written + 0.4)).abs() < 1e-9, "{}", block.phases.write);
+    }
+
+    #[test]
     fn only_docs_over_a_batch_count_as_multi_batch() {
         let run = run_of(vec![timing("docs/big.md", false, 20, [0; 6]), timing("docs/small.md", false, 3, [0; 6])]);
         let lengths = lengths_for(&[("docs/big.md", (0..20).map(|i| 10 + i).collect()), ("docs/small.md", vec![4, 5, 6])]);
