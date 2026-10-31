@@ -1255,6 +1255,27 @@ a
     }
 
     #[tokio::test]
+    async fn a_refresh_times_a_doc_whose_vector_is_unusable() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", "# A\nBROKEN passage\n");
+        write(dir.path(), "b.md", "# B\nsound passage\n");
+        let store = store_with_project("p", dir.path()).await;
+
+        let run = refresh(&store, &Unusable, &TokenSplitter::fallback(), "p", dir.path(), &HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(run.report.failed.len(), 1, "{:?}", run.report);
+        let mut docs: Vec<(&str, usize)> = run.timing.docs.iter().map(|d| (d.path.as_str(), d.passages)).collect();
+        docs.sort();
+        assert_eq!(docs, [("a.md", 0), ("b.md", 1)]);
+        let failed = run.timing.docs.iter().find(|d| d.path == "a.md").unwrap();
+        assert!(failed.phases.read > Duration::ZERO, "{failed:?}");
+        assert!(failed.phases.embed > Duration::ZERO, "{failed:?}");
+        assert_eq!(failed.phases.write, Duration::ZERO, "{failed:?}");
+    }
+
+    #[tokio::test]
     async fn a_short_batch_still_aborts_the_refresh() {
         let dir = crate::test_dir::test_dir();
         write(dir.path(), "a.md", "# A\na\n");
