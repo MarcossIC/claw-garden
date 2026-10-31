@@ -626,6 +626,48 @@ impl EvalEmbedder {
     }
 }
 
+/// What decides which kernels ONNX Runtime picks, so whether another machine
+/// can be expected to give the same bits. The system counts too: ONNX Runtime
+/// is built apart for each one, and on Linux a CPU with the same features as
+/// the Windows one that made a fixture moved the last bits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct EvalCpu {
+    pub os: String,
+    pub arch: String,
+    pub avx2: bool,
+    pub avx512f: bool,
+    pub fma: bool,
+}
+
+impl EvalCpu {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn this() -> Self {
+        EvalCpu {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            avx2: is_x86_feature_detected!("avx2"),
+            avx512f: is_x86_feature_detected!("avx512f"),
+            fma: is_x86_feature_detected!("fma"),
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    pub fn this() -> Self {
+        EvalCpu {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            avx2: false,
+            avx512f: false,
+            fma: false,
+        }
+    }
+}
+
+/// The intra-op threads the embedding session is built with.
+pub fn session_threads() -> Result<usize, EvalError> {
+    crate::memory::embedder::session_threads().map_err(|e| EvalError::Embed(e.to_string()))
+}
+
 /// One save for [`EvalIngest::save`].
 pub struct EvalSave<'a> {
     pub agent_id: &'a str,
@@ -1746,6 +1788,26 @@ mod tests {
     use crate::memory::db::{seed_on_disk, StoredContract};
     use crate::memory::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
     use crate::memory::pieces::StoredPiece;
+
+    #[test]
+    fn eval_cpu_names_this_machine() {
+        let cpu = EvalCpu::this();
+        assert_eq!(cpu.os, std::env::consts::OS);
+        assert_eq!(cpu.arch, std::env::consts::ARCH);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            assert_eq!(cpu.avx2, is_x86_feature_detected!("avx2"));
+            assert_eq!(cpu.avx512f, is_x86_feature_detected!("avx512f"));
+            assert_eq!(cpu.fma, is_x86_feature_detected!("fma"));
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        assert!(!cpu.avx2 && !cpu.avx512f && !cpu.fma);
+    }
+
+    #[test]
+    fn session_threads_is_the_count_the_session_builds_with() {
+        assert_eq!(session_threads().unwrap(), std::thread::available_parallelism().unwrap().get());
+    }
 
     struct Measuring(Arc<crate::metrics::Recorder>);
 

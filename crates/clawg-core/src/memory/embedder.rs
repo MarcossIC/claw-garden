@@ -526,6 +526,13 @@ impl Inference {
     }
 }
 
+/// The intra-op threads a session is built with.
+pub(crate) fn session_threads() -> Result<usize, EmbedError> {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .map_err(|e| EmbedError::LoadFailed(e.to_string()))
+}
+
 /// The session options the embeddings were always made with: the CPU provider
 /// without its arena, graph optimization level 3 and as many intra-op threads
 /// as the machine has. The thread count is not a detail: it sets how ONNX
@@ -533,7 +540,7 @@ impl Inference {
 /// of a vector.
 pub(crate) fn session_builder() -> Result<SessionBuilder, EmbedError> {
     let failed = |e: String| EmbedError::LoadFailed(e);
-    let threads = std::thread::available_parallelism().map_err(|e| failed(e.to_string()))?.get();
+    let threads = session_threads()?;
     Session::builder()
         .map_err(|e| failed(e.to_string()))?
         .with_execution_providers(vec![cpu_provider().build()])
