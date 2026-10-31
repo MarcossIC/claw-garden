@@ -1103,6 +1103,9 @@ mod tests {
         let crumbs = expected_breadcrumbs(&index, &root, &cases);
         index.close().await.unwrap();
         check_headings(&cases, &crumbs.unwrap()).unwrap();
-        assert_eq!(cases.len(), 15);
+
+        let code = cases.iter().filter(|c| is_code_path(&c.expected[0].path)).count();
+        let docs = cases.len() - code;
+        assert!(cases.len() >= 40 && docs >= 15 && code >= 15, "{docs} questions of docs and {code} of code");
     }
 }

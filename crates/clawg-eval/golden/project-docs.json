@@ -60,6 +60,75 @@
     "expected": [{"path": "README.md", "heading": "Si algo falla"}]
   },
   {
+    "id": "d11",
+    "question": "si alguien roba la credencial con la que se certifican los lanzamientos, ¿qué pasa con las instalaciones que ya tengo?",
+    "expected": [
+      {"path": "README.md", "heading": "Si una clave de firma se compromete"},
+      {"path": "openspec/specs/release/spec.md", "heading": "R6. Firma y claves"},
+      {"path": "openspec/changes/archive/2026-10-18-release-and-self-update/spec.md", "heading": "R6. Firma y claves"}
+    ]
+  },
+  {
+    "id": "d12",
+    "question": "I upgraded and the new build misbehaves; how do I go back to the previous executable and my earlier data by hand?",
+    "expected": [{"path": "README.md", "heading": "Volver atrás a mano"}]
+  },
+  {
+    "id": "d13",
+    "question": "why is the pending work sequenced so that checking how good the answers are comes before anything reaches the assistant on its own?",
+    "expected": [{"path": "openspec/README.md", "heading": "Orden de ejecución de lo pendiente"}]
+  },
+  {
+    "id": "d14",
+    "question": "el sitio donde se publican los lanzamientos me corta por pedir demasiado seguido desde mi conexión; ¿cómo me lo hace saber el actualizador y cuánto debo aguardar?",
+    "expected": [
+      {"path": "openspec/specs/self-update/spec.md", "heading": "S6. Sólo a pedido"},
+      {"path": "crates/clawg-cli/src/update/client.rs"}
+    ]
+  },
+  {
+    "id": "d15",
+    "question": "tras muchas ramas y subidas de número, el disco se llena de binarios de prueba compilados; ¿cómo lo mantengo bajo control?",
+    "expected": [{"path": ".claude/CLAUDE.md", "heading": "Build directories"}]
+  },
+  {
+    "id": "d16",
+    "question": "a private journal kept beside the documentation must stay out of the shared history; how should files be picked for the next snapshot so it can't sneak in?",
+    "expected": [
+      {"path": ".claude/CLAUDE.md", "heading": "Rules for agents"},
+      {"path": ".gemini/GEMINI.md", "heading": "Rules for agents"}
+    ]
+  },
+  {
+    "id": "d17",
+    "question": "¿por qué los fragmentos de un mismo guardado largo no se marcan como contradictorios entre sí?",
+    "expected": [
+      {"path": "openspec/specs/disputes/spec.md", "heading": "R8. Los pedazos hermanos no se disputan"},
+      {"path": "openspec/changes/archive/2026-10-13-dispute-resolution/spec.md", "heading": "R8. Los pedazos hermanos no se disputan"}
+    ]
+  },
+  {
+    "id": "d18",
+    "question": "what stops a client whose self-reported name has path separators or a reserved device name from writing its notes file outside the intended folder?",
+    "expected": [
+      {"path": "openspec/specs/visibility/spec.md", "heading": "R5. Ruta del workspace"},
+      {"path": "openspec/changes/archive/2026-10-12-visibility-policy/spec.md", "heading": "R5. Ruta del workspace"}
+    ]
+  },
+  {
+    "id": "d19",
+    "question": "¿se pueden separar las cifras de uso según el asistente que las generó? ¿y por qué no?",
+    "expected": [{"path": "openspec/specs/metrics/spec.md", "heading": "Límites conocidos"}]
+  },
+  {
+    "id": "d20",
+    "question": "how are the command-line messages worded correctly for one item versus several items, in English and in Spanish?",
+    "expected": [
+      {"path": "openspec/specs/preferences/spec.md", "heading": "CL5. Concordancia"},
+      {"path": "openspec/changes/archive/2026-10-23-cli-language/spec.md", "heading": "CL5. Concordancia"}
+    ]
+  },
+  {
     "id": "c01",
     "question": "¿dónde se elige el entorno de datos a partir de la línea de comandos, una variable y si el binario es de depuración?",
     "expected": [{"path": "crates/clawg-core/src/paths.rs"}]
@@ -83,5 +152,80 @@
     "id": "c05",
     "question": "¿qué código sube o baja la temperatura de un recuerdo según cuánto se usa?",
     "expected": [{"path": "crates/clawg-core/src/memory/tier.rs"}, {"path": "crates/clawg-core/src/memory/access.rs"}]
+  },
+  {
+    "id": "c06",
+    "question": "where is a saved text reduced to one key, so the same sentence with its accents encoded another way counts as a repeat?",
+    "expected": [{"path": "crates/clawg-core/src/memory/dedup.rs"}]
+  },
+  {
+    "id": "c07",
+    "question": "¿qué código hace que, al eliminar lo último que se guardó sobre un asunto, vuelva a quedar visible lo anterior?",
+    "expected": [{"path": "crates/clawg-core/src/memory/revival.rs"}]
+  },
+  {
+    "id": "c08",
+    "question": "¿cómo adivina en qué idioma está escrito un recuerdo sin ninguna red neuronal?",
+    "expected": [{"path": "crates/clawg-core/src/memory/language.rs"}]
+  },
+  {
+    "id": "c09",
+    "question": "¿qué hace que el modelo que convierte texto en vectores deje de ocupar RAM cuando nadie lo usa un rato y se cargue de nuevo después?",
+    "expected": [{"path": "crates/clawg-core/src/memory/idle_embedder.rs"}]
+  },
+  {
+    "id": "c10",
+    "question": "where is the label naming the subject of a note checked so it holds nothing but permitted symbols and stays short enough?",
+    "expected": [{"path": "crates/clawg-core/src/memory/topic.rs"}]
+  },
+  {
+    "id": "c11",
+    "question": "¿dónde se evita cortar un texto largo en medio de una palabra cuando se lo parte por tamaño?",
+    "expected": [{"path": "crates/clawg-core/src/memory/chunker/token_splitter.rs"}]
+  },
+  {
+    "id": "c12",
+    "question": "what keeps two programs from writing the same saved memories at once, even when neither one is the service?",
+    "expected": [{"path": "crates/clawg-core/src/memory/store_lock.rs"}]
+  },
+  {
+    "id": "c13",
+    "question": "¿qué código le saca permisos a otros usuarios del sistema sobre las carpetas donde se guardan los datos?",
+    "expected": [{"path": "crates/clawg-core/src/private_dir.rs"}]
+  },
+  {
+    "id": "c14",
+    "question": "how are timing measurements condensed so that several one-minute slices can be combined and still give median and tail figures?",
+    "expected": [{"path": "crates/clawg-core/src/metrics/histogram.rs"}]
+  },
+  {
+    "id": "c15",
+    "question": "¿qué código reparte las mediciones guardadas por día, hora o lanzamiento del programa respetando el huso horario de cuando corrió cada ejecución?",
+    "expected": [{"path": "crates/clawg-core/src/metrics/report.rs"}]
+  },
+  {
+    "id": "c16",
+    "question": "a malicious site I visit tries to talk to the memory service running on this computer: what turns it away?",
+    "expected": [{"path": "crates/clawg-cli/src/daemon/guard.rs"}]
+  },
+  {
+    "id": "c17",
+    "question": "¿dónde se comprueba que el archivo con las sumas de verificación de una versión nueva lo produjeron realmente los mantenedores?",
+    "expected": [{"path": "crates/clawg-cli/src/update/signature.rs"}]
+  },
+  {
+    "id": "c18",
+    "question": "when the in-place upgrade breaks in the middle, which code lists the ordered actions and how each one is reverted?",
+    "expected": [{"path": "crates/clawg-cli/src/update/plan.rs"}]
+  },
+  {
+    "id": "c19",
+    "question": "how does the diagnostic tell whether the editor would actually launch the memory server for this environment, without modifying the editor's configuration?",
+    "expected": [{"path": "crates/clawg-cli/src/doctor/mcp.rs"}]
+  },
+  {
+    "id": "c20",
+    "question": "si el script de arranque del asistente no logra hablar con el servicio de recuerdos, ¿por qué el editor sigue andando como si nada?",
+    "expected": [{"path": "crates/clawg-cli/src/hook.rs"}]
   }
 ]
