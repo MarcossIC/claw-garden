@@ -103,8 +103,8 @@ pub fn padded_sorted(lengths: &[usize]) -> usize {
 pub struct Tokens {
     /// Inside the model's window, without padding.
     pub real: usize,
-    /// Doc by doc, in the order of each doc's passages: what the model would
-    /// run if a refresh did not sort them.
+    /// Doc by doc, in the order of each doc's passages: what a refresh ran
+    /// before it sorted or queued them.
     pub padded: usize,
     /// What the embedder reports it ran.
     pub padded_ran: usize,

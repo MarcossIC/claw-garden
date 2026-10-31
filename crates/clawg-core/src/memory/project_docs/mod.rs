@@ -1496,7 +1496,7 @@ a
 
         let result = index.try_refresh(&store, &ShortBatch, None, "p").await;
 
-        assert!(matches!(result, Err(DocIndexError::VectorCount { ref path, .. }) if path == "a.md"), "{result:?}");
+        assert!(matches!(result, Err(DocIndexError::VectorCount { ref path, passages: 2, .. }) if path == "a.md"), "{result:?}");
         assert_eq!(index_sizes(&store).await, (0, 0, 0, 0));
     }
 
@@ -2915,6 +2915,12 @@ old
     }
 
     #[test]
+    fn the_limit_stays_at_the_cap_through_many_flushes() {
+        let groups = queue_groups(QUEUE_PASSAGES, &[QUEUE_PASSAGES; 80]);
+        assert_eq!(groups, (0..80).map(|k| vec![k]).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn a_doc_with_no_passages_moves_no_flush() {
         let mut queue = Queue::new(EMBED_BATCH);
         assert_eq!(decision_after(&mut queue, &[10, 0]), [(false, false), (false, false)]);
@@ -3145,6 +3151,7 @@ old
         assert_eq!(embed_shares(ns(10), &[1, 1, 1]), [ns(3), ns(3), ns(4)], "the rest goes to the last");
         assert_eq!(embed_shares(ns(10), &[0, 2, 0]), [ns(0), ns(10), ns(0)], "a doc with no texts gets none");
         assert_eq!(embed_shares(ns(7), &[5]), [ns(7)]);
+        assert_eq!(embed_shares(ns(10), &[1, 1, 1, 0]), [ns(3), ns(3), ns(4), ns(0)], "the rest goes to the last doc with texts");
         for total in [0u64, 1, 9, 1_000_003, u64::MAX / 3] {
             for counts in [vec![1, 2, 3], vec![7, 0, 11, 5], vec![1; 9], vec![0, 4]] {
                 let shares = embed_shares(ns(total), &counts);
