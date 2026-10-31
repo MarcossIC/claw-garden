@@ -1,0 +1,11 @@
+{
+  "id": "example-count-lines",
+  "category": "N",
+  "example": true,
+  "fixture": "example-tally",
+  "prompt": "Add a function count_lines(path) to tally.py that returns the number of lines of the file.",
+  "checks": [
+    {"kind": "file_contains", "path": "tally.py", "text": "def count_lines(path)"},
+    {"kind": "file_contains", "path": "tally.py", "text": "def count_words(path)"}
+  ]
+}
