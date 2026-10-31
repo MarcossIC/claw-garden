@@ -103,12 +103,14 @@ pub fn padded_sorted(lengths: &[usize]) -> usize {
 pub struct Tokens {
     /// Inside the model's window, without padding.
     pub real: usize,
-    /// Doc by doc, in the order each was embedded: what the model runs
-    /// without the memo.
+    /// Doc by doc, in the order of each doc's passages: what the model would
+    /// run if a refresh did not sort them.
     pub padded: usize,
     /// What the embedder reports it ran.
     pub padded_ran: usize,
-    /// `padded` with each doc's passages sorted longest first.
+    /// `padded` with each doc's passages sorted longest first, the order a
+    /// refresh embeds a doc of more than one batch in: what the model runs
+    /// without the memo.
     pub padded_sorted_in_doc: usize,
     /// `padded` with every passage of the run sorted longest first.
     pub padded_sorted_all: usize,
@@ -117,8 +119,8 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    /// `docs` holds the lengths of each doc's passages in the order they were
-    /// embedded. The three paddings do not bound each other: sorting can pad
+    /// `docs` holds the lengths of each doc's passages in the order of the
+    /// passages. The three paddings do not bound each other: sorting can pad
     /// more when the last run is short.
     pub fn new(docs: &[Vec<usize>], count_seconds: f64, padded_ran: f64) -> Self {
         let all: Vec<usize> = docs.iter().flatten().copied().collect();
@@ -146,13 +148,14 @@ impl Tokens {
     }
 }
 
-/// Said when the padding computed and the padding that ran differ although
-/// every passage was embedded: then both are the same runs.
+/// Said when the padding computed for the order a refresh embeds in
+/// (`padded_sorted_in_doc`) and the padding that ran differ although every
+/// passage was embedded: then both are the same runs.
 pub fn padding_warning(tokens: &Tokens, from_memo: usize) -> Option<String> {
-    (from_memo == 0 && tokens.padded != tokens.padded_ran).then(|| {
+    (from_memo == 0 && tokens.padded_sorted_in_doc != tokens.padded_ran).then(|| {
         format!(
-            "warning: the padded tokens computed ({}) differ from those the embedder ran ({})",
-            tokens.padded, tokens.padded_ran
+            "warning: the padded tokens computed for the refresh order ({}) differ from those the embedder ran ({})",
+            tokens.padded_sorted_in_doc, tokens.padded_ran
         )
     })
 }
@@ -410,9 +413,27 @@ mod tests {
     }
 
     #[test]
+    fn the_padding_warning_compares_with_the_sorted_in_doc_padding() {
+        let sorted_ran = Tokens { padded: 1000, padded_sorted_in_doc: 900, padded_ran: 900, ..tokens_of(&[]) };
+        let unsorted_ran = Tokens { padded: 1000, padded_sorted_in_doc: 900, padded_ran: 1000, ..tokens_of(&[]) };
+
+        assert_eq!(padding_warning(&sorted_ran, 0), None, "the model ran the sorted padding");
+        assert!(padding_warning(&unsorted_ran, 0).is_some(), "it ran the padding of the passages' order");
+    }
+
+    #[test]
+    fn the_padding_warning_names_both_numbers() {
+        let t = Tokens { padded: 1200, padded_sorted_in_doc: 900, padded_ran: 1000, ..tokens_of(&[]) };
+
+        let warning = padding_warning(&t, 0).expect("a warning");
+
+        assert!(warning.contains("900") && warning.contains("1000"), "{warning}");
+    }
+
+    #[test]
     fn a_mismatch_between_computed_and_ran_padding_warns_only_when_nothing_came_from_the_memo() {
-        let t = Tokens { padded: 1000, padded_ran: 1200, ..tokens_of(&[]) };
-        let same = Tokens { padded: 1000, padded_ran: 1000, ..tokens_of(&[]) };
+        let t = Tokens { padded_sorted_in_doc: 1000, padded_ran: 1200, ..tokens_of(&[]) };
+        let same = Tokens { padded_sorted_in_doc: 1000, padded_ran: 1000, ..tokens_of(&[]) };
 
         let warning = padding_warning(&t, 0).expect("a warning");
 
