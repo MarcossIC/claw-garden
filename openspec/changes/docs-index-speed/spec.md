@@ -156,9 +156,9 @@ Los pasajes que la cola retiene, se reutilicen o no, MUST contar contra su lími
 
 **Tests (fallan hoy, funciones puras):** `the_queue_limit_starts_at_one_batch_and_doubles_up_to_the_cap`, `the_queue_flushes_before_a_doc_that_would_pass_its_limit_and_when_it_reaches_it`, `a_doc_with_no_passages_moves_no_flush`.
 
-### IS8. Un doc más grande que el límite va solo
+### IS8. Un doc más grande que el límite va solo, salvo en la rampa
 
-Un doc con más pasajes que el límite MUST vaciarse solo: la cola se vacía antes de él si no está vacía, y él es su propio vaciado. Ninguna llamada al embedder MUST retener más de `QUEUE_PASSAGES` pasajes, salvo que sea un solo doc.
+Un doc con más pasajes que el límite MUST vaciarse solo: la cola se vacía antes de él si no está vacía, y él es su propio vaciado. Mientras el límite crece hay una excepción: el vaciado de antes lo duplica, y si el doc queda por debajo del límite nuevo (tiene entre límite + 1 y 2 × límite − 1 pasajes) los docs que siguen se le suman. En el tope el límite ya no crece, y un doc con más de `QUEUE_PASSAGES` pasajes va siempre solo. Ninguna llamada al embedder MUST retener más de `QUEUE_PASSAGES` pasajes, salvo que sea un solo doc.
 
 #### Escenario: un doc grande
 - GIVEN límite 16, un doc de 40 pasajes y uno de 3 antes que él
@@ -170,7 +170,7 @@ Un doc con más pasajes que el límite MUST vaciarse solo: la cola se vacía ant
 - WHEN se refresca
 - THEN ninguna llamada pasa de `QUEUE_PASSAGES` pasajes
 
-**Tests:** `a_doc_over_the_limit_is_a_flush_of_its_own` (pura, falla hoy) y `no_call_holds_more_passages_than_the_cap_unless_it_is_one_doc`. `a_doc_over_a_batch_reaches_the_embedder_longest_first` sigue pasando sin cambios.
+**Tests:** `a_doc_over_the_limit_is_a_flush_of_its_own` (pura, falla hoy), `a_doc_between_the_limit_and_twice_it_joins_the_docs_after_it_while_the_limit_grows` (la rampa) y `no_call_holds_more_passages_than_the_cap_unless_it_is_one_doc`. `a_doc_over_a_batch_reaches_the_embedder_longest_first` sigue pasando sin cambios.
 
 ### IS9. Los docs de un vaciado comparten una llamada, ordenada
 

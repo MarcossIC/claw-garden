@@ -153,7 +153,7 @@ fin del plan: vaciar; después, remove_docs
   - cuando llega al límite;
   - al terminar el plan.
 - **El límite** empieza en `EMBED_BATCH` y se duplica con cada vaciado hasta el tope, `QUEUE_PASSAGES` (D11).
-- **Un doc más grande que el límite** se vacía solo: para él, A2 es A1.
+- **Un doc más grande que el límite** se vacía solo: para él, A2 es A1. La excepción es la rampa: si la cola no estaba vacía, el vaciado de antes duplica el límite, y un doc de entre límite + 1 y 2 × límite − 1 pasajes queda por debajo del nuevo y los docs que siguen se le suman. En el tope un doc de más de `QUEUE_PASSAGES` va siempre solo. La cuenta de D9 usa la misma pieza, así que la tabla ya lo incluye.
 - **Los vectores vuelven por posición**, como hoy. Los textos se concatenan doc tras doc, `in_passage_order` deja los vectores en el orden de esa concatenación, y cada doc toma los suyos según cuántos textos tiene.
 
 La decisión la toma una pieza pura. Su único estado es lo que retiene la cola y cuántos vaciados se hicieron, y con el tamaño del doc que llega dice si vaciar antes y si vaciar después. La recorren `refresh` y `eval_api::queue_groups` (D14), así que la evaluación agrupa como el refresco por construcción.
@@ -267,10 +267,10 @@ Lo que no se escribió conserva su huella anterior, o no tiene ninguna, así que
   - sus fases.
 - **El vaciado suma:**
   - los vectores f32, 1536 B cada uno;
-  - mientras cuenta, las copias con prefijo de `passage_token_counts` (`embedder.rs:273-277`).
+  - mientras cuenta, las copias con prefijo y las codificaciones del tokenizer de `passage_token_counts`, que cuenta en tandas de `EMBED_BATCH`: coexisten las de una tanda (unos 70 a 80 B por token, a lo sumo 512 tokens por texto, o sea unos 40 KB por texto y 640 KB por tanda), no las de la llamada.
 
   Los textos se ordenan moviéndolos, sin copiarlos: hoy se clonan (`mod.rs:660`), y el vaciado es su dueño.
-- **La cota:** H es el máximo, sobre los vaciados, de Σ (3 × bytes del texto + 1536). Cuenta el pasaje, el texto a embeber, la copia del conteo y el vector, y es una cota porque la copia y el vector no coexisten.
+- **La cota:** H es el máximo, sobre los vaciados, de Σ (3 × bytes del texto + 1536). Cuenta el pasaje, el texto a embeber, la copia del conteo y el vector, y es una cota porque la copia y el vector no coexisten. Los vectores f32 se consumen al armar los blobs (`into_iter`), así que no viven junto a ellos. Lo que H no cuenta es el máximo de una tanda de codificaciones y el blob que se arma, que son del orden de 1 MiB. IS17 sigue siendo la puerta.
   - Los tamaños tienen tope: un pasaje tiene a lo sumo 480 tokens (`crates/clawg-core/src/memory/chunker/mod.rs:26`); un pedazo de código, 1200 caracteres (`project_docs/code.rs:13`) y un breadcrumb de hasta 256 B (`chunk.rs:12`); un doc, 256 KiB (`corpus.rs:14`).
   - La cuenta de D9 mide H en este corpus en lugar de suponer bytes por token.
 - **La cota en pasajes:** hoy es el doc más grande; con A2, el mayor entre el tope y el doc más grande.
