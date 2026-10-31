@@ -34,6 +34,13 @@ Si un doc que un caso espera cita la pregunta de ese mismo caso, o de cualquier 
 - WHEN corre `rag-eval --fake --docs`
 - THEN sale con 2 y stderr nombra `q1` y `notes.md`
 
+Un `expected` con `heading` que no es el último segmento del breadcrumb de ningún pasaje de su doc, partido como lo parte el índice (el mismo enmascarado y el mismo splitter, sin embeber), MUST salir con 2 nombrando el caso, el doc y el heading, antes de indexar. Un heading renombrado, o uno cuya sección sólo tiene subsecciones, deja la pregunta sin pasaje que pueda responderla y baja la medición en silencio.
+
+#### Escenario: un heading sin pasaje propio
+- GIVEN un caso q1 que espera `README.md > Proyecto`, y en `README.md` la sección `Proyecto` sólo tiene subsecciones
+- WHEN corre `rag-eval --fake --docs`
+- THEN sale con 2 sin indexar, y stderr nombra `q1` y `README.md > Proyecto`
+
 ### DQ3. El archivo de resultados de docs
 
 `rag-eval --real --docs` MUST escribir `{out-dir}/{fecha}-real-docs.json`, o `{fecha}-real-docs-{tag}.json` con `--tag`, en el directorio de resultados de siempre (`--out-dir`, por defecto `docs/eval/results/`, fuera de git). Un archivo existente MUST NOT pisarse sin `--force` (salida 4), y la comprobación MUST hacerse antes de indexar. `--fake --docs` MUST sólo imprimir. El archivo MUST llevar:
@@ -68,7 +75,7 @@ MUST NOT llevar el texto de ningún pasaje ni rutas absolutas.
 
 ### DQ5. El golden de docs ampliado
 
-`crates/clawg-eval/golden/project-docs.json` MUST tener al menos 40 preguntas con respuesta, al menos 15 de docs y 15 de código, que sigan evitando las palabras del pasaje que las responde. `the_shipped_golden_set_names_docs_this_workspace_has` MUST comprobar que ninguna cita su propia respuesta (DQ2) y la cantidad mínima, no un número exacto. Las preguntas sin respuesta quedan para el cambio del piso de relevancia: el formato de hoy exige un `expected` por caso.
+`crates/clawg-eval/golden/project-docs.json` MUST tener al menos 40 preguntas con respuesta, al menos 15 de docs y 15 de código, que sigan evitando las palabras del pasaje que las responde. `the_shipped_golden_set_names_docs_this_workspace_has` MUST comprobar que ninguna cita su propia respuesta, que cada heading esperado tiene un pasaje (DQ2) y la cantidad mínima, no un número exacto. Las preguntas sin respuesta quedan para el cambio del piso de relevancia: el formato de hoy exige un `expected` por caso.
 
 ## Pasos 2 a 4: condicionales
 

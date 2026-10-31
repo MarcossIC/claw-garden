@@ -14,6 +14,16 @@ Decisiones con alternativas. Requisitos en la [spec](spec.md) (DQ1 a DQ9); decis
 
 Un `expected` que cita una pregunta es un golden inválido (DQ2, salida 2) y no una exclusión silenciosa: dejarlo fuera haría fallar `check_corpus` con un mensaje que no dice por qué.
 
+Un heading esperado sin pasaje también es un golden inválido (DQ2), y se comprueba así:
+
+| Opción | A favor | En contra |
+|---|---|---|
+| **a. Partir el doc con el splitter del índice antes de indexar** (elegida) | Los breadcrumbs son los de producción: mismo enmascarado, mismo splitter, mismas secciones sin cuerpo que no dan pasaje; falla antes de los minutos del indexado real | Expone `EvalDocIndex::breadcrumbs` y saca el despacho por tipo de `refresh` a `project_docs::passages` |
+| b. Buscar el heading con un regex en el markdown | No toca `clawg-core` | Da por bueno un heading cuya sección sólo tiene subsecciones, que no tiene pasaje, y no sirve para código |
+| c. Comprobar contra los pasajes guardados después de indexar | Exacto | Con el modelo real falla después de embeber todo el repo |
+
+`check_headings(cases, crumbs)` es pura y vive en `docs.rs`; `expected_breadcrumbs` pide al índice los breadcrumbs de cada doc que un caso espera bajo un heading, y `measure_with` corre las dos antes de `index`.
+
 ## D2. El archivo de resultados y su `--diff` (DQ3, DQ4)
 
 | Opción | A favor | En contra |

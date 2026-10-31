@@ -34,8 +34,13 @@ Con el embedder falso (sólo comprueba la tubería, sus números no miden nada),
 
 ### 5. Preguntas nuevas
 
-- [ ] RED: `the_shipped_golden_set_names_docs_this_workspace_has` pasa a exigir al menos 40 casos, 15 de docs y 15 de código, y que ninguno espere un doc que cite una pregunta.
-- [ ] GREEN: las preguntas nuevas, escritas sin las palabras del pasaje que las responde.
+El set de 15 tenía casos rotos en silencio, porque `check_corpus` mira la ruta y no el heading: d09 esperaba `Ningún evento aceptado se pierde en un apagado ordenado`, que hoy es `Ningún save aceptado…`, y no podía acertar nunca; d05 nombraba `AGENTS.md > Data profiles`, que no existe; c03 esperaba `spill.rs` para lo que hoy guarda el outbox. Un heading que existe pero cuya sección sólo tiene subsecciones tampoco tiene pasaje, así que el chequeo usa el chunker y no un regex sobre el markdown.
+
+- [x] RED: `a_doc_index_names_a_docs_breadcrumbs_without_indexing_it` (`eval_api.rs`); `an_expected_heading_no_passage_ends_in_fails_validation` (`docs.rs`); `docs_mode_refuses_an_expected_heading_no_passage_ends_in` (`tests/docs_mode.rs`); `the_shipped_golden_set_names_docs_this_workspace_has` comprueba que cada heading esperado tiene un pasaje.
+- [x] GREEN: `project_docs::passages`, que el refresco y la evaluación comparten; `EvalDocIndex::breadcrumbs`; `check_headings` y `expected_breadcrumbs`, llamados en `measure_with` antes de indexar; d05, d09 y c03 corregidos.
+- Commit: `feat(eval): refuse an expected heading no passage ends in`
+- [x] RED: `the_shipped_golden_set_names_docs_this_workspace_has` pasa a exigir al menos 40 casos, 15 de docs y 15 de código.
+- [x] GREEN: las preguntas nuevas, escritas sin las palabras del pasaje que las responde. Comprobado con los tokens del FTS de docs (`unicode61 remove_diacritics 2`, sin stemming, con la ruta y el heading del breadcrumb): ninguna comparte con su pasaje más que palabras vacías. d11 y d14 esperan también la otra respuesta que el repo tiene (`R6. Firma y claves` de la spec de release y su copia archivada; `update/client.rs`).
 - [ ] Línea base del set ampliado con `--real` (necesita el modelo real).
 - Commit: `test(eval): widen the docs golden set`
 
