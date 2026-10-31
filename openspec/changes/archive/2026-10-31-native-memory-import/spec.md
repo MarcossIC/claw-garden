@@ -1,6 +1,6 @@
 # native-memory-import — Especificación
 
-Suma requisitos a [`specs/portability`](../../specs/portability/spec.md) (la fuente `claude-code`) y a [`specs/doctor`](../../specs/doctor/spec.md) (el hallazgo `native_memory`). Origen: [proposal](proposal.md).
+Suma requisitos a [`specs/portability`](../../../specs/portability/spec.md) (la fuente `claude-code`) y a [`specs/doctor`](../../../specs/doctor/spec.md) (el hallazgo `native_memory`). Origen: [proposal](proposal.md).
 
 ## NM1. El directorio
 

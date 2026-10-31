@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 y 4 | M (la parte A); B y C son S | — para el importador, que construye sobre [history-import](../archive/2026-10-24-history-import/proposal.md) (44) y [import-undo](../archive/2026-10-24-import-undo/proposal.md) (84), archivados; la recomendación de apagar la memoria nativa espera al brazo A4 de [agent-eval](../agent-eval/exploration.md) (96) | exploración cerrada; sigue en la [propuesta](proposal.md) |
+| 1 y 4 | M (la parte A); B y C son S | — para el importador, que construye sobre [history-import](../2026-10-24-history-import/proposal.md) (44) y [import-undo](../2026-10-24-import-undo/proposal.md) (84), archivados; la recomendación de apagar la memoria nativa espera al brazo A4 de [agent-eval](../../agent-eval/exploration.md) (96) | exploración cerrada; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** Claude Code trae su propia memoria automática y la deja encendida por defecto. Para quien usa clawg, las dos memorias escriben en paralelo los mismos hechos, cada una con sus reglas, y lo que aprendió la nativa no le llega a otros agentes ni a otra herramienta. Las investigaciones proponen «integrarla en lugar de competir»: absorber lo que ya escribió y, recién con datos, recomendar apagarla. Este cambio propone un importador más (`clawg import --from claude-code`), sobre el modelo de notas ajenas que ya usa el de engram, y deja la decisión de apagar la memoria nativa a la medición de 96.
 
@@ -17,13 +17,13 @@
 | Se apaga con `autoMemoryEnabled: false` o `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` | **Cierta,** también por proyecto en su `.claude/settings.json` o desde `/memory` (misma página, «Enable or disable auto memory») |
 | Hay un issue de 2026 en que seguía escribiendo con todo apagado | **Sin verificar aquí.** No se abrió el issue; si se recomienda apagarla, la verificación es un paso del plan (B) |
 | clawg no hace nada con la memoria nativa | **Cierta.** No hay ninguna coincidencia de `autoMemory` en `crates/`; `setup` sólo escribe el servidor, dos hooks y el bloque del protocolo (`HOOK_EVENTS`, `crates/clawg-cli/src/setup.rs:48`), y `doctor` no la mira |
-| Habría que importar las notas «como candidatas» | **No existe un estado candidata, y no hace falta.** Una fila importada lleva `source = 'import'` y sale marcada `imported` en `memory_status`, ACTIVE CONFLICTS y `synthesize` ([`specs/provenance`](../../specs/provenance/spec.md), tabla de sellos). Es la misma marca que reciben las notas de engram |
+| Habría que importar las notas «como candidatas» | **No existe un estado candidata, y no hace falta.** Una fila importada lleva `source = 'import'` y sale marcada `imported` en `memory_status`, ACTIVE CONFLICTS y `synthesize` ([`specs/provenance`](../../../specs/provenance/spec.md), tabla de sellos). Es la misma marca que reciben las notas de engram |
 
 ## Lo que ya existe y se reutiliza
 
 - El modelo de notas ajenas (`ForeignExport`, `ForeignNote`, `crates/clawg-core/src/memory/portability/foreign.rs:12-70`): un adaptador sólo lee su formato a este modelo, sin abrir el store.
 - `translate` (`crates/clawg-core/src/memory/portability/translate.rs:308`): enmascara, parte con el tokenizer del daemon, tipa, fecha, deduplica por proyecto de origen y escribe `created_by_ref` y `origin_project`, que hacen que un segundo import encuentre cada nota.
-- `--project-map NOMBRE=RUTA|NOMBRE=project:REF`, el diario del import y `clawg import --undo N` ([`specs/portability`](../../specs/portability/spec.md)).
+- `--project-map NOMBRE=RUTA|NOMBRE=project:REF`, el diario del import y `clawg import --undo N` ([`specs/portability`](../../../specs/portability/spec.md)).
 
 ## Partes
 
