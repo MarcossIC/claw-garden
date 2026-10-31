@@ -2334,15 +2334,23 @@ old
         std::env::var(name).map_or(default, |v| v.parse().unwrap())
     }
 
-    /// The pinned tokenizer and the cached real model, from
-    /// `CLAWG_E5_MODEL_DIR` (`<data dir>/models/multilingual-e5-small`); nothing is downloaded.
-    async fn real_model() -> (Arc<Tokenizer>, crate::memory::embedder::E5Embedder) {
-        use crate::memory::model_download::{load_cached_model, load_verified_tokenizer, tokenizer_path};
+    /// The pinned tokenizer from `CLAWG_E5_MODEL_DIR`
+    /// (`<data dir>/models/multilingual-e5-small`) and the data dir above it.
+    fn pinned_tokenizer() -> (Arc<Tokenizer>, PathBuf) {
+        use crate::memory::model_download::{load_verified_tokenizer, tokenizer_path};
 
         let model_dir = PathBuf::from(std::env::var_os("CLAWG_E5_MODEL_DIR").expect("CLAWG_E5_MODEL_DIR is not set"));
         let base = model_dir.parent().and_then(Path::parent).unwrap().to_path_buf();
         assert_eq!(tokenizer_path(&base).parent(), Some(model_dir.as_path()), "CLAWG_E5_MODEL_DIR is <data dir>/models/multilingual-e5-small");
-        let tokenizer = load_verified_tokenizer(&base).expect("the pinned tokenizer.json");
+        (load_verified_tokenizer(&base).expect("the pinned tokenizer.json"), base)
+    }
+
+    /// The pinned tokenizer and the cached real model, from
+    /// `CLAWG_E5_MODEL_DIR`; nothing is downloaded.
+    async fn real_model() -> (Arc<Tokenizer>, crate::memory::embedder::E5Embedder) {
+        use crate::memory::model_download::load_cached_model;
+
+        let (tokenizer, base) = pinned_tokenizer();
         let files = load_cached_model(&base, &crate::memory::model_download::CacheLock::new()).await.unwrap();
         let embedder = crate::memory::embedder::E5Embedder::from_parts(&files.onnx, tokenizer.clone(), &files.tokenizer, Arc::default()).unwrap();
         (tokenizer, embedder)
@@ -2351,10 +2359,13 @@ old
     /// The docs of this repository with passages, by path, each with the texts
     /// a refresh would embed.
     fn repo_docs(tokenizer: &Arc<Tokenizer>) -> Vec<(String, Vec<String>)> {
+        docs_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."), tokenizer)
+    }
+
+    fn docs_under(root: &Path, tokenizer: &Arc<Tokenizer>) -> Vec<(String, Vec<String>)> {
         let splitter = TokenSplitter::with_tokenizer(tokenizer.clone());
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut docs: Vec<(String, Vec<String>)> = Vec::new();
-        for file in corpus::walk(&root).unwrap().docs {
+        for file in corpus::walk(root).unwrap().docs {
             let Some((text, _)) = corpus::read(&file) else { continue };
             let found = super::passages(file.kind, &file.path, &redact(&text).text, &splitter);
             if !found.is_empty() {
@@ -2522,5 +2533,276 @@ old
             differences.iter().filter(|&&d| d == 0.0).count(),
             differences.iter().copied().fold(0f32, f32::max),
         );
+    }
+
+    /// What the queue of a refresh decides about a doc that arrives.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Flush {
+        before: bool,
+        after: bool,
+    }
+
+    /// The passages a queue holds and the flushes it has made: all it needs to
+    /// say when to flush. Its limit starts at one batch and doubles with each
+    /// flush up to `cap`.
+    struct Queue {
+        cap: usize,
+        held: usize,
+        flushes: usize,
+    }
+
+    impl Queue {
+        fn new(cap: usize) -> Self {
+            Queue { cap, held: 0, flushes: 0 }
+        }
+
+        fn limit(&self) -> usize {
+            (EMBED_BATCH << self.flushes.min(16)).min(self.cap)
+        }
+
+        fn flush(&mut self) {
+            self.held = 0;
+            self.flushes += 1;
+        }
+
+        fn admit(&mut self, passages: usize) -> Flush {
+            if passages == 0 {
+                return Flush { before: false, after: false };
+            }
+            let before = self.held > 0 && self.held + passages > self.limit();
+            if before {
+                self.flush();
+            }
+            self.held += passages;
+            let after = self.held >= self.limit();
+            if after {
+                self.flush();
+            }
+            Flush { before, after }
+        }
+    }
+
+    /// The docs, by position, that share each call of a queue with `cap`.
+    fn queue_groups(cap: usize, passages_per_doc: &[usize]) -> Vec<Vec<usize>> {
+        let mut queue = Queue::new(cap);
+        let (mut groups, mut open) = (Vec::new(), Vec::new());
+        for (k, &n) in passages_per_doc.iter().enumerate() {
+            let flush = queue.admit(n);
+            if flush.before {
+                groups.push(std::mem::take(&mut open));
+            }
+            open.push(k);
+            if flush.after {
+                groups.push(std::mem::take(&mut open));
+            }
+        }
+        if !open.is_empty() {
+            groups.push(open);
+        }
+        groups
+    }
+
+    /// A passage as a call sees it: its tokens and the bytes of its text.
+    type Sent = (usize, usize);
+
+    #[derive(Default)]
+    struct Cost {
+        padded: usize,
+        batches: usize,
+        attention: usize,
+        biggest: usize,
+        held: usize,
+    }
+
+    /// The cost of embedding each call, its passages in the order given.
+    fn cost(calls: &[Vec<Sent>]) -> Cost {
+        let mut total = Cost::default();
+        for call in calls {
+            for run in call.chunks(EMBED_BATCH) {
+                let longest = run.iter().map(|s| s.0).max().unwrap();
+                total.padded += run.len() * longest;
+                total.attention += run.len() * longest * longest;
+            }
+            total.batches += call.len().div_ceil(EMBED_BATCH);
+            total.biggest = total.biggest.max(call.len());
+            total.held = total.held.max(call.iter().map(|s| 3 * s.1 + 1536).sum());
+        }
+        total
+    }
+
+    fn longest_first_of(call: Vec<Sent>) -> Vec<Sent> {
+        let tokens: Vec<usize> = call.iter().map(|s| s.0).collect();
+        crate::memory::embedder::longest_first(&tokens).into_iter().map(|k| call[k]).collect()
+    }
+
+    fn in_each_doc_calls(docs: &[Vec<Sent>]) -> Vec<Vec<Sent>> {
+        docs.iter().map(|d| if d.len() > EMBED_BATCH { longest_first_of(d.clone()) } else { d.clone() }).collect()
+    }
+
+    fn queue_calls(docs: &[Vec<Sent>], cap: usize) -> Vec<Vec<Sent>> {
+        let sizes: Vec<usize> = docs.iter().map(Vec::len).collect();
+        queue_groups(cap, &sizes).into_iter().map(|g| longest_first_of(g.into_iter().flat_map(|k| docs[k].iter().copied()).collect())).collect()
+    }
+
+    fn all_together_calls(docs: &[Vec<Sent>]) -> Vec<Vec<Sent>> {
+        vec![longest_first_of(docs.concat())]
+    }
+
+    fn print_cost(name: &str, cost: &Cost) {
+        println!(
+            "{name:>14}: P {:>9}  B {:>6}  Q {:>14}  largest call {:>6} passages  H {:>10} bytes ({:.1} MiB)",
+            cost.padded,
+            cost.batches,
+            cost.attention,
+            cost.biggest,
+            cost.held,
+            cost.held as f64 / (1024.0 * 1024.0),
+        );
+    }
+
+    /// The tokens as the model receives each passage and the bytes of its
+    /// text, per doc, from the tokenizer alone.
+    fn sent_per_doc(tokenizer: &Tokenizer, docs: &[(String, Vec<String>)]) -> Vec<Vec<Sent>> {
+        use crate::memory::embedder::{apply_role_prefix, expected_contract, window_encodings, EmbedRole};
+
+        let contract = expected_contract();
+        let prefixed: Vec<String> = docs
+            .iter()
+            .flat_map(|d| d.1.iter())
+            .map(|t| apply_role_prefix(EmbedRole::Passage, t, &contract.query_prefix, &contract.passage_prefix))
+            .collect();
+        let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+        let mut lengths = window_encodings(tokenizer, &refs).unwrap().into_iter().map(|e| e.len());
+        docs.iter().map(|d| d.1.iter().map(|t| (lengths.next().unwrap(), t.len())).collect()).collect()
+    }
+
+    /// `(X in each doc, X all together)` for P, B and Q.
+    fn each_and_all(docs: &[Vec<Sent>]) -> [(f64, f64); 3] {
+        let (each, all) = (cost(&in_each_doc_calls(docs)), cost(&all_together_calls(docs)));
+        [
+            (each.padded as f64, all.padded as f64),
+            (each.batches as f64, all.batches as f64),
+            (each.attention as f64, all.attention as f64),
+        ]
+    }
+
+    /// Counts, with the tokenizer alone, the padding (P), the batches (B) and
+    /// the attention (Q) of each order of the passages of a docs tree, and the
+    /// bytes the largest call of each holds (H), to choose how many passages a
+    /// queue holds. `CLAWG_DOCS_ROOT` is the tree (this repository by default)
+    /// and `CLAWG_EMBED_PASSAGES` is about how many passages the sample of the
+    /// ceiling holds (5000 by default, `0` for the whole tree).
+    #[test]
+    #[ignore = "a count: needs CLAWG_E5_MODEL_DIR; run it with `cargo test -p clawg-core --lib -- --ignored padding_and_batches_by_queue_cap --nocapture`"]
+    fn padding_and_batches_by_queue_cap() {
+        const CAPS: [usize; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+        const MIB: f64 = 1024.0 * 1024.0;
+
+        let limit = env_count("CLAWG_EMBED_PASSAGES", 5000);
+        let (tokenizer, _) = pinned_tokenizer();
+        let root = std::env::var_os("CLAWG_DOCS_ROOT").map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."), PathBuf::from);
+        let all = docs_under(&root, &tokenizer);
+        let available: usize = all.iter().map(|d| d.1.len()).sum();
+        let stride = if limit == 0 { 1 } else { available.div_ceil(limit).max(1) };
+        let sample_docs: Vec<(String, Vec<String>)> = all.iter().step_by(stride).cloned().collect();
+        let corpus = sent_per_doc(&tokenizer, &all);
+        let sample = sent_per_doc(&tokenizer, &sample_docs);
+        assert!(!sample.is_empty(), "the tree holds no passage");
+
+        println!("tree {}: {} docs, {available} passages", root.display(), all.len());
+        println!("-- corpus");
+        print_cost("passage order", &cost(&corpus));
+        print_cost("in each doc", &cost(&in_each_doc_calls(&corpus)));
+        for c in CAPS {
+            print_cost(&format!("queue {c}"), &cost(&queue_calls(&corpus, c)));
+        }
+        print_cost("all together", &cost(&all_together_calls(&corpus)));
+
+        println!("-- sample: every {stride}th doc, {} docs, {} passages", sample.len(), sample.iter().map(Vec::len).sum::<usize>());
+        print_cost("passage order", &cost(&sample));
+        print_cost("in each doc", &cost(&in_each_doc_calls(&sample)));
+        print_cost("all together", &cost(&all_together_calls(&sample)));
+
+        println!("-- rule");
+        let names = ["P", "B", "Q"];
+        let (of_corpus, of_sample) = (each_and_all(&corpus), each_and_all(&sample));
+        let rho = |(each, all): (f64, f64)| (each - all) / each;
+        let mut transfer = 1f64;
+        for k in 0..3 {
+            let (rc, rs) = (rho(of_corpus[k]), rho(of_sample[k]));
+            println!("rho_{}: corpus {rc:.4}, sample {rs:.4}, corpus/sample {:.4}", names[k], rc / rs);
+            if rs > 0.0 {
+                transfer = transfer.min(rc / rs);
+            }
+        }
+        println!("min(1, min_X rho_X(corpus)/rho_X(sample)) = {transfer:.4}");
+        for c in CAPS {
+            let queue = cost(&queue_calls(&corpus, c));
+            let at = [queue.padded as f64, queue.batches as f64, queue.attention as f64];
+            let recovered: Vec<f64> = (0..3)
+                .map(|k| {
+                    let (each, all) = of_corpus[k];
+                    if each - all > 0.0 { (each - at[k]) / (each - all) } else { 1.0 }
+                })
+                .collect();
+            let worst = recovered.iter().copied().fold(f64::INFINITY, f64::min);
+            println!(
+                "c {c:>4}: R_P {:.4}  R_B {:.4}  R_Q {:.4}  previsto {:.4}  H {:.1} MiB  H <= 16 MiB: {}",
+                recovered[0],
+                recovered[1],
+                recovered[2],
+                0.210 * transfer * worst,
+                queue.held as f64 / MIB,
+                queue.held as f64 <= 16.0 * MIB,
+            );
+        }
+    }
+
+    fn decision_after(queue: &mut Queue, docs: &[usize]) -> Vec<(bool, bool)> {
+        docs.iter()
+            .map(|&n| {
+                let d = queue.admit(n);
+                (d.before, d.after)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_queue_limit_starts_at_one_batch_and_doubles_up_to_the_cap() {
+        let mut queue = Queue::new(64);
+        let mut limits = Vec::new();
+        for n in [16, 32, 64, 64] {
+            limits.push(queue.limit());
+            assert_eq!(queue.admit(n), Flush { before: false, after: true }, "a doc of {n} fills the limit");
+        }
+        assert_eq!(limits, [16, 32, 64, 64]);
+    }
+
+    #[test]
+    fn the_queue_flushes_before_a_doc_that_would_pass_its_limit_and_when_it_reaches_it() {
+        let mut queue = Queue::new(EMBED_BATCH);
+        let flushed = decision_after(&mut queue, &[10, 8, 6, 2]);
+        assert_eq!(flushed, [(false, false), (true, false), (false, false), (false, true)]);
+        assert_eq!(queue.admit(1), Flush { before: false, after: false }, "the queue starts again from empty");
+    }
+
+    #[test]
+    fn a_doc_over_the_limit_is_a_flush_of_its_own() {
+        let mut queue = Queue::new(64);
+        assert_eq!(decision_after(&mut queue, &[3, 40]), [(false, false), (true, true)]);
+        assert_eq!(queue.limit(), 64.min(EMBED_BATCH * 4), "the limit grew once per flush");
+        assert_eq!(queue_groups(64, &[3, 40]), [vec![0], vec![1]]);
+        assert_eq!(queue_groups(64, &[40]), [vec![0]]);
+        let groups = queue_groups(64, &[30; 7]);
+        assert_eq!(groups.concat(), (0..7).collect::<Vec<_>>());
+        assert!(groups.iter().all(|g| g.len() == 1 || g.len() * 30 <= 64), "{groups:?}");
+    }
+
+    #[test]
+    fn a_doc_with_no_passages_moves_no_flush() {
+        let mut queue = Queue::new(EMBED_BATCH);
+        assert_eq!(decision_after(&mut queue, &[10, 0]), [(false, false), (false, false)]);
+        assert_eq!(queue.admit(6), Flush { before: false, after: true }, "the queue still held 10");
+        assert_eq!(queue_groups(EMBED_BATCH, &[10, 0, 6]), [vec![0, 1, 2]]);
     }
 }
