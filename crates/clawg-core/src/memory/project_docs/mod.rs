@@ -2330,6 +2330,41 @@ old
         assert_eq!(stored.iter().filter(|p| p.0 == "a.md").count(), 0);
     }
 
+    fn env_count(name: &str, default: usize) -> usize {
+        std::env::var(name).map_or(default, |v| v.parse().unwrap())
+    }
+
+    /// The pinned tokenizer and the cached real model, from
+    /// `CLAWG_E5_MODEL_DIR` (`<data dir>/models/multilingual-e5-small`); nothing is downloaded.
+    async fn real_model() -> (Arc<Tokenizer>, crate::memory::embedder::E5Embedder) {
+        use crate::memory::model_download::{load_cached_model, load_verified_tokenizer, tokenizer_path};
+
+        let model_dir = PathBuf::from(std::env::var_os("CLAWG_E5_MODEL_DIR").expect("CLAWG_E5_MODEL_DIR is not set"));
+        let base = model_dir.parent().and_then(Path::parent).unwrap().to_path_buf();
+        assert_eq!(tokenizer_path(&base).parent(), Some(model_dir.as_path()), "CLAWG_E5_MODEL_DIR is <data dir>/models/multilingual-e5-small");
+        let tokenizer = load_verified_tokenizer(&base).expect("the pinned tokenizer.json");
+        let files = load_cached_model(&base, &crate::memory::model_download::CacheLock::new()).await.unwrap();
+        let embedder = crate::memory::embedder::E5Embedder::from_parts(&files.onnx, tokenizer.clone(), &files.tokenizer, Arc::default()).unwrap();
+        (tokenizer, embedder)
+    }
+
+    /// The docs of this repository with passages, by path, each with the texts
+    /// a refresh would embed.
+    fn repo_docs(tokenizer: &Arc<Tokenizer>) -> Vec<(String, Vec<String>)> {
+        let splitter = TokenSplitter::with_tokenizer(tokenizer.clone());
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut docs: Vec<(String, Vec<String>)> = Vec::new();
+        for file in corpus::walk(&root).unwrap().docs {
+            let Some((text, _)) = corpus::read(&file) else { continue };
+            let found = super::passages(file.kind, &file.path, &redact(&text).text, &splitter);
+            if !found.is_empty() {
+                docs.push((file.path, found.iter().map(Passage::indexed_text).collect()));
+            }
+        }
+        docs.sort_by(|a, b| a.0.cmp(&b.0));
+        docs
+    }
+
     /// Embeds real passages of the docs of this repository in the order of
     /// their doc and in the order a refresh uses, and reports how many vectors
     /// keep their bits. `CLAWG_E5_MODEL_DIR` is `<data dir>/models/multilingual-e5-small`;
@@ -2338,26 +2373,11 @@ old
     #[tokio::test]
     #[ignore = "a measurement: needs CLAWG_E5_MODEL_DIR; run it with `cargo test -p clawg-core --lib -- --ignored docs_passages_keep_their_bits --nocapture`"]
     async fn docs_passages_keep_their_bits_in_either_order() {
-        use crate::memory::model_download::{load_cached_model, load_verified_tokenizer, tokenizer_path};
         use std::time::Duration;
 
-        let count = |name: &str, default: usize| std::env::var(name).map_or(default, |v| v.parse().unwrap());
-        let model_dir = PathBuf::from(std::env::var_os("CLAWG_E5_MODEL_DIR").expect("CLAWG_E5_MODEL_DIR is not set"));
-        let base = model_dir.parent().and_then(Path::parent).unwrap().to_path_buf();
-        assert_eq!(tokenizer_path(&base).parent(), Some(model_dir.as_path()), "CLAWG_E5_MODEL_DIR is <data dir>/models/multilingual-e5-small");
-        let (limit, runs) = (count("CLAWG_EMBED_PASSAGES", 5000), count("CLAWG_EMBED_RUNS", 3));
-
-        let tokenizer = load_verified_tokenizer(&base).expect("the pinned tokenizer.json");
-        let splitter = TokenSplitter::with_tokenizer(tokenizer.clone());
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut docs: Vec<(String, Vec<String>)> = Vec::new();
-        for file in corpus::walk(&root).unwrap().docs {
-            let Some((text, _)) = corpus::read(&file) else { continue };
-            let found = super::passages(file.kind, &file.path, &redact(&text).text, &splitter);
-            if found.len() > EMBED_BATCH {
-                docs.push((file.path, found.iter().map(Passage::indexed_text).collect()));
-            }
-        }
+        let (limit, runs) = (env_count("CLAWG_EMBED_PASSAGES", 5000), env_count("CLAWG_EMBED_RUNS", 3));
+        let (tokenizer, embedder) = real_model().await;
+        let docs: Vec<(String, Vec<String>)> = repo_docs(&tokenizer).into_iter().filter(|d| d.1.len() > EMBED_BATCH).collect();
         let available: usize = docs.iter().map(|d| d.1.len()).sum();
         let stride = available.div_ceil(limit).max(1);
         let mut taken = 0;
@@ -2372,8 +2392,6 @@ old
         let passages: usize = docs.iter().map(|d| d.1.len()).sum();
         assert!(passages > 0, "no doc of this repository has more than {EMBED_BATCH} passages");
 
-        let files = load_cached_model(&base, &crate::memory::model_download::CacheLock::new()).await.unwrap();
-        let embedder = crate::memory::embedder::E5Embedder::from_parts(&files.onnx, tokenizer.clone(), &files.tokenizer, Arc::default()).unwrap();
         let embed_all = |sorted: bool| {
             let (docs, embedder, tokenizer) = (&docs, &embedder, &tokenizer);
             async move {
@@ -2416,6 +2434,91 @@ old
         println!(
             "{} docs of more than {EMBED_BATCH} passages: {} of {passages} vectors with the same bits in either order, largest difference {:e}",
             docs.len(),
+            differences.iter().filter(|&&d| d == 0.0).count(),
+            differences.iter().copied().fold(0f32, f32::max),
+        );
+    }
+
+    /// Measures the ceiling of ordering passages by tokens across docs against
+    /// the order of a refresh (inside each doc), on docs of every size, with the
+    /// real model. The two alternate in one process so drift in the machine
+    /// hits both alike. `CLAWG_EMBED_PASSAGES` is about how many passages the
+    /// sample holds (5000 by default, `0` for the whole corpus) and
+    /// `CLAWG_EMBED_RUNS` how many pairs run (3 by default).
+    #[tokio::test]
+    #[ignore = "a measurement: needs CLAWG_E5_MODEL_DIR; run it with `cargo test -p clawg-core --lib -- --ignored sorting_across_docs --nocapture`"]
+    async fn sorting_across_docs_against_sorting_in_each_doc() {
+        use crate::memory::embedder::{longest_first, passage_token_counts};
+
+        let (limit, runs) = (env_count("CLAWG_EMBED_PASSAGES", 5000), env_count("CLAWG_EMBED_RUNS", 3));
+        let (tokenizer, embedder) = real_model().await;
+        let all = repo_docs(&tokenizer);
+        let available: usize = all.iter().map(|d| d.1.len()).sum();
+        let stride = if limit == 0 { 1 } else { available.div_ceil(limit).max(1) };
+        let docs: Vec<(String, Vec<String>)> = all.into_iter().step_by(stride).collect();
+        let texts: Vec<String> = docs.iter().flat_map(|d| d.1.iter().cloned()).collect();
+        let passages = texts.len();
+        assert!(passages > 0, "the sample holds no passage");
+        println!(
+            "{} docs, {passages} passages, {} docs of more than {EMBED_BATCH} passages",
+            docs.len(),
+            docs.iter().filter(|d| d.1.len() > EMBED_BATCH).count(),
+        );
+
+        let lengths = passage_token_counts(&tokenizer, &embedder, &texts).unwrap();
+        let padded = |sent: &[usize]| -> usize { sent.chunks(EMBED_BATCH).map(|c| c.len() * c.iter().max().unwrap()).sum() };
+        let mut in_each_doc = 0;
+        let mut from = 0;
+        for (_, doc) in &docs {
+            let own = &lengths[from..from + doc.len()];
+            from += doc.len();
+            let sent: Vec<usize> = if doc.len() > EMBED_BATCH { longest_first(own).into_iter().map(|k| own[k]).collect() } else { own.to_vec() };
+            in_each_doc += padded(&sent);
+        }
+        let across: usize = padded(&longest_first(&lengths).into_iter().map(|k| lengths[k]).collect::<Vec<_>>());
+        let real: usize = lengths.iter().sum();
+        println!("real tokens {real}; padded tokens: in each doc {in_each_doc}, across docs {across}, ratio {:.3}", across as f64 / in_each_doc as f64);
+
+        let each_doc = || async {
+            let clock = Instant::now();
+            let mut blobs = Vec::with_capacity(passages);
+            for (path, doc) in &docs {
+                blobs.extend(embed_passages(&embedder, Some(&*tokenizer), path, doc.clone()).await.unwrap());
+            }
+            (clock.elapsed(), blobs)
+        };
+        let across_docs = || async {
+            let clock = Instant::now();
+            let order = longest_first(&passage_token_counts(&tokenizer, &embedder, &texts).unwrap());
+            let sent: Vec<String> = order.iter().map(|&k| texts[k].clone()).collect();
+            let vectors = embedder.embed_batch(&sent, EmbedRole::Passage).await.unwrap();
+            assert_eq!(vectors.len(), passages);
+            let blobs: Vec<Vec<u8>> = in_passage_order(&order, vectors).iter().map(|v| le_bytes(&to_unit(v).unwrap())).collect();
+            (clock.elapsed(), blobs)
+        };
+
+        let mut ratios = Vec::new();
+        let mut last = (Vec::new(), Vec::new());
+        for run in 0..runs {
+            let (a, in_blobs) = each_doc().await;
+            let (b, across_blobs) = across_docs().await;
+            let ratio = b.as_secs_f64() / a.as_secs_f64();
+            println!("run {run}: in each doc {a:.2?}, across docs {b:.2?}, ratio {ratio:.3}");
+            ratios.push(ratio);
+            last = (in_blobs, across_blobs);
+        }
+        ratios.sort_by(f64::total_cmp);
+        println!("median ratio across/in each doc of {runs} pairs: {:.3}", ratios[ratios.len() / 2]);
+
+        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
+        let differences: Vec<f32> = last
+            .0
+            .iter()
+            .zip(&last.1)
+            .map(|(a, b)| floats(a).iter().zip(floats(b)).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max))
+            .collect();
+        println!(
+            "{} of {passages} vectors with the same bits in either order, largest difference {:e}",
             differences.iter().filter(|&&d| d == 0.0).count(),
             differences.iter().copied().fold(0f32, f32::max),
         );
