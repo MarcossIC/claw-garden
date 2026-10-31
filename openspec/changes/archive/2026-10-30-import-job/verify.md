@@ -194,3 +194,8 @@ El ítem queda abierto: hace falta un push, y sólo se hace con autorización. E
 ## Veredicto
 
 **PASS WITH WARNINGS.** La suite y los dos clippy pasan en Windows. Cada requisito tiene prueba, y las desviaciones del diseño no rompen ninguno. Hubo tres avisos: el texto de R3 y HI16 que falta para archivar, el orden de IJ9 sin prueba y dos casos de la tabla de IJ2. Los dos últimos los cerraron `6c7700a` y `51eedc3`, sólo con pruebas, con la suite y los dos clippy en verde (la falla intermitente de `hook` apareció una vez y pasó al repetir). Queda el primero, que es del archivo. Falta el CI de Linux, sobre todo la prueba de Ctrl-C.
+
+## Al archivar (2026-10-30)
+
+- **WARNING 1, cerrado.** R3 y HI16 de [`specs/portability`](../../../specs/portability/spec.md) dicen ahora que `clawg import` manda la ruta absoluta a `POST /v1/imports` y sigue el trabajo, y que `POST /v1/import` queda igual para otros clientes. El escenario de IJ16 dice que el daemon recibe la ruta y nada del contenido del archivo, que es lo que sostiene la prueba.
+- **Linux en local, otra vez no.** `cargo clippy --locked --workspace --all-targets` y `cargo test --locked --workspace` no compilan en el entorno del archivo: el build de `ort-sys` baja ONNX Runtime de `cdn.pyke.io`, y la red del entorno lo rechaza (`403` del proxy). No es del código. Linux y Windows, la prueba de Ctrl-C incluida, quedan para el CI del pull request que archiva el cambio.

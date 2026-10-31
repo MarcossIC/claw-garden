@@ -1,8 +1,8 @@
 # portability — Especificación
 
-Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`, también desde el export de otra herramienta de memoria (HI4 a HI18), cómo escala la importación (IL1 e IL5), cómo decide sin ocupar la conexión del store (ID1 a ID3), cómo se deshace un import sin perder lo guardado después (IU1 a IU5), qué deja en el log cada fase de una importación (IT1 a IT4) y en qué orden embebe sus filas sin cambiar lo que escribe (ET1 a ET3). Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
+Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila por fila: el formato `clawg-memories`, `clawg export`, `clawg import` y `POST /v1/import`, también desde el export de otra herramienta de memoria (HI4 a HI18), cómo escala la importación (IL1 e IL5), cómo decide sin ocupar la conexión del store (ID1 a ID3), cómo se deshace un import sin perder lo guardado después (IU1 a IU5), qué deja en el log cada fase de una importación (IT1 a IT4) en qué orden embebe sus filas sin cambiar lo que escribe (ET1 a ET3) y cómo corre como un trabajo del daemon, que se sigue, se cancela en un límite seguro y sobrevive a su cliente (IJ1 a IJ11 e IJ15 a IJ17). Los snapshots de archivo entero (`backup` y `restore`) están en [`specs/restore`](../restore/spec.md); el enmascarado que el import aplica, en [`specs/secrets`](../secrets/spec.md).
 
-**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6). [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó el idioma de los informes de `export` e `import` (CL3). [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24, sumó el proyecto de origen al formato (HI2) y el import desde otra herramienta (HI4 a HI18); su V23 está en [`specs/storage`](../storage/spec.md) y el filtro `--origin-project` en [`specs/project`](../project/spec.md) (HI3). [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24, sumó que cada búsqueda de la importación llega a sus filas por índice (IL1) y que su tiempo crece con sus filas (IL5); su V25 está en [`specs/storage`](../storage/spec.md) (IL2 e IL3). [import-decision-pass](../../changes/archive/2026-10-24-import-decision-pass/proposal.md), archivado el 2026-10-24, sumó que la pasada de decisión no ocupa la conexión (ID1), que decide lo mismo que la pasada SQL (ID2) y que deja de planificar cuando se suelta el import (ID3), y llevó a la tabla de IL1 las consultas de su carga (ID4). [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24, sumó el número y el diario de cada import (IU1), `clawg import --undo N` (IU2 a IU4) y sus puertas en el daemon y el CLI (IU5); su V26 está en [`specs/storage`](../storage/spec.md) (IU6). [import-timing](../../changes/archive/2026-10-24-import-timing/proposal.md), archivado el 2026-10-24, sumó la línea de log de cada fase de una importación (IT1), el tiempo en SQLite y en la cola de las fases que usan la conexión (IT2), el resumen (IT3) y que medir no cambia la importación (IT4). [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24, sumó a IT1 la memoria privada con que termina cada fase en el daemon (RF5 de esa spec). [embed-throughput](../../changes/archive/2026-10-27-embed-throughput/proposal.md), archivado el 2026-10-27, sumó que una importación embebe primero las filas de más tokens (ET1), que el orden no cambia lo que se escribe (ET2) y la medición de la fase de embeddings (ET3). [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 4, que sale en 0.65.0, llevó a la línea `project` el nombre, los localizadores, la lápida y las declaraciones de un proyecto (R1), cambió adónde va cada proyecto del archivo y lo que el import graba y sugiere (R4), sumó la fila presente en otro proyecto (R5), el diario del registro y lo que retira su `--undo` (IU1, IU2), `--project-map NOMBRE=project:REF` y los caminos crudos (HI7, HI16); sus requisitos están en [`specs/project`](../project/spec.md) (PL53 a PL65) y su V31 en [`specs/storage`](../storage/spec.md).
+**Origen:** [memory-portability](../../changes/archive/2026-10-20-memory-portability/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, llevó a proyecto el texto vivo y el titular de la clave de R5. [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23, sumó el idioma de cada fila (LP6). [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23, sumó el idioma de los informes de `export` e `import` (CL3). [history-import](../../changes/archive/2026-10-24-history-import/proposal.md), archivado el 2026-10-24, sumó el proyecto de origen al formato (HI2) y el import desde otra herramienta (HI4 a HI18); su V23 está en [`specs/storage`](../storage/spec.md) y el filtro `--origin-project` en [`specs/project`](../project/spec.md) (HI3). [import-linear](../../changes/archive/2026-10-24-import-linear/proposal.md), archivado el 2026-10-24, sumó que cada búsqueda de la importación llega a sus filas por índice (IL1) y que su tiempo crece con sus filas (IL5); su V25 está en [`specs/storage`](../storage/spec.md) (IL2 e IL3). [import-decision-pass](../../changes/archive/2026-10-24-import-decision-pass/proposal.md), archivado el 2026-10-24, sumó que la pasada de decisión no ocupa la conexión (ID1), que decide lo mismo que la pasada SQL (ID2) y que deja de planificar cuando se suelta el import (ID3), y llevó a la tabla de IL1 las consultas de su carga (ID4). [import-undo](../../changes/archive/2026-10-24-import-undo/proposal.md), archivado el 2026-10-24, sumó el número y el diario de cada import (IU1), `clawg import --undo N` (IU2 a IU4) y sus puertas en el daemon y el CLI (IU5); su V26 está en [`specs/storage`](../storage/spec.md) (IU6). [import-timing](../../changes/archive/2026-10-24-import-timing/proposal.md), archivado el 2026-10-24, sumó la línea de log de cada fase de una importación (IT1), el tiempo en SQLite y en la cola de las fases que usan la conexión (IT2), el resumen (IT3) y que medir no cambia la importación (IT4). [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24, sumó a IT1 la memoria privada con que termina cada fase en el daemon (RF5 de esa spec). [embed-throughput](../../changes/archive/2026-10-27-embed-throughput/proposal.md), archivado el 2026-10-27, sumó que una importación embebe primero las filas de más tokens (ET1), que el orden no cambia lo que se escribe (ET2) y la medición de la fase de embeddings (ET3). [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 4, que sale en 0.65.0, llevó a la línea `project` el nombre, los localizadores, la lápida y las declaraciones de un proyecto (R1), cambió adónde va cada proyecto del archivo y lo que el import graba y sugiere (R4), sumó la fila presente en otro proyecto (R5), el diario del registro y lo que retira su `--undo` (IU1, IU2), `--project-map NOMBRE=project:REF` y los caminos crudos (HI7, HI16); sus requisitos están en [`specs/project`](../project/spec.md) (PL53 a PL65) y su V31 en [`specs/storage`](../storage/spec.md). [import-job](../../changes/archive/2026-10-30-import-job/proposal.md), archivado el 2026-10-30, que sale en 0.68.0, hizo de la importación un trabajo del daemon (IJ1 a IJ11), llevó `clawg import` a esa ruta (IJ15 a IJ17) y cambió R3 y HI16 en consecuencia; las rutas en [`specs/daemon-access`](../daemon-access/spec.md) (IJ12 a IJ14) y el apagado con un trabajo activo en [`specs/storage`](../storage/spec.md) (IJ18).
 
 ## Dónde está
 
@@ -15,6 +15,7 @@ Fuente de verdad de cómo las memorias salen de un store y entran en otro, fila 
 - Los proyectos del archivo: las líneas de un id (`FileProject`), el registro leído en la misma llamada que `plan_ids_in` (`Registry`, `registry_in`) y la decisión pura de adónde va cada uno y por qué paso (`place` y `By`, `crates/clawg-core/src/memory/portability/projects.rs`); lo que se graba, en `record_projects` (`import.rs`), y lo que se agregó al registro, en `memory_import_registry` (V31).
 - El deshacer, en `crates/clawg-core/src/memory/portability/undo.rs`: `undo_import`, la carga (`load`; `LOAD_BATCH` y `WRITE_BATCH`), la decisión pura (`decide`, que termina en `decide_registry` para lo que el import sumó al registro de proyectos), lo que borra una fila (`REMOVE_SQL` y `remove_in`), lo que devuelve en las demás (`restore_in` y `take_back_in`), lo que retira del registro donde sigue como lo encontró la decisión (`take_back_registered_in`) y la entrada de `memory_import_registry` que deja de pesar (`forget_in`), y el reporte (`UndoReport`); la ruta, `undo_import` (`crates/clawg-cli/src/daemon/api.rs:2085`); el comando, `undo` y `render_undo` (`crates/clawg-cli/src/import.rs:298` y `import.rs:308`).
 - Otra fuente: el modelo común (`ForeignExport`, `ForeignNote`, `ForeignRelation`, `crates/clawg-core/src/memory/portability/foreign.rs:12-72`), el adaptador de engram (`read`, `crates/clawg-core/src/memory/portability/engram.rs:22`) y la traducción a filas (`translate` y `rewrite_key`, `crates/clawg-core/src/memory/portability/translate.rs:307` y `translate.rs:502`).
+- El trabajo: las rutas `start_import_job`, `import_job` y `cancel_import_job`, y lo que el trabajo hace al aceptarse y al correr (`accept_job`, `run_job`, `crates/clawg-cli/src/daemon/api.rs`); el registro de trabajos, con su ranura, la reserva atómica, la vista, el cierre y el abandono (`ImportJobs`, `Reservation`, `JobView`, `phase_of`, `crates/clawg-cli/src/daemon/imports.rs`); la señal de parada y los contadores (`ImportControl`, `StopCause`, `Counters`, `crates/clawg-core/src/memory/portability/control.rs`); la entrada desde lo parseado (`import_parsed`, `import.rs`); el cliente (`start_import`, `import_job`, `cancel_import`, `route_missing` y `ClientError::means_daemon_gone`, `crates/clawg-cli/src/client.rs`); y el comando, que sigue el trabajo (`run`, `follow`, `Follow::on` sobre un `Event`, `shows_progress`, `interrupts`, `POLL_EVERY`, `MAX_UNANSWERED`, `crates/clawg-cli/src/import.rs`).
 - Los snapshots: `Reason::PreImport`, `pre-import`, y `Reason::PreUndo`, `pre-undo`, podados con los demás automáticos (`crates/clawg-core/src/memory/backup.rs`).
 
 ## R1. El formato `clawg-memories` versión 1
@@ -64,7 +65,7 @@ El archivo MUST crearse nuevo (un `FILE` que existe es un error que no lo toca) 
 
 ## R3. `clawg import` por el daemon
 
-`clawg import FILE [--dry-run] [--agent A] [--map-root OLD=NEW]... [--profile P]` (con `--from` y `--project-map` para otra fuente, HI16) MUST enviar el archivo a `POST /v1/import` de un daemon en marcha y nunca iniciar uno. Un encabezado ausente, de otro formato o de una `version` desconocida MUST rechazarse con `400` sin escribir nada ni tomar snapshot.
+`clawg import FILE [--dry-run] [--follow] [--agent A] [--map-root OLD=NEW]... [--profile P]` (con `--from` y `--project-map` para otra fuente, HI16) MUST mandar la ruta absoluta del archivo a `POST /v1/imports` de un daemon en marcha, sin leerlo, y seguir el trabajo (IJ15); MUST NOT iniciar un daemon. `POST /v1/import`, que recibe el texto del archivo en el cuerpo, sigue igual para otros clientes (IJ11). Un encabezado ausente, de otro formato o de una `version` desconocida MUST rechazarse con `400` sin escribir nada ni tomar snapshot.
 
 Antes de escribir, el daemon MUST tomar un snapshot `pre-import` (automático, podado como los demás). Cada fila insertada MUST:
 
@@ -335,9 +336,9 @@ Un prompt con texto MUST guardarse como `chat_message` del usuario, y el `summar
 
 ## HI16. La ruta y el comando
 
-`POST /v1/import` MUST aceptar `from` (`clawg` por defecto, `engram`) y `project_map` (pares de nombre y destino). El destino de cada par de `project_map` y de `map_roots` es un texto (una raíz, como antes), `{"root", "path"}` (la raíz y el camino crudo) o, sólo en `project_map`, `{"project"}` (un id o el nombre de un solo proyecto vivo, que el daemon resuelve antes de leer el archivo: 404 si no es ninguno, 409 `project_ambiguous` si es de dos o más, 409 `project_deleted` si está borrado). `from` desconocido, `project_map` con `from` `clawg`, o `map_roots` con otra fuente MUST ser un `400` sin escribir. Con otra fuente, el daemon MUST leer el archivo con su adaptador antes de pedir el embedder, así un archivo que no lee es un `400` también mientras el modelo carga, y MUST responder `503` `tokenizer_not_ready` sin el tokenizer, también en un `--dry-run`. Un export de engram mandado sin `from` MUST ser el `400` de un archivo sin encabezado.
+`POST /v1/import`, y `POST /v1/imports` con `path` en lugar de `text` (IJ1), MUST aceptar `from` (`clawg` por defecto, `engram`) y `project_map` (pares de nombre y destino). El destino de cada par de `project_map` y de `map_roots` es un texto (una raíz, como antes), `{"root", "path"}` (la raíz y el camino crudo) o, sólo en `project_map`, `{"project"}` (un id o el nombre de un solo proyecto vivo, que el daemon resuelve antes de leer el archivo: 404 si no es ninguno, 409 `project_ambiguous` si es de dos o más, 409 `project_deleted` si está borrado). `from` desconocido, `project_map` con `from` `clawg`, o `map_roots` con otra fuente MUST ser un `400` sin escribir. Con otra fuente, el daemon MUST leer el archivo con su adaptador antes de pedir el embedder, así un archivo que no lee es un `400` también mientras el modelo carga, y MUST responder `503` `tokenizer_not_ready` sin el tokenizer, también en un `--dry-run`. Un export de engram mandado sin `from` MUST ser el `400` de un archivo sin encabezado.
 
-`clawg import [--from clawg|engram] FILE [--dry-run] [--agent A] [--map-root OLD=NEW]... [--project-map NOMBRE=RUTA|NOMBRE=project:REF]...` MUST mandar el archivo a un daemon en marcha y nunca iniciar uno. `--project-map` MUST separarse en el último `=project:`, y si no lo hay, en el último `=`. Por cada camino, el CLI MUST mandar un objeto con la raíz y el camino crudo, absoluto y canónico, así un daemon anterior rechaza el cuerpo en lugar de leer el camino crudo como una raíz. `--map-root` MUST valer sólo con `--from clawg` y `--project-map` sólo con otra fuente. El CLI MUST resolver cada `RUTA` como un puente y rechazar, antes de leer el archivo, una que no es un directorio. `--dry-run` MUST responder el reporte que daría el import, sin escribir, sin embeber y sin snapshot.
+`clawg import [--from clawg|engram] FILE [--dry-run] [--agent A] [--map-root OLD=NEW]... [--project-map NOMBRE=RUTA|NOMBRE=project:REF]...` MUST mandar la ruta del archivo a un daemon en marcha, como trabajo (IJ15), y nunca iniciar uno. `--project-map` MUST separarse en el último `=project:`, y si no lo hay, en el último `=`. Por cada camino, el CLI MUST mandar un objeto con la raíz y el camino crudo, absoluto y canónico, así un daemon anterior rechaza el cuerpo en lugar de leer el camino crudo como una raíz. `--map-root` MUST valer sólo con `--from clawg` y `--project-map` sólo con otra fuente. El CLI MUST resolver cada `RUTA` como un puente y rechazar, antes de leer el archivo, una que no es un directorio. `--dry-run` MUST responder el reporte que daría el import, sin escribir, sin embeber y sin snapshot.
 
 #### Escenario: un ensayo y el import
 - GIVEN un export de engram con notas largas, claves, prompts y un proyecto mapeado
@@ -682,3 +683,252 @@ Un test ignorado MUST medir la fase de embeddings sobre las filas que el export 
 - THEN cada corrida del embedder se rellena hasta su propio texto más largo, no hasta el de la llamada
 
 **Tests:** `padding_counts_each_run_of_the_embedder_apart` y `the_embedding_phase_of_a_real_export` (`import.rs`, `#[ignore]`: necesita `CLAWG_E5_MODEL_DIR` y `CLAWG_IMPORT_EXPORT`, y opcionalmente `CLAWG_EMBED_ROWS` y `CLAWG_EMBED_RUNS`). Depende de la máquina, así que queda fuera de CI.
+
+## Definiciones del trabajo de importación
+
+- **Trabajo de importación:** una importación que el daemon corre en una tarea propia, con un id del proceso que empieza en 1, visible por `GET /v1/imports/{id}`. Distinto de `import_id` (V26, `memory_import`), que se toma en la primera escritura (`Journal`, `crates/clawg-core/src/memory/portability/import.rs`) y no existe en una pasada en seco ni en una importación que no añade nada.
+- **Trabajo activo:** el que no llegó a un estado final. **Estado final:** `done`, `failed`, `cancelled` o `interrupted`.
+- **Parada:** la señal única que levantan `DELETE /v1/imports/{id}` (causa cancelación) y el apagado (causa apagado). Se mira en los puntos de IJ6.
+
+## IJ1. `POST /v1/imports`: la ruta, el cuerpo y el 202
+
+`POST /v1/imports` MUST aceptar el cuerpo de `POST /v1/import` (`ImportRequest`) con `path` en lugar de `text`. El cuerpo MUST rechazar campos desconocidos con un `400` que nombra el campo, de modo que un `text` no se ignora. Para eso el daemon MUST leer el cuerpo como bytes y deserializarlo con `serde_json` (`start_import_job`, `crates/clawg-cli/src/daemon/api.rs`): con el extractor `Json`, `deny_unknown_fields` da un `422` en texto plano, no un `400`. Antes del `202`, el daemon MUST comprobar que `path` es absoluta, que nombra un archivo regular, que su tamaño no pasa de `MAX_IMPORT_BYTES` y que se puede leer; cualquiera de esas fallas MUST ser un `400` que nombra la causa, sin crear trabajo. El daemon MUST leer y parsear el archivo (el paso `read`) dentro del `POST`, antes del `202`, en una sola llamada bloqueante, y el trabajo MUST recibir lo parseado (`import_parsed`, `crates/clawg-core/src/memory/portability/import.rs`): el texto del archivo no vive más allá de la respuesta y un archivo de clawg se parsea una vez. Aceptado, MUST responder `202` con el estado del trabajo (IJ4) en `phase` de su primera fase.
+
+La ruta MUST NOT tener el tope de cuerpo de `2 * MAX_IMPORT_BYTES` (`IMPORT_BODY_LIMIT`) de `POST /v1/import`, que existe sólo por el escape JSON del archivo.
+
+#### Escenario: se acepta sin esperar
+- GIVEN un export de clawg en un archivo del perfil de prueba y un embedder de prueba que suelta los lotes de a uno
+- WHEN se manda `POST /v1/imports` con su ruta absoluta
+- THEN responde `202` con `job_id` y `phase` sin esperar el embedding, y `GET /v1/imports/{id}` responde el estado
+
+#### Escenario: la ruta no sirve
+- GIVEN una ruta relativa, un directorio, un archivo de `MAX_IMPORT_BYTES + 1` bytes y, en Unix, un archivo sin permiso de lectura
+- WHEN se manda cada uno
+- THEN cada uno es un `400` antes del `202`, sin trabajo y sin que cambie el store
+
+#### Escenario: un campo que no existe
+- GIVEN un cuerpo con `path` y `text`
+- WHEN se manda
+- THEN es un `400` (no un `422`) que nombra el campo y no hay trabajo
+
+**Tests:** `an_import_job_is_accepted_without_waiting_for_the_embedder` y `a_job_import_refuses_a_path_that_is_not_an_absolute_readable_regular_file_within_the_limit` y `a_job_import_refuses_an_unknown_field` (`crates/clawg-cli/tests/api.rs`, que fija el estado `400` y que el cuerpo nombra el campo); `the_client_sends_a_path_and_not_the_file` (`crates/clawg-cli/src/client.rs`, mod tests, sobre el cuerpo que arma `start_import`); `a_clawg_file_is_parsed_once_for_a_job` (unidad en `import.rs`: la entrada que parte de lo parseado da el mismo informe que `import` sobre el texto y no vuelve a llamar a `format::parse`, medido con el contador de parseos de la prueba).
+
+## IJ2. Cada rechazo de `POST /v1/import` sigue antes del 202, con la misma respuesta
+
+Cada `400`, `404`, `409` y `503` que da `POST /v1/import` antes de importar (`checked_fields`, `import_error`, `embedder_for`, `crates/clawg-cli/src/daemon/api.rs`) MUST ser, en `POST /v1/imports`, la misma respuesta (estado y `error`) y MUST NOT dejar un trabajo: el agente en blanco, `map_roots` sin raíz, el mapa de la otra fuente, `from` desconocido, el formato o la versión desconocidos, un encabezado ausente, el proyecto del mapa que no está (`404`), ambiguo (`409 project_ambiguous`) o borrado (`409 project_deleted`), el `503 tokenizer_not_ready` de otra fuente sin tokenizer, también en seco, y, para una importación real, el `503 embedder_not_ready` o `embedder_failed` sin modelo. Una pasada en seco MUST NOT pedir el modelo, como en la ruta síncrona.
+
+#### Escenario: las dos rutas dicen lo mismo
+- GIVEN cada uno de esos casos armado como cuerpo de `POST /v1/import` y como `POST /v1/imports` con el mismo contenido en un archivo
+- WHEN se manda a las dos rutas
+- THEN el estado y el `error` coinciden, y después de cada uno se acepta un trabajo, así que ninguno dejó la ranura tomada
+
+**Test:** `a_job_import_refuses_what_the_synchronous_import_refuses`, una tabla de casos que recorre las dos rutas con el mismo cuerpo salvo `text`/`path` (`both_routes_refuse`, `crates/clawg-cli/tests/api.rs`; `409 project_ambiguous` y `503 embedder_failed` en un arnés propio).
+
+## IJ3. Un solo trabajo activo; `wake()` al aceptar; nada nuevo durante el apagado
+
+Con un trabajo activo (o un `POST` que ya reservó su lugar), `POST /v1/imports` MUST responder `409` `import_running` con el id del activo en `job_id` del cuerpo de error (como `memories` en un save fallido), sin abrir ni leer el archivo. El orden de las comprobaciones MUST ser: el cuerpo estricto (`400`), que `path` sea absoluta, todo lo que sólo lee el cuerpo y `resolve_map` (`400`, `404`, `409 project_ambiguous`, `409 project_deleted`), la reserva del lugar (`409 import_running` o `503 shutting_down`) y recién entonces el archivo. Así un pedido mal armado se entera de su falla aunque haya un trabajo, y dos `POST` nunca leen archivos a la vez. La reserva y la comprobación MUST ser una sola operación atómica. Un `POST` que falla después de reservar (un `400` del archivo, un cliente que se va) MUST soltar la reserva; el id que tomó no existe nunca: su `GET` es `404`.
+
+Terminado ese trabajo (cualquier estado final), el siguiente `POST` MUST aceptarse. Una vez que el apagado empezó a esperar al trabajo, `POST /v1/imports` MUST responder `503` `shutting_down` con `retryable: true`, sin leer el archivo y sin trabajo: uno aceptado después correría contra un store que se cierra. Aceptado un trabajo real, el daemon MUST llamar a `wake()` del embedder (como lo hace un registro); uno en seco MUST NOT despertarlo.
+
+#### Escenario: un segundo POST
+- GIVEN un trabajo en `embedding` que el embedder de prueba retiene
+- WHEN llega otro `POST /v1/imports`, con otro archivo
+- THEN es `409 import_running` con el `job_id` del primero; liberado el primero y terminado, el mismo `POST` da `202`
+
+#### Escenario: el orden de las comprobaciones
+- GIVEN un trabajo activo
+- WHEN llega un `POST` con un `agent` en blanco y otro, válido, con un archivo que no existe
+- THEN el primero es el `400` del agente y el segundo es `409 import_running`, sin que se intente abrir el archivo
+
+#### Escenario: durante el apagado
+- GIVEN el registro de trabajos cerrado por el apagado
+- WHEN llega un `POST /v1/imports` válido
+- THEN es `503 shutting_down` con `retryable: true`, no hay trabajo y el archivo no se abre
+
+**Tests:** `a_second_import_job_while_one_runs_is_refused_with_its_id`, `a_job_import_checks_the_body_before_the_running_job_and_the_job_before_the_file` y `accepting_a_real_job_wakes_the_embedder_and_a_dry_run_does_not` (`crates/clawg-cli/tests/api.rs`, con `Harness::start_unloaded` y el contador de cargas del embedder de prueba); `a_job_import_during_shutdown_is_refused_with_a_retryable_503` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`, con `accept_job` y el registro cerrado); y, sobre el registro sin runtime, `a_reservation_is_atomic_and_released_when_dropped` y `a_closed_registry_refuses_to_reserve` (`crates/clawg-cli/src/daemon/imports.rs`).
+
+## IJ4. `GET /v1/imports/{id}`: el estado sale de la memoria del proceso
+
+`GET /v1/imports/{id}` MUST responder, sin tocar la conexión del store: `job_id`; `phase` (`planning`, `preparing` o `translating`, `loading`, `deciding`, `embedding`, `snapshot`, `writing`, `linking`, y los finales `done`, `failed`, `cancelled`, `interrupted`), la que corresponde al paso que corre de verdad (`Step`, `crates/clawg-core/src/memory/portability/timing.rs`; `phase_of`, `crates/clawg-cli/src/daemon/imports.rs`); `dry_run`; `from`; `started_at_ms`; `phase_started_at_ms`; los contadores de IJ5; `import_id` en cuanto el primer lote confirmado lo toma, y ausente antes; `stopping` (la causa pedida: `cancel` o `shutdown`; la primera causa levantada gana, así que un `DELETE` y después el apagado deja `cancel` y el trabajo termina `cancelled`, y al revés termina `interrupted`) mientras se pidió parar y no paró; `stopped_in` (el nombre del paso donde paró, `Step::name`) en un final `cancelled` o `interrupted`; `abandoned: true`, sólo cuando el apagado abortó la tarea (IJ18, en [`specs/storage`](../storage/spec.md)); `report` con `done` y con una parada en `write` (que implica al menos un lote confirmado), y MUST NOT llevar `report` una parada anterior a la primera escritura, porque un informe armado antes del primer lote nombraría proyectos y sugerencias que no se registraron: esa parada lleva `stopped_in` y los contadores de las fases que corrieron; y, con `failed`, `error` y `detail` con los códigos de la ruta síncrona (`embedder_not_ready` de una recarga que falla; `project_deleted` de la comprobación dentro de la transacción). Una pasada en seco MUST terminar `done` tras `deciding`, sin pasar por `embedding`, `snapshot`, `writing` ni `linking`. El daemon MUST recordar el último trabajo terminado mientras viva el proceso; un id que no es el activo ni el último terminado MUST ser `404`.
+
+#### Escenario: la fase avanza dentro de embedding
+- GIVEN un trabajo real con un embedder de prueba que suelta un lote por vez
+- WHEN se consulta entre lote y lote
+- THEN `phase` es `embedding` y `rows_embedded` crece sin pasar de `rows_to_embed`
+
+#### Escenario: el último terminado se recuerda
+- GIVEN un trabajo que terminó `done` y después otro que terminó
+- WHEN se consulta el id del primero y el del segundo
+- THEN el primero es `404` y el segundo trae su estado y su `report`
+
+#### Escenario: una recarga que falla
+- GIVEN un modelo soltado por inactividad cuya recarga falla
+- WHEN se acepta un trabajo real y llega a `embedding`
+- THEN termina `failed` con `error: embedder_not_ready`, sin filas nuevas, sin snapshot `pre-import` y sin fila de `memory_import`
+
+**Tests:** `a_job_reports_its_phase_and_rows_embedded_advance_inside_embedding`, `only_the_last_finished_job_is_remembered`, `an_unknown_job_is_a_404`, `a_dry_run_job_ends_done_after_deciding`, `a_failing_reload_fails_the_job_without_writing` (`crates/clawg-cli/tests/api.rs`); por el binario con `CLAWG_TEST_EMBEDDER=fake`, `a_job_import_ends_done_with_the_report_of_the_synchronous_import` (`crates/clawg-cli/tests/binary.rs`: el `report` del trabajo es igual, salvo snapshot e `import_id`, al de `POST /v1/import` para el mismo archivo).
+
+En una parada sin `report` (cancelada en `embedding`, por ejemplo), hasta dónde llegó el trabajo lo dicen `stopped_in` y los contadores; el CLI dice que no se escribió nada (IJ15).
+
+#### Escenario: una parada antes de escribir no tiene informe
+- GIVEN un trabajo cancelado en `embedding` y otro cancelado en `snapshot`
+- WHEN se consulta cada uno
+- THEN ninguno trae `report` ni `import_id`; el primero trae `stopped_in: embed` y el segundo `stopped_in: snapshot`, con el snapshot `pre-import` hecho y sin filas
+
+#### Escenario: la primera causa gana
+- GIVEN un trabajo al que llega un `DELETE` y después la orden de apagado
+- WHEN termina
+- THEN `stopping` mostró `cancel` y el final es `cancelled`
+
+**Tests (además de los de arriba):** `a_job_stopped_before_its_first_write_has_no_report` (`mod tests` de `crates/clawg-cli/src/daemon/api.rs`, con un `on_step` que levanta la señal); `the_first_stop_cause_wins` (unidad en `crates/clawg-core/src/memory/portability/control.rs`, sobre `ImportControl::stop`); `phase_of_covers_every_step` (unidad en `crates/clawg-cli/src/daemon/imports.rs`).
+
+## IJ5. Los contadores y sus invariantes
+
+El estado MUST llevar, contados en filas y notas y nunca en lotes: `rows` y `notes` (al terminar `prepare` o `translate`), `rows_to_embed`, `rows_embedded`, `rows_written` y `notes_written`. Una «nota» es la unidad que un lote de escritura mantiene entera (`Prepared::units`). `ImportTimings` MUST seguir registrando cada paso al terminar, sin cambios. Al terminar `done`: `rows_embedded == rows_to_embed`, igual a las filas insertadas que no están borradas; `rows_written == report.rows` y `notes_written == notes`. Al parar en `writing`, el informe parcial MUST contar exactamente las filas y notas de los lotes confirmados, y `rows_written`/`notes_written` MUST coincidir con él. Los contadores MUST NOT depender de `EMBED_BATCH` ni de `WRITE_BATCH`.
+
+#### Escenario: el final coincide con el informe
+- GIVEN un trabajo de un archivo de clawg y otro de uno de otra herramienta, con notas largas en piezas
+- WHEN terminan `done`
+- THEN los contadores cumplen las igualdades de arriba contra su `report`
+
+#### Escenario: la parada en writing
+- GIVEN un trabajo parado en `writing` tras algunos lotes
+- WHEN se compara el `report` con los contadores
+- THEN las filas y notas del informe son las de los lotes confirmados
+
+**Tests:** `a_finished_jobs_counters_match_its_report` y `a_job_stopped_in_writing_counts_exactly_the_committed_batches` (`crates/clawg-cli/tests/api.rs`); `the_counters_do_not_depend_on_the_batch_sizes` (unidad en `import.rs`, con `EMBED_BATCH` y `WRITE_BATCH` ejercidos en dos tamaños de archivo).
+
+## IJ6. `DELETE /v1/imports/{id}`: cancelar en un límite seguro
+
+`DELETE /v1/imports/{id}` sobre un trabajo activo MUST levantar la señal con causa cancelación y responder `202` con el estado, que ya trae `stopping: cancel`; el trabajo MUST llegar a `cancelled` en su siguiente punto de parada. Sobre un trabajo en estado final MUST responder `200` con su estado, sin cambiar nada (`202` es sólo para uno activo: al terminado no se le pidió nada); un id desconocido, `404`. Los puntos de parada por paso MUST ser éstos, y lo que cada uno deja:
+
+| Paso | La señal se mira | Lo que deja |
+|---|---|---|
+| `plan` | entre pasadas (a lo sumo `PLAN_PASSES`) | nada |
+| `prepare` | al terminar | nada |
+| `translate` | compite con el `spawn_blocking` | nada |
+| `load` | entre llamadas de `LOAD_BATCH` | nada |
+| `decide` | por lote, como en la ruta síncrona | nada |
+| `embed` | compite con cada lote y con el orden por tokens, y se mira antes del snapshot | nada: los vectores se sueltan |
+| `snapshot` | no se corta; se mira al terminar | el snapshot `pre-import`, sin filas; el trabajo termina `cancelled` con `stopped_in: snapshot` |
+| `write` | entre lotes de `note_batches` | notas enteras (IJ7) |
+| `links` | no se corta (una transacción) | la importación entera: el trabajo termina `done` |
+
+El estado final MUST decir lo que pasó: una parada pedida durante el último lote de escritura no encuentra otro lote antes del cual mirarse, así que corre `links` y el trabajo termina `done` (faltan ~1 s para una importación entera; cortar ahí dejaría una parcial que hay que deshacer), con la respuesta del `DELETE` habiendo mostrado `stopping: cancel`. Antes del lote 0 la señal no se mira después del snapshot, de modo que `stopped_in: write` implica al menos un lote confirmado y, con él, un `report`.
+
+Hasta el snapshot, MUST NOT escribirse ninguna fila de `memory`, ninguna fila de `memory_import*` ni ningún snapshot `pre-import`: se conserva «nada antes del snapshot» y el orden global de más a menos tokens. Soltar el `await` de un lote de embedding MUST abandonar ese lote sin API nueva en `Embedder`. `DELETE` de un trabajo en estado final MUST responder su estado sin cambiar nada (idempotente); un id desconocido, `404`.
+
+#### Escenario: cancelar en embedding
+- GIVEN un trabajo real en `embedding`, con un embedder que retiene el lote en vuelo
+- WHEN llega `DELETE`
+- THEN el trabajo termina `cancelled` con `stopped_in: embed`, sin filas nuevas, sin fila de `memory_import` y sin snapshot `pre-import`, y el lote retenido no impide que termine
+
+#### Escenario: cancelar dos veces y cancelar lo terminado
+- GIVEN un trabajo ya `cancelled` y otro `done`
+- WHEN llega otro `DELETE` a cada uno
+- THEN cada uno contesta `200` con su estado y nada cambia; un `DELETE` a un trabajo activo contesta `202` con `stopping`; uno a un id desconocido, `404`
+
+#### Escenario: cancelar durante snapshot
+- GIVEN un trabajo real al que llega el `DELETE` mientras corre `snapshot`
+- WHEN el snapshot termina
+- THEN el trabajo termina `cancelled` con `stopped_in: snapshot`, sin filas, sin fila de `memory_import` y con el snapshot `pre-import` hecho
+
+#### Escenario: cancelar durante links
+- GIVEN un trabajo cuyo `DELETE` llega durante `linking`
+- WHEN la transacción termina
+- THEN el trabajo termina `done` con la importación entera
+
+**Tests:** `deleting_a_job_in_embedding_leaves_no_row_no_journal_and_no_snapshot`, `a_delete_on_a_finished_job_changes_nothing` (que fija el `200`, el `202` del activo con `stopping` y el `404`), `a_delete_during_links_ends_done` y `a_delete_during_snapshot_ends_cancelled_with_the_snapshot_and_no_rows` (`crates/clawg-cli/tests/api.rs` los dos primeros; los de parada determinista en `mod tests` de `crates/clawg-cli/src/daemon/api.rs`, con un `on_step`); `each_step_of_an_import_stops_where_the_table_says` (unidad en `import.rs`, un paso por caso con la señal levantada de antemano o por un gancho de la prueba); `an_abandoned_embedding_batch_does_not_block_the_stop` (unidad en `import.rs` con un `Embedder` de prueba que no responde).
+
+## IJ7. Cancelar en `write` deja notas enteras y libera el número
+
+Una parada en `write` MUST devolver lo confirmado (el `Ledger` de los lotes que se confirmaron y el `import_id`) en vez de un error, y el `report` del trabajo se arma con eso. El store MUST quedar con notas enteras: ninguna fila de `memory_piece` sin la cabeza de su save, y cada nota de otra herramienta completa o ausente. `memory_import.finished_at` MUST quedar `NULL` (la transacción de `links` no corrió). El número MUST soltarse al soltarse el `Journal`, de modo que `clawg import --undo N` deje de ser `Running` (`UndoError::Running`, `crates/clawg-core/src/memory/portability/undo.rs`) y quite lo escrito; una reimportación del mismo archivo MUST hallar presentes esas notas y terminar el resto.
+
+#### Escenario: parada a mitad de la escritura
+- GIVEN un trabajo de notas largas que se para entre dos lotes de escritura
+- WHEN se mira el store, el estado y se corre `--undo N`
+- THEN no hay pieza sin cabeza, el `report` cuenta las notas de los lotes confirmados, el estado trae `import_id` y `--undo` lo quita sin 409
+
+#### Escenario: terminar con una reimportación
+- GIVEN el mismo trabajo parado
+- WHEN se importa otra vez el archivo
+- THEN las notas escritas son presentes, se escribe el resto y los vínculos que faltaron se rellenan
+
+**Tests:** `a_job_stopped_in_writing_leaves_whole_notes_and_frees_its_number` y `importing_again_finishes_a_stopped_job` (`crates/clawg-cli/tests/api.rs`); `a_stop_between_write_batches_returns_the_committed_ledger` (unidad en `import.rs`). Para el flujo `--undo`, `undoing_a_stopped_job_works` (`crates/clawg-cli/tests/api.rs`).
+
+## IJ8. Un trabajo sobrevive al cliente; `POST /v1/import` sigue cancelando
+
+Un trabajo MUST seguir y llegar a `done` si el cliente que lo aceptó cierra la conexión tras el `202`, o si muere el proceso `clawg import` que lo sigue. `POST /v1/import` (síncrono) MUST seguir cancelando la importación cuando el cliente se va: el futuro del handler se suelta y `StopOnDrop` levanta la bandera de `decide`.
+
+#### Escenario: el cliente se va
+- GIVEN un trabajo en `embedding` y el cliente que lo aceptó
+- WHEN el cliente cierra la conexión (en el binario, se mata el proceso de `clawg import`)
+- THEN el trabajo llega a `done`
+
+#### Escenario: guarda del síncrono
+- GIVEN `POST /v1/import` con un embedder lento
+- WHEN el cliente cierra la conexión TCP
+- THEN el futuro del handler se suelta y no queda ninguna fila ni `memory_import`
+
+**Tests:** `a_job_outlives_the_client_that_accepted_it` (`crates/clawg-cli/tests/api.rs`) y `killing_clawg_import_does_not_stop_the_job` (`crates/clawg-cli/tests/binary.rs`, con un proceso que se mata por su propio handle). **Guarda:** `the_synchronous_import_still_cancels_when_the_client_goes` (`crates/clawg-cli/tests/api.rs`), que pasaba antes de la ruta de trabajos y fija que la síncrona no cambió.
+
+## IJ9. El modelo: `wake()` al aceptar, falla en `embed`
+
+Aceptar un trabajo real MUST despertar el modelo (IJ3), de modo que un modelo que la inactividad soltó esté cargado, o su recarga ya haya fallado, antes de la fase `embedding`. No hay guardia de retención: el modelo puede soltarse otra vez por inactividad. Si la recarga falla al llegar a `embed`, el trabajo MUST terminar `failed` con `embedder_not_ready` y MUST NOT escribir nada (ver IJ4).
+
+#### Escenario: recarga antes de embedding
+- GIVEN un daemon con el modelo soltado por inactividad (`Harness::start_unloaded`) y un embedder de prueba que cuenta cargas
+- WHEN se acepta un trabajo real
+- THEN el contador de cargas sube antes de que `phase` sea `embedding`
+
+**Test:** `accepting_a_job_reloads_a_released_model_before_embedding` (`crates/clawg-cli/tests/api.rs`: retiene la conexión del store y mira la carga con el trabajo todavía antes de `embedding`). La falla de la recarga es el escenario de IJ4.
+
+## IJ10. La memoria: el archivo no se copia ni se retiene
+
+El cliente MUST NOT leer el archivo: manda la ruta (IJ15). El daemon MUST NOT bufferear el archivo como cuerpo de la petición ni conservar su texto después del `202` (IJ1). No hay requisito de pico: la medición de memoria (el pico privado del cliente y del daemon por cuerpo y por ruta, en el mismo build, con `CLAWG_TEST_EMBEDDER=fake`) es una anotación de `verify.md`, no una prueba de la suite, y su resultado no cambia ningún requisito.
+
+**Tests:** los de IJ1 (`the_client_sends_a_path_and_not_the_file`, `a_clawg_file_is_parsed_once_for_a_job`); `the_job_route_has_no_body_limit_sized_for_the_file` (`crates/clawg-cli/tests/api.rs`: el cuerpo de `POST /v1/imports` no necesita `IMPORT_BODY_LIMIT`). La medición, en el [verify](../../changes/archive/2026-10-30-import-job/verify.md#la-medición-de-memoria-d10).
+
+## IJ11. `POST /v1/import` no cambia
+
+`POST /v1/import` y `POST /v1/import/undo` MUST NOT cambiar de contrato, de respuestas ni de comportamiento, y las funciones de importación del núcleo MUST recibir, para esas rutas, un control que nadie levanta (el `StopOnDrop` sigue cortando `decide`). El informe, el formato de los archivos y lo que una importación decide MUST NOT cambiar.
+
+**Tests (guardas):** las pruebas de import de `crates/clawg-cli/tests/api.rs` (entre ellas `an_import_stores_rows_with_their_state_and_a_dry_run_stores_none`, `import_answers_400_for_an_unknown_version_before_the_embedder` y `an_import_is_undone_by_its_number`) y las de `import.rs` siguen verdes sin tocarse; `the_report_of_a_job_equals_the_report_of_the_synchronous_import` ( `crates/clawg-cli/tests/api.rs`, mismo archivo por las dos rutas) fija que no cambia el informe.
+
+## IJ15. `clawg import` por la ruta de trabajos
+
+`clawg import FILE` MUST mandar la ruta absoluta del archivo a `POST /v1/imports` sin leerlo, sondear `GET /v1/imports/{id}` cada segundo hasta un estado final e imprimir el informe por stdout con el mismo `render` que la ruta síncrona (`crates/clawg-cli/src/import.rs`), así un script que espera el informe no se rompe. En una terminal MUST mostrar además las fases y los contadores por stderr; `--follow` MUST mostrarlos también fuera de una; sin terminal ni `--follow`, stderr MUST NOT llevar progreso. Ctrl-C MUST mandar `DELETE`, esperar el estado final e imprimir lo escrito, con `clawg import --undo N` cuando el estado trae `import_id`; un segundo Ctrl-C MUST salir sin esperar. Si el daemon desaparece mientras sigue un trabajo, MUST decir el último `import_id` visto y cómo deshacerlo, según la última fase vista: antes de `snapshot`, que no se escribió nada; en `snapshot`, que no se escribió nada y puede haber quedado un snapshot; en `writing` o `linking` con `import_id` K, que la importación K quedó escrita en parte (o entera si estaba en `linking`) y que se deshace con `clawg import --undo K` o se termina importando otra vez el archivo; en `writing` sin `import_id`, que su primer lote pudo escribirse y que una reimportación termina el resto. Un `404` sobre su propio id mientras lo sigue (otro cliente lanzó un trabajo justo después del final de éste y el último terminado ya es otro) MUST tratarse como esa desaparición, con la última vista. Sólo son desaparición una conexión rechazada (`ClientError::NotRunning`), un token rechazado (`Unauthorized`: el daemon es otro) y ese `404`; cualquier otro error del sondeo o del `DELETE` (un `500`, una conexión cortada a mitad de la respuesta) es pasajero, y el CLI MUST preguntar otra vez en el próximo sondeo, o mandar otra vez el `DELETE` que no llegó. Una vista vuelve la cuenta a cero. Tras `MAX_UNANSWERED` (5) errores pasajeros seguidos MUST salir con 1 nombrando el trabajo, la última fase vista y el último error, y diciendo que la importación puede seguir corriendo y que `clawg status` la muestra; MUST NOT decir que el daemon desapareció ni que no se escribió nada, porque el trabajo puede seguir y escribirlo todo. Una parada (`cancelled` o `interrupted`) sin `report` MUST imprimir en qué paso paró y que no se escribió nada (en `snapshot`, además, que el snapshot `pre-import` quedó en `backups`); con `report`, el informe y cuánto se escribió, con `clawg import --undo K` o la reimportación para terminarlo. Un `done` al que se mandó `DELETE` MUST decir que el trabajo estaba en su último paso y terminó. Cualquier final distinto de `done` MUST salir con 1. `--dry-run` MUST ir también como trabajo; `--undo` MUST seguir síncrono y sin cambios. El sondeo MUST vivir en `crates/clawg-cli/src/import.rs`, no en `client.rs`, así `only_health_sets_a_timeout` no cambia. No hay un modo que imprima el id y salga.
+
+#### Escenario: stdout igual, progreso aparte
+- GIVEN un export y un daemon de prueba (`CLAWG_TEST_EMBEDDER=fake`)
+- WHEN se corre `clawg import --follow FILE`
+- THEN stderr trae las fases en el orden de `Step` y stdout es exactamente el `render` del mismo informe
+
+#### Escenario: Ctrl-C
+- GIVEN un import en `writing`
+- WHEN llega Ctrl-C una vez
+- THEN el CLI manda `DELETE`, imprime lo escrito con el `--undo N` y sale con 1; con un segundo Ctrl-C antes del estado final, sale sin esperar
+
+#### Escenario: un error pasajero
+- GIVEN un daemon vivo que responde `500` a algunos sondeos de un trabajo que sigue
+- WHEN el trabajo termina `done` antes del quinto error seguido
+- THEN `clawg import` imprime el informe de siempre y sale con 0; con cinco errores seguidos, sale con 1 sin decir que el daemon desapareció ni que no se escribió nada
+
+**Tests:** `follow_prints_the_phases_in_order_on_stderr_and_the_same_report_on_stdout` (`crates/clawg-cli/tests/binary.rs`); `ctrl_c_sends_the_delete_and_prints_what_was_written` (`binary.rs`, Unix con SIGINT; en Windows, la misma lógica como unidad con la señal inyectada en `import.rs`); `a_second_ctrl_c_leaves_without_waiting`, `any_final_state_but_done_exits_1`, `phases_go_to_stderr_only_on_a_terminal_or_with_follow`, `a_vanished_daemon_names_the_last_import_id`, `a_404_on_its_own_job_while_following_is_a_vanished_daemon`, `a_stop_without_a_report_says_nothing_was_written`, `a_passing_error_asks_again_and_a_view_resets_the_count`, `the_limit_of_passing_errors_fails_without_claiming_the_daemon_went_away` y `a_delete_that_meets_a_passing_error_is_sent_again` (unidades puras en `crates/clawg-cli/src/import.rs`, sobre la decisión de qué imprimir y qué código devolver); `a_daemon_that_fails_a_poll_and_goes_on_does_not_end_the_import` (`import.rs`, contra un daemon de prueba) y `only_a_refused_connection_a_new_token_or_an_unknown_job_mean_the_daemon_went_away` (`client.rs`); `the_job_poll_lives_outside_the_client_and_sets_no_timeout` (guarda: `only_health_sets_a_timeout` sigue verde y las importaciones por el binario de `binary.rs` siguen verdes).
+
+## IJ16. Un CLI nuevo frente a un daemon sin la ruta
+
+Si `POST /v1/imports` responde un `404` cuyo cuerpo no es un objeto JSON con `error` de texto (`route_missing`, una función pura; un `404` propio del daemon lo lleva, mientras que el que sale del fallback por defecto de axum, que `router` no reemplaza, no tiene cuerpo), el CLI MUST NOT volver al cuerpo de `POST /v1/import` ni mandar nada del archivo; MUST decir que el daemon que corre es anterior a este clawg y que `clawg stop` hace que el próximo arranque use esta versión, con la frase de `version_warning` (`crates/clawg-cli/src/memories.rs`) y la versión que da `/health`, y salir con 1. Si las versiones coinciden (una build de desarrollo anterior a la ruta), la frase MUST decir que el daemon es una build anterior de la misma versión y que `clawg stop` hace que el próximo arranque use ésta. Un `404` del daemon nuevo (un `project_map` a un proyecto que no está, IJ2) lleva `error` y MUST seguir siendo un error del daemon, no un daemon anterior.
+
+#### Escenario: daemon anterior
+- GIVEN un daemon de prueba que no sirve `/v1/imports`
+- WHEN se corre `clawg import FILE`
+- THEN sale con 1, el daemon recibió sólo el `POST` con la ruta y nada del contenido del archivo, y la salida es la frase de `version_warning`
+
+**Tests:** `import_against_a_daemon_without_the_job_route_exits_1_without_sending_the_file` (`crates/clawg-cli/tests/binary.rs`, con un servidor de prueba con el fallback por defecto de axum que registra lo que recibe) y `route_missing_tells_a_bodyless_404_from_the_daemons_own` (unidad pura en `crates/clawg-cli/src/client.rs`: un `404` sin cuerpo, con un cuerpo que no es JSON o sin `error` es la ruta ausente; uno con `{"error": …}` no).
+
+## IJ17. El CLI habla el idioma de la preferencia
+
+Todo lo que `clawg import` imprime por primera vez en este cambio (las fases y contadores, el mensaje de Ctrl-C, el de daemon desaparecido, el de daemon anterior, el de trabajo `failed`/`cancelled`/`interrupted`) MUST decirse en el idioma de `preferences.json`, un `match` sobre `Lang` por frase, y en inglés sin preferencia, como los demás comandos (`.claude/CLAUDE.md`, párrafo de `preferences.json`). Los identificadores (`phase`, `job_id`, `import_id`, códigos de error, comandos, códigos de salida) y la causa técnica de una falla MUST quedar como vienen.
+
+**Test:** `the_job_messages_speak_both_languages` (unidad en `crates/clawg-cli/src/import.rs`, junto a `the_undo_report_speaks_spanish`).

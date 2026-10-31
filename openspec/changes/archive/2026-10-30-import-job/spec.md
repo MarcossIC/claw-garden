@@ -1,6 +1,6 @@
 # import-job — Especificación
 
-Suma requisitos a [`specs/portability`](../../specs/portability/spec.md), IJ1 a IJ11 y IJ15 a IJ17, y modifica R3 y HI16; a [`specs/daemon-access`](../../specs/daemon-access/spec.md), IJ12 a IJ14, que agregan las rutas de trabajos, el bloque `import` de `/health` y las filas de `PROJECT_INPUTS`; y a [`specs/storage`](../../specs/storage/spec.md), IJ18, que modifica «Cada fase del apagado tiene tope». IJ19 es transversal: no cambia ningún esquema.
+Suma requisitos a [`specs/portability`](../../../specs/portability/spec.md), IJ1 a IJ11 y IJ15 a IJ17, y modifica R3 y HI16; a [`specs/daemon-access`](../../../specs/daemon-access/spec.md), IJ12 a IJ14, que agregan las rutas de trabajos, el bloque `import` de `/health` y las filas de `PROJECT_INPUTS`; y a [`specs/storage`](../../../specs/storage/spec.md), IJ18, que modifica «Cada fase del apagado tiene tope». IJ19 es transversal: no cambia ningún esquema.
 
 Las decisiones y lo descartado están en la [propuesta](proposal.md) y la [exploración](exploration.md); acá sólo el contrato y la prueba que lo fija. Una «prueba propuesta» es una que hoy no existe y falla (o no compila) antes del cambio; una «guarda» ya pasa hoy y debe seguir pasando. Los nombres de prueba son los que el cambio debe escribir; el diseño puede afinarlos sin cambiar la intención.
 
@@ -271,7 +271,7 @@ Si `POST /v1/imports` responde un `404` cuyo cuerpo no es un objeto JSON con `er
 #### Escenario: daemon anterior
 - GIVEN un daemon de prueba que no sirve `/v1/imports`
 - WHEN se corre `clawg import FILE`
-- THEN sale con 1, el daemon no recibió el archivo ni su ruta, y la salida es la frase de `version_warning`
+- THEN sale con 1, el daemon recibió sólo el `POST` con la ruta y nada del contenido del archivo, y la salida es la frase de `version_warning`
 
 **Tests (propuestos):** `import_against_a_daemon_without_the_job_route_exits_1_without_sending_the_file` (`crates/clawg-cli/tests/binary.rs`, con un servidor de prueba con el fallback por defecto de axum que registra lo que recibe) y `route_missing_tells_a_bodyless_404_from_the_daemons_own` (unidad pura en `crates/clawg-cli/src/client.rs`: un `404` sin cuerpo, con un cuerpo que no es JSON o sin `error` es la ruta ausente; uno con `{"error": …}` no).
 
