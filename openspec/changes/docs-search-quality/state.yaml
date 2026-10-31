@@ -8,11 +8,11 @@ artifacts:
   spec: done  # DQ1 a DQ5 entran; DQ6 a DQ9 detrás de su puerta
   design: done
   tasks: done
-  apply: in_progress  # tareas 1 a 3 (paso 1, sin el modelo real); la 4 y siguientes necesitan el modelo real
+  apply: in_progress  # paso 1 y golden ampliado hechos y medidos; 2a medida, no pasó y se revirtió; 2b a 2e, paso 3 y paso 4 sin empezar
   verify: pending
   archive: pending  # specs/eval ya tiene IC3 a IC8 de docs-index-cost, cuyo bloque index va en el archivo de DQ3 y se lee con el --diff de DQ4: al archivar, DQ3 y DQ4 se integran ahí
 gates:
-  "2": pending  # expresión léxica de docs: ninguna pregunta sale del top 3 y +2 en Hit@3
+  "2": pending  # expresión léxica de docs: ninguna pregunta sale del top 3 y +2 en Hit@3. 2a no pasó (Hit@3 −1, revertida); 2b a 2e sin medir
   "3": pending  # identificadores partidos, misma puerta
   "4": pending  # prefijo de docs, misma puerta
-updated: 2026-10-30
+updated: 2026-10-31

@@ -28,7 +28,7 @@ Requisitos en la [spec](spec.md) (DQ1 a DQ9) y decisiones en el [diseño](design
 
 Con el embedder falso (sólo comprueba la tubería, sus números no miden nada), sobre este repo el 2026-10-30: `indexed 726 docs into 14068 passages (2 skipped)` y `left out 1 doc quoting a question: openspec/changes/archive/2026-10-15-project-indexing/verify.md`, el único que cita las preguntas.
 
-- [ ] `rag-eval --real --docs` sobre el commit anterior a la tarea 1 y sobre la tarea 3: anotar en `verify.md` Hit@1/3/5 y MRR@10 de docs y código, cuántos docs se dejaron fuera y cuáles, y el tiempo de indexado. El primer número no tiene archivo (la tarea 2 no existía); se anota de stdout.
+- [x] `rag-eval --real --docs` sobre el commit anterior a la tarea 1 y sobre la tarea 3: anotar en `verify.md` Hit@1/3/5 y MRR@10 de docs y código, cuántos docs se dejaron fuera y cuáles, y el tiempo de indexado. El primer número no tiene archivo (la tarea 2 no existía); se anota de stdout. La corrida de la tarea 3 se cortó por falta de memoria, y en su lugar se toma `cost-d` (`0f09b2b`), que ya tiene el filtro y el golden de 40.
 
 ## Golden ampliado (DQ5)
 
@@ -41,16 +41,18 @@ El set de 15 tenía casos rotos en silencio, porque `check_corpus` mira la ruta 
 - Commit: `feat(eval): refuse an expected heading no passage ends in`
 - [x] RED: `the_shipped_golden_set_names_docs_this_workspace_has` pasa a exigir al menos 40 casos, 15 de docs y 15 de código.
 - [x] GREEN: las preguntas nuevas, escritas sin las palabras del pasaje que las responde. Comprobado con los tokens del FTS de docs (`unicode61 remove_diacritics 2`, sin stemming, con la ruta y el heading del breadcrumb): ninguna comparte con su pasaje más que palabras vacías. d11 y d14 esperan también la otra respuesta que el repo tiene (`R6. Firma y claves` de la spec de release y su copia archivada; `update/client.rs`).
-- [ ] Línea base del set ampliado con `--real` (necesita el modelo real).
+- [x] Línea base del set ampliado con `--real`: `dq-base` en `verify.md`.
 - Commit: `test(eval): widen the docs golden set`
+- [x] Mover la referencia de `.claude/CLAUDE.md` a `docs/reference/` (`5d5fbe3`) quitó d16, que sólo respondían archivos de instrucciones para agentes, y dejó el set en 39. d21 la reemplaza con un id nuevo, para que un `--diff` contra una corrida vieja no una dos preguntas distintas.
+- Commit: `test(eval): ask the docs golden set how another agent's memories are shown`
 
 ## Paso 2: expresión léxica de docs (DQ6; D3) — puerta: propuesta, decisión 4
 
 ### 6. 2a, palabras vacías y tokens cortos
 
-- [ ] RED: tabla de casos de `docs_match_expression` (la pregunta larga, el identificador corto, sólo vacías); `rare_words_beat_stopwords_in_the_lexical_channel` (`project_docs/mod.rs`).
-- [ ] GREEN: `DOCS_STOPWORDS`, `docs_match_expression`, `search` la usa; `fts_match_expression` sin cambios.
-- [ ] Medición contra la línea base; si no pasa la puerta, se revierte y se anota.
+- [x] RED: tabla de casos de `docs_match_expression` (la pregunta larga, el identificador corto, sólo vacías); `rare_words_beat_stopwords_in_the_lexical_channel` (`project_docs/mod.rs`).
+- [x] GREEN: `DOCS_STOPWORDS`, `docs_match_expression`, `search` la usa; `fts_match_expression` sin cambios.
+- [x] Medición contra la línea base; si no pasa la puerta, se revierte y se anota. No pasó: Hit@3 −1, con d01 y c14 fuera del top 3 (`verify.md`). Se revirtió en `51c3a6b`.
 
 ### 7 a 10. 2b orden por rareza, 2c AND con respaldo OR, 2d repetidos, 2e rutas como frase
 
