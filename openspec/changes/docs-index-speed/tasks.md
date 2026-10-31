@@ -57,8 +57,8 @@ Antes del primer test: `cargo clean --workspace --target-dir target-test`. Ning�
 ### 6. El caso nuevo de `e5_golden` (IS4; D7) — espera la Parte 2a
 
 - [x] RED (escrito en el árbol, sin commitear): en `crates/clawg-core/tests/e5_golden.rs`, el caso `a batch of 17, longest first` después de `a batch of 17` (`:206`): los mismos 17 textos (`:176-183`), una sola llamada, en el orden de `eval_api::passage_order`. `the_vectors_are_the_ones_fastembed_gave` (ignorado) lo incluye. Test nuevo, que corre con la suite: `a_batch_longest_first_stays_within_the_tolerance_of_the_batch_in_order` (lee sólo la fixture; por texto, diferencia mayor ≤ 1e-6, nombra texto y diferencia; imprime cuántos dan los mismos bits). Falla mientras la fixture no tenga el caso.
-- [ ] Este grupo NO se commitea en la Parte 1: el test no pasa sin el bless y la suite se rompería. Se deja el árbol con estos cambios (sin `git add`) y se pasa a la Parte 2a, o se guarda como parche fuera del repo.
-- [ ] Docs: `docs/reference/testing.md`, si habla de los casos de `e5_golden`.
+- [x] Este grupo NO se commitea en la Parte 1: el test no pasa sin el bless y la suite se rompería. Se deja el árbol con estos cambios (sin `git add`) y se pasa a la Parte 2a, o se guarda como parche fuera del repo.
+- [x] Docs: `docs/reference/testing.md`, si habla de los casos de `e5_golden`. No los describe, así que no cambia.
 - Commit (después de 2a y 2b): `test(embedder): pin the vectors of a batch embedded longest first`, con `crates/clawg-core/tests/e5_golden.rs`, `crates/clawg-core/tests/fixtures/e5_golden.json` y la doc.
 
 ### Cierre de la Parte 1
@@ -69,7 +69,7 @@ Los grupos 1 a 5 se commitean y se comprueban cada uno con sus archivos. La suit
 
 Una a la vez, sin otra compilación ni prueba en marcha. Usan el modelo del perfil dev (`~/.clawg-dev/models`, sólo lectura), nunca `~/.clawg`. No matar ningún `clawg.exe`. Cada ítem marca qué necesita.
 
-- [ ] 2a. Bless de `e5_golden` (modelo real, autorización, máquina de la fixture: Windows `x86_64` con AVX2, AVX-512F y FMA): `CLAWG_BLESS=1 CLAWG_E5_MODEL_DIR=<data dir dev>/models/multilingual-e5-small cargo test -p clawg-core --features eval --target-dir target-test --test e5_golden -- --ignored the_vectors_are_the_ones_fastembed_gave` (el target pide `eval`, `e5_golden.rs:14`). Antes, comprobar que la huella de la fixture es la de la máquina. Revisar `git diff` de `crates/clawg-core/tests/fixtures/e5_golden.json`: sólo debe agregar el caso nuevo. Correr sin `CLAWG_BLESS`: `CLAWG_E5_MODEL_DIR=… cargo test -p clawg-core --features eval --target-dir target-test --test e5_golden -- --include-ignored` (incluye el test sobre la fixture). Commitear el grupo 6.
+- [x] 2a. Bless de `e5_golden` (modelo real, autorización, máquina de la fixture: Windows `x86_64` con AVX2, AVX-512F y FMA): `CLAWG_BLESS=1 CLAWG_E5_MODEL_DIR=<data dir dev>/models/multilingual-e5-small cargo test -p clawg-core --features eval --target-dir target-test --test e5_golden -- --ignored the_vectors_are_the_ones_fastembed_gave` (el target pide `eval`, `e5_golden.rs:14`). Antes, comprobar que la huella de la fixture es la de la máquina. Revisar `git diff` de `crates/clawg-core/tests/fixtures/e5_golden.json`: sólo debe agregar el caso nuevo. Correr sin `CLAWG_BLESS`: `CLAWG_E5_MODEL_DIR=… cargo test -p clawg-core --features eval --target-dir target-test --test e5_golden -- --include-ignored` (incluye el test sobre la fixture). Commitear el grupo 6.
   - Si algún texto difiere más de 1e-6 entre `a batch of 17` y el caso nuevo, el paso cae (propuesta, decisión 4). En ese caso:
     - Se corre igual 2b y sus números se anotan en `verify.md`.
     - No se commitea el grupo 6 y se descartan sus cambios.
