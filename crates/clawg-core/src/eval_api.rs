@@ -1321,6 +1321,39 @@ pub struct EvalDocReport {
     pub skipped: usize,
 }
 
+/// Where one doc spent its time in a refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvalPhases {
+    pub read: std::time::Duration,
+    pub mask: std::time::Duration,
+    pub split: std::time::Duration,
+    pub lookup: std::time::Duration,
+    pub embed: std::time::Duration,
+    pub write: std::time::Duration,
+}
+
+/// One doc a refresh went through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalDocTiming {
+    /// Relative to the root, `/`-separated. It stays with the caller: the
+    /// results never carry it.
+    pub path: String,
+    pub code: bool,
+    pub passages: usize,
+    pub phases: EvalPhases,
+}
+
+/// What indexing a root found and wrote, and where it spent its time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalIndexRun {
+    pub report: EvalDocReport,
+    /// Walking, reading and hashing the whole tree and planning the refresh.
+    pub scan: std::time::Duration,
+    /// Dropping the docs that are gone.
+    pub remove: std::time::Duration,
+    pub docs: Vec<EvalDocTiming>,
+}
+
 /// One passage a doc search returned, ranked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalDocHit {
@@ -1347,18 +1380,41 @@ impl EvalDocIndex {
 
     /// Indexes the docs under `root` but those at the relative paths in
     /// `left_out`, which the index never sees.
-    pub async fn index(&self, root: &Path, left_out: &[String]) -> Result<EvalDocReport, EvalError> {
+    pub async fn index(&self, root: &Path, left_out: &[String]) -> Result<EvalIndexRun, EvalError> {
         let left_out: std::collections::HashSet<String> = left_out.iter().cloned().collect();
-        let r = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root, &left_out)
+        let run = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root, &left_out)
             .await
-            .map_err(|e| EvalError::Insert(e.to_string()))?
-            .report;
+            .map_err(|e| EvalError::Insert(e.to_string()))?;
+        let r = run.report;
         // A measurement without a doc measures another corpus, so a doc the
         // daemon would skip and retry fails the run here.
         if let Some(f) = r.failed.first() {
             return Err(EvalError::Insert(format!("{} could not be indexed: {}", f.path, f.reason)));
         }
-        Ok(EvalDocReport { docs: r.docs, passages: r.passages, skipped: r.skipped })
+        let docs = run
+            .timing
+            .docs
+            .into_iter()
+            .map(|d| EvalDocTiming {
+                code: matches!(d.kind, project_docs::corpus::DocKind::Code(_)),
+                path: d.path,
+                passages: d.passages,
+                phases: EvalPhases {
+                    read: d.phases.read,
+                    mask: d.phases.mask,
+                    split: d.phases.split,
+                    lookup: d.phases.lookup,
+                    embed: d.phases.embed,
+                    write: d.phases.write,
+                },
+            })
+            .collect();
+        Ok(EvalIndexRun {
+            report: EvalDocReport { docs: r.docs, passages: r.passages, skipped: r.skipped },
+            scan: run.timing.scan,
+            remove: run.timing.remove,
+            docs,
+        })
     }
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<EvalDocHit>, EvalError> {
@@ -2653,13 +2709,42 @@ mod tests {
         std::fs::write(root.path().join("notes.txt"), "not a doc").unwrap();
 
         let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
-        let report = index.index(root.path(), &[]).await.unwrap();
+        let report = index.index(root.path(), &[]).await.unwrap().report;
         let hits = index.search("daemon", 5).await.unwrap();
 
         assert_eq!(report, EvalDocReport { docs: 1, passages: 2, skipped: 0 });
         assert_eq!(doc_paths(root.path()).unwrap(), ["README.md"]);
         assert!(is_code_path("src/lib.rs") && !is_code_path("README.md"));
         assert_eq!(hits[0], EvalDocHit { path: "README.md".into(), breadcrumb: "README.md > Guía > Uso".into() });
+    }
+
+    #[tokio::test]
+    async fn an_index_run_carries_the_timings_of_the_refresh() {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        std::fs::write(root.path().join("a.md"), "# A
+alpha passage
+").unwrap();
+        std::fs::write(root.path().join("b.md"), "# B
+## One
+first
+## Two
+second
+").unwrap();
+        std::fs::write(root.path().join("c.rs"), "fn main() {}
+").unwrap();
+
+        let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
+        let run = index.index(root.path(), &[]).await.unwrap();
+        index.close().await.unwrap();
+
+        let mut docs: Vec<(&str, bool)> = run.docs.iter().map(|d| (d.path.as_str(), d.code)).collect();
+        docs.sort();
+        assert_eq!(docs, [("a.md", false), ("b.md", false), ("c.rs", true)]);
+        assert_eq!(run.docs.iter().map(|d| d.passages).sum::<usize>(), run.report.passages);
+        assert_eq!(run.report.docs, 3);
+        assert!(run.scan > std::time::Duration::ZERO, "the walk of the tree is measured");
+        assert!(run.docs.iter().all(|d| d.phases.embed > std::time::Duration::ZERO || d.passages == 0));
     }
 
     #[tokio::test]

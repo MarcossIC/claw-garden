@@ -847,7 +847,7 @@ mod tests {
     async fn index(embedder: &EvalEmbedder, root: &Path) -> (EvalDocReport, Vec<(String, i64, Vec<u8>)>) {
         let store_dir = crate::test_dir::test_dir();
         let index = EvalDocIndex::open(store_dir.path(), embedder, store_dir.path()).await.unwrap();
-        let report = index.index(root, &[]).await.unwrap();
+        let report = index.index(root, &[]).await.unwrap().report;
         let vectors = index
             .store
             .conn

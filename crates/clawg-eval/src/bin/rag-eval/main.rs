@@ -5,6 +5,7 @@ mod diff;
 mod docs;
 mod follow_up;
 mod golden;
+mod index_cost;
 mod lang_detect;
 mod metrics;
 mod report;

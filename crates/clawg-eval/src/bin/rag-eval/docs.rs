@@ -5,12 +5,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clawg_core::eval_api::{doc_paths, is_code_path, EvalDocHit, EvalDocIndex, EvalDocReport, EvalEmbedder, EvalError};
+use clawg_core::eval_api::{
+    doc_paths, is_code_path, session_threads, EvalCpu, EvalDocHit, EvalDocIndex, EvalDocReport, EvalEmbedder, EvalError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::Cli;
 use crate::diff::{metric_line, verdict, MetricDiff, METRIC_HEADER};
+use crate::index_cost::{IndexBlock, Phases};
 use crate::report::{Mode, ReportError};
 use crate::stats::{paired_bootstrap_ci, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED};
 use crate::{EXIT_GOLDEN_INVALID, EXIT_OK, EXIT_RESULTS_EXISTS, EXIT_RUNTIME_FAILURE};
@@ -224,14 +227,21 @@ fn left_out_line(left_out: &[String]) -> String {
     }
 }
 
-pub fn render(report: &EvalDocReport, took: Duration, left_out: &[String], results: &[CaseResult<'_>]) -> String {
+pub fn render(
+    report: &EvalDocReport,
+    took: Duration,
+    left_out: &[String],
+    results: &[CaseResult<'_>],
+    phases: &Phases,
+) -> String {
     let all: Vec<&CaseResult<'_>> = results.iter().collect();
     let mut out = format!(
-        "indexed {} docs into {} passages ({} skipped) in {:.1} s\n{}{}",
+        "indexed {} docs into {} passages ({} skipped) in {:.1} s\n{}{}{}",
         report.docs,
         report.passages,
         report.skipped,
         took.as_secs_f64(),
+        phases.line(),
         left_out_line(left_out),
         score_line(&all),
     );
@@ -311,6 +321,7 @@ pub struct DocsResults {
     pub cases: usize,
     pub corpus: DocsCorpus,
     pub index_seconds: f64,
+    pub index: IndexBlock,
     pub aggregate: DocsAggregate,
     pub per_case: Vec<CaseRank>,
 }
@@ -325,6 +336,7 @@ impl DocsResults {
         left_out: &[String],
         took: Duration,
         results: &[CaseResult<'_>],
+        index: IndexBlock,
     ) -> Self {
         let score_of = |code: Option<bool>| {
             let ranks: Vec<Option<usize>> =
@@ -347,6 +359,7 @@ impl DocsResults {
                 left_out: left_out.to_vec(),
             },
             index_seconds: took.as_secs_f64(),
+            index,
             aggregate: DocsAggregate {
                 all: score_of(None).unwrap_or(score(&[])),
                 docs: score_of(Some(false)),
@@ -707,14 +720,15 @@ async fn measure_with(
     }
 
     let started = Instant::now();
-    let report = match index.index(&cli.docs_root, left_out).await {
-        Ok(report) => report,
+    let run = match index.index(&cli.docs_root, left_out).await {
+        Ok(run) => run,
         Err(e) => {
             eprintln!("indexing {} failed: {e}", cli.docs_root.display());
             return EXIT_RUNTIME_FAILURE;
         }
     };
     let took = started.elapsed();
+    let report = run.report;
 
     let mut results = Vec::with_capacity(cases.len());
     for case in cases {
@@ -732,11 +746,19 @@ async fn measure_with(
             code: is_code_path(&case.expected[0].path),
         });
     }
-    print!("{}", render(&report, took, left_out, &results));
+    print!("{}", render(&report, took, left_out, &results, &Phases::of(&run)));
     let Some(stamp) = output.stamp else {
         return EXIT_OK;
     };
-    let file = DocsResults::new(stamp, output.golden_sha256, &report, left_out, took, &results);
+    let threads = match session_threads() {
+        Ok(threads) => threads,
+        Err(e) => {
+            eprintln!("{e}");
+            return EXIT_RUNTIME_FAILURE;
+        }
+    };
+    let block = IndexBlock::new(&run, None, EvalCpu::this(), threads, cfg!(debug_assertions));
+    let file = DocsResults::new(stamp, output.golden_sha256, &report, left_out, took, &results, block);
     match write_results(&file, &cli.out_dir, cli.force) {
         Ok(path) => {
             println!("results written to {}", path.display());
@@ -756,6 +778,7 @@ async fn measure_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clawg_core::eval_api::{EvalCpu, EvalDocTiming, EvalIndexRun, EvalMemoReport, EvalPhases};
 
     fn hit(path: &str, breadcrumb: &str) -> EvalDocHit {
         EvalDocHit { path: path.to_string(), breadcrumb: breadcrumb.to_string() }
@@ -897,9 +920,9 @@ mod tests {
         let results = [CaseResult { case: &cases[0], rank: Some(1), top: None, code: false }];
         let report = EvalDocReport { docs: 1, passages: 1, skipped: 0 };
 
-        let none = render(&report, Duration::ZERO, &[], &results);
-        let one = render(&report, Duration::ZERO, &["notes/verify.md".to_string()], &results);
-        let two = render(&report, Duration::ZERO, &["a/x.md".to_string(), "b/y.md".to_string()], &results);
+        let none = render(&report, Duration::ZERO, &[], &results, &Phases::default());
+        let one = render(&report, Duration::ZERO, &["notes/verify.md".to_string()], &results, &Phases::default());
+        let two = render(&report, Duration::ZERO, &["a/x.md".to_string(), "b/y.md".to_string()], &results, &Phases::default());
 
         assert!(none.contains("\nleft out 0 docs quoting a question\n"), "{none}");
         assert!(one.contains("\nleft out 1 doc quoting a question: notes/verify.md\n"), "{one}");
@@ -918,7 +941,41 @@ mod tests {
             &["notes/verify.md".to_string()],
             Duration::from_millis(2500),
             &results,
+            sample_block(None),
         )
+    }
+
+    fn doc_timing(path: &str, code: bool, passages: usize, ms: [u64; 6]) -> EvalDocTiming {
+        let [read, mask, split, lookup, embed, write] = ms.map(Duration::from_millis);
+        EvalDocTiming { path: path.to_string(), code, passages, phases: EvalPhases { read, mask, split, lookup, embed, write } }
+    }
+
+    /// 2 docs, 5 passages, in quarter seconds so every sum is exact in binary.
+    fn sample_run() -> EvalIndexRun {
+        EvalIndexRun {
+            report: EvalDocReport { docs: 2, passages: 5, skipped: 1 },
+            scan: Duration::from_millis(500),
+            remove: Duration::from_millis(250),
+            docs: vec![
+                doc_timing("secret/area/guide.md", false, 3, [250, 500, 1000, 0, 3000, 750]),
+                doc_timing("crates/hidden/src/lib.rs", true, 2, [250, 250, 500, 250, 1000, 250]),
+            ],
+        }
+    }
+
+    fn sample_block(memo: Option<&EvalMemoReport>) -> IndexBlock {
+        IndexBlock::new(&sample_run(), memo, EvalCpu::this(), 8, true)
+    }
+
+    fn memo_of(from_memo: usize, embedded: usize) -> EvalMemoReport {
+        EvalMemoReport {
+            file: "memo.bin".to_string(),
+            used: true,
+            from_memo,
+            embedded,
+            seconds: 0.5,
+            warnings: vec!["a warning that is not for the file".to_string()],
+        }
     }
 
     fn two_cases() -> Vec<DocsCase> {
@@ -953,6 +1010,90 @@ mod tests {
         assert!(json.get("tag").is_none());
         let text = json.to_string();
         assert!(!text.contains("first?"), "no question text: {text}");
+    }
+
+    #[test]
+    fn the_index_block_reports_the_memo_and_the_phases() {
+        let run = EvalIndexRun { report: EvalDocReport { docs: 2, passages: 100, skipped: 0 }, ..sample_run() };
+        let with = serde_json::to_value(IndexBlock::new(&run, Some(&memo_of(30, 70)), EvalCpu::this(), 8, true)).unwrap();
+        let without = serde_json::to_value(IndexBlock::new(&run, None, EvalCpu::this(), 8, false)).unwrap();
+
+        assert_eq!(with["memo"], serde_json::json!({"used": true, "from_memo": 30, "embedded": 70, "seconds": 0.5}));
+        assert_eq!(without["memo"], serde_json::json!({"used": false, "from_memo": 0, "embedded": 100, "seconds": 0.0}));
+        assert_eq!(
+            with["phases"],
+            serde_json::json!({"scan": 0.5, "read": 0.5, "mask": 0.75, "split": 1.5, "lookup": 0.25, "embed": 4.0, "write": 1.25}),
+            "the removal counts as a write"
+        );
+        assert_eq!(with["phases"], without["phases"]);
+        assert_eq!((with["build"].as_str(), without["build"].as_str()), (Some("debug"), Some("release")));
+        let cpu = EvalCpu::this();
+        assert_eq!(with["machine"]["os"], cpu.os.as_str());
+        assert_eq!(with["machine"]["arch"], cpu.arch.as_str());
+        assert_eq!(with["machine"]["avx2"], cpu.avx2);
+        assert_eq!(with["machine"]["threads"], 8);
+    }
+
+    #[test]
+    fn the_index_block_holds_no_text_and_no_path() {
+        let text = serde_json::to_string(&sample_block(Some(&memo_of(1, 4)))).unwrap();
+
+        for secret in ["secret", "area", "guide", "crates", "hidden", "lib.rs", "memo.bin", "warning"] {
+            assert!(!text.contains(secret), "{secret} leaked into {text}");
+        }
+    }
+
+    #[test]
+    fn index_seconds_and_corpus_keep_their_shape() {
+        let cases = two_cases();
+        let json = serde_json::to_value(two_results(&cases)).unwrap();
+
+        assert!(json["index_seconds"].is_f64(), "{}", json["index_seconds"]);
+        let mut corpus: Vec<&str> = json["corpus"].as_object().unwrap().keys().map(String::as_str).collect();
+        corpus.sort();
+        assert_eq!(corpus, ["docs", "left_out", "passages", "skipped"]);
+        assert!(json["corpus"]["docs"].is_u64() && json["corpus"]["left_out"].is_array());
+        assert_eq!(json["index"]["build"], "debug");
+        let keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+        let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+        assert!(at("index_seconds") < at("index") && at("index") < at("aggregate"), "{keys:?}");
+    }
+
+    #[test]
+    fn a_results_file_without_an_index_block_still_diffs() {
+        let old = docs_file("g", &[], &[("q1", false, Some(1)), ("q2", false, Some(4))]);
+        let cases = two_cases();
+        let new = serde_json::to_value(two_results(&cases)).unwrap();
+        assert!(new.get("index").is_some());
+
+        let diff = diff_values(&old, &new).unwrap().expect("two docs files");
+
+        assert_eq!(diff.all.joined, 2);
+        assert!(!render_diff(&diff).contains("index"), "no time is compared");
+    }
+
+    #[test]
+    fn a_results_file_with_an_index_block_still_diffs_against_an_old_one() {
+        let old = docs_file("g", &[], &[("q1", false, Some(1)), ("q2", false, Some(4))]);
+        let cases = two_cases();
+        let new = serde_json::to_value(two_results(&cases)).unwrap();
+
+        let diff = diff_values(&new, &old).unwrap().expect("two docs files");
+
+        assert_eq!(diff.all.joined, 2);
+        assert!(!render_diff(&diff).contains("index"), "no time is compared");
+    }
+
+    #[test]
+    fn the_report_shows_the_phases_after_its_first_line() {
+        let cases = two_cases();
+        let results = [CaseResult { case: &cases[0], rank: Some(1), top: None, code: false }];
+        let phases = Phases::of(&sample_run());
+
+        let text = render(&EvalDocReport { docs: 2, passages: 5, skipped: 1 }, Duration::from_millis(2500), &[], &results, &phases);
+
+        assert!(text.starts_with("indexed 2 docs into 5 passages (1 skipped) in 2.5 s\nphases: scan 0.50 s  read 0.50 s"), "{text}");
+        assert!(text.contains("embed 4.00 s  write 1.25 s\nleft out 0 docs"), "{text}");
     }
 
     #[test]
@@ -1056,7 +1197,7 @@ mod tests {
         ];
         let report = EvalDocReport { docs: 2, passages: 7, skipped: 1 };
 
-        let text = render(&report, Duration::from_millis(1500), &[], &results);
+        let text = render(&report, Duration::from_millis(1500), &[], &results, &Phases::default());
 
         assert!(text.starts_with("indexed 2 docs into 7 passages (1 skipped) in 1.5 s\n"), "{text}");
         assert!(text.contains("Hit@1 0.50  Hit@3 0.50  Hit@5 0.50  MRR@10 0.50  over 2 questions"), "{text}");
@@ -1078,7 +1219,7 @@ mod tests {
             CaseResult { case: &cases[2], rank: Some(2), top: None, code: true },
         ];
 
-        let text = render(&EvalDocReport { docs: 3, passages: 3, skipped: 0 }, Duration::ZERO, &[], &results);
+        let text = render(&EvalDocReport { docs: 3, passages: 3, skipped: 0 }, Duration::ZERO, &[], &results, &Phases::default());
 
         assert!(text.contains("  docs  Hit@1 0.00  Hit@3 0.00  Hit@5 0.00  MRR@10 0.00  over 1 questions\n"), "{text}");
         assert!(text.contains("  code  Hit@1 0.50  Hit@3 1.00  Hit@5 1.00  MRR@10 0.75  over 2 questions\n"), "{text}");
