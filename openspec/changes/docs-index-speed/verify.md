@@ -120,3 +120,130 @@ Los dos pares limpios dan lo mismo, uno en cada régimen, y los promedios de las
 | decisión 4 de la propuesta | 0 bits movidos (arriba) | ✅ |
 
 **A1 se queda.** Lo que sigue es A2, que se especifica y se diseña con esta corrida como base. Su puerta es (`padded_sorted_in_doc` − `padded_sorted_all`) / `padded`: 0,162 en R y (7 282 905 − 5 849 005) / 8 765 221 = 0,164 en este corpus. Su «se queda si» compara contra corridas del paso de A1, en las mismas condiciones.
+
+## A1: verificación del código (2026-10-31)
+
+Verifica el código de A1, los commits `ad22dad`, `e81deed`, `eebaf09`, `eedd2f7`, `f663d3b` y `3d7ae94` (`git diff 30bf545..1c806ac -- crates docs/reference`, sin los archivos del merge `eafcb8a`), contra la [spec](spec.md) (IS1 a IS5), el [diseño](design.md) (D1 a D7) y la Parte 1 de [tasks.md](tasks.md). Los resultados con el modelo real (los bits y «se queda si») son los de arriba y no se volvieron a correr.
+
+- **El árbol.** Cuando empezó la verificación, `HEAD` ya era `67914fc`, un merge de `develop` posterior a `1c806ac` que trae agent-eval. No toca ningún archivo de A1: en `crates/clawg-core` sólo agrega `eval_api::earned_tier` y su prueba, y en `crates/clawg-eval` el binario `agent-eval`. Todo se corrió sobre `67914fc`, sin cambiar de rama. Por eso, al final, `git diff 1c806ac -- crates` no da vacío (trae ese merge), y la comprobación que vale es `git diff HEAD -- crates`, que sí da vacío.
+- **El build.** Antes de la primera prueba se corrió `cargo clean --workspace --target-dir target-test`. Sólo se usó `target-test`. No hubo build release, ni modelo real, ni `CLAWG_BLESS`, ni pruebas `#[ignore]`, ni acceso a `~/.clawg*`.
+- **Las mutaciones.** Cada una se aplicó sobre el árbol limpio y se revirtió con `git restore` del archivo antes de la siguiente. Casi todas se corrieron con `cargo test -p clawg-core --features eval --target-dir target-test --lib --no-fail-fast`. Las que tocan `longest_first` o el aviso también con `cargo test -p clawg-eval --target-dir target-test index_cost`. M7, la que más se esperaba que no mordiera, se corrió con `cargo test --workspace --no-fail-fast`. Las de la fixture, con `--test e5_golden`. Sólo se juntaron en una corrida mutaciones de archivos distintos cuyas pruebas no se pisan, y cada falla se atribuyó por la prueba y por el mensaje.
+
+### Las mutaciones
+
+La aplicación nunca vio fallar por una aserción las cinco pruebas de refresco de IS1: pasaron de no compilar a pasar. Lo que sigue prueba que muerden. Las líneas son las de `67914fc`.
+
+| # | Mutación | Prueba que falla | Resultado |
+|---|---|---|---|
+| M1 | `passage_order` da siempre `None` (`… \|\| true` en `crates/clawg-core/src/memory/project_docs/mod.rs:689`) | `a_doc_over_a_batch_reaches_the_embedder_longest_first` (`mod.rs:2155`: `[(1, 0), (8, 1)] is out of order`), `passage_order_is_none_up_to_one_batch_and_longest_first_above_it` (`:2133`: «more than one batch is ordered»), `passage_order_is_the_order_a_refresh_embeds_in` (`eval_api.rs:2975`: la identidad frente a `None`) | muerde |
+| M2 | `embed_passages` no llama `in_passage_order`, y los vectores quedan en el orden en que se mandaron (`mod.rs:671`) | `a_reordered_doc_keeps_each_passage_with_its_own_vector` (`:2172`: «passage 0»), `a_reordered_doc_writes_what_an_unordered_one_wrote` (`:2191`) | muerde |
+| M3 | el umbral pasa a `texts.len() < EMBED_BATCH` (`:689`) | `a_doc_of_one_batch_or_less_keeps_the_passage_order` (`:2205`), `passage_order_is_none_…` (`:2129`: 16 textos dan un orden) | muerde |
+| M4 | el umbral pasa a `texts.len() <= 8` | las dos de M3 y `reuse_decides_whether_a_doc_is_reordered` (`:2242`: «ten texts are one batch or less») | muerde |
+| M5 | la clave sin el prefijo de pasaje: se cuentan los textos tal cual (`:692-695`) | ninguna en la biblioteca de `clawg-core` | **no muerde** (WARNING 2) |
+| M6 | la clave sin la ventana: `encode_batch(…, true)` sin truncar, en lugar de `window_encodings` (`:697`) | ninguna en la biblioteca de `clawg-core` | **no muerde** (WARNING 2) |
+| M7 | la clave de `TokenSplitter::count_all`: el texto crudo, sin prefijo, sin tokens especiales y sin ventana | ninguna en toda la suite (`cargo test --workspace`) | **no muerde** (WARNING 2) |
+| M8 | `in_passage_order` junta (`sorted[order[j]]`) en vez de repartir (`:703-709`) | `in_passage_order_undoes_longest_first` (`:2118`: `[40, 30, 10, 0, 20]`), `a_reordered_doc_keeps_…` (`:2172`), `a_reordered_doc_writes_…` (`:2191`) | muerde |
+| M9 | una llamada al embedder por tanda en lugar de una por doc (`:663-666`) | `a_doc_over_a_batch_…` (`:2150`: «one call for the doc», 2 contra 1), `without_a_tokenizer_a_doc_keeps_the_passage_order` (`:2218`), `an_empty_memo_embeds_in_the_batches_production_does` (`eval_api/vector_memo.rs:903`), `a_changed_doc_embeds_only_its_new_texts` (`vector_memo.rs:925`) | muerde |
+| M10 | `longest_first` ascendente (`crates/clawg-core/src/memory/embedder.rs:191`) | `longest_first_puts_the_most_tokens_first_and_keeps_ties_in_order` (`embedder.rs:998`), `longest_first_is_stable_and_descending` (`eval_api.rs:2983`), `passage_order_is_the_order_a_refresh_embeds_in`, `a_doc_over_a_batch_…`, `passage_order_is_none_…`, dos de la importación (`import.rs:5289`) y tres de `index_cost` (`a_doc_over_embed_batch_runs_several_batches`, `sorting_can_pad_more_when_the_last_batch_is_short`, `sorting_keeps_ties_in_their_order`) | muerde |
+| M11 | `longest_first` con `sort_unstable_by_key` | sólo `an_import_of_another_tool_embeds_its_rows_longest_first` (`import.rs:5308`: «equal lengths keep the order of the file») | muerde, pero ninguna prueba de A1 (SUGGESTION 1) |
+| M12 | `longest_first` desempata al revés (`(Reverse(len), Reverse(k))`) | `longest_first_puts_…`, `longest_first_is_stable_and_descending`, `passage_order_is_the_order_a_refresh_embeds_in`, `a_doc_over_a_batch_…`, `passage_order_is_none_…`, `an_import_of_another_tool_…`, `sorting_keeps_ties_in_their_order` | muerde |
+| M13 | `padding_warning` compara `padded` otra vez (`crates/clawg-eval/src/bin/rag-eval/index_cost.rs:155`) | `the_padding_warning_compares_with_the_sorted_in_doc_padding` (`index_cost.rs:420`), `a_mismatch_between_computed_and_ran_padding_warns_only_when_nothing_came_from_the_memo` (`:442`) | muerde |
+| M14 | el mensaje del aviso nombra `padded` (`:158`) | `the_padding_warning_names_both_numbers` (`:430`: nombra 1200 y 1000), `a_mismatch_…` (`:440`) | muerde |
+| M15 | `eval_api::passage_order` da siempre la identidad (`crates/clawg-core/src/eval_api.rs:1201`) | `passage_order_is_the_order_a_refresh_embeds_in` (`eval_api.rs:2975`) | muerde |
+| M16 | `TokenSplitter::tokenizer()` da siempre `None` (`crates/clawg-core/src/memory/chunker/token_splitter.rs:31`) | `a_doc_over_a_batch_…` (`mod.rs:2155`) | muerde |
+| M17 | la fixture sin el caso `a batch of 17, longest first` (renombrado) | `a_batch_longest_first_stays_within_the_tolerance_of_the_batch_in_order` (`crates/clawg-core/tests/e5_golden.rs:137`: «the fixture has no case named …») | muerde |
+| M18 | la fixture con un vector del caso nuevo movido: su primera componente, a 0 | la misma (`e5_golden.rs:146`): nombra el texto y «moved its vector by 0.041131318, over 0.000001» | muerde |
+| M19 | un vector inutilizable corta el refresco: el error de `to_unit` pasa a `DocIndexError::Embed` (`mod.rs:678`) | `an_unusable_vector_in_a_reordered_doc_skips_only_that_doc` (`:2102`), y también las anteriores `an_unusable_vector_skips_its_doc_and_the_rest_go_on` y `a_refresh_times_a_doc_whose_vector_is_unusable` | muerde |
+
+De las 19 mutaciones, 16 muerden. Las cinco pruebas de refresco de IS1 muerden todas: `a_doc_over_a_batch_…` (M1, M9, M10, M12, M16), `a_reordered_doc_keeps_…` y `a_reordered_doc_writes_…` (M2, M8), `reuse_decides_…` (M4) y `an_unusable_vector_in_a_reordered_doc_…` (M19). M19 no es propia del orden: es la misma regla que ya fijaba `an_unusable_vector_skips_its_doc_and_the_rest_go_on`, y la prueba nueva comprueba que el orden no la rompe.
+
+**Por qué M5, M6 y M7 no muerden, y cuánto importa.** El modelo rellena según K = min(L + c, W): L son los tokens del texto, c el prefijo y los tokens especiales, W la ventana. Con un tokenizer que cuenta el prefijo siempre igual, K es una función no decreciente de L. Ordenar por L, por L + c o por K da entonces la misma secuencia de valores de K, y el relleno de cada tanda depende sólo de esa secuencia. Así, ninguna de las tres claves mutadas cambia el relleno. Lo único que cambia es el orden entre textos que empatan en K, que son los que la ventana corta. Eso puede cambiar qué textos comparten tanda, y con eso los últimos bits (IS4 e IS5 midieron 0 bits movidos con la clave de producción). Con el tokenizer de palabras de las pruebas, c es constante, y ningún texto de las pruebas de refresco se acerca a la ventana: ninguna prueba puede ver la diferencia. Lo que la ve, y lo que importa para la puerta, es la igualdad que el modelo real dio en las tres corridas del paso: `padded_ran` = `padded_sorted_in_doc` = 7 282 905. `padded_sorted_in_doc` se cuenta con prefijo y ventana (`EvalDocIndex::passage_lengths`, `eval_api.rs:1464-1503`), y `padding_warning` avisaría si no coincidieran. Una clave que con el tokenizer real contara el prefijo distinto según el texto sí podría cambiar el relleno, y la corrida real lo habría mostrado. El hueco es de la suite, no del código.
+
+### Cumplimiento de la spec
+
+Cada escenario contra la prueba que lo sostiene. Todas salieron `ok` en la corrida final, salvo las ignoradas, que se toman de las corridas con el modelo real anotadas arriba. ✅ cumple; ⚠️ parcial.
+
+| Requisito | Escenario | Prueba | |
+|---|---|---|---|
+| IS1 | un doc largo llega ordenado | `a_doc_over_a_batch_reaches_the_embedder_longest_first` (`mod.rs:2140`): una llamada de 20 textos, que no crecen, con los empates por sección | ✅ |
+| IS1 | cada pasaje conserva su vector | `a_reordered_doc_keeps_each_passage_with_its_own_vector` (`:2161`) y `a_reordered_doc_writes_what_an_unordered_one_wrote` (`:2177`): `RefreshReport` y `dump` iguales a los de un refresco sin tokenizer, con docs de 20, 30 y 2 pasajes | ✅ |
+| IS1 | la reutilización decide | `reuse_decides_whether_a_doc_is_reordered` (`:2223`): 10 reusados y 10 en el orden de los pasajes. Que no se cuenten tokens es estructural: `passage_order` vuelve antes de tokenizar (`:689-691`), y no hay costura para observarlo | ✅ |
+| IS1 | una tanda o menos | `a_doc_of_one_batch_or_less_keeps_the_passage_order` (`:2195`), `passage_order_is_none_up_to_one_batch_and_longest_first_above_it` (`:2124`): 16 dan `None` y 17, un orden. Lo de no tokenizar, como en el escenario anterior | ✅ |
+| IS1 | un vector inutilizable | `an_unusable_vector_in_a_reordered_doc_skips_only_that_doc` (`:2246`) | ✅ |
+| IS1 | relleno menor | Ninguna prueba mide el relleno de las tandas que manda el refresco. Se sostiene por composición: el 1640 frente a 2000 es la fórmula (`a_doc_over_embed_batch_runs_several_batches`, `index_cost.rs:351`), y que el refresco mande un orden que no crece lo prueba `a_doc_over_a_batch_…`. Fuera de la suite lo cierra la corrida real, con `padded_ran` = `padded_sorted_in_doc` (WARNING 1) | ⚠️ |
+| IS1 | (no es un escenario) las piezas puras que nombra el requisito | `in_passage_order_undoes_longest_first` (`:2113`: vacío, empates, identidad), `passage_order_is_none_…` | ✅ |
+| IS2 | sin largos | `without_a_tokenizer_a_doc_keeps_the_passage_order` (`:2209`) y `passage_order(None, …)` en `:2136`. «Si contar falla» no tiene prueba, porque el tokenizer de palabras no falla. Es el `.ok()?` de `:697` | ✅ |
+| IS3 | coinciden | `the_padding_warning_compares_with_the_sorted_in_doc_padding` (`index_cost.rs:416`) | ✅ |
+| IS3 | difieren | `the_padding_warning_names_both_numbers` (`:425`) | ✅ |
+| IS3 | algo salió de la memoria | `a_mismatch_between_computed_and_ran_padding_warns_only_when_nothing_came_from_the_memo` (`:434`), con `from_memo = 30` | ✅ |
+| IS4 | el caso falta | `a_batch_longest_first_stays_within_the_tolerance_of_the_batch_in_order` (`e5_golden.rs:131`), con M17. La spec nombra `the_vectors_are_the_ones_fastembed_gave`, pero esa prueba lee los textos de la fixture (`e5_golden.rs:345`), así que no falla si falta un caso (SUGGESTION 2) | ✅ |
+| IS4 | el orden mueve un vector más de la cota | la misma prueba, con M18: nombra el texto y la diferencia. Con la fixture de `3d7ae94` imprime «17 of 17 vectors have the same bits in either order» | ✅ |
+| IS5 | el informe | `docs_passages_keep_their_bits_in_either_order` (`mod.rs:2267`, ignorada): imprime los vectores con los mismos bits, la diferencia mayor y la mediana de cada orden. La corrida de arriba dio 4799 de 4799 y diferencia 0 | ✅ |
+
+**12 de 13 escenarios cumplen enteros, y 1 en parte** (el relleno menor). Ninguno queda sin prueba.
+
+Hay dos reglas del texto de IS1 que ninguna prueba muerde: contar «con el prefijo de pasaje del embedder, cortados a su ventana» (M5 a M7, WARNING 2) y «MUST NOT contar sus tokens» con una tanda o menos, que es estructural. IS3 pide que los campos no cambien de nombre ni de tipo, y eso también es estructural: el diff de `Tokens` sólo cambia comentarios. La fixture de IS4 sí reordena de verdad. En `a batch of 17, longest first` (`tests/fixtures/e5_golden.json:20`) van primero los cuatro textos largos y después las frases cortas, así que el caso no es la identidad.
+
+### El diseño
+
+| Decisión | ¿Se siguió? | Notas |
+|---|---|---|
+| D1. El orden vive en el refresco | ✅ | `E5Embedder::embed_batch` no cambia. El orden está en `embed_passages` (`mod.rs:648-679`) |
+| D2. La clave y el tokenizer | ✅ | Prefijo de pasaje, `window_encodings` y `Encoding::len` (`:692-697`). El tokenizer sale de `TokenSplitter::tokenizer()` (`:543`). `refresh` y sus llamadores no cambian de firma |
+| D3. Contar sólo cuando importa | ✅ | Se mide `to_embed` (`:540`, `:543`), no los pasajes del doc |
+| D4. Las piezas puras | ✅ | `longest_first` está en `embedder.rs:189`, con su prueba, y la usan la importación y `eval_api::longest_first`. `in_passage_order` es privada, pero quedó junto a `passage_order` (`:703`) y no junto a `fill` (`:603`). `passage_order` es `pub(crate)` |
+| D5. El costo de contar | ✅ | Va entre el `lap` de `lookup` y el de `embed` (`:542-544`) |
+| D6. El aviso | ✅ | Compara contra `padded_sorted_in_doc` (`index_cost.rs:155`). Se corrigieron los comentarios de `Tokens`, de `EvalDocLengths` y de `passage_lengths`, y se renombró la prueba a «ordinal» |
+| D7. Los bits | ✅ | Están el caso nuevo, la prueba sobre la fixture y la prueba ignorada, que no abre store ni temporal. Un desvío: la prueba del orden usa un embedder nuevo, `Batches` (`mod.rs:2034`), y no `Recording` (`:1466`). `Recording` anota textos y no llamadas, y no da un vector con NaN. El desvío está justificado, aunque repite la regla `BROKEN` de `Unusable` (`:1235`) |
+
+### `.claude/CLAUDE.md` y las reglas
+
+- **Nada prohibido en el rango.** No hay `#[allow]`, ni código comentado, ni `TODO`. Los comentarios nuevos son de documentación y explican un porqué. Por ejemplo, el de `passage_order` dice por qué da `None`: una tanda rellena igual en cualquier orden, sin tokenizer no hay con qué contar, y un texto que no se puede contar falla en el embedder.
+- **Sin referencias al plan.** Ninguna prueba, comentario, mensaje o commit nombra un plan, una tarea, el cambio ni los números IS o D. «Phase» sólo aparece en `docs/reference/daemon.md`, como la fase `embed` de los tiempos del refresco (`DocPhases`).
+- **Commits.** Los seis son convencionales y no tienen atribución. `3d7ae94` también marca tareas en `tasks.md` (SUGGESTION 6).
+- **Visibilidad.**
+  - `TokenSplitter::tokenizer()` es `pub` en un tipo `pub(crate)` de un módulo `pub(crate)`, así que su alcance real es el crate, como el de sus vecinos `with_tokenizer`, `fallback` y `count`. La usa producción (`mod.rs:543`).
+  - `project_docs::passage_order` es `pub(crate)` porque la llama `eval_api`.
+  - `eval_api::passage_order` es `pub` y sólo la usa `e5_golden`, que como prueba de integración sólo ve lo público. D7 lo eligió así para que la fixture fije el orden de producción, y la función sólo existe con `eval`, que el release no enlaza.
+- **Puro e I/O.** `passage_order` e `in_passage_order` son puras. No hay dependencias nuevas: no cambian `Cargo.toml` ni `Cargo.lock`, y `tokenizers` ya era una dependencia de `clawg-core`.
+- **Temporales.**
+  - Las pruebas de refresco nuevas usan `crate::test_dir::test_dir()` y un store en memoria (`MemoryStore::new_for_test`, `crates/clawg-core/src/memory/db.rs:264`), así que no escriben ningún `memory.db` en el temporal.
+  - Antes de la primera corrida, el temporal del sistema ya tenía ocho `.tmp*` con `memory.db` y `memory.lock`, un `.tmp*` con `clawg-copy.exe` y un `clawg-loader-lets-go-*` con `model.onnx`. Ninguno es `rag-eval-*`.
+  - Al terminar hay uno más: `.tmpUFd8Mh`, con `memory.db` y un `memory.lock` vacío. Se escribió durante la corrida de `cargo test --workspace` con M7, que pasó entera, y la corrida final de la suite no dejó otro. Tiene la misma forma que los ocho anteriores: un store en disco, que las pruebas de A1 no abren. Parece una fuga intermitente de alguna prueba que abre un store en disco, anterior a este cambio y fuera de su alcance.
+  - No se borró nada. Que lo haya creado esta verificación es probable pero no seguro, y la única herramienta para borrarlo queda fuera de lo que esta verificación podía usar.
+  - `docs/eval/cache/` no existe.
+- **`docs/reference/daemon.md`** describe lo que hace el código: el umbral, que haga falta un tokenizer, el orden con empates, la clave, la vuelta de cada vector a su pasaje y el conteo dentro de `embed`. Tiene dos detalles (SUGGESTION 4).
+
+### Lo que encontró la verificación
+
+**CRITICAL:** ninguno.
+
+**WARNING:**
+
+1. **Ninguna prueba de la suite mide el relleno de las tandas que manda el refresco** (escenario «relleno menor» de IS1). El 1640 frente a 2000 lo prueba la fórmula de `rag-eval` (`index_cost.rs:351`). Que el refresco mande ese orden lo prueba `a_doc_over_a_batch_…`. Que una secuencia que no crece rellene `padded_sorted` es aritmética. La medición la dio la corrida real (`padded_ran` = `padded_sorted_in_doc`). **Arreglo:** un `Batches` que, con el tokenizer de palabras, sume filas × el largo mayor de cada tanda de `EMBED_BATCH` que recibe, y un doc de 20 pasajes que alternan 10 y 100 palabras, que tiene que dar 1640.
+2. **La clave «con el prefijo de pasaje, cortada a la ventana» de IS1 no la sostiene ninguna prueba** (`mod.rs:692-697`; mutaciones M5, M6 y M7). Por lo de arriba, no cambia el relleno con ningún tokenizer que cuente el prefijo siempre igual, y la corrida real mostró la igualdad. Pero la regla está en el requisito y se podría perder sin que nada fallara. **Arreglo:** un caso puro en `passage_order_is_none_up_to_one_batch_and_longest_first_above_it`, con el tokenizer de palabras, que ya tiene ventana de 512 y no agrega tokens especiales.
+   - Con un embedder de prefijo de una palabra (el `Prefixed` de `eval_api.rs:2885` u otro igual), dos textos de 511 y 512 palabras empatan en la ventana y tienen que quedar en el orden de los pasajes. Sin prefijo, el de 512 pasaría delante.
+   - Dos textos de 600 y 700 palabras también empatan en 512. Sin ventana, el de 700 pasaría delante.
+
+**SUGGESTION:**
+
+1. **Las pruebas de empates de A1 no ven un `sort_unstable`** (M11). Con este toolchain, el orden inestable deja los empates en su lugar con 20 elementos o menos, y todas las pruebas de A1 ordenan 20 o menos. Lo detecta una prueba de la importación con más filas, y como `longest_first` es compartida, la regla queda cubierta. Si se quiere que lo vea el refresco, `a_doc_over_a_batch_…` puede usar un doc de más de 20 pasajes con empates.
+2. **El escenario «el caso falta» de IS4 nombra una prueba que no falla por eso.** `the_vectors_are_the_ones_fastembed_gave` lee los textos de la fixture (`e5_golden.rs:328-366`), así que un caso que falta no lo hace fallar. La que falla es `a_batch_longest_first_stays_within_the_tolerance_of_the_batch_in_order` (`:137`). Al archivar, conviene que la spec nombre esa. Por la misma razón, la fixture fija el orden de producción del momento del bless. Ninguna prueba de la suite compara ese orden con el `passage_order` de hoy, porque hace falta el tokenizer real.
+3. **`passage_order` arma las copias con prefijo antes de mirar si hay tokenizer** (`mod.rs:692-697`). Sin tokenizer y con más de 16 textos, copia todos para nada. Basta con poner `let tokenizer = tokenizer?;` antes de la línea 692. Además, `passage_order` y `EvalDocIndex::passage_lengths` (`eval_api.rs:1490-1502`) arman la clave cada uno por su lado, y la igualdad de D2 depende de que coincidan. Una sola función para las dos haría que `a_passage_longer_than_the_window_counts_the_window` (`eval_api.rs:2955`) cubriera también la de producción, y cerraría el WARNING 2 de paso.
+4. **`docs/reference/daemon.md`** dice «so the order changes no row, id or report». Con el modelo real, los últimos bits de un vector pueden moverse según con qué textos comparte tanda (IS1). En esta CPU se movieron 0, pero en otra pueden moverse. Tampoco dice que un conteo fallido deja el orden de los pasajes. Son dos frases.
+5. **Detalles de forma.** El comentario de `passage_lengths` quedó mal partido después de la edición («`None` without a» / «tokenizer, which only the real model brings», `eval_api.rs:1468-1469`). También falta una línea en blanco entre ítems de prueba en `mod.rs:2031-2032` y en `:2259-2260`.
+6. **`3d7ae94` mezcla.** Es un commit `test(embedder)` que también marca casillas de `tasks.md`. Ese cambio era su propio commit de `docs(openspec)`.
+
+### Resultado de la suite y de clippy
+
+Sobre `67914fc` (`HEAD`), con el árbol limpio y después de revertir las mutaciones M1 a M18:
+
+- `cargo test --workspace --no-fail-fast --target-dir target-test`: pasa (salida 0). Las ignoradas son las de antes más `docs_passages_keep_their_bits_in_either_order`, que es la medición de IS5.
+- `cargo clippy --workspace --all-targets --target-dir target-test -- -A clippy::all -D warnings`: salida 0.
+- `cargo clippy --locked -p clawg-cli --target-dir target-test -- -A clippy::all -D warnings`: salida 0.
+- M19 se aplicó y se revirtió después de esa corrida. Al terminar, `git status` está limpio y `git diff HEAD -- crates` no da nada, así que la suite corrió sobre los mismos bytes que quedan.
+- Ninguna métrica de `rag-eval` se volvió a medir. Las de A1 son las de «se queda si», arriba.
+
+### Veredicto
+
+**PASS WITH WARNINGS.** La suite y los dos clippy pasan. De las 19 mutaciones, 16 muerden, y entre ellas las cinco pruebas de refresco de IS1, que la aplicación sólo había visto pasar de no compilar a pasar. Muerden también el umbral (16 y 8), la vuelta al orden de los pasajes (quitada o invertida), la llamada única por doc, el sentido y los empates de `longest_first`, el aviso y su mensaje, la puerta de `eval_api`, el tokenizer del partidor y la fixture (el caso que falta y el vector que se mueve). No muerden las tres que cambian la clave (M5, M6 y M7, WARNING 2). Por construcción, no pueden cambiar el relleno con un tokenizer que cuente el prefijo igual para todos los textos, y la igualdad `padded_ran` = `padded_sorted_in_doc` del modelo real cubre el caso que la suite no ve. 12 de 13 escenarios cumplen enteros, y el del relleno menor cumple en parte, cerrado por la corrida real (WARNING 1). Ningún hallazgo cambia la conducta del daemon ni un número de las puertas.
