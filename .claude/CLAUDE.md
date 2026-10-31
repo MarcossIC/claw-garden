@@ -11,7 +11,7 @@ It holds only what every session needs: the rules, and where to look for the res
 | Data directory and profiles, migrations and snapshots, model download and idle unload, store lock, socket and TCP, metrics, projects (identity, merge, delete, subfolders), sharing, preferences | `docs/reference/data-profiles.md` |
 | Every `clawg` command | `docs/reference/commands.md` |
 | Daemon HTTP API, docs index, ingest (masking, outbox, pieces, topic keys, contradiction detector, provenance), MCP tools, protocol and languages | `docs/reference/daemon.md` |
-| The suite, `testing` builds, CI and release workflows, eval tools (`rag-eval`, `revision-eval`, `load-eval`) | `docs/reference/testing.md` |
+| The suite, `testing` builds, CI and release workflows, eval tools (`rag-eval`, `revision-eval`, `load-eval`, `perf-bench`) and the daemon bench | `docs/reference/testing.md` |
 | Versioning, publishing and release keys | `docs/reference/release.md` |
 | Design documents | `docs/` |
 
@@ -21,7 +21,7 @@ It holds only what every session needs: the rules, and where to look for the res
 | --- | --- |
 | `crates/clawg-core` | Memory engine: SQLite storage, ONNX embeddings, ranking, background workers, the exclusive lock on `memory.db`, the daemon's usage metrics. Library `clawg_core`. |
 | `crates/clawg-cli` | The `clawg` binary (`serve`, `mcp`, `hook`, `setup`, `doctor`, …): the daemon in `src/daemon/`, the MCP bridge in `src/mcp/`. Also a library `clawg_cli`. |
-| `crates/clawg-eval` | Evaluation tools (`rag-eval`, `golden-mine`, `conflict-eval`, `revision-eval`, `load-eval`), through clawg-core's `eval` feature, which production builds never link. |
+| `crates/clawg-eval` | Evaluation tools (`rag-eval`, `golden-mine`, `conflict-eval`, `revision-eval`, `load-eval`, `perf-bench`), through clawg-core's `eval` feature, which production builds never link. |
 
 ## Data profiles
 

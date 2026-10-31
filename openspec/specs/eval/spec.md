@@ -1,6 +1,6 @@
 # eval — Especificación
 
-Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md), y lo que cuesta ese índice: su memoria de vectores, los tokens, el reparto por área y el bloque `index` del archivo de resultados), `rag-eval --background` (medir sobre la copia de un snapshot real, con casos que citan su save por origen y nombran su proyecto) y la baseline medida.
+Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md), y lo que cuesta ese índice: su memoria de vectores, los tokens, el reparto por área y el bloque `index` del archivo de resultados), `rag-eval --background` (medir sobre la copia de un snapshot real, con casos que citan su save por origen y nombran su proyecto), el banco de rendimiento del daemon y `perf-bench diff`, y la baseline medida.
 
 **Origen:**
 - [eval-golden-expansion](../../changes/archive/2026-10-12-eval-golden-expansion/proposal.md), archivado el 2026-10-12.
@@ -15,6 +15,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo la línea del aviso en español en «`chains`: lo que cuesta la clave (M4)»; el parser que lee las respuestas vacías en los dos idiomas, AL7 de esa spec, está en [`specs/retrieval`](../retrieval/spec.md), y la paridad español contra inglés y el store mezclado, sus M1 y M2, no se midieron: piden el golden pareado y el modelo real).
 - [ranking-at-scale](../../changes/archive/2026-10-29-ranking-at-scale/proposal.md), archivado el 2026-10-29 (sólo el paso 1: «`rag-eval --background`: medir a escala» y «A escala» en la baseline; el peso de los resúmenes y la puerta de abstención se cerraron sin código en sus puertas).
 - [docs-index-cost](../../changes/archive/2026-10-31-docs-index-cost/proposal.md), archivado el 2026-10-31, que sale en 0.69.0 (sólo IC3 a IC8: la memoria de vectores de `rag-eval --docs`, los tokens, el reparto por área y el bloque `index` del archivo de resultados, en «`rag-eval --docs`: medir el índice de documentación», y «Índice de docs» en la baseline). Las fases del refresco que mide (IC1 e IC2) están en [`specs/project-docs`](../project-docs/spec.md), «Refresco incremental».
+- [perf-bench](../../changes/archive/2026-10-31-perf-bench/proposal.md), archivado el 2026-10-31, que sale en 0.70.0 (sólo «Banco de rendimiento del daemon» y su baseline).
 
 ## Definiciones
 
@@ -1105,6 +1106,57 @@ El decaimiento lee el reloj al buscar, así que las dos corridas de una comparac
 
 **Tests:** `diff_compares_an_anchor_run_with_and_without_background` y `a_diff_over_one_background_a_day_apart_warns` (`diff.rs`).
 
+## Banco de rendimiento del daemon
+
+```
+cargo test -p clawg-cli --test perf_bench -- --ignored --nocapture
+perf-bench diff FIRST SECOND [--fail-on-regression]
+```
+
+Un banco que se repite igual en la próxima versión: el store, la carga y el calendario salen de una semilla, así dos corridas en una máquina difieren sólo por el código. Es el test `#[ignore]` `bench` de `crates/clawg-cli/tests/perf_bench.rs` (CI nunca lo corre; las pruebas de sus partes puras corren con la suite), y el `diff` es el binario `perf-bench` de `clawg-eval` (`crates/clawg-eval/src/bin/perf-bench/`). Las rutas sin prefijo de esta sección son de esos dos lugares.
+
+### El banco
+
+`bench` MUST arrancar el binario de la suite con `serve --profile dev --port 0`, un home temporal (`CLAWG_TEST_HOME`) y `CLAWG_TEST_EMBEDDER=fake`, en Linux, Windows y macOS, y MUST terminarlo por su propio handle al final, falle o no. Lo configuran, por una función pura (`Config::from_vars`), `CLAWG_BENCH_ROWS` (de 1 a 1 000 000, 10 000 por defecto), `CLAWG_BENCH_SEED` (74), `CLAWG_BENCH_TAG` (minúsculas, dígitos y guiones) y `CLAWG_BENCH_MODEL_DIR`; un valor inválido falla nombrando la variable antes de arrancar nada. Con `CLAWG_BENCH_MODEL_DIR`, un directorio de datos, MUST copiar su `models/` al home temporal y arrancar sin el embedder falso: el daemon verifica los archivos contra sus SHA-256 como en cualquier arranque. Un directorio sin `models/` MUST fallar antes de arrancar, y el banco MUST NOT leer un perfil que no se le nombró.
+
+**La siembra.** El banco MUST sembrar con un export `clawg-memories` armado con los tipos de `portability::format` y mandado a `POST /v1/import`, y MUST fallar si el import no inserta todas las filas o declara alguna inválida. Para la misma semilla, filas y hora el export es el mismo byte a byte (`seed_export`, SplitMix64): cuatro agentes, tres proyectos con su línea `project` y un cuarto de las filas sin proyecto, alrededor de una décima `superseded` (por la fila siguiente, causa `revision`) y una vigésima borrada, textos de 12 a 40 palabras de 64 frecuentes con sesgo hacia las primeras y, una palabra de cada 25, un identificador `identN` de `filas / 20` posibles. Las consultas (dos a cuatro palabras frecuentes, un tercio con identificador), los textos de los saves (únicos; 40 palabras para un pedazo, `96 + 72 × (n − 1)` para n con el tokenizer falso, a lo sumo 64 KiB) y el corpus de docs (400 archivos Markdown de ocho secciones) MUST salir de la misma semilla.
+
+**La carga.** Cada petición MUST salir en el instante que le da su tasa, en una tarea propia, y su latencia MUST contarse desde ese instante hasta la respuesta completa (lazo abierto, sin omisión coordinada); una respuesta que no es 2xx o un error de transporte es un fallo y no una muestra. Varios flujos a la vez se intercalan por el que vence antes, el primero de la lista ante un empate (`earliest`). Antes de medir, el daemon MUST quedar 5 s sin peticiones y recibir unas de calentamiento que no cuentan. Las tasas son las que un build debug atiende con 10 000 filas sin que la cola crezca.
+
+| Escenario | Petición | Tasa y cantidad |
+|---|---|---|
+| `search` | `POST /v1/search`, `limit` 10 | 5/s, 100 |
+| `context` | `POST /v1/context` con consulta | 3/s, 60 |
+| `session_start` | `POST /v1/context` sin consulta, como el hook | 3/s, 60 |
+| `save_1`, `save_10`, `save_100` | `POST /v1/memories` de 1, 10 y 100 pedazos | 5/s, 60; 0,5/s, 20; 1/15 s, 4 |
+| `{flujo}_during_{fondo}` | `search` (5/s), `context` (2/s), `session_start` (1/s) y `save_1` (1/s) a la vez, mientras corre el fondo | hasta que el fondo termina |
+
+Los fondos son un save de 100 pedazos y `POST /v1/backup`, que se repiten hasta cubrir 10 s (cada snapshot se borra en cuanto se escribe), y el primer refresco del índice de docs del corpus, lanzado con `POST /v1/projects` e `index_docs`, que termina cuando `docs.refresh.duration` de `GET /v1/metrics` cuenta uno más.
+
+**El archivo.** Al final el banco MUST escribir `docs/eval/results/{fecha UTC}-{fake|real}-perf-bench-{filas}[-{tag}].json`, fuera de git, y MUST NOT reemplazar uno existente (falla antes de arrancar). Lleva `format` (`clawg-perf-bench`), `version` (1), `clawg`, `build` (`debug` o `release`), `embedder` (`fake` o `real`), `machine` (`os`, `arch`, `threads`), `started_at_ms`, `store` (`rows`, `seed`, `seed_seconds`, `by_state` del import, `docs_files` y `GET /v1/stats`), `process` (`cpu_idle_ratio` y `cpu_load_ratio`, CPU del proceso del daemon sobre tiempo de reloj sin dividir por núcleos; `rss_peak_bytes`; `private_peak_bytes`, sólo Windows; leídos por su pid: `/proc/<pid>/stat` y `status` en Linux, `GetProcessTimes` y `GetProcessMemoryInfo` en Windows, `null` en otro sistema), `scenarios[]` (`name`, `rate_per_s`, `sent`, `failed`, `background_seconds` y `background_runs` en los de fondo, `summary` con `count`, `mean_us`, `p50_us`, `p95_us`, `p99_us` y `max_us` por rango más cercano, y `samples_us`, las muestras crudas) y `metrics` (los histogramas de la ejecución de `GET /v1/metrics` sin `buckets`, y los gauges `embedder.*` del minuto). Ningún campo lleva el texto de una memoria. El banco MUST fallar después de escribir el archivo si algún escenario tuvo fallos.
+
+**Tests:** `the_config_reads_its_defaults_and_refuses_what_it_cannot_use`, `the_seeded_store_is_the_same_for_a_seed_and_another_for_another`, `the_seeded_store_is_an_export_the_import_reads_whole`, `rows_share_frequent_words_and_few_share_an_identifier`, `queries_and_saves_repeat_for_a_seed`, `a_save_has_the_words_of_its_pieces_and_fits_the_content_limit`, `the_docs_corpus_repeats_for_a_seed`, `requests_leave_at_a_fixed_rate`, `streams_send_in_the_order_their_requests_fall_due`, `a_quantile_is_the_nearest_rank`, `the_date_of_a_file_is_utc`, `a_result_file_is_never_replaced`, `the_cpu_of_a_process_is_read_after_its_command` (`perf_bench.rs`).
+
+### `perf-bench diff`
+
+MUST leer los dos archivos y rechazar con salida 1 uno que no sea `clawg-perf-bench` versión 1 o no se pueda leer; argumentos inválidos son la salida 2. Para cada escenario de los dos MUST dar `n` de cada lado, el p50 y el p95 por rango más cercano, el cambio relativo de los dos (segundo sobre primero, menos uno) con un intervalo bootstrap percentil del 95 % (4 000 remuestreos, cada lado con reemplazo por su cuenta, semilla fija: los mismos dos archivos dan siempre la misma salida), y el valor p bilateral de Mann-Whitney U (aproximación normal, corrección por empates y de continuidad), que se lee pero no decide. El veredicto (`verdict`, `diff.rs`):
+
+| Veredicto | Condición |
+|---|---|
+| `slower` | la segunda corrida tiene más fallos que la primera, o el p95 subió más del 20 % y el límite inferior del intervalo es mayor que cero |
+| `faster` | el p95 bajó más del 20 % y el límite superior es menor que cero |
+| `too few samples` | menos de 40 muestras de algún lado (los fallos nuevos deciden igual) |
+| `no change` | el resto |
+
+MUST avisar (`warning:`) cuando las corridas difieren en `build`, `embedder`, `machine`, `store.rows` o `store.seed`, y nombrar cada escenario que está en una sola. Con `--fail-on-regression` MUST salir con 6 si algún escenario es `slower`.
+
+#### Escenario: la misma corrida dos veces
+- GIVEN un archivo comparado consigo mismo
+- WHEN se calcula el diff
+- THEN no hay avisos, cada escenario es `no change` y el valor p de rangos es 1
+
+**Tests:** `a_quantile_is_the_nearest_rank`, `erfc_matches_known_values`, `mann_whitney_matches_a_value_computed_by_hand`, `mann_whitney_sees_no_difference_between_equal_samples`, `mann_whitney_sees_a_shift_of_the_whole_distribution`, `the_bootstrap_is_deterministic_for_a_seed`, `the_same_distribution_gives_an_interval_around_zero`, `a_slower_run_gives_an_interval_above_zero`, `an_empty_side_or_a_zero_quantile_is_no_change` (`stats.rs`); `the_verdict_needs_the_threshold_and_an_interval_without_zero`, `the_same_run_twice_is_no_change`, `a_slower_scenario_is_a_regression`, `what_differs_between_the_runs_is_named`, `a_result_file_is_read_by_its_format_and_ignores_what_it_does_not_compare` (`diff.rs`); `diff_takes_two_files_and_the_flag`, `anything_else_is_refused` (`main.rs`).
+
 ## Baseline medida
 
 Estas cifras no son tests de `cargo`: se miden a mano con `rag-eval --real`, que necesita el modelo. La medición completa está en el [`verify.md` archivado](../../changes/archive/2026-10-12-eval-golden-expansion/verify.md#medición-rag-eval---real). Las cifras de la semilla 7 de abajo son de antes de [long-save-context](../../changes/archive/2026-10-14-long-save-context/proposal.md); el set actual tiene 1.040 filas y 124 casos. Todas son, además, de antes del pooling mean ([`specs/storage`](../storage/spec.md)): los vectores eran CLS y el piso de coseno 0,8793, así que no se reproducen con el embedder de hoy.
@@ -1248,9 +1300,19 @@ Medido con el modelo real el 2026-10-31 en Windows (16 hilos, AVX2, AVX-512F y F
 - **Por área en R:** `archive` 42,8 % de `phases.embed`, `code` 41,3 % y `docs` 15,9 %.
 - `--diff` de D contra R no mueve ninguna pregunta del golden de docs, así que la memoria no cambia qué vector va con qué pasaje con el modelo real.
 
+### Banco de rendimiento del daemon
+
+Medido el 2026-10-31 en Linux x86_64 con 4 hilos, en un build debug con el embedder falso, 10 000 filas y la semilla 74, dos veces sobre el mismo commit (`docs/eval/results/2026-10-31-fake-perf-bench-10000-verify-a.json` y `-verify-b.json`, fuera de git). El detalle está en el [verify](../../changes/archive/2026-10-31-perf-bench/verify.md) del cambio. Los números de un build debug no dicen nada de un release; sirven para comparar dos commits en la misma máquina.
+
+- **Siembra:** 9,0 a 10,9 s para 10 000 filas por `POST /v1/import`.
+- **p95 solos (A / B):** `search` 86,5 / 79,4 ms, `context` 160,3 / 145,7, `session_start` 87,1 / 87,4, `save_1` 55,8 / 49,8, `save_10` 443,3 / 449,0, `save_100` 4 500,7 / 4 705,2.
+- **Detrás de un fondo (A / B):** `search` durante un save de 100 pedazos 243,1 / 260,1 ms, durante un backup 203,8 / 276,1, durante el refresco de 400 docs 182,6 / 179,9; un `save_1` detrás del save largo espera unos 10 s en el p95.
+- **Proceso:** CPU en reposo 0, bajo carga 0,43; pico de RSS 96 a 97 MB.
+- `perf-bench diff` de A contra B no marca ningún escenario `slower`; con 50 ms inyectados en `POST /v1/search` marca `search`, `search_during_backup` y `search_during_docs_refresh`, y ninguno que no busque.
+
 ## Invariantes
 
 - El generador, el reporte, la estadística y `--diff` son lógica pura, separada de la E/S: se prueban sin modelo, sin red y sin `docs/eval/`.
 - `--diff` es determinista: el bootstrap usa una semilla fija, y los mismos dos archivos dan siempre la misma salida.
-- Producción nunca enlaza esto: `clawg-eval` usa `clawg-core` a través de la feature `eval`.
+- Producción nunca enlaza esto: `clawg-eval` usa `clawg-core` a través de la feature `eval`, y el banco del daemon es un test ignorado de `clawg-cli`.
 - Ni la memoria de vectores de `rag-eval --docs` ni el bloque `index` de su archivo de resultados guardan el texto de un pasaje, el de una pregunta ni una ruta: la memoria sólo claves y vectores, el bloque sólo números, banderas y los nombres de build, sistema y arquitectura.

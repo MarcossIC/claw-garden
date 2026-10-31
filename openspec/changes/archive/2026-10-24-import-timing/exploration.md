@@ -57,7 +57,7 @@ Visible en `clawg import` sin leer el log. **En contra:** rompe la paridad entre
 
 ### D. Perfilar en lugar de instrumentar
 
-`samply` o WPR sobre el daemon dan el reparto por función, incluido SQLite. **En contra:** es una corrida de investigación (perf-bench lo excluye a propósito, `openspec/changes/perf-bench/exploration.md:47`), no algo que acompaña al import en prod. Sigue disponible sin ningún cambio.
+`samply` o WPR sobre el daemon dan el reparto por función, incluido SQLite. **En contra:** es una corrida de investigación (perf-bench lo excluye a propósito, `openspec/changes/archive/2026-10-31-perf-bench/exploration.md:47`), no algo que acompaña al import en prod. Sigue disponible sin ningún cambio.
 
 ### Recomendación: A
 
