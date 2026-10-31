@@ -8,6 +8,7 @@
 pub mod chunk;
 pub mod code;
 pub mod corpus;
+mod lexical;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,7 +19,6 @@ use crate::memory::chunker::token_splitter::TokenSplitter;
 use crate::memory::clock::TimestampMs;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::redact::redact;
-use crate::memory::search::{fts_match_expression, MAX_LEXICAL_TOKENS};
 use crate::memory::vector::to_unit;
 use crate::memory::MemoryStore;
 
@@ -407,7 +407,7 @@ pub async fn search(
         .map_err(|e| DocIndexError::Query(e.to_string()))?;
     let vector = to_unit(&vector).map_err(|e| DocIndexError::Query(e.to_string()))?;
     let bytes = le_bytes(&vector);
-    let expression = fts_match_expression(query, MAX_LEXICAL_TOKENS);
+    let terms = lexical::docs_match_expression(query);
     let project_id = project_id.to_string();
     Ok(store
         .conn
@@ -420,16 +420,19 @@ pub async fn search(
                 )?
                 .query_map(rusqlite::params![bytes, k, project_id], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
-            let lexical: Vec<i64> = match &expression {
-                Some(expression) => c
-                    .prepare(
-                        "SELECT rowid FROM project_doc_fts \
-                         WHERE project_doc_fts MATCH ?1 AND project_id = ?2 ORDER BY rank LIMIT ?3",
-                    )?
+            let mut by_term = c.prepare(
+                "SELECT rowid FROM project_doc_fts \
+                 WHERE project_doc_fts MATCH ?1 AND project_id = ?2 ORDER BY rank LIMIT ?3",
+            )?;
+            let mut lexical: Vec<i64> = Vec::new();
+            for expression in [&terms.all, &terms.any].into_iter().flatten() {
+                lexical = by_term
                     .query_map(rusqlite::params![expression, project_id, k], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?,
-                None => Vec::new(),
-            };
+                    .collect::<rusqlite::Result<_>>()?;
+                if !lexical.is_empty() {
+                    break;
+                }
+            }
             let mut stmt = c.prepare("SELECT path, breadcrumb, body FROM project_doc_chunk WHERE id = ?1")?;
             fuse(&dense, &lexical, limit)
                 .into_iter()
@@ -1851,6 +1854,37 @@ old
 
         assert_eq!(crumbs(&dense_only).last(), Some(&"chunker.md > Cap"), "by meaning it is the farthest");
         assert_eq!(crumbs(&hits)[0], "chunker.md > Cap");
+    }
+
+    #[tokio::test]
+    async fn a_passage_with_all_three_rarest_words_beats_one_with_many_of_the_others() {
+        let (_dir, store) = indexed(&[
+            ("a.md", "# Uno\ntombstone de la el de la el de la el\n"),
+            ("b.md", "# Dos\nTombstone, fingerprint, ledger, port.\n"),
+            ("c.md", "# Tres\nnada aquí\n"),
+            ("d.md", "# Cuatro\notra cosa\n"),
+        ])
+        .await;
+
+        let dense_only = search(&store, &Topical, "p", "zzz", 5).await.unwrap();
+        let hits = search(&store, &Topical, "p", "tombstone fingerprint ledger de la el", 5).await.unwrap();
+
+        assert_eq!(crumbs(&dense_only).last(), Some(&"b.md > Dos"), "by meaning it is the farthest");
+        assert_eq!(crumbs(&hits)[0], "b.md > Dos", "{:?}", crumbs(&hits));
+    }
+
+    #[tokio::test]
+    async fn the_term_search_falls_back_to_any_word_when_no_passage_has_the_rarest_three() {
+        let (_dir, store) = indexed(&[
+            ("a.md", "# Uno\nnada aquí\n"),
+            ("b.md", "# Dos\nTombstone, fingerprint, port.\n"),
+            ("c.md", "# Tres\nLedger, port.\n"),
+        ])
+        .await;
+
+        let hits = search(&store, &Topical, "p", "tombstone fingerprint ledger", 5).await.unwrap();
+
+        assert_eq!(crumbs(&hits)[0], "b.md > Dos", "{:?}", crumbs(&hits));
     }
 
     #[tokio::test]
