@@ -213,6 +213,8 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
         found.extend(checks::invariants(lang, &facts.invariants));
     }
     found.extend(claude_code(lang, profile, &exe));
+    let imported = inspection.facts.as_ref().map(|f| f.claude_code_imports.as_slice()).unwrap_or_default();
+    found.extend(native_memory(lang, profile, imported));
 
     let summary = Summary::of(&found);
     Ok(Report {
@@ -303,6 +305,38 @@ fn claude_code(lang: Lang, profile: Profile, exe: &Path) -> Vec<Finding> {
         Err(e) => mcp::Config::Unreadable(e.to_string()),
     };
     mcp::mcp(lang, &path, &config, profile, exe, Path::is_file)
+}
+
+/// Claude Code's own memory beside this profile's, from the names of its
+/// files under the client's projects directory, never their text.
+fn native_memory(lang: Lang, profile: Profile, imported: &[String]) -> Vec<Finding> {
+    let home = clawg_core::paths::home_dir();
+    let Ok((servers, settings, _)) = crate::setup::locations(home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR")) else {
+        return Vec::new();
+    };
+    let config = match std::fs::read_to_string(&servers) {
+        Ok(text) => mcp::Config::Text(text),
+        Err(_) => mcp::Config::Missing,
+    };
+    let Some(dir) = settings.parent().map(|d| d.join("projects")) else { return Vec::new() };
+    checks::native_memory(lang, &dir, &topic_files(&dir), imported, mcp::registered(&config, profile), profile)
+}
+
+/// Every topic file of every project's memory directory under `projects`, by
+/// project and file name, in order.
+fn topic_files(projects: &Path) -> Vec<(String, String)> {
+    use clawg_core::memory::portability::claude_code::{is_topic_file, MEMORY_DIR};
+    let mut files = Vec::new();
+    let mut names = names_in(projects);
+    names.sort();
+    for project in names {
+        let memory = projects.join(&project).join(MEMORY_DIR);
+        let mut topics: Vec<String> =
+            names_in(&memory).into_iter().filter(|f| is_topic_file(f) && memory.join(f).is_file()).collect();
+        topics.sort();
+        files.extend(topics.into_iter().map(|file| (project.clone(), file)));
+    }
+    files
 }
 
 #[cfg(test)]

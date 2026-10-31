@@ -128,6 +128,15 @@ pub fn mcp(lang: Lang, path: &Path, config: &Config, profile: Profile, exe: &Pat
     found
 }
 
+/// Whether `config` gives Claude Code a server for `profile`, however it
+/// starts it.
+pub fn registered(config: &Config, profile: Profile) -> bool {
+    let Config::Text(text) = config else { return false };
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .is_some_and(|parsed| parsed.get("mcpServers").and_then(|m| m.get(profile.mcp_server_name())).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +158,16 @@ mod tests {
     }
 
     const AGENT: [&str; 5] = ["mcp", "--profile", "dev", "--agent", "claude-code"];
+
+    #[test]
+    fn a_server_is_registered_when_the_config_names_it() {
+        assert!(registered(&config(&exe("bin"), &AGENT), Profile::Dev));
+        assert!(!registered(&config(&exe("bin"), &AGENT), Profile::Prod), "another profile's server");
+        assert!(!registered(&Config::Missing, Profile::Dev));
+        assert!(!registered(&Config::Unreadable("denied".into()), Profile::Dev));
+        assert!(!registered(&Config::Text("{ not json".into()), Profile::Dev));
+        assert!(!registered(&Config::Text(r#"{"mcpServers": {}}"#.into()), Profile::Dev));
+    }
 
     #[test]
     fn mcp_findings() {
