@@ -127,7 +127,7 @@ Por cada pedido de pasajes el decorador MUST consultar la memoria **tal como est
 - `--fake` MUST NOT usarla nunca; `--no-cache` sin `--docs` MUST ser un error de uso (salida 1), como `--root` sin `--docs`.
 - Vive en `docs/eval/cache/`, resuelta como `default_out_dir` (`crates/clawg-eval/src/bin/rag-eval/cli.rs:291-298`), sin depender del directorio de trabajo, junto a `docs/eval/results/` y fuera de git (`docs/eval/**`, `.gitignore:32`). No hay bandera para elegir otra carpeta.
 - MUST guardar sólo claves y vectores (los `f32` exactos), nunca texto ni rutas.
-- Se acumula sin purga: una corrida no borra lo que no usó. Se limpia borrando la carpeta, y `--help` MUST decirlo, con el tamaño que ocupa por contrato (17 584 pasajes × (32 + 384 × 4) bytes ≈ 27,6 MB como cota).
+- Se acumula sin purga: una corrida no borra lo que no usó. Se limpia borrando la carpeta, y `--help` MUST decirlo, con lo que ocupa: 1568 bytes (32 + 384 × 4) por texto distinto y por contrato. MUST NOT dar una cota, porque la memoria crece con el corpus y con cada corrida que embebe un texto que no tiene: con los 18 249 pasajes del 2026-10-31 ocupa 28,6 MB.
 - Un doc que cambia MUST embeber sólo los textos que no están en la memoria; los de sus pasajes sin cambios salen de ella.
 - Si un vector que devuelve el embedder de verdad no sirve (cuenta distinta, dimensión o valor no finito), el decorador MUST fallar igual que sin memoria y MUST NOT guardarlo.
 
@@ -264,7 +264,7 @@ Una corrida en la que ningún pasaje salió de la memoria (`from_memo = 0`: con 
 
 `rag-eval --docs` MUST repartir lo que mide en tres áreas según la ruta relativa de cada doc: `archive` si empieza con `openspec/changes/archive/`; si no, `code` para `DocKind::Code` y `docs` para el resto (Markdown y manifiestos). La decisión MUST ser pura (ruta y tipo) y MUST vivir en `rag-eval`: producción MUST NOT nombrar `archive/` ni recibir un clasificador del lado de la evaluación que la cambie, y el refresco MUST NOT filtrar por área. El prefijo se compara con la ruta relativa con `/`, y `openspec/changes/archived/x.md` y `openspec/changes/archive.md` no cuentan como archivo.
 
-`index.by_area.{docs,code,archive}` MUST llevar, para cada área: `docs` (docs reindexados), `passages`, `multi_batch_docs` (docs con más de `EMBED_BATCH` pasajes), `phases.{read,mask,split,lookup,embed,write}` (la suma de los docs del área) y `tokens.{real,padded,multi_batch_real,multi_batch_padded}`, donde `multi_batch_*` suman sólo los docs con más de `EMBED_BATCH` pasajes. `scan` no se reparte: es del recorrido entero. La suma de las tres áreas MUST dar los totales de `index.phases` (menos `scan`), `corpus.passages` y `index.tokens.{real,padded}`.
+`index.by_area.{docs,code,archive}` MUST llevar, para cada área: `docs` (docs reindexados), `passages`, `multi_batch_docs` (docs con más de `EMBED_BATCH` pasajes), `phases.{read,mask,split,lookup,embed,write}` (la suma de los docs del área) y `tokens.{real,padded,multi_batch_real,multi_batch_padded}`, donde `multi_batch_*` suman sólo los docs con más de `EMBED_BATCH` pasajes. `scan` no se reparte: es del recorrido entero. Tampoco la remoción de los docs que ya no están, que IC1 cuenta en `write` y no es de ningún doc. La suma de las tres áreas MUST dar los totales de `index.phases` menos `scan` (con `write` más la remoción igual a `index.phases.write`), `corpus.passages` e `index.tokens.{real,padded}`.
 
 #### Escenario: la ruta decide
 - GIVEN `openspec/changes/archive/2026-01-01-x/proposal.md`, `docs/a.md`, `Cargo.toml` y `crates/x/src/lib.rs`
@@ -286,12 +286,17 @@ Una corrida en la que ningún pasaje salió de la memoria (`from_memo = 0`: con 
 - WHEN se reparten
 - THEN la suma de cada fase, de los pasajes y de los tokens por área da el total
 
+#### Escenario: la remoción no es de ningún área
+- GIVEN un refresco que borró docs que ya no están, con una remoción mayor que cero
+- WHEN se reparte
+- THEN el `write` de las áreas más la remoción da `index.phases.write`
+
 #### Escenario: una tanda múltiple
 - GIVEN un doc de 20 pasajes y uno de 3 en `docs`
 - WHEN se reparten
 - THEN `multi_batch_docs` vale 1 y `multi_batch_real` y `multi_batch_padded` suman sólo el de 20
 
-**Tests (fallan hoy):** `area_of_a_path_is_decided_by_its_prefix_and_kind` (tabla), `areas_add_up_to_the_totals` y `only_docs_over_a_batch_count_as_multi_batch` en el módulo de áreas de `rag-eval`; un test que busca el texto `archive/` en `crates/clawg-core/src` y falla si aparece en el refresco (`production_never_names_the_archive`).
+**Tests (fallan hoy):** `area_of_a_path_is_decided_by_its_prefix_and_kind` (tabla), `areas_add_up_to_the_totals`, `the_removal_of_docs_is_in_the_total_write_and_in_no_area` y `only_docs_over_a_batch_count_as_multi_batch` en el módulo de áreas de `rag-eval`; un test que busca el texto `archive/` en las fuentes del refresco, `crates/clawg-core/src/memory/project_docs/`, y falla si aparece (`production_never_names_the_archive`).
 
 ### IC8. El bloque `index` del archivo de resultados y el informe
 

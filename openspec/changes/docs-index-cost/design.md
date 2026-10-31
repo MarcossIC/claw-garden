@@ -125,7 +125,7 @@ Formato, todo little-endian:
 | cada entrada: clave y `dimensions` `f32` (`to_le_bytes`) | 32 + 4 × `dimensions` |
 | SHA-256 de todo lo anterior | 32 |
 
-Las entradas van ordenadas por clave, así que el mismo contenido da los mismos bytes. Para este corpus: 56 + 17 584 × 1 568 + 32 bytes, unos 27,6 MB, la cota de la propuesta.
+Las entradas van ordenadas por clave, así que el mismo contenido da los mismos bytes. Para el corpus de la propuesta: 56 + 17 584 × 1 568 + 32 bytes, unos 27,6 MB. No es una cota: el archivo guarda una entrada por texto distinto que alguna corrida embebió y nunca se purga, así que crece con el corpus. La corrida D del cierre escribió 56 + 18 245 × 1 568 + 32 = 28 608 248 bytes.
 
 - **Leer** (`decode(bytes, contract) -> Result<HashMap<[u8;32], Vec<f32>>, MemoUnreadable>`, pura): una marca distinta, una versión que no es `1`, otro `contract_digest`, otra dimensión, un largo que no es exactamente el que dicen la cabecera y las entradas, o un SHA final que no coincide, dan un `MemoUnreadable` (`thiserror`) y ningún vector. El SHA final separa un archivo entero de uno dañado en el medio, no sólo de uno truncado; cuesta un hash de 27,6 MB por lectura y otro por escritura, que van a `memo.seconds`. I/O: `std::fs::read`; un archivo que no existe es una memoria vacía sin aviso (la primera corrida), cualquier otro error de lectura es un `MemoUnreadable` con su causa.
 - **Escribir** (`encode(&mut impl Write, contract, entries)`, sobre cualquier `Write`, y `replace_file(path, write)`, I/O): crea la carpeta si falta, crea `{nombre}.tmp-{uuid}` con `create_new` en la misma carpeta, escribe por un `BufWriter`, `sync_all`, y renombra sobre el nombre de la memoria (`std::fs::rename` reemplaza en Windows y en Unix). Si algo falla, borra el temporal y devuelve el error: la memoria anterior queda como estaba. `uuid` ya es dependencia del núcleo. Un proceso matado puede dejar un `.tmp-`, que ninguna lectura abre y que borrar la carpeta limpia.
@@ -240,7 +240,7 @@ index: {
 - `Cli::cache_dir`, sin bandera, lo pone `default_cache_dir()`: `docs/eval/cache` resuelto desde `CARGO_MANIFEST_DIR` como `default_out_dir` (`cli.rs:291-298`), al lado de `results/` y bajo `docs/eval/**` (`.gitignore:32`). Es un campo para que los tests de `docs.rs` lo apunten a un temporal; ninguna bandera lo cambia.
 - `memo_dir(cli) -> Option<&Path>`, pura: `Some(cache_dir)` sólo con `--real --docs` sin `--no-cache`. `docs::measure` abre `EvalMemo` sólo cuando da `Some`, así que con `--fake` o `--no-cache` la carpeta ni se lee ni se crea.
 - Los tests de la carpeta (`no_cache_leaves_the_folder_byte_for_byte`, `docs_mode_with_the_fake_embedder_never_touches_the_memo`) van en `docs.rs` y no en `crates/clawg-eval/tests/docs_mode.rs`: el binario resuelve siempre `docs/eval/cache` del workspace y no hay bandera para apuntarlo a un temporal, mientras que un test de `docs.rs` arma el `Cli` con `cache_dir` en un `TempPath` y corre `run_in` (como `a_docs_run_removes_its_index`, `docs.rs:768-785`). `memo_dir` se prueba por tabla.
-- `--help` describe `--no-cache`, dice dónde vive la memoria, que se acumula sin purga, que se limpia borrando la carpeta y que ocupa a lo sumo unos 27,6 MB por contrato para este corpus.
+- `--help` describe `--no-cache`, dice dónde vive la memoria, que se acumula sin purga, que se limpia borrando la carpeta y que ocupa 1568 bytes por texto distinto y por contrato (unos 28 MB para este repositorio hoy), creciendo con cada corrida que embebe un texto nuevo, sin dar una cota.
 
 ## Visibilidad nueva y código movido
 
