@@ -87,4 +87,74 @@ Una a la vez, sin otra compilación ni prueba en marcha. Usan el modelo del perf
 ## Parte 3 — después de medir
 
 - [ ] A2 tiene su propia actualización de spec, diseño y tareas cuando A1 esté medido. No se hace aquí.
-- [ ] Archivar y subir la versión (minor) según `openspec/config.yaml` y `.claude/CLAUDE.md` sólo cuando el cambio se cierre, no ahora.
+- [ ] Archivar y subir la versión (minor) según `openspec/config.yaml` y `.claude/CLAUDE.md` sólo cuando el cambio se cierre, no ahora. (Ver Parte 8.)
+
+# Paso A2
+
+Requisitos IS6 a IS17 en la [spec](spec.md), «Paso A2», y decisiones D8 a D15 en el [diseño](design.md), «Paso A2». Las reglas de commit, TDD y comprobación son las de arriba. Antes del primer test de la Parte 4: `cargo clean --workspace --target-dir target-test` (otra versión de las fuentes).
+
+## Orden elegido
+
+La pieza pura de D8 sólo la llama la cuenta ignorada hasta que `refresh` la use, y sin llamador de producción sería código muerto (`tests/conventions.rs`, avisos como errores). Por eso vive en el módulo `#[cfg(test)]` en la Parte 4 y se promueve a producción en el mismo commit que `refresh` con la cola (Parte 6, grupo 1). Las Partes 6 y 7a sólo existen si la Parte 5 elige un tope.
+
+## Parte 4 — la cuenta del tope, sin modelo (lo hace apply)
+
+### 7. La cuenta ignorada y la decisión de vaciado (IS6, IS7; D8, D9)
+
+- [ ] RED en el módulo `tests` de `crates/clawg-core/src/memory/project_docs/mod.rs`, sobre una función pura `queue_flush` (nombre libre) definida dentro de ese mismo módulo, no en producción: `the_queue_limit_starts_at_one_batch_and_doubles_up_to_the_cap`, `the_queue_flushes_before_a_doc_that_would_pass_its_limit_and_when_it_reaches_it`, `a_doc_over_the_limit_is_a_flush_of_its_own`, `a_doc_with_no_passages_moves_no_flush`. Fallan por no compilar.
+- [ ] GREEN: la función recibe el tope c (parámetro) y lleva como único estado lo que retiene la cola y cuántos vaciados se hicieron; con el tamaño del doc que llega dice si vaciar antes y si vaciar después. Límite inicial `EMBED_BATCH`, se duplica por vaciado hasta c.
+- [ ] Escribir y compilar, sin correr, `padding_and_batches_by_queue_cap` (`#[ignore]`), junto a `sorting_across_docs_against_sorting_in_each_doc` (`mod.rs:2450`): sólo `load_verified_tokenizer` (como `real_model`, `:2339`) y los prefijos de `expected_contract()` (`embedder.rs:157-164`), sin sesión de ONNX; `CLAWG_DOCS_ROOT` cambia el árbol (por omisión, este repositorio); parte como `repo_docs` (`:2353`), en orden de ruta, con `passage_token_counts` (`embedder.rs:268-279`). Imprime P, B, Q, los pasajes de la llamada más grande y H (Σ 3 × bytes del texto + 1536, máximo sobre los vaciados) para: orden de los pasajes, en cada doc, la cola con c ∈ {64, 128, 256, 512, 1024, 2048, 4096} y todo junto; y P, B y Q en cada doc y todo junto sobre la muestra de `sorting_across_docs_…` (`:2455-2458`). No abre un store ni usa el temporal.
+- [ ] Comprobar: `cargo test -p clawg-core --target-dir target-test --lib the_queue` y `... a_doc_with_no_passages_moves_no_flush` pasan; `cargo test -p clawg-core --target-dir target-test --no-run` compila. NO correr la cuenta.
+- Commit: `test(project-docs): count the padding and batches of a bounded queue`
+
+## Parte 5 — correr la cuenta (sólo el tokenizer; autorización; la pide el orquestador, apply no la corre)
+
+Usa `CLAWG_E5_MODEL_DIR` del perfil dev (`<data dir dev>/models/multilingual-e5-small`, sólo lectura), nunca `~/.clawg`. Sin otra compilación en marcha; no matar ningún `clawg.exe`.
+
+- [ ] 5a. Sobre HEAD y este repositorio: `CLAWG_E5_MODEL_DIR=… cargo test -p clawg-core --lib --target-dir target-test padding_and_batches_by_queue_cap -- --ignored --nocapture`. Guardar la salida (P, B, Q, pasajes, H por orden y por c).
+- [ ] 5b. Las tandas «en cada doc» del techo: worktree descartable de `0c9d49a` y `CLAWG_DOCS_ROOT=<worktree>`; la prueba se lleva al worktree (como parche fuera del repo) con su propio `target-test` dentro. Validar que reproduce P = 1 998 461 (en cada doc) y 1 614 977 (todo junto) sobre la muestra; si no, B no vale y la Parte 5 se detiene y se informa. Tomar B de cada doc de la muestra (197 docs, Σ ⌈n/16⌉) y B todo junto (329). Borrar el worktree y su build: en Windows, `cmd //c 'rd /s /q "\\?\<ruta>"'` y `git worktree prune`.
+- [ ] 5c. Aplicar la regla de D9 tal cual: ρ_X, R_X(c), previsto(c) = 0,210 × min(1, min_X ρ_X(corpus) / ρ_X(muestra)) × min_X R_X(c), y elegir el menor c con H(c) ≤ 16 MiB y previsto(c) ≥ 0,18. Escribir en `verify.md` («A2: la cuenta del tope») la tabla (P, B, Q, H, R_X y previsto por c, y la muestra) y la decisión. Commit: `docs(openspec): record the queue cap count`.
+- [ ] 5d. **Si ningún c cumple:** A2 se cierra sin código de producción. Se saltan la Parte 6, la Parte 7 completa (incluida 7a) y el chequeo de pico; IS7 a IS17 quedan sin implementar salvo IS6. Se marcan como no aplicables, el cambio va a archivo junto con A1 (Parte 8) y no hay commit de producción.
+- [ ] 5e. **Si uno cumple:** `QUEUE_PASSAGES` = ese c y sigue la Parte 6.
+
+## Parte 6 — código de producción (sólo si la Parte 5 eligió un tope; lo hace apply)
+
+### 8. `refresh` embebe en vaciados de una cola (IS7 a IS14; D8 a D12)
+
+- [ ] RED en `project_docs/mod.rs`, con `Batches` (`:2031`), el tokenizer de palabras, `try_refresh` y `test_dir()`: `small_docs_share_one_call_to_the_embedder`, `no_call_holds_more_passages_than_the_cap_unless_it_is_one_doc` (docs que suman más que `QUEUE_PASSAGES`), `each_passage_of_a_shared_call_keeps_its_own_vector`, `an_unusable_vector_in_a_shared_call_skips_only_its_doc`, `a_shared_call_writes_its_docs_in_plan_order` (también compara `RefreshReport`), `an_embedder_error_keeps_the_docs_of_its_call_as_they_were`, `embed_shares_split_the_time_by_texts_and_add_up_to_it` (pura) y `every_doc_of_a_shared_call_has_embed_time`. Siguen pasando: `a_doc_over_a_batch_reaches_the_embedder_longest_first`, `a_failed_embedding_keeps_the_doc_as_it_was`, `a_short_batch_still_aborts_the_refresh`, `an_unusable_vector_skips_its_doc_and_the_rest_go_on`, `a_refresh_times_a_doc_whose_vector_is_unusable`, las dos de `vector_memo.rs:889-930` y `the_docs_timing_line_names_every_phase` (`api.rs:3207`).
+- [ ] GREEN: promover la pieza de la Parte 4 a producción (`const QUEUE_PASSAGES` = c elegido, la prueba de la Parte 4 llama ahora a la de producción); `refresh` (`:515-563`) lee, enmascara, parte y busca vectores de cada doc y lo encola; al vaciar manda los textos en el orden del plan por `passage_order` sobre la lista entera, vuelve con `in_passage_order` y reparte por doc; cada doc pasa por `to_unit` (inutilizable a `failed`), `fill` y `replace_doc` en el orden del plan; vaciar al terminar el plan antes de `remove_docs`. `embed_passages` pasa a embeber un vaciado y devolver el resultado de cada doc; `Embed` y `VectorCount` nombran el primer doc, con `passages` = textos del vaciado. Los textos se ordenan moviéndolos, sin clonarlos (D13). `embed_shares` reparte el `lap` en nanosegundos enteros con el resto al último doc; un `DocTiming` se agrega al escribirse o fallar el doc. Actualizar los comentarios de los errores y el de «one changed doc» (`:518-520`).
+- [ ] Docs: `docs/reference/daemon.md`, en el párrafo del índice de docs: la cola, su tope, el límite que crece, los fallos y que `embed` incluye contar, ordenar y repartir.
+- [ ] Comprobar: `cargo test -p clawg-core --target-dir target-test project_docs` y `cargo test -p clawg-cli --target-dir target-test docs_timing`.
+- Commit: `perf(project-docs): embed the docs of a refresh in shared calls`
+
+### 9. La evaluación agrupa como el refresco (IS15; D14)
+
+- [ ] RED en `crates/clawg-core/src/eval_api.rs`: `queue_groups_are_the_calls_a_refresh_makes` (con `--features eval`: los grupos que da `queue_groups` son las llamadas que registra un refresco con `Recording`).
+- [ ] GREEN: `pub fn queue_groups(passages_per_doc: &[usize]) -> Vec<Vec<usize>>` (nombre y forma libres), que delega en la pieza de producción con `QUEUE_PASSAGES`, como `eval_api::passage_order` (`:1196`).
+- [ ] Comprobar: `cargo test -p clawg-core --features eval --target-dir target-test --lib eval_api`.
+- Commit: `feat(eval): expose how a docs refresh groups its docs into calls`
+
+### 10. `padded_sorted_queue` y el aviso (IS15; D14)
+
+- [ ] RED en `crates/clawg-eval/src/bin/rag-eval/index_cost.rs`: `padded_sorted_queue_sorts_each_group_of_docs_together`, `the_padding_warning_compares_with_the_queue_padding` (`padded_sorted_queue = 800`, `padded_ran = 800`: sin aviso; con 900 avisa y nombra 800 y 900; con `from_memo > 0`, nunca) y reescribir `the_padding_warning_names_both_numbers` y `a_mismatch_between_computed_and_ran_padding_warns_only_when_nothing_came_from_the_memo` sobre ese campo.
+- [ ] GREEN: `tokens.padded_sorted_queue` (grupos de `queue_groups` sobre los docs en orden de ruta, cada uno con `padded_sorted`, `:96`); `padding_warning` (`:154`) compara contra él; `Tokens::line` y los comentarios de `Tokens`. `padded` y `padded_sorted_in_doc` no cambian de nombre ni de sentido.
+- [ ] Docs: `docs/reference/testing.md` si describe el aviso.
+- [ ] Comprobar: `cargo test -p clawg-eval --target-dir target-test index_cost`.
+- Commit: `feat(eval): warn when the padding that ran differs from the queue order`
+
+### Cierre de la Parte 6
+
+- [ ] Sobre el último commit: `cargo test --workspace --target-dir target-test` y los dos clippy de arriba. Ambos deben pasar sin avisos.
+
+## Parte 7 — medir (modelo real, release, autorización; la pide el orquestador, apply no la corre)
+
+- [ ] 7a. Escribir y compilar, sin correr: el tercer orden de `sorting_across_docs_against_sorting_in_each_doc` (D15), la cola con `QUEUE_PASSAGES` por la función de vaciado de producción; informa cuántos vectores dan los mismos bits que en cada doc, la diferencia mayor y, en debug, el tiempo de la cola (vista previa, no decide). No hay caso nuevo en `e5_golden` ni cambia su tolerancia. Comprobar con `--no-run` y los dos clippy. Commit: `test(project-docs): report whether the queue order moves bits`.
+- [ ] 7b. Bits (modelo real): `CLAWG_E5_MODEL_DIR=… CLAWG_EMBED_PASSAGES=5000 CLAWG_EMBED_RUNS=3 cargo test -p clawg-core --lib --target-dir target-test sorting_across_docs_against_sorting_in_each_doc -- --ignored --nocapture`. Si algún bit se mueve, vale la decisión 4 (≤ 1e-6 y `--diff` sin cambios; si no, el paso cae). Si no se mueve ninguno, nada guardado cambia.
+- [ ] 7c. «Se queda si»: base = último commit de código de A1 (`eafcb8a`, o el que el orquestador fije), paso = HEAD. Corridas alternadas `rag-eval --real --docs --no-cache` de release, 3 pares (base, paso, base, paso, base, paso), con `CLAWG_PROFILE=dev`, el mismo worktree de corpus congelado y `--root`, `--golden` y `--out` explícitos. La base se compila en un worktree descartable con su propio build; el paso en `target-test`. Se llaman los binarios directamente después de compilar, sin otra compilación ni corrida en paralelo. Se comparan corridas vecinas del mismo régimen de la máquina, con `phases.split` como indicador (como `verify.md`, «A1: «se queda si»»); un par que cruza un cambio de régimen no se usa. Condiciones: `phases.embed` baja ≥ 15 %; `tokens.padded_ran == tokens.padded_sorted_queue` y sin aviso en cada corrida del paso; `--diff` base-n contra paso-n no mueve ninguna pregunta; decisión 4.
+- [ ] 7d. Pico de memoria (D13, con autorización): perfil dev sin otro daemon dev, builds release, un `clawg serve --profile dev` nuevo por rama, copia congelada del corpus registrada con `clawg projects add`, esperar `docs refresh of …: done` y un minuto más, leer `clawg metrics report --metric process.private_peak_bytes --by minute --since 1h --profile dev`; alternar base, paso, base, paso y comparar vecinas. Si el pico ya está fijado antes del refresco en las dos ramas, leer el máximo por minuto de `process.private_bytes` durante el refresco. Condición: ≤ 5 %.
+- [ ] 7e. Registrar en `verify.md` («A2: «se queda si»») por corrida `index_seconds`, `phases.*`, `tokens.*` y `by_area`, el pico y los bits, con el veredicto de cada condición. Si A2 no se queda, se revierten los commits 8 a 10 (y 7a) y se cierra con la tabla de la Parte 5. Commit: `docs(openspec): record the queue ordering measurement`.
+- [ ] 7f. Borrar los worktrees (corpus y base), sus directorios de build, las copias del corpus y sus proyectos del perfil dev. Si el paso se adopta y algún bit se movió, vaciar `docs/eval/cache/`. La tarea termina sin ningún build dir que no sea `target` y `target-test`.
+
+## Parte 8 — cierre
+
+- [ ] Archivar el cambio (A1 y, si se adoptó, A2) y subir la versión (minor) según `openspec/config.yaml` y `.claude/CLAUDE.md`, con `cargo update --workspace` y `chore: bump version to X.Y.Z`; sólo cuando el cambio se cierre. Si A2 cerró en 5d, se archiva con A1 sin código de A2.
