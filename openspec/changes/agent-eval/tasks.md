@@ -29,7 +29,7 @@ Un binario es un crate: una función que sólo usa otro módulo todavía ausente
 
 ## 5. Verificación
 
-- [ ] Suite completa y los dos clippy sobre el último commit.
+- [x] Suite completa y clippy sobre el último commit: pasan.
 
 ## Después de este cambio
 

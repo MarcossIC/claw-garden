@@ -9,6 +9,6 @@ artifacts:
   design: skipped  # las decisiones están en la propuesta
   tasks: done
   apply: done  # grupos 1 a 4
-  verify: pending
+  verify: pending  # la suite y clippy pasan; falta la primera sesión real
   archive: pending
 updated: 2026-10-31
