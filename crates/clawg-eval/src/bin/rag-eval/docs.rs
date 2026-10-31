@@ -1172,14 +1172,14 @@ mod tests {
             json["tokens"],
             serde_json::json!({
                 "real": 75, "padded": 120, "padded_ran": 120,
-                "padded_sorted_in_doc": 120, "padded_sorted_all": 120, "count_seconds": 0.25
+                "padded_sorted_in_doc": 120, "padded_sorted_queue": 120, "padded_sorted_all": 120, "count_seconds": 0.25
             })
         );
         let text = serde_json::to_string(&json).unwrap();
         assert!(!text.contains("doc0"), "no path: {text}");
         let results = [CaseResult { case: &two_cases()[0], rank: Some(1), top: None, code: false }];
         let report = render(&EvalDocReport { docs: 2, passages: 5, skipped: 1 }, Duration::ZERO, &[], &results, &Phases::default(), Some(RealRun { block: &block, memo: None }));
-        assert!(report.contains("tokens: real 75  padded 120  ran 120  sorted in doc 120  sorted in run 120  counted in 0.25 s\n"), "{report}");
+        assert!(report.contains("tokens: real 75  padded 120  ran 120  sorted in doc 120  sorted in queue 120  sorted in run 120  counted in 0.25 s\n"), "{report}");
     }
 
     #[test]
