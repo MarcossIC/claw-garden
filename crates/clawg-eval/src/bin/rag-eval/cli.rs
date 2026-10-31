@@ -4,7 +4,7 @@
 //! builder API whose main job would be parsing two mutually exclusive flags
 //! and four optional ones.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which embedder backs a run. Exactly one of `--fake`/`--real` is required
 /// unless `--help` was given; the two are mutually exclusive with each
@@ -90,6 +90,11 @@ pub struct Cli {
     /// `--keep-store`: leave the store a run seeds on disk and name it, to
     /// open the database behind a number. Without it the run removes it.
     pub keep_store: bool,
+    /// `--no-cache`: a docs run neither reads nor writes the vector memo.
+    pub no_cache: bool,
+    /// Where the vector memo lives. No flag sets it: a test points it at a
+    /// temporary folder.
+    pub cache_dir: PathBuf,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -133,6 +138,8 @@ pub enum CliError {
     DocsWithOtherMode,
     #[error("--root is only meaningful with --docs")]
     RootWithoutDocs,
+    #[error("--no-cache is only meaningful with --docs")]
+    NoCacheWithoutDocs,
     #[error("--lexical-only is mutually exclusive with --agent-view, --follow-up, --docs and the sweep flags (--sweep-imp, --sweep-cos-floor, --sweep-lexical, --fts-tokenizer)")]
     LexicalOnlyWithOtherMode,
     #[error("--fail-on-regression is only meaningful with --diff")]
@@ -226,6 +233,14 @@ OPTIONS:
                          the primary metric. --fake only prints. Mutually exclusive with
                          --audit, --follow-up, --agent-view and every sweep flag.
     --root <dir>        With --docs: the project to index (default: this workspace)
+    --no-cache          With --docs: neither read nor write the vector memo. A real docs run
+                         keeps the vectors of the passages it embeds in docs/eval/cache/, next
+                         to the results folder and outside git, and the next run embeds only
+                         the texts that are not there. The folder is never purged: a run does
+                         not remove what it did not use. To clean it, delete the folder. It
+                         holds only keys and vectors, at most about 27.6 MB per model contract
+                         for this workspace (17,584 passages x (32 + 384 x 4) bytes). Use this
+                         flag to time a run that embeds every passage, as production does.
     --lexical-only      Rank every case by the lexical channel alone: the same FTS5 match and
                          bm25 order the full search uses, with no vectors and no scoring. A
                          floor for the full ranking; writes {date}-{mode}-lexical-only.json,
@@ -297,6 +312,23 @@ pub fn default_out_dir() -> PathBuf {
         .join("results")
 }
 
+/// Default folder of the vector memo, resolved like [`default_out_dir`], beside
+/// the results folder.
+pub fn default_cache_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("eval")
+        .join("cache")
+}
+
+/// The vector memo's folder when this run uses one: only a real docs run that
+/// did not ask for none. A fake run embeds nothing a memo could keep.
+pub fn memo_dir(cli: &Cli) -> Option<&Path> {
+    (cli.docs && matches!(cli.mode, Mode::Real) && !cli.no_cache).then_some(cli.cache_dir.as_path())
+}
+
 /// Parses an argv-shaped iterator. The first element (the program name, the
 /// same thing `std::env::args()` yields at index 0) is skipped unconditionally.
 pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, CliError> {
@@ -322,6 +354,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut lang_detect = false;
     let mut background: Option<PathBuf> = None;
     let mut keep_store = false;
+    let mut no_cache = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -363,6 +396,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
             "--check-only" => check_only = true,
             "--force" => force = true,
             "--keep-store" => keep_store = true,
+            "--no-cache" => no_cache = true,
             "--audit" => audit = true,
             "--golden" => {
                 let value = args
@@ -487,6 +521,9 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     if docs_root.is_some() && !docs {
         return Err(CliError::RootWithoutDocs);
     }
+    if no_cache && !docs {
+        return Err(CliError::NoCacheWithoutDocs);
+    }
 
     let default_golden = if docs { default_docs_golden_path } else { default_golden_path };
     Ok(ParseOutcome::Run(Cli {
@@ -508,6 +545,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         lexical_only,
         background,
         keep_store,
+        no_cache,
+        cache_dir: default_cache_dir(),
     }))
 }
 
@@ -1054,5 +1093,48 @@ mod tests {
         assert!(HELP_TEXT.contains("--docs"));
         assert!(HELP_TEXT.contains("--root <dir>"));
         assert!(HELP_TEXT.contains("{date}-real-docs.json"));
+    }
+
+    #[test]
+    fn no_cache_without_docs_is_an_error() {
+        for args in [&["--fake", "--no-cache"][..], &["--real", "--no-cache"]] {
+            assert_eq!(parse(argv(args)).expect_err("--no-cache needs --docs"), CliError::NoCacheWithoutDocs, "{args:?}");
+        }
+        assert!(run_cli(&["--fake", "--docs", "--no-cache"]).no_cache);
+        assert!(run_cli(&["--real", "--docs", "--no-cache"]).no_cache);
+        assert!(!run_cli(&["--real", "--docs"]).no_cache);
+    }
+
+    #[test]
+    fn the_memo_folder_sits_next_to_the_results_folder() {
+        let cache = default_cache_dir();
+
+        assert_eq!(cache.file_name(), Some(std::ffi::OsStr::new("cache")));
+        assert_eq!(cache.parent(), default_out_dir().parent());
+        assert_eq!(run_cli(&["--real", "--docs"]).cache_dir, cache);
+    }
+
+    #[test]
+    fn the_memo_is_used_only_by_a_real_docs_run_that_did_not_ask_for_none() {
+        let table: [(&[&str], bool); 6] = [
+            (&["--real", "--docs"], true),
+            (&["--real", "--docs", "--no-cache"], false),
+            (&["--fake", "--docs"], false),
+            (&["--fake", "--docs", "--no-cache"], false),
+            (&["--real"], false),
+            (&["--fake"], false),
+        ];
+
+        for (args, used) in table {
+            let cli = run_cli(args);
+            assert_eq!(memo_dir(&cli), used.then_some(cli.cache_dir.as_path()), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn the_help_text_documents_no_cache() {
+        for needle in ["--no-cache", "docs/eval/cache", "never purged", "delete the folder", "27.6 MB"] {
+            assert!(HELP_TEXT.contains(needle), "{needle}");
+        }
     }
 }

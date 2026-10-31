@@ -116,3 +116,28 @@ fn docs_mode_refuses_an_expected_doc_that_quotes_a_question() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("q1") && stderr.contains("docs/backups.md"), "{stderr}");
 }
+
+#[test]
+fn docs_mode_with_the_fake_embedder_writes_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    project(&root);
+    let golden = dir.path().join("golden.json");
+    std::fs::write(&golden, r#"[{"id": "q1", "question": "daemon stop", "expected": [{"path": "README.md"}]}]"#).unwrap();
+    let out_dir = dir.path().join("results");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rag-eval"))
+        .args(["--fake", "--docs", "--root"])
+        .arg(&root)
+        .arg("--golden")
+        .arg(&golden)
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .expect("rag-eval must start");
+
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!out_dir.exists(), "a fake run writes no results file");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(leftovers.len(), 2, "only the repo and the golden set: {leftovers:?}");
+}

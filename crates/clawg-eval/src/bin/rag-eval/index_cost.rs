@@ -72,6 +72,18 @@ impl MemoBlock {
     }
 }
 
+/// The report line for the vector memo: the file a run used and what came
+/// from it, or that it used none.
+pub fn memo_line(memo: Option<&EvalMemoReport>) -> String {
+    match memo {
+        Some(m) => format!(
+            "vector memo {}: {} from the memo, {} embedded, {:.2} s\n",
+            m.file, m.from_memo, m.embedded, m.seconds
+        ),
+        None => "vector memo: not used (--no-cache)\n".to_string(),
+    }
+}
+
 /// Tokens a model run pads a list of passage lengths to: the passages in runs
 /// of `EMBED_BATCH`, in order, each run as many rows as it holds times its
 /// longest.

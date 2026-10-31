@@ -7,14 +7,14 @@ use std::time::{Duration, Instant};
 
 use clawg_core::eval_api::{
     doc_paths, is_code_path, session_threads, EvalCpu, EvalDocHit, EvalDocIndex, EvalDocReport, EvalEmbedder, EvalError,
-    EvalIndexRun,
+    EvalIndexRun, EvalMemo, EvalMemoReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cli::Cli;
+use crate::cli::{memo_dir, Cli};
 use crate::diff::{metric_line, verdict, MetricDiff, METRIC_HEADER};
-use crate::index_cost::{padding_warning, IndexBlock, Phases, Tokens};
+use crate::index_cost::{memo_line, padding_warning, IndexBlock, Phases, Tokens};
 use crate::report::{Mode, ReportError};
 use crate::stats::{paired_bootstrap_ci, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED};
 use crate::{EXIT_GOLDEN_INVALID, EXIT_OK, EXIT_RESULTS_EXISTS, EXIT_RUNTIME_FAILURE};
@@ -228,13 +228,20 @@ fn left_out_line(left_out: &[String]) -> String {
     }
 }
 
+/// What only a run that writes a results file has to report.
+pub struct RealRun<'a> {
+    pub block: &'a IndexBlock,
+    /// `None` when the run used no memo.
+    pub memo: Option<&'a EvalMemoReport>,
+}
+
 pub fn render(
     report: &EvalDocReport,
     took: Duration,
     left_out: &[String],
     results: &[CaseResult<'_>],
     phases: &Phases,
-    index: Option<&IndexBlock>,
+    real: Option<RealRun<'_>>,
 ) -> String {
     let all: Vec<&CaseResult<'_>> = results.iter().collect();
     let mut out = format!(
@@ -244,8 +251,8 @@ pub fn render(
         report.skipped,
         took.as_secs_f64(),
         phases.line(),
-        index.and_then(|i| i.tokens.as_ref()).map_or(String::new(), Tokens::line),
-        index.map_or(String::new(), |i| i.by_area.lines()),
+        real.as_ref().and_then(|r| r.block.tokens.as_ref()).map_or(String::new(), Tokens::line),
+        real.as_ref().map_or(String::new(), |r| memo_line(r.memo) + &r.block.by_area.lines()),
         left_out_line(left_out),
         score_line(&all),
     );
@@ -680,14 +687,20 @@ async fn measure(
         crate::cli::Mode::Real => base_dir,
         crate::cli::Mode::Fake => scratch,
     };
-    let index = match EvalDocIndex::open(scratch, embedder, tokenizer_dir).await {
+    // Read before the index is timed, so the memo's seconds stay out of it.
+    let memo = memo_dir(cli).map(|dir| EvalMemo::open(embedder, dir));
+    if let Some(warning) = memo.as_ref().and_then(EvalMemo::warning) {
+        eprintln!("warning: {warning}");
+    }
+    let memoized = memo.as_ref().map(EvalMemo::embedder);
+    let index = match EvalDocIndex::open(scratch, memoized.as_ref().unwrap_or(embedder), tokenizer_dir).await {
         Ok(index) => index,
         Err(e) => {
             eprintln!("{e}");
             return EXIT_RUNTIME_FAILURE;
         }
     };
-    let code = measure_with(cli, embedder, &index, cases, left_out, output).await;
+    let code = measure_with(cli, embedder, &index, memo.as_ref(), cases, left_out, output).await;
     if let Err(e) = index.close().await {
         eprintln!("warning: {e}");
     }
@@ -704,22 +717,27 @@ struct Output {
 /// The `index` block of a real run: the machine, the phases and the tokens
 /// of the passages `index` holds. A failure is already printed; its exit
 /// code comes back.
-async fn index_block(index: &EvalDocIndex, embedder: &EvalEmbedder, run: &EvalIndexRun) -> Result<IndexBlock, i32> {
+async fn index_block(
+    index: &EvalDocIndex,
+    embedder: &EvalEmbedder,
+    run: &EvalIndexRun,
+    memo: Option<&EvalMemoReport>,
+) -> Result<IndexBlock, i32> {
     let padded_ran = embedder.passage_tokens_ran();
     let lengths = index.passage_lengths().await.map_err(|e| {
         eprintln!("could not count the tokens of the passages: {e}");
         EXIT_RUNTIME_FAILURE
     })?;
     let tokens = lengths.as_ref().map(|l| Tokens::of(l, padded_ran));
-    // The memo is not read yet, so every passage was embedded.
-    if let Some(warning) = tokens.as_ref().and_then(|t| padding_warning(t, 0)) {
+    let from_memo = memo.map_or(0, |m| m.from_memo);
+    if let Some(warning) = tokens.as_ref().and_then(|t| padding_warning(t, from_memo)) {
         eprintln!("{warning}");
     }
     let threads = session_threads().map_err(|e| {
         eprintln!("{e}");
         EXIT_RUNTIME_FAILURE
     })?;
-    Ok(IndexBlock::new(run, lengths.as_ref(), None, EvalCpu::this(), threads, cfg!(debug_assertions), tokens))
+    Ok(IndexBlock::new(run, lengths.as_ref(), memo, EvalCpu::this(), threads, cfg!(debug_assertions), tokens))
 }
 
 /// Indexes the root but `left_out` into `index`, asks it every question,
@@ -728,6 +746,7 @@ async fn measure_with(
     cli: &Cli,
     embedder: &EvalEmbedder,
     index: &EvalDocIndex,
+    memo: Option<&EvalMemo>,
     cases: &[DocsCase],
     left_out: &[String],
     output: Output,
@@ -746,19 +765,29 @@ async fn measure_with(
     }
 
     let started = Instant::now();
-    let run = match index.index(&cli.docs_root, left_out).await {
+    let indexed = index.index(&cli.docs_root, left_out).await;
+    let took = started.elapsed();
+    // What the run embedded is kept whether or not it finished; the read
+    // warning was already said.
+    let memo_report = memo.map(|m| {
+        let finished = m.finish();
+        for warning in finished.warnings.iter().filter(|w| Some(w.as_str()) != m.warning()) {
+            eprintln!("warning: {warning}");
+        }
+        finished
+    });
+    let run = match indexed {
         Ok(run) => run,
         Err(e) => {
             eprintln!("indexing {} failed: {e}", cli.docs_root.display());
             return EXIT_RUNTIME_FAILURE;
         }
     };
-    let took = started.elapsed();
     let report = run.report;
     // Only a run that writes a file counts tokens; the padding the embedder
     // ran is read before the questions embed anything.
     let block = match &output.stamp {
-        Some(_) => match index_block(index, embedder, &run).await {
+        Some(_) => match index_block(index, embedder, &run, memo_report.as_ref()).await {
             Ok(block) => Some(block),
             Err(code) => return code,
         },
@@ -781,7 +810,7 @@ async fn measure_with(
             code: is_code_path(&case.expected[0].path),
         });
     }
-    print!("{}", render(&report, took, left_out, &results, &Phases::of(&run), block.as_ref()));
+    print!("{}", render(&report, took, left_out, &results, &Phases::of(&run), block.as_ref().map(|block| RealRun { block, memo: memo_report.as_ref() })));
     let (Some(stamp), Some(block)) = (output.stamp, block) else {
         return EXIT_OK;
     };
@@ -1153,7 +1182,7 @@ mod tests {
         let text = serde_json::to_string(&json).unwrap();
         assert!(!text.contains("doc0"), "no path: {text}");
         let results = [CaseResult { case: &two_cases()[0], rank: Some(1), top: None, code: false }];
-        let report = render(&EvalDocReport { docs: 2, passages: 5, skipped: 1 }, Duration::ZERO, &[], &results, &Phases::default(), Some(&block));
+        let report = render(&EvalDocReport { docs: 2, passages: 5, skipped: 1 }, Duration::ZERO, &[], &results, &Phases::default(), Some(RealRun { block: &block, memo: None }));
         assert!(report.contains("tokens: real 75  padded 120  ran 120  sorted in doc 120  sorted in run 120  counted in 0.25 s\n"), "{report}");
     }
 
@@ -1164,7 +1193,7 @@ mod tests {
         let results = [CaseResult { case: &cases[0], rank: Some(1), top: None, code: false }];
         let report = EvalDocReport { docs: 2, passages: 5, skipped: 1 };
 
-        let real = render(&report, Duration::ZERO, &[], &results, &Phases::default(), Some(&block));
+        let real = render(&report, Duration::ZERO, &[], &results, &Phases::default(), Some(RealRun { block: &block, memo: None }));
         let fake = render(&report, Duration::ZERO, &[], &results, &Phases::default(), None);
 
         assert!(real.contains("
@@ -1176,6 +1205,107 @@ mod tests {
         assert!(!fake.contains("archive:"), "{fake}");
     }
 
+    fn real_docs_cli(extra: &[&str], root: &Path, cache: &Path) -> Cli {
+        let mut args = vec!["rag-eval".to_string(), "--real".into(), "--docs".into(), "--root".into(), root.to_string_lossy().into()];
+        args.extend(extra.iter().map(|a| a.to_string()));
+        let Ok(crate::cli::ParseOutcome::Run(mut cli)) = crate::cli::parse(args.into_iter()) else {
+            panic!("the docs arguments parse");
+        };
+        cli.cache_dir = cache.to_path_buf();
+        cli
+    }
+
+    fn docs_root_with_one_doc() -> crate::test_temp::TempPath {
+        let root = crate::test_temp::temp_path("memo-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("README.md"), "# Proyecto\n## Apagado\nEl daemon se detiene con clawg stop.\n").unwrap();
+        root
+    }
+
+    fn one_case() -> Vec<DocsCase> {
+        parse(r#"[{"id": "q1", "question": "daemon stop", "expected": [{"path": "README.md"}]}]"#).unwrap()
+    }
+
+    /// The name and bytes of every file in `dir`, or `None` when it is not there.
+    fn folder_bytes(dir: &Path) -> Option<Vec<(String, Vec<u8>)>> {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .ok()?
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap())
+            })
+            .collect();
+        files.sort();
+        Some(files)
+    }
+
+    async fn run_with(cli: &Cli, root: &Path) -> i32 {
+        let scratch = crate::test_temp::temp_path("memo-scratch");
+        let output = Output { stamp: None, golden_sha256: String::new() };
+        run_in(cli, &EvalEmbedder::fake(), root, &one_case(), &[], output, &scratch).await
+    }
+
+    #[tokio::test]
+    async fn a_real_docs_run_keeps_its_vectors_in_the_cache_folder() {
+        let root = docs_root_with_one_doc();
+        let cache = crate::test_temp::temp_path("memo-cache");
+        let cli = real_docs_cli(&[], &root, &cache);
+
+        assert_eq!(run_with(&cli, &root).await, EXIT_OK);
+        let first = folder_bytes(&cache).expect("the run created the folder");
+        assert_eq!(run_with(&cli, &root).await, EXIT_OK);
+
+        assert_eq!(first.len(), 1, "one memo per contract");
+        assert!(first[0].0.starts_with("docs-vectors-") && first[0].0.ends_with(".bin"), "{}", first[0].0);
+        assert_eq!(folder_bytes(&cache), Some(first), "a second run adds nothing, so it rewrites nothing");
+    }
+
+    #[tokio::test]
+    async fn no_cache_leaves_the_folder_byte_for_byte() {
+        let root = docs_root_with_one_doc();
+        let cache = crate::test_temp::temp_path("memo-cache");
+        let absent = crate::test_temp::temp_path("memo-absent");
+        assert_eq!(run_with(&real_docs_cli(&[], &root, &cache), &root).await, EXIT_OK);
+        let before = folder_bytes(&cache);
+        assert!(before.as_ref().is_some_and(|f| !f.is_empty()));
+
+        assert_eq!(run_with(&real_docs_cli(&["--no-cache"], &root, &cache), &root).await, EXIT_OK);
+        assert_eq!(run_with(&real_docs_cli(&["--no-cache"], &root, &absent), &root).await, EXIT_OK);
+
+        assert_eq!(folder_bytes(&cache), before);
+        assert!(!absent.exists(), "a folder that was not there is not created");
+    }
+
+    #[tokio::test]
+    async fn docs_mode_with_the_fake_embedder_never_touches_the_memo() {
+        let root = docs_root_with_one_doc();
+        let absent = crate::test_temp::temp_path("memo-absent");
+        let mut cli = real_docs_cli(&[], &root, &absent);
+        cli.mode = crate::cli::Mode::Fake;
+
+        assert_eq!(run_with(&cli, &root).await, EXIT_OK);
+
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn the_docs_report_names_the_memo_file() {
+        let block = sample_block(Some(&memo_of(30, 70)));
+        let cases = two_cases();
+        let results = [CaseResult { case: &cases[0], rank: Some(1), top: None, code: false }];
+        let report = EvalDocReport { docs: 2, passages: 5, skipped: 1 };
+        let at = |memo: Option<&EvalMemoReport>| {
+            render(&report, Duration::ZERO, &[], &results, &Phases::default(), Some(RealRun { block: &block, memo }))
+        };
+
+        let with = at(Some(&memo_of(30, 70)));
+        let without = at(None);
+
+        assert!(with.contains("vector memo memo.bin: 30 from the memo, 70 embedded, 0.50 s\n"), "{with}");
+        assert!(without.contains("vector memo: not used (--no-cache)\n"), "{without}");
+        assert!(!with.contains("a warning that is not for the file"), "{with}");
+    }
+
     #[test]
     fn a_fake_run_reports_no_tokens_and_no_memo() {
         let block = IndexBlock::new(&sample_run(), None, None, EvalCpu::this(), 8, true, None);
@@ -1184,7 +1314,7 @@ mod tests {
 
         let json = serde_json::to_value(&block).unwrap();
         let report = render(&EvalDocReport { docs: 2, passages: 5, skipped: 1 }, Duration::ZERO, &[], &results, &Phases::default(), None);
-        let counted = render(&EvalDocReport { docs: 2, passages: 5, skipped: 1 }, Duration::ZERO, &[], &results, &Phases::default(), Some(&block));
+        let counted = render(&EvalDocReport { docs: 2, passages: 5, skipped: 1 }, Duration::ZERO, &[], &results, &Phases::default(), Some(RealRun { block: &block, memo: None }));
 
         assert!(json["tokens"].is_null(), "{json}");
         assert_eq!(json["memo"], serde_json::json!({"used": false, "from_memo": 0, "embedded": 5, "seconds": 0.0}));
