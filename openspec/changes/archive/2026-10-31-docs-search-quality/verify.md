@@ -136,3 +136,16 @@ Se midió en este worktree, con la constante cambiada sin commitear y restaurada
 | código | 0,000 | 0,050 | 0,100 | 0,041 | 20 |
 
 `--diff dq-base3 dq-prefix`: Hit@1 da 0 mejor y 1 peor, Hit@3 0 y 1, Hit@5 no cambia, y MRR@10 da 0 y 3, con media −0,020 [−0,053, +0,000]. Sólo se mueve código: c02 del 1 al 2, c04 del 7 al 8 y c14 del 2 al 5. Ninguna pregunta de docs cambia de puesto. c14 sale del top 3, así que el prefijo no se productiviza y no queda código.
+
+## Suite y clippy
+
+Sobre el estado del archivo, en Windows: la versión 0.71.0 con el código de `5136a4e`, el mismo de `clawg-core` que en `dba0bd2`. `cargo test --workspace --target-dir target-test` pasa entera, y los dos clippy de `docs/reference/testing.md` salen sin errores.
+
+La primera corrida falló en `memory::search::tests::disputed_status_does_not_change_score`, un test intermitente anterior a este cambio. Cada fila toma su `last_accessed_at` con resolución de segundos: si las dos inserciones caen en segundos distintos, el puntaje difiere en la séptima cifra y el `assert_eq` exacto falla. Aislado pasó 25 de 25 veces, y la suite completa, repetida con `--no-fail-fast`, pasó entera.
+
+## Al archivar (2026-10-31)
+
+- DQ1 a DQ5 pasaron a [`specs/eval`](../../../specs/eval/spec.md), en «`rag-eval --docs`», con los `ruta:línea` de hoy y la calidad de `dq-base3` en «Índice de docs». DQ3 decía `--out-dir`, pero la bandera que existe es `--out`: así quedó en la spec del cambio y en la principal. Las dos referencias de `specs/eval` a «DQ3 y DQ4 de docs-search-quality, todavía sin archivar» apuntan ahora a esos requisitos.
+- [`specs/project-docs`](../../../specs/project-docs/spec.md) suma en «Refresco incremental» las rutas que el refresco deja fuera y el troceo que comparte con el eval. En «Límites conocidos», la calidad medida y lo que no entró reemplazan la mejora del canal léxico que daba por posible. De paso se corrigieron las citas de «Búsqueda» (`search`, `fuse`, `fts_match_expression`, `MAX_LEXICAL_TOKENS`).
+- DQ6 a DQ9 no se consolidan. 2a, 2b, 2c y el prefijo no pasaron su puerta, y 2d, 2e, DQ7 y DQ8 no se pueden medir con este golden.
+- La versión sube a 0.71.0. Ningún commit de este cambio subió una versión antes.

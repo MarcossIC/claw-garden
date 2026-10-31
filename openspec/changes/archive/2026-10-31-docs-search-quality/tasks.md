@@ -63,6 +63,8 @@ El set de 15 tenía casos rotos en silencio, porque `check_corpus` mira la ruta 
 
 ## Paso 3: identificadores partidos (DQ7, DQ8; D4)
 
+No se hizo: el golden no comparte palabras de contenido con sus respuestas, así que no puede medir un cambio léxico (`verify.md`, «Por qué el paso 2 no puede pasar su puerta con este golden»).
+
 ### 11. La huella
 
 - [ ] RED: `docs_contract_names_the_lexical_version`, `an_old_fingerprint_reads_as_lexical_version_1`, `an_index_of_the_previous_version_is_rewritten_without_embedding` (con datos sembrados con la huella sin `+lex`), `another_model_still_reembeds_every_passage`.
@@ -83,4 +85,4 @@ El set de 15 tenía casos rotos en silencio, porque `check_corpus` mira la ruta 
 
 ### 14. Specs y verify
 
-- [ ] Consolidar en `specs/eval` y `specs/project-docs` lo que entró; `verify.md` con la suite, los dos clippy y cada medición.
+- [x] Consolidar en `specs/eval` y `specs/project-docs` lo que entró; `verify.md` con la suite, los dos clippy y cada medición.

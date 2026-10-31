@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| medición (1, 3) | M, por puertas (la fase 0 es S y no trae ningún modelo nuevo) | — para memorias; el paso 1 de [docs-search-quality](../docs-search-quality/proposal.md) (20) y la memo de [docs-index-cost](../archive/2026-10-31-docs-index-cost/proposal.md) (94) para la parte de docs. Alimenta a [model-reembed](../model-reembed/exploration.md) (17) | exploración (borrador) |
+| medición (1, 3) | M, por puertas (la fase 0 es S y no trae ningún modelo nuevo) | — para memorias; el paso 1 de [docs-search-quality](../archive/2026-10-31-docs-search-quality/proposal.md) (20) y la memo de [docs-index-cost](../archive/2026-10-31-docs-index-cost/proposal.md) (94) para la parte de docs. Alimenta a [model-reembed](../model-reembed/exploration.md) (17) | exploración (borrador) |
 
 **Tesis:** quedarse con `multilingual-e5-small` en fp32, sin cuantizar, y decidir un cambio de modelo **midiendo**, no leyendo tablas de MTEB. Este cambio sólo mide, como [english-recall](../archive/2026-10-17-english-recall/proposal.md) (21) y [revision-eval](../archive/2026-10-21-revision-eval/proposal.md) (48): compara e5-small con candidatos de **384 dimensiones** y licencia Apache 2.0 sobre el golden propio, entre idiomas y a escala, con su costo en memoria y tiempo, contra un umbral fijado antes de correr. Sin un candidato que lo pase, cierra con la evidencia y nada cambia. Con uno que lo pase, el cambio de modelo lo hace 17, que hoy no tiene modelo destino.
 

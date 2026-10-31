@@ -6,7 +6,7 @@
 
 ## Problema
 
-`rag-eval --real --docs` tardó 2407,1 s en indexar 727 docs en 17 584 pasajes, en Windows y con un build debug ([verify de docs-search-quality](../docs-search-quality/verify.md), líneas 3 y 11). Verificado contra el código de hoy:
+`rag-eval --real --docs` tardó 2407,1 s en indexar 727 docs en 17 584 pasajes, en Windows y con un build debug ([verify de docs-search-quality](../archive/2026-10-31-docs-search-quality/verify.md), líneas 3 y 11). Verificado contra el código de hoy:
 
 - **El refresco embebe doc por doc y sin ordenar.** Un bucle secuencial lee, enmascara, parte, pide los vectores guardados, embebe y escribe cada doc (`crates/clawg-core/src/memory/project_docs/mod.rs:447-482`). Manda todos los pasajes de un doc en una llamada (`:566-568`), que el embedder corta en tandas de `EMBED_BATCH` = 16 consecutivos (`crates/clawg-core/src/memory/embedder.rs:184`, `:436`) y rellena hasta el más largo (`pad_right`, `:259-261`). La atención crece con textos × tokens² (`:179-181`).
 - **Hay un antecedente medido, de otro corpus.** La importación ordena de más tokens a menos (`longest_first`, `crates/clawg-core/src/memory/portability/import.rs:2537`). Eso bajó su fase `embed` un 30,4 %, y las 5000 filas comparadas dieron los mismos bits ([verify de embed-throughput](../archive/2026-10-27-embed-throughput/verify.md), línea 30; [propuesta](../archive/2026-10-27-embed-throughput/proposal.md), línea 16). Ese cambio dejó el refresco de docs como «otro cambio, con su propia medición» ([design](../archive/2026-10-27-embed-throughput/design.md), línea 54). Midió filas de memoria, no pasajes de docs.
@@ -105,7 +105,7 @@ Van de menor a mayor riesgo. El paso 0 abre A1, A2 y E. Si `embed` es menos de l
 - **Por qué ese umbral:** menos del 10 % es menos de lo que se le pidió a A1, y E paga en calidad de recuperación y en un reindexado completo.
 - **Costo:**
   - Cada proyecto se reindexa una vez.
-  - Necesita una huella de docs que cubra cómo se parte (`docs_contract`, decisión 6 de [docs-search-quality](../docs-search-quality/proposal.md)). Sin ella, `plan_refresh` conserva los pasajes viejos (`mod.rs:124`).
+  - Necesita una huella de docs que cubra cómo se parte (`docs_contract`, decisión 6 de [docs-search-quality](../archive/2026-10-31-docs-search-quality/proposal.md)). Sin ella, `plan_refresh` conserva los pasajes viejos (`mod.rs:124`).
 - **Se queda si:** ninguna pregunta sale del top 3, y `--diff` no empeora Hit@3 ni MRR@10 con p < 0,05, mirando docs y código por separado.
 
 ## Descartados

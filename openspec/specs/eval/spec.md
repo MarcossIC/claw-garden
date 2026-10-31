@@ -1,6 +1,6 @@
 # eval — Especificación
 
-Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md), y lo que cuesta ese índice: su memoria de vectores, los tokens, el reparto por área y el bloque `index` del archivo de resultados), `rag-eval --background` (medir sobre la copia de un snapshot real, con casos que citan su save por origen y nombran su proyecto), el banco de rendimiento del daemon y `perf-bench diff`, y la baseline medida.
+Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md), sin los docs que citan sus preguntas, con su archivo de resultados y su `--diff`, y lo que cuesta ese índice: su memoria de vectores, los tokens, el reparto por área y el bloque `index` del archivo de resultados), `rag-eval --background` (medir sobre la copia de un snapshot real, con casos que citan su save por origen y nombran su proyecto), el banco de rendimiento del daemon y `perf-bench diff`, y la baseline medida.
 
 **Origen:**
 - [eval-golden-expansion](../../changes/archive/2026-10-12-eval-golden-expansion/proposal.md), archivado el 2026-10-12.
@@ -16,6 +16,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [ranking-at-scale](../../changes/archive/2026-10-29-ranking-at-scale/proposal.md), archivado el 2026-10-29 (sólo el paso 1: «`rag-eval --background`: medir a escala» y «A escala» en la baseline; el peso de los resúmenes y la puerta de abstención se cerraron sin código en sus puertas).
 - [docs-index-cost](../../changes/archive/2026-10-31-docs-index-cost/proposal.md), archivado el 2026-10-31, que sale en 0.69.0 (sólo IC3 a IC8: la memoria de vectores de `rag-eval --docs`, los tokens, el reparto por área y el bloque `index` del archivo de resultados, en «`rag-eval --docs`: medir el índice de documentación», y «Índice de docs» en la baseline). Las fases del refresco que mide (IC1 e IC2) están en [`specs/project-docs`](../project-docs/spec.md), «Refresco incremental».
 - [perf-bench](../../changes/archive/2026-10-31-perf-bench/proposal.md), archivado el 2026-10-31, que sale en 0.70.0 (sólo «Banco de rendimiento del daemon» y su baseline).
+- [docs-search-quality](../../changes/archive/2026-10-31-docs-search-quality/proposal.md), archivado el 2026-10-31, que sale en 0.71.0 (sólo DQ1 a DQ5: los docs que citan una pregunta fuera del corpus medido, el golden inválido, el archivo de resultados de docs, su `--diff` y el golden de 40, en «`rag-eval --docs`: medir el índice de documentación», y la calidad en «Índice de docs», en la baseline). Sus pasos 2 a 4 (una expresión léxica propia de docs, los identificadores partidos y un prefijo de pasaje para docs) no entraron: los que se midieron no pasaron su puerta, y los léxicos que faltan no se pueden medir con este golden ([verify](../../changes/archive/2026-10-31-docs-search-quality/verify.md)).
 
 ## Definiciones
 
@@ -675,7 +676,7 @@ Mide docs y código juntos ([`specs/project-docs`](../project-docs/spec.md)) y M
 - indexar la raíz (por defecto, el workspace de `clawg-eval`: `default_docs_root`, `cli.rs:302`) en un store temporal con el embedder elegido, que se borra al terminar. No toca el store de memorias de ningún perfil; con `--real` el modelo se toma del directorio de datos que resuelve `production_base_dir` (`main.rs:79`), el mismo caché que usa el resto de `rag-eval --real`. Con `--real` los vectores de los pasajes pasan por una memoria en disco que evita embeber dos veces el mismo texto (IC3 a IC5, abajo), salvo con `--no-cache`;
 - leer el golden set de docs (por defecto `crates/clawg-eval/golden/project-docs.json`, `default_docs_golden_path`, `cli.rs:297`; `deny_unknown_fields`): una lista de `{ "id", "question", "expected": [{ "path", "heading"? }] }`, con ids únicos, preguntas no vacías y al menos un `expected` por pregunta;
 - contar un acierto cuando un hit tiene la ruta esperada y, si se da `heading`, el último tramo de su breadcrumb igual a ese encabezado (`matches`, `crates/clawg-eval/src/bin/rag-eval/docs.rs:172`); la posición de una pregunta es la del primer hit que acierta con cualquiera de sus `expected`, entre los 10 primeros;
-- reportar por stdout Hit@1, Hit@3, Hit@5 y MRR@10 para todas las preguntas y, aparte, para las de docs y las de código (según la primera ruta esperada), el tiempo de indexado, la cantidad de docs, de pasajes y de salteados, y el detalle de cada pregunta (para una que no acierta primera, qué esperaba y qué salió primero), más las fases del refresco (IC8). Con `--real` escribe además el archivo de resultados `{fecha}-real-docs[-{tag}].json` en el directorio de `--out` (`results_path`, `docs.rs:389`; un archivo existente sin `--force` es la salida 4), y `rag-eval --diff` compara dos de esos archivos (`diff_files`, `docs.rs:502`; `render_diff`, `:567`); la forma del archivo y esa comparación son DQ3 y DQ4 de [docs-search-quality](../../changes/docs-search-quality/spec.md), todavía sin archivar, que las integra al archivarse. Con `--fake` sólo imprime y no escribe archivo;
+- reportar por stdout Hit@1, Hit@3, Hit@5 y MRR@10 para todas las preguntas y, aparte, para las de docs y las de código (según la primera ruta esperada), el tiempo de indexado, la cantidad de docs, de pasajes y de salteados, y el detalle de cada pregunta (para una que no acierta primera, qué esperaba y qué salió primero), más las fases del refresco (IC8). Con `--real` escribe además el archivo de resultados `{fecha}-real-docs[-{tag}].json` en el directorio de `--out` (`results_path`, `docs.rs:389`; un archivo existente sin `--force` es la salida 4), y `rag-eval --diff` compara dos de esos archivos (`diff_files`, `docs.rs:502`; `render_diff`, `:567`); la forma del archivo y esa comparación son DQ3 y DQ4, abajo. Con `--fake` sólo imprime y no escribe archivo;
 - rechazar `--docs` junto a `--audit`, `--follow-up`, `--agent-view`, `--lexical-only` o los flags de sweep (`--sweep-imp`, `--sweep-cos-floor`, `--sweep-lexical`, `--fts-tokenizer`), y `--root` o `--no-cache` sin `--docs`; el rechazo es un error de uso (salida 1);
 - salir con 2 si el golden set no se puede leer o no valida, o si un `expected` nombra un doc que el corpus no tiene (`check_corpus`, `docs.rs:88`): así un doc renombrado rompe la medición en vez de bajarla en silencio;
 - fallar nombrando el doc si el indexado dejó uno como estaba por un vector inservible (`RefreshReport::failed`, [`specs/project-docs`](../project-docs/spec.md), «Refresco incremental»), en lugar de medir sin él.
@@ -683,6 +684,89 @@ Mide docs y código juntos ([`specs/project-docs`](../project-docs/spec.md)) y M
 El golden set de docs se versiona porque pregunta sobre los docs públicos de este repo, a diferencia de `docs/eval/golden.json`. Sus preguntas evitan las palabras del pasaje que las responde, para medir sentido y no coincidencia léxica; cuando el mismo contenido vive en dos archivos, cualquiera cuenta.
 
 **Tests:** `the_docs_golden_set_parses_and_rejects_unknown_fields`, `hits_count_when_path_and_heading_match`, `an_expected_doc_missing_from_the_corpus_fails_validation`, `the_report_scores_docs_and_code_apart` y `the_shipped_golden_set_names_docs_this_workspace_has` en `crates/clawg-eval/src/bin/rag-eval/docs.rs`; `docs_reads_its_own_golden_set_and_this_workspace_by_default`, `docs_takes_a_root_and_a_golden_set`, `root_without_docs_is_an_error` y `docs_with_another_mode_is_an_error` en `crates/clawg-eval/src/bin/rag-eval/cli.rs`; `a_doc_index_answers_from_the_root_it_indexed` y `a_doc_the_index_could_not_embed_fails_the_measurement` en `crates/clawg-core/src/eval_api.rs`; `docs_mode_runs_end_to_end_with_the_fake_embedder` y `docs_mode_refuses_a_golden_set_naming_a_doc_the_root_lacks` en `crates/clawg-eval/tests/docs_mode.rs`.
+
+### DQ1. El corpus medido no cita las preguntas
+
+`rag-eval --docs` MUST dejar fuera del índice que mide todo doc del corpus cuyo texto contiene, con los espacios plegados a uno y sin distinguir mayúsculas, la pregunta de algún caso del golden de docs (`quoting_docs`, `docs.rs:107`; un doc que no es UTF-8 no cita nada, y el índice también lo saltea). El filtro MUST vivir en la ruta de evaluación. El refresco recibe las rutas que deja fuera y no las lee (`refresh`, `crates/clawg-core/src/memory/project_docs/mod.rs:486`, y `scan`, `:466`). El daemon le pasa un conjunto vacío, `corpus::walk` no cambia, y `EvalDocIndex::index` (`crates/clawg-core/src/eval_api.rs:1485`) recibe la lista del eval. Un doc dejado fuera no se indexa, no puede salir como hit y no cuenta en `RefreshReport::docs`. El informe MUST decir cuántos docs dejó fuera y cuáles, por ruta relativa, y el archivo de resultados los lleva en `corpus.left_out` (DQ3).
+
+#### Escenario: un doc que cita una pregunta
+- GIVEN una raíz con `README.md`, que responde la pregunta q1, y `notes.md`, que la copia textual
+- WHEN corre `rag-eval --fake --docs`
+- THEN `notes.md` no está entre los docs indexados ni puede salir como hit, y el informe dice `left out 1 doc quoting a question: notes.md`
+
+#### Escenario: una cita con otros saltos de línea
+- GIVEN un doc que tiene la pregunta partida en dos líneas y con otra capitalización
+- WHEN se decide qué docs citan una pregunta
+- THEN ese doc la cita
+
+#### Escenario: nada que excluir
+- GIVEN una raíz sin docs que citen preguntas
+- WHEN corre `rag-eval --fake --docs`
+- THEN el informe dice `left out 0 docs quoting a question` y los números son los de antes
+
+**Tests:** `a_doc_quotes_a_question_across_lines_and_case`, `quoting_docs_names_only_the_docs_that_quote` y `the_report_names_the_docs_it_left_out` en `crates/clawg-eval/src/bin/rag-eval/docs.rs`; `a_doc_left_out_is_neither_indexed_nor_counted` en `crates/clawg-core/src/memory/project_docs/mod.rs`; `docs_mode_leaves_out_a_doc_that_quotes_a_question` en `crates/clawg-eval/tests/docs_mode.rs`.
+
+### DQ2. Un golden que no puede medir es inválido
+
+- Si un doc que un caso espera cita la pregunta de algún caso, `rag-eval --docs` MUST salir con 2 nombrando el caso y el doc, antes de indexar (`check_quotes`, `docs.rs:120`): medirlo sería medir coincidencia textual, y dejarlo fuera en silencio haría fallar `check_corpus` con un mensaje que no dice por qué.
+- Un `expected` con `heading` que no es el último segmento del breadcrumb de ningún pasaje de su doc MUST salir con 2 nombrando el caso, el doc y el heading, antes de indexar (`check_headings`, `docs.rs:134`; `expected_breadcrumbs`, `:153`; los dos corren en `measure_with`, `:741`, antes del indexado). El doc se parte como lo parte el índice, con el mismo enmascarado y el mismo splitter y sin embeber (`project_docs::passages`, `mod.rs:371`, que comparten el refresco y el eval, y `EvalDocIndex::breadcrumbs`, `eval_api.rs:1532`). Un heading renombrado, o uno cuya sección sólo tiene subsecciones, deja la pregunta sin pasaje que pueda responderla y bajaría la medición en silencio.
+- Un `expected` que no está en el corpus MUST seguir saliendo con 2 (`check_corpus`, arriba).
+
+#### Escenario: un `expected` que copia su pregunta
+- GIVEN un caso q1 que espera `notes.md`, y `notes.md` copia la pregunta de q1
+- WHEN corre `rag-eval --fake --docs`
+- THEN sale con 2, y stderr nombra `q1` y `notes.md`
+
+#### Escenario: un heading sin pasaje propio
+- GIVEN un caso q1 que espera `README.md > Proyecto`, y en `README.md` la sección `Proyecto` sólo tiene subsecciones
+- WHEN corre `rag-eval --fake --docs`
+- THEN sale con 2 sin indexar, y stderr nombra `q1` y `README.md > Proyecto`
+
+**Tests:** `an_expected_doc_that_quotes_a_question_fails_validation` y `an_expected_heading_no_passage_ends_in_fails_validation` en `docs.rs`; `a_doc_index_names_a_docs_breadcrumbs_without_indexing_it` en `eval_api.rs`; `docs_mode_refuses_an_expected_doc_that_quotes_a_question` y `docs_mode_refuses_an_expected_heading_no_passage_ends_in` en `docs_mode.rs`.
+
+### DQ3. El archivo de resultados de docs
+
+`rag-eval --real --docs` MUST escribir `{fecha}-real-docs.json`, o `{fecha}-real-docs-{tag}.json` con `--tag`, en el directorio de `--out` (por defecto `docs/eval/results/`, fuera de git; `results_path`, `docs.rs:389`). Un archivo existente MUST NOT pisarse sin `--force` (salida 4), y la comprobación MUST hacerse antes de indexar, porque el indexado real tarda minutos (`write_results`, `:398`). `--fake --docs` MUST sólo imprimir: el embedder falso no mide calidad, y un archivo suyo confundiría un `--diff`. El archivo (`DocsResults`, `:323`) MUST llevar:
+
+- `kind: "docs"`, la fecha, el modo, el tag, el `model_id` del embedder y el sha corto de git;
+- el golden: su sha256 y la cantidad de casos, sin ruta absoluta;
+- el corpus: docs, pasajes, salteados y las rutas relativas que DQ1 dejó fuera (`left_out`);
+- el tiempo de indexado en segundos y el bloque `index` (IC8);
+- `aggregate`: Hit@1, Hit@3, Hit@5 y MRR@10 de todas las preguntas, y aparte de docs y de código;
+- `per_case`: por pregunta, `id`, `code`, `rank` (desde 1, `null` fuera de los 10 primeros) y `top`, el breadcrumb del primer hit.
+
+MUST NOT llevar el texto de ningún pasaje ni rutas absolutas.
+
+#### Escenario
+- GIVEN dos preguntas, una en el puesto 2 y otra sin acierto
+- WHEN se arman los resultados y se escriben en un directorio temporal
+- THEN el archivo se llama `{fecha}-real-docs.json`, `per_case` trae `rank` 2 y `null`, y un segundo intento sin `--force` falla con `AlreadyExists`
+
+**Tests:** `docs_results_name_their_file_and_refuse_to_overwrite` y `docs_results_carry_ranks_and_no_text` en `docs.rs`; `docs_mode_with_the_fake_embedder_writes_no_file` en `docs_mode.rs`.
+
+### DQ4. `--diff` de dos corridas de docs
+
+`rag-eval --diff A B` lee los dos archivos una vez y elige el diff por `kind` (`run_diff`, `crates/clawg-eval/src/bin/rag-eval/main.rs:991`; `diff_values`, `docs.rs:511`; `render_diff`, `:567`). Con dos archivos `kind: "docs"` MUST unir las preguntas por `id` y MUST informar, para todas y aparte para docs y para código, cuántas mejoraron y cuántas empeoraron en Hit@1, Hit@3 y Hit@5, con el p exacto pareado (`stats::mcnemar_exact`), y el cambio medio de MRR@10 con su intervalo bootstrap (`paired_bootstrap_ci`, con la semilla de `diff.rs`), así que el p y el intervalo se leen igual que los de memorias. MUST nombrar las preguntas que entraron o salieron del top 3 y las que están en un solo archivo (fuera de la cuenta), y avisar cuando los dos archivos difieren en el sha256 del golden o en los docs excluidos. El veredicto primario es Hit@3: con `--fail-on-regression` MUST salir con 6 si Hit@3 empeora con p < 0,05. Un archivo de docs contra uno que no es de docs MUST ser un error (salida 1).
+
+#### Escenario: una pregunta sale del top 3
+- GIVEN A con q1 en el puesto 1 y q2 en el 4, y B con q1 en el 5 y q2 en el 2
+- WHEN corre `rag-eval --diff A B`
+- THEN Hit@3 da 1 mejor y 1 peor, p = 1, y el informe nombra `q1` como salida del top 3 y `q2` como entrada
+
+#### Escenario: archivos de dos clases
+- GIVEN A de docs y B de memorias
+- WHEN corre `rag-eval --diff A B`
+- THEN sale con 1 y dice que no compara una corrida de docs con una de memorias
+
+**Tests:** `a_docs_diff_counts_moves_and_names_the_top_3_changes`, `a_docs_diff_splits_docs_and_code` y `a_docs_diff_warns_when_the_corpus_differs` en `docs.rs`; `a_docs_file_against_a_memory_file_is_an_error` y `a_docs_hit_at_3_regression_fails_the_run` en `main.rs`.
+
+### DQ5. El golden de docs
+
+`crates/clawg-eval/golden/project-docs.json` MUST tener al menos 40 preguntas con respuesta, al menos 15 de docs y 15 de código, que sigan evitando las palabras del pasaje que las responde. `the_shipped_golden_set_names_docs_this_workspace_has` MUST comprobar que cada doc esperado está en el corpus, que ninguno cita una pregunta, que cada heading esperado tiene un pasaje (DQ2) y la cantidad mínima, no un número exacto. Un caso que se quita MUST reponerse con un id nuevo: `--diff` une por `id`, y reusar uno uniría dos preguntas distintas. Las preguntas sin respuesta quedan para el piso de relevancia, porque el formato exige un `expected` por caso.
+
+Como cada pregunta comparte con su respuesta, a lo sumo, palabras vacías, este golden mide el canal denso. El canal léxico sólo llega a la respuesta por esas palabras, así que una mejora suya (una expresión propia de docs, identificadores partidos, una ruta como frase) no se puede medir con él: necesita preguntas que nombren lo que su pasaje dice, como un identificador, una ruta o un término propio.
+
+**Tests:** `the_shipped_golden_set_names_docs_this_workspace_has` en `docs.rs`.
 
 Lo que sigue es lo que cuesta ese indexado y cómo no pagar dos veces el mismo vector. Las salidas de `rag-eval` son las de `crates/clawg-eval/src/bin/rag-eval/main.rs:53-63`: 1 fallo de ejecución o de uso, 2 golden inválido, 3 sin modelo, 4 archivo de resultados existente, 6 regresión. Las fases del refresco que se suman (`scan`, `read`, `mask`, `split`, `lookup`, `embed`, `write`) son las de IC1 de [`specs/project-docs`](../project-docs/spec.md). Los tests de IC3 a IC8 usan embedders falsos, no necesitan el modelo y no dejan nada en el temporal del sistema (`crate::test_dir::test_dir()` en `clawg-core`, `TempPath` en `rag-eval`).
 
@@ -924,7 +1008,7 @@ El archivo de `rag-eval --real --docs` (`DocsResults`, `crates/clawg-eval/src/bi
 
 El informe por stdout (`render`, `docs.rs:238`) MUST nombrar el archivo de la memoria (o decir que no se usó, con `--no-cache`) y mostrar `index.memo` (`from_memo`, `embedded`, `seconds`) y las fases. Con `--fake`, `rag-eval` MUST seguir sin escribir archivo (`docs.rs:618`), el informe no muestra tokens ni memoria, y no se cuenta nada con el tokenizer.
 
-`rag-eval --diff` (DQ4 de [docs-search-quality](../../changes/docs-search-quality/spec.md)) MUST leer un archivo sin bloque `index` contra uno que lo tiene, en cualquier orden, y seguir sin comparar tiempos: `DocsFile` (`docs.rs:411`) no usa `deny_unknown_fields` y no tiene campos obligatorios de `index`.
+`rag-eval --diff` (DQ4) MUST leer un archivo sin bloque `index` contra uno que lo tiene, en cualquier orden, y seguir sin comparar tiempos: `DocsFile` (`docs.rs:411`) no usa `deny_unknown_fields` y no tiene campos obligatorios de `index`.
 
 #### Escenario: el bloque
 - GIVEN una corrida real con memoria que sacó 30 de 100 pasajes de ella
@@ -1299,6 +1383,16 @@ Medido con el modelo real el 2026-10-31 en Windows (16 hilos, AVX2, AVX-512F y F
 - **Memoria:** D la llenó con un archivo de 28 608 248 bytes (18 245 entradas de 1568 bytes más 88 de cabecera y checksum: 4 textos repetidos) y `memo.seconds` 1,35 s; R no la tocó (mismo SHA-256, tamaño y fecha).
 - **Por área en R:** `archive` 42,8 % de `phases.embed`, `code` 41,3 % y `docs` 15,9 %.
 - `--diff` de D contra R no mueve ninguna pregunta del golden de docs, así que la memoria no cambia qué vector va con qué pasaje con el modelo real.
+
+La calidad, medida el mismo día en `5136a4e` con un build debug y la memoria, sobre las 40 preguntas del golden (DQ5), 762 docs y 18 646 pasajes, con 1 doc fuera por citar las preguntas (`2026-10-31-real-docs-dq-base3.json`; el detalle, en el [verify](../../changes/archive/2026-10-31-docs-search-quality/verify.md) de docs-search-quality):
+
+| | Hit@1 | Hit@3 | Hit@5 | MRR@10 | preguntas |
+|---|---|---|---|---|---|
+| todas | 0,075 | 0,100 | 0,100 | 0,091 | 40 |
+| docs | 0,100 | 0,100 | 0,100 | 0,100 | 20 |
+| código | 0,050 | 0,100 | 0,100 | 0,082 | 20 |
+
+Aciertan d01 y d03 en el puesto 1, c02 en el 1, c14 en el 2 y c04 en el 7. Ninguna de las tres corridas entre `cabfaa8` y `5136a4e` movió una pregunta, aunque entraron docs al corpus en el medio.
 
 ### Banco de rendimiento del daemon
 

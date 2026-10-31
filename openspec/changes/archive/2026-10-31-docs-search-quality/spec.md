@@ -1,6 +1,6 @@
 # docs-search-quality — Especificación
 
-Suma DQ1 a DQ4 (paso 1, entero) a [`specs/eval`](../../specs/eval/spec.md), DQ5 (el golden ampliado) también a `specs/eval`, y DQ6 a DQ9 (condicionales, cada uno detrás de su puerta) a [`specs/project-docs`](../../specs/project-docs/spec.md). Origen: [proposal](proposal.md).
+Suma DQ1 a DQ4 (paso 1, entero) a [`specs/eval`](../../../specs/eval/spec.md), DQ5 (el golden ampliado) también a `specs/eval`, y DQ6 a DQ9 (condicionales, cada uno detrás de su puerta) a [`specs/project-docs`](../../../specs/project-docs/spec.md). Origen: [proposal](proposal.md).
 
 Las salidas de `rag-eval` son las de `crates/clawg-eval/src/bin/rag-eval/main.rs:52-62`: 1 fallo de ejecución o de uso, 2 golden inválido, 3 sin modelo, 4 archivo de resultados existente, 6 regresión.
 
@@ -43,7 +43,7 @@ Un `expected` con `heading` que no es el último segmento del breadcrumb de ning
 
 ### DQ3. El archivo de resultados de docs
 
-`rag-eval --real --docs` MUST escribir `{out-dir}/{fecha}-real-docs.json`, o `{fecha}-real-docs-{tag}.json` con `--tag`, en el directorio de resultados de siempre (`--out-dir`, por defecto `docs/eval/results/`, fuera de git). Un archivo existente MUST NOT pisarse sin `--force` (salida 4), y la comprobación MUST hacerse antes de indexar. `--fake --docs` MUST sólo imprimir. El archivo MUST llevar:
+`rag-eval --real --docs` MUST escribir `{out}/{fecha}-real-docs.json`, o `{fecha}-real-docs-{tag}.json` con `--tag`, en el directorio de resultados de siempre (`--out`, por defecto `docs/eval/results/`, fuera de git). Un archivo existente MUST NOT pisarse sin `--force` (salida 4), y la comprobación MUST hacerse antes de indexar. `--fake --docs` MUST sólo imprimir. El archivo MUST llevar:
 
 - `kind: "docs"`, la fecha, el modo, el tag, el `model_id` del embedder y el sha corto de git;
 - el golden: su sha256 y la cantidad de casos (sin ruta absoluta);

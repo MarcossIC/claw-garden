@@ -4,7 +4,7 @@ Suma IC1 e IC2 a [`specs/project-docs`](../../../specs/project-docs/spec.md) («
 
 Las salidas de `rag-eval` son las de `crates/clawg-eval/src/bin/rag-eval/main.rs:52-62`: 1 fallo de ejecución o de uso, 2 golden inválido, 3 sin modelo, 4 archivo de resultados existente, 6 regresión.
 
-IC6 a IC8 y la parte de `--diff` de IC8 se apoyan en DQ3 y DQ4 de [docs-search-quality](../../docs-search-quality/spec.md) (el archivo de resultados de docs y su `--diff`), que todavía no se archivaron; hoy ya existen en el código (`DocsResults`, `crates/clawg-eval/src/bin/rag-eval/docs.rs:302`; `DocsFile`, `docs.rs:386`; `render_diff`, `docs.rs:543`). El cambio que se archive segundo integra el del otro.
+IC6 a IC8 y la parte de `--diff` de IC8 se apoyan en DQ3 y DQ4 de [docs-search-quality](../2026-10-31-docs-search-quality/spec.md) (el archivo de resultados de docs y su `--diff`), que todavía no se archivaron; hoy ya existen en el código (`DocsResults`, `crates/clawg-eval/src/bin/rag-eval/docs.rs:302`; `DocsFile`, `docs.rs:386`; `render_diff`, `docs.rs:543`). El cambio que se archive segundo integra el del otro.
 
 Todos los tests de este cambio usan embedders falsos, no necesitan el modelo y no dejan nada en el temporal del sistema (`crate::test_dir::test_dir()` en `clawg-core`, `TempPath` en `rag-eval`).
 

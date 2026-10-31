@@ -1,0 +1,25 @@
+change: docs-search-quality
+objective: "3"
+depends_on: [eval-rigor, memory-rank-fusion]
+phase: archived
+release: "0.71.0"
+artifacts:
+  exploration: done
+  proposal: done  # las decisiones abiertas cerradas con la opción recomendada de la exploración
+  spec: done  # DQ1 a DQ5 en specs/eval («rag-eval --docs»); DQ6 a DQ9 no entraron
+  design: done
+  tasks: done
+  apply: done  # paso 1 y golden ampliado; 2a, 2b, 2c y el paso 4 medidos y fuera; 2d, 2e y el paso 3 sin medir
+  verify: done  # verify.md: la suite, los dos clippy y cada medición con el modelo real
+  archive: done
+after_archive:  # fuera del cambio
+  - "medir el canal léxico de docs (2d, 2e y los identificadores partidos de DQ7 y DQ8) necesita un golden con preguntas que nombren lo que dice su pasaje: un identificador, una ruta o un término propio"
+  - "con 4 de 40 en el top 3, lo que falla es el canal denso, no la expresión léxica ni el prefijo: el modelo (embedder-bakeoff) o un reranker"
+  - "el paso E de docs-index-speed contaba con el docs_contract del paso 3 de este cambio, que no se hizo"
+  - "d05 tiene por primer hit la sección «Data profiles» de .claude/CLAUDE.md, que responde bien pero no cuenta: el golden no espera archivos de instrucciones para agentes"
+gates:
+  "2": failed  # 2a y 2b dieron Hit@3 −1 y 2c no movió nada; las tres revertidas. 2d y 2e sin medir
+  "3": not_measured  # identificadores partidos: el golden no puede medir un cambio léxico
+  "4": failed  # "passage: " de docs: Hit@3 −1 (c14 fuera del top 3), docs sin cambios; sin código
+updated: 2026-10-31
+main_spec: openspec/specs/eval/spec.md, openspec/specs/project-docs/spec.md
