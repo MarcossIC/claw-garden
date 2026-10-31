@@ -35,7 +35,7 @@ El banco MUST sembrar el store con un export `clawg-memories` (`crates/clawg-cor
 - dejar alrededor de una décima `superseded` (cada una por la fila siguiente, con causa `revision`) y una vigésima borrada;
 - escribir textos de 12 a 40 palabras tomadas de 64 frecuentes, las primeras mucho más que las últimas, y, una de cada 25, un identificador `identN` de `filas / 20` posibles.
 
-Las consultas MUST salir de la misma semilla: dos a cuatro palabras frecuentes, y un tercio con un identificador. Cada save MUST llevar un texto único (no lo absorbe la deduplicación) con las palabras que dan sus pedazos con el tokenizer falso de una palabra por token: 40 para uno, `96 + 72 × (n − 1)` para n, y a lo sumo 64 KiB (el límite de `content`). El corpus de docs MUST ser de 200 archivos Markdown de ocho secciones, también de la semilla.
+Las consultas MUST salir de la misma semilla: dos a cuatro palabras frecuentes, y un tercio con un identificador. Cada save MUST llevar un texto único (no lo absorbe la deduplicación) con las palabras que dan sus pedazos con el tokenizer falso de una palabra por token: 40 para uno, `96 + 72 × (n − 1)` para n, y a lo sumo 64 KiB (el límite de `content`). El corpus de docs MUST ser de 400 archivos Markdown de ocho secciones, también de la semilla.
 
 #### Escenario: el import lee la siembra entera
 - GIVEN 2 000 filas con la semilla por defecto
@@ -68,7 +68,7 @@ Solos, uno después del otro, MUST correr:
 | `session_start` | `POST /v1/context` sin consulta, como el hook al empezar una sesión |
 | `save_1`, `save_10`, `save_100` | `POST /v1/memories` de 1, 10 y 100 pedazos, que responde cuando el save quedó guardado |
 
-Y, para cada operación de fondo (`save_100`, `backup` con `POST /v1/backup`, `docs_refresh` con `POST /v1/projects` del corpus con `index_docs`), los flujos `search`, `context`, `session_start` y `save_1` a la vez mientras la operación corre, como `{flujo}_during_{fondo}`. El save y el backup de fondo MUST repetirse hasta cubrir 5 s; el refresco corre una vez y termina cuando `docs.refresh.duration` de `GET /v1/metrics` cuenta uno más. Cada snapshot del backup MUST borrarse en cuanto se escribe.
+Y, para cada operación de fondo (`save_100`, `backup` con `POST /v1/backup`, `docs_refresh` con `POST /v1/projects` del corpus con `index_docs`), los flujos `search`, `context`, `session_start` y `save_1` a la vez mientras la operación corre, como `{flujo}_during_{fondo}`. El save y el backup de fondo MUST repetirse hasta cubrir 10 s; el refresco corre una vez y termina cuando `docs.refresh.duration` de `GET /v1/metrics` cuenta uno más. Cada snapshot del backup MUST borrarse en cuanto se escribe.
 
 ## PB5. El archivo de resultado
 

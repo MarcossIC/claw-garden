@@ -38,7 +38,7 @@ Las tasas se eligieron con una corrida debug de 10 000 filas: a 40 búsquedas po
 
 ## D5. Cuándo termina una operación de fondo (PB4)
 
-El save y el backup responden cuando terminan, así que su tarea marca el fin al volver. El refresco de docs lo lanza `POST /v1/projects` en segundo plano (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs`), así que el banco espera a que el histograma `docs.refresh.duration` de `GET /v1/metrics` cuente uno más, consultando cada 250 ms: una lectura que no toca el store. Se descartó esperar con `POST /v1/projects/docs/search`, que espera el refresco pero pasa por el embedder y el store y entraría en lo medido. Un backup de un store chico tarda decenas de milisegundos y dejaría una o dos muestras; por eso el save y el backup de fondo se repiten hasta 5 s.
+El save y el backup responden cuando terminan, así que su tarea marca el fin al volver. El refresco de docs lo lanza `POST /v1/projects` en segundo plano (`spawn_doc_refresh`, `crates/clawg-cli/src/daemon/api.rs`), así que el banco espera a que el histograma `docs.refresh.duration` de `GET /v1/metrics` cuente uno más, consultando cada 250 ms: una lectura que no toca el store. Se descartó esperar con `POST /v1/projects/docs/search`, que espera el refresco pero pasa por el embedder y el store y entraría en lo medido. Un backup de un store chico tarda decenas de milisegundos y dejaría una o dos muestras; por eso el save y el backup de fondo se repiten hasta 10 s.
 
 ## D6. La CPU y la memoria del daemon (PB5)
 
