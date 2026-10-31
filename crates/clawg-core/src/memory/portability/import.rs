@@ -2534,7 +2534,7 @@ async fn embedding_order(prepared: &Arc<Prepared>, picked: Vec<usize>, chunker: 
 
 /// The indices of `tokens` from the largest count to the smallest, equal
 /// counts in the order they came.
-fn longest_first(tokens: &[usize]) -> Vec<usize> {
+pub(crate) fn longest_first(tokens: &[usize]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..tokens.len()).collect();
     order.sort_by_key(|&k| Reverse(tokens[k]));
     order

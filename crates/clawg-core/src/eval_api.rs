@@ -1076,6 +1076,16 @@ pub fn is_claim_type(memory_type: &str) -> bool {
 pub const NEAR_DUPLICATE_FLOOR: f32 = crate::memory::contradiction::NEAR_DUPLICATE_FLOOR;
 pub const CONTRADICTION_THRESHOLD: f32 = crate::memory::contradiction::CONTRADICTION_THRESHOLD;
 
+/// The most texts one inference run embeds: a doc's passages are embedded in
+/// runs of this many, each padded to its longest.
+pub const EMBED_BATCH: usize = crate::memory::embedder::EMBED_BATCH;
+
+/// The indices of `tokens` from the largest count to the smallest, equal
+/// counts in the order they came: the order an import embeds its rows in.
+pub fn longest_first(tokens: &[usize]) -> Vec<usize> {
+    crate::memory::portability::import::longest_first(tokens)
+}
+
 /// The token window the live embedder truncates to — re-exported so the eval
 /// binary's `--follow-up` budget reads the exact same number production's
 /// embedder enforces, rather than a second copy that could drift from it.
@@ -1311,6 +1321,7 @@ pub struct EvalDocIndex {
     store: MemoryStore,
     embedder: Arc<dyn Embedder>,
     splitter: TokenSplitter,
+    tokenizer: Option<Arc<tokenizers::Tokenizer>>,
 }
 
 /// What indexing a root found and wrote.
@@ -1354,6 +1365,48 @@ pub struct EvalIndexRun {
     pub docs: Vec<EvalDocTiming>,
 }
 
+/// The tokens of each passage of one doc, in the order they were embedded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalDocLengths {
+    pub path: String,
+    pub lengths: Vec<usize>,
+}
+
+/// The tokens of the passages an index holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalPassageLengths {
+    pub docs: Vec<EvalDocLengths>,
+    /// What the calls to the tokenizer took, apart from reading the store.
+    pub count_seconds: f64,
+}
+
+/// The tokens of each text inside the model's window, grouped by doc (a doc's
+/// texts come together) and counted in runs of [`EMBED_BATCH`], as the
+/// embedder takes them, with the time the tokenizer took.
+fn lengths_by_doc(
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[(String, String)],
+) -> Result<(Vec<EvalDocLengths>, std::time::Duration), EvalError> {
+    let mut docs: Vec<EvalDocLengths> = Vec::new();
+    let mut took = std::time::Duration::ZERO;
+    let mut start = 0;
+    while start < texts.len() {
+        let end = texts[start..].iter().position(|(path, _)| *path != texts[start].0).map_or(texts.len(), |n| start + n);
+        let mut lengths = Vec::with_capacity(end - start);
+        for run in texts[start..end].chunks(EMBED_BATCH) {
+            let refs: Vec<&str> = run.iter().map(|(_, text)| text.as_str()).collect();
+            let counting = std::time::Instant::now();
+            let encodings = crate::memory::embedder::window_encodings(tokenizer, &refs)
+                .map_err(|e| EvalError::Embed(e.to_string()))?;
+            took += counting.elapsed();
+            lengths.extend(encodings.iter().map(tokenizers::Encoding::len));
+        }
+        docs.push(EvalDocLengths { path: texts[start].0.clone(), lengths });
+        start = end;
+    }
+    Ok((docs, took))
+}
+
 /// One passage a doc search returned, ranked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalDocHit {
@@ -1371,11 +1424,60 @@ impl EvalDocIndex {
         let store = MemoryStore::open(base_dir, StoreHolder::Eval)
             .await
             .map_err(|e| EvalError::Open(e.to_string()))?;
-        let splitter = match model_download::load_tokenizer(tokenizer_dir) {
-            Some(tok) => TokenSplitter::with_tokenizer(tok),
+        let tokenizer = model_download::load_tokenizer(tokenizer_dir);
+        let splitter = match &tokenizer {
+            Some(tok) => TokenSplitter::with_tokenizer(tok.clone()),
             None => TokenSplitter::fallback(),
         };
-        Ok(Self { store, embedder: embedder.inner.clone(), splitter })
+        Ok(Self { store, embedder: embedder.inner.clone(), splitter, tokenizer })
+    }
+
+    /// Counts with `tokenizer`, which a test sets where the model's goes.
+    #[cfg(test)]
+    fn with_tokenizer(mut self, tokenizer: Arc<tokenizers::Tokenizer>) -> Self {
+        self.tokenizer = Some(tokenizer);
+        self
+    }
+
+    /// The tokens of every passage the index holds, as the model receives
+    /// them: the text of the stored passage under the embedder's passage
+    /// prefix, cut to the model's window, by doc in path order and within a
+    /// doc in the order its passages were embedded. `None` without a
+    /// tokenizer, which only the real model brings.
+    pub async fn passage_lengths(&self) -> Result<Option<EvalPassageLengths>, EvalError> {
+        let Some(tokenizer) = &self.tokenizer else { return Ok(None) };
+        let rows = self
+            .store
+            .conn
+            .call(|c| -> rusqlite::Result<Vec<(String, project_docs::chunk::Passage)>> {
+                c.prepare(
+                    "SELECT path, ordinal, breadcrumb, body FROM project_doc_chunk \
+                     WHERE project_id = ?1 ORDER BY path, ordinal",
+                )?
+                .query_map([EVAL_DOCS_PROJECT], |r| {
+                    Ok((
+                        r.get(0)?,
+                        project_docs::chunk::Passage { ordinal: r.get(1)?, breadcrumb: r.get(2)?, body: r.get(3)? },
+                    ))
+                })?
+                .collect()
+            })
+            .await
+            .map_err(|e| EvalError::Doc(e.to_string()))?;
+        let texts: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|(path, passage)| {
+                let text = crate::memory::embedder::apply_role_prefix(
+                    EmbedRole::Passage,
+                    &passage.indexed_text(),
+                    self.embedder.query_prefix(),
+                    self.embedder.passage_prefix(),
+                );
+                (path, text)
+            })
+            .collect();
+        let (docs, took) = lengths_by_doc(tokenizer, &texts)?;
+        Ok(Some(EvalPassageLengths { docs, count_seconds: took.as_secs_f64() }))
     }
 
     /// Indexes the docs under `root` but those at the relative paths in
@@ -2745,6 +2847,98 @@ second
         assert_eq!(run.report.docs, 3);
         assert!(run.scan > std::time::Duration::ZERO, "the walk of the tree is measured");
         assert!(run.docs.iter().all(|d| d.phases.embed > std::time::Duration::ZERO || d.passages == 0));
+    }
+
+    /// `FakeEmbedder` with a one-word prefix on passages.
+    struct Prefixed;
+
+    #[async_trait::async_trait]
+    impl Embedder for Prefixed {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "prefixed" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "pfx " }
+    }
+
+    /// A doc of `n` sections whose section `i` has `i` words.
+    fn ladder(n: usize) -> String {
+        (1..=n).map(|i| format!("## S{i}\n{}\n", vec!["w"; i].join(" "))).collect()
+    }
+
+    async fn lengths_of_ladder(embedder: EvalEmbedder) -> EvalPassageLengths {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        std::fs::write(root.path().join("a.md"), format!("# A\n{}", ladder(20))).unwrap();
+        std::fs::write(root.path().join("b.md"), "# B\nsolo\n").unwrap();
+        let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path())
+            .await
+            .unwrap()
+            .with_tokenizer(crate::memory::chunker::word_tokenizer());
+        index.index(root.path(), &[]).await.unwrap();
+        let lengths = index.passage_lengths().await.unwrap().expect("a tokenizer is set");
+        index.close().await.unwrap();
+        lengths
+    }
+
+    #[tokio::test]
+    async fn passage_lengths_follow_the_stored_passages_in_batch_order() {
+        let plain = lengths_of_ladder(EvalEmbedder::fake()).await;
+        let prefixed = lengths_of_ladder(EvalEmbedder::of(Arc::new(Prefixed), Arc::default())).await;
+
+        let paths: Vec<&str> = plain.docs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, ["a.md", "b.md"], "by path");
+        let a = &plain.docs[0].lengths;
+        assert_eq!(a.len(), 20, "one length per stored passage, past one batch");
+        assert!(a.windows(2).all(|w| w[1] == w[0] + 1), "in ordinal order, one more word each: {a:?}");
+        let with_prefix = &prefixed.docs[0].lengths;
+        assert!(
+            a.iter().zip(with_prefix).all(|(plain, prefixed)| *prefixed == plain + 1),
+            "the prefix of the embedder is part of the text: {a:?} {with_prefix:?}"
+        );
+        assert_eq!(plain.docs[1].lengths.len(), 1);
+        assert!(plain.count_seconds >= 0.0);
+    }
+
+    #[test]
+    fn lengths_are_counted_in_batches_of_the_embedder() {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let texts: Vec<(String, String)> = (0..19)
+            .map(|i| ("a.md".to_string(), vec!["w"; i + 1].join(" ")))
+            .chain([("b.md".to_string(), "x y".to_string())])
+            .collect();
+
+        let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
+
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].path, "a.md");
+        assert_eq!(docs[0].lengths, (1..=19).collect::<Vec<usize>>());
+        assert_eq!((docs[1].path.as_str(), docs[1].lengths.clone()), ("b.md", vec![2]));
+        assert_eq!(lengths_by_doc(&tokenizer, &[]).unwrap().0, Vec::<EvalDocLengths>::new());
+    }
+
+    #[test]
+    fn longest_first_is_stable_and_descending() {
+        assert_eq!(longest_first(&[3, 9, 3, 1, 9]), vec![1, 4, 0, 2, 3]);
+        assert_eq!(longest_first(&[]), Vec::<usize>::new());
+        assert_eq!(longest_first(&[5, 5, 5]), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn passage_lengths_are_none_without_a_tokenizer() {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        std::fs::write(root.path().join("a.md"), "# A\nalpha\n").unwrap();
+        let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
+        index.index(root.path(), &[]).await.unwrap();
+
+        let lengths = index.passage_lengths().await.unwrap();
+        index.close().await.unwrap();
+
+        assert!(lengths.is_none());
+        assert_eq!(EMBED_BATCH, crate::memory::embedder::EMBED_BATCH);
     }
 
     #[tokio::test]
