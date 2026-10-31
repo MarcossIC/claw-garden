@@ -10,7 +10,7 @@ artifacts:
   tasks: done
   apply: in_progress  # tareas 1 a 3 (paso 1, sin el modelo real); la 4 y siguientes necesitan el modelo real
   verify: pending
-  archive: pending
+  archive: pending  # specs/eval ya tiene IC3 a IC8 de docs-index-cost, cuyo bloque index va en el archivo de DQ3 y se lee con el --diff de DQ4: al archivar, DQ3 y DQ4 se integran ahí
 gates:
   "2": pending  # expresión léxica de docs: ninguna pregunta sale del top 3 y +2 en Hit@3
   "3": pending  # identificadores partidos, misma puerta

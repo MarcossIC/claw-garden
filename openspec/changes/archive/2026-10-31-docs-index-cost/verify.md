@@ -309,3 +309,10 @@ En la misma pasada por la spec quedaron hechas las dos correcciones de redacció
 **La varianza de `phases.embed` entre corridas** (+26,8 % de D a R, en sentido contrario al del build). No es un defecto del código, pero afecta a cómo `docs-index-speed` lee sus puertas de tiempo (E y el producto de A1). Lo explica «Lo que hay que saber antes de leer estos tiempos».
 
 A5 y B4 siguen como en el veredicto.
+
+## Al archivar (2026-10-31)
+
+- IC1 e IC2 pasaron a [`specs/project-docs`](../../../specs/project-docs/spec.md), en «Refresco incremental», e IC3 a IC8 a [`specs/eval`](../../../specs/eval/spec.md), en «`rag-eval --docs`», con la baseline «Índice de docs» y un invariante sin texto ni rutas. Se fueron las frases del plan y se pusieron los `ruta:línea` de hoy. De paso se corrigieron las citas de `project-docs` que el código de este cambio había corrido (`refresh`, `replace_doc`, `remove_docs`, `plan_refresh`, `root_of`, `RefreshGuard::run`, el `redact` del refresco y los demás de «Refresco incremental» y RM5).
+- El escenario de IC2 lleva los literales que da `seconds`, con una cifra decimal (`read 0.2`, `write 0.8`), los mismos que fija `the_docs_timing_line_names_every_phase`.
+- IC6 a IC8 se apoyan en DQ3 y DQ4 de [docs-search-quality](../../docs-search-quality/spec.md), que sigue en apply. `specs/eval` dice ahora que una corrida `--real --docs` escribe un archivo de resultados y que `--diff` compara dos, con la bandera que existe (`--out`; DQ3 dice `--out-dir`), y deja la forma del archivo y la comparación a DQ3 y DQ4, que se integran cuando ese cambio se archive. La frase de `specs/eval` «No escribe archivo de resultados, así que no hay `--diff` de docs» ya era falsa contra el código y se reemplazó.
+- La versión sube a 0.69.0. El commit que subió a 0.68.0 (`a46842a`) es anterior a todo el código de este cambio, así que no aplica la regla de no subir cuando la versión sin publicar ya trae el código.

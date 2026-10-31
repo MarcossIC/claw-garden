@@ -1,6 +1,6 @@
 # eval — Especificación
 
-Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md)), `rag-eval --background` (medir sobre la copia de un snapshot real, con casos que citan su save por origen y nombran su proyecto) y la baseline medida.
+Fuente de verdad del comportamiento actual de la evaluación de recuperación: el generador sintético de `golden-mine synth`, la etiqueta de subconjunto y el idioma de la consulta en el golden set, sus casos sin respuesta y de versión nueva, el reporte de `rag-eval` (por subconjunto, por pareja de idiomas consulta–fila, aciertos estrictos y parciales con intervalo, partición calibración/prueba), la comparación de dos corridas con `--diff` y su corte por pareja, el brazo sólo léxico, los intrusos del audit, el barrido de contradicciones, `conflict-eval` (el detector de contradicciones entero, sobre pares etiquetados y un flujo de saves), `revision-eval` (qué cambia la clave de tema, sobre cadenas de versiones y sobre el export de un store real), `rag-eval --docs` (la medición del índice de la documentación y el código de un proyecto, [`specs/project-docs`](../project-docs/spec.md), y lo que cuesta ese índice: su memoria de vectores, los tokens, el reparto por área y el bloque `index` del archivo de resultados), `rag-eval --background` (medir sobre la copia de un snapshot real, con casos que citan su save por origen y nombran su proyecto) y la baseline medida.
 
 **Origen:**
 - [eval-golden-expansion](../../changes/archive/2026-10-12-eval-golden-expansion/proposal.md), archivado el 2026-10-12.
@@ -14,6 +14,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «`rag-eval --lang-detect`», LP15 de esa spec).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo la línea del aviso en español en «`chains`: lo que cuesta la clave (M4)»; el parser que lee las respuestas vacías en los dos idiomas, AL7 de esa spec, está en [`specs/retrieval`](../retrieval/spec.md), y la paridad español contra inglés y el store mezclado, sus M1 y M2, no se midieron: piden el golden pareado y el modelo real).
 - [ranking-at-scale](../../changes/archive/2026-10-29-ranking-at-scale/proposal.md), archivado el 2026-10-29 (sólo el paso 1: «`rag-eval --background`: medir a escala» y «A escala» en la baseline; el peso de los resúmenes y la puerta de abstención se cerraron sin código en sus puertas).
+- [docs-index-cost](../../changes/archive/2026-10-31-docs-index-cost/proposal.md), archivado el 2026-10-31, que sale en 0.69.0 (sólo IC3 a IC8: la memoria de vectores de `rag-eval --docs`, los tokens, el reparto por área y el bloque `index` del archivo de resultados, en «`rag-eval --docs`: medir el índice de documentación», y «Índice de docs» en la baseline). Las fases del refresco que mide (IC1 e IC2) están en [`specs/project-docs`](../project-docs/spec.md), «Refresco incremental».
 
 ## Definiciones
 
@@ -664,22 +665,297 @@ Una corrida `--real` de `chains`, y `store --labels` después de una reproducci�
 ## `rag-eval --docs`: medir el índice de documentación
 
 ```
-rag-eval (--fake | --real) --docs [--root <dir>] [--golden <path>]
+rag-eval (--fake | --real) --docs [--root <dir>] [--golden <path>] [--no-cache]
+                                  [--out <dir>] [--tag <slug>] [--force]
 ```
 
 Mide docs y código juntos ([`specs/project-docs`](../project-docs/spec.md)) y MUST:
 
-- indexar la raíz (por defecto, el workspace de `clawg-eval`: `default_docs_root`, `cli.rs:239`) en un store temporal con el embedder elegido, que se borra al terminar. No toca el store de memorias de ningún perfil; con `--real` el modelo se toma del directorio de datos que resuelve `production_base_dir` (`main.rs:74`), el mismo caché que usa el resto de `rag-eval --real`;
-- leer el golden set de docs (por defecto `crates/clawg-eval/golden/project-docs.json`, `default_docs_golden_path`, `cli.rs:234`; `deny_unknown_fields`): una lista de `{ "id", "question", "expected": [{ "path", "heading"? }] }`, con ids únicos, preguntas no vacías y al menos un `expected` por pregunta;
-- contar un acierto cuando un hit tiene la ruta esperada y, si se da `heading`, el último tramo de su breadcrumb igual a ese encabezado (`matches`, `crates/clawg-eval/src/bin/rag-eval/docs.rs:86`); la posición de una pregunta es la del primer hit que acierta con cualquiera de sus `expected`, entre los 10 primeros;
-- reportar por stdout Hit@1, Hit@3, Hit@5 y MRR@10 para todas las preguntas y, aparte, para las de docs y las de código (según la primera ruta esperada), el tiempo de indexado, la cantidad de docs, de pasajes y de salteados, y el detalle de cada pregunta (para una que no acierta primera, qué esperaba y qué salió primero). No escribe archivo de resultados, así que no hay `--diff` de docs;
-- rechazar `--docs` junto a `--audit`, `--follow-up`, `--agent-view`, `--lexical-only` o los flags de sweep (`--sweep-imp`, `--sweep-cos-floor`, `--sweep-lexical`, `--fts-tokenizer`), y `--root` sin `--docs`; el rechazo es un error de uso (salida 1);
-- salir con 2 si el golden set no se puede leer o no valida, o si un `expected` nombra un doc que el corpus no tiene (`check_corpus`, `docs.rs:76`): así un doc renombrado rompe la medición en vez de bajarla en silencio;
+- indexar la raíz (por defecto, el workspace de `clawg-eval`: `default_docs_root`, `cli.rs:302`) en un store temporal con el embedder elegido, que se borra al terminar. No toca el store de memorias de ningún perfil; con `--real` el modelo se toma del directorio de datos que resuelve `production_base_dir` (`main.rs:79`), el mismo caché que usa el resto de `rag-eval --real`. Con `--real` los vectores de los pasajes pasan por una memoria en disco que evita embeber dos veces el mismo texto (IC3 a IC5, abajo), salvo con `--no-cache`;
+- leer el golden set de docs (por defecto `crates/clawg-eval/golden/project-docs.json`, `default_docs_golden_path`, `cli.rs:297`; `deny_unknown_fields`): una lista de `{ "id", "question", "expected": [{ "path", "heading"? }] }`, con ids únicos, preguntas no vacías y al menos un `expected` por pregunta;
+- contar un acierto cuando un hit tiene la ruta esperada y, si se da `heading`, el último tramo de su breadcrumb igual a ese encabezado (`matches`, `crates/clawg-eval/src/bin/rag-eval/docs.rs:172`); la posición de una pregunta es la del primer hit que acierta con cualquiera de sus `expected`, entre los 10 primeros;
+- reportar por stdout Hit@1, Hit@3, Hit@5 y MRR@10 para todas las preguntas y, aparte, para las de docs y las de código (según la primera ruta esperada), el tiempo de indexado, la cantidad de docs, de pasajes y de salteados, y el detalle de cada pregunta (para una que no acierta primera, qué esperaba y qué salió primero), más las fases del refresco (IC8). Con `--real` escribe además el archivo de resultados `{fecha}-real-docs[-{tag}].json` en el directorio de `--out` (`results_path`, `docs.rs:389`; un archivo existente sin `--force` es la salida 4), y `rag-eval --diff` compara dos de esos archivos (`diff_files`, `docs.rs:502`; `render_diff`, `:567`); la forma del archivo y esa comparación son DQ3 y DQ4 de [docs-search-quality](../../changes/docs-search-quality/spec.md), todavía sin archivar, que las integra al archivarse. Con `--fake` sólo imprime y no escribe archivo;
+- rechazar `--docs` junto a `--audit`, `--follow-up`, `--agent-view`, `--lexical-only` o los flags de sweep (`--sweep-imp`, `--sweep-cos-floor`, `--sweep-lexical`, `--fts-tokenizer`), y `--root` o `--no-cache` sin `--docs`; el rechazo es un error de uso (salida 1);
+- salir con 2 si el golden set no se puede leer o no valida, o si un `expected` nombra un doc que el corpus no tiene (`check_corpus`, `docs.rs:88`): así un doc renombrado rompe la medición en vez de bajarla en silencio;
 - fallar nombrando el doc si el indexado dejó uno como estaba por un vector inservible (`RefreshReport::failed`, [`specs/project-docs`](../project-docs/spec.md), «Refresco incremental»), en lugar de medir sin él.
 
 El golden set de docs se versiona porque pregunta sobre los docs públicos de este repo, a diferencia de `docs/eval/golden.json`. Sus preguntas evitan las palabras del pasaje que las responde, para medir sentido y no coincidencia léxica; cuando el mismo contenido vive en dos archivos, cualquiera cuenta.
 
 **Tests:** `the_docs_golden_set_parses_and_rejects_unknown_fields`, `hits_count_when_path_and_heading_match`, `an_expected_doc_missing_from_the_corpus_fails_validation`, `the_report_scores_docs_and_code_apart` y `the_shipped_golden_set_names_docs_this_workspace_has` en `crates/clawg-eval/src/bin/rag-eval/docs.rs`; `docs_reads_its_own_golden_set_and_this_workspace_by_default`, `docs_takes_a_root_and_a_golden_set`, `root_without_docs_is_an_error` y `docs_with_another_mode_is_an_error` en `crates/clawg-eval/src/bin/rag-eval/cli.rs`; `a_doc_index_answers_from_the_root_it_indexed` y `a_doc_the_index_could_not_embed_fails_the_measurement` en `crates/clawg-core/src/eval_api.rs`; `docs_mode_runs_end_to_end_with_the_fake_embedder` y `docs_mode_refuses_a_golden_set_naming_a_doc_the_root_lacks` en `crates/clawg-eval/tests/docs_mode.rs`.
+
+Lo que sigue es lo que cuesta ese indexado y cómo no pagar dos veces el mismo vector. Las salidas de `rag-eval` son las de `crates/clawg-eval/src/bin/rag-eval/main.rs:53-63`: 1 fallo de ejecución o de uso, 2 golden inválido, 3 sin modelo, 4 archivo de resultados existente, 6 regresión. Las fases del refresco que se suman (`scan`, `read`, `mask`, `split`, `lookup`, `embed`, `write`) son las de IC1 de [`specs/project-docs`](../project-docs/spec.md). Los tests de IC3 a IC8 usan embedders falsos, no necesitan el modelo y no dejan nada en el temporal del sistema (`crate::test_dir::test_dir()` en `clawg-core`, `TempPath` en `rag-eval`).
+
+### IC3. La clave de la memoria de vectores
+
+`rag-eval --real --docs` MUST identificar cada vector guardado por una clave: el SHA-256 de, en este orden, `model_id`, `dimensions`, el prefijo de consulta y el de pasaje (`E5_QUERY_PREFIX` y `E5_PASSAGE_PREFIX`, `crates/clawg-core/src/memory/embedder.rs:120` y `:141`), el SHA-256 del `model.onnx` (`MODEL_SHA256`, `crates/clawg-core/src/memory/model_download.rs:63`), el rol, el texto exacto con su prefijo y la marca de la máquina: sistema, arquitectura, AVX2, AVX-512F y FMA, los campos de `EvalCpu` (`crates/clawg-core/src/eval_api.rs:637`), y los hilos con que se arma la sesión (`session_threads`, `embedder.rs:530`, que usa `session_builder`, `:541`: otro número de hilos cambia cómo ONNX Runtime reparte y suma el trabajo, y puede mover los últimos bits). Cada componente de texto entra a la clave detrás de su largo, de modo que no se confunda con el vecino (`hash_contract`, `crates/clawg-core/src/eval_api/vector_memo.rs:48`; `memo_key`, `:70`). Si cambia cualquiera, la clave cambia y el vector guardado MUST NOT usarse (`from_memo = 0` para ese texto). La clave es pura: no lee disco ni reloj.
+
+Una máquina distinta nunca usa los vectores de otra, porque ahí los últimos bits cambian (documentado en `EvalCpu`, `eval_api.rs:632-636`): no hay tolerancia.
+
+#### Escenario: otro prefijo
+- GIVEN una memoria llena con un embedder falso de prefijo de pasaje `"query: "`
+- WHEN se indexa el mismo árbol con el mismo embedder con prefijo `"passage: "`
+- THEN `from_memo` vale 0 y se embeben todos los pasajes
+
+#### Escenario: otro modelo, otra dimensión
+- GIVEN una memoria llena con el modelo `m1` de 384 dimensiones
+- WHEN se indexa con `m2`, o con `m1` de 768 dimensiones
+- THEN `from_memo` vale 0 en los dos casos
+
+#### Escenario: otro SHA del `model.onnx`
+- GIVEN una memoria llena con un SHA de modelo dado
+- WHEN se indexa con otro SHA y todo lo demás igual
+- THEN `from_memo` vale 0
+
+#### Escenario: otro rol
+- GIVEN una memoria con el vector de un texto como pasaje
+- WHEN se pide el mismo texto como consulta
+- THEN la clave es otra y no hay vector guardado
+
+#### Escenario: otro texto
+- GIVEN una memoria con el vector de un texto
+- WHEN se pide el mismo texto con un solo carácter distinto, incluido un espacio, o con otro prefijo ya aplicado
+- THEN la clave es otra
+
+#### Escenario: otra máquina
+- GIVEN una memoria hecha con una marca de máquina
+- WHEN la marca difiere en el sistema, la arquitectura, AVX2, AVX-512F, FMA o los hilos, uno por uno
+- THEN la clave es otra en cada caso y `from_memo` vale 0
+
+#### Escenario: lo mismo da la misma clave
+- GIVEN dos contratos, roles, textos y marcas iguales
+- WHEN se calcula la clave dos veces, en dos procesos
+- THEN es la misma
+
+**Tests:** `the_memo_key_changes_with_each_component_of_the_contract` (tabla: un componente por fila, de a uno), `the_memo_key_separates_neighbouring_components` (`("ab","c")` frente a `("a","bc")`), `the_memo_key_is_stable` (un literal de SHA-256, que vale entre procesos) y `a_memo_made_under_another_contract_is_not_used` (embedder falso de prefijo, modelo y SHA configurables) en `crates/clawg-core/src/eval_api/vector_memo.rs`.
+
+### IC4. Cómo una corrida usa la memoria
+
+La memoria de vectores MUST ser un decorador de `Embedder` dentro de `eval_api` (`MemoEmbedder`, `vector_memo.rs:286`, detrás de `EvalMemo`, `:370`, que arma `EvalEmbedder`, `eval_api.rs:550`); el embedder de producción MUST NOT cambiar. MUST estar activa por defecto en `rag-eval --real --docs`, y MUST valer sólo para los pasajes: las preguntas (rol de consulta) MUST NOT pasar por ella ni escribirse en ella.
+
+Por cada pedido de pasajes el decorador MUST consultar la memoria **tal como estaba al empezar la corrida**, devolver lo que tiene y mandar el resto al embedder de verdad en **una sola llamada**, en el orden en que llegó, de modo que con la memoria vacía se embeba en las mismas tandas que sin decorador. Los vectores nuevos se agregan a la memoria **al terminar de indexar** (`EvalMemo::finish`, `vector_memo.rs:454`), haya terminado bien o no (cada vector guardado pasó los controles de una respuesta), y MUST NOT entrar a la consulta de esa misma corrida. Una corrida que no agregó nada MUST NOT reescribir el archivo. Un texto repetido dentro de la corrida que la memoria no tenía se embebe cada vez, como sin memoria, y se guarda una sola vez.
+
+- `--no-cache` MUST NOT leer ni escribir la memoria: la carpeta queda byte por byte como estaba, y no se crea si no existía.
+- `--fake` MUST NOT usarla nunca; `--no-cache` sin `--docs` MUST ser un error de uso (salida 1), como `--root` sin `--docs`. Sólo una corrida `--real --docs` sin `--no-cache` tiene carpeta de memoria (`memo_dir`, `crates/clawg-eval/src/bin/rag-eval/cli.rs:330`).
+- Vive en `docs/eval/cache/`, resuelta como `default_out_dir` (`default_cache_dir`, `cli.rs:319`; `default_out_dir`, `:308`), sin depender del directorio de trabajo, junto a `docs/eval/results/` y fuera de git (`docs/eval/**`, `.gitignore:32`). No hay bandera para elegir otra carpeta. Hay un archivo por contrato (`docs-vectors-{16 hex}.bin`, `memo_file_name`, `vector_memo.rs:107`), así que una corrida de otro contrato no toma por ilegible, ni reemplaza, el de otro.
+- MUST guardar sólo claves y vectores (los `f32` exactos), nunca texto ni rutas.
+- Se acumula sin purga: una corrida no borra lo que no usó. Se limpia borrando la carpeta, y `--help` MUST decirlo, con lo que ocupa: 1568 bytes (32 + 384 × 4) por texto distinto y por contrato. MUST NOT dar una cota, porque la memoria crece con el corpus y con cada corrida que embebe un texto que no tiene: con los 18 249 pasajes del 2026-10-31 ocupa 28,6 MB.
+- Un doc que cambia MUST embeber sólo los textos que no están en la memoria; los de sus pasajes sin cambios salen de ella.
+- Si un vector que devuelve el embedder de verdad no sirve (cuenta distinta, dimensión o valor no finito), el decorador MUST fallar igual que sin memoria y MUST NOT guardarlo.
+
+#### Escenario: la segunda corrida no embebe nada
+- GIVEN un árbol indexado una vez con la memoria vacía y un embedder falso que cuenta los textos
+- WHEN se indexa otra vez el mismo árbol con el mismo contrato y la memoria que dejó la primera
+- THEN el embedder no recibe ningún texto, `from_memo` es `corpus.passages`, `embedded` es 0 y los vectores guardados son los mismos bytes
+
+#### Escenario: la memoria vacía embebe como producción
+- GIVEN un árbol con un doc de 20 pasajes y otro de 3, y un embedder falso que anota el tamaño de cada llamada
+- WHEN se indexa con la memoria vacía y, aparte, sin decorador
+- THEN las llamadas, su orden y sus textos son los mismos
+
+#### Escenario: sólo se embeben los textos nuevos
+- GIVEN la memoria llena de un árbol, y un doc en el que se edita una sección
+- WHEN se indexa de nuevo
+- THEN el embedder recibe sólo los pasajes cuyo texto con prefijo no estaba, en el orden en que llegaron en una sola llamada, y `from_memo + embedded` es `corpus.passages`
+
+#### Escenario: lo nuevo no se usa en la misma corrida
+- GIVEN la memoria vacía y dos pedidos de pasajes al decorador con el mismo texto (por el refresco no se arma: el breadcrumb de cada pasaje empieza con la ruta de su doc)
+- WHEN se embeben y la corrida termina
+- THEN el embedder recibe el texto en los dos pedidos y `from_memo` vale 0; la memoria queda con una sola entrada para ese texto
+
+#### Escenario: las preguntas no pasan por ella
+- GIVEN una memoria llena
+- WHEN se hace una pregunta (rol de consulta)
+- THEN el embedder la recibe y la memoria no cambia
+
+#### Escenario: `--no-cache`
+- GIVEN una carpeta `cache/` con una memoria
+- WHEN se indexa con `--no-cache`
+- THEN se embebe todo, `index.memo.used` vale `false` y la carpeta queda byte por byte como estaba; si no existía, sigue sin existir
+
+#### Escenario: `--fake`
+- GIVEN `rag-eval --fake --docs`
+- WHEN corre
+- THEN no se abre ni se crea la carpeta de la memoria
+
+#### Escenario: la ruta no depende del directorio de trabajo
+- GIVEN el binario ejecutado desde otro directorio
+- WHEN se resuelve la carpeta de la memoria
+- THEN es `docs/eval/cache/` del workspace, al lado de `docs/eval/results/`
+
+#### Escenario: sólo claves y vectores
+- GIVEN una memoria escrita tras indexar un árbol con un texto reconocible
+- WHEN se leen sus bytes
+- THEN no contienen ese texto ni ninguna ruta
+
+**Tests:** `a_full_memo_embeds_nothing_and_stores_the_same_vector_bytes`, `an_empty_memo_embeds_in_the_batches_production_does`, `a_changed_doc_embeds_only_its_new_texts`, `what_a_run_adds_is_not_used_until_the_next_run`, `a_run_that_adds_nothing_does_not_touch_the_file`, `what_a_run_embedded_before_the_index_failed_is_kept`, `questions_never_go_through_the_memo`, `a_vector_the_embedder_returns_unusable_is_not_stored` y `the_memo_file_holds_no_text` (decorador con embedder falso que anota llamadas; carpeta con `test_dir()`) en `crates/clawg-core/src/eval_api/vector_memo.rs`; `the_memo_folder_sits_next_to_the_results_folder`, `no_cache_without_docs_is_an_error`, `the_memo_is_used_only_by_a_real_docs_run_that_did_not_ask_for_none`, `the_help_text_documents_no_cache` y `the_help_text_gives_the_size_of_the_memo_per_text_and_no_bound` en `crates/clawg-eval/src/bin/rag-eval/cli.rs`; `no_cache_leaves_the_folder_byte_for_byte` (compara un resumen de bytes antes y después, y la ausencia de la carpeta) y `docs_mode_with_the_fake_embedder_never_touches_the_memo` en `crates/clawg-eval/src/bin/rag-eval/docs.rs`, con la carpeta de la memoria del `Cli` en un `TempPath`: el binario resuelve siempre la del workspace y ninguna bandera la cambia.
+
+### IC5. Una memoria que no se puede leer
+
+Una memoria truncada, con una cabecera que no es la esperada, de una versión que no se conoce o ilegible MUST ignorarse con un aviso por stderr que nombre el archivo y la causa (`load_memo`, `vector_memo.rs:200`); la corrida MUST embeber todo, como con la memoria vacía, y `index.memo.used` MUST valer `false`. Nunca MUST usarse un vector a medias: un archivo que no se lee entero no aporta ninguno. Una corrida que ignoró una memoria ilegible MUST NOT salir con error por eso. Escribir la memoria MUST NOT dejar nunca un archivo a medias: se escribe a un archivo temporal de la misma carpeta y se renombra (`replace_file`, `vector_memo.rs:225`), y si la escritura falla la memoria anterior queda como estaba y la corrida avisa sin fallar. En el caso de una memoria ilegible, lo que la corrida embebió MUST reemplazarla al terminar.
+
+#### Escenario: truncada
+- GIVEN una memoria a la que se le cortó el final a la mitad de un vector
+- WHEN se indexa
+- THEN se avisa, se embebe todo y `from_memo` vale 0; ningún pasaje usa un vector parcial
+
+#### Escenario: cabecera desconocida o ilegible
+- GIVEN un archivo que no empieza con la cabecera de la memoria, o uno de una versión posterior, o uno que no se puede abrir
+- WHEN se indexa
+- THEN se avisa con el nombre del archivo y se embebe todo
+
+#### Escenario: la escritura se corta
+- GIVEN una escritura que falla antes de terminar
+- WHEN la corrida cierra
+- THEN la memoria anterior sigue intacta, no queda un archivo parcial con el nombre de la memoria, y se avisa
+
+**Tests:** `a_truncated_memo_is_ignored_with_a_warning`, `a_memo_with_an_unknown_header_is_ignored`, `an_unreadable_memo_is_ignored`, `a_memo_that_cannot_be_read_is_replaced_by_what_the_run_embedded`, `a_failed_write_leaves_the_previous_memo` (la escritura se parte con un escritor que falla; sin tocar el modelo) y `a_write_that_fails_is_a_warning_and_not_an_error` en `crates/clawg-core/src/eval_api/vector_memo.rs`.
+
+### IC6. Los tokens
+
+`rag-eval --real --docs` MUST contar los tokens del corpus que indexó, después de indexar, y el archivo de resultados MUST llevarlos en `index.tokens`. Se cuentan sobre el texto de cada pasaje escrito, con el prefijo de pasaje y como lo embebe el modelo: tokenizado y recortado a la ventana de 512 (`window_encodings`, `crates/clawg-core/src/memory/embedder.rs:240`; el conteo, `lengths_by_doc`, `eval_api.rs:1386`, y `EvalDocIndex::passage_lengths`, `:1447`). Los campos son (`Tokens`, `crates/clawg-eval/src/bin/rag-eval/index_cost.rs:103`):
+
+| Campo | Qué es |
+|---|---|
+| `real` | La suma de los tokens de cada pasaje dentro de la ventana, sin relleno |
+| `padded` | Por doc, en tandas de `EMBED_BATCH` (`embedder.rs:184`) y en el orden del doc, filas × el más largo de la tanda, sumado: lo que corre el modelo sin memoria (`padded`, `index_cost.rs:90`) |
+| `padded_ran` | La suma de `embedder.batch_tokens` con `role=passage` de la corrida (`embedder.rs:509`): lo que corrió de verdad |
+| `padded_sorted_in_doc` | El cálculo de `padded` con los pasajes de cada doc ordenados de más tokens a menos, los empates en el orden del doc, como `longest_first` (`crates/clawg-core/src/memory/portability/import.rs:2537`, que `eval_api.rs:1085` reexporta), el orden con que una importación embebe sus filas (`padded_sorted`, `index_cost.rs:96`) |
+| `padded_sorted_all` | El mismo cálculo con todos los pasajes de la corrida en ese orden, los empates en el orden de la corrida, cortados en tandas de `EMBED_BATCH` |
+| `count_seconds` | Cuánto llevó contar, tokenizando como el embedder: la estimación de lo que cuesta tokenizar dentro de `embed` |
+
+El conteo MUST ser puro sobre largos ya medidos (sin tokenizer, sin disco): `padded`, `padded_sorted_in_doc` y `padded_sorted_all` se calculan sobre listas de largos por doc (`Tokens::new`, `index_cost.rs:123`). Un doc con `EMBED_BATCH` pasajes o menos corre una sola tanda de ese tamaño, así que su relleno es el mismo en cualquier orden. Con una tanda incompleta, ordenar puede rellenar más: los tres campos MUST NOT acotarse entre sí, y los cocientes entre ellos pueden salir negativos.
+
+`EvalEmbedder::real` (`eval_api.rs:573`) MUST conservar el recorder de su embedder (`eval_api.rs:580-583`) y `padded_ran` (`passage_tokens_ran`, `eval_api.rs:621`) MUST leerse de él. `embedder.batch_tokens` es un gauge (`Gauge`, `crates/clawg-core/src/metrics/recorder.rs:50`), que `Recorder::run()` (`recorder.rs:172`) no devuelve, así que se lee su `sum` de la ventana en curso (`Recorder::minute`, `:167`) con `role=passage`, la que en la evaluación nadie vacía. Nada de esto escribe en un `metrics.db`.
+
+Una corrida en la que ningún pasaje salió de la memoria (`from_memo = 0`: con `--no-cache`, con la memoria vacía o con una que no tenía ninguno de sus textos) MUST avisar por stderr cuando `padded != padded_ran` (`padding_warning`, `index_cost.rs:151`): cada pasaje corrió en las tandas de producción y los dos números tienen que coincidir. Con `from_memo > 0` el aviso no sale, porque `padded_ran` cuenta sólo lo que se embebió.
+
+#### Escenario: relleno de una tanda
+- GIVEN un doc de 3 pasajes de 10, 40 y 25 tokens
+- WHEN se calcula
+- THEN `real` es 75, `padded` es 3 × 40 = 120 y `padded_sorted_in_doc` es 120: es una sola tanda
+
+#### Escenario: más de una tanda
+- GIVEN un doc de 20 pasajes (`EMBED_BATCH` = 16) cuyos largos se alternan entre 10 y 100 tokens, empezando por 10
+- WHEN se calcula
+- THEN `real` es 1100, `padded` es 16 × 100 + 4 × 100 = 2000 y `padded_sorted_in_doc` es 16 × 100 + 4 × 10 = 1640
+
+#### Escenario: ordenar puede rellenar más
+- GIVEN un doc de 17 pasajes: 16 de 10 tokens y, al final, uno de 100
+- WHEN se calcula
+- THEN `padded` es 16 × 10 + 1 × 100 = 260 y `padded_sorted_in_doc` es 16 × 100 + 1 × 10 = 1610
+
+#### Escenario: ordenar entre docs
+- GIVEN tres docs: 3 pasajes de 10 tokens, 3 de 10 y 10 de 100
+- WHEN se calcula
+- THEN `padded` y `padded_sorted_in_doc` son 1060 y `padded_sorted_all` es 16 × 100 = 1600, una sola tanda con el más largo; si todos los pasajes miden lo mismo, los tres valen los pasajes por ese largo
+
+#### Escenario: ventana de 512
+- GIVEN un pasaje de 700 tokens
+- WHEN se cuenta
+- THEN aporta a lo sumo lo que la ventana deja (512, con los tokens especiales)
+
+#### Escenario: sin pasajes
+- GIVEN un corpus sin pasajes
+- WHEN se calcula
+- THEN todo vale 0
+
+#### Escenario: el aviso
+- GIVEN una corrida con `from_memo = 0`, `padded = 1000` y `padded_ran = 1200`
+- WHEN termina
+- THEN stderr avisa que difieren y el archivo igual los lleva
+
+#### Escenario: el recorder
+- GIVEN `EvalEmbedder` con un embedder de prueba que anota un gauge `embedder.batch_tokens` con `role=passage` y otro con `role=query`
+- WHEN se pide `padded_ran`
+- THEN suma sólo el de `passage`
+
+**Tests:** `padding_of_a_batch_is_rows_times_the_longest`, `a_doc_over_embed_batch_runs_several_batches`, `one_batch_pads_the_same_in_any_order`, `sorting_can_pad_more_when_the_last_batch_is_short`, `sorting_keeps_ties_in_their_order`, `sorting_across_docs_batches_the_whole_run`, `an_empty_corpus_has_no_tokens` y `a_mismatch_between_computed_and_ran_padding_warns_only_when_nothing_came_from_the_memo` (puros, sin modelo) en `crates/clawg-eval/src/bin/rag-eval/index_cost.rs`; `the_index_block_carries_the_tokens_of_a_real_run` en `docs.rs`; `a_passage_longer_than_the_window_counts_the_window`, `padded_ran_sums_only_passage_batches` y `the_real_embedder_keeps_its_recorder` (por `EvalEmbedder::of`, que recibe el recorder, porque `EvalEmbedder::real` necesita el modelo) en `crates/clawg-core/src/eval_api.rs`. Que `real` conserve su recorder lo cierra con el modelo la igualdad `padded == padded_ran` de «Índice de docs», en la baseline.
+
+### IC7. El reparto por área
+
+`rag-eval --docs` MUST repartir lo que mide en tres áreas según la ruta relativa de cada doc: `archive` si empieza con `openspec/changes/archive/`; si no, `code` para `DocKind::Code` y `docs` para el resto (Markdown y manifiestos). La decisión MUST ser pura (ruta y tipo) y MUST vivir en `rag-eval` (`area_of`, `crates/clawg-eval/src/bin/rag-eval/index_cost.rs:172`): producción MUST NOT nombrar `archive/` ni recibir un clasificador del lado de la evaluación que la cambie, y el refresco MUST NOT filtrar por área. El prefijo se compara con la ruta relativa con `/`, y `openspec/changes/archived/x.md` y `openspec/changes/archive.md` no cuentan como archivo.
+
+`index.by_area.{docs,code,archive}` (`ByArea::of`, `index_cost.rs:242`) MUST llevar, para cada área: `docs` (docs reindexados), `passages`, `multi_batch_docs` (docs con más de `EMBED_BATCH` pasajes), `phases.{read,mask,split,lookup,embed,write}` (la suma de los docs del área) y `tokens.{real,padded,multi_batch_real,multi_batch_padded}`, donde `multi_batch_*` suman sólo los docs con más de `EMBED_BATCH` pasajes. `scan` no se reparte: es del recorrido entero. Tampoco la remoción de los docs que ya no están, que IC1 cuenta en `write` y no es de ningún doc. La suma de las tres áreas MUST dar los totales de `index.phases` menos `scan` (con `write` más la remoción igual a `index.phases.write`), `corpus.passages` e `index.tokens.{real,padded}`.
+
+#### Escenario: la ruta decide
+- GIVEN `openspec/changes/archive/2026-01-01-x/proposal.md`, `docs/a.md`, `Cargo.toml` y `crates/x/src/lib.rs`
+- WHEN se clasifican
+- THEN son `archive`, `docs`, `docs` y `code`
+
+#### Escenario: un código bajo archive
+- GIVEN `openspec/changes/archive/x/script.rs`
+- WHEN se clasifica
+- THEN es `archive`
+
+#### Escenario: prefijos parecidos
+- GIVEN `openspec/changes/archived/x.md` y `openspec/changes/archive.md`
+- WHEN se clasifican
+- THEN son `docs`
+
+#### Escenario: las áreas suman el total
+- GIVEN tiempos y largos por doc de las tres áreas
+- WHEN se reparten
+- THEN la suma de cada fase, de los pasajes y de los tokens por área da el total
+
+#### Escenario: la remoción no es de ningún área
+- GIVEN un refresco que borró docs que ya no están, con una remoción mayor que cero
+- WHEN se reparte
+- THEN el `write` de las áreas más la remoción da `index.phases.write`
+
+#### Escenario: una tanda múltiple
+- GIVEN un doc de 20 pasajes y uno de 3 en `docs`
+- WHEN se reparten
+- THEN `multi_batch_docs` vale 1 y `multi_batch_real` y `multi_batch_padded` suman sólo el de 20
+
+**Tests:** `area_of_a_path_is_decided_by_its_prefix_and_kind` (tabla), `areas_add_up_to_the_totals`, `the_removal_of_docs_is_in_the_total_write_and_in_no_area` y `only_docs_over_a_batch_count_as_multi_batch` en `crates/clawg-eval/src/bin/rag-eval/index_cost.rs`; `production_never_names_the_archive`, en `crates/clawg-core/src/memory/project_docs/mod.rs`, busca el texto `archive/` en las fuentes del refresco, `crates/clawg-core/src/memory/project_docs/`, y falla si aparece.
+
+### IC8. El bloque `index` del archivo de resultados y el informe
+
+El archivo de `rag-eval --real --docs` (`DocsResults`, `crates/clawg-eval/src/bin/rag-eval/docs.rs:323`) MUST llevar un bloque `index` (`IndexBlock`, `index_cost.rs:295`) con:
+
+- `build`: `debug` o `release` (`cfg!(debug_assertions)`);
+- `machine`: `os`, `arch`, `avx2`, `avx512f`, `fma` y `threads`, los hilos de la sesión (`session_threads`, `embedder.rs:530`);
+- `phases`: `scan`, `read`, `mask`, `split`, `lookup`, `embed` y `write`, en segundos, sumados sobre el refresco (IC1);
+- `memo`: `used` (si se leyó una memoria utilizable), `from_memo` (pasajes que salieron de ella), `embedded` (pasajes que se embebieron; `from_memo + embedded` es `corpus.passages`) y `seconds` (lo que llevó leer y escribir la memoria, **fuera** de `index_seconds`);
+- `tokens` (IC6) y `by_area` (IC7).
+
+`index_seconds` y `corpus` MUST NOT cambiar de nombre, tipo ni de lo que miden. Ningún campo de `index` MUST llevar texto de un pasaje, de una pregunta ni una ruta; el bloque sólo lleva números, banderas y los nombres `debug`/`release`, el sistema y la arquitectura. Como la memoria no cuenta en `index_seconds`, `phases` suma a lo más `index_seconds` más el error de medir.
+
+El informe por stdout (`render`, `docs.rs:238`) MUST nombrar el archivo de la memoria (o decir que no se usó, con `--no-cache`) y mostrar `index.memo` (`from_memo`, `embedded`, `seconds`) y las fases. Con `--fake`, `rag-eval` MUST seguir sin escribir archivo (`docs.rs:618`), el informe no muestra tokens ni memoria, y no se cuenta nada con el tokenizer.
+
+`rag-eval --diff` (DQ4 de [docs-search-quality](../../changes/docs-search-quality/spec.md)) MUST leer un archivo sin bloque `index` contra uno que lo tiene, en cualquier orden, y seguir sin comparar tiempos: `DocsFile` (`docs.rs:411`) no usa `deny_unknown_fields` y no tiene campos obligatorios de `index`.
+
+#### Escenario: el bloque
+- GIVEN una corrida real con memoria que sacó 30 de 100 pasajes de ella
+- WHEN se arma el archivo
+- THEN `index.memo` es `{ used: true, from_memo: 30, embedded: 70, seconds: … }`, `corpus.passages` es 100 y `index_seconds` no incluye `memo.seconds`
+
+#### Escenario: sin memoria
+- GIVEN una corrida con `--no-cache`
+- WHEN se arma el archivo
+- THEN `index.memo.used` es `false`, `from_memo` vale 0, `embedded` es `corpus.passages` y `seconds` vale 0
+
+#### Escenario: sin texto ni rutas
+- GIVEN un archivo armado con docs de rutas y textos reconocibles
+- WHEN se serializa
+- THEN ninguna cadena del bloque `index` contiene una ruta del corpus ni el texto de un pasaje
+
+#### Escenario: lo de antes no se mueve
+- GIVEN los resultados del mismo caso con y sin el bloque
+- WHEN se comparan `index_seconds`, `corpus`, `aggregate` y `per_case`
+- THEN tienen los mismos nombres y tipos
+
+#### Escenario: `--diff` de un archivo viejo contra uno nuevo
+- GIVEN A sin bloque `index` y B con él
+- WHEN corre `rag-eval --diff A B` y `--diff B A`
+- THEN compara las preguntas como siempre, no informa ningún tiempo y no falla
+
+#### Escenario: el informe de stdout
+- GIVEN una corrida real con memoria
+- WHEN se imprime el informe
+- THEN nombra el archivo de la memoria y muestra `from_memo`, `embedded` y las fases; con `--fake` no muestra tokens ni memoria
+
+**Tests:** `the_index_block_reports_the_memo_and_the_phases`, `the_index_block_holds_no_text_and_no_path` (serializa y busca), `index_seconds_and_corpus_keep_their_shape`, `a_results_file_without_an_index_block_still_diffs`, `a_results_file_with_an_index_block_still_diffs_against_an_old_one`, `the_docs_report_names_the_memo_file` y `a_fake_run_reports_no_tokens_and_no_memo` (cadenas del informe) en `crates/clawg-eval/src/bin/rag-eval/docs.rs`; `the_areas_hold_no_path` en `index_cost.rs`; `docs_mode_with_the_fake_embedder_writes_no_file` en `crates/clawg-eval/tests/docs_mode.rs`.
 
 ## `rag-eval --lang-detect`: el detector de idioma
 
@@ -961,8 +1237,20 @@ Medido con el modelo real el 2026-10-28 y el 2026-10-29, sobre dos cortes del mi
 - **Los resúmenes de sesión no inundan cuando hay respuesta.** En calibración, sobre el corte nuevo, ocupan el 7,1 % del top 3 en los casos que no piden un resumen, contra el 11,7 % de las filas. En los casos sin respuesta ocupan el 33,3 %.
 - **Ni el coseno del mejor hit ni el hueco separan las consultas con y sin respuesta.** Las sin respuesta van de 0,854 a 0,891 de coseno, y las con respuesta arrancan en 0,851. Abstener en 15 de 18 sin respuesta cuesta 19 de 63 con respuesta.
 
+### Índice de docs
+
+Medido con el modelo real el 2026-10-31 en Windows (16 hilos, AVX2, AVX-512F y FMA), sobre 740 docs y 18 249 pasajes (2 saltados y 1 fuera por citar las preguntas), con `rag-eval --real --docs`. D: build debug y memoria vacía; R: build release y `--no-cache`. Ninguna de las dos usó vectores de la memoria (`from_memo = 0`). El detalle está en el [verify](../../changes/archive/2026-10-31-docs-index-cost/verify.md#corridas-reales) del cambio.
+
+- **Tiempo:** `index_seconds` 1601,5 s en D y 1951,2 s en R. La suma de `index.phases` da `index_seconds` (diferencia menor a 0,01 %).
+- **`phases.embed`:** 1526,3 s en D (95,3 % de `index_seconds`) y 1935,0 s en R (99,2 %). El de R es un 26,8 % más lento aunque sea release, y la inferencia corre en la misma biblioteca nativa en los dos builds; la carga de la máquina no se midió, así que una diferencia de ese tamaño entre dos corridas sueltas no se lee como mejora ni como regresión. Las demás fases de R suman 16,2 s (`mask` 0,8 s, `split` 12,0 s, `write` 3,0 s).
+- **Tokens:** `real` 5 645 075 y `padded` 8 467 287, igual a `padded_ran` en las dos corridas (el relleno es 1,50 × lo real). Ordenado por largo, `padded_sorted_in_doc` baja a 7 023 477 y `padded_sorted_all` a 5 648 371.
+- **Memoria:** D la llenó con un archivo de 28 608 248 bytes (18 245 entradas de 1568 bytes más 88 de cabecera y checksum: 4 textos repetidos) y `memo.seconds` 1,35 s; R no la tocó (mismo SHA-256, tamaño y fecha).
+- **Por área en R:** `archive` 42,8 % de `phases.embed`, `code` 41,3 % y `docs` 15,9 %.
+- `--diff` de D contra R no mueve ninguna pregunta del golden de docs, así que la memoria no cambia qué vector va con qué pasaje con el modelo real.
+
 ## Invariantes
 
 - El generador, el reporte, la estadística y `--diff` son lógica pura, separada de la E/S: se prueban sin modelo, sin red y sin `docs/eval/`.
 - `--diff` es determinista: el bootstrap usa una semilla fija, y los mismos dos archivos dan siempre la misma salida.
 - Producción nunca enlaza esto: `clawg-eval` usa `clawg-core` a través de la feature `eval`.
+- Ni la memoria de vectores de `rag-eval --docs` ni el bloque `index` de su archivo de resultados guardan el texto de un pasaje, el de una pregunta ni una ruta: la memoria sólo claves y vectores, el bloque sólo números, banderas y los nombres de build, sistema y arquitectura.

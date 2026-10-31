@@ -88,7 +88,7 @@ Se llama una vez al empezar `serve`, antes de cualquier tanda. **A favor:** el g
 
 Ordenar los índices por cantidad de tokens, agrupar de a `EMBED_BATCH` y devolver los vectores en el orden original. **A favor:** menos padding en refrescos de docs. **En contra:** cambia el largo rectangular de cada llamada, y el comentario de `pool_and_normalize` (`embedder.rs:270-274`) sólo garantiza el orden de las operaciones, no que otra composición de tanda dé los mismos bits; el lote de 17 de `e5_golden` lo ejerce. Si los bits se mueven, hay que decidir entre reescribir la fixture o tolerancia. No sirve para el re-embeber (infiere de a una fila), así que lo gana 17 si ese cambio agrupa.
 
-**Pasó a [docs-index-speed](../docs-index-speed/proposal.md) (95)**, como sus pasos A1 y A2, con la puerta que lee el relleno medido por [docs-index-cost](../docs-index-cost/proposal.md) (94). Si los bits se mueven, se reescribe la fixture.
+**Pasó a [docs-index-speed](../docs-index-speed/proposal.md) (95)**, como sus pasos A1 y A2, con la puerta que lee el relleno medido por [docs-index-cost](../archive/2026-10-31-docs-index-cost/proposal.md) (94). Si los bits se mueven, se reescribe la fixture.
 
 ### E. Codificar una sola vez en `split_save`, y/o `spawn_blocking` sobre un tamaño
 
