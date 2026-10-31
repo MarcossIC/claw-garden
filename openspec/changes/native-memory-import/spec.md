@@ -17,7 +17,7 @@ Un DIR que no es ninguno de los tres, o que no es un directorio, MUST rechazarse
 - WHEN se importa `projects/`, `projects/-work-app` o `projects/-work-app/memory`
 - THEN las tres lecturas dan la misma nota, del proyecto `-work-app`
 
-**Tests:** `a_memory_dir_a_project_dir_and_the_projects_dir_read_the_same_note`, `a_directory_without_memory_is_refused`, `entries_that_are_not_topic_files_are_counted`.
+**Tests:** `a_memory_dir_a_project_dir_and_the_projects_dir_read_the_same_note`, `a_directory_without_memory_is_refused`, `entries_that_are_not_topic_files_are_counted`, `a_file_that_is_not_utf8_is_listed_unread`, `the_document_reads_from_text_and_has_no_format_version`, `a_claude_code_import_reads_a_directory_and_refuses_a_file`, `a_claude_code_job_reads_a_directory`.
 
 ## NM2. El frontmatter
 
@@ -36,7 +36,7 @@ Cada archivo de tema MUST dar una nota con:
 
 - origen `claude-code:<proyecto>/<archivo>`;
 - título `name`, o el nombre del archivo sin `.md` si no hay;
-- contenido `description` y el cuerpo, separados por una línea, o el que haya;
+- contenido `description` y el cuerpo, separados por una línea en blanco, o el que haya;
 - fecha `modified` si se lee como fecha, si no la hora de modificación del archivo, y si tampoco, ilegible (el import le da su propia hora);
 - proyecto de origen, el del directorio (NM1).
 
@@ -68,7 +68,7 @@ Al guardarse, una nota de `claude-code` MUST tomar el tipo `user_preference` si 
 - WHEN se corre `--dry-run`, después el import, después el import otra vez, después `--undo` del primero
 - THEN el `--dry-run` no escribe nada; el import guarda tres notas con el agente `migrated`; el segundo no agrega ninguna; el `--undo` deja el store sin ellas
 
-**Tests:** `a_claude_code_memory_imports_through_the_binary`, `import_takes_a_source_and_project_maps`, `the_claude_code_document_imports_by_text` y los de `parse_input`.
+**Tests:** `a_claude_code_memory_imports_through_the_binary`, `import_takes_claude_codes_memory_with_a_project_named_by_its_directory`, `the_claude_code_document_imports_by_text`, `parse_input_reads_each_source`, `a_source_without_a_format_version_is_named_alone`.
 
 ## NM7. El aviso de `doctor`
 
@@ -79,4 +79,4 @@ Al guardarse, una nota de `claude-code` MUST tomar el tipo `user_preference` si 
 
 Sin servidor registrado o sin archivos de tema, MUST NOT dar el hallazgo.
 
-**Tests:** `native_memory_is_named_until_every_file_is_imported`, `the_facts_name_the_origins_imported_from_claude_code`, `doctor_names_native_memory_not_imported`.
+**Tests:** `native_memory_is_named_until_every_file_is_imported`, `a_server_is_registered_when_the_config_names_it`, `the_facts_name_the_origins_imported_from_claude_code`, `doctor_names_native_memory_not_imported`.
