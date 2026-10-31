@@ -238,6 +238,11 @@ fn execute(command: Command) -> Result<(), String> {
         }
         Command::Run { args, replay } => {
             let replay = std::path::absolute(&replay).map_err(|e| format!("{}: {e}", replay.display()))?;
+            match std::fs::metadata(&replay) {
+                Ok(m) if m.is_file() => {}
+                Ok(_) => return Err(format!("--replay {} is not a file", replay.display())),
+                Err(e) => return Err(format!("--replay {}: {e}", replay.display())),
+            }
             let (plan, layout) = prepare(&args)?;
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
             let client = Step {
@@ -325,6 +330,29 @@ mod tests {
         assert_eq!(parse_args(args(&["replay-client", "s"])), Ok(Some(Command::ReplayClient { stream: "s".into() })));
         assert_eq!(parse_args(args(&["--help"])), Ok(None));
         assert_eq!(parse_args(args(&["run", "-h"])), Ok(None));
+    }
+
+    #[test]
+    fn run_refuses_a_replay_that_is_not_a_file_before_laying_out_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("run");
+        let args = RunArgs {
+            data: default_data(),
+            task: "example-count-lines".into(),
+            arm: Arm::A0,
+            out: out.clone(),
+            clawg: clawg().into(),
+            model: "m".into(),
+            effort: None,
+            max_budget_usd: None,
+            profile: Profile::Dev,
+            lang: None,
+        };
+        for replay in [dir.path().join("missing.jsonl"), dir.path().to_path_buf()] {
+            let err = execute(Command::Run { args: args.clone(), replay: replay.clone() }).unwrap_err();
+            assert!(err.contains(&format!("--replay {}", replay.display())), "{err}");
+            assert!(!out.exists(), "the run was laid out for {}", replay.display());
+        }
     }
 
     #[test]
