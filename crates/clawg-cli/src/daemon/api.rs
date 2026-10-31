@@ -36,6 +36,7 @@ use clawg_core::memory::bootstrap::EmbedderStatus;
 use clawg_core::memory::chunker::ChatChunker;
 use clawg_core::memory::dispute::{judge_pair, open_pairs, resolve_dispute_core, OpenPairs, Outcome, Resolution, ResolveError, Verdict};
 use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder};
+use clawg_core::memory::portability::timing::seconds;
 use clawg_core::memory::project_docs::{self, DocHit, DocIndexError, RefreshGuard};
 use clawg_core::memory::worker::{
     ChunkOutcome, IngestFailure, IngestReport, SavedChunk,
@@ -2993,16 +2994,35 @@ fn refresh_line(project_id: &str, r: &project_docs::RefreshReport) -> String {
     )
 }
 
+/// Where a refresh spent its time, the phases summed over its docs. `took` is
+/// the total the metrics record too, so the line and the series agree.
+fn refresh_timing_line(project_id: &str, took: Duration, timing: &project_docs::RefreshTiming) -> String {
+    let p = timing.phases();
+    format!(
+        "docs refresh of {project_id}: done in {} s: scan {}, read {}, mask {}, split {}, lookup {}, embed {}, write {}",
+        seconds(took),
+        seconds(timing.scan),
+        seconds(p.read),
+        seconds(p.mask),
+        seconds(p.split),
+        seconds(p.lookup),
+        seconds(p.embed),
+        seconds(p.write),
+    )
+}
+
 /// Nobody waits on the outcome: a failure is logged and kept for the next
 /// search to name.
 async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder, project_id: &str) {
     let tokenizer = app.runtime.tokenizer.get().cloned();
     let started = Instant::now();
-    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer).await.map(|run| run.report);
-    record_refresh(&app.runtime.metrics, started.elapsed(), refreshed.as_ref().ok());
+    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer).await;
+    let took = started.elapsed();
+    record_refresh(&app.runtime.metrics, took, refreshed.as_ref().ok().map(|run| &run.report));
     match refreshed {
-        Ok(r) => {
+        Ok(project_docs::RefreshRun { report: r, timing }) => {
             log::info!("{}", refresh_line(project_id, &r));
+            log::info!("{}", refresh_timing_line(project_id, took, &timing));
             for f in &r.failed {
                 log::warn!("left {} of {project_id} as it was: {}", f.path, f.reason);
             }
@@ -3151,6 +3171,47 @@ mod tests {
 
     fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
         SavedChunk { id, outcome }
+    }
+
+    #[test]
+    fn the_docs_timing_line_names_every_phase() {
+        let ms = Duration::from_millis;
+        let timing = project_docs::RefreshTiming {
+            scan: ms(500),
+            docs: vec![
+                project_docs::DocTiming {
+                    path: "a.md".into(),
+                    kind: project_docs::corpus::DocKind::Markdown,
+                    passages: 2,
+                    phases: project_docs::DocPhases {
+                        read: ms(100),
+                        mask: ms(300),
+                        split: ms(600),
+                        lookup: Duration::ZERO,
+                        embed: ms(2000),
+                        write: ms(250),
+                    },
+                },
+                project_docs::DocTiming {
+                    path: "b.md".into(),
+                    kind: project_docs::corpus::DocKind::Markdown,
+                    passages: 1,
+                    phases: project_docs::DocPhases {
+                        read: ms(150),
+                        mask: ms(200),
+                        split: ms(400),
+                        lookup: Duration::ZERO,
+                        embed: ms(1000),
+                        write: ms(250),
+                    },
+                },
+            ],
+            remove: ms(250),
+        };
+        assert_eq!(
+            refresh_timing_line("p", ms(6000), &timing),
+            "docs refresh of p: done in 6.0 s: scan 0.5, read 0.2, mask 0.5, split 1.0, lookup 0.0, embed 3.0, write 0.8"
+        );
     }
 
     #[test]

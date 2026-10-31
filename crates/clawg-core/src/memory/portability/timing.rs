@@ -99,7 +99,7 @@ impl Timing {
     }
 }
 
-fn seconds(d: Duration) -> String {
+pub fn seconds(d: Duration) -> String {
     format!("{:.1}", d.as_secs_f64())
 }
 
