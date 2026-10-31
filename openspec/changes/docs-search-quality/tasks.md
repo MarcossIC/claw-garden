@@ -57,6 +57,9 @@ El set de 15 tenía casos rotos en silencio, porque `check_corpus` mira la ruta 
 ### 7 a 10. 2b orden por rareza, 2c AND con respaldo OR, 2d repetidos, 2e rutas como frase
 
 - [ ] Cada una con su test de tabla y su medición contra la anterior, un commit cada una.
+- [x] 2b, contra `dq-base2` (`ebd99fb`): Hit@3 −1, con d01 fuera del top 3. Se revirtió en `86737e0`.
+- [x] 2c, sin 2b (el orden sólo elige los 3 del AND, y la vuelta al OR es la expresión de hoy), contra `dq-base2`: ninguna pregunta se mueve. Se revirtió en `ff709e0`.
+- [ ] 2d y 2e sin medir. 2e no puede mover este golden (ninguna pregunta nombra una ruta), y 2d cambia el tope como 2b; ver `verify.md`, «Por qué el paso 2 no puede pasar su puerta con este golden».
 
 ## Paso 3: identificadores partidos (DQ7, DQ8; D4)
 

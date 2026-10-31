@@ -83,4 +83,38 @@ Por pregunta: d01 1, d03 1, c02 1, c14 2, c04 7, y las demás fuera de los 10 pr
 
 Por pregunta: d01 1 → fuera de los 10, d02 fuera → 2, d03 1 → 3, d05 fuera → 5, c04 7 → 4 y c14 2 → 5; las demás no se mueven.
 
-La puerta pide que ninguna pregunta del top 3 salga de él y que Hit@3 gane al menos 2. Salen d01 y c14 y el neto es −1, así que 2a se revirtió. Sin las palabras vacías, el canal léxico favorece pasajes densos en palabras de contenido sueltas por encima de la respuesta. El primer hit de d01 pasa a ser `openspec/changes/archive/2026-10-21-query-plans/verify.md > … > Linux (2026-10-21)`, el de d02 `crates/clawg-cli/src/setup.rs > mod tests` y el de c14 `crates/clawg-cli/src/daemon/metrics.rs > mod tests > fn each_minute_and_the_stop_are_written()`.
+La puerta pide que ninguna pregunta del top 3 salga de él y que Hit@3 gane al menos 2. Salen d01 y c14 y el neto es −1, así que 2a se revirtió.
+
+### Línea base de 2b y 2c (`ebd99fb`, `2026-10-31-real-docs-dq-base2.json`)
+
+Entre `cabfaa8` y `ebd99fb` entró el merge del fallback de hilos del embedder, que suma docs sobre su RAM. Para que esos docs no se mezclen con el efecto de cada pieza, 2b y 2c se miden contra esta corrida. 753 docs y 18480 pasajes; indexado en 77,3 s, con 18417 vectores del memo y 63 embebidos. Da exactamente lo mismo que `dq-base`, pregunta por pregunta: el merge no movió nada.
+
+### 2b. Orden por rareza (`459f024`, revertido en `86737e0`): no pasa la puerta
+
+Sin lista de vacías y sin quitar repetidos: el tope de 16 se queda con los tokens que el orden pone primero (identificadores, después los más largos, desempate por posición), en lugar de con los 16 primeros. 30 de las 40 preguntas tienen más de 16 tokens. `2026-10-31-real-docs-dq-2b.json`: 754 docs y 18484 pasajes, indexado en 71,5 s.
+
+| | Hit@1 | Hit@3 | Hit@5 | MRR@10 | preguntas |
+|---|---|---|---|---|---|
+| todas | 0,050 | 0,075 | 0,075 | 0,062 | 40 |
+| docs | 0,050 | 0,050 | 0,050 | 0,050 | 20 |
+| código | 0,050 | 0,100 | 0,100 | 0,074 | 20 |
+
+`--diff dq-base2 dq-2b`: Hit@1, Hit@3 y Hit@5 dan 0 mejor y 1 peor; MRR@10 0 mejor y 2 peor, con media −0,029 [−0,083, +0,000]. d01 pasa del 1 a fuera de los 10 y c14 del 2 al 3. d01 sale del top 3, así que 2b se revirtió. Su primer hit vuelve a ser `openspec/changes/archive/2026-10-21-query-plans/verify.md > … > Linux (2026-10-21)`, como en 2a: el orden rescata las últimas palabras de la pregunta, que el tope de hoy corta, y esas palabras llevan a esa bitácora.
+
+### 2c. AND de los 3 más raros, con respaldo OR (`f0479d4`, revertido en `ff709e0`): no pasa la puerta
+
+Medida sin 2b: el orden por rareza sólo elige los 3 tokens del AND, y la vuelta al OR es la expresión de hoy, sin cambios. `2026-10-31-real-docs-dq-2c.json`: 754 docs y 18486 pasajes, indexado en 72,6 s.
+
+`--diff dq-base2 dq-2c`: ninguna pregunta se mueve, en ninguna métrica. Cambia el primer hit de d21 y el de c11, que siguen sin acertar. Neto 0 en Hit@3 contra los +2 que pide la puerta, así que 2c se revirtió.
+
+### Por qué el paso 2 no puede pasar su puerta con este golden
+
+Cada pregunta del golden se escribió sin las palabras del pasaje que la responde (tarea 5): con su respuesta comparte, a lo sumo, palabras vacías. Así, el canal léxico no puede encontrar la respuesta de ninguna pregunta por sus palabras de contenido, y una expresión distinta sólo cambia qué otros pasajes propone:
+
+- 2a quitó lo único que la respuesta compartía con la pregunta.
+- 2b sumó palabras del final de la pregunta, que llevan a otros pasajes.
+- 2c casi nunca encontró las 3 palabras juntas.
+- 2e no tiene sobre qué actuar: ninguna pregunta nombra una ruta ni un archivo.
+- 2d cambia las palabras que entran en el tope, como 2b, en 18 preguntas.
+
+Lo que el golden mide es el canal denso. Medir el léxico necesita preguntas que nombren lo que el pasaje dice (un identificador, una ruta, un término propio), y este golden las excluye por construcción. Sin las palabras vacías, el canal léxico favorece pasajes densos en palabras de contenido sueltas por encima de la respuesta. El primer hit de d01 pasa a ser `openspec/changes/archive/2026-10-21-query-plans/verify.md > … > Linux (2026-10-21)`, el de d02 `crates/clawg-cli/src/setup.rs > mod tests` y el de c14 `crates/clawg-cli/src/daemon/metrics.rs > mod tests > fn each_minute_and_the_stop_are_written()`.
