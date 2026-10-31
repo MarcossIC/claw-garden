@@ -1,14 +1,16 @@
 change: native-memory-import
 objective: "1, 4"
-depends_on: []
-phase: explore
+depends_on: [history-import, import-undo]
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done
+  proposal: done
+  spec: done  # NM1 a NM7: la fuente claude-code en specs/portability, el hallazgo native_memory en specs/doctor
+  design: done
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
+after_archive:  # fuera del cambio
+  - "apagar la memoria nativa (parte B) espera a que agent-eval compare clawg contra ella"
 updated: 2026-10-31

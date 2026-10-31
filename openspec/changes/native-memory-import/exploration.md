@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 y 4 | M (la parte A); B y C son S | — para el importador, que construye sobre [history-import](../archive/2026-10-24-history-import/proposal.md) (44) y [import-undo](../archive/2026-10-24-import-undo/proposal.md) (84), archivados; la recomendación de apagar la memoria nativa espera al brazo A4 de [agent-eval](../agent-eval/exploration.md) (96) | exploración (borrador) |
+| 1 y 4 | M (la parte A); B y C son S | — para el importador, que construye sobre [history-import](../archive/2026-10-24-history-import/proposal.md) (44) y [import-undo](../archive/2026-10-24-import-undo/proposal.md) (84), archivados; la recomendación de apagar la memoria nativa espera al brazo A4 de [agent-eval](../agent-eval/exploration.md) (96) | exploración cerrada; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** Claude Code trae su propia memoria automática y la deja encendida por defecto. Para quien usa clawg, las dos memorias escriben en paralelo los mismos hechos, cada una con sus reglas, y lo que aprendió la nativa no le llega a otros agentes ni a otra herramienta. Las investigaciones proponen «integrarla en lugar de competir»: absorber lo que ya escribió y, recién con datos, recomendar apagarla. Este cambio propone un importador más (`clawg import --from claude-code`), sobre el modelo de notas ajenas que ya usa el de engram, y deja la decisión de apagar la memoria nativa a la medición de 96.
 
