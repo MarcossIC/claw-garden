@@ -2905,6 +2905,13 @@ old
     }
 
     #[test]
+    fn a_doc_between_the_limit_and_twice_it_joins_the_docs_after_it_while_the_limit_grows() {
+        assert_eq!(queue_groups(64, &[3, 20, 5]), [vec![0], vec![1, 2]], "the flush before it doubled the limit past it");
+        assert_eq!(queue_groups(64, &[20, 5]), [vec![0], vec![1]], "with the queue empty it fills the limit and goes alone");
+        assert_eq!(queue_groups(EMBED_BATCH, &[3, 20, 5]), [vec![0], vec![1], vec![2]], "at the cap the limit no longer grows, so it goes alone");
+    }
+
+    #[test]
     fn a_doc_with_no_passages_moves_no_flush() {
         let mut queue = Queue::new(EMBED_BATCH);
         assert_eq!(decision_after(&mut queue, &[10, 0]), [(false, false), (false, false)]);
@@ -2980,8 +2987,9 @@ old
 
     #[tokio::test]
     async fn no_call_holds_more_passages_than_the_cap_unless_it_is_one_doc() {
+        const DOCS: usize = 60;
         let dir = crate::test_dir::test_dir();
-        for k in 0..20 {
+        for k in 0..DOCS {
             write(dir.path(), &format!("d{k:02}.md"), &sections(&[2; 30]));
         }
         let store = store_with_project("p", dir.path()).await;
@@ -2990,11 +2998,10 @@ old
         let report = refreshed_with(&Arc::new(DocIndex::default()), &store, &embedder, words()).await;
 
         let sizes: Vec<usize> = embedder.take().iter().map(Vec::len).collect();
-        assert!(QUEUE_PASSAGES < 20 * 30, "the docs add up to more than the cap");
-        assert_eq!((report.indexed, report.passages), (20, 600));
-        assert_eq!(sizes.iter().sum::<usize>(), 600);
+        assert_eq!((report.indexed, report.passages), (DOCS, DOCS * 30));
+        assert_eq!(sizes.iter().sum::<usize>(), DOCS * 30);
         assert!(sizes.iter().all(|&n| n <= QUEUE_PASSAGES || n == 30), "{sizes:?}");
-        assert!(sizes.iter().any(|&n| n > 30), "docs share calls: {sizes:?}");
+        assert!(sizes.iter().any(|&n| n > QUEUE_PASSAGES / 2), "the limit grows up to the cap: {sizes:?}");
     }
 
     #[tokio::test]
@@ -3051,6 +3058,34 @@ old
         assert!(report.failed[0].reason.contains("finite"), "{report:?}");
         let paths: Vec<String> = passages(&store, "p").await.into_iter().map(|p| p.0).collect();
         assert_eq!(paths, ["a.md", "c.md"]);
+        let stored = dump(&store).await.0;
+        assert_eq!(stored.len(), 2);
+        for (path, _, _, _, blob, text) in &stored {
+            let own = FakeEmbedder::default().embed_with_role(text, EmbedRole::Passage).await.unwrap();
+            assert_eq!(blob, &le_bytes(&to_unit(&own).unwrap()), "{path} keeps the vector of its own text");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_passages_a_doc_reuses_count_against_the_limit() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", &sections(&[3; EMBED_BATCH]));
+        write(dir.path(), "b.md", &sections(&[3; EMBED_BATCH]));
+        let store = store_with_project("p", dir.path()).await;
+        let embedder = Batches::new();
+        let index = Arc::new(DocIndex::default());
+        refreshed_with(&index, &store, &embedder, words()).await;
+        embedder.take();
+
+        let mut changed = vec![3; EMBED_BATCH];
+        changed[0] = 4;
+        write(dir.path(), "a.md", &sections(&changed));
+        write(dir.path(), "b.md", &sections(&changed));
+        let report = refreshed_with(&index, &store, &embedder, words()).await;
+
+        assert_eq!((report.indexed, report.reused), (2, 2 * (EMBED_BATCH - 1)));
+        let sizes: Vec<usize> = embedder.take().iter().map(Vec::len).collect();
+        assert_eq!(sizes, [1, 1], "each doc fills the limit with its passages, reused or not");
     }
 
     #[tokio::test]
