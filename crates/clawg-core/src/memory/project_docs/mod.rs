@@ -808,6 +808,24 @@ mod tests {
 
     use crate::memory::embedder::FakeEmbedder;
 
+    #[test]
+    fn production_never_names_the_archive() {
+        let needle = concat!("archive", "/");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/memory/project_docs");
+        let mut checked = 0;
+
+        for entry in std::fs::read_dir(&dir).expect("the sources of the docs index") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("a readable source");
+                assert!(!text.contains(needle), "{} names the archive", path.display());
+                checked += 1;
+            }
+        }
+
+        assert!(checked >= 4, "the sources were found: {checked}");
+    }
+
     /// `FakeEmbedder` under another model id, counting every text it embeds.
     struct Counting {
         model: &'static str,

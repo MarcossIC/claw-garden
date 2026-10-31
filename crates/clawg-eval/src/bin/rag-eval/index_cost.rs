@@ -3,6 +3,7 @@
 
 use clawg_core::eval_api::{longest_first, EvalCpu, EvalIndexRun, EvalMemoReport, EvalPassageLengths, EMBED_BATCH};
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// Seconds a refresh spent in each of its phases, summed over its docs. The
 /// removal of docs that are gone counts as a write.
@@ -144,6 +145,138 @@ pub fn padding_warning(tokens: &Tokens, from_memo: usize) -> Option<String> {
     })
 }
 
+/// Where a doc of the corpus sits: the project's own docs, its code, or the
+/// archive of finished changes, whose volume would otherwise hide the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Area {
+    Docs,
+    Code,
+    Archive,
+}
+
+/// The area of a doc by its path relative to the root, `/`-separated, and its
+/// kind. The prefix is compared whole: a folder or a file that only starts
+/// with the same letters is not the archive.
+pub fn area_of(path: &str, code: bool) -> Area {
+    if path.starts_with(concat!("openspec/changes/archive", "/")) {
+        Area::Archive
+    } else if code {
+        Area::Code
+    } else {
+        Area::Docs
+    }
+}
+
+/// [`Phases`] of an area: `scan` belongs to the whole walk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct AreaPhases {
+    pub read: f64,
+    pub mask: f64,
+    pub split: f64,
+    pub lookup: f64,
+    pub embed: f64,
+    pub write: f64,
+}
+
+/// Tokens of the passages of an area. `multi_batch_*` count only the docs with
+/// more passages than one embedding run holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct AreaTokens {
+    pub real: usize,
+    pub padded: usize,
+    pub multi_batch_real: usize,
+    pub multi_batch_padded: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct AreaBlock {
+    pub docs: usize,
+    pub passages: usize,
+    pub multi_batch_docs: usize,
+    pub phases: AreaPhases,
+    /// `None` without the model's tokenizer.
+    pub tokens: Option<AreaTokens>,
+}
+
+impl AreaBlock {
+    fn line(&self, name: &str) -> String {
+        format!(
+            "  {name}: {} docs, {} passages ({} over one batch)  read {:.2} s  mask {:.2} s  split {:.2} s  lookup {:.2} s  embed {:.2} s  write {:.2} s
+",
+            self.docs,
+            self.passages,
+            self.multi_batch_docs,
+            self.phases.read,
+            self.phases.mask,
+            self.phases.split,
+            self.phases.lookup,
+            self.phases.embed,
+            self.phases.write,
+        )
+    }
+}
+
+/// What indexing cost in each [`Area`]; together they add up to the totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct ByArea {
+    pub docs: AreaBlock,
+    pub code: AreaBlock,
+    pub archive: AreaBlock,
+}
+
+impl ByArea {
+    /// Joins each doc's timings with its passage lengths by path; a doc with no
+    /// lengths adds none.
+    pub fn of(run: &EvalIndexRun, lengths: Option<&EvalPassageLengths>) -> Self {
+        let by_path: HashMap<&str, &[usize]> = lengths
+            .map(|l| l.docs.iter().map(|d| (d.path.as_str(), d.lengths.as_slice())).collect())
+            .unwrap_or_default();
+        let mut areas = Self::default();
+        if lengths.is_some() {
+            for area in [&mut areas.docs, &mut areas.code, &mut areas.archive] {
+                area.tokens = Some(AreaTokens::default());
+            }
+        }
+        for doc in &run.docs {
+            let area = match area_of(&doc.path, doc.code) {
+                Area::Docs => &mut areas.docs,
+                Area::Code => &mut areas.code,
+                Area::Archive => &mut areas.archive,
+            };
+            let multi = doc.passages > EMBED_BATCH;
+            area.docs += 1;
+            area.passages += doc.passages;
+            area.multi_batch_docs += usize::from(multi);
+            let p = &doc.phases;
+            area.phases.read += p.read.as_secs_f64();
+            area.phases.mask += p.mask.as_secs_f64();
+            area.phases.split += p.split.as_secs_f64();
+            area.phases.lookup += p.lookup.as_secs_f64();
+            area.phases.embed += p.embed.as_secs_f64();
+            area.phases.write += p.write.as_secs_f64();
+            if let Some(tokens) = area.tokens.as_mut() {
+                let own = by_path.get(doc.path.as_str()).copied().unwrap_or(&[]);
+                let (real, padded) = (own.iter().sum::<usize>(), padded(own));
+                tokens.real += real;
+                tokens.padded += padded;
+                if multi {
+                    tokens.multi_batch_real += real;
+                    tokens.multi_batch_padded += padded;
+                }
+            }
+        }
+        areas
+    }
+
+    /// One line per area for the report.
+    pub fn lines(&self) -> String {
+        [("docs", &self.docs), ("code", &self.code), ("archive", &self.archive)]
+            .into_iter()
+            .map(|(name, area)| area.line(name))
+            .collect()
+    }
+}
+
 /// The `index` block of a docs results file: numbers, flags and the names of
 /// the build, the system and the architecture, never a path or a text.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -154,11 +287,13 @@ pub struct IndexBlock {
     pub memo: MemoBlock,
     /// `None` without the model's tokenizer.
     pub tokens: Option<Tokens>,
+    pub by_area: ByArea,
 }
 
 impl IndexBlock {
     pub fn new(
         run: &EvalIndexRun,
+        lengths: Option<&EvalPassageLengths>,
         memo: Option<&EvalMemoReport>,
         cpu: EvalCpu,
         threads: usize,
@@ -171,6 +306,7 @@ impl IndexBlock {
             phases: Phases::of(run),
             memo: MemoBlock::of(memo, run.report.passages),
             tokens,
+            by_area: ByArea::of(run, lengths),
         }
     }
 }
@@ -271,5 +407,123 @@ mod tests {
         assert!(warning.contains("1000") && warning.contains("1200"), "{warning}");
         assert_eq!(padding_warning(&t, 30), None, "with passages from the memo, the model ran fewer");
         assert_eq!(padding_warning(&same, 0), None);
+    }
+
+    fn timing(path: &str, code: bool, passages: usize, ms: [u64; 6]) -> clawg_core::eval_api::EvalDocTiming {
+        use std::time::Duration;
+        let [read, mask, split, lookup, embed, write] = ms.map(Duration::from_millis);
+        clawg_core::eval_api::EvalDocTiming {
+            path: path.to_string(),
+            code,
+            passages,
+            phases: clawg_core::eval_api::EvalPhases { read, mask, split, lookup, embed, write },
+        }
+    }
+
+    fn run_of(docs: Vec<clawg_core::eval_api::EvalDocTiming>) -> EvalIndexRun {
+        let passages = docs.iter().map(|d| d.passages).sum();
+        EvalIndexRun {
+            report: clawg_core::eval_api::EvalDocReport { docs: docs.len(), passages, skipped: 0 },
+            scan: std::time::Duration::from_millis(500),
+            remove: std::time::Duration::ZERO,
+            docs,
+        }
+    }
+
+    fn lengths_for(docs: &[(&str, Vec<usize>)]) -> EvalPassageLengths {
+        EvalPassageLengths {
+            docs: docs
+                .iter()
+                .map(|(path, lengths)| clawg_core::eval_api::EvalDocLengths { path: path.to_string(), lengths: lengths.clone() })
+                .collect(),
+            count_seconds: 0.0,
+        }
+    }
+
+    fn block_of(run: &EvalIndexRun, lengths: &EvalPassageLengths) -> IndexBlock {
+        IndexBlock::new(run, Some(lengths), None, EvalCpu::this(), 8, true, Some(Tokens::of(lengths, 0.0)))
+    }
+
+    #[test]
+    fn area_of_a_path_is_decided_by_its_prefix_and_kind() {
+        let cases = [
+            ("openspec/changes/archive/2026-01-01-x/proposal.md", false, Area::Archive),
+            ("docs/a.md", false, Area::Docs),
+            ("Cargo.toml", false, Area::Docs),
+            ("crates/x/src/lib.rs", true, Area::Code),
+            ("openspec/changes/archive/x/script.rs", true, Area::Archive),
+            ("openspec/changes/archived/x.md", false, Area::Docs),
+            ("openspec/changes/archive.md", false, Area::Docs),
+        ];
+
+        for (path, code, area) in cases {
+            assert_eq!(area_of(path, code), area, "{path}");
+        }
+    }
+
+    #[test]
+    fn areas_add_up_to_the_totals() {
+        let run = run_of(vec![
+            timing("docs/a.md", false, 3, [250, 500, 1000, 0, 3000, 750]),
+            timing("crates/x/src/lib.rs", true, 2, [250, 250, 500, 250, 1000, 250]),
+            timing("openspec/changes/archive/y/p.md", false, 4, [500, 250, 250, 250, 2000, 500]),
+        ]);
+        let lengths = lengths_for(&[
+            ("docs/a.md", vec![10, 40, 25]),
+            ("crates/x/src/lib.rs", vec![7, 9]),
+            ("openspec/changes/archive/y/p.md", vec![5, 5, 80, 1]),
+        ]);
+
+        let block = block_of(&run, &lengths);
+        let areas = [&block.by_area.docs, &block.by_area.code, &block.by_area.archive];
+        let sum = |f: fn(&AreaBlock) -> f64| areas.iter().map(|a| f(a)).sum::<f64>();
+        let tokens = block.tokens.as_ref().unwrap();
+
+        assert_eq!(sum(|a| a.phases.read), block.phases.read);
+        assert_eq!(sum(|a| a.phases.mask), block.phases.mask);
+        assert_eq!(sum(|a| a.phases.split), block.phases.split);
+        assert_eq!(sum(|a| a.phases.lookup), block.phases.lookup);
+        assert_eq!(sum(|a| a.phases.embed), block.phases.embed);
+        assert_eq!(sum(|a| a.phases.write), block.phases.write);
+        assert_eq!(areas.iter().map(|a| a.passages).sum::<usize>(), run.report.passages);
+        assert_eq!(areas.iter().map(|a| a.docs).sum::<usize>(), 3);
+        assert_eq!(areas.iter().map(|a| a.tokens.unwrap().real).sum::<usize>(), tokens.real);
+        assert_eq!(areas.iter().map(|a| a.tokens.unwrap().padded).sum::<usize>(), tokens.padded);
+        assert_eq!((block.by_area.docs.docs, block.by_area.code.docs, block.by_area.archive.docs), (1, 1, 1));
+    }
+
+    #[test]
+    fn only_docs_over_a_batch_count_as_multi_batch() {
+        let run = run_of(vec![timing("docs/big.md", false, 20, [0; 6]), timing("docs/small.md", false, 3, [0; 6])]);
+        let lengths = lengths_for(&[("docs/big.md", (0..20).map(|i| 10 + i).collect()), ("docs/small.md", vec![4, 5, 6])]);
+
+        let docs = block_of(&run, &lengths).by_area.docs;
+        let tokens = docs.tokens.unwrap();
+
+        assert_eq!((docs.docs, docs.passages, docs.multi_batch_docs), (2, 23, 1));
+        let big: Vec<usize> = (0..20).map(|i| 10 + i).collect();
+        assert_eq!(tokens.multi_batch_real, big.iter().sum::<usize>());
+        assert_eq!(tokens.multi_batch_padded, padded(&big));
+        assert_eq!(tokens.real, big.iter().sum::<usize>() + 15);
+    }
+
+    #[test]
+    fn the_areas_hold_no_path() {
+        let run = run_of(vec![timing("secret/dir/a.md", false, 1, [0; 6])]);
+        let lengths = lengths_for(&[("secret/dir/a.md", vec![3])]);
+
+        let text = serde_json::to_string(&block_of(&run, &lengths).by_area).unwrap();
+
+        assert!(!text.contains("secret") && !text.contains("a.md"), "{text}");
+    }
+
+    #[test]
+    fn a_doc_without_lengths_counts_no_tokens() {
+        let run = run_of(vec![timing("docs/a.md", false, 1, [0; 6])]);
+
+        let block = IndexBlock::new(&run, None, None, EvalCpu::this(), 8, true, None);
+
+        assert!(block.by_area.docs.tokens.is_none());
+        assert_eq!(block.by_area.docs.passages, 1);
     }
 }

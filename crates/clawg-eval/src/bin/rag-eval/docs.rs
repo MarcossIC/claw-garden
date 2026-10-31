@@ -238,13 +238,14 @@ pub fn render(
 ) -> String {
     let all: Vec<&CaseResult<'_>> = results.iter().collect();
     let mut out = format!(
-        "indexed {} docs into {} passages ({} skipped) in {:.1} s\n{}{}{}{}",
+        "indexed {} docs into {} passages ({} skipped) in {:.1} s\n{}{}{}{}{}",
         report.docs,
         report.passages,
         report.skipped,
         took.as_secs_f64(),
         phases.line(),
         index.and_then(|i| i.tokens.as_ref()).map_or(String::new(), Tokens::line),
+        index.map_or(String::new(), |i| i.by_area.lines()),
         left_out_line(left_out),
         score_line(&all),
     );
@@ -718,7 +719,7 @@ async fn index_block(index: &EvalDocIndex, embedder: &EvalEmbedder, run: &EvalIn
         eprintln!("{e}");
         EXIT_RUNTIME_FAILURE
     })?;
-    Ok(IndexBlock::new(run, None, EvalCpu::this(), threads, cfg!(debug_assertions), tokens))
+    Ok(IndexBlock::new(run, lengths.as_ref(), None, EvalCpu::this(), threads, cfg!(debug_assertions), tokens))
 }
 
 /// Indexes the root but `left_out` into `index`, asks it every question,
@@ -985,14 +986,14 @@ mod tests {
             scan: Duration::from_millis(500),
             remove: Duration::from_millis(250),
             docs: vec![
-                doc_timing("secret/area/guide.md", false, 3, [250, 500, 1000, 0, 3000, 750]),
+                doc_timing("secret/folder/guide.md", false, 3, [250, 500, 1000, 0, 3000, 750]),
                 doc_timing("crates/hidden/src/lib.rs", true, 2, [250, 250, 500, 250, 1000, 250]),
             ],
         }
     }
 
     fn sample_block(memo: Option<&EvalMemoReport>) -> IndexBlock {
-        IndexBlock::new(&sample_run(), memo, EvalCpu::this(), 8, true, None)
+        IndexBlock::new(&sample_run(), None, memo, EvalCpu::this(), 8, true, None)
     }
 
     fn memo_of(from_memo: usize, embedded: usize) -> EvalMemoReport {
@@ -1043,8 +1044,8 @@ mod tests {
     #[test]
     fn the_index_block_reports_the_memo_and_the_phases() {
         let run = EvalIndexRun { report: EvalDocReport { docs: 2, passages: 100, skipped: 0 }, ..sample_run() };
-        let with = serde_json::to_value(IndexBlock::new(&run, Some(&memo_of(30, 70)), EvalCpu::this(), 8, true, None)).unwrap();
-        let without = serde_json::to_value(IndexBlock::new(&run, None, EvalCpu::this(), 8, false, None)).unwrap();
+        let with = serde_json::to_value(IndexBlock::new(&run, None, Some(&memo_of(30, 70)), EvalCpu::this(), 8, true, None)).unwrap();
+        let without = serde_json::to_value(IndexBlock::new(&run, None, None, EvalCpu::this(), 8, false, None)).unwrap();
 
         assert_eq!(with["memo"], serde_json::json!({"used": true, "from_memo": 30, "embedded": 70, "seconds": 0.5}));
         assert_eq!(without["memo"], serde_json::json!({"used": false, "from_memo": 0, "embedded": 100, "seconds": 0.0}));
@@ -1066,7 +1067,7 @@ mod tests {
     fn the_index_block_holds_no_text_and_no_path() {
         let text = serde_json::to_string(&sample_block(Some(&memo_of(1, 4)))).unwrap();
 
-        for secret in ["secret", "area", "guide", "crates", "hidden", "lib.rs", "memo.bin", "warning"] {
+        for secret in ["secret", "folder", "guide", "crates", "hidden", "lib.rs", "memo.bin", "warning"] {
             assert!(!text.contains(secret), "{secret} leaked into {text}");
         }
     }
@@ -1138,7 +1139,7 @@ mod tests {
     #[test]
     fn the_index_block_carries_the_tokens_of_a_real_run() {
         let tokens = Tokens::of(&lengths_of(&[&[10, 40, 25]]), 120.0);
-        let block = IndexBlock::new(&sample_run(), None, EvalCpu::this(), 8, true, Some(tokens));
+        let block = IndexBlock::new(&sample_run(), None, None, EvalCpu::this(), 8, true, Some(tokens));
 
         let json = serde_json::to_value(&block).unwrap();
 
@@ -1157,8 +1158,27 @@ mod tests {
     }
 
     #[test]
+    fn the_report_prints_one_line_per_area_of_a_real_run() {
+        let block = sample_block(None);
+        let cases = two_cases();
+        let results = [CaseResult { case: &cases[0], rank: Some(1), top: None, code: false }];
+        let report = EvalDocReport { docs: 2, passages: 5, skipped: 1 };
+
+        let real = render(&report, Duration::ZERO, &[], &results, &Phases::default(), Some(&block));
+        let fake = render(&report, Duration::ZERO, &[], &results, &Phases::default(), None);
+
+        assert!(real.contains("
+  docs: 1 docs, 3 passages (0 over one batch)  read 0.25 s"), "{real}");
+        assert!(real.contains("
+  code: 1 docs, 2 passages (0 over one batch)  read 0.25 s"), "{real}");
+        assert!(real.contains("
+  archive: 0 docs, 0 passages"), "{real}");
+        assert!(!fake.contains("archive:"), "{fake}");
+    }
+
+    #[test]
     fn a_fake_run_reports_no_tokens_and_no_memo() {
-        let block = IndexBlock::new(&sample_run(), None, EvalCpu::this(), 8, true, None);
+        let block = IndexBlock::new(&sample_run(), None, None, EvalCpu::this(), 8, true, None);
         let cases = two_cases();
         let results = [CaseResult { case: &cases[0], rank: Some(1), top: None, code: false }];
 
