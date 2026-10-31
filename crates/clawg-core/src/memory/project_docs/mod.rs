@@ -560,7 +560,10 @@ pub(crate) async fn refresh(
 }
 
 /// The most passages the queue of a refresh holds before it embeds them. A
-/// doc with more passages than the queue's limit goes alone.
+/// doc with more passages than the limit goes in a flush of its own, except
+/// while the limit still grows and the queue was not empty: the flush before
+/// the doc doubles the limit, and if the doc is still under the new limit the
+/// docs after it join it. At this cap a doc past it is always alone.
 pub(crate) const QUEUE_PASSAGES: usize = 512;
 
 /// What the queue of a refresh decides about a doc that arrives.
