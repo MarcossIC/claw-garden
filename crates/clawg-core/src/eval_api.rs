@@ -1180,6 +1180,20 @@ impl EvalTokenCounter {
     }
 }
 
+/// The order in which a docs refresh hands `texts` (the `indexed_text` of the
+/// passages it embeds) to the embedder, as indices into them: the order of
+/// production's own `passage_order`, counted by `counter`'s tokenizer under
+/// `embedder`'s passage prefix, and the identity where production leaves the
+/// passages as they are (`EMBED_BATCH` texts or fewer, or a counter with no
+/// tokenizer).
+pub fn passage_order(embedder: &EvalEmbedder, counter: &EvalTokenCounter, texts: &[String]) -> Vec<usize> {
+    let tokenizer = match &counter.0 {
+        EvalTokenCounterInner::Real(tok) => Some(tok.as_ref()),
+        EvalTokenCounterInner::Fake => None,
+    };
+    project_docs::passage_order(tokenizer, embedder.inner.as_ref(), texts).unwrap_or_else(|| (0..texts.len()).collect())
+}
+
 /// True iff the real embedding model is already cached at `base_dir` —
 /// never triggers a download. Delegates to the module that owns the
 /// cache-dir layout and the on-disk verification, so this check can never
@@ -1365,7 +1379,8 @@ pub struct EvalIndexRun {
     pub docs: Vec<EvalDocTiming>,
 }
 
-/// The tokens of each passage of one doc, in the order they were embedded.
+/// The tokens of each passage of one doc, in the order of its passages, not
+/// in the one they were embedded in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalDocLengths {
     pub path: String,
@@ -1442,7 +1457,8 @@ impl EvalDocIndex {
     /// The tokens of every passage the index holds, as the model receives
     /// them: the text of the stored passage under the embedder's passage
     /// prefix, cut to the model's window, by doc in path order and within a
-    /// doc in the order its passages were embedded. `None` without a
+    /// doc in the order of its passages, which is not the order a refresh
+    /// embedded them in. `None` without a
     /// tokenizer, which only the real model brings.
     pub async fn passage_lengths(&self) -> Result<Option<EvalPassageLengths>, EvalError> {
         let Some(tokenizer) = &self.tokenizer else { return Ok(None) };
@@ -2884,7 +2900,7 @@ second
     }
 
     #[tokio::test]
-    async fn passage_lengths_follow_the_stored_passages_in_batch_order() {
+    async fn passage_lengths_follow_the_stored_passages_in_ordinal_order() {
         let plain = lengths_of_ladder(EvalEmbedder::fake()).await;
         let prefixed = lengths_of_ladder(EvalEmbedder::of(Arc::new(Prefixed), Arc::default())).await;
 
@@ -2928,6 +2944,23 @@ second
         let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
 
         assert_eq!(docs[0].lengths, vec![EMBED_MAX_TOKENS, 2]);
+    }
+
+    #[test]
+    fn passage_order_is_the_order_a_refresh_embeds_in() {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let counter = EvalTokenCounter(EvalTokenCounterInner::Real(tokenizer.clone()));
+        let embedder = EvalEmbedder::of(Arc::new(Prefixed), Arc::default());
+        let texts = |lengths: &[usize]| -> Vec<String> { lengths.iter().map(|&n| vec!["w"; n].join(" ")).collect() };
+        let seventeen = texts(&[2, 5, 2, 9, 1, 5, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 8]);
+
+        let order = passage_order(&embedder, &counter, &seventeen);
+
+        assert_eq!(Some(order.clone()), project_docs::passage_order(Some(&tokenizer), &Prefixed, &seventeen));
+        assert_eq!(order[..5], [3, 16, 1, 5, 6]);
+        assert_eq!(passage_order(&embedder, &EvalTokenCounter::fake(), &seventeen), (0..17).collect::<Vec<_>>());
+        let sixteen = texts(&[1; 16]);
+        assert_eq!(passage_order(&embedder, &counter, &sixteen), (0..16).collect::<Vec<_>>());
     }
 
     #[test]
