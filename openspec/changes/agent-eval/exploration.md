@@ -172,6 +172,19 @@ Lo que destraba, cada cosa con su número ya fijado o por fijar:
 - **Idioma de la campaña núcleo**: el del perfil real (`es`), el default (`en`) o los dos con la mitad de corridas cada uno.
 - **Versión fija de Claude Code** por campaña.
 
+## Preguntas que llegan de 98, 99 y 100
+
+Una investigación posterior, sobre la integración con Claude Code, dejó tres cambios en exploración que piden datos de este arnés antes de decidir. No suman brazos nuevos al piloto; son conteos sobre las mismas corridas o tareas que ya están en la segunda tanda:
+
+| Pregunta | Para qué cambio | Qué se cuenta, y en qué tanda |
+|---|---|---|
+| ¿Cuántas sesiones llegan a compactar sin haber guardado un `session_summary`? | [session-lifecycle](../session-lifecycle/exploration.md) (99), parte B | En el stream de cada corrida larga y en las tareas R: eventos de compactación y saves de `session_summary` antes de cada uno. Campaña núcleo |
+| ¿Un resumen del cliente (`compact_summary`) sirve tanto como uno del agente para retomar? | 99, parte C | Tareas R con dos siembras de LAST SESSION, una con cada resumen. Segunda tanda |
+| ¿Los subagentes llaman a las herramientas de clawg? | 99, parte D | Llamadas a `search_memory` y `search_project` dentro de un subagente. Piloto, sin costo extra |
+| ¿Un aviso `changed=RUTA` hace que el agente compruebe el código antes de usar la memoria? | [memory-anchors](../memory-anchors/exploration.md) (98), paso 2 | Una tarea S con una memoria anclada a un archivo que la tarea cambió, con y sin el aviso. Segunda tanda, después del paso 2 de 98 |
+| ¿Clawg agrega algo sobre la memoria nativa con los mismos hechos? | [native-memory-import](../native-memory-import/exploration.md) (100), parte B | Es A3 contra A4, la pregunta de producto de P1: 100 no recomienda apagar la memoria nativa hasta tenerla |
+| ¿Buscar en `UserPromptSubmit` y mostrar hasta 3 entradas compactas ayuda más que lo que cuesta? | «Ideas evaluadas» del [README](../../README.md) | Un brazo de diagnóstico más, A3 con ese hook, sólo si el piloto muestra muchas tareas K sin ninguna búsqueda. No entra en el piloto |
+
 ## Hallazgos laterales
 
 - **Las instrucciones quedan a 20 caracteres del tope viejo.** La apertura en inglés mide 2.028 de los 2.048 que `the_instructions_fit_older_clients` exige por los clientes anteriores a v2.1.296 (`server.rs:2571-2577`). Cualquier oración nueva en la apertura rompe ese test. Si la versión mínima de Claude Code soportada ya es 2.1.296 o posterior, el test puede pasar a 4.096; si no, la apertura no tiene margen. No se verificó qué versión mínima se soporta.

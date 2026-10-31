@@ -1,0 +1,14 @@
+change: memory-anchors
+objective: "1, 3"
+depends_on: []
+phase: explore
+artifacts:
+  exploration: draft
+  proposal: pending
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-10-31
