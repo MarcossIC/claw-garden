@@ -112,7 +112,7 @@ async fn a_second_runtime_open_on_the_same_dir_is_refused_naming_the_first_holde
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().to_path_buf();
 
-    let (_first, _rx) = MemoryRuntime::open(base.clone(), StoreHolder::Daemon)
+    let (first, _rx) = MemoryRuntime::open(base.clone(), StoreHolder::Daemon)
         .await
         .expect("first open");
 
@@ -127,6 +127,8 @@ async fn a_second_runtime_open_on_the_same_dir_is_refused_naming_the_first_holde
         }
         other => panic!("expected StoreInUse naming the daemon, got {other:?}"),
     }
+    // On Windows a store still open cannot be deleted with its directory.
+    first.close().await;
 }
 
 // ── MemoryRuntime boots on a plain tokio runtime ──────────────────────────
@@ -174,6 +176,7 @@ async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
         wm.workspace_path("agent-1", None),
         base.join("workspaces").join("agent-1").join("default").join("workspace.md")
     );
+    rt.close().await;
 }
 
 /// `new_for_test` is a shortcut for hosts' tests: an in-memory store with the

@@ -17,15 +17,18 @@
 //! Compiled only when the `eval` feature is enabled, so the shipped
 //! application's public surface is unchanged by this module's existence.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
 use crate::memory::access::AccessTracker;
-use crate::memory::db::MemoryStore;
+use crate::memory::backup::{check_restorable, known_migrations, open_for_probe, wal_with_commits, BackupError, SchemaPlan};
+use crate::memory::bootstrap::is_pooling_upgrade;
+use crate::memory::db::{differing_fields, ContractStatus, EmbeddingIdentity, MemoryStore, StoredContract};
 use crate::memory::chunker::token_splitter::TokenSplitter;
 use crate::memory::embedder::{E5Embedder, Embedder, FakeEmbedder};
 
@@ -33,16 +36,27 @@ use crate::memory::embedder::{E5Embedder, Embedder, FakeEmbedder};
 /// without reaching into the private `memory` module tree.
 pub use crate::memory::embedder::EmbedRole;
 use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::language;
+use crate::memory::merge::{canonical, canonical_in};
 use crate::memory::model_download;
+use crate::memory::pieces::read_links;
 use crate::memory::project_docs;
+use crate::memory::prompt_builder::LAST_SESSION_SQL;
+use crate::memory::registry::{
+    resolve_project, Refusal as ResolveRefusal, ResolveError as RegistryResolveError, ResolveOptions,
+};
 use crate::memory::score::{ImportanceFactor, ScoringConfig};
 use crate::memory::search::{lexical_channel_only, search_all_memories_with_scoring, SearchScope};
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, ChunkOutcome, IngestRequest};
 use crate::memory::TableKind;
+use crate::metrics::Recorder;
 use crate::models::chat::Role;
 use crate::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
+
+mod vector_memo;
+pub use vector_memo::{EvalMemo, EvalMemoReport};
 
 /// Opaque handle to a memory store. Every operation available on it is a
 /// method below — the wrapped store itself is never reachable.
@@ -97,17 +111,15 @@ pub struct EvalScope {
 }
 
 impl EvalScope {
+    /// The pools alone: the project and the reach are the search's, which
+    /// [`EvalStore::search`] sets as the daemon does.
     fn into_search_scope(self) -> SearchScope {
         SearchScope {
             memory: self.memory,
             episodic: self.episodic,
             procedural: self.procedural,
-            // rag-eval never carries a project — its whole corpus is one
-            // unscoped pool, so this keeps every query bit-identical to
-            // retrieval before project scoping existed.
             project_id: None,
             lexical: self.lexical,
-            // One agent's corpus: nothing to share.
             reach: crate::memory::sharing::Reach::Own,
         }
     }
@@ -210,6 +222,36 @@ pub struct EvalHit {
     pub tier: i64,
     pub score: f64,
     pub distance: f64,
+    pub memory_type: String,
+    /// It holds every identifier of the query.
+    pub exact: bool,
+}
+
+/// What the `memory` KNN of a search asked for and handed to the ranking,
+/// before the collapse to one hit per save and the cut.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalPool {
+    pub requested: usize,
+    pub rows: usize,
+    pub saves: usize,
+    pub passes: usize,
+    /// The eligible rows, counted up to the window when the first one came
+    /// back short; none when it came back full.
+    pub eligible: Option<usize>,
+    pub ids: Vec<i64>,
+}
+
+/// A search's hits, best first, and its `memory` pool.
+#[derive(Debug, Clone)]
+pub struct EvalSearch {
+    pub hits: Vec<EvalHit>,
+    pub pool: EvalPool,
+}
+
+/// The cosine a search reads from the L2 distance of two unit vectors, the
+/// function the score itself uses, so a measurement never reads a copy.
+pub fn cosine_from_distance(distance: f64) -> f64 {
+    crate::memory::score::cosine_from_l2_unit(distance)
 }
 
 /// Errors surfaced by [`EvalStore`]. Its own type rather than a re-export of
@@ -236,6 +278,14 @@ pub enum EvalError {
     UnknownTokenizer(String),
     #[error("failed to recreate memory_fts: {0}")]
     RecreateFts(String),
+    #[error("failed to read the store: {0}")]
+    Read(String),
+    #[error("cannot split the doc {0}")]
+    Doc(String),
+    #[error("failed to close the store: {0}")]
+    Close(String),
+    #[error("cannot measure over the snapshot: {0}")]
+    Background(#[from] BackgroundRefusal),
 }
 
 /// Tokenizer strings [`EvalStore::recreate_fts_with_tokenizer`] accepts — an
@@ -311,37 +361,122 @@ impl EvalStore {
     /// hit shape. `query_text` is the lexical half of the question — fed
     /// through untouched to `search_all_memories_with_scoring`, mirroring
     /// production's own `embedding`/`query_text` pairing (`search.rs`).
+    ///
+    /// The scope is the daemon's: `agent_id` reaches what the sharing policy
+    /// of the store's directory lets it (every agent without one), and
+    /// `project`, followed past its merges, reads its own rows, the rows
+    /// without one and every `user_preference`. One agent's corpus without a
+    /// project ranks as it did under the agent's own reach.
     pub async fn search(
         &self,
         embedding: &[f32],
         agent_id: &str,
         scope: EvalScope,
+        project: Option<&str>,
         k_final: usize,
         scoring: EvalScoringConfig,
         query_text: Option<&str>,
-    ) -> Result<Vec<EvalHit>, EvalError> {
-        let hits = search_all_memories_with_scoring(
+    ) -> Result<EvalSearch, EvalError> {
+        let project = match project {
+            Some(id) => Some(canonical(&self.0, id).await.map_err(|e| EvalError::Search(e.to_string()))?),
+            None => None,
+        };
+        let scope = scope
+            .into_search_scope()
+            .with_project(project.as_deref())
+            .with_reach(self.0.reader_for(agent_id).reach);
+        let (hits, pool) = search_all_memories_with_scoring(
             &self.0,
             embedding,
             query_text,
             agent_id,
-            scope.into_search_scope(),
+            scope,
             k_final,
             &scoring.into_scoring_config(),
         )
         .await
         .map_err(|e| EvalError::Search(e.to_string()))?;
 
-        Ok(hits
-            .into_iter()
-            .map(|h| EvalHit {
-                id: h.id,
-                kind: h.kind.into(),
-                tier: h.tier,
-                score: h.score,
-                distance: h.distance,
+        Ok(EvalSearch {
+            hits: hits
+                .into_iter()
+                .map(|h| EvalHit {
+                    id: h.id,
+                    kind: h.kind.into(),
+                    tier: h.tier,
+                    score: h.score,
+                    distance: h.distance,
+                    memory_type: h.memory_type,
+                    exact: h.exact,
+                })
+                .collect(),
+            pool: EvalPool {
+                requested: pool.requested,
+                rows: pool.rows,
+                saves: pool.saves,
+                passes: pool.passes,
+                eligible: pool.eligible,
+                ids: pool.ids,
+            },
+        })
+    }
+
+    /// `last_accessed_at` of each of the `memory` rows `ids` that exists, in
+    /// the order of `ids`: the instant the decay of a hit is measured from.
+    pub async fn last_accessed(&self, ids: Vec<i64>) -> Result<Vec<(i64, i64)>, EvalError> {
+        self.0
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<(i64, i64)>> {
+                let mut stmt = c.prepare_cached("SELECT last_accessed_at FROM memory WHERE id = ?1")?;
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(at) = stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()? {
+                        out.push((id, at));
+                    }
+                }
+                Ok(out)
             })
-            .collect())
+            .await
+            .map_err(|e| EvalError::Read(e.to_string()))
+    }
+
+    /// What the live rows of the store are, in counts and names.
+    pub async fn composition(&self) -> Result<EvalComposition, EvalError> {
+        self.0.conn.call(|c| composition_in(c)).await.map_err(|e| EvalError::Read(e.to_string()))
+    }
+
+    /// Of the rows `seeded`, those whose text a live row outside them also
+    /// holds, by `content_hash`.
+    pub async fn twins(&self, seeded: Vec<i64>) -> Result<Vec<i64>, EvalError> {
+        let seeded = serde_json::to_string(&seeded).map_err(|e| EvalError::Read(e.to_string()))?;
+        self.0
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = c.prepare(
+                    "SELECT DISTINCT a.id FROM memory a JOIN memory b ON b.content_hash = a.content_hash \
+                     WHERE a.id IN (SELECT value FROM json_each(?1)) \
+                       AND b.id NOT IN (SELECT value FROM json_each(?1)) \
+                       AND b.deleted_at IS NULL AND b.status IN ('active', 'disputed') \
+                     ORDER BY a.id",
+                )?;
+                let ids = stmt.query_map([&seeded], |r| r.get(0))?.collect();
+                ids
+            })
+            .await
+            .map_err(|e| EvalError::Read(e.to_string()))
+    }
+
+    /// Closes the store and returns once its connection let the files go:
+    /// dropping it only signals the connection's thread, and on Windows a
+    /// file still open cannot be deleted.
+    pub async fn close(self) -> Result<(), EvalError> {
+        self.0.conn.clone().close().await.map_err(|e| EvalError::Close(e.to_string()))
+    }
+
+    /// The project and the expected saves of each case in this store, read
+    /// once before anything is measured.
+    pub async fn resolve_cases(&self, cases: &[EvalCaseRef]) -> Result<Vec<EvalResolved>, EvalResolveError> {
+        resolve_cases_in(&self.0, cases).await
     }
 
     /// Row ids for `query_text` ranked by the lexical channel alone (bm25 over
@@ -412,9 +547,16 @@ fn parse_memory_type(raw: &str) -> Result<MemoryType, EvalError> {
 /// discipline as [`EvalStore`]: the concrete implementation is boxed behind
 /// this module's own type, so neither the `Embedder` trait nor either of its
 /// implementations is ever named outside this file.
-pub struct EvalEmbedder(Arc<dyn Embedder>);
+pub struct EvalEmbedder {
+    inner: Arc<dyn Embedder>,
+    metrics: Arc<Recorder>,
+}
 
 impl EvalEmbedder {
+    fn of(inner: Arc<dyn Embedder>, metrics: Arc<Recorder>) -> Self {
+        EvalEmbedder { inner, metrics }
+    }
+
     /// A deterministic double: the same text always yields the same vector,
     /// with no model to load and no network involved. Its vectors are NOT
     /// L2-normalized (`‖v‖ ≈ 11.3` rather than 1.0), so distances measured
@@ -422,26 +564,27 @@ impl EvalEmbedder {
     /// the real model — a run against this embedder validates plumbing and
     /// metric code, not retrieval quality.
     pub fn fake() -> Self {
-        EvalEmbedder(Arc::new(FakeEmbedder::default()))
+        EvalEmbedder::of(Arc::new(FakeEmbedder::default()), Arc::default())
     }
 
     /// Loads the real embedding model rooted at `base_dir`, downloading it
     /// first if it is not already cached. See [`model_is_cached`] to check
     /// readiness without paying for a download.
     pub async fn real(base_dir: &Path) -> Result<Self, EvalError> {
-        let files = model_download::ensure_model(base_dir, None)
+        let files = model_download::ensure_model(base_dir, None, &model_download::CacheLock::new())
             .await
             .map_err(|e| EvalError::ModelLoad(e.to_string()))?;
         // The evaluation tools are not the daemon: they parse their own copy.
         let tokenizer = model_download::parse_verified_tokenizer(&files.tokenizer.tokenizer_file)
             .map_err(EvalError::ModelLoad)?;
-        let inner = E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer)
+        let metrics = Arc::<Recorder>::default();
+        let inner = E5Embedder::from_parts(&files.onnx, Arc::new(tokenizer), &files.tokenizer, metrics.clone())
             .map_err(|e| EvalError::ModelLoad(e.to_string()))?;
-        Ok(EvalEmbedder(Arc::new(inner)))
+        Ok(EvalEmbedder::of(Arc::new(inner), metrics))
     }
 
     pub async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, EvalError> {
-        self.0
+        self.inner
             .embed_with_role(text, role)
             .await
             .map_err(|e| EvalError::Embed(e.to_string()))
@@ -450,27 +593,82 @@ impl EvalEmbedder {
     /// One vector per text, in input order, through the embedder's batch path:
     /// a real model cuts the texts into the batches production cuts.
     pub async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, EvalError> {
-        self.0
+        self.inner
             .embed_batch(texts, role)
             .await
             .map_err(|e| EvalError::Embed(e.to_string()))
     }
 
     pub fn dimensions(&self) -> usize {
-        self.0.dimensions()
+        self.inner.dimensions()
     }
 
     pub fn model_id(&self) -> &str {
-        self.0.model_id()
+        self.inner.model_id()
     }
 
     pub fn query_prefix(&self) -> &str {
-        self.0.query_prefix()
+        self.inner.query_prefix()
     }
 
     pub fn passage_prefix(&self) -> &str {
-        self.0.passage_prefix()
+        self.inner.passage_prefix()
     }
+
+    /// The tokens, padding included, that the session has run over for
+    /// passages since this handle was made. The recorder stays a private
+    /// field so a caller can read this one number and nothing else of it.
+    pub fn passage_tokens_ran(&self) -> f64 {
+        self.metrics
+            .minute()
+            .gauges
+            .iter()
+            .filter(|(key, _)| key.name == "embedder.batch_tokens" && key.label_pairs().contains(&("role", "passage")))
+            .map(|(_, gauge)| gauge.sum)
+            .sum()
+    }
+}
+
+/// What decides which kernels ONNX Runtime picks, so whether another machine
+/// can be expected to give the same bits. The system counts too: ONNX Runtime
+/// is built apart for each one, and on Linux a CPU with the same features as
+/// the Windows one that made a fixture moved the last bits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct EvalCpu {
+    pub os: String,
+    pub arch: String,
+    pub avx2: bool,
+    pub avx512f: bool,
+    pub fma: bool,
+}
+
+impl EvalCpu {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    pub fn this() -> Self {
+        EvalCpu {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            avx2: is_x86_feature_detected!("avx2"),
+            avx512f: is_x86_feature_detected!("avx512f"),
+            fma: is_x86_feature_detected!("fma"),
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    pub fn this() -> Self {
+        EvalCpu {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            avx2: false,
+            avx512f: false,
+            fma: false,
+        }
+    }
+}
+
+/// The intra-op threads the embedding session is built with.
+pub fn session_threads() -> usize {
+    crate::memory::embedder::session_threads()
 }
 
 /// One save for [`EvalIngest::save`].
@@ -503,7 +701,8 @@ pub struct EvalCandidate {
     pub escalated: bool,
 }
 
-/// The event an explicit save enters the worker as.
+/// The event an explicit save enters the worker as, `age_ms` before now: the
+/// worker stores a save at the instant of its event.
 fn explicit_event(
     agent_id: &str,
     project_id: Option<&str>,
@@ -511,11 +710,13 @@ fn explicit_event(
     memory_type: &str,
     importance: f64,
     topic_key: Option<&str>,
+    age_ms: u64,
 ) -> MemoryEvent {
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .saturating_sub(age_ms);
     MemoryEvent {
         agent_id: agent_id.to_string(),
         project_id: project_id.map(str::to_string),
@@ -563,7 +764,23 @@ impl EvalIngest {
         let (mut runtime, _) = MemoryRuntime::open(base_dir.to_path_buf(), StoreHolder::Eval)
             .await
             .map_err(|e| EvalError::Open(e.to_string()))?;
-        let _ = runtime.embedder.set(embedder.0.clone());
+        let _ = runtime.embedder.set(embedder.inner.clone());
+        // Written as the daemon writes it when its model loads, so a store
+        // made here serves as a snapshot; one of another model is refused.
+        // A refusal closes the store first: the runtime's workers hold it open
+        // until the process ends otherwise.
+        let refusal = match runtime.store.ensure_embedding_contract(EmbeddingIdentity::of(embedder.inner.as_ref())).await {
+            Err(e) => Some(EvalError::Open(e.to_string())),
+            Ok(ContractStatus::Mismatch { stored, actual }) => Some(EvalError::Open(format!(
+                "its vectors are of another model ({})",
+                differing_fields(&stored, &actual).join("; ")
+            ))),
+            Ok(_) => None,
+        };
+        if let Some(refusal) = refusal {
+            runtime.close().await;
+            return Err(refusal);
+        }
         runtime.access_tracker = Arc::new(AccessTracker::inert());
 
         let (tx, rx) = tokio::sync::mpsc::channel(INGEST_QUEUE_CAPACITY);
@@ -586,16 +803,18 @@ impl EvalIngest {
     ///
     /// Waits for room when the queue is full: a measurement loads its whole
     /// set before reading, and refusing a row would measure a smaller set.
+    /// `age_ms` backdates the save from now, as [`EvalStore::insert`] does.
     pub async fn send(
         &self,
         agent_id: &str,
         content: &str,
         memory_type: &str,
         importance: f64,
+        age_ms: u64,
     ) -> Result<(), EvalError> {
         parse_memory_type(memory_type)?;
         self.tx
-            .send(explicit_event(agent_id, None, content, memory_type, importance, None).into())
+            .send(explicit_event(agent_id, None, content, memory_type, importance, None, age_ms).into())
             .await
             .map_err(|_| EvalError::Insert("the ingest worker has stopped".to_string()))
     }
@@ -618,6 +837,7 @@ impl EvalIngest {
             save.memory_type,
             save.importance,
             save.topic_key,
+            0,
         );
         self.tx
             .send(IngestRequest { event, reply: Some(reply), outbox: None })
@@ -640,6 +860,44 @@ impl EvalIngest {
         })
     }
 
+    /// [`EvalStore::resolve_cases`] over this store.
+    pub async fn resolve_cases(&self, cases: &[EvalCaseRef]) -> Result<Vec<EvalResolved>, EvalResolveError> {
+        resolve_cases_in(&self.runtime.store, cases).await
+    }
+
+    /// [`EvalStore::composition`] over this store.
+    pub async fn composition(&self) -> Result<EvalComposition, EvalError> {
+        self.runtime.store.conn.call(|c| composition_in(c)).await.map_err(|e| EvalError::Read(e.to_string()))
+    }
+
+    /// The positions in `texts` of those a live row already holds, hashed as a
+    /// save of each would hash it: asked before a corpus goes in, the texts
+    /// the ingest would merge into a row that was there.
+    pub async fn holding(&self, texts: Vec<String>) -> Result<Vec<usize>, EvalError> {
+        let hashes: Vec<String> = texts
+            .iter()
+            .map(|t| crate::memory::dedup::content_hash(&crate::memory::redact::redact(t).text))
+            .collect();
+        self.runtime
+            .store
+            .conn
+            .call(move |c| -> rusqlite::Result<Vec<usize>> {
+                let mut stmt = c.prepare(
+                    "SELECT EXISTS (SELECT 1 FROM memory WHERE content_hash = ?1 \
+                     AND deleted_at IS NULL AND status IN ('active', 'disputed'))",
+                )?;
+                let mut held = Vec::new();
+                for (i, hash) in hashes.iter().enumerate() {
+                    if stmt.query_row([hash], |r| r.get::<_, bool>(0))? {
+                        held.push(i);
+                    }
+                }
+                Ok(held)
+            })
+            .await
+            .map_err(|e| EvalError::Read(e.to_string()))
+    }
+
     /// Closes the queue and waits for the worker to finish it. The worker only
     /// ends once every sender is gone, so this is the one "everything queued
     /// is now stored" signal the pipeline has.
@@ -651,8 +909,21 @@ impl EvalIngest {
     pub async fn finish(self) -> Result<MemoryRuntime, EvalError> {
         let Self { tx, worker, runtime } = self;
         drop(tx);
-        worker.await.map_err(|e| EvalError::Insert(format!("the ingest worker failed: {e}")))?;
+        if let Err(e) = worker.await {
+            runtime.close().await;
+            return Err(EvalError::Insert(format!("the ingest worker failed: {e}")));
+        }
         Ok(runtime)
+    }
+
+    /// Stops the worker and closes the store, for a run that ends before
+    /// [`finish`](Self::finish) hands the runtime on: dropping it only signals
+    /// the connection's thread, and on Windows a file still open cannot be
+    /// deleted.
+    pub async fn close(self) {
+        if let Ok(runtime) = self.finish().await {
+            runtime.close().await;
+        }
     }
 }
 
@@ -805,6 +1076,16 @@ pub fn is_claim_type(memory_type: &str) -> bool {
 pub const NEAR_DUPLICATE_FLOOR: f32 = crate::memory::contradiction::NEAR_DUPLICATE_FLOOR;
 pub const CONTRADICTION_THRESHOLD: f32 = crate::memory::contradiction::CONTRADICTION_THRESHOLD;
 
+/// The most texts one inference run embeds: a doc's passages are embedded in
+/// runs of this many, each padded to its longest.
+pub const EMBED_BATCH: usize = crate::memory::embedder::EMBED_BATCH;
+
+/// The indices of `tokens` from the largest count to the smallest, equal
+/// counts in the order they came: the order an import embeds its rows in.
+pub fn longest_first(tokens: &[usize]) -> Vec<usize> {
+    crate::memory::portability::import::longest_first(tokens)
+}
+
 /// The token window the live embedder truncates to — re-exported so the eval
 /// binary's `--follow-up` budget reads the exact same number production's
 /// embedder enforces, rather than a second copy that could drift from it.
@@ -907,6 +1188,108 @@ pub fn model_is_cached(base_dir: &Path) -> bool {
     model_download::model_is_cached(base_dir)
 }
 
+/// How the model file reaches the ONNX session: the arms `load-eval` compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadArm {
+    /// Read into a `Vec`, hashed, built with `commit_from_memory`.
+    Vec,
+    /// Hashed in blocks through a handle that stays open, built by path.
+    File,
+    /// The read-only view production loads from.
+    View,
+}
+
+/// Where one load spent its time, in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LoadTiming {
+    /// Reading and hashing `model.onnx`.
+    pub verify_ms: u64,
+    /// Building the session from it.
+    pub session_ms: u64,
+}
+
+/// The size of the blocks the `File` arm hashes in.
+const HASH_BLOCK: usize = 1024 * 1024;
+
+/// Loads the model under `model_dir` once, by `arm`, and drops the session.
+/// The files must already be there ([`fetch_model`]); nothing is downloaded.
+/// The caller measures the process, so a measured load runs in a process of
+/// its own.
+pub fn load_once(model_dir: &Path, arm: LoadArm) -> Result<LoadTiming, EvalError> {
+    use std::time::Instant;
+
+    let failed = |e: String| EvalError::ModelLoad(e);
+    let path = model_download::cache_dir_of(model_dir).join("onnx").join("model.onnx");
+    let mismatch = || EvalError::ModelLoad(format!("{} does not verify", path.display()));
+    let built = |at: Instant| at.elapsed().as_millis() as u64;
+    let start = Instant::now();
+    match arm {
+        LoadArm::Vec => {
+            let bytes = std::fs::read(&path).map_err(|e| failed(e.to_string()))?;
+            if model_download::sha256_hex(&bytes) != model_download::MODEL_SHA256 {
+                return Err(mismatch());
+            }
+            let verify_ms = built(start);
+            let start = Instant::now();
+            crate::memory::embedder::build_session(&bytes).map_err(|e| failed(e.to_string()))?;
+            Ok(LoadTiming { verify_ms, session_ms: built(start) })
+        }
+        LoadArm::File => {
+            use sha2::Digest;
+            use std::io::Read;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_SHARE_READ: u32 = 0x1;
+                options.share_mode(FILE_SHARE_READ);
+            }
+            let mut file = options.open(&path).map_err(|e| failed(e.to_string()))?;
+            let mut hasher = sha2::Sha256::new();
+            let mut block = vec![0u8; HASH_BLOCK];
+            loop {
+                let n = file.read(&mut block).map_err(|e| failed(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&block[..n]);
+            }
+            drop(block);
+            if model_download::hex_digest(hasher.finalize().as_slice()) != model_download::MODEL_SHA256 {
+                return Err(mismatch());
+            }
+            let verify_ms = built(start);
+            let start = Instant::now();
+            // `file` is still open: the handle outlives the build, as a held view would.
+            crate::memory::embedder::session_builder()
+                .map_err(|e| failed(e.to_string()))?
+                .commit_from_file(&path)
+                .map_err(|e| failed(e.to_string()))?;
+            drop(file);
+            Ok(LoadTiming { verify_ms, session_ms: built(start) })
+        }
+        LoadArm::View => {
+            let guard = model_download::CacheLock::new().read_now();
+            let view = model_download::verified_onnx(&path, model_download::MODEL_SHA256, guard)
+                .map_err(|e| failed(format!("{}: {e:?}", path.display())))?;
+            let verify_ms = built(start);
+            let start = Instant::now();
+            crate::memory::embedder::build_session(&view).map_err(|e| failed(e.to_string()))?;
+            Ok(LoadTiming { verify_ms, session_ms: built(start) })
+        }
+    }
+}
+
+/// Downloads the model into `dir` (`models/multilingual-e5-small` under it)
+/// unless it is already there and verifies. `CLAWG_HF_BASE_URL` names a mirror.
+pub async fn fetch_model(dir: &Path) -> Result<(), EvalError> {
+    model_download::ensure_model(dir, None, &model_download::CacheLock::new())
+        .await
+        .map(drop)
+        .map_err(|e| EvalError::ModelLoad(e.to_string()))
+}
+
 /// Cosine similarity of two vectors, computed directly rather than recovered
 /// from an L2 distance. The single definition shared by every binary that
 /// compares embeddings offline: `golden-mine` uses it to mine hard
@@ -938,6 +1321,7 @@ pub struct EvalDocIndex {
     store: MemoryStore,
     embedder: Arc<dyn Embedder>,
     splitter: TokenSplitter,
+    tokenizer: Option<Arc<tokenizers::Tokenizer>>,
 }
 
 /// What indexing a root found and wrote.
@@ -946,6 +1330,81 @@ pub struct EvalDocReport {
     pub docs: usize,
     pub passages: usize,
     pub skipped: usize,
+}
+
+/// Where one doc spent its time in a refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvalPhases {
+    pub read: std::time::Duration,
+    pub mask: std::time::Duration,
+    pub split: std::time::Duration,
+    pub lookup: std::time::Duration,
+    pub embed: std::time::Duration,
+    pub write: std::time::Duration,
+}
+
+/// One doc a refresh went through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalDocTiming {
+    /// Relative to the root, `/`-separated. It stays with the caller: the
+    /// results never carry it.
+    pub path: String,
+    pub code: bool,
+    pub passages: usize,
+    pub phases: EvalPhases,
+}
+
+/// What indexing a root found and wrote, and where it spent its time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalIndexRun {
+    pub report: EvalDocReport,
+    /// Walking, reading and hashing the whole tree and planning the refresh.
+    pub scan: std::time::Duration,
+    /// Dropping the docs that are gone.
+    pub remove: std::time::Duration,
+    pub docs: Vec<EvalDocTiming>,
+}
+
+/// The tokens of each passage of one doc, in the order they were embedded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalDocLengths {
+    pub path: String,
+    pub lengths: Vec<usize>,
+}
+
+/// The tokens of the passages an index holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalPassageLengths {
+    pub docs: Vec<EvalDocLengths>,
+    /// What the calls to the tokenizer took, apart from reading the store.
+    pub count_seconds: f64,
+}
+
+/// The tokens of each text inside the model's window, grouped by doc (a doc's
+/// texts come together) and counted in runs of [`EMBED_BATCH`], as the
+/// embedder takes them, with the time the tokenizer took.
+fn lengths_by_doc(
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[(String, String)],
+) -> Result<(Vec<EvalDocLengths>, std::time::Duration), EvalError> {
+    let mut docs: Vec<EvalDocLengths> = Vec::new();
+    let mut took = std::time::Duration::ZERO;
+    let mut start = 0;
+    while start < texts.len() {
+        let end = texts[start..].iter().position(|(path, _)| *path != texts[start].0).map_or(texts.len(), |n| start + n);
+        let mut lengths = Vec::with_capacity(end - start);
+        for run in texts[start..end].chunks(EMBED_BATCH) {
+            let refs: Vec<&str> = run.iter().map(|(_, text)| text.as_str()).collect();
+            let counting = std::time::Instant::now();
+            let encodings = crate::memory::embedder::window_encodings(tokenizer, &refs)
+                .map_err(|e| EvalError::Embed(e.to_string()))?;
+            took += counting.elapsed();
+            lengths.extend(encodings.iter().map(tokenizers::Encoding::len));
+        }
+        docs.push(EvalDocLengths { path: texts[start].0.clone(), lengths });
+        start = end;
+    }
+    Ok((docs, took))
 }
 
 /// One passage a doc search returned, ranked.
@@ -965,23 +1424,99 @@ impl EvalDocIndex {
         let store = MemoryStore::open(base_dir, StoreHolder::Eval)
             .await
             .map_err(|e| EvalError::Open(e.to_string()))?;
-        let splitter = match model_download::load_tokenizer(tokenizer_dir) {
-            Some(tok) => TokenSplitter::with_tokenizer(tok),
+        let tokenizer = model_download::load_tokenizer(tokenizer_dir);
+        let splitter = match &tokenizer {
+            Some(tok) => TokenSplitter::with_tokenizer(tok.clone()),
             None => TokenSplitter::fallback(),
         };
-        Ok(Self { store, embedder: embedder.0.clone(), splitter })
+        Ok(Self { store, embedder: embedder.inner.clone(), splitter, tokenizer })
     }
 
-    pub async fn index(&self, root: &Path) -> Result<EvalDocReport, EvalError> {
-        let r = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root)
+    /// Counts with `tokenizer`, which a test sets where the model's goes.
+    #[cfg(test)]
+    fn with_tokenizer(mut self, tokenizer: Arc<tokenizers::Tokenizer>) -> Self {
+        self.tokenizer = Some(tokenizer);
+        self
+    }
+
+    /// The tokens of every passage the index holds, as the model receives
+    /// them: the text of the stored passage under the embedder's passage
+    /// prefix, cut to the model's window, by doc in path order and within a
+    /// doc in the order its passages were embedded. `None` without a
+    /// tokenizer, which only the real model brings.
+    pub async fn passage_lengths(&self) -> Result<Option<EvalPassageLengths>, EvalError> {
+        let Some(tokenizer) = &self.tokenizer else { return Ok(None) };
+        let rows = self
+            .store
+            .conn
+            .call(|c| -> rusqlite::Result<Vec<(String, project_docs::chunk::Passage)>> {
+                c.prepare(
+                    "SELECT path, ordinal, breadcrumb, body FROM project_doc_chunk \
+                     WHERE project_id = ?1 ORDER BY path, ordinal",
+                )?
+                .query_map([EVAL_DOCS_PROJECT], |r| {
+                    Ok((
+                        r.get(0)?,
+                        project_docs::chunk::Passage { ordinal: r.get(1)?, breadcrumb: r.get(2)?, body: r.get(3)? },
+                    ))
+                })?
+                .collect()
+            })
+            .await
+            .map_err(|e| EvalError::Doc(e.to_string()))?;
+        let texts: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|(path, passage)| {
+                let text = crate::memory::embedder::apply_role_prefix(
+                    EmbedRole::Passage,
+                    &passage.indexed_text(),
+                    self.embedder.query_prefix(),
+                    self.embedder.passage_prefix(),
+                );
+                (path, text)
+            })
+            .collect();
+        let (docs, took) = lengths_by_doc(tokenizer, &texts)?;
+        Ok(Some(EvalPassageLengths { docs, count_seconds: took.as_secs_f64() }))
+    }
+
+    /// Indexes the docs under `root` but those at the relative paths in
+    /// `left_out`, which the index never sees.
+    pub async fn index(&self, root: &Path, left_out: &[String]) -> Result<EvalIndexRun, EvalError> {
+        let left_out: std::collections::HashSet<String> = left_out.iter().cloned().collect();
+        let run = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root, &left_out)
             .await
             .map_err(|e| EvalError::Insert(e.to_string()))?;
+        let r = run.report;
         // A measurement without a doc measures another corpus, so a doc the
         // daemon would skip and retry fails the run here.
         if let Some(f) = r.failed.first() {
             return Err(EvalError::Insert(format!("{} could not be indexed: {}", f.path, f.reason)));
         }
-        Ok(EvalDocReport { docs: r.docs, passages: r.passages, skipped: r.skipped })
+        let docs = run
+            .timing
+            .docs
+            .into_iter()
+            .map(|d| EvalDocTiming {
+                code: matches!(d.kind, project_docs::corpus::DocKind::Code(_)),
+                path: d.path,
+                passages: d.passages,
+                phases: EvalPhases {
+                    read: d.phases.read,
+                    mask: d.phases.mask,
+                    split: d.phases.split,
+                    lookup: d.phases.lookup,
+                    embed: d.phases.embed,
+                    write: d.phases.write,
+                },
+            })
+            .collect();
+        Ok(EvalIndexRun {
+            report: EvalDocReport { docs: r.docs, passages: r.passages, skipped: r.skipped },
+            scan: run.timing.scan,
+            remove: run.timing.remove,
+            docs,
+        })
     }
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<EvalDocHit>, EvalError> {
@@ -989,6 +1524,22 @@ impl EvalDocIndex {
             .await
             .map_err(|e| EvalError::Search(e.to_string()))?;
         Ok(hits.into_iter().map(|h| EvalDocHit { path: h.path, breadcrumb: h.breadcrumb }).collect())
+    }
+
+    /// The breadcrumbs of the passages a refresh would make of the doc at
+    /// `path` under `root`, read, masked and split as it does, without
+    /// embedding or storing anything.
+    pub fn breadcrumbs(&self, root: &Path, path: &str) -> Result<Vec<String>, EvalError> {
+        let kind = project_docs::corpus::classify(path).ok_or_else(|| EvalError::Doc(format!("{path}: not a doc")))?;
+        let text = std::fs::read_to_string(root.join(path)).map_err(|e| EvalError::Doc(format!("{path}: {e}")))?;
+        let masked = crate::memory::redact::redact(&text).text;
+        Ok(project_docs::passages(kind, path, &masked, &self.splitter).into_iter().map(|p| p.breadcrumb).collect())
+    }
+
+    /// Closes the index's store as [`EvalStore::close`] does, so its
+    /// directory can be removed on Windows.
+    pub async fn close(self) -> Result<(), EvalError> {
+        self.store.conn.clone().close().await.map_err(|e| EvalError::Close(e.to_string()))
     }
 }
 
@@ -1012,18 +1563,461 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     h.update(bytes);
-    let out = h.finalize();
-    let mut s = String::with_capacity(out.len() * 2);
-    for b in out {
+    hex(&h.finalize())
+}
+
+fn hex(digest: &[u8]) -> String {
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
     }
     s
 }
 
+/// Why a snapshot cannot be measured over. Each is decided before anything
+/// opens its copy for writing, so neither the snapshot nor the copy changed.
+#[derive(Debug, thiserror::Error)]
+pub enum BackgroundRefusal {
+    #[error(
+        "{} beside it holds commits the file alone does not have; measure a snapshot `clawg backup` wrote",
+        .0.display()
+    )]
+    WalWithCommits(PathBuf),
+    #[error("{0}")]
+    Unusable(String),
+    #[error("it has no embedding contract, so nothing says which model made its vectors")]
+    NoContract,
+    #[error("{}", contract_refusal(.differing, *.pooling_upgrade))]
+    Contract { differing: Vec<String>, pooling_upgrade: bool },
+}
+
+fn contract_refusal(differing: &[String], pooling_upgrade: bool) -> String {
+    if pooling_upgrade {
+        "its vectors were pooled by CLS; open it once with the daemon, which embeds them again by mean, \
+         and back it up again"
+            .to_string()
+    } else {
+        format!("its vectors are of another model ({})", differing.join("; "))
+    }
+}
+
+/// The embedding contract a snapshot was written under.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalContract {
+    pub model_id: String,
+    pub dim: i64,
+    pub query_prefix: String,
+    pub passage_prefix: String,
+}
+
+/// A snapshot copied for a measurement: its digest, the schema opening the
+/// copy migrates it from and to, and the contract of its vectors.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalBackground {
+    pub sha256: String,
+    pub schema_from: i32,
+    pub schema_to: i32,
+    pub contract: EvalContract,
+}
+
+/// Copies the snapshot `snapshot` to `dir/memory.db` and decides, before
+/// anything opens the copy for writing, whether it can be measured over: no
+/// `-wal` with commits beside it, a whole clawg store this binary opens (the
+/// rule of `clawg restore`) and vectors of `embedder`'s model. The snapshot
+/// itself is only read as a file, since a read-only connection still creates
+/// files beside a store in WAL mode. Nothing refused is repaired or embedded
+/// again; a store of an older schema is migrated when the copy is opened, as
+/// the daemon would migrate it.
+pub fn copy_background(snapshot: &Path, dir: &Path, embedder: &EvalEmbedder) -> Result<EvalBackground, EvalError> {
+    if let Some(wal) = wal_with_commits(snapshot) {
+        return Err(BackgroundRefusal::WalWithCommits(wal).into());
+    }
+    let copy = dir.join("memory.db");
+    let sha256 =
+        copy_hashing(snapshot, &copy).map_err(|e| BackgroundRefusal::Unusable(format!("it could not be copied: {e}")))?;
+    let plan = check_restorable(&copy).map_err(|e| {
+        BackgroundRefusal::Unusable(match e {
+            BackupError::Unusable { reason, .. } => reason,
+            other => other.to_string(),
+        })
+    })?;
+    let binary = known_migrations().iter().map(|m| m.version).max().unwrap_or(0);
+    let (schema_from, schema_to) = match plan {
+        SchemaPlan::Pending { from, to } => (from, to),
+        _ => (binary, binary),
+    };
+    let stored = stored_contract(&copy).map_err(|e| BackgroundRefusal::Unusable(e.to_string()))?;
+    let contract = background_contract(stored.as_ref(), &EmbeddingIdentity::of(embedder.inner.as_ref()))?;
+    Ok(EvalBackground {
+        sha256,
+        schema_from,
+        schema_to,
+        contract: EvalContract {
+            model_id: contract.model_id.clone(),
+            dim: contract.dim,
+            query_prefix: contract.query_prefix.clone(),
+            passage_prefix: contract.passage_prefix.clone(),
+        },
+    })
+}
+
+/// Copies `from` to the new file `to` in one read, hashing what it copies.
+fn copy_hashing(from: &Path, to: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::{Read, Write};
+    let mut input = std::fs::File::open(from)?;
+    let mut output = std::fs::File::create_new(to)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        output.write_all(&buf[..n])?;
+    }
+    output.sync_all()?;
+    Ok(hex(&hasher.finalize()))
+}
+
+/// The contract of the store at `path`, read without writing; none for a
+/// store from before the table.
+fn stored_contract(path: &Path) -> rusqlite::Result<Option<StoredContract>> {
+    let c = open_for_probe(path)?;
+    let has_table: bool = c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_contract')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_table {
+        crate::memory::inspect::contract(&c)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether vectors stored under `stored` are `actual`'s. A store the daemon
+/// would embed again by mean is named as such, since opening it once with the
+/// daemon is the way to measure it.
+fn background_contract<'a>(
+    stored: Option<&'a StoredContract>,
+    actual: &EmbeddingIdentity,
+) -> Result<&'a StoredContract, BackgroundRefusal> {
+    let stored = stored.ok_or(BackgroundRefusal::NoContract)?;
+    let differing = differing_fields(stored, actual);
+    if differing.is_empty() {
+        Ok(stored)
+    } else {
+        Err(BackgroundRefusal::Contract { pooling_upgrade: is_pooling_upgrade(stored, actual), differing })
+    }
+}
+
+/// How many live rows of a store hold one value of a column, NULL first.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalCount {
+    pub value: Option<String>,
+    pub rows: u64,
+}
+
+/// Where the live rows another tool's project gave are: the name of the
+/// project they are in, none for the rows without one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalPlacement {
+    pub origin_project: String,
+    pub project: Option<String>,
+    pub rows: u64,
+}
+
+/// The live rows of a store (those a search can return) in counts and names
+/// alone, never a text, a row id or a key.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvalComposition {
+    pub rows: u64,
+    pub by_type: Vec<EvalCount>,
+    pub by_agent: Vec<EvalCount>,
+    pub by_lang: Vec<EvalCount>,
+    pub by_source: Vec<EvalCount>,
+    /// By the name of the project, the rows without one under none.
+    pub by_project: Vec<EvalCount>,
+    pub placement: Vec<EvalPlacement>,
+}
+
+const LIVE_ROW: &str = "m.deleted_at IS NULL AND m.status IN ('active', 'disputed')";
+const PROJECT_NAME: &str = "CASE WHEN m.project_id IS NULL THEN NULL ELSE COALESCE(p.name, m.project_id) END";
+
+fn composition_in(c: &rusqlite::Connection) -> rusqlite::Result<EvalComposition> {
+    let by = |column: &str| -> rusqlite::Result<Vec<EvalCount>> {
+        let mut stmt = c.prepare(&format!(
+            "SELECT {column}, COUNT(*) FROM memory m LEFT JOIN project p ON p.id = m.project_id \
+             WHERE {LIVE_ROW} GROUP BY 1 ORDER BY 1"
+        ))?;
+        let counts = stmt.query_map([], |r| Ok(EvalCount { value: r.get(0)?, rows: r.get::<_, i64>(1)? as u64 }))?;
+        counts.collect()
+    };
+    let by_type = by("m.memory_type")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT m.origin_project, {PROJECT_NAME}, COUNT(*) FROM memory m LEFT JOIN project p ON p.id = m.project_id \
+         WHERE {LIVE_ROW} AND m.origin_project IS NOT NULL GROUP BY 1, 2 ORDER BY 1, 2"
+    ))?;
+    let placement = stmt
+        .query_map([], |r| {
+            Ok(EvalPlacement { origin_project: r.get(0)?, project: r.get(1)?, rows: r.get::<_, i64>(2)? as u64 })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(EvalComposition {
+        rows: by_type.iter().map(|c| c.rows).sum(),
+        by_type,
+        by_agent: by("m.agent_id")?,
+        by_lang: by("m.lang")?,
+        by_source: by("m.source")?,
+        by_project: by(PROJECT_NAME)?,
+        placement,
+    })
+}
+
+/// A case of a golden set as a store reads it: the project it names, by id
+/// or by the name of one live project, and the saves it expects, by the
+/// origin an import recorded in `created_by_ref`. Ids and pieces change from
+/// one import of an export to the next; the origin and the name do not.
+#[derive(Debug, Clone)]
+pub struct EvalCaseRef {
+    pub id: String,
+    pub project: Option<String>,
+    pub origins: Vec<String>,
+}
+
+/// What a case's references are in one store.
+#[derive(Debug, Clone)]
+pub struct EvalResolved {
+    /// This store's own id of the project the case names, past its merges.
+    pub project_id: Option<String>,
+    /// One per origin, in the case's order.
+    pub expected: Vec<EvalExpectedSave>,
+}
+
+/// The live rows an import of one origin wrote. A hit on any of them finds
+/// the save.
+#[derive(Debug, Clone)]
+pub struct EvalExpectedSave {
+    pub origin: String,
+    /// By save, then by piece.
+    pub rows: Vec<i64>,
+    pub memory_type: String,
+    /// `memory.lang` of its first piece, or what the detector reads in its
+    /// text when the maintenance pass has not classified it yet.
+    pub lang: String,
+    /// Its pieces joined as `read_memory` joins them.
+    pub text: String,
+    /// Whether it is the summary LAST SESSION opens a context of the case's
+    /// project with.
+    pub is_last_summary: bool,
+}
+
+/// Why a golden set does not hold over a store.
+#[derive(Debug, thiserror::Error)]
+pub enum EvalResolveError {
+    #[error("case {case}: no live project is named {name:?}")]
+    UnknownProject { case: String, name: String },
+    #[error("case {case}: {name:?} names more than one live project ({})", .candidates.join(", "))]
+    AmbiguousProject { case: String, name: String, candidates: Vec<String> },
+    #[error("case {case}: {name:?} leads to a deleted project")]
+    DeletedProject { case: String, name: String },
+    #[error("case {case}: no live row was imported from {origin}")]
+    NoLiveRow { case: String, origin: String },
+    #[error("case {case}: rows imported from {origin} are outside the project {project}")]
+    OutsideProject { case: String, origin: String, project: String },
+    #[error("failed to read the store: {0}")]
+    Store(String),
+}
+
+async fn resolve_cases_in(store: &MemoryStore, cases: &[EvalCaseRef]) -> Result<Vec<EvalResolved>, EvalResolveError> {
+    let mut resolved = Vec::with_capacity(cases.len());
+    for case in cases {
+        let project_id = match &case.project {
+            Some(name) => Some(case_project(store, &case.id, name).await?),
+            None => None,
+        };
+        let mut expected = Vec::with_capacity(case.origins.len());
+        for origin in &case.origins {
+            let (id, origin, project) = (case.id.clone(), origin.clone(), project_id.clone());
+            let save = store
+                .conn
+                .call(move |c| Ok(expected_save_in(c, &id, &origin, project.as_deref())))
+                .await
+                .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| EvalResolveError::Store(e.to_string()))??;
+            expected.push(save);
+        }
+        resolved.push(EvalResolved { project_id, expected });
+    }
+    Ok(resolved)
+}
+
+/// The project `name` leads to, as the `project` argument of a tool reads it,
+/// without creating one.
+async fn case_project(store: &MemoryStore, case: &str, name: &str) -> Result<String, EvalResolveError> {
+    let unknown = || EvalResolveError::UnknownProject { case: case.to_string(), name: name.to_string() };
+    let resolution = match resolve_project(store, name, ResolveOptions::default()).await {
+        Ok(resolution) => resolution,
+        Err(RegistryResolveError::Name(_)) => return Err(unknown()),
+        Err(e) => return Err(EvalResolveError::Store(e.to_string())),
+    };
+    match (resolution.refused, resolution.project_id) {
+        (Some(ResolveRefusal::Ambiguous), _) => Err(EvalResolveError::AmbiguousProject {
+            case: case.to_string(),
+            name: name.to_string(),
+            candidates: resolution.candidates.into_iter().map(|c| c.id).collect(),
+        }),
+        (Some(_), _) | (None, None) => Err(unknown()),
+        (None, Some(_)) if resolution.deleted => {
+            Err(EvalResolveError::DeletedProject { case: case.to_string(), name: name.to_string() })
+        }
+        (None, Some(id)) => Ok(id),
+    }
+}
+
+/// The live rows an import of `origin` wrote, which a search can return, and
+/// whether they are within what a search under `project` reads: its own
+/// rows, the rows without one and every `user_preference`.
+fn expected_save_in(
+    c: &rusqlite::Connection,
+    case: &str,
+    origin: &str,
+    project: Option<&str>,
+) -> Result<EvalExpectedSave, EvalResolveError> {
+    let store = |e: rusqlite::Error| EvalResolveError::Store(e.to_string());
+    type Row = (i64, Option<String>, String, Option<String>, String);
+    let mut stmt = c
+        .prepare(
+            "SELECT id, project_id, memory_type, lang, content FROM memory \
+             WHERE source = 'import' AND created_by_ref = ?1 \
+               AND deleted_at IS NULL AND status IN ('active', 'disputed')",
+        )
+        .map_err(store)?;
+    let mut rows: Vec<Row> = stmt
+        .query_map([origin], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .map_err(store)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(store)?;
+    if rows.is_empty() {
+        return Err(EvalResolveError::NoLiveRow { case: case.to_string(), origin: origin.to_string() });
+    }
+    if let Some(project) = project {
+        for (_, row_project, memory_type, ..) in &rows {
+            let Some(row_project) = row_project else { continue };
+            if memory_type != "user_preference" && canonical_in(c, row_project).map_err(store)? != project {
+                return Err(EvalResolveError::OutsideProject {
+                    case: case.to_string(),
+                    origin: origin.to_string(),
+                    project: project.to_string(),
+                });
+            }
+        }
+    }
+
+    let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let links = read_links(c, &ids).map_err(store)?;
+    let save = |id: i64| links.get(&id).map_or((false, id), |l| (true, l.save_id));
+    rows.sort_by_key(|r| (save(r.0), links.get(&r.0).map_or(1, |l| l.position.piece)));
+    let text = rows
+        .chunk_by(|a, b| save(a.0) == save(b.0))
+        .map(|pieces| crate::memory::pieces::join_pieces(&pieces.iter().map(|r| r.4.as_str()).collect::<Vec<_>>()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let memory_type = rows[0].2.clone();
+    let lang = rows[0].3.clone().unwrap_or_else(|| language::column_value(language::detect(&text)).to_string());
+    let is_last_summary = memory_type == "session_summary"
+        && c.query_row(LAST_SESSION_SQL, [project], |r| r.get::<_, i64>(0))
+            .optional()
+            .map_err(store)?
+            .is_some_and(|last| ids.contains(&last));
+    Ok(EvalExpectedSave {
+        origin: origin.to_string(),
+        rows: rows.iter().map(|r| r.0).collect(),
+        memory_type,
+        lang,
+        text,
+        is_last_summary,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::backup::{latest_known, read_history};
+    use crate::memory::db::{seed_on_disk, StoredContract};
+    use crate::memory::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
+    use crate::memory::pieces::StoredPiece;
+
+    #[test]
+    fn eval_cpu_names_this_machine() {
+        let cpu = EvalCpu::this();
+        assert_eq!(cpu.os, std::env::consts::OS);
+        assert_eq!(cpu.arch, std::env::consts::ARCH);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            assert_eq!(cpu.avx2, is_x86_feature_detected!("avx2"));
+            assert_eq!(cpu.avx512f, is_x86_feature_detected!("avx512f"));
+            assert_eq!(cpu.fma, is_x86_feature_detected!("fma"));
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        assert!(!cpu.avx2 && !cpu.avx512f && !cpu.fma);
+    }
+
+    #[test]
+    fn session_threads_is_the_count_the_session_builds_with() {
+        assert_eq!(session_threads(), std::thread::available_parallelism().unwrap().get());
+    }
+
+    struct Measuring(Arc<crate::metrics::Recorder>);
+
+    #[async_trait::async_trait]
+    impl Embedder for Measuring {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, crate::memory::embedder::EmbedError> {
+            let label = match role {
+                EmbedRole::Passage => "passage",
+                EmbedRole::Query => "query",
+            };
+            self.0.gauge("embedder.batch_tokens", &[("role", label)], 10.0 * texts.len() as f64);
+            let mut out = Vec::new();
+            for text in texts {
+                out.push(self.embed_with_role(text, role).await?);
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "measuring" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    #[tokio::test]
+    async fn padded_ran_sums_only_passage_batches() {
+        let recorder = Arc::new(crate::metrics::Recorder::default());
+        let embedder = EvalEmbedder::of(Arc::new(Measuring(recorder.clone())), recorder);
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        embedder.embed_batch(&texts, EmbedRole::Passage).await.unwrap();
+        embedder.embed_batch(&texts[..2], EmbedRole::Query).await.unwrap();
+        embedder.embed_batch(&texts[..1], EmbedRole::Passage).await.unwrap();
+
+        assert_eq!(embedder.passage_tokens_ran(), 40.0);
+    }
+
+    #[test]
+    fn the_real_embedder_keeps_its_recorder() {
+        let recorder = Arc::new(crate::metrics::Recorder::default());
+        let embedder = EvalEmbedder::of(Arc::new(FakeEmbedder::default()), recorder.clone());
+        assert_eq!(embedder.passage_tokens_ran(), 0.0);
+
+        recorder.gauge("embedder.batch_tokens", &[("role", "passage")], 7.0);
+        assert_eq!(embedder.passage_tokens_ran(), 7.0, "what the session writes is what the handle reads");
+        assert_eq!(EvalEmbedder::fake().passage_tokens_ran(), 0.0);
+    }
 
     #[test]
     fn into_search_scope_maps_lexical_through_unchanged() {
@@ -1054,7 +2048,7 @@ mod tests {
     /// its way into the top 10 on importance, which the 30 fillers give up.
     #[tokio::test]
     async fn search_feeds_query_text_to_the_lexical_channel() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         let agent = "agent-query-text-wiring";
 
@@ -1094,19 +2088,19 @@ mod tests {
         let scoring = EvalScoringConfig::default();
 
         let with_text = store
-            .search(&on_axis, agent, scope, 10, scoring, Some("ZQXIDENT42"))
+            .search(&on_axis, agent, scope, None, 10, scoring, Some("ZQXIDENT42"))
             .await
             .unwrap();
         assert!(
-            with_text.iter().any(|h| h.id == m_id),
+            with_text.hits.iter().any(|h| h.id == m_id),
             "M is reachable only through the lexical channel, so its absence means the query \
              text never reached it: {:?}",
-            with_text.iter().map(|h| h.id).collect::<Vec<_>>()
+            with_text.hits.iter().map(|h| h.id).collect::<Vec<_>>()
         );
 
-        let without_text = store.search(&on_axis, agent, scope, 10, scoring, None).await.unwrap();
+        let without_text = store.search(&on_axis, agent, scope, None, 10, scoring, None).await.unwrap();
         assert!(
-            !without_text.iter().any(|h| h.id == m_id),
+            !without_text.hits.iter().any(|h| h.id == m_id),
             "the control must miss M — otherwise the assertion above proves nothing about the \
              lexical channel"
         );
@@ -1116,11 +2110,11 @@ mod tests {
 
     #[tokio::test]
     async fn recreate_fts_with_tokenizer_same_tokenizer_matches_the_migrated_schema_byte_for_byte() {
-        let dir_a = tempfile::tempdir().unwrap();
+        let dir_a = crate::test_dir::test_dir();
         let store_a = EvalStore::open(dir_a.path()).await.expect("open must succeed");
         let migrated_sql = store_a.fts_schema_sql().await;
 
-        let dir_b = tempfile::tempdir().unwrap();
+        let dir_b = crate::test_dir::test_dir();
         let store_b = EvalStore::open(dir_b.path()).await.expect("open must succeed");
         store_b
             .recreate_fts_with_tokenizer("unicode61 remove_diacritics 2")
@@ -1136,11 +2130,11 @@ mod tests {
 
     #[tokio::test]
     async fn recreate_fts_with_tokenizer_trigram_differs_only_in_the_tokenize_clause() {
-        let dir_a = tempfile::tempdir().unwrap();
+        let dir_a = crate::test_dir::test_dir();
         let store_a = EvalStore::open(dir_a.path()).await.expect("open must succeed");
         let migrated_sql = store_a.fts_schema_sql().await;
 
-        let dir_c = tempfile::tempdir().unwrap();
+        let dir_c = crate::test_dir::test_dir();
         let store_c = EvalStore::open(dir_c.path()).await.expect("open must succeed");
         store_c.recreate_fts_with_tokenizer("trigram").await.expect("recreate with trigram must succeed");
         let rebuilt_trigram_sql = store_c.fts_schema_sql().await;
@@ -1155,7 +2149,7 @@ mod tests {
 
     #[tokio::test]
     async fn recreate_fts_with_tokenizer_rejects_an_unlisted_tokenizer() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         match store.recreate_fts_with_tokenizer("porter").await {
             Err(EvalError::UnknownTokenizer(t)) => assert_eq!(t, "porter"),
@@ -1168,7 +2162,7 @@ mod tests {
         // Confirms no backfill is needed: the AFTER INSERT
         // trigger must survive the DROP TABLE, so a row inserted after the
         // swap is still lexically findable with no extra step.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         store.recreate_fts_with_tokenizer("trigram").await.expect("recreate must succeed");
 
@@ -1381,11 +2375,11 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_finish_returns_only_after_every_event_is_stored() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         for i in 0..5 {
             ingest
-                .send("agent-ingest", &format!("distinct memory number {i} about the ingest drain"), "chat_message", 3.0)
+                .send("agent-ingest", &format!("distinct memory number {i} about the ingest drain"), "chat_message", 3.0, 0)
                 .await
                 .unwrap();
         }
@@ -1397,13 +2391,57 @@ mod tests {
             5,
             "finish() is the drained signal: every queued event must already be a row when it returns"
         );
+        runtime.close().await;
+    }
+
+    #[tokio::test]
+    async fn eval_ingest_backdates_created_at() {
+        let dir = crate::test_dir::test_dir();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        const DAY_MS: u64 = 86_400_000;
+        ingest.send("agent-ingest", "a fresh note about the ferry", "semantic_fact", 3.0, 0).await.unwrap();
+        ingest.send("agent-ingest", "an old note about the harbour", "semantic_fact", 3.0, 300 * DAY_MS).await.unwrap();
+
+        let runtime = ingest.finish().await.unwrap();
+
+        let created: Vec<i64> = runtime
+            .store
+            .conn
+            .call(|c| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = c.prepare("SELECT created_at FROM memory ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 2);
+        let gap = created[0] - created[1];
+        assert!((gap - (300 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
+        runtime.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_ingest_names_the_texts_a_live_row_already_holds() {
+        let dir = crate::test_dir::test_dir();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        ingest.save(keyed("a note already in the store", None)).await.unwrap();
+
+        let held = ingest
+            .holding(vec!["a new note".to_string(), "  a note already in the store ".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(held, vec![1], "a text is held as a save of it would hash it");
+        assert!(ingest.composition().await.unwrap().rows >= 1);
+        assert!(ingest.resolve_cases(&[]).await.unwrap().is_empty());
+        ingest.finish().await.unwrap().close().await;
     }
 
     #[tokio::test]
     async fn ingest_honours_the_declared_type_and_importance() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
-        ingest.send("agent-ingest", "always answer in rioplatense spanish", "user_preference", 9.5).await.unwrap();
+        ingest.send("agent-ingest", "always answer in rioplatense spanish", "user_preference", 9.5, 0).await.unwrap();
 
         let runtime = ingest.finish().await.unwrap();
 
@@ -1416,18 +2454,19 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_rejects_an_unknown_memory_type_before_queueing_anything() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
-        match ingest.send("agent-ingest", "content", "not_a_real_type", 3.0).await {
+        match ingest.send("agent-ingest", "content", "not_a_real_type", 3.0, 0).await {
             Err(EvalError::UnknownMemoryType(t)) => assert_eq!(t, "not_a_real_type"),
             other => panic!("expected UnknownMemoryType, got {other:?}"),
         }
+        ingest.finish().await.unwrap().close().await;
     }
 
     #[tokio::test]
     async fn conflict_pairs_reads_the_table() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         let runtime = ingest.finish().await.unwrap();
         assert!(conflict_pairs(&runtime).await.unwrap().is_empty());
@@ -1494,7 +2533,7 @@ mod tests {
     }
 
     fn placed_embedder() -> EvalEmbedder {
-        EvalEmbedder(Arc::new(PlacedByFirstWord))
+        EvalEmbedder::of(Arc::new(PlacedByFirstWord), Arc::default())
     }
 
     fn keyed<'a>(content: &'a str, key: Option<&'a str>) -> EvalSave<'a> {
@@ -1510,7 +2549,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_stores_under_the_agent_project_and_key_it_is_given() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
         let saved = ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap();
@@ -1536,7 +2575,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_save_under_the_same_key_reports_the_first_as_replaced() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
         let first = ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap();
@@ -1544,11 +2583,12 @@ mod tests {
 
         assert!(first.replaced.is_empty());
         assert_eq!(second.replaced, vec![first.rows[0].0]);
+        ingest.finish().await.unwrap().close().await;
     }
 
     #[tokio::test]
     async fn save_reports_the_candidates_the_detector_paired() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await.unwrap();
 
         let older = ingest.save(keyed("base the build runs on cargo", None)).await.unwrap();
@@ -1560,11 +2600,12 @@ mod tests {
         assert_eq!(candidate.id, older.rows[0].0);
         assert!((candidate.distance - 0.2).abs() < 0.01, "distance was {}", candidate.distance);
         assert!(!candidate.escalated, "two facts are never put to the user");
+        ingest.finish().await.unwrap().close().await;
     }
 
     #[tokio::test]
     async fn save_with_an_invalid_key_fails() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
         match ingest.save(keyed("content", Some("Not A Key"))).await {
@@ -1577,7 +2618,7 @@ mod tests {
 
     #[tokio::test]
     async fn joined_pieces_equal_the_text_read_memory_returns() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         let text: String = (0..900).map(|i| format!("word{i} ")).collect();
         let saved = ingest.save(keyed(&text, None)).await.unwrap();
@@ -1617,7 +2658,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_distances_equal_the_knn_distance() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await.unwrap();
         let base = ingest.save(keyed("base the build runs on cargo", None)).await.unwrap().rows[0].0;
         let near = ingest.save(keyed("near the build runs on make", None)).await.unwrap().rows[0].0;
@@ -1648,7 +2689,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_distances_of_nothing_is_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let runtime = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path())
             .await
             .unwrap()
@@ -1661,7 +2702,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_superseded_vectors_leaves_every_live_row_its_own() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         let old = ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap().rows[0].0;
         let new = ingest.save(keyed("the build runs on make", Some("build/tool"))).await.unwrap().rows[0].0;
@@ -1695,7 +2736,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_superseded_text_leaves_the_live_rows_matchable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
         ingest.save(keyed("the build runs on cargo", Some("build/tool"))).await.unwrap();
         let new = ingest.save(keyed("the build runs on make", Some("build/tool"))).await.unwrap().rows[0].0;
@@ -1710,7 +2751,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_runtime_is_rooted_at_the_given_base_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
 
         let runtime = ingest.finish().await.unwrap();
@@ -1728,9 +2769,9 @@ mod tests {
     /// needed to tell the two apart.
     #[tokio::test]
     async fn ingest_runtime_never_records_access() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
-        ingest.send("agent-ingest", "a single row whose access count must not move", "chat_message", 3.0).await.unwrap();
+        ingest.send("agent-ingest", "a single row whose access count must not move", "chat_message", 3.0, 0).await.unwrap();
         let runtime = ingest.finish().await.unwrap();
         let id: i64 = runtime
             .store
@@ -1764,19 +2805,175 @@ mod tests {
 
     #[tokio::test]
     async fn a_doc_index_answers_from_the_root_it_indexed() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
         std::fs::write(root.path().join("README.md"), "# Guía\n## Instalación\nCompilá con cargo build.\n## Uso\nArrancá el daemon.\n").unwrap();
         std::fs::write(root.path().join("notes.txt"), "not a doc").unwrap();
 
         let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
-        let report = index.index(root.path()).await.unwrap();
+        let report = index.index(root.path(), &[]).await.unwrap().report;
         let hits = index.search("daemon", 5).await.unwrap();
 
         assert_eq!(report, EvalDocReport { docs: 1, passages: 2, skipped: 0 });
         assert_eq!(doc_paths(root.path()).unwrap(), ["README.md"]);
         assert!(is_code_path("src/lib.rs") && !is_code_path("README.md"));
         assert_eq!(hits[0], EvalDocHit { path: "README.md".into(), breadcrumb: "README.md > Guía > Uso".into() });
+    }
+
+    #[tokio::test]
+    async fn an_index_run_carries_the_timings_of_the_refresh() {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        std::fs::write(root.path().join("a.md"), "# A
+alpha passage
+").unwrap();
+        std::fs::write(root.path().join("b.md"), "# B
+## One
+first
+## Two
+second
+").unwrap();
+        std::fs::write(root.path().join("c.rs"), "fn main() {}
+").unwrap();
+
+        let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
+        let run = index.index(root.path(), &[]).await.unwrap();
+        index.close().await.unwrap();
+
+        let mut docs: Vec<(&str, bool)> = run.docs.iter().map(|d| (d.path.as_str(), d.code)).collect();
+        docs.sort();
+        assert_eq!(docs, [("a.md", false), ("b.md", false), ("c.rs", true)]);
+        assert_eq!(run.docs.iter().map(|d| d.passages).sum::<usize>(), run.report.passages);
+        assert_eq!(run.report.docs, 3);
+        assert!(run.scan > std::time::Duration::ZERO, "the walk of the tree is measured");
+        assert!(run.docs.iter().all(|d| d.phases.embed > std::time::Duration::ZERO || d.passages == 0));
+    }
+
+    /// `FakeEmbedder` with a one-word prefix on passages.
+    struct Prefixed;
+
+    #[async_trait::async_trait]
+    impl Embedder for Prefixed {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "prefixed" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "pfx " }
+    }
+
+    /// A doc of `n` sections whose section `i` has `i` words.
+    fn ladder(n: usize) -> String {
+        (1..=n).map(|i| format!("## S{i}\n{}\n", vec!["w"; i].join(" "))).collect()
+    }
+
+    async fn lengths_of_ladder(embedder: EvalEmbedder) -> EvalPassageLengths {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        std::fs::write(root.path().join("a.md"), format!("# A\n{}", ladder(20))).unwrap();
+        std::fs::write(root.path().join("b.md"), "# B\nsolo\n").unwrap();
+        let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path())
+            .await
+            .unwrap()
+            .with_tokenizer(crate::memory::chunker::word_tokenizer());
+        index.index(root.path(), &[]).await.unwrap();
+        let lengths = index.passage_lengths().await.unwrap().expect("a tokenizer is set");
+        index.close().await.unwrap();
+        lengths
+    }
+
+    #[tokio::test]
+    async fn passage_lengths_follow_the_stored_passages_in_batch_order() {
+        let plain = lengths_of_ladder(EvalEmbedder::fake()).await;
+        let prefixed = lengths_of_ladder(EvalEmbedder::of(Arc::new(Prefixed), Arc::default())).await;
+
+        let paths: Vec<&str> = plain.docs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, ["a.md", "b.md"], "by path");
+        let a = &plain.docs[0].lengths;
+        assert_eq!(a.len(), 20, "one length per stored passage, past one batch");
+        assert!(a.windows(2).all(|w| w[1] == w[0] + 1), "in ordinal order, one more word each: {a:?}");
+        let with_prefix = &prefixed.docs[0].lengths;
+        assert!(
+            a.iter().zip(with_prefix).all(|(plain, prefixed)| *prefixed == plain + 1),
+            "the prefix of the embedder is part of the text: {a:?} {with_prefix:?}"
+        );
+        assert_eq!(plain.docs[1].lengths.len(), 1);
+        assert!(plain.count_seconds >= 0.0);
+    }
+
+    #[test]
+    fn lengths_are_counted_in_batches_of_the_embedder() {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let texts: Vec<(String, String)> = (0..19)
+            .map(|i| ("a.md".to_string(), vec!["w"; i + 1].join(" ")))
+            .chain([("b.md".to_string(), "x y".to_string())])
+            .collect();
+
+        let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
+
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].path, "a.md");
+        assert_eq!(docs[0].lengths, (1..=19).collect::<Vec<usize>>());
+        assert_eq!((docs[1].path.as_str(), docs[1].lengths.clone()), ("b.md", vec![2]));
+        assert_eq!(lengths_by_doc(&tokenizer, &[]).unwrap().0, Vec::<EvalDocLengths>::new());
+    }
+
+    #[test]
+    fn a_passage_longer_than_the_window_counts_the_window() {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let long = vec!["w"; EMBED_MAX_TOKENS + 188].join(" ");
+        let texts = vec![("a.md".to_string(), long), ("a.md".to_string(), "x y".to_string())];
+
+        let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
+
+        assert_eq!(docs[0].lengths, vec![EMBED_MAX_TOKENS, 2]);
+    }
+
+    #[test]
+    fn longest_first_is_stable_and_descending() {
+        assert_eq!(longest_first(&[3, 9, 3, 1, 9]), vec![1, 4, 0, 2, 3]);
+        assert_eq!(longest_first(&[]), Vec::<usize>::new());
+        assert_eq!(longest_first(&[5, 5, 5]), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn passage_lengths_are_none_without_a_tokenizer() {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        std::fs::write(root.path().join("a.md"), "# A\nalpha\n").unwrap();
+        let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
+        index.index(root.path(), &[]).await.unwrap();
+
+        let lengths = index.passage_lengths().await.unwrap();
+        index.close().await.unwrap();
+
+        assert!(lengths.is_none());
+        assert_eq!(EMBED_BATCH, crate::memory::embedder::EMBED_BATCH);
+    }
+
+    #[tokio::test]
+    async fn a_doc_index_names_a_docs_breadcrumbs_without_indexing_it() {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        std::fs::write(
+            root.path().join("README.md"),
+            "# Guía\n## Instalación\n### Windows\nUsá el instalador.\n## Uso\nArrancá el daemon.\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("notes.txt"), "not a doc").unwrap();
+
+        let index = EvalDocIndex::open(store_dir.path(), &EvalEmbedder::fake(), store_dir.path()).await.unwrap();
+        let crumbs = index.breadcrumbs(root.path(), "README.md");
+        let not_a_doc = index.breadcrumbs(root.path(), "notes.txt");
+        let missing = index.breadcrumbs(root.path(), "gone.md");
+        let hits = index.search("daemon", 5).await.unwrap();
+        index.close().await.unwrap();
+
+        assert_eq!(crumbs.unwrap(), ["README.md > Guía > Instalación > Windows", "README.md > Guía > Uso"]);
+        assert!(matches!(not_a_doc, Err(EvalError::Doc(ref e)) if e.contains("notes.txt")), "{not_a_doc:?}");
+        assert!(matches!(missing, Err(EvalError::Doc(ref e)) if e.contains("gone.md")), "{missing:?}");
+        assert!(hits.is_empty(), "naming the breadcrumbs indexes nothing");
     }
 
     /// `FakeEmbedder`, except that a text holding `BROKEN` embeds to a
@@ -1800,21 +2997,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_doc_the_index_could_not_embed_fails_the_measurement() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
         std::fs::write(root.path().join("a.md"), "# A\nBROKEN passage\n").unwrap();
         std::fs::write(root.path().join("b.md"), "# B\nsound passage\n").unwrap();
 
-        let embedder = EvalEmbedder(Arc::new(Unusable));
+        let embedder = EvalEmbedder::of(Arc::new(Unusable), Arc::default());
         let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path()).await.unwrap();
-        let result = index.index(root.path()).await;
+        let result = index.index(root.path(), &[]).await;
 
         assert!(matches!(result, Err(EvalError::Insert(ref e)) if e.contains("a.md")), "{result:?}");
     }
 
     #[tokio::test]
     async fn eval_insert_backdates_created_at() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         let mut embedding = vec![0.0; 384];
         embedding[0] = 1.0;
@@ -1837,9 +3034,492 @@ mod tests {
         assert!((gap - (30 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
     }
 
+    /// A row of `agent` (none for a row no agent saved) in `project`.
+    async fn put_row(
+        store: &EvalStore,
+        agent: Option<&str>,
+        project: Option<&str>,
+        memory_type: MemoryType,
+        content: &str,
+        embedding: Vec<f32>,
+    ) -> i64 {
+        let record = NewMemoryRecord {
+            scope: match (agent, project) {
+                (Some(_), _) => "agent",
+                (None, Some(_)) => "project",
+                (None, None) => "global",
+            },
+            agent_id: agent.map(str::to_string),
+            project_id: project.map(str::to_string),
+            content: content.to_string(),
+            memory_type,
+            source: MemorySource::Chat,
+            created_by_type: CreatedByType::System,
+            created_by_ref: "rag-eval".to_string(),
+            importance: 5.0,
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            candidates: Vec::new(),
+            derived_from: Vec::new(),
+            topic_key: None,
+            source_session_id: None,
+        };
+        store.0.insert_memory_with_vector(record, embedding).await.unwrap()
+    }
+
+    fn at_cosine(cos: f32) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 384];
+        v[0] = cos;
+        v[1] = (1.0 - cos * cos).sqrt();
+        v
+    }
+
+    const MEMORY_ONLY: EvalScope = EvalScope { memory: Some(30), episodic: None, procedural: None, lexical: None };
+
+    #[tokio::test]
+    async fn production_reach_reads_other_agents_and_unowned_rows() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let own = put_row(&store, Some("a"), None, MemoryType::SemanticFact, "own row", at_cosine(0.99)).await;
+        let other = put_row(&store, Some("b"), None, MemoryType::SemanticFact, "other row", at_cosine(0.98)).await;
+        let unowned = put_row(&store, None, None, MemoryType::SemanticFact, "unowned row", at_cosine(0.97)).await;
+
+        let hits = store.search(&at_cosine(1.0), "a", MEMORY_ONLY, None, 10, EvalScoringConfig::default(), None).await;
+        let mut ids: Vec<i64> = hits.unwrap().hits.iter().map(|h| h.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![own, other, unowned]);
+
+        let (own_reach, _) = search_all_memories_with_scoring(
+            &store.0, &at_cosine(1.0), None, "a", MEMORY_ONLY.into_search_scope(), 10, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+        assert!(!own_reach.iter().any(|h| h.id == other), "the agent's own reach must not read b's row");
+    }
+
+    #[tokio::test]
+    async fn a_project_search_reads_its_own_unowned_and_every_preference() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let fact = MemoryType::SemanticFact;
+        let in_p = put_row(&store, Some("a"), Some("p"), fact, "row of p", at_cosine(0.99)).await;
+        let in_q = put_row(&store, Some("a"), Some("q"), fact, "row of q", at_cosine(0.98)).await;
+        let unscoped = put_row(&store, Some("a"), None, fact, "row of none", at_cosine(0.97)).await;
+        let preference =
+            put_row(&store, Some("a"), Some("q"), MemoryType::UserPreference, "preference of q", at_cosine(0.96)).await;
+
+        let hits =
+            store.search(&at_cosine(1.0), "a", MEMORY_ONLY, Some("p"), 10, EvalScoringConfig::default(), None).await;
+        let mut ids: Vec<i64> = hits.unwrap().hits.iter().map(|h| h.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![in_p, unscoped, preference]);
+        assert!(!ids.contains(&in_q));
+    }
+
+    #[tokio::test]
+    async fn a_one_agent_store_ranks_the_same_under_the_daemons_reach() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        for i in 0..12 {
+            let cos = 0.99 - i as f32 * 0.01;
+            put_row(&store, Some("a"), None, MemoryType::SemanticFact, &format!("row {i}"), at_cosine(cos)).await;
+        }
+        let scope = EvalScope { lexical: Some(20), ..MEMORY_ONLY };
+
+        let daemons = store
+            .search(&at_cosine(1.0), "a", scope, None, 10, EvalScoringConfig::default(), Some("row"))
+            .await
+            .unwrap();
+        let (own, _) = search_all_memories_with_scoring(
+            &store.0, &at_cosine(1.0), Some("row"), "a", scope.into_search_scope(), 10, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(daemons.hits.iter().map(|h| h.id).collect::<Vec<_>>(), own.iter().map(|h| h.id).collect::<Vec<_>>());
+        for (d, o) in daemons.hits.iter().zip(&own) {
+            assert!((d.score - o.score).abs() < 1e-9, "{} scored {} and {}", d.id, d.score, o.score);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_search_hands_back_its_pool_with_each_hits_type_and_last_access() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let fact = put_row(&store, Some("a"), None, MemoryType::SemanticFact, "a fact", at_cosine(0.99)).await;
+        let summary = put_row(&store, Some("a"), None, MemoryType::SessionSummary, "a summary", at_cosine(0.98)).await;
+
+        let found = store.search(&at_cosine(1.0), "a", MEMORY_ONLY, None, 10, EvalScoringConfig::default(), None).await.unwrap();
+
+        assert_eq!(found.hits.iter().map(|h| (h.id, h.memory_type.as_str())).collect::<Vec<_>>(), [
+            (fact, "semantic_fact"),
+            (summary, "session_summary")
+        ]);
+        assert!(found.hits.iter().all(|h| !h.exact));
+        let pool = &found.pool;
+        assert_eq!((pool.requested, pool.rows, pool.saves, pool.passes, pool.eligible), (30, 2, 2, 1, Some(2)));
+        let accessed = store.last_accessed(vec![fact, summary]).await.unwrap();
+        assert_eq!(accessed.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [fact, summary]);
+        assert!((cosine_from_distance(0.0) - 1.0).abs() < 1e-12);
+        assert!((cosine_from_distance(found.hits[0].distance) - 0.99).abs() < 1e-3);
+    }
+
+    // --- copy_background --------------------------------------------------
+
+    fn fake_identity() -> EmbeddingIdentity {
+        EmbeddingIdentity::of(EvalEmbedder::fake().inner.as_ref())
+    }
+
+    /// `memory.db` in `dir`, migrated up to `target` with one row and the
+    /// embedding contract of `identity`, standing alone as a snapshot does.
+    async fn snapshot_in(dir: &Path, target: Option<i32>, identity: Option<&EmbeddingIdentity>) -> PathBuf {
+        seed_on_disk(dir, target).await;
+        let path = dir.join("memory.db");
+        if let Some(id) = identity {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO embedding_contract \
+                     (id, model_id, dim, metric, normalized, query_prefix, passage_prefix, created_at) \
+                     VALUES (1, ?1, ?2, 'cosine', 1, ?3, ?4, 0)",
+                    rusqlite::params![id.model_id, id.dim as i64, id.query_prefix, id.passage_prefix],
+                )
+                .unwrap();
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_with_a_nonempty_wal_is_refused_untouched() {
+        let at = crate::test_dir::test_dir();
+        let snapshot = snapshot_in(at.path(), None, Some(&fake_identity())).await;
+        let wal = at.path().join("memory.db-wal");
+        std::fs::write(&wal, b"commits the file alone does not have").unwrap();
+        let before = (std::fs::read(&snapshot).unwrap(), std::fs::read(&wal).unwrap());
+        let copy = crate::test_dir::test_dir();
+
+        let refused = copy_background(&snapshot, copy.path(), &EvalEmbedder::fake()).unwrap_err();
+
+        assert!(
+            matches!(&refused, EvalError::Background(BackgroundRefusal::WalWithCommits(p)) if *p == wal),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().contains("memory.db-wal"), "{refused}");
+        assert_eq!((std::fs::read(&snapshot).unwrap(), std::fs::read(&wal).unwrap()), before);
+        assert!(!copy.path().join("memory.db").exists());
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_of_another_embedding_contract_is_refused_untouched() {
+        let other = EmbeddingIdentity { model_id: "another-model".to_string(), ..fake_identity() };
+        for (identity, cause) in [(Some(other), "another-model"), (None, "no embedding contract")] {
+            let at = crate::test_dir::test_dir();
+            let snapshot = snapshot_in(at.path(), None, identity.as_ref()).await;
+            let before = std::fs::read(&snapshot).unwrap();
+            let copy = crate::test_dir::test_dir();
+
+            let refused = copy_background(&snapshot, copy.path(), &EvalEmbedder::fake()).unwrap_err();
+
+            assert!(matches!(refused, EvalError::Background(_)), "{refused:?}");
+            assert!(refused.to_string().contains(cause), "{refused}");
+            assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+            assert_eq!(std::fs::read(copy.path().join("memory.db")).unwrap(), before, "the copy was written to");
+        }
+    }
+
+    #[test]
+    fn background_contract_names_a_cls_store_and_what_differs() {
+        let actual = EmbeddingIdentity {
+            model_id: E5_MODEL_ID.to_string(),
+            dim: 384,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+        let stored = |model_id: &str, dim: i64| StoredContract {
+            model_id: model_id.to_string(),
+            dim,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+
+        assert!(background_contract(Some(&stored(E5_MODEL_ID, 384)), &actual).is_ok());
+        let cls = background_contract(Some(&stored(LEGACY_CLS_MODEL_ID, 384)), &actual).unwrap_err();
+        assert!(matches!(cls, BackgroundRefusal::Contract { pooling_upgrade: true, .. }), "{cls:?}");
+        assert!(cls.to_string().contains("CLS") && cls.to_string().contains("daemon"), "{cls}");
+        let other = background_contract(Some(&stored("another", 768)), &actual).unwrap_err();
+        assert!(
+            matches!(&other, BackgroundRefusal::Contract { pooling_upgrade: false, differing } if differing.len() == 2),
+            "{other:?}"
+        );
+        assert!(matches!(background_contract(None, &actual), Err(BackgroundRefusal::NoContract)));
+    }
+
+    #[tokio::test]
+    async fn a_newer_schema_snapshot_is_refused() {
+        let elsewhere = crate::test_dir::test_dir();
+        let damaged = elsewhere.path().join("notes.db");
+        std::fs::write(&damaged, "not a database at all, just some words").unwrap();
+        let foreign = elsewhere.path().join("foreign.db");
+        rusqlite::Connection::open(&foreign).unwrap().execute_batch("CREATE TABLE x (y)").unwrap();
+        let newer_dir = crate::test_dir::test_dir();
+        let newer = snapshot_in(newer_dir.path(), None, Some(&fake_identity())).await;
+        rusqlite::Connection::open(&newer)
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) \
+                 VALUES ({}, 'from_the_future', '2026-10-12T00:00:00Z', '1')",
+                latest_known() + 1
+            ))
+            .unwrap();
+
+        for (file, cause) in [(&damaged, "not a database"), (&foreign, "no clawg migration history"), (&newer, "newer than")] {
+            let before = std::fs::read(file).unwrap();
+            let copy = crate::test_dir::test_dir();
+
+            let refused = copy_background(file, copy.path(), &EvalEmbedder::fake()).unwrap_err();
+
+            assert!(matches!(refused, EvalError::Background(BackgroundRefusal::Unusable(_))), "{refused:?}");
+            assert!(refused.to_string().contains(cause), "{refused}");
+            assert_eq!(std::fs::read(file).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_schema_snapshot_is_migrated_in_the_copy() {
+        let at = crate::test_dir::test_dir();
+        let snapshot = snapshot_in(at.path(), Some(26), Some(&fake_identity())).await;
+        let before = std::fs::read(&snapshot).unwrap();
+        let copy = crate::test_dir::test_dir();
+
+        let background = copy_background(&snapshot, copy.path(), &EvalEmbedder::fake()).unwrap();
+
+        assert_eq!((background.schema_from, background.schema_to), (26, latest_known()));
+        assert_eq!(background.sha256, sha256_hex(&before));
+        assert_eq!(background.contract.model_id, fake_identity().model_id);
+        let store = EvalStore::open(copy.path()).await.unwrap();
+        let applied = store.0.conn.call(|c| -> rusqlite::Result<_> { read_history(c) }).await.unwrap();
+        assert_eq!(applied.iter().map(|m| m.version).max(), Some(latest_known()));
+        assert_eq!(store.composition().await.unwrap().rows, 1);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+    }
+
+    fn counts(of: &[EvalCount]) -> Vec<(Option<&str>, u64)> {
+        of.iter().map(|c| (c.value.as_deref(), c.rows)).collect()
+    }
+
+    #[tokio::test]
+    async fn the_composition_counts_rows_without_text() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let fact = MemoryType::SemanticFact;
+        put_row(&store, Some("a"), Some("p"), fact, "private alpha", at_cosine(0.9)).await;
+        put_row(&store, Some("a"), None, MemoryType::SessionSummary, "private beta", at_cosine(0.8)).await;
+        let placed = put_row(&store, Some("migrated"), Some("p"), fact, "private gamma", at_cosine(0.7)).await;
+        let unplaced = put_row(&store, Some("migrated"), None, fact, "private delta", at_cosine(0.6)).await;
+        let deleted = put_row(&store, None, None, fact, "private epsilon", at_cosine(0.5)).await;
+        store
+            .0
+            .conn
+            .call(move |c| -> rusqlite::Result<()> {
+                c.execute(
+                    "UPDATE memory SET source = 'import', origin_project = 'engram-app' WHERE id IN (?1, ?2)",
+                    [placed, unplaced],
+                )?;
+                c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [deleted])?;
+                c.execute("UPDATE project SET name = 'App' WHERE id = 'p'", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let composition = store.composition().await.unwrap();
+
+        let json = serde_json::to_string(&composition).unwrap();
+        assert!(!json.contains("private"), "{json}");
+        assert_eq!(composition.rows, 4);
+        assert_eq!(counts(&composition.by_type), vec![(Some("semantic_fact"), 3), (Some("session_summary"), 1)]);
+        assert_eq!(counts(&composition.by_agent), vec![(Some("a"), 2), (Some("migrated"), 2)]);
+        assert_eq!(counts(&composition.by_source), vec![(Some("chat"), 2), (Some("import"), 2)]);
+        assert_eq!(counts(&composition.by_project), vec![(None, 2), (Some("App"), 2)]);
+        assert_eq!(composition.by_lang.iter().map(|c| c.rows).sum::<u64>(), 4);
+        assert_eq!(
+            composition.placement,
+            vec![
+                EvalPlacement { origin_project: "engram-app".to_string(), project: None, rows: 1 },
+                EvalPlacement { origin_project: "engram-app".to_string(), project: Some("App".to_string()), rows: 1 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_evaluation_ingest_records_and_checks_its_embedding_contract() {
+        let dir = crate::test_dir::test_dir();
+        let ingest = EvalIngest::open(dir.path(), &EvalEmbedder::fake(), dir.path()).await.unwrap();
+        let runtime = ingest.finish().await.unwrap();
+        let stored = runtime
+            .store
+            .conn
+            .call(|c| -> rusqlite::Result<_> { crate::memory::inspect::contract(c) })
+            .await
+            .unwrap();
+        assert_eq!(stored.map(|s| s.model_id), Some(fake_identity().model_id));
+        runtime.close().await;
+        drop(runtime);
+
+        let refused = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await;
+
+        assert!(matches!(&refused, Err(EvalError::Open(e)) if e.contains("placed-by-first-word")), "{:?}", refused.err());
+    }
+
+    // --- resolve_cases ----------------------------------------------------
+
+    fn case(project: Option<&str>, origins: &[&str]) -> EvalCaseRef {
+        EvalCaseRef {
+            id: "c1".to_string(),
+            project: project.map(str::to_string),
+            origins: origins.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    async fn run_sql(store: &EvalStore, statements: String) {
+        store.0.conn.call(move |c| c.execute_batch(&statements)).await.unwrap();
+    }
+
+    /// Marks `ids` as the rows an import of `origin` wrote.
+    async fn imported_from(store: &EvalStore, origin: &str, ids: &[i64]) {
+        let ids = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+        run_sql(store, format!("UPDATE memory SET source = 'import', created_by_ref = '{origin}' WHERE id IN ({ids})"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_project_name_resolves_to_each_backgrounds_own_id() {
+        for id in ["app-1111", "app-2222"] {
+            let dir = crate::test_dir::test_dir();
+            let store = EvalStore::open(dir.path()).await.unwrap();
+            put_row(&store, Some("a"), Some(id), MemoryType::SemanticFact, "a row of the app", at_cosine(0.9)).await;
+            run_sql(&store, format!("UPDATE project SET name = 'App' WHERE id = '{id}'")).await;
+
+            let resolved = store.resolve_cases(&[case(Some("app"), &[])]).await.unwrap();
+
+            assert_eq!(resolved[0].project_id.as_deref(), Some(id));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_or_unknown_project_name_is_refused() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        for id in ["app-1111", "app-2222", "gone-3333"] {
+            put_row(&store, Some("a"), Some(id), MemoryType::SemanticFact, &format!("a row of {id}"), at_cosine(0.9)).await;
+        }
+        run_sql(
+            &store,
+            "UPDATE project SET name = 'App' WHERE id IN ('app-1111', 'app-2222'); \
+             UPDATE project SET deleted_at = 1 WHERE id = 'gone-3333';"
+                .to_string(),
+        )
+        .await;
+
+        let ambiguous = store.resolve_cases(&[case(Some("APP"), &[])]).await.unwrap_err();
+        assert!(matches!(&ambiguous, EvalResolveError::AmbiguousProject { case, .. } if case == "c1"), "{ambiguous:?}");
+        let unknown = store.resolve_cases(&[case(Some("nowhere"), &[])]).await.unwrap_err();
+        assert!(matches!(unknown, EvalResolveError::UnknownProject { .. }), "{unknown:?}");
+        let deleted = store.resolve_cases(&[case(Some("gone-3333"), &[])]).await.unwrap_err();
+        assert!(matches!(deleted, EvalResolveError::DeletedProject { .. }), "{deleted:?}");
+        assert!(deleted.to_string().contains("c1"), "{deleted}");
+    }
+
+    #[tokio::test]
+    async fn an_origin_resolves_to_every_live_piece_of_its_save() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let texts = [
+            "The ferry to the island leaves at nine in the morning from the north pier, and the return is at six.",
+            "and the return is at six in the evening, but on the weekends there is a second one that leaves at noon.",
+            "that leaves at noon and comes back with the last of the tourists who stayed for the market in the square.",
+        ];
+        let mut pieces = Vec::new();
+        for text in texts {
+            pieces.push(put_row(&store, Some("migrated"), Some("p"), MemoryType::SemanticFact, text, at_cosine(0.9)).await);
+        }
+        store
+            .0
+            .link_pieces(pieces.iter().map(|&memory_id| StoredPiece { memory_id, context: String::new() }).collect())
+            .await
+            .unwrap();
+        imported_from(&store, "engram:ferry", &pieces).await;
+        let native = put_row(&store, Some("claude-code"), Some("p"), MemoryType::SemanticFact, "a native row", at_cosine(0.8)).await;
+        run_sql(&store, format!("UPDATE memory SET created_by_ref = 'engram:ferry' WHERE id = {native}")).await;
+
+        let resolved = store.resolve_cases(&[case(Some("p"), &["engram:ferry"])]).await.unwrap();
+
+        let save = &resolved[0].expected[0];
+        assert_eq!(save.rows, pieces);
+        assert_eq!(save.memory_type, "semantic_fact");
+        assert_eq!(save.text, join_pieces(&texts));
+        assert_eq!(save.lang, "en");
+        assert!(!save.is_last_summary);
+    }
+
+    #[tokio::test]
+    async fn an_origin_without_a_live_row_is_refused() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let replaced = put_row(&store, Some("migrated"), None, MemoryType::SemanticFact, "an older note", at_cosine(0.9)).await;
+        imported_from(&store, "engram:old", &[replaced]).await;
+        run_sql(&store, format!("UPDATE memory SET status = 'superseded' WHERE id = {replaced}")).await;
+
+        for origin in ["engram:missing", "engram:old"] {
+            let refused = store.resolve_cases(&[case(None, &[origin])]).await.unwrap_err();
+
+            assert!(matches!(&refused, EvalResolveError::NoLiveRow { origin: o, .. } if o == origin), "{refused:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expected_save_outside_the_case_project_is_refused() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let fact = MemoryType::SemanticFact;
+        put_row(&store, Some("a"), Some("p"), fact, "a row of p", at_cosine(0.9)).await;
+        let in_q = put_row(&store, Some("migrated"), Some("q"), fact, "a row of q", at_cosine(0.9)).await;
+        let preference =
+            put_row(&store, Some("migrated"), Some("q"), MemoryType::UserPreference, "a preference of q", at_cosine(0.9)).await;
+        let unscoped = put_row(&store, Some("migrated"), None, fact, "a row of none", at_cosine(0.9)).await;
+        imported_from(&store, "engram:q", &[in_q]).await;
+        imported_from(&store, "engram:preference", &[preference]).await;
+        imported_from(&store, "engram:none", &[unscoped]).await;
+
+        let refused = store.resolve_cases(&[case(Some("p"), &["engram:q"])]).await.unwrap_err();
+        assert!(matches!(refused, EvalResolveError::OutsideProject { .. }), "{refused:?}");
+
+        let read = store.resolve_cases(&[case(Some("p"), &["engram:preference", "engram:none"])]).await.unwrap();
+        assert_eq!(read[0].expected.len(), 2);
+        assert!(store.resolve_cases(&[case(None, &["engram:q"])]).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_resolved_save_says_whether_it_is_the_last_summary_of_its_project() {
+        let dir = crate::test_dir::test_dir();
+        let store = EvalStore::open(dir.path()).await.unwrap();
+        let summary = MemoryType::SessionSummary;
+        let older = put_row(&store, Some("migrated"), Some("p"), summary, "the older session", at_cosine(0.9)).await;
+        let newer = put_row(&store, Some("migrated"), Some("p"), summary, "the newer session", at_cosine(0.9)).await;
+        imported_from(&store, "engram:older", &[older]).await;
+        imported_from(&store, "engram:newer", &[newer]).await;
+        run_sql(&store, format!("UPDATE memory SET created_at = created_at - 86400000 WHERE id = {older}")).await;
+
+        let resolved = store.resolve_cases(&[case(Some("p"), &["engram:older", "engram:newer"])]).await.unwrap();
+
+        assert_eq!(resolved[0].expected.iter().map(|s| s.is_last_summary).collect::<Vec<_>>(), vec![false, true]);
+    }
+
     #[tokio::test]
     async fn lexical_search_ranks_by_bm25_without_vectors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = EvalStore::open(dir.path()).await.expect("open must succeed");
         let mut query = vec![0.0_f32; 384];
         query[0] = 1.0;

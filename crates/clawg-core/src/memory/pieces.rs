@@ -652,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn rows_from_v10_survive_the_piece_table() {
         use crate::memory::embedder::{EmbedRole, Embedder, FakeEmbedder};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         crate::memory::db::seed_on_disk(dir.path(), Some(10)).await;
         let pieces = [
             "Notes on clawg-ledger, the crate that settles balances, first part",

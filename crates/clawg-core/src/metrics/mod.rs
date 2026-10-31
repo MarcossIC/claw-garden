@@ -1,11 +1,13 @@
 //! Usage metrics of the daemon: what it records while it serves and what it
 //! keeps of it in `metrics.db`, beside the memory store and never in it.
 
+pub mod event;
 pub mod histogram;
 pub mod recorder;
 pub mod report;
 pub mod store;
 
+pub use event::{DetailValue, Event, EventKind, EventRow};
 pub use histogram::{Histogram, Unit};
 pub use recorder::{Gauge, Recorder, SeriesKey, Window};
 
@@ -13,6 +15,14 @@ pub use recorder::{Gauge, Recorder, SeriesKey, Window};
 /// system does not say. Only the daemon knows the calls, so it hands one to
 /// what logs memory.
 pub type MemoryProbe = fn() -> Option<u64>;
+
+/// The two readings a model load logs around itself: the private memory of
+/// the process and the highest it has ever been.
+#[derive(Clone, Copy)]
+pub struct MemoryProbes {
+    pub private: MemoryProbe,
+    pub private_peak: MemoryProbe,
+}
 
 /// `bytes` in MiB with one decimal, as the log lines print memory.
 pub fn mib(bytes: u64) -> String {

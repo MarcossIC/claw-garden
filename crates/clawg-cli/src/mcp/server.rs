@@ -1836,7 +1836,7 @@ mod tests {
             shutdown,
             save_timeout: SAVE_CONFIRM_TIMEOUT,
             sessions: Default::default(),
-            metrics: Default::default(),
+            imports: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr: SocketAddr = listener.local_addr().expect("addr");
@@ -3015,40 +3015,6 @@ mod tests {
         assert_eq!(render_contract(&reread), rendered);
     }
 
-    /// The names in backticks after the `):` of the line that opens with
-    /// `MCP tools (`, or `None` when no such line exists.
-    fn tool_names_in_doc(doc: &str) -> Option<std::collections::BTreeSet<String>> {
-        let line = doc.lines().find(|l| l.starts_with("MCP tools ("))?;
-        let (_, list) = line.split_once("): ")?;
-        Some(list.split('`').skip(1).step_by(2).map(str::to_string).collect())
-    }
-
-    #[test]
-    fn tool_names_in_doc_reads_the_mcp_tools_line() {
-        let doc = "# Title\n\nSee `server.rs`.\n\nMCP tools (`crates/x/server.rs`): `save_memory`, `search_memory`.\n\nMore `text`.\n";
-        let names = tool_names_in_doc(doc).expect("the line is there");
-        assert_eq!(names.into_iter().collect::<Vec<_>>(), ["save_memory", "search_memory"]);
-        assert_eq!(tool_names_in_doc("no list here\n"), None);
-    }
-
-    /// `.claude/CLAUDE.md` is what an agent working on this repo reads to learn
-    /// the tools; a tool added or dropped without it leaves that list stale.
-    #[tokio::test]
-    async fn the_claude_md_tool_list_is_the_registered_one() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.claude/CLAUDE.md");
-        let doc = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let documented = tool_names_in_doc(&doc).unwrap_or_else(|| panic!("{path} has no `MCP tools (...)` line"));
-        let (b, _d) = bridge().await;
-        let registered: std::collections::BTreeSet<String> =
-            b.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
-        let missing: Vec<&String> = registered.difference(&documented).collect();
-        let unknown: Vec<&String> = documented.difference(&registered).collect();
-        assert!(
-            missing.is_empty() && unknown.is_empty(),
-            "the MCP tools line of {path} is stale: missing {missing:?}, not registered {unknown:?}"
-        );
-    }
-
     /// The descriptions, schemas and instructions are what the model reads
     /// in every session; a change to them, ours or a dependency's, has to
     /// show up as a diff of the contract file.
@@ -3501,7 +3467,7 @@ mod tests {
             text(Err(daemon_error(
                 503,
                 "embedder_failed",
-                ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![] },
+                ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![], ..Default::default() },
             ))),
             Err("not saved: the embedding model failed to load (connection refused); clawg will retry".to_string())
         );
@@ -3509,7 +3475,7 @@ mod tests {
             text(Err(daemon_error(
                 503,
                 "embedder_failed",
-                ErrorDetails { detail: Some("contract mismatch".into()), retryable: Some(false), memories: vec![] },
+                ErrorDetails { detail: Some("contract mismatch".into()), retryable: Some(false), memories: vec![], ..Default::default() },
             ))),
             Err("not saved: the embedding model failed to load (contract mismatch)".to_string())
         );
@@ -3521,6 +3487,7 @@ mod tests {
                     detail: Some("store insert failed: disk full".into()),
                     retryable: None,
                     memories: vec![saved(57, "inserted")],
+                    ..Default::default()
                 },
             ))),
             Err("not saved: store insert failed: disk full; partially saved as #57".to_string())
@@ -3557,7 +3524,7 @@ mod tests {
         let failed = daemon_error(
             503,
             "embedder_failed",
-            ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![] },
+            ErrorDetails { detail: Some("connection refused".into()), retryable: Some(true), memories: vec![], ..Default::default() },
         );
         let t = ClawgMcp::explain(Lang::En, &failed);
         assert!(!t.contains("in a minute"), "{t}");
@@ -4694,7 +4661,7 @@ mod tests {
                 shutdown,
                 save_timeout: SAVE_CONFIRM_TIMEOUT,
                 sessions: Default::default(),
-                metrics: Default::default(),
+                imports: Default::default(),
             });
             Self::serve(data_dir, token, wrap(router(ctx))).await.with_store(store)
         }

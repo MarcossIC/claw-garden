@@ -13,6 +13,8 @@ pub mod private_dir;
 /// Host-agnostic assembly of the memory substrate — the store, the ingest
 /// channel and the background workers, without any UI runtime.
 pub mod runtime;
+#[cfg(test)]
+mod test_dir;
 
 /// Narrow, feature-gated door into retrieval internals for the evaluation
 /// binaries. See `eval_api.rs` for why an opaque wrapper is preferred over

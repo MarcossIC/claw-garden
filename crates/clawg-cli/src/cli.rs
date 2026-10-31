@@ -106,9 +106,11 @@ pub enum Command {
     /// Import a file `clawg export` wrote, keeping each memory's dates,
     /// accesses, state and links, or the export of another memory tool, each
     /// note split and masked as a save of its text. Needs a running daemon,
-    /// which embeds each memory again; the store is snapshotted first.
-    /// Importing a file twice adds nothing. `--undo N` takes import N back,
-    /// keeping what was saved, edited or judged since.
+    /// which reads the file, embeds each memory again and keeps going if this
+    /// command is killed; the store is snapshotted first. Ctrl-C asks the
+    /// daemon to stop the import and waits for it. Importing a file twice
+    /// adds nothing. `--undo N` takes import N back, keeping what was saved,
+    /// edited or judged since.
     Import {
         /// The file `clawg export` wrote, or the other tool's export (for
         /// engram, `engram export --all`).
@@ -126,6 +128,10 @@ pub enum Command {
         /// Report what would be imported, or undone, and write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Write the phases of the import to stderr even when it is not a
+        /// terminal, which gets them anyway. The report stays on stdout.
+        #[arg(long, conflicts_with = "undo")]
+        follow: bool,
         /// Store every memory that has an agent under this one instead.
         #[arg(long, value_parser = parse_agent)]
         agent: Option<String>,
@@ -629,11 +635,16 @@ impl MoveOpts {
 pub enum MetricsAction {
     /// Sum one metric by local day, by hour of the local day, by local minute
     /// or by version, and print its count, mean and percentiles (or, for a gauge, its
-    /// samples, mean and extremes) as JSON.
+    /// samples, mean and extremes) as JSON; or, with `--events`, list the
+    /// events of each run.
     Report {
         /// The metric, as `http.duration` or `process.rss_bytes`.
-        #[arg(long)]
-        metric: String,
+        #[arg(long, required_unless_present = "events")]
+        metric: Option<String>,
+        /// List the events (model loads, backups, imports, shutdowns...) by
+        /// run instead of a metric.
+        #[arg(long, conflicts_with_all = ["metric", "labels", "by"])]
+        events: bool,
         /// Only the series with this label, as `route=/v1/search`. Repeat it
         /// to ask for several.
         #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
@@ -1179,6 +1190,7 @@ mod tests {
                 undo: None,
                 from: ImportSource::Clawg,
                 dry_run: true,
+                follow: false,
                 agent: Some("dev".into()),
                 map_root: vec![
                     RootMap { old: "/a/repo".into(), new: PathBuf::from(".") },
@@ -1202,6 +1214,7 @@ mod tests {
                 undo: Some(4),
                 from: ImportSource::Clawg,
                 dry_run: true,
+                follow: false,
                 agent: None,
                 map_root: Vec::new(),
                 project_map: Vec::new(),
@@ -1221,6 +1234,20 @@ mod tests {
     }
 
     #[test]
+    fn follow_conflicts_with_undo() {
+        let follows = |args: &[&str]| match Cli::parse_args(args) {
+            Ok(Cli { command: Command::Import { follow, .. }, .. }) => Ok(follow),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.kind()),
+        };
+        assert_eq!(follows(&["clawg", "import", "m.jsonl", "--follow"]), Ok(true));
+        assert_eq!(follows(&["clawg", "import", "m.jsonl", "--follow", "--dry-run"]), Ok(true));
+        assert_eq!(follows(&["clawg", "import", "m.jsonl"]), Ok(false));
+        let conflict = Err(clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(follows(&["clawg", "import", "--undo", "4", "--follow"]), conflict);
+    }
+
+    #[test]
     fn import_takes_a_source_and_project_maps() {
         let args = ["clawg", "import", "--from", "engram", "e.json", "--project-map", "my=app=C:\\work\\app", "--project-map", "b=."];
         assert_eq!(
@@ -1230,6 +1257,7 @@ mod tests {
                 undo: None,
                 from: ImportSource::Engram,
                 dry_run: false,
+                follow: false,
                 agent: None,
                 map_root: Vec::new(),
                 project_map: vec![
@@ -1571,7 +1599,8 @@ mod tests {
             parse(&["clawg", "metrics", "report", "--metric", "http.duration"]).command,
             Command::Metrics {
                 action: MetricsAction::Report {
-                    metric: "http.duration".into(),
+                    metric: Some("http.duration".into()),
+                    events: false,
                     labels: vec![],
                     by: ReportBy::Version,
                     since: std::time::Duration::from_secs(30 * 86_400),
@@ -1587,7 +1616,8 @@ mod tests {
             .command,
             Command::Metrics {
                 action: MetricsAction::Report {
-                    metric: "http.duration".into(),
+                    metric: Some("http.duration".into()),
+                    events: false,
                     labels: vec![("route".into(), "/v1/search".into()), ("transport".into(), "unix".into())],
                     by: ReportBy::Hour,
                     since: std::time::Duration::from_secs(12 * 3600),
@@ -1602,6 +1632,16 @@ mod tests {
         };
         assert_eq!(by, ReportBy::Minute);
         assert!(Cli::try_parse_from(["clawg", "metrics", "report"]).is_err(), "the metric is required");
+        let Command::Metrics { action: MetricsAction::Report { metric, events, since, .. } } =
+            parse(&["clawg", "metrics", "report", "--events", "--since", "2d"]).command
+        else {
+            panic!("a report")
+        };
+        assert_eq!((metric, events, since), (None, true, std::time::Duration::from_secs(2 * 86_400)));
+        for both in [&["--events", "--metric", "m"][..], &["--events", "--by", "day"], &["--events", "--label", "a=b"]] {
+            let args = [&["clawg", "metrics", "report"][..], both].concat();
+            assert!(Cli::try_parse_from(args).is_err(), "{both:?}");
+        }
         for bad in ["route", "=x", "route=", "a"] {
             assert!(parse_label(bad).is_err(), "{bad}");
         }

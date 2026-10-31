@@ -1,0 +1,18 @@
+change: import-job
+objective: "1"
+depends_on: [import-linear, import-decision-pass, import-undo, embed-throughput]
+phase: archived
+release: "0.68.0"
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done  # IJ1 a IJ11 e IJ15 a IJ17 en specs/portability (con R3 y HI16), IJ12 a IJ14 en specs/daemon-access, IJ18 en specs/storage; IJ19 queda en la spec del cambio
+  design: done
+  tasks: done  # 1 a 10, 10b y 12; el CI de la 11 corre en el pull request que lo archiva
+  apply: done
+  verify: done  # la suite, los dos clippy y la medición de memoria en Windows; Linux, sólo por el CI
+  archive: done
+after_archive:  # fuera del cambio
+  - "las sugerencias que verify.md deja como están: el camino de error de los servidores antes de la señal, una prueba por el binario del cableado de serve.rs y una ruta que no es Unicode"
+updated: 2026-10-30
+main_spec: openspec/specs/portability/spec.md, openspec/specs/daemon-access/spec.md, openspec/specs/storage/spec.md

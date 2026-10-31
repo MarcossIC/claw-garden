@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use clawg_cli::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, REFRESH_GRACE, SAVE_CONFIRM_TIMEOUT};
 use clawg_core::memory::bootstrap::EmbedderStatus;
-use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder};
+use clawg_core::memory::embedder::{EmbedError, EmbedRole, Embedder, FakeEmbedder, Gate, GatedEmbedder};
 use clawg_core::memory::idle_embedder::{IdleEmbedder, ReloadFn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use clawg_core::memory::worker::{IngestFailure, IngestReport, IngestRequest};
@@ -56,6 +56,9 @@ enum EmbedderState {
     /// Queries embed as the fake model does; passages wait for a gate to
     /// open, and may then fail.
     Docs(DocsEmbedder),
+    /// Queries and single texts embed as the fake model does; a batch waits
+    /// for its gate.
+    Gated(GatedEmbedder),
 }
 
 /// `FakeEmbedder` under the same model id, except that a passage waits until
@@ -233,6 +236,12 @@ impl Harness {
         Self::start_with(EmbedderState::LoadingWithoutWorker, capacity).await
     }
 
+    /// Daemon whose embedder holds every batch until the returned gate lets it through.
+    async fn start_gated() -> (Self, Gate) {
+        let (embedder, gate) = GatedEmbedder::new();
+        (Self::start_inner(EmbedderState::Gated(embedder)).await, gate)
+    }
+
     async fn start_inner(embedder: EmbedderState) -> Self {
         Self::start_with(embedder, INGEST_QUEUE_CAPACITY).await
     }
@@ -272,7 +281,7 @@ impl Harness {
                     Arc::new(FakeEmbedder::default()),
                     reload,
                     Some(Duration::from_secs(600)),
-                    None,
+                    Default::default(),
                     &tokio::runtime::Handle::current(),
                 );
                 idle.unload().await;
@@ -319,6 +328,12 @@ impl Harness {
                 tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
                 (runtime, None)
             }
+            EmbedderState::Gated(embedder) => {
+                let runtime = with_empty_embedder(runtime, EmbedderStatus::Ready);
+                runtime.embedder.set(Arc::new(embedder) as Arc<dyn Embedder>).ok();
+                tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+                (runtime, None)
+            }
             EmbedderState::DroppingReplies => {
                 let mut rx = rx;
                 tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -348,7 +363,7 @@ impl Harness {
             shutdown,
             save_timeout,
             sessions: Default::default(),
-            metrics: Default::default(),
+            imports: Default::default(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -377,6 +392,12 @@ impl Harness {
             .send()
             .await
             .expect("request");
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn delete_json(&self, path: &str) -> (u16, Value) {
+        let r = self.authed(self.http.delete(self.url(path))).send().await.expect("request");
         let status = r.status().as_u16();
         (status, r.json().await.unwrap_or(Value::Null))
     }
@@ -1560,8 +1581,12 @@ async fn a_search_with_a_language_counts_the_other_one() {
 async fn a_search_without_a_language_has_no_count() {
     let h = Harness::start().await;
     save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let total = clawg_core::metrics::SeriesKey::new("search.duration", &[("arm", "total")]);
+    let searches = || h.ctx.runtime.metrics.run().get(&total).map_or(0, |h| h.count());
+    let before = searches();
     let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a" })).await;
     assert_eq!(status, 200, "{body}");
+    assert_eq!(searches(), before + 1, "the store's search measures into the daemon's recorder");
     assert!(body.get("other_language").is_none(), "{body}");
     let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "lang": "es" })).await;
     assert_eq!(status, 200, "{body}");
@@ -3136,6 +3161,26 @@ async fn docs_search_indexes_on_first_use_and_answers() {
 }
 
 #[tokio::test]
+async fn a_docs_search_records_the_refresh_and_how_long_it_waited_for_it() {
+    let h = Harness::start().await;
+    let (_dir, id) = project_with_docs(&h, &[("README.md", "# Claw\nLocal memory.\n"), ("b.md", "# B\nb\n")]).await;
+
+    let (status, body) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "memory" })).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = h.post_json("/v1/projects/docs/search", json!({ "project_id": id, "query": "memory" })).await;
+    assert_eq!(status, 200);
+
+    let run = h.ctx.runtime.metrics.run();
+    let count = |name: &str| run.get(&clawg_core::metrics::SeriesKey::new(name, &[])).map_or(0, |h| h.count());
+    assert_eq!(count("docs.refresh.duration"), 1, "the second search found a fresh index");
+    assert_eq!(count("docs.search.inline_wait"), 1, "only the search that started a refresh waited for it");
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "indexed")]), Some((1, 2.0)));
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "unchanged")]), Some((1, 0.0)));
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "removed")]), Some((1, 0.0)));
+    assert_eq!(gauge_of(&h, "docs.refresh.files", &[("state", "failed")]), Some((1, 0.0)));
+}
+
+#[tokio::test]
 async fn docs_search_takes_at_most_the_limit() {
     let h = Harness::start().await;
     let (_dir, id) = project_with_docs(&h, &[("a.md", "# A\na\n# B\nb\n# C\nc\n")]).await;
@@ -3835,6 +3880,59 @@ async fn an_import_stores_rows_with_their_state_and_a_dry_run_stores_none() {
     assert_eq!(found["hits"][0]["id"], live["id"], "{found}");
 }
 
+/// Closing the client of a synchronous import cuts the import: the request's
+/// future, which holds the embedding batch, is dropped with the connection.
+#[tokio::test]
+async fn the_synchronous_import_still_cancels_when_the_client_goes() {
+    let (h, gate) = Harness::start_gated().await;
+    let client = {
+        let (http, url, token) = (h.http.clone(), h.url("/v1/import"), h.token.clone());
+        tokio::spawn(async move {
+            http.post(url).bearer_auth(token).json(&json!({ "text": export_file(1) })).send().await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the import reached the embedder");
+    let in_flight = || h.ctx.runtime.metrics.minute().gauges.iter().find(|(key, _)| key.name == "http.in_flight").map(|(_, g)| g.last);
+    assert_eq!(in_flight(), Some(1.0), "the import is the one request in flight");
+
+    client.abort();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while in_flight() != Some(0.0) {
+        assert!(Instant::now() < deadline, "the request outlived its client: {:?}", in_flight());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=a").await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+    let journaled: i64 = h
+        .ctx
+        .runtime
+        .store
+        .conn
+        .call(|c| c.query_row("SELECT COUNT(*) FROM memory_import", [], |r| r.get(0)))
+        .await
+        .expect("count imports");
+    assert_eq!(journaled, 0, "nothing was written before the batch was let go");
+}
+
+#[tokio::test]
+async fn an_import_and_its_snapshot_are_events_of_the_run() {
+    let h = Harness::start().await;
+    let (status, _) = h.post_json("/v1/import", json!({ "text": export_file(1), "dry_run": true })).await;
+    assert_eq!(status, 200);
+    let (status, _) = h.post_json("/v1/import", json!({ "text": export_file(1) })).await;
+    assert_eq!(status, 200);
+
+    let events = h.ctx.runtime.metrics.run_events();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(kinds, ["import", "backup", "import"], "the real import writes its snapshot first");
+    let label = |l: &'static str| clawg_core::metrics::DetailValue::Label(l);
+    assert_eq!(events[0].detail["dry_run"], label("yes"));
+    assert_eq!(events[0].detail["source"], label("clawg"));
+    assert_eq!(events[1].detail["reason"], label("pre-import"));
+    assert_eq!(events[2].detail["inserted"], clawg_core::metrics::DetailValue::Number(2.0));
+}
+
 #[tokio::test]
 async fn an_import_is_undone_by_its_number() {
     let h = Harness::start().await;
@@ -3951,6 +4049,587 @@ async fn an_engram_export_without_notes_imports_nothing() {
     assert_eq!((report["rows"].clone(), report["inserted"].clone(), report["foreign"]["notes"].clone()), (json!(0), json!(0), json!(0)));
     let (_, listed) = h.get_json("/v1/memories?kind=memory").await;
     assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
+}
+
+// ── /v1/imports ─────────────────────────────────────────────────────────────
+
+/// Writes `text` as `name` in `dir` and answers the file's absolute path.
+fn file_in(dir: &std::path::Path, name: &str, text: &str) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, text).expect("an export file");
+    path.to_string_lossy().into_owned()
+}
+
+/// A clawg export of `rows` rows of agent `a`, none of them replaced.
+fn rows_export(rows: usize) -> String {
+    let header = json!({
+        "kind": "header", "format": "clawg-memories", "version": 1, "exported_at": 0, "clawg": "0.0.0",
+        "filter": {"project": null, "agent": null, "include_deleted": false},
+    });
+    let row = |id: usize| {
+        json!({
+            "kind": "memory", "id": id, "scope": "agent", "agent_id": "a", "content": format!("the row {id} of the export"),
+            "memory_type": "semantic_fact", "source": "explicit", "created_at": 1_000 + id,
+            "created_by_type": "agent", "last_modified_at": 1_000 + id, "last_accessed_at": 9_000,
+            "access_count": 1, "importance": 5.0, "tier": 2, "status": "active",
+        })
+    };
+    std::iter::once(header).chain((1..=rows).map(row)).map(|line| format!("{line}\n")).collect()
+}
+
+const FINAL_PHASES: [&str; 4] = ["done", "failed", "cancelled", "interrupted"];
+
+impl Harness {
+    /// Polls job `id` until `ready` likes what it shows.
+    async fn job_until(&self, id: u64, ready: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (status, job) = self.get_json(&format!("/v1/imports/{id}")).await;
+            assert_eq!(status, 200, "{job}");
+            if ready(&job) {
+                return job;
+            }
+            assert!(Instant::now() < deadline, "the job never got there: {job}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn finished_job(&self, id: u64) -> Value {
+        self.job_until(id, |job| FINAL_PHASES.contains(&job["phase"].as_str().unwrap_or(""))).await
+    }
+
+    /// Accepts a job over the file `text` and answers its id.
+    async fn accepted_job(&self, dir: &std::path::Path, name: &str, text: &str, fields: Value) -> u64 {
+        let mut body = fields;
+        body["path"] = json!(file_in(dir, name, text));
+        let (status, accepted) = self.post_json("/v1/imports", body).await;
+        assert_eq!(status, 202, "{accepted}");
+        accepted["job_id"].as_u64().expect("a job id")
+    }
+
+    async fn count_of(&self, sql: &'static str) -> i64 {
+        self.ctx.runtime.store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
+    }
+}
+
+#[tokio::test]
+async fn an_import_job_is_accepted_without_waiting_for_the_embedder() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let id = h.accepted_job(dir.path(), "export.jsonl", &export_file(1), json!({})).await;
+    assert_eq!(id, 1);
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+
+    let (status, job) = h.get_json(&format!("/v1/imports/{id}")).await;
+    assert_eq!((status, job["phase"].as_str(), job["from"].as_str(), job["dry_run"].as_bool()), (200, Some("embedding"), Some("clawg"), Some(false)), "{job}");
+    assert_eq!((job["rows"].clone(), job["rows_to_embed"].clone(), job["rows_embedded"].clone()), (json!(2), json!(2), json!(0)), "{job}");
+    assert!(job["started_at_ms"].as_i64().is_some_and(|at| at > 0) && job["phase_started_at_ms"].as_i64().is_some_and(|at| at > 0), "{job}");
+    assert!(job.get("report").is_none() && job.get("import_id").is_none() && job.get("stopping").is_none(), "{job}");
+
+    gate.release(10);
+    let done = h.finished_job(id).await;
+    assert_eq!((done["phase"].as_str(), done["report"]["inserted"].clone()), (Some("done"), json!(2)), "{done}");
+}
+
+/// A file its owner may not read, where the platform and the user running the
+/// tests make one.
+#[cfg(unix)]
+fn unreadable_file(dir: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let locked = file_in(dir, "locked.jsonl", &export_file(1));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    std::fs::read(&locked).is_err().then_some(locked)
+}
+
+#[cfg(not(unix))]
+fn unreadable_file(_dir: &std::path::Path) -> Option<String> {
+    None
+}
+
+#[tokio::test]
+async fn a_job_import_refuses_a_path_that_is_not_an_absolute_readable_regular_file_within_the_limit() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let too_big = dir.path().join("too-big.jsonl");
+    std::fs::File::create(&too_big)
+        .and_then(|file| file.set_len(clawg_core::memory::portability::MAX_IMPORT_BYTES as u64 + 1))
+        .expect("a file over the limit");
+    let cases = vec![
+        ("a relative path", "export.jsonl".to_string(), "absolute"),
+        ("a directory", dir.path().to_string_lossy().into_owned(), "regular file"),
+        ("a file that is not there", dir.path().join("missing.jsonl").to_string_lossy().into_owned(), "no such file"),
+        ("a file over the limit", too_big.to_string_lossy().into_owned(), "at most"),
+    ];
+    let unreadable = unreadable_file(dir.path()).map(|path| ("a file nobody may read", path, "cannot be read"));
+
+    for (name, path, names) in cases.into_iter().chain(unreadable) {
+        let (status, body) = h.post_json("/v1/imports", json!({ "path": path })).await;
+        assert_eq!(status, 400, "{name}: {body}");
+        assert!(body["error"].as_str().is_some_and(|e| e.contains(names)), "{name}: {body}");
+    }
+    assert_eq!(h.count_of("SELECT COUNT(*) FROM memory_import").await, 0);
+    let id = h.accepted_job(dir.path(), "good.jsonl", &export_file(1), json!({ "dry_run": true })).await;
+    assert_eq!(h.finished_job(id).await["phase"], "done", "no refusal left the slot held");
+}
+
+#[tokio::test]
+async fn a_job_import_refuses_an_unknown_field() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = file_in(dir.path(), "export.jsonl", &export_file(1));
+
+    let (status, body) = h.post_json("/v1/imports", json!({ "path": path, "text": "the export itself" })).await;
+    assert_eq!(status, 400, "a misspelt field is a 400, not the 422 of the Json extractor: {body}");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("text")), "the refusal names the field: {body}");
+
+    let (status, body) = h.post_json("/v1/imports", json!({ "dry_run": true })).await;
+    assert_eq!(status, 400, "a body without a path: {body}");
+    let r = h.authed(h.http.post(h.url("/v1/imports"))).body("{ not json").send().await.expect("request");
+    assert_eq!(r.status(), 400);
+    let id = h.accepted_job(dir.path(), "again.jsonl", &export_file(1), json!({ "dry_run": true })).await;
+    assert_eq!(h.finished_job(id).await["phase"], "done");
+}
+
+#[tokio::test]
+async fn a_job_import_refuses_what_the_synchronous_import_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engram = engram_export(vec![observation("a", Some("app"), "Port", "the daemon listens on 27380")]);
+    // What the request says besides the export, the export, whether a model
+    // is loaded and whether the tokenizer is.
+    let cases: Vec<(&str, Value, String, bool, bool)> = vec![
+        ("a blank agent", json!({ "agent": "  " }), export_file(1), true, false),
+        ("a map_roots without a root", json!({ "map_roots": [["/old", { "project": "x" }]] }), export_file(1), true, false),
+        ("a project_map on a clawg export", json!({ "project_map": [["app", "/work/app"]] }), export_file(1), true, false),
+        ("an unknown source", json!({ "from": "mem0" }), export_file(1), true, false),
+        ("a map_roots on another tool's export", json!({ "from": "engram", "map_roots": [["/old", "/new"]] }), engram.clone(), true, true),
+        ("an unknown version", json!({}), export_file(2), true, false),
+        ("a file with no header", json!({}), String::new(), true, false),
+        ("an unknown project", json!({ "from": "engram", "project_map": [["app", { "project": "nowhere" }]] }), engram.clone(), true, true),
+        ("another tool's export without the tokenizer", json!({ "from": "engram" }), engram.clone(), true, false),
+        ("the same, as a dry run", json!({ "from": "engram", "dry_run": true }), engram.clone(), true, false),
+        ("a real import without a model", json!({}), export_file(1), false, false),
+    ];
+    for (name, fields, text, model, tokenizer) in cases {
+        let h = if model { Harness::start().await } else { Harness::start_without_embedder().await };
+        let h = if tokenizer { h.with_tokenizer() } else { h };
+        both_routes_refuse(&h, dir.path(), name, fields, &text).await;
+    }
+
+    let h = Harness::start().await.with_tokenizer();
+    for id in ["twin-1111", "twin-2222"] {
+        h.ctx
+            .runtime
+            .store
+            .conn
+            .call(move |c| c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, 'Twin', 'user', 1, 1)", [id]))
+            .await
+            .unwrap();
+    }
+    let ambiguous = json!({ "from": "engram", "project_map": [["app", { "project": "twin" }]] });
+    let (status, error) = both_routes_refuse(&h, dir.path(), "a name two projects hold", ambiguous, &engram).await;
+    assert_eq!((status, error.as_str()), (409, Some("project_ambiguous")));
+
+    let h = Harness::start_failed("disk full", false).await;
+    let (status, error) = both_routes_refuse(&h, dir.path(), "a model that failed to load", json!({}), &export_file(1)).await;
+    assert_eq!((status, error.as_str()), (503, Some("embedder_failed")));
+}
+
+/// Sends the same request to both routes, expects one refusal from both and
+/// that it leaves the slot free; answers its status and error.
+async fn both_routes_refuse(h: &Harness, dir: &std::path::Path, name: &str, fields: Value, text: &str) -> (u16, Value) {
+    let (mut by_body, mut by_path) = (fields.clone(), fields);
+    by_body["text"] = json!(text);
+    by_path["path"] = json!(file_in(dir, "case.jsonl", text));
+
+    let (sync_status, sync_body) = h.post_json("/v1/import", by_body).await;
+    let (job_status, job_body) = h.post_json("/v1/imports", by_path).await;
+
+    assert!(sync_status >= 400, "{name}: the synchronous import refuses it: {sync_status} {sync_body}");
+    assert_eq!((job_status, &job_body["error"]), (sync_status, &sync_body["error"]), "{name}: {job_body} / {sync_body}");
+    let id = h.accepted_job(dir, "after.jsonl", &export_file(1), json!({ "dry_run": true })).await;
+    assert_eq!(h.finished_job(id).await["phase"], "done", "{name}: a refusal leaves no job and no reservation");
+    (sync_status, sync_body["error"].clone())
+}
+
+/// How many files the daemon's backups directory holds.
+fn snapshots_of(h: &Harness) -> usize {
+    std::fs::read_dir(clawg_core::paths::backups_dir(&h.ctx.runtime.base_dir)).map(|d| d.count()).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn deleting_a_job_in_embedding_leaves_no_row_no_journal_and_no_snapshot() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(5), json!({})).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+
+    let (status, asked) = h.delete_json(&format!("/v1/imports/{id}")).await;
+    assert_eq!((status, asked["stopping"].as_str(), asked["job_id"].as_u64()), (202, Some("cancel"), Some(id)), "{asked}");
+
+    // The batch the gate holds is never released: the stop does not wait for it.
+    let job = h.finished_job(id).await;
+    assert_eq!((job["phase"].as_str(), job["stopped_in"].as_str()), (Some("cancelled"), Some("embed")), "{job}");
+    assert!(job.get("stopping").is_none() && job.get("report").is_none() && job.get("import_id").is_none(), "{job}");
+    assert_eq!(h.count_of("SELECT COUNT(*) FROM memory").await, 0);
+    assert_eq!(h.count_of("SELECT COUNT(*) FROM memory_import").await, 0);
+    assert_eq!(snapshots_of(&h), 0, "the snapshot comes after the embedding");
+}
+
+#[tokio::test]
+async fn a_delete_on_a_finished_job_changes_nothing() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stopped = h.accepted_job(dir.path(), "one.jsonl", &rows_export(2), json!({})).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+    assert_eq!(h.delete_json(&format!("/v1/imports/{stopped}")).await.0, 202);
+    let cancelled = h.finished_job(stopped).await;
+
+    let (status, again) = h.delete_json(&format!("/v1/imports/{stopped}")).await;
+    assert_eq!((status, &again), (200, &cancelled), "a cancelled job is told as it is, not asked again");
+
+    let finished = h.accepted_job(dir.path(), "two.jsonl", &rows_export(2), json!({ "dry_run": true })).await;
+    let done = h.finished_job(finished).await;
+    let (status, told) = h.delete_json(&format!("/v1/imports/{finished}")).await;
+    assert_eq!((status, &told), (200, &done), "a job that is done is told as it is");
+    assert_eq!(h.finished_job(finished).await, done, "and nothing about it changed");
+
+    let (status, unknown) = h.delete_json("/v1/imports/99").await;
+    assert_eq!(status, 404, "{unknown}");
+    assert!(unknown["error"].as_str().is_some_and(|e| e.contains("99")), "the daemon's own 404 carries a body: {unknown}");
+}
+
+#[tokio::test]
+async fn a_job_outlives_the_client_that_accepted_it() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = file_in(dir.path(), "export.jsonl", &rows_export(3));
+    let id = {
+        // A client of its own, gone as soon as it has its answer.
+        let client = reqwest::Client::new();
+        let accepted = client.post(h.url("/v1/imports")).bearer_auth(&h.token).json(&json!({ "path": path })).send().await.expect("request");
+        assert_eq!(accepted.status(), 202);
+        accepted.json::<Value>().await.expect("json")["job_id"].as_u64().expect("a job id")
+    };
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+    assert_eq!(h.get_json(&format!("/v1/imports/{id}")).await.1["phase"], "embedding");
+
+    gate.release(10);
+    let done = h.finished_job(id).await;
+    assert_eq!((done["phase"].as_str(), done["report"]["inserted"].clone()), (Some("done"), json!(3)), "{done}");
+}
+
+#[tokio::test]
+async fn health_carries_the_active_jobs_import_block_without_the_connection() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(4), json!({})).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+
+    // The store's one connection is held by a call that does not return until told to.
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let store = h.ctx.runtime.store.clone();
+    let hold = tokio::spawn(async move {
+        store
+            .conn
+            .call(move |_| {
+                entered.send(()).ok();
+                released.recv_timeout(Duration::from_secs(30)).ok();
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+    });
+    held.await.expect("the connection is held");
+
+    let started = Instant::now();
+    let r = h.http.get(h.url("/health")).send().await.expect("request");
+    let waited = started.elapsed();
+    assert_eq!(r.status(), 200);
+    let health: Value = r.json().await.expect("json");
+    assert!(waited < Duration::from_secs(5), "health did not wait for the connection: {waited:?}");
+    assert!(health.get("ingest").is_none(), "the outbox counts need the connection: {health}");
+    let block = &health["import"];
+    assert_eq!((block["job_id"].as_u64(), block["phase"].as_str(), block["rows_to_embed"].clone()), (Some(id), Some("embedding"), json!(4)), "{health}");
+    assert!(block.get("report").is_none(), "{health}");
+
+    release.send(()).ok();
+    hold.await.expect("joined").expect("the held call ended");
+    gate.release(10);
+    h.finished_job(id).await;
+}
+
+#[tokio::test]
+async fn health_has_no_import_block_without_an_active_job() {
+    let h = Harness::start().await;
+    let (_, idle) = h.get_json("/health").await;
+    assert!(idle.get("import").is_none(), "{idle}");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(2), json!({ "dry_run": true })).await;
+    h.finished_job(id).await;
+    let (_, after) = h.get_json("/health").await;
+    assert!(after.get("import").is_none(), "a job that ended is not active: {after}");
+}
+
+#[tokio::test]
+async fn a_second_import_job_while_one_runs_is_refused_with_its_id() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = h.accepted_job(dir.path(), "first.jsonl", &export_file(1), json!({})).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+
+    let other = file_in(dir.path(), "other.jsonl", &rows_export(3));
+    let (status, body) = h.post_json("/v1/imports", json!({ "path": other })).await;
+    assert_eq!((status, body["error"].as_str(), body["job_id"].as_u64()), (409, Some("import_running"), Some(first)), "{body}");
+
+    gate.release(10);
+    h.finished_job(first).await;
+    let (status, again) = h.post_json("/v1/imports", json!({ "path": other, "dry_run": true })).await;
+    assert_eq!(status, 202, "a finished job frees the slot: {again}");
+    assert_eq!(again["job_id"], 2, "the refused request took no id");
+}
+
+#[tokio::test]
+async fn a_job_import_checks_the_body_before_the_running_job_and_the_job_before_the_file() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = h.accepted_job(dir.path(), "first.jsonl", &export_file(1), json!({})).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+
+    let path = file_in(dir.path(), "other.jsonl", &export_file(1));
+    let (status, body) = h.post_json("/v1/imports", json!({ "path": path, "agent": " " })).await;
+    assert_eq!((status, body["error"].as_str()), (400, Some("agent must not be blank")), "{body}");
+    let (status, body) = h.post_json("/v1/imports", json!({ "path": dir.path().join("missing.jsonl") })).await;
+    assert_eq!((status, body["error"].as_str(), body["job_id"].as_u64()), (409, Some("import_running"), Some(first)), "the file is not opened: {body}");
+    gate.release(10);
+    h.finished_job(first).await;
+}
+
+#[tokio::test]
+async fn accepting_a_real_job_wakes_the_embedder_and_a_dry_run_does_not() {
+    let h = Harness::start_unloaded(false).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let dry = h.accepted_job(dir.path(), "dry.jsonl", &rows_export(3), json!({ "dry_run": true })).await;
+    h.finished_job(dry).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(h.reloads.load(Ordering::SeqCst), 0, "a dry run needs no model");
+
+    // Nothing in a file without rows asks the model for a vector, so a load
+    // is the wake of the job's acceptance.
+    let real = h.accepted_job(dir.path(), "empty.jsonl", &export_with(&[], &[]), json!({})).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.reloads.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "accepting a real job never woke the model");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    h.finished_job(real).await;
+}
+
+#[tokio::test]
+async fn accepting_a_job_reloads_a_released_model_before_embedding() {
+    let h = Harness::start_unloaded(false).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // The job cannot plan while the store's one connection is held, so it
+    // stays short of embedding and a load can only be the acceptance's.
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let store = h.ctx.runtime.store.clone();
+    let hold = tokio::spawn(async move {
+        store
+            .conn
+            .call(move |_| {
+                entered.send(()).ok();
+                released.recv_timeout(Duration::from_secs(30)).ok();
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+    });
+    held.await.expect("the connection is held");
+
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(3), json!({})).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.reloads.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the model did not load before the job reached embedding");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, job) = h.get_json(&format!("/v1/imports/{id}")).await;
+    assert_ne!(job["phase"], "embedding", "{job}");
+
+    release.send(()).ok();
+    hold.await.expect("hold task").expect("hold call");
+    let done = h.finished_job(id).await;
+    assert_eq!((done["phase"].as_str(), done["report"]["inserted"].clone()), (Some("done"), json!(3)), "{done}");
+    assert_eq!(h.reloads.load(Ordering::SeqCst), 1, "the wake and the embedding share one load");
+}
+
+#[tokio::test]
+async fn a_failing_reload_fails_the_job_without_writing() {
+    let h = Harness::start_unloaded(true).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(3), json!({})).await;
+
+    let failed = h.finished_job(id).await;
+    assert_eq!((failed["phase"].as_str(), failed["error"].as_str()), (Some("failed"), Some("embedder_not_ready")), "{failed}");
+    assert!(failed.get("report").is_none() && failed.get("import_id").is_none(), "{failed}");
+    assert_eq!(h.count_of("SELECT COUNT(*) FROM memory").await, 0);
+    assert_eq!(h.count_of("SELECT COUNT(*) FROM memory_import").await, 0);
+    let snapshots = std::fs::read_dir(clawg_core::paths::backups_dir(&h.ctx.runtime.base_dir)).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(snapshots, 0, "the snapshot comes after the embedding");
+}
+
+#[tokio::test]
+async fn a_job_reports_its_phase_and_rows_embedded_advance_inside_embedding() {
+    let (h, gate) = Harness::start_gated().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(70), json!({})).await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered()).await.expect("the job reached the embedder");
+
+    let job = h.job_until(id, |job| job["phase"] == "embedding").await;
+    assert_eq!((job["rows_to_embed"].clone(), job["rows_embedded"].clone()), (json!(70), json!(0)), "{job}");
+    let mut seen = vec![0];
+    for _ in 0..3 {
+        gate.release(1);
+        let before = *seen.last().unwrap();
+        let job = h.job_until(id, |job| job["rows_embedded"].as_u64().unwrap_or(0) > before || job["phase"] != "embedding").await;
+        seen.push(job["rows_embedded"].as_u64().unwrap());
+        assert!(job["rows_embedded"].as_u64() <= job["rows_to_embed"].as_u64(), "{job}");
+    }
+    assert!(seen.windows(2).all(|pair| pair[0] < pair[1]), "rows_embedded only grows: {seen:?}");
+    gate.release(10);
+    let done = h.finished_job(id).await;
+    assert_eq!((done["rows_embedded"].clone(), done["rows_to_embed"].clone()), (json!(70), json!(70)), "{done}");
+}
+
+#[tokio::test]
+async fn only_the_last_finished_job_is_remembered() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = h.accepted_job(dir.path(), "one.jsonl", &export_file(1), json!({ "dry_run": true })).await;
+    h.finished_job(first).await;
+    let second = h.accepted_job(dir.path(), "two.jsonl", &export_file(1), json!({ "dry_run": true })).await;
+    let done = h.finished_job(second).await;
+
+    let (status, gone) = h.get_json(&format!("/v1/imports/{first}")).await;
+    assert_eq!(status, 404, "{gone}");
+    assert!(done["report"]["rows"].is_u64() && second == first + 1, "{done}");
+}
+
+#[tokio::test]
+async fn an_unknown_job_is_a_404() {
+    let h = Harness::start().await;
+    let (status, body) = h.get_json("/v1/imports/99").await;
+    assert_eq!(status, 404, "{body}");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("99")), "the daemon's own 404 carries a body: {body}");
+}
+
+#[tokio::test]
+async fn a_dry_run_job_ends_done_after_deciding() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = h.accepted_job(dir.path(), "export.jsonl", &rows_export(5), json!({ "dry_run": true })).await;
+
+    let done = h.finished_job(id).await;
+    assert_eq!((done["phase"].as_str(), done["dry_run"].as_bool(), done["report"]["inserted"].clone()), (Some("done"), Some(true), json!(5)), "{done}");
+    assert_eq!((done["rows"].clone(), done["rows_embedded"].clone(), done["rows_written"].clone()), (json!(5), json!(0), json!(0)), "{done}");
+    assert!(done["report"]["snapshot"].is_null() && done.get("import_id").is_none(), "{done}");
+    assert_eq!(h.count_of("SELECT COUNT(*) FROM memory").await, 0);
+}
+
+#[tokio::test]
+async fn a_finished_jobs_counters_match_its_report() {
+    let h = Harness::start().await.with_tokenizer();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engram = engram_export(vec![
+        observation("a", None, "Notes on the ledger", &long_note()),
+        observation("b", None, "Port", "the daemon listens on 27380"),
+    ]);
+    for (name, text, fields) in [("clawg", rows_export(40), json!({})), ("engram", engram, json!({ "from": "engram" }))] {
+        let id = h.accepted_job(dir.path(), "export.jsonl", &text, fields).await;
+        let job = h.finished_job(id).await;
+        assert_eq!(job["phase"], "done", "{name}: {job}");
+        let report = &job["report"];
+        assert_eq!((job["rows"].clone(), job["rows_written"].clone()), (report["rows"].clone(), report["rows"].clone()), "{name}: {job}");
+        assert_eq!(job["rows_embedded"], job["rows_to_embed"], "{name}: {job}");
+        assert_eq!(job["rows_embedded"], report["inserted"], "{name}: no row of the file is deleted: {job}");
+        assert_eq!(job["notes_written"], job["notes"], "{name}: {job}");
+        assert_eq!(job["import_id"], report["import_id"], "{name}: {job}");
+        if name == "engram" {
+            assert!(job["notes"].as_u64() < job["rows"].as_u64(), "a long note is one note and many rows: {job}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_report_of_a_job_equals_the_report_of_the_synchronous_import() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engram = engram_export(vec![
+        observation("a", None, "Notes on the ledger", &long_note()),
+        observation("b", None, "Port", "the daemon listens on 27380"),
+    ]);
+    let unmarked = |mut report: Value| {
+        report["snapshot"] = Value::Null;
+        report
+    };
+    for (name, text, fields) in [("clawg", rows_export(40), json!({ "agent": "b" })), ("engram", engram, json!({ "from": "engram" }))] {
+        let (by_body, by_path) = (Harness::start().await.with_tokenizer(), Harness::start().await.with_tokenizer());
+        let mut body = fields.clone();
+        body["text"] = json!(text);
+        let (status, synchronous) = by_body.post_json("/v1/import", body).await;
+        assert_eq!(status, 200, "{name}: {synchronous}");
+
+        let id = by_path.accepted_job(dir.path(), "export.jsonl", &text, fields).await;
+        let job = by_path.finished_job(id).await;
+        assert!(synchronous["snapshot"].is_string() && job["report"]["snapshot"].is_string(), "{name}");
+        assert_eq!(unmarked(job["report"].clone()), unmarked(synchronous), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn the_job_route_has_no_body_limit_sized_for_the_file() {
+    let h = Harness::start().await;
+    let (status, body) = h.post_json("/v1/import", json!({ "text": "x".repeat(3 * 1024 * 1024) })).await;
+    assert_eq!(status, 400, "the synchronous route takes an export of that size in its body: {body}");
+
+    let padded = json!({ "path": "x".repeat(3 * 1024 * 1024) });
+    let refused = h.authed(h.http.post(h.url("/v1/imports"))).json(&padded).send().await;
+    // The daemon may close the connection while the client is still sending.
+    match refused {
+        Ok(r) => assert_eq!(r.status(), 413, "the body carries a path, so it keeps axum's default limit"),
+        Err(e) => assert!(e.is_request(), "{e}"),
+    }
+}
+
+#[tokio::test]
+async fn the_job_routes_require_the_guard_and_the_token() {
+    let h = Harness::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body = json!({ "path": file_in(dir.path(), "export.jsonl", &export_file(1)), "dry_run": true });
+    let foreign = format!("evil.example:{}", h.addr.port());
+    let requests = |http: &reqwest::Client| {
+        [http.post(h.url("/v1/imports")).json(&body), http.get(h.url("/v1/imports/1")), http.delete(h.url("/v1/imports/1"))]
+    };
+
+    for request in requests(&h.http) {
+        let r = request.send().await.expect("request");
+        assert_eq!(r.status(), 401, "no token");
+    }
+    for request in requests(&h.http) {
+        let r = request.bearer_auth("not-the-token").send().await.expect("request");
+        assert_eq!(r.status(), 401, "the wrong token");
+    }
+    for request in requests(&h.http) {
+        let r = request.bearer_auth(&h.token).header("host", &foreign).send().await.expect("request");
+        assert_eq!((r.status().as_u16(), r.json::<Value>().await.expect("json")), (403, json!({ "error": "forbidden" })), "a foreign host");
+    }
+    for request in requests(&h.http) {
+        let r = request.bearer_auth(&h.token).header("origin", "http://evil.example").send().await.expect("request");
+        assert_eq!(r.status(), 403, "an origin");
+    }
+    let (status, accepted) = h.post_json("/v1/imports", body).await;
+    assert_eq!(status, 202, "with the token and a loopback host: {accepted}");
 }
 
 /// A clawg export of another store: `project_lines`, then one row of each
@@ -4155,6 +4834,7 @@ async fn an_unkeyed_save_names_the_row_a_key_would_revise() {
 /// The `http.duration` series of the run, as label strings with their count.
 fn http_durations(h: &Harness) -> Vec<(String, u64)> {
     h.ctx
+        .runtime
         .metrics
         .run()
         .iter()
@@ -4181,16 +4861,66 @@ async fn every_request_is_timed_by_route_status_and_transport() {
     assert_eq!(count_of(&series, "method=POST,route=/v1/search,status=2xx,transport=tcp"), 1, "{series:?}");
     assert_eq!(count_of(&series, "method=GET,route=/v1/memories/{kind}/{id},status=4xx,transport=tcp"), 1, "{series:?}");
 
-    let run = h.ctx.metrics.run();
+    let run = h.ctx.runtime.metrics.run();
     let bytes = run
         .iter()
         .find(|(key, _)| key.name == "http.request_bytes" && key.labels == "method=POST,route=/v1/search")
         .map(|(_, histogram)| histogram.clone())
         .expect("the size of the search is recorded");
     assert!(bytes.max() > 0, "the size comes from Content-Length");
-    let minute = h.ctx.metrics.minute();
+    let minute = h.ctx.runtime.metrics.minute();
     let in_flight = minute.gauges.iter().find(|(key, _)| key.name == "http.in_flight").expect("in flight").1;
     assert!(in_flight.max >= 1.0 && in_flight.last == 0.0, "{in_flight:?}");
+}
+
+/// The samples and the last value of a gauge of the minute in progress.
+fn gauge_of(h: &Harness, name: &str, labels: &[(&str, &str)]) -> Option<(u64, f64)> {
+    let key = clawg_core::metrics::SeriesKey::new(name, labels);
+    h.ctx.runtime.metrics.minute().gauges.get(&key).map(|g| (g.count, g.last))
+}
+
+#[tokio::test]
+async fn a_search_records_its_arms_its_hits_and_what_it_withheld() {
+    let h = Harness::start().await;
+    save_id(&h, json!({ "content": ENGLISH_NOTE, "agent_id": "a" })).await;
+    let (status, body) = h.post_json("/v1/search", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(status, 200, "{body}");
+
+    let shown = body["hits"].as_array().unwrap().len() as f64;
+    let withheld = body["withheld"].as_f64().unwrap();
+    assert_eq!(gauge_of(&h, "search.hits", &[]), Some((1, shown)));
+    assert_eq!(gauge_of(&h, "search.withheld", &[]), Some((1, withheld)));
+}
+
+#[tokio::test]
+async fn a_context_records_its_state_its_size_and_the_blocks_it_cut() {
+    let h = Harness::start().await;
+    for n in 0..3 {
+        let content = format!("Note {n}: {}", "the deploy script lives in ops and runs after every merge. ".repeat(6));
+        save_id(&h, json!({ "content": content, "agent_id": "a" })).await;
+    }
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "a", "budget": 600 })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["retrieval"]["state"], "recent", "{body}");
+    let (_, body_searched) = h.post_json("/v1/context", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(body_searched["retrieval"]["state"], "searched", "{body_searched}");
+
+    assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "recent")]), Some((1, 1.0)));
+    assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "searched")]), Some((1, 1.0)));
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "recent")]), Some((1, 1.0)), "only the first context was cut");
+    assert_eq!(gauge_of(&h, "context.cut", &[("block", "long_term")]), None);
+
+    let run = h.ctx.runtime.metrics.run();
+    let bytes = &run[&clawg_core::metrics::SeriesKey::new("context.prompt_bytes", &[])];
+    assert_eq!(bytes.count(), 2);
+    assert_eq!(
+        bytes.max(),
+        [&body, &body_searched].iter().map(|b| b["prompt"].as_str().unwrap().len() as u64).max().unwrap()
+    );
+
+    let h = Harness::start_without_embedder().await;
+    h.post_json("/v1/context", json!({ "query": "deploy", "agent_id": "a" })).await;
+    assert_eq!(gauge_of(&h, "context.retrieval_state", &[("state", "embedder_not_ready")]), Some((1, 1.0)));
 }
 
 #[tokio::test]
@@ -4235,7 +4965,7 @@ async fn no_label_comes_from_the_request() {
         .await
         .expect("request");
 
-    let labels: Vec<String> = h.ctx.metrics.run().keys().map(|key| key.labels.clone()).collect();
+    let labels: Vec<String> = h.ctx.runtime.metrics.run().keys().map(|key| key.labels.clone()).collect();
     for label in &labels {
         for leaked in ["424242", "secretagent", "zebra", "qwerty", "nowhere", "BREW"] {
             assert!(!label.contains(leaked), "{label} carries {leaked}");
@@ -4544,6 +5274,10 @@ const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
     // projects another tool's projects are mapped to.
     ("POST", "/import", Some("body.project_map[].project")),
     ("POST", "/import/undo", None),
+    // The same, for the file at a path, which a job imports.
+    ("POST", "/imports", Some("body.project_map[].project")),
+    ("GET", "/imports/{id}", None),
+    ("DELETE", "/imports/{id}", None),
     // A root, whose project the registration follows.
     ("POST", "/projects", None),
     ("GET", "/projects", None),
@@ -4748,6 +5482,20 @@ async fn every_route_that_takes_a_project_follows_a_merge() {
                 let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated&limit=10").await;
                 let id = ids_in(&listed["items"])[0];
                 assert_eq!(project_of(&h, id).await, json!(web), "{route}");
+            }
+            ("POST", "/imports") => {
+                h.ctx.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+                let text = engram_export(vec![observation("merged-job-map", Some("notes"), "Port", "the job mapped service listens on 7071")]);
+                let dir = tempfile::tempdir().expect("tempdir");
+                let id = h.accepted_job(dir.path(), "merged.json", &text, json!({ "from": "engram", "project_map": [["notes", { "project": app }]] })).await;
+                let done = h.finished_job(id).await;
+                assert_eq!(done["phase"], "done", "{route}: {done}");
+                let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated&limit=10").await;
+                let ids = ids_in(&listed["items"]);
+                assert!(ids.len() >= 2, "{route}: {listed}");
+                for id in ids {
+                    assert_eq!(project_of(&h, id).await, json!(web), "{route}");
+                }
             }
             _ => panic!("{route} takes a project and no check here follows it past a merge"),
         }
@@ -5176,6 +5924,19 @@ async fn every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule() {
                     let (status, body) = h.post_json("/v1/import", ask).await;
                     refused(&route, status, &body);
                 }
+            }
+            ("POST", "/imports") => {
+                h.ctx.runtime.tokenizer.set(clawg_core::memory::chunker::word_tokenizer()).ok();
+                let text = engram_export(vec![observation("deleted-job-map", Some("notes"), "Port", "a note of a job for a deleted project")]);
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = file_in(dir.path(), "deleted.json", &text);
+                for dry_run in [true, false] {
+                    let ask = json!({ "path": path, "from": "engram", "dry_run": dry_run, "project_map": [["notes", { "project": gone }]] });
+                    let (status, body) = h.post_json("/v1/imports", ask).await;
+                    refused(&route, status, &body);
+                }
+                let id = h.accepted_job(dir.path(), "after.jsonl", &export_file(1), json!({ "dry_run": true })).await;
+                assert_eq!(h.finished_job(id).await["phase"], "done", "{route}: a refusal leaves no job");
             }
             _ => panic!("{route} takes a project and no check here says what it does with a deleted one"),
         }

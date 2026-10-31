@@ -21,7 +21,7 @@ use futures::future::BoxFuture;
 use tokio::time::Instant;
 
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
-use crate::metrics::{mib, MemoryProbe};
+use crate::metrics::{mib, EventKind, MemoryProbes, Recorder};
 
 /// Loads the model again: the same files and the same load the bootstrap used.
 pub type ReloadFn =
@@ -69,6 +69,14 @@ fn sweep_period(idle: Duration) -> Duration {
     (idle / 4).clamp(Duration::from_secs(1), Duration::from_secs(60))
 }
 
+/// What loads are watched with: the private memory around each, when the
+/// daemon gave a way to read it, and the recorder their events go to.
+#[derive(Clone, Default)]
+pub struct LoadWatch {
+    pub memory: Option<MemoryProbes>,
+    pub metrics: Arc<Recorder>,
+}
+
 /// Who asked for a load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cause {
@@ -80,16 +88,41 @@ enum Cause {
     Recovery,
 }
 
+impl Cause {
+    /// The cause as a `model_load` event names it.
+    fn as_str(self) -> &'static str {
+        match self {
+            Cause::Wake => "wake",
+            Cause::Call => "call",
+            Cause::Recovery => "recovery",
+        }
+    }
+}
+
 /// The line a load logs: who asked, how long it took and the private memory
-/// around it, when the daemon gave a way to read it.
-fn load_line(cause: Cause, took: Duration, memory: Option<(u64, u64)>) -> String {
+/// around it and the process's private peak before and after, when the daemon
+/// gave a way to read them. The peak is the process's in the load's window,
+/// so a task running meanwhile may be the one that raised it.
+fn load_line(cause: Cause, took: Duration, memory: Option<(u64, u64)>, peak: Option<(u64, u64)>) -> String {
     let asked = match cause {
         Cause::Wake => "for a wake",
         Cause::Call => "for a call that embeds",
         Cause::Recovery => "for a call that found its worker gone",
     };
     let memory = memory.map(|(before, after)| format!("; private memory {} before, {} after", mib(before), mib(after)));
-    format!("embedding model loaded again in {} ms {asked}{}", took.as_millis(), memory.unwrap_or_default())
+    let peak = peak.map(|(before, after)| {
+        if after > before {
+            format!("; private peak rose to {}", mib(after))
+        } else {
+            format!("; private peak stayed at {}, set before this load", mib(before))
+        }
+    });
+    format!(
+        "embedding model loaded again in {} ms {asked}{}{}",
+        took.as_millis(),
+        memory.unwrap_or_default(),
+        peak.unwrap_or_default()
+    )
 }
 
 /// What the sweeper did when the model went.
@@ -122,7 +155,8 @@ struct Shared {
     /// Read by health without waiting on a load that holds `model`.
     resident: AtomicBool,
     reload: ReloadFn,
-    memory: Option<MemoryProbe>,
+    memory: Option<MemoryProbes>,
+    metrics: Arc<Recorder>,
     dimensions: usize,
     model_id: String,
     query_prefix: String,
@@ -164,9 +198,18 @@ impl Shared {
             slot.recovering = false;
             slot.last_recovery = Some(now);
         }
-        let before = self.memory.and_then(|read| read());
+        let before = self.memory.and_then(|probes| (probes.private)());
+        let peak_before = self.memory.and_then(|probes| (probes.private_peak)());
         let started = std::time::Instant::now();
-        let model = match (self.reload)().await.and_then(|model| self.same_model(model)) {
+        let loaded = (self.reload)().await.and_then(|model| self.same_model(model));
+        let took = started.elapsed();
+        let ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        let outcome = if loaded.is_ok() { "loaded" } else { "failed" };
+        self.metrics.event(
+            EventKind::ModelLoad,
+            &[("cause", cause.as_str().into()), ("outcome", outcome.into()), ("ms", ms.into())],
+        );
+        let model = match loaded {
             Ok(model) => model,
             Err(e) => {
                 // Not ready rather than failed: the save that asked stays
@@ -175,9 +218,9 @@ impl Shared {
                 return Err(EmbedError::NotReady);
             }
         };
-        let took = started.elapsed();
-        let after = self.memory.and_then(|read| read());
-        log::info!("{}", load_line(cause, took, before.zip(after)));
+        let after = self.memory.and_then(|probes| (probes.private)());
+        let peak_after = self.memory.and_then(|probes| (probes.private_peak)());
+        log::info!("{}", load_line(cause, took, before.zip(after), peak_before.zip(peak_after)));
         slot.model = Some(model.clone());
         slot.woken_at = (cause == Cause::Wake).then(Instant::now);
         self.resident.store(true, Ordering::Release);
@@ -192,6 +235,7 @@ impl Shared {
             return;
         }
         log::warn!("the embedding model's inference worker is gone; the model is dropped and loaded again");
+        self.metrics.event(EventKind::EmbedderRecovery, &[]);
         self.resident.store(false, Ordering::Release);
         slot.model = None;
         slot.recovering = true;
@@ -243,6 +287,10 @@ impl Shared {
         let unloaded = Unloaded { woken_unused: slot.woken_at.take().is_some() };
         let unused = if unloaded.woken_unused { "; no call used it after the wake that loaded it" } else { "" };
         log::info!("embedding model unloaded after {} s without use{unused}", idle.as_secs());
+        self.metrics.event(
+            EventKind::ModelUnload,
+            &[("idle_s", idle.as_secs().into()), ("woken_unused", unloaded.woken_unused.into())],
+        );
         Some(unloaded)
     }
 }
@@ -257,12 +305,13 @@ impl IdleEmbedder {
     /// `runtime` the sweeper that unloads it once it sat `idle` unused. The
     /// sweeper ends when the embedder is dropped. With no `idle` there is no
     /// sweeper and the model only goes when its worker does. Each load logs
-    /// the private memory `memory` reads before and after it.
+    /// the private memory and peak `watch` reads before and after it, and
+    /// each load, unload and recovery is an event of `watch`'s recorder.
     pub fn new(
         loaded: Arc<dyn Embedder>,
         reload: ReloadFn,
         idle: Option<Duration>,
-        memory: Option<MemoryProbe>,
+        watch: LoadWatch,
         runtime: &tokio::runtime::Handle,
     ) -> Self {
         let shared = Arc::new(Shared {
@@ -279,7 +328,8 @@ impl IdleEmbedder {
             usage: SyncMutex::new(Usage { last_used: Instant::now(), in_flight: 0 }),
             resident: AtomicBool::new(true),
             reload,
-            memory,
+            memory: watch.memory,
+            metrics: watch.metrics,
         });
         let Some(idle) = idle else { return Self { shared } };
         let weak = Arc::downgrade(&shared);
@@ -376,7 +426,7 @@ mod tests {
     }
 
     fn idle_embedder(loads: Arc<AtomicUsize>) -> IdleEmbedder {
-        IdleEmbedder::new(fake(), counting_reload(loads), Some(IDLE), None, &tokio::runtime::Handle::current())
+        IdleEmbedder::new(fake(), counting_reload(loads), Some(IDLE), LoadWatch::default(), &tokio::runtime::Handle::current())
     }
 
     async fn pass(duration: Duration) {
@@ -490,7 +540,7 @@ mod tests {
             Arc::new(Slow),
             reload,
             Some(IDLE),
-            None,
+            LoadWatch::default(),
             &tokio::runtime::Handle::current(),
         ));
         let call = tokio::spawn({
@@ -520,7 +570,7 @@ mod tests {
                 })
             })
         };
-        let embedder = IdleEmbedder::new(fake(), reload, Some(IDLE), None, &tokio::runtime::Handle::current());
+        let embedder = IdleEmbedder::new(fake(), reload, Some(IDLE), LoadWatch::default(), &tokio::runtime::Handle::current());
         pass(IDLE * 2).await;
 
         let first = embedder.embed_with_role("a text", EmbedRole::Query).await;
@@ -552,7 +602,7 @@ mod tests {
             }
         }
         let reload: ReloadFn = Arc::new(|| Box::pin(async { Ok(Arc::new(Other) as Arc<dyn Embedder>) }));
-        let embedder = IdleEmbedder::new(fake(), reload, Some(IDLE), None, &tokio::runtime::Handle::current());
+        let embedder = IdleEmbedder::new(fake(), reload, Some(IDLE), LoadWatch::default(), &tokio::runtime::Handle::current());
         pass(IDLE * 2).await;
 
         let result = embedder.embed_with_role("a text", EmbedRole::Query).await;
@@ -603,7 +653,7 @@ mod tests {
     /// a test runs the sweep itself.
     async fn unswept() -> IdleEmbedder {
         let embedder =
-            IdleEmbedder::new(fake(), counting_reload(Arc::new(AtomicUsize::new(0))), None, None, &tokio::runtime::Handle::current());
+            IdleEmbedder::new(fake(), counting_reload(Arc::new(AtomicUsize::new(0))), None, LoadWatch::default(), &tokio::runtime::Handle::current());
         embedder.unload().await;
         embedder
     }
@@ -634,26 +684,85 @@ mod tests {
     #[test]
     fn a_load_names_who_asked_and_the_memory_around_it() {
         assert_eq!(
-            load_line(Cause::Wake, Duration::from_millis(9_234), Some((297_795_584, 775_946_240))),
+            load_line(Cause::Wake, Duration::from_millis(9_234), Some((297_795_584, 775_946_240)), None),
             "embedding model loaded again in 9234 ms for a wake; private memory 284.0 MiB before, 740.0 MiB after"
         );
-        assert_eq!(load_line(Cause::Call, Duration::from_millis(12), None), "embedding model loaded again in 12 ms for a call that embeds");
-        assert!(load_line(Cause::Recovery, Duration::ZERO, None).ends_with("for a call that found its worker gone"));
+        assert_eq!(load_line(Cause::Call, Duration::from_millis(12), None, None), "embedding model loaded again in 12 ms for a call that embeds");
+        assert!(load_line(Cause::Recovery, Duration::ZERO, None, None).ends_with("for a call that found its worker gone"));
+    }
+
+    const MIB: u64 = 1_048_576;
+
+    #[test]
+    fn a_load_line_names_the_peak_when_the_load_raised_it() {
+        let line = load_line(
+            Cause::Wake,
+            Duration::from_millis(9_234),
+            Some((297_795_584, 775_946_240)),
+            Some((1_000 * MIB, 1_600 * MIB)),
+        );
+        assert_eq!(
+            line,
+            "embedding model loaded again in 9234 ms for a wake; private memory 284.0 MiB before, 740.0 MiB after; private peak rose to 1600.0 MiB"
+        );
+    }
+
+    #[test]
+    fn a_load_line_says_when_the_load_did_not_pass_the_peak() {
+        let line = load_line(
+            Cause::Call,
+            Duration::from_millis(1_102),
+            Some((300 * MIB, 760 * MIB)),
+            Some((1_622 * MIB, 1_622 * MIB)),
+        );
+        assert!(line.ends_with("; private peak stayed at 1622.0 MiB, set before this load"), "{line}");
+    }
+
+    #[test]
+    fn a_load_line_without_a_peak_probe_is_unchanged() {
+        let memory = Some((297_795_584, 775_946_240));
+        let today = "embedding model loaded again in 9234 ms for a wake; private memory 284.0 MiB before, 740.0 MiB after";
+        assert_eq!(load_line(Cause::Wake, Duration::from_millis(9_234), memory, None), today);
+        assert_eq!(
+            load_line(Cause::Call, Duration::from_millis(12), None, None),
+            "embedding model loaded again in 12 ms for a call that embeds"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn with_no_idle_time_the_model_stays_and_a_dead_worker_is_still_recovered() {
         let loads = Arc::new(AtomicUsize::new(0));
         let embedder =
-            IdleEmbedder::new(fake(), counting_reload(loads.clone()), None, None, &tokio::runtime::Handle::current());
+            IdleEmbedder::new(fake(), counting_reload(loads.clone()), None, LoadWatch::default(), &tokio::runtime::Handle::current());
         pass(IDLE * 100).await;
         assert!(embedder.resident());
         assert_eq!(loads.load(Ordering::SeqCst), 0);
 
         let embedder =
-            IdleEmbedder::new(dead(), counting_reload(loads.clone()), None, None, &tokio::runtime::Handle::current());
+            IdleEmbedder::new(dead(), counting_reload(loads.clone()), None, LoadWatch::default(), &tokio::runtime::Handle::current());
         embedder.embed_with_role("a text", EmbedRole::Query).await.expect("recovered");
         assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_load_unload_and_recovery_is_an_event() {
+        let kinds = |watch: &LoadWatch| {
+            watch.metrics.take_events().iter().map(|e| (e.kind.as_str(), e.detail.get("cause").copied())).collect::<Vec<_>>()
+        };
+        let label = |l: &'static str| Some(crate::metrics::DetailValue::Label(l));
+        let watch = LoadWatch::default();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let embedder =
+            IdleEmbedder::new(fake(), counting_reload(loads.clone()), Some(IDLE), watch.clone(), &tokio::runtime::Handle::current());
+        pass(IDLE * 2).await;
+        embedder.embed_with_role("a text", EmbedRole::Query).await.unwrap();
+        assert_eq!(kinds(&watch), [("model_unload", None), ("model_load", label("call"))]);
+
+        let watch = LoadWatch::default();
+        let embedder =
+            IdleEmbedder::new(dead(), counting_reload(loads.clone()), None, watch.clone(), &tokio::runtime::Handle::current());
+        embedder.embed_with_role("a text", EmbedRole::Query).await.unwrap();
+        assert_eq!(kinds(&watch), [("embedder_recovery", None), ("model_load", label("recovery"))]);
     }
 
     /// A model whose inference worker is gone. With a barrier, each call
@@ -690,7 +799,7 @@ mod tests {
     async fn a_model_whose_worker_is_gone_is_loaded_again_within_the_call() {
         let loads = Arc::new(AtomicUsize::new(0));
         let embedder =
-            IdleEmbedder::new(dead(), counting_reload(loads.clone()), Some(IDLE), None, &tokio::runtime::Handle::current());
+            IdleEmbedder::new(dead(), counting_reload(loads.clone()), Some(IDLE), LoadWatch::default(), &tokio::runtime::Handle::current());
 
         let vector = embedder.embed_with_role("a text", EmbedRole::Query).await.expect("the call recovers");
         assert_eq!(vector, fake().embed_with_role("a text", EmbedRole::Query).await.unwrap());
@@ -708,7 +817,7 @@ mod tests {
             Arc::new(Dead(Some(both_hold_it))),
             counting_reload(loads.clone()),
             Some(IDLE),
-            None,
+            LoadWatch::default(),
             &tokio::runtime::Handle::current(),
         ));
 
@@ -733,7 +842,7 @@ mod tests {
                 Box::pin(async { Ok(dead()) })
             })
         };
-        let embedder = IdleEmbedder::new(dead(), reload, Some(IDLE), None, &tokio::runtime::Handle::current());
+        let embedder = IdleEmbedder::new(dead(), reload, Some(IDLE), LoadWatch::default(), &tokio::runtime::Handle::current());
         let call = || embedder.embed_with_role("a text", EmbedRole::Query);
 
         let first = call().await;

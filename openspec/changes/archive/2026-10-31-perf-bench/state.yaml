@@ -1,0 +1,18 @@
+change: perf-bench
+objective: "transversal"
+depends_on: [usage-metrics, pipeline-metrics]
+phase: archived
+release: "0.70.0"
+artifacts:
+  exploration: done
+  proposal: done
+  spec: done  # PB1 a PB8, una sección nueva en specs/eval
+  design: done
+  tasks: done
+  apply: done
+  verify: done  # PASS WITH WARNINGS (verify.md): el mínimo de muestras subió a 40; sin modelo real ni release
+  archive: done
+after_archive:  # fuera del cambio
+  - "las puertas de 57 y 62 corren el banco con el modelo real y --release, con autorización"
+updated: 2026-10-31
+main_spec: openspec/specs/eval/spec.md

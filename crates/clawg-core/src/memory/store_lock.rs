@@ -221,8 +221,8 @@ mod tests {
     use super::*;
     use crate::paths::{store_lock_file, store_owner_file};
 
-    fn tmp() -> tempfile::TempDir {
-        tempfile::tempdir().expect("tempdir")
+    fn tmp() -> crate::test_dir::TestDir {
+        crate::test_dir::test_dir()
     }
 
     #[test]

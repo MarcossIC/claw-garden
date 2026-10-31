@@ -59,8 +59,24 @@ pub struct CorpusRow {
 #[serde(deny_unknown_fields)]
 pub struct RetrievalCase {
     pub query: String,
+    /// Absent in a case that cites its save by origin, which names no row of
+    /// the corpus.
+    #[serde(default)]
     pub corpus_refs: Vec<String>,
+    #[serde(default)]
     pub expected_refs: Vec<String>,
+    /// The saves the case expects in a `--background` store, each by the
+    /// `created_by_ref` its import recorded (`engram:<sync_id>`): ids and
+    /// pieces change from one import of an export to the next, the origin does
+    /// not. A hit on any piece of such a save finds it.
+    #[serde(default)]
+    pub expected_origins: Vec<String>,
+    /// The project the case is asked from, by the name it has in a
+    /// `--background` store (an id is read too): the search reads its rows,
+    /// the rows without one and every `user_preference`. Absent, the search
+    /// reads every project.
+    #[serde(default)]
+    pub project: Option<String>,
     #[serde(default)]
     pub status: CaseStatus,
     #[serde(default)]
@@ -196,6 +212,11 @@ impl RefMap {
     pub fn ref_of(&self, id: i64) -> Option<&str> {
         self.to_ref.get(&id).map(String::as_str)
     }
+
+    /// Every seeded id, in no particular order.
+    pub fn ids(&self) -> Vec<i64> {
+        self.to_ref.keys().copied().collect()
+    }
 }
 
 /// Everything that can make a golden set unusable, each carrying the exact
@@ -258,6 +279,12 @@ pub enum GoldenError {
 
     #[error("E_UPDATE_NOT_NEWER: update case '{query}' expects a row no newer than its stale row '{stale_ref}'")]
     UpdateNotNewer { query: String, stale_ref: String },
+
+    #[error("E_ORIGIN_WITH_REFS: retrieval_case '{0}' cites its save by origin and also names rows of the corpus")]
+    OriginWithRefs(String),
+
+    #[error("E_NEEDS_BACKGROUND: retrieval_case '{0}' names a project or an origin, which only a --background store holds")]
+    NeedsBackground(String),
 }
 
 /// A validated golden set paired with the SHA-256 of the exact bytes it was
@@ -345,10 +372,15 @@ pub fn validate(golden: &GoldenSet) -> Result<(), GoldenError> {
             }
         }
 
+        let by_origin = !case.expected_origins.is_empty();
+        if by_origin && !(case.corpus_refs.is_empty() && case.expected_refs.is_empty() && case.stale_refs.is_empty()) {
+            return Err(GoldenError::OriginWithRefs(case.query.clone()));
+        }
+
         // `recall_at_k` scores an empty expectation as a total miss, so a case
         // without one would drag every aggregate down; only the class that
         // stays out of them may have it.
-        match (case.subset == CaseSubset::Unanswerable, case.expected_refs.is_empty()) {
+        match (case.subset == CaseSubset::Unanswerable, case.expected_refs.is_empty() && !by_origin) {
             (true, false) => return Err(GoldenError::UnanswerableExpects(case.query.clone())),
             (false, true) => return Err(GoldenError::NoExpected(case.query.clone())),
             _ => {}
@@ -362,6 +394,16 @@ pub fn validate(golden: &GoldenSet) -> Result<(), GoldenError> {
     }
 
     Ok(())
+}
+
+/// The first case that names a project or an origin, which only a store from
+/// `--background` can resolve.
+pub fn needs_background(golden: &GoldenSet) -> Option<&str> {
+    golden
+        .retrieval_cases
+        .iter()
+        .find(|c| c.project.is_some() || !c.expected_origins.is_empty())
+        .map(|c| c.query.as_str())
 }
 
 /// An `update` case names one newer row and the older rows it restates; no
@@ -420,6 +462,51 @@ mod tests {
             r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": ["c1"]}"#,
             case,
         ))
+    }
+
+    // --- cases by origin ------------------------------------------------
+
+    #[test]
+    fn a_case_may_cite_its_expected_save_by_origin() {
+        let golden = with_case(r#"{"query": "q1", "expected_origins": ["engram:ferry"], "project": "App"}"#);
+
+        assert!(validate(&golden).is_ok());
+        let case = &golden.retrieval_cases[0];
+        assert_eq!(case.expected_origins, vec!["engram:ferry".to_string()]);
+        assert_eq!(case.project.as_deref(), Some("App"));
+        assert!(case.corpus_refs.is_empty() && case.expected_refs.is_empty());
+        assert!(serde_json::from_str::<GoldenSet>(&VALID_MINIMAL.replace(
+            r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": ["c1"]}"#,
+            r#"{"query": "q1", "expected_origin": ["engram:ferry"]}"#,
+        ))
+        .is_err(), "a misspelled key is still a parse error");
+    }
+
+    #[test]
+    fn an_origin_case_cannot_also_carry_corpus_refs() {
+        for case in [
+            r#"{"query": "q1", "corpus_refs": ["c1"], "expected_origins": ["engram:x"]}"#,
+            r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": ["c1"], "expected_origins": ["engram:x"]}"#,
+            r#"{"query": "q1", "corpus_refs": ["c1"], "stale_refs": ["c1"], "expected_origins": ["engram:x"], "subset": "update"}"#,
+        ] {
+            assert!(matches!(validate(&with_case(case)), Err(GoldenError::OriginWithRefs(q)) if q == "q1"), "{case}");
+        }
+        let unanswerable = with_case(r#"{"query": "q1", "expected_origins": ["engram:x"], "subset": "unanswerable"}"#);
+        assert!(matches!(validate(&unanswerable), Err(GoldenError::UnanswerableExpects(_))));
+        let nothing = with_case(r#"{"query": "q1"}"#);
+        assert!(matches!(validate(&nothing), Err(GoldenError::NoExpected(_))));
+        let named = with_case(r#"{"query": "q1", "subset": "unanswerable", "project": "App"}"#);
+        assert!(validate(&named).is_ok(), "an unanswerable case may name a project");
+    }
+
+    #[test]
+    fn a_case_that_reads_a_store_needs_a_background() {
+        let plain = parse_only(VALID_MINIMAL);
+        assert!(needs_background(&plain).is_none());
+        let origin = with_case(r#"{"query": "q1", "expected_origins": ["engram:x"]}"#);
+        assert_eq!(needs_background(&origin), Some("q1"));
+        let project = with_case(r#"{"query": "q1", "corpus_refs": ["c1"], "expected_refs": ["c1"], "project": "App"}"#);
+        assert_eq!(needs_background(&project), Some("q1"));
     }
 
     #[test]

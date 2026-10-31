@@ -496,19 +496,26 @@ pub fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The `-wal` beside `path` when it holds commits, read from its size alone:
+/// the file it sits beside lacks them, so a copy of that file alone is not the
+/// store that wrote them.
+pub(crate) fn wal_with_commits(path: &Path) -> Option<PathBuf> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0).then_some(wal)
+}
+
 /// Whether `path` is a whole clawg store this binary can open, read without
-/// writing to it.
-fn check_restorable(path: &Path) -> Result<(), BackupError> {
+/// writing to it, and what opening it would do to its schema.
+pub(crate) fn check_restorable(path: &Path) -> Result<SchemaPlan, BackupError> {
     let unusable = |reason: String| BackupError::Unusable { path: path.to_path_buf(), reason };
     if !path.is_file() {
         return Err(unusable("there is no such file".into()));
     }
     // Opened here, the file reads with its WAL folded in, but only the file is
     // copied in: what the WAL holds would pass every check and then be gone.
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    let wal = PathBuf::from(wal);
-    if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+    if let Some(wal) = wal_with_commits(path) {
         return Err(unusable(format!(
             "{} beside it holds commits the file alone does not have, and only the file is restored; \
              restore a snapshot `clawg backup` wrote, or copy the store again with nothing using it",
@@ -536,7 +543,7 @@ fn check_restorable(path: &Path) -> Result<(), BackupError> {
         SchemaPlan::Diverged { version } => Err(unusable(format!(
             "its migration V{version} does not match this clawg build"
         ))),
-        SchemaPlan::UpToDate | SchemaPlan::Pending { .. } => Ok(()),
+        plan @ (SchemaPlan::UpToDate | SchemaPlan::Pending { .. }) => Ok(plan),
     }
 }
 
@@ -728,7 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_snapshot_includes_writes_still_in_the_wal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         insert(&store, "only in the wal").await;
         let wal = dir.path().join("memory.db-wal");
@@ -748,7 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_snapshot_keeps_vectors_and_full_text_searchable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let id = insert(&store, "a searchable sentence about lighthouses").await;
         store
@@ -832,7 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_automatic_snapshot_prunes_older_automatic_ones() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let backups = dir.path().join("backups");
         std::fs::create_dir_all(&backups).unwrap();
         let (auto, manual) = auto_and_manual_names();
@@ -865,7 +872,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_offline_backup_copies_without_migrating() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(7)).await;
 
         let path = backup_offline(dir.path()).unwrap();
@@ -879,7 +886,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_offline_backup_refuses_a_held_store() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         let _daemon = StoreLock::acquire(dir.path(), StoreHolder::Daemon).unwrap();
 
@@ -894,7 +901,7 @@ mod tests {
 
     #[test]
     fn an_offline_backup_of_nothing_says_so() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         for base in [dir.path().to_path_buf(), dir.path().join("never-created")] {
             let err = backup_offline(&base).unwrap_err();
             assert!(matches!(err, MemoryError::Backup(BackupError::NoStore { .. })), "got {err:?}");
@@ -904,10 +911,10 @@ mod tests {
 
     #[tokio::test]
     async fn restore_onto_a_machine_without_a_data_directory() {
-        let source = tempfile::tempdir().unwrap();
+        let source = crate::test_dir::test_dir();
         seed_on_disk(source.path(), None).await;
         let snapshot = backup_offline(source.path()).unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let base = home.path().join(".clawg-dev");
 
         let restored = restore(&base, &snapshot).unwrap();
@@ -919,10 +926,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn restore_creates_a_private_data_directory() {
-        let source = tempfile::tempdir().unwrap();
+        let source = crate::test_dir::test_dir();
         seed_on_disk(source.path(), None).await;
         let snapshot = backup_offline(source.path()).unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let base = home.path().join(".clawg-dev");
 
         restore(&base, &snapshot).unwrap();
@@ -933,7 +940,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_snapshot_directory_is_created_private() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
 
         let path = backup_offline(dir.path()).unwrap();
@@ -948,7 +955,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_replaces_the_store_and_keeps_the_previous_one() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         let only_a = backup_offline(dir.path()).unwrap();
         add_row(dir.path(), "added after the backup");
@@ -970,15 +977,15 @@ mod tests {
 
     #[tokio::test]
     async fn restore_refuses_files_it_cannot_open_safely() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
-        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = crate::test_dir::test_dir();
 
         let text = elsewhere.path().join("notes.db");
         std::fs::write(&text, "not a database at all, just some words").unwrap();
         let foreign = elsewhere.path().join("foreign.db");
         rusqlite::Connection::open(&foreign).unwrap().execute_batch("CREATE TABLE x (y)").unwrap();
-        let newer_dir = tempfile::tempdir().unwrap();
+        let newer_dir = crate::test_dir::test_dir();
         seed_on_disk(newer_dir.path(), None).await;
         rusqlite::Connection::open(newer_dir.path().join("memory.db"))
             .unwrap()
@@ -1016,7 +1023,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_directory_syncs_and_a_missing_one_says_so() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         sync_dir(dir.path()).expect("a directory syncs");
         assert!(sync_dir(&dir.path().join("missing")).is_err());
     }
@@ -1025,15 +1032,15 @@ mod tests {
     /// `-wal` that the file alone lacks, and a restore installs only the file.
     #[tokio::test]
     async fn restore_refuses_a_copy_with_commits_in_its_wal() {
-        let live = tempfile::tempdir().unwrap();
+        let live = crate::test_dir::test_dir();
         let store = MemoryStore::open(live.path(), StoreHolder::Eval).await.unwrap();
         insert(&store, "only in the WAL").await;
-        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = crate::test_dir::test_dir();
         let copy = elsewhere.path().join("copy.db");
         std::fs::copy(live.path().join("memory.db"), &copy).unwrap();
         std::fs::copy(live.path().join("memory.db-wal"), elsewhere.path().join("copy.db-wal")).unwrap();
         drop(store);
-        let target = tempfile::tempdir().unwrap();
+        let target = crate::test_dir::test_dir();
         seed_on_disk(target.path(), None).await;
         let before = std::fs::read(target.path().join("memory.db")).unwrap();
 
@@ -1047,7 +1054,7 @@ mod tests {
 
     #[tokio::test]
     async fn restoring_the_oldest_kept_automatic_snapshot_survives_the_pruning() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         let manual = backup_offline(dir.path()).unwrap();
         let backups = dir.path().join("backups");
@@ -1066,7 +1073,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_refuses_while_the_daemon_holds_the_store() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         let snapshot = backup_offline(dir.path()).unwrap();
         let moved = dir.path().join("kept.db");
@@ -1084,10 +1091,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_restored_older_snapshot_migrates_on_the_next_open() {
-        let older = tempfile::tempdir().unwrap();
+        let older = crate::test_dir::test_dir();
         seed_on_disk(older.path(), Some(7)).await;
         let v7 = backup_offline(older.path()).unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
 
         restore(dir.path(), &v7).unwrap();
@@ -1110,10 +1117,10 @@ mod tests {
 
     #[tokio::test]
     async fn restoring_over_a_store_migrated_by_a_newer_version_keeps_it_as_pre_restore() {
-        let older = tempfile::tempdir().unwrap();
+        let older = crate::test_dir::test_dir();
         seed_on_disk(older.path(), None).await;
         let snapshot = backup_offline(older.path()).unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), None).await;
         add_row(dir.path(), "written by the newer version");
         rusqlite::Connection::open(dir.path().join("memory.db"))
@@ -1142,7 +1149,7 @@ mod tests {
 
     #[tokio::test]
     async fn probing_a_newer_store_reads_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         // Through the production open, so the file is in WAL mode and was
         // closed the way a stopped daemon leaves it.
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
@@ -1196,21 +1203,21 @@ mod tests {
 
     #[test]
     fn probing_without_a_store_creates_none() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         assert_eq!(probe(dir.path()).state, ProbeState::Missing);
         assert!(files_in(dir.path()).is_empty());
     }
 
     #[test]
     fn probing_a_file_that_is_not_a_store_says_unreadable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         std::fs::write(dir.path().join("memory.db"), "not a database at all, just some words").unwrap();
         assert!(matches!(probe(dir.path()).state, ProbeState::Unreadable(_)));
     }
 
     #[tokio::test]
     async fn a_failed_snapshot_leaves_no_file_behind() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let backups = dir.path().join("backups");
         let target = backups.clone();

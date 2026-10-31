@@ -40,6 +40,7 @@ use crate::memory::spill;
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, IngestReport, IngestRequest, Replay};
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
+use crate::metrics::Recorder;
 
 /// How many saves the ingest queue holds before a producer is refused.
 ///
@@ -155,6 +156,10 @@ pub struct MemoryRuntime {
     /// Which projects' documentation indexes are being refreshed, and when
     /// each last was, so the daemon never refreshes one project twice at once.
     pub project_docs: Arc<DocIndex>,
+    /// Where the search, the ingest and the embedder measure what they do;
+    /// the store's, so every clone of it measures into the same one. The
+    /// daemon serves and keeps it beside its own series.
+    pub metrics: Arc<Recorder>,
 }
 
 impl MemoryRuntime {
@@ -186,6 +191,7 @@ impl MemoryRuntime {
         Ok((
             Self {
                 base_dir,
+                metrics: store.metrics().clone(),
                 store,
                 memory_tx,
                 embedder: Arc::new(OnceCell::new()),
@@ -434,6 +440,7 @@ impl MemoryRuntime {
         (
             Self {
                 base_dir,
+                metrics: store.metrics().clone(),
                 store,
                 memory_tx,
                 embedder: Arc::new(embedder),
@@ -571,8 +578,8 @@ mod tests {
     use tokio::sync::mpsc::error::TrySendError;
     use crate::models::chat::Role;
 
-    fn tmp_base() -> tempfile::TempDir {
-        tempfile::tempdir().expect("tempdir")
+    fn tmp_base() -> crate::test_dir::TestDir {
+        crate::test_dir::test_dir()
     }
 
     fn chat_event(content: &str) -> MemoryEvent {
@@ -616,6 +623,7 @@ mod tests {
             .await
             .expect("vec_version");
         assert!(!version.is_empty());
+        rt.close().await;
     }
 
     /// `VACUUM INTO` reads the whole file, and every call queued behind it on
@@ -649,6 +657,7 @@ mod tests {
             .expect("snapshot");
         let bytes = std::fs::read(&path).expect("the snapshot exists");
         assert!(bytes.starts_with(b"SQLite format 3\0"), "a whole SQLite database");
+        rt.close().await;
     }
 
     /// The snapshot's own connection must still read what the store's
@@ -682,6 +691,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM memory WHERE content = 'only in the WAL'", [], |r| r.get(0))
             .expect("count");
         assert_eq!(rows, 1, "the snapshot must include what is still in the WAL");
+        rt.close().await;
     }
 
     /// Production `open()` must NOT fill the embedder cell: the 470 MB
@@ -696,6 +706,7 @@ mod tests {
         assert!(!rt.embedder_ready());
         assert_eq!(rt.embedder_status(), EmbedderStatus::Loading);
         assert!(rt.tokenizer.get().is_none());
+        rt.close().await;
     }
 
     /// The returned sender and receiver must be two ends of ONE channel, and
@@ -710,6 +721,7 @@ mod tests {
         rt.memory_tx.try_send(chat_event("hello").into()).expect("send");
         let req = rx.recv().await.expect("event");
         assert_eq!(req.event.content, "hello");
+        rt.close().await;
     }
 
     /// The flush worker is spawned inside `AccessTracker::new` during `open`,
@@ -723,6 +735,7 @@ mod tests {
             .expect("open");
         rt.access_tracker.record(vec![1, 2, 3]);
         rt.access_tracker.record(vec![]); // empty is a no-op, not an error
+        rt.close().await;
     }
 
     #[tokio::test]
@@ -739,6 +752,7 @@ mod tests {
                 .join("default")
                 .join("workspace.md")
         );
+        rt.close().await;
     }
 
     #[tokio::test]
@@ -790,6 +804,51 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    /// Two runtimes in one process measure apart, and what the store records
+    /// is what the runtime serves.
+    #[tokio::test]
+    async fn a_test_runtime_carries_its_own_recorder() {
+        let (a_dir, b_dir) = (tmp_base(), tmp_base());
+        let (a, _a_rx) = MemoryRuntime::new_for_test(a_dir.path().to_path_buf()).await;
+        let (b, _b_rx) = MemoryRuntime::new_for_test(b_dir.path().to_path_buf()).await;
+        assert!(!Arc::ptr_eq(&a.metrics, &b.metrics));
+        assert!(Arc::ptr_eq(&a.metrics, a.store.clone().metrics()), "every clone of the store measures into the runtime's");
+
+        a.store.metrics().gauge("probe", &[], 1.0);
+        assert_eq!(a.metrics.minute().gauges.len(), 1);
+        assert!(b.metrics.minute().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_accepted_save_records_its_stages_its_pieces_and_how_long_it_took() {
+        use crate::metrics::SeriesKey;
+        let tmp = tmp_base();
+        let (rt, rx) = MemoryRuntime::new_for_test(tmp.path().to_path_buf()).await;
+        let (drain, drain_rx) = watch::channel(None);
+        let workers = Workers {
+            ingest: tokio::spawn(rt.ingest_worker(rx, drain_rx)),
+            maintenance: tokio::spawn(rt.maintenance_worker()),
+            drain,
+        };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        rt.accept(chat_event("the deploy script lives in ops"), None, Some(reply)).await.unwrap();
+        let report = answer.await.unwrap();
+        assert!(report.failure.is_none());
+
+        let run = rt.metrics.run();
+        for stage in ["split", "gate", "embed", "store", "link"] {
+            assert_eq!(run.get(&SeriesKey::new("ingest.stage", &[("stage", stage)])).map(|h| h.count()), Some(1), "{stage}");
+        }
+        assert_eq!(run[&SeriesKey::new("ingest.end_to_end", &[])].count(), 1, "the save had an outbox row");
+        let gauges = rt.metrics.minute().gauges;
+        assert_eq!(gauges[&SeriesKey::new("ingest.outcome", &[("outcome", "stored")])].count, 1);
+        assert_eq!(gauges[&SeriesKey::new("ingest.pieces", &[])].last, 1.0);
+        assert_eq!(gauges[&SeriesKey::new("ingest.queue_depth", &[])].last, 0.0);
+
+        assert!(rt.shutdown(workers).await);
+        rt.close().await;
+    }
+
     /// The maintenance loop never returns, so what is actually assertable is
     /// that its future satisfies the bounds every executor demands.
     #[tokio::test]
@@ -817,6 +876,7 @@ mod tests {
             tokenizer,
             access_tracker: _,
             project_docs: _,
+            metrics: _,
         } = rt;
 
         let worker = tokio::spawn(ingest_worker_future(

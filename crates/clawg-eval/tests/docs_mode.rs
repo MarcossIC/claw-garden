@@ -63,3 +63,81 @@ fn docs_mode_refuses_a_golden_set_naming_a_doc_the_root_lacks() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("docs/gone.md"));
 }
+
+#[test]
+fn docs_mode_refuses_an_expected_heading_no_passage_ends_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    project(&root);
+    let golden = dir.path().join("golden.json");
+    // `Proyecto` is a heading of README.md, but its section holds only
+    // subsections, so no passage ends in it.
+    std::fs::write(&golden, r#"[{"id": "q1", "question": "cómo se instala", "expected": [{"path": "README.md", "heading": "Proyecto"}]}]"#)
+        .unwrap();
+
+    let out = rag_eval_docs(&root, &golden);
+
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("q1") && stderr.contains("README.md > Proyecto"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("indexed"), "the golden set is refused before indexing");
+}
+
+#[test]
+fn docs_mode_leaves_out_a_doc_that_quotes_a_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    project(&root);
+    write(&root, "notes/verify.md", "| q1 | daemon stop | 1 |\n");
+    let golden = dir.path().join("golden.json");
+    std::fs::write(&golden, r#"[{"id": "q1", "question": "daemon stop", "expected": [{"path": "README.md", "heading": "Apagado"}]}]"#)
+        .unwrap();
+
+    let out = rag_eval_docs(&root, &golden);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.starts_with("indexed 4 docs into 5 passages (0 skipped)"), "{stdout}");
+    assert!(stdout.contains("\nleft out 1 doc quoting a question: notes/verify.md\n"), "{stdout}");
+}
+
+#[test]
+fn docs_mode_refuses_an_expected_doc_that_quotes_a_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    project(&root);
+    let golden = dir.path().join("golden.json");
+    std::fs::write(&golden, r#"[{"id": "q1", "question": "snapshot antes de tocar", "expected": [{"path": "docs/backups.md"}]}]"#)
+        .unwrap();
+
+    let out = rag_eval_docs(&root, &golden);
+
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("q1") && stderr.contains("docs/backups.md"), "{stderr}");
+}
+
+#[test]
+fn docs_mode_with_the_fake_embedder_writes_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    project(&root);
+    let golden = dir.path().join("golden.json");
+    std::fs::write(&golden, r#"[{"id": "q1", "question": "daemon stop", "expected": [{"path": "README.md"}]}]"#).unwrap();
+    let out_dir = dir.path().join("results");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rag-eval"))
+        .args(["--fake", "--docs", "--root"])
+        .arg(&root)
+        .arg("--golden")
+        .arg(&golden)
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .expect("rag-eval must start");
+
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!out_dir.exists(), "a fake run writes no results file");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(leftovers.len(), 2, "only the repo and the golden set: {leftovers:?}");
+}

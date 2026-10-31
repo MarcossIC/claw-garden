@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use clawg_core::eval_api::{join_pieces, EmbedRole, EvalEmbedder, EvalTokenCounter};
+use clawg_core::eval_api::{join_pieces, EmbedRole, EvalCpu, EvalEmbedder, EvalTokenCounter};
 use serde::{Deserialize, Serialize};
 
 const MODEL_DIR_VAR: &str = "CLAWG_E5_MODEL_DIR";
@@ -25,52 +25,17 @@ const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/e5_go
 const DIMENSIONS: usize = 384;
 const TOLERANCE: f32 = 1e-6;
 
-/// What decides which kernels ONNX Runtime picks, so whether another machine
-/// can be expected to give the same bits. The system counts too: ONNX Runtime
-/// is built apart for each one, and on Linux a CPU with the same features as
-/// the Windows one that made the fixture moved the last bits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Cpu {
-    os: String,
-    arch: String,
-    avx2: bool,
-    avx512f: bool,
-    fma: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Comparison {
     ExactBits,
     MaxDifference(f32),
 }
 
-fn comparison_for(fixture: &Cpu, this: &Cpu) -> Comparison {
+fn comparison_for(fixture: &EvalCpu, this: &EvalCpu) -> Comparison {
     if fixture == this {
         Comparison::ExactBits
     } else {
         Comparison::MaxDifference(TOLERANCE)
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn this_cpu() -> Cpu {
-    Cpu {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        avx2: is_x86_feature_detected!("avx2"),
-        avx512f: is_x86_feature_detected!("avx512f"),
-        fma: is_x86_feature_detected!("fma"),
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn this_cpu() -> Cpu {
-    Cpu {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        avx2: false,
-        avx512f: false,
-        fma: false,
     }
 }
 
@@ -101,7 +66,7 @@ struct Case {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Fixture {
-    cpu: Cpu,
+    cpu: EvalCpu,
     cases: Vec<Case>,
 }
 
@@ -123,22 +88,22 @@ fn max_difference(expected: &[u32], actual: &[f32]) -> f32 {
 
 #[test]
 fn the_comparison_is_by_bits_only_on_the_cpu_that_made_the_fixture() {
-    let fixture = Cpu { os: "windows".into(), arch: "x86_64".into(), avx2: true, avx512f: true, fma: true };
+    let fixture = EvalCpu { os: "windows".into(), arch: "x86_64".into(), avx2: true, avx512f: true, fma: true };
     assert_eq!(comparison_for(&fixture, &fixture.clone()), Comparison::ExactBits);
 
-    let no_avx512 = Cpu { avx512f: false, ..fixture.clone() };
+    let no_avx512 = EvalCpu { avx512f: false, ..fixture.clone() };
     assert_eq!(comparison_for(&fixture, &no_avx512), Comparison::MaxDifference(TOLERANCE));
 
-    let no_avx2 = Cpu { avx2: false, ..fixture.clone() };
+    let no_avx2 = EvalCpu { avx2: false, ..fixture.clone() };
     assert_eq!(comparison_for(&fixture, &no_avx2), Comparison::MaxDifference(TOLERANCE));
 
-    let no_fma = Cpu { fma: false, ..fixture.clone() };
+    let no_fma = EvalCpu { fma: false, ..fixture.clone() };
     assert_eq!(comparison_for(&fixture, &no_fma), Comparison::MaxDifference(TOLERANCE));
 
-    let other_arch = Cpu { arch: "aarch64".into(), ..fixture.clone() };
+    let other_arch = EvalCpu { arch: "aarch64".into(), ..fixture.clone() };
     assert_eq!(comparison_for(&fixture, &other_arch), Comparison::MaxDifference(TOLERANCE));
 
-    let other_os = Cpu { os: "linux".into(), ..fixture.clone() };
+    let other_os = EvalCpu { os: "linux".into(), ..fixture.clone() };
     assert_eq!(comparison_for(&fixture, &other_os), Comparison::MaxDifference(TOLERANCE));
 }
 
@@ -254,7 +219,7 @@ async fn bless(embedder: &EvalEmbedder, base: &Path) -> ! {
         let bits = vectors.iter().map(|v| v.iter().map(|x| x.to_bits()).collect()).collect();
         cases.push(Case { name, role, texts, bits });
     }
-    let fixture = Fixture { cpu: this_cpu(), cases };
+    let fixture = Fixture { cpu: EvalCpu::this(), cases };
     std::fs::create_dir_all(Path::new(FIXTURE).parent().expect("the fixture has a directory"))
         .expect("create the fixture directory");
     std::fs::write(FIXTURE, render(&fixture)).expect("write the fixture");
@@ -335,7 +300,7 @@ async fn the_vectors_are_the_ones_fastembed_gave() {
             panic!("read {FIXTURE}: {e}; create it with {BLESS_VAR}=1 and --ignored")
         }))
         .expect("the fixture is JSON");
-    let comparison = comparison_for(&fixture.cpu, &this_cpu());
+    let comparison = comparison_for(&fixture.cpu, &EvalCpu::this());
     match comparison {
         Comparison::ExactBits => {
             println!("compared exact bits: this CPU is the one that made the fixture ({:?})", fixture.cpu)
@@ -343,7 +308,7 @@ async fn the_vectors_are_the_ones_fastembed_gave() {
         Comparison::MaxDifference(max) => println!(
             "compared with a maximum difference of {max}: the fixture was made on {:?}, this is {:?}",
             fixture.cpu,
-            this_cpu()
+            EvalCpu::this()
         ),
     }
 

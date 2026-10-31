@@ -152,7 +152,7 @@ Si falta el VC++ Redistributable, `install.ps1` MUST decirlo con el enlace ofici
 
 ## R10. Documentación
 
-El README MUST traer la instalación en una línea, cómo verificar lo bajado (`minisign` con la clave del repositorio), la glibc mínima de Linux, SmartScreen y Smart App Control, qué pasa con una clave comprometida (incluido que el respaldo no protege a los binarios que no se actualicen), y «Actualizar» con la vuelta atrás a mano. `.claude/CLAUDE.md` MUST describir el flujo de Versioning y de CI con el release, y listar `update` en Commands.
+El README MUST traer la instalación en una línea, cómo verificar lo bajado (`minisign` con la clave del repositorio), la glibc mínima de Linux, SmartScreen y Smart App Control, qué pasa con una clave comprometida (incluido que el respaldo no protege a los binarios que no se actualicen), y «Actualizar» con la vuelta atrás a mano. `docs/reference/release.md` y `docs/reference/testing.md` MUST describir el flujo de Versioning y de CI con el release, y `docs/reference/commands.md` MUST listar `update`.
 
 #### Escenario: README completo
 - GIVEN el README

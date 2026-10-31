@@ -4,7 +4,7 @@
 //! builder API whose main job would be parsing two mutually exclusive flags
 //! and four optional ones.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which embedder backs a run. Exactly one of `--fake`/`--real` is required
 /// unless `--help` was given; the two are mutually exclusive with each
@@ -82,6 +82,19 @@ pub struct Cli {
     /// no vectors), as a floor the full ranking has to beat. Mutually
     /// exclusive with the other arms and every sweep flag.
     pub lexical_only: bool,
+    /// `--background <snapshot>`: a snapshot `clawg backup` wrote, copied and
+    /// measured under the golden corpus. The sweep flags vary the ranking over
+    /// it; the modes that measure the golden corpus alone, and a tokenizer
+    /// swap that would empty its text index, are refused with it.
+    pub background: Option<PathBuf>,
+    /// `--keep-store`: leave the store a run seeds on disk and name it, to
+    /// open the database behind a number. Without it the run removes it.
+    pub keep_store: bool,
+    /// `--no-cache`: a docs run neither reads nor writes the vector memo.
+    pub no_cache: bool,
+    /// Where the vector memo lives. No flag sets it: a test points it at a
+    /// temporary folder.
+    pub cache_dir: PathBuf,
 }
 
 /// What a parse attempt produces. `--help` is not an error: it takes
@@ -125,10 +138,16 @@ pub enum CliError {
     DocsWithOtherMode,
     #[error("--root is only meaningful with --docs")]
     RootWithoutDocs,
+    #[error("--no-cache is only meaningful with --docs")]
+    NoCacheWithoutDocs,
     #[error("--lexical-only is mutually exclusive with --agent-view, --follow-up, --docs and the sweep flags (--sweep-imp, --sweep-cos-floor, --sweep-lexical, --fts-tokenizer)")]
     LexicalOnlyWithOtherMode,
     #[error("--fail-on-regression is only meaningful with --diff")]
     FailOnRegressionWithoutDiff,
+    #[error("--background is mutually exclusive with --docs, --lang-detect, --fts-tokenizer, --follow-up, --audit and --lexical-only")]
+    BackgroundWithOtherMode,
+    #[error("--keep-store is mutually exclusive with --background, --agent-view and --docs, which always remove their store")]
+    KeepStoreWithOtherMode,
 }
 
 pub const HELP_TEXT: &str = "\
@@ -169,6 +188,10 @@ OPTIONS:
                          records the tokenizer in the file, so two runs differing only
                          in this flag stay comparable side by side.
     --force             Allow overwriting an existing results file for the same date+config
+    --keep-store        Leave the store a run seeds in the system temp directory and print
+                         its path, to open the database behind a number. Without it the run
+                         removes the store when it ends, passed or failed. Mutually exclusive
+                         with --background, --agent-view and --docs, which always remove theirs.
     --diff <a.json> <b.json>
                          Compare two existing results files' retrieval.per_case and
                          similarity.per_case, joined on query, reporting better/worse/net
@@ -180,10 +203,13 @@ OPTIONS:
                          over the cases with that pair in both files; the pair rows are
                          informative and never enter primary: nor --fail-on-regression.
                          Ends with whether each primary metric (recall@5, search.found)
-                         moved distinguishably at p < 0.05. Needs neither --fake/--real nor
-                         a golden set; short-circuits like --help.
+                         moved distinguishably at p < 0.05. When a file was measured over
+                         --background it names each side's snapshot and search time, and warns
+                         when both searched one snapshot more than a day apart (the exit code
+                         stays the metrics'). Needs neither --fake/--real nor a golden set;
+                         short-circuits like --help.
     --fail-on-regression With --diff, on either side of it: exit 6 when a primary metric
-                         (retrieval recall@5, agent_view search.found) gets worse with
+                         (retrieval recall@5, agent_view search.found, docs hit@3) gets worse with
                          p < 0.05. The informative metrics never fail the run.
     --follow-up          Run the synthetic Ceiling/Floor/Treatment arms instead of the
                          normal single-arm pass, measuring whether conversational context
@@ -198,15 +224,44 @@ OPTIONS:
     --docs              Index a project's documentation (Markdown and manifests) into a
                          temporary store and score the questions of the docs golden set
                          (crates/clawg-eval/golden/project-docs.json unless --golden says
-                         otherwise): Hit@1/3/5 and MRR@10, printed. Writes no results file.
-                         Mutually exclusive with --audit, --follow-up, --agent-view and
-                         every sweep flag.
+                         otherwise): Hit@1/3/5 and MRR@10. Leaves out of the index, and
+                         names, every doc that quotes a question; an expected doc that does
+                         is a golden set error. With --real writes {date}-real-docs.json
+                         ({date}-real-docs-{tag}.json with --tag), which --diff compares with
+                         another docs run: Hit@1/3/5 and mrr@10 for all questions, docs and
+                         code, the questions that entered or left the top 3, and hit@3 as
+                         the primary metric. --fake only prints. Mutually exclusive with
+                         --audit, --follow-up, --agent-view and every sweep flag.
     --root <dir>        With --docs: the project to index (default: this workspace)
+    --no-cache          With --docs: neither read nor write the vector memo. A real docs run
+                         keeps the vectors of the passages it embeds in docs/eval/cache/, next
+                         to the results folder and outside git, and the next run embeds only
+                         the texts that are not there. The folder is never purged: a run does
+                         not remove what it did not use. To clean it, delete the folder. It
+                         holds only keys and vectors: 1,568 bytes per distinct passage text
+                         (32 + 384 x 4) and model contract, some 28 MB for this workspace
+                         today, and it grows with every run that embeds a text it does not
+                         hold. Use this flag to time a run that embeds every passage, as
+                         production does.
     --lexical-only      Rank every case by the lexical channel alone: the same FTS5 match and
                          bm25 order the full search uses, with no vectors and no scoring. A
                          floor for the full ranking; writes {date}-{mode}-lexical-only.json,
                          which --diff compares with any other run. Mutually exclusive with
                          --agent-view, --follow-up, --docs and every sweep flag.
+    --background <snapshot>
+                         Measure over a copy of a snapshot `clawg backup` wrote, with the golden
+                         corpus seeded on top and every search reaching every agent's rows, as
+                         the daemon does. The snapshot is only read; the copy, in the system temp
+                         directory, is migrated if its schema is older and removed when the run
+                         ends. A snapshot with commits in a -wal beside it, damaged, of a newer
+                         or diverged schema, or embedded by another model is refused with exit 1.
+                         A hit from the snapshot keeps its place in ranked_refs as bg, and the
+                         results name the snapshot (path, sha256, contract, schema, the time of
+                         the search and its rows by type, agent, language, source and project)
+                         and fold bg-<first 8 hex of its sha256> into the tag. Mutually exclusive
+                         with --docs, --lang-detect, --fts-tokenizer, --follow-up, --audit and
+                         --lexical-only; the sweep flags are accepted, and with --agent-view the
+                         corpus is saved through the ingest on top of the copy.
     --lang-detect       Print as JSON how clawg's language detector labels the corpus rows
                          that carry a lang (en or es): by label, in total and for the rows
                          of eight words or more, with the share right, crossed and
@@ -259,6 +314,23 @@ pub fn default_out_dir() -> PathBuf {
         .join("results")
 }
 
+/// Default folder of the vector memo, resolved like [`default_out_dir`], beside
+/// the results folder.
+pub fn default_cache_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("eval")
+        .join("cache")
+}
+
+/// The vector memo's folder when this run uses one: only a real docs run that
+/// did not ask for none. A fake run embeds nothing a memo could keep.
+pub fn memo_dir(cli: &Cli) -> Option<&Path> {
+    (cli.docs && matches!(cli.mode, Mode::Real) && !cli.no_cache).then_some(cli.cache_dir.as_path())
+}
+
 /// Parses an argv-shaped iterator. The first element (the program name, the
 /// same thing `std::env::args()` yields at index 0) is skipped unconditionally.
 pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, CliError> {
@@ -282,6 +354,9 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     let mut fail_on_regression = false;
     let mut lexical_only = false;
     let mut lang_detect = false;
+    let mut background: Option<PathBuf> = None;
+    let mut keep_store = false;
+    let mut no_cache = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -322,6 +397,8 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
             }
             "--check-only" => check_only = true,
             "--force" => force = true,
+            "--keep-store" => keep_store = true,
+            "--no-cache" => no_cache = true,
             "--audit" => audit = true,
             "--golden" => {
                 let value = args
@@ -374,10 +451,22 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
                     .ok_or_else(|| CliError::MissingValue("--fts-tokenizer".to_string()))?;
                 fts_tokenizer = Some(value);
             }
+            "--background" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| CliError::MissingValue("--background".to_string()))?;
+                background = Some(PathBuf::from(value));
+            }
             other => return Err(CliError::UnknownFlag(other.to_string())),
         }
     }
 
+    if background.is_some() && (docs || lang_detect || fts_tokenizer.is_some() || follow_up || audit || lexical_only) {
+        return Err(CliError::BackgroundWithOtherMode);
+    }
+    if keep_store && (background.is_some() || agent_view || docs) {
+        return Err(CliError::KeepStoreWithOtherMode);
+    }
     if lang_detect {
         return Ok(ParseOutcome::LangDetect { golden: golden_path.unwrap_or_else(default_golden_path) });
     }
@@ -434,6 +523,9 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
     if docs_root.is_some() && !docs {
         return Err(CliError::RootWithoutDocs);
     }
+    if no_cache && !docs {
+        return Err(CliError::NoCacheWithoutDocs);
+    }
 
     let default_golden = if docs { default_docs_golden_path } else { default_golden_path };
     Ok(ParseOutcome::Run(Cli {
@@ -453,6 +545,10 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ParseOutcome, Cl
         docs,
         docs_root: docs_root.unwrap_or_else(default_docs_root),
         lexical_only,
+        background,
+        keep_store,
+        no_cache,
+        cache_dir: default_cache_dir(),
     }))
 }
 
@@ -482,6 +578,46 @@ mod tests {
             ParseOutcome::Help => panic!("expected Run, got Help"),
             ParseOutcome::Diff { a, b, .. } => panic!("expected Run, got Diff({a:?}, {b:?})"),
             ParseOutcome::LangDetect { golden } => panic!("expected Run, got LangDetect({golden:?})"),
+        }
+    }
+
+    #[test]
+    fn background_parses() {
+        assert_eq!(run_cli(&["--fake", "--background", "snap.db"]).background, Some(PathBuf::from("snap.db")));
+        assert_eq!(run_cli(&["--fake"]).background, None);
+        let swept = run_cli(&["--real", "--background", "snap.db", "--sweep-cos-floor", "0.8", "--sweep-lexical", "0"]);
+        assert_eq!(swept.sweep_cos_floor, vec![0.8]);
+        assert_eq!(parse(argv(&["--fake", "--background"])), Err(CliError::MissingValue("--background".to_string())));
+        let viewed = run_cli(&["--fake", "--agent-view", "--background", "snap.db"]);
+        assert!(viewed.agent_view && viewed.background.is_some(), "agent-view measures over a background too");
+    }
+
+    #[test]
+    fn background_with_docs_is_a_usage_error() {
+        for other in [
+            &["--docs"][..],
+            &["--lang-detect"],
+            &["--fts-tokenizer", "trigram"],
+            &["--follow-up"],
+            &["--audit"],
+            &["--lexical-only"],
+        ] {
+            let args: Vec<&str> = ["--fake", "--background", "snap.db"].iter().chain(other).copied().collect();
+            assert_eq!(parse(argv(&args)), Err(CliError::BackgroundWithOtherMode), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn keep_store_parses() {
+        assert!(run_cli(&["--fake", "--keep-store"]).keep_store);
+        assert!(!run_cli(&["--fake"]).keep_store, "a run removes the store it seeds unless asked to keep it");
+    }
+
+    #[test]
+    fn keep_store_with_a_mode_that_always_removes_its_store_is_a_usage_error() {
+        for other in [&["--background", "snap.db"][..], &["--agent-view"], &["--docs"]] {
+            let args: Vec<&str> = ["--fake", "--keep-store"].iter().chain(other).copied().collect();
+            assert_eq!(parse(argv(&args)), Err(CliError::KeepStoreWithOtherMode), "{other:?}");
         }
     }
 
@@ -958,5 +1094,60 @@ mod tests {
     fn the_help_text_documents_docs() {
         assert!(HELP_TEXT.contains("--docs"));
         assert!(HELP_TEXT.contains("--root <dir>"));
+        assert!(HELP_TEXT.contains("{date}-real-docs.json"));
+    }
+
+    #[test]
+    fn no_cache_without_docs_is_an_error() {
+        for args in [&["--fake", "--no-cache"][..], &["--real", "--no-cache"]] {
+            assert_eq!(parse(argv(args)).expect_err("--no-cache needs --docs"), CliError::NoCacheWithoutDocs, "{args:?}");
+        }
+        assert!(run_cli(&["--fake", "--docs", "--no-cache"]).no_cache);
+        assert!(run_cli(&["--real", "--docs", "--no-cache"]).no_cache);
+        assert!(!run_cli(&["--real", "--docs"]).no_cache);
+    }
+
+    #[test]
+    fn the_memo_folder_sits_next_to_the_results_folder() {
+        let cache = default_cache_dir();
+
+        assert_eq!(cache.file_name(), Some(std::ffi::OsStr::new("cache")));
+        assert_eq!(cache.parent(), default_out_dir().parent());
+        assert_eq!(run_cli(&["--real", "--docs"]).cache_dir, cache);
+    }
+
+    #[test]
+    fn the_memo_is_used_only_by_a_real_docs_run_that_did_not_ask_for_none() {
+        let table: [(&[&str], bool); 6] = [
+            (&["--real", "--docs"], true),
+            (&["--real", "--docs", "--no-cache"], false),
+            (&["--fake", "--docs"], false),
+            (&["--fake", "--docs", "--no-cache"], false),
+            (&["--real"], false),
+            (&["--fake"], false),
+        ];
+
+        for (args, used) in table {
+            let cli = run_cli(args);
+            assert_eq!(memo_dir(&cli), used.then_some(cli.cache_dir.as_path()), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn the_help_text_documents_no_cache() {
+        for needle in ["--no-cache", "docs/eval/cache", "never purged", "delete the folder"] {
+            assert!(HELP_TEXT.contains(needle), "{needle}");
+        }
+    }
+
+    #[test]
+    fn the_help_text_gives_the_size_of_the_memo_per_text_and_no_bound() {
+        let start = HELP_TEXT.find("    --no-cache ").expect("the --no-cache entry");
+        let end = start + HELP_TEXT[start..].find("    --lexical-only ").expect("the entry after it");
+        let entry = &HELP_TEXT[start..end];
+        for needle in ["1,568 bytes per distinct passage text", "grows"] {
+            assert!(entry.contains(needle), "{needle}");
+        }
+        assert!(!entry.contains("at most"), "{entry}");
     }
 }

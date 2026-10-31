@@ -156,14 +156,14 @@ mod tests {
 
     #[test]
     fn a_git_or_a_manifest_marks_a_project() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         assert!(!has_project_marker(dir.path()));
         std::fs::write(dir.path().join("README.md"), "# notes\n").unwrap();
         assert!(!has_project_marker(dir.path()), "a doc alone is not a project");
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
         assert!(has_project_marker(dir.path()));
 
-        let worktree = tempfile::tempdir().unwrap();
+        let worktree = crate::test_dir::test_dir();
         std::fs::write(worktree.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
         assert!(has_project_marker(worktree.path()), "a .git file, as in a worktree");
     }
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn the_walk_honours_gitignore_and_keeps_hidden_docs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let root = dir.path();
         write(root, "README.md", b"# Readme");
         write(root, "docs/guia.MD", b"# Guia");
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn oversized_and_binary_files_are_skipped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let root = dir.path();
         write(root, "big.md", &vec![b'a'; MAX_DOC_BYTES as usize + 1]);
         write(root, "binary.md", &[0xff, 0xfe, 0x00, 0x80]);
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn a_root_that_is_not_a_directory_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         assert!(matches!(walk(&dir.path().join("gone")), Err(CorpusError::NotADirectory(_))));
     }
 

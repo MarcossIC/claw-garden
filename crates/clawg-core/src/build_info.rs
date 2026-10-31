@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn only_the_end_of_a_big_file_is_read() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join("clawg");
         let mut file = vec![7u8; 100_000];
         file.append(&mut stamped(r#"{"version":"0.0.1"}"#));
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn a_small_file_is_read_whole() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join("clawg");
         std::fs::write(&path, stamped("{}")).unwrap();
 

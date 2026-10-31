@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 
 use super::histogram::{Histogram, Unit};
+use super::event::{Event, EventRow};
 use super::recorder::{Gauge, SeriesKey, Window};
 
 pub const METRICS_FILE: &str = "metrics.db";
 
-const SCHEMA_VERSION: i64 = 1;
+/// 2 added `event`, which a file of 1 gets when it is opened to write.
+const SCHEMA_VERSION: i64 = 2;
 
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MINUTES: i64 = 60;
@@ -87,6 +89,7 @@ pub struct GaugeRow {
 pub struct Pruned {
     pub folded_minutes: usize,
     pub dropped_hours: usize,
+    pub dropped_events: usize,
     pub dropped_runs: usize,
 }
 
@@ -208,9 +211,50 @@ impl MetricsDb {
         Ok(())
     }
 
+    /// Keeps `events` of the run, in the same transaction for all of them.
+    pub fn write_events(&mut self, run_id: i64, events: &[Event]) -> Result<(), MetricsError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        for event in events {
+            tx.execute(
+                "INSERT INTO event (run_id, at_ms, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+                params![run_id, event.at_ms, event.kind.as_str(), event.detail_json()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The events from `since_ms` on, oldest first. A file of schema 1 has
+    /// none.
+    pub fn events_since(&self, since_ms: i64) -> Result<Vec<EventRow>, MetricsError> {
+        let has_events: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'event')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_events {
+            return Ok(Vec::new());
+        }
+        let mut stmt =
+            self.conn.prepare("SELECT run_id, at_ms, kind, detail FROM event WHERE at_ms >= ?1 ORDER BY at_ms, rowid")?;
+        let rows = stmt.query_map([since_ms], |r| {
+            let detail: String = r.get(3)?;
+            Ok(EventRow {
+                run_id: r.get(0)?,
+                at_ms: r.get(1)?,
+                kind: r.get(2)?,
+                detail: serde_json::from_str(&detail).unwrap_or(serde_json::Value::Null),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Folds the minutes older than [`MINUTES_KEPT_MS`] into their hour and
-    /// drops the hours older than [`HOURS_KEPT_MS`], with the runs that have
-    /// nothing left, in one transaction.
+    /// drops the hours and the events older than [`HOURS_KEPT_MS`], with the
+    /// runs that have nothing left, in one transaction.
     pub fn prune(&mut self, now_ms: i64) -> Result<Pruned, MetricsError> {
         let minute_cut = (now_ms - MINUTES_KEPT_MS).div_euclid(MINUTE_MS);
         let hour_cut = (now_ms - HOURS_KEPT_MS).div_euclid(MINUTE_MS * HOUR_MINUTES);
@@ -229,14 +273,16 @@ impl MetricsDb {
 
         let dropped_hours = tx.execute("DELETE FROM hist_hour WHERE hour < ?1", [hour_cut])?
             + tx.execute("DELETE FROM gauge_hour WHERE hour < ?1", [hour_cut])?;
+        let dropped_events = tx.execute("DELETE FROM event WHERE at_ms < ?1", [now_ms - HOURS_KEPT_MS])?;
         let dropped_runs = tx.execute(
             "DELETE FROM run WHERE started_at_ms < ?1 \
              AND id NOT IN (SELECT run_id FROM hist_minute UNION SELECT run_id FROM hist_hour \
-                            UNION SELECT run_id FROM gauge_minute UNION SELECT run_id FROM gauge_hour)",
+                            UNION SELECT run_id FROM gauge_minute UNION SELECT run_id FROM gauge_hour \
+                            UNION SELECT run_id FROM event)",
             [now_ms - HOURS_KEPT_MS],
         )?;
         tx.commit()?;
-        Ok(Pruned { folded_minutes: folded, dropped_hours, dropped_runs })
+        Ok(Pruned { folded_minutes: folded, dropped_hours, dropped_events, dropped_runs })
     }
 
     /// The runs that started at `since_ms` or later, or that have rows from
@@ -371,6 +417,10 @@ CREATE TABLE IF NOT EXISTS gauge_hour (
     count INTEGER NOT NULL, sum REAL NOT NULL, min REAL NOT NULL, max REAL NOT NULL, last REAL NOT NULL,
     PRIMARY KEY (run_id, hour, name, labels)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS event (
+    run_id INTEGER NOT NULL, at_ms INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS event_by_time ON event (at_ms);
 CREATE INDEX IF NOT EXISTS hist_minute_by_name ON hist_minute (name, minute);
 CREATE INDEX IF NOT EXISTS gauge_minute_by_name ON gauge_minute (name, minute);
 ";
@@ -561,7 +611,7 @@ fn by_key(rows: &[HistRow]) -> std::collections::BTreeMap<(i64, String), Histogr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::Recorder;
+    use crate::metrics::{EventKind, Recorder};
 
     const NOW: i64 = 1_790_000_000_000;
 
@@ -591,7 +641,7 @@ mod tests {
 
     #[test]
     fn a_run_is_recorded_open_and_closed_on_stop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         let mut db = MetricsDb::open(&path, NOW).unwrap();
         let first = db.start_run(&run_info(NOW)).unwrap();
@@ -610,7 +660,7 @@ mod tests {
 
     #[test]
     fn a_minute_is_written_with_its_series() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         let mut db = MetricsDb::open(&path, NOW).unwrap();
         let run = db.start_run(&run_info(NOW)).unwrap();
@@ -630,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_file_is_set_aside_and_recreated() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         let garbage = vec![0x42u8; 8192];
         std::fs::write(&path, &garbage).unwrap();
@@ -645,7 +695,7 @@ mod tests {
 
     #[test]
     fn a_newer_schema_is_refused_untouched() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         Connection::open(&path).unwrap().pragma_update(None, "user_version", 9).unwrap();
         assert!(matches!(MetricsDb::open(&path, NOW), Err(MetricsError::Newer(9))));
@@ -656,7 +706,7 @@ mod tests {
     #[test]
     fn the_file_is_private_to_its_owner() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let path = dir.path().join(METRICS_FILE);
         MetricsDb::open(&path, NOW).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -664,7 +714,7 @@ mod tests {
 
     #[test]
     fn old_minutes_fold_into_their_hour() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let mut db = MetricsDb::open(&dir.path().join(METRICS_FILE), NOW).unwrap();
         let old = NOW - MINUTES_KEPT_MS - DAY_MS;
         let hour_start = old.div_euclid(3_600_000) * 3_600_000;
@@ -688,9 +738,101 @@ mod tests {
         assert_eq!((folded.gauge.count, folded.gauge.min, folded.gauge.max, folded.gauge.last), (2, 5.0, 8.0, 8.0));
     }
 
+    /// The tables of schema 1 as clawg wrote them before events.
+    const SCHEMA_1: &str = "
+CREATE TABLE run (
+    id INTEGER PRIMARY KEY, started_at_ms INTEGER NOT NULL, stopped_at_ms INTEGER, version TEXT NOT NULL,
+    dist_target TEXT, profile TEXT NOT NULL, os TEXT NOT NULL, arch TEXT NOT NULL, cpus INTEGER NOT NULL,
+    embedding_model TEXT NOT NULL, idle_minutes INTEGER, utc_offset_s INTEGER NOT NULL
+);
+CREATE TABLE hist_minute (
+    run_id INTEGER NOT NULL, minute INTEGER NOT NULL, name TEXT NOT NULL, labels TEXT NOT NULL,
+    unit TEXT NOT NULL, count INTEGER NOT NULL, sum INTEGER NOT NULL, min INTEGER NOT NULL,
+    max INTEGER NOT NULL, buckets BLOB NOT NULL, PRIMARY KEY (run_id, minute, name, labels)
+) WITHOUT ROWID;
+CREATE TABLE hist_hour (
+    run_id INTEGER NOT NULL, hour INTEGER NOT NULL, name TEXT NOT NULL, labels TEXT NOT NULL,
+    unit TEXT NOT NULL, count INTEGER NOT NULL, sum INTEGER NOT NULL, min INTEGER NOT NULL,
+    max INTEGER NOT NULL, buckets BLOB NOT NULL, PRIMARY KEY (run_id, hour, name, labels)
+) WITHOUT ROWID;
+CREATE TABLE gauge_minute (
+    run_id INTEGER NOT NULL, minute INTEGER NOT NULL, name TEXT NOT NULL, labels TEXT NOT NULL,
+    count INTEGER NOT NULL, sum REAL NOT NULL, min REAL NOT NULL, max REAL NOT NULL, last REAL NOT NULL,
+    PRIMARY KEY (run_id, minute, name, labels)
+) WITHOUT ROWID;
+CREATE TABLE gauge_hour (
+    run_id INTEGER NOT NULL, hour INTEGER NOT NULL, name TEXT NOT NULL, labels TEXT NOT NULL,
+    count INTEGER NOT NULL, sum REAL NOT NULL, min REAL NOT NULL, max REAL NOT NULL, last REAL NOT NULL,
+    PRIMARY KEY (run_id, hour, name, labels)
+) WITHOUT ROWID;
+PRAGMA user_version = 1;
+";
+
+    #[test]
+    fn a_file_of_schema_1_gets_its_events_and_keeps_its_rows() {
+        let dir = crate::test_dir::test_dir();
+        let path = dir.path().join(METRICS_FILE);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA_1).unwrap();
+            c.execute(
+                "INSERT INTO run (id, started_at_ms, version, profile, os, arch, cpus, embedding_model, utc_offset_s) \
+                 VALUES (1, ?1, '0.66.0', 'dev', 'linux', 'x86_64', 8, 'm', 0)",
+                [NOW],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO gauge_minute VALUES (1, ?1, 'process.rss_bytes', '', 1, 7.0, 7.0, 7.0, 7.0)",
+                [NOW.div_euclid(MINUTE_MS)],
+            )
+            .unwrap();
+        }
+        let read = MetricsDb::open_read_only(&path).unwrap();
+        assert!(read.events_since(0).unwrap().is_empty(), "a file of schema 1 reads as one without events");
+        drop(read);
+
+        let mut db = MetricsDb::open(&path, NOW).unwrap();
+        let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(db.runs_since(0).unwrap().len(), 1, "its runs stay");
+        assert_eq!(db.gauge_rows_since("process.rss_bytes", 0).unwrap()[0].gauge.last, 7.0, "its minutes stay");
+
+        let run = db.start_run(&run_info(NOW)).unwrap();
+        let event = |at_ms, kind| crate::metrics::Event {
+            at_ms,
+            kind,
+            detail: std::collections::BTreeMap::from([("ms", 40u64.into()), ("reason", "manual".into())]),
+        };
+        db.write_events(run, &[event(NOW, EventKind::Backup), event(NOW + 1, EventKind::Shutdown)]).unwrap();
+        let events = db.events_since(NOW).unwrap();
+        assert_eq!(events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["backup", "shutdown"]);
+        assert_eq!(events[0].run_id, run);
+        assert_eq!(events[0].detail, serde_json::json!({ "ms": 40, "reason": "manual" }));
+        assert_eq!(db.events_since(NOW + 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn events_past_the_retention_go_with_their_run() {
+        let dir = crate::test_dir::test_dir();
+        let mut db = MetricsDb::open(&dir.path().join(METRICS_FILE), NOW).unwrap();
+        let ancient = NOW - HOURS_KEPT_MS - DAY_MS;
+        let gone = db.start_run(&run_info(ancient)).unwrap();
+        let old = crate::metrics::Event { at_ms: ancient, kind: EventKind::Backup, detail: Default::default() };
+        db.write_events(gone, &[old]).unwrap();
+        let kept = db.start_run(&run_info(ancient)).unwrap();
+        let recent = crate::metrics::Event { at_ms: NOW, kind: EventKind::Import, detail: Default::default() };
+        db.write_events(kept, &[recent]).unwrap();
+
+        let pruned = db.prune(NOW).unwrap();
+
+        assert_eq!((pruned.dropped_events, pruned.dropped_runs), (1, 1));
+        assert_eq!(db.runs_since(0).unwrap().iter().map(|r| r.id).collect::<Vec<_>>(), [kept], "a recent event keeps its run");
+        assert_eq!(db.events_since(0).unwrap().len(), 1);
+    }
+
     #[test]
     fn hours_past_the_retention_are_dropped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let mut db = MetricsDb::open(&dir.path().join(METRICS_FILE), NOW).unwrap();
         let ancient = NOW - HOURS_KEPT_MS - DAY_MS;
         let gone = db.start_run(&run_info(ancient)).unwrap();

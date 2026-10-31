@@ -5,20 +5,24 @@ mod diff;
 mod docs;
 mod follow_up;
 mod golden;
+mod index_cost;
 mod lang_detect;
 mod metrics;
 mod report;
 mod seed;
 mod similarity;
 mod stats;
+#[cfg(test)]
+mod test_temp;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use clawg_core::eval_api::{
-    compose_query_context, model_is_cached, query_budget_tokens,
-    EmbedRole, EvalEmbedder, EvalScope, EvalScoringConfig, EvalTokenCounter, MIGRATION_FTS_TOKENIZER,
-    EMBED_MAX_TOKENS, SPECIAL_TOKEN_RESERVE,
+    compose_query_context, copy_background, cosine_from_distance, model_is_cached, query_budget_tokens,
+    EmbedRole, EvalCaseRef, EvalEmbedder, EvalError, EvalKind, EvalResolveError, EvalResolved, EvalScope,
+    EvalScoringConfig, EvalSearch, EvalStore, EvalTokenCounter, MIGRATION_FTS_TOKENIZER, EMBED_MAX_TOKENS,
+    SPECIAL_TOKEN_RESERVE,
 };
 
 use golden::{CaseStatus, CaseSubset, PairLabel};
@@ -99,6 +103,12 @@ async fn load_embedder(mode: cli::Mode, base_dir: &std::path::Path) -> Result<Ev
 /// number someone will quote later, and a partially-computed one is worse
 /// than none, because nothing downstream can tell the two apart.
 async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
+    run_with_scratch(args, seed::unique_store_path()).await
+}
+
+/// [`run`], with the store the run seeds, or the copy of its `--background`,
+/// in `scratch`.
+async fn run_with_scratch<I: Iterator<Item = String>>(args: I, scratch: PathBuf) -> i32 {
     let cli = match cli::parse(args) {
         Ok(cli::ParseOutcome::Help) => {
             println!("{}", cli::HELP_TEXT);
@@ -172,6 +182,12 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         }
     };
     let golden_set = &loaded_golden.set;
+    if cli.background.is_none() {
+        if let Some(query) = golden::needs_background(golden_set) {
+            eprintln!("golden set validation failed: {}", golden::GoldenError::NeedsBackground(query.to_string()));
+            return EXIT_GOLDEN_INVALID;
+        }
+    }
 
     let embedder = match load_embedder(cli.mode, &base_dir).await {
         Ok(e) => e,
@@ -205,28 +221,234 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         return run_agent_view(&cli, &loaded_golden, &embedder, &counter, &base_dir).await;
     }
 
-    let seeded = match seed::seed(&golden_set.corpus, &embedder, cli.fts_tokenizer.as_deref()).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("seeding failed: {e}");
-            return EXIT_RUNTIME_FAILURE;
+    let Some(snapshot) = &cli.background else {
+        let seeded = match seed::seed(&scratch, &golden_set.corpus, &embedder, cli.fts_tokenizer.as_deref()).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("seeding failed: {e}");
+                release_seeded(&scratch, cli.keep_store).await;
+                return EXIT_RUNTIME_FAILURE;
+            }
+        };
+        println!("seeded {} rows", golden_set.corpus.len());
+        let code = measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, None, &[]).await;
+        if let Err(e) = seeded.store.close().await {
+            eprintln!("warning: {e}");
         }
+        release_seeded(&scratch, cli.keep_store).await;
+        return code;
     };
 
-    // The temp store is left on disk on purpose: when a number in the results
-    // JSON looks wrong, the database that produced it is still there to be
-    // opened. Printing the path is what makes that recoverable — a per-run
-    // uuid directory nobody was told about is not a forensic trace.
-    println!("seeded {} rows into {}", golden_set.corpus.len(), seeded.store_path.display());
+    // A copy of a snapshot is removed whatever the run gives: it weighs as
+    // much as the store it copies, holds its text, and the snapshot is still
+    // there to measure again.
+    let cases: Vec<EvalCaseRef> = golden_set
+        .retrieval_cases
+        .iter()
+        .map(|c| EvalCaseRef { id: c.query.clone(), project: c.project.clone(), origins: c.expected_origins.clone() })
+        .collect();
+    let (seeded, background, resolved) =
+        match seed_over_background(snapshot, &scratch, &cases, &golden_set.corpus, &embedder).await {
+            Ok(over) => over,
+            Err(failure) => {
+                seed::remove_scratch(&scratch).await;
+                return match failure {
+                    OverFailure::Store(e) => {
+                        eprintln!("{}: {e}", snapshot.display());
+                        EXIT_RUNTIME_FAILURE
+                    }
+                    OverFailure::Golden(e) => {
+                        eprintln!("golden set validation failed: {e}");
+                        EXIT_GOLDEN_INVALID
+                    }
+                };
+            }
+        };
+    println!(
+        "seeded {} rows over a copy of {} in {}",
+        golden_set.corpus.len(),
+        snapshot.display(),
+        seeded.store_path.display()
+    );
+    let code =
+        measure(&cli, &loaded_golden, &embedder, &counter, budget, &seeded, Some(background), &resolved).await;
+    if let Err(e) = seeded.store.close().await {
+        eprintln!("warning: {e}");
+    }
+    seed::remove_scratch(&scratch).await;
+    code
+}
 
+/// Removes the store a run seeded in `scratch`, or names it when `keep` asks
+/// for it to stay.
+async fn release_seeded(scratch: &std::path::Path, keep: bool) {
+    if keep {
+        println!("kept the seeded store in {}", scratch.display());
+    } else {
+        seed::remove_scratch(scratch).await;
+    }
+}
+
+/// Why a run over a background stopped before measuring.
+enum OverFailure {
+    /// The snapshot, or its copy, could not be used.
+    Store(EvalError),
+    /// A case names a project or an origin the background does not hold.
+    Golden(EvalResolveError),
+}
+
+impl From<EvalError> for OverFailure {
+    fn from(e: EvalError) -> Self {
+        OverFailure::Store(e)
+    }
+}
+
+/// Copies `snapshot` into `scratch`, refusing one that cannot be measured over
+/// before anything opens the copy for writing, opens the copy (which migrates
+/// an older schema), resolves each case's project and origins in it, reads
+/// what it holds and seeds `corpus` on top.
+async fn seed_over_background(
+    snapshot: &std::path::Path,
+    scratch: &std::path::Path,
+    cases: &[EvalCaseRef],
+    corpus: &[golden::CorpusRow],
+    embedder: &EvalEmbedder,
+) -> Result<(seed::SeedResult, report::Background, Vec<EvalResolved>), OverFailure> {
+    std::fs::create_dir_all(scratch).map_err(|e| EvalError::Open(format!("{}: {e}", scratch.display())))?;
+    let copied = copy_background(snapshot, scratch, embedder)?;
+    let store = EvalStore::open(scratch).await?;
+    let read = async {
+        let resolved = store.resolve_cases(cases).await.map_err(OverFailure::Golden)?;
+        let composition = store.composition().await?;
+        Ok::<_, OverFailure>((resolved, composition))
+    }
+    .await;
+    let (resolved, composition) = match read {
+        Ok(read) => read,
+        Err(failure) => {
+            seed::close_after_failure(store).await;
+            return Err(failure);
+        }
+    };
+    let seeded = seed::seed_onto(store, scratch.to_path_buf(), corpus, embedder).await?;
+    let twins = seeded.store.twins(seeded.refs.ids()).await;
+    let mut twins: Vec<String> = match twins {
+        Ok(ids) => ids.into_iter().filter_map(|id| seeded.refs.ref_of(id).map(str::to_string)).collect(),
+        Err(e) => {
+            seed::close_after_failure(seeded.store).await;
+            return Err(e.into());
+        }
+    };
+    twins.sort();
+    let background = report::Background {
+        path: snapshot.to_string_lossy().to_string(),
+        sha256: copied.sha256,
+        contract: copied.contract,
+        schema: report::SchemaSpan { from: copied.schema_from, to: copied.schema_to },
+        // The searches follow once the cases are embedded.
+        searched_at_ms: now_ms(),
+        composition,
+        golden_twins: twins,
+    };
+    Ok((seeded, background, resolved))
+}
+
+/// The tag segment that names the snapshot a run measured over: two runs of
+/// one day, with and without it, write two files.
+fn background_slug(background: &report::Background) -> String {
+    format!("bg-{}", &background.sha256[..8])
+}
+
+/// A hit outside the golden corpus, which only a background holds: it keeps
+/// its place in the ranking, unnamed, so no expected row climbs past it.
+const BACKGROUND_HIT: &str = "bg";
+
+/// The refs of `ids`, in their order. Without a background every hit is a
+/// golden row; with one, a hit on a row of a save the case cites is its
+/// origin, the first time it shows, and any other keeps its place as `bg`.
+fn rank_refs(ids: &[i64], refs: &golden::RefMap, background: bool, cited: &HashMap<i64, String>) -> Vec<String> {
+    let mut shown = HashSet::new();
+    ids.iter()
+        .filter_map(|id| {
+            if let Some(r) = refs.ref_of(*id) {
+                return Some(r.to_string());
+            }
+            match cited.get(id) {
+                Some(origin) if shown.insert(origin.as_str()) => Some(origin.clone()),
+                _ => background.then(|| BACKGROUND_HIT.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// What one case's search over a background shows beside its metrics.
+async fn case_scale(
+    ec: &EmbeddedCase,
+    found: &EvalSearch,
+    seeded: &seed::SeedResult,
+    expected: &HashSet<String>,
+) -> Result<report::CaseScale, EvalError> {
+    let top5 = &found.hits[..found.hits.len().min(5)];
+    let memory_ids = top5.iter().filter(|h| h.kind == EvalKind::Memory).map(|h| h.id).collect();
+    let accessed: HashMap<i64, i64> = seeded.store.last_accessed(memory_ids).await?.into_iter().collect();
+    let now = now_ms();
+    let pool = report::PoolSurvival {
+        requested: found.pool.requested,
+        saves: found.pool.saves,
+        eligible: found.pool.eligible,
+        expected_in_pool: (ec.subset != CaseSubset::Unanswerable).then(|| {
+            found.pool.ids.iter().any(|id| {
+                ec.cited.contains_key(id) || seeded.refs.ref_of(*id).is_some_and(|r| expected.contains(r))
+            })
+        }),
+    };
+    let cause = report::short_pool_cause(&pool);
+    let scores: Vec<f64> = found.hits.iter().map(|h| h.score).collect();
+    Ok(report::CaseScale {
+        project: ec.project.clone(),
+        expected_type: ec.expected_type.clone(),
+        expected_is_last_summary: ec.expected_is_last_summary,
+        top5_types: top5.iter().map(|h| h.memory_type.clone()).collect(),
+        decay_age_days: top5
+            .iter()
+            .map(|h| match h.kind {
+                EvalKind::Memory => accessed.get(&h.id).map(|at| (now - at) as f64 / seed::DAY_MS),
+                _ => None,
+            })
+            .collect(),
+        best_cosine: found.hits.iter().filter(|h| !h.exact).map(|h| cosine_from_distance(h.distance)).reduce(f64::max),
+        score_gap_1_10: report::score_gap_1_10(&scores),
+        passes: Some(found.pool.passes),
+        pool_survival: Some(pool),
+        short_pool: Some(cause.is_some()),
+        short_pool_cause: cause,
+    })
+}
+
+/// Scores the golden cases over the seeded store and writes the results.
+/// `resolved` holds each case's project and cited saves in a background, in
+/// the order of the cases; it is empty without one.
+async fn measure(
+    cli: &cli::Cli,
+    loaded_golden: &golden::LoadedGolden,
+    embedder: &EvalEmbedder,
+    counter: &EvalTokenCounter,
+    budget: usize,
+    seeded: &seed::SeedResult,
+    background: Option<report::Background>,
+    resolved: &[EvalResolved],
+) -> i32 {
+    let golden_set = &loaded_golden.set;
     let lang_by_ref = row_langs(&golden_set.corpus);
+    let type_by_ref: HashMap<&str, &str> =
+        golden_set.corpus.iter().map(|r| (r.ref_.as_str(), r.memory_type.as_str())).collect();
 
     // Every query embedded exactly once, up front — shared unchanged across
     // every grid point's search below, so an N-point sweep never re-embeds
     // the same case N times. Search itself (the part that actually varies
     // per point) happens later, inside the grid loop.
     let mut embedded_cases: Vec<EmbeddedCase> = Vec::with_capacity(golden_set.retrieval_cases.len());
-    for case in &golden_set.retrieval_cases {
+    for (i, case) in golden_set.retrieval_cases.iter().enumerate() {
         // `history` is chronological oldest-first, as a human writes it;
         // `compose_query_context` wants newest-first, hence the reverse.
         // Empty history (every case in the current golden.json) makes this
@@ -247,15 +469,33 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 return EXIT_RUNTIME_FAILURE;
             }
         };
+        let resolution = resolved.get(i);
+        let cited_save = resolution.and_then(|r| r.expected.first());
         embedded_cases.push(EmbeddedCase {
             query: case.query.clone(),
             expected_refs: case.expected_refs.clone(),
+            expected_origins: case.expected_origins.clone(),
             corpus_refs: case.corpus_refs.clone(),
             status: case.status,
             query_lang: case.query_lang.clone(),
-            lang: case_lang(&case.expected_refs, &lang_by_ref),
+            lang: match cited_save {
+                Some(save) => Some(save.lang.clone()),
+                None => case_lang(&case.expected_refs, &lang_by_ref),
+            },
             subset: case.subset,
             stale_refs: case.stale_refs.clone(),
+            project: case.project.clone(),
+            expected_type: match cited_save {
+                Some(save) => Some(save.memory_type.clone()),
+                None => case.expected_refs.first().and_then(|r| type_by_ref.get(r.as_str())).map(|t| t.to_string()),
+            },
+            expected_is_last_summary: cited_save
+                .filter(|save| save.memory_type == "session_summary")
+                .map(|save| save.is_last_summary),
+            project_id: resolution.and_then(|r| r.project_id.clone()),
+            cited: resolution
+                .map(|r| r.expected.iter().flat_map(|s| s.rows.iter().map(|id| (*id, s.origin.clone()))).collect())
+                .unwrap_or_default(),
             embedding,
         });
     }
@@ -269,7 +509,10 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     let similarity_results = if cli.mode == cli::Mode::Real {
         let sim_sources: Vec<SimCaseSource> = embedded_cases
             .iter()
-            .filter(|c| c.status != CaseStatus::KnownRed && c.subset != CaseSubset::Unanswerable)
+            // A case by origin has no vector of the corpus to rank.
+            .filter(|c| {
+                c.status != CaseStatus::KnownRed && c.subset != CaseSubset::Unanswerable && c.expected_origins.is_empty()
+            })
             .map(|c| SimCaseSource {
                 query: c.query.clone(),
                 expected_refs: c.expected_refs.clone(),
@@ -366,6 +609,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     // just below the grid, where it used to live) because the `--follow-up`
     // branch needs it too and returns before the grid is ever built.
     let run_tag = fold_tag(cli.tag.as_deref(), tokenizer_slug(cli.fts_tokenizer.as_deref()).as_deref());
+    let run_tag = fold_tag(run_tag.as_deref(), background.as_ref().map(background_slug).as_deref());
     // Recorded as the tokenizer actually in effect, never as "the flag was
     // absent": a results file exists to answer what produced its numbers, and
     // the absence of a flag is a fact about a command line, not about an index.
@@ -375,9 +619,9 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
     if cli.follow_up {
         return run_follow_up(FollowUpRunContext {
             golden_set,
-            embedder: &embedder,
-            seeded: &seeded,
-            counter: &counter,
+            embedder,
+            seeded,
+            counter,
             budget,
             lang_by_ref: &lang_by_ref,
             date,
@@ -427,24 +671,46 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
         let mut blocked = Vec::new();
         let mut unanswerable = Vec::new();
         for ec in &embedded_cases {
-            let ids: Vec<i64> = if cli.lexical_only {
-                seeded.store.lexical_search(&ec.query, seed::AGENT_ID, K_FINAL).await
+            let found = if cli.lexical_only {
+                None
             } else {
                 match seeded
                     .store
-                    .search(&ec.embedding, seed::AGENT_ID, scope, K_FINAL, point.scoring, Some(&ec.query))
+                    .search(
+                        &ec.embedding,
+                        seed::AGENT_ID,
+                        scope,
+                        ec.project_id.as_deref(),
+                        K_FINAL,
+                        point.scoring,
+                        Some(&ec.query),
+                    )
                     .await
                 {
-                    Ok(h) => h.iter().map(|h| h.id).collect(),
+                    Ok(found) => Some(found),
                     Err(e) => {
                         eprintln!("search failed for query '{}': {e}", ec.query);
                         return EXIT_RUNTIME_FAILURE;
                     }
                 }
             };
-            let ranked_refs: Vec<String> =
-                ids.iter().filter_map(|id| seeded.refs.ref_of(*id)).map(|r| r.to_string()).collect();
-            let expected: HashSet<String> = ec.expected_refs.iter().cloned().collect();
+            let ids: Vec<i64> = match &found {
+                Some(found) => found.hits.iter().map(|h| h.id).collect(),
+                None => seeded.store.lexical_search(&ec.query, seed::AGENT_ID, K_FINAL).await,
+            };
+            let ranked_refs = rank_refs(&ids, &seeded.refs, background.is_some(), &ec.cited);
+            let expected_refs: Vec<String> = ec.expected_refs.iter().chain(&ec.expected_origins).cloned().collect();
+            let expected: HashSet<String> = expected_refs.iter().cloned().collect();
+            let scale = match (&background, &found) {
+                (Some(_), Some(found)) => match case_scale(ec, found, seeded, &expected).await {
+                    Ok(scale) => scale,
+                    Err(e) => {
+                        eprintln!("failed to read the hits of '{}': {e}", ec.query);
+                        return EXIT_RUNTIME_FAILURE;
+                    }
+                },
+                _ => report::CaseScale::default(),
+            };
 
             let recall_1 = metrics::recall_at_k(&ranked_refs, &expected, 1);
             let recall_5 = metrics::recall_at_k(&ranked_refs, &expected, 5);
@@ -457,7 +723,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 .then(|| metrics::fresh_first(&ranked_refs, &ec.expected_refs[0], &ec.stale_refs));
             let result = report::CaseResult {
                 query: ec.query.clone(),
-                expected_refs: ec.expected_refs.clone(),
+                expected_refs,
                 ranked_refs,
                 recall_1,
                 recall_5,
@@ -470,6 +736,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
                 subset: ec.subset,
                 abstained,
                 fresh_first,
+                scale,
             };
 
             if abstained.is_some() {
@@ -487,7 +754,10 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        let retrieval = report::RetrievalResults::from_cases(per_case, blocked, unanswerable);
+        let mut retrieval = report::RetrievalResults::from_cases(per_case, blocked, unanswerable);
+        retrieval.scale = background
+            .as_ref()
+            .map(|b| report::scale_of(&retrieval.per_case, &retrieval.unanswerable, &b.composition.by_type));
         let aggregate = retrieval.aggregate;
         let per_case = &retrieval.per_case;
         // Computed unconditionally, not gated behind `cli.audit`: a sweep's
@@ -536,6 +806,7 @@ async fn run<I: Iterator<Item = String>>(args: I) -> i32 {
             audit: audit_report,
             similarity: similarity_results.clone(),
             agent_view: None,
+            background: background.clone(),
         };
 
         report::print_stdout(&results);
@@ -631,9 +902,14 @@ async fn run_agent_view(
             cli::Mode::Real => base_dir,
             cli::Mode::Fake => &scratch,
         },
+        background: cli.background.as_deref(),
     };
-    let view = match agent_view::runner::run(&input, &scratch).await {
-        Ok(view) => view,
+    let (view, background) = match agent_view::runner::run(&input, &scratch).await {
+        Ok(measured) => measured,
+        Err(agent_view::runner::RunError::Golden(e)) => {
+            eprintln!("golden set validation failed: {e}");
+            return EXIT_GOLDEN_INVALID;
+        }
         Err(e) => {
             eprintln!("agent-view run failed: {e}");
             return EXIT_RUNTIME_FAILURE;
@@ -643,7 +919,7 @@ async fn run_agent_view(
 
     // Only the agent-view summary is printed: the ordinary report would show
     // an empty retrieval block, as if the ranking had been scored and failed.
-    let results = build_agent_view_run_results(cli, loaded_golden, embedder, view);
+    let results = build_agent_view_run_results(cli, loaded_golden, embedder, view, background);
     match report::write_json(&results, &cli.out_dir, cli.force) {
         Ok(path) => {
             println!("results written to {}", path.display());
@@ -669,16 +945,18 @@ fn build_agent_view_run_results(
     loaded_golden: &golden::LoadedGolden,
     embedder: &EvalEmbedder,
     view: agent_view::AgentViewResults,
+    background: Option<report::Background>,
 ) -> report::RunResults {
     let golden_set = &loaded_golden.set;
     let mode = match cli.mode {
         cli::Mode::Fake => report::Mode::Fake,
         cli::Mode::Real => report::Mode::Real,
     };
+    let tag = fold_tag(cli.tag.as_deref(), Some("agent-view"));
     report::RunResults {
         date: current_date_string(),
         mode,
-        tag: fold_tag(cli.tag.as_deref(), Some("agent-view")),
+        tag: fold_tag(tag.as_deref(), background.as_ref().map(background_slug).as_deref()),
         model_id: embedder.model_id().to_string(),
         git_sha: report::git_sha(),
         k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: K_POOL.lexical },
@@ -700,6 +978,7 @@ fn build_agent_view_run_results(
         audit: None,
         similarity: None,
         agent_view: Some(view),
+        background,
     }
 }
 
@@ -710,6 +989,22 @@ fn build_agent_view_run_results(
 /// touched, so a failure here is reported as a generic runtime failure rather
 /// than overloading a more specific code with a meaning it does not have.
 fn run_diff(a_path: &std::path::Path, b_path: &std::path::Path, fail_on_regression: bool) -> i32 {
+    match docs::diff_files(a_path, b_path) {
+        Ok(Some(d)) => {
+            print!("{}", docs::render_diff(&d));
+            return if fail_on_regression && docs::regressed(&d) {
+                eprintln!("docs hit@3 got worse with p < 0.05");
+                EXIT_REGRESSION
+            } else {
+                EXIT_OK
+            };
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("error: {e}");
+            return EXIT_RUNTIME_FAILURE;
+        }
+    }
     match diff::diff_files(a_path, b_path) {
         Ok(d) => {
             diff::print_stdout(&d);
@@ -852,10 +1147,10 @@ async fn score_follow_up_arm<'a>(
         let hits = match ctx
             .seeded
             .store
-            .search(&embedding, seed::AGENT_ID, K_POOL, K_FINAL, EvalScoringConfig::default(), Some(&arm.lexical))
+            .search(&embedding, seed::AGENT_ID, K_POOL, None, K_FINAL, EvalScoringConfig::default(), Some(&arm.lexical))
             .await
         {
-            Ok(h) => h,
+            Ok(found) => found.hits,
             Err(e) => {
                 eprintln!("search failed for '{}': {e}", case.query);
                 return Err(EXIT_RUNTIME_FAILURE);
@@ -886,6 +1181,7 @@ async fn score_follow_up_arm<'a>(
             subset: case.subset,
             abstained: None,
             fresh_first: None,
+            scale: Default::default(),
         });
     }
     Ok(per_case)
@@ -928,6 +1224,7 @@ fn build_follow_up_run_results(
         audit: None,
         similarity: None,
         agent_view: None,
+        background: None,
     }
 }
 
@@ -963,12 +1260,21 @@ fn write_follow_up_arm_results(
 struct EmbeddedCase {
     query: String,
     expected_refs: Vec<String>,
+    expected_origins: Vec<String>,
     corpus_refs: Vec<String>,
     status: CaseStatus,
     query_lang: Option<String>,
     lang: Option<String>,
     subset: CaseSubset,
     stale_refs: Vec<String>,
+    /// The case's project, as the case names it.
+    project: Option<String>,
+    expected_type: Option<String>,
+    expected_is_last_summary: Option<bool>,
+    /// The background's own id of the case's project.
+    project_id: Option<String>,
+    /// Every live row of the saves the case cites, with its origin.
+    cited: HashMap<i64, String>,
     embedding: Vec<f32>,
 }
 
@@ -1169,6 +1475,7 @@ fn build_similarity_results(
             subset: src.subset,
             abstained: None,
             fresh_first: None,
+            scale: Default::default(),
         });
 
         // Query-anchored rivals: every OTHER corpus vector, not just this
@@ -1311,10 +1618,14 @@ fn current_date_string() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clawg_core::eval_api::production_lexical_budget;
+    use clawg_core::eval_api::{production_lexical_budget, sha256_hex, EvalIngest, EvalSave};
 
     #[test]
     fn civil_from_days_matches_known_reference_dates() {
@@ -1350,8 +1661,21 @@ mod tests {
         assert_eq!(case_lang(&[], &lang_by_ref), None, "no expected rows, nothing to attribute");
     }
 
-    fn temp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("rag-eval-main-test-{tag}-{}", uuid::Uuid::new_v4()))
+    use crate::test_temp::{temp_path, TempPath};
+
+    /// The `memory.db` of a background, in a directory removed when the test
+    /// that made it ends.
+    struct Snapshot {
+        file: PathBuf,
+        _dir: TempPath,
+    }
+
+    impl std::ops::Deref for Snapshot {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.file
+        }
     }
 
     /// Runs `--fake` on `golden_json` under `tag` and returns the results file.
@@ -1379,6 +1703,628 @@ mod tests {
 
     fn with_extra_case(golden: &str, case: &str) -> String {
         golden.replacen(r#""retrieval_cases": ["#, &format!(r#""retrieval_cases": [{case},"#), 1)
+    }
+
+    /// `memory.db` of a store holding `texts`, saved through the ingest under
+    /// one agent and closed so the file stands alone, as `clawg backup` leaves
+    /// a snapshot.
+    async fn background_snapshot(texts: &[String]) -> Snapshot {
+        background_with(texts, &[], &[]).await
+    }
+
+    /// A save of a background that an import of `origin` wrote.
+    struct Imported {
+        origin: &'static str,
+        project: Option<&'static str>,
+        memory_type: &'static str,
+        text: &'static str,
+    }
+
+    /// [`background_snapshot`] of `notes`, plus `imports` saved under the
+    /// agent an import uses and marked as an import of their origin writes
+    /// them, with each project of `names` given its name.
+    async fn background_with(notes: &[String], imports: &[Imported], names: &[(&str, &str)]) -> Snapshot {
+        let dir = temp_path("background");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ingest = EvalIngest::open(&dir, &EvalEmbedder::fake(), &dir).await.unwrap();
+        for text in notes {
+            ingest.send("background-agent", text, "semantic_fact", 3.0, 0).await.unwrap();
+        }
+        let mut marks: Vec<(String, Vec<i64>)> = Vec::new();
+        for imported in imports {
+            let saved = ingest
+                .save(EvalSave {
+                    agent_id: "migrated",
+                    project_id: imported.project,
+                    content: imported.text,
+                    memory_type: imported.memory_type,
+                    importance: 3.0,
+                    topic_key: None,
+                })
+                .await
+                .unwrap();
+            marks.push((imported.origin.to_string(), saved.rows.iter().map(|(id, _)| *id).collect()));
+        }
+        let runtime = ingest.finish().await.unwrap();
+        let names: Vec<(String, String)> = names.iter().map(|(id, name)| (id.to_string(), name.to_string())).collect();
+        runtime
+            .store
+            .conn
+            .call(move |c| {
+                for (origin, ids) in &marks {
+                    for id in ids {
+                        c.execute(
+                            "UPDATE memory SET source = 'import', created_by_ref = ?1 WHERE id = ?2",
+                            (origin.as_str(), *id),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
+                for (id, name) in &names {
+                    c.execute("UPDATE project SET name = ?1 WHERE id = ?2", (name.as_str(), id.as_str()))
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok::<(), String>(())
+            })
+            .await
+            .unwrap();
+        runtime.store.conn.clone().close().await.unwrap();
+        Snapshot { file: dir.join("memory.db"), _dir: dir }
+    }
+
+    const FERRY: &str = "the ferry to the island leaves from the north pier at nine";
+
+    /// A golden of one case over a background, besides the corpus of
+    /// [`sweep_golden_json`].
+    fn golden_with_case(case: &str) -> String {
+        sweep_golden_json().replacen(r#""retrieval_cases": ["#, &format!(r#""retrieval_cases": [{case},"#), 1)
+    }
+
+    /// The exit code of `--fake` on `golden_json`, over `snapshot` when given.
+    async fn exit_of(golden_json: &str, tag: &str, snapshot: Option<&std::path::Path>) -> i32 {
+        let out_dir = temp_path(&format!("{tag}-out"));
+        let scratch = temp_path(&format!("{tag}-scratch"));
+        let code = match snapshot {
+            Some(snapshot) => run_over(golden_json, snapshot, tag, &out_dir, &scratch).await,
+            None => {
+                let golden_path = temp_path(&format!("{tag}-golden.json"));
+                std::fs::write(&golden_path, golden_json).unwrap();
+                let args = ["rag-eval", "--fake", "--golden", &golden_path.to_string_lossy(), "--out", &out_dir.to_string_lossy()]
+                    .map(str::to_string);
+                let code = run_with_scratch(args.into_iter(), scratch.to_path_buf()).await;
+                std::fs::remove_file(&golden_path).ok();
+                code
+            }
+        };
+        assert!(!scratch.exists(), "the copy is removed whatever the run gives");
+        std::fs::remove_dir_all(&out_dir).ok();
+        code
+    }
+
+    #[tokio::test]
+    async fn an_origin_case_finds_its_save_in_the_background() {
+        let imports = [Imported { origin: "engram:ferry", project: Some("app-1111"), memory_type: "semantic_fact", text: FERRY }];
+        let snapshot = background_with(&background_notes(20), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(&format!(r#"{{"query": "{FERRY}", "expected_origins": ["engram:ferry"], "project": "App"}}"#));
+        let (out_dir, scratch) = (temp_path("origin-found-out"), temp_path("origin-found-scratch"));
+
+        assert_eq!(run_over(&golden, &snapshot, "origin-found", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, _, json) = only_results(&out_dir);
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["expected_refs"], serde_json::json!(["engram:ferry"]), "{case}");
+        assert_eq!(case["ranked_refs"][0], "engram:ferry", "{case}");
+        assert_eq!(case["recall@1"], 1.0);
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_origin_without_a_row_fails_validation() {
+        let snapshot = background_snapshot(&background_notes(5)).await;
+        let golden = golden_with_case(r#"{"query": "anything", "expected_origins": ["engram:no-such-note"]}"#);
+
+        assert_eq!(exit_of(&golden, "origin-missing", Some(&snapshot)).await, EXIT_GOLDEN_INVALID);
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_origin_case_without_background_fails_validation() {
+        let golden = golden_with_case(r#"{"query": "anything", "expected_origins": ["engram:ferry"]}"#);
+
+        assert_eq!(exit_of(&golden, "origin-no-background", None).await, EXIT_GOLDEN_INVALID);
+    }
+
+    #[tokio::test]
+    async fn project_without_background_fails_validation() {
+        let golden = golden_with_case(r#"{"query": "anything", "corpus_refs": ["c1"], "expected_refs": ["c1"], "project": "App"}"#);
+
+        assert_eq!(exit_of(&golden, "project-no-background", None).await, EXIT_GOLDEN_INVALID);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_or_unknown_project_name_fails_validation() {
+        let imports = [
+            Imported { origin: "engram:one", project: Some("app-1111"), memory_type: "semantic_fact", text: "one app note" },
+            Imported { origin: "engram:two", project: Some("app-2222"), memory_type: "semantic_fact", text: "another app note" },
+        ];
+        let snapshot = background_with(&[], &imports, &[("app-1111", "App"), ("app-2222", "APP")]).await;
+
+        for (project, tag) in [("app", "project-ambiguous"), ("nowhere", "project-unknown")] {
+            let golden = golden_with_case(&format!(r#"{{"query": "anything", "subset": "unanswerable", "project": "{project}"}}"#));
+            assert_eq!(exit_of(&golden, tag, Some(&snapshot)).await, EXIT_GOLDEN_INVALID, "{project}");
+        }
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_expected_save_outside_the_case_project_fails_validation() {
+        let imports = [
+            Imported { origin: "engram:app", project: Some("app-1111"), memory_type: "semantic_fact", text: "an app note" },
+            Imported { origin: "engram:other", project: Some("other-2222"), memory_type: "semantic_fact", text: "a note of another project" },
+        ];
+        let snapshot = background_with(&[], &imports, &[("app-1111", "App"), ("other-2222", "Other")]).await;
+        let golden = golden_with_case(r#"{"query": "anything", "expected_origins": ["engram:other"], "project": "App"}"#);
+
+        assert_eq!(exit_of(&golden, "origin-outside", Some(&snapshot)).await, EXIT_GOLDEN_INVALID);
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_case_may_name_a_project() {
+        let imports = [Imported { origin: "engram:app", project: Some("app-1111"), memory_type: "semantic_fact", text: "an app note" }];
+        let snapshot = background_with(&background_notes(5), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(r#"{"query": "a question nobody answered", "subset": "unanswerable", "project": "App"}"#);
+        let (out_dir, scratch) = (temp_path("unanswerable-project-out"), temp_path("unanswerable-project-scratch"));
+
+        assert_eq!(run_over(&golden, &snapshot, "unanswerable-project", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, _, json) = only_results(&out_dir);
+        assert_eq!(json["retrieval"]["unanswerable"].as_array().unwrap().len(), 1);
+        assert_eq!(json["retrieval"]["abstention"]["n_cases"], 1);
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    /// The results of `--fake` on `golden_json` over `snapshot`, which it removes.
+    async fn results_over(golden_json: &str, snapshot: Snapshot, tag: &str) -> (String, serde_json::Value) {
+        let (out_dir, scratch) = (temp_path(&format!("{tag}-out")), temp_path(&format!("{tag}-scratch")));
+        assert_eq!(run_over(golden_json, &snapshot, tag, &out_dir, &scratch).await, EXIT_OK);
+        let (_, raw, json) = only_results(&out_dir);
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+        (raw, json)
+    }
+
+    #[tokio::test]
+    async fn a_case_reports_the_type_of_each_top5_hit() {
+        let (_, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "top5").await;
+
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["expected_type"], "chat_message");
+        assert_eq!(
+            case["top5_types"],
+            serde_json::json!(["chat_message", "semantic_fact", "semantic_fact", "semantic_fact", "semantic_fact"]),
+            "the identical golden row first, then the background by id: {case}"
+        );
+    }
+
+    #[tokio::test]
+    async fn best_cosine_of_an_identical_row_is_one() {
+        let (_, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "cosine").await;
+
+        let best = json["retrieval"]["per_case"][0]["best_cosine"].as_f64().unwrap();
+        assert!((best - 1.0).abs() < 1e-6, "{best}");
+        assert!(json["retrieval"]["per_case"][0]["score_gap_1_10"].as_f64().unwrap() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_case_reports_passes_pool_survival_and_decay_age() {
+        let (_, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "pool").await;
+
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["passes"], 1);
+        assert_eq!(
+            case["pool_survival"],
+            serde_json::json!({"requested": 30, "saves": 23, "eligible": 23, "expected_in_pool": true}),
+            "{case}"
+        );
+        let ages = case["decay_age_days"].as_array().unwrap();
+        assert_eq!(ages.len(), 5);
+        assert!(ages.iter().all(|a| a.as_f64().unwrap() < 1.0), "{ages:?}");
+    }
+
+    #[tokio::test]
+    async fn a_case_whose_pool_returns_fewer_than_thirty_saves_is_a_short_pool() {
+        let (_, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "short").await;
+
+        let retrieval = &json["retrieval"];
+        assert_eq!(retrieval["per_case"][0]["short_pool"], true);
+        assert_eq!(retrieval["per_case"][0]["short_pool_cause"], "scope");
+        assert_eq!(retrieval["scale"]["short_pool_cases"], serde_json::json!({"scope": 2, "crowded": 0}));
+        assert_eq!(retrieval["scale"]["top3_by_type"]["n_cases"], 0, "a short pool stays out of the weight aggregates");
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_case_reports_its_distribution_apart() {
+        let golden = golden_with_case(r#"{"query": "a question nobody answered", "subset": "unanswerable"}"#);
+
+        let (_, json) = results_over(&golden, background_snapshot(&background_notes(40)).await, "unanswerable-scale").await;
+
+        let retrieval = &json["retrieval"];
+        assert_eq!(retrieval["per_case"].as_array().unwrap().len(), 2);
+        let unanswered = &retrieval["unanswerable"][0];
+        assert_eq!(unanswered["top5_types"].as_array().unwrap().len(), 5, "{unanswered}");
+        assert!(unanswered.get("best_cosine").is_some(), "{unanswered}");
+        assert!(unanswered["pool_survival"].get("expected_in_pool").is_none(), "{unanswered}");
+        let cells = retrieval["scale"]["distributions"].as_array().unwrap();
+        assert!(cells.iter().any(|d| d["answered"] == false), "{cells:?}");
+    }
+
+    #[tokio::test]
+    async fn the_per_case_report_holds_no_stored_text_or_row_id() {
+        let (raw, json) = results_over(sweep_golden_json(), background_snapshot(&background_notes(20)).await, "no-text").await;
+
+        assert!(!raw.contains("harbour timetable"));
+        let mut keys: Vec<String> = json["retrieval"]["per_case"][0].as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "best_cosine", "decay_age_days", "expected_refs", "expected_type", "lang", "mrr", "ndcg@10", "passes",
+                "pool_survival", "query", "ranked_refs", "recall@1", "recall@10", "recall@5", "score_gap_1_10",
+                "short_pool", "short_pool_cause", "status", "subset", "top5_types"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_case_expecting_a_summary_says_whether_it_is_the_last_one() {
+        const SUMMARY: &str = "the last session moved the ferry timetable to the harbour office";
+        let imports = [Imported { origin: "engram:last", project: Some("app-1111"), memory_type: "session_summary", text: SUMMARY }];
+        let snapshot = background_with(&background_notes(5), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(&format!(r#"{{"query": "{SUMMARY}", "expected_origins": ["engram:last"], "project": "App"}}"#));
+
+        let (_, json) = results_over(&golden, snapshot, "last-summary").await;
+
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["project"], "App");
+        assert_eq!(case["expected_type"], "session_summary");
+        assert_eq!(case["expected_is_last_summary"], true, "{case}");
+    }
+
+    /// The results of `--fake --agent-view` on `golden_json` over `snapshot`,
+    /// which it removes.
+    async fn agent_view_over(golden_json: &str, snapshot: Snapshot, tag: &str) -> serde_json::Value {
+        let golden_path = temp_path(&format!("{tag}-golden.json"));
+        std::fs::write(&golden_path, golden_json).unwrap();
+        let out_dir = temp_path(&format!("{tag}-out"));
+        let args = [
+            "rag-eval",
+            "--fake",
+            "--agent-view",
+            "--golden",
+            &golden_path.to_string_lossy(),
+            "--out",
+            &out_dir.to_string_lossy(),
+            "--tag",
+            tag,
+            "--background",
+            &snapshot.to_string_lossy(),
+        ]
+        .map(str::to_string);
+        assert_eq!(run(args.into_iter()).await, EXIT_OK);
+        let (_, _, json) = only_results(&out_dir);
+        std::fs::remove_file(&golden_path).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+        json
+    }
+
+    #[tokio::test]
+    async fn agent_view_sends_the_case_project_to_search_and_context() {
+        const SUMMARY: &str = "the last session moved the ferry timetable to the harbour office by the north pier";
+        let imports = [Imported { origin: "engram:last", project: Some("app-1111"), memory_type: "session_summary", text: SUMMARY }];
+        let snapshot = background_with(&background_notes(5), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(
+            r#"{"query": "which colour was chosen for the dashboard", "expected_origins": ["engram:last"], "project": "App"}"#,
+        );
+
+        let json = agent_view_over(&golden, snapshot, "view-project").await;
+
+        let case = &json["agent_view"]["per_case"][0];
+        assert!(
+            case["context"]["sections"].get("LAST SESSION").is_some(),
+            "only a context asked for the project opens with its last session: {case}"
+        );
+        assert_eq!(json["background"]["composition"]["rows"], 6);
+    }
+
+    #[tokio::test]
+    async fn an_origin_case_is_found_in_any_piece_of_its_save() {
+        let long: String = (0..60)
+            .map(|i| match i {
+                30 => "the spare keys of the pier are kept under ZQXPIER42 in the harbour office. ".to_string(),
+                _ => format!("sentence {i} of the long harbour note says the pier opens at dawn. "),
+            })
+            .collect();
+        let long: &'static str = Box::leak(long.into_boxed_str());
+        let imports = [Imported { origin: "engram:long", project: Some("app-1111"), memory_type: "semantic_fact", text: long }];
+        let snapshot = background_with(&background_notes(3), &imports, &[("app-1111", "App")]).await;
+        let golden = golden_with_case(
+            r#"{"query": "where are the keys of ZQXPIER42", "expected_origins": ["engram:long"], "project": "App"}"#,
+        );
+
+        let json = agent_view_over(&golden, snapshot, "view-piece").await;
+
+        let case = &json["agent_view"]["per_case"][0];
+        assert_eq!(case["expected_refs"], serde_json::json!(["engram:long"]));
+        assert_eq!(case["search"]["found"], true, "a fragment of the piece shown is a fragment of the save: {case}");
+    }
+
+    #[test]
+    fn a_hit_on_any_piece_of_the_cited_save_counts() {
+        let mut refs = golden::RefMap::new();
+        refs.insert("c1", 100);
+        let cited: HashMap<i64, String> = [(7, "engram:long"), (8, "engram:long"), (9, "engram:long")]
+            .into_iter()
+            .map(|(id, origin)| (id, origin.to_string()))
+            .collect();
+
+        assert_eq!(rank_refs(&[8, 100], &refs, true, &cited), ["engram:long", "c1"]);
+        assert_eq!(rank_refs(&[9], &refs, true, &cited), ["engram:long"]);
+    }
+
+    #[test]
+    fn a_background_hit_not_cited_never_counts() {
+        let refs = golden::RefMap::new();
+        let cited: HashMap<i64, String> = [(7, "engram:a".to_string()), (20, "engram:a".to_string())].into_iter().collect();
+
+        assert_eq!(
+            rank_refs(&[3, 7, 20, 4], &refs, true, &cited),
+            ["bg", "engram:a", "bg", "bg"],
+            "a second live save of one origin counts once"
+        );
+        assert_eq!(rank_refs(&[3, 7], &refs, false, &HashMap::new()), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_golden_without_origins_measures_exactly_as_before() {
+        let json = run_fake(sweep_golden_json(), "no-origins").await;
+
+        let retrieval = &json["retrieval"];
+        assert_eq!(retrieval["per_case"][0]["expected_refs"], serde_json::json!(["c1"]));
+        assert_eq!(retrieval["per_case"][0]["ranked_refs"][0], "c1");
+        assert_eq!(retrieval["aggregate"]["recall@1"], 1.0);
+        assert_eq!(json["golden_set"]["content_sha256"], sha256_hex(sweep_golden_json().as_bytes()));
+    }
+
+    fn background_notes(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("background note {i} on the harbour timetable")).collect()
+    }
+
+    fn sha_of(path: &std::path::Path) -> String {
+        sha256_hex(&std::fs::read(path).unwrap())
+    }
+
+    /// Runs `--fake --background snapshot` on `golden_json` under `tag`,
+    /// writing to `out_dir` and copying the snapshot into `scratch`.
+    async fn run_over(golden_json: &str, snapshot: &std::path::Path, tag: &str, out_dir: &std::path::Path, scratch: &std::path::Path) -> i32 {
+        let golden_path = temp_path(&format!("{tag}-golden.json"));
+        std::fs::write(&golden_path, golden_json).unwrap();
+        let args = [
+            "rag-eval",
+            "--fake",
+            "--golden",
+            &golden_path.to_string_lossy(),
+            "--out",
+            &out_dir.to_string_lossy(),
+            "--tag",
+            tag,
+            "--background",
+            &snapshot.to_string_lossy(),
+        ]
+        .map(str::to_string);
+        let code = run_with_scratch(args.into_iter(), scratch.to_path_buf()).await;
+        std::fs::remove_file(&golden_path).ok();
+        code
+    }
+
+    /// The one results file in `out_dir`, as written and as parsed.
+    fn only_results(out_dir: &std::path::Path) -> (String, String, serde_json::Value) {
+        let files: Vec<PathBuf> = std::fs::read_dir(out_dir).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let raw = std::fs::read_to_string(&files[0]).unwrap();
+        let name = files[0].file_name().unwrap().to_string_lossy().to_string();
+        let json = serde_json::from_str(&raw).unwrap();
+        (name, raw, json)
+    }
+
+    #[tokio::test]
+    async fn a_background_run_leaves_the_snapshot_byte_identical() {
+        let snapshot = background_snapshot(&background_notes(200)).await;
+        let before = sha_of(&snapshot);
+        let (out_dir, scratch) = (temp_path("bg-identical-out"), temp_path("bg-identical-scratch"));
+
+        let code = run_over(sweep_golden_json(), &snapshot, "bg-identical", &out_dir, &scratch).await;
+
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(sha_of(&snapshot), before);
+        assert!(!scratch.exists(), "the copy is removed when the run ends");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn the_background_copy_is_removed_even_when_the_run_fails() {
+        let snapshot = background_snapshot(&background_notes(20)).await;
+        let out_dir = temp_path("bg-fails-out");
+        let first = temp_path("bg-fails-first");
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-fails", &out_dir, &first).await, EXIT_OK);
+
+        let second = temp_path("bg-fails-second");
+        let code = run_over(sweep_golden_json(), &snapshot, "bg-fails", &out_dir, &second).await;
+
+        assert_eq!(code, EXIT_RESULTS_EXISTS, "the second run finds the first one's file after measuring");
+        assert!(!second.exists(), "the copy is removed when the run fails");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    /// [`run_over`] without a background: the corpus is seeded into `scratch`,
+    /// created beforehand so a run that leaves it behind is seen.
+    async fn run_seeded(tag: &str, out_dir: &std::path::Path, scratch: &std::path::Path, extra: &[&str]) -> i32 {
+        let golden_path = temp_path(&format!("{tag}-golden.json"));
+        std::fs::write(&golden_path, sweep_golden_json()).unwrap();
+        std::fs::create_dir_all(scratch).unwrap();
+        let (golden, out) = (golden_path.to_string_lossy().to_string(), out_dir.to_string_lossy().to_string());
+        let args: Vec<String> = ["rag-eval", "--fake", "--golden", &golden, "--out", &out, "--tag", tag]
+            .iter()
+            .chain(extra)
+            .map(|a| a.to_string())
+            .collect();
+        let code = run_with_scratch(args.into_iter(), scratch.to_path_buf()).await;
+        std::fs::remove_file(&golden_path).ok();
+        code
+    }
+
+    #[tokio::test]
+    async fn a_run_removes_the_store_it_seeded() {
+        let (out_dir, scratch) = (temp_path("seeded-out"), temp_path("seeded-scratch"));
+
+        let code = run_seeded("seeded", &out_dir, &scratch, &[]).await;
+
+        assert_eq!(code, EXIT_OK);
+        assert!(!scratch.exists(), "the store a run seeds is removed when it ends");
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_run_that_fails_after_seeding_removes_its_store_too() {
+        let out_dir = temp_path("seeded-fails-out");
+        let first = temp_path("seeded-fails-first");
+        assert_eq!(run_seeded("seeded-fails", &out_dir, &first, &[]).await, EXIT_OK);
+        let second = temp_path("seeded-fails-second");
+
+        let code = run_seeded("seeded-fails", &out_dir, &second, &[]).await;
+
+        assert_eq!(code, EXIT_RESULTS_EXISTS, "the second run finds the first one's file after measuring");
+        assert!(!second.exists(), "the store is removed when the run fails");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(&first).ok();
+    }
+
+    #[tokio::test]
+    async fn keep_store_leaves_the_seeded_store_on_disk() {
+        let (out_dir, scratch) = (temp_path("kept-out"), temp_path("kept-scratch"));
+
+        let code = run_seeded("kept", &out_dir, &scratch, &["--keep-store"]).await;
+
+        assert_eq!(code, EXIT_OK);
+        assert!(scratch.join("memory.db").exists(), "asked for, the store stays to be opened");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[tokio::test]
+    async fn a_refused_background_exits_with_one_naming_its_cause() {
+        let snapshot = background_snapshot(&background_notes(5)).await;
+        let wal = snapshot.with_file_name("memory.db-wal");
+        std::fs::write(&wal, b"commits the file alone does not have").unwrap();
+        let before = (sha_of(&snapshot), sha_of(&wal));
+        let (out_dir, scratch) = (temp_path("bg-refused-out"), temp_path("bg-refused-scratch"));
+
+        let code = run_over(sweep_golden_json(), &snapshot, "bg-refused", &out_dir, &scratch).await;
+
+        assert_eq!(code, EXIT_RUNTIME_FAILURE);
+        assert_eq!((sha_of(&snapshot), sha_of(&wal)), before);
+        assert!(!scratch.exists());
+        assert!(!out_dir.exists(), "nothing is measured over a refused snapshot");
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_run_without_background_measures_as_before() {
+        let json = run_fake(sweep_golden_json(), "no-background").await;
+
+        assert!(json.get("background").is_none(), "{json}");
+        for case in json["retrieval"]["per_case"].as_array().unwrap() {
+            assert!(case["ranked_refs"].as_array().unwrap().iter().all(|r| r != "bg"), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_report_describes_the_background_without_text() {
+        let snapshot = background_snapshot(&background_notes(200)).await;
+        let (out_dir, scratch) = (temp_path("bg-report-out"), temp_path("bg-report-scratch"));
+
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-report", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, raw, json) = only_results(&out_dir);
+        let background = &json["background"];
+        assert_eq!(background["path"], snapshot.to_string_lossy().as_ref());
+        assert_eq!(background["sha256"], sha_of(&snapshot));
+        assert_eq!(background["contract"]["model_id"], "fake-embedder");
+        assert_eq!(background["schema"]["from"], background["schema"]["to"]);
+        assert!(background["searched_at_ms"].as_i64().unwrap() > 0, "{background}");
+        assert_eq!(background["composition"]["rows"], 200);
+        assert_eq!(background["composition"]["by_agent"], serde_json::json!([{"value": "background-agent", "rows": 200}]));
+        assert_eq!(background["golden_twins"], serde_json::json!([]));
+        assert!(!raw.contains("harbour timetable"), "no text of the background reaches the results");
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_golden_row_also_in_the_background_is_named_a_twin() {
+        let mut texts = background_notes(20);
+        texts.push("the retrieval decay term compares milliseconds against seconds".to_string());
+        let snapshot = background_snapshot(&texts).await;
+        let (out_dir, scratch) = (temp_path("bg-twin-out"), temp_path("bg-twin-scratch"));
+
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-twin", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, _, json) = only_results(&out_dir);
+        assert_eq!(json["background"]["golden_twins"], serde_json::json!(["c1"]));
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn the_results_file_with_a_background_holds_no_stored_text() {
+        let snapshot = background_snapshot(&background_notes(30)).await;
+        let (out_dir, scratch) = (temp_path("bg-file-out"), temp_path("bg-file-scratch"));
+
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-file", &out_dir, &scratch).await, EXIT_OK);
+
+        let (name, raw, json) = only_results(&out_dir);
+        assert!(name.contains(&format!("bg-file-bg-{}", &sha_of(&snapshot)[..8])), "{name}");
+        assert!(!raw.contains("harbour timetable"));
+        for case in json["retrieval"]["per_case"].as_array().unwrap() {
+            for r in case["ranked_refs"].as_array().unwrap() {
+                assert!(["c1", "c2", "c3", "bg"].contains(&r.as_str().unwrap()), "a ranked ref is a golden ref or bg: {r}");
+            }
+        }
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_background_hit_ranked_first_keeps_its_place() {
+        let mut texts = background_notes(20);
+        texts.push("the retrieval decay term compares milliseconds against seconds".to_string());
+        let snapshot = background_snapshot(&texts).await;
+        let (out_dir, scratch) = (temp_path("bg-first-out"), temp_path("bg-first-scratch"));
+
+        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-first", &out_dir, &scratch).await, EXIT_OK);
+
+        let (_, _, json) = only_results(&out_dir);
+        let case = &json["retrieval"]["per_case"][0];
+        assert_eq!(case["ranked_refs"][0], "bg", "{case}");
+        assert_eq!(case["ranked_refs"][1], "c1", "{case}");
+        assert_eq!(case["recall@1"], 0.0);
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_dir_all(snapshot.parent().unwrap()).ok();
     }
 
     #[tokio::test]
@@ -1490,6 +2436,36 @@ mod tests {
 
         std::fs::remove_file(&golden_path).ok();
         std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_docs_hit_at_3_regression_fails_the_run() {
+        let file = |rank: usize| {
+            let cases: Vec<_> = (0..6).map(|i| serde_json::json!({"id": format!("q{i}"), "code": false, "rank": rank, "top": null})).collect();
+            serde_json::json!({"kind": "docs", "golden_sha256": "g", "corpus": {"left_out": []}, "per_case": cases})
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        std::fs::write(&a, file(1).to_string()).expect("write a");
+        std::fs::write(&b, file(4).to_string()).expect("write b");
+        let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let argv = |extra: &[&str]| {
+            ["rag-eval", "--diff", a.as_str(), b.as_str()].iter().chain(extra).map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+
+        assert_eq!(run(argv(&[]).into_iter()).await, EXIT_OK);
+        assert_eq!(run(argv(&["--fail-on-regression"]).into_iter()).await, EXIT_REGRESSION);
+    }
+
+    #[tokio::test]
+    async fn a_docs_file_against_a_memory_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        std::fs::write(&a, r#"{"kind": "docs", "golden_sha256": "g", "corpus": {"left_out": []}, "per_case": []}"#).expect("write a");
+        std::fs::write(&b, r#"{"retrieval": {"per_case": []}}"#).expect("write b");
+        let argv = ["rag-eval", "--diff", &a.to_string_lossy(), &b.to_string_lossy()].map(|s| s.to_string());
+
+        assert_eq!(run(argv.into_iter()).await, EXIT_RUNTIME_FAILURE);
     }
 
     #[tokio::test]

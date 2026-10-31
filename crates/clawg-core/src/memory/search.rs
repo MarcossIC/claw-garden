@@ -10,6 +10,7 @@ use crate::memory::score::{score as compute_score, RawHit, ScoringConfig};
 use crate::memory::sharing::{Reach, Reader};
 use crate::memory::vector::to_unit;
 use crate::memory::{MemoryError, MemoryStore, TableKind};
+use crate::metrics::{Recorder, Unit};
 
 /// Per-table k_pool selection. `None` means "skip this table entirely".
 ///
@@ -427,19 +428,52 @@ const KNN_PROCEDURAL: KnnTable = KnnTable {
 struct KnnOutcome {
     hits: Vec<RankedHit>,
     passes: usize,
+    /// How many saves `hits` stand for.
+    saves: usize,
+    /// The eligible rows counted when the first window came back short,
+    /// capped at the window; `None` when it came back full.
+    eligible: Option<usize>,
 }
 
 impl KnnOutcome {
     /// A table the scope switched off: it asked for nothing, so nothing was
     /// queried and no pass ran.
     fn skipped() -> Self {
-        Self { hits: Vec::new(), passes: 0 }
+        Self { hits: Vec::new(), passes: 0, saves: 0, eligible: None }
     }
 
     /// Whether recovery happened — a single pass is the ordinary path, and a
     /// table that was never queried did not recover from anything.
     fn retried(&self) -> bool {
         self.passes > 1
+    }
+}
+
+/// What the `memory` KNN of one search asked for and handed to the merge,
+/// before readability, the collapse to one hit per save and the cut. An
+/// evaluation reads it to tell a row that never reached the pool from one
+/// that reached it and ranked low, and a window crowded by other rows from a
+/// scope that holds few.
+#[derive(Debug)]
+pub struct MemoryPool {
+    pub requested: usize,
+    pub rows: usize,
+    pub saves: usize,
+    pub passes: usize,
+    pub eligible: Option<usize>,
+    pub ids: Vec<i64>,
+}
+
+impl MemoryPool {
+    fn of(requested: Option<usize>, outcome: &KnnOutcome) -> Self {
+        Self {
+            requested: requested.unwrap_or(0),
+            rows: outcome.hits.len(),
+            saves: outcome.saves,
+            passes: outcome.passes,
+            eligible: outcome.eligible,
+            ids: outcome.hits.iter().map(|h| h.id).collect(),
+        }
     }
 }
 
@@ -593,6 +627,7 @@ async fn knn_one(
             };
 
             let mut passes = 0usize;
+            let mut eligible = None;
             let mut raw = run(c, table, &q, &agent, &proj, k, &mut passes, &lexical_matches)?;
             let mut links = links_of(&raw);
             let widen = if raw.len() < k {
@@ -603,6 +638,7 @@ async fn knn_one(
                     rusqlite::params![k as i64, &agent, &proj],
                     |row| row.get(0),
                 )?;
+                eligible = Some(reachable as usize);
                 raw.len() < reachable as usize
             } else {
                 // A full window of one save's pieces offers one memory: the
@@ -640,7 +676,8 @@ async fn knn_one(
             // join happened to emit first.
             hits.sort_by(hit_cmp);
             let hits = trim_to_saves(hits, &links, k);
-            Ok(KnnOutcome { hits, passes })
+            let saves = distinct_saves(hits.iter().map(|h| h.id), &links);
+            Ok(KnnOutcome { hits, passes, saves, eligible })
         })
         .await
         .map_err(|e| match e {
@@ -1202,12 +1239,13 @@ async fn score_lexical_candidates(
 }
 
 /// Does the actual work behind `search_all_memories`, plus hands back the
-/// pool-survival line it computed along the way. Split out so a test can
-/// drive the exact call site that builds that line (`format_pool_line`
-/// below) through the real orchestration path instead of re-assembling it
-/// from outcomes the test constructed itself — the public wrapper is nothing
-/// but this function with the second half of the tuple dropped, so nothing
-/// about the split changes what a caller of `search_all_memories` observes.
+/// pool-survival line it computed along the way and the `memory` pool it was
+/// computed from. Split out so a test can drive the exact call site that
+/// builds that line (`format_pool_line` below) through the real orchestration
+/// path instead of re-assembling it from outcomes the test constructed itself
+/// — the public wrapper is nothing but this function with the last two parts
+/// of the tuple dropped, so nothing about the split changes what a caller of
+/// `search_all_memories` observes.
 async fn search_all_memories_inner(
     store: &MemoryStore,
     embedding: &[f32],
@@ -1219,7 +1257,7 @@ async fn search_all_memories_inner(
     scope: SearchScope,
     k_final: usize,
     scoring: &ScoringConfig,
-) -> Result<(Vec<RankedHit>, String), MemoryError> {
+) -> Result<(Vec<RankedHit>, String, MemoryPool), MemoryError> {
     // Same funnel every caller shares (prompt_builder.rs, contradiction.rs,
     // eval_api.rs): an unusable query vector means "no direction to search
     // with", which is a caller-input problem, not a store failure — so this
@@ -1230,7 +1268,7 @@ async fn search_all_memories_inner(
         Ok(v) => v,
         Err(e) => {
             log::warn!("search_all_memories: discarding unusable query vector: {e}");
-            return Ok((Vec::new(), String::new()));
+            return Ok((Vec::new(), String::new(), MemoryPool::of(scope.memory, &KnnOutcome::skipped())));
         }
     };
 
@@ -1250,8 +1288,14 @@ async fn search_all_memories_inner(
     // Run before the dense arms, not beside them: the bonus has to be in each
     // row's score before `knn_one` trims a widened window back to k. All arms
     // share one connection, so nothing ran in parallel to lose.
+    let metrics = store.metrics();
     let lexical_matches = match (scope.lexical, query_text) {
-        (Some(k), Some(q)) => identifier_matches(store, q, agents, project_id, k).await,
+        (Some(k), Some(q)) => {
+            let started = Instant::now();
+            let matches = identifier_matches(store, q, agents, project_id, k).await;
+            record_arm(metrics, "identifiers", started);
+            matches
+        }
         _ => HashSet::new(),
     };
     // Ids are per table and only `memory` has a lexical index.
@@ -1261,7 +1305,11 @@ async fn search_all_memories_inner(
         async {
             match scope.memory {
                 Some(k) => {
-                    knn_one(store, KNN_MEMORY, &q_bytes, agents, project_id, k, scoring, now, &lexical_matches).await
+                    let started = Instant::now();
+                    let outcome =
+                        knn_one(store, KNN_MEMORY, &q_bytes, agents, project_id, k, scoring, now, &lexical_matches).await;
+                    record_arm(metrics, "knn_memory", started);
+                    outcome
                 }
                 None => Ok(KnnOutcome::skipped()),
             }
@@ -1269,7 +1317,11 @@ async fn search_all_memories_inner(
         async {
             match scope.episodic {
                 Some(k) => {
-                    knn_one(store, KNN_EPISODIC, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await
+                    let started = Instant::now();
+                    let outcome =
+                        knn_one(store, KNN_EPISODIC, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await;
+                    record_arm(metrics, "knn_episodic", started);
+                    outcome
                 }
                 None => Ok(KnnOutcome::skipped()),
             }
@@ -1277,7 +1329,11 @@ async fn search_all_memories_inner(
         async {
             match scope.procedural {
                 Some(k) => {
-                    knn_one(store, KNN_PROCEDURAL, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await
+                    let started = Instant::now();
+                    let outcome =
+                        knn_one(store, KNN_PROCEDURAL, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await;
+                    record_arm(metrics, "knn_skill", started);
+                    outcome
                 }
                 None => Ok(KnnOutcome::skipped()),
             }
@@ -1291,12 +1347,23 @@ async fn search_all_memories_inner(
             // no query text to match — and collapse into the same empty
             // result as a sanitizer that yielded zero tokens.
             let ids = match (scope.lexical, query_text) {
-                (Some(k), Some(q)) => lexical_candidates(store, q, agents, project_id, k).await,
-                _ => Vec::new(),
+                (Some(k), Some(q)) => {
+                    let started = Instant::now();
+                    let ids = lexical_candidates(store, q, agents, project_id, k).await;
+                    Some((ids, started.elapsed()))
+                }
+                _ => None,
             };
-            Ok::<Vec<i64>, MemoryError>(ids)
+            Ok::<_, MemoryError>(ids)
         },
     )?;
+    for (outcome, table) in [(&mem, "memory"), (&epi, "episodic"), (&pro, "skill")] {
+        if outcome.retried() {
+            metrics.gauge("search.knn_retry", &[("table", table)], 1.0);
+        }
+    }
+    let (lex_ids, lexical_took) = lex_ids.unzip();
+    let lex_ids = lex_ids.unwrap_or_default();
 
     // Differenced against memory-kind hits ONLY, never the merged 3-table
     // pool: `memory`, `episodic_trajectory` and `procedural_skill` each keep
@@ -1323,11 +1390,16 @@ async fn search_all_memories_inner(
     // can. Both halves of the channel had to be infallible for that to be
     // true — a fail-soft candidate query feeding a fallible scoring query is
     // a channel that still breaks retrieval, just later.
+    let scoring_started = Instant::now();
     let lex_hits = if leftover.is_empty() {
         Vec::new()
     } else {
         score_lexical_candidates(store, &q_bytes, agents, project_id, &leftover, scoring, now, &lexical_matches).await
     };
+    // The arm is its candidates and the scoring of those the dense arm missed.
+    if let Some(took) = lexical_took {
+        record_micros(metrics, "lexical", took + scoring_started.elapsed());
+    }
 
     // Built before the merge below consumes the per-table hits, which is also
     // what lets a test assemble it from real outcomes instead of from numbers
@@ -1337,6 +1409,7 @@ async fn search_all_memories_inner(
     let channel_attribution =
         crate::memory::admin::format_channel_attribution(mem.hits.len(), lexical_only);
     let telemetry = format!("{pool_survival} {channel_attribution}");
+    let memory_pool = MemoryPool::of(scope.memory, &mem);
 
     // A promoted lexical candidate competes for the same k_final slots as
     // every dense hit and can displace one — there is no reserved quota. It
@@ -1370,6 +1443,7 @@ async fn search_all_memories_inner(
     // window empty while debug logging is off and reporting `warming` for a
     // long time after someone turns it on.
     store.knn_latency().record(elapsed);
+    record_micros(metrics, "total", elapsed);
 
     // Tier-per-hit, pool-survival and channel-attribution logging — appended
     // to the existing retrieval debug line via pure, unit-tested helpers.
@@ -1386,7 +1460,16 @@ async fn search_all_memories_inner(
         store.knn_latency().snapshot(),
     );
 
-    Ok((all, telemetry))
+    Ok((all, telemetry, memory_pool))
+}
+
+/// Records under `search.duration` how long `arm` took since `started`.
+fn record_arm(metrics: &Recorder, arm: &'static str, started: Instant) {
+    record_micros(metrics, arm, started.elapsed());
+}
+
+fn record_micros(metrics: &Recorder, arm: &'static str, took: std::time::Duration) {
+    metrics.observe("search.duration", Unit::Micros, &[("arm", arm)], u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
 }
 
 /// Top-level KNN orchestrator. Returns up to `k_final` hits sorted DESC by score.
@@ -1398,7 +1481,7 @@ pub async fn search_all_memories(
     scope: SearchScope,
     k_final: usize,
 ) -> Result<Vec<RankedHit>, MemoryError> {
-    let (hits, _pool_survival) =
+    let (hits, _pool_survival, _memory_pool) =
         search_all_memories_inner(store, embedding, query_text, agent_id, scope, k_final, &ScoringConfig::DEFAULT)
             .await?;
     Ok(hits)
@@ -1416,7 +1499,8 @@ pub(crate) async fn lexical_channel_only(store: &MemoryStore, query_text: &str, 
 /// exposed to the caller instead of pinned to `ScoringConfig::DEFAULT`. Every
 /// production call site keeps using the unparameterized wrapper above — this
 /// one exists for `rag-eval`, which needs to re-search a seeded corpus under
-/// several configs without re-seeding.
+/// several configs without re-seeding, and reads the `memory` pool beside the
+/// hits.
 #[cfg(feature = "eval")]
 pub(crate) async fn search_all_memories_with_scoring(
     store: &MemoryStore,
@@ -1426,10 +1510,10 @@ pub(crate) async fn search_all_memories_with_scoring(
     scope: SearchScope,
     k_final: usize,
     scoring: &ScoringConfig,
-) -> Result<Vec<RankedHit>, MemoryError> {
-    let (hits, _pool_survival) =
+) -> Result<(Vec<RankedHit>, MemoryPool), MemoryError> {
+    let (hits, _pool_survival, memory_pool) =
         search_all_memories_inner(store, embedding, query_text, agent_id, scope, k_final, scoring).await?;
-    Ok(hits)
+    Ok((hits, memory_pool))
 }
 
 #[cfg(test)]
@@ -2866,7 +2950,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-telemetry-wired", Some("P2"), 30, serialize_embedding(&near)).await;
         bulk_insert_memory_rows(&store, "agent-telemetry-wired", Some("P1"), 40, serialize_embedding(&far)).await;
 
-        let (hits, line) =
+        let (hits, line, _) =
             search_all_memories_inner(&store, &near, None, "agent-telemetry-wired", scope, 30, &ScoringConfig::DEFAULT)
                 .await
                 .unwrap();
@@ -4165,7 +4249,7 @@ mod tests {
             lexical: Some(20),
             reach: Reach::Own,
         };
-        let (hits, _telemetry) = search_all_memories_inner(
+        let (hits, _telemetry, _) = search_all_memories_inner(
             &store,
             &near,
             Some("collision_unique_tok"),
@@ -4197,14 +4281,14 @@ mod tests {
         store.conn.call(|c| c.execute("DROP TABLE memory_fts", [])).await.unwrap();
 
         let scope_on = SearchScope { lexical: Some(20), ..SearchScope::all_default() };
-        let (hits_on, _t_on) = search_all_memories_inner(
+        let (hits_on, _t_on, _) = search_all_memories_inner(
             &store, &near, Some("bulk"), agent, scope_on, 30, &ScoringConfig::DEFAULT,
         )
         .await
         .unwrap();
 
         let scope_off = SearchScope { lexical: None, ..SearchScope::all_default() };
-        let (hits_off, _t_off) = search_all_memories_inner(
+        let (hits_off, _t_off, _) = search_all_memories_inner(
             &store, &near, Some("bulk"), agent, scope_off, 30, &ScoringConfig::DEFAULT,
         )
         .await
@@ -4267,7 +4351,7 @@ mod tests {
             lexical: Some(20),
             reach: Reach::Own,
         };
-        let (hits, telemetry) = search_all_memories_inner(
+        let (hits, telemetry, _) = search_all_memories_inner(
             &store,
             &near,
             Some("dedupattr_tok"),
@@ -4342,7 +4426,7 @@ mod tests {
         )
         .await;
 
-        let (hits, _telemetry) = result.expect(
+        let (hits, _telemetry, _) = result.expect(
             "a scoring query that cannot run means the lexical channel contributed nothing — \
              never that the whole search failed",
         );
@@ -4384,7 +4468,7 @@ mod tests {
             reach: Reach::Own,
         };
 
-        let (hits, telemetry) = search_all_memories_inner(
+        let (hits, telemetry, _) = search_all_memories_inner(
             &store,
             &near,
             Some("GPX-Store-7f3a"),
@@ -4405,7 +4489,7 @@ mod tests {
         );
 
         let scope_off = SearchScope { lexical: None, ..scope };
-        let (hits_off, telemetry_off) = search_all_memories_inner(
+        let (hits_off, telemetry_off, _) = search_all_memories_inner(
             &store,
             &near,
             Some("GPX-Store-7f3a"),
@@ -4439,7 +4523,7 @@ mod tests {
         bulk_insert_memory_rows(&store, agent, None, 10, serialize_embedding(&near)).await;
 
         let scope_on = SearchScope::all_default();
-        let (hits_on, telemetry_on) = search_all_memories_inner(
+        let (hits_on, telemetry_on, _) = search_all_memories_inner(
             &store,
             &near,
             Some("zzz_token_with_no_overlap_in_the_corpus"),
@@ -4456,7 +4540,7 @@ mod tests {
         );
 
         let scope_off = SearchScope { lexical: None, ..SearchScope::all_default() };
-        let (hits_off, _t_off) = search_all_memories_inner(
+        let (hits_off, _t_off, _) = search_all_memories_inner(
             &store,
             &near,
             Some("zzz_token_with_no_overlap_in_the_corpus"),
@@ -4511,7 +4595,7 @@ mod tests {
             reach: Reach::Own,
         };
 
-        let (hits_present, _t1) = search_all_memories_inner(
+        let (hits_present, _t1, _) = search_all_memories_inner(
             &store,
             &near,
             Some("kill_switch_unique_token"),
@@ -4529,7 +4613,7 @@ mod tests {
         );
 
         store.conn.call(|c| c.execute("DROP TABLE memory_fts", [])).await.unwrap();
-        let (hits_dropped, _t2) = search_all_memories_inner(
+        let (hits_dropped, _t2, _) = search_all_memories_inner(
             &store,
             &near,
             Some("kill_switch_unique_token"),
@@ -4664,7 +4748,7 @@ mod tests {
             lexical: Some(20),
             reach: Reach::Own,
         };
-        let (_hits, telemetry) = search_all_memories_inner(
+        let (_hits, telemetry, _) = search_all_memories_inner(
             &store,
             &near,
             Some("attribution_parity_token"),
@@ -5321,13 +5405,123 @@ mod tests {
         let save = seed_linked_save(&store, agent).await;
         let others = seed_others(&store, agent).await;
 
-        let (hits, _) = search_all_memories_inner(
+        let (hits, _, _) = search_all_memories_inner(
             &store, &unit_basis_vec(), None, agent, SearchScope::all_default(), 3, &ScoringConfig::DEFAULT,
         )
         .await
         .unwrap();
 
         assert_eq!(ids_and_pieces(&hits), vec![(save[0], Some((1, 3))), (others[0], None), (others[1], None)]);
+    }
+
+    /// The arms of one search, by the label each records under.
+    fn arms_recorded(store: &MemoryStore) -> Vec<String> {
+        let run = store.metrics().run();
+        let mut arms: Vec<String> = run
+            .iter()
+            .filter(|(key, h)| key.name == "search.duration" && h.count() > 0)
+            .flat_map(|(key, _)| key.label_pairs().into_iter().map(|(_, v)| v.to_string()).collect::<Vec<_>>())
+            .collect();
+        arms.sort();
+        arms
+    }
+
+    #[tokio::test]
+    async fn a_search_records_how_long_each_arm_took() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-arms";
+        bulk_insert_memory_rows(&store, agent, None, 3, unit_basis_embedding()).await;
+
+        search_all_memories(&store, &unit_basis_vec(), Some("vector arms"), agent, SearchScope::all_default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            arms_recorded(&store),
+            ["identifiers", "knn_episodic", "knn_memory", "knn_skill", "lexical", "total"],
+            "every arm that ran, and the whole search"
+        );
+
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let only_memory =
+            SearchScope { episodic: None, procedural: None, lexical: None, ..SearchScope::all_default() };
+        search_all_memories(&store, &unit_basis_vec(), Some("vector arms"), agent, only_memory, 10).await.unwrap();
+        assert_eq!(arms_recorded(&store), ["knn_memory", "total"], "an arm the scope switched off did not run");
+        let gauges = store.metrics().minute().gauges;
+        assert!(
+            !gauges.keys().any(|k| k.name == "search.knn_retry"),
+            "a window that came back full was not widened: {gauges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_widened_window_is_counted_by_its_table() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-widened";
+        bulk_insert_memory_rows(&store, agent, Some("P2"), 30, unit_basis_embedding()).await;
+        bulk_insert_memory_rows(&store, agent, Some("P1"), 40, off_axis_embedding()).await;
+        let scope = SearchScope { lexical: None, ..SearchScope::all_default() }.with_project(Some("P1"));
+
+        search_all_memories(&store, &unit_basis_vec(), None, agent, scope, 10).await.unwrap();
+
+        let gauges = store.metrics().minute().gauges;
+        let retried: Vec<&str> = gauges
+            .iter()
+            .filter(|(k, _)| k.name == "search.knn_retry")
+            .flat_map(|(k, g)| {
+                assert_eq!(g.count, 1);
+                k.label_pairs().into_iter().map(|(_, v)| v)
+            })
+            .collect();
+        assert_eq!(retried, ["memory"], "only the crowded table was searched again");
+    }
+
+    #[tokio::test]
+    async fn the_memory_pool_counts_saves_and_reports_its_eligible_rows() {
+        let only_memory = SearchScope { memory: Some(30), episodic: None, procedural: None, ..SearchScope::all_default() };
+
+        // A scope with fewer rows than the window: the count of what it holds
+        // is read, and the three pieces of one save are one save.
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-pool-small";
+        let mut seeded = seed_linked_save(&store, agent).await;
+        seeded.extend(seed_others(&store, agent).await);
+        let (_, _, pool) = search_all_memories_inner(
+            &store, &unit_basis_vec(), None, agent, only_memory.clone(), 10, &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+        let mut ids = pool.ids.clone();
+        ids.sort_unstable();
+        seeded.sort_unstable();
+        assert_eq!(
+            (pool.requested, pool.rows, pool.saves, pool.passes, pool.eligible),
+            (30, 6, 4, 1, Some(6))
+        );
+        assert_eq!(ids, seeded);
+
+        // A window the other project's rows crowded: the scope holds more
+        // than the window, and only the wider pass reaches it.
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-pool-crowded";
+        bulk_insert_memory_rows(&store, agent, Some("P2"), 30, serialize_embedding(&unit_basis_vec())).await;
+        bulk_insert_memory_rows(&store, agent, Some("P1"), 40, serialize_embedding(&off_axis_vec())).await;
+        let (_, _, pool) = search_all_memories_inner(
+            &store, &unit_basis_vec(), None, agent, only_memory.clone().with_project(Some("P1")), 10,
+            &ScoringConfig::DEFAULT,
+        )
+        .await
+        .unwrap();
+        assert_eq!((pool.rows, pool.saves, pool.passes, pool.eligible), (30, 30, 2, Some(30)));
+
+        // A full window of distinct saves never reads the count.
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-pool-full";
+        bulk_insert_memory_rows(&store, agent, None, 35, serialize_embedding(&unit_basis_vec())).await;
+        let (_, _, pool) =
+            search_all_memories_inner(&store, &unit_basis_vec(), None, agent, only_memory, 10, &ScoringConfig::DEFAULT)
+                .await
+                .unwrap();
+        assert_eq!((pool.rows, pool.saves, pool.passes, pool.eligible), (30, 30, 1, None));
     }
 
     #[test]
@@ -5394,7 +5588,7 @@ mod tests {
             );
         }
 
-        let (hits, _) = search_all_memories_inner(
+        let (hits, _, _) = search_all_memories_inner(
             &store, &unit_basis_vec(), None, agent, SearchScope::all_default(), 10, &ScoringConfig::DEFAULT,
         )
         .await
@@ -5412,7 +5606,7 @@ mod tests {
         let save = seed_linked_save(&store, agent).await;
         store.conn.call(|c| c.execute("DROP TABLE memory_piece", [])).await.unwrap();
 
-        let (hits, _) = search_all_memories_inner(
+        let (hits, _, _) = search_all_memories_inner(
             &store, &unit_basis_vec(), None, agent, SearchScope::all_default(), 3, &ScoringConfig::DEFAULT,
         )
         .await

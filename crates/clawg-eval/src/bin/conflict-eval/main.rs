@@ -132,7 +132,7 @@ async fn run(args: impl Iterator<Item = String>) -> i32 {
     };
     let tokenizer_dir = if options.real { base_dir.clone() } else { std::env::temp_dir() };
 
-    match measure_all(&embedder, &tokenizer_dir, &pairs, &flow, options.real).await {
+    match measure_all(&embedder, &tokenizer_dir, &std::env::temp_dir(), &pairs, &flow, options.real).await {
         Ok(report) => {
             let json = serde_json::to_string_pretty(&report).expect("the report always serializes");
             println!("{json}");
@@ -194,9 +194,11 @@ struct Report<'a> {
 
 const AGENT: &str = "conflict-eval";
 
+/// Measures every pair and the flow, each in a store of its own made in `work`.
 async fn measure_all<'a>(
     embedder: &EvalEmbedder,
     tokenizer_dir: &Path,
+    work: &Path,
     pairs: &'a [measure::LabelledPair],
     flow: &[FlowSave],
     real: bool,
@@ -204,21 +206,23 @@ async fn measure_all<'a>(
     let mut outcomes: Vec<(Class, PairOutcome)> = Vec::new();
     let mut by_lang: Vec<(String, PairOutcome)> = Vec::new();
     for pair in pairs {
-        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let dir = tempfile::tempdir_in(work).map_err(|e| e.to_string())?;
         let ingest = EvalIngest::open(dir.path(), embedder, tokenizer_dir).await.map_err(|e| e.to_string())?;
-        ingest.send(AGENT, &pair.old, &pair.memory_type, 5.0).await.map_err(|e| e.to_string())?;
-        ingest.send(AGENT, &pair.new, &pair.memory_type, 5.0).await.map_err(|e| e.to_string())?;
+        ingest.send(AGENT, &pair.old, &pair.memory_type, 5.0, 0).await.map_err(|e| e.to_string())?;
+        ingest.send(AGENT, &pair.new, &pair.memory_type, 5.0, 0).await.map_err(|e| e.to_string())?;
         let runtime = ingest.finish().await.map_err(|e| e.to_string())?;
         let found = conflict_pairs(&runtime).await.map_err(|e| e.to_string())?;
+        // On Windows a store still open cannot be deleted with its directory.
+        runtime.close().await;
         let outcome = PairOutcome { candidate: !found.is_empty(), escalated: found.iter().any(|p| p.escalated) };
         outcomes.push((pair.class, outcome));
         by_lang.push((format!("{}/{}", pair.class.as_str(), pair.lang), outcome));
     }
 
-    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let dir = tempfile::tempdir_in(work).map_err(|e| e.to_string())?;
     let ingest = EvalIngest::open(dir.path(), embedder, tokenizer_dir).await.map_err(|e| e.to_string())?;
     for save in flow {
-        ingest.send(AGENT, &save.content, &save.memory_type, 5.0).await.map_err(|e| e.to_string())?;
+        ingest.send(AGENT, &save.content, &save.memory_type, 5.0, 0).await.map_err(|e| e.to_string())?;
     }
     let runtime = ingest.finish().await.map_err(|e| e.to_string())?;
     let flow_pairs: Vec<(i64, bool)> = conflict_pairs(&runtime)
@@ -227,6 +231,7 @@ async fn measure_all<'a>(
         .into_iter()
         .map(|p| (p.new_id, p.escalated))
         .collect();
+    runtime.close().await;
     let flow = flow_report(flow.len(), &flow_pairs);
 
     let classes = by(&outcomes);
@@ -287,13 +292,11 @@ mod tests {
         assert!(facts.len() >= 200, "{}", facts.len());
     }
 
-    /// The double places texts far apart, so nothing pairs: this checks that
-    /// every pair and the flow go through the worker and the report is whole.
-    #[tokio::test]
-    async fn a_fake_run_measures_every_class_and_the_flow() {
+    /// One shipped pair of each class, and a flow of two saves.
+    fn one_pair_of_each_class_and_a_flow() -> (Vec<measure::LabelledPair>, Vec<FlowSave>) {
         let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/data/conflict-pairs.json")).unwrap();
         let pairs: Vec<_> = parse_pairs(&text).unwrap();
-        let few: Vec<_> = Class::ALL
+        let few = Class::ALL
             .iter()
             .flat_map(|c| pairs.iter().filter(move |p| p.class == *c).take(1).cloned())
             .collect();
@@ -301,12 +304,31 @@ mod tests {
             FlowSave { content: "the first fact of the flow is long enough".into(), memory_type: "semantic_fact".into() },
             FlowSave { content: "a preference of the flow".into(), memory_type: "user_preference".into() },
         ];
-        let tokenizer = tempfile::tempdir().unwrap();
+        (few, flow)
+    }
 
-        let report = measure_all(&EvalEmbedder::fake(), tokenizer.path(), &few, &flow, false).await.unwrap();
+    /// The double places texts far apart, so nothing pairs: this checks that
+    /// every pair and the flow go through the worker and the report is whole.
+    #[tokio::test]
+    async fn a_fake_run_measures_every_class_and_the_flow() {
+        let (few, flow) = one_pair_of_each_class_and_a_flow();
+        let (tokenizer, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+
+        let report = measure_all(&EvalEmbedder::fake(), tokenizer.path(), work.path(), &few, &flow, false).await.unwrap();
 
         assert_eq!(report.by_class.len(), Class::ALL.len());
         assert_eq!(report.flow.saves, 2);
         assert_eq!(report.model, "fake");
+    }
+
+    #[tokio::test]
+    async fn a_run_removes_every_store_it_made() {
+        let (few, flow) = one_pair_of_each_class_and_a_flow();
+        let (tokenizer, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+
+        measure_all(&EvalEmbedder::fake(), tokenizer.path(), work.path(), &few, &flow, false).await.unwrap();
+
+        let left: Vec<_> = std::fs::read_dir(work.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "every store is removed when its measurement ends: {left:?}");
     }
 }

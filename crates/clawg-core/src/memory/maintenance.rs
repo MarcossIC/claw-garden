@@ -15,6 +15,7 @@ use crate::memory::embedder::{EmbedRole, Embedder};
 use crate::memory::revival::revive_hidden;
 use crate::memory::vector::to_unit;
 use crate::memory::MemoryError;
+use crate::metrics::EventKind;
 use serde::Serialize;
 
 /// Startup delay before the first maintenance pass: long enough to let the
@@ -90,6 +91,7 @@ pub(crate) async fn run_maintenance_once(store: &MemoryStore) {
 /// Never panics: a recoverable DB error is logged via `log::warn!` and the
 /// call returns — the caller (the maintenance loop) keeps ticking.
 pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: TimestampMs) {
+    let started = std::time::Instant::now();
     // One statement per table, and a failure moves to the next rather than
     // aborting: the three tables decay independently, so one table's demotion
     // failing is no reason to leave the other two stale for a whole day. Same
@@ -135,6 +137,18 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
     if classified > 0 {
         log::info!("maintenance: recorded the language of {classified} rows saved before it was recorded");
     }
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    store.metrics().event(
+        EventKind::Maintenance,
+        &[
+            ("ms", ms.into()),
+            ("swept", swept.into()),
+            ("released", released.into()),
+            ("revived", revived.into()),
+            ("dropped_pairs", dropped.into()),
+            ("classified", classified.into()),
+        ],
+    );
 
     // Placed after the demotion pass so the counts describe the post-pass
     // state. A query failure here logs and returns like the demotion above —
@@ -872,6 +886,16 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     // ── Test helpers ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_maintenance_pass_is_an_event_with_what_it_did() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        super::run_maintenance_once(&store).await;
+        let events = store.metrics().take_events();
+        assert_eq!(events.iter().map(|e| e.kind).collect::<Vec<_>>(), [crate::metrics::EventKind::Maintenance]);
+        let keys: Vec<&str> = events[0].detail.keys().copied().collect();
+        assert_eq!(keys, ["classified", "dropped_pairs", "ms", "released", "revived", "swept"]);
+    }
 
     /// Current wall-clock time in milliseconds since UNIX epoch — same
     /// formula used in production (`run_maintenance_once`, `access.rs::flush`).

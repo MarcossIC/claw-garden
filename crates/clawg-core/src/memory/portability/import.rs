@@ -27,6 +27,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
+use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,7 +51,10 @@ use crate::memory::registry::{find_project, new_project_id, project_name, Named}
 use crate::memory::subfolder::declared_in;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
-use crate::memory::portability::format::{parse, ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
+use crate::memory::portability::control::{ImportControl, StopCause};
+#[cfg(test)]
+use crate::memory::portability::format::parse;
+use crate::memory::portability::format::{ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
 use crate::memory::portability::timing::{ImportTimings, Step, Timing};
 use crate::memory::portability::translate::{
     translate, ForeignReport, LeftOut, MappedProject, MergedNote, NoteRows, TakenKey, TakenProject, TranslateOptions,
@@ -469,8 +473,9 @@ async fn plan(
     paths: &[(usize, PathBuf)],
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
+    control: &ImportControl,
 ) -> Result<Planning, ImportError> {
-    let (clock, mut timing) = (Instant::now(), Timing::new(Step::Plan));
+    let (clock, mut timing) = control.begin(Step::Plan);
     let (mut ahead, mut passes) = (ReadAhead::default(), 1);
     let plans = loop {
         let (planned, asks) = (roots.to_vec(), paths.to_vec());
@@ -2052,6 +2057,7 @@ fn write_links<S: Seat>(seat: &mut S, prepared: &Prepared, ledger: &mut Ledger) 
 /// Reads `text` and imports it into `store`, writing the `pre-import`
 /// snapshot into `backups` first, each step logged in `timings` as it ends.
 /// A dry run writes nothing and needs no embedder.
+#[cfg(test)]
 pub async fn import(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
@@ -2062,36 +2068,157 @@ pub async fn import(
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
-    let prepared = prepare_file(store, text, options, ground, timings).await?;
-    let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, "clawg", timings).await?;
-    Ok(report(&prepared, &written, options.dry_run))
+    let (_, parsed) = parse(text)?;
+    let input = ImportInput::Clawg(parsed);
+    finished(import_parsed(store, embedder, chunker, backups, input, options, ground, timings, &ImportControl::default()).await?)
 }
 
-/// A clawg export, worked out against the ids its roots would get here.
-async fn prepare_file(
+/// The report of an import nobody can stop.
+#[cfg(test)]
+fn finished(imported: Imported) -> Result<ImportReport, ImportError> {
+    match imported {
+        Imported::Done(report) => Ok(report),
+        Imported::Stopped(_) => Err(MemoryError::Internal("the import was stopped".to_owned()).into()),
+    }
+}
+
+/// What an import reads, already parsed: the caller has done that once and
+/// the import never sees the text.
+pub enum ImportInput {
+    Clawg(Parsed),
+    Foreign(ForeignExport),
+}
+
+/// How an import ended.
+pub enum Imported {
+    Done(ImportReport),
+    Stopped(Stopped),
+}
+
+/// An import that stopped because its control asked it to.
+pub struct Stopped {
+    pub cause: StopCause,
+    /// The step it was in when it stopped.
+    pub step: Step,
+    /// What the write batches that were committed did; only after one was.
+    /// Before the first, nothing was recorded, and a report would name
+    /// projects and suggestions that were planned and not written.
+    pub report: Option<ImportReport>,
+}
+
+/// Where a step ended other than by finishing.
+#[derive(Debug)]
+enum Cut {
+    Stopped(Step, StopCause),
+    Failed(ImportError),
+}
+
+impl<E: Into<ImportError>> From<E> for Cut {
+    fn from(e: E) -> Self {
+        Cut::Failed(e.into())
+    }
+}
+
+impl Cut {
+    fn into_result(self) -> Result<Imported, ImportError> {
+        match self {
+            Cut::Stopped(step, cause) => Ok(Imported::Stopped(Stopped { cause, step, report: None })),
+            Cut::Failed(e) => Err(e),
+        }
+    }
+}
+
+/// `work`, or the stop if it was raised first: dropping `work` is how a step
+/// stops at its next `.await`. A stop already raised wins over work that is
+/// ready in the same poll.
+async fn or_stop<T>(control: &ImportControl, step: Step, work: impl Future<Output = T>) -> Result<T, Cut> {
+    tokio::select! {
+        biased;
+        cause = control.raised() => Err(Cut::Stopped(step, cause)),
+        out = work => Ok(out),
+    }
+}
+
+/// The stop raised while `step` ran, for a step that cannot be interrupted.
+fn stopped_after(control: &ImportControl, step: Step) -> Result<(), Cut> {
+    control.cause().map_or(Ok(()), |cause| Err(Cut::Stopped(step, cause)))
+}
+
+/// Imports an input that is parsed already, writing the `pre-import`
+/// snapshot into `backups` first, each step logged in `timings` as it ends,
+/// with `control` showing where it is as it runs and asking it to stop.
+/// A dry run writes nothing and needs no embedder.
+pub async fn import_parsed(
     store: &MemoryStore,
-    text: &str,
+    embedder: Option<&dyn Embedder>,
+    chunker: Arc<ChatChunker>,
+    backups: &Path,
+    input: ImportInput,
     options: &ImportOptions,
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
-) -> Result<Arc<Prepared>, ImportError> {
+    control: &ImportControl,
+) -> Result<Imported, ImportError> {
+    match input {
+        ImportInput::Clawg(parsed) => {
+            let prepared = match prepare_parsed(store, parsed, options, ground, timings, control).await {
+                Ok(prepared) => prepared,
+                Err(cut) => return cut.into_result(),
+            };
+            let written = match write(store, embedder, &chunker, backups, &prepared, options.dry_run, "clawg", timings, control).await {
+                Ok(written) => written,
+                Err(cut) => return cut.into_result(),
+            };
+            Ok(ended(report(&prepared, &written, options.dry_run), written.cut))
+        }
+        ImportInput::Foreign(export) => {
+            let source = export.source;
+            let (prepared, foreign) = match prepare_export(store, chunker.clone(), export, options, ground, timings, control).await {
+                Ok(prepared) => prepared,
+                Err(cut) => return cut.into_result(),
+            };
+            let written = match write(store, embedder, &chunker, backups, &prepared, options.dry_run, source, timings, control).await {
+                Ok(written) => written,
+                Err(cut) => return cut.into_result(),
+            };
+            let report = with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger);
+            Ok(ended(report, written.cut))
+        }
+    }
+}
+
+/// `report` as the result of a write that `cut` stopped between batches, or
+/// as the end of one that finished.
+fn ended(report: ImportReport, cut: Option<StopCause>) -> Imported {
+    match cut {
+        None => Imported::Done(report),
+        Some(cause) => Imported::Stopped(Stopped { cause, step: Step::Write, report: Some(report) }),
+    }
+}
+
+/// A parsed clawg export, worked out against the ids its roots would get here.
+async fn prepare_parsed(
+    store: &MemoryStore,
+    parsed: Parsed,
+    options: &ImportOptions,
+    ground: Arc<dyn Ground>,
+    timings: &mut ImportTimings,
+    control: &ImportControl,
+) -> Result<Arc<Prepared>, Cut> {
     let clock = Instant::now();
-    let (_, parsed) = parse(text)?;
     let projects = projects_of(&parsed);
     let roots = roots_here(&projects, options);
-    let parsing = clock.elapsed();
+    let listing = clock.elapsed();
     let planned: Vec<PathBuf> = roots.iter().map(|(root, _, _)| root.clone()).collect();
     let paths: Vec<(usize, PathBuf)> = roots.iter().enumerate().filter_map(|(k, (_, _, path))| Some((k, path.clone()?))).collect();
-    let planning = plan(store, &planned, &paths, ground, timings).await?;
-    let clock = Instant::now();
+    let planning = or_stop(control, Step::Plan, plan(store, &planned, &paths, ground, timings, control)).await??;
+    let (clock, timing) = control.begin(Step::Prepare);
     let row_projects: BTreeSet<&str> = parsed.memories.iter().filter_map(|(_, m)| m.project_id.as_deref()).collect();
     let settled = settle_projects(&projects, &roots, &planning, &row_projects, TimestampMs::now().as_millis_i64());
     let prepared = prepare(parsed, settled, options, Texts::Raw);
-    timings.record(Timing {
-        elapsed: parsing + clock.elapsed(),
-        rows: Some(prepared.rows.len()),
-        ..Timing::new(Step::Prepare)
-    });
+    timings.record(Timing { elapsed: listing + clock.elapsed(), rows: Some(prepared.rows.len()), ..timing });
+    control.count(|c| (c.rows, c.notes) = (prepared.rows.len(), prepared.units().len()));
+    stopped_after(control, Step::Prepare)?;
     Ok(Arc::new(prepared))
 }
 
@@ -2100,6 +2227,7 @@ async fn prepare_file(
 /// text would store, under the agent of `options` or [`MIGRATED_AGENT`], in
 /// the project a registration gives the root `options.project_map` names for
 /// its project, or in none.
+#[cfg(test)]
 pub async fn import_foreign(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
@@ -2110,10 +2238,7 @@ pub async fn import_foreign(
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
-    let source = export.source;
-    let (prepared, foreign) = prepare_export(store, chunker.clone(), export, options, ground, timings).await?;
-    let written = write(store, embedder, &chunker, backups, &prepared, options.dry_run, source, timings).await?;
-    Ok(with_foreign(report(&prepared, &written, options.dry_run), foreign, &prepared.notes, &written.ledger))
+    finished(import_parsed(store, embedder, chunker, backups, ImportInput::Foreign(export), options, ground, timings, &ImportControl::default()).await?)
 }
 
 /// Another tool's export translated into rows, with what the translation
@@ -2125,7 +2250,8 @@ async fn prepare_export(
     options: &ImportOptions,
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
-) -> Result<(Arc<Prepared>, ForeignReport), ImportError> {
+    control: &ImportControl,
+) -> Result<(Arc<Prepared>, ForeignReport), Cut> {
     // Planned before the translation, which tells keys apart by the project
     // each note goes to here.
     let mut seen = HashSet::new();
@@ -2138,7 +2264,7 @@ async fn prepare_export(
         .iter()
         .filter_map(|(_, target)| Some((index[target.root()?], PathBuf::from(target.path()?))))
         .collect();
-    let planning = plan(store, &roots, &asks, ground, timings).await?;
+    let planning = or_stop(control, Step::Plan, plan(store, &roots, &asks, ground, timings, control)).await??;
     let mut declared = planning.declared.iter();
     let project_map = options
         .project_map
@@ -2160,19 +2286,21 @@ async fn prepare_export(
     let plans = planning.plans;
     let translate_options = TranslateOptions { agent: options.agent.clone().unwrap_or_else(|| MIGRATED_AGENT.to_owned()), project_map };
     let now = TimestampMs::now().as_millis_i64();
-    let clock = Instant::now();
+    let (clock, timing) = control.begin(Step::Translate);
     // Masking and splitting thousands of notes is work the daemon's other
     // requests should not wait behind.
-    let (prepared, foreign) = tokio::task::spawn_blocking(move || {
+    let translating = tokio::task::spawn_blocking(move || {
         let Translated { parsed, notes, report } = translate(&export, &translate_options, &chunker, now);
         let settled = mapped_projects(&roots, &plans);
         let mut prepared = prepare(parsed, settled, &ImportOptions::default(), Texts::Notes(notes));
         prepared.mapped_to = mapped_to;
         (prepared, report)
-    })
-    .await
-    .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
-    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..Timing::new(Step::Translate) });
+    });
+    let (prepared, foreign) = or_stop(control, Step::Translate, translating)
+        .await?
+        .map_err(|e| MemoryError::Internal(format!("could not translate the export: {e}")))?;
+    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..timing });
+    control.count(|c| (c.rows, c.notes) = (prepared.rows.len(), prepared.units().len()));
     Ok((Arc::new(prepared), foreign))
 }
 
@@ -2196,6 +2324,22 @@ fn note_batches(units: &[usize], limit: usize) -> Vec<Range<usize>> {
     batches
 }
 
+/// The notes of each of `batches`, which `note_batches` made of whole units.
+fn batch_notes(units: &[usize], batches: &[Range<usize>]) -> Vec<usize> {
+    let (mut unit, mut at) = (0, 0);
+    batches
+        .iter()
+        .map(|batch| {
+            let first = unit;
+            while unit < units.len() && at < batch.end {
+                at += units[unit];
+                unit += 1;
+            }
+            unit - first
+        })
+        .collect()
+}
+
 /// Where every row went, and what the writing left behind.
 struct Written {
     ledger: Ledger,
@@ -2205,6 +2349,9 @@ struct Written {
     import_id: Option<i64>,
     /// The deleted projects a live row brought back, or would on a dry run.
     revived: BTreeSet<String>,
+    /// Why the write stopped between two batches, leaving the ledger of those
+    /// it committed and the journal open.
+    cut: Option<StopCause>,
 }
 
 /// Places every row and link of `prepared` and, unless this is a dry run,
@@ -2219,21 +2366,23 @@ async fn write(
     dry_run: bool,
     source: &'static str,
     timings: &mut ImportTimings,
-) -> Result<Written, ImportError> {
+    control: &ImportControl,
+) -> Result<Written, Cut> {
     let now = TimestampMs::now().as_millis_i64();
-    let (clock, mut timing) = (Instant::now(), Timing::new(Step::Load));
-    let planned = load(store, prepared, &mut timing).await?;
+    let (clock, mut timing) = control.begin(Step::Load);
+    let planned = or_stop(control, Step::Load, load(store, prepared, &mut timing)).await??;
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
-    let clock = Instant::now();
+    let (clock, timing) = control.begin(Step::Decide);
     let stop = Arc::new(AtomicBool::new(false));
     let _stop = StopOnDrop(stop.clone());
     let decide_from = prepared.clone();
-    let decided = tokio::task::spawn_blocking(move || decide(planned, &decide_from, &stop))
-        .await
+    let deciding = tokio::task::spawn_blocking(move || decide(planned, &decide_from, &stop));
+    let decided = or_stop(control, Step::Decide, deciding)
+        .await?
         .map_err(|e| MemoryError::Internal(format!("could not plan the import: {e}")))?
         .ok_or_else(|| MemoryError::Internal("the import was stopped".to_owned()))?;
-    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..Timing::new(Step::Decide) });
+    timings.record(Timing { elapsed: clock.elapsed(), rows: Some(prepared.rows.len()), ..timing });
 
     if dry_run {
         let revived = prepared
@@ -2243,44 +2392,64 @@ async fn write(
             .filter_map(|r| r.project.clone())
             .filter(|p| prepared.deleted.contains(p))
             .collect();
-        return Ok(Written { ledger: decided, snapshot: None, import_id: None, revived });
+        return Ok(Written { ledger: decided, snapshot: None, import_id: None, revived, cut: None });
     }
     let embedder = embedder.ok_or(ImportError::NoEmbedder)?;
 
     let picked = rows_to_embed(prepared, &decided);
-    let (clock, mut timing) = (Instant::now(), Timing { rows: Some(picked.len()), ..Timing::new(Step::Embed) });
-    let order = embedding_order(prepared, picked, chunker).await?;
+    let (clock, timing) = control.begin(Step::Embed);
+    let mut timing = Timing { rows: Some(picked.len()), ..timing };
+    control.count(|c| c.rows_to_embed = picked.len());
+    let order = or_stop(control, Step::Embed, embedding_order(prepared, picked, chunker)).await??;
     let mut vectors: HashMap<i64, Vec<u8>> = HashMap::with_capacity(order.len());
     for batch in order.chunks(EMBED_BATCH) {
         let asked = Instant::now();
         let rows: Vec<&Row> = batch.iter().map(|&k| &prepared.rows[k]).collect();
         let texts: Vec<String> = rows.iter().map(|r| embedding_text(&r.context, &r.content).into_owned()).collect();
-        let embedded = embedder.embed_batch(&texts, EmbedRole::Passage).await?;
+        // A batch the embedder still holds is let go: its thread drops the
+        // answer, and nothing it computes is written.
+        let embedded = or_stop(control, Step::Embed, embedder.embed_batch(&texts, EmbedRole::Passage)).await??;
         for (row, vector) in rows.iter().zip(embedded) {
             let unit = to_unit(&vector).map_err(|e| EmbedError::InferenceFailed(e.to_string()))?;
             vectors.insert(row.src.id, unit.iter().flat_map(|f| f.to_le_bytes()).collect());
         }
+        control.count(|c| c.rows_embedded += rows.len());
         timing.batch(asked.elapsed());
     }
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
+    stopped_after(control, Step::Embed)?;
 
-    let clock = Instant::now();
+    let (clock, timing) = control.begin(Step::Snapshot);
     let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreImport).await?.display().to_string();
-    timings.record(Timing { elapsed: clock.elapsed(), ..Timing::new(Step::Snapshot) });
+    timings.record(Timing { elapsed: clock.elapsed(), ..timing });
+    stopped_after(control, Step::Snapshot)?;
 
     let vectors = Arc::new(vectors);
     let mut ledger = Ledger::default();
     // A transaction a cut leaves unwritten journals nothing, and the number
     // is the first write's, so an import that adds nothing has none.
     let mut journal = Journal::new(store, source, now, Some(snapshot.clone()));
-    let mut batches = note_batches(&prepared.units(), WRITE_BATCH);
+    let units = prepared.units();
+    let mut batches = note_batches(&units, WRITE_BATCH);
     if batches.is_empty() {
         // The projects are recorded even when there is no row.
         batches.push(0..0);
     }
-    let (clock, mut timing) = (Instant::now(), Timing { rows: Some(prepared.rows.len()), ..Timing::new(Step::Write) });
+    let notes = batch_notes(&units, &batches);
+    let (clock, timing) = control.begin(Step::Write);
+    let mut timing = Timing { rows: Some(prepared.rows.len()), ..timing };
+    let mut cut = None;
     for (k, range) in batches.into_iter().enumerate() {
-        let (batch, vectors) = (prepared.clone(), vectors.clone());
+        // Only between batches: a transaction that was sent commits whatever
+        // the caller does, and its ledger and journal come back with it. The
+        // first batch always runs, so a write that stopped has a report.
+        if k > 0 {
+            cut = control.cause();
+            if cut.is_some() {
+                break;
+            }
+        }
+        let (batch, vectors, rows) = (prepared.clone(), vectors.clone(), range.len());
         let mut placed = std::mem::take(&mut ledger);
         let mut logged = journal;
         let written = timed(store, &mut timing, move |c| {
@@ -2301,10 +2470,21 @@ async fn write(
         })
         .await?;
         (ledger, journal) = written.map_err(|(id, delete_id)| ImportError::ProjectDeleted { id, delete_id })?;
+        control.numbered(journal.id);
+        control.count(|c| {
+            c.rows_written += rows;
+            c.notes_written += notes[k];
+        });
     }
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
+    if cut.is_some() {
+        // The journal ends here without `finished_at`, and its drop lets the
+        // import's number go.
+        let revived = std::mem::take(&mut journal.revived);
+        return Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id, revived, cut });
+    }
 
-    let (clock, mut timing) = (Instant::now(), Timing::new(Step::Links));
+    let (clock, mut timing) = control.begin(Step::Links);
     let links = prepared.clone();
     let (ledger, mut journal) = timed(store, &mut timing, move |c| {
         let tx = c.transaction()?;
@@ -2319,7 +2499,7 @@ async fn write(
     timings.record(Timing { elapsed: clock.elapsed(), ..timing });
 
     let revived = std::mem::take(&mut journal.revived);
-    Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id, revived })
+    Ok(Written { ledger, snapshot: Some(snapshot), import_id: journal.id, revived, cut: None })
 }
 
 /// The indices in `prepared.rows` of the rows the import inserts and are not
@@ -2354,7 +2534,7 @@ async fn embedding_order(prepared: &Arc<Prepared>, picked: Vec<usize>, chunker: 
 
 /// The indices of `tokens` from the largest count to the smallest, equal
 /// counts in the order they came.
-fn longest_first(tokens: &[usize]) -> Vec<usize> {
+pub(crate) fn longest_first(tokens: &[usize]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..tokens.len()).collect();
     order.sort_by_key(|&k| Reverse(tokens[k]));
     order
@@ -2489,6 +2669,9 @@ pub(crate) mod tests {
     use crate::memory::events::{MemoryEvent, MemorySource};
     use crate::memory::portability::export::{read, Export, ExportFilter};
     use crate::memory::identity::{Disk, FakeGround, RootCommit};
+    use crate::memory::embedder::GatedEmbedder;
+    use crate::memory::portability::control::{Counters, StopCause};
+    use futures::FutureExt;
     use crate::memory::portability::fixtures::{other_project, project, seed, OTHER_ROOT, ROOT};
     use crate::memory::portability::foreign::{ForeignNote, ForeignRelation, NoteKind, When};
     use crate::memory::portability::format::tests::EXAMPLE;
@@ -2544,13 +2727,13 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    pub(crate) async fn run(store: &MemoryStore, text: &str, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+    pub(crate) async fn run(store: &MemoryStore, text: &str, options: ImportOptions) -> (ImportReport, crate::test_dir::TestDir) {
         run_on(store, text, options, Arc::new(Disk)).await
     }
 
     /// [`run`] with what `ground` finds at each root.
-    async fn run_on(store: &MemoryStore, text: &str, options: ImportOptions, ground: Arc<dyn Ground>) -> (ImportReport, tempfile::TempDir) {
-        let backups = tempfile::tempdir().unwrap();
+    async fn run_on(store: &MemoryStore, text: &str, options: ImportOptions, ground: Arc<dyn Ground>) -> (ImportReport, crate::test_dir::TestDir) {
+        let backups = crate::test_dir::test_dir();
         let report = import(store, Some(&FakeEmbedder::default()), Arc::new(ChatChunker::with_fallback()), backups.path(), text, &options, ground, &mut ImportTimings::new(false))
             .await
             .unwrap();
@@ -2716,7 +2899,7 @@ pub(crate) mod tests {
     async fn an_unknown_version_writes_nothing() {
         let file = seeded_file().await.replacen("\"version\":1", "\"version\":2", 1);
         let dst = destination().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let err = import(&dst, Some(&FakeEmbedder::default()), Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::Format(FormatError::UnknownVersion(2))), "{err}");
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
@@ -2727,7 +2910,7 @@ pub(crate) mod tests {
     async fn a_dry_run_reports_without_writing() {
         let file = seeded_file().await;
         let dst = destination().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let sequence = "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'memory'), 0)";
         let before = count(&dst, sequence).await;
         let dry = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
@@ -2789,7 +2972,7 @@ pub(crate) mod tests {
     async fn a_dry_run_and_an_import_that_adds_nothing_have_no_number() {
         let file = seeded_file().await;
         let dst = destination().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let dry = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert_eq!(dry.import_id, None);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_import").await, 0);
@@ -2803,7 +2986,7 @@ pub(crate) mod tests {
     async fn without_an_embedder_nothing_is_written() {
         let file = seeded_file().await;
         let dst = destination().await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let err = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap_err();
         assert!(matches!(err, ImportError::NoEmbedder));
         assert_eq!(count(&dst, "SELECT count(*) FROM memory").await, 1);
@@ -3033,7 +3216,7 @@ pub(crate) mod tests {
             merged: std::sync::atomic::AtomicBool::new(false),
             fake: FakeEmbedder::default(),
         };
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
 
         import(&dst, Some(&embedder), Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false))
             .await
@@ -3072,7 +3255,7 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
-        let clone = tempfile::tempdir().unwrap();
+        let clone = crate::test_dir::test_dir();
         std::fs::create_dir_all(clone.path().join(".git")).unwrap();
         std::fs::write(clone.path().join(".git").join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
         let here = clone.path().to_string_lossy().into_owned();
@@ -3464,7 +3647,7 @@ pub(crate) mod tests {
         run(&dst, &file, ImportOptions::default()).await;
         let ground = Arc::new(FakeGround::default());
         ground.put(Path::new("/work/notas"), None, Some("s1"), RootCommit::Known("c1".into()));
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
         let reg = crate::memory::project::Registration {
             root: Path::new("/work/notas"),
@@ -3526,7 +3709,7 @@ pub(crate) mod tests {
 
         let ground = Arc::new(FakeGround::default());
         ground.put(Path::new("/work/mono"), Some("github.com/acme/mono"), Some("s1"), RootCommit::Known("c1".into()));
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
         let reg = crate::memory::project::Registration {
             root: Path::new("/work/mono"),
@@ -3871,12 +4054,12 @@ pub(crate) mod tests {
         assert_eq!(reasons, vec!["memory 15 was revived by deleting 16, which is not in the file"], "{report:#?}");
     }
 
-    pub(crate) async fn run_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
+    pub(crate) async fn run_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> (ImportReport, crate::test_dir::TestDir) {
         run_export(store, foreign_export(notes), options).await
     }
 
-    pub(crate) async fn run_export(store: &MemoryStore, export: ForeignExport, options: ImportOptions) -> (ImportReport, tempfile::TempDir) {
-        let backups = tempfile::tempdir().unwrap();
+    pub(crate) async fn run_export(store: &MemoryStore, export: ForeignExport, options: ImportOptions) -> (ImportReport, crate::test_dir::TestDir) {
+        let backups = crate::test_dir::test_dir();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let report =
             import_foreign(store, Some(&FakeEmbedder::default()), chunker, backups.path(), export, &options, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
@@ -4052,7 +4235,7 @@ pub(crate) mod tests {
         let content = format!("{}{}", words.join(" "), " word".repeat(600));
         let dst = destination().await;
         let notes = vec![foreign_note("engram:long", title, &content)];
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let dry_run = ImportOptions { dry_run: true, ..Default::default() };
         let dry = import_foreign(&dst, None, chunker, backups.path(), foreign_export(notes.clone()), &dry_run, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
@@ -4154,13 +4337,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let clone = || {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_dir::test_dir();
             std::fs::create_dir_all(dir.path().join(".git")).unwrap();
             std::fs::write(dir.path().join(".git").join("config"), "[remote \"origin\"]\n\turl = https://github.com/acme/app\n").unwrap();
             dir
         };
         let (one, two) = (clone(), clone());
-        let root = |dir: &tempfile::TempDir| dir.path().to_string_lossy().into_owned();
+        let root = |dir: &crate::test_dir::TestDir| dir.path().to_string_lossy().into_owned();
         let keyed = |origin: &str, project: &str, content: &str| ForeignNote {
             project: Some(project.into()),
             topic_key: Some("sdd/x".into()),
@@ -4221,12 +4404,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_project_map_path_in_a_declared_subfolder_goes_to_its_project() {
         let dst = destination().await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let root = crate::memory::identity::strip_verbatim(&std::fs::canonicalize(dir.path()).unwrap());
         let inside = root.join("apps").join("web").join("src");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(&inside).unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let workspaces = crate::memory::workspace::WorkspaceManager::new(home.path().join("workspaces"));
         let reg = crate::memory::project::Registration {
             root: &root,
@@ -4272,7 +4455,7 @@ pub(crate) mod tests {
         let dst = destination().await;
         run_foreign(&dst, sample_notes(), ImportOptions::default()).await;
         let moved_to = register(&dst, "/work/moved").await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let filter = MoveFilter { origin_project: Some("a".into()), include_deleted: true, ..Default::default() };
         let moved = move_memories_core(&dst, backups.path(), &filter, Some(moved_to.clone()), false).await.unwrap();
         assert!(!moved.moved.is_empty());
@@ -4324,7 +4507,7 @@ pub(crate) mod tests {
         let first = vec![proposal("a", "the proposal of a", T0), proposal("b", "the proposal of b", T0), long("closing", T0)];
         run_foreign(&dst, first, ImportOptions::default()).await;
         let elsewhere = register(&dst, "/work/elsewhere").await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let filter = MoveFilter { origin_project: Some("a".into()), ..Default::default() };
         move_memories_core(&dst, backups.path(), &filter, Some(elsewhere.clone()), false).await.unwrap();
 
@@ -4656,7 +4839,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_store_from_v16_travels_whole() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         seed_on_disk(dir.path(), Some(16)).await;
         let exported = crate::memory::portability::export(dir.path(), &ExportFilter::default(), 0).unwrap();
         let dst = destination().await;
@@ -4725,11 +4908,11 @@ pub(crate) mod tests {
     }
 
     async fn file_of(store: &MemoryStore, text: &str, options: ImportOptions) -> Arc<Prepared> {
-        prepare_file(store, text, &options, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap()
+        prepare_parsed(store, parsed(text), &options, Arc::new(Disk), &mut ImportTimings::new(false), &ImportControl::default()).await.unwrap()
     }
 
     async fn notes_of(store: &MemoryStore, notes: Vec<ForeignNote>, options: ImportOptions) -> Arc<Prepared> {
-        prepare_export(store, Arc::new(ChatChunker::with_fallback()), foreign_export(notes), &options, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap().0
+        prepare_export(store, Arc::new(ChatChunker::with_fallback()), foreign_export(notes), &options, Arc::new(Disk), &mut ImportTimings::new(false), &ImportControl::default()).await.unwrap().0
     }
 
     /// What the pass that decided on the connection made of `prepared`: the
@@ -4850,7 +5033,7 @@ pub(crate) mod tests {
         decides_alike(&dst, notes_of(&dst, notes, plain()).await, "two notes of an origin and a text twice").await;
 
         let dst = destination().await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let options = ImportOptions { project_map: vec![("a".into(), dir.path().to_string_lossy().into_owned().into())], ..Default::default() };
         let prepared = notes_of(&dst, sample_notes(), options).await;
         let root_id = prepared.projects[0].root_id.clone();
@@ -4903,7 +5086,7 @@ pub(crate) mod tests {
         insert_row(&dst, "claude-code", Some(project()), "Storage engine: DuckDB", Some("storage/engine"), 5).await;
         let purged = insert_row(&dst, "claude-code", None, "A row purged since", None, 6).await;
         dst.conn.call(move |c| c.execute("DELETE FROM memory WHERE id = ?1", [purged])).await.unwrap();
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let dry = import(&dst, None, Arc::new(ChatChunker::with_fallback()), backups.path(), &file, &ImportOptions { dry_run: true, ..Default::default() }, Arc::new(Disk), &mut ImportTimings::new(false)).await.unwrap();
         assert!(dry.topic_taken.iter().all(|t| t.stored_as > purged) && !dry.topic_taken.is_empty(), "{dry:#?}");
         let (real, _) = run(&dst, &file, ImportOptions::default()).await;
@@ -4919,7 +5102,7 @@ pub(crate) mod tests {
     }
 
     async fn timed_foreign(store: &MemoryStore, notes: Vec<ForeignNote>, dry_run: bool) -> (ImportReport, ImportTimings) {
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let chunker = Arc::new(ChatChunker::with_fallback());
         let options = ImportOptions { dry_run, ..Default::default() };
         let mut timings = ImportTimings::new(dry_run);
@@ -4931,7 +5114,7 @@ pub(crate) mod tests {
     }
 
     async fn timed_file(store: &MemoryStore, file: &str) -> (ImportReport, ImportTimings) {
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let mut timings = ImportTimings::new(false);
         let report =
             import(store, Some(&FakeEmbedder::default()), Arc::new(ChatChunker::with_fallback()), backups.path(), file, &ImportOptions::default(), Arc::new(Disk), &mut timings)
@@ -5098,7 +5281,7 @@ pub(crate) mod tests {
     }
 
     async fn import_notes_with(store: &MemoryStore, embedder: &dyn Embedder, notes: Vec<ForeignNote>) -> ImportReport {
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         import_foreign(
             store,
             Some(embedder),
@@ -5148,7 +5331,7 @@ pub(crate) mod tests {
         let file = seeded_file().await;
         let dst = destination().await;
         let embedder = Recording::new();
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         import(&dst, Some(&embedder), word_chunker(), backups.path(), &file, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false))
             .await
             .unwrap();
@@ -5269,7 +5452,7 @@ pub(crate) mod tests {
         let export = engram::read(&std::fs::read_to_string(path("CLAWG_IMPORT_EXPORT")).unwrap()).unwrap();
         let store = MemoryStore::new_for_test().await.unwrap();
         let chunker = Arc::new(ChatChunker::with_tokenizer(tokenizer.clone()));
-        let (prepared, _) = prepare_export(&store, chunker.clone(), export, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(true)).await.unwrap();
+        let (prepared, _) = prepare_export(&store, chunker.clone(), export, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(true), &ImportControl::default()).await.unwrap();
         let planned = load(&store, &prepared, &mut Timing::new(Step::Load)).await.unwrap();
         let decided = decide(planned, &prepared, &AtomicBool::new(false)).unwrap();
         let rows: Vec<&Row> = rows_to_embed(&prepared, &decided).into_iter().map(|k| &prepared.rows[k]).collect();
@@ -5329,9 +5512,9 @@ pub(crate) mod tests {
         let first: Vec<usize> = (0..sample).collect();
         report_padding(&format!("first {sample} rows"), &first);
 
-        let files = load_cached_model(&base).await.unwrap();
+        let files = load_cached_model(&base, &crate::memory::model_download::CacheLock::new()).await.unwrap();
         let pad_id = check_tokenizer(&tokenizer, &files.tokenizer).unwrap();
-        let embedder = E5Embedder::from_parts(&files.onnx, tokenizer.clone(), &files.tokenizer).unwrap();
+        let embedder = E5Embedder::from_parts(&files.onnx, tokenizer.clone(), &files.tokenizer, Arc::default()).unwrap();
         let orders = orders(&first);
         let embed = |order: &[usize]| {
             let (texts, embedder) = (&texts, &embedder);
@@ -5411,5 +5594,243 @@ pub(crate) mod tests {
                 probes.len(),
             );
         }
+    }
+
+    fn parsed(text: &str) -> Parsed {
+        parse(text).unwrap().1
+    }
+
+    /// An import of `input` into `store` with a control of its own, and the
+    /// counters the control ended with.
+    async fn counted(store: &MemoryStore, input: ImportInput) -> (ImportReport, Counters, crate::test_dir::TestDir) {
+        let backups = crate::test_dir::test_dir();
+        let control = ImportControl::default();
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let Imported::Done(report) = import_parsed(store, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
+            .await
+            .unwrap()
+        else {
+            panic!("nothing raised a stop");
+        };
+        (report, control.progress().counters, backups)
+    }
+
+    #[tokio::test]
+    async fn a_clawg_file_is_parsed_once_for_a_job() {
+        let file = seeded_file().await;
+        let (by_text, _) = run(&destination().await, &file, ImportOptions::default()).await;
+        let (by_parsed, _, _) = counted(&destination().await, ImportInput::Clawg(parsed(&file))).await;
+        assert_eq!(ImportReport { snapshot: None, ..by_parsed }, ImportReport { snapshot: None, ..by_text });
+
+        let (by_text, _) = run_foreign(&destination().await, sample_notes(), ImportOptions::default()).await;
+        let (by_parsed, _, _) = counted(&destination().await, ImportInput::Foreign(foreign_export(sample_notes()))).await;
+        assert_eq!(ImportReport { snapshot: None, ..by_parsed }, ImportReport { snapshot: None, ..by_text });
+    }
+
+    #[tokio::test]
+    async fn the_counters_do_not_depend_on_the_batch_sizes() {
+        for rows in [31, 32, 33, 255, 256, 257] {
+            let contents: Vec<String> = (1..=rows).map(|k| format!("the row {k} of the file")).collect();
+            let list: Vec<(i64, Option<&str>, &str)> = contents.iter().enumerate().map(|(k, c)| (k as i64 + 1, None, c.as_str())).collect();
+            let store = MemoryStore::new_for_test().await.unwrap();
+            let (report, counters, _) = counted(&store, ImportInput::Clawg(parsed(&clawg_file(&[], &list)))).await;
+            assert_eq!(report.inserted, rows);
+            let all = Counters { rows, notes: rows, rows_to_embed: rows, rows_embedded: rows, rows_written: rows, notes_written: rows };
+            assert_eq!(counters, all, "a file of {rows} rows");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_counters_of_a_finished_import_match_its_report() {
+        let (report, counters, _) = counted(&destination().await, ImportInput::Clawg(parsed(&seeded_file().await))).await;
+        assert_eq!((counters.rows_embedded, counters.rows_written, counters.notes_written), (counters.rows_to_embed, report.rows, counters.notes));
+        assert_eq!((counters.rows, counters.notes), (report.rows, report.rows), "a clawg file has a note for each row");
+
+        let (report, counters, _) = counted(&destination().await, ImportInput::Foreign(foreign_export(sample_notes()))).await;
+        assert_eq!((counters.rows_embedded, counters.rows_written, counters.notes_written), (counters.rows_to_embed, report.rows, counters.notes));
+        assert_eq!(counters.rows, report.rows);
+        assert!(counters.rows > counters.notes, "a long note is several rows: {counters:?}");
+        assert!(counters.rows_to_embed < counters.rows, "a note the source deleted is not embedded: {counters:?}");
+    }
+
+    #[test]
+    fn batch_notes_counts_the_notes_of_each_write_batch() {
+        let units = [1, 1, 1, 1, 1];
+        assert_eq!(batch_notes(&units, &note_batches(&units, 2)), vec![2, 2, 1]);
+        let units = [3, 1, 2, 5, 1];
+        let batches = note_batches(&units, 4);
+        assert_eq!(batches, vec![0..4, 4..6, 6..11, 11..12]);
+        assert_eq!(batch_notes(&units, &batches), vec![2, 1, 1, 1]);
+        assert_eq!(batch_notes(&[], &[0..0]), vec![0], "the batch that only records the projects");
+    }
+
+    /// A clawg file of `rows` rows, in as many write batches as `WRITE_BATCH` makes.
+    fn rows_file(rows: usize) -> String {
+        let contents: Vec<String> = (1..=rows).map(|k| format!("the row {k} of the file")).collect();
+        let list: Vec<(i64, Option<&str>, &str)> = contents.iter().enumerate().map(|(k, c)| (k as i64 + 1, None, c.as_str())).collect();
+        clawg_file(&[], &list)
+    }
+
+    /// What an import of `input` left after `Cancel` was raised as it entered
+    /// `step`: its result, the store, the directory of its snapshots and its
+    /// control.
+    async fn cancelled_at(step: Step, input: ImportInput) -> (Imported, MemoryStore, crate::test_dir::TestDir, ImportControl) {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let backups = crate::test_dir::test_dir();
+        let control = ImportControl::default();
+        let raise = control.clone();
+        control.on_step(move |entered| {
+            if entered == step {
+                raise.stop(StopCause::Cancel);
+            }
+        });
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let imported = import_parsed(&store, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
+            .await
+            .unwrap();
+        (imported, store, backups, control)
+    }
+
+    /// The rows of `memory` and of `memory_import`, and the files in `backups`.
+    async fn left_by(store: &MemoryStore, backups: &crate::test_dir::TestDir) -> (usize, usize, usize) {
+        let (rows, imports): (usize, usize) = store
+            .conn
+            .call(|c| {
+                Ok::<_, rusqlite::Error>((
+                    c.query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM memory_import", [], |r| r.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        (rows, imports, std::fs::read_dir(backups.path()).unwrap().count())
+    }
+
+    #[tokio::test]
+    async fn each_step_of_an_import_stops_where_the_table_says() {
+        let rows = WRITE_BATCH + 1;
+        // Raised on entering the first step; where it stops; the rows, the
+        // journaled imports and the snapshots it leaves; whether it reports.
+        let table = [
+            (Step::Plan, Step::Plan, (0, 0, 0), false),
+            (Step::Prepare, Step::Prepare, (0, 0, 0), false),
+            (Step::Load, Step::Load, (0, 0, 0), false),
+            (Step::Decide, Step::Decide, (0, 0, 0), false),
+            (Step::Embed, Step::Embed, (0, 0, 0), false),
+            (Step::Snapshot, Step::Snapshot, (0, 0, 1), false),
+            (Step::Write, Step::Write, (WRITE_BATCH, 1, 1), true),
+        ];
+        for (raised, stops_in, left, reports) in table {
+            let (imported, store, backups, _) = cancelled_at(raised, ImportInput::Clawg(parsed(&rows_file(rows)))).await;
+            let Imported::Stopped(stopped) = imported else { panic!("{raised:?} did not stop the import") };
+            assert_eq!((stopped.cause, stopped.step), (StopCause::Cancel, stops_in), "raised in {raised:?}");
+            assert_eq!(stopped.report.is_some(), reports, "the report after {raised:?}");
+            assert_eq!(left_by(&store, &backups).await, left, "left by a stop in {raised:?}");
+        }
+
+        let (imported, store, backups, _) = cancelled_at(Step::Translate, ImportInput::Foreign(foreign_export(sample_notes()))).await;
+        let Imported::Stopped(stopped) = imported else { panic!("the translation was not stopped") };
+        assert_eq!((stopped.cause, stopped.step, stopped.report.is_none()), (StopCause::Cancel, Step::Translate, true));
+        assert_eq!(left_by(&store, &backups).await, (0, 0, 0));
+
+        let (imported, store, backups, _) = cancelled_at(Step::Links, ImportInput::Clawg(parsed(&rows_file(rows)))).await;
+        let Imported::Done(report) = imported else { panic!("the links are not a place to stop") };
+        assert_eq!((report.inserted, left_by(&store, &backups).await), (rows, (rows, 1, 1)));
+        let finished: Option<i64> = store.conn.call(|c| c.query_row("SELECT finished_at FROM memory_import", [], |r| r.get(0))).await.unwrap();
+        assert!(finished.is_some(), "an import stopped in its links ends");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_embedding_batch_does_not_block_the_stop() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let backups = crate::test_dir::test_dir();
+        let (embedder, gate) = GatedEmbedder::new();
+        let control = ImportControl::default();
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let input = ImportInput::Clawg(parsed(&rows_file(3)));
+        let (options, mut timings) = (ImportOptions::default(), ImportTimings::new(false));
+        let import = import_parsed(&store, Some(&embedder), chunker, backups.path(), input, &options, Arc::new(Disk), &mut timings, &control);
+        let stop = async {
+            gate.entered().await;
+            control.stop(StopCause::Cancel);
+        };
+        let (imported, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async { tokio::join!(import, stop) })
+            .await
+            .expect("the stop waited for the batch the embedder holds");
+        let Imported::Stopped(stopped) = imported.unwrap() else { panic!("the import finished") };
+        assert_eq!((stopped.cause, stopped.step, stopped.report.is_none()), (StopCause::Cancel, Step::Embed, true));
+        assert_eq!(left_by(&store, &backups).await, (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_stop_between_write_batches_returns_the_committed_ledger() {
+        let (imported, store, _backups, control) = cancelled_at(Step::Write, ImportInput::Clawg(parsed(&rows_file(WRITE_BATCH + 1)))).await;
+        let Imported::Stopped(stopped) = imported else { panic!("the write was not stopped") };
+        assert_eq!((stopped.cause, stopped.step), (StopCause::Cancel, Step::Write));
+        let report = stopped.report.expect("a batch was committed");
+
+        let (journaled, finished_at): (usize, Option<i64>) = store
+            .conn
+            .call(|c| {
+                c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM memory_import_row WHERE import_id = i.import_id), i.finished_at FROM memory_import i",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!((report.inserted, journaled), (WRITE_BATCH, WRITE_BATCH));
+        assert_eq!(report.rows, WRITE_BATCH + 1, "the rows of the file, not the committed ones");
+        assert!(report.import_id.is_some() && finished_at.is_none(), "the journal stays open for an undo");
+        assert!(store.importing.lock().unwrap().is_empty(), "a stopped import lets its number go");
+        assert_eq!(control.progress().counters.rows_written, WRITE_BATCH);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_import_sends_nothing_after_its_cut() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let backups = crate::test_dir::test_dir();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(Some(held));
+        let control = ImportControl::default();
+        let queue = store.clone();
+        control.on_step(move |step| {
+            if step != Step::Write {
+                return;
+            }
+            if let Some(held) = held.lock().unwrap().take() {
+                // The batches queue behind this call, which holds the
+                // connection until the test lets go; polling it once sends it.
+                let hold = move |_: &mut rusqlite::Connection| {
+                    let _ = held.recv();
+                    Ok::<_, rusqlite::Error>(())
+                };
+                let _ = queue.conn.call(hold).now_or_never();
+            }
+        });
+        let task = tokio::spawn({
+            let (store, control) = (store.clone(), control.clone());
+            let (backups, input) = (backups.path().to_path_buf(), ImportInput::Clawg(parsed(&rows_file(WRITE_BATCH + 1))));
+            async move {
+                let chunker = Arc::new(ChatChunker::with_fallback());
+                import_parsed(&store, Some(&FakeEmbedder::default()), chunker, &backups, input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control).await
+            }
+        });
+        while control.progress().step != Some(Step::Write) {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        assert!(matches!(task.await, Err(e) if e.is_cancelled()));
+        release.send(()).unwrap();
+
+        // Whatever was queued ran before this call; nothing was queued after.
+        let (rows, finished_at): (usize, Option<i64>) = store
+            .conn
+            .call(|c| Ok::<_, rusqlite::Error>((c.query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))?, c.query_row("SELECT finished_at FROM memory_import", [], |r| r.get(0))?)))
+            .await
+            .unwrap();
+        assert_eq!(rows, WRITE_BATCH, "the batch already sent committed and no other was sent");
+        assert!(finished_at.is_none(), "the links were never sent");
     }
 }

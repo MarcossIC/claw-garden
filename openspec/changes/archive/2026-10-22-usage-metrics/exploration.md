@@ -1,6 +1,6 @@
 # usage-metrics — Exploración
 
-Objetivo transversal: poder comparar el rendimiento del daemon por día, por franja horaria y por versión con datos de uso real, sin sacar nada de la máquina. Nace de una propuesta de medición escrita sobre 0.26.0 (doce propuestas, M0 a M12); este cambio toma su base: el histograma agregable, el fichero aparte, la latencia HTTP por ruta, el proceso y una forma de leerlo. Lo que se apoya en esta base va en [pipeline-metrics](../../pipeline-metrics/exploration.md) (73) y [perf-bench](../../perf-bench/exploration.md) (74); la rotación del log, en [serve-log-rotation](../2026-10-22-serve-log-rotation/exploration.md) (72).
+Objetivo transversal: poder comparar el rendimiento del daemon por día, por franja horaria y por versión con datos de uso real, sin sacar nada de la máquina. Nace de una propuesta de medición escrita sobre 0.26.0 (doce propuestas, M0 a M12); este cambio toma su base: el histograma agregable, el fichero aparte, la latencia HTTP por ruta, el proceso y una forma de leerlo. Lo que se apoya en esta base va en [pipeline-metrics](../2026-10-30-pipeline-metrics/exploration.md) (73) y [perf-bench](../2026-10-31-perf-bench/exploration.md) (74); la rotación del log, en [serve-log-rotation](../2026-10-22-serve-log-rotation/exploration.md) (72).
 
 ## Premisas que se verificaron y cuáles no eran del todo ciertas
 

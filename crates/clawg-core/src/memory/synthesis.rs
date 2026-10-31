@@ -765,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn a_purged_source_leaves_the_conclusion_to_review() {
         use crate::memory::store_lock::StoreHolder;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let a = seed(&store, Some("p"), "tabs in go", 1).await;
         let c = conclude(&store, Some("p"), &[a], 2).await;
@@ -807,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn a_purged_source_counts_until_the_first_review() {
         use crate::memory::store_lock::StoreHolder;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let a = seed(&store, Some("p"), "tabs in go", 1).await;
         conclude(&store, Some("p"), &[a], 2).await;

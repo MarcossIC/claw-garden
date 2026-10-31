@@ -33,7 +33,7 @@ pub enum Step {
 }
 
 impl Step {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Step::Read => "read",
             Step::Plan => "plan",
@@ -99,7 +99,7 @@ impl Timing {
     }
 }
 
-fn seconds(d: Duration) -> String {
+pub fn seconds(d: Duration) -> String {
     format!("{:.1}", d.as_secs_f64())
 }
 

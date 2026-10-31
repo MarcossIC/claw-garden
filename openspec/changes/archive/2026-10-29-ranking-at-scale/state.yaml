@@ -1,0 +1,22 @@
+change: ranking-at-scale
+objective: "1"
+depends_on: [history-import, piece-boundaries]
+phase: archived
+release: "0.66.0"
+artifacts:
+  exploration: done
+  proposal: done  # las decisiones del 2026-10-28
+  spec: done  # RS1 a RS12 en specs/eval; RS13 y RS14 no entraron
+  design: done
+  tasks: done  # 1 a 16 y 20; 17 a 19 y 21 a 23 no se hicieron, porque sus puertas cerraron
+  apply: done  # el paso 1, y el arreglo del parser del contexto de agent-view
+  verify: done  # la suite y los dos clippy en Windows, el CI del pull request #99 en Linux y Windows, y la medición con el modelo real sobre los dos cortes
+  archive: done
+gates:
+  "1": closed  # session_summary ocupa el 7,1 % del top 3 cuando hay respuesta; el peso no se hace
+  "2": closed  # ni C1, ni C2, ni C3 separan las consultas con y sin respuesta; la abstención no se hace
+after_archive:  # fuera del cambio
+  - "borrar los dos cortes de docs/eval/backgrounds/ cuando la persona lo confirme"
+  - "el paso operativo: ubicar las ~15.709 filas sin proyecto del perfil prod, con autorización, antes de leer en prod lo que este cambio midió"
+updated: 2026-10-29
+main_spec: openspec/specs/eval/spec.md

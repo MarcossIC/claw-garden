@@ -26,8 +26,7 @@ pub const AGENT_ID: &str = "rag-eval-agent";
 pub struct SeedResult {
     pub store: EvalStore,
     pub refs: RefMap,
-    /// Where the temp store was opened. Left on disk deliberately — see
-    /// [`unique_store_path`].
+    /// Where the temp store was opened.
     pub store_path: PathBuf,
     pub mean_norm: f64,
     pub max_norm_deviation: f64,
@@ -43,7 +42,7 @@ pub struct SeedResult {
     pub vectors: Vec<(String, Vec<f32>)>,
 }
 
-/// Opens a fresh temp store and inserts every row of `corpus` into it,
+/// Opens a fresh store at `store_path` and inserts every row of `corpus` into it,
 /// embedding each row's content with `embedder`. Fails loud: the first
 /// embedding or insert error aborts the whole pass rather than returning a
 /// partially-seeded store that would make every case scored against it
@@ -55,30 +54,54 @@ pub struct SeedResult {
 /// trigger under the requested tokenizer, with no separate backfill step.
 /// `None` leaves the store on the tokenizer the V8 migration already applied.
 pub async fn seed(
+    store_path: &std::path::Path,
     corpus: &[CorpusRow],
     embedder: &EvalEmbedder,
     fts_tokenizer: Option<&str>,
 ) -> Result<SeedResult, EvalError> {
-    let store_path = unique_store_path();
-    let store = EvalStore::open(&store_path).await?;
+    let store = EvalStore::open(store_path).await?;
     if let Some(tokenizer) = fts_tokenizer {
-        store.recreate_fts_with_tokenizer(tokenizer).await?;
+        if let Err(e) = store.recreate_fts_with_tokenizer(tokenizer).await {
+            close_after_failure(store).await;
+            return Err(e);
+        }
     }
+    seed_onto(store, store_path.to_path_buf(), corpus, embedder).await
+}
+
+/// Inserts every row of `corpus` into `store`, open at `store_path`, which
+/// may already hold rows: a background the corpus is measured among. A
+/// failure closes `store` before it is returned, since this call took the
+/// only handle the caller could close it with.
+pub async fn seed_onto(
+    store: EvalStore,
+    store_path: PathBuf,
+    corpus: &[CorpusRow],
+    embedder: &EvalEmbedder,
+) -> Result<SeedResult, EvalError> {
     let mut refs = RefMap::new();
     let mut norms: Vec<f64> = Vec::with_capacity(corpus.len());
     let mut vectors: Vec<(String, Vec<f32>)> = Vec::with_capacity(corpus.len());
 
-    for row in corpus {
-        // Passage: corpus rows are the stored side of the space — this must
-        // match production's worker.rs role, or the harness seeds a space
-        // production never writes to.
-        let embedding = embedder.embed_with_role(&row.content, EmbedRole::Passage).await?;
-        norms.push(l2_norm(&embedding));
-        vectors.push((row.ref_.clone(), embedding.clone()));
-        let id = store
-            .insert(AGENT_ID, &row.content, &row.memory_type, row.importance, embedding, age_ms(row.age_days))
-            .await?;
-        refs.insert(row.ref_.clone(), id);
+    let inserted = async {
+        for row in corpus {
+            // Passage: corpus rows are the stored side of the space — this must
+            // match production's worker.rs role, or the harness seeds a space
+            // production never writes to.
+            let embedding = embedder.embed_with_role(&row.content, EmbedRole::Passage).await?;
+            norms.push(l2_norm(&embedding));
+            vectors.push((row.ref_.clone(), embedding.clone()));
+            let id = store
+                .insert(AGENT_ID, &row.content, &row.memory_type, row.importance, embedding, age_ms(row.age_days))
+                .await?;
+            refs.insert(row.ref_.clone(), id);
+        }
+        Ok::<_, EvalError>(())
+    }
+    .await;
+    if let Err(e) = inserted {
+        close_after_failure(store).await;
+        return Err(e);
     }
 
     let (mean_norm, max_norm_deviation) = norm_stats(&norms);
@@ -86,21 +109,43 @@ pub async fn seed(
     Ok(SeedResult { store, refs, store_path, mean_norm, max_norm_deviation, vectors })
 }
 
-const DAY_MS: f64 = 86_400_000.0;
+/// Closes `store` on a path that already failed. The failure that stopped the
+/// run is the one to report, so one in closing is only a warning; the close is
+/// still awaited, since the directory is removed next and on Windows a file
+/// still open cannot be deleted.
+pub(crate) async fn close_after_failure(store: EvalStore) {
+    if let Err(e) = store.close().await {
+        eprintln!("warning: {e}");
+    }
+}
+
+pub(crate) const DAY_MS: f64 = 86_400_000.0;
 
 /// A row's `age_days` as the whole milliseconds the store backdates it by.
-fn age_ms(age_days: f64) -> u64 {
+pub(crate) fn age_ms(age_days: f64) -> u64 {
     (age_days * DAY_MS).round() as u64
 }
 
-/// A path under the system temp directory, unique per run. Not cleaned up
-/// afterward — an unexpected retrieval number is easier to diagnose with the
-/// exact database that produced it still on disk than with a clean rerun
-/// that may not reproduce it. `tempfile` (which would auto-delete) is a
-/// dev-dependency in this crate and does not reach `[[bin]]` targets at all,
-/// which makes this a constraint as much as a choice.
-fn unique_store_path() -> PathBuf {
+/// A path under the system temp directory, unique per run, for the store the
+/// run seeds or copies. The run removes it when it ends; `--keep-store` keeps
+/// a seeded one, to open the database behind an unexpected number.
+pub(crate) fn unique_store_path() -> PathBuf {
     std::env::temp_dir().join(format!("rag-eval-{}", uuid::Uuid::new_v4()))
+}
+
+/// Removal is retried: on Windows another process (a virus scanner, the
+/// search indexer) can hold a file it has just seen written for a moment, and
+/// a directory holding an open file cannot be deleted. Failing to delete is
+/// reported, not fatal: the measurement itself is already complete.
+pub(crate) async fn remove_scratch(scratch: &std::path::Path) {
+    for _ in 0..40 {
+        match std::fs::remove_dir_all(scratch) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    eprintln!("warning: could not remove the scratch directory {}", scratch.display());
 }
 
 fn l2_norm(v: &[f32]) -> f64 {
@@ -127,6 +172,7 @@ fn norm_stats(norms: &[f64]) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_temp::temp_path;
 
     #[test]
     fn age_days_converts_to_whole_milliseconds() {
@@ -156,10 +202,9 @@ mod tests {
             row("c3", "gamma content", "tool_error", 2.5),
         ];
         let embedder = EvalEmbedder::fake();
+        let store = temp_path("seed-map");
 
-        // seed() opens its own temp store; nothing to pass in but the corpus
-        // and the embedder.
-        let result = seed(&corpus, &embedder, None).await.expect("seeding must succeed");
+        let result = seed(&store, &corpus, &embedder, None).await.expect("seeding must succeed");
 
         let id1 = result.refs.id_of("c1").expect("c1 must be mapped");
         let id2 = result.refs.id_of("c2").expect("c2 must be mapped");
@@ -170,16 +215,16 @@ mod tests {
         assert_eq!(result.refs.ref_of(id2), Some("c2"));
         assert_eq!(result.refs.ref_of(id3), Some("c3"));
         assert_eq!(result.refs.id_of("does-not-exist"), None);
-
-        std::fs::remove_dir_all(&result.store_path).ok();
+        result.store.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn seed_computes_norm_stats_over_the_actual_embeddings() {
         let corpus = vec![row("c1", "some content", "chat_message", 3.0)];
         let embedder = EvalEmbedder::fake();
+        let store = temp_path("seed-norms");
 
-        let result = seed(&corpus, &embedder, None).await.expect("seeding must succeed");
+        let result = seed(&store, &corpus, &embedder, None).await.expect("seeding must succeed");
 
         // FakeEmbedder is documented (embedder.rs) as unnormalized with
         // ‖v‖ ≈ 11.3 — far from 1.0. Asserting a wide, generous band rather
@@ -189,8 +234,7 @@ mod tests {
         // unrelated reasons.
         assert!(result.mean_norm > 5.0, "expected an unnormalized fake vector, got mean_norm={}", result.mean_norm);
         assert!(result.max_norm_deviation > 4.0);
-
-        std::fs::remove_dir_all(&result.store_path).ok();
+        result.store.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -200,25 +244,22 @@ mod tests {
             row("c2", "beta content", "code_block", 4.0),
         ];
         let embedder = EvalEmbedder::fake();
+        let store = temp_path("seed-vectors");
 
-        let result = seed(&corpus, &embedder, None).await.expect("seeding must succeed");
+        let result = seed(&store, &corpus, &embedder, None).await.expect("seeding must succeed");
 
         assert_eq!(result.vectors.len(), corpus.len());
         for (_ref_, vector) in &result.vectors {
             assert_eq!(vector.len(), embedder.dimensions());
         }
-
-        std::fs::remove_dir_all(&result.store_path).ok();
+        result.store.close().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn seed_uses_a_fresh_store_path_on_every_call() {
-        let embedder = EvalEmbedder::fake();
-        let a = seed(&[], &embedder, None).await.expect("seeding an empty corpus must still open a store");
-        let b = seed(&[], &embedder, None).await.expect("seeding an empty corpus must still open a store");
-        assert_ne!(a.store_path, b.store_path, "each run must get its own temp store");
-        std::fs::remove_dir_all(&a.store_path).ok();
-        std::fs::remove_dir_all(&b.store_path).ok();
+    #[test]
+    fn every_run_gets_a_fresh_store_path_under_the_temp_dir() {
+        let (a, b) = (unique_store_path(), unique_store_path());
+        assert_ne!(a, b, "each run must get its own temp store");
+        assert!(a.starts_with(std::env::temp_dir()));
     }
 
     #[tokio::test]
@@ -230,16 +271,30 @@ mod tests {
         // meaningless without saying so.
         let corpus = vec![row("c1", "content", "not_a_real_type", 3.0)];
         let embedder = EvalEmbedder::fake();
+        let store = temp_path("seed-unknown-type");
 
         // `SeedResult` (the Ok side) does not derive `Debug` — it wraps an
         // opaque `EvalStore` handle deliberately, so `expect_err` (which
         // requires the whole `Result` to be `Debug`) is not usable here.
         // Matching directly on the outcome avoids that requirement.
-        match seed(&corpus, &embedder, None).await {
+        match seed(&store, &corpus, &embedder, None).await {
             Err(EvalError::UnknownMemoryType(_)) => {}
             Err(other) => panic!("expected UnknownMemoryType, got {other}"),
             Ok(_) => panic!("unknown memory_type must fail the whole seed"),
         }
+    }
+
+    /// The store is the seed's to close once it took it: a caller that
+    /// removes the directory after a failure must find nothing held.
+    #[tokio::test]
+    async fn a_failed_seed_lets_go_of_its_store() {
+        let corpus = vec![row("c1", "content", "not_a_real_type", 3.0)];
+        let embedder = EvalEmbedder::fake();
+        let store = temp_path("seed-failed-close");
+
+        assert!(seed(&store, &corpus, &embedder, None).await.is_err());
+
+        std::fs::remove_dir_all(&store).expect("the store must come off at the first attempt");
     }
 
     #[tokio::test]
@@ -257,20 +312,21 @@ mod tests {
             row("c2", "second row content", "chat_message", 3.0),
         ];
         let embedder = EvalEmbedder::fake();
+        let store = temp_path("seed-trigram");
 
-        let result = seed(&corpus, &embedder, Some("trigram")).await.expect("seeding must succeed");
+        let result = seed(&store, &corpus, &embedder, Some("trigram")).await.expect("seeding must succeed");
         assert!(result.refs.id_of("c1").is_some());
         assert!(result.refs.id_of("c2").is_some());
-
-        std::fs::remove_dir_all(&result.store_path).ok();
+        result.store.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn seed_rejects_an_unlisted_tokenizer_before_seeding_anything() {
         let corpus = vec![row("c1", "content", "chat_message", 3.0)];
         let embedder = EvalEmbedder::fake();
+        let store = temp_path("seed-porter");
 
-        match seed(&corpus, &embedder, Some("porter")).await {
+        match seed(&store, &corpus, &embedder, Some("porter")).await {
             Err(EvalError::UnknownTokenizer(t)) => assert_eq!(t, "porter"),
             Err(other) => panic!("expected UnknownTokenizer, got {other}"),
             Ok(_) => panic!("an unlisted tokenizer must fail before any row is inserted"),

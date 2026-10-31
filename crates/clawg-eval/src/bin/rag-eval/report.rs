@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use clawg_core::eval_api::EvalScoringConfig;
+use clawg_core::eval_api::{EvalComposition, EvalContract, EvalCount, EvalScoringConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::golden::{CaseStatus, CaseSubset};
@@ -94,6 +94,8 @@ pub struct CaseResult {
     /// Only on `update` cases: the newer row came before every stale one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_first: Option<bool>,
+    #[serde(flatten)]
+    pub scale: CaseScale,
 }
 
 /// Retrieval quality restricted to the cases of one language. The embedding
@@ -250,6 +252,9 @@ pub struct RetrievalResults {
     /// Share of `update` cases whose newer row came first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<Rate>,
+    /// Only over a background: see [`Scale`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<Scale>,
 }
 
 /// The threshold sweep restricted to the pairs of one language. A distance
@@ -472,6 +477,35 @@ pub struct RunResults {
     /// earlier results file reads as a run that never measured it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_view: Option<crate::agent_view::AgentViewResults>,
+    /// Present only for a run over `--background`, absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<Background>,
+}
+
+/// The snapshot a run measured over, in names and counts alone: never a text,
+/// a row id or a key of it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Background {
+    /// As it was given.
+    pub path: String,
+    pub sha256: String,
+    pub contract: EvalContract,
+    pub schema: SchemaSpan,
+    /// When the searches ran: decay reads the clock, so two runs over one
+    /// background compare only from the same day.
+    pub searched_at_ms: i64,
+    /// Its live rows before the golden corpus was seeded on top.
+    pub composition: EvalComposition,
+    /// The golden refs whose text a live row of the background also holds,
+    /// which the ranking never credits.
+    pub golden_twins: Vec<String>,
+}
+
+/// The schema of a snapshot, and the one its copy was migrated to.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SchemaSpan {
+    pub from: i32,
+    pub to: i32,
 }
 
 impl RetrievalResults {
@@ -496,7 +530,240 @@ impl RetrievalResults {
             unanswerable,
             abstention,
             freshness,
+            scale: None,
         }
+    }
+}
+
+/// What a case's search shows over a background, beside its metrics: what a
+/// type weight or an abstention gate would be decided on. Every field is
+/// absent without a background, so no file of a run without one carries it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CaseScale {
+    /// The project the case names, as it names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// The `memory_type` of the first save the case expects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_type: Option<String>,
+    /// Only when that save is a `session_summary`: whether it is the one LAST
+    /// SESSION opens a context of the case's project with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_is_last_summary: Option<bool>,
+    /// The `memory_type` of each of the first five hits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top5_types: Vec<String>,
+    /// The age decay reads of each of those hits, in days since it was last
+    /// accessed, read right after the search; none for a hit of another table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decay_age_days: Vec<Option<f64>>,
+    /// The highest raw cosine among the hits that are not `exact`, with no
+    /// decay or importance in it; absent when every hit is `exact`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_cosine: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_gap_1_10: Option<f64>,
+    /// How many KNN queries the `memory` pool took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_survival: Option<PoolSurvival>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_pool: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_pool_cause: Option<ShortPoolCause>,
+}
+
+/// What the `memory` pool of a case's search asked for and gave back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolSurvival {
+    pub requested: usize,
+    /// The distinct saves it held after its retry.
+    pub saves: usize,
+    /// The eligible rows, counted up to `requested` when the first window came
+    /// back short.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<usize>,
+    /// Whether a row the case expects reached the pool, which tells a row that
+    /// never got there from one that got there and ranked low; absent for an
+    /// unanswerable case, and false for a row only the lexical channel found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_in_pool: Option<bool>,
+}
+
+/// Why a pool came back with fewer saves than it asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortPoolCause {
+    /// The scope holds fewer rows than the window.
+    Scope,
+    /// It holds more, and rows outside it, or the pieces of a few saves,
+    /// filled the window.
+    Crowded,
+}
+
+/// Why `pool` is short, or none when it holds every save it asked for.
+pub fn short_pool_cause(pool: &PoolSurvival) -> Option<ShortPoolCause> {
+    if pool.saves >= pool.requested {
+        return None;
+    }
+    match pool.eligible {
+        Some(eligible) if eligible < pool.requested => Some(ShortPoolCause::Scope),
+        _ => Some(ShortPoolCause::Crowded),
+    }
+}
+
+/// The score of the first hit minus that of the tenth; none with fewer than ten.
+pub fn score_gap_1_10(scores: &[f64]) -> Option<f64> {
+    Some(scores.first()? - scores.get(9)?)
+}
+
+/// What a run over a background says of the cases with a whole pool: how
+/// much of the top 3 each type takes, and how the cosine and the gap spread
+/// with and without an answer.
+#[derive(Debug, Clone, Serialize)]
+pub struct Scale {
+    pub top3_by_type: TypePlaces,
+    pub distributions: Vec<Distribution>,
+    pub short_pool_cases: ShortPoolCases,
+}
+
+/// The places of the top 3 of the answered cases that do not expect a
+/// `session_summary`, by the type of the hit in each.
+#[derive(Debug, Clone, Serialize)]
+pub struct TypePlaces {
+    pub n_cases: usize,
+    pub n_places: usize,
+    pub types: Vec<TypeShare>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TypeShare {
+    pub memory_type: String,
+    pub places: usize,
+    pub share: f64,
+    /// The share of the background's live rows of this type.
+    pub row_share: f64,
+}
+
+/// The spread of `best_cosine` and `score_gap_1_10` over the cases of one
+/// side, pair and partition; `pair` none for every pair together.
+#[derive(Debug, Clone, Serialize)]
+pub struct Distribution {
+    pub answered: bool,
+    pub pair: Option<String>,
+    pub split: Split,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_cosine: Option<Quantiles>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_gap_1_10: Option<Quantiles>,
+}
+
+/// Nearest-rank percentiles, each one of the values.
+#[derive(Debug, Clone, Serialize)]
+pub struct Quantiles {
+    pub n: usize,
+    pub p5: f64,
+    pub p25: f64,
+    pub p50: f64,
+    pub p75: f64,
+    pub p95: f64,
+}
+
+impl Quantiles {
+    fn of(values: &[f64]) -> Option<Self> {
+        let p = |q: f64| crate::agent_view::stats::percentile(values, q);
+        (!values.is_empty()).then(|| Self { n: values.len(), p5: p(5.0), p25: p(25.0), p50: p(50.0), p75: p(75.0), p95: p(95.0) })
+    }
+}
+
+/// The cases left out of [`Scale`] for a short pool, by cause.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ShortPoolCases {
+    pub scope: usize,
+    pub crowded: usize,
+}
+
+/// [`Scale`] of the answered cases `per_case` and the `unanswerable` ones,
+/// against the background's live rows by type.
+pub fn scale_of(per_case: &[CaseResult], unanswerable: &[CaseResult], rows_by_type: &[EvalCount]) -> Scale {
+    let mut short_pool_cases = ShortPoolCases::default();
+    for case in per_case.iter().chain(unanswerable) {
+        match case.scale.short_pool_cause {
+            Some(ShortPoolCause::Scope) => short_pool_cases.scope += 1,
+            Some(ShortPoolCause::Crowded) => short_pool_cases.crowded += 1,
+            None => {}
+        }
+    }
+    let whole = |c: &&CaseResult| c.scale.short_pool != Some(true);
+
+    let weighed: Vec<&CaseResult> = per_case
+        .iter()
+        .filter(whole)
+        .filter(|c| c.scale.expected_type.as_deref() != Some("session_summary"))
+        .collect();
+    let mut places: BTreeMap<String, usize> = BTreeMap::new();
+    for case in &weighed {
+        for memory_type in case.scale.top5_types.iter().take(3) {
+            *places.entry(memory_type.clone()).or_default() += 1;
+        }
+    }
+    let n_places: usize = places.values().sum();
+    let total_rows: u64 = rows_by_type.iter().map(|c| c.rows).sum();
+    let row_share = |memory_type: &str| {
+        let rows = rows_by_type.iter().find(|c| c.value.as_deref() == Some(memory_type)).map_or(0, |c| c.rows);
+        if total_rows == 0 { 0.0 } else { rows as f64 / total_rows as f64 }
+    };
+    for count in rows_by_type {
+        if let Some(memory_type) = &count.value {
+            places.entry(memory_type.clone()).or_default();
+        }
+    }
+    let types = places
+        .into_iter()
+        .map(|(memory_type, n)| TypeShare {
+            share: if n_places == 0 { 0.0 } else { n as f64 / n_places as f64 },
+            row_share: row_share(&memory_type),
+            memory_type,
+            places: n,
+        })
+        .collect();
+
+    let mut distributions = Vec::new();
+    for (answered, cases) in [(true, per_case), (false, unanswerable)] {
+        let cases: Vec<&CaseResult> = cases.iter().filter(whole).collect();
+        let pair = |c: &CaseResult| pair_of(c.query_lang.as_deref(), c.lang.as_deref()).map(|p| format!("{}>{}", p.query_lang, p.lang));
+        let mut pairs: Vec<Option<String>> = vec![None];
+        let mut named: Vec<String> = cases.iter().filter_map(|c| pair(c)).collect();
+        named.sort();
+        named.dedup();
+        pairs.extend(named.into_iter().map(Some));
+        for split in [Split::Calibration, Split::Test] {
+            for wanted in &pairs {
+                let group: Vec<&&CaseResult> = cases
+                    .iter()
+                    .filter(|c| split_of(&c.query) == split && (wanted.is_none() || pair(c) == *wanted))
+                    .collect();
+                let cosine: Vec<f64> = group.iter().filter_map(|c| c.scale.best_cosine).collect();
+                let gap: Vec<f64> = group.iter().filter_map(|c| c.scale.score_gap_1_10).collect();
+                if cosine.is_empty() && gap.is_empty() {
+                    continue;
+                }
+                distributions.push(Distribution {
+                    answered,
+                    pair: wanted.clone(),
+                    split,
+                    best_cosine: Quantiles::of(&cosine),
+                    score_gap_1_10: Quantiles::of(&gap),
+                });
+            }
+        }
+    }
+
+    Scale {
+        top3_by_type: TypePlaces { n_cases: weighed.len(), n_places, types },
+        distributions,
+        short_pool_cases,
     }
 }
 
@@ -1032,7 +1299,129 @@ mod tests {
             subset: CaseSubset::Natural,
             abstained: None,
             fresh_first: None,
+            scale: Default::default(),
         }
+    }
+
+    // --- scale -----------------------------------------------------------
+
+    fn scaled(query: &str, expected_type: &str, top: &[&str]) -> CaseResult {
+        CaseResult {
+            scale: CaseScale {
+                expected_type: Some(expected_type.to_string()),
+                top5_types: top.iter().map(|t| t.to_string()).collect(),
+                short_pool: Some(false),
+                ..CaseScale::default()
+            },
+            ..case(query, 1.0, CaseStatus::Active)
+        }
+    }
+
+    fn rows_of(value: &str, rows: u64) -> EvalCount {
+        EvalCount { value: Some(value.to_string()), rows }
+    }
+
+    #[test]
+    fn the_gap_is_first_minus_tenth() {
+        let scores: Vec<f64> = (0..12).map(|i| 1.0 - i as f64 * 0.05).collect();
+
+        assert!((score_gap_1_10(&scores).unwrap() - 0.45).abs() < 1e-12);
+        assert_eq!(score_gap_1_10(&scores[..9]), None);
+    }
+
+    #[test]
+    fn a_crowded_window_is_told_apart_from_a_small_scope() {
+        let pool = |saves, eligible| PoolSurvival { requested: 30, saves, eligible, expected_in_pool: None };
+
+        assert_eq!(short_pool_cause(&pool(30, None)), None);
+        assert_eq!(short_pool_cause(&pool(12, Some(12))), Some(ShortPoolCause::Scope));
+        assert_eq!(short_pool_cause(&pool(12, Some(30))), Some(ShortPoolCause::Crowded));
+        assert_eq!(
+            short_pool_cause(&pool(12, None)),
+            Some(ShortPoolCause::Crowded),
+            "a full window of the pieces of a few saves"
+        );
+    }
+
+    #[test]
+    fn top3_places_by_type_against_row_share() {
+        let cases: Vec<CaseResult> = (0..10)
+            .map(|i| {
+                let top: &[&str] = if i < 5 {
+                    &["session_summary", "session_summary", "semantic_fact", "session_summary"]
+                } else {
+                    &["semantic_fact", "session_summary", "semantic_fact"]
+                };
+                scaled(&format!("q{i}"), "semantic_fact", top)
+            })
+            .collect();
+        let rows = [rows_of("semantic_fact", 89), rows_of("session_summary", 11)];
+
+        let scale = scale_of(&cases, &[], &rows);
+
+        let places = &scale.top3_by_type;
+        assert_eq!((places.n_cases, places.n_places), (10, 30));
+        let summary = places.types.iter().find(|t| t.memory_type == "session_summary").unwrap();
+        assert_eq!(summary.places, 15);
+        assert!((summary.share - 0.5).abs() < 1e-12);
+        assert!((summary.row_share - 0.11).abs() < 1e-12);
+        let asking = scaled("q-summary", "session_summary", &["session_summary"; 3]);
+        let with_asking: Vec<CaseResult> = cases.iter().cloned().chain([asking]).collect();
+        assert_eq!(scale_of(&with_asking, &[], &rows).top3_by_type.n_cases, 10, "a case that asks for a summary stays out");
+    }
+
+    #[test]
+    fn distributions_split_by_answered_pair_and_partition() {
+        let with = |query: String, cosine: f64, lang: Option<&str>| CaseResult {
+            query_lang: Some("es".to_string()),
+            lang: lang.map(str::to_string),
+            scale: CaseScale {
+                best_cosine: Some(cosine),
+                score_gap_1_10: Some(cosine / 10.0),
+                short_pool: Some(false),
+                ..CaseScale::default()
+            },
+            ..case(&query, 1.0, CaseStatus::Active)
+        };
+        let answered: Vec<CaseResult> = (0..40)
+            .map(|i| with(format!("answered {i}"), 0.80 + i as f64 / 1000.0, Some(if i % 2 == 0 { "es" } else { "en" })))
+            .collect();
+        let unanswered: Vec<CaseResult> =
+            (0..20).map(|i| with(format!("unanswered {i}"), 0.70 + i as f64 / 1000.0, None)).collect();
+
+        let scale = scale_of(&answered, &unanswered, &[]);
+
+        let cell = |answered: bool, pair: Option<&str>, split: Split| {
+            scale.distributions.iter().find(|d| d.answered == answered && d.pair.as_deref() == pair && d.split == split)
+        };
+        let n = |d: Option<&Distribution>| d.map_or(0, |d| d.best_cosine.as_ref().unwrap().n);
+        for split in [Split::Calibration, Split::Test] {
+            assert_eq!(n(cell(true, None, split)), n(cell(true, Some("es>es"), split)) + n(cell(true, Some("es>en"), split)));
+        }
+        assert_eq!(n(cell(true, None, Split::Calibration)) + n(cell(true, None, Split::Test)), 40);
+        assert_eq!(n(cell(false, None, Split::Calibration)) + n(cell(false, None, Split::Test)), 20);
+        let unanswered_cosine = cell(false, None, Split::Calibration).unwrap().best_cosine.as_ref().unwrap();
+        assert!(unanswered_cosine.p95 < 0.80, "the unanswered cosines stay in their own cell");
+        assert!(unanswered_cosine.p5 <= unanswered_cosine.p50 && unanswered_cosine.p50 <= unanswered_cosine.p95);
+    }
+
+    #[test]
+    fn short_pool_cases_stay_out_of_the_weight_aggregates() {
+        let mut short = scaled("q-short", "semantic_fact", &["session_summary"; 3]);
+        short.scale.short_pool = Some(true);
+        short.scale.short_pool_cause = Some(ShortPoolCause::Crowded);
+        short.scale.best_cosine = Some(0.9);
+        let whole = scaled("q-whole", "semantic_fact", &["semantic_fact"; 3]);
+        let mut unanswered = case("q-unanswered", 0.0, CaseStatus::Active);
+        unanswered.scale =
+            CaseScale { short_pool: Some(true), short_pool_cause: Some(ShortPoolCause::Scope), best_cosine: Some(0.5), ..CaseScale::default() };
+
+        let scale = scale_of(&[short, whole], &[unanswered], &[]);
+
+        assert_eq!(scale.top3_by_type.n_cases, 1);
+        assert!(scale.top3_by_type.types.iter().all(|t| t.memory_type != "session_summary"), "{:?}", scale.top3_by_type);
+        assert!(scale.distributions.is_empty(), "{:?}", scale.distributions);
+        assert_eq!((scale.short_pool_cases.scope, scale.short_pool_cases.crowded), (1, 1));
     }
 
     fn case_in(query: &str, recall_10: f64, lang: Option<&str>) -> CaseResult {
@@ -1444,6 +1833,7 @@ mod tests {
             audit: None,
             similarity: None,
             agent_view: None,
+            background: None,
         }
     }
 
@@ -1486,7 +1876,7 @@ mod tests {
     fn an_unmeasured_run_omits_the_similarity_key_entirely() {
         // Absent, not null: a reader must be able to tell "this run predates
         // the similarity instrument" from "it was computed and found nothing".
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Fake);
         let path = write_json(&results, &out_dir, false).expect("write must succeed");
         let written = std::fs::read_to_string(&path).expect("must read back");
@@ -1544,7 +1934,7 @@ mod tests {
 
     #[test]
     fn a_measured_run_serializes_the_similarity_block_with_both_prefixes() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let mut results = minimal_results("2026-07-27", Mode::Real);
         results.similarity = Some(minimal_similarity_results());
         let path = write_json(&results, &out_dir, false).expect("write must succeed");
@@ -1567,7 +1957,7 @@ mod tests {
 
     #[test]
     fn scoring_config_is_always_serialized_and_round_trips_every_field() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let mut results = minimal_results("2026-07-27", Mode::Real);
         results.scoring_config = EvalScoringConfig {
             importance_base: 0.7,
@@ -1594,7 +1984,7 @@ mod tests {
     fn scoring_config_is_present_even_at_default_values() {
         // The zero point of a sweep is not "nothing to report" — it is the
         // one config every non-sweep run has always scored with.
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Fake);
         let path = write_json(&results, &out_dir, false).expect("write must succeed");
         let written = std::fs::read_to_string(&path).expect("must read back");
@@ -1616,7 +2006,7 @@ mod tests {
     fn an_unaudited_run_omits_the_audit_key_entirely() {
         // Serializing it as `null` would read as "audited, found nothing",
         // which is a different claim from "never audited".
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Fake);
         let path = write_json(&results, &out_dir, false).expect("write must succeed");
         let written = std::fs::read_to_string(&path).expect("must read back");
@@ -1627,7 +2017,7 @@ mod tests {
 
     #[test]
     fn write_json_creates_the_out_dir_and_writes_the_expected_filename() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Fake);
         let path = write_json(&results, &out_dir, false).expect("first write must succeed");
         assert_eq!(path, out_dir.join("2026-07-27-fake.json"));
@@ -1639,7 +2029,7 @@ mod tests {
 
     #[test]
     fn write_json_refuses_to_overwrite_without_force() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let results = minimal_results("2026-07-27", Mode::Real);
         write_json(&results, &out_dir, false).expect("first write must succeed");
 
@@ -1655,7 +2045,7 @@ mod tests {
 
     #[test]
     fn write_json_overwrites_when_force_is_set() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-report-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("report");
         let mut results = minimal_results("2026-07-27", Mode::Fake);
         write_json(&results, &out_dir, false).expect("first write must succeed");
 
@@ -1734,7 +2124,7 @@ mod tests {
 
     #[test]
     fn write_sweep_index_writes_the_expected_filename() {
-        let out_dir = std::env::temp_dir().join(format!("rag-eval-sweep-test-{}", uuid::Uuid::new_v4()));
+        let out_dir = crate::test_temp::temp_path("sweep");
         let index = SweepIndex {
             date: "2026-08-16".to_string(),
             mode: Mode::Real,

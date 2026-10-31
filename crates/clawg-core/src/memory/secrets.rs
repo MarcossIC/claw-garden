@@ -624,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_scan_finds_live_and_deleted_rows_without_their_secrets() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let aws = insert(&store, format!("staging uses {}", fake("AKIA", "Q7ZX", 16))).await;
         insert(&store, "nothing secret here".to_string()).await;
@@ -650,7 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_scan_flags_rows_saved_before_a_new_rule() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let password = insert(&store, "db password=hunter2".to_string()).await;
         let marked = insert(&store, "card <private>4111 1111</private>".to_string()).await;
@@ -682,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_scan_finds_reasons_that_hold_a_secret() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let a = insert(&store, "the deploy runs on fridays".to_string()).await;
         let b = insert(&store, "the deploy runs on mondays".to_string()).await;
@@ -709,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn masking_reasons_rewrites_only_the_ones_with_a_secret() {
         use crate::memory::backup::backup_offline;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let a = insert(&store, "the deploy runs on fridays".to_string()).await;
         let b = insert(&store, "the deploy runs on mondays".to_string()).await;
@@ -743,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn masking_reasons_refuses_while_the_daemon_holds_the_store() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let a = insert(&store, "the deploy runs on fridays".to_string()).await;
         let b = insert(&store, "the deploy runs on mondays".to_string()).await;
@@ -761,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_scan_of_a_store_from_before_the_pairs_lists_rows_only() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         crate::memory::db::seed_on_disk(dir.path(), Some(14)).await;
         rusqlite::Connection::open(dir.path().join("memory.db"))
             .unwrap()
@@ -776,7 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_scan_reads_while_another_process_holds_the_store() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let id = insert(&store, format!("ci token {}", fake("ghp_", "a1B2", 36))).await;
         assert!(matches!(
@@ -862,7 +862,7 @@ mod tests {
 
     #[tokio::test]
     async fn purging_a_live_row_leaves_no_trace_of_its_text() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let id = store_with_a_secret(dir.path(), false).await;
         assert!(bytes_mention(dir.path(), b"quokka"), "the fixture holds the secret");
 
@@ -876,7 +876,7 @@ mod tests {
 
     #[tokio::test]
     async fn purging_a_deleted_row_leaves_no_trace_of_its_text() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let id = store_with_a_secret(dir.path(), true).await;
         assert!(bytes_mention(dir.path(), b"quokka"), "a soft delete keeps the text");
 
@@ -887,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn purging_releases_the_rows_that_disputed_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let disputed = insert(&store, "the deploy runs on fridays".to_string()).await;
         let challenger = insert(&store, "the deploy runs on mondays".to_string()).await;
@@ -914,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn purging_drops_the_pairs_of_the_row() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let old = insert(&store, "the deploy runs on fridays".to_string()).await;
         let purged = insert(&store, "the deploy runs on mondays".to_string()).await;
@@ -942,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn purging_keeps_the_links_that_name_the_row_as_a_source() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         let source = insert(&store, "the go service uses tabs".to_string()).await;
         let purged = insert(&store, "the user indents with tabs".to_string()).await;
@@ -971,7 +971,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_refuses_while_the_daemon_holds_the_store() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let id = store_with_a_secret(dir.path(), false).await;
         let before = std::fs::read(dir.path().join("memory.db")).unwrap();
         let _daemon = StoreLock::acquire(dir.path(), StoreHolder::Daemon).unwrap();
@@ -987,7 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_refuses_an_unknown_id_untouched() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         store_with_a_secret(dir.path(), false).await;
         let before = std::fs::read(dir.path().join("memory.db")).unwrap();
 
@@ -1001,7 +1001,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_refuses_a_store_with_pending_migrations_untouched() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let older = crate::memory::backup::latest_known() - 1;
         crate::memory::db::seed_on_disk(dir.path(), Some(older)).await;
         let before = std::fs::read(dir.path().join("memory.db")).unwrap();
@@ -1017,7 +1017,7 @@ mod tests {
     async fn purge_names_the_backups_that_still_hold_the_row() {
         use crate::memory::backup::backup_offline;
         let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         crate::memory::db::seed_on_disk(dir.path(), None).await;
         let without = backup_offline(dir.path()).unwrap();
         pause();
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[tokio::test]
     async fn purging_the_current_revision_brings_the_previous_one_back() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         crate::memory::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         let mut ids = Vec::new();
@@ -1101,7 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn purge_names_the_workspaces_that_still_hold_the_text() {
         use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let id = store_with_a_secret(dir.path(), false).await;
         let root = dir.path().join("workspaces");
         let write = |agent: &str, project: &str, auto: &str, user: &str| {
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn purging_the_first_piece_empties_the_head_of_its_save() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         crate::memory::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         let mut ids = Vec::new();
@@ -1169,7 +1169,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_keeps_other_agents_and_longer_saves_in_the_outbox() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         crate::memory::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         c.execute(INSERT_ROW, ["use pnpm"]).unwrap();
@@ -1191,7 +1191,7 @@ mod tests {
     #[tokio::test]
     async fn purge_removes_the_text_from_the_outbox() {
         use crate::memory::backup::backup_offline;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         crate::memory::db::seed_on_disk(dir.path(), None).await;
         let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
         add_outbox_row(&c, "op-1", SECRET);
@@ -1213,7 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_backup_from_before_the_outbox_is_not_named_for_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let backups = crate::paths::backups_dir(dir.path());
         std::fs::create_dir_all(&backups).unwrap();
         let old = backups.join(crate::memory::backup::snapshot_name(0, crate::memory::backup::Reason::Manual));
@@ -1226,7 +1226,7 @@ mod tests {
 
     #[test]
     fn the_scan_of_a_missing_store_creates_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let err = scan(dir.path()).unwrap_err();
         assert!(matches!(err, MemoryError::Backup(BackupError::NoStore { .. })), "{err}");
         assert!(files_in(dir.path()).is_empty(), "{:?}", files_in(dir.path()));
@@ -1244,7 +1244,7 @@ mod tests {
     /// a trajectory, a docs index and a pending save, deleted with its
     /// memories; and another project that links to it. The store is closed.
     struct DeletedProject {
-        dir: tempfile::TempDir,
+        dir: crate::test_dir::TestDir,
         delete_id: i64,
         secret: i64,
         other: i64,
@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     async fn deleted_project() -> DeletedProject {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
         store
             .conn

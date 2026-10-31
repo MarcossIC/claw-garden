@@ -326,6 +326,8 @@ clawg import repo.jsonl --map-root /work/repo=C:\code\repo --profile dev   # el 
 clawg import memorias.jsonl --agent claude-code --profile dev         # todas bajo otro agente
 ```
 
+Mientras corre, `clawg import` muestra por stderr la fase y los contadores (en una terminal, o con `--follow`). Ctrl-C la para en un punto seguro y dice qué alcanzó a escribir, con su `clawg import --undo N`; un segundo Ctrl-C sale sin esperar. Cerrar o matar el comando no la para: sigue en el daemon, y `clawg status` la muestra.
+
 Importar dos veces el mismo archivo no agrega nada. Una memoria cuyo texto ya está vivo acá no se duplica, y una cuya `topic_key` ya tiene una versión viva acá queda reemplazada por esa. El reporte dice cuántas trajo por tipo, estado y proyecto, y cuáles no pudo traer y por qué.
 
 Cada importación que escribe algo tiene un número, que el reporte nombra. `clawg import --undo N` la deshace días después sin perder lo guardado desde entonces: borra para siempre las memorias que trajo y siguen como las dejó, y devuelve lo que cambió en las que ya estaban. Las que alguien editó, borró, restauró o juzgó, y las que otra memoria necesita (una conclusión que se apoya en ellas, por ejemplo), se quedan, y el reporte dice por qué. Antes de escribir guarda un snapshot `pre-undo`:
@@ -504,7 +506,7 @@ clawg update --check          # dice si hay un release nuevo (100 si lo hay); cl
 clawg memories list|search|show|stats   # visor de sólo lectura (list --deleted: las borradas)
 clawg undelete 12 --profile dev         # devuelve una memoria borrada (con el daemon corriendo)
 clawg export --out m.jsonl --profile dev  # las memorias, una fila por línea (--project, --agent, --include-deleted, --format markdown)
-clawg import m.jsonl --profile dev        # las trae a este perfil, con el daemon corriendo (--dry-run, --agent, --map-root OLD=NEW)
+clawg import m.jsonl --profile dev        # las trae a este perfil, con el daemon corriendo (--dry-run, --agent, --map-root OLD=NEW, --follow)
 clawg import --from engram e.json --profile dev   # las notas de otra herramienta (--project-map NOMBRE=RUTA)
 clawg import --undo 3 --profile dev       # deshace la importación 3 y conserva lo que cambió desde entonces (--dry-run)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)

@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn a_reader_admits_what_its_reach_admits() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let mut p = SharingPolicy::default();
         p.hide("b", "a");
         save(dir.path(), &p).unwrap();
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn a_missing_policy_shares_everything() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let p = load(dir.path()).unwrap();
         assert_eq!(p, SharingPolicy::default());
         assert_eq!(p.reach_for("cursor"), all_but(&[]));
@@ -339,14 +339,14 @@ mod tests {
 
     #[test]
     fn an_unreadable_policy_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         std::fs::write(sharing_file(dir.path()), "{ not json").unwrap();
         assert!(matches!(load(dir.path()), Err(SharingError::Json(_))));
     }
 
     #[test]
     fn hide_and_unhide_rewrite_the_policy() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let mut p = load(dir.path()).unwrap();
         p.hide("cursor", "claude-code");
         save(dir.path(), &p).unwrap();
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn an_exclusion_can_come_before_the_data_directory_exists() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let base = dir.path().join(".clawg-dev");
         let mut p = SharingPolicy::default();
         p.hide("cursor", "claude-code");
@@ -385,7 +385,7 @@ mod tests {
         // The guard is the caller's: `load` fails, so there is no policy to
         // change and save. This pins that `load` does fail rather than
         // handing back an empty policy that a save would then write out.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let hand_edit = r#"{"version":1,"hides":{"cursor":["claude-code",]}}"#;
         std::fs::write(sharing_file(dir.path()), hand_edit).unwrap();
         assert!(load(dir.path()).is_err());
@@ -420,7 +420,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn save_creates_a_private_data_directory() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::test_dir::test_dir();
         let base = home.path().join(".clawg-dev");
 
         save(&base, &SharingPolicy::default()).unwrap();

@@ -1044,7 +1044,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         save(&store, fact("a note that makes the target a project", Some("target-2b3c"))).await;
         let id = save(&store, fact("a note of an id from before projects", Some("old-1a2b"))).await;
-        let backups = tempfile::tempdir().unwrap();
+        let backups = crate::test_dir::test_dir();
         let filter = MoveFilter { ids: vec![id], ..MoveFilter::default() };
         let moved = move_memories_core(&store, backups.path(), &filter, Some("target-2b3c".into()), false).await.unwrap();
         // As an id a store from before V27 only names in its history.
@@ -1206,7 +1206,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_declaration_is_listed_on_both_sides_with_its_paths() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir::test_dir();
         let (mono, other) = (dir.path().join("mono"), dir.path().join("other"));
         std::fs::create_dir_all(mono.join("apps").join("web")).unwrap();
         std::fs::create_dir_all(&other).unwrap();

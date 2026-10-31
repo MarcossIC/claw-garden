@@ -285,8 +285,10 @@ mod tests {
         for p in &passages {
             assert!(splitter.count(&p.indexed_text()) <= CHUNK_MAX_TOKENS, "{}", p.breadcrumb);
         }
+        // A definition over the cap is split by the splitter, whose cut may
+        // fall inside its signature; each piece still sits under its header.
         for name in ["fn plan_refresh", "fn needs_refresh", "fn fuse", "pub async fn search"] {
-            assert!(passages.iter().any(|p| p.body.contains(name)), "{name} is in no passage");
+            assert!(passages.iter().any(|p| p.body.contains(name) || p.breadcrumb.contains(name)), "{name} is in no passage");
         }
     }
 

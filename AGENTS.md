@@ -1,3 +1,3 @@
 # Claw Garden
 
-The instructions for agents working on this repository (workspace, data profiles, commands, MCP tools, code conventions, rules, versioning and testing) live in [`.claude/CLAUDE.md`](.claude/CLAUDE.md). Read that file before making changes; it is the only copy kept up to date.
+The rules for agents working on this repository (code conventions, commits, versioning, testing and build directories) live in [`.claude/CLAUDE.md`](.claude/CLAUDE.md), which says where the rest is documented under `docs/reference/`. Read it before making changes; do not copy it here.

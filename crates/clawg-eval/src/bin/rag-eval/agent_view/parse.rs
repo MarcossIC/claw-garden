@@ -29,25 +29,29 @@ pub enum ParseError {
 }
 
 /// Splits `format_search` output into its lines. The sentences of an empty
-/// answer are read in every language the tool speaks.
+/// answer, and the note that closes an answer with a row another agent saved,
+/// are read in every language the tool speaks.
 pub fn parse_search_output(text: &str) -> Result<Vec<SearchLine>, ParseError> {
     use clawg_cli::mcp::tools::{no_memories_found, no_relevant_memories};
-    let empty = [Lang::En, Lang::Es]
+    use clawg_core::memory::prompt_builder::shared_note;
+    let languages = [Lang::En, Lang::Es];
+    let empty = languages
         .into_iter()
         .any(|lang| text.trim() == no_memories_found(lang) || text.starts_with(no_relevant_memories(lang)));
     if empty {
         return Ok(Vec::new());
     }
     text.lines()
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !line.trim().is_empty() && !languages.into_iter().any(|lang| *line == shared_note(lang)))
         .map(|line| parse_search_line(line).ok_or_else(|| ParseError::SearchLine(line.to_string())))
         .collect()
 }
 
 /// `{rank}. #{id} [{kind}/{type}/t{tier} score={score}] {content}`, with
-/// `piece={k}/{n}` before the score for a piece of a long save. The first `]`
-/// closes the metadata because nothing inside it can contain one; content is
-/// free to.
+/// `piece={k}/{n}` before the score for a piece of a long save and `by
+/// {author}` after it for a row another agent saved. The first `]` closes the
+/// metadata because nothing inside it can contain one (an author's brackets
+/// are shown as parentheses); content is free to.
 fn parse_search_line(line: &str) -> Option<SearchLine> {
     let (rank, rest) = line.split_once(". #")?;
     let rank = rank.parse().ok()?;
@@ -57,7 +61,7 @@ fn parse_search_line(line: &str) -> Option<SearchLine> {
     }
     let id = id.parse().ok()?;
     let (meta, after) = rest.split_once(']')?;
-    let score = meta.split_once(" score=")?.1.parse().ok()?;
+    let score = meta.split_once(" score=")?.1.split(' ').next()?.parse().ok()?;
     let content = match after.strip_prefix(' ') {
         Some(content) => content,
         None if after.is_empty() => after,
@@ -148,10 +152,11 @@ fn joined(segments: Vec<Vec<&str>>) -> Vec<String> {
 }
 
 /// The text after a hit header, `[YYYY-MM-DD #id type] `, where the type is
-/// one word and may be absent, and a piece of a long save adds `piece={k}/{n}`.
+/// one word and may be absent, a piece of a long save adds `piece={k}/{n}`
+/// and a row another agent saved ends with `by {author}`.
 fn hit_text(line: &str) -> Option<&str> {
     let (header, text) = line.strip_prefix('[')?.split_once("] ")?;
-    let header = without_piece(header);
+    let header = without_piece(without_author(header));
     let (date, rest) = header.split_once(" #")?;
     let id = rest.split_once(' ').map_or(rest, |(id, kind)| {
         if kind.is_empty() || kind.contains(' ') { "" } else { id }
@@ -163,6 +168,12 @@ fn hit_text(line: &str) -> Option<&str> {
         && b[..4].iter().chain(&b[5..7]).chain(&b[8..]).all(u8::is_ascii_digit);
     let is_id = !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit());
     (is_date && is_id).then_some(text)
+}
+
+/// `header` up to its ` by {author}` mark. Nothing before the mark can hold
+/// ` by `, while the author, shown through `display_author`, may hold spaces.
+fn without_author(header: &str) -> &str {
+    header.split_once(" by ").map_or(header, |(before, _)| before)
 }
 
 /// `header` without a trailing ` piece={k}/{n}`, or as it came.
@@ -184,6 +195,21 @@ mod tests {
     #[test]
     fn the_empty_result_sentence_parses_to_no_lines() {
         assert!(parse_search_output("no memories found").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_hit_another_agent_saved_parses() {
+        let line = "1. #10 [Memory/semantic_fact/t3 piece=7/14 score=0.88 by migrated] the pier opens at dawn";
+
+        for lang in [Lang::En, Lang::Es] {
+            let text = format!("{line}\n{}", clawg_core::memory::prompt_builder::shared_note(lang));
+
+            let parsed = parse_search_output(&text).unwrap();
+
+            assert_eq!(parsed.len(), 1, "the note on shared rows is not a hit");
+            assert_eq!((parsed[0].rank, parsed[0].id, parsed[0].score), (1, 10, 0.88));
+            assert_eq!(parsed[0].content, "the pier opens at dawn");
+        }
     }
 
     #[test]
@@ -302,6 +328,17 @@ mod tests {
     fn a_context_hit_with_a_piece_is_one_segment() {
         let text = "=== LONG-TERM KNOWLEDGE ===\n[2026-10-15 #58 semantic_fact piece=2/4] the retry budget was set\n";
         assert_eq!(context_segments(text), vec!["the retry budget was set".to_string()]);
+    }
+
+    #[test]
+    fn a_context_hit_another_agent_saved_is_one_segment() {
+        let text = "=== LONG-TERM KNOWLEDGE ===\n\
+                    [2026-07-27 #10 semantic_fact piece=7/14 by migrated] the pier opens at dawn\n\
+                    [2026-07-26 #11 architectural_decision by a (b) c] the gate stays shut\n";
+        assert_eq!(
+            context_segments(text),
+            vec!["the pier opens at dawn".to_string(), "the gate stays shut".to_string()]
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal | S–M | — (se coordina con 54, 17, 20 y 61; ver «Interacciones») | exploración (borrador) |
+| transversal | S–M | — (se coordina con 54, 17, 20 y 61; ver «Interacciones») | exploración cerrada; ver [propuesta](proposal.md) |
 
 **Tesis:** el daemon es un proceso de fondo y no debería quitarle todos los núcleos al IDE y al compilador del usuario mientras indexa o re-embebe, ni guardar memoria que no necesita. Hoy el embedder pide un hilo de cálculo por núcleo lógico, deja los hilos de ONNX Runtime con su espera activa por defecto, arranca sin saberlo un segundo grupo de hilos (el de `rayon`, por el tokenizer) que vive hasta que el proceso termina, rellena con padding hasta el texto más largo de cada tanda, y tokeniza tres veces un guardado largo dentro del worker asíncrono. Además hay tres preguntas de memoria que nadie midió. El cambio es de **medición primero**: nada que mueva vectores o sume complejidad se hace si la medición no muestra que importa. Una corrección barata sí va sin puerta: si `available_parallelism()` falla, hoy el modelo no carga nunca. Con la puerta, el resultado correcto puede ser cerrar con una sola línea de código y un registro de lo medido (enfoque F).
 
@@ -88,6 +88,8 @@ Se llama una vez al empezar `serve`, antes de cualquier tanda. **A favor:** el g
 
 Ordenar los índices por cantidad de tokens, agrupar de a `EMBED_BATCH` y devolver los vectores en el orden original. **A favor:** menos padding en refrescos de docs. **En contra:** cambia el largo rectangular de cada llamada, y el comentario de `pool_and_normalize` (`embedder.rs:270-274`) sólo garantiza el orden de las operaciones, no que otra composición de tanda dé los mismos bits; el lote de 17 de `e5_golden` lo ejerce. Si los bits se mueven, hay que decidir entre reescribir la fixture o tolerancia. No sirve para el re-embeber (infiere de a una fila), así que lo gana 17 si ese cambio agrupa.
 
+**Pasó a [docs-index-speed](../docs-index-speed/proposal.md) (95)**, como sus pasos A1 y A2, con la puerta que lee el relleno medido por [docs-index-cost](../archive/2026-10-31-docs-index-cost/proposal.md) (94). Si los bits se mueven, se reescribe la fixture.
+
 ### E. Codificar una sola vez en `split_save`, y/o `spawn_blocking` sobre un tamaño
 
 Codificar el texto una vez y sacar las tres cortes de los offsets. **A favor:** un tercio del trabajo y el worker no se bloquea. **En contra:** los bordes de pieza tienen que quedar byte por byte iguales: `resume_positions` y el dedup comparan hashes por posición (`outbox.rs:93-110`), y un corte distinto invalida el progreso de un guardado en vuelo. Con 54 el peor caso ya está acotado; E sólo va si la puerta lo mide.
@@ -143,13 +145,13 @@ Si ninguna medición pasa su umbral, se cierra con el arreglo de `available_para
 
 Son del usuario.
 
-- [ ] **Valor de reemplazo del paso 0.** ¿1 o 2 hilos? Candidato: 2, porque 1 alarga todo y la falla es rara.
+- [x] **Valor de reemplazo del paso 0.** 2 hilos, porque 1 alarga todo y la falla es rara ([propuesta](proposal.md), decisión 1).
 - [ ] **Umbrales de la puerta.** ¿Cuánta CPU de proceso justifica A o B (por ejemplo, 20 % menos de CPU total) y cuánta pared se paga por ella (por ejemplo, hasta 25 % más)? ¿Qué p99 de búsqueda durante un refresco es aceptable?
 - [ ] **Bits.** Si D o B mueven algún bit: ¿se reescribe la fixture o se acepta la tolerancia de 1e-6? Por defecto, nada que mueva bits entra sin decisión.
 - [ ] **Variable de entorno para hilos.** ¿Una variable `CLAWG_EMBEDDER_THREADS` o sólo la constante?
 - [ ] **E y el tamaño.** ¿`spawn_blocking` sobre qué tamaño de texto?
 - [ ] **`MALLOC_ARENA_MAX` del usuario.** ¿Se respeta si está definida (en vez de pisarla con `mallopt`) o se mantiene la garantía de 46?
-- [ ] **Máquinas de medición.** ¿Qué Linux y Windows se usan, con cuántos hilos?
+- [ ] **Máquinas de medición.** ¿Qué Linux y Windows se usan, con cuántos hilos? Una de las dos con 8 hilos lógicos o más y SMT: una de 4 hilos sin SMT repite lo que ya midió 46.
 
 ## Cómo se mide
 

@@ -251,6 +251,11 @@ impl Daemon {
         (answer.status.as_u16(), serde_json::from_slice(&answer.body).unwrap_or(Value::Null))
     }
 
+    async fn get(&self, path: &str) -> (u16, Value) {
+        let answer = self.client().send(Call::new(reqwest::Method::GET, path)).await.expect("request");
+        (answer.status.as_u16(), serde_json::from_slice(&answer.body).unwrap_or(Value::Null))
+    }
+
     async fn list(&self) -> String {
         let call = Call::new(reqwest::Method::GET, "/v1/memories").query([("limit", "100")]);
         let answer = self.client().send(call).await.expect("list");
@@ -672,6 +677,131 @@ async fn a_daemon_records_its_requests_and_report_reads_them_after_stop() {
 }
 
 #[tokio::test]
+async fn a_daemon_probes_its_store_without_being_asked() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    // The gauges of the minute go to the writer at the turn of the minute,
+    // and Prometheus text keeps each one's last value whatever minute it was.
+    let mut text = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let answer = daemon
+            .client()
+            .send(Call::new(reqwest::Method::GET, "/v1/metrics?format=prometheus"))
+            .await
+            .expect("metrics");
+        assert_eq!(answer.status.as_u16(), 200);
+        text = String::from_utf8(answer.body.to_vec()).expect("text");
+        if text.contains("clawg_db_probe_wait_seconds_count") && text.contains("clawg_outbox_pending") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for series in [
+        "clawg_db_probe_wait_seconds_count ",
+        "clawg_db_cache_used_bytes ",
+        "clawg_db_file_bytes{file=\"db\"} ",
+        "clawg_db_file_bytes{file=\"wal\"} ",
+        "clawg_outbox_pending 0",
+        "clawg_outbox_failed 0",
+    ] {
+        assert!(text.contains(series), "{series} in:\n{text}");
+    }
+    assert!(!text.contains("clawg_outbox_oldest_pending_s"), "no row waits:\n{text}");
+}
+
+/// Every stage the daemon measures, read from a real one: a save of several
+/// pieces, a search, a context, a docs index, a backup and its stop. The fake
+/// model has no session to batch, so `embedder.batch`, `embedder.batch_tokens`
+/// and `embedder.wait` are left to the tests of the embedder.
+#[tokio::test]
+async fn a_daemon_measures_its_pipeline_and_keeps_its_events() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    let words: Vec<String> = (0..700).map(|i| format!("word{i}")).collect();
+    let (status, saved) = daemon.post("/v1/memories", json!({ "content": words.join(" "), "agent_id": "smoke" })).await;
+    assert_eq!(status, 201, "{saved}");
+    assert!(saved["memories"].as_array().is_some_and(|m| m.len() > 1), "a save of several pieces: {saved}");
+    assert_eq!(daemon.post("/v1/search", json!({ "query": "word1 word2", "agent_id": "smoke" })).await.0, 200);
+    assert_eq!(daemon.post("/v1/context", json!({ "query": "word3", "agent_id": "smoke" })).await.0, 200);
+
+    let root = sandbox.home.join("docs-project");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("README.md"), "# Docs\nThe pipeline is measured.\n").unwrap();
+    let (status, registered) = daemon
+        .post("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true, "index_docs": true }))
+        .await;
+    assert_eq!(status, 200, "{registered}");
+    let (status, found) =
+        daemon.post("/v1/projects/docs/search", json!({ "project_id": registered["root_id"], "query": "pipeline" })).await;
+    assert_eq!(status, 200, "{found}");
+    assert_eq!(daemon.post("/v1/backup", json!({})).await.0, 200);
+
+    let mut text = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let answer = daemon
+            .client()
+            .send(Call::new(reqwest::Method::GET, "/v1/metrics?format=prometheus"))
+            .await
+            .expect("metrics");
+        text = String::from_utf8(answer.body.to_vec()).expect("text");
+        if text.contains("clawg_docs_refresh_duration_seconds_count") && text.contains("clawg_db_cache_used_bytes") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for series in [
+        "clawg_db_probe_wait_seconds_count ",
+        "clawg_db_cache_used_bytes ",
+        "clawg_db_file_bytes{file=\"db\"} ",
+        "clawg_outbox_pending ",
+        "clawg_search_duration_seconds_count{arm=\"total\"} ",
+        "clawg_search_duration_seconds_count{arm=\"knn_memory\"} ",
+        "clawg_search_hits ",
+        "clawg_search_withheld ",
+        "clawg_context_retrieval_state{state=\"searched\"} ",
+        "clawg_context_prompt_bytes_count ",
+        "clawg_ingest_stage_seconds_count{stage=\"embed\"} ",
+        "clawg_ingest_stage_seconds_count{stage=\"link\"} ",
+        "clawg_ingest_end_to_end_seconds_count ",
+        "clawg_ingest_outcome{outcome=\"stored\"} ",
+        "clawg_ingest_pieces ",
+        "clawg_ingest_queue_depth ",
+        "clawg_embedder_load_seconds_count{phase=\"session\"} ",
+        "clawg_docs_refresh_duration_seconds_count ",
+        "clawg_docs_refresh_files{state=\"indexed\"} ",
+    ] {
+        assert!(text.contains(series), "{series} in:\n{text}");
+    }
+    let answer = daemon.client().send(Call::new(reqwest::Method::GET, "/v1/metrics")).await.expect("metrics");
+    let metrics: Value = serde_json::from_slice(&answer.body).expect("metrics JSON");
+    let kinds: Vec<&str> = metrics["run"]["events"].as_array().unwrap().iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert!(kinds.contains(&"model_load") && kinds.contains(&"backup"), "{metrics}");
+
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stop.status.code(), Some(0), "{}", stderr_of(&stop));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+
+    let report = metrics_report(&sandbox, &["--events"]);
+    let events = report["runs"][0]["events"].as_array().expect("the run's events");
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
+    for kind in ["model_load", "backup", "shutdown"] {
+        assert!(kinds.contains(&kind), "{kind} in {report}");
+    }
+    let shutdown = events.iter().find(|e| e["kind"] == "shutdown").unwrap();
+    assert_eq!(shutdown["detail"]["within_bounds"], "yes", "{report}");
+    let load = events.iter().find(|e| e["kind"] == "model_load").unwrap();
+    assert_eq!((load["detail"]["cause"].as_str(), load["detail"]["outcome"].as_str()), (Some("start"), Some("loaded")));
+    let stage = metrics_report(&sandbox, &["--metric", "ingest.stage", "--label", "stage=store"]);
+    assert!(stage["groups"][0]["count"].as_u64().is_some_and(|n| n >= 1), "{stage}");
+}
+
+#[tokio::test]
 async fn a_killed_daemon_leaves_its_run_not_stopped() {
     let sandbox = Sandbox::new();
     let daemon = sandbox.serve().await;
@@ -788,6 +918,253 @@ async fn export_and_import_round_trip_through_the_binary() {
     assert_eq!(markdown.status.code(), Some(0), "{}", stderr_of(&markdown));
     let text = std::fs::read_to_string(&view).expect("the view");
     assert!(text.contains("> a second exported memory"), "{text}");
+}
+
+/// A job reads the file at its path, and ends with the report the synchronous
+/// import gives for the same export.
+#[tokio::test]
+async fn a_job_import_ends_done_with_the_report_of_the_synchronous_import() {
+    let source = Sandbox::new();
+    let daemon = source.serve().await;
+    daemon.wait_until_ready().await;
+    for content in ["exported while the daemon runs", "a second exported memory"] {
+        let (status, body) = daemon.post("/v1/memories", json!({ "content": content, "agent_id": "smoke" })).await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let file = source.home.join("memories.jsonl");
+    let exported = source.run(&["export", "--out", &file.to_string_lossy(), "--profile", "dev"]);
+    assert_eq!(exported.status.code(), Some(0), "{}", stderr_of(&exported));
+
+    let (by_body, by_path) = (Sandbox::new(), Sandbox::new());
+    let (synchronous, job) = (by_body.serve().await, by_path.serve().await);
+    synchronous.wait_until_ready().await;
+    job.wait_until_ready().await;
+    let text = std::fs::read_to_string(&file).expect("the export");
+    let (status, expected) = synchronous.post("/v1/import", json!({ "text": text, "agent": "moved" })).await;
+    assert_eq!(status, 200, "{expected}");
+
+    let (status, accepted) = job.post("/v1/imports", json!({ "path": file.to_string_lossy(), "agent": "moved" })).await;
+    assert_eq!(status, 202, "{accepted}");
+    let id = accepted["job_id"].as_u64().expect("a job id");
+    let deadline = Instant::now() + START_BUDGET;
+    let done = loop {
+        let (status, state) = job.get(&format!("/v1/imports/{id}")).await;
+        assert_eq!(status, 200, "{state}");
+        if state["phase"] == "done" {
+            break state;
+        }
+        assert!(Instant::now() < deadline, "the job never ended: {state}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let unmarked = |mut report: Value| {
+        report["snapshot"] = Value::Null;
+        report["import_id"] = Value::Null;
+        report
+    };
+    assert_eq!(unmarked(done["report"].clone()), unmarked(expected), "{done}");
+    assert!(job.list().await.contains("exported while the daemon runs"));
+}
+
+// ── clawg import follows its job ────────────────────────────────────────────
+
+/// A clawg export of `rows` memories, each saying something of its own.
+fn export_of(sandbox: &Sandbox, rows: usize) -> PathBuf {
+    let mut text = String::from(r#"{"kind":"header","format":"clawg-memories","version":1,"exported_at":0,"clawg":"0.0.0"}"#);
+    text.push('\n');
+    for i in 1..=rows {
+        let at = 10 + i;
+        text.push_str(&format!(
+            r#"{{"kind":"memory","id":{i},"scope":"agent","agent_id":"a","content":"Deploys of service number {i} go out on Tuesdays","memory_type":"semantic_fact","source":"explicit","created_at":{at},"created_by_type":"agent","last_modified_at":{at},"last_accessed_at":{at},"access_count":0,"importance":5.0,"tier":3,"status":"active"}}"#
+        ));
+        text.push('\n');
+    }
+    let file = sandbox.home.join(format!("export-{rows}.jsonl"));
+    std::fs::write(&file, text).expect("the export");
+    file
+}
+
+/// The phases of a job, in the order of the steps they show.
+const PHASES: [&str; 10] =
+    ["planning", "preparing", "translating", "loading", "deciding", "embedding", "snapshot", "writing", "linking", "done"];
+
+/// The phase each stderr line starts with, in the order they came.
+fn phases_in(stderr: &str) -> Vec<&'static str> {
+    stderr
+        .lines()
+        .filter_map(|line| PHASES.iter().copied().find(|phase| line.split([':', ' ']).next() == Some(phase)))
+        .collect()
+}
+
+/// Until job `id` of `daemon` is in `phase`.
+async fn wait_for_job(daemon: &Daemon, id: u64, phase: &str) -> Value {
+    let deadline = Instant::now() + START_BUDGET;
+    loop {
+        let (status, state) = daemon.get(&format!("/v1/imports/{id}")).await;
+        if status == 200 && state["phase"] == phase {
+            return state;
+        }
+        assert!(Instant::now() < deadline, "job {id} never was {phase}: {status} {state}\n{}", daemon.log_text());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `--follow` writes the phases to stderr, in order, and leaves stdout as it
+/// was: the report of the import, which a script reads.
+#[tokio::test]
+async fn follow_prints_the_phases_in_order_on_stderr_and_the_same_report_on_stdout() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let file = export_of(&sandbox, 40).to_string_lossy().into_owned();
+
+    let plain = sandbox.run(&["import", &file, "--dry-run", "--profile", "dev"]);
+    let followed = sandbox.run(&["import", &file, "--dry-run", "--follow", "--profile", "dev"]);
+    assert_eq!(plain.status.code(), Some(0), "{}", stderr_of(&plain));
+    assert_eq!(followed.status.code(), Some(0), "{}", stderr_of(&followed));
+    assert!(stdout_of(&plain).starts_with("would import 40 of 40 memories"), "{}", stdout_of(&plain));
+    assert_eq!(stdout_of(&followed), stdout_of(&plain), "the report is the same with or without --follow");
+    assert_eq!(phases_in(&stderr_of(&plain)), Vec::<&str>::new(), "no terminal and no --follow: no progress");
+
+    let seen = phases_in(&stderr_of(&followed));
+    assert_eq!(seen.first(), Some(&"planning"), "{}", stderr_of(&followed));
+    assert_eq!(seen.last(), Some(&"done"), "{}", stderr_of(&followed));
+    let order: Vec<usize> = seen.iter().map(|seen| PHASES.iter().position(|phase| phase == seen).expect("a phase")).collect();
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "each phase once, in the order of the steps: {seen:?}");
+
+    let real = sandbox.run(&["import", &file, "--follow", "--profile", "dev"]);
+    assert_eq!(real.status.code(), Some(0), "{}", stderr_of(&real));
+    assert!(stdout_of(&real).starts_with("imported 40 of 40 memories in the file"), "{}", stdout_of(&real));
+    assert_eq!(phases_in(&stderr_of(&real)).last(), Some(&"done"), "{}", stderr_of(&real));
+}
+
+/// The daemon holds the job, not the command that follows it.
+#[tokio::test]
+async fn killing_clawg_import_does_not_stop_the_job() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let file = export_of(&sandbox, 2000).to_string_lossy().into_owned();
+    let mut child = sandbox
+        .command(&["import", &file, "--follow", "--profile", "dev"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn clawg import");
+
+    let deadline = Instant::now() + START_BUDGET;
+    while daemon.get("/v1/imports/1").await.0 != 200 {
+        assert!(Instant::now() < deadline, "the daemon never accepted the job:\n{}", daemon.log_text());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // It asks again only after a second, so it is still following.
+    assert!(child.try_wait().expect("try_wait").is_none(), "the command ended before it was killed");
+    child.kill().expect("kill the command");
+    let _ = child.wait();
+
+    let done = wait_for_job(&daemon, 1, "done").await;
+    assert_eq!(done["report"]["inserted"], 2000, "{done}");
+}
+
+/// A daemon that answers `/health` and, for everything else, what an axum
+/// router does with a route it does not have: a `404` with no body. It notes
+/// each request it gets.
+struct DaemonWithoutJobs {
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl DaemonWithoutJobs {
+    async fn publish(sandbox: &Sandbox, version: &str) -> Self {
+        use axum::extract::{Request, State};
+        use axum::middleware::{from_fn_with_state, Next};
+        use axum::response::Response;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        async fn note(State(requests): State<Arc<Mutex<Vec<(String, String)>>>>, request: Request, next: Next) -> Response {
+            let (parts, body) = request.into_parts();
+            let body = axum::body::to_bytes(body, 1 << 20).await.expect("the request body");
+            let line = format!("{} {}", parts.method, parts.uri.path());
+            requests.lock().expect("requests").push((line, String::from_utf8_lossy(&body).into_owned()));
+            next.run(Request::from_parts(parts, axum::body::Body::from(body))).await
+        }
+        let health = json!({ "status": "ok", "version": version, "profile": "dev", "pid": 1, "embedder": "ready", "uptime_s": 1 });
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(move || { let health = health.clone(); async move { axum::Json(health) } }))
+            .layer(from_fn_with_state(requests.clone(), note));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let data_dir = sandbox.data_dir();
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let state = clawg_cli::daemon::lifecycle::DaemonState {
+            pid: std::process::id(),
+            port: Some(port),
+            unix_socket: false,
+            profile: "dev".into(),
+            version: version.into(),
+            started_at_ms: 0,
+        };
+        clawg_cli::daemon::lifecycle::write_state(&data_dir, &state).expect("daemon.json");
+        clawg_cli::daemon::lifecycle::write_token(&data_dir, "0123456789abcdef0123456789abcdef").expect("token");
+        Self { requests }
+    }
+
+    fn requests(&self) -> Vec<(String, String)> {
+        self.requests.lock().expect("requests").clone()
+    }
+}
+
+// The stand-in daemon runs on a worker while the test waits for the command.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_against_a_daemon_without_the_job_route_exits_1_without_sending_the_file() {
+    let sandbox = Sandbox::new();
+    let daemon = DaemonWithoutJobs::publish(&sandbox, "0.0.1").await;
+    let file = export_of(&sandbox, 3).to_string_lossy().into_owned();
+
+    let import = sandbox.run(&["import", &file, "--profile", "dev"]);
+
+    assert_eq!(import.status.code(), Some(1), "{}", stderr_of(&import));
+    assert!(stdout_of(&import).is_empty(), "{}", stdout_of(&import));
+    let said = stderr_of(&import);
+    assert!(said.contains("older than this clawg") && said.contains("0.0.1") && said.contains("'clawg stop'"), "{said}");
+    let requests = daemon.requests();
+    let asked: Vec<&str> = requests.iter().map(|(line, _)| line.as_str()).collect();
+    assert_eq!(asked, ["GET /health", "POST /v1/imports", "GET /health"], "nothing else is asked");
+    let body = &requests[1].1;
+    assert!(body.contains("export-3.jsonl") && !body.contains("Deploys of service"), "the path went, not the file: {body}");
+}
+
+/// Ctrl-C asks the daemon to stop the job, waits for it and says what was
+/// written.
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_c_sends_the_delete_and_prints_what_was_written() {
+    use std::io::Read;
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let file = export_of(&sandbox, 50_000).to_string_lossy().into_owned();
+    let mut child = sandbox
+        .command(&["import", &file, "--follow", "--profile", "dev"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clawg import");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let mut first = String::new();
+    stderr.read_line(&mut first).expect("the first phase");
+    assert!(first.starts_with("planning"), "{first}");
+    let pid = libc::pid_t::try_from(child.id()).expect("pid");
+
+    // SAFETY: plain FFI call on this test's own child.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+
+    let status = child.wait().expect("the command ends");
+    let (mut out, mut rest) = (String::new(), String::new());
+    child.stdout.take().expect("stdout").read_to_string(&mut out).expect("stdout text");
+    stderr.read_to_string(&mut rest).expect("stderr text");
+    assert_eq!(status.code(), Some(1), "{out}\n{rest}");
+    assert!(out.contains("nothing was written") || out.contains("`clawg import --undo "), "{out}\n{rest}");
+    wait_for_job(&daemon, 1, "cancelled").await;
 }
 
 #[tokio::test]

@@ -16,11 +16,11 @@ use clawg_core::memory::bootstrap::{
     run_embedder_bootstrap_with_retry, serve_deps, unloading_when_idle, EmbedderDeps, LogSink,
 };
 use clawg_core::memory::embedder::E5_MODEL_ID;
-use clawg_core::memory::idle_embedder::{idle_after, DEFAULT_IDLE, IDLE_MINUTES_VAR};
+use clawg_core::memory::idle_embedder::{idle_after, LoadWatch, DEFAULT_IDLE, IDLE_MINUTES_VAR};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::metrics::store::RunInfo;
-use clawg_core::metrics::Recorder;
+use clawg_core::metrics::{DetailValue, EventKind};
 use clawg_core::paths::{data_dir, socket_file, PathsError, Profile};
 use clawg_core::private_dir::ensure_private_dir;
 use clawg_core::runtime::{MemoryRuntime, Workers};
@@ -150,7 +150,13 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         load,
         base_dir.clone(),
         idle,
-        Some(super::process::private_bytes),
+        LoadWatch {
+            memory: Some(clawg_core::metrics::MemoryProbes {
+                private: super::process::private_bytes,
+                private_peak: super::process::private_peak_bytes,
+            }),
+            metrics: runtime.metrics.clone(),
+        },
         tokio::runtime::Handle::current(),
     );
     tokio::spawn(run_embedder_bootstrap_with_retry(
@@ -205,11 +211,12 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         },
     )?;
 
-    let metrics = Arc::new(Recorder::default());
     let writer = {
         let path = metrics_path(&base_dir, std::env::var(METRICS_VAR).ok().as_deref());
         let run = run_info(profile, idle);
-        let (metrics, path) = (metrics.clone(), path.clone());
+        // The runtime's, so what the search, the ingest and the embedder
+        // measure is written with the daemon's own series.
+        let (metrics, path) = (runtime.metrics.clone(), path.clone());
         tokio::task::spawn_blocking(move || Writer::start(path.as_deref(), metrics, &run, now_ms() as i64))
             .await
             .map_err(|e| ServeError::Server(std::io::Error::other(e)))?
@@ -229,8 +236,10 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
         shutdown: shutdown_tx,
         save_timeout: SAVE_CONFIRM_TIMEOUT,
         sessions: Default::default(),
-        metrics,
+        imports: Default::default(),
     });
+
+    let store_probe = super::store_probe::spawn(ctx.runtime.store.clone(), base_dir.clone(), ctx.runtime.metrics.clone());
 
     log::info!(
         "clawg serve {} listening on {}, data dir {}",
@@ -242,9 +251,17 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
     // The signal is observed once and stops both servers; the grace counts
     // from it once.
     let (stopping_tx, stopping) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        shutdown_signal(shutdown_rx).await;
-        let _ = stopping_tx.send(true);
+    let signalled = Arc::new(std::sync::OnceLock::new());
+    tokio::spawn({
+        let (signalled, ctx) = (signalled.clone(), ctx.clone());
+        async move {
+            shutdown_signal(shutdown_rx).await;
+            let _ = signalled.set(Instant::now());
+            // Before the servers are told, so no job is accepted in between
+            // and the running one is asked to stop as the grace starts.
+            ctx.imports.close();
+            let _ = stopping_tx.send(true);
+        }
     });
     let tcp_server = {
         let (app, stopping) = (router_on(ctx.clone(), Transport::Tcp), stopping.clone());
@@ -264,27 +281,49 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
             }
         }
     };
-    let servers = async { tokio::try_join!(tcp_server, socket_server).map(drop) };
+    // Waits for the signal first: it must outlast a job that ends before the
+    // shutdown, not return with it.
+    let import_job = {
+        let (ctx, stopping) = (ctx.clone(), stopping.clone());
+        async move {
+            stopped(stopping).await;
+            ctx.imports.settled().await;
+            Ok::<(), std::io::Error>(())
+        }
+    };
+    let servers = async { tokio::try_join!(tcp_server, socket_server, import_job).map(drop) };
     let result = match within_grace(servers, stopped(stopping), HTTP_GRACE).await {
         Some(result) => result,
         None => {
             log::warn!(
-                "requests were still in flight {} s after the shutdown began; they were cut",
+                "requests or an import job were still running {} s after the shutdown began; they were cut",
                 HTTP_GRACE.as_secs()
             );
+            ctx.imports.abandon(now_ms() as i64);
             Ok(())
         }
     };
 
-    // No request comes in any more, so the last minute is complete.
-    writer.close(METRICS_CLOSE).await;
+    let http = signalled.get().map_or(Duration::ZERO, |at| at.elapsed());
+
+    // Before the drain and the close, so no probe waits in the queue the
+    // close empties.
+    store_probe.abort();
 
     // No request can queue a save any more, so whatever is queued now is all
     // there is to drain or spill.
+    let draining = Instant::now();
+    let finished = ctx.runtime.shutdown(workers).await;
+    ctx.runtime.metrics.event(EventKind::Shutdown, &shutdown_detail(http, draining.elapsed(), finished));
+
+    // No request comes in and nothing is ingested any more, so the last minute
+    // is complete, the shutdown's own event with it.
+    writer.close(METRICS_CLOSE).await;
+
     // After a shutdown that finished nothing else uses the connection, so the
     // close runs at once; after one its bound cut, a call may still hold the
     // connection, and the close would wait behind it past every bound.
-    if ctx.runtime.shutdown(workers).await {
+    if finished {
         ctx.runtime.close().await;
     }
 
@@ -294,6 +333,14 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
     log::info!("clawg serve {} stopped", profile.as_str());
 
     result.map_err(ServeError::Server)
+}
+
+/// The phases of a shutdown as its event records them: the requests in
+/// flight, the drain with what follows it, and whether it ended within its
+/// bounds.
+fn shutdown_detail(http: Duration, drain: Duration, finished: bool) -> [(&'static str, DetailValue); 3] {
+    let ms = |d: Duration| DetailValue::from(u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    [("http_ms", ms(http)), ("drain_ms", ms(drain)), ("within_bounds", finished.into())]
 }
 
 /// What this run records about itself in `metrics.db`.
@@ -468,6 +515,19 @@ mod tests {
     /// The daemon losing the store to another process is a user-facing event,
     /// not a database fault: the message must name the holder and say what to
     /// do, and must not be dressed up as "could not open the memory store".
+    #[test]
+    fn a_shutdown_event_names_its_phases_in_milliseconds() {
+        let detail = shutdown_detail(Duration::from_millis(1_250), Duration::from_micros(9_999), false);
+        assert_eq!(
+            detail,
+            [
+                ("http_ms", DetailValue::Number(1_250.0)),
+                ("drain_ms", DetailValue::Number(9.0)),
+                ("within_bounds", DetailValue::Label("no")),
+            ]
+        );
+    }
+
     #[test]
     fn a_lost_store_race_is_reported_with_the_holder_and_what_to_do() {
         let err = classify_open_error(MemoryError::StoreInUse {

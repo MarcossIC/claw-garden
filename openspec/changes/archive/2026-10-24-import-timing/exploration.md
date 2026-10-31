@@ -53,11 +53,11 @@ Visible en `clawg import` sin leer el log. **En contra:** rompe la paridad entre
 
 ### C. Series en `metrics.db`
 
-`db.op_duration{op=import}` y un evento `import` es lo que propone pipeline-metrics (`openspec/changes/pipeline-metrics/exploration.md:31`, `:36`). **En contra:** llega después del import en prod, y un total por minuto no da el desglose de una corrida. Cuando llegue, 73 puede alimentarse de `ImportTimings`.
+`db.op_duration{op=import}` y un evento `import` es lo que propone pipeline-metrics (`openspec/changes/archive/2026-10-30-pipeline-metrics/exploration.md:31`, `:36`). **En contra:** llega después del import en prod, y un total por minuto no da el desglose de una corrida. Cuando llegue, 73 puede alimentarse de `ImportTimings`.
 
 ### D. Perfilar en lugar de instrumentar
 
-`samply` o WPR sobre el daemon dan el reparto por función, incluido SQLite. **En contra:** es una corrida de investigación (perf-bench lo excluye a propósito, `openspec/changes/perf-bench/exploration.md:47`), no algo que acompaña al import en prod. Sigue disponible sin ningún cambio.
+`samply` o WPR sobre el daemon dan el reparto por función, incluido SQLite. **En contra:** es una corrida de investigación (perf-bench lo excluye a propósito, `openspec/changes/archive/2026-10-31-perf-bench/exploration.md:47`), no algo que acompaña al import en prod. Sigue disponible sin ningún cambio.
 
 ### Recomendación: A
 

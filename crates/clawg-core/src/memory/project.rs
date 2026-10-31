@@ -1041,7 +1041,7 @@ mod tests {
     struct Fixture {
         store: MemoryStore,
         ws: WorkspaceManager,
-        _dir: tempfile::TempDir,
+        _dir: crate::test_dir::TestDir,
         backups: PathBuf,
         ground: Arc<FakeGround>,
     }
@@ -1049,7 +1049,7 @@ mod tests {
     impl Fixture {
         async fn new() -> Self {
             let store = MemoryStore::new_for_test().await.unwrap();
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_dir::test_dir();
             let ws = WorkspaceManager::new(dir.path().join("workspaces"));
             let backups = dir.path().join("backups");
             Fixture { store, ws, _dir: dir, backups, ground: Arc::new(FakeGround::default()) }

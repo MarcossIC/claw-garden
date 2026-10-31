@@ -234,7 +234,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Import { file, undo, from, dry_run, agent, map_root, project_map, profile } => {
+        Command::Import { file, undo, from, dry_run, follow, agent, map_root, project_map, profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             // The daemon is the store's only writer and has the model that
             // embeds each row; with none running, nothing is started.
@@ -246,17 +246,27 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Probe::NeedsStart => return Err(unavailable(ClientError::NotRunning)),
             };
             let maps = import::Maps { roots: &map_root, projects: &project_map };
-            let out = match (undo, file) {
-                (Some(n), _) => import::undo(lang, &client, n, dry_run).await,
-                (None, Some(file)) => import::run(lang, &client, &file, from, dry_run, agent.as_deref(), maps).await,
+            let finished = match (undo, file) {
+                (Some(n), _) => import::undo(lang, &client, n, dry_run).await.map(import::Finished::done),
+                (None, Some(file)) => {
+                    // Before the daemon is asked, so a Ctrl-C meanwhile waits for the job.
+                    let mut interrupts = import::interrupts();
+                    let watch = import::Watch::new(follow);
+                    import::run(lang, &client, &file, from, dry_run, agent.as_deref(), maps, watch, &mut interrupts).await
+                }
                 (None, None) => return Err("name the file to import, or --undo N".into()),
             }
             .map_err(|e| match e {
                 import::ImportError::Client(e) => unavailable(e),
                 other => other.to_string(),
             })?;
-            println!("{out}");
-            Ok(ExitCode::SUCCESS)
+            if !finished.out.is_empty() {
+                println!("{}", finished.out);
+            }
+            if let Some(note) = &finished.note {
+                eprintln!("{note}");
+            }
+            Ok(if finished.ok { ExitCode::SUCCESS } else { ExitCode::from(EXIT_FAILURE) })
         }
 
         Command::Secrets { mask_reasons: true, yes, profile } => {
@@ -362,10 +372,15 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             Ok(ExitCode::from(code))
         }
 
-        Command::Metrics { action: MetricsAction::Report { metric, labels, by, since, profile } } => {
+        Command::Metrics { action: MetricsAction::Report { metric, events, labels, by, since, profile } } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            println!("{}", metrics::report(language(&base_dir), &base_dir, &metric, &labels, by, since, now_ms() as i64)?);
+            let (lang, now) = (language(&base_dir), now_ms() as i64);
+            let printed = match metric {
+                Some(metric) if !events => metrics::report(lang, &base_dir, &metric, &labels, by, since, now)?,
+                _ => metrics::events(lang, &base_dir, since, now)?,
+            };
+            println!("{printed}");
             Ok(ExitCode::SUCCESS)
         }
 
