@@ -238,9 +238,11 @@ OPTIONS:
                          to the results folder and outside git, and the next run embeds only
                          the texts that are not there. The folder is never purged: a run does
                          not remove what it did not use. To clean it, delete the folder. It
-                         holds only keys and vectors, at most about 27.6 MB per model contract
-                         for this workspace (17,584 passages x (32 + 384 x 4) bytes). Use this
-                         flag to time a run that embeds every passage, as production does.
+                         holds only keys and vectors: 1,568 bytes per distinct passage text
+                         (32 + 384 x 4) and model contract, some 28 MB for this workspace
+                         today, and it grows with every run that embeds a text it does not
+                         hold. Use this flag to time a run that embeds every passage, as
+                         production does.
     --lexical-only      Rank every case by the lexical channel alone: the same FTS5 match and
                          bm25 order the full search uses, with no vectors and no scoring. A
                          floor for the full ranking; writes {date}-{mode}-lexical-only.json,
@@ -1133,8 +1135,19 @@ mod tests {
 
     #[test]
     fn the_help_text_documents_no_cache() {
-        for needle in ["--no-cache", "docs/eval/cache", "never purged", "delete the folder", "27.6 MB"] {
+        for needle in ["--no-cache", "docs/eval/cache", "never purged", "delete the folder"] {
             assert!(HELP_TEXT.contains(needle), "{needle}");
         }
+    }
+
+    #[test]
+    fn the_help_text_gives_the_size_of_the_memo_per_text_and_no_bound() {
+        let start = HELP_TEXT.find("    --no-cache ").expect("the --no-cache entry");
+        let end = start + HELP_TEXT[start..].find("    --lexical-only ").expect("the entry after it");
+        let entry = &HELP_TEXT[start..end];
+        for needle in ["1,568 bytes per distinct passage text", "grows"] {
+            assert!(entry.contains(needle), "{needle}");
+        }
+        assert!(!entry.contains("at most"), "{entry}");
     }
 }
