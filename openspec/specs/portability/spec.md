@@ -929,6 +929,6 @@ Si `POST /v1/imports` responde un `404` cuyo cuerpo no es un objeto JSON con `er
 
 ## IJ17. El CLI habla el idioma de la preferencia
 
-Todo lo que `clawg import` imprime por primera vez en este cambio (las fases y contadores, el mensaje de Ctrl-C, el de daemon desaparecido, el de daemon anterior, el de trabajo `failed`/`cancelled`/`interrupted`) MUST decirse en el idioma de `preferences.json`, un `match` sobre `Lang` por frase, y en inglés sin preferencia, como los demás comandos (`.claude/CLAUDE.md`, párrafo de `preferences.json`). Los identificadores (`phase`, `job_id`, `import_id`, códigos de error, comandos, códigos de salida) y la causa técnica de una falla MUST quedar como vienen.
+Todo lo que `clawg import` imprime por primera vez en este cambio (las fases y contadores, el mensaje de Ctrl-C, el de daemon desaparecido, el de daemon anterior, el de trabajo `failed`/`cancelled`/`interrupted`) MUST decirse en el idioma de `preferences.json`, un `match` sobre `Lang` por frase, y en inglés sin preferencia, como los demás comandos (`docs/reference/data-profiles.md`, párrafo de `preferences.json`). Los identificadores (`phase`, `job_id`, `import_id`, códigos de error, comandos, códigos de salida) y la causa técnica de una falla MUST quedar como vienen.
 
 **Test:** `the_job_messages_speak_both_languages` (unidad en `crates/clawg-cli/src/import.rs`, junto a `the_undo_report_speaks_spanish`).

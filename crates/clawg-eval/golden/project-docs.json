@@ -26,8 +26,7 @@
     "id": "d05",
     "question": "which folder and port does each environment use, and can a debug binary reach the production data?",
     "expected": [
-      {"path": ".claude/CLAUDE.md", "heading": "Data profiles"},
-      {"path": ".gemini/GEMINI.md", "heading": "Data profiles"},
+      {"path": "docs/reference/data-profiles.md", "heading": "Data profiles"},
       {"path": "README.md", "heading": "Perfiles y datos"}
     ]
   },
@@ -89,15 +88,7 @@
   {
     "id": "d15",
     "question": "tras muchas ramas y subidas de número, el disco se llena de binarios de prueba compilados; ¿cómo lo mantengo bajo control?",
-    "expected": [{"path": ".claude/CLAUDE.md", "heading": "Build directories"}]
-  },
-  {
-    "id": "d16",
-    "question": "a private journal kept beside the documentation must stay out of the shared history; how should files be picked for the next snapshot so it can't sneak in?",
-    "expected": [
-      {"path": ".claude/CLAUDE.md", "heading": "Rules for agents"},
-      {"path": ".gemini/GEMINI.md", "heading": "Rules for agents"}
-    ]
+    "expected": [{"path": "docs/reference/testing.md", "heading": "Build directories"}]
   },
   {
     "id": "d17",
