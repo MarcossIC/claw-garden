@@ -2998,7 +2998,7 @@ fn refresh_line(project_id: &str, r: &project_docs::RefreshReport) -> String {
 async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder, project_id: &str) {
     let tokenizer = app.runtime.tokenizer.get().cloned();
     let started = Instant::now();
-    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer).await;
+    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer).await.map(|run| run.report);
     record_refresh(&app.runtime.metrics, started.elapsed(), refreshed.as_ref().ok());
     match refreshed {
         Ok(r) => {

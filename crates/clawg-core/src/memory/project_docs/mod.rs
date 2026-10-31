@@ -89,6 +89,70 @@ pub struct RefreshReport {
     pub failed: Vec<FailedDoc>,
 }
 
+/// What a refresh spent in each phase of one doc.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocPhases {
+    pub read: Duration,
+    pub mask: Duration,
+    pub split: Duration,
+    pub lookup: Duration,
+    pub embed: Duration,
+    pub write: Duration,
+}
+
+impl DocPhases {
+    fn plus(self, other: Self) -> Self {
+        Self {
+            read: self.read + other.read,
+            mask: self.mask + other.mask,
+            split: self.split + other.split,
+            lookup: self.lookup + other.lookup,
+            embed: self.embed + other.embed,
+            write: self.write + other.write,
+        }
+    }
+}
+
+/// The phases of one doc a refresh went through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocTiming {
+    /// Relative to the project root, `/`-separated.
+    pub path: String,
+    pub kind: DocKind,
+    /// Passages the doc wrote: none for a doc that was not read or was left
+    /// as it was.
+    pub passages: usize,
+    pub phases: DocPhases,
+}
+
+/// Where a refresh spent its time. Kept apart from [`RefreshReport`], which
+/// tests compare for equality and so cannot depend on the clock.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshTiming {
+    /// Walking, reading and hashing the whole tree, the stored fingerprints
+    /// and the plan: once per refresh, not per doc.
+    pub scan: Duration,
+    pub docs: Vec<DocTiming>,
+    /// Dropping the docs that are gone.
+    pub remove: Duration,
+}
+
+impl RefreshTiming {
+    /// The phases summed over the docs, with the removal counted as a write.
+    pub fn phases(&self) -> DocPhases {
+        let mut sum = self.docs.iter().fold(DocPhases::default(), |acc, d| acc.plus(d.phases));
+        sum.write += self.remove;
+        sum
+    }
+}
+
+/// A finished refresh: what it did and where it spent its time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshRun {
+    pub report: RefreshReport,
+    pub timing: RefreshTiming,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedDoc {
     pub path: String,
@@ -188,7 +252,7 @@ impl RefreshGuard {
         store: &MemoryStore,
         embedder: &dyn Embedder,
         tokenizer: Option<Arc<tokenizers::Tokenizer>>,
-    ) -> Result<RefreshReport, DocIndexError> {
+    ) -> Result<RefreshRun, DocIndexError> {
         let result = async {
             let root = root_of(store, &self.project_id).await?;
             let splitter = match tokenizer {
@@ -288,7 +352,7 @@ impl DocIndex {
         let Some(guard) = self.begin(project_id) else {
             return Ok(RefreshOutcome::AlreadyRunning);
         };
-        guard.run(store, embedder, tokenizer).await.map(RefreshOutcome::Refreshed)
+        guard.run(store, embedder, tokenizer).await.map(|run| RefreshOutcome::Refreshed(run.report))
     }
 }
 
@@ -426,7 +490,8 @@ pub(crate) async fn refresh(
     project_id: &str,
     root: &Path,
     left_out: &HashSet<String>,
-) -> Result<RefreshReport, DocIndexError> {
+) -> Result<RefreshRun, DocIndexError> {
+    let mut mark = Instant::now();
     // Walked before anything is read from the index: a root that is gone must
     // fail here, not read as an empty tree whose plan drops every doc.
     let (root_buf, left_out) = (root.to_path_buf(), left_out.clone());
@@ -444,18 +509,25 @@ pub(crate) async fn refresh(
     };
     let files: HashMap<&str, &DocFile> = scan.docs.iter().map(|d| (d.file.path.as_str(), &d.file)).collect();
     let indexed_before: HashSet<&str> = stored.iter().map(|f| f.path.as_str()).collect();
+    let mut timing = RefreshTiming { scan: lap(&mut mark), ..Default::default() };
     for path in &plan.index {
         let file = files[path.as_str()].clone();
         let kind = file.kind;
         // Read again rather than kept from the scan, so a refresh holds one
         // changed doc in memory at a time, not the whole tree. The hash stored
         // is the one of the bytes actually indexed.
-        let Some((text, hash)) = blocking(move || corpus::read(&file)).await else {
+        let read = blocking(move || corpus::read(&file)).await;
+        let mut phases = DocPhases { read: lap(&mut mark), ..Default::default() };
+        let timed = |passages, phases| DocTiming { path: path.clone(), kind, passages, phases };
+        let Some((text, hash)) = read else {
             report.skipped += 1;
+            timing.docs.push(timed(0, phases));
             continue;
         };
         let masked = redact(&text).text;
+        phases.mask = lap(&mut mark);
         let passages = passages(kind, path, &masked, splitter);
+        phases.split = lap(&mut mark);
         // A new doc has nothing stored to reuse, so it does not ask.
         let kept = if indexed_before.contains(path.as_str()) {
             stored_vectors(store, project_id, path, &model_id).await?
@@ -465,10 +537,14 @@ pub(crate) async fn refresh(
         let reuse = reuse_plan(&passages, &kept);
         let to_embed: Vec<String> = reuse.to_embed.iter().map(|&i| passages[i].indexed_text()).collect();
         let reused = passages.len() - to_embed.len();
-        let new = match embed_passages(embedder, path, to_embed).await {
+        phases.lookup = lap(&mut mark);
+        let embedded = embed_passages(embedder, path, to_embed).await;
+        phases.embed = lap(&mut mark);
+        let new = match embedded {
             Ok(vectors) => vectors,
             Err(DocIndexError::Vector { path, reason }) => {
                 report.failed.push(FailedDoc { path, reason });
+                timing.docs.push(timed(0, phases));
                 continue;
             }
             Err(e) => return Err(e),
@@ -476,13 +552,24 @@ pub(crate) async fn refresh(
         let vectors = fill(reuse, new);
         report.passages += passages.len();
         report.reused += reused;
+        let written = passages.len();
         let doc = IndexedDoc { path: path.clone(), hash, model_id: model_id.clone(), passages, vectors };
         replace_doc(store, project_id, doc).await?;
         report.indexed += 1;
+        phases.write = lap(&mut mark);
+        timing.docs.push(timed(written, phases));
     }
     remove_docs(store, project_id, plan.remove.clone()).await?;
     report.removed = plan.remove.len();
-    Ok(report)
+    timing.remove = lap(&mut mark);
+    Ok(RefreshRun { report, timing })
+}
+
+/// The time since `mark`, which moves to now: consecutive laps leave no work
+/// between them unmeasured.
+fn lap(mark: &mut Instant) -> Duration {
+    let now = Instant::now();
+    now.duration_since(std::mem::replace(mark, now))
 }
 
 /// Which vectors of a doc's new passages come from its stored version and
@@ -933,10 +1020,121 @@ mod tests {
 
         let report = refresh(&store, &Counting::new("m1"), &TokenSplitter::fallback(), "p", dir.path(), &left_out)
             .await
-            .unwrap();
+            .unwrap()
+            .report;
 
         assert_eq!(report, RefreshReport { docs: 1, indexed: 1, passages: 1, ..Default::default() });
         assert_eq!(passages(&store, "p").await, [("a.md".into(), "a.md > A".into(), "a".into())]);
+    }
+
+    async fn vector_blobs(store: &MemoryStore, project_id: &str) -> Vec<(String, Vec<u8>)> {
+        let id = project_id.to_string();
+        store
+            .conn
+            .call(move |c| -> rusqlite::Result<_> {
+                let mut stmt = c.prepare(
+                    "SELECT c.path, v.embedding FROM project_doc_chunk c                      JOIN project_doc_vectors v ON v.rowid = c.id                      WHERE c.project_id = ?1 ORDER BY c.path, c.ordinal",
+                )?;
+                let rows = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect();
+                rows
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn run_refresh(store: &MemoryStore, root: &Path) -> RefreshRun {
+        refresh(store, &Counting::new("m1"), &TokenSplitter::fallback(), "p", root, &HashSet::new())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_refresh_times_each_phase_of_every_doc() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", "# A
+a
+## Two
+more
+");
+        write(dir.path(), "b.md", "# B
+b
+");
+        write(dir.path(), "c.rs", "fn one() {}
+");
+        let store = store_with_project("p", dir.path()).await;
+
+        let run = run_refresh(&store, dir.path()).await;
+
+        let mut docs: Vec<(&str, DocKind, usize)> =
+            run.timing.docs.iter().map(|d| (d.path.as_str(), d.kind, d.passages)).collect();
+        docs.sort_by_key(|d| d.0);
+        let code = docs[2].1;
+        assert!(matches!(code, DocKind::Code(_)), "{code:?}");
+        assert_eq!(docs[0], ("a.md", DocKind::Markdown, 2));
+        assert_eq!(docs[1], ("b.md", DocKind::Markdown, 1));
+        assert_eq!((docs[2].0, docs[2].2), ("c.rs", 1));
+        assert_eq!(run.timing.docs.iter().map(|d| d.passages).sum::<usize>(), run.report.passages);
+        assert!(run.timing.scan > Duration::ZERO, "the walk of the tree is measured once");
+    }
+
+    #[tokio::test]
+    async fn timing_does_not_change_what_a_refresh_writes() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", "# A
+a
+## Two
+more
+");
+        write(dir.path(), "c.rs", "fn one() {}
+");
+        let timed = store_with_project("p", dir.path()).await;
+        let plain = store_with_project("p", dir.path()).await;
+
+        let run = run_refresh(&timed, dir.path()).await;
+        let report = refreshed(&Arc::new(DocIndex::default()), &plain, &Counting::new("m1"), "p").await;
+
+        assert_eq!(run.report, report);
+        assert_eq!(passages(&timed, "p").await, passages(&plain, "p").await);
+        assert_eq!(vector_blobs(&timed, "p").await, vector_blobs(&plain, "p").await);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_refresh_has_no_doc_timings() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", "# A
+a
+");
+        let store = store_with_project("p", dir.path()).await;
+        run_refresh(&store, dir.path()).await;
+
+        let run = run_refresh(&store, dir.path()).await;
+
+        assert!(run.timing.docs.is_empty());
+        assert_eq!(run.timing.phases().embed, Duration::ZERO);
+        assert!(run.timing.scan > Duration::ZERO);
+    }
+
+    #[test]
+    fn a_doc_that_was_not_read_still_counts_its_read_time() {
+        let ms = Duration::from_millis;
+        let unread = DocTiming {
+            path: "gone.md".into(),
+            kind: DocKind::Markdown,
+            passages: 0,
+            phases: DocPhases { read: ms(7), ..DocPhases::default() },
+        };
+        let read = DocTiming {
+            path: "a.md".into(),
+            kind: DocKind::Markdown,
+            passages: 2,
+            phases: DocPhases { read: ms(1), mask: ms(2), split: ms(3), lookup: ms(4), embed: ms(5), write: ms(6) },
+        };
+        let timing = RefreshTiming { scan: ms(100), docs: vec![unread, read], remove: ms(9) };
+
+        assert_eq!(
+            timing.phases(),
+            DocPhases { read: ms(8), mask: ms(2), split: ms(3), lookup: ms(4), embed: ms(5), write: ms(15) }
+        );
     }
 
     #[tokio::test]

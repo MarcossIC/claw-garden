@@ -1284,7 +1284,8 @@ impl EvalDocIndex {
         let left_out: std::collections::HashSet<String> = left_out.iter().cloned().collect();
         let r = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root, &left_out)
             .await
-            .map_err(|e| EvalError::Insert(e.to_string()))?;
+            .map_err(|e| EvalError::Insert(e.to_string()))?
+            .report;
         // A measurement without a doc measures another corpus, so a doc the
         // daemon would skip and retry fails the run here.
         if let Some(f) = r.failed.first() {
