@@ -12,7 +12,7 @@ perf-bench diff FIRST SECOND [--fail-on-regression]
          bootstrap interval (each run drawn again on its own) and the
          Mann-Whitney rank test. A scenario is slower when its p95 rose over
          20 % and the interval leaves out no change, or when the second run
-         has failures the first did not; with fewer than 20 samples a side it
+         has failures the first did not; with fewer than 40 samples a side it
          decides nothing. Runs of another build, embedder, machine, store
          size or seed are compared with a warning.
 

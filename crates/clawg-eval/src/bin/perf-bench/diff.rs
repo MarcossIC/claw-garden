@@ -14,8 +14,9 @@ pub const VERSION: u32 = 1;
 /// no change is a regression.
 pub const THRESHOLD: f64 = 0.20;
 
-/// Fewer samples on either side say nothing about a p95.
-pub const MIN_SAMPLES: usize = 20;
+/// Fewer samples on either side say nothing about a p95: below 40 the
+/// nearest rank leaves one sample above it, and the verdict rides on it.
+pub const MIN_SAMPLES: usize = 40;
 
 /// The fields of a result file the comparison reads; the rest is for people.
 #[derive(Debug, Clone, Deserialize)]
@@ -271,8 +272,10 @@ mod tests {
         assert_eq!(verdict(n, (0, 0), c(0.15, 0.05, 0.25)), Verdict::NoChange, "under the threshold");
         assert_eq!(verdict(n, (0, 0), c(-0.30, -0.50, -0.10)), Verdict::Faster);
         assert_eq!(verdict(n, (0, 0), c(-0.15, -0.25, -0.05)), Verdict::NoChange);
-        assert_eq!(verdict((19, 100), (0, 0), c(0.90, 0.50, 1.50)), Verdict::TooFew);
-        assert_eq!(verdict((19, 100), (0, 3), c(0.0, 0.0, 0.0)), Verdict::Slower, "new failures");
+        assert_eq!(verdict((39, 100), (0, 0), c(0.90, 0.50, 1.50)), Verdict::TooFew);
+        assert_eq!(verdict((100, 39), (0, 0), c(0.90, 0.50, 1.50)), Verdict::TooFew);
+        assert_eq!(verdict((40, 40), (0, 0), c(0.90, 0.50, 1.50)), Verdict::Slower);
+        assert_eq!(verdict((39, 100), (0, 3), c(0.0, 0.0, 0.0)), Verdict::Slower, "new failures");
         assert_eq!(verdict(n, (3, 3), c(0.0, -0.1, 0.1)), Verdict::NoChange, "the same failures");
     }
 
