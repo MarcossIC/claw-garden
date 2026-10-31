@@ -1065,6 +1065,13 @@ pub fn join_pieces(pieces: &[&str]) -> String {
     crate::memory::pieces::join_pieces(pieces)
 }
 
+/// The tier a row inserted at tier 3 earns from its importance, accesses and
+/// type, the promotion the store applies: a seeded row lands where the store
+/// would have put it.
+pub fn earned_tier(importance: f64, access_count: i64, memory_type: &str) -> i64 {
+    crate::memory::tier::compute_tier(3, importance, access_count, memory_type)
+}
+
 /// Whether a memory type asserts something the detector can pair; a name that
 /// is no memory type does not.
 pub fn is_claim_type(memory_type: &str) -> bool {
@@ -1083,7 +1090,7 @@ pub const EMBED_BATCH: usize = crate::memory::embedder::EMBED_BATCH;
 /// The indices of `tokens` from the largest count to the smallest, equal
 /// counts in the order they came: the order an import embeds its rows in.
 pub fn longest_first(tokens: &[usize]) -> Vec<usize> {
-    crate::memory::portability::import::longest_first(tokens)
+    crate::memory::embedder::longest_first(tokens)
 }
 
 /// The token window the live embedder truncates to — re-exported so the eval
@@ -1178,6 +1185,20 @@ impl EvalTokenCounter {
         let split = crate::memory::chunker::ChatChunker::from_tokenizer(tokenizer).split_save(text);
         (split.pieces.into_iter().map(|c| c.text).collect(), split.head)
     }
+}
+
+/// The order in which a docs refresh hands `texts` (the `indexed_text` of the
+/// passages it embeds) to the embedder, as indices into them: the order of
+/// production's own `passage_order`, counted by `counter`'s tokenizer under
+/// `embedder`'s passage prefix, and the identity where production leaves the
+/// passages as they are (`EMBED_BATCH` texts or fewer, or a counter with no
+/// tokenizer).
+pub fn passage_order(embedder: &EvalEmbedder, counter: &EvalTokenCounter, texts: &[String]) -> Vec<usize> {
+    let tokenizer = match &counter.0 {
+        EvalTokenCounterInner::Real(tok) => Some(tok.as_ref()),
+        EvalTokenCounterInner::Fake => None,
+    };
+    project_docs::passage_order(tokenizer, embedder.inner.as_ref(), texts).unwrap_or_else(|| (0..texts.len()).collect())
 }
 
 /// True iff the real embedding model is already cached at `base_dir` —
@@ -1365,7 +1386,8 @@ pub struct EvalIndexRun {
     pub docs: Vec<EvalDocTiming>,
 }
 
-/// The tokens of each passage of one doc, in the order they were embedded.
+/// The tokens of each passage of one doc, in the order of its passages, not
+/// in the one they were embedded in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalDocLengths {
     pub path: String,
@@ -1442,7 +1464,8 @@ impl EvalDocIndex {
     /// The tokens of every passage the index holds, as the model receives
     /// them: the text of the stored passage under the embedder's passage
     /// prefix, cut to the model's window, by doc in path order and within a
-    /// doc in the order its passages were embedded. `None` without a
+    /// doc in the order of its passages, which is not the order a refresh
+    /// embedded them in. `None` without a
     /// tokenizer, which only the real model brings.
     pub async fn passage_lengths(&self) -> Result<Option<EvalPassageLengths>, EvalError> {
         let Some(tokenizer) = &self.tokenizer else { return Ok(None) };
@@ -1949,6 +1972,15 @@ mod tests {
     use crate::memory::db::{seed_on_disk, StoredContract};
     use crate::memory::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
     use crate::memory::pieces::StoredPiece;
+
+    #[test]
+    fn a_seeded_row_earns_the_tier_the_store_promotes_it_to() {
+        assert_eq!(earned_tier(5.0, 1, "semantic_fact"), 3);
+        assert_eq!(earned_tier(9.0, 1, "semantic_fact"), 1);
+        assert_eq!(earned_tier(5.0, 1, "user_preference"), 1);
+        assert_eq!(earned_tier(5.0, 2, "architectural_decision"), 2);
+        assert_eq!(earned_tier(5.0, 3, "architectural_decision"), 1);
+    }
 
     #[test]
     fn eval_cpu_names_this_machine() {
@@ -2884,7 +2916,7 @@ second
     }
 
     #[tokio::test]
-    async fn passage_lengths_follow_the_stored_passages_in_batch_order() {
+    async fn passage_lengths_follow_the_stored_passages_in_ordinal_order() {
         let plain = lengths_of_ladder(EvalEmbedder::fake()).await;
         let prefixed = lengths_of_ladder(EvalEmbedder::of(Arc::new(Prefixed), Arc::default())).await;
 
@@ -2928,6 +2960,23 @@ second
         let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
 
         assert_eq!(docs[0].lengths, vec![EMBED_MAX_TOKENS, 2]);
+    }
+
+    #[test]
+    fn passage_order_is_the_order_a_refresh_embeds_in() {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let counter = EvalTokenCounter(EvalTokenCounterInner::Real(tokenizer.clone()));
+        let embedder = EvalEmbedder::of(Arc::new(Prefixed), Arc::default());
+        let texts = |lengths: &[usize]| -> Vec<String> { lengths.iter().map(|&n| vec!["w"; n].join(" ")).collect() };
+        let seventeen = texts(&[2, 5, 2, 9, 1, 5, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 8]);
+
+        let order = passage_order(&embedder, &counter, &seventeen);
+
+        assert_eq!(Some(order.clone()), project_docs::passage_order(Some(&tokenizer), &Prefixed, &seventeen));
+        assert_eq!(order[..5], [3, 16, 1, 5, 6]);
+        assert_eq!(passage_order(&embedder, &EvalTokenCounter::fake(), &seventeen), (0..17).collect::<Vec<_>>());
+        let sixteen = texts(&[1; 16]);
+        assert_eq!(passage_order(&embedder, &counter, &sixteen), (0..16).collect::<Vec<_>>());
     }
 
     #[test]

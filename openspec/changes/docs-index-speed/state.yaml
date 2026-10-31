@@ -1,24 +1,24 @@
 change: docs-index-speed
 objective: "3"
 depends_on: [docs-index-cost]
-phase: propose
+phase: apply
 artifacts:
   exploration: done
   proposal: done  # umbrales fijados antes de leer las corridas D y R de docs-index-cost
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  spec: done  # sólo A1 (IS1 a IS5); A2 se especifica con A1 medido
+  design: done  # sólo A1 (D1 a D7)
+  tasks: done  # parte 1 sin modelo; parte 2 con modelo real y autorización
+  apply: in_progress  # A1 hecho y adoptado; falta A2
+  verify: in_progress  # puertas, bits (0 movidos) y «se queda si» de A1 en verify.md
   archive: pending
 gates:
-  "0": pending  # R: index.phases.embed >= 120 s y >= 0,5 de index_seconds; abre A1, A2 y E (bajo 0,5, S va antes de A1 y se relee)
-  C: pending  # D: (scan+mask+split+lookup+write+tokens.count_seconds)/index_seconds >= 0,25 y esa suma en R <= la mitad de la de D
-  W: pending  # R: phases.write/index_seconds >= 0,10 (prepare_cached en replace_doc y delete_doc)
-  A1: pending  # R: (tokens.padded - padded_sorted_in_doc)/padded >= 0,10 y ese ahorro x phases.embed >= 2 x count_seconds
-  S: pending  # corrida de W (o R): (read+mask+split+lookup+write)/index_seconds >= 0,15
-  A2: pending  # R: (padded_sorted_in_doc - padded_sorted_all)/padded >= 0,15
-  E: pending  # puerta 0 abierta en la última corrida; experimento (solape 32): tokens.real y phases.embed -10 % y ninguna pregunta sale del top 3
+  "0": open  # R: embed 1935,0 s y 0,992 de index_seconds; abre A1, A2 y E, y S no pasa delante de A1
+  C: closed  # D: 0,051 < 0,25 (R/D 0,218 cumple, pero la puerta pide las dos); sin variante ni línea en specs/eval
+  W: closed  # R: write 0,0015 < 0,10
+  A1: kept  # R: 0,171 >= 0,10, y 330,0 s >= 3,9 s; se queda: embed -12,6 % y -12,7 % en los pares limpios, 0 bits, --diff sin movimientos
+  S: closed  # R (W no abre): 0,0083 < 0,15
+  A2: open  # R: 0,162 >= 0,15; se diseña después de medir A1
+  E: waiting  # la puerta 0 abre, pero falta el docs_contract que docs-search-quality no hizo
   B: dropped  # EMBED_BATCH: ningún campo de docs-index-cost lo decide y alcanza a todo el embedder
   D: dropped  # openspec/changes/archive/ sigue en el índice (decisión 1)
-updated: 2026-10-30
+updated: 2026-10-31

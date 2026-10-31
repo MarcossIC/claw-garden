@@ -27,6 +27,11 @@ impl TokenSplitter {
         Self { tokenizer: None }
     }
 
+    /// The tokenizer the splitter counts with, if it has one.
+    pub fn tokenizer(&self) -> Option<&tokenizers::Tokenizer> {
+        self.tokenizer.as_deref()
+    }
+
     /// Test-only: the raw address of the wrapped `Tokenizer`, or `None` in
     /// fallback mode. Lets a test prove two splitters share the identical
     /// `Arc` (one parse of `tokenizer.json`, reused) rather than each

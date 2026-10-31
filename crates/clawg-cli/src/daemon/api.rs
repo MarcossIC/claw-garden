@@ -1986,7 +1986,9 @@ const IMPORT_BODY_LIMIT: usize = 2 * MAX_IMPORT_BYTES;
 pub struct ImportRequest {
     /// The export, as `clawg export` wrote it, or as another tool did.
     pub text: String,
-    /// The tool the export comes from: `clawg` when missing, or `engram`.
+    /// The tool the export comes from: `clawg` when missing, `engram`, or
+    /// `claude-code`, whose memory is sent as the document its directory
+    /// reads into.
     #[serde(default)]
     pub from: Option<String>,
     #[serde(default)]
@@ -2055,6 +2057,8 @@ struct ImportFields {
 enum Source {
     Clawg,
     Engram,
+    /// Claude Code's auto memory, a directory rather than a file.
+    ClaudeCode,
 }
 
 impl Source {
@@ -2062,6 +2066,7 @@ impl Source {
         match self {
             Source::Clawg => "clawg",
             Source::Engram => "engram",
+            Source::ClaudeCode => portability::claude_code::SOURCE,
         }
     }
 }
@@ -2098,15 +2103,17 @@ async fn checked_fields(app: &AppCtx, fields: ImportFields) -> ApiResult<Asked> 
             }
             Source::Clawg
         }
-        Some("engram") => {
+        Some(tool @ ("engram" | "claude-code")) => {
             if !map_roots.is_empty() {
                 return Err(ApiError::bad_request(
                     "map_roots maps the roots of a clawg export; another tool's projects take project_map",
                 ));
             }
-            Source::Engram
+            if tool == "engram" { Source::Engram } else { Source::ClaudeCode }
         }
-        Some(other) => return Err(ApiError::bad_request(format!("unknown source {other:?}; expected clawg or engram"))),
+        Some(other) => {
+            return Err(ApiError::bad_request(format!("unknown source {other:?}; expected clawg, engram or claude-code")))
+        }
     };
     Ok(Asked { source, options: ImportOptions { dry_run, agent, map_roots, project_map } })
 }
@@ -2120,6 +2127,9 @@ fn parse_input(source: Source, text: &str) -> ApiResult<ImportInput> {
         }
         Source::Engram => {
             portability::engram::read(text).map(ImportInput::Foreign).map_err(|e| ApiError::bad_request(e.to_string()))
+        }
+        Source::ClaudeCode => {
+            portability::claude_code::read(text).map(ImportInput::Foreign).map_err(|e| ApiError::bad_request(e.to_string()))
         }
     }
 }
@@ -2208,7 +2218,8 @@ fn record_import(app: &AppCtx, source: Source, report: &ImportReport, started: I
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportJobRequest {
-    /// An absolute path to the export, a regular file this daemon can read.
+    /// An absolute path to the export, a regular file this daemon can read;
+    /// for `claude-code`, the memory directory it reads.
     pub path: String,
     #[serde(default)]
     pub from: Option<String>,
@@ -2226,6 +2237,9 @@ pub struct ImportJobRequest {
 /// one call, so it lives no longer than that: the job keeps what was parsed.
 fn read_export(path: &std::path::Path, source: Source) -> ApiResult<ImportInput> {
     use std::io::Read;
+    if source == Source::ClaudeCode {
+        return read_claude_code(path);
+    }
     let unreadable = |e: std::io::Error| match e.kind() {
         std::io::ErrorKind::NotFound => ApiError::bad_request("no such file"),
         _ => ApiError::bad_request(format!("the file cannot be read: {e}")),
@@ -2248,6 +2262,22 @@ fn read_export(path: &std::path::Path, source: Source) -> ApiResult<ImportInput>
     }
     let text = String::from_utf8(bytes).map_err(|_| ApiError::bad_request("the file is not UTF-8 text"))?;
     parse_input(source, &text)
+}
+
+/// Claude Code's memory under the directory `path`, read whole, every text
+/// counted against the limit of a file.
+fn read_claude_code(path: &std::path::Path) -> ApiResult<ImportInput> {
+    use portability::claude_code::{collect, from_document, CollectError};
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ApiError::bad_request("no such directory")),
+        Ok(meta) if !meta.is_dir() => return Err(ApiError::bad_request("not a directory")),
+        _ => {}
+    }
+    match collect(path, MAX_IMPORT_BYTES) {
+        Ok(document) => Ok(ImportInput::Foreign(from_document(document))),
+        Err(CollectError::NotADirectory { .. }) => Err(ApiError::bad_request("not a directory")),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
+    }
 }
 
 /// What a job runs with once it is accepted.
@@ -3246,7 +3276,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_input_reads_both_sources() {
+    fn parse_input_reads_each_source() {
         let clawg = serde_json::json!({
             "kind": "header", "format": "clawg-memories", "version": 1, "exported_at": 0, "clawg": "0.0.0",
             "filter": {"project": null, "agent": null, "include_deleted": false},
@@ -3254,9 +3284,19 @@ mod tests {
         .to_string();
         let engram = serde_json::json!({ "version": "0.2.0", "exported_at": "2025-03-01 10:00:00", "sessions": [], "observations": [], "prompts": [] }).to_string();
 
+        let claude_code = serde_json::json!({ "projects": [{ "name": "-work-app", "entries": [
+            { "name": "port.md", "text": "---\nname: Port\n---\n27380", "modified_ms": 1 }
+        ] }] })
+        .to_string();
+
         assert!(matches!(parse_input(Source::Clawg, &clawg), Ok(ImportInput::Clawg(_))));
         assert!(matches!(parse_input(Source::Engram, &engram), Ok(ImportInput::Foreign(_))));
-        for (source, text) in [(Source::Clawg, &engram), (Source::Engram, &clawg)] {
+        match parse_input(Source::ClaudeCode, &claude_code) {
+            Ok(ImportInput::Foreign(export)) => assert_eq!((export.source, export.notes.len()), ("claude-code", 1)),
+            Ok(_) => panic!("a clawg export"),
+            Err(e) => panic!("{}", e.message),
+        }
+        for (source, text) in [(Source::Clawg, &engram), (Source::Engram, &clawg), (Source::ClaudeCode, &clawg)] {
             let refused = parse_input(source, text).err().expect("a file of the other tool is refused");
             assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{source:?}");
         }
@@ -3266,6 +3306,33 @@ mod tests {
     fn a_source_is_named_as_the_import_event_logs_it() {
         assert_eq!(Source::Clawg.name(), "clawg");
         assert_eq!(Source::Engram.name(), "engram");
+        assert_eq!(Source::ClaudeCode.name(), "claude-code");
+    }
+
+    #[test]
+    fn a_claude_code_import_reads_a_directory_and_refuses_a_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory = dir.path().join("-work-app").join("memory");
+        std::fs::create_dir_all(&memory).expect("memory dir");
+        std::fs::write(memory.join("port.md"), "---\nname: Port\ntype: reference\n---\n27380").expect("a topic file");
+        match read_export(dir.path(), Source::ClaudeCode) {
+            Ok(ImportInput::Foreign(export)) => {
+                let origins: Vec<&str> = export.notes.iter().map(|n| n.origin.as_str()).collect();
+                assert_eq!(origins, ["claude-code:-work-app/port.md"]);
+            }
+            Ok(_) => panic!("a clawg export"),
+            Err(e) => panic!("{}", e.message),
+        }
+        let refused = |path: &std::path::Path| read_export(path, Source::ClaudeCode).err().expect("refused");
+        let file = refused(&memory.join("port.md"));
+        assert_eq!((file.status, file.message.as_str()), (StatusCode::BAD_REQUEST, "not a directory"));
+        let missing = refused(&dir.path().join("missing"));
+        assert_eq!(missing.message, "no such directory");
+        let other = tempfile::tempdir().expect("tempdir");
+        let none = refused(other.path());
+        assert_eq!(none.status, StatusCode::BAD_REQUEST);
+        assert!(none.message.contains("holds no Claude Code memory"), "{}", none.message);
+        assert!(read_export(&memory.join("port.md"), Source::Engram).is_err(), "engram reads a file of its own");
     }
 
     /// The rows an import writes in one batch.

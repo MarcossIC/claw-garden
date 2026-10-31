@@ -7,6 +7,7 @@
 //! which side of the query/passage distinction it is on — see [`EmbedRole`]
 //! below for why that distinction matters.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -182,6 +183,14 @@ pub const EMBED_MAX_TOKENS: usize = 512;
 /// single run, which the process then kept. At 16 the peak stays in the
 /// hundreds of megabytes and indexing runs as fast as with one big batch.
 pub const EMBED_BATCH: usize = 16;
+
+/// The indices of `tokens` from the largest count to the smallest, equal
+/// counts in the order they came.
+pub(crate) fn longest_first(tokens: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..tokens.len()).collect();
+    order.sort_by_key(|&k| Reverse(tokens[k]));
+    order
+}
 
 /// Tokens the composer's budget reserves for what the model adds around the
 /// text itself: `<s>`/`</s>` (2) plus slack for a BPE merge that can span the
@@ -984,6 +993,13 @@ impl Embedder for GatedEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longest_first_puts_the_most_tokens_first_and_keeps_ties_in_order() {
+        assert_eq!(longest_first(&[3, 9, 3, 1, 9]), vec![1, 4, 0, 2, 3]);
+        assert_eq!(longest_first(&[]), Vec::<usize>::new());
+        assert_eq!(longest_first(&[5, 5, 5]), vec![0, 1, 2]);
+    }
 
     #[test]
     fn the_session_takes_every_thread_the_machine_reports() {

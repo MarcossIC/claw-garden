@@ -41,7 +41,7 @@ use crate::memory::backup::Reason;
 use crate::memory::chunker::{embedding_text, ChatChunker};
 use crate::memory::clock::TimestampMs;
 use crate::memory::dedup::content_hash;
-use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
+use crate::memory::embedder::{longest_first, EmbedError, EmbedRole, Embedder};
 use crate::memory::identity::{Ground, ReadAhead};
 use crate::memory::merge::canonical_in;
 use crate::memory::project::{plan_ids_in, RootPlan};
@@ -2530,14 +2530,6 @@ async fn embedding_order(prepared: &Arc<Prepared>, picked: Vec<usize>, chunker: 
     })
     .await
     .map_err(|e| MemoryError::Internal(format!("could not order the rows to embed: {e}")))
-}
-
-/// The indices of `tokens` from the largest count to the smallest, equal
-/// counts in the order they came.
-pub(crate) fn longest_first(tokens: &[usize]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..tokens.len()).collect();
-    order.sort_by_key(|&k| Reverse(tokens[k]));
-    order
 }
 
 fn report(prepared: &Prepared, written: &Written, dry_run: bool) -> ImportReport {
@@ -5216,13 +5208,6 @@ pub(crate) mod tests {
         assert_eq!((small.inserted, large.inserted), (NOTES, 2 * NOTES));
         let ratio = twice.as_secs_f64() / once.as_secs_f64();
         assert!(ratio <= 3.0, "{NOTES} notes in {once:?}, twice as many in {twice:?}: {ratio:.2} times");
-    }
-
-    #[test]
-    fn longest_first_puts_the_most_tokens_first_and_keeps_ties_in_order() {
-        assert_eq!(longest_first(&[3, 9, 3, 1, 9]), vec![1, 4, 0, 2, 3]);
-        assert_eq!(longest_first(&[]), Vec::<usize>::new());
-        assert_eq!(longest_first(&[5, 5, 5]), vec![0, 1, 2]);
     }
 
     /// Answers as the fake embedder does, noting the texts of every call.

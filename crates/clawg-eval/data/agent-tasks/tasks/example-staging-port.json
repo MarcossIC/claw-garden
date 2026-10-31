@@ -1,0 +1,17 @@
+{
+  "id": "example-staging-port",
+  "category": "K1",
+  "example": true,
+  "fixture": "example-tally",
+  "prompt": "What port does the tally service listen on in staging? Answer with the number.",
+  "memories": [
+    {
+      "content": "Tally staging service listens on port 48213\nThe staging deploy of tally overrides PORT from deploy/service.env with 48213, because the staging proxy already owns 8080. The override lives in the staging host's environment, not in this repository.",
+      "age_days": 45
+    }
+  ],
+  "tracers": ["48213"],
+  "checks": [
+    {"kind": "answer_contains", "text": "48213"}
+  ]
+}
