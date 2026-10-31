@@ -1065,6 +1065,13 @@ pub fn join_pieces(pieces: &[&str]) -> String {
     crate::memory::pieces::join_pieces(pieces)
 }
 
+/// The tier a row inserted at tier 3 earns from its importance, accesses and
+/// type, the promotion the store applies: a seeded row lands where the store
+/// would have put it.
+pub fn earned_tier(importance: f64, access_count: i64, memory_type: &str) -> i64 {
+    crate::memory::tier::compute_tier(3, importance, access_count, memory_type)
+}
+
 /// Whether a memory type asserts something the detector can pair; a name that
 /// is no memory type does not.
 pub fn is_claim_type(memory_type: &str) -> bool {
@@ -1965,6 +1972,15 @@ mod tests {
     use crate::memory::db::{seed_on_disk, StoredContract};
     use crate::memory::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
     use crate::memory::pieces::StoredPiece;
+
+    #[test]
+    fn a_seeded_row_earns_the_tier_the_store_promotes_it_to() {
+        assert_eq!(earned_tier(5.0, 1, "semantic_fact"), 3);
+        assert_eq!(earned_tier(9.0, 1, "semantic_fact"), 1);
+        assert_eq!(earned_tier(5.0, 1, "user_preference"), 1);
+        assert_eq!(earned_tier(5.0, 2, "architectural_decision"), 2);
+        assert_eq!(earned_tier(5.0, 3, "architectural_decision"), 1);
+    }
 
     #[test]
     fn eval_cpu_names_this_machine() {

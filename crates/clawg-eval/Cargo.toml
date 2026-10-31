@@ -40,6 +40,12 @@ path = "src/bin/revision-eval/main.rs"
 name = "perf-bench"
 path = "src/bin/perf-bench/main.rs"
 
+# Lays out agent sessions by arm and scores what their client printed; a
+# recorded stream replays a session without calling any model.
+[[bin]]
+name = "agent-eval"
+path = "src/bin/agent-eval/main.rs"
+
 [dependencies]
 clawg-core = { workspace = true, features = ["eval"] }
 # Only `rag-eval --agent-view` and `revision-eval` use it: they serve the daemon's
