@@ -8,7 +8,7 @@ artifacts:
   spec: done  # A1 (IS1 a IS5) y A2 (IS6 a IS17)
   design: done  # A1 (D1 a D7) y A2 (D8 a D15)
   tasks: done  # A1: partes 1 a 3; A2: partes 4 a 8
-  apply: in_progress  # A1 adoptado; A2 con el código escrito y verificado (17678e0..60b4838); falta su Parte 7, la medición
+  apply: in_progress  # A1 adoptado; A2 con el código escrito y verificado (17678e0..60b4838) y la prueba de bits de la cola escrita (bb6a565, 7a); faltan 7b a 7f, la medición
   verify: in_progress  # A1 y el código de A2 verificados (PASS WITH WARNINGS, hallazgos cerrados); faltan IS16 (bits del orden de la cola) e IS17 (pico de memoria)
   archive: pending
 gates:
