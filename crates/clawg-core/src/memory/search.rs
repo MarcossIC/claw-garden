@@ -1,8 +1,9 @@
-//! KNN search across memory + episodic + procedural via tokio::try_join!,
-//! merged + ranked by the score formula of `score.rs`.
+//! KNN search across memory + episodic + procedural, one table after another
+//! on the store's connection, merged + ranked by the score formula of
+//! `score.rs`.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::pieces::SaveLink;
@@ -433,13 +434,16 @@ struct KnnOutcome {
     /// The eligible rows counted when the first window came back short,
     /// capped at the window; `None` when it came back full.
     eligible: Option<usize>,
+    /// How long its call ran on the connection's thread, without its wait
+    /// in the connection's queue.
+    ran: Duration,
 }
 
 impl KnnOutcome {
     /// A table the scope switched off: it asked for nothing, so nothing was
     /// queried and no pass ran.
     fn skipped() -> Self {
-        Self { hits: Vec::new(), passes: 0, saves: 0, eligible: None }
+        Self { hits: Vec::new(), passes: 0, saves: 0, eligible: None, ran: Duration::ZERO }
     }
 
     /// Whether recovery happened — a single pass is the ordinary path, and a
@@ -564,6 +568,9 @@ async fn knn_one(
     store
         .conn
         .call(move |c| {
+            // Started here, on the connection's thread: the wait in its queue
+            // is the queue's, not this table's.
+            let started = Instant::now();
             // Probe and both passes share one hop to the DB thread. `run` is a
             // free function rather than a closure so the row mapping exists in
             // exactly one place regardless of how many passes happen.
@@ -677,7 +684,7 @@ async fn knn_one(
             hits.sort_by(hit_cmp);
             let hits = trim_to_saves(hits, &links, k);
             let saves = distinct_saves(hits.iter().map(|h| h.id), &links);
-            Ok(KnnOutcome { hits, passes, saves, eligible })
+            Ok(KnnOutcome { hits, passes, saves, eligible, ran: started.elapsed() })
         })
         .await
         .map_err(|e| match e {
@@ -717,7 +724,7 @@ fn format_pool_line(
 
 // ── lexical (FTS5) candidate channel ──
 //
-// Wired into search_all_memories_inner's 4th try_join! arm below.
+// Wired into search_all_memories_inner as the arm after the three KNN.
 
 /// Maximum number of OR-ed terms an FTS5 MATCH expression may carry, taken
 /// from the front of the token list. Bounds the expression so a pasted
@@ -837,45 +844,71 @@ fn lexical_budget(requested: usize) -> usize {
     requested.min(MAX_LEXICAL_CANDIDATES)
 }
 
+/// Runs `query` on the store's connection for a channel that never fails a
+/// search, and says how long it ran on the connection's thread: the clock
+/// starts there, so the wait in the connection's queue is not in it. A query
+/// that fails is logged under `channel`, answers nothing and keeps the time it
+/// ran; a call that never reached the thread ran for none.
+async fn run_fail_soft<R: Default + Send + 'static>(
+    store: &MemoryStore,
+    channel: &'static str,
+    query: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<R> + Send + 'static,
+) -> (R, Duration) {
+    let ran = store
+        .conn
+        .call_raw(move |c| {
+            let started = Instant::now();
+            let answer = query(c);
+            (answer, started.elapsed())
+        })
+        .await;
+    match ran {
+        Ok((Ok(answer), took)) => (answer, took),
+        Ok((Err(e), took)) => {
+            log::warn!("{channel}: channel contributed nothing: {e}");
+            (R::default(), took)
+        }
+        Err(e) => {
+            log::warn!("{channel}: channel contributed nothing: {e}");
+            (R::default(), Duration::ZERO)
+        }
+    }
+}
+
 /// Candidate rowids for `query_text`, best-first by bm25, restricted to what
-/// `agent_id`/`project_id` may see. Never fails by contract — the return
-/// type carries no `Result` — because a missing table, a MATCH the parser
-/// rejects, or a dead connection all mean "this channel contributed
-/// nothing", which is strictly weaker than what the dense channel already
-/// produced, not a reason to fail a search that would otherwise succeed.
+/// `agent_id`/`project_id` may see, and how long their query ran on the
+/// connection's thread. Never fails by contract — the return type carries
+/// no `Result` — because a missing table, a MATCH the parser rejects, or a
+/// dead connection all mean "this channel contributed nothing", which is
+/// strictly weaker than what the dense channel already produced, not a
+/// reason to fail a search that would otherwise succeed.
 async fn lexical_candidates(
     store: &MemoryStore,
     query_text: &str,
     agents: &str,
     project_id: Option<&str>,
     k: usize,
-) -> Vec<i64> {
+) -> (Vec<i64>, Duration) {
     let Some(match_expr) = fts_match_expression(query_text, MAX_LEXICAL_TOKENS) else {
-        return Vec::new();
+        return (Vec::new(), Duration::ZERO);
     };
     let k = lexical_budget(k);
     let agent = agents.to_string();
     let proj = project_id.map(str::to_owned);
 
-    store
-        .conn
-        .call(move |c| -> Result<Vec<i64>, rusqlite::Error> {
-            let mut stmt = c.prepare(LEXICAL_CANDIDATE_SQL)?;
-            let rows = stmt.query_map(
-                rusqlite::params![match_expr, agent, proj, k as i64],
-                |row| row.get::<_, i64>(0),
-            )?;
-            let mut ids = Vec::new();
-            for row in rows {
-                ids.push(row?);
-            }
-            Ok(ids)
-        })
-        .await
-        .unwrap_or_else(|e| {
-            log::warn!("lexical_candidates: channel contributed nothing: {e}");
-            Vec::new()
-        })
+    run_fail_soft(store, "lexical_candidates", move |c| -> Result<Vec<i64>, rusqlite::Error> {
+        let mut stmt = c.prepare(LEXICAL_CANDIDATE_SQL)?;
+        let rows = stmt.query_map(
+            rusqlite::params![match_expr, agent, proj, k as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    })
+    .await
 }
 
 /// How many identifiers one query may require of a row. Unlike
@@ -948,18 +981,19 @@ const IDENTIFIER_MATCH_SQL: &str = concat!(
 /// Ids of the `memory` rows that hold every identifier in `query_text`, or
 /// none at all when more rows than `budget` hold them: a name many rows share
 /// says nothing about which one is meant, and rewarding the first `budget`
-/// of them would be arbitrary. Fail-soft for the same reason as
-/// [`lexical_candidates`].
+/// of them would be arbitrary. With them, how long their query ran on the
+/// connection's thread; the check of each row that follows runs here and is
+/// not counted. Fail-soft for the same reason as [`lexical_candidates`].
 async fn identifier_matches(
     store: &MemoryStore,
     query_text: &str,
     agents: &str,
     project_id: Option<&str>,
     budget: usize,
-) -> HashSet<i64> {
+) -> (HashSet<i64>, Duration) {
     let tokens = identifier_tokens(query_text);
     if tokens.is_empty() {
-        return HashSet::new();
+        return (HashSet::new(), Duration::ZERO);
     }
     let match_expr = tokens.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" AND ");
     let budget = lexical_budget(budget);
@@ -971,23 +1005,17 @@ async fn identifier_matches(
     // out the ones that hold it. Past the window the rows cannot all be
     // checked, and no bonus is the safe answer.
     let window = MAX_LEXICAL_CANDIDATES;
-    let rows = store
-        .conn
-        .call(move |c| -> Result<Vec<(i64, String)>, rusqlite::Error> {
-            let mut stmt = c.prepare(IDENTIFIER_MATCH_SQL)?;
-            let rows = stmt.query_map(
-                rusqlite::params![match_expr, agent, proj, window as i64 + 1],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )?;
-            rows.collect()
-        })
-        .await
-        .unwrap_or_else(|e| {
-            log::warn!("identifier_matches: channel contributed nothing: {e}");
-            Vec::new()
-        });
+    let (rows, ran) = run_fail_soft(store, "identifier_matches", move |c| -> Result<Vec<(i64, String)>, rusqlite::Error> {
+        let mut stmt = c.prepare(IDENTIFIER_MATCH_SQL)?;
+        let rows = stmt.query_map(
+            rusqlite::params![match_expr, agent, proj, window as i64 + 1],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        rows.collect()
+    })
+    .await;
     if rows.len() > window {
-        return HashSet::new();
+        return (HashSet::new(), ran);
     }
 
     let split_by_fts: Vec<&str> = tokens.into_iter().filter(|t| t.contains('_')).collect();
@@ -997,9 +1025,9 @@ async fn identifier_matches(
         .map(|(id, _)| id)
         .collect();
     if ids.len() > budget {
-        return HashSet::new();
+        return (HashSet::new(), ran);
     }
-    ids.into_iter().collect()
+    (ids.into_iter().collect(), ran)
 }
 
 // Second-stage scoring query for lexical candidates. The column list and
@@ -1146,6 +1174,8 @@ fn lexical_score_sql(n: usize) -> String {
 /// crossed fixture — many candidates AND a large corpus — because either
 /// dimension alone hides the difference completely.
 ///
+/// With the hits, how long their query ran on the connection's thread.
+///
 /// Never fails by contract — the return type carries no `Result` — for the
 /// same reason [`lexical_candidates`] does not. This channel exists to ADD
 /// candidates to a search the dense arms have already answered, so there is
@@ -1162,12 +1192,12 @@ async fn score_lexical_candidates(
     scoring: &ScoringConfig,
     now: TimestampMs,
     lexical_matches: &HashSet<i64>,
-) -> Vec<RankedHit> {
+) -> (Vec<RankedHit>, Duration) {
     // A round-trip skipped, not a correctness fix: `m.id IN ()` is always
     // false on its own, so this guard exists only to avoid paying for a DB
     // call whose answer is already known to be empty.
     if ids.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Duration::ZERO);
     }
     let q = q_bytes.to_vec();
     let agent = agents.to_string();
@@ -1176,66 +1206,60 @@ async fn score_lexical_candidates(
     let scoring = *scoring;
     let lexical_matches = lexical_matches.clone();
 
-    store
-        .conn
-        .call(move |c| -> Result<Vec<RankedHit>, rusqlite::Error> {
-            let sql = lexical_score_sql(ids.len());
-            let mut stmt = c.prepare(&sql)?;
+    run_fail_soft(store, "score_lexical_candidates", move |c| -> Result<Vec<RankedHit>, rusqlite::Error> {
+        let sql = lexical_score_sql(ids.len());
+        let mut stmt = c.prepare(&sql)?;
 
-            let mut binds: Vec<rusqlite::types::Value> = vec![q.into(), agent.into()];
-            binds.push(match proj {
-                Some(p) => rusqlite::types::Value::Text(p),
-                None => rusqlite::types::Value::Null,
+        let mut binds: Vec<rusqlite::types::Value> = vec![q.into(), agent.into()];
+        binds.push(match proj {
+            Some(p) => rusqlite::types::Value::Text(p),
+            None => rusqlite::types::Value::Null,
+        });
+        binds.extend(ids.iter().copied().map(rusqlite::types::Value::Integer));
+
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
+            let id = row.get(0)?;
+            Ok(RawHit {
+                id,
+                kind: TableKind::Memory,
+                content: row.get(1)?,
+                memory_type: row.get(2)?,
+                tier: row.get(3)?,
+                status: row.get(4)?,
+                distance: row.get(5)?,
+                created_at: row.get(6)?,
+                last_accessed_at: row.get(7)?,
+                importance: row.get(8)?,
+                lexical_match: lexical_matches.contains(&id),
+                agent_id: row.get(9)?,
+                topic_key: row.get(10)?,
+                project_id: row.get(11)?,
+            })
+        })?;
+
+        let mut hits = Vec::new();
+        for row in rows {
+            let r = row?;
+            hits.push(RankedHit {
+                id: r.id,
+                kind: r.kind,
+                score: compute_score(&scoring, &r, now),
+                content: r.content,
+                memory_type: r.memory_type,
+                tier: r.tier,
+                status: r.status,
+                distance: r.distance,
+                created_at: r.created_at,
+                agent_id: r.agent_id,
+                piece: None,
+                exact: r.lexical_match,
+                topic_key: r.topic_key,
+                project_id: r.project_id,
             });
-            binds.extend(ids.iter().copied().map(rusqlite::types::Value::Integer));
-
-            let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
-                let id = row.get(0)?;
-                Ok(RawHit {
-                    id,
-                    kind: TableKind::Memory,
-                    content: row.get(1)?,
-                    memory_type: row.get(2)?,
-                    tier: row.get(3)?,
-                    status: row.get(4)?,
-                    distance: row.get(5)?,
-                    created_at: row.get(6)?,
-                    last_accessed_at: row.get(7)?,
-                    importance: row.get(8)?,
-                    lexical_match: lexical_matches.contains(&id),
-                    agent_id: row.get(9)?,
-                    topic_key: row.get(10)?,
-                    project_id: row.get(11)?,
-                })
-            })?;
-
-            let mut hits = Vec::new();
-            for row in rows {
-                let r = row?;
-                hits.push(RankedHit {
-                    id: r.id,
-                    kind: r.kind,
-                    score: compute_score(&scoring, &r, now),
-                    content: r.content,
-                    memory_type: r.memory_type,
-                    tier: r.tier,
-                    status: r.status,
-                    distance: r.distance,
-                    created_at: r.created_at,
-                    agent_id: r.agent_id,
-                    piece: None,
-                    exact: r.lexical_match,
-                    topic_key: r.topic_key,
-                    project_id: r.project_id,
-                });
-            }
-            Ok(hits)
-        })
-        .await
-        .unwrap_or_else(|e| {
-            log::warn!("score_lexical_candidates: channel contributed nothing: {e}");
-            Vec::new()
-        })
+        }
+        Ok(hits)
+    })
+    .await
 }
 
 /// Does the actual work behind `search_all_memories`, plus hands back the
@@ -1285,15 +1309,13 @@ async fn search_all_memories_inner(
     // independent per-row `strftime('%s','now')` calls could never guarantee.
     let now = TimestampMs::now();
 
-    // Run before the dense arms, not beside them: the bonus has to be in each
-    // row's score before `knn_one` trims a widened window back to k. All arms
-    // share one connection, so nothing ran in parallel to lose.
+    // The first arm: the bonus has to be in each row's score before
+    // `knn_one` trims a widened window back to k.
     let metrics = store.metrics();
     let lexical_matches = match (scope.lexical, query_text) {
         (Some(k), Some(q)) => {
-            let started = Instant::now();
-            let matches = identifier_matches(store, q, agents, project_id, k).await;
-            record_arm(metrics, "identifiers", started);
+            let (matches, ran) = identifier_matches(store, q, agents, project_id, k).await;
+            record_arm(metrics, "identifiers", ran);
             matches
         }
         _ => HashSet::new(),
@@ -1301,62 +1323,45 @@ async fn search_all_memories_inner(
     // Ids are per table and only `memory` has a lexical index.
     let no_matches = HashSet::new();
 
-    let (mem, epi, pro, lex_ids) = tokio::try_join!(
-        async {
-            match scope.memory {
-                Some(k) => {
-                    let started = Instant::now();
-                    let outcome =
-                        knn_one(store, KNN_MEMORY, &q_bytes, agents, project_id, k, scoring, now, &lexical_matches).await;
-                    record_arm(metrics, "knn_memory", started);
-                    outcome
-                }
-                None => Ok(KnnOutcome::skipped()),
-            }
-        },
-        async {
-            match scope.episodic {
-                Some(k) => {
-                    let started = Instant::now();
-                    let outcome =
-                        knn_one(store, KNN_EPISODIC, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await;
-                    record_arm(metrics, "knn_episodic", started);
-                    outcome
-                }
-                None => Ok(KnnOutcome::skipped()),
-            }
-        },
-        async {
-            match scope.procedural {
-                Some(k) => {
-                    let started = Instant::now();
-                    let outcome =
-                        knn_one(store, KNN_PROCEDURAL, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await;
-                    record_arm(metrics, "knn_skill", started);
-                    outcome
-                }
-                None => Ok(KnnOutcome::skipped()),
-            }
-        },
-        async {
-            // Infallible by construction: `lexical_candidates` never returns
-            // `Result` at all, so there is exactly one `Ok(...)` in this arm
-            // and nothing here can bubble an FTS5-specific failure into the
-            // rest of the search. `(None, _)` and `(_, None)` both mean "the
-            // channel has nothing to spend its budget on" — off, or on with
-            // no query text to match — and collapse into the same empty
-            // result as a sanitizer that yielded zero tokens.
-            let ids = match (scope.lexical, query_text) {
-                (Some(k), Some(q)) => {
-                    let started = Instant::now();
-                    let ids = lexical_candidates(store, q, agents, project_id, k).await;
-                    Some((ids, started.elapsed()))
-                }
-                _ => None,
-            };
-            Ok::<_, MemoryError>(ids)
-        },
-    )?;
+    // One arm after another, in the order they always reached the
+    // connection: it runs one call at a time, so joining them ran nothing in
+    // parallel. Each call goes in once the one before came back.
+    let mem = match scope.memory {
+        Some(k) => {
+            let outcome =
+                knn_one(store, KNN_MEMORY, &q_bytes, agents, project_id, k, scoring, now, &lexical_matches).await?;
+            record_arm(metrics, "knn_memory", outcome.ran);
+            outcome
+        }
+        None => KnnOutcome::skipped(),
+    };
+    let epi = match scope.episodic {
+        Some(k) => {
+            let outcome = knn_one(store, KNN_EPISODIC, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await?;
+            record_arm(metrics, "knn_episodic", outcome.ran);
+            outcome
+        }
+        None => KnnOutcome::skipped(),
+    };
+    let pro = match scope.procedural {
+        Some(k) => {
+            let outcome =
+                knn_one(store, KNN_PROCEDURAL, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await?;
+            record_arm(metrics, "knn_skill", outcome.ran);
+            outcome
+        }
+        None => KnnOutcome::skipped(),
+    };
+    // Infallible by construction: `lexical_candidates` never returns `Result`
+    // at all, so nothing here can bubble an FTS5-specific failure into the
+    // rest of the search. `(None, _)` and `(_, None)` both mean "the channel
+    // has nothing to spend its budget on" — off, or on with no query text to
+    // match — and collapse into the same empty result as a sanitizer that
+    // yielded zero tokens.
+    let lex_ids = match (scope.lexical, query_text) {
+        (Some(k), Some(q)) => Some(lexical_candidates(store, q, agents, project_id, k).await),
+        _ => None,
+    };
     for (outcome, table) in [(&mem, "memory"), (&epi, "episodic"), (&pro, "skill")] {
         if outcome.retried() {
             metrics.gauge("search.knn_retry", &[("table", table)], 1.0);
@@ -1390,15 +1395,14 @@ async fn search_all_memories_inner(
     // can. Both halves of the channel had to be infallible for that to be
     // true — a fail-soft candidate query feeding a fallible scoring query is
     // a channel that still breaks retrieval, just later.
-    let scoring_started = Instant::now();
-    let lex_hits = if leftover.is_empty() {
-        Vec::new()
+    let (lex_hits, scoring_ran) = if leftover.is_empty() {
+        (Vec::new(), Duration::ZERO)
     } else {
         score_lexical_candidates(store, &q_bytes, agents, project_id, &leftover, scoring, now, &lexical_matches).await
     };
     // The arm is its candidates and the scoring of those the dense arm missed.
-    if let Some(took) = lexical_took {
-        record_micros(metrics, "lexical", took + scoring_started.elapsed());
+    if let Some(candidates_ran) = lexical_took {
+        record_arm(metrics, "lexical", candidates_ran + scoring_ran);
     }
 
     // Built before the merge below consumes the per-table hits, which is also
@@ -1443,7 +1447,7 @@ async fn search_all_memories_inner(
     // window empty while debug logging is off and reporting `warming` for a
     // long time after someone turns it on.
     store.knn_latency().record(elapsed);
-    record_micros(metrics, "total", elapsed);
+    record_arm(metrics, "total", elapsed);
 
     // Tier-per-hit, pool-survival and channel-attribution logging — appended
     // to the existing retrieval debug line via pure, unit-tested helpers.
@@ -1463,12 +1467,9 @@ async fn search_all_memories_inner(
     Ok((all, telemetry, memory_pool))
 }
 
-/// Records under `search.duration` how long `arm` took since `started`.
-fn record_arm(metrics: &Recorder, arm: &'static str, started: Instant) {
-    record_micros(metrics, arm, started.elapsed());
-}
-
-fn record_micros(metrics: &Recorder, arm: &'static str, took: std::time::Duration) {
+/// Records under `search.duration` what `arm` took: for `total` the whole
+/// search, for an arm the time its calls ran on the connection's thread.
+fn record_arm(metrics: &Recorder, arm: &'static str, took: Duration) {
     metrics.observe("search.duration", Unit::Micros, &[("arm", arm)], u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
 }
 
@@ -1492,7 +1493,7 @@ pub async fn search_all_memories(
 /// ranking against, so it uses the same `MATCH` expression and order.
 #[cfg(feature = "eval")]
 pub(crate) async fn lexical_channel_only(store: &MemoryStore, query_text: &str, agent_id: &str, k: usize) -> Vec<i64> {
-    lexical_candidates(store, query_text, &reach_bind(agent_id, &Reach::Own), None, k).await
+    lexical_candidates(store, query_text, &reach_bind(agent_id, &Reach::Own), None, k).await.0
 }
 
 /// Same orchestration as [`search_all_memories`], with the scoring config
@@ -3448,7 +3449,7 @@ mod tests {
         let count = MAX_LEXICAL_CANDIDATES + 88;
         insert_rows_at_increasing_distance(&store, agent, "ceiling_shared_token row", count).await;
 
-        let ids = lexical_candidates(&store, "ceiling_shared_token", &only(agent), None, usize::MAX).await;
+        let ids = lexical_candidates(&store, "ceiling_shared_token", &only(agent), None, usize::MAX).await.0;
         assert_eq!(
             ids.len(),
             MAX_LEXICAL_CANDIDATES,
@@ -3464,7 +3465,7 @@ mod tests {
             &ScoringConfig::DEFAULT,
             TimestampMs::now(), &HashSet::new(),
         )
-        .await;
+        .await.0;
         assert_eq!(
             hits.len(),
             MAX_LEXICAL_CANDIDATES,
@@ -3507,7 +3508,7 @@ mod tests {
             );
         }
 
-        let ids = lexical_candidates(&store, "shared_tok", &only("agent-a"), None, 20).await;
+        let ids = lexical_candidates(&store, "shared_tok", &only("agent-a"), None, 20).await.0;
 
         assert_eq!(
             ids.len(),
@@ -3547,7 +3548,7 @@ mod tests {
             &store, agent, "unique_tok", "chat_message", 3, 5.0, "active", emb.clone(),
         ).await;
 
-        let ids = lexical_candidates(&store, "unique_tok", &only(agent), None, 20).await;
+        let ids = lexical_candidates(&store, "unique_tok", &only(agent), None, 20).await.0;
 
         assert!(
             ids.contains(&best_id),
@@ -3577,7 +3578,7 @@ mod tests {
         )
         .await;
 
-        let ids = lexical_candidates(&store, "revtok", &only(agent), None, 2).await;
+        let ids = lexical_candidates(&store, "revtok", &only(agent), None, 2).await.0;
 
         assert_eq!(ids, vec![current]);
     }
@@ -3624,7 +3625,7 @@ mod tests {
             emb,
         ).await;
 
-        let ids = lexical_candidates(&store, "configuracion", &only("agent-accent"), None, 20).await;
+        let ids = lexical_candidates(&store, "configuracion", &only("agent-accent"), None, 20).await.0;
 
         assert!(
             ids.contains(&id),
@@ -3641,7 +3642,7 @@ mod tests {
             &store, "agent-pref-lex", Some("P2"), "user_preference", "pref_tok content", emb,
         ).await;
 
-        let ids = lexical_candidates(&store, "pref_tok", &only("agent-pref-lex"), Some("P1"), 20).await;
+        let ids = lexical_candidates(&store, "pref_tok", &only("agent-pref-lex"), Some("P1"), 20).await.0;
 
         assert!(
             ids.contains(&id),
@@ -3655,7 +3656,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         store.conn.call(|c| c.execute("DROP TABLE memory_fts", [])).await.unwrap();
 
-        let ids = lexical_candidates(&store, "anything", &only("agent-x"), None, 20).await;
+        let ids = lexical_candidates(&store, "anything", &only("agent-x"), None, 20).await.0;
 
         assert!(
             ids.is_empty(),
@@ -3685,7 +3686,7 @@ mod tests {
         let dense_score = dense_hits.hits.iter().find(|h| h.id == dense_id).unwrap().score;
 
         let lexical_hits = score_lexical_candidates(&store, &emb, &only(agent), None, &[lexical_id], &ScoringConfig::DEFAULT, now, &HashSet::new())
-            .await;
+            .await.0;
         let lexical_score = lexical_hits.iter().find(|h| h.id == lexical_id).unwrap().score;
 
         assert_eq!(
@@ -3709,7 +3710,7 @@ mod tests {
         let requested = vec![ids[0], ids[2], ids[4]];
 
         let hits = score_lexical_candidates(&store, &emb, &only(agent), None, &requested, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
-            .await;
+            .await.0;
 
         let mut returned: Vec<i64> = hits.iter().map(|h| h.id).collect();
         returned.sort();
@@ -3731,7 +3732,7 @@ mod tests {
         soft_delete_keeping_vector(&store, id).await;
 
         let hits = score_lexical_candidates(&store, &emb, &only(agent), None, &[id], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
-            .await;
+            .await.0;
 
         assert!(hits.is_empty(), "a soft-deleted memory must never be scored, even if its id reaches this query directly");
     }
@@ -3755,7 +3756,7 @@ mod tests {
         let hits = score_lexical_candidates(
             &store, &emb, &only("agent-intruder"), None, &[other], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new(),
         )
-        .await;
+        .await.0;
 
         assert!(hits.is_empty(), "a row belonging to another agent must never be scored for this caller");
     }
@@ -3773,7 +3774,7 @@ mod tests {
         let hits = score_lexical_candidates(
             &store, &emb, &only(agent), None, &[superseded], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new(),
         )
-        .await;
+        .await.0;
 
         assert!(hits.is_empty(), "only 'active' and 'disputed' rows are eligible to reach a caller");
     }
@@ -3796,7 +3797,7 @@ mod tests {
         let hits = score_lexical_candidates(
             &store, &emb, &only(agent), Some("project-current"), &[pref], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new(),
         )
-        .await;
+        .await.0;
 
         assert_eq!(
             hits.iter().map(|h| h.id).collect::<Vec<_>>(),
@@ -3810,7 +3811,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let emb = unit_basis_embedding();
         let hits = score_lexical_candidates(&store, &emb, &only("agent-empty"), None, &[], &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
-            .await;
+            .await.0;
         assert!(hits.is_empty());
     }
 
@@ -3960,7 +3961,7 @@ mod tests {
                         &ScoringConfig::DEFAULT,
                         TimestampMs::now(), &HashSet::new(),
                     )
-                    .await;
+                    .await.0;
                     best = best.min(t.elapsed());
                 }
                 (best, hits)
@@ -3985,7 +3986,7 @@ mod tests {
         );
     }
 
-    // ── lexical channel wiring (4th try_join! arm inside search_all_memories_inner) ──
+    // ── lexical channel wiring (the arm after the three KNN inside search_all_memories_inner) ──
 
     /// Component-wise negation — cosine ≈ -1 after normalization, exactly
     /// antipodal to `v`. Mirrors `contradiction.rs`'s `far()` fixture (same
@@ -4094,7 +4095,7 @@ mod tests {
             &ScoringConfig::DEFAULT,
             TimestampMs::now(), &HashSet::new(),
         )
-        .await;
+        .await.0;
 
         assert_eq!(
             hits.iter().map(|h| h.id).collect::<Vec<_>>(),
@@ -4159,7 +4160,7 @@ mod tests {
             &ScoringConfig::DEFAULT,
             TimestampMs::now(), &HashSet::new(),
         )
-        .await;
+        .await.0;
 
         let q = q_bytes.clone();
         let knn: std::collections::HashMap<i64, f64> = store
@@ -4270,6 +4271,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(arms_recorded(&store).contains(&"lexical".to_string()), "the failed channel still ran, and says so");
 
         let scope_off = SearchScope { lexical: None, ..SearchScope::all_default() };
         let (hits_off, _t_off, _) = search_all_memories_inner(
@@ -4320,7 +4322,7 @@ mod tests {
 
         // Asserted, not assumed: if the token ever stopped matching both rows
         // the test below would still pass while measuring nothing.
-        let proposed = lexical_candidates(&store, "dedupattr_tok", &only(agent), None, 20).await;
+        let proposed = lexical_candidates(&store, "dedupattr_tok", &only(agent), None, 20).await.0;
         assert_eq!(
             proposed.len(),
             2,
@@ -4628,7 +4630,7 @@ mod tests {
         )
         .await;
 
-        let ids_before = lexical_candidates(&store, "unique_trigger_removal_token", &only(agent), None, 20).await;
+        let ids_before = lexical_candidates(&store, "unique_trigger_removal_token", &only(agent), None, 20).await.0;
         assert_eq!(ids_before.len(), 1, "test setup: the row must be lexically reachable before deletion");
         let id = ids_before[0];
 
@@ -4693,7 +4695,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ids = lexical_candidates(&store, "survivor_token", &only(agent), None, 20).await;
+        let ids = lexical_candidates(&store, "survivor_token", &only(agent), None, 20).await.0;
         assert!(
             ids.contains(&survivor),
             "the index must remain intact for an unrelated row after a soft-then-hard delete sequence"
@@ -5036,7 +5038,7 @@ mod tests {
         )
         .await;
 
-        let matches = identifier_matches(&store, "snake_case", &only(agent), None, 20).await;
+        let matches = identifier_matches(&store, "snake_case", &only(agent), None, 20).await.0;
         assert_eq!(matches, HashSet::from([own]));
     }
 
@@ -5434,6 +5436,111 @@ mod tests {
         assert!(
             !gauges.keys().any(|k| k.name == "search.knn_retry"),
             "a window that came back full was not widened: {gauges:?}"
+        );
+    }
+
+    /// What `arm` took in the one search `store` measured.
+    fn arm_took(store: &MemoryStore, arm: &str) -> std::time::Duration {
+        let run = store.metrics().run();
+        let histogram = run
+            .get(&crate::metrics::SeriesKey::new("search.duration", &[("arm", arm)]))
+            .unwrap_or_else(|| panic!("no {arm} arm was recorded"));
+        assert_eq!(histogram.count(), 1, "one search, one sample of {arm}");
+        std::time::Duration::from_micros(histogram.sum())
+    }
+
+    /// A call that holds the connection of `store` until `release` gets a
+    /// message; it is running on the connection's thread when this returns.
+    async fn hold_connection(store: &MemoryStore) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let store = store.clone();
+        let holding = tokio::spawn(async move {
+            store
+                .conn
+                .call(move |_| -> rusqlite::Result<()> {
+                    let _ = started.send(());
+                    let _ = held.recv();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        });
+        running.await.unwrap();
+        (release, holding)
+    }
+
+    /// The `memory` KNN and the lexical channel, the arms that stay when the
+    /// legacy tables go.
+    fn memory_and_lexical() -> SearchScope {
+        SearchScope { episodic: None, procedural: None, ..SearchScope::all_default() }
+    }
+
+    #[tokio::test]
+    async fn an_arm_measures_its_run_on_the_connection_not_its_wait() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let agent = "agent-held";
+        bulk_insert_memory_rows(&store, agent, None, 3, unit_basis_embedding()).await;
+        let (release, holding) = hold_connection(&store).await;
+
+        // No identifier in the query, so nothing reaches the connection before
+        // the arms are behind the held call.
+        let search = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                search_all_memories(&store, &unit_basis_vec(), Some("vector arms"), agent, memory_and_lexical(), 10).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        release.send(()).unwrap();
+        holding.await.unwrap();
+        search.await.unwrap().unwrap();
+
+        let total = arm_took(&store, "total");
+        assert!(total >= std::time::Duration::from_millis(150), "the search waited for the held call: {total:?}");
+        for arm in ["identifiers", "knn_memory", "lexical"] {
+            let took = arm_took(&store, arm);
+            assert!(took < std::time::Duration::from_millis(150), "{arm} took {took:?} of a search that waited {total:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_call_that_arrives_during_a_search_runs_between_its_arms() {
+        // An empty store: no hit to link and no candidate to score, so the
+        // arms are the only calls the search makes.
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (release, holding) = hold_connection(&store).await;
+        let search = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                search_all_memories(&store, &unit_basis_vec(), Some("vector arms"), "agent-between", memory_and_lexical(), 10)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let arriving = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .conn
+                    .call(|_| -> rusqlite::Result<()> {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+        holding.await.unwrap();
+        search.await.unwrap().unwrap();
+        arriving.await.unwrap();
+
+        let total = arm_took(&store, "total");
+        assert!(
+            total >= std::time::Duration::from_millis(250),
+            "the lexical arm, sent once the KNN came back, waits for the call that arrived meanwhile: {total:?}"
         );
     }
 
