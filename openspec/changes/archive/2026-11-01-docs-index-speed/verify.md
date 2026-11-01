@@ -61,7 +61,7 @@ Corridas autorizadas, una por vez y sin otra compilación en marcha. Las dos usa
 
 ### Qué se concluye
 
-- **La decisión 4 se cumple con diferencia 0, en esta CPU.** No hay que reescribir vectores. Como no se movió ningún bit, la memoria de `docs/eval/cache/` sigue siendo exacta en esta máquina, y la tarea 2c no la vacía. Las corridas de 2d usan `--no-cache` de todas formas. En otra CPU, `e5_golden` compara con 1e-6, como antes.
+- **La decisión 4 se cumple con diferencia 0, en esta CPU.** No hay que reescribir vectores. No se movió ningún bit en esta muestra de 4799 pasajes, y la tarea 2c no vacía la memoria de `docs/eval/cache/`, aunque eso no comprueba cada vector que guarda. Las corridas de 2d usan `--no-cache` de todas formas. En otra CPU, `e5_golden` compara con 1e-6, como antes.
 - **El tiempo de 2b no decide «se queda si».** Es una corrida por orden, sin alternar, en debug, y la varianza entre corridas de esta máquina llegó al 26,8 %. Hay una salvedad. Todo el ahorro de tokens está en los docs de más de una tanda: `(padded − padded_sorted_in_doc) / multi_batch_padded` de R da 1 443 810 / 6 652 055 = 0,217. Este subconjunto es justo de esos docs, y aun así el reloj bajó un 8,6 %, menos que el −10 % que pide «se queda si». La prueba no imprime el relleno de su muestra, así que no se sabe si la muestra rellena como el corpus entero. Decide la tarea 2d, con corridas alternadas de `rag-eval`.
 
 ### Suite y clippy
@@ -571,7 +571,7 @@ Corridas autorizadas de la Parte 7, una por vez y sin otra compilación ni prueb
 - **Tokens rellenados:** 2 003 961 en cada doc, 1 664 643 en la cola (0,831) y 1 620 417 todo junto (0,809).
 - **Tiempo:** los tres órdenes se turnan en cada ronda. Contra «en cada doc», la cola da 0,798, 0,702 y 0,905 (mediana 0,798), y todo junto 0,791, 0,674 y 0,701. Es vista previa en debug y no decide nada.
 
-La decisión 4 se cumple con diferencia 0 en esta CPU. Nada guardado cambia, y `docs/eval/cache/` no se vacía.
+La decisión 4 se cumple con diferencia 0 en esta CPU, sobre una muestra de 5293 pasajes; el corpus congelado de 7c tiene 19 278. No se reescribe nada guardado, y `docs/eval/cache/` no se vacía. Eso no prueba que la memoria siga exacta: su clave no incluye cómo se armó la tanda y sus bytes no se compararon. Para afirmarlo haría falta comparar los bytes de cada pasaje guardado con la agrupación completa, o vaciarla.
 
 ### El tiempo (7c)
 
@@ -649,7 +649,7 @@ Cuatro daemons `clawg serve --profile dev` de release, uno por corrida, alternan
 | decisión 4 de la propuesta | 0 bits movidos (7b) | ✅ |
 | IS17: el pico sube ≤ 5 % | baja un 9,4 % (1312,6 frente a 1448,5 MiB, en las dos corridas de cada rama) | ✅ |
 
-**A2 se queda.** IS16 e IS17 quedan cumplidos: IS16 por la 7b e IS17 por la 7d. No se revierte ningún commit. Como no se movió ningún bit, `docs/eval/cache/` sigue siendo exacta.
+**A2 se queda.** IS16 e IS17 quedan cumplidos: IS16 por la 7b e IS17 por la 7d. No se revierte ningún commit. `docs/eval/cache/` no se vació: la 7b no movió ningún bit en su muestra, lo que no comprueba la memoria entera.
 
 ## Archivo (2026-11-01)
 
