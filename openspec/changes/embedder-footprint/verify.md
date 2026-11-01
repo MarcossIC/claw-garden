@@ -1,6 +1,6 @@
 # embedder-footprint — Verificación
 
-Registro de la puerta (tarea 2). Sólo están medidos los pasos 2.1 y 2.2, en Windows. Falta Linux y faltan los pasos 2.3 a 2.6.
+Registro de la puerta (tarea 2). Están medidos los pasos 2.1 y 2.2, en Windows y en Linux. Faltan los pasos 2.3 a 2.6.
 
 ## La máquina y el build
 
@@ -81,11 +81,80 @@ Tres límites de esta lectura:
 - Las tandas de acá son de un texto corto, no de 16 pasajes largos.
 - Es un build debug. La inferencia es la misma biblioteca nativa, pero el código Rust del daemon gasta más que en release. Ese gasto cae en las dos ventanas y no afecta a un resultado que queda por debajo del umbral.
 
+## 2.1 y 2.2 en Linux
+
+### La máquina y el build
+
+| Dato | Valor |
+|---|---|
+| Sistema | Ubuntu 24.04.5 LTS, núcleo Linux 6.18, x86_64, máquina virtual bajo KVM |
+| CPU | Intel Xeon @ 2.10 GHz (familia 6, modelo 207), 1 zócalo |
+| Hilos | 4 físicos, 4 lógicos (sin SMT) |
+| Instrucciones | AVX2, AVX-512F, FMA |
+| Memoria | 15 GiB, sin swap |
+| Build | debug con la feature `testing` (`cargo test -p clawg-cli --no-run`), versión 0.73.0, sobre `6cb64fc` |
+
+Esta máquina no cumple los 8 hilos lógicos con SMT de la guía. Ese requisito lo cubre la de Windows.
+
+### Cómo se midió, y en qué difiere de Windows
+
+- El esquema es el mismo: cada corrida es un daemon solo, `serve --profile dev --port 0`, con el modelo real, un `CLAWG_TEST_HOME` temporal y una store vacía, una detrás de otra. Corren con `RUST_LOG=info` y sin ninguna otra variable de clawg, del tokenizer, de `rayon` ni de malloc, salvo las que pide cada paso. `status` dio el directorio de datos dentro del home temporal; no se abrió ningún perfil real.
+- El modelo se bajó una vez, en una corrida aparte que no se mide, y se movió de un home al siguiente. Todas las corridas medidas arrancan con el modelo en disco.
+- **Hilos:** las entradas de `/proc/<pid>/task`, leídas en cada marca. El `pid` es el de `/health` y coincide con el proceso de `serve`, así que el binario no se renombra.
+- **CPU:** usuario + sistema del proceso, los campos 14 y 15 de `/proc/<pid>/stat` divididos por `CLK_TCK` (100). Es el acumulado exacto del proceso, con los hilos que ya terminaron, en pasos de 0,01 s. En Windows era la integral de porcentajes leídos cada segundo.
+- **Memoria:** `RssAnon` de `/proc/<pid>/status`, las páginas anónimas residentes. No es la misma medida que los privados de Windows, que cuentan la memoria comprometida esté residente o no, así que las cifras no se comparan entre plataformas.
+- Además de las marcas, un muestreo de `/proc` cada segundo da los rangos dentro de cada fase. Leer `/proc` no gasta CPU del daemon.
+- Cada guardado es un `POST /v1/memories` de unas 30 palabras, de 205 a 253 caracteres: una cabecera única y 26 palabras al azar de un vocabulario de unas 90. Las 5 tandas dieron 20 de 20 con `201`, cada guardado quedó en una sola pieza y `pending` volvió a 0. Como los textos comparten vocabulario, el detector de contradicciones registró conflictos entre ellos.
+- Los registros crudos no se conservan en git.
+
+### 2.1 Hilos vivos
+
+`CLAWG_EMBEDDER_IDLE_MINUTES=1`. La lectura 1 llega con `embedder` en `loading`, a 0 s de uptime, antes de que se lea el tokenizer. El modelo se soltó 75 s después de que `pending` volviera a 0 en las dos corridas (74,9 y 75,0 s, mirando `/health` cada segundo).
+
+| Momento | Normal: hilos | Normal: `RssAnon` | Control `TOKENIZERS_PARALLELISM=false`: hilos | Control: `RssAnon` |
+|---|---|---|---|---|
+| 1. Al arrancar, modelo cargando | 9 | 22,0 MiB | 9 | 21,9 MiB |
+| 2. 15 s después de `ready` | 10 | 804,6 MiB | 10 | 804,6 MiB |
+| 3. 15 s después de 20 guardados | 14 | 805,4 MiB | 10 | 805,3 MiB |
+| 4. 15 s después de soltar el modelo | **10** | 330,5 MiB | **6** | 330,5 MiB |
+| 5. 60 s más tarde | 10 | 330,5 MiB | 6 | 330,6 MiB |
+
+En el muestreo de cada segundo, el recuento oscila en 1 hilo dentro de cada fase: con el modelo suelto, 10-11 en la normal y 6-7 en el control; con el modelo cargado después de la tanda, 14-15 y 10-11.
+
+- **El grupo de `rayon` deja 4 hilos con el modelo suelto**, los mismos que lógicos tiene la máquina, como los 16 de Windows. Aparecen con la primera tanda: el control no sube.
+- **Soltar el modelo quita 4 hilos en las dos variantes**, de 14 a 10 y de 10 a 6. Es compatible con `embedder-worker` más 3 del grupo de ONNX Runtime (la sesión pide 4 hilos de intra-op y uno es el que llama), sin atribuir hilo por hilo. Entre las lecturas 1 y 2 el recuento sólo sube de 9 a 10 porque durante la carga llega a 13, y los hilos de arranque se van en los 10 s siguientes.
+- **El tokenizer paralelo no mueve la memoria.** Normal y control difieren en 0,1 MiB o menos en cada lectura. Soltar el modelo baja `RssAnon` unos 475 MiB en las dos.
+- Los 20 guardados tardaron 0,749 s en la corrida normal y 0,724 s en el control. En las tres repeticiones de 2.2, 0,664, 0,759 y 0,757 s.
+
+**C abre** también en Linux por el umbral fijado: con el modelo suelto, la normal tiene 4 hilos más que el control de forma sostenida, 10 contra 6 en las dos lecturas y 10-11 contra 6-7 en el muestreo. Coincide con Windows.
+
+### 2.2 CPU en reposo
+
+`CLAWG_EMBEDDER_IDLE_MINUTES=0`, tokenizer sin tocar. Cada repetición es un daemon nuevo en un home nuevo. El reposo empieza 30 s después de `embedder: ready`, sin ninguna inferencia hecha todavía. La ventana «tras la tanda» empieza al ver `pending` en 0 después del último guardado.
+
+| Repetición | Reposo, 60 s | Tras la tanda, 60 s | Diferencia | Los 60 s siguientes | Primeros 10 s tras la tanda |
+|---|---|---|---|---|---|
+| 1 | 0,01 s | 0,02 s | +0,01 s | 0,01 s | 0,01 s |
+| 2 | 0,01 s | 0,01 s | 0,00 s | 0,02 s | 0,00 s |
+| 3 | 0,01 s | 0,01 s | 0,00 s | 0,00 s | 0,00 s |
+
+**Mediana de la diferencia: 0,00 s**, contra un umbral de +0,6 s. **A no abre por 2.2** en Linux, y coincide con Windows. Cada ventana está entre 0 y 2 pasos de 0,01 s, así que la diferencia queda por debajo de lo que esta lectura resuelve. Durante las ventanas había 14 hilos vivos, los 4 de `rayon` entre ellos.
+
+Límites de esta lectura:
+
+- La ventana de reposo no tiene ninguna petición al daemon. La de tras la tanda y la siguiente tienen cada una una petición a `/health` en su primer instante, la de la lectura de la marca. Si pesa, sube la ventana tras la tanda.
+- El reposo en Linux es 0,01 s en 60 s; en Windows fue de 0,161 a 0,316 s. Los métodos no son los mismos y la diferencia no se atribuye.
+- Los tres límites de la lectura de Windows valen igual acá: no mide la espera activa durante un refresco, las tandas no son de pasajes largos y es un build debug.
+
+### Lo raro
+
+- **En Linux un hilo nuevo hereda el nombre del que lo crea, así que contar por nombre no separa los grupos.** Los 4 de `rayon` se llaman `embedder-worker`. Los 3 que se van con el modelo junto con `embedder-worker` se llaman `tokio-rt-worker`, porque la carga corre en un hilo de bloqueo de tokio. En la repetición 1 de 2.2, esos 3 tenían 0 s de CPU antes de la tanda y de 0,11 a 0,16 s cada uno después; `embedder-worker`, 0,29 s, y los 4 de `rayon`, 0 s cada uno.
+- **Con el modelo suelto, `RssAnon` queda en 330,5 MiB** en las dos variantes. La lectura 1 (22 MiB) es anterior a leer el tokenizer, así que no sirve de base para saber cuánto queda del modelo.
+
 ## Lo que esto corrige de la exploración
 
 - **`window_encodings` ya no es el único llamador de `encode_batch`.** También lo llama `TokenSplitter::count_all` (`crates/clawg-core/src/memory/chunker/token_splitter.rs:57`), que está hecho para repartir la tanda entre los núcleos. `set_parallelism(false)` cambiaría los dos.
 
 ## Pendiente
 
-- 2.1 y 2.2 en Linux.
 - 2.3 a 2.7, con sus umbrales fijados antes de medir.

@@ -12,8 +12,8 @@ artifacts:
   verify: pending
   archive: pending
 gates:
-  C: open  # 2.1 en Windows: 16 hilos de rayon vivos con el modelo suelto; falta Linux
-  A: pending  # 2.2 en Windows no abre (mediana -0,073 s, umbral +0,6 s); falta Linux y la CPU total de 2.3
+  C: open  # 2.1: con el modelo suelto quedan vivos los hilos de rayon, tantos como lógicos: 16 en Windows y 4 en Linux
+  A: pending  # 2.2 no abre en Windows (mediana -0,073 s) ni en Linux (mediana 0,00 s), umbral +0,6 s; falta la CPU total de 2.3
   B: pending  # 2.3 y 2.4: CPU, pared y p99 de búsqueda con menos hilos
   E: pending  # 2.5: tiempo de la triple codificación de split_save
   arena: pending  # 2.4: p99 de búsqueda con 1 y 2 arenas de malloc
