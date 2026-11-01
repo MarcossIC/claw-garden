@@ -12,9 +12,21 @@
 //! 0.71, below the cosine floor; two of one topic near 0.49; two of one claim
 //! near 0.32, inside the dispute band of the contradiction detector.
 
-use crate::memory::contradiction::{CONTRADICTION_THRESHOLD, NEAR_DUPLICATE_FLOOR};
+use std::collections::HashMap;
+
+use rusqlite::params;
+
+use crate::memory::clock::TimestampMs;
+use crate::memory::contradiction::{detect_contradiction, CONTRADICTION_THRESHOLD, NEAR_DUPLICATE_FLOOR};
+use crate::memory::score::ScoringConfig;
+use crate::memory::search::{memory_project_predicate, reach_predicate, reader_bind, search_all_memories, SearchScope};
 use crate::memory::sharing::{Reach, Reader};
+use crate::memory::store_insert::MemoryType;
+use crate::memory::store_lock::StoreHolder;
 use crate::memory::vector::{to_unit, EMBEDDING_DIM};
+use crate::memory::{MemoryStore, TableKind};
+use crate::metrics::SeriesKey;
+use crate::test_dir::{test_dir, TestDir};
 
 /// The squared weights of the directions a vector is the sum of. A row with
 /// no claim of its own to share puts the weight of the claim into its noise.
@@ -38,6 +50,17 @@ const ONE_IN: usize = 20;
 /// kind it asks about in each.
 const QUERY_PROJECTS: usize = 5;
 const TOPICS_PER_KIND: usize = 20;
+
+/// What a search asks of the `memory` KNN (`SearchScope::all_default`,
+/// which [`search`] checks), and the `limit` a search and `recall_context`
+/// get by default (`DEFAULT_SEARCH_LIMIT` of the daemon, `K_FINAL` of
+/// `prompt_builder.rs`).
+const POOL: usize = 30;
+const LIMIT: usize = 10;
+/// `CANDIDATE_POOL` of `contradiction.rs`, which a probe without siblings
+/// asks for; a test holds the two together.
+const DETECTOR_POOL: usize = 5;
+const DAY_MS: i64 = 86_400_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reading {
@@ -108,6 +131,19 @@ fn agent_id(agent: usize) -> String {
     format!("a{agent}")
 }
 
+fn project_id(project: usize) -> String {
+    format!("p{project}")
+}
+
+/// Every row states something, so the detector weighs every one.
+fn memory_type(row: &Row) -> MemoryType {
+    if row.preference {
+        MemoryType::UserPreference
+    } else {
+        MemoryType::SemanticFact
+    }
+}
+
 impl Shape {
     /// The reader every search and probe runs as: `a0`, under the reading
     /// of the shape.
@@ -176,9 +212,21 @@ struct Builder {
     claims: usize,
     plain: usize,
     rows: Vec<Row>,
+    queries: Vec<Query>,
+    probes: Vec<Query>,
 }
 
 impl Builder {
+    fn new(seed: u64) -> Self {
+        let mut rng = SplitMix64(seed);
+        let global = rng.direction();
+        Builder { rng, global, topics: Vec::new(), claims: 0, plain: 0, rows: Vec::new(), queries: Vec::new(), probes: Vec::new() }
+    }
+
+    fn corpus(self) -> Corpus {
+        Corpus { rows: self.rows, queries: self.queries, probes: self.probes }
+    }
+
     fn topic(&mut self) -> usize {
         let direction = self.rng.direction();
         self.topics.push(direction);
@@ -235,17 +283,13 @@ fn lay_out(shape: Shape, seed: u64) -> Corpus {
     let per_project: Vec<usize> =
         (0..projects).map(|p| in_projects / projects + usize::from(p < in_projects % projects)).collect();
 
-    let mut rng = SplitMix64(seed);
-    let global = rng.direction();
-    let mut b = Builder { rng, global, topics: Vec::new(), claims: 0, plain: 0, rows: Vec::with_capacity(shape.rows) };
+    let mut b = Builder::new(seed);
     let shared: Vec<usize> = (0..(per_project[0] / 2).div_ceil(BLOCK).max(1)).map(|_| b.topic()).collect();
     let own: Vec<Vec<usize>> = per_project
         .iter()
         .map(|n| (0..(n - n / 2).div_ceil(BLOCK).max(1)).map(|_| b.topic()).collect())
         .collect();
     let searched = projects.min(QUERY_PROJECTS);
-    let mut queries = Vec::new();
-    let mut probes = Vec::new();
 
     let lengths = CHAIN_LENGTHS.iter().flat_map(|&n| std::iter::repeat_n(n, CHAINS_PER_LENGTH));
     for (c, length) in lengths.enumerate() {
@@ -274,10 +318,16 @@ fn lay_out(shape: Shape, seed: u64) -> Corpus {
             version(&mut b, true);
         }
         let live = version(&mut b, false);
-        for list in [&mut queries, &mut probes] {
-            let vector = b.vector(topic, Some(&direction));
-            list.push(Query { kind: Kind::Chain(length), project, claim: Some(claim), live: Some(live), vector });
-        }
+        let query = |b: &mut Builder| Query {
+            kind: Kind::Chain(length),
+            project,
+            claim: Some(claim),
+            live: Some(live),
+            vector: b.vector(topic, Some(&direction)),
+        };
+        let (search, probe) = (query(&mut b), query(&mut b));
+        b.queries.push(search);
+        b.probes.push(probe);
     }
 
     for j in 0..REPEATED_CLAIMS {
@@ -301,7 +351,7 @@ fn lay_out(shape: Shape, seed: u64) -> Corpus {
         }
         for project in 0..searched {
             let vector = b.vector(topic, Some(&direction));
-            probes.push(Query { kind: Kind::Repeated, project, claim: Some(claim), live: None, vector });
+            b.probes.push(Query { kind: Kind::Repeated, project, claim: Some(claim), live: None, vector });
         }
     }
 
@@ -324,11 +374,11 @@ fn lay_out(shape: Shape, seed: u64) -> Corpus {
         let topics = topics.chain(shared.iter().take(TOPICS_PER_KIND).map(|&t| (Kind::SharedTopic, t)));
         for (kind, topic) in topics.collect::<Vec<_>>() {
             let vector = b.vector(topic, None);
-            queries.push(Query { kind, project, claim: None, live: None, vector });
+            b.queries.push(Query { kind, project, claim: None, live: None, vector });
         }
     }
 
-    Corpus { rows: b.rows, queries, probes }
+    b.corpus()
 }
 
 /// Whether `reader`, searching from `project`, may receive `row`: the
@@ -354,6 +404,229 @@ fn loss(reference: &[i64], got: &[i64]) -> Option<f64> {
 fn quantile(sorted: &[f64], q: f64) -> f64 {
     let rank = (q * sorted.len() as f64).ceil() as usize;
     sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// A corpus in a store of its own under the system temp dir, and the id
+/// each row got.
+struct Seeded {
+    store: MemoryStore,
+    ids: Vec<i64>,
+    rows: HashMap<i64, usize>,
+    _dir: TestDir,
+}
+
+const INSERT_ROW: &str = "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source, created_at, \
+     created_by_type, created_by_ref, last_modified_at, last_accessed_at, importance, tier, status, deleted_at) \
+     VALUES ('agent', ?1, ?2, ?3, ?4, 'chat', ?5, 'user', ?1, ?5, ?5, 5.0, 3, ?6, ?7)";
+
+fn bytes(vector: &[f32]) -> Vec<u8> {
+    vector.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Writes `corpus` in one transaction. Every row gets the same importance,
+/// tier and age, and an age a day ahead of the clock a search reads leaves
+/// every decay at exactly 1 (`score.rs` clamps the age at 0): the score of a
+/// row is its distance alone. A deleted row has no vector, as a delete leaves
+/// it.
+async fn seed(corpus: &Corpus) -> Seeded {
+    let dir = test_dir();
+    let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.expect("a store in the test dir");
+    let at = TimestampMs::now().as_millis_i64() + DAY_MS;
+    let rows: Vec<_> = corpus
+        .rows
+        .iter()
+        .map(|r| {
+            let status = if r.superseded { "superseded" } else { "active" };
+            (agent_id(r.agent), r.project.map(project_id), memory_type(r).as_str(), status, (!r.deleted).then(|| bytes(&r.vector)))
+        })
+        .collect();
+    let ids = store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<i64>> {
+            let tx = c.transaction()?;
+            let mut ids = Vec::with_capacity(rows.len());
+            {
+                let mut insert_row = tx.prepare_cached(INSERT_ROW)?;
+                let mut insert_vector = tx.prepare_cached("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)")?;
+                for (i, (agent, project, memory_type, status, vector)) in rows.into_iter().enumerate() {
+                    let deleted = vector.is_none().then_some(at);
+                    insert_row.execute(params![agent, project, format!("row {i}"), memory_type, at, status, deleted])?;
+                    let id = tx.last_insert_rowid();
+                    if let Some(vector) = vector {
+                        insert_vector.execute(params![id, vector])?;
+                    }
+                    ids.push(id);
+                }
+            }
+            tx.commit()?;
+            Ok(ids)
+        })
+        .await
+        .expect("the corpus is written");
+    let rows = ids.iter().enumerate().map(|(row, &id)| (id, row)).collect();
+    Seeded { store, ids, rows, _dir: dir }
+}
+
+impl Seeded {
+    /// Closes the store before its directory goes, so nothing is left behind.
+    async fn close(self) {
+        self.store.conn.clone().close().await.expect("the store closes");
+    }
+}
+
+/// What a search or a probe returned, and what it cost.
+#[derive(Debug)]
+struct Ran {
+    ids: Vec<i64>,
+    /// Whether the `memory` KNN ran its second, wider pass.
+    retried: bool,
+    /// Microseconds of the whole search and of its `memory` KNN arm.
+    total_us: u64,
+    knn_us: u64,
+}
+
+/// What the recorder of `store` holds of the one search since the last
+/// read, which empties it: `search.knn_retry` and `search.duration`.
+fn ran(store: &MemoryStore, ids: Vec<i64>) -> Ran {
+    let window = store.metrics().take_minute();
+    let retried = window.gauges.contains_key(&SeriesKey::new("search.knn_retry", &[("table", "memory")]));
+    let took = |arm| window.histograms.get(&SeriesKey::new("search.duration", &[("arm", arm)])).map_or(0, |h| h.sum());
+    Ran { ids, retried, total_us: took("total"), knn_us: took("knn_memory") }
+}
+
+/// A search as the daemon runs it (`search` in `daemon/api.rs`): the default
+/// scope from `project` with the reach of `reader`, asking for the whole pool
+/// so a cut at any `limit` reads its first rows. No text, so no lexical
+/// channel: what is measured is the dense window.
+async fn search(store: &MemoryStore, reader: &Reader, project: usize, vector: &[f32]) -> Ran {
+    let scope = SearchScope::all_default().with_project(Some(&project_id(project))).with_reach(reader.reach.clone());
+    assert_eq!(scope.memory, Some(POOL), "the reference is cut at the pool a search asks for");
+    store.metrics().take_minute();
+    let hits = search_all_memories(store, vector, None, &reader.agent_id, scope, POOL).await.expect("the search runs");
+    ran(store, hits.into_iter().filter(|h| h.kind == TableKind::Memory).map(|h| h.id).collect())
+}
+
+/// A probe of the detector as a save without a key or siblings runs it.
+async fn probe(store: &MemoryStore, reader: &Reader, project: usize, vector: &[f32]) -> Ran {
+    store.metrics().take_minute();
+    let project = project_id(project);
+    let found = detect_contradiction(store, vector, "", reader, Some(&project), MemoryType::SemanticFact, &[]).await;
+    ran(store, found.into_iter().map(|(_, c)| c.id).collect())
+}
+
+/// The nearest rows `reader` may receive from `project`, at most `limit`,
+/// with the distance vec0 gives, from every row: what a window nothing
+/// crowded would hold. It reads the predicates of the search through the
+/// same macros, so the two cannot drift apart.
+const EXACT_SQL: &str = concat!(
+    "SELECT m.id, vec_distance_l2(v.embedding, ?1) AS distance
+     FROM memory m JOIN memory_vectors v ON v.rowid = m.id
+     WHERE m.status IN ('active', 'disputed')
+       AND m.deleted_at IS NULL
+       AND ",
+    reach_predicate!("m.agent_id", "?2"),
+    "
+       AND ",
+    memory_project_predicate!("m.", "?3"),
+    "
+     ORDER BY distance, m.id
+     LIMIT ?4"
+);
+
+async fn exact(store: &MemoryStore, reader: &Reader, project: usize, vector: &[f32], limit: usize) -> Vec<(i64, f64)> {
+    // The search turns its query into a unit vector before vec0 sees it.
+    let query = bytes(&to_unit(vector).expect("a query of the layout is usable"));
+    let reach = reader_bind(Some(reader));
+    let project = project_id(project);
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<Vec<(i64, f64)>> {
+            let mut stmt = c.prepare_cached(EXACT_SQL)?;
+            let rows = stmt.query_map(params![query, reach, project, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        })
+        .await
+        .expect("the exact query runs")
+}
+
+/// [`EXACT_SQL`] worked out from the layout alone: [`eligible`] and [`l2`].
+fn pure_reference(corpus: &Corpus, ids: &[i64], reader: &Reader, project: usize, vector: &[f32], limit: usize) -> Vec<(i64, f64)> {
+    let query = to_unit(vector).expect("a query of the layout is usable");
+    let mut near: Vec<(i64, f64)> = corpus
+        .rows
+        .iter()
+        .zip(ids)
+        .filter(|(row, _)| eligible(row, reader, project))
+        .map(|(row, &id)| (id, l2(&query, &row.vector)))
+        .collect();
+    near.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    near.truncate(limit);
+    near
+}
+
+/// The L2 distance under which a row scores above 0: the cosine floor of the
+/// default scoring, between unit vectors.
+fn floor_distance() -> f64 {
+    let floor = ScoringConfig::DEFAULT.cosine_floor.expect("the default scoring has a cosine floor");
+    (2.0 * (1.0 - floor)).sqrt()
+}
+
+/// A search against its reference.
+struct Searched {
+    kind: Kind,
+    /// The share of the reference at [`LIMIT`] and at [`POOL`] the search did
+    /// not return; none when no eligible row scores above 0.
+    loss10: Option<f64>,
+    loss30: Option<f64>,
+    /// Where the live version of a chain came, from 1; none when it did not.
+    live_rank: Option<usize>,
+    ran: Ran,
+}
+
+/// A probe of the detector against its reference.
+struct Probed {
+    kind: Kind,
+    /// The candidates of the reference, and how many of them the probe missed.
+    reference: usize,
+    missed: usize,
+    ran: Ran,
+}
+
+struct Measured {
+    searches: Vec<Searched>,
+    probes: Vec<Probed>,
+}
+
+/// Runs every search and probe of `corpus` as `reader` and holds each against
+/// the exact nearest rows. With every score down to the distance, the
+/// reference of a search is the rows a window nothing crowded would rank
+/// first, past those scoring 0, and the reference of a probe is the pool of
+/// the detector over the eligible rows, through its band and its types.
+async fn measure(seeded: &Seeded, corpus: &Corpus, reader: &Reader) -> Measured {
+    let floor = floor_distance();
+    let mut searches = Vec::with_capacity(corpus.queries.len());
+    for query in &corpus.queries {
+        let ran = search(&seeded.store, reader, query.project, &query.vector).await;
+        let near = exact(&seeded.store, reader, query.project, &query.vector, POOL).await;
+        let scored: Vec<i64> = near.iter().filter(|n| n.1 < floor).map(|n| n.0).collect();
+        let at = |limit: usize| loss(&scored[..scored.len().min(limit)], &ran.ids[..ran.ids.len().min(limit)]);
+        let live_rank = query.live.and_then(|row| ran.ids.iter().position(|&id| id == seeded.ids[row]).map(|p| p + 1));
+        searches.push(Searched { kind: query.kind, loss10: at(LIMIT), loss30: at(POOL), live_rank, ran });
+    }
+    let band = f64::from(NEAR_DUPLICATE_FLOOR)..f64::from(CONTRADICTION_THRESHOLD);
+    let mut probes = Vec::with_capacity(corpus.probes.len());
+    for query in &corpus.probes {
+        let ran = probe(&seeded.store, reader, query.project, &query.vector).await;
+        let near = exact(&seeded.store, reader, query.project, &query.vector, DETECTOR_POOL).await;
+        let candidates: Vec<i64> = near
+            .iter()
+            .filter(|(id, d)| band.contains(d) && memory_type(&corpus.rows[seeded.rows[id]]).is_claim_bearing())
+            .map(|n| n.0)
+            .collect();
+        let missed = candidates.iter().filter(|id| !ran.ids.contains(id)).count();
+        probes.push(Probed { kind: query.kind, reference: candidates.len(), missed, ran });
+    }
+    Measured { searches, probes }
 }
 
 #[cfg(test)]
@@ -485,6 +758,161 @@ mod tests {
         assert_eq!(loss(&reference, &got), Some(0.3));
         assert_eq!(loss(&reference, &reference), Some(0.0));
         assert_eq!(loss(&[], &got), None);
+    }
+
+    /// `topics` topics of `per_topic` rows each, all `a0`'s in `p0`, and a
+    /// search of each topic.
+    fn one_reader(seed: u64, topics: usize, per_topic: usize) -> Builder {
+        let mut b = Builder::new(seed);
+        for _ in 0..topics {
+            let topic = b.topic();
+            for _ in 0..per_topic {
+                b.plain(0, Some(0), topic);
+            }
+            let vector = b.vector(topic, None);
+            b.queries.push(Query { kind: Kind::OwnTopic, project: 0, claim: None, live: None, vector });
+        }
+        b
+    }
+
+    #[tokio::test]
+    async fn the_exact_query_returns_the_pure_reference() {
+        let corpus = lay_out(SMALL, 7);
+        let seeded = seed(&corpus).await;
+        let reader = SMALL.reader();
+        for query in corpus.queries.iter().chain(&corpus.probes).step_by(3) {
+            let sql = exact(&seeded.store, &reader, query.project, &query.vector, POOL).await;
+            let pure = pure_reference(&corpus, &seeded.ids, &reader, query.project, &query.vector, POOL);
+            let ids = |near: &[(i64, f64)]| near.iter().map(|n| n.0).collect::<Vec<_>>();
+            assert_eq!(ids(&sql), ids(&pure), "{:?} from p{}", query.kind, query.project);
+            for ((_, a), (_, b)) in sql.iter().zip(&pure) {
+                assert!((a - b).abs() < 1e-5, "{a} against {b}");
+            }
+        }
+        seeded.close().await;
+    }
+
+    #[tokio::test]
+    async fn without_foreign_rows_nothing_is_lost_in_one_pass() {
+        let corpus = one_reader(11, 3, BLOCK).corpus();
+        let seeded = seed(&corpus).await;
+        let reader = Reader::new(agent_id(0), Reach::AllBut(Vec::new()));
+        let measured = measure(&seeded, &corpus, &reader).await;
+        assert_eq!(measured.searches.len(), 3);
+        for searched in &measured.searches {
+            assert_eq!((searched.loss10, searched.loss30), (Some(0.0), Some(0.0)));
+            assert!(!searched.ran.retried, "a window of eligible rows needs no second pass");
+            assert!(searched.ran.total_us > 0 && searched.ran.knn_us > 0);
+        }
+        seeded.close().await;
+    }
+
+    #[tokio::test]
+    async fn rows_past_the_widened_window_are_counted_lost() {
+        // The reader's 40 rows of the topic sit near 0.49 from the query, and
+        // 200 rows of another project state the query's own claim, near 0.32.
+        let mut b = one_reader(13, 1, BLOCK);
+        let topic = b.rows[0].topic;
+        let (claim, direction) = b.claim();
+        for _ in 0..200 {
+            let vector = b.vector(topic, Some(&direction));
+            b.push(Row {
+                agent: 0,
+                project: Some(1),
+                topic,
+                claim: Some(claim),
+                preference: false,
+                superseded: false,
+                deleted: false,
+                vector,
+            });
+        }
+        b.queries[0].vector = b.vector(topic, Some(&direction));
+        let corpus = b.corpus();
+        let seeded = seed(&corpus).await;
+        let reader = Reader::new(agent_id(0), Reach::AllBut(Vec::new()));
+        let measured = measure(&seeded, &corpus, &reader).await;
+        let searched = &measured.searches[0];
+        assert!(searched.ran.retried, "a crowded window runs its second pass");
+        assert_eq!(searched.loss30, Some(1.0), "the 120 rows of the wider window are all the other project's");
+        seeded.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_live_version_behind_its_revisions_is_found_first() {
+        // Ten superseded versions and the live one are the eleven rows nearest
+        // the claim; the wider passes of the search (120) and the detector
+        // (20) both reach past them.
+        let mut b = one_reader(19, 1, BLOCK);
+        b.queries.clear();
+        let topic = b.rows[0].topic;
+        let (claim, direction) = b.claim();
+        let mut live = 0;
+        for superseded in std::iter::repeat_n(true, 10).chain([false]) {
+            let vector = b.vector(topic, Some(&direction));
+            live = b.push(Row {
+                agent: 0,
+                project: Some(0),
+                topic,
+                claim: Some(claim),
+                preference: false,
+                superseded,
+                deleted: false,
+                vector,
+            });
+        }
+        let query = |b: &mut Builder| Query {
+            kind: Kind::Chain(10),
+            project: 0,
+            claim: Some(claim),
+            live: Some(live),
+            vector: b.vector(topic, Some(&direction)),
+        };
+        let (search, probe) = (query(&mut b), query(&mut b));
+        b.queries.push(search);
+        b.probes.push(probe);
+        let corpus = b.corpus();
+        let seeded = seed(&corpus).await;
+        let reader = Reader::new(agent_id(0), Reach::AllBut(Vec::new()));
+        let measured = measure(&seeded, &corpus, &reader).await;
+        let (searched, probed) = (&measured.searches[0], &measured.probes[0]);
+        assert_eq!((searched.kind, searched.live_rank), (Kind::Chain(10), Some(1)));
+        assert!(searched.ran.retried, "the superseded versions crowd the first window");
+        assert_eq!((probed.kind, probed.reference, probed.missed), (Kind::Chain(10), 1, 0));
+        assert_eq!(probed.ran.ids, vec![seeded.ids[live]]);
+        seeded.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_detector_reference_keeps_the_pool_of_the_detector() {
+        // Seven rows of one claim, all eligible and inside the band: the
+        // detector weighs as many as its pool, and so must its reference.
+        let mut b = Builder::new(17);
+        let topic = b.topic();
+        let (claim, direction) = b.claim();
+        for _ in 0..7 {
+            let vector = b.vector(topic, Some(&direction));
+            b.push(Row {
+                agent: 0,
+                project: Some(0),
+                topic,
+                claim: Some(claim),
+                preference: false,
+                superseded: false,
+                deleted: false,
+                vector,
+            });
+        }
+        let vector = b.vector(topic, Some(&direction));
+        b.probes.push(Query { kind: Kind::Repeated, project: 0, claim: Some(claim), live: None, vector });
+        let corpus = b.corpus();
+        let seeded = seed(&corpus).await;
+        let reader = Reader::new(agent_id(0), Reach::AllBut(Vec::new()));
+        let measured = measure(&seeded, &corpus, &reader).await;
+        let probed = &measured.probes[0];
+        assert_eq!((probed.reference, probed.missed), (DETECTOR_POOL, 0));
+        assert_eq!(probed.ran.ids.len(), DETECTOR_POOL);
+        seeded.close().await;
     }
 
     #[test]
