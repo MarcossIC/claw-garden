@@ -4,7 +4,7 @@
 |---|---|---|---|
 | medición (transversal) | S | — | exploración (borrador) |
 
-**Tesis:** `search.duration` por brazo no mide lo que dice. Los tres KNN y el canal léxico arrancan su reloj casi juntos y se encolan en la misma conexión, así que cada brazo suma lo que tardaron los anteriores. knn-prefilter y read-connections deciden con mediciones de esta búsqueda, por eso este cambio va antes que ellos.
+**Tesis:** `search.duration` por brazo no mide lo que dice. Los tres KNN y el canal léxico arrancan su reloj casi juntos y se encolan en la misma conexión, así que cada brazo suma lo que tardaron los anteriores. read-connections decide con mediciones de esta búsqueda, por eso este cambio va antes. knn-prefilter no: su puerta se lee por pérdidas, y la latencia que informa es la de `total` y la de `knn_memory`, el primer brazo de la cola, en búsquedas que corren solas y sin canal léxico ([su verify](../knn-prefilter/verify.md), después de la tabla de la segunda pasada).
 
 ## Problema (verificado contra el código)
 
@@ -56,5 +56,6 @@ Sin medir: cuánto se desvía en una base real. La conclusión sale de leer el c
 
 ## Interacciones
 
-- **knn-prefilter y read-connections:** leen estas series en sus puertas de medición. Con los números de hoy, `knn_skill` parece caro por lo que costó `knn_memory`.
+- **read-connections:** lee estas series en su puerta de medición. Con los números de hoy, `knn_skill` parece caro por lo que costó `knn_memory`.
+- **knn-prefilter:** no decide con estas series. Su puerta se lee por pérdidas, K1 cronometra cada consulta dentro del hilo de la conexión, y sus latencias son las de `total` y `knn_memory`, el primer brazo de la cola, en búsquedas que corren solas y sin canal léxico ([su verify](../knn-prefilter/verify.md), después de la tabla de la segunda pasada).
 - **retire-legacy-kinds:** saca dos de los brazos. El test no debería depender de ellos.
