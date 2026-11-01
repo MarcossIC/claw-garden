@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| medición (transversal) | S | — | exploración (borrador) |
+| medición (transversal) | S | — | exploración cerrada; sigue en la [propuesta](proposal.md) |
 
 **Tesis:** `search.duration` por brazo no mide lo que dice. Los tres KNN y el canal léxico arrancan su reloj casi juntos y se encolan en la misma conexión, así que cada brazo suma lo que tardaron los anteriores. read-connections decide con mediciones de esta búsqueda, por eso este cambio va antes. knn-prefilter no: su puerta se lee por pérdidas, y la latencia que informa es la de `total` y la de `knn_memory`, el primer brazo de la cola, en búsquedas que corren solas y sin canal léxico ([su verify](../knn-prefilter/verify.md), después de la tabla de la segunda pasada).
 
