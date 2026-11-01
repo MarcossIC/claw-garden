@@ -1,0 +1,14 @@
+change: core-use-cases
+objective: "transversal"
+depends_on: [memory-module-layout]
+phase: explore
+artifacts:
+  exploration: draft
+  proposal: pending
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-11-01
