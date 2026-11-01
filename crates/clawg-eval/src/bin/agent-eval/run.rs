@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -35,11 +35,18 @@ pub const CLAWG_LOG: &str = "clawg.log";
 /// migration and binds before it publishes itself.
 const START_BUDGET: Duration = Duration::from_secs(60);
 
+/// How long a daemon that listens may take to have its model ready: on its
+/// first start in a run's home it downloads the model before it loads it.
+const READY_BUDGET: Duration = Duration::from_secs(15 * 60);
+
 /// How long the daemon may take to go once `clawg stop`, which already waits
 /// for it, has returned.
 const EXIT_BUDGET: Duration = Duration::from_secs(10);
 
 const POLL: Duration = Duration::from_millis(50);
+
+/// Between two `clawg status`, each a process of its own.
+const STATUS_POLL: Duration = Duration::from_millis(250);
 
 /// Who plays the session of a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,14 +191,18 @@ pub enum RunError {
         .0.display()
     )]
     NotIsolated(PathBuf),
-    #[error("the daemon of the run exited with {code:?} before it listened; see {}", .log.display())]
-    DaemonExited { code: Option<i32>, log: PathBuf },
+    #[error("the daemon of the run exited with {code:?} before {before}; see {}", .log.display())]
+    DaemonExited { code: Option<i32>, before: &'static str, log: PathBuf },
     #[error("the daemon of the run did not publish {} within {}s; see {}", .state_file.display(), START_BUDGET.as_secs(), .log.display())]
     DaemonSilent { state_file: PathBuf, log: PathBuf },
+    #[error("the daemon of the run did not have its model ready within {}s; see {}", READY_BUDGET.as_secs(), .0.display())]
+    ModelNotReady(PathBuf),
+    #[error("the daemon of the run cannot load its model: {error}; see {}", .log.display())]
+    ModelFailed { error: String, log: PathBuf },
     #[error("the daemon of the run was still there after `clawg stop` and was ended; see {}", .0.display())]
     DaemonStayed(PathBuf),
-    #[error("`{command}` exited with {code:?}; see {}", .log.display())]
-    Step { command: String, code: Option<i32>, log: PathBuf },
+    #[error("`{command}` exited with {code:?} ({said}); see {}", .log.display())]
+    Step { command: String, code: Option<i32>, said: String, log: PathBuf },
     #[error("the client exited with {code:?}; see {}", .log.display())]
     Client { code: Option<i32>, log: PathBuf },
     #[error("the run asks for {program} {expected}, and `{program} --version` reports {}", .found.as_deref().unwrap_or("no version"))]
@@ -341,10 +352,9 @@ pub fn execute(root: &Path, agent_eval: &Path) -> Result<(), RunError> {
     served.listening(&daemon.state_file)?;
     let log_path = root.join(CLAWG_LOG);
     let mut log = File::create(&log_path).map_err(io(&log_path))?;
-    let session = plan
-        .before
-        .iter()
-        .try_for_each(|step| run_step(step, &plan.env, root, &mut log, &log_path))
+    let session = served
+        .ready(&daemon.status, &plan.env, root, &mut log, &log_path)
+        .and_then(|()| plan.before.iter().try_for_each(|step| run_step(step, &plan.env, root, &mut log, &log_path)))
         .and_then(|()| client_ran(start_client(&plan, &layout, client)?, root));
     let stopped = plan.after.iter().try_for_each(|step| run_step(step, &plan.env, root, &mut log, &log_path));
     let gone = served.gone_within(EXIT_BUDGET);
@@ -368,24 +378,67 @@ fn client_ran(code: Option<i32>, root: &Path) -> Result<(), RunError> {
 /// Runs `step` to its end with the plan's variables, and appends its command
 /// line, what it printed and its exit code to `log`.
 fn run_step(step: &Step, env: &[(String, String)], root: &Path, log: &mut File, log_path: &Path) -> Result<(), RunError> {
-    let command = std::iter::once(&step.program).chain(&step.args).map(String::as_str).collect::<Vec<_>>().join(" ");
-    let output = Command::new(&step.program)
+    let output = captured(step, env, root)?;
+    write_output(log, log_path, step, &output)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let said = last_line(&output.stdout, &output.stderr).to_owned();
+        Err(RunError::Step { command: command_line(step), code: output.status.code(), said, log: log_path.to_owned() })
+    }
+}
+
+fn command_line(step: &Step) -> String {
+    std::iter::once(&step.program).chain(&step.args).map(String::as_str).collect::<Vec<_>>().join(" ")
+}
+
+fn captured(step: &Step, env: &[(String, String)], root: &Path) -> Result<Output, RunError> {
+    Command::new(&step.program)
         .args(&step.args)
         .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(root)
         .stdin(Stdio::null())
         .output()
-        .map_err(io(Path::new(&step.program)))?;
-    let code = output.status.code();
-    writeln!(log, "$ {command}")
+        .map_err(io(Path::new(&step.program)))
+}
+
+fn write_output(log: &mut File, log_path: &Path, step: &Step, output: &Output) -> Result<(), RunError> {
+    writeln!(log, "$ {}", command_line(step))
         .and_then(|()| log.write_all(&output.stdout))
         .and_then(|()| log.write_all(&output.stderr))
-        .and_then(|()| writeln!(log, "exit {code:?}\n"))
-        .map_err(io(log_path))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(RunError::Step { command, code, log: log_path.to_owned() })
+        .and_then(|()| writeln!(log, "exit {:?}\n", output.status.code()))
+        .map_err(io(log_path))
+}
+
+/// The last line a command that failed printed, its stderr first: the
+/// sentence that says why, so the error is read without opening the log.
+fn last_line<'a>(stdout: &'a [u8], stderr: &'a [u8]) -> &'a str {
+    let last = |bytes: &'a [u8]| std::str::from_utf8(bytes).ok().and_then(|text| text.lines().rev().map(str::trim).find(|l| !l.is_empty()));
+    last(stderr).or_else(|| last(stdout)).unwrap_or("")
+}
+
+/// What the output of `clawg status` says of the model of the daemon `pid`.
+#[derive(Debug, PartialEq, Eq)]
+enum Readiness {
+    Ready,
+    /// Loading, being downloaded, failed in a way the daemon retries, or no
+    /// answer from that daemon yet.
+    NotYet,
+    Failed(String),
+}
+
+fn readiness(status: &str, pid: u32) -> Readiness {
+    let Ok(status) = serde_json::from_str::<Value>(status) else { return Readiness::NotYet };
+    let health = &status["health"];
+    if health["pid"].as_u64() != Some(u64::from(pid)) {
+        return Readiness::NotYet;
+    }
+    match health["embedder"].as_str() {
+        Some("ready") => Readiness::Ready,
+        Some("failed") if health["embedder_retryable"] == Value::Bool(false) => {
+            Readiness::Failed(health["embedder_error"].as_str().unwrap_or("no reason given").to_owned())
+        }
+        _ => Readiness::NotYet,
     }
 }
 
@@ -449,12 +502,39 @@ impl Served {
                 return Ok(());
             }
             if let Some(status) = self.exited() {
-                return Err(RunError::DaemonExited { code: status.code(), log: self.log.clone() });
+                return Err(RunError::DaemonExited { code: status.code(), before: "it listened", log: self.log.clone() });
             }
             if Instant::now() >= deadline {
                 return Err(RunError::DaemonSilent { state_file: state_file.to_owned(), log: self.log.clone() });
             }
             std::thread::sleep(POLL);
+        }
+    }
+
+    /// Until `status` says its model is ready. The answer that decides, or
+    /// the last one, goes to `log`.
+    fn ready(&self, status: &Step, env: &[(String, String)], root: &Path, log: &mut File, log_path: &Path) -> Result<(), RunError> {
+        let deadline = Instant::now() + READY_BUDGET;
+        loop {
+            let output = captured(status, env, root)?;
+            let said = readiness(&String::from_utf8_lossy(&output.stdout), self.pid);
+            let exited = self.exited();
+            let late = Instant::now() >= deadline;
+            if said != Readiness::NotYet || exited.is_some() || late {
+                write_output(log, log_path, status, &output)?;
+            }
+            match said {
+                Readiness::Ready => return Ok(()),
+                Readiness::Failed(error) => return Err(RunError::ModelFailed { error, log: self.log.clone() }),
+                Readiness::NotYet => {}
+            }
+            if let Some(exit) = exited {
+                return Err(RunError::DaemonExited { code: exit.code(), before: "its model was ready", log: self.log.clone() });
+            }
+            if late {
+                return Err(RunError::ModelNotReady(log_path.to_owned()));
+            }
+            std::thread::sleep(STATUS_POLL);
         }
     }
 
@@ -653,6 +733,29 @@ mod tests {
             assert!(!holds(std::io::Cursor::new(b"xxCLAWG_TEST_HOMxCLAWG_TEST_"), needle, chunk).unwrap(), "chunk {chunk}");
             assert!(!holds(std::io::Cursor::new(b""), needle, chunk).unwrap());
         }
+    }
+
+    #[test]
+    fn the_model_is_ready_once_the_status_of_this_daemon_says_so() {
+        let status = |pid: u32, embedder: &str, extra: &str| {
+            format!(r#"{{"running": true, "profile": "dev", "health": {{"status": "ok", "pid": {pid}, "embedder": "{embedder}"{extra}}}}}"#)
+        };
+        assert_eq!(readiness(&status(42, "ready", ""), 42), Readiness::Ready);
+        assert_eq!(readiness(&status(42, "loading", ""), 42), Readiness::NotYet);
+        assert_eq!(readiness(&status(43, "ready", ""), 42), Readiness::NotYet, "another daemon's model");
+        let failed = r#", "embedder_error": "no model.onnx", "embedder_retryable": false"#;
+        assert_eq!(readiness(&status(42, "failed", failed), 42), Readiness::Failed("no model.onnx".into()));
+        let retried = r#", "embedder_error": "HTTP 503", "embedder_retryable": true"#;
+        assert_eq!(readiness(&status(42, "failed", retried), 42), Readiness::NotYet, "the daemon retries the load itself");
+        assert_eq!(readiness(r#"{"running": false, "health": null}"#, 42), Readiness::NotYet);
+        assert_eq!(readiness("", 42), Readiness::NotYet);
+    }
+
+    #[test]
+    fn a_step_that_fails_is_told_by_its_last_line() {
+        assert_eq!(last_line(b"", b"warn: x\nclawg: the import failed: embedder_not_ready\n\n"), "clawg: the import failed: embedder_not_ready");
+        assert_eq!(last_line(b"report\n", b""), "report");
+        assert_eq!(last_line(b"", b" \n"), "");
     }
 
     #[test]

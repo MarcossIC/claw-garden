@@ -125,6 +125,9 @@ pub struct Daemon {
     pub serve: Step,
     /// The file it publishes, naming its pid, once it listens.
     pub state_file: PathBuf,
+    /// What says whether its model is ready, once it listens: a seed or a
+    /// session sent before would meet `embedder_not_ready`.
+    pub status: Step,
 }
 
 /// Everything a run does, decided before anything is written.
@@ -195,6 +198,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         daemon = Some(Daemon {
             serve: Step { program: clawg.clone(), args: ["serve", "--profile", options.profile.as_str(), "--port", "0"].map(String::from).to_vec() },
             state_file: clawg_core::paths::daemon_state_file(&data),
+            status: Step { program: clawg.clone(), args: ["status", "--profile", options.profile.as_str()].map(String::from).to_vec() },
         });
         if let Some(lang) = options.lang {
             files.push((clawg_core::paths::preferences_file(&data), Preferences { language: Some(lang) }.to_json()));
@@ -329,6 +333,8 @@ mod tests {
         assert_eq!(daemon.serve.program, options(None).clawg.to_str().unwrap());
         assert_eq!(daemon.serve.args, ["serve", "--profile", "dev", "--port", "0"]);
         assert_eq!(daemon.state_file, layout().home().join(".clawg-dev").join("daemon.json"));
+        assert_eq!(daemon.status.program, daemon.serve.program);
+        assert_eq!(daemon.status.args, ["status", "--profile", "dev"]);
     }
 
     #[test]

@@ -146,7 +146,9 @@ fn a_replayed_session_with_clawg_finds_the_fact_and_succeeds() {
     assert!(data.join("memory.db").is_file(), "the daemon kept its store in the run's home");
     assert!(!data.join("daemon.json").exists(), "clawg stop ended the daemon");
     let log = clawg_log(&run);
+    let ready = log.find("\"embedder\": \"ready\"").unwrap_or_else(|| panic!("the run did not wait for the model:\n{log}"));
     let imported = log.find("imported 1 of 1 memories").unwrap_or_else(|| panic!("the seed was not imported:\n{log}"));
+    assert!(ready < imported, "the seed went before the model was ready:\n{log}");
     assert!(log[imported..].contains(" stop --profile dev"), "{log}");
 }
 
@@ -175,6 +177,7 @@ fn a_replayed_edit_changes_the_working_directory_the_checks_read() {
     assert!(r["saves"][0]["marks"].as_array().unwrap().iter().all(|m| m[1] != "fail"), "{:#}", r["saves"][0]);
     let log = clawg_log(&run);
     assert!(!log.contains(" import "), "a task without memories seeds nothing:\n{log}");
+    assert!(log.contains("\"embedder\": \"ready\""), "the session started before the model was ready:\n{log}");
     assert!(log.contains(" stop --profile dev"), "{log}");
     assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists());
 
