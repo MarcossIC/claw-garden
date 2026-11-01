@@ -77,15 +77,20 @@ struct Shape {
     projects: usize,
     rows: usize,
     reading: Reading,
+    /// Whether its numbers are read against the thresholds, or only reported.
+    decides: bool,
 }
 
 const SHAPES: [Shape; 5] = [
-    Shape { name: "F1", agents: 1, projects: 3, rows: 10_000, reading: Reading::Open },
-    Shape { name: "F2", agents: 3, projects: 5, rows: 10_000, reading: Reading::Open },
-    Shape { name: "F3", agents: 3, projects: 5, rows: 10_000, reading: Reading::Closed },
-    Shape { name: "F4", agents: 3, projects: 5, rows: 50_000, reading: Reading::Open },
-    Shape { name: "E1", agents: 5, projects: 20, rows: 50_000, reading: Reading::Closed },
+    Shape { name: "F1", agents: 1, projects: 3, rows: 10_000, reading: Reading::Open, decides: true },
+    Shape { name: "F2", agents: 3, projects: 5, rows: 10_000, reading: Reading::Open, decides: true },
+    Shape { name: "F3", agents: 3, projects: 5, rows: 10_000, reading: Reading::Closed, decides: true },
+    Shape { name: "F4", agents: 3, projects: 5, rows: 50_000, reading: Reading::Open, decides: true },
+    Shape { name: "E1", agents: 5, projects: 20, rows: 50_000, reading: Reading::Closed, decides: false },
 ];
+
+/// The seed every shape is laid out with.
+const SEED: u64 = 37;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Kind {
@@ -629,17 +634,196 @@ async fn measure(seeded: &Seeded, corpus: &Corpus, reader: &Reader) -> Measured 
     Measured { searches, probes }
 }
 
+/// The longest chain whose searches and probes are read against the
+/// thresholds; longer ones are only reported.
+const DECIDING_CHAIN: usize = 20;
+/// The thresholds: the mean loss of the searches at [`LIMIT`] and at
+/// [`POOL`], and the share of the candidates of the reference that the probes
+/// missed. A shape that decides and passes one of them opens the change.
+const U1: f64 = 0.02;
+const U2: f64 = 0.05;
+const U3: f64 = 0.10;
+
+fn decides(kind: Kind) -> bool {
+    !matches!(kind, Kind::Chain(n) if n > DECIDING_CHAIN)
+}
+
+/// What a shape gives over what decides.
+struct Thresholds {
+    loss10: f64,
+    loss30: f64,
+    detector: f64,
+}
+
+impl Thresholds {
+    fn opens(&self) -> bool {
+        self.loss10 > U1 || self.loss30 > U2 || self.detector > U3
+    }
+}
+
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn thresholds(measured: &Measured) -> Thresholds {
+    let searches: Vec<&Searched> = measured.searches.iter().filter(|s| decides(s.kind)).collect();
+    let losses = |at: fn(&Searched) -> Option<f64>| searches.iter().filter_map(|s| at(s)).collect::<Vec<_>>();
+    let (reference, missed) = measured
+        .probes
+        .iter()
+        .filter(|p| decides(p.kind))
+        .fold((0, 0), |(reference, missed), p| (reference + p.reference, missed + p.missed));
+    Thresholds {
+        loss10: mean(&losses(|s| s.loss10)),
+        loss30: mean(&losses(|s| s.loss30)),
+        detector: if reference == 0 { 0.0 } else { missed as f64 / reference as f64 },
+    }
+}
+
+fn kind_name(kind: Kind) -> String {
+    match kind {
+        Kind::OwnTopic => "own topic".to_string(),
+        Kind::SharedTopic => "shared topic".to_string(),
+        Kind::Chain(n) => format!("chain of {n}"),
+        Kind::Repeated => "repeated claim".to_string(),
+    }
+}
+
+fn sorted(mut values: Vec<f64>) -> Vec<f64> {
+    values.sort_by(f64::total_cmp);
+    values
+}
+
+/// `mean / p90 / max` of `values`, or a dash when there are none.
+fn spread(values: Vec<f64>) -> String {
+    if values.is_empty() {
+        return "-".to_string();
+    }
+    let values = sorted(values);
+    format!("{:.3} / {:.3} / {:.3}", mean(&values), quantile(&values, 0.9), values[values.len() - 1])
+}
+
+/// `p50 / p99` of `micros`, in milliseconds.
+fn latency(micros: impl Iterator<Item = u64>) -> String {
+    let values = sorted(micros.map(|us| us as f64 / 1000.0).collect());
+    if values.is_empty() {
+        return "-".to_string();
+    }
+    format!("{:.1} / {:.1} ms", quantile(&values, 0.5), quantile(&values, 0.99))
+}
+
+fn share(part: usize, whole: usize) -> String {
+    format!("{part}/{whole}")
+}
+
+/// The report of one shape, a line per kind of search and of probe.
+fn report(shape: Shape, measured: &Measured, took: std::time::Duration) -> String {
+    let reading = match shape.reading {
+        Reading::Open => "open",
+        Reading::Closed => "closed",
+    };
+    let mut out = format!(
+        "== {}: {} agents, {} projects, {} rows, {reading} reading, {} ({} searches, {} probes, {:.1} s)\n",
+        shape.name,
+        shape.agents,
+        shape.projects,
+        shape.rows,
+        if shape.decides { "decides" } else { "informs" },
+        measured.searches.len(),
+        measured.probes.len(),
+        took.as_secs_f64(),
+    );
+    let mut kinds: Vec<Kind> = measured.searches.iter().map(|s| s.kind).collect();
+    kinds.sort();
+    kinds.dedup();
+    out.push_str("search kind        n  scored  loss@10 mean / p90 / max  loss@30 mean / p90 / max  second pass  live first\n");
+    for kind in kinds {
+        let of: Vec<&Searched> = measured.searches.iter().filter(|s| s.kind == kind).collect();
+        let live = match kind {
+            Kind::Chain(_) => share(of.iter().filter(|s| s.live_rank == Some(1)).count(), of.len()),
+            _ => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "{:<16} {:>3}  {:>6}  {:<25} {:<25} {:>11}  {:>10}\n",
+            kind_name(kind),
+            of.len(),
+            of.iter().filter(|s| s.loss30.is_some()).count(),
+            spread(of.iter().filter_map(|s| s.loss10).collect()),
+            spread(of.iter().filter_map(|s| s.loss30).collect()),
+            share(of.iter().filter(|s| s.ran.retried).count(), of.len()),
+            live,
+        ));
+    }
+    let mut kinds: Vec<Kind> = measured.probes.iter().map(|p| p.kind).collect();
+    kinds.sort();
+    kinds.dedup();
+    out.push_str("probe kind         n  candidates  missed  second pass\n");
+    for kind in kinds {
+        let of: Vec<&Probed> = measured.probes.iter().filter(|p| p.kind == kind).collect();
+        out.push_str(&format!(
+            "{:<16} {:>3}  {:>10}  {:>6}  {:>11}\n",
+            kind_name(kind),
+            of.len(),
+            of.iter().map(|p| p.reference).sum::<usize>(),
+            of.iter().map(|p| p.missed).sum::<usize>(),
+            share(of.iter().filter(|p| p.ran.retried).count(), of.len()),
+        ));
+    }
+    out.push_str(&format!(
+        "latency p50 / p99: search {}, its memory KNN {}; probe {}\n",
+        latency(measured.searches.iter().map(|s| s.ran.total_us)),
+        latency(measured.searches.iter().map(|s| s.ran.knn_us)),
+        latency(measured.probes.iter().map(|p| p.ran.total_us)),
+    ));
+    let read = thresholds(measured);
+    let past = |value: f64, threshold: f64| if value > threshold { "passes" } else { "stays under" };
+    out.push_str(&format!(
+        "over topics and chains of at most {DECIDING_CHAIN}: U1 loss@10 {:.4} {} {U1}; U2 loss@30 {:.4} {} {U2}; U3 detector {:.4} {} {U3}{}\n",
+        read.loss10,
+        past(read.loss10, U1),
+        read.loss30,
+        past(read.loss30, U2),
+        read.detector,
+        past(read.detector, U3),
+        match (shape.decides, read.opens()) {
+            (false, _) => " (informs only)",
+            (true, true) => ": opens",
+            (true, false) => ": stays closed",
+        },
+    ));
+    out
+}
+
+/// The bare vec0 pass of a search: its `k` nearest of the whole table, with
+/// none of the predicates the search applies after them.
+const VEC0_SQL: &str = "SELECT rowid, distance FROM memory_vectors WHERE embedding MATCH ?1 AND k = ?2";
+
+/// Runs `sql` with `binds` on the thread of the store and times it there,
+/// without the hop to it.
+async fn timed(store: &MemoryStore, sql: &'static str, binds: Vec<rusqlite::types::Value>) -> (Vec<i64>, std::time::Duration) {
+    store
+        .conn
+        .call(move |c| -> rusqlite::Result<(Vec<i64>, std::time::Duration)> {
+            let mut stmt = c.prepare_cached(sql)?;
+            let started = std::time::Instant::now();
+            let ids = stmt.query_map(rusqlite::params_from_iter(binds), |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+            Ok((ids, started.elapsed()))
+        })
+        .await
+        .expect("the query runs")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A shape small enough to lay out in a unit test, with every source of
     /// crowding: two agents, two projects, chains and repeated claims.
-    const SMALL: Shape = Shape { name: "small", agents: 2, projects: 2, rows: 3_000, reading: Reading::Closed };
-
-    fn mean(values: &[f64]) -> f64 {
-        values.iter().sum::<f64>() / values.len() as f64
-    }
+    const SMALL: Shape =
+        Shape { name: "small", agents: 2, projects: 2, rows: 3_000, reading: Reading::Closed, decides: false };
 
     #[test]
     fn the_same_seed_lays_out_the_same_corpus() {
@@ -913,6 +1097,132 @@ mod tests {
         assert_eq!((probed.reference, probed.missed), (DETECTOR_POOL, 0));
         assert_eq!(probed.ran.ids.len(), DETECTOR_POOL);
         seeded.close().await;
+    }
+
+    /// A table of `rows` rows of one project, `a0` holding 1 % of them,
+    /// `a1` 9 % and `a2` the rest, interleaved, and a search per run.
+    fn cost_corpus(rows: usize, runs: usize) -> Corpus {
+        let mut b = Builder::new(SEED);
+        let topics: Vec<usize> = (0..rows.div_ceil(BLOCK)).map(|_| b.topic()).collect();
+        for i in 0..rows {
+            let agent = match i % 100 {
+                0 => 0,
+                1..10 => 1,
+                _ => 2,
+            };
+            let topic = topics[i % topics.len()];
+            let vector = b.vector(topic, None);
+            b.push(Row { agent, project: Some(0), topic, claim: None, preference: false, superseded: false, deleted: false, vector });
+        }
+        for run in 0..runs {
+            let vector = b.vector(topics[(run * 7) % topics.len()], None);
+            b.queries.push(Query { kind: Kind::OwnTopic, project: 0, claim: None, live: None, vector });
+        }
+        b.corpus()
+    }
+
+    #[tokio::test]
+    #[ignore = "a measurement: run it with `cargo test -p clawg-core --lib -- --ignored what_the_window_loses --nocapture`"]
+    async fn what_the_window_loses_against_the_exact_neighbours() {
+        println!("{} build, seed {SEED}", if cfg!(debug_assertions) { "debug" } else { "release" });
+        for shape in SHAPES {
+            let started = std::time::Instant::now();
+            let corpus = lay_out(shape, SEED);
+            let seeded = seed(&corpus).await;
+            let measured = measure(&seeded, &corpus, &shape.reader()).await;
+            seeded.close().await;
+            println!("{}", report(shape, &measured, started.elapsed()));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "a measurement: run it with `cargo test -p clawg-core --lib -- --ignored what_the_exact_query_costs --nocapture`"]
+    async fn what_the_exact_query_costs_against_the_window() {
+        use rusqlite::types::Value;
+        const RUNS: usize = 30;
+        println!("{} build, {RUNS} runs a cell, p50 / max in ms", if cfg!(debug_assertions) { "debug" } else { "release" });
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        for rows in [1_000, 10_000, 100_000] {
+            let corpus = cost_corpus(rows, RUNS);
+            let seeded = seed(&corpus).await;
+            let store = &seeded.store;
+            let readers = [
+                (100, Reader::new(agent_id(2), Reach::AllBut(Vec::new()))),
+                (10, Reader::new(agent_id(1), Reach::AllBut(vec![agent_id(2)]))),
+                (1, Reader::new(agent_id(0), Reach::AllBut(vec![agent_id(1), agent_id(2)]))),
+            ];
+            for (percent, reader) in &readers {
+                let mut took: [Vec<f64>; 4] = Default::default();
+                let mut second = 0;
+                for query in &corpus.queries {
+                    let unit = bytes(&to_unit(&query.vector).unwrap());
+                    let exact_binds = vec![
+                        Value::Blob(unit.clone()),
+                        Value::Text(reader_bind(Some(reader)).unwrap()),
+                        Value::Text(project_id(0)),
+                        Value::Integer(POOL as i64),
+                    ];
+                    let (exact_ids, exact_took) = timed(store, EXACT_SQL, exact_binds).await;
+                    let (_, narrow) = timed(store, VEC0_SQL, vec![Value::Blob(unit.clone()), Value::Integer(POOL as i64)]).await;
+                    let (wide_ids, wide) = timed(store, VEC0_SQL, vec![Value::Blob(unit), Value::Integer(4 * POOL as i64)]).await;
+                    let searched = search(store, reader, 0, &query.vector).await;
+                    if *percent == 100 {
+                        assert_eq!(exact_ids, wide_ids[..POOL], "with every row eligible the exact query is the window");
+                    }
+                    second += usize::from(searched.retried);
+                    for (k, value) in [ms(exact_took), ms(narrow), ms(wide), searched.knn_us as f64 / 1000.0].into_iter().enumerate() {
+                        took[k].push(value);
+                    }
+                }
+                let [exact, narrow, wide, knn] = took.map(sorted);
+                let cell = |v: &[f64]| format!("{:.2} / {:.2}", quantile(v, 0.5), v[v.len() - 1]);
+                println!(
+                    "{rows} rows, {percent} % eligible: exact {}; vec0 k=30 {}; vec0 k=120 {}; exact / k=120 {:.2}; the search's memory KNN {} with {} second passes",
+                    cell(&exact),
+                    cell(&narrow),
+                    cell(&wide),
+                    quantile(&exact, 0.5) / quantile(&wide, 0.5),
+                    cell(&knn),
+                    share(second, corpus.queries.len()),
+                );
+            }
+            let plan: Vec<String> = store
+                .conn
+                .call(|c| -> rusqlite::Result<Vec<String>> {
+                    let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {EXACT_SQL}"))?;
+                    let rows = stmt.query_map(params![Vec::<u8>::new(), "{}", "p0", 1], |r| r.get(3))?;
+                    rows.collect()
+                })
+                .await
+                .unwrap();
+            println!("plan of the exact query: {}", plan.join(" | "));
+            seeded.close().await;
+        }
+    }
+
+    #[test]
+    fn the_thresholds_read_only_what_decides() {
+        let ran = || Ran { ids: Vec::new(), retried: false, total_us: 0, knn_us: 0 };
+        let searched = |kind, loss10, loss30| Searched { kind, loss10, loss30, live_rank: None, ran: ran() };
+        let probed = |kind, reference, missed| Probed { kind, reference, missed, ran: ran() };
+        let mut measured = Measured {
+            searches: vec![
+                searched(Kind::OwnTopic, Some(0.0), Some(0.0)),
+                searched(Kind::SharedTopic, None, None),
+                searched(Kind::Chain(40), Some(1.0), Some(1.0)),
+            ],
+            probes: vec![probed(Kind::Chain(20), 1, 0), probed(Kind::Chain(40), 1, 1)],
+        };
+        let read = thresholds(&measured);
+        assert_eq!((read.loss10, read.loss30, read.detector), (0.0, 0.0, 0.0), "a chain of 40 informs only");
+        assert!(!read.opens());
+
+        measured.searches.push(searched(Kind::Chain(20), Some(0.0), Some(0.2)));
+        measured.probes.push(probed(Kind::Repeated, 3, 1));
+        let read = thresholds(&measured);
+        assert!((read.loss30 - 0.1).abs() < 1e-12 && read.loss10 == 0.0, "{}", read.loss30);
+        assert!((read.detector - 0.25).abs() < 1e-12);
+        assert!(read.opens());
     }
 
     #[test]
