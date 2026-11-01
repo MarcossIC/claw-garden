@@ -32,7 +32,18 @@ Un refresco de docs ya bajó de unos 45 a unos 20 minutos, así que no se devuel
 - **Ruido:** dentro de una misma rama, sin cambio de régimen, `embed` varió menos del 2 % en docs-index-speed.
 - **C:** abrió por 2.1, pero lo medido de su ganancia es el recuento de hilos. Si su brazo no degrada el tiempo y tampoco gana CPU, entrar o no queda como decisión expresa.
 - **E (2.5):** abre sólo si las dos codificaciones de más pesan al menos 5 % del tiempo de un guardado de 64 KiB, contando las tres codificaciones y la tanda. Se fijó antes de medir `split_save`, pero después de estimar con los datos del refresco que rondaría el 2 %.
-- **Sin fijar todavía:** el p99 de búsqueda de 2.4.
+
+### El de 2.4, una arena contra dos, también antes de medir
+
+Se compara el mismo build, sin la llamada a `keep_one_malloc_arena`, con `MALLOC_ARENA_MAX=1` y con `=2`, mientras el daemon refresca docs y un cliente busca cada 100 ms. Cada corrida con 2 arenas se compara con la de 1 arena de su ronda; los porcentajes son la mediana de los 3 cocientes, y las cifras absolutas, la mediana de las 3 diferencias.
+
+**D6 de embedder-idle-unload, la arena única, se reabre sólo si, con 2 arenas, se cumplen las tres:**
+
+- el p99 de búsqueda baja al menos 22 % y al menos 20 ms;
+- el refresco no sube más que el menor entre +5 % y +60 s;
+- el pico de `RssAnon` sube menos de 100 MiB.
+
+Si falta una condición, queda una arena. La lectura vale para los hilos de la máquina donde se mide: con más hilos hay más contención por la arena, y la respuesta puede ser otra.
 
 ## Cómo se midió
 
