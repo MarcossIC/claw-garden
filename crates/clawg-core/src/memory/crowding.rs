@@ -45,7 +45,7 @@ const CHAINS_PER_LENGTH: usize = 15;
 const REPEATED_CLAIMS: usize = 15;
 const UNOWNED_PERCENT: usize = 20;
 /// One plain row in this many is a preference, and another one is deleted.
-const ONE_IN: usize = 20;
+const ONE_IN: u64 = 20;
 /// How many projects the reader searches from, and how many topics of each
 /// kind it asks about in each.
 const QUERY_PROJECTS: usize = 5;
@@ -215,7 +215,6 @@ struct Builder {
     global: Vec<f32>,
     topics: Vec<Vec<f32>>,
     claims: usize,
-    plain: usize,
     rows: Vec<Row>,
     queries: Vec<Query>,
     probes: Vec<Query>,
@@ -225,7 +224,7 @@ impl Builder {
     fn new(seed: u64) -> Self {
         let mut rng = SplitMix64(seed);
         let global = rng.direction();
-        Builder { rng, global, topics: Vec::new(), claims: 0, plain: 0, rows: Vec::new(), queries: Vec::new(), probes: Vec::new() }
+        Builder { rng, global, topics: Vec::new(), claims: 0, rows: Vec::new(), queries: Vec::new(), probes: Vec::new() }
     }
 
     fn corpus(self) -> Corpus {
@@ -258,19 +257,21 @@ impl Builder {
     }
 
     /// A row that belongs to no chain and repeats no claim: one in
-    /// [`ONE_IN`] of them is a preference, and another one is deleted.
+    /// [`ONE_IN`] of them is a preference, and another one is deleted. Each
+    /// row draws it: a count would come back in step with the turn of the
+    /// agents over the topics, and leave every row of one agent on a topic
+    /// deleted.
     fn plain(&mut self, agent: usize, project: Option<usize>, topic: usize) {
-        let k = self.plain;
-        self.plain += 1;
+        let draw = self.rng.next_u64() % ONE_IN;
         let vector = self.vector(topic, None);
         self.push(Row {
             agent,
             project,
             topic,
             claim: None,
-            preference: k % ONE_IN == 0,
+            preference: draw == 0,
             superseded: false,
-            deleted: k % ONE_IN == ONE_IN / 2,
+            deleted: draw == 1,
             vector,
         });
     }
@@ -865,12 +866,31 @@ mod tests {
         assert_eq!(corpus.probes.iter().filter(|p| p.kind == Kind::Repeated).count(), 15 * 5);
         assert_eq!(corpus.probes.iter().filter(|p| matches!(p.kind, Kind::Chain(_))).count(), 60);
 
-        // 8 590 rows are neither chains nor copies: one in 20 is a
+        // 8 590 rows are neither chains nor copies: about one in 20 is a
         // preference and another one in 20 is deleted.
-        assert_eq!(corpus.rows.iter().filter(|r| r.preference).count(), 430);
-        assert_eq!(corpus.rows.iter().filter(|r| r.deleted).count(), 429);
+        for count in [corpus.rows.iter().filter(|r| r.preference).count(), corpus.rows.iter().filter(|r| r.deleted).count()] {
+            assert!((0.04..0.06).contains(&(count as f64 / 8_590.0)), "{count}");
+        }
         let topics = |kind| corpus.queries.iter().filter(|q| q.kind == kind).count();
         assert_eq!((topics(Kind::OwnTopic), topics(Kind::SharedTopic)), (5 * 17, 5 * 17));
+    }
+
+    #[test]
+    fn preferences_and_deletions_fall_apart_from_agents_and_topics() {
+        // Four topics of each kind and five agents: a row of an agent comes
+        // back to the same topic every 20 rows, the period of one in 20.
+        let shape = Shape { name: "stride", agents: 5, projects: 1, rows: 1_975, reading: Reading::Open, decides: false };
+        let corpus = lay_out(shape, 7);
+        let mut groups: HashMap<(Option<usize>, usize, usize), (usize, usize)> = HashMap::new();
+        for row in corpus.rows.iter().filter(|r| r.claim.is_none()) {
+            let group = groups.entry((row.project, row.topic, row.agent)).or_default();
+            group.0 += 1;
+            group.1 += usize::from(row.deleted);
+        }
+        assert!(groups.values().any(|g| g.0 >= 8));
+        for (group, (rows, deleted)) in &groups {
+            assert!(*deleted < *rows, "every row of {group:?} is deleted");
+        }
     }
 
     #[test]
