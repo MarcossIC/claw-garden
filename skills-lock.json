@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "skills": {
+    "rust-build": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-build/SKILL.md",
+      "computedHash": "fee3ac08335a8217cbc323715af4566d6ffe4fdb4fc275f95910a255396d1348"
+    },
+    "rust-cli-interface": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-cli-interface/SKILL.md",
+      "computedHash": "32712e0f82e2834e5e73b8023a1b158b3da0a8e1858f4641251456342469284f"
+    },
+    "rust-cli-testing": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-cli-testing/SKILL.md",
+      "computedHash": "c48a668807140cfd0462bccad6105a39373dd1edffeb94909f95a03248a949a4"
+    },
+    "rust-concurrency": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-concurrency/SKILL.md",
+      "computedHash": "2e24327376bbdd3c4e0a7d475825030fd152558a8e55c197c4c498fb9bab4fbc"
+    },
+    "rust-debugging": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-debugging/SKILL.md",
+      "computedHash": "977e6a991df4e0385be8ec155a54d31e0914e0745627c4b86e16b2afdffe2e1c"
+    },
+    "rust-design": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-design/SKILL.md",
+      "computedHash": "04fed1d33fd9790c023e9d77038fedb30024e33a7056e4b020412e24cc412748"
+    },
+    "rust-distribution": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-distribution/SKILL.md",
+      "computedHash": "df0875b505dc475302ab61dc9a1f4236fee21774ca358a1dd7ef4a385ad407c0"
+    },
+    "rust-errors": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-errors/SKILL.md",
+      "computedHash": "85b207a7e85a70591d578048cab79744ec665e2eb40b7a984f1a5a6a3fc78afc"
+    },
+    "rust-filesystem": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-filesystem/SKILL.md",
+      "computedHash": "0924cfa878f0ad98a93ca0d31df5dd7cd6a02454145ad9d930be27b0e8ad380e"
+    },
+    "rust-idiomatic": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-idiomatic/SKILL.md",
+      "computedHash": "18011e771a022809915d6f663ae2d2912d85602690cac7033ee8bc9c2f2486e1"
+    },
+    "rust-implement": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-implement/SKILL.md",
+      "computedHash": "05c624857704469d3188c2dc07927210fd8527c855818a841aff15b63523fc79"
+    },
+    "rust-io": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-io/SKILL.md",
+      "computedHash": "ab4142f455a4aa1f9ac56580aebf1f00a750dcfd1556ff97c442f30282e8f79d"
+    },
+    "rust-memory": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-memory/SKILL.md",
+      "computedHash": "2bd983c2dd23dea173effeb608c9275f028f2792ee6072e7e4357915c89e697a"
+    },
+    "rust-performance": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-performance/SKILL.md",
+      "computedHash": "97f0dbf728e42d55dc08638572daa02ac056ee4c3c6ddb35538b0f0473f629bf"
+    },
+    "rust-processes": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-processes/SKILL.md",
+      "computedHash": "57a5c011fb8eae110bc1211b577e3a29e5ab08e3865ee4d0830ebea081c88047"
+    },
+    "rust-testing": {
+      "source": "Dankosik/rust-cli-skills",
+      "ref": "v1.0.0",
+      "sourceType": "github",
+      "skillPath": "skills/rust-testing/SKILL.md",
+      "computedHash": "0ddbffea3c41feaa869d42eb1be17d5c8a1c84a39f7ab540686a1b5103f5b840"
+    }
+  }
+}
