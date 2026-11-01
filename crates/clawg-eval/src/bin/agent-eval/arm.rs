@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use clawg_cli::setup::{self, FileStep, Mode, State};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::{Lang, Preferences};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::seed;
@@ -36,6 +36,10 @@ pub const ARMS: [Arm; 6] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A4, Ar
 /// The tools arm B takes away.
 const READ_TOOLS: [&str; 3] = ["search_memory", "read_memory", "list_memories"];
 
+/// The variable a `testing` build of clawg reads its home from instead of the
+/// system's: clawg-core's `paths::TEST_HOME_VAR`, which only such a build has.
+pub const TEST_HOME_VAR: &str = "CLAWG_TEST_HOME";
+
 impl Arm {
     pub fn parse(name: &str) -> Option<Arm> {
         ARMS.into_iter().find(|a| a.as_str() == name)
@@ -52,7 +56,8 @@ impl Arm {
         }
     }
 
-    fn has_clawg(self) -> bool {
+    /// Whether a run of this arm starts clawg: its daemon, its bridge, its hooks.
+    pub fn has_clawg(self) -> bool {
         matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::B)
     }
 
@@ -103,23 +108,34 @@ pub struct Options {
 }
 
 /// One program and its arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     pub program: String,
     pub args: Vec<String>,
 }
 
+/// The `clawg serve` of the run's home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Daemon {
+    pub serve: Step,
+    /// The file it publishes, naming its pid, once it listens.
+    pub state_file: PathBuf,
+}
+
 /// Everything a run does, decided before anything is written.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunPlan {
     pub task: String,
-    pub arm: &'static str,
+    pub arm: String,
     /// Files written before the session, by absolute path.
     pub files: Vec<(PathBuf, String)>,
-    /// Commands run before the session, against a daemon of the run's home.
+    /// Started before every command, and ended by the last of [`RunPlan::after`].
+    pub daemon: Option<Daemon>,
+    /// Commands run before the session, against [`RunPlan::daemon`].
     pub before: Vec<Step>,
     /// The client session, run in [`Layout::workdir`].
     pub client: Step,
+    /// What every process of the run gets on top of the environment it inherits.
     pub env: Vec<(String, String)>,
     /// Commands run after the session.
     pub after: Vec<Step>,
@@ -142,6 +158,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
     let workdir = text(&layout.workdir())?;
     let server_name = options.profile.mcp_server_name();
     let mut files = Vec::new();
+    let mut daemon = None;
     let mut before = Vec::new();
     let mut after = Vec::new();
     let mut servers = serde_json::Map::new();
@@ -167,8 +184,14 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
                 }
             }
         }
+        let data = layout.data_dir(options.profile);
+        // An ephemeral port, so a run never takes the profile's port from a
+        // daemon of the user's.
+        daemon = Some(Daemon {
+            serve: Step { program: clawg.clone(), args: ["serve", "--profile", options.profile.as_str(), "--port", "0"].map(String::from).to_vec() },
+            state_file: clawg_core::paths::daemon_state_file(&data),
+        });
         if let Some(lang) = options.lang {
-            let data = layout.data_dir(options.profile);
             files.push((clawg_core::paths::preferences_file(&data), Preferences { language: Some(lang) }.to_json()));
         }
         if !task.memories.is_empty() {
@@ -215,7 +238,8 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
     let home = text(&layout.home())?;
     let mut env = vec![
         ("HOME".to_owned(), home.clone()),
-        ("USERPROFILE".to_owned(), home),
+        ("USERPROFILE".to_owned(), home.clone()),
+        (TEST_HOME_VAR.to_owned(), home),
         ("CLAUDE_CONFIG_DIR".to_owned(), text(&layout.config_dir())?),
         ("CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_owned(), if arm == Arm::A4 { "0" } else { "1" }.to_owned()),
     ];
@@ -225,8 +249,9 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
 
     Ok(RunPlan {
         task: task.id.clone(),
-        arm: arm.as_str(),
+        arm: arm.as_str().to_owned(),
         files,
+        daemon,
         before,
         client: Step { program: "claude".into(), args },
         env,
@@ -289,12 +314,40 @@ mod tests {
     }
 
     #[test]
+    fn the_arms_with_clawg_start_a_daemon_of_the_run_on_an_ephemeral_port() {
+        let with_daemon: Vec<Arm> = ARMS.into_iter().filter(|arm| plan(&task(true), *arm, &layout(), &options(None)).unwrap().daemon.is_some()).collect();
+        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::B]);
+
+        let plan = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        let daemon = plan.daemon.unwrap();
+        assert_eq!(daemon.serve.program, options(None).clawg.to_str().unwrap());
+        assert_eq!(daemon.serve.args, ["serve", "--profile", "dev", "--port", "0"]);
+        assert_eq!(daemon.state_file, layout().home().join(".clawg-dev").join("daemon.json"));
+    }
+
+    #[test]
+    fn every_process_of_a_run_finds_its_home_also_in_a_testing_build() {
+        for arm in ARMS {
+            let plan = plan(&task(true), arm, &layout(), &options(None)).unwrap();
+            assert_eq!(env(&plan, "CLAWG_TEST_HOME"), layout().home().to_str(), "{}", arm.as_str());
+            assert_eq!(env(&plan, "CLAWG_TEST_HOME"), env(&plan, "HOME"));
+        }
+    }
+
+    #[test]
+    fn the_plan_reads_back_from_its_json() {
+        let plan = plan(&task(true), Arm::B, &layout(), &options(Some(Lang::Es))).unwrap();
+        let back: RunPlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back, plan);
+    }
+
+    #[test]
     fn a0_has_no_server_no_hooks_no_seed_and_no_native_memory() {
         let plan = plan(&task(true), Arm::A0, &layout(), &options(None)).unwrap();
         let mcp: serde_json::Value = serde_json::from_str(file(&plan, "mcp.json").unwrap()).unwrap();
         assert_eq!(mcp, json!({ "mcpServers": {} }));
         assert_eq!(plan.files.len(), 1);
-        assert!(plan.before.is_empty() && plan.after.is_empty());
+        assert!(plan.daemon.is_none() && plan.before.is_empty() && plan.after.is_empty());
         assert_eq!(env(&plan, "CLAUDE_CODE_DISABLE_AUTO_MEMORY"), Some("1"));
         assert!(plan.client.args.contains(&"--strict-mcp-config".to_owned()));
         assert!(has_arg_pair(&plan, "-p", "Which port?"));

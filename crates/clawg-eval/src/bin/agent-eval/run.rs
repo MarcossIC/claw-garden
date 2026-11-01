@@ -1,17 +1,22 @@
-//! One run: its directory laid out from the plan, the client started in its
-//! working directory with its stream captured, and the result scored from
-//! what it left. [`evaluate`] is pure; the rest is the I/O around it.
+//! One run: its directory laid out from the plan, the session it plans run
+//! (the daemon of its home, the seed, the client in its working directory
+//! with its stream captured, the stop), and the result scored from what it
+//! left. [`evaluate`] is pure; the rest is the I/O around it.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::arm::{Arm, Layout, Options, RunPlan, Step};
+use crate::arm::{Arm, Daemon, Layout, Options, RunPlan, Step, TEST_HOME_VAR};
 use crate::rubric::{self, Mark, SaveMarks};
 use crate::score::{self, Score, TracerFate};
 use crate::stream::{self, Outcome, Transcript};
@@ -21,6 +26,20 @@ pub const RUN_FILE: &str = "run.json";
 pub const STREAM_FILE: &str = "stream.jsonl";
 pub const CLIENT_LOG: &str = "client.log";
 pub const RESULT_FILE: &str = "result.json";
+/// What the daemon of the run printed.
+pub const SERVE_LOG: &str = "serve.log";
+/// What each clawg command of the run printed, after its command line.
+pub const CLAWG_LOG: &str = "clawg.log";
+
+/// Generous: a cold debug binary on a loaded machine opens SQLite, runs every
+/// migration and binds before it publishes itself.
+const START_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long the daemon may take to go once `clawg stop`, which already waits
+/// for it, has returned.
+const EXIT_BUDGET: Duration = Duration::from_secs(10);
+
+const POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Session {
@@ -129,6 +148,21 @@ pub enum RunError {
     NotARun(PathBuf, String),
     #[error("{0}")]
     Arm(#[from] crate::arm::ArmError),
+    #[error(
+        "{} is not a `testing` build of clawg: on Windows clawg finds its home through the system and not HOME, so this run would use the profile of the user who runs it; only a build with clawg-core's `testing` feature reads {TEST_HOME_VAR}",
+        .0.display()
+    )]
+    NotIsolated(PathBuf),
+    #[error("the daemon of the run exited with {code:?} before it listened; see {}", .log.display())]
+    DaemonExited { code: Option<i32>, log: PathBuf },
+    #[error("the daemon of the run did not publish {} within {}s; see {}", .state_file.display(), START_BUDGET.as_secs(), .log.display())]
+    DaemonSilent { state_file: PathBuf, log: PathBuf },
+    #[error("the daemon of the run was still there after `clawg stop` and was ended; see {}", .0.display())]
+    DaemonStayed(PathBuf),
+    #[error("`{command}` exited with {code:?}; see {}", .log.display())]
+    Step { command: String, code: Option<i32>, log: PathBuf },
+    #[error("the client exited with {code:?}; see {}", .log.display())]
+    Client { code: Option<i32>, log: PathBuf },
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
@@ -183,6 +217,210 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
+/// Refuses, on Windows, a run that would start a clawg that does not keep to
+/// the run's home. There clawg finds the home through the system, not `HOME`,
+/// and only a `testing` build reads [`TEST_HOME_VAR`]: the name in the binary
+/// is the mark of one, the mark `release.yml` checks a release never carries.
+pub fn check_isolation(windows: bool, arm: Arm, clawg: &Path) -> Result<(), RunError> {
+    if !windows || !arm.has_clawg() {
+        return Ok(());
+    }
+    let file = File::open(clawg).map_err(io(clawg))?;
+    if holds(file, TEST_HOME_VAR.as_bytes(), 1 << 20).map_err(io(clawg))? {
+        Ok(())
+    } else {
+        Err(RunError::NotIsolated(clawg.to_owned()))
+    }
+}
+
+/// Whether `needle`, not empty, is somewhere in what `reader` gives, read
+/// `chunk` bytes at a time.
+fn holds(mut reader: impl Read, needle: &[u8], chunk: usize) -> std::io::Result<bool> {
+    let keep = needle.len() - 1;
+    let mut buf = vec![0; keep + chunk];
+    let mut held = 0;
+    loop {
+        let read = match reader.read(&mut buf[held..]) {
+            Ok(0) => return Ok(false),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let end = held + read;
+        if buf[..end].windows(needle.len()).any(|w| w == needle) {
+            return Ok(true);
+        }
+        held = keep.min(end);
+        buf.copy_within(end - held..end, 0);
+    }
+}
+
+/// The plan `prepare` left in `root`'s `run.json`.
+pub fn read_plan(root: &Path) -> Result<RunPlan, RunError> {
+    let mut record = read_record(root)?;
+    serde_json::from_value(record["plan"].take()).map_err(|e| RunError::NotARun(root.to_owned(), e.to_string()))
+}
+
+fn read_record(root: &Path) -> Result<Value, RunError> {
+    let path = root.join(RUN_FILE);
+    let text = std::fs::read_to_string(&path).map_err(io(&path))?;
+    serde_json::from_str(&text).map_err(|e| RunError::NotARun(root.to_owned(), e.to_string()))
+}
+
+/// Runs the session `prepare` laid out in `root`, as its `run.json` plans it,
+/// with `client` as the client: with clawg, the daemon of the run's home
+/// first, then the commands before the session, the client and the commands
+/// after it, which also run when the seed or the client failed. A seed that
+/// does not load starts no client.
+pub fn execute(root: &Path, client: &Step) -> Result<(), RunError> {
+    let plan = read_plan(root)?;
+    let layout = Layout { root: root.to_owned() };
+    let Some(daemon) = &plan.daemon else {
+        return client_ran(start_client(&plan, &layout, client)?, root);
+    };
+    let served = Served::start(daemon, &plan.env, root)?;
+    served.listening(&daemon.state_file)?;
+    let log_path = root.join(CLAWG_LOG);
+    let mut log = File::create(&log_path).map_err(io(&log_path))?;
+    let session = plan
+        .before
+        .iter()
+        .try_for_each(|step| run_step(step, &plan.env, root, &mut log, &log_path))
+        .and_then(|()| client_ran(start_client(&plan, &layout, client)?, root));
+    let stopped = plan.after.iter().try_for_each(|step| run_step(step, &plan.env, root, &mut log, &log_path));
+    let gone = served.gone_within(EXIT_BUDGET);
+    session?;
+    stopped?;
+    if gone {
+        Ok(())
+    } else {
+        Err(RunError::DaemonStayed(served.log.clone()))
+    }
+}
+
+fn client_ran(code: Option<i32>, root: &Path) -> Result<(), RunError> {
+    if code == Some(0) {
+        Ok(())
+    } else {
+        Err(RunError::Client { code, log: root.join(CLIENT_LOG) })
+    }
+}
+
+/// Runs `step` to its end with the plan's variables, and appends its command
+/// line, what it printed and its exit code to `log`.
+fn run_step(step: &Step, env: &[(String, String)], root: &Path, log: &mut File, log_path: &Path) -> Result<(), RunError> {
+    let command = std::iter::once(&step.program).chain(&step.args).map(String::as_str).collect::<Vec<_>>().join(" ");
+    let output = Command::new(&step.program)
+        .args(&step.args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(io(Path::new(&step.program)))?;
+    let code = output.status.code();
+    writeln!(log, "$ {command}")
+        .and_then(|()| log.write_all(&output.stdout))
+        .and_then(|()| log.write_all(&output.stderr))
+        .and_then(|()| writeln!(log, "exit {code:?}\n"))
+        .map_err(io(log_path))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(RunError::Step { command, code, log: log_path.to_owned() })
+    }
+}
+
+/// Whether `state` is a daemon's state file that names `pid`.
+fn names_pid(state: Option<&str>, pid: u32) -> bool {
+    state.and_then(|text| serde_json::from_str::<Value>(text).ok()).is_some_and(|v| v["pid"].as_u64() == Some(u64::from(pid)))
+}
+
+/// The run's `clawg serve`, a child of this process. A thread reaps it as soon
+/// as it exits: on Unix an unreaped child stays a zombie, and `clawg stop`,
+/// which waits for its pid to go, would wait it out. Dropped while it still
+/// runs, it is ended through its own handle, never by name.
+struct Served {
+    child: Arc<Mutex<Child>>,
+    pid: u32,
+    log: PathBuf,
+}
+
+fn lock(child: &Mutex<Child>) -> MutexGuard<'_, Child> {
+    child.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Served {
+    fn start(daemon: &Daemon, env: &[(String, String)], root: &Path) -> Result<Self, RunError> {
+        let log = root.join(SERVE_LOG);
+        let out = File::create(&log).map_err(io(&log))?;
+        let err = out.try_clone().map_err(io(&log))?;
+        let child = Command::new(&daemon.serve.program)
+            .args(&daemon.serve.args)
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .spawn()
+            .map_err(io(Path::new(&daemon.serve.program)))?;
+        let pid = child.id();
+        let child = Arc::new(Mutex::new(child));
+        let reaped = Arc::downgrade(&child);
+        std::thread::spawn(move || {
+            while let Some(child) = reaped.upgrade() {
+                if !matches!(lock(&child).try_wait(), Ok(None)) {
+                    return;
+                }
+                drop(child);
+                std::thread::sleep(POLL);
+            }
+        });
+        Ok(Self { child, pid, log })
+    }
+
+    fn exited(&self) -> Option<ExitStatus> {
+        lock(&self.child).try_wait().ok().flatten()
+    }
+
+    /// Until `state_file` names it, which it writes once it listens.
+    fn listening(&self, state_file: &Path) -> Result<(), RunError> {
+        let deadline = Instant::now() + START_BUDGET;
+        loop {
+            if names_pid(std::fs::read_to_string(state_file).ok().as_deref(), self.pid) {
+                return Ok(());
+            }
+            if let Some(status) = self.exited() {
+                return Err(RunError::DaemonExited { code: status.code(), log: self.log.clone() });
+            }
+            if Instant::now() >= deadline {
+                return Err(RunError::DaemonSilent { state_file: state_file.to_owned(), log: self.log.clone() });
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    fn gone_within(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while self.exited().is_none() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+        true
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let mut child = lock(&self.child);
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Starts `client` in the working directory with the plan's variables, its
 /// stdout into `stream.jsonl` and its stderr into `client.log`. The exit code,
 /// `None` when it was killed.
@@ -204,10 +442,8 @@ pub fn start_client(plan: &RunPlan, layout: &Layout, client: &Step) -> Result<Op
 /// Scores the run in `root` from its `run.json`, `stream.jsonl` and working
 /// directory, and writes `result.json`.
 pub fn score_dir(root: &Path, client: &str) -> Result<RunResult, RunError> {
-    let path = root.join(RUN_FILE);
-    let text = std::fs::read_to_string(&path).map_err(io(&path))?;
     let not_a_run = |why: &str| RunError::NotARun(root.to_owned(), why.to_owned());
-    let record: Value = serde_json::from_str(&text).map_err(|e| not_a_run(&e.to_string()))?;
+    let record = read_record(root)?;
     let task: Task = serde_json::from_value(record["task"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
     let arm = record["arm"].as_str().ok_or_else(|| not_a_run("no arm"))?.to_owned();
     let profile = match record["profile"].as_str() {
@@ -292,7 +528,51 @@ mod tests {
         let record: Value = serde_json::from_str(&std::fs::read_to_string(layout.root.join(RUN_FILE)).unwrap()).unwrap();
         assert_eq!(record["arm"], "a3");
         assert_eq!(record["task"]["id"], "t");
+        assert_eq!(read_plan(&layout.root).unwrap(), plan, "a run runs what run.json says");
         assert!(matches!(prepare(&task(), Arm::A3, &fixture, &layout, &opts), Err(RunError::NotEmpty(_))));
+    }
+
+    #[test]
+    fn on_windows_a_run_with_clawg_needs_a_testing_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let testing = dir.path().join("testing");
+        std::fs::write(&testing, b"\x7fELF\0\0CLAWG_TEST_HOME\0\0").unwrap();
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"\x7fELF\0\0clawg 0.73.0\0").unwrap();
+        let missing = dir.path().join("missing");
+
+        assert!(check_isolation(true, Arm::A3, &testing).is_ok());
+        let refused = check_isolation(true, Arm::A2, &other).unwrap_err();
+        assert!(matches!(&refused, RunError::NotIsolated(path) if *path == other), "{refused}");
+        assert!(refused.to_string().contains("testing"), "{refused}");
+        assert!(matches!(check_isolation(true, Arm::B, &missing), Err(RunError::Io { .. })));
+        assert!(check_isolation(true, Arm::A0, &missing).is_ok(), "an arm without clawg starts none");
+        assert!(check_isolation(true, Arm::A4, &other).is_ok(), "an arm without clawg starts none");
+        assert!(check_isolation(false, Arm::A3, &other).is_ok(), "elsewhere HOME keeps clawg in the run's home");
+    }
+
+    #[test]
+    fn the_mark_is_found_wherever_a_read_cuts_it() {
+        let needle = b"CLAWG_TEST_HOME";
+        for chunk in [1, 2, 5, 14, 15, 16, 64] {
+            for at in [0, 3, 13, 29] {
+                let mut bytes = vec![b'x'; at];
+                bytes.extend_from_slice(needle);
+                bytes.extend_from_slice(b"yyyy");
+                assert!(holds(std::io::Cursor::new(&bytes), needle, chunk).unwrap(), "chunk {chunk}, at {at}");
+            }
+            assert!(!holds(std::io::Cursor::new(b"xxCLAWG_TEST_HOMxCLAWG_TEST_"), needle, chunk).unwrap(), "chunk {chunk}");
+            assert!(!holds(std::io::Cursor::new(b""), needle, chunk).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_daemon_listens_once_its_state_file_names_it() {
+        let state = r#"{"pid": 4242, "port": 50000, "unix_socket": true, "profile": "dev", "version": "0.73.0", "started_at_ms": 1}"#;
+        assert!(names_pid(Some(state), 4242));
+        assert!(!names_pid(Some(state), 4243), "a state file another daemon left");
+        assert!(!names_pid(Some("{\"pid\": 42"), 42), "a state file still being written");
+        assert!(!names_pid(None, 4242));
     }
 
     #[test]

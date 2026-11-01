@@ -27,12 +27,20 @@ agent-eval replay-client STREAM
                  fixture copied as the working directory, the client's
                  configuration, the seed and run.json with the command line
                  of the client session. Starts nothing.
-  run            prepares the run, then starts the replay client in its
-                 working directory instead of a real one: it prints STREAM,
-                 a recorded stream-json, and makes the file changes its
-                 Write and Edit calls record. The stream is captured in
-                 stream.jsonl and scored into result.json. No model is
-                 called.
+  run            prepares the run and runs the session run.json plans. An
+                 arm with clawg first starts the daemon of the run's home
+                 (clawg serve --port 0, output in serve.log), loads the seed
+                 with clawg import and ends with clawg stop, which also runs
+                 when the seed or the client failed (their output in
+                 clawg.log); a seed that does not load starts no client.
+                 The client is the replay client, started in the working
+                 directory instead of a real one: it prints STREAM, a
+                 recorded stream-json, and makes the file changes its Write
+                 and Edit calls record. The stream is captured in
+                 stream.jsonl and scored into result.json. No Claude model
+                 is called. On Windows clawg finds its home through the
+                 system, so an arm with clawg needs a `testing` build of it,
+                 which reads CLAWG_TEST_HOME; any other is refused.
   score          scores a run directory again from its stream.jsonl.
   replay-client  the client a dry run starts: prints STREAM after making
                  its file changes in the current directory.
@@ -211,7 +219,7 @@ fn read_files(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> std:
     Ok(())
 }
 
-fn prepare(args: &RunArgs) -> Result<(arm::RunPlan, Layout), String> {
+fn prepare(args: &RunArgs) -> Result<Layout, String> {
     let tasks = task::load(&args.data).map_err(|e| e.to_string())?;
     let t = task::find(tasks, &args.task).map_err(|e| e.to_string())?;
     let layout = Layout { root: std::path::absolute(&args.out).map_err(|e| format!("{}: {e}", args.out.display()))? };
@@ -224,15 +232,15 @@ fn prepare(args: &RunArgs) -> Result<(arm::RunPlan, Layout), String> {
         max_budget_usd: args.max_budget_usd,
         now_ms: now_ms(),
     };
-    let plan = run::prepare(&t, args.arm, &task::fixture_dir(&args.data, &t), &layout, &options).map_err(|e| e.to_string())?;
-    Ok((plan, layout))
+    run::prepare(&t, args.arm, &task::fixture_dir(&args.data, &t), &layout, &options).map_err(|e| e.to_string())?;
+    Ok(layout)
 }
 
 fn execute(command: Command) -> Result<(), String> {
     match command {
         Command::Tasks { data } => list_tasks(&data),
         Command::Prepare(args) => {
-            let (_, layout) = prepare(&args)?;
+            let layout = prepare(&args)?;
             println!("prepared {}", layout.root.display());
             Ok(())
         }
@@ -243,19 +251,14 @@ fn execute(command: Command) -> Result<(), String> {
                 Ok(_) => return Err(format!("--replay {} is not a file", replay.display())),
                 Err(e) => return Err(format!("--replay {}: {e}", replay.display())),
             }
-            let (plan, layout) = prepare(&args)?;
+            run::check_isolation(cfg!(windows), args.arm, &args.clawg).map_err(|e| e.to_string())?;
+            let layout = prepare(&args)?;
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
             let client = Step {
                 program: exe.to_string_lossy().into_owned(),
                 args: vec!["replay-client".into(), replay.to_string_lossy().into_owned()],
             };
-            let code = run::start_client(&plan, &layout, &client).map_err(|e| e.to_string())?;
-            if code != Some(0) {
-                return Err(format!(
-                    "the replay client exited with {code:?}; see {}",
-                    layout.root.join(run::CLIENT_LOG).display()
-                ));
-            }
+            run::execute(&layout.root, &client).map_err(|e| e.to_string())?;
             let result = run::score_dir(&layout.root, "replay").map_err(|e| e.to_string())?;
             println!("{}", run::summary(&result));
             Ok(())
