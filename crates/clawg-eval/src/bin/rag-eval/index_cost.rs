@@ -1,7 +1,7 @@
 //! What indexing a project's docs cost: the `index` block of a docs results
 //! file and the lines of the report that read it.
 
-use clawg_core::eval_api::{longest_first, EvalCpu, EvalIndexRun, EvalMemoReport, EvalPassageLengths, EMBED_BATCH};
+use clawg_core::eval_api::{longest_first, queue_groups, EvalCpu, EvalIndexRun, EvalMemoReport, EvalPassageLengths, EMBED_BATCH};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -103,13 +103,19 @@ pub fn padded_sorted(lengths: &[usize]) -> usize {
 pub struct Tokens {
     /// Inside the model's window, without padding.
     pub real: usize,
-    /// Doc by doc, in the order each was embedded: what the model runs
-    /// without the memo.
+    /// Doc by doc, in the order of each doc's passages: what a refresh ran
+    /// before it sorted or queued them.
     pub padded: usize,
     /// What the embedder reports it ran.
     pub padded_ran: usize,
-    /// `padded` with each doc's passages sorted longest first.
+    /// `padded` with each doc's passages sorted longest first, the order a
+    /// refresh embedded a doc of more than one batch in before it queued
+    /// docs: what the model would run doc by doc.
     pub padded_sorted_in_doc: usize,
+    /// `padded` with the passages of each group of docs that share a call of a
+    /// refresh (`queue_groups`) sorted longest first: what the model runs
+    /// without the memo.
+    pub padded_sorted_queue: usize,
     /// `padded` with every passage of the run sorted longest first.
     pub padded_sorted_all: usize,
     /// What the calls to the tokenizer took.
@@ -117,16 +123,22 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    /// `docs` holds the lengths of each doc's passages in the order they were
-    /// embedded. The three paddings do not bound each other: sorting can pad
-    /// more when the last run is short.
+    /// `docs` holds the lengths of each doc's passages in the order of the
+    /// passages. The paddings do not bound each other: sorting can pad more
+    /// when the last run is short.
     pub fn new(docs: &[Vec<usize>], count_seconds: f64, padded_ran: f64) -> Self {
         let all: Vec<usize> = docs.iter().flatten().copied().collect();
+        let per_doc: Vec<usize> = docs.iter().map(Vec::len).collect();
+        let padded_sorted_queue = queue_groups(&per_doc)
+            .iter()
+            .map(|group| padded_sorted(&group.iter().flat_map(|&k| docs[k].iter().copied()).collect::<Vec<_>>()))
+            .sum();
         Self {
             real: all.iter().sum(),
             padded: docs.iter().map(|d| padded(d)).sum(),
             padded_ran: padded_ran.round() as usize,
             padded_sorted_in_doc: docs.iter().map(|d| padded_sorted(d)).sum(),
+            padded_sorted_queue,
             padded_sorted_all: padded_sorted(&all),
             count_seconds,
         }
@@ -140,19 +152,26 @@ impl Tokens {
     /// One line for the report.
     pub fn line(&self) -> String {
         format!(
-            "tokens: real {}  padded {}  ran {}  sorted in doc {}  sorted in run {}  counted in {:.2} s\n",
-            self.real, self.padded, self.padded_ran, self.padded_sorted_in_doc, self.padded_sorted_all, self.count_seconds,
+            "tokens: real {}  padded {}  ran {}  sorted in doc {}  sorted in queue {}  sorted in run {}  counted in {:.2} s\n",
+            self.real,
+            self.padded,
+            self.padded_ran,
+            self.padded_sorted_in_doc,
+            self.padded_sorted_queue,
+            self.padded_sorted_all,
+            self.count_seconds,
         )
     }
 }
 
-/// Said when the padding computed and the padding that ran differ although
-/// every passage was embedded: then both are the same runs.
+/// Said when the padding computed for the order a refresh embeds in
+/// (`padded_sorted_queue`) and the padding that ran differ although every
+/// passage was embedded: then both are the same runs.
 pub fn padding_warning(tokens: &Tokens, from_memo: usize) -> Option<String> {
-    (from_memo == 0 && tokens.padded != tokens.padded_ran).then(|| {
+    (from_memo == 0 && tokens.padded_sorted_queue != tokens.padded_ran).then(|| {
         format!(
-            "warning: the padded tokens computed ({}) differ from those the embedder ran ({})",
-            tokens.padded, tokens.padded_ran
+            "warning: the padded tokens computed for the refresh order ({}) differ from those the embedder ran ({})",
+            tokens.padded_sorted_queue, tokens.padded_ran
         )
     })
 }
@@ -410,9 +429,49 @@ mod tests {
     }
 
     #[test]
+    fn padded_sorted_queue_sorts_each_group_of_docs_together() {
+        // The first doc fills the queue's first limit and goes alone; the next
+        // two share the second call, where the long passages go first.
+        let batch = [5; 16];
+        let (short, long) = ([10; 8], [100; 8]);
+
+        let t = tokens_of(&[&batch, &short, &long]);
+
+        assert_eq!(t.padded_sorted_queue, 16 * 5 + 16 * 100);
+        assert_eq!(t.padded_sorted_in_doc, 16 * 5 + 8 * 10 + 8 * 100, "each doc on its own");
+        assert_eq!(t.padded_sorted_all, 16 * 100 + 16 * 5, "the whole run in one call");
+        assert_eq!(tokens_of(&[]).padded_sorted_queue, 0);
+    }
+
+    #[test]
+    fn the_padding_warning_compares_with_the_queue_padding() {
+        let at = |sorted_in_doc, queue, ran| Tokens {
+            padded_sorted_in_doc: sorted_in_doc,
+            padded_sorted_queue: queue,
+            padded_ran: ran,
+            ..tokens_of(&[])
+        };
+
+        assert_eq!(padding_warning(&at(700, 800, 800), 0), None, "the model ran the queue's padding");
+        assert_eq!(padding_warning(&at(800, 700, 800), 0).map(|w| w.contains("700")), Some(true), "the padding of each doc is not the one to match");
+        let warning = padding_warning(&at(800, 800, 900), 0).expect("a warning");
+        assert!(warning.contains("800") && warning.contains("900"), "{warning}");
+        assert_eq!(padding_warning(&at(800, 800, 900), 30), None, "with passages from the memo, the model ran fewer");
+    }
+
+    #[test]
+    fn the_padding_warning_names_both_numbers() {
+        let t = Tokens { padded: 1200, padded_sorted_queue: 900, padded_ran: 1000, ..tokens_of(&[]) };
+
+        let warning = padding_warning(&t, 0).expect("a warning");
+
+        assert!(warning.contains("900") && warning.contains("1000"), "{warning}");
+    }
+
+    #[test]
     fn a_mismatch_between_computed_and_ran_padding_warns_only_when_nothing_came_from_the_memo() {
-        let t = Tokens { padded: 1000, padded_ran: 1200, ..tokens_of(&[]) };
-        let same = Tokens { padded: 1000, padded_ran: 1000, ..tokens_of(&[]) };
+        let t = Tokens { padded_sorted_queue: 1000, padded_ran: 1200, ..tokens_of(&[]) };
+        let same = Tokens { padded_sorted_queue: 1000, padded_ran: 1000, ..tokens_of(&[]) };
 
         let warning = padding_warning(&t, 0).expect("a warning");
 

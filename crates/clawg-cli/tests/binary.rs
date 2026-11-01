@@ -1224,6 +1224,76 @@ async fn an_engram_export_imports_through_the_binary() {
     assert_eq!(mixed.status.code(), Some(2), "a map of a clawg export is a usage error: {}", stderr_of(&mixed));
 }
 
+/// Claude Code's memory of `project` under the sandbox's projects directory,
+/// written by hand as the client writes it: an index, a preference with its
+/// type nested under `metadata`, one with it at the top, and a fact.
+fn claude_code_memory(sandbox: &Sandbox, project: &str) -> PathBuf {
+    let projects = sandbox.home.join(".claude").join("projects");
+    let memory = projects.join(project).join("memory");
+    std::fs::create_dir_all(&memory).expect("memory dir");
+    let files = [
+        ("MEMORY.md", "- [Tabs](tabs.md) — Makefiles\n- [Review](review.md)\n- [Port](port.md)\n"),
+        ("tabs.md", "---\nname: Tabs in Makefiles\ndescription: indentation\nmetadata:\n  type: feedback\n---\n\nIndent Makefiles with tabs.\n"),
+        ("review.md", "---\nname: Small reviews\ntype: user\n---\nThe user reviews one commit at a time.\n"),
+        ("port.md", "---\nname: Daemon port\ntype: reference\nmood: calm\n---\nThe daemon listens on 27380.\n"),
+    ];
+    for (name, text) in files {
+        std::fs::write(memory.join(name), text).expect("a memory file");
+    }
+    projects
+}
+
+#[tokio::test]
+async fn a_claude_code_memory_imports_through_the_binary() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let app = sandbox.home.join("app");
+    std::fs::create_dir_all(app.join(".git")).expect("repo");
+    let projects = claude_code_memory(&sandbox, "-sandbox-app").to_string_lossy().into_owned();
+    let map = format!("-sandbox-app={}", app.display());
+    let import = |more: &[&str]| {
+        let mut argv = vec!["import", "--from", "claude-code", projects.as_str(), "--project-map", map.as_str()];
+        argv.extend_from_slice(more);
+        argv.extend_from_slice(&["--profile", "dev"]);
+        sandbox.run(&argv)
+    };
+    let imported = |rows: &str| ["Indent Makefiles with tabs.", "one commit at a time", "listens on 27380"].map(|t| rows.contains(t));
+
+    let dry = import(&["--dry-run"]);
+    assert_eq!(dry.status.code(), Some(0), "{}", stderr_of(&dry));
+    let said = stdout_of(&dry);
+    assert!(said.starts_with("would import 3 of 3 "), "{said}");
+    assert!(said.contains("from claude-code: notes 3,"), "{said}");
+    assert!(said.contains("observation feedback → user_preference: 1"), "{said}");
+    assert!(said.contains("observation reference → semantic_fact: 1"), "{said}");
+    assert!(said.contains("frontmatter.mood 1"), "what the adapter does not know is counted: {said}");
+    assert_eq!(imported(&daemon.list().await), [false; 3], "a dry run writes nothing");
+
+    let done = import(&[]);
+    assert_eq!(done.status.code(), Some(0), "{}", stderr_of(&done));
+    assert!(stdout_of(&done).contains("this is import 1;"), "{}", stdout_of(&done));
+    let rows = daemon.list().await;
+    assert_eq!(imported(&rows), [true; 3], "{rows}");
+    assert_eq!(rows.matches("\"agent_id\":\"migrated\"").count(), 3, "{rows}");
+    assert_eq!(rows.matches("\"memory_type\":\"user_preference\"").count(), 2, "{rows}");
+    assert!(!rows.contains("architectural_decision"), "{rows}");
+
+    let again = import(&[]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr_of(&again));
+    assert!(stdout_of(&again).starts_with("imported 0 of "), "a second import adds nothing: {}", stdout_of(&again));
+    let again_dry = import(&["--dry-run"]);
+    assert!(stdout_of(&again_dry).starts_with("would import 0 of "), "{}", stdout_of(&again_dry));
+
+    let undone = sandbox.run(&["import", "--undo", "1", "--profile", "dev"]);
+    assert_eq!(undone.status.code(), Some(0), "{}", stderr_of(&undone));
+    assert!(stdout_of(&undone).starts_with("took back import 1: removed 3 memories"), "{}", stdout_of(&undone));
+    assert_eq!(imported(&daemon.list().await), [false; 3], "the undo leaves the store as before the import");
+
+    let mixed = sandbox.run(&["import", "--from", "claude-code", &projects, "--map-root", "/a=.", "--profile", "dev"]);
+    assert_eq!(mixed.status.code(), Some(2), "a map of a clawg export is a usage error: {}", stderr_of(&mixed));
+}
+
 #[tokio::test]
 async fn projects_move_moves_and_undoes_a_seeded_store() {
     let sandbox = Sandbox::new();
@@ -1739,6 +1809,38 @@ async fn doctor_reads_a_running_daemons_store_without_changing_it() {
     assert_eq!(findings(&report, "store.owner"), [("ok", "healthy")]);
     assert_eq!(findings(&report, "agents"), [("ok", "healthy")]);
     assert_eq!(store_files(&sandbox.data_dir()), before, "a stopped store gains no file and no byte");
+}
+
+#[tokio::test]
+async fn doctor_names_native_memory_not_imported() {
+    let sandbox = Sandbox::new();
+    let projects = claude_code_memory(&sandbox, "-sandbox-app");
+    let (_, report) = doctor(&sandbox);
+    assert!(findings(&report, "native_memory").is_empty(), "no server registered, no finding: {report}");
+
+    let servers = json!({ "mcpServers": { "clawg-dev": { "type": "stdio", "command": BIN, "args": ["mcp", "--profile", "dev"] } } });
+    std::fs::write(sandbox.home.join(".claude.json"), servers.to_string()).expect(".claude.json");
+    let (output, report) = doctor(&sandbox);
+    assert_eq!(output.status.code(), Some(0), "an info finding does not fail: {report}");
+    assert_eq!(findings(&report, "native_memory"), [("info", "not_imported")], "{report}");
+    let finding = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "native_memory").unwrap();
+    assert_eq!(finding["evidence"]["files"], 3, "{finding}");
+    assert_eq!(finding["evidence"]["not_imported"], 3, "{finding}");
+    assert_eq!(finding["evidence"]["dir"].as_str().map(PathBuf::from), Some(projects.clone()), "{finding}");
+    let step = finding["safe_next_step"].as_str().expect("a step");
+    assert!(step.starts_with("clawg import --from claude-code ") && step.ends_with(" --dry-run --profile dev"), "{step}");
+    assert!(!stdout_of(&output).contains("Indent Makefiles"), "doctor reads no memory's text");
+
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let import = sandbox.run(&["import", "--from", "claude-code", &projects.to_string_lossy(), "--profile", "dev"]);
+    assert_eq!(import.status.code(), Some(0), "{}", stderr_of(&import));
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "native_memory"), [("ok", "healthy")], "{report}");
+
+    std::fs::write(projects.join("-sandbox-app").join("memory").join("new.md"), "A memory written since.").expect("new file");
+    let (_, report) = doctor(&sandbox);
+    assert_eq!(findings(&report, "native_memory"), [("info", "not_imported")], "a new memory is named again: {report}");
 }
 
 #[tokio::test]

@@ -52,6 +52,9 @@ pub struct StoreFacts {
     /// The subfolders declared as projects (V30), by repository and subpath;
     /// `None` before the table exists, when none could be declared.
     pub subfolders: Option<Vec<DeclaredSubfolder>>,
+    /// The origin of every note imported from Claude Code's auto memory,
+    /// deleted or not, each once and in order.
+    pub claude_code_imports: Vec<String>,
 }
 
 /// A row of `project_subfolder`, as it is stored.
@@ -327,7 +330,17 @@ fn read_facts(c: &Connection) -> rusqlite::Result<StoreFacts> {
         id_rows: id_rows(c)?,
         open_deletes: if has.table("project_delete") { Some(open_deletes(c)?) } else { None },
         subfolders: if has.table("project_subfolder") { Some(subfolders(c)?) } else { None },
+        claude_code_imports: claude_code_imports(c)?,
     })
+}
+
+fn claude_code_imports(c: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = c.prepare(
+        "SELECT DISTINCT created_by_ref FROM memory WHERE source = 'import' AND created_by_ref LIKE ?1 ORDER BY created_by_ref",
+    )?;
+    let prefix = format!("{}:%", crate::memory::portability::claude_code::SOURCE);
+    let rows = stmt.query_map([prefix], |r| r.get(0))?;
+    rows.collect()
 }
 
 fn subfolders(c: &Connection) -> rusqlite::Result<Vec<DeclaredSubfolder>> {
@@ -849,6 +862,25 @@ mod tests {
         })
         .await;
         assert_eq!(found.lonely_disputes, [2, 3]);
+    }
+
+    #[tokio::test]
+    async fn the_facts_name_the_origins_imported_from_claude_code() {
+        let dir = store_with(|c| {
+            for content in ["one piece", "another piece", "a deleted one", "from engram", "saved here"] {
+                insert(c, &row(content));
+            }
+            c.execute_batch(
+                "UPDATE memory SET source = 'import', created_by_ref = 'claude-code:-work-app/a.md' WHERE id IN (1, 2);
+                 UPDATE memory SET source = 'import', created_by_ref = 'claude-code:-work-app/b.md', deleted_at = 1 WHERE id = 3;
+                 UPDATE memory SET source = 'import', created_by_ref = 'engram:obs-1' WHERE id = 4;
+                 UPDATE memory SET created_by_ref = 'claude-code:-work-app/c.md' WHERE id = 5;",
+            )
+            .unwrap();
+        })
+        .await;
+        let facts = inspect(dir.path()).facts.unwrap();
+        assert_eq!(facts.claude_code_imports, ["claude-code:-work-app/a.md", "claude-code:-work-app/b.md"]);
     }
 
     #[tokio::test]

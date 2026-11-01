@@ -4051,6 +4051,72 @@ async fn an_engram_export_without_notes_imports_nothing() {
     assert_eq!(listed["items"].as_array().map(Vec::len), Some(0), "{listed}");
 }
 
+/// Claude Code's memory of the project `-work-app` as the daemon reads it:
+/// a preference with the type nested, a fact, and the index.
+fn claude_code_document() -> Value {
+    json!({ "projects": [{ "name": "-work-app", "entries": [
+        { "name": "MEMORY.md", "text": "- [Tabs](tabs.md)\n- [Port](port.md)", "modified_ms": 1_793_361_600_000_i64 },
+        { "name": "port.md", "text": "---\nname: Port\ntype: reference\n---\nThe daemon listens on 27380.",
+          "modified_ms": 1_793_361_600_000_i64 },
+        { "name": "tabs.md", "text": "---\nname: Tabs\nmetadata:\n  type: feedback\n---\nIndent Makefiles with tabs.",
+          "modified_ms": 1_793_361_600_000_i64 }
+    ] }] })
+}
+
+#[tokio::test]
+async fn the_claude_code_document_imports_by_text() {
+    let h = Harness::start().await.with_tokenizer();
+    let text = claude_code_document().to_string();
+
+    let (status, report) = h.post_json("/v1/import", json!({ "text": text, "from": "claude-code" })).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!((report["foreign"]["source"].clone(), report["foreign"]["version"].clone()), (json!("claude-code"), json!("")));
+    assert_eq!((report["foreign"]["notes"].clone(), report["inserted"].clone()), (json!(2), json!(2)));
+    assert_eq!(report["foreign"]["unplaced"], json!({}), "{report}");
+    let (_, listed) = h.get_json("/v1/memories?kind=memory&agent=migrated").await;
+    let mut types: Vec<(String, String)> = listed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|m| (m["summary"].as_str().unwrap().to_owned(), m["memory_type"].as_str().unwrap().to_owned()))
+        .collect();
+    types.sort();
+    assert_eq!(
+        types,
+        [
+            ("Port\nThe daemon listens on 27380.".to_owned(), "semantic_fact".to_owned()),
+            ("Tabs\nIndent Makefiles with tabs.".to_owned(), "user_preference".to_owned()),
+        ]
+    );
+
+    let (status, again) = h.post_json("/v1/import", json!({ "text": text, "from": "claude-code" })).await;
+    assert_eq!((status, again["inserted"].clone()), (200, json!(0)), "{again}");
+    let (status, body) =
+        h.post_json("/v1/import", json!({ "text": text, "from": "claude-code", "map_roots": [["/old", "/new"]] })).await;
+    assert_eq!(status, 400, "a map of a clawg export: {body}");
+}
+
+#[tokio::test]
+async fn a_claude_code_job_reads_a_directory() {
+    let h = Harness::start().await.with_tokenizer();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let memory = dir.path().join("-work-app").join("memory");
+    std::fs::create_dir_all(&memory).expect("memory dir");
+    std::fs::write(memory.join("port.md"), "---\nname: Port\ntype: reference\n---\nThe daemon listens on 27380.").expect("topic");
+    let path = dir.path().to_string_lossy().into_owned();
+
+    let (status, job) = h.post_json("/v1/imports", json!({ "path": path, "from": "claude-code", "dry_run": true })).await;
+    assert_eq!(status, 202, "{job}");
+    let done = h.finished_job(job["job_id"].as_u64().expect("job id")).await;
+    assert_eq!((done["phase"].clone(), done["from"].clone()), (json!("done"), json!("claude-code")), "{done}");
+    assert_eq!(done["report"]["foreign"]["notes"], 1, "{done}");
+
+    let file = memory.join("port.md").to_string_lossy().into_owned();
+    let (status, body) = h.post_json("/v1/imports", json!({ "path": file, "from": "claude-code" })).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("not a directory")), "{body}");
+}
+
 // ── /v1/imports ─────────────────────────────────────────────────────────────
 
 /// Writes `text` as `name` in `dir` and answers the file's absolute path.
@@ -5618,6 +5684,8 @@ async fn the_listing_after_a_merge_shows_the_target_alone() {
 }
 
 /// Writes a save still in the outbox for `project`, as one the worker has not finished.
+/// Only after the worker has stored a save: it reads the outbox once, when it
+/// starts, and would store a row written before that read.
 async fn pending_save(h: &Harness, operation: &'static str, project: &str) {
     let event = json!({ "agent_id": "agent-http", "project_id": project, "content": "" }).to_string();
     h.ctx
@@ -5640,6 +5708,7 @@ async fn a_merge_waits_for_the_saves_of_its_projects() {
     let h = Harness::start().await;
     let (app, web, other) =
         (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
+    save_in(&h, &other, "the other service is written in Go").await;
     pending_save(&h, "op-1", &app).await;
     let store = h.ctx.runtime.store.clone();
     // Taken before the spawn: the task may start its sleep before this line runs.

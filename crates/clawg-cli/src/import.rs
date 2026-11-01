@@ -840,15 +840,14 @@ fn render_foreign(lang: Lang, f: &ForeignReport, lines: &mut Vec<String>) {
         Lang::En => "(none)",
         Lang::Es => "(ninguno)",
     };
+    // A source that does not version its format is named alone.
+    let source = if f.version.is_empty() { f.source.clone() } else { format!("{} {}", f.source, f.version) };
     lines.push(match lang {
         Lang::En => format!(
-            "from {} {}: notes {}, memories {}, notes in more than one memory {}",
-            f.source, f.version, f.notes, f.rows, f.split_notes
+            "from {source}: notes {}, memories {}, notes in more than one memory {}",
+            f.notes, f.rows, f.split_notes
         ),
-        Lang::Es => format!(
-            "de {} {}: notas {}, memorias {}, notas en más de una memoria {}",
-            f.source, f.version, f.notes, f.rows, f.split_notes
-        ),
+        Lang::Es => format!("de {source}: notas {}, memorias {}, notas en más de una memoria {}", f.notes, f.rows, f.split_notes),
     });
     let heading = match lang {
         Lang::En => "notes by type of the source:",
@@ -1479,6 +1478,18 @@ mod tests {
              projects whose id a registration gave another root during the import, not imported:\n  web (/work/web) belongs to /other/web, notes 2\n\
              the store before the import is in /b/memory-x-pre-import.db; `clawg restore` brings it back"
         );
+    }
+
+    #[test]
+    fn a_source_without_a_format_version_is_named_alone() {
+        let report = |lang| {
+            let mut r = foreign_report();
+            let foreign = r.foreign.as_mut().unwrap();
+            (foreign.source, foreign.version) = ("claude-code".into(), String::new());
+            render(lang, &r)
+        };
+        assert!(report(Lang::En).contains("\nfrom claude-code: notes 5, memories 4,"), "{}", report(Lang::En));
+        assert!(report(Lang::Es).contains("\nde claude-code: notas 5, memorias 4,"), "{}", report(Lang::Es));
     }
 
     #[test]

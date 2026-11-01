@@ -16,6 +16,7 @@ use clawg_core::memory::inspect::{
     duplicates, live_of, AgentRows, DeclaredSubfolder, Duplicate, FolderPrint, IdRows, Invariants, OpenDelete, OutboxFacts,
     ProjectRow, RegistryRow, RemoteRow,
 };
+use clawg_core::memory::portability::claude_code;
 use clawg_core::memory::store_lock::StoreOwner;
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
@@ -528,6 +529,39 @@ pub fn outbox(lang: Lang, facts: &OutboxFacts, daemon_running: bool, profile: Pr
     found
 }
 
+/// Claude Code's own memory beside clawg's: the topic files under `dir`, by
+/// project and file name, against the origins clawg imported. Named only
+/// when the client runs this profile's server, so two memories are news.
+pub fn native_memory(
+    lang: Lang,
+    dir: &Path,
+    files: &[(String, String)],
+    imported: &[String],
+    registered: bool,
+    profile: Profile,
+) -> Vec<Finding> {
+    if !registered || files.is_empty() {
+        return Vec::new();
+    }
+    let imported: std::collections::HashSet<&str> = imported.iter().map(String::as_str).collect();
+    let missing = files.iter().filter(|(project, file)| !imported.contains(claude_code::origin(project, file).as_str())).count();
+    let projects = files.iter().map(|(project, _)| project).collect::<std::collections::BTreeSet<_>>().len();
+    let evidence = json!({ "dir": dir, "projects": projects, "files": files.len(), "not_imported": missing });
+    if missing == 0 {
+        let message = match lang {
+            Lang::En => format!("clawg has imported every file of Claude Code's own memory ({})", files.len()),
+            Lang::Es => format!("clawg importó todos los archivos de la memoria propia de Claude Code ({})", files.len()),
+        };
+        return vec![Finding::ok("native_memory", message).evidence(evidence)];
+    }
+    let message = match lang {
+        Lang::En => format!("Claude Code's own memory has {missing} of {} files clawg has not imported", files.len()),
+        Lang::Es => format!("la memoria propia de Claude Code tiene {missing} de {} archivos que clawg no importó", files.len()),
+    };
+    let step = format!("clawg import --from claude-code {} --dry-run", shell_word(&dir.to_string_lossy()));
+    vec![Finding::new("native_memory", Severity::Info, "not_imported", message).evidence(evidence).step(with_profile(&step, profile))]
+}
+
 pub fn agents(lang: Lang, rows: &[AgentRows]) -> Vec<Finding> {
     let listed: Vec<_> =
         rows.iter().map(|r| json!({ "agent_id": r.agent_id, "live": r.live, "total": r.total })).collect();
@@ -1008,6 +1042,35 @@ mod tests {
 
     fn kinds(found: &[Finding]) -> Vec<(&'static str, Severity, &'static str)> {
         found.iter().map(|f| (f.check_id, f.severity, f.reason_code)).collect()
+    }
+
+    #[test]
+    fn native_memory_is_named_until_every_file_is_imported() {
+        let dir = Path::new("/home/u/.claude/projects");
+        let files: Vec<(String, String)> = [("-work-app", "a.md"), ("-work-app", "b.md"), ("-work-web", "c.md")]
+            .iter()
+            .map(|(p, f)| (p.to_string(), f.to_string()))
+            .collect();
+        let imported = |origins: &[&str]| origins.iter().map(|o| o.to_string()).collect::<Vec<_>>();
+
+        let missing = native_memory(L, dir, &files, &imported(&["claude-code:-work-app/a.md", "engram:x"]), true, P);
+        assert_eq!(kinds(&missing), [("native_memory", Severity::Info, "not_imported")]);
+        assert_eq!(missing[0].evidence, json!({ "dir": dir, "projects": 2, "files": 3, "not_imported": 2 }));
+        assert_eq!(
+            missing[0].safe_next_step.as_deref(),
+            Some("clawg import --from claude-code /home/u/.claude/projects --dry-run --profile dev")
+        );
+        assert!(!missing[0].requires_confirmation, "a dry run writes nothing");
+        assert_eq!(missing[0].message, "Claude Code's own memory has 2 of 3 files clawg has not imported");
+        let es = native_memory(Lang::Es, dir, &files, &[], true, P);
+        assert_eq!(es[0].message, "la memoria propia de Claude Code tiene 3 de 3 archivos que clawg no importó");
+
+        let all = imported(&["claude-code:-work-app/a.md", "claude-code:-work-app/b.md", "claude-code:-work-web/c.md"]);
+        assert_eq!(kinds(&native_memory(L, dir, &files, &all, true, P)), [("native_memory", Severity::Ok, "healthy")]);
+        assert!(native_memory(L, dir, &files, &[], false, P).is_empty(), "without the server, two memories are no news");
+        assert!(native_memory(L, dir, &[], &[], true, P).is_empty(), "nothing to import");
+        let spaced = native_memory(L, Path::new("/home/u/my claude/projects"), &files, &[], true, P);
+        assert!(spaced[0].safe_next_step.as_deref().unwrap().contains("'/home/u/my claude/projects'"), "{spaced:?}");
     }
 
     #[test]

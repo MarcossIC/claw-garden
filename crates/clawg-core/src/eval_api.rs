@@ -1065,6 +1065,13 @@ pub fn join_pieces(pieces: &[&str]) -> String {
     crate::memory::pieces::join_pieces(pieces)
 }
 
+/// The tier a row inserted at tier 3 earns from its importance, accesses and
+/// type, the promotion the store applies: a seeded row lands where the store
+/// would have put it.
+pub fn earned_tier(importance: f64, access_count: i64, memory_type: &str) -> i64 {
+    crate::memory::tier::compute_tier(3, importance, access_count, memory_type)
+}
+
 /// Whether a memory type asserts something the detector can pair; a name that
 /// is no memory type does not.
 pub fn is_claim_type(memory_type: &str) -> bool {
@@ -1083,7 +1090,7 @@ pub const EMBED_BATCH: usize = crate::memory::embedder::EMBED_BATCH;
 /// The indices of `tokens` from the largest count to the smallest, equal
 /// counts in the order they came: the order an import embeds its rows in.
 pub fn longest_first(tokens: &[usize]) -> Vec<usize> {
-    crate::memory::portability::import::longest_first(tokens)
+    crate::memory::embedder::longest_first(tokens)
 }
 
 /// The token window the live embedder truncates to — re-exported so the eval
@@ -1178,6 +1185,27 @@ impl EvalTokenCounter {
         let split = crate::memory::chunker::ChatChunker::from_tokenizer(tokenizer).split_save(text);
         (split.pieces.into_iter().map(|c| c.text).collect(), split.head)
     }
+}
+
+/// The order in which a docs refresh hands `texts` (the `indexed_text` of the
+/// passages it embeds) to the embedder, as indices into them: the order of
+/// production's own `passage_order`, counted by `counter`'s tokenizer under
+/// `embedder`'s passage prefix, and the identity where production leaves the
+/// passages as they are (`EMBED_BATCH` texts or fewer, or a counter with no
+/// tokenizer).
+pub fn passage_order(embedder: &EvalEmbedder, counter: &EvalTokenCounter, texts: &[String]) -> Vec<usize> {
+    let tokenizer = match &counter.0 {
+        EvalTokenCounterInner::Real(tok) => Some(tok.as_ref()),
+        EvalTokenCounterInner::Fake => None,
+    };
+    project_docs::passage_order(tokenizer, embedder.inner.as_ref(), texts).unwrap_or_else(|| (0..texts.len()).collect())
+}
+
+/// The docs, by position, that share each call a docs refresh makes to the
+/// embedder when `passages_per_doc` are the passages of the docs it indexes, in
+/// the order of the plan: the flushes of production's own queue, with its cap.
+pub fn queue_groups(passages_per_doc: &[usize]) -> Vec<Vec<usize>> {
+    project_docs::queue_groups(project_docs::QUEUE_PASSAGES, passages_per_doc)
 }
 
 /// True iff the real embedding model is already cached at `base_dir` —
@@ -1365,7 +1393,8 @@ pub struct EvalIndexRun {
     pub docs: Vec<EvalDocTiming>,
 }
 
-/// The tokens of each passage of one doc, in the order they were embedded.
+/// The tokens of each passage of one doc, in the order of its passages, not
+/// in the one they were embedded in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalDocLengths {
     pub path: String,
@@ -1380,11 +1409,12 @@ pub struct EvalPassageLengths {
     pub count_seconds: f64,
 }
 
-/// The tokens of each text inside the model's window, grouped by doc (a doc's
+/// The tokens of each text as the model receives it, grouped by doc (a doc's
 /// texts come together) and counted in runs of [`EMBED_BATCH`], as the
-/// embedder takes them, with the time the tokenizer took.
+/// embedder takes them, with the time counting took.
 fn lengths_by_doc(
     tokenizer: &tokenizers::Tokenizer,
+    embedder: &dyn Embedder,
     texts: &[(String, String)],
 ) -> Result<(Vec<EvalDocLengths>, std::time::Duration), EvalError> {
     let mut docs: Vec<EvalDocLengths> = Vec::new();
@@ -1394,12 +1424,12 @@ fn lengths_by_doc(
         let end = texts[start..].iter().position(|(path, _)| *path != texts[start].0).map_or(texts.len(), |n| start + n);
         let mut lengths = Vec::with_capacity(end - start);
         for run in texts[start..end].chunks(EMBED_BATCH) {
-            let refs: Vec<&str> = run.iter().map(|(_, text)| text.as_str()).collect();
+            let run: Vec<&str> = run.iter().map(|(_, text)| text.as_str()).collect();
             let counting = std::time::Instant::now();
-            let encodings = crate::memory::embedder::window_encodings(tokenizer, &refs)
+            let counts = crate::memory::embedder::passage_token_counts(tokenizer, embedder, &run)
                 .map_err(|e| EvalError::Embed(e.to_string()))?;
             took += counting.elapsed();
-            lengths.extend(encodings.iter().map(tokenizers::Encoding::len));
+            lengths.extend(counts);
         }
         docs.push(EvalDocLengths { path: texts[start].0.clone(), lengths });
         start = end;
@@ -1442,8 +1472,9 @@ impl EvalDocIndex {
     /// The tokens of every passage the index holds, as the model receives
     /// them: the text of the stored passage under the embedder's passage
     /// prefix, cut to the model's window, by doc in path order and within a
-    /// doc in the order its passages were embedded. `None` without a
-    /// tokenizer, which only the real model brings.
+    /// doc in the order of its passages, which is not the order a refresh
+    /// embedded them in. `None` without a tokenizer, which only the real model
+    /// brings.
     pub async fn passage_lengths(&self) -> Result<Option<EvalPassageLengths>, EvalError> {
         let Some(tokenizer) = &self.tokenizer else { return Ok(None) };
         let rows = self
@@ -1466,17 +1497,9 @@ impl EvalDocIndex {
             .map_err(|e| EvalError::Doc(e.to_string()))?;
         let texts: Vec<(String, String)> = rows
             .into_iter()
-            .map(|(path, passage)| {
-                let text = crate::memory::embedder::apply_role_prefix(
-                    EmbedRole::Passage,
-                    &passage.indexed_text(),
-                    self.embedder.query_prefix(),
-                    self.embedder.passage_prefix(),
-                );
-                (path, text)
-            })
+            .map(|(path, passage)| (path, passage.indexed_text()))
             .collect();
-        let (docs, took) = lengths_by_doc(tokenizer, &texts)?;
+        let (docs, took) = lengths_by_doc(tokenizer, self.embedder.as_ref(), &texts)?;
         Ok(Some(EvalPassageLengths { docs, count_seconds: took.as_secs_f64() }))
     }
 
@@ -1949,6 +1972,15 @@ mod tests {
     use crate::memory::db::{seed_on_disk, StoredContract};
     use crate::memory::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
     use crate::memory::pieces::StoredPiece;
+
+    #[test]
+    fn a_seeded_row_earns_the_tier_the_store_promotes_it_to() {
+        assert_eq!(earned_tier(5.0, 1, "semantic_fact"), 3);
+        assert_eq!(earned_tier(9.0, 1, "semantic_fact"), 1);
+        assert_eq!(earned_tier(5.0, 1, "user_preference"), 1);
+        assert_eq!(earned_tier(5.0, 2, "architectural_decision"), 2);
+        assert_eq!(earned_tier(5.0, 3, "architectural_decision"), 1);
+    }
 
     #[test]
     fn eval_cpu_names_this_machine() {
@@ -2863,6 +2895,59 @@ second
         fn passage_prefix(&self) -> &str { "pfx " }
     }
 
+    /// `FakeEmbedder` that notes how many texts each call holds.
+    #[derive(Default)]
+    struct CallSizes {
+        sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for CallSizes {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+            FakeEmbedder::default().embed_with_role(text, role).await
+        }
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, crate::memory::embedder::EmbedError> {
+            self.sizes.lock().unwrap().push(texts.len());
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                out.push(self.embed_with_role(text, role).await?);
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize { 384 }
+        fn model_id(&self) -> &str { "call-sizes" }
+        fn query_prefix(&self) -> &str { "" }
+        fn passage_prefix(&self) -> &str { "" }
+    }
+
+    #[tokio::test]
+    async fn queue_groups_are_the_calls_a_refresh_makes() {
+        let store_dir = crate::test_dir::test_dir();
+        let root = crate::test_dir::test_dir();
+        for (name, passages) in [("a.md", 3), ("b.md", 20), ("c.md", 5), ("d.md", 0), ("e.md", 5)] {
+            let doc = if passages == 0 { "# Empty
+".to_string() } else { format!("# T
+{}", ladder(passages)) };
+            std::fs::write(root.path().join(name), doc).unwrap();
+        }
+        let recording = Arc::new(CallSizes::default());
+        let embedder = EvalEmbedder::of(recording.clone(), Arc::default());
+        let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path()).await.unwrap();
+
+        let run = index.index(root.path(), &[]).await.unwrap();
+        index.close().await.unwrap();
+
+        let mut docs: Vec<(&str, usize)> = run.docs.iter().map(|d| (d.path.as_str(), d.passages)).collect();
+        docs.sort();
+        let per_doc: Vec<usize> = docs.iter().map(|d| d.1).collect();
+        assert_eq!(per_doc, [3, 20, 5, 0, 5]);
+        let groups = queue_groups(&per_doc);
+        assert_eq!(groups.concat(), [0, 1, 2, 3, 4], "every doc is in a group, in the order of the plan");
+        let sizes: Vec<usize> = groups.iter().map(|g| g.iter().map(|&k| per_doc[k]).sum()).collect();
+        assert_eq!(sizes, [3, 30]);
+        assert_eq!(*recording.sizes.lock().unwrap(), sizes, "the calls the refresh made");
+    }
+
     /// A doc of `n` sections whose section `i` has `i` words.
     fn ladder(n: usize) -> String {
         (1..=n).map(|i| format!("## S{i}\n{}\n", vec!["w"; i].join(" "))).collect()
@@ -2884,7 +2969,7 @@ second
     }
 
     #[tokio::test]
-    async fn passage_lengths_follow_the_stored_passages_in_batch_order() {
+    async fn passage_lengths_follow_the_stored_passages_in_ordinal_order() {
         let plain = lengths_of_ladder(EvalEmbedder::fake()).await;
         let prefixed = lengths_of_ladder(EvalEmbedder::of(Arc::new(Prefixed), Arc::default())).await;
 
@@ -2910,13 +2995,13 @@ second
             .chain([("b.md".to_string(), "x y".to_string())])
             .collect();
 
-        let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
+        let (docs, _) = lengths_by_doc(&tokenizer, &FakeEmbedder::default(), &texts).unwrap();
 
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0].path, "a.md");
         assert_eq!(docs[0].lengths, (1..=19).collect::<Vec<usize>>());
         assert_eq!((docs[1].path.as_str(), docs[1].lengths.clone()), ("b.md", vec![2]));
-        assert_eq!(lengths_by_doc(&tokenizer, &[]).unwrap().0, Vec::<EvalDocLengths>::new());
+        assert_eq!(lengths_by_doc(&tokenizer, &FakeEmbedder::default(), &[]).unwrap().0, Vec::<EvalDocLengths>::new());
     }
 
     #[test]
@@ -2925,9 +3010,26 @@ second
         let long = vec!["w"; EMBED_MAX_TOKENS + 188].join(" ");
         let texts = vec![("a.md".to_string(), long), ("a.md".to_string(), "x y".to_string())];
 
-        let (docs, _) = lengths_by_doc(&tokenizer, &texts).unwrap();
+        let (docs, _) = lengths_by_doc(&tokenizer, &FakeEmbedder::default(), &texts).unwrap();
 
         assert_eq!(docs[0].lengths, vec![EMBED_MAX_TOKENS, 2]);
+    }
+
+    #[test]
+    fn passage_order_is_the_order_a_refresh_embeds_in() {
+        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let counter = EvalTokenCounter(EvalTokenCounterInner::Real(tokenizer.clone()));
+        let embedder = EvalEmbedder::of(Arc::new(Prefixed), Arc::default());
+        let texts = |lengths: &[usize]| -> Vec<String> { lengths.iter().map(|&n| vec!["w"; n].join(" ")).collect() };
+        let seventeen = texts(&[2, 5, 2, 9, 1, 5, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 8]);
+
+        let order = passage_order(&embedder, &counter, &seventeen);
+
+        assert_eq!(Some(order.clone()), project_docs::passage_order(Some(&tokenizer), &Prefixed, &seventeen));
+        assert_eq!(order[..5], [3, 16, 1, 5, 6]);
+        assert_eq!(passage_order(&embedder, &EvalTokenCounter::fake(), &seventeen), (0..17).collect::<Vec<_>>());
+        let sixteen = texts(&[1; 16]);
+        assert_eq!(passage_order(&embedder, &counter, &sixteen), (0..16).collect::<Vec<_>>());
     }
 
     #[test]

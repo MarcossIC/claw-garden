@@ -113,7 +113,9 @@ pub enum Command {
     /// edited or judged since.
     Import {
         /// The file `clawg export` wrote, or the other tool's export (for
-        /// engram, `engram export --all`).
+        /// engram, `engram export --all`; for claude-code, a project's
+        /// `memory` directory, the project directory that holds it, or
+        /// `~/.claude/projects` for every project).
         #[arg(required_unless_present = "undo")]
         file: Option<PathBuf>,
         /// Take back import N, the number its report gave: remove for good
@@ -146,7 +148,14 @@ pub enum Command {
         /// the name of one live project. Repeat it for each project; the
         /// notes of a project not named are stored in none, and `clawg
         /// projects move --origin-project NAME` places them later.
-        #[arg(long = "project-map", value_name = "NAME=PATH|NAME=project:REF", value_parser = parse_project_map)]
+        /// A NAME may start with `-`, as the directory Claude Code names after
+        /// a project's path does.
+        #[arg(
+            long = "project-map",
+            value_name = "NAME=PATH|NAME=project:REF",
+            value_parser = parse_project_map,
+            allow_hyphen_values = true
+        )]
         project_map: Vec<ProjectMap>,
         #[command(flatten)]
         profile: ProfileArg,
@@ -322,6 +331,8 @@ pub enum ImportSource {
     Clawg,
     /// The JSON `engram export` writes.
     Engram,
+    /// Claude Code's auto memory: a directory of Markdown files.
+    ClaudeCode,
 }
 
 impl ImportSource {
@@ -330,6 +341,7 @@ impl ImportSource {
         match self {
             ImportSource::Clawg => "clawg",
             ImportSource::Engram => "engram",
+            ImportSource::ClaudeCode => "claude-code",
         }
     }
 }
@@ -381,7 +393,7 @@ impl Cli {
                 ImportSource::Clawg if !project_map.is_empty() => {
                     Some("--project-map maps the projects of another tool's export; name the tool with --from")
                 }
-                ImportSource::Engram if !map_root.is_empty() => {
+                ImportSource::Engram | ImportSource::ClaudeCode if !map_root.is_empty() => {
                     Some("--map-root maps the roots of a clawg export; another tool's projects take --project-map")
                 }
                 _ => None,
@@ -1277,6 +1289,23 @@ mod tests {
         for bad in ["a", "=.", "a="] {
             assert!(parses(&["clawg", "import", "--from", "engram", "e.json", "--project-map", bad]).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn import_takes_claude_codes_memory_with_a_project_named_by_its_directory() {
+        let args = ["clawg", "import", "--from", "claude-code", "projects", "--project-map", "-work-app=/work/app", "--dry-run"];
+        match Cli::parse_args(args).expect("parse").command {
+            Command::Import { file, from, project_map, dry_run, .. } => {
+                assert_eq!((file, from, dry_run), (Some(PathBuf::from("projects")), ImportSource::ClaudeCode, true));
+                assert_eq!(project_map, [ProjectMap { name: "-work-app".into(), to: MapTo::Path(PathBuf::from("/work/app")) }]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(ImportSource::ClaudeCode.as_str(), "claude-code");
+        let parses = |args: &[&str]| Cli::parse_args(args).map(|_| ()).map_err(|e| e.kind());
+        let conflict = Err(clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(parses(&["clawg", "import", "--from", "claude-code", "p", "--map-root", "/a=."]), conflict);
+        assert!(parses(&["clawg", "import", "--from", "claude-code", "p", "--project-map", "--dry-run"]).is_err());
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! which side of the query/passage distinction it is on — see [`EmbedRole`]
 //! below for why that distinction matters.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -183,6 +184,14 @@ pub const EMBED_MAX_TOKENS: usize = 512;
 /// hundreds of megabytes and indexing runs as fast as with one big batch.
 pub const EMBED_BATCH: usize = 16;
 
+/// The indices of `tokens` from the largest count to the smallest, equal
+/// counts in the order they came.
+pub(crate) fn longest_first(tokens: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..tokens.len()).collect();
+    order.sort_by_key(|&k| Reverse(tokens[k]));
+    order
+}
+
 /// Tokens the composer's budget reserves for what the model adds around the
 /// text itself: `<s>`/`</s>` (2) plus slack for a BPE merge that can span the
 /// prefix/text boundary and tokenize slightly differently than summing
@@ -252,6 +261,26 @@ pub(crate) fn window_encodings(tokenizer: &Tokenizer, texts: &[&str]) -> Result<
             tokenizer.post_process(encoding, None, true).map_err(failed)
         })
         .collect()
+}
+
+/// The tokens of each passage as the model receives it: under the embedder's
+/// passage prefix and cut to the window. Counted one batch at a time, so the
+/// encodings alive together are a batch's, however many texts there are.
+pub(crate) fn passage_token_counts<S: AsRef<str>>(
+    tokenizer: &Tokenizer,
+    embedder: &dyn Embedder,
+    texts: &[S],
+) -> Result<Vec<usize>, EmbedError> {
+    let mut counts = Vec::with_capacity(texts.len());
+    for batch in texts.chunks(EMBED_BATCH) {
+        let prefixed: Vec<String> = batch
+            .iter()
+            .map(|t| apply_role_prefix(EmbedRole::Passage, t.as_ref(), embedder.query_prefix(), embedder.passage_prefix()))
+            .collect();
+        let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+        counts.extend(window_encodings(tokenizer, &refs)?.iter().map(Encoding::len));
+    }
+    Ok(counts)
 }
 
 /// Lays the encodings out as one rectangle, padding every text on the right to
@@ -984,6 +1013,13 @@ impl Embedder for GatedEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longest_first_puts_the_most_tokens_first_and_keeps_ties_in_order() {
+        assert_eq!(longest_first(&[3, 9, 3, 1, 9]), vec![1, 4, 0, 2, 3]);
+        assert_eq!(longest_first(&[]), Vec::<usize>::new());
+        assert_eq!(longest_first(&[5, 5, 5]), vec![0, 1, 2]);
+    }
 
     #[test]
     fn the_session_takes_every_thread_the_machine_reports() {

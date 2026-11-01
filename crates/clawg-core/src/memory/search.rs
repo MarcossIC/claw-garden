@@ -2027,55 +2027,39 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let emb = unit_basis_embedding();
         let agent = "agent-dispute-test";
+        // One access time bound to both rows and one search scoring both: a
+        // `strftime('%s','now')` per insert and a `now` per search would let a
+        // second boundary between the steps change the recency of one score.
+        let accessed_at = TimestampMs::now().as_millis_i64() - 86_400_000;
 
-        // Insert active version
-        let emb2 = emb.clone();
-        let a2 = agent.to_string();
-        let active_id = store.conn.call(move |c| -> Result<i64, rusqlite::Error> {
-            let tx = c.transaction()?;
-            tx.execute(
-                "INSERT INTO memory (scope, agent_id, content, memory_type, source,
-                 created_at, created_by_type, created_by_ref,
-                 last_modified_at, last_accessed_at, importance, tier, status)
-                 VALUES ('agent', ?1, 'active version', 'chat_message', 'chat',
-                 0, 'user', ?1, 0, (strftime('%s','now')*1000) - 86400000, 5.0, 3, 'active')",
-                params![a2],
-            )?;
-            let id = tx.last_insert_rowid();
-            tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)", params![id, emb2])?;
-            tx.commit()?;
-            Ok(id)
-        }).await.unwrap();
+        let mut ids = Vec::new();
+        for (content, status) in [("active version", "active"), ("disputed version", "disputed")] {
+            let emb_row = emb.clone();
+            let a = agent.to_string();
+            let id = store.conn.call(move |c| -> Result<i64, rusqlite::Error> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO memory (scope, agent_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', ?1, ?2, 'chat_message', 'chat',
+                     0, 'user', ?1, 0, ?3, 5.0, 3, ?4)",
+                    params![a, content, accessed_at, status],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)", params![id, emb_row])?;
+                tx.commit()?;
+                Ok(id)
+            }).await.unwrap();
+            ids.push(id);
+        }
+        let (active_id, disputed_id) = (ids[0], ids[1]);
 
-        let q_vec = unit_basis_vec();
-        let active_hits = search_all_memories(&store, &q_vec, None, agent, SearchScope::all_default(), 10)
+        let hits = search_all_memories(&store, &unit_basis_vec(), None, agent, SearchScope::all_default(), 10)
             .await.unwrap();
-        let active_score = active_hits.iter().find(|h| h.id == active_id).unwrap().score;
+        let score_of = |id: i64| hits.iter().find(|h| h.id == id).expect("both rows must be retrievable").score;
 
-        // Insert disputed version
-        let emb3 = emb.clone();
-        let a3 = agent.to_string();
-        let disputed_id = store.conn.call(move |c| -> Result<i64, rusqlite::Error> {
-            let tx = c.transaction()?;
-            tx.execute(
-                "INSERT INTO memory (scope, agent_id, content, memory_type, source,
-                 created_at, created_by_type, created_by_ref,
-                 last_modified_at, last_accessed_at, importance, tier, status)
-                 VALUES ('agent', ?1, 'disputed version', 'chat_message', 'chat',
-                 0, 'user', ?1, 0, (strftime('%s','now')*1000) - 86400000, 5.0, 3, 'disputed')",
-                params![a3],
-            )?;
-            let id = tx.last_insert_rowid();
-            tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)", params![id, emb3])?;
-            tx.commit()?;
-            Ok(id)
-        }).await.unwrap();
-
-        let all_hits = search_all_memories(&store, &q_vec, None, agent, SearchScope::all_default(), 10)
-            .await.unwrap();
-        let disputed_score = all_hits.iter().find(|h| h.id == disputed_id).unwrap().score;
-
-        assert_eq!(disputed_score, active_score,
+        assert_eq!(score_of(disputed_id), score_of(active_id),
             "a disputed row must rank like an active one");
     }
 

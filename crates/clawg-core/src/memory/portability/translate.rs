@@ -21,6 +21,7 @@ use crate::memory::store_insert::MemoryType;
 use crate::memory::tier::compute_tier;
 use crate::memory::topic::{validate_topic_key, MAX_TOPIC_KEY_LEN};
 
+use super::claude_code;
 use super::foreign::{ForeignExport, ForeignNote, ForeignRelation, NoteKind, When};
 use super::format::{ConflictLine, MemoryLine, Parsed, PieceLine, ProjectLine};
 
@@ -270,7 +271,7 @@ struct Draft<'a> {
 
 impl<'a> Draft<'a> {
     /// `None` for a note with nothing to store.
-    fn new(note: &'a ForeignNote, options: &TranslateOptions, now_ms: i64) -> Option<Self> {
+    fn new(source: &str, note: &'a ForeignNote, options: &TranslateOptions, now_ms: i64) -> Option<Self> {
         let masked = redact(&text_of(note)?);
         let clamp = |when: When| match when {
             When::At(at) if at <= now_ms => (at, false),
@@ -284,7 +285,7 @@ impl<'a> Draft<'a> {
             note,
             masked: !masked.kinds.is_empty(),
             text: masked.text,
-            memory_type: memory_type_of(note),
+            memory_type: memory_type_of(source, note),
             group: Group { project: note.project.clone(), personal: note.personal },
             project_id: mapped.map(|m| m.project_id.clone()),
             written,
@@ -317,7 +318,7 @@ pub fn translate(export: &ForeignExport, options: &TranslateOptions, chunker: &C
     };
     let mut drafts = Vec::with_capacity(export.notes.len());
     for note in &export.notes {
-        match Draft::new(note, options, now_ms) {
+        match Draft::new(export.source, note, options, now_ms) {
             Some(draft) => drafts.push(draft),
             None => report.without_text.push(note.origin.clone()),
         }
@@ -352,14 +353,19 @@ fn text_of(note: &ForeignNote) -> Option<String> {
     }
 }
 
-fn memory_type_of(note: &ForeignNote) -> MemoryType {
+/// The type a note of `source` is stored as. A note of Claude Code's memory
+/// is never a decision: the client does not tell one from a fact, and a
+/// decision typed wrong is disputed with the user's own.
+fn memory_type_of(source: &str, note: &ForeignNote) -> MemoryType {
     match note.kind {
         NoteKind::Prompt => MemoryType::ChatMessage,
         NoteKind::SessionSummary => MemoryType::SessionSummary,
-        NoteKind::Observation => match note.source_type.as_deref() {
-            Some("decision" | "architecture") => MemoryType::ArchitecturalDecision,
-            Some("preference") => MemoryType::UserPreference,
-            Some("session_summary") => MemoryType::SessionSummary,
+        NoteKind::Observation => match (source, note.source_type.as_deref()) {
+            (claude_code::SOURCE, Some("user" | "feedback")) => MemoryType::UserPreference,
+            (claude_code::SOURCE, _) => MemoryType::SemanticFact,
+            (_, Some("decision" | "architecture")) => MemoryType::ArchitecturalDecision,
+            (_, Some("preference")) => MemoryType::UserPreference,
+            (_, Some("session_summary")) => MemoryType::SessionSummary,
             _ => MemoryType::SemanticFact,
         },
     }
@@ -881,6 +887,26 @@ pub(crate) mod tests {
         let mut seen = HashSet::new();
         let pieces = split.pieces.into_iter().map(|c| c.text).filter(|p| seen.insert(content_hash(p))).collect();
         (pieces, split.head)
+    }
+
+    #[test]
+    fn claude_code_types_are_preferences_or_facts() {
+        let mut notes: Vec<ForeignNote> = ["user", "feedback", "project", "reference", "decision", "preference"]
+            .iter()
+            .map(|t| ForeignNote { source_type: Some(t.to_string()), ..note(&format!("claude-code:p/{t}.md"), "Title", t) })
+            .collect();
+        notes.push(ForeignNote { source_type: None, ..note("claude-code:p/untyped.md", "Untyped", "no type") });
+        let export = ForeignExport { source: "claude-code", version: String::new(), ..export(notes) };
+        let t = translate(&export, &options(&[]), &ChatChunker::with_fallback(), NOW);
+        let ty = |name: &str| row(&t, &format!("claude-code:p/{name}.md")).memory_type.clone();
+        assert_eq!(ty("user"), "user_preference");
+        assert_eq!(ty("feedback"), "user_preference");
+        assert_eq!(ty("project"), "semantic_fact");
+        assert_eq!(ty("reference"), "semantic_fact");
+        assert_eq!(ty("decision"), "semantic_fact", "the client tells no decision from a fact");
+        assert_eq!(ty("preference"), "semantic_fact", "engram's types are engram's");
+        assert_eq!(ty("untyped"), "semantic_fact");
+        assert_eq!(t.report.by_source_type.iter().find(|c| c.source_type.as_deref() == Some("feedback")).unwrap().memory_type, "user_preference");
     }
 
     #[test]

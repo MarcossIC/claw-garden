@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use clawg_core::eval_api::{join_pieces, EmbedRole, EvalCpu, EvalEmbedder, EvalTokenCounter};
+use clawg_core::eval_api::{join_pieces, passage_order, EmbedRole, EvalCpu, EvalEmbedder, EvalTokenCounter};
 use serde::{Deserialize, Serialize};
 
 const MODEL_DIR_VAR: &str = "CLAWG_E5_MODEL_DIR";
@@ -122,6 +122,33 @@ fn the_fixture_holds_one_vector_of_the_model_size_for_every_text() {
     }
 }
 
+const BATCH_OF_17: &str = "a batch of 17";
+const BATCH_OF_17_LONGEST_FIRST: &str = "a batch of 17, longest first";
+
+/// The same 17 texts embedded in the order a docs refresh sends them move no
+/// vector by more than the tolerance, whatever CPU the fixture was made on.
+#[test]
+fn a_batch_longest_first_stays_within_the_tolerance_of_the_batch_in_order() {
+    let fixture: Fixture = serde_json::from_str(&std::fs::read_to_string(FIXTURE).unwrap_or_else(|e| {
+        panic!("read {FIXTURE}: {e}; create it with {BLESS_VAR}=1 {MODEL_DIR_VAR}=<dir> and --ignored")
+    }))
+    .expect("the fixture is JSON");
+    let case = |name: &str| {
+        fixture.cases.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("the fixture has no case named {name:?}"))
+    };
+    let (in_order, longest_first) = (case(BATCH_OF_17), case(BATCH_OF_17_LONGEST_FIRST));
+    assert_eq!(in_order.texts.len(), longest_first.texts.len(), "the same texts");
+
+    let mut same_bits = 0;
+    for (text, bits) in longest_first.texts.iter().zip(&longest_first.bits) {
+        let at = in_order.texts.iter().position(|t| t == text).unwrap_or_else(|| panic!("{text:?} is not in {BATCH_OF_17:?}"));
+        let moved = max_difference(&in_order.bits[at], &bits.iter().map(|b| f32::from_bits(*b)).collect::<Vec<_>>());
+        assert!(moved <= TOLERANCE, "{text:?}: the order moved its vector by {moved}, over {TOLERANCE}");
+        same_bits += usize::from(in_order.bits[at] == *bits);
+    }
+    println!("{same_bits} of {} vectors have the same bits in either order", longest_first.texts.len());
+}
+
 /// `model_dir` is `<data dir>/models/multilingual-e5-small`; `EvalEmbedder::real`
 /// wants the data dir.
 fn data_dir_of(model_dir: &Path) -> PathBuf {
@@ -171,7 +198,7 @@ fn text_of_tokens(counter: &EvalTokenCounter, tokens: usize) -> String {
     text
 }
 
-fn inputs(counter: &EvalTokenCounter) -> Vec<(String, Role, Vec<String>)> {
+fn inputs(counter: &EvalTokenCounter, embedder: &EvalEmbedder) -> Vec<(String, Role, Vec<String>)> {
     let one = |name: &str, role: Role, text: String| (name.to_string(), role, vec![text]);
     let batch_of_17: Vec<String> = (0..17)
         .map(|i| match i % 4 {
@@ -181,6 +208,8 @@ fn inputs(counter: &EvalTokenCounter) -> Vec<(String, Role, Vec<String>)> {
             _ => text_of_tokens(counter, 40 + 37 * i),
         })
         .collect();
+    let refresh_order = passage_order(embedder, counter, &batch_of_17);
+    let batch_of_17_longest_first: Vec<String> = refresh_order.iter().map(|&k| batch_of_17[k].clone()).collect();
     vec![
         one("short query in English", Role::Query, "how do I restart the daemon".into()),
         one("short query in Spanish", Role::Query, "¿dónde se guarda la memoria del agente?".into()),
@@ -203,7 +232,8 @@ fn inputs(counter: &EvalTokenCounter) -> Vec<(String, Role, Vec<String>)> {
         one("special tokens as text", Role::Query, "<s> </s> <pad> <unk> <mask>".into()),
         one("special tokens inside a passage", Role::Passage, "antes <s> medio </s> después <pad> <unk> <mask> fin".into()),
         one("empty", Role::Passage, String::new()),
-        ("a batch of 17".to_string(), Role::Passage, batch_of_17),
+        (BATCH_OF_17.to_string(), Role::Passage, batch_of_17),
+        (BATCH_OF_17_LONGEST_FIRST.to_string(), Role::Passage, batch_of_17_longest_first),
     ]
 }
 
@@ -214,7 +244,7 @@ async fn embed(embedder: &EvalEmbedder, role: Role, texts: &[String]) -> Vec<Vec
 async fn bless(embedder: &EvalEmbedder, base: &Path) -> ! {
     let counter = EvalTokenCounter::real(base).expect("the tokenizer loads");
     let mut cases = Vec::new();
-    for (name, role, texts) in inputs(&counter) {
+    for (name, role, texts) in inputs(&counter, embedder) {
         let vectors = embed(embedder, role, &texts).await;
         let bits = vectors.iter().map(|v| v.iter().map(|x| x.to_bits()).collect()).collect();
         cases.push(Case { name, role, texts, bits });
