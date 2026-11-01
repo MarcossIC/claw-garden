@@ -1,15 +1,15 @@
 change: search-arm-timing
 objective: "medición (transversal)"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: skipped  # las alternativas están en la exploración (A, B, C) y lo elegido en la propuesta
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done  # A1 en 99248f0, A2 en cf39d3c, docs en 7410412
+  verify: done  # Linux: suite, los dos clippy y rag-eval --fake --diff sin casos movidos sobre un golden sintético; quedan el CI de Windows y el golden de 46 casos, fuera de git
   archive: pending
 main_spec: openspec/specs/metrics/spec.md
 updated: 2026-11-01

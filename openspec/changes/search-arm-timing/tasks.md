@@ -26,12 +26,14 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 4. Cierre
 
-- [ ] Suite y los dos clippy sobre el último commit.
-- [ ] `rag-eval --fake` y `--agent-view` con el código nuevo sobre el golden de la tarea 0, y `rag-eval --diff` contra los de antes: ningún caso se mueve.
-- [ ] `verify.md`, `state.yaml` y la fila 101 de `openspec/README.md`.
+- [x] Suite y los dos clippy sobre el último commit, en Linux; Windows en el CI del pull request.
+- [x] `rag-eval --fake` y `--agent-view` con el código nuevo sobre el golden de la tarea 0, y `rag-eval --diff` contra los de antes: ningún caso se mueve.
+- [x] `verify.md`, `state.yaml` y la fila 101 de `openspec/README.md`.
 - Commit: `docs(openspec): record the search arm timing as applied and verified`
 
 ## Al archivar (fuera de este cambio)
+
+- `rag-eval --fake --diff` sobre el golden de 46 casos (`docs/eval/golden.json`, fuera de git), en una máquina que lo tenga.
 
 - Si la versión que lo publica no es la siguiente a 0.73.0, corregir «hasta 0.73.0» en `docs/reference/data-profiles.md` y en R14 de `specs/metrics`.
 - La línea de origen de `specs/metrics` y la fila 101 de `openspec/README.md` con la versión.
