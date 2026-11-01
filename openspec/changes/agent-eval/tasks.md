@@ -52,6 +52,16 @@ Un binario es un crate: una función que sólo usa otro módulo todavía ausente
 
 - [x] Suite completa y clippy sobre el último commit: pasan.
 
+## 10. El modelo listo antes de la siembra (AE7)
+
+En Windows `clawg import` salía con 1: un import real pide el embedder y el daemon responde `503 embedder_not_ready` mientras el modelo carga, y la siembra se mandaba apenas aparecía `daemon.json`.
+
+- [x] RED: `the_model_is_ready_once_the_status_of_this_daemon_says_so`, `a_step_that_fails_is_told_by_its_last_line` (`run.rs`), el paso `status` en `the_arms_with_clawg_start_a_daemon_of_the_run_on_an_ephemeral_port` (`arm.rs`), y en `tests/agent_eval.rs` el `clawg status` con el modelo listo antes del import y de la sesión.
+- [x] GREEN: `Daemon::status` en el plan, la espera de `Served::ready` y la última línea de un paso que falla en su error.
+- Commit: `fix(eval): wait for the run's daemon to have its model ready before the seed`
+- Commit: `docs: say that the agent-eval runner waits for the model`
+- [x] Suite completa y clippy sobre el último commit: pasan.
+
 ## Después de este cambio
 
 - [ ] Las seis tareas del piloto y su fixture, revisadas antes de correr.
