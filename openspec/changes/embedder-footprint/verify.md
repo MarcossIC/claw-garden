@@ -1,6 +1,6 @@
 # embedder-footprint — Verificación
 
-Registro de la puerta (tarea 2). Están medidos los pasos 2.1 y 2.2, en Windows y en Linux, y 2.3 en Windows. Faltan 2.4, sólo las arenas de malloc en Linux, y 2.5.
+Registro de la puerta (tarea 2). Están medidos los pasos 2.1 y 2.2, en Windows y en Linux, 2.3 en Windows, y 2.4, las arenas de malloc, y 2.5 en Linux. Falta 2.5 en Windows.
 
 ## La máquina y el build
 
@@ -32,7 +32,18 @@ Un refresco de docs ya bajó de unos 45 a unos 20 minutos, así que no se devuel
 - **Ruido:** dentro de una misma rama, sin cambio de régimen, `embed` varió menos del 2 % en docs-index-speed.
 - **C:** abrió por 2.1, pero lo medido de su ganancia es el recuento de hilos. Si su brazo no degrada el tiempo y tampoco gana CPU, entrar o no queda como decisión expresa.
 - **E (2.5):** abre sólo si las dos codificaciones de más pesan al menos 5 % del tiempo de un guardado de 64 KiB, contando las tres codificaciones y la tanda. Se fijó antes de medir `split_save`, pero después de estimar con los datos del refresco que rondaría el 2 %.
-- **Sin fijar todavía:** el p99 de búsqueda de 2.4.
+
+### El de 2.4, una arena contra dos, también antes de medir
+
+Se compara el mismo build, sin la llamada a `keep_one_malloc_arena`, con `MALLOC_ARENA_MAX=1` y con `=2`, mientras el daemon refresca docs y un cliente busca cada 100 ms. Cada corrida con 2 arenas se compara con la de 1 arena de su ronda; los porcentajes son la mediana de los 3 cocientes, y las cifras absolutas, la mediana de las 3 diferencias.
+
+**D6 de embedder-idle-unload, la arena única, se reabre sólo si, con 2 arenas, se cumplen las tres:**
+
+- el p99 de búsqueda baja al menos 22 % y al menos 20 ms;
+- el refresco no sube más que el menor entre +5 % y +60 s;
+- el pico de `RssAnon` sube menos de 100 MiB.
+
+Si falta una condición, queda una arena. La lectura vale para los hilos de la máquina donde se mide: con más hilos hay más contención por la arena, y la respuesta puede ser otra.
 
 ## Cómo se midió
 
@@ -208,13 +219,115 @@ El mismo build y el mismo `rag-eval --real --docs --no-cache`, sobre una muestra
 
 **C no entra.** Una ganancia tan baja no justifica cambiar el tokenizer, y menos con el tiempo subiendo en las tres rondas. Sin ningún brazo en pie, no hacen falta el refresco completo de confirmación ni medir 2.3 en Linux.
 
+## 2.4 y 2.5 en Linux
+
+### La máquina y el build
+
+| Dato | Valor |
+|---|---|
+| Sistema | Ubuntu 24.04.5 LTS, núcleo Linux 6.18, glibc 2.39, x86_64, máquina virtual bajo KVM |
+| CPU | Intel Xeon @ 2.10 GHz (familia 6, modelo 207), 1 zócalo. La máquina virtual no expone sensor térmico ni control de frecuencia |
+| Hilos | 4 físicos, 4 lógicos (sin SMT) |
+| Instrucciones | AVX2, AVX-512F, FMA |
+| Memoria | 15 GiB, sin swap |
+| Build | release con la feature `testing`: `cargo build --release --locked -p clawg-cli --features clawg-core/testing`, rustc 1.99.1, versión 0.73.0, sobre `453fc0a`, cuyos fuentes de `crates/` son los de `6cb64fc` |
+
+La huella es la de 2.1 y 2.2 en Linux. Cada paso tiene su build, con un parche de medición que no se commitea:
+
+- **El de 2.4** quita de `crates/clawg-cli/src/main.rs` la llamada a `keep_one_malloc_arena` y su `use`. Nada más cambia, así que las arenas las fija sólo `MALLOC_ARENA_MAX`. Las dos variantes usan el mismo binario.
+- **El de 2.5** conserva la llamada, como en producción, y suma un reloj (`Instant`) en el worker: alrededor de cada una de las tres llamadas de `split_save`, alrededor de `tok.encode` dentro de `split_by_tokens` y alrededor de las etapas de `ingest_pieces` (`split`, `gate`, `embed`, `store`). Cada lectura sale como una línea de log.
+
+Los builds se compilaron antes de la primera corrida medida. Mientras se midió no se compiló ni se corrió ningún test, y las corridas fueron de a una.
+
+### 2.4 Una arena contra dos
+
+#### Cómo se midió
+
+- **La muestra.** De la prueba corta de Windows quedaron la regla (cada séptimo archivo de cada tipo, más `README.md`) y el tamaño (119 documentos, 3223 pasajes), pero no la lista de archivos. El árbol es el de `6cb64fc` sin el documento que `rag-eval` deja afuera por citar una pregunta del golden (`openspec/changes/archive/2026-10-15-project-indexing/verify.md`): 821 documentos. Indexado entero en Linux, sin ese documento da 19.694 pasajes, contra 19.696 en Windows, así que la plataforma casi no mueve el recuento. Ninguna de las reglas probadas da 3223 justo: por orden de bytes de la ruta, la muestra da 2598 pasajes desde el índice 1 y 3743 desde el 2. Se usa la que más se acerca, con **119 documentos y 3231 pasajes**. Toma los archivos en el orden en que los lista `Get-ChildItem -Recurse` (primero los de cada carpeta, después sus subcarpetas, sin distinguir mayúsculas), los agrupa por tipo y se queda con uno de cada siete desde el índice 2, más `README.md`. Son 88 Markdown, `README.md` incluido, 30 de Rust y 1 manifiesto.
+- **El store.** 10.000 filas de la siembra de `perf_bench` (`seed_export`, semilla 74), con el generador portado a un guion: 4 agentes, 3 proyectos y filas sin proyecto; 8.515 vivas, 1.032 reemplazadas y 453 borradas. Se importó una sola vez, con `POST /v1/import` y el modelo real, en un home aparte. Cada corrida arranca sobre una copia de ese directorio de datos, con el índice de docs vacío, así que cada refresco indexa la muestra entera.
+- **Cada corrida** es un daemon solo, `serve --profile dev --port 0`, en un `CLAWG_TEST_HOME` temporal que también es su `HOME`. Corre con `RUST_LOG=info` y el `MALLOC_ARENA_MAX` de su variante, sin ninguna otra variable de clawg, del tokenizer, de `rayon` ni de malloc. El modelo real se bajó una vez con `curl`, los cinco archivos verificaron contra sus `sha256` y cada home lo recibe enlazado. El log de cada daemon nombra su directorio de datos dentro del home temporal; no se abrió ningún perfil real. La ruta del home pasa de los 108 bytes que admite un socket Unix, así que el daemon sólo escucha por TCP, que es por donde llega el cliente.
+- **Una corrida, en orden:** el modelo listo, 30 s de reposo, 20 búsquedas seguidas de calentamiento que no cuentan, 5 s de pausa y `POST /v1/projects` con `index_docs: true` sobre la muestra, que arranca el refresco. Desde ese instante el cliente lanza un `POST /v1/search` cada 100 ms, cada uno en su propio hilo y sin esperar a los anteriores. La latencia cuenta desde el tic, no desde el envío (lazo abierto, como en `perf_bench`); el envío más tardío salió 23 ms después de su tic. Las consultas son las de `perf_bench` para la misma semilla: de 2 a 4 palabras frecuentes y, en un tercio, un identificador raro. El agente rota entre los cuatro. El cliente deja de lanzar cuando el log dice `docs refresh of …: done in N s` y espera a las búsquedas que siguen en vuelo.
+- **El refresco** es el tiempo de esa línea. **`RssAnon`** sale de `/proc/<pid>/status` cada 100 ms, y el pico es el máximo dentro del refresco. **Los percentiles** se toman por rango más cercano, como en `perf-bench`.
+- **3 rondas con el orden rotado** (1-2, 2-1, 1-2) y 30 s entre corridas. Antes de la primera hubo dos pilotos con 1 arena, sobre las dos muestras por orden de bytes, y el indexado del árbol entero; ninguno cuenta.
+- Los registros crudos no se conservan en git.
+
+#### Resultados
+
+| Corrida | Orden en la ronda | Búsquedas | p50 | p99 | Refresco | Pico de `RssAnon` | CPU del refresco |
+|---|---|---|---|---|---|---|---|
+| 1 arena, ronda 1 | 1.º | 3749 | 1811 ms | 4215 ms | 374,9 s | 1313,9 MiB | 1194 s |
+| 2 arenas, ronda 1 | 2.º | 3651 | 1773 ms | 4310 ms | 365,0 s | 1333,7 MiB | 1179 s |
+| 2 arenas, ronda 2 | 1.º | 3231 | 1487 ms | 3594 ms | 323,0 s | 1301,2 MiB | 1056 s |
+| 1 arena, ronda 2 | 2.º | 3519 | 1651 ms | 4424 ms | 351,8 s | 1288,2 MiB | 1104 s |
+| 1 arena, ronda 3 | 1.º | 3331 | 1538 ms | 3720 ms | 333,0 s | 1293,3 MiB | 1078 s |
+| 2 arenas, ronda 3 | 2.º | 3480 | 1627 ms | 3838 ms | 347,9 s | 1303,5 MiB | 1125 s |
+
+Todas las búsquedas respondieron 200, y en cada corrida se indexaron los 119 documentos y los 3231 pasajes. Los p50 y p99 de cada corrida se calculan sobre todas sus búsquedas.
+
+| 2 arenas frente a 1, en la misma ronda | p99 | Refresco | Pico de `RssAnon` |
+|---|---|---|---|
+| Ronda 1 | +2,3 % (+95 ms) | −2,6 % (−9,9 s) | +19,8 MiB |
+| Ronda 2 | −18,8 % (−829 ms) | −8,2 % (−28,8 s) | +13,0 MiB |
+| Ronda 3 | +3,2 % (+118 ms) | +4,5 % (+14,9 s) | +10,2 MiB |
+| **Mediana** | **+2,3 % (+95 ms)** | **−2,6 % (−9,9 s)** | **+13,0 MiB** |
+
+Contra el umbral:
+
+- **p99:** tenía que bajar al menos 22 % y 20 ms. Sube 2,3 % y 95 ms. **No se cumple.**
+- **Refresco:** en un refresco de unos 350 s el techo que manda es +5 %, menor que +60 s. Baja 2,6 % y 9,9 s. Se cumple.
+- **Pico de `RssAnon`:** sube 13,0 MiB, por debajo de 100 MiB. Se cumple.
+
+**Queda una arena: D6 de embedder-idle-unload no se reabre.** La lectura vale para los 4 hilos de esta máquina. En una con más hilos que pidan memoria a la vez, la arena única puede pesar más, y eso no está medido.
+
+Para leer los números:
+
+- **Durante un refresco, una búsqueda espera a la tanda de docs que está corriendo.** Fuera del refresco, las búsquedas de calentamiento tardan de 33 a 56 ms. Durante el refresco, la mediana va de 1,5 a 1,8 s. El embedder tiene un solo hilo que atiende una cola por orden de llegada, y el refresco manda cada tanda de 16 pasajes como un pedido aparte (`E5Embedder::embed_batch`). La consulta de una búsqueda entra, entonces, detrás de la tanda en curso y de las búsquedas que llegaron antes. El p99 lo pone la inferencia de una tanda de pasajes largos, que la arena de malloc no toca.
+- **El ruido entre corridas es mayor que la diferencia entre variantes.** Con el mismo binario y la misma muestra, el refresco fue de 323 a 375 s, un 16 % de punta a punta. La ronda 2 es la única donde 2 arenas ganan claro; en las otras dos pierden por poco.
+- Durante el refresco el daemon tiene como máximo 15 hilos en todas las corridas y usa en promedio de 3,1 a 3,3 de los 4 núcleos. Antes del refresco, `RssAnon` ronda los 800 MiB, y 837,8 MiB en la última corrida.
+
+### 2.5 `split_save`
+
+#### Cómo se midió
+
+- Con el build de 2.5, un daemon solo sobre una store vacía, en un home temporal como los de 2.4 y sin `MALLOC_ARENA_MAX`: la llamada a `keep_one_malloc_arena` deja una arena, como en producción. El modelo listo y 30 s de reposo antes del primer guardado. Corrió después de las seis corridas de 2.4.
+- **Los textos** son ventanas seguidas de la prosa de los Markdown del árbol de `6cb64fc`, en orden de ruta, sin texto repetido entre guardados. Los de 64 KiB tienen 65.536 bytes y de 17.502 a 21.806 tokens. Los de 5.000 tokens tienen esa cantidad justa, contada con el tokenizer del modelo, en 15.078 a 16.712 bytes. En los 12 guardados, el recuento que registra el daemon coincide con el del guion.
+- Cada `POST /v1/memories` va solo: se espera a que su línea de reloj salga en el log y a que `pending` vuelva a 0, y 5 s más. Primero va un guardado de cada tamaño que no cuenta, y después 5 de cada uno, alternados. Los 12 terminaron sin fallas.
+- **Cada codificación** se mide con su llamada entera dentro de `split_save`: la codificación y el plan de cortes. El `encode` solo es del 94 al 98 % de cada llamada; el plan es de 0,1 a 0,6 ms. **La tanda** es la etapa `embed`: todas las piezas, de a 16 por pedido al embedder.
+
+#### Resultados
+
+En las filas de mediana, cada columna es su propia mediana.
+
+| Guardado | Tokens | Piezas | Entera (480) | Cabecera (32) | Piezas (96) | Tanda | Las dos de más sobre las tres y la tanda |
+|---|---|---|---|---|---|---|---|
+| 64 KiB, 1 | 18.655 | 264 | 34,1 ms | 21,7 ms | 21,2 ms | 5,49 s | 0,77 % |
+| 64 KiB, 2 | 20.603 | 293 | 39,4 ms | 24,8 ms | 22,7 ms | 6,16 s | 0,76 % |
+| 64 KiB, 3 | 20.931 | 300 | 37,0 ms | 30,2 ms | 43,0 ms | 6,76 s | 1,07 % |
+| 64 KiB, 4 | 21.806 | 330 | 62,8 ms | 58,0 ms | 56,9 ms | 7,88 s | 1,43 % |
+| 64 KiB, 5 | 20.604 | 299 | 46,7 ms | 45,0 ms | 41,4 ms | 7,02 s | 1,21 % |
+| **64 KiB, mediana** | 20.604 | 299 | 39,4 ms | 30,2 ms | 41,4 ms | 6,76 s | **1,07 %** |
+| 5.000 tokens, 1 | 5.000 | 72 | 18,4 ms | 8,6 ms | 7,2 ms | 1,57 s | 0,98 % |
+| 5.000 tokens, 2 | 5.000 | 72 | 13,4 ms | 7,2 ms | 8,5 ms | 1,63 s | 0,95 % |
+| 5.000 tokens, 3 | 5.000 | 72 | 15,5 ms | 13,2 ms | 12,5 ms | 1,49 s | 1,68 % |
+| 5.000 tokens, 4 | 5.000 | 71 | 12,6 ms | 11,0 ms | 8,6 ms | 1,48 s | 1,29 % |
+| 5.000 tokens, 5 | 5.000 | 71 | 18,1 ms | 11,2 ms | 9,3 ms | 1,64 s | 1,22 % |
+| **5.000 tokens, mediana** | 5.000 | 72 | 15,5 ms | 11,0 ms | 8,6 ms | 1,57 s | **1,22 %** |
+
+**E no abre en Linux.** Las dos codificaciones de más pesan 1,07 % de un guardado de 64 KiB, mediana de 5, y 1,43 % en el peor, contra un umbral de 5 %. Contando sólo el `encode`, 1,02 %. Queda por debajo del 2 % que se estimó antes de medir.
+
+Para leer los números:
+
+- **La cabecera codifica el texto entero** para quedarse con sus primeros 32 tokens, así que cuesta como las otras dos: de 21,7 a 58,0 ms en un guardado de 64 KiB.
+- **El worker queda tomado durante la etapa `split`**, que enmascara y llama a `split_save`: de 86 a 191 ms en los guardados de 64 KiB, 110 ms de mediana, y de 31 a 44 ms en los de 5.000 tokens. Esa es la otra mitad de E, pasarlo a `spawn_blocking`, que el umbral no cubre.
+- **La etapa `store` crece de un guardado de 64 KiB al siguiente:** 0,9 s en el de calentamiento y de 3,3 a 7,8 s en los cinco que cuentan, mientras la tanda va de 5,5 a 7,9 s. No se atribuye. No entra en el umbral; si entrara, la parte de las codificaciones sería todavía menor.
+- 2.5 no se midió en Windows.
+
 ## Lo que esto corrige de la exploración
 
 - **`window_encodings` ya no es el único llamador de `encode_batch`.** También lo llama `TokenSplitter::count_all` (`crates/clawg-core/src/memory/chunker/token_splitter.rs:57`), que está hecho para repartir la tanda entre los núcleos. `set_parallelism(false)` cambiaría los dos.
 
 ## Pendiente
 
-- 2.4: sólo una arena contra dos, en Linux, con el build de medición de la tarea (`clawg serve` pisa `MALLOC_ARENA_MAX` con `mallopt`) y su umbral fijado antes de medir. La latencia por brazo ya no tiene brazos que comparar.
-- 2.5: `split_save`.
+- 2.5 en Windows: sin medir. En Linux, E queda en 1,07 %, contra un umbral de 5 %.
 - 2.6 no se corre: no entra ningún cambio de hilos, de espera activa ni de tokenizer, así que no hay combinación que comprobar.
 - 2.7: cerrar el registro.
