@@ -5684,6 +5684,8 @@ async fn the_listing_after_a_merge_shows_the_target_alone() {
 }
 
 /// Writes a save still in the outbox for `project`, as one the worker has not finished.
+/// Only after the worker has stored a save: it reads the outbox once, when it
+/// starts, and would store a row written before that read.
 async fn pending_save(h: &Harness, operation: &'static str, project: &str) {
     let event = json!({ "agent_id": "agent-http", "project_id": project, "content": "" }).to_string();
     h.ctx
@@ -5706,6 +5708,7 @@ async fn a_merge_waits_for_the_saves_of_its_projects() {
     let h = Harness::start().await;
     let (app, web, other) =
         (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/other").await);
+    save_in(&h, &other, "the other service is written in Go").await;
     pending_save(&h, "op-1", &app).await;
     let store = h.ctx.runtime.store.clone();
     // Taken before the spawn: the task may start its sleep before this line runs.
