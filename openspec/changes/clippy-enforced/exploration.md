@@ -35,7 +35,7 @@ Una excepción puntual usa `#[expect(clippy::..., reason = "...")]` y no `#[allo
 
 1. **Paso 0, sin código:** correr `cargo clippy --workspace --all-targets --target-dir target-test` en Linux y Windows, y anotar el conteo por lint.
 2. Arreglar lo mecánico en commits por lint, y justificar o arreglar el resto.
-3. Declarar `[workspace.lints]`, sacar `-A clippy::all` de los comandos del CI, de los documentos y de los archivos de instrucciones, y actualizar `tests/conventions.rs` y las dos specs.
+3. Declarar `[workspace.lints]` en el `Cargo.toml` raíz y agregar `[lints]` con `workspace = true` a los tres paquetes (`clawg-cli`, `clawg-core` y `clawg-eval`): Cargo no la hereda solo, y un paquete sin esa tabla queda fuera de la política. Sacar `-A clippy::all` de los comandos del CI, de los documentos y de los archivos de instrucciones, y actualizar `tests/conventions.rs` y las dos specs.
 
 ### No-alcance
 

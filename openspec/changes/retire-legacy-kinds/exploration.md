@@ -47,7 +47,7 @@ Queda sin descartar SQL armado por nombre de tabla, que una búsqueda literal no
 ## Alcance candidato
 
 1. **Puerta, sin código:** contar filas vivas y borradas en las dos tablas en cada perfil disponible, con autorización para abrirlos. `clawg export` ya informa `legacy_rows`. Si aparecen filas en número, se revisa qué son antes de seguir.
-2. Migración nueva: cada fila viva pasa a `memory`, con su vector si lo tiene. Después se borran las dos tablas y sus `vec0`. Test con una base sembrada en la versión anterior, según `config.yaml`. El snapshot `pre-migration` es la vuelta atrás.
+2. Migración nueva: cada fila viva pasa a `memory`, con su vector si lo tiene. Una fila que un borrado de proyecto dejó en su diario (`project_delete_row`) tampoco se puede perder en silencio, porque deshacer descarta con un `warn` un `tbl` que no conoce (`crates/clawg-core/src/memory/project_delete.rs:778-781`). Hay dos salidas: migrarla a `memory` con su `deleted_at` y reescribir en la misma transacción su entrada del diario (`tbl` = `memory` y `row_id` = el id nuevo), o, si existe alguna, abortar la actualización sin modificar la base y decir por qué. Después se borran las dos tablas y sus `vec0`. Test con una base sembrada en la versión anterior, según `config.yaml`, y un test que deshace un proyecto borrado antes de la migración. El snapshot `pre-migration` es la vuelta atrás.
 3. Quitar los dos tipos de búsqueda, mantenimiento, proyectos, purga y exportación, y unificar `TableKind` y `MemoryKind`.
 4. API, CLI y MCP: un `kind` viejo recibe un error que lo explica, no un 404 mudo. Bendecir los dos contratos.
 
@@ -59,13 +59,14 @@ Queda sin descartar SQL armado por nombre de tabla, que una búsqueda literal no
 ## Decisiones abiertas
 
 1. A qué `memory_type` va una fila migrada. Una trayectoria y una habilidad no encajan igual en los tipos actuales.
-2. Qué pasa con las referencias a un id viejo: `project_delete_row` y los diarios que nombran la tabla.
-3. Si una fila ya borrada se migra para que `restore` la siga trayendo, o se conserva sólo en el snapshot.
+2. Cuál de las dos salidas del punto 2 del alcance se elige para las filas de `project_delete_row`, y qué pasa con cualquier otra referencia a un id viejo.
+3. Si una fila ya borrada que no está en ningún diario se migra para que `restore` la siga trayendo, o se conserva sólo en el snapshot.
 4. Si el `kind` viejo se sigue aceptando por una versión, con un aviso, para clientes anteriores.
 
 ## Cómo se mide
 
 - **Test en rojo:** una base en la versión anterior con filas de los dos tipos abre con la versión nueva, y cada fila viva se encuentra por búsqueda.
+- **Test en rojo:** un proyecto con filas de los dos tipos, borrado antes de la migración, se deshace con la versión nueva y recupera esas filas. Si la decisión 2 elige abortar, la actualización falla con esa base y la deja intacta.
 - Una búsqueda hace dos KNN y dos consultas de elegibles menos, visible en `search.duration`.
 - `rag-eval --diff` con el modelo real sin casos movidos: el golden set no tiene filas de estos tipos.
 

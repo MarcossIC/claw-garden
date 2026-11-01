@@ -32,7 +32,7 @@ Ejemplos concretos:
 
 ## El punto delicado: leer no puede perder filas
 
-Hoy, una fila con un `status` inesperado llega como texto y sigue siendo legible. Con un enum estricto, `FromSql` falla, y esa fila desaparece de una búsqueda o la rompe. `config.yaml` lo prohíbe: «No change may lose, hide or destroy stored memories». Una base puede tener valores que este código no conoce, escritos por otra versión o por un import.
+Hoy, un valor inesperado llega como texto y la fila sigue siendo legible donde ya se la admite. Un listado sólo filtra por estado si se lo piden (`RowFilter::lifecycle`, `crates/clawg-core/src/memory/admin.rs:937-943`, y `push_filters`, `:979`), así que por defecto muestra cualquier `status` y cualquier `memory_type`. La búsqueda sólo admite `status IN ('active', 'disputed')` (`search.rs:267`): un `status` desconocido ya no entra en ella, y un `memory_type` desconocido con un estado elegible sí. Con un enum estricto, `FromSql` falla, y la fila desaparece de donde hoy se ve o rompe esa lectura. `config.yaml` lo prohíbe: «No change may lose, hide or destroy stored memories». Una base puede tener valores que este código no conoce, escritos por otra versión o por un import.
 
 | Opción para un valor desconocido | A favor | En contra |
 |---|---|---|
@@ -64,7 +64,7 @@ Hoy, una fila con un `status` inesperado llega como texto y sigue siendo legible
 
 ## Cómo se mide
 
-- **Test en rojo:** una fila sembrada con un `status` y un `memory_type` que el código no conoce sigue apareciendo en una búsqueda y en un listado.
+- **Test en rojo:** una fila sembrada con un `memory_type` que el código no conoce y `status` `active` o `disputed` sigue apareciendo en una búsqueda y en un listado, y una sembrada con un `status` que el código no conoce sigue apareciendo en un listado. La búsqueda no cambia: un `status` fuera de `active` y `disputed` sigue sin entrar en ella.
 - El JSON de `crates/clawg-cli/tests/api.rs` y los contratos del agente no cambian.
 - `rag-eval --diff` con el embedder falso sin casos movidos.
 - `perf-bench` sin regresión: los newtypes de `String` no deberían costar nada nuevo.

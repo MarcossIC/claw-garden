@@ -19,7 +19,7 @@ Sin medir: cuánto se desvía en una base real. La conclusión sale de leer el c
 
 ## Lo que ya existe y se reutiliza
 
-- `db.probe_wait` mide aparte la espera en la cola (`MemoryStore::probe_wait`, `crates/clawg-core/src/memory/conn_probe.rs`), así que un brazo no necesita incluirla para que se vea.
+- `db.probe_wait` mide aparte la espera en la cola (`MemoryStore::probe_wait`, `crates/clawg-core/src/memory/conn_probe.rs`), así que un brazo no necesita incluirla para que se vea una cola sostenida. **Límite:** es una muestra cada 10 s (`PROBE_INTERVAL`, `crates/clawg-cli/src/daemon/store_probe.rs:14`), y una cola breve puede no caer en ninguna, aunque se refleje en `total`. Antes de usar esta serie para decidir si hacen falta conexiones de lectura hay que contar con ese límite, o registrar aparte la espera de las búsquedas.
 - Retener la conexión desde un test ya está hecho (`crates/clawg-cli/src/daemon/api.rs:3644-3648`).
 - `metrics.db` guarda la versión de cada corrida, así que un minuto anterior y uno posterior se pueden separar.
 
@@ -51,7 +51,7 @@ Sin medir: cuánto se desvía en una base real. La conclusión sale de leer el c
 
 ## Cómo se mide
 
-- **Test en rojo:** retener la conexión 200 ms, lanzar una búsqueda y comprobar que los brazos KNN quedan por debajo de esa espera y `total` por encima. Hoy los brazos la incluyen.
+- **Test en rojo:** una búsqueda con una consulta sin identificadores: `identifier_matches` vuelve sin pedir la conexión (`search.rs:960-963`), así que la espera no cae antes de que arranquen los relojes de los brazos KNN. El test toma la conexión con una llamada que espera una señal para soltarla, confirma que ya empezó (como `the_probe_waits_behind_a_call_in_progress`, `crates/clawg-core/src/memory/conn_probe.rs:67`), lanza la búsqueda, deja pasar 200 ms y recién ahí la suelta. Así `total` cubre toda la retención y queda por encima de 150 ms, y los brazos KNN quedan por debajo. Hoy los brazos la incluyen.
 - `rag-eval --diff` con el embedder falso sin ningún caso movido: el cambio no toca el ranking.
 
 ## Interacciones

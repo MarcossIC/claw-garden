@@ -12,7 +12,7 @@
 
 - `pub conn: Connection` (`crates/clawg-core/src/memory/db.rs:150`).
 - `crates/clawg-cli/src/daemon/api.rs:2920-2928` la usa en producción con SQL crudo, para contar las carpetas de un proyecto.
-- `clawg-eval` la usa para cerrar: `app.runtime.store.conn.clone().close()` (`crates/clawg-eval/src/bin/rag-eval/agent_view/runner.rs:310`; `crates/clawg-eval/src/bin/revision-eval/run.rs:489`, `:633`, `:798`). Existe `MemoryRuntime::close` (`crates/clawg-core/src/runtime.rs:355`).
+- `clawg-eval` la usa para cerrar: `app.runtime.store.conn.clone().close()` (`crates/clawg-eval/src/bin/rag-eval/agent_view/runner.rs:310`; `crates/clawg-eval/src/bin/revision-eval/run.rs:489`, `:633`, `:798`). Existe `MemoryRuntime::close` (`crates/clawg-core/src/runtime.rs:355`), pero registra el error y no lo devuelve, mientras `rag-eval` y `revision-eval` terminan con `RunError::Close`.
 - Fuera de eso, el límite ya está bastante bien: `clawg-cli` no menciona `rusqlite::` en producción.
 - `.conn` aparece 755 veces en 50 archivos; unas 620 están en tests. Las de `clawg-core` siguen andando con `pub(crate)`. Las de afuera son las de `crates/clawg-cli/tests/api.rs`, `mcp/server.rs`, `daemon/api.rs` y `daemon/store_probe.rs`, más `crates/clawg-core/tests/`.
 
@@ -62,7 +62,7 @@
 
 ## Alcance candidato
 
-1. Mover el SQL de `api.rs:2920` a una función de core, y usar `MemoryRuntime::close` en `clawg-eval`.
+1. Mover el SQL de `api.rs:2920` a una función de core, y hacer falible `MemoryRuntime::close` para usarla en `clawg-eval`: devuelve `Result<(), MemoryError>`, el daemon registra el error como hoy (`crates/clawg-cli/src/daemon/serve.rs:327`), y `rag-eval` y `revision-eval` lo propagan como `RunError::Close` en vez de informar éxito.
 2. `conn` a `pub(crate)`, con el acceso crudo para tests.
 3. `StorageError` y una sola traducción de los errores de `tokio_rusqlite`.
 4. Cerrar `memory/mod.rs` módulo por módulo y borrar lo que el compilador señale.
