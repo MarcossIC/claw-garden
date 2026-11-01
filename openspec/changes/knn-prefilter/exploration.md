@@ -154,7 +154,7 @@ No es un destino sino la **puerta**: se corre la medición de más abajo y se re
 - **project-clone-identity (30):** re-key de proyecto. Con A obliga a reescribir vectores; con B no.
 - **agent-sharing / `sharing.json`:** B respeta la lista de ocultos tal como está, porque reusa el mismo predicado.
 - **knowledge-synthesis y `search_project`:** la búsqueda de documentos no se toca; ya tiene partición (`V12__project_docs.sql:36-39`).
-- **search-arm-timing (101):** arregla las duraciones por brazo que esta puerta lee. Conviene que entre antes.
+- **search-arm-timing (101):** no es requisito de esta puerta, que decide por pérdidas y no por duraciones. La latencia que informa es `total` y `knn_memory`, el primer brazo que entra en la cola.
 - **search-index-ports (110):** lo que decida este cambio pasa a ser cómo filtra el adaptador `vec0` de ese puerto.
 
 ## Alcance candidato

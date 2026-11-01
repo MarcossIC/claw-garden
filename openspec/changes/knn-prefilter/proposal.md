@@ -22,8 +22,8 @@ Lo que hay medido no alcanza para decidir:
 | Premisa | Hoy |
 |---|---|
 | El detector de contradicciones busca con `Reach::OwnOnly` (líneas 19 y 48) | **Ya no.** Desde agent-authorship (76) busca con el alcance de quien guarda: `reach: saver.reach.clone()` (`crates/clawg-core/src/memory/contradiction.rs:173-185`). Las filas de otros agentes son candidatas, no crowding, salvo que `sharing.json` las oculte. El crowding del detector viene de otros proyectos, de agentes ocultos y de las revisiones `superseded`. El test 4 de la exploración («no marca nunca una fila ajena») deja de valer, como anotó la [exploración de agent-authorship](../archive/2026-10-22-agent-authorship/exploration.md), línea 213. |
-| Una búsqueda con `limit = 50` necesita `50/s ≤ 120` (tabla de la línea 43) | **El pool es 30.** `knn_one` recorta a `k` saves (`trim_to_saves`, `search.rs:678`) y `limit` sólo corta después (`:1434`), así que ninguna llamada recibe más de 30 filas de `memory` (`SearchScope::all_default`, `:40`). La condición de una llamada con `limit ≥ 30` es `30/s ≤ 120`, es decir `s ≥ 1/4`. |
-| `recall_context` es otra medición | **Comparte el pool.** Busca con el mismo `SearchScope::all_default()` y el mismo alcance (`crates/clawg-core/src/memory/prompt_builder.rs:227-233`), con `K_FINAL` = 10 más lo ya emitido (`:57`, `:217`). Lo que pierde la ventana es lo mismo para las dos herramientas; medir la búsqueda mide las dos. |
+| Una búsqueda con `limit = 50` necesita `50/s ≤ 120` (tabla de la línea 43) | **El pool es 30.** `knn_one` recorta a `k` saves (`trim_to_saves`, `search.rs:678`) y `limit` sólo corta después (`:1434`), así que la ventana densa no le da a ninguna llamada más de 30 saves (`SearchScope::all_default`, `:40`). Si las 30 filas elegibles son 30 saves distintos, la condición de una llamada con `limit ≥ 30` es `30/s ≤ 120`, es decir `s ≥ 1/4`. La ventana cuenta filas y el pool cuenta saves (`:646`, `:678`): si un save aporta varias piezas, las 120 filas rinden menos saves, y con `r` piezas por save la condición pasa a `s ≥ r/4`. En un store de producción con saves de varias piezas, 1/4 es la cota más favorable. |
+| `recall_context` es otra medición | **Comparte la ventana densa, no el resultado final.** Busca con el mismo `SearchScope::all_default()` y el mismo alcance (`crates/clawg-core/src/memory/prompt_builder.rs:227-233`), con `K_FINAL` = 10 más lo ya emitido (`:57`, `:217`), y saca lo ya emitido antes de su corte final (`:254`, `:261`). Esta medición corre sin texto de consulta (decisión 1), mientras las dos herramientas le pasan texto al canal léxico (`crates/clawg-cli/src/daemon/api.rs:1503`, `prompt_builder.rs:230`), que puede recuperar lo que la ventana densa perdió (`search.rs:1421`). Lo medido es la pérdida dentro de esa ventana, que comparten; no es la pérdida final de ninguna de las dos. |
 | `rag-eval` usa `Reach::Own` y `project_id: None` (línea 24) | Usa el alcance del daemon y el proyecto del caso (`eval_api.rs:384-388`), como se dijo arriba. Le sigue faltando el corpus y la referencia. |
 | Citas | `search.rs:224-233` → `:244-258`; `:246-253` → `:267-273`; `:311-326` → `:331-346`; `:361` → `:381`; `:430-432` → `:483-485`; `:495` → `:548`; `:593` → `:649`; `:620-621` → `:677-678`; `:37-46` → `:38-47`; `contradiction.rs:58` → `:59`; `:178` → `:183`; `:200` → `:206`; `api.rs:75`, `:77` → `crates/clawg-cli/src/daemon/api.rs:94`, `:96`; `:289-298` → `:319-323`. Lo demás sigue donde la exploración lo cita. |
 
@@ -98,7 +98,7 @@ Cómo se reparten las filas de una forma de `N` filas, `A` agentes y `P` proyect
 
 | Medida | Definición | Por forma |
 |---|---|---|
-| `loss@10`, `loss@30` | `|referencia \ resultado| / |referencia|`, promedio sobre las consultas con referencia no vacía | por tipo de consulta: tema propio, tema compartido, cadena por largo |
+| `loss@10`, `loss@30` | `\|referencia \ resultado\| / \|referencia\|`, promedio sobre las consultas con referencia no vacía | por tipo de consulta: tema propio, tema compartido, cadena por largo |
 | pérdida del detector | candidatos de la referencia que `detect_contradiction` no devuelve, sobre los candidatos de la referencia | por cadena según largo, y afirmaciones repetidas |
 | la versión vigente | su puesto en el resultado de cada consulta de afirmación | por largo |
 | `passes` | parte de las búsquedas y de las sondas que corrieron la segunda pasada (`search.knn_retry`, `search.rs:1360-1364`) | |
@@ -110,7 +110,7 @@ La puerta **abre** si, en alguna forma que decide (F1 a F4), sobre las consultas
 
 | # | Umbral | Lo mide |
 |---|---|---|
-| U1 | `loss@10` medio > 0,02 | lo que ve una búsqueda por defecto y `recall_context` |
+| U1 | `loss@10` medio > 0,02 | la parte densa de lo que ve una búsqueda por defecto y `recall_context` |
 | U2 | `loss@30` medio > 0,05 | el pool que reordena la puntuación |
 | U3 | el detector pierde más de 1 de cada 10 candidatos de la referencia (> 0,10) | lo que deja pasar sin par |
 
