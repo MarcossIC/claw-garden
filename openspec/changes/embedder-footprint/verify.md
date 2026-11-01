@@ -1,6 +1,6 @@
 # embedder-footprint — Verificación
 
-Registro de la puerta (tarea 2). Están medidos los pasos 2.1 y 2.2, en Windows y en Linux. Faltan los pasos 2.3 a 2.6.
+Registro de la puerta (tarea 2). Están medidos los pasos 2.1 y 2.2, en Windows y en Linux, y 2.3 en Windows. Faltan 2.4, sólo las arenas de malloc en Linux, y 2.5.
 
 ## La máquina y el build
 
@@ -31,7 +31,8 @@ Un refresco de docs ya bajó de unos 45 a unos 20 minutos, así que no se devuel
 - **Marginal:** un porcentaje alto sobre un consumo bajo no cuenta. La ganancia tiene que dejar libre al menos 1 núcleo en promedio durante el refresco, o 100 MiB de pico de privados.
 - **Ruido:** dentro de una misma rama, sin cambio de régimen, `embed` varió menos del 2 % en docs-index-speed.
 - **C:** abrió por 2.1, pero lo medido de su ganancia es el recuento de hilos. Si su brazo no degrada el tiempo y tampoco gana CPU, entrar o no queda como decisión expresa.
-- **Sin fijar todavía:** el p99 de búsqueda de 2.4 y el tiempo de `split_save` de 2.5.
+- **E (2.5):** abre sólo si las dos codificaciones de más pesan al menos 5 % del tiempo de un guardado de 64 KiB, contando las tres codificaciones y la tanda. Se fijó antes de medir `split_save`, pero después de estimar con los datos del refresco que rondaría el 2 %.
+- **Sin fijar todavía:** el p99 de búsqueda de 2.4.
 
 ## Cómo se midió
 
@@ -151,10 +152,69 @@ Límites de esta lectura:
 - **En Linux un hilo nuevo hereda el nombre del que lo crea, así que contar por nombre no separa los grupos.** Los 4 de `rayon` se llaman `embedder-worker`. Los 3 que se van con el modelo junto con `embedder-worker` se llaman `tokio-rt-worker`, porque la carga corre en un hilo de bloqueo de tokio. En la repetición 1 de 2.2, esos 3 tenían 0 s de CPU antes de la tanda y de 0,11 a 0,16 s cada uno después; `embedder-worker`, 0,29 s, y los 4 de `rayon`, 0 s cada uno.
 - **Con el modelo suelto, `RssAnon` queda en 330,5 MiB** en las dos variantes. La lectura 1 (22 MiB) es anterior a leer el tokenizer, así que no sirve de base para saber cuánto queda del modelo.
 
+## 2.3 CPU y pared de un refresco de docs
+
+### Ronda 1 en Windows: brazos seguidos, sin pausa
+
+Build release con la feature `testing`, versión 0.73.0, sobre `6cb64fc`, con dos parches de medición que no se commitean: hilos y espera activa por variable de entorno en `session_builder`, y el reloj, la CPU y el pico de privados alrededor del indexado en `rag-eval`. Cada corrida es `rag-eval --real --docs --no-cache` sobre el mismo árbol: 821 documentos, 19.696 pasajes. Los brazos corrieron en el orden de la tabla.
+
+| Brazo | Hilos del proceso | Tiempo | Frente a la base | `split` | `count` | CPU total | Núcleos en promedio | Pico de privados |
+|---|---|---|---|---|---|---|---|---|
+| Base, 16 hilos | 36 | 1024,2 s | – | 10,08 s | 2,04 s | 10.955 s | 10,7 | 1483,6 MiB |
+| 8 hilos | 27 | 1436,3 s | +40,2 % | 10,88 s (+7,9 %) | 1,92 s (−5,9 %) | 9.515 s (−13,1 %) | 6,6 | 1482,7 MiB |
+| 4 hilos | 23 | 1906,5 s | +86,1 % | 10,84 s (+7,5 %) | 2,08 s (+2,0 %) | 6.788 s (−38,0 %) | 3,6 | 1483,3 MiB |
+| Sin espera activa | 35 | 1343,7 s | +31,2 % | 11,83 s (+17,4 %) | 2,68 s (+31,4 %) | 14.584 s (+33,1 %) | 10,9 | 1485,3 MiB |
+
+- **`split` y `count` sirven de termómetro.** Son trabajo del tokenizer, que estos tres brazos no tocan: si suben, la máquina entera iba más lenta. `split` cae a lo largo de la corrida y `count` se mide al terminar de indexar; dura unos 2 s, así que es una lectura ruidosa.
+- **La ronda no es pareja.** La base corrió primera y en frío, y no se registró la temperatura durante los brazos. Tras 1 h 40 min de carga, el sensor térmico marcaba 373 K, unos 100 °C. Con la máquina casi en reposo bajó a 340 K en unos 15 minutos y quedó estable en 339 K. `% Passive Limit` siguió en 100 todo el tiempo, así que ese contador no descarta un freno por calor.
+- **El brazo de tokenizer en serie no tiene datos.** Se cortó a los 4 minutos por la temperatura.
+- **La memoria no se mueve** con ningún brazo: 1483 a 1485 MiB.
+- **La búsqueda no cambia.** Las 40 preguntas dieron el mismo rango y el mismo primer pasaje en los cuatro brazos. Es buena señal, pero no reemplaza la comprobación de bits de 2.6.
+
+**B se descarta en Windows, sin repetir.** `split` no quedó parejo, como pedía la regla para no repetir un brazo, pero `count` no sube. Aun descontando `split`, 8 hilos quedan en +30 % y 4 hilos en +73 %, contra un techo de +5 %. Tampoco hay un punto intermedio: 8 hilos ahorran 13 % de CPU a cambio de +40 % de tiempo, así que llegar a 22 % pide bajar de 8 hilos, y eso cuesta todavía más tiempo. En la máquina Linux de 4 hilos, físicos y `min(lógicos, 4)` coinciden con la base, así que no hay brazo que medir.
+
+En esta ronda, A quedó sin decidir: descontando `count` y `split`, el tiempo daba entre 0 y +12 % y la CPU entre +1 % y +13 %, en una sola corrida y en caliente. Se resolvió con la prueba corta.
+
+### Prueba corta en Windows: en frío, con temperatura y frecuencia registradas
+
+El mismo build y el mismo `rag-eval --real --docs --no-cache`, sobre una muestra del árbol: cada séptimo archivo de cada tipo, más `README.md`. Son 119 documentos y 3223 pasajes, con una pregunta de relleno, así que las métricas de búsqueda de estas corridas no significan nada. Tres rondas con el orden rotado, y cada brazo se compara con la base de su ronda. `typeperf` registra cada 5 s el sensor térmico y `% Processor Performance`; la frecuencia es ese porcentaje sobre los 2000 MHz nominales, una aproximación.
+
+| Corrida | Orden en la ronda | Tiempo | Frente a la base | CPU total | Frente a la base | Pico de privados | Hilos | Frecuencia, primeros 30 s |
+|---|---|---|---|---|---|---|---|---|
+| Base 1 | 1.º | 171,81 s | – | 1642,8 s | – | 1640,0 MiB | 38 | 3949 MHz |
+| Sin espera 1 | 2.º | 179,86 s | +4,7 % | 1673,5 s | +1,9 % | 1639,5 MiB | 38 | 3930 MHz |
+| Serie 1, repetida | al final | 173,51 s | +1,0 % | 1637,8 s | −0,3 % | 1618,3 MiB | 22 | 4020 MHz |
+| Serie 2 | 1.º | 176,03 s | +2,3 % | 1674,7 s | −2,2 % | 1621,8 MiB | 22 | 3933 MHz |
+| Base 2 | 2.º | 172,13 s | – | 1711,6 s | – | 1641,6 MiB | 37 | 4002 MHz |
+| Sin espera 2 | 3.º | 173,82 s | +1,0 % | 1676,0 s | −2,1 % | 1641,0 MiB | 37 | 4003 MHz |
+| Sin espera 3 | 1.º | 176,08 s | +3,0 % | 1674,8 s | −0,2 % | 1639,2 MiB | 38 | 4002 MHz |
+| Serie 3 | 2.º | 172,85 s | +1,1 % | 1661,2 s | −1,0 % | 1621,4 MiB | 22 | 4003 MHz |
+| Base 3 | 3.º | 170,93 s | – | 1678,3 s | – | 1639,2 MiB | 38 | 4010 MHz |
+
+| Brazo | Mediana de tiempo | Mediana de CPU | Pico de privados, mediana |
+|---|---|---|---|
+| Sin espera activa | +3,0 % | −0,2 % | −0,5 MiB |
+| Tokenizer en serie | +1,1 % | −1,0 % | −19,8 MiB |
+
+- **Un sensor térmico solo no prueba un arranque en frío.** El sensor quedó fijo en 337 K durante 5 minutos, de 12:59 a 13:04, con la máquina a plena carga, y saltó de golpe a 361 K. El guion leyó 337 K al terminar «sin espera 1» y lanzó «serie 1» 2 segundos después. Esa corrida arrancó a 3483 MHz, dio 192,56 s y no cuenta. Se repitió al final tras 10 minutos fijos de pausa y se compara con la base de su ronda. Las otras 9 corridas arrancaron entre 3930 y 4020 MHz.
+- **La frecuencia baja a la mitad de cada corrida.** Arranca cerca de 4,0 GHz y termina cerca de 3,45 GHz, con el sensor entre 361 K y 372 K. Una corrida de 3 minutos pasa por las dos zonas; un refresco completo pasa casi todo su tiempo en la segunda.
+- **La base es estable.** 171,81, 172,13 y 170,93 s: 0,7 % de punta a punta.
+- **El recuento de tokens es el mismo en todas las corridas,** también en serie: 1.012.475 reales, 1.501.796 con relleno.
+- **`split` no cambia en serie** (1,47 a 1,77 s, contra 1,45 a 1,95 s de la base). **`count` sí:** de 0,28 a 0,30 s pasa a 0,90 a 1,64 s, porque es el trabajo que `encode_batch` reparte entre los núcleos.
+
+**A se descarta.** Con +3,0 % de tiempo necesitaba al menos 22 % de CPU o de memoria y gana 0,2 % de CPU. El +31 % de la ronda 1 era casi todo calor: en frío queda en +3 %. Tampoco abrió por 2.2, ni en Windows ni en Linux. Esta prueba corta no se corrió en Linux.
+
+**C no pasa por la regla general de 2.3 y queda en el caso previsto para él.** El tiempo sube 1,1 %, dentro de lo que no se distingue del ruido, aunque sube en las tres rondas. La ganancia es marginal: 1 % de CPU, unos 0,1 núcleos, y 20 MiB de pico, contra 1 núcleo o 100 MiB. Lo único que cambia de forma clara son los hilos, 16 menos. Entrar o no era decisión expresa.
+
+**C no entra.** Una ganancia tan baja no justifica cambiar el tokenizer, y menos con el tiempo subiendo en las tres rondas. Sin ningún brazo en pie, no hacen falta el refresco completo de confirmación ni medir 2.3 en Linux.
+
 ## Lo que esto corrige de la exploración
 
 - **`window_encodings` ya no es el único llamador de `encode_batch`.** También lo llama `TokenSplitter::count_all` (`crates/clawg-core/src/memory/chunker/token_splitter.rs:57`), que está hecho para repartir la tanda entre los núcleos. `set_parallelism(false)` cambiaría los dos.
 
 ## Pendiente
 
-- 2.3 a 2.7, con sus umbrales fijados antes de medir.
+- 2.4: sólo `MALLOC_ARENA_MAX=1` contra `=2`, en Linux, con su umbral fijado antes de medir. La latencia por brazo ya no tiene brazos que comparar.
+- 2.5: `split_save`.
+- 2.6 no se corre: no entra ningún cambio de hilos, de espera activa ni de tokenizer, así que no hay combinación que comprobar.
+- 2.7: cerrar el registro.

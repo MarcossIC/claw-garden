@@ -12,10 +12,10 @@ artifacts:
   verify: pending
   archive: pending
 gates:
-  C: open  # 2.1: con el modelo suelto quedan vivos los hilos de rayon, tantos como lógicos: 16 en Windows y 4 en Linux
-  A: pending  # 2.2 no abre en Windows (mediana -0,073 s) ni en Linux (mediana 0,00 s), umbral +0,6 s; falta la CPU total de 2.3
-  B: pending  # 2.3 y 2.4: CPU, pared y p99 de búsqueda con menos hilos
-  E: pending  # 2.5: tiempo de la triple codificación de split_save
+  C: dropped  # 2.1 abre: con el modelo suelto quedan vivos los hilos de rayon, tantos como lógicos: 16 en Windows y 4 en Linux; 2.3: +1,1 % de tiempo, -1,0 % de CPU, -20 MiB, ganancia marginal; se decidió no entrar
+  A: dropped  # 2.2 no abre en Windows (mediana -0,073 s) ni en Linux (mediana 0,00 s), umbral +0,6 s; 2.3 en Windows, en frío: +3,0 % de tiempo por -0,2 % de CPU
+  B: dropped  # 2.3 en Windows: 8 hilos +40 % de tiempo por -13 % de CPU, 4 hilos +86 % por -38 %, contra un techo de +5 %
+  E: pending  # 2.5: abre si las dos codificaciones de más pesan al menos 5 % de un guardado de 64 KiB
   arena: pending  # 2.4: p99 de búsqueda con 1 y 2 arenas de malloc
   D: dropped  # pasó a docs-index-speed
 updated: 2026-11-01
