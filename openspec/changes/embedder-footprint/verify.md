@@ -214,7 +214,7 @@ El mismo build y el mismo `rag-eval --real --docs --no-cache`, sobre una muestra
 
 ## Pendiente
 
-- 2.4: sólo `MALLOC_ARENA_MAX=1` contra `=2`, en Linux, con su umbral fijado antes de medir. La latencia por brazo ya no tiene brazos que comparar.
+- 2.4: sólo una arena contra dos, en Linux, con el build de medición de la tarea (`clawg serve` pisa `MALLOC_ARENA_MAX` con `mallopt`) y su umbral fijado antes de medir. La latencia por brazo ya no tiene brazos que comparar.
 - 2.5: `split_save`.
 - 2.6 no se corre: no entra ningún cambio de hilos, de espera activa ni de tokenizer, así que no hay combinación que comprobar.
 - 2.7: cerrar el registro.
