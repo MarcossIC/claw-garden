@@ -25,7 +25,7 @@ Medición, transversal. read-connections (57) decide en su puerta si una lectura
    - `identifiers`: la consulta de coincidencias (`identifier_matches`). El filtro de `holds_identifier`, que corre después en la tarea sobre las filas que volvieron, queda fuera.
    - `knn_memory`, `knn_episodic`, `knn_skill`: la llamada de `knn_one` entera: las pasadas, la cuenta de elegibles, los enlaces de las piezas, el puntaje, el orden y el recorte, que ya corren todos en esa clausura (`search.rs:566-680`).
    - `lexical`: la llamada de candidatos más la de puntaje de los que el denso no trajo, si corrió.
-   - Un brazo que el alcance prendió pero no llamó a la conexión (una consulta sin tokens, ningún candidato que puntuar) registra 0; uno que el alcance apagó no registra nada, como hoy.
+   - Un brazo que corrió sin nada que pedirle a la conexión (una consulta sin identificadores para `identifiers`, sin tokens para `lexical`) registra 0; uno que no corrió (el alcance lo apagó, o `identifiers` y `lexical` sin texto de consulta) no registra nada, como hoy.
    - Una consulta léxica o de identificadores que falla sigue sin hacer fallar la búsqueda y cuenta lo que corrió antes de fallar.
    - `total` no cambia: de punta a punta, con las esperas. Quien quiera lo que costó la cola lee `total` y `db.probe_wait`.
 3. **Cómo vuelve la duración.** `KnnOutcome`, que ya lleva `passes`, gana el campo `ran`. Los canales que no fallan (`identifier_matches`, `lexical_candidates`, `score_lexical_candidates`) devuelven su duración junto con su resultado, por una función que corre la consulta con `call_raw` y la cronometra dentro: así un error de SQLite vuelve con lo que la consulta corrió, y una llamada que nunca llegó al hilo (la conexión cerrada) vuelve con 0.

@@ -4,13 +4,13 @@ Delta sobre R14 de [`specs/metrics`](../../specs/metrics/spec.md). La serie sigu
 
 ## A1. Cada brazo mide su ejecución en el hilo de la conexión
 
-Cada brazo que el alcance prendió MUST registrar el tiempo que sus llamadas corrieron en el hilo de la conexión del store, sin la espera en su cola:
+Cada brazo que corrió (el alcance lo prendió y, para `identifiers` y `lexical`, la búsqueda trae texto) MUST registrar el tiempo que sus llamadas corrieron en el hilo de la conexión del store, sin la espera en su cola:
 
 - `identifiers`: la consulta de coincidencias; lo que se filtra después fuera del hilo MUST NOT contarse;
 - `knn_memory`, `knn_episodic`, `knn_skill`: la llamada del KNN de su tabla, con sus pasadas, la cuenta de elegibles y el puntaje;
 - `lexical`: la llamada de candidatos más la de puntaje, si corrió.
 
-Un brazo prendido que no llamó a la conexión MUST registrar 0. Un brazo que el alcance apagó MUST NOT registrar nada. Una consulta léxica o de identificadores que falla MUST NOT hacer fallar la búsqueda, y su brazo MUST registrar lo que corrió. `total` MUST seguir midiendo la búsqueda de punta a punta, esperas incluidas.
+Un brazo que corrió sin nada que pedirle a la conexión (una consulta sin identificadores para `identifiers`, sin tokens para `lexical`) MUST registrar 0. Un brazo que no corrió MUST NOT registrar nada. Una consulta léxica o de identificadores que falla MUST NOT hacer fallar la búsqueda, y su brazo MUST registrar lo que corrió. `total` MUST seguir midiendo la búsqueda de punta a punta, esperas incluidas.
 
 #### Escenario: una búsqueda que espera detrás de una llamada en curso
 - GIVEN la conexión retenida por una llamada que espera una señal, y una búsqueda con el KNN de `memory` y el canal léxico, con una consulta sin identificadores, encolada detrás
