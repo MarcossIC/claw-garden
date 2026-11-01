@@ -3,6 +3,7 @@
 //! replays a session, stops the daemon and scores the session, with the fake
 //! model and no client. Every run is written under a temporary directory.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -31,16 +32,21 @@ fn clawg() -> &'static Path {
 }
 
 /// `agent-eval`, with what keeps every clawg it starts on the fake model and
-/// off the profile's port.
-fn agent_eval(args: &[&str]) -> Output {
+/// off the profile's port, and `env` on top.
+fn agent_eval_with(args: &[&str], env: &[(&str, &OsStr)]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_agent-eval"))
         .args(args)
         .env("CLAWG_TEST_EMBEDDER", "fake")
         .env("CLAWG_TEST_DEFAULT_PORT", "off")
         .env("RUST_LOG", "info")
         .env_remove("CLAWG_PROFILE")
+        .envs(env.iter().copied())
         .output()
         .expect("agent-eval must start")
+}
+
+fn agent_eval(args: &[&str]) -> Output {
+    agent_eval_with(args, &[])
 }
 
 fn replay(dir: &Path, task: &str, arm: &str) -> (Output, PathBuf) {
@@ -219,4 +225,40 @@ fn a_daemon_that_never_listens_starts_no_client() {
     assert!(stderr(&output).contains("before it listened") && stderr(&output).contains("serve.log"), "{}", stderr(&output));
     assert!(std::fs::read_to_string(run.join("serve.log")).unwrap().contains("unknown command serve"));
     assert!(!run.join("clawg.log").exists() && !run.join("stream.jsonl").exists());
+}
+
+#[test]
+fn a_run_with_claude_refuses_another_version_before_laying_out_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    // agent-eval knows no `--version`, so as `claude` it reports none.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_agent-eval"), bin.join(format!("claude{}", std::env::consts::EXE_SUFFIX))).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()))).unwrap();
+    let out = dir.path().join("run");
+
+    let output = agent_eval_with(
+        &[
+            "run",
+            "--task",
+            "example-staging-port",
+            "--arm",
+            "a3",
+            "--out",
+            out.to_str().unwrap(),
+            "--clawg",
+            clawg().to_str().unwrap(),
+            "--model",
+            "some-model",
+            "--max-budget-usd",
+            "0.5",
+            "--claude-version",
+            "2.1.300",
+        ],
+        &[("PATH", &path)],
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("claude 2.1.300") && stderr(&output).contains("no version"), "{}", stderr(&output));
+    assert!(!out.exists(), "nothing of the run was laid out");
 }

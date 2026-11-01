@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::arm::{Arm, Daemon, Layout, Options, RunPlan, Step, TEST_HOME_VAR};
@@ -41,6 +41,37 @@ const EXIT_BUDGET: Duration = Duration::from_secs(10);
 
 const POLL: Duration = Duration::from_millis(50);
 
+/// Who plays the session of a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Client {
+    /// The client the plan starts, [`crate::arm::CLIENT`]: a paid session.
+    Claude,
+    /// A recorded stream, replayed by `agent-eval replay-client`.
+    Replay(PathBuf),
+}
+
+impl Client {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Client::Claude => "claude",
+            Client::Replay(_) => "replay",
+        }
+    }
+
+    /// The command that starts it: the plan's own, or `agent_eval` replaying
+    /// the stream.
+    fn step(&self, planned: &Step, agent_eval: &Path) -> Step {
+        match self {
+            Client::Claude => planned.clone(),
+            Client::Replay(stream) => Step {
+                program: agent_eval.to_string_lossy().into_owned(),
+                args: vec!["replay-client".into(), stream.to_string_lossy().into_owned()],
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Session {
     pub session_id: Option<String>,
@@ -66,7 +97,7 @@ pub struct RunResult {
     pub category: String,
     pub example: bool,
     pub arm: String,
-    /// `replay` for a recorded stream; a real client would say `claude`.
+    /// [`Client::name`].
     pub client: String,
     pub lang: Option<Lang>,
     pub session: Session,
@@ -163,6 +194,8 @@ pub enum RunError {
     Step { command: String, code: Option<i32>, log: PathBuf },
     #[error("the client exited with {code:?}; see {}", .log.display())]
     Client { code: Option<i32>, log: PathBuf },
+    #[error("the run asks for {program} {expected}, and `{program} --version` reports {}", .found.as_deref().unwrap_or("no version"))]
+    ClientVersion { program: String, expected: String, found: Option<String> },
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
@@ -170,8 +203,9 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
 }
 
 /// Lays the run out in an empty or missing `layout.root`: the fixture copied
-/// as the working directory, every planned file and `run.json`.
-pub fn prepare(task: &Task, arm: Arm, fixture: &Path, layout: &Layout, options: &Options) -> Result<RunPlan, RunError> {
+/// as the working directory, every planned file and `run.json`, which names
+/// the client that plays the session.
+pub fn prepare(task: &Task, arm: Arm, fixture: &Path, layout: &Layout, options: &Options, client: &Client) -> Result<RunPlan, RunError> {
     let root = &layout.root;
     if std::fs::read_dir(root).is_ok_and(|mut d| d.next().is_some()) {
         return Err(RunError::NotEmpty(root.clone()));
@@ -196,6 +230,8 @@ pub fn prepare(task: &Task, arm: Arm, fixture: &Path, layout: &Layout, options: 
         "model": options.model,
         "effort": options.effort,
         "max_budget_usd": options.max_budget_usd,
+        "claude_version": options.claude_version,
+        "client": client,
         "plan": plan,
     });
     let path = root.join(RUN_FILE);
@@ -255,10 +291,32 @@ fn holds(mut reader: impl Read, needle: &[u8], chunk: usize) -> std::io::Result<
     }
 }
 
-/// The plan `prepare` left in `root`'s `run.json`.
-pub fn read_plan(root: &Path) -> Result<RunPlan, RunError> {
+/// The version `claude --version` printed: its first word, as in
+/// `2.1.300 (Claude Code)`.
+fn reported_version(output: &str) -> Option<&str> {
+    output.split_whitespace().next()
+}
+
+/// Refuses a `program` that does not report `expected`, so no session runs
+/// on another version than the one the run is pinned to.
+pub fn check_client_version(program: &str, expected: &str) -> Result<(), RunError> {
+    let output = Command::new(program).arg("--version").stdin(Stdio::null()).output().map_err(io(Path::new(program)))?;
+    let printed = String::from_utf8_lossy(&output.stdout);
+    let found = if output.status.success() { reported_version(&printed) } else { None };
+    if found == Some(expected) {
+        Ok(())
+    } else {
+        Err(RunError::ClientVersion { program: program.to_owned(), expected: expected.to_owned(), found: found.map(str::to_owned) })
+    }
+}
+
+/// The plan `prepare` left in `root`'s `run.json`, and its client.
+fn read_run(root: &Path) -> Result<(RunPlan, Client), RunError> {
     let mut record = read_record(root)?;
-    serde_json::from_value(record["plan"].take()).map_err(|e| RunError::NotARun(root.to_owned(), e.to_string()))
+    let not_a_run = |e: serde_json::Error| RunError::NotARun(root.to_owned(), e.to_string());
+    let plan = serde_json::from_value(record["plan"].take()).map_err(not_a_run)?;
+    let client = serde_json::from_value(record["client"].take()).map_err(not_a_run)?;
+    Ok((plan, client))
 }
 
 fn read_record(root: &Path) -> Result<Value, RunError> {
@@ -267,13 +325,14 @@ fn read_record(root: &Path) -> Result<Value, RunError> {
     serde_json::from_str(&text).map_err(|e| RunError::NotARun(root.to_owned(), e.to_string()))
 }
 
-/// Runs the session `prepare` laid out in `root`, as its `run.json` plans it,
-/// with `client` as the client: with clawg, the daemon of the run's home
-/// first, then the commands before the session, the client and the commands
-/// after it, which also run when the seed or the client failed. A seed that
-/// does not load starts no client.
-pub fn execute(root: &Path, client: &Step) -> Result<(), RunError> {
-    let plan = read_plan(root)?;
+/// Runs the session `prepare` laid out in `root`, as its `run.json` plans it:
+/// with clawg, the daemon of the run's home first, then the commands before
+/// the session, the client and the commands after it, which also run when the
+/// seed or the client failed. A seed that does not load starts no client.
+/// `agent_eval`, this binary, is the replay client.
+pub fn execute(root: &Path, agent_eval: &Path) -> Result<(), RunError> {
+    let (plan, client) = read_run(root)?;
+    let client = &client.step(&plan.client, agent_eval);
     let layout = Layout { root: root.to_owned() };
     let Some(daemon) = &plan.daemon else {
         return client_ran(start_client(&plan, &layout, client)?, root);
@@ -441,9 +500,10 @@ pub fn start_client(plan: &RunPlan, layout: &Layout, client: &Step) -> Result<Op
 
 /// Scores the run in `root` from its `run.json`, `stream.jsonl` and working
 /// directory, and writes `result.json`.
-pub fn score_dir(root: &Path, client: &str) -> Result<RunResult, RunError> {
+pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     let not_a_run = |why: &str| RunError::NotARun(root.to_owned(), why.to_owned());
     let record = read_record(root)?;
+    let client: Client = serde_json::from_value(record["client"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
     let task: Task = serde_json::from_value(record["task"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
     let arm = record["arm"].as_str().ok_or_else(|| not_a_run("no arm"))?.to_owned();
     let profile = match record["profile"].as_str() {
@@ -456,7 +516,7 @@ pub fn score_dir(root: &Path, client: &str) -> Result<RunResult, RunError> {
     let stream = std::fs::read_to_string(&stream_path).map_err(io(&stream_path))?;
     let workdir = Layout { root: root.to_owned() }.workdir();
     let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
-    let result = evaluate(&task, &arm, client, profile, lang, &stream::parse(&stream), read_file);
+    let result = evaluate(&task, &arm, client.name(), profile, lang, &stream::parse(&stream), read_file);
     let out = root.join(RESULT_FILE);
     std::fs::write(&out, serde_json::to_string_pretty(&result).expect("JSON serializes") + "\n").map_err(io(&out))?;
     Ok(result)
@@ -506,7 +566,35 @@ mod tests {
     }
 
     fn options(clawg: PathBuf) -> Options {
-        Options { clawg, profile: Profile::Dev, lang: None, model: "m".into(), effort: None, max_budget_usd: None, now_ms: 0 }
+        Options {
+            clawg,
+            profile: Profile::Dev,
+            lang: None,
+            model: "m".into(),
+            effort: None,
+            max_budget_usd: None,
+            claude_version: Some("2.1.300".into()),
+            now_ms: 0,
+        }
+    }
+
+    #[test]
+    fn the_client_is_claude_as_planned_or_a_replay_of_a_stream() {
+        let planned = Step { program: "claude".into(), args: vec!["-p".into(), "Which port?".into()] };
+        let exe = Path::new("/bin/agent-eval");
+        assert_eq!(Client::Claude.step(&planned, exe), planned);
+        let replay = Client::Replay(PathBuf::from("/runs/s.jsonl"));
+        assert_eq!(replay.step(&planned, exe), Step { program: "/bin/agent-eval".into(), args: vec!["replay-client".into(), "/runs/s.jsonl".into()] });
+        assert_eq!((Client::Claude.name(), replay.name()), ("claude", "replay"));
+        assert_eq!(serde_json::to_value(&Client::Claude).unwrap(), json!("claude"));
+        assert_eq!(serde_json::to_value(&replay).unwrap(), json!({ "replay": "/runs/s.jsonl" }));
+    }
+
+    #[test]
+    fn the_version_claude_reports_is_its_first_word() {
+        assert_eq!(reported_version("2.1.300 (Claude Code)\n"), Some("2.1.300"));
+        assert_eq!(reported_version("  2.1.301\n"), Some("2.1.301"));
+        assert_eq!(reported_version(""), None);
     }
 
     #[test]
@@ -518,7 +606,7 @@ mod tests {
         let layout = Layout { root: dir.path().join("run") };
         let opts = options(dir.path().join("clawg"));
 
-        let plan = prepare(&task(), Arm::A3, &fixture, &layout, &opts).unwrap();
+        let plan = prepare(&task(), Arm::A3, &fixture, &layout, &opts, &Client::Claude).unwrap();
 
         assert_eq!(std::fs::read_to_string(layout.workdir().join("src/app.py")).unwrap(), "print(1)\n");
         for (path, body) in &plan.files {
@@ -528,8 +616,9 @@ mod tests {
         let record: Value = serde_json::from_str(&std::fs::read_to_string(layout.root.join(RUN_FILE)).unwrap()).unwrap();
         assert_eq!(record["arm"], "a3");
         assert_eq!(record["task"]["id"], "t");
-        assert_eq!(read_plan(&layout.root).unwrap(), plan, "a run runs what run.json says");
-        assert!(matches!(prepare(&task(), Arm::A3, &fixture, &layout, &opts), Err(RunError::NotEmpty(_))));
+        assert_eq!((&record["client"], &record["claude_version"]), (&json!("claude"), &json!("2.1.300")));
+        assert_eq!(read_run(&layout.root).unwrap(), (plan, Client::Claude), "a run runs what run.json says");
+        assert!(matches!(prepare(&task(), Arm::A3, &fixture, &layout, &opts, &Client::Claude), Err(RunError::NotEmpty(_))));
     }
 
     #[test]
@@ -582,15 +671,21 @@ mod tests {
         std::fs::create_dir_all(&fixture).unwrap();
         std::fs::write(fixture.join("a.txt"), "ok").unwrap();
         let layout = Layout { root: dir.path().join("run") };
-        prepare(&task(), Arm::A0, &fixture, &layout, &options(dir.path().join("clawg"))).unwrap();
+        let replay = Client::Replay(dir.path().join("s.jsonl"));
+        prepare(&task(), Arm::A0, &fixture, &layout, &options(dir.path().join("clawg")), &replay).unwrap();
         std::fs::write(layout.root.join(STREAM_FILE), STREAM).unwrap();
 
-        let r = score_dir(&layout.root, "replay").unwrap();
+        let r = score_dir(&layout.root).unwrap();
 
         assert!(r.score.success);
-        assert_eq!(r.arm, "a0");
+        assert_eq!((r.arm.as_str(), r.client.as_str()), ("a0", "replay"));
         let written: Value = serde_json::from_str(&std::fs::read_to_string(layout.root.join(RESULT_FILE)).unwrap()).unwrap();
         assert_eq!(written["score"]["success"], true);
-        assert!(matches!(score_dir(dir.path(), "replay"), Err(RunError::Io { .. })));
+        assert!(matches!(score_dir(dir.path()), Err(RunError::Io { .. })));
+
+        let claude = Layout { root: dir.path().join("claude") };
+        prepare(&task(), Arm::A0, &fixture, &claude, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
+        std::fs::write(claude.root.join(STREAM_FILE), STREAM).unwrap();
+        assert_eq!(score_dir(&claude.root).unwrap().client, "claude");
     }
 }

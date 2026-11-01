@@ -36,6 +36,9 @@ pub const ARMS: [Arm; 6] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A4, Ar
 /// The tools arm B takes away.
 const READ_TOOLS: [&str; 3] = ["search_memory", "read_memory", "list_memories"];
 
+/// The client a real run starts, found on the `PATH`.
+pub const CLIENT: &str = "claude";
+
 /// The variable a `testing` build of clawg reads its home from instead of the
 /// system's: clawg-core's `paths::TEST_HOME_VAR`, which only such a build has.
 pub const TEST_HOME_VAR: &str = "CLAWG_TEST_HOME";
@@ -104,6 +107,8 @@ pub struct Options {
     pub model: String,
     pub effort: Option<String>,
     pub max_budget_usd: Option<f64>,
+    /// The Claude Code version the run is pinned to; recorded, not planned.
+    pub claude_version: Option<String>,
     pub now_ms: i64,
 }
 
@@ -253,7 +258,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         files,
         daemon,
         before,
-        client: Step { program: "claude".into(), args },
+        client: Step { program: CLIENT.into(), args },
         env,
         after,
     })
@@ -285,6 +290,7 @@ mod tests {
             model: "some-model".into(),
             effort: Some("medium".into()),
             max_budget_usd: Some(1.5),
+            claude_version: Some("2.1.300".into()),
             now_ms: 1_800_000_000_000,
         }
     }
@@ -355,7 +361,8 @@ mod tests {
         assert!(has_arg_pair(&plan, "--model", "some-model"));
         assert!(has_arg_pair(&plan, "--effort", "medium"));
         assert!(has_arg_pair(&plan, "--max-budget-usd", "1.5"));
-        assert_eq!(plan.client.program, "claude");
+        assert_eq!(plan.client.program, CLIENT);
+        assert_eq!(CLIENT, "claude");
     }
 
     #[test]

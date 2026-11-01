@@ -12,12 +12,13 @@ use std::path::{Path, PathBuf};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::Lang;
 
-use crate::arm::{Arm, Layout, Options, Step};
+use crate::arm::{Arm, Layout, Options};
+use crate::run::Client;
 
 const HELP_TEXT: &str = "\
 agent-eval tasks [--data DIR]
 agent-eval prepare RUN_OPTIONS
-agent-eval run RUN_OPTIONS --replay STREAM
+agent-eval run RUN_OPTIONS (--replay STREAM | --max-budget-usd N --claude-version V)
 agent-eval score --run DIR
 agent-eval replay-client STREAM
 
@@ -33,22 +34,27 @@ agent-eval replay-client STREAM
                  with clawg import and ends with clawg stop, which also runs
                  when the seed or the client failed (their output in
                  clawg.log); a seed that does not load starts no client.
-                 The client is the replay client, started in the working
-                 directory instead of a real one: it prints STREAM, a
-                 recorded stream-json, and makes the file changes its Write
-                 and Edit calls record. The stream is captured in
-                 stream.jsonl and scored into result.json. No Claude model
-                 is called. On Windows clawg finds its home through the
-                 system, so an arm with clawg needs a `testing` build of it,
-                 which reads CLAWG_TEST_HOME; any other is refused.
+                 The client runs in the working directory, its stream
+                 captured in stream.jsonl and scored into result.json. With
+                 --replay it is the replay client instead of a real one: it
+                 prints STREAM, a recorded stream-json, and makes the file
+                 changes its Write and Edit calls record, and no Claude
+                 model is called. Without it the client is claude, a paid
+                 session: the run needs --max-budget-usd, its hard cap, and
+                 --claude-version, the Claude Code version it is pinned to,
+                 and refuses before laying anything out a claude whose
+                 --version reports another one. On Windows clawg finds its
+                 home through the system, so an arm with clawg needs a
+                 `testing` build of it, which reads CLAWG_TEST_HOME; any
+                 other is refused.
   score          scores a run directory again from its stream.jsonl.
   replay-client  the client a dry run starts: prints STREAM after making
                  its file changes in the current directory.
 
 RUN_OPTIONS:
   --task ID --arm a0|a2|a3|a3-eager|a4|b --out DIR --clawg PATH --model M
-  [--effort E] [--max-budget-usd N] [--profile dev|prod] [--lang en|es]
-  [--data DIR]
+  [--effort E] [--max-budget-usd N] [--claude-version V] [--profile dev|prod]
+  [--lang en|es] [--data DIR]
 
   --clawg is the absolute path of the clawg binary the arms with clawg run;
   --profile (dev by default) picks its data directory under the run's home.
@@ -70,6 +76,7 @@ struct RunArgs {
     model: String,
     effort: Option<String>,
     max_budget_usd: Option<f64>,
+    claude_version: Option<String>,
     profile: Profile,
     lang: Option<Lang>,
 }
@@ -78,7 +85,8 @@ struct RunArgs {
 enum Command {
     Tasks { data: PathBuf },
     Prepare(RunArgs),
-    Run { args: RunArgs, replay: PathBuf },
+    /// Without a replay, a run of the real client.
+    Run { args: RunArgs, replay: Option<PathBuf> },
     Score { dir: PathBuf },
     ReplayClient { stream: PathBuf },
 }
@@ -110,7 +118,7 @@ fn required(flags: &mut Vec<(String, String)>, name: &str) -> Result<String, Str
     take(flags, name).ok_or_else(|| format!("--{name} is required"))
 }
 
-const RUN_FLAGS: [&str; 10] = ["task", "arm", "out", "clawg", "model", "effort", "max-budget-usd", "profile", "lang", "data"];
+const RUN_FLAGS: [&str; 11] = ["task", "arm", "out", "clawg", "model", "effort", "max-budget-usd", "claude-version", "profile", "lang", "data"];
 
 fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
     let arm_name = required(f, "arm")?;
@@ -141,6 +149,7 @@ fn run_args(f: &mut Vec<(String, String)>) -> Result<RunArgs, String> {
         model: required(f, "model")?,
         effort: take(f, "effort"),
         max_budget_usd,
+        claude_version: take(f, "claude-version"),
         profile,
         lang,
     })
@@ -162,8 +171,17 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
         "run" => {
             let allowed: Vec<&str> = RUN_FLAGS.iter().copied().chain(["replay"]).collect();
             let mut f = flags(rest, &allowed)?;
-            let replay = PathBuf::from(required(&mut f, "replay")?);
-            Command::Run { args: run_args(&mut f)?, replay }
+            let replay = take(&mut f, "replay").map(PathBuf::from);
+            let args = run_args(&mut f)?;
+            if replay.is_none() {
+                if args.max_budget_usd.is_none() {
+                    return Err("a run without --replay starts claude, a paid session: cap it with --max-budget-usd".into());
+                }
+                if args.claude_version.is_none() {
+                    return Err("a run without --replay starts claude: pin its version with --claude-version".into());
+                }
+            }
+            Command::Run { args, replay }
         }
         "score" => Command::Score { dir: PathBuf::from(required(&mut flags(rest, &["run"])?, "run")?) },
         "replay-client" => {
@@ -219,7 +237,7 @@ fn read_files(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> std:
     Ok(())
 }
 
-fn prepare(args: &RunArgs) -> Result<Layout, String> {
+fn prepare(args: &RunArgs, client: &Client) -> Result<Layout, String> {
     let tasks = task::load(&args.data).map_err(|e| e.to_string())?;
     let t = task::find(tasks, &args.task).map_err(|e| e.to_string())?;
     let layout = Layout { root: std::path::absolute(&args.out).map_err(|e| format!("{}: {e}", args.out.display()))? };
@@ -230,41 +248,49 @@ fn prepare(args: &RunArgs) -> Result<Layout, String> {
         model: args.model.clone(),
         effort: args.effort.clone(),
         max_budget_usd: args.max_budget_usd,
+        claude_version: args.claude_version.clone(),
         now_ms: now_ms(),
     };
-    run::prepare(&t, args.arm, &task::fixture_dir(&args.data, &t), &layout, &options).map_err(|e| e.to_string())?;
+    run::prepare(&t, args.arm, &task::fixture_dir(&args.data, &t), &layout, &options, client).map_err(|e| e.to_string())?;
     Ok(layout)
+}
+
+/// The absolute path of a stream to replay, which must be a file.
+fn replay_file(stream: &Path) -> Result<PathBuf, String> {
+    let stream = std::path::absolute(stream).map_err(|e| format!("{}: {e}", stream.display()))?;
+    match std::fs::metadata(&stream) {
+        Ok(m) if m.is_file() => Ok(stream),
+        Ok(_) => Err(format!("--replay {} is not a file", stream.display())),
+        Err(e) => Err(format!("--replay {}: {e}", stream.display())),
+    }
 }
 
 fn execute(command: Command) -> Result<(), String> {
     match command {
         Command::Tasks { data } => list_tasks(&data),
         Command::Prepare(args) => {
-            let layout = prepare(&args)?;
+            let layout = prepare(&args, &Client::Claude)?;
             println!("prepared {}", layout.root.display());
             Ok(())
         }
         Command::Run { args, replay } => {
-            let replay = std::path::absolute(&replay).map_err(|e| format!("{}: {e}", replay.display()))?;
-            match std::fs::metadata(&replay) {
-                Ok(m) if m.is_file() => {}
-                Ok(_) => return Err(format!("--replay {} is not a file", replay.display())),
-                Err(e) => return Err(format!("--replay {}: {e}", replay.display())),
-            }
-            run::check_isolation(cfg!(windows), args.arm, &args.clawg).map_err(|e| e.to_string())?;
-            let layout = prepare(&args)?;
-            let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
-            let client = Step {
-                program: exe.to_string_lossy().into_owned(),
-                args: vec!["replay-client".into(), replay.to_string_lossy().into_owned()],
+            let client = match replay {
+                Some(stream) => Client::Replay(replay_file(&stream)?),
+                None => Client::Claude,
             };
-            run::execute(&layout.root, &client).map_err(|e| e.to_string())?;
-            let result = run::score_dir(&layout.root, "replay").map_err(|e| e.to_string())?;
+            run::check_isolation(cfg!(windows), args.arm, &args.clawg).map_err(|e| e.to_string())?;
+            if let (Client::Claude, Some(version)) = (&client, &args.claude_version) {
+                run::check_client_version(arm::CLIENT, version).map_err(|e| e.to_string())?;
+            }
+            let layout = prepare(&args, &client)?;
+            let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
+            run::execute(&layout.root, &exe).map_err(|e| e.to_string())?;
+            let result = run::score_dir(&layout.root).map_err(|e| e.to_string())?;
             println!("{}", run::summary(&result));
             Ok(())
         }
         Command::Score { dir } => {
-            let result = run::score_dir(&dir, "replay").map_err(|e| e.to_string())?;
+            let result = run::score_dir(&dir).map_err(|e| e.to_string())?;
             println!("{}", run::summary(&result));
             Ok(())
         }
@@ -313,17 +339,32 @@ mod tests {
     fn run_takes_its_options_with_their_defaults() {
         let parsed = parse_args(args(&["run", "--task", "t", "--arm", "a3-eager", "--out", "r", "--clawg", clawg(), "--model", "m", "--replay", "s.jsonl"]));
         let Ok(Some(Command::Run { args: run, replay })) = parsed else { panic!("{parsed:?}") };
-        assert_eq!(replay, PathBuf::from("s.jsonl"));
+        assert_eq!(replay, Some(PathBuf::from("s.jsonl")));
         assert_eq!((run.arm, run.profile, run.lang, run.effort, run.max_budget_usd), (Arm::A3Eager, Profile::Dev, None, None, None));
-        assert_eq!(run.data, default_data());
+        assert_eq!((run.data, run.claude_version), (default_data(), None));
 
         let parsed = parse_args(args(&[
             "prepare", "--task", "t", "--arm", "b", "--out", "r", "--clawg", clawg(), "--model", "m", "--profile", "prod", "--lang", "es",
-            "--effort", "high", "--max-budget-usd", "1.5", "--data", "d",
+            "--effort", "high", "--max-budget-usd", "1.5", "--data", "d", "--claude-version", "2.1.300",
         ]));
         let Ok(Some(Command::Prepare(prepared))) = parsed else { panic!("{parsed:?}") };
         assert_eq!((prepared.profile, prepared.lang, prepared.max_budget_usd), (Profile::Prod, Some(Lang::Es), Some(1.5)));
         assert_eq!((prepared.effort.as_deref(), prepared.data), (Some("high"), PathBuf::from("d")));
+        assert_eq!(prepared.claude_version.as_deref(), Some("2.1.300"));
+    }
+
+    #[test]
+    fn a_run_without_a_replay_starts_claude_only_with_a_budget_and_a_pinned_version() {
+        let base = ["run", "--task", "t", "--arm", "a3", "--out", "r", "--clawg", clawg(), "--model", "m"];
+        let with = |extra: &[&str]| parse_args(args(&[&base[..], extra].concat()));
+        assert!(with(&[]).unwrap_err().contains("--max-budget-usd"));
+        assert!(with(&["--claude-version", "2.1.300"]).unwrap_err().contains("--max-budget-usd"));
+        assert!(with(&["--max-budget-usd", "1.5"]).unwrap_err().contains("--claude-version"));
+
+        let parsed = with(&["--max-budget-usd", "1.5", "--claude-version", "2.1.300", "--lang", "es"]);
+        let Ok(Some(Command::Run { args: run, replay: None })) = parsed else { panic!("{parsed:?}") };
+        assert_eq!((run.max_budget_usd, run.claude_version.as_deref(), run.lang), (Some(1.5), Some("2.1.300"), Some(Lang::Es)));
+        assert_eq!(run.model, "m");
     }
 
     #[test]
@@ -348,11 +389,12 @@ mod tests {
             model: "m".into(),
             effort: None,
             max_budget_usd: None,
+            claude_version: None,
             profile: Profile::Dev,
             lang: None,
         };
         for replay in [dir.path().join("missing.jsonl"), dir.path().to_path_buf()] {
-            let err = execute(Command::Run { args: args.clone(), replay: replay.clone() }).unwrap_err();
+            let err = execute(Command::Run { args: args.clone(), replay: Some(replay.clone()) }).unwrap_err();
             assert!(err.contains(&format!("--replay {}", replay.display())), "{err}");
             assert!(!out.exists(), "the run was laid out for {}", replay.display());
         }
@@ -371,7 +413,6 @@ mod tests {
         assert!(with(&["--arm", "a0", "--arm", "a3", "--clawg", clawg()]).contains("given twice"));
         assert!(with(&["--arm", "a0", "--clawg"]).contains("needs a value"));
         assert!(with(&["--clawg", clawg()]).contains("--arm is required"));
-        assert!(parse_args(args(&["run", "--task", "t"])).unwrap_err().contains("--replay is required"));
         assert!(parse_args(args(&[])).unwrap_err().contains("name a command"));
         assert!(parse_args(args(&["launch"])).unwrap_err().contains("unknown command"));
         assert!(parse_args(args(&["replay-client"])).unwrap_err().contains("one stream file"));
