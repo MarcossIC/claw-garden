@@ -8,7 +8,7 @@ artifacts:
   spec: done  # AE1 a AE6
   design: skipped  # las decisiones están en la propuesta
   tasks: done
-  apply: done  # grupos 1 a 4
+  apply: done  # grupos 1 a 4 y 6 a 8
   verify: pending  # la suite y clippy pasan; falta la primera sesión real
   archive: pending
-updated: 2026-10-31
+updated: 2026-11-01
