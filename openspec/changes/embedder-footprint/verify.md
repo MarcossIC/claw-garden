@@ -1,6 +1,6 @@
 # embedder-footprint — Verificación
 
-Registro de la puerta (tarea 2). Están medidos los pasos 2.1 y 2.2, en Windows y en Linux, 2.3 en Windows y 2.4, las arenas de malloc, en Linux. Falta 2.5.
+Registro de la puerta (tarea 2). Están medidos los pasos 2.1 y 2.2, en Windows y en Linux, 2.3 en Windows, y 2.4, las arenas de malloc, y 2.5 en Linux. Falta 2.5 en Windows.
 
 ## La máquina y el build
 
@@ -235,6 +235,7 @@ El mismo build y el mismo `rag-eval --real --docs --no-cache`, sobre una muestra
 La huella es la de 2.1 y 2.2 en Linux. Cada paso tiene su build, con un parche de medición que no se commitea:
 
 - **El de 2.4** quita de `crates/clawg-cli/src/main.rs` la llamada a `keep_one_malloc_arena` y su `use`. Nada más cambia, así que las arenas las fija sólo `MALLOC_ARENA_MAX`. Las dos variantes usan el mismo binario.
+- **El de 2.5** conserva la llamada, como en producción, y suma un reloj (`Instant`) en el worker: alrededor de cada una de las tres llamadas de `split_save`, alrededor de `tok.encode` dentro de `split_by_tokens` y alrededor de las etapas de `ingest_pieces` (`split`, `gate`, `embed`, `store`). Cada lectura sale como una línea de log.
 
 Los builds se compilaron antes de la primera corrida medida. Mientras se midió no se compiló ni se corrió ningún test, y las corridas fueron de a una.
 
@@ -284,12 +285,49 @@ Para leer los números:
 - **El ruido entre corridas es mayor que la diferencia entre variantes.** Con el mismo binario y la misma muestra, el refresco fue de 323 a 375 s, un 16 % de punta a punta. La ronda 2 es la única donde 2 arenas ganan claro; en las otras dos pierden por poco.
 - Durante el refresco el daemon tiene como máximo 15 hilos en todas las corridas y usa en promedio de 3,1 a 3,3 de los 4 núcleos. Antes del refresco, `RssAnon` ronda los 800 MiB, y 837,8 MiB en la última corrida.
 
+### 2.5 `split_save`
+
+#### Cómo se midió
+
+- Con el build de 2.5, un daemon solo sobre una store vacía, en un home temporal como los de 2.4 y sin `MALLOC_ARENA_MAX`: la llamada a `keep_one_malloc_arena` deja una arena, como en producción. El modelo listo y 30 s de reposo antes del primer guardado. Corrió después de las seis corridas de 2.4.
+- **Los textos** son ventanas seguidas de la prosa de los Markdown del árbol de `6cb64fc`, en orden de ruta, sin texto repetido entre guardados. Los de 64 KiB tienen 65.536 bytes y de 17.502 a 21.806 tokens. Los de 5.000 tokens tienen esa cantidad justa, contada con el tokenizer del modelo, en 15.078 a 16.712 bytes. En los 12 guardados, el recuento que registra el daemon coincide con el del guion.
+- Cada `POST /v1/memories` va solo: se espera a que su línea de reloj salga en el log y a que `pending` vuelva a 0, y 5 s más. Primero va un guardado de cada tamaño que no cuenta, y después 5 de cada uno, alternados. Los 12 terminaron sin fallas.
+- **Cada codificación** se mide con su llamada entera dentro de `split_save`: la codificación y el plan de cortes. El `encode` solo es del 94 al 98 % de cada llamada; el plan es de 0,1 a 0,6 ms. **La tanda** es la etapa `embed`: todas las piezas, de a 16 por pedido al embedder.
+
+#### Resultados
+
+En las filas de mediana, cada columna es su propia mediana.
+
+| Guardado | Tokens | Piezas | Entera (480) | Cabecera (32) | Piezas (96) | Tanda | Las dos de más sobre las tres y la tanda |
+|---|---|---|---|---|---|---|---|
+| 64 KiB, 1 | 18.655 | 264 | 34,1 ms | 21,7 ms | 21,2 ms | 5,49 s | 0,77 % |
+| 64 KiB, 2 | 20.603 | 293 | 39,4 ms | 24,8 ms | 22,7 ms | 6,16 s | 0,76 % |
+| 64 KiB, 3 | 20.931 | 300 | 37,0 ms | 30,2 ms | 43,0 ms | 6,76 s | 1,07 % |
+| 64 KiB, 4 | 21.806 | 330 | 62,8 ms | 58,0 ms | 56,9 ms | 7,88 s | 1,43 % |
+| 64 KiB, 5 | 20.604 | 299 | 46,7 ms | 45,0 ms | 41,4 ms | 7,02 s | 1,21 % |
+| **64 KiB, mediana** | 20.604 | 299 | 39,4 ms | 30,2 ms | 41,4 ms | 6,76 s | **1,07 %** |
+| 5.000 tokens, 1 | 5.000 | 72 | 18,4 ms | 8,6 ms | 7,2 ms | 1,57 s | 0,98 % |
+| 5.000 tokens, 2 | 5.000 | 72 | 13,4 ms | 7,2 ms | 8,5 ms | 1,63 s | 0,95 % |
+| 5.000 tokens, 3 | 5.000 | 72 | 15,5 ms | 13,2 ms | 12,5 ms | 1,49 s | 1,68 % |
+| 5.000 tokens, 4 | 5.000 | 71 | 12,6 ms | 11,0 ms | 8,6 ms | 1,48 s | 1,29 % |
+| 5.000 tokens, 5 | 5.000 | 71 | 18,1 ms | 11,2 ms | 9,3 ms | 1,64 s | 1,22 % |
+| **5.000 tokens, mediana** | 5.000 | 72 | 15,5 ms | 11,0 ms | 8,6 ms | 1,57 s | **1,22 %** |
+
+**E no abre en Linux.** Las dos codificaciones de más pesan 1,07 % de un guardado de 64 KiB, mediana de 5, y 1,43 % en el peor, contra un umbral de 5 %. Contando sólo el `encode`, 1,02 %. Queda por debajo del 2 % que se estimó antes de medir.
+
+Para leer los números:
+
+- **La cabecera codifica el texto entero** para quedarse con sus primeros 32 tokens, así que cuesta como las otras dos: de 21,7 a 58,0 ms en un guardado de 64 KiB.
+- **El worker queda tomado durante la etapa `split`**, que enmascara y llama a `split_save`: de 86 a 191 ms en los guardados de 64 KiB, 110 ms de mediana, y de 31 a 44 ms en los de 5.000 tokens. Esa es la otra mitad de E, pasarlo a `spawn_blocking`, que el umbral no cubre.
+- **La etapa `store` crece de un guardado de 64 KiB al siguiente:** 0,9 s en el de calentamiento y de 3,3 a 7,8 s en los cinco que cuentan, mientras la tanda va de 5,5 a 7,9 s. No se atribuye. No entra en el umbral; si entrara, la parte de las codificaciones sería todavía menor.
+- 2.5 no se midió en Windows.
+
 ## Lo que esto corrige de la exploración
 
 - **`window_encodings` ya no es el único llamador de `encode_batch`.** También lo llama `TokenSplitter::count_all` (`crates/clawg-core/src/memory/chunker/token_splitter.rs:57`), que está hecho para repartir la tanda entre los núcleos. `set_parallelism(false)` cambiaría los dos.
 
 ## Pendiente
 
-- 2.5: `split_save`.
+- 2.5 en Windows: sin medir. En Linux, E queda en 1,07 %, contra un umbral de 5 %.
 - 2.6 no se corre: no entra ningún cambio de hilos, de espera activa ni de tokenizer, así que no hay combinación que comprobar.
 - 2.7: cerrar el registro.
