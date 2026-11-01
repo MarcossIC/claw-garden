@@ -274,7 +274,7 @@ Lo que no se escribió conserva su huella anterior, o no tiene ninguna, así que
   - Los tamaños tienen tope: un pasaje tiene a lo sumo 480 tokens (`crates/clawg-core/src/memory/chunker/mod.rs:26`); un pedazo de código, 1200 caracteres (`project_docs/code.rs:13`) y un breadcrumb de hasta 256 B (`chunk.rs:12`); un doc, 256 KiB (`corpus.rs:14`).
   - La cuenta de D9 mide H en este corpus en lugar de suponer bytes por token.
 - **La cota en pasajes:** hoy es el doc más grande; con A2, el mayor entre el tope y el doc más grande.
-- **Por qué 16 MiB:** el 5 % de la menor memoria privada estable medida con el modelo cargado es 37 MB (739 MB, [exploración de embedder-footprint](../embedder-footprint/exploration.md), línea 25). La mitad deja lugar a lo que el asignador no devuelve.
+- **Por qué 16 MiB:** el 5 % de la menor memoria privada estable medida con el modelo cargado es 37 MB (739 MB, [exploración de embedder-footprint](../../embedder-footprint/exploration.md), línea 25). La mitad deja lugar a lo que el asignador no devuelve.
 
 **El pico (+5 %), con autorización.**
 1. Se usa el perfil dev, sin otro daemon dev en marcha, porque el store tiene un solo dueño.

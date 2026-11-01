@@ -6,7 +6,7 @@ Cada puerta lee los campos de las corridas D y R de docs-index-cost, con los umb
 
 - **Corridas:** sobre `0f09b2b`, una detrás de otra, con la misma `index.machine`: `windows`, `x86_64`, avx2, avx512f y fma, 16 hilos. D es debug con la memoria vacía y R es release con `--no-cache`.
 - **Archivos (fuera de git):** `docs/eval/results/2026-10-31-real-docs-cost-d.json` y `docs/eval/results/2026-10-31-real-docs-cost-r.json`.
-- **Campos:** los copia la [verificación de docs-index-cost](../archive/2026-10-31-docs-index-cost/verify.md), en «Lo que dio cada corrida». Los cocientes de abajo se recalcularon con esos campos y coinciden con los de su tabla «Los cocientes que leen las puertas de `docs-index-speed`».
+- **Campos:** los copia la [verificación de docs-index-cost](../2026-10-31-docs-index-cost/verify.md), en «Lo que dio cada corrida». Los cocientes de abajo se recalcularon con esos campos y coinciden con los de su tabla «Los cocientes que leen las puertas de `docs-index-speed`».
 
 | Puerta | Campo | Valor | Umbral | |
 |---|---|---|---|---|
@@ -650,3 +650,7 @@ Cuatro daemons `clawg serve --profile dev` de release, uno por corrida, alternan
 | IS17: el pico sube ≤ 5 % | baja un 9,4 % (1312,6 frente a 1448,5 MiB, en las dos corridas de cada rama) | ✅ |
 
 **A2 se queda.** IS16 e IS17 quedan cumplidos: IS16 por la 7b e IS17 por la 7d. No se revierte ningún commit. Como no se movió ningún bit, `docs/eval/cache/` sigue siendo exacta.
+
+## Archivo (2026-11-01)
+
+El cambio se archiva con A1 y A2 adoptados, y sale en 0.73.0. El comportamiento (IS1, IS2 e IS7 a IS14) pasó a [`specs/project-docs`](../../../specs/project-docs/spec.md), «Refresco incremental» y «La cola del refresco»; IS3 e IS15, a [`specs/eval`](../../../specs/eval/spec.md), IC6, con lo medido en «Índice de docs»; IS4, a [`specs/storage`](../../../specs/storage/spec.md), «Los mismos vectores que fastembed». IS5, IS6, IS16 e IS17 son requisitos de medición y quedan sólo en este archivo, con las puertas y sus resultados. El test del caso de `e5_golden` de IS4 es `a_batch_longest_first_stays_within_the_tolerance_of_the_batch_in_order`, no el que nombraba la spec. El paso E sigue en espera.

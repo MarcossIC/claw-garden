@@ -86,8 +86,8 @@ Una a la vez, sin otra compilación ni prueba en marcha. Usan el modelo del perf
 
 ## Parte 3 — después de medir
 
-- [ ] A2 tiene su propia actualización de spec, diseño y tareas cuando A1 esté medido. No se hace aquí.
-- [ ] Archivar y subir la versión (minor) según `openspec/config.yaml` y `.claude/CLAUDE.md` sólo cuando el cambio se cierre, no ahora. (Ver Parte 8.)
+- [x] A2 tiene su propia actualización de spec, diseño y tareas cuando A1 esté medido. No se hace aquí.
+- [x] Archivar y subir la versión (minor) según `openspec/config.yaml` y `.claude/CLAUDE.md` sólo cuando el cambio se cierre, no ahora. (Ver Parte 8.)
 
 # Paso A2
 
@@ -164,4 +164,4 @@ Usa `CLAWG_E5_MODEL_DIR` del perfil dev (`<data dir dev>/models/multilingual-e5-
 
 ## Parte 8 — cierre
 
-- [ ] Archivar el cambio (A1 y, si se adoptó, A2) y subir la versión (minor) según `openspec/config.yaml` y `.claude/CLAUDE.md`, con `cargo update --workspace` y `chore: bump version to X.Y.Z`; sólo cuando el cambio se cierre. Si A2 cerró en 5d, se archiva con A1 sin código de A2.
+- [x] Archivar el cambio (A1 y, si se adoptó, A2) y subir la versión (minor) según `openspec/config.yaml` y `.claude/CLAUDE.md`, con `cargo update --workspace` y `chore: bump version to X.Y.Z`; sólo cuando el cambio se cierre. Si A2 cerró en 5d, se archiva con A1 sin código de A2.

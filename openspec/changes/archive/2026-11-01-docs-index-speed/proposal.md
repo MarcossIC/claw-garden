@@ -6,11 +6,11 @@
 
 ## Problema
 
-`rag-eval --real --docs` tardó 2407,1 s en indexar 727 docs en 17 584 pasajes, en Windows y con un build debug ([verify de docs-search-quality](../archive/2026-10-31-docs-search-quality/verify.md), líneas 3 y 11). Verificado contra el código de hoy:
+`rag-eval --real --docs` tardó 2407,1 s en indexar 727 docs en 17 584 pasajes, en Windows y con un build debug ([verify de docs-search-quality](../2026-10-31-docs-search-quality/verify.md), líneas 3 y 11). Verificado contra el código de hoy:
 
 - **El refresco embebe doc por doc y sin ordenar.** Un bucle secuencial lee, enmascara, parte, pide los vectores guardados, embebe y escribe cada doc (`crates/clawg-core/src/memory/project_docs/mod.rs:447-482`). Manda todos los pasajes de un doc en una llamada (`:566-568`), que el embedder corta en tandas de `EMBED_BATCH` = 16 consecutivos (`crates/clawg-core/src/memory/embedder.rs:184`, `:436`) y rellena hasta el más largo (`pad_right`, `:259-261`). La atención crece con textos × tokens² (`:179-181`).
-- **Hay un antecedente medido, de otro corpus.** La importación ordena de más tokens a menos (`longest_first`, `crates/clawg-core/src/memory/portability/import.rs:2537`). Eso bajó su fase `embed` un 30,4 %, y las 5000 filas comparadas dieron los mismos bits ([verify de embed-throughput](../archive/2026-10-27-embed-throughput/verify.md), línea 30; [propuesta](../archive/2026-10-27-embed-throughput/proposal.md), línea 16). Ese cambio dejó el refresco de docs como «otro cambio, con su propia medición» ([design](../archive/2026-10-27-embed-throughput/design.md), línea 54). Midió filas de memoria, no pasajes de docs.
-- **Lo que falta saber lo mide #94**: el tiempo por fase, los tokens reales contra los rellenados (también en los dos órdenes posibles, sin correrlos), debug contra release y el peso de cada área ([propuesta de #94](../archive/2026-10-31-docs-index-cost/proposal.md), «El bloque `index`» y «Qué lee 95»). Esta propuesta fija ahora, antes de ver esos números, qué campo decide cada mejora y con qué umbral.
+- **Hay un antecedente medido, de otro corpus.** La importación ordena de más tokens a menos (`longest_first`, `crates/clawg-core/src/memory/portability/import.rs:2537`). Eso bajó su fase `embed` un 30,4 %, y las 5000 filas comparadas dieron los mismos bits ([verify de embed-throughput](../2026-10-27-embed-throughput/verify.md), línea 30; [propuesta](../2026-10-27-embed-throughput/proposal.md), línea 16). Ese cambio dejó el refresco de docs como «otro cambio, con su propia medición» ([design](../2026-10-27-embed-throughput/design.md), línea 54). Midió filas de memoria, no pasajes de docs.
+- **Lo que falta saber lo mide #94**: el tiempo por fase, los tokens reales contra los rellenados (también en los dos órdenes posibles, sin correrlos), debug contra release y el peso de cada área ([propuesta de #94](../2026-10-31-docs-index-cost/proposal.md), «El bloque `index`» y «Qué lee 95»). Esta propuesta fija ahora, antes de ver esos números, qué campo decide cada mejora y con qué umbral.
 
 ## Objetivo
 
@@ -23,7 +23,7 @@
    - Sacarlo sólo en la evaluación con `left_out`: mediría otro corpus, sin los duplicados que hacen difícil el ranking.
 
    Este cambio lee `index.by_area.archive` sólo para explicar los números.
-2. **Qué es de este cambio.** Ordenar los pasajes por largo antes de armar las tandas se hace acá y no en 62 embedder-footprint. 62 lo lista como enfoque ([exploración](../embedder-footprint/exploration.md), línea 89), pero deja fuera el tamaño de tanda (línea 138). Además, el refresco de docs es el único camino que arma tandas con largos mezclados. Los hilos de ONNX Runtime, la espera activa y el grupo de `rayon` quedan en 62; el tamaño del tokenizer, en 91.
+2. **Qué es de este cambio.** Ordenar los pasajes por largo antes de armar las tandas se hace acá y no en 62 embedder-footprint. 62 lo lista como enfoque ([exploración](../../embedder-footprint/exploration.md), línea 89), pero deja fuera el tamaño de tanda (línea 138). Además, el refresco de docs es el único camino que arma tandas con largos mezclados. Los hilos de ONNX Runtime, la espera activa y el grupo de `rayon` quedan en 62; el tamaño del tokenizer, en 91.
 3. **La puerta 0 lee `index.phases.embed` de R, no `FIRST_INDEX_WAIT`.** La exploración cerraba A si la primera indexación entraba en `FIRST_INDEX_WAIT` (20 s, `crates/clawg-cli/src/daemon/api.rs:3034`). Con 17 584 pasajes en una CPU, eso no decide nada. Al ritmo que midió la importación (65,9 filas/s con 129,3 tokens por fila; verify de embed-throughput, línea 30, y propuesta, línea 11), en 20 s se embeben unos mil pasajes. La puerta pasa a ser el tiempo de embeber en release y la parte del total que ocupa (paso 0).
 4. **Bits.**
    - Toda medición que cambia el orden de las tandas corre con `--no-cache`: con la memoria de #94 activa, se mediría la memoria (#94, «Qué lee 95»). C y W no cambian ningún vector y pueden usarla.
@@ -68,7 +68,7 @@ Van de menor a mayor riesgo. El paso 0 abre A1, A2 y E. Si `embed` es menos de l
 - **Si no se queda:** sólo se documenta en `specs/eval` que `rag-eval --docs` se corre en release, como `load-eval`.
 
 **W.**
-- **Por qué ese umbral:** `replace_doc` prepara tres sentencias por pasaje (`mod.rs:645-660`), y `delete_doc` dos por pasaje (`:703-715`). En la importación, preparar dos sentencias por fila costaba ~16 % de un banco ([verify de import-linear](../archive/2026-10-24-import-linear/verify.md), línea 34). Si `write` es menos del 10 % del total, la ganancia queda bajo ~2 %, dentro del ruido.
+- **Por qué ese umbral:** `replace_doc` prepara tres sentencias por pasaje (`mod.rs:645-660`), y `delete_doc` dos por pasaje (`:703-715`). En la importación, preparar dos sentencias por fila costaba ~16 % de un banco ([verify de import-linear](../2026-10-24-import-linear/verify.md), línea 34). Si `write` es menos del 10 % del total, la ganancia queda bajo ~2 %, dentro del ruido.
 - **Costo:** ninguno; lo escrito no cambia.
 - **Se queda si:** `phases.write` baja ≥ 10 %.
 
@@ -105,7 +105,7 @@ Van de menor a mayor riesgo. El paso 0 abre A1, A2 y E. Si `embed` es menos de l
 - **Por qué ese umbral:** menos del 10 % es menos de lo que se le pidió a A1, y E paga en calidad de recuperación y en un reindexado completo.
 - **Costo:**
   - Cada proyecto se reindexa una vez.
-  - Necesita una huella de docs que cubra cómo se parte (`docs_contract`, decisión 6 de [docs-search-quality](../archive/2026-10-31-docs-search-quality/proposal.md)). Sin ella, `plan_refresh` conserva los pasajes viejos (`mod.rs:124`).
+  - Necesita una huella de docs que cubra cómo se parte (`docs_contract`, decisión 6 de [docs-search-quality](../2026-10-31-docs-search-quality/proposal.md)). Sin ella, `plan_refresh` conserva los pasajes viejos (`mod.rs:124`).
 - **Se queda si:** ninguna pregunta sale del top 3, y `--diff` no empeora Hit@3 ni MRR@10 con p < 0,05, mirando docs y código por separado.
 
 ## Descartados

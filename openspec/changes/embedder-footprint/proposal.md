@@ -33,7 +33,7 @@ Transversal: que el daemon, un proceso de fondo, no deje de cargar el modelo por
 ## No-alcance
 
 - Elegir A (espera activa), B (menos hilos), C (tokenizer en serie) o E (una sola codificación en `split_save`) sin su medición.
-- Ordenar las tandas por largo (D): pasó a [docs-index-speed](../docs-index-speed/proposal.md).
+- Ordenar las tandas por largo (D): pasó a [docs-index-speed](../archive/2026-11-01-docs-index-speed/proposal.md).
 - Las preguntas de memoria (a) y (b): pasaron a ram-footprint (90) y ram-footprint-gates (92), archivados.
 - Cambiar el modelo, el contrato de embedding, `EMBED_BATCH` o la política de descarga por inactividad.
 

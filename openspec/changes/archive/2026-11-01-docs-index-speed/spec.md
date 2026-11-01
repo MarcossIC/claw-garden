@@ -1,6 +1,6 @@
 # docs-index-speed — Especificación
 
-Modifica [`specs/project-docs`](../../specs/project-docs/spec.md) («Refresco incremental») con IS1 e IS2, e IC6 de [`specs/eval`](../../specs/eval/spec.md) («`rag-eval --docs`», bloque `index.tokens`) con IS3. IS4 e IS5 son requisitos de verificación, no de producción. Cubre sólo el paso A1 de la [propuesta](proposal.md); A2 se especifica en «Paso A2», al final (IS6 a IS17), y C, W y S están cerrados (ver [`verify.md`](verify.md)) y no piden nada. Todos los tests usan embedders falsos y no dejan nada en el temporal, salvo IS4 e IS5, que necesitan el modelo real y corren sólo con autorización, nunca en la suite normal.
+Modifica [`specs/project-docs`](../../../specs/project-docs/spec.md) («Refresco incremental») con IS1 e IS2, e IC6 de [`specs/eval`](../../../specs/eval/spec.md) («`rag-eval --docs`», bloque `index.tokens`) con IS3. IS4 e IS5 son requisitos de verificación, no de producción. Cubre sólo el paso A1 de la [propuesta](proposal.md); A2 se especifica en «Paso A2», al final (IS6 a IS17), y C, W y S están cerrados (ver [`verify.md`](verify.md)) y no piden nada. Todos los tests usan embedders falsos y no dejan nada en el temporal, salvo IS4 e IS5, que necesitan el modelo real y corren sólo con autorización, nunca en la suite normal.
 
 ## Orden del refresco (`specs/project-docs`)
 
