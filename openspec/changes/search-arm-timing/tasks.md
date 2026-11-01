@@ -4,23 +4,24 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 0. Antes del código
 
-- [ ] `rag-eval --fake` y `rag-eval --fake --agent-view` sobre un golden, con el código de antes. Sin `docs/eval/golden.json` (fuera de git), uno sintético: `golden-mine synth` con la base de `crates/clawg-eval/tests/synth_roundtrip.rs`, `--seed 7 --distractors 40`. Los resultados quedan fuera del repositorio.
+- [x] `rag-eval --fake` y `rag-eval --fake --agent-view` sobre un golden, con el código de antes. Sin `docs/eval/golden.json` (fuera de git), uno sintético: `golden-mine synth` con la base de `crates/clawg-eval/tests/synth_roundtrip.rs`, `--seed 7 --distractors 40`. Los resultados quedan fuera del repositorio.
 
 ## 1. Cada brazo mide su ejecución en el hilo de la conexión (A1)
 
-- [ ] Test primero: `an_arm_measures_its_run_on_the_connection_not_its_wait` (`crates/clawg-core/src/memory/search.rs`), en rojo porque los brazos incluyen la retención.
-- [ ] `KnnOutcome::ran`, tomado dentro de la clausura de `knn_one`. `identifier_matches`, `lexical_candidates` y `score_lexical_candidates` devuelven su duración, por una función que corre su consulta con `call_raw` y la cronometra en el hilo. `record_arm` toma una duración.
+- [x] Test primero: `an_arm_measures_its_run_on_the_connection_not_its_wait` (`crates/clawg-core/src/memory/search.rs`), en rojo porque los brazos incluyen la retención.
+- [x] `KnnOutcome::ran`, tomado dentro de la clausura de `knn_one`. `identifier_matches`, `lexical_candidates` y `score_lexical_candidates` devuelven su duración, por una función que corre su consulta con `call_raw` y la cronometra en el hilo. `record_arm` toma una duración.
+- [x] `search_all_memories_inner_fails_soft_when_memory_fts_is_missing` comprueba además que el canal léxico que falló registra su brazo (pasa antes y después: fija lo que no cambia).
 - Commit: `fix(search): time each arm on the connection's thread, without its wait in the queue`
 
 ## 2. Los brazos esperan su turno uno detrás de otro (A2)
 
-- [ ] Test primero: `a_call_that_arrives_during_a_search_runs_between_its_arms` (`search.rs`), en rojo porque `try_join!` encola los brazos juntos.
-- [ ] Esperas en orden en lugar de `try_join!`, con el mismo orden de brazos; los comentarios que hablaban del `try_join!`.
+- [x] Test primero: `a_call_that_arrives_during_a_search_runs_between_its_arms` (`search.rs`), en rojo porque `try_join!` encola los brazos juntos.
+- [x] Esperas en orden en lugar de `try_join!`, con el mismo orden de brazos; los comentarios que hablaban del `try_join!`.
 - Commit: `fix(search): send the arms to the connection one after another`
 
 ## 3. Docs (A3)
 
-- [ ] `docs/reference/data-profiles.md` y R14 de `openspec/specs/metrics/spec.md`: qué mide un brazo, que `total` sigue de punta a punta, y que hasta 0.73.0 cada brazo incluía la espera en la cola, que `--by version` separa.
+- [x] `docs/reference/data-profiles.md` y R14 de `openspec/specs/metrics/spec.md`: qué mide un brazo, que `total` sigue de punta a punta, y que hasta 0.73.0 cada brazo incluía la espera en la cola, que `--by version` separa.
 - Commit: `docs: say what each search arm measures and since which version`
 
 ## 4. Cierre
