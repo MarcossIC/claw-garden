@@ -1,14 +1,16 @@
 change: knn-prefilter
 objective: "2, 4"
 depends_on: []
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done  # sus premisas del detector y del limit 50 se corrigen en la propuesta
+  proposal: done  # sólo la puerta de medición: formas, corpus y umbrales fijados antes de medir
+  spec: done  # KP1 a KP8, la medición
+  design: skipped  # la puerta no elige arquitectura; B1, B2 o A se deciden después, con sus números
+  tasks: done
+  apply: pending  # el corpus, la medición y las dos corridas ignoradas
+  verify: pending  # verify.md con la lectura de U1 a U3 y K1
   archive: pending
-updated: 2026-10-19
+gates:
+  "0": pending  # U1 a U3 sobre F1 a F4; K1 informa B contra A
+updated: 2026-11-01
