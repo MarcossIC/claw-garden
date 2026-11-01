@@ -182,7 +182,7 @@ Un pasaje ya guardado MUST NOT volver a partirse mientras su archivo no cambie d
 
 ## Refresco incremental
 
-`refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:488`) MUST dejar en el índice del proyecto exactamente los docs del disco, y:
+Un `refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:488`) que termina bien MUST dejar en el índice del proyecto exactamente los docs del disco, salvo los que no pudo releer o anotó en `RefreshReport::failed`, que quedan como estaban. Si el embedder falla o un vector no sirve, los docs afectados MUST quedar como estaban, como dicen los puntos de abajo. Además:
 
 - un doc cuya huella coincide con la guardada MUST NOT re-leerse en pasajes ni re-embeberse;
 - un doc nuevo o cambiado (otro sha256, u otro modelo) MUST reemplazar todos sus pasajes, vectores y entradas léxicas en **una** transacción por doc (`replace_doc`, `mod.rs:935`), así una búsqueda nunca ve medio doc. El embedding de los pasajes sin vector reutilizable (RM5) se hace antes de pedir la conexión, para no bloquear los saves mientras tanto, y en una llamada que el doc comparte con otros ([«La cola del refresco»](#la-cola-del-refresco));
@@ -276,7 +276,7 @@ Un refresco no embebe doc por doc. Lee, enmascara y parte cada doc, busca sus ve
 #### Escenario: docs chicos comparten la llamada
 - GIVEN docs de pocos pasajes cuya suma cabe en el límite de la cola
 - WHEN se refresca
-- THEN el embedder recibe una sola llamada con los textos de todos, del más largo al más corto, y cada blob es el de su texto
+- THEN el embedder recibe una sola llamada con los textos de todos, y cada blob es el de su texto; si son más de `EMBED_BATCH` textos llegan del más largo al más corto, y si son `EMBED_BATCH` o menos, en el orden del plan
 
 #### Escenario: el límite crece
 - GIVEN una cola con tope 64 y docs que llenan cada límite
