@@ -11,7 +11,7 @@ KP1 a KP8 describen la medición de la [propuesta](proposal.md). Viven en un mó
 
 ## KP1. Un corpus determinista con la forma pedida
 
-El generador MUST ser puro: dada una forma y una semilla, MUST devolver las mismas filas, con sus vectores bit a bit, y las mismas consultas y sondas. MUST armar cada vector como la suma normalizada de las componentes global, tema, afirmación y ruido con los pesos de la propuesta (0,75, 0,13, 0,07 y 0,05). MUST dar exactamente las filas de la forma: 15 cadenas de cada largo (5, 10, 20 y 40 versiones `superseded` más la vigente) del lector, 15 afirmaciones repetidas por cada agente en cada proyecto, un 20 % de las filas sin proyecto, una de cada 20 del resto `user_preference` y otra de cada 20 borrada y sin vector.
+El generador MUST ser puro: dada una forma y una semilla, MUST devolver las mismas filas, con sus vectores bit a bit, y las mismas consultas y sondas. MUST armar cada vector como la suma normalizada de las componentes global, tema, afirmación y ruido con los pesos de la propuesta (0,75, 0,13, 0,07 y 0,05). MUST dar exactamente las filas de la forma: 15 cadenas de cada largo (5, 10, 20 y 40 versiones `superseded` más la vigente) del lector, 15 afirmaciones repetidas por cada agente en cada proyecto, un 20 % de las filas sin proyecto y, del resto, una de cada 20 `user_preference` y otra de cada 20 borrada y sin vector. Esas dos MUST sortearse fila por fila: un contador vuelve a caer en el mismo agente y el mismo tema cada vez que la vuelta de los agentes por los temas es múltiplo de 20, y deja borradas todas las filas de un agente en un tema.
 
 #### Escenario: la misma semilla
 - GIVEN una forma y una semilla
@@ -28,7 +28,12 @@ El generador MUST ser puro: dada una forma y una semilla, MUST devolver las mism
 - WHEN se miden sus distancias L2
 - THEN la media de cada grupo cae cerca de 0,71, 0,49 y 0,32, y todo par de la misma afirmación queda dentro de `[0,10, 0,42)`
 
-**Tests:** `the_same_seed_lays_out_the_same_corpus`, `a_shape_holds_its_chains_copies_and_unowned_rows`, `the_layout_puts_topics_claims_and_unrelated_rows_at_their_distances`.
+#### Escenario: el borrado no sigue al agente ni al tema
+- GIVEN cinco agentes y cuatro temas de cada clase, de modo que una fila de un agente vuelve al mismo tema cada 20 filas
+- WHEN se genera
+- THEN ningún grupo de proyecto, tema y agente queda con todas sus filas borradas
+
+**Tests:** `the_same_seed_lays_out_the_same_corpus`, `a_shape_holds_its_chains_copies_and_unowned_rows`, `the_layout_puts_topics_claims_and_unrelated_rows_at_their_distances`, `preferences_and_deletions_fall_apart_from_agents_and_topics`.
 
 ## KP2. La elegibilidad pura es la de producción
 
@@ -39,7 +44,7 @@ La medición MUST decidir qué fila es elegible con una función pura sobre lo q
 - WHEN se decide para el lector
 - THEN las tres primeras son elegibles y las otras cuatro no
 
-**Tests:** `eligibility_follows_the_production_predicates`.
+**Tests:** `eligibility_follows_the_production_predicates`, `a_closed_reading_hides_every_other_agent`.
 
 ## KP3. La referencia exacta
 
@@ -50,7 +55,9 @@ La referencia de una consulta MUST ser las `L` filas elegibles más cercanas por
 - WHEN se calcula la referencia de cada consulta en SQL y con la elegibilidad pura y distancias en Rust
 - THEN las dos dan las mismas filas en el mismo orden
 
-**Tests:** `the_exact_query_returns_the_pure_reference`.
+El pool del detector (`CANDIDATE_POOL`, `contradiction.rs:59`) es privado, así que la medición lo repite y un test los ata: con 7 filas elegibles dentro de la banda, la sonda devuelve tantas como la referencia, 5.
+
+**Tests:** `the_exact_query_returns_the_pure_reference`, `the_detector_reference_keeps_the_pool_of_the_detector`.
 
 ## KP4. La pérdida
 
@@ -82,13 +89,20 @@ Sobre un corpus chico que corre con la suite, la medición MUST dar pérdida 0 y
 - WHEN corre la consulta
 - THEN corrió la segunda pasada y la pérdida a 30 es mayor que 0
 
-**Tests:** `without_foreign_rows_nothing_is_lost_in_one_pass`, `rows_past_the_widened_window_are_counted_lost`.
+#### Escenario: la versión vigente detrás de sus revisiones
+- GIVEN una cadena de 10 versiones `superseded` y la vigente, del lector, entre 40 filas del tema
+- WHEN corren su búsqueda y su sonda
+- THEN las dos corrieron la segunda pasada, la vigente sale primera en la búsqueda y la sonda la devuelve sola
+
+**Tests:** `without_foreign_rows_nothing_is_lost_in_one_pass`, `rows_past_the_widened_window_are_counted_lost`, `the_live_version_behind_its_revisions_is_found_first`.
 
 ## KP6. El informe de la pérdida
 
 `what_the_window_loses_against_the_exact_neighbours`, `#[ignore]`, MUST correr cada forma de la propuesta (F1 a F4 y E1) con su semilla y MUST imprimir, por forma: la semilla, cuántas consultas y sondas corrieron, `loss@10` y `loss@30` medios y su p90 y máximo por tipo de consulta (tema propio, tema compartido, cadena de cada largo), la pérdida del detector por cadena de cada largo y en las afirmaciones repetidas, el puesto de la versión vigente por largo, la parte de búsquedas y sondas con segunda pasada, y p50 y p99 de la latencia total y del brazo `knn_memory`. MUST imprimir también, para las formas que deciden, cada umbral (U1 a U3) con su valor sobre lo que decide (temas y cadenas de hasta 20) y si pasa. No necesita el modelo ni un perfil de datos.
 
-**Test:** `what_the_window_loses_against_the_exact_neighbours` (se corre con `cargo test -p clawg-core --lib -- --ignored what_the_window_loses --nocapture`).
+La lectura de los umbrales MUST ser pura: deja fuera las cadenas de más de 20 versiones, y una forma abre si pasa uno.
+
+**Tests:** `the_thresholds_read_only_what_decides`; la corrida, `what_the_window_loses_against_the_exact_neighbours` (`cargo test -p clawg-core --lib -- --ignored what_the_window_loses --nocapture`).
 
 ## KP7. El costo de la consulta exacta
 
