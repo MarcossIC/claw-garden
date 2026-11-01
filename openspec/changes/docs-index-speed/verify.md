@@ -550,3 +550,103 @@ No muerden ocho:
 El código no lo contradice ningún escenario, pero hay dos puntos donde el texto y el código difieren. Un doc de más pasajes que el límite se suma a los siguientes durante la rampa (WARNING 1, que se arregla en el texto). La cota de memoria de D13 no cuenta las codificaciones del tokenizer ni la doble copia de los vectores (WARNING 5), y así el pico de IS17 es la única puerta de memoria.
 
 IS16 e IS17 esperan a la Parte 7. Ningún hallazgo cambia lo que el refresco escribe ni un número de la tabla de IS6.
+
+## A2: «se queda si» (2026-11-01)
+
+Corridas autorizadas de la Parte 7, una por vez y sin otra compilación ni prueba en marcha. Usan el modelo del perfil dev (`multilingual-e5-small`), sólo leído, en esta máquina: Windows `x86_64` con AVX2, AVX-512F y FMA, 16 hilos. Durante todas corrió también el daemon `prod` del editor, que ninguna corrida registra.
+
+- **Base:** `2f92e17`, el commit anterior al código de A2, que ya incluye A1 (0.72.0). Se compiló en release en un worktree descartable, con su propio directorio de build.
+- **Paso:** `30b549f` (0.72.2), compilado en `target-test` después de `cargo clean --workspace`, porque la versión subió. Entre la base y el paso, el daemon sólo cambia en `crates/clawg-core/src/memory/project_docs/mod.rs` y `embedder.rs`. Lo demás que entró (agent-eval y las subidas de versión) no toca el índice de docs.
+- **Corpus:** congelado en un worktree de `30b549f`. Tiene 787 docs, 19 278 pasajes, 2 saltados y 1 dejado fuera (`openspec/changes/archive/2026-10-15-project-indexing/verify.md`), con el golden de 40 preguntas.
+  - Las dos ramas lo leen con `--root`, `--golden` y `--out` explícitos, y se llaman los binarios ya compilados.
+  - En los JSON, `git_sha` es el del corpus y no el del binario.
+  - El checkout del worktree tiene fin de línea CRLF. Por eso sus tokens no se comparan con los de A1.
+
+### Los bits (7b)
+
+`sorting_across_docs_against_sorting_in_each_doc` con el tercer orden (`bb6a565`) corrió en debug, con `CLAWG_EMBED_PASSAGES=5000` y `CLAWG_EMBED_RUNS=3`.
+
+- **Muestra:** 197 docs y 5293 pasajes, de los que 77 docs tienen más de 16 pasajes. La cola los manda en 16 llamadas.
+- **Bits:** la cola da **5293 de 5293 vectores con los mismos bits** que ordenando en cada doc, con diferencia mayor 0. Todo junto da lo mismo.
+- **Tokens rellenados:** 2 003 961 en cada doc, 1 664 643 en la cola (0,831) y 1 620 417 todo junto (0,809).
+- **Tiempo:** los tres órdenes se turnan en cada ronda. Contra «en cada doc», la cola da 0,798, 0,702 y 0,905 (mediana 0,798), y todo junto 0,791, 0,674 y 0,701. Es vista previa en debug y no decide nada.
+
+La decisión 4 se cumple con diferencia 0 en esta CPU. Nada guardado cambia, y `docs/eval/cache/` no se vacía.
+
+### El tiempo (7c)
+
+Seis corridas de `rag-eval --real --docs --no-cache` en release, con `CLAWG_PROFILE=dev`, alternando base, paso, base, paso, base y paso. Los resultados, fuera de git, están en `docs/eval/results/2026-11-01-real-docs-a2-{base,step}-{1,2,3}.json`.
+
+| corrida | empieza | `index_seconds` | `phases.embed` | `phases.split` | `tokens.padded_ran` |
+|---|---|---|---|---|---|
+| base-1 | 23:25 (31/10) | 1601,6 | 1585,43 | 11,99 | 7 435 637 |
+| paso-1 | 23:52 | 1187,6 | 1172,47 | 11,24 | 6 114 552 |
+| base-2 | 00:12 | 1580,4 | 1562,66 | 12,98 | 7 435 637 |
+| paso-2 | 00:38 | 1184,3 | 1169,48 | 10,85 | 6 114 552 |
+| base-3 | 00:58 | 1569,4 | 1552,32 | 12,74 | 7 435 637 |
+| paso-3 | 01:24 | 1175,3 | 1161,04 | 10,70 | 6 114 552 |
+
+**Las otras fases** son chicas y parecidas en las seis: `scan` 0,05–0,06, `read` 0,21–0,29, `mask` 0,82–0,95, `lookup` 0,01–0,02 y `write` 2,47–3,41 s. `count_seconds` va de 1,96 a 2,00 s.
+
+**Los tokens** son iguales en las seis: `real` 5 976 339, `padded` 8 944 685, `padded_sorted_in_doc` 7 435 637 y `padded_sorted_all` 5 979 576. El paso agrega `padded_sorted_queue` 6 114 552. En la base, `padded_ran` = `padded_sorted_in_doc`, como dejó A1.
+
+**La cola recupera 0,9073 del ahorro de tokens del techo:** (7 435 637 − 6 114 552) / (7 435 637 − 5 979 576). La cuenta del tope, sin modelo y sobre el corpus de `478f59f`, había dado R_P(512) = 0,9071.
+
+**Esta vez la máquina no cambió de régimen.** Dentro de cada rama, `embed` varía menos del 2 %. `split` es más bajo en el paso (10,7–11,2 s frente a 12,0–13,0 s) en las tres corridas, no en una sola. Esa diferencia sería propia de la rama y no de la máquina, aunque no está medido por qué. Una explicación probable: el paso parte varios docs seguidos antes de cada llamada al modelo, y la base parte uno por llamada. Por eso `split` no sirve acá para comparar entre ramas, y se comparan los tres pares y las vecinas:
+
+| comparación | `phases.embed` |
+|---|---|
+| par 1 (base-1 → paso-1) | **−26,1 %** |
+| par 2 (base-2 → paso-2) | **−25,2 %** |
+| par 3 (base-3 → paso-3) | **−25,2 %** |
+| paso-1 contra el promedio de base-1 y base-2 | −25,5 % |
+| paso-2 contra el promedio de base-2 y base-3 | −24,9 % |
+
+**Por área (`by_area`).** Los conteos son iguales en las seis corridas: docs 68 docs, 2903 pasajes y 45 de más de una tanda; code 211, 8485 y 109; archive 508, 7890 y 150. En el paso, el tiempo de una llamada compartida se reparte entre sus docs por textos (`embed_shares`). Por eso el `embed` por área del paso es un reparto, no una medición por doc.
+
+| área | par 1 | par 2 | par 3 |
+|---|---|---|---|
+| docs | 213,51 → 158,31 s (−25,9 %) | 205,46 → 158,52 s (−22,8 %) | 202,75 → 156,57 s (−22,8 %) |
+| code | 671,30 → 584,92 s (−12,9 %) | 677,64 → 583,45 s (−13,9 %) | 673,85 → 577,29 s (−14,3 %) |
+| archive | 700,62 → 429,24 s (−38,7 %) | 679,56 → 427,51 s (−37,1 %) | 675,73 → 427,18 s (−36,8 %) |
+
+**Dónde gana.** Gana más en `archive`, que tiene muchos docs chicos. Antes, cada uno corría su propia tanda incompleta, y en la cola comparten tandas. En `code` gana menos, porque sus pedazos tienen un tope de caracteres y ya rellenaban poco.
+
+**Por qué el reloj baja más que los tokens.** Los tokens rellenados bajan un 17,8 % y el reloj un 25 %. Pasa porque la cola, además de rellenar menos, llena las tandas: el modelo corre menos veces, y cada corrida tiene un costo que no depende del relleno. En A1 era al revés: tokens −16,9 % y reloj −12,7 %.
+
+**Por qué supera el techo de debug.** El techo de debug había dado −21,0 % («A2: el techo, antes del código»). La explicación más probable no está medida. En debug, la parte en Rust (tokenizar y armar los tensores) es lenta y no se achica con la cola, así que diluye la mejora. En release pesa poco.
+
+### El pico de memoria (7d)
+
+Cuatro daemons `clawg serve --profile dev` de release, uno por corrida, alternando base, paso, base y paso.
+
+- **Preparación.** Antes de la primera corrida hubo un arranque del paso sin proyecto. Aplicó las migraciones V25 a V31 al store dev, que estaba en la 24, y escribió su snapshot `pre-migration`. Sin ese arranque, la migración habría caído dentro de base-1.
+- **Las copias del corpus.** Cada daemon indexó una copia propia del worktree congelado, sin `.git` y en una ruta nueva: 968 archivos idénticos, registrados con `clawg projects add`. Un worktree resuelve a su repositorio principal, y el índice de docs va por raíz. Con la misma ruta, el segundo daemon habría reutilizado los vectores del primero.
+- **El store dev** tenía 51 998 memorias vivas.
+- **La lectura.** `clawg metrics report --metric process.private_peak_bytes` y `process.private_bytes`, `--by minute`, tomando de cada daemon sólo los minutos en que muestreó él solo.
+- **El tiempo de más.** Tres de los daemons siguieron vivos después de su refresco más de lo previsto: base-1 y paso-1 unas 2 h, y base-2 media hora. El script que esperaba el fin del refresco no encontraba `rg`, una función de la shell que un `bash` hijo no hereda, y esperó hasta su tope. Eso no cambia el pico. En las cuatro corridas, el pico al terminar el refresco es el mismo que el de toda la vida del proceso. Después del refresco el modelo se descarga a los 10 minutos sin uso, y `private` baja a unos 320 MiB.
+
+| corrida | empieza | refresco del daemon | `embed` del daemon | pico, primer minuto | pico de vida del proceso | `private` máx. en el refresco |
+|---|---|---|---|---|---|---|
+| base-1 | 01:49 | 1539,0 s | 1521,0 s | 1188,5 MiB | **1448,5 MiB** | 1349,9 MiB |
+| paso-1 | 04:22 | 868,4 s | 854,0 s | 1189,0 MiB | **1312,6 MiB** | 1193,8 MiB |
+| base-2 | 06:55 | 1170,7 s | 1154,2 s | 1188,3 MiB | **1448,5 MiB** | 1399,1 MiB |
+| paso-2 | 07:46 | 926,3 s | 911,0 s | 1300,1 MiB | **1312,6 MiB** | 1176,9 MiB |
+
+**El pico lo fija el refresco en las dos ramas.** Arranca en unos 1188 MiB y crece mientras indexa, así que vale `private_peak_bytes` y no hace falta el máximo de `private_bytes`. Las dos corridas de cada rama dan el mismo pico, sin diferencia de un MiB. **El paso tiene un pico un 9,4 % más bajo que la base** (1312,6 frente a 1448,5 MiB).
+
+**Por qué baja el pico.** La explicación más probable no está medida por separado. La base cuenta los tokens de todos los textos de un doc de una vez, con todas sus codificaciones en memoria. El paso los cuenta de a 16 y consume los vectores con `into_iter` (`d003faf`, el WARNING 5 de la verificación del código).
+
+**Los tiempos del daemon son informativos.** Van en la misma dirección que la 7c: paso-1 contra el promedio de las dos bases −36,2 %, y paso-2 contra base-2 −21,1 %. No deciden nada, porque las dos bases difieren un 24 % entre sí.
+
+### Las condiciones de «se queda si»
+
+| condición | resultado | |
+|---|---|---|
+| `phases.embed` baja ≥ 15 % | −26,1 %, −25,2 % y −25,2 % en los tres pares; −25,5 % y −24,9 % contra las vecinas | ✅ |
+| `tokens.padded_ran` = `tokens.padded_sorted_queue`, sin aviso, en cada corrida del paso | 6 114 552 = 6 114 552 en las tres. `padding_warning` sólo avisa si difieren | ✅ |
+| `--diff` base-n contra paso-n no mueve ninguna pregunta | en los tres pares: 0 mejores y 0 peores en Hit@1, Hit@3, Hit@5 y MRR@10, en todas, docs y código (p = 1). Las seis corridas dan Hit@1 0,05, Hit@3 0,10, Hit@5 0,10 y MRR@10 0,079 | ✅ |
+| decisión 4 de la propuesta | 0 bits movidos (7b) | ✅ |
+| IS17: el pico sube ≤ 5 % | baja un 9,4 % (1312,6 frente a 1448,5 MiB, en las dos corridas de cada rama) | ✅ |
+
+**A2 se queda.** IS16 e IS17 quedan cumplidos: IS16 por la 7b e IS17 por la 7d. No se revierte ningún commit. Como no se movió ningún bit, `docs/eval/cache/` sigue siendo exacta.
