@@ -1,5 +1,6 @@
-//! KNN search across memory + episodic + procedural via tokio::try_join!,
-//! merged + ranked by the score formula of `score.rs`.
+//! KNN search across memory + episodic + procedural, one table after another
+//! on the store's connection, merged + ranked by the score formula of
+//! `score.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -723,7 +724,7 @@ fn format_pool_line(
 
 // ── lexical (FTS5) candidate channel ──
 //
-// Wired into search_all_memories_inner's 4th try_join! arm below.
+// Wired into search_all_memories_inner as the arm after the three KNN.
 
 /// Maximum number of OR-ed terms an FTS5 MATCH expression may carry, taken
 /// from the front of the token list. Bounds the expression so a pasted
@@ -1308,9 +1309,8 @@ async fn search_all_memories_inner(
     // independent per-row `strftime('%s','now')` calls could never guarantee.
     let now = TimestampMs::now();
 
-    // Run before the dense arms, not beside them: the bonus has to be in each
-    // row's score before `knn_one` trims a widened window back to k. All arms
-    // share one connection, so nothing ran in parallel to lose.
+    // The first arm: the bonus has to be in each row's score before
+    // `knn_one` trims a widened window back to k.
     let metrics = store.metrics();
     let lexical_matches = match (scope.lexical, query_text) {
         (Some(k), Some(q)) => {
@@ -1323,55 +1323,45 @@ async fn search_all_memories_inner(
     // Ids are per table and only `memory` has a lexical index.
     let no_matches = HashSet::new();
 
-    let (mem, epi, pro, lex_ids) = tokio::try_join!(
-        async {
-            match scope.memory {
-                Some(k) => {
-                    let outcome =
-                        knn_one(store, KNN_MEMORY, &q_bytes, agents, project_id, k, scoring, now, &lexical_matches).await?;
-                    record_arm(metrics, "knn_memory", outcome.ran);
-                    Ok(outcome)
-                }
-                None => Ok(KnnOutcome::skipped()),
-            }
-        },
-        async {
-            match scope.episodic {
-                Some(k) => {
-                    let outcome =
-                        knn_one(store, KNN_EPISODIC, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await?;
-                    record_arm(metrics, "knn_episodic", outcome.ran);
-                    Ok(outcome)
-                }
-                None => Ok(KnnOutcome::skipped()),
-            }
-        },
-        async {
-            match scope.procedural {
-                Some(k) => {
-                    let outcome =
-                        knn_one(store, KNN_PROCEDURAL, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await?;
-                    record_arm(metrics, "knn_skill", outcome.ran);
-                    Ok(outcome)
-                }
-                None => Ok(KnnOutcome::skipped()),
-            }
-        },
-        async {
-            // Infallible by construction: `lexical_candidates` never returns
-            // `Result` at all, so there is exactly one `Ok(...)` in this arm
-            // and nothing here can bubble an FTS5-specific failure into the
-            // rest of the search. `(None, _)` and `(_, None)` both mean "the
-            // channel has nothing to spend its budget on" — off, or on with
-            // no query text to match — and collapse into the same empty
-            // result as a sanitizer that yielded zero tokens.
-            let ids = match (scope.lexical, query_text) {
-                (Some(k), Some(q)) => Some(lexical_candidates(store, q, agents, project_id, k).await),
-                _ => None,
-            };
-            Ok::<_, MemoryError>(ids)
-        },
-    )?;
+    // One arm after another, in the order they always reached the
+    // connection: it runs one call at a time, so joining them ran nothing in
+    // parallel. Each call goes in once the one before came back.
+    let mem = match scope.memory {
+        Some(k) => {
+            let outcome =
+                knn_one(store, KNN_MEMORY, &q_bytes, agents, project_id, k, scoring, now, &lexical_matches).await?;
+            record_arm(metrics, "knn_memory", outcome.ran);
+            outcome
+        }
+        None => KnnOutcome::skipped(),
+    };
+    let epi = match scope.episodic {
+        Some(k) => {
+            let outcome = knn_one(store, KNN_EPISODIC, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await?;
+            record_arm(metrics, "knn_episodic", outcome.ran);
+            outcome
+        }
+        None => KnnOutcome::skipped(),
+    };
+    let pro = match scope.procedural {
+        Some(k) => {
+            let outcome =
+                knn_one(store, KNN_PROCEDURAL, &q_bytes, agents, project_id, k, scoring, now, &no_matches).await?;
+            record_arm(metrics, "knn_skill", outcome.ran);
+            outcome
+        }
+        None => KnnOutcome::skipped(),
+    };
+    // Infallible by construction: `lexical_candidates` never returns `Result`
+    // at all, so nothing here can bubble an FTS5-specific failure into the
+    // rest of the search. `(None, _)` and `(_, None)` both mean "the channel
+    // has nothing to spend its budget on" — off, or on with no query text to
+    // match — and collapse into the same empty result as a sanitizer that
+    // yielded zero tokens.
+    let lex_ids = match (scope.lexical, query_text) {
+        (Some(k), Some(q)) => Some(lexical_candidates(store, q, agents, project_id, k).await),
+        _ => None,
+    };
     for (outcome, table) in [(&mem, "memory"), (&epi, "episodic"), (&pro, "skill")] {
         if outcome.retried() {
             metrics.gauge("search.knn_retry", &[("table", table)], 1.0);
@@ -3996,7 +3986,7 @@ mod tests {
         );
     }
 
-    // ── lexical channel wiring (4th try_join! arm inside search_all_memories_inner) ──
+    // ── lexical channel wiring (the arm after the three KNN inside search_all_memories_inner) ──
 
     /// Component-wise negation — cosine ≈ -1 after normalization, exactly
     /// antipodal to `v`. Mirrors `contradiction.rs`'s `far()` fixture (same
@@ -5512,6 +5502,46 @@ mod tests {
             let took = arm_took(&store, arm);
             assert!(took < std::time::Duration::from_millis(150), "{arm} took {took:?} of a search that waited {total:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_call_that_arrives_during_a_search_runs_between_its_arms() {
+        // An empty store: no hit to link and no candidate to score, so the
+        // arms are the only calls the search makes.
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let (release, holding) = hold_connection(&store).await;
+        let search = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                search_all_memories(&store, &unit_basis_vec(), Some("vector arms"), "agent-between", memory_and_lexical(), 10)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let arriving = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .conn
+                    .call(|_| -> rusqlite::Result<()> {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+        holding.await.unwrap();
+        search.await.unwrap().unwrap();
+        arriving.await.unwrap();
+
+        let total = arm_took(&store, "total");
+        assert!(
+            total >= std::time::Duration::from_millis(250),
+            "the lexical arm, sent once the KNN came back, waits for the call that arrived meanwhile: {total:?}"
+        );
     }
 
     #[tokio::test]
