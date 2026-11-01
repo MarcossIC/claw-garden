@@ -12,10 +12,10 @@ artifacts:
   verify: pending
   archive: pending
 gates:
-  C: pending  # 2.1: hilos de rayon vivos con el modelo suelto
-  A: pending  # 2.2 y 2.3: CPU en reposo y CPU total con y sin espera activa
+  C: open  # 2.1 en Windows: 16 hilos de rayon vivos con el modelo suelto; falta Linux
+  A: pending  # 2.2 en Windows no abre (mediana -0,073 s, umbral +0,6 s); falta Linux y la CPU total de 2.3
   B: pending  # 2.3 y 2.4: CPU, pared y p99 de búsqueda con menos hilos
   E: pending  # 2.5: tiempo de la triple codificación de split_save
   arena: pending  # 2.4: p99 de búsqueda con 1 y 2 arenas de malloc
   D: dropped  # pasó a docs-index-speed
-updated: 2026-10-31
+updated: 2026-11-01
