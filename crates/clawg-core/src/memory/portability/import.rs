@@ -5648,7 +5648,7 @@ pub(crate) mod tests {
         let batches = note_batches(&units, 4);
         assert_eq!(batches, vec![0..4, 4..6, 6..11, 11..12]);
         assert_eq!(batch_notes(&units, &batches), vec![2, 1, 1, 1]);
-        assert_eq!(batch_notes(&[], &[0..0]), vec![0], "the batch that only records the projects");
+        assert_eq!(batch_notes(&[], std::slice::from_ref(&(0..0))), vec![0], "the batch that only records the projects");
     }
 
     /// A clawg file of `rows` rows, in as many write batches as `WRITE_BATCH` makes.
