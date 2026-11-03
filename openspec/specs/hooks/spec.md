@@ -39,7 +39,12 @@ Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a
 - WHEN corre `clawg hook session-start --agent a`
 - THEN stdout está vacío, sale con 0 y no aparece un `daemon.json`
 
-**Tests:** `a_hook_without_a_daemon_prints_nothing`, `a_hook_with_input_that_is_not_json_prints_nothing`, `a_hook_usage_error_exits_1` (`tests/binary.rs`), `a_hook_usage_error_never_blocks` (`cli.rs`, que sólo prueba `is_hook_invocation`), `a_daemon_that_does_not_answer_gives_nothing` y `without_a_daemon_nothing_is_printed` (`hook.rs`). Ningún test llega a un daemon que responde con un error o que no responde, ni ejerce `shutdown_background`: el tope que vence en `a_daemon_that_does_not_answer_gives_nothing` es el de la lectura de stdin ([verify](../../changes/archive/2026-10-18-agent-lifecycle-hooks/verify.md#lo-que-encontró-la-verificación), W1).
+#### Escenario: el daemon falla
+- GIVEN un daemon publicado que responde 500 a todo, u otro que acepta la conexión y nunca responde
+- WHEN corren `session-start` y `user-prompt-submit` con una entrada válida
+- THEN ninguno imprime nada, y con el que no responde los dos vuelven al vencer el tope
+
+**Tests:** `a_hook_without_a_daemon_prints_nothing`, `a_hook_with_input_that_is_not_json_prints_nothing`, `a_hook_usage_error_exits_1` (`tests/binary.rs`), `a_hook_usage_error_never_blocks` (`cli.rs`, que sólo prueba `is_hook_invocation`), `a_daemon_that_does_not_answer_gives_nothing`, `a_daemon_that_answers_an_error_gives_nothing`, `a_daemon_that_never_answers_gives_nothing_by_the_deadline` y `without_a_daemon_nothing_is_printed` (`hook.rs`). El tope que vence en `a_daemon_that_does_not_answer_gives_nothing` es el de la lectura de stdin; los dos siguientes publican un daemon en el directorio de datos, uno que responde 500 a todo y otro que acepta la conexión y nunca escribe, y miran que el hook le haya preguntado: con los dos eventos no imprime nada, con el primero y una preferencia imprime sólo la línea del idioma, y con el segundo vuelve al vencer el tope. Ningún test ejerce `shutdown_background` ([verify](../../changes/archive/2026-10-18-agent-lifecycle-hooks/verify.md#lo-que-encontró-la-verificación), W1).
 
 ## R4. `session-start`
 

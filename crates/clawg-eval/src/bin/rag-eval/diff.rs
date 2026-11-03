@@ -49,8 +49,8 @@ pub fn regressed(diff: &RunDiff) -> bool {
 }
 
 /// How a primary metric's movement reads at `stats::ALPHA`. A movement that
-/// does not reach it says how many one-way cases would have, and never that
-/// the runs are the same: with a few dozen cases, "not distinguishable" is all
+/// does not reach it says how many more cases would have, and never that the
+/// runs are the same: with a few dozen cases, "not distinguishable" is all
 /// the data can say.
 pub fn verdict(name: &str, m: &MetricDiff) -> String {
     let p = m.p_value();
@@ -59,12 +59,29 @@ pub fn verdict(name: &str, m: &MetricDiff) -> String {
         let direction = if m.better > m.worse { "better" } else { "worse" };
         format!("{name}: distinguishable, {direction} (p = {p:.4}, {} better / {} worse)", m.better, m.worse)
     } else {
-        format!(
-            "{name}: not distinguishable with {moved} case(s) moving (p = {p:.4}); \
-             a conclusion needs at least {} cases moving one way",
-            crate::stats::min_one_way_significant()
-        )
+        format!("{name}: not distinguishable with {moved} case(s) moving (p = {p:.4}); {}", still_needed(m))
     }
+}
+
+/// What a movement short of `stats::ALPHA` still needs. With no case moving
+/// the other way that is the six of a one-way movement; each case that did
+/// raises it, so the line counts the cases more on the leading side, net of
+/// the ones against: 3 better and 10 worse need 2 more worse, not 6.
+fn still_needed(m: &MetricDiff) -> String {
+    let against = m.better.min(m.worse);
+    if against == 0 {
+        return format!(
+            "a conclusion needs at least {} cases moving one way",
+            crate::stats::min_one_way_significant()
+        );
+    }
+    let more = crate::stats::more_one_way_significant(m.better.max(m.worse), against);
+    let (moved_against, leading) = match m.better.cmp(&m.worse) {
+        Ordering::Greater => ("worse", "better"),
+        Ordering::Less => ("better", "worse"),
+        Ordering::Equal => ("each way", "one way"),
+    };
+    format!("{against} moved {moved_against}, so a conclusion needs at least {more} more case(s) moving {leading}")
 }
 
 /// The five per-case metrics' movement for one block (`retrieval` or
@@ -718,6 +735,21 @@ mod tests {
         let line = verdict("retrieval recall@5", &m);
         assert!(line.contains("not distinguishable with 1 case(s)"), "{line}");
         assert!(line.contains("at least 6 cases"), "{line}");
+    }
+
+    #[test]
+    fn a_movement_both_ways_says_how_many_more_cases_one_way_are_needed() {
+        let m = moved(3, 10);
+        assert!((m.p_value() - 0.0923).abs() < 1e-4, "p = {}", m.p_value());
+        let line = verdict("retrieval recall@5", &m);
+        assert!(line.contains("not distinguishable with 13 case(s)"), "{line}");
+        assert!(line.contains("3 moved better, so a conclusion needs at least 2 more case(s) moving worse"), "{line}");
+        assert!(!line.contains("6 cases"), "{line}");
+
+        let line = verdict("m", &moved(10, 3));
+        assert!(line.contains("3 moved worse, so a conclusion needs at least 2 more case(s) moving better"), "{line}");
+        let line = verdict("m", &moved(3, 3));
+        assert!(line.contains("3 moved each way, so a conclusion needs at least 9 more case(s) moving one way"), "{line}");
     }
 
     #[test]

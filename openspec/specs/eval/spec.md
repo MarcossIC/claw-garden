@@ -329,6 +329,7 @@ rag-eval --diff <a.json> <b.json> [--fail-on-regression]
 
 - `mcnemar_exact(better, worse)` (`stats.rs:13`): el p exacto, sumado en logaritmos para que miles de casos no lo lleven a 0, y nunca mayor que 1. Es simétrica, y `(0, 0)` da 1.
 - `min_one_way_significant()` (`stats.rs:53`): la menor cantidad de casos que, moviéndose todos en una dirección, llega a p < `ALPHA` = 0,05 (`stats.rs:49`). No depende del tamaño del set, porque sólo cuentan los casos que se movieron, y da 6: `(0, 6)` da 0,03125 y `(0, 5)`, 0,0625.
+- `more_one_way_significant(lead, against)` (`stats.rs:61`): la menor cantidad de casos más que, moviéndose todos como los `lead` y con los `against` que se movieron en contra contados, llega a p < `ALPHA`; 0 si ya llega. `min_one_way_significant()` es `more_one_way_significant(0, 0)`. `(10, 3)` da 2, porque `(12, 3)` da 0,035 y `(11, 3)` 0,057, y `(3, 3)` da 9.
 - `wilson(k, n)` (`stats.rs:35`): el intervalo de Wilson al 95 % (`Z_95` = 1,959963985, `stats.rs:29`). `wilson(0, 0)` da 0 a 1.
 - `paired_bootstrap_ci(deltas, resamples, seed)` (`stats.rs:74`): la media de las diferencias por caso y su intervalo percentil al 95 %, con `BOOTSTRAP_RESAMPLES` = 10.000 remuestreos con reposición (`stats.rs:65`) y la semilla fija `BOOTSTRAP_SEED` (`stats.rs:68`) sobre el mismo SplitMix64 de `golden-mine` (`stats.rs:94-110`), así que los mismos dos archivos dan siempre el mismo intervalo. Sin diferencias da `(0, 0, 0)`.
 
@@ -343,7 +344,7 @@ rag-eval --diff <a.json> <b.json> [--fail-on-regression]
 - THEN dos llamadas dan el mismo intervalo
 - AND diferencias todas 0 dan `(0, 0, 0)`, y diferencias todas positivas dan un límite inferior mayor que 0
 
-**Tests** (`stats.rs`): `wilson_matches_known_intervals`, `wilson_of_no_cases_is_the_whole_range`, `mcnemar_exact_matches_known_p_values`, `mcnemar_exact_is_symmetric_and_never_above_one`, `mcnemar_exact_stays_finite_for_thousands_of_cases`, `bootstrap_is_deterministic_for_a_seed`, `bootstrap_of_zero_differences_is_zero`, `bootstrap_of_positive_differences_excludes_zero`, `six_cases_one_way_is_the_smallest_significant_count`, `splitmix_matches_the_golden_mine_sequence`.
+**Tests** (`stats.rs`): `wilson_matches_known_intervals`, `wilson_of_no_cases_is_the_whole_range`, `mcnemar_exact_matches_known_p_values`, `mcnemar_exact_is_symmetric_and_never_above_one`, `mcnemar_exact_stays_finite_for_thousands_of_cases`, `bootstrap_is_deterministic_for_a_seed`, `bootstrap_of_zero_differences_is_zero`, `bootstrap_of_positive_differences_excludes_zero`, `six_cases_one_way_is_the_smallest_significant_count`, `the_cases_still_needed_count_the_ones_that_moved_against`, `splitmix_matches_the_golden_mine_sequence`.
 
 ### Qué compara
 
@@ -364,7 +365,8 @@ Una fila se imprime como `{métrica}  {better}  {worse}  {net}  {p}`, seguida de
 Al final, bajo `primary:`, MUST imprimirse siempre la línea de `retrieval recall@5`, haya o no casos de recuperación en los archivos, y la de `agent_view search.found` cuando existe el bloque (`render`, `diff.rs:475-479`). El texto sale de `verdict` (`diff.rs:55`):
 
 - con p < 0,05: `{nombre}: distinguishable, better|worse (p = {p}, {b} better / {w} worse)`;
-- si no: `{nombre}: not distinguishable with {movidos} case(s) moving (p = {p}); a conclusion needs at least 6 cases moving one way`. El 6 es el mínimo cuando ningún caso se mueve en la otra dirección; con movimiento mixto hacen falta más, y la línea no lo dice.
+- si no, sin casos movidos en contra: `{nombre}: not distinguishable with {movidos} case(s) moving (p = {p}); a conclusion needs at least 6 cases moving one way`;
+- si no, con `c` casos movidos en contra (`still_needed`, `diff.rs:70`): `{nombre}: not distinguishable with {movidos} case(s) moving (p = {p}); {c} moved better|worse|each way, so a conclusion needs at least {k} more case(s) moving worse|better|one way`, donde `k` es `more_one_way_significant` de los dos lados: los casos netos más que hacen falta del lado que va adelante. Con 3 mejores y 10 peores (p = 0,0923) la línea pide 2 más hacia peor, no 6.
 
 El texto MUST NOT decir que no hay diferencia, ni que las corridas son iguales.
 
@@ -381,6 +383,11 @@ El texto MUST NOT decir que no hay diferencia, ni que las corridas son iguales.
 - GIVEN dos archivos donde R@5 mejora en 1 caso
 - THEN p = 1 y la línea primaria dice «not distinguishable» y nombra los 6 casos
 
+#### Escenario: casos en las dos direcciones
+- GIVEN dos archivos donde R@5 mejora en 3 casos y empeora en 10
+- THEN p = 0,0923 y la línea primaria dice «not distinguishable», que 3 se movieron hacia mejor y que hacen falta al menos 2 casos más hacia peor
+- AND con 3 y 3 pide 9 más en una dirección
+
 #### Escenario: `found` cambia
 - GIVEN dos archivos de agent-view iguales salvo un caso con `search.found` de `false` a `true`
 - THEN `search.found` informa 1 mejor, 0 peores
@@ -393,7 +400,7 @@ El texto MUST NOT decir que no hay diferencia, ni que las corridas son iguales.
 - GIVEN un archivo sin `agent_view` y otro con el bloque
 - THEN el diff no falla y no imprime el bloque
 
-**Tests** (`diff.rs`): `self_diff_is_a_no_op`, `six_one_way_improvements_are_significant`, `one_improvement_is_not_distinguishable_and_says_how_many_are_needed`, `a_continuous_metric_carries_a_bootstrap_interval`, `the_verdict_never_says_there_is_no_difference`, `a_found_flip_in_agent_view_shows_up`, `fewer_tokens_count_as_better`, `agent_view_joins_on_query_and_skips_known_red`, `a_file_without_agent_view_diffs_without_the_block`, `abstention_is_diffed_when_both_files_have_it` y `freshness_is_diffed_when_both_files_have_update_cases`.
+**Tests** (`diff.rs`): `self_diff_is_a_no_op`, `six_one_way_improvements_are_significant`, `one_improvement_is_not_distinguishable_and_says_how_many_are_needed`, `a_movement_both_ways_says_how_many_more_cases_one_way_are_needed`, `a_continuous_metric_carries_a_bootstrap_interval`, `the_verdict_never_says_there_is_no_difference`, `a_found_flip_in_agent_view_shows_up`, `fewer_tokens_count_as_better`, `agent_view_joins_on_query_and_skips_known_red`, `a_file_without_agent_view_diffs_without_the_block`, `abstention_is_diffed_when_both_files_have_it` y `freshness_is_diffed_when_both_files_have_update_cases`.
 
 ### Corte por pareja
 

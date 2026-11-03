@@ -85,9 +85,12 @@ Cada fila compite con las demás en la búsqueda, así que deja afuera:
   todavía quedan memorias en inglés, busca de nuevo con la consulta en inglés.
 - Pon `user_stated` sólo cuando la memoria es lo que dijo la persona: sus
   palabras, una corrección o una instrucción explícita. Déjalo afuera para lo
-  que inferiste, encontraste o concluiste. Sin él la memoria es tuya: un par en
-  conflicto marca un save común como inferred y un save con `derived_from` como
-  conclusion; un lado sin marca puede ser de la persona.
+  que inferiste, encontraste o concluiste. Un save declarado lleva sólo lo que
+  dijo la persona: lo que le sumas (una ruta, un motivo, una regla de la
+  documentación del proyecto) va en otro save, sin `user_stated`. Sin él la
+  memoria es tuya: un par en conflicto marca un save común como inferred y un
+  save con `derived_from` como conclusion; un lado sin marca puede ser de la
+  persona.
 
 ## Tipo e importancia
 
