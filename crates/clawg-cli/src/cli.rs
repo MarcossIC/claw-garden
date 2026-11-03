@@ -1834,7 +1834,7 @@ mod tests {
         );
 
         assert_eq!(move_opts(&["--undo", "4"]).request(None, None), MoveRequest { undo: Some(4), ..MoveRequest::default() });
-        assert_eq!(move_opts(&["--agent", "a", "--to-none"]).request(None, None).to_none, true);
+        assert!(move_opts(&["--agent", "a", "--to-none"]).request(None, None).to_none);
 
         for bad in [
             vec!["--id", "3"],
