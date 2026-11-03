@@ -865,6 +865,23 @@ pub enum MemoriesAction {
     Stats(StatsOpts),
 }
 
+impl ProjectsAction {
+    /// The `--profile` the action was given, whichever action it is.
+    pub fn profile(&self) -> &ProfileArg {
+        match self {
+            ProjectsAction::List { profile }
+            | ProjectsAction::Rename { profile, .. }
+            | ProjectsAction::Create { profile, .. }
+            | ProjectsAction::Locate { profile, .. }
+            | ProjectsAction::Add { profile, .. }
+            | ProjectsAction::KeepApart { profile, .. } => profile,
+            ProjectsAction::Move(o) => &o.profile,
+            ProjectsAction::Merge(o) => &o.profile,
+            ProjectsAction::Delete(o) => &o.profile,
+        }
+    }
+}
+
 impl MemoriesAction {
     /// The `--profile` the action was given, whichever action it is.
     pub fn profile(&self) -> &ProfileArg {
@@ -1708,6 +1725,27 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["clawg", "projects", "rename", "app-1a2b"]).is_err(), "the name is required");
         assert!(Cli::try_parse_from(["clawg", "projects", "list", "extra"]).is_err(), "list takes no argument");
+    }
+
+    #[test]
+    fn each_projects_action_names_its_profile() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().expect("a unicode temp dir");
+        for args in [
+            &["list"][..],
+            &["rename", "app-1a2b", "App"],
+            &["create", "Ideas"],
+            &["locate", "app-1a2b", dir],
+            &["add", dir],
+            &["move", "--to-none", "--id", "4"],
+            &["merge", "old-1", "--into", "app-1a2b"],
+            &["delete", "app-1a2b"],
+            &["keep-apart", "app-1a2b", "old-1"],
+        ] {
+            let line: Vec<&str> = ["clawg", "projects"].iter().chain(args).chain(&["--profile", "dev"]).copied().collect();
+            let Command::Projects { action } = parse(&line).command else { panic!("{line:?} is a projects action") };
+            assert_eq!(action.profile(), &ProfileArg { profile: Some("dev".into()) }, "{line:?}");
+        }
     }
 
     #[test]

@@ -1,17 +1,40 @@
 //! The JSON `clawg status` prints.
 //!
-//! Assembled by a pure function so the shape is under test without a daemon:
-//! the command itself only resolves a profile, does two lookups and prints.
+//! Assembled by a pure function so the shape is under test without a daemon;
+//! [`command`] does the lookups and leaves the printing to `main`.
 
 use std::path::Path;
 
-use clawg_core::memory::backup::{ProbeState, SchemaPlan, StoreProbe};
+use clawg_core::memory::backup::{probe, ProbeState, SchemaPlan, StoreProbe};
 use clawg_core::memory::MemoryError;
 use clawg_core::paths::Profile;
 use serde_json::{json, Value};
 
-use crate::client::Health;
-use crate::daemon::lifecycle::DaemonState;
+use crate::client::{DaemonClient, Health};
+use crate::daemon::lifecycle::{read_state, DaemonState};
+
+/// What `clawg status` prints for the profile's data directory, and the code
+/// it exits with: 0 when a daemon answers, 1 when none does. The non-zero
+/// exit is what makes it usable from a shell script:
+/// `clawg status >/dev/null || clawg serve &`.
+pub async fn command(profile: Profile, base_dir: &Path) -> (String, u8) {
+    let state = read_state(base_dir);
+
+    // A state file proves only that a daemon once ran here. Liveness is
+    // whatever `/health` says, and nothing else.
+    let health = match DaemonClient::from_data_dir(base_dir) {
+        Some(client) => client.health().await.ok(),
+        None => None,
+    };
+
+    let running = health.is_some();
+    // Only without a daemon: a running one has already opened the
+    // store, and its health says how that went.
+    let store = if running { None } else { Some(probe(base_dir)) };
+    let report = status_report(profile, base_dir, state.as_ref(), health.as_ref(), store.as_ref());
+    let text = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string());
+    (text, if running { 0 } else { 1 })
+}
 
 /// Builds the status document.
 ///
@@ -72,6 +95,7 @@ fn store_block(probe: &StoreProbe) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::tests::{publish, start_daemon};
 
     fn state() -> DaemonState {
         DaemonState {
@@ -206,6 +230,35 @@ mod tests {
                 assert!(v.get(key).is_some(), "missing {key} in {v}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn status_without_a_daemon_reports_the_store_and_exits_1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let (out, code) = command(Profile::Dev, dir.path()).await;
+
+        let v: Value = serde_json::from_str(&out).expect("the status is JSON");
+        assert_eq!(v["running"], false);
+        assert!(v["daemon"].is_null() && v["health"].is_null(), "{v}");
+        assert_eq!(v["store"]["state"], "missing");
+        assert_eq!(out, serde_json::to_string_pretty(&v).expect("json"), "printed pretty");
+        assert_eq!(code, 1, "a script reads a missing daemon from the exit code");
+    }
+
+    #[tokio::test]
+    async fn status_with_a_daemon_reports_its_health_and_exits_0() {
+        let d = start_daemon().await;
+        publish(&d);
+
+        let (out, code) = command(Profile::Dev, d.dir.path()).await;
+
+        let v: Value = serde_json::from_str(&out).expect("the status is JSON");
+        assert_eq!(v["running"], true);
+        assert_eq!(v["daemon"]["pid"], std::process::id());
+        assert_eq!(v["health"]["status"], "ok");
+        assert!(v["store"].is_null(), "a running daemon's store is not probed: {v}");
+        assert_eq!(code, 0);
     }
 
     #[test]

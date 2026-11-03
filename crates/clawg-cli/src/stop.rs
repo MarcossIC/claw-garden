@@ -6,7 +6,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+use clawg_core::paths::Profile;
+use clawg_core::preferences::Lang;
+
 use crate::client::{ClientError, DaemonClient};
+use crate::error::CliError;
 use crate::process::{Exit, Watched};
 
 /// How long `clawg stop` waits for the daemon to end. A shutdown goes through
@@ -21,6 +25,35 @@ use crate::process::{Exit, Watched};
 /// all five with room to spare, so the installer never replaces the binary
 /// while the daemon is still writing.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `clawg stop`: stops the profile's daemon in `base_dir` and says so in
+/// `lang`. Returns only once the process has ended, so `clawg stop && clawg
+/// serve` cannot lose the race for the lock, and an installer can replace
+/// `clawg.exe` right after.
+pub async fn command(lang: Lang, profile: Profile, base_dir: &Path) -> Result<String, CliError> {
+    let pid = stop_in(base_dir, STOP_TIMEOUT).await.map_err(|e| CliError::Failed(explain(lang, e, profile)))?;
+    Ok(report(lang, profile, pid))
+}
+
+/// The line printed once the daemon has ended.
+pub fn report(lang: Lang, profile: Profile, pid: u32) -> String {
+    let name = profile.as_str();
+    match lang {
+        Lang::En => format!("stopped the {name} daemon (pid {pid})"),
+        Lang::Es => format!("se detuvo el daemon {name} (pid {pid})"),
+    }
+}
+
+/// Why nothing was stopped: no daemon names the profile, and any other
+/// failure is shown as it came.
+pub fn explain(lang: Lang, err: ClientError, profile: Profile) -> String {
+    let name = profile.as_str();
+    match (err, lang) {
+        (ClientError::NotRunning, Lang::En) => format!("no clawg daemon is running for profile {name}"),
+        (ClientError::NotRunning, Lang::Es) => format!("no hay ningún daemon de clawg corriendo para el perfil {name}"),
+        (other, _) => other.to_string(),
+    }
+}
 
 /// Stops the daemon published in `base_dir` and returns its pid once the
 /// process has ended.
@@ -52,7 +85,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use clawg_core::paths::Profile;
     use clawg_core::runtime::MemoryRuntime;
 
     use crate::daemon::api::{router, AppCtx, SAVE_CONFIRM_TIMEOUT};
@@ -89,6 +121,26 @@ mod tests {
         )
         .expect("write state");
         write_token(dir, TOKEN).expect("write token");
+    }
+
+    #[tokio::test]
+    async fn a_missing_daemon_is_named_in_both_languages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let en = command(Lang::En, Profile::Dev, dir.path()).await.expect_err("nothing to stop");
+        let es = command(Lang::Es, Profile::Dev, dir.path()).await.expect_err("nothing to stop");
+
+        assert_eq!(en.to_string(), "no clawg daemon is running for profile dev");
+        assert_eq!(es.to_string(), "no hay ningún daemon de clawg corriendo para el perfil dev");
+        let late = ClientError::StopTimeout { pid: 7, timeout: Duration::from_secs(1) };
+        let cause = late.to_string();
+        assert_eq!(explain(Lang::Es, late, Profile::Dev), cause, "any other failure is shown as it came");
+    }
+
+    #[test]
+    fn the_stop_line_speaks_both_languages() {
+        assert_eq!(report(Lang::En, Profile::Dev, 42), "stopped the dev daemon (pid 42)");
+        assert_eq!(report(Lang::Es, Profile::Prod, 42), "se detuvo el daemon prod (pid 42)");
     }
 
     #[tokio::test]
