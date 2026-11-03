@@ -364,19 +364,80 @@ fn third_party_actions_are_pinned_to_a_commit() {
     }
 }
 
+/// Each `cargo clippy` command among a workflow's lines, joined with the lines
+/// that continue it: a trailing `\` in bash, a trailing `` ` `` in PowerShell,
+/// the default shell of a Windows runner.
+fn clippy_commands(lines: &[String]) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut rest = lines.iter();
+    while let Some(line) = rest.next() {
+        if !line.contains("cargo clippy") {
+            continue;
+        }
+        let mut command = line.trim().to_string();
+        while let Some(head) = command.strip_suffix(['\\', '`']) {
+            let next = rest.next().map_or("", |l| l.trim());
+            command = format!("{} {next}", head.trim_end()).trim_end().to_string();
+        }
+        commands.push(command);
+    }
+    commands
+}
+
+/// The words of `command` that set a lint level.
+fn lint_level_flags(command: &str) -> Vec<&str> {
+    let sets_a_level = |word: &&str| {
+        ["-A", "-W"].iter().any(|flag| word.starts_with(flag))
+            || ["--allow", "--warn", "--cap-lints"].iter().any(|flag| *word == *flag || word.starts_with(&format!("{flag}=")))
+    };
+    command.split_whitespace().filter(sets_a_level).collect()
+}
+
+#[test]
+fn clippy_commands_join_what_a_shell_continues() {
+    let lines = [
+        "      - run: cargo clippy --locked -- -D warnings",
+        "      - run: |",
+        "          cargo clippy --locked \\",
+        "            --workspace \\",
+        "            -- -A clippy::all",
+        "          cargo test --locked",
+        "      - run: cargo clippy `",
+        "          --cap-lints=allow",
+        "      - run: cargo test \\",
+        "          --locked",
+        "      - run: cargo clippy \\",
+    ]
+    .map(String::from);
+    assert_eq!(
+        clippy_commands(&lines),
+        [
+            "- run: cargo clippy --locked -- -D warnings",
+            "cargo clippy --locked --workspace -- -A clippy::all",
+            "- run: cargo clippy --cap-lints=allow",
+            "- run: cargo clippy",
+        ]
+    );
+}
+
+#[test]
+fn lint_level_flags_tells_a_level_from_other_flags() {
+    let levels = "cargo clippy -A clippy::all -Wclippy::pedantic --allow a --warn=b --cap-lints allow --cap-lints=warn";
+    assert_eq!(lint_level_flags(levels), ["-A", "-Wclippy::pedantic", "--allow", "--warn=b", "--cap-lints", "--cap-lints=warn"]);
+
+    let fine = lint_level_flags("cargo clippy --fix --allow-dirty --locked --workspace --all-targets -p clawg-cli -- -D warnings");
+    assert!(fine.is_empty(), "{fine:?}");
+}
+
 #[test]
 fn no_workflow_turns_clippy_lints_off() {
     // Which lints run is [workspace.lints.clippy] of the root manifest; a
     // command only makes them fail.
     let mut seen = 0;
     for name in workflow_files() {
-        for line in workflow_code(&name).iter().filter(|l| l.contains("cargo clippy")) {
-            let sets_a_level = |word: &&str| {
-                ["-A", "-W"].iter().any(|flag| word.starts_with(flag))
-                    || ["--allow", "--warn", "--cap-lints"].iter().any(|flag| *word == *flag || word.starts_with(&format!("{flag}=")))
-            };
-            let flags: Vec<&str> = line.split_whitespace().filter(sets_a_level).collect();
-            assert!(flags.is_empty(), "{name} runs `{}` with {flags:?}", line.trim());
+        for command in clippy_commands(&workflow_code(&name)) {
+            let flags = lint_level_flags(&command);
+            assert!(flags.is_empty(), "{name} runs `{command}` with {flags:?}");
             seen += 1;
         }
     }
