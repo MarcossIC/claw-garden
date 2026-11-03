@@ -1827,7 +1827,7 @@ mod tests {
 
     use crate::client::{ErrorDetails, ListArgs, ReplacedMemory, SaveArgs, SaveOutcome, SavedMemory};
     use crate::daemon::api::{router, AppCtx, MAX_CONTENT_BYTES, SAVE_CONFIRM_TIMEOUT};
-    use crate::mcp::protocol::PROTOCOL;
+    use crate::mcp::protocol::{PROTOCOL, PROTOCOL_ES};
     use crate::mcp::tools::CONTENT_PREVIEW_LIMIT;
 
     /// Brings up an in-process daemon and returns a bridge pointed at it.
@@ -2741,10 +2741,29 @@ mod tests {
     #[test]
     fn the_protocol_describes_the_session_summary() {
         let summary = PROTOCOL.split("\n## Session summary").nth(1).expect("a session summary section");
-        for section in ["Goal:", "Instructions:", "Discoveries:", "Accomplished:", "Next steps:", "Relevant files:"] {
+        for section in
+            ["Goal:", "Instructions:", "Discoveries:", "Accomplished:", "Next steps:", "Relevant files:", "Validation:"]
+        {
             assert!(summary.contains(section), "{section} missing");
         }
         assert!(PROTOCOL.contains("\n## After a compaction"), "{PROTOCOL}");
+    }
+
+    #[test]
+    fn the_spanish_protocol_describes_the_session_summary() {
+        let summary = PROTOCOL_ES.split("\n## Resumen de sesión").nth(1).expect("a session summary section");
+        let summary = summary.split("\n## ").next().unwrap_or(summary);
+        for section in [
+            "Objetivo:",
+            "Instrucciones:",
+            "Descubrimientos:",
+            "Logrado:",
+            "Próximos pasos:",
+            "Archivos relevantes:",
+            "Validación:",
+        ] {
+            assert!(summary.contains(section), "{section} missing");
+        }
     }
 
     /// A tool renamed or dropped, or a misspelt type, would otherwise leave

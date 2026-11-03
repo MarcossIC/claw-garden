@@ -129,6 +129,7 @@ Al final de una sesión larga, o antes de que se compacte el contexto, guarda un
 - Próximos pasos: lo que sigue, en orden.
 - Archivos relevantes: las rutas que importan, cada una con una línea sobre
   por qué.
+- Validación: el comando exacto que comprueba el trabajo.
 
 El resumen más nuevo del proyecto abre el contexto de la sesión siguiente,
 bajo LAST SESSION, pregunte lo que pregunte primero esa sesión.
