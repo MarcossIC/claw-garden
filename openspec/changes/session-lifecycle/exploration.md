@@ -63,6 +63,8 @@ Un hook `SubagentStart` podría darle al subagente el workspace y las preferenci
 
 Sumar una línea «Validation: the exact command that checks the work» a las secciones del `session_summary` (`protocol.md:117-125`, y su par en `protocol.es.md`). No cambia código ni datos; cambia el contrato que fija `agent_contract.json` sólo si la línea entra en la apertura, y no entra. Se verifica con los tests que comparan los dos protocolos y con una tarea reanudada de 96.
 
+**Aplicada** en `0c172da`, antes que el resto del cambio, que sigue abierto por A, B, C y D. La línea cierra las secciones en `protocol.md` («- Validation: the exact command that checks the work.») y en `protocol.es.md` («- Validación: el comando exacto que comprueba el trabajo.»). Queda en «Session summary», fuera de la apertura, así que `agent_contract.json` y `agent_contract.es.json` no cambiaron. La piden `the_protocol_describes_the_session_summary` y `the_spanish_protocol_describes_the_session_summary` (`crates/clawg-cli/src/mcp/server.rs`). Falta, para cuando el cambio se archive: [`specs/mcp`](../../specs/mcp/spec.md) habla de las «seis partes» del resumen y no nombra esa prueba en español, y el criterio `summary_sections` de la rúbrica de agent-eval (`SUMMARY_SECTIONS_EN` y `_ES`, `crates/clawg-eval/src/bin/agent-eval/rubric.rs:20-22`) sigue pidiendo las seis; si pide también la séptima lo decide la tarea reanudada de 96.
+
 ## Descartado
 
 - **Una herramienta `claw_handoff(save|load)` y un esquema validado de 400 tokens.** `save_memory` con `memory_type = session_summary` y LAST SESSION ya hacen el `save` y el `load`. Validar campos obligatorios pide parsear el texto de un save, cosa que clawg no hace con ningún tipo, y suma una herramienta al contrato del agente.
@@ -83,7 +85,7 @@ Sumar una línea «Validation: the exact command that checks the work» a las se
 | B | Investigar | Medio | Medio (formato no documentado) | Bajo |
 | C | Investigar | Medio | Medio (escritura no pedida) | Bajo |
 | D | Posponer | Bajo hasta medirlo | Bajo | Bajo |
-| E | Incorporar | Bajo a Medio | Bajo | Bajo |
+| E | Incorporar (aplicada) | Bajo a Medio | Bajo | Bajo |
 
 ## Fuentes
 
