@@ -1,16 +1,17 @@
 change: embedder-footprint
 objective: "transversal"
 depends_on: []
-phase: apply
+phase: archived
+release: "0.71.0"  # 09d3804, la tarea 1, su único código; al archivar la versión no sube (verify.md, «Al archivar»)
 artifacts:
   exploration: done
   proposal: done
-  spec: done  # EF1, delta sobre specs/storage («Los mismos vectores que fastembed»)
+  spec: done  # EF1, en specs/storage («Los mismos vectores que fastembed»)
   design: skipped  # sin decisión de arquitectura: el respaldo es una función pura y la puerta es medición
   tasks: done
   apply: done  # tarea 1 en 09d3804; la puerta (tarea 2) cerró sin abrir ninguna opción, así que no hay tarea 3
   verify: done  # 2.1 a 2.5 y la decisión de 2.7, en verify.md
-  archive: pending
+  archive: done
 gates:
   C: dropped  # 2.1 abre: con el modelo suelto quedan vivos los hilos de rayon, tantos como lógicos: 16 en Windows y 4 en Linux; 2.3: +1,1 % de tiempo, -1,0 % de CPU, -20 MiB, ganancia marginal; se decidió no entrar
   A: dropped  # 2.2 no abre en Windows (mediana -0,073 s) ni en Linux (mediana 0,00 s), umbral +0,6 s; 2.3 en Windows, en frío: +3,0 % de tiempo por -0,2 % de CPU
@@ -18,4 +19,7 @@ gates:
   E: dropped  # 2.5: abre si las dos codificaciones de más pesan al menos 5 % de un guardado de 64 KiB; pesan 1,07 % en Linux y 1,43 % en Windows (mediana de 5)
   arena: dropped  # 2.4 en Linux, 4 hilos: con 2 arenas el p99 sube 2,3 % (+95 ms), contra una baja de al menos 22 % y 20 ms; queda una arena
   D: dropped  # pasó a docs-index-speed
+after_archive:  # fuera del cambio
+  - "pasar la etapa split a spawn_blocking, la otra mitad de E, que el umbral no cubre: en «Backlog sin spec» de openspec/README.md"
+main_spec: openspec/specs/storage/spec.md
 updated: 2026-11-03

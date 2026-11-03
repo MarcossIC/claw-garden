@@ -386,7 +386,7 @@ Para leer los números:
 | A, sin espera activa | 2.2: mediana ≥ +0,6 s de CPU tras una tanda. 2.3: pasando de +2 % de tiempo, ganar al menos 22 % de CPU o de memoria, sin ser marginal | 2.2: −0,073 s en Windows y 0,00 s en Linux. 2.3 en Windows, en frío: +3,0 % de tiempo por −0,2 % de CPU | Se descarta |
 | B, menos hilos | 2.3: techo de tiempo, el menor entre +5 % y +60 s | 2.3 en Windows, ronda 1: 8 hilos, +40,2 % de tiempo por −13,1 % de CPU; 4 hilos, +86,1 % por −38,0 % | Se descarta |
 | C, tokenizer en serie | 2.1: hilos de más sostenidos con el modelo suelto. 2.3: una ganancia que no sea marginal, 1 núcleo o 100 MiB; si no, decisión expresa | 2.1: 16 hilos de más en Windows y 4 en Linux, abre. 2.3 en Windows, en frío: +1,1 % de tiempo, −1,0 % de CPU, −19,8 MiB de pico | Abrió por 2.1 y no entra: ganancia marginal |
-| D, ordenar las tandas por largo | Sin umbral en este cambio | Sin número en este cambio | Pasó a [docs-index-speed](../archive/2026-11-01-docs-index-speed/proposal.md) (95), que lo decidió con sus puertas |
+| D, ordenar las tandas por largo | Sin umbral en este cambio | Sin número en este cambio | Pasó a [docs-index-speed](../2026-11-01-docs-index-speed/proposal.md) (95), que lo decidió con sus puertas |
 | E, codificar una sola vez | 2.5: las dos codificaciones de más, sobre las tres más la tanda, mediana de 5 guardados de 64 KiB. Abre con 5 % o más | 1,07 % en Linux y 1,43 % en Windows. El peor guardado, 1,43 % y 1,62 % | No abre |
 | Arena, D6 de embedder-idle-unload | 2.4, con 2 arenas, las tres: el p99 baja al menos 22 % y 20 ms, el refresco no sube más que el menor entre +5 % y +60 s, el pico de `RssAnon` sube menos de 100 MiB | 2.4 en Linux, 4 hilos: p99 +2,3 % (+95 ms), refresco −2,6 % (−9,9 s), pico +13,0 MiB | Queda una arena |
 
@@ -403,3 +403,9 @@ Lo que estas lecturas no cubren: la arena se midió sólo en Linux con 4 hilos, 
 ## Pendiente
 
 - Nada de la puerta. 2.6 no se corre: no entra ningún cambio de hilos, de espera activa ni de tokenizer, así que no hay combinación que comprobar.
+
+## Al archivar (2026-11-03)
+
+- EF1 pasó a [`specs/storage`](../../../specs/storage/spec.md), «Los mismos vectores que fastembed», con su línea de origen y sus dos escenarios. De la frase que reemplazaba queda lo que no es de hilos, el proveedor de CPU sin arena y la optimización de nivel 3: sigue siendo así y EF1 no lo repite. Las citas de línea son las de `b100e16`.
+- La tarea 1 (`09d3804`), el único código de este cambio, ya salió: `git tag --contains 09d3804` da `v0.71.0` y `v0.72.2`, así que la primera versión publicada es 0.71.0.
+- **La versión no sube.** `Cargo.toml` queda en 0.73.0, aunque `openspec/README.md` y `openspec/config.yaml` digan que archivar sube el minor. 0.73.0 no tiene tag y ya trae el código de los cambios archivados, y subirla dejaría falsas las notas «sale en 0.73.0». Es la excepción que ya se aplicó al archivar project-registry y project-locators.
