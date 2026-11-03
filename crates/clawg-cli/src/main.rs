@@ -9,13 +9,11 @@
 //! where a usage error is `1`: a client reads `2` from a hook as "block", and a
 //! client that ignores a hook's `args` runs the binary alone.
 
-#[cfg(windows)]
-use std::path::Path;
 use std::process::ExitCode;
 
 use clawg_cli::backup;
 use clawg_cli::cli::{
-    is_bare_invocation, is_hook_invocation, preferences_profile, sharing_profile, Cli, Command, MetricsAction, PathAction,
+    is_bare_invocation, is_hook_invocation, preferences_profile, sharing_profile, Cli, Command, MetricsAction,
     ProfileArg, SetupClient,
 };
 use clawg_cli::daemon::lifecycle::now_ms;
@@ -40,6 +38,7 @@ use clawg_cli::status;
 use clawg_cli::stop;
 use clawg_cli::undelete;
 use clawg_cli::update;
+use clawg_cli::user_path;
 use clawg_core::memory::embedder::keep_one_malloc_arena;
 use clawg_core::paths::data_dir;
 
@@ -282,53 +281,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::from(code))
         }
 
-        Command::Path { action } => run_path(action),
+        Command::Path { action } => {
+            println!("{}", user_path::command(action)?);
+            Ok(ExitCode::SUCCESS)
+        }
     }
-}
-
-/// `clawg path add|remove`. Idempotent on purpose: the installer runs it on
-/// every install and uninstall, and "already there" is success, not failure.
-#[cfg(windows)]
-fn run_path(action: PathAction) -> Result<ExitCode, CliError> {
-    use clawg_cli::user_path::{registry, Change};
-
-    let (dir, adding) = match action {
-        PathAction::Add { dir } => (dir, true),
-        PathAction::Remove { dir } => (dir, false),
-    };
-    let dir = match dir {
-        Some(dir) => dir,
-        None => std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_path_buf))
-            .ok_or_else(|| CliError::Failed("cannot locate the directory of this clawg binary; pass --dir".into()))?,
-    };
-    let dir = dir.to_str().ok_or_else(|| CliError::Failed("the directory is not valid Unicode".into()))?;
-
-    let change = if adding {
-        registry::add(registry::ENVIRONMENT_KEY, dir)
-    } else {
-        registry::remove(registry::ENVIRONMENT_KEY, dir)
-    }
-    .map_err(|e| CliError::Failed(format!("could not update the user PATH: {e}")))?;
-
-    if matches!(change, Change::Added | Change::Removed) {
-        registry::broadcast_environment_change();
-    }
-    match change {
-        Change::Added => println!("added {dir} to the user PATH; new terminals will find clawg"),
-        Change::AlreadyPresent => println!("{dir} is already on the user PATH"),
-        Change::Removed => println!("removed {dir} from the user PATH"),
-        Change::NotPresent => println!("{dir} was not on the user PATH"),
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-#[cfg(not(windows))]
-fn run_path(_action: PathAction) -> Result<ExitCode, CliError> {
-    Err(CliError::Failed(
-        "`clawg path` manages the Windows user PATH; on this platform, add the \
-         directory holding clawg to your shell profile instead"
-            .to_string(),
-    ))
 }

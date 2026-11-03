@@ -15,6 +15,55 @@
 //! The user PATH is normally `REG_EXPAND_SZ`; rewriting it as `REG_SZ` would
 //! silently stop every `%VAR%` entry in it from expanding.
 
+use crate::cli::PathAction;
+use crate::error::CliError;
+
+/// `clawg path add|remove`: what it did to the user PATH. Idempotent on
+/// purpose: the installer runs it on every install and uninstall, and
+/// "already there" is success, not failure.
+#[cfg(windows)]
+pub fn command(action: PathAction) -> Result<String, CliError> {
+    let (dir, adding) = match action {
+        PathAction::Add { dir } => (dir, true),
+        PathAction::Remove { dir } => (dir, false),
+    };
+    let dir = match dir {
+        Some(dir) => dir,
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .ok_or_else(|| CliError::Failed("cannot locate the directory of this clawg binary; pass --dir".into()))?,
+    };
+    let dir = dir.to_str().ok_or_else(|| CliError::Failed("the directory is not valid Unicode".into()))?;
+
+    let change = if adding {
+        registry::add(registry::ENVIRONMENT_KEY, dir)
+    } else {
+        registry::remove(registry::ENVIRONMENT_KEY, dir)
+    }
+    .map_err(|e| CliError::Failed(format!("could not update the user PATH: {e}")))?;
+
+    if matches!(change, Change::Added | Change::Removed) {
+        registry::broadcast_environment_change();
+    }
+    Ok(match change {
+        Change::Added => format!("added {dir} to the user PATH; new terminals will find clawg"),
+        Change::AlreadyPresent => format!("{dir} is already on the user PATH"),
+        Change::Removed => format!("removed {dir} from the user PATH"),
+        Change::NotPresent => format!("{dir} was not on the user PATH"),
+    })
+}
+
+/// `clawg path` everywhere else: there is no user PATH to change.
+#[cfg(not(windows))]
+pub fn command(_action: PathAction) -> Result<String, CliError> {
+    Err(CliError::Failed(
+        "`clawg path` manages the Windows user PATH; on this platform, add the \
+         directory holding clawg to your shell profile instead"
+            .to_string(),
+    ))
+}
+
 /// What a change to the PATH did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Change {
@@ -208,6 +257,17 @@ mod tests {
     /// matches without case.
     fn vars(name: &str) -> Option<String> {
         name.eq_ignore_ascii_case("LOCALAPPDATA").then(|| r"C:\Users\dev\AppData\Local".to_string())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn outside_windows_the_path_command_says_what_to_do_instead() {
+        let err = command(crate::cli::PathAction::Add { dir: None }).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`clawg path` manages the Windows user PATH; on this platform, add the directory holding clawg to your \
+             shell profile instead"
+        );
     }
 
     // ── with_entry ──────────────────────────────────────────────────────────
