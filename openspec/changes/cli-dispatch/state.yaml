@@ -1,14 +1,15 @@
 change: cli-dispatch
 objective: "transversal"
 depends_on: []
-phase: explore
+phase: apply
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done
+  proposal: done  # enfoque A; un error se traduce en el módulo del comando, con su explain
+  spec: done  # CD1 a CD4
+  design: skipped  # las alternativas están en la exploración (A, B, C) y en la decisión 2 de la propuesta
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-01
+main_spec: openspec/specs/quality/spec.md
+updated: 2026-11-03
