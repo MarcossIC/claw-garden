@@ -205,7 +205,7 @@ pub fn plan_refresh(disk: &[(String, String)], stored: &[Fingerprint], model_id:
 /// Whether a project whose last refresh started at `last_started` is due for
 /// another at `now`.
 pub fn needs_refresh(last_started: Option<Instant>, now: Instant, interval: Duration) -> bool {
-    last_started.map_or(true, |t| now.saturating_duration_since(t) >= interval)
+    last_started.is_none_or(|t| now.saturating_duration_since(t) >= interval)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -793,12 +793,11 @@ async fn write_queued(
 fn embed_shares(total: Duration, texts: &[usize]) -> Vec<Duration> {
     let all: u128 = texts.iter().map(|&n| n as u128).sum();
     let mut shares = vec![0u128; texts.len()];
-    if all > 0 {
+    if let Some(last) = texts.iter().rposition(|&n| n > 0) {
         let nanos = total.as_nanos();
         for (share, &n) in shares.iter_mut().zip(texts) {
             *share = nanos * n as u128 / all;
         }
-        let last = texts.iter().rposition(|&n| n > 0).expect("some doc has texts");
         shares[last] += nanos - shares.iter().sum::<u128>();
     }
     shares.into_iter().map(|n| Duration::new((n / 1_000_000_000) as u64, (n % 1_000_000_000) as u32)).collect()
@@ -1970,7 +1969,7 @@ old
         for (a, b) in partly.0.iter().zip(&full.0) {
             assert_eq!((&a.0, a.1, &a.2, &a.3), (&b.0, b.1, &b.2, &b.3));
             let decode = |blob: &[u8]| -> Vec<f32> {
-                blob.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+                blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect()
             };
             let (x, y) = (decode(&a.4), decode(&b.4));
             let cosine: f32 = x.iter().zip(&y).map(|(p, q)| p * q).sum();
@@ -2612,7 +2611,7 @@ old
             println!("median of {runs}: {}: {:.2?}", names[k], median(&took[k]));
         }
 
-        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
+        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect() };
         let differences: Vec<f32> = blobs[0]
             .iter()
             .zip(&blobs[1])
@@ -2626,12 +2625,15 @@ old
         );
     }
 
-    /// Measures the ceiling of ordering passages by tokens across docs against
-    /// the order of a refresh (inside each doc), on docs of every size, with the
-    /// real model. The two alternate in one process so drift in the machine
-    /// hits both alike. `CLAWG_EMBED_PASSAGES` is about how many passages the
+    /// Measures, with the real model, three orders of the passages of docs of
+    /// every size: sorted inside each doc, sorted in each call of the queue of
+    /// a refresh (`QUEUE_PASSAGES`, through the flush production embeds), and
+    /// all of them sorted across docs, which is the ceiling of the queue. They
+    /// take turns in one process so drift in the machine hits all three alike,
+    /// and the queue and the ceiling report how many vectors keep the bits they
+    /// had in each doc. `CLAWG_EMBED_PASSAGES` is about how many passages the
     /// sample holds (5000 by default, `0` for the whole corpus) and
-    /// `CLAWG_EMBED_RUNS` how many pairs run (3 by default).
+    /// `CLAWG_EMBED_RUNS` how many rounds of the three run (3 by default).
     #[tokio::test]
     #[ignore = "a measurement: needs CLAWG_E5_MODEL_DIR; run it with `cargo test -p clawg-core --lib -- --ignored sorting_across_docs --nocapture`"]
     async fn sorting_across_docs_against_sorting_in_each_doc() {
@@ -2646,31 +2648,59 @@ old
         let texts: Vec<String> = docs.iter().flat_map(|d| d.1.iter().cloned()).collect();
         let passages = texts.len();
         assert!(passages > 0, "the sample holds no passage");
+        let groups = queue_groups(QUEUE_PASSAGES, &docs.iter().map(|d| d.1.len()).collect::<Vec<_>>());
         println!(
-            "{} docs, {passages} passages, {} docs of more than {EMBED_BATCH} passages",
+            "{} docs, {passages} passages, {} docs of more than {EMBED_BATCH} passages, {} calls in a queue of {QUEUE_PASSAGES}",
             docs.len(),
             docs.iter().filter(|d| d.1.len() > EMBED_BATCH).count(),
+            groups.len(),
         );
 
         let lengths = passage_token_counts(&tokenizer, &embedder, &texts).unwrap();
+        let mut rest = &lengths[..];
+        let own_lengths: Vec<&[usize]> = docs
+            .iter()
+            .map(|(_, doc)| {
+                let (own, after) = rest.split_at(doc.len());
+                rest = after;
+                own
+            })
+            .collect();
         let padded = |sent: &[usize]| -> usize { sent.chunks(EMBED_BATCH).map(|c| c.len() * c.iter().max().unwrap()).sum() };
-        let mut in_each_doc = 0;
-        let mut from = 0;
-        for (_, doc) in &docs {
-            let own = &lengths[from..from + doc.len()];
-            from += doc.len();
-            let sent: Vec<usize> = if doc.len() > EMBED_BATCH { longest_first(own).into_iter().map(|k| own[k]).collect() } else { own.to_vec() };
-            in_each_doc += padded(&sent);
-        }
-        let across: usize = padded(&longest_first(&lengths).into_iter().map(|k| lengths[k]).collect::<Vec<_>>());
+        let padded_as_sent = |call: &[usize]| -> usize {
+            if call.len() > EMBED_BATCH {
+                padded(&longest_first(call).into_iter().map(|k| call[k]).collect::<Vec<_>>())
+            } else {
+                padded(call)
+            }
+        };
+        let in_each_doc: usize = own_lengths.iter().map(|own| padded_as_sent(own)).sum();
+        let in_queue: usize = groups.iter().map(|g| padded_as_sent(&g.iter().flat_map(|&k| own_lengths[k].iter().copied()).collect::<Vec<_>>())).sum();
+        let across = padded_as_sent(&lengths);
         let real: usize = lengths.iter().sum();
-        println!("real tokens {real}; padded tokens: in each doc {in_each_doc}, across docs {across}, ratio {:.3}", across as f64 / in_each_doc as f64);
+        println!(
+            "real tokens {real}; padded tokens: in each doc {in_each_doc}, in the queue {in_queue}, across docs {across}; ratios to in each doc {:.3} and {:.3}",
+            in_queue as f64 / in_each_doc as f64,
+            across as f64 / in_each_doc as f64,
+        );
 
         let each_doc = || async {
             let clock = Instant::now();
             let mut blobs = Vec::with_capacity(passages);
             for (path, doc) in &docs {
                 blobs.extend(embed_passages(&embedder, Some(&*tokenizer), &[(path, doc.len())], doc.clone()).await.unwrap().remove(0).unwrap());
+            }
+            (clock.elapsed(), blobs)
+        };
+        let queue = || async {
+            let clock = Instant::now();
+            let mut blobs = Vec::with_capacity(passages);
+            for group in &groups {
+                let owners: Vec<(&str, usize)> = group.iter().map(|&k| (docs[k].0.as_str(), docs[k].1.len())).collect();
+                let texts: Vec<String> = group.iter().flat_map(|&k| docs[k].1.iter().cloned()).collect();
+                for doc in embed_passages(&embedder, Some(&*tokenizer), &owners, texts).await.unwrap() {
+                    blobs.extend(doc.unwrap());
+                }
             }
             (clock.elapsed(), blobs)
         };
@@ -2684,31 +2714,45 @@ old
             (clock.elapsed(), blobs)
         };
 
-        let mut ratios = Vec::new();
-        let mut last = (Vec::new(), Vec::new());
+        let names = ["in each doc", "in the queue", "across docs"];
+        let mut took: [Vec<f64>; 3] = Default::default();
+        let mut last: [Vec<Vec<u8>>; 3] = Default::default();
         for run in 0..runs {
-            let (a, in_blobs) = each_doc().await;
-            let (b, across_blobs) = across_docs().await;
-            let ratio = b.as_secs_f64() / a.as_secs_f64();
-            println!("run {run}: in each doc {a:.2?}, across docs {b:.2?}, ratio {ratio:.3}");
-            ratios.push(ratio);
-            last = (in_blobs, across_blobs);
+            for turn in 0..3 {
+                let k = (run + turn) % 3;
+                let (elapsed, blobs) = match k {
+                    0 => each_doc().await,
+                    1 => queue().await,
+                    _ => across_docs().await,
+                };
+                println!("run {run}: {}: {elapsed:.2?}", names[k]);
+                took[k].push(elapsed.as_secs_f64());
+                last[k] = blobs;
+            }
+            println!("run {run}: ratios to in each doc: in the queue {:.3}, across docs {:.3}", took[1][run] / took[0][run], took[2][run] / took[0][run]);
         }
-        ratios.sort_by(f64::total_cmp);
-        println!("median ratio across/in each doc of {runs} pairs: {:.3}", ratios[ratios.len() / 2]);
+        let median_ratio = |k: usize| {
+            let mut ratios: Vec<f64> = took[k].iter().zip(&took[0]).map(|(t, each)| t / each).collect();
+            ratios.sort_by(f64::total_cmp);
+            ratios[ratios.len() / 2]
+        };
+        println!("median ratio to in each doc of {runs} rounds: in the queue {:.3}, across docs {:.3}", median_ratio(1), median_ratio(2));
 
-        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
-        let differences: Vec<f32> = last
-            .0
-            .iter()
-            .zip(&last.1)
-            .map(|(a, b)| floats(a).iter().zip(floats(b)).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max))
-            .collect();
-        println!(
-            "{} of {passages} vectors with the same bits in either order, largest difference {:e}",
-            differences.iter().filter(|&&d| d == 0.0).count(),
-            differences.iter().copied().fold(0f32, f32::max),
-        );
+        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect() };
+        for k in 1..3 {
+            assert_eq!(last[k].len(), passages, "{} embedded every passage", names[k]);
+            let differences: Vec<f32> = last[0]
+                .iter()
+                .zip(&last[k])
+                .map(|(a, b)| floats(a).iter().zip(floats(b)).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max))
+                .collect();
+            println!(
+                "{}: {} of {passages} vectors with the same bits as in each doc, largest difference {:e}",
+                names[k],
+                differences.iter().filter(|&&d| d == 0.0).count(),
+                differences.iter().copied().fold(0f32, f32::max),
+            );
+        }
     }
 
     /// A passage as a call sees it: its tokens and the bytes of its text.

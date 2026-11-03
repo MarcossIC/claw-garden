@@ -836,9 +836,11 @@ fn reader_query(agent: Option<&str>) -> Vec<(&'static str, &str)> {
 enum Transport {
     /// TCP, and the socket on Unix.
     Http(reqwest::Client),
-    /// The socket on Windows, where reqwest cannot dial one.
+    /// The socket on Windows, where reqwest cannot dial one. Boxed, since
+    /// hyper's client is held inline and would size every [`DaemonClient`]
+    /// and every value holding one; reqwest's is one pointer.
     #[cfg(windows)]
-    AfUnix(AfUnixClient),
+    AfUnix(Box<AfUnixClient>),
 }
 
 #[cfg(windows)]
@@ -1019,7 +1021,7 @@ fn socket_transport(path: &Path) -> Option<Transport> {
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .pool_timer(TokioTimer::new())
         .build(crate::daemon::socket::Connector::new(path));
-    Some(Transport::AfUnix(client))
+    Some(Transport::AfUnix(Box::new(client)))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1366,6 +1368,7 @@ impl DaemonClient {
     /// empty or invalid change. `project` moves the row's save, `Some(None)`
     /// out of every project. `agent` names the agent the change is for; a row
     /// out of its reach comes back as not found.
+    #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
     pub async fn update(
         &self,
         kind: &str,

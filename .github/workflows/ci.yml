@@ -56,19 +56,19 @@ jobs:
           components: clippy
       # Pull requests only read the cache, which cache.yml writes from main, so
       # what a build script of a pull request leaves there never reaches main.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
-      # Compiler warnings are errors; clippy's own lints are not enforced yet.
-      # --locked everywhere: a Cargo.lock that trails Cargo.toml fails here
-      # instead of in release.yml, after the merge.
-      - run: cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings
+      # Compiler warnings and the lints of [workspace.lints.clippy] in the root
+      # Cargo.toml are errors. --locked everywhere: a Cargo.lock that trails
+      # Cargo.toml fails here instead of in release.yml, after the merge.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # Includes crates/clawg-cli/tests/binary.rs, which runs the built binary
       # against a temporary home with the fake model: nothing is downloaded.
       - run: cargo test --locked --workspace
       # What release.yml builds: --workspace turns on clawg-core's `testing` and
       # `eval`, and without --all-targets no dev-dependency, so neither, is in.
-      - run: cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings
+      - run: cargo clippy --locked -p clawg-cli -- -D warnings
       # The build_info tests of a build without `testing`. build_info has no
       # platform code, so Linux alone runs them.
       - run: cargo test --locked -p clawg-core --lib build_info

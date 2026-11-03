@@ -11,6 +11,9 @@ rust-version.workspace = true
 # No library target: this crate is only the evaluation binaries.
 autobins = false
 
+[lints]
+workspace = true
+
 # Directory name matches the declared bin name so cargo's `src/bin/*/main.rs`
 # autodiscovery converges on this same target instead of minting a second one
 # from the same path.

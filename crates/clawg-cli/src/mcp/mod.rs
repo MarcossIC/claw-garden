@@ -76,6 +76,7 @@ pub async fn run(profile: Profile, autostart: bool, agent: Option<String>) -> Re
 /// without a daemon still fail at once. The slow part, spawning and polling
 /// until the daemon answers, runs in a task started here so the daemon is
 /// already warming when the first tool arrives.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub(crate) async fn run_with<T>(
     profile: Profile,
     base_dir: &Path,

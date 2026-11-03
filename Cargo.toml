@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/clawg-cli", "crates/clawg-core", "crates/clawg-eval"]
 
 [workspace.package]
-version = "0.72.2"
+version = "0.73.0"
 authors = ["The Claw Garden contributors"]
 license = "MIT"
 repository = "https://github.com/MarcossIC/claw-garden"
@@ -64,6 +64,16 @@ tempfile = "3"
 
 clawg-core = { path = "crates/clawg-core" }
 clawg-cli = { path = "crates/clawg-cli" }
+
+# Clippy's lints for every package, each of which takes them with `[lints]
+# workspace = true`: the default group, futures large enough to overflow a
+# stack when they are moved, and that an exception is an `#[expect]` with a
+# reason where it applies. `cargo clippy -- -D warnings` fails on any of them.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+large_futures = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 
 # On Linux the debug info goes inside the executable (Windows keeps it in a
 # separate `.pdb`), and with all of it the `clawg` the update tests serve as a

@@ -777,7 +777,7 @@ mod tests {
     async fn the_pieces_of_one_save_are_one_version() {
         let found = invariants_of(|c| {
             let ids: Vec<i64> =
-                ["one", "two", "three"].iter().map(|t| insert(c, &Row { topic: Some("guide/setup"), ..row(*t) })).collect();
+                ["one", "two", "three"].iter().map(|t| insert(c, &Row { topic: Some("guide/setup"), ..row(t) })).collect();
             for (n, id) in ids.iter().enumerate() {
                 link(c, 7, n as i64 + 1, *id, if n == 0 { "" } else { "one" });
             }

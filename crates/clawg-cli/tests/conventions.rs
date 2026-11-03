@@ -148,10 +148,11 @@ fn read_repo_file(relative: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The value written for `key` inside `[section]` of a manifest, as the raw
-/// text after the `=`, without a trailing comment.
-fn manifest_value(manifest: &str, section: &str, key: &str) -> Option<String> {
+/// Each `key = value` written inside `[section]` of a manifest, the value as
+/// the raw text after the first `=`, without a trailing comment.
+fn manifest_entries(manifest: &str, section: &str) -> Vec<(String, String)> {
     let mut inside = false;
+    let mut entries = Vec::new();
     for line in manifest.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -162,13 +163,40 @@ fn manifest_value(manifest: &str, section: &str, key: &str) -> Option<String> {
             continue;
         }
         if let Some((name, value)) = line.split_once('=') {
-            if name.trim() == key {
-                let value = value.split(" #").next().unwrap_or(value);
-                return Some(value.trim().to_string());
-            }
+            let value = value.split(" #").next().unwrap_or(value);
+            entries.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
-    None
+    entries
+}
+
+/// The value written for `key` inside `[section]` of a manifest, as the raw
+/// text after the `=`, without a trailing comment.
+fn manifest_value(manifest: &str, section: &str, key: &str) -> Option<String> {
+    manifest_entries(manifest, section).into_iter().find(|(name, _)| name == key).map(|(_, value)| value)
+}
+
+#[test]
+fn every_package_takes_the_workspace_lints() {
+    // Cargo applies [workspace.lints] only to a package whose [lints] says
+    // `workspace = true`, and such a package cannot add lints of its own.
+    let root = read_repo_file("Cargo.toml");
+    let clippy = manifest_entries(&root, "workspace.lints.clippy");
+    let level = |lint: &str| clippy.iter().find(|(name, _)| name == lint).map(|(_, value)| value.as_str());
+    assert_eq!(level("all"), Some(r#"{ level = "warn", priority = -1 }"#), "the default group, below the lints named after it");
+    for lint in ["large_futures", "allow_attributes", "allow_attributes_without_reason"] {
+        assert_eq!(level(lint), Some(r#""warn""#), "clippy::{lint}");
+    }
+    let allowed: Vec<&str> = clippy.iter().filter(|(_, value)| value.contains(r#""allow""#)).map(|(name, _)| name.as_str()).collect();
+    assert!(allowed.is_empty(), "an exception is an #[expect] where it applies, not a workspace allow: {allowed:?}");
+
+    let members = manifest_value(&root, "workspace", "members").expect("the workspace lists its members");
+    let members: Vec<&str> = members.split('"').skip(1).step_by(2).collect();
+    assert!(!members.is_empty(), "no member read from {members:?}");
+    for member in members {
+        let manifest = read_repo_file(&format!("{member}/Cargo.toml"));
+        assert_eq!(manifest_value(&manifest, "lints", "workspace").as_deref(), Some("true"), "{member} takes the workspace lints");
+    }
 }
 
 #[test]
@@ -334,6 +362,86 @@ fn third_party_actions_are_pinned_to_a_commit() {
             assert!(line.contains(" # "), "{name}:{}: name the tag the SHA stands for in a trailing comment", n + 1);
         }
     }
+}
+
+/// Each `cargo clippy` command among a workflow's lines, joined with the lines
+/// that continue it: a trailing `\` in bash, a trailing `` ` `` in PowerShell,
+/// the default shell of a Windows runner.
+fn clippy_commands(lines: &[String]) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut rest = lines.iter();
+    while let Some(line) = rest.next() {
+        if !line.contains("cargo clippy") {
+            continue;
+        }
+        let mut command = line.trim().to_string();
+        while let Some(head) = command.strip_suffix(['\\', '`']) {
+            let next = rest.next().map_or("", |l| l.trim());
+            command = format!("{} {next}", head.trim_end()).trim_end().to_string();
+        }
+        commands.push(command);
+    }
+    commands
+}
+
+/// The words of `command` that set a lint level.
+fn lint_level_flags(command: &str) -> Vec<&str> {
+    let sets_a_level = |word: &&str| {
+        ["-A", "-W"].iter().any(|flag| word.starts_with(flag))
+            || ["--allow", "--warn", "--cap-lints"].iter().any(|flag| *word == *flag || word.starts_with(&format!("{flag}=")))
+    };
+    command.split_whitespace().filter(sets_a_level).collect()
+}
+
+#[test]
+fn clippy_commands_join_what_a_shell_continues() {
+    let lines = [
+        "      - run: cargo clippy --locked -- -D warnings",
+        "      - run: |",
+        "          cargo clippy --locked \\",
+        "            --workspace \\",
+        "            -- -A clippy::all",
+        "          cargo test --locked",
+        "      - run: cargo clippy `",
+        "          --cap-lints=allow",
+        "      - run: cargo test \\",
+        "          --locked",
+        "      - run: cargo clippy \\",
+    ]
+    .map(String::from);
+    assert_eq!(
+        clippy_commands(&lines),
+        [
+            "- run: cargo clippy --locked -- -D warnings",
+            "cargo clippy --locked --workspace -- -A clippy::all",
+            "- run: cargo clippy --cap-lints=allow",
+            "- run: cargo clippy",
+        ]
+    );
+}
+
+#[test]
+fn lint_level_flags_tells_a_level_from_other_flags() {
+    let levels = "cargo clippy -A clippy::all -Wclippy::pedantic --allow a --warn=b --cap-lints allow --cap-lints=warn";
+    assert_eq!(lint_level_flags(levels), ["-A", "-Wclippy::pedantic", "--allow", "--warn=b", "--cap-lints", "--cap-lints=warn"]);
+
+    let fine = lint_level_flags("cargo clippy --fix --allow-dirty --locked --workspace --all-targets -p clawg-cli -- -D warnings");
+    assert!(fine.is_empty(), "{fine:?}");
+}
+
+#[test]
+fn no_workflow_turns_clippy_lints_off() {
+    // Which lints run is [workspace.lints.clippy] of the root manifest; a
+    // command only makes them fail.
+    let mut seen = 0;
+    for name in workflow_files() {
+        for command in clippy_commands(&workflow_code(&name)) {
+            let flags = lint_level_flags(&command);
+            assert!(flags.is_empty(), "{name} runs `{command}` with {flags:?}");
+            seen += 1;
+        }
+    }
+    assert!(seen > 0, "no workflow runs clippy");
 }
 
 #[test]
@@ -581,7 +689,7 @@ fn the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms() {
     assert!(has("branches: [main]"), "the push trigger is main");
     assert!(has("os: [ubuntu-latest, windows-latest]"), "both platforms run");
     assert!(has("fail-fast: false"), "one platform failing must not stop the other");
-    assert!(has("- run: cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings"));
+    assert!(has("- run: cargo clippy --locked --workspace --all-targets -- -D warnings"));
     assert!(has("- run: cargo test --locked --workspace"));
 
     // CI is the only trigger of the release and must never hold its secrets.
@@ -777,7 +885,7 @@ fn the_ci_workflow_checks_the_locked_production_build() {
     }
     // Without --all-targets no dev-dependency, and so no `testing`, reaches
     // clawg-core: the configuration release.yml builds.
-    for wanted in ["cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings", "cargo test --locked -p clawg-core --lib build_info"] {
+    for wanted in ["cargo clippy --locked -p clawg-cli -- -D warnings", "cargo test --locked -p clawg-core --lib build_info"] {
         assert!(commands.iter().any(|c| c == wanted), "ci.yml lacks `{wanted}`: {commands:?}");
     }
 

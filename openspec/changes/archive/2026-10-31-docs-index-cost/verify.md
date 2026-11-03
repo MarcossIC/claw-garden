@@ -261,7 +261,7 @@ D llenó `docs/eval/cache/` con un archivo de 28 608 248 bytes. Eso es exactamen
 
 ### Los cocientes que leen las puertas de `docs-index-speed`
 
-Los umbrales son los de `openspec/changes/docs-index-speed/state.yaml`, fijados antes de estas corridas. Las puertas se deciden en ese cambio. Aquí sólo se anota el número contra su umbral.
+Los umbrales son los de `openspec/changes/archive/2026-11-01-docs-index-speed/state.yaml`, fijados antes de estas corridas. Las puertas se deciden en ese cambio. Aquí sólo se anota el número contra su umbral.
 
 | puerta | cociente | valor | umbral |
 |---|---|---|---|

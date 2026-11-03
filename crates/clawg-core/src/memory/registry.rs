@@ -872,7 +872,7 @@ pub async fn resolve_project(store: &MemoryStore, reference: &str, options: Reso
                 let delete_id = if deleted { deleted_in(&tx, id).map_err(sql)?.and_then(|d| d.delete_id) } else { None };
                 Ok(Candidate { id: id.to_string(), name: name.to_string(), deleted, delete_id })
             };
-            match named_in(&all, &reference).as_slice() {
+            match named_in(&all, reference).as_slice() {
                 [one] => return resolved(one.clone(), false),
                 [] => {}
                 many => {
@@ -884,7 +884,7 @@ pub async fn resolve_project(store: &MemoryStore, reference: &str, options: Reso
                     return Ok(Resolution { refused: Some(Refusal::Ambiguous), candidates, ..Resolution::default() });
                 }
             }
-            let key = name_key(&reference);
+            let key = name_key(reference);
             let similar = all
                 .iter()
                 .filter(|(_, name, _)| !key.is_empty() && name_key(name) == key)
@@ -901,7 +901,7 @@ pub async fn resolve_project(store: &MemoryStore, reference: &str, options: Reso
             let now = TimestampMs::now();
             let mut id = None;
             for n in 0..NEW_ID_TRIES {
-                let tried = new_project_id(&reference, now.as_millis_i64(), n);
+                let tried = new_project_id(reference, now.as_millis_i64(), n);
                 let taken: bool = tx
                     .query_row(
                         "SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1) OR EXISTS (SELECT 1 FROM project_path WHERE id = ?1)",

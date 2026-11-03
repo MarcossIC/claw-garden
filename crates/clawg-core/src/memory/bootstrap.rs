@@ -846,7 +846,7 @@ pub async fn run_embedder_bootstrap(
 /// mismatch stops the loop (see [`classify`]). `sleep` is the wait itself,
 /// injected so tests run without waiting; production passes
 /// `tokio::time::sleep`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn run_embedder_bootstrap_with_retry<S, F>(
     base_dir: std::path::PathBuf,
     embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
@@ -1632,13 +1632,13 @@ mod tests {
             "verifying must precede done; got {phases:?}"
         );
         assert!(
-            phases.iter().any(|p| *p == "downloading"),
+            phases.contains(&"downloading"),
             "at least one `downloading` event expected; got {phases:?}"
         );
 
         // No error events on the success path.
         assert!(
-            !phases.iter().any(|p| *p == "error"),
+            !phases.contains(&"error"),
             "no `error` events on the success path; got {phases:?}"
         );
 
@@ -2103,11 +2103,13 @@ mod tests {
         assert_eq!(secs(u32::MAX), 1800);
     }
 
+    type Waits = Arc<Mutex<Vec<(std::time::Duration, EmbedderStatus)>>>;
+
     /// Records each requested wait and the status visible during it, and
     /// returns at once so the test does not sleep.
     fn recording_sleep(
         status: watch::Receiver<EmbedderStatus>,
-    ) -> (Arc<Mutex<Vec<(std::time::Duration, EmbedderStatus)>>>, impl Fn(std::time::Duration) -> futures::future::Ready<()>) {
+    ) -> (Waits, impl Fn(std::time::Duration) -> futures::future::Ready<()>) {
         let waits = Arc::new(Mutex::new(Vec::new()));
         let recorded = waits.clone();
         let sleep = move |d| {

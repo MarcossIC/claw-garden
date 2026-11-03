@@ -948,6 +948,7 @@ pub struct MoveRequest {
 
 /// What a [`MoveRequest`] asks for, once it is known to ask for one thing.
 #[derive(Debug, PartialEq)]
+#[expect(clippy::large_enum_variant, reason = "one per request, consumed by the handler that parsed it; none is stored")]
 pub enum MovePlan {
     Move { filter: MoveFilter, target: Option<String> },
     Undo(i64),
@@ -3685,7 +3686,7 @@ mod tests {
         std::fs::write(&path, rows_file(1)).expect("an export file");
         let request: ImportJobRequest = serde_json::from_value(serde_json::json!({ "path": path })).expect("a request");
 
-        let refused = accept_job(app.clone(), request, ImportControl::default()).await.err().expect("refused");
+        let refused = accept_job(app.clone(), request, ImportControl::default()).await.expect_err("refused");
 
         assert_eq!((refused.status, refused.message.as_str(), refused.retryable), (StatusCode::SERVICE_UNAVAILABLE, "shutting_down", Some(true)));
         assert!(refused.job_id.is_none());

@@ -17,6 +17,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [docs-index-cost](../../changes/archive/2026-10-31-docs-index-cost/proposal.md), archivado el 2026-10-31, que sale en 0.69.0 (sólo IC3 a IC8: la memoria de vectores de `rag-eval --docs`, los tokens, el reparto por área y el bloque `index` del archivo de resultados, en «`rag-eval --docs`: medir el índice de documentación», y «Índice de docs» en la baseline). Las fases del refresco que mide (IC1 e IC2) están en [`specs/project-docs`](../project-docs/spec.md), «Refresco incremental».
 - [perf-bench](../../changes/archive/2026-10-31-perf-bench/proposal.md), archivado el 2026-10-31, que sale en 0.70.0 (sólo «Banco de rendimiento del daemon» y su baseline).
 - [docs-search-quality](../../changes/archive/2026-10-31-docs-search-quality/proposal.md), archivado el 2026-10-31, que sale en 0.71.0 (sólo DQ1 a DQ5: los docs que citan una pregunta fuera del corpus medido, el golden inválido, el archivo de resultados de docs, su `--diff` y el golden de 40, en «`rag-eval --docs`: medir el índice de documentación», y la calidad en «Índice de docs», en la baseline). Sus pasos 2 a 4 (una expresión léxica propia de docs, los identificadores partidos y un prefijo de pasaje para docs) no entraron: los que se midieron no pasaron su puerta, y los léxicos que faltan no se pueden medir con este golden ([verify](../../changes/archive/2026-10-31-docs-search-quality/verify.md)).
+- [docs-index-speed](../../changes/archive/2026-11-01-docs-index-speed/proposal.md), archivado el 2026-11-01, que sale en 0.73.0 (sólo IS3 e IS15: `padded_sorted_queue` y el aviso de relleno, en IC6 de «`rag-eval --docs`: medir el índice de documentación», y lo medido en «Índice de docs», en la baseline). El orden y la cola con que el refresco embebe (IS1, IS2 e IS7 a IS14) están en [`specs/project-docs`](../project-docs/spec.md), «La cola del refresco».
 
 ## Definiciones
 
@@ -897,22 +898,23 @@ Una memoria truncada, con una cabecera que no es la esperada, de una versión qu
 
 ### IC6. Los tokens
 
-`rag-eval --real --docs` MUST contar los tokens del corpus que indexó, después de indexar, y el archivo de resultados MUST llevarlos en `index.tokens`. Se cuentan sobre el texto de cada pasaje escrito, con el prefijo de pasaje y como lo embebe el modelo: tokenizado y recortado a la ventana de 512 (`window_encodings`, `crates/clawg-core/src/memory/embedder.rs:240`; el conteo, `lengths_by_doc`, `eval_api.rs:1386`, y `EvalDocIndex::passage_lengths`, `:1447`). Los campos son (`Tokens`, `crates/clawg-eval/src/bin/rag-eval/index_cost.rs:103`):
+`rag-eval --real --docs` MUST contar los tokens del corpus que indexó, después de indexar, y el archivo de resultados MUST llevarlos en `index.tokens`. Se cuentan sobre el texto de cada pasaje escrito, con el prefijo de pasaje y como lo embebe el modelo: tokenizado y recortado a la ventana de 512 (`window_encodings`, `crates/clawg-core/src/memory/embedder.rs:249`; el conteo, `lengths_by_doc`, `eval_api.rs:1415`, y `EvalDocIndex::passage_lengths`, `:1478`). Los campos son (`Tokens`, `crates/clawg-eval/src/bin/rag-eval/index_cost.rs:103`):
 
 | Campo | Qué es |
 |---|---|
 | `real` | La suma de los tokens de cada pasaje dentro de la ventana, sin relleno |
-| `padded` | Por doc, en tandas de `EMBED_BATCH` (`embedder.rs:184`) y en el orden del doc, filas × el más largo de la tanda, sumado: lo que corre el modelo sin memoria (`padded`, `index_cost.rs:90`) |
-| `padded_ran` | La suma de `embedder.batch_tokens` con `role=passage` de la corrida (`embedder.rs:509`): lo que corrió de verdad |
-| `padded_sorted_in_doc` | El cálculo de `padded` con los pasajes de cada doc ordenados de más tokens a menos, los empates en el orden del doc, como `longest_first` (`crates/clawg-core/src/memory/portability/import.rs:2537`, que `eval_api.rs:1085` reexporta), el orden con que una importación embebe sus filas (`padded_sorted`, `index_cost.rs:96`) |
+| `padded` | Por doc, en tandas de `EMBED_BATCH` (`embedder.rs:185`) y en el orden del doc, filas × el más largo de la tanda, sumado: lo que corría el modelo cuando el refresco embebía doc por doc y sin ordenar, el contrafactual (`padded`, `index_cost.rs:90`) |
+| `padded_ran` | La suma de `embedder.batch_tokens` con `role=passage` de la corrida (`embedder.rs:538`): lo que corrió de verdad |
+| `padded_sorted_in_doc` | El cálculo de `padded` con los pasajes de cada doc ordenados de más tokens a menos, los empates en el orden del doc, como `longest_first` (`crates/clawg-core/src/memory/embedder.rs:189`, que `eval_api.rs:1092` reexporta), el orden con que una importación embebe sus filas (`import.rs:2529`) y con que el refresco embebía un doc de más de una tanda antes de la cola (`padded_sorted`, `index_cost.rs:96`) |
+| `padded_sorted_queue` | El cálculo de `padded` con los pasajes de cada grupo de docs que comparten una llamada del refresco ordenados de más tokens a menos, los empates en el orden del plan, y sumado. Los grupos los da `queue_groups` (`eval_api.rs:1207`), que delega en la cola de producción con su tope ([`specs/project-docs`](../project-docs/spec.md), «La cola del refresco»), así que es el relleno de las tandas que corre el modelo sin memoria (`Tokens::new`, `index_cost.rs:129`) |
 | `padded_sorted_all` | El mismo cálculo con todos los pasajes de la corrida en ese orden, los empates en el orden de la corrida, cortados en tandas de `EMBED_BATCH` |
 | `count_seconds` | Cuánto llevó contar, tokenizando como el embedder: la estimación de lo que cuesta tokenizar dentro de `embed` |
 
-El conteo MUST ser puro sobre largos ya medidos (sin tokenizer, sin disco): `padded`, `padded_sorted_in_doc` y `padded_sorted_all` se calculan sobre listas de largos por doc (`Tokens::new`, `index_cost.rs:123`). Un doc con `EMBED_BATCH` pasajes o menos corre una sola tanda de ese tamaño, así que su relleno es el mismo en cualquier orden. Con una tanda incompleta, ordenar puede rellenar más: los tres campos MUST NOT acotarse entre sí, y los cocientes entre ellos pueden salir negativos.
+El conteo MUST ser puro sobre largos ya medidos (sin tokenizer, sin disco): `padded`, `padded_sorted_in_doc`, `padded_sorted_queue` y `padded_sorted_all` se calculan sobre listas de largos por doc (`Tokens::new`, `index_cost.rs:129`). `padded` y `padded_sorted_in_doc` conservan su nombre, su tipo y su sentido: un archivo de resultados anterior a `padded_sorted_queue` sigue legible con `--diff`. Un doc con `EMBED_BATCH` pasajes o menos corre una sola tanda de ese tamaño, así que su relleno es el mismo en cualquier orden. Con una tanda incompleta, ordenar puede rellenar más: los cuatro campos MUST NOT acotarse entre sí, y los cocientes entre ellos pueden salir negativos.
 
 `EvalEmbedder::real` (`eval_api.rs:573`) MUST conservar el recorder de su embedder (`eval_api.rs:580-583`) y `padded_ran` (`passage_tokens_ran`, `eval_api.rs:621`) MUST leerse de él. `embedder.batch_tokens` es un gauge (`Gauge`, `crates/clawg-core/src/metrics/recorder.rs:50`), que `Recorder::run()` (`recorder.rs:172`) no devuelve, así que se lee su `sum` de la ventana en curso (`Recorder::minute`, `:167`) con `role=passage`, la que en la evaluación nadie vacía. Nada de esto escribe en un `metrics.db`.
 
-Una corrida en la que ningún pasaje salió de la memoria (`from_memo = 0`: con `--no-cache`, con la memoria vacía o con una que no tenía ninguno de sus textos) MUST avisar por stderr cuando `padded != padded_ran` (`padding_warning`, `index_cost.rs:151`): cada pasaje corrió en las tandas de producción y los dos números tienen que coincidir. Con `from_memo > 0` el aviso no sale, porque `padded_ran` cuenta sólo lo que se embebió.
+Una corrida en la que ningún pasaje salió de la memoria (`from_memo = 0`: con `--no-cache`, con la memoria vacía o con una que no tenía ninguno de sus textos) MUST avisar por stderr cuando `padded_sorted_queue != padded_ran` (`padding_warning`, `index_cost.rs:170`): cada pasaje corrió en el orden y las llamadas del refresco, que es lo que calcula `padded_sorted_queue`, y los dos números tienen que coincidir. El mensaje MUST nombrar los dos números. Con `from_memo > 0` el aviso no sale, porque `padded_ran` cuenta sólo lo que se embebió.
 
 #### Escenario: relleno de una tanda
 - GIVEN un doc de 3 pasajes de 10, 40 y 25 tokens
@@ -944,17 +946,37 @@ Una corrida en la que ningún pasaje salió de la memoria (`from_memo = 0`: con 
 - WHEN se calcula
 - THEN todo vale 0
 
+#### Escenario: ordenar con la cola
+- GIVEN tres docs: uno de 16 pasajes de 5 tokens, otro de 8 de 10 y otro de 8 de 100
+- WHEN se calcula
+- THEN `padded_sorted_queue` es 16 × 5 + 16 × 100 = 1680: el primero llena el primer límite y va solo, y los otros dos comparten la segunda llamada, con los largos primero; `padded_sorted_in_doc` es 16 × 5 + 8 × 10 + 8 × 100 = 960 y `padded_sorted_all` es 16 × 100 + 16 × 5 = 1680
+
+#### Escenario: los grupos son las llamadas
+- GIVEN docs con pasajes `[3, 20, 5, 0, 5]`
+- WHEN `queue_groups` y un refresco agrupan
+- THEN dan los mismos grupos
+
 #### Escenario: el aviso
-- GIVEN una corrida con `from_memo = 0`, `padded = 1000` y `padded_ran = 1200`
+- GIVEN una corrida con `from_memo = 0`, `padded_sorted_queue = 800` y `padded_ran = 900`
 - WHEN termina
-- THEN stderr avisa que difieren y el archivo igual los lleva
+- THEN stderr avisa que difieren, nombra 800 y 900, y el archivo igual los lleva
+
+#### Escenario: coinciden
+- GIVEN `from_memo = 0`, `padded_sorted_queue = 800` y `padded_ran = 800`
+- WHEN se evalúa el aviso
+- THEN no hay aviso
+
+#### Escenario: algo salió de la memoria
+- GIVEN `from_memo > 0` y los dos números distintos
+- WHEN se evalúa el aviso
+- THEN no hay aviso
 
 #### Escenario: el recorder
 - GIVEN `EvalEmbedder` con un embedder de prueba que anota un gauge `embedder.batch_tokens` con `role=passage` y otro con `role=query`
 - WHEN se pide `padded_ran`
 - THEN suma sólo el de `passage`
 
-**Tests:** `padding_of_a_batch_is_rows_times_the_longest`, `a_doc_over_embed_batch_runs_several_batches`, `one_batch_pads_the_same_in_any_order`, `sorting_can_pad_more_when_the_last_batch_is_short`, `sorting_keeps_ties_in_their_order`, `sorting_across_docs_batches_the_whole_run`, `an_empty_corpus_has_no_tokens` y `a_mismatch_between_computed_and_ran_padding_warns_only_when_nothing_came_from_the_memo` (puros, sin modelo) en `crates/clawg-eval/src/bin/rag-eval/index_cost.rs`; `the_index_block_carries_the_tokens_of_a_real_run` en `docs.rs`; `a_passage_longer_than_the_window_counts_the_window`, `padded_ran_sums_only_passage_batches` y `the_real_embedder_keeps_its_recorder` (por `EvalEmbedder::of`, que recibe el recorder, porque `EvalEmbedder::real` necesita el modelo) en `crates/clawg-core/src/eval_api.rs`. Que `real` conserve su recorder lo cierra con el modelo la igualdad `padded == padded_ran` de «Índice de docs», en la baseline.
+**Tests:** `padding_of_a_batch_is_rows_times_the_longest`, `a_doc_over_embed_batch_runs_several_batches`, `one_batch_pads_the_same_in_any_order`, `sorting_can_pad_more_when_the_last_batch_is_short`, `sorting_keeps_ties_in_their_order`, `sorting_across_docs_batches_the_whole_run`, `an_empty_corpus_has_no_tokens`, `padded_sorted_queue_sorts_each_group_of_docs_together`, `the_padding_warning_compares_with_the_queue_padding`, `the_padding_warning_names_both_numbers` y `a_mismatch_between_computed_and_ran_padding_warns_only_when_nothing_came_from_the_memo` (puros, sin modelo) en `crates/clawg-eval/src/bin/rag-eval/index_cost.rs`; `a_results_file_with_an_index_block_still_diffs_against_an_old_one` y `a_results_file_without_an_index_block_still_diffs` en `docs.rs`; `queue_groups_are_the_calls_a_refresh_makes` en `crates/clawg-core/src/eval_api.rs`; `the_index_block_carries_the_tokens_of_a_real_run` en `docs.rs`; `a_passage_longer_than_the_window_counts_the_window`, `padded_ran_sums_only_passage_batches` y `the_real_embedder_keeps_its_recorder` (por `EvalEmbedder::of`, que recibe el recorder, porque `EvalEmbedder::real` necesita el modelo) en `crates/clawg-core/src/eval_api.rs`. Que `real` conserve su recorder lo cierra con el modelo la igualdad `padded == padded_ran` de «Índice de docs», en la baseline.
 
 ### IC7. El reparto por área
 
@@ -1383,6 +1405,18 @@ Medido con el modelo real el 2026-10-31 en Windows (16 hilos, AVX2, AVX-512F y F
 - **Memoria:** D la llenó con un archivo de 28 608 248 bytes (18 245 entradas de 1568 bytes más 88 de cabecera y checksum: 4 textos repetidos) y `memo.seconds` 1,35 s; R no la tocó (mismo SHA-256, tamaño y fecha).
 - **Por área en R:** `archive` 42,8 % de `phases.embed`, `code` 41,3 % y `docs` 15,9 %.
 - `--diff` de D contra R no mueve ninguna pregunta del golden de docs, así que la memoria no cambia qué vector va con qué pasaje con el modelo real.
+
+El orden y la cola con que el refresco embebe ([`specs/project-docs`](../project-docs/spec.md), «La cola del refresco») se midieron el 2026-10-31 y el 2026-11-01 en la misma máquina, con `rag-eval --real --docs --no-cache` en release, alternando la base y el paso, sobre un corpus congelado de 772 docs y 18 885 pasajes (el orden por doc) y de 787 docs y 19 278 pasajes (la cola). El detalle, con las condiciones y los umbrales fijados antes, está en el [verify](../../changes/archive/2026-11-01-docs-index-speed/verify.md) del cambio:
+
+| | `tokens.padded_ran` | `phases.embed` | vectores con otros bits |
+|---|---|---|---|
+| ordenar dentro de cada doc | −16,9 % | −12,6 % y −12,7 % en los dos pares limpios | 0 de 4799 |
+| la cola con `QUEUE_PASSAGES` = 512 (contra lo anterior) | −17,8 % | −26,1 %, −25,2 % y −25,2 % en los tres pares | 0 de 5293 |
+
+- **Sin movimientos en la calidad.** `--diff` de la base contra el paso no mueve ninguna pregunta en ninguno de los pares (0 mejores y 0 peores en Hit@1, Hit@3, Hit@5 y MRR@10), y `tokens.padded_ran` es igual a `padded_sorted_in_doc` en el paso de la primera medición y a `padded_sorted_queue` en el de la segunda, sin aviso.
+- **El tope.** 512 es el menor tope cuya reducción prevista del tiempo de `embed` llega a 0,18 (0,1905) con una llamada de a lo sumo 16 MiB de textos retenidos (2,2 MiB), según una cuenta sin modelo sobre los largos del corpus: recupera 0,907 del ahorro de tokens rellenados que daría ordenar todo junto. La medición lo confirmó: 0,9073.
+- **Memoria.** El pico privado de un daemon dev que indexa el corpus baja un 9,4 % (1312,6 frente a 1448,5 MiB). La explicación más probable, que no se midió por separado, es que los largos se cuentan de a una tanda y no con todas las codificaciones de un doc a la vez.
+- **Dónde gana.** Más en `archive` (−37 % a −39 % de `embed`), con muchos docs chicos que antes corrían cada uno su tanda incompleta, que en `code` (−13 % a −14 %), cuyos pedazos tienen un tope de caracteres y ya rellenaban poco.
 
 La calidad, medida el mismo día en `5136a4e` con un build debug y la memoria, sobre las 40 preguntas del golden (DQ5), 762 docs y 18 646 pasajes, con 1 doc fuera por citar las preguntas (`2026-10-31-real-docs-dq-base3.json`; el detalle, en el [verify](../../changes/archive/2026-10-31-docs-search-quality/verify.md) de docs-search-quality):
 

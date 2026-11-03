@@ -12,6 +12,7 @@ Fuente de verdad del comportamiento actual del índice de la documentación y el
 - [ram-footprint-gates](../../changes/archive/2026-10-29-ram-footprint-gates/proposal.md), archivado el 2026-10-29, que sale en 0.67.0 (RM5: el refresco reutiliza el vector de cada pasaje cuyo texto indexado no cambió, en «Refresco incremental» y «RM5»). La vista de sólo lectura del ONNX y la carga que no se pisa con la reparación están en [`specs/storage`](../storage/spec.md) (RM1 y RM2).
 - [docs-index-cost](../../changes/archive/2026-10-31-docs-index-cost/proposal.md), archivado el 2026-10-31, que sale en 0.69.0 (IC1 e IC2: el refresco mide el tiempo de cada fase por doc y el daemon lo escribe en una línea del log, en «Refresco incremental»). La medición del índice con `rag-eval --docs` está en [`specs/eval`](../eval/spec.md) (IC3 a IC8).
 - [docs-search-quality](../../changes/archive/2026-10-31-docs-search-quality/proposal.md), archivado el 2026-10-31, que sale en 0.71.0 (en «Refresco incremental», las rutas que el refresco deja fuera y el troceo que comparte con el eval; en «Límites conocidos», la calidad medida y las alternativas del canal léxico y del prefijo que no pasaron su puerta). Lo que mide, DQ1 a DQ5, está en [`specs/eval`](../eval/spec.md).
+- [docs-index-speed](../../changes/archive/2026-11-01-docs-index-speed/proposal.md), archivado el 2026-11-01, que sale en 0.73.0 (IS1, IS2 e IS7 a IS14: el refresco embebe del pasaje más largo al más corto y los docs comparten las llamadas al embedder a través de una cola acotada, en «Refresco incremental» y «La cola del refresco»). El relleno que mide `rag-eval --docs` (IS3 e IS15) está en [`specs/eval`](../eval/spec.md), IC6, y el caso de `e5_golden` que fija el orden (IS4), en [`specs/storage`](../storage/spec.md).
 
 ## Definiciones
 
@@ -26,8 +27,8 @@ Fuente de verdad del comportamiento actual del índice de la documentación y el
 - **Breadcrumb:** la ruta relativa seguida de los encabezados (o, en código, las cabeceras de definición) que contienen al pedazo, del más externo al propio, unidos con ` > `. El del preámbulo y el de un manifiesto es sólo la ruta relativa.
 - **Pasaje:** una fila de `project_doc_chunk`: el breadcrumb, el texto de un pedazo de un doc, su vector y su entrada léxica.
 - **Texto indexado:** `breadcrumb + "\n\n" + cuerpo` (`Passage::indexed_text`, `crates/clawg-core/src/memory/project_docs/chunk.rs:28`). Es lo que se embebe y lo que entra al índice léxico.
-- **Huella de un doc:** el sha256 de sus bytes en el disco y el id del modelo que embebió sus pasajes (`Fingerprint`, `crates/clawg-core/src/memory/project_docs/mod.rs:171`).
-- **Refresco:** la pasada que deja el índice de un proyecto igual a sus docs en el disco (`refresh`, `mod.rs:486`).
+- **Huella de un doc:** el sha256 de sus bytes en el disco y el id del modelo que embebió sus pasajes (`Fingerprint`, `crates/clawg-core/src/memory/project_docs/mod.rs:173`).
+- **Refresco:** la pasada que deja el índice de un proyecto igual a sus docs en el disco (`refresh`, `mod.rs:488`).
 
 El índice vive en cuatro tablas propias (`project_doc_file`, `project_doc_chunk`, `project_doc_vectors`, `project_doc_fts`; `crates/clawg-core/migrations/V12__project_docs.sql`). `project_doc_vectors` es un `vec0` de 384 dimensiones con `project_id` como partition key, así que el filtro por proyecto se aplica dentro del KNN; `project_doc_fts` guarda su propio texto. Ninguna sentencia del índice nombra una tabla de memorias, y no hay access tracker, tiers ni decaimiento: un doc no "se usa", está en el disco.
 
@@ -35,7 +36,7 @@ El índice vive en cuatro tablas propias (`project_doc_file`, `project_doc_chunk
 
 El daemon MUST leer los archivos sólo de una raíz aceptada. Una raíz queda aceptada cuando la registra el puente que arrancó en ella y es un proyecto que se indexa solo ([abajo](#el-puente-acepta-su-raíz-sola-sólo-si-es-un-proyecto)), o cuando el usuario la agrega con `clawg projects add` (más abajo). Cualquier otra raíz, la del puente que no es un proyecto o una que el modelo nombre en `project_path`, queda sólo registrada. La marca se guarda en `project.index_docs` y sólo sube ([`specs/project`](../project/spec.md), R4 y R6).
 
-La guarda está junto a la lectura, no en quien la pide. `root_of` (`crates/clawg-core/src/memory/project_docs/mod.rs:679`) lee `root_path` e `index_docs`. Con una raíz sólo registrada MUST devolver `DocIndexError::NotAccepted` (`mod.rs:51`), un error distinto de `UnknownProject`. Todo refresco pasa por `RefreshGuard::run`, que pide la raíz a `root_of` antes de recorrer nada (`mod.rs:250`). Así ningún camino lee el disco de una raíz sólo registrada, aunque quien llame no mire la marca.
+La guarda está junto a la lectura, no en quien la pide. `root_of` (`crates/clawg-core/src/memory/project_docs/mod.rs:890`) lee `root_path` e `index_docs`. Con una raíz sólo registrada MUST devolver `DocIndexError::NotAccepted` (`mod.rs:52`), un error distinto de `UnknownProject`. Todo refresco pasa por `RefreshGuard::run`, que pide la raíz a `root_of` antes de recorrer nada (`mod.rs:252`). Así ningún camino lee el disco de una raíz sólo registrada, aunque quien llame no mire la marca.
 
 #### Escenario: registrada sin indexar
 - GIVEN una raíz con un `README.md`
@@ -181,25 +182,25 @@ Un pasaje ya guardado MUST NOT volver a partirse mientras su archivo no cambie d
 
 ## Refresco incremental
 
-`refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:486`) MUST dejar en el índice del proyecto exactamente los docs del disco, y:
+Un `refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:488`) que termina bien MUST dejar en el índice del proyecto exactamente los docs del disco, salvo los que no pudo releer o anotó en `RefreshReport::failed`, que quedan como estaban. Si el embedder falla o un vector no sirve, los docs afectados MUST quedar como estaban, como dicen los puntos de abajo. Además:
 
 - un doc cuya huella coincide con la guardada MUST NOT re-leerse en pasajes ni re-embeberse;
-- un doc nuevo o cambiado (otro sha256, u otro modelo) MUST reemplazar todos sus pasajes, vectores y entradas léxicas en **una** transacción por doc (`replace_doc`, `mod.rs:724`), así una búsqueda nunca ve medio doc. El embedding de los pasajes sin vector reutilizable (RM5) se hace antes de pedir la conexión, para no bloquear los saves mientras tanto;
-- un doc que ya no está en el corpus MUST perder todos sus pasajes y su huella (`remove_docs`, `mod.rs:759`);
+- un doc nuevo o cambiado (otro sha256, u otro modelo) MUST reemplazar todos sus pasajes, vectores y entradas léxicas en **una** transacción por doc (`replace_doc`, `mod.rs:935`), así una búsqueda nunca ve medio doc. El embedding de los pasajes sin vector reutilizable (RM5) se hace antes de pedir la conexión, para no bloquear los saves mientras tanto, y en una llamada que el doc comparte con otros ([«La cola del refresco»](#la-cola-del-refresco));
+- un doc que ya no está en el corpus MUST perder todos sus pasajes y su huella (`remove_docs`, `mod.rs:970`);
 - un doc vacío o sin secciones con texto MUST guardar su huella sin pasajes;
 - si la raíz no existe o no es un directorio, MUST NOT borrar nada y MUST devolver el error: el recorrido falla antes de leer las huellas guardadas, así que un disco "vacío" por error no arma un plan que borre todo;
-- si el embedder falla en un doc (`DocIndexError::Embed`) o devuelve otra cantidad de vectores que de pasajes (`DocIndexError::VectorCount`), ese doc MUST quedar como estaba, el refresco MUST terminar con el error y el siguiente MUST reintentarlo: la huella vieja no coincide con el disco;
-- si un vector de un doc no sirve (`to_unit` lo rechaza por su dimensión, un valor no finito o norma cero; `DocIndexError::Vector`), ese doc MUST quedar como estaba y anotarse en `RefreshReport::failed` con su ruta y la causa, y el refresco MUST seguir con los demás docs del plan y con `remove_docs`. El siguiente MUST reintentarlo. El daemon MUST dejar cada doc salteado en el log como `warn`, y `rag-eval --docs` (`EvalDocIndex::index`, `crates/clawg-core/src/eval_api.rs:1485`) MUST fallar nombrándolo, porque una medición sin un doc mide otro corpus;
-- MUST tomar los docs del recorrido salvo las rutas relativas que recibe para dejar fuera, que no lee (`scan`, `mod.rs:466`): un doc dejado fuera no se indexa ni cuenta en `RefreshReport::docs`. El daemon le pasa un conjunto vacío; sólo `rag-eval --docs` deja fuera los docs que citan una pregunta de su golden (DQ1 de [`specs/eval`](../eval/spec.md));
-- MUST partir cada doc con `passages` (`mod.rs:371`), la misma función con la que `rag-eval --docs` comprueba los headings de su golden sin embeber (DQ2 de [`specs/eval`](../eval/spec.md)), así que el eval ve los breadcrumbs que indexa el refresco;
+- si el embedder falla en una llamada (`DocIndexError::Embed`) o devuelve otra cantidad de vectores que de textos (`DocIndexError::VectorCount`), los docs de esa llamada MUST quedar como estaban, el refresco MUST terminar con el error y el siguiente MUST reintentarlos: la huella vieja no coincide con el disco. Los docs de las llamadas anteriores ya están escritos y no se vuelven a embeber;
+- si un vector de un doc no sirve (`to_unit` lo rechaza por su dimensión, un valor no finito o norma cero; `DocIndexError::Vector`), ese doc MUST quedar como estaba y anotarse en `RefreshReport::failed` con su ruta y la causa, y el refresco MUST seguir con los demás docs de su llamada y del plan, y con `remove_docs`. El siguiente MUST reintentarlo. El daemon MUST dejar cada doc salteado en el log como `warn`, y `rag-eval --docs` (`EvalDocIndex::index`, `crates/clawg-core/src/eval_api.rs:1508`) MUST fallar nombrándolo, porque una medición sin un doc mide otro corpus;
+- MUST tomar los docs del recorrido salvo las rutas relativas que recibe para dejar fuera, que no lee (`scan`, `mod.rs:468`): un doc dejado fuera no se indexa ni cuenta en `RefreshReport::docs`. El daemon le pasa un conjunto vacío; sólo `rag-eval --docs` deja fuera los docs que citan una pregunta de su golden (DQ1 de [`specs/eval`](../eval/spec.md));
+- MUST partir cada doc con `passages` (`mod.rs:373`), la misma función con la que `rag-eval --docs` comprueba los headings de su golden sin embeber (DQ2 de [`specs/eval`](../eval/spec.md)), así que el eval ve los breadcrumbs que indexa el refresco;
 - MUST NOT leer ni escribir `memory`, `episodic_trajectory`, `procedural_skill`, sus vectores, su FTS ni el access tracker;
 - MUST devolver cuántos docs vio, reindexó, dejó igual, quitó y salteó, cuántos pasajes escribió y qué docs dejó como estaban por un vector inservible (`RefreshReport`).
 
-La huella se toma de los bytes que se leyeron para trocear, sin enmascarar, así un cambio en un secreto también reindexa. La decisión de qué hacer con cada doc MUST ser una función pura de las huellas del disco y las guardadas (`plan_refresh`, `mod.rs:188`). El `model_id` de cada doc es el del embedder: un cambio de modelo, o del pooling que su id nombra ([`specs/storage`](../storage/spec.md), «Pooling mean y re-embebido al arrancar»), reindexa todo sin código extra.
+La huella se toma de los bytes que se leyeron para trocear, sin enmascarar, así un cambio en un secreto también reindexa. La decisión de qué hacer con cada doc MUST ser una función pura de las huellas del disco y las guardadas (`plan_refresh`, `mod.rs:190`). El `model_id` de cada doc es el del embedder: un cambio de modelo, o del pooling que su id nombra ([`specs/storage`](../storage/spec.md), «Pooling mean y re-embebido al arrancar»), reindexa todo sin código extra.
 
-Sólo MUST correr un refresco por proyecto a la vez: un pedido de refresco mientras otro corre MUST volver enseguida diciendo que ya hay uno en curso, sin esperar (`DocIndex::begin`, `begin_if_due` y `try_refresh`, `mod.rs:276`, `:290` y `:345`). La marca se suelta también si el refresco falla o su tarea se cancela.
+Sólo MUST correr un refresco por proyecto a la vez: un pedido de refresco mientras otro corre MUST volver enseguida diciendo que ya hay uno en curso, sin esperar (`DocIndex::begin`, `begin_if_due` y `try_refresh`, `mod.rs:278`, `:292` y `:347`). La marca se suelta también si el refresco falla o su tarea se cancela.
 
-`DocIndex` MUST guardar, por proyecto, el error del último refresco que terminó, lanzado por una búsqueda o por un registro (`RefreshGuard::run`, `mod.rs:250`; `last_error`, `mod.rs:332`), escrito antes de soltar la marca, y MUST borrarlo cuando un refresco termina bien. Un refresco que no corrió porque había otro en curso, o que se canceló, MUST NOT cambiarlo. La raíz y su `index_docs` se leen de `project` en cada refresco (`root_of`, arriba). Si un nuevo registro cambia la raíz, el próximo refresco usa la nueva. Una raíz sólo registrada no se refresca: el refresco falla con `NotAccepted` antes de recorrer el disco.
+`DocIndex` MUST guardar, por proyecto, el error del último refresco que terminó, lanzado por una búsqueda o por un registro (`RefreshGuard::run`, `mod.rs:252`; `last_error`, `mod.rs:334`), escrito antes de soltar la marca, y MUST borrarlo cuando un refresco termina bien. Un refresco que no corrió porque había otro en curso, o que se canceló, MUST NOT cambiarlo. La raíz y su `index_docs` se leen de `project` en cada refresco (`root_of`, arriba). Si un nuevo registro cambia la raíz, el próximo refresco usa la nueva. Una raíz sólo registrada no se refresca: el refresco falla con `NotAccepted` antes de recorrer el disco.
 
 #### Escenario: nada cambió
 - GIVEN un proyecto ya indexado
@@ -238,17 +239,98 @@ Sólo MUST correr un refresco por proyecto a la vez: un pedido de refresco mient
 
 **Tests:** en `crates/clawg-core/src/memory/project_docs/mod.rs`: `plan_keeps_what_did_not_change_and_rewrites_what_did`, `plan_rewrites_every_doc_embedded_by_another_model` y `plan_of_an_empty_tree_drops_everything` (puros); `an_unchanged_project_embeds_nothing`, `a_changed_doc_replaces_its_passages_and_a_deleted_one_loses_them`, `another_model_reindexes_every_doc`, `a_missing_root_deletes_nothing`, `a_failed_embedding_keeps_the_doc_as_it_was`, `an_unusable_vector_skips_its_doc_and_the_rest_go_on`, `a_short_batch_still_aborts_the_refresh`, `the_last_error_lasts_until_a_refresh_succeeds`, `a_second_refresh_does_not_wait_for_the_first`, `an_unregistered_project_is_refused`, `a_root_that_was_not_accepted_is_not_read` y `refreshing_never_touches_memories`, contra un store en memoria y un directorio temporal; `a_doc_the_index_could_not_embed_fails_the_measurement` en `crates/clawg-core/src/eval_api.rs`.
 
+### La cola del refresco
+
+Un refresco no embebe doc por doc. Lee, enmascara y parte cada doc, busca sus vectores reutilizables (RM5) y lo deja en una cola (`Queue`, `mod.rs:580`; `refresh`, `mod.rs:546`) hasta que la cola se vacía: entonces `write_queued` (`mod.rs:742`) manda los textos a embeber de todos los docs de ese vaciado al embedder en **una** llamada y escribe cada doc. Así un doc de pocos pasajes no corre una tanda casi vacía del modelo, que rellena cada fila hasta la más larga de su tanda (`EMBED_BATCH` = 16, `crates/clawg-core/src/memory/embedder.rs:185`), y un doc grande no mezcla textos de largos muy distintos. El refresco retiene sólo los docs de su cola y no el árbol: el texto leído y el enmascarado se sueltan al terminar la vuelta del bucle (`mod.rs:521-525`).
+
+- **El límite crece hasta el tope.** Los pasajes que la cola retiene, se reutilicen o no, MUST contar contra su límite (`Queue::admit`, `mod.rs:600`). El límite MUST empezar en `EMBED_BATCH` y duplicarse con cada vaciado hasta `QUEUE_PASSAGES` (512, `mod.rs:567`; `Queue::limit`, `mod.rs:591`), así los primeros docs de un primer índice se pueden buscar después de una tanda y no de 512 pasajes. La cola MUST vaciarse antes de que entre un doc que la pasaría del límite (si no está vacía), cuando llega al límite y al terminar el plan. Un doc sin pasajes MUST NOT mover ningún vaciado. La decisión es una función pura que recorren `refresh` y `queue_groups` (`mod.rs:619`), la agrupación que usa la evaluación ([`specs/eval`](../eval/spec.md), IC6).
+- **Un doc grande.** Un doc con más pasajes que el límite MUST vaciarse solo: la cola se vacía antes de él si no está vacía, y él es su propio vaciado. Mientras el límite crece hay una excepción: el vaciado de antes lo duplica, y si el doc queda por debajo del límite nuevo (con la cola no vacía, entre límite + 1 y 2 × límite − 1 pasajes) los docs que siguen se le suman. En el tope el límite ya no crece, y un doc con más de `QUEUE_PASSAGES` pasajes va siempre solo. Ninguna llamada al embedder MUST retener más de `QUEUE_PASSAGES` pasajes, salvo que sea un solo doc.
+- **Una llamada, ordenada de más tokens a menos.** Los textos a embeber de los docs de un vaciado MUST llegar al embedder en una sola llamada (`embed_passages`, `mod.rs:813`), concatenados en el orden del plan. Cuando son más de `EMBED_BATCH`, MUST ordenarse de más tokens a menos sobre la lista entera, con los empates en el orden del plan (`passage_order`, `mod.rs:864`), así cada tanda rellena sus textos hasta un largo parecido. Los tokens se cuentan como los recibe el modelo: con el prefijo de pasaje del embedder y cortados a su ventana (`passage_token_counts`, `embedder.rs:269`). Con `EMBED_BATCH` textos o menos en la llamada, MUST ir en el orden del plan y MUST NOT contarse sus tokens: una tanda rellena igual en cualquier orden. La reutilización decide qué se cuenta: sólo los textos que de verdad se embeben.
+- **Sin tokenizer.** Los largos los cuenta el tokenizer del partidor que recibe el refresco (`TokenSplitter::tokenizer()`, `mod.rs:515`). Cuando el partidor no tiene tokenizer (`TokenSplitter::fallback()`, los tests del refresco, `CLAWG_TEST_EMBEDDER=fake` sin tokenizer), o contar falla, la llamada MUST ir en el orden del plan y el refresco MUST NOT fallar por eso (`passage_order` devuelve `None`, `mod.rs:865-868`): lo que pase después es lo que hace el embedder con esos textos.
+- **Cada vector vuelve a su doc y a su pasaje.** Con un embedder cuyo vector depende sólo del texto, cada pasaje MUST guardar el vector de su propio texto, sea de su doc o de otro del vaciado, y lo que se escribe (`RefreshReport`, pasajes, ordinales, qué vector va con qué texto) MUST ser lo mismo que sin cola. Los vectores vuelven al orden de los textos (`in_passage_order`, `mod.rs:874`), cada doc toma los suyos según cuántos textos tenía (`mod.rs:843-854`) y `fill` (`mod.rs:671`) los pone en el orden de sus pasajes. Con el modelo real sólo pueden moverse los últimos bits de un vector, porque cambia con qué textos comparte su tanda; la tolerancia de `e5_golden` no se amplía ([`specs/storage`](../storage/spec.md), RM4).
+- **Un vector inutilizable omite sólo su doc.** El doc dueño del texto MUST ir a `failed` con su motivo (`mod.rs:763-767`) y los demás docs del vaciado MUST escribirse. Los vectores de los docs que siguen no se corren: el reparto separa los de cada dueño antes de revisar ninguno (`mod.rs:847-852`).
+- **Un error del embedder termina el refresco.** Si el embedder falla o devuelve otra cantidad de vectores que de textos, el refresco MUST terminar con `Embed` o `VectorCount`, que nombran el primer doc del vaciado (`mod.rs:822`), con `VectorCount.passages` igual a los textos de la llamada (`mod.rs:836-838`). Ningún doc del vaciado que falló MUST quedar escrito; los de vaciados anteriores MUST seguir escritos, y el refresco siguiente MUST planear el resto.
+- **Se escribe en el orden del plan.** Después de su vaciado, cada doc MUST escribirse en una transacción propia (`replace_doc`, `mod.rs:935`), en el orden del plan (`mod.rs:759-785`), de modo que los ids de fila salgan como cuando se embebía doc por doc: `fuse` desempata por id de pasaje (`mod.rs:384`). `RefreshReport` MUST ser igual para las mismas entradas: sus campos son sumas y `failed` sigue el orden del plan.
+- **Los tiempos siguen sumando.** `read`, `mask`, `split`, `lookup` y `write` se miden por doc. El tiempo de la llamada de un vaciado MUST repartirse entre sus docs según la parte de textos que aporta cada uno, en nanosegundos enteros y con el resto al último doc con textos (`embed_shares`, `mod.rs:793`), así que un doc sin textos no recibe nada. Un vaciado sin textos no reparte: su tiempo queda en la marca y lo toma la fase siguiente (`mod.rs:756-758`). `RefreshTiming::phases` MUST seguir sumando todo `index_seconds` y la línea del daemon (IC2) MUST NOT cambiar de forma. `timing.docs` sale en el orden en que terminan los docs, que puede no ser el del plan: ningún consumidor depende de él.
+
+#### Escenario: un doc largo llega ordenado
+- GIVEN un doc de 20 pasajes sin vectores guardados, con largos conocidos y un embedder falso que anota cada llamada
+- WHEN se refresca
+- THEN el embedder recibe una llamada de 20 textos, del más largo al más corto, los empates en el orden de los pasajes, y el pasaje *i* guarda el vector de su propio texto
+
+#### Escenario: relleno menor
+- GIVEN un doc de 20 pasajes que alternan 10 y 100 tokens
+- WHEN se refresca
+- THEN el relleno de las tandas que corre el modelo es 16 × 100 + 4 × 10 = 1640, no 2000
+
+#### Escenario: la reutilización decide
+- GIVEN un doc de 20 pasajes del que 10 tienen vector guardado
+- WHEN se refresca
+- THEN los 10 textos restantes llegan en el orden de los pasajes, sin contar tokens
+
+#### Escenario: sin tokenizer
+- GIVEN un doc de 20 pasajes y un refresco cuyo partidor no tiene tokenizer
+- WHEN se refresca
+- THEN llega en el orden de los pasajes y el refresco no falla
+
+#### Escenario: docs chicos comparten la llamada
+- GIVEN docs de pocos pasajes cuya suma cabe en el límite de la cola
+- WHEN se refresca
+- THEN el embedder recibe una sola llamada con los textos de todos, y cada blob es el de su texto; si son más de `EMBED_BATCH` textos llegan del más largo al más corto, y si son `EMBED_BATCH` o menos, en el orden del plan
+
+#### Escenario: el límite crece
+- GIVEN una cola con tope 64 y docs que llenan cada límite
+- WHEN se suceden vaciados
+- THEN los límites son 16, 32, 64, 64
+
+#### Escenario: vaciar antes y al llegar
+- GIVEN límite 16 y una cola con 10 pasajes
+- WHEN llega un doc de 8, y luego uno de 6
+- THEN se vacía antes del de 8; el de 8 entra solo; al llegar el de 6 la cola retiene 14 y no se vacía; con 2 más llega a 16 y se vacía
+
+#### Escenario: un doc más grande que el tope
+- GIVEN docs que suman más que `QUEUE_PASSAGES` y uno de más de `QUEUE_PASSAGES` pasajes
+- WHEN se refresca
+- THEN el grande va en una llamada solo y ninguna otra pasa de `QUEUE_PASSAGES` pasajes
+
+#### Escenario: los reutilizados cuentan
+- GIVEN dos docs de 16 pasajes indexados, y un cambio en un pasaje de cada uno
+- WHEN se refresca
+- THEN hace dos llamadas de un texto, porque cada doc llena el límite de 16 con sus pasajes
+
+#### Escenario: el del medio
+- GIVEN tres docs en una llamada y un vector no finito para un texto del segundo
+- WHEN se refresca
+- THEN sólo el segundo va a `failed`; el primero y el tercero se indexan, cada pasaje con el vector de su propio texto
+
+#### Escenario: falla el segundo vaciado
+- GIVEN dos vaciados y un embedder que falla en la segunda llamada
+- WHEN se refresca, y después otra vez con un embedder sano
+- THEN el primero termina en `Err` con los docs del primer vaciado escritos y los del segundo como estaban; el segundo indexa los que faltan
+
+#### Escenario: ids por ruta
+- GIVEN cuatro docs que comparten una llamada
+- WHEN se refresca
+- THEN los ids de fila crecen con la ruta, y el informe es el de un refresco doc por doc
+
+#### Escenario: el reparto suma
+- GIVEN un vaciado de 3, 1 y 6 textos y un tiempo de 10 ns
+- WHEN se reparte
+- THEN los docs reciben 3, 1 y 6 ns, y en general la suma es siempre el tiempo del vaciado
+
+**Tests:** en `crates/clawg-core/src/memory/project_docs/mod.rs`, puros: `passage_order_is_none_up_to_one_batch_and_longest_first_above_it`, `in_passage_order_undoes_longest_first`, `the_queue_limit_starts_at_one_batch_and_doubles_up_to_the_cap`, `the_limit_stays_at_the_cap_through_many_flushes`, `the_queue_flushes_before_a_doc_that_would_pass_its_limit_and_when_it_reaches_it`, `a_doc_with_no_passages_moves_no_flush`, `a_doc_over_the_limit_is_a_flush_of_its_own`, `a_doc_between_the_limit_and_twice_it_joins_the_docs_after_it_while_the_limit_grows` y `embed_shares_split_the_time_by_texts_and_add_up_to_it`; de refresco, con embedders falsos: `a_doc_over_a_batch_reaches_the_embedder_longest_first`, `a_reordered_doc_keeps_each_passage_with_its_own_vector`, `a_reordered_doc_writes_what_an_unordered_one_wrote`, `reuse_decides_whether_a_doc_is_reordered`, `a_doc_of_one_batch_or_less_keeps_the_passage_order`, `without_a_tokenizer_a_doc_keeps_the_passage_order`, `small_docs_share_one_call_to_the_embedder`, `each_passage_of_a_shared_call_keeps_its_own_vector`, `a_doc_over_the_cap_goes_alone`, `no_call_holds_more_passages_than_the_cap_unless_it_is_one_doc`, `the_passages_a_doc_reuses_count_against_the_limit`, `an_unusable_vector_in_a_reordered_doc_skips_only_that_doc`, `an_unusable_vector_in_a_shared_call_skips_only_its_doc`, `an_embedder_error_keeps_the_docs_of_its_call_as_they_were`, `a_shared_call_writes_its_docs_in_plan_order` y `every_doc_of_a_shared_call_has_embed_time`; `queue_groups_are_the_calls_a_refresh_makes` en `crates/clawg-core/src/eval_api.rs`; `the_docs_timing_line_names_every_phase` en `crates/clawg-cli/src/daemon/api.rs` fija que la línea del daemon no cambia de forma. Se conservan `a_short_batch_still_aborts_the_refresh` (ahora afirma que `VectorCount.passages` cuenta los textos de la llamada) y `an_unusable_vector_skips_its_doc_and_the_rest_go_on`. Los tests con el modelo real, ignorados: `docs_passages_keep_their_bits_in_either_order` y `sorting_across_docs_against_sorting_in_each_doc` (`mod.rs`), que cuentan cuántos vectores dan los mismos bits en cada orden.
+
 ### RM5. El refresco reutiliza los vectores de los pasajes que no cambiaron
 
-Cuando un doc cambia (otro sha256), `refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:486`) MUST reutilizar el vector guardado de cada pasaje cuyo `indexed_text` entero (`breadcrumb`, `"\n\n"` y `body`; `crates/clawg-core/src/memory/project_docs/chunk.rs:28`) está entre los pasajes guardados de ese mismo doc, siempre que el `model_id` guardado del doc sea el del refresco (leído una vez, `mod.rs:501`, y con los vectores en la misma sentencia, `stored_vectors`, `mod.rs:612`). MUST embeber sólo los demás pasajes: `reuse_plan` (`mod.rs:587`) los separa, y `embed_passages` (`mod.rs:645`) recibe sólo esos, sin llamar al embebedor si no hay ninguno.
+Cuando un doc cambia (otro sha256), `refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:488`) MUST reutilizar el vector guardado de cada pasaje cuyo `indexed_text` entero (`breadcrumb`, `"\n\n"` y `body`; `crates/clawg-core/src/memory/project_docs/chunk.rs:28`) está entre los pasajes guardados de ese mismo doc, siempre que el `model_id` guardado del doc sea el del refresco (leído una vez, `mod.rs:503`, y con los vectores en la misma sentencia, `stored_vectors`, `mod.rs:682`). MUST embeber sólo los demás pasajes: `reuse_plan` (`mod.rs:657`) los separa, y `write_queued` (`mod.rs:742`) entrega a `embed_passages` (`mod.rs:813`) sólo esos textos, sin llamar al embebedor si el vaciado no tiene ninguno. Los reutilizados cuentan contra el límite de la cola ([«La cola del refresco»](#la-cola-del-refresco)).
 
 - **Por valor.** MUST leer pares de texto y bytes del vector, nunca ids de fila (`replace_doc` borra y vuelve a insertar con ids nuevos). Un texto repetido en el doc MUST reutilizar en todos sus pasajes, y el vector es el de su primer pasaje.
-- **Todo o nada.** El doc MUST seguir reemplazándose entero en **una** transacción (`replace_doc`, `mod.rs:724`); lo ya dicho sobre un embedder que falla, un vector inservible y la cuenta distinta no cambia.
+- **Todo o nada.** El doc MUST seguir reemplazándose entero en **una** transacción (`replace_doc`, `mod.rs:935`); lo ya dicho sobre un embedder que falla, un vector inservible y la cuenta distinta no cambia.
 - **Qué no reutiliza.** Un doc guardado con otro `model_id` MUST NOT reutilizar nada. Un archivo movido MUST NOT reutilizar nada, porque su ruta está en el `indexed_text`. Un doc que no cambió sigue sin re-embeberse.
-- **`reused`.** `RefreshReport` (`mod.rs:74`) MUST llevar `reused`, los pasajes reutilizados (no los textos distintos). La línea `indexed the docs of …` (`refresh_line`, `crates/clawg-cli/src/daemon/api.rs:2990`) MUST mostrarlo.
+- **`reused`.** `RefreshReport` (`mod.rs:76`) MUST llevar `reused`, los pasajes reutilizados (no los textos distintos). La línea `indexed the docs of …` (`refresh_line`, `crates/clawg-cli/src/daemon/api.rs:3020`) MUST mostrarlo.
 - **Equivalencia.** El doc que queda MUST ser equivalente al de un reindexado completo: los mismos pasajes y, con un embebedor falso determinista, los mismos vectores byte a byte. Con el modelo real, fuera de CI, MUST coincidir con tolerancia de 1e-5 por componente o coseno ≥ 1 − 1e-6 (`a_partly_reused_doc_matches_a_full_reindex_within_tolerance`, `#[ignore]`).
-- **Deriva.** Un pasaje sin cambios conserva su vector hasta que cambie el `model_id` o se reindexe. Si el contrato cambia sin que cambie el id, esa deriva también alcanza a los pasajes sin cambios de un doc cambiado, como hoy alcanza a un doc que no cambia (`plan_refresh`, `mod.rs:188`). El contrato y su id los fija un test ([`specs/storage`](../storage/spec.md), RM4).
-- **Un refresco a la vez.** No cambia. `DocIndex::begin` (`mod.rs:276`) ya impide que otro refresco cambie lo leído antes de que se escriba, y `same_model` (`crates/clawg-core/src/memory/idle_embedder.rs:262`) rechaza una recarga con otro id, así que no hace falta descartar lo reutilizado si la sesión cambia.
+- **Deriva.** Un pasaje sin cambios conserva su vector hasta que cambie el `model_id` o se reindexe. Si el contrato cambia sin que cambie el id, esa deriva también alcanza a los pasajes sin cambios de un doc cambiado, como hoy alcanza a un doc que no cambia (`plan_refresh`, `mod.rs:190`). El contrato y su id los fija un test ([`specs/storage`](../storage/spec.md), RM4).
+- **Un refresco a la vez.** No cambia. `DocIndex::begin` (`mod.rs:278`) ya impide que otro refresco cambie lo leído antes de que se escriba, y `same_model` (`crates/clawg-core/src/memory/idle_embedder.rs:262`) rechaza una recarga con otro id, así que no hace falta descartar lo reutilizado si la sesión cambia.
 
 #### Escenario: se edita una sección
 - GIVEN un doc indexado de varios pasajes y un embebedor falso que anota los textos que le piden
@@ -274,19 +356,19 @@ Cuando un doc cambia (otro sha256), `refresh` (`crates/clawg-core/src/memory/pro
 
 ### IC1. El refresco mide sus fases
 
-`refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:486`) MUST medir con `Instant`, por doc, el tiempo de cada fase y MUST devolverlo aparte de `RefreshReport`, en un `RefreshRun { report, timing }` (`RefreshRun`, `mod.rs:151`; `RefreshTiming`, `:131`; `DocTiming`, `:118`; `DocPhases`, `:94`). `RefreshReport` se compara por igualdad en los tests del refresco (`an_unchanged_project_embeds_nothing`, `a_changed_doc_replaces_its_passages_and_a_deleted_one_loses_them`, `a_doc_left_out_is_neither_indexed_nor_counted`, `mod.rs:978`, `:998` y `:1032`) y MUST NOT ganar un campo que dependa del reloj; `try_refresh` entrega sólo el `report` (`mod.rs:355`), así que `RefreshOutcome` no cambia. Las fases son siete:
+`refresh` (`crates/clawg-core/src/memory/project_docs/mod.rs:488`) MUST medir con `Instant`, por doc, el tiempo de cada fase y MUST devolverlo aparte de `RefreshReport`, en un `RefreshRun { report, timing }` (`RefreshRun`, `mod.rs:153`; `RefreshTiming`, `:133`; `DocTiming`, `:120`; `DocPhases`, `:96`). `RefreshReport` se compara por igualdad en los tests del refresco (`an_unchanged_project_embeds_nothing`, `a_changed_doc_replaces_its_passages_and_a_deleted_one_loses_them`, `a_doc_left_out_is_neither_indexed_nor_counted`, `mod.rs:1189`, `:1209` y `:1243`) y MUST NOT ganar un campo que dependa del reloj; `try_refresh` entrega sólo el `report` (`mod.rs:358`), así que `RefreshOutcome` no cambia. Las fases son siete:
 
 | Fase | Qué cubre |
 |---|---|
-| `scan` | Recorrer, leer y hashear todo el árbol, más las huellas guardadas, el plan y lo que se arma antes del bucle (`mod.rs:494-512`). Una vez por refresco, no por doc |
-| `read` | `corpus::read` del doc a reindexar (`mod.rs:519`) |
-| `mask` | `redact` (`mod.rs:527`) |
-| `split` | `passages` (`mod.rs:529`) |
-| `lookup` | Los vectores guardados del doc y `reuse_plan` (`mod.rs:531-540`) |
-| `embed` | `embed_passages` (`mod.rs:541`) |
-| `write` | `fill`, los contadores y `replace_doc` de cada doc (`mod.rs:552-559`), y `remove_docs` (`:562`) |
+| `scan` | Recorrer, leer y hashear todo el árbol, más las huellas guardadas, el plan y lo que se arma antes del bucle (`mod.rs:496-514`). Una vez por refresco, no por doc |
+| `read` | `corpus::read` del doc a reindexar (`mod.rs:525-526`) |
+| `mask` | `redact` (`mod.rs:532-533`) |
+| `split` | `passages` (`mod.rs:534-535`) |
+| `lookup` | Los vectores guardados del doc y `reuse_plan` (`mod.rs:536-545`) |
+| `embed` | La llamada al embedder del vaciado (`embed_passages`, `mod.rs:755`), repartida entre los docs del vaciado según sus textos (`embed_shares`, `mod.rs:758`) |
+| `write` | `fill`, los contadores y `replace_doc` de cada doc (`mod.rs:770-783`), y `remove_docs` (`:556`) |
 
-Entre dos fases no queda trabajo sin medir: cada una empieza donde terminó la anterior (`lap`, `mod.rs:570`), así que las fases de un doc suman todo su tiempo en el bucle. La remoción de los docs que ya no están se mide aparte (`RefreshTiming::remove`) y `RefreshTiming::phases` (`mod.rs:142`) la suma a `write`.
+Entre dos fases no queda trabajo sin medir: cada una empieza donde terminó la anterior (`lap`, `mod.rs:640`), así que las fases suman todo el tiempo del bucle. La remoción de los docs que ya no están se mide aparte (`RefreshTiming::remove`) y `RefreshTiming::phases` (`mod.rs:144`) la suma a `write`.
 
 Lo que el refresco devuelve de cada doc reindexado MUST llevar su ruta relativa, su `DocKind` (`crates/clawg-core/src/memory/project_docs/corpus.rs:37`), cuántos pasajes escribió y la duración de `read`, `mask`, `split`, `lookup`, `embed` y `write`. Un doc que no se pudo leer, o que quedó como estaba por un vector inservible, lleva su entrada con cero pasajes y las fases que alcanzó a recorrer. La ruta sirve para repartir por área ([`specs/eval`](../eval/spec.md), IC7) y MUST NOT llegar a ningún archivo de resultados. La medición MUST ser pura (`Duration` y conteos). El refresco MUST escribir exactamente lo que escribía: los mismos docs, pasajes, vectores y huellas, y el mismo `RefreshReport`.
 
@@ -303,10 +385,10 @@ Lo que el refresco devuelve de cada doc reindexado MUST llevar su ruta relativa,
 #### Escenario: nada cambió
 - GIVEN un proyecto ya indexado
 - WHEN se refresca sin tocar el disco
-- THEN los tiempos no traen ningún doc, `embed` vale cero, `write` es sólo la llamada a `remove_docs`, que vuelve sin tocar el store cuando no hay nada que quitar (`mod.rs:759-762`): casi cero, no cero, y `scan` está medido
+- THEN los tiempos no traen ningún doc, `embed` vale cero, `write` es sólo la llamada a `remove_docs`, que vuelve sin tocar el store cuando no hay nada que quitar (`mod.rs:971-973`): casi cero, no cero, y `scan` está medido
 
 #### Escenario: un doc que no se leyó
-- GIVEN un doc que desaparece entre el recorrido y la lectura (`mod.rs:522-526`)
+- GIVEN un doc que desaparece entre el recorrido y la lectura (`mod.rs:525-531`)
 - WHEN se refresca
 - THEN no entra a los pasajes ni a `RefreshReport::indexed`, cuenta como saltado, y su `read` cuenta igual en el total de la fase
 
@@ -314,13 +396,13 @@ Lo que el refresco devuelve de cada doc reindexado MUST llevar su ruta relativa,
 
 ### IC2. La línea del daemon
 
-Después de `indexed the docs of …` (`refresh_docs`, `crates/clawg-cli/src/daemon/api.rs:3016`) el daemon MUST escribir una línea `info`, armada por `refresh_timing_line` (`api.rs:2999`):
+Después de `indexed the docs of …` (`refresh_docs`, `crates/clawg-cli/src/daemon/api.rs:3046`) el daemon MUST escribir una línea `info`, armada por `refresh_timing_line` (`api.rs:3029`):
 
 ```
 docs refresh of {project_id}: done in {s} s: scan {s}, read {s}, mask {s}, split {s}, lookup {s}, embed {s}, write {s}
 ```
 
-con `done in` el tiempo total del refresco y cada fase en segundos, `read` a `write` sumados sobre los docs, en el formato de segundos del resumen de una importación (`seconds`, `crates/clawg-core/src/memory/portability/timing.rs:102`, que usa `Summary`, `:179`): una cifra decimal. La línea MUST salir sólo cuando el refresco terminó bien, sin nombres de doc ni rutas. `refresh_line` (`api.rs:2990`) MUST NOT cambiar. MUST NOT haber series nuevas en `metrics.db`: `record_refresh` (`api.rs:3036`) sigue registrando `docs.refresh.duration` y `docs.refresh.files` y nada más.
+con `done in` el tiempo total del refresco y cada fase en segundos, `read` a `write` sumados sobre los docs, en el formato de segundos del resumen de una importación (`seconds`, `crates/clawg-core/src/memory/portability/timing.rs:102`, que usa `Summary`, `:179`): una cifra decimal. La línea MUST salir sólo cuando el refresco terminó bien, sin nombres de doc ni rutas. `refresh_line` (`api.rs:3020`) MUST NOT cambiar. MUST NOT haber series nuevas en `metrics.db`: `record_refresh` (`api.rs:3066`) sigue registrando `docs.refresh.duration` y `docs.refresh.files` y nada más.
 
 #### Escenario: la línea
 - GIVEN los tiempos de un refresco con `scan` 0,5 s, `read` 0,25 s, `mask` 0,5 s, `split` 1 s, `lookup` 0 s, `embed` 3 s y `write` 0,75 s, y 6 s de total
@@ -336,7 +418,7 @@ con `done in` el tiempo total del refresco y cada fase en segundos, `read` a `wr
 
 ## Secretos
 
-El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory/redact.rs:235`; `project_docs/mod.rs:527`) antes de trocearse. Ningún pasaje, vector ni entrada léxica MUST contener un secreto que reconozca el detector de [`specs/secrets`](../secrets/spec.md) (R1); una marca privada abierta en un doc enmascara, en el índice, hasta el próximo cierre o el final del archivo. La huella usa los bytes del disco, sin enmascarar.
+El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory/redact.rs:235`; `project_docs/mod.rs:532`) antes de trocearse. Ningún pasaje, vector ni entrada léxica MUST contener un secreto que reconozca el detector de [`specs/secrets`](../secrets/spec.md) (R1); una marca privada abierta en un doc enmascara, en el índice, hasta el próximo cierre o el final del archivo. La huella usa los bytes del disco, sin enmascarar.
 
 #### Escenario
 - GIVEN `docs/setup.md` con una clave `sk-ant-…` de formato válido
@@ -353,11 +435,11 @@ El texto de un doc MUST pasar entero por `redact` (`crates/clawg-core/src/memory
 - El `error` del 403 (`not_accepted`, `api.rs:2743`) MUST decir qué raíces lee el daemon y nombrar la raíz y el comando con que el usuario la acepta. Cuando el perfil del daemon no es `prod`, el comando lleva su `--profile`: «clawg reads the files of the projects the user added, and of the one a bridge was started in when that folder has a .git or a manifest and is not the home directory or a filesystem root; `<raíz>` is neither. Ask the user to run ``clawg projects add "<raíz>" --profile dev`` if they want it searched, then call again». Lo arma el daemon, que sabe su perfil, así que también lo lee bien un puente de una versión anterior.
 - Con el embedder sin cargar o fallado MUST responder como `POST /v1/search` (503 con el mismo cuerpo, [`specs/ingest`](../ingest/spec.md)). Se comprueba después del 404 y del 403.
 - `limit` MUST tomar 5 si falta (`DEFAULT_DOCS_LIMIT`, `api.rs:2710`) y MUST quedar entre 1 y 20 (`clamp_docs_limit`, `api.rs:2712`; `MAX_DOCS_LIMIT`, `api.rs:2708`): 0 vale 1.
-- Si el último refresco del proyecto empezó hace 60 s o más (`REFRESH_INTERVAL`, `mod.rs:32`) o nunca empezó, y no hay uno en curso, MUST tomar la marca (`begin_if_due`, `needs_refresh`) y lanzar el refresco en una tarea propia (`refresh_docs_in_background`, `api.rs:2664`), que MUST seguir hasta el final aunque la petición se cancele. MUST esperarlo a lo sumo 3 s (`REFRESH_GRACE`, `api.rs:2701`), o 20 s si el índice del proyecto está vacío (`FIRST_INDEX_WAIT`, `api.rs:2695`), y después buscar en lo que haya indexado.
+- Si el último refresco del proyecto empezó hace 60 s o más (`REFRESH_INTERVAL`, `mod.rs:34`) o nunca empezó, y no hay uno en curso, MUST tomar la marca (`begin_if_due`, `needs_refresh`) y lanzar el refresco en una tarea propia (`refresh_docs_in_background`, `api.rs:3014`), que MUST seguir hasta el final aunque la petición se cancele. MUST esperarlo a lo sumo 3 s (`REFRESH_GRACE`, `api.rs:3090`), o 20 s si el índice del proyecto está vacío (`FIRST_INDEX_WAIT`, `api.rs:3084`), y después buscar en lo que haya indexado.
 - Si hay un refresco del proyecto en curso que no lanzó esta búsqueda y el índice del proyecto está vacío (el primero, que suele lanzar el registro del puente un momento antes), MUST esperarlo hasta `FIRST_INDEX_WAIT` antes de buscar, para no contestar "los docs no dicen nada" mientras se arman. Con un índice ya armado no espera: contesta con lo que hay.
 - Un refresco fallido MUST NOT impedir la búsqueda sobre lo que ya está indexado. Mientras el proyecto tenga guardado el error de su último refresco ([«Refresco incremental»](#refresco-incremental)), sea de la búsqueda o de uno en segundo plano, la respuesta MUST traerlo en `warning`.
 - `indexing` MUST ser `true` si un refresco del proyecto está en curso al responder.
-- La búsqueda (`search`, `mod.rs:397`) MUST combinar dos listas, cada una de hasta 50 pasajes del proyecto (`CANDIDATES_PER_CHANNEL`, `mod.rs:37`): los vecinos más cercanos al vector de la consulta (rol `Query`) y los mejores por BM25 de FTS5 con la misma expresión de consulta que usa la búsqueda léxica de memorias (`fts_match_expression` con `MAX_LEXICAL_TOKENS`, `crates/clawg-core/src/memory/search.rs:748` y `:728`). MUST fusionarlas por rango recíproco (`fuse`, `mod.rs:382`: `1 / (60 + rango)`, rango desde 1, sumado si un pasaje está en las dos; `RRF_K`, `mod.rs:42`), ordenar por puntaje y desempatar por id de pasaje menor. Usa rangos y no el piso de coseno ni el bono léxico de las memorias, que se calibraron sobre otro corpus.
+- La búsqueda (`search`, `mod.rs:399`) MUST combinar dos listas, cada una de hasta 50 pasajes del proyecto (`CANDIDATES_PER_CHANNEL`, `mod.rs:39`): los vecinos más cercanos al vector de la consulta (rol `Query`) y los mejores por BM25 de FTS5 con la misma expresión de consulta que usa la búsqueda léxica de memorias (`fts_match_expression` con `MAX_LEXICAL_TOKENS`, `crates/clawg-core/src/memory/search.rs:748` y `:728`). MUST fusionarlas por rango recíproco (`fuse`, `mod.rs:384`: `1 / (60 + rango)`, rango desde 1, sumado si un pasaje está en las dos; `RRF_K`, `mod.rs:44`), ordenar por puntaje y desempatar por id de pasaje menor. Usa rangos y no el piso de coseno ni el bono léxico de las memorias, que se calibraron sobre otro corpus.
 - MUST NOT devolver pasajes de otro proyecto.
 - `text` MUST ser el cuerpo del pasaje, sin el breadcrumb repetido.
 

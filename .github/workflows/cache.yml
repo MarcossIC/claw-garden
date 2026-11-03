@@ -47,11 +47,11 @@ jobs:
         with:
           toolchain: 1.99.1
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace --no-run
-      - run: cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings
+      - run: cargo clippy --locked -p clawg-cli -- -D warnings
       - run: cargo test --locked -p clawg-core --lib build_info --no-run
         if: runner.os == 'Linux'

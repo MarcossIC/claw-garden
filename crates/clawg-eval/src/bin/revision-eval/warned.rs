@@ -350,7 +350,7 @@ impl World<'_> {
     /// Whether the save still held a live row at `at`: made before, not deleted
     /// and not replaced by then.
     fn live(&self, save: usize, at: i64) -> bool {
-        self.groups[save].rows.iter().any(|r| r.created_at < at && self.gone_at.get(&r.id).map_or(true, |&gone| gone > at))
+        self.groups[save].rows.iter().any(|r| r.created_at < at && self.gone_at.get(&r.id).is_none_or(|&gone| gone > at))
     }
 
     fn same_scope(&self, a: usize, b: usize) -> bool {
@@ -1424,7 +1424,7 @@ mod tests {
     fn a_marked_pair_without_a_distance_is_refused_without_naming_it() {
         let rows = [Row::new(1, "a", "p", "earlier"), Row::new(10, "a", "p", "later")];
 
-        let error = select_of(&rows, &[conflict(10, 1, None, true)], at(10)).err().expect("refused");
+        let error = select_of(&rows, &[conflict(10, 1, None, true)], at(10)).expect_err("refused");
 
         assert!(matches!(error, WarnedError::NoDistance(1)), "{error}");
         assert_eq!(error.to_string(), "1 marked pairs carry no distance: a store that did not keep it cannot be measured");
@@ -1525,7 +1525,7 @@ mod tests {
         let with = |edit: &dyn Fn(&mut Vec<LabelLine>)| {
             let mut lines = ok.clone();
             edit(&mut lines);
-            score(&file, &lines).err().expect("refused")
+            score(&file, &lines).expect_err("refused")
         };
 
         for empty in [None, Some(String::new())] {
@@ -1557,7 +1557,7 @@ mod tests {
         };
 
         for empty in [None, Some("")] {
-            let error = score(&file, &lines(empty)).err().expect("refused");
+            let error = score(&file, &lines(empty)).expect_err("refused");
             assert!(matches!(error, WarnedError::EmptyLabel { n: 2, field: "c" }), "{error}");
             assert!(error.keeps_work());
         }
@@ -1594,7 +1594,7 @@ mod tests {
 
     #[test]
     fn the_precision_is_the_revisions_among_the_marked_with_their_wilson_interval() {
-        let scored = Case::new(&marked_spread(100, 90), &vec![false; 100]).score();
+        let scored = Case::new(&marked_spread(100, 90), &[false; 100]).score();
 
         assert_eq!((scored.precision.k, scored.precision.n), (90, 100));
         let wilson = crate::stats::Rate::of(90, 100);
@@ -1605,7 +1605,7 @@ mod tests {
     #[test]
     fn the_minimum_precision_comes_from_the_prevalence_of_the_marked_pairs_and_the_rest() {
         // 90 revisions among 100 marked, none among 100 of the rest, which is all of it: π = 0.45.
-        let scored = Case::new(&marked_spread(100, 90), &vec![false; 100]).score();
+        let scored = Case::new(&marked_spread(100, 90), &[false; 100]).score();
 
         assert!((scored.prevalence.estimate - 0.45).abs() < 1e-12 && scored.prevalence.census);
         assert!((scored.p_min - 0.9 / 1.45).abs() < 1e-12, "{}", scored.p_min);
@@ -1645,7 +1645,7 @@ mod tests {
 
     #[test]
     fn the_warning_stays_when_the_lower_bound_of_the_precision_clears_the_minimum() {
-        let scored = Case::new(&marked_spread(100, 90), &vec![false; 100]).score();
+        let scored = Case::new(&marked_spread(100, 90), &[false; 100]).score();
 
         assert_eq!(scored.decision, Decision::Keeps);
         assert!(scored.precision.lo > scored.p_min);
@@ -1761,7 +1761,7 @@ mod tests {
         file.pairs[0].distance = None;
         let lines = Case::new(&marked_spread(3, 1), &[false]).lines();
 
-        let error = score(&file, &lines).err().expect("refused");
+        let error = score(&file, &lines).expect_err("refused");
 
         assert!(matches!(error, WarnedError::NoDistance(1)), "{error}");
     }

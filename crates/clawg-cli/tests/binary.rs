@@ -21,6 +21,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clawg_cli::client::{Call, DaemonClient};
+use clawg_core::metrics::store::{MetricsDb, METRICS_FILE};
 use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_clawg");
@@ -804,17 +805,16 @@ async fn a_daemon_measures_its_pipeline_and_keeps_its_events() {
 #[tokio::test]
 async fn a_killed_daemon_leaves_its_run_not_stopped() {
     let sandbox = Sandbox::new();
-    let daemon = sandbox.serve().await;
-    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
-    daemon.wait_for_exit(Duration::from_secs(5)).await;
-    drop(daemon);
-
     let killed = sandbox.serve().await;
     killed.kill();
     drop(killed);
 
-    let report = metrics_report(&sandbox, &["--metric", "http.duration"]);
-    assert_eq!(report["runs"], json!({ "total": 2, "not_stopped": 1 }), "{report}");
+    // Read from the file: `report` knows a metric only once a minute of it is
+    // written, and a kill writes none. No stopped run to compare with, since
+    // past `METRICS_CLOSE` a stop leaves its run without an end too.
+    let db = MetricsDb::open_read_only(&sandbox.data_dir().join(METRICS_FILE)).expect("metrics.db");
+    let runs = db.runs_since(0).expect("runs");
+    assert_eq!(runs.iter().map(|run| run.stopped_at_ms).collect::<Vec<_>>(), [None]);
 }
 
 #[tokio::test]
@@ -1078,8 +1078,9 @@ impl DaemonWithoutJobs {
         use axum::extract::{Request, State};
         use axum::middleware::{from_fn_with_state, Next};
         use axum::response::Response;
+        type Requests = Arc<Mutex<Vec<(String, String)>>>;
         let requests = Arc::new(Mutex::new(Vec::new()));
-        async fn note(State(requests): State<Arc<Mutex<Vec<(String, String)>>>>, request: Request, next: Next) -> Response {
+        async fn note(State(requests): State<Requests>, request: Request, next: Next) -> Response {
             let (parts, body) = request.into_parts();
             let body = axum::body::to_bytes(body, 1 << 20).await.expect("the request body");
             let line = format!("{} {}", parts.method, parts.uri.path());
@@ -2411,11 +2412,12 @@ async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
 const UNCAUSED_SCHEMA: i32 = 16;
 
 type Row = (i64, String, String, Option<i64>, Option<String>, bool);
+type Seed = (i64, &'static str, &'static str, Option<i64>, Option<&'static str>, bool);
 
 /// `(id, content, status, superseded_by, topic_key, deleted)`. 2 revised 1;
 /// 4 revised 3 until a verdict undid it; 6 won a verdict over 5; 8 revised 7
 /// and was deleted.
-const UNCAUSED_ROWS: [(i64, &str, &str, Option<i64>, Option<&str>, bool); 8] = [
+const UNCAUSED_ROWS: [Seed; 8] = [
     (1, "storage engine is SQLite", "superseded", Some(2), Some("storage/engine"), false),
     (2, "storage engine moved to Postgres", "active", None, Some("storage/engine"), false),
     (3, "the daemon listens on port 27380", "active", None, Some("api/port"), false),

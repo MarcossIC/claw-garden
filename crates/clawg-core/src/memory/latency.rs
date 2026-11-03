@@ -89,7 +89,7 @@ fn nearest_rank(sorted: &[u64], p: u64) -> u64 {
     let n = sorted.len() as u64;
     debug_assert!(n > 0, "nearest_rank called on an empty window");
     // Integer ceiling of (p * n) / 100 without floating point.
-    let rank = (p * n + 99) / 100;
+    let rank = (p * n).div_ceil(100);
     let idx = rank.saturating_sub(1).min(n.saturating_sub(1));
     sorted[idx as usize]
 }

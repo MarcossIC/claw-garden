@@ -124,6 +124,8 @@ Medir, y si no hay espera medible, cerrar sin código y dejar la prueba como reg
 - **doctor-checks (31), `clawg status` y `clawg secrets`.** Ya abren una conexión de lectura propia con `open_for_probe` (`backup.rs:528`, `:479`, `secrets.rs:40`) cuando el daemon está parado o sobre snapshots; no cambian. Con un daemon andando, `status` va por HTTP y no abre la base. Un chequeo de doctor que mire invariantes con el daemon andando tendría un lector natural; no es de este cambio.
 - **query-plans (56).** Hermano de esta exploración: abarata las consultas del contexto. Se complementan: un plan mejor baja la duración de cada lectura, el lector evita que espere a una escritura. Conviene que 56 se mida antes, porque si el contexto queda en microsegundos, su espera en la cola pesa menos.
 - **save-bounds (54).** Acota la duración de un guardado largo en el único hilo de escritura; este cambio no depende de eso pero se mide mejor con 54 entregado.
+- **search-arm-timing (101).** Arregla las duraciones por brazo que esta medición leería. Su enfoque C, todos los brazos en una sola llamada, se decide acá si la medición lo pide.
+- **storage-read-side (108).** Separa lectura y escritura con un tipo. Ninguno depende del otro: si este cambio pasa su puerta, `read` se enruta al lector.
 - **Specs:** `openspec/specs/storage/spec.md` (una conexión de escritura y las de lectura, el orden del cierre) y, si cambia `/health`, la de ingest. No cambia el contrato de `/health`, sólo cómo se calcula.
 
 ## Alcance candidato

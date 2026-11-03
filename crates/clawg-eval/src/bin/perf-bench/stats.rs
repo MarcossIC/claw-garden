@@ -33,7 +33,7 @@ pub struct Change {
 pub const RESAMPLES: usize = 4_000;
 
 /// Fixed so the same two files always print the same interval.
-pub const SEED: u64 = 0x5EED_0F_BE7C;
+pub const SEED: u64 = 0x5E_ED0F_BE7C;
 
 const ALPHA: f64 = 0.05;
 

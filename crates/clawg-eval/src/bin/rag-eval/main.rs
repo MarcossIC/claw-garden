@@ -428,6 +428,7 @@ async fn case_scale(
 /// Scores the golden cases over the seeded store and writes the results.
 /// `resolved` holds each case's project and cited saves in a background, in
 /// the order of the cases; it is empty without one.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn measure(
     cli: &cli::Cli,
     loaded_golden: &golden::LoadedGolden,
@@ -542,7 +543,8 @@ async fn measure(
     // possible; the production detector applies ONE threshold to both
     // languages, so whether one threshold can serve both is a question the
     // combined curve cannot answer.
-    let mut by_lang: BTreeMap<String, (Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    type Buckets = (Vec<f64>, Vec<f64>, Vec<f64>);
+    let mut by_lang: BTreeMap<String, Buckets> = BTreeMap::new();
     for pair in &golden_set.contradiction_pairs {
         // Passage/Passage, matching production: `worker.rs`'s contradiction
         // hook compares a Passage chunk against Passage-embedded stored rows,

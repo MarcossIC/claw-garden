@@ -412,7 +412,7 @@ mod tests {
         let uq = to_unit(&query).unwrap();
         let dist: f32 = ub.iter().zip(uq.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
         assert!(
-            dist >= NEAR_DUPLICATE_FLOOR && dist < CONTRADICTION_THRESHOLD,
+            (NEAR_DUPLICATE_FLOOR..CONTRADICTION_THRESHOLD).contains(&dist),
             "near() must produce unit-space distance in [{NEAR_DUPLICATE_FLOOR}, {CONTRADICTION_THRESHOLD}); got {dist}"
         );
 
@@ -662,7 +662,7 @@ mod tests {
         let uq = to_unit(&query).unwrap();
         let dist: f32 = ub.iter().zip(uq.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
         assert!(
-            dist >= NEAR_DUPLICATE_FLOOR && dist < CONTRADICTION_THRESHOLD,
+            (NEAR_DUPLICATE_FLOOR..CONTRADICTION_THRESHOLD).contains(&dist),
             "fixture must land inside [{NEAR_DUPLICATE_FLOOR}, {CONTRADICTION_THRESHOLD}) so only \
              the candidate gate can produce an empty result; got {dist}"
         );
@@ -826,7 +826,7 @@ mod tests {
         let uq = to_unit(&query).unwrap();
         let dist: f32 = ub.iter().zip(uq.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
         assert!(
-            dist >= NEAR_DUPLICATE_FLOOR && dist < CONTRADICTION_THRESHOLD,
+            (NEAR_DUPLICATE_FLOOR..CONTRADICTION_THRESHOLD).contains(&dist),
             "fixture must land inside [{NEAR_DUPLICATE_FLOOR}, {CONTRADICTION_THRESHOLD}); got {dist}"
         );
 

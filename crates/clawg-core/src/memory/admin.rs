@@ -3593,7 +3593,7 @@ mod tests {
             })
             .await
             .unwrap()
-            .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+            .map(|b| b.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect())
     }
 
     async fn text_matches(store: &MemoryStore, word: &str) -> Vec<i64> {
@@ -4409,10 +4409,12 @@ mod tests {
         columns(store, id).await.0.expect("deleted")
     }
 
-    async fn pairs(store: &MemoryStore) -> Vec<(i64, i64, String, Option<String>)> {
+    type Pair = (i64, i64, String, Option<String>);
+
+    async fn pairs(store: &MemoryStore) -> Vec<Pair> {
         store
             .conn
-            .call(|c| -> rusqlite::Result<Vec<(i64, i64, String, Option<String>)>> {
+            .call(|c| -> rusqlite::Result<Vec<Pair>> {
                 let mut stmt = c.prepare("SELECT new_id, old_id, state, verdict FROM memory_conflict ORDER BY new_id, old_id")?;
                 let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
                 rows.collect()

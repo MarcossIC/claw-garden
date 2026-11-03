@@ -1,12 +1,12 @@
-/// Tier promotion and demotion logic for the RAG access-tracker.
-///
-/// The two directions are deliberately separate functions, not one that reads
-/// a signed delta: [`compute_tier`] is **promote-only** — it never returns a
-/// tier number greater than `current` (lower numbers = higher tier) — and
-/// [`demote_inactive`] is the only thing that lowers one on its own. A single
-/// function would let an access event demote a row, which is exactly
-/// backwards. [`retier`] is the one other way down, and only on request: a
-/// correction takes away the tier the corrected field was giving.
+//! Tier promotion and demotion logic for the RAG access-tracker.
+//!
+//! The two directions are deliberately separate functions, not one that reads
+//! a signed delta: [`compute_tier`] is **promote-only** — it never returns a
+//! tier number greater than `current` (lower numbers = higher tier) — and
+//! [`demote_inactive`] is the only thing that lowers one on its own. A single
+//! function would let an access event demote a row, which is exactly
+//! backwards. [`retier`] is the one other way down, and only on request: a
+//! correction takes away the tier the corrected field was giving.
 
 use crate::memory::MemoryError;
 

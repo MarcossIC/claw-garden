@@ -177,10 +177,7 @@ fn decode(bytes: &[u8], contract: &MemoContract) -> Result<HashMap<Key, Vec<f32>
         .chunks_exact(entry_bytes)
         .map(|entry| {
             let key: Key = entry[..32].try_into().expect("a 32-byte key");
-            let vector = entry[32..]
-                .chunks_exact(4)
-                .map(|f| f32::from_le_bytes(f.try_into().expect("four bytes")))
-                .collect();
+            let vector = entry[32..].as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect();
             (key, vector)
         })
         .collect())

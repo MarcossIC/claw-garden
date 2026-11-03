@@ -81,10 +81,7 @@ impl Histogram {
         if buckets.len() != len * 8 {
             return Err(BadBuckets);
         }
-        let buckets: Vec<u64> = buckets
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().expect("chunks of eight")))
-            .collect();
+        let buckets: Vec<u64> = buckets.as_chunks::<8>().0.iter().copied().map(u64::from_le_bytes).collect();
         let count = buckets.iter().fold(0u64, |acc, n| acc.saturating_add(*n));
         Ok(Self { unit, buckets, count, sum, min, max })
     }

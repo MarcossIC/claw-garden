@@ -946,6 +946,7 @@ async fn embed_pieces(
 
 /// Stores the pieces of `evt` and returns its report with the pieces to link,
 /// in order, each with the head its vector was embedded behind.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn ingest_pieces(
     evt: &MemoryEvent,
     saver: &Reader,
@@ -1081,8 +1082,8 @@ async fn store_pieces(to: &PieceStore<'_>, absorbed: &mut u64, gated: &mut Gated
         .map(|(_, candidate)| candidate)
         .collect();
         let candidates = record.candidates.clone();
-        let note = note_for(track, &noted, position, &content_hash, true, context(position));
-        let absorbed_note = note_for(track, &noted, position, &content_hash, false, "");
+        let note = note_for(track, noted, position, &content_hash, true, context(position));
+        let absorbed_note = note_for(track, noted, position, &content_hash, false, "");
         let id = match store.insert_unless_twin(saver, record, vec, note, absorbed_note).await {
             Ok(Insert::Inserted(id)) => id,
             Ok(Insert::Absorbed(id)) => {
@@ -2035,8 +2036,9 @@ mod tests {
 
         // Fetch all rows ordered by id
         let conn = store.conn.clone();
-        let rows: Vec<(i64, String, Option<String>, i64)> = conn
-            .call(|c| -> Result<Vec<(i64, String, Option<String>, i64)>, rusqlite::Error> {
+        type Row = (i64, String, Option<String>, i64);
+        let rows: Vec<Row> = conn
+            .call(|c| -> Result<Vec<Row>, rusqlite::Error> {
                 let mut stmt = c.prepare(
                     "SELECT id, status, disputed_against, access_count FROM memory ORDER BY id ASC"
                 )?;

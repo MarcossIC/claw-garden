@@ -157,6 +157,7 @@ impl From<rusqlite::Error> for SubfolderError {
 }
 
 /// What a declaration of `subpath` would do, decided on the connection.
+#[expect(clippy::large_enum_variant, reason = "one per declaration, matched as soon as it returns; none is stored")]
 enum Step {
     Done(Declared),
     /// `other` holds nothing but this subfolder: it is merged into the target.
