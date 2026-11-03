@@ -41,7 +41,6 @@ use clawg_cli::stop;
 use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::embedder::keep_one_malloc_arena;
-use clawg_core::memory::secrets::{mask_reasons, purge, purge_delete, scan};
 use clawg_core::paths::data_dir;
 
 /// Exit code for "the command ran and failed", as opposed to clap's `2` for
@@ -189,43 +188,15 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(if finished.ok { ExitCode::SUCCESS } else { ExitCode::from(EXIT_FAILURE) })
         }
 
-        Command::Secrets { mask_reasons: true, yes, profile } => {
-            let profile = profile.resolve()?;
-            let base_dir = data_dir(profile)?;
-            let lang = language(&base_dir);
-            secrets::confirm_mask_reasons(lang, yes).map_err(CliError::Failed)?;
-            let masked =
-                mask_reasons(&base_dir).map_err(|e| CliError::Failed(secrets::explain(lang, e, secrets::Rewrite::MaskReasons)))?;
-            println!("{}", secrets::mask_report(lang, &masked));
-            Ok(ExitCode::SUCCESS)
-        }
-
-        Command::Secrets { mask_reasons: false, profile, .. } => {
-            let profile = profile.resolve()?;
-            let base_dir = data_dir(profile)?;
-            let scanned = scan(&base_dir)?;
-            println!("{}", secrets::report(language(&base_dir), &scanned));
+        Command::Secrets { mask_reasons, yes, profile } => {
+            let base_dir = data_dir(profile.resolve()?)?;
+            println!("{}", secrets::command(&base_dir, mask_reasons, yes)?);
             Ok(ExitCode::SUCCESS)
         }
 
         Command::Purge { id, project_delete, yes, profile } => {
-            let profile = profile.resolve()?;
-            let base_dir = data_dir(profile)?;
-            let lang = language(&base_dir);
-            match (id, project_delete) {
-                (Some(id), None) => {
-                    secrets::confirm(lang, id, yes).map_err(CliError::Failed)?;
-                    let purged = purge(&base_dir, id).map_err(|e| CliError::Failed(secrets::explain(lang, e, secrets::Rewrite::Purge)))?;
-                    println!("{}", secrets::purge_report(lang, id, &purged));
-                }
-                (None, Some(delete_id)) => {
-                    secrets::confirm_delete(lang, delete_id, yes).map_err(CliError::Failed)?;
-                    let purged =
-                        purge_delete(&base_dir, delete_id).map_err(|e| CliError::Failed(secrets::explain(lang, e, secrets::Rewrite::Purge)))?;
-                    println!("{}", secrets::purge_delete_report(lang, delete_id, &purged));
-                }
-                _ => return Err(CliError::Failed("name a memory to purge, or a delete with --project-delete".to_string())),
-            }
+            let base_dir = data_dir(profile.resolve()?)?;
+            println!("{}", secrets::purge(&base_dir, id, project_delete, yes)?);
             Ok(ExitCode::SUCCESS)
         }
 
