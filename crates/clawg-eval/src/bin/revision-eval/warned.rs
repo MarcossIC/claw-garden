@@ -350,7 +350,7 @@ impl World<'_> {
     /// Whether the save still held a live row at `at`: made before, not deleted
     /// and not replaced by then.
     fn live(&self, save: usize, at: i64) -> bool {
-        self.groups[save].rows.iter().any(|r| r.created_at < at && self.gone_at.get(&r.id).map_or(true, |&gone| gone > at))
+        self.groups[save].rows.iter().any(|r| r.created_at < at && self.gone_at.get(&r.id).is_none_or(|&gone| gone > at))
     }
 
     fn same_scope(&self, a: usize, b: usize) -> bool {

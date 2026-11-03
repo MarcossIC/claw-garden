@@ -170,7 +170,7 @@ fn leaf(breadcrumb: &str) -> Option<&str> {
 }
 
 pub fn matches(hit: &EvalDocHit, expected: &ExpectedDoc) -> bool {
-    hit.path == expected.path && expected.heading.as_deref().map_or(true, |h| leaf(&hit.breadcrumb) == Some(h))
+    hit.path == expected.path && expected.heading.as_deref().is_none_or(|h| leaf(&hit.breadcrumb) == Some(h))
 }
 
 /// The rank, from 1, of the first hit that answers the question.
