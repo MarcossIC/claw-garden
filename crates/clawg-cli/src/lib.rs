@@ -24,6 +24,7 @@
 //! taken inside `MemoryStore::open` (`clawg_core::memory::store_lock`) refuses
 //! a second opener, whether it is another daemon or an evaluation run.
 
+pub mod backup;
 pub mod cli;
 pub mod client;
 pub mod daemon;

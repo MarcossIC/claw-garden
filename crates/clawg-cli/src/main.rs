@@ -13,11 +13,11 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use clawg_cli::backup;
 use clawg_cli::cli::{
     is_bare_invocation, is_hook_invocation, preferences_profile, sharing_profile, Cli, Command, MetricsAction, PathAction,
     ProfileArg, ProjectsAction, SetupClient,
 };
-use clawg_cli::client::{probe_running, ClientError, Probe};
 use clawg_cli::daemon::lifecycle::now_ms;
 use clawg_cli::daemon::serve;
 use clawg_cli::doctor;
@@ -40,7 +40,7 @@ use clawg_cli::status;
 use clawg_cli::stop;
 use clawg_cli::undelete;
 use clawg_cli::update;
-use clawg_core::memory::backup::{backup_offline, restore};
+use clawg_core::memory::backup::restore;
 use clawg_core::memory::embedder::keep_one_malloc_arena;
 use clawg_core::memory::identity::Disk;
 use clawg_core::memory::portability::export::project_id_of;
@@ -168,19 +168,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
         }
 
         Command::Backup { profile } => {
-            let profile = profile.resolve()?;
-            let base_dir = data_dir(profile)?;
-            // A running daemon holds the store and its only connection, so the
-            // snapshot has to come from it; with none, no daemon is started
-            // just to copy a file.
-            let path = match probe_running(&base_dir, false).await {
-                Ok(Probe::Running(client)) => client.backup().await?,
-                Ok(Probe::NeedsStart) | Err(ClientError::NotRunning) => {
-                    backup_offline(&base_dir)?
-                }
-                Err(e) => return Err(e.into()),
-            };
-            println!("{}", path.display());
+            let base_dir = data_dir(profile.resolve()?)?;
+            println!("{}", backup::command(&base_dir).await?.display());
             Ok(ExitCode::SUCCESS)
         }
 
