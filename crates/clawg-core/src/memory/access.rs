@@ -1,24 +1,24 @@
-/// Fire-and-forget access tracker for the RAG hot path.
-///
-/// [`AccessTracker`] receives memory IDs via [`record`] from the retrieval hot
-/// path and forwards them to an async worker over an unbounded channel.  The
-/// worker uses `tokio::select!` to flush the buffer either when 30 seconds
-/// elapse or when ≥500 entries accumulate.
-///
-/// # Design decisions
-///
-/// * An `UnboundedSender` — sender-only public surface keeps the struct
-///   `Send + Sync` without an interior `Connection`.  The hot path MUST
-///   NOT block; `UnboundedSender::send` never awaits, and the one `Mutex`
-///   guards the worker handle, which only `shutdown` touches.
-/// * `record` is synchronous, infallible, and zero-copy beyond the `Vec<i64>`
-///   already owned by the caller.
-/// * Empty vectors are discarded at `record` entry — no channel traffic for
-///   no-op calls.
-/// * Flush errors are logged via `log::warn!` and the worker continues —
-///   never panics.
-///
-/// [`record`]: AccessTracker::record
+//! Fire-and-forget access tracker for the RAG hot path.
+//!
+//! [`AccessTracker`] receives memory IDs via [`record`] from the retrieval hot
+//! path and forwards them to an async worker over an unbounded channel.  The
+//! worker uses `tokio::select!` to flush the buffer either when 30 seconds
+//! elapse or when ≥500 entries accumulate.
+//!
+//! # Design decisions
+//!
+//! * An `UnboundedSender` — sender-only public surface keeps the struct
+//!   `Send + Sync` without an interior `Connection`.  The hot path MUST
+//!   NOT block; `UnboundedSender::send` never awaits, and the one `Mutex`
+//!   guards the worker handle, which only `shutdown` touches.
+//! * `record` is synchronous, infallible, and zero-copy beyond the `Vec<i64>`
+//!   already owned by the caller.
+//! * Empty vectors are discarded at `record` entry — no channel traffic for
+//!   no-op calls.
+//! * Flush errors are logged via `log::warn!` and the worker continues —
+//!   never panics.
+//!
+//! [`record`]: AccessTracker::record
 
 use std::collections::HashMap;
 use std::sync::Mutex;
