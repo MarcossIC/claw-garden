@@ -249,15 +249,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::from(code))
         }
 
-        Command::Metrics { action: MetricsAction::Report { metric, events, labels, by, since, profile } } => {
-            let profile = profile.resolve()?;
-            let base_dir = data_dir(profile)?;
-            let (lang, now) = (language(&base_dir), now_ms() as i64);
-            let printed = match metric {
-                Some(metric) if !events => metrics::report(lang, &base_dir, &metric, &labels, by, since, now).map_err(CliError::Failed)?,
-                _ => metrics::events(lang, &base_dir, since, now).map_err(CliError::Failed)?,
-            };
-            println!("{printed}");
+        Command::Metrics { action } => {
+            let MetricsAction::Report { profile, .. } = &action;
+            let base_dir = data_dir(profile.resolve()?)?;
+            println!("{}", metrics::command(language(&base_dir), &base_dir, &action, now_ms() as i64)?);
             Ok(ExitCode::SUCCESS)
         }
 
