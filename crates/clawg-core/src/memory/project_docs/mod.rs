@@ -793,12 +793,11 @@ async fn write_queued(
 fn embed_shares(total: Duration, texts: &[usize]) -> Vec<Duration> {
     let all: u128 = texts.iter().map(|&n| n as u128).sum();
     let mut shares = vec![0u128; texts.len()];
-    if all > 0 {
+    if let Some(last) = texts.iter().rposition(|&n| n > 0) {
         let nanos = total.as_nanos();
         for (share, &n) in shares.iter_mut().zip(texts) {
             *share = nanos * n as u128 / all;
         }
-        let last = texts.iter().rposition(|&n| n > 0).expect("some doc has texts");
         shares[last] += nanos - shares.iter().sum::<u128>();
     }
     shares.into_iter().map(|n| Duration::new((n / 1_000_000_000) as u64, (n % 1_000_000_000) as u32)).collect()
