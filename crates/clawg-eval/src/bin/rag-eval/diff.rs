@@ -726,8 +726,7 @@ mod tests {
         diff.retrieval.recall_5 = moved(0, 6);
         assert!(regressed(&diff));
 
-        let mut diff = RunDiff::default();
-        diff.agent_view = Some(AgentViewDiff { search_found: moved(0, 6), ..AgentViewDiff::default() });
+        let diff = RunDiff { agent_view: Some(AgentViewDiff { search_found: moved(0, 6), ..AgentViewDiff::default() }), ..RunDiff::default() };
         assert!(regressed(&diff));
     }
 

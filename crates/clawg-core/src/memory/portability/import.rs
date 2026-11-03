@@ -565,8 +565,10 @@ fn settle_projects(
         .zip(&planning.declared)
         .filter_map(|(k, d)| Some((k, d.as_deref()?)))
         .collect();
-    let mut settled = Settled::default();
-    settled.deleted = registry.projects.iter().filter(|(_, p)| p.deleted).map(|(id, _)| id.clone()).collect();
+    let mut settled = Settled {
+        deleted: registry.projects.iter().filter(|(_, p)| p.deleted).map(|(id, _)| id.clone()).collect(),
+        ..Settled::default()
+    };
     let mut taken: HashSet<String> = HashSet::new();
     let mut at = 0;
     for project in projects {
