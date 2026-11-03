@@ -127,9 +127,16 @@ static VEC0_REGISTERED: Once = Once::new();
 /// correct approach for `rusqlite 0.37` (which still exposes the raw FFI).
 /// The `Once` guard makes this idempotent and thread-safe.
 pub(crate) fn ensure_vec0_registered() {
+    // The entry point sqlite3_auto_extension takes; sqlite-vec declares its
+    // init without arguments.
+    type VecInit = unsafe extern "C" fn(
+        *mut rusqlite::ffi::sqlite3,
+        *mut *mut std::ffi::c_char,
+        *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::ffi::c_int;
     VEC0_REGISTERED.call_once(|| {
         unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), VecInit>(
                 sqlite_vec::sqlite3_vec_init as *const (),
             )));
         }
