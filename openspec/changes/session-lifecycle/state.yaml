@@ -8,7 +8,7 @@ artifacts:
   spec: pending
   design: pending
   tasks: pending
-  apply: pending
+  apply: pending  # la parte E, aplicada en 0c172da; A, B, C y D siguen
   verify: pending
   archive: pending
-updated: 2026-10-31
+updated: 2026-11-03

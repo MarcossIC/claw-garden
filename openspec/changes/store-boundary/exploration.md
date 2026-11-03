@@ -25,7 +25,7 @@
 **Todo es público.**
 
 - 44 de los 51 módulos de `memory` son `pub mod` (`crates/clawg-core/src/memory/mod.rs:24-89`), y `clawg-core` tiene 447 `pub fn`. Los otros dos crates usan del orden de 73 rutas, contadas por sus dos primeros segmentos.
-- `pub` apaga `dead_code`. Dos casos conocidos: `insert_episodic_trajectory` (`store_insert.rs:660`), sin llamadores de producción, y `OllamaEmbedder` y `OpenAIEmbedder`, en el backlog de `openspec/README.md`.
+- `pub` apaga `dead_code`. Dos casos conocidos: `insert_episodic_trajectory` (`store_insert.rs:660`), sin llamadores de producción, y `OllamaEmbedder` y `OpenAIEmbedder`, que el backlog de `openspec/README.md` registraba y que `977da21` borró.
 - `MemoryRuntime` declara «Every field is deliberately public» (`runtime.rs:115-120`).
 
 **`MemoryStore` hace de más.** Junta conexión, lock, latencia, métricas, ruta de `sharing.json` y el conjunto de imports en curso (`db.rs:149-176`). `reader_for` lee un archivo desde el store (`db.rs:291-296`), y `importing` es estado de un caso de uso (`crates/clawg-core/src/memory/portability/undo.rs:1218`).

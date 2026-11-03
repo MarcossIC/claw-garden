@@ -123,6 +123,7 @@ At the end of a long session, or before the context is compacted, save a
 - Accomplished: what is done, and what was left half done.
 - Next steps: what comes next, in order.
 - Relevant files: the paths that matter, each with one line on why.
+- Validation: the exact command that checks the work.
 
 The newest summary of the project opens the next session's context, under
 LAST SESSION, whatever that session asks first.
