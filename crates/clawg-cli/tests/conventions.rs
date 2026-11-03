@@ -365,6 +365,25 @@ fn third_party_actions_are_pinned_to_a_commit() {
 }
 
 #[test]
+fn no_workflow_turns_clippy_lints_off() {
+    // Which lints run is [workspace.lints.clippy] of the root manifest; a
+    // command only makes them fail.
+    let mut seen = 0;
+    for name in workflow_files() {
+        for line in workflow_code(&name).iter().filter(|l| l.contains("cargo clippy")) {
+            let sets_a_level = |word: &&str| {
+                ["-A", "-W"].iter().any(|flag| word.starts_with(flag))
+                    || ["--allow", "--warn", "--cap-lints"].iter().any(|flag| *word == *flag || word.starts_with(&format!("{flag}=")))
+            };
+            let flags: Vec<&str> = line.split_whitespace().filter(sets_a_level).collect();
+            assert!(flags.is_empty(), "{name} runs `{}` with {flags:?}", line.trim());
+            seen += 1;
+        }
+    }
+    assert!(seen > 0, "no workflow runs clippy");
+}
+
+#[test]
 fn every_checkout_drops_the_token() {
     let mut seen = 0;
     for name in workflow_files() {
@@ -609,7 +628,7 @@ fn the_ci_workflow_ignores_only_non_code_paths_and_runs_on_both_platforms() {
     assert!(has("branches: [main]"), "the push trigger is main");
     assert!(has("os: [ubuntu-latest, windows-latest]"), "both platforms run");
     assert!(has("fail-fast: false"), "one platform failing must not stop the other");
-    assert!(has("- run: cargo clippy --locked --workspace --all-targets -- -A clippy::all -D warnings"));
+    assert!(has("- run: cargo clippy --locked --workspace --all-targets -- -D warnings"));
     assert!(has("- run: cargo test --locked --workspace"));
 
     // CI is the only trigger of the release and must never hold its secrets.
@@ -805,7 +824,7 @@ fn the_ci_workflow_checks_the_locked_production_build() {
     }
     // Without --all-targets no dev-dependency, and so no `testing`, reaches
     // clawg-core: the configuration release.yml builds.
-    for wanted in ["cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings", "cargo test --locked -p clawg-core --lib build_info"] {
+    for wanted in ["cargo clippy --locked -p clawg-cli -- -D warnings", "cargo test --locked -p clawg-core --lib build_info"] {
         assert!(commands.iter().any(|c| c == wanted), "ci.yml lacks `{wanted}`: {commands:?}");
     }
 
