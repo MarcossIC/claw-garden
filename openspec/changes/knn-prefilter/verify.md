@@ -138,6 +138,52 @@ La propuesta dice que, si la puerta abre, el paso siguiente es B1, con su propue
 
 Quedan abiertas las decisiones de la exploración que este paso no tomó: B1 o B2, cómo se anuncia la ruta exacta, si tiene techo y el alcance en contradicciones. A eso se suma si F3 sigue siendo una forma que decide, ahora que es la única que abre.
 
+**Recomendación para ese paso:** la variante del punto 2. Cubre la única forma que abre sin cobrarles a F2 y F4, mientras que A paga re-key, `live` y una migración por esa misma forma. Lo que la decide es si F3, la lectura cerrada, sigue siendo una forma que importa: si no, no hace falta ninguna de las dos.
+
+## El KNN en uso real (2026-11-03)
+
+Otra pregunta y otra fuente que la puerta: `clawg metrics report --by version`, con una ventana de 30 días, sobre un perfil de producción en Windows con más de 54.000 filas importadas. La pregunta era si la etapa `store` del worker pesa, y qué la explica.
+
+`ingest.stage`, con `--label stage=<etapa>`. Una toma es una pasada del worker por un guardado:
+
+| Versión | Etapa | Tomas | p50 | Media | p95 | Máx |
+|---|---|---:|---:|---:|---:|---:|
+| 0.71.0 | `embed` | 26 | 94 ms | 450 ms | 1.280 ms | 1.420 ms |
+| 0.71.0 | `store` | 26 | 119 ms | 132 ms | 314 ms | 326 ms |
+| 0.72.2 | `embed` | 49 | 73 ms | 302 ms | 1.161 ms | 1.322 ms |
+| 0.72.2 | `store` | 49 | 115 ms | 186 ms | 1.105 ms | 1.316 ms |
+
+- `store` supera a `embed` en la mediana de las dos versiones, y en 0.72.2 su p95 llega al 95 % del de `embed`. Los p50 son interpolados, pero caen en buckets distintos: la dirección es firme aunque el valor exacto no.
+- `embed` sigue costando más en total: en 0.72.2, la media de `store` es el 62 % de la de `embed`.
+- La cola creció: en 0.72.2, 3 de 49 tomas de `store` pasan de 1 s; en 0.71.0 ninguna pasa de 326 ms.
+- No urge: las 49 tomas de `store` suman unos 9 s.
+
+Lo que quedó descartado como causa:
+
+- **La espera en la conexión:** `db.probe_wait` da, en 0.72.2, p50 de 50 µs y p99 de 240 µs en 13.273 sondeos. No lo descarta del todo para un guardado puntual, porque el sondeo corre cada 10 s y no coincide con los guardados.
+- **Las piezas, como causa de que creciera la cola:** `ingest.pieces` tiene casi la misma forma en las dos versiones (media 1,54 y 1,55, máximo 8), pero el máximo de `store` pasó de 326 a 1.316 ms.
+- **El código:** entre v0.71.0 y v0.72.2 no cambió ninguna dependencia, y el único commit que toca los archivos de la etapa `store` es de tests (`c7d91b0`).
+
+`search.duration`, con `--label arm=knn_memory`. El detector pasa por este brazo (`contradiction_search_scope` sólo pide `memory`), junto con las búsquedas normales, y la serie no los separa:
+
+| Versión | Tomas | Mín | p50 | Media | p95 | Máx |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.71.0 | 25 | 57 ms | 183 ms | 163 ms | 344 ms | 357 ms |
+| 0.72.2 | 93 | 57 ms | 164 ms | 171 ms | 438 ms | 612 ms |
+| 0.73.0 | 19 | 75 ms | 175 ms | 248 ms | 874 ms | 874 ms |
+
+Sólo 0.73.0 tiene el reloj de R14 de [`specs/metrics`](../../specs/metrics/spec.md): hasta 0.72.2 cada brazo suma las esperas, así que esas filas no se comparan con la última.
+
+**Lectura.** El criterio se fijó antes de leer: un p50 cerca de 100 ms quiere decir que el KNN explica `store` y no hacen falta timers; muy por debajo, el costo está en el insert o el commit, y valen dos timers en `store_pieces`, alrededor de `detect_contradiction` e `insert_unless_twin`. Dio 175 ms, así que el KNN explica la mayor parte de `store` y los timers no hacen falta. También encaja con la cola: al menos 28 de los 49 guardados de 0.72.2 son de una pieza, y a 115 ms por pieza, 8 piezas dan 0,9 s, cerca de 1,3 s. Un tipo que no afirma nada, como `session_summary`, saltea el KNN (`is_claim_bearing`, `crates/clawg-core/src/memory/contradiction.rs:197`), lo que podría explicar que el guardado de 8 piezas de 0.71.0 no pasara de 326 ms.
+
+Es una dirección, no una medida del detector:
+
+- El p50 del brazo supera al de `store` entero (115 ms), que lo contiene. Son poblaciones distintas: la serie mezcla búsquedas normales y no dice cuántas tomas son de guardados. El dato más firme es el mínimo: ninguna toma de 0.73.0 bajó de 75 ms.
+- Son 19 tomas de una sola ejecución, con el p95 igual al máximo.
+- El `store` comparado es de 0.72.2: cuando se leyó, `ingest.stage` no tenía grupo 0.73.0. Con más uso, repetir la lectura de `stage=store` compara la misma versión.
+
+**Para el paso siguiente:** esta pasada la paga cada búsqueda y cada guardado que afirma algo, no sólo una búsqueda tapada. B1 y la variante no la bajan, porque no la tocan. A podría, porque reduce el recorrido al proyecto, pero no está medido cuánto. No cambia la recomendación de arriba, porque este costo no urge; sí es un argumento a favor de A que la puerta no tenía.
+
 ## Lo que no se midió
 
 - **El canal léxico.** La búsqueda corrió sin texto (decisión 1). Una fila que la ventana perdió puede volver por FTS5 si comparte palabras con la consulta.

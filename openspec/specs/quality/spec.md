@@ -1,6 +1,6 @@
 # quality — Especificación
 
-Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servidor MCP y la convención de no esconder código muerto, y de dónde están documentados esos chequeos. Ninguno cambia el comportamiento de un comando, una ruta o una herramienta. Lo que hace cada herramienta está en [`specs/mcp`](../mcp/spec.md).
+Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servidor MCP, la convención de no esconder código muerto y la de no dejar un store abierto en un test de integración, y de dónde están documentados esos chequeos. Ninguno cambia el comportamiento de un comando, una ruta o una herramienta. Lo que hace cada herramienta está en [`specs/mcp`](../mcp/spec.md).
 
 **Origen:**
 - [quality-guards](../../changes/archive/2026-10-15-quality-guards/proposal.md), archivado el 2026-10-15. Los ids de requisito son los de esa spec. R5 (borrar el código sin llamador que escondían los `allow`) fue un arreglo de una vez y no queda como requisito: lo que impide que vuelva es R4 y el comando de `clippy` de R6. R3 (que la línea `MCP tools` de `.claude/CLAUDE.md` nombrara las herramientas registradas) se quitó: ningún test lee un archivo de instrucciones para agentes (R6).
@@ -103,3 +103,21 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
 - THEN clippy falla con `unfulfilled_lint_expectations` hasta que se quita el atributo
 
 **Test:** ninguno que lea `.claude/CLAUDE.md`, por la regla de arriba: el comando de `clippy` y el resto se comprueban a mano, y terminó con código 0 al archivar, en Linux y en Windows. La tabla y los comandos del CI los fijan los dos tests de `conventions.rs` nombrados arriba.
+
+## R7. Un test de integración cierra el store que abre en disco
+
+Un test bajo `crates/*/tests` que abre un runtime con `MemoryRuntime::open` MUST llamar a `MemoryRuntime::close` antes de terminar. Soltar un runtime sólo le avisa al hilo de su conexión, y en Windows un archivo abierto no se puede borrar: `tempfile` se rinde sin error, el store queda en el temporal del sistema y ningún test falla. Un test de integración no alcanza `crate::test_dir`, que en `src/` detecta este caso. El test de esta convención MUST fallar con la ruta, relativa a `crates/`, y el nombre de cada test que no cierra.
+
+Reconocerlo MUST ser una función pura (`tests_leaving_a_store_open`, `crates/clawg-cli/tests/conventions.rs:1018`). Lee el texto de cada test: un `.close().await` alcanza, así que un test con dos runtimes puede dejar uno abierto.
+
+#### Escenario: un test que abre en disco y no cierra
+- GIVEN un test con `MemoryRuntime::open` y sin `.close().await`
+- WHEN corre la convención
+- THEN falla y nombra el archivo y el test
+
+#### Escenario: un test en memoria
+- GIVEN un test con `MemoryRuntime::new_for_test`, que no toca el disco
+- WHEN corre la convención
+- THEN no cuenta
+
+**Test:** `an_integration_test_closes_the_store_it_opens_on_disk` (`conventions.rs:1057`) y el puro `tests_leaving_a_store_open_names_each_test_without_a_close` (`conventions.rs:1029`).

@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | M–L, con puerta | — | exploración (borrador) |
+| 1 | M–L, con puerta | — | exploración; la puerta pasó |
 
 **Tesis:** `episodic_trajectory` y `procedural_skill` no reciben filas nuevas, pero cada búsqueda las sigue consultando y el código las carga en todas partes. Son el sobrante de cuando el producto era un agente. Conviene sacarlas antes de abstraer el almacenamiento: no tiene sentido diseñar un puerto para lo que se va a borrar. Por la regla de `config.yaml` sobre la base del usuario, nada se borra sin saber primero qué filas hay y sin un camino de vuelta.
 
@@ -46,7 +46,7 @@ Queda sin descartar SQL armado por nombre de tabla, que una búsqueda literal no
 
 ## Alcance candidato
 
-1. **Puerta, sin código:** contar filas vivas y borradas en las dos tablas en cada perfil disponible, con autorización para abrirlos. `clawg export` ya informa `legacy_rows`. Si aparecen filas en número, se revisa qué son antes de seguir.
+1. **Puerta, sin código:** contar filas vivas y borradas en las dos tablas en cada perfil disponible, con autorización para abrirlos. `clawg export` ya informa `legacy_rows`. Si aparecen filas en número, se revisa qué son antes de seguir. Hecho: ver [Resultado de la puerta](#resultado-de-la-puerta-2026-11-03).
 2. Migración nueva: cada fila viva pasa a `memory`, con su vector si lo tiene. Una fila que un borrado de proyecto dejó en su diario (`project_delete_row`) tampoco se puede perder en silencio, porque deshacer descarta con un `warn` un `tbl` que no conoce (`crates/clawg-core/src/memory/project_delete.rs:778-781`). Hay dos salidas: migrarla a `memory` con su `deleted_at` y reescribir en la misma transacción su entrada del diario (`tbl` = `memory` y `row_id` = el id nuevo), o, si existe alguna, abortar la actualización sin modificar la base y decir por qué. Después se borran las dos tablas y sus `vec0`. Test con una base sembrada en la versión anterior, según `config.yaml`, y un test que deshace un proyecto borrado antes de la migración. El snapshot `pre-migration` es la vuelta atrás.
 3. Quitar los dos tipos de búsqueda, mantenimiento, proyectos, purga y exportación, y unificar `TableKind` y `MemoryKind`.
 4. API, CLI y MCP: un `kind` viejo recibe un error que lo explica, no un 404 mudo. Bendecir los dos contratos.
@@ -55,6 +55,17 @@ Queda sin descartar SQL armado por nombre de tabla, que una búsqueda literal no
 
 - Cambiar cómo se guardan o clasifican las memorias normales.
 - Una función nueva de habilidades o trayectorias. Si vuelve, vuelve con su propio cambio y su propio escritor.
+
+## Resultado de la puerta (2026-11-03)
+
+Contado con `sqlite3 -readonly` sobre el `memory.db` de los perfiles `prod` y `dev`, con `count(*)` en las dos tablas y en `project_delete_row` filtrado por `tbl`:
+
+| Perfil | `episodic_trajectory` | `procedural_skill` | Entradas del diario que las nombran |
+|---|---:|---:|---:|
+| `prod` | 0 | 0 | 0 |
+| `dev` | 0 | 0 | 0 |
+
+**La puerta pasa:** no hay filas vivas ni borradas, y ningún diario nombra estas tablas. El alcance no cambia, porque la base de otra persona puede tener filas: la migración sin pérdida se escribe igual.
 
 ## Decisiones abiertas
 
@@ -72,7 +83,7 @@ Queda sin descartar SQL armado por nombre de tabla, que una búsqueda literal no
 
 ## Riesgos
 
-- Es la primera migración que borra tablas con datos posibles. Si la cuenta de un perfil real no da cero, la decisión 1 pasa a ser la importante.
+- Es la primera migración que borra tablas con datos posibles. Las dos bases contadas dan cero, así que ninguna fila real orienta la decisión 1 ni prueba la migración: sólo la prueba el test sembrado.
 - `doctor` y las invariantes tienen que seguir pasando sobre una base recién migrada.
 
 ## Interacciones
