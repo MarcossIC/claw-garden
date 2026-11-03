@@ -595,7 +595,7 @@ La descarga MUST usar un cliente con 30 s para conectar y 60 s por lectura (`DOW
 
 ### RM1. Un hash por archivo, fuera de los hilos del runtime
 
-Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_runtime`, `model_download.rs:642`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:477`). En una corrida, cada archivo MUST hashearse una sola vez: el de la caché al leerlo (`check_cache`, `model_download.rs:705`). Sólo la corrida que baja el ONNX lo hashea una segunda vez, al verificarlo desde la caché tras renombrarlo. El ONNX MUST NOT juntarse en memoria ni armarse desde bytes: la carga recibe la vista de sólo lectura sobre la que se hasheó (`verified_onnx`, `model_download.rs:814`; `OnnxFile`, `model_download.rs:335`). Los archivos chicos (el tokenizer y la configuración) se entregan desde memoria, hasheados una vez. El cierre del archivo bajado (`sync_all` y el `rename`) MUST correr en una tarea bloqueante. Un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, `model_download.rs:1093`, lo que pide libre el chequeo de disco y más que cualquier archivo del modelo) MUST fallar sin reintentar; el tope se cuenta con los bytes que llegan, sin juntarlos en memoria (`DownloadError::TooLarge`, `model_download.rs:425`).
+Leer y hashear la caché MUST correr en una tarea bloqueante (`check_cache_off_runtime`, `model_download.rs:656`), no en un hilo del runtime asíncrono, en el arranque y en cada recarga. El worker de ingest MUST leer, verificar y parsear `tokenizer.json` en una tarea bloqueante (`ingest_worker_future`, `crates/clawg-core/src/runtime.rs:477`). En una corrida, cada archivo MUST hashearse una sola vez: el de la caché al leerlo (`check_cache`, `model_download.rs:734`). Sólo la corrida que baja el ONNX lo hashea una segunda vez, al verificarlo desde la caché tras renombrarlo. El ONNX MUST NOT juntarse en memoria ni armarse desde bytes: la carga recibe la vista de sólo lectura sobre la que se hasheó (`verified_onnx`, `model_download.rs:814`; `OnnxFile`, `model_download.rs:335`). Los archivos chicos (el tokenizer y la configuración) se entregan desde memoria, hasheados una vez. El cierre del archivo bajado (`sync_all` y el `rename`) MUST correr en una tarea bloqueante. Un archivo que anuncia o trae más de 600 MB (`MAX_FILE_BYTES`, `model_download.rs:1093`, lo que pide libre el chequeo de disco y más que cualquier archivo del modelo) MUST fallar sin reintentar; el tope se cuenta con los bytes que llegan, sin juntarlos en memoria (`DownloadError::TooLarge`, `model_download.rs:425`).
 
 #### Escenario: falta un archivo chico
 - GIVEN la caché completa salvo `config.json`
@@ -691,7 +691,7 @@ El daemon MUST soltar el modelo cuando pasó el tiempo de ocio desde el último 
 
 ### Recargar a demanda, una sola vez
 
-Una llamada con el modelo suelto MUST cargarlo con la misma carga del arranque sobre los archivos de la caché, leídos y verificados otra vez (`cached` y `load`, en `unloading_when_idle`; `load_cached_model`, `crates/clawg-core/src/memory/model_download.rs:617`), y MUST devolver el mismo vector que antes de soltarlo. Una recarga MUST NOT tocar la red. Una recarga MUST NOT volver a parsear el tokenizer («Un solo tokenizer por proceso»). Las llamadas que llegan durante una carga MUST compartirla. `model_id`, `dimensions` y los prefijos MUST NOT cargar el modelo.
+Una llamada con el modelo suelto MUST cargarlo con la misma carga del arranque sobre los archivos de la caché, leídos y verificados otra vez (`cached` y `load`, en `unloading_when_idle`; `load_cached_model`, `crates/clawg-core/src/memory/model_download.rs:631`), y MUST devolver el mismo vector que antes de soltarlo. Una recarga MUST NOT tocar la red. Una recarga MUST NOT volver a parsear el tokenizer («Un solo tokenizer por proceso»). Las llamadas que llegan durante una carga MUST compartirla. `model_id`, `dimensions` y los prefijos MUST NOT cargar el modelo.
 
 #### Escenario: varias llamadas, una carga
 - GIVEN el modelo suelto
@@ -704,7 +704,7 @@ Una llamada con el modelo suelto MUST cargarlo con la misma carga del arranque s
 
 Una recarga cuya caché no pasa (falta un archivo, no se lee o tiene otro SHA-256; `DownloadError::NotCached`, `crates/clawg-core/src/memory/model_download.rs:417`) MUST responder «no listo» (`EmbedError::NotReady`) sin esperar ninguna descarga, y MUST lanzar una reparación: `ensure` en una tarea del runtime, fuera del cerrojo del modelo, salvo que ya haya una en curso, así que hay a lo sumo una a la vez (`repair_in_background`, `bootstrap.rs:505`). La reparación no carga el modelo: la llamada siguiente que encuentre la caché reparada MUST cargarla. Una reparación que falla MUST dejarlo en el log, y la llamada siguiente MAY lanzar otra. Cualquier otra recarga que falla MUST responder «no listo» igual, y la llamada siguiente MUST intentar otra vez. Una recarga que trae otro `model_id` u otra dimensión MUST rechazarse igual: los vectores nuevos no pueden caer en otro espacio que los guardados. El estado del embedder MUST NOT pasar a `failed` por una recarga ni por una reparación.
 
-El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca lo que tarda la red: la lectura recorre los cinco archivos aunque el que no pasa sea chico, así que el «no listo» llega después de hashear el ONNX. Medido el 2026-10-19 con el modelo real, en un build debug en Windows: las dos búsquedas respondieron en 8,7 y 9,2 s, lo que una recarga buena tarda en leer y verificar la caché (9,5 s).
+El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca lo que tarda la red. La lectura de una recarga MUST empezar por los archivos chicos (los tres de configuración, después `tokenizer.json` y al final el ONNX, `FileKind::read_cost`) y MUST cortar en el primero que no pasa (`Reading::UntilOneFails`, `model_download.rs:674`, en `load_cached_from`, `:635`), así que un archivo chico dañado da el «no listo» sin hashear el ONNX, y `NotCached` nombra sólo ese archivo; la reparación vuelve a leer todo. El arranque MUST leer los cinco (`Reading::Whole`), porque baja cada uno que no pasa. Cuando la recarga leía los cinco, medido el 2026-10-19 con el modelo real en un build debug en Windows, las dos búsquedas del escenario respondían en 8,7 y 9,2 s, lo que una recarga buena tarda en leer y verificar la caché (9,5 s).
 
 #### Escenario: un archivo borrado del modelo suelto
 - GIVEN el modelo suelto, `tokenizer_config.json` borrado de la caché y una descarga que tarda
@@ -712,7 +712,13 @@ El cerrojo del modelo queda tomado lo que tarda leer y hashear la caché, nunca 
 - THEN las dos responden `503 embedder_not_ready` (`embed_failure`, `crates/clawg-cli/src/daemon/api.rs:1431`) sin esperar la descarga, y hay una sola en curso
 - AND cuando la descarga termina, la búsqueda siguiente carga el modelo y responde
 
-**Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_reload_with_a_damaged_cache_is_not_ready_and_repairs_it_once_in_the_background` (`bootstrap.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
+#### Escenario: la recarga corta en el primer archivo que falla
+- GIVEN una caché sin `tokenizer_config.json` y con el ONNX y `tokenizer.json` alterados
+- WHEN se lee para una recarga
+- THEN `NotCached` nombra sólo `tokenizer_config.json`
+- AND el arranque sobre la misma caché baja los tres y carga el modelo
+
+**Tests:** `a_failed_load_is_not_ready_and_the_next_call_tries_again` y `a_model_that_comes_back_as_another_model_is_refused` (`idle_embedder.rs`); `a_reload_with_a_damaged_cache_is_not_ready_and_repairs_it_once_in_the_background` (`bootstrap.rs`); `a_reload_stops_at_the_first_file_that_fails_reading_the_small_ones_first` y `the_cached_model_never_touches_the_network` (`model_download.rs`); `a_search_whose_model_cannot_load_again_answers_not_ready` (`crates/clawg-cli/tests/api.rs`).
 
 ### Un pánico en la inferencia contesta y suelta la sesión
 

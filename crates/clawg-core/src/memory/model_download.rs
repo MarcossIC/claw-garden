@@ -81,6 +81,19 @@ pub enum FileKind {
     TokenizerConfig,
 }
 
+impl FileKind {
+    /// How much a file of this kind costs to read and hash, to order a
+    /// reload by: the three of configuration are under a kilobyte,
+    /// `tokenizer.json` 17 MB and the model 470 MB.
+    fn read_cost(self) -> u8 {
+        match self {
+            FileKind::ConfigJson | FileKind::SpecialTokensMap | FileKind::TokenizerConfig => 0,
+            FileKind::TokenizerJson => 1,
+            FileKind::Onnx => 2,
+        }
+    }
+}
+
 /// One entry of the model manifest.
 #[derive(Debug, Clone)]
 pub struct FileSpec {
@@ -534,7 +547,7 @@ async fn fetch(
     // (1) Cache-hit fast path: NO events emitted. Every startup after the first
     // takes this branch, and emitting progress here would flash a download UI
     // for work that never happens.
-    let mut cached = check_cache_off_runtime(&cache_dir, source.files, &source.lock).await?;
+    let mut cached = check_cache_off_runtime(&cache_dir, source.files, &source.lock, Reading::Whole).await?;
     if let Some(busy) = cached.busy_error() {
         return Err(busy);
     }
@@ -593,7 +606,7 @@ async fn fetch(
         }
     }
     if let Some(spec) = downloaded_onnx {
-        let mut again = check_cache_off_runtime(&cache_dir, std::slice::from_ref(&spec), &source.lock).await?;
+        let mut again = check_cache_off_runtime(&cache_dir, std::slice::from_ref(&spec), &source.lock, Reading::Whole).await?;
         if let Some(busy) = again.busy_error() {
             return Err(busy);
         }
@@ -613,7 +626,8 @@ async fn fetch(
 }
 
 /// The model from the cache alone: a missing or altered file is an error and
-/// nothing is downloaded. What a reload of the idle model reads.
+/// nothing is downloaded. What a reload of the idle model reads, up to the
+/// first file that fails: the error names that one only.
 pub async fn load_cached_model(base_dir: &Path, lock: &CacheLock) -> Result<ModelFiles, DownloadError> {
     load_cached_from(base_dir, &ALL_FILES, lock).await
 }
@@ -623,7 +637,7 @@ pub(crate) async fn load_cached_from(
     files: &[FileSpec],
     lock: &CacheLock,
 ) -> Result<ModelFiles, DownloadError> {
-    let mut cached = check_cache_off_runtime(&cache_dir_of(base_dir), files, lock).await?;
+    let mut cached = check_cache_off_runtime(&cache_dir_of(base_dir), files, lock, Reading::UntilOneFails).await?;
     if let Some(busy) = cached.busy_error() {
         return Err(busy);
     }
@@ -643,15 +657,29 @@ async fn check_cache_off_runtime(
     cache_dir: &Path,
     files: &[FileSpec],
     lock: &CacheLock,
+    reading: Reading,
 ) -> Result<CacheCheck, DownloadError> {
     let guard = lock.read().await;
     let (dir, files) = (cache_dir.to_path_buf(), files.to_vec());
-    tokio::task::spawn_blocking(move || check_cache(&dir, &files, guard))
+    tokio::task::spawn_blocking(move || check_cache(&dir, &files, guard, reading))
         .await
         .map_err(|e| DownloadError::Io {
             file: cache_dir.display().to_string(),
             source: std::io::Error::other(e.to_string()),
         })
+}
+
+/// How much of the cache a check reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// Every file, in the manifest's order: the start downloads each one that
+    /// fails, so it needs to know them all.
+    Whole,
+    /// The cheapest files first, up to the first that fails: a reload that
+    /// cannot use the cache answers "not ready" either way, and a damaged
+    /// configuration file is found without hashing the model, with the
+    /// model's lock held.
+    UntilOneFails,
 }
 
 /// What the cache holds: the bytes of every file that passed its hash, and
@@ -699,12 +727,17 @@ impl CacheCheck {
     }
 }
 
-/// Reads every file of `files` once, keeping the bytes of those that pass and,
-/// for the model, the view they were hashed on, which takes `guard` with it.
-/// A guard the model does not keep is released when the check ends.
-fn check_cache(cache_dir: &Path, files: &[FileSpec], guard: OwnedRwLockReadGuard<()>) -> CacheCheck {
+/// Reads the files of `files` once, as `reading` says, keeping the bytes of
+/// those that pass and, for the model, the view they were hashed on, which
+/// takes `guard` with it. A guard the model does not keep is released when
+/// the check ends.
+fn check_cache(cache_dir: &Path, files: &[FileSpec], guard: OwnedRwLockReadGuard<()>, reading: Reading) -> CacheCheck {
     let mut check = CacheCheck { found: Vec::new(), onnx: None, missing: Vec::new(), busy: Vec::new() };
     let mut guard = Some(guard);
+    let mut files: Vec<&FileSpec> = files.iter().collect();
+    if reading == Reading::UntilOneFails {
+        files.sort_by_key(|spec| spec.kind.read_cost());
+    }
     for spec in files {
         let path = cache_dir.join(spec.path);
         let checked = match spec.kind {
@@ -719,6 +752,9 @@ fn check_cache(cache_dir: &Path, files: &[FileSpec], guard: OwnedRwLockReadGuard
             Err(Unusable::Busy(e)) => check.busy.push((spec.path.to_string(), e)),
             Err(_) => check.missing.push(spec.clone()),
         }
+        if reading == Reading::UntilOneFails && !(check.missing.is_empty() && check.busy.is_empty()) {
+            break;
+        }
     }
     check
 }
@@ -728,7 +764,7 @@ fn check_cache(cache_dir: &Path, files: &[FileSpec], guard: OwnedRwLockReadGuard
 /// check [`ensure_model`] makes.
 #[cfg(feature = "eval")]
 pub(crate) fn model_is_cached(base_dir: &Path) -> bool {
-    let check = check_cache(&cache_dir_of(base_dir), &ALL_FILES, CacheLock::new().read_now());
+    let check = check_cache(&cache_dir_of(base_dir), &ALL_FILES, CacheLock::new().read_now(), Reading::Whole);
     check.missing.is_empty() && check.busy.is_empty()
 }
 
@@ -1922,7 +1958,7 @@ mod tests {
             drop(held);
         });
 
-        let check = check_cache(&cache_dir, &specs, CacheLock::new().read_now());
+        let check = check_cache(&cache_dir, &specs, CacheLock::new().read_now(), Reading::Whole);
         release.join().unwrap();
         assert!(check.missing.is_empty() && check.busy.is_empty(), "missing {:?}", check.missing);
         assert_eq!(check.found.len() + usize::from(check.onnx.is_some()), specs.len());
@@ -1984,11 +2020,46 @@ mod tests {
         std::fs::write(cache_dir.join("config.json"), b"altered").unwrap();
         match load_cached_from(tmp.path(), &specs, &CacheLock::new()).await {
             Err(DownloadError::NotCached { files }) => {
-                assert_eq!(files, ["config.json", "tokenizer_config.json"]);
+                assert_eq!(files, ["config.json"], "the reload stops at the first file that fails");
             }
             other => panic!("expected NotCached, got {other:?}"),
         }
         assert!(collect_partials(&cache_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reload_stops_at_the_first_file_that_fails_reading_the_small_ones_first() {
+        let tmp = TestDir::new("reload-stops-early");
+        let cache_dir = tmp.path().join("models").join("multilingual-e5-small");
+        let files = fixture_files();
+        let specs = fixture_specs(&files);
+        write_all_to_cache(&cache_dir, &files);
+        std::fs::remove_file(cache_dir.join("tokenizer_config.json")).unwrap();
+        // Altered too, so a reload that read either would name it.
+        std::fs::write(cache_dir.join("onnx/model.onnx"), b"altered").unwrap();
+        std::fs::write(cache_dir.join("tokenizer.json"), b"altered").unwrap();
+
+        match load_cached_from(tmp.path(), &specs, &CacheLock::new()).await {
+            Err(DownloadError::NotCached { files }) => assert_eq!(files, ["tokenizer_config.json"]),
+            other => panic!("expected NotCached, got {other:?}"),
+        }
+
+        // The start still reads every file, to download each one that fails.
+        let mut server = mockito::Server::new_async().await;
+        let mut mocks = Vec::new();
+        for f in &files {
+            let damaged = ["onnx/model.onnx", "tokenizer.json", "tokenizer_config.json"].contains(&f.path);
+            let mock = server.mock("GET", format!("/{}", f.path).as_str()).with_status(200).with_body(f.bytes.clone());
+            mocks.push(mock.expect(usize::from(damaged)).create_async().await);
+        }
+        let oracle = MockDiskOracle::returning(MIN_FREE_BYTES);
+        let model = ensure_model_from(tmp.path(), &source(&server.url(), &oracle, &specs), None)
+            .await
+            .expect("the start repairs the cache");
+        assert_eq!(&*model.onnx, &files[0].bytes[..]);
+        for mock in &mocks {
+            mock.assert_async().await;
+        }
     }
 
     // ---------- The model as a read-only view ----------
@@ -2026,7 +2097,7 @@ mod tests {
         let refused = verified_onnx(&path, specs[0].sha256, lock.read_now());
         assert!(matches!(refused, Err(Unusable::Altered)));
         assert!(lock.0.try_write().is_ok(), "a refused file keeps no lock");
-        let check = check_cache(&cache_dir, &specs, lock.read_now());
+        let check = check_cache(&cache_dir, &specs, lock.read_now(), Reading::Whole);
         assert!(check.onnx.is_none() && check.missing.iter().any(|spec| spec.path == specs[0].path));
 
         std::fs::write(&path, b"").unwrap();
