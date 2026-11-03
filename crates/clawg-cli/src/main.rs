@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use clawg_cli::backup;
 use clawg_cli::cli::{
     is_bare_invocation, is_hook_invocation, preferences_profile, sharing_profile, Cli, Command, MetricsAction, PathAction,
-    ProfileArg, ProjectsAction, SetupClient,
+    ProfileArg, SetupClient,
 };
 use clawg_cli::daemon::lifecycle::now_ms;
 use clawg_cli::daemon::serve;
@@ -256,89 +256,11 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Projects { action: ProjectsAction::List { profile } } => {
-            let daemon = running(&profile).await?;
-            println!("{}", projects::list(daemon.lang, &daemon.client).await.map_err(|e| daemon.unavailable(e))?);
-            Ok(ExitCode::SUCCESS)
-        }
-
-        Command::Projects { action: ProjectsAction::Rename { id, name, profile } } => {
-            let daemon = running(&profile).await?;
-            let renamed = projects::rename(daemon.lang, &daemon.client, &id, &name)
-                .await
-                .map_err(|e| projects::rename_refused(daemon.lang, &id, &e).map(CliError::Failed).unwrap_or_else(|| daemon.unavailable(e)))?;
-            println!("{renamed}");
-            Ok(ExitCode::SUCCESS)
-        }
-
-        Command::Projects { action: ProjectsAction::Create { name, new, profile } } => {
-            let daemon = running(&profile).await?;
-            let (said, done) = projects::create(daemon.lang, &daemon.client, &name, new)
-                .await
-                .map_err(|e| projects::create_refused(daemon.lang, &e).map(CliError::Failed).unwrap_or_else(|| daemon.unavailable(e)))?;
+        Command::Projects { action } => {
+            let daemon = running(action.profile()).await?;
+            let (said, code) = projects::command(&daemon, action).await?;
             println!("{said}");
-            Ok(if done { ExitCode::SUCCESS } else { ExitCode::FAILURE })
-        }
-
-        Command::Projects { action: ProjectsAction::Locate { project, path, subfolder, profile } } => {
-            let daemon = running(&profile).await?;
-            let located = projects::locate(daemon.lang, &daemon.client, &project, &path, subfolder).await.map_err(|e| match e {
-                projects::AddError::Client(e) => projects::locate_refused(daemon.lang, &e).map(CliError::Failed).unwrap_or_else(|| daemon.unavailable(e)),
-                other => other.into(),
-            })?;
-            println!("{located}");
-            Ok(ExitCode::SUCCESS)
-        }
-
-        Command::Projects { action: ProjectsAction::Add { path, profile } } => {
-            // The daemon owns the store and does the indexing; with none
-            // running, nothing is started and the store is not opened.
-            let daemon = running(&profile).await?;
-            let added = projects::add(daemon.lang, &daemon.client, &path).await.map_err(|e| match e {
-                projects::AddError::Client(e) => daemon.unavailable(e),
-                other => other.into(),
-            })?;
-            println!("{added}");
-            Ok(ExitCode::SUCCESS)
-        }
-
-        Command::Projects { action: ProjectsAction::Move(opts) } => {
-            let daemon = running(&opts.profile).await?;
-            let cwd = std::env::current_dir()?;
-            let moved = projects::move_memories(daemon.lang, &daemon.client, &opts, &cwd).await.map_err(|e| match e {
-                projects::AddError::Client(e) => projects::move_refused(daemon.lang, &e).map(CliError::Failed).unwrap_or_else(|| daemon.unavailable(e)),
-                other => other.into(),
-            })?;
-            println!("{moved}");
-            Ok(ExitCode::SUCCESS)
-        }
-
-        Command::Projects { action: ProjectsAction::Merge(opts) } => {
-            let daemon = running(&opts.profile).await?;
-            let merged = projects::merge(daemon.lang, &daemon.client, &opts)
-                .await
-                .map_err(|e| projects::merge_refused(daemon.lang, &e).map(CliError::Failed).unwrap_or_else(|| daemon.unavailable(e)))?;
-            println!("{merged}");
-            Ok(ExitCode::SUCCESS)
-        }
-
-        Command::Projects { action: ProjectsAction::Delete(opts) } => {
-            let daemon = running(&opts.profile).await?;
-            let undo = opts.undo.is_some();
-            let (said, done) = projects::delete(daemon.lang, &daemon.client, &opts)
-                .await
-                .map_err(|e| projects::delete_refused(daemon.lang, undo, &e).map(CliError::Failed).unwrap_or_else(|| daemon.unavailable(e)))?;
-            println!("{said}");
-            Ok(if done { ExitCode::SUCCESS } else { ExitCode::FAILURE })
-        }
-
-        Command::Projects { action: ProjectsAction::KeepApart { project_id, other_id, profile } } => {
-            let daemon = running(&profile).await?;
-            let kept = projects::keep_apart(daemon.lang, &daemon.client, &project_id, &other_id)
-                .await
-                .map_err(|e| projects::keep_apart_refused(daemon.lang, &e).map(CliError::Failed).unwrap_or_else(|| daemon.unavailable(e)))?;
-            println!("{kept}");
-            Ok(ExitCode::SUCCESS)
+            Ok(ExitCode::from(code))
         }
 
         Command::Memories { action } => {
