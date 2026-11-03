@@ -1970,7 +1970,7 @@ old
         for (a, b) in partly.0.iter().zip(&full.0) {
             assert_eq!((&a.0, a.1, &a.2, &a.3), (&b.0, b.1, &b.2, &b.3));
             let decode = |blob: &[u8]| -> Vec<f32> {
-                blob.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+                blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect()
             };
             let (x, y) = (decode(&a.4), decode(&b.4));
             let cosine: f32 = x.iter().zip(&y).map(|(p, q)| p * q).sum();
@@ -2612,7 +2612,7 @@ old
             println!("median of {runs}: {}: {:.2?}", names[k], median(&took[k]));
         }
 
-        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
+        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect() };
         let differences: Vec<f32> = blobs[0]
             .iter()
             .zip(&blobs[1])
@@ -2739,7 +2739,7 @@ old
         };
         println!("median ratio to in each doc of {runs} rounds: in the queue {:.3}, across docs {:.3}", median_ratio(1), median_ratio(2));
 
-        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
+        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect() };
         for k in 1..3 {
             assert_eq!(last[k].len(), passages, "{} embedded every passage", names[k]);
             let differences: Vec<f32> = last[0]

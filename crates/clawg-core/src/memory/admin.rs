@@ -3593,7 +3593,7 @@ mod tests {
             })
             .await
             .unwrap()
-            .map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+            .map(|b| b.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect())
     }
 
     async fn text_matches(store: &MemoryStore, word: &str) -> Vec<i64> {
