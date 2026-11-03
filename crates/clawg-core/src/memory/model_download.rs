@@ -2378,19 +2378,19 @@ mod tests {
             "last must be verify; the terminal `done` is now emitted by the bootstrap, not ensure_model"
         );
         assert!(
-            phases.iter().any(|p| *p == "chunk"),
+            phases.contains(&"chunk"),
             "expected at least one chunk event"
         );
         // ensure_model MUST NOT emit Done — that responsibility moved to the
         // bootstrap layer (`memory::bootstrap`) so a listener receives EXACTLY
         // ONE terminal `done`, after the embedder is actually loadable.
         assert!(
-            !phases.iter().any(|p| *p == "done"),
+            !phases.contains(&"done"),
             "ensure_model must NOT emit Done; got {phases:?}"
         );
         // No Error event on the success path.
         assert!(
-            !phases.iter().any(|p| *p == "error"),
+            !phases.contains(&"error"),
             "no error events on success path; got {phases:?}"
         );
     }

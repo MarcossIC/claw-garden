@@ -1632,13 +1632,13 @@ mod tests {
             "verifying must precede done; got {phases:?}"
         );
         assert!(
-            phases.iter().any(|p| *p == "downloading"),
+            phases.contains(&"downloading"),
             "at least one `downloading` event expected; got {phases:?}"
         );
 
         // No error events on the success path.
         assert!(
-            !phases.iter().any(|p| *p == "error"),
+            !phases.contains(&"error"),
             "no `error` events on the success path; got {phases:?}"
         );
 
