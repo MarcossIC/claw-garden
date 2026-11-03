@@ -21,6 +21,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clawg_cli::client::{Call, DaemonClient};
+use clawg_core::metrics::store::{MetricsDb, METRICS_FILE};
 use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_clawg");
@@ -804,17 +805,16 @@ async fn a_daemon_measures_its_pipeline_and_keeps_its_events() {
 #[tokio::test]
 async fn a_killed_daemon_leaves_its_run_not_stopped() {
     let sandbox = Sandbox::new();
-    let daemon = sandbox.serve().await;
-    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
-    daemon.wait_for_exit(Duration::from_secs(5)).await;
-    drop(daemon);
-
     let killed = sandbox.serve().await;
     killed.kill();
     drop(killed);
 
-    let report = metrics_report(&sandbox, &["--metric", "http.duration"]);
-    assert_eq!(report["runs"], json!({ "total": 2, "not_stopped": 1 }), "{report}");
+    // Read from the file: `report` knows a metric only once a minute of it is
+    // written, and a kill writes none. No stopped run to compare with, since
+    // past `METRICS_CLOSE` a stop leaves its run without an end too.
+    let db = MetricsDb::open_read_only(&sandbox.data_dir().join(METRICS_FILE)).expect("metrics.db");
+    let runs = db.runs_since(0).expect("runs");
+    assert_eq!(runs.iter().map(|run| run.stopped_at_ms).collect::<Vec<_>>(), [None]);
 }
 
 #[tokio::test]
