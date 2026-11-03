@@ -948,6 +948,7 @@ pub struct MoveRequest {
 
 /// What a [`MoveRequest`] asks for, once it is known to ask for one thing.
 #[derive(Debug, PartialEq)]
+#[expect(clippy::large_enum_variant, reason = "one per request, consumed by the handler that parsed it; none is stored")]
 pub enum MovePlan {
     Move { filter: MoveFilter, target: Option<String> },
     Undo(i64),

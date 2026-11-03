@@ -179,6 +179,7 @@ pub struct ConflictLine {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[expect(clippy::large_enum_variant, reason = "the export is read and written one line at a time; the reader keeps each variant as its own type")]
 pub enum Line {
     Header(Header),
     Project(ProjectLine),

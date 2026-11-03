@@ -73,6 +73,7 @@ impl Finished {
 
 /// What happened while a job was followed.
 #[derive(Debug)]
+#[expect(clippy::large_enum_variant, reason = "the follow loop holds one event at a time; none is stored")]
 pub enum Event {
     /// The daemon showed the job.
     Polled(ImportJob),

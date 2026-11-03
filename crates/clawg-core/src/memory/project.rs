@@ -647,6 +647,7 @@ struct FromDisk {
 }
 
 /// What a pass of [`plan_in`] settles on, or what it needs from the disk first.
+#[expect(clippy::large_enum_variant, reason = "one per pass, matched as soon as it returns; none is stored")]
 enum Planned {
     Plan(Plan),
     /// The first commit of the root: no folder of its path recorded its git directory.

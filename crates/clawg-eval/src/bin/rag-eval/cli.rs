@@ -105,6 +105,7 @@ pub struct Cli {
 /// first would make `--diff` depend on inputs it never reads.
 // `PartialEq` only — see the note on `Cli` above; `ParseOutcome::Run` wraps one.
 #[derive(Debug, PartialEq)]
+#[expect(clippy::large_enum_variant, reason = "one per run, matched as soon as it is parsed; none is stored")]
 pub enum ParseOutcome {
     Help,
     Run(Cli),
