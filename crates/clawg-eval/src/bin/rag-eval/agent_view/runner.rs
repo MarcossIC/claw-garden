@@ -342,7 +342,7 @@ pub async fn run(
         .map(|save| (save.origin.as_str(), save.text.as_str()))
         .collect();
     let corpus = Corpus::new(
-        input.golden_set.corpus.iter().map(|r| (r.ref_.as_str(), r.content.as_str())).chain(cited.into_iter()),
+        input.golden_set.corpus.iter().map(|r| (r.ref_.as_str(), r.content.as_str())).chain(cited),
     );
 
     let measured = async {
