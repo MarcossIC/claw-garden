@@ -65,7 +65,7 @@ pub struct Interval {
 pub const BOOTSTRAP_RESAMPLES: usize = 10_000;
 
 /// Fixed so the same two files always print the same interval.
-pub const BOOTSTRAP_SEED: u64 = 0x5EED_0F_E7A1;
+pub const BOOTSTRAP_SEED: u64 = 0x5E_ED0F_E7A1;
 
 /// Mean of the per-case differences and its 95 % percentile bootstrap
 /// interval: `resamples` draws of the cases with replacement, the mean of
