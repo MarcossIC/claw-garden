@@ -193,8 +193,7 @@ async fn flush(conn: &Connection, buffer: Vec<i64>) {
         .collect();
 
     // One `(?,?,?)` placeholder per deduplicated entry.
-    let placeholders: String = std::iter::repeat("(?,?,?)")
-        .take(entries.len())
+    let placeholders: String = std::iter::repeat_n("(?,?,?)", entries.len())
         .collect::<Vec<_>>()
         .join(",");
 
