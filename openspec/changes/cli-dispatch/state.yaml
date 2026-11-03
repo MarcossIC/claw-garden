@@ -1,15 +1,15 @@
 change: cli-dispatch
 objective: "transversal"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done  # enfoque A; un error se traduce en el módulo del comando, con su explain
   spec: done  # CD1 a CD4
   design: skipped  # las alternativas están en la exploración (A, B, C) y en la decisión 2 de la propuesta
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done  # un commit por comando que se mudó, después de status, CliError, stop y Running
+  verify: done  # Linux: suite, los dos clippy y el binario de antes contra el de después en 244 casos; Windows en el CI del pull request
   archive: pending
 main_spec: openspec/specs/quality/spec.md
 updated: 2026-11-03
