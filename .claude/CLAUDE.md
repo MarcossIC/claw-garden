@@ -63,12 +63,13 @@ Selection: `--profile dev|prod`, then `CLAWG_PROFILE`, then the build type (`dev
 
 ```
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 - On Windows add `--target-dir target-test` to both: live `clawg.exe` processes lock `target\debug\clawg.exe`.
 - The bar is that the whole suite passes. Never record how many tests it has.
 - Compiler warnings, `dead_code` and `unused` among them, are errors; `tests/conventions.rs` fails when a source hides dead code behind an `allow`.
+- Clippy's lints are those of `[workspace.lints.clippy]` in the root `Cargo.toml`, and a command never turns one off. A finding that is not fixed takes `#[expect(clippy::<lint>, reason = "<why>")]` where it applies, never `#[allow]` or an entry in the table.
 - A test leaves nothing in the system temp dir. In clawg-core take the directory from `crate::test_dir::test_dir()` and close what the test opened (`MemoryRuntime::close`, `EvalIngest::finish`).
 - Tests that run the binary use a temporary home (`CLAWG_TEST_HOME`), the fake model (`CLAWG_TEST_EMBEDDER=fake`) and `--port 0`; they need clawg-core's `testing` feature, which only `[dev-dependencies]` may enable.
 - What the model sees of the MCP server is pinned in `crates/clawg-cli/src/mcp/agent_contract.json` and `agent_contract.es.json`. When a change to it is intended, run `CLAWG_BLESS=1 cargo test -p clawg-cli the_agent_contract_matches_its_file` (or `the_spanish_agent_contract_matches_its_file`), review the diff and run the tests again.
