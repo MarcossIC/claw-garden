@@ -2705,7 +2705,7 @@ mod tests {
 
         build_memory_prompt(Lang::En, &store, &wm, Some(embedder), "agent-1", None, &Reach::Own, query, &EmittedIds::default(), None, DEFAULT_BUDGET)
             .await
-            .unwrap().text;
+            .unwrap();
 
         let calls = recording.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "expected exactly one embed call, got {calls:?}");
