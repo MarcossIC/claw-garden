@@ -91,7 +91,7 @@ Parte de las búsquedas y sondas que corrieron la segunda pasada (`search.knn_re
 
 Con la lectura abierta nada se pierde, pero cada búsqueda de un tema compartido paga dos pasadas. Es lo que la exploración llamaba «quién paga el reintento»: casi todo el tiempo de una búsqueda es el brazo de vec0.
 
-[search-arm-timing](../search-arm-timing/exploration.md) (101) muestra que cada brazo de `search.duration` suma lo que tardaron los anteriores en la cola de la conexión. Estas cifras no cambian por eso:
+[search-arm-timing](../archive/2026-11-03-search-arm-timing/exploration.md) (101) muestra que cada brazo de `search.duration` suma lo que tardaron los anteriores en la cola de la conexión. Estas cifras no cambian por eso:
 
 - `knn_memory` es el primer brazo que entra en la cola, y cada búsqueda medida corre sola y sin canal léxico.
 - `total` mide la búsqueda de punta a punta.

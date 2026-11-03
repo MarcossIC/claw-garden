@@ -1,6 +1,6 @@
 # search-arm-timing — Especificación
 
-Delta sobre R14 de [`specs/metrics`](../../specs/metrics/spec.md). La serie sigue siendo `search.duration` (`us`) con `arm` en `knn_memory`, `knn_episodic`, `knn_skill`, `lexical`, `identifiers` y `total`; cambia qué mide cada brazo y cómo esperan los brazos su turno en la conexión. `total`, `search.knn_retry`, los resultados y su orden no cambian.
+Delta sobre R14 de [`specs/metrics`](../../../specs/metrics/spec.md). La serie sigue siendo `search.duration` (`us`) con `arm` en `knn_memory`, `knn_episodic`, `knn_skill`, `lexical`, `identifiers` y `total`; cambia qué mide cada brazo y cómo esperan los brazos su turno en la conexión. `total`, `search.knn_retry`, los resultados y su orden no cambian.
 
 ## A1. Cada brazo mide su ejecución en el hilo de la conexión
 

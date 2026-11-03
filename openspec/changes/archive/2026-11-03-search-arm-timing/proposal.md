@@ -11,12 +11,12 @@ Detalle en la [exploración](exploration.md); verificado otra vez contra `develo
 - `search_all_memories_inner` corre los tres KNN y los candidatos léxicos con `tokio::try_join!` (`crates/clawg-core/src/memory/search.rs:1304-1359`). Cada brazo toma su reloj antes de su primera espera (`:1308`, `:1320`, `:1332`, `:1351`) y lo cierra al volver (`:1311`, `:1323`, `:1335`, `:1353`); el léxico le suma el puntaje de sus candidatos (`:1393-1402`).
 - Las cuatro llamadas van a la misma cola: `knn_one` y `lexical_candidates` llaman a `store.conn.call` (`search.rs:565-566`, `:861-862`), y `tokio-rusqlite` las corre de a una, en orden de llegada, en un solo hilo (`tokio-rusqlite-0.7.0/src/lib.rs:376-377`, `event_loop` en `:412`). `try_join!` las encola juntas y espera la primera.
 - Por eso `knn_episodic` incluye la ejecución de `knn_memory`, `knn_skill` la de los dos y `lexical` la de los tres, y cada brazo suma además lo que otras llamadas tuvieran delante en la cola.
-- `docs/reference/data-profiles.md:18` y R14 de [`specs/metrics`](../../specs/metrics/spec.md) lo presentan como la duración de cada brazo.
+- `docs/reference/data-profiles.md:18` y R14 de [`specs/metrics`](../../../specs/metrics/spec.md) lo presentan como la duración de cada brazo.
 - Los tests fijan qué brazos se registran (`search.rs:5424`, `:5432`) y el total (`crates/clawg-cli/tests/api.rs:1584`); nada fija qué mide cada brazo.
 
 ## Objetivo que sirve
 
-Medición, transversal. read-connections (57) decide en su puerta si una lectura espera en la cola, y lee la búsqueda por brazo para saber en cuál. Con las series de hoy esa lectura atribuye a cada brazo el costo de los anteriores. knn-prefilter (37) no decide con ellas ([su verify](../knn-prefilter/verify.md), después de la tabla de la segunda pasada).
+Medición, transversal. read-connections (57) decide en su puerta si una lectura espera en la cola, y lee la búsqueda por brazo para saber en cuál. Con las series de hoy esa lectura atribuye a cada brazo el costo de los anteriores. knn-prefilter (37) no decide con ellas ([su verify](../../knn-prefilter/verify.md), después de la tabla de la segunda pasada).
 
 ## Decisiones
 

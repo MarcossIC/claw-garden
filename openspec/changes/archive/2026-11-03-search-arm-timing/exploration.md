@@ -4,12 +4,12 @@
 |---|---|---|---|
 | medición (transversal) | S | — | exploración cerrada; sigue en la [propuesta](proposal.md) |
 
-**Tesis:** `search.duration` por brazo no mide lo que dice. Los tres KNN y el canal léxico arrancan su reloj casi juntos y se encolan en la misma conexión, así que cada brazo suma lo que tardaron los anteriores. read-connections decide con mediciones de esta búsqueda, por eso este cambio va antes. knn-prefilter no: su puerta se lee por pérdidas, y la latencia que informa es la de `total` y la de `knn_memory`, el primer brazo de la cola, en búsquedas que corren solas y sin canal léxico ([su verify](../knn-prefilter/verify.md), después de la tabla de la segunda pasada).
+**Tesis:** `search.duration` por brazo no mide lo que dice. Los tres KNN y el canal léxico arrancan su reloj casi juntos y se encolan en la misma conexión, así que cada brazo suma lo que tardaron los anteriores. read-connections decide con mediciones de esta búsqueda, por eso este cambio va antes. knn-prefilter no: su puerta se lee por pérdidas, y la latencia que informa es la de `total` y la de `knn_memory`, el primer brazo de la cola, en búsquedas que corren solas y sin canal léxico ([su verify](../../knn-prefilter/verify.md), después de la tabla de la segunda pasada).
 
 ## Problema (verificado contra el código)
 
 - `search_all_memories_inner` corre los brazos con `tokio::try_join!` (`crates/clawg-core/src/memory/search.rs:1304-1359`). Cada uno toma `started` antes de su primera espera (`:1308`, `:1320`, `:1332`, `:1351`) y lo cierra al volver (`:1311`, `:1323`, `:1335`, `:1353`).
-- Todos van a la misma cola: `knn_one` llama a `store.conn.call` (`search.rs:564-566`), y `tokio-rusqlite` atiende en orden con un solo hilo (ver [read-connections](../read-connections/exploration.md), primera tabla de premisas).
+- Todos van a la misma cola: `knn_one` llama a `store.conn.call` (`search.rs:564-566`), y `tokio-rusqlite` atiende en orden con un solo hilo (ver [read-connections](../../read-connections/exploration.md), primera tabla de premisas).
 - Por eso `knn_episodic` incluye la ejecución de `knn_memory`, `knn_skill` la de los dos, y `lexical` la de los tres, más el puntaje de sus candidatos (`:1401`). Cada brazo suma además lo que otras llamadas tuvieran en la cola.
 - `try_join!` no da paralelismo. El comentario de `:1288-1290` ya lo dice de otro brazo: «All arms share one connection, so nothing ran in parallel to lose».
 - `docs/reference/data-profiles.md:18` y `openspec/specs/metrics/spec.md:164` lo presentan como la duración de cada brazo, sin esa salvedad.
@@ -57,5 +57,5 @@ Sin medir: cuánto se desvía en una base real. La conclusión sale de leer el c
 ## Interacciones
 
 - **read-connections:** lee estas series en su puerta de medición. Con los números de hoy, `knn_skill` parece caro por lo que costó `knn_memory`.
-- **knn-prefilter:** no decide con estas series. Su puerta se lee por pérdidas, K1 cronometra cada consulta dentro del hilo de la conexión, y sus latencias son las de `total` y `knn_memory`, el primer brazo de la cola, en búsquedas que corren solas y sin canal léxico ([su verify](../knn-prefilter/verify.md), después de la tabla de la segunda pasada).
+- **knn-prefilter:** no decide con estas series. Su puerta se lee por pérdidas, K1 cronometra cada consulta dentro del hilo de la conexión, y sus latencias son las de `total` y `knn_memory`, el primer brazo de la cola, en búsquedas que corren solas y sin canal léxico ([su verify](../../knn-prefilter/verify.md), después de la tabla de la segunda pasada).
 - **retire-legacy-kinds:** saca dos de los brazos. El test no debería depender de ellos.

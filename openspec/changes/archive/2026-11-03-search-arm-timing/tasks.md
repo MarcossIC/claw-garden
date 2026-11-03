@@ -33,7 +33,7 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## Al archivar (fuera de este cambio)
 
-- `rag-eval --fake --diff` sobre el golden de 46 casos (`docs/eval/golden.json`, fuera de git), en una máquina que lo tenga.
+- `rag-eval --fake --diff` sobre el golden de 46 casos (`docs/eval/golden.json`, fuera de git), en una máquina que lo tenga. Hecho en Windows: ningún caso se mueve ([verify](verify.md#el-golden-de-46-casos)).
 
-- Si la versión que lo publica no es la siguiente a 0.73.0, corregir «hasta 0.73.0» en `docs/reference/data-profiles.md` y en R14 de `specs/metrics`.
-- La línea de origen de `specs/metrics` y la fila 101 de `openspec/README.md` con la versión.
+- Si la versión que lo publica no es la siguiente a 0.73.0, corregir «hasta 0.73.0» en `docs/reference/data-profiles.md` y en R14 de `specs/metrics`. Hecho: lo publica la propia 0.73.0, así que dicen «hasta 0.72.2» ([verify](verify.md#al-archivar-2026-11-03)).
+- La línea de origen de `specs/metrics` y la fila 101 de `openspec/README.md` con la versión. Hecho: 0.73.0.

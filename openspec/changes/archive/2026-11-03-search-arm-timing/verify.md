@@ -43,3 +43,9 @@ En Windows x86_64, build debug (`cargo build --locked -p clawg-eval --bin rag-ev
 ## Lo que no se midió
 
 - **Una base real.** Falta medir cuánto se desviaban los brazos y cuánto crece `total` con la cola ocupada, ahora que cada brazo vuelve a hacer fila. Lo mide read-connections en su puerta, con el modelo real y un perfil de datos, y eso pide autorización.
+
+## Al archivar (2026-11-03)
+
+- A1 a A3 cambian R14 de [`specs/metrics`](../../../specs/metrics/spec.md), que ya los decía desde la tarea 3. Se suma su línea de origen y que el reloj de ahora sale en 0.73.0.
+- **«Hasta 0.73.0» pasó a «hasta 0.72.2».** La spec y los documentos se escribieron suponiendo que 0.73.0 sería la última versión con el reloj viejo. El código entró con `Cargo.toml` ya en 0.73.0, y el último tag es `v0.72.2`, así que 0.72.2 es la última con el reloj viejo y 0.73.0 la primera con el nuevo.
+- **La versión no sube.** `Cargo.toml` queda en 0.73.0, aunque `openspec/README.md` y `openspec/config.yaml` digan que archivar sube el minor. 0.73.0 no tiene tag y ya trae el código, y subirla dejaría falsas las notas «sale en 0.73.0». Es la excepción que ya se aplicó al archivar project-registry y project-locators.
