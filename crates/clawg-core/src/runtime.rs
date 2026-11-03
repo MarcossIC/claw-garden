@@ -482,7 +482,7 @@ async fn checkpoint(store: &MemoryStore) {
 /// Builds the chat chunker once — resolving the tokenizer as a side effect,
 /// which is what fills `tokenizer_cell` for the query path — then hands
 /// ownership to the worker loop.
-fn ingest_worker_future<L>(
+async fn ingest_worker_future<L>(
     base_dir: PathBuf,
     store: Arc<MemoryStore>,
     embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
@@ -490,36 +490,34 @@ fn ingest_worker_future<L>(
     rx: Receiver<IngestRequest>,
     drain: watch::Receiver<Option<Instant>>,
     load_tokenizer: L,
-) -> impl Future<Output = Vec<MemoryEvent>> + Send + 'static
+) -> Vec<MemoryEvent>
 where
     L: FnOnce(&std::path::Path) -> Option<Arc<tokenizers::Tokenizer>> + Send + 'static,
 {
-    async move {
-        // Reading, hashing and parsing 17 MB is blocking work.
-        let chat_chunker = {
-            let (base_dir, tokenizer) = (base_dir.clone(), tokenizer.clone());
-            tokio::task::spawn_blocking(move || resolve_tokenizer_and_chunker(&base_dir, &tokenizer, load_tokenizer))
-                .await
-        }
-        .unwrap_or_else(|e| {
-            log::warn!("reading tokenizer.json failed ({e}); chunking by bytes until the model loads");
-            Arc::new(ChatChunker::from_cell(tokenizer.clone()))
-        });
-        import_spill(&base_dir, &store).await;
-        let replay = match store.outbox_pending().await {
-            Ok(rows) => {
-                if !rows.is_empty() {
-                    log::info!("ingesting {} saves accepted before this start", rows.len());
-                }
-                Replay::rows(rows)
-            }
-            Err(e) => {
-                log::error!("could not read the outbox: {e}; its saves wait for the next start");
-                Replay::none()
-            }
-        };
-        memory_worker(rx, drain, replay, store, embedder, chat_chunker).await
+    // Reading, hashing and parsing 17 MB is blocking work.
+    let chat_chunker = {
+        let (base_dir, tokenizer) = (base_dir.clone(), tokenizer.clone());
+        tokio::task::spawn_blocking(move || resolve_tokenizer_and_chunker(&base_dir, &tokenizer, load_tokenizer))
+            .await
     }
+    .unwrap_or_else(|e| {
+        log::warn!("reading tokenizer.json failed ({e}); chunking by bytes until the model loads");
+        Arc::new(ChatChunker::from_cell(tokenizer.clone()))
+    });
+    import_spill(&base_dir, &store).await;
+    let replay = match store.outbox_pending().await {
+        Ok(rows) => {
+            if !rows.is_empty() {
+                log::info!("ingesting {} saves accepted before this start", rows.len());
+            }
+            Replay::rows(rows)
+        }
+        Err(e) => {
+            log::error!("could not read the outbox: {e}; its saves wait for the next start");
+            Replay::none()
+        }
+    };
+    memory_worker(rx, drain, replay, store, embedder, chat_chunker).await
 }
 
 /// Moves the events a previous version spilled to `ingest-pending.jsonl` into
