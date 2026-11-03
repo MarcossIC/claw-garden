@@ -621,6 +621,7 @@ impl ClawgMcp {
     /// `Err` is a client that could not be had at all, already the sentence
     /// the model should read; `Ok` is what `op` returned, for the tool to
     /// render as it always has.
+    #[expect(clippy::result_large_err, reason = "the error is the tool's answer, which rmcp takes by value once per call")]
     async fn call<T, F, Fut>(&self, op: F) -> Result<Result<T, ClientError>, CallToolResult>
     where
         F: Fn(DaemonClient) -> Fut,
