@@ -1424,7 +1424,7 @@ mod tests {
     fn a_marked_pair_without_a_distance_is_refused_without_naming_it() {
         let rows = [Row::new(1, "a", "p", "earlier"), Row::new(10, "a", "p", "later")];
 
-        let error = select_of(&rows, &[conflict(10, 1, None, true)], at(10)).err().expect("refused");
+        let error = select_of(&rows, &[conflict(10, 1, None, true)], at(10)).expect_err("refused");
 
         assert!(matches!(error, WarnedError::NoDistance(1)), "{error}");
         assert_eq!(error.to_string(), "1 marked pairs carry no distance: a store that did not keep it cannot be measured");
@@ -1525,7 +1525,7 @@ mod tests {
         let with = |edit: &dyn Fn(&mut Vec<LabelLine>)| {
             let mut lines = ok.clone();
             edit(&mut lines);
-            score(&file, &lines).err().expect("refused")
+            score(&file, &lines).expect_err("refused")
         };
 
         for empty in [None, Some(String::new())] {
@@ -1557,7 +1557,7 @@ mod tests {
         };
 
         for empty in [None, Some("")] {
-            let error = score(&file, &lines(empty)).err().expect("refused");
+            let error = score(&file, &lines(empty)).expect_err("refused");
             assert!(matches!(error, WarnedError::EmptyLabel { n: 2, field: "c" }), "{error}");
             assert!(error.keeps_work());
         }
@@ -1761,7 +1761,7 @@ mod tests {
         file.pairs[0].distance = None;
         let lines = Case::new(&marked_spread(3, 1), &[false]).lines();
 
-        let error = score(&file, &lines).err().expect("refused");
+        let error = score(&file, &lines).expect_err("refused");
 
         assert!(matches!(error, WarnedError::NoDistance(1)), "{error}");
     }
