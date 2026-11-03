@@ -441,7 +441,7 @@ pub(crate) mod tests {
             return;
         }
         let overlap = overlap.min(max - 1);
-        let marked = |from: usize, to: usize| (from..=to).filter(|&i| starts[i]).last();
+        let marked = |from: usize, to: usize| (from..=to).rfind(|&i| starts[i]);
         assert_eq!((windows[0].0, windows[windows.len() - 1].1), (0, n), "{}", at());
         let mut previous_end = 0;
         for (k, &(s, e)) in windows.iter().enumerate() {
