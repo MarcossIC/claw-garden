@@ -1614,7 +1614,7 @@ mod tests {
         let m_onnx = server
             .mock("GET", "/onnx/model.onnx")
             .with_status(200)
-            .with_body(b"WRONG-BYTES".to_vec()) // SHA won't match the fixture's.
+            .with_body(b"WRONG-BYTES") // SHA won't match the fixture's.
             .expect(1)
             .create_async()
             .await;
