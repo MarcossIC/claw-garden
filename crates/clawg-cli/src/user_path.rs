@@ -380,7 +380,7 @@ mod tests {
         /// only keep `clawg path add` from a PATH every program reads.
         #[test]
         fn a_byte_left_after_the_last_unit_is_not_part_of_the_value() {
-            for tail in [&[b'x'][..], &[0][..], &[0, 0, 0][..]] {
+            for tail in [&b"x"[..], &[0][..], &[0, 0, 0][..]] {
                 let scratch = ScratchKey::new("odd");
                 let mut bytes: Vec<u8> = r"C:\tools".encode_utf16().flat_map(u16::to_le_bytes).collect();
                 bytes.extend_from_slice(tail);
