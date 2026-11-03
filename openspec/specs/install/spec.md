@@ -2,7 +2,7 @@
 
 Fuente de verdad de cómo la suite prueba el binario `clawg` mismo: el build de test y las dos variables que sólo él lee (el home de prueba y el embedder de prueba), la regla que las mantiene fuera del binario que se entrega, las pruebas que lanzan el binario como proceso hijo, y el CI. Nada de esto cambia el binario que se entrega. El directorio de datos, el lock y el outbox están en [`specs/storage`](../storage/spec.md); el puente y su reconexión, en [`specs/mcp`](../mcp/spec.md).
 
-**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, la amplió (C1 a C6): `--locked`, la configuración de producción, acciones fijadas, el toolchain fijado y los workflows de avisos y del instalador. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó el embedder de prueba `blocked`. [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20, reemplazó el «Límite conocido» del autoarranque. [windows-socket](../../changes/archive/2026-10-20-windows-socket/proposal.md), archivado el 2026-10-20, lo llevó a Windows.
+**Origen:** [install-smoke](../../changes/archive/2026-10-16-install-smoke/proposal.md), archivado el 2026-10-16. [release-and-self-update](../../changes/archive/2026-10-18-release-and-self-update/proposal.md), archivado el 2026-10-18, reemplazó la sección «CI» (I1): el filtro de rutas del workflow y su relación con el release. [ci-hardening](../../changes/archive/2026-10-19-ci-hardening/proposal.md), archivado el 2026-10-19, la amplió (C1 a C6): `--locked`, la configuración de producción, acciones fijadas, el toolchain fijado y los workflows de avisos y del instalador. [shutdown-budget](../../changes/archive/2026-10-20-shutdown-budget/proposal.md), archivado el 2026-10-20, sumó el embedder de prueba `blocked`. [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20, reemplazó el «Límite conocido» del autoarranque. [windows-socket](../../changes/archive/2026-10-20-windows-socket/proposal.md), archivado el 2026-10-20, lo llevó a Windows. [clippy-enforced](../../changes/archive/2026-11-03-clippy-enforced/proposal.md), archivado el 2026-11-03, cuyo código salió en 0.73.0, sacó `-A clippy::all` de los comandos de clippy de la sección «CI» (sólo CE2; lo demás está en R6 de [`specs/quality`](../quality/spec.md)).
 
 ## Definiciones
 
@@ -157,6 +157,16 @@ La suite MUST pasar en Linux y en Windows. Para eso, las fixtures de los tests d
 - GIVEN un error de compilación dentro de un bloque `cfg(not(feature = "testing"))` de clawg-core
 - WHEN corre la CI de un PR
 - THEN el `clippy` de `-p clawg-cli` falla antes del merge
+
+#### Escenario: un workflow que apaga lints
+- GIVEN un workflow bajo `.github/workflows/` con `cargo clippy … -- -A clippy::all -D warnings`
+- WHEN corre la suite
+- THEN el test falla y nombra el workflow y el comando
+
+#### Escenario: un lint nuevo en un pull request
+- GIVEN un pull request que agrega `vec![1, 2, 3]` donde alcanza un arreglo (`clippy::useless_vec`)
+- WHEN corre el CI
+- THEN el paso de clippy falla en Linux y en Windows
 
 #### Escenario: sólo documentación
 - GIVEN un push a `main` que sólo cambia `README.md` y `openspec/**`

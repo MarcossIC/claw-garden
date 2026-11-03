@@ -10,7 +10,7 @@ Detalle en la [exploración](exploration.md); verificado otra vez contra `develo
 
 - El CI corre clippy con `-A clippy::all -D warnings` (`.github/workflows/ci.yml:65` y `:71`, `.github/workflows/cache.yml:53` y `:55`). `-A clippy::all` apaga todos los lints de clippy y sólo quedan los warnings del compilador; el comentario de `ci.yml:62` lo dice: «clippy's own lints are not enforced yet».
 - Ningún `Cargo.toml` declara `[workspace.lints]`, así que nada dice qué lints rigen el workspace.
-- El mismo comando está en `.claude/CLAUDE.md:66`, `docs/reference/testing.md:21` y `:36`, R6 de [`specs/quality`](../../specs/quality/spec.md) y la sección CI de [`specs/install`](../../specs/install/spec.md); `crates/clawg-cli/tests/conventions.rs:584` y `:780` fijan su texto en `ci.yml`.
+- El mismo comando está en `.claude/CLAUDE.md:66`, `docs/reference/testing.md:21` y `:36`, R6 de [`specs/quality`](../../../specs/quality/spec.md) y la sección CI de [`specs/install`](../../../specs/install/spec.md); `crates/clawg-cli/tests/conventions.rs:584` y `:780` fijan su texto en `ci.yml`.
 - Sin `-A clippy::all`, `cargo clippy --locked --workspace --all-targets` da 124 hallazgos en 34 lints en Linux ([paso 0](exploration.md#paso-0-el-conteo)).
 
 ## Objetivo que sirve

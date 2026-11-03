@@ -9,7 +9,7 @@ En Linux x86_64, build debug, toolchain 1.99.1, sobre `ec0a3e7`, el último comm
 - `cargo test --locked --workspace --no-fail-fast` pasa. Contra la base (`c0bf3af`, corrida antes del primer arreglo), cada binario de tests da los mismos pasados e ignorados, salvo `crates/clawg-cli/tests/conventions.rs`, que suma `every_package_takes_the_workspace_lints` y `no_workflow_turns_clippy_lints_off`.
 - `cargo test --locked -p clawg-core --lib build_info` pasa.
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin bendecir: lo que ve el modelo no cambió.
-- Windows queda para el CI del pull request, que compila el código `cfg(windows)`.
+- Windows lo corrió después el CI del pull request, que compila el código `cfg(windows)`: ver «Al archivar».
 
 ## El conteo, antes y después
 
@@ -46,5 +46,12 @@ Con la tabla, ninguno de los tres lints sueltos da nada: `large_futures` (la fut
 
 ## Lo que no se midió
 
-- **Windows.** El código `cfg(windows)` no se compila en Linux; lo revisa el CI del pull request en `windows-latest`, y lo que marque se arregla con el mismo criterio de la [propuesta](proposal.md#decisiones).
 - **Otros cambios abiertos.** Las tareas de otros cambios abiertos que dan el comando con `-A clippy::all` (`embedder-footprint`, `knn-prefilter`) registran lo que corrieron y no se tocan, como los `verify.md` archivados.
+
+## Al archivar (2026-11-03)
+
+- **Windows ya se midió.** El job `test (windows-latest)` pasó en #121 y sobre `a7f7337`, el último commit de `develop` antes de publicar. Ese job corre los dos clippy y la suite.
+- **`391e0ad`, posterior a esta verificación,** hizo que `no_workflow_turns_clippy_lints_off` también lea un comando que el shell parte en varias líneas. CE2 no cambia.
+- **CE1 a CE4 en las specs.** `ec0a3e7` ya los había llevado a R6 de [`specs/quality`](../../../specs/quality/spec.md) y a la sección CI de [`specs/install`](../../../specs/install/spec.md). Al comprobarlos faltaban y se agregaron: el `priority = -1` de CE1, qué se puede anotar y con qué motivo (CE3), lo que tiene que decir `docs/reference/testing.md` (CE4) y los seis escenarios de CE1 a CE3. Las citas de `ci.yml` y `cache.yml` siguen valiendo sobre `a7f7337`.
+- **El código ya salió.** `git tag --contains ec0a3e7` da `v0.73.0`, así que la primera versión publicada es 0.73.0.
+- **La versión sube a 0.74.0.** 0.73.0 ya tiene tag, así que no aplica la excepción de embedder-footprint y search-arm-timing. Subirla en `develop` no publica nada, porque publica el merge a `main`: 0.74.0 no se publica hasta que `develop` lleve código nuevo.

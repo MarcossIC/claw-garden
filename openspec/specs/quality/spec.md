@@ -5,6 +5,7 @@ Fuente de verdad de las redes de tests que vigilan lo que el modelo ve del servi
 **Origen:**
 - [quality-guards](../../changes/archive/2026-10-15-quality-guards/proposal.md), archivado el 2026-10-15. Los ids de requisito son los de esa spec. R5 (borrar el código sin llamador que escondían los `allow`) fue un arreglo de una vez y no queda como requisito: lo que impide que vuelva es R4 y el comando de `clippy` de R6. R3 (que la línea `MCP tools` de `.claude/CLAUDE.md` nombrara las herramientas registradas) se quitó: ningún test lee un archivo de instrucciones para agentes (R6).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo el contrato de una sesión en español en R1 y R2; qué lee esa sesión está en [`specs/mcp`](../mcp/spec.md), AL2 a AL4).
+- [clippy-enforced](../../changes/archive/2026-11-03-clippy-enforced/proposal.md), archivado el 2026-11-03, cuyo código salió en 0.73.0 (CE1, CE3 y CE4 en R6: qué lints de clippy rigen, cómo se anota una excepción y qué dicen los docs; CE2 está en [`specs/install`](../install/spec.md), «CI»).
 
 ## Definiciones
 
@@ -77,7 +78,28 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
   cargo clippy --workspace --all-targets -- -D warnings
   ```
 
-  Qué lints de clippy corren lo dice `[workspace.lints.clippy]` del `Cargo.toml` raíz, que cada paquete toma con `[lints] workspace = true`: el grupo por defecto, `large_futures`, `allow_attributes` y `allow_attributes_without_reason`. El comando MUST NOT apagar ninguno. Un hallazgo que no se arregla MUST anotarse en el ítem con `#[expect(clippy::<lint>, reason = "<motivo>")]`, nunca con `#[allow]` ni en la tabla; cuando el lint deja de emitirse, la expectativa no cumplida hace fallar el comando hasta que se quita. `every_package_takes_the_workspace_lints` y `no_workflow_turns_clippy_lints_off` (`crates/clawg-cli/tests/conventions.rs`) fijan la tabla y los comandos del CI ([`specs/install`](../install/spec.md), «CI»).
+  Qué lints de clippy corren lo dice `[workspace.lints.clippy]` del `Cargo.toml` raíz, que cada paquete toma con `[lints] workspace = true`: el grupo por defecto (`all` en `warn` con `priority = -1`, para que un lint suelto pese más que el grupo), `large_futures`, `allow_attributes` y `allow_attributes_without_reason`. El comando MUST NOT apagar ninguno. Un hallazgo que no se arregla MUST anotarse en el ítem con `#[expect(clippy::<lint>, reason = "<motivo>")]`, nunca con `#[allow]` ni en la tabla; cuando el lint deja de emitirse, la expectativa no cumplida hace fallar el comando hasta que se quita. Sólo se anota lo que pide un refactor con su propio cambio (`too_many_arguments`) o lo que el lint cuida y en ese lugar no pasa, y el motivo MUST decir cuál de las dos y por qué. `every_package_takes_the_workspace_lints` y `no_workflow_turns_clippy_lints_off` (`crates/clawg-cli/tests/conventions.rs`) fijan la tabla y los comandos del CI ([`specs/install`](../install/spec.md), «CI»).
+- `docs/reference/testing.md` («Local checks» y «CI and release workflows») MUST dar ese mismo comando, y MUST decir que `[workspace.lints.clippy]` es la que dice qué lints corren y que una excepción es un `#[expect]` con motivo.
 - `README.md` MUST NOT dar un número de versión como ejemplo de la salida de `clawg --version`.
+
+#### Escenario: un paquete sin la tabla
+- GIVEN un miembro del workspace cuyo `Cargo.toml` no tiene `[lints]` con `workspace = true`
+- WHEN corre la suite
+- THEN el test falla y nombra el paquete
+
+#### Escenario: una excepción del workspace
+- GIVEN `[workspace.lints.clippy]` con un lint en `allow`
+- WHEN corre la suite
+- THEN el test falla y nombra el lint
+
+#### Escenario: un `allow` de un lint de clippy
+- GIVEN `#[allow(clippy::too_many_arguments)]` sobre una función
+- WHEN corre clippy
+- THEN falla con `clippy::allow_attributes`
+
+#### Escenario: una excepción que dejó de hacer falta
+- GIVEN una función con `#[expect(clippy::too_many_arguments, reason = "…")]`
+- WHEN un cambio la deja con siete parámetros o menos
+- THEN clippy falla con `unfulfilled_lint_expectations` hasta que se quita el atributo
 
 **Test:** ninguno que lea `.claude/CLAUDE.md`, por la regla de arriba: el comando de `clippy` y el resto se comprueban a mano, y terminó con código 0 al archivar, en Linux y en Windows. La tabla y los comandos del CI los fijan los dos tests de `conventions.rs` nombrados arriba.
