@@ -274,6 +274,8 @@ async fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     const MINUTE: i64 = 60_000;
 
@@ -555,6 +557,89 @@ mod tests {
         let out = respond(HookEvent::SessionStart, "a", dir.path(), stdin, Duration::from_millis(100)).await;
         assert_eq!(out, None);
         assert!(started.elapsed() < Duration::from_secs(2), "the deadline covers the whole hook");
+    }
+
+    /// A daemon published in `dir` that answers every call with `status`, or,
+    /// without one, takes every connection and never writes a byte. Counts
+    /// the requests or connections it got.
+    async fn broken_daemon(dir: &Path, status: Option<axum::http::StatusCode>) -> Arc<AtomicUsize> {
+        use crate::daemon::lifecycle::{write_state, write_token, DaemonState};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let got = Arc::new(AtomicUsize::new(0));
+        let counter = got.clone();
+        match status {
+            Some(status) => {
+                let app = axum::Router::new().fallback(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async move { (status, axum::Json(serde_json::json!({ "error": "the daemon failed" }))) }
+                });
+                tokio::spawn(async move {
+                    let _ = axum::serve(listener, app).await;
+                });
+            }
+            None => {
+                tokio::spawn(async move {
+                    let mut held = Vec::new();
+                    while let Ok((stream, _)) = listener.accept().await {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        held.push(stream);
+                    }
+                });
+            }
+        }
+        let state = DaemonState {
+            pid: std::process::id(),
+            port: Some(port),
+            unix_socket: false,
+            profile: "dev".into(),
+            version: "0.1.0".into(),
+            started_at_ms: 0,
+        };
+        write_state(dir, &state).expect("write state");
+        write_token(dir, "0123456789abcdef0123456789abcdef").expect("write token");
+        got
+    }
+
+    fn hook_input(cwd: &Path) -> String {
+        serde_json::json!({ "cwd": cwd, "session_id": "s", "source": "startup" }).to_string()
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_answers_an_error_gives_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = broken_daemon(dir.path(), Some(axum::http::StatusCode::INTERNAL_SERVER_ERROR)).await;
+        let input = hook_input(dir.path());
+
+        for event in [HookEvent::SessionStart, HookEvent::UserPromptSubmit] {
+            let out = respond(event, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await;
+            assert_eq!(out, None, "{event:?}");
+        }
+        assert!(got.load(Ordering::SeqCst) > 0, "the hook asked the daemon");
+
+        let es = clawg_core::preferences::Preferences { language: Some(Lang::Es) };
+        clawg_core::preferences::save(dir.path(), &es).unwrap();
+        let out = respond(HookEvent::SessionStart, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await.expect("the language line");
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["additionalContext"], SPANISH_LINE);
+        assert_eq!(respond(HookEvent::UserPromptSubmit, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_never_answers_gives_nothing_by_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = broken_daemon(dir.path(), None).await;
+        let input = hook_input(dir.path());
+        let deadline = Duration::from_millis(300);
+
+        for event in [HookEvent::SessionStart, HookEvent::UserPromptSubmit] {
+            let started = std::time::Instant::now();
+            let out = respond(event, "a", dir.path(), input.as_bytes(), deadline).await;
+            let took = started.elapsed();
+            assert_eq!(out, None, "{event:?}");
+            assert!(took >= deadline && took < Duration::from_secs(2), "{event:?}: the deadline ends the wait, after {took:?}");
+        }
+        assert!(got.load(Ordering::SeqCst) > 0, "what the hook waited for was the daemon, not stdin");
     }
 
     #[tokio::test]
