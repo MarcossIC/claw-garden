@@ -165,7 +165,9 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:191`; `sha
 
 ## R7. `clawg sharing`
 
-`Command::Sharing` (`crates/clawg-cli/src/cli.rs:111`; ejecución en `run`, `crates/clawg-cli/src/sharing.rs:17`, y `main.rs:196`):
+`Command::Sharing` (`crates/clawg-cli/src/cli.rs:219`; ejecución en `run`, `crates/clawg-cli/src/sharing.rs:17`, y `main.rs:196`):
+
+- Su ayuda MUST decir que la política sirve para la relevancia y la privacidad entre agentes que cooperan y no es una frontera de acceso, y que aislar a un agente no confiable pide otro perfil u otro usuario del sistema. Lo mismo dice el README. Es coherente con el modelo de amenazas, en el que los agentes son del mismo usuario y pueden leer el token: el nombre del agente lo declara el cliente (`--agent`, si no `clientInfo.name` tal cual; `resolve_agent`, `crates/clawg-cli/src/mcp/server.rs:97`), y una llamada sin `?agent=` llega a cualquier fila (`ReaderQuery`, `crates/clawg-cli/src/daemon/api.rs:516`).
 
 - `clawg sharing [--profile P]` MUST imprimir la política, una exclusión por línea (`<lector> does not read <autor>`, `no agent reads <autor>`, `<lector> reads no other agent`, `no agent reads another`), o `every agent reads every other agent` (`render`, `sharing.rs:148`). Con un archivo inválido MUST imprimir el error y salir con 1.
 - `clawg sharing hide <LECTOR> <AUTOR> [--profile P]` MUST agregar la exclusión y `clawg sharing unhide <LECTOR> <AUTOR>` MUST quitarla. Los dos imprimen la política resultante. Ocultar lo que ya está oculto o mostrar lo que no lo está MUST NOT fallar.
@@ -175,7 +177,7 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:191`; `sha
 - `--profile` MUST valer antes o después de la acción (`clawg sharing --profile dev hide …` y `clawg sharing hide … --profile dev`, `sharing_profile`, `cli.rs:194`): una exclusión escrita en el directorio de otro perfil deja compartiendo lo que el usuario cree oculto.
 - MUST funcionar con el daemon corriendo y sin abrir la base.
 
-**Tests:** `sharing_shows_hides_and_unhides`, `sharing_rejects_a_blank_or_self_exclusion`, `every_agent_is_accepted_on_either_side` y `sharing_takes_the_profile_from_either_side_of_the_action` en `crates/clawg-cli/src/cli.rs`; `hide_and_unhide_print_the_policy_they_leave`, `a_change_on_an_invalid_policy_leaves_it_alone`, `hiding_an_agent_from_itself_writes_nothing` y `every_agent_on_both_sides_stops_all_sharing` en `crates/clawg-cli/src/sharing.rs`; `hide_and_unhide_rewrite_the_policy`, `hiding_twice_and_unhiding_nothing_are_fine`, `an_invalid_policy_is_never_rewritten`, `an_exclusion_can_come_before_the_data_directory_exists`, `the_saved_file_parses_back_to_the_same_policy` y `render_lists_one_exclusion_per_line` en `crates/clawg-core/src/memory/sharing.rs`.
+**Tests:** `the_sharing_help_says_it_is_not_an_access_boundary`, `sharing_shows_hides_and_unhides`, `sharing_rejects_a_blank_or_self_exclusion`, `every_agent_is_accepted_on_either_side` y `sharing_takes_the_profile_from_either_side_of_the_action` en `crates/clawg-cli/src/cli.rs`; `hide_and_unhide_print_the_policy_they_leave`, `a_change_on_an_invalid_policy_leaves_it_alone`, `hiding_an_agent_from_itself_writes_nothing` y `every_agent_on_both_sides_stops_all_sharing` en `crates/clawg-cli/src/sharing.rs`; `hide_and_unhide_rewrite_the_policy`, `hiding_twice_and_unhiding_nothing_are_fine`, `an_invalid_policy_is_never_rewritten`, `an_exclusion_can_come_before_the_data_directory_exists`, `the_saved_file_parses_back_to_the_same_policy` y `render_lists_one_exclusion_per_line` en `crates/clawg-core/src/memory/sharing.rs`.
 
 ## R8. Datos de la versión anterior
 

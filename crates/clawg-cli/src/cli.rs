@@ -211,7 +211,11 @@ pub enum Command {
     /// `hide` and `unhide`. Every agent reads every other agent until hidden;
     /// a change counts from the next search, with the daemon running. A shared
     /// memory reaches the other agent's provider: `clawg secrets` lists the
-    /// rows that hold a secret.
+    /// rows that hold a secret. It is for relevance and privacy between agents
+    /// that cooperate, not an access boundary: an agent's name is whatever its
+    /// client says, and whatever holds the profile's token reaches every row.
+    /// Keeping out an agent you do not trust takes another profile or another
+    /// system user.
     Sharing {
         #[command(subcommand)]
         action: Option<SharingAction>,
@@ -1532,6 +1536,15 @@ mod tests {
         assert!(Cli::try_parse_from(["clawg", "sharing", "hide", "cursor"]).is_err(), "both agents are needed");
         let e = hide_of(&["clawg", "sharing", "hide", "cursor", "cursor"]);
         assert_eq!(e.check(Lang::En), Err("cursor always reads its own memories".to_string()));
+    }
+
+    #[test]
+    fn the_sharing_help_says_it_is_not_an_access_boundary() {
+        let mut cli = <Cli as clap::CommandFactory>::command();
+        let help = cli.find_subcommand_mut("sharing").expect("sharing").render_long_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("relevance and privacy between agents that cooperate, not an access boundary"), "{help}");
+        assert!(help.contains("another profile or another system user"), "{help}");
     }
 
     #[test]

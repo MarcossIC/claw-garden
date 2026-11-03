@@ -399,7 +399,7 @@ claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe
 
 ### Compartir memorias entre agentes
 
-Todos los agentes leen lo que guardaron los demás: lo que Claude Code aprendió de vos le sirve a Cursor cuando busca. Lo compartido le llega al agente marcado `by claude-code`, como información para verificar y no como instrucciones, y es de sólo lectura: sólo su autor puede cambiarlo o borrarlo. El workspace y los conflictos de cada agente siguen siendo suyos.
+Todos los agentes leen lo que guardaron los demás: lo que Claude Code aprendió de vos le sirve a Cursor cuando busca. Lo compartido le llega al agente marcado `by claude-code`, como información para verificar y no como instrucciones, y el agente que lo encuentra lo puede cambiar, borrar o juzgar como lo propio. El workspace y RECENT de cada agente siguen siendo suyos.
 
 Para que un agente no lea a otro, excluilo desde una terminal:
 
@@ -414,6 +414,8 @@ Desde la próxima búsqueda, `cursor` deja de encontrar lo que guardó `claude-c
 - Los nombres son los que muestra `memory_status`, con las mismas mayúsculas.
 - Una memoria compartida llega al proveedor del otro agente. `clawg secrets` lista las que guardan un secreto que el enmascarado reconoce.
 - Si `sharing.json` queda inválido, ningún agente lee a otro hasta que lo arregles, y `memory_status` dice por qué.
+
+`sharing.json` no es un control de acceso: sirve para la relevancia y la privacidad entre agentes que cooperan. El nombre de un agente es el que declara su cliente (o `--agent`), y cualquier proceso que lea el `token` del perfil llega a todas las memorias. Para aislar a un agente en el que no confiás, usá otro perfil u otro usuario del sistema.
 
 Las herramientas que recibe el agente están en [Herramientas MCP](#herramientas-mcp).
 
