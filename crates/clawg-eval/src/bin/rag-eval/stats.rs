@@ -51,7 +51,15 @@ pub const ALPHA: f64 = 0.05;
 /// The fewest cases that, all moving the same way and none the other, reach
 /// `ALPHA`. Independent of the set's size: only the cases that moved count.
 pub fn min_one_way_significant() -> usize {
-    (1..).find(|&m| mcnemar_exact(m, 0) < ALPHA).expect("the p-value halves with every case")
+    more_one_way_significant(0, 0)
+}
+
+/// The fewest cases more, all moving the way `lead` cases already did, that
+/// reach `ALPHA` with the `against` cases that moved the other way still
+/// counted: the net movement a conclusion still needs. None when the
+/// movement already reaches it.
+pub fn more_one_way_significant(lead: usize, against: usize) -> usize {
+    (0..).find(|&more| mcnemar_exact(lead + more, against) < ALPHA).expect("the p-value falls with every case one way")
 }
 
 /// A mean difference and its interval.
@@ -194,5 +202,15 @@ mod tests {
     #[test]
     fn six_cases_one_way_is_the_smallest_significant_count() {
         assert_eq!(min_one_way_significant(), 6);
+    }
+
+    #[test]
+    fn the_cases_still_needed_count_the_ones_that_moved_against() {
+        assert_eq!(more_one_way_significant(0, 0), 6);
+        assert_eq!(more_one_way_significant(1, 0), 5);
+        assert_eq!(more_one_way_significant(6, 0), 0);
+        assert_eq!(more_one_way_significant(10, 3), 2);
+        assert!(mcnemar_exact(12, 3) < ALPHA && mcnemar_exact(11, 3) >= ALPHA);
+        assert_eq!(more_one_way_significant(3, 3), 9);
     }
 }
