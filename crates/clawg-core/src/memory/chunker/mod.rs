@@ -197,6 +197,6 @@ mod tests {
     fn chunk_cap_and_overlap_constants_hold_the_contract() {
         assert_eq!(CHUNK_MAX_TOKENS, 480);
         assert_eq!(CHUNK_OVERLAP_TOKENS, 64);
-        assert!(CHUNK_OVERLAP_TOKENS < CHUNK_MAX_TOKENS, "overlap must stay below max or stride collapses to 0");
+        const { assert!(CHUNK_OVERLAP_TOKENS < CHUNK_MAX_TOKENS, "overlap must stay below max or stride collapses to 0") }
     }
 }
