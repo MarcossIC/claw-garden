@@ -1594,7 +1594,7 @@ mod tests {
 
     #[test]
     fn the_precision_is_the_revisions_among_the_marked_with_their_wilson_interval() {
-        let scored = Case::new(&marked_spread(100, 90), &vec![false; 100]).score();
+        let scored = Case::new(&marked_spread(100, 90), &[false; 100]).score();
 
         assert_eq!((scored.precision.k, scored.precision.n), (90, 100));
         let wilson = crate::stats::Rate::of(90, 100);
@@ -1605,7 +1605,7 @@ mod tests {
     #[test]
     fn the_minimum_precision_comes_from_the_prevalence_of_the_marked_pairs_and_the_rest() {
         // 90 revisions among 100 marked, none among 100 of the rest, which is all of it: π = 0.45.
-        let scored = Case::new(&marked_spread(100, 90), &vec![false; 100]).score();
+        let scored = Case::new(&marked_spread(100, 90), &[false; 100]).score();
 
         assert!((scored.prevalence.estimate - 0.45).abs() < 1e-12 && scored.prevalence.census);
         assert!((scored.p_min - 0.9 / 1.45).abs() < 1e-12, "{}", scored.p_min);
@@ -1645,7 +1645,7 @@ mod tests {
 
     #[test]
     fn the_warning_stays_when_the_lower_bound_of_the_precision_clears_the_minimum() {
-        let scored = Case::new(&marked_spread(100, 90), &vec![false; 100]).score();
+        let scored = Case::new(&marked_spread(100, 90), &[false; 100]).score();
 
         assert_eq!(scored.decision, Decision::Keeps);
         assert!(scored.precision.lo > scored.p_min);

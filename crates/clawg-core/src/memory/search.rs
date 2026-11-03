@@ -1653,7 +1653,7 @@ mod tests {
             topic_key: None,
             project_id: None,
         };
-        let mut hits = vec![h2, h1];
+        let mut hits = [h2, h1];
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         assert!((hits[0].score - 0.9).abs() < 1e-9);
     }
