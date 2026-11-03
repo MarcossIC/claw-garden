@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::memory::pieces::{read_save_core, SaveLink};
+use crate::memory::pieces::read_save_core;
 use crate::memory::provenance::mark;
 use crate::preferences::Lang;
 use crate::memory::{
@@ -12,7 +12,7 @@ use crate::memory::{
     admin::MemoryKind,
     clock::TimestampMs,
     embedder::{EmbedError, EmbedRole, Embedder},
-    search::{memory_project_predicate, search_all_memories, RankedHit, SearchScope},
+    search::{memory_project_predicate, search_all_memories, PiecePosition, RankedHit, SearchScope},
     sharing::{Reach, Reader},
     workspace::{EmittedIds, WorkspaceManager},
     MemoryError, MemoryStore, TableKind,
@@ -320,10 +320,7 @@ pub async fn build_session_prompt(
 ) -> Result<MemoryPrompt, MemoryError> {
     let workspace_content = read_workspace(workspace, agent_id, project_id).await;
     let since = TimestampMs::now().as_millis_i64().saturating_sub(RECENT_WINDOW_MS);
-    let rows = fetch_recent_rows(store, agent_id, project_id, since).await?;
-    let rows: Vec<RankedHit> = rows.into_iter().filter(|h| !emitted.contains(h.kind, h.id)).collect();
-    let links = store.save_links(rows.iter().map(|h| h.id).collect()).await?;
-    let hits = one_row_per_save(rows, &links, K_FINAL);
+    let hits = fetch_recent_saves(store, agent_id, project_id, since, emitted, K_FINAL).await?;
     let retrieval = Retrieval::Recent { hits: hits.len() };
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
     // No room: at a session start the summary is the handoff, and these rows
@@ -999,41 +996,73 @@ async fn fetch_last_session(
         .map_err(|e| MemoryError::Backend(format!("fetch_last_session: {e}")))
 }
 
-/// Rows RECENT may print in a prompt without a query: the reader's own live
-/// rows since `?3`, newest first, under the search's project predicate. The
-/// pool is wider than the block because the pieces of one long save are
-/// rows of their own, and they fold into one line. The pieces of a save share
-/// its stamp and are inserted in order, so `id ASC` within a stamp keeps the
-/// opening of a save the pool's cut falls inside.
-const RECENT_ROWS_SQL: &str = concat!(
+/// A row RECENT may print: a live row of the reader's own (`?1`) since `?3`,
+/// under the search's project predicate (`?2`), that the workspace did not
+/// print (`?4`, a JSON array of ids).
+macro_rules! recent_row {
+    ($m:literal) => {
+        concat!(
+            $m, "status IN ('active', 'disputed') AND ", $m, "deleted_at IS NULL AND ", $m, "agent_id = ?1 AND ",
+            memory_project_predicate!($m, "?2"), " AND ", $m, "created_at >= ?3 AND ",
+            $m, "id NOT IN (SELECT value FROM json_each(?4))"
+        )
+    };
+}
+
+/// The saves RECENT prints in a prompt without a query, newest first, at most
+/// `?5`: one row per save, so the `LIMIT` counts saves however many pieces
+/// each holds. A long save is its piece of lowest position among the rows
+/// that qualify, since the opening names its subject; no earlier piece of it
+/// may qualify. A row's save is the oldest that links it, as
+/// [`MemoryStore::save_links`] reads it. The last two columns are the
+/// piece's position and its save's count, `NULL` for a row of one piece.
+/// `CROSS JOIN` keeps the save's own pieces in the outer loop of the check:
+/// without statistics the planner would walk every row of the agent instead.
+const RECENT_SAVES_SQL: &str = concat!(
     "
-    SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key, project_id
-    FROM memory
-    WHERE status IN ('active', 'disputed')
-      AND deleted_at IS NULL
-      AND agent_id = ?1
-      AND ",
-    memory_project_predicate!("", "?2"),
+    SELECT m.id, m.content, m.memory_type, m.tier, m.status, m.created_at, m.agent_id, m.topic_key, m.project_id,
+           p.piece, (SELECT COUNT(*) FROM memory_piece n WHERE n.save_id = p.save_id)
+    FROM memory m
+    LEFT JOIN memory_piece p
+      ON p.memory_id = m.id
+     AND p.save_id = (SELECT MIN(save_id) FROM memory_piece WHERE memory_id = m.id)
+     AND p.piece = (SELECT MIN(piece) FROM memory_piece WHERE memory_id = m.id AND save_id = p.save_id)
+    WHERE ",
+    recent_row!("m."),
     "
-      AND created_at >= ?3
-    ORDER BY created_at DESC, id ASC
-    LIMIT ?4
+      AND NOT EXISTS (
+        SELECT 1 FROM memory_piece q CROSS JOIN memory o ON o.id = q.memory_id
+        WHERE q.save_id = p.save_id AND q.piece < p.piece
+          AND (SELECT MIN(save_id) FROM memory_piece WHERE memory_id = o.id) = q.save_id
+          AND ",
+    recent_row!("o."),
+    "
+      )
+    ORDER BY m.created_at DESC, m.id ASC
+    LIMIT ?5
 "
 );
-const RECENT_ROW_POOL: i64 = 200;
 
-async fn fetch_recent_rows(
+/// The newest `limit` saves RECENT may print ([`RECENT_SAVES_SQL`]), each
+/// with its piece's position when it is a piece of a long save.
+async fn fetch_recent_saves(
     store: &MemoryStore,
     agent_id: &str,
     project_id: Option<&str>,
     since: i64,
+    emitted: &EmittedIds,
+    limit: usize,
 ) -> Result<Vec<RankedHit>, MemoryError> {
     let (agent, project) = (agent_id.to_string(), project_id.map(str::to_string));
+    let printed = serde_json::to_string(&emitted.memory_ids().collect::<Vec<i64>>())
+        .map_err(|e| MemoryError::Backend(format!("fetch_recent_saves: {e}")))?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<RankedHit>> {
-            let mut stmt = c.prepare_cached(RECENT_ROWS_SQL)?;
-            let rows = stmt.query_map(rusqlite::params![agent, project, since, RECENT_ROW_POOL], |row| {
+            let mut stmt = c.prepare_cached(RECENT_SAVES_SQL)?;
+            let rows = stmt.query_map(rusqlite::params![agent, project, since, printed, limit], |row| {
+                let piece: Option<i64> = row.get(9)?;
                 Ok(RankedHit {
                     id: row.get(0)?,
                     kind: TableKind::Memory,
@@ -1045,7 +1074,7 @@ async fn fetch_recent_rows(
                     distance: 0.0,
                     created_at: TimestampMs::from_unix_millis(row.get(5)?),
                     agent_id: row.get(6)?,
-                    piece: None,
+                    piece: piece.map(|piece| row.get(10).map(|pieces| PiecePosition { piece, pieces })).transpose()?,
                     exact: false,
                     topic_key: row.get(7)?,
                     project_id: row.get(8)?,
@@ -1054,34 +1083,7 @@ async fn fetch_recent_rows(
             rows.collect()
         })
         .await
-        .map_err(|e| MemoryError::Backend(format!("fetch_recent_rows: {e}")))
-}
-
-/// The first `k` saves of `rows`, in their order, each as its piece of
-/// lowest position: the opening is what names the subject of a long save.
-fn one_row_per_save(rows: Vec<RankedHit>, links: &HashMap<i64, SaveLink>, k: usize) -> Vec<RankedHit> {
-    let mut out: Vec<RankedHit> = Vec::new();
-    let mut slot_of_save: HashMap<i64, usize> = HashMap::new();
-    for mut row in rows {
-        let link = links.get(&row.id).copied();
-        row.piece = link.map(|l| l.position);
-        match link.and_then(|l| slot_of_save.get(&l.save_id).copied()) {
-            Some(slot) => {
-                let piece = |h: &RankedHit| h.piece.map_or(0, |p| p.piece);
-                if piece(&row) < piece(&out[slot]) {
-                    out[slot] = row;
-                }
-            }
-            None if out.len() < k => {
-                if let Some(link) = link {
-                    slot_of_save.insert(link.save_id, out.len());
-                }
-                out.push(row);
-            }
-            None => {}
-        }
-    }
-    out
+        .map_err(|e| MemoryError::Backend(format!("fetch_recent_saves: {e}")))
 }
 
 /// Partitions hits into (recent, longterm) at `now - RECENT_WINDOW_MS`. A stamp
@@ -3629,12 +3631,11 @@ mod tests {
         assert!(!prompt.text.contains(&format!("#{second} ")), "{}", prompt.text);
     }
 
-    #[tokio::test]
-    async fn a_long_save_the_row_pool_cuts_is_still_shown_by_its_opening() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        // Every piece of a save carries the save's stamp, as ingest writes it.
-        let pieces = RECENT_ROW_POOL + 1;
-        let ts = TimestampMs::now().as_millis_i64() - 86_400_000;
+    /// A save of `pieces` rows of `agent_id`, `age_ms` old, linked in order.
+    /// Every piece carries the save's stamp, as ingest writes it.
+    async fn seed_long_save(store: &MemoryStore, agent_id: &str, label: &str, pieces: usize, age_ms: i64) -> Vec<i64> {
+        let (agent, text) = (agent_id.to_string(), label.to_string());
+        let ts = TimestampMs::now().as_millis_i64() - age_ms;
         let ids = store
             .conn
             .call(move |c| -> Result<Vec<i64>, rusqlite::Error> {
@@ -3644,8 +3645,8 @@ mod tests {
                             "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
                              created_at, created_by_type, created_by_ref,
                              last_modified_at, last_accessed_at, importance, tier, status)
-                             VALUES ('agent', 'agent-1', NULL, ?1, 'semantic_fact', 'explicit', ?2, 'agent', 'agent-1', ?2, ?2, 5.0, 2, 'active')",
-                            rusqlite::params![format!("piece {i} of a long save"), ts],
+                             VALUES ('agent', ?1, NULL, ?2, 'semantic_fact', 'explicit', ?3, 'agent', ?1, ?3, ?3, 5.0, 2, 'active')",
+                            rusqlite::params![agent, format!("piece {i} of {text}"), ts],
                         )?;
                         Ok(c.last_insert_rowid())
                     })
@@ -3658,14 +3659,46 @@ mod tests {
             .enumerate()
             .map(|(i, &memory_id)| crate::memory::pieces::StoredPiece {
                 memory_id,
-                context: if i == 0 { String::new() } else { "opening".into() },
+                context: if i == 0 { String::new() } else { label.to_string() },
             })
             .collect();
         store.link_pieces(linked).await.unwrap();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_shows_ten_saves_however_many_pieces_they_hold() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        // Eleven saves of 25 pieces: the ten newest alone are 250 rows.
+        let mut openings = Vec::new();
+        for save in 0..11 {
+            let ids = seed_long_save(&store, "agent-1", &format!("save {save}"), 25, 86_400_000 + save * 60_000).await;
+            openings.push(ids[0]);
+        }
 
         let prompt = session_prompt(&store, "agent-1", None).await;
 
-        assert!(prompt.text.contains(&format!("#{} semantic_fact piece=1/{pieces}]", ids[0])), "{}", prompt.text);
+        let recent = block(&prompt.text, SEP_RECENT).unwrap_or_else(|| panic!("no RECENT block: {}", prompt.text));
+        for id in &openings[..10] {
+            assert!(recent.contains(&format!("#{id} semantic_fact piece=1/25]")), "#{id} missing: {recent}");
+        }
+        assert!(!recent.contains(&format!("#{} ", openings[10])), "the eleventh is older than the ten: {recent}");
+        assert!(matches!(prompt.retrieval, Retrieval::Recent { hits: 10 }), "{:?}", prompt.retrieval);
+    }
+
+    #[tokio::test]
+    async fn a_long_save_whose_opening_is_gone_is_shown_by_its_next_piece() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let ids = seed_long_save(&store, "agent-1", "a long save", 3, 86_400_000).await;
+        let opening = ids[0];
+        store.conn.call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [opening])).await.unwrap();
+
+        let prompt = session_prompt(&store, "agent-1", None).await;
+
+        let recent = block(&prompt.text, SEP_RECENT).unwrap_or_else(|| panic!("no RECENT block: {}", prompt.text));
+        assert!(recent.contains(&format!("#{} semantic_fact piece=2/3]", ids[1])), "{recent}");
+        assert!(!recent.contains(&format!("#{} ", ids[2])), "one line per save: {recent}");
+        assert!(matches!(prompt.retrieval, Retrieval::Recent { hits: 1 }), "{:?}", prompt.retrieval);
     }
 
     #[tokio::test]
@@ -3920,6 +3953,13 @@ mod tests {
             .unwrap()
     }
 
+    /// What [`fetch_recent_saves`] binds to [`RECENT_SAVES_SQL`] for `agent-1`
+    /// in `project`, with nothing printed by the workspace.
+    fn recent_binds(project: rusqlite::types::Value) -> Vec<rusqlite::types::Value> {
+        use rusqlite::types::Value;
+        vec![Value::Text("agent-1".into()), project, Value::Integer(0), Value::Text("[]".into()), Value::Integer(K_FINAL as i64)]
+    }
+
     /// Both run on every context and every `session-start`, so they must reach
     /// the newest rows by key and stop there: a scan or a sort makes their cost
     /// the size of the store rather than of what they return.
@@ -3928,22 +3968,21 @@ mod tests {
         use rusqlite::types::Value;
         let store = MemoryStore::new_for_test().await.unwrap();
         let cases = [
-            ("LAST SESSION in a project", LAST_SESSION_SQL, vec![Value::Text("proj-a".into())], "idx_memory_session_summary"),
-            ("LAST SESSION without a project", LAST_SESSION_SQL, vec![Value::Null], "idx_memory_session_summary"),
-            (
-                "RECENT",
-                RECENT_ROWS_SQL,
-                vec![Value::Text("agent-1".into()), Value::Text("proj-a".into()), Value::Integer(0), Value::Integer(RECENT_ROW_POOL)],
-                "idx_memory_agent_created",
-            ),
+            ("LAST SESSION in a project", LAST_SESSION_SQL, vec![Value::Text("proj-a".into())], "memory", "idx_memory_session_summary"),
+            ("LAST SESSION without a project", LAST_SESSION_SQL, vec![Value::Null], "memory", "idx_memory_session_summary"),
+            ("RECENT", RECENT_SAVES_SQL, recent_binds(Value::Text("proj-a".into())), "m", "idx_memory_agent_created"),
+            ("RECENT without a project", RECENT_SAVES_SQL, recent_binds(Value::Null), "m", "idx_memory_agent_created"),
         ];
-        for (name, sql, binds, index) in cases {
+        for (name, sql, binds, table, index) in cases {
             let plan = plan_of(&store, sql, binds).await;
             assert!(
-                plan.iter().any(|l| l.starts_with("SEARCH memory USING INDEX") && l.contains(index)),
+                plan.iter().any(|l| l.starts_with(&format!("SEARCH {table} USING INDEX {index}"))),
                 "{name} does not search `{index}`: {plan:?}"
             );
             assert!(!plan.iter().any(|l| l.contains("TEMP B-TREE")), "{name} sorts its rows: {plan:?}");
+            // RECENT checks the earlier pieces of a save by the save's key; a
+            // second walk of the index would read the agent's week per row.
+            assert_eq!(plan.iter().filter(|l| l.contains(index)).count(), 1, "{name} reads `{index}` again: {plan:?}");
         }
     }
 
@@ -3987,12 +4026,7 @@ mod tests {
         };
         use rusqlite::types::Value;
         let last = ids(LAST_SESSION_SQL, vec![Value::Text("proj-a".into())]).await.unwrap();
-        let recent = ids(
-            RECENT_ROWS_SQL,
-            vec![Value::Text("agent-1".into()), Value::Text("proj-a".into()), Value::Integer(0), Value::Integer(RECENT_ROW_POOL)],
-        )
-        .await
-        .unwrap();
+        let recent = ids(RECENT_SAVES_SQL, recent_binds(Value::Text("proj-a".into()))).await.unwrap();
 
         assert_eq!(last, expected, "LAST SESSION");
         assert_eq!(recent, expected, "RECENT");
