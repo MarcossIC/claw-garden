@@ -14,6 +14,40 @@
 - `crates/clawg-cli/tests/conventions.rs:584` y `:780` fijan el texto del comando en el CI. También lo dan `.claude/CLAUDE.md:66` y `docs/reference/testing.md:36`.
 - El backlog de `openspec/README.md` registró 28 lints propios en su momento (7 de `too_many_arguments`). Ese número no se volvió a medir, y el código creció desde entonces.
 
+## Paso 0: el conteo
+
+`cargo clippy --locked --workspace --all-targets`, sin `-A clippy::all`, sobre `c0bf3af`, con la toolchain fijada (1.99.1), en Linux. Se cuenta cada lugar (archivo, línea y columna) una vez: el código que compilan dos targets, la biblioteca y sus tests, da el mismo hallazgo dos veces, y así los 188 mensajes son 124 lugares.
+
+- **124 hallazgos en 34 lints**, todos `warn`: ninguno de `clippy::correctness`, que es `deny`. Por paquete: `clawg-core` 81, `clawg-eval` 23 y `clawg-cli` 20 (2 de ellos en `tests/`).
+- `cargo clippy --locked -p clawg-cli`, lo que construye el release, da 48, todos entre los 124.
+- Los dos `#[allow(clippy::too_many_arguments)]` que ya había (`crates/clawg-core/src/memory/bootstrap.rs:849`, `crates/clawg-core/src/memory/prompt_builder.rs:2489`) no cuentan: el lint no se emite ahí.
+- El código `cfg(windows)` no se compila en Linux: lo cuenta el CI del pull request, en `windows-latest`.
+
+| Lint | Hallazgos |
+|---|---|
+| `too_many_arguments` | 22 |
+| `type_complexity` | 19 |
+| `chunks_exact_to_as_chunks` | 8 |
+| `cloned_ref_to_slice_refs` | 8 |
+| `unnecessary_map_or` | 7 |
+| `large_enum_variant` | 6 |
+| `needless_borrow` | 5 |
+| `err_expect` | 5 |
+| `manual_contains` | 5 |
+| `manual_repeat_n` | 4 |
+| `useless_vec` | 4 |
+| `manual_range_contains` | 3 |
+| `empty_line_after_doc_comments`, `field_reassign_with_default`, `unusual_byte_groupings`, `explicit_auto_deref`, `assertions_on_constants`, `double_ended_iterator_last` | 2 cada uno |
+| `missing_transmute_annotations`, `double_must_use`, `manual_checked_ops`, `manual_div_ceil`, `manual_async_fn`, `for_unbounded_range`, `result_large_err`, `bool_assert_comparison`, `useless_conversion`, `needless_lifetimes`, `useless_format`, `identity_op`, `single_range_in_vec_init`, `unnecessary_to_owned`, `unnecessary_operation`, `needless_range_loop` | 1 cada uno |
+
+Fuera del grupo por defecto, para la primera decisión abierta:
+
+- `await_holding_lock` y `await_holding_refcell_ref` ya están en él (`clippy::suspicious`) y no dan nada.
+- `large_futures` (`clippy::pedantic`) no da nada con su umbral, 16 KiB. Bajado a 2 KiB con un `clippy.toml` de prueba, la future más grande mide 9.504 bytes en `clawg-cli` (la de `main`, `crates/clawg-cli/src/main.rs:142`), 8.952 en un test de `clawg-core` y 11.560 en un test de `rag-eval`.
+- `allow_attributes` y `allow_attributes_without_reason` (`clippy::restriction`) dan los dos `allow` de arriba y nada más.
+
+Ninguno de los 124 pide cambiar conducta: cada uno tiene un arreglo que deja el resultado igual, o un motivo para un `#[expect]` (los 22 `too_many_arguments`, que resuelve domain-types, y los lugares donde lo que el lint cuida no pasa). Con menos de 150, sigue el enfoque A; la [propuesta](proposal.md) dice qué se arregla y qué se anota.
+
 ## Lo que ya existe y se reutiliza
 
 - El CI fija la versión de la toolchain (`ci.yml:55`), así que un lint nuevo no rompe una rama sin un cambio explícito de versión.
