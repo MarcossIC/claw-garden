@@ -375,8 +375,8 @@ fn lay_out(shape: Shape, seed: u64) -> Corpus {
         b.plain((u / shared.len()) % agents, None, shared[u % shared.len()]);
     }
 
-    for project in 0..searched {
-        let topics = own[project].iter().take(TOPICS_PER_KIND).map(|&t| (Kind::OwnTopic, t));
+    for (project, mine) in own.iter().enumerate().take(searched) {
+        let topics = mine.iter().take(TOPICS_PER_KIND).map(|&t| (Kind::OwnTopic, t));
         let topics = topics.chain(shared.iter().take(TOPICS_PER_KIND).map(|&t| (Kind::SharedTopic, t)));
         for (kind, topic) in topics.collect::<Vec<_>>() {
             let vector = b.vector(topic, None);
