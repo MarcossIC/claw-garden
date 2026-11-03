@@ -1405,7 +1405,7 @@ mod tests {
     fn a_hit_of_another_project_does_not_show_its_topic_key() {
         let elsewhere = placed(preference(68), Some("other"));
         assert_eq!(
-            format_hits(Lang::En, &[elsewhere.clone()], "a", Some("here")),
+            format_hits(Lang::En, std::slice::from_ref(&elsewhere), "a", Some("here")),
             "1. #68 [Memory/user_preference/t2 score=0.56] tabs"
         );
         assert!(format_hits(Lang::En, &[elsewhere], "a", Some("other")).contains(" score=0.56 topic=style/indent]"));
@@ -1414,7 +1414,7 @@ mod tests {
     #[test]
     fn a_hit_without_a_project_shows_its_key_only_to_a_bridge_without_one() {
         let unplaced = placed(preference(68), None);
-        assert!(!format_hits(Lang::En, &[unplaced.clone()], "a", Some("here")).contains("topic="));
+        assert!(!format_hits(Lang::En, std::slice::from_ref(&unplaced), "a", Some("here")).contains("topic="));
         assert!(format_hits(Lang::En, &[unplaced], "a", None).contains(" score=0.56 topic=style/indent]"));
     }
 
