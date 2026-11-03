@@ -42,6 +42,7 @@ pub mod process;
 pub mod projects;
 pub mod relevance;
 pub mod restore;
+pub mod running;
 pub mod secrets;
 pub mod serve_log;
 pub mod setup;
