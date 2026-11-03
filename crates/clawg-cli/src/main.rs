@@ -17,8 +17,8 @@ use clawg_cli::cli::{
     is_bare_invocation, is_hook_invocation, preferences_profile, sharing_profile, Cli, Command, MetricsAction, PathAction,
     ProjectsAction, SetupClient,
 };
-use clawg_cli::client::{probe_running, ClientError, DaemonClient, Probe};
-use clawg_cli::daemon::lifecycle::{now_ms, read_state};
+use clawg_cli::client::{probe_running, ClientError, Probe};
+use clawg_cli::daemon::lifecycle::now_ms;
 use clawg_cli::daemon::serve;
 use clawg_cli::doctor;
 use clawg_cli::export;
@@ -34,11 +34,11 @@ use clawg_cli::secrets;
 use clawg_cli::setup;
 use clawg_cli::preferences;
 use clawg_cli::sharing;
-use clawg_cli::status::status_report;
+use clawg_cli::status;
 use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
 use clawg_cli::undelete;
 use clawg_cli::update;
-use clawg_core::memory::backup::{backup_offline, probe, restore};
+use clawg_core::memory::backup::{backup_offline, restore};
 use clawg_core::memory::embedder::keep_one_malloc_arena;
 use clawg_core::memory::identity::Disk;
 use clawg_core::memory::portability::export::project_id_of;
@@ -146,29 +146,9 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Command::Status { profile } => {
             let profile = profile.resolve().map_err(|e| e.to_string())?;
             let base_dir = data_dir(profile).map_err(|e| e.to_string())?;
-            let state = read_state(&base_dir);
-
-            // A state file proves only that a daemon once ran here. Liveness is
-            // whatever `/health` says, and nothing else.
-            let health = match DaemonClient::from_data_dir(&base_dir) {
-                Some(client) => client.health().await.ok(),
-                None => None,
-            };
-
-            let running = health.is_some();
-            // Only without a daemon: a running one has already opened the
-            // store, and its health says how that went.
-            let store = if running { None } else { Some(probe(&base_dir)) };
-            let report =
-                status_report(profile, &base_dir, state.as_ref(), health.as_ref(), store.as_ref());
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
-            );
-
-            // A non-zero exit is what makes this usable from a shell script:
-            // `clawg status >/dev/null || clawg serve &`.
-            Ok(if running { ExitCode::SUCCESS } else { ExitCode::from(EXIT_FAILURE) })
+            let (text, code) = status::command(profile, &base_dir).await;
+            println!("{text}");
+            Ok(ExitCode::from(code))
         }
 
         Command::Stop { profile } => {
