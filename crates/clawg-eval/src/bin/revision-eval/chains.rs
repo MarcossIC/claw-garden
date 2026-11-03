@@ -801,7 +801,7 @@ mod tests {
         assert_eq!((two.last_where_reference.matching, two.verdict), (38, Verdict::Pass));
         assert!(two.breaking.is_empty(), "two chains moved one place are within the threshold");
 
-        *keyed[9].shown.context.last_mut().unwrap() = Some(9 % 3 + 2);
+        *keyed[9].shown.context.last_mut().unwrap() = Some(2);
         let three = m2(&keyed, &control);
         assert_eq!((three.last_where_reference.matching, three.verdict), (37, Verdict::Fail));
         assert_eq!(three.breaking, ["c0", "c1", "c9"]);
