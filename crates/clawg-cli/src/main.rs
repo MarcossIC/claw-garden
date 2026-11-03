@@ -40,7 +40,6 @@ use clawg_cli::status;
 use clawg_cli::stop;
 use clawg_cli::undelete;
 use clawg_cli::update;
-use clawg_core::memory::backup::restore;
 use clawg_core::memory::embedder::keep_one_malloc_arena;
 use clawg_core::memory::identity::Disk;
 use clawg_core::memory::portability::export::project_id_of;
@@ -174,11 +173,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
         }
 
         Command::Restore { file, profile } => {
-            let profile = profile.resolve()?;
-            let base_dir = data_dir(profile)?;
-            let lang = language(&base_dir);
-            let restored = restore(&base_dir, &file).map_err(|e| CliError::Failed(restore::explain(lang, e)))?;
-            println!("{}", restore::report(lang, &file, &restored));
+            let base_dir = data_dir(profile.resolve()?)?;
+            println!("{}", restore::command(language(&base_dir), &base_dir, &file)?);
             Ok(ExitCode::SUCCESS)
         }
 
