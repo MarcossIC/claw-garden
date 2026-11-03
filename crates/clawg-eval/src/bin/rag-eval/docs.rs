@@ -170,7 +170,7 @@ fn leaf(breadcrumb: &str) -> Option<&str> {
 }
 
 pub fn matches(hit: &EvalDocHit, expected: &ExpectedDoc) -> bool {
-    hit.path == expected.path && expected.heading.as_deref().map_or(true, |h| leaf(&hit.breadcrumb) == Some(h))
+    hit.path == expected.path && expected.heading.as_deref().is_none_or(|h| leaf(&hit.breadcrumb) == Some(h))
 }
 
 /// The rank, from 1, of the first hit that answers the question.
@@ -983,7 +983,7 @@ mod tests {
         assert!(two.contains("\nleft out 2 docs quoting a question: a/x.md, b/y.md\n"), "{two}");
     }
 
-    fn two_results<'a>(cases: &'a [DocsCase]) -> DocsResults {
+    fn two_results(cases: &[DocsCase]) -> DocsResults {
         let results = [
             CaseResult { case: &cases[0], rank: Some(2), top: Some("a.md > Otro".into()), code: false },
             CaseResult { case: &cases[1], rank: None, top: Some("src/b.rs".into()), code: true },

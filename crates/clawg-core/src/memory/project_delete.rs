@@ -1150,6 +1150,7 @@ mod tests {
             self.row_in(id, project, Some("agent-a"), "semantic_fact", "active", None, content).await;
         }
 
+        #[expect(clippy::too_many_arguments, reason = "a test fixture that takes each column of the row it seeds")]
         async fn row_in(&self, id: i64, project: &str, agent: Option<&str>, kind: &str, status: &str, deleted_at: Option<i64>, content: &str) {
             let agent = agent.map_or("NULL".to_string(), |a| format!("'{a}'"));
             let scope = if agent == "NULL" { "project" } else { "agent" };

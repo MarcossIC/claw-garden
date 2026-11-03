@@ -155,12 +155,8 @@ pub mod registry {
         }
         // A byte left after the last whole unit is half a unit, which no
         // reader takes for text, so dropping it rewrites what every reader sees.
-        let units: Vec<u16> = raw
-            .bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .take_while(|&unit| unit != 0)
-            .collect();
+        let units: Vec<u16> =
+            raw.bytes.as_chunks::<2>().0.iter().copied().map(u16::from_le_bytes).take_while(|&unit| unit != 0).collect();
         let text = String::from_utf16(&units).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "the user PATH is not valid UTF-16; leaving it alone")
         })?;
@@ -337,12 +333,8 @@ mod tests {
 
             fn get(&self) -> (String, RegType) {
                 let raw = self.key().get_raw_value("Path").expect("read value");
-                let units: Vec<u16> = raw
-                    .bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .take_while(|&u| u != 0)
-                    .collect();
+                let units: Vec<u16> =
+                    raw.bytes.as_chunks::<2>().0.iter().copied().map(u16::from_le_bytes).take_while(|&u| u != 0).collect();
                 (String::from_utf16(&units).expect("utf-16"), raw.vtype)
             }
         }
@@ -388,7 +380,7 @@ mod tests {
         /// only keep `clawg path add` from a PATH every program reads.
         #[test]
         fn a_byte_left_after_the_last_unit_is_not_part_of_the_value() {
-            for tail in [&[b'x'][..], &[0][..], &[0, 0, 0][..]] {
+            for tail in [&b"x"[..], &[0][..], &[0, 0, 0][..]] {
                 let scratch = ScratchKey::new("odd");
                 let mut bytes: Vec<u8> = r"C:\tools".encode_utf16().flat_map(u16::to_le_bytes).collect();
                 bytes.extend_from_slice(tail);

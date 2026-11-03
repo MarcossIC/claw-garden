@@ -71,13 +71,13 @@ Reconocer el atributo en una línea MUST ser una función pura (`hides_dead_code
 - `AGENTS.md` MUST mandar a `.claude/CLAUDE.md` y MUST NOT repetir su contenido; `README.md` MUST mandar a `.claude/CLAUDE.md` para las convenciones (`README.md:412`).
 - `.claude/CLAUDE.md` MUST guardar sólo las reglas y dónde está el resto; el comportamiento (perfiles, comandos, API, tests, CI, release) MUST estar en `docs/reference/` o en las specs, no en él.
 - Ningún test MUST leer un archivo de instrucciones para agentes (`.claude/`, `.cursor/`, `.gemini/`, `AGENTS.md`): son texto para el modelo y cambian sin que cambie el comportamiento. Los tests de `clawg setup` y `doctor` que escriben o leen el `CLAUDE.md` de un usuario en un directorio temporal prueban el producto y no cuentan.
-- `.claude/CLAUDE.md`, sección Testing, MUST dar el comando de `clippy` que hace fallar los warnings del compilador, `dead_code` y `unused` incluidos, y cómo bendecir el contrato. Ese comando MUST terminar con código 0:
+- `.claude/CLAUDE.md`, sección Testing, MUST dar el comando de `clippy` que hace fallar los warnings del compilador (`dead_code` y `unused` incluidos) y los lints de clippy, y cómo bendecir el contrato. Ese comando MUST terminar con código 0:
 
   ```
-  cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
+  cargo clippy --workspace --all-targets -- -D warnings
   ```
 
-  Los lints propios de `clippy` quedan afuera con `-A clippy::all` hasta que se arreglen los que hay; están en el backlog de [`openspec/README.md`](../../README.md#backlog-sin-spec-arreglos-sueltos).
+  Qué lints de clippy corren lo dice `[workspace.lints.clippy]` del `Cargo.toml` raíz, que cada paquete toma con `[lints] workspace = true`: el grupo por defecto, `large_futures`, `allow_attributes` y `allow_attributes_without_reason`. El comando MUST NOT apagar ninguno. Un hallazgo que no se arregla MUST anotarse en el ítem con `#[expect(clippy::<lint>, reason = "<motivo>")]`, nunca con `#[allow]` ni en la tabla; cuando el lint deja de emitirse, la expectativa no cumplida hace fallar el comando hasta que se quita. `every_package_takes_the_workspace_lints` y `no_workflow_turns_clippy_lints_off` (`crates/clawg-cli/tests/conventions.rs`) fijan la tabla y los comandos del CI ([`specs/install`](../install/spec.md), «CI»).
 - `README.md` MUST NOT dar un número de versión como ejemplo de la salida de `clawg --version`.
 
-**Test:** ninguno, por la regla de arriba. El comando de `clippy` y el resto se comprueban a mano; terminó con código 0 al archivar, en Linux y en Windows.
+**Test:** ninguno que lea `.claude/CLAUDE.md`, por la regla de arriba: el comando de `clippy` y el resto se comprueban a mano, y terminó con código 0 al archivar, en Linux y en Windows. La tabla y los comandos del CI los fijan los dos tests de `conventions.rs` nombrados arriba.

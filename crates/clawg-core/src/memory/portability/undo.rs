@@ -1258,12 +1258,14 @@ pub async fn undo_import(store: &MemoryStore, backups: &Path, import_id: i64, dr
     }
     // A row that changed after the decision stays; what it would have kept
     // with it is weighed again by the next undo.
+    // A row taken out with the rows it brought back, or kept and why.
+    type Retired = (i64, Result<Vec<i64>, KeepReason>);
     for batch in retire.chunks(WRITE_BATCH) {
         let batch: Vec<(i64, Logged, Vec<Replaced>)> =
             batch.iter().map(|id| (*id, logged[id].clone(), restore_by.get(id).cloned().unwrap_or_default())).collect();
         let done = store
             .conn
-            .call(move |c| -> rusqlite::Result<Vec<(i64, Result<Vec<i64>, KeepReason>)>> {
+            .call(move |c| -> rusqlite::Result<Vec<Retired>> {
                 let tx = c.transaction()?;
                 let mut done = Vec::with_capacity(batch.len());
                 for (id, logged, replaced) in &batch {
@@ -1305,9 +1307,10 @@ pub async fn undo_import(store: &MemoryStore, backups: &Path, import_id: i64, dr
     let (unfill, links, projects, remotes, gone) =
         (plan.unfill.clone(), plan.links.clone(), plan.projects.clone(), plan.remotes.clone(), plan.gone.clone());
     let (take_back, forget) = (plan.take_back.clone(), plan.forget.clone());
+    type Undone = (Vec<i64>, Vec<i64>, usize, Vec<String>, Vec<String>, RegistryUndo);
     let (restored, unfilled, removed_links, removed_projects, removed_remotes, registry) = store
         .conn
-        .call(move |c| -> rusqlite::Result<(Vec<i64>, Vec<i64>, usize, Vec<String>, Vec<String>, RegistryUndo)> {
+        .call(move |c| -> rusqlite::Result<Undone> {
             let tx = c.transaction()?;
             let mut restored = Vec::new();
             for r in &rest {

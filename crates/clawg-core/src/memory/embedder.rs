@@ -61,6 +61,7 @@ impl EmbedRole {
 /// that inherits `""` for both is silently claiming "no prefixes" instead of
 /// deciding to have none.
 #[async_trait]
+#[expect(clippy::double_must_use, reason = "async_trait marks each method #[must_use], and the boxed future it returns already is")]
 pub trait Embedder: Send + Sync {
     /// Compute the embedding for a single text, prefixed per `role`. Vector
     /// length MUST equal [`Embedder::dimensions`].
@@ -298,11 +299,11 @@ pub(crate) fn pad_right(encodings: &[Encoding], pad_id: u32) -> PaddedBatch {
     for encoding in encodings {
         let padding = len - encoding.len();
         batch.ids.extend(encoding.get_ids().iter().map(|x| *x as i64));
-        batch.ids.extend(std::iter::repeat(pad_id as i64).take(padding));
+        batch.ids.extend(std::iter::repeat_n(pad_id as i64, padding));
         batch.mask.extend(encoding.get_attention_mask().iter().map(|x| *x as i64));
-        batch.mask.extend(std::iter::repeat(0).take(padding));
+        batch.mask.extend(std::iter::repeat_n(0, padding));
         batch.type_ids.extend(encoding.get_type_ids().iter().map(|x| *x as i64));
-        batch.type_ids.extend(std::iter::repeat(0).take(padding));
+        batch.type_ids.extend(std::iter::repeat_n(0, padding));
     }
     batch
 }

@@ -346,7 +346,7 @@ pub fn analyse(flow: &[Save], reports: &[EvalSaved]) -> Analysis {
                     let Some(&j) = analysis.owner.get(&candidate.id).filter(|&&j| j < i) else { continue };
                     if !same_scope(&flow[j], save) {
                         elsewhere = true;
-                    } else if closest.map_or(true, |(_, d)| candidate.distance < d) {
+                    } else if closest.is_none_or(|(_, d)| candidate.distance < d) {
                         closest = Some((j, candidate.distance));
                     }
                 }
@@ -385,7 +385,7 @@ impl Analysis {
     /// Whether the save `j` still held a live row when the save `i` came: a
     /// row is gone from the moment a keyed save replaces it.
     fn live_before(&self, j: usize, i: usize) -> bool {
-        self.owned[j].iter().any(|row| self.replaced_at.get(row).map_or(true, |&by| by >= i))
+        self.owned[j].iter().any(|row| self.replaced_at.get(row).is_none_or(|&by| by >= i))
     }
 
     fn has_live_predecessor(&self, flow: &[Save], i: usize) -> bool {
@@ -413,7 +413,7 @@ impl Analysis {
 pub fn closest(candidates: &[(usize, f64)]) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
     for &(save, distance) in candidates {
-        if best.map_or(true, |(_, d)| distance < d) {
+        if best.is_none_or(|(_, d)| distance < d) {
             best = Some((save, distance));
         }
     }

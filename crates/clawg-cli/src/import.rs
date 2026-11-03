@@ -73,6 +73,7 @@ impl Finished {
 
 /// What happened while a job was followed.
 #[derive(Debug)]
+#[expect(clippy::large_enum_variant, reason = "the follow loop holds one event at a time; none is stored")]
 pub enum Event {
     /// The daemon showed the job.
     Polled(ImportJob),
@@ -366,6 +367,7 @@ pub fn interrupts() -> mpsc::UnboundedReceiver<()> {
 /// as a bridge resolves its own, and a PATH that is not a directory stops it
 /// before the daemon is asked; each OLD root is taken as written. The daemon
 /// reads the file, so only its absolute path is sent.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn run(
     lang: Lang,
     client: &DaemonClient,
@@ -471,10 +473,12 @@ async fn follow(
     }
 }
 
+type Targets = Vec<(String, MapTarget)>;
+
 /// What the maps send: each path as its root and the path itself, which a
 /// declared subfolder leads to its project, as a bridge resolves its own; a
 /// project by the reference given, which the daemon resolves.
-fn targets(maps: Maps<'_>) -> (Vec<(String, MapTarget)>, Vec<(String, MapTarget)>) {
+fn targets(maps: Maps<'_>) -> (Targets, Targets) {
     let folder = |path: &Path| {
         let identity = ProjectIdentity::resolve(path);
         MapTarget::Folder {

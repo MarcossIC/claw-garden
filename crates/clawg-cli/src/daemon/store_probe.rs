@@ -97,10 +97,10 @@ pub fn spawn(store: Arc<MemoryStore>, base_dir: std::path::PathBuf, recorder: Ar
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(PROBE_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        for n in 0u64.. {
+        for n in (0..MINUTE_EVERY).cycle() {
             ticks.tick().await;
             probe(&store, &recorder).await;
-            if n % MINUTE_EVERY == 0 {
+            if n == 0 {
                 read_minute(&store, &base_dir, &recorder).await;
             }
         }

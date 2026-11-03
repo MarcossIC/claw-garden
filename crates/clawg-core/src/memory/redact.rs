@@ -223,7 +223,7 @@ pub fn find_secrets(text: &str) -> Vec<Found> {
     found.sort_by(|a, b| a.range.start.cmp(&b.range.start).then(b.range.end.cmp(&a.range.end)));
     let mut kept: Vec<Found> = Vec::with_capacity(found.len());
     for f in found {
-        if kept.last().map_or(true, |last| f.range.start >= last.range.end) {
+        if kept.last().is_none_or(|last| f.range.start >= last.range.end) {
             kept.push(f);
         }
     }

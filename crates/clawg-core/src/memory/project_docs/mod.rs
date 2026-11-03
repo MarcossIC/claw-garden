@@ -205,7 +205,7 @@ pub fn plan_refresh(disk: &[(String, String)], stored: &[Fingerprint], model_id:
 /// Whether a project whose last refresh started at `last_started` is due for
 /// another at `now`.
 pub fn needs_refresh(last_started: Option<Instant>, now: Instant, interval: Duration) -> bool {
-    last_started.map_or(true, |t| now.saturating_duration_since(t) >= interval)
+    last_started.is_none_or(|t| now.saturating_duration_since(t) >= interval)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -793,12 +793,11 @@ async fn write_queued(
 fn embed_shares(total: Duration, texts: &[usize]) -> Vec<Duration> {
     let all: u128 = texts.iter().map(|&n| n as u128).sum();
     let mut shares = vec![0u128; texts.len()];
-    if all > 0 {
+    if let Some(last) = texts.iter().rposition(|&n| n > 0) {
         let nanos = total.as_nanos();
         for (share, &n) in shares.iter_mut().zip(texts) {
             *share = nanos * n as u128 / all;
         }
-        let last = texts.iter().rposition(|&n| n > 0).expect("some doc has texts");
         shares[last] += nanos - shares.iter().sum::<u128>();
     }
     shares.into_iter().map(|n| Duration::new((n / 1_000_000_000) as u64, (n % 1_000_000_000) as u32)).collect()
@@ -1970,7 +1969,7 @@ old
         for (a, b) in partly.0.iter().zip(&full.0) {
             assert_eq!((&a.0, a.1, &a.2, &a.3), (&b.0, b.1, &b.2, &b.3));
             let decode = |blob: &[u8]| -> Vec<f32> {
-                blob.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+                blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect()
             };
             let (x, y) = (decode(&a.4), decode(&b.4));
             let cosine: f32 = x.iter().zip(&y).map(|(p, q)| p * q).sum();
@@ -2612,7 +2611,7 @@ old
             println!("median of {runs}: {}: {:.2?}", names[k], median(&took[k]));
         }
 
-        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
+        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect() };
         let differences: Vec<f32> = blobs[0]
             .iter()
             .zip(&blobs[1])
@@ -2739,7 +2738,7 @@ old
         };
         println!("median ratio to in each doc of {runs} rounds: in the queue {:.3}, across docs {:.3}", median_ratio(1), median_ratio(2));
 
-        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
+        let floats = |blob: &Vec<u8>| -> Vec<f32> { blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect() };
         for k in 1..3 {
             assert_eq!(last[k].len(), passages, "{} embedded every passage", names[k]);
             let differences: Vec<f32> = last[0]

@@ -1,14 +1,15 @@
 change: clippy-enforced
 objective: "transversal"
 depends_on: []
-phase: explore
+phase: verify
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  exploration: done  # con el conteo del paso 0: 124 hallazgos en 34 lints, en Linux
+  proposal: done  # enfoque A; suma large_futures, allow_attributes y allow_attributes_without_reason; clawg-eval con el mismo nivel
+  spec: done  # CE1 a CE4
+  design: skipped  # las alternativas están en la exploración (A, B, C) y lo elegido en la propuesta
+  tasks: done
+  apply: done  # un commit por lint (34), la tabla en 9fa08d5, el CI en 154af56, los docs en b1e570a y ec0a3e7
+  verify: done  # Linux: suite y los dos clippy sin -A clippy::all; Windows en el CI del pull request
   archive: pending
-updated: 2026-11-01
+main_spec: openspec/specs/quality/spec.md
+updated: 2026-11-03

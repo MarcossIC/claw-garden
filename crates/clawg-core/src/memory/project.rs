@@ -647,6 +647,7 @@ struct FromDisk {
 }
 
 /// What a pass of [`plan_in`] settles on, or what it needs from the disk first.
+#[expect(clippy::large_enum_variant, reason = "one per pass, matched as soon as it returns; none is stored")]
 enum Planned {
     Plan(Plan),
     /// The first commit of the root: no folder of its path recorded its git directory.
@@ -1467,10 +1468,10 @@ mod tests {
 
         assert_eq!(settle(&[], Some("github.com/acme/a")), Settled::Fresh);
         assert_eq!(settle(&[], None), Settled::Fresh);
-        assert_eq!(settle(&[a.clone()], None), Settled::Row(0), "an unknown remote contradicts nothing");
-        assert_eq!(settle(&[a.clone()], Some("github.com/acme/a")), Settled::Row(0));
-        assert_eq!(settle(&[none.clone()], Some("github.com/acme/a")), Settled::Row(0), "a first remote");
-        assert_eq!(settle(&[a.clone()], Some("github.com/acme/b")), Settled::Contradicted);
+        assert_eq!(settle(std::slice::from_ref(&a), None), Settled::Row(0), "an unknown remote contradicts nothing");
+        assert_eq!(settle(std::slice::from_ref(&a), Some("github.com/acme/a")), Settled::Row(0));
+        assert_eq!(settle(std::slice::from_ref(&none), Some("github.com/acme/a")), Settled::Row(0), "a first remote");
+        assert_eq!(settle(std::slice::from_ref(&a), Some("github.com/acme/b")), Settled::Contradicted);
         assert_eq!(settle(&[a.clone(), b.clone()], Some("github.com/acme/b")), Settled::Row(1));
         assert_eq!(settle(&[a.clone(), b.clone()], Some("github.com/acme/c")), Settled::Contradicted);
         assert_eq!(settle(&[a.clone(), none, b], Some("github.com/acme/c")), Settled::Row(1));

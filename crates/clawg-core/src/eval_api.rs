@@ -367,6 +367,7 @@ impl EvalStore {
     /// `project`, followed past its merges, reads its own rows, the rows
     /// without one and every `user_preference`. One agent's corpus without a
     /// project ranks as it did under the agent's own reach.
+    #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
     pub async fn search(
         &self,
         embedding: &[f32],

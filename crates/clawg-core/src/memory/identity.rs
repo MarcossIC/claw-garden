@@ -686,7 +686,7 @@ mod tests {
             id
         );
         // Must end with exactly 4 hex chars
-        let hash_part = id.split('-').last().unwrap();
+        let hash_part = id.split('-').next_back().unwrap();
         assert_eq!(hash_part.len(), 4, "Hash part must be 4 chars: {}", id);
         assert!(
             hash_part.chars().all(|c| c.is_ascii_hexdigit()),

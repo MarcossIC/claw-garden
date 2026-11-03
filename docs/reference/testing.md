@@ -18,7 +18,7 @@ A `testing` build also stands in for what makes a binary a release, so `clawg up
 
 ## CI and release workflows
 
-CI (`.github/workflows/ci.yml`) runs clippy and the suite on Linux and Windows for every pull request that changes a file outside the documentation and tooling paths it ignores. A push to `main` with such a change runs only `merged`, a job that builds nothing: the pull request it merges already ran the suite on that content, and `release.yml` waits for a successful run of the push, which a run of skipped jobs alone is not. A push that only changes the ignored paths runs neither CI nor the release. Every command takes `--locked`, so a `Cargo.lock` that trails `Cargo.toml` fails there. Besides the workspace (where `--workspace` turns on clawg-core's `testing` and `eval`), it runs what the release builds: `cargo clippy --locked -p clawg-cli -- -A clippy::all -D warnings`, without `--all-targets` so no dev-dependency brings `testing` in, and, on Linux alone since `build_info` has no platform code, `cargo test --locked -p clawg-core --lib build_info`, the `cfg(not(feature = "testing"))` side of those tests. Pull requests only read the build cache (`save-if: false`); `cache.yml` writes it from `main`.
+CI (`.github/workflows/ci.yml`) runs clippy and the suite on Linux and Windows for every pull request that changes a file outside the documentation and tooling paths it ignores. A push to `main` with such a change runs only `merged`, a job that builds nothing: the pull request it merges already ran the suite on that content, and `release.yml` waits for a successful run of the push, which a run of skipped jobs alone is not. A push that only changes the ignored paths runs neither CI nor the release. Every command takes `--locked`, so a `Cargo.lock` that trails `Cargo.toml` fails there. Besides the workspace (where `--workspace` turns on clawg-core's `testing` and `eval`), it runs what the release builds: `cargo clippy --locked -p clawg-cli -- -D warnings`, without `--all-targets` so no dev-dependency brings `testing` in, and, on Linux alone since `build_info` has no platform code, `cargo test --locked -p clawg-core --lib build_info`, the `cfg(not(feature = "testing"))` side of those tests. Pull requests only read the build cache (`save-if: false`); `cache.yml` writes it from `main`.
 
 The compiler is fixed in `rust-toolchain.toml` (an exact `X.Y.Z` with clippy), which local builds use too; every workflow passes the same version to `dtolnay/rust-toolchain`. Raising it is a commit of its own that changes all of them. `rust-version` in the root `Cargo.toml` is the highest `rust-version` among the packages in `Cargo.lock` (1.90, from `tree-sitter-language`; a `cargo +1.90.0 check --locked --workspace --all-targets` builds), never above the pinned toolchain; `tests/conventions.rs` compares the three.
 
@@ -30,13 +30,15 @@ Three more workflows are not named `CI`, so `release.yml` does not wait for them
 
 On Windows, live `clawg.exe` processes (for example the editor's MCP bridge) lock `target\debug\clawg.exe` and make the build fail. There the suite and clippy run in `target-test` instead: `cargo test --workspace --target-dir target-test`. See Build directories below for when it is cleaned.
 
-Compiler warnings, `dead_code` and `unused` among them, are errors here (clippy's own lints are not enforced yet):
+Compiler warnings, `dead_code` and `unused` among them, and clippy's lints are errors here:
 
 ```
-cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 `tests/conventions.rs` in `clawg-cli` fails when a source hides dead code behind an `allow`.
+
+Which clippy lints run is `[workspace.lints.clippy]` in the root `Cargo.toml`: the default group, `large_futures` (a future over 16 KiB, which a move copies whole onto the stack), and `allow_attributes` with `allow_attributes_without_reason`. Every package takes the table with `[lints] workspace = true`, which Cargo does not apply on its own, and a package that takes it cannot add lints of its own. `tests/conventions.rs` checks that each member takes it, that it allows nothing, and that no workflow passes clippy a lint level (`-A`, `-W`, `--cap-lints`). A finding that is not fixed is annotated where it applies with `#[expect(clippy::<lint>, reason = "<why>")]`, the reason saying why the lint does not hold there or which refactor of its own it waits for; once the lint stops firing, the unfulfilled expectation fails the command until the attribute goes.
 
 What the model sees of the MCP server (each tool's name, description and input schema, and the instructions) is pinned in `crates/clawg-cli/src/mcp/agent_contract.json`. When a change to it is intended, run `CLAWG_BLESS=1 cargo test -p clawg-cli the_agent_contract_matches_its_file`: it rewrites the file and fails, so review the diff and run the tests again. It pins the server without a language preference, and `agent_contract.es.json` the server in Spanish (`CLAWG_BLESS=1 cargo test -p clawg-cli the_spanish_agent_contract_matches_its_file`); the English variant a preference gives is held by the tests of `protocol.rs` and `server.rs` (each fits 2048 characters and names only what exists).
 

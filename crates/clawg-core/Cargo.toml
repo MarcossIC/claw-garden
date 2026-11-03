@@ -8,6 +8,9 @@ repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 name = "clawg_core"
 crate-type = ["rlib"]

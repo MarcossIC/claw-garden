@@ -2091,7 +2091,7 @@ mod tests {
         let (stale, ok) = delete(Lang::En, &c, &opts(&[&gone, "--with-memories", "--confirm", "00000000"])).await.expect("stale");
         assert!(!ok && stale.starts_with("the project changed since that report"), "{stale}");
         let (done, ok) = delete(Lang::En, &c, &opts(&[&gone, "--with-memories", "--confirm", confirm])).await.expect("delete");
-        assert!(ok && done.starts_with(&format!("deleted project ")) && done.contains("with its 1 memory as delete 1"), "{done}");
+        assert!(ok && done.starts_with("deleted project ") && done.contains("with its 1 memory as delete 1"), "{done}");
         let (emptied, ok) = delete(Lang::En, &c, &opts(&[&empty])).await.expect("empty");
         assert!(ok && emptied.contains("as delete 2;"), "{emptied}");
 

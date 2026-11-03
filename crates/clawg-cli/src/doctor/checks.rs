@@ -1259,7 +1259,7 @@ mod tests {
     fn project_findings() {
         let root = if cfg!(windows) { r"C:\work\proj" } else { "/work/proj" };
         let good = ProjectRow { id: derive_project_id(Path::new(root)), root_path: root.into() };
-        assert_eq!(kinds(&projects(L, &[good.clone()])), [("projects", Severity::Ok, "healthy")]);
+        assert_eq!(kinds(&projects(L, std::slice::from_ref(&good))), [("projects", Severity::Ok, "healthy")]);
         let bad = ProjectRow { id: "proj-0000".into(), root_path: root.into() };
         let found = projects(L, &[good, bad]);
         assert_eq!(kinds(&found), [("projects", Severity::Warn, "id_mismatch")]);
@@ -1596,7 +1596,7 @@ mod tests {
         all.extend(project_merges(lang, &registry[..1], &[], P));
         let gone = RegistryRow { deleted_at: Some(9), ..registered(&[("gone-1a2b", "gone", 7, None)]).remove(0) };
         let opens = [OpenDelete { project_id: "gone-1a2b".into(), delete_id: 4 }];
-        all.extend(project_deletes(lang, &[gone.clone()], &[id_rows("gone-1a2b", 1, 0)], &opens));
+        all.extend(project_deletes(lang, std::slice::from_ref(&gone), &[id_rows("gone-1a2b", 1, 0)], &opens));
         all.extend(project_deletes(lang, &[gone], &[], &opens));
         let lost = DeclaredSubfolder { parent_id: "web-3c4d".into(), subpath: "apps/web".into(), project_id: "nowhere-9f9f".into() };
         all.extend(project_subfolders(lang, &registry, &[lost]));

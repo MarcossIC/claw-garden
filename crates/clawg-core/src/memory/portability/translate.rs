@@ -702,7 +702,9 @@ fn relate(relations: &[ForeignRelation], now_ms: i64, t: &mut Translated) {
     };
     let mut left_out: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = |reason: &str| *left_out.entry(reason.to_owned()).or_default() += 1;
-    let mut newest: BTreeMap<(i64, i64), (&ForeignRelation, Range<i64>, Range<i64>)> = BTreeMap::new();
+    // A relation with the rows of the notes at its two ends.
+    type Placed<'r> = (&'r ForeignRelation, Range<i64>, Range<i64>);
+    let mut newest: BTreeMap<(i64, i64), Placed<'_>> = BTreeMap::new();
     {
         let into: HashMap<&str, &str> = t.report.absorbed.iter().map(|a| (a.origin.as_str(), a.into.as_str())).collect();
         let rows_of: HashMap<&str, Range<i64>> = t.notes.iter().map(|n| (n.origin.as_str(), n.rows.clone())).collect();

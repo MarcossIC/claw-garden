@@ -872,10 +872,7 @@ fn serialize_f32_vec(v: &[f32]) -> Vec<u8> {
 
 /// Inverse of [`serialize_f32_vec`].
 fn deserialize_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    bytes.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 #[cfg(test)]

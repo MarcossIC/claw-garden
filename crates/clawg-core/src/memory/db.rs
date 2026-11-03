@@ -127,9 +127,16 @@ static VEC0_REGISTERED: Once = Once::new();
 /// correct approach for `rusqlite 0.37` (which still exposes the raw FFI).
 /// The `Once` guard makes this idempotent and thread-safe.
 pub(crate) fn ensure_vec0_registered() {
+    // The entry point sqlite3_auto_extension takes; sqlite-vec declares its
+    // init without arguments.
+    type VecInit = unsafe extern "C" fn(
+        *mut rusqlite::ffi::sqlite3,
+        *mut *mut std::ffi::c_char,
+        *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::ffi::c_int;
     VEC0_REGISTERED.call_once(|| {
         unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), VecInit>(
                 sqlite_vec::sqlite3_vec_init as *const (),
             )));
         }
@@ -1099,7 +1106,8 @@ mod tests {
         .await
         .unwrap();
         conn.call(|c| {
-            let rows: [(i64, &str, Option<&str>, Option<i64>, Option<i64>); 6] = [
+            type Row = (i64, &'static str, Option<&'static str>, Option<i64>, Option<i64>);
+            let rows: [Row; 6] = [
                 (1, "active", None, None, None),
                 (2, "disputed", Some("[1]"), None, Some(20)),
                 (3, "active", None, None, None),
@@ -1138,7 +1146,8 @@ mod tests {
         run_migrations(&conn).await.unwrap();
 
         assert_eq!(conn.call(rows).await.unwrap(), before);
-        let pairs: Vec<(i64, i64, Option<f64>, String, Option<String>, i64)> = conn
+        type Pair = (i64, i64, Option<f64>, String, Option<String>, i64);
+        let pairs: Vec<Pair> = conn
             .call(|c| {
                 let mut stmt = c.prepare(
                     "SELECT new_id, old_id, distance, state, verdict, created_at FROM memory_conflict \
@@ -1233,7 +1242,8 @@ mod tests {
         conn.call(|c| {
             // 2 is a revision of 1; 4 lost a verdict to 3; 6 was a revision of
             // 5 until a verdict undid it; 7 is another agent's row under 1's key.
-            let rows: [(i64, &str, &str, Option<i64>, Option<&str>); 7] = [
+            type Row = (i64, &'static str, &'static str, Option<i64>, Option<&'static str>);
+            let rows: [Row; 7] = [
                 (1, "a", "active", None, Some("storage/engine")),
                 (2, "a", "superseded", Some(1), Some("storage/engine")),
                 (3, "a", "active", None, None),
@@ -1443,7 +1453,8 @@ mod tests {
 
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
 
-        let (rows, reviews, indexes): (Vec<(i64, Option<String>, String)>, i64, Vec<String>) = store
+        type Row = (i64, Option<String>, String);
+        let (rows, reviews, indexes): (Vec<Row>, i64, Vec<String>) = store
             .conn
             .call(|c| -> rusqlite::Result<_> {
                 let mut stmt = c.prepare("SELECT id, agent_id, status FROM memory WHERE id >= 10 ORDER BY id")?;
@@ -1499,7 +1510,8 @@ mod tests {
 
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
 
-        let (rows, logged): (Vec<(i64, String, Option<String>, Option<String>)>, i64) = store
+        type Row = (i64, String, Option<String>, Option<String>);
+        let (rows, logged): (Vec<Row>, i64) = store
             .conn
             .call(|c| -> rusqlite::Result<_> {
                 let mut stmt =
@@ -2179,7 +2191,8 @@ mod tests {
 
         let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
 
-        let (after, deleted, journal, adopted): (Vec<Whole>, i64, (i64, i64, i64), (i64, Option<i64>)) = store
+        type Journal = (i64, i64, i64);
+        let (after, deleted, journal, adopted): (Vec<Whole>, i64, Journal, (i64, Option<i64>)) = store
             .conn
             .call(move |c| {
                 let deleted = c.query_row("SELECT COUNT(*) FROM project WHERE deleted_at IS NOT NULL", [], |r| r.get(0))?;

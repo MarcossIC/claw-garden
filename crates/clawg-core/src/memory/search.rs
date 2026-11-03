@@ -549,6 +549,7 @@ fn retry_window(k: usize) -> usize {
 /// so that stays a measured property rather than a claim. The widened result
 /// is trimmed back to k so the pool stays a budget for finding candidates
 /// rather than a licence to return more of them.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn knn_one(
     store: &MemoryStore,
     table: KnnTable,
@@ -579,6 +580,7 @@ async fn knn_one(
             // call site: counted here, the number cannot drift from the number
             // of queries actually issued, which is the whole reason it is
             // reported at all.
+            #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
             fn run(
                 c: &rusqlite::Connection,
                 table: KnnTable,
@@ -1183,6 +1185,7 @@ fn lexical_score_sql(n: usize) -> String {
 /// propagating. Being infallible in the SIGNATURE rather than by a `?` a
 /// caller happens not to write is what makes that a fact a reader can check
 /// at a glance instead of a discipline every future call site has to repeat.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn score_lexical_candidates(
     store: &MemoryStore,
     q_bytes: &[u8],
@@ -1549,6 +1552,7 @@ mod tests {
         serialize_embedding(&unit_basis_vec())
     }
 
+    #[expect(clippy::too_many_arguments, reason = "a test fixture that takes each column of the row it seeds")]
     async fn insert_memory_row(
         store: &MemoryStore,
         agent_id: &str,
@@ -1653,7 +1657,7 @@ mod tests {
             topic_key: None,
             project_id: None,
         };
-        let mut hits = vec![h2, h1];
+        let mut hits = [h2, h1];
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         assert!((hits[0].score - 0.9).abs() < 1e-9);
     }

@@ -166,6 +166,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn install(
     lang: Lang,
     exe: &Path,

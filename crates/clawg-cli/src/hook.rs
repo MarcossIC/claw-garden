@@ -399,7 +399,7 @@ mod tests {
         let full = Context { suggestions: vec![suggestion; 9], ..context("x", 10_000) };
         let added = session_start_text(&full, Some(&failed), true, Some(Lang::Es)).unwrap().len() - "x".len();
         assert!(added < 1_500, "{added} bytes added");
-        assert!(SESSION_BUDGET + 1_500 <= 10_000, "the whole stays under what the client injects");
+        const { assert!(SESSION_BUDGET + 1_500 <= 10_000, "the whole stays under what the client injects") }
     }
 
     const SPANISH_LINE: &str = "clawg: el idioma de la persona es el español. Respóndele en español salvo que escriba \

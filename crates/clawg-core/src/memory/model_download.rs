@@ -893,6 +893,7 @@ const CHUNK_PROGRESS_BYTES: u64 = 64 * 1024;
 /// Emits `DownloadProgress::Chunk` events throttled to one per
 /// `CHUNK_PROGRESS_BYTES` (64 KB) of cumulative download progress across all
 /// files in the current run.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn download_one(
     client: &reqwest::Client,
     cache_dir: &Path,
@@ -1614,7 +1615,7 @@ mod tests {
         let m_onnx = server
             .mock("GET", "/onnx/model.onnx")
             .with_status(200)
-            .with_body(b"WRONG-BYTES".to_vec()) // SHA won't match the fixture's.
+            .with_body(b"WRONG-BYTES") // SHA won't match the fixture's.
             .expect(1)
             .create_async()
             .await;
@@ -2378,19 +2379,19 @@ mod tests {
             "last must be verify; the terminal `done` is now emitted by the bootstrap, not ensure_model"
         );
         assert!(
-            phases.iter().any(|p| *p == "chunk"),
+            phases.contains(&"chunk"),
             "expected at least one chunk event"
         );
         // ensure_model MUST NOT emit Done — that responsibility moved to the
         // bootstrap layer (`memory::bootstrap`) so a listener receives EXACTLY
         // ONE terminal `done`, after the embedder is actually loadable.
         assert!(
-            !phases.iter().any(|p| *p == "done"),
+            !phases.contains(&"done"),
             "ensure_model must NOT emit Done; got {phases:?}"
         );
         // No Error event on the success path.
         assert!(
-            !phases.iter().any(|p| *p == "error"),
+            !phases.contains(&"error"),
             "no error events on success path; got {phases:?}"
         );
     }

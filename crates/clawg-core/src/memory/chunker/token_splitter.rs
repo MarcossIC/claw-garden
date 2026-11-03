@@ -347,7 +347,9 @@ pub(crate) mod tests {
 
     #[test]
     fn plan_word_windows_with_every_start_marked_keeps_a_fixed_stride() {
-        let table: [(usize, usize, usize, &[(usize, usize)]); 7] = [
+        // (words, max, overlap, the windows)
+        type Case = (usize, usize, usize, &'static [(usize, usize)]);
+        let table: [Case; 7] = [
             (0, 480, 64, &[]),
             (1, 480, 64, &[(0, 1)]),
             (480, 480, 64, &[(0, 480)]),
@@ -441,7 +443,7 @@ pub(crate) mod tests {
             return;
         }
         let overlap = overlap.min(max - 1);
-        let marked = |from: usize, to: usize| (from..=to).filter(|&i| starts[i]).last();
+        let marked = |from: usize, to: usize| (from..=to).rfind(|&i| starts[i]);
         assert_eq!((windows[0].0, windows[windows.len() - 1].1), (0, n), "{}", at());
         let mut previous_end = 0;
         for (k, &(s, e)) in windows.iter().enumerate() {
