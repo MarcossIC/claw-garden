@@ -2,11 +2,52 @@
 //! commands so the wording is under test without a store. Each sentence comes
 //! in the user's language; ids, kinds and commands do not change.
 
+use std::path::Path;
+
 use clawg_core::memory::redact::SecretKind;
-use clawg_core::memory::secrets::{MaskedReasons, Purged, PurgedDelete, Scanned, WorkspaceHolding};
+use clawg_core::memory::secrets::{self as store, MaskedReasons, Purged, PurgedDelete, Scanned, WorkspaceHolding};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::preferences::Lang;
+
+use crate::error::CliError;
+use crate::preferences::language;
+
+/// `clawg secrets`: lists what in the store of `base_dir` holds a secret or,
+/// with `mask_reasons`, masks the verdict reasons once `yes` confirms it.
+/// The listing reads the store before the language, as before, so a store
+/// that cannot be read is all stderr says.
+pub fn command(base_dir: &Path, mask_reasons: bool, yes: bool) -> Result<String, CliError> {
+    if !mask_reasons {
+        let scanned = store::scan(base_dir)?;
+        return Ok(report(language(base_dir), &scanned));
+    }
+    let lang = language(base_dir);
+    confirm_mask_reasons(lang, yes).map_err(CliError::Failed)?;
+    let masked =
+        store::mask_reasons(base_dir).map_err(|e| CliError::Failed(explain(lang, e, Rewrite::MaskReasons)))?;
+    Ok(mask_report(lang, &masked))
+}
+
+/// `clawg purge`: removes memory `id`, or every row delete `project_delete`
+/// left deleted, for good, once `yes` confirms it.
+pub fn purge(base_dir: &Path, id: Option<i64>, project_delete: Option<i64>, yes: bool) -> Result<String, CliError> {
+    let lang = language(base_dir);
+    let refused = |e| CliError::Failed(explain(lang, e, Rewrite::Purge));
+    match (id, project_delete) {
+        (Some(id), None) => {
+            confirm(lang, id, yes).map_err(CliError::Failed)?;
+            let purged = store::purge(base_dir, id).map_err(refused)?;
+            Ok(purge_report(lang, id, &purged))
+        }
+        (None, Some(delete_id)) => {
+            confirm_delete(lang, delete_id, yes).map_err(CliError::Failed)?;
+            let purged = store::purge_delete(base_dir, delete_id).map_err(refused)?;
+            Ok(purge_delete_report(lang, delete_id, &purged))
+        }
+        _ => Err(CliError::Failed("name a memory to purge, or a delete with --project-delete".to_string())),
+    }
+}
 
 /// One line per row and per verdict reason that holds a secret, then a line
 /// on what to do with each. Only ids, kinds and whether the row is deleted:
@@ -356,6 +397,37 @@ mod tests {
     use super::*;
     use clawg_core::preferences::Lang;
     use clawg_core::memory::secrets::{Flagged, FlaggedPair};
+
+    #[test]
+    fn a_purge_without_yes_is_refused_before_the_store_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let memory = purge(dir.path(), Some(7), None, false).unwrap_err();
+        let delete = purge(dir.path(), None, Some(3), false).unwrap_err();
+        let masking = command(dir.path(), true, false).unwrap_err();
+
+        assert_eq!(memory.to_string(), confirm(Lang::En, 7, false).unwrap_err());
+        assert_eq!(delete.to_string(), confirm_delete(Lang::En, 3, false).unwrap_err());
+        assert_eq!(masking.to_string(), confirm_mask_reasons(Lang::En, false).unwrap_err());
+        assert!(!dir.path().join("memory.db").exists(), "nothing was opened");
+    }
+
+    #[test]
+    fn a_purge_names_a_memory_or_a_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = purge(dir.path(), None, None, true).unwrap_err();
+        assert_eq!(err.to_string(), "name a memory to purge, or a delete with --project-delete");
+    }
+
+    #[test]
+    fn a_scan_without_a_store_fails_as_the_store_says() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = command(dir.path(), false, false).unwrap_err();
+
+        assert!(matches!(err, CliError::Memory(_)), "{err:?}");
+        assert_eq!(err.to_string(), store::scan(dir.path()).unwrap_err().to_string());
+    }
 
     #[test]
     fn the_secrets_report_lists_rows_and_never_their_content() {

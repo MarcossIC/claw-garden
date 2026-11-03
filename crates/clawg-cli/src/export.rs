@@ -7,11 +7,39 @@
 use std::io::Write;
 use std::path::Path;
 
+use clawg_core::memory::identity::Disk;
+use clawg_core::memory::portability::export::project_id_of;
 use clawg_core::memory::portability::format::ProjectLine;
 use clawg_core::memory::portability::{export, markdown, Export, ExportFilter};
+use clawg_core::memory::ProjectIdentity;
 use clawg_core::preferences::Lang;
 
 use crate::cli::ExportFormat;
+use crate::daemon::lifecycle::now_ms;
+use crate::error::CliError;
+use crate::preferences::language;
+
+/// `clawg export`: the rows of the store in `base_dir` of the project
+/// `project` is in, or of every project, into `out`. The language is read
+/// once the project is known, so a project that fails is all stderr says.
+pub fn command(
+    base_dir: &Path,
+    out: &Path,
+    project: Option<&Path>,
+    agent: Option<String>,
+    include_deleted: bool,
+    format: ExportFormat,
+) -> Result<String, CliError> {
+    let project_id = match project {
+        Some(path) => {
+            let identity = ProjectIdentity::resolve(path);
+            Some(project_id_of(base_dir, &identity.root, Some(&identity.path), &Disk)?)
+        }
+        None => None,
+    };
+    let filter = ExportFilter { project_id, agent, include_deleted };
+    run(language(base_dir), base_dir, out, &filter, format, now_ms() as i64).map_err(CliError::Failed)
+}
 
 /// Exports the rows of the store in `base_dir` that `filter` takes into
 /// `out`, and says what it wrote in `lang`. `out` must not exist.
@@ -216,6 +244,18 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn a_project_without_a_store_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("memories.jsonl");
+
+        let err = command(dir.path(), &out, Some(dir.path()), None, false, ExportFormat::Jsonl).unwrap_err();
+
+        assert!(matches!(err, CliError::Export(_)), "the project is resolved first: {err:?}");
+        assert!(err.to_string().contains("no memory store"), "{err}");
+        assert!(!out.exists(), "nothing is written");
     }
 
     #[test]
