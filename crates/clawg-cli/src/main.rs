@@ -36,7 +36,7 @@ use clawg_cli::setup;
 use clawg_cli::preferences;
 use clawg_cli::sharing;
 use clawg_cli::status;
-use clawg_cli::stop::{stop_in, STOP_TIMEOUT};
+use clawg_cli::stop;
 use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::backup::{backup_offline, restore};
@@ -154,24 +154,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
 
         Command::Stop { profile } => {
             let profile = profile.resolve()?;
-            // Returns only once the process has ended, so `clawg stop && clawg
-            // serve` cannot lose the race for the lock, and an installer can
-            // replace `clawg.exe` right after.
             let base_dir = data_dir(profile)?;
-            let lang = language(&base_dir);
-            let name = profile.as_str();
-            let pid = stop_in(&base_dir, STOP_TIMEOUT).await.map_err(|e| match (e, lang) {
-                (ClientError::NotRunning, Lang::En) => format!("no clawg daemon is running for profile {name}"),
-                (ClientError::NotRunning, Lang::Es) => {
-                    format!("no hay ningún daemon de clawg corriendo para el perfil {name}")
-                }
-                (other, _) => other.to_string(),
-            })
-            .map_err(CliError::Failed)?;
-            match lang {
-                Lang::En => println!("stopped the {name} daemon (pid {pid})"),
-                Lang::Es => println!("se detuvo el daemon {name} (pid {pid})"),
-            }
+            println!("{}", stop::command(language(&base_dir), profile, &base_dir).await?);
             Ok(ExitCode::SUCCESS)
         }
 
