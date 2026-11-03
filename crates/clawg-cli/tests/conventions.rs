@@ -148,10 +148,11 @@ fn read_repo_file(relative: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The value written for `key` inside `[section]` of a manifest, as the raw
-/// text after the `=`, without a trailing comment.
-fn manifest_value(manifest: &str, section: &str, key: &str) -> Option<String> {
+/// Each `key = value` written inside `[section]` of a manifest, the value as
+/// the raw text after the first `=`, without a trailing comment.
+fn manifest_entries(manifest: &str, section: &str) -> Vec<(String, String)> {
     let mut inside = false;
+    let mut entries = Vec::new();
     for line in manifest.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -162,13 +163,40 @@ fn manifest_value(manifest: &str, section: &str, key: &str) -> Option<String> {
             continue;
         }
         if let Some((name, value)) = line.split_once('=') {
-            if name.trim() == key {
-                let value = value.split(" #").next().unwrap_or(value);
-                return Some(value.trim().to_string());
-            }
+            let value = value.split(" #").next().unwrap_or(value);
+            entries.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
-    None
+    entries
+}
+
+/// The value written for `key` inside `[section]` of a manifest, as the raw
+/// text after the `=`, without a trailing comment.
+fn manifest_value(manifest: &str, section: &str, key: &str) -> Option<String> {
+    manifest_entries(manifest, section).into_iter().find(|(name, _)| name == key).map(|(_, value)| value)
+}
+
+#[test]
+fn every_package_takes_the_workspace_lints() {
+    // Cargo applies [workspace.lints] only to a package whose [lints] says
+    // `workspace = true`, and such a package cannot add lints of its own.
+    let root = read_repo_file("Cargo.toml");
+    let clippy = manifest_entries(&root, "workspace.lints.clippy");
+    let level = |lint: &str| clippy.iter().find(|(name, _)| name == lint).map(|(_, value)| value.as_str());
+    assert_eq!(level("all"), Some(r#"{ level = "warn", priority = -1 }"#), "the default group, below the lints named after it");
+    for lint in ["large_futures", "allow_attributes", "allow_attributes_without_reason"] {
+        assert_eq!(level(lint), Some(r#""warn""#), "clippy::{lint}");
+    }
+    let allowed: Vec<&str> = clippy.iter().filter(|(_, value)| value.contains(r#""allow""#)).map(|(name, _)| name.as_str()).collect();
+    assert!(allowed.is_empty(), "an exception is an #[expect] where it applies, not a workspace allow: {allowed:?}");
+
+    let members = manifest_value(&root, "workspace", "members").expect("the workspace lists its members");
+    let members: Vec<&str> = members.split('"').skip(1).step_by(2).collect();
+    assert!(!members.is_empty(), "no member read from {members:?}");
+    for member in members {
+        let manifest = read_repo_file(&format!("{member}/Cargo.toml"));
+        assert_eq!(manifest_value(&manifest, "lints", "workspace").as_deref(), Some("true"), "{member} takes the workspace lints");
+    }
 }
 
 #[test]

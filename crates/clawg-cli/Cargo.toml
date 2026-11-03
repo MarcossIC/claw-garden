@@ -8,6 +8,9 @@ repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 # The binary is `clawg`, not `clawg-cli`: the package name is a crate-registry
 # concern, the binary name is the product's user-facing identity.
 [[bin]]
