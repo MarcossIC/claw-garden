@@ -846,7 +846,7 @@ pub async fn run_embedder_bootstrap(
 /// mismatch stops the loop (see [`classify`]). `sleep` is the wait itself,
 /// injected so tests run without waiting; production passes
 /// `tokio::time::sleep`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn run_embedder_bootstrap_with_retry<S, F>(
     base_dir: std::path::PathBuf,
     embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,

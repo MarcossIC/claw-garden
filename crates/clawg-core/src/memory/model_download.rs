@@ -893,6 +893,7 @@ const CHUNK_PROGRESS_BYTES: u64 = 64 * 1024;
 /// Emits `DownloadProgress::Chunk` events throttled to one per
 /// `CHUNK_PROGRESS_BYTES` (64 KB) of cumulative download progress across all
 /// files in the current run.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn download_one(
     client: &reqwest::Client,
     cache_dir: &Path,

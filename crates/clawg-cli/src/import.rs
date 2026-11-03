@@ -366,6 +366,7 @@ pub fn interrupts() -> mpsc::UnboundedReceiver<()> {
 /// as a bridge resolves its own, and a PATH that is not a directory stops it
 /// before the daemon is asked; each OLD root is taken as written. The daemon
 /// reads the file, so only its absolute path is sent.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn run(
     lang: Lang,
     client: &DaemonClient,

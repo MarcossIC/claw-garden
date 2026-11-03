@@ -189,6 +189,7 @@ struct ConflictPair {
 ///
 /// `budget` is the most bytes the text may take; see [`fit_to_budget`] for
 /// what gives way and the one case that can still go over it.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn build_memory_prompt(
     lang: Lang,
     store: &MemoryStore,
@@ -308,6 +309,7 @@ pub async fn build_memory_prompt(
 /// last session's summary follows `reach`, as its block does in a search. No
 /// access is recorded: these rows were picked for being new, not relevant,
 /// and counting them at every session start would promote a row for its age.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn build_session_prompt(
     lang: Lang,
     store: &MemoryStore,
@@ -345,6 +347,7 @@ async fn read_workspace(workspace: &WorkspaceManager, agent_id: &str, project_id
 
 /// Lays `hits` out under the workspace, with the conflicts on what the
 /// prompt could show, cut to `budget` with `hit_room` kept for the hits.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn assemble(
     lang: Lang,
     store: &MemoryStore,
@@ -2486,7 +2489,7 @@ mod tests {
     /// Seeds one `memory` row at an explicit age, so a fixture can put a row
     /// far enough in the past for its decay term to bottom out at the tier
     /// floor. [`seed_memory`] always stamps "now", which cannot express that.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "a test fixture that takes each column of the row it seeds")]
     async fn seed_memory_aged(
         store: &MemoryStore,
         agent_id: &str,

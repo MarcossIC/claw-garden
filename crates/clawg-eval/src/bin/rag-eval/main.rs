@@ -428,6 +428,7 @@ async fn case_scale(
 /// Scores the golden cases over the seeded store and writes the results.
 /// `resolved` holds each case's project and cited saves in a background, in
 /// the order of the cases; it is empty without one.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn measure(
     cli: &cli::Cli,
     loaded_golden: &golden::LoadedGolden,

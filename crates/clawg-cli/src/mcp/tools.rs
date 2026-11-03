@@ -1107,6 +1107,7 @@ pub fn format_language(session: Option<Lang>, now: Option<Lang>) -> Option<Strin
 /// facts health cannot carry — which data directory, profile and agent this
 /// bridge is attached to, whose memories the agent reads, and the language
 /// line of [`format_language`] when there is one.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub fn format_status(
     lang: Lang,
     health: &Health,

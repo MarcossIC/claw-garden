@@ -946,6 +946,7 @@ async fn embed_pieces(
 
 /// Stores the pieces of `evt` and returns its report with the pieces to link,
 /// in order, each with the head its vector was embedded behind.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn ingest_pieces(
     evt: &MemoryEvent,
     saver: &Reader,

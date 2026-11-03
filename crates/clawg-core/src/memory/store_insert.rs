@@ -1975,6 +1975,7 @@ mod tests {
     /// Raw-inserts a `memory` row with the given `content_hash`, `status`, and
     /// `deleted_at`, bypassing `insert_memory_with_vector` (which does not yet
     /// bind `content_hash`). Returns the new row id.
+    #[expect(clippy::too_many_arguments, reason = "a test fixture that takes each column of the row it seeds")]
     async fn seed_hashed_row(
         store: &MemoryStore,
         agent_id: &str,

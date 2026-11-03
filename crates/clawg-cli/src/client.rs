@@ -1366,6 +1366,7 @@ impl DaemonClient {
     /// empty or invalid change. `project` moves the row's save, `Some(None)`
     /// out of every project. `agent` names the agent the change is for; a row
     /// out of its reach comes back as not found.
+    #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
     pub async fn update(
         &self,
         kind: &str,

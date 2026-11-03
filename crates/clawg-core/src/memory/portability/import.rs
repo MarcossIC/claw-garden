@@ -2060,6 +2060,7 @@ fn write_links<S: Seat>(seat: &mut S, prepared: &Prepared, ledger: &mut Ledger) 
 /// snapshot into `backups` first, each step logged in `timings` as it ends.
 /// A dry run writes nothing and needs no embedder.
 #[cfg(test)]
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn import(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
@@ -2150,6 +2151,7 @@ fn stopped_after(control: &ImportControl, step: Step) -> Result<(), Cut> {
 /// snapshot into `backups` first, each step logged in `timings` as it ends,
 /// with `control` showing where it is as it runs and asking it to stop.
 /// A dry run writes nothing and needs no embedder.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn import_parsed(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
@@ -2230,6 +2232,7 @@ async fn prepare_parsed(
 /// the project a registration gives the root `options.project_map` names for
 /// its project, or in none.
 #[cfg(test)]
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn import_foreign(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
@@ -2359,6 +2362,7 @@ struct Written {
 /// Places every row and link of `prepared` and, unless this is a dry run,
 /// embeds the rows to insert and writes them after a `pre-import` snapshot,
 /// journaled as an import from `source`.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn write(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
