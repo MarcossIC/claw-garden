@@ -21,7 +21,7 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla por la a
 
 ## 3. Docs (A3)
 
-- [x] `docs/reference/data-profiles.md` y R14 de `openspec/specs/metrics/spec.md`: qué mide un brazo, que `total` sigue de punta a punta, y que hasta 0.73.0 cada brazo incluía la espera en la cola, que `--by version` separa.
+- [x] `docs/reference/data-profiles.md` y R14 de `openspec/specs/metrics/spec.md`: qué mide un brazo, que `total` sigue de punta a punta, y que hasta 0.72.2 cada brazo incluía la espera en la cola, que `--by version` separa.
 - Commit: `docs: say what each search arm measures and since which version`
 
 ## 4. Cierre
