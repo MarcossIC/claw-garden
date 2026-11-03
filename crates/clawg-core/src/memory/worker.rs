@@ -1081,8 +1081,8 @@ async fn store_pieces(to: &PieceStore<'_>, absorbed: &mut u64, gated: &mut Gated
         .map(|(_, candidate)| candidate)
         .collect();
         let candidates = record.candidates.clone();
-        let note = note_for(track, &noted, position, &content_hash, true, context(position));
-        let absorbed_note = note_for(track, &noted, position, &content_hash, false, "");
+        let note = note_for(track, noted, position, &content_hash, true, context(position));
+        let absorbed_note = note_for(track, noted, position, &content_hash, false, "");
         let id = match store.insert_unless_twin(saver, record, vec, note, absorbed_note).await {
             Ok(Insert::Inserted(id)) => id,
             Ok(Insert::Absorbed(id)) => {
