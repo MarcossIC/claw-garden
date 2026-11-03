@@ -836,9 +836,11 @@ fn reader_query(agent: Option<&str>) -> Vec<(&'static str, &str)> {
 enum Transport {
     /// TCP, and the socket on Unix.
     Http(reqwest::Client),
-    /// The socket on Windows, where reqwest cannot dial one.
+    /// The socket on Windows, where reqwest cannot dial one. Boxed, since
+    /// hyper's client is held inline and would size every [`DaemonClient`]
+    /// and every value holding one; reqwest's is one pointer.
     #[cfg(windows)]
-    AfUnix(AfUnixClient),
+    AfUnix(Box<AfUnixClient>),
 }
 
 #[cfg(windows)]
@@ -1019,7 +1021,7 @@ fn socket_transport(path: &Path) -> Option<Transport> {
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .pool_timer(TokioTimer::new())
         .build(crate::daemon::socket::Connector::new(path));
-    Some(Transport::AfUnix(client))
+    Some(Transport::AfUnix(Box::new(client)))
 }
 
 #[cfg(not(any(unix, windows)))]
