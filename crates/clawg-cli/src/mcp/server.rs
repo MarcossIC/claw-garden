@@ -692,22 +692,7 @@ impl ClawgMcp {
                  por qué, o prueba de nuevo si todavía está arrancando"
             }
             (ClientError::Daemon { details, .. }, _) if err.is_root_collision() => {
-                let detail = details.detail.as_deref().unwrap_or(match lang {
-                    Lang::En => "this project's id belongs to another root",
-                    Lang::Es => "el id de este proyecto pertenece a otra raíz",
-                });
-                return match lang {
-                    Lang::En => format!(
-                        "not done: {detail}, and clawg will not mix two projects' memories under one id, so this \
-                         project cannot be used until one of the two folders is renamed; all_projects \
-                         still searches every project"
-                    ),
-                    Lang::Es => format!(
-                        "no se hizo: {detail}, y clawg no mezcla las memorias de dos proyectos bajo un id, así que \
-                         este proyecto no se puede usar hasta que se renombre una de las dos carpetas; all_projects \
-                         sigue buscando en todos los proyectos"
-                    ),
-                };
+                return Self::refused_root(lang, details.detail.as_deref(), false);
             }
             (ClientError::Daemon { status: 503, message, .. }, Lang::En) if message == "embedder_not_ready" => {
                 "the memory index is still loading its embedding model; \
@@ -741,6 +726,44 @@ impl ClawgMcp {
             (other, _) => return other.to_string(),
         };
         text.to_string()
+    }
+
+    /// [`Self::explain`] for `search_memory` and `synthesize`, the tools that
+    /// take `all_projects`: a refused root points at the argument the model
+    /// can pass to the same tool.
+    fn explain_with_all_projects(lang: Lang, err: &ClientError) -> String {
+        match err {
+            ClientError::Daemon { details, .. } if err.is_root_collision() => {
+                Self::refused_root(lang, details.detail.as_deref(), true)
+            }
+            other => Self::explain(lang, other),
+        }
+    }
+
+    /// The refusal of a root whose id belongs to another root. Every project
+    /// is still reached with `all_projects`; `own` says the tool called takes
+    /// it, and otherwise the sentence names `search_memory`, which does.
+    fn refused_root(lang: Lang, detail: Option<&str>, own: bool) -> String {
+        let detail = detail.unwrap_or(match lang {
+            Lang::En => "this project's id belongs to another root",
+            Lang::Es => "el id de este proyecto pertenece a otra raíz",
+        });
+        let wide = match (lang, own) {
+            (Lang::En, true) => "all_projects still reaches every project",
+            (Lang::En, false) => "search_memory with all_projects still searches every project",
+            (Lang::Es, true) => "all_projects sigue alcanzando todos los proyectos",
+            (Lang::Es, false) => "search_memory con all_projects sigue buscando en todos los proyectos",
+        };
+        match lang {
+            Lang::En => format!(
+                "not done: {detail}, and clawg will not mix two projects' memories under one id, so this \
+                 project cannot be used until one of the two folders is renamed; {wide}"
+            ),
+            Lang::Es => format!(
+                "no se hizo: {detail}, y clawg no mezcla las memorias de dos proyectos bajo un id, así que \
+                 este proyecto no se puede usar hasta que se renombre una de las dos carpetas; {wide}"
+            ),
+        }
     }
 
     /// What `save_memory` tells the model: `Ok` is a success result, `Err` an
@@ -1121,7 +1144,7 @@ impl ClawgMcp {
                 Self::ok(format_search(found, agent_id, save_project.as_deref(), self.language))
             }
             Ok(Ok(Err(refusal))) => Self::failed(refusal),
-            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
+            Ok(Err(e)) => Self::failed(Self::explain_with_all_projects(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -1450,7 +1473,7 @@ impl ClawgMcp {
         match result {
             Ok(Ok(Ok(synthesis))) => Self::ok(format_synthesis(self.speaks(), &synthesis)),
             Ok(Ok(Err(refusal))) => Self::failed(refusal),
-            Ok(Err(e)) => Self::failed(Self::explain(self.speaks(), &e)),
+            Ok(Err(e)) => Self::failed(Self::explain_with_all_projects(self.speaks(), &e)),
             Err(failure) => Ok(failure),
         }
     }
@@ -2205,6 +2228,49 @@ mod tests {
             .unwrap();
 
         assert!(!is_error(&found), "{}", text(&found));
+    }
+
+    /// Only `search_memory` and `synthesize` take `all_projects`, so a tool
+    /// without it points at `search_memory` for the way to every project.
+    #[tokio::test]
+    async fn a_colliding_root_names_an_all_projects_the_tool_can_pass() {
+        for lang in [None, Some(Lang::Es)] {
+            let (b, _repo, _d, _identity) = colliding_bridge().await;
+            let b = b.with_language(lang);
+
+            let own = [
+                b.search_memory_impl(
+                    "a",
+                    SearchMemoryArgs { query: "anything".into(), limit: None, project_path: None, project: None, all_projects: None },
+                )
+                .await
+                .unwrap(),
+                b.synthesize_impl("a", SynthesizeArgs::default()).await.unwrap(),
+            ];
+            for result in &own {
+                let out = text(result);
+                assert!(is_error(result), "{out}");
+                assert!(out.contains("all_projects") && !out.contains("search_memory"), "{lang:?}: {out}");
+            }
+
+            let without = [
+                b.save_memory_impl("a", save_args("never mixed")).await.unwrap(),
+                b.recall_context_impl(
+                    "a",
+                    RecallContextArgs { query: "anything".into(), project_path: None, project: None, budget: None },
+                )
+                .await
+                .unwrap(),
+                b.search_project_impl(SearchProjectArgs { query: "anything".into(), limit: None, project_path: None, project: None })
+                    .await
+                    .unwrap(),
+            ];
+            for result in &without {
+                let out = text(result);
+                assert!(is_error(result), "{out}");
+                assert!(out.contains("search_memory") && out.contains("all_projects"), "{lang:?}: {out}");
+            }
+        }
     }
 
     #[tokio::test]
