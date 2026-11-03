@@ -30,6 +30,7 @@ pub mod daemon;
 #[cfg(windows)]
 pub mod detach;
 pub mod doctor;
+pub mod error;
 pub mod export;
 pub mod hook;
 pub mod import;
