@@ -61,6 +61,7 @@ impl EmbedRole {
 /// that inherits `""` for both is silently claiming "no prefixes" instead of
 /// deciding to have none.
 #[async_trait]
+#[expect(clippy::double_must_use, reason = "async_trait marks each method #[must_use], and the boxed future it returns already is")]
 pub trait Embedder: Send + Sync {
     /// Compute the embedding for a single text, prefixed per `role`. Vector
     /// length MUST equal [`Embedder::dimensions`].
