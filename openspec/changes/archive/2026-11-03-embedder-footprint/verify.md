@@ -1,6 +1,6 @@
 # embedder-footprint — Verificación
 
-Registro de la puerta (tarea 2). Están medidos los pasos 2.1 y 2.2, en Windows y en Linux, 2.3 en Windows, y 2.4, las arenas de malloc, y 2.5 en Linux. Falta 2.5 en Windows.
+Registro de la puerta (tarea 2). Están medidos los pasos 2.1, 2.2 y 2.5, en Windows y en Linux, 2.3 en Windows y 2.4, las arenas de malloc, en Linux. 2.6 no se corre. Cada opción contra su umbral está en [2.7](#27-cada-opción-contra-su-umbral): ninguna entra, y el cambio se cierra con la tarea 1 y este registro (enfoque F).
 
 ## La máquina y el build
 
@@ -320,7 +320,81 @@ Para leer los números:
 - **La cabecera codifica el texto entero** para quedarse con sus primeros 32 tokens, así que cuesta como las otras dos: de 21,7 a 58,0 ms en un guardado de 64 KiB.
 - **El worker queda tomado durante la etapa `split`**, que enmascara y llama a `split_save`: de 86 a 191 ms en los guardados de 64 KiB, 110 ms de mediana, y de 31 a 44 ms en los de 5.000 tokens. Esa es la otra mitad de E, pasarlo a `spawn_blocking`, que el umbral no cubre.
 - **La etapa `store` crece de un guardado de 64 KiB al siguiente:** 0,9 s en el de calentamiento y de 3,3 a 7,8 s en los cinco que cuentan, mientras la tanda va de 5,5 a 7,9 s. No se atribuye. No entra en el umbral; si entrara, la parte de las codificaciones sería todavía menor.
-- 2.5 no se midió en Windows.
+- 2.5 en Windows está en [su sección](#25-en-windows).
+
+## 2.5 en Windows
+
+### La máquina y el build
+
+| Dato | Valor |
+|---|---|
+| Sistema | Windows 11 25H2, compilación 26200, x86_64 |
+| CPU | AMD Ryzen AI 7 350 (familia 26, modelo 96), el de la primera tabla de este registro |
+| Hilos | 16 lógicos. Los 8 físicos vienen de esa tabla: en esta corrida se leyeron sólo los lógicos |
+| Instrucciones | AVX2 y AVX-512F, que el sistema informa presentes. FMA viene de esa tabla |
+| Energía | con corriente, plan `Balanced`, modo `Best Performance` (`ActiveOverlayAcPowerScheme`). La primera tabla dice `Best Power Efficiency`, así que el modo no es el de esas mediciones |
+| Build | release con la feature `testing`: `cargo build --release --locked -p clawg-cli --features clawg-core/testing`, rustc 1.99.1, versión 0.73.0, sobre `b100e16`, con el parche de 2.5 de la sección de Linux, que no se commitea |
+
+### Cómo se midió
+
+El método es el de Linux. Lo que hay que precisar:
+
+- El binario se compiló antes de la primera corrida, en un worktree temporal, y se copió como `clawg-measure.exe`. Mientras se midió no se compiló ni se corrió ningún test.
+- Un daemon solo, `serve --profile dev --port 0`, con un `CLAWG_TEST_HOME` temporal, una store vacía y `RUST_LOG=info`, sin ninguna otra variable de clawg, del tokenizer, de `rayon` ni de ONNX Runtime. El guion comprobó antes del primer guardado que el log nombra un directorio de datos dentro del home temporal y que el `pid` de `/health` es el del proceso que arrancó. No se abrió ningún perfil real.
+- El modelo real se copió de un perfil dev a `<home>/.clawg-dev/models/multilingual-e5-small` antes de arrancar: no se bajó nada. La ruta del socket pasa de los 108 bytes que admite, así que el daemon sólo escucha por TCP.
+- **Los textos** salen del árbol de `6cb64fc`. La herramienta de Linux no está en git, así que la prosa se armó de nuevo y los textos no son byte por byte los de esa corrida. De cada `.md`, en orden de bytes de la ruta, entran todas las líneas menos las vacías, los bloques de código, las filas de tabla, los separadores, las que ya aparecieron y las que parecen llevar un secreto, para que la máscara no cambie el recuento. Las ventanas son seguidas. Los de 64 KiB tienen 65.536 bytes y de 17.115 a 21.699 tokens. Los de 5.000 tokens tienen esa cantidad justa, contada con el `tokenizer.json` del modelo, en 14.774 a 18.282 bytes. Los rangos incluyen los dos de calentamiento. En los 12 guardados, el recuento que registra el daemon coincide con el de la herramienta, y ninguno enmascaró nada.
+- Cada `POST /v1/memories` va solo: se espera a que su línea de reloj de `store` salga en el log y a que `pending` vuelva a 0, y 5 s más. El modelo listo y 30 s de reposo antes del primero. Primero va un guardado de cada tamaño que no cuenta, y después 5 de cada uno, alternados, empezando por 64 KiB. Los 12 respondieron `201`, con una sola toma cada uno y `failed` en 0.
+- **Cada codificación** se mide con su llamada entera dentro de `split_save`. El `encode` solo es del 95 al 98 % de cada llamada; el plan es de 0,1 a 0,8 ms. **La tanda** es la etapa `embed`.
+- `typeperf` registró cada 5 s el sensor térmico, `% Passive Limit`, `% Processor Performance` y `% Processor Time`. La frecuencia es ese porcentaje sobre los 2000 MHz nominales, una aproximación.
+- La tanda no falló y no se repitió. Antes hubo un ensayo en otro home, con sólo los dos guardados de calentamiento y 3 s de reposo, para probar el guion. No cuenta.
+- Los registros crudos no se conservan en git.
+
+### Resultados
+
+En las filas de mediana, cada columna es su propia mediana.
+
+| Guardado | Tokens | Piezas | Entera (480) | Cabecera (32) | Piezas (96) | Tanda | Las dos de más sobre las tres y la tanda | `split` | `store` |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 KiB, 1 | 19.707 | 279 | 41,3 ms | 25,2 ms | 28,4 ms | 3,67 s | 1,42 % | 95,1 ms | 3,48 s |
+| 64 KiB, 2 | 20.765 | 297 | 44,1 ms | 25,8 ms | 26,3 ms | 3,83 s | 1,33 % | 104,0 ms | 5,32 s |
+| 64 KiB, 3 | 21.557 | 315 | 35,0 ms | 30,5 ms | 29,4 ms | 4,09 s | 1,43 % | 104,9 ms | 4,94 s |
+| 64 KiB, 4 | 21.699 | 312 | 31,7 ms | 31,9 ms | 31,8 ms | 3,85 s | 1,62 % | 101,4 ms | 5,27 s |
+| 64 KiB, 5 | 21.582 | 313 | 31,7 ms | 30,0 ms | 30,9 ms | 3,83 s | 1,55 % | 97,6 ms | 5,99 s |
+| **64 KiB, mediana** | 21.557 | 312 | 35,0 ms | 30,0 ms | 29,4 ms | 3,83 s | **1,43 %** | 101,4 ms | 5,27 s |
+| 5.000 tokens, 1 | 5.000 | 72 | 7,3 ms | 3,6 ms | 4,0 ms | 1,20 s | 0,62 % | 14,9 ms | 0,69 s |
+| 5.000 tokens, 2 | 5.000 | 72 | 7,8 ms | 3,7 ms | 3,5 ms | 1,26 s | 0,56 % | 16,6 ms | 0,82 s |
+| 5.000 tokens, 3 | 5.000 | 71 | 8,2 ms | 7,5 ms | 6,9 ms | 0,94 s | 1,49 % | 24,0 ms | 0,71 s |
+| 5.000 tokens, 4 | 5.000 | 74 | 7,3 ms | 6,1 ms | 6,1 ms | 1,02 s | 1,18 % | 21,0 ms | 0,74 s |
+| 5.000 tokens, 5 | 5.000 | 72 | 7,8 ms | 6,4 ms | 6,3 ms | 0,87 s | 1,42 % | 22,1 ms | 0,95 s |
+| **5.000 tokens, mediana** | 5.000 | 72 | 7,8 ms | 6,1 ms | 6,1 ms | 1,02 s | **1,18 %** | 21,0 ms | 0,74 s |
+
+**E no abre en Windows.** Las dos codificaciones de más pesan 1,43 % de un guardado de 64 KiB, mediana de 5, y 1,62 % en el peor, contra un umbral de 5 %. Contando sólo el `encode`, 1,40 %.
+
+Para leer los números:
+
+- **Frente a Linux, la parte sube de 1,07 % a 1,43 % porque baja el denominador.** Las codificaciones cuestan casi lo mismo, con medianas de 35,0, 30,0 y 29,4 ms contra 39,4, 30,2 y 41,4 ms. La tanda pasa de 6,76 s a 3,83 s, con 16 hilos lógicos contra 4. Son máquinas distintas, y no se separa qué parte de esa baja se debe a los hilos.
+- **El worker queda tomado durante la etapa `split`,** que enmascara y llama a `split_save`: de 95 a 105 ms en los guardados de 64 KiB, 101 ms de mediana, y de 15 a 24 ms en los de 5.000 tokens. En Linux fueron 110 ms de mediana y de 31 a 44 ms. Esa es la otra mitad de E, pasarlo a `spawn_blocking`, que el umbral no cubre.
+- **La etapa `store` crece de un guardado de 64 KiB al siguiente, como en Linux:** 1,05 s en el de calentamiento y de 3,48 a 5,99 s en los cinco que cuentan. No se atribuye. No entra en el umbral; si entrara, la parte de las codificaciones sería todavía menor.
+- En «64 KiB, 3» la tanda embebió 314 de las 315 piezas: el dedup absorbió una. El detector de contradicciones emparejó filas en 11 de los 12 guardados.
+- **El sensor no dice nada en esta corrida.** Quedó fijo en 372 K en las 30 lecturas, con `% Passive Limit` en 100, y ya se vio en la prueba corta de 2.3 que un sensor fijo no prueba un estado térmico. La frecuencia fue de 3878 a 4510 MHz, con mediana de 4065 MHz. La tanda arrancó unos 5 minutos después de las compilaciones y del ensayo. Medir en frío no era condición.
+- **Otros procesos siguieron vivos.** Dos `clawg.exe` ajenos a la medición no se tocaron, y durante la tanda no se les pidió nada. `% Processor Time` de la máquina entera fue de 7,4 a 61,1 %, con mediana de 20,8 %. Esa lectura no separa por proceso.
+
+## 2.7 Cada opción contra su umbral
+
+| Opción | Umbral | Número | Decisión |
+|---|---|---|---|
+| A, sin espera activa | 2.2: mediana ≥ +0,6 s de CPU tras una tanda. 2.3: pasando de +2 % de tiempo, ganar al menos 22 % de CPU o de memoria, sin ser marginal | 2.2: −0,073 s en Windows y 0,00 s en Linux. 2.3 en Windows, en frío: +3,0 % de tiempo por −0,2 % de CPU | Se descarta |
+| B, menos hilos | 2.3: techo de tiempo, el menor entre +5 % y +60 s | 2.3 en Windows, ronda 1: 8 hilos, +40,2 % de tiempo por −13,1 % de CPU; 4 hilos, +86,1 % por −38,0 % | Se descarta |
+| C, tokenizer en serie | 2.1: hilos de más sostenidos con el modelo suelto. 2.3: una ganancia que no sea marginal, 1 núcleo o 100 MiB; si no, decisión expresa | 2.1: 16 hilos de más en Windows y 4 en Linux, abre. 2.3 en Windows, en frío: +1,1 % de tiempo, −1,0 % de CPU, −19,8 MiB de pico | Abrió por 2.1 y no entra: ganancia marginal |
+| D, ordenar las tandas por largo | Sin umbral en este cambio | Sin número en este cambio | Pasó a [docs-index-speed](../2026-11-01-docs-index-speed/proposal.md) (95), que lo decidió con sus puertas |
+| E, codificar una sola vez | 2.5: las dos codificaciones de más, sobre las tres más la tanda, mediana de 5 guardados de 64 KiB. Abre con 5 % o más | 1,07 % en Linux y 1,43 % en Windows. El peor guardado, 1,43 % y 1,62 % | No abre |
+| Arena, D6 de embedder-idle-unload | 2.4, con 2 arenas, las tres: el p99 baja al menos 22 % y 20 ms, el refresco no sube más que el menor entre +5 % y +60 s, el pico de `RssAnon` sube menos de 100 MiB | 2.4 en Linux, 4 hilos: p99 +2,3 % (+95 ms), refresco −2,6 % (−9,9 s), pico +13,0 MiB | Queda una arena |
+
+**Ninguna opción entra, así que no hay tarea 3 y 2.6 no se corre.** El cambio se cierra con la tarea 1 y este registro (enfoque F).
+
+`spawn_blocking`, la otra mitad de E, queda fuera de esta decisión porque el umbral no lo cubre. Está en «Backlog sin spec» de `openspec/README.md`, con las cifras de la etapa `split`.
+
+Lo que estas lecturas no cubren: la arena se midió sólo en Linux con 4 hilos, y la prueba corta de 2.3, sólo en Windows.
 
 ## Lo que esto corrige de la exploración
 
@@ -328,6 +402,10 @@ Para leer los números:
 
 ## Pendiente
 
-- 2.5 en Windows: sin medir. En Linux, E queda en 1,07 %, contra un umbral de 5 %.
-- 2.6 no se corre: no entra ningún cambio de hilos, de espera activa ni de tokenizer, así que no hay combinación que comprobar.
-- 2.7: cerrar el registro.
+- Nada de la puerta. 2.6 no se corre: no entra ningún cambio de hilos, de espera activa ni de tokenizer, así que no hay combinación que comprobar.
+
+## Al archivar (2026-11-03)
+
+- EF1 pasó a [`specs/storage`](../../../specs/storage/spec.md), «Los mismos vectores que fastembed», con su línea de origen y sus dos escenarios. De la frase que reemplazaba queda lo que no es de hilos, el proveedor de CPU sin arena y la optimización de nivel 3: sigue siendo así y EF1 no lo repite. Las citas de línea son las de `b100e16`.
+- La tarea 1 (`09d3804`), el único código de este cambio, ya salió: `git tag --contains 09d3804` da `v0.71.0` y `v0.72.2`, así que la primera versión publicada es 0.71.0.
+- **La versión no sube.** `Cargo.toml` queda en 0.73.0, aunque `openspec/README.md` y `openspec/config.yaml` digan que archivar sube el minor. 0.73.0 no tiene tag y ya trae el código de los cambios archivados, y subirla dejaría falsas las notas «sale en 0.73.0». Es la excepción que ya se aplicó al archivar project-registry y project-locators.

@@ -32,7 +32,20 @@ Se corrieron `rag-eval --fake` y `rag-eval --fake --agent-view` dos veces sobre 
 - `rag-eval --diff` no mueve ningún caso en ninguna métrica: retrieval, similarity, la vista del agente y cada par.
 - Los JSON de antes y de después son iguales salvo en `git_sha`, `tag` y, en la vista del agente, las latencias de reloj. Los hits de cada caso son idénticos.
 
+### El golden de 46 casos
+
+En Windows x86_64, build debug (`cargo build --locked -p clawg-eval --bin rag-eval`), sobre `docs/eval/golden.json`, que está fuera de git: 46 casos y 48 filas, `content_sha256` `363d3e08…` en las cuatro corridas. `rag-eval --fake` y `rag-eval --fake --agent-view` corrieron antes, sobre `d34366c`, en un worktree temporal, y después, sobre `b100e16`, con el árbol limpio.
+
+- `rag-eval --diff` no mueve ningún caso en ninguna métrica: retrieval, similarity, la vista del agente y los pares `en>en` (7 casos), `es>en` (19) y `es>es` (20). Su veredicto dice «not distinguishable with 0 case(s) moving», porque para concluir pide 6 casos moviéndose en una dirección. Lo que cierra la pregunta es la línea siguiente.
+- Los JSON de antes y de después son iguales campo por campo salvo `git_sha`, `tag` y, en la vista del agente, las latencias de reloj (`latency_ms` de cada caso y `latency_p50_ms` y `latency_p99_ms` de cada corte). Los hits de cada caso son idénticos.
+- Entre `d34366c` y `b100e16` hay 41 commits que tocan `crates/`, y los de A1 y A2 son dos de ellos. Ninguno mueve un caso.
+
 ## Lo que no se midió
 
-- **El golden de 46 casos** (`docs/eval/golden.json`) está fuera de git y no estaba en este checkout. Antes de archivar, `rag-eval --fake --diff` sobre él queda para una máquina que lo tenga. El sintético pasa por el mismo camino, `search_all_memories` con el canal léxico, y el cambio no toca qué consultas corren ni `hit_cmp`.
 - **Una base real.** Falta medir cuánto se desviaban los brazos y cuánto crece `total` con la cola ocupada, ahora que cada brazo vuelve a hacer fila. Lo mide read-connections en su puerta, con el modelo real y un perfil de datos, y eso pide autorización.
+
+## Al archivar (2026-11-03)
+
+- A1 a A3 cambian R14 de [`specs/metrics`](../../../specs/metrics/spec.md), que ya los decía desde la tarea 3. Se suma su línea de origen y que el reloj de ahora sale en 0.73.0.
+- **«Hasta 0.73.0» pasó a «hasta 0.72.2».** La spec y los documentos se escribieron suponiendo que 0.73.0 sería la última versión con el reloj viejo. El código entró con `Cargo.toml` ya en 0.73.0, y el último tag es `v0.72.2`, así que 0.72.2 es la última con el reloj viejo y 0.73.0 la primera con el nuevo.
+- **La versión no sube.** `Cargo.toml` queda en 0.73.0, aunque `openspec/README.md` y `openspec/config.yaml` digan que archivar sube el minor. 0.73.0 no tiene tag y ya trae el código, y subirla dejaría falsas las notas «sale en 0.73.0». Es la excepción que ya se aplicó al archivar project-registry y project-locators.

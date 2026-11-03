@@ -52,7 +52,7 @@ Impacto: cuánto mejora la capacidad de decidir sobre el modelo, o el producto s
 | H5 | Eval atado a e5 y tokens contados con el tokenizer del modelo | **Incorporar** (es lo que construye este cambio) | Alto | Medio | Medio |
 | H6 | Recalibrar seis constantes | **Modificar**: en el bake-off sólo `cosine_floor`; las otras, en 17 para el ganador | Medio | Medio | Medio |
 | H7 | Tolerancia de `e5_golden` con int8 | **Posponer** junto con int8 | Bajo | Bajo | Bajo |
-| H8 / Q | Cuantizar e5-small a int8 | **Posponer** (decide la puerta de [embedder-footprint](../embedder-footprint/exploration.md), 62, y re-embebe por 17) | Medio | Medio | Medio |
+| H8 / Q | Cuantizar e5-small a int8 | **Posponer** (decide la puerta de [embedder-footprint](../archive/2026-11-03-embedder-footprint/exploration.md), 62, y re-embebe por 17) | Medio | Medio | Medio |
 | Q2 | fp16 en CPU | **Descartar** | — | — | — |
 | Q3 | Truncar e5-small por Matryoshka | **Descartar** | — | — | — |
 | U | El umbral para cambiar | **Modificar** (suma escala, idiomas mezclados y la memoria del tokenizer) | Alto | Bajo | Bajo |

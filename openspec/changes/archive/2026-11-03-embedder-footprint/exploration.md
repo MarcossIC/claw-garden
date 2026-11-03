@@ -44,7 +44,7 @@ El tokenizer compartido (`Arc<Tokenizer>`, el mismo que usa el chunker) codifica
 
 (a) Si el patrón de memoria de ORT guarda un plan por forma de entrada, un daemon con `CLAWG_EMBEDDER_IDLE_MINUTES=0` (no suelta nunca el modelo) podría crecer con miles de formas. (b) La carga junta los bytes del onnx (~470 MB, cifra de 46) con la sesión en construcción; el pico de cada recarga es el máximo posible del proceso y nunca se leyó. (c) Una arena frente a dos y la latencia de búsqueda durante un refresco: falta el dato para saber si D6 de 46 tiene costo.
 
-**(a) y (b) pasaron a [ram-footprint (90)](../archive/2026-10-24-ram-footprint/exploration.md)**, que suma la medición en prod del 2026-10-24 (el modelo cargado el 73 al 81 % de los minutos y un máximo de 1.278 MiB sin dueño) y las mediciones con las que se atribuye cada pico. 90 se archivó con esas mediciones, y el día de uso que las lee pasó a [ram-footprint-gates (92)](../ram-footprint-gates/exploration.md). Sus filas de la tabla de la puerta se miden allá. (c) queda acá.
+**(a) y (b) pasaron a [ram-footprint (90)](../2026-10-24-ram-footprint/exploration.md)**, que suma la medición en prod del 2026-10-24 (el modelo cargado el 73 al 81 % de los minutos y un máximo de 1.278 MiB sin dueño) y las mediciones con las que se atribuye cada pico. 90 se archivó con esas mediciones, y el día de uso que las lee pasó a [ram-footprint-gates (92)](../2026-10-29-ram-footprint-gates/exploration.md). Sus filas de la tabla de la puerta se miden allá. (c) queda acá.
 
 ## Lo que ya existe y se reutiliza
 
@@ -88,7 +88,7 @@ Se llama una vez al empezar `serve`, antes de cualquier tanda. **A favor:** el g
 
 Ordenar los índices por cantidad de tokens, agrupar de a `EMBED_BATCH` y devolver los vectores en el orden original. **A favor:** menos padding en refrescos de docs. **En contra:** cambia el largo rectangular de cada llamada, y el comentario de `pool_and_normalize` (`embedder.rs:270-274`) sólo garantiza el orden de las operaciones, no que otra composición de tanda dé los mismos bits; el lote de 17 de `e5_golden` lo ejerce. Si los bits se mueven, hay que decidir entre reescribir la fixture o tolerancia. No sirve para el re-embeber (infiere de a una fila), así que lo gana 17 si ese cambio agrupa.
 
-**Pasó a [docs-index-speed](../archive/2026-11-01-docs-index-speed/proposal.md) (95)**, como sus pasos A1 y A2, con la puerta que lee el relleno medido por [docs-index-cost](../archive/2026-10-31-docs-index-cost/proposal.md) (94). Si los bits se mueven, se reescribe la fixture.
+**Pasó a [docs-index-speed](../2026-11-01-docs-index-speed/proposal.md) (95)**, como sus pasos A1 y A2, con la puerta que lee el relleno medido por [docs-index-cost](../2026-10-31-docs-index-cost/proposal.md) (94). Si los bits se mueven, se reescribe la fixture.
 
 ### E. Codificar una sola vez en `split_save`, y/o `spawn_blocking` sobre un tamaño
 

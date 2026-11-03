@@ -1,6 +1,6 @@
 # search-arm-timing — Especificación
 
-Delta sobre R14 de [`specs/metrics`](../../specs/metrics/spec.md). La serie sigue siendo `search.duration` (`us`) con `arm` en `knn_memory`, `knn_episodic`, `knn_skill`, `lexical`, `identifiers` y `total`; cambia qué mide cada brazo y cómo esperan los brazos su turno en la conexión. `total`, `search.knn_retry`, los resultados y su orden no cambian.
+Delta sobre R14 de [`specs/metrics`](../../../specs/metrics/spec.md). La serie sigue siendo `search.duration` (`us`) con `arm` en `knn_memory`, `knn_episodic`, `knn_skill`, `lexical`, `identifiers` y `total`; cambia qué mide cada brazo y cómo esperan los brazos su turno en la conexión. `total`, `search.knn_retry`, los resultados y su orden no cambian.
 
 ## A1. Cada brazo mide su ejecución en el hilo de la conexión
 
@@ -34,7 +34,7 @@ La búsqueda MUST mandar cada llamada a la conexión después de que volvió la 
 
 ## A3. El nombre y lo que se registra, como antes
 
-Las mismas búsquedas MUST registrar los mismos brazos bajo `search.duration`, y `search.knn_retry` igual que antes. Los docs MUST decir qué mide un brazo y que hasta 0.73.0 cada brazo incluía la espera en la cola, la de sus hermanos incluida, y que `clawg metrics report --by version` separa las dos.
+Las mismas búsquedas MUST registrar los mismos brazos bajo `search.duration`, y `search.knn_retry` igual que antes. Los docs MUST decir qué mide un brazo y que hasta 0.72.2 cada brazo incluía la espera en la cola, la de sus hermanos incluida, y que `clawg metrics report --by version` separa las dos.
 
 **Tests:** `a_search_records_how_long_each_arm_took`, `a_widened_window_is_counted_by_its_table` (`search.rs`); `a_search_without_a_language_has_no_count`, que cuenta las búsquedas por `total` (`crates/clawg-cli/tests/api.rs`). Pasan hoy y después: fijan lo que no cambia.
 
