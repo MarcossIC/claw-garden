@@ -304,7 +304,8 @@ mod tests {
 
     #[test]
     fn a_chain_out_of_shape_is_refused() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+        type Break = (&'static str, Box<dyn Fn(&mut Value)>);
+        let cases: Vec<Break> = vec![
             ("2 or 3 versions", Box::new(|s: &mut Value| {
                 s["chains"][0]["versions"].as_array_mut().unwrap().truncate(1);
             })),

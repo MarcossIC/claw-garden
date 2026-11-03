@@ -2035,8 +2035,9 @@ mod tests {
 
         // Fetch all rows ordered by id
         let conn = store.conn.clone();
-        let rows: Vec<(i64, String, Option<String>, i64)> = conn
-            .call(|c| -> Result<Vec<(i64, String, Option<String>, i64)>, rusqlite::Error> {
+        type Row = (i64, String, Option<String>, i64);
+        let rows: Vec<Row> = conn
+            .call(|c| -> Result<Vec<Row>, rusqlite::Error> {
                 let mut stmt = c.prepare(
                     "SELECT id, status, disputed_against, access_count FROM memory ORDER BY id ASC"
                 )?;

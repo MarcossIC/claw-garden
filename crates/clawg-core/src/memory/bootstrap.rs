@@ -2103,11 +2103,13 @@ mod tests {
         assert_eq!(secs(u32::MAX), 1800);
     }
 
+    type Waits = Arc<Mutex<Vec<(std::time::Duration, EmbedderStatus)>>>;
+
     /// Records each requested wait and the status visible during it, and
     /// returns at once so the test does not sleep.
     fn recording_sleep(
         status: watch::Receiver<EmbedderStatus>,
-    ) -> (Arc<Mutex<Vec<(std::time::Duration, EmbedderStatus)>>>, impl Fn(std::time::Duration) -> futures::future::Ready<()>) {
+    ) -> (Waits, impl Fn(std::time::Duration) -> futures::future::Ready<()>) {
         let waits = Arc::new(Mutex::new(Vec::new()));
         let recorded = waits.clone();
         let sleep = move |d| {

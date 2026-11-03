@@ -347,7 +347,9 @@ pub(crate) mod tests {
 
     #[test]
     fn plan_word_windows_with_every_start_marked_keeps_a_fixed_stride() {
-        let table: [(usize, usize, usize, &[(usize, usize)]); 7] = [
+        // (words, max, overlap, the windows)
+        type Case = (usize, usize, usize, &'static [(usize, usize)]);
+        let table: [Case; 7] = [
             (0, 480, 64, &[]),
             (1, 480, 64, &[(0, 1)]),
             (480, 480, 64, &[(0, 480)]),

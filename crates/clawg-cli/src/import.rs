@@ -471,10 +471,12 @@ async fn follow(
     }
 }
 
+type Targets = Vec<(String, MapTarget)>;
+
 /// What the maps send: each path as its root and the path itself, which a
 /// declared subfolder leads to its project, as a bridge resolves its own; a
 /// project by the reference given, which the daemon resolves.
-fn targets(maps: Maps<'_>) -> (Vec<(String, MapTarget)>, Vec<(String, MapTarget)>) {
+fn targets(maps: Maps<'_>) -> (Targets, Targets) {
     let folder = |path: &Path| {
         let identity = ProjectIdentity::resolve(path);
         MapTarget::Folder {

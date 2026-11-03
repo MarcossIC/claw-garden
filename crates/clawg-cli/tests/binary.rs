@@ -1078,8 +1078,9 @@ impl DaemonWithoutJobs {
         use axum::extract::{Request, State};
         use axum::middleware::{from_fn_with_state, Next};
         use axum::response::Response;
+        type Requests = Arc<Mutex<Vec<(String, String)>>>;
         let requests = Arc::new(Mutex::new(Vec::new()));
-        async fn note(State(requests): State<Arc<Mutex<Vec<(String, String)>>>>, request: Request, next: Next) -> Response {
+        async fn note(State(requests): State<Requests>, request: Request, next: Next) -> Response {
             let (parts, body) = request.into_parts();
             let body = axum::body::to_bytes(body, 1 << 20).await.expect("the request body");
             let line = format!("{} {}", parts.method, parts.uri.path());
@@ -2411,11 +2412,12 @@ async fn store_behind(sandbox: &Sandbox) -> (PathBuf, Daemon) {
 const UNCAUSED_SCHEMA: i32 = 16;
 
 type Row = (i64, String, String, Option<i64>, Option<String>, bool);
+type Seed = (i64, &'static str, &'static str, Option<i64>, Option<&'static str>, bool);
 
 /// `(id, content, status, superseded_by, topic_key, deleted)`. 2 revised 1;
 /// 4 revised 3 until a verdict undid it; 6 won a verdict over 5; 8 revised 7
 /// and was deleted.
-const UNCAUSED_ROWS: [(i64, &str, &str, Option<i64>, Option<&str>, bool); 8] = [
+const UNCAUSED_ROWS: [Seed; 8] = [
     (1, "storage engine is SQLite", "superseded", Some(2), Some("storage/engine"), false),
     (2, "storage engine moved to Postgres", "active", None, Some("storage/engine"), false),
     (3, "the daemon listens on port 27380", "active", None, Some("api/port"), false),

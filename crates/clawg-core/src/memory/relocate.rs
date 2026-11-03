@@ -361,6 +361,11 @@ pub(crate) fn read_units_in(
     Ok(units)
 }
 
+/// A live row of the unit and the row of the target with its text.
+type Twin = (i64, i64);
+/// A live row of the unit, its key and the row of the target that holds it.
+type Holder = (i64, String, i64);
+
 /// The first live row of the target holding the text, and the first holding
 /// the key, of a live row of `rows`.
 fn clashes_in(
@@ -368,7 +373,7 @@ fn clashes_in(
     rows: &[UnitRow],
     target: Option<&str>,
     reach: Option<&str>,
-) -> rusqlite::Result<(Option<(i64, i64)>, Option<(i64, String, i64)>)> {
+) -> rusqlite::Result<(Option<Twin>, Option<Holder>)> {
     let ids: HashSet<i64> = rows.iter().map(|r| r.id).collect();
     let mut twin = None;
     let mut holder = None;
