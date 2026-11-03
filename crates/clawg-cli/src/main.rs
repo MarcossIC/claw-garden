@@ -34,20 +34,15 @@ use clawg_cli::restore;
 use clawg_cli::running::Running;
 use clawg_cli::secrets;
 use clawg_cli::setup;
-use clawg_cli::preferences;
+use clawg_cli::preferences::{self, language};
 use clawg_cli::sharing;
 use clawg_cli::status;
 use clawg_cli::stop;
 use clawg_cli::undelete;
 use clawg_cli::update;
 use clawg_core::memory::embedder::keep_one_malloc_arena;
-use clawg_core::memory::identity::Disk;
-use clawg_core::memory::portability::export::project_id_of;
-use clawg_core::memory::portability::ExportFilter;
-use clawg_core::memory::ProjectIdentity;
 use clawg_core::memory::secrets::{mask_reasons, purge, purge_delete, scan};
 use clawg_core::paths::data_dir;
-use clawg_core::preferences::{language_in, Lang};
 
 /// Exit code for "the command ran and failed", as opposed to clap's `2` for
 /// "the command was never valid".
@@ -101,12 +96,6 @@ fn main() -> ExitCode {
         runtime.shutdown_timeout(serve::RUNTIME_TEARDOWN);
     }
     code
-}
-
-/// The language a command speaks to the user in: the profile's preference,
-/// read once, and English without one.
-fn language(base_dir: &std::path::Path) -> Lang {
-    language_in(base_dir).unwrap_or(Lang::En)
 }
 
 /// The profile's daemon, found running, for a command that never starts one.
@@ -179,17 +168,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
         }
 
         Command::Export { out, project, agent, include_deleted, format, profile } => {
-            let profile = profile.resolve()?;
-            let base_dir = data_dir(profile)?;
-            let project_id = match project {
-                Some(path) => {
-                    let identity = ProjectIdentity::resolve(&path);
-                    Some(project_id_of(&base_dir, &identity.root, Some(&identity.path), &Disk)?)
-                }
-                None => None,
-            };
-            let filter = ExportFilter { project_id, agent, include_deleted };
-            println!("{}", export::run(language(&base_dir), &base_dir, &out, &filter, format, now_ms() as i64).map_err(CliError::Failed)?);
+            let base_dir = data_dir(profile.resolve()?)?;
+            println!("{}", export::command(&base_dir, &out, project.as_deref(), agent, include_deleted, format)?);
             Ok(ExitCode::SUCCESS)
         }
 
