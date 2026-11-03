@@ -983,7 +983,7 @@ mod tests {
         assert!(two.contains("\nleft out 2 docs quoting a question: a/x.md, b/y.md\n"), "{two}");
     }
 
-    fn two_results<'a>(cases: &'a [DocsCase]) -> DocsResults {
+    fn two_results(cases: &[DocsCase]) -> DocsResults {
         let results = [
             CaseResult { case: &cases[0], rank: Some(2), top: Some("a.md > Otro".into()), code: false },
             CaseResult { case: &cases[1], rank: None, top: Some("src/b.rs".into()), code: true },
