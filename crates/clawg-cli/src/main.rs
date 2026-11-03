@@ -178,20 +178,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             // embeds each row; with none running, nothing is started.
             let daemon = running(&profile).await?;
             let maps = import::Maps { roots: &map_root, projects: &project_map };
-            let finished = match (undo, file) {
-                (Some(n), _) => import::undo(daemon.lang, &daemon.client, n, dry_run).await.map(import::Finished::done),
-                (None, Some(file)) => {
-                    // Before the daemon is asked, so a Ctrl-C meanwhile waits for the job.
-                    let mut interrupts = import::interrupts();
-                    let watch = import::Watch::new(follow);
-                    import::run(daemon.lang, &daemon.client, &file, from, dry_run, agent.as_deref(), maps, watch, &mut interrupts).await
-                }
-                (None, None) => return Err(CliError::Failed("name the file to import, or --undo N".into())),
-            }
-            .map_err(|e| match e {
-                import::ImportError::Client(e) => daemon.unavailable(e),
-                other => other.into(),
-            })?;
+            let finished =
+                import::command(&daemon, file.as_deref(), undo, from, dry_run, follow, agent.as_deref(), maps).await?;
             if !finished.out.is_empty() {
                 println!("{}", finished.out);
             }
