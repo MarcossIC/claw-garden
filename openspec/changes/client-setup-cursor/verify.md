@@ -8,7 +8,7 @@ En Linux x86_64, build debug, toolchain 1.99.1, sobre `813e856`, el último comm
 - `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también.
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin bendecir: lo que ve el modelo no cambió.
 - Los tests de `setup claude-code` (`setup.rs` y los tres de `tests/binary.rs`) y los de `clawg hook` que ya existían pasan sin cambiar lo que esperan; sólo se les sumó el cliente donde construyen un `Command::Hook` o llaman a `respond` o a `envelope`.
-- Windows queda para el CI del pull request: ahí `Shell::HOST` es PowerShell (`crates/clawg-cli/src/setup/cursor.rs:46`) y `setup_cursor_installs_and_remove_undoes_it` escribe la línea con `& "<ruta>"`.
+- En Windows, el CI del pull request (`windows-latest`, sobre `1f51c7a`, cuyo código es el de `813e856`) pasa los dos clippy y `cargo test --locked --workspace` sin ningún arreglo. Ahí `Shell::HOST` es PowerShell (`crates/clawg-cli/src/setup/cursor.rs:46`) y `setup_cursor_installs_and_remove_undoes_it` escribe la línea con `& "<ruta>"`; `the_installed_cursor_hook_runs_through_a_shell` es sólo de Unix, así que nada corrió esa línea por PowerShell.
 
 ## Los tests en rojo
 
@@ -79,4 +79,4 @@ Con Cursor instalado (3.28 o posterior), el perfil `dev`, un build de desarrollo
 
 ## Veredicto
 
-Sin CRITICAL en Linux. Los siete puntos de arriba quedan como WARNING hasta la verificación local con Cursor real.
+Sin CRITICAL en Linux ni en el CI de Windows. Los siete puntos de arriba quedan como WARNING hasta la verificación local con Cursor real.

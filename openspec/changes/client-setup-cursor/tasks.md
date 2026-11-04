@@ -42,5 +42,5 @@ Sin conducta nueva: los tests de `setup.rs` pasan sin cambiar lo que esperan.
 
 - [x] `cargo test --workspace` y `cargo clippy --workspace --all-targets -- -D warnings` en Linux, sobre el último commit.
 - [x] `verify.md`, con lo que queda pendiente en local con Cursor real; `state.yaml`, la fila 115 de `openspec/README.md` y la línea de `openspec/ROADMAP.md`.
-- [ ] El CI del pull request en Windows, y lo que marque, arreglado.
+- [x] El CI del pull request en Windows, y lo que marque, arreglado: pasó sin ningún arreglo.
 - Commit: `docs(openspec): record client-setup-cursor applied`

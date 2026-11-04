@@ -9,6 +9,6 @@ artifacts:
   design: skipped  # las decisiones se cerraron en la exploración
   tasks: done
   apply: done  # un commit por paso: el refactor de lo común, el hook y setup cursor, con sus tests en rojo antes
-  verify: pending  # Linux hecho (suite y clippy, verify.md); faltan Windows en el CI del pull request y lo de Cursor real, en local
+  verify: pending  # Linux y el CI de Windows pasan (verify.md); falta lo de Cursor real, en local
   archive: pending
 updated: 2026-11-04
