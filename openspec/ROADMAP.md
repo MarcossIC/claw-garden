@@ -26,7 +26,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 ## Antes de la primera noche (a mano)
 
 - Apagar en Cursor "Include Third-Party Plugins, Skills, and Other Configs" (Settings → Agents → Third-Party Imports). En Windows, los hooks `.sh` de un plugin de Claude Code abren una ventana de Git Bash. Va antes de instalar cualquier hook de clawg.
-- Archivar cli-dispatch y publicar lo que hay en `develop`.
+- Publicar lo que hay en `develop`.
 
 ## Noche 1
 

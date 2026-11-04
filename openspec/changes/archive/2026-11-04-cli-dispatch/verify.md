@@ -7,7 +7,7 @@ En Linux x86_64, build debug, toolchain 1.99.1, sobre `2aed17a`, el último comm
 - `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también. El `#[expect(clippy::too_many_arguments)]` de `import::command` se cumple.
 - `cargo test --workspace --no-fail-fast` pasa. Contra la base (`a7f7337`, corrida antes del primer commit), los mismos ignorados; lo que se suma son los tests de la [spec](spec.md) y `a_command_speaks_english_without_a_readable_preference` (`preferences.rs`).
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin bendecir: lo que ve el modelo no cambió.
-- Windows queda para el CI del pull request, que compila el código `cfg(windows)`: `user_path::command`, que reemplaza a `run_path` de `main.rs`.
+- Windows lo corrió después el CI del pull request, que compila el código `cfg(windows)`: `user_path::command`, que reemplaza a `run_path` de `main.rs`. Ver «Al archivar».
 
 ## `tests/binary.rs`
 
@@ -42,7 +42,9 @@ Sólo se normalizan la hora de cada línea de log, los números de cuatro cifras
 
 `dispatch` pasó de 445 a 172 líneas y `main.rs` de 612 a 289; `.map_err(|e| e.to_string())` ya no aparece en `main.rs`.
 
-## Lo que queda
+## Al archivar (2026-11-04)
 
-- El CI del pull request en `windows-latest`.
-- Archivar y subir la versión, fuera de este cambio.
+- **Windows ya se midió.** El job `test (windows-latest)` del CI de #123 pasó sobre `34ce9d4`, la punta del pull request, que contiene `2aed17a`. Ese job compila el código `cfg(windows)` y corre los dos clippy y la suite.
+- **El código sigue diciendo lo mismo.** `develop` se movió después de esta verificación, así que se comprobó otra vez sobre `592a6e0`: cada test que nombra la spec sigue en su archivo, `git diff a7f7337 592a6e0 -- crates/clawg-cli/tests/binary.rs` sale vacío, `dispatch` devuelve `Result<ExitCode, CliError>` (`crates/clawg-cli/src/main.rs:118`), `main` imprime el error en `:76-85`, y en `main.rs` no aparece `.map_err(|e| e.to_string())`. La suite y los dos clippy de ese commit los corre el CI de #126; este registro no los repite en local porque archivar no cambia código.
+- **CD1 a CD4 en las specs.** Pasan a [`specs/quality`](../../../specs/quality/spec.md) como reglas de ahora, sin lo que sólo valía para este cambio: los «fallan hoy», los «como hoy» y la cuenta de 13 comandos, que quedaría vieja con la próxima acción. Dos cosas se agregan al consolidar, porque el código ya las hace y CD2 las contradecía o las callaba: las negativas que la propuesta dejó fuera de alcance siguen sólo en inglés, y `export` y `secrets` leen el idioma después del paso que puede fallar. De las invariantes, la de `tests/binary.rs` se cumplió una vez y queda en el «Origen», y la del contrato ya la fija R1.
+- **La versión sube a 0.75.0.** El bump a 0.74.0 (`152502a`) se hizo en paralelo y no contiene este código: `git merge-base --is-ancestor 2aed17a 152502a` falla, y las dos líneas se juntan en `78ed0a6`. Así que no aplica la excepción de una versión sin publicar que ya trae el código, aunque 0.74.0 no tenga tag. Subirla en `develop` no publica nada, porque publica el merge a `main`, y 0.74.0 no llega a salir.

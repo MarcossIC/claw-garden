@@ -65,4 +65,4 @@ Cada uno: el test de la tabla de CD4 primero, después la función del comando y
 - [x] `git diff a7f7337 -- crates/clawg-cli/tests/binary.rs` vacío.
 - [x] El binario de `a7f7337` y el del último commit, sobre los mismos 244 casos en un home temporal con el embedder falso, sin preferencia, en `en`, en `es` y con un `preferences.json` inválido: misma salida, mismo stderr, mismo código ([verify](verify.md)).
 - [x] La suite y los dos clippy en Linux.
-- [ ] Windows, por el CI del pull request.
+- [x] Windows, por el CI del pull request ([verify](verify.md#al-archivar-2026-11-04)).

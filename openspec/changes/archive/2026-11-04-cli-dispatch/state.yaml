@@ -1,7 +1,8 @@
 change: cli-dispatch
 objective: "transversal"
 depends_on: []
-phase: verify
+phase: archived
+release: "0.75.0"  # el bump a 0.74.0 (152502a) no trae su código, así que al archivar la versión sube (verify.md, «Al archivar»)
 artifacts:
   exploration: done
   proposal: done  # enfoque A; un error se traduce en el módulo del comando, con su explain
@@ -9,7 +10,7 @@ artifacts:
   design: skipped  # las alternativas están en la exploración (A, B, C) y en la decisión 2 de la propuesta
   tasks: done
   apply: done  # un commit por comando que se mudó, después de status, CliError, stop y Running
-  verify: done  # Linux: suite, los dos clippy y el binario de antes contra el de después en 244 casos; Windows en el CI del pull request
-  archive: pending
+  verify: done  # Linux: suite, los dos clippy y el binario de antes contra el de después en 244 casos; Windows: el CI de #123
+  archive: done
 main_spec: openspec/specs/quality/spec.md
-updated: 2026-11-03
+updated: 2026-11-04

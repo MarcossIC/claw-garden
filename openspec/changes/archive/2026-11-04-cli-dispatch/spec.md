@@ -1,12 +1,12 @@
 # cli-dispatch — Especificación
 
-Cómo se organiza por dentro el despacho de los comandos de `clawg`. Ningún comando cambia de conducta: lo que dice está en las specs de cada dominio ([`specs/doctor`](../../specs/doctor/spec.md), [`specs/portability`](../../specs/portability/spec.md), [`specs/secrets`](../../specs/secrets/spec.md), [`specs/preferences`](../../specs/preferences/spec.md) y las demás), y esas specs no cambian. Al archivar, estos requisitos se suman a [`specs/quality`](../../specs/quality/spec.md).
+Cómo se organiza por dentro el despacho de los comandos de `clawg`. Ningún comando cambia de conducta: lo que dice está en las specs de cada dominio ([`specs/doctor`](../../../specs/doctor/spec.md), [`specs/portability`](../../../specs/portability/spec.md), [`specs/secrets`](../../../specs/secrets/spec.md), [`specs/preferences`](../../../specs/preferences/spec.md) y las demás), y esas specs no cambian. Al archivar, estos requisitos se suman a [`specs/quality`](../../../specs/quality/spec.md).
 
 ## Definiciones
 
 - **Lo común:** lo que un comando necesita antes de hacer lo suyo y que comparte con otros: su perfil, su directorio de datos, su idioma y, si lo necesita, el daemon corriendo.
 - **Función del comando:** la función de su módulo en `clawg_cli` a la que `dispatch` le pasa lo común y los argumentos del comando, y que devuelve lo que se imprime o el error.
-- **Frase compuesta:** un texto que clawg arma para la persona, en el idioma del comando ([`specs/preferences`](../../specs/preferences/spec.md)): la que enmarca un fallo, una negativa o un informe.
+- **Frase compuesta:** un texto que clawg arma para la persona, en el idioma del comando ([`specs/preferences`](../../../specs/preferences/spec.md)): la que enmarca un fallo, una negativa o un informe.
 
 ## CD1. El texto de un error es el de antes
 
@@ -26,7 +26,7 @@ Cómo se organiza por dentro el despacho de los comandos de `clawg`. Ningún com
 
 ## CD2. La frase que enmarca un fallo la compone el módulo del comando
 
-Cuando un comando dice un fallo con palabras propias, la frase MUST componerla una función pura de su módulo que recibe el idioma del comando, y MUST NOT componerla `main` ni `dispatch`. La causa técnica MUST ir tal cual dentro de la frase, como pide [`specs/preferences`](../../specs/preferences/spec.md). Los 13 comandos que necesitan el daemon y no lo arrancan (`import`, `undelete`, `outbox`, `projects` y `memories`) MUST decir que no lo encontraron con `memories::explain_unavailable`, a través de un solo lugar.
+Cuando un comando dice un fallo con palabras propias, la frase MUST componerla una función pura de su módulo que recibe el idioma del comando, y MUST NOT componerla `main` ni `dispatch`. La causa técnica MUST ir tal cual dentro de la frase, como pide [`specs/preferences`](../../../specs/preferences/spec.md). Los 13 comandos que necesitan el daemon y no lo arrancan (`import`, `undelete`, `outbox`, `projects` y `memories`) MUST decir que no lo encontraron con `memories::explain_unavailable`, a través de un solo lugar.
 
 #### Escenario: `stop` sin daemon
 - GIVEN un directorio de datos sin daemon
