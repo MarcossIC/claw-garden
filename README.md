@@ -10,6 +10,7 @@ Memoria local para agentes de código. Claw Garden guarda, clasifica y recupera 
 - [Comprobar que funciona](#comprobar-que-funciona)
 - [Ver lo que se guarda](#ver-lo-que-se-guarda)
 - [Conectarlo a Claude Code](#conectarlo-a-claude-code)
+- [Conectarlo a Cursor](#conectarlo-a-cursor)
 - [Otros clientes MCP](#otros-clientes-mcp)
 - [Si algo falla](#si-algo-falla)
 - [Desinstalar](#desinstalar)
@@ -427,22 +428,45 @@ La primera vez que se abre la segunda copia, lo que había guardado en ella pasa
 
 Para unir a mano dos proyectos que clawg no relaciona (un repo que cambió de remoto, un fork), está `clawg projects move --from-project <id> --to <ruta>`.
 
+## Conectarlo a Cursor
+
+Un solo comando conecta clawg a Cursor:
+
+```powershell
+clawg setup cursor --profile prod
+```
+
+Hace dos cosas, y se puede repetir sin miedo:
+
+1. **Registra el servidor MCP** en `~/.cursor/mcp.json`, con la ruta completa del `clawg` que corriste y la identidad del agente fijada en `--agent cursor` (ver [Fijar la identidad del agente](#fijar-la-identidad-del-agente)). Los otros servidores del archivo no se tocan.
+2. **Instala el hook de inicio de sesión** (`sessionStart`) en `~/.cursor/hooks.json`: cada chat nuevo recibe la memoria del proyecto. Cursor corre los hooks de usuario en `~/.cursor`, así que el proyecto sale de la carpeta abierta en la ventana, nunca del directorio donde corre el hook. Si la ventana tiene varias carpetas, o ninguna, el hook no adivina: no inyecta memoria, sólo la línea del idioma si elegiste uno. En Windows la línea del hook está escrita para PowerShell, que es como Cursor la corre, también con espacios en la ruta.
+
+No instala un recordatorio de guardar, porque el hook de Cursor antes de cada mensaje no puede agregar contexto, ni un archivo de reglas: Cursor ya recibe las instrucciones del servidor MCP.
+
+Como `setup claude-code`, guarda una copia de cada archivo en `~/.clawg/backups/setup/` antes de cambiarlo, y con `--dry-run` muestra lo que haría sin tocar nada. Lo que no coincide con lo que instalaría (un `clawg` registrado con otro comando, otro hook de clawg en `sessionStart`) no lo reemplaza: lo dice y sale con 1. Para rehacerlo, `clawg setup cursor --remove --profile prod` y otra vez `clawg setup cursor --profile prod`.
+
+**Apagá la configuración de terceros de Cursor.** "Include Third-Party Plugins, Skills, and Other Configs" (Settings → Agents → Third-Party Imports) viene encendido y hace que Cursor también cargue los hooks de `~/.claude/settings.json` y los plugins de Claude Code; en Windows, un hook `.sh` de un plugin abre una ventana de Git Bash. clawg no puede leer ese ajuste, así que `setup cursor` lo recuerda cada vez. Si queda encendido, el hook que instaló `clawg setup claude-code` no hace nada cuando lo corre Cursor.
+
+Después **reiniciá Cursor**, abrí un chat y pedile al agente que use la herramienta `memory_status`: dice qué agente está en uso (`cursor`) y qué perfil.
+
+La configuración sigue la documentación de Cursor 3.28. Falta comprobarla con Cursor instalado: que el hook corra en Windows sin abrir una ventana y que la memoria llegue al agente.
+
 ## Otros clientes MCP
 
-Cualquier cliente que acepte servidores MCP por stdio sirve: hay que darle el comando y sus argumentos. En los que se configuran con un JSON del estilo `mcpServers` (por ejemplo Cursor), sería:
+Cualquier cliente que acepte servidores MCP por stdio sirve: hay que darle el comando y sus argumentos, con un `--agent` fijo para ese cliente (ver [Fijar la identidad del agente](#fijar-la-identidad-del-agente)). En los que se configuran con un JSON del estilo `mcpServers`, sería:
 
 ```json
 {
   "mcpServers": {
     "clawg": {
       "command": "C:\\Users\\<tu-usuario>\\AppData\\Local\\Programs\\clawg\\clawg.exe",
-      "args": ["mcp", "--profile", "prod"]
+      "args": ["mcp", "--profile", "prod", "--agent", "<cliente>"]
     }
   }
 }
 ```
 
-El camino probado hoy es Claude Code. La configuración de otros clientes sigue el estándar MCP, pero no está verificada con cada uno.
+A Claude Code y a Cursor los conecta `clawg setup`. La configuración de otros clientes sigue el estándar MCP, pero no está verificada con cada uno.
 
 ## Si algo falla
 
@@ -488,10 +512,11 @@ Algún hallazgo es `error`: otro `clawg.exe` en el PATH que gana o una copia dup
 clawg stop --profile prod
 clawg path remove --dir "$env:LOCALAPPDATA\Programs\clawg"
 clawg setup claude-code --remove --profile prod
+clawg setup cursor --remove --profile prod
 Remove-Item -Recurse "$env:LOCALAPPDATA\Programs\clawg"
 ```
 
-Esto, en orden: detiene el daemon, saca la carpeta del PATH, quita de Claude Code el servidor, los hooks y el protocolo que instaló `clawg setup` (si lo corriste) y borra el binario.
+Esto, en orden: detiene el daemon, saca la carpeta del PATH, quita de Claude Code y de Cursor el servidor, los hooks y el protocolo que instaló `clawg setup` (si lo corriste) y borra el binario.
 
 Tus memorias **no se borran**: viven en `~/.clawg`. Si también querés eliminarlas, borrá esa carpeta a mano.
 
@@ -522,6 +547,7 @@ clawg import --from engram e.json --profile dev   # las notas de otra herramient
 clawg import --from claude-code ~/.claude/projects --profile dev   # la memoria propia de Claude Code
 clawg import --undo 3 --profile dev       # deshace la importación 3 y conserva lo que cambió desde entonces (--dry-run)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
+clawg setup cursor --profile dev        # conecta Cursor: servidor MCP y hook de inicio de sesión (--dry-run, --remove)
 clawg metrics report --metric http.duration --label route=/v1/search --by version   # latencias y memoria del daemon (--by day|hour, --since 7d)
 ```
 

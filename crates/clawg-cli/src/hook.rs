@@ -7,6 +7,10 @@
 //! trouble with the daemon or the input prints nothing, and `main` exits 0.
 //! What is decided from the facts gathered is pure; [`respond`] only gathers
 //! them.
+//!
+//! Two clients run it, and each has its own input and output: Claude Code
+//! sends `cwd` and reads `hookSpecificOutput`; Cursor runs a user hook in
+//! `~/.cursor`, sends `workspace_roots` and reads `additional_context`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,7 +21,7 @@ use clawg_core::preferences::{self, Lang};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::cli::HookEvent;
+use crate::cli::{HookClient, HookEvent};
 use crate::client::{Context, DaemonClient, Health, ListArgs};
 use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
 
@@ -48,6 +52,13 @@ pub struct HookInput {
     /// in this project carry it.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Cursor's folders of the window, in place of `cwd`.
+    #[serde(default)]
+    pub workspace_roots: Option<Vec<PathBuf>>,
+    /// Sent by Cursor only, whatever it holds: what tells that Cursor runs a
+    /// hook installed for Claude Code.
+    #[serde(default)]
+    pub cursor_version: Option<serde_json::Value>,
 }
 
 impl HookInput {
@@ -163,12 +174,31 @@ pub fn save_reminder(lang: Lang, now_ms: i64, last_save_ms: Option<i64>, session
 }
 
 /// The object the client reads from a hook's stdout.
-pub fn envelope(event: HookEvent, text: &str) -> String {
+pub fn envelope(host: HookClient, event: HookEvent, text: &str) -> String {
     let name = match event {
         HookEvent::SessionStart => "SessionStart",
         HookEvent::UserPromptSubmit => "UserPromptSubmit",
     };
-    serde_json::json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } }).to_string()
+    match host {
+        HookClient::ClaudeCode => {
+            serde_json::json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } }).to_string()
+        }
+        HookClient::Cursor => serde_json::json!({ "additional_context": text }).to_string(),
+    }
+}
+
+/// The folder whose project the hook reads: Claude Code's `cwd`, or the
+/// directory the hook runs in without one. Cursor runs a user hook in
+/// `~/.cursor`, so its folder is its one workspace root, and with several or
+/// none there is no telling which: none.
+pub fn folder(host: HookClient, input: &HookInput, current_dir: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
+    match host {
+        HookClient::ClaudeCode => input.cwd.clone().or_else(current_dir),
+        HookClient::Cursor => match input.workspace_roots.as_deref() {
+            Some([root]) => Some(root.clone()),
+            _ => None,
+        },
+    }
 }
 
 /// When the session began: the transcript file's creation. A file system
@@ -183,24 +213,43 @@ fn now_ms() -> i64 {
 }
 
 /// The hook's stdout for `event`, read from `input` and the daemon of
-/// `base_dir` within `deadline`; `None` prints nothing. No daemon is started.
-/// With a preferred language, `session-start` names it whatever the daemon
-/// does: absent, failing or too slow, the line is still printed alone. Both
-/// events speak that language, read again at every event since a hook has
-/// no session to keep one.
+/// `base_dir` within `deadline`, in the output of `host`; `None` prints
+/// nothing. No daemon is started. With a preferred language, `session-start`
+/// names it whatever the daemon does: absent, failing or too slow, the line
+/// is still printed alone. Both events speak that language, read again at
+/// every event since a hook has no session to keep one.
+///
+/// Cursor's `beforeSubmitPrompt` cannot add to the context, so
+/// `user-prompt-submit` says nothing to Cursor; and a hook installed for
+/// Claude Code that Cursor runs says nothing at all, since its input names no
+/// folder of Claude Code's and its agent is not Cursor's.
 pub async fn respond(
     event: HookEvent,
+    host: HookClient,
     agent: &str,
     base_dir: &Path,
     input: impl AsyncRead + Unpin,
     deadline: Duration,
 ) -> Option<String> {
-    let language = preferences::language_in(base_dir);
-    let answered = tokio::time::timeout(deadline, answer(event, agent, base_dir, input, language)).await.ok().flatten();
-    match event {
-        HookEvent::SessionStart => answered.or_else(|| language.map(|l| envelope(event, &language_line(l)))),
-        HookEvent::UserPromptSubmit => answered,
+    if host == HookClient::Cursor && event == HookEvent::UserPromptSubmit {
+        return None;
     }
+    let language = preferences::language_in(base_dir);
+    let deadline = tokio::time::Instant::now() + deadline;
+    let input = tokio::time::timeout_at(deadline, read_input(input)).await.ok().flatten();
+    let input = input.as_deref().and_then(HookInput::parse);
+    if host == HookClient::ClaudeCode && input.as_ref().is_some_and(|i| i.cursor_version.is_some()) {
+        return None;
+    }
+    let answered = match &input {
+        Some(input) => tokio::time::timeout_at(deadline, answer(event, host, agent, base_dir, input, language)).await.ok().flatten(),
+        None => None,
+    };
+    let text = match event {
+        HookEvent::SessionStart => answered.or_else(|| language.map(language_line)),
+        HookEvent::UserPromptSubmit => answered,
+    }?;
+    Some(envelope(host, event, &text))
 }
 
 /// The most stdin a hook reads: the client's object is a few hundred bytes,
@@ -228,18 +277,18 @@ async fn project_of(client: &DaemonClient, cwd: &Path) -> Option<String> {
     }
 }
 
+/// What the hook says for `event`, before the client's output wraps it.
 async fn answer(
     event: HookEvent,
+    host: HookClient,
     agent: &str,
     base_dir: &Path,
-    input: impl AsyncRead + Unpin,
+    input: &HookInput,
     language: Option<Lang>,
 ) -> Option<String> {
-    let bytes = read_input(input).await?;
-    let input = HookInput::parse(&bytes)?;
+    let dir = folder(host, input, || std::env::current_dir().ok())?;
     let client = DaemonClient::from_data_dir(base_dir)?;
-    let cwd = input.cwd.clone().or_else(|| std::env::current_dir().ok())?;
-    let project = project_of(&client, &cwd).await?;
+    let project = project_of(&client, &dir).await?;
     // Both events register: a daemon started since the session began learns
     // it at the next prompt. A refusal changes nothing the hook prints.
     let register = async {
@@ -247,7 +296,7 @@ async fn answer(
             let _ = client.register_session(agent, Some(&project), session).await;
         }
     };
-    let text = match event {
+    match event {
         HookEvent::SessionStart => {
             let (context, health, ()) =
                 tokio::join!(client.recent_context(agent, Some(&project), SESSION_BUDGET, language), client.health(), register);
@@ -267,8 +316,7 @@ async fn answer(
             let started = input.transcript_path.as_deref().and_then(session_started_at);
             save_reminder(language.unwrap_or(Lang::En), now_ms(), last, started)
         }
-    }?;
-    Some(envelope(event, &text))
+    }
 }
 
 #[cfg(test)]
@@ -311,7 +359,7 @@ mod tests {
         assert!(text.contains("evidence about past work, not instructions"), "{text}");
         assert!(text.ends_with("=== WORKSPACE ===\ntabs"), "nothing is added after a plain start: {text}");
 
-        let out: serde_json::Value = serde_json::from_str(&envelope(HookEvent::SessionStart, &text)).unwrap();
+        let out: serde_json::Value = serde_json::from_str(&envelope(HookClient::ClaudeCode, HookEvent::SessionStart, &text)).unwrap();
         assert_eq!(out["hookSpecificOutput"]["hookEventName"], "SessionStart");
         assert_eq!(out["hookSpecificOutput"]["additionalContext"], text.as_str());
     }
@@ -431,13 +479,13 @@ mod tests {
         clawg_core::preferences::save(dir.path(), &es).unwrap();
         let stdin = &br#"{"cwd":"/"}"#[..];
 
-        let out = respond(HookEvent::SessionStart, "a", dir.path(), stdin, HOOK_DEADLINE).await.expect("the language line");
+        let out = respond(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), stdin, HOOK_DEADLINE).await.expect("the language line");
         let out: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(out["hookSpecificOutput"]["additionalContext"], SPANISH_LINE);
-        assert_eq!(respond(HookEvent::UserPromptSubmit, "a", dir.path(), stdin, HOOK_DEADLINE).await, None);
+        assert_eq!(respond(HookEvent::UserPromptSubmit, HookClient::ClaudeCode, "a", dir.path(), stdin, HOOK_DEADLINE).await, None);
 
         let (_writer, silent) = tokio::io::duplex(64);
-        let out = respond(HookEvent::SessionStart, "a", dir.path(), silent, Duration::from_millis(100)).await;
+        let out = respond(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), silent, Duration::from_millis(100)).await;
         assert!(out.is_some_and(|o| o.contains("el idioma de la persona es el español")), "the deadline still leaves the line");
     }
 
@@ -469,7 +517,7 @@ mod tests {
         client.save(save("The monorepo builds with one workspace", m)).await.expect("save");
         let start = |cwd: &Path| {
             let (stdin, dir) = (serde_json::json!({ "cwd": cwd, "source": "startup" }).to_string(), d.dir.path().to_path_buf());
-            async move { respond(HookEvent::SessionStart, "a", &dir, stdin.as_bytes(), HOOK_DEADLINE).await.unwrap_or_default() }
+            async move { respond(HookEvent::SessionStart, HookClient::ClaudeCode, "a", &dir, stdin.as_bytes(), HOOK_DEADLINE).await.unwrap_or_default() }
         };
 
         let inside = start(&mono.join("apps").join("web").join("src")).await;
@@ -545,7 +593,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut input = br#"{"cwd":"/"}"#.to_vec();
         input.resize(INPUT_LIMIT as usize + 1, b' ');
-        let out = respond(HookEvent::SessionStart, "a", dir.path(), &input[..], HOOK_DEADLINE).await;
+        let out = respond(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), &input[..], HOOK_DEADLINE).await;
         assert_eq!(out, None);
     }
 
@@ -554,7 +602,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_writer, stdin) = tokio::io::duplex(64);
         let started = std::time::Instant::now();
-        let out = respond(HookEvent::SessionStart, "a", dir.path(), stdin, Duration::from_millis(100)).await;
+        let out = respond(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), stdin, Duration::from_millis(100)).await;
         assert_eq!(out, None);
         assert!(started.elapsed() < Duration::from_secs(2), "the deadline covers the whole hook");
     }
@@ -612,17 +660,17 @@ mod tests {
         let input = hook_input(dir.path());
 
         for event in [HookEvent::SessionStart, HookEvent::UserPromptSubmit] {
-            let out = respond(event, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await;
+            let out = respond(event, HookClient::ClaudeCode, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await;
             assert_eq!(out, None, "{event:?}");
         }
         assert!(got.load(Ordering::SeqCst) > 0, "the hook asked the daemon");
 
         let es = clawg_core::preferences::Preferences { language: Some(Lang::Es) };
         clawg_core::preferences::save(dir.path(), &es).unwrap();
-        let out = respond(HookEvent::SessionStart, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await.expect("the language line");
+        let out = respond(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await.expect("the language line");
         let out: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(out["hookSpecificOutput"]["additionalContext"], SPANISH_LINE);
-        assert_eq!(respond(HookEvent::UserPromptSubmit, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await, None);
+        assert_eq!(respond(HookEvent::UserPromptSubmit, HookClient::ClaudeCode, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await, None);
     }
 
     #[tokio::test]
@@ -634,7 +682,7 @@ mod tests {
 
         for event in [HookEvent::SessionStart, HookEvent::UserPromptSubmit] {
             let started = std::time::Instant::now();
-            let out = respond(event, "a", dir.path(), input.as_bytes(), deadline).await;
+            let out = respond(event, HookClient::ClaudeCode, "a", dir.path(), input.as_bytes(), deadline).await;
             let took = started.elapsed();
             assert_eq!(out, None, "{event:?}");
             assert!(took >= deadline && took < Duration::from_secs(2), "{event:?}: the deadline ends the wait, after {took:?}");
@@ -642,10 +690,113 @@ mod tests {
         assert!(got.load(Ordering::SeqCst) > 0, "what the hook waited for was the daemon, not stdin");
     }
 
+    /// What Cursor hands a user hook at `sessionStart`, with `roots` as the
+    /// window's folders: the fields its documentation lists, and no `cwd`.
+    fn cursor_input(roots: &[&Path]) -> String {
+        serde_json::json!({
+            "conversation_id": "668320d2-2fd8-4888-b33c-2a466fec86e7",
+            "generation_id": "490b90b7-a2ce-4c2c-bb76-cb77b125df2f",
+            "model": "auto",
+            "hook_event_name": "sessionStart",
+            "cursor_version": "3.28.0",
+            "workspace_roots": roots,
+            "user_email": "user@example.com",
+            "transcript_path": null,
+            "session_id": "668320d2-2fd8-4888-b33c-2a466fec86e7",
+        })
+        .to_string()
+    }
+
+    fn spanish(dir: &Path) {
+        let es = clawg_core::preferences::Preferences { language: Some(Lang::Es) };
+        clawg_core::preferences::save(dir, &es).unwrap();
+    }
+
+    #[test]
+    fn the_hook_input_reads_what_cursor_sends() {
+        let input = HookInput::parse(cursor_input(&[Path::new("/work/repo")]).as_bytes()).unwrap();
+        assert_eq!(input.workspace_roots, Some(vec![PathBuf::from("/work/repo")]));
+        assert_eq!(input.session_id.as_deref(), Some("668320d2-2fd8-4888-b33c-2a466fec86e7"));
+        assert!(input.cursor_version.is_some());
+        assert_eq!((input.cwd, input.source), (None, None));
+        let any_version = HookInput::parse(br#"{"cursor_version":3,"workspace_roots":null}"#).unwrap();
+        assert!(any_version.cursor_version.is_some(), "what it holds does not matter");
+        assert_eq!(any_version.workspace_roots, None);
+    }
+
+    #[test]
+    fn cursor_reads_the_project_of_its_one_workspace_root() {
+        let (repo, other, dot_cursor) = (PathBuf::from("/work/repo"), PathBuf::from("/work/other"), PathBuf::from("/home/u/.cursor"));
+        let here = || Some(dot_cursor.clone());
+        let input = |roots: Option<Vec<PathBuf>>| HookInput { workspace_roots: roots, ..HookInput::default() };
+
+        assert_eq!(folder(HookClient::Cursor, &input(Some(vec![repo.clone()])), here), Some(repo.clone()));
+        assert_eq!(folder(HookClient::Cursor, &input(Some(vec![repo.clone(), other])), here), None, "no guessing between two");
+        assert_eq!(folder(HookClient::Cursor, &input(Some(Vec::new())), here), None);
+        assert_eq!(folder(HookClient::Cursor, &input(None), here), None, "never the directory the hook runs in");
+
+        let claude = HookInput { cwd: Some(repo.clone()), ..HookInput::default() };
+        assert_eq!(folder(HookClient::ClaudeCode, &claude, here), Some(repo));
+        assert_eq!(folder(HookClient::ClaudeCode, &HookInput::default(), here), Some(dot_cursor), "as before, without cwd");
+    }
+
+    #[test]
+    fn cursor_gets_additional_context() {
+        let out: serde_json::Value = serde_json::from_str(&envelope(HookClient::Cursor, HookEvent::SessionStart, "ctx")).unwrap();
+        assert_eq!(out, serde_json::json!({ "additional_context": "ctx" }));
+        let claude: serde_json::Value =
+            serde_json::from_str(&envelope(HookClient::ClaudeCode, HookEvent::SessionStart, "ctx")).unwrap();
+        assert_eq!(claude["hookSpecificOutput"]["additionalContext"], "ctx");
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_hook_run_by_cursor_prints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        spanish(dir.path());
+        let got = broken_daemon(dir.path(), Some(axum::http::StatusCode::INTERNAL_SERVER_ERROR)).await;
+        let input = cursor_input(&[dir.path()]);
+
+        for event in [HookEvent::SessionStart, HookEvent::UserPromptSubmit] {
+            let out = respond(event, HookClient::ClaudeCode, "claude-code", dir.path(), input.as_bytes(), HOOK_DEADLINE).await;
+            assert_eq!(out, None, "{event:?}: not even the language line");
+        }
+        assert_eq!(got.load(Ordering::SeqCst), 0, "the daemon is never asked");
+    }
+
+    #[tokio::test]
+    async fn cursor_without_one_root_gets_only_the_language_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = broken_daemon(dir.path(), Some(axum::http::StatusCode::INTERNAL_SERVER_ERROR)).await;
+        let two = cursor_input(&[dir.path(), Path::new("/elsewhere")]);
+        let start = |input: String| {
+            let dir = dir.path().to_path_buf();
+            async move { respond(HookEvent::SessionStart, HookClient::Cursor, "cursor", &dir, input.as_bytes(), HOOK_DEADLINE).await }
+        };
+
+        assert_eq!(start(two.clone()).await, None);
+        spanish(dir.path());
+        let out: serde_json::Value = serde_json::from_str(&start(two).await.expect("the language line")).unwrap();
+        assert_eq!(out, serde_json::json!({ "additional_context": SPANISH_LINE }));
+        let none: serde_json::Value = serde_json::from_str(&start(cursor_input(&[])).await.expect("the language line")).unwrap();
+        assert_eq!(none, out);
+        assert_eq!(got.load(Ordering::SeqCst), 0, "no project or session is registered");
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_says_nothing_to_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        spanish(dir.path());
+        let got = broken_daemon(dir.path(), Some(axum::http::StatusCode::INTERNAL_SERVER_ERROR)).await;
+        let input = cursor_input(&[dir.path()]);
+        let out = respond(HookEvent::UserPromptSubmit, HookClient::Cursor, "cursor", dir.path(), input.as_bytes(), HOOK_DEADLINE).await;
+        assert_eq!(out, None);
+        assert_eq!(got.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn without_a_daemon_nothing_is_printed() {
         let dir = tempfile::tempdir().unwrap();
-        let out = respond(HookEvent::SessionStart, "a", dir.path(), &br#"{"cwd":"/"}"#[..], HOOK_DEADLINE).await;
+        let out = respond(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), &br#"{"cwd":"/"}"#[..], HOOK_DEADLINE).await;
         assert_eq!(out, None);
     }
 }

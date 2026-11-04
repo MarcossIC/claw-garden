@@ -275,13 +275,17 @@ pub enum Command {
         /// gets no client name, and another id would read another agent.
         #[arg(long, value_parser = parse_agent)]
         agent: String,
+        /// The client that runs the hook, whose input it reads and whose
+        /// output it prints.
+        #[arg(long, value_enum, default_value_t = HookClient::ClaudeCode)]
+        client: HookClient,
         #[command(flatten)]
         profile: ProfileArg,
     },
     /// Connect clawg to an agent client: register the MCP server with this
     /// binary's absolute path and a pinned agent id, install the lifecycle
-    /// hooks and the memory protocol. Safe to run again; what differs from
-    /// the plan is reported and left as it is.
+    /// hooks and, for Claude Code, the memory protocol. Safe to run again;
+    /// what differs from the plan is reported and left as it is.
     Setup {
         client: SetupClient,
         /// Print what would change, and change nothing.
@@ -905,10 +909,20 @@ pub enum HookEvent {
     UserPromptSubmit,
 }
 
+/// The clients whose hook input and output `clawg hook` speaks: Claude
+/// Code's `cwd` and `hookSpecificOutput`, or Cursor's `workspace_roots` and
+/// `additional_context`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum HookClient {
+    ClaudeCode,
+    Cursor,
+}
+
 /// The agent clients `clawg setup` knows how to configure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SetupClient {
     ClaudeCode,
+    Cursor,
 }
 
 /// Whether `args`, as the process got them, run `clawg hook`. A client reads
@@ -1429,15 +1443,37 @@ mod tests {
             Command::Hook {
                 event: HookEvent::SessionStart,
                 agent: "claude-code".into(),
+                client: HookClient::ClaudeCode,
                 profile: ProfileArg { profile: Some("dev".into()) },
             }
         );
         assert_eq!(
             parse(&["clawg", "hook", "user-prompt-submit", "--agent", "a"]).command,
-            Command::Hook { event: HookEvent::UserPromptSubmit, agent: "a".into(), profile: ProfileArg { profile: None } }
+            Command::Hook {
+                event: HookEvent::UserPromptSubmit,
+                agent: "a".into(),
+                client: HookClient::ClaudeCode,
+                profile: ProfileArg { profile: None },
+            }
         );
         assert!(Cli::try_parse_from(["clawg", "hook", "session-start"]).is_err(), "the agent is required");
         assert!(Cli::try_parse_from(["clawg", "hook", "pre-compact", "--agent", "a"]).is_err(), "only the events it answers");
+    }
+
+    #[test]
+    fn hook_takes_the_client_that_runs_it() {
+        assert_eq!(
+            parse(&["clawg", "hook", "session-start", "--agent", "cursor", "--client", "cursor", "--profile", "dev"]).command,
+            Command::Hook {
+                event: HookEvent::SessionStart,
+                agent: "cursor".into(),
+                client: HookClient::Cursor,
+                profile: ProfileArg { profile: Some("dev".into()) },
+            }
+        );
+        let named = parse(&["clawg", "hook", "session-start", "--agent", "a", "--client", "claude-code"]).command;
+        assert_eq!(named, parse(&["clawg", "hook", "session-start", "--agent", "a"]).command, "claude-code is the default");
+        assert!(Cli::try_parse_from(["clawg", "hook", "session-start", "--agent", "a", "--client", "codex"]).is_err());
     }
 
     #[test]
@@ -1450,8 +1486,12 @@ mod tests {
             parse(&["clawg", "setup", "claude-code", "--dry-run", "--remove", "--profile", "dev"]).command,
             Command::Setup { client: SetupClient::ClaudeCode, dry_run: true, remove: true, profile: ProfileArg { profile: Some("dev".into()) } }
         );
+        assert_eq!(
+            parse(&["clawg", "setup", "cursor", "--dry-run", "--profile", "dev"]).command,
+            Command::Setup { client: SetupClient::Cursor, dry_run: true, remove: false, profile: ProfileArg { profile: Some("dev".into()) } }
+        );
         assert!(Cli::try_parse_from(["clawg", "setup"]).is_err(), "the client is required");
-        assert!(Cli::try_parse_from(["clawg", "setup", "cursor"]).is_err(), "only the clients it knows");
+        assert!(Cli::try_parse_from(["clawg", "setup", "codex"]).is_err(), "only the clients it knows");
         assert!(!parse(&["clawg", "setup", "claude-code"]).command.loads_the_model());
     }
 

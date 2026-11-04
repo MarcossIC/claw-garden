@@ -34,7 +34,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 |---|---|---|
 | [history-reimport](changes/history-reimport/exploration.md), ensayo | Local: copia del store, export, transcripciones, línea base | Si el rendimiento mejoró de verdad, y un mapa para las notas sin proyecto |
 | [session-start-context](changes/session-start-context/proposal.md) | Nube | El traspaso de sesión vuelve a entrar, y el aviso deja de contar lo importado. Aplicado y verificado en Linux, con un PR abierto a `develop` ([verify](changes/session-start-context/verify.md)); falta revisarlo, ver el CI de Windows y archivarlo |
-| [client-setup-cursor](changes/client-setup-cursor/exploration.md) | Nube | `clawg setup cursor` y el hook en el formato de Cursor |
+| [client-setup-cursor](changes/client-setup-cursor/proposal.md) | Nube | `clawg setup cursor` y el hook en el formato de Cursor. Aplicado y verificado en Linux y en el CI de Windows, con un PR abierto a `develop` ([verify](changes/client-setup-cursor/verify.md)); falta revisarlo, verificarlo con Cursor real (noche 2, [pendiente en local](changes/client-setup-cursor/verify.md#pendiente-en-local)) y archivarlo |
 
 **Al otro día, con la persona:** revisar los dos PRs, decidir [preference-model](changes/preference-model/exploration.md) y hacer la prueba de 10 minutos de [bridge-project-identity](changes/bridge-project-identity/exploration.md).
 
@@ -42,7 +42,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 | Cambio | Dónde | Necesita antes |
 |---|---|---|
-| Verificar client-setup-cursor con Cursor real, perfil `dev` | Local: cliente instalado | Noche 1 |
+| Verificar client-setup-cursor con Cursor real, perfil `dev` (los pasos, en su [verify](changes/client-setup-cursor/verify.md#pendiente-en-local)) | Local: cliente instalado | Noche 1 |
 | [preference-model](changes/preference-model/exploration.md) | Nube | Las decisiones de la persona, session-start-context |
 | [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | La prueba con Cursor real |
 
