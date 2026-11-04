@@ -4,7 +4,7 @@
 |---|---|---|---|
 | 4 | M | — | exploración; decisiones cerradas, lista para aplicar |
 
-**Tesis:** `clawg setup` sólo conoce a Claude Code (`specs/setup`), y `clawg hook` sólo habla su formato. Conectar Cursor hoy es editar archivos a mano, y aun así el hook no funcionaría. Este cambio agrega `clawg setup cursor` y le enseña al hook el formato de Cursor. A qué proyecto va cada memoria lo resuelve [bridge-project-identity](../bridge-project-identity/exploration.md).
+**Tesis:** `clawg setup` sólo conoce a Claude Code (`specs/setup`), y `clawg hook` sólo habla su formato. Conectar Cursor hoy es editar archivos a mano, y aun así el hook no funcionaría. Este cambio agrega `clawg setup cursor` y le enseña al hook el formato de Cursor. A qué proyecto va cada memoria lo resuelve [bridge-project-identity](../../bridge-project-identity/exploration.md).
 
 ## Lo que dice Cursor (documentación consultada el 2026-11-03, Cursor 3.28)
 

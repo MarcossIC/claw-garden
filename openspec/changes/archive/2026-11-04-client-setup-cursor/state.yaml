@@ -1,7 +1,8 @@
 change: client-setup-cursor
 objective: "4"
 depends_on: []
-phase: verify
+phase: archived
+release: "0.76.0"  # el bump a 0.75.0 (b425b3c) no trae su código, así que la versión sube; el bump va en un commit posterior, junto con el registro de corridas del hook (verify.md, «Al archivar»)
 artifacts:
   exploration: done
   proposal: done  # las nueve decisiones de la exploración, y las que fija la aplicación sin cambiarlas
@@ -9,6 +10,7 @@ artifacts:
   design: skipped  # las decisiones se cerraron en la exploración
   tasks: done
   apply: done  # un commit por paso: el refactor de lo común, el hook y setup cursor, con sus tests en rojo antes
-  verify: pending  # Linux y el CI de Windows pasan (verify.md); falta lo de Cursor real, en local
-  archive: pending
+  verify: done  # Linux y el CI de Windows pasan (verify.md); la prueba con Cursor real queda en prod
+  archive: done
+main_spec: openspec/specs/setup/spec.md, openspec/specs/hooks/spec.md
 updated: 2026-11-04

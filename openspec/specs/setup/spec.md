@@ -7,6 +7,7 @@ Fuente de verdad del comportamiento actual de `clawg setup <cliente>`: el subcom
 - [setup-exec-hooks](../../changes/archive/2026-10-19-setup-exec-hooks/proposal.md), archivado el 2026-10-19: los hooks en forma exec y la migración de la forma heredada (R3, R6), la escritura por el destino de un enlace con el modo del archivo y la poda de copias (R7), y R8. El porqué, en su [diseño](../../changes/archive/2026-10-19-setup-exec-hooks/design.md): la forma de shell que reemplaza la había elegido client-setup porque `args` era nuevo, y un shell entre el cliente y clawg puede no ejecutar una ruta entre comillas (PowerShell, en Windows sin Git Bash) o imprimir antes del JSON del hook.
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23: el bloque del protocolo sigue la preferencia del perfil (LP13).
 - [cli-language](../../changes/archive/2026-10-23-cli-language/proposal.md), archivado el 2026-10-23: el reporte en el idioma del perfil (R7).
+- [client-setup-cursor](../../changes/archive/2026-11-04-client-setup-cursor/proposal.md), archivado el 2026-11-04, sale en 0.76.0: `clawg setup cursor` (CU1 a CU5), que escribe el servidor en `~/.cursor/mcp.json` y el hook de `sessionStart` en `~/.cursor/hooks.json`, con la misma escritura, copia y reporte que R7. Lo que sólo Cursor real reproduce queda en prod ([pendiente](../../changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)).
 
 ## Definiciones
 
@@ -19,6 +20,13 @@ Fuente de verdad del comportamiento actual de `clawg setup <cliente>`: el subcom
 - **Hook de clawg de un evento y un perfil:** en forma exec, un hook con `args` cuyo `command` es un programa llamado `clawg` (o `clawg.exe`), cuyos dos primeros argumentos son `hook <evento>` y que lleva `--profile P` (o `--profile=P`); en forma heredada, un hook sin `args` cuyo `command`, partido como lo partiría un shell simple, cumple lo mismo (`is_clawg_hook`, `setup.rs:403`; `hook_words`, `setup.rs:391`).
 - **Forma heredada idéntica:** una forma heredada cuyas palabras son exactamente `<clawg> hook <evento> --agent claude-code --profile P` y cuyo `command` es la cadena que generaban las versiones anteriores de `setup` para esa ruta: la ruta sin comillas si sólo tiene letras ASCII, dígitos y `/._-:`, si no entre comillas dobles con `"`, `$`, `` ` `` y `\` escapados, seguida de los argumentos separados por un espacio (`is_legacy_hook`, `setup.rs:413`; `legacy_command`, `setup.rs:312`, que sólo reconoce y ya no escribe). En Windows esas versiones ya habían pasado la ruta a `/`.
 - **Bloque:** el texto de `crates/clawg-cli/src/mcp/protocol.md` entre `<!-- BEGIN CLAWG MEMORY PROTOCOL -->` y `<!-- END CLAWG MEMORY PROTOCOL -->`.
+- **Directorio de Cursor:** `~/.cursor`, con el home de `clawg_core::paths::home_dir` (el de `CLAWG_TEST_HOME` en un build de tests). Ahí viven `mcp.json` (los servidores de usuario, en `mcpServers`) y `hooks.json` (los hooks de usuario, en `hooks.<evento>`).
+- **Servidor del plan de Cursor:** `{"type": "stdio", "command": <exe>, "args": ["mcp", "--profile", P, "--agent", "cursor"]}`, con `<exe>` la ruta absoluta del binario en ejecución sin el prefijo `\\?\`. Su nombre es el del perfil (`Profile::mcp_server_name`), igual que en Claude Code.
+- **Argumentos del hook de Cursor:** `hook session-start --agent cursor --client cursor --profile P`.
+- **Shell del hook de Cursor:** PowerShell en Windows, un shell POSIX en los demás (`Shell::HOST`, `crates/clawg-cli/src/setup/cursor.rs:46`).
+- **Línea del hook de Cursor:** en un shell POSIX, la ruta del binario sin comillas si sólo tiene letras ASCII, dígitos y `/._-:`, si no entre comillas dobles con `"`, `$`, `` ` `` y `\` escapados por `\`, seguida de un espacio y los argumentos del hook. En PowerShell, `& "` y la ruta con `` ` ``, `$` y `"` escapados por `` ` ``, `" ` y los argumentos.
+- **Hook del plan de Cursor:** `{"command": <línea del hook de Cursor>}`.
+- **Hook de clawg de Cursor del perfil:** una entrada de `hooks.sessionStart` cuyo `command`, partido como lo partiría el shell del hook (y sin un `&` inicial en PowerShell), empieza por un programa llamado `clawg` (o `clawg.exe`) seguido de `hook session-start`, y lleva `--profile P` o `--profile=P`.
 
 ## R1. `clawg setup claude-code`
 
@@ -114,6 +122,56 @@ Cada archivo MUST escribirse por un temporal en el directorio del archivo real y
 
 **Test:** `the_block_follows_the_preferred_language` y `another_language_rewrites_the_block` (`setup.rs`, sobre `plan`).
 
+## CU1. `clawg setup cursor`
+
+`clawg setup cursor [--profile P] [--dry-run] [--remove]` MUST resolver el perfil como los otros subcomandos (un build debug MUST rechazar `prod`), MUST rechazar una ruta del binario que no sea absoluta y MUST NOT abrir el store ni arrancar un daemon. Antes de escribir MUST leer `mcp.json` y `hooks.json`; si uno no se puede leer, no es JSON válido o no tiene la forma que Cursor lee (un objeto; `mcpServers` y `hooks` objetos; `hooks.sessionStart` una lista), MUST fallar sin escribir ninguno. MUST NOT escribir un archivo de reglas ni ningún otro archivo de Cursor.
+
+#### Escenario: un `hooks.json` roto
+- GIVEN un `mcp.json` válido y un `hooks.json` que no es JSON
+- WHEN corre `clawg setup cursor`
+- THEN sale con error nombrando `hooks.json`, y ninguno de los dos archivos cambia ni aparece una copia
+
+**Tests:** `setup_takes_a_client_a_profile_dry_run_and_remove` (`cli.rs`), `an_invalid_file_writes_nothing`, `a_relative_binary_path_is_refused` (`setup/cursor.rs`).
+
+## CU2. El servidor en `mcp.json`
+
+Sin servidor del perfil, el plan MUST agregar el servidor del plan de Cursor al final de `mcpServers`, que se crea si falta. Si existe y coincide (mismo `command` y `args`, `type` ausente o `stdio`), MUST NOT hacer nada. Si existe y no coincide, MUST reportarlo como conflicto y MUST NOT reemplazarlo. Los otros servidores y las otras claves MUST conservarse, en su orden.
+
+#### Escenario: otros servidores
+- GIVEN un `mcp.json` con dos servidores ajenos y una clave ajena
+- WHEN corre `clawg setup cursor` y después `clawg setup cursor --remove`
+- THEN después de la primera los dos servidores y la clave siguen iguales y en su orden, con `clawg-dev` al final, y después de la segunda el archivo es el de antes
+
+**Tests:** `an_empty_state_plans_the_server_and_the_hook`, `a_different_server_is_a_conflict`, `other_servers_stay_and_remove_gives_the_file_back` (`setup/cursor.rs`).
+
+## CU3. El hook en `hooks.json`
+
+El plan MUST agregar el hook del plan de Cursor al final de `hooks.sessionStart`, creando lo que falte; un `hooks.json` que no existía (o vacío) MUST empezar con `"version": 1`. MUST NOT instalar ningún otro evento, `beforeSubmitPrompt` incluido. Un hook igual al del plan MUST quedar como está; otro hook de clawg de Cursor del perfil MUST reportarse como conflicto, mostrado como su `command`, y MUST NOT reemplazarse. Los hooks y las claves ajenas, y los hooks de clawg de otro perfil, MUST conservarse, en su orden.
+
+#### Escenario: una ruta con espacio
+- GIVEN el binario en `C:\Users\Ana María\AppData\Local\Programs\clawg\clawg.exe`
+- WHEN se arma la línea del hook de Cursor para PowerShell
+- THEN es `& "C:\Users\Ana María\AppData\Local\Programs\clawg\clawg.exe" hook session-start --agent cursor --client cursor --profile dev`, y partida como la parte PowerShell da esa ruta y los argumentos del hook
+
+#### Escenario: un hook de clawg distinto
+- GIVEN un `hooks.json` con `clawg hook session-start --agent claude-code --profile dev` en `sessionStart`
+- WHEN corre `clawg setup cursor --profile dev`
+- THEN el reporte lo da como conflicto, el archivo no cambia y sale con 1
+
+**Tests:** `the_hook_line_is_written_for_the_shell_that_runs_it`, `a_hook_line_reads_back_as_its_words`, `a_different_clawg_hook_is_a_conflict`, `foreign_hooks_and_keys_keep_their_order`, `a_hook_of_the_other_profile_is_not_ours`, `nothing_is_installed_before_a_prompt` (`setup/cursor.rs`); `the_installed_cursor_hook_runs_through_a_shell` (`tests/binary.rs`, Unix: la línea que quedó en `hooks.json`, corrida con `sh -c` en `~/.cursor` y la entrada de Cursor, imprime la salida de Cursor).
+
+## CU4. Idempotencia, `--dry-run` y `--remove`
+
+Una segunda corrida sobre lo que dejó la primera MUST NOT escribir nada. `--dry-run` MUST reportar el mismo plan y MUST NOT escribir nada. `--remove` MUST quitar el servidor del perfil si es de clawg (`command` llamado `clawg` y primer argumento `mcp`), y `mcpServers` si queda vacío, y los hooks de clawg de Cursor del perfil, y `hooks.sessionStart` y `hooks` si quedan vacíos. Un servidor ajeno con el nombre del perfil MUST reportarse como conflicto y quedarse. `setup` seguido de `--remove` MUST devolver cada archivo al mismo contenido JSON, con la sangría de dos espacios; un `mcp.json` que no existía queda como `{}` y un `hooks.json` que no existía como `{"version": 1}`.
+
+**Tests:** `a_second_run_changes_nothing`, `dry_run_writes_nothing`, `remove_after_setup_gives_back_the_files`, `remove_leaves_a_foreign_server` (`setup/cursor.rs`); `setup_cursor_installs_and_remove_undoes_it` (`tests/binary.rs`).
+
+## CU5. Escritura y reporte de Cursor
+
+Cada archivo MUST escribirse como en `setup claude-code` (R7): por un temporal en el directorio del archivo real y un `rename`, a través de un enlace simbólico, con el modo del archivo, con la copia previa en `<data>/backups/setup/<nombre>-<yyyyMMddHHmmssfff>` y la poda a las 5 más recientes de ese nombre. Un paso que falla no detiene el otro. El reporte MUST dar un renglón por archivo en el idioma preferido del perfil, con las rutas, el nombre del servidor y el evento tal cual. Al instalar, también con `--dry-run`, MUST avisar que en Cursor hay que apagar «Include Third-Party Plugins, Skills, and Other Configs» (Settings → Agents → Third-Party Imports), porque con eso encendido Cursor también carga los hooks y plugins de Claude Code y clawg no puede leer ese ajuste. El código de salida MUST ser 1 ante un conflicto, un archivo que no se pudo escribir o una copia que no se pudo borrar, y 0 si no; el aviso no lo cambia.
+
+**Tests:** `apply_copies_the_previous_file_first`, `setup_warns_to_turn_off_third_party_configs`, `the_report_speaks_spanish` (`setup/cursor.rs`).
+
 ## Verificación
 
-Con el `claude` real en un home temporal y el perfil dev, en Linux (2.1.303 y 2.1.304) y en Windows (2.1.304): `claude mcp get` da el servidor conectado con la ruta absoluta y `--agent claude-code`, la forma heredada se migra y una segunda corrida no cambia nada, `clawg` a secas sale con 1 y `--remove` deja los archivos como estaban ([verify de client-setup](../../changes/archive/2026-10-19-client-setup/verify.md), [verify de setup-exec-hooks](../../changes/archive/2026-10-19-setup-exec-hooks/verify.md)). En Windows, con el binario en una ruta con un espacio y un carácter no ASCII, una sesión real de Claude Code recibió el contexto del hook exec. Quedan sin verificar Windows sin Git Bash (Claude Code 2.1.304 encuentra el de Git for Windows aunque no esté en el PATH), un archivo enlazado en Windows y un cliente anterior a 2.1.139.
+Con el `claude` real en un home temporal y el perfil dev, en Linux (2.1.303 y 2.1.304) y en Windows (2.1.304): `claude mcp get` da el servidor conectado con la ruta absoluta y `--agent claude-code`, la forma heredada se migra y una segunda corrida no cambia nada, `clawg` a secas sale con 1 y `--remove` deja los archivos como estaban ([verify de client-setup](../../changes/archive/2026-10-19-client-setup/verify.md), [verify de setup-exec-hooks](../../changes/archive/2026-10-19-setup-exec-hooks/verify.md)). En Windows, con el binario en una ruta con un espacio y un carácter no ASCII, una sesión real de Claude Code recibió el contexto del hook exec. Quedan sin verificar Windows sin Git Bash (Claude Code 2.1.304 encuentra el de Git for Windows aunque no esté en el PATH), un archivo enlazado en Windows y un cliente anterior a 2.1.139. CU1 a CU5 se verificaron en Linux y en el CI de Windows con el embedder falso; con Cursor real, la prueba queda en prod ([verify de client-setup-cursor](../../changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)).

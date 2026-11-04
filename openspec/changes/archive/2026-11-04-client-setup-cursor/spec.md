@@ -1,6 +1,6 @@
 # client-setup-cursor — Especificación
 
-`clawg setup cursor` conecta clawg a Cursor, y `clawg hook session-start --client cursor` responde el hook `sessionStart` de Cursor. Al archivar, CU1 a CU5 se suman a [`specs/setup`](../../specs/setup/spec.md) y CU6 a CU8 a [`specs/hooks`](../../specs/hooks/spec.md). Lo que esas specs dicen de Claude Code no cambia.
+`clawg setup cursor` conecta clawg a Cursor, y `clawg hook session-start --client cursor` responde el hook `sessionStart` de Cursor. Al archivar, CU1 a CU5 se suman a [`specs/setup`](../../../specs/setup/spec.md) y CU6 a CU8 a [`specs/hooks`](../../../specs/hooks/spec.md). Lo que esas specs dicen de Claude Code no cambia.
 
 ## Definiciones
 
@@ -61,13 +61,13 @@ Una segunda corrida sobre lo que dejó la primera MUST NOT escribir nada. `--dry
 
 ## CU5. Escritura y reporte
 
-Cada archivo MUST escribirse como en `setup claude-code` ([`specs/setup`](../../specs/setup/spec.md), R7): por un temporal en el directorio del archivo real y un `rename`, a través de un enlace simbólico, con el modo del archivo, con la copia previa en `<data>/backups/setup/<nombre>-<yyyyMMddHHmmssfff>` y la poda a las 5 más recientes de ese nombre. Un paso que falla no detiene el otro. El reporte MUST dar un renglón por archivo en el idioma preferido del perfil, con las rutas, el nombre del servidor y el evento tal cual. Al instalar, también con `--dry-run`, MUST avisar que en Cursor hay que apagar «Include Third-Party Plugins, Skills, and Other Configs» (Settings → Agents → Third-Party Imports), porque con eso encendido Cursor también carga los hooks y plugins de Claude Code y clawg no puede leer ese ajuste. El código de salida MUST ser 1 ante un conflicto, un archivo que no se pudo escribir o una copia que no se pudo borrar, y 0 si no; el aviso no lo cambia.
+Cada archivo MUST escribirse como en `setup claude-code` ([`specs/setup`](../../../specs/setup/spec.md), R7): por un temporal en el directorio del archivo real y un `rename`, a través de un enlace simbólico, con el modo del archivo, con la copia previa en `<data>/backups/setup/<nombre>-<yyyyMMddHHmmssfff>` y la poda a las 5 más recientes de ese nombre. Un paso que falla no detiene el otro. El reporte MUST dar un renglón por archivo en el idioma preferido del perfil, con las rutas, el nombre del servidor y el evento tal cual. Al instalar, también con `--dry-run`, MUST avisar que en Cursor hay que apagar «Include Third-Party Plugins, Skills, and Other Configs» (Settings → Agents → Third-Party Imports), porque con eso encendido Cursor también carga los hooks y plugins de Claude Code y clawg no puede leer ese ajuste. El código de salida MUST ser 1 ante un conflicto, un archivo que no se pudo escribir o una copia que no se pudo borrar, y 0 si no; el aviso no lo cambia.
 
 **Tests:** `apply_copies_the_previous_file_first`, `setup_warns_to_turn_off_third_party_configs`, `the_report_speaks_spanish` (`setup/cursor.rs`).
 
 ## CU6. `clawg hook session-start --client cursor`
 
-`clawg hook` MUST tomar `--client claude-code|cursor`, con `claude-code` por defecto; sin `--client`, MUST hacer lo de [`specs/hooks`](../../specs/hooks/spec.md). Con `--client cursor`, `session-start` MUST leer `workspace_roots` y `session_id` de la entrada de Cursor, tolerando campos desconocidos y ausentes, MUST registrar la raíz y la sesión como R6 de `specs/hooks`, y MUST imprimir la salida de Cursor con el mismo texto que el sobre de Claude Code (R4, R7 y AL6 de `specs/hooks`), o nada cuando ese texto no existe. Con `--client cursor`, `user-prompt-submit` MUST NOT imprimir nada ni consultar al daemon.
+`clawg hook` MUST tomar `--client claude-code|cursor`, con `claude-code` por defecto; sin `--client`, MUST hacer lo de [`specs/hooks`](../../../specs/hooks/spec.md). Con `--client cursor`, `session-start` MUST leer `workspace_roots` y `session_id` de la entrada de Cursor, tolerando campos desconocidos y ausentes, MUST registrar la raíz y la sesión como R6 de `specs/hooks`, y MUST imprimir la salida de Cursor con el mismo texto que el sobre de Claude Code (R4, R7 y AL6 de `specs/hooks`), o nada cuando ese texto no existe. Con `--client cursor`, `user-prompt-submit` MUST NOT imprimir nada ni consultar al daemon.
 
 #### Escenario: una raíz
 - GIVEN un daemon con un save del agente `smoke` en el proyecto de `/work/repo`, y el hook corriendo en `~/.cursor`
@@ -100,4 +100,4 @@ Sin `--client cursor`, una entrada con `cursor_version` (de cualquier tipo) MUST
 
 ## Verificación
 
-En Linux, con directorios temporales, el embedder falso y `--port 0`. Lo que sólo Cursor reproduce queda en [`verify.md`](verify.md) como pendiente en local, con Cursor instalado y el perfil `dev`.
+En Linux, con directorios temporales, el embedder falso y `--port 0`. Lo que sólo Cursor reproduce queda en [`verify.md`](verify.md) como pendiente en prod, con Cursor instalado y el perfil `prod`.

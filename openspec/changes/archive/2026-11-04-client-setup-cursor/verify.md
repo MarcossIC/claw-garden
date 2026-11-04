@@ -30,7 +30,7 @@ Escritos antes del código de cada commit; fallaban sin compilar.
 | una con dos raíces no registra ningún proyecto | `a_cursor_session_with_two_roots_registers_no_project` (`tests/binary.rs`), `cursor_without_one_root_gets_only_the_language_line` (`hook.rs`, contra un daemon que cuenta los pedidos: ninguno) |
 | una entrada con `cursor_version` en un hook sin `--client cursor` no imprime nada y sale con 0 | `a_claude_code_hook_that_cursor_runs_does_nothing` (`tests/binary.rs`, con la preferencia `es`, que sin esto imprimiría la línea del idioma), `a_claude_code_hook_run_by_cursor_prints_nothing` (`hook.rs`) |
 
-La entrada de Cursor de los tests (`cursor_input` en `hook.rs`, `cursor_session_start` en `tests/binary.rs`) lleva los campos que la exploración leyó en la documentación. Desde la sesión en la nube `cursor.com` no se pudo abrir (la red no lo permite), así que no está copiada de un ejemplo de la documentación: es una de las cosas de «Pendiente en local».
+La entrada de Cursor de los tests (`cursor_input` en `hook.rs`, `cursor_session_start` en `tests/binary.rs`) lleva los campos que la exploración leyó en la documentación. Desde la sesión en la nube `cursor.com` no se pudo abrir (la red no lo permite), así que no está copiada de un ejemplo de la documentación: es una de las cosas de «Pendiente en prod».
 
 ## Una corrida a mano
 
@@ -65,18 +65,25 @@ Con `CLAWG_TEST_HOME` en un directorio temporal, `CLAWG_TEST_EMBEDDER=fake` y el
 | Los tests de `clawg hook` que ya existían | Sólo el campo `client` de `Command::Hook` | También el cliente en cada llamada a `respond` y a `envelope` | Las dos funciones lo reciben; lo que esperan no cambió |
 | `the_installed_cursor_hook_runs_through_a_shell` | No estaba | Sumado a CU3 | Es la única prueba de que la línea de `hooks.json` llega entera a `clawg hook --client cursor` por un shell |
 
-## Pendiente en local
+## Pendiente en prod
 
-Con Cursor instalado (3.28 o posterior), el perfil `dev`, un build de desarrollo y la configuración de terceros apagada salvo donde se dice. En un repositorio con un save del agente `cursor`, después de `target/debug/clawg setup cursor --profile dev` y de reiniciar Cursor:
+Con Cursor 3.28 o posterior, una versión publicada de clawg instalada (no un build de desarrollo), y después de `clawg setup cursor --profile prod` y de reiniciar Cursor. Antes, apagar en Cursor «Include Third-Party Plugins, Skills, and Other Configs» (Settings → Agents → Third-Party Imports), salvo en el punto donde se dice otra cosa. La prueba se hace en una ventana con exactamente UNA carpeta abierta: con varias, el hook no inyecta nada a propósito (`folder`, `crates/clawg-cli/src/hook.rs:194`), y eso se ve igual que una falla. En un repositorio con un save del agente `cursor`:
 
 1. **Que el hook corra por PowerShell sin abrir ventanas** (Windows): abrir un chat nuevo no muestra ninguna ventana, también con el binario en una ruta con un espacio.
-2. **Que `additional_context` llegue al agente:** en el chat nuevo, el agente conoce el save sin buscarlo. Con la preferencia `es`, que el texto con acentos llegue entero por PowerShell.
-3. **Que la decisión 7 sea cierta para la entrada que Cursor manda de verdad:** con la configuración de terceros encendida y `clawg setup claude-code --profile dev` instalado, el hook de Claude Code que corre Cursor no imprime nada (si Cursor respeta `args`, porque la entrada trae `cursor_version`; si no, porque corre `clawg` solo, que sale con 1 sin escribir en stdout): el agente recibe el contexto una sola vez, el del hook de Cursor, y `clawg projects list --profile dev` no lista `~/.cursor`.
-4. **La forma de `hooks.json` que Cursor acepta:** `"version": 1` y una entrada con sólo `command`, como la leyó la exploración. `cursor.com` no se pudo abrir desde la nube.
-5. **La forma de `workspace_roots` en Windows:** el hook toma la raíz tal como llega. Si Cursor la manda como `/c:/…` y no como `C:\…`, el proyecto no sería el mismo que el del `cwd` de Claude Code para el mismo repositorio.
+2. **Que `additional_context` llegue al agente:** en el chat nuevo, el agente conoce el save sin buscarlo. Con la preferencia `es`, que el texto con acentos llegue entero por PowerShell. **Riesgo:** cursor.com/docs/hooks dice de `sessionStart`: "This hook runs as fire-and-forget; the agent loop does not wait for or enforce a blocking response." Así que que un chat reciba el contexto no prueba que siempre llegue: probar en varios chats nuevos.
+3. **Que la decisión 7 sea cierta para la entrada que Cursor manda de verdad:** aplica sólo cuando `clawg setup claude-code --profile prod` está instalado en el mismo perfil; hasta entonces este punto queda pendiente. Con la configuración de terceros encendida, el hook de Claude Code que corre Cursor no imprime nada (si Cursor respeta `args`, porque la entrada trae `cursor_version`; si no, porque corre `clawg` solo, que sale con 1 sin escribir en stdout): el agente recibe el contexto una sola vez, el del hook de Cursor, y `clawg projects list --profile prod` no lista `~/.cursor`. Es el único punto que necesita la configuración de terceros encendida. Los hooks de Claude Code todavía no están instalados en prod: su instalación depende de la segunda pasada de [ram-footprint-gates](../2026-10-29-ram-footprint-gates/exploration.md), que necesita autorización (fila 92 de `openspec/README.md`).
+4. **Resuelto leyendo la documentación** (cursor.com/docs/hooks, leído el 2026-11-04): `hooks.json` es `{"version": 1, "hooks": {...}}` y cada entrada tiene un `command` obligatorio; en Windows, la app de escritorio corre los comandos de hook por PowerShell y les pasa el JSON por stdin; los hooks de usuario corren desde `~/.cursor/`. Lo que queda por mirar es sólo que Cursor acepta el archivo: su log deja de decir `No user hooks configuration found` (`%APPDATA%/Cursor/logs/<sesión>/window*/output_*/cursor.hooks.*.log`). Ese log muestra sólo que la configuración se cargó y `Hook step requested: workspaceOpen`; no prueba que un hook haya corrido.
+5. **La forma de `workspace_roots` en Windows:** el hook toma la raíz tal como llega. Si Cursor la manda como `/c:/…` y no como `C:\…`, el proyecto no sería el mismo que el del `cwd` de Claude Code para el mismo repositorio. La forma que llega la muestra el registro de corridas del cambio hook-run-log, que todavía no está en `openspec/changes/`.
 6. **Una ruta con espacios en macOS o Linux:** que Cursor corra la línea por un shell, que es para lo que está escrita.
-7. **Que la entrada de los tests sea la de verdad:** guardar la entrada de un `sessionStart` real (un hook de usuario que la copie a un archivo) y compararla con `cursor_input`.
+7. **Que la entrada de los tests sea la de verdad:** la que el registro de corridas de hook-run-log muestra para un `sessionStart` real, comparada con `cursor_input`.
+
+## Al archivar (2026-11-04)
+
+- Se archiva sin la corrida con Cursor real. Esa prueba se hace en prod, después de publicar, con el binario publicado (los puntos de «Pendiente en prod»).
+- Nada en este cambio prueba todavía que `additional_context` llegue al agente: los tests fijan lo que el hook imprime, no lo que Cursor hace con ello.
+- Un hook que no inyecta nada no deja rastro (`crates/clawg-cli/src/hook.rs:6-7`). Por eso el cambio hook-run-log agrega el registro de corridas, que hace diagnosticable una falla ahí.
+- La versión: el código de este cambio viene después del bump a 0.75.0 (`b425b3c`), que no tiene tag. Por eso sale en 0.76.0, y ese único bump se commitea después del código de hook-run-log, para que las dos cosas salgan juntas.
 
 ## Veredicto
 
-Sin CRITICAL en Linux ni en el CI de Windows. Los siete puntos de arriba quedan como WARNING hasta la verificación local con Cursor real.
+Sin CRITICAL en Linux ni en el CI de Windows. Los puntos de «Pendiente en prod» quedan como WARNING hasta probarlos en prod.

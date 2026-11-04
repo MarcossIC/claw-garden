@@ -52,7 +52,7 @@ Lo que la exploración no fijaba y se decide al aplicar, sin cambiar ninguna de 
 
 ## Fuera de alcance
 
-- El proyecto por defecto del puente (`crates/clawg-cli/src/mcp/server.rs`): lo resuelve [bridge-project-identity](../bridge-project-identity/exploration.md).
+- El proyecto por defecto del puente (`crates/clawg-cli/src/mcp/server.rs`): lo resuelve [bridge-project-identity](../../bridge-project-identity/exploration.md).
 - `crates/clawg-core/src/memory/prompt_builder.rs`, que toca session-start-context en paralelo.
 - El contrato del agente (`agent_contract.json`, `agent_contract.es.json`): no cambia nada de lo que ve el modelo.
 - Un archivo de reglas para Cursor (decisión 8) y el hook `beforeSubmitPrompt` (decisión 3).
@@ -75,7 +75,7 @@ Además: los tests de `setup claude-code` y de `clawg hook` que ya existen pasan
 
 `rag-eval`: no aplica, no hay cambio de ranking.
 
-Lo que un CI no reproduce queda en `verify.md` como pendiente en local, con Cursor instalado y el perfil `dev`: que el hook corra por PowerShell sin abrir ventanas, que `additional_context` llegue al agente y que la decisión 7 sea cierta para la entrada que Cursor manda de verdad.
+Lo que un CI no reproduce queda en `verify.md` como pendiente en prod, con Cursor instalado y el perfil `prod`: que el hook corra por PowerShell sin abrir ventanas, que `additional_context` llegue al agente y que la decisión 7 sea cierta para la entrada que Cursor manda de verdad.
 
 ## Datos y vuelta atrás
 

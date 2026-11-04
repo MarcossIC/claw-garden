@@ -34,15 +34,13 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 |---|---|---|
 | [history-reimport](changes/history-reimport/exploration.md), ensayo | Local: copia del store, export, transcripciones, línea base | Si el rendimiento mejoró de verdad, y un mapa para las notas sin proyecto |
 | [session-start-context](changes/session-start-context/proposal.md) | Nube | El traspaso de sesión vuelve a entrar, y el aviso deja de contar lo importado. Aplicado y verificado en Linux, con un PR abierto a `develop` ([verify](changes/session-start-context/verify.md)); falta revisarlo, ver el CI de Windows y archivarlo |
-| [client-setup-cursor](changes/client-setup-cursor/proposal.md) | Nube | `clawg setup cursor` y el hook en el formato de Cursor. Aplicado y verificado en Linux y en el CI de Windows, con un PR abierto a `develop` ([verify](changes/client-setup-cursor/verify.md)); falta revisarlo, verificarlo con Cursor real (noche 2, [pendiente en local](changes/client-setup-cursor/verify.md#pendiente-en-local)) y archivarlo |
 
-**Al otro día, con la persona:** revisar los dos PRs, decidir [preference-model](changes/preference-model/exploration.md) y hacer la prueba de 10 minutos de [bridge-project-identity](changes/bridge-project-identity/exploration.md).
+**Al otro día, con la persona:** decidir [preference-model](changes/preference-model/exploration.md) y hacer la prueba de 10 minutos de [bridge-project-identity](changes/bridge-project-identity/exploration.md).
 
 ## Noche 2
 
 | Cambio | Dónde | Necesita antes |
 |---|---|---|
-| Verificar client-setup-cursor con Cursor real, perfil `dev` (los pasos, en su [verify](changes/client-setup-cursor/verify.md#pendiente-en-local)) | Local: cliente instalado | Noche 1 |
 | [preference-model](changes/preference-model/exploration.md) | Nube | Las decisiones de la persona, session-start-context |
 | [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | La prueba con Cursor real |
 
@@ -55,7 +53,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 ## Piloto (una semana de trabajo real, no una noche)
 
-Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario.
+Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario, con una excepción: Cursor se conecta con `clawg setup cursor --profile prod`, porque esa es la prueba con Cursor real ([pendiente en prod](changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)). Esa instalación también es a nivel usuario y afecta a cada ventana de Cursor, no sólo a este repositorio.
 
 **Pasa si:**
 - responde 10 preguntas reales cuya respuesta sólo está en el historial;
