@@ -1,0 +1,13 @@
+change: session-start-context
+objective: "1, 4"
+depends_on: []
+phase: proposal  # decisiones cerradas en la exploración
+artifacts:
+  exploration: done
+  proposal: pending
+  spec: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-11-03

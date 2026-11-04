@@ -1,0 +1,13 @@
+change: preference-model
+objective: "1, 2, 4"
+depends_on: [session-start-context]
+phase: explore  # esperan las decisiones de la persona
+artifacts:
+  exploration: done
+  proposal: pending
+  spec: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-11-03

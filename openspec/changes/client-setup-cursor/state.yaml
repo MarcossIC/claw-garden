@@ -1,0 +1,13 @@
+change: client-setup-cursor
+objective: "4"
+depends_on: []
+phase: proposal  # decisiones cerradas en la exploración
+artifacts:
+  exploration: done
+  proposal: pending
+  spec: pending
+  tasks: pending
+  apply: pending
+  verify: pending  # lo de Cursor real se verifica en local
+  archive: pending
+updated: 2026-11-03

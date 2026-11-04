@@ -1,0 +1,9 @@
+change: history-reimport
+objective: "1, 2"
+depends_on: []
+phase: explore  # el paso siguiente es el ensayo en dev
+artifacts:
+  exploration: done
+  verify: pending  # el ensayo deja acá sus números
+  archive: pending
+updated: 2026-11-03
