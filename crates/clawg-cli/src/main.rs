@@ -123,10 +123,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Hook { event, agent, profile } => {
+        Command::Hook { event, agent, client, profile } => {
             let profile = profile.resolve()?;
             let base_dir = data_dir(profile)?;
-            if let Some(out) = hook::respond(event, &agent, &base_dir, tokio::io::stdin(), hook::HOOK_DEADLINE).await {
+            if let Some(out) = hook::respond(event, client, &agent, &base_dir, tokio::io::stdin(), hook::HOOK_DEADLINE).await {
                 println!("{out}");
             }
             Ok(ExitCode::SUCCESS)

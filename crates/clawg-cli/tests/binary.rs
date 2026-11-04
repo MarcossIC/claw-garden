@@ -1557,8 +1557,14 @@ async fn a_bridge_left_open_reaches_the_daemon_after_a_restart() {
 
 /// Runs `clawg hook` with `input` on stdin, as a client does.
 fn hook(sandbox: &Sandbox, args: &[&str], input: &str) -> Output {
+    hook_in(sandbox, &sandbox.home, args, input)
+}
+
+/// [`hook`] run in `dir`, as Cursor runs a user hook in `~/.cursor`.
+fn hook_in(sandbox: &Sandbox, dir: &Path, args: &[&str], input: &str) -> Output {
     let mut child = sandbox
         .command(&[&["hook"], args].concat())
+        .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1738,6 +1744,99 @@ async fn a_hook_registers_the_session_of_the_saves() {
     let list = daemon.list().await;
     assert_eq!(session_of(&list, "the deploy script lives in ops/deploy.sh"), "s1", "{list}");
     assert_eq!(session_of(&list, "the release notes live in docs/releases"), "s2", "a later prompt of another session wins: {list}");
+}
+
+/// What Cursor hands a user hook at `sessionStart`, with `roots` as the
+/// window's folders: the fields its documentation lists, and no `cwd`.
+fn cursor_session_start(roots: &[&Path]) -> String {
+    json!({
+        "conversation_id": "668320d2-2fd8-4888-b33c-2a466fec86e7",
+        "generation_id": "490b90b7-a2ce-4c2c-bb76-cb77b125df2f",
+        "model": "auto",
+        "hook_event_name": "sessionStart",
+        "cursor_version": "3.28.0",
+        "workspace_roots": roots,
+        "user_email": "user@example.com",
+        "transcript_path": null,
+        "session_id": "668320d2-2fd8-4888-b33c-2a466fec86e7",
+    })
+    .to_string()
+}
+
+/// The folder of every project the daemon has.
+async fn project_roots(daemon: &Daemon) -> Vec<PathBuf> {
+    let (status, listing) = daemon.get("/v1/projects").await;
+    assert_eq!(status, 200, "{listing}");
+    let projects = listing["projects"].as_array().expect("projects");
+    let folders = projects.iter().flat_map(|p| p["folders"].as_array().expect("folders").iter());
+    folders.map(|f| PathBuf::from(f["root_path"].as_str().expect("root_path"))).collect()
+}
+
+/// A home with the `~/.cursor` a user hook of Cursor runs in.
+fn dot_cursor(sandbox: &Sandbox) -> PathBuf {
+    let dir = sandbox.home.join(".cursor");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn a_cursor_session_start_reads_its_one_root_and_not_its_directory() {
+    let sandbox = Sandbox::new();
+    let (root, cursor) = (sandbox.home.join("repo"), dot_cursor(&sandbox));
+    std::fs::create_dir_all(&root).unwrap();
+    let project = clawg_core::memory::ProjectIdentity::resolve(&root).id;
+    let daemon = sandbox.serve().await;
+    let (status, body) = daemon
+        .post(
+            "/v1/memories",
+            json!({ "content": "the deploy script lives in ops/deploy.sh", "agent_id": "smoke", "project_id": project }),
+        )
+        .await;
+    assert!(status == 201 || status == 202, "{body}");
+    daemon.wait_until_ingested().await;
+
+    let args = ["session-start", "--agent", "smoke", "--client", "cursor", "--profile", "dev"];
+    let out = hook_in(&sandbox, &cursor, &args, &cursor_session_start(&[&root]));
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let reply: Value = serde_json::from_str(&stdout_of(&out)).expect("one JSON object");
+    let keys: Vec<&String> = reply.as_object().expect("an object").keys().collect();
+    assert_eq!(keys, ["additional_context"], "{reply}");
+    assert!(reply["additional_context"].as_str().expect("text").contains("ops/deploy.sh"), "{reply}");
+    let roots = project_roots(&daemon).await;
+    assert!(roots.iter().all(|r| r.file_name() != Some(".cursor".as_ref())), "{roots:?}");
+}
+
+#[tokio::test]
+async fn a_cursor_session_with_two_roots_registers_no_project() {
+    let sandbox = Sandbox::new();
+    let (web, api, cursor) = (sandbox.home.join("web"), sandbox.home.join("api"), dot_cursor(&sandbox));
+    for dir in [&web, &api] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let daemon = sandbox.serve().await;
+
+    let args = ["session-start", "--agent", "smoke", "--client", "cursor", "--profile", "dev"];
+    let out = hook_in(&sandbox, &cursor, &args, &cursor_session_start(&[&web, &api]));
+
+    assert_eq!((out.status.code(), stdout_of(&out)), (Some(0), String::new()), "{}", stderr_of(&out));
+    assert_eq!(project_roots(&daemon).await, Vec::<PathBuf>::new(), "neither root, nor the hook's directory");
+}
+
+#[tokio::test]
+async fn a_claude_code_hook_that_cursor_runs_does_nothing() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let (root, cursor) = (sandbox.home.join("repo"), dot_cursor(&sandbox));
+    std::fs::create_dir_all(&root).unwrap();
+    let daemon = sandbox.serve().await;
+
+    let out = hook_in(&sandbox, &cursor, &["session-start", "--agent", "claude-code", "--profile", "dev"], &cursor_session_start(&[&root]));
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), "", "not even the language line");
+    assert_eq!(project_roots(&daemon).await, Vec::<PathBuf>::new());
 }
 
 // ── doctor ─────────────────────────────────────────────────────────────────
