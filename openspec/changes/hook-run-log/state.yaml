@@ -2,7 +2,7 @@ change: hook-run-log
 objective: "4"
 depends_on: []
 phase: verify
-release: "0.76.0"  # sale con client-setup-cursor, antes de la prueba con Cursor real; el bump va en un commit posterior
+release: "0.76.0"  # su código es anterior al bump a 0.76.0 (chore: bump version to 0.76.0), así que archivarlo no vuelve a subir la versión
 artifacts:
   exploration: skipped  # la evidencia va en la propuesta
   proposal: done  # las siete decisiones, cerradas antes de escribirla

@@ -34,3 +34,8 @@ Requisitos en la [spec](spec.md); las decisiones, en la [propuesta](proposal.md#
 - [x] `verify.md`, `state.yaml` y las referencias de [client-setup-cursor](../archive/2026-11-04-client-setup-cursor/verify.md) a este cambio.
 - [ ] El CI de Windows del pull request, que todavía no existe.
 - Commit: `docs(openspec): record hook-run-log applied`
+
+## 5. Revisión
+
+- [x] Los siete hallazgos de la revisión, cada uno con su test en rojo primero ([verify](verify.md#la-revisión)); HR8 en la spec.
+- Commits: `fix(hook): bound what a session start records`, `fix(doctor): read a damaged hook record line by line`, `chore: bump version to 0.76.0` y `docs(openspec): record the review of hook-run-log`
