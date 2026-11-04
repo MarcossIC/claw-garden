@@ -284,8 +284,8 @@ pub enum Command {
     },
     /// Connect clawg to an agent client: register the MCP server with this
     /// binary's absolute path and a pinned agent id, install the lifecycle
-    /// hooks and the memory protocol. Safe to run again; what differs from
-    /// the plan is reported and left as it is.
+    /// hooks and, for Claude Code, the memory protocol. Safe to run again;
+    /// what differs from the plan is reported and left as it is.
     Setup {
         client: SetupClient,
         /// Print what would change, and change nothing.
@@ -922,6 +922,7 @@ pub enum HookClient {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SetupClient {
     ClaudeCode,
+    Cursor,
 }
 
 /// Whether `args`, as the process got them, run `clawg hook`. A client reads
@@ -1485,8 +1486,12 @@ mod tests {
             parse(&["clawg", "setup", "claude-code", "--dry-run", "--remove", "--profile", "dev"]).command,
             Command::Setup { client: SetupClient::ClaudeCode, dry_run: true, remove: true, profile: ProfileArg { profile: Some("dev".into()) } }
         );
+        assert_eq!(
+            parse(&["clawg", "setup", "cursor", "--dry-run", "--profile", "dev"]).command,
+            Command::Setup { client: SetupClient::Cursor, dry_run: true, remove: false, profile: ProfileArg { profile: Some("dev".into()) } }
+        );
         assert!(Cli::try_parse_from(["clawg", "setup"]).is_err(), "the client is required");
-        assert!(Cli::try_parse_from(["clawg", "setup", "cursor"]).is_err(), "only the clients it knows");
+        assert!(Cli::try_parse_from(["clawg", "setup", "codex"]).is_err(), "only the clients it knows");
         assert!(!parse(&["clawg", "setup", "claude-code"]).command.loads_the_model());
     }
 

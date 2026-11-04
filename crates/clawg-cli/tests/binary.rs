@@ -3057,6 +3057,72 @@ async fn setup_registers_through_a_fake_claude_and_remove_undoes_it() {
     assert_eq!(std::fs::read_to_string(config.join("settings.json")).unwrap(), "{}\n");
 }
 
+#[tokio::test]
+async fn setup_cursor_installs_and_remove_undoes_it() {
+    let sandbox = Sandbox::new();
+    let cursor = sandbox.home.join(".cursor");
+    let setup = |args: &[&str]| sandbox.run(&[&["setup", "cursor", "--profile", "dev"], args].concat());
+
+    let dry = setup(&["--dry-run"]);
+    assert_eq!(dry.status.code(), Some(0), "{}", stderr_of(&dry));
+    assert!(stdout_of(&dry).contains("mcp server clawg-dev in"), "{}", stdout_of(&dry));
+    assert!(!cursor.exists() && !sandbox.data_dir().exists(), "a dry run writes nothing");
+
+    std::fs::create_dir_all(&cursor).unwrap();
+    let mine = serde_json::to_string_pretty(&json!({ "mcpServers": { "docs": { "url": "http://localhost:3000/mcp" } } })).unwrap() + "\n";
+    std::fs::write(cursor.join("mcp.json"), &mine).unwrap();
+    let out = setup(&[]);
+    assert_eq!(out.status.code(), Some(0), "{}{}", stdout_of(&out), stderr_of(&out));
+    let servers: Value = serde_json::from_str(&std::fs::read_to_string(cursor.join("mcp.json")).unwrap()).unwrap();
+    let server = &servers["mcpServers"]["clawg-dev"];
+    let command = Path::new(server["command"].as_str().expect("command"));
+    assert!(command.is_absolute() && command.file_stem() == Some("clawg".as_ref()), "{servers}");
+    assert_eq!(server["args"], json!(["mcp", "--profile", "dev", "--agent", "cursor"]), "{servers}");
+    assert_eq!(servers["mcpServers"]["docs"], json!({ "url": "http://localhost:3000/mcp" }));
+    let hooks: Value = serde_json::from_str(&std::fs::read_to_string(cursor.join("hooks.json")).unwrap()).unwrap();
+    let line = hooks["hooks"]["sessionStart"][0]["command"].as_str().expect("the hook");
+    assert!(line.ends_with(" hook session-start --agent cursor --client cursor --profile dev"), "{hooks}");
+
+    let removed = setup(&["--remove"]);
+    assert_eq!(removed.status.code(), Some(0), "{}", stdout_of(&removed));
+    assert_eq!(std::fs::read_to_string(cursor.join("mcp.json")).unwrap(), mine);
+    let hooks: Value = serde_json::from_str(&std::fs::read_to_string(cursor.join("hooks.json")).unwrap()).unwrap();
+    assert_eq!(hooks, json!({ "version": 1 }));
+}
+
+/// The line `setup cursor` installs, run through `sh -c` in `~/.cursor` with
+/// what Cursor hands it: the quoting and `--client cursor` reach the hook.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_installed_cursor_hook_runs_through_a_shell() {
+    let sandbox = Sandbox::new();
+    let installed = sandbox.run(&["setup", "cursor", "--profile", "dev"]);
+    assert_eq!(installed.status.code(), Some(0), "{}", stderr_of(&installed));
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let cursor = sandbox.home.join(".cursor");
+    let hooks: Value = serde_json::from_str(&std::fs::read_to_string(cursor.join("hooks.json")).unwrap()).unwrap();
+    let line = hooks["hooks"]["sessionStart"][0]["command"].as_str().expect("the hook").to_string();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let mut child = sandbox
+        .command_of(Path::new("/bin/sh"), &["-c", &line])
+        .current_dir(&cursor)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sh");
+    child.stdin.take().expect("stdin").write_all(cursor_session_start(&[&root]).as_bytes()).unwrap();
+    let out = child.wait_with_output().expect("the hook");
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let reply: Value = serde_json::from_str(&stdout_of(&out)).expect("one JSON object");
+    let context = reply["additional_context"].as_str().expect("Cursor's output");
+    assert!(context.starts_with("clawg: el idioma de la persona es el español."), "{reply}");
+}
+
 // ── purging a project delete ───────────────────────────────────────────────
 
 #[tokio::test]

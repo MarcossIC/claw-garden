@@ -26,6 +26,8 @@ use serde_json::{Map, Value};
 
 use crate::update::plan::stamp;
 
+pub mod cursor;
+
 /// The agent id the bridge and the hooks are pinned to: the name Claude Code
 /// reports of itself, so a user who never pinned it keeps their memories.
 pub const AGENT: &str = "claude-code";
@@ -407,9 +409,14 @@ fn hook_words(hook: &Value) -> Option<Vec<String>> {
 }
 
 /// Whether a hook is clawg's for `event_arg` (`session-start`, …) and
-/// `profile`, in either form. One without `--profile` belongs to no profile.
+/// `profile`, in either form.
 fn is_clawg_hook(hook: &Value, event_arg: &str, profile: Profile) -> bool {
-    let Some(words) = hook_words(hook) else { return false };
+    hook_words(hook).is_some_and(|words| runs_clawg_hook(&words, event_arg, profile))
+}
+
+/// Whether a command's words run `clawg hook <event_arg>` for `profile`. One
+/// without `--profile` belongs to no profile.
+fn runs_clawg_hook(words: &[String], event_arg: &str, profile: Profile) -> bool {
     let profile_given = words.windows(2).any(|w| w[0] == "--profile" && w[1] == profile.as_str())
         || words.iter().any(|w| w.strip_prefix("--profile=") == Some(profile.as_str()));
     words.len() >= 3 && is_clawg_program(&words[0]) && words[1] == "hook" && words[2] == event_arg && profile_given
@@ -912,18 +919,7 @@ fn create_fresh(path: &Path, _mode: Option<u32>) -> std::io::Result<std::fs::Fil
 pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String, u8) {
     let lang = state.language.unwrap_or(Lang::En);
     let dry = applied.is_none();
-    // A step as done, or as a dry run would do it: each language gives both.
-    let will = |en: (&str, &str), es: (&str, &str)| {
-        let (done, planned) = match lang {
-            Lang::En => en,
-            Lang::Es => es,
-        };
-        match (dry, lang) {
-            (false, _) => done.to_string(),
-            (true, Lang::En) => format!("would {planned}"),
-            (true, Lang::Es) => planned.to_string(),
-        }
-    };
+    let will = |en: (&str, &str), es: (&str, &str)| done_or_planned(lang, dry, en, es);
     let mut lines = Vec::new();
     let mut incomplete = false;
     let name = plan.server.name;
@@ -1074,6 +1070,20 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
         );
     }
     (lines.join("\n"), if incomplete { 1 } else { 0 })
+}
+
+/// A step as done, or as a dry run would do it: each language gives both, as
+/// `(done, planned)`.
+fn done_or_planned(lang: Lang, dry: bool, en: (&str, &str), es: (&str, &str)) -> String {
+    let (done, planned) = match lang {
+        Lang::En => en,
+        Lang::Es => es,
+    };
+    match (dry, lang) {
+        (false, _) => done.to_string(),
+        (true, Lang::En) => format!("would {planned}"),
+        (true, Lang::Es) => planned.to_string(),
+    }
 }
 
 /// The report's lines about the files written: the copies made, the older

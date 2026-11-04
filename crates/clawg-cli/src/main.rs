@@ -273,10 +273,13 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Setup { client: SetupClient::ClaudeCode, dry_run, remove, profile } => {
+        Command::Setup { client, dry_run, remove, profile } => {
             let profile = profile.resolve()?;
             let mode = if remove { setup::Mode::Remove } else { setup::Mode::Install };
-            let (text, code) = setup::run(profile, mode, dry_run)?;
+            let (text, code) = match client {
+                SetupClient::ClaudeCode => setup::run(profile, mode, dry_run)?,
+                SetupClient::Cursor => setup::cursor::run(profile, mode, dry_run)?,
+            };
             println!("{text}");
             Ok(ExitCode::from(code))
         }
