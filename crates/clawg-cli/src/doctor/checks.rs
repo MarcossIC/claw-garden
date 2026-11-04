@@ -1062,7 +1062,7 @@ pub fn hook_runs(lang: Lang, runs: &[Run], hook_installed: bool, now_ms: i64, pr
         (Lang::Es, n) => format!("los últimos {n} inicios de sesión del hook, el más nuevo primero:"),
     };
     let lines = newest.iter().take(RUNS_IN_MESSAGE).map(|run| {
-        format!("{}  {}  {}  {}", age(lang, now_ms - run.at_ms), run.client, folder_name(lang, run), what_happened(lang, run))
+        format!("{}  {}  {}  {}", age(lang, now_ms.saturating_sub(run.at_ms)), run.client, folder_name(lang, run), what_happened(lang, run))
     });
     let message = std::iter::once(heading).chain(lines).collect::<Vec<_>>().join("\n");
     let evidence = json!({ "cursor_hook_installed": hook_installed, "total": runs.len(), "runs": newest });
@@ -1141,8 +1141,8 @@ fn what_happened(lang: Lang, run: &Run) -> String {
         (Outcome::DaemonError, Lang::Es) => "el daemon falló",
         (Outcome::TimedOut, Lang::En) => "it ran out of time",
         (Outcome::TimedOut, Lang::Es) => "se acabó el tiempo",
-        (Outcome::BadInput, Lang::En) => "the input was not JSON",
-        (Outcome::BadInput, Lang::Es) => "la entrada no era JSON",
+        (Outcome::BadInput, Lang::En) => "the input could not be read",
+        (Outcome::BadInput, Lang::Es) => "la entrada no se pudo leer",
         (Outcome::OtherClient, Lang::En) => "a Claude Code hook that Cursor runs",
         (Outcome::OtherClient, Lang::Es) => "un hook de Claude Code que corre Cursor",
     };
@@ -1945,6 +1945,24 @@ mod tests {
         printed.bytes = 300;
         let line = hook_runs(L, &[printed], false, NOW, P)[0].message.lines().nth(1).unwrap().to_string();
         assert!(line.ends_with("nothing: the daemon did not answer; printed 300 B"), "{line}");
+    }
+
+    #[test]
+    fn a_run_stamped_at_the_extremes_does_not_panic() {
+        for at_ms in [i64::MIN, i64::MAX, 0] {
+            let mut run = hook_run(1, Outcome::Injected);
+            run.at_ms = at_ms;
+            assert_eq!(hook_runs(L, &[run], false, NOW, P)[0].severity, Severity::Info);
+        }
+    }
+
+    #[test]
+    fn bad_input_does_not_claim_the_input_was_not_json() {
+        for (lang, said) in [(Lang::En, "the input could not be read"), (Lang::Es, "la entrada no se pudo leer")] {
+            let line = hook_runs(lang, &[hook_run(1, Outcome::BadInput)], false, NOW, P)[0].message.lines().nth(1).unwrap().to_string();
+            assert!(line.ends_with(said), "{line}");
+            assert!(!line.contains("JSON"), "{line}");
+        }
     }
 
     #[test]
