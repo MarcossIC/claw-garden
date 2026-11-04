@@ -1839,6 +1839,75 @@ async fn a_claude_code_hook_that_cursor_runs_does_nothing() {
     assert_eq!(project_roots(&daemon).await, Vec::<PathBuf>::new());
 }
 
+/// The lines of the hook's record, as JSON, and the file's text.
+fn hook_runs(sandbox: &Sandbox) -> (Vec<Value>, String) {
+    let text = std::fs::read_to_string(sandbox.data_dir().join("hook-runs.jsonl")).unwrap_or_default();
+    (text.lines().map(|l| serde_json::from_str(l).expect("a line of JSON")).collect(), text)
+}
+
+#[tokio::test]
+async fn a_cursor_session_start_leaves_its_line_and_no_input_value() {
+    let sandbox = Sandbox::new();
+    let (root, cursor) = (sandbox.home.join("repo"), dot_cursor(&sandbox));
+    std::fs::create_dir_all(&root).unwrap();
+    let project = clawg_core::memory::ProjectIdentity::resolve(&root).id;
+    let daemon = sandbox.serve().await;
+    let (status, body) = daemon
+        .post(
+            "/v1/memories",
+            json!({ "content": "the deploy script lives in ops/deploy.sh", "agent_id": "smoke", "project_id": project }),
+        )
+        .await;
+    assert!(status == 201 || status == 202, "{body}");
+    daemon.wait_until_ingested().await;
+
+    let args = ["session-start", "--agent", "smoke", "--client", "cursor", "--profile", "dev"];
+    let out = hook_in(&sandbox, &cursor, &args, &cursor_session_start(&[&root]));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    let (runs, text) = hook_runs(&sandbox);
+    assert_eq!(runs.len(), 1, "{text}");
+    let run = &runs[0];
+    assert_eq!((run["client"].as_str(), run["agent"].as_str(), run["outcome"].as_str()), (Some("cursor"), Some("smoke"), Some("injected")));
+    assert_eq!(run["roots"], 1);
+    assert_eq!(run["folder"], root.to_str().unwrap());
+    assert_eq!(run["cursor_version"], "3.28.0");
+    assert_eq!(run["bytes"], stdout_of(&out).trim_end().len());
+    assert!(run["input_keys"].as_array().unwrap().contains(&json!("user_email")), "{run}");
+    for value in ["user@example.com", "ops/deploy.sh", "668320d2"] {
+        assert!(!text.contains(value), "{value:?} in {text}");
+    }
+}
+
+#[tokio::test]
+async fn two_roots_leave_their_count_and_not_their_paths() {
+    let sandbox = Sandbox::new();
+    let (web, api, cursor) = (sandbox.home.join("web"), sandbox.home.join("api"), dot_cursor(&sandbox));
+    let _daemon = sandbox.serve().await;
+
+    let args = ["session-start", "--agent", "cursor", "--client", "cursor", "--profile", "dev"];
+    let out = hook_in(&sandbox, &cursor, &args, &cursor_session_start(&[&web, &api]));
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+
+    let (runs, text) = hook_runs(&sandbox);
+    assert_eq!(runs.len(), 1, "{text}");
+    assert_eq!((runs[0]["outcome"].as_str(), runs[0]["roots"].as_u64(), runs[0]["bytes"].as_u64()), (Some("several_folders"), Some(2), Some(0)));
+    assert!(runs[0]["folder"].is_null(), "{text}");
+    for value in [web.to_str().unwrap(), api.to_str().unwrap(), "user@example.com"] {
+        assert!(!text.contains(value), "{value:?} in {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_hook_does_not_create_the_data_directory_to_record() {
+    let sandbox = Sandbox::new();
+    let cursor = dot_cursor(&sandbox);
+    let args = ["session-start", "--agent", "cursor", "--client", "cursor", "--profile", "dev"];
+    let out = hook_in(&sandbox, &cursor, &args, &cursor_session_start(&[&sandbox.home]));
+    assert_eq!((out.status.code(), stdout_of(&out), stderr_of(&out)), (Some(0), String::new(), String::new()));
+    assert!(!sandbox.data_dir().exists(), "nothing was created to hold the record");
+}
+
 // ── doctor ─────────────────────────────────────────────────────────────────
 
 /// `clawg doctor` with a PATH that holds no `clawg` and no Claude Code

@@ -22,6 +22,7 @@ use clawg_cli::doctor;
 use clawg_cli::error::CliError;
 use clawg_cli::export;
 use clawg_cli::hook;
+use clawg_cli::hook_log;
 use clawg_cli::import;
 use clawg_cli::mcp;
 use clawg_cli::memories;
@@ -126,7 +127,11 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Hook { event, agent, client, profile } => {
             let profile = profile.resolve()?;
             let base_dir = data_dir(profile)?;
-            if let Some(out) = hook::respond(event, client, &agent, &base_dir, tokio::io::stdin(), hook::HOOK_DEADLINE).await {
+            let (out, run) = hook::respond_with_run(event, client, &agent, &base_dir, tokio::io::stdin(), hook::HOOK_DEADLINE).await;
+            if let Some(run) = run {
+                hook_log::record(&base_dir, &run);
+            }
+            if let Some(out) = out {
                 println!("{out}");
             }
             Ok(ExitCode::SUCCESS)

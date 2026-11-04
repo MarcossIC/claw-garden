@@ -55,7 +55,7 @@ El registro MUST NOT contener el valor de `user_email`, el texto del contexto ni
 - WHEN corre el hook
 - THEN la línea dice `several_folders`, `roots` 2, `folder` `null`, y ni el correo, ni las rutas ni el `transcript_path` aparecen en el archivo
 
-**Tests:** `a_run_never_holds_an_input_value` (`hook_log.rs`), `a_cursor_session_start_leaves_its_line_and_no_input_value`, `two_roots_leave_their_count_and_not_their_paths` (`tests/binary.rs`).
+**Tests:** `a_run_never_holds_an_input_value` (`hook.rs`), `a_cursor_session_start_leaves_its_line_and_no_input_value`, `two_roots_leave_their_count_and_not_their_paths` (`tests/binary.rs`).
 
 ## HR4. El registro está acotado y nunca molesta
 

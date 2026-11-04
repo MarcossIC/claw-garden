@@ -34,6 +34,7 @@ pub mod doctor;
 pub mod error;
 pub mod export;
 pub mod hook;
+pub mod hook_log;
 pub mod import;
 pub mod mcp;
 pub mod memories;
