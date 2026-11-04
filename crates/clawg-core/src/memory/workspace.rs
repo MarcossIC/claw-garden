@@ -3,9 +3,9 @@
 //! preserved byte-for-byte.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::memory::clock::TimestampMs;
 use crate::memory::prompt_builder::indent_continuations;
 use crate::memory::{record::TableKind, MemoryError, MemoryStore};
 
@@ -272,6 +272,8 @@ impl WorkspaceManager {
 struct MemoryLine {
     id: i64,
     content: String,
+    importance: f64,
+    created_at: TimestampMs,
 }
 
 /// One `procedural_skill` row selected for the AUTO section. `trigger` says
@@ -285,6 +287,8 @@ struct SkillLine {
     trigger: String,
     /// Raw column value: a JSON array of tool names, parsed at render time.
     tool_sequence_json: String,
+    importance: f64,
+    created_at: TimestampMs,
 }
 
 #[derive(Clone)]
@@ -302,29 +306,41 @@ struct AutoRows {
 /// model through nobody. Reporting what was rendered, instead of restating a
 /// rule about what might have been, makes "never deliver the same row twice"
 /// impossible to violate by drift.
+///
+/// Each row comes with the line it printed and what orders it, so the prompt
+/// can take a row out of its copy of the section and name it: the file holds
+/// no ids.
 #[derive(Debug, Clone, Default)]
 pub struct EmittedIds {
-    memory: HashSet<i64>,
-    procedural: HashSet<i64>,
+    rows: Vec<EmittedRow>,
+}
+
+/// A row the AUTO section printed, in the order it printed them.
+#[derive(Debug, Clone)]
+pub(crate) struct EmittedRow {
+    pub(crate) kind: TableKind,
+    pub(crate) id: i64,
+    pub(crate) importance: f64,
+    pub(crate) created_at: TimestampMs,
+    /// The entry as the file holds it, without its last line break.
+    pub(crate) line: String,
 }
 
 impl EmittedIds {
     pub(crate) fn contains(&self, kind: TableKind, id: i64) -> bool {
-        match kind {
-            TableKind::Memory => self.memory.contains(&id),
-            TableKind::Procedural => self.procedural.contains(&id),
-            // The AUTO section has no episodic query, so no trajectory can
-            // ever have been emitted through it.
-            TableKind::Episodic => false,
-        }
+        self.rows.iter().any(|r| r.kind == kind && r.id == id)
     }
 
     pub(crate) fn memory_ids(&self) -> impl Iterator<Item = i64> + '_ {
-        self.memory.iter().copied()
+        self.rows.iter().filter(|r| r.kind == TableKind::Memory).map(|r| r.id)
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.memory.len() + self.procedural.len()
+        self.rows.len()
+    }
+
+    pub(crate) fn rows(&self) -> &[EmittedRow] {
+        &self.rows
     }
 }
 
@@ -358,7 +374,7 @@ async fn fetch_auto_rows(
             // and the conflicts block reaches the prompt for every row this
             // section emits, so the dispute is shown next to it.
             let mut stmt = c.prepare(
-                "SELECT id, content FROM memory
+                "SELECT id, content, importance, created_at FROM memory
                  WHERE memory_type = 'user_preference'
                    AND importance >= 8
                    AND agent_id = ?1
@@ -368,9 +384,7 @@ async fn fetch_auto_rows(
                  ORDER BY importance DESC",
             )?;
             let user_prefs: Vec<MemoryLine> = readable(
-                stmt.query_map(rusqlite::params![agent], |row| {
-                    Ok(MemoryLine { id: row.get(0)?, content: row.get(1)? })
-                })?,
+                stmt.query_map(rusqlite::params![agent], map_memory)?,
                 "user_preference",
             );
 
@@ -385,7 +399,7 @@ async fn fetch_auto_rows(
             // every real workspace, which is where they are actually needed.
             let arch_decisions: Vec<MemoryLine> = if let Some(ref pid) = proj {
                 let mut stmt2 = c.prepare(
-                    "SELECT id, content FROM memory
+                    "SELECT id, content, importance, created_at FROM memory
                      WHERE memory_type = 'architectural_decision'
                        AND importance >= 8
                        AND agent_id = ?1
@@ -396,15 +410,13 @@ async fn fetch_auto_rows(
                      ORDER BY importance DESC",
                 )?;
                 let rows: Vec<MemoryLine> = readable(
-                    stmt2.query_map(rusqlite::params![agent, pid], |row| {
-                        Ok(MemoryLine { id: row.get(0)?, content: row.get(1)? })
-                    })?,
+                    stmt2.query_map(rusqlite::params![agent, pid], map_memory)?,
                     "architectural_decision",
                 );
                 rows
             } else {
                 let mut stmt2 = c.prepare(
-                    "SELECT id, content FROM memory
+                    "SELECT id, content, importance, created_at FROM memory
                      WHERE memory_type = 'architectural_decision'
                        AND importance >= 8
                        AND agent_id = ?1
@@ -414,9 +426,7 @@ async fn fetch_auto_rows(
                      ORDER BY importance DESC",
                 )?;
                 let rows: Vec<MemoryLine> = readable(
-                    stmt2.query_map(rusqlite::params![agent], |row| {
-                        Ok(MemoryLine { id: row.get(0)?, content: row.get(1)? })
-                    })?,
+                    stmt2.query_map(rusqlite::params![agent], map_memory)?,
                     "architectural_decision",
                 );
                 rows
@@ -435,11 +445,13 @@ async fn fetch_auto_rows(
                     skill_name: row.get(1)?,
                     trigger: row.get(2)?,
                     tool_sequence_json: row.get(3)?,
+                    importance: row.get(4)?,
+                    created_at: TimestampMs::from_unix_millis(row.get(5)?),
                 })
             };
             let top_skills: Vec<SkillLine> = if let Some(ref pid) = proj {
                 let mut stmt3 = c.prepare(
-                    "SELECT id, skill_name, trigger, tool_sequence FROM procedural_skill
+                    "SELECT id, skill_name, trigger, tool_sequence, importance, created_at FROM procedural_skill
                      WHERE agent_id = ?1
                        AND (project_id = ?2 OR project_id IS NULL)
                        AND tier = 1
@@ -452,7 +464,7 @@ async fn fetch_auto_rows(
                 rows
             } else {
                 let mut stmt3 = c.prepare(
-                    "SELECT id, skill_name, trigger, tool_sequence FROM procedural_skill
+                    "SELECT id, skill_name, trigger, tool_sequence, importance, created_at FROM procedural_skill
                      WHERE agent_id = ?1
                        AND tier = 1
                        AND deleted_at IS NULL
@@ -478,6 +490,15 @@ async fn fetch_auto_rows(
             }
             other => MemoryError::Backend(other.to_string()),
         })
+}
+
+fn map_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryLine> {
+    Ok(MemoryLine {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        importance: row.get(2)?,
+        created_at: TimestampMs::from_unix_millis(row.get(3)?),
+    })
 }
 
 /// The rows that read. One that does not is left out of its section rather
@@ -509,16 +530,21 @@ fn render_auto_section(rows: &AutoRows) -> (String, EmittedIds) {
         content = render_rows(&kept);
     }
 
-    let emitted = EmittedIds {
-        memory: kept
-            .user_prefs
-            .iter()
-            .chain(kept.arch_decisions.iter())
-            .map(|r| r.id)
-            .collect(),
-        procedural: kept.top_skills.iter().map(|s| s.id).collect(),
-    };
-    (content, emitted)
+    let memory = kept.user_prefs.iter().chain(&kept.arch_decisions).map(|r| EmittedRow {
+        kind: TableKind::Memory,
+        id: r.id,
+        importance: r.importance,
+        created_at: r.created_at,
+        line: memory_line(r),
+    });
+    let skills = kept.top_skills.iter().map(|s| EmittedRow {
+        kind: TableKind::Procedural,
+        id: s.id,
+        importance: s.importance,
+        created_at: s.created_at,
+        line: format_skill_line(s),
+    });
+    (content, EmittedIds { rows: memory.chain(skills).collect() })
 }
 
 /// `["read","edit"]` → `"read → edit"`. Returns `None` for an empty or
@@ -546,8 +572,12 @@ fn format_skill_line(skill: &SkillLine) -> String {
         line.push_str(" — tools: ");
         line.push_str(&seq);
     }
-    line.push('\n');
     line
+}
+
+/// The entry of a preference or a decision, without its line break.
+fn memory_line(row: &MemoryLine) -> String {
+    format!("- {}", copied(&row.content))
 }
 
 /// A saved text as the AUTO section holds it: each line after the first
@@ -564,15 +594,18 @@ fn render_rows(rows: &AutoRows) -> String {
     out.push('\n');
     out.push_str("## User Preferences (always active)\n");
     for row in &rows.user_prefs {
-        out.push_str(&format!("- {}\n", copied(&row.content)));
+        out.push_str(&memory_line(row));
+        out.push('\n');
     }
     out.push_str("## Architectural Decisions\n");
     for row in &rows.arch_decisions {
-        out.push_str(&format!("- {}\n", copied(&row.content)));
+        out.push_str(&memory_line(row));
+        out.push('\n');
     }
     out.push_str("## Procedural Skills\n");
     for skill in &rows.top_skills {
         out.push_str(&format_skill_line(skill));
+        out.push('\n');
     }
     out.push_str(AUTO_END);
     out.push('\n');
@@ -849,6 +882,7 @@ fn is_windows_device_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use crate::memory::db::MemoryStore;
 
     #[test]
@@ -1365,6 +1399,28 @@ mod tests {
              the only channel that can still deliver it"
         );
         assert_eq!(emitted.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_regeneration_reports_each_line_it_wrote() {
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let pref = insert_tier1_memory(&store, "agent-lines", "answer in spanish\nand keep it short", "user_preference", 9.0).await;
+        store.conn.call(move |c| c.execute("UPDATE memory SET created_at = 1234 WHERE id = ?1", [pref])).await.unwrap();
+        let skill = insert_skill(&store, "agent-lines", "fix-a-test", "a test fails", "[\"read\",\"edit\"]").await;
+
+        let emitted = wm.regenerate_auto_section("agent-lines", None, &store).await.unwrap();
+
+        let reported: Vec<(TableKind, i64, f64, i64)> =
+            emitted.rows().iter().map(|r| (r.kind, r.id, r.importance, r.created_at.as_millis_i64())).collect();
+        assert_eq!(reported, [(TableKind::Memory, pref, 9.0, 1234), (TableKind::Procedural, skill, 8.0, 1_700_000_000_000)]);
+        assert_eq!(emitted.rows()[0].line, "- answer in spanish\n  | and keep it short");
+        let file = tokio::fs::read_to_string(wm.workspace_path("agent-lines", None)).await.unwrap();
+        let auto = &file[file.find(AUTO_START).unwrap()..file.find(AUTO_END).unwrap()];
+        for row in emitted.rows() {
+            assert!(auto.contains(&format!("\n{}\n", row.line)), "{:?} is not a line of:\n{auto}", row.line);
+        }
     }
 
     #[tokio::test]
