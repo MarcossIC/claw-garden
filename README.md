@@ -451,6 +451,10 @@ Después **reiniciá Cursor**, abrí un chat y pedile al agente que use la herra
 
 La configuración sigue la documentación de Cursor 3.28. Falta comprobarla con Cursor instalado: que el hook corra en Windows sin abrir una ventana y que la memoria llegue al agente.
 
+**Comprobar que anduvo.** Cada chat nuevo que corre el hook deja una línea en `~/.clawg/hook-runs.jsonl`, y `clawg doctor --profile prod` muestra las últimas en `checks`, en la entrada `hooks.runs`: cuándo, qué cliente, qué carpeta y qué pasó con la memoria (`inyectó 3,2 KB`, `nada: varias carpetas`, `nada: el daemon no respondió`, …). Si el hook está instalado y no hay ninguna, `doctor` lo dice: abrí un chat nuevo y corré `doctor` otra vez; si sigue igual, Cursor no está corriendo el hook. Que una línea diga `inyectó` prueba que el hook imprimió el contexto, no que el agente lo haya leído: Cursor documenta `sessionStart` como "fire-and-forget".
+
+Si un chat empieza sin memoria, pegá la entrada `hooks.runs` de la salida de `clawg doctor --profile prod` (lleva las últimas 20 corridas completas). Lleva la carpeta de cada chat, pero no tu correo ni el texto de ninguna memoria: de lo que Cursor manda sólo guarda el nombre de los campos, nunca sus valores.
+
 ## Otros clientes MCP
 
 Cualquier cliente que acepte servidores MCP por stdio sirve: hay que darle el comando y sus argumentos, con un `--agent` fijo para ese cliente (ver [Fijar la identidad del agente](#fijar-la-identidad-del-agente)). En los que se configuran con un JSON del estilo `mcpServers`, sería:
