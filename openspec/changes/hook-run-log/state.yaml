@@ -1,7 +1,7 @@
 change: hook-run-log
 objective: "4"
 depends_on: []
-phase: apply
+phase: verify
 release: "0.76.0"  # sale con client-setup-cursor, antes de la prueba con Cursor real; el bump va en un commit posterior
 artifacts:
   exploration: skipped  # la evidencia va en la propuesta
@@ -9,8 +9,8 @@ artifacts:
   spec: done  # HR1 a HR7; al archivar, HR1 a HR5 van a specs/hooks y HR6 y HR7 a specs/doctor
   design: skipped  # las decisiones están en la propuesta
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done  # un commit por paso, con sus tests en rojo antes
+  verify: pending  # Linux y el CI de Windows no corrieron: falta el pull request; en Windows local pasan la suite y los dos clippy (verify.md)
   archive: pending
 main_spec: openspec/specs/hooks/spec.md, openspec/specs/doctor/spec.md
 updated: 2026-11-04

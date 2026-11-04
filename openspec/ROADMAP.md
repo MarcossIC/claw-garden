@@ -34,7 +34,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 |---|---|---|
 | [history-reimport](changes/history-reimport/exploration.md), ensayo | Local: copia del store, export, transcripciones, línea base | Si el rendimiento mejoró de verdad, y un mapa para las notas sin proyecto |
 | [session-start-context](changes/session-start-context/proposal.md) | Nube | El traspaso de sesión vuelve a entrar, y el aviso deja de contar lo importado. Aplicado y verificado en Linux, con un PR abierto a `develop` ([verify](changes/session-start-context/verify.md)); falta revisarlo, ver el CI de Windows y archivarlo |
-| [hook-run-log](changes/hook-run-log/proposal.md) | Local | Sale en el mismo release que client-setup-cursor, antes de la prueba con Cursor real: cada inicio de sesión deja una línea y `clawg doctor` muestra las últimas, para saber si el hook corrió y por qué no inyectó. |
+| [hook-run-log](changes/hook-run-log/proposal.md) | Local | Sale en el mismo release que client-setup-cursor, antes de la prueba con Cursor real: cada inicio de sesión deja una línea y `clawg doctor` muestra las últimas, para saber si el hook corrió y por qué no inyectó. Aplicado y verificado en Windows localmente, falta el CI de Windows ([verify](changes/hook-run-log/verify.md)) |
 
 **Al otro día, con la persona:** decidir [preference-model](changes/preference-model/exploration.md) y hacer la prueba de 10 minutos de [bridge-project-identity](changes/bridge-project-identity/exploration.md).
 
