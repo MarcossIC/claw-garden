@@ -1,13 +1,15 @@
 change: session-start-context
 objective: "1, 4"
 depends_on: []
-phase: proposal  # decisiones cerradas en la exploración
+phase: apply
 artifacts:
   exploration: done
-  proposal: pending
-  spec: pending
-  tasks: pending
+  proposal: done  # las seis decisiones de la exploración, y cómo se nombra una entrada de AUTO
+  spec: done  # SC1 a SC6
+  design: skipped  # las decisiones están cerradas en la exploración; la propuesta dice cómo se aplican
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-03
+main_spec: openspec/specs/retrieval/spec.md
+updated: 2026-11-04
