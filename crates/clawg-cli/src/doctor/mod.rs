@@ -215,6 +215,9 @@ pub fn run(profile: Profile) -> Result<Report, DoctorError> {
     found.extend(claude_code(lang, profile, &exe));
     let imported = inspection.facts.as_ref().map(|f| f.claude_code_imports.as_slice()).unwrap_or_default();
     found.extend(native_memory(lang, profile, imported));
+    let runs = crate::hook_log::read_runs(&data_dir);
+    let cursor_hook = crate::setup::cursor::hook_installed(clawg_core::paths::home_dir().as_deref(), profile);
+    found.extend(checks::hook_runs(lang, &runs, cursor_hook, now_ms(), profile));
 
     let summary = Summary::of(&found);
     Ok(Report {

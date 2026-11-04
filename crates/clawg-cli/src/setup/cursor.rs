@@ -327,6 +327,22 @@ pub fn locations(home: Option<&Path>) -> Result<(PathBuf, PathBuf), SetupError> 
     Ok((dir.join("mcp.json"), dir.join("hooks.json")))
 }
 
+/// Whether `text`, a `hooks.json`, has `profile`'s hook under `sessionStart`.
+fn installed_in(text: &str, profile: Profile, shell: Shell) -> bool {
+    let Ok(Value::Object(file)) = serde_json::from_str::<Value>(text) else { return false };
+    file.get("hooks")
+        .and_then(|hooks| hooks.get(EVENT))
+        .and_then(Value::as_array)
+        .is_some_and(|listed| listed.iter().any(|hook| is_clawg_hook(hook, profile, shell)))
+}
+
+/// Whether the `hooks.json` under `home` has the hook `setup cursor` writes
+/// for `profile`; a missing or unreadable file says no.
+pub fn hook_installed(home: Option<&Path>, profile: Profile) -> bool {
+    let Ok((_, hooks)) = locations(home) else { return false };
+    std::fs::read_to_string(hooks).is_ok_and(|text| installed_in(&text, profile, Shell::HOST))
+}
+
 /// Reads what [`plan`] decides from, the preferred language from `data_dir`.
 pub fn read_state(exe: PathBuf, profile: Profile, home: Option<&Path>, data_dir: &Path) -> Result<State, SetupError> {
     let (servers, hooks) = locations(home)?;
@@ -748,6 +764,27 @@ mod tests {
         assert_eq!(json(written(&installing.hooks))["hooks"]["sessionStart"][0]["command"], prod);
         let removing = plan(&state(None, Some(&hooks)), Mode::Remove, Shell::Posix).unwrap();
         assert_eq!((&removing.hook_step, &removing.hooks), (&Step::Absent, &FileStep::Unchanged), "the prod hook stays");
+    }
+
+    #[test]
+    fn the_hook_of_this_profile_is_found_in_hooks_json() {
+        let ours = hook_line("/opt/clawg/clawg", Profile::Dev, Shell::Posix);
+        let hooks = |command: &str| serde_json::json!({ "version": 1, "hooks": { "sessionStart": [{ "command": "other" }, { "command": command }] } }).to_string();
+
+        assert!(installed_in(&hooks(&ours), Profile::Dev, Shell::Posix));
+        assert!(!installed_in(&hooks(&ours), Profile::Prod, Shell::Posix), "the other profile's hook is not ours");
+        assert!(!installed_in(&hooks("echo hi"), Profile::Dev, Shell::Posix));
+        for text in ["", "not json", "[]", r#"{"hooks":{"sessionStart":"x"}}"#, r#"{"version":1}"#] {
+            assert!(!installed_in(text, Profile::Dev, Shell::Posix), "{text:?}");
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        assert!(!hook_installed(Some(home.path()), Profile::Dev), "no file");
+        assert!(!hook_installed(None, Profile::Dev), "no home");
+        let (_, hooks_path) = locations(Some(home.path())).unwrap();
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        std::fs::write(&hooks_path, hooks(&hook_line("/opt/clawg/clawg", Profile::Dev, Shell::HOST))).unwrap();
+        assert!(hook_installed(Some(home.path()), Profile::Dev));
     }
 
     #[test]

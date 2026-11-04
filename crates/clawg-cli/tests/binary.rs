@@ -1949,6 +1949,45 @@ fn store_files(data_dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 #[tokio::test]
+async fn doctor_lists_the_hook_runs_and_still_exits_0() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.data_dir()).unwrap();
+    let cursor = dot_cursor(&sandbox);
+    let root = sandbox.home.join("repo");
+    let cursor_args = ["session-start", "--agent", "cursor", "--client", "cursor", "--profile", "dev"];
+    hook_in(&sandbox, &cursor, &cursor_args, &cursor_session_start(&[&root]));
+    hook_in(&sandbox, &cursor, &cursor_args, &cursor_session_start(&[&root, &sandbox.home]));
+    let claude = json!({ "cwd": root, "source": "startup" }).to_string();
+    hook(&sandbox, &["session-start", "--agent", "claude-code", "--profile", "dev"], &claude);
+
+    let (output, report) = doctor(&sandbox);
+
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(findings(&report, "hooks.runs"), [("info", "recent")]);
+    let found = report["checks"].as_array().unwrap().iter().find(|f| f["check_id"] == "hooks.runs").unwrap();
+    let message = found["message"].as_str().unwrap();
+    assert_eq!(message.lines().count(), 4, "a heading and three runs: {message}");
+    let runs = found["evidence"]["runs"].as_array().unwrap();
+    let clients: Vec<&str> = runs.iter().map(|r| r["client"].as_str().unwrap()).collect();
+    assert_eq!(clients, ["claude-code", "cursor", "cursor"], "newest first");
+    assert!(!report.to_string().contains("user@example.com"));
+}
+
+#[tokio::test]
+async fn doctor_says_when_the_installed_hook_never_ran() {
+    let sandbox = Sandbox::new();
+    let (_, before) = doctor(&sandbox);
+    assert_eq!(findings(&before, "hooks.runs"), [], "no Cursor hook and no runs: nothing to say");
+
+    let setup = sandbox.run(&["setup", "cursor", "--profile", "dev"]);
+    assert_eq!(setup.status.code(), Some(0), "{}", stderr_of(&setup));
+    let (output, after) = doctor(&sandbox);
+
+    assert_eq!(output.status.code(), Some(0), "{after}");
+    assert_eq!(findings(&after, "hooks.runs"), [("info", "not_run")]);
+}
+
+#[tokio::test]
 async fn doctor_reads_a_running_daemons_store_without_changing_it() {
     let sandbox = Sandbox::new();
     let daemon = sandbox.serve().await;

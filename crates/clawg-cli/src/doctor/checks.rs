@@ -25,6 +25,7 @@ use serde_json::json;
 use super::finding::{Finding, Severity};
 use super::Analysis;
 use crate::daemon::socket::SocketError;
+use crate::hook_log::{Outcome, Run};
 use crate::mcp::server::FALLBACK_AGENT_ID;
 
 /// Days the newest snapshot may age before `backup.age` warns. A starting
@@ -1027,6 +1028,132 @@ pub fn invariants(lang: Lang, inv: &Invariants) -> Vec<Finding> {
     found
 }
 
+/// Runs the message lists, newest first.
+const RUNS_IN_MESSAGE: usize = 5;
+/// Runs the evidence keeps in full, newest first.
+const RUNS_IN_EVIDENCE: usize = 20;
+
+/// The record of `clawg hook session-start`: `runs` oldest first, and whether
+/// this profile's Cursor hook is installed. Always `info`: several outcomes
+/// are no fault, and which are is not known yet. Without runs, an installed
+/// hook says nobody ran it, and no hook says nothing.
+pub fn hook_runs(lang: Lang, runs: &[Run], hook_installed: bool, now_ms: i64, profile: Profile) -> Vec<Finding> {
+    if runs.is_empty() {
+        if !hook_installed {
+            return Vec::new();
+        }
+        let message = match lang {
+            Lang::En => "the Cursor hook is installed and no chat has run it yet: open a new chat in Cursor and run \
+                         `clawg doctor` again. If this stays the same, Cursor is not running the hook",
+            Lang::Es => "el hook de Cursor está instalado y todavía ningún chat lo corrió: abre un chat nuevo en Cursor y \
+                         corre `clawg doctor` otra vez. Si sigue igual, Cursor no está corriendo el hook",
+        };
+        let evidence = json!({ "cursor_hook_installed": true, "total": 0, "runs": [] });
+        return vec![Finding::new("hooks.runs", Severity::Info, "not_run", message)
+            .evidence(evidence)
+            .step(with_profile("clawg doctor", profile))];
+    }
+    let newest: Vec<&Run> = runs.iter().rev().take(RUNS_IN_EVIDENCE).collect();
+    let listed = newest.len().min(RUNS_IN_MESSAGE);
+    let heading = match (lang, listed) {
+        (Lang::En, 1) => "the last session start of the hook:".to_string(),
+        (Lang::En, n) => format!("the last {n} session starts of the hook, newest first:"),
+        (Lang::Es, 1) => "el último inicio de sesión del hook:".to_string(),
+        (Lang::Es, n) => format!("los últimos {n} inicios de sesión del hook, el más nuevo primero:"),
+    };
+    let lines = newest.iter().take(RUNS_IN_MESSAGE).map(|run| {
+        format!("{}  {}  {}  {}", age(lang, now_ms - run.at_ms), run.client, folder_name(lang, run), what_happened(lang, run))
+    });
+    let message = std::iter::once(heading).chain(lines).collect::<Vec<_>>().join("\n");
+    let evidence = json!({ "cursor_hook_installed": hook_installed, "total": runs.len(), "runs": newest });
+    vec![Finding::new("hooks.runs", Severity::Info, "recent", message).evidence(evidence)]
+}
+
+/// How long ago, in words, for a clock that may have gone back.
+fn age(lang: Lang, elapsed_ms: i64) -> String {
+    let minutes = elapsed_ms.max(0) / 60_000;
+    let (hours, days) = (minutes / 60, minutes / (24 * 60));
+    match lang {
+        Lang::En => match minutes {
+            0 => "just now".to_string(),
+            1..=59 => format!("{minutes} min ago"),
+            _ if days == 0 => format!("{hours} h ago"),
+            _ if days == 1 => "1 day ago".to_string(),
+            _ => format!("{days} days ago"),
+        },
+        Lang::Es => match minutes {
+            0 => "ahora".to_string(),
+            1..=59 => format!("hace {minutes} min"),
+            _ if days == 0 => format!("hace {hours} h"),
+            _ if days == 1 => "hace 1 día".to_string(),
+            _ => format!("hace {days} días"),
+        },
+    }
+}
+
+/// The last part of the run's folder, whichever separator it came with, or
+/// how many folders there were.
+fn folder_name(lang: Lang, run: &Run) -> String {
+    match (&run.folder, run.roots) {
+        (Some(folder), _) => {
+            let last = folder.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default();
+            if last.is_empty() { folder.clone() } else { last.to_string() }
+        }
+        (None, Some(n)) if n > 1 => match lang {
+            Lang::En => format!("({n} folders)"),
+            Lang::Es => format!("({n} carpetas)"),
+        },
+        _ => match lang {
+            Lang::En => "(no folder)".to_string(),
+            Lang::Es => "(sin carpeta)".to_string(),
+        },
+    }
+}
+
+fn size(lang: Lang, bytes: usize) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let kb = format!("{:.1} KB", bytes as f64 / 1024.0);
+    match lang {
+        Lang::En => kb,
+        Lang::Es => kb.replace('.', ","),
+    }
+}
+
+/// What became of the memory in a run, in words; what was printed besides is
+/// said when there was something.
+fn what_happened(lang: Lang, run: &Run) -> String {
+    let reason = match (run.outcome, lang) {
+        (Outcome::Injected, Lang::En) => return format!("injected {}", size(lang, run.bytes)),
+        (Outcome::Injected, Lang::Es) => return format!("inyectó {}", size(lang, run.bytes)),
+        (Outcome::EmptyContext, Lang::En) => "no memories to show",
+        (Outcome::EmptyContext, Lang::Es) => "sin memorias para mostrar",
+        (Outcome::SeveralFolders, Lang::En) => "several folders",
+        (Outcome::SeveralFolders, Lang::Es) => "varias carpetas",
+        (Outcome::NoFolder, Lang::En) => "no folder",
+        (Outcome::NoFolder, Lang::Es) => "sin carpeta",
+        (Outcome::NoDaemon, Lang::En) => "the daemon did not answer",
+        (Outcome::NoDaemon, Lang::Es) => "el daemon no respondió",
+        (Outcome::ProjectRefused, Lang::En) => "the project was refused",
+        (Outcome::ProjectRefused, Lang::Es) => "se rechazó el proyecto",
+        (Outcome::DaemonError, Lang::En) => "the daemon failed",
+        (Outcome::DaemonError, Lang::Es) => "el daemon falló",
+        (Outcome::TimedOut, Lang::En) => "it ran out of time",
+        (Outcome::TimedOut, Lang::Es) => "se acabó el tiempo",
+        (Outcome::BadInput, Lang::En) => "the input was not JSON",
+        (Outcome::BadInput, Lang::Es) => "la entrada no era JSON",
+        (Outcome::OtherClient, Lang::En) => "a Claude Code hook that Cursor runs",
+        (Outcome::OtherClient, Lang::Es) => "un hook de Claude Code que corre Cursor",
+    };
+    match (lang, run.bytes) {
+        (Lang::En, 0) => format!("nothing: {reason}"),
+        (Lang::Es, 0) => format!("nada: {reason}"),
+        (Lang::En, bytes) => format!("nothing: {reason}; printed {}", size(lang, bytes)),
+        (Lang::Es, bytes) => format!("nada: {reason}; imprimió {}", size(lang, bytes)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1718,5 +1845,119 @@ mod tests {
         assert_eq!(found[1].evidence["repository_id"], "gone-0004");
         let healthy = project_subfolders(L, &registry, &all[..2]);
         assert_eq!((healthy[0].reason_code, &healthy[0].evidence), ("healthy", &json!({ "declared": 2 })));
+    }
+
+    const MIN: i64 = 60_000;
+    const NOW: i64 = 1_000_000 * MIN;
+
+    fn hook_run(minutes_ago: i64, outcome: Outcome) -> Run {
+        Run {
+            at_ms: NOW - minutes_ago * MIN,
+            client: "cursor".into(),
+            agent: "cursor".into(),
+            source: None,
+            outcome,
+            bytes: 0,
+            elapsed_ms: 5,
+            roots: Some(1),
+            folder: Some("/c:/Users/me/claw-garden".into()),
+            cursor_version: Some("3.28.0".into()),
+            input_keys: vec!["workspace_roots".into()],
+        }
+    }
+
+    #[test]
+    fn recent_runs_are_listed_newest_first_five_in_the_message_and_twenty_in_the_evidence() {
+        let runs: Vec<Run> = (0..25).map(|i| hook_run(25 - i, Outcome::NoDaemon)).collect();
+        let found = hook_runs(L, &runs, false, NOW, P);
+
+        assert_eq!(kinds(&found), [("hooks.runs", Severity::Info, "recent")]);
+        let lines: Vec<&str> = found[0].message.lines().collect();
+        assert_eq!(lines.len(), 6, "a heading and five runs: {}", found[0].message);
+        assert!(lines[1].starts_with("1 min ago"), "{lines:?}");
+        assert!(lines[5].starts_with("5 min ago"), "{lines:?}");
+        let evidence = found[0].evidence["runs"].as_array().unwrap();
+        assert_eq!(evidence.len(), 20);
+        assert_eq!((evidence[0]["at_ms"].as_i64(), evidence[19]["at_ms"].as_i64()), (Some(NOW - MIN), Some(NOW - 20 * MIN)));
+        assert_eq!(found[0].evidence["total"], 25);
+        assert_eq!(evidence[0]["folder"], "/c:/Users/me/claw-garden", "the evidence is the run in full");
+    }
+
+    #[test]
+    fn a_run_reads_as_age_client_folder_and_what_happened() {
+        let mut injected = hook_run(5, Outcome::Injected);
+        injected.bytes = 3_277;
+        let mut several = hook_run(125, Outcome::SeveralFolders);
+        (several.roots, several.folder) = (Some(4), None);
+        let mut down = hook_run(26 * 60, Outcome::NoDaemon);
+        down.folder = Some(r"C:\Users\me\pdf-service\".into());
+
+        let es = hook_runs(Lang::Es, &[down.clone(), several.clone(), injected.clone()], false, NOW, P);
+        let lines: Vec<&str> = es[0].message.lines().skip(1).collect();
+        assert_eq!(lines[0], "hace 5 min  cursor  claw-garden  inyectó 3,2 KB");
+        assert_eq!(lines[1], "hace 2 h  cursor  (4 carpetas)  nada: varias carpetas");
+        assert_eq!(lines[2], "hace 1 día  cursor  pdf-service  nada: el daemon no respondió");
+        let en = hook_runs(L, &[injected], false, NOW, P);
+        assert_eq!(en[0].message.lines().nth(1), Some("5 min ago  cursor  claw-garden  injected 3.2 KB"));
+    }
+
+    #[test]
+    fn a_folder_is_named_by_its_last_part() {
+        let named = |folder: Option<&str>, roots: Option<usize>| {
+            let mut run = hook_run(1, Outcome::Injected);
+            (run.folder, run.roots) = (folder.map(String::from), roots);
+            folder_name(L, &run)
+        };
+        assert_eq!(named(Some("/c:/Users/me/claw-garden"), Some(1)), "claw-garden");
+        assert_eq!(named(Some(r"C:\Users\me\pdf-service\"), None), "pdf-service");
+        assert_eq!(named(Some("/"), None), "/");
+        assert_eq!(named(None, Some(4)), "(4 folders)");
+        assert_eq!(named(None, Some(0)), "(no folder)");
+        assert_eq!(named(None, None), "(no folder)");
+    }
+
+    #[test]
+    fn ages_are_counted_in_words() {
+        let at = |lang, ms: i64| age(lang, ms);
+        assert_eq!(at(Lang::Es, 20_000), "ahora");
+        assert_eq!(at(Lang::Es, -5 * MIN), "ahora", "a clock that went back");
+        assert_eq!(at(Lang::Es, 59 * MIN), "hace 59 min");
+        assert_eq!(at(Lang::Es, 3 * 60 * MIN), "hace 3 h");
+        assert_eq!(at(Lang::Es, 24 * 60 * MIN), "hace 1 día");
+        assert_eq!(at(Lang::Es, 49 * 60 * MIN), "hace 2 días");
+        assert_eq!(at(Lang::En, 20_000), "just now");
+        assert_eq!(at(Lang::En, 24 * 60 * MIN), "1 day ago");
+        assert_eq!(at(Lang::En, 72 * 60 * MIN), "3 days ago");
+    }
+
+    #[test]
+    fn every_outcome_has_words_and_none_raises_the_severity() {
+        use Outcome::*;
+        for outcome in [Injected, EmptyContext, SeveralFolders, NoFolder, NoDaemon, ProjectRefused, DaemonError, TimedOut, BadInput, OtherClient] {
+            for lang in [Lang::En, Lang::Es] {
+                let found = hook_runs(lang, &[hook_run(1, outcome)], true, NOW, P);
+                assert_eq!(found[0].severity, Severity::Info, "{outcome:?}");
+                let line = found[0].message.lines().nth(1).unwrap();
+                assert!(!line.contains('_'), "{outcome:?} reads as an identifier: {line}");
+            }
+        }
+        let mut printed = hook_run(1, Outcome::NoDaemon);
+        printed.bytes = 300;
+        let line = hook_runs(L, &[printed], false, NOW, P)[0].message.lines().nth(1).unwrap().to_string();
+        assert!(line.ends_with("nothing: the daemon did not answer; printed 300 B"), "{line}");
+    }
+
+    #[test]
+    fn an_installed_hook_with_no_runs_says_so_and_none_installed_says_nothing() {
+        assert_eq!(hook_runs(L, &[], false, NOW, P), []);
+        let found = hook_runs(L, &[], true, NOW, P);
+        assert_eq!(kinds(&found), [("hooks.runs", Severity::Info, "not_run")]);
+        assert!(found[0].message.contains("installed") && found[0].message.contains("new chat"), "{}", found[0].message);
+        assert_eq!(found[0].safe_next_step.as_deref(), Some("clawg doctor --profile dev"));
+        assert!(!found[0].requires_confirmation);
+        let es = hook_runs(Lang::Es, &[], true, NOW, P);
+        assert!(es[0].message.contains("chat nuevo"), "{}", es[0].message);
+        let with_runs_and_no_hook = hook_runs(L, &[hook_run(1, Outcome::Injected)], false, NOW, P);
+        assert_eq!(kinds(&with_runs_and_no_hook), [("hooks.runs", Severity::Info, "recent")]);
     }
 }
