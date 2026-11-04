@@ -33,7 +33,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 | Cambio | Dónde | Qué deja resuelto |
 |---|---|---|
 | [history-reimport](changes/history-reimport/exploration.md), ensayo | Local: copia del store, export, transcripciones, línea base | Si el rendimiento mejoró de verdad, y un mapa para las notas sin proyecto |
-| [session-start-context](changes/session-start-context/exploration.md) | Nube | El traspaso de sesión vuelve a entrar, y el aviso deja de contar lo importado |
+| [session-start-context](changes/session-start-context/proposal.md) | Nube | El traspaso de sesión vuelve a entrar, y el aviso deja de contar lo importado. Aplicado y verificado en Linux, con un PR abierto a `develop` ([verify](changes/session-start-context/verify.md)); falta revisarlo, ver el CI de Windows y archivarlo |
 | [client-setup-cursor](changes/client-setup-cursor/exploration.md) | Nube | `clawg setup cursor` y el hook en el formato de Cursor |
 
 **Al otro día, con la persona:** revisar los dos PRs, decidir [preference-model](changes/preference-model/exploration.md) y hacer la prueba de 10 minutos de [bridge-project-identity](changes/bridge-project-identity/exploration.md).
