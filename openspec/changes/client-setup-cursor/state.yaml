@@ -1,13 +1,14 @@
 change: client-setup-cursor
 objective: "4"
 depends_on: []
-phase: proposal  # decisiones cerradas en la exploración
+phase: apply
 artifacts:
   exploration: done
-  proposal: pending
-  spec: pending
-  tasks: pending
+  proposal: done  # las nueve decisiones de la exploración, y las que fija la aplicación sin cambiarlas
+  spec: done  # CU1 a CU8; al archivar, CU1 a CU5 van a specs/setup y CU6 a CU8 a specs/hooks
+  design: skipped  # las decisiones se cerraron en la exploración
+  tasks: done
   apply: pending
   verify: pending  # lo de Cursor real se verifica en local
   archive: pending
-updated: 2026-11-03
+updated: 2026-11-04
