@@ -2318,7 +2318,11 @@ mod tests {
         let snapshot = background_snapshot(&texts).await;
         let (out_dir, scratch) = (temp_path("bg-first-out"), temp_path("bg-first-scratch"));
 
-        assert_eq!(run_over(sweep_golden_json(), &snapshot, "bg-first", &out_dir, &scratch).await, EXIT_OK);
+        // A day of age, so the twin outranks the golden row by its decay. With
+        // both new they tie, since decay reads whole seconds, and the twin wins
+        // only by its lower id until a slow run puts their ages a second apart.
+        let golden = sweep_golden_json().replacen(r#""lang": "en"}"#, r#""lang": "en", "age_days": 1}"#, 1);
+        assert_eq!(run_over(&golden, &snapshot, "bg-first", &out_dir, &scratch).await, EXIT_OK);
 
         let (_, _, json) = only_results(&out_dir);
         let case = &json["retrieval"]["per_case"][0];
