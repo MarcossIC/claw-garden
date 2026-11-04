@@ -37,6 +37,14 @@ const PENDING: &str = "deleted_at IS NULL AND status <> 'superseded' \
                      WHERE d.source_id = memory.id \
                        AND c.deleted_at IS NULL AND c.status <> 'superseded')";
 
+/// What the reminder counts: the pending memories an import did not write.
+/// An import brings history already written somewhere else, not memories new
+/// to this store, and counting it kept the reminder on in every context of a
+/// project that imported; `synthesis_core` still lists those rows.
+fn unreviewed_condition() -> String {
+    format!("{PENDING} AND source <> 'import'")
+}
+
 const CONCLUSION: &str = "deleted_at IS NULL AND status <> 'superseded' \
      AND EXISTS (SELECT 1 FROM memory_derivation d WHERE d.memory_id = memory.id)";
 
@@ -277,8 +285,8 @@ pub async fn synthesis_core(
 }
 
 /// How many pending memories of a scope that `reader` reaches arrived after
-/// the scope's last review, by any agent; every pending memory when the scope
-/// was never reviewed.
+/// the scope's last review, by any agent, leaving out what an import wrote;
+/// every such memory when the scope was never reviewed.
 pub async fn unreviewed_count(
     store: &MemoryStore,
     reader: Option<&Reader>,
@@ -291,7 +299,7 @@ pub async fn unreviewed_count(
         .call(move |c| -> rusqlite::Result<usize> {
             let scope = Scope { reach: reach.as_deref(), project: project_id.as_deref() };
             let after = reviewed_at(c, scope)?;
-            count(c, PENDING, scope, after)
+            count(c, &unreviewed_condition(), scope, after)
         })
         .await
         .map_err(backend("unreviewed count"))
@@ -610,6 +618,25 @@ mod tests {
 
         conclude(&store, Some("p"), &[a, b], 13).await;
         assert_eq!(unreviewed_count(&store, None, Some("p")).await.unwrap(), 1, "a conclusion and its sources are not pending");
+    }
+
+    #[tokio::test]
+    async fn the_reminder_leaves_out_what_an_import_wrote() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        for i in 0..25 {
+            let id = seed(&store, Some("p"), &format!("imported note {i}"), i).await;
+            store.conn.call(move |c| c.execute("UPDATE memory SET source = 'import' WHERE id = ?1", [id])).await.unwrap();
+        }
+        for i in 0..3 {
+            seed(&store, Some("p"), &format!("own note {i}"), 100 + i).await;
+        }
+
+        assert_eq!(unreviewed_count(&store, None, Some("p")).await.unwrap(), 3, "an import is history, not new memories");
+        assert_eq!(unreviewed_count(&store, Some(&shared("a")), Some("p")).await.unwrap(), 3);
+
+        let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(1_000)).await.unwrap();
+        assert_eq!(found.pending_total, 28, "synthesize still reviews what was imported");
+        assert_eq!(found.pending.len(), 28);
     }
 
     #[tokio::test]

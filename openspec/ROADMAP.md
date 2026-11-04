@@ -26,15 +26,15 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 ## Antes de la primera noche (a mano)
 
 - Apagar en Cursor "Include Third-Party Plugins, Skills, and Other Configs" (Settings → Agents → Third-Party Imports). En Windows, los hooks `.sh` de un plugin de Claude Code abren una ventana de Git Bash. Va antes de instalar cualquier hook de clawg.
-- Archivar cli-dispatch y publicar lo que hay en `develop`.
+- Publicar lo que hay en `develop`.
 
 ## Noche 1
 
 | Cambio | Dónde | Qué deja resuelto |
 |---|---|---|
 | [history-reimport](changes/history-reimport/exploration.md), ensayo | Local: copia del store, export, transcripciones, línea base | Si el rendimiento mejoró de verdad, y un mapa para las notas sin proyecto |
-| [session-start-context](changes/session-start-context/exploration.md) | Nube | El traspaso de sesión vuelve a entrar, y el aviso deja de contar lo importado |
-| [client-setup-cursor](changes/client-setup-cursor/proposal.md) | Nube | `clawg setup cursor` y el hook en el formato de Cursor: aplicado y probado en Linux, en un PR a `develop`; lo que sólo Cursor reproduce queda en su [verify](changes/client-setup-cursor/verify.md#pendiente-en-local) |
+| [session-start-context](changes/session-start-context/proposal.md) | Nube | El traspaso de sesión vuelve a entrar, y el aviso deja de contar lo importado. Aplicado y verificado en Linux, con un PR abierto a `develop` ([verify](changes/session-start-context/verify.md)); falta revisarlo, ver el CI de Windows y archivarlo |
+| [client-setup-cursor](changes/client-setup-cursor/proposal.md) | Nube | `clawg setup cursor` y el hook en el formato de Cursor. Aplicado y verificado en Linux y en el CI de Windows, con un PR abierto a `develop` ([verify](changes/client-setup-cursor/verify.md)); falta revisarlo, verificarlo con Cursor real (noche 2, [pendiente en local](changes/client-setup-cursor/verify.md#pendiente-en-local)) y archivarlo |
 
 **Al otro día, con la persona:** revisar los dos PRs, decidir [preference-model](changes/preference-model/exploration.md) y hacer la prueba de 10 minutos de [bridge-project-identity](changes/bridge-project-identity/exploration.md).
 
