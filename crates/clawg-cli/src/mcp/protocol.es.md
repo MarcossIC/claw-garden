@@ -85,9 +85,12 @@ Cada fila compite con las demás en la búsqueda, así que deja afuera:
   todavía quedan memorias en inglés, busca de nuevo con la consulta en inglés.
 - Pon `user_stated` sólo cuando la memoria es lo que dijo la persona: sus
   palabras, una corrección o una instrucción explícita. Déjalo afuera para lo
-  que inferiste, encontraste o concluiste. Sin él la memoria es tuya: un par en
-  conflicto marca un save común como inferred y un save con `derived_from` como
-  conclusion; un lado sin marca puede ser de la persona.
+  que inferiste, encontraste o concluiste. Un save declarado lleva sólo lo que
+  dijo la persona: el contexto que le sumas (una ruta, un motivo) va en otro
+  save, sin `user_stated`, y sólo cuando el código y la documentación no lo
+  dicen ya. Sin él la memoria es tuya: un par en conflicto marca un save común
+  como inferred y un save con `derived_from` como conclusion; un lado sin
+  marca puede ser de la persona.
 
 ## Tipo e importancia
 
@@ -129,6 +132,7 @@ Al final de una sesión larga, o antes de que se compacte el contexto, guarda un
 - Próximos pasos: lo que sigue, en orden.
 - Archivos relevantes: las rutas que importan, cada una con una línea sobre
   por qué.
+- Validación: el comando exacto que comprueba el trabajo.
 
 El resumen más nuevo del proyecto abre el contexto de la sesión siguiente,
 bajo LAST SESSION, pregunte lo que pregunte primero esa sesión.

@@ -279,9 +279,11 @@ async fn a_save_accepted_while_the_model_loads_survives_a_process_that_dies() {
     let workers = start(&runtime, rx);
     let rows = wait_for_rows(&runtime.store, 1).await;
     runtime.shutdown(workers).await;
+    let pending = outbox_contents(&runtime.store).await;
+    runtime.close().await;
 
     assert_eq!(rows, vec!["accepted before the process died"]);
-    assert!(outbox_contents(&runtime.store).await.is_empty());
+    assert!(pending.is_empty());
 }
 
 /// The connection closes on its own thread when its last handle drops, which
@@ -322,11 +324,14 @@ async fn shutdown_checkpoints_the_wal_into_memory_db() {
 
     let wal = tmp.path().join("memory.db-wal");
     let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-    assert_eq!(wal_len, 0, "the WAL must be folded into memory.db");
-
     let copy_dir = tempfile::tempdir().unwrap();
     let copy = copy_dir.path().join("memory.db");
     std::fs::copy(tmp.path().join("memory.db"), &copy).unwrap();
+    // Read before the close, which folds the WAL by itself: this test is about
+    // what the shutdown did.
+    runtime.close().await;
+
+    assert_eq!(wal_len, 0, "the WAL must be folded into memory.db");
     let conn = rusqlite::Connection::open(&copy).unwrap();
     let content: String = conn
         .query_row("SELECT content FROM memory WHERE agent_id = 'agent-shutdown'", [], |r| r.get(0))

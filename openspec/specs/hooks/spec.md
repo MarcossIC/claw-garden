@@ -9,12 +9,15 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 3a, que sale en 0.65.0 (sólo la línea de las sugerencias pendientes de R4), y su entrega 3b, en la misma versión (sólo el `cwd` como `path` del registro).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (R7, LP12 de esa spec, y la excepción que suma a R3).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (AL6, y el idioma que suma a R4 y R5). Las notas que el daemon escribe en el contexto están en [`specs/retrieval`](../retrieval/spec.md), AL5.
+- [client-setup-cursor](../../changes/archive/2026-11-04-client-setup-cursor/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (CU6 a CU8): `clawg hook` toma `--client` para leer la entrada de `sessionStart` de Cursor, la carpeta sale de la única raíz de `workspace_roots`, y un hook de Claude Code que corre Cursor no imprime nada.
 
 ## Definiciones
 
 - **Host:** el cliente que corre los hooks (Claude Code). Le pasa al hook un objeto JSON por stdin y lee su stdout; lee el código de salida 2 como «bloquear la sesión o el mensaje».
 - **Sobre:** la salida que el host inyecta, `{"hookSpecificOutput": {"hookEventName": E, "additionalContext": T}}` (`envelope`, `crates/clawg-cli/src/hook.rs:165`).
 - **Inicio de la sesión:** la fecha de creación del archivo `transcript_path` que manda el host (`session_started_at`, `hook.rs:175`). Un sistema de archivos que no guarda la creación no la da.
+- **Entrada de Cursor:** el objeto JSON que Cursor pasa por stdin. Lleva `conversation_id`, `generation_id`, `model`, `hook_event_name`, `cursor_version`, `workspace_roots`, `user_email` y `transcript_path`; `sessionStart` suma `session_id`, igual a `conversation_id`. No lleva `cwd`.
+- **Salida de Cursor:** `{"additional_context": T}` en stdout.
 
 ## R2. `clawg hook <evento>`
 
@@ -39,7 +42,12 @@ Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a
 - WHEN corre `clawg hook session-start --agent a`
 - THEN stdout está vacío, sale con 0 y no aparece un `daemon.json`
 
-**Tests:** `a_hook_without_a_daemon_prints_nothing`, `a_hook_with_input_that_is_not_json_prints_nothing`, `a_hook_usage_error_exits_1` (`tests/binary.rs`), `a_hook_usage_error_never_blocks` (`cli.rs`, que sólo prueba `is_hook_invocation`), `a_daemon_that_does_not_answer_gives_nothing` y `without_a_daemon_nothing_is_printed` (`hook.rs`). Ningún test llega a un daemon que responde con un error o que no responde, ni ejerce `shutdown_background`: el tope que vence en `a_daemon_that_does_not_answer_gives_nothing` es el de la lectura de stdin ([verify](../../changes/archive/2026-10-18-agent-lifecycle-hooks/verify.md#lo-que-encontró-la-verificación), W1).
+#### Escenario: el daemon falla
+- GIVEN un daemon publicado que responde 500 a todo, u otro que acepta la conexión y nunca responde
+- WHEN corren `session-start` y `user-prompt-submit` con una entrada válida
+- THEN ninguno imprime nada, y con el que no responde los dos vuelven al vencer el tope; con una preferencia de idioma, `session-start` imprime igual la línea del idioma, sola en el sobre (R7)
+
+**Tests:** `a_hook_without_a_daemon_prints_nothing`, `a_hook_with_input_that_is_not_json_prints_nothing`, `a_hook_usage_error_exits_1` (`tests/binary.rs`), `a_hook_usage_error_never_blocks` (`cli.rs`, que sólo prueba `is_hook_invocation`), `a_daemon_that_does_not_answer_gives_nothing`, `a_daemon_that_answers_an_error_gives_nothing`, `a_daemon_that_never_answers_gives_nothing_by_the_deadline` y `without_a_daemon_nothing_is_printed` (`hook.rs`). El tope que vence en `a_daemon_that_does_not_answer_gives_nothing` es el de la lectura de stdin; los dos siguientes publican un daemon en el directorio de datos, uno que responde 500 a todo y otro que acepta la conexión y nunca escribe, y miran que el hook le haya preguntado: con los dos eventos no imprime nada, con el primero y una preferencia imprime sólo la línea del idioma, y con el segundo vuelve al vencer el tope. Ningún test ejerce `shutdown_background` ([verify](../../changes/archive/2026-10-18-agent-lifecycle-hooks/verify.md#lo-que-encontró-la-verificación), W1).
 
 ## R4. `session-start`
 
@@ -109,3 +117,36 @@ Los dos eventos MUST leer la preferencia en cada evento (`language_in`, `hook.rs
 - THEN el recordatorio es `memoria de clawg: no se guardó nada de este proyecto en los últimos 40 minutos. Lo que esta sesión decidió o aprendió llega a las sesiones siguientes sólo cuando save_memory lo guarda.`
 
 **Test:** `session_start_speaks_the_preferred_language` y `the_save_reminder_speaks_the_preferred_language` (`hook.rs`), sobre las funciones puras. Ningún test corre `user-prompt-submit` con preferencia contra un daemon: el camino de `respond` con el idioma sólo se prueba sin daemon, donde no imprime nada (`session_start_without_a_daemon_still_names_the_language`), como pasa con R5 en inglés.
+
+## CU6. `clawg hook session-start --client cursor`
+
+`clawg hook` MUST tomar `--client claude-code|cursor`, con `claude-code` por defecto; sin `--client`, MUST hacer lo de R2 a R5. Con `--client cursor`, `session-start` MUST leer `workspace_roots` y `session_id` de la entrada de Cursor, tolerando campos desconocidos y ausentes, MUST registrar la raíz y la sesión como R6, y MUST imprimir la salida de Cursor con el mismo texto que el sobre de Claude Code (R4, R7 y AL6), o nada cuando ese texto no existe. Con `--client cursor`, `user-prompt-submit` MUST NOT imprimir nada ni consultar al daemon.
+
+#### Escenario: una raíz
+- GIVEN un daemon con un save del agente `smoke` en el proyecto de `/work/repo`, y el hook corriendo en `~/.cursor`
+- WHEN corre `clawg hook session-start --agent smoke --client cursor` con `workspace_roots` igual a `["/work/repo"]`
+- THEN stdout es `{"additional_context": T}`, T trae ese save, y entre los proyectos del daemon no hay ninguno con raíz `~/.cursor`
+
+**Tests:** `hook_takes_an_event_an_agent_and_a_profile` y `hook_takes_the_client_that_runs_it` (`cli.rs`), `the_hook_input_reads_what_cursor_sends`, `cursor_gets_additional_context`, `user_prompt_submit_says_nothing_to_cursor` (`hook.rs`), `a_cursor_session_start_reads_its_one_root_and_not_its_directory` (`tests/binary.rs`).
+
+## CU7. La carpeta sale de la entrada
+
+Con `--client cursor`, la carpeta del proyecto MUST ser la única raíz de `workspace_roots`, y MUST NOT salir del directorio actual (`folder`, `crates/clawg-cli/src/hook.rs:194`). Con varias raíces o ninguna, el hook MUST NOT registrar ningún proyecto ni sesión y MUST imprimir sólo la línea del idioma, en la salida de Cursor, cuando hay preferencia, y nada si no.
+
+#### Escenario: dos raíces
+- GIVEN un daemon y una entrada de `sessionStart` con dos raíces
+- WHEN corre `clawg hook session-start --agent smoke --client cursor`
+- THEN stdout está vacío, sale con 0 y el daemon no tiene ningún proyecto
+
+**Tests:** `cursor_reads_the_project_of_its_one_workspace_root`, `cursor_without_one_root_gets_only_the_language_line` (`hook.rs`), `a_cursor_session_with_two_roots_registers_no_project` (`tests/binary.rs`).
+
+## CU8. Un hook de Claude Code que corre Cursor no hace nada
+
+Sin `--client cursor`, una entrada con `cursor_version` (de cualquier tipo) MUST NOT imprimir nada, tampoco la línea del idioma, MUST NOT consultar al daemon ni registrar nada, y MUST salir con 0.
+
+#### Escenario: Cursor corre el hook de Claude Code
+- GIVEN la preferencia `es`, un daemon y la entrada de `sessionStart` de Cursor con una raíz
+- WHEN corre `clawg hook session-start --agent claude-code` en `~/.cursor`
+- THEN stdout está vacío, sale con 0 y el daemon no tiene ningún proyecto
+
+**Tests:** `a_claude_code_hook_run_by_cursor_prints_nothing` (`hook.rs`), `a_claude_code_hook_that_cursor_runs_does_nothing` (`tests/binary.rs`).

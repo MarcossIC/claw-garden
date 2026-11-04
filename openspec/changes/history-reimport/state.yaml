@@ -1,0 +1,9 @@
+change: history-reimport
+objective: "1, 2"
+depends_on: []
+phase: verify  # ensayo hecho en dev; el corte en prod espera la aprobación del piloto
+artifacts:
+  exploration: done
+  verify: pending  # el ensayo dejó sus números en verify.md; falta la verificación del corte
+  archive: pending
+updated: 2026-11-04

@@ -9,7 +9,19 @@ use clawg_core::metrics::store::{MetricsDb, MetricsError, METRICS_FILE};
 
 use clawg_core::preferences::Lang;
 
-use crate::cli::ReportBy;
+use crate::cli::{MetricsAction, ReportBy};
+use crate::error::CliError;
+
+/// `clawg metrics report`: the report of `--metric`, or with `--events` the
+/// events of each run.
+pub fn command(lang: Lang, base_dir: &Path, action: &MetricsAction, now_ms: i64) -> Result<String, CliError> {
+    let MetricsAction::Report { metric, events: by_run, labels, by, since, .. } = action;
+    match metric {
+        Some(metric) if !by_run => report(lang, base_dir, metric, labels, *by, *since, now_ms),
+        _ => events(lang, base_dir, *since, now_ms),
+    }
+    .map_err(CliError::Failed)
+}
 
 /// The report of `metric` in `base_dir`'s `metrics.db` as pretty JSON, or
 /// why there is none, in `lang`. The JSON itself has no prose to translate.
@@ -120,6 +132,8 @@ mod tests {
     use clawg_core::metrics::{EventKind, Recorder, Unit};
     use serde_json::Value;
 
+    use crate::cli::ProfileArg;
+
     const NOW: i64 = 1_790_000_000_000;
 
     fn seeded(dir: &Path) {
@@ -143,6 +157,30 @@ mod tests {
         r.observe("http.duration", Unit::Micros, &[("route", "/health")], 90);
         r.gauge("process.rss_bytes", &[], 1024.0);
         db.write_minute(run, NOW - 1000, &r.take_minute()).unwrap();
+    }
+
+    #[test]
+    fn the_flags_choose_the_report_or_the_events() {
+        let dir = tempfile::tempdir().unwrap();
+        seeded(dir.path());
+        let day = Duration::from_secs(86_400);
+        let asked = |metric: Option<&str>, events: bool| MetricsAction::Report {
+            metric: metric.map(str::to_owned),
+            events,
+            labels: vec![],
+            by: ReportBy::Day,
+            since: day,
+            profile: ProfileArg::default(),
+        };
+
+        let of_metric = command(Lang::En, dir.path(), &asked(Some("http.duration"), false), NOW).unwrap();
+        let of_events = command(Lang::En, dir.path(), &asked(None, true), NOW).unwrap();
+
+        assert_eq!(of_metric, report(Lang::En, dir.path(), "http.duration", &[], ReportBy::Day, day, NOW).unwrap());
+        assert_eq!(of_events, events(Lang::En, dir.path(), day, NOW).unwrap());
+        let missing = tempfile::tempdir().unwrap();
+        let err = command(Lang::Es, missing.path(), &asked(None, true), NOW).unwrap_err();
+        assert_eq!(err.to_string(), events(Lang::Es, missing.path(), day, NOW).unwrap_err());
     }
 
     #[test]

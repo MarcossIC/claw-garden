@@ -26,6 +26,8 @@ use serde_json::{Map, Value};
 
 use crate::update::plan::stamp;
 
+pub mod cursor;
+
 /// The agent id the bridge and the hooks are pinned to: the name Claude Code
 /// reports of itself, so a user who never pinned it keeps their memories.
 pub const AGENT: &str = "claude-code";
@@ -49,6 +51,9 @@ const HOOK_EVENTS: [(&str, &str); 2] = [("SessionStart", "session-start"), ("Use
 
 /// Copies of each file kept in `backups/setup`, the newest.
 const KEPT_COPIES: usize = 5;
+
+/// How a file this module reads is expected to be laid out, as an error says it.
+const CLAUDE_LAYOUT: &str = "as Claude Code writes it";
 
 /// Whether setup installs or takes away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,8 +99,8 @@ pub enum SetupError {
     Read { path: PathBuf, source: std::io::Error },
     #[error("{path} is not valid JSON ({source}); nothing was changed")]
     InvalidJson { path: PathBuf, source: serde_json::Error },
-    #[error("{path} is not laid out as Claude Code writes it ({what}); nothing was changed")]
-    Unexpected { path: PathBuf, what: &'static str },
+    #[error("{path} is not laid out {layout} ({what}); nothing was changed")]
+    Unexpected { path: PathBuf, layout: &'static str, what: &'static str },
     #[error("{path} has one clawg protocol marker without the other; fix or remove it by hand, nothing was changed")]
     LoneMarker { path: PathBuf },
 }
@@ -203,7 +208,7 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
     }
     let exe = state.exe.to_str().ok_or_else(|| SetupError::NonUnicodeExe(state.exe.clone()))?;
     let server = Server::planned(exe, state.profile);
-    let servers = parse_object(&state.servers)?;
+    let servers = parse_object(&state.servers, CLAUDE_LAYOUT)?;
     let registered = |name: &str| servers.as_ref().and_then(|s| s.get("mcpServers")).and_then(|m| m.get(name));
 
     let found = registered(server.name);
@@ -215,7 +220,7 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
         (_, Some(entry)) => ServerStep::Conflict(describe_command(entry)),
     };
 
-    let mut settings = parse_object(&state.settings)?;
+    let mut settings = parse_object(&state.settings, CLAUDE_LAYOUT)?;
     if mode == Mode::Install && settings.is_none() {
         settings = Some(Map::new());
     }
@@ -248,15 +253,16 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
     Ok(Plan { mode, server, server_step, hooks, settings: settings_step, block, instructions })
 }
 
-/// The file's JSON object, `None` when the file is missing.
-fn parse_object(file: &File) -> Result<Option<Map<String, Value>>, SetupError> {
+/// The file's JSON object, `None` when the file is missing; `layout` says
+/// how the client lays the file out, for the error.
+fn parse_object(file: &File, layout: &'static str) -> Result<Option<Map<String, Value>>, SetupError> {
     let Some(text) = &file.text else { return Ok(None) };
     if text.trim().is_empty() {
         return Ok(Some(Map::new()));
     }
     match serde_json::from_str(text) {
         Ok(Value::Object(map)) => Ok(Some(map)),
-        Ok(_) => Err(SetupError::Unexpected { path: file.path.clone(), what: "not an object" }),
+        Ok(_) => Err(SetupError::Unexpected { path: file.path.clone(), layout, what: "not an object" }),
         Err(source) => Err(SetupError::InvalidJson { path: file.path.clone(), source }),
     }
 }
@@ -306,24 +312,28 @@ fn planned_hook(exe: &str, event_arg: &str, profile: Profile) -> Value {
     serde_json::json!({ "type": "command", "command": exe, "args": hook_args(event_arg, profile), "timeout": HOOK_TIMEOUT_SECS })
 }
 
-/// The command line earlier versions of setup wrote for a hook, `words`
-/// being the program and its arguments: the program in double quotes only
-/// when it had anything outside `[A-Za-z0-9/._-:]`.
-fn legacy_command(words: &[String]) -> String {
-    let program = &words[0];
-    let mut line = if !program.is_empty() && program.chars().all(|c| c.is_ascii_alphanumeric() || "/._-:".contains(c)) {
-        program.clone()
-    } else {
-        let mut quoted = String::from('"');
-        for c in program.chars() {
-            if matches!(c, '"' | '$' | '`' | '\\') {
-                quoted.push('\\');
-            }
-            quoted.push(c);
+/// `word` as a POSIX shell reads it back: as it is when it has nothing
+/// outside `[A-Za-z0-9/._-:]`, else in double quotes with `"`, `$`, `` ` ``
+/// and `\` escaped.
+fn sh_word(word: &str) -> String {
+    if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || "/._-:".contains(c)) {
+        return word.to_string();
+    }
+    let mut quoted = String::from('"');
+    for c in word.chars() {
+        if matches!(c, '"' | '$' | '`' | '\\') {
+            quoted.push('\\');
         }
-        quoted.push('"');
-        quoted
-    };
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// The command line earlier versions of setup wrote for a hook, `words`
+/// being the program and its arguments: the program as a shell word.
+fn legacy_command(words: &[String]) -> String {
+    let mut line = sh_word(&words[0]);
     for word in &words[1..] {
         line.push(' ');
         line.push_str(word);
@@ -399,9 +409,14 @@ fn hook_words(hook: &Value) -> Option<Vec<String>> {
 }
 
 /// Whether a hook is clawg's for `event_arg` (`session-start`, …) and
-/// `profile`, in either form. One without `--profile` belongs to no profile.
+/// `profile`, in either form.
 fn is_clawg_hook(hook: &Value, event_arg: &str, profile: Profile) -> bool {
-    let Some(words) = hook_words(hook) else { return false };
+    hook_words(hook).is_some_and(|words| runs_clawg_hook(&words, event_arg, profile))
+}
+
+/// Whether a command's words run `clawg hook <event_arg>` for `profile`. One
+/// without `--profile` belongs to no profile.
+fn runs_clawg_hook(words: &[String], event_arg: &str, profile: Profile) -> bool {
     let profile_given = words.windows(2).any(|w| w[0] == "--profile" && w[1] == profile.as_str())
         || words.iter().any(|w| w.strip_prefix("--profile=") == Some(profile.as_str()));
     words.len() >= 3 && is_clawg_program(&words[0]) && words[1] == "hook" && words[2] == event_arg && profile_given
@@ -426,12 +441,14 @@ fn hooks_of(groups: &[Value]) -> impl Iterator<Item = &Value> {
     groups.iter().filter_map(|g| g.get("hooks").and_then(Value::as_array)).flatten()
 }
 
-/// The `hooks` object of the settings, and the array of one event in it.
+/// The `hooks` object of the settings, and the array of one event in it;
+/// `layout` says how the client lays the file out, for the error.
 fn event_groups<'a>(
     settings: &'a mut Map<String, Value>,
     event: &str,
     create: bool,
     path: &Path,
+    layout: &'static str,
 ) -> Result<Option<&'a mut Vec<Value>>, SetupError> {
     if !settings.contains_key("hooks") {
         if !create {
@@ -442,7 +459,7 @@ fn event_groups<'a>(
     let hooks = settings
         .get_mut("hooks")
         .and_then(Value::as_object_mut)
-        .ok_or(SetupError::Unexpected { path: path.to_path_buf(), what: "`hooks` is not an object" })?;
+        .ok_or(SetupError::Unexpected { path: path.to_path_buf(), layout, what: "`hooks` is not an object" })?;
     if !hooks.contains_key(event) {
         if !create {
             return Ok(None);
@@ -453,7 +470,7 @@ fn event_groups<'a>(
         .get_mut(event)
         .and_then(Value::as_array_mut)
         .map(Some)
-        .ok_or(SetupError::Unexpected { path: path.to_path_buf(), what: "an event under `hooks` is not a list" })
+        .ok_or(SetupError::Unexpected { path: path.to_path_buf(), layout, what: "an event under `hooks` is not a list" })
 }
 
 fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile, path: &Path) -> Result<HooksStep, SetupError> {
@@ -463,7 +480,7 @@ fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile,
         // Checked before anything is created, so an unchanged file stays byte
         // for byte as it was.
         let (mut installed, mut legacy, mut other) = (false, false, None);
-        if let Some(groups) = event_groups(settings, event, false, path)? {
+        if let Some(groups) = event_groups(settings, event, false, path, CLAUDE_LAYOUT)? {
             for hook in hooks_of(groups).filter(|h| is_clawg_hook(h, arg, profile)) {
                 if runs_as(hook, &planned) {
                     installed = true;
@@ -477,13 +494,13 @@ fn install_hooks(settings: &mut Map<String, Value>, exe: &str, profile: Profile,
         if let Some(other) = other {
             step.conflicts.push((event, other));
         } else if legacy {
-            let groups = event_groups(settings, event, false, path)?.expect("found above");
+            let groups = event_groups(settings, event, false, path, CLAUDE_LAYOUT)?.expect("found above");
             migrate_hooks(groups, &planned, installed, arg, profile);
             step.migrated.push(event);
         } else if installed {
             step.unchanged.push(event);
         } else {
-            let groups = event_groups(settings, event, true, path)?.expect("created");
+            let groups = event_groups(settings, event, true, path, CLAUDE_LAYOUT)?.expect("created");
             let mut group = Map::new();
             if event == "SessionStart" {
                 group.insert("matcher".into(), SESSION_START_MATCHER.into());
@@ -522,7 +539,7 @@ fn migrate_hooks(groups: &mut Vec<Value>, planned: &Value, installed: bool, even
 fn remove_hooks(settings: &mut Map<String, Value>, profile: Profile, path: &Path) -> Result<HooksStep, SetupError> {
     let mut step = HooksStep::default();
     for (event, arg) in HOOK_EVENTS {
-        let Some(groups) = event_groups(settings, event, false, path)? else { continue };
+        let Some(groups) = event_groups(settings, event, false, path, CLAUDE_LAYOUT)? else { continue };
         let mut removed = false;
         groups.retain_mut(|group| {
             let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
@@ -700,11 +717,20 @@ pub struct Applied {
     pub failures: Vec<String>,
 }
 
+/// What writing the files of a plan did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Written {
+    /// Copies of files as they were before being changed.
+    pub backups: Vec<PathBuf>,
+    /// Older copies removed to keep [`KEPT_COPIES`] of each file.
+    pub pruned: Vec<PathBuf>,
+    /// A file that could not be written, with why.
+    pub failures: Vec<String>,
+}
+
 /// Carries the plan out: runs `claude` for the server, then writes the
-/// files, each through a temporary file and a rename after copying the old
-/// one to `<data>/backups/setup`, where only the newest [`KEPT_COPIES`] of
-/// each file stay. A failed step does not stop the others; each can be run
-/// again.
+/// files with [`write_files`]. A failed step does not stop the others; each
+/// can be run again.
 pub fn apply(plan: &Plan, state: &State, claude: Option<&Path>, base_dir: &Path, now_ms: i64) -> Applied {
     let args = match plan.server_step {
         ServerStep::Add => Some(plan.server.add_args()),
@@ -716,21 +742,31 @@ pub fn apply(plan: &Plan, state: &State, claude: Option<&Path>, base_dir: &Path,
         (Some(_), None) => ServerOutcome::Manual,
         (Some(args), Some(claude)) => run_claude(claude, &args),
     };
-    let mut applied = Applied { server, backups: Vec::new(), pruned: Vec::new(), failures: Vec::new() };
-    for (step, file) in [(&plan.settings, &state.settings), (&plan.instructions, &state.instructions)] {
+    let files = [(&plan.settings, &state.settings), (&plan.instructions, &state.instructions)];
+    let Written { backups, pruned, failures } = write_files(&files, base_dir, now_ms);
+    Applied { server, backups, pruned, failures }
+}
+
+/// Writes each file whose step changes it, through a temporary file and a
+/// rename after copying the old one to `<data>/backups/setup`, where only the
+/// newest [`KEPT_COPIES`] of each file stay. A file that fails does not stop
+/// the others.
+fn write_files(files: &[(&FileStep, &File)], base_dir: &Path, now_ms: i64) -> Written {
+    let mut written = Written::default();
+    for &(step, file) in files {
         if *step == FileStep::Unchanged {
             continue;
         }
         match write_file(step, file, base_dir, now_ms) {
             Ok(Some(backup)) => {
-                prune_copies(&copies_dir(base_dir), &copy_name(&file.path), &mut applied);
-                applied.backups.push(backup);
+                prune_copies(&copies_dir(base_dir), &copy_name(&file.path), &mut written);
+                written.backups.push(backup);
             }
             Ok(None) => {}
-            Err(e) => applied.failures.push(format!("cannot write {}: {e}", file.path.display())),
+            Err(e) => written.failures.push(format!("cannot write {}: {e}", file.path.display())),
         }
     }
-    applied
+    written
 }
 
 fn copies_dir(base_dir: &Path) -> PathBuf {
@@ -756,19 +792,19 @@ fn stale_copies(names: &[String], name: &str, keep: usize) -> Vec<String> {
     copies[..stale].iter().map(|n| n.to_string()).collect()
 }
 
-fn prune_copies(dir: &Path, name: &str, applied: &mut Applied) {
+fn prune_copies(dir: &Path, name: &str, written: &mut Written) {
     let names: Vec<String> = match std::fs::read_dir(dir) {
         Ok(entries) => entries.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect(),
         Err(e) => {
-            applied.failures.push(format!("cannot list the copies in {}: {e}", dir.display()));
+            written.failures.push(format!("cannot list the copies in {}: {e}", dir.display()));
             return;
         }
     };
     for stale in stale_copies(&names, name, KEPT_COPIES) {
         let path = dir.join(stale);
         match std::fs::remove_file(&path) {
-            Ok(()) => applied.pruned.push(path),
-            Err(e) => applied.failures.push(format!("cannot remove the older copy {}: {e}", path.display())),
+            Ok(()) => written.pruned.push(path),
+            Err(e) => written.failures.push(format!("cannot remove the older copy {}: {e}", path.display())),
         }
     }
 }
@@ -883,18 +919,7 @@ fn create_fresh(path: &Path, _mode: Option<u32>) -> std::io::Result<std::fs::Fil
 pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String, u8) {
     let lang = state.language.unwrap_or(Lang::En);
     let dry = applied.is_none();
-    // A step as done, or as a dry run would do it: each language gives both.
-    let will = |en: (&str, &str), es: (&str, &str)| {
-        let (done, planned) = match lang {
-            Lang::En => en,
-            Lang::Es => es,
-        };
-        match (dry, lang) {
-            (false, _) => done.to_string(),
-            (true, Lang::En) => format!("would {planned}"),
-            (true, Lang::Es) => planned.to_string(),
-        }
-    };
+    let will = |en: (&str, &str), es: (&str, &str)| done_or_planned(lang, dry, en, es);
     let mut lines = Vec::new();
     let mut incomplete = false;
     let name = plan.server.name;
@@ -1030,24 +1055,7 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
     });
 
     if let Some(applied) = applied {
-        for backup in &applied.backups {
-            let backup = backup.display();
-            lines.push(match lang {
-                Lang::En => format!("previous file copied to {backup}"),
-                Lang::Es => format!("archivo anterior copiado a {backup}"),
-            });
-        }
-        for copy in &applied.pruned {
-            let copy = copy.display();
-            lines.push(match lang {
-                Lang::En => format!("older copy removed: {copy}"),
-                Lang::Es => format!("copia más vieja borrada: {copy}"),
-            });
-        }
-        for failure in &applied.failures {
-            incomplete = true;
-            lines.push(failure.clone());
-        }
+        incomplete |= file_lines(lang, &applied.backups, &applied.pruned, &applied.failures, &mut lines);
     }
     let changed = matches!(plan.server_step, ServerStep::Add | ServerStep::Remove)
         || plan.settings != FileStep::Unchanged
@@ -1062,6 +1070,42 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
         );
     }
     (lines.join("\n"), if incomplete { 1 } else { 0 })
+}
+
+/// A step as done, or as a dry run would do it: each language gives both, as
+/// `(done, planned)`.
+fn done_or_planned(lang: Lang, dry: bool, en: (&str, &str), es: (&str, &str)) -> String {
+    let (done, planned) = match lang {
+        Lang::En => en,
+        Lang::Es => es,
+    };
+    match (dry, lang) {
+        (false, _) => done.to_string(),
+        (true, Lang::En) => format!("would {planned}"),
+        (true, Lang::Es) => planned.to_string(),
+    }
+}
+
+/// The report's lines about the files written: the copies made, the older
+/// copies removed and each failure. Whether a failure kept a step from ending
+/// as planned.
+fn file_lines(lang: Lang, backups: &[PathBuf], pruned: &[PathBuf], failures: &[String], lines: &mut Vec<String>) -> bool {
+    for backup in backups {
+        let backup = backup.display();
+        lines.push(match lang {
+            Lang::En => format!("previous file copied to {backup}"),
+            Lang::Es => format!("archivo anterior copiado a {backup}"),
+        });
+    }
+    for copy in pruned {
+        let copy = copy.display();
+        lines.push(match lang {
+            Lang::En => format!("older copy removed: {copy}"),
+            Lang::Es => format!("copia más vieja borrada: {copy}"),
+        });
+    }
+    lines.extend(failures.iter().cloned());
+    !failures.is_empty()
 }
 
 /// `clawg setup claude-code` from start to end, given where things are.
@@ -1087,10 +1131,12 @@ pub fn run(profile: Profile, mode: Mode, dry_run: bool) -> Result<(String, u8), 
     let state = read_state(current_exe()?, profile, home.as_deref(), std::env::var_os("CLAUDE_CONFIG_DIR"), &base_dir)?;
     let entries: Vec<PathBuf> = std::env::var_os("PATH").map(|raw| std::env::split_paths(&raw).collect()).unwrap_or_default();
     let claude = find_claude(&entries, Path::is_file);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
-    run_in(state, mode, dry_run, claude.as_deref(), &base_dir, now_ms)
+    run_in(state, mode, dry_run, claude.as_deref(), &base_dir, now_ms())
+}
+
+/// The time the copies are stamped with.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 /// The running binary's path as a client should launch it: without the

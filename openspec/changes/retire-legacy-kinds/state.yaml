@@ -1,9 +1,9 @@
 change: retire-legacy-kinds
 objective: "1"
 depends_on: []
-phase: explore
+phase: proposal  # la puerta pasó: toca escribir la propuesta del enfoque A
 artifacts:
-  exploration: draft
+  exploration: done  # con el resultado de la puerta
   proposal: pending
   spec: pending
   design: pending
@@ -11,4 +11,6 @@ artifacts:
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-01
+gates:
+  "0": passed  # 0 filas y 0 entradas de diario en prod y en dev
+updated: 2026-11-03

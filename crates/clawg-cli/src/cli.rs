@@ -211,7 +211,11 @@ pub enum Command {
     /// `hide` and `unhide`. Every agent reads every other agent until hidden;
     /// a change counts from the next search, with the daemon running. A shared
     /// memory reaches the other agent's provider: `clawg secrets` lists the
-    /// rows that hold a secret.
+    /// rows that hold a secret. It is for relevance and privacy between agents
+    /// that cooperate, not an access boundary: an agent's name is whatever its
+    /// client says, and whatever holds the profile's token reaches every row.
+    /// Keeping out an agent you do not trust takes another profile or another
+    /// system user.
     Sharing {
         #[command(subcommand)]
         action: Option<SharingAction>,
@@ -271,13 +275,17 @@ pub enum Command {
         /// gets no client name, and another id would read another agent.
         #[arg(long, value_parser = parse_agent)]
         agent: String,
+        /// The client that runs the hook, whose input it reads and whose
+        /// output it prints.
+        #[arg(long, value_enum, default_value_t = HookClient::ClaudeCode)]
+        client: HookClient,
         #[command(flatten)]
         profile: ProfileArg,
     },
     /// Connect clawg to an agent client: register the MCP server with this
     /// binary's absolute path and a pinned agent id, install the lifecycle
-    /// hooks and the memory protocol. Safe to run again; what differs from
-    /// the plan is reported and left as it is.
+    /// hooks and, for Claude Code, the memory protocol. Safe to run again;
+    /// what differs from the plan is reported and left as it is.
     Setup {
         client: SetupClient,
         /// Print what would change, and change nothing.
@@ -865,6 +873,23 @@ pub enum MemoriesAction {
     Stats(StatsOpts),
 }
 
+impl ProjectsAction {
+    /// The `--profile` the action was given, whichever action it is.
+    pub fn profile(&self) -> &ProfileArg {
+        match self {
+            ProjectsAction::List { profile }
+            | ProjectsAction::Rename { profile, .. }
+            | ProjectsAction::Create { profile, .. }
+            | ProjectsAction::Locate { profile, .. }
+            | ProjectsAction::Add { profile, .. }
+            | ProjectsAction::KeepApart { profile, .. } => profile,
+            ProjectsAction::Move(o) => &o.profile,
+            ProjectsAction::Merge(o) => &o.profile,
+            ProjectsAction::Delete(o) => &o.profile,
+        }
+    }
+}
+
 impl MemoriesAction {
     /// The `--profile` the action was given, whichever action it is.
     pub fn profile(&self) -> &ProfileArg {
@@ -884,10 +909,20 @@ pub enum HookEvent {
     UserPromptSubmit,
 }
 
+/// The clients whose hook input and output `clawg hook` speaks: Claude
+/// Code's `cwd` and `hookSpecificOutput`, or Cursor's `workspace_roots` and
+/// `additional_context`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum HookClient {
+    ClaudeCode,
+    Cursor,
+}
+
 /// The agent clients `clawg setup` knows how to configure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SetupClient {
     ClaudeCode,
+    Cursor,
 }
 
 /// Whether `args`, as the process got them, run `clawg hook`. A client reads
@@ -1408,15 +1443,37 @@ mod tests {
             Command::Hook {
                 event: HookEvent::SessionStart,
                 agent: "claude-code".into(),
+                client: HookClient::ClaudeCode,
                 profile: ProfileArg { profile: Some("dev".into()) },
             }
         );
         assert_eq!(
             parse(&["clawg", "hook", "user-prompt-submit", "--agent", "a"]).command,
-            Command::Hook { event: HookEvent::UserPromptSubmit, agent: "a".into(), profile: ProfileArg { profile: None } }
+            Command::Hook {
+                event: HookEvent::UserPromptSubmit,
+                agent: "a".into(),
+                client: HookClient::ClaudeCode,
+                profile: ProfileArg { profile: None },
+            }
         );
         assert!(Cli::try_parse_from(["clawg", "hook", "session-start"]).is_err(), "the agent is required");
         assert!(Cli::try_parse_from(["clawg", "hook", "pre-compact", "--agent", "a"]).is_err(), "only the events it answers");
+    }
+
+    #[test]
+    fn hook_takes_the_client_that_runs_it() {
+        assert_eq!(
+            parse(&["clawg", "hook", "session-start", "--agent", "cursor", "--client", "cursor", "--profile", "dev"]).command,
+            Command::Hook {
+                event: HookEvent::SessionStart,
+                agent: "cursor".into(),
+                client: HookClient::Cursor,
+                profile: ProfileArg { profile: Some("dev".into()) },
+            }
+        );
+        let named = parse(&["clawg", "hook", "session-start", "--agent", "a", "--client", "claude-code"]).command;
+        assert_eq!(named, parse(&["clawg", "hook", "session-start", "--agent", "a"]).command, "claude-code is the default");
+        assert!(Cli::try_parse_from(["clawg", "hook", "session-start", "--agent", "a", "--client", "codex"]).is_err());
     }
 
     #[test]
@@ -1429,8 +1486,12 @@ mod tests {
             parse(&["clawg", "setup", "claude-code", "--dry-run", "--remove", "--profile", "dev"]).command,
             Command::Setup { client: SetupClient::ClaudeCode, dry_run: true, remove: true, profile: ProfileArg { profile: Some("dev".into()) } }
         );
+        assert_eq!(
+            parse(&["clawg", "setup", "cursor", "--dry-run", "--profile", "dev"]).command,
+            Command::Setup { client: SetupClient::Cursor, dry_run: true, remove: false, profile: ProfileArg { profile: Some("dev".into()) } }
+        );
         assert!(Cli::try_parse_from(["clawg", "setup"]).is_err(), "the client is required");
-        assert!(Cli::try_parse_from(["clawg", "setup", "cursor"]).is_err(), "only the clients it knows");
+        assert!(Cli::try_parse_from(["clawg", "setup", "codex"]).is_err(), "only the clients it knows");
         assert!(!parse(&["clawg", "setup", "claude-code"]).command.loads_the_model());
     }
 
@@ -1532,6 +1593,15 @@ mod tests {
         assert!(Cli::try_parse_from(["clawg", "sharing", "hide", "cursor"]).is_err(), "both agents are needed");
         let e = hide_of(&["clawg", "sharing", "hide", "cursor", "cursor"]);
         assert_eq!(e.check(Lang::En), Err("cursor always reads its own memories".to_string()));
+    }
+
+    #[test]
+    fn the_sharing_help_says_it_is_not_an_access_boundary() {
+        let mut cli = <Cli as clap::CommandFactory>::command();
+        let help = cli.find_subcommand_mut("sharing").expect("sharing").render_long_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("relevance and privacy between agents that cooperate, not an access boundary"), "{help}");
+        assert!(help.contains("another profile or another system user"), "{help}");
     }
 
     #[test]
@@ -1708,6 +1778,27 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["clawg", "projects", "rename", "app-1a2b"]).is_err(), "the name is required");
         assert!(Cli::try_parse_from(["clawg", "projects", "list", "extra"]).is_err(), "list takes no argument");
+    }
+
+    #[test]
+    fn each_projects_action_names_its_profile() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().expect("a unicode temp dir");
+        for args in [
+            &["list"][..],
+            &["rename", "app-1a2b", "App"],
+            &["create", "Ideas"],
+            &["locate", "app-1a2b", dir],
+            &["add", dir],
+            &["move", "--to-none", "--id", "4"],
+            &["merge", "old-1", "--into", "app-1a2b"],
+            &["delete", "app-1a2b"],
+            &["keep-apart", "app-1a2b", "old-1"],
+        ] {
+            let line: Vec<&str> = ["clawg", "projects"].iter().chain(args).chain(&["--profile", "dev"]).copied().collect();
+            let Command::Projects { action } = parse(&line).command else { panic!("{line:?} is a projects action") };
+            assert_eq!(action.profile(), &ProfileArg { profile: Some("dev".into()) }, "{line:?}");
+        }
     }
 
     #[test]

@@ -23,8 +23,10 @@ use clawg_core::memory::relocate::MoveReport;
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::preferences::Lang;
 
-use crate::cli::{DeleteOpts, MergeOpts, MoveOpts};
+use crate::cli::{DeleteOpts, MergeOpts, MoveOpts, ProjectsAction};
 use crate::client::{ClientError, DaemonClient, Located};
+use crate::error::CliError;
+use crate::running::Running;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AddError {
@@ -32,6 +34,68 @@ pub enum AddError {
     NotADirectory(PathBuf),
     #[error(transparent)]
     Client(#[from] ClientError),
+}
+
+/// `clawg projects ACTION` through the daemon found running: what to print,
+/// and the exit code, 1 when a create or a delete was left undone.
+pub async fn command(daemon: &Running, action: ProjectsAction) -> Result<(String, u8), CliError> {
+    let (lang, client) = (daemon.lang, &daemon.client);
+    let exit = |done: bool| if done { 0 } else { 1 };
+    Ok(match action {
+        ProjectsAction::List { .. } => (list(lang, client).await.map_err(|e| daemon.unavailable(e))?, 0),
+        ProjectsAction::Rename { id, name, .. } => {
+            let renamed = rename(lang, client, &id, &name).await.map_err(|e| refused(daemon, rename_refused(lang, &id, &e), e))?;
+            (renamed, 0)
+        }
+        ProjectsAction::Create { name, new, .. } => {
+            let (said, done) = create(lang, client, &name, new).await.map_err(|e| refused(daemon, create_refused(lang, &e), e))?;
+            (said, exit(done))
+        }
+        ProjectsAction::Locate { project, path, subfolder, .. } => {
+            let located = locate(lang, client, &project, &path, subfolder).await.map_err(|e| match e {
+                AddError::Client(e) => refused(daemon, locate_refused(lang, &e), e),
+                other => other.into(),
+            })?;
+            (located, 0)
+        }
+        ProjectsAction::Add { path, .. } => {
+            let added = add(lang, client, &path).await.map_err(|e| match e {
+                AddError::Client(e) => daemon.unavailable(e),
+                other => other.into(),
+            })?;
+            (added, 0)
+        }
+        ProjectsAction::Move(opts) => {
+            let cwd = std::env::current_dir()?;
+            let moved = move_memories(lang, client, &opts, &cwd).await.map_err(|e| match e {
+                AddError::Client(e) => refused(daemon, move_refused(lang, &e), e),
+                other => other.into(),
+            })?;
+            (moved, 0)
+        }
+        ProjectsAction::Merge(opts) => {
+            let merged = merge(lang, client, &opts).await.map_err(|e| refused(daemon, merge_refused(lang, &e), e))?;
+            (merged, 0)
+        }
+        ProjectsAction::Delete(opts) => {
+            let undo = opts.undo.is_some();
+            let (said, done) =
+                delete(lang, client, &opts).await.map_err(|e| refused(daemon, delete_refused(lang, undo, &e), e))?;
+            (said, exit(done))
+        }
+        ProjectsAction::KeepApart { project_id, other_id, .. } => {
+            let kept = keep_apart(lang, client, &project_id, &other_id)
+                .await
+                .map_err(|e| refused(daemon, keep_apart_refused(lang, &e), e))?;
+            (kept, 0)
+        }
+    })
+}
+
+/// A refusal of the daemon in the words `said` has for it, or, with none,
+/// as any failed request to the daemon is said.
+fn refused(daemon: &Running, said: Option<String>, err: ClientError) -> CliError {
+    said.map(CliError::Failed).unwrap_or_else(|| daemon.unavailable(err))
 }
 
 /// Every project the daemon has, as [`render_list`] prints it.
@@ -1210,8 +1274,30 @@ pub fn render_move(lang: Lang, report: &MoveReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ProfileArg;
     use crate::client::tests::{publish, start_daemon};
     use clawg_core::memory::relocate::{MovedRow, Refusal, Skipped};
+    use clawg_core::paths::Profile;
+
+    #[tokio::test]
+    async fn a_listing_and_a_refused_rename_go_through_the_running_daemon() {
+        let d = start_daemon().await;
+        publish(&d);
+        let daemon = Running::find(Profile::Dev, d.dir.path(), Lang::Es).await.expect("the daemon answers");
+        let create = |name: &str| ProjectsAction::Create { name: name.into(), new: false, profile: ProfileArg::default() };
+
+        let listed = command(&daemon, ProjectsAction::List { profile: ProfileArg::default() }).await.expect("a listing");
+        let renamed = command(&daemon, ProjectsAction::Rename { id: "nope".into(), name: "x".into(), profile: ProfileArg::default() })
+            .await
+            .expect_err("no project nope");
+        let (_, created) = command(&daemon, create("mi-app")).await.expect("created");
+        let (close, refused) = command(&daemon, create("Mi App")).await.expect("answered");
+
+        assert_eq!(listed, ("todavía no hay proyectos".to_string(), 0));
+        assert_eq!(renamed.to_string(), "no se pudo renombrar nope: no project has the id nope");
+        assert_eq!((created, refused), (0, 1), "a create left undone exits 1");
+        assert!(close.starts_with("no se creó nada"), "{close}");
+    }
 
     fn moved(id: i64, to: Option<&str>) -> MovedRow {
         serde_json::from_value(serde_json::json!({ "id": id, "from_project": null, "to_project": to })).unwrap()

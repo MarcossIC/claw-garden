@@ -1,12 +1,21 @@
-//! `clawg restore` — what it prints, kept apart from the command so the
-//! wording is under test without a store.
+//! `clawg restore` — the command, and what it prints kept apart from it so
+//! the wording is under test without a store.
 
 use std::path::Path;
 
-use clawg_core::memory::backup::Restored;
+use clawg_core::memory::backup::{restore, Restored};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::MemoryError;
 use clawg_core::preferences::Lang;
+
+use crate::error::CliError;
+
+/// Replaces the store in `base_dir` with the database at `from` and says so
+/// in `lang`; a refusal says how to free the store.
+pub fn command(lang: Lang, base_dir: &Path, from: &Path) -> Result<String, CliError> {
+    let restored = restore(base_dir, from).map_err(|e| CliError::Failed(explain(lang, e)))?;
+    Ok(report(lang, from, &restored))
+}
 
 /// The line printed after a restore.
 pub fn report(lang: Lang, from: &Path, restored: &Restored) -> String {
@@ -33,7 +42,7 @@ pub fn explain(lang: Lang, err: MemoryError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clawg_core::memory::store_lock::StoreOwner;
+    use clawg_core::memory::store_lock::{StoreLock, StoreOwner};
     use std::path::PathBuf;
 
     #[test]
@@ -62,6 +71,17 @@ mod tests {
         let msg = report(Lang::En, from, &kept);
         assert!(msg.contains("/b/memory-x-manual.db") && msg.contains("pre-restore"), "{msg}");
         assert_eq!(report(Lang::En, from, &Restored { previous: None }), "restored /b/memory-x-manual.db");
+    }
+
+    #[test]
+    fn a_store_the_daemon_holds_is_refused_in_the_commands_language() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _held = StoreLock::acquire(dir.path(), StoreHolder::Daemon).expect("the daemon's lock");
+
+        let err = command(Lang::Es, dir.path(), &dir.path().join("memory-x-manual.db")).expect_err("the daemon holds the store");
+
+        let said = err.to_string();
+        assert!(said.ends_with("; ejecuta primero `clawg stop` y después restaura"), "{said}");
     }
 
     #[test]

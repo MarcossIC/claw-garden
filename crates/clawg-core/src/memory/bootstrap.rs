@@ -733,12 +733,16 @@ pub async fn run_embedder_bootstrap(
     // is dropped (which happens when `ensure` returns and `progress_tx` goes
     // out of scope). Since `ensure_model` never emits `Done`, the forwarder's
     // last forwarded event is `Verify` and there is no race with the
-    // synthetic terminal `done` emitted below.
+    // synthetic terminal `done` emitted below. Its `Error` is not forwarded
+    // either: every failed attempt ends with the terminal `error` below,
+    // which carries the same cause, and the sink would report it twice.
     let forwarder_sink = sink.clone();
     let forwarder = tokio::spawn(async move {
         while let Some(p) = progress_rx.recv().await {
-            let event = progress_to_stream_event(p);
-            forwarder_sink.emit_event(event);
+            if matches!(p, DownloadProgress::Error { .. }) {
+                continue;
+            }
+            forwarder_sink.emit_event(progress_to_stream_event(p));
         }
     });
 
@@ -1647,19 +1651,25 @@ mod tests {
     }
 
     /// Error path: when `ensure` returns Err, the bootstrap emits exactly one
-    /// terminal `error` event and the cell stays empty.
+    /// terminal `error` event and the cell stays empty. `ensure` reports the
+    /// failure on its progress channel first, as `ensure_model_from` does.
     #[tokio::test]
     async fn run_embedder_bootstrap_emits_terminal_error_when_ensure_fails() {
         let cell: Arc<OnceCell<Arc<dyn Embedder>>> = Arc::new(OnceCell::new());
 
-        let ensure: EnsureModelFn = Arc::new(move |_base, _progress| {
+        let ensure: EnsureModelFn = Arc::new(move |_base, progress| {
             Box::pin(async move {
-                Err(DownloadError::RetryExhausted {
+                let error = DownloadError::RetryExhausted {
                     file: "onnx/model.onnx".into(),
                     host: "huggingface.co".into(),
                     attempts: 3,
                     cause: "HTTP 503 Service Unavailable".into(),
-                })
+                };
+                if let Some(tx) = progress {
+                    let _ = tx.send(DownloadProgress::Start { bytes_total: 100 });
+                    let _ = tx.send(DownloadProgress::Error { message: error.to_string() });
+                }
+                Err(error)
             })
         });
         let load: LoadEmbedderFn =
@@ -1685,6 +1695,11 @@ mod tests {
             phases.last().copied(),
             Some("error"),
             "`error` must be the LAST event on the error path; got {phases:?}"
+        );
+        assert_eq!(
+            phases.iter().filter(|p| **p == "error").count(),
+            1,
+            "one failure is one `error` event, so `LogSink` logs it once; got {phases:?}"
         );
         assert_eq!(
             count_done_phases(&events),

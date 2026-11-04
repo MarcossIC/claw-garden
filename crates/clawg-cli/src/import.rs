@@ -14,7 +14,9 @@ use tokio::sync::mpsc;
 
 use crate::cli::{ImportSource, MapTo, ProjectMap, RootMap};
 use crate::client::{ClientError, DaemonClient, ImportJob, ImportJobRequest};
+use crate::error::CliError;
 use crate::memories::version_warning;
+use crate::running::Running;
 
 /// How often a job is asked how far it got.
 pub const POLL_EVERY: Duration = Duration::from_secs(1);
@@ -360,6 +362,35 @@ pub fn interrupts() -> mpsc::UnboundedReceiver<()> {
         }
     });
     received
+}
+
+/// `clawg import`: takes import `undo_id` back, or imports `file`, through
+/// the daemon found running. A failure to reach it is said as the other
+/// commands that need it say it.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
+pub async fn command(
+    daemon: &Running,
+    file: Option<&Path>,
+    undo_id: Option<i64>,
+    from: ImportSource,
+    dry_run: bool,
+    follow: bool,
+    agent: Option<&str>,
+    maps: Maps<'_>,
+) -> Result<Finished, CliError> {
+    let finished = match (undo_id, file) {
+        (Some(n), _) => undo(daemon.lang, &daemon.client, n, dry_run).await.map(Finished::done),
+        (None, Some(file)) => {
+            // Before the daemon is asked, so a Ctrl-C meanwhile waits for the job.
+            let mut interrupts = interrupts();
+            run(daemon.lang, &daemon.client, file, from, dry_run, agent, maps, Watch::new(follow), &mut interrupts).await
+        }
+        (None, None) => return Err(CliError::Failed("name the file to import, or --undo N".into())),
+    };
+    finished.map_err(|e| match e {
+        ImportError::Client(e) => daemon.unavailable(e),
+        other => other.into(),
+    })
 }
 
 /// Asks the daemon to import `file`, an export of `from`, follows the job to
@@ -1029,6 +1060,21 @@ mod tests {
     use crate::client::tests::{publish, start_daemon};
     use clawg_core::memory::portability::{Counters, KeptRow};
     use clawg_core::memory::portability::format::Invalid;
+    use clawg_core::paths::Profile;
+
+    #[tokio::test]
+    async fn neither_a_file_nor_an_undo_is_refused_once_the_daemon_answers() {
+        let d = start_daemon().await;
+        publish(&d);
+        let daemon = Running::find(Profile::Dev, d.dir.path(), Lang::En).await.expect("the daemon answers");
+        let maps = Maps { roots: &[], projects: &[] };
+
+        let nothing = command(&daemon, None, None, ImportSource::Clawg, false, false, None, maps).await.expect_err("nothing to do");
+        let unknown = command(&daemon, None, Some(99), ImportSource::Clawg, false, false, None, maps).await.expect_err("no import 99");
+
+        assert_eq!(nothing.to_string(), "name the file to import, or --undo N");
+        assert_eq!(unknown.to_string(), "daemon returned 404: no import 99", "the daemon's refusal is shown as it came");
+    }
 
     const FILE: &str = concat!(
         r#"{"kind":"header","format":"clawg-memories","version":1,"exported_at":0,"clawg":"0.0.0"}"#,

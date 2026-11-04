@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::memory::pieces::{read_save_core, SaveLink};
+use crate::memory::pieces::read_save_core;
 use crate::memory::provenance::mark;
 use crate::preferences::Lang;
 use crate::memory::{
@@ -12,9 +12,9 @@ use crate::memory::{
     admin::MemoryKind,
     clock::TimestampMs,
     embedder::{EmbedError, EmbedRole, Embedder},
-    search::{memory_project_predicate, search_all_memories, RankedHit, SearchScope},
+    search::{memory_project_predicate, search_all_memories, PiecePosition, RankedHit, SearchScope},
     sharing::{Reach, Reader},
-    workspace::{EmittedIds, WorkspaceManager},
+    workspace::{EmittedIds, EmittedRow, WorkspaceManager},
     MemoryError, MemoryStore, TableKind,
 };
 
@@ -64,10 +64,14 @@ const MAX_CONFLICT_PAIRS: usize = 5;
 pub const DEFAULT_BUDGET: usize = 8_000;
 /// The most a caller may ask for; a larger budget is cut down to this.
 pub const MAX_BUDGET: usize = 24_000;
-/// A context with a query keeps a quarter of its budget for its hits. With
-/// the default, the other three quarters are what the workspace's AUTO
-/// section may take, so a stocked workspace no longer leaves the hits out.
+/// A context with a query keeps a quarter of its budget for its hits, so a
+/// long summary and a dispute no longer leave out what the query asked for.
 const HIT_ROOM_DIVISOR: usize = 4;
+/// While a summary or a hit waits, the workspace's AUTO section yields what
+/// it takes over half the budget before anything else is cut: its
+/// preferences have no cap of their own, and a stocked workspace left the
+/// session start without the last session's summary.
+const AUTO_ROOM_DIVISOR: usize = 2;
 /// Ends a hit whose text the budget shortened.
 const TRUNCATED: &str = " [truncated]";
 
@@ -139,6 +143,8 @@ pub enum PromptBlock {
     LongTerm,
     LastSession,
     Conflicts,
+    /// The AUTO section of the workspace; what the user wrote is never cut.
+    Workspace,
 }
 
 impl PromptBlock {
@@ -148,6 +154,7 @@ impl PromptBlock {
             PromptBlock::LongTerm => "long_term",
             PromptBlock::LastSession => "last_session",
             PromptBlock::Conflicts => "conflicts",
+            PromptBlock::Workspace => "workspace",
         }
     }
 }
@@ -204,7 +211,7 @@ pub async fn build_memory_prompt(
     budget: usize,
 ) -> Result<MemoryPrompt, MemoryError> {
     // 1. Read workspace file (may be empty on fresh install or read failure).
-    let workspace_content = read_workspace(workspace, agent_id, project_id).await;
+    let workspace_content = read_workspace(workspace, agent_id, project_id, emitted).await;
 
     // 2. Compute query embedding ONLY if embedder is available.
     //
@@ -271,7 +278,7 @@ pub async fn build_memory_prompt(
     log::info!(
         "{}",
         crate::memory::admin::format_tier1_coverage(
-            !workspace_content.is_empty(),
+            !workspace_content.render().is_empty(),
             hits.len()
         )
     );
@@ -286,7 +293,7 @@ pub async fn build_memory_prompt(
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
     let hit_room = budget / HIT_ROOM_DIVISOR;
     let reader = Reader::new(agent_id, reach.clone());
-    let fitted = assemble(lang, store, &workspace_content, last_session, hits, emitted, &reader, budget, hit_room).await;
+    let fitted = assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, hit_room).await;
 
     // Fire-and-forget access recording, of the hits the text kept: a row this
     // channel suppressed or the budget cut was not retrieved for the agent,
@@ -320,29 +327,33 @@ pub async fn build_session_prompt(
     emitted: &EmittedIds,
     budget: usize,
 ) -> Result<MemoryPrompt, MemoryError> {
-    let workspace_content = read_workspace(workspace, agent_id, project_id).await;
+    let workspace_content = read_workspace(workspace, agent_id, project_id, emitted).await;
     let since = TimestampMs::now().as_millis_i64().saturating_sub(RECENT_WINDOW_MS);
-    let rows = fetch_recent_rows(store, agent_id, project_id, since).await?;
-    let rows: Vec<RankedHit> = rows.into_iter().filter(|h| !emitted.contains(h.kind, h.id)).collect();
-    let links = store.save_links(rows.iter().map(|h| h.id).collect()).await?;
-    let hits = one_row_per_save(rows, &links, K_FINAL);
+    let hits = fetch_recent_saves(store, agent_id, project_id, since, emitted, K_FINAL).await?;
     let retrieval = Retrieval::Recent { hits: hits.len() };
     let (last_session, hits) = with_last_session(store, agent_id, project_id, reach, hits).await;
     // No room: at a session start the summary is the handoff, and these rows
     // are only the newest, not what anything asked for.
     let reader = Reader::new(agent_id, reach.clone());
-    let fitted = assemble(lang, store, &workspace_content, last_session, hits, emitted, &reader, budget, 0).await;
+    let fitted = assemble(lang, store, workspace_content, last_session, hits, emitted, &reader, budget, 0).await;
     Ok(MemoryPrompt { text: fitted.text, retrieval, cut: fitted.cut })
 }
 
 /// Only its content reaches the model: no markers, no empty headings. A
 /// file that cannot be read is an empty workspace, not a failed prompt.
-async fn read_workspace(workspace: &WorkspaceManager, agent_id: &str, project_id: Option<&str>) -> String {
+/// `emitted` is the report of the regeneration that wrote the file, which
+/// names the rows of its AUTO section.
+async fn read_workspace(
+    workspace: &WorkspaceManager,
+    agent_id: &str,
+    project_id: Option<&str>,
+    emitted: &EmittedIds,
+) -> PromptWorkspace {
     let raw = workspace.read(agent_id, project_id).await.unwrap_or_else(|e| {
         log::warn!("workspace read failed: {e}; treating as empty");
         String::new()
     });
-    workspace_for_prompt(&raw)
+    workspace_for_prompt(&raw, emitted)
 }
 
 /// Lays `hits` out under the workspace, with the conflicts on what the
@@ -351,7 +362,7 @@ async fn read_workspace(workspace: &WorkspaceManager, agent_id: &str, project_id
 async fn assemble(
     lang: Lang,
     store: &MemoryStore,
-    workspace_content: &str,
+    workspace_content: PromptWorkspace,
     last_session: Option<RankedHit>,
     hits: Vec<RankedHit>,
     emitted: &EmittedIds,
@@ -403,7 +414,7 @@ struct PromptParts<'a> {
     /// The language of the notes the prompt adds; the blocks' headings and
     /// markers are the same in every language.
     lang: Lang,
-    workspace: &'a str,
+    workspace: PromptWorkspace,
     /// The last session's summary, or nothing. A block of its own rather than
     /// an option so the budget cuts it as it cuts the last hit of any block.
     last_session: Vec<RankedHit>,
@@ -422,12 +433,13 @@ struct PromptParts<'a> {
 struct Cut {
     budget: usize,
     full: usize,
-    /// Every hit in the order the prompt prints them, which is not the order
-    /// the cut takes them in.
+    /// Every AUTO row and hit in the order the prompt prints them, which is
+    /// not the order the cut takes them in.
     printed: Vec<(TableKind, i64)>,
     left_out: Vec<(TableKind, i64)>,
     shortened: Vec<(TableKind, i64)>,
-    /// Nothing is left to cut and the text is still over.
+    /// Nothing is left to cut and the text, with what the user wrote in the
+    /// workspace, is still over.
     workspace_over: bool,
 }
 
@@ -441,11 +453,13 @@ struct Fitted {
 
 /// Renders `parts` in at most `budget` bytes.
 ///
-/// While the text is over, and RECENT and LONG-TERM take more than
-/// `hit_room`, the hit of either that scored lowest goes (see
-/// [`next_to_cut`]); then the last session's summary, then the last conflict
-/// pair, which joins the count of pairs not shown, then the hits left in the
-/// room, by the same rule. The blocks say how old a hit is, not how relevant:
+/// While the text is over, a summary or a hit waits and the workspace's AUTO
+/// section takes more than half the budget, an AUTO entry goes first (see
+/// [`PromptWorkspace::next_to_cut`]). Then, while the text is over and
+/// RECENT and LONG-TERM take more than `hit_room`, the hit of either that
+/// scored lowest goes (see [`next_to_cut`]); then the last session's
+/// summary, then the last conflict pair, which joins the count of pairs not
+/// shown, then the hits left in the room, by the same rule. The blocks say how old a hit is, not how relevant:
 /// cutting a whole block first would drop an `exact` hit of last week before
 /// a recent one that barely passed the floor. The summary outlasts the hits
 /// beyond the room because no query brings it back, and gives way to the
@@ -458,19 +472,21 @@ struct Fitted {
 /// Each step renders the whole text, so the closing note, the SHARED note and
 /// the text a conflict gains when its hit goes are all counted as they are.
 ///
-/// The workspace is never cut: its preferences and USER section are the
-/// standing contract with the user, and every row it printed is one the
-/// search skipped, so cutting it here would leave that row with no channel.
-/// When the workspace and the closing note alone are over the budget, the
-/// text goes over it and says so.
+/// The rest of the AUTO section goes last, by the same rule, when nothing
+/// else is left: with nothing waiting it may take the whole budget. Each AUTO
+/// row it cuts is named by id, since the search skipped it for being in the
+/// workspace and the closing note is its only channel left. What the user
+/// wrote is never cut, and an AUTO entry the regeneration did not report
+/// cannot be named, so it stays too. When those and the closing note alone
+/// are over the budget, the text goes over it and says so.
 fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
     let full = render(&parts, None);
     if full.len() <= budget {
         return Fitted { text: full, shown: parts.recent.into_iter().chain(parts.longterm).collect(), cut: Vec::new() };
     }
     let mut blocks = Vec::new();
-    let printed =
-        parts.last_session.iter().chain(&parts.recent).chain(&parts.longterm).map(|h| (h.kind, h.id)).collect();
+    let hits = parts.last_session.iter().chain(&parts.recent).chain(&parts.longterm).map(|h| (h.kind, h.id));
+    let printed = parts.workspace.rows().chain(hits).collect();
     let mut cut = Cut { budget, full: full.len(), printed, left_out: Vec::new(), shortened: Vec::new(), workspace_over: false };
     loop {
         let text = render(&parts, Some(&cut));
@@ -478,6 +494,12 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
             blocks.sort();
             return Fitted { text, shown: parts.recent.into_iter().chain(parts.longterm).collect(), cut: blocks };
         };
+        let waiting = !parts.last_session.is_empty() || !parts.recent.is_empty() || !parts.longterm.is_empty();
+        let auto = parts.workspace.next_to_cut();
+        if let Some(at) = auto.filter(|_| waiting && parts.workspace.auto_text().len() > budget / AUTO_ROOM_DIVISOR) {
+            cut_auto(&mut parts.workspace, at, &mut blocks, &mut cut);
+            continue;
+        }
         let hits_over = hit_bytes(&parts).saturating_sub(parts.hit_room);
         let (block, at, by) = match next_to_cut(&parts.recent, &parts.longterm) {
             Some((bucket, at)) if hits_over > 0 => {
@@ -499,8 +521,12 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
                 (hits_in(&mut parts, bucket), at, over)
             }
             None => {
+                if let Some(at) = auto {
+                    cut_auto(&mut parts.workspace, at, &mut blocks, &mut cut);
+                    continue;
+                }
                 cut.workspace_over = true;
-                    blocks.sort();
+                blocks.sort();
                 return Fitted { text: render(&parts, Some(&cut)), shown: Vec::new(), cut: blocks };
             }
         };
@@ -524,6 +550,13 @@ fn fit_to_budget(mut parts: PromptParts<'_>, budget: usize) -> Fitted {
             let hit = block.remove(at);
             cut.left_out.push((hit.kind, hit.id));
         }
+    }
+}
+
+fn cut_auto(workspace: &mut PromptWorkspace, at: usize, blocks: &mut Vec<PromptBlock>, cut: &mut Cut) {
+    if let Some(row) = workspace.take(at) {
+        cut_from(blocks, PromptBlock::Workspace);
+        cut.left_out.push(row);
     }
 }
 
@@ -612,10 +645,11 @@ fn positions(recent: &[RankedHit], longterm: &[RankedHit]) -> HashMap<i64, usize
 fn render(parts: &PromptParts<'_>, cut: Option<&Cut>) -> String {
     let PromptParts { lang, workspace, last_session, recent, longterm, conflicts, conflicts_omitted, reader, .. } = parts;
     let mut out = String::new();
+    let workspace = workspace.render();
     if !workspace.is_empty() {
         out.push_str(SEP_WORKSPACE);
         out.push('\n');
-        out.push_str(workspace);
+        out.push_str(&workspace);
         if !workspace.ends_with('\n') {
             out.push('\n');
         }
@@ -698,8 +732,8 @@ fn format_cut(lang: Lang, cut: &Cut) -> String {
     }
     if cut.workspace_over {
         out.push_str(match lang {
-            Lang::En => " The workspace alone is over the budget and is shown whole.",
-            Lang::Es => " El workspace solo ya pasa el presupuesto y se muestra entero.",
+            Lang::En => " The part of the workspace the user wrote is over the budget on its own and is shown whole.",
+            Lang::Es => " La parte del workspace que escribió la persona ya pasa el presupuesto sola y se muestra entera.",
         });
     }
     out
@@ -1002,41 +1036,73 @@ async fn fetch_last_session(
         .map_err(|e| MemoryError::Backend(format!("fetch_last_session: {e}")))
 }
 
-/// Rows RECENT may print in a prompt without a query: the reader's own live
-/// rows since `?3`, newest first, under the search's project predicate. The
-/// pool is wider than the block because the pieces of one long save are
-/// rows of their own, and they fold into one line. The pieces of a save share
-/// its stamp and are inserted in order, so `id ASC` within a stamp keeps the
-/// opening of a save the pool's cut falls inside.
-const RECENT_ROWS_SQL: &str = concat!(
+/// A row RECENT may print: a live row of the reader's own (`?1`) since `?3`,
+/// under the search's project predicate (`?2`), that the workspace did not
+/// print (`?4`, a JSON array of ids).
+macro_rules! recent_row {
+    ($m:literal) => {
+        concat!(
+            $m, "status IN ('active', 'disputed') AND ", $m, "deleted_at IS NULL AND ", $m, "agent_id = ?1 AND ",
+            memory_project_predicate!($m, "?2"), " AND ", $m, "created_at >= ?3 AND ",
+            $m, "id NOT IN (SELECT value FROM json_each(?4))"
+        )
+    };
+}
+
+/// The saves RECENT prints in a prompt without a query, newest first, at most
+/// `?5`: one row per save, so the `LIMIT` counts saves however many pieces
+/// each holds. A long save is its piece of lowest position among the rows
+/// that qualify, since the opening names its subject; no earlier piece of it
+/// may qualify. A row's save is the oldest that links it, as
+/// [`MemoryStore::save_links`] reads it. The last two columns are the
+/// piece's position and its save's count, `NULL` for a row of one piece.
+/// `CROSS JOIN` keeps the save's own pieces in the outer loop of the check:
+/// without statistics the planner would walk every row of the agent instead.
+const RECENT_SAVES_SQL: &str = concat!(
     "
-    SELECT id, content, memory_type, tier, status, created_at, agent_id, topic_key, project_id
-    FROM memory
-    WHERE status IN ('active', 'disputed')
-      AND deleted_at IS NULL
-      AND agent_id = ?1
-      AND ",
-    memory_project_predicate!("", "?2"),
+    SELECT m.id, m.content, m.memory_type, m.tier, m.status, m.created_at, m.agent_id, m.topic_key, m.project_id,
+           p.piece, (SELECT COUNT(*) FROM memory_piece n WHERE n.save_id = p.save_id)
+    FROM memory m
+    LEFT JOIN memory_piece p
+      ON p.memory_id = m.id
+     AND p.save_id = (SELECT MIN(save_id) FROM memory_piece WHERE memory_id = m.id)
+     AND p.piece = (SELECT MIN(piece) FROM memory_piece WHERE memory_id = m.id AND save_id = p.save_id)
+    WHERE ",
+    recent_row!("m."),
     "
-      AND created_at >= ?3
-    ORDER BY created_at DESC, id ASC
-    LIMIT ?4
+      AND NOT EXISTS (
+        SELECT 1 FROM memory_piece q CROSS JOIN memory o ON o.id = q.memory_id
+        WHERE q.save_id = p.save_id AND q.piece < p.piece
+          AND (SELECT MIN(save_id) FROM memory_piece WHERE memory_id = o.id) = q.save_id
+          AND ",
+    recent_row!("o."),
+    "
+      )
+    ORDER BY m.created_at DESC, m.id ASC
+    LIMIT ?5
 "
 );
-const RECENT_ROW_POOL: i64 = 200;
 
-async fn fetch_recent_rows(
+/// The newest `limit` saves RECENT may print ([`RECENT_SAVES_SQL`]), each
+/// with its piece's position when it is a piece of a long save.
+async fn fetch_recent_saves(
     store: &MemoryStore,
     agent_id: &str,
     project_id: Option<&str>,
     since: i64,
+    emitted: &EmittedIds,
+    limit: usize,
 ) -> Result<Vec<RankedHit>, MemoryError> {
     let (agent, project) = (agent_id.to_string(), project_id.map(str::to_string));
+    let printed = serde_json::to_string(&emitted.memory_ids().collect::<Vec<i64>>())
+        .map_err(|e| MemoryError::Backend(format!("fetch_recent_saves: {e}")))?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<RankedHit>> {
-            let mut stmt = c.prepare_cached(RECENT_ROWS_SQL)?;
-            let rows = stmt.query_map(rusqlite::params![agent, project, since, RECENT_ROW_POOL], |row| {
+            let mut stmt = c.prepare_cached(RECENT_SAVES_SQL)?;
+            let rows = stmt.query_map(rusqlite::params![agent, project, since, printed, limit], |row| {
+                let piece: Option<i64> = row.get(9)?;
                 Ok(RankedHit {
                     id: row.get(0)?,
                     kind: TableKind::Memory,
@@ -1048,7 +1114,7 @@ async fn fetch_recent_rows(
                     distance: 0.0,
                     created_at: TimestampMs::from_unix_millis(row.get(5)?),
                     agent_id: row.get(6)?,
-                    piece: None,
+                    piece: piece.map(|piece| row.get(10).map(|pieces| PiecePosition { piece, pieces })).transpose()?,
                     exact: false,
                     topic_key: row.get(7)?,
                     project_id: row.get(8)?,
@@ -1057,34 +1123,7 @@ async fn fetch_recent_rows(
             rows.collect()
         })
         .await
-        .map_err(|e| MemoryError::Backend(format!("fetch_recent_rows: {e}")))
-}
-
-/// The first `k` saves of `rows`, in their order, each as its piece of
-/// lowest position: the opening is what names the subject of a long save.
-fn one_row_per_save(rows: Vec<RankedHit>, links: &HashMap<i64, SaveLink>, k: usize) -> Vec<RankedHit> {
-    let mut out: Vec<RankedHit> = Vec::new();
-    let mut slot_of_save: HashMap<i64, usize> = HashMap::new();
-    for mut row in rows {
-        let link = links.get(&row.id).copied();
-        row.piece = link.map(|l| l.position);
-        match link.and_then(|l| slot_of_save.get(&l.save_id).copied()) {
-            Some(slot) => {
-                let piece = |h: &RankedHit| h.piece.map_or(0, |p| p.piece);
-                if piece(&row) < piece(&out[slot]) {
-                    out[slot] = row;
-                }
-            }
-            None if out.len() < k => {
-                if let Some(link) = link {
-                    slot_of_save.insert(link.save_id, out.len());
-                }
-                out.push(row);
-            }
-            None => {}
-        }
-    }
-    out
+        .map_err(|e| MemoryError::Backend(format!("fetch_recent_saves: {e}")))
 }
 
 /// Partitions hits into (recent, longterm) at `now - RECENT_WINDOW_MS`. A stamp
@@ -1105,27 +1144,113 @@ fn bucket_by_recency(hits: Vec<RankedHit>, now: TimestampMs) -> (Vec<RankedHit>,
     (recent, longterm)
 }
 
+/// The workspace as the prompt shows it: what the user wrote before the
+/// AUTO section and from its end on, which the budget never cuts, and the
+/// AUTO section entry by entry, which it may.
+struct PromptWorkspace {
+    before: String,
+    /// `None` for a file without the AUTO marker, which is the user's whole.
+    auto: Option<Vec<AutoEntry>>,
+    after: String,
+}
+
+/// A line of the AUTO section, or an entry (`- `) with the lines behind its
+/// margin. `row` is the row the regeneration reported for it: only such an
+/// entry may be cut, since any other could not be named.
+struct AutoEntry {
+    text: String,
+    row: Option<EmittedRow>,
+}
+
+impl PromptWorkspace {
+    /// The text the prompt prints: the AUTO section without its empty
+    /// headings, and the user's own text as written, both without markers.
+    fn render(&self) -> String {
+        if self.auto.is_none() {
+            return self.before.clone();
+        }
+        [self.before.as_str(), self.auto_text().as_str(), self.after.as_str()]
+            .into_iter()
+            .map(trim_blank_lines)
+            .filter(|piece| !piece.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The AUTO section as the prompt prints it.
+    fn auto_text(&self) -> String {
+        let Some(auto) = &self.auto else {
+            return String::new();
+        };
+        let lines: String = auto.iter().map(|entry| format!("{}\n", entry.text)).collect();
+        trim_blank_lines(&without_empty_headings(&lines)).to_string()
+    }
+
+    /// The rows of the AUTO section in the order the prompt prints them.
+    fn rows(&self) -> impl Iterator<Item = (TableKind, i64)> + '_ {
+        self.auto.iter().flatten().filter_map(|entry| entry.row.as_ref().map(|row| (row.kind, row.id)))
+    }
+
+    /// Where the entry the budget cuts next sits: the lowest importance, at
+    /// equal importance the oldest, at equal age the lowest id. Preferences,
+    /// decisions and skills compete alike, and an entry without a row stays.
+    fn next_to_cut(&self) -> Option<usize> {
+        self.auto
+            .iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(at, entry)| entry.row.as_ref().map(|row| (at, row)))
+            .min_by(|(_, a), (_, b)| {
+                a.importance.total_cmp(&b.importance).then(a.created_at.cmp(&b.created_at)).then(a.id.cmp(&b.id))
+            })
+            .map(|(at, _)| at)
+    }
+
+    /// Takes out the entry at `at`, which [`Self::next_to_cut`] found, and
+    /// names its row.
+    fn take(&mut self, at: usize) -> Option<(TableKind, i64)> {
+        let entry = self.auto.as_mut()?.remove(at);
+        entry.row.map(|row| (row.kind, row.id))
+    }
+}
+
 /// What the model gets of the workspace file: the AUTO section without its
 /// empty headings, and the user's own text as written, both without the
 /// markers. The markers stay in the file, where regeneration needs them to
 /// find the USER section; to the model they are noise. A file without the
 /// AUTO marker was not generated, so it is handed over whole.
-fn workspace_for_prompt(raw: &str) -> String {
+///
+/// Each entry of the AUTO section is matched, by its exact text, to a row
+/// `emitted` reports; two rows with the same line take the entries in order.
+fn workspace_for_prompt(raw: &str, emitted: &EmittedIds) -> PromptWorkspace {
     use crate::memory::workspace::{AUTO_END, AUTO_START, USER_END, USER_START};
 
     let Some(auto_start) = raw.find(AUTO_START) else {
-        return raw.to_string();
+        return PromptWorkspace { before: raw.to_string(), auto: None, after: String::new() };
     };
     let body = &raw[auto_start + AUTO_START.len()..];
     let (auto, rest) = body.split_once(AUTO_END).unwrap_or((body, ""));
-    let rest = rest.replace(USER_START, "").replace(USER_END, "");
-    let auto = without_empty_headings(auto);
-    [&raw[..auto_start], auto.as_str(), rest.as_str()]
-        .into_iter()
-        .map(trim_blank_lines)
-        .filter(|piece| !piece.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut entries: Vec<AutoEntry> = Vec::new();
+    for line in auto.lines() {
+        match entries.last_mut() {
+            Some(entry) if entry.text.starts_with("- ") && line.starts_with(CONTINUATION) => {
+                entry.text.push('\n');
+                entry.text.push_str(line);
+            }
+            _ => entries.push(AutoEntry { text: line.to_string(), row: None }),
+        }
+    }
+    let mut reported: Vec<&EmittedRow> = emitted.rows().iter().collect();
+    for entry in entries.iter_mut().filter(|entry| entry.text.starts_with("- ")) {
+        if let Some(at) = reported.iter().position(|row| row.line == entry.text) {
+            entry.row = Some(reported.remove(at).clone());
+        }
+    }
+    PromptWorkspace {
+        before: raw[..auto_start].to_string(),
+        auto: Some(entries),
+        after: rest.replace(USER_START, "").replace(USER_END, ""),
+    }
 }
 
 /// Drops each `## ` heading with nothing under it before the next one.
@@ -1382,7 +1507,7 @@ mod tests {
     fn rendered_with(recent: Vec<RankedHit>, last_session: Vec<RankedHit>) -> String {
         let parts = PromptParts {
             lang: Lang::En,
-            workspace: "- tabs, not spaces",
+            workspace: workspace_for_prompt("- tabs, not spaces", &EmittedIds::default()),
             last_session,
             recent,
             longterm: Vec::new(),
@@ -1641,10 +1766,10 @@ mod tests {
         hit_at_2023_11_14(id, TableKind::Memory, "semantic_fact", &format!("{id} ").repeat(bytes / (id.to_string().len() + 1)))
     }
 
-    fn parts<'a>(workspace: &'a str, recent: &[(i64, usize)], longterm: &[(i64, usize)], conflicts: Vec<ConflictPair>) -> PromptParts<'a> {
+    fn parts<'a>(workspace: &str, recent: &[(i64, usize)], longterm: &[(i64, usize)], conflicts: Vec<ConflictPair>) -> PromptParts<'a> {
         PromptParts {
             lang: Lang::En,
-            workspace,
+            workspace: workspace_for_prompt(workspace, &EmittedIds::default()),
             recent: recent.iter().map(|&(id, bytes)| sized_hit(id, bytes)).collect(),
             longterm: longterm.iter().map(|&(id, bytes)| sized_hit(id, bytes)).collect(),
             last_session: Vec::new(),
@@ -1784,10 +1909,14 @@ mod tests {
 
         let conflicts_gone = fit_to_budget(ten_long_hits(), 200);
         assert!(conflicts_gone.cut.contains(&PromptBlock::Conflicts), "{}", conflicts_gone.text);
+
+        let auto = known_auto(&[(101, 9.0, 1, 3_000), (102, 9.0, 2, 3_000)], "");
+        let auto_gone = fit_to_budget(PromptParts { workspace: auto, ..parts("", &[(1, 500)], &[], vec![]) }, 3_000);
+        assert_eq!(auto_gone.cut, [PromptBlock::Workspace], "{}", auto_gone.text);
         assert_eq!(
-            [PromptBlock::Recent, PromptBlock::LongTerm, PromptBlock::LastSession, PromptBlock::Conflicts]
+            [PromptBlock::Recent, PromptBlock::LongTerm, PromptBlock::LastSession, PromptBlock::Conflicts, PromptBlock::Workspace]
                 .map(PromptBlock::as_str),
-            ["recent", "long_term", "last_session", "conflicts"]
+            ["recent", "long_term", "last_session", "conflicts", "workspace"]
         );
     }
 
@@ -1840,7 +1969,7 @@ mod tests {
         assert!(fitted.text.contains(workspace.trim_end()), "the workspace is never cut");
         assert!(header_ids(&fitted.text).is_empty(), "{}", fitted.text);
         let budget = block(&fitted.text, SEP_BUDGET).expect("the overflow is said");
-        assert!(budget.contains("The workspace alone is over the budget"), "{budget}");
+        assert!(budget.contains("The part of the workspace the user wrote is over the budget on its own"), "{budget}");
         assert!(budget.contains(&format!("the full context is {} bytes", fit_to_budget(parts(&workspace, &[(1, 500)], &[(2, 500)], vec![]), MAX_BUDGET).text.len())), "{budget}");
     }
 
@@ -1923,6 +2052,88 @@ mod tests {
                 let fitted = fit_to_budget(parts, budget);
                 assert!(fitted.text.len() <= budget, "{} bytes over a budget of {budget}:\n{}", fitted.text.len(), fitted.text);
             }
+        }
+    }
+
+    /// A workspace whose AUTO section holds a preference of about `bytes`
+    /// per `(id, importance, age in days, bytes)`, each known by the row the
+    /// regeneration reported, with `user` as the USER section.
+    fn known_auto(rows: &[(i64, f64, i64, usize)], user: &str) -> PromptWorkspace {
+        let mut auto = vec![AutoEntry { text: "## User Preferences (always active)".into(), row: None }];
+        for &(id, importance, age_days, bytes) in rows {
+            let line = format!("- {}", format!("pref{id} ").repeat(bytes / (id.to_string().len() + 5)));
+            let created_at = TimestampMs::from_unix_millis(1_700_000_000_000 - age_days * 86_400_000);
+            let row = EmittedRow { kind: TableKind::Memory, id, importance, created_at, line: line.clone() };
+            auto.push(AutoEntry { text: line, row: Some(row) });
+        }
+        PromptWorkspace { before: String::new(), auto: Some(auto), after: user.to_string() }
+    }
+
+    /// The ids of the AUTO entries `known_auto` wrote that the text prints.
+    fn auto_ids(text: &str) -> Vec<i64> {
+        text.lines()
+            .filter_map(|l| l.strip_prefix("- pref"))
+            .filter_map(|l| l.split(' ').next()?.parse().ok())
+            .collect()
+    }
+
+    #[test]
+    fn the_auto_rows_over_half_go_before_the_hits() {
+        let rows: Vec<_> = (101..=105).map(|id| (id, 9.0, 1, 1_000)).collect();
+        let parts = PromptParts { workspace: known_auto(&rows, ""), ..parts("", &[(1, 1_000), (2, 1_000)], &[], vec![]) };
+
+        let fitted = fit_to_budget(parts, 6_000);
+
+        assert!(fitted.text.len() <= 6_000, "{}", fitted.text);
+        assert_eq!(header_ids(&fitted.text), [1, 2], "the hits stay whole: {}", fitted.text);
+        assert_eq!(auto_ids(&fitted.text), [103, 104, 105], "{}", fitted.text);
+        assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Left out: #101, #102."), "{}", fitted.text);
+        assert!(!fitted.text.contains(TRUNCATED), "{}", fitted.text);
+    }
+
+    #[test]
+    fn with_nothing_waiting_the_auto_rows_take_the_whole_budget() {
+        let rows: Vec<_> = (1..=18).map(|n| (100 + n, 9.0, n, 800)).collect();
+        let parts = PromptParts { workspace: known_auto(&rows, ""), ..parts("", &[], &[], vec![]) };
+
+        let fitted = fit_to_budget(parts, 8_000);
+
+        assert!(fitted.text.len() <= 8_000, "{} bytes: {}", fitted.text.len(), fitted.text);
+        let workspace = block(&fitted.text, SEP_WORKSPACE).unwrap();
+        assert!(workspace.len() > 4_000, "more than half, with nothing else to show: {} bytes", workspace.len());
+        let kept = auto_ids(&fitted.text);
+        assert_eq!(kept, (101..101 + kept.len() as i64).collect::<Vec<_>>(), "the newest stay: {}", fitted.text);
+    }
+
+    #[test]
+    fn the_auto_rows_go_by_importance_then_newest() {
+        let workspace = known_auto(&[(1, 9.0, 10, 1_000), (2, 8.0, 10, 1_000), (3, 8.0, 1, 1_000), (4, 10.0, 1, 1_000)], "");
+        let fitted = fit_to_budget(PromptParts { workspace, ..parts("", &[], &[], vec![]) }, 2_400);
+
+        assert_eq!(auto_ids(&fitted.text), [1, 4], "{}", fitted.text);
+        assert!(block(&fitted.text, SEP_BUDGET).unwrap().contains("Left out: #2, #3."), "{}", fitted.text);
+    }
+
+    #[test]
+    fn what_the_user_wrote_is_never_cut() {
+        let user = "my own note, written by hand. ".repeat(300);
+        let rows = [(101, 9.0, 1, 300), (102, 9.0, 2, 300), (103, 9.0, 3, 300)];
+        for (lang, left_out, said) in [
+            (Lang::En, "Left out: #101, #102, #103, #1.", "The part of the workspace the user wrote is over the budget on its own and is shown whole."),
+            (
+                Lang::Es,
+                "Quedaron afuera: #101, #102, #103, #1.",
+                "La parte del workspace que escribió la persona ya pasa el presupuesto sola y se muestra entera.",
+            ),
+        ] {
+            let parts = PromptParts { lang, workspace: known_auto(&rows, &user), ..parts("", &[(1, 500)], &[], vec![]) };
+
+            let fitted = fit_to_budget(parts, 8_000);
+
+            assert!(fitted.text.contains(user.trim_end()), "what the user wrote is whole: {}", fitted.text);
+            assert!(auto_ids(&fitted.text).is_empty() && header_ids(&fitted.text).is_empty(), "{}", fitted.text);
+            let budget = block(&fitted.text, SEP_BUDGET).expect("the overflow is said");
+            assert!(budget.contains(left_out) && budget.contains(said), "{budget}");
         }
     }
 
@@ -3302,6 +3513,78 @@ mod tests {
         assert!(hits.contains(&format!("#{asked} ")), "the hit the query asked for is shown: {prompt}");
     }
 
+    /// A preference of `agent_id` in `project_id` that the workspace prints,
+    /// `age_days` old.
+    async fn seed_preference(store: &MemoryStore, agent_id: &str, project_id: Option<&str>, content: &str, importance: f64, age_days: i64) -> i64 {
+        let id = seed_dated(store, agent_id, project_id, content, age_days).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET memory_type = 'user_preference', importance = ?2, tier = 1 WHERE id = ?1",
+                    rusqlite::params![id, importance],
+                )
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    /// The session start that once came back with the workspace alone: 18
+    /// preferences of about 800 bytes, 14 KB in all, and the last session's
+    /// summary, under the default budget.
+    #[tokio::test]
+    async fn a_stocked_workspace_leaves_room_for_the_last_session() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let (agent, project) = ("agent-stocked", Some("proj-a"));
+        let mut prefs = Vec::new();
+        for n in 0..18_i64 {
+            let importance = [8.0, 9.0, 10.0][(n % 3) as usize];
+            let text = format!("preference {n}: {}", "keep it this way. ".repeat(43));
+            prefs.push((seed_preference(&store, agent, project, &text, importance, 10 + n).await, importance, n));
+        }
+        let summary = format!("Goal: fix the session start. {}", "Next steps: run the suite. ".repeat(50));
+        let summary = seed_summary(&store, agent, project, &summary, 1).await;
+        let emitted = wm.regenerate_auto_section(agent, project, &store).await.unwrap();
+        assert_eq!(emitted.len(), 18, "the workspace prints every preference");
+
+        let at_start = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, DEFAULT_BUDGET).await.unwrap();
+        let query = QueryTexts::single_shot("where was I");
+        let with_query =
+            build_memory_prompt(Lang::En, &store, &wm, None, agent, project, &Reach::Own, query, &emitted, None, DEFAULT_BUDGET)
+                .await
+                .unwrap();
+
+        for prompt in [at_start, with_query] {
+            let text = &prompt.text;
+            assert!(text.len() <= DEFAULT_BUDGET, "{} bytes: {text}", text.len());
+            let last = block(text, SEP_LAST_SESSION).unwrap_or_else(|| panic!("no LAST SESSION: {text}"));
+            assert!(last.contains(&format!("#{summary} ")) && !last.contains(TRUNCATED), "the summary is whole: {text}");
+            let left_out = block(text, SEP_BUDGET).expect("the cut is said");
+            let (kept, cut): (Vec<_>, Vec<_>) = prefs.iter().partition(|(_, _, n)| text.contains(&format!("preference {n}: ")));
+            assert!(!cut.is_empty(), "{text}");
+            for (id, _, _) in &cut {
+                assert!(left_out.contains(&format!("#{id},")) || left_out.contains(&format!("#{id}.")), "#{id} is named: {left_out}");
+            }
+            for (_, importance, n) in &kept {
+                for (_, cut_importance, m) in &cut {
+                    assert!(importance > cut_importance || (importance == cut_importance && n < m), "a kept one outranks a cut one: {text}");
+                }
+            }
+            assert!(prompt.cut.contains(&PromptBlock::Workspace), "{:?}", prompt.cut);
+        }
+
+        let roomy = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, MAX_BUDGET).await.unwrap().text;
+        let unknown = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &EmittedIds::default(), MAX_BUDGET)
+            .await
+            .unwrap()
+            .text;
+        assert!(!roomy.contains(SEP_BUDGET), "{roomy}");
+        assert_eq!(roomy, unknown, "the rows the regeneration names change nothing while the text fits");
+    }
+
     #[tokio::test]
     async fn e2e_full_4_block_output() {
         use crate::memory::embedder::FakeEmbedder;
@@ -3632,12 +3915,11 @@ mod tests {
         assert!(!prompt.text.contains(&format!("#{second} ")), "{}", prompt.text);
     }
 
-    #[tokio::test]
-    async fn a_long_save_the_row_pool_cuts_is_still_shown_by_its_opening() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        // Every piece of a save carries the save's stamp, as ingest writes it.
-        let pieces = RECENT_ROW_POOL + 1;
-        let ts = TimestampMs::now().as_millis_i64() - 86_400_000;
+    /// A save of `pieces` rows of `agent_id`, `age_ms` old, linked in order.
+    /// Every piece carries the save's stamp, as ingest writes it.
+    async fn seed_long_save(store: &MemoryStore, agent_id: &str, label: &str, pieces: usize, age_ms: i64) -> Vec<i64> {
+        let (agent, text) = (agent_id.to_string(), label.to_string());
+        let ts = TimestampMs::now().as_millis_i64() - age_ms;
         let ids = store
             .conn
             .call(move |c| -> Result<Vec<i64>, rusqlite::Error> {
@@ -3647,8 +3929,8 @@ mod tests {
                             "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
                              created_at, created_by_type, created_by_ref,
                              last_modified_at, last_accessed_at, importance, tier, status)
-                             VALUES ('agent', 'agent-1', NULL, ?1, 'semantic_fact', 'explicit', ?2, 'agent', 'agent-1', ?2, ?2, 5.0, 2, 'active')",
-                            rusqlite::params![format!("piece {i} of a long save"), ts],
+                             VALUES ('agent', ?1, NULL, ?2, 'semantic_fact', 'explicit', ?3, 'agent', ?1, ?3, ?3, 5.0, 2, 'active')",
+                            rusqlite::params![agent, format!("piece {i} of {text}"), ts],
                         )?;
                         Ok(c.last_insert_rowid())
                     })
@@ -3661,14 +3943,46 @@ mod tests {
             .enumerate()
             .map(|(i, &memory_id)| crate::memory::pieces::StoredPiece {
                 memory_id,
-                context: if i == 0 { String::new() } else { "opening".into() },
+                context: if i == 0 { String::new() } else { label.to_string() },
             })
             .collect();
         store.link_pieces(linked).await.unwrap();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_context_without_a_query_shows_ten_saves_however_many_pieces_they_hold() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        // Eleven saves of 25 pieces: the ten newest alone are 250 rows.
+        let mut openings = Vec::new();
+        for save in 0..11 {
+            let ids = seed_long_save(&store, "agent-1", &format!("save {save}"), 25, 86_400_000 + save * 60_000).await;
+            openings.push(ids[0]);
+        }
 
         let prompt = session_prompt(&store, "agent-1", None).await;
 
-        assert!(prompt.text.contains(&format!("#{} semantic_fact piece=1/{pieces}]", ids[0])), "{}", prompt.text);
+        let recent = block(&prompt.text, SEP_RECENT).unwrap_or_else(|| panic!("no RECENT block: {}", prompt.text));
+        for id in &openings[..10] {
+            assert!(recent.contains(&format!("#{id} semantic_fact piece=1/25]")), "#{id} missing: {recent}");
+        }
+        assert!(!recent.contains(&format!("#{} ", openings[10])), "the eleventh is older than the ten: {recent}");
+        assert!(matches!(prompt.retrieval, Retrieval::Recent { hits: 10 }), "{:?}", prompt.retrieval);
+    }
+
+    #[tokio::test]
+    async fn a_long_save_whose_opening_is_gone_is_shown_by_its_next_piece() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let ids = seed_long_save(&store, "agent-1", "a long save", 3, 86_400_000).await;
+        let opening = ids[0];
+        store.conn.call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [opening])).await.unwrap();
+
+        let prompt = session_prompt(&store, "agent-1", None).await;
+
+        let recent = block(&prompt.text, SEP_RECENT).unwrap_or_else(|| panic!("no RECENT block: {}", prompt.text));
+        assert!(recent.contains(&format!("#{} semantic_fact piece=2/3]", ids[1])), "{recent}");
+        assert!(!recent.contains(&format!("#{} ", ids[2])), "one line per save: {recent}");
+        assert!(matches!(prompt.retrieval, Retrieval::Recent { hits: 1 }), "{:?}", prompt.retrieval);
     }
 
     #[tokio::test]
@@ -3923,6 +4237,13 @@ mod tests {
             .unwrap()
     }
 
+    /// What [`fetch_recent_saves`] binds to [`RECENT_SAVES_SQL`] for `agent-1`
+    /// in `project`, with nothing printed by the workspace.
+    fn recent_binds(project: rusqlite::types::Value) -> Vec<rusqlite::types::Value> {
+        use rusqlite::types::Value;
+        vec![Value::Text("agent-1".into()), project, Value::Integer(0), Value::Text("[]".into()), Value::Integer(K_FINAL as i64)]
+    }
+
     /// Both run on every context and every `session-start`, so they must reach
     /// the newest rows by key and stop there: a scan or a sort makes their cost
     /// the size of the store rather than of what they return.
@@ -3931,22 +4252,21 @@ mod tests {
         use rusqlite::types::Value;
         let store = MemoryStore::new_for_test().await.unwrap();
         let cases = [
-            ("LAST SESSION in a project", LAST_SESSION_SQL, vec![Value::Text("proj-a".into())], "idx_memory_session_summary"),
-            ("LAST SESSION without a project", LAST_SESSION_SQL, vec![Value::Null], "idx_memory_session_summary"),
-            (
-                "RECENT",
-                RECENT_ROWS_SQL,
-                vec![Value::Text("agent-1".into()), Value::Text("proj-a".into()), Value::Integer(0), Value::Integer(RECENT_ROW_POOL)],
-                "idx_memory_agent_created",
-            ),
+            ("LAST SESSION in a project", LAST_SESSION_SQL, vec![Value::Text("proj-a".into())], "memory", "idx_memory_session_summary"),
+            ("LAST SESSION without a project", LAST_SESSION_SQL, vec![Value::Null], "memory", "idx_memory_session_summary"),
+            ("RECENT", RECENT_SAVES_SQL, recent_binds(Value::Text("proj-a".into())), "m", "idx_memory_agent_created"),
+            ("RECENT without a project", RECENT_SAVES_SQL, recent_binds(Value::Null), "m", "idx_memory_agent_created"),
         ];
-        for (name, sql, binds, index) in cases {
+        for (name, sql, binds, table, index) in cases {
             let plan = plan_of(&store, sql, binds).await;
             assert!(
-                plan.iter().any(|l| l.starts_with("SEARCH memory USING INDEX") && l.contains(index)),
+                plan.iter().any(|l| l.starts_with(&format!("SEARCH {table} USING INDEX {index}"))),
                 "{name} does not search `{index}`: {plan:?}"
             );
             assert!(!plan.iter().any(|l| l.contains("TEMP B-TREE")), "{name} sorts its rows: {plan:?}");
+            // RECENT checks the earlier pieces of a save by the save's key; a
+            // second walk of the index would read the agent's week per row.
+            assert_eq!(plan.iter().filter(|l| l.contains(index)).count(), 1, "{name} reads `{index}` again: {plan:?}");
         }
     }
 
@@ -3990,12 +4310,7 @@ mod tests {
         };
         use rusqlite::types::Value;
         let last = ids(LAST_SESSION_SQL, vec![Value::Text("proj-a".into())]).await.unwrap();
-        let recent = ids(
-            RECENT_ROWS_SQL,
-            vec![Value::Text("agent-1".into()), Value::Text("proj-a".into()), Value::Integer(0), Value::Integer(RECENT_ROW_POOL)],
-        )
-        .await
-        .unwrap();
+        let recent = ids(RECENT_SAVES_SQL, recent_binds(Value::Text("proj-a".into()))).await.unwrap();
 
         assert_eq!(last, expected, "LAST SESSION");
         assert_eq!(recent, expected, "RECENT");
@@ -4028,5 +4343,7 @@ mod tests {
         let cut = spanish(true);
         assert!(cut.contains(&format!("{SEP_BUDGET}\nRecortado para entrar en 200 bytes; el contexto completo mide ")), "{cut}");
         assert!(cut.contains("read_memory devuelve cualquiera de ellas entera."), "{cut}");
+        let over = fit_to_budget(PromptParts { lang: Lang::Es, ..parts(&"- tabs\n".repeat(100), &[], &[], vec![]) }, 200).text;
+        assert!(over.contains("La parte del workspace que escribió la persona ya pasa el presupuesto sola y se muestra entera."), "{over}");
     }
 }

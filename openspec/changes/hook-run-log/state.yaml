@@ -1,0 +1,16 @@
+change: hook-run-log
+objective: "4"
+depends_on: []
+phase: verify
+release: "0.76.0"  # su código es anterior al bump a 0.76.0 (chore: bump version to 0.76.0), así que archivarlo no vuelve a subir la versión
+artifacts:
+  exploration: skipped  # la evidencia va en la propuesta
+  proposal: done  # las siete decisiones, cerradas antes de escribirla
+  spec: done  # HR1 a HR8; al archivar, HR1 a HR5 y HR8 van a specs/hooks y HR6 y HR7 a specs/doctor
+  design: skipped  # las decisiones están en la propuesta
+  tasks: done
+  apply: done  # un commit por paso, con sus tests en rojo antes
+  verify: pending  # Linux y el CI de Windows no corrieron: falta el pull request; en Windows local pasan la suite y los dos clippy (verify.md)
+  archive: pending
+main_spec: openspec/specs/hooks/spec.md, openspec/specs/doctor/spec.md
+updated: 2026-11-04

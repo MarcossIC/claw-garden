@@ -1012,6 +1012,71 @@ fn the_installer_and_update_set_the_binary_aside_under_one_name() {
     assert_eq!(plan::leftovers(&by_script, "clawg.exe"), by_script, "update deletes what install.ps1 set aside");
 }
 
+/// The tests of `source` that open a runtime on disk and never close it. Read
+/// as text, like the manifests above: one `.close().await` is enough, so a test
+/// with two runtimes can still leave one open.
+fn tests_leaving_a_store_open(source: &str) -> Vec<&str> {
+    source
+        .split("#[tokio::test")
+        .skip(1)
+        .filter(|test| test.contains("MemoryRuntime::open(") && !test.contains(".close().await"))
+        .filter_map(|test| test.split_once("fn ")?.1.split_once('('))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+#[test]
+fn tests_leaving_a_store_open_names_each_test_without_a_close() {
+    let source = r#"
+#[tokio::test]
+async fn stays_in_memory() {
+    let (rt, _rx) = MemoryRuntime::new_for_test(base).await;
+}
+
+#[tokio::test]
+async fn closes_what_it_opens() {
+    let (rt, _rx) = MemoryRuntime::open(base, StoreHolder::Daemon).await.unwrap();
+    rt.close().await;
+}
+
+#[tokio::test]
+async fn only_shuts_down() {
+    let (rt, rx) = MemoryRuntime::open(base, StoreHolder::Daemon).await.unwrap();
+    rt.shutdown(start(&rt, rx)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_drops_it() {
+    let (rt, _rx) = MemoryRuntime::open(base, StoreHolder::Daemon).await.unwrap();
+}
+"#;
+    assert_eq!(tests_leaving_a_store_open(source), ["only_shuts_down", "only_drops_it"]);
+}
+
+#[test]
+fn an_integration_test_closes_the_store_it_opens_on_disk() {
+    // Dropping a runtime only signals its connection's thread, and on Windows
+    // `TempDir` gives up at once on a file still open: the store stays in the
+    // system temp dir and no test fails, so nothing else would say it.
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
+    let mut files = Vec::new();
+    for krate in fs::read_dir(crates).expect("read crates/").flatten() {
+        rust_files(&krate.path().join("tests"), &mut files);
+    }
+    let this_file = Path::new(file!()).file_name().expect("this file has a name");
+    files.retain(|file| file.file_name() != Some(this_file));
+    assert!(!files.is_empty(), "no integration tests found under {}", crates.display());
+
+    let mut found = Vec::new();
+    for file in &files {
+        let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        for name in tests_leaving_a_store_open(&source) {
+            found.push(format!("{}: {name}", file.strip_prefix(crates).unwrap_or(file).display()));
+        }
+    }
+    assert!(found.is_empty(), "call MemoryRuntime::close before the test ends:\n{}", found.join("\n"));
+}
+
 /// The base64 line of a minisign `.pub`, which names the key whatever its
 /// comment says.
 fn key_line(public_key: &str) -> &str {

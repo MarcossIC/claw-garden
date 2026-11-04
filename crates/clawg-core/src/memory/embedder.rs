@@ -1,11 +1,10 @@
 //! The [`Embedder`] trait and its concrete implementations: [`E5Embedder`]
 //! (the production embedder: `multilingual-e5-small` on an ONNX Runtime session
-//! of our own, with the process's shared tokenizer),
-//! [`OllamaEmbedder`]/[`OpenAIEmbedder`] (unimplemented stubs reserved for
-//! future backends), and `FakeEmbedder` (a deterministic test double). Every
-//! embed call carries an explicit [`EmbedRole`] so a caller can never forget
-//! which side of the query/passage distinction it is on — see [`EmbedRole`]
-//! below for why that distinction matters.
+//! of our own, with the process's shared tokenizer) and `FakeEmbedder` (a
+//! deterministic test double). Every embed call carries an explicit
+//! [`EmbedRole`] so a caller can never forget which side of the query/passage
+//! distinction it is on — see [`EmbedRole`] below for why that distinction
+//! matters.
 
 use std::cmp::Reverse;
 use std::sync::Arc;
@@ -795,65 +794,6 @@ const _: fn() = || {
 };
 
 // ============================================================================
-// Stub embedders.
-//
-// Metadata-only, deliberately — these are extension points, not half-built
-// backends. Neither can embed anything: `embed_with_role` panics via
-// `unimplemented!()`, and nothing constructs them outside their own tests.
-// What they DO carry is real `dimensions`/`model_id`, which is what makes them
-// useful before anyone implements them: the persisted embedding contract keys
-// off exactly those two values, so swapping to one of these backends produces
-// a clean contract mismatch on load instead of silently reading a corpus
-// embedded by a different model at a different dimension.
-//
-// Not feature-gated: code that pattern-matches on `Box<dyn Embedder>` should
-// never need a `#[cfg]` branch just because the active backend happens to be
-// unimplemented.
-// ============================================================================
-
-pub struct OllamaEmbedder;
-
-#[async_trait]
-impl Embedder for OllamaEmbedder {
-    async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
-        unimplemented!("no Ollama embedding backend is wired up yet")
-    }
-    fn dimensions(&self) -> usize {
-        384
-    }
-    fn model_id(&self) -> &str {
-        "ollama-placeholder"
-    }
-    fn query_prefix(&self) -> &str {
-        ""
-    }
-    fn passage_prefix(&self) -> &str {
-        ""
-    }
-}
-
-pub struct OpenAIEmbedder;
-
-#[async_trait]
-impl Embedder for OpenAIEmbedder {
-    async fn embed_with_role(&self, _text: &str, _role: EmbedRole) -> Result<Vec<f32>, EmbedError> {
-        unimplemented!("no OpenAI embedding backend is wired up yet")
-    }
-    fn dimensions(&self) -> usize {
-        1536
-    }
-    fn model_id(&self) -> &str {
-        "openai-placeholder"
-    }
-    fn query_prefix(&self) -> &str {
-        ""
-    }
-    fn passage_prefix(&self) -> &str {
-        ""
-    }
-}
-
-// ============================================================================
 // FakeEmbedder — deterministic test double for the Embedder trait.
 //
 // SipHash-seeds a linear congruential generator from the input text and fills
@@ -1399,35 +1339,6 @@ mod tests {
     fn embed_max_tokens_and_special_token_reserve_are_pinned() {
         assert_eq!(EMBED_MAX_TOKENS, 512);
         assert_eq!(SPECIAL_TOKEN_RESERVE, 4);
-    }
-
-    // ---------- Stub embedders ----------
-
-    #[test]
-    fn ollama_stub_compiles_and_implements_trait() {
-        let _: Box<dyn Embedder> = Box::new(OllamaEmbedder);
-    }
-
-    #[test]
-    fn openai_stub_compiles_and_implements_trait() {
-        let _: Box<dyn Embedder> = Box::new(OpenAIEmbedder);
-    }
-
-    #[test]
-    fn ollama_stub_dimensions_is_384() {
-        assert_eq!(OllamaEmbedder.dimensions(), 384);
-    }
-
-    #[test]
-    fn openai_stub_dimensions_is_1536() {
-        assert_eq!(OpenAIEmbedder.dimensions(), 1536);
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "no Ollama embedding backend")]
-    async fn ollama_stub_embed_is_unimplemented() {
-        // unwrap() of a panicking unimplemented!() body — should_panic catches it.
-        let _ = OllamaEmbedder.embed_with_role("x", EmbedRole::Passage).await;
     }
 
     // ---------- embed_batch (default impl + invariants) ----------

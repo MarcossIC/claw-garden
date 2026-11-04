@@ -1,6 +1,6 @@
 # clippy-enforced — Especificación
 
-Delta sobre R6 de [`specs/quality`](../../specs/quality/spec.md) y la sección CI de [`specs/install`](../../specs/install/spec.md). Los lints de clippy pasan a regir el workspace desde una tabla del `Cargo.toml` raíz, y el comando de clippy, local y en el CI, deja de apagarlos. Ningún comando, ruta, herramienta ni dato cambia de conducta.
+Delta sobre R6 de [`specs/quality`](../../../specs/quality/spec.md) y la sección CI de [`specs/install`](../../../specs/install/spec.md). Los lints de clippy pasan a regir el workspace desde una tabla del `Cargo.toml` raíz, y el comando de clippy, local y en el CI, deja de apagarlos. Ningún comando, ruta, herramienta ni dato cambia de conducta.
 
 ## CE1. Los paquetes toman los lints del workspace
 

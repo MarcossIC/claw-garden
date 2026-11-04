@@ -10,6 +10,12 @@ use clawg_core::preferences::{self, Lang};
 
 use crate::cli::PreferencesAction;
 
+/// The language a command speaks to the user in: the profile's preference,
+/// read once, and English without one or with a file that cannot be read.
+pub fn language(base_dir: &Path) -> Lang {
+    preferences::language_in(base_dir).unwrap_or(Lang::En)
+}
+
 /// Applies `action` (none shows the preferences) and returns what to print.
 pub fn run(base_dir: &Path, action: Option<&PreferencesAction>) -> Result<String, String> {
     // An unreadable file is never overwritten: it may be a hand edit halfway
@@ -88,6 +94,16 @@ mod tests {
         assert!(none.starts_with("No language preference: clawg uses English."), "{none}");
         assert!(none.contains("clawg setup claude-code"), "{none}");
         assert_eq!(clawg_core::preferences::language_in(dir.path()), None);
+    }
+
+    #[test]
+    fn a_command_speaks_english_without_a_readable_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(language(dir.path()), Lang::En);
+        run(dir.path(), Some(&set(Lang::Es))).unwrap();
+        assert_eq!(language(dir.path()), Lang::Es);
+        std::fs::write(preferences_file(dir.path()), "not json").unwrap();
+        assert_eq!(language(dir.path()), Lang::En);
     }
 
     #[test]
