@@ -275,8 +275,8 @@ pub async fn respond_with_run(
     let run = (event == HookEvent::SessionStart).then(|| Run {
         at_ms,
         client: client_name(host).into(),
-        agent: agent.into(),
-        source: parsed.as_ref().and_then(|i| i.source.clone()),
+        agent: hook_log::cut(agent, hook_log::AGENT_CHARS),
+        source: parsed.as_ref().and_then(|i| i.source.as_deref()).map(|s| hook_log::cut(s, hook_log::SOURCE_CHARS)),
         outcome,
         bytes: printed.as_ref().map_or(0, String::len),
         elapsed_ms: started.elapsed().as_millis() as u64,
@@ -285,8 +285,8 @@ pub async fn respond_with_run(
             .as_ref()
             .filter(|_| outcome != Outcome::OtherClient)
             .and_then(|i| folder(host, i, || std::env::current_dir().ok()))
-            .map(|f| f.to_string_lossy().into_owned()),
-        cursor_version: parsed.as_ref().and_then(|i| i.cursor_version.as_ref()).map(version_text),
+            .map(|f| hook_log::cut(&f.to_string_lossy(), hook_log::FOLDER_CHARS)),
+        cursor_version: parsed.as_ref().and_then(|i| i.cursor_version.as_ref()).and_then(version_text),
         input_keys: raw.as_deref().map(hook_log::input_keys).unwrap_or_default(),
     });
     (printed, run)
@@ -299,14 +299,10 @@ fn client_name(host: HookClient) -> &'static str {
     }
 }
 
-/// Cursor's version as the record keeps it: the text of the field, cut short
-/// since whatever the client sends there is not ours to keep whole.
-fn version_text(version: &serde_json::Value) -> String {
-    let text = match version {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
-    text.chars().take(32).collect()
+/// Cursor's version as the record keeps it: only a string, cut short. Any
+/// other value (an object can hold anything) is not a version and is not kept.
+fn version_text(version: &serde_json::Value) -> Option<String> {
+    version.as_str().map(|v| hook_log::cut(v, hook_log::VERSION_CHARS))
 }
 
 /// Why Cursor's input names no folder: more than one root is not the same as
@@ -943,7 +939,8 @@ mod tests {
         assert_eq!(claude("not json".into(), here.clone(), HOOK_DEADLINE).await.outcome, Outcome::BadInput);
         assert_eq!(claude("[1]".into(), here.clone(), HOOK_DEADLINE).await.outcome, Outcome::BadInput);
         assert_eq!(claude(r#"{"cwd":"/"}"#.into(), here.clone(), HOOK_DEADLINE).await.outcome, Outcome::NoDaemon);
-        assert_eq!(claude(cursor_input(&[dir.path()]), here.clone(), HOOK_DEADLINE).await.outcome, Outcome::OtherClient);
+        let other = claude(cursor_input(&[dir.path()]), here.clone(), HOOK_DEADLINE).await;
+        assert_eq!((other.outcome, other.folder), (Outcome::OtherClient, None), "no folder was read");
 
         let two = cursor(&[dir.path(), Path::new("/elsewhere")]).await;
         assert_eq!((two.outcome, two.roots, two.folder), (Outcome::SeveralFolders, Some(2), None));
@@ -1039,6 +1036,46 @@ mod tests {
             respond_with_run(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), input.as_bytes(), HOOK_DEADLINE).await;
         assert_eq!(out.as_deref(), Some(printed.as_str()));
         assert_eq!(run.expect("a run").bytes, printed.len());
+    }
+
+    #[tokio::test]
+    async fn what_a_run_keeps_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = format!(r#"{{"cwd":"/x","source":"{}","{}":1}}"#, "S".repeat(500_000), "K".repeat(400_000));
+        let (_, run) = start_run(HookClient::ClaudeCode, "a", dir.path(), &huge, HOOK_DEADLINE).await;
+        assert!(crate::hook_log::line(&run).len() < 4096, "{} bytes", crate::hook_log::line(&run).len());
+        assert_eq!(run.source.as_deref().map(|s| s.chars().count()), Some(32));
+        assert_eq!(run.input_keys.iter().map(|k| k.chars().count()).collect::<Vec<_>>(), [3, 6, 64], "cwd, source and the long name");
+
+        let long_folder = serde_json::json!({ "cwd": "é".repeat(5_000) }).to_string();
+        let (_, run) = start_run(HookClient::ClaudeCode, "a", dir.path(), &long_folder, HOOK_DEADLINE).await;
+        assert_eq!(run.folder.as_deref().map(|f| f.chars().count()), Some(1024));
+
+        let many: Vec<String> = (0..100).map(|i| format!("\"f{i}\":1")).collect();
+        let (_, run) = start_run(HookClient::ClaudeCode, "a", dir.path(), &format!("{{{}}}", many.join(",")), HOOK_DEADLINE).await;
+        assert_eq!(run.input_keys.len(), 32);
+
+        let agent = "g".repeat(10_000);
+        let (_, run) = start_run(HookClient::ClaudeCode, &agent, dir.path(), r#"{"cwd":"/"}"#, HOOK_DEADLINE).await;
+        assert_eq!(run.agent.chars().count(), 64);
+    }
+
+    #[tokio::test]
+    async fn the_cursor_version_is_kept_only_as_a_cut_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let with = |version: serde_json::Value| {
+            let input = serde_json::json!({ "cwd": "/x", "cursor_version": version }).to_string();
+            let dir = dir.path().to_path_buf();
+            async move { start_run(HookClient::Cursor, "cursor", &dir, &input, HOOK_DEADLINE).await.1 }
+        };
+
+        let object = with(serde_json::json!({ "user_email": "leak@example.com", "a": "b" })).await;
+        assert_eq!(object.cursor_version, None);
+        assert!(!crate::hook_log::line(&object).contains("leak@example.com"));
+        assert_eq!(with(serde_json::json!(3)).await.cursor_version, None);
+        assert_eq!(with(serde_json::json!(["x"])).await.cursor_version, None);
+        assert_eq!(with(serde_json::json!("3.28.0")).await.cursor_version.as_deref(), Some("3.28.0"));
+        assert_eq!(with(serde_json::json!("v".repeat(500))).await.cursor_version.map(|v| v.chars().count()), Some(32));
     }
 
     #[tokio::test]

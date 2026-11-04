@@ -6,7 +6,7 @@ release: "0.76.0"  # sale con client-setup-cursor, antes de la prueba con Cursor
 artifacts:
   exploration: skipped  # la evidencia va en la propuesta
   proposal: done  # las siete decisiones, cerradas antes de escribirla
-  spec: done  # HR1 a HR7; al archivar, HR1 a HR5 van a specs/hooks y HR6 y HR7 a specs/doctor
+  spec: done  # HR1 a HR8; al archivar, HR1 a HR5 y HR8 van a specs/hooks y HR6 y HR7 a specs/doctor
   design: skipped  # las decisiones están en la propuesta
   tasks: done
   apply: done  # un commit por paso, con sus tests en rojo antes

@@ -1,6 +1,6 @@
 # hook-run-log — Especificación
 
-`clawg hook session-start` deja un renglón por corrida en `<data>/hook-runs.jsonl`, y `clawg doctor` muestra las últimas. Al archivar, HR1 a HR5 se suman a [`specs/hooks`](../../specs/hooks/spec.md) y HR6 y HR7 a [`specs/doctor`](../../specs/doctor/spec.md). Lo que esas specs dicen de la salida del hook no cambia.
+`clawg hook session-start` deja un renglón por corrida en `<data>/hook-runs.jsonl`, y `clawg doctor` muestra las últimas. Al archivar, HR1 a HR5 y HR8 se suman a [`specs/hooks`](../../specs/hooks/spec.md) y HR6 y HR7 a [`specs/doctor`](../../specs/doctor/spec.md). Lo que esas specs dicen de la salida del hook no cambia.
 
 ## Definiciones
 
@@ -26,7 +26,7 @@
 
 | `outcome` | Cuándo |
 |---|---|
-| `bad_input` | la entrada no se pudo leer entera ni es JSON |
+| `bad_input` | la entrada no se pudo leer entera, no es JSON o es un JSON que no tiene la forma de la entrada de un hook |
 | `other_client` | `--client claude-code` y la entrada trae `cursor_version` |
 | `timed_out` | el plazo del hook venció leyendo la entrada o esperando al daemon |
 | `several_folders` | `--client cursor` y `workspace_roots` tiene más de una raíz |
@@ -48,25 +48,25 @@ Con la línea del idioma, un aviso o cualquier otro texto impreso, `outcome` MUS
 
 ## HR3. Nada de la entrada, fuera de los campos
 
-El registro MUST NOT contener el valor de `user_email`, el texto del contexto ni el valor de ningún campo de la entrada fuera de `source`, `cwd`, `workspace_roots` (una carpeta, o sólo la cuenta si son varias) y `cursor_version`. Con varias raíces, `roots` MUST ser la cuenta y `folder` MUST ser `null`.
+El registro MUST NOT contener el valor de `user_email`, el texto del contexto ni el valor de ningún campo de la entrada fuera de `source`, `cwd`, `workspace_roots` (una carpeta, o sólo la cuenta si son varias) y `cursor_version`. `cursor_version` MUST guardarse sólo cuando es un texto JSON, y cualquier otro tipo (un objeto puede traer cualquier cosa) MUST guardarse como `null`. Con varias raíces, `roots` MUST ser la cuenta y `folder` MUST ser `null`, y con `other_client` `folder` MUST ser `null`.
 
 #### Escenario: dos raíces y un correo
 - GIVEN una entrada de Cursor con dos raíces, `user_email` `user@example.com` y un `transcript_path`
 - WHEN corre el hook
 - THEN la línea dice `several_folders`, `roots` 2, `folder` `null`, y ni el correo, ni las rutas ni el `transcript_path` aparecen en el archivo
 
-**Tests:** `a_run_never_holds_an_input_value` (`hook.rs`), `a_cursor_session_start_leaves_its_line_and_no_input_value`, `two_roots_leave_their_count_and_not_their_paths` (`tests/binary.rs`).
+**Tests:** `a_run_never_holds_an_input_value`, `the_cursor_version_is_kept_only_as_a_cut_string` y `every_session_start_names_why` (`hook.rs`, esta última por la carpeta de `other_client`), `a_cursor_session_start_leaves_its_line_and_no_input_value`, `two_roots_leave_their_count_and_not_their_paths` (`tests/binary.rs`).
 
 ## HR4. El registro está acotado y nunca molesta
 
-La línea MUST armarse entera y agregarse con una sola escritura. Antes de agregar, con el registro en 64 KiB o más, MUST renombrarlo a `hook-runs.1.jsonl`, reemplazando al anterior, y empezar uno nuevo. MUST NOT crear el directorio de datos: si no existe, no registra. Cualquier falla (permisos, un directorio en lugar del archivo, un disco lleno) MUST tragarse sin nada en stdout ni en stderr y sin cambiar la salida ni el código de salida. El registro MUST escribirse antes de imprimir.
+La línea MUST armarse entera y agregarse con una sola escritura. Antes de agregar, con el registro en 64 KiB o más, MUST renombrarlo a `hook-runs.1.jsonl`, reemplazando al anterior, y empezar uno nuevo. MUST NOT crear el directorio de datos: si no existe, no registra. Cualquier falla (permisos, un directorio en lugar del archivo, un disco lleno) MUST tragarse sin nada en stdout ni en stderr y sin cambiar la salida ni el código de salida. El registro MUST escribirse antes de imprimir. Si ese renombrado falla, la corrida MUST agregarse igual al archivo actual, y la próxima vuelve a intentarlo.
 
 #### Escenario: el directorio de datos no existe
 - GIVEN un home sin directorio de datos
 - WHEN corre el hook
 - THEN no hay directorio de datos después, y la salida es la de siempre
 
-**Tests:** `a_line_is_appended`, `the_file_rolls_over_at_64_kib_and_replaces_the_old_one`, `concurrent_appends_keep_every_line`, `a_missing_data_directory_is_not_created`, `a_failed_append_is_swallowed` (`hook_log.rs`), `a_hook_does_not_create_the_data_directory_to_record` (`tests/binary.rs`).
+**Tests:** `a_line_is_appended`, `a_failed_roll_still_records_the_run`, `the_file_rolls_over_at_64_kib_and_replaces_the_old_one`, `concurrent_appends_keep_every_line`, `a_missing_data_directory_is_not_created`, `a_failed_append_is_swallowed` (`hook_log.rs`), `a_hook_does_not_create_the_data_directory_to_record` (`tests/binary.rs`).
 
 ## HR5. La salida del hook no cambia
 
@@ -76,14 +76,14 @@ La línea MUST armarse entera y agregarse con una sola escritura. Antes de agreg
 
 ## HR6. `clawg doctor` muestra las últimas corridas
 
-`clawg doctor` MUST sumar un hallazgo `hooks.runs` de severidad `info` cuando el registro tiene corridas (`reason_code` `recent`), con un `message` en el idioma del comando que lista las últimas 5, la más nueva primero: su antigüedad, el cliente, la última parte de `folder` (o `(N carpetas)` con varias, o `(sin carpeta)`) y qué pasó, en palabras. `evidence` MUST traer las últimas 20 completas, la más nueva primero. Lee `hook-runs.jsonl` y, si hace falta, `hook-runs.1.jsonl`, ignora las líneas que no son una corrida, MUST NOT abrir el store para esto y MUST NOT cambiar el código de salida ni la severidad por ningún `outcome`. El JSON de `clawg doctor` es la salida completa, y es lo que se pega.
+`clawg doctor` MUST sumar un hallazgo `hooks.runs` de severidad `info` cuando el registro tiene corridas (`reason_code` `recent`), con un `message` en el idioma del comando que lista las últimas 5, la más nueva primero: su antigüedad, el cliente, la última parte de `folder` (o `(N carpetas)` con varias, o `(sin carpeta)`) y qué pasó, en palabras. `evidence` MUST traer las últimas 20 completas, la más nueva primero. Lee `hook-runs.jsonl` y, si hace falta, `hook-runs.1.jsonl`, ignora las líneas que no son una corrida, MUST NOT abrir el store para esto y MUST NOT cambiar el código de salida ni la severidad por ningún `outcome`. El JSON de `clawg doctor` es la salida completa, y es lo que se pega. Una línea dañada (un byte que no es UTF-8, una línea cortada) MUST costar sólo esa línea, y un `at_ms` extremo MUST NOT hacer fallar el cálculo de la antigüedad. Para `bad_input`, el mensaje MUST decir que la entrada no se pudo leer, no que no era JSON.
 
 #### Escenario: corridas de dos clientes
 - GIVEN siete corridas en el registro
 - WHEN corre `clawg doctor`
 - THEN `hooks.runs` es `info`, su `message` lista las cinco últimas y su `evidence.runs` las siete
 
-**Tests:** `recent_runs_are_listed_newest_first_five_in_the_message_and_twenty_in_the_evidence`, `every_outcome_has_words_and_none_raises_the_severity`, `a_folder_is_named_by_its_last_part`, `ages_are_counted_in_words` (`checks.rs`), `doctor_lists_the_hook_runs_and_still_exits_0` (`tests/binary.rs`).
+**Tests:** `a_damaged_file_costs_only_its_damaged_lines` (`hook_log.rs`), `a_run_stamped_at_the_extremes_does_not_panic`, `bad_input_does_not_claim_the_input_was_not_json` (`checks.rs`), `recent_runs_are_listed_newest_first_five_in_the_message_and_twenty_in_the_evidence`, `every_outcome_has_words_and_none_raises_the_severity`, `a_folder_is_named_by_its_last_part`, `ages_are_counted_in_words` (`checks.rs`), `doctor_lists_the_hook_runs_and_still_exits_0` (`tests/binary.rs`).
 
 ## HR7. El hook instalado que nadie corrió
 
@@ -95,3 +95,14 @@ Con el hook de Cursor del perfil instalado en `~/.cursor/hooks.json` (la regla d
 - THEN `hooks.runs` es `info` `not_run`; y sin `setup cursor` no hay ningún `hooks.runs`
 
 **Tests:** `an_installed_hook_with_no_runs_says_so_and_none_installed_says_nothing` (`checks.rs`), `the_hook_of_this_profile_is_found_in_hooks_json` (`setup/cursor.rs`), `doctor_says_when_the_installed_hook_never_ran` (`tests/binary.rs`).
+
+## HR8. Cada campo está acotado
+
+Una línea MUST quedar chica por grande que sea la entrada, así que cada campo MUST cortarse por caracteres, sin partir uno: `source` a 32, `folder` a 1.024, `cursor_version` a 32, `agent` a 64, y de `input_keys` sólo los primeros 32 nombres, cada uno a 64. Con una entrada de 900 KB (un `source` de 500.000 caracteres y un nombre de campo de 400.000), la línea MUST ocupar menos de 4 KiB. Como el límite es por caracteres, el peor caso con caracteres que JSON escapa sigue siendo de decenas de KiB, y no lo pinta ningún test.
+
+#### Escenario: una entrada enorme
+- GIVEN `{"cwd":"/x","source":"S"×500.000,"K"×400.000:1}`
+- WHEN corre el hook
+- THEN `source` tiene 32 caracteres, el único nombre de `input_keys` que sobra tiene 64, y la línea ocupa menos de 4 KiB
+
+**Tests:** `what_a_run_keeps_is_bounded` (`hook.rs`), `cutting_stops_on_a_character_boundary` e `input_keys_keep_the_first_32_names_cut_at_64_characters` (`hook_log.rs`).

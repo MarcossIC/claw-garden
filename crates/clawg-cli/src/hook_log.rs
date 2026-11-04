@@ -20,6 +20,20 @@ pub const ROLLED: &str = "hook-runs.1.jsonl";
 /// The size, in bytes, at which the record is renamed and a new one starts.
 pub const ROLL_AT: u64 = 64 * 1024;
 
+// What a line keeps of each thing the client or the command line says, in
+// characters: a line stays small however large the input is.
+pub const SOURCE_CHARS: usize = 32;
+pub const FOLDER_CHARS: usize = 1024;
+pub const VERSION_CHARS: usize = 32;
+pub const AGENT_CHARS: usize = 64;
+pub const KEYS_KEPT: usize = 32;
+pub const KEY_CHARS: usize = 64;
+
+/// The first `chars` characters of `text`, never splitting one.
+pub fn cut(text: &str, chars: usize) -> String {
+    text.chars().take(chars).collect()
+}
+
 /// What happened to the memory in a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,7 +88,7 @@ pub fn line(run: &Run) -> String {
 /// object.
 pub fn input_keys(input: &[u8]) -> Vec<String> {
     match serde_json::from_slice::<serde_json::Value>(input) {
-        Ok(serde_json::Value::Object(fields)) => fields.keys().cloned().collect(),
+        Ok(serde_json::Value::Object(fields)) => fields.keys().take(KEYS_KEPT).map(|k| cut(k, KEY_CHARS)).collect(),
         _ => Vec::new(),
     }
 }
@@ -85,12 +99,13 @@ pub fn parse_runs(text: &str) -> Vec<Run> {
 }
 
 /// The runs of a data directory, oldest first: the rolled file, then the
-/// current one. Missing or unreadable files read as empty.
+/// current one. Missing or unreadable files read as empty, and a damaged byte
+/// costs the line it is in, not the file.
 pub fn read_runs(dir: &Path) -> Vec<Run> {
     [ROLLED, FILE]
         .iter()
-        .filter_map(|name| std::fs::read_to_string(dir.join(name)).ok())
-        .flat_map(|text| parse_runs(&text))
+        .filter_map(|name| std::fs::read(dir.join(name)).ok())
+        .flat_map(|bytes| parse_runs(&String::from_utf8_lossy(&bytes)))
         .collect()
 }
 
@@ -103,9 +118,10 @@ pub fn record(dir: &Path, run: &Run) {
 fn append(dir: &Path, line: &str) -> std::io::Result<()> {
     let path = dir.join(FILE);
     // Renaming instead of rewriting: two hooks that start together never
-    // lose a line to a copy of the file.
+    // lose a line to a copy of the file. A roll that fails costs nothing: the
+    // run is still appended and the next one tries again.
     if std::fs::metadata(&path).is_ok_and(|m| m.len() >= ROLL_AT) {
-        std::fs::rename(&path, dir.join(ROLLED))?;
+        let _ = std::fs::rename(&path, dir.join(ROLLED));
     }
     std::fs::OpenOptions::new().append(true).create(true).open(path)?.write_all(line.as_bytes())
 }
@@ -226,6 +242,53 @@ mod tests {
         record(&missing, &run(Outcome::Injected));
         assert!(!missing.exists());
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cutting_stops_on_a_character_boundary() {
+        assert_eq!(cut("abcdef", 3), "abc");
+        assert_eq!(cut("abc", 3), "abc");
+        assert_eq!(cut("ééé", 2), "éé", "a character is never split");
+        assert_eq!(cut("日本語", 1), "日");
+        assert_eq!(cut("", 4), "");
+    }
+
+    #[test]
+    fn input_keys_keep_the_first_32_names_cut_at_64_characters() {
+        let fields: Vec<String> = (0..100).map(|i| format!("\"{}{i}\":1", "k".repeat(200))).collect();
+        let keys = input_keys(format!("{{{}}}", fields.join(",")).as_bytes());
+        assert_eq!(keys.len(), KEYS_KEPT);
+        assert!(keys.iter().all(|k| k.chars().count() == KEY_CHARS), "{keys:?}");
+        let kept: Vec<String> = (0..40).map(|i| format!("\"f{i}\":1")).collect();
+        assert_eq!(input_keys(format!("{{{}}}", kept.join(",")).as_bytes())[..2], ["f0", "f1"], "the first ones, in order");
+    }
+
+    #[test]
+    fn a_damaged_file_costs_only_its_damaged_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (run(Outcome::Injected), run(Outcome::NoDaemon));
+        let mut bytes = line(&a).into_bytes();
+        bytes.extend_from_slice(b"half a li\xc3\n");
+        bytes.extend_from_slice(line(&b).as_bytes());
+        std::fs::write(dir.path().join(FILE), bytes).unwrap();
+        assert_eq!(read_runs(dir.path()), [a, b]);
+    }
+
+    #[test]
+    fn a_failed_roll_still_records_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(FILE);
+        std::fs::write(&current, format!("{}\n", "x".repeat(1023)).repeat(64)).unwrap();
+        // A directory with something in it cannot be replaced by a file.
+        let rolled = dir.path().join(ROLLED);
+        std::fs::create_dir(&rolled).unwrap();
+        std::fs::write(rolled.join("keep"), b"1").unwrap();
+
+        record(dir.path(), &run(Outcome::Injected));
+
+        let text = std::fs::read(&current).unwrap();
+        assert!(text.len() as u64 > ROLL_AT, "the file was not rolled");
+        assert_eq!(parse_runs(&String::from_utf8_lossy(&text)).len(), 1, "and the run was appended");
     }
 
     #[test]
