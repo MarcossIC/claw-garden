@@ -71,7 +71,7 @@ Tests en rojo primero, con directorios temporales y la entrada de `sessionStart`
 - una con dos raíces no registra ningún proyecto;
 - una entrada con `cursor_version` en un hook sin `--client cursor` no imprime nada y sale con 0.
 
-Además: los tests de `setup claude-code` y de `clawg hook` que ya existen pasan sin cambiar lo que esperan (sólo se suma el campo `client` donde se construye un `Command::Hook`), y la suite y `cargo clippy --workspace --all-targets -- -D warnings` pasan en Linux. El código `cfg(windows)` lo revisa el CI del pull request.
+Además: los tests de `setup claude-code` y de `clawg hook` que ya existen pasan sin cambiar lo que esperan (sólo se suma el cliente donde se construye un `Command::Hook` o se llama a `respond` o a `envelope`), y la suite y `cargo clippy --workspace --all-targets -- -D warnings` pasan en Linux. El código `cfg(windows)` lo revisa el CI del pull request.
 
 `rag-eval`: no aplica, no hay cambio de ranking.
 

@@ -51,7 +51,7 @@ El plan MUST agregar el hook del plan al final de `hooks.sessionStart`, creando 
 - WHEN corre `clawg setup cursor --profile dev`
 - THEN el reporte lo da como conflicto, el archivo no cambia y sale con 1
 
-**Tests:** `the_hook_line_is_written_for_the_shell_that_runs_it`, `a_hook_line_reads_back_as_its_words`, `a_different_clawg_hook_is_a_conflict`, `foreign_hooks_and_keys_keep_their_order`, `a_hook_of_the_other_profile_is_not_ours`, `nothing_is_installed_before_a_prompt` (`setup/cursor.rs`).
+**Tests:** `the_hook_line_is_written_for_the_shell_that_runs_it`, `a_hook_line_reads_back_as_its_words`, `a_different_clawg_hook_is_a_conflict`, `foreign_hooks_and_keys_keep_their_order`, `a_hook_of_the_other_profile_is_not_ours`, `nothing_is_installed_before_a_prompt` (`setup/cursor.rs`); `the_installed_cursor_hook_runs_through_a_shell` (`tests/binary.rs`, Unix: la línea que quedó en `hooks.json`, corrida con `sh -c` en `~/.cursor` y la entrada de Cursor, imprime la salida de Cursor).
 
 ## CU4. Idempotencia, `--dry-run` y `--remove`
 

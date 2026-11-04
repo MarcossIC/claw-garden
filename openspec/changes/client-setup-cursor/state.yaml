@@ -1,14 +1,14 @@
 change: client-setup-cursor
 objective: "4"
 depends_on: []
-phase: apply
+phase: verify
 artifacts:
   exploration: done
   proposal: done  # las nueve decisiones de la exploración, y las que fija la aplicación sin cambiarlas
   spec: done  # CU1 a CU8; al archivar, CU1 a CU5 van a specs/setup y CU6 a CU8 a specs/hooks
   design: skipped  # las decisiones se cerraron en la exploración
   tasks: done
-  apply: pending
-  verify: pending  # lo de Cursor real se verifica en local
+  apply: done  # un commit por paso: el refactor de lo común, el hook y setup cursor, con sus tests en rojo antes
+  verify: pending  # Linux hecho (suite y clippy, verify.md); faltan Windows en el CI del pull request y lo de Cursor real, en local
   archive: pending
 updated: 2026-11-04
