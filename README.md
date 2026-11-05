@@ -94,13 +94,13 @@ clawg update            # la instala
 Si querés volver a la versión anterior después de una actualización:
 
 ```
-clawg stop
+clawg stop --profile prod
 ```
 
 Poné de nuevo el binario anterior en su nombre: renombrá `clawg.exe.old-<fecha>` (la carpeta de instalación es la de `clawg doctor`) a `clawg.exe`. Si la actualización migró el store, restaurá el snapshot de antes con ese binario:
 
 ```
-clawg restore ~/.clawg/backups/memory-<fecha>-pre-migration.db
+clawg restore ~/.clawg/backups/memory-<fecha>-pre-migration.db --profile prod
 ```
 
 `clawg restore` guarda el store actual como `pre-restore` antes de reemplazarlo. El siguiente comando que necesite el daemon lo arranca.
