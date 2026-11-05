@@ -2,12 +2,12 @@
 
 ## Suite y clippy
 
-En Linux x86_64, build debug, toolchain 1.99.1, en `target`, sobre `1f8d375`: el último commit de código, después del de `docs/reference`. El commit que sigue sólo toca esta carpeta, el mapa de openspec y el ROADMAP.
+En Linux x86_64, build debug, toolchain 1.99.1, en `target`, sobre `b59ce4c`: el último commit de código, el arreglo que pidió el CI de Windows (abajo). Los commits de registro sólo tocan esta carpeta, el mapa de openspec y el ROADMAP. La misma suite y los mismos clippy pasaron antes sobre `1f8d375`.
 
 - `cargo test --workspace --no-fail-fast` pasa, sin ningún test fallado. Los ignorados son los `#[ignore]` que ya tenía el repositorio: este cambio no agrega ninguno.
 - `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también.
 - Los contratos del agente pasan después de bendecirlos con `CLAWG_BLESS=1`, en los dos idiomas. El diff es sólo `all_projects` en el `inputSchema` de `save_memory`; las `instructions` no cambian, porque el protocolo cambió fuera de la apertura ([abajo](#el-contrato-del-agente)).
-- En Windows: el CI del pull request. El cambio no toca código `cfg(windows)`: la consulta del workspace, las de la búsqueda, el formato de las líneas y el puente son los mismos en las dos plataformas.
+- En Windows, el CI de [#131](https://github.com/MarcossIC/claw-garden/pull/131) falló sobre `f23117e` en `the_protocol_says_which_preferences_open_every_session`: `no section Type and importance`. El checkout de Windows deja `protocol.md` con saltos `\r\n`, y el helper del test buscaba la sección con `\n`. Se reprodujo en Linux pasando los dos protocolos a CRLF, y `b59ce4c` hace que el helper lea el texto sin `\r`, como `opening`; pasa con CRLF y con LF. Sobre `b59ce4c`, los jobs `test (ubuntu-latest)` y `test (windows-latest)` pasaron. El cambio no toca código `cfg(windows)`.
 
 ## Los tests en rojo
 
@@ -115,4 +115,4 @@ Lo que se mide contra `prod`. Necesita el store real o una copia, y un binario c
 
 ## Veredicto
 
-Sin CRITICAL en Linux. Quedan como WARNING el CI de Windows, que corre en el pull request, y lo que se mide contra `prod` ([«Pendiente en local»](#pendiente-en-local)).
+Sin CRITICAL en Linux ni en el CI de Windows. Queda como WARNING lo que se mide contra `prod` ([«Pendiente en local»](#pendiente-en-local)).

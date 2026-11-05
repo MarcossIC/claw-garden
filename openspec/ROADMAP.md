@@ -40,7 +40,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 | Cambio | Dónde | Necesita antes |
 |---|---|---|
-| [preference-model](changes/preference-model/proposal.md) | Nube | Las decisiones, cerradas en la exploración. Aplicado y verificado en Linux, con un PR abierto a `develop` ([verify](changes/preference-model/verify.md)); falta revisarlo, ver el CI de Windows, medir contra `prod` lo pendiente en local y archivarlo |
+| [preference-model](changes/preference-model/proposal.md) | Nube | Las decisiones, cerradas en la exploración. Aplicado y verificado en Linux y en el CI de Windows, con un PR abierto a `develop` ([verify](changes/preference-model/verify.md)); falta revisarlo, medir contra `prod` lo pendiente en local y archivarlo |
 | [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | La prueba con Cursor real |
 
 ## Noche 3

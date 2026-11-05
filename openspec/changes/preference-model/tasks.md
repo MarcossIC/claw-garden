@@ -59,7 +59,8 @@ Los requisitos están en la [spec](spec.md); las decisiones, en la [propuesta](p
 ## 7. Verificación
 
 - [x] La suite, `cargo clippy --workspace --all-targets -- -D warnings` y `cargo clippy -p clawg-cli -- -D warnings` en Linux, sobre el último commit de código ([verify](verify.md)).
-- [ ] El CI del pull request en Linux y Windows; lo que marque se arregla.
+- [x] El CI del pull request en Linux y Windows; lo que marque se arregla. Windows marcó el helper de secciones del test del protocolo, que no leía saltos `\r\n`.
+- Commit: `test(protocol): read a protocol section whatever its line breaks`
 - [x] `verify.md`, con lo que se mide contra `prod` como pendiente en local; `state.yaml`; la línea del cambio en `ROADMAP.md` y la fila 117 del mapa de openspec.
 - Commit: `docs(openspec): record preference-model applied`
 
