@@ -10,7 +10,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo "Hits de otros agentes" y los cambios de agente en "El bono respeta el scope" y en "Línea de hit en `recall_context`").
 - [project-indexing](../../changes/archive/2026-10-15-project-indexing/proposal.md), archivado el 2026-10-15 (sólo "El piso de coseno", "Indexar un proyecto no cambia la búsqueda de memorias", el valor de `RELEVANCE_RATIO` y la medición con pooling mean en "Medición del contexto").
 - [memory-rank-fusion](../../changes/archive/2026-10-17-memory-rank-fusion/proposal.md), archivado el 2026-10-17 (sólo "Definiciones", "Corte relativo en `POST /v1/search`" y "Cliente HTTP y herramienta `search_memory`").
-- [context-budget](../../changes/archive/2026-10-17-context-budget/proposal.md), archivado el 2026-10-17 (desde "El prompt cumple el presupuesto" hasta "Un workspace más grande que el presupuesto se entrega y se dice", y lo que esos apartados cambian en "Definiciones", "`recall_context` deja afuera los ceros", los conflictos, "Medición del contexto" e "Invariantes").
+- [context-budget](../../changes/archive/2026-10-17-context-budget/proposal.md), archivado el 2026-10-17 (desde "El prompt cumple el presupuesto" hasta "Un workspace más grande que el presupuesto se entrega y se dice", hoy «SC5. Lo que escribió la persona no se corta», y lo que esos apartados cambian en "Definiciones", "`recall_context` deja afuera los ceros", los conflictos, "Medición del contexto" e "Invariantes").
 - [memory-protocol](../../changes/archive/2026-10-17-memory-protocol/proposal.md), archivado el 2026-10-17 (sólo el texto en inglés de "Una NOTE por bloque de conflictos" y de la línea de omitidos en "Orden y tope de los conflictos").
 - [conflict-candidates](../../changes/archive/2026-10-18-conflict-candidates/proposal.md), archivado el 2026-10-18 (sólo el texto de "Una NOTE por bloque de conflictos" y qué es un "Par de conflicto").
 - [search-abstention](../../changes/archive/2026-10-18-search-abstention/proposal.md), archivado el 2026-10-18 (sólo la fila de score 0 y la frase de abstención en "Definiciones", y lo que cambian en el corte relativo, en "Corte relativo en `POST /v1/search`", en "`recall_context` deja afuera los ceros", en "Cliente HTTP y herramienta `search_memory`", en el parser de `rag-eval --agent-view`, en "Medición del contexto", en "Invariantes" y en "Fuera de esta spec").
@@ -21,6 +21,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22 (sólo ACTIVE CONFLICTS en «Hits de otros agentes»: los pares de cualquier autor que el lector alcanza).
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (sólo «`other_language` en la búsqueda y el contexto», LP7 de esa spec; la línea que el puente arma con el conteo está en [`specs/mcp`](../mcp/spec.md), LP8).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo «AL5. Las notas del contexto en el idioma del pedido», las respuestas vacías en español en el parser de `rag-eval --agent-view`, AL7 de esa spec, y el idioma de la NOTE, de la línea de omitidos y del bloque `BUDGET`; lo que el puente responde en español está en [`specs/mcp`](../mcp/spec.md), AL1 a AL4).
+- [session-start-context](../../changes/archive/2026-11-04-session-start-context/proposal.md), archivado el 2026-11-04, que salió en 0.76.0 (SC1 a SC5 de esa spec, con esos nombres, y lo que cambian en «Definiciones», «El prompt cumple el presupuesto» y «Lo cortado se nombra por id»; SC6 está en [`specs/synthesis`](../synthesis/spec.md), R8, y el bloque `workspace` de `context.cut`, en [`specs/metrics`](../metrics/spec.md), R14).
 
 ## Definiciones
 
@@ -48,7 +49,12 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - **Hit candidato:** hit que el prompt de `recall_context` llevaría sin presupuesto: los de la búsqueda sin las filas del workspace ni las filas de score 0, cortados en `K_FINAL = 10` (`build_memory_prompt`, `prompt_builder.rs:170`; las filas del workspace salen en `:232`, las de score 0 en `:237` y el corte en `:239`).
 - **Hit mostrado:** hit candidato de `kind = memory` que el presupuesto dejó en RECENT o LONG-TERM, entero o recortado. Los ids son por tabla, así que un hit episodic o procedural nunca cuenta. Sin recorte, los hits mostrados son todos los candidatos de `memory`. El resumen de LAST SESSION ([«La última sesión»](#la-última-sesión)) no es hit candidato ni mostrado.
 - **Cortado / recortado:** un hit candidato que el presupuesto dejó afuera / uno cuyo texto acortó.
-- **Fila del workspace:** id en `EmittedIds` (`crates/clawg-core/src/memory/workspace.rs:201`), que se suma a los candidatos de `memory` en `shown` (`assemble`, `prompt_builder.rs:338-343`). Su bullet no tiene id. **No** es un hit mostrado.
+- **Fila del workspace:** id en `EmittedIds` (`crates/clawg-core/src/memory/workspace.rs:314`), que se suma a los candidatos de `memory` en `shown` (`assemble`, `prompt_builder.rs:374-379`), también si el presupuesto corta su entrada, porque esa lista se arma antes del recorte. Su bullet no tiene id: el prompt la reconoce por su texto. **No** es un hit mostrado.
+- **Parte de la persona:** lo que el prompt muestra de `workspace.md` antes de `AUTO-START` y después de `AUTO-END`, la sección USER incluida, sin marcadores. Un archivo sin `AUTO-START` es todo parte de la persona.
+- **Entrada de AUTO:** una línea de la sección AUTO que empieza con `- `, con las líneas que la siguen detrás del margen (`  |`). Así escribe la regeneración una preferencia, una decisión o un skill.
+- **Entrada conocida:** una entrada de AUTO cuyo texto es exactamente la línea que la regeneración del mismo pedido informó de una fila, junto con el kind, el id, la importancia y el `created_at` de esa fila. Si dos filas tienen la misma línea, las entradas se asignan en orden.
+- **Algo esperando:** el prompt todavía tiene un resumen de LAST SESSION, o algún hit en RECENT o LONG-TERM.
+- **Bytes de AUTO:** los bytes que la sección AUTO ocupa en el texto del prompt, con sus encabezados y sus entradas.
 - **Posición de un hit:** índice 0-based en el orden impreso: RECENT y luego LONG-TERM (`positions`, `prompt_builder.rs:548`). LAST SESSION no cuenta. Las posiciones se toman antes del presupuesto; el presupuesto puede quitar un hit del medio, pero los que quedan conservan su orden.
 - **Par de conflicto:** un par escalado: fila nueva (`disputed`) contra una fila vieja que nombra en `disputed_against` ([`specs/disputes`](../disputes/spec.md)). Los pares pendientes no entran al bloque; los ve el agente en la respuesta del save y en `memory_status`. `fetch_active_conflicts` (`prompt_builder.rs:1109`) sólo trae pares con al menos un lado en `shown`, es decir, hit candidato de `memory` o fila del workspace, antes del presupuesto; el otro lado puede estar fuera del prompt.
 - **Texto guardado:** todo texto que clawg no escribió y le muestra al modelo: el contenido de una memoria, de cualquier tabla y de cualquier agente, y el nombre y el disparador de un `procedural_skill`.
@@ -420,7 +426,7 @@ Tras ordenar, el bloque MUST conservar los primeros 5 pares (`MAX_CONFLICT_PAIRS
 
 ## Workspace en el prompt
 
-El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:1059`) MUST NOT contener `<!-- `, ni sección USER vacía, ni un encabezado `## ` de la sección AUTO sin bullets debajo. El contenido no vacío de USER MUST conservarse tal cual lo escribió el usuario, encabezados incluidos, sin marcadores y sin líneas en blanco al principio ni al final: la poda de encabezados sólo mira la sección AUTO, que es la que genera `render_rows` (`workspace.rs:456`). Un archivo sin `AUTO_START` MUST entregarse entero; uno con AUTO pero sin `AUTO-END` se toma como AUTO hasta el final, y el texto antes de `AUTO-START` se entrega. Si no queda nada, no se emite la sección WORKSPACE. El archivo en disco MUST ser byte a byte idéntico antes y después de un recall.
+El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:1225`) MUST NOT contener `<!-- `, ni sección USER vacía, ni un encabezado `## ` de la sección AUTO sin bullets debajo. El contenido no vacío de USER MUST conservarse tal cual lo escribió el usuario, encabezados incluidos, sin marcadores y sin líneas en blanco al principio ni al final: la poda de encabezados sólo mira la sección AUTO, que es la que genera `render_rows` (`workspace.rs:591`). Un archivo sin `AUTO_START` MUST entregarse entero; uno con AUTO pero sin `AUTO-END` se toma como AUTO hasta el final, y el texto antes de `AUTO-START` se entrega. Si no queda nada, no se emite la sección WORKSPACE. El archivo en disco MUST ser byte a byte idéntico antes y después de un recall.
 
 #### Escenario: sin marcadores
 - GIVEN un archivo con AUTO/USER, un bullet bajo `## User Preferences` y los otros dos encabezados vacíos
@@ -533,11 +539,11 @@ LAST SESSION y RECENT corren en cada `POST /v1/context` y en cada `clawg hook se
 
 ## El prompt cumple el presupuesto
 
-`build_memory_prompt` y `build_session_prompt` reciben el presupuesto del contexto y arman el texto con `fit_to_budget` (`prompt_builder.rs:440`), una función pura sobre el workspace, el último resumen, los hits candidatos, los pares ya ordenados y la reserva de los hits (`PromptParts::hit_room`). Si el texto entero entra, MUST ser byte a byte el que se arma sin presupuesto. Si no entra, MUST quitar de a uno, midiendo otra vez el texto entero después de cada paso, hasta que entre (`:453-467`): primero los hits de RECENT y LONG-TERM mientras esos dos bloques ocupen más bytes que la reserva (su separador, sus líneas con el margen y la línea en blanco que los abre; `hit_bytes`, `:493`), después el resumen de LAST SESSION, después los pares de conflictos desde el último, y después los hits que quedan. Entre los hits va primero el de menor score, sea del bloque que sea, y un hit exacto sólo cuando no queda ningún otro (`next_to_cut`, `prompt_builder.rs:521`); un empate se resuelve desde el final de LONG-TERM y después desde el final de RECENT, así que un contexto sin consulta, cuyos hits valen 0, se sigue cortando desde su save más viejo. Los bloques dicen la edad de un hit y no su relevancia: cortar un bloque entero primero quitaba un hit exacto de la semana pasada antes que uno de RECENT que apenas pasó el piso, y la búsqueda nunca corta un exacto ([«Definiciones»](#definiciones), corte relativo). El resumen queda por encima de los hits que pasan de la reserva porque ninguna consulta lo trae de vuelta, y cede ante los conflictos porque esos piden una pregunta al usuario. El texto MUST NOT superar el presupuesto salvo en el caso de [un workspace más grande que el presupuesto](#un-workspace-más-grande-que-el-presupuesto-se-entrega-y-se-dice).
+`build_memory_prompt` y `build_session_prompt` reciben el presupuesto del contexto y arman el texto con `fit_to_budget` (`prompt_builder.rs:482`), una función pura sobre el workspace, el último resumen, los hits candidatos, los pares ya ordenados y la reserva de los hits (`PromptParts::hit_room`). Si el texto entero entra, MUST ser byte a byte el que se arma sin presupuesto. Si no entra, MUST quitar de a uno, midiendo otra vez el texto entero después de cada paso, hasta que entre (`:491-553`): primero las entradas conocidas de la sección AUTO mientras haya algo esperando y sus bytes pasen de la mitad del presupuesto ([SC2](#sc2-la-sección-auto-cede-lo-que-pasa-de-la-mitad)), después los hits de RECENT y LONG-TERM mientras esos dos bloques ocupen más bytes que la reserva (su separador, sus líneas con el margen y la línea en blanco que los abre; `hit_bytes`, `:571`), después el resumen de LAST SESSION, después los pares de conflictos desde el último, después los hits que quedan, y por último las entradas conocidas que queden ([SC3](#sc3-sin-nada-esperando-auto-usa-todo-el-presupuesto)). Entre los hits va primero el de menor score, sea del bloque que sea, y un hit exacto sólo cuando no queda ningún otro (`next_to_cut`, `prompt_builder.rs:608`); un empate se resuelve desde el final de LONG-TERM y después desde el final de RECENT, así que un contexto sin consulta, cuyos hits valen 0, se sigue cortando desde su save más viejo. Los bloques dicen la edad de un hit y no su relevancia: cortar un bloque entero primero quitaba un hit exacto de la semana pasada antes que uno de RECENT que apenas pasó el piso, y la búsqueda nunca corta un exacto ([«Definiciones»](#definiciones), corte relativo). El resumen queda por encima de los hits que pasan de la reserva porque ninguna consulta lo trae de vuelta, y cede ante los conflictos porque esos piden una pregunta al usuario. El texto MUST NOT superar el presupuesto salvo en el caso de [SC5](#sc5-lo-que-escribió-la-persona-no-se-corta).
 
-La reserva MUST ser un cuarto del presupuesto en un contexto con consulta (`HIT_ROOM_DIVISOR`, `prompt_builder.rs:70`; `build_memory_prompt`, `:264`) y 0 en el contexto sin consulta (`build_session_prompt`, `:289`), cuyo orden es entonces el de antes: todos los hits, después LAST SESSION, después los conflictos. Con la reserva, los mejores hits sobreviven al resumen y a los conflictos, que son lo que un contexto con consulta pidió: en un store maduro, un workspace cerca del tope del AUTO, un resumen largo y un par en disputa se comían el presupuesto default, y el recorte sacaba todos los hits, los de la consulta incluidos (un `recall_context` real con 19.134 bytes de contexto entero, y `revision-eval chains --real --background`). Con el default la reserva es de 2.000 bytes, y los 6.000 que quedan son los que el AUTO puede ocupar (`AUTO_BYTE_CAP`, `crates/clawg-core/src/memory/workspace.rs:19-20`). Sin consulta no hay reserva: al iniciar una sesión LAST SESSION es el traspaso, y RECENT son los saves más nuevos, no la respuesta a una pregunta.
+La reserva MUST ser un cuarto del presupuesto en un contexto con consulta (`HIT_ROOM_DIVISOR`, `prompt_builder.rs:69`; `build_memory_prompt`, `:294`) y 0 en el contexto sin consulta (`build_session_prompt`, `:338`), cuyo orden, después de lo que cede la sección AUTO, es todos los hits, LAST SESSION y los conflictos. Con la reserva, los mejores hits sobreviven al resumen y a los conflictos, que son lo que un contexto con consulta pidió: en un store maduro, un workspace cerca del tope del AUTO, un resumen largo y un par en disputa se comían el presupuesto default, y el recorte sacaba todos los hits, los de la consulta incluidos (un `recall_context` real con 19.134 bytes de contexto entero, y `revision-eval chains --real --background`). Con el default la reserva es de 2.000 bytes. `AUTO_BYTE_CAP` (6.000 bytes, `crates/clawg-core/src/memory/workspace.rs:19-20`) sólo recorta los skills y las decisiones al escribir el archivo (`render_auto_section`, `:517`): las preferencias no tienen tope, y por eso, mientras algo espera, la sección AUTO cede lo que pasa de la mitad del presupuesto. Sin consulta no hay reserva: al iniciar una sesión LAST SESSION es el traspaso, y RECENT son los saves más nuevos, no la respuesta a una pregunta.
 
-El workspace MUST NOT recortarse: sus preferencias y su sección USER son el acuerdo con el usuario, y cada fila que imprimió es una que la búsqueda salteó (`EmittedIds`), así que cortarla la dejaría sin ningún canal. Medir el texto entero en cada paso cuenta la nota `SHARED`, el bloque `BUDGET`, el texto que gana un conflicto cuando se va su hit y el margen de cada línea de continuación (4 bytes por línea, `  | `).
+Del workspace sólo se cortan entradas conocidas de la sección AUTO, nunca [lo que escribió la persona](#sc5-lo-que-escribió-la-persona-no-se-corta). Cada fila que la sección imprimió es una que la búsqueda salteó (`EmittedIds`), así que, una vez cortada, el bloque `BUDGET` es su único canal: por eso se nombra por id. Medir el texto entero en cada paso cuenta la nota `SHARED`, el bloque `BUDGET`, el texto que gana un conflicto cuando se va su hit y el margen de cada línea de continuación (4 bytes por línea, `  | `).
 
 #### Escenario: muchas filas largas
 - GIVEN diez hits de 2.000 bytes y un presupuesto de 8.000
@@ -569,15 +575,71 @@ El workspace MUST NOT recortarse: sus preferencias y su sección USER son el acu
 
 **Tests:** `the_prompt_never_exceeds_the_budget`, `the_cut_starts_at_the_end_of_long_term` (el empate), `the_cut_takes_the_lowest_score_first_across_recent_and_long_term`, `an_exact_hit_is_cut_only_when_no_other_hit_is_left`, `a_context_that_fits_is_left_as_it_was`, `conflicts_go_after_every_hit`, `the_last_session_block_gives_way_after_the_hits` (que además comprueba que el resumen no entra en `Fitted.shown`), todos con reserva 0; `the_hits_over_their_room_go_before_the_last_session`, `the_hits_in_their_room_outlast_the_last_session_and_the_conflicts`, `a_room_never_takes_the_prompt_over_the_budget` y, con el store, `a_store_of_long_rows_fits_the_budget`, `a_mature_store_still_shows_the_hit_of_the_query` y `a_context_without_a_query_keeps_the_last_session_over_its_saves` (`prompt_builder.rs`). Que sin recorte el prompt sea el de antes lo siguen probando `e2e_full_4_block_output` y los tests de bloques, que corren con el default.
 
+## SC1. La regeneración informa cada línea que escribió
+
+`regenerate_auto_section` (`crates/clawg-core/src/memory/workspace.rs:213`) MUST informar, de cada fila que imprimió en la sección AUTO, su kind, su id, su importancia, su `created_at` y la línea tal como quedó en el archivo, sin el salto final (`EmittedRow`, `:320`; `render_auto_section`, `:517`). MUST NOT cambiar qué filas imprime ni el texto del archivo. `workspace.md` no guarda ids: el daemon regenera antes de cada contexto (`crates/clawg-cli/src/daemon/api.rs:1580`), y `workspace_for_prompt` (`prompt_builder.rs:1225`) reconoce cada entrada del archivo por su texto. Si la regeneración falla, el informe queda vacío (`api.rs:1583-1586`) y ninguna entrada es conocida.
+
+#### Escenario: una preferencia de dos líneas y un skill
+- GIVEN una preferencia de importancia 9 cuyo texto tiene dos líneas, y un skill
+- WHEN se regenera el workspace
+- THEN el informe trae las dos filas con su importancia y su fecha, y cada línea informada está en la sección AUTO del archivo
+
+**Test:** `the_regeneration_reports_each_line_it_wrote` (`workspace.rs`).
+
+## SC2. La sección AUTO cede lo que pasa de la mitad
+
+Mientras el texto no entre en el presupuesto, haya algo esperando y los bytes de AUTO pasen de `budget / 2` (`AUTO_ROOM_DIVISOR`, `prompt_builder.rs:74`; el paso, `:497-502`), `fit_to_budget` MUST quitar una entrada conocida antes que cualquier otra cosa. Después MUST seguir con los hits que pasan de su reserva, el resumen de LAST SESSION, los pares de conflictos y los hits de la reserva. Si el texto entra en cualquier punto, el recorte MUST detenerse. Un texto que entra entero MUST quedar byte a byte igual, se pase o no el informe de la regeneración. Vale para `build_session_prompt` y para `build_memory_prompt`. Es una prioridad de recorte y no un tope fijo, como la reserva de los hits.
+
+#### Escenario: un workspace de 14 KB al iniciar la sesión
+- GIVEN 18 preferencias de 800 bytes en el workspace de un agente y un resumen de la sesión anterior en el proyecto
+- WHEN se pide el contexto con el presupuesto de 8.000 bytes, sin consulta, y después con una consulta y sin modelo
+- THEN cada prompt ocupa como mucho 8.000 bytes, trae el resumen entero bajo LAST SESSION y nombra por id en `BUDGET` las preferencias cortadas
+
+#### Escenario: el mismo workspace con lugar
+- GIVEN el mismo store
+- WHEN se pide el contexto con 24.000 bytes
+- THEN el prompt es el mismo que se arma sin el informe de la regeneración
+
+#### Escenario: AUTO por encima de la mitad y hits
+- GIVEN entradas de AUTO por 5.000 bytes y dos hits de 1.000, con un presupuesto de 6.000
+- WHEN el texto no entra
+- THEN se cortan entradas de AUTO, no los hits
+
+**Tests:** `a_stocked_workspace_leaves_room_for_the_last_session` (con el store, las dos rutas y el texto con lugar) y `the_auto_rows_over_half_go_before_the_hits` (`prompt_builder.rs`).
+
+## SC3. Sin nada esperando, AUTO usa todo el presupuesto
+
+Cuando ya no queda nada esperando, ni resumen ni hits, y no quedan pares de conflictos, `fit_to_budget` MUST quitar entradas conocidas sólo mientras el texto no entre (`prompt_builder.rs:523-527`).
+
+#### Escenario: sólo preferencias
+- GIVEN 18 entradas de AUTO de 800 bytes, sin resumen ni hits
+- WHEN el presupuesto es de 8.000 bytes
+- THEN el prompt ocupa como mucho 8.000 bytes, y sus bytes de AUTO pasan de 4.000
+
+**Test:** `with_nothing_waiting_the_auto_rows_take_the_whole_budget` (`prompt_builder.rs`).
+
+## SC4. El orden de AUTO y cómo se nombra lo cortado
+
+Entre las entradas conocidas, MUST salir primero la de menor importancia; a igual importancia, la de `created_at` más viejo, y a igual fecha, la de menor id (`PromptWorkspace::next_to_cut`, `prompt_builder.rs:1197`). Las preferencias, las decisiones y los skills compiten entre sí. Una entrada MUST quitarse entera, sin acortarse (`cut_auto`, `:556`). Una entrada que no es conocida MUST NOT quitarse, porque no se la puede nombrar. Un encabezado que se queda sin entradas MUST salir del prompt, como sale uno vacío ([«Workspace en el prompt»](#workspace-en-el-prompt)).
+
+Cada entrada quitada MUST nombrarse en «Left out» / «Quedaron afuera» del bloque `BUDGET`, en el orden en que se imprimiría, antes que los hits. Un skill MUST llevar su kind (`procedural #id`). `MemoryPrompt.cut` MUST incluir `PromptBlock::Workspace` (`:147`), cuyo nombre es `workspace`, y el daemon MUST registrarlo en `context.cut` como los otros bloques ([`specs/metrics`](../metrics/spec.md), R14).
+
+#### Escenario: importancia y edad
+- GIVEN cuatro entradas de AUTO: #1 de importancia 9 y #2 de importancia 8, de hace 10 días, y #3 de importancia 8 y #4 de importancia 10, de hace 1 día
+- WHEN el presupuesto deja lugar para dos
+- THEN quedan #4 y #1, y el bloque `BUDGET` dice `Left out: #2, #3.`
+
+**Tests:** `the_auto_rows_go_by_importance_then_newest` y `the_fit_names_each_block_it_cut` (`prompt_builder.rs`).
+
 ## El primer hit de un bloque se recorta en lugar de saltarse
 
-Cuando el hit a quitar es el único que queda en su bloque, su texto MUST acortarse en lo que sobra, en un límite de carácter UTF-8, sin espacio al final y terminado en ` [truncated]` (`shorten`, `prompt_builder.rs:533`). Mientras los hits pasan de la reserva, el hit solo se acorta sólo en lo que pasan de ella, o en lo que el texto pasa del presupuesto si es menos, y no se quita en ese paso: un hit largo y relevante queda en la reserva en vez de irse entero, y lo que siga sobrando lo cortan LAST SESSION y los conflictos. LAST SESSION tiene un solo hit, así que el resumen siempre se acorta antes de irse. Si volver a medir lo deja todavía por encima, se acorta otra vez sin repetir la marca. Sólo si no le queda texto MUST quitarse. Un hit recortado sigue siendo hit mostrado: un hit acortado y su id dicen más que un bloque vacío.
+Cuando el hit a quitar es el único que queda en su bloque, su texto MUST acortarse en lo que sobra, en un límite de carácter UTF-8, sin espacio al final y terminado en ` [truncated]` (`shorten`, `prompt_builder.rs:620`). Mientras los hits pasan de la reserva, el hit solo se acorta sólo en lo que pasan de ella, o en lo que el texto pasa del presupuesto si es menos, y no se quita en ese paso: un hit largo y relevante queda en la reserva en vez de irse entero, y lo que siga sobrando lo cortan LAST SESSION y los conflictos. LAST SESSION tiene un solo hit, así que el resumen siempre se acorta antes de irse. Si volver a medir lo deja todavía por encima, se acorta otra vez sin repetir la marca. Sólo si no le queda texto MUST quitarse. Un hit recortado sigue siendo hit mostrado: un hit acortado y su id dicen más que un bloque vacío.
 
 **Tests:** `the_first_hit_of_a_block_is_shortened_not_dropped`, `a_shortened_text_ends_on_a_character_boundary` y `a_lone_hit_over_its_room_is_shortened_to_it` (`prompt_builder.rs`).
 
 ## Lo cortado se nombra por id
 
-Si algo se cortó o recortó, el prompt MUST terminar con un bloque `=== BUDGET ===` (`render`, `prompt_builder.rs:598-606`; su texto en `format_cut`, `:613`) que dice el presupuesto, cuántos bytes ocupa el contexto entero, los ids cortados en el orden en que se imprimirían y los recortados, el resumen de LAST SESSION entre ellos como un hit más, con su kind delante cuando no es `memory` (`episodic #3`), y que `read_memory` los devuelve enteros:
+Si algo se cortó o recortó, el prompt MUST terminar con un bloque `=== BUDGET ===` (`render`, `prompt_builder.rs:645`; su texto en `format_cut`, `:701`) que dice el presupuesto, cuántos bytes ocupa el contexto entero, los ids cortados en el orden en que se imprimirían (las entradas de AUTO primero, porque el workspace se imprime antes) y los recortados, el resumen de LAST SESSION entre ellos como un hit más, con su kind delante cuando no es `memory` (`episodic #3`), y que `read_memory` los devuelve enteros:
 
 ```
 === BUDGET ===
@@ -595,11 +657,17 @@ Sin recorte el bloque MUST NOT aparecer. El bloque MUST NOT quitarse para entrar
 
 **Tests:** `what_the_budget_left_out_is_named_by_id` y `the_budget_block_stays_with_the_smallest_budget` (`prompt_builder.rs`); `a_hit_cut_by_the_budget_is_readable_whole` (`crates/clawg-cli/src/mcp/server.rs`).
 
-## Un workspace más grande que el presupuesto se entrega y se dice
+## SC5. Lo que escribió la persona no se corta
 
-Si sin ningún hit, resumen ni par el texto sigue por encima del presupuesto, el prompt MUST llevar el workspace entero, ningún hit y el bloque `BUDGET` con cuántos bytes ocupa el contexto entero y la frase `The workspace alone is over the budget and is shown whole.`, o `El workspace solo ya pasa el presupuesto y se muestra entero.` con `lang: es` (`prompt_builder.rs:463-466` y `:645-650`). Es el único caso en que el prompt supera el presupuesto.
+La parte de la persona MUST NOT cortarse: su sección USER es el acuerdo con el usuario. Si al no quedar ninguna entrada conocida, ningún hit, resumen ni par el texto sigue por encima del presupuesto, el prompt MUST llevar la parte de la persona entera. El bloque `BUDGET` MUST nombrar las entradas cortadas, cuántos bytes ocupa el contexto entero y la frase `The part of the workspace the user wrote is over the budget on its own and is shown whole.`, o `La parte del workspace que escribió la persona ya pasa el presupuesto sola y se muestra entera.` con `lang: es` (`prompt_builder.rs:528` y `:733-738`). Es el único caso en que el prompt pasa el presupuesto.
 
-**Test:** `a_workspace_over_the_budget_is_kept_and_said` (`prompt_builder.rs`).
+Una entrada que no es conocida tampoco se corta (SC4). Cuando la regeneración falla ninguna lo es, así que toda la sección AUTO queda, y si con ella el texto pasa el presupuesto la frase sale igual, aunque lo que sobra no sea lo que escribió la persona.
+
+#### Escenario: una sección USER de 9.000 bytes
+- GIVEN una sección USER de 9.000 bytes, tres entradas de AUTO y un hit, con el presupuesto de 8.000
+- THEN el prompt trae la sección USER entera, ninguna entrada ni hit, y el bloque `BUDGET` nombra las tres entradas y el hit y dice la frase
+
+**Tests:** `what_the_user_wrote_is_never_cut`, `a_workspace_over_the_budget_is_kept_and_said` (un archivo sin marcadores) y `the_notes_of_the_prompt_follow_its_language` (`prompt_builder.rs`).
 
 ## El parser de `rag-eval --agent-view`
 

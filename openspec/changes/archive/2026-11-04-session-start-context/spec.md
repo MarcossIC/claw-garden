@@ -1,6 +1,6 @@
 # session-start-context — Especificación
 
-Cambia [`specs/retrieval`](../../specs/retrieval/spec.md): «El prompt cumple el presupuesto», «Lo cortado se nombra por id», «Un workspace más grande que el presupuesto se entrega y se dice» y la definición de «Fila del workspace». Cambia también R8 de [`specs/synthesis`](../../specs/synthesis/spec.md) y el recuento `context.cut` de [`specs/metrics`](../../specs/metrics/spec.md). Al archivar, estos requisitos pasan a esas specs.
+Cambia [`specs/retrieval`](../../../specs/retrieval/spec.md): «El prompt cumple el presupuesto», «Lo cortado se nombra por id», «Un workspace más grande que el presupuesto se entrega y se dice» y la definición de «Fila del workspace». Cambia también R8 de [`specs/synthesis`](../../../specs/synthesis/spec.md) y el recuento `context.cut` de [`specs/metrics`](../../../specs/metrics/spec.md). Al archivar, estos requisitos pasan a esas specs.
 
 ## Definiciones
 
