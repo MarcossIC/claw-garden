@@ -111,3 +111,15 @@ Cambia «La clave de tema en las herramientas» de [`specs/mcp`](../../specs/mcp
 - AND un save con `all_projects` y esa clave responde que la reemplaza, y la fila nueva tampoco tiene proyecto
 
 **Tests:** `a_hit_without_a_project_shows_how_a_save_revises_it`, que reemplaza a `a_hit_without_a_project_shows_its_key_only_to_a_bridge_without_one`, `a_marked_key_stays_before_the_author_of_the_hit` y `format_save_shows_the_key_only_where_a_save_revises_it` (`crates/clawg-cli/src/mcp/tools.rs`); `a_preference_of_every_project_is_replaced_with_all_projects_and_the_key_shown` y `the_protocol_says_where_a_key_is_shown` (`crates/clawg-cli/src/mcp/server.rs`).
+
+## PM9. Un save declarado sella la fila que repite
+
+Un save con `user_stated` cuyo texto ya está vivo en su alcance MUST dejar esa fila con `source = 'explicit'` y `created_by_type = 'user'`, además de reforzarla (`reinforce_in`, `crates/clawg-core/src/memory/store_insert.rs`), sea que la encuentre antes de calcular el embedding o después. También MUST subirla a la importancia del save, sin bajarla nunca, y recalcular su tier con ella: si no, lo que dijo la persona quedaría fuera del workspace por haberse inferido antes con menos importancia. Un save sin `user_stated` MUST dejar el sello y la importancia como estaban. Una fila `import` MUST conservar los dos, porque un segundo import y `clawg doctor` la encuentran por su `source`, y una `synthesis` también, porque una conclusión es del agente aunque se apoye en lo que dijo la persona.
+
+#### Escenario: lo inferido, y después declarado
+- GIVEN una preferencia guardada sin `user_stated`, que queda `explicit` / `agent` con importancia 5
+- WHEN la persona dice lo mismo y el agente guarda el mismo texto con `user_stated` e importancia 9
+- THEN sigue habiendo una fila, es `explicit` / `user` con importancia 9, y entra al workspace
+- AND otro save declarado del mismo texto con importancia 2 la deja en 9
+
+**Tests:** `a_stated_save_seals_the_row_it_repeats_as_the_users`, `an_inferred_save_leaves_the_seal_of_the_row_it_repeats`, `a_stated_save_leaves_an_import_and_a_conclusion_as_they_are`, `a_stated_save_raises_the_importance_of_the_row_it_repeats_and_never_lowers_it`, `an_inferred_save_leaves_the_importance_of_the_row_it_repeats`, `a_preference_stated_after_it_was_inferred_enters_the_workspace` y `a_twin_restored_while_the_save_is_embedded_is_reinforced_not_copied` (`crates/clawg-core/src/memory/worker.rs`).

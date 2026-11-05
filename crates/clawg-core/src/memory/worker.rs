@@ -21,9 +21,10 @@ use crate::memory::contradiction::{Candidate, SaveKey};
 use crate::memory::pieces::StoredPiece;
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
+use crate::memory::provenance::{is_stated, seal};
 use crate::memory::redact::{redact, SecretKind};
 use crate::memory::sharing::Reader;
-use crate::memory::store_insert::{NewMemoryRecord, Stored as Insert};
+use crate::memory::store_insert::{deliberate_importance, NewMemoryRecord, Repeat, Stored as Insert};
 use crate::memory::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
 use crate::memory::clock::TimestampMs;
 use crate::memory::MemoryStore;
@@ -597,12 +598,14 @@ async fn absorb_duplicate(
     absorbed: &mut u64,
     note: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
 ) -> Option<i64> {
+    let (source, created_by_type) = seal(evt.source, &evt.role, !evt.sources().is_empty(), evt.user_stated);
+    let stated_importance = is_stated(source, created_by_type).then(|| deliberate_importance(evt));
     match store
         .reinforce_noting(
             saver,
             evt.project_id.as_deref(),
             content_hash,
-            evt.sources(),
+            Repeat { derived_from: evt.sources(), stated_importance },
             evt.timestamp_ms,
             note,
         )
@@ -2876,6 +2879,132 @@ mod tests {
         );
     }
 
+    fn deliberate_save(content: &str, user_stated: bool, ts: u64) -> MemoryEvent {
+        MemoryEvent { source: MemorySource::Explicit, user_stated, ..make_event(Role::User, content, None, ts) }
+    }
+
+    async fn seal_of(store: &MemoryStore, id: i64) -> (String, String) {
+        store
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT source, created_by_type FROM memory WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stated_save_seals_the_row_it_repeats_as_the_users() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let text = "answer in short sentences";
+        let inferred = process_with(Arc::new(FakeEmbedder::default()), &store, &deliberate_save(text, false, 1)).await.memories[0].id;
+        assert_eq!(seal_of(&store, inferred).await, ("explicit".to_string(), "agent".to_string()));
+
+        let stated = process_with(Arc::new(FakeEmbedder::default()), &store, &deliberate_save(text, true, 2)).await;
+
+        assert_eq!(stated.memories, vec![SavedChunk { id: inferred, outcome: ChunkOutcome::Reinforced }]);
+        assert_eq!(seal_of(&store, inferred).await, ("explicit".to_string(), "user".to_string()));
+        assert_eq!(count_memory(&store).await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_inferred_save_leaves_the_seal_of_the_row_it_repeats() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder = || -> Arc<dyn Embedder> { Arc::new(FakeEmbedder::default()) };
+        for (first_stated, seal) in [(false, "agent"), (true, "user")] {
+            let text = format!("answer in short sentences, {seal}");
+            let id = process_with(embedder(), &store, &deliberate_save(&text, first_stated, 1)).await.memories[0].id;
+
+            process_with(embedder(), &store, &deliberate_save(&text, false, 2)).await;
+
+            assert_eq!(seal_of(&store, id).await, ("explicit".to_string(), seal.to_string()));
+        }
+    }
+
+    /// An import is found again by its `source`, and a conclusion stays the
+    /// agent's whoever's words it rests on, so a repeat leaves both as they are.
+    #[tokio::test]
+    async fn a_stated_save_leaves_an_import_and_a_conclusion_as_they_are() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder = || -> Arc<dyn Embedder> { Arc::new(FakeEmbedder::default()) };
+        for source in ["import", "synthesis"] {
+            let text = format!("answer in short sentences, {source}");
+            let id = process_with(embedder(), &store, &deliberate_save(&text, false, 1)).await.memories[0].id;
+            store
+                .conn
+                .call(move |c| c.execute("UPDATE memory SET source = ?2 WHERE id = ?1", rusqlite::params![id, source]))
+                .await
+                .unwrap();
+
+            let stated = MemoryEvent { importance: Some(9.0), ..deliberate_save(&text, true, 2) };
+            process_with(embedder(), &store, &stated).await;
+
+            assert_eq!(seal_of(&store, id).await, (source.to_string(), "agent".to_string()));
+            assert_eq!(weight_of(&store, id).await.0, 5.0, "{source}");
+        }
+    }
+
+    async fn weight_of(store: &MemoryStore, id: i64) -> (f64, i64) {
+        store
+            .conn
+            .call(move |c| c.query_row("SELECT importance, tier FROM memory WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stated_save_raises_the_importance_of_the_row_it_repeats_and_never_lowers_it() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder = || -> Arc<dyn Embedder> { Arc::new(FakeEmbedder::default()) };
+        let text = "answer in short sentences";
+        let id = process_with(embedder(), &store, &deliberate_save(text, false, 1)).await.memories[0].id;
+        assert_eq!(weight_of(&store, id).await.0, 5.0);
+
+        let stated = MemoryEvent { importance: Some(9.0), ..deliberate_save(text, true, 2) };
+        process_with(embedder(), &store, &stated).await;
+        assert_eq!(weight_of(&store, id).await, (9.0, 1), "the importance earns its tier at once");
+
+        let lower = MemoryEvent { importance: Some(2.0), ..deliberate_save(text, true, 3) };
+        process_with(embedder(), &store, &lower).await;
+        assert_eq!(weight_of(&store, id).await, (9.0, 1));
+    }
+
+    #[tokio::test]
+    async fn an_inferred_save_leaves_the_importance_of_the_row_it_repeats() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder = || -> Arc<dyn Embedder> { Arc::new(FakeEmbedder::default()) };
+        let text = "answer in short sentences";
+        let id = process_with(embedder(), &store, &deliberate_save(text, false, 1)).await.memories[0].id;
+
+        let inferred = MemoryEvent { importance: Some(9.0), ..deliberate_save(text, false, 2) };
+        process_with(embedder(), &store, &inferred).await;
+
+        assert_eq!(weight_of(&store, id).await.0, 5.0);
+    }
+
+    #[tokio::test]
+    async fn a_preference_stated_after_it_was_inferred_enters_the_workspace() {
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let embedder = || -> Arc<dyn Embedder> { Arc::new(FakeEmbedder::default()) };
+        let preference = |user_stated, importance, ts| MemoryEvent {
+            memory_type: Some("user_preference".to_string()),
+            importance,
+            ..deliberate_save("answer in short sentences", user_stated, ts)
+        };
+        let id = process_with(embedder(), &store, &preference(false, None, 1)).await.memories[0].id;
+        let tmp = crate::test_dir::test_dir();
+        let wm = crate::memory::workspace::WorkspaceManager::new(tmp.path().join("workspaces"));
+        let reach = crate::memory::sharing::Reach::Own;
+        let before = wm.regenerate_auto_section("agent-test", None, &reach, &store).await.unwrap();
+        use crate::memory::record::TableKind;
+        assert!(!before.contains(TableKind::Memory, id), "inferred, and at importance 5");
+
+        process_with(embedder(), &store, &preference(true, Some(9.0), 2)).await;
+
+        let after = wm.regenerate_auto_section("agent-test", None, &reach, &store).await.unwrap();
+        assert!(after.contains(TableKind::Memory, id), "what the user said opens every session");
+    }
+
     /// The dedup check runs before the embedding and the contradiction probe,
     /// and a restore of the same text can land while the save waits for the
     /// model.
@@ -2907,8 +3036,9 @@ mod tests {
         }
 
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
-        let evt = make_event(Role::User, "the train leaves on tuesdays", None, 1);
-        let twin = process_with(Arc::new(FakeEmbedder::default()), &store, &evt).await.memories[0].id;
+        let inferred = deliberate_save("the train leaves on tuesdays", false, 1);
+        let evt = MemoryEvent { importance: Some(9.0), ..deliberate_save("the train leaves on tuesdays", true, 2) };
+        let twin = process_with(Arc::new(FakeEmbedder::default()), &store, &inferred).await.memories[0].id;
         store
             .conn
             .call(move |c| c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [twin]))
@@ -2935,6 +3065,8 @@ mod tests {
         let report = saving.await.unwrap();
 
         assert_eq!(report.memories, vec![SavedChunk { id: twin, outcome: ChunkOutcome::Reinforced }]);
+        assert_eq!(seal_of(&store, twin).await, ("explicit".to_string(), "user".to_string()), "a stated save seals the twin too");
+        assert_eq!(weight_of(&store, twin).await.0, 9.0, "and raises its importance");
         let live: i64 = store
             .conn
             .call(|c| c.query_row("SELECT COUNT(*) FROM memory WHERE deleted_at IS NULL", [], |r| r.get(0)))

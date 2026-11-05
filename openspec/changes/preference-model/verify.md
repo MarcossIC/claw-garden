@@ -28,6 +28,10 @@ Cada test se corrió antes del código que lo hace pasar, salvo los dos que la t
 | PM6 | `the_protocol_says_which_preferences_open_every_session` | Con el protocolo de antes: `Type and importance names user_stated` |
 | PM8 | `a_hit_without_a_project_shows_how_a_save_revises_it`, `a_marked_key_stays_before_the_author_of_the_hit`, `format_save_shows_the_key_only_where_a_save_revises_it`, `a_preference_of_every_project_is_replaced_with_all_projects_and_the_key_shown` | El hit y `read_memory` no mostraban la clave: `#68\ntabs` |
 | PM8 | `the_protocol_says_where_a_key_is_shown` | El protocolo decía que una memoria sin proyecto no muestra clave |
+| PM9 | `a_stated_save_seals_the_row_it_repeats_as_the_users`, `a_twin_restored_while_the_save_is_embedded_is_reinforced_not_copied` | La fila seguía `explicit` / `agent` después del save declarado |
+| PM9 | `an_inferred_save_leaves_the_seal_of_the_row_it_repeats`, `a_stated_save_leaves_an_import_and_a_conclusion_as_they_are`, `an_inferred_save_leaves_the_importance_of_the_row_it_repeats` | Pasaban: fijan lo que no cambia |
+| PM9 | `a_stated_save_raises_the_importance_of_the_row_it_repeats_and_never_lowers_it` | La fila seguía en importancia 5 y tier 3: `(5.0, 3)` en lugar de `(9.0, 1)` |
+| PM9 | `a_preference_stated_after_it_was_inferred_enters_the_workspace` | Con la fila sellada pero en importancia 5, no entraba al workspace |
 
 **Tests que cambiaron, y por qué:**
 
@@ -92,7 +96,7 @@ diff --git a/crates/clawg-cli/src/mcp/agent_contract.json b/crates/clawg-cli/src
 
 ## Lo que no se midió
 
-- **`rag-eval --diff`.** No aplica: el ranking no cambia.
+- **`rag-eval --diff`.** No aplica a PM1 a PM8: el ranking no cambia. PM9 sí puede mover una fila, porque la importancia entra al puntaje, pero sólo cuando un save declarado repite un texto con más importancia que la de su fila. No se midió, porque necesita el modelo real y el golden fuera de git.
 - **El agent view con el golden real.** Necesita el modelo real y el golden fuera de git (`docs/eval/`). La ingesta de evaluación sella cada fila como declarada (`user_stated: true`, `crates/clawg-core/src/eval_api.rs:735`), así que ningún hit lleva marca y una preferencia sin proyecto o del proyecto del caso sigue entrando al workspace. Lo que puede moverse es una preferencia del golden guardada en otro proyecto que el del caso: queda en [«Pendiente en local»](#pendiente-en-local).
 
 ## Pendiente en local

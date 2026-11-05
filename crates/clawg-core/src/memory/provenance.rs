@@ -33,6 +33,11 @@ pub(crate) fn seal(source: MemorySource, role: &Role, has_sources: bool, user_st
     }
 }
 
+/// Whether this is the seal [`seal`] gives a save the user stated.
+pub(crate) fn is_stated(source: MemorySource, created_by_type: CreatedByType) -> bool {
+    source == MemorySource::Explicit && created_by_type == CreatedByType::User
+}
+
 /// What a reader shows of a stored row's origin, if anything.
 pub fn mark(source: &str, created_by_type: &str) -> Option<&'static str> {
     match (source, created_by_type) {
