@@ -94,20 +94,22 @@ pub fn input_keys(input: &[u8]) -> Vec<String> {
     }
 }
 
-/// The runs in `text`, oldest first; a line that is not a run is skipped.
-pub fn parse_runs(text: &str) -> Vec<Run> {
-    text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+/// The runs in the bytes of a record, oldest first. A line that is not a run is
+/// skipped, and so is one with a byte that is not UTF-8: read leniently it could
+/// still be a run, with a folder other than the one written.
+pub fn parse_runs(bytes: &[u8]) -> Vec<Run> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 /// The runs of a data directory, oldest first: the rolled file, then the
 /// current one. Missing or unreadable files read as empty, and a damaged byte
 /// costs the line it is in, not the file.
 pub fn read_runs(dir: &Path) -> Vec<Run> {
-    [ROLLED, FILE]
-        .iter()
-        .filter_map(|name| std::fs::read(dir.join(name)).ok())
-        .flat_map(|bytes| parse_runs(&String::from_utf8_lossy(&bytes)))
-        .collect()
+    [ROLLED, FILE].iter().filter_map(|name| std::fs::read(dir.join(name)).ok()).flat_map(|bytes| parse_runs(&bytes)).collect()
 }
 
 /// Appends `run` to the record of `dir`. Any failure is swallowed, and a
@@ -208,7 +210,7 @@ mod tests {
     fn runs_are_read_back_and_a_line_that_is_not_a_run_is_skipped() {
         let (a, b) = (run(Outcome::Injected), run(Outcome::NoDaemon));
         let text = format!("{}garbage\n\n{{\"outcome\":\"unheard_of\"}}\n{}", line(&a), line(&b));
-        assert_eq!(parse_runs(&text), [a, b]);
+        assert_eq!(parse_runs(text.as_bytes()), [a, b]);
     }
 
     #[test]
@@ -235,7 +237,7 @@ mod tests {
         std::fs::write(&rolled, b"older").unwrap();
         record(dir.path(), &run(Outcome::NoDaemon));
         assert_eq!(std::fs::read(&rolled).unwrap(), vec![b'b'; ROLL_AT as usize], "the old rolled file is replaced");
-        assert_eq!(parse_runs(&std::fs::read_to_string(&current).unwrap()).len(), 1, "a new file starts");
+        assert_eq!(parse_runs(&std::fs::read(&current).unwrap()).len(), 1, "a new file starts");
     }
 
     #[test]
@@ -307,6 +309,11 @@ mod tests {
         let (a, b) = (run(Outcome::Injected), run(Outcome::NoDaemon));
         let mut bytes = line(&a).into_bytes();
         bytes.extend_from_slice(b"half a li\xc3\n");
+        // Still JSON once a bad byte reads as U+FFFD: the folder it would show
+        // is not the one that was written.
+        let mut altered = line(&run(Outcome::DaemonError)).replace("/work/", "/w@rk/").into_bytes();
+        *altered.iter_mut().find(|byte| **byte == b'@').unwrap() = 0xff;
+        bytes.extend_from_slice(&altered);
         bytes.extend_from_slice(line(&b).as_bytes());
         std::fs::write(dir.path().join(FILE), bytes).unwrap();
         assert_eq!(read_runs(dir.path()), [a, b]);
@@ -326,7 +333,7 @@ mod tests {
 
         let text = std::fs::read(&current).unwrap();
         assert!(text.len() as u64 > ROLL_AT, "the file was not rolled");
-        assert_eq!(parse_runs(&String::from_utf8_lossy(&text)).len(), 1, "and the run was appended");
+        assert_eq!(parse_runs(&text).len(), 1, "and the run was appended");
     }
 
     #[test]
