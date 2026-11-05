@@ -182,11 +182,13 @@ mod tests {
         }
     }
 
-    /// The text of the `## {heading}` section of `text`, up to the next one.
-    fn section<'a>(text: &'a str, heading: &str) -> &'a str {
+    /// The text of the `## {heading}` section of `text`, up to the next one,
+    /// with `\n` line breaks: a checkout on Windows can turn them into `\r\n`.
+    fn section(text: &str, heading: &str) -> String {
+        let text = text.replace("\r\n", "\n");
         let start = text.find(&format!("\n## {heading}\n")).unwrap_or_else(|| panic!("no section {heading}"));
         let body = &text[start + heading.len() + 5..];
-        body.find("\n## ").map_or(body, |end| &body[..end])
+        body.find("\n## ").map_or(body, |end| &body[..end]).to_string()
     }
 
     #[test]
