@@ -1,13 +1,14 @@
 change: preference-model
 objective: "1, 2, 4"
 depends_on: [session-start-context]
-phase: explore  # esperan las decisiones de la persona
+phase: apply
 artifacts:
-  exploration: done
-  proposal: pending
-  spec: pending
-  tasks: pending
+  exploration: done  # las decisiones, cerradas: alcance A, entre agentes, sólo lo declarado entra solo
+  proposal: done
+  spec: done  # PM1 a PM7
+  design: skipped  # las decisiones están cerradas en la exploración; la propuesta dice cómo se aplican
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-03
+updated: 2026-11-05
