@@ -78,10 +78,10 @@ En esa corrida `doctor` salió con 1 por tres hallazgos `error` que no son de es
 
 | Requisito | Dónde |
 |---|---|
-| HR1 | `respond_with_run` arma `Run` (`crates/clawg-cli/src/hook.rs`, junto a `respond`), `hook_log::line` y `input_keys` (`crates/clawg-cli/src/hook_log.rs`); `main.rs` registra con `hook_log::record` |
+| HR1 | `respond_with_run` arma `Run` (`crates/clawg-cli/src/hook.rs`, junto a `respond`), `hook_log::line` y `input_keys` (`crates/clawg-cli/src/hook_log.rs`); `respond_and_record` registra con `hook_log::record_by` |
 | HR2 | `answer` devuelve el motivo de cada salida, `missing_folder` y `daemon_failure`; `respond_with_run` suma `bad_input`, `other_client` y `timed_out` |
 | HR3 | `Run` sólo tiene los campos de la spec; `version_text` corta el texto de `cursor_version` a 32 caracteres; `folder` es `None` con varias raíces (lo decide `folder`, `hook.rs`) |
-| HR4 | `hook_log::append` (una `write_all`, `rename` a 64 KiB, `create(true)` sin `create_dir`), `record` traga el resultado, `main.rs` registra antes de `println!` |
+| HR4 | `hook_log::append` (una `write_all`, `rename` a 64 KiB, `create(true)` sin `create_dir`), `record` traga el resultado, `respond_and_record` devuelve la salida después de registrar, `record_by` espera hasta el plazo y no más, `RECORD_RESERVE`, y `shutdown_background` en `main.rs` no espera la escritura al salir |
 | HR8 | `hook_log::cut` y las constantes de largo, `input_keys`; `respond_with_run` corta `agent`, `source` y `folder`, y `version_text` sólo toma un texto JSON |
 | HR5 | `respond` delega en `respond_with_run` y devuelve `.0`; el ayudante de tests es lo único cambiado en los tests de antes |
 | HR6 | `checks::hook_runs`, `age`, `folder_name`, `what_happened` (`crates/clawg-cli/src/doctor/checks.rs`); la lectura, `hook_log::read_runs`, en `doctor/mod.rs`, que no abre el store para esto |
@@ -113,19 +113,36 @@ Una revisión independiente reprodujo siete problemas; cada uno se resolvió con
 
 En la corrida a mano con la entrada de 900.029 bytes, un `cursor_version` que era un objeto con `leak@example.com` y un `{"cwd":5}`, con el binario de tests `target-test/debug/clawg.exe` en un home temporal (borrado al terminar): las tres corridas salieron con 0; `hook-runs.jsonl` quedó con 3 líneas y 713 bytes en total (305, 206 y 199 bytes); `leak@example.com` aparece 0 veces en el archivo y 0 en la salida de `clawg doctor`, que ocupa 5.548 bytes, y `hooks.runs` dice `nothing: the input could not be read` para la de forma equivocada.
 
+### Una escritura trabada
+
+Una revisión posterior encontró que `record` corría sin límite de tiempo entre la respuesta y la impresión: un disco o un recurso de red que no responde demoraba la respuesta sin tope. Ahora la escritura corre en un hilo aparte y se la espera hasta el plazo (HR4). Esperar sólo lo que queda del plazo deja sin tiempo a una corrida `timed_out`, que antes siempre escribía su línea, así que `session-start` le reserva 50 ms.
+
+Medido en Windows, con 16 núcleos; «cargada» son 32 procesos ocupados:
+
+| Medida | Máquina libre | Máquina cargada |
+|---|---|---|
+| Una escritura, 400 veces en un directorio temporal, dos tandas | mediana 0,4 ms, máximo 1,3 ms | mediana 0,7 ms, máximo 15 ms |
+| Líneas `timed_out` del binario con stdin abierto, sin reserva | 25 de 26 | 12 de 12 |
+| Las mismas, con 50 ms de reserva | 20 de 20 | 12 de 12 |
+
+Los conteos son pocos para distinguir las dos variantes: sin reserva la línea depende de una carrera con la salida del proceso, que se perdió una vez. Los 50 ms salen de la primera fila, el triple del peor caso.
+
 ### Mutaciones
 
 | Mutación | Resultado |
 |---|---|
 | Quitar el filtro de `folder` para `other_client` | Sobrevivía; ahora la mata `every_session_start_names_why` |
-| Imprimir antes de registrar en `main.rs` | Sobrevive: ningún test fija ese orden. No se armó nada para eso; que el registro vaya antes de imprimir es lo que dice la spec (HR4) y lo que hace `main.rs`, y un cambio de orden no lo detecta ningún test |
+| Imprimir antes de registrar | Ya no se puede desde `main.rs`, que recibe la salida de `respond_and_record` una vez registrada; `a_session_start_out_of_time_still_leaves_its_line_by_the_deadline` fija que la línea está cuando esa función vuelve |
+| Esperar la escritura sin límite | La mata `a_write_held_up_is_not_waited_for_past_the_deadline`: la espera dura los 10 s que el test retiene la escritura |
+| Dejar `RECORD_RESERVE` en cero | La mata `a_session_start_out_of_time_still_leaves_its_line_by_the_deadline`: la respuesta usa los 3 s enteros |
 
 ## Lo que no se vio
 
 - Windows en CI: no hay pull request. Lo de Windows de este cambio (`rename` sobre un archivo que existe, `OpenOptions::append`) corrió sólo en la suite local.
 - Dos hooks que rotan a la vez: cada uno decide por el tamaño que vio, y el segundo puede renombrar el archivo nuevo de un primero que ya rotó, y reemplazar `hook-runs.1.jsonl` por un archivo casi vacío. Pierde la generación vieja, nunca una línea del archivo en uso. No hay test de esa carrera.
 - Un `sessionStart` de Cursor real: nada de este cambio prueba qué manda Cursor ni que el contexto llegue al agente. Es lo que `clawg doctor` va a mostrar después, en prod.
+- Una escritura trabada de punta a punta en Windows: `a_record_that_cannot_be_written_does_not_hold_up_the_answer` usa un FIFO y es sólo de Unix. En Windows se compiló sin su `cfg(unix)` pero no corrió, y lo que corre es `a_write_held_up_is_not_waited_for_past_the_deadline`, que no pasa por `main`. Tampoco se midió la carrera de la línea `timed_out` en Unix.
 
 ## Veredicto
 
-Sin CRITICAL en Windows local, después de la revisión. Falta el CI de Windows del pull request, que queda como WARNING; el orden entre registrar e imprimir no lo fija ningún test.
+Sin CRITICAL en Windows local, después de la revisión. Falta el CI del pull request, que queda como WARNING: el de Windows por lo de arriba, y el de Linux por el test del FIFO.
