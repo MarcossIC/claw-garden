@@ -369,6 +369,11 @@ async fn fetch_auto_rows(
             // this one must not, or the same preference has to be re-taught
             // once per project. Narrowing it is a behavior change, not a fix.
             //
+            // Only a preference the user stated enters on its own: this section
+            // reaches every session before any query, as a standing rule, and
+            // one the agent inferred, concluded or copied from what it read is
+            // still found by searching, marked as such.
+            //
             // All three memory queries drop superseded rows but keep disputed
             // ones: a disputed row ranks like an active one everywhere else,
             // and the conflicts block reaches the prompt for every row this
@@ -376,6 +381,7 @@ async fn fetch_auto_rows(
             let mut stmt = c.prepare(
                 "SELECT id, content, importance, created_at FROM memory
                  WHERE memory_type = 'user_preference'
+                   AND created_by_type = 'user'
                    AND importance >= 8
                    AND agent_id = ?1
                    AND tier = 1
@@ -1875,5 +1881,52 @@ mod tests {
                 "preference {id} describes the person, not the project, so it must survive scoping"
             );
         }
+    }
+
+    /// A tier-1 preference of importance 9, sealed with `source` and
+    /// `created_by_type` as a save leaves them.
+    async fn insert_sealed_preference(
+        store: &MemoryStore,
+        agent_id: &str,
+        project_id: Option<&str>,
+        content: &str,
+        source: &str,
+        created_by_type: &str,
+    ) -> i64 {
+        let (agent, project, content) = (agent_id.to_string(), project_id.map(str::to_owned), content.to_string());
+        let (source, by) = (source.to_string(), created_by_type.to_string());
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', ?1, ?2, ?3, 'user_preference', ?4, 0, ?5, ?1, 0, 0, 9.0, 1, 'active')",
+                    rusqlite::params![agent, project, content, source, by],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_a_preference_the_user_stated_enters_the_workspace() {
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let inferred = insert_sealed_preference(&store, "agent-seal", None, "inferred tabs", "explicit", "agent").await;
+        let stated = insert_sealed_preference(&store, "agent-seal", None, "stated tabs", "explicit", "user").await;
+        let concluded = insert_sealed_preference(&store, "agent-seal", None, "concluded tabs", "synthesis", "agent").await;
+
+        let emitted = wm.regenerate_auto_section("agent-seal", None, &store).await.unwrap();
+
+        assert!(emitted.contains(TableKind::Memory, stated), "what the user said opens every session");
+        for id in [inferred, concluded] {
+            assert!(!emitted.contains(TableKind::Memory, id), "#{id} is the agent's, reached by searching");
+        }
+        let file = tokio::fs::read_to_string(wm.workspace_path("agent-seal", None)).await.unwrap();
+        assert!(file.contains("- stated tabs\n") && !file.contains("inferred tabs") && !file.contains("concluded tabs"), "{file}");
     }
 }

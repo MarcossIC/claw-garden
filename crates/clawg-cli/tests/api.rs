@@ -1707,16 +1707,16 @@ async fn context_says_how_many_hits_it_withheld() {
     assert_eq!(body["retrieval"], json!({ "state": "searched", "hits": 0, "withheld": 4 }));
 }
 
-/// Standing preferences are never cut, so a workspace of many long ones
-/// overflows any budget and the closing note names the one that applied.
+/// Standing preferences the user stated fill the workspace, so a workspace
+/// of many long ones overflows any budget and the closing note names the one
+/// that applied.
 #[tokio::test]
 async fn context_takes_a_budget_and_clamps_it() {
     let h = Harness::start().await;
     for i in 0..20 {
         let content = format!("preference {i}: {}", "always keep the error path explicit ".repeat(40));
-        let (status, body) = h
-            .post_json("/v1/memories", json!({ "content": content, "agent_id": "a", "memory_type": "user_preference", "importance": 9.0 }))
-            .await;
+        let save = json!({ "content": content, "agent_id": "a", "memory_type": "user_preference", "importance": 9.0, "user_stated": true });
+        let (status, body) = h.post_json("/v1/memories", save).await;
         assert_eq!(status, 201, "{body}");
     }
     let context = |budget: Value| {

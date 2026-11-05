@@ -3513,15 +3513,16 @@ mod tests {
         assert!(hits.contains(&format!("#{asked} ")), "the hit the query asked for is shown: {prompt}");
     }
 
-    /// A preference of `agent_id` in `project_id` that the workspace prints,
-    /// `age_days` old.
+    /// A preference the user stated to `agent_id` in `project_id`, which the
+    /// workspace prints, `age_days` old.
     async fn seed_preference(store: &MemoryStore, agent_id: &str, project_id: Option<&str>, content: &str, importance: f64, age_days: i64) -> i64 {
         let id = seed_dated(store, agent_id, project_id, content, age_days).await;
         store
             .conn
             .call(move |c| {
                 c.execute(
-                    "UPDATE memory SET memory_type = 'user_preference', importance = ?2, tier = 1 WHERE id = ?1",
+                    "UPDATE memory SET memory_type = 'user_preference', created_by_type = 'user', importance = ?2, tier = 1
+                     WHERE id = ?1",
                     rusqlite::params![id, importance],
                 )
             })
@@ -4006,7 +4007,11 @@ mod tests {
         store
             .conn
             .call(move |c| {
-                c.execute("UPDATE memory SET memory_type = 'user_preference', importance = 9.0, tier = 1 WHERE id = ?1", [shown])?;
+                c.execute(
+                    "UPDATE memory SET memory_type = 'user_preference', created_by_type = 'user', importance = 9.0, tier = 1
+                     WHERE id = ?1",
+                    [shown],
+                )?;
                 c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [gone])
             })
             .await
