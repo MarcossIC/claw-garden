@@ -3825,6 +3825,106 @@ mod tests {
         assert!(conflicts.contains(&format!("#{old_id}")) && conflicts.contains(&format!("#{new_id}")), "{conflicts}");
     }
 
+    /// A preference as the previous version wrote it: tier 1, importance 9,
+    /// sealed `source` / `created_by_type`, with the query's vector.
+    async fn seed_sealed_preference(store: &MemoryStore, project_id: Option<&str>, content: &str, by: &str) -> i64 {
+        let (project, content, by) = (project_id.map(str::to_owned), content.to_string(), by.to_string());
+        let mut near = vec![0.0_f32; 384];
+        near[0] = 1.0;
+        let bytes = unit_bytes(&near);
+        let ts = TimestampMs::now().as_millis_i64() - 30 * 86_400_000;
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', 'agent-1', ?1, ?2, 'user_preference', 'explicit', ?3, ?4, 'agent-1', ?3, ?3, 9.0, 1, 'active')",
+                    rusqlite::params![project, content, ts, by],
+                )?;
+                let id = c.last_insert_rowid();
+                c.execute("INSERT INTO memory_vectors (rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_preference_out_of_the_workspace_is_still_found() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let inferred = seed_sealed_preference(&store, Some("P1"), "indent this repository with tabs", "agent").await;
+        let elsewhere = seed_sealed_preference(&store, Some("P2"), "indent the other repository with spaces", "user").await;
+        let before_the_seal = seed_sealed_preference(&store, Some("P1"), "answer in short sentences", "user").await;
+        let columns = |id: i64| {
+            let store = store.clone();
+            async move {
+                store
+                    .conn
+                    .call(move |c| {
+                        c.query_row(
+                            "SELECT agent_id, project_id, source, created_by_type, importance, tier, status, content
+                             FROM memory WHERE id = ?1",
+                            [id],
+                            |r| {
+                                Ok(format!(
+                                    "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, Option<String>>(1)?,
+                                    r.get::<_, String>(2)?,
+                                    r.get::<_, String>(3)?,
+                                    r.get::<_, f64>(4)?,
+                                    r.get::<_, i64>(5)?,
+                                    r.get::<_, String>(6)?,
+                                    r.get::<_, String>(7)?
+                                ))
+                            },
+                        )
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut before = Vec::new();
+        for id in [inferred, elsewhere, before_the_seal] {
+            before.push(columns(id).await);
+        }
+
+        let emitted = wm.regenerate_auto_section("agent-1", Some("P1"), &store).await.unwrap();
+        let prompt = build_memory_prompt(
+            Lang::En,
+            &store,
+            &wm,
+            Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
+            "agent-1",
+            Some("P1"),
+            &Reach::Own,
+            QueryTexts::single_shot("how to indent"),
+            &emitted,
+            None,
+            DEFAULT_BUDGET,
+        )
+        .await
+        .unwrap()
+        .text;
+
+        let workspace = block(&prompt, SEP_WORKSPACE).unwrap_or_else(|| panic!("{prompt}"));
+        assert!(workspace.contains("answer in short sentences"), "a row from before the seal is the user's: {prompt}");
+        assert!(!workspace.contains("indent"), "{prompt}");
+        let hits = [block(&prompt, SEP_RECENT), block(&prompt, SEP_LONGTERM)].into_iter().flatten().collect::<String>();
+        for id in [inferred, elsewhere] {
+            assert!(hits.contains(&format!("#{id} ")), "#{id} left the workspace and is still found: {prompt}");
+        }
+        let mut after = Vec::new();
+        for id in [inferred, elsewhere, before_the_seal] {
+            after.push(columns(id).await);
+        }
+        assert_eq!(after, before, "no row is rewritten");
+    }
+
     #[tokio::test]
     async fn a_hidden_side_keeps_its_pair_out() {
         let store = MemoryStore::new_for_test().await.unwrap();

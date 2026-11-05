@@ -361,13 +361,13 @@ async fn fetch_auto_rows(
         .call(move |c| -> Result<AutoRows, rusqlite::Error> {
             // Query 1: user_preference rows with importance >= 8.
             //
-            // Filtered by agent only, deliberately: a preference describes the
-            // person the agent is working with — how they want to be spoken to,
-            // what they never want done — and that does not stop being true
-            // when they switch projects. The other two queries below scope by
-            // project because a decision or a skill belongs to a codebase;
-            // this one must not, or the same preference has to be re-taught
-            // once per project. Narrowing it is a behavior change, not a fix.
+            // Scoped to the project or none, like the decisions below: a rule
+            // the user gave for one repository is not a rule for the others,
+            // and one that holds wherever they work is saved without a
+            // project, so it enters every workspace. Without a project the
+            // listing is unscoped, as for the other two queries. The search
+            // still reaches every preference from any project, so one of
+            // another repository is found when it is asked for.
             //
             // Only a preference the user stated enters on its own: this section
             // reaches every session before any query, as a standing rule, and
@@ -384,13 +384,14 @@ async fn fetch_auto_rows(
                    AND created_by_type = 'user'
                    AND importance >= 8
                    AND agent_id = ?1
+                   AND (?2 IS NULL OR project_id = ?2 OR project_id IS NULL)
                    AND tier = 1
                    AND deleted_at IS NULL
                    AND status <> 'superseded'
                  ORDER BY importance DESC",
             )?;
             let user_prefs: Vec<MemoryLine> = readable(
-                stmt.query_map(rusqlite::params![agent], map_memory)?,
+                stmt.query_map(rusqlite::params![agent, proj], map_memory)?,
                 "user_preference",
             );
 
@@ -1856,30 +1857,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_preferences_cross_project_boundaries() {
+    async fn a_preference_of_another_project_stays_out_of_the_workspace() {
         let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let store = MemoryStore::new_for_test().await.unwrap();
+        let here = insert_tier1_memory_with_project(&store, "agent-prefs", Some("P1"), "prefiere voseo", "user_preference", 9.0).await;
+        let there = insert_tier1_memory_with_project(&store, "agent-prefs", Some("P2"), "prefiere tabs", "user_preference", 9.0).await;
+        let everywhere = insert_tier1_memory_with_project(&store, "agent-prefs", None, "prefiere commits cortos", "user_preference", 9.0).await;
 
-        let p1 = insert_tier1_memory_with_project(
-            &store, "agent-prefs", Some("P1"), "prefiere voseo", "user_preference", 9.0,
-        )
-        .await;
-        let p2 = insert_tier1_memory_with_project(
-            &store, "agent-prefs", Some("P2"), "prefiere tabs", "user_preference", 9.0,
-        )
-        .await;
+        let emitted = wm.regenerate_auto_section("agent-prefs", Some("P1"), &store).await.unwrap();
 
-        let emitted = wm
-            .regenerate_auto_section("agent-prefs", Some("P1"), &store)
-            .await
-            .unwrap();
+        assert!(emitted.contains(TableKind::Memory, here), "a rule of this project is shown in it");
+        assert!(emitted.contains(TableKind::Memory, everywhere), "a rule saved without a project holds in every one");
+        assert!(!emitted.contains(TableKind::Memory, there), "a rule of another repository is not this one's");
+    }
 
-        for id in [p1, p2] {
-            assert!(
-                emitted.contains(TableKind::Memory, id),
-                "preference {id} describes the person, not the project, so it must survive scoping"
-            );
+    #[tokio::test]
+    async fn an_unscoped_workspace_takes_the_preferences_of_every_project() {
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mut ids = Vec::new();
+        for project in [Some("P1"), Some("P2"), None] {
+            ids.push(insert_tier1_memory_with_project(&store, "agent-any", project, &format!("rule of {project:?}"), "user_preference", 9.0).await);
+        }
+
+        let emitted = wm.regenerate_auto_section("agent-any", None, &store).await.unwrap();
+
+        for id in ids {
+            assert!(emitted.contains(TableKind::Memory, id), "a workspace of no project lists #{id}, as it lists every decision");
         }
     }
 
