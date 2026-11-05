@@ -4132,6 +4132,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recent_preference_shows_its_origin() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let inferred = seed_dated(&store, "agent-1", None, "tabs in the go service", 1).await;
+        let stated = seed_dated(&store, "agent-1", None, "short answers", 1).await;
+        let fact = seed_dated(&store, "agent-1", None, "the go service builds with make", 1).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET memory_type = 'user_preference' WHERE id IN (?1, ?2)", [inferred, stated])?;
+                c.execute("UPDATE memory SET created_by_type = 'user' WHERE id = ?1", [stated])
+            })
+            .await
+            .unwrap();
+
+        let text = session_prompt(&store, "agent-1", None).await.text;
+
+        let recent = block(&text, SEP_RECENT).unwrap_or_else(|| panic!("{text}"));
+        assert!(recent.contains(&format!("#{inferred} user_preference inferred] tabs")), "{text}");
+        assert!(recent.contains(&format!("#{stated} user_preference] short")), "{text}");
+        assert!(recent.contains(&format!("#{fact} semantic_fact] the go")), "only a preference is marked: {text}");
+    }
+
+    #[tokio::test]
     async fn a_context_without_a_query_skips_what_the_workspace_showed_and_the_dead() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let shown = seed_dated(&store, "agent-1", None, "tabs over spaces in every file", 1).await;
