@@ -614,6 +614,10 @@ pub struct SavedText {
     /// The project of the row asked for, read as [`Hit::project_id`] is.
     #[serde(default, deserialize_with = "sent")]
     pub project_id: Option<Option<String>>,
+    /// The type of the row asked for. A daemon that predates the field does
+    /// not send it.
+    #[serde(default)]
+    pub memory_type: Option<String>,
 }
 
 #[derive(Serialize)]

@@ -99,3 +99,15 @@ Una base con filas escritas como las escribe la versión anterior MUST abrirse s
 - AND las tres conservan su `agent_id`, `project_id`, `source`, `created_by_type`, importancia, tier, estado y contenido
 
 **Test:** `a_preference_out_of_the_workspace_is_still_found` (`prompt_builder.rs`). Hoy falla: las tres entran al workspace y ninguna es un hit.
+
+## PM8. Una preferencia sin proyecto se reemplaza con `all_projects`
+
+Cambia «La clave de tema en las herramientas» de [`specs/mcp`](../../specs/mcp/spec.md), que cuenta una fila sin proyecto como de otro proyecto. Desde un puente con proyecto, `search_memory` y `read_memory` MUST mostrar la clave de una `user_preference` sin proyecto como ` topic=K all_projects`, en el lugar de ` topic=K`, porque un save con `all_projects` y esa clave la revisa ([`specs/ingest`](../../specs/ingest/spec.md), «Alcance de una clave»). Cualquier otra fila sin proyecto MUST seguir sin mostrarla, y un puente sin proyecto MUST seguir viendo ` topic=K`. `GET /v1/memories/{kind}/{id}/save` MUST mandar `memory_type` en una fila que lo tiene; una respuesta sin él, de un daemon anterior, MUST leerse como hasta ahora. `protocol.md` y `protocol.es.md` MUST decir, en «How to write a save» y en «Cómo escribir un save», cómo se reemplaza esa preferencia.
+
+#### Escenario: reemplazar una preferencia general
+- GIVEN una `user_preference` con la clave `style/indent` guardada con `all_projects`, y un puente en el proyecto P
+- WHEN el agente la encuentra con `search_memory` o la lee con `read_memory`
+- THEN ve `topic=style/indent all_projects`
+- AND un save con `all_projects` y esa clave responde que la reemplaza, y la fila nueva tampoco tiene proyecto
+
+**Tests:** `a_hit_without_a_project_shows_how_a_save_revises_it`, que reemplaza a `a_hit_without_a_project_shows_its_key_only_to_a_bridge_without_one`, `a_marked_key_stays_before_the_author_of_the_hit` y `format_save_shows_the_key_only_where_a_save_revises_it` (`crates/clawg-cli/src/mcp/tools.rs`); `a_preference_of_every_project_is_replaced_with_all_projects_and_the_key_shown` y `the_protocol_says_where_a_key_is_shown` (`crates/clawg-cli/src/mcp/server.rs`).

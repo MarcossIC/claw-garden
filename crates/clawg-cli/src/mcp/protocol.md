@@ -74,8 +74,10 @@ Every row competes with the others in search, so leave out:
   agent saved, so pick a name that says the topic, never a generic word. `search_memory` and
   `read_memory` show a memory's key as `topic=K` only where saving under it
   replaces that memory: save its new version under that key, the one shown,
-  never a new one. A memory of another project, or of none, shows no key,
-  since a save here would keep it beside the new one.
+  never a new one. A preference saved without a project shows
+  `topic=K all_projects`: save its new version with `all_projects` and that key.
+  Any other memory of another project, or of none, shows no key, since a save
+  here would keep it beside the new one.
 - Write it so it reads on its own months from now, with no conversation
   around it.
 - Write it in English, and search in English too. A memory saved in one

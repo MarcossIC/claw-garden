@@ -76,8 +76,10 @@ Cada fila compite con las demás en la búsqueda, así que deja afuera:
   palabra genérica. `search_memory` y `read_memory` muestran la clave de una
   memoria como `topic=K` sólo donde guardar bajo ella reemplaza esa memoria:
   guarda su versión nueva bajo esa clave, la que se muestra, nunca una nueva.
-  Una memoria de otro proyecto, o de ninguno, no muestra clave, porque un save
-  aquí la dejaría al lado de la nueva.
+  Una preferencia guardada sin proyecto muestra `topic=K all_projects`: guarda
+  su versión nueva con `all_projects` y esa clave. Cualquier otra memoria de
+  otro proyecto, o de ninguno, no muestra clave, porque un save aquí la dejaría
+  al lado de la nueva.
 - Escríbela para que se lea sola dentro de meses, sin ninguna conversación
   alrededor.
 - Escríbela en español, y busca en español también. Una memoria guardada en

@@ -26,6 +26,8 @@ Cada test se corrió antes del código que lo hace pasar, salvo los dos que la t
 | PM5 | `a_marked_preference_is_one_segment` (`crates/clawg-eval/src/bin/rag-eval/agent_view/parse.rs`) | El parser del agent view no leía una línea marcada como hit: daba `[]` |
 | PM4 | `a_save_for_every_project_has_no_project`, `all_projects_goes_without_a_project` | No compilaban: `save_memory` no tenía `all_projects` |
 | PM6 | `the_protocol_says_which_preferences_open_every_session` | Con el protocolo de antes: `Type and importance names user_stated` |
+| PM8 | `a_hit_without_a_project_shows_how_a_save_revises_it`, `a_marked_key_stays_before_the_author_of_the_hit`, `format_save_shows_the_key_only_where_a_save_revises_it`, `a_preference_of_every_project_is_replaced_with_all_projects_and_the_key_shown` | El hit y `read_memory` no mostraban la clave: `#68\ntabs` |
+| PM8 | `the_protocol_says_where_a_key_is_shown` | El protocolo decía que una memoria sin proyecto no muestra clave |
 
 **Tests que cambiaron, y por qué:**
 
@@ -34,6 +36,7 @@ Cada test se corrió antes del código que lo hace pasar, salvo los dos que la t
 - `seed_preference` y el fixture de `a_context_without_a_query_skips_what_the_workspace_showed_and_the_dead` (`prompt_builder.rs`), y `context_takes_a_budget_and_clamps_it` (`crates/clawg-cli/tests/api.rs`), siembran preferencias declaradas: son las que el workspace imprime y lo que esos tests necesitan.
 - `ranked_hit_serializes_to_json` (`crates/clawg-core/tests/public_api.rs`) suma que `origin` se omite sin marca y se manda con ella.
 - `every_origin_a_row_can_show_is_known` (`parse.rs`) ata las marcas que el parser reconoce a las que da `provenance::mark`.
+- `a_hit_without_a_project_shows_how_a_save_revises_it` reemplaza a `a_hit_without_a_project_shows_its_key_only_to_a_bridge_without_one`, que ya no es cierto para una preferencia (PM8).
 
 ## La spec contra el código
 

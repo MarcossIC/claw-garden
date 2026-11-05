@@ -179,6 +179,23 @@ fn revised_from(row_project: &Option<Option<String>>, save_project: Option<&str>
     row_project.as_ref().is_none_or(|p| p.as_deref() == save_project)
 }
 
+/// A row's key as a search hit or `read_memory` shows it: only where a save can
+/// revise the row under it, since a key of another project would promise a
+/// revision the reader cannot make. From a bridge with a project, a preference
+/// without one is revised only by a save with `all_projects`, and says so.
+fn shown_key(key: Option<&str>, memory_type: Option<&str>, row_project: &Option<Option<String>>, save_project: Option<&str>) -> String {
+    let Some(key) = key else {
+        return String::new();
+    };
+    if revised_from(row_project, save_project) {
+        format!(" topic={key}")
+    } else if matches!(row_project, Some(None)) && memory_type == Some("user_preference") {
+        format!(" topic={key} all_projects")
+    } else {
+        String::new()
+    }
+}
+
 /// The author of a hit `reader` did not save, if any. A hit without an author
 /// is a row no agent saved, or comes from a daemon that predates sharing,
 /// where every hit was the reader's own: either way there is nobody to name.
@@ -204,15 +221,7 @@ fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_project: Option<&str
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             let author = shared_author(h, reader);
             let by = author.map(|a| format!(" by {}", display_author(a))).unwrap_or_default();
-            // A save under a key revises the rows of the project it goes to,
-            // whoever saved them, so a key of another project would promise a
-            // revision the reader cannot make.
-            let topic = h
-                .topic_key
-                .as_deref()
-                .filter(|_| revised_from(&h.project_id, save_project))
-                .map(|k| format!(" topic={k}"))
-                .unwrap_or_default();
+            let topic = shown_key(h.topic_key.as_deref(), Some(&h.memory_type), &h.project_id, save_project);
             format!(
                 "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{topic}{by}] {}",
                 i + 1,
@@ -305,12 +314,7 @@ pub fn format_open_pairs(lang: Lang, open: &OpenPairs) -> String {
 /// is named, so the model knows the text has a gap there. The key shows only
 /// when a save in `save_project` would revise the row, as on a search hit.
 pub fn format_save(lang: Lang, save: &SavedText, save_project: Option<&str>) -> String {
-    let topic = save
-        .topic_key
-        .as_deref()
-        .filter(|_| revised_from(&save.project_id, save_project))
-        .map(|k| format!(" topic={k}"))
-        .unwrap_or_default();
+    let topic = shown_key(save.topic_key.as_deref(), save.memory_type.as_deref(), &save.project_id, save_project);
     if save.pieces <= 1 {
         return format!("#{}{topic}\n{}", save.id, save.text);
     }
@@ -1415,11 +1419,28 @@ mod tests {
         assert!(format_hits(Lang::En, &[elsewhere], "a", Some("other")).contains(" score=0.56 topic=style/indent]"));
     }
 
+    /// A bridge with a project revises a preference of every project only by
+    /// saving with `all_projects`, so the hit says so. Another row without a
+    /// project keeps its key to a bridge without one.
     #[test]
-    fn a_hit_without_a_project_shows_its_key_only_to_a_bridge_without_one() {
+    fn a_hit_without_a_project_shows_how_a_save_revises_it() {
         let unplaced = placed(preference(68), None);
-        assert!(!format_hits(Lang::En, std::slice::from_ref(&unplaced), "a", Some("here")).contains("topic="));
+        assert!(
+            format_hits(Lang::En, std::slice::from_ref(&unplaced), "a", Some("here")).contains(" score=0.56 topic=style/indent all_projects]")
+        );
         assert!(format_hits(Lang::En, &[unplaced], "a", None).contains(" score=0.56 topic=style/indent]"));
+
+        let fact = placed(keyed(hit(68, "Memory", "semantic_fact", 2, 0.56, "tabs"), "style/indent"), None);
+        assert!(!format_hits(Lang::En, std::slice::from_ref(&fact), "a", Some("here")).contains("topic="));
+        assert!(format_hits(Lang::En, &[fact], "a", None).contains(" score=0.56 topic=style/indent]"));
+    }
+
+    #[test]
+    fn a_marked_key_stays_before_the_author_of_the_hit() {
+        let shared = Hit { agent_id: Some("cursor".into()), ..placed(preference(68), None) };
+        assert!(
+            format_hits(Lang::En, &[shared], "a", Some("here")).contains(" score=0.56 topic=style/indent all_projects by cursor] tabs")
+        );
     }
 
     #[test]
@@ -1584,6 +1605,7 @@ mod tests {
             text: "first and second\nfourth".into(),
             topic_key: None,
             project_id: None,
+            memory_type: None,
         };
         assert_eq!(
             format_save(Lang::En, &save, None),
@@ -1605,6 +1627,7 @@ mod tests {
             text: "short".into(),
             topic_key: Some("cli/export-format".into()),
             project_id: None,
+            memory_type: None,
         };
         assert_eq!(format_save(Lang::En, &single, None), "#68 topic=cli/export-format\nshort");
         let piece = SavedText { piece: 2, pieces: 3, ids: vec![Some(67), Some(68), Some(69)], ..single };
@@ -1626,9 +1649,17 @@ mod tests {
             text: "tabs".into(),
             topic_key: Some("style/indent".into()),
             project_id: Some(Some("other".into())),
+            memory_type: Some("user_preference".into()),
         };
         assert_eq!(format_save(Lang::En, &save, Some("here")), "#68\ntabs");
         assert_eq!(format_save(Lang::En, &save, Some("other")), "#68 topic=style/indent\ntabs");
+        let every_project = SavedText { project_id: Some(None), ..save.clone() };
+        assert_eq!(format_save(Lang::En, &every_project, Some("here")), "#68 topic=style/indent all_projects\ntabs");
+        assert_eq!(format_save(Lang::En, &every_project, None), "#68 topic=style/indent\ntabs");
+        let a_fact = SavedText { memory_type: Some("semantic_fact".into()), ..every_project.clone() };
+        assert_eq!(format_save(Lang::En, &a_fact, Some("here")), "#68\ntabs");
+        let no_type_sent = SavedText { memory_type: None, ..every_project };
+        assert_eq!(format_save(Lang::En, &no_type_sent, Some("here")), "#68\ntabs", "a daemon that does not send the type");
         let from_an_older_daemon = SavedText { project_id: None, ..save };
         assert_eq!(format_save(Lang::En, &from_an_older_daemon, Some("here")), "#68 topic=style/indent\ntabs");
     }
@@ -2337,6 +2368,7 @@ mod tests {
             text: "texto".into(),
             topic_key: None,
             project_id: None,
+            memory_type: None,
         };
         assert_eq!(format_save(Lang::Es, &save, None), "#5 es la pieza 2 de 3 de un save: #4, #5, (falta)\ntexto");
     }

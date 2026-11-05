@@ -50,6 +50,9 @@ pub struct SaveText {
     /// The project the row asked for was saved in, `None` without one; sent
     /// as `null` rather than left out, as a search hit's is.
     pub project_id: Option<String>,
+    /// The type of the row asked for, which only `memory` rows have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_type: Option<String>,
 }
 
 /// Shortest repeated text treated as the overlap between two neighbours;
@@ -118,6 +121,7 @@ pub async fn read_save_core(
     }
     let topic_key = row.topic_key.clone();
     let project_id = row.project_id.clone();
+    let memory_type = row.memory_type.clone();
     let single = |text: String| SaveText {
         kind,
         id,
@@ -128,6 +132,7 @@ pub async fn read_save_core(
         text,
         topic_key: topic_key.clone(),
         project_id: project_id.clone(),
+        memory_type: memory_type.clone(),
     };
     if kind != MemoryKind::Memory {
         return Ok(Some(single(row.summary)));
@@ -184,6 +189,7 @@ pub async fn read_save_core(
         text,
         topic_key,
         project_id,
+        memory_type,
     }))
 }
 

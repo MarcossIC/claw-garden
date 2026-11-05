@@ -2750,6 +2750,7 @@ mod tests {
         let save = save.split("\n## ").next().unwrap_or(save).split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(save.contains("only where saving under it replaces"), "{save}");
         assert!(save.contains("another project"), "{save}");
+        assert!(save.contains("`topic=K all_projects`: save its new version with `all_projects` and that key"), "{save}");
     }
 
     #[test]
@@ -3998,6 +3999,30 @@ mod tests {
         assert!(!text(&again).contains("replaces"), "{}", text(&again));
         assert_eq!(rows_in(&b, &other.id).await, 1);
         assert_eq!(rows_in(&b, &test_project().id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_preference_of_every_project_is_replaced_with_all_projects_and_the_key_shown() {
+        let (b, _d) = bridge().await;
+        let general = |content: &str| SaveMemoryArgs {
+            memory_type: Some("user_preference".into()),
+            topic_key: Some("style/indent".into()),
+            all_projects: Some(true),
+            ..save_args(content)
+        };
+        let saved = b.save_memory_impl("a", general("Indent with tabs")).await.unwrap();
+        let id = text(&saved).trim_start_matches("saved #").parse::<i64>().expect("an id");
+
+        let args = SearchMemoryArgs { query: "Indent with tabs".into(), limit: None, project_path: None, project: None, all_projects: None };
+        let found = text(&b.search_memory_impl("a", args).await.unwrap());
+        assert!(found.contains(" topic=style/indent all_projects]"), "{found}");
+        let read = text(&b.read_memory_impl("a", ReadMemoryArgs { id, kind: None }).await.unwrap());
+        assert_eq!(read, format!("#{id} topic=style/indent all_projects\nIndent with tabs"));
+
+        let again = text(&b.save_memory_impl("a", general("Indent with two spaces")).await.unwrap());
+        assert!(again.contains(&format!("replaces #{id}")), "{again}");
+        let new = again.trim_start_matches("saved #").split(';').next().unwrap().parse::<i64>().expect("an id");
+        assert_eq!(project_of(&b, new).await, None, "the new version holds in every project too");
     }
 
     #[tokio::test]
