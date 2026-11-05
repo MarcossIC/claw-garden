@@ -23,27 +23,16 @@ Qué sigue y en qué orden. Es el único lugar que ordena lo pendiente: [README.
 
 Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismos archivos.
 
-## Antes de la primera noche (a mano)
-
-- Apagar en Cursor "Include Third-Party Plugins, Skills, and Other Configs" (Settings → Agents → Third-Party Imports). En Windows, los hooks `.sh` de un plugin de Claude Code abren una ventana de Git Bash. Va antes de instalar cualquier hook de clawg.
-- Publicar lo que hay en `develop`. Su pull request corre el CI que le falta al último arreglo de [hook-run-log](changes/archive/2026-11-04-hook-run-log/verify.md#veredicto), y lo que marque se arregla aparte.
-
 ## Noche 1
 
-| Cambio | Dónde | Qué deja resuelto |
-|---|---|---|
-| [history-reimport](changes/history-reimport/exploration.md), ensayo | Local: copia del store, export, transcripciones, línea base | Si el rendimiento mejoró de verdad, y un mapa para las notas sin proyecto |
-
-**Al otro día, con la persona:** decidir [preference-model](changes/preference-model/exploration.md) y hacer la prueba de 10 minutos de [bridge-project-identity](changes/bridge-project-identity/exploration.md).
-
-## Noche 2
+**Antes, con la persona:** la [prueba de 10 minutos](changes/bridge-project-identity/exploration.md#la-prueba-que-falta-local-10-minutos-con-una-persona) de bridge-project-identity con Cursor real. Sin ella, ese cambio no entra en la noche.
 
 | Cambio | Dónde | Necesita antes |
 |---|---|---|
-| [preference-model](changes/preference-model/proposal.md) | Nube | Las decisiones, cerradas en la exploración. Aplicado y verificado en Linux y en el CI de Windows, con un PR abierto a `develop` ([verify](changes/preference-model/verify.md)); falta revisarlo, medir contra `prod` lo pendiente en local y archivarlo |
-| [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | La prueba con Cursor real |
+| [preference-model](changes/preference-model/verify.md#pendiente-en-local), cierre | Local: una copia aislada de `prod`, el modelo real y el golden fuera de git | Nada: salió en 0.77.0. Mide contra la copia los tres primeros puntos pendientes en local (el cuarto, Cursor real, va en el piloto), se archiva y sube el minor |
+| [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | La prueba con Cursor real, de arriba |
 
-## Noche 3
+## Noche 2
 
 | Cambio | Dónde | Por qué acá |
 |---|---|---|
@@ -52,7 +41,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 ## Piloto (una semana de trabajo real, no una noche)
 
-Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario, con una excepción: Cursor se conecta con `clawg setup cursor --profile prod`, porque esa es la prueba con Cursor real ([pendiente en prod](changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)). Esa instalación también es a nivel usuario y afecta a cada ventana de Cursor, no sólo a este repositorio. Los mismos hooks prueban el arranque real de session-start-context ([pendiente en prod](changes/archive/2026-11-04-session-start-context/verify.md#pendiente-en-prod)).
+Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario, con una excepción: Cursor se conecta con `clawg setup cursor --profile prod`, porque esa es la prueba con Cursor real ([pendiente en prod](changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)). Esa instalación también es a nivel usuario y afecta a cada ventana de Cursor, no sólo a este repositorio. Los mismos hooks prueban el arranque real de session-start-context ([pendiente en prod](changes/archive/2026-11-04-session-start-context/verify.md#pendiente-en-prod)), y que una preferencia declarada a Claude Code entre al arranque de Cursor en el mismo proyecto ([preference-model](changes/preference-model/verify.md#pendiente-en-local), punto 4).
 
 **Pasa si:**
 - responde 10 preguntas reales cuya respuesta sólo está en el historial;
@@ -63,6 +52,8 @@ Se publica lo anterior y se instalan los hooks a mano en un repositorio real con
 - la RAM es aceptable: esta semana decide el brazo B de ram-footprint-gates, porque cada evento de hook despierta el modelo.
 
 ## Corte (una noche local, con el piloto aprobado)
+
+Antes, lo que dejó el ensayo de history-reimport en [«Para el corte»](changes/history-reimport/verify.md#para-el-corte): decidir qué snapshots automáticos de `prod` se copian aparte, porque el corte poda algunos, y volver a clasificar las notas de un export nuevo que el mapa no conoce.
 
 Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y después:
 
