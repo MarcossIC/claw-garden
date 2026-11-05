@@ -55,7 +55,7 @@ La sección AUTO MUST imprimir una preferencia elegible sólo si es declarada. U
 
 ## PM4. `save_memory` con `all_projects`
 
-`save_memory` MUST tomar `all_projects`, un booleano opcional (`SaveMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs`). Con `true`, el save MUST llegar al daemon sin `project_id`, sin registrar el directorio del puente. Con `project`, `project_path` o `new_project`, MUST negarse sin llamar al daemon, con una frase que nombra los argumentos, en el idioma de la sesión. Su descripción MUST decir que guarda la memoria sin proyecto, así la lee cada proyecto, y que es para lo que vale en todo proyecto, como una preferencia que la persona tiene en todo lo que hace. Ausente o `false`, el save MUST hacer lo de hoy.
+`save_memory` MUST tomar `all_projects`, un booleano opcional (`SaveMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs`). Con `true`, el save MUST llegar al daemon sin `project_id`. Con `project` o `project_path`, MUST negarse sin llamar al daemon, con una frase que nombra los argumentos, en el idioma de la sesión; `new_project` ya se niega sin `project`. Su descripción MUST decir que guarda la memoria sin proyecto, así la lee cada proyecto, y que es para lo que vale en todo proyecto, como una preferencia que la persona tiene en todo lo que hace. Ausente o `false`, el save MUST hacer lo de hoy.
 
 #### Escenario: una preferencia general
 - GIVEN un puente en el proyecto P
@@ -66,13 +66,13 @@ La sección AUTO MUST imprimir una preferencia elegible sólo si es declarada. U
 - WHEN el agente llama a `save_memory` con `all_projects: true` y `project`, o con `all_projects: true` y `project_path`
 - THEN la respuesta es un error que nombra los dos argumentos, y no se guarda nada
 
-**Tests:** `a_save_for_every_project_has_no_project` y `all_projects_goes_without_a_project` (`server.rs`); `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, bendecidos. Hoy el primero falla porque la fila queda en P, y el segundo porque el save pasa.
+**Tests:** `a_save_for_every_project_has_no_project` y `all_projects_goes_without_a_project` (`server.rs`); `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, bendecidos. Hoy no compilan: `save_memory` no tiene `all_projects`.
 
 ## PM5. Una preferencia que no declaró la persona se marca al buscarla
 
 Un hit de `memory` cuyo `memory_type` es `user_preference` MUST llevar su marca en `RankedHit.origin`, y cualquier otro hit MUST llevar `None`. `POST /v1/search` MUST mandarla como `origin`, y omitirla cuando no hay. El cliente del puente MUST leer un hit sin `origin`, el de un daemon anterior, como sin marca (`Hit.origin`, `crates/clawg-cli/src/client.rs`).
 
-La línea del hit MUST llevar la marca después del tipo, separada por un espacio: `[AAAA-MM-DD #id user_preference inferred] contenido` en `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:851`) y `N. #id [memory/user_preference/t1 inferred score=S] contenido` en `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:192`), antes de `piece=`, `score=`, `topic=` y `by`. Una línea sin marca MUST quedar byte a byte como hoy.
+La línea del hit MUST llevar la marca después del tipo, separada por un espacio: `[AAAA-MM-DD #id user_preference inferred] contenido` en `recall_context` (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:851`) y `N. #id [Memory/user_preference/t1 inferred score=S] contenido` en `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:192`), antes de `piece=`, `score=`, `topic=` y `by`. Vale también para RECENT del contexto sin consulta, que lee `source` y `created_by_type` en su propia consulta e imprime la misma línea. Una línea sin marca MUST quedar byte a byte como hoy.
 
 #### Escenario: tres hits
 - GIVEN una preferencia `explicit` / `agent`, una preferencia `explicit` / `user` y un `semantic_fact` `explicit` / `agent`, cerca de la consulta
@@ -80,7 +80,7 @@ La línea del hit MUST llevar la marca después del tipo, separada por un espaci
 - THEN el hit de la primera trae `origin` `inferred`, y los otros dos no traen nada
 - AND en `recall_context` y en `search_memory` sólo la línea de la primera lleva ` inferred` después del tipo
 
-**Tests:** `a_preference_hit_carries_its_origin` (`crates/clawg-core/src/memory/search.rs`), `a_preference_hit_line_shows_its_origin` (`prompt_builder.rs`), `format_hits_shows_the_origin_of_a_preference` (`tools.rs`) y `a_hit_from_an_old_daemon_has_no_origin` (`client.rs`). Hoy no compilan: el hit no tiene origen.
+**Tests:** `a_preference_hit_carries_its_origin` (`crates/clawg-core/src/memory/search.rs`), `a_preference_hit_line_shows_its_origin` y `a_recent_preference_shows_its_origin` (`prompt_builder.rs`), `format_hits_shows_the_origin_of_a_preference` (`tools.rs`) y `a_hit_from_an_old_daemon_has_no_origin` (`client.rs`). Hoy no compilan: el hit no tiene origen.
 
 ## PM6. El protocolo dice qué preferencias entran solas
 

@@ -1,14 +1,15 @@
 change: preference-model
 objective: "1, 2, 4"
 depends_on: [session-start-context]
-phase: apply
+phase: verify
 artifacts:
   exploration: done  # las decisiones, cerradas: alcance A, entre agentes, sólo lo declarado entra solo
   proposal: done
   spec: done  # PM1 a PM7
   design: skipped  # las decisiones están cerradas en la exploración; la propuesta dice cómo se aplican
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done  # el sello, el proyecto y el alcance del workspace; la marca en los hits; all_projects y el protocolo; docs/reference
+  verify: done  # Linux: la suite y los dos clippy; Windows en el CI del pull request; lo que se mide contra prod queda pendiente en local (verify.md)
   archive: pending
+main_spec: openspec/specs/retrieval/spec.md, openspec/specs/sharing/spec.md, openspec/specs/provenance/spec.md, openspec/specs/mcp/spec.md
 updated: 2026-11-05
