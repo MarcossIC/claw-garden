@@ -101,7 +101,7 @@ diff --git a/crates/clawg-cli/src/mcp/agent_contract.json b/crates/clawg-cli/src
 
 ## Pendiente en local
 
-Lo que se mide contra `prod`. Necesita el store real o una copia, y un binario con este cambio: publicado, o el build debug de esta rama sobre una copia del directorio de datos de `prod` abierta con `--profile dev` (un build debug no abre `prod`). Ninguno de los dos pasos escribe en el store.
+Lo que se mide contra `prod`. Necesita una copia aislada del directorio de datos de `prod` y un binario con este cambio, publicado o el build debug de esta rama. Los dos binarios corren sobre esa copia, abierta con `--profile dev` (un build debug no abre `prod`), y ninguno sobre el `~/.clawg` real, en el que arrancar un daemon puede migrar la base y `POST /v1/context` reescribe `workspace.md`. Cada medición empieza de una copia nueva, por lo mismo.
 
 1. **Las filas elegibles por alcance y por sello**, con una lectura sobre una copia de `memory.db`:
 
@@ -116,7 +116,7 @@ Lo que se mide contra `prod`. Necesita el store real o una copia, y un binario c
    ```
 
    Dice cuántas preferencias de las que hoy entran dejan de entrar por el sello (`created_by_type` distinto de `user`) y cuántas por el proyecto, y cuántas ganan los otros agentes. Es el recuento que la exploración pidió antes del sello, y la entrada de la revisión a mano con la persona, que queda fuera de este cambio.
-2. **Los bytes de `session-start` por proyecto, antes y después.** Para cada proyecto con filas, `POST /v1/context` sin `query` con `agent_id` `claude-code`, con un binario de `4242171`, la base de este cambio, y con uno de este cambio, sobre el mismo store: los bytes de `prompt` y los del bloque WORKSPACE. La [propuesta de session-start-context](../archive/2026-11-04-session-start-context/proposal.md#problema) midió un workspace de 14.560 bytes, 14.400 de ellos en 18 preferencias.
+2. **Los bytes de `session-start` por proyecto, antes y después.** Para cada proyecto con filas, `POST /v1/context` sin `query` con `agent_id` `claude-code`, con un binario de `4242171`, la base de este cambio, y con uno de este cambio, cada uno sobre una copia nueva del mismo store: los bytes de `prompt` y los del bloque WORKSPACE. La [propuesta de session-start-context](../archive/2026-11-04-session-start-context/proposal.md#problema) midió un workspace de 14.560 bytes, 14.400 de ellos en 18 preferencias.
 3. **El agent view con el golden real**: `rag-eval --real --agent-view` contra la línea base de `openspec/config.yaml`, para ver que ningún caso se mueve.
 4. **Cursor real**, en el piloto del [ROADMAP](../../ROADMAP.md): una preferencia declarada a Claude Code entra al arranque de Cursor en el mismo proyecto.
 
