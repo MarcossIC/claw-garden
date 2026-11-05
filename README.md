@@ -453,7 +453,7 @@ La configuración sigue la documentación de Cursor 3.28. Falta comprobarla con 
 
 **Comprobar que anduvo.** Cada chat nuevo que corre el hook intenta dejar una línea en `~/.clawg/hook-runs.jsonl`, y `clawg doctor` muestra las últimas en `checks`, en la entrada `hooks.runs`: cuándo, qué cliente, qué carpeta y qué pasó con la memoria (`inyectó 3,2 KB`, `nada: varias carpetas`, `nada: el daemon no respondió`, …). Ese registro se escribe como se puede: si la escritura falla o no termina dentro del plazo del hook, el hook corre igual y no queda línea. Si el hook está instalado y no hay ninguna, `doctor` lo dice: abrí un chat nuevo y corré `doctor` otra vez, pero una línea que falta no alcanza para saber si el hook corrió. Que una línea diga `inyectó` prueba que el hook imprimió el contexto, no que el agente lo haya leído: Cursor documenta `sessionStart` como "fire-and-forget".
 
-Si un chat empieza sin memoria, pegá la entrada `hooks.runs` de la salida de `clawg doctor` (lleva las últimas 20 corridas completas). Lleva la carpeta de cada chat, pero no tu correo ni el texto de ninguna memoria: de lo que Cursor manda sólo guarda el nombre de los campos, nunca sus valores.
+Si un chat empieza sin memoria, mirá la entrada `hooks.runs` de la salida de `clawg doctor` (lleva las últimas 20 corridas completas) y tachá lo que no quieras compartir antes de pegarla: trae la ruta de la carpeta de cada chat, que puede decir tu usuario o tu correo, y la versión de Cursor.
 
 ## Otros clientes MCP
 
