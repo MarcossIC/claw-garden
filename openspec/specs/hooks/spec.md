@@ -10,7 +10,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (R7, LP12 de esa spec, y la excepción que suma a R3).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (AL6, y el idioma que suma a R4 y R5). Las notas que el daemon escribe en el contexto están en [`specs/retrieval`](../retrieval/spec.md), AL5.
 - [client-setup-cursor](../../changes/archive/2026-11-04-client-setup-cursor/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (CU6 a CU8): `clawg hook` toma `--client` para leer la entrada de `sessionStart` de Cursor, la carpeta sale de la única raíz de `workspace_roots`, y un hook de Claude Code que corre Cursor no imprime nada.
-- [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (HR1 a HR5 y HR8): `clawg hook session-start` deja una línea por corrida en `<data>/hook-runs.jsonl`. La espera acotada de esa escritura (HR4) sale en 0.77.0.
+- [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (HR1 a HR5 y HR8): `clawg hook session-start` deja una línea por corrida en `<data>/hook-runs.jsonl`. La espera acotada de esa escritura (HR4) sale en 0.77.0, y la de los archivos que el hook lee, en una versión posterior.
 
 ## Definiciones
 
@@ -40,7 +40,7 @@ Sin daemon, con un daemon que responde un error o no responde a tiempo, o con un
 
 El hook MUST NOT arrancar un daemon (usa `DaemonClient::from_data_dir`, no `probe_running(.., true)`, que puede esperar hasta 60 s): el puente MCP es quien arranca el daemon con la sesión, así que el primer `SessionStart` del día puede llegar antes y quedar sin contexto. Es la decisión de no autoarrancar (D6 del diseño archivado), y ese es todo su costo.
 
-Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a las tareas bloqueantes cuando es un hook (`shutdown_background`, `main.rs:82`); un `drop` común esperaría la lectura de stdin o la escritura del registro (HR4) más allá del tope.
+Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a las tareas bloqueantes cuando es un hook (`shutdown_background`, `main.rs:82`); un `drop` común esperaría la lectura de stdin, la de un archivo o la escritura del registro (HR4) más allá del tope.
 
 #### Escenario: el daemon no está
 - GIVEN un perfil sin daemon
@@ -98,7 +98,7 @@ Antes de leer, los dos eventos MUST registrar la raíz de `cwd`, con `cwd` mismo
 
 ## R7. El idioma de la persona en `session-start`
 
-Con preferencia ([`specs/preferences`](../preferences/spec.md)), `session-start` MUST abrir con una línea que dice el idioma de la persona, que se le responda en él salvo que escriba en otro, y que se guarde y se busque en él (`language_line`, `crates/clawg-cli/src/hook.rs:62`; `session_start_text`, `hook.rs:76`). MUST imprimirla, sola en el sobre, aunque no haya daemon, falle, no responda a tiempo o el contexto no traiga nada (`respond`, `hook.rs:190-203`), y lo que el hook suma, con la línea, MUST seguir ocupando menos de los 1.500 bytes de R4. Sin preferencia, lo de R3 y R4 sin cambios. `user-prompt-submit` no imprime la línea: en qué idioma habla está en AL6.
+Con preferencia ([`specs/preferences`](../preferences/spec.md)), `session-start` MUST abrir con una línea que dice el idioma de la persona, que se le responda en él salvo que escriba en otro, y que se guarde y se busque en él (`language_line`, `crates/clawg-cli/src/hook.rs:62`; `session_start_text`, `hook.rs:76`). MUST imprimirla, sola en el sobre, aunque no haya daemon, falle, no responda a tiempo o el contexto no traiga nada (`respond`, `hook.rs:190-203`), y lo que el hook suma, con la línea, MUST seguir ocupando menos de los 1.500 bytes de R4. Sin preferencia, lo de R3 y R4 sin cambios, y una preferencia que no se leyó en la espera de HR4 cuenta como ninguna en ese evento. `user-prompt-submit` no imprime la línea: en qué idioma habla está en AL6.
 
 #### Escenario: sin daemon
 - GIVEN la preferencia `es` y ningún daemon
@@ -175,7 +175,7 @@ Sin `--client cursor`, una entrada con `cursor_version` (de cualquier tipo) MUST
 |---|---|
 | `bad_input` | la entrada no se pudo leer entera, no es JSON o es un JSON que no tiene la forma de la entrada de un hook |
 | `other_client` | `--client claude-code` y la entrada trae `cursor_version` |
-| `timed_out` | el plazo del hook venció leyendo la entrada o esperando al daemon |
+| `timed_out` | el plazo del hook venció leyendo la entrada o llegando al daemon: sus archivos, la identidad del proyecto o su respuesta |
 | `several_folders` | `--client cursor` y `workspace_roots` tiene más de una raíz |
 | `no_folder` | no hay carpeta (Cursor sin raíces, o el directorio actual ilegible) |
 | `no_daemon` | no hay un daemon al que hablarle |
@@ -210,6 +210,18 @@ La línea MUST armarse entera y agregarse con una sola escritura. Antes de agreg
 
 La espera por esa escritura MUST terminar en el plazo del hook (`HOOK_DEADLINE`), haya terminado la escritura o no: un disco trabado MUST NOT demorar la respuesta, y `main` MUST NOT esperar esa escritura al salir. Esa corrida se queda sin línea. `session-start` MUST responder dentro del plazo menos `RECORD_RESERVE` (50 ms), para que una corrida `timed_out` también tenga tiempo de dejar la suya; `user-prompt-submit`, que no registra, MUST conservar el plazo entero.
 
+El plazo MUST empezar antes de leer la preferencia de idioma. Todo archivo que el hook lee (la preferencia, `daemon.json`, `token`, los que dicen la identidad del proyecto y la fecha del transcript) MUST leerse fuera del hilo que responde (`blocking`, `hook.rs`), para que un disco trabado no impida responder dentro del plazo; esa lectura se queda sin terminar. A la preferencia el hook MUST esperarla hasta `LANGUAGE_WAIT` (1 s, `read_by`), dentro del plazo, y después seguir sin idioma: una lectura trabada cuesta la línea del idioma y no la memoria. Una que termina en esa espera deja la línea disponible como siempre (R7). El valor está por encima del peor caso medido: 785 ms en Windows con el doble de hilos ocupados que núcleos, con el 99% por debajo de 17 ms, y menos de 1 ms con la máquina libre.
+
+#### Escenario: la preferencia no se puede leer
+- GIVEN un daemon con una memoria del proyecto y una lectura de la preferencia que nunca termina
+- WHEN corre `clawg hook session-start`
+- THEN imprime el contexto sin la línea del idioma, dentro del plazo, y la corrida dice `injected`
+
+#### Escenario: el estado del daemon no se puede leer
+- GIVEN la preferencia `es` y un `daemon.json` cuya apertura se bloquea para siempre (un FIFO que nadie escribe)
+- WHEN corre `clawg hook session-start`
+- THEN al vencer el plazo imprime sólo la línea del idioma y sale con 0
+
 #### Escenario: el directorio de datos no existe
 - GIVEN un home sin directorio de datos
 - WHEN corre el hook
@@ -225,7 +237,7 @@ La espera por esa escritura MUST terminar en el plazo del hook (`HOOK_DEADLINE`)
 - WHEN corre `clawg hook session-start`
 - THEN responde antes del plazo y el registro tiene su línea, con `timed_out`
 
-**Tests:** `a_line_is_appended`, `a_failed_roll_still_records_the_run`, `the_file_rolls_over_at_64_kib_and_replaces_the_old_one`, `concurrent_appends_keep_every_line`, `a_missing_data_directory_is_not_created`, `a_failed_append_is_swallowed`, `a_write_in_time_is_done_when_the_wait_ends`, `a_write_held_up_is_not_waited_for_past_the_deadline` (`hook_log.rs`), `a_session_start_out_of_time_still_leaves_its_line_by_the_deadline`, `a_prompt_records_nothing_and_keeps_the_whole_deadline` (`hook.rs`), `a_hook_does_not_create_the_data_directory_to_record` y, sólo en Unix, `a_record_that_cannot_be_written_does_not_hold_up_the_answer` (`tests/binary.rs`). Este último todavía no corrió en ningún sistema ([verify](../../changes/archive/2026-11-04-hook-run-log/verify.md#veredicto)).
+**Tests:** `a_line_is_appended`, `a_failed_roll_still_records_the_run`, `the_file_rolls_over_at_64_kib_and_replaces_the_old_one`, `concurrent_appends_keep_every_line`, `a_missing_data_directory_is_not_created`, `a_failed_append_is_swallowed`, `a_write_in_time_is_done_when_the_wait_ends`, `a_write_held_up_is_not_waited_for_past_the_deadline` (`hook_log.rs`), `a_session_start_out_of_time_still_leaves_its_line_by_the_deadline`, `a_prompt_records_nothing_and_keeps_the_whole_deadline`, `a_read_held_up_is_not_waited_for_past_the_deadline`, `a_read_in_time_gives_what_it_read`, `a_language_held_up_costs_its_line_and_not_the_memory` (`hook.rs`), `a_hook_does_not_create_the_data_directory_to_record` y, sólo en Unix, `a_record_that_cannot_be_written_does_not_hold_up_the_answer`, `a_preference_that_cannot_be_read_does_not_hold_up_the_answer`, `a_daemon_state_that_cannot_be_read_does_not_hold_up_the_answer` y `a_project_that_cannot_be_read_does_not_hold_up_the_answer` (`tests/binary.rs`). El primero de esos cuatro todavía no corrió en ningún sistema ([verify](../../changes/archive/2026-11-04-hook-run-log/verify.md#veredicto)). La fecha del transcript no tiene un test que la trabe: pedir los metadatos de un FIFO no lo abre.
 
 ## HR5. La salida del hook no cambia
 

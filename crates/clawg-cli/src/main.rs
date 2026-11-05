@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         }
     };
     if hook {
-        // A stdin the client never closed, or a record a stuck disk holds up,
+        // A stdin the client never closed, or a file a stuck disk holds up,
         // still occupies a blocking thread, which an ordinary drop of the
         // runtime would wait for past the deadline.
         runtime.shutdown_background();
