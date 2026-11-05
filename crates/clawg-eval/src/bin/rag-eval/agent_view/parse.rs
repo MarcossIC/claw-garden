@@ -152,11 +152,12 @@ fn joined(segments: Vec<Vec<&str>>) -> Vec<String> {
 }
 
 /// The text after a hit header, `[YYYY-MM-DD #id type] `, where the type is
-/// one word and may be absent, a piece of a long save adds `piece={k}/{n}`
-/// and a row another agent saved ends with `by {author}`.
+/// one word and may be absent, a preference the user did not state adds its
+/// origin after it, a piece of a long save adds `piece={k}/{n}` and a row
+/// another agent saved ends with `by {author}`.
 fn hit_text(line: &str) -> Option<&str> {
     let (header, text) = line.strip_prefix('[')?.split_once("] ")?;
-    let header = without_piece(without_author(header));
+    let header = without_origin(without_piece(without_author(header)));
     let (date, rest) = header.split_once(" #")?;
     let id = rest.split_once(' ').map_or(rest, |(id, kind)| {
         if kind.is_empty() || kind.contains(' ') { "" } else { id }
@@ -174,6 +175,17 @@ fn hit_text(line: &str) -> Option<&str> {
 /// ` by `, while the author, shown through `display_author`, may hold spaces.
 fn without_author(header: &str) -> &str {
     header.split_once(" by ").map_or(header, |(before, _)| before)
+}
+
+/// Every mark `provenance::mark` gives a row, as a hit header shows it.
+const ORIGINS: [&str; 3] = ["conclusion", "imported", "inferred"];
+
+/// `header` without a trailing origin mark, or as it came.
+fn without_origin(header: &str) -> &str {
+    match header.rsplit_once(' ') {
+        Some((before, origin)) if ORIGINS.contains(&origin) => before,
+        _ => header,
+    }
 }
 
 /// `header` without a trailing ` piece={k}/{n}`, or as it came.
@@ -339,6 +351,27 @@ mod tests {
             context_segments(text),
             vec!["the pier opens at dawn".to_string(), "the gate stays shut".to_string()]
         );
+    }
+
+    #[test]
+    fn every_origin_a_row_can_show_is_known() {
+        for source in ["explicit", "synthesis", "import", "chat", "code_file", "compaction"] {
+            for by in ["user", "agent", "system"] {
+                if let Some(origin) = clawg_core::memory::provenance::mark(source, by) {
+                    assert!(ORIGINS.contains(&origin), "{source}/{by} shows {origin}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_marked_preference_is_one_segment() {
+        let text = "=== LONG-TERM KNOWLEDGE ===\n\
+                    [2026-07-27 #10 user_preference inferred piece=1/2 by cursor] tabs in go\n\
+                    [2026-07-26 #11 user_preference conclusion] short answers\n";
+        assert_eq!(context_segments(text), vec!["tabs in go".to_string(), "short answers".to_string()]);
+        let line = "1. #10 [Memory/user_preference/t1 inferred score=0.90] tabs in go";
+        assert_eq!(parse_search_output(line).unwrap()[0].content, "tabs in go");
     }
 
     #[test]

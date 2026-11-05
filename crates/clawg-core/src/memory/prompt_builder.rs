@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::memory::pieces::read_save_core;
-use crate::memory::provenance::mark;
+use crate::memory::provenance::{mark, preference_mark};
 use crate::preferences::Lang;
 use crate::memory::{
     access::AccessTracker,
@@ -845,21 +845,29 @@ fn is_line_break(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}')
 }
 
-/// `[YYYY-MM-DD #id type] content`, with ` by <agent>` before the `]` when
-/// another agent saved it. Ids are numbered per table, so any kind other than
-/// `memory` is named before the type (`procedural/procedure`).
+/// `[YYYY-MM-DD #id type] content`, with the origin of a preference the user
+/// did not state after the type, as ACTIVE CONFLICTS marks a side, and
+/// ` by <agent>` before the `]` when another agent saved it. Ids are numbered
+/// per table, so any kind other than `memory` is named before the type
+/// (`procedural/procedure`).
 fn format_hit_line(hit: &RankedHit, reader: &str) -> String {
     let (y, m, d) = unix_millis_to_ymd(hit.created_at);
     let kind = match hit.kind {
         TableKind::Memory => String::new(),
         other => format!("{other:?}/").to_lowercase(),
     };
+    let origin = hit.origin.map(|o| format!(" {o}")).unwrap_or_default();
     let piece = hit.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
     let by = match &hit.agent_id {
         Some(author) if is_shared(hit, reader) => format!(" by {}", display_author(author)),
         _ => String::new(),
     };
-    format!("[{y:04}-{m:02}-{d:02} #{} {kind}{}{piece}{by}] {}", hit.id, hit.memory_type, indent_continuations(&hit.content))
+    format!(
+        "[{y:04}-{m:02}-{d:02} #{} {kind}{}{origin}{piece}{by}] {}",
+        hit.id,
+        hit.memory_type,
+        indent_continuations(&hit.content)
+    )
 }
 
 /// Printed once above the pairs: it is the same for every one of them.
@@ -1028,6 +1036,8 @@ async fn fetch_last_session(
                     exact: false,
                     topic_key: row.get(7)?,
                     project_id: row.get(8)?,
+                    // A session summary, never a preference.
+                    origin: None,
                 }));
             }
             Ok(None)
@@ -1054,14 +1064,15 @@ macro_rules! recent_row {
 /// each holds. A long save is its piece of lowest position among the rows
 /// that qualify, since the opening names its subject; no earlier piece of it
 /// may qualify. A row's save is the oldest that links it, as
-/// [`MemoryStore::save_links`] reads it. The last two columns are the
-/// piece's position and its save's count, `NULL` for a row of one piece.
+/// [`MemoryStore::save_links`] reads it. Columns 9 and 10 are the piece's
+/// position and its save's count, `NULL` for a row of one piece; the last two
+/// are the row's origin.
 /// `CROSS JOIN` keeps the save's own pieces in the outer loop of the check:
 /// without statistics the planner would walk every row of the agent instead.
 const RECENT_SAVES_SQL: &str = concat!(
     "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status, m.created_at, m.agent_id, m.topic_key, m.project_id,
-           p.piece, (SELECT COUNT(*) FROM memory_piece n WHERE n.save_id = p.save_id)
+           p.piece, (SELECT COUNT(*) FROM memory_piece n WHERE n.save_id = p.save_id), m.source, m.created_by_type
     FROM memory m
     LEFT JOIN memory_piece p
       ON p.memory_id = m.id
@@ -1103,11 +1114,14 @@ async fn fetch_recent_saves(
             let mut stmt = c.prepare_cached(RECENT_SAVES_SQL)?;
             let rows = stmt.query_map(rusqlite::params![agent, project, since, printed, limit], |row| {
                 let piece: Option<i64> = row.get(9)?;
+                let memory_type: String = row.get(2)?;
+                let (source, by): (String, String) = (row.get(11)?, row.get(12)?);
                 Ok(RankedHit {
                     id: row.get(0)?,
                     kind: TableKind::Memory,
                     content: row.get(1)?,
-                    memory_type: row.get(2)?,
+                    origin: preference_mark(&memory_type, Some(&source), Some(&by)),
+                    memory_type,
                     tier: row.get(3)?,
                     status: row.get(4)?,
                     score: 0.0,
@@ -1447,6 +1461,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         }
     }
 
@@ -1572,6 +1587,18 @@ mod tests {
         let mut hit = hit_at_2023_11_14(58, TableKind::Memory, "semantic_fact", "the retry budget was set");
         hit.piece = Some(crate::memory::search::PiecePosition { piece: 2, pieces: 4 });
         assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #58 semantic_fact piece=2/4] the retry budget was set");
+    }
+
+    #[test]
+    fn a_preference_hit_line_shows_its_origin() {
+        let mut hit = hit_at_2023_11_14(59, TableKind::Memory, "user_preference", "tabs");
+        hit.origin = Some("inferred");
+        hit.piece = Some(crate::memory::search::PiecePosition { piece: 1, pieces: 2 });
+        hit.agent_id = Some("cursor".into());
+        assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #59 user_preference inferred piece=1/2 by cursor] tabs");
+
+        let stated = hit_at_2023_11_14(60, TableKind::Memory, "user_preference", "tabs");
+        assert_eq!(format_hit_line(&stated, "agent-1"), "[2023-11-14 #60 user_preference] tabs", "no mark, the line of before");
     }
 
     #[test]
@@ -2158,6 +2185,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
 
         let hits = vec![make_hit(recent_ts), make_hit(recent_ts), make_hit(old_ts)];
@@ -2183,6 +2211,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -2207,6 +2236,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -2232,6 +2262,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
         assert_eq!(recent.len(), 1, "a future timestamp counts as recent rather than being clamped");
@@ -2302,7 +2333,7 @@ mod tests {
             c.execute("UPDATE memory SET tier = 1 WHERE id = ?1", [old_id])?;
             Ok(())
         }).await.unwrap();
-        let emitted = wm.regenerate_auto_section("agent-x", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-x", None, &Reach::Own, &store).await.unwrap();
 
         let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &emitted, None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(result.contains(SEP_CONFLICTS), "{result}");
@@ -2444,7 +2475,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         // Pre-write a workspace file
-        wm.regenerate_auto_section("agent-1", None, &store).await.unwrap();
+        wm.regenerate_auto_section("agent-1", None, &Reach::Own, &store).await.unwrap();
         // Also manually write something to the workspace to ensure it's non-empty
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::write(&path, "<!-- AUTO-START -->\n## Notes\n- something\n<!-- AUTO-END -->\n<!-- USER-START -->\n<!-- USER-END -->\n").await.unwrap();
@@ -2614,10 +2645,10 @@ mod tests {
     async fn recent_longterm_split_by_7day_window() {
         let now_ms: i64 = 1_700_000_000_000;
         let recent = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let old = vec![
-            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let (r, l) = bucket_by_recency(recent.into_iter().chain(old).collect(), TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 1);
@@ -2628,8 +2659,8 @@ mod tests {
     async fn all_old_hits_go_to_longterm_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 0);
@@ -2640,8 +2671,8 @@ mod tests {
     async fn all_recent_hits_go_to_recent_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 2);
@@ -2947,7 +2978,7 @@ mod tests {
 
         seed_memory(&store, "agent-gap", content, "user_preference", 1, 5.0, bytes).await;
 
-        let emitted = wm.regenerate_auto_section("agent-gap", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-gap", None, &Reach::Own, &store).await.unwrap();
         assert_eq!(emitted.len(), 0, "importance 5 is below the workspace bar");
 
         let result =
@@ -3021,7 +3052,7 @@ mod tests {
             .await
             .unwrap();
 
-        let emitted = wm.regenerate_auto_section("agent-3t", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-3t", None, &Reach::Own, &store).await.unwrap();
         assert_eq!(emitted.len(), 2, "one preference + one skill are rendered by the workspace");
 
         let result =
@@ -3079,7 +3110,7 @@ mod tests {
             .await;
         }
 
-        let emitted = wm.regenerate_auto_section("agent-budget", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-budget", None, &Reach::Own, &store).await.unwrap();
         assert_eq!(emitted.len(), 5, "the fixture must actually fill the workspace");
 
         let result =
@@ -3513,15 +3544,16 @@ mod tests {
         assert!(hits.contains(&format!("#{asked} ")), "the hit the query asked for is shown: {prompt}");
     }
 
-    /// A preference of `agent_id` in `project_id` that the workspace prints,
-    /// `age_days` old.
+    /// A preference the user stated to `agent_id` in `project_id`, which the
+    /// workspace prints, `age_days` old.
     async fn seed_preference(store: &MemoryStore, agent_id: &str, project_id: Option<&str>, content: &str, importance: f64, age_days: i64) -> i64 {
         let id = seed_dated(store, agent_id, project_id, content, age_days).await;
         store
             .conn
             .call(move |c| {
                 c.execute(
-                    "UPDATE memory SET memory_type = 'user_preference', importance = ?2, tier = 1 WHERE id = ?1",
+                    "UPDATE memory SET memory_type = 'user_preference', created_by_type = 'user', importance = ?2, tier = 1
+                     WHERE id = ?1",
                     rusqlite::params![id, importance],
                 )
             })
@@ -3547,7 +3579,7 @@ mod tests {
         }
         let summary = format!("Goal: fix the session start. {}", "Next steps: run the suite. ".repeat(50));
         let summary = seed_summary(&store, agent, project, &summary, 1).await;
-        let emitted = wm.regenerate_auto_section(agent, project, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section(agent, project, &Reach::Own, &store).await.unwrap();
         assert_eq!(emitted.len(), 18, "the workspace prints every preference");
 
         let at_start = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, DEFAULT_BUDGET).await.unwrap();
@@ -3683,7 +3715,7 @@ mod tests {
         }).await.unwrap();
 
         // Regenerate workspace AUTO section (captures user_preference)
-        let emitted = wm.regenerate_auto_section("e2e-agent", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("e2e-agent", None, &Reach::Own, &store).await.unwrap();
 
         let result = build_memory_prompt(Lang::En, 
             &store, &wm, Some(embedder), "e2e-agent", None, &Reach::Own, QueryTexts::single_shot("some query"), &emitted, None, DEFAULT_BUDGET
@@ -3784,7 +3816,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let mut near = vec![0.0_f32; 384];
         near[0] = 1.0;
-        seed_memory_aged(&store, "claude-code", "regla de claude-code en tier uno", "user_preference", 1, 9.5, 1, unit_bytes(&near)).await;
+        seed_memory_aged(&store, "claude-code", "regla de claude-code en tier uno", "architectural_decision", 1, 9.5, 1, unit_bytes(&near)).await;
         let (old_id, new_id) = disputed_pair(&store, "claude-code", "semantic_fact", 8.0).await;
         // Both sides searchable, so the pair is in what cursor is shown.
         let bytes = unit_bytes(&near);
@@ -3799,7 +3831,7 @@ mod tests {
             .await
             .unwrap();
 
-        let emitted = wm.regenerate_auto_section("cursor", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("cursor", None, &Reach::AllBut(Vec::new()), &store).await.unwrap();
         let prompt = build_memory_prompt(Lang::En, 
             &store,
             &wm,
@@ -3822,6 +3854,108 @@ mod tests {
         assert!(prompt.contains(&format!("#{new_id} ")), "the disputed row is among the hits: {prompt}");
         let conflicts = block(&prompt, SEP_CONFLICTS).unwrap_or_else(|| panic!("claude-code's dispute is cursor's to review too: {prompt}"));
         assert!(conflicts.contains(&format!("#{old_id}")) && conflicts.contains(&format!("#{new_id}")), "{conflicts}");
+    }
+
+    /// A preference as the previous version wrote it: tier 1, importance 9,
+    /// sealed `source` / `created_by_type`, with the query's vector.
+    async fn seed_sealed_preference(store: &MemoryStore, project_id: Option<&str>, content: &str, by: &str) -> i64 {
+        let (project, content, by) = (project_id.map(str::to_owned), content.to_string(), by.to_string());
+        let mut near = vec![0.0_f32; 384];
+        near[0] = 1.0;
+        let bytes = unit_bytes(&near);
+        let ts = TimestampMs::now().as_millis_i64() - 30 * 86_400_000;
+        store
+            .conn
+            .call(move |c| -> Result<i64, rusqlite::Error> {
+                c.execute(
+                    "INSERT INTO memory (scope, agent_id, project_id, content, memory_type, source,
+                     created_at, created_by_type, created_by_ref,
+                     last_modified_at, last_accessed_at, importance, tier, status)
+                     VALUES ('agent', 'agent-1', ?1, ?2, 'user_preference', 'explicit', ?3, ?4, 'agent-1', ?3, ?3, 9.0, 1, 'active')",
+                    rusqlite::params![project, content, ts, by],
+                )?;
+                let id = c.last_insert_rowid();
+                c.execute("INSERT INTO memory_vectors (rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, bytes])?;
+                Ok(id)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_preference_out_of_the_workspace_is_still_found() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let tmp = crate::test_dir::test_dir();
+        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
+        let inferred = seed_sealed_preference(&store, Some("P1"), "indent this repository with tabs", "agent").await;
+        let elsewhere = seed_sealed_preference(&store, Some("P2"), "indent the other repository with spaces", "user").await;
+        let before_the_seal = seed_sealed_preference(&store, Some("P1"), "answer in short sentences", "user").await;
+        let columns = |id: i64| {
+            let store = store.clone();
+            async move {
+                store
+                    .conn
+                    .call(move |c| {
+                        c.query_row(
+                            "SELECT agent_id, project_id, source, created_by_type, importance, tier, status, content
+                             FROM memory WHERE id = ?1",
+                            [id],
+                            |r| {
+                                Ok(format!(
+                                    "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, Option<String>>(1)?,
+                                    r.get::<_, String>(2)?,
+                                    r.get::<_, String>(3)?,
+                                    r.get::<_, f64>(4)?,
+                                    r.get::<_, i64>(5)?,
+                                    r.get::<_, String>(6)?,
+                                    r.get::<_, String>(7)?
+                                ))
+                            },
+                        )
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut before = Vec::new();
+        for id in [inferred, elsewhere, before_the_seal] {
+            before.push(columns(id).await);
+        }
+
+        let emitted = wm.regenerate_auto_section("agent-1", Some("P1"), &Reach::Own, &store).await.unwrap();
+        let prompt = build_memory_prompt(
+            Lang::En,
+            &store,
+            &wm,
+            Some(Arc::new(FixedVecEmbedder) as Arc<dyn Embedder>),
+            "agent-1",
+            Some("P1"),
+            &Reach::Own,
+            QueryTexts::single_shot("how to indent"),
+            &emitted,
+            None,
+            DEFAULT_BUDGET,
+        )
+        .await
+        .unwrap()
+        .text;
+
+        let workspace = block(&prompt, SEP_WORKSPACE).unwrap_or_else(|| panic!("{prompt}"));
+        assert!(workspace.contains("answer in short sentences"), "a row from before the seal is the user's: {prompt}");
+        assert!(!workspace.contains("indent"), "{prompt}");
+        let hits = [block(&prompt, SEP_RECENT), block(&prompt, SEP_LONGTERM)].into_iter().flatten().collect::<String>();
+        for id in [inferred, elsewhere] {
+            assert!(hits.contains(&format!("#{id} ")), "#{id} left the workspace and is still found: {prompt}");
+        }
+        assert!(hits.contains(&format!("#{inferred} user_preference inferred]")), "marked as the agent's: {prompt}");
+        assert!(hits.contains(&format!("#{elsewhere} user_preference]")), "what the user said carries no mark: {prompt}");
+        let mut after = Vec::new();
+        for id in [inferred, elsewhere, before_the_seal] {
+            after.push(columns(id).await);
+        }
+        assert_eq!(after, before, "no row is rewritten");
     }
 
     #[tokio::test]
@@ -3998,6 +4132,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recent_preference_shows_its_origin() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let inferred = seed_dated(&store, "agent-1", None, "tabs in the go service", 1).await;
+        let stated = seed_dated(&store, "agent-1", None, "short answers", 1).await;
+        let fact = seed_dated(&store, "agent-1", None, "the go service builds with make", 1).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute("UPDATE memory SET memory_type = 'user_preference' WHERE id IN (?1, ?2)", [inferred, stated])?;
+                c.execute("UPDATE memory SET created_by_type = 'user' WHERE id = ?1", [stated])
+            })
+            .await
+            .unwrap();
+
+        let text = session_prompt(&store, "agent-1", None).await.text;
+
+        let recent = block(&text, SEP_RECENT).unwrap_or_else(|| panic!("{text}"));
+        assert!(recent.contains(&format!("#{inferred} user_preference inferred] tabs")), "{text}");
+        assert!(recent.contains(&format!("#{stated} user_preference] short")), "{text}");
+        assert!(recent.contains(&format!("#{fact} semantic_fact] the go")), "only a preference is marked: {text}");
+    }
+
+    #[tokio::test]
     async fn a_context_without_a_query_skips_what_the_workspace_showed_and_the_dead() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let shown = seed_dated(&store, "agent-1", None, "tabs over spaces in every file", 1).await;
@@ -4006,14 +4163,18 @@ mod tests {
         store
             .conn
             .call(move |c| {
-                c.execute("UPDATE memory SET memory_type = 'user_preference', importance = 9.0, tier = 1 WHERE id = ?1", [shown])?;
+                c.execute(
+                    "UPDATE memory SET memory_type = 'user_preference', created_by_type = 'user', importance = 9.0, tier = 1
+                     WHERE id = ?1",
+                    [shown],
+                )?;
                 c.execute("UPDATE memory SET deleted_at = 1 WHERE id = ?1", [gone])
             })
             .await
             .unwrap();
         let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        let emitted = wm.regenerate_auto_section("agent-1", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-1", None, &Reach::Own, &store).await.unwrap();
         assert!(emitted.contains(TableKind::Memory, shown), "the fixture needs the workspace to print #{shown}");
 
         let text = build_session_prompt(Lang::En, &store, &wm, "agent-1", None, &Reach::Own, &emitted, DEFAULT_BUDGET).await.unwrap().text;

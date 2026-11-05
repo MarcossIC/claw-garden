@@ -1573,12 +1573,13 @@ async fn context(
     let project_id = live_project(&app, body.project_id.clone()).await?;
     let project_id = project_id.as_deref();
     let query = body.query.as_deref().filter(|q| !q.trim().is_empty());
+    let reach = reach(&app, &body.agent_id);
 
     // Unconditional regen (~2-5 ms). A failure degrades to "no ids were
     // emitted", which can make the prompt repeat a row — a degraded prompt
     // beats a failed request.
     let emitted = workspace
-        .regenerate_auto_section(&body.agent_id, project_id, &app.runtime.store)
+        .regenerate_auto_section(&body.agent_id, project_id, &reach, &app.runtime.store)
         .await
         .unwrap_or_else(|e| {
             log::warn!("workspace regen failed: {e}");
@@ -1594,7 +1595,7 @@ async fn context(
                 app.runtime.embedder.get().cloned(),
                 &body.agent_id,
                 project_id,
-                &reach(&app, &body.agent_id),
+                &reach,
                 QueryTexts { lexical: query, embedded: query },
                 &emitted,
                 Some(app.runtime.access_tracker.as_ref()),
@@ -1603,7 +1604,6 @@ async fn context(
             .await
         }
         None => {
-            let reach = reach(&app, &body.agent_id);
             build_session_prompt(
                 lang.unwrap_or(Lang::En),
                 &app.runtime.store,

@@ -400,7 +400,7 @@ claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe
 
 ### Compartir memorias entre agentes
 
-Todos los agentes leen lo que guardaron los demás: lo que Claude Code aprendió de vos le sirve a Cursor cuando busca. Lo compartido le llega al agente marcado `by claude-code`, como información para verificar y no como instrucciones, y el agente que lo encuentra lo puede cambiar, borrar o juzgar como lo propio. El workspace y RECENT de cada agente siguen siendo suyos.
+Todos los agentes leen lo que guardaron los demás: lo que Claude Code aprendió de vos le sirve a Cursor cuando busca. Lo compartido le llega al agente marcado `by claude-code`, como información para verificar y no como instrucciones, y el agente que lo encuentra lo puede cambiar, borrar o juzgar como lo propio. Las preferencias que le dijiste a un agente entran solas al workspace de los demás, porque te describen a vos; las decisiones del workspace y RECENT siguen siendo de cada agente.
 
 Para que un agente no lea a otro, excluilo desde una terminal:
 
@@ -569,7 +569,7 @@ Registra `clawg-dev` con la ruta de ese binario y sus hooks con `--profile dev`;
 
 ### Herramientas MCP
 
-- `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones.
+- `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones. Con `all_projects`, la guarda sin proyecto, para lo que vale en todo lo que hacés.
 - `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia. Lo que guardó otro agente va marcado `by <agente>`.
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
 - `search_project`: busca en la documentación del proyecto (los Markdown y los manifiestos como `Cargo.toml` o `package.json`, respetando `.gitignore`) y en su código Rust, Python y TypeScript, partido por definición, y devuelve cada pasaje con su ruta de encabezados o de definiciones. Sirve para preguntas sobre cómo funciona el proyecto. El índice se arma solo la primera vez que el agente abre el proyecto y se pone al día cuando cambian los archivos.

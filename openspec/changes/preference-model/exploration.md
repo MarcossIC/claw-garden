@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1, 2 y 4 | M | session-start-context, que reparte el presupuesto | exploración; hay decisiones de la persona abiertas |
+| 1, 2 y 4 | M | session-start-context, que reparte el presupuesto | decisiones cerradas; ver [`state.yaml`](state.yaml) |
 
 **Tesis:** el problema de las preferencias no es dónde se guardan, sino qué entra solo a cada sesión. Hoy decide un número que pone el agente, sin mirar quién lo dijo ni a qué proyecto corresponde. Hace falta decidir el alcance y el sello antes de instalar los hooks en todos los proyectos.
 
@@ -71,9 +71,11 @@ Entra lo que tiene `importance >= 8` y tier 1. El número lo pone el agente, sin
 
 La exploración necesita a la persona; la aplicación se prueba en Linux. Va después de session-start-context, con las decisiones tomadas.
 
-## Decisiones abiertas (de la persona)
+## Decisiones (cerradas)
 
-- [ ] Alcance: A, B o C. Recomendado: A.
-- [ ] Si las preferencias cruzan agentes. Recomendado: sí.
-- [ ] Sello: sólo lo declarado entra solo. Recomendado: sí, después de contar.
-- [ ] Cómo se clasifican las preferencias que ya existen: revisión a mano de las que hoy entran, con la persona.
+- [x] Alcance: A, por el proyecto de la fila.
+- [x] Las preferencias cruzan agentes: siguen lo que el agente puede leer.
+- [x] Sello: sólo lo declarado entra solo. El recuento de las filas elegibles se hace en prod, con una lectura, y queda en el [verify](verify.md).
+- [x] Las preferencias que ya existen se clasifican a mano, con la persona, fuera de este cambio: [preference-model](proposal.md) no cambia filas guardadas.
+
+Cómo se aplican: [propuesta](proposal.md#decisiones).
