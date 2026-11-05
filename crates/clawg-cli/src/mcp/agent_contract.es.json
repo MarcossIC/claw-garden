@@ -284,6 +284,14 @@
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
+          "all_projects": {
+            "default": null,
+            "description": "True para una memoria que vale en todos los proyectos, como una preferencia que la persona tiene en todo lo que hace: se guarda sin proyecto, así la lee cada proyecto. No con project ni con project_path.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "content": {
             "description": "La memoria a guardar, escrita como una afirmación que se entiende sola: se va a leer en una sesión futura sin nada de esta conversación alrededor. Como máximo 64 KiB; parte un texto más largo en varios saves.",
             "type": "string"

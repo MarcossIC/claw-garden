@@ -179,6 +179,11 @@ pub struct SaveMemoryArgs {
     /// a project of its own: creates it apart. Only with project.
     #[serde(default)]
     pub new_project: Option<bool>,
+    /// True for a memory that holds in every project, such as a preference
+    /// the user has wherever they work: it is saved without a project, so
+    /// every project reads it. Not with project or project_path.
+    #[serde(default)]
+    pub all_projects: Option<bool>,
     /// Only for a conclusion: the ids of the memories it generalizes, as
     /// `synthesize` lists them. Omit for an ordinary memory.
     #[serde(default)]
@@ -1055,6 +1060,13 @@ impl ClawgMcp {
         if let Some(both) = self.one_place(args.project.as_deref(), args.project_path.as_deref(), "project_path") {
             return Self::failed(both);
         }
+        let all_projects = args.all_projects.unwrap_or(false);
+        if all_projects && (args.project.is_some() || args.project_path.is_some()) {
+            return Self::failed(match self.speaks() {
+                Lang::En => "all_projects saves without a project: pass it without project or project_path",
+                Lang::Es => "all_projects guarda sin proyecto: pásalo sin project ni project_path",
+            });
+        }
         if args.new_project == Some(true) && args.project.is_none() {
             return Self::failed(match self.speaks() {
                 Lang::En => "new_project goes with project: name the project to create",
@@ -1064,15 +1076,16 @@ impl ClawgMcp {
         let args = &args;
         let result = self
             .call(|client| async move {
-                // A save is never "all projects": a memory belongs somewhere, and
-                // an unscoped write would be invisible to every project-scoped
-                // search. A name is resolved, and a new one created, before the
-                // save reaches the outbox.
+                // A memory belongs to the bridge's project unless the call
+                // names another or says it holds in every one: a row without
+                // a project is read from all of them. A name is resolved, and
+                // a new one created, before the save reaches the outbox.
                 let project_id = match args.project.as_deref() {
                     Some(reference) => match self.named(&client, reference, true, args.new_project.unwrap_or(false)).await? {
                         Ok(resolution) => resolution.project_id,
                         Err(refusal) => return Ok(Err(refusal)),
                     },
+                    None if all_projects => None,
                     None => self.project_for(&client, args.project_path.as_deref(), false).await?,
                 };
                 client
@@ -1941,6 +1954,7 @@ mod tests {
             project_path: None,
             project: None,
             new_project: None,
+            all_projects: None,
             derived_from: None,
             topic_key: None,
             user_stated: None,
@@ -3324,6 +3338,7 @@ mod tests {
                     project_path: None,
                     project: None,
                     new_project: None,
+                    all_projects: None,
                     derived_from: None,
                     topic_key: None,
                     user_stated: None,
@@ -3398,6 +3413,7 @@ mod tests {
                     project_path: None,
                     project: None,
                     new_project: None,
+                    all_projects: None,
                     derived_from: None,
                     topic_key: None,
                     user_stated: None,
@@ -4448,6 +4464,7 @@ mod tests {
                 project_path: Some("/some/elsewhere".into()),
                 project: None,
                 new_project: None,
+                all_projects: None,
                 derived_from: None,
                 topic_key: None,
                 user_stated: None,
@@ -5024,6 +5041,43 @@ mod tests {
         let moved = UpdateMemoryArgs { to_project: Some("ideas".into()), clear_project: true, ..update_args(1, None, None) };
         let moved = b.update_memory_impl("a", moved).await.unwrap();
         assert_eq!(text(&moved), "pass one of to_project_path, to_project or clear_project");
+        let client = b.client.get().await.expect("daemon");
+        assert_eq!(client.resolve_project("ideas", false, false, Born::Agent).await.unwrap().project_id, None, "nothing was created");
+    }
+
+    #[tokio::test]
+    async fn a_save_for_every_project_has_no_project() {
+        let (b, _d) = bridge().await;
+        let general = SaveMemoryArgs {
+            memory_type: Some("user_preference".into()),
+            all_projects: Some(true),
+            ..save_args("Answer in short sentences")
+        };
+
+        let saved = b.save_memory_impl("agent-a", general).await.expect("save");
+
+        let id: i64 = text(&saved).strip_prefix("saved #").and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{}", text(&saved)));
+        assert_eq!(project_of(&b, id).await, None, "every project reads a row of none");
+        let here = saved_id(&b, "agent-a", "The release job signs SHA256SUMS").await;
+        assert_eq!(project_of(&b, here).await.as_deref(), Some(test_project().id.as_str()), "without it, the bridge's project");
+    }
+
+    #[tokio::test]
+    async fn all_projects_goes_without_a_project() {
+        let (b, _d) = bridge().await;
+        for (lang, refusal) in [
+            (Lang::En, "all_projects saves without a project: pass it without project or project_path"),
+            (Lang::Es, "all_projects guarda sin proyecto: pásalo sin project ni project_path"),
+        ] {
+            let b = b.clone().with_language(Some(lang));
+            for args in [
+                SaveMemoryArgs { all_projects: Some(true), project: Some("ideas".into()), ..save_args("x") },
+                SaveMemoryArgs { all_projects: Some(true), project_path: Some("/work/app".into()), ..save_args("x") },
+            ] {
+                let r = b.save_memory_impl("a", args).await.unwrap();
+                assert_eq!((is_error(&r), text(&r)), (true, refusal.to_string()), "{lang:?}");
+            }
+        }
         let client = b.client.get().await.expect("daemon");
         assert_eq!(client.resolve_project("ideas", false, false, Born::Agent).await.unwrap().project_id, None, "nothing was created");
     }

@@ -176,6 +176,12 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     ),
     (
         "save_memory",
+        Some("all_projects"),
+        "True para una memoria que vale en todos los proyectos, como una preferencia que la persona tiene en todo \
+         lo que hace: se guarda sin proyecto, así la lee cada proyecto. No con project ni con project_path.",
+    ),
+    (
+        "save_memory",
         Some("content"),
         "La memoria a guardar, escrita como una afirmación que se entiende sola: se va a leer en una sesión futura \
          sin nada de esta conversación alrededor. Como máximo 64 KiB; parte un texto más largo en varios saves.",

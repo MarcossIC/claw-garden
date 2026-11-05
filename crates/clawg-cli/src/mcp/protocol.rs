@@ -182,6 +182,23 @@ mod tests {
         }
     }
 
+    /// The text of the `## {heading}` section of `text`, up to the next one.
+    fn section<'a>(text: &'a str, heading: &str) -> &'a str {
+        let start = text.find(&format!("\n## {heading}\n")).unwrap_or_else(|| panic!("no section {heading}"));
+        let body = &text[start + heading.len() + 5..];
+        body.find("\n## ").map_or(body, |end| &body[..end])
+    }
+
+    #[test]
+    fn the_protocol_says_which_preferences_open_every_session() {
+        for (text, heading) in [(PROTOCOL, "Type and importance"), (PROTOCOL_ES, "Tipo e importancia")] {
+            let types = section(text, heading);
+            for name in ["`user_stated`", "`all_projects`", "inferred"] {
+                assert!(types.contains(name), "{heading} names {name}:\n{types}");
+            }
+        }
+    }
+
     #[test]
     fn a_language_rewrites_both_rules_of_the_english_protocol() {
         let en = text(Some(Lang::En));
