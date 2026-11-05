@@ -154,3 +154,7 @@ Sin CRITICAL. Un WARNING: el arreglo de la escritura trabada (`0ff19a7d`) no pas
 - Se archiva con ese WARNING abierto: la validación se hace después, con el CI de Linux y Windows del pull request que suba `0ff19a7d`, y lo que marque se arregla aparte.
 - La versión no sube: el código de este cambio salió en 0.76.0, y `0ff19a7d` viene después del bump a 0.77.0 (`5f83185e`), que todavía no tiene tag, así que sale en esa.
 - Hasta que salga 0.77.0, la 0.76.0 publicada tiene la escritura sin límite de tiempo que ese arreglo corrige.
+
+## Después de archivar (2026-11-05)
+
+- El WARNING se cierra. El CI del pull request #132, que subió `0ff19a7d` y publicó 0.77.0, pasó en Linux y Windows. `a_record_that_cannot_be_written_does_not_hold_up_the_answer` pasó en Linux: es `#[cfg(unix)]`, así que en Windows no corre. No quedó nada para arreglar aparte.
