@@ -22,7 +22,6 @@ use clawg_cli::doctor;
 use clawg_cli::error::CliError;
 use clawg_cli::export;
 use clawg_cli::hook;
-use clawg_cli::hook_log;
 use clawg_cli::import;
 use clawg_cli::mcp;
 use clawg_cli::memories;
@@ -85,8 +84,9 @@ fn main() -> ExitCode {
         }
     };
     if hook {
-        // A stdin the client never closed still holds a blocking read, which
-        // an ordinary drop of the runtime would wait for past the deadline.
+        // A stdin the client never closed, or a record a stuck disk holds up,
+        // still occupies a blocking thread, which an ordinary drop of the
+        // runtime would wait for past the deadline.
         runtime.shutdown_background();
     } else if serves {
         // A model load still running on a blocking thread cannot be
@@ -127,10 +127,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Hook { event, agent, client, profile } => {
             let profile = profile.resolve()?;
             let base_dir = data_dir(profile)?;
-            let (out, run) = hook::respond_with_run(event, client, &agent, &base_dir, tokio::io::stdin(), hook::HOOK_DEADLINE).await;
-            if let Some(run) = run {
-                hook_log::record(&base_dir, &run);
-            }
+            let out = hook::respond_and_record(event, client, &agent, &base_dir, tokio::io::stdin(), hook::HOOK_DEADLINE).await;
             if let Some(out) = out {
                 println!("{out}");
             }

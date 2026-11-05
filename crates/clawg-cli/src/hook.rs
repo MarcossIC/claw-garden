@@ -30,6 +30,12 @@ use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
 /// seconds a hook is configured with, so the client never cancels one.
 pub const HOOK_DEADLINE: Duration = Duration::from_secs(3);
 
+/// What a session start keeps of its deadline for the record: a run that used
+/// up its time still leaves its line, which is what tells why that session
+/// started without memory. Three times the worst write measured, 15 ms on
+/// Windows with every core busy; an idle machine takes about 1 ms.
+pub const RECORD_RESERVE: Duration = Duration::from_millis(50);
+
 /// Minutes without a save, counted from the session's start at the earliest,
 /// before `user-prompt-submit` says so. Not measured yet.
 pub const SAVE_REMINDER_AFTER: Duration = Duration::from_secs(30 * 60);
@@ -235,9 +241,32 @@ pub async fn respond(
     respond_with_run(event, host, agent, base_dir, input, deadline).await.0
 }
 
+/// [`respond`], with the run written to the record by the time it returns, so
+/// that a print that fails still leaves the evidence. The whole takes `deadline`
+/// at most: a session start answers within all of it but [`RECORD_RESERVE`], and
+/// a write still held up when it ends is left behind.
+pub async fn respond_and_record(
+    event: HookEvent,
+    host: HookClient,
+    agent: &str,
+    base_dir: &Path,
+    input: impl AsyncRead + Unpin,
+    deadline: Duration,
+) -> Option<String> {
+    let end = tokio::time::Instant::now() + deadline;
+    let to_answer = match event {
+        HookEvent::SessionStart => deadline.saturating_sub(RECORD_RESERVE),
+        HookEvent::UserPromptSubmit => deadline,
+    };
+    let (out, run) = respond_with_run(event, host, agent, base_dir, input, to_answer).await;
+    if let Some(run) = run {
+        hook_log::record_by(end, base_dir.to_path_buf(), run).await;
+    }
+    out
+}
+
 /// [`respond`], and what the run leaves in the record: a `session-start` that
-/// read its input. Nothing is written here; the caller records it before it
-/// prints.
+/// read its input. Nothing is written here; [`respond_and_record`] does.
 pub async fn respond_with_run(
     event: HookEvent,
     host: HookClient,
@@ -961,6 +990,29 @@ mod tests {
         let input = hook_input(mute.path());
         let waited = claude(input, mute.path().to_path_buf(), Duration::from_millis(300)).await;
         assert_eq!(waited.outcome, Outcome::TimedOut, "a daemon that never answers");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_start_out_of_time_still_leaves_its_line_by_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_writer, silent) = tokio::io::duplex(64);
+        let started = tokio::time::Instant::now();
+        let out = respond_and_record(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), silent, HOOK_DEADLINE).await;
+        assert_eq!(out, None);
+        assert!(started.elapsed() < HOOK_DEADLINE, "the answer leaves time to write, took {:?}", started.elapsed());
+        let outcomes: Vec<Outcome> = hook_log::read_runs(dir.path()).iter().map(|r| r.outcome).collect();
+        assert_eq!(outcomes, [Outcome::TimedOut]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_records_nothing_and_keeps_the_whole_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_writer, silent) = tokio::io::duplex(64);
+        let started = tokio::time::Instant::now();
+        let out = respond_and_record(HookEvent::UserPromptSubmit, HookClient::ClaudeCode, "a", dir.path(), silent, HOOK_DEADLINE).await;
+        assert_eq!(out, None);
+        assert!(started.elapsed() >= HOOK_DEADLINE, "{:?}", started.elapsed());
+        assert_eq!(hook_log::read_runs(dir.path()), []);
     }
 
     #[tokio::test]

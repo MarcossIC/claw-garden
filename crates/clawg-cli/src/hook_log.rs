@@ -9,9 +9,10 @@
 //! created for it.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 
 /// The record, in the data directory.
 pub const FILE: &str = "hook-runs.jsonl";
@@ -115,6 +116,17 @@ pub fn record(dir: &Path, run: &Run) {
     let _ = append(dir, &line(run));
 }
 
+/// [`record`], waited for until `deadline` and no later. The write runs on a
+/// thread of its own, so a disk that holds it up cannot hold up the answer, and
+/// what is left of it ends with the process.
+pub async fn record_by(deadline: Instant, dir: PathBuf, run: Run) {
+    wait_until(deadline, move || record(&dir, &run)).await;
+}
+
+async fn wait_until(deadline: Instant, write: impl FnOnce() + Send + 'static) {
+    let _ = tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(write)).await;
+}
+
 fn append(dir: &Path, line: &str) -> std::io::Result<()> {
     let path = dir.join(FILE);
     // Renaming instead of rewriting: two hooks that start together never
@@ -128,6 +140,8 @@ fn append(dir: &Path, line: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn run(outcome: Outcome) -> Run {
@@ -242,6 +256,30 @@ mod tests {
         record(&missing, &run(Outcome::Injected));
         assert!(!missing.exists());
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_in_time_is_done_when_the_wait_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        record_by(started + Duration::from_secs(30), dir.path().to_path_buf(), run(Outcome::Injected)).await;
+        assert_eq!(read_runs(dir.path()).len(), 1, "written by the time the hook prints");
+        assert!(started.elapsed() < Duration::from_secs(20), "the rest of the time is not spent");
+    }
+
+    #[tokio::test]
+    async fn a_write_held_up_is_not_waited_for_past_the_deadline() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let deadline = Duration::from_millis(100);
+        let started = Instant::now();
+        // Bounded so that a wait with no limit fails this test and does not hang it.
+        wait_until(started + deadline, move || {
+            let _ = held.recv_timeout(Duration::from_secs(10));
+        })
+        .await;
+        let took = started.elapsed();
+        drop(release);
+        assert!(took >= deadline && took < Duration::from_secs(2), "the deadline ends the wait, after {took:?}");
     }
 
     #[test]
