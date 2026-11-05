@@ -2302,7 +2302,7 @@ mod tests {
             c.execute("UPDATE memory SET tier = 1 WHERE id = ?1", [old_id])?;
             Ok(())
         }).await.unwrap();
-        let emitted = wm.regenerate_auto_section("agent-x", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-x", None, &Reach::Own, &store).await.unwrap();
 
         let result = build_memory_prompt(Lang::En, &store, &wm, None, "agent-x", None, &Reach::Own, QueryTexts::single_shot("query"), &emitted, None, DEFAULT_BUDGET).await.unwrap().text;
         assert!(result.contains(SEP_CONFLICTS), "{result}");
@@ -2444,7 +2444,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
 
         // Pre-write a workspace file
-        wm.regenerate_auto_section("agent-1", None, &store).await.unwrap();
+        wm.regenerate_auto_section("agent-1", None, &Reach::Own, &store).await.unwrap();
         // Also manually write something to the workspace to ensure it's non-empty
         let path = wm.workspace_path("agent-1", None);
         tokio::fs::write(&path, "<!-- AUTO-START -->\n## Notes\n- something\n<!-- AUTO-END -->\n<!-- USER-START -->\n<!-- USER-END -->\n").await.unwrap();
@@ -2947,7 +2947,7 @@ mod tests {
 
         seed_memory(&store, "agent-gap", content, "user_preference", 1, 5.0, bytes).await;
 
-        let emitted = wm.regenerate_auto_section("agent-gap", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-gap", None, &Reach::Own, &store).await.unwrap();
         assert_eq!(emitted.len(), 0, "importance 5 is below the workspace bar");
 
         let result =
@@ -3021,7 +3021,7 @@ mod tests {
             .await
             .unwrap();
 
-        let emitted = wm.regenerate_auto_section("agent-3t", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-3t", None, &Reach::Own, &store).await.unwrap();
         assert_eq!(emitted.len(), 2, "one preference + one skill are rendered by the workspace");
 
         let result =
@@ -3079,7 +3079,7 @@ mod tests {
             .await;
         }
 
-        let emitted = wm.regenerate_auto_section("agent-budget", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-budget", None, &Reach::Own, &store).await.unwrap();
         assert_eq!(emitted.len(), 5, "the fixture must actually fill the workspace");
 
         let result =
@@ -3548,7 +3548,7 @@ mod tests {
         }
         let summary = format!("Goal: fix the session start. {}", "Next steps: run the suite. ".repeat(50));
         let summary = seed_summary(&store, agent, project, &summary, 1).await;
-        let emitted = wm.regenerate_auto_section(agent, project, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section(agent, project, &Reach::Own, &store).await.unwrap();
         assert_eq!(emitted.len(), 18, "the workspace prints every preference");
 
         let at_start = build_session_prompt(Lang::En, &store, &wm, agent, project, &Reach::Own, &emitted, DEFAULT_BUDGET).await.unwrap();
@@ -3684,7 +3684,7 @@ mod tests {
         }).await.unwrap();
 
         // Regenerate workspace AUTO section (captures user_preference)
-        let emitted = wm.regenerate_auto_section("e2e-agent", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("e2e-agent", None, &Reach::Own, &store).await.unwrap();
 
         let result = build_memory_prompt(Lang::En, 
             &store, &wm, Some(embedder), "e2e-agent", None, &Reach::Own, QueryTexts::single_shot("some query"), &emitted, None, DEFAULT_BUDGET
@@ -3785,7 +3785,7 @@ mod tests {
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
         let mut near = vec![0.0_f32; 384];
         near[0] = 1.0;
-        seed_memory_aged(&store, "claude-code", "regla de claude-code en tier uno", "user_preference", 1, 9.5, 1, unit_bytes(&near)).await;
+        seed_memory_aged(&store, "claude-code", "regla de claude-code en tier uno", "architectural_decision", 1, 9.5, 1, unit_bytes(&near)).await;
         let (old_id, new_id) = disputed_pair(&store, "claude-code", "semantic_fact", 8.0).await;
         // Both sides searchable, so the pair is in what cursor is shown.
         let bytes = unit_bytes(&near);
@@ -3800,7 +3800,7 @@ mod tests {
             .await
             .unwrap();
 
-        let emitted = wm.regenerate_auto_section("cursor", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("cursor", None, &Reach::AllBut(Vec::new()), &store).await.unwrap();
         let prompt = build_memory_prompt(Lang::En, 
             &store,
             &wm,
@@ -3893,7 +3893,7 @@ mod tests {
             before.push(columns(id).await);
         }
 
-        let emitted = wm.regenerate_auto_section("agent-1", Some("P1"), &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-1", Some("P1"), &Reach::Own, &store).await.unwrap();
         let prompt = build_memory_prompt(
             Lang::En,
             &store,
@@ -4118,7 +4118,7 @@ mod tests {
             .unwrap();
         let tmp = crate::test_dir::test_dir();
         let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        let emitted = wm.regenerate_auto_section("agent-1", None, &store).await.unwrap();
+        let emitted = wm.regenerate_auto_section("agent-1", None, &Reach::Own, &store).await.unwrap();
         assert!(emitted.contains(TableKind::Memory, shown), "the fixture needs the workspace to print #{shown}");
 
         let text = build_session_prompt(Lang::En, &store, &wm, "agent-1", None, &Reach::Own, &emitted, DEFAULT_BUDGET).await.unwrap().text;
