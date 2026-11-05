@@ -241,7 +241,7 @@ El plazo MUST empezar antes de leer la preferencia de idioma. Todo archivo que e
 
 ## HR5. La salida del hook no cambia
 
-`respond` MUST devolver lo que devolvía, con la misma firma, y `main` MUST imprimir lo mismo que antes y salir con el mismo código, salvo una respuesta del daemon que llegue dentro de los 50 ms que `session-start` reserva para el registro (HR4), que cuenta como `timed_out`. Los tests de `clawg hook` que ya existen MUST pasar sin cambiar lo que esperan.
+`respond` MUST devolver lo que devolvía, con la misma firma y la misma conducta, y con el plazo que le pasa quien la llama. `main` MUST imprimir lo mismo que antes y salir con el mismo código, salvo una respuesta del daemon que llegue dentro de los 50 ms que `session-start` reserva para el registro (HR4), que cuenta como `timed_out`: esa excepción es de `main`, que responde por `respond_and_record`, y no de `respond`. Los tests de `clawg hook` que ya existen MUST pasar sin cambiar lo que esperan.
 
 **Tests:** los de `hook.rs` y `tests/binary.rs` que ya había, y `respond_prints_what_the_run_counted` (`hook.rs`).
 
