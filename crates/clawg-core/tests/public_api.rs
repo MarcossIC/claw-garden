@@ -75,12 +75,16 @@ fn ranked_hit_serializes_to_json() {
         exact: false,
         topic_key: None,
         project_id: None,
+        origin: None,
     };
     let json = serde_json::to_value(&hit).expect("RankedHit must be Serialize");
     assert_eq!(json["id"], 7);
     assert_eq!(json["memory_type"], "semantic_fact");
     assert_eq!(json["kind"], "Memory");
     assert!(json["created_at"].is_i64(), "created_at must serialize as a millisecond number");
+    assert!(json.get("origin").is_none(), "a hit with no mark sends none: {json}");
+    let inferred = RankedHit { memory_type: "user_preference".into(), origin: Some("inferred"), ..hit };
+    assert_eq!(serde_json::to_value(&inferred).unwrap()["origin"], "inferred");
 }
 
 // ── explicit memories are constructible from outside the crate ────────────

@@ -30,6 +30,19 @@ use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
 /// seconds a hook is configured with, so the client never cancels one.
 pub const HOOK_DEADLINE: Duration = Duration::from_secs(3);
 
+/// What a session start keeps of its deadline for the record: a run that used
+/// up its time still leaves its line, which is what tells why that session
+/// started without memory. Three times the worst write measured, 15 ms on
+/// Windows with every core busy; an idle machine takes about 1 ms.
+pub const RECORD_RESERVE: Duration = Duration::from_millis(50);
+
+/// How long a hook waits for the preferred language before it goes on without
+/// one, so that a read a stuck disk holds up costs the language and not the
+/// memory. Above the worst read measured, 785 ms on Windows with twice as many
+/// busy threads as cores (99% under 17 ms, and under 1 ms on an idle machine),
+/// and it leaves two of the three seconds for the rest.
+pub const LANGUAGE_WAIT: Duration = Duration::from_secs(1);
+
 /// Minutes without a save, counted from the session's start at the earliest,
 /// before `user-prompt-submit` says so. Not measured yet.
 pub const SAVE_REMINDER_AFTER: Duration = Duration::from_secs(30 * 60);
@@ -235,9 +248,32 @@ pub async fn respond(
     respond_with_run(event, host, agent, base_dir, input, deadline).await.0
 }
 
+/// [`respond`], with the run written to the record by the time it returns, so
+/// that a print that fails still leaves the evidence. The whole takes `deadline`
+/// at most: a session start answers within all of it but [`RECORD_RESERVE`], and
+/// a write still held up when it ends is left behind.
+pub async fn respond_and_record(
+    event: HookEvent,
+    host: HookClient,
+    agent: &str,
+    base_dir: &Path,
+    input: impl AsyncRead + Unpin,
+    deadline: Duration,
+) -> Option<String> {
+    let end = tokio::time::Instant::now() + deadline;
+    let to_answer = match event {
+        HookEvent::SessionStart => deadline.saturating_sub(RECORD_RESERVE),
+        HookEvent::UserPromptSubmit => deadline,
+    };
+    let (out, run) = respond_with_run(event, host, agent, base_dir, input, to_answer).await;
+    if let Some(run) = run {
+        hook_log::record_by(end, base_dir.to_path_buf(), run).await;
+    }
+    out
+}
+
 /// [`respond`], and what the run leaves in the record: a `session-start` that
-/// read its input. Nothing is written here; the caller records it before it
-/// prints.
+/// read its input. Nothing is written here; [`respond_and_record`] does.
 pub async fn respond_with_run(
     event: HookEvent,
     host: HookClient,
@@ -246,13 +282,29 @@ pub async fn respond_with_run(
     input: impl AsyncRead + Unpin,
     deadline: Duration,
 ) -> (Option<String>, Option<Run>) {
+    let preferences_dir = base_dir.to_path_buf();
+    respond_reading(event, host, agent, base_dir, input, deadline, move || preferences::language_in(&preferences_dir)).await
+}
+
+/// [`respond_with_run`] with its read of the language as an argument, since no
+/// file holds up a read on every system and a test needs one that does.
+async fn respond_reading(
+    event: HookEvent,
+    host: HookClient,
+    agent: &str,
+    base_dir: &Path,
+    input: impl AsyncRead + Unpin,
+    deadline: Duration,
+    read_language: impl FnOnce() -> Option<Lang> + Send + 'static,
+) -> (Option<String>, Option<Run>) {
     if host == HookClient::Cursor && event == HookEvent::UserPromptSubmit {
         return (None, None);
     }
     let started = std::time::Instant::now();
     let at_ms = now_ms();
-    let language = preferences::language_in(base_dir);
-    let deadline = tokio::time::Instant::now() + deadline;
+    let now = tokio::time::Instant::now();
+    let deadline = now + deadline;
+    let language = read_by(deadline.min(now + LANGUAGE_WAIT), read_language).await;
     let read = tokio::time::timeout_at(deadline, read_input(input)).await;
     let read_in_time = read.is_ok();
     let raw = read.ok().flatten();
@@ -314,6 +366,18 @@ fn missing_folder(host: HookClient, input: &HookInput) -> Outcome {
     }
 }
 
+/// `read` on a thread of its own: on the thread that answers, a file a stuck disk
+/// holds up would hold up the timers too, and no deadline could end the wait.
+/// What is left of it ends with the process.
+async fn blocking<T: Send + 'static>(read: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(read).await.ok()
+}
+
+/// What `read` gives by `deadline`, or `None` when it has not finished.
+async fn read_by<T: Send + 'static>(deadline: tokio::time::Instant, read: impl FnOnce() -> Option<T> + Send + 'static) -> Option<T> {
+    tokio::time::timeout_at(deadline, blocking(read)).await.ok().flatten().flatten()
+}
+
 /// The most stdin a hook reads: the client's object is a few hundred bytes,
 /// and nothing else may fill the hook's memory.
 const INPUT_LIMIT: u64 = 1 << 20;
@@ -330,7 +394,8 @@ async fn read_input(input: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
 /// the id derived from the root, as the bridge reads it; one from before
 /// assigned ids that refuses the root, as nothing.
 async fn project_of(client: &DaemonClient, cwd: &Path) -> Option<String> {
-    let identity = ProjectIdentity::resolve(cwd);
+    let cwd = cwd.to_path_buf();
+    let identity = blocking(move || ProjectIdentity::resolve(&cwd)).await?;
     let legacy = identity.legacy_ids();
     match client.register_project(&identity.root, Some(&identity.path), &legacy, false).await {
         Ok(given) => Some(given.project_id),
@@ -340,7 +405,8 @@ async fn project_of(client: &DaemonClient, cwd: &Path) -> Option<String> {
 }
 
 /// What the hook says for `event`, before the client's output wraps it, and
-/// what happened to the memory.
+/// what happened to the memory. Every file it reads goes through [`blocking`], so
+/// the deadline around this future can end the wait.
 async fn answer(
     event: HookEvent,
     host: HookClient,
@@ -352,7 +418,10 @@ async fn answer(
     let Some(dir) = folder(host, input, || std::env::current_dir().ok()) else {
         return (None, missing_folder(host, input));
     };
-    let Some(client) = DaemonClient::from_data_dir(base_dir) else { return (None, Outcome::NoDaemon) };
+    let data_dir = base_dir.to_path_buf();
+    let Some(client) = blocking(move || DaemonClient::from_data_dir(&data_dir)).await.flatten() else {
+        return (None, Outcome::NoDaemon);
+    };
     let Some(project) = project_of(&client, &dir).await else { return (None, Outcome::ProjectRefused) };
     // Both events register: a daemon started since the session began learns
     // it at the next prompt. A refusal changes nothing the hook prints.
@@ -387,7 +456,8 @@ async fn answer(
                 Err(e) => return (None, daemon_failure(&e)),
             };
             let last = list.first().and_then(|row| row.created_at);
-            let started = input.transcript_path.as_deref().and_then(session_started_at);
+            let transcript = input.transcript_path.clone();
+            let started = blocking(move || transcript.as_deref().and_then(session_started_at)).await.flatten();
             let reminder = save_reminder(language.unwrap_or(Lang::En), now_ms(), last, started);
             let outcome = if reminder.is_some() { Outcome::Injected } else { Outcome::EmptyContext };
             (reminder, outcome)
@@ -961,6 +1031,97 @@ mod tests {
         let input = hook_input(mute.path());
         let waited = claude(input, mute.path().to_path_buf(), Duration::from_millis(300)).await;
         assert_eq!(waited.outcome, Outcome::TimedOut, "a daemon that never answers");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_start_out_of_time_still_leaves_its_line_by_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_writer, silent) = tokio::io::duplex(64);
+        let started = tokio::time::Instant::now();
+        let out = respond_and_record(HookEvent::SessionStart, HookClient::ClaudeCode, "a", dir.path(), silent, HOOK_DEADLINE).await;
+        assert_eq!(out, None);
+        assert!(started.elapsed() < HOOK_DEADLINE, "the answer leaves time to write, took {:?}", started.elapsed());
+        let outcomes: Vec<Outcome> = hook_log::read_runs(dir.path()).iter().map(|r| r.outcome).collect();
+        assert_eq!(outcomes, [Outcome::TimedOut]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_records_nothing_and_keeps_the_whole_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_writer, silent) = tokio::io::duplex(64);
+        let started = tokio::time::Instant::now();
+        let out = respond_and_record(HookEvent::UserPromptSubmit, HookClient::ClaudeCode, "a", dir.path(), silent, HOOK_DEADLINE).await;
+        assert_eq!(out, None);
+        assert!(started.elapsed() >= HOOK_DEADLINE, "{:?}", started.elapsed());
+        assert_eq!(hook_log::read_runs(dir.path()), []);
+    }
+
+    #[tokio::test]
+    async fn a_read_held_up_is_not_waited_for_past_the_deadline() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let deadline = Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        // Bounded so that a wait with no limit fails this test and does not hang it.
+        let read = read_by(started + deadline, move || {
+            let _ = held.recv_timeout(Duration::from_secs(10));
+            Some(Lang::Es)
+        })
+        .await;
+        let took = started.elapsed();
+        drop(release);
+        assert_eq!(read, None);
+        assert!(took >= deadline && took < Duration::from_secs(2), "the deadline ends the wait, after {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_language_held_up_costs_its_line_and_not_the_memory() {
+        use crate::client::tests::{publish, start_daemon};
+        let d = start_daemon().await;
+        publish(&d);
+        let client = DaemonClient::from_data_dir(d.dir.path()).expect("client");
+        let repo = tempfile::tempdir().unwrap();
+        let root = ProjectIdentity::resolve(repo.path()).root;
+        let project = client.register_project(&root, None, &[], false).await.unwrap().project_id;
+        let save = crate::client::SaveArgs {
+            content: "The deploy script lives in ops/deploy.sh".into(),
+            agent_id: "a".into(),
+            project_id: Some(project),
+            memory_type: Some("semantic_fact".into()),
+            importance: None,
+            derived_from: Vec::new(),
+            topic_key: None,
+            user_stated: false,
+        };
+        client.save(save).await.expect("save");
+        let input = serde_json::json!({ "cwd": root, "source": "startup" }).to_string();
+
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (out, run) = respond_reading(
+            HookEvent::SessionStart,
+            HookClient::ClaudeCode,
+            "a",
+            d.dir.path(),
+            input.as_bytes(),
+            HOOK_DEADLINE,
+            // Bounded so that a wait with no limit fails this test and does not hang it.
+            move || {
+                let _ = held.recv_timeout(Duration::from_secs(10));
+                Some(Lang::Es)
+            },
+        )
+        .await;
+        drop(release);
+
+        assert_eq!(run.expect("a run").outcome, Outcome::Injected);
+        let out = out.expect("the context");
+        assert!(out.contains("ops/deploy.sh"), "{out}");
+        assert!(!out.contains("español"), "a language not read in time is not named: {out}");
+    }
+
+    #[tokio::test]
+    async fn a_read_in_time_gives_what_it_read() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        assert_eq!(read_by(deadline, || Some(Lang::Es)).await, Some(Lang::Es));
     }
 
     #[tokio::test]

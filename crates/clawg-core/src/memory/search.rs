@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::pieces::SaveLink;
+use crate::memory::provenance::preference_mark;
 use crate::memory::score::{score as compute_score, RawHit, ScoringConfig};
 use crate::memory::sharing::{Reach, Reader};
 use crate::memory::vector::to_unit;
@@ -148,6 +149,12 @@ pub struct RankedHit {
     /// Sent as `null` rather than left out, so a bridge can tell such a row
     /// from a daemon that predates the field.
     pub project_id: Option<String>,
+    /// How a preference the user did not state was saved: `inferred`,
+    /// `imported` or `conclusion` (`provenance::mark`). Only the stated ones
+    /// enter the workspace on their own, so a hit says when it is not one.
+    /// `None` for a stated preference and for every other row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<&'static str>,
 }
 
 /// Position `piece` (from 1) of a save stored as `pieces` rows.
@@ -260,7 +267,8 @@ pub fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
 const SEARCH_SQL_MEMORY: &str = concat!(
     "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status, knn.distance,
-        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key, m.project_id
+        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key, m.project_id,
+        m.source, m.created_by_type
     FROM memory_vectors knn
     JOIN memory m ON m.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -283,7 +291,7 @@ const SEARCH_SQL_MEMORY: &str = concat!(
 const SEARCH_SQL_EPISODIC: &str = concat!(
     "
     SELECT epi.id, epi.task, 'episode' AS memory_type, epi.tier, epi.status, knn.distance,
-        epi.created_at, epi.last_accessed_at, epi.importance, epi.agent_id, NULL, epi.project_id
+        epi.created_at, epi.last_accessed_at, epi.importance, epi.agent_id, NULL, epi.project_id, NULL, NULL
     FROM episodic_vectors knn
     JOIN episodic_trajectory epi ON epi.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -302,7 +310,7 @@ const SEARCH_SQL_EPISODIC: &str = concat!(
 const SEARCH_SQL_PROCEDURAL: &str = concat!(
     "
     SELECT pro.id, pro.skill_name, 'procedure' AS memory_type, pro.tier, pro.status, knn.distance,
-        pro.created_at, pro.last_accessed_at, pro.importance, pro.agent_id, NULL, pro.project_id
+        pro.created_at, pro.last_accessed_at, pro.importance, pro.agent_id, NULL, pro.project_id, NULL, NULL
     FROM procedural_vectors knn
     JOIN procedural_skill pro ON pro.id = knn.rowid
     WHERE knn.embedding MATCH ?1
@@ -597,11 +605,14 @@ async fn knn_one(
                     rusqlite::params![q, k as i64, agent, proj],
                     |row| {
                         let id = row.get(0)?;
+                        let memory_type: String = row.get(2)?;
+                        let (source, by): (Option<String>, Option<String>) = (row.get(12)?, row.get(13)?);
                         Ok(RawHit {
                             id,
                             kind: table.kind,
                             content: row.get(1)?,
-                            memory_type: row.get(2)?,
+                            origin: preference_mark(&memory_type, source.as_deref(), by.as_deref()),
+                            memory_type,
                             tier: row.get(3)?,
                             status: row.get(4)?,
                             distance: row.get(5)?,
@@ -675,6 +686,7 @@ async fn knn_one(
                     exact: r.lexical_match,
                     topic_key: r.topic_key,
                     project_id: r.project_id,
+                    origin: r.origin,
                 })
                 .collect();
             // Sorted before the trim, not after: the widened window is cut
@@ -1120,7 +1132,8 @@ const LEXICAL_SCORE_SQL_PREFIX: &str = concat!(
     "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status,
         vec_distance_l2(v.embedding, ?1) AS distance,
-        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key, m.project_id
+        m.created_at, m.last_accessed_at, m.importance, m.agent_id, m.topic_key, m.project_id,
+        m.source, m.created_by_type
     FROM memory_vectors v
     JOIN memory m NOT INDEXED ON m.id = v.rowid
     WHERE m.status IN ('active', 'disputed')
@@ -1222,11 +1235,14 @@ async fn score_lexical_candidates(
 
         let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
             let id = row.get(0)?;
+            let memory_type: String = row.get(2)?;
+            let (source, by): (Option<String>, Option<String>) = (row.get(12)?, row.get(13)?);
             Ok(RawHit {
                 id,
                 kind: TableKind::Memory,
                 content: row.get(1)?,
-                memory_type: row.get(2)?,
+                origin: preference_mark(&memory_type, source.as_deref(), by.as_deref()),
+                memory_type,
                 tier: row.get(3)?,
                 status: row.get(4)?,
                 distance: row.get(5)?,
@@ -1258,6 +1274,7 @@ async fn score_lexical_candidates(
                 exact: r.lexical_match,
                 topic_key: r.topic_key,
                 project_id: r.project_id,
+                origin: r.origin,
             });
         }
         Ok(hits)
@@ -1640,6 +1657,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
         let h2 = RankedHit {
             id: 2,
@@ -1656,6 +1674,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
         let mut hits = [h2, h1];
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -1687,6 +1706,7 @@ mod tests {
                 exact: false,
                 topic_key: None,
                 project_id: None,
+                origin: None,
             }
         }
 
@@ -5257,6 +5277,37 @@ mod tests {
         assert_eq!(author(theirs).as_deref(), Some("a"));
     }
 
+    #[tokio::test]
+    async fn a_preference_hit_carries_its_origin() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let near = || serialize_embedding(&axis(0));
+        let inferred = insert_memory_row(&store, "b", "tabs in the go service", "user_preference", 2, 5.0, "active", near()).await;
+        let stated = insert_memory_row(&store, "b", "tabs in the rust crate", "user_preference", 2, 5.0, "active", near()).await;
+        let fact = insert_memory_row(&store, "b", "tabs in the makefile", "semantic_fact", 2, 5.0, "active", near()).await;
+        let only_lexical =
+            insert_memory_row(&store, "b", "zephyrword indentation", "user_preference", 2, 5.0, "active", serialize_embedding(&axis(1))).await;
+        store
+            .conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE memory SET source = 'explicit', created_by_type = 'agent' WHERE id IN (?1, ?2, ?3)",
+                    params![inferred, fact, only_lexical],
+                )?;
+                c.execute("UPDATE memory SET source = 'explicit', created_by_type = 'user' WHERE id = ?1", [stated])
+            })
+            .await
+            .unwrap();
+
+        let dense = search_all_memories(&store, &axis(0), None, "b", SearchScope::all_default(), 10).await.unwrap();
+        let lexical = search_all_memories(&store, &axis(0), Some("zephyrword"), "b", SearchScope::all_default(), 10).await.unwrap();
+
+        let origin = |hits: &[RankedHit], id: i64| hits.iter().find(|h| h.id == id).map(|h| h.origin).unwrap_or_else(|| panic!("#{id} in {hits:?}"));
+        assert_eq!(origin(&dense, inferred), Some("inferred"), "a preference the agent saved on its own");
+        assert_eq!(origin(&dense, stated), None, "a preference the user stated carries no mark");
+        assert_eq!(origin(&dense, fact), None, "only a preference is marked");
+        assert_eq!(origin(&lexical, only_lexical), Some("inferred"), "the lexical channel marks it too");
+    }
+
     // ── one hit per save ─────────────────────────────────────────────
 
     fn memory_hit(id: i64, score: f64) -> RankedHit {
@@ -5275,6 +5326,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         }
     }
 

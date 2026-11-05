@@ -11,7 +11,7 @@ Verificado contra `develop` (`4bc5a96f`):
 - `clawg hook` no deja rastro. Ante cualquier problema no imprime nada y sale con 0 (`crates/clawg-cli/src/hook.rs:6-7`), y `main` imprime la salida o nada (`crates/clawg-cli/src/main.rs:126-133`). Un hook que no inyectó, uno que no corrió y uno que corrió y no tenía memoria se ven igual.
 - `respond` descarta el motivo: `answer` devuelve `Option<String>` (`hook.rs:281-288`), y una carpeta que no se pudo elegir (`hook.rs:194`), un daemon ausente (`hook.rs:290`), una raíz rechazada (`hook.rs:275`) y un contexto vacío (`hook.rs:304`) terminan en el mismo `None`.
 - `clawg doctor` no sabe nada de Cursor: lo único del cliente que mira es el registro de Claude Code (`crates/clawg-cli/src/doctor/mod.rs:215`).
-- Cursor no ayuda. Su propio log de hooks sólo dice `Hook step requested: workspaceOpen` ([verify de client-setup-cursor](../archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod), punto 4), y su documentación dice de `sessionStart`: «This hook runs as fire-and-forget; the agent loop does not wait for or enforce a blocking response» (mismo archivo, punto 2).
+- Cursor no ayuda. Su propio log de hooks sólo dice `Hook step requested: workspaceOpen` ([verify de client-setup-cursor](../2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod), punto 4), y su documentación dice de `sessionStart`: «This hook runs as fire-and-forget; the agent loop does not wait for or enforce a blocking response» (mismo archivo, punto 2).
 - La prueba con Cursor real se hace en prod, con el binario publicado. Si un chat empieza sin memoria, hoy nadie puede decir si el hook corrió, qué mandó Cursor ni por qué no se inyectó nada.
 
 ## Objetivo que sirve

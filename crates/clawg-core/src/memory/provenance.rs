@@ -33,6 +33,11 @@ pub(crate) fn seal(source: MemorySource, role: &Role, has_sources: bool, user_st
     }
 }
 
+/// Whether this is the seal [`seal`] gives a save the user stated.
+pub(crate) fn is_stated(source: MemorySource, created_by_type: CreatedByType) -> bool {
+    source == MemorySource::Explicit && created_by_type == CreatedByType::User
+}
+
 /// What a reader shows of a stored row's origin, if anything.
 pub fn mark(source: &str, created_by_type: &str) -> Option<&'static str> {
     match (source, created_by_type) {
@@ -41,6 +46,16 @@ pub fn mark(source: &str, created_by_type: &str) -> Option<&'static str> {
         ("explicit", "agent") => Some("inferred"),
         _ => None,
     }
+}
+
+/// What a hit shows of its origin: the mark of a preference, since the
+/// workspace prints only the ones the user stated and the model reads a
+/// preference as a rule of the person. Every other row shows none.
+pub(crate) fn preference_mark(memory_type: &str, source: Option<&str>, created_by_type: Option<&str>) -> Option<&'static str> {
+    if memory_type != "user_preference" {
+        return None;
+    }
+    mark(source?, created_by_type?)
 }
 
 #[cfg(test)]

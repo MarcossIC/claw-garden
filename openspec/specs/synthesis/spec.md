@@ -6,6 +6,7 @@ Fuente de verdad del comportamiento actual de la síntesis dirigida por el agent
 - [knowledge-synthesis](../../changes/archive/2026-10-13-knowledge-synthesis/proposal.md), archivado el 2026-10-13. Los ids de requisito son los de esa spec (R1 vive en `specs/retrieval`).
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19: «Conclusiones a revisar» y su aviso, el rechazo de una fuente reemplazada (R3) y el enlace que una purga conserva (R6).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: el alcance, la memoria pendiente, la revisión y las fuentes de otro agente pasan de agente a proyecto, dentro de lo que alcanza el lector.
+- [session-start-context](../../changes/archive/2026-11-04-session-start-context/proposal.md), archivado el 2026-11-04, que salió en 0.76.0: SC6 de esa spec cambia «Memoria sin revisar» y R8, porque el aviso deja afuera lo importado.
 
 ## Definiciones
 
@@ -14,7 +15,7 @@ Fuente de verdad del comportamiento actual de la síntesis dirigida por el agent
 - **Fuentes de una conclusión:** los `source_id` de sus filas en `memory_derivation`.
 - **Alcance:** un `project_id`, o todo el store cuando se pide sin proyecto, con las filas de cualquier autor que el lector alcanza ([`specs/sharing`](../sharing/spec.md)); sin lector el pedido es del usuario (el visor, `curl`) y ve todas. Su clave en `synthesis_review` es `('', scope_key)`, con el `project_id` o `''` para todo el store: la revisión es del proyecto, no de un agente. Las filas que V10 escribió con un agente quedan y nadie las lee.
 - **Memoria pendiente de un alcance:** fila viva del alcance que no es conclusión y que no es fuente de ninguna conclusión viva, de cualquier autor (`PENDING`, `crates/clawg-core/src/memory/synthesis.rs`).
-- **Memoria sin revisar de un alcance:** memoria pendiente con `created_at` mayor que el `reviewed_at` del alcance, o cualquier pendiente si el alcance nunca se revisó.
+- **Memoria sin revisar de un alcance:** memoria pendiente que no trajo un import (`source <> 'import'`) con `created_at` mayor que el `reviewed_at` del alcance, o cualquiera de ellas si el alcance nunca se revisó.
 - **Fuente perdida:** fuente que no es una fila viva: su fila no existe (purgada), está borrada o está `superseded`. Una fuente `disputed` no está perdida: la disputa ya sale en ACTIVE CONFLICTS y no dice que la fuente sea falsa.
 - **Conclusión a revisar:** conclusión viva con al menos una fuente perdida.
 
@@ -186,6 +187,8 @@ Una conclusión de otro agente que el lector alcanza MUST aparecer; una que le o
 
 `POST /v1/context` MUST devolver `unreviewed`: cuántas memorias sin revisar tiene el alcance pedido, dentro de lo que alcanza el agente del pedido. `recall_context` MUST agregar al final del contexto una línea que nombra `synthesize` y la cantidad cuando `unreviewed` es 20 o más, y no agregar nada debajo de eso. La línea MUST NOT ir dentro del prompt que arma `build_memory_prompt`, para que `rag-eval --agent-view` no cambie. Un contexto vacío (`no context yet`) lleva la línea igual.
 
+`unreviewed` MUST contar sólo las memorias pendientes con `source` distinto de `'import'` (`unreviewed_condition`, `crates/clawg-core/src/memory/synthesis.rs:44`; `unreviewed_count`, `:290`), con las mismas reglas de alcance, de lector y de `reviewed_at`. Un import trae historia ya escrita en otra herramienta, no memorias nuevas para sacar conclusiones, y contarla dejaba el aviso prendido en cada contexto de un proyecto que importó. `synthesis_core` MUST seguir listando y contando en `pending_total` todas las pendientes, las importadas incluidas, y `conclusions_to_review_count` no cambia: cambia el aviso, no lo que se puede revisar.
+
 La misma línea llega al inicio de la sesión por el hook `session-start` ([`specs/hooks`](../hooks/spec.md), R4).
 
 Las instrucciones del servidor MCP MUST nombrar `synthesize`.
@@ -197,7 +200,14 @@ Las instrucciones del servidor MCP MUST nombrar `synthesize`.
 - WHEN se sintetiza P y se vuelve a pedir `recall_context`
 - THEN la línea no está
 
-**Test:** `unreviewed_counts_what_arrived_after_the_last_review` en `synthesis.rs`; `the_nudge_appears_from_the_threshold` y `the_nudge_follows_an_empty_context_too` en `tools.rs`; `context_reports_unreviewed_memories` en `crates/clawg-cli/tests/api.rs`; el test de instrucciones en `server.rs`.
+#### Escenario: un proyecto con un import
+- GIVEN 25 memorias importadas y 3 propias, todas pendientes en el proyecto P
+- WHEN se cuenta el aviso de P
+- THEN da 3
+- WHEN se sintetiza P
+- THEN `pending_total` es 28 y la lista trae las 28
+
+**Test:** `unreviewed_counts_what_arrived_after_the_last_review` y `the_reminder_leaves_out_what_an_import_wrote` en `synthesis.rs`; `the_nudge_appears_from_the_threshold` y `the_nudge_follows_an_empty_context_too` en `tools.rs`; `context_reports_unreviewed_memories` en `crates/clawg-cli/tests/api.rs`; el test de instrucciones en `server.rs`.
 
 ## R9. Datos de la versión anterior
 

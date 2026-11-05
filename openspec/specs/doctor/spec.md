@@ -1,6 +1,6 @@
 # doctor — Especificación
 
-Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está mal en el directorio de datos, en el store y en el registro de Claude Code, con la evidencia y el siguiente paso seguro, sin escribir nada. Cómo `clawg setup claude-code` escribe ese registro está en [`specs/setup`](../setup/spec.md); el enmascarado y `clawg purge`, en [`specs/secrets`](../secrets/spec.md); los snapshots, en [`specs/storage`](../storage/spec.md).
+Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está mal en el directorio de datos, en el store y en el registro de Claude Code, con la evidencia y el siguiente paso seguro, sin escribir nada. Cómo `clawg setup claude-code` escribe ese registro está en [`specs/setup`](../setup/spec.md); el enmascarado y `clawg purge`, en [`specs/secrets`](../secrets/spec.md); los snapshots, en [`specs/storage`](../storage/spec.md); el registro de corridas del hook que muestra (HR6 y HR7), en [`specs/hooks`](../hooks/spec.md).
 
 **Origen:**
 - [doctor-checks](../../changes/archive/2026-10-20-doctor-checks/proposal.md), archivado el 2026-10-20. Los ids de requisito son los de esa spec. El análisis del PATH (`analyze`) es anterior y queda como estaba.
@@ -10,8 +10,9 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [project-registry](../../changes/archive/2026-10-25-project-registry/proposal.md), archivado el 2026-10-25: el chequeo `project_remotes` (R7, su RG5).
 - [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 1, que sale en 0.65.0: los chequeos `projects` y `project_remotes` leen las carpetas de `project_path` (V27), con los mismos hallazgos. Un store anterior a V27 se lee con la tabla que tiene. Su entrega 2a, en la misma versión: los chequeos `project_duplicates`, `project_orphans` y `project_merges` (R7). Su entrega 2b: el chequeo `project_deletes`, y un proyecto borrado ni es un duplicado ni deja huérfanas a sus filas (R7). Su entrega 3b: el chequeo `project_subfolders` (R7).
 - [native-memory-import](../../changes/archive/2026-10-31-native-memory-import/proposal.md), archivado el 2026-10-31, que sale en 0.72.0: el chequeo `native_memory` (NM7). Cómo se importa esa memoria está en [`specs/portability`](../portability/spec.md) (NM1 a NM6).
+- [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0: el chequeo `hooks.runs` (HR6 y HR7). Lo que lee está en [`specs/hooks`](../hooks/spec.md) (HR1 a HR5 y HR8).
 
-**Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
+**Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`; la lectura del registro del hook en `crates/clawg-cli/src/hook_log.rs`, y si el hook de Cursor está instalado en `crates/clawg-cli/src/setup/cursor.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 
 ## R1. Un sobre uniforme y el JSON de antes
 
@@ -222,3 +223,27 @@ La decisión MUST ser una función pura del texto del archivo, el perfil, el bin
 Sin el servidor registrado o sin archivos de tema MUST NOT haber hallazgo. Un archivo reescrito después de importarlo no se nombra (su origen ya está); un segundo import lo trae como versión nueva. La decisión MUST ser una función pura del directorio, los archivos, los orígenes importados, el registro y el perfil.
 
 **Tests:** `native_memory_is_named_until_every_file_is_imported`, `a_server_is_registered_when_the_config_names_it` (`doctor`); `the_facts_name_the_origins_imported_from_claude_code` (`inspect.rs`); `doctor_names_native_memory_not_imported` (`crates/clawg-cli/tests/binary.rs`).
+
+## HR6. `clawg doctor` muestra las últimas corridas
+
+La corrida, el registro y `outcome` se definen en [`specs/hooks`](../hooks/spec.md).
+
+`clawg doctor` MUST sumar un hallazgo `hooks.runs` de severidad `info` cuando el registro tiene corridas (`reason_code` `recent`), con un `message` en el idioma del comando que lista las últimas 5, la más nueva primero: su antigüedad, el cliente, la última parte de `folder` (o `(N carpetas)` con varias, o `(sin carpeta)`) y qué pasó, en palabras. `evidence` MUST traer las últimas 20 completas, la más nueva primero. Lee `hook-runs.jsonl` y, si hace falta, `hook-runs.1.jsonl`, ignora las líneas que no son una corrida, MUST NOT abrir el store para esto y MUST NOT cambiar el código de salida ni la severidad por ningún `outcome`. El JSON de `clawg doctor` es la salida completa, y es lo que se pega. Una línea dañada (un byte que no es UTF-8, una línea cortada) MUST costar sólo esa línea, y un `at_ms` extremo MUST NOT hacer fallar el cálculo de la antigüedad. Para `bad_input`, el mensaje MUST decir que la entrada no se pudo leer, no que no era JSON.
+
+#### Escenario: corridas de dos clientes
+- GIVEN siete corridas en el registro
+- WHEN corre `clawg doctor`
+- THEN `hooks.runs` es `info`, su `message` lista las cinco últimas y su `evidence.runs` las siete
+
+**Tests:** `a_damaged_file_costs_only_its_damaged_lines` (`hook_log.rs`), `a_run_stamped_at_the_extremes_does_not_panic`, `bad_input_does_not_claim_the_input_was_not_json` (`checks.rs`), `recent_runs_are_listed_newest_first_five_in_the_message_and_twenty_in_the_evidence`, `every_outcome_has_words_and_none_raises_the_severity`, `a_folder_is_named_by_its_last_part`, `ages_are_counted_in_words` (`checks.rs`), `doctor_lists_the_hook_runs_and_still_exits_0` (`tests/binary.rs`).
+
+## HR7. El hook instalado sin corridas registradas
+
+Con el hook de Cursor del perfil instalado en `~/.cursor/hooks.json` (la regla de `setup cursor`) y sin corridas, `clawg doctor` MUST dar un hallazgo `hooks.runs` `info` con `reason_code` `not_run`, que dice que el hook está instalado y todavía no hay corridas registradas, y que el paso siguiente es abrir un chat nuevo y correr `clawg doctor` otra vez. MUST decir que una línea que falta no dice si el hook corrió, y MUST NOT decir que Cursor no lo corre: una escritura que falla o se pasa del plazo no deja línea ([`specs/hooks`](../hooks/spec.md), HR4). Sin hook instalado y sin corridas MUST NOT dar ningún hallazgo `hooks.runs`.
+
+#### Escenario: instalado y sin corridas
+- GIVEN `clawg setup cursor` aplicado y ningún registro
+- WHEN corre `clawg doctor`
+- THEN `hooks.runs` es `info` `not_run`; y sin `setup cursor` no hay ningún `hooks.runs`
+
+**Tests:** `an_installed_hook_with_no_runs_says_so_and_none_installed_says_nothing` (`checks.rs`), `the_hook_of_this_profile_is_found_in_hooks_json` (`setup/cursor.rs`), `doctor_says_when_the_installed_hook_has_no_runs` (`tests/binary.rs`).

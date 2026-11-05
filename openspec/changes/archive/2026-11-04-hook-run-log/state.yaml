@@ -1,8 +1,8 @@
 change: hook-run-log
 objective: "4"
 depends_on: []
-phase: verify
-release: "0.76.0"  # su código es anterior al bump a 0.76.0 (chore: bump version to 0.76.0), así que archivarlo no vuelve a subir la versión
+phase: archived
+release: "0.76.0"  # su código es anterior al bump a 0.76.0 (chore: bump version to 0.76.0), así que archivarlo no vuelve a subir la versión; el arreglo de la escritura trabada (0ff19a7d) sale en 0.77.0, que todavía no tiene tag (verify.md, «Al archivar»)
 artifacts:
   exploration: skipped  # la evidencia va en la propuesta
   proposal: done  # las siete decisiones, cerradas antes de escribirla
@@ -10,7 +10,7 @@ artifacts:
   design: skipped  # las decisiones están en la propuesta
   tasks: done
   apply: done  # un commit por paso, con sus tests en rojo antes
-  verify: pending  # Linux y el CI de Windows no corrieron: falta el pull request; en Windows local pasan la suite y los dos clippy (verify.md)
-  archive: pending
+  verify: done  # la suite y los dos clippy en Windows; el CI de Linux y Windows de #126 hasta d68d4c35; el CI del arreglo de la escritura trabada queda para después del archivo (verify.md, «Veredicto»)
+  archive: done
 main_spec: openspec/specs/hooks/spec.md, openspec/specs/doctor/spec.md
 updated: 2026-11-04

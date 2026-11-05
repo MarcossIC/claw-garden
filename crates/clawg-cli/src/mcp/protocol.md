@@ -74,8 +74,10 @@ Every row competes with the others in search, so leave out:
   agent saved, so pick a name that says the topic, never a generic word. `search_memory` and
   `read_memory` show a memory's key as `topic=K` only where saving under it
   replaces that memory: save its new version under that key, the one shown,
-  never a new one. A memory of another project, or of none, shows no key,
-  since a save here would keep it beside the new one.
+  never a new one. A preference saved without a project shows
+  `topic=K all_projects`: save its new version with `all_projects` and that key.
+  Any other memory of another project, or of none, shows no key, since a save
+  here would keep it beside the new one.
 - Write it so it reads on its own months from now, with no conversation
   around it.
 - Write it in English, and search in English too. A memory saved in one
@@ -96,7 +98,9 @@ Every row competes with the others in search, so leave out:
 - `semantic_fact`: a fact about the project or the world: what is true, what
   was done, found or measured, and a fixed bug with its root cause. The
   default.
-- `user_preference`: how the user wants things done, in any project.
+- `user_preference`: how the user wants things done. One that holds wherever
+  they work is saved with `all_projects`, without a project; one for this
+  project only, without it.
 - `architectural_decision`: a design choice and its reason. What was done,
   archived or measured after a decision is a `semantic_fact`: two close
   decisions are put to the user as a conflict.
@@ -108,10 +112,13 @@ Every row competes with the others in search, so leave out:
 An unknown type is refused, and the error lists these seven.
 
 `importance` goes from 0 to 10 and defaults to 5. Leave it at 5 unless the
-memory matters more or less than usual. A `user_preference` at 8 or more is
-printed at the top of every `recall_context`, in every project, and an
-`architectural_decision` at 9 or more at the top of every `recall_context` of
-its project. At 9 or more a memory is never demoted for not being used. `update_memory` corrects the type or the importance later.
+memory matters more or less than usual. A `user_preference` at 8 or more that
+the user stated, saved with `user_stated`, is printed at the top of every
+`recall_context` of its project, or of every project with `all_projects`, for
+every agent that reads it; one they did not state is found by search, marked
+inferred, imported or conclusion. An `architectural_decision` at 9 or more is
+printed at the top of every `recall_context` of its project. At 9 or more a
+memory is never demoted for not being used. `update_memory` corrects the type or the importance later.
 When the user says a memory belongs to another project, or to none, `update_memory`
 moves it with `to_project_path` or `clear_project`.
 

@@ -76,8 +76,10 @@ Cada fila compite con las demás en la búsqueda, así que deja afuera:
   palabra genérica. `search_memory` y `read_memory` muestran la clave de una
   memoria como `topic=K` sólo donde guardar bajo ella reemplaza esa memoria:
   guarda su versión nueva bajo esa clave, la que se muestra, nunca una nueva.
-  Una memoria de otro proyecto, o de ninguno, no muestra clave, porque un save
-  aquí la dejaría al lado de la nueva.
+  Una preferencia guardada sin proyecto muestra `topic=K all_projects`: guarda
+  su versión nueva con `all_projects` y esa clave. Cualquier otra memoria de
+  otro proyecto, o de ninguno, no muestra clave, porque un save aquí la dejaría
+  al lado de la nueva.
 - Escríbela para que se lea sola dentro de meses, sin ninguna conversación
   alrededor.
 - Escríbela en español, y busca en español también. Una memoria guardada en
@@ -99,8 +101,9 @@ Cada fila compite con las demás en la búsqueda, así que deja afuera:
 - `semantic_fact`: un hecho del proyecto o del mundo: lo que es cierto, lo que
   se hizo, se encontró o se midió, y un bug arreglado con su causa. El valor
   por defecto.
-- `user_preference`: cómo quiere la persona que se hagan las cosas, en
-  cualquier proyecto.
+- `user_preference`: cómo quiere la persona que se hagan las cosas. Una que
+  vale en todo lo que hace se guarda con `all_projects`, sin proyecto; una
+  sólo de este proyecto, sin él.
 - `architectural_decision`: una elección de diseño y su motivo. Lo que se hizo,
   se archivó o se midió después de una decisión es un `semantic_fact`: dos
   decisiones cercanas se le plantean a la persona como un conflicto.
@@ -112,10 +115,13 @@ Cada fila compite con las demás en la búsqueda, así que deja afuera:
 Un tipo desconocido se rechaza, y el error lista estos siete.
 
 `importance` va de 0 a 10 y por defecto es 5. Déjala en 5 salvo que la memoria
-importe más o menos que lo habitual. Una `user_preference` con 8 o más se
-imprime arriba de cada `recall_context`, en todos los proyectos, y una
-`architectural_decision` con 9 o más arriba de cada `recall_context` de su
-proyecto. Con 9 o más una memoria nunca baja de tier por no usarse.
+importe más o menos que lo habitual. Una `user_preference` con 8 o más que dijo
+la persona, guardada con `user_stated`, se imprime arriba de cada
+`recall_context` de su proyecto, o de todos con `all_projects`, para cada agente
+que la lee; una que no dijo la encuentra la búsqueda, marcada inferred,
+imported o conclusion. Una `architectural_decision` con 9 o más se imprime
+arriba de cada `recall_context` de su proyecto. Con 9 o más una memoria nunca
+baja de tier por no usarse.
 `update_memory` corrige después el tipo o la importancia. Cuando la persona
 dice que una memoria es de otro proyecto, o de ninguno, `update_memory` la
 mueve con `to_project_path` o `clear_project`.

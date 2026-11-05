@@ -1306,6 +1306,33 @@ async fn search_and_context_follow_the_sharing_policy_from_the_next_call() {
 }
 
 #[tokio::test]
+async fn a_stated_preference_reaches_the_session_start_of_another_agent() {
+    const RULE: &str = "Answer in short sentences and never use emoji.";
+    let h = Harness::start().await;
+    save_id(
+        &h,
+        json!({
+            "content": RULE, "agent_id": "claude-code", "project_id": "p",
+            "memory_type": "user_preference", "importance": 9.0, "user_stated": true,
+        }),
+    )
+    .await;
+    let workspace = |body: &Value| {
+        let prompt = body["prompt"].as_str().unwrap().to_owned();
+        let start = prompt.find("=== WORKSPACE ===").map(|at| at + "=== WORKSPACE ===".len());
+        start.map(|at| prompt[at..].split("\n=== ").next().unwrap_or_default().to_owned()).unwrap_or_default()
+    };
+
+    let (status, body) = h.post_json("/v1/context", json!({ "agent_id": "cursor", "project_id": "p" })).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(workspace(&body).contains(&format!("- {RULE}")), "what the user told one agent opens another's session: {body}");
+
+    write_policy(&h, r#"{"version":1,"hides":{"cursor":["claude-code"]}}"#);
+    let (_, body) = h.post_json("/v1/context", json!({ "agent_id": "cursor", "project_id": "p" })).await;
+    assert!(!workspace(&body).contains(RULE), "a hidden author stays out from the next call: {body}");
+}
+
+#[tokio::test]
 async fn an_unreadable_policy_shares_nothing_over_http() {
     let h = Harness::start().await;
     let theirs = save_id(&h, json!({ "content": CONTENT, "agent_id": "a" })).await;
@@ -1707,16 +1734,16 @@ async fn context_says_how_many_hits_it_withheld() {
     assert_eq!(body["retrieval"], json!({ "state": "searched", "hits": 0, "withheld": 4 }));
 }
 
-/// Standing preferences are never cut, so a workspace of many long ones
-/// overflows any budget and the closing note names the one that applied.
+/// Standing preferences the user stated fill the workspace, so a workspace
+/// of many long ones overflows any budget and the closing note names the one
+/// that applied.
 #[tokio::test]
 async fn context_takes_a_budget_and_clamps_it() {
     let h = Harness::start().await;
     for i in 0..20 {
         let content = format!("preference {i}: {}", "always keep the error path explicit ".repeat(40));
-        let (status, body) = h
-            .post_json("/v1/memories", json!({ "content": content, "agent_id": "a", "memory_type": "user_preference", "importance": 9.0 }))
-            .await;
+        let save = json!({ "content": content, "agent_id": "a", "memory_type": "user_preference", "importance": 9.0, "user_stated": true });
+        let (status, body) = h.post_json("/v1/memories", save).await;
         assert_eq!(status, 201, "{body}");
     }
     let context = |budget: Value| {

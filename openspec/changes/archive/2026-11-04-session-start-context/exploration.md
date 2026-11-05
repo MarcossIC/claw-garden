@@ -4,7 +4,7 @@
 |---|---|---|---|
 | 1 y 4 | S–M | — | exploración; decisiones cerradas, lista para aplicar |
 
-**Tesis:** instalar los hooks en todos los proyectos hoy empeora el arranque de cada sesión. Las preferencias ocupan todo el presupuesto, el resumen de la última sesión queda afuera y el aviso de `synthesize` sale en cada proyecto importado. Este cambio arregla el reparto y el aviso. Qué preferencias merecen entrar lo decide [preference-model](../preference-model/exploration.md).
+**Tesis:** instalar los hooks en todos los proyectos hoy empeora el arranque de cada sesión. Las preferencias ocupan todo el presupuesto, el resumen de la última sesión queda afuera y el aviso de `synthesize` sale en cada proyecto importado. Este cambio arregla el reparto y el aviso. Qué preferencias merecen entrar lo decide [preference-model](../../preference-model/exploration.md).
 
 ## Problema (verificado)
 

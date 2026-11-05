@@ -34,6 +34,8 @@ pub(crate) struct RawHit {
     pub topic_key: Option<String>,
     /// The project the row was saved in; `None` for a row saved without one.
     pub project_id: Option<String>,
+    /// The mark of a preference the user did not state (`provenance::preference_mark`).
+    pub origin: Option<&'static str>,
 }
 
 /// Tier-floor decay minimums — `MAX(tier_floor, exp_decay(...))` never lets a
@@ -337,6 +339,7 @@ mod tests {
             topic_key: None,
             agent_id: None,
             project_id: None,
+            origin: None,
         }
     }
 

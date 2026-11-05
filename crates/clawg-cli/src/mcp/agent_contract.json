@@ -284,6 +284,14 @@
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
+          "all_projects": {
+            "default": null,
+            "description": "True for a memory that holds in every project, such as a preference\nthe user has wherever they work: it is saved without a project, so\nevery project reads it. Not with project or project_path.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "content": {
             "description": "The memory to store, written as a self-contained statement — it will be\nread back in a future session with none of this conversation around it.\nAt most 64 KiB; split a longer text into several saves.",
             "type": "string"

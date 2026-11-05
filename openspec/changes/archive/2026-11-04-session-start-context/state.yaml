@@ -1,7 +1,8 @@
 change: session-start-context
 objective: "1, 4"
 depends_on: []
-phase: verify
+phase: archived
+release: "0.76.0"  # todo su código; al archivar la versión sube a 0.77.0 (verify.md, «Al archivar»)
 artifacts:
   exploration: done
   proposal: done  # las seis decisiones de la exploración, y cómo se nombra una entrada de AUTO
@@ -9,7 +10,7 @@ artifacts:
   design: skipped  # las decisiones están cerradas en la exploración; la propuesta dice cómo se aplican
   tasks: done
   apply: done  # el aviso; el informe de la regeneración junto con el recorte de AUTO; docs/reference
-  verify: done  # Linux: la suite y los dos clippy; Windows en el CI del pull request; falta un arranque real con Claude Code sobre el perfil dev
-  archive: pending
-main_spec: openspec/specs/retrieval/spec.md
+  verify: done  # Linux y el CI de Windows; el contexto con consulta sobre un store real; el arranque con Claude Code queda en prod (verify.md)
+  archive: done
+main_spec: openspec/specs/retrieval/spec.md, openspec/specs/synthesis/spec.md, openspec/specs/metrics/spec.md
 updated: 2026-11-04

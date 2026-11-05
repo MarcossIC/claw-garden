@@ -1,6 +1,6 @@
 # hook-run-log — Especificación
 
-`clawg hook session-start` deja un renglón por corrida en `<data>/hook-runs.jsonl`, y `clawg doctor` muestra las últimas. Al archivar, HR1 a HR5 y HR8 se suman a [`specs/hooks`](../../specs/hooks/spec.md) y HR6 y HR7 a [`specs/doctor`](../../specs/doctor/spec.md). Lo que esas specs dicen de la salida del hook no cambia.
+`clawg hook session-start` deja un renglón por corrida en `<data>/hook-runs.jsonl`, y `clawg doctor` muestra las últimas. Al archivar, HR1 a HR5 y HR8 se suman a [`specs/hooks`](../../../specs/hooks/spec.md) y HR6 y HR7 a [`specs/doctor`](../../../specs/doctor/spec.md). Lo que esas specs dicen de la salida del hook no cambia.
 
 ## Definiciones
 
@@ -61,16 +61,28 @@ El registro MUST NOT contener el valor de `user_email`, el texto del contexto ni
 
 La línea MUST armarse entera y agregarse con una sola escritura. Antes de agregar, con el registro en 64 KiB o más, MUST renombrarlo a `hook-runs.1.jsonl`, reemplazando al anterior, y empezar uno nuevo. MUST NOT crear el directorio de datos: si no existe, no registra. Cualquier falla (permisos, un directorio en lugar del archivo, un disco lleno) MUST tragarse sin nada en stdout ni en stderr y sin cambiar la salida ni el código de salida. El registro MUST escribirse antes de imprimir. Si ese renombrado falla, la corrida MUST agregarse igual al archivo actual, y la próxima vuelve a intentarlo.
 
+La espera por esa escritura MUST terminar en el plazo del hook (`HOOK_DEADLINE`), haya terminado la escritura o no: un disco trabado MUST NOT demorar la respuesta, y `main` MUST NOT esperar esa escritura al salir. Esa corrida se queda sin línea. `session-start` MUST responder dentro del plazo menos `RECORD_RESERVE` (50 ms), para que una corrida `timed_out` también tenga tiempo de dejar la suya; `user-prompt-submit`, que no registra, MUST conservar el plazo entero.
+
 #### Escenario: el directorio de datos no existe
 - GIVEN un home sin directorio de datos
 - WHEN corre el hook
 - THEN no hay directorio de datos después, y la salida es la de siempre
 
-**Tests:** `a_line_is_appended`, `a_failed_roll_still_records_the_run`, `the_file_rolls_over_at_64_kib_and_replaces_the_old_one`, `concurrent_appends_keep_every_line`, `a_missing_data_directory_is_not_created`, `a_failed_append_is_swallowed` (`hook_log.rs`), `a_hook_does_not_create_the_data_directory_to_record` (`tests/binary.rs`).
+#### Escenario: el registro no se puede escribir
+- GIVEN la preferencia `es` y un `hook-runs.jsonl` cuya apertura se bloquea para siempre (un FIFO que nadie lee)
+- WHEN corre `clawg hook session-start`
+- THEN imprime la línea del idioma y sale con 0, sin esperar a esa escritura
+
+#### Escenario: la corrida se queda sin tiempo
+- GIVEN un stdin que nunca se cierra
+- WHEN corre `clawg hook session-start`
+- THEN responde antes del plazo y el registro tiene su línea, con `timed_out`
+
+**Tests:** `a_line_is_appended`, `a_failed_roll_still_records_the_run`, `the_file_rolls_over_at_64_kib_and_replaces_the_old_one`, `concurrent_appends_keep_every_line`, `a_missing_data_directory_is_not_created`, `a_failed_append_is_swallowed`, `a_write_in_time_is_done_when_the_wait_ends`, `a_write_held_up_is_not_waited_for_past_the_deadline` (`hook_log.rs`), `a_session_start_out_of_time_still_leaves_its_line_by_the_deadline`, `a_prompt_records_nothing_and_keeps_the_whole_deadline` (`hook.rs`), `a_hook_does_not_create_the_data_directory_to_record` y, sólo en Unix, `a_record_that_cannot_be_written_does_not_hold_up_the_answer` (`tests/binary.rs`).
 
 ## HR5. La salida del hook no cambia
 
-`respond` MUST devolver lo que devolvía, con la misma firma, y `main` MUST imprimir lo mismo que antes y salir con el mismo código. Los tests de `clawg hook` que ya existen MUST pasar sin cambiar lo que esperan.
+`respond` MUST devolver lo que devolvía, con la misma firma y la misma conducta, y con el plazo que le pasa quien la llama. `main` MUST imprimir lo mismo que antes y salir con el mismo código, salvo una respuesta del daemon que llegue dentro de los 50 ms que `session-start` reserva para el registro (HR4), que cuenta como `timed_out`: esa excepción es de `main`, que responde por `respond_and_record`, y no de `respond`. Los tests de `clawg hook` que ya existen MUST pasar sin cambiar lo que esperan.
 
 **Tests:** los de `hook.rs` y `tests/binary.rs` que ya había, y `respond_prints_what_the_run_counted` (`hook.rs`).
 

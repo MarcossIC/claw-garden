@@ -12,7 +12,7 @@ use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::language;
 use crate::memory::vector::to_unit;
 use crate::memory::outbox::{apply_note, OutboxNote};
-use crate::memory::provenance::seal;
+use crate::memory::provenance::{is_stated, seal};
 use crate::memory::search::{reach_predicate, reader_bind};
 use crate::memory::sharing::Reader;
 use crate::memory::MemoryStore;
@@ -197,12 +197,7 @@ impl NewMemoryRecord {
             // with no stated type IS an asserted fact — and, being
             // claim-bearing, it stays eligible for contradiction resolution
             // instead of landing in the inert `ChatMessage` bucket.
-            let importance = evt
-                .importance
-                .filter(|v| !v.is_nan()) // NaN has no place on the scale to clamp it to.
-                .map(|v| v.clamp(IMPORTANCE_MIN, IMPORTANCE_MAX))
-                .unwrap_or(DEFAULT_IMPORTANCE);
-            (memory_type, importance)
+            (memory_type, deliberate_importance(evt))
         } else if evt.source == MemorySource::Compaction {
             (MemoryType::SessionSummary, 6.0)
         } else {
@@ -237,6 +232,14 @@ impl NewMemoryRecord {
             source_session_id: evt.session_id.clone(),
         }
     }
+}
+
+/// The importance a deliberate save asks for, on the scale, or the default.
+pub(crate) fn deliberate_importance(evt: &MemoryEvent) -> f64 {
+    evt.importance
+        .filter(|v| !v.is_nan()) // NaN has no place on the scale to clamp it to.
+        .map(|v| v.clamp(IMPORTANCE_MIN, IMPORTANCE_MAX))
+        .unwrap_or(DEFAULT_IMPORTANCE)
 }
 
 /// Links `memory_id` to each of `sources` inside the caller's transaction. A
@@ -317,6 +320,26 @@ const REINFORCE_LOOKUP_SQL: &str = concat!(
     " ORDER BY created_at ASC LIMIT 1"
 );
 
+/// What a save the user stated does to the row it repeats: gives it the seal
+/// such a save gets (`provenance::seal`) and raises it to the save's importance,
+/// never lowering it, or what the user said could stay out of the workspace for
+/// having been inferred first at a lower one. An import keeps its `source`, which
+/// a second import and `clawg doctor` find it by, and a conclusion stays the
+/// agent's whoever's words it rests on.
+const SEAL_AS_STATED_SQL: &str = "UPDATE memory SET source = 'explicit', created_by_type = 'user', \
+         importance = MAX(importance, ?2), \
+         tier = compute_tier(tier, MAX(importance, ?2), access_count, memory_type) \
+     WHERE id = ?1 AND source NOT IN ('import', 'synthesis')";
+
+/// What a repeated save brings to the row it reinforces.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Repeat<'a> {
+    pub(crate) derived_from: &'a [i64],
+    /// The importance of a save sealed as the user's
+    /// (`provenance::is_stated`), and `None` for any other.
+    pub(crate) stated_importance: Option<f64>,
+}
+
 impl MemoryStore {
     /// [`MemoryStore::reinforce_noting`] with nothing to note.
     #[cfg(test)]
@@ -328,14 +351,14 @@ impl MemoryStore {
         derived_from: &[i64],
         now_ms: u64,
     ) -> Result<Option<i64>, MemoryStoreError> {
-        self.reinforce_noting(saver, project_id, content_hash, derived_from, now_ms, |_| None).await
+        self.reinforce_noting(saver, project_id, content_hash, Repeat { derived_from, stated_importance: None }, now_ms, |_| None).await
     }
 
     /// Reinforces the existing active row matching `(COALESCE(project_id,''),
     /// content_hash)` within `saver`'s reach, if any: `access_count += 1`,
     /// `last_accessed_at = MAX(last_accessed_at, now_ms)`, `tier` recomputed
-    /// via `compute_tier`. Returns the reinforced row's id, or `None` on a
-    /// miss.
+    /// via `compute_tier`, and the seal and importance of a save the user
+    /// stated. Returns the reinforced row's id, or `None` on a miss.
     ///
     /// One `conn.call()` holding one `SELECT .optional()` → branch → `UPDATE`
     /// — atomic for that pair, shaped after `promote_to_procedural_skill`
@@ -375,14 +398,15 @@ impl MemoryStore {
         saver: &Reader,
         project_id: Option<&str>,
         content_hash: &str,
-        derived_from: &[i64],
+        repeat: Repeat<'_>,
         now_ms: u64,
         note: impl FnOnce(i64) -> Option<OutboxNote> + Send + 'static,
     ) -> Result<Option<i64>, MemoryStoreError> {
         let reach = reader_bind(Some(saver));
         let project_id = project_id.map(str::to_string);
         let content_hash = content_hash.to_string();
-        let derived_from = derived_from.to_vec();
+        let derived_from = repeat.derived_from.to_vec();
+        let stated_importance = repeat.stated_importance;
         let now = TimestampMs::from_unix_millis_u64(now_ms);
 
         self.conn
@@ -401,7 +425,7 @@ impl MemoryStore {
                     return Ok(None);
                 };
 
-                reinforce_in(&tx, id, now, &derived_from)?;
+                reinforce_in(&tx, id, now, Repeat { derived_from: &derived_from, stated_importance })?;
                 if let Some(note) = note(id) {
                     apply_note(&tx, &note)?;
                 }
@@ -473,7 +497,9 @@ impl MemoryStore {
                     .optional()?;
                 let (stored, note) = match twin {
                     Some(id) => {
-                        reinforce_in(&tx, id, row.created_at, &row.record.derived_from)?;
+                        let stated_importance =
+                            is_stated(row.record.source, row.record.created_by_type).then_some(row.record.importance);
+                        reinforce_in(&tx, id, row.created_at, Repeat { derived_from: &row.record.derived_from, stated_importance })?;
                         (Stored::Absorbed(id), absorbed(id))
                     }
                     None => {
@@ -499,13 +525,14 @@ pub(crate) enum Stored {
     Absorbed(i64),
 }
 
-/// One more access to an existing row, at `now`, its tier recomputed, and the
-/// save's sources linked to it.
+/// One more access to an existing row, at `now`, its tier recomputed, the save's
+/// sources linked to it and, when the user stated the save, its seal and
+/// importance.
 fn reinforce_in(
     tx: &rusqlite::Transaction<'_>,
     id: i64,
     now: TimestampMs,
-    derived_from: &[i64],
+    repeat: Repeat<'_>,
 ) -> rusqlite::Result<()> {
     tx.execute(
         "UPDATE memory \
@@ -515,7 +542,10 @@ fn reinforce_in(
          WHERE id = ?1",
         rusqlite::params![id, now],
     )?;
-    link_sources(tx, id, derived_from, now)
+    if let Some(importance) = repeat.stated_importance {
+        tx.execute(SEAL_AS_STATED_SQL, rusqlite::params![id, importance])?;
+    }
+    link_sources(tx, id, repeat.derived_from, now)
 }
 
 /// A `memory` row and its vector, worked out before the transaction that

@@ -1908,6 +1908,146 @@ async fn a_hook_does_not_create_the_data_directory_to_record() {
     assert!(!sandbox.data_dir().exists(), "nothing was created to hold the record");
 }
 
+/// Opening a FIFO that no one reads blocks for good, as a stuck disk does.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_record_that_cannot_be_written_does_not_hold_up_the_answer() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let made = Command::new("mkfifo").arg(sandbox.data_dir().join("hook-runs.jsonl")).status().expect("run mkfifo");
+    assert!(made.success());
+
+    let mut child = sandbox
+        .command(&["hook", "session-start", "--agent", "a", "--profile", "dev"])
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clawg hook");
+    child.stdin.take().expect("stdin").write_all(br#"{"cwd":"/"}"#).expect("write stdin");
+    let limit = Instant::now() + REPLY_BUDGET;
+    while child.try_wait().expect("wait for the hook").is_none() {
+        if Instant::now() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the hook waited for a write that nothing will finish");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let out = child.wait_with_output().expect("clawg hook");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("español"), "the answer still arrives: {}", stdout_of(&out));
+}
+
+/// Opening a FIFO that no one writes blocks for good, as a stuck disk does.
+/// With no answer from the daemon's files, the language line goes out alone.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_daemon_state_that_cannot_be_read_does_not_hold_up_the_answer() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let made = Command::new("mkfifo").arg(sandbox.data_dir().join("daemon.json")).status().expect("run mkfifo");
+    assert!(made.success());
+
+    let mut child = sandbox
+        .command(&["hook", "session-start", "--agent", "a", "--profile", "dev"])
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clawg hook");
+    child.stdin.take().expect("stdin").write_all(br#"{"cwd":"/"}"#).expect("write stdin");
+    let limit = Instant::now() + REPLY_BUDGET;
+    while child.try_wait().expect("wait for the hook").is_none() {
+        if Instant::now() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the hook waited for a read that nothing will finish");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let out = child.wait_with_output().expect("clawg hook");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("español"), "the answer still arrives: {}", stdout_of(&out));
+}
+
+/// Finding the project reads a `.git` that is not a directory, and opening a
+/// FIFO that no one writes blocks for good, as a stuck disk does.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_project_that_cannot_be_read_does_not_hold_up_the_answer() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).expect("create the project");
+    let made = Command::new("mkfifo").arg(root.join(".git")).status().expect("run mkfifo");
+    assert!(made.success());
+    let _daemon = sandbox.serve().await;
+
+    let mut child = sandbox
+        .command(&["hook", "session-start", "--agent", "a", "--profile", "dev"])
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clawg hook");
+    let input = json!({ "cwd": root }).to_string();
+    child.stdin.take().expect("stdin").write_all(input.as_bytes()).expect("write stdin");
+    let limit = Instant::now() + REPLY_BUDGET;
+    while child.try_wait().expect("wait for the hook").is_none() {
+        if Instant::now() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the hook waited for a read that nothing will finish");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let out = child.wait_with_output().expect("clawg hook");
+    assert_eq!((out.status.code(), stdout_of(&out)), (Some(0), String::new()), "{}", stderr_of(&out));
+}
+
+/// Opening a FIFO that no one writes blocks for good, as a stuck disk does.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_preference_that_cannot_be_read_does_not_hold_up_the_answer() {
+    let sandbox = Sandbox::new();
+    let set = sandbox.run(&["preferences", "set", "language", "es", "--profile", "dev"]);
+    assert_eq!(set.status.code(), Some(0), "{}", stderr_of(&set));
+    let preferences = sandbox.data_dir().join("preferences.json");
+    std::fs::remove_file(&preferences).expect("remove the preferences");
+    let made = Command::new("mkfifo").arg(&preferences).status().expect("run mkfifo");
+    assert!(made.success());
+
+    let mut child = sandbox
+        .command(&["hook", "session-start", "--agent", "a", "--profile", "dev"])
+        .current_dir(&sandbox.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clawg hook");
+    child.stdin.take().expect("stdin").write_all(br#"{"cwd":"/"}"#).expect("write stdin");
+    let limit = Instant::now() + REPLY_BUDGET;
+    while child.try_wait().expect("wait for the hook").is_none() {
+        if Instant::now() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the hook waited for a read that nothing will finish");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let out = child.wait_with_output().expect("clawg hook");
+    assert_eq!((out.status.code(), stdout_of(&out)), (Some(0), String::new()), "{}", stderr_of(&out));
+}
+
 // ── doctor ─────────────────────────────────────────────────────────────────
 
 /// `clawg doctor` with a PATH that holds no `clawg` and no Claude Code
@@ -1974,7 +2114,7 @@ async fn doctor_lists_the_hook_runs_and_still_exits_0() {
 }
 
 #[tokio::test]
-async fn doctor_says_when_the_installed_hook_never_ran() {
+async fn doctor_says_when_the_installed_hook_has_no_runs() {
     let sandbox = Sandbox::new();
     let (_, before) = doctor(&sandbox);
     assert_eq!(findings(&before, "hooks.runs"), [], "no Cursor hook and no runs: nothing to say");

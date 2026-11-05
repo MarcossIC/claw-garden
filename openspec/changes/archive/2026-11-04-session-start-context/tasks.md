@@ -40,10 +40,11 @@ Los requisitos están en la [spec](spec.md); las decisiones, en la [propuesta](p
 ## 4. Verificación
 
 - [x] La suite, `cargo clippy --workspace --all-targets -- -D warnings` y `cargo clippy -p clawg-cli -- -D warnings` en Linux, sobre el último commit ([verify](verify.md)).
-- [ ] El CI del pull request en verde en Linux y Windows.
+- [x] El CI de #129 en verde en Linux y Windows, sobre `26c52fb`.
 - [x] `verify.md`, `state.yaml`, la fila 114 del `README.md` de openspec y la línea del cambio en `ROADMAP.md`.
 - Commit: `docs(openspec): record session-start-context applied`
 
 ## 5. Archivo (fuera de este cambio)
 
-- [ ] Llevar SC1 a SC5 a `specs/retrieval`, SC6 a `specs/synthesis` y el bloque `workspace` a `specs/metrics`; mover la carpeta a `changes/archive/`; subir el minor.
+- [x] Llevar SC1 a SC5 a `specs/retrieval`, SC6 a `specs/synthesis` y el bloque `workspace` a `specs/metrics`; mover la carpeta a `changes/archive/`; subir el minor, a 0.77.0.
+- Commits: `docs(openspec): archive session-start-context and fold it into the specs` y `chore: bump version to 0.77.0`

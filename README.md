@@ -245,7 +245,7 @@ Muestra en JSON qué archivos `clawg.exe` encuentra tu PATH y, en `checks`, cada
 **3. El estado del daemon**
 
 ```powershell
-clawg status --profile prod
+clawg status
 ```
 
 Recién instalado, lo normal es que diga `"running": false` y termine con código `1`: todavía nadie arrancó el daemon.
@@ -255,13 +255,13 @@ Recién instalado, lo normal es que diga `"running": false` y termine con códig
 Abrí **dos** terminales. En la primera:
 
 ```powershell
-clawg serve --profile prod
+clawg serve
 ```
 
 Dejala abierta. En la segunda:
 
 ```powershell
-clawg status --profile prod
+clawg status
 ```
 
 Ahora debería decir `"running": true`. La primera vez, el modelo de embeddings se descarga en segundo plano desde Hugging Face (una sola vez, necesita internet): mientras tanto el daemon ya responde, pero la búsqueda semántica todavía no está lista. Repetí `status` y vas a ver el modelo pasar de `loading` a `ready`; suele tardar entre 3 y 15 segundos.
@@ -269,7 +269,7 @@ Ahora debería decir `"running": true`. La primera vez, el modelo de embeddings 
 Para detenerlo:
 
 ```powershell
-clawg stop --profile prod
+clawg stop
 ```
 
 Si lo usás desde Claude Code no hace falta arrancarlo a mano: `clawg mcp` lo lanza solo cuando no hay uno corriendo.
@@ -281,15 +281,15 @@ Si lo usás desde Claude Code no hace falta arrancarlo a mano: `clawg mcp` lo la
 Los cuatro comandos:
 
 ```powershell
-clawg memories stats --profile prod                # cuántas memorias hay, agrupadas por tipo, tier, estado, agente y proyecto
-clawg memories list --profile prod                 # las más recientes primero (20 por defecto)
-clawg memories search "base de datos" --profile prod   # busca; todas las palabras deben aparecer
-clawg memories show 12 --profile prod              # una memoria completa, con todos sus metadatos
+clawg memories stats                # cuántas memorias hay, agrupadas por tipo, tier, estado, agente y proyecto
+clawg memories list                 # las más recientes primero (20 por defecto)
+clawg memories search "base de datos"   # busca; todas las palabras deben aparecer
+clawg memories show 12              # una memoria completa, con todos sus metadatos
 ```
 
 El número de `show` es el `id` que aparece en `list` y `search`.
 
-`clawg memories list --deleted` lista las memorias borradas, la última borrada primero. Una borrada vuelve con `clawg undelete <id> --profile prod`, también con el daemon corriendo: se busca de nuevo como antes de borrarla. No vuelve si después se guardó el mismo texto (ya está esa copia), ni si otra memoria viva del mismo agente y proyecto tiene hoy su misma `topic_key` (ya hay una versión vigente de ese tema), ni si tiene un secreto (`clawg secrets` la lista y `clawg purge` la borra del todo).
+`clawg memories list --deleted` lista las memorias borradas, la última borrada primero. Una borrada vuelve con `clawg undelete <id>`, también con el daemon corriendo: se busca de nuevo como antes de borrarla. No vuelve si después se guardó el mismo texto (ya está esa copia), ni si otra memoria viva del mismo agente y proyecto tiene hoy su misma `topic_key` (ya hay una versión vigente de ese tema), ni si tiene un secreto (`clawg secrets` la lista y `clawg purge` la borra del todo).
 
 Se pueden agregar estos filtros a `list` y `search`:
 
@@ -312,9 +312,9 @@ Detalles útiles:
 `clawg export` escribe las memorias en un archivo de texto, una por línea (JSON Lines), con sus fechas, accesos, estado y vínculos. Funciona con el daemon corriendo o sin él, y no modifica nada:
 
 ```powershell
-clawg export --out memorias.jsonl --profile prod                      # todas las vivas
-clawg export --out repo.jsonl --project C:\code\repo --include-deleted --profile prod   # un proyecto, también las borradas
-clawg export --out memorias.md --format markdown --profile prod       # una vista para leer, que import no lee
+clawg export --out memorias.jsonl                      # todas las vivas
+clawg export --out repo.jsonl --project C:\code\repo --include-deleted   # un proyecto, también las borradas
+clawg export --out memorias.md --format markdown       # una vista para leer, que import no lee
 ```
 
 El archivo tiene el texto de las memorias tal como está guardado: sólo lo puede leer su dueño, y `clawg secrets` lista las que tienen un secreto. Las memorias que todavía esperan en el outbox no viajan.
@@ -366,7 +366,7 @@ clawg import --from claude-code $HOME\.claude\projects --project-map C--code-cla
 Con Claude Code instalado (`claude` en el PATH), un solo comando conecta clawg:
 
 ```powershell
-clawg setup claude-code --profile prod
+clawg setup claude-code
 ```
 
 Hace tres cosas, y se puede repetir sin miedo:
@@ -377,7 +377,7 @@ Hace tres cosas, y se puede repetir sin miedo:
 
 Antes de cambiar un archivo, guarda una copia en `~/.clawg/backups/setup/` y conserva las cinco más recientes de cada uno. Si `settings.json` o `CLAUDE.md` es un enlace simbólico (por ejemplo, de un repositorio de dotfiles), escribe en el archivo al que apunta y el enlace queda; el archivo conserva sus permisos. Con `--dry-run` muestra lo que haría sin tocar nada. Si `CLAUDE_CONFIG_DIR` está definido, usa ese directorio en vez de `~/.claude`.
 
-Lo que no coincide con lo que instalaría no lo reemplaza: lo dice y sale con 1. Pasa, por ejemplo, si ya habías registrado `clawg` con otro comando o si moviste el binario. Para rehacerlo, `clawg setup claude-code --remove --profile prod` y otra vez `clawg setup claude-code --profile prod`. Si `claude` no está en el PATH, instala hooks y protocolo, imprime el comando de registro para que lo corras vos y sale con 1.
+Lo que no coincide con lo que instalaría no lo reemplaza: lo dice y sale con 1. Pasa, por ejemplo, si ya habías registrado `clawg` con otro comando o si moviste el binario. Para rehacerlo, `clawg setup claude-code --remove` y otra vez `clawg setup claude-code`. Si `claude` no está en el PATH, instala hooks y protocolo, imprime el comando de registro para que lo corras vos y sale con 1.
 
 Un servidor llamado igual en el scope `local` o `project` de Claude Code gana al de usuario; `claude mcp list` muestra cuál se usa.
 
@@ -386,13 +386,13 @@ Después **abrí una sesión nueva** de Claude Code. Adentro:
 1. Escribí `/mcp` para ver el estado del servidor `clawg`.
 2. Pedile al agente que use la herramienta `memory_status`: te dice si el daemon está corriendo, qué perfil usa y si el modelo ya cargó.
 3. Pedile que guarde algo, por ejemplo: "guardá en memoria que en este proyecto usamos pnpm".
-4. En una terminal, comprobalo con el visor: `clawg memories list --here --profile prod`.
+4. En una terminal, comprobalo con el visor: `clawg memories list --here`.
 
 ### Fijar la identidad del agente
 
 Cada agente es dueño de sus memorias: las lista, las cambia, las borra y resuelve sus conflictos, pero no los de otro. Al buscar, también encuentra lo que guardaron los demás (ver [Compartir memorias entre agentes](#compartir-memorias-entre-agentes)). Sin configurar nada, el agente es el nombre que reporta el cliente MCP. Si el cliente cambia ese nombre, o deja de mandarlo (la versión nueva del protocolo lo vuelve opcional), lo guardado antes queda a nombre del agente viejo: la búsqueda lo sigue encontrando, marcado como de otro agente, pero el nuevo no lo puede listar, cambiar, borrar ni resolver como propio.
 
-`clawg setup claude-code` lo fija siempre en `claude-code`, que es el nombre que Claude Code reporta de sí mismo, así que si venías sin `--agent` no perdés nada. Si registraste el servidor a mano con otro nombre, lo anterior queda con ese nombre: `memory_status` dice qué agente está en uso y de dónde salió, y `clawg memories stats` cuenta las memorias por agente. Nada se borra; vuelve a verse con el nombre anterior. Registrarlo a mano sigue siendo posible:
+`clawg setup claude-code` lo fija siempre en `claude-code`, que es el nombre que Claude Code reporta de sí mismo, así que si venías sin `--agent` no perdés nada. Si registraste el servidor a mano con otro nombre, lo anterior queda con ese nombre: `memory_status` dice qué agente está en uso y de dónde salió, y `clawg memories stats` cuenta las memorias por agente. Nada se borra; vuelve a verse con el nombre anterior. Registrarlo a mano sigue siendo posible. Este comando sí lleva `--profile prod`: es el registro que escribe `clawg setup claude-code`, y si no coincide, `setup` no lo toca:
 
 ```powershell
 claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe" mcp --profile prod --agent claude-code
@@ -400,12 +400,12 @@ claude mcp add --scope user clawg -- "$env:LOCALAPPDATA\Programs\clawg\clawg.exe
 
 ### Compartir memorias entre agentes
 
-Todos los agentes leen lo que guardaron los demás: lo que Claude Code aprendió de vos le sirve a Cursor cuando busca. Lo compartido le llega al agente marcado `by claude-code`, como información para verificar y no como instrucciones, y el agente que lo encuentra lo puede cambiar, borrar o juzgar como lo propio. El workspace y RECENT de cada agente siguen siendo suyos.
+Todos los agentes leen lo que guardaron los demás: lo que Claude Code aprendió de vos le sirve a Cursor cuando busca. Lo compartido le llega al agente marcado `by claude-code`, como información para verificar y no como instrucciones, y el agente que lo encuentra lo puede cambiar, borrar o juzgar como lo propio. Las preferencias que le dijiste a un agente entran solas al workspace de los demás, porque te describen a vos; las decisiones del workspace y RECENT siguen siendo de cada agente.
 
 Para que un agente no lea a otro, excluilo desde una terminal:
 
 ```powershell
-clawg sharing hide cursor claude-code --profile prod
+clawg sharing hide cursor claude-code
 ```
 
 Desde la próxima búsqueda, `cursor` deja de encontrar lo que guardó `claude-code`, sin reiniciar nada. La exclusión va en una sola dirección: `claude-code` sigue leyendo a `cursor`. `*` vale por cualquier agente: `hide '*' codex` hace que nadie lea a `codex`, `hide codex '*'` que `codex` no lea a nadie, y `hide '*' '*'` vuelve a dejar a cada agente con lo suyo.
@@ -433,7 +433,7 @@ Para unir a mano dos proyectos que clawg no relaciona (un repo que cambió de re
 Un solo comando conecta clawg a Cursor:
 
 ```powershell
-clawg setup cursor --profile prod
+clawg setup cursor
 ```
 
 Hace dos cosas, y se puede repetir sin miedo:
@@ -443,7 +443,7 @@ Hace dos cosas, y se puede repetir sin miedo:
 
 No instala un recordatorio de guardar, porque el hook de Cursor antes de cada mensaje no puede agregar contexto, ni un archivo de reglas: Cursor ya recibe las instrucciones del servidor MCP.
 
-Como `setup claude-code`, guarda una copia de cada archivo en `~/.clawg/backups/setup/` antes de cambiarlo, y con `--dry-run` muestra lo que haría sin tocar nada. Lo que no coincide con lo que instalaría (un `clawg` registrado con otro comando, otro hook de clawg en `sessionStart`) no lo reemplaza: lo dice y sale con 1. Para rehacerlo, `clawg setup cursor --remove --profile prod` y otra vez `clawg setup cursor --profile prod`.
+Como `setup claude-code`, guarda una copia de cada archivo en `~/.clawg/backups/setup/` antes de cambiarlo, y con `--dry-run` muestra lo que haría sin tocar nada. Lo que no coincide con lo que instalaría (un `clawg` registrado con otro comando, otro hook de clawg en `sessionStart`) no lo reemplaza: lo dice y sale con 1. Para rehacerlo, `clawg setup cursor --remove` y otra vez `clawg setup cursor`.
 
 **Apagá la configuración de terceros de Cursor.** "Include Third-Party Plugins, Skills, and Other Configs" (Settings → Agents → Third-Party Imports) viene encendido y hace que Cursor también cargue los hooks de `~/.claude/settings.json` y los plugins de Claude Code; en Windows, un hook `.sh` de un plugin abre una ventana de Git Bash. clawg no puede leer ese ajuste, así que `setup cursor` lo recuerda cada vez. Si queda encendido, el hook que instaló `clawg setup claude-code` no hace nada cuando lo corre Cursor.
 
@@ -451,9 +451,9 @@ Después **reiniciá Cursor**, abrí un chat y pedile al agente que use la herra
 
 La configuración sigue la documentación de Cursor 3.28. Falta comprobarla con Cursor instalado: que el hook corra en Windows sin abrir una ventana y que la memoria llegue al agente.
 
-**Comprobar que anduvo.** Cada chat nuevo que corre el hook deja una línea en `~/.clawg/hook-runs.jsonl`, y `clawg doctor --profile prod` muestra las últimas en `checks`, en la entrada `hooks.runs`: cuándo, qué cliente, qué carpeta y qué pasó con la memoria (`inyectó 3,2 KB`, `nada: varias carpetas`, `nada: el daemon no respondió`, …). Si el hook está instalado y no hay ninguna, `doctor` lo dice: abrí un chat nuevo y corré `doctor` otra vez; si sigue igual, Cursor no está corriendo el hook. Que una línea diga `inyectó` prueba que el hook imprimió el contexto, no que el agente lo haya leído: Cursor documenta `sessionStart` como "fire-and-forget".
+**Comprobar que anduvo.** Cada chat nuevo que corre el hook intenta dejar una línea en `~/.clawg/hook-runs.jsonl`, y `clawg doctor` muestra las últimas en `checks`, en la entrada `hooks.runs`: cuándo, qué cliente, qué carpeta y qué pasó con la memoria (`inyectó 3,2 KB`, `nada: varias carpetas`, `nada: el daemon no respondió`, …). Ese registro se escribe como se puede: si la escritura falla o no termina dentro del plazo del hook, el hook corre igual y no queda línea. Si el hook está instalado y no hay ninguna, `doctor` lo dice: abrí un chat nuevo y corré `doctor` otra vez, pero una línea que falta no alcanza para saber si el hook corrió. Que una línea diga `inyectó` prueba que el hook imprimió el contexto, no que el agente lo haya leído: Cursor documenta `sessionStart` como "fire-and-forget".
 
-Si un chat empieza sin memoria, pegá la entrada `hooks.runs` de la salida de `clawg doctor --profile prod` (lleva las últimas 20 corridas completas). Lleva la carpeta de cada chat, pero no tu correo ni el texto de ninguna memoria: de lo que Cursor manda sólo guarda el nombre de los campos, nunca sus valores.
+Si un chat empieza sin memoria, mirá la entrada `hooks.runs` de la salida de `clawg doctor` (lleva las últimas 20 corridas completas) y tachá lo que no quieras compartir antes de pegarla: trae la ruta de la carpeta de cada chat, que puede decir tu usuario o tu correo, y la versión de Cursor.
 
 ## Otros clientes MCP
 
@@ -499,10 +499,10 @@ Tenés una versión vieja de `scripts\install.ps1`, que intentaba sobrescribir e
 Algún programa tiene el binario viejo abierto sin permitir que se renombre. No se tocó nada. Fijate si es un `clawg` con `Get-Process clawg -ErrorAction SilentlyContinue | Select-Object Id, Path`. Si aparece, cerrá las sesiones de Claude Code que lo usan. Si no aparece ninguno, esperá un minuto. En los dos casos, después repetí el paso 4.
 
 **`clawg memories ...` dice que no hay daemon.**
-El visor no lo arranca solo. Corré `clawg serve --profile prod` en otra terminal, o abrí una sesión de Claude Code con el servidor registrado.
+El visor no lo arranca solo. Corré `clawg serve` en otra terminal, o abrí una sesión de Claude Code con el servidor registrado.
 
 **Después de `clawg stop` o de actualizar, el agente dice que el daemon no está corriendo.**
-El puente busca solo al daemon nuevo en cuanto vuelve a arrancar, pero no lo arranca él: así un `clawg stop` hecho a propósito (para `restore` o `purge`) se respeta. Corré `clawg serve --profile prod`, o en Claude Code escribí `/mcp` y reconectalo, que arranca uno con el binario instalado.
+El puente busca solo al daemon nuevo en cuanto vuelve a arrancar, pero no lo arranca él: así un `clawg stop` hecho a propósito (para `restore` o `purge`) se respeta. Corré `clawg serve`, o en Claude Code escribí `/mcp` y reconectalo, que arranca uno con el binario instalado.
 
 **Después de actualizar, `memory_status` dice `loading` un rato.**
 Las versiones anteriores calculaban los vectores de las memorias de una forma que las dejaba casi todas igual de parecidas a cualquier pregunta. La primera vez que arranca esta versión guarda una copia en `~/.clawg/backups` (`…-pre-reembed.db`) y vuelve a calcular el vector de cada memoria; hasta que termina, la búsqueda por sentido no está disponible.
@@ -513,10 +513,10 @@ Algún hallazgo es `error`: otro `clawg.exe` en el PATH que gana o una copia dup
 ## Desinstalar
 
 ```powershell
-clawg stop --profile prod
+clawg stop
 clawg path remove --dir "$env:LOCALAPPDATA\Programs\clawg"
-clawg setup claude-code --remove --profile prod
-clawg setup cursor --remove --profile prod
+clawg setup claude-code --remove
+clawg setup cursor --remove
 Remove-Item -Recurse "$env:LOCALAPPDATA\Programs\clawg"
 ```
 
@@ -569,7 +569,7 @@ Registra `clawg-dev` con la ruta de ese binario y sus hooks con `--profile dev`;
 
 ### Herramientas MCP
 
-- `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones.
+- `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones. Con `all_projects`, la guarda sin proyecto, para lo que vale en todo lo que hacés.
 - `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia. Lo que guardó otro agente va marcado `by <agente>`.
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
 - `search_project`: busca en la documentación del proyecto (los Markdown y los manifiestos como `Cargo.toml` o `package.json`, respetando `.gitignore`) y en su código Rust, Python y TypeScript, partido por definición, y devuelve cada pasaje con su ruta de encabezados o de definiciones. Sirve para preguntas sobre cómo funciona el proyecto. El índice se arma solo la primera vez que el agente abre el proyecto y se pone al día cuando cambian los archivos.
@@ -587,7 +587,7 @@ Registra `clawg-dev` con la ruta de ese binario y sus hooks con `--profile dev`;
 - Perfil `dev`: datos en `~/.clawg-dev`, puerto por defecto 27381.
 - Perfil `prod`: datos en `~/.clawg`, puerto por defecto 27380.
 
-El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha en un socket dentro del directorio de datos (`clawg.sock`). En Linux y macOS descarta toda conexión de otro usuario; en Windows es un socket AF_UNIX nativo y lo protegen los permisos del directorio de datos, que el archivo hereda: una cuenta sin acceso de escritura a él no puede conectarse. Los clientes van por él siempre que el daemon lo publique y nunca vuelven a TCP. Además escucha en `127.0.0.1`, en el puerto que pida `--port` o, sin él, en el del perfil, para los clientes de versiones anteriores al socket; si ese puerto está ocupado (por ejemplo por el daemon de otro usuario) sigue sólo por el socket. Si la ruta del socket no cabe en `sun_path` (108 bytes en Linux y Windows, 104 en macOS), el daemon no arranca y nombra la ruta, salvo que se le dé `--port`, y entonces sigue sólo por TCP; si el sistema no tiene AF_UNIX (un Windows antiguo), sigue sólo por TCP. Para mirarlo a mano: `curl --unix-socket ~/.clawg/clawg.sock http://localhost/health`. Los endpoints `/v1` exigen un token bearer guardado en el directorio de datos (en Unix, con permisos 0600 desde que se crea). En Unix el directorio de datos es privado de su dueño: clawg lo crea 0700, igual que los directorios que crea adentro, y a uno que ya existía con permisos para el grupo u otros se los quita y lo deja escrito en el registro con el modo anterior y el nuevo (si se compartía por grupo a propósito, `chmod` lo devuelve). Así otro usuario de la máquina no lee la memoria, las copias ni los registros. Toda ruta, `/health` incluida, responde 403 a una petición dirigida a un nombre que no sea `127.0.0.1`, `localhost` o `[::1]`, o que traiga una cabecera `Origin`: así una página web abierta en el navegador no llega al daemon, ni con DNS rebinding. No es una barrera contra un proceso del mismo usuario, que puede leer el token.
+El binario instalado usa `prod` sin que haga falta indicarlo. El perfil sale de `--profile dev|prod`, luego de la variable de entorno `CLAWG_PROFILE`, y por último del tipo de build (debug es `dev`, release es `prod`). Un build debug rechaza `prod`, así que nunca puede tocar `~/.clawg`. El daemon escucha en un socket dentro del directorio de datos (`clawg.sock`). En Linux y macOS descarta toda conexión de otro usuario; en Windows es un socket AF_UNIX nativo y lo protegen los permisos del directorio de datos, que el archivo hereda: una cuenta sin acceso de escritura a él no puede conectarse. Los clientes van por él siempre que el daemon lo publique y nunca vuelven a TCP. Además escucha en `127.0.0.1`, en el puerto que pida `--port` o, sin él, en el del perfil, para los clientes de versiones anteriores al socket; si ese puerto está ocupado (por ejemplo por el daemon de otro usuario) sigue sólo por el socket. Si la ruta del socket no cabe en `sun_path` (108 bytes en Linux y Windows, 104 en macOS), el daemon no arranca y nombra la ruta, salvo que se le dé `--port`, y entonces sigue sólo por TCP; si el sistema no tiene AF_UNIX (un Windows antiguo), sigue sólo por TCP. Para mirarlo a mano: `curl --unix-socket ~/.clawg/clawg.sock http://localhost/health`. Los endpoints `/v1` exigen un token bearer guardado en el directorio de datos (en Unix, con permisos 0600 desde que se crea). En Unix el directorio de datos es privado de su dueño: clawg lo crea 0700, igual que los directorios que crea adentro, y a uno que ya existía con permisos para el grupo u otros se los quita y lo deja escrito en el registro con el modo anterior y el nuevo (si se compartía por grupo a propósito, `chmod` lo devuelve). Así otro usuario de la máquina no lee la memoria, las copias ni los registros. Toda ruta, `/health` incluida, responde 403 a una petición dirigida a un nombre que no sea `127.0.0.1`, `localhost` o `[::1]`, o que traiga una cabecera `Origin`: así una página web abierta en el navegador no llega al daemon, ni con DNS rebinding. No es una barrera contra un proceso del mismo usuario, que puede leer el token.
 
 Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, si hay socket, versión), `token`, `clawg.sock`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén. Si se excluyó algo con `clawg sharing`, también `sharing.json`.
 
