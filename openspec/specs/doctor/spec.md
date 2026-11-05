@@ -237,13 +237,13 @@ La corrida, el registro y `outcome` se definen en [`specs/hooks`](../hooks/spec.
 
 **Tests:** `a_damaged_file_costs_only_its_damaged_lines` (`hook_log.rs`), `a_run_stamped_at_the_extremes_does_not_panic`, `bad_input_does_not_claim_the_input_was_not_json` (`checks.rs`), `recent_runs_are_listed_newest_first_five_in_the_message_and_twenty_in_the_evidence`, `every_outcome_has_words_and_none_raises_the_severity`, `a_folder_is_named_by_its_last_part`, `ages_are_counted_in_words` (`checks.rs`), `doctor_lists_the_hook_runs_and_still_exits_0` (`tests/binary.rs`).
 
-## HR7. El hook instalado que nadie corrió
+## HR7. El hook instalado sin corridas registradas
 
-Con el hook de Cursor del perfil instalado en `~/.cursor/hooks.json` (la regla de `setup cursor`) y sin corridas, `clawg doctor` MUST dar un hallazgo `hooks.runs` `info` con `reason_code` `not_run`, que dice que el hook está instalado y todavía ningún chat lo corrió, y que el paso siguiente es abrir un chat nuevo y correr `clawg doctor` otra vez. Sin hook instalado y sin corridas MUST NOT dar ningún hallazgo `hooks.runs`.
+Con el hook de Cursor del perfil instalado en `~/.cursor/hooks.json` (la regla de `setup cursor`) y sin corridas, `clawg doctor` MUST dar un hallazgo `hooks.runs` `info` con `reason_code` `not_run`, que dice que el hook está instalado y todavía no hay corridas registradas, y que el paso siguiente es abrir un chat nuevo y correr `clawg doctor` otra vez. MUST decir que una línea que falta no dice si el hook corrió, y MUST NOT decir que Cursor no lo corre: una escritura que falla o se pasa del plazo no deja línea ([`specs/hooks`](../hooks/spec.md), HR4). Sin hook instalado y sin corridas MUST NOT dar ningún hallazgo `hooks.runs`.
 
 #### Escenario: instalado y sin corridas
 - GIVEN `clawg setup cursor` aplicado y ningún registro
 - WHEN corre `clawg doctor`
 - THEN `hooks.runs` es `info` `not_run`; y sin `setup cursor` no hay ningún `hooks.runs`
 
-**Tests:** `an_installed_hook_with_no_runs_says_so_and_none_installed_says_nothing` (`checks.rs`), `the_hook_of_this_profile_is_found_in_hooks_json` (`setup/cursor.rs`), `doctor_says_when_the_installed_hook_never_ran` (`tests/binary.rs`).
+**Tests:** `an_installed_hook_with_no_runs_says_so_and_none_installed_says_nothing` (`checks.rs`), `the_hook_of_this_profile_is_found_in_hooks_json` (`setup/cursor.rs`), `doctor_says_when_the_installed_hook_has_no_runs` (`tests/binary.rs`).

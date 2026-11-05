@@ -2114,7 +2114,7 @@ async fn doctor_lists_the_hook_runs_and_still_exits_0() {
 }
 
 #[tokio::test]
-async fn doctor_says_when_the_installed_hook_never_ran() {
+async fn doctor_says_when_the_installed_hook_has_no_runs() {
     let sandbox = Sandbox::new();
     let (_, before) = doctor(&sandbox);
     assert_eq!(findings(&before, "hooks.runs"), [], "no Cursor hook and no runs: nothing to say");

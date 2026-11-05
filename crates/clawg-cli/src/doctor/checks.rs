@@ -1036,17 +1036,20 @@ const RUNS_IN_EVIDENCE: usize = 20;
 /// The record of `clawg hook session-start`: `runs` oldest first, and whether
 /// this profile's Cursor hook is installed. Always `info`: several outcomes
 /// are no fault, and which are is not known yet. Without runs, an installed
-/// hook says nobody ran it, and no hook says nothing.
+/// hook says none is recorded, which does not prove it never ran, since a line
+/// that cannot be written in time is left out; and no hook says nothing.
 pub fn hook_runs(lang: Lang, runs: &[Run], hook_installed: bool, now_ms: i64, profile: Profile) -> Vec<Finding> {
     if runs.is_empty() {
         if !hook_installed {
             return Vec::new();
         }
         let message = match lang {
-            Lang::En => "the Cursor hook is installed and no chat has run it yet: open a new chat in Cursor and run \
-                         `clawg doctor` again. If this stays the same, Cursor is not running the hook",
-            Lang::Es => "el hook de Cursor está instalado y todavía ningún chat lo corrió: abre un chat nuevo en Cursor y \
-                         corre `clawg doctor` otra vez. Si sigue igual, Cursor no está corriendo el hook",
+            Lang::En => "the Cursor hook is installed and no run is recorded yet: open a new chat in Cursor and run \
+                         `clawg doctor` again. A missing line does not tell whether the hook ran, since writing it \
+                         can fail without stopping the hook",
+            Lang::Es => "el hook de Cursor está instalado y todavía no hay corridas registradas: abre un chat nuevo en \
+                         Cursor y corre `clawg doctor` otra vez. Una línea que falta no dice si el hook corrió, porque \
+                         escribirla puede fallar sin frenar el hook",
         };
         let evidence = json!({ "cursor_hook_installed": true, "total": 0, "runs": [] });
         return vec![Finding::new("hooks.runs", Severity::Info, "not_run", message)
@@ -1971,10 +1974,14 @@ mod tests {
         let found = hook_runs(L, &[], true, NOW, P);
         assert_eq!(kinds(&found), [("hooks.runs", Severity::Info, "not_run")]);
         assert!(found[0].message.contains("installed") && found[0].message.contains("new chat"), "{}", found[0].message);
+        assert!(found[0].message.contains("does not tell whether the hook ran"), "the record is best effort: {}", found[0].message);
+        assert!(!found[0].message.contains("not running"), "{}", found[0].message);
         assert_eq!(found[0].safe_next_step.as_deref(), Some("clawg doctor --profile dev"));
         assert!(!found[0].requires_confirmation);
         let es = hook_runs(Lang::Es, &[], true, NOW, P);
         assert!(es[0].message.contains("chat nuevo"), "{}", es[0].message);
+        assert!(es[0].message.contains("no dice si el hook corrió"), "{}", es[0].message);
+        assert!(!es[0].message.contains("no está corriendo"), "{}", es[0].message);
         let with_runs_and_no_hook = hook_runs(L, &[hook_run(1, Outcome::Injected)], false, NOW, P);
         assert_eq!(kinds(&with_runs_and_no_hook), [("hooks.runs", Severity::Info, "recent")]);
     }
