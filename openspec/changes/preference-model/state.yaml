@@ -5,7 +5,7 @@ phase: verify
 artifacts:
   exploration: done  # las decisiones, cerradas: alcance A, entre agentes, sólo lo declarado entra solo
   proposal: done
-  spec: done  # PM1 a PM7
+  spec: done  # PM1 a PM9
   design: skipped  # las decisiones están cerradas en la exploración; la propuesta dice cómo se aplican
   tasks: done
   apply: done  # el sello, el proyecto y el alcance del workspace; la marca en los hits; all_projects y el protocolo; docs/reference

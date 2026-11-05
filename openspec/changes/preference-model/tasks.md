@@ -66,4 +66,4 @@ Los requisitos están en la [spec](spec.md); las decisiones, en la [propuesta](p
 
 ## 8. Archivo (fuera de este cambio)
 
-- [ ] Llevar PM1 a PM3 a `specs/retrieval` y R5 de `specs/sharing`, PM5 a `specs/provenance` y `specs/retrieval`, PM4 y PM6 a `specs/mcp`, PM7 a `specs/retrieval`; mover la carpeta a `changes/archive/`; subir el minor.
+- [ ] Llevar PM1 a PM3 a `specs/retrieval` y R5 de `specs/sharing`, PM5 y PM9 a `specs/provenance` y PM5 también a `specs/retrieval`, PM4, PM6 y PM8 a `specs/mcp`, PM7 a `specs/retrieval`; mover la carpeta a `changes/archive/`; subir el minor.
