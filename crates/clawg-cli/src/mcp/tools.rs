@@ -187,7 +187,8 @@ fn shared_author<'a>(hit: &'a Hit, reader: &str) -> Option<&'a str> {
 }
 
 /// Renders search hits as a numbered list, or says plainly that there were
-/// none. A hit another agent saved names it, and the list then ends with the
+/// none. A preference the user did not state says how it was saved, after its
+/// tier. A hit another agent saved names it, and the list then ends with the
 /// note on how to read such hits.
 fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_project: Option<&str>) -> String {
     if hits.is_empty() {
@@ -199,6 +200,7 @@ fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_project: Option<&str
         .iter()
         .enumerate()
         .map(|(i, h)| {
+            let origin = h.origin.as_deref().map(|o| format!(" {o}")).unwrap_or_default();
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             let author = shared_author(h, reader);
             let by = author.map(|a| format!(" by {}", display_author(a))).unwrap_or_default();
@@ -212,7 +214,7 @@ fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_project: Option<&str
                 .map(|k| format!(" topic={k}"))
                 .unwrap_or_default();
             format!(
-                "{}. #{} [{}/{}/t{}{piece} score={:.2}{topic}{by}] {}",
+                "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{topic}{by}] {}",
                 i + 1,
                 h.id,
                 h.kind,
@@ -1190,6 +1192,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         }
     }
 
@@ -1546,6 +1549,17 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #58 [Memory/semantic_fact/t3 piece=2/4 score=0.81] the retry budget was set");
         assert_eq!(lines[1], "2. #7 [Memory/semantic_fact/t3 score=0.50] a short one");
+    }
+
+    #[test]
+    fn format_hits_shows_the_origin_of_a_preference() {
+        let mut inferred = hit(9, "Memory", "user_preference", 1, 0.9, "tabs");
+        inferred.origin = Some("inferred".into());
+        inferred.piece = Some(crate::client::PiecePosition { piece: 1, pieces: 2 });
+        let out = format_hits(Lang::En, &[inferred, hit(10, "Memory", "user_preference", 1, 0.8, "spaces")], "a", None);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "1. #9 [Memory/user_preference/t1 inferred piece=1/2 score=0.90] tabs");
+        assert_eq!(lines[1], "2. #10 [Memory/user_preference/t1 score=0.80] spaces", "no mark, the line of before");
     }
 
     /// A newline inside a memory would split one hit across two lines and make

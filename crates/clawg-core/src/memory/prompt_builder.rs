@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::memory::pieces::read_save_core;
-use crate::memory::provenance::mark;
+use crate::memory::provenance::{mark, preference_mark};
 use crate::preferences::Lang;
 use crate::memory::{
     access::AccessTracker,
@@ -845,21 +845,29 @@ fn is_line_break(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}')
 }
 
-/// `[YYYY-MM-DD #id type] content`, with ` by <agent>` before the `]` when
-/// another agent saved it. Ids are numbered per table, so any kind other than
-/// `memory` is named before the type (`procedural/procedure`).
+/// `[YYYY-MM-DD #id type] content`, with the origin of a preference the user
+/// did not state after the type, as ACTIVE CONFLICTS marks a side, and
+/// ` by <agent>` before the `]` when another agent saved it. Ids are numbered
+/// per table, so any kind other than `memory` is named before the type
+/// (`procedural/procedure`).
 fn format_hit_line(hit: &RankedHit, reader: &str) -> String {
     let (y, m, d) = unix_millis_to_ymd(hit.created_at);
     let kind = match hit.kind {
         TableKind::Memory => String::new(),
         other => format!("{other:?}/").to_lowercase(),
     };
+    let origin = hit.origin.map(|o| format!(" {o}")).unwrap_or_default();
     let piece = hit.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
     let by = match &hit.agent_id {
         Some(author) if is_shared(hit, reader) => format!(" by {}", display_author(author)),
         _ => String::new(),
     };
-    format!("[{y:04}-{m:02}-{d:02} #{} {kind}{}{piece}{by}] {}", hit.id, hit.memory_type, indent_continuations(&hit.content))
+    format!(
+        "[{y:04}-{m:02}-{d:02} #{} {kind}{}{origin}{piece}{by}] {}",
+        hit.id,
+        hit.memory_type,
+        indent_continuations(&hit.content)
+    )
 }
 
 /// Printed once above the pairs: it is the same for every one of them.
@@ -1028,6 +1036,8 @@ async fn fetch_last_session(
                     exact: false,
                     topic_key: row.get(7)?,
                     project_id: row.get(8)?,
+                    // A session summary, never a preference.
+                    origin: None,
                 }));
             }
             Ok(None)
@@ -1054,14 +1064,15 @@ macro_rules! recent_row {
 /// each holds. A long save is its piece of lowest position among the rows
 /// that qualify, since the opening names its subject; no earlier piece of it
 /// may qualify. A row's save is the oldest that links it, as
-/// [`MemoryStore::save_links`] reads it. The last two columns are the
-/// piece's position and its save's count, `NULL` for a row of one piece.
+/// [`MemoryStore::save_links`] reads it. Columns 9 and 10 are the piece's
+/// position and its save's count, `NULL` for a row of one piece; the last two
+/// are the row's origin.
 /// `CROSS JOIN` keeps the save's own pieces in the outer loop of the check:
 /// without statistics the planner would walk every row of the agent instead.
 const RECENT_SAVES_SQL: &str = concat!(
     "
     SELECT m.id, m.content, m.memory_type, m.tier, m.status, m.created_at, m.agent_id, m.topic_key, m.project_id,
-           p.piece, (SELECT COUNT(*) FROM memory_piece n WHERE n.save_id = p.save_id)
+           p.piece, (SELECT COUNT(*) FROM memory_piece n WHERE n.save_id = p.save_id), m.source, m.created_by_type
     FROM memory m
     LEFT JOIN memory_piece p
       ON p.memory_id = m.id
@@ -1103,11 +1114,14 @@ async fn fetch_recent_saves(
             let mut stmt = c.prepare_cached(RECENT_SAVES_SQL)?;
             let rows = stmt.query_map(rusqlite::params![agent, project, since, printed, limit], |row| {
                 let piece: Option<i64> = row.get(9)?;
+                let memory_type: String = row.get(2)?;
+                let (source, by): (String, String) = (row.get(11)?, row.get(12)?);
                 Ok(RankedHit {
                     id: row.get(0)?,
                     kind: TableKind::Memory,
                     content: row.get(1)?,
-                    memory_type: row.get(2)?,
+                    origin: preference_mark(&memory_type, Some(&source), Some(&by)),
+                    memory_type,
                     tier: row.get(3)?,
                     status: row.get(4)?,
                     score: 0.0,
@@ -1447,6 +1461,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         }
     }
 
@@ -1572,6 +1587,18 @@ mod tests {
         let mut hit = hit_at_2023_11_14(58, TableKind::Memory, "semantic_fact", "the retry budget was set");
         hit.piece = Some(crate::memory::search::PiecePosition { piece: 2, pieces: 4 });
         assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #58 semantic_fact piece=2/4] the retry budget was set");
+    }
+
+    #[test]
+    fn a_preference_hit_line_shows_its_origin() {
+        let mut hit = hit_at_2023_11_14(59, TableKind::Memory, "user_preference", "tabs");
+        hit.origin = Some("inferred");
+        hit.piece = Some(crate::memory::search::PiecePosition { piece: 1, pieces: 2 });
+        hit.agent_id = Some("cursor".into());
+        assert_eq!(format_hit_line(&hit, "agent-1"), "[2023-11-14 #59 user_preference inferred piece=1/2 by cursor] tabs");
+
+        let stated = hit_at_2023_11_14(60, TableKind::Memory, "user_preference", "tabs");
+        assert_eq!(format_hit_line(&stated, "agent-1"), "[2023-11-14 #60 user_preference] tabs", "no mark, the line of before");
     }
 
     #[test]
@@ -2158,6 +2185,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
 
         let hits = vec![make_hit(recent_ts), make_hit(recent_ts), make_hit(old_ts)];
@@ -2183,6 +2211,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -2207,6 +2236,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
         let now_ms: i64 = 1_700_000_000_000;
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
@@ -2232,6 +2262,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         };
         let (recent, longterm) = bucket_by_recency(vec![hit], TimestampMs::from_unix_millis(now_ms));
         assert_eq!(recent.len(), 1, "a future timestamp counts as recent rather than being clamped");
@@ -2614,10 +2645,10 @@ mod tests {
     async fn recent_longterm_split_by_7day_window() {
         let now_ms: i64 = 1_700_000_000_000;
         let recent = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "r".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let old = vec![
-            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "o".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 8 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let (r, l) = bucket_by_recency(recent.into_iter().chain(old).collect(), TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 1);
@@ -2628,8 +2659,8 @@ mod tests {
     async fn all_old_hits_go_to_longterm_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 30 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 20 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 0);
@@ -2640,8 +2671,8 @@ mod tests {
     async fn all_recent_hits_go_to_recent_only() {
         let now_ms: i64 = 1_700_000_000_000;
         let hits = vec![
-            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
-            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None },
+            RankedHit { id: 1, kind: TableKind::Memory, content: "a".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.9, distance: 0.1, created_at: TimestampMs::from_unix_millis(now_ms - 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
+            RankedHit { id: 2, kind: TableKind::Memory, content: "b".to_string(), memory_type: "chat_message".to_string(), tier: 2, status: "active".to_string(), score: 0.8, distance: 0.2, created_at: TimestampMs::from_unix_millis(now_ms - 2 * 86_400_000), agent_id: None, piece: None, exact: false, topic_key: None, project_id: None, origin: None },
         ];
         let (r, l) = bucket_by_recency(hits, TimestampMs::from_unix_millis(now_ms));
         assert_eq!(r.len(), 2);
@@ -3918,6 +3949,8 @@ mod tests {
         for id in [inferred, elsewhere] {
             assert!(hits.contains(&format!("#{id} ")), "#{id} left the workspace and is still found: {prompt}");
         }
+        assert!(hits.contains(&format!("#{inferred} user_preference inferred]")), "marked as the agent's: {prompt}");
+        assert!(hits.contains(&format!("#{elsewhere} user_preference]")), "what the user said carries no mark: {prompt}");
         let mut after = Vec::new();
         for id in [inferred, elsewhere, before_the_seal] {
             after.push(columns(id).await);

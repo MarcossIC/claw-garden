@@ -1540,6 +1540,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         }
     }
 
@@ -2555,6 +2556,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         }
     }
 
@@ -3501,6 +3503,7 @@ mod tests {
             exact: false,
             topic_key: None,
             project_id: None,
+            origin: None,
         }];
 
         assert_eq!(format_skill_hits(&hits), "skill_hits=1");

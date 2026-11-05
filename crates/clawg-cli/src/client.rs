@@ -232,6 +232,11 @@ pub struct Hit {
     /// `None` from a daemon that predates the field.
     #[serde(default, deserialize_with = "sent")]
     pub project_id: Option<Option<String>>,
+    /// How a preference the user did not state was saved (`inferred`,
+    /// `imported` or `conclusion`). A daemon that predates the field does not
+    /// send it, and the hit is shown without a mark.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 /// A field a daemon sends even when it is `null`, read so that `None` means
@@ -3045,6 +3050,21 @@ pub(crate) mod tests {
         });
         let hit: Hit = serde_json::from_value(old).expect("old shape still parses");
         assert_eq!(hit.agent_id, None);
+    }
+
+    #[test]
+    fn a_hit_from_an_old_daemon_has_no_origin() {
+        let old = serde_json::json!({
+            "id": 3, "kind": "Memory", "content": "x", "memory_type": "user_preference", "tier": 1, "score": 0.5
+        });
+        let hit: Hit = serde_json::from_value(old).expect("old shape still parses");
+        assert_eq!(hit.origin, None);
+        let new = serde_json::json!({
+            "id": 3, "kind": "Memory", "content": "x", "memory_type": "user_preference", "tier": 1, "score": 0.5,
+            "origin": "inferred"
+        });
+        let hit: Hit = serde_json::from_value(new).expect("the new shape parses");
+        assert_eq!(hit.origin.as_deref(), Some("inferred"));
     }
 
     #[test]

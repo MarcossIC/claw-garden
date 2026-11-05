@@ -43,6 +43,16 @@ pub fn mark(source: &str, created_by_type: &str) -> Option<&'static str> {
     }
 }
 
+/// What a hit shows of its origin: the mark of a preference, since the
+/// workspace prints only the ones the user stated and the model reads a
+/// preference as a rule of the person. Every other row shows none.
+pub(crate) fn preference_mark(memory_type: &str, source: Option<&str>, created_by_type: Option<&str>) -> Option<&'static str> {
+    if memory_type != "user_preference" {
+        return None;
+    }
+    mark(source?, created_by_type?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
