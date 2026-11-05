@@ -26,14 +26,13 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 ## Antes de la primera noche (a mano)
 
 - Apagar en Cursor "Include Third-Party Plugins, Skills, and Other Configs" (Settings → Agents → Third-Party Imports). En Windows, los hooks `.sh` de un plugin de Claude Code abren una ventana de Git Bash. Va antes de instalar cualquier hook de clawg.
-- Publicar lo que hay en `develop`.
+- Publicar lo que hay en `develop`. Su pull request corre el CI que le falta al último arreglo de [hook-run-log](changes/archive/2026-11-04-hook-run-log/verify.md#veredicto), y lo que marque se arregla aparte.
 
 ## Noche 1
 
 | Cambio | Dónde | Qué deja resuelto |
 |---|---|---|
 | [history-reimport](changes/history-reimport/exploration.md), ensayo | Local: copia del store, export, transcripciones, línea base | Si el rendimiento mejoró de verdad, y un mapa para las notas sin proyecto |
-| [hook-run-log](changes/hook-run-log/proposal.md) | Local | Sale en el mismo release que client-setup-cursor, antes de la prueba con Cursor real: cada inicio de sesión deja una línea y `clawg doctor` muestra las últimas, para saber si el hook corrió y por qué no inyectó. Aplicado y verificado en Windows localmente, falta el CI de Windows ([verify](changes/hook-run-log/verify.md)) |
 
 **Al otro día, con la persona:** decidir [preference-model](changes/preference-model/exploration.md) y hacer la prueba de 10 minutos de [bridge-project-identity](changes/bridge-project-identity/exploration.md).
 

@@ -1,6 +1,6 @@
 # hook-run-log — Especificación
 
-`clawg hook session-start` deja un renglón por corrida en `<data>/hook-runs.jsonl`, y `clawg doctor` muestra las últimas. Al archivar, HR1 a HR5 y HR8 se suman a [`specs/hooks`](../../specs/hooks/spec.md) y HR6 y HR7 a [`specs/doctor`](../../specs/doctor/spec.md). Lo que esas specs dicen de la salida del hook no cambia.
+`clawg hook session-start` deja un renglón por corrida en `<data>/hook-runs.jsonl`, y `clawg doctor` muestra las últimas. Al archivar, HR1 a HR5 y HR8 se suman a [`specs/hooks`](../../../specs/hooks/spec.md) y HR6 y HR7 a [`specs/doctor`](../../../specs/doctor/spec.md). Lo que esas specs dicen de la salida del hook no cambia.
 
 ## Definiciones
 

@@ -1,6 +1,6 @@
 # hooks — Especificación
 
-Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcomando que el cliente corre en sus hooks de ciclo de vida para que la memoria llegue al agente sin que tenga que acordarse de pedirla. Cubre cómo lee su entrada, qué escribe al iniciar la sesión y al enviar un mensaje, cómo le dice al daemon en qué sesión del host se trabaja, y por qué nunca rompe la sesión. El contexto que pide al iniciar, el que no lleva consulta, está en [`specs/retrieval`](../retrieval/spec.md) («El contexto sin consulta»), y la herramienta `recall_context`, con la que comparte los avisos de síntesis y de revisión, en [`specs/synthesis`](../synthesis/spec.md) (R8 y «El aviso de revisión»).
+Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcomando que el cliente corre en sus hooks de ciclo de vida para que la memoria llegue al agente sin que tenga que acordarse de pedirla. Cubre cómo lee su entrada, qué escribe al iniciar la sesión y al enviar un mensaje, cómo le dice al daemon en qué sesión del host se trabaja, qué deja registrado de cada inicio de sesión y por qué nunca rompe la sesión. El contexto que pide al iniciar, el que no lleva consulta, está en [`specs/retrieval`](../retrieval/spec.md) («El contexto sin consulta»), y la herramienta `recall_context`, con la que comparte los avisos de síntesis y de revisión, en [`specs/synthesis`](../synthesis/spec.md) (R8 y «El aviso de revisión»). Lo que `clawg doctor` muestra del registro está en [`specs/doctor`](../doctor/spec.md) (HR6 y HR7).
 
 **Origen:**
 - [agent-lifecycle-hooks](../../changes/archive/2026-10-18-agent-lifecycle-hooks/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec: R1 vive en [`specs/retrieval`](../retrieval/spec.md) y acá están R2 a R5.
@@ -10,6 +10,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (R7, LP12 de esa spec, y la excepción que suma a R3).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (AL6, y el idioma que suma a R4 y R5). Las notas que el daemon escribe en el contexto están en [`specs/retrieval`](../retrieval/spec.md), AL5.
 - [client-setup-cursor](../../changes/archive/2026-11-04-client-setup-cursor/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (CU6 a CU8): `clawg hook` toma `--client` para leer la entrada de `sessionStart` de Cursor, la carpeta sale de la única raíz de `workspace_roots`, y un hook de Claude Code que corre Cursor no imprime nada.
+- [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (HR1 a HR5 y HR8): `clawg hook session-start` deja una línea por corrida en `<data>/hook-runs.jsonl`. La espera acotada de esa escritura (HR4) sale en 0.77.0.
 
 ## Definiciones
 
@@ -18,6 +19,10 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - **Inicio de la sesión:** la fecha de creación del archivo `transcript_path` que manda el host (`session_started_at`, `hook.rs:175`). Un sistema de archivos que no guarda la creación no la da.
 - **Entrada de Cursor:** el objeto JSON que Cursor pasa por stdin. Lleva `conversation_id`, `generation_id`, `model`, `hook_event_name`, `cursor_version`, `workspace_roots`, `user_email` y `transcript_path`; `sessionStart` suma `session_id`, igual a `conversation_id`. No lleva `cwd`.
 - **Salida de Cursor:** `{"additional_context": T}` en stdout.
+- **Corrida:** una ejecución de `clawg hook session-start`, de `--client claude-code` o de `--client cursor`, que llegó a leer su entrada. `user-prompt-submit` no es una corrida, con ningún cliente.
+- **Registro:** `<data>/hook-runs.jsonl`, un objeto JSON por línea. Al llegar a 64 KiB (65.536 bytes) pasa a `hook-runs.1.jsonl`.
+- **Campos de una corrida:** `at_ms` (milisegundos Unix al empezar), `client` (`claude-code` o `cursor`), `agent`, `source` (el de la entrada, o `null`), `outcome`, `bytes` (los de la salida impresa en stdout, sin el salto de línea final; 0 si no se imprimió nada), `elapsed_ms`, `roots` (la cantidad de `workspace_roots`, o `null` si no se mandaron), `folder` (la carpeta cuyo proyecto se leyó, como llegó, o `null`), `cursor_version` (el texto de ese campo, o `null`) e `input_keys` (los nombres de los campos de primer nivel de la entrada, en su orden; vacío si la entrada no es un objeto JSON).
+- **`outcome`:** uno de `injected`, `empty_context`, `several_folders`, `no_folder`, `no_daemon`, `project_refused`, `daemon_error`, `timed_out`, `bad_input`, `other_client`.
 
 ## R2. `clawg hook <evento>`
 
@@ -31,11 +36,11 @@ Esta spec no instala el hook: lo instala `clawg setup claude-code`, en forma exe
 
 ## R3. Un hook nunca rompe la sesión
 
-Sin daemon, con un daemon que responde un error o no responde a tiempo, o con una entrada que no es JSON, el hook MUST NOT escribir nada en stdout, salvo la línea del idioma de `session-start` cuando hay preferencia (R7), y MUST salir con 0 (`respond` y `answer`, `hook.rs:190-257`; `Command::Hook`, `main.rs:108-115`). El tope es de 3 s en total, de leer stdin a la respuesta (`HOOK_DEADLINE`, `hook.rs:26`), por debajo de los 5 s con los que se configura un hook, para que el host nunca lo cancele. Un error de uso de `clawg hook`, o un perfil rechazado, MUST salir con 1 y el motivo en stderr; `clawg hook` MUST NOT salir con 2, el código de clap para un uso inválido, que el host leería como «bloquear» y borraría el mensaje del usuario (`is_hook_invocation`, `cli.rs:298`; el camino de `Cli::try_parse` en `main.rs:43-55`, que hace lo mismo con `clawg` sin argumentos, [`specs/setup`](../setup/spec.md) R8).
+Sin daemon, con un daemon que responde un error o no responde a tiempo, o con una entrada que no es JSON, el hook MUST NOT escribir nada en stdout, salvo la línea del idioma de `session-start` cuando hay preferencia (R7), y MUST salir con 0 (`respond` y `answer`, `hook.rs:190-257`; `Command::Hook`, `main.rs:108-115`). El tope es de 3 s en total, de leer stdin a la respuesta (`HOOK_DEADLINE`, `hook.rs:26`), por debajo de los 5 s con los que se configura un hook, para que el host nunca lo cancele; `session-start` responde 50 ms antes de ese tope, para dejar su línea en el registro (HR4). Un error de uso de `clawg hook`, o un perfil rechazado, MUST salir con 1 y el motivo en stderr; `clawg hook` MUST NOT salir con 2, el código de clap para un uso inválido, que el host leería como «bloquear» y borraría el mensaje del usuario (`is_hook_invocation`, `cli.rs:298`; el camino de `Cli::try_parse` en `main.rs:43-55`, que hace lo mismo con `clawg` sin argumentos, [`specs/setup`](../setup/spec.md) R8).
 
 El hook MUST NOT arrancar un daemon (usa `DaemonClient::from_data_dir`, no `probe_running(.., true)`, que puede esperar hasta 60 s): el puente MCP es quien arranca el daemon con la sesión, así que el primer `SessionStart` del día puede llegar antes y quedar sin contexto. Es la decisión de no autoarrancar (D6 del diseño archivado), y ese es todo su costo.
 
-Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a las tareas bloqueantes cuando es un hook (`shutdown_background`, `main.rs:82`); un `drop` común esperaría la lectura de stdin más allá del tope.
+Como el host puede dejar abierto el stdin, `main` apaga el runtime sin esperar a las tareas bloqueantes cuando es un hook (`shutdown_background`, `main.rs:82`); un `drop` común esperaría la lectura de stdin o la escritura del registro (HR4) más allá del tope.
 
 #### Escenario: el daemon no está
 - GIVEN un perfil sin daemon
@@ -150,3 +155,91 @@ Sin `--client cursor`, una entrada con `cursor_version` (de cualquier tipo) MUST
 - THEN stdout está vacío, sale con 0 y el daemon no tiene ningún proyecto
 
 **Tests:** `a_claude_code_hook_run_by_cursor_prints_nothing` (`hook.rs`), `a_claude_code_hook_that_cursor_runs_does_nothing` (`tests/binary.rs`).
+
+## HR1. Cada inicio de sesión deja un renglón
+
+`clawg hook session-start`, con cualquiera de los dos clientes, MUST agregar una línea al registro con los campos de una corrida, y MUST NOT agregar ninguna en `user-prompt-submit`. `folder` MUST ser la ruta tal como llegó (`cwd`, la única raíz de Cursor), sin normalizar. `input_keys` MUST ser los nombres y no los valores.
+
+#### Escenario: un `sessionStart` de Cursor
+- GIVEN un directorio de datos que existe y una entrada de Cursor con una raíz, `user_email` y los campos de su documentación
+- WHEN corre `clawg hook session-start --agent cursor --client cursor`
+- THEN el registro tiene una línea con `client` `cursor`, `agent` `cursor`, `roots` 1, la raíz tal como llegó en `folder`, la versión en `cursor_version` y `input_keys` con los nombres de los campos de la entrada
+
+**Tests:** `a_session_start_leaves_one_line_with_its_fields` (`hook.rs`), `a_cursor_session_start_leaves_its_line_and_no_input_value` (`tests/binary.rs`), `user_prompt_submit_leaves_no_run` (`hook.rs`), `a_run_is_one_json_line_with_every_field` e `input_keys_are_the_names_of_the_top_level_fields` (`hook_log.rs`).
+
+## HR2. El motivo dice qué pasó con la memoria
+
+`outcome` MUST salir de estos hechos, en este orden:
+
+| `outcome` | Cuándo |
+|---|---|
+| `bad_input` | la entrada no se pudo leer entera, no es JSON o es un JSON que no tiene la forma de la entrada de un hook |
+| `other_client` | `--client claude-code` y la entrada trae `cursor_version` |
+| `timed_out` | el plazo del hook venció leyendo la entrada o esperando al daemon |
+| `several_folders` | `--client cursor` y `workspace_roots` tiene más de una raíz |
+| `no_folder` | no hay carpeta (Cursor sin raíces, o el directorio actual ilegible) |
+| `no_daemon` | no hay un daemon al que hablarle |
+| `project_refused` | el daemon rechaza la raíz porque su id pertenece a otra |
+| `daemon_error` | el daemon respondió con un error |
+| `empty_context` | el daemon respondió y el texto del contexto está vacío |
+| `injected` | el daemon respondió y el contexto tiene texto |
+
+Con la línea del idioma, un aviso o cualquier otro texto impreso, `outcome` MUST conservar su motivo y `bytes` MUST mostrar lo impreso.
+
+#### Escenario: sin daemon y con un idioma elegido
+- GIVEN la preferencia `es` y ningún daemon
+- WHEN corre `clawg hook session-start`
+- THEN la línea dice `no_daemon` y `bytes` es el largo de lo que se imprimió: la línea del idioma
+
+**Tests:** `every_session_start_names_why`, `the_language_line_alone_keeps_its_reason`, `an_empty_context_and_an_injected_one_differ`, `a_refused_root_is_project_refused` (`hook.rs`).
+
+## HR3. Nada de la entrada, fuera de los campos
+
+El registro MUST NOT contener el valor de `user_email`, el texto del contexto ni el valor de ningún campo de la entrada fuera de `source`, `cwd`, `workspace_roots` (una carpeta, o sólo la cuenta si son varias) y `cursor_version`. `cursor_version` MUST guardarse sólo cuando es un texto JSON, y cualquier otro tipo (un objeto puede traer cualquier cosa) MUST guardarse como `null`. Con varias raíces, `roots` MUST ser la cuenta y `folder` MUST ser `null`, y con `other_client` `folder` MUST ser `null`.
+
+#### Escenario: dos raíces y un correo
+- GIVEN una entrada de Cursor con dos raíces, `user_email` `user@example.com` y un `transcript_path`
+- WHEN corre el hook
+- THEN la línea dice `several_folders`, `roots` 2, `folder` `null`, y ni el correo, ni las rutas ni el `transcript_path` aparecen en el archivo
+
+**Tests:** `a_run_never_holds_an_input_value`, `the_cursor_version_is_kept_only_as_a_cut_string` y `every_session_start_names_why` (`hook.rs`, esta última por la carpeta de `other_client`), `a_cursor_session_start_leaves_its_line_and_no_input_value`, `two_roots_leave_their_count_and_not_their_paths` (`tests/binary.rs`).
+
+## HR4. El registro está acotado y nunca molesta
+
+La línea MUST armarse entera y agregarse con una sola escritura. Antes de agregar, con el registro en 64 KiB o más, MUST renombrarlo a `hook-runs.1.jsonl`, reemplazando al anterior, y empezar uno nuevo. MUST NOT crear el directorio de datos: si no existe, no registra. Cualquier falla (permisos, un directorio en lugar del archivo, un disco lleno) MUST tragarse sin nada en stdout ni en stderr y sin cambiar la salida ni el código de salida. El registro MUST escribirse antes de imprimir. Si ese renombrado falla, la corrida MUST agregarse igual al archivo actual, y la próxima vuelve a intentarlo.
+
+La espera por esa escritura MUST terminar en el plazo del hook (`HOOK_DEADLINE`), haya terminado la escritura o no: un disco trabado MUST NOT demorar la respuesta, y `main` MUST NOT esperar esa escritura al salir. Esa corrida se queda sin línea. `session-start` MUST responder dentro del plazo menos `RECORD_RESERVE` (50 ms), para que una corrida `timed_out` también tenga tiempo de dejar la suya; `user-prompt-submit`, que no registra, MUST conservar el plazo entero.
+
+#### Escenario: el directorio de datos no existe
+- GIVEN un home sin directorio de datos
+- WHEN corre el hook
+- THEN no hay directorio de datos después, y la salida es la de siempre
+
+#### Escenario: el registro no se puede escribir
+- GIVEN la preferencia `es` y un `hook-runs.jsonl` cuya apertura se bloquea para siempre (un FIFO que nadie lee)
+- WHEN corre `clawg hook session-start`
+- THEN imprime la línea del idioma y sale con 0, sin esperar a esa escritura
+
+#### Escenario: la corrida se queda sin tiempo
+- GIVEN un stdin que nunca se cierra
+- WHEN corre `clawg hook session-start`
+- THEN responde antes del plazo y el registro tiene su línea, con `timed_out`
+
+**Tests:** `a_line_is_appended`, `a_failed_roll_still_records_the_run`, `the_file_rolls_over_at_64_kib_and_replaces_the_old_one`, `concurrent_appends_keep_every_line`, `a_missing_data_directory_is_not_created`, `a_failed_append_is_swallowed`, `a_write_in_time_is_done_when_the_wait_ends`, `a_write_held_up_is_not_waited_for_past_the_deadline` (`hook_log.rs`), `a_session_start_out_of_time_still_leaves_its_line_by_the_deadline`, `a_prompt_records_nothing_and_keeps_the_whole_deadline` (`hook.rs`), `a_hook_does_not_create_the_data_directory_to_record` y, sólo en Unix, `a_record_that_cannot_be_written_does_not_hold_up_the_answer` (`tests/binary.rs`). Este último todavía no corrió en ningún sistema ([verify](../../changes/archive/2026-11-04-hook-run-log/verify.md#veredicto)).
+
+## HR5. La salida del hook no cambia
+
+`respond` MUST devolver lo que devolvía, con la misma firma, y `main` MUST imprimir lo mismo que antes y salir con el mismo código, salvo una respuesta del daemon que llegue dentro de los 50 ms que `session-start` reserva para el registro (HR4), que cuenta como `timed_out`. Los tests de `clawg hook` que ya existen MUST pasar sin cambiar lo que esperan.
+
+**Tests:** los de `hook.rs` y `tests/binary.rs` que ya había, y `respond_prints_what_the_run_counted` (`hook.rs`).
+
+## HR8. Cada campo está acotado
+
+Una línea MUST quedar chica por grande que sea la entrada, así que cada campo MUST cortarse por caracteres, sin partir uno: `source` a 32, `folder` a 1.024, `cursor_version` a 32, `agent` a 64, y de `input_keys` sólo los primeros 32 nombres, cada uno a 64. Con una entrada de 900 KB (un `source` de 500.000 caracteres y un nombre de campo de 400.000), la línea MUST ocupar menos de 4 KiB. Como el límite es por caracteres, el peor caso con caracteres que JSON escapa sigue siendo de decenas de KiB, y no lo pinta ningún test.
+
+#### Escenario: una entrada enorme
+- GIVEN `{"cwd":"/x","source":"S"×500.000,"K"×400.000:1}`
+- WHEN corre el hook
+- THEN `source` tiene 32 caracteres, el único nombre de `input_keys` que sobra tiene 64, y la línea ocupa menos de 4 KiB
+
+**Tests:** `what_a_run_keeps_is_bounded` (`hook.rs`), `cutting_stops_on_a_character_boundary` e `input_keys_keep_the_first_32_names_cut_at_64_characters` (`hook_log.rs`).

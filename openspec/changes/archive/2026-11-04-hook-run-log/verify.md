@@ -9,7 +9,7 @@ En Windows x86_64, build debug, toolchain 1.99.1, en `target-test` (limpiado con
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin bendecir: lo que ve el modelo no cambió.
 - Después de esa corrida sólo cambiaron documentos (`docs/reference/data-profiles.md` y dos `verify.md`); como hay tests que leen documentos, se volvieron a correr `tests/conventions.rs` (clawg-cli) y `tests/docs_mode.rs` (clawg-eval), que pasan.
 - Los tests de `clawg hook` que ya existían pasan sin cambiar lo que esperan: sólo se tocó el ayudante `broken_daemon`, que ahora delega en `daemon_answering` con el mismo mensaje de error.
-- El CI de Windows no corrió: no hay pull request todavía.
+- El CI de #126 pasó en `test (windows-latest)` y `test (ubuntu-latest)` sobre `4f5f0e5d`, que trae este cambio hasta `d68d4c35`. El arreglo de [la escritura trabada](#una-escritura-trabada) es posterior: tiene su corrida local, en esa sección, y ningún CI.
 
 ## Los tests en rojo
 
@@ -127,6 +127,8 @@ Medido en Windows, con 16 núcleos; «cargada» son 32 procesos ocupados:
 
 Los conteos son pocos para distinguir las dos variantes: sin reserva la línea depende de una carrera con la salida del proceso, que se perdió una vez. Los 50 ms salen de la primera fila, el triple del peor caso.
 
+En Windows, sobre 0.77.0 y con `target-test` recién limpiado, antes de commitear este arreglo: `cargo test --workspace` sin fallos y los dos clippy salen con 0.
+
 ### Mutaciones
 
 | Mutación | Resultado |
@@ -138,11 +140,17 @@ Los conteos son pocos para distinguir las dos variantes: sin reserva la línea d
 
 ## Lo que no se vio
 
-- Windows en CI: no hay pull request. Lo de Windows de este cambio (`rename` sobre un archivo que existe, `OpenOptions::append`) corrió sólo en la suite local.
+- El CI sobre `0ff19a7d`, el arreglo de la escritura trabada. El de #126, en verde en Linux y Windows, es anterior: ahí corrió lo de Windows de este cambio (`rename` sobre un archivo que existe, `OpenOptions::append`), que ese arreglo no tocó, pero la espera con plazo sólo corrió en la suite local de Windows.
 - Dos hooks que rotan a la vez: cada uno decide por el tamaño que vio, y el segundo puede renombrar el archivo nuevo de un primero que ya rotó, y reemplazar `hook-runs.1.jsonl` por un archivo casi vacío. Pierde la generación vieja, nunca una línea del archivo en uso. No hay test de esa carrera.
 - Un `sessionStart` de Cursor real: nada de este cambio prueba qué manda Cursor ni que el contexto llegue al agente. Es lo que `clawg doctor` va a mostrar después, en prod.
-- Una escritura trabada de punta a punta en Windows: `a_record_that_cannot_be_written_does_not_hold_up_the_answer` usa un FIFO y es sólo de Unix. En Windows se compiló sin su `cfg(unix)` pero no corrió, y lo que corre es `a_write_held_up_is_not_waited_for_past_the_deadline`, que no pasa por `main`. Tampoco se midió la carrera de la línea `timed_out` en Unix.
+- Una escritura trabada de punta a punta: `a_record_that_cannot_be_written_does_not_hold_up_the_answer` usa un FIFO y es sólo de Unix, y el único CI con Linux es anterior a ese test, así que no corrió en ningún sistema. En Windows se compiló sin su `cfg(unix)` pero no corrió, y lo que corre es `a_write_held_up_is_not_waited_for_past_the_deadline`, que no pasa por `main`. Tampoco se midió la carrera de la línea `timed_out` en Unix.
 
 ## Veredicto
 
-Sin CRITICAL en Windows local, después de la revisión. Falta el CI del pull request, que queda como WARNING: el de Windows por lo de arriba, y el de Linux por el test del FIFO.
+Sin CRITICAL. Un WARNING: el arreglo de la escritura trabada (`0ff19a7d`) no pasó por ningún CI, y `a_record_that_cannot_be_written_does_not_hold_up_the_answer` no corrió en ningún sistema. El resto del cambio pasó el CI de #126 en Linux y Windows.
+
+## Al archivar (2026-11-04)
+
+- Se archiva con ese WARNING abierto: la validación se hace después, con el CI de Linux y Windows del pull request que suba `0ff19a7d`, y lo que marque se arregla aparte.
+- La versión no sube: el código de este cambio salió en 0.76.0, y `0ff19a7d` viene después del bump a 0.77.0 (`5f83185e`), que todavía no tiene tag, así que sale en esa.
+- Hasta que salga 0.77.0, la 0.76.0 publicada tiene la escritura sin límite de tiempo que ese arreglo corrige.
