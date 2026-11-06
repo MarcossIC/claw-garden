@@ -8,8 +8,42 @@
 //! client that gives none falls back on the bridge's own directory.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clawg_core::memory::ProjectIdentity;
+use rmcp::service::RequestContext;
+use rmcp::RoleServer;
+
+/// How long a call waits for the client's `roots/list`. A client answers it
+/// from what it holds, so this only bounds one that never answers; past it
+/// the call reads as a client without roots.
+pub const ROOTS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The folders the client of `ctx` has open, asked in this call: empty when
+/// it declares no `roots`, answers with an error or not in time, or names no
+/// folder this machine has.
+pub async fn asked(ctx: &RequestContext<RoleServer>) -> Vec<PathBuf> {
+    if ctx.client_capabilities().and_then(|c| c.roots).is_none() {
+        return Vec::new();
+    }
+    match tokio::time::timeout(ROOTS_TIMEOUT, uris(ctx)).await {
+        Ok(Ok(uris)) => uris.iter().filter_map(|uri| folder_of(uri)).collect(),
+        Ok(Err(e)) => {
+            log::debug!("the client did not list its roots: {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            log::warn!("the client did not list its roots within {} s", ROOTS_TIMEOUT.as_secs());
+            Vec::new()
+        }
+    }
+}
+
+/// The `uri` of each root the client answers `roots/list` with.
+#[expect(deprecated, reason = "rmcp deprecates roots (SEP-2577), yet roots/list is the one place Cursor names the folders it has open")]
+async fn uris(ctx: &RequestContext<RoleServer>) -> Result<Vec<String>, rmcp::service::ServiceError> {
+    Ok(ctx.peer.list_roots().await?.roots.into_iter().map(|root| root.uri).collect())
+}
 
 /// The folder a root's `uri` names on this machine, or `None` when it names
 /// none. A `file:` URI is read as one; anything else as the path itself,

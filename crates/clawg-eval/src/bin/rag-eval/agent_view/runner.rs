@@ -221,7 +221,7 @@ async fn answer_cases(
         let expected: Vec<String> = case.expected_refs.iter().chain(&case.expected_origins).cloned().collect();
         let started = Instant::now();
         let found = session.client.search(search_request(&case.query, project_id)).await?;
-        let search_text = format_search(found, AGENT_ID, None, None);
+        let search_text = format_search(found, AGENT_ID, &[], None);
         let search_ms = elapsed_ms(started);
         let count_tokens = |line: &str| input.counter.count(line);
         let search_read = read_search(&search_text, &count_tokens, &expected, corpus)
