@@ -7,7 +7,7 @@ En Linux x86_64, build debug, toolchain 1.99.1, sobre `2f63dd6`, el último comm
 - `cargo test --workspace`: pasa entero, en un `target` limpio; los ignorados son los de antes (los que piden el modelo real o un ensayo a mano).
 - `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también. El `#[expect(deprecated)]` de `uris` se cumple: `list_roots` y `ListRootsResult` están marcados obsoletos en `rmcp` 3.5.1.
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` fallaron por la aserción con las descripciones nuevas y pasan después de `CLAWG_BLESS=1`; el diff de los dos contratos va en el pull request.
-- En Windows, el CI del pull request: pendiente al escribir esto. El código `cfg(windows)` que toca este cambio es el de una raíz: `uri_path` saca la barra de antes de la unidad sólo en Windows (`crates/clawg-cli/src/mcp/roots.rs:63`), y `a_root_as_a_path_and_as_a_uri_is_one_project` escribe ahí la ruta con la unidad en minúscula, como la manda Cursor, y la URI con barras.
+- En Windows, el CI del pull request ([#133](https://github.com/MarcossIC/claw-garden/pull/133), `windows-latest`). Sobre `09aee6a` fallaron 18 tests de `crates/clawg-cli/src/mcp/server.rs`, todos por cómo los tests armaban un proyecto, no por el puente: `test_project()` armaba a mano la raíz `/proj-test`, que en Windows es una ruta de la unidad actual (`D:\proj-test`, otro id) y que ahora se resuelve porque los saves nombran su carpeta; `repo_with_src` derivaba el id viejo de la forma `\\?\` que da `canonicalize`, y el test del directorio personal comparaba con esa misma forma. `7671fce` arma los tres como el puente resuelve un `project_path`; sobre `7671fce`, Windows pasa los dos clippy y `cargo test --locked --workspace`, y Linux también (`ubuntu-latest`). En Linux, después de ese commit, pasan los tests de `mcp::` y `cargo clippy -p clawg-cli --all-targets -- -D warnings`. Lo `cfg(windows)` que toca este cambio es el de una raíz: `uri_path` saca la barra de antes de la unidad sólo en Windows (`crates/clawg-cli/src/mcp/roots.rs:63`), y `a_root_as_a_path_and_as_a_uri_is_one_project` escribe ahí la ruta con la unidad en minúscula, como la manda Cursor, y la URI con barras; pasó en las dos corridas.
 
 ## Los tests en rojo
 
@@ -64,6 +64,7 @@ El cliente de prueba es el `Session` de los tests de `server.rs`, que habla JSON
 | Los tests que guardaban sin proyecto | `save_args` pasa `project_path` | `save_here`, un método de los tests de `server.rs`, nombra la carpeta del puente, o `all_projects` en uno sin carpeta, cuando el save no nombra nada; los tres saves de `tests/binary.rs` y los del `duplex` pasan `all_projects` o `project_path` | Cada test guarda donde guardaba antes, con la carpeta del puente que hasta ahora ponía el puente |
 | README | Fuera del alcance | La lista de herramientas MCP y la sección de Cursor dicen que un save nombra su proyecto y qué hace con las carpetas abiertas | Es lo que lee quien instala; `docs/reference/daemon.md` lo dice para quien mantiene |
 | Las firmas de `clawg-eval` y `contradiction.rs` | Fuera del alcance | `rag-eval` y `revision-eval` pasan a `format_search` una lista (`&[]`, o la del proyecto que pasaban), y arman `SearchArgs` con `project_ids` vacío; `contradiction.rs` arma su `SearchScope` con `projects` | Son los llamadores de lo que cambió de firma; lo que hacen no cambia |
+| Los tests en Windows | No estaba | `7671fce`: `test_project()`, `repo_with_src` y el test del directorio personal arman sus carpetas como el puente resuelve un `project_path` | Con todo save nombrando su carpeta, la ruta de un proyecto de prueba se resuelve; armada a mano (`/proj-test`, o la forma `\\?\` de `canonicalize`) daba otro id en Windows |
 | `resolve_project` | No se nombraba | Sigue, con la única carpeta abierta como proyecto por defecto | Su orden (`all_projects`, después la ruta, después el proyecto por defecto) es el mismo, y sus tests no cambian |
 
 ## Pendiente en local
@@ -77,4 +78,4 @@ Con Cursor instalado (la prueba de la exploración usó 3.28.7 en Windows) y un 
 
 ## Veredicto
 
-Sin CRITICAL en Linux. Quedan como WARNING el CI de Windows del pull request, hasta que pase, y los puntos de «Pendiente en local», hasta probarlos con Cursor.
+Sin CRITICAL en Linux ni en el CI de Windows. Los puntos de «Pendiente en local» quedan como WARNING hasta probarlos con Cursor.

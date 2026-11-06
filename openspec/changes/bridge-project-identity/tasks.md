@@ -51,5 +51,5 @@ Lo que se hizo distinto de lo previsto está en [«Frente a lo previsto»](verif
 
 - [x] `cargo test --workspace` y `cargo clippy --workspace --all-targets -- -D warnings` en Linux, sobre el último commit.
 - [x] `verify.md`, con el save desde Cursor en un workspace con dos repositorios pendiente en local; `state.yaml` y la línea de `openspec/ROADMAP.md`.
-- [ ] El CI del pull request en Windows, y lo que marque, arreglado.
+- [x] El CI del pull request en Windows, y lo que marque, arreglado: 18 tests de `server.rs` armaban su proyecto con una ruta que en Windows resuelve a otro id; arreglado en `test(mcp): name the bridge's own folder as a project_path resolves it`.
 - Commit: `docs(openspec): record bridge-project-identity applied`
