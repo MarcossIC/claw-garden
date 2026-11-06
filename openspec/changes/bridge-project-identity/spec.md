@@ -12,7 +12,7 @@ De qué proyecto lee y en cuál guarda el puente `clawg mcp` cuando una herramie
 
 ## BI1. Las raíces se piden en cada llamada
 
-Ante una llamada sin proyecto de `save_memory`, `search_memory`, `recall_context`, `search_project`, `synthesize`, `read_memory`, `answer_suggestion` o `memory_status`, el puente MUST mandar `roots/list` a un cliente con raíces, dentro de esa llamada, y esperar la respuesta como mucho `ROOTS_TIMEOUT` (2 s). MUST NOT reusar la respuesta en otra llamada, ni esperar `notifications/roots/list_changed`. A un cliente sin raíces MUST NOT mandarle `roots/list`. Un error, un plazo vencido o una respuesta sin carpetas MUST contar como un cliente sin raíces. `list_memories`, `delete_memory`, `restore_memory`, `update_memory` y `resolve_conflict` MUST NOT pedir raíces.
+Ante cada llamada de `save_memory`, `search_memory`, `recall_context`, `search_project`, `synthesize`, `read_memory`, `answer_suggestion` o `memory_status`, también la que nombra su proyecto, el puente MUST mandar `roots/list` a un cliente con raíces, dentro de esa llamada, y esperar la respuesta como mucho `ROOTS_TIMEOUT` (2 s). MUST NOT reusar la respuesta en otra llamada, ni esperar `notifications/roots/list_changed`. A un cliente sin raíces MUST NOT mandarle `roots/list`. Un error, un plazo vencido o una respuesta sin carpetas MUST contar como un cliente sin raíces. `list_memories`, `delete_memory`, `restore_memory`, `update_memory` y `resolve_conflict` MUST NOT pedir raíces.
 
 #### Escenario: las raíces cambian entre dos llamadas
 - GIVEN una sesión `initialize` que declara `roots`, con `/work/a` abierta
@@ -61,14 +61,14 @@ Las carpetas abiertas de una llamada MUST ser las raíces del cliente, resueltas
 
 ## BI5. `search_memory` lee las carpetas abiertas
 
-Una llamada sin proyecto ni `all_projects` MUST buscar: sin carpetas abiertas, en todos los proyectos; con una, en su proyecto, registrado como hoy el del directorio; con varias, en el grupo de sus proyectos, cada uno registrado. En una búsqueda de un grupo, cada hit cuya fila tiene proyecto MUST mostrar ` project=<id>` después del puntaje y de la clave; un hit sin proyecto MUST NOT mostrarlo. Una búsqueda de un proyecto, o de todos, MUST mostrar cada hit como antes. `topic=K` MUST mostrarse en una fila de cualquier proyecto de las carpetas abiertas (`revised_from` contra una lista: con un proyecto, la regla de antes), y con `all_projects` la lista es la de las carpetas abiertas. El puente MUST mandar el grupo en `project_ids` y MUST NOT mandar `project_id` con él.
+Una llamada sin proyecto ni `all_projects` MUST buscar: sin carpetas abiertas, en todos los proyectos; con una, en su proyecto, registrado como hoy el del directorio; con varias, en el grupo de sus proyectos, cada uno registrado (dos carpetas del mismo proyecto cuentan una vez). Cuando una llamada sin `project` ni `project_path` tiene varias carpetas abiertas (un grupo, o todos con `all_projects`), cada hit cuya fila tiene proyecto MUST mostrar ` project=<id>` después del puntaje y de la clave, con un `[` o un `]` del id como paréntesis y un control o un salto de línea como espacio; un hit sin proyecto MUST NOT mostrarlo. Con una carpeta o ninguna, o con `project` o `project_path`, cada hit MUST mostrarse como antes. `topic=K` MUST mostrarse en una fila de cualquier proyecto de las carpetas abiertas (`revised_from` contra una lista: con un proyecto, la regla de antes), y con `all_projects` la lista es la de las carpetas abiertas. El puente MUST mandar el grupo en `project_ids` y MUST NOT mandar `project_id` con él.
 
 #### Escenario: un workspace de dos repositorios
 - GIVEN una memoria en el proyecto de `/work/a`, otra en el de `/work/b` y otra en el de `/work/c`, y un cliente con `/work/a` y `/work/b` abiertas
 - WHEN busca sin proyecto algo que las tres responden
 - THEN vuelven las dos primeras, cada una con su `project=`, y no la tercera
 
-**Tests:** `a_search_with_one_root_reads_its_project`, `a_search_with_several_roots_reads_all_of_them_and_names_each`, `a_search_without_roots_reads_the_directory` (`server.rs`); `format_hits_names_the_project_of_each_hit_of_a_group`, `the_key_shows_on_a_row_of_any_open_folder` (`tools.rs`); `a_search_sends_a_group_only_when_it_has_one` (`client.rs`).
+**Tests:** `a_search_with_one_root_reads_its_project`, `a_search_with_several_roots_reads_all_of_them_and_names_each`, `a_search_without_roots_reads_the_directory` (`server.rs`); `format_hits_names_the_project_of_each_hit_of_a_group`, `a_project_named_by_a_hit_keeps_the_hit_on_its_line`, `the_key_shows_on_a_row_of_any_open_folder` (`tools.rs`); `a_search_sends_a_group_only_when_it_has_one` (`client.rs`).
 
 ## BI6. La búsqueda de un grupo
 
