@@ -21,20 +21,24 @@ Una sonda MCP stdio mínima, sin commitear y registrada en `~/.cursor/mcp.json`,
 | Caso | Qué pasó |
 |---|---|
 | 1. Una ventana con un repositorio | El directorio del proceso es el directorio personal del usuario, no el repositorio. `roots/list` da una raíz: el repositorio. |
-| 2. Una segunda ventana con otro repositorio | Cursor arranca un proceso nuevo, pero su `roots/list` da las carpetas de todas las ventanas abiertas (6, con la nueva al final). El proceso de la ventana que ya estaba sigue vivo. |
+| 2. Una segunda ventana con otro repositorio | Cursor arranca un proceso nuevo, pero su `roots/list` da las carpetas de todas las ventanas abiertas (6). El proceso de la ventana que ya estaba sigue vivo: cada ventana tiene el suyo. |
 | 3. Un workspace con varios repositorios | `roots/list` da sus 5 carpetas. |
 | 4. `notifications/roots/list_changed` al cambiar las carpetas | No llegó nunca. Cursor declara `roots.listChanged: false` en cada `initialize`. |
 
 Además:
-- El directorio es el personal en los 14 arranques, con cualquier combinación de ventanas.
+- El directorio es el personal en los 22 arranques, con cualquier combinación de ventanas.
 - `WORKSPACE_FOLDER_PATHS` trae siempre las mismas carpetas que `roots/list`, separadas por comas.
 - El `uri` de cada raíz llega como ruta de Windows con la unidad en minúscula (`c:\...`), no como una URI `file:`.
 - Cada apertura reinicia el servidor 2 o 3 veces en pocos segundos.
 - El cliente es `cursor-vscode` 1.0.0, con protocolo `2025-11-25`.
 
-**Falta medir:** nadie llamó a la herramienta de la sonda desde el chat, así que no se sabe si un proceso arrancado antes que otra ventana ve las carpetas nuevas cuando se le vuelve a pedir `roots/list`. Las decisiones de abajo no dependen de eso: si las raíces se piden en cada llamada, las dos respuestas posibles quedan cubiertas.
+**Llamadas desde el chat.** La sonda pide `roots/list` otra vez en cada llamada a su herramienta. Se llamó en este orden:
 
-**Qué se deduce:** las raíces no dicen desde qué ventana llega una llamada, y el directorio nunca es el repositorio. El enfoque A sólo da una respuesta cuando hay abierta una sola ventana con un solo repositorio.
+1. Con claw-garden sola, desde su chat: respondió el proceso de esa ventana, con una raíz.
+2. Se abrió el workspace de 5 repositorios en otra ventana y se llamó desde su chat: respondió un proceso nuevo, con 6 raíces.
+3. Desde el chat de claw-garden otra vez: respondió el mismo proceso que en 1, y `roots/list` ya le dio las 6. En el medio no llegó ningún `list_changed`.
+
+**Qué se deduce:** cada ventana tiene su proceso, pero las raíces son siempre las de todas las ventanas abiertas en ese momento, así que no dicen desde qué ventana llega una llamada. El directorio nunca es el repositorio. El enfoque A sólo da una respuesta cuando hay abierta una sola ventana con un solo repositorio. Guardar las raíces al arrancar sólo acertaría en la ventana que se abrió primero y sola, y nunca se actualizaría. Pedirlas en cada llamada da siempre la lista actual.
 
 ## Enfoques
 
