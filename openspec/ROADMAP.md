@@ -25,11 +25,9 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 ## Noche 1
 
-**Antes, con la persona:** la [prueba de 10 minutos](changes/bridge-project-identity/exploration.md#la-prueba-que-falta-local-10-minutos-con-una-persona) de bridge-project-identity con Cursor real. Sin ella, ese cambio no entra en la noche.
-
 | Cambio | Dónde | Necesita antes |
 |---|---|---|
-| [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | La prueba con Cursor real, de arriba |
+| [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | — (la [prueba con Cursor real](changes/bridge-project-identity/exploration.md#resultado-de-la-prueba-con-cursor-2026-11-05-y-2026-11-06) está hecha) |
 
 ## Noche 2
 

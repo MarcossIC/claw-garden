@@ -1,13 +1,13 @@
 change: bridge-project-identity
 objective: "2, 4"
 depends_on: []
-phase: explore  # falta la prueba con Cursor real
+phase: proposal  # la prueba con Cursor está hecha y las tres decisiones cerradas
 artifacts:
-  exploration: done
+  exploration: done  # con el resultado de la prueba con Cursor
   proposal: pending
   spec: pending
   tasks: pending
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-03
+updated: 2026-11-06
