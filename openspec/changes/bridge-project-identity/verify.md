@@ -139,7 +139,7 @@ No aplica. La búsqueda de un proyecto o de todos corre la misma consulta que an
 
 ## CI del pull request
 
-Pendiente: los jobs `test (ubuntu-latest)` y `test (windows-latest)` del pull request a `develop`.
+En [#134](https://github.com/MarcossIC/claw-garden/pull/134), sobre `4a6624f9`, pasaron los jobs `test (ubuntu-latest)` y `test (windows-latest)`, que corren la suite y los clippy con `-D warnings`. No hubo nada que arreglar.
 
 ## Pendiente en local
 
@@ -150,4 +150,4 @@ Con Cursor real, conectado con `clawg setup cursor` a un perfil con este binario
 
 ## Veredicto
 
-Sin CRITICAL aquí. Queda el CI del pull request en Linux y Windows, y Cursor real en local ([arriba](#pendiente-en-local)).
+Sin CRITICAL aquí ni en el CI del pull request, en Linux y en Windows. Queda Cursor real, en local ([arriba](#pendiente-en-local)).

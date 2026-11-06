@@ -53,7 +53,7 @@ Los requisitos están en la [spec](spec.md); las decisiones, en la [propuesta](p
 ## 5. Verificación
 
 - [x] La suite, `cargo clippy --workspace --all-targets -- -D warnings` y `cargo clippy -p clawg-cli -- -D warnings`, sobre el último commit de código ([verify](verify.md)).
-- [ ] El CI del pull request en Linux y Windows; lo que marque se arregla.
+- [x] El CI del pull request en Linux y Windows; lo que marque se arregla. Pasó en [#134](https://github.com/MarcossIC/claw-garden/pull/134) sin nada que arreglar.
 - [x] `verify.md`, con el save desde Cursor en un workspace de dos repositorios como pendiente en local; `state.yaml`; la línea del cambio en `ROADMAP.md` y su fila del mapa de openspec.
 - Commit: `docs(openspec): record bridge-project-identity applied`
 
