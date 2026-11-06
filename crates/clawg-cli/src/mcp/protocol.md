@@ -5,8 +5,8 @@ answering anything that depends on earlier sessions, and `recall_context` once
 when a broad task needs background. For how this project works (its design,
 conventions, commands or where something is implemented), call
 `search_project` before opening files: it searches the project's own
-documentation and code. Memories are scoped to the current project unless you
-say otherwise.
+documentation and code. Name each save's project: `project_path`, `project` or
+`all_projects`.
 
 Use `save_memory` when a decision is made, when the user confirms or rejects a
 proposal, corrects you or states a preference, when a bug is fixed (with its
@@ -77,7 +77,9 @@ Every row competes with the others in search, so leave out:
   never a new one. A preference saved without a project shows
   `topic=K all_projects`: save its new version with `all_projects` and that key.
   Any other memory of another project, or of none, shows no key, since a save
-  here would keep it beside the new one.
+  here would keep it beside the new one. In a search over several projects, a
+  hit shows its key beside its `project=`: save its new version with that
+  `project`.
 - Write it so it reads on its own months from now, with no conversation
   around it.
 - Write it in English, and search in English too. A memory saved in one
@@ -167,14 +169,22 @@ says so; check what it claims against the code or ask the user.
 
 ## Projects
 
-Memories belong to the project of the directory you work in. For one with
-no folder here, such as an idea, or one other than this directory's, pass
-`project` with its id or its name to `save_memory`, `search_memory`,
-`recall_context`, `search_project` or `synthesize`, and `to_project` to
-`update_memory`. A name no project has creates the project when you save.
-When the answer names projects whose name is close, ask the user which one
-they mean and pass its id, or save again with `new_project` if it is another
-project.
+A call that names no project reads in the folders your client has open, or
+in the directory clawg was started in when the client names none. A search
+over several of them marks each hit with `project=` and the id of its
+project. `recall_context`, `search_project`, `synthesize` and
+`answer_suggestion` work on one project: with several open, pass
+`project_path` or `project`.
+
+Every save names where it goes: `project_path` with the folder of the
+repository the memory is about, `project` with the id or the name of a
+project with no folder here, such as an idea, or `all_projects` for what holds
+in every project. A save that names none is refused, and the answer lists the
+folders open. A name no project has creates the project when you save. When
+the answer names projects whose name is close, ask the user which one they
+mean and pass its id, or save again with `new_project` if it is another
+project. `update_memory` moves a memory with `to_project` or
+`to_project_path`.
 
 When `recall_context` says this project may be the same as another, ask the
 user, then call `answer_suggestion` with merge or apart, `user_answered` and

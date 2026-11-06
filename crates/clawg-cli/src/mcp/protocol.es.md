@@ -5,8 +5,8 @@ de responder algo que dependa de sesiones anteriores, y `recall_context` una
 vez cuando una tarea amplia necesite contexto. Para cómo funciona este
 proyecto (su diseño, convenciones, comandos o dónde está algo), llama a
 `search_project` antes de abrir archivos: busca en la documentación y el
-código del propio proyecto. Las memorias son del proyecto actual salvo que
-digas otra cosa.
+código del propio proyecto. Nombra el proyecto de cada save: `project_path`,
+`project` o `all_projects`.
 
 Usa `save_memory` cuando se toma una decisión, cuando la persona acepta o
 rechaza una propuesta, te corrige o dice una preferencia, cuando se arregla
@@ -79,7 +79,8 @@ Cada fila compite con las demás en la búsqueda, así que deja afuera:
   Una preferencia guardada sin proyecto muestra `topic=K all_projects`: guarda
   su versión nueva con `all_projects` y esa clave. Cualquier otra memoria de
   otro proyecto, o de ninguno, no muestra clave, porque un save aquí la dejaría
-  al lado de la nueva.
+  al lado de la nueva. En una búsqueda en varios proyectos, un hit muestra su
+  clave junto a su `project=`: guarda su versión nueva con ese `project`.
 - Escríbela para que se lea sola dentro de meses, sin ninguna conversación
   alrededor.
 - Escríbela en español, y busca en español también. Una memoria guardada en
@@ -174,14 +175,22 @@ afirma con el código o pregúntale a la persona.
 
 ## Proyectos
 
-Las memorias son del proyecto del directorio en el que trabajas. Para uno
-sin carpeta aquí, como una idea, o uno que no es el de este directorio, pasa
-`project` con su id o su nombre a `save_memory`, `search_memory`,
-`recall_context`, `search_project` o `synthesize`, y `to_project` a
-`update_memory`. Un nombre que ningún proyecto tiene crea el proyecto al
+Una llamada que no nombra un proyecto lee en las carpetas que tu cliente
+tiene abiertas, o en el directorio en el que arrancó clawg cuando el cliente
+no nombra ninguna. Una búsqueda en varias de ellas marca cada hit con
+`project=` y el id de su proyecto. `recall_context`, `search_project`,
+`synthesize` y `answer_suggestion` trabajan sobre un proyecto: con varios
+abiertos, pasa `project_path` o `project`.
+
+Cada save nombra adónde va: `project_path` con la carpeta del repositorio del
+que trata la memoria, `project` con el id o el nombre de un proyecto sin
+carpeta aquí, como una idea, o `all_projects` para lo que vale en todos los
+proyectos. Un save que no nombra ninguno se rechaza, y la respuesta lista las
+carpetas abiertas. Un nombre que ningún proyecto tiene crea el proyecto al
 guardar. Cuando la respuesta nombra proyectos con un nombre parecido,
 pregúntale a la persona cuál es y pasa su id, o guarda de nuevo con
-`new_project` si es otro proyecto.
+`new_project` si es otro proyecto. `update_memory` mueve una memoria con
+`to_project` o `to_project_path`.
 
 Cuando `recall_context` dice que este proyecto puede ser el mismo que otro,
 pregúntale a la persona, y después llama a `answer_suggestion` con merge o

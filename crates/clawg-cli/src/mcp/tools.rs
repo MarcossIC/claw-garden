@@ -103,17 +103,37 @@ fn nothing_relevant(lang: Lang, withheld: usize) -> String {
     }
 }
 
-/// What `search_memory` hands the model for a search's answer, as `reader`,
-/// whose saves go to `save_project`, in a session whose preferred language
-/// is `language`.
+/// What `search_memory` hands the model for a search's answer in one project
+/// or in all of them, as `reader`, whose saves go to `save_project`, in a
+/// session whose preferred language is `language`.
 pub fn format_search(found: Found, reader: &str, save_project: Option<&str>, language: Option<Lang>) -> String {
+    format_found(found, reader, Revises::In(save_project), language)
+}
+
+/// [`format_search`] for a search in a group of projects: each hit names its
+/// project, which a save that revises it under its key names too.
+pub fn format_group_search(found: Found, reader: &str, language: Option<Lang>) -> String {
+    format_found(found, reader, Revises::InEachHitsProject, language)
+}
+
+/// Where a save that revises a hit under its key goes.
+#[derive(Debug, Clone, Copy)]
+enum Revises<'a> {
+    /// Into this project, the one a search read, or into none.
+    In(Option<&'a str>),
+    /// Into the project each hit names with `project=`, in a search of a
+    /// group of projects.
+    InEachHitsProject,
+}
+
+fn format_found(found: Found, reader: &str, revises: Revises<'_>, language: Option<Lang>) -> String {
     let lang = language.unwrap_or(Lang::En);
     let returned = found.hits.len();
     let hits = relevant_hits(found.hits);
     let text = if hits.is_empty() && returned + found.withheld > 0 {
         nothing_relevant(lang, returned + found.withheld)
     } else {
-        format_hits(lang, &hits, reader, save_project)
+        hit_lines(lang, &hits, reader, revises)
     };
     with_other_language(text, language, found.other_language.as_ref(), hits.len())
 }
@@ -172,17 +192,18 @@ pub fn name_in_spanish(lang: Lang) -> &'static str {
 }
 
 /// Whether a save in `save_project` revises a row of `row_project` under its
-/// key: a key revises only the rows of the project the save goes to, so a row
-/// without one only from a save without one. A row whose project the daemon
-/// did not send keeps its key, as before the daemon sent it.
+/// key: a key revises only the rows of the project the save goes to, and a
+/// save names its project, so no save revises a row without one but a save
+/// with `all_projects`, which [`shown_key`] names. A row whose project the
+/// daemon did not send keeps its key, as before the daemon sent it.
 fn revised_from(row_project: &Option<Option<String>>, save_project: Option<&str>) -> bool {
-    row_project.as_ref().is_none_or(|p| p.as_deref() == save_project)
+    row_project.as_ref().is_none_or(|p| p.is_some() && p.as_deref() == save_project)
 }
 
 /// A row's key as a search hit or `read_memory` shows it: only where a save can
 /// revise the row under it, since a key of another project would promise a
-/// revision the reader cannot make. From a bridge with a project, a preference
-/// without one is revised only by a save with `all_projects`, and says so.
+/// revision the reader cannot make. A preference without a project is revised
+/// only by a save with `all_projects`, and says so.
 fn shown_key(key: Option<&str>, memory_type: Option<&str>, row_project: &Option<Option<String>>, save_project: Option<&str>) -> String {
     let Some(key) = key else {
         return String::new();
@@ -207,7 +228,14 @@ fn shared_author<'a>(hit: &'a Hit, reader: &str) -> Option<&'a str> {
 /// none. A preference the user did not state says how it was saved, after its
 /// tier. A hit another agent saved names it, and the list then ends with the
 /// note on how to read such hits.
+#[cfg(test)]
 fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_project: Option<&str>) -> String {
+    hit_lines(lang, hits, reader, Revises::In(save_project))
+}
+
+/// [`format_hits`] for where `revises` says a save goes: in a group, each hit
+/// with a project names it after its score.
+fn hit_lines(lang: Lang, hits: &[Hit], reader: &str, revises: Revises<'_>) -> String {
     if hits.is_empty() {
         // A sentence, not an empty string: a model reading `""` cannot tell a
         // successful empty search from a broken tool.
@@ -221,9 +249,16 @@ fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_project: Option<&str
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             let author = shared_author(h, reader);
             let by = author.map(|a| format!(" by {}", display_author(a))).unwrap_or_default();
+            let (project, save_project) = match revises {
+                Revises::In(save_project) => (String::new(), save_project),
+                Revises::InEachHitsProject => {
+                    let own = h.project_id.as_ref().and_then(|p| p.as_deref());
+                    (own.map(|p| format!(" project={p}")).unwrap_or_default(), own)
+                }
+            };
             let topic = shown_key(h.topic_key.as_deref(), Some(&h.memory_type), &h.project_id, save_project);
             format!(
-                "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{topic}{by}] {}",
+                "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{project}{topic}{by}] {}",
                 i + 1,
                 h.id,
                 h.kind,
@@ -1015,35 +1050,14 @@ pub fn format_context(lang: Lang, prompt: &str) -> String {
     }
 }
 
-/// Decides which project a tool call is scoped to.
-///
-/// Precedence, and why: `all_projects` wins because it is the only way to ask
-/// for the unscoped view and a caller that passed both meant the broader one;
-/// then an explicit `project_path`, which is the caller naming a project other
-/// than where the bridge happens to be running; then the bridge's own working
-/// directory. `resolve` turns a path into its project; it is passed in so this
-/// rule stays testable without a filesystem.
-pub fn resolve_project(
-    default_project: Option<&ProjectIdentity>,
-    project_path: Option<&str>,
-    all_projects: bool,
-    resolve: impl FnOnce(&Path) -> ProjectIdentity,
-) -> Option<ProjectIdentity> {
-    if all_projects {
-        return None;
-    }
-    match project_path {
-        Some(p) if !p.is_empty() => Some(resolve(Path::new(p))),
-        _ => default_project.cloned(),
-    }
-}
-
 /// Whether registering `project` lets the daemon read its files: only when it
-/// is the root the bridge was started in, the one project the user opened.
-/// Any other root the model names is a label for memories until the user adds
-/// it. Roots are compared, not ids, because two roots that collide share one.
-pub fn indexes_docs(project: &ProjectIdentity, bridge: Option<&ProjectIdentity>) -> bool {
-    bridge.is_some_and(|own| own.root == project.root)
+/// is the root of a folder the person opened that is indexed on its own (a
+/// root the client declared, or the directory the bridge was started in).
+/// Any other root the model names is a label for memories until the person
+/// adds it. Roots are compared, not ids, because two roots that collide share
+/// one.
+pub fn indexes_docs(project: &ProjectIdentity, opened: &[&ProjectIdentity]) -> bool {
+    opened.iter().any(|open| open.root == project.root)
 }
 
 /// The `memory_status` line on whose memories `reader` reads besides its own.
@@ -1425,14 +1439,38 @@ mod tests {
     #[test]
     fn a_hit_without_a_project_shows_how_a_save_revises_it() {
         let unplaced = placed(preference(68), None);
-        assert!(
-            format_hits(Lang::En, std::slice::from_ref(&unplaced), "a", Some("here")).contains(" score=0.56 topic=style/indent all_projects]")
-        );
-        assert!(format_hits(Lang::En, &[unplaced], "a", None).contains(" score=0.56 topic=style/indent]"));
+        for project in [Some("here"), None] {
+            let out = format_hits(Lang::En, std::slice::from_ref(&unplaced), "a", project);
+            assert!(out.contains(" score=0.56 topic=style/indent all_projects]"), "{project:?}: {out}");
+        }
 
         let fact = placed(keyed(hit(68, "Memory", "semantic_fact", 2, 0.56, "tabs"), "style/indent"), None);
-        assert!(!format_hits(Lang::En, std::slice::from_ref(&fact), "a", Some("here")).contains("topic="));
-        assert!(format_hits(Lang::En, &[fact], "a", None).contains(" score=0.56 topic=style/indent]"));
+        for project in [Some("here"), None] {
+            let out = format_hits(Lang::En, std::slice::from_ref(&fact), "a", project);
+            assert!(!out.contains("topic="), "no save goes to no project but one with all_projects: {out}");
+        }
+    }
+
+    #[test]
+    fn a_group_hit_names_its_project_and_its_key() {
+        let fact = |id: i64, project: Option<&str>| placed(keyed(hit(id, "Memory", "semantic_fact", 2, 0.56, "tabs"), "style/indent"), project);
+        let shared = Hit { agent_id: Some("cursor".into()), ..fact(70, Some("web-3c4d")) };
+        let hits = vec![
+            fact(68, Some("app-1a2b")),
+            shared,
+            fact(71, None),
+            placed(preference(72), None),
+            hit(73, "Memory", "semantic_fact", 2, 0.56, "from an older daemon"),
+        ];
+
+        let out = format_group_search(shown(hits), "a", None);
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "1. #68 [Memory/semantic_fact/t2 score=0.56 project=app-1a2b topic=style/indent] tabs");
+        assert_eq!(lines[1], "2. #70 [Memory/semantic_fact/t2 score=0.56 project=web-3c4d topic=style/indent by cursor] tabs");
+        assert_eq!(lines[2], "3. #71 [Memory/semantic_fact/t2 score=0.56] tabs", "no project to name, and no save revises it");
+        assert_eq!(lines[3], "4. #72 [Memory/user_preference/t2 score=0.56 topic=style/indent all_projects] tabs");
+        assert_eq!(lines[4], "5. #73 [Memory/semantic_fact/t2 score=0.56] from an older daemon");
     }
 
     #[test]
@@ -1655,7 +1693,7 @@ mod tests {
         assert_eq!(format_save(Lang::En, &save, Some("other")), "#68 topic=style/indent\ntabs");
         let every_project = SavedText { project_id: Some(None), ..save.clone() };
         assert_eq!(format_save(Lang::En, &every_project, Some("here")), "#68 topic=style/indent all_projects\ntabs");
-        assert_eq!(format_save(Lang::En, &every_project, None), "#68 topic=style/indent\ntabs");
+        assert_eq!(format_save(Lang::En, &every_project, None), "#68 topic=style/indent all_projects\ntabs");
         let a_fact = SavedText { memory_type: Some("semantic_fact".into()), ..every_project.clone() };
         assert_eq!(format_save(Lang::En, &a_fact, Some("here")), "#68\ntabs");
         let no_type_sent = SavedText { memory_type: None, ..every_project };
@@ -2084,53 +2122,21 @@ mod tests {
         assert_eq!(format_context(Lang::En, "   \n "), "no context yet");
     }
 
-    // ── resolve_project ─────────────────────────────────────────────────────
-
-    #[test]
-    fn resolve_project_resolves_an_explicit_path() {
-        let default = identity("proj-default");
-        let resolved = resolve_project(Some(&default), Some("/some/other/project"), false, |p| {
-            assert_eq!(p, Path::new("/some/other/project"));
-            identity("other-1a2b")
-        })
-        .expect("an explicit path must resolve");
-        assert_eq!(resolved.id, "other-1a2b", "an explicit path must override the default");
-    }
-
-    #[test]
-    fn without_a_path_the_bridges_own_project_is_used() {
-        let default = identity("proj-default");
-        let resolved = resolve_project(Some(&default), Some(""), false, |_| unreachable!());
-        assert_eq!(resolved, Some(default));
-    }
-
-    /// The only way to ask for the unscoped view. A caller that passed both
-    /// meant the broader one — narrowing it would silently ignore the request.
-    #[test]
-    fn all_projects_outranks_everything() {
-        let d = identity("d");
-        assert_eq!(resolve_project(Some(&d), Some("/p"), true, |_| unreachable!()), None);
-        assert_eq!(resolve_project(None, None, true, |_| unreachable!()), None);
-    }
-
-    #[test]
-    fn resolve_project_is_none_when_there_is_nothing_to_scope_to() {
-        assert_eq!(resolve_project(None, None, false, |_| unreachable!()), None);
-    }
-
     fn identity(id: &str) -> ProjectIdentity {
         ProjectIdentity { id: id.into(), root: format!("/{id}").into(), legacy_id: id.into(), path: format!("/{id}").into() }
     }
 
     #[test]
-    fn only_the_bridges_own_root_is_indexed() {
-        let own = identity("repo-1a2b");
-        assert!(indexes_docs(&own, Some(&own)));
-        assert!(!indexes_docs(&identity("other-3c4d"), Some(&own)));
-        assert!(!indexes_docs(&own, None), "a bridge with no project of its own indexes nothing");
-        // Two roots that collide share an id; only the root says which is the bridge's.
-        let twin = ProjectIdentity { root: "/elsewhere/repo-1a2b".into(), ..own.clone() };
-        assert!(!indexes_docs(&twin, Some(&own)));
+    fn only_a_folder_the_person_opened_is_indexed() {
+        let (root, start) = (identity("root-5e6f"), identity("repo-1a2b"));
+        let opened = [&root, &start];
+        assert!(indexes_docs(&root, &opened), "a root the client declared");
+        assert!(indexes_docs(&start, &opened), "the directory the bridge was started in");
+        assert!(!indexes_docs(&identity("other-3c4d"), &opened), "a folder the model named");
+        assert!(!indexes_docs(&start, &[]), "with no folder open, none");
+        // Two roots that collide share an id; only the root says which is open.
+        let twin = ProjectIdentity { root: "/elsewhere/repo-1a2b".into(), ..start.clone() };
+        assert!(!indexes_docs(&twin, &opened));
     }
 
     // ── format_status ───────────────────────────────────────────────────────

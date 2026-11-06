@@ -202,6 +202,31 @@ mod tests {
     }
 
     #[test]
+    fn the_protocol_says_where_a_call_without_a_project_goes() {
+        for (text, heading) in [(PROTOCOL, "Projects"), (PROTOCOL_ES, "Proyectos")] {
+            let projects = section(text, heading);
+            for name in [
+                "`project_path`",
+                "`project`",
+                "`all_projects`",
+                "`project=`",
+                "`recall_context`",
+                "`search_project`",
+                "`synthesize`",
+                "`answer_suggestion`",
+            ] {
+                assert!(projects.contains(name), "{heading} names {name}:
+{projects}");
+            }
+        }
+        for text in [PROTOCOL, PROTOCOL_ES] {
+            let opening = opening(text);
+            assert!(opening.contains("`project_path`, `project`"), "the opening asks each save to name its project:
+{opening}");
+        }
+    }
+
+    #[test]
     fn a_language_rewrites_both_rules_of_the_english_protocol() {
         let en = text(Some(Lang::En));
         assert!(en.contains("Save memories and search in English:") && en.contains("Reply to the user in English unless"));

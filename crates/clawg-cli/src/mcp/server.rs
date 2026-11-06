@@ -17,20 +17,22 @@
 //!
 //! rmcp resolves the calling client from a `RequestContext`, which no test can
 //! construct (its `Peer` is crate-private). So each `#[tool]` method does
-//! exactly two things — resolve the agent id from the request, then delegate —
-//! and all the behaviour lives in an `*_impl` taking that id explicitly, where
-//! a test can drive it against an in-process daemon.
+//! exactly two things — resolve the agent id, and the client's roots where the
+//! tool reads or saves, from the request, then delegate — and all the
+//! behaviour lives in an `*_impl` taking that id explicitly, on a server that
+//! holds those roots ([`ClawgMcp::with_roots`]), where a test can drive it
+//! against an in-process daemon. The roots themselves are asked of a real
+//! client in the tests of [`crate::mcp`].
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clawg_core::memory::dispute::Verdict;
 use clawg_core::memory::sharing;
 use clawg_core::memory::store_insert::MemoryType;
 use clawg_core::memory::project_docs::corpus::{auto_indexable, has_project_marker};
-use clawg_core::memory::identity::strip_verbatim;
 use clawg_core::memory::registry::{Born, Resolution as ProjectResolution};
 use clawg_core::memory::ProjectIdentity;
 use clawg_core::paths::Profile;
@@ -49,11 +51,12 @@ use crate::client::{
     ClientError, DaemonClient, ListArgs, RelatedMemory, SaveArgs, SaveOutcome, SearchArgs, SynthesisArgs,
 };
 use crate::mcp::protocol::{self, opening};
+use crate::mcp::roots::{self, Folder, Start};
 use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
-    format_docs, format_language, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
+    format_docs, format_language, format_recall, format_resolution, format_rows, format_save, format_search, format_group_search, format_sharing,
     format_answered, format_delete, format_open_pairs, format_refusal, format_restore, format_status, format_synthesis, format_update,
-    indexes_docs, no_folder, resolve_project, topic_key_warning,
+    indexes_docs, no_folder, topic_key_warning,
 };
 
 /// The daemon refused a root because its id already belongs to another one.
@@ -165,14 +168,14 @@ pub struct SaveMemoryArgs {
     /// retrieved sooner. Defaults to 5.
     #[serde(default)]
     pub importance: Option<f64>,
-    /// Absolute path of the project this memory belongs to. Defaults to the
-    /// directory this bridge was started in.
+    /// Absolute path of a folder of the project this memory belongs to, such
+    /// as the repository it is about. A save names its project with this,
+    /// project or all_projects; with none it is refused.
     #[serde(default)]
     pub project_path: Option<String>,
     /// The project this memory belongs to by its id or its name, for one with
-    /// no folder here, such as an idea, or another than this directory's. A
-    /// name no project has or resembles creates the project. Not with
-    /// project_path.
+    /// no folder here, such as an idea. A name no project has or resembles
+    /// creates the project. Not with project_path.
     #[serde(default)]
     pub project: Option<String>,
     /// True only when the user said a name that resembles other projects is
@@ -209,12 +212,13 @@ pub struct SearchMemoryArgs {
     /// How many memories to return, 1 to 50. Defaults to 10.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Absolute path of the project to search in. Defaults to the directory
-    /// this bridge was started in.
+    /// Absolute path of the project to search in. Defaults to the projects of
+    /// the folders open in the client, or of the directory this bridge was
+    /// started in when it names none.
     #[serde(default)]
     pub project_path: Option<String>,
-    /// The project by its id or its name, for one with no folder here or
-    /// another than this directory's. Not with project_path.
+    /// The project by its id or its name, for one with no folder here or one
+    /// not open in the client. Not with project_path.
     #[serde(default)]
     pub project: Option<String>,
     /// Search every project instead of just one. Use when the user asks about
@@ -228,12 +232,13 @@ pub struct RecallContextArgs {
     /// What the user is asking about. The returned block is meant to be read
     /// as background before answering, not quoted back to them.
     pub query: String,
-    /// Absolute path of the project. Defaults to the directory this bridge was
-    /// started in.
+    /// Absolute path of the project. Defaults to the project of the folder
+    /// open in the client, or of the directory this bridge was started in
+    /// when it names none; with several open, pass this or project.
     #[serde(default)]
     pub project_path: Option<String>,
-    /// The project by its id or its name, for one with no folder here or
-    /// another than this directory's. Not with project_path.
+    /// The project by its id or its name, for one with no folder here or one
+    /// not open in the client. Not with project_path.
     #[serde(default)]
     pub project: Option<String>,
     /// Most bytes of context to return, about 4 per token. Defaults to 8000,
@@ -250,13 +255,15 @@ pub struct SearchProjectArgs {
     /// How many passages to return, 1 to 20. Defaults to 5.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Absolute path of the project. Defaults to the directory this bridge was
-    /// started in. Another project's files are searched only once the user
-    /// has added it with `clawg projects add`.
+    /// Absolute path of the project. Defaults to the project of the folder
+    /// open in the client, or of the directory this bridge was started in
+    /// when it names none; with several open, pass this or project. Another
+    /// project's files are searched only once the user has added it with
+    /// `clawg projects add`.
     #[serde(default)]
     pub project_path: Option<String>,
-    /// The project by its id or its name, for one with no folder here or
-    /// another than this directory's. Not with project_path.
+    /// The project by its id or its name, for one with no folder here or one
+    /// not open in the client. Not with project_path.
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -266,12 +273,13 @@ pub struct SynthesizeArgs {
     /// How many memories to review, 1 to 100. Defaults to 30.
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Absolute path of the project to review. Defaults to the directory this
-    /// bridge was started in.
+    /// Absolute path of the project to review. Defaults to the project of the
+    /// folder open in the client, or of the directory this bridge was started
+    /// in when it names none; with several open, pass this or project.
     #[serde(default)]
     pub project_path: Option<String>,
-    /// The project by its id or its name, for one with no folder here or
-    /// another than this directory's. Not with project_path.
+    /// The project by its id or its name, for one with no folder here or one
+    /// not open in the client. Not with project_path.
     #[serde(default)]
     pub project: Option<String>,
     /// Review every project at once, for conclusions about the user rather
@@ -468,8 +476,9 @@ pub struct AnswerSuggestionArgs {
     /// True only when the user answered whether they are one project.
     #[serde(default)]
     pub user_answered: bool,
-    /// This project by its id or its name. Defaults to the directory this
-    /// bridge was started in.
+    /// This project by its id or its name. Defaults to the project of the
+    /// folder open in the client, or of the directory this bridge was started
+    /// in when it names none.
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -485,11 +494,15 @@ pub struct ClawgMcp {
     /// The last name a client declared to this bridge. Shared by every clone,
     /// because rmcp clones the server per call.
     declared: Arc<std::sync::Mutex<Option<String>>>,
-    /// The project the bridge process itself is sitting in.
-    default_project: Option<ProjectIdentity>,
-    /// `default_project` when it is a project whose files the daemon may read
-    /// without the user adding it (see [`own_root_to_index`]).
-    docs_root: Option<ProjectIdentity>,
+    /// The directory the bridge process was started in, unless it is the
+    /// home directory, where a call reads when the client declares no roots.
+    started_in: Option<Folder>,
+    /// The user's home directory, canonical, which is never a project.
+    home: Option<PathBuf>,
+    /// The roots the client declared for the call at hand, as folders;
+    /// `None` when it declares none. Set on the clone that serves one call
+    /// ([`Self::at`]), since the client may change them between two calls.
+    roots: Option<Vec<Folder>>,
     /// Roots, with the path inside each they were reached through, already
     /// sent to `POST /v1/projects` by this process, with the ids it gave
     /// them: a declared subfolder of a root leads to another project. Shared
@@ -510,59 +523,78 @@ struct ProjectIds {
     root: String,
 }
 
-/// The bridge's own project, when its root is one the daemon may read on its
-/// own: a folder with a `.git` or a manifest, other than the home directory.
-/// The working directory is whatever the client was opened in, `~` included.
-fn own_root_to_index(project: Option<&ProjectIdentity>) -> Option<ProjectIdentity> {
-    let home = clawg_core::paths::home_dir().map(|h| std::fs::canonicalize(&h).map(|c| strip_verbatim(&c)).unwrap_or(h));
-    project.filter(|p| auto_indexable(&p.root, home.as_deref(), has_project_marker(&p.root))).cloned()
-}
-
 impl ClawgMcp {
-    /// Builds a server whose default project is the bridge's working directory.
-    ///
-    /// The working directory is the right default because an MCP host launches
-    /// the bridge from the project the user has open — so "where am I?" and
-    /// "which project do these memories belong to?" have the same answer
-    /// without anyone configuring it.
+    /// Builds a server started in this process's working directory.
     pub fn new(client: DaemonClient, profile: Profile) -> Self {
-        Self::pending(ClientHandle::ready(client), profile)
+        Self::pending(ClientHandle::ready(client), profile, Start::of_process())
     }
 
     /// [`ClawgMcp::new`] for a daemon that may still be starting: each tool
     /// call waits on the handle instead of assuming a live client.
-    pub fn pending(client: ClientHandle, profile: Profile) -> Self {
-        let default_project = std::env::current_dir()
-            .ok()
-            .map(|cwd| ProjectIdentity::resolve(&cwd));
-        Self::with_handle(client, profile, default_project)
+    ///
+    /// The working directory is where a call reads when the client declares
+    /// no roots, unless it is the home directory: Cursor starts every bridge
+    /// there, whatever the person has open.
+    pub fn pending(client: ClientHandle, profile: Profile, start: Start) -> Self {
+        let home = start.home.as_deref().map(roots::canonical_home);
+        let started_in = start.dir.as_deref().and_then(|dir| Folder::at(dir, home.as_deref()));
+        Self::with_handle(client, profile, started_in, home)
     }
 
-    /// [`ClawgMcp::new`] with the default project stated explicitly.
-    pub fn with_project(
-        client: DaemonClient,
-        profile: Profile,
-        default_project: Option<ProjectIdentity>,
-    ) -> Self {
-        Self::with_handle(ClientHandle::ready(client), profile, default_project)
+    /// A server started in `project`'s folder, read whatever it is: no home
+    /// directory is set aside, from it or from the roots it is given later.
+    pub fn with_project(client: DaemonClient, profile: Profile, project: Option<ProjectIdentity>) -> Self {
+        let home = clawg_core::paths::home_dir().map(|h| roots::canonical_home(&h));
+        let started_in = project.map(|project| Folder {
+            indexable: auto_indexable(&project.root, home.as_deref(), has_project_marker(&project.root)),
+            project,
+        });
+        Self::with_handle(ClientHandle::ready(client), profile, started_in, None)
     }
 
-    fn with_handle(
-        client: ClientHandle,
-        profile: Profile,
-        default_project: Option<ProjectIdentity>,
-    ) -> Self {
+    fn with_handle(client: ClientHandle, profile: Profile, started_in: Option<Folder>, home: Option<PathBuf>) -> Self {
         Self {
             client,
             configured_agent: None,
             declared: Arc::default(),
-            docs_root: own_root_to_index(default_project.as_ref()),
-            default_project,
+            started_in,
+            home,
+            roots: None,
             registered: Arc::default(),
             profile,
             language: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// This server with the roots a client declared, as folders; `None` for a
+    /// client that declares none.
+    pub fn with_roots(mut self, roots: Option<Vec<Folder>>) -> Self {
+        self.roots = roots;
+        self
+    }
+
+    /// The server that serves one call: with the roots the client of `ctx`
+    /// declares now, asked for on every call, since a client may change them
+    /// without telling.
+    async fn at(&self, ctx: &RequestContext<RoleServer>) -> Self {
+        let roots = roots::declared(ctx).await.map(|uris| roots::folders(&uris, self.home.as_deref()));
+        self.clone().with_roots(roots)
+    }
+
+    /// The folders a call that names no project reads in: the client's roots
+    /// when it declared any, else the directory the bridge was started in.
+    fn reading_folders(&self) -> Vec<&Folder> {
+        match &self.roots {
+            Some(roots) if !roots.is_empty() => roots.iter().collect(),
+            _ => self.started_in.iter().collect(),
+        }
+    }
+
+    /// The roots of the folders the person opened whose files the daemon may
+    /// read on its own.
+    fn indexable_roots(&self) -> Vec<&ProjectIdentity> {
+        self.roots.iter().flatten().chain(&self.started_in).filter(|f| f.indexable).map(|f| &f.project).collect()
     }
 
     /// The preferred language this session speaks and searches in. In
@@ -928,10 +960,9 @@ impl ClawgMcp {
         }
     }
 
-    /// The ids of the project a call is scoped to, registered with the daemon
-    /// first so rows saved under its legacy id, or under the id of another
-    /// clone of its remote, are already under its project when the call reads
-    /// or writes.
+    /// The ids of `project`, registered with the daemon first so rows saved
+    /// under its legacy id, or under the id of another clone of its remote,
+    /// are already under its project when the call reads or writes.
     ///
     /// Each root and path is sent once per process, even when the call
     /// fails: a daemon that cannot register (an older version, say) must not
@@ -942,27 +973,14 @@ impl ClawgMcp {
     /// assigned ids answers: that is `Err`, because reading or writing under
     /// the id would mix two projects, and it is asked again on the next call
     /// because nothing in this process would notice it being resolved.
-    async fn ids_for(
-        &self,
-        client: &DaemonClient,
-        project_path: Option<&str>,
-        all_projects: bool,
-    ) -> Result<Option<ProjectIds>, ClientError> {
-        let Some(project) = resolve_project(
-            self.default_project.as_ref(),
-            project_path,
-            all_projects,
-            ProjectIdentity::resolve,
-        ) else {
-            return Ok(None);
-        };
+    async fn register(&self, client: &DaemonClient, project: &ProjectIdentity) -> Result<ProjectIds, ClientError> {
         let key = (project.root.clone(), project.path.clone());
         let mut registered = self.registered.lock().await;
         if let Some(ids) = registered.get(&key) {
-            return Ok(Some(ids.clone()));
+            return Ok(ids.clone());
         }
         let legacy = project.legacy_ids();
-        let index_docs = indexes_docs(&project, self.docs_root.as_ref());
+        let index_docs = indexes_docs(project, &self.indexable_roots());
         let ids = match client.register_project(&project.root, Some(&project.path), &legacy, index_docs).await {
             Ok(given) => ProjectIds { project: given.project_id, root: given.root_id },
             Err(e) if e.is_root_collision() => return Err(e),
@@ -972,34 +990,56 @@ impl ClawgMcp {
                 // The daemon never saw it, so the one found after reading the
                 // files again must get it.
                 if on_failure(&e) == Next::Reresolve {
-                    return Ok(Some(derived));
+                    return Ok(derived);
                 }
                 derived
             }
         };
         registered.insert(key, ids.clone());
-        Ok(Some(ids))
+        Ok(ids)
     }
 
-    /// Which project's memories a call reads and writes; see [`Self::ids_for`].
-    async fn project_for(
-        &self,
-        client: &DaemonClient,
-        project_path: Option<&str>,
-        all_projects: bool,
-    ) -> Result<Option<String>, ClientError> {
-        Ok(self.ids_for(client, project_path, all_projects).await?.map(|ids| ids.project))
+    /// The ids of the project of the folder at `path`; see [`Self::register`].
+    async fn at_path(&self, client: &DaemonClient, path: &str) -> Result<ProjectIds, ClientError> {
+        self.register(client, &ProjectIdentity::resolve(Path::new(path))).await
     }
 
-    /// The project a `save_memory` with `project_path` goes to, which is
-    /// where a key it shows revises. Resolved without registering it: an
-    /// `all_projects` search registers nothing. A root not registered yet
-    /// reads as the id derived from it.
+    /// The projects a call that names no project reads, from its reading
+    /// folders, each registered: two folders that lead to one project, such
+    /// as two clones of a remote, count once.
+    async fn reading(&self, client: &DaemonClient) -> Result<Vec<ProjectIds>, ClientError> {
+        let mut projects: Vec<ProjectIds> = Vec::new();
+        for folder in self.reading_folders() {
+            let ids = self.register(client, &folder.project).await?;
+            if !projects.iter().any(|p| p.project == ids.project) {
+                projects.push(ids);
+            }
+        }
+        Ok(projects)
+    }
+
+    /// The project where a key shown to the model revises its row: the one a
+    /// save with `project_path` goes to, or, without one, the one project
+    /// the call reads; `None` when it reads none or several. Resolved
+    /// without registering: an `all_projects` search registers nothing. A
+    /// root not registered yet reads as the id derived from it.
     async fn save_project(&self, project_path: Option<&str>) -> Option<String> {
-        let project = resolve_project(self.default_project.as_ref(), project_path, false, ProjectIdentity::resolve)?;
         let registered = self.registered.lock().await;
-        let given = registered.get(&(project.root.clone(), project.path.clone())).map(|ids| ids.project.clone());
-        Some(given.unwrap_or(project.id))
+        let id_of = |project: &ProjectIdentity| {
+            let given = registered.get(&(project.root.clone(), project.path.clone())).map(|ids| ids.project.clone());
+            given.unwrap_or_else(|| project.id.clone())
+        };
+        if let Some(path) = project_path.filter(|p| !p.is_empty()) {
+            return Some(id_of(&ProjectIdentity::resolve(Path::new(path))));
+        }
+        let mut ids: Vec<String> = self.reading_folders().into_iter().map(|f| id_of(&f.project)).collect();
+        ids.sort();
+        ids.dedup();
+        let mut ids = ids.into_iter();
+        match (ids.next(), ids.next()) {
+            (Some(one), None) => Some(one),
+            _ => None,
+        }
     }
 
     /// The sentence refusing a call that names its project twice, by
@@ -1009,6 +1049,58 @@ impl ClawgMcp {
             Lang::En => format!("pass project or {path_name}, not both"),
             Lang::Es => format!("pasa project o {path_name}, no los dos"),
         })
+    }
+
+    /// The paths of the reading folders, for a sentence that offers them.
+    fn folders_open(&self) -> String {
+        self.reading_folders().iter().map(|f| f.project.path.display().to_string()).collect::<Vec<_>>().join(", ")
+    }
+
+    /// The refusal of a save that names no project, offering the reading
+    /// folders as its `project_path`.
+    fn unplaced(&self) -> String {
+        let folders = self.folders_open();
+        let open = match (self.speaks(), folders.is_empty()) {
+            (_, true) => String::new(),
+            (Lang::En, false) => format!(" (open here: {folders})"),
+            (Lang::Es, false) => format!(" (abiertas aquí: {folders})"),
+        };
+        match self.speaks() {
+            Lang::En => format!(
+                "not saved: name the project this memory belongs to: project_path with the folder of its \
+                 repository{open}, project with the id or the name of one, or all_projects for what holds in every \
+                 project"
+            ),
+            Lang::Es => format!(
+                "no se guardó: nombra el proyecto de esta memoria: project_path con la carpeta de su \
+                 repositorio{open}, project con el id o el nombre de uno, o all_projects para lo que vale en todos \
+                 los proyectos"
+            ),
+        }
+    }
+
+    /// The one project of `projects`, or none, or [`Self::several_open`].
+    fn one_of(&self, projects: Vec<String>) -> Result<Option<String>, String> {
+        if projects.len() < 2 {
+            return Ok(projects.into_iter().next());
+        }
+        Err(self.several_open())
+    }
+
+    /// The refusal of a call that works on one project while the client has
+    /// several open, offering their folders as its `project_path`.
+    fn several_open(&self) -> String {
+        let folders = self.folders_open();
+        match self.speaks() {
+            Lang::En => format!(
+                "nothing done: the client has several projects open ({folders}); pass project_path with the folder \
+                 of the one you mean, or project"
+            ),
+            Lang::Es => format!(
+                "no se hizo nada: el cliente tiene varios proyectos abiertos ({folders}); pasa project_path con la \
+                 carpeta del que quieres, o project"
+            ),
+        }
     }
 
     /// The project `reference` (an id or a name) leads to, or the sentence
@@ -1028,20 +1120,26 @@ impl ClawgMcp {
         })
     }
 
-    /// Which project's memories a call reads: the one `project` names, else
-    /// the one of its path as [`Self::project_for`] gives it. `all_projects`
-    /// wins over both.
+    /// Which projects a call reads: none with `all_projects`, which wins;
+    /// else the one `project` names, or the one of `project_path`; else its
+    /// reading projects, none when it has no reading folder.
     async fn scope_for(
         &self,
         client: &DaemonClient,
         project: Option<&str>,
         project_path: Option<&str>,
         all_projects: bool,
-    ) -> Result<Result<Option<String>, String>, ClientError> {
-        match project {
-            Some(reference) if !all_projects => Ok(self.named(client, reference, false, false).await?.map(|r| r.project_id)),
-            _ => Ok(Ok(self.project_for(client, project_path, all_projects).await?)),
+    ) -> Result<Result<Vec<String>, String>, ClientError> {
+        if all_projects {
+            return Ok(Ok(Vec::new()));
         }
+        if let Some(reference) = project {
+            return Ok(self.named(client, reference, false, false).await?.map(|r| r.project_id.into_iter().collect()));
+        }
+        if let Some(path) = project_path.filter(|p| !p.is_empty()) {
+            return Ok(Ok(vec![self.at_path(client, path).await?.project]));
+        }
+        Ok(Ok(self.reading(client).await?.into_iter().map(|ids| ids.project).collect()))
     }
 
     // ── Implementations, testable without a Peer ────────────────────────────
@@ -1073,20 +1171,25 @@ impl ClawgMcp {
                 Lang::Es => "new_project va con project: nombra el proyecto que hay que crear",
             });
         }
+        // A save names where it goes: no project is guessed for it, since
+        // a conversation may be about another project than the folders open,
+        // and a row without a project is read from every project.
+        let project_path = args.project_path.as_deref().filter(|p| !p.trim().is_empty());
+        if args.project.is_none() && project_path.is_none() && !all_projects {
+            return Self::failed(self.unplaced());
+        }
         let args = &args;
         let result = self
             .call(|client| async move {
-                // A memory belongs to the bridge's project unless the call
-                // names another or says it holds in every one: a row without
-                // a project is read from all of them. A name is resolved, and
-                // a new one created, before the save reaches the outbox.
-                let project_id = match args.project.as_deref() {
-                    Some(reference) => match self.named(&client, reference, true, args.new_project.unwrap_or(false)).await? {
+                // A name is resolved, and a new one created, before the save
+                // reaches the outbox.
+                let project_id = match (args.project.as_deref(), project_path) {
+                    (Some(reference), _) => match self.named(&client, reference, true, args.new_project.unwrap_or(false)).await? {
                         Ok(resolution) => resolution.project_id,
                         Err(refusal) => return Ok(Err(refusal)),
                     },
-                    None if all_projects => None,
-                    None => self.project_for(&client, args.project_path.as_deref(), false).await?,
+                    (None, Some(path)) => Some(self.at_path(&client, path).await?.project),
+                    (None, None) => None,
                 };
                 client
                     .save(SaveArgs {
@@ -1130,32 +1233,38 @@ impl ClawgMcp {
         let all_projects = args.all_projects.unwrap_or(false);
         let result = self
             .call(|client| async move {
-                let project_id =
+                let projects =
                     match self.scope_for(&client, args.project.as_deref(), args.project_path.as_deref(), all_projects).await? {
-                        Ok(project_id) => project_id,
+                        Ok(projects) => projects,
                         Err(refusal) => return Ok(Err(refusal)),
                     };
                 let save_project = match (all_projects, args.project.as_deref()) {
-                    (false, _) => project_id.clone(),
+                    (false, _) => projects.first().cloned(),
                     (true, Some(reference)) => self.named(&client, reference, false, false).await?.ok().and_then(|r| r.project_id),
                     (true, None) => self.save_project(args.project_path.as_deref()).await,
                 };
-                client
-                    .search(SearchArgs {
-                        query: args.query.clone(),
-                        agent_id: agent_id.to_string(),
-                        project_id,
-                        limit: args.limit,
-                        lang: self.language,
-                    })
-                    .await
-                    .map(|found| Ok((found, save_project)))
+                let search = SearchArgs {
+                    query: args.query.clone(),
+                    agent_id: agent_id.to_string(),
+                    project_id: None,
+                    limit: args.limit,
+                    lang: self.language,
+                };
+                // A search of one project, or of all, goes out as it always
+                // has; only a group of projects needs the field.
+                let found = match projects.as_slice() {
+                    [_, _, ..] => client.search_group(search, &projects).await.map(|found| (found, None)),
+                    one => client.search(SearchArgs { project_id: one.first().cloned(), ..search }).await.map(|found| (found, Some(save_project))),
+                };
+                found.map(Ok)
             })
             .await;
         match result {
-            Ok(Ok(Ok((found, save_project)))) => {
+            Ok(Ok(Ok((found, Some(save_project))))) => {
                 Self::ok(format_search(found, agent_id, save_project.as_deref(), self.language))
             }
+            // A group, where each hit names its own project.
+            Ok(Ok(Ok((found, None)))) => Self::ok(format_group_search(found, agent_id, self.language)),
             Ok(Ok(Err(refusal))) => Self::failed(refusal),
             Ok(Err(e)) => Self::failed(Self::explain_with_all_projects(self.speaks(), &e)),
             Err(failure) => Ok(failure),
@@ -1173,7 +1282,8 @@ impl ClawgMcp {
         let args = &args;
         let result = self
             .call(|client| async move {
-                let project_id = match self.scope_for(&client, args.project.as_deref(), args.project_path.as_deref(), false).await? {
+                let projects = self.scope_for(&client, args.project.as_deref(), args.project_path.as_deref(), false).await?;
+                let project_id = match projects.and_then(|projects| self.one_of(projects)) {
                     Ok(project_id) => project_id,
                     Err(refusal) => return Ok(Err(refusal)),
                 };
@@ -1270,8 +1380,8 @@ impl ClawgMcp {
             })
             .await;
         match result {
-            // `read_memory` names no project, so a save after it goes to the
-            // bridge's own.
+            // `read_memory` names no project, so its key is shown where a
+            // save in the one project the call reads revises it.
             Ok(Ok(save)) => Self::ok(format_save(self.speaks(), &save, self.save_project(None).await.as_deref())),
             Ok(Err(e)) => Self::failed(Self::route_failure_text(self.speaks(), &e, Route::ReadSave)),
             Err(failure) => Ok(failure),
@@ -1334,7 +1444,7 @@ impl ClawgMcp {
         let result = self
             .call(|client| async move {
                 let project = match (args.to_project_path.as_deref(), args.to_project.as_deref()) {
-                    (Some(path), _) => Some(self.project_for(&client, Some(path), false).await?),
+                    (Some(path), _) => Some(Some(self.at_path(&client, path).await?.project)),
                     (None, Some(reference)) => match self.named(&client, reference, false, false).await? {
                         Ok(resolution) => Some(resolution.project_id),
                         Err(refusal) => return Ok(Err(refusal)),
@@ -1422,9 +1532,16 @@ impl ClawgMcp {
                         }
                         Err(refusal) => return Ok(Err(refusal)),
                     },
-                    None => match self.ids_for(&client, args.project_path.as_deref(), false).await? {
-                        Some(ids) => ids.root,
-                        None => return Ok(Ok(None)),
+                    None => match args.project_path.as_deref().filter(|p| !p.is_empty()) {
+                        Some(path) => self.at_path(&client, path).await?.root,
+                        None => {
+                            let mut reading = self.reading(&client).await?;
+                            match (reading.pop(), reading.is_empty()) {
+                                (Some(one), true) => one.root,
+                                (None, _) => return Ok(Ok(None)),
+                                (Some(_), false) => return Ok(Err(self.several_open())),
+                            }
+                        }
                     },
                 };
                 client.search_docs(&root, &args.query, args.limit).await.map(|found| Ok(Some(found)))
@@ -1472,11 +1589,11 @@ impl ClawgMcp {
         let all_projects = args.all_projects.unwrap_or(false);
         let result = self
             .call(|client| async move {
-                let project_id =
-                    match self.scope_for(&client, args.project.as_deref(), args.project_path.as_deref(), all_projects).await? {
-                        Ok(project_id) => project_id,
-                        Err(refusal) => return Ok(Err(refusal)),
-                    };
+                let projects = self.scope_for(&client, args.project.as_deref(), args.project_path.as_deref(), all_projects).await?;
+                let project_id = match projects.and_then(|projects| self.one_of(projects)) {
+                    Ok(project_id) => project_id,
+                    Err(refusal) => return Ok(Err(refusal)),
+                };
                 client
                     .synthesis(&SynthesisArgs { agent_id: Some(agent_id.into()), project_id, limit: args.limit })
                     .await
@@ -1497,19 +1614,23 @@ impl ClawgMcp {
         let args = &args;
         let result = self
             .call(|client| async move {
-                // By id too, so the bridge's own project, merged since it
-                // registered, is the live one the suggestion names.
+                // By id too, so the project the call reads, merged since it
+                // was registered, is the live one the suggestion names.
                 let reference = match args.project.clone() {
                     Some(reference) => reference,
-                    None => match self.project_for(&client, None, false).await? {
-                        Some(own) => own,
-                        None => {
-                            return Ok(Err(match self.speaks() {
-                                Lang::En => "no project to answer for: pass project".to_string(),
-                                Lang::Es => "no hay proyecto por el que responder: pasa project".to_string(),
-                            }))
+                    None => {
+                        let reading = self.reading(&client).await?.into_iter().map(|ids| ids.project).collect();
+                        match self.one_of(reading) {
+                            Ok(Some(one)) => one,
+                            Ok(None) => {
+                                return Ok(Err(match self.speaks() {
+                                    Lang::En => "no project to answer for: pass project".to_string(),
+                                    Lang::Es => "no hay proyecto por el que responder: pasa project".to_string(),
+                                }))
+                            }
+                            Err(several) => return Ok(Err(several)),
                         }
-                    },
+                    }
                 };
                 let project = match self.named(&client, &reference, false, false).await? {
                     Ok(resolution) => resolution.project_id.unwrap_or(reference),
@@ -1585,7 +1706,7 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SaveMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.save_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        self.at(&ctx).await.save_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -1607,7 +1728,7 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.search_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        self.at(&ctx).await.search_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -1624,7 +1745,7 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<RecallContextArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.recall_context_impl(&self.agent_id_for(Some(&ctx)), args).await
+        self.at(&ctx).await.recall_context_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -1657,7 +1778,7 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ReadMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.read_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        self.at(&ctx).await.read_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -1744,9 +1865,10 @@ impl ClawgMcp {
     )]
     async fn answer_suggestion(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<AnswerSuggestionArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.answer_suggestion_impl(args).await
+        self.at(&ctx).await.answer_suggestion_impl(args).await
     }
 
     #[tool(
@@ -1765,7 +1887,7 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SynthesizeArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.synthesize_impl(&self.agent_id_for(Some(&ctx)), args).await
+        self.at(&ctx).await.synthesize_impl(&self.agent_id_for(Some(&ctx)), args).await
     }
 
     #[tool(
@@ -1781,9 +1903,10 @@ impl ClawgMcp {
     )]
     async fn search_project(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchProjectArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.search_project_impl(args).await
+        self.at(&ctx).await.search_project_impl(args).await
     }
 
     #[tool(
@@ -1794,7 +1917,7 @@ impl ClawgMcp {
                        user why."
     )]
     async fn memory_status(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.memory_status_impl(self.agent_for(Some(&ctx))).await
+        self.at(&ctx).await.memory_status_impl(self.agent_for(Some(&ctx))).await
     }
 }
 
@@ -1892,13 +2015,16 @@ mod tests {
         )
     }
 
-    /// The default project of [`bridge`]: a root that is already canonical, so
-    /// there is no legacy id to move.
-    /// A project the daemon gives the id derived from its root, as it gives
-    /// any root that no other one holds.
+    /// The folder [`bridge`] is started in, which does not exist: a save
+    /// names it as its `project_path`.
+    const PROJ_TEST: &str = "/proj-test";
+
+    /// The project of [`bridge`], resolved as a `project_path` naming
+    /// [`PROJ_TEST`] is, so the two are one project on every system. The
+    /// daemon gives it the id derived from its root, as it gives any root
+    /// that no other one holds.
     fn test_project() -> ProjectIdentity {
-        let id = clawg_core::memory::derive_project_id(std::path::Path::new("/proj-test"));
-        ProjectIdentity { id: id.clone(), root: "/proj-test".into(), legacy_id: id, path: "/proj-test".into() }
+        ProjectIdentity::resolve(Path::new(PROJ_TEST))
     }
 
     /// A bridge pointed at an address where nothing is listening.
@@ -1929,7 +2055,10 @@ mod tests {
     /// identity a bridge started in `src` resolves to.
     fn repo_with_src() -> (tempfile::TempDir, ProjectIdentity) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = std::fs::canonicalize(dir.path()).expect("canonicalize").join("repo");
+        // Without the `\\?\` of a Windows canonical path, as a working
+        // directory or a `project_path` names it, so its legacy id is theirs.
+        let base = clawg_core::memory::identity::strip_verbatim(&std::fs::canonicalize(dir.path()).expect("canonicalize"));
+        let repo = base.join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect(".git");
         std::fs::create_dir_all(repo.join("src")).expect("src");
         let identity = ProjectIdentity::resolve(&repo.join("src"));
@@ -1946,12 +2075,13 @@ mod tests {
             .len()
     }
 
+    /// A save of `content` in the project of [`bridge`].
     fn save_args(content: &str) -> SaveMemoryArgs {
         SaveMemoryArgs {
             content: content.into(),
             memory_type: None,
             importance: None,
-            project_path: None,
+            project_path: Some(PROJ_TEST.into()),
             project: None,
             new_project: None,
             all_projects: None,
@@ -1959,6 +2089,17 @@ mod tests {
             topic_key: None,
             user_stated: None,
         }
+    }
+
+    /// A save of `content` that names no project yet.
+    fn bare_save(content: &str) -> SaveMemoryArgs {
+        SaveMemoryArgs { project_path: None, ..save_args(content) }
+    }
+
+    /// A save of `content` in `project`, named by the path it was reached
+    /// through.
+    fn save_args_in(project: &ProjectIdentity, content: &str) -> SaveMemoryArgs {
+        SaveMemoryArgs { project_path: Some(project.path.display().to_string()), ..save_args(content) }
     }
 
     #[tokio::test]
@@ -1980,7 +2121,7 @@ mod tests {
             .await
             .expect("seed a legacy row");
 
-        let saved = b.save_memory_impl("a", save_args("saved after")).await.unwrap();
+        let saved = b.save_memory_impl("a", save_args_in(&identity, "saved after")).await.unwrap();
         assert!(!is_error(&saved), "{}", text(&saved));
 
         assert_eq!(rows_in(&b, &identity.id).await, 2);
@@ -2007,14 +2148,14 @@ mod tests {
     #[tokio::test]
     async fn two_clones_of_one_remote_share_their_memories() {
         let (_dir, work, review) = two_clones();
-        let (a, _d) = bridge_at(Some(work), |r| r).await;
+        let (a, _d) = bridge_at(Some(work.clone()), |r| r).await;
         let client = a.client.get().await.expect("daemon");
-        let b = ClawgMcp::with_project(client, Profile::Dev, Some(review));
+        let b = ClawgMcp::with_project(client, Profile::Dev, Some(review.clone()));
         let search = |q: &str| SearchMemoryArgs { query: q.into(), limit: None, project_path: None, project: None, all_projects: None };
 
-        let saved = a.save_memory_impl("a", save_args("tests run with cargo nextest")).await.unwrap();
+        let saved = a.save_memory_impl("a", save_args_in(&work, "tests run with cargo nextest")).await.unwrap();
         assert!(!is_error(&saved), "{}", text(&saved));
-        b.save_memory_impl("a", save_args("the socket is clawg.sock")).await.unwrap();
+        b.save_memory_impl("a", save_args_in(&review, "the socket is clawg.sock")).await.unwrap();
 
         let from_review = text(&b.search_memory_impl("a", search("tests run with cargo nextest")).await.unwrap());
         assert!(from_review.contains("tests run with cargo nextest"), "{from_review}");
@@ -2040,10 +2181,10 @@ mod tests {
     #[tokio::test]
     async fn a_root_is_registered_once_per_bridge() {
         let (_repo, identity) = repo_with_src();
-        let (b, _d) = bridge_at(Some(identity), |r| r).await;
+        let (b, _d) = bridge_at(Some(identity.clone()), |r| r).await;
 
         for content in ["one", "two"] {
-            b.save_memory_impl("a", save_args(content)).await.unwrap();
+            b.save_memory_impl("a", save_args_in(&identity, content)).await.unwrap();
         }
         b.search_memory_impl(
             "a",
@@ -2128,7 +2269,7 @@ mod tests {
         let (_folder, identity) = elsewhere();
         let (b, _d, store) = bridge_with_store(identity.clone()).await;
 
-        let saved = b.save_memory_impl("a", save_args("kept in a folder of notes")).await.unwrap();
+        let saved = b.save_memory_impl("a", save_args_in(&identity, "kept in a folder of notes")).await.unwrap();
         assert!(!is_error(&saved), "{}", text(&saved));
         let found = b
             .search_project_impl(SearchProjectArgs { query: "What lives outside the repo".into(), limit: None, project_path: None, project: None })
@@ -2164,6 +2305,100 @@ mod tests {
         assert!(out.starts_with("clawg reads the files of"), "the daemon's sentence, unwrapped: {out}");
         assert!(out.contains(&format!("clawg projects add \"{}\" --profile dev", other.root.display())), "{out}");
         assert_eq!(clawg_core::memory::project_docs::doc_count(&store, &other.id).await.unwrap(), 0);
+    }
+
+    /// Two repositories side by side, by canonical name.
+    fn two_repos() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = clawg_core::memory::identity::strip_verbatim(&std::fs::canonicalize(dir.path()).expect("canonicalize"));
+        let repo = |name: &str| {
+            let path = base.join(name);
+            std::fs::create_dir_all(path.join(".git")).expect(".git");
+            path
+        };
+        let (first, second) = (repo("first"), repo("second"));
+        (dir, first, second)
+    }
+
+    fn folder(path: &Path) -> Folder {
+        Folder::at(path, None).expect("a folder")
+    }
+
+    #[tokio::test]
+    async fn a_save_names_its_project_or_is_refused_before_the_daemon() {
+        let (_dir, first, second) = two_repos();
+
+        let unplaced = dead_bridge().save_memory_impl("a", bare_save("a fact")).await.unwrap();
+        let out = text(&unplaced);
+        assert!(is_error(&unplaced), "{out}");
+        assert!(out.starts_with("not saved: name the project") && out.contains("all_projects"), "{out}");
+        assert!(!out.contains("open here"), "no folder is open: {out}");
+
+        let open = dead_bridge().with_roots(Some(vec![folder(&first), folder(&second)]));
+        let out = text(&open.save_memory_impl("a", bare_save("a fact")).await.unwrap());
+        for path in [&first, &second] {
+            assert!(out.contains(&path.display().to_string()), "the open folders are its options: {out}");
+        }
+        let spanish = dead_bridge().with_language(Some(Lang::Es));
+        let out = text(&spanish.save_memory_impl("a", bare_save("un hecho")).await.unwrap());
+        assert!(out.starts_with("no se guardó: nombra el proyecto"), "{out}");
+
+        let placed = dead_bridge().save_memory_impl("a", save_args_in(&ProjectIdentity::resolve(&first), "a fact")).await.unwrap();
+        assert!(!text(&placed).starts_with("not saved: name the project"), "a save that names its project reaches the daemon: {}", text(&placed));
+    }
+
+    #[tokio::test]
+    async fn what_works_on_one_project_asks_for_one_when_several_are_open() {
+        let (_dir, first, second) = two_repos();
+        let (b, _d) = bridge().await;
+        let both = b.clone().with_roots(Some(vec![folder(&first), folder(&second)]));
+        let recall = || RecallContextArgs { query: "anything".into(), project_path: None, project: None, budget: None };
+
+        let answers = [
+            both.recall_context_impl("a", recall()).await.unwrap(),
+            both.synthesize_impl("a", SynthesizeArgs::default()).await.unwrap(),
+            both.search_project_impl(SearchProjectArgs { query: "anything".into(), limit: None, project_path: None, project: None })
+                .await
+                .unwrap(),
+            both.answer_suggestion_impl(AnswerSuggestionArgs {
+                other: "other-1a2b".into(),
+                answer: "merge".into(),
+                reason: "the same app".into(),
+                user_answered: true,
+                project: None,
+            })
+            .await
+            .unwrap(),
+        ];
+
+        for answer in &answers {
+            let out = text(answer);
+            assert!(is_error(answer), "{out}");
+            assert!(out.contains("several projects open"), "{out}");
+            for path in [&first, &second] {
+                assert!(out.contains(&path.display().to_string()), "{out}");
+            }
+        }
+        let one = b.with_roots(Some(vec![folder(&first)]));
+        let context = one.recall_context_impl("a", recall()).await.unwrap();
+        assert!(!is_error(&context), "with one open, its project: {}", text(&context));
+    }
+
+    #[tokio::test]
+    async fn a_declared_root_is_indexed_like_the_start_directory() {
+        let (_notes, notes) = elsewhere();
+        let (_dir, repo, _) = two_repos();
+        std::fs::write(repo.join("README.md"), "# Repo\nThe kestrel pipeline signs every archive.\n").expect("readme");
+        let (b, _d, store) = bridge_with_store(notes).await;
+        let b = b.with_roots(Some(vec![folder(&repo)]));
+
+        let found = b
+            .search_project_impl(SearchProjectArgs { query: "The kestrel pipeline".into(), limit: None, project_path: None, project: None })
+            .await
+            .unwrap();
+
+        assert!(!is_error(&found) && text(&found).contains("kestrel"), "{}", text(&found));
+        assert_eq!(index_docs_of(&store, &ProjectIdentity::resolve(&repo).id).await, Some(1));
     }
 
     /// A bridge whose daemon is one from before assigned ids, which answers
@@ -2206,7 +2441,7 @@ mod tests {
             .await
             .expect("seed a colliding project");
 
-        let saved = b.save_memory_impl("a", save_args("kept apart from /elsewhere")).await.unwrap();
+        let saved = b.save_memory_impl("a", save_args_in(&identity, "kept apart from /elsewhere")).await.unwrap();
 
         assert!(!is_error(&saved), "{}", text(&saved));
         assert_eq!(rows_in(&b, &identity.id).await, 0, "nothing under the other root's id");
@@ -2220,7 +2455,7 @@ mod tests {
         let (b, _repo, _d, identity) = colliding_bridge().await;
 
         for _ in 0..2 {
-            let saved = b.save_memory_impl("a", save_args("never mixed")).await.unwrap();
+            let saved = b.save_memory_impl("a", save_args_in(&identity, "never mixed")).await.unwrap();
             let out = text(&saved);
             assert!(is_error(&saved), "{out}");
             assert!(out.contains("/elsewhere") && out.contains(&identity.root.display().to_string()), "{out}");
@@ -2249,7 +2484,7 @@ mod tests {
     #[tokio::test]
     async fn a_colliding_root_names_an_all_projects_the_tool_can_pass() {
         for lang in [None, Some(Lang::Es)] {
-            let (b, _repo, _d, _identity) = colliding_bridge().await;
+            let (b, _repo, _d, identity) = colliding_bridge().await;
             let b = b.with_language(lang);
 
             let own = [
@@ -2268,7 +2503,7 @@ mod tests {
             }
 
             let without = [
-                b.save_memory_impl("a", save_args("never mixed")).await.unwrap(),
+                b.save_memory_impl("a", save_args_in(&identity, "never mixed")).await.unwrap(),
                 b.recall_context_impl(
                     "a",
                     RecallContextArgs { query: "anything".into(), project_path: None, project: None, budget: None },
@@ -2431,7 +2666,7 @@ mod tests {
         let mut session = Session::open(&b);
 
         session
-            .call(Some(modern_meta(Some("probe-host"))), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays" }))
+            .call(Some(modern_meta(Some("probe-host"))), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays", "project_path": PROJ_TEST }))
             .await;
 
         assert_eq!(rows_of(&b, "probe-host").await, 1);
@@ -2446,7 +2681,7 @@ mod tests {
         let discovered = session.request("server/discover", serde_json::json!({ "_meta": modern_meta(Some("probe-host")) })).await;
         assert!(discovered["result"].is_object(), "{discovered}");
         session
-            .call(Some(modern_meta(None)), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays" }))
+            .call(Some(modern_meta(None)), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays", "project_path": PROJ_TEST }))
             .await;
 
         assert_eq!(rows_of(&b, "probe-host").await, 1);
@@ -2460,7 +2695,7 @@ mod tests {
         let content = "the team deploys on tuesdays and never on fridays";
         let mut legacy = Session::open(&b);
         legacy.initialize("probe-host").await;
-        legacy.call(None, "save_memory", serde_json::json!({ "content": content })).await;
+        legacy.call(None, "save_memory", serde_json::json!({ "content": content, "project_path": PROJ_TEST })).await;
 
         let mut modern = Session::open(&b);
         let found = modern
@@ -2716,6 +2951,7 @@ mod tests {
             "Do not save",
             "judge each with `resolve_conflict`",
             "ask the user which memory holds",
+            "Name each save's project",
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
         }
@@ -2739,6 +2975,7 @@ mod tests {
             "No guardes",
             "juzga cada una con `resolve_conflict`",
             "pregúntale a la persona qué memoria vale",
+            "Nombra el proyecto de cada save",
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
         }
@@ -3336,7 +3573,7 @@ mod tests {
                     content: content.into(),
                     memory_type: Some("semantic_fact".into()),
                     importance: Some(8.0),
-                    project_path: None,
+                    project_path: Some(PROJ_TEST.into()),
                     project: None,
                     new_project: None,
                     all_projects: None,
@@ -3411,7 +3648,7 @@ mod tests {
                     content: "not stored".into(),
                     memory_type: None,
                     importance: None,
-                    project_path: None,
+                    project_path: Some(PROJ_TEST.into()),
                     project: None,
                     new_project: None,
                     all_projects: None,
@@ -3995,7 +4232,7 @@ mod tests {
         let there = text(&search(Some(other.root.display().to_string())).await.unwrap());
         assert!(there.contains(" topic=style/indent]"), "{there}");
 
-        let again = b.save_memory_impl("a", preference("Indent with two spaces", None)).await.unwrap();
+        let again = b.save_memory_impl("a", preference("Indent with two spaces", Some(PROJ_TEST.into()))).await.unwrap();
         assert!(!text(&again).contains("replaces"), "{}", text(&again));
         assert_eq!(rows_in(&b, &other.id).await, 1);
         assert_eq!(rows_in(&b, &test_project().id).await, 1);
@@ -4008,7 +4245,7 @@ mod tests {
             memory_type: Some("user_preference".into()),
             topic_key: Some("style/indent".into()),
             all_projects: Some(true),
-            ..save_args(content)
+            ..bare_save(content)
         };
         let saved = b.save_memory_impl("a", general("Indent with tabs")).await.unwrap();
         let id = text(&saved).trim_start_matches("saved #").parse::<i64>().expect("an id");
@@ -4036,7 +4273,7 @@ mod tests {
         };
         let id_of = |saved: &CallToolResult| text(saved).trim_start_matches("saved #").parse::<i64>().expect("an id");
         let there = id_of(&b.save_memory_impl("a", keyed(Some(other.root.display().to_string()))).await.unwrap());
-        let here = id_of(&b.save_memory_impl("a", keyed(None)).await.unwrap());
+        let here = id_of(&b.save_memory_impl("a", keyed(Some(PROJ_TEST.into()))).await.unwrap());
         let read = |id: i64| b.read_memory_impl("a", ReadMemoryArgs { id, kind: None });
 
         assert_eq!(text(&read(there).await.unwrap()), format!("#{there}\nStorage engine is SQLite"));
@@ -4929,7 +5166,7 @@ mod tests {
     async fn a_daemon_that_comes_up_after_the_start_gave_up_is_used() {
         let data = tempfile::tempdir().expect("tempdir");
         let (outcome, handle) = ClientHandle::pending(Duration::from_millis(50), data.path().to_path_buf());
-        let b = ClawgMcp::with_handle(handle, Profile::Dev, None);
+        let b = ClawgMcp::with_handle(handle, Profile::Dev, None, None);
         outcome
             .send(crate::mcp::startup::Startup::Failed(Arc::new(ClientError::StartTimeout(Duration::from_secs(60)))))
             .ok();
@@ -4994,9 +5231,10 @@ mod tests {
         // A root on disk: the bridge's own root is registered to be indexed,
         // and the daemon refuses that for a directory that does not exist.
         let repo = tempfile::tempdir().expect("tempdir");
-        let b = ClawgMcp::with_project(stale, Profile::Dev, Some(ProjectIdentity::resolve(repo.path())));
+        let project = ProjectIdentity::resolve(repo.path());
+        let b = ClawgMcp::with_project(stale, Profile::Dev, Some(project.clone()));
 
-        let saved = b.save_memory_impl("agent", save_args("registered after all")).await.unwrap();
+        let saved = b.save_memory_impl("agent", save_args_in(&project, "registered after all")).await.unwrap();
         assert!(!is_error(&saved), "{}", text(&saved));
         assert_eq!(registered.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -5007,7 +5245,7 @@ mod tests {
     async fn saving_to_a_project_by_name_creates_it() {
         let (b, _d) = bridge().await;
 
-        let saved = b.save_memory_impl("a", SaveMemoryArgs { project: Some("ideas de producto".into()), ..save_args("A pricing page for teams") }).await.unwrap();
+        let saved = b.save_memory_impl("a", SaveMemoryArgs { project: Some("ideas de producto".into()), ..bare_save("A pricing page for teams") }).await.unwrap();
 
         assert!(!is_error(&saved), "{}", text(&saved));
         let client = b.client.get().await.expect("daemon");
@@ -5027,19 +5265,19 @@ mod tests {
     #[tokio::test]
     async fn a_similar_name_is_answered_with_its_candidates() {
         let (b, _d) = bridge().await;
-        let first = b.save_memory_impl("a", SaveMemoryArgs { project: Some("mi-app".into()), ..save_args("The app ships weekly") }).await.unwrap();
+        let first = b.save_memory_impl("a", SaveMemoryArgs { project: Some("mi-app".into()), ..bare_save("The app ships weekly") }).await.unwrap();
         assert!(!is_error(&first), "{}", text(&first));
         let client = b.client.get().await.expect("daemon");
         let app = client.resolve_project("mi-app", false, false, Born::Agent).await.unwrap().project_id.expect("an id");
 
-        let refused = b.save_memory_impl("a", SaveMemoryArgs { project: Some("Mi App".into()), ..save_args("The app ships daily") }).await.unwrap();
+        let refused = b.save_memory_impl("a", SaveMemoryArgs { project: Some("Mi App".into()), ..bare_save("The app ships daily") }).await.unwrap();
 
         assert!(is_error(&refused), "{}", text(&refused));
         assert!(text(&refused).starts_with("not saved: no project is named \"Mi App\""), "{}", text(&refused));
         assert!(text(&refused).contains(&format!("{app} \"mi-app\"")) && text(&refused).contains("new_project"), "{}", text(&refused));
         assert_eq!(rows_in(&b, &app).await, 1, "nothing was saved");
         let apart = b
-            .save_memory_impl("a", SaveMemoryArgs { project: Some("Mi App".into()), new_project: Some(true), ..save_args("The app ships daily") })
+            .save_memory_impl("a", SaveMemoryArgs { project: Some("Mi App".into()), new_project: Some(true), ..bare_save("The app ships daily") })
             .await
             .unwrap();
         assert!(!is_error(&apart), "{}", text(&apart));
@@ -5076,7 +5314,7 @@ mod tests {
         let general = SaveMemoryArgs {
             memory_type: Some("user_preference".into()),
             all_projects: Some(true),
-            ..save_args("Answer in short sentences")
+            ..bare_save("Answer in short sentences")
         };
 
         let saved = b.save_memory_impl("agent-a", general).await.expect("save");
@@ -5096,7 +5334,7 @@ mod tests {
         ] {
             let b = b.clone().with_language(Some(lang));
             for args in [
-                SaveMemoryArgs { all_projects: Some(true), project: Some("ideas".into()), ..save_args("x") },
+                SaveMemoryArgs { all_projects: Some(true), project: Some("ideas".into()), ..bare_save("x") },
                 SaveMemoryArgs { all_projects: Some(true), project_path: Some("/work/app".into()), ..save_args("x") },
             ] {
                 let r = b.save_memory_impl("a", args).await.unwrap();
@@ -5110,7 +5348,7 @@ mod tests {
     #[tokio::test]
     async fn searching_the_docs_of_a_project_without_a_folder_says_so() {
         let (b, _d) = bridge().await;
-        b.save_memory_impl("a", SaveMemoryArgs { project: Some("ideas".into()), ..save_args("An idea") }).await.unwrap();
+        b.save_memory_impl("a", SaveMemoryArgs { project: Some("ideas".into()), ..bare_save("An idea") }).await.unwrap();
         let client = b.client.get().await.expect("daemon");
         let ideas = client.resolve_project("ideas", false, false, Born::Agent).await.unwrap().project_id.expect("an id");
 
@@ -5125,7 +5363,7 @@ mod tests {
         let (b, _d, store) = bridge_with_store(test_project()).await;
         let client = b.client.get().await.expect("daemon");
         let own = client.register_project(&test_project().root, None, &[], false).await.expect("register").project_id;
-        b.save_memory_impl("a", SaveMemoryArgs { project: Some("copia".into()), ..save_args("The copy keeps its own config") }).await.unwrap();
+        b.save_memory_impl("a", SaveMemoryArgs { project: Some("copia".into()), ..bare_save("The copy keeps its own config") }).await.unwrap();
         let copy = client.resolve_project("copia", false, false, Born::Agent).await.unwrap().project_id.expect("an id");
         let (one, two) = (own.clone(), copy.clone());
         store
@@ -5162,7 +5400,7 @@ mod tests {
     /// A repository with `apps/web/src` and `apps/webapp`, by canonical name.
     fn monorepo() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mono = strip_verbatim(&std::fs::canonicalize(dir.path()).expect("canonicalize")).join("mono");
+        let mono = clawg_core::memory::identity::strip_verbatim(&std::fs::canonicalize(dir.path()).expect("canonicalize")).join("mono");
         for sub in [".git", "apps/web/src", "apps/webapp"] {
             std::fs::create_dir_all(mono.join(sub)).expect("the checkout");
         }
@@ -5186,12 +5424,13 @@ mod tests {
     #[tokio::test]
     async fn a_bridge_in_a_declared_subfolder_saves_into_its_project() {
         let (_repo, mono) = monorepo();
-        let (b, _d) = bridge_at(Some(ProjectIdentity::resolve(&mono.join("apps").join("web"))), |r| r).await;
+        let (in_web, at_mono) = (ProjectIdentity::resolve(&mono.join("apps").join("web")), ProjectIdentity::resolve(&mono));
+        let (b, _d) = bridge_at(Some(in_web.clone()), |r| r).await;
         let web = declare_web(&b, &mono).await;
-        let at_root = ClawgMcp::with_project(b.client.get().await.expect("daemon"), Profile::Dev, Some(ProjectIdentity::resolve(&mono)));
+        let at_root = ClawgMcp::with_project(b.client.get().await.expect("daemon"), Profile::Dev, Some(at_mono.clone()));
 
-        let saved = b.save_memory_impl("a", save_args("The web app renders on the server")).await.unwrap();
-        let other = at_root.save_memory_impl("a", save_args("The monorepo builds with one workspace")).await.unwrap();
+        let saved = b.save_memory_impl("a", save_args_in(&in_web, "The web app renders on the server")).await.unwrap();
+        let other = at_root.save_memory_impl("a", save_args_in(&at_mono, "The monorepo builds with one workspace")).await.unwrap();
 
         assert!(!is_error(&saved) && !is_error(&other), "{} {}", text(&saved), text(&other));
         let m = project_of_root(&b, &mono).await;
