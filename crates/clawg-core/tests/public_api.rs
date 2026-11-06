@@ -30,7 +30,7 @@ fn search_scope_constructors_and_fields_are_public() {
     assert_eq!(scope.episodic, Some(5));
     assert_eq!(scope.procedural, Some(5));
     assert_eq!(scope.lexical, Some(20));
-    assert_eq!(scope.project_id.as_deref(), Some("proj-1"));
+    assert_eq!(scope.projects, Some(vec!["proj-1".to_string()]));
 }
 
 /// Coercing to a function pointer pins the exact signature the daemon calls,

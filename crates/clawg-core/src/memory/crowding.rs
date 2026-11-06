@@ -19,7 +19,7 @@ use rusqlite::params;
 use crate::memory::clock::TimestampMs;
 use crate::memory::contradiction::{detect_contradiction, CONTRADICTION_THRESHOLD, NEAR_DUPLICATE_FLOOR};
 use crate::memory::score::ScoringConfig;
-use crate::memory::search::{memory_project_predicate, reach_predicate, reader_bind, search_all_memories, SearchScope};
+use crate::memory::search::{memory_project_predicate, project_bind, reach_predicate, reader_bind, search_all_memories, SearchScope};
 use crate::memory::sharing::{Reach, Reader};
 use crate::memory::store_insert::MemoryType;
 use crate::memory::store_lock::StoreHolder;
@@ -543,7 +543,7 @@ async fn exact(store: &MemoryStore, reader: &Reader, project: usize, vector: &[f
     // The search turns its query into a unit vector before vec0 sees it.
     let query = bytes(&to_unit(vector).expect("a query of the layout is usable"));
     let reach = reader_bind(Some(reader));
-    let project = project_id(project);
+    let project = project_bind(Some(&project_id(project)));
     store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<(i64, f64)>> {
@@ -1179,7 +1179,7 @@ mod tests {
                     let exact_binds = vec![
                         Value::Blob(unit.clone()),
                         Value::Text(reader_bind(Some(reader)).unwrap()),
-                        Value::Text(project_id(0)),
+                        Value::Text(project_bind(Some(&project_id(0))).expect("a project binds")),
                         Value::Integer(POOL as i64),
                     ];
                     let (exact_ids, exact_took) = timed(store, EXACT_SQL, exact_binds).await;
@@ -1210,7 +1210,7 @@ mod tests {
                 .conn
                 .call(|c| -> rusqlite::Result<Vec<String>> {
                     let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {EXACT_SQL}"))?;
-                    let rows = stmt.query_map(params![Vec::<u8>::new(), "{}", "p0", 1], |r| r.get(3))?;
+                    let rows = stmt.query_map(params![Vec::<u8>::new(), "{}", project_bind(Some("p0")), 1], |r| r.get(3))?;
                     rows.collect()
                 })
                 .await

@@ -12,7 +12,7 @@ use crate::memory::{
     admin::MemoryKind,
     clock::TimestampMs,
     embedder::{EmbedError, EmbedRole, Embedder},
-    search::{memory_project_predicate, search_all_memories, PiecePosition, RankedHit, SearchScope},
+    search::{memory_project_predicate, project_bind, search_all_memories, PiecePosition, RankedHit, SearchScope},
     sharing::{Reach, Reader},
     workspace::{EmittedIds, EmittedRow, WorkspaceManager},
     MemoryError, MemoryStore, TableKind,
@@ -1104,7 +1104,7 @@ async fn fetch_recent_saves(
     emitted: &EmittedIds,
     limit: usize,
 ) -> Result<Vec<RankedHit>, MemoryError> {
-    let (agent, project) = (agent_id.to_string(), project_id.map(str::to_string));
+    let (agent, project) = (agent_id.to_string(), project_bind(project_id));
     let printed = serde_json::to_string(&emitted.memory_ids().collect::<Vec<i64>>())
         .map_err(|e| MemoryError::Backend(format!("fetch_recent_saves: {e}")))?;
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -4400,8 +4400,9 @@ mod tests {
 
     /// What [`fetch_recent_saves`] binds to [`RECENT_SAVES_SQL`] for `agent-1`
     /// in `project`, with nothing printed by the workspace.
-    fn recent_binds(project: rusqlite::types::Value) -> Vec<rusqlite::types::Value> {
+    fn recent_binds(project: Option<&str>) -> Vec<rusqlite::types::Value> {
         use rusqlite::types::Value;
+        let project = project_bind(project).map_or(Value::Null, Value::Text);
         vec![Value::Text("agent-1".into()), project, Value::Integer(0), Value::Text("[]".into()), Value::Integer(K_FINAL as i64)]
     }
 
@@ -4415,8 +4416,8 @@ mod tests {
         let cases = [
             ("LAST SESSION in a project", LAST_SESSION_SQL, vec![Value::Text("proj-a".into())], "memory", "idx_memory_session_summary"),
             ("LAST SESSION without a project", LAST_SESSION_SQL, vec![Value::Null], "memory", "idx_memory_session_summary"),
-            ("RECENT", RECENT_SAVES_SQL, recent_binds(Value::Text("proj-a".into())), "m", "idx_memory_agent_created"),
-            ("RECENT without a project", RECENT_SAVES_SQL, recent_binds(Value::Null), "m", "idx_memory_agent_created"),
+            ("RECENT", RECENT_SAVES_SQL, recent_binds(Some("proj-a")), "m", "idx_memory_agent_created"),
+            ("RECENT without a project", RECENT_SAVES_SQL, recent_binds(None), "m", "idx_memory_agent_created"),
         ];
         for (name, sql, binds, table, index) in cases {
             let plan = plan_of(&store, sql, binds).await;
@@ -4471,7 +4472,7 @@ mod tests {
         };
         use rusqlite::types::Value;
         let last = ids(LAST_SESSION_SQL, vec![Value::Text("proj-a".into())]).await.unwrap();
-        let recent = ids(RECENT_SAVES_SQL, recent_binds(Value::Text("proj-a".into()))).await.unwrap();
+        let recent = ids(RECENT_SAVES_SQL, recent_binds(Some("proj-a"))).await.unwrap();
 
         assert_eq!(last, expected, "LAST SESSION");
         assert_eq!(recent, expected, "RECENT");
