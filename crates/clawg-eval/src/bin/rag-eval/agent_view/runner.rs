@@ -84,6 +84,7 @@ fn search_request(query: &str, project_id: Option<&str>) -> SearchArgs {
         query: query.to_string(),
         agent_id: AGENT_ID.to_string(),
         project_id: project_id.map(str::to_string),
+        project_ids: Vec::new(),
         limit: None,
         lang: None,
     }

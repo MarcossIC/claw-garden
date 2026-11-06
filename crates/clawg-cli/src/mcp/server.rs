@@ -1145,6 +1145,7 @@ impl ClawgMcp {
                         query: args.query.clone(),
                         agent_id: agent_id.to_string(),
                         project_id,
+                        project_ids: Vec::new(),
                         limit: args.limit,
                         lang: self.language,
                     })

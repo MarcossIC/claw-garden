@@ -356,6 +356,7 @@ async fn read_router(
                 query: chain.query.clone(),
                 agent_id: AGENT.to_string(),
                 project_id: Some(PROJECT.to_string()),
+                project_ids: Vec::new(),
                 limit: None,
                 lang: None,
             })
