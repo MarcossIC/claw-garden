@@ -1,12 +1,12 @@
 //! Whether a session succeeded at its task, and where each tracer went. Pure:
 //! the working directory is read through the function the caller passes.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::stream::{is_tool, Transcript};
 use crate::task::{contains_ci, Check, Task};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TracerFate {
     /// The agent wrote it: in the answer, in a tool's input or in its text.
@@ -17,13 +17,13 @@ pub enum TracerFate {
     NeverReached,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckResult {
     pub check: String,
     pub passed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Score {
     /// Every check passed and the session ended without an error.
     pub success: bool,

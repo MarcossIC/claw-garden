@@ -79,7 +79,7 @@ impl Client {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: Option<String>,
     pub model: Option<String>,
@@ -98,7 +98,7 @@ pub struct Session {
     pub outcome: Option<Outcome>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResult {
     pub task: String,
     pub category: String,
