@@ -282,6 +282,9 @@ fn execute(command: Command) -> Result<(), String> {
             if let (Client::Claude, Some(version)) = (&client, &args.claude_version) {
                 run::check_client_version(arm::CLIENT, version).map_err(|e| e.to_string())?;
             }
+            if client == Client::Claude {
+                run::check_paid_run(&args.out).map_err(|e| e.to_string())?;
+            }
             let layout = prepare(&args, &client)?;
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
             run::execute(&layout.root, &exe).map_err(|e| e.to_string())?;
