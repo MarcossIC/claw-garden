@@ -166,13 +166,14 @@ pub struct SaveMemoryArgs {
     /// retrieved sooner. Defaults to 5.
     #[serde(default)]
     pub importance: Option<f64>,
-    /// Absolute path of the project this memory belongs to. Defaults to the
-    /// directory this bridge was started in.
+    /// Absolute path of a folder of the project this memory belongs to, such
+    /// as one the client has open. Every save passes project_path, project or
+    /// all_projects.
     #[serde(default)]
     pub project_path: Option<String>,
-    /// The project this memory belongs to by its id or its name, for one with
-    /// no folder here, such as an idea, or another than this directory's. A
-    /// name no project has or resembles creates the project. Not with
+    /// The project this memory belongs to by its id or its name, as a search
+    /// hit names it after project=, or for one with no folder here, such as an
+    /// idea. A name no project has or resembles creates the project. Not with
     /// project_path.
     #[serde(default)]
     pub project: Option<String>,
@@ -217,8 +218,9 @@ pub struct SearchMemoryArgs {
     /// How many memories to return, 1 to 50. Defaults to 10.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Absolute path of the project to search in. Defaults to the directory
-    /// this bridge was started in.
+    /// Absolute path of the project to search in. Defaults to the folders the
+    /// client has open, or else the directory this bridge was started in;
+    /// with several open it searches them all.
     #[serde(default)]
     pub project_path: Option<String>,
     /// The project by its id or its name, for one with no folder here or
@@ -236,8 +238,9 @@ pub struct RecallContextArgs {
     /// What the user is asking about. The returned block is meant to be read
     /// as background before answering, not quoted back to them.
     pub query: String,
-    /// Absolute path of the project. Defaults to the directory this bridge was
-    /// started in.
+    /// Absolute path of the project. Defaults to the folder the client has
+    /// open, or else the directory this bridge was started in; with several
+    /// open, pass the one you work in.
     #[serde(default)]
     pub project_path: Option<String>,
     /// The project by its id or its name, for one with no folder here or
@@ -258,9 +261,10 @@ pub struct SearchProjectArgs {
     /// How many passages to return, 1 to 20. Defaults to 5.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Absolute path of the project. Defaults to the directory this bridge was
-    /// started in. Another project's files are searched only once the user
-    /// has added it with `clawg projects add`.
+    /// Absolute path of the project. Defaults to the folder the client has
+    /// open, or else the directory this bridge was started in; with several
+    /// open, pass the one you ask about. A folder that is not open is searched
+    /// only once the user has added it with `clawg projects add`.
     #[serde(default)]
     pub project_path: Option<String>,
     /// The project by its id or its name, for one with no folder here or
@@ -274,8 +278,9 @@ pub struct SynthesizeArgs {
     /// How many memories to review, 1 to 100. Defaults to 30.
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Absolute path of the project to review. Defaults to the directory this
-    /// bridge was started in.
+    /// Absolute path of the project to review. Defaults to the folder the
+    /// client has open, or else the directory this bridge was started in; with
+    /// several open, pass one, or all_projects.
     #[serde(default)]
     pub project_path: Option<String>,
     /// The project by its id or its name, for one with no folder here or
@@ -476,8 +481,9 @@ pub struct AnswerSuggestionArgs {
     /// True only when the user answered whether they are one project.
     #[serde(default)]
     pub user_answered: bool,
-    /// This project by its id or its name. Defaults to the directory this
-    /// bridge was started in.
+    /// This project by its id or its name. Defaults to the folder the client
+    /// has open, or else the directory this bridge was started in; with
+    /// several open, pass it.
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -1707,6 +1713,7 @@ impl ClawgMcp {
                        whole. Start with a first line that names the subject, then say what, \
                        why and where, with the exact paths and identifiers involved. Write it so \
                        it still makes sense months from now, with no conversation around it. \
+                       Name where it goes with project_path, project or all_projects. \
                        Returns the id of each stored piece, which \
                        update_memory and delete_memory accept, or why nothing was stored."
     )]
@@ -1730,7 +1737,9 @@ impl ClawgMcp {
                        means the rest scored far lower, not that nothing else is stored. \
                        Content longer than 500 characters is truncated. A hit marked piece=K/N \
                        is the best matching piece K of a long text saved as N pieces; \
-                       read_memory with its id returns the whole text."
+                       read_memory with its id returns the whole text. With several folders open \
+                       in the client it searches them all, and each hit names its project after \
+                       project=."
     )]
     async fn search_memory(
         &self,
