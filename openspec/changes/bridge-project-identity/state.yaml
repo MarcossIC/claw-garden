@@ -1,12 +1,13 @@
 change: bridge-project-identity
 objective: "2, 4"
 depends_on: []
-phase: proposal  # la prueba con Cursor está hecha y las tres decisiones cerradas
+phase: apply  # propuesta, spec y tareas escritas; las decisiones de la exploración no se reabren
 artifacts:
   exploration: done  # con el resultado de la prueba con Cursor
-  proposal: pending
-  spec: pending
-  tasks: pending
+  proposal: done  # cierra los tres puntos de «Para la propuesta»: sólo search_memory lee de un grupo
+  spec: done  # BP1 a BP11
+  design: skipped  # las decisiones están cerradas en la exploración; la propuesta dice cómo se aplican
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
