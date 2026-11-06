@@ -2034,12 +2034,13 @@ mod tests {
     }
 
     /// The default project of [`bridge`]: a root that is already canonical, so
-    /// there is no legacy id to move.
+    /// there is no legacy id to move, and that a `project_path` naming it
+    /// resolves to again (on Windows `/proj-test` is a path of the current
+    /// drive).
     /// A project the daemon gives the id derived from its root, as it gives
     /// any root that no other one holds.
     fn test_project() -> ProjectIdentity {
-        let id = clawg_core::memory::derive_project_id(std::path::Path::new("/proj-test"));
-        ProjectIdentity { id: id.clone(), root: "/proj-test".into(), legacy_id: id, path: "/proj-test".into() }
+        ProjectIdentity::resolve(&ProjectIdentity::resolve(std::path::Path::new("/proj-test")).root)
     }
 
     /// A bridge pointed at an address where nothing is listening.
@@ -2070,7 +2071,7 @@ mod tests {
     /// identity a bridge started in `src` resolves to.
     fn repo_with_src() -> (tempfile::TempDir, ProjectIdentity) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo = std::fs::canonicalize(dir.path()).expect("canonicalize").join("repo");
+        let repo = strip_verbatim(&std::fs::canonicalize(dir.path()).expect("canonicalize")).join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect(".git");
         std::fs::create_dir_all(repo.join("src")).expect("src");
         let identity = ProjectIdentity::resolve(&repo.join("src"));
@@ -2613,7 +2614,7 @@ mod tests {
         let mut session = Session::open(&b);
 
         session
-            .call(Some(modern_meta(Some("probe-host"))), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays", "project_path": "/proj-test" }))
+            .call(Some(modern_meta(Some("probe-host"))), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays", "project_path": test_project().root }))
             .await;
 
         assert_eq!(rows_of(&b, "probe-host").await, 1);
@@ -2628,7 +2629,7 @@ mod tests {
         let discovered = session.request("server/discover", serde_json::json!({ "_meta": modern_meta(Some("probe-host")) })).await;
         assert!(discovered["result"].is_object(), "{discovered}");
         session
-            .call(Some(modern_meta(None)), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays", "project_path": "/proj-test" }))
+            .call(Some(modern_meta(None)), "save_memory", serde_json::json!({ "content": "deploys happen on tuesdays", "project_path": test_project().root }))
             .await;
 
         assert_eq!(rows_of(&b, "probe-host").await, 1);
@@ -2642,7 +2643,7 @@ mod tests {
         let content = "the team deploys on tuesdays and never on fridays";
         let mut legacy = Session::open(&b);
         legacy.initialize("probe-host").await;
-        legacy.call(None, "save_memory", serde_json::json!({ "content": content, "project_path": "/proj-test" })).await;
+        legacy.call(None, "save_memory", serde_json::json!({ "content": content, "project_path": test_project().root })).await;
 
         let mut modern = Session::open(&b);
         let found = modern
@@ -5568,7 +5569,7 @@ mod tests {
     async fn a_bridge_started_in_the_home_directory_registers_no_project() {
         let (_dir, alpha, beta, _gamma) = three_checkouts();
         let home = tempfile::tempdir().expect("home");
-        let home_root = std::fs::canonicalize(home.path()).expect("canonicalize");
+        let home_root = ProjectIdentity::resolve(home.path()).root;
         let (mut b, _d) = bridge_at(Some(ProjectIdentity::resolve(&home_root)), |r| r).await;
         b.home = Some(home_root);
         let ids = one_in_each(&b, &[&alpha, &beta]).await;
