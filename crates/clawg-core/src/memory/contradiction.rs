@@ -175,7 +175,7 @@ fn contradiction_search_scope(project_id: Option<&str>, pool: usize, saver: &Rea
         memory: Some(pool),
         episodic: None,
         procedural: None,
-        project_id: project_id.map(str::to_owned),
+        projects: project_id.map(|p| vec![p.to_owned()]),
         lexical: None,
         // A save is compared with every row its agent reaches, whoever saved
         // it: an agent judges any pair it reaches, and a row hidden from it

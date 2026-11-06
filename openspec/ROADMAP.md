@@ -27,7 +27,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 | Cambio | Dónde | Necesita antes |
 |---|---|---|
-| [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | — (la [prueba con Cursor real](changes/bridge-project-identity/exploration.md#resultado-de-la-prueba-con-cursor-2026-11-05-y-2026-11-06) está hecha) |
+| [bridge-project-identity](changes/bridge-project-identity/verify.md#pendiente-en-local) | Nube, aplicado en un pull request a `develop` | — (la [prueba con Cursor real](changes/bridge-project-identity/exploration.md#resultado-de-la-prueba-con-cursor-2026-11-05-y-2026-11-06) está hecha). El pull request pasa en Linux y en Windows; queda pendiente en local, con Cursor, un save en un workspace con dos repositorios |
 
 ## Noche 2
 

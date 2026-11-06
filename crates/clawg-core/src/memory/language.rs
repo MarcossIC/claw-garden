@@ -8,13 +8,14 @@
 //! dependency; with too little evidence the answer is undecided. The detector
 //! is pure; [`count_saves_in`] reads the column it fills.
 
-use crate::memory::search::{memory_project_predicate, reader_bind, reader_predicate};
+use crate::memory::search::{memory_project_predicate, project_bind, projects_bind, reader_bind, reader_predicate};
 use crate::memory::sharing::Reader;
 use crate::memory::{MemoryError, MemoryStore};
 use crate::preferences::Lang;
 
-/// Live saves in language `?1` of the scope a search of project `?2` (NULL
-/// for every project) reads, within reach `?3` as [`reader_bind`] binds it. A
+/// Live saves in language `?1` of the scope a search of the projects `?2`
+/// (NULL for every project, as [`projects_bind`] binds them) reads, within
+/// reach `?3` as [`reader_bind`] binds it. A
 /// long save counts once, under the lowest save that holds the row; a row of
 /// no save counts as its own, by a negative key no save id takes.
 const COUNT_SAVES_SQL: &str = concat!(
@@ -37,13 +38,32 @@ pub async fn count_saves_in(
     project_id: Option<&str>,
     reader: &Reader,
 ) -> Result<usize, MemoryError> {
+    count_saves_bound(store, lang, project_bind(project_id), reader).await
+}
+
+/// [`count_saves_in`] for a search of a group of projects: what a search of
+/// each one could return, each save counted once.
+pub async fn count_saves_in_projects(
+    store: &MemoryStore,
+    lang: Lang,
+    projects: &[String],
+    reader: &Reader,
+) -> Result<usize, MemoryError> {
+    count_saves_bound(store, lang, projects_bind(Some(projects)), reader).await
+}
+
+async fn count_saves_bound(
+    store: &MemoryStore,
+    lang: Lang,
+    projects: Option<String>,
+    reader: &Reader,
+) -> Result<usize, MemoryError> {
     let reach = reader_bind(Some(reader));
-    let project_id = project_id.map(str::to_owned);
     store
         .conn
         .call(move |c| {
             c.prepare_cached(COUNT_SAVES_SQL)?
-                .query_row(rusqlite::params![lang.as_str(), project_id, reach], |r| r.get::<_, i64>(0))
+                .query_row(rusqlite::params![lang.as_str(), projects, reach], |r| r.get::<_, i64>(0))
                 .map(|n| n as usize)
         })
         .await
@@ -291,6 +311,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn counting_a_group_counts_each_of_its_projects() {
+        let rows = vec![
+            row(1, Some("r"), Some("pa"), Some("en")),
+            row(2, Some("r"), Some("pb"), Some("en")),
+            row(3, Some("r"), Some("pc"), Some("en")),
+            row(4, Some("r"), None, Some("en")),
+            Seed { memory_type: "user_preference", ..row(5, Some("r"), Some("pc"), Some("en")) },
+        ];
+        let store = seeded(rows, &[]).await;
+        let reader = Reader::new("r", Reach::Own);
+        let group = |projects: &[&str]| projects.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+
+        let both = count_saves_in_projects(&store, Lang::En, &group(&["pa", "pb"]), &reader).await.unwrap();
+        let one = count_saves_in_projects(&store, Lang::En, &group(&["pa"]), &reader).await.unwrap();
+
+        assert_eq!(both, 4, "rows 1, 2 and 4, and the preference 5, not row 3 of pc");
+        assert_eq!(one, count_saves_in(&store, Lang::En, Some("pa"), &reader).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn counting_by_language_uses_its_index() {
         let store = seeded(vec![row(1, Some("r"), Some("pa"), Some("en"))], &[]).await;
         let reader = crate::memory::search::reader_bind(Some(&Reader::new("r", Reach::AllBut(Vec::new()))));
@@ -298,7 +338,7 @@ mod tests {
             .conn
             .call(move |c| {
                 let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {COUNT_SAVES_SQL}"))?;
-                let rows = stmt.query_map(rusqlite::params!["en", "pa", reader], |r| r.get::<_, String>(3))?;
+                let rows = stmt.query_map(rusqlite::params!["en", project_bind(Some("pa")), reader], |r| r.get::<_, String>(3))?;
                 rows.collect::<rusqlite::Result<_>>()
             })
             .await

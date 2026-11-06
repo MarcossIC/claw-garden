@@ -5,8 +5,8 @@ answering anything that depends on earlier sessions, and `recall_context` once
 when a broad task needs background. For how this project works (its design,
 conventions, commands or where something is implemented), call
 `search_project` before opening files: it searches the project's own
-documentation and code. Memories are scoped to the current project unless you
-say otherwise.
+documentation and code. Every `save_memory` names its project with
+`project_path` or `project`.
 
 Use `save_memory` when a decision is made, when the user confirms or rejects a
 proposal, corrects you or states a preference, when a bug is fixed (with its
@@ -167,14 +167,19 @@ says so; check what it claims against the code or ask the user.
 
 ## Projects
 
-Memories belong to the project of the directory you work in. For one with
-no folder here, such as an idea, or one other than this directory's, pass
-`project` with its id or its name to `save_memory`, `search_memory`,
-`recall_context`, `search_project` or `synthesize`, and `to_project` to
-`update_memory`. A name no project has creates the project when you save.
-When the answer names projects whose name is close, ask the user which one
-they mean and pass its id, or save again with `new_project` if it is another
-project.
+Every `save_memory` says where the memory goes: `project_path` with a folder
+of the project it belongs to, `project` with its id or its name, for one with
+no folder here such as an idea, or `all_projects` for what holds in every
+project. A save that names none is refused, and the refusal lists the folders
+open in the client. The other tools take `project_path` or `project` too, and
+`update_memory` takes `to_project`. Without them they read the folders open in
+the client, or else the directory the server started in: with several open,
+`search_memory` searches them all and each hit names its project after
+project=, the id `project` takes, while `recall_context`, `search_project` and
+`synthesize` ask for the folder you work in. A name no project has creates the
+project when you save. When the answer names projects whose name is close, ask
+the user which one they mean and pass its id, or save again with `new_project`
+if it is another project.
 
 When `recall_context` says this project may be the same as another, ask the
 user, then call `answer_suggestion` with merge or apart, `user_answered` and
