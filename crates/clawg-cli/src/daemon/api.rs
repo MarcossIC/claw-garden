@@ -68,7 +68,7 @@ use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
     conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
 };
-use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
+use clawg_core::memory::{read_save_core, search_projects, RankedHit, SaveText, SearchScope};
 use clawg_core::metrics::{EventKind, Recorder, Unit};
 use clawg_core::models::chat::Role;
 use clawg_core::paths::Profile;
@@ -424,6 +424,11 @@ pub struct SearchRequest {
     pub agent_id: String,
     #[serde(default)]
     pub project_id: Option<String>,
+    /// A group of projects to search instead of `project_id`, each one as it
+    /// is searched alone, the hits joined by score. A bridge sends its first
+    /// one as `project_id` too, which is what a daemon from before reads.
+    #[serde(default)]
+    pub project_ids: Vec<String>,
     #[serde(default)]
     pub limit: Option<usize>,
     /// Share of the best hit's score the others need to be returned. Absent,
@@ -1493,17 +1498,15 @@ async fn search(
         .map_err(embed_failure)?;
 
     let caller = reader(&app, &body.agent_id);
-    let project_id = live_project(&app, body.project_id.clone()).await?;
-    let scope = SearchScope::all_default()
-        .with_project(project_id.as_deref())
-        .with_reach(caller.reach.clone());
-    let mut hits = search_all_memories(
+    let projects = searched_projects(&app, body.project_id.clone(), &body.project_ids).await?;
+    let mut hits = search_projects(
         &app.runtime.store,
         &embedding,
         // The raw text drives the lexical (FTS5) channel beside the vector one.
         Some(&body.query),
         &body.agent_id,
-        scope,
+        SearchScope::all_default().with_reach(caller.reach.clone()),
+        &projects,
         limit,
     )
     .await
@@ -1522,11 +1525,29 @@ async fn search(
     let withheld = found - hits.len();
     app.runtime.metrics.gauge("search.hits", &[], hits.len() as f64);
     app.runtime.metrics.gauge("search.withheld", &[], withheld as f64);
-    let other_language = match lang {
-        Some(lang) => other_language(&app, lang, project_id.as_deref(), &caller).await,
-        None => None,
+    // The count reads one project or all of them; a group has no such count.
+    let other_language = match (lang, projects.as_slice()) {
+        (Some(lang), []) => other_language(&app, lang, None, &caller).await,
+        (Some(lang), [one]) => other_language(&app, lang, Some(one), &caller).await,
+        _ => None,
     };
     Ok(Json(SearchBody { hits, withheld, other_language }))
+}
+
+/// The live projects a search reads, without repeats: its group when it has
+/// one, else its `project_id`, else none, which is every project.
+async fn searched_projects(app: &AppCtx, project_id: Option<String>, group: &[String]) -> ApiResult<Vec<String>> {
+    if group.is_empty() {
+        return Ok(live_project(app, project_id).await?.into_iter().collect());
+    }
+    let mut projects: Vec<String> = Vec::with_capacity(group.len());
+    for id in group {
+        let live = canonical(&app.runtime.store, id).await.map_err(ApiError::internal)?;
+        if !projects.contains(&live) {
+            projects.push(live);
+        }
+    }
+    Ok(projects)
 }
 
 /// The live project a request's `project` leads to: an open bridge keeps the

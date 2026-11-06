@@ -1508,6 +1508,47 @@ pub async fn search_all_memories(
     Ok(hits)
 }
 
+/// [`search_all_memories`] over a group of projects: each project is searched
+/// as it is alone, with the same query, and the hits are joined as one search
+/// ranks them. A hit's score is its row's, whichever project it was searched
+/// from, so the lists merge by score. A row two projects reach, one without a
+/// project or a preference, comes back once, and a save once, by its best
+/// piece. A group of one is that project's search, and an empty one is
+/// `scope` as it is.
+pub async fn search_projects(
+    store: &MemoryStore,
+    embedding: &[f32],
+    query_text: Option<&str>,
+    agent_id: &str,
+    scope: SearchScope,
+    projects: &[String],
+    k_final: usize,
+) -> Result<Vec<RankedHit>, MemoryError> {
+    let group = match projects {
+        [] => return search_all_memories(store, embedding, query_text, agent_id, scope, k_final).await,
+        [one] => return search_all_memories(store, embedding, query_text, agent_id, scope.with_project(Some(one)), k_final).await,
+        group => group,
+    };
+    let mut all = Vec::new();
+    for project in group {
+        let scope = scope.clone().with_project(Some(project));
+        all.extend(search_all_memories(store, embedding, query_text, agent_id, scope, k_final).await?);
+    }
+    all.sort_by(hit_cmp);
+    let mut seen = std::collections::BTreeSet::new();
+    all.retain(|hit| seen.insert((hit.kind, hit.id)));
+    let memory_ids: Vec<i64> = all.iter().filter(|h| h.kind == TableKind::Memory).map(|h| h.id).collect();
+    let mut all = match store.save_links(memory_ids).await {
+        Ok(links) => collapse_saves(all, &links),
+        Err(e) => {
+            log::warn!("search: reading save links failed, pieces stay separate: {e}");
+            all
+        }
+    };
+    all.truncate(k_final);
+    Ok(all)
+}
+
 /// The lexical channel on its own: `agent_id`'s rowids best-first by bm25,
 /// with no vector read and nothing scored. A floor to compare the full
 /// ranking against, so it uses the same `MATCH` expression and order.
@@ -2533,6 +2574,40 @@ mod tests {
         assert!(
             hits.iter().any(|h| h.id == id),
             "a NULL-project memory row must remain visible from a scoped query"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_search_takes_each_row_once() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let emb = unit_basis_embedding();
+        let mut ids = Vec::new();
+        for (project, content) in
+            [(Some("PA"), "row of the first project"), (Some("PB"), "row of the second"), (Some("PC"), "row outside the group"), (None, "row of no project")]
+        {
+            ids.push(insert_memory_row_with_project(&store, "agent-group", project, "chat_message", content, emb.clone()).await);
+        }
+        let (a, b, outside, none) = (ids[0], ids[1], ids[2], ids[3]);
+        let q_vec = unit_basis_vec();
+        let group = ["PA".to_string(), "PB".to_string()];
+
+        let hits = search_projects(&store, &q_vec, None, "agent-group", SearchScope::all_default(), &group, 10).await.unwrap();
+
+        let found: Vec<i64> = hits.iter().map(|h| h.id).collect();
+        for id in [a, b, none] {
+            assert_eq!(found.iter().filter(|f| **f == id).count(), 1, "#{id} comes back once: {found:?}");
+        }
+        assert!(!found.contains(&outside), "a project outside the group stays out: {found:?}");
+        let cut = search_projects(&store, &q_vec, None, "agent-group", SearchScope::all_default(), &group, 2).await.unwrap();
+        assert_eq!(cut.len(), 2, "the group is cut at k as one search");
+
+        let of_one = search_projects(&store, &q_vec, None, "agent-group", SearchScope::all_default(), &group[..1], 10).await.unwrap();
+        let alone =
+            search_all_memories(&store, &q_vec, None, "agent-group", SearchScope::all_default().with_project(Some("PA")), 10).await.unwrap();
+        assert_eq!(
+            of_one.iter().map(|h| h.id).collect::<Vec<_>>(),
+            alone.iter().map(|h| h.id).collect::<Vec<_>>(),
+            "a group of one is that project's search"
         );
     }
 
