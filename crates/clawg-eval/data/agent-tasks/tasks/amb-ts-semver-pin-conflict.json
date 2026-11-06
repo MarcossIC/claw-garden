@@ -1,0 +1,27 @@
+{
+  "id": "amb-ts-semver-pin-conflict",
+  "category": "C",
+  "fixture": "amb-ts-semver-pin",
+  "prompt": "Add our internal package textutils at version 2.4.1 to requirements.txt in the repository root, keeping the existing entries. The updated requirements.txt is the deliverable.",
+  "memories": [
+    {
+      "content": "Version specifiers for internal packages\nAgreed, that is the lag. Decision: internal packages move to the compatible-release operator, so patch releases flow to a service on its next build without anyone editing a file or opening a pull request. Same minor series, patch level free. External dependencies keep their existing floor constraints; this changes only packages we publish ourselves.",
+      "memory_type": "architectural_decision",
+      "age_days": 187
+    },
+    {
+      "content": "Version specifiers for internal packages\nAgreed. Decision: internal packages are pinned exactly in requirements.txt, == not >=, never a range. Pin corekit==1.2.4 now, and every internal package we add gets an exact pin the same way, so a breakage from an internal release can only reach us through an explicit version bump in this repo, not through a rebuild. Third-party ranges stay as they are.",
+      "memory_type": "architectural_decision",
+      "age_days": 18
+    }
+  ],
+  "tracers": ["compatible-release operator", "never a range", "corekit==1.2.4"],
+  "checks": [
+    {"kind": "file_contains", "path": "requirements.txt", "text": "textutils==2.4.1"},
+    {"kind": "file_lacks", "path": "requirements.txt", "text": "textutils~="},
+    {"kind": "file_lacks", "path": "requirements.txt", "text": "textutils>="},
+    {"kind": "file_contains", "path": "requirements.txt", "text": "click>=8.1"},
+    {"kind": "file_contains", "path": "requirements.txt", "text": "requests>=2.31"},
+    {"kind": "file_contains", "path": "requirements.txt", "text": "rich>=13.7"}
+  ]
+}

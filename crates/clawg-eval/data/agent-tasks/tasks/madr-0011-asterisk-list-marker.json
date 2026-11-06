@@ -1,0 +1,18 @@
+{
+  "id": "madr-0011-asterisk-list-marker",
+  "category": "K3",
+  "fixture": "letta-simple-edit",
+  "prompt": "Write docs/notes.md: a short Markdown bulleted list naming the three Python files in this repo and the bug each one has.",
+  "memories": [
+    {
+      "content": "Decision: use an asterisk as the Markdown list marker\nLists in Markdown can be indicated by `*` (asterisk) or `-` (hyphen). Chosen option: \"Use an asterisk\", because an asterisk does not have a meaning of \"good\" or \"bad\", whereas a hyphen `-` could be read as indicator of something negative (in contrast to `+`, which could be more be read as \"good\").",
+      "memory_type": "architectural_decision",
+      "age_days": 120
+    }
+  ],
+  "tracers": ["asterisk"],
+  "checks": [
+    {"kind": "file_contains", "path": "docs/notes.md", "text": "\n* "},
+    {"kind": "file_lacks", "path": "docs/notes.md", "text": "\n- "}
+  ]
+}

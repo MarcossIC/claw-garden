@@ -1,0 +1,8 @@
+# managed ignore rules
+*.pyc
+.venv/
+__pycache__/
+build/
+dist/
+logs/
+node_modules/
