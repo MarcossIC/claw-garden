@@ -8,7 +8,7 @@ En Linux x86_64, build debug, toolchain 1.99.1, en `target`, sobre `b59ce4c`: el
 - `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también.
 - Los contratos del agente pasan después de bendecirlos con `CLAWG_BLESS=1`, en los dos idiomas. El diff es sólo `all_projects` en el `inputSchema` de `save_memory`; las `instructions` no cambian, porque el protocolo cambió fuera de la apertura ([abajo](#el-contrato-del-agente)).
 - En Windows, el CI de [#131](https://github.com/MarcossIC/claw-garden/pull/131) falló sobre `f23117e` en `the_protocol_says_which_preferences_open_every_session`: `no section Type and importance`. El checkout de Windows deja `protocol.md` con saltos `\r\n`, y el helper del test buscaba la sección con `\n`. Se reprodujo en Linux pasando los dos protocolos a CRLF, y `b59ce4c` hace que el helper lea el texto sin `\r`, como `opening`; pasa con CRLF y con LF. Sobre `b59ce4c`, los jobs `test (ubuntu-latest)` y `test (windows-latest)` pasaron. El cambio no toca código `cfg(windows)`.
-- Los arreglos de la revisión de [#131](https://github.com/MarcossIC/claw-garden/pull/131) (PM8, PM9 y las lecturas acotadas del hook, [`specs/hooks`](../../specs/hooks/spec.md) HR4) pasan en Windows x86_64: `cargo test --workspace --no-fail-fast` y los dos clippy, con `--target-dir target-test`. Sus tests con un FIFO son sólo de Unix: en Windows sólo se comprobó que compilan, sacándoles el `cfg`. Falta correrlos en Linux, con la suite y los clippy, en el CI del pull request que los lleve.
+- Los arreglos de la revisión de [#131](https://github.com/MarcossIC/claw-garden/pull/131) (PM8, PM9 y las lecturas acotadas del hook, [`specs/hooks`](../../specs/hooks/spec.md) HR4) pasan en Windows x86_64: `cargo test --workspace --no-fail-fast` y los dos clippy, con `--target-dir target-test`. Sus tests con un FIFO son sólo de Unix: en Windows sólo se comprobó que compilan, sacándoles el `cfg`. En Linux corrieron con la suite y los dos clippy en el CI de #132, que los llevó a `main` sobre `0e146ff9` y salió como 0.77.0: pasaron los jobs `test (ubuntu-latest)` y `test (windows-latest)`.
 
 ## Los tests en rojo
 
@@ -95,16 +95,18 @@ diff --git a/crates/clawg-cli/src/mcp/agent_contract.json b/crates/clawg-cli/src
              "type": "string"
 ```
 
-## Lo que no se midió
+## `rag-eval`
 
-- **`rag-eval --diff`.** No aplica a PM1 a PM8: el ranking no cambia. PM9 sí puede mover una fila, porque la importancia entra al puntaje, pero sólo cuando un save declarado repite un texto con más importancia que la de su fila. No se midió, porque necesita el modelo real y el golden fuera de git.
-- **El agent view con el golden real.** Necesita el modelo real y el golden fuera de git (`docs/eval/`). La ingesta de evaluación sella cada fila como declarada (`user_stated: true`, `crates/clawg-core/src/eval_api.rs:735`), así que ningún hit lleva marca y una preferencia sin proyecto o del proyecto del caso sigue entrando al workspace. Lo que puede moverse es una preferencia del golden guardada en otro proyecto que el del caso: queda en [«Pendiente en local»](#pendiente-en-local).
+- **`rag-eval --diff`.** No aplica a PM1 a PM8: el ranking no cambia. PM9 sí puede mover una fila, porque la importancia entra al puntaje, pero sólo cuando un save declarado repite un texto vivo con más importancia que la de su fila. El `--diff` del agent view ([punto 3](#medido-sobre-una-copia-de-prod)) no mueve ningún caso en `retrieval` ni en `similarity`; eso no descarta que PM9 mueva una fila de un store real, porque depende de esos saves.
+- **El agent view con el golden real.** La ingesta de evaluación sella cada fila como declarada (`user_stated: true`, `crates/clawg-core/src/eval_api.rs:735`), así que ningún hit lleva marca y una preferencia sin proyecto o del proyecto del caso sigue entrando al workspace. Lo que podía moverse era una preferencia del golden guardada en otro proyecto que el del caso: no se movió ningún caso ([punto 3](#medido-sobre-una-copia-de-prod)).
 
-## Pendiente en local
+## Medido sobre una copia de prod
 
-Lo que se mide contra `prod`. Necesita una copia aislada del directorio de datos de `prod` y un binario con este cambio, publicado o el build debug de esta rama. Los dos binarios corren sobre esa copia, abierta con `--profile dev` (un build debug no abre `prod`), y ninguno sobre el `~/.clawg` real, en el que arrancar un daemon puede migrar la base y `POST /v1/context` reescribe `workspace.md`. Cada medición empieza de una copia nueva, por lo mismo.
+Medido el 2026-11-06. Arrancar un daemon sobre el `~/.clawg` real puede migrar la base, y `POST /v1/context` reescribe `workspace.md`, así que cada medición empezó de una copia nueva del directorio de datos de `prod`: `memory.db`, leída por una conexión de sólo lectura y copiada con la API de backup de SQLite en un solo paso (una transacción de lectura, consistente aunque el daemon de `prod` tenga la base abierta), y `models/`, `workspaces/`, `sessions/` y `preferences.json`. Nunca `daemon.json`, `token`, el socket, los locks, `metrics.db` ni `backups/`. Las cinco copias tienen las mismas filas: 56.367 en `memory`, con la misma última fecha y las mismas 20 preferencias elegibles.
 
-1. **Las filas elegibles por alcance y por sello**, con una lectura sobre una copia de `memory.db`:
+En Windows el directorio de datos sale de la carpeta del usuario, y sólo un build con la feature `testing` de clawg-core lo muda (`CLAWG_TEST_HOME`, `crates/clawg-core/src/paths.rs`). Los binarios son builds debug con esa feature, que sin `CLAWG_TEST_EMBEDDER` no cambia nada más: el modelo real se carga de la copia. El de la base es de `4242171`, en un worktree aparte; el de este cambio, de `1a00cc1f`, cuyo código de `clawg-core`, `clawg-cli` y `rag-eval` es el de 0.77.0. Cada daemon arrancó con `CLAWG_TEST_HOME` en su copia, el perfil `dev` y `--port 0`, registró la copia como su directorio de datos y contestó `/health` con su propio pid y el perfil `dev`.
+
+1. **Las filas elegibles por alcance y por sello**, con esta lectura sobre la copia de `memory.db`:
 
    ```sql
    SELECT CASE WHEN project_id IS NULL THEN 'sin proyecto' ELSE project_id END AS alcance,
@@ -116,11 +118,55 @@ Lo que se mide contra `prod`. Necesita una copia aislada del directorio de datos
    ORDER BY 1, 2, 3, 4;
    ```
 
-   Dice cuántas preferencias de las que hoy entran dejan de entrar por el sello (`created_by_type` distinto de `user`) y cuántas por el proyecto, y cuántas ganan los otros agentes. Es el recuento que la exploración pidió antes del sello, y la entrada de la revisión a mano con la persona, que queda fuera de este cambio.
+   Dice cuántas preferencias de las que hoy entran dejan de entrar por el sello (`created_by_type` distinto de `user`) y cuántas por el proyecto, y cuántas ganan los otros agentes. Es el recuento que la exploración pidió antes del sello, y la entrada de la revisión a mano con la persona, que queda fuera de este cambio. P1 es el único proyecto con filas elegibles; P2 a P18 son los otros proyectos del store, de más a menos filas vivas.
+
+   | Alcance | `created_by_type` | `source` | `agent_id` | Filas |
+   |---|---|---|---|---|
+   | P1 | `agent` | `explicit` | `claude-code` | 2 |
+   | P1 | `user` | `explicit` | `claude-code` | 18 |
+
+   Ninguna es sin proyecto ni de otro agente. De las 140 `user_preference` vivas, sólo estas 20 tienen importancia 8 o más y tier 1. En `4242171` la consulta filtraba sólo por agente, así que las 20 entraban al workspace de `claude-code` en cada proyecto. Con este cambio:
+   - por el sello dejan de entrar 2, en todo proyecto;
+   - por el proyecto, las 18 declaradas dejan de entrar en los otros 17 proyectos, y siguen entrando en P1 y en el workspace sin proyecto;
+   - los otros agentes ganan las 18 en P1: sin `sharing.json`, cada agente alcanza las filas de `claude-code`, y ninguno tiene preferencias elegibles propias.
 2. **Los bytes de `session-start` por proyecto, antes y después.** Para cada proyecto con filas, `POST /v1/context` sin `query` con `agent_id` `claude-code`, con un binario de `4242171`, la base de este cambio, y con uno de este cambio, cada uno sobre una copia nueva del mismo store: los bytes de `prompt` y los del bloque WORKSPACE. La [propuesta de session-start-context](../archive/2026-11-04-session-start-context/proposal.md#problema) midió un workspace de 14.560 bytes, 14.400 de ellos en 18 preferencias.
+
+   El pedido es el de `clawg hook session-start`: `budget` 8.000 (`SESSION_BUDGET`, `crates/clawg-cli/src/hook.rs:52`) y `lang` `es`, la preferencia de la copia, para los 18 proyectos y sin proyecto. Con 8.000 el workspace sale recortado con los dos binarios, así que se repitió con 24.000, el máximo, para verlo entero. Cada binario y cada presupuesto corrió sobre su propia copia. Cada celda es antes (`4242171`) → después (este cambio). WORKSPACE son los bytes del bloque, desde `=== WORKSPACE ===` hasta el separador siguiente, con las preferencias que imprime entre paréntesis; — es que no hay bloque, y * que el prompt trae `=== BUDGET ===` porque el presupuesto dejó algo afuera.
+
+   | Proyecto | `prompt`, 8.000 | WORKSPACE, 8.000 | `prompt`, 24.000 | WORKSPACE, 24.000 |
+   |---|---|---|---|---|
+   | P1 | 6.885* → 7.994* | 3.159 (3) → 3.159 (3) | 23.863* → 23.512* | 13.665 (16) → 13.326 (16) |
+   | P2 | 7.522* → 7.494* | 3.159 (3) → — | 23.632* → 10.794 | 15.003 (18) → — |
+   | P3 | 7.617* → 7.992* | 3.159 (3) → — | 23.171* → 10.333 | 15.003 (18) → — |
+   | P4 | 7.612* → 7.337* | 3.159 (3) → — | 23.765 → 9.679 | 16.421 (20) → — |
+   | P5 | 7.469* → 7.844* | 3.159 (3) → — | 23.950* → 10.185 | 15.936 (19) → — |
+   | P6 | 7.724* → 7.871* | 3.159 (3) → — | 23.341* → 11.829 | 13.665 (16) → — |
+   | P7 | 7.853* → 7.269* | 3.159 (3) → — | 23.407* → 10.569 | 15.003 (18) → — |
+   | P8 | 7.629* → 7.988* | 3.159 (3) → — | 23.609* → 10.256 | 13.665 (16) → — |
+   | P9 | 7.805* → 7.221* | 3.159 (3) → — | 23.359* → 10.521 | 15.003 (18) → — |
+   | P10 | 7.664* → 7.811* | 3.159 (3) → — | 23.281* → 11.769 | 13.665 (16) → — |
+   | P11 | 7.422* → 7.797* | 3.159 (3) → — | 23.903* → 10.138 | 15.936 (19) → — |
+   | P12 | 7.674* → 7.090* | 3.159 (3) → — | 23.228* → 10.390 | 15.003 (18) → — |
+   | P13 | 7.768* → 7.326* | 3.159 (3) → — | 22.176 → 8.090 | 16.421 (20) → — |
+   | P14 | 7.768* → 7.326* | 3.159 (3) → — | 22.176 → 8.090 | 16.421 (20) → — |
+   | P15 | 7.768* → 7.326* | 3.159 (3) → — | 22.176 → 8.090 | 16.421 (20) → — |
+   | P16 | 7.768* → 7.326* | 3.159 (3) → — | 22.176 → 8.090 | 16.421 (20) → — |
+   | P17 | 7.768* → 7.326* | 3.159 (3) → — | 22.176 → 8.090 | 16.421 (20) → — |
+   | P18 | 7.768* → 7.326* | 3.159 (3) → — | 22.176 → 8.090 | 16.421 (20) → — |
+   | sin proyecto | 7.809* → 7.795* | 3.159 (3) → 3.159 (3) | 23.520* → 23.238* | 11.943 (13) → 11.673 (13) |
+
+   - En los 17 proyectos sin preferencias el bloque WORKSPACE desaparece. Con 8.000 ocupaba 3.159 bytes (3 preferencias, recortado), y RECENT toma ese lugar: pasa de 8 hits a 10 y el prompt queda cerca del tope. Con 24.000 el bloque ocupaba de 13.665 a 16.421 bytes (de 16 a 20 preferencias), y el prompt baja de 22.176–23.950 bytes a 8.090–11.829, sin recortar nada.
+   - En P1 entra lo mismo con 8.000: 3.159 bytes, 3 preferencias. Con 24.000, 16 en los dos, de 20 elegibles antes y de 18 después, y el bloque baja de 13.665 a 13.326 bytes.
+   - Sin proyecto el workspace toma las declaradas de todo proyecto: con 24.000, 13 en los dos, recortado.
+   - Sin recorte, el workspace de la base mide hoy 16.421 bytes, con 20 preferencias.
 3. **El agent view con el golden real**: `rag-eval --real --agent-view` contra la línea base de `openspec/config.yaml`, para ver que ningún caso se mueve.
-4. **Cursor real**, en el piloto del [ROADMAP](../../ROADMAP.md): una preferencia declarada a Claude Code entra al arranque de Cursor en el mismo proyecto.
+
+   `rag-eval --real --agent-view --tag preference-model-tip`, con el `rag-eval` de este cambio y el modelo de una copia nueva, sobre el golden de 46 casos con el sha256 de la línea base (`363d3e08…`): `search_memory` 36/46 a 761,4 tokens de media y `recall_context` 37/46 a 1.037,3, lo mismo que la línea base (`docs/eval/results/2026-10-20-real-untrusted-recall-fix-agent-view.json`). `rag-eval --diff` contra ese archivo no mueve ningún caso, ni a mejor ni a peor, en `search.found`, `context.found`, los tokens de cada herramienta, `retrieval`, `similarity` y cada par de idiomas (`en>en` 7, `es>en` 19, `es>es` 20). El resultado queda en `docs/eval/results/2026-11-06-real-preference-model-tip-agent-view.json`, fuera de git.
+
+## Pendiente en prod
+
+- **Cursor real**, en el piloto del [ROADMAP](../../ROADMAP.md): una preferencia declarada a Claude Code entra al arranque de Cursor en el mismo proyecto.
 
 ## Veredicto
 
-Sin CRITICAL en Linux ni en el CI de Windows. Queda como WARNING lo que se mide contra `prod` ([«Pendiente en local»](#pendiente-en-local)).
+Sin CRITICAL en Linux ni en el CI de Windows. Lo que se medía contra `prod` se midió sobre copias ([arriba](#medido-sobre-una-copia-de-prod)), y el agent view no mueve ningún caso. Queda Cursor real, en el piloto ([«Pendiente en prod»](#pendiente-en-prod)).
