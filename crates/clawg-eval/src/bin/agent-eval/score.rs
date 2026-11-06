@@ -40,8 +40,8 @@ pub fn score(task: &Task, t: &Transcript, read_file: impl Fn(&str) -> Option<Str
             let passed = match check {
                 Check::AnswerContains { text } => contains_ci(t.answer(), text),
                 Check::AnswerLacks { text } => !contains_ci(t.answer(), text),
-                Check::FileContains { path, text } => read_file(path).is_some_and(|body| body.contains(text.as_str())),
-                Check::FileLacks { path, text } => !read_file(path).is_some_and(|body| body.contains(text.as_str())),
+                Check::FileContains { path, text } => read_file(path).is_some_and(|body| file_has(&body, text)),
+                Check::FileLacks { path, text } => !read_file(path).is_some_and(|body| file_has(&body, text)),
                 Check::ToolCalled { name } => t.calls.iter().any(|c| is_tool(&c.name, name)),
             };
             CheckResult { check: check.describe(), passed }
@@ -50,6 +50,12 @@ pub fn score(task: &Task, t: &Transcript, read_file: impl Fn(&str) -> Option<Str
     let ended = t.result.as_ref().is_some_and(|r| !r.is_error);
     let tracers = task.tracers.iter().map(|tr| (tr.clone(), fate(t, tr))).collect();
     Score { success: ended && checks.iter().all(|c| c.passed), ended, checks, tracers }
+}
+
+/// A checkout with `core.autocrlf` leaves CRLF in the fixtures and the agent's edits keep it,
+/// while a check is written with LF.
+fn file_has(body: &str, text: &str) -> bool {
+    body.replace("\r\n", "\n").contains(&text.replace("\r\n", "\n"))
 }
 
 fn fate(t: &Transcript, tracer: &str) -> TracerFate {
@@ -122,6 +128,31 @@ mod tests {
         let s = score(&task(), &parse_stream(FOUND), |_| None);
         assert!(!s.success);
         assert!(!s.checks[2].passed && s.checks[3].passed);
+    }
+
+    #[test]
+    fn file_checks_ignore_carriage_returns() {
+        let t = parse_task(
+            r#"{"id": "t", "category": "K1", "fixture": "f", "prompt": "p",
+                "checks": [
+                    {"kind": "file_contains", "path": ".gitignore", "text": "dist/\ndist2/\nlogs/"},
+                    {"kind": "file_lacks", "path": ".gitignore", "text": "dist2/\ntmp/"},
+                    {"kind": "file_lacks", "path": ".gitignore", "text": "dist/\nlogs/"}
+                ]}"#,
+        )
+        .unwrap();
+        let crlf = |_: &str| Some("dist/\r\ndist2/\r\nlogs/\r\n".to_owned());
+        let s = score(&t, &parse_stream(FOUND), crlf);
+        assert!(s.checks[0].passed, "a CRLF file passes an LF check");
+        assert!(s.checks[1].passed, "the absent text is still absent");
+        assert!(s.checks[2].passed);
+
+        let t = parse_task(
+            r#"{"id": "t", "category": "K1", "fixture": "f", "prompt": "p",
+                "checks": [{"kind": "file_lacks", "path": ".gitignore", "text": "dist/\ndist2/"}]}"#,
+        )
+        .unwrap();
+        assert!(!score(&t, &parse_stream(FOUND), crlf).checks[0].passed, "file_lacks sees the text through CRLF");
     }
 
     #[test]
