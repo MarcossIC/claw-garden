@@ -12,7 +12,7 @@ Cambia de [`specs/project`](../../specs/project/spec.md) R3, que deja al puente 
 
 ## BP1. El puente pide las raíces en cada llamada
 
-En cada llamada a una herramienta, el puente MUST pedir `roots/list` si el cliente declaró la capacidad `roots` (`RequestContext::client_capabilities`, que lee el `initialize` o el `_meta` de la llamada), y MUST NOT pedirla si no la declaró. MUST esperar la respuesta como mucho `ROOTS_WAIT` (3 s). Una respuesta de error, o ninguna a tiempo, MUST contar como un cliente sin roots en esa llamada, con un warning en el log, y la herramienta MUST seguir. Las raíces MUST pedirse otra vez en la llamada siguiente: nunca se guardan entre llamadas, porque un cliente puede cambiarlas sin avisar (Cursor declara `roots.listChanged: false`).
+En cada llamada a una herramienta que lee o guarda (`save_memory`, `search_memory`, `recall_context`, `read_memory`, `synthesize`, `search_project`, `answer_suggestion` y `memory_status`), el puente MUST pedir `roots/list` si el cliente declaró la capacidad `roots` (`RequestContext::client_capabilities`, que lee el `initialize` o el `_meta` de la llamada), y MUST NOT pedirla si no la declaró. MUST esperar la respuesta como mucho `ROOTS_WAIT` (3 s). Una respuesta de error, o ninguna a tiempo, MUST contar como un cliente sin roots en esa llamada, con un warning en el log, y la herramienta MUST seguir. Las raíces MUST pedirse otra vez en la llamada siguiente: nunca se guardan entre llamadas, porque un cliente puede cambiarlas sin avisar (Cursor declara `roots.listChanged: false`).
 
 #### Escenario: las raíces cambian entre dos llamadas
 - GIVEN un cliente con roots que declara la carpeta A, con una memoria guardada en A y otra en B
@@ -23,6 +23,8 @@ En cada llamada a una herramienta, el puente MUST pedir `roots/list` si el clien
 - GIVEN un cliente que no declara la capacidad `roots`
 - WHEN llama a cualquier herramienta
 - THEN el puente no le manda `roots/list`
+
+Las demás (`list_memories`, `delete_memory`, `restore_memory`, `update_memory`, `resolve_conflict`) no dependen del proyecto de la llamada y no las piden.
 
 **Tests:** `a_change_of_roots_between_two_calls_is_seen_in_the_second` (`crates/clawg-cli/src/mcp/mod.rs`); el cliente de prueba falla si recibe `roots/list` sin haber declarado la capacidad, así que cada test sin roots lo comprueba. Hoy el primero falla: el puente nunca pide las raíces y busca en su directorio de arranque.
 
@@ -41,7 +43,7 @@ Cada carpeta MUST resolver su proyecto con `ProjectIdentity::resolve`, como un `
 - WHEN el cliente la declara una vez como ruta y otra como `file:` con su ruta codificada (en Windows, la ruta con la unidad en minúscula y la URI con `%3A`)
 - THEN las dos llevan al mismo proyecto, y una búsqueda trae lo guardado con su `project_path`
 
-**Tests:** `a_root_is_a_folder_as_a_uri_or_as_a_path` (`roots.rs`), puro, con las formas de Windows y de Unix en cualquier sistema; `a_root_as_a_path_and_as_a_file_uri_is_the_same_project` (`mod.rs`). Hoy no compilan: no hay `root_path`.
+**Tests:** `a_root_is_a_folder_as_a_uri_or_as_a_path` y `a_root_that_names_no_folder_here_is_dropped` (`roots.rs`), puros, con las formas de Windows y de Unix en cualquier sistema; `a_root_as_a_path_and_as_a_file_uri_is_the_same_project` (`mod.rs`). Hoy no compilan: no hay `root_path`.
 
 ## BP3. El directorio personal nunca es un proyecto
 
@@ -54,7 +56,7 @@ Una carpeta cuya ruta canónica, o cuya raíz (`ProjectIdentity.root`), es el di
 - WHEN el cliente declara como raíces el directorio personal y la carpeta A
 - THEN la búsqueda va sólo a A
 
-**Test:** `the_home_directory_is_never_a_project` (`mod.rs`). Hoy falla: el directorio personal es el proyecto por defecto.
+**Tests:** `the_home_directory_is_never_a_project` (`mod.rs`) y `the_home_directory_and_its_root_are_no_folder` (`roots.rs`). Hoy el primero falla: el directorio personal es el proyecto por defecto.
 
 ## BP4. Dónde lee una llamada sin proyecto
 
@@ -108,20 +110,20 @@ En una búsqueda en grupo, la línea de un hit de una fila con proyecto MUST lle
 
 ## BP8. Lo que es de un proyecto pide uno cuando hay varios
 
-`recall_context`, `synthesize`, `search_project` y `answer_suggestion` sin `project`, `project_path` (en `answer_suggestion`, sin `project`) ni `all_projects` MUST, con un grupo, negarse sin buscar ni escribir, con un error en el idioma de la sesión que dice que el cliente tiene varios proyectos abiertos y lista la ruta de cada carpeta de lectura como opción de `project_path`, o `project`. Con un proyecto MUST usarlo; sin ninguno, MUST hacer lo de hoy (`recall_context` y `synthesize` sin proyecto; `search_project` y `answer_suggestion` se niegan con su frase). `memory_status` MUST contar los conflictos del proyecto de lectura, o de todos los proyectos sin uno o con un grupo. La clave que muestran `read_memory` y `search_memory` con `all_projects` MUST compararse con el proyecto de lectura, o con ninguno sin uno o con un grupo.
+`recall_context`, `synthesize`, `search_project` y `answer_suggestion` sin `project`, `project_path` (en `answer_suggestion`, sin `project`) ni `all_projects` MUST, con un grupo, negarse sin buscar ni escribir memorias (las carpetas de lectura se registran, como en cualquier lectura), con un error en el idioma de la sesión que dice que el cliente tiene varios proyectos abiertos y lista la ruta de cada carpeta de lectura como opción de `project_path`, o `project`. Con un proyecto MUST usarlo; sin ninguno, MUST hacer lo de hoy (`recall_context` y `synthesize` sin proyecto; `search_project` y `answer_suggestion` se niegan con su frase). `memory_status` MUST contar los conflictos del proyecto de lectura, o de todos los proyectos sin uno o con un grupo. La clave que muestran `read_memory` y `search_memory` con `all_projects` MUST compararse con el proyecto de lectura, o con ninguno sin uno o con un grupo.
 
 #### Escenario: dos ventanas
 - GIVEN un cliente con las raíces A y B, de dos proyectos
 - WHEN llama a `recall_context`, `synthesize`, `search_project` o `answer_suggestion` sin proyecto
-- THEN cada una responde un error que lista A y B, y no lee ni escribe nada
+- THEN cada una responde un error que lista A y B, y no lee ni escribe memorias
 
 **Test:** `what_works_on_one_project_asks_for_one_when_several_are_open` (`server.rs`). Hoy no compila: el servidor no conoce las raíces.
 
 ## BP9. Una raíz declarada se indexa como el directorio de arranque
 
-El registro de un proyecto MUST mandar `index_docs: true` cuando su raíz es la de una carpeta de lectura que se indexa sola (`auto_indexable`: tiene un `.git` o un manifiesto y no es el directorio personal), sea el directorio de arranque o una raíz del cliente. Cualquier otra raíz, como la de un `project_path` que nombra el modelo, MUST seguir con `false` hasta `clawg projects add`. La decisión MUST ser pura sobre las raíces (`indexes_docs`, `crates/clawg-cli/src/mcp/tools.rs`).
+El registro de un proyecto MUST mandar `index_docs: true` cuando su raíz es la de una carpeta de lectura que se indexa sola (`auto_indexable`: tiene un `.git` o un manifiesto y no es el directorio personal), sea el directorio de arranque o una raíz del cliente. Cualquier otra raíz, como la de un `project_path` que nombra el modelo, MUST seguir con `false` hasta `clawg projects add`. La decisión MUST ser pura sobre las raíces (`indexes_docs`, `crates/clawg-cli/src/mcp/tools.rs`). El 403 de `search_project` (`not_accepted`, `crates/clawg-cli/src/daemon/api.rs`) MUST decir que el daemon lee una carpeta que el cliente MCP tiene abierta o en la que arrancó un puente, y ya no sólo esta última.
 
-**Test:** `a_declared_root_is_indexed_like_the_start_directory` (`server.rs`). Hoy falla: sólo la raíz del directorio de arranque se indexa.
+**Tests:** `a_declared_root_is_indexed_like_the_start_directory` (`server.rs`) y `only_a_folder_the_person_opened_is_indexed` (`tools.rs`), que reemplaza a `only_the_bridges_own_root_is_indexed`. Hoy el primero falla: sólo la raíz del directorio de arranque se indexa.
 
 ## BP10. La clave de una fila sin proyecto
 
@@ -133,7 +135,7 @@ El registro de un proyecto MUST mandar `index_docs: true` cuando su raíz es la 
 
 - La apertura de `protocol.md` MUST pedir que cada save nombre su proyecto con `project_path`, `project` o `all_projects`, en lugar de decir que las memorias son del proyecto actual; la de `protocol.es.md`, lo mismo en español. Cada variante MUST seguir en 2.048 caracteres o menos: sin preferencia 2.030, con `en` 2.047.
 - «## Projects» y «## Proyectos» MUST decir que una llamada sin proyecto lee en las carpetas que el cliente tiene abiertas, o en el directorio de arranque; que un save nombra siempre su proyecto; que una búsqueda en varios proyectos marca cada hit con `project=`; y que `recall_context`, `search_project`, `synthesize` y `answer_suggestion` piden uno cuando hay varios.
-- Las descripciones de `project_path` de `save_memory`, `search_memory`, `recall_context`, `search_project` y `synthesize`, y la de `project` de `answer_suggestion`, MUST NOT decir que el valor por defecto es el directorio donde arrancó el puente: la de `save_memory` dice que un save nombra su proyecto con ella, con `project` o con `all_projects`; las demás, que por defecto son los proyectos abiertos en el cliente.
-- `agent_contract.json` y `agent_contract.es.json` MUST cambiar sólo en las `instructions` y en esas descripciones, y se bendicen.
+- Las descripciones de `project_path` de `save_memory`, `search_memory`, `recall_context`, `search_project` y `synthesize`, y la de `project` de `answer_suggestion`, MUST NOT decir que el valor por defecto es el directorio donde arrancó el puente: la de `save_memory` dice que un save nombra su proyecto con ella, con `project` o con `all_projects`, y que sin ninguno se rechaza; las demás, que por defecto son los proyectos de las carpetas abiertas en el cliente, o del directorio de arranque cuando no nombra ninguna, y las de un proyecto, que con varias abiertas se pasa esta o `project`. La de `project` de esas cinco MUST NOT decir «otro que el de este directorio».
+- `agent_contract.json` y `agent_contract.es.json` MUST cambiar sólo en las `instructions` y en esas descripciones de `project_path` y `project`, y se bendicen.
 
 **Tests:** `the_protocol_says_where_a_call_without_a_project_goes` (`crates/clawg-cli/src/mcp/protocol.rs`), en los dos idiomas; `the_instructions_carry_the_saving_habits` y `the_spanish_instructions_carry_the_saving_habits`, que pasan a pedir la oración nueva; `the_instructions_fit_older_clients`; `the_spanish_protocol_has_the_sections_and_spans_of_the_english_one`; `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, bendecidos. Hoy el primero falla: «## Projects» dice que las memorias son del directorio en el que se trabaja.
