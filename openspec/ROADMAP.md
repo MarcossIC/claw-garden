@@ -71,7 +71,7 @@ Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y despué
 | [knn-prefilter](changes/knn-prefilter/proposal.md) | Las búsquedas en un proyecto chico traen poco o nada que sí está guardado. La fracción de filas ajenas es lo que decide la pérdida |
 | [read-connections](changes/read-connections/exploration.md) | Un hook vence sus 3 s detrás de una operación larga y el arranque queda sin contexto |
 | [session-lifecycle](changes/session-lifecycle/exploration.md) | Dos sesiones en paralelo del mismo proyecto reciben el traspaso de la otra |
-| [agent-eval](changes/agent-eval/proposal.md) | El agente no busca ni guarda cuando debería, y hay que medirlo. Pide autorización de gasto |
+| [agent-eval](changes/agent-eval/proposal.md) | El agente no busca ni guarda cuando debería, y hay que medirlo. Tareas, fixtures y corredor listos para sesiones pagas; falta correr el piloto en local, con una clave de API ([tareas](changes/agent-eval/tasks.md#después-de-este-cambio)) |
 | [topic-key-warning](changes/topic-key-warning/proposal.md) | No sube: se cierra cuando aparezcan casos reales que verifiquen su criterio |
 
 ## Después del corte (no bloquean)
