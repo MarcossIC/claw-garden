@@ -2,12 +2,12 @@
 
 Fuente de verdad del comportamiento actual del origen de una memoria: con qué `source` y `created_by_type` se sella cada save, cómo el agente declara que algo lo dijo el usuario, y qué marca muestra cada lector. El origen no cambia ningún par, estado ni puntaje: cómo se forman y se juzgan los pares está en [`specs/disputes`](../disputes/spec.md), y qué es una conclusión, en [`specs/synthesis`](../synthesis/spec.md).
 
-**Origen:** [memory-provenance](../../changes/archive/2026-10-18-memory-provenance/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec.
+**Origen:** [memory-provenance](../../changes/archive/2026-10-18-memory-provenance/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec. [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0, sumó PM5 y PM9, con los ids de su spec: la marca de un hit de preferencia, cuyo formato está en [`specs/retrieval`](../retrieval/spec.md), PM5, y el sello de un save declarado que repite una fila.
 
 ## Definiciones
 
 - **Origen de una fila:** sus columnas `source` y `created_by_type` en `memory`. No hay columna nueva ni migración: los valores nuevos son `synthesis` en `source` y `agent` en un `explicit`.
-- **Marca:** lo que un lector deriva del origen (`mark`, `crates/clawg-core/src/memory/provenance.rs:37-44`). Se marca lo que nunca fue ambiguo, no lo dicho: las filas guardadas antes del sello dicen `explicit` / `user` aunque el usuario no las haya dicho, y no se reescriben, así que una fila sin marca es «dicha por el usuario, o anterior a que se registrara el origen». Ningún lector afirma que una fila es del usuario.
+- **Marca:** lo que un lector deriva del origen (`mark`, `crates/clawg-core/src/memory/provenance.rs:42-49`). Se marca lo que nunca fue ambiguo, no lo dicho: las filas guardadas antes del sello dicen `explicit` / `user` aunque el usuario no las haya dicho, y no se reescriben, así que una fila sin marca es «dicha por el usuario, o anterior a que se registrara el origen». Ningún lector afirma que una fila es del usuario.
 
 ## P1. Sello de un save
 
@@ -81,3 +81,21 @@ Un evento `chat`, `code_file` o `compaction` MUST sellarse como antes: por el ro
 Una base con filas `explicit` / `user` escritas por la versión anterior MUST abrir con todas sus filas, sin cambiar su origen, y ninguna MUST llevar marca. No hay migración: el sello es un valor más en columnas que ya existían. Un binario anterior abre la base sin cambios y muestra los valores nuevos tal cual, porque los lee como texto (`crates/clawg-core/src/memory/admin.rs:1076-1078`); un save que haga después vuelve a sellarse `explicit` / `user`.
 
 **Test:** `rows_saved_before_provenance_keep_their_origin_and_no_mark` en `crates/clawg-core/src/memory/provenance.rs`.
+
+## PM5. La marca en los hits de una preferencia
+
+`search_memory` y `recall_context` MUST mostrar la marca de un hit sólo cuando es una `user_preference` (`preference_mark`, `crates/clawg-core/src/memory/provenance.rs:53`): el workspace imprime sólo las preferencias declaradas, y el modelo lee una preferencia como una regla de la persona. Cualquier otro hit MUST NOT llevarla. El formato de la línea, `POST /v1/search` y el cliente están en [`specs/retrieval`](../retrieval/spec.md), PM5; `synthesize` sigue marcando cada fila que tiene marca (P5).
+
+**Tests:** los de PM5 en [`specs/retrieval`](../retrieval/spec.md).
+
+## PM9. Un save declarado sella la fila que repite
+
+Un save con `user_stated` cuyo texto ya está vivo en su alcance MUST dejar esa fila con `source = 'explicit'` y `created_by_type = 'user'`, además de reforzarla (`reinforce_in`, `crates/clawg-core/src/memory/store_insert.rs`), sea que la encuentre antes de calcular el embedding o después. También MUST subirla a la importancia del save, sin bajarla nunca, y recalcular su tier con ella: si no, lo que dijo la persona quedaría fuera del workspace por haberse inferido antes con menos importancia ([`specs/retrieval`](../retrieval/spec.md), PM2). Un save sin `user_stated` MUST dejar el sello y la importancia como estaban. Una fila `import` MUST conservar los dos, porque un segundo import y `clawg doctor` la encuentran por su `source`, y una `synthesis` también, porque una conclusión es del agente aunque se apoye en lo que dijo la persona.
+
+#### Escenario: lo inferido, y después declarado
+- GIVEN una preferencia guardada sin `user_stated`, que queda `explicit` / `agent` con importancia 5
+- WHEN la persona dice lo mismo y el agente guarda el mismo texto con `user_stated` e importancia 9
+- THEN sigue habiendo una fila, es `explicit` / `user` con importancia 9, y entra al workspace
+- AND otro save declarado del mismo texto con importancia 2 la deja en 9
+
+**Tests:** `a_stated_save_seals_the_row_it_repeats_as_the_users`, `an_inferred_save_leaves_the_seal_of_the_row_it_repeats`, `a_stated_save_leaves_an_import_and_a_conclusion_as_they_are`, `a_stated_save_raises_the_importance_of_the_row_it_repeats_and_never_lowers_it`, `an_inferred_save_leaves_the_importance_of_the_row_it_repeats`, `a_preference_stated_after_it_was_inferred_enters_the_workspace` y `a_twin_restored_while_the_save_is_embedded_is_reinforced_not_copied` (`crates/clawg-core/src/memory/worker.rs`).

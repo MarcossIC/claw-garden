@@ -1,15 +1,16 @@
 change: preference-model
 objective: "1, 2, 4"
 depends_on: [session-start-context]
-phase: verify
+phase: archived
+release: "0.77.0"  # todo su código, los arreglos de la revisión incluidos, está en v0.77.0 (#132); al archivarlo la versión sube a 0.78.0 (verify.md, «Al archivar»)
 artifacts:
   exploration: done  # las decisiones, cerradas: alcance A, entre agentes, sólo lo declarado entra solo
   proposal: done
-  spec: done  # PM1 a PM9
+  spec: done  # PM1 a PM9; al archivar, PM1 a PM3, PM5 y PM7 van a specs/retrieval, R5 de specs/sharing cambia, PM5 y PM9 van a specs/provenance, PM4, PM6 y PM8 a specs/mcp
   design: skipped  # las decisiones están cerradas en la exploración; la propuesta dice cómo se aplican
   tasks: done
   apply: done  # el sello, el proyecto y el alcance del workspace; la marca en los hits; all_projects y el protocolo; docs/reference
-  verify: done  # Linux: la suite y los dos clippy; el CI del pull request en Linux y Windows; lo que se mide contra prod queda pendiente en local (verify.md)
-  archive: pending
+  verify: done  # Linux: la suite y los dos clippy; el CI de #131 y de #132 en Linux y Windows; los puntos 1 a 3 medidos sobre copias de prod; Cursor real queda para el piloto (verify.md)
+  archive: done
 main_spec: openspec/specs/retrieval/spec.md, openspec/specs/sharing/spec.md, openspec/specs/provenance/spec.md, openspec/specs/mcp/spec.md
-updated: 2026-11-05
+updated: 2026-11-06

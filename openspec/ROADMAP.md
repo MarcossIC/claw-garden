@@ -29,7 +29,6 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 | Cambio | Dónde | Necesita antes |
 |---|---|---|
-| [preference-model](changes/preference-model/verify.md#medido-sobre-una-copia-de-prod), cierre | Local: una copia aislada de `prod`, el modelo real y el golden fuera de git | Nada: salió en 0.77.0. Mide contra la copia los tres primeros puntos pendientes en local (el cuarto, Cursor real, va en el piloto), se archiva y sube el minor |
 | [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | La prueba con Cursor real, de arriba |
 
 ## Noche 2
@@ -41,7 +40,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 ## Piloto (una semana de trabajo real, no una noche)
 
-Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario, con una excepción: Cursor se conecta con `clawg setup cursor --profile prod`, porque esa es la prueba con Cursor real ([pendiente en prod](changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)). Esa instalación también es a nivel usuario y afecta a cada ventana de Cursor, no sólo a este repositorio. Los mismos hooks prueban el arranque real de session-start-context ([pendiente en prod](changes/archive/2026-11-04-session-start-context/verify.md#pendiente-en-prod)), y que una preferencia declarada a Claude Code entre al arranque de Cursor en el mismo proyecto ([preference-model](changes/preference-model/verify.md#pendiente-en-prod)).
+Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario, con una excepción: Cursor se conecta con `clawg setup cursor --profile prod`, porque esa es la prueba con Cursor real ([pendiente en prod](changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)). Esa instalación también es a nivel usuario y afecta a cada ventana de Cursor, no sólo a este repositorio. Los mismos hooks prueban el arranque real de session-start-context ([pendiente en prod](changes/archive/2026-11-04-session-start-context/verify.md#pendiente-en-prod)), y que una preferencia declarada a Claude Code entre al arranque de Cursor en el mismo proyecto ([preference-model](changes/archive/2026-11-06-preference-model/verify.md#pendiente-en-prod)).
 
 **Pasa si:**
 - responde 10 preguntas reales cuya respuesta sólo está en el historial;

@@ -8,7 +8,7 @@ En Linux x86_64, build debug, toolchain 1.99.1, en `target`, sobre `b59ce4c`: el
 - `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también.
 - Los contratos del agente pasan después de bendecirlos con `CLAWG_BLESS=1`, en los dos idiomas. El diff es sólo `all_projects` en el `inputSchema` de `save_memory`; las `instructions` no cambian, porque el protocolo cambió fuera de la apertura ([abajo](#el-contrato-del-agente)).
 - En Windows, el CI de [#131](https://github.com/MarcossIC/claw-garden/pull/131) falló sobre `f23117e` en `the_protocol_says_which_preferences_open_every_session`: `no section Type and importance`. El checkout de Windows deja `protocol.md` con saltos `\r\n`, y el helper del test buscaba la sección con `\n`. Se reprodujo en Linux pasando los dos protocolos a CRLF, y `b59ce4c` hace que el helper lea el texto sin `\r`, como `opening`; pasa con CRLF y con LF. Sobre `b59ce4c`, los jobs `test (ubuntu-latest)` y `test (windows-latest)` pasaron. El cambio no toca código `cfg(windows)`.
-- Los arreglos de la revisión de [#131](https://github.com/MarcossIC/claw-garden/pull/131) (PM8, PM9 y las lecturas acotadas del hook, [`specs/hooks`](../../specs/hooks/spec.md) HR4) pasan en Windows x86_64: `cargo test --workspace --no-fail-fast` y los dos clippy, con `--target-dir target-test`. Sus tests con un FIFO son sólo de Unix: en Windows sólo se comprobó que compilan, sacándoles el `cfg`. En Linux corrieron con la suite y los dos clippy en el CI de #132, que los llevó a `main` sobre `0e146ff9` y salió como 0.77.0: pasaron los jobs `test (ubuntu-latest)` y `test (windows-latest)`.
+- Los arreglos de la revisión de [#131](https://github.com/MarcossIC/claw-garden/pull/131) (PM8, PM9 y las lecturas acotadas del hook, [`specs/hooks`](../../../specs/hooks/spec.md) HR4) pasan en Windows x86_64: `cargo test --workspace --no-fail-fast` y los dos clippy, con `--target-dir target-test`. Sus tests con un FIFO son sólo de Unix: en Windows sólo se comprobó que compilan, sacándoles el `cfg`. En Linux corrieron con la suite y los dos clippy en el CI de #132, que los llevó a `main` sobre `0e146ff9` y salió como 0.77.0: pasaron los jobs `test (ubuntu-latest)` y `test (windows-latest)`.
 
 ## Los tests en rojo
 
@@ -129,7 +129,7 @@ En Windows el directorio de datos sale de la carpeta del usuario, y sólo un bui
    - por el sello dejan de entrar 2, en todo proyecto;
    - por el proyecto, las 18 declaradas dejan de entrar en los otros 17 proyectos, y siguen entrando en P1 y en el workspace sin proyecto;
    - los otros agentes ganan las 18 en P1: sin `sharing.json`, cada agente alcanza las filas de `claude-code`, y ninguno tiene preferencias elegibles propias.
-2. **Los bytes de `session-start` por proyecto, antes y después.** Para cada proyecto con filas, `POST /v1/context` sin `query` con `agent_id` `claude-code`, con un binario de `4242171`, la base de este cambio, y con uno de este cambio, cada uno sobre una copia nueva del mismo store: los bytes de `prompt` y los del bloque WORKSPACE. La [propuesta de session-start-context](../archive/2026-11-04-session-start-context/proposal.md#problema) midió un workspace de 14.560 bytes, 14.400 de ellos en 18 preferencias.
+2. **Los bytes de `session-start` por proyecto, antes y después.** Para cada proyecto con filas, `POST /v1/context` sin `query` con `agent_id` `claude-code`, con un binario de `4242171`, la base de este cambio, y con uno de este cambio, cada uno sobre una copia nueva del mismo store: los bytes de `prompt` y los del bloque WORKSPACE. La [propuesta de session-start-context](../2026-11-04-session-start-context/proposal.md#problema) midió un workspace de 14.560 bytes, 14.400 de ellos en 18 preferencias.
 
    El pedido es el de `clawg hook session-start`: `budget` 8.000 (`SESSION_BUDGET`, `crates/clawg-cli/src/hook.rs:52`) y `lang` `es`, la preferencia de la copia, para los 18 proyectos y sin proyecto. Con 8.000 el workspace sale recortado con los dos binarios, así que se repitió con 24.000, el máximo, para verlo entero. Cada binario y cada presupuesto corrió sobre su propia copia. Cada celda es antes (`4242171`) → después (este cambio). WORKSPACE son los bytes del bloque, desde `=== WORKSPACE ===` hasta el separador siguiente, con las preferencias que imprime entre paréntesis; — es que no hay bloque, y * que el prompt trae `=== BUDGET ===` porque el presupuesto dejó algo afuera.
 
@@ -165,7 +165,12 @@ En Windows el directorio de datos sale de la carpeta del usuario, y sólo un bui
 
 ## Pendiente en prod
 
-- **Cursor real**, en el piloto del [ROADMAP](../../ROADMAP.md): una preferencia declarada a Claude Code entra al arranque de Cursor en el mismo proyecto.
+- **Cursor real**, en el piloto del [ROADMAP](../../../ROADMAP.md): una preferencia declarada a Claude Code entra al arranque de Cursor en el mismo proyecto.
+
+## Al archivar (2026-11-06)
+
+- PM1, PM2, PM3, PM5 y PM7 pasan a [`specs/retrieval`](../../../specs/retrieval/spec.md), con las definiciones de preferencia elegible, declarada y alcance del lector; R5 de [`specs/sharing`](../../../specs/sharing/spec.md) deja las preferencias del workspace en el alcance del lector; PM5 y PM9 pasan a [`specs/provenance`](../../../specs/provenance/spec.md), y PM4, PM6 y PM8 a [`specs/mcp`](../../../specs/mcp/spec.md), que cambia «La clave de tema en las herramientas».
+- Todo el código del cambio, los arreglos de la revisión incluidos, está en `v0.77.0`, el merge de #132. La versión sube igual a 0.78.0, porque archivar un cambio de openspec sube el minor. Al subirla, `clawg-core` y `clawg-cli` de `develop` son los de `v0.77.0`: lo que vino después es de `clawg-eval` y de documentación.
 
 ## Veredicto
 

@@ -1,12 +1,12 @@
 # preference-model — Especificación
 
-Cambia R5 de [`specs/sharing`](../../specs/sharing/spec.md) («Lo que sigue siendo de cada agente, y lo que no») y la línea de [`specs/retrieval`](../../specs/retrieval/spec.md) que dice que el workspace ve sólo lo del agente. Suma a `specs/retrieval` qué preferencias entran al workspace y la marca en la línea de un hit, a [`specs/provenance`](../../specs/provenance/spec.md) dónde se muestra la marca, y a [`specs/mcp`](../../specs/mcp/spec.md) `all_projects` de `save_memory` y lo que dice el protocolo. Al archivar, estos requisitos pasan a esas specs.
+Cambia R5 de [`specs/sharing`](../../../specs/sharing/spec.md) («Lo que sigue siendo de cada agente, y lo que no») y la línea de [`specs/retrieval`](../../../specs/retrieval/spec.md) que dice que el workspace ve sólo lo del agente. Suma a `specs/retrieval` qué preferencias entran al workspace y la marca en la línea de un hit, a [`specs/provenance`](../../../specs/provenance/spec.md) dónde se muestra la marca, y a [`specs/mcp`](../../../specs/mcp/spec.md) `all_projects` de `save_memory` y lo que dice el protocolo. Al archivar, estos requisitos pasan a esas specs.
 
 ## Definiciones
 
 - **Preferencia elegible:** una fila de `memory` con `memory_type = 'user_preference'`, importancia 8 o más, tier 1, sin `deleted_at` y con estado distinto de `superseded`. Es lo que la consulta ya pide hoy (`fetch_auto_rows`, `crates/clawg-core/src/memory/workspace.rs:376-385`), menos el filtro por agente.
-- **Declarada:** una fila con `created_by_type = 'user'`. La deja así un save con `user_stated` (`seal`, `crates/clawg-core/src/memory/provenance.rs:15`) y cualquier fila guardada antes del sello ([`specs/provenance`](../../specs/provenance/spec.md), P6).
-- **Alcance del lector:** el `Reach` que el daemon resuelve para el agente que pide el contexto desde `sharing.json` (`reach`, `crates/clawg-cli/src/daemon/api.rs:1557`), el mismo de la búsqueda ([`specs/sharing`](../../specs/sharing/spec.md), R1 y R2).
+- **Declarada:** una fila con `created_by_type = 'user'`. La deja así un save con `user_stated` (`seal`, `crates/clawg-core/src/memory/provenance.rs:15`) y cualquier fila guardada antes del sello ([`specs/provenance`](../../../specs/provenance/spec.md), P6).
+- **Alcance del lector:** el `Reach` que el daemon resuelve para el agente que pide el contexto desde `sharing.json` (`reach`, `crates/clawg-cli/src/daemon/api.rs:1557`), el mismo de la búsqueda ([`specs/sharing`](../../../specs/sharing/spec.md), R1 y R2).
 - **Marca:** lo que devuelve `mark(source, created_by_type)` (`provenance.rs:37`): `inferred`, `imported`, `conclusion` o ninguna.
 
 ## PM1. El proyecto de una preferencia
@@ -102,7 +102,7 @@ Una base con filas escritas como las escribe la versión anterior MUST abrirse s
 
 ## PM8. Una preferencia sin proyecto se reemplaza con `all_projects`
 
-Cambia «La clave de tema en las herramientas» de [`specs/mcp`](../../specs/mcp/spec.md), que cuenta una fila sin proyecto como de otro proyecto. Desde un puente con proyecto, `search_memory` y `read_memory` MUST mostrar la clave de una `user_preference` sin proyecto como ` topic=K all_projects`, en el lugar de ` topic=K`, porque un save con `all_projects` y esa clave la revisa ([`specs/ingest`](../../specs/ingest/spec.md), «Alcance de una clave»). Cualquier otra fila sin proyecto MUST seguir sin mostrarla, y un puente sin proyecto MUST seguir viendo ` topic=K`. `GET /v1/memories/{kind}/{id}/save` MUST mandar `memory_type` en una fila que lo tiene; una respuesta sin él, de un daemon anterior, MUST leerse como hasta ahora. `protocol.md` y `protocol.es.md` MUST decir, en «How to write a save» y en «Cómo escribir un save», cómo se reemplaza esa preferencia.
+Cambia «La clave de tema en las herramientas» de [`specs/mcp`](../../../specs/mcp/spec.md), que cuenta una fila sin proyecto como de otro proyecto. Desde un puente con proyecto, `search_memory` y `read_memory` MUST mostrar la clave de una `user_preference` sin proyecto como ` topic=K all_projects`, en el lugar de ` topic=K`, porque un save con `all_projects` y esa clave la revisa ([`specs/ingest`](../../../specs/ingest/spec.md), «Alcance de una clave»). Cualquier otra fila sin proyecto MUST seguir sin mostrarla, y un puente sin proyecto MUST seguir viendo ` topic=K`. `GET /v1/memories/{kind}/{id}/save` MUST mandar `memory_type` en una fila que lo tiene; una respuesta sin él, de un daemon anterior, MUST leerse como hasta ahora. `protocol.md` y `protocol.es.md` MUST decir, en «How to write a save» y en «Cómo escribir un save», cómo se reemplaza esa preferencia.
 
 #### Escenario: reemplazar una preferencia general
 - GIVEN una `user_preference` con la clave `style/indent` guardada con `all_projects`, y un puente en el proyecto P

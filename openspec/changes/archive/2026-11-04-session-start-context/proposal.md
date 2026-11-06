@@ -45,7 +45,7 @@ Las decisiones están cerradas en la exploración ([«Decisiones»](exploration.
 
 ## Fuera de alcance
 
-- Qué filas son elegibles para el workspace: el umbral de importancia, el tier, el alcance por proyecto de las preferencias, `AUTO_BYTE_CAP` y el tope de skills. Lo decide [preference-model](../../preference-model/exploration.md).
+- Qué filas son elegibles para el workspace: el umbral de importancia, el tier, el alcance por proyecto de las preferencias, `AUTO_BYTE_CAP` y el tope de skills. Lo decide [preference-model](../2026-11-06-preference-model/exploration.md).
 - `workspace.md` en disco: su sección AUTO sigue siendo la que escribe la regeneración. Sólo cambia lo que el prompt muestra de ella.
 - `crates/clawg-cli/src/hook.rs`, que toca client-setup-cursor en paralelo. Este cambio no lo necesita: el hook ya pide el contexto al daemon y repite el aviso que el daemon cuenta.
 - El contrato del agente (`agent_contract.json`), el umbral de 20 del aviso, `conclusions_to_review`, `DEFAULT_BUDGET`, la reserva de los hits y el ranking.
