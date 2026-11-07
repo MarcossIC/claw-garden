@@ -425,7 +425,8 @@ pub struct SearchRequest {
     #[serde(default)]
     pub project_id: Option<String>,
     /// A group of projects to search at once, each read as `project_id` reads
-    /// one. Not with `project_id`.
+    /// one. It wins over `project_id`, where a bridge names the group's first
+    /// project for a daemon that predates groups.
     #[serde(default)]
     pub project_ids: Option<Vec<String>>,
     #[serde(default)]
@@ -1539,17 +1540,17 @@ async fn search(
     Ok(Json(SearchBody { hits, withheld, other_language }))
 }
 
-/// The live projects a search reads: the one of `project_id`, or each of
-/// `project_ids` once, or `None` for every project.
+/// The live projects a search reads: each of `project_ids` once, whatever
+/// `project_id` says, or else the one of `project_id`, or `None` for every
+/// project.
 async fn searched_projects(
     app: &AppCtx,
     project_id: Option<String>,
     project_ids: Option<Vec<String>>,
 ) -> ApiResult<Option<Vec<String>>> {
-    match (project_id, project_ids) {
-        (Some(_), Some(_)) => Err(ApiError::bad_request("pass project_id or project_ids, not both")),
-        (None, Some(ids)) if ids.is_empty() => Err(ApiError::bad_request("project_ids names no project")),
-        (None, Some(ids)) => {
+    match project_ids {
+        Some(ids) if ids.is_empty() => Err(ApiError::bad_request("project_ids names no project")),
+        Some(ids) => {
             let mut live: Vec<String> = Vec::with_capacity(ids.len());
             for id in ids {
                 let id = canonical(&app.runtime.store, &id).await.map_err(ApiError::internal)?;
@@ -1559,7 +1560,7 @@ async fn searched_projects(
             }
             Ok(Some(live))
         }
-        (project_id, None) => Ok(live_project(app, project_id).await?.map(|id| vec![id])),
+        None => Ok(live_project(app, project_id).await?.map(|id| vec![id])),
     }
 }
 
@@ -3173,10 +3174,10 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
         other => format!(" --profile {}", other.as_str()),
     };
     format!(
-        "clawg reads the files of the projects the user added, and of the one a bridge was \
-         started in when that folder has a .git or a manifest and is not the home directory or a \
-         filesystem root; {root} is neither. Ask the user to run `clawg projects add \"{root}\"{flag}` \
-         if they want it searched, then call again",
+        "clawg reads the files of the projects the user added, and of a folder the MCP client has \
+         open or a bridge was started in when that folder has a .git or a manifest and is not the \
+         home directory or a filesystem root; {root} is neither. Ask the user to run `clawg projects \
+         add \"{root}\"{flag}` if they want it searched, then call again",
         root = root.display()
     )
 }
@@ -3304,6 +3305,14 @@ mod tests {
         let root = std::path::Path::new("/work/other");
         assert!(not_accepted(root, Profile::Prod).contains("`clawg projects add \"/work/other\"`"));
         assert!(not_accepted(root, Profile::Dev).contains("`clawg projects add \"/work/other\" --profile dev`"));
+    }
+
+    /// A folder the MCP client has open is read as the bridge's own
+    /// directory is, so the refusal names both.
+    #[test]
+    fn the_refusal_names_what_is_read_without_the_user_adding_it() {
+        let refusal = not_accepted(std::path::Path::new("/work/other"), Profile::Prod);
+        assert!(refusal.contains("a folder the MCP client has open or a bridge was started in"), "{refusal}");
     }
 
     #[test]
