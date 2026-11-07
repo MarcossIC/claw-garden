@@ -16,7 +16,7 @@ Detalle, la prueba con Cursor y las decisiones en la [exploración](exploration.
 
 ## Objetivo que sirve
 
-2, porque una memoria tiene que caer en su proyecto, y 4, porque Cursor es el segundo cliente de la meta de esta etapa ([ROADMAP](../../ROADMAP.md)): sin esto, lo que guarda cae en un proyecto que no existe y lo que busca no ve el de la ventana.
+2, porque una memoria tiene que caer en su proyecto, y 4, porque Cursor es el segundo cliente de la meta de esta etapa ([ROADMAP](../../../ROADMAP.md)): sin esto, lo que guarda cae en un proyecto que no existe y lo que busca no ve el de la ventana.
 
 ## Decisiones
 
@@ -28,7 +28,7 @@ Las tres de la exploración, cerradas allí, no se reabren: **B para guardar y A
 4. **Un save nombra siempre su proyecto,** con cualquier cliente: `project_path`, `project` o `all_projects`. Sin ninguno, `save_memory` se niega sin llamar al daemon, y la frase lista las carpetas abiertas como opciones de `project_path`, en el idioma de la sesión. Sin carpetas abiertas, dice que pase la carpeta del proyecto. El resto de `save_memory` no cambia.
 5. **`search_memory` sin `project` ni `project_path` lee las carpetas abiertas.** Ninguna: todos los proyectos, como hoy sin proyecto. Una: su proyecto, como hoy el del directorio. Varias: **el grupo**, cada proyecto con la regla de hoy (sus filas, las sin proyecto y toda `user_preference`). Con varias carpetas abiertas y sin `project` ni `project_path` (un grupo, o todos con `all_projects`), cada hit dice su proyecto, ` project=<id>` después del puntaje, cuando su fila tiene uno: es el id que `project` acepta para guardar ahí. Con una carpeta o ninguna, o nombrando el proyecto, cada hit se muestra como hoy.
 6. **El grupo es del core.** El predicado de proyecto pasa a atar una lista JSON de ids en lugar de un id (`m.project_id IN (SELECT value FROM json_each(?))`), con la misma regla, y un proyecto es una lista de uno. `SearchScope` guarda la lista (`with_project` sigue igual y suma `with_projects`), y lo usan todas las consultas que hoy usan el predicado, así la regla vive en un solo lugar. `POST /v1/search` toma `project_ids`, que no va con `project_id`, y cada id pasa por `live_project` como el de hoy. El conteo del otro idioma de esa búsqueda cuenta el grupo.
-7. **La clave de un hit en un grupo.** `topic=K` se muestra donde un save la revisaría: con varias carpetas, en una fila de cualquier proyecto del grupo, porque el hit dice su proyecto y un save con ese `project` la revisa. La regla de hoy (`revised_from`, `tools.rs:178`) compara con un proyecto; pasa a comparar con los proyectos de las carpetas, y con uno solo da lo mismo que hoy. Una fila sin proyecto ya no muestra la clave cuando no hay proyecto, porque un save nombra el suyo y sólo uno con `all_projects` la revisa: una preferencia sin proyecto sigue mostrando `all_projects` (PM8 de [`specs/mcp`](../../specs/mcp/spec.md)), ahora desde cualquier puente, y cualquier otra, ninguna clave (BI5).
+7. **La clave de un hit en un grupo.** `topic=K` se muestra donde un save la revisaría: con varias carpetas, en una fila de cualquier proyecto del grupo, porque el hit dice su proyecto y un save con ese `project` la revisa. La regla de hoy (`revised_from`, `tools.rs:178`) compara con un proyecto; pasa a comparar con los proyectos de las carpetas, y con uno solo da lo mismo que hoy. Una fila sin proyecto ya no muestra la clave cuando no hay proyecto, porque un save nombra el suyo y sólo uno con `all_projects` la revisa: una preferencia sin proyecto sigue mostrando `all_projects` (PM8 de [`specs/mcp`](../../../specs/mcp/spec.md)), ahora desde cualquier puente, y cualquier otra, ninguna clave (BI5).
 8. **Las otras herramientas que leen** (lo que la exploración deja para la propuesta). Lo coherente con `search_memory` es usar las carpetas abiertas, y así lo hacen todas; difieren sólo con varias carpetas, cuando la respuesta es de un proyecto y un grupo no la tiene:
 
    | Herramienta | Con varias carpetas y sin `project` ni `project_path` | Por qué |
@@ -57,11 +57,11 @@ Las tres de la exploración, cerradas allí, no se reabren: **B para guardar y A
 ## Fuera de alcance
 
 - Qué preferencias entran solas a una sesión: el workspace, su consulta y el contexto de un grupo. Por eso `recall_context` no arma un grupo (decisión 8).
-- El hook `session-start`: con Cursor ya lee `workspace_roots` y no adivina con varias ([`specs/hooks`](../../specs/hooks/spec.md), CU7 de client-setup-cursor); con Claude Code sigue tomando su `cwd`, también si es el directorio personal.
+- El hook `session-start`: con Cursor ya lee `workspace_roots` y no adivina con varias ([`specs/hooks`](../../../specs/hooks/spec.md), CU7 de client-setup-cursor); con Claude Code sigue tomando su `cwd`, también si es el directorio personal.
 - `notifications/roots/list_changed`: Cursor no la manda, y pedir las raíces en cada llamada la hace innecesaria.
 - Un `.cursor/mcp.json` por repositorio (enfoque C, descartado en la exploración).
 - Mover las memorias que ya están en el proyecto del directorio personal: `update_memory` con `to_project_path` lo hace fila por fila, y `clawg projects` mueve un proyecto entero.
-- [preference-model](../archive/2026-11-06-preference-model/proposal.md), que se cierra aparte; subir la versión y archivar.
+- [preference-model](../2026-11-06-preference-model/proposal.md), que se cierra aparte; subir la versión y archivar.
 
 ## Cómo se mide el éxito
 

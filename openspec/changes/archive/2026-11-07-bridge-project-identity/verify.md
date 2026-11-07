@@ -106,7 +106,12 @@ Cursor 3.29.9 en Windows, conectado con los argumentos que escribe `clawg setup 
 
 ## Pendiente en prod
 
-- **Claude Code**, en el piloto del [ROADMAP](../../ROADMAP.md): con una carpeta, lo que lee es lo de antes, declare `roots` o no; un save sin proyecto se rechaza y el agente lo repite con `project_path`. Durante la prueba, el clawg instalado era 0.77.0, sin este cambio.
+- **Claude Code**, en el piloto del [ROADMAP](../../../ROADMAP.md): con una carpeta, lo que lee es lo de antes, declare `roots` o no; un save sin proyecto se rechaza y el agente lo repite con `project_path`. Durante la prueba, el clawg instalado era 0.77.0, sin este cambio.
+
+## Al archivar (2026-11-07)
+
+- BI1 a BI5 y BI7 a BI10 pasan a [`specs/mcp`](../../../specs/mcp/spec.md), con sus definiciones y `project=` entre los marcadores, y cambian ahí PM4 (un save sin `all_projects` nombra su proyecto), PM8 y «La clave de tema en las herramientas» (una fila sin proyecto no muestra su clave desde ningún puente), y los pares de `memory_status`. BI6 pasa a [`specs/retrieval`](../../../specs/retrieval/spec.md). En [`specs/project`](../../../specs/project/spec.md), R3 deja de dar al puente el proyecto de su directorio como el de un save, y R6 pide `index_docs` para una carpeta abierta y no sólo para la raíz del puente. En [`specs/project-docs`](../../../specs/project-docs/spec.md) se acepta sola una carpeta abierta, y cambian la frase del 403 y lo que dice `project_path` de `search_project`.
+- Todo el código del cambio está en `v0.78.0`, el merge de #135. La versión sube igual a 0.79.0, porque archivar un cambio de openspec sube el minor.
 
 ## Veredicto
 

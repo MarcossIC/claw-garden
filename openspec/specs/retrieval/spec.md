@@ -23,6 +23,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo «AL5. Las notas del contexto en el idioma del pedido», las respuestas vacías en español en el parser de `rag-eval --agent-view`, AL7 de esa spec, y el idioma de la NOTE, de la línea de omitidos y del bloque `BUDGET`; lo que el puente responde en español está en [`specs/mcp`](../mcp/spec.md), AL1 a AL4).
 - [session-start-context](../../changes/archive/2026-11-04-session-start-context/proposal.md), archivado el 2026-11-04, que salió en 0.76.0 (SC1 a SC5 de esa spec, con esos nombres, y lo que cambian en «Definiciones», «El prompt cumple el presupuesto» y «Lo cortado se nombra por id»; SC6 está en [`specs/synthesis`](../synthesis/spec.md), R8, y el bloque `workspace` de `context.cut`, en [`specs/metrics`](../metrics/spec.md), R14).
 - [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0 (PM1, PM2, PM3, PM5 y PM7 de esa spec, con esos nombres; las tres definiciones de las preferencias, y lo que cambian en «Hits de otros agentes», «Línea de hit en `recall_context`», «El parser de `rag-eval --agent-view`» y «Fuera de esta spec»). Dónde se muestra la marca y el sello de un save que repite una fila están en [`specs/provenance`](../provenance/spec.md), PM5 y PM9; `all_projects`, el protocolo y la clave de una preferencia sin proyecto, en [`specs/mcp`](../mcp/spec.md), PM4, PM6 y PM8.
+- [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (sólo BI6 de esa spec, con ese nombre). De qué carpetas sale el grupo y cómo lo muestra el puente está en [`specs/mcp`](../mcp/spec.md), BI1 a BI5.
 
 ## Definiciones
 
@@ -170,6 +171,17 @@ Cuando no queda ninguna línea, `search_memory` MUST responder la frase de abste
 - THEN `search_memory` dice `no memories found`
 
 **Tests:** `search_request_carries_the_relevance_ratio` y `a_search_answer_without_withheld_still_parses` (`client.rs`, mod tests); `relevant_hits_keeps_the_ones_the_cut_lets_through_in_order`, `the_search_output_shows_only_the_relevant_hits`, `search_says_when_nothing_was_relevant` y `nothing_stored_is_not_called_irrelevant` (`tools.rs`, mod tests); `search_memory_tells_nothing_relevant_from_nothing_stored` y `search_with_nothing_stored_says_so_without_failing` (`crates/clawg-cli/src/mcp/server.rs`).
+
+## BI6. La búsqueda de un grupo
+
+Un grupo son dos o más proyectos que una búsqueda lee a la vez; el puente lo arma con las carpetas que el cliente tiene abiertas ([`specs/mcp`](../mcp/spec.md), BI5). El predicado de proyecto (`memory_project_predicate!`, y el de `episodic_trajectory` y `procedural_skill` en las consultas de búsqueda, `table_project_predicate!`, `crates/clawg-core/src/memory/search.rs`) MUST atar una lista JSON de ids o NULL (`projects_bind`): con NULL, todas las filas; con una lista, las de cada proyecto de la lista, las sin proyecto y, en `memory`, toda `user_preference`. Un proyecto MUST atarse como una lista de uno, en cada consulta que usa el predicado. `SearchScope` MUST guardar la lista (`with_project` para uno, `with_projects` para varios). `POST /v1/search` MUST tomar `project_ids`, una lista de ids que pasan cada uno por `live_project` (`SearchRequest.project_ids` y `searched_projects`, `crates/clawg-cli/src/daemon/api.rs`); con `project_id` y `project_ids` a la vez MUST leer el grupo, y una lista vacía MUST responder 400. El conteo del otro idioma de esa búsqueda ([LP7](#lp7-other_language-en-la-búsqueda-y-el-contexto)) MUST contar el mismo grupo (`count_saves_in_projects`, `crates/clawg-core/src/memory/language.rs`). Lo que lee una consulta con un proyecto MUST NOT cambiar. La búsqueda de un grupo es una sola, con un ranking y los cupos de candidatos compartidos, y no una por proyecto juntadas por puntaje.
+
+#### Escenario: un grupo en el core
+- GIVEN filas en los proyectos `p`, `q` y `r`, una sin proyecto y una `user_preference` de `r`
+- WHEN se busca con el grupo `p`, `q`
+- THEN vuelven las de `p` y `q`, la sin proyecto y la preferencia, y no el resto de `r`
+
+**Tests:** `a_group_scope_reads_each_of_its_projects` (`search.rs`), `counting_a_group_counts_each_of_its_projects` (`language.rs`), `a_search_takes_a_group_of_projects`, `a_group_wins_over_the_project_of_a_search` y, con un proyecto unido a otro, `every_route_that_takes_a_project_follows_a_merge` (`crates/clawg-cli/tests/api.rs`). Los tests del core que buscan, cuentan pares o arman un contexto con un proyecto pasan sin cambiar lo que esperan, y los de `EXPLAIN QUERY PLAN` siguen viendo la tabla que manda.
 
 ## Identificadores de la consulta
 
