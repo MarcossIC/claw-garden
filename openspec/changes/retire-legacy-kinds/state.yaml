@@ -1,13 +1,13 @@
 change: retire-legacy-kinds
 objective: "1"
 depends_on: []
-phase: proposal  # exploración cerrada: toca escribir la propuesta del enfoque A
+phase: apply
 artifacts:
   exploration: done  # con el resultado de la puerta y las cuatro decisiones tomadas
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  proposal: done  # enfoque A; umbral de rag-eval --diff fijado: ningún caso se mueve
+  spec: done  # R1 a R10
+  design: done  # D1 a D9
+  tasks: done  # partes 1 a 6; la 7 (archivo) queda fuera
   apply: pending
   verify: pending
   archive: pending
@@ -18,4 +18,5 @@ decisions:
   old_ids: rewritten  # en la misma transacción que migra la fila
   deleted_rows: migrated  # también las que ningún diario anotó
   old_kind: error  # desde la primera versión, sin versión de tolerancia
-updated: 2026-11-06
+updated: 2026-11-07
+main_spec: openspec/specs/storage/spec.md, openspec/specs/retrieval/spec.md, openspec/specs/project/spec.md, openspec/specs/restore/spec.md, openspec/specs/secrets/spec.md, openspec/specs/portability/spec.md, openspec/specs/doctor/spec.md, openspec/specs/mcp/spec.md, openspec/specs/eval/spec.md
