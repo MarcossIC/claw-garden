@@ -107,8 +107,8 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "recall_context",
         Some("project_path"),
-        "Ruta absoluta del proyecto. Por defecto, el proyecto de la carpeta abierta en el cliente, o del directorio \
-         en el que arrancó este puente cuando no nombra ninguna; con varias abiertas, pasa esta o project.",
+        "Ruta absoluta del proyecto. Por defecto, la carpeta que el cliente tiene abierta, o si no el directorio en \
+         el que arrancó este puente; con varias abiertas, pasa aquella en la que trabajas.",
     ),
     (
         "recall_context",
@@ -172,8 +172,9 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
          preferencia que dijo o una decisión que se tomó. Guarda una cosa por llamada, en pocas frases: un texto \
          largo se parte en piezas que la búsqueda encuentra de a una, y read_memory lo devuelve entero. Empieza con \
          una primera línea que nombre el tema, y después di qué, por qué y dónde, con las rutas e identificadores \
-         exactos. Escríbelo para que tenga sentido dentro de meses, sin ninguna conversación alrededor. Devuelve el \
-         id de cada pieza guardada, que aceptan update_memory y delete_memory, o por qué no se guardó nada.",
+         exactos. Escríbelo para que tenga sentido dentro de meses, sin ninguna conversación alrededor. Nombra a \
+         dónde va con project_path, project o all_projects. Devuelve el id de cada pieza guardada, que aceptan \
+         update_memory y delete_memory, o por qué no se guardó nada.",
     ),
     (
         "save_memory",
@@ -208,8 +209,8 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "save_memory",
         Some("project_path"),
-        "Ruta absoluta de una carpeta del proyecto al que pertenece esta memoria, como el repositorio del que \
-         trata. Un save nombra su proyecto con esta, con project o con all_projects; sin ninguno se rechaza.",
+        "Ruta absoluta de una carpeta del proyecto al que pertenece esta memoria, como una que el cliente tiene \
+         abierta. Todo save pasa project_path, project o all_projects.",
     ),
     (
         "save_memory",
@@ -234,7 +235,8 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
          relevancia a la mejor (al menos dos), con sus ids, tipos de fila y puntajes; una lista corta significa que \
          el resto puntuó mucho más bajo, no que no haya nada más guardado. El contenido de más de 500 caracteres se \
          recorta. Un hit marcado piece=K/N es la pieza K, la que mejor coincide, de un texto largo guardado en N \
-         piezas; read_memory con su id devuelve el texto entero.",
+         piezas; read_memory con su id devuelve el texto entero. Con varias carpetas abiertas en el cliente busca \
+         en todas, y cada hit nombra su proyecto después de project=.",
     ),
     (
         "search_memory",
@@ -246,8 +248,8 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "search_memory",
         Some("project_path"),
-        "Ruta absoluta del proyecto en el que buscar. Por defecto, los proyectos de las carpetas abiertas en el \
-         cliente, o del directorio en el que arrancó este puente cuando no nombra ninguna.",
+        "Ruta absoluta del proyecto en el que buscar. Por defecto, las carpetas que el cliente tiene abiertas, o si \
+         no el directorio en el que arrancó este puente; con varias abiertas busca en todas.",
     ),
     (
         "search_memory",
@@ -268,9 +270,9 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "search_project",
         Some("project_path"),
-        "Ruta absoluta del proyecto. Por defecto, el proyecto de la carpeta abierta en el cliente, o del directorio \
-         en el que arrancó este puente cuando no nombra ninguna; con varias abiertas, pasa esta o project. En los \
-         archivos de otro proyecto sólo se busca una vez que la persona lo agregó con `clawg projects add`.",
+        "Ruta absoluta del proyecto. Por defecto, la carpeta que el cliente tiene abierta, o si no el directorio en \
+         el que arrancó este puente; con varias abiertas, pasa aquella por la que preguntas. En una carpeta que no \
+         está abierta sólo se busca una vez que la persona la agregó con `clawg projects add`.",
     ),
     (
         "search_project",
@@ -297,9 +299,8 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "synthesize",
         Some("project_path"),
-        "Ruta absoluta del proyecto a revisar. Por defecto, el proyecto de la carpeta abierta en el cliente, o del \
-         directorio en el que arrancó este puente cuando no nombra ninguna; con varias abiertas, pasa esta o \
-         project.",
+        "Ruta absoluta del proyecto a revisar. Por defecto, la carpeta que el cliente tiene abierta, o si no el \
+         directorio en el que arrancó este puente; con varias abiertas, pasa una, o all_projects.",
     ),
     (
         "update_memory",
@@ -380,14 +381,15 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "answer_suggestion",
         Some("project"),
-        "Este proyecto por su id o su nombre. Por defecto, el proyecto de la carpeta abierta en el cliente, o del \
-         directorio en el que arrancó este puente cuando no nombra ninguna.",
+        "Este proyecto por su id o su nombre. Por defecto, la carpeta que el cliente tiene abierta, o si no el \
+         directorio en el que arrancó este puente; con varias abiertas, pásalo.",
     ),
     (
         "save_memory",
         Some("project"),
-        "El proyecto de esta memoria por su id o su nombre, para uno sin carpeta aquí, como una idea. Un nombre \
-         que ningún proyecto tiene ni se le parece crea el proyecto. No con project_path.",
+        "El proyecto de esta memoria por su id o su nombre, como lo nombra un hit después de project=, o para uno \
+         sin carpeta aquí, como una idea. Un nombre que ningún proyecto tiene ni se le parece crea el proyecto. No \
+         con project_path.",
     ),
     (
         "save_memory",
@@ -395,14 +397,14 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
         "True sólo cuando la persona dijo que un nombre parecido al de otros proyectos es un proyecto aparte: lo \
          crea aparte. Sólo con project.",
     ),
-    ("search_memory", Some("project"), "Para uno sin carpeta aquí o que no está abierto en el cliente, el proyecto por su id o su nombre. \
-         No con project_path."),
-    ("recall_context", Some("project"), "Para uno sin carpeta aquí o que no está abierto en el cliente, el proyecto por su id o su nombre. \
-         No con project_path."),
-    ("search_project", Some("project"), "Para uno sin carpeta aquí o que no está abierto en el cliente, el proyecto por su id o su nombre. \
-         No con project_path."),
-    ("synthesize", Some("project"), "Para uno sin carpeta aquí o que no está abierto en el cliente, el proyecto por su id o su nombre. \
-         No con project_path."),
+    ("search_memory", Some("project"), "Para uno sin carpeta aquí o que no es el de este directorio, el proyecto por su id o su nombre. No con \
+         project_path."),
+    ("recall_context", Some("project"), "Para uno sin carpeta aquí o que no es el de este directorio, el proyecto por su id o su nombre. No con \
+         project_path."),
+    ("search_project", Some("project"), "Para uno sin carpeta aquí o que no es el de este directorio, el proyecto por su id o su nombre. No con \
+         project_path."),
+    ("synthesize", Some("project"), "Para uno sin carpeta aquí o que no es el de este directorio, el proyecto por su id o su nombre. No con \
+         project_path."),
     (
         "update_memory",
         Some("to_project"),

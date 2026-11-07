@@ -6,84 +6,86 @@
 
 ## Problema
 
-Detalle y evidencia en la [exploración](exploration.md), verificado otra vez contra `develop` (`27c4a88e`).
+Detalle, la prueba con Cursor y las decisiones en la [exploración](exploration.md); verificado otra vez contra `develop` (`27c4a88`):
 
-- **El puente decide una vez, con el directorio donde arrancó.** `ClawgMcp::pending` fija `default_project` con `std::env::current_dir()` (`crates/clawg-cli/src/mcp/server.rs:535`), y cada herramienta sin `project` ni `project_path` lo usa (`resolve_project`, `crates/clawg-cli/src/mcp/tools.rs:1026`). Cursor arranca el proceso en el directorio personal del usuario en los 22 arranques medidos, así que todo lo que guarda o busca sin proyecto va a un proyecto «directorio personal».
-- **No pide las raíces del cliente.** No hay `roots/list` en `crates/clawg-cli/src`. Cursor las da: una por carpeta de cada ventana abierta, también en un workspace de varios repositorios, y sin avisar cuando cambian (`roots.listChanged: false`).
-- **Un save cae en un proyecto adivinado.** Sin `project` ni `project_path`, `save_memory_impl` guarda en el proyecto del directorio (`server.rs:1083-1090`). Pasa también en Claude Code, donde una conversación puede tratar de otro proyecto que el de su directorio.
-- **Una búsqueda va a un proyecto o a todos.** `POST /v1/search` toma un `project_id` (`SearchRequest`, `crates/clawg-cli/src/daemon/api.rs:422`) y el core un `SearchScope.project_id` (`crates/clawg-core/src/memory/search.rs:26`): buscar en un grupo de proyectos no existe.
-- **Sólo la raíz del puente se indexa sola.** `index_docs` va sólo para la raíz que resolvió el directorio de arranque (`own_root_to_index`, `server.rs:516`; `indexes_docs`, `tools.rs:1045`). En Cursor esa raíz es el directorio personal, que nunca se indexa, así que `search_project` no tiene qué leer.
+- **El puente decide el proyecto una sola vez, con su directorio.** `ClawgMcp::pending` toma `std::env::current_dir()` al crearse (`crates/clawg-cli/src/mcp/server.rs:535`) y lo guarda en `default_project`. Cada herramienta sin `project` ni `project_path` usa ese proyecto (`resolve_project`, `crates/clawg-cli/src/mcp/tools.rs:1026-1039`), también `save_memory` (`server.rs:1089`).
+- **En Cursor ese directorio es el personal del usuario** en los 22 arranques de la prueba, con cualquier combinación de ventanas. Hoy el puente registra esa carpeta como un proyecto y guarda ahí cada memoria de Cursor que no nombra otro.
+- **El puente no pide raíces.** No hay `roots/list` en `crates/clawg-cli/src`. Cursor sí las da: una ventana con un repositorio responde una raíz; dos ventanas, las carpetas de las dos, y siempre la lista actual, sin `notifications/roots/list_changed` (declara `roots.listChanged: false`). Cada raíz llega como ruta de Windows con la unidad en minúscula (`c:\...`), no como URI `file:`.
+- **Una búsqueda va a un proyecto o a todos.** El predicado de proyecto compara con un solo id (`memory_project_predicate!`, `crates/clawg-core/src/memory/search.rs:110`), y `POST /v1/search` toma un solo `project_id` (`SearchRequest`, `crates/clawg-cli/src/daemon/api.rs:422`). Buscar en las carpetas de un workspace de varios repositorios no se puede.
+- **Los documentos de un proyecto sólo se indexan solos si es el directorio del puente** (`own_root_to_index`, `server.rs:516`; `indexes_docs`, `tools.rs:1045`). En Cursor, ningún repositorio abierto lo es.
 
 ## Objetivo que sirve
 
-2, porque una memoria de un repositorio tiene que quedar en ese repositorio y no en otro; 4, porque Cursor es uno de los dos clientes de uso diario. Va en la noche 1 del [ROADMAP](../../ROADMAP.md), antes del piloto que conecta Cursor con `clawg setup cursor`.
+2, porque una memoria tiene que caer en su proyecto, y 4, porque Cursor es el segundo cliente de la meta de esta etapa ([ROADMAP](../../ROADMAP.md)): sin esto, lo que guarda cae en un proyecto que no existe y lo que busca no ve el de la ventana.
 
 ## Decisiones
 
-Las decisiones están cerradas en la exploración ([«Decisiones»](exploration.md#decisiones)): B para guardar y A para leer; todo save sin proyecto se rechaza; `search_memory` con varias raíces busca en todas, y cada hit dice su proyecto. Esta propuesta no las reabre: dice cómo se aplican y cierra los tres puntos de [«Para la propuesta»](exploration.md#para-la-propuesta).
+Las tres de la exploración, cerradas allí, no se reabren: **B para guardar y A para leer**, **todo save sin proyecto se rechaza** y **`search_memory` con varias raíces busca en todas**. Lo que sigue dice cómo se aplican y responde la sección «Para la propuesta».
 
-1. **Las raíces de cada llamada.** En cada llamada a una herramienta, si el cliente declaró la capacidad `roots` (en `initialize`, o en el `_meta` de la llamada en el ciclo `2026-07-28`; `RequestContext::client_capabilities`), el puente le pide `roots/list` y espera la respuesta hasta `ROOTS_WAIT` (3 s). Una respuesta que falla o no llega cuenta como un cliente sin roots, con un warning en el log. A un cliente que no declaró la capacidad no se le pide. No escucha `notifications/roots/list_changed`: Cursor no la manda, y pedirlas en cada llamada ya da la lista actual.
-2. **De una raíz a una carpeta.** Una raíz `file:` se lee como ruta: sin `file://` ni el host `localhost`, con los `%XX` decodificados, y en Windows `/c:/…` queda `c:\…` y otro host es una ruta UNC. Una raíz que no es una URI, como las de Cursor (`c:\…`), se usa como ruta. Una relativa o de otro esquema se descarta. Cada carpeta resuelve con `ProjectIdentity::resolve`, como un `project_path`, así que `c:\x` y `file:///C:/x` llevan a la misma raíz: la canonicalización pone la caja real de la unidad. La lectura de la URI es pura y se prueba sin filesystem.
-3. **El directorio personal nunca es un proyecto.** Ni como directorio de arranque ni como raíz: una carpeta cuya ruta o cuya raíz es el directorio personal, canónico, se descarta. Una carpeta dentro de él, con o sin `.git`, sigue siendo un proyecto, como hoy.
-4. **Dónde lee una llamada sin proyecto.** En las **carpetas de lectura**: las raíces que dio el cliente, si dio alguna que quede; si no, el directorio donde arrancó el puente, salvo el personal; si no, ninguna. Cada una se registra como hoy (`ids_for`, una vez por raíz y camino en el proceso), y dos que llevan al mismo proyecto, como dos clones de un remoto, cuentan una vez. Sin ninguna, lo que lee va sin proyecto, como hoy un puente cuyo `current_dir()` falló.
-5. **Un save dice siempre su proyecto.** `save_memory` sin `project_path`, `project` ni `all_projects` se niega sin llamar al daemon, con una frase en el idioma de la sesión que dice qué pasar y lista las carpetas de lectura como opciones de `project_path`; sin carpetas, sólo los argumentos. No hay más proyecto por defecto para guardar, con ningún cliente.
-6. **`search_memory` en un grupo.** Con dos o más proyectos de lectura, `search_memory` busca en el grupo: `POST /v1/search` toma `project_ids`, y el daemon corre la búsqueda de un proyecto en cada uno con el mismo embedding de la consulta, junta los hits por puntaje, deja uno por fila y uno por save, corta en `limit` y aplica `min_relative_score` antes de registrar los accesos. El puntaje de un hit es el de su fila (`score.rs`), el mismo en las dos búsquedas, así que se comparan. La búsqueda de un proyecto no cambia. El puente manda también `project_id` con el primero del grupo, así un daemon anterior, que ignora `project_ids`, busca en un proyecto y nunca en todos.
-7. **Cada hit de un grupo dice su proyecto.** En una búsqueda en grupo, la línea lleva `project=<id>` después de `score=`, y la clave de la fila, si tiene, porque un save con ese `project` y esa clave la revisa. Una fila sin proyecto no lleva `project=` y su clave sigue la regla de PM8. La línea de una búsqueda en un proyecto, o en todos, queda byte a byte como hoy.
-8. **Las otras herramientas que leen sin proyecto.** `recall_context`, `synthesize`, `search_project` y `answer_suggestion` son de un proyecto: el contexto lleva el workspace, la última sesión y las sugerencias de uno; `synthesize` marca revisadas las memorias que muestra; `search_project` lee el índice de un checkout; `answer_suggestion` responde por uno y puede unir dos. Con un proyecto de lectura usan ese; con varios se niegan, sin buscar ni escribir, con las carpetas de lectura como opciones de `project_path`, como un save; sin ninguno, hacen lo de hoy. Leer de un grupo es de `search_memory`, la herramienta de las preguntas puntuales, que no necesita adivinar el repositorio porque juntar hits no mezcla nada: un contexto o una revisión de un grupo necesitaría un workspace y una última sesión del grupo, que no existen. `memory_status` cuenta los conflictos del proyecto de lectura, o de todos cuando no hay uno. La clave que muestran `read_memory` y una búsqueda con `all_projects` se compara con ese mismo proyecto.
-9. **El índice de una raíz.** Una raíz que declaró el cliente es una carpeta que la persona abrió, como el directorio de arranque: se registra con `index_docs` si es un proyecto que se indexa solo (`auto_indexable`: tiene un `.git` o un manifiesto y no es el directorio personal). Una carpeta que el modelo nombra en `project_path` sigue sin indexarse hasta `clawg projects add`.
-10. **La clave de una fila sin proyecto.** Como ningún save se guarda sin proyecto por omisión, ningún save común revisa una fila sin proyecto: desde cualquier puente, con proyecto o sin él, una `user_preference` sin proyecto muestra `topic=K all_projects` y cualquier otra fila sin proyecto no muestra clave. Cambia la última frase de PM8 en [`specs/mcp`](../../specs/mcp/spec.md), que dejaba ver `topic=K` desde un puente sin proyecto.
-11. **Lo que ve el modelo.** La apertura del protocolo cambia una oración: «Memories are scoped to the current project unless you say otherwise.» pasa a «Name each save's project: `project_path`, `project` or `all_projects`.», y en español «Las memorias son del proyecto actual salvo que digas otra cosa.» pasa a «Nombra el proyecto de cada save: `project_path`, `project` o `all_projects`.». Son 2 caracteres más en inglés, que con `en` deja la apertura en 2.047 de 2.048. «## Projects» y «## Proyectos» dicen dónde lee una llamada sin proyecto, que una búsqueda en varios proyectos marca cada hit con `project=`, y qué herramientas piden uno cuando hay varios. Las descripciones de `project_path` y de `project` dejan de decir «el directorio en el que arrancó este puente». Los dos contratos del agente se bendicen con `CLAWG_BLESS=1`.
+1. **Las raíces se piden en cada llamada.** Cuando el cliente declara `roots` (en `initialize`, o en el `_meta` de la request en el ciclo 2026-07-28), cada llamada de una herramienta que usa un proyecto por defecto manda `roots/list` y espera la respuesta como mucho 2 s; también la que nombra su proyecto, porque la primera vez que se registra una carpeta abierta se registra con su índice de documentos (decisión 9). No se guarda para la siguiente: Cursor no avisa cuando cambian. Un cliente que no declara `roots` no recibe el pedido. Un error, un plazo vencido o una respuesta sin carpetas cuentan como un cliente sin raíces. `rmcp` marca `list_roots` como obsoleto (SEP-2577, `rmcp-3.5.1/src/service/server.rs:939-943`); el puente lo usa con un `#[expect(deprecated)]` que dice por qué: es lo único que dice qué carpetas tiene abiertas Cursor.
+2. **Una raíz es una carpeta.** Un `uri` `file:` se lee como camino, con los `%XX` decodificados, el host vacío o `localhost`, y en Windows la unidad sin la barra de adelante (`file:///c:/x` es `c:/x`). Cualquier otro texto se toma como camino si es absoluto en esta máquina, que es lo que manda Cursor; si no, se ignora. Después, cada carpeta se resuelve como un `project_path` (`ProjectIdentity::resolve`): la misma carpeta escrita de las dos formas da el mismo proyecto.
+3. **Las carpetas abiertas.** Son las raíces del cliente, resueltas, sin repetir la misma raíz y sin el directorio personal. Si no queda ninguna, el directorio donde arrancó el puente, salvo que su raíz sea el directorio personal. **El directorio personal nunca es un proyecto**: ni como raíz ni como directorio. Puede no haber ninguna carpeta abierta.
+4. **Un save nombra siempre su proyecto,** con cualquier cliente: `project_path`, `project` o `all_projects`. Sin ninguno, `save_memory` se niega sin llamar al daemon, y la frase lista las carpetas abiertas como opciones de `project_path`, en el idioma de la sesión. Sin carpetas abiertas, dice que pase la carpeta del proyecto. El resto de `save_memory` no cambia.
+5. **`search_memory` sin `project` ni `project_path` lee las carpetas abiertas.** Ninguna: todos los proyectos, como hoy sin proyecto. Una: su proyecto, como hoy el del directorio. Varias: **el grupo**, cada proyecto con la regla de hoy (sus filas, las sin proyecto y toda `user_preference`). Con varias carpetas abiertas y sin `project` ni `project_path` (un grupo, o todos con `all_projects`), cada hit dice su proyecto, ` project=<id>` después del puntaje, cuando su fila tiene uno: es el id que `project` acepta para guardar ahí. Con una carpeta o ninguna, o nombrando el proyecto, cada hit se muestra como hoy.
+6. **El grupo es del core.** El predicado de proyecto pasa a atar una lista JSON de ids en lugar de un id (`m.project_id IN (SELECT value FROM json_each(?))`), con la misma regla, y un proyecto es una lista de uno. `SearchScope` guarda la lista (`with_project` sigue igual y suma `with_projects`), y lo usan todas las consultas que hoy usan el predicado, así la regla vive en un solo lugar. `POST /v1/search` toma `project_ids`, que no va con `project_id`, y cada id pasa por `live_project` como el de hoy. El conteo del otro idioma de esa búsqueda cuenta el grupo.
+7. **La clave de un hit en un grupo.** `topic=K` se muestra donde un save la revisaría: con varias carpetas, en una fila de cualquier proyecto del grupo, porque el hit dice su proyecto y un save con ese `project` la revisa. La regla de hoy (`revised_from`, `tools.rs:178`) compara con un proyecto; pasa a comparar con los proyectos de las carpetas, y con uno solo da lo mismo que hoy. Una fila sin proyecto sigue mostrando la clave sólo cuando no hay proyecto, y una preferencia sin proyecto sigue mostrando `all_projects` (PM8 de [`specs/mcp`](../../specs/mcp/spec.md)).
+8. **Las otras herramientas que leen** (lo que la exploración deja para la propuesta). Lo coherente con `search_memory` es usar las carpetas abiertas, y así lo hacen todas; difieren sólo con varias carpetas, cuando la respuesta es de un proyecto y un grupo no la tiene:
+
+   | Herramienta | Con varias carpetas y sin `project` ni `project_path` | Por qué |
+   |---|---|---|
+   | `recall_context` | Se niega, lista las carpetas y dice que `search_memory` busca en todas | Su respuesta es de un proyecto: el workspace de ese proyecto, su LAST SESSION y sus sugerencias. Armarla para un grupo cambia qué preferencias entran solas, que queda fuera |
+   | `synthesize` sin `all_projects` | Igual que `recall_context` | Marca revisado un proyecto (`synthesis_review`, `crates/clawg-core/src/memory/synthesis.rs:146-150`); un grupo no tiene marca |
+   | `search_project` | Igual | El índice es de una carpeta y rankea sus pasajes contra sí mismos |
+   | `answer_suggestion` | Igual | Es una respuesta de la persona sobre un proyecto |
+   | `memory_status` | Cuenta los pares de todos los proyectos | No toma argumentos, y no puede fallar por una línea |
+   | `read_memory` | Muestra la clave de una fila de cualquiera de los proyectos | La misma regla que `search_memory` (decisión 7) |
+
+   Con una carpeta, cada una hace lo de hoy con el directorio; sin ninguna, lo de hoy sin proyecto. `list_memories`, `delete_memory`, `restore_memory`, `update_memory` y `resolve_conflict` no usan un proyecto por defecto y no piden raíces.
+9. **Los documentos de las carpetas abiertas.** Una carpeta abierta se registra con `index_docs` si tiene `.git` o un manifiesto y no es el directorio personal (`auto_indexable`, `crates/clawg-core/src/memory/project_docs/corpus.rs:26`), como hoy el directorio del puente: es una carpeta que la persona abrió. Cualquier otro camino que nombre el modelo sigue siendo una etiqueta hasta `clawg projects add`.
+10. **Lo que ve el modelo.** Las descripciones de `project_path` y `project` de `save_memory` dicen que nombrar uno de los tres es obligatorio; las de las herramientas que leen, que sin él leen las carpetas que el cliente tiene abiertas, o el directorio, y qué hacen con varias. La de `search_memory` dice que con varias carpetas busca en todas y que cada hit nombra su proyecto. La apertura del protocolo y su sección «Projects», en los dos idiomas: un save nombra su proyecto, y con varias carpetas se pasa `project_path`. `agent_contract.json` y `agent_contract.es.json` se bendicen con `CLAWG_BLESS=1`, y el diff va en el pull request.
 
 ## Alcance
 
-1. `crates/clawg-cli/src/mcp/server.rs`: las raíces de la llamada (`roots/list`), las carpetas de lectura, el save que exige su proyecto, la búsqueda en grupo, la negativa con varias de las otras herramientas, `index_docs` de una raíz y las descripciones.
-2. `crates/clawg-cli/src/mcp/roots.rs`, nuevo: de una raíz a una ruta, y el directorio personal.
-3. `crates/clawg-cli/src/mcp/mod.rs`: el directorio de arranque y el personal llegan al servidor como argumentos, para que un test los elija.
-4. `crates/clawg-cli/src/mcp/tools.rs`: `project=` en un hit de un grupo, la regla de la clave de una fila sin proyecto e `indexes_docs` con varias carpetas.
-5. `crates/clawg-cli/src/mcp/tools_es.rs`, `protocol.md` y `protocol.es.md`; `agent_contract.json` y `agent_contract.es.json`, bendecidos.
-6. `crates/clawg-cli/src/client.rs`: `SearchArgs.project_ids`. `crates/clawg-cli/src/daemon/api.rs`: `project_ids` en `POST /v1/search`.
-7. `crates/clawg-core/src/memory/search.rs`: la búsqueda en un grupo (`search_projects`).
-8. Los tests que guardaban sin proyecto pasan el suyo: `server.rs`, `crates/clawg-cli/tests/binary.rs`.
-9. Docs: `docs/reference/daemon.md` y `docs/reference/data-profiles.md`. `specs/mcp`, `specs/project` y `specs/project-docs` reciben los requisitos de la [spec](spec.md) al archivar.
-10. Lo que el CI del pull request marque en Windows.
+1. `crates/clawg-cli/src/mcp/roots.rs`, nuevo: leer una raíz, las carpetas abiertas (puro, con el resolvedor como argumento) y el pedido de `roots/list` con su plazo.
+2. `crates/clawg-cli/src/mcp/server.rs`: las raíces de cada llamada en un clon del servidor, el save sin proyecto, el grupo de `search_memory`, las herramientas de la decisión 8, el directorio personal y el índice de documentos. `tools.rs` y `tools_es.rs`: las frases, la marca de proyecto y la clave contra varios proyectos.
+3. `crates/clawg-core/src/memory/search.rs`: el predicado con una lista y `SearchScope`; `language.rs`, `dispute.rs`, `crowding.rs`, `prompt_builder.rs` y `eval_api.rs` atan la lista. `crates/clawg-cli/src/daemon/api.rs` y `client.rs`: `project_ids` en la búsqueda.
+4. `protocol.md`, `protocol.es.md` y los dos contratos, bendecidos.
+5. Docs: `docs/reference/daemon.md` (herramientas MCP y la búsqueda) y `docs/reference/data-profiles.md` (de dónde sale el proyecto del puente).
+6. `openspec`: esta propuesta, la [spec](spec.md), las [tareas](tasks.md), `verify.md`, `state.yaml` y la línea de `ROADMAP.md`. Los requisitos van a `specs/mcp` y `specs/retrieval` al archivar, que queda fuera.
+7. Lo que el CI del pull request marque en Windows.
 
 ## Fuera de alcance
 
-- Qué preferencias entran solas a una sesión, y [preference-model](../archive/2026-11-06-preference-model/proposal.md), que se cierra aparte.
-- Escuchar `notifications/roots/list_changed`, o guardar las raíces entre llamadas.
-- Un contexto, una síntesis, un índice de documentos o una respuesta a una sugerencia sobre un grupo de proyectos.
-- Marcar el proyecto en una búsqueda sin proyecto o con `all_projects`, y en `recall_context`.
-- La línea del otro idioma en una búsqueda en grupo: el daemon no cuenta `other_language` para un grupo.
-- Dejar de pedir las raíces a un cliente que una vez no las dio a tiempo: espera a que aparezca uno.
-- Los hooks, que siguen leyendo el `cwd` de su entrada.
+- Qué preferencias entran solas a una sesión: el workspace, su consulta y el contexto de un grupo. Por eso `recall_context` no arma un grupo (decisión 8).
+- El hook `session-start`: con Cursor ya lee `workspace_roots` y no adivina con varias ([`specs/hooks`](../../specs/hooks/spec.md), CU7 de client-setup-cursor); con Claude Code sigue tomando su `cwd`, también si es el directorio personal.
+- `notifications/roots/list_changed`: Cursor no la manda, y pedir las raíces en cada llamada la hace innecesaria.
 - Un `.cursor/mcp.json` por repositorio (enfoque C, descartado en la exploración).
-- Mover las memorias que ya cayeron en el proyecto del directorio personal: `update_memory` con `to_project_path` y `clawg projects move` ya lo hacen.
-- Subir la versión y archivar.
+- Mover las memorias que ya están en el proyecto del directorio personal: `update_memory` con `to_project_path` lo hace fila por fila, y `clawg projects` mueve un proyecto entero.
+- [preference-model](../archive/2026-11-06-preference-model/proposal.md), que se cierra aparte; subir la versión y archivar.
 
 ## Cómo se mide el éxito
 
-Primero, tests que fallan hoy. Corren con el embedder falso y, los de las raíces, con un cliente MCP de prueba que habla por el stdio del puente y contesta `roots/list`:
+Primero, tests que fallan hoy, con un cliente MCP de prueba que habla por un `duplex` como un host real y declara `roots` o no, en Linux con el embedder falso. Los nombres, en la [spec](spec.md):
 
-- Un save sin `project`, `project_path` ni `all_projects` se rechaza con las raíces como opciones; sin roots, con el directorio de arranque como opción; y no se guarda nada.
-- Una búsqueda sin proyecto con una raíz busca en su proyecto; con dos, en los dos y no en un tercero, cada hit con su `project=`; sin roots, en el directorio de arranque.
-- El directorio personal nunca es un proyecto: ni como directorio de arranque ni como raíz se registra, y un save desde ahí no lo ofrece como opción.
-- Una raíz como ruta y como URI `file:` dan el mismo proyecto; en Windows, también con la unidad en minúscula.
-- Un cambio de raíces entre dos llamadas se ve en la segunda.
-- `recall_context`, `synthesize`, `search_project` y `answer_suggestion` sin proyecto, con dos proyectos de lectura, se niegan nombrando las dos carpetas.
-- Una raíz que es un repositorio se registra con `index_docs`, y `search_project` lee su documentación.
-- `POST /v1/search` con `project_ids` trae lo de cada proyecto del grupo, una fila sin proyecto una sola vez, y nada de un proyecto de afuera.
+- un save sin `project`, `project_path` ni `all_projects` se rechaza con las raíces como opciones, con roots y sin roots;
+- una búsqueda sin proyecto con una raíz busca en su proyecto, con varias en todas y nombra el proyecto de cada hit, y sin roots usa el directorio;
+- el directorio personal nunca es un proyecto: ni como raíz ni como directorio del puente;
+- una raíz como ruta y como URI `file:` dan el mismo proyecto;
+- un cambio de raíces entre dos llamadas se ve en la segunda, sin `list_changed`;
+- un cliente sin la capacidad no recibe ningún `roots/list` y sigue como hoy, salvo el save sin proyecto.
 
 Lo que no puede cambiar:
 
-- La búsqueda de un proyecto o de todos: su consulta, sus hits y su línea, byte a byte.
-- Un cliente que no declara roots no recibe `roots/list`.
-- La suite pasa, y `cargo clippy --workspace --all-targets -- -D warnings` sale con 0 aquí y, por el CI del pull request, en Linux y en Windows.
-- El contrato del agente cambia sólo en la apertura, en las descripciones de `project_path` y `project`, y en los dos idiomas.
+- Una búsqueda de un proyecto, o de todos, devuelve las mismas filas y la misma línea de hit que hoy; los tests de búsqueda, de contexto, de pares y de idioma del core pasan sin cambiar lo que esperan.
+- La suite pasa, y `cargo clippy --workspace --all-targets -- -D warnings` sale con 0 en Linux y, por el CI del pull request, en Windows.
+- El contrato cambia sólo en las descripciones de la decisión 10, en los dos idiomas.
 
-`rag-eval --diff` no aplica: el ranking de un proyecto no cambia, y el agent view busca con un `project_id`.
+`rag-eval --diff` no aplica: el ranking de un proyecto no cambia, y `rag-eval` busca sin proyecto, que tampoco cambia.
 
 Pendiente en local, con Cursor real ([verify](verify.md)): un save desde una ventana con dos repositorios cae en el proyecto que nombró el agente, y una búsqueda con dos ventanas abiertas trae memorias de los dos.
 
 ## Datos y vuelta atrás
 
-No toca el esquema ni reescribe filas. `project_ids` es un campo opcional de `POST /v1/search`. Un puente anterior contra este daemon no lo manda y busca como siempre; este puente contra un daemon anterior manda también `project_id` con el primer proyecto del grupo, y ese daemon busca sólo en él: una búsqueda más angosta, nunca más ancha. La negativa del save es del puente, así que un puente anterior sigue guardando en su directorio. Lo que ya se guardó en el proyecto del directorio personal queda donde está, y se mueve con `update_memory`. Para volver atrás alcanza con el binario anterior.
+No toca el esquema, los identificadores guardados, los estados ni el contrato de embedding, y no reescribe ninguna fila. Las memorias que Cursor ya guardó en el proyecto del directorio personal quedan ahí: se siguen encontrando con `all_projects` y se mueven con `update_memory`. Un binario anterior abre la base sin cambios y vuelve a la conducta de antes.
+
+Un puente anterior contra este daemon no manda `project_ids` y busca como siempre. Este puente contra un daemon anterior manda `project_ids`, que ese daemon ignora, y la búsqueda de un grupo sale sin proyecto, en todos: más ancha, nunca más angosta; se arregla reiniciando el daemon con el binario nuevo. Para volver atrás alcanza con el binario anterior.

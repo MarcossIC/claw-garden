@@ -1,14 +1,14 @@
 change: bridge-project-identity
 objective: "2, 4"
 depends_on: []
-phase: verify  # aplicado en #134 a develop, con el CI en verde; falta Cursor real en local
+phase: verify  # pendiente en local: el save desde Cursor en un workspace con dos repositorios (verify.md)
 artifacts:
   exploration: done  # con el resultado de la prueba con Cursor
-  proposal: done  # cierra los tres puntos de «Para la propuesta»: sólo search_memory lee de un grupo
-  spec: done  # BP1 a BP11; al archivar, BP1 a BP8, BP10 y BP11 van a specs/mcp, BP9 a specs/project-docs y specs/project, y cambian R3 y PL47 de specs/project
-  design: skipped  # las decisiones están cerradas en la exploración; la propuesta dice cómo se aplican
-  tasks: done  # las tareas 3 y 4 fueron un commit (tasks.md, «Frente a lo previsto»)
-  apply: done  # la búsqueda en un grupo; las raíces del cliente, las carpetas de lectura, el save que nombra su proyecto; protocolo y contratos; docs/reference
-  verify: partial  # Windows: la suite y los dos clippy; el CI de #134 en Linux y Windows; pendiente en local el save desde Cursor en un workspace de dos repositorios (verify.md)
+  proposal: done  # las tres decisiones de la exploración y la tabla de las otras herramientas que leen
+  spec: done  # BI1 a BI10
+  design: skipped  # las decisiones se cerraron en la exploración y la propuesta
+  tasks: done
+  apply: done  # un commit por paso, con sus tests en rojo antes
+  verify: partial  # Linux y el CI de Windows pasan; falta lo pendiente en local con Cursor
   archive: pending
 updated: 2026-11-06

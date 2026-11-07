@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory::clock::TimestampMs;
 use crate::memory::provenance::mark;
 use crate::memory::redact::redact;
-use crate::memory::search::{memory_project_predicate, reader_bind, reader_predicate};
+use crate::memory::search::{memory_project_predicate, project_bind, reader_bind, reader_predicate};
 use crate::memory::sharing::Reader;
 use crate::memory::store_insert::MemoryType;
 use crate::memory::{MemoryError, MemoryStore};
@@ -466,7 +466,7 @@ pub async fn open_pairs(
     limit: usize,
 ) -> Result<OpenPairs, MemoryError> {
     let reach = reader_bind(reader);
-    let project = project_id.map(str::to_owned);
+    let project = project_bind(project_id);
     store
         .conn
         .call(move |c| -> rusqlite::Result<OpenPairs> {

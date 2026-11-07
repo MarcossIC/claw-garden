@@ -2,152 +2,80 @@
 
 ## Suite y clippy
 
-En Windows x86_64 (`x86_64-pc-windows-msvc`), build debug, toolchain 1.99.1, con `--target-dir target-test`, sobre `89a61907`: el último commit, de documentación, con el código de `51410a4f`.
+En Linux x86_64, build debug, toolchain 1.99.1, sobre `2f63dd6`, el último commit que toca código o docs (el que sigue sólo toca `openspec/`):
 
-- `cargo test --workspace --no-fail-fast` pasa, sin ningún test fallado. Los ignorados son los `#[ignore]` que ya tenía el repositorio: este cambio no agrega ninguno.
-- `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también.
-- Los contratos del agente pasan después de bendecirlos con `CLAWG_BLESS=1`, en los dos idiomas ([abajo](#el-contrato-del-agente)).
-- El código `cfg(windows)` que toca el cambio (la lectura de una raíz como ruta de Windows, que en realidad es pura y se prueba en los dos sistemas, y la caja de la unidad en `a_root_as_a_path_and_as_a_file_uri_is_the_same_project`) corrió aquí. Linux lo corre el CI del pull request ([abajo](#ci-del-pull-request)).
+- `cargo test --workspace`: pasa entero, en un `target` limpio; los ignorados son los de antes (los que piden el modelo real o un ensayo a mano).
+- `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también. El `#[expect(deprecated)]` de `uris` se cumple: `list_roots` y `ListRootsResult` están marcados obsoletos en `rmcp` 3.5.1.
+- `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` fallaron por la aserción con las descripciones nuevas y pasan después de `CLAWG_BLESS=1`; el diff de los dos contratos va en el pull request.
+- En Windows, el CI del pull request ([#133](https://github.com/MarcossIC/claw-garden/pull/133), `windows-latest`). Sobre `09aee6a` fallaron 18 tests de `crates/clawg-cli/src/mcp/server.rs`, todos por cómo los tests armaban un proyecto, no por el puente: `test_project()` armaba a mano la raíz `/proj-test`, que en Windows es una ruta de la unidad actual (`D:\proj-test`, otro id) y que ahora se resuelve porque los saves nombran su carpeta; `repo_with_src` derivaba el id viejo de la forma `\\?\` que da `canonicalize`, y el test del directorio personal comparaba con esa misma forma. `7671fce` arma los tres como el puente resuelve un `project_path`; sobre `7671fce`, Windows pasa los dos clippy y `cargo test --locked --workspace`, y Linux también (`ubuntu-latest`). En Linux, después de ese commit, pasan los tests de `mcp::` y `cargo clippy -p clawg-cli --all-targets -- -D warnings`. Lo `cfg(windows)` que toca este cambio es el de una raíz: `uri_path` saca la barra de antes de la unidad sólo en Windows (`crates/clawg-cli/src/mcp/roots.rs:63`), y `a_root_as_a_path_and_as_a_uri_is_one_project` escribe ahí la ruta con la unidad en minúscula, como la manda Cursor, y la URI con barras; pasó en las dos corridas.
 
 ## Los tests en rojo
 
-Los de «Cómo se mide» se escribieron antes que cualquier código, con un cliente MCP de prueba que habla por el stdio en memoria del puente (`crates/clawg-cli/src/mcp/mod.rs`), y se corrieron contra el puente de `develop`, al que sólo se le pasó el directorio de arranque y el personal como argumentos (`Start`) para que el test los eligiera.
+Escritos antes del código de cada commit.
 
-| Requisito | Test | Cómo fallaba |
+| Commit | Antes | Después |
 |---|---|---|
-| BP5 | `a_save_without_a_project_is_refused_with_the_roots_as_options` | El save se guardaba: `saved #1` |
-| BP5 | `a_save_without_a_project_is_refused_without_roots_too` | El save se guardaba en el proyecto del directorio de arranque: `saved #1` |
-| BP4 | `a_search_with_one_root_reads_its_project` | El puente nunca pedía las raíces y buscaba en el proyecto del directorio de arranque, el personal: no traía la memoria de A |
-| BP4 | `a_search_without_roots_reads_the_start_directory` | Pasaba: fija lo que no cambia, un cliente sin roots en un puente arrancado en A |
-| BP6, BP7 | `a_search_with_several_roots_reads_all_of_them_and_names_each_project` | `no memories found`: buscaba en el directorio personal |
-| BP3 | `the_home_directory_is_never_a_project` | Desde el directorio personal, la búsqueda iba al proyecto «directorio personal» y no traía la memoria de A |
-| BP2 | `a_root_as_a_path_and_as_a_file_uri_is_the_same_project` | Con la raíz `c:\…\home\a`, en minúscula como la manda Cursor, no traía lo guardado en `C:\…\home\a` |
-| BP1 | `a_change_of_roots_between_two_calls_is_seen_in_the_second` | La primera búsqueda, con la raíz A, ya no traía la memoria de A |
-| BP6 | `a_search_takes_a_group_of_projects` (`crates/clawg-cli/tests/api.rs`) | El daemon ignoraba `project_ids` y buscaba en todos los proyectos: volvía la memoria del proyecto de afuera |
-| BP6 | `a_group_search_takes_each_row_once` (`search.rs`), `a_group_search_names_its_first_project_for_an_older_daemon` (`client.rs`) | No compilaban: no había `search_projects` ni `grouped` |
-| BP11 | `the_protocol_says_where_a_call_without_a_project_goes` (`protocol.rs`) | `Projects names project_path`: la sección decía que las memorias son del directorio en el que se trabaja |
-| BP11 | `the_instructions_carry_the_saving_habits`, `the_spanish_instructions_carry_the_saving_habits` | La apertura no pedía nombrar el proyecto de cada save |
-| BP7 | `a_group_hit_names_its_project_and_its_key` (`tools.rs`) | No compilaba: no había `format_group_search` |
+| `feat(mcp): read a client's roots as the folders it has open` | No compilaba: `roots.rs` sólo tenía sus tests (`cannot find type ProjectIdentity`, `PathBuf`, `Path`, y las funciones) | pasan |
+| `feat(search): search a group of projects` | No compilaba: `no method with_projects`, `cannot find function projects_bind`, `count_saves_in_projects` | pasan |
+| `feat(daemon): take a group of projects in a search` | `a_search_sends_a_group_only_when_it_has_one` no compilaba (`SearchArgs` sin `project_ids`); con el cliente nuevo y el daemon de antes, `a_search_takes_a_group_of_projects` y `a_search_refuses_a_project_and_a_group` fallaban por la aserción: el daemon ignoraba `project_ids`, buscaba en todos y respondía 200 | pasan |
+| `feat(mcp): read the folders the client has open and make every save name its project` | No compilaba: `no method with_roots`, `no field home`, y `format_hits`, `format_search`, `format_save` e `indexes_docs` con la firma de antes | pasan |
+| `feat(mcp): tell the model that a save names its project` | Los dos contratos fallaban por la aserción | pasan, bendecidos |
 
-Los que se escribieron con el código o después se vieron fallar contra una mutación de la línea que los hace pasar, una por test, y la línea se devolvió:
+## «Cómo se mide», test por test
 
-| Requisito | Test | Mutación | Cómo falló |
-|---|---|---|---|
-| BP5 | `a_save_names_its_project_or_is_refused_before_the_daemon` (`server.rs`) | sin la negativa del save sin lugar | Llegaba al daemon: `the clawg daemon is not running …` |
-| BP8 | `what_works_on_one_project_asks_for_one_when_several_are_open` (`server.rs`) | `one_of` toma el primero de varios | `recall_context` respondía `no context yet` |
-| BP9 | `a_declared_root_is_indexed_like_the_start_directory` (`server.rs`) | `indexable_roots` sin las raíces | El 403 de `search_project`: la raíz no se había registrado con `index_docs` |
-| BP2 | `a_root_is_a_folder_as_a_uri_or_as_a_path` (`roots.rs`) | sin quitar la `/` de `/c:/…` | La URI de VS Code no daba carpeta (`None`): `\c:\Users\u\repo` no es una ruta absoluta de Windows |
-| BP3 | `the_home_directory_and_its_root_are_no_folder` (`roots.rs`) | sin comparar la raíz con el directorio personal | Una carpeta de notas bajo un directorio personal con `.git` era una carpeta |
-| BP10 | `a_hit_without_a_project_shows_how_a_save_revises_it`, `format_save_shows_the_key_only_where_a_save_revises_it` (`tools.rs`) | `revised_from` como antes | Desde un puente sin proyecto mostraban `topic=style/indent` |
+| Lo que pedía la exploración | Test |
+|---|---|
+| un save sin `project`, `project_path` ni `all_projects` se rechaza con las raíces como opciones, con roots | `a_save_that_names_no_project_is_refused_with_the_open_folders` (`server.rs`, dos raíces: el error nombra las dos y los tres argumentos, y el daemon no tiene ninguna fila); el save de `the_roots_are_asked_on_each_call`, por el `duplex` |
+| … y sin roots | `a_save_without_roots_offers_the_directory` (el directorio del puente como opción, también en español), `a_save_with_no_open_folder_asks_for_the_project_folder` (sin carpeta: pide la del proyecto) |
+| una búsqueda sin proyecto con una raíz busca en su proyecto | `a_search_with_one_root_reads_its_project`, y la primera llamada de `the_roots_are_asked_on_each_call` |
+| … con varias busca en todas | `a_search_with_several_roots_reads_all_of_them_and_names_each` (dos de tres checkouts, cada hit con su `project=`); en el core, `a_group_scope_reads_each_of_its_projects` (las tres tablas y el canal léxico); por HTTP, `a_search_takes_a_group_of_projects` |
+| … y sin roots usa el directorio | `a_search_without_roots_reads_the_directory`, `a_client_without_roots_is_not_asked` y `a_roots_error_counts_as_no_roots` (por el `duplex`) |
+| el directorio personal nunca es un proyecto | `the_home_directory_is_never_a_project` (`roots.rs`: ni como raíz ni como directorio), `a_bridge_started_in_the_home_directory_registers_no_project` (`server.rs`: la búsqueda lee todos los proyectos y no se registra ninguno) |
+| una raíz como ruta de Windows y como URI `file:` dan el mismo proyecto | `a_root_is_read_as_a_uri_or_a_path` (puro, con y sin Windows) y `a_root_as_a_path_and_as_a_uri_is_one_project` (una carpeta real, con un espacio en el nombre) |
+| un cambio de raíces entre dos llamadas se ve en la segunda | `the_roots_are_asked_on_each_call`: una sesión `initialize` que declara `roots` con `listChanged: false`; la búsqueda ve una carpeta, el cliente abre otra sin avisar, el save rechazado nombra las dos, y el cliente recibió dos `roots/list` |
+| un cliente sin la capacidad sigue como hoy | `a_client_without_roots_is_not_asked`: no recibe ningún `roots/list` y la búsqueda lee el directorio del puente |
 
-**Tests que cambiaron, y por qué:**
+El cliente de prueba es el `Session` de los tests de `server.rs`, que habla JSON-RPC por un `duplex` como un host, y contesta cada `roots/list` con lo que tiene en ese momento, o con un error.
 
-- Los tests de `server.rs` que guardaban sin proyecto nombran el suyo: `save_args` guarda en `PROJ_TEST`, el directorio de arranque de `bridge`, `save_args_in` en la carpeta de otro, y `bare_save` no nombra ninguno, para los que pasan `project` o `all_projects`. Tres sesiones por JSON-RPC (`a_request_without_client_info_keeps_the_name_declared_on_discover`, `a_session_without_initialize_saves_under_the_client_it_declares`, `memories_saved_through_initialize_stay_visible_without_it`) y los tres saves de `crates/clawg-cli/tests/binary.rs` pasan `project_path`.
-- `test_project` sale de `ProjectIdentity::resolve("/proj-test")`, el mismo de antes en Linux; en Windows ese camino resuelve a `C:\proj-test`, y hecho a mano no era el proyecto de un save con ese `project_path`. `repo_with_src` deja la ruta sin el `\\?\` de Windows, que ni un directorio de trabajo ni un `project_path` llevan ([tareas](tasks.md#frente-a-lo-previsto)).
-- `only_a_folder_the_person_opened_is_indexed` reemplaza a `only_the_bridges_own_root_is_indexed`: `indexes_docs` compara con varias raíces abiertas.
-- `resolve_project_resolves_an_explicit_path`, `without_a_path_the_bridges_own_project_is_used`, `all_projects_outranks_everything` y `resolve_project_is_none_when_there_is_nothing_to_scope_to` (`tools.rs`) se borraron con `resolve_project`, la regla del proyecto por defecto.
-- `a_hit_without_a_project_shows_how_a_save_revises_it` y `format_save_shows_the_key_only_where_a_save_revises_it` piden lo mismo sin proyecto que con él (BP10).
-- `every_route_that_takes_a_project_follows_a_merge` (`crates/clawg-cli/tests/api.rs`) busca también con un grupo que nombra un proyecto unido.
-- `a_search_names_its_language_only_when_it_has_one` y el test del cuerpo de `POST /v1/search` (`client.rs`) pasan el grupo vacío a `search_request`.
-
-## La spec contra el código
+## El spec contra el código
 
 | Requisito | Dónde |
 |---|---|
-| BP1 | `declared` (`crates/clawg-cli/src/mcp/roots.rs`), con `ROOTS_WAIT`; `ClawgMcp::at` (`crates/clawg-cli/src/mcp/server.rs`), llamado por `save_memory`, `search_memory`, `recall_context`, `read_memory`, `synthesize`, `search_project`, `answer_suggestion` y `memory_status` |
-| BP2 | `root_path`, `from_file_uri`, `percent_decode` e `is_absolute` (`roots.rs`); `folders` resuelve cada una con `Folder::at` |
-| BP3 | `Folder::at` (`roots.rs`), para la raíz y para el directorio de arranque (`ClawgMcp::pending`) |
-| BP4 | `reading_folders` y `reading` (`server.rs`); `scope_for` |
-| BP5 | `unplaced` y su llamada en `save_memory_impl` (`server.rs`), antes de `call` |
-| BP6 | `search_projects` (`crates/clawg-core/src/memory/search.rs`); `searched_projects` y `search` (`crates/clawg-cli/src/daemon/api.rs`); `search_group` y `grouped` (`crates/clawg-cli/src/client.rs`); la rama de un grupo en `search_memory_impl` |
-| BP7 | `format_group_search` y `hit_lines` (`crates/clawg-cli/src/mcp/tools.rs`) |
-| BP8 | `one_of` y `several_open` (`server.rs`), en `recall_context_impl`, `synthesize_impl`, `search_project_impl` y `answer_suggestion_impl`; `save_project` para `memory_status`, `read_memory` y `search_memory` con `all_projects` |
-| BP9 | `indexable_roots` y `register` (`server.rs`); `indexes_docs` (`tools.rs`); `not_accepted` (`api.rs`) |
-| BP10 | `revised_from` (`tools.rs`) |
-| BP11 | `protocol.md` y `protocol.es.md` (la apertura, «How to write a save» / «Cómo escribir un save» y «Projects» / «Proyectos»); las descripciones en `server.rs` y `tools_es.rs`. La apertura mide 2.030 sin preferencia, 2.047 con `en` y 1.938 con `es` |
+| BI1 | `roots::asked` y `ROOTS_TIMEOUT` (`crates/clawg-cli/src/mcp/roots.rs:20`, `:25`), `uris` con el `#[expect(deprecated)]` (`roots.rs:44`); `ClawgMcp::asking` (`crates/clawg-cli/src/mcp/server.rs:613`), que usan las ocho herramientas en sus métodos `#[tool]` |
+| BI2 | `folder_of` y `uri_path` (`roots.rs:51`, `:63`) |
+| BI3 | `open_folders` (`roots.rs:102`), `ClawgMcp::open_folders` y `canonical_home` (`server.rs:618`, `:531`) |
+| BI4 | `SaveMemoryArgs::names_its_project` (`server.rs:208`) en `save_memory_impl` (`server.rs:1139`), `no_project_named` (`crates/clawg-cli/src/mcp/tools.rs:1084`) |
+| BI5 | `search_memory_impl` (`server.rs:1217`), `ids_of` (`server.rs:1047`), `save_projects` (`server.rs:1088`); `format_hits`, `revised_from` y `display_project` (`tools.rs:231`, `:179`, `:207`); `SearchArgs.project_ids` (`crates/clawg-cli/src/client.rs:676`) |
+| BI6 | `memory_project_predicate!`, `table_project_predicate!`, `projects_bind` y `SearchScope::with_projects` (`crates/clawg-core/src/memory/search.rs:119`, `:131`, `:143`, `:60`); `count_saves_in_projects` (`crates/clawg-core/src/memory/language.rs:46`); `SearchRequest.project_ids` y `searched_projects` (`crates/clawg-cli/src/daemon/api.rs:430`, `:1544`) |
+| BI7 | `several_open` y `unnamed_with_several` (`server.rs:655`, `:670`), `several_folders` (`tools.rs:1106`), en `recall_context_impl`, `synthesize_impl`, `search_project_impl` y `answer_suggestion_impl` |
+| BI8 | `memory_status_impl` con `one_folder` (`server.rs:1662`, `:624`), `read_memory_impl` con `known_ids` (`server.rs:1383`, `:645`) |
+| BI9 | `indexable_folders` (`server.rs:631`) e `indexes_docs` (`tools.rs:1073`), en `ids_of` |
+| BI10 | Los comentarios `///` de los `*Args` y los atributos `#[tool]` de `save_memory` y `search_memory` (`server.rs`), `crates/clawg-cli/src/mcp/tools_es.rs`, la apertura y la sección de proyectos de `protocol.md` y `protocol.es.md`, y los dos contratos |
 
-## El contrato del agente
+## Frente a lo previsto
 
-Sólo cambian las `instructions` (la oración de la apertura) y las descripciones de `project_path` y `project`, en los dos idiomas.
-
-```diff
-diff --git a/crates/clawg-cli/src/mcp/agent_contract.json b/crates/clawg-cli/src/mcp/agent_contract.json
-@@ -1,5 +1,5 @@
- {
--  "instructions": "… it searches the project's own documentation and code. Memories are scoped to the current project unless you say otherwise.\n\n…",
-+  "instructions": "… it searches the project's own documentation and code. Name each save's project: `project_path`, `project` or `all_projects`.\n\n…",
-@@ answer_suggestion.project
--            "description": "This project by its id or its name. Defaults to the directory this\nbridge was started in.",
-+            "description": "This project by its id or its name. Defaults to the project of the\nfolder open in the client, or of the directory this bridge was started\nin when it names none.",
-@@ recall_context.project, search_memory.project, search_project.project, synthesize.project
--            "description": "The project by its id or its name, for one with no folder here or\nanother than this directory's. Not with project_path.",
-+            "description": "The project by its id or its name, for one with no folder here or one\nnot open in the client. Not with project_path.",
-@@ recall_context.project_path
--            "description": "Absolute path of the project. Defaults to the directory this bridge was\nstarted in.",
-+            "description": "Absolute path of the project. Defaults to the project of the folder\nopen in the client, or of the directory this bridge was started in\nwhen it names none; with several open, pass this or project.",
-@@ save_memory.project
--            "description": "The project this memory belongs to by its id or its name, for one with\nno folder here, such as an idea, or another than this directory's. A\nname no project has or resembles creates the project. Not with\nproject_path.",
-+            "description": "The project this memory belongs to by its id or its name, for one with\nno folder here, such as an idea. A name no project has or resembles\ncreates the project. Not with project_path.",
-@@ save_memory.project_path
--            "description": "Absolute path of the project this memory belongs to. Defaults to the\ndirectory this bridge was started in.",
-+            "description": "Absolute path of a folder of the project this memory belongs to, such\nas the repository it is about. A save names its project with this,\nproject or all_projects; with none it is refused.",
-@@ search_memory.project_path
--            "description": "Absolute path of the project to search in. Defaults to the directory\nthis bridge was started in.",
-+            "description": "Absolute path of the project to search in. Defaults to the projects of\nthe folders open in the client, or of the directory this bridge was\nstarted in when it names none.",
-@@ search_project.project_path
--            "description": "Absolute path of the project. Defaults to the directory this bridge was\nstarted in. Another project's files are searched only once the user\nhas added it with `clawg projects add`.",
-+            "description": "Absolute path of the project. Defaults to the project of the folder\nopen in the client, or of the directory this bridge was started in\nwhen it names none; with several open, pass this or project. Another\nproject's files are searched only once the user has added it with\n`clawg projects add`.",
-@@ synthesize.project_path
--            "description": "Absolute path of the project to review. Defaults to the directory this\nbridge was started in.",
-+            "description": "Absolute path of the project to review. Defaults to the project of the\nfolder open in the client, or of the directory this bridge was started\nin when it names none; with several open, pass this or project.",
-diff --git a/crates/clawg-cli/src/mcp/agent_contract.es.json b/crates/clawg-cli/src/mcp/agent_contract.es.json
-@@ -1,5 +1,5 @@
- {
--  "instructions": "… busca en la documentación y el código del propio proyecto. Las memorias son del proyecto actual salvo que digas otra cosa.\n\n…",
-+  "instructions": "… busca en la documentación y el código del propio proyecto. Nombra el proyecto de cada save: `project_path`, `project` o `all_projects`.\n\n…",
-@@ answer_suggestion.project
--            "description": "Este proyecto por su id o su nombre. Por defecto, el directorio en el que arrancó este puente.",
-+            "description": "Este proyecto por su id o su nombre. Por defecto, el proyecto de la carpeta abierta en el cliente, o del directorio en el que arrancó este puente cuando no nombra ninguna.",
-@@ recall_context.project, search_memory.project, search_project.project, synthesize.project
--            "description": "Para uno sin carpeta aquí o que no es el de este directorio, el proyecto por su id o su nombre. No con project_path.",
-+            "description": "Para uno sin carpeta aquí o que no está abierto en el cliente, el proyecto por su id o su nombre. No con project_path.",
-@@ recall_context.project_path
--            "description": "Ruta absoluta del proyecto. Por defecto, el directorio en el que arrancó este puente.",
-+            "description": "Ruta absoluta del proyecto. Por defecto, el proyecto de la carpeta abierta en el cliente, o del directorio en el que arrancó este puente cuando no nombra ninguna; con varias abiertas, pasa esta o project.",
-@@ save_memory.project
--            "description": "El proyecto de esta memoria por su id o su nombre, para uno sin carpeta aquí, como una idea, o que no es el de este directorio. Un nombre que ningún proyecto tiene ni se le parece crea el proyecto. No con project_path.",
-+            "description": "El proyecto de esta memoria por su id o su nombre, para uno sin carpeta aquí, como una idea. Un nombre que ningún proyecto tiene ni se le parece crea el proyecto. No con project_path.",
-@@ save_memory.project_path
--            "description": "Ruta absoluta del proyecto al que pertenece esta memoria. Por defecto, el directorio en el que arrancó este puente.",
-+            "description": "Ruta absoluta de una carpeta del proyecto al que pertenece esta memoria, como el repositorio del que trata. Un save nombra su proyecto con esta, con project o con all_projects; sin ninguno se rechaza.",
-@@ search_memory.project_path
--            "description": "Ruta absoluta del proyecto en el que buscar. Por defecto, el directorio en el que arrancó este puente.",
-+            "description": "Ruta absoluta del proyecto en el que buscar. Por defecto, los proyectos de las carpetas abiertas en el cliente, o del directorio en el que arrancó este puente cuando no nombra ninguna.",
-@@ search_project.project_path
--            "description": "Ruta absoluta del proyecto. Por defecto, el directorio en el que arrancó este puente. En los archivos de otro proyecto sólo se busca una vez que la persona lo agregó con `clawg projects add`.",
-+            "description": "Ruta absoluta del proyecto. Por defecto, el proyecto de la carpeta abierta en el cliente, o del directorio en el que arrancó este puente cuando no nombra ninguna; con varias abiertas, pasa esta o project. En los archivos de otro proyecto sólo se busca una vez que la persona lo agregó con `clawg projects add`.",
-@@ synthesize.project_path
--            "description": "Ruta absoluta del proyecto a revisar. Por defecto, el directorio en el que arrancó este puente.",
-+            "description": "Ruta absoluta del proyecto a revisar. Por defecto, el proyecto de la carpeta abierta en el cliente, o del directorio en el que arrancó este puente cuando no nombra ninguna; con varias abiertas, pasa esta o project.",
-```
-
-El diff completo es el de `crates/clawg-cli/src/mcp/agent_contract.json` y `agent_contract.es.json` en `51410a4f`; aquí las `instructions` se acortan a la oración que cambia y cada hunk se nombra por su herramienta y su argumento.
-
-## `rag-eval`
-
-No aplica. La búsqueda de un proyecto o de todos corre la misma consulta que antes (`search_projects` con un proyecto o ninguno llama a `search_all_memories` como lo hacía `search`), y el agent view busca con un `project_id`, nunca con un grupo, así que ninguna línea que lee cambia.
-
-## CI del pull request
-
-En [#134](https://github.com/MarcossIC/claw-garden/pull/134), sobre `4a6624f9`, pasaron los jobs `test (ubuntu-latest)` y `test (windows-latest)`, que corren la suite y los clippy con `-D warnings`. No hubo nada que arreglar.
+| Punto | Previsto | Hecho | Por qué |
+|---|---|---|---|
+| Cuándo se piden las raíces | En una llamada sin proyecto | En cada llamada de las ocho herramientas, también la que nombra su proyecto; la spec y la propuesta lo dicen | Una carpeta abierta se registra con su índice de documentos la primera vez que se nombra, y el registro no se repite en el proceso: un save con `project_path` antes de cualquier búsqueda la dejaba sin índice |
+| La marca `project=` | En una búsqueda de un grupo | Con varias carpetas abiertas y sin `project` ni `project_path`, también con `all_projects`; la spec lo dice | Es cuando el agente no sabe de qué proyecto es cada hit; con `all_projects` y una carpeta, o nombrando el proyecto, la línea es la de antes |
+| `display_project` | No estaba | Un `[` o `]` del id como paréntesis, un control o un salto de línea como espacio; test `a_project_named_by_a_hit_keeps_the_hit_on_its_line` | El id sale del nombre de una carpeta, y uno con `]` cerraría el encabezado del hit, que `rag-eval` y el agente leen hasta el primer `]` |
+| `SearchScope` | «Guarda la lista» | El campo público pasa de `project_id` a `projects`; los cuatro tests que lo leían (`search.rs` y `tests/public_api.rs`) leen el nuevo, y los que llaman a las funciones internas de búsqueda con un proyecto lo atan con `bound` | El campo es la lista; lo que esperan esos tests no cambió |
+| `count_saves_in` | Contar un grupo | Queda como estaba, para un proyecto, y suma `count_saves_in_projects` | Su test no cambia, y el contexto sigue contando un proyecto |
+| Los tests que guardaban sin proyecto | `save_args` pasa `project_path` | `save_here`, un método de los tests de `server.rs`, nombra la carpeta del puente, o `all_projects` en uno sin carpeta, cuando el save no nombra nada; los tres saves de `tests/binary.rs` y los del `duplex` pasan `all_projects` o `project_path` | Cada test guarda donde guardaba antes, con la carpeta del puente que hasta ahora ponía el puente |
+| README | Fuera del alcance | La lista de herramientas MCP y la sección de Cursor dicen que un save nombra su proyecto y qué hace con las carpetas abiertas | Es lo que lee quien instala; `docs/reference/daemon.md` lo dice para quien mantiene |
+| Las firmas de `clawg-eval` y `contradiction.rs` | Fuera del alcance | `rag-eval` y `revision-eval` pasan a `format_search` una lista (`&[]`, o la del proyecto que pasaban), y arman `SearchArgs` con `project_ids` vacío; `contradiction.rs` arma su `SearchScope` con `projects` | Son los llamadores de lo que cambió de firma; lo que hacen no cambia |
+| Los tests en Windows | No estaba | `7671fce`: `test_project()`, `repo_with_src` y el test del directorio personal arman sus carpetas como el puente resuelve un `project_path` | Con todo save nombrando su carpeta, la ruta de un proyecto de prueba se resuelve; armada a mano (`/proj-test`, o la forma `\\?\` de `canonicalize`) daba otro id en Windows |
+| `resolve_project` | No se nombraba | Sigue, con la única carpeta abierta como proyecto por defecto | Su orden (`all_projects`, después la ruta, después el proyecto por defecto) es el mismo, y sus tests no cambian |
 
 ## Pendiente en local
 
-Con Cursor real, conectado con `clawg setup cursor` a un perfil con este binario:
+Con Cursor instalado (la prueba de la exploración usó 3.28.7 en Windows) y un clawg con este cambio conectado con `clawg setup cursor`: un build de esta rama con el perfil `dev`, o la versión publicada con `prod`. Después de reiniciar Cursor:
 
-- **Un save desde una ventana con un workspace de dos repositorios** cae en el proyecto que nombró el agente: el agente pasa el `project_path` del repositorio del que trata la memoria, y sin él la respuesta lista las dos carpetas. Es lo único que este cambio no puede comprobar sin el cliente: si el modelo de Cursor nombra el proyecto que corresponde.
-- **Una búsqueda con dos ventanas abiertas** trae memorias de los dos proyectos, cada una con su `project=`.
+1. **Un save desde Cursor en un workspace con dos repositorios cae en el proyecto correcto.** Con un workspace de dos repositorios abierto en una ventana, pedirle al agente que guarde algo de uno de ellos. Si el agente no nombra el proyecto, la respuesta de `save_memory` es el rechazo con las dos carpetas; el agente vuelve a guardar con `project_path`. `clawg memories list --profile P` muestra la fila en el proyecto de ese repositorio, y `clawg projects list --profile P` no lista el directorio personal.
+2. **Una búsqueda con dos ventanas abiertas trae memorias de los dos repositorios,** cada hit con su `project=`.
+3. **Que Cursor conteste `roots/list` a tiempo en cada llamada:** el log del daemon no dice `the client did not list its roots within 2 s`.
+4. **Claude Code:** con una carpeta, lo que lee es lo de antes, declare `roots` o no; un save sin proyecto se rechaza y el agente lo repite con `project_path`.
 
 ## Veredicto
 
-Sin CRITICAL aquí ni en el CI del pull request, en Linux y en Windows. Queda Cursor real, en local ([arriba](#pendiente-en-local)).
+Sin CRITICAL en Linux ni en el CI de Windows. Los puntos de «Pendiente en local» quedan como WARNING hasta probarlos con Cursor.

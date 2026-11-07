@@ -29,7 +29,6 @@ use crate::client::{
     probe_running, start_daemon, ClientError, DaemonSpawner, Probe, ProcessSpawner, AUTOSTART_TIMEOUT,
 };
 use handshake::PreInitGuard;
-use roots::Start;
 use server::ClawgMcp;
 use startup::{ClientHandle, Startup};
 
@@ -65,15 +64,13 @@ pub async fn run(profile: Profile, autostart: bool, agent: Option<String>) -> Re
         spawner,
         AUTOSTART_TIMEOUT,
         TOOL_READY_WAIT,
-        Start::of_process(),
         AsyncRwTransport::new_server(stdin, stdout),
     )
     .await
 }
 
-/// [`run`] with the data directory, spawner, timings, start and transport
-/// supplied, so a test can drive the whole bridge without a real process, a
-/// real working directory or real stdio.
+/// [`run`] with the data directory, spawner, timings and transport supplied, so
+/// a test can drive the whole bridge without a real process or real stdio.
 ///
 /// Before the transport opens only the quick checks run (see
 /// [`probe_running`]), so a store held by a non-daemon or `--no-autostart`
@@ -89,7 +86,6 @@ pub(crate) async fn run_with<T>(
     spawner: Arc<dyn DaemonSpawner>,
     start_timeout: Duration,
     tool_wait: Duration,
-    start: Start,
     transport: T,
 ) -> Result<(), McpError>
 where
@@ -134,7 +130,7 @@ where
     let transport = PreInitGuard::new(transport);
     // Read once: a session keeps the language it was opened in, its
     // instructions and its answers alike.
-    let service = ClawgMcp::pending(client, profile, start)
+    let service = ClawgMcp::pending(client, profile)
         .with_agent(agent)
         .with_language(clawg_core::preferences::language_in(base_dir))
         .serve(transport)
@@ -248,64 +244,13 @@ mod tests {
         }
     }
 
-    /// An in-process daemon whose files are already in its data directory, as
-    /// a running daemon's are, so a bridge reaches it without starting one.
-    struct RunningDaemon {
-        dir: tempfile::TempDir,
-    }
-    impl RunningDaemon {
-        async fn start() -> Self {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
-            tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
-            let token = "running-daemon-token".to_string();
-            let (shutdown, _rx) = tokio::sync::watch::channel(false);
-            let ctx = Arc::new(AppCtx {
-                runtime,
-                token: token.clone(),
-                profile: Profile::Dev,
-                started_at: Instant::now(),
-                shutdown,
-                save_timeout: SAVE_CONFIRM_TIMEOUT,
-                sessions: Default::default(),
-                imports: Default::default(),
-            });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            let port = listener.local_addr().expect("addr").port();
-            tokio::spawn(async move {
-                let _ = axum::serve(listener, router(ctx)).await;
-            });
-            let state = DaemonState {
-                pid: std::process::id(),
-                port: Some(port),
-                unix_socket: false,
-                profile: "dev".into(),
-                version: "0.1.0".into(),
-                started_at_ms: 0,
-            };
-            write_state(dir.path(), &state).expect("write state");
-            write_token(dir.path(), &token).expect("write token");
-            Self { dir }
-        }
-
-        fn client(&self) -> crate::client::DaemonClient {
-            crate::client::DaemonClient::from_data_dir(self.dir.path()).expect("the daemon's files")
-        }
-    }
-
     type HostLines = tokio::io::Lines<BufReader<ReadHalf<DuplexStream>>>;
 
-    /// The host side of an in-memory stdio pipe wired to a running bridge: an
-    /// MCP client that declares `roots` when it has some, and answers each
-    /// `roots/list` with the ones it has at that moment.
+    /// The host side of an in-memory stdio pipe wired to a running bridge.
     struct Host {
         write: WriteHalf<DuplexStream>,
         lines: HostLines,
         bridge: JoinHandle<Result<(), McpError>>,
-        /// `None`: the client does not declare the capability, and being
-        /// asked for its roots fails the test.
-        roots: Option<Vec<String>>,
-        next_id: u32,
     }
 
     fn connect(
@@ -314,18 +259,6 @@ mod tests {
         spawner: Arc<dyn DaemonSpawner>,
         start_timeout: Duration,
         tool_wait: Duration,
-    ) -> Host {
-        connect_with(base_dir, autostart, spawner, start_timeout, tool_wait, Start::default(), None)
-    }
-
-    fn connect_with(
-        base_dir: &Path,
-        autostart: bool,
-        spawner: Arc<dyn DaemonSpawner>,
-        start_timeout: Duration,
-        tool_wait: Duration,
-        start: Start,
-        roots: Option<Vec<String>>,
     ) -> Host {
         let (host, server) = tokio::io::duplex(64 * 1024);
         let (server_read, server_write) = tokio::io::split(server);
@@ -339,72 +272,12 @@ mod tests {
                 spawner,
                 start_timeout,
                 tool_wait,
-                start,
                 AsyncRwTransport::new_server(server_read, server_write),
             )
             .await
         });
         let (host_read, write) = tokio::io::split(host);
-        Host { write, lines: BufReader::new(host_read).lines(), bridge, roots, next_id: 100 }
-    }
-
-    /// A bridge started in `start`, with `home` as the user's home directory,
-    /// against `daemon`, its session open; its client declares `roots`.
-    async fn open(daemon: &RunningDaemon, start: &Path, home: &Path, roots: Option<Vec<String>>) -> Host {
-        let start = Start { dir: Some(start.to_path_buf()), home: Some(home.to_path_buf()) };
-        let mut host =
-            connect_with(daemon.dir.path(), false, Arc::new(CannotSpawn), Duration::from_secs(5), Duration::from_secs(5), start, roots);
-        host.initialize(Duration::from_secs(5)).await;
-        host
-    }
-
-    /// A home directory with three repositories in it, by canonical path.
-    struct Folders {
-        _dir: tempfile::TempDir,
-        home: PathBuf,
-        a: PathBuf,
-        b: PathBuf,
-        c: PathBuf,
-    }
-
-    fn folders() -> Folders {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = std::fs::canonicalize(dir.path()).expect("canonicalize");
-        let home = clawg_core::memory::identity::strip_verbatim(&base).join("home");
-        let repo = |name: &str| {
-            let path = home.join(name);
-            std::fs::create_dir_all(path.join(".git")).expect(".git");
-            path
-        };
-        let (a, b, c) = (repo("a"), repo("b"), repo("c"));
-        Folders { _dir: dir, home, a, b, c }
-    }
-
-    /// A folder as a root of the client, as Cursor sends it: a plain path.
-    fn root(path: &Path) -> String {
-        path.display().to_string()
-    }
-
-    /// `path` as a `file:` URI, every byte but the unreserved ones and `/`
-    /// percent-encoded, as VS Code writes them.
-    fn file_uri(path: &Path) -> String {
-        let text = path.display().to_string().replace('\\', "/");
-        let text = if text.starts_with('/') { text } else { format!("/{text}") };
-        let mut uri = String::from("file://");
-        for byte in text.bytes() {
-            if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
-                uri.push(char::from(byte));
-            } else {
-                uri.push_str(&format!("%{byte:02X}"));
-            }
-        }
-        uri
-    }
-
-    /// The id the daemon gives a repository with no remote: the one derived
-    /// from its root.
-    fn project_id(path: &Path) -> String {
-        clawg_core::memory::ProjectIdentity::resolve(path).id
+        Host { write, lines: BufReader::new(host_read).lines(), bridge }
     }
 
     impl Host {
@@ -426,15 +299,11 @@ mod tests {
         }
 
         async fn initialize(&mut self, budget: Duration) -> Value {
-            let capabilities = match self.roots {
-                Some(_) => json!({ "roots": { "listChanged": false } }),
-                None => json!({}),
-            };
             self.send(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {
                     "protocolVersion": "2025-06-18",
-                    "capabilities": capabilities,
+                    "capabilities": {},
                     "clientInfo": { "name": "probe-host", "version": "0" }
                 }
             }))
@@ -442,45 +311,6 @@ mod tests {
             let reply = self.next(budget).await;
             self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
             reply
-        }
-
-        /// Calls `tool` and returns its answer, answering every `roots/list`
-        /// the bridge sends meanwhile with the roots of the moment.
-        async fn call(&mut self, tool: &str, arguments: Value) -> Value {
-            self.next_id += 1;
-            let id = self.next_id;
-            self.send(json!({
-                "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                "params": { "name": tool, "arguments": arguments }
-            }))
-            .await;
-            loop {
-                let frame = self.next(Duration::from_secs(20)).await;
-                if frame["method"] == "roots/list" {
-                    let roots = self
-                        .roots
-                        .clone()
-                        .unwrap_or_else(|| panic!("the bridge asked for roots the client never declared: {frame}"));
-                    let listed: Vec<Value> = roots.iter().map(|uri| json!({ "uri": uri })).collect();
-                    self.send(json!({ "jsonrpc": "2.0", "id": frame["id"].clone(), "result": { "roots": listed } }))
-                        .await;
-                } else if frame["id"] == id {
-                    return frame;
-                }
-            }
-        }
-
-        /// Saves `content` in the project of `folder`.
-        async fn save_in(&mut self, folder: &Path, content: &str) {
-            let reply = self.call("save_memory", json!({ "content": content, "project_path": root(folder) })).await;
-            assert!(!tool_failed(&reply), "the save must be stored: {reply}");
-        }
-
-        /// What `search_memory` answers for `query`, with no project named.
-        async fn search(&mut self, query: &str) -> String {
-            let reply = self.call("search_memory", json!({ "query": query })).await;
-            assert!(!tool_failed(&reply), "{reply}");
-            tool_text(&reply)
         }
 
         async fn memory_status(&mut self, id: u32, budget: Duration) -> Value {
@@ -615,149 +445,5 @@ mod tests {
             .expect("no panic");
         assert!(matches!(outcome, Err(McpError::Client(ClientError::NotRunning))), "{outcome:?}");
         assert_eq!(spawner.calls.load(Ordering::SeqCst), 0, "--no-autostart never spawns");
-    }
-
-    // ── where a call without a project goes ─────────────────────────────────
-
-    const IN_A: &str = "the staging port of the first repository is 48213";
-    const IN_B: &str = "the second repository builds its docs with mdbook";
-    const IN_C: &str = "the third repository pins its toolchain to nightly";
-
-    /// How many memories the store holds, in any project.
-    async fn stored(daemon: &RunningDaemon) -> usize {
-        let listing = crate::client::ListArgs { kind: Some("memory".into()), ..Default::default() };
-        daemon.client().list(listing).await.expect("list").len()
-    }
-
-    #[tokio::test]
-    async fn a_save_without_a_project_is_refused_with_the_roots_as_options() {
-        let (daemon, f) = (RunningDaemon::start().await, folders());
-        let mut host = open(&daemon, &f.home, &f.home, Some(vec![root(&f.a), root(&f.b)])).await;
-
-        let reply = host.call("save_memory", json!({ "content": IN_A })).await;
-
-        let text = tool_text(&reply);
-        assert!(tool_failed(&reply), "{reply}");
-        for named in ["project_path", "project", "all_projects", &root(&f.a), &root(&f.b)] {
-            assert!(text.contains(named), "the refusal names {named}: {text}");
-        }
-        assert_eq!(stored(&daemon).await, 0, "nothing is saved");
-    }
-
-    #[tokio::test]
-    async fn a_save_without_a_project_is_refused_without_roots_too() {
-        let (daemon, f) = (RunningDaemon::start().await, folders());
-        let mut host = open(&daemon, &f.a, &f.home, None).await;
-
-        let reply = host.call("save_memory", json!({ "content": IN_A })).await;
-
-        let text = tool_text(&reply);
-        assert!(tool_failed(&reply), "{reply}");
-        assert!(text.contains("project_path") && text.contains(&root(&f.a)), "the start directory is the option: {text}");
-
-        let mut at_home = open(&daemon, &f.home, &f.home, None).await;
-        let reply = at_home.call("save_memory", json!({ "content": IN_A })).await;
-        let text = tool_text(&reply);
-        assert!(tool_failed(&reply), "{reply}");
-        assert!(text.contains("all_projects") && !text.contains(&root(&f.home)), "home is never an option: {text}");
-        assert_eq!(stored(&daemon).await, 0, "nothing is saved");
-    }
-
-    #[tokio::test]
-    async fn a_search_with_one_root_reads_its_project() {
-        let (daemon, f) = (RunningDaemon::start().await, folders());
-        let mut host = open(&daemon, &f.home, &f.home, Some(vec![root(&f.a)])).await;
-        host.save_in(&f.a, IN_A).await;
-        host.save_in(&f.b, IN_B).await;
-
-        assert!(host.search(IN_A).await.contains(IN_A), "the root's project is searched");
-        let other = host.search(IN_B).await;
-        assert!(!other.contains(IN_B), "another project is not: {other}");
-    }
-
-    #[tokio::test]
-    async fn a_search_with_several_roots_reads_all_of_them_and_names_each_project() {
-        let (daemon, f) = (RunningDaemon::start().await, folders());
-        let mut host = open(&daemon, &f.home, &f.home, Some(vec![root(&f.a), root(&f.b)])).await;
-        host.save_in(&f.a, IN_A).await;
-        host.save_in(&f.b, IN_B).await;
-        host.save_in(&f.c, IN_C).await;
-
-        let found = host.search(IN_A).await;
-        assert!(found.contains(IN_A) && found.contains(&format!(" project={}", project_id(&f.a))), "{found}");
-        let found = host.search(IN_B).await;
-        assert!(found.contains(IN_B) && found.contains(&format!(" project={}", project_id(&f.b))), "{found}");
-        let outside = host.search(IN_C).await;
-        assert!(!outside.contains(IN_C), "a project no root leads to is not searched: {outside}");
-    }
-
-    #[tokio::test]
-    async fn a_search_without_roots_reads_the_start_directory() {
-        let (daemon, f) = (RunningDaemon::start().await, folders());
-        let mut host = open(&daemon, &f.a, &f.home, None).await;
-        host.save_in(&f.a, IN_A).await;
-        host.save_in(&f.b, IN_B).await;
-
-        assert!(host.search(IN_A).await.contains(IN_A), "the start directory's project is searched");
-        let other = host.search(IN_B).await;
-        assert!(!other.contains(IN_B), "another project is not: {other}");
-    }
-
-    #[tokio::test]
-    async fn the_home_directory_is_never_a_project() {
-        let (daemon, f) = (RunningDaemon::start().await, folders());
-        let mut seeding = open(&daemon, &f.a, &f.home, None).await;
-        seeding.save_in(&f.a, IN_A).await;
-        seeding.save_in(&f.b, IN_B).await;
-
-        let mut at_home = open(&daemon, &f.home, &f.home, None).await;
-        assert!(at_home.search(IN_A).await.contains(IN_A), "without a project a search reaches every project");
-
-        let mut home_as_root = open(&daemon, &f.a, &f.home, Some(vec![root(&f.home), root(&f.b)])).await;
-        assert!(home_as_root.search(IN_B).await.contains(IN_B), "the other root is searched");
-        let not_home = home_as_root.search(IN_A).await;
-        assert!(!not_home.contains(IN_A), "a home root is dropped, not read as its project or as none: {not_home}");
-
-        let listing = daemon.client().list_projects().await.expect("projects");
-        let folders: Vec<&str> = listing.projects.iter().flat_map(|p| p.folders.iter().map(|f| f.root_path.as_str())).collect();
-        assert!(!folders.iter().any(|path| Path::new(path) == f.home), "home was registered: {folders:?}");
-    }
-
-    #[tokio::test]
-    async fn a_root_as_a_path_and_as_a_file_uri_is_the_same_project() {
-        let (daemon, f) = (RunningDaemon::start().await, folders());
-        let mut seeding = open(&daemon, &f.a, &f.home, None).await;
-        seeding.save_in(&f.a, IN_A).await;
-        seeding.save_in(&f.b, IN_B).await;
-
-        // Cursor sends a Windows root with the drive in lower case, and VS
-        // Code a URI with the colon encoded.
-        let lower_drive = |text: String| match text.as_bytes() {
-            [drive, b':', ..] if cfg!(windows) => format!("{}{}", char::from(drive.to_ascii_lowercase()), &text[1..]),
-            _ => text,
-        };
-        let as_uri = file_uri(Path::new(&lower_drive(root(&f.a))));
-        for declared in [lower_drive(root(&f.a)), as_uri] {
-            let mut host = open(&daemon, &f.home, &f.home, Some(vec![declared.clone()])).await;
-            assert!(host.search(IN_A).await.contains(IN_A), "{declared} leads to the project of {}", f.a.display());
-            let other = host.search(IN_B).await;
-            assert!(!other.contains(IN_B), "{declared} leads to one project: {other}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_change_of_roots_between_two_calls_is_seen_in_the_second() {
-        let (daemon, f) = (RunningDaemon::start().await, folders());
-        let mut host = open(&daemon, &f.home, &f.home, Some(vec![root(&f.a)])).await;
-        host.save_in(&f.a, IN_A).await;
-        host.save_in(&f.b, IN_B).await;
-        assert!(host.search(IN_A).await.contains(IN_A));
-
-        // No `notifications/roots/list_changed`, as Cursor sends none.
-        host.roots = Some(vec![root(&f.b)]);
-
-        assert!(host.search(IN_B).await.contains(IN_B), "the second call reads the new root");
-        let before = host.search(IN_A).await;
-        assert!(!before.contains(IN_A), "and not the old one: {before}");
     }
 }

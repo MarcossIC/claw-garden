@@ -103,37 +103,17 @@ fn nothing_relevant(lang: Lang, withheld: usize) -> String {
     }
 }
 
-/// What `search_memory` hands the model for a search's answer in one project
-/// or in all of them, as `reader`, whose saves go to `save_project`, in a
-/// session whose preferred language is `language`.
-pub fn format_search(found: Found, reader: &str, save_project: Option<&str>, language: Option<Lang>) -> String {
-    format_found(found, reader, Revises::In(save_project), language)
-}
-
-/// [`format_search`] for a search in a group of projects: each hit names its
-/// project, which a save that revises it under its key names too.
-pub fn format_group_search(found: Found, reader: &str, language: Option<Lang>) -> String {
-    format_found(found, reader, Revises::InEachHitsProject, language)
-}
-
-/// Where a save that revises a hit under its key goes.
-#[derive(Debug, Clone, Copy)]
-enum Revises<'a> {
-    /// Into this project, the one a search read, or into none.
-    In(Option<&'a str>),
-    /// Into the project each hit names with `project=`, in a search of a
-    /// group of projects.
-    InEachHitsProject,
-}
-
-fn format_found(found: Found, reader: &str, revises: Revises<'_>, language: Option<Lang>) -> String {
+/// What `search_memory` hands the model for a search's answer, as `reader`,
+/// whose saves name one of `save_projects`, in a session whose preferred
+/// language is `language`.
+pub fn format_search(found: Found, reader: &str, save_projects: &[String], language: Option<Lang>) -> String {
     let lang = language.unwrap_or(Lang::En);
     let returned = found.hits.len();
     let hits = relevant_hits(found.hits);
     let text = if hits.is_empty() && returned + found.withheld > 0 {
         nothing_relevant(lang, returned + found.withheld)
     } else {
-        hit_lines(lang, &hits, reader, revises)
+        format_hits(lang, &hits, reader, save_projects)
     };
     with_other_language(text, language, found.other_language.as_ref(), hits.len())
 }
@@ -191,30 +171,48 @@ pub fn name_in_spanish(lang: Lang) -> &'static str {
     }
 }
 
-/// Whether a save in `save_project` revises a row of `row_project` under its
-/// key: a key revises only the rows of the project the save goes to, and a
-/// save names its project, so no save revises a row without one but a save
-/// with `all_projects`, which [`shown_key`] names. A row whose project the
-/// daemon did not send keeps its key, as before the daemon sent it.
-fn revised_from(row_project: &Option<Option<String>>, save_project: Option<&str>) -> bool {
-    row_project.as_ref().is_none_or(|p| p.is_some() && p.as_deref() == save_project)
+/// Whether a save in one of `save_projects` revises a row of `row_project`
+/// under its key: a key revises only the rows of the project the save goes
+/// to, so a row without one only from a save without one (no project). A row
+/// whose project the daemon did not send keeps its key, as before the daemon
+/// sent it.
+fn revised_from(row_project: &Option<Option<String>>, save_projects: &[String]) -> bool {
+    match row_project {
+        None => true,
+        Some(None) => save_projects.is_empty(),
+        Some(Some(project)) => save_projects.contains(project),
+    }
 }
 
 /// A row's key as a search hit or `read_memory` shows it: only where a save can
 /// revise the row under it, since a key of another project would promise a
-/// revision the reader cannot make. A preference without a project is revised
-/// only by a save with `all_projects`, and says so.
-fn shown_key(key: Option<&str>, memory_type: Option<&str>, row_project: &Option<Option<String>>, save_project: Option<&str>) -> String {
+/// revision the reader cannot make. From a bridge with a project, a preference
+/// without one is revised only by a save with `all_projects`, and says so.
+fn shown_key(key: Option<&str>, memory_type: Option<&str>, row_project: &Option<Option<String>>, save_projects: &[String]) -> String {
     let Some(key) = key else {
         return String::new();
     };
-    if revised_from(row_project, save_project) {
+    if revised_from(row_project, save_projects) {
         format!(" topic={key}")
     } else if matches!(row_project, Some(None)) && memory_type == Some("user_preference") {
         format!(" topic={key} all_projects")
     } else {
         String::new()
     }
+}
+
+/// A project id as a hit names it: an id comes from a folder's name, so a
+/// bracket is shown as a parenthesis and a control or a line break as a
+/// space, and no id can close the hit's metadata or open a line.
+fn display_project(id: &str) -> String {
+    id.chars()
+        .map(|c| match c {
+            '[' => '(',
+            ']' => ')',
+            c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => ' ',
+            c => c,
+        })
+        .collect()
 }
 
 /// The author of a hit `reader` did not save, if any. A hit without an author
@@ -226,16 +224,11 @@ fn shared_author<'a>(hit: &'a Hit, reader: &str) -> Option<&'a str> {
 
 /// Renders search hits as a numbered list, or says plainly that there were
 /// none. A preference the user did not state says how it was saved, after its
-/// tier. A hit another agent saved names it, and the list then ends with the
-/// note on how to read such hits.
-#[cfg(test)]
-fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_project: Option<&str>) -> String {
-    hit_lines(lang, hits, reader, Revises::In(save_project))
-}
-
-/// [`format_hits`] for where `revises` says a save goes: in a group, each hit
-/// with a project names it after its score.
-fn hit_lines(lang: Lang, hits: &[Hit], reader: &str, revises: Revises<'_>) -> String {
+/// tier. When a save could name more than one project, a hit with a project
+/// names it after its key, as the id `project` takes. A hit another agent
+/// saved names it, and the list then ends with the note on how to read such
+/// hits.
+fn format_hits(lang: Lang, hits: &[Hit], reader: &str, save_projects: &[String]) -> String {
     if hits.is_empty() {
         // A sentence, not an empty string: a model reading `""` cannot tell a
         // successful empty search from a broken tool.
@@ -249,16 +242,13 @@ fn hit_lines(lang: Lang, hits: &[Hit], reader: &str, revises: Revises<'_>) -> St
             let piece = h.piece.map(|p| format!(" piece={}/{}", p.piece, p.pieces)).unwrap_or_default();
             let author = shared_author(h, reader);
             let by = author.map(|a| format!(" by {}", display_author(a))).unwrap_or_default();
-            let (project, save_project) = match revises {
-                Revises::In(save_project) => (String::new(), save_project),
-                Revises::InEachHitsProject => {
-                    let own = h.project_id.as_ref().and_then(|p| p.as_deref());
-                    (own.map(|p| format!(" project={p}")).unwrap_or_default(), own)
-                }
+            let topic = shown_key(h.topic_key.as_deref(), Some(&h.memory_type), &h.project_id, save_projects);
+            let project = match &h.project_id {
+                Some(Some(project)) if save_projects.len() > 1 => format!(" project={}", display_project(project)),
+                _ => String::new(),
             };
-            let topic = shown_key(h.topic_key.as_deref(), Some(&h.memory_type), &h.project_id, save_project);
             format!(
-                "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{project}{topic}{by}] {}",
+                "{}. #{} [{}/{}/t{}{origin}{piece} score={:.2}{topic}{project}{by}] {}",
                 i + 1,
                 h.id,
                 h.kind,
@@ -347,9 +337,10 @@ pub fn format_open_pairs(lang: Lang, open: &OpenPairs) -> String {
 /// What `read_memory` tells the model: which piece it asked for and every
 /// row of the save, then the whole text. A position with no row it may read
 /// is named, so the model knows the text has a gap there. The key shows only
-/// when a save in `save_project` would revise the row, as on a search hit.
-pub fn format_save(lang: Lang, save: &SavedText, save_project: Option<&str>) -> String {
-    let topic = shown_key(save.topic_key.as_deref(), save.memory_type.as_deref(), &save.project_id, save_project);
+/// when a save in one of `save_projects` would revise the row, as on a search
+/// hit.
+pub fn format_save(lang: Lang, save: &SavedText, save_projects: &[String]) -> String {
+    let topic = shown_key(save.topic_key.as_deref(), save.memory_type.as_deref(), &save.project_id, save_projects);
     if save.pieces <= 1 {
         return format!("#{}{topic}\n{}", save.id, save.text);
     }
@@ -1050,14 +1041,95 @@ pub fn format_context(lang: Lang, prompt: &str) -> String {
     }
 }
 
+/// Decides which project a tool call is scoped to.
+///
+/// Precedence, and why: `all_projects` wins because it is the only way to ask
+/// for the unscoped view and a caller that passed both meant the broader one;
+/// then an explicit `project_path`, which is the caller naming a project other
+/// than the folder it has open; then `default_project`, the one folder open
+/// (`roots::open_folders`), if there is just one. `resolve` turns a path into
+/// its project; it is passed in so this rule stays testable without a
+/// filesystem.
+pub fn resolve_project(
+    default_project: Option<&ProjectIdentity>,
+    project_path: Option<&str>,
+    all_projects: bool,
+    resolve: impl FnOnce(&Path) -> ProjectIdentity,
+) -> Option<ProjectIdentity> {
+    if all_projects {
+        return None;
+    }
+    match project_path {
+        Some(p) if !p.is_empty() => Some(resolve(Path::new(p))),
+        _ => default_project.cloned(),
+    }
+}
+
 /// Whether registering `project` lets the daemon read its files: only when it
-/// is the root of a folder the person opened that is indexed on its own (a
-/// root the client declared, or the directory the bridge was started in).
-/// Any other root the model names is a label for memories until the person
-/// adds it. Roots are compared, not ids, because two roots that collide share
-/// one.
-pub fn indexes_docs(project: &ProjectIdentity, opened: &[&ProjectIdentity]) -> bool {
-    opened.iter().any(|open| open.root == project.root)
+/// is one of `open`, the folders the user has open in the client (or the one
+/// the bridge was started in) that may be read on their own. Any other root
+/// the model names is a label for memories until the user adds it. Roots are
+/// compared, not ids, because two roots that collide share one.
+pub fn indexes_docs(project: &ProjectIdentity, open: &[ProjectIdentity]) -> bool {
+    open.iter().any(|folder| folder.root == project.root)
+}
+
+/// The folders a refusal offers, each as its root, for `project_path`.
+fn listed(folders: &[ProjectIdentity]) -> String {
+    folders.iter().map(|f| f.root.display().to_string()).collect::<Vec<_>>().join(", ")
+}
+
+/// Why `save_memory` saved nothing: it names no project. `open` are the
+/// folders the client has open, offered for `project_path`.
+pub fn no_project_named(lang: Lang, open: &[ProjectIdentity]) -> String {
+    let folder = match (open, lang) {
+        ([], Lang::En) => "project_path with the project's folder".to_string(),
+        ([], Lang::Es) => "project_path con la carpeta del proyecto".to_string(),
+        (open, Lang::En) => format!("project_path with one of the folders open here ({})", listed(open)),
+        (open, Lang::Es) => format!("project_path con una de las carpetas abiertas ({})", listed(open)),
+    };
+    match lang {
+        Lang::En => format!(
+            "not saved: say which project this memory belongs to: {folder}, project with a project's id or name, \
+             or all_projects for one that holds in every project"
+        ),
+        Lang::Es => format!(
+            "no se guardó: di a qué proyecto pertenece esta memoria: {folder}, project con el id o el nombre de un \
+             proyecto, o all_projects para una que vale en todos los proyectos"
+        ),
+    }
+}
+
+/// Why `tool`, whose answer is about one project, did nothing with several
+/// folders open: which to pass, and that `search_memory` reads them all.
+/// `answer_suggestion` takes no path, so its folders come with their ids.
+pub fn several_folders(lang: Lang, tool: &str, open: &[(ProjectIdentity, String)]) -> String {
+    let by_id = tool == "answer_suggestion";
+    let folders = open
+        .iter()
+        .map(|(folder, id)| match (by_id, lang) {
+            (true, Lang::En) => format!("{id} at {}", folder.root.display()),
+            (true, Lang::Es) => format!("{id} en {}", folder.root.display()),
+            (false, _) => folder.root.display().to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pass = match (lang, by_id) {
+        (Lang::En, true) => "pass project with the id of the one the suggestion is about",
+        (Lang::En, false) => "pass project_path with the one you work in, or project",
+        (Lang::Es, true) => "pasa project con el id de aquel del que habla la sugerencia",
+        (Lang::Es, false) => "pasa project_path con la carpeta en la que trabajas, o project",
+    };
+    match lang {
+        Lang::En => format!(
+            "not done: several folders are open here ({folders}) and {tool} answers for one project: {pass}; \
+             search_memory searches them all"
+        ),
+        Lang::Es => format!(
+            "no se hizo: hay varias carpetas abiertas ({folders}) y {tool} responde por un proyecto: {pass}; \
+             search_memory busca en todas"
+        ),
+    }
 }
 
 /// The `memory_status` line on whose memories `reader` reads besides its own.
@@ -1244,11 +1316,11 @@ mod tests {
     #[test]
     fn a_poor_search_names_the_memories_in_the_other_language() {
         let found = Found { other_language: other("en", 12), ..shown(scored(&[0.5])) };
-        let out = format_search(found, "a", None, Some(Lang::Es));
+        let out = format_search(found, "a", &[], Some(Lang::Es));
         assert!(out.ends_with(&format!("\n\n{TWELVE_IN_ENGLISH}")), "{out}");
 
         let nothing = Found { hits: Vec::new(), withheld: 4, other_language: other("en", 1) };
-        let out = format_search(nothing, "a", None, Some(Lang::Es));
+        let out = format_search(nothing, "a", &[], Some(Lang::Es));
         assert!(out.starts_with("no hay memorias relevantes para esta consulta: 4 buscadas"), "{out}");
         assert!(
             out.ends_with("clawg: 1 memoria de este ámbito sigue en inglés, y una consulta encuentra mejor una memoria en su \
@@ -1256,36 +1328,36 @@ mod tests {
             "{out}"
         );
         let empty = Found { hits: Vec::new(), withheld: 0, other_language: other("es", 2) };
-        assert!(format_search(empty, "a", None, Some(Lang::En)).contains("2 memories in this scope are still in Spanish"));
+        assert!(format_search(empty, "a", &[], Some(Lang::En)).contains("2 memories in this scope are still in Spanish"));
     }
 
     #[test]
     fn a_search_that_shows_enough_says_nothing_of_the_other_language() {
         let three = scored(&[0.5, 0.5, 0.5]);
-        let with = format_search(Found { other_language: other("en", 12), ..shown(three.clone()) }, "a", None, Some(Lang::Es));
-        assert_eq!(with, format_search(shown(three), "a", None, None));
+        let with = format_search(Found { other_language: other("en", 12), ..shown(three.clone()) }, "a", &[], Some(Lang::Es));
+        assert_eq!(with, format_search(shown(three), "a", &[], None));
     }
 
     #[test]
     fn no_memories_in_the_other_language_means_no_line() {
         let one = scored(&[0.5]);
-        let with = format_search(Found { other_language: other("en", 0), ..shown(one.clone()) }, "a", None, Some(Lang::Es));
-        assert_eq!(with, format_search(shown(one), "a", None, None));
+        let with = format_search(Found { other_language: other("en", 0), ..shown(one.clone()) }, "a", &[], Some(Lang::Es));
+        assert_eq!(with, format_search(shown(one), "a", &[], None));
     }
 
     #[test]
     fn without_a_preference_no_line() {
         let one = scored(&[0.5]);
-        let with = format_search(Found { other_language: other("en", 12), ..shown(one.clone()) }, "a", None, None);
-        assert_eq!(with, format_search(shown(one), "a", None, None));
+        let with = format_search(Found { other_language: other("en", 12), ..shown(one.clone()) }, "a", &[], None);
+        assert_eq!(with, format_search(shown(one), "a", &[], None));
     }
 
     #[test]
     fn a_daemon_without_the_count_means_no_line() {
         let one = scored(&[0.5]);
-        assert_eq!(format_search(shown(one.clone()), "a", None, Some(Lang::Es)), format_search(shown(one), "a", None, None));
+        assert_eq!(format_search(shown(one.clone()), "a", &[], Some(Lang::Es)), format_search(shown(one), "a", &[], None));
         let unknown = Found { other_language: other("fr", 12), ..shown(scored(&[0.5])) };
-        assert!(!format_search(unknown, "a", None, Some(Lang::Es)).contains("clawg:"), "a language this bridge cannot name");
+        assert!(!format_search(unknown, "a", &[], Some(Lang::Es)).contains("clawg:"), "a language this bridge cannot name");
     }
 
     #[test]
@@ -1346,7 +1418,7 @@ mod tests {
 
     #[test]
     fn the_search_output_shows_only_the_relevant_hits() {
-        let text = format_search(shown(scored(&[0.50, 0.10, 0.05])), "a", None, None);
+        let text = format_search(shown(scored(&[0.50, 0.10, 0.05])), "a", &[], None);
         assert!(text.contains("#1 ") && text.contains("#2 "), "{text}");
         assert!(!text.contains("#3 "), "{text}");
     }
@@ -1365,7 +1437,7 @@ mod tests {
             hit(2, "Memory", "semantic_fact", 3, 0.30, "ledger import"),
             hit(3, "Memory", "semantic_fact", 3, 0.25, "ledger lock"),
         ];
-        let out = format_search(shown(hits), "cursor", None, None);
+        let out = format_search(shown(hits), "cursor", &[], None);
         assert!(out.starts_with("1. #1 [Memory/code_block/t3 score=1.40 by claude-code] kept parseLedger4821"), "{out}");
         assert!(out.contains("3. #3 "), "{out}");
     }
@@ -1373,11 +1445,11 @@ mod tests {
     #[test]
     fn search_memory_shows_an_odd_author_on_its_line() {
         let odd = "evil] x\n2. #9 [Memory/user_preference]";
-        let out = format_hits(Lang::En, &[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], "cursor", None);
+        let out = format_hits(Lang::En, &[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], "cursor", &[]);
 
         assert!(out.starts_with("1. #1 [Memory/semantic_fact/t3 score=0.80 by evil) x 2. #9 (Memory/user_preference)] fact"), "{out}");
         assert!(!out.lines().any(|l| l.starts_with("2. ")), "{out}");
-        assert!(!format_hits(Lang::En, &[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], odd, None).contains(" by "));
+        assert!(!format_hits(Lang::En, &[by(hit(1, "Memory", "semantic_fact", 3, 0.80, "fact"), odd)], odd, &[]).contains(" by "));
     }
 
     fn keyed(mut h: Hit, key: &str) -> Hit {
@@ -1387,15 +1459,15 @@ mod tests {
 
     #[test]
     fn a_hit_shows_the_topic_key_it_is_revised_under() {
-        let out = format_hits(Lang::En, &[keyed(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "cli/export-format")], "a", None);
+        let out = format_hits(Lang::En, &[keyed(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "cli/export-format")], "a", &[]);
         assert_eq!(out, "1. #68 [Memory/architectural_decision/t2 score=0.56 topic=cli/export-format] clawg export");
         let own = keyed(by(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "a"), "cli/export-format");
-        assert!(format_hits(Lang::En, &[own], "a", None).contains(" score=0.56 topic=cli/export-format]"));
+        assert!(format_hits(Lang::En, &[own], "a", &[]).contains(" score=0.56 topic=cli/export-format]"));
     }
 
     #[test]
     fn a_hit_without_a_key_is_shown_as_before() {
-        let out = format_hits(Lang::En, &[hit(68, "Memory", "semantic_fact", 2, 0.56, "clawg export")], "a", None);
+        let out = format_hits(Lang::En, &[hit(68, "Memory", "semantic_fact", 2, 0.56, "clawg export")], "a", &[]);
         assert_eq!(out, "1. #68 [Memory/semantic_fact/t2 score=0.56] clawg export");
     }
 
@@ -1404,7 +1476,7 @@ mod tests {
     #[test]
     fn another_agents_hit_shows_its_topic_key() {
         let shared = keyed(by(hit(68, "Memory", "architectural_decision", 2, 0.56, "clawg export"), "claude-code"), "cli/export-format");
-        let out = format_hits(Lang::En, &[shared], "cursor", None);
+        let out = format_hits(Lang::En, &[shared], "cursor", &[]);
         assert!(
             out.starts_with("1. #68 [Memory/architectural_decision/t2 score=0.56 topic=cli/export-format by claude-code] clawg export"),
             "{out}"
@@ -1427,10 +1499,10 @@ mod tests {
     fn a_hit_of_another_project_does_not_show_its_topic_key() {
         let elsewhere = placed(preference(68), Some("other"));
         assert_eq!(
-            format_hits(Lang::En, std::slice::from_ref(&elsewhere), "a", Some("here")),
+            format_hits(Lang::En, std::slice::from_ref(&elsewhere), "a", &["here".into()]),
             "1. #68 [Memory/user_preference/t2 score=0.56] tabs"
         );
-        assert!(format_hits(Lang::En, &[elsewhere], "a", Some("other")).contains(" score=0.56 topic=style/indent]"));
+        assert!(format_hits(Lang::En, &[elsewhere], "a", &["other".into()]).contains(" score=0.56 topic=style/indent]"));
     }
 
     /// A bridge with a project revises a preference of every project only by
@@ -1439,63 +1511,81 @@ mod tests {
     #[test]
     fn a_hit_without_a_project_shows_how_a_save_revises_it() {
         let unplaced = placed(preference(68), None);
-        for project in [Some("here"), None] {
-            let out = format_hits(Lang::En, std::slice::from_ref(&unplaced), "a", project);
-            assert!(out.contains(" score=0.56 topic=style/indent all_projects]"), "{project:?}: {out}");
-        }
+        assert!(
+            format_hits(Lang::En, std::slice::from_ref(&unplaced), "a", &["here".into()]).contains(" score=0.56 topic=style/indent all_projects]")
+        );
+        assert!(format_hits(Lang::En, &[unplaced], "a", &[]).contains(" score=0.56 topic=style/indent]"));
 
         let fact = placed(keyed(hit(68, "Memory", "semantic_fact", 2, 0.56, "tabs"), "style/indent"), None);
-        for project in [Some("here"), None] {
-            let out = format_hits(Lang::En, std::slice::from_ref(&fact), "a", project);
-            assert!(!out.contains("topic="), "no save goes to no project but one with all_projects: {out}");
-        }
+        assert!(!format_hits(Lang::En, std::slice::from_ref(&fact), "a", &["here".into()]).contains("topic="));
+        assert!(format_hits(Lang::En, &[fact], "a", &[]).contains(" score=0.56 topic=style/indent]"));
+    }
+
+    /// With several folders open a search reads several projects, and each
+    /// hit names its own: the id `project` takes to save there.
+    #[test]
+    fn format_hits_names_the_project_of_each_hit_of_a_group() {
+        let hits = [
+            placed(hit(1, "Memory", "semantic_fact", 2, 0.9, "in alpha"), Some("alpha-1a2b")),
+            placed(hit(2, "Memory", "semantic_fact", 2, 0.8, "in none"), None),
+            hit(3, "Memory", "semantic_fact", 2, 0.7, "from an older daemon"),
+        ];
+        let group = ["alpha-1a2b".to_string(), "beta-3c4d".to_string()];
+
+        let out = format_hits(Lang::En, &hits, "a", &group);
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(lines[0], "1. #1 [Memory/semantic_fact/t2 score=0.90 project=alpha-1a2b] in alpha");
+        assert_eq!(lines[1], "2. #2 [Memory/semantic_fact/t2 score=0.80] in none");
+        assert_eq!(lines[2], "3. #3 [Memory/semantic_fact/t2 score=0.70] from an older daemon");
+        assert!(!format_hits(Lang::En, &hits, "a", &group[..1]).contains("project="), "one project names none");
     }
 
     #[test]
-    fn a_group_hit_names_its_project_and_its_key() {
-        let fact = |id: i64, project: Option<&str>| placed(keyed(hit(id, "Memory", "semantic_fact", 2, 0.56, "tabs"), "style/indent"), project);
-        let shared = Hit { agent_id: Some("cursor".into()), ..fact(70, Some("web-3c4d")) };
-        let hits = vec![
-            fact(68, Some("app-1a2b")),
-            shared,
-            fact(71, None),
-            placed(preference(72), None),
-            hit(73, "Memory", "semantic_fact", 2, 0.56, "from an older daemon"),
-        ];
+    fn a_project_named_by_a_hit_keeps_the_hit_on_its_line() {
+        let odd = placed(hit(1, "Memory", "semantic_fact", 2, 0.9, "x"), Some("a]b\nc-1a2b"));
+        let group = ["a]b\nc-1a2b".to_string(), "beta-3c4d".to_string()];
 
-        let out = format_group_search(shown(hits), "a", None);
+        let out = format_hits(Lang::En, &[odd], "a", &group);
 
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "1. #68 [Memory/semantic_fact/t2 score=0.56 project=app-1a2b topic=style/indent] tabs");
-        assert_eq!(lines[1], "2. #70 [Memory/semantic_fact/t2 score=0.56 project=web-3c4d topic=style/indent by cursor] tabs");
-        assert_eq!(lines[2], "3. #71 [Memory/semantic_fact/t2 score=0.56] tabs", "no project to name, and no save revises it");
-        assert_eq!(lines[3], "4. #72 [Memory/user_preference/t2 score=0.56 topic=style/indent all_projects] tabs");
-        assert_eq!(lines[4], "5. #73 [Memory/semantic_fact/t2 score=0.56] from an older daemon");
+        assert_eq!(out, "1. #1 [Memory/semantic_fact/t2 score=0.90 project=a)b c-1a2b] x");
+    }
+
+    #[test]
+    fn the_key_shows_on_a_row_of_any_open_folder() {
+        let in_beta = Hit { agent_id: Some("cursor".into()), ..placed(keyed(hit(5, "Memory", "semantic_fact", 2, 0.56, "x"), "deploy/day"), Some("beta-3c4d")) };
+        let group = ["alpha-1a2b".to_string(), "beta-3c4d".to_string()];
+
+        assert!(
+            format_hits(Lang::En, std::slice::from_ref(&in_beta), "a", &group).contains(" score=0.56 topic=deploy/day project=beta-3c4d by cursor] x"),
+            "the key, then the project, then the author"
+        );
+        assert!(!format_hits(Lang::En, &[in_beta], "a", &group[..1]).contains("topic="), "a save in alpha would not revise it");
     }
 
     #[test]
     fn a_marked_key_stays_before_the_author_of_the_hit() {
         let shared = Hit { agent_id: Some("cursor".into()), ..placed(preference(68), None) };
         assert!(
-            format_hits(Lang::En, &[shared], "a", Some("here")).contains(" score=0.56 topic=style/indent all_projects by cursor] tabs")
+            format_hits(Lang::En, &[shared], "a", &["here".into()]).contains(" score=0.56 topic=style/indent all_projects by cursor] tabs")
         );
     }
 
     #[test]
     fn a_hit_from_an_older_daemon_shows_its_key() {
-        assert!(format_hits(Lang::En, &[preference(68)], "a", Some("here")).contains(" score=0.56 topic=style/indent]"));
+        assert!(format_hits(Lang::En, &[preference(68)], "a", &["here".into()]).contains(" score=0.56 topic=style/indent]"));
     }
 
     #[test]
     fn search_says_when_nothing_was_relevant() {
         let sentence = |n: usize| format!("no relevant memories for this query: {n} searched, none close enough to show");
-        assert_eq!(format_search(Found { hits: Vec::new(), withheld: 3, other_language: None }, "a", None, None), sentence(3), "the daemon cut them all");
-        assert_eq!(format_search(Found { hits: scored(&[0.0, 0.0]), withheld: 1, other_language: None }, "a", None, None), sentence(3), "the bridge cut the rest");
+        assert_eq!(format_search(Found { hits: Vec::new(), withheld: 3, other_language: None }, "a", &[], None), sentence(3), "the daemon cut them all");
+        assert_eq!(format_search(Found { hits: scored(&[0.0, 0.0]), withheld: 1, other_language: None }, "a", &[], None), sentence(3), "the bridge cut the rest");
     }
 
     #[test]
     fn nothing_stored_is_not_called_irrelevant() {
-        assert_eq!(format_search(shown(Vec::new()), "a", None, None), "no memories found");
+        assert_eq!(format_search(shown(Vec::new()), "a", &[], None), "no memories found");
     }
 
     #[test]
@@ -1569,7 +1659,7 @@ mod tests {
 
     #[test]
     fn format_hits_says_so_when_there_are_none() {
-        assert_eq!(format_hits(Lang::En, &[], "a", None), "no memories found");
+        assert_eq!(format_hits(Lang::En, &[], "a", &[]), "no memories found");
     }
 
     #[test]
@@ -1577,7 +1667,7 @@ mod tests {
         let out = format_hits(Lang::En, &[
             hit(42, "Memory", "semantic_fact", 2, 0.876, "first"),
             hit(7, "Procedural", "procedural_skill", 1, 0.5, "second"),
-        ], "a", None);
+        ], "a", &[]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("1. #42 "), "line was: {}", lines[0]);
@@ -1586,7 +1676,7 @@ mod tests {
 
     #[test]
     fn format_hits_carries_kind_type_tier_and_score() {
-        let out = format_hits(Lang::En, &[hit(42, "Memory", "semantic_fact", 2, 0.876, "content here")], "a", None);
+        let out = format_hits(Lang::En, &[hit(42, "Memory", "semantic_fact", 2, 0.876, "content here")], "a", &[]);
         assert!(out.contains("Memory/semantic_fact/t2"), "out was: {out}");
         assert!(out.contains("score=0.88"), "score must be readable, not raw f64: {out}");
         assert!(out.contains("content here"), "out was: {out}");
@@ -1595,7 +1685,7 @@ mod tests {
     #[test]
     fn format_hits_truncates_long_content() {
         let long = "x".repeat(CONTENT_PREVIEW_LIMIT + 100);
-        let out = format_hits(Lang::En, &[hit(1, "Memory", "chat_message", 3, 0.1, &long)], "a", None);
+        let out = format_hits(Lang::En, &[hit(1, "Memory", "chat_message", 3, 0.1, &long)], "a", &[]);
         assert!(out.ends_with('…'), "out ended: {:?}", &out[out.len().saturating_sub(20)..]);
         assert!(out.len() < long.len(), "the preview must be shorter than the content");
     }
@@ -1604,7 +1694,7 @@ mod tests {
     fn format_hits_names_the_piece_of_a_long_save() {
         let mut piece = hit(58, "Memory", "semantic_fact", 3, 0.81, "the retry budget was set");
         piece.piece = Some(crate::client::PiecePosition { piece: 2, pieces: 4 });
-        let out = format_hits(Lang::En, &[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")], "a", None);
+        let out = format_hits(Lang::En, &[piece, hit(7, "Memory", "semantic_fact", 3, 0.5, "a short one")], "a", &[]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #58 [Memory/semantic_fact/t3 piece=2/4 score=0.81] the retry budget was set");
         assert_eq!(lines[1], "2. #7 [Memory/semantic_fact/t3 score=0.50] a short one");
@@ -1615,7 +1705,7 @@ mod tests {
         let mut inferred = hit(9, "Memory", "user_preference", 1, 0.9, "tabs");
         inferred.origin = Some("inferred".into());
         inferred.piece = Some(crate::client::PiecePosition { piece: 1, pieces: 2 });
-        let out = format_hits(Lang::En, &[inferred, hit(10, "Memory", "user_preference", 1, 0.8, "spaces")], "a", None);
+        let out = format_hits(Lang::En, &[inferred, hit(10, "Memory", "user_preference", 1, 0.8, "spaces")], "a", &[]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #9 [Memory/user_preference/t1 inferred piece=1/2 score=0.90] tabs");
         assert_eq!(lines[1], "2. #10 [Memory/user_preference/t1 score=0.80] spaces", "no mark, the line of before");
@@ -1625,7 +1715,7 @@ mod tests {
     /// the numbering meaningless to whoever is reading it.
     #[test]
     fn format_hits_keeps_each_hit_on_one_line() {
-        let out = format_hits(Lang::En, &[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")], "a", None);
+        let out = format_hits(Lang::En, &[hit(1, "Memory", "chat_message", 3, 0.1, "two\nlines")], "a", &[]);
         assert_eq!(out.lines().count(), 1, "out was: {out:?}");
     }
 
@@ -1646,11 +1736,11 @@ mod tests {
             memory_type: None,
         };
         assert_eq!(
-            format_save(Lang::En, &save, None),
+            format_save(Lang::En, &save, &[]),
             "#58 is piece 2 of 4 of one save: #57, #58, (missing), #60\nfirst and second\nfourth"
         );
         let single = SavedText { piece: 1, pieces: 1, ids: vec![Some(58)], missing: vec![], text: "short".into(), ..save };
-        assert_eq!(format_save(Lang::En, &single, None), "#58\nshort");
+        assert_eq!(format_save(Lang::En, &single, &[]), "#58\nshort");
     }
 
     #[test]
@@ -1667,10 +1757,10 @@ mod tests {
             project_id: None,
             memory_type: None,
         };
-        assert_eq!(format_save(Lang::En, &single, None), "#68 topic=cli/export-format\nshort");
+        assert_eq!(format_save(Lang::En, &single, &[]), "#68 topic=cli/export-format\nshort");
         let piece = SavedText { piece: 2, pieces: 3, ids: vec![Some(67), Some(68), Some(69)], ..single };
         assert_eq!(
-            format_save(Lang::En, &piece, None),
+            format_save(Lang::En, &piece, &[]),
             "#68 is piece 2 of 3 of one save: #67, #68, #69 topic=cli/export-format\nshort"
         );
     }
@@ -1689,17 +1779,17 @@ mod tests {
             project_id: Some(Some("other".into())),
             memory_type: Some("user_preference".into()),
         };
-        assert_eq!(format_save(Lang::En, &save, Some("here")), "#68\ntabs");
-        assert_eq!(format_save(Lang::En, &save, Some("other")), "#68 topic=style/indent\ntabs");
+        assert_eq!(format_save(Lang::En, &save, &["here".into()]), "#68\ntabs");
+        assert_eq!(format_save(Lang::En, &save, &["other".into()]), "#68 topic=style/indent\ntabs");
         let every_project = SavedText { project_id: Some(None), ..save.clone() };
-        assert_eq!(format_save(Lang::En, &every_project, Some("here")), "#68 topic=style/indent all_projects\ntabs");
-        assert_eq!(format_save(Lang::En, &every_project, None), "#68 topic=style/indent all_projects\ntabs");
+        assert_eq!(format_save(Lang::En, &every_project, &["here".into()]), "#68 topic=style/indent all_projects\ntabs");
+        assert_eq!(format_save(Lang::En, &every_project, &[]), "#68 topic=style/indent\ntabs");
         let a_fact = SavedText { memory_type: Some("semantic_fact".into()), ..every_project.clone() };
-        assert_eq!(format_save(Lang::En, &a_fact, Some("here")), "#68\ntabs");
+        assert_eq!(format_save(Lang::En, &a_fact, &["here".into()]), "#68\ntabs");
         let no_type_sent = SavedText { memory_type: None, ..every_project };
-        assert_eq!(format_save(Lang::En, &no_type_sent, Some("here")), "#68\ntabs", "a daemon that does not send the type");
+        assert_eq!(format_save(Lang::En, &no_type_sent, &["here".into()]), "#68\ntabs", "a daemon that does not send the type");
         let from_an_older_daemon = SavedText { project_id: None, ..save };
-        assert_eq!(format_save(Lang::En, &from_an_older_daemon, Some("here")), "#68 topic=style/indent\ntabs");
+        assert_eq!(format_save(Lang::En, &from_an_older_daemon, &["here".into()]), "#68 topic=style/indent\ntabs");
     }
 
     // ── format_rows ─────────────────────────────────────────────────────────
@@ -2122,21 +2212,54 @@ mod tests {
         assert_eq!(format_context(Lang::En, "   \n "), "no context yet");
     }
 
+    // ── resolve_project ─────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_project_resolves_an_explicit_path() {
+        let default = identity("proj-default");
+        let resolved = resolve_project(Some(&default), Some("/some/other/project"), false, |p| {
+            assert_eq!(p, Path::new("/some/other/project"));
+            identity("other-1a2b")
+        })
+        .expect("an explicit path must resolve");
+        assert_eq!(resolved.id, "other-1a2b", "an explicit path must override the default");
+    }
+
+    #[test]
+    fn without_a_path_the_bridges_own_project_is_used() {
+        let default = identity("proj-default");
+        let resolved = resolve_project(Some(&default), Some(""), false, |_| unreachable!());
+        assert_eq!(resolved, Some(default));
+    }
+
+    /// The only way to ask for the unscoped view. A caller that passed both
+    /// meant the broader one — narrowing it would silently ignore the request.
+    #[test]
+    fn all_projects_outranks_everything() {
+        let d = identity("d");
+        assert_eq!(resolve_project(Some(&d), Some("/p"), true, |_| unreachable!()), None);
+        assert_eq!(resolve_project(None, None, true, |_| unreachable!()), None);
+    }
+
+    #[test]
+    fn resolve_project_is_none_when_there_is_nothing_to_scope_to() {
+        assert_eq!(resolve_project(None, None, false, |_| unreachable!()), None);
+    }
+
     fn identity(id: &str) -> ProjectIdentity {
         ProjectIdentity { id: id.into(), root: format!("/{id}").into(), legacy_id: id.into(), path: format!("/{id}").into() }
     }
 
     #[test]
-    fn only_a_folder_the_person_opened_is_indexed() {
-        let (root, start) = (identity("root-5e6f"), identity("repo-1a2b"));
-        let opened = [&root, &start];
-        assert!(indexes_docs(&root, &opened), "a root the client declared");
-        assert!(indexes_docs(&start, &opened), "the directory the bridge was started in");
-        assert!(!indexes_docs(&identity("other-3c4d"), &opened), "a folder the model named");
-        assert!(!indexes_docs(&start, &[]), "with no folder open, none");
+    fn only_an_open_folder_is_indexed() {
+        let (own, open) = (identity("repo-1a2b"), identity("open-5e6f"));
+        assert!(indexes_docs(&own, &[open.clone(), own.clone()]));
+        assert!(indexes_docs(&open, &[open.clone(), own.clone()]));
+        assert!(!indexes_docs(&identity("other-3c4d"), &[open, own.clone()]));
+        assert!(!indexes_docs(&own, &[]), "a bridge with no folder open indexes nothing");
         // Two roots that collide share an id; only the root says which is open.
-        let twin = ProjectIdentity { root: "/elsewhere/repo-1a2b".into(), ..start.clone() };
-        assert!(!indexes_docs(&twin, &opened));
+        let twin = ProjectIdentity { root: "/elsewhere/repo-1a2b".into(), ..own.clone() };
+        assert!(!indexes_docs(&twin, &[own]));
     }
 
     // ── format_status ───────────────────────────────────────────────────────
@@ -2280,7 +2403,7 @@ mod tests {
             by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"),
             by(hit(2, "Memory", "semantic_fact", 3, 0.70, "ajena"), "claude-code"),
         ];
-        let out = format_search(shown(hits), "cursor", None, None);
+        let out = format_search(shown(hits), "cursor", &[], None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "1. #1 [Memory/semantic_fact/t2 score=0.80] propia");
         assert_eq!(lines[1], "2. #2 [Memory/semantic_fact/t3 score=0.70 by claude-code] ajena");
@@ -2292,7 +2415,7 @@ mod tests {
     fn format_search_leaves_own_hits_alone() {
         let own = vec![by(hit(1, "Memory", "semantic_fact", 2, 0.80, "propia"), "cursor"), hit(2, "Memory", "semantic_fact", 3, 0.70, "vieja")];
         assert_eq!(
-            format_search(shown(own), "cursor", None, None),
+            format_search(shown(own), "cursor", &[], None),
             "1. #1 [Memory/semantic_fact/t2 score=0.80] propia\n2. #2 [Memory/semantic_fact/t3 score=0.70] vieja"
         );
     }
@@ -2307,16 +2430,16 @@ mod tests {
             piece: Some(crate::client::PiecePosition { piece: 2, pieces: 3 }),
             ..hit(4, "memory", "semantic_fact", 3, 0.91, "El puerto es 8080")
         };
-        let en = format_search(shown(vec![shared.clone()]), "a", None, None);
-        let es = format_search(shown(vec![shared]), "a", None, Some(Lang::Es));
+        let en = format_search(shown(vec![shared.clone()]), "a", &[], None);
+        let es = format_search(shown(vec![shared]), "a", &[], Some(Lang::Es));
         let line = "1. #4 [memory/semantic_fact/t3 piece=2/3 score=0.91 topic=api/port by cursor] El puerto es 8080";
         assert_eq!(en.lines().next(), Some(line));
         assert_eq!(es.lines().next(), Some(line), "a hit line is markers and the row's own text");
         assert_eq!(es.lines().nth(1), Some(shared_note(Lang::Es)));
-        assert_eq!(format_search(shown(Vec::new()), "a", None, Some(Lang::Es)), "no se encontraron memorias");
+        assert_eq!(format_search(shown(Vec::new()), "a", &[], Some(Lang::Es)), "no se encontraron memorias");
         let none = Found { hits: Vec::new(), withheld: 3, other_language: None };
         assert_eq!(
-            format_search(none, "a", None, Some(Lang::Es)),
+            format_search(none, "a", &[], Some(Lang::Es)),
             "no hay memorias relevantes para esta consulta: 3 buscadas, ninguna lo bastante cerca para mostrarla"
         );
     }
@@ -2376,7 +2499,7 @@ mod tests {
             project_id: None,
             memory_type: None,
         };
-        assert_eq!(format_save(Lang::Es, &save, None), "#5 es la pieza 2 de 3 de un save: #4, #5, (falta)\ntexto");
+        assert_eq!(format_save(Lang::Es, &save, &[]), "#5 es la pieza 2 de 3 de un save: #4, #5, (falta)\ntexto");
     }
 
     #[test]

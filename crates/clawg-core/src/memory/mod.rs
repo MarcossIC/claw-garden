@@ -69,7 +69,7 @@ pub use record::{
 /// caller. Keeping the import path one level shorter than `memory::search::…`
 /// mirrors how [`MemoryStore`] is already re-exported out of `db`.
 pub use pieces::{read_save_core, SaveText};
-pub use search::{search_all_memories, search_projects, PiecePosition, RankedHit, SearchScope};
+pub use search::{search_all_memories, PiecePosition, RankedHit, SearchScope};
 
 pub mod clock;
 pub(crate) mod latency;

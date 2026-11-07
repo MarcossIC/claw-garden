@@ -156,7 +156,7 @@ impl Sandbox {
                 }
             }
         });
-        Bridge { child, stdin, lines, log, root }
+        Bridge { child, stdin, lines, log }
     }
 }
 
@@ -343,8 +343,6 @@ struct Bridge {
     stdin: ChildStdin,
     lines: mpsc::Receiver<String>,
     log: PathBuf,
-    /// The folder it was started in, which a save names as its project.
-    root: PathBuf,
 }
 
 impl Bridge {
@@ -1358,7 +1356,7 @@ async fn a_daemon_without_a_port_serves_status_stop_bridge_and_hooks_over_its_so
 
     let mut bridge = sandbox.bridge();
     bridge.initialize();
-    let saved = bridge.call(2, "save_memory", json!({ "content": "the bridge reaches the daemon over its socket", "project_path": bridge.root }));
+    let saved = bridge.call(2, "save_memory", json!({ "content": "the bridge reaches the daemon over its socket", "all_projects": true }));
     assert!(!tool_failed(&saved), "{saved}");
 
     let (status, body) = daemon
@@ -1511,7 +1509,7 @@ async fn a_bridge_on_real_stdio_answers_initialize_and_the_tools_reach_the_daemo
     assert!(!tool_failed(&status), "{status}");
     assert!(tool_text(&status).contains("\"status\""), "{status}");
 
-    let saved = bridge.call(4, "save_memory", json!({ "content": "the bridge speaks real stdio", "project_path": bridge.root }));
+    let saved = bridge.call(4, "save_memory", json!({ "content": "the bridge speaks real stdio", "all_projects": true }));
     assert!(!tool_failed(&saved), "{saved}");
     let found = bridge.call(5, "search_memory", json!({ "query": "the bridge speaks real stdio" }));
     assert!(!tool_failed(&found), "{found}");
@@ -3215,7 +3213,7 @@ async fn an_older_bridge_reaches_a_new_daemon_over_the_profile_port() {
     let mut bridge = sandbox.bridge_of(&older);
 
     bridge.initialize();
-    let saved = bridge.call(2, "save_memory", json!({ "content": "an older bridge still reaches the daemon", "project_path": bridge.root }));
+    let saved = bridge.call(2, "save_memory", json!({ "content": "an older bridge still reaches the daemon", "all_projects": true }));
 
     assert!(!tool_failed(&saved), "{saved}");
 }

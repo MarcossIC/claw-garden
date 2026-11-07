@@ -670,6 +670,10 @@ pub struct SearchArgs {
     pub query: String,
     pub agent_id: String,
     pub project_id: Option<String>,
+    /// A group of projects to search at once, instead of `project_id`. Left
+    /// out when empty: a daemon that predates groups reads what it always did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub project_ids: Vec<String>,
     pub limit: Option<usize>,
     /// The language the query is in; the answer then counts the memories in
     /// the other one. Left out without it, as a daemon that predates it
@@ -689,21 +693,10 @@ struct SearchRequest<'a> {
     #[serde(flatten)]
     args: &'a SearchArgs,
     min_relative_score: f64,
-    /// The projects of a group search, left out of a search in one project
-    /// or in all of them.
-    #[serde(skip_serializing_if = "<[String]>::is_empty")]
-    project_ids: &'a [String],
 }
 
-fn search_request<'a>(args: &'a SearchArgs, group: &'a [String]) -> SearchRequest<'a> {
-    SearchRequest { args, min_relative_score: RELEVANCE_RATIO, project_ids: group }
-}
-
-/// `args` for a search in `group`: its `project_id` is the first project of
-/// the group, which a daemon that predates groups searches alone, so such a
-/// daemon answers a narrower search and never one of every project.
-fn grouped(args: SearchArgs, group: &[String]) -> SearchArgs {
-    SearchArgs { project_id: group.first().cloned().or(args.project_id), ..args }
+fn search_request(args: &SearchArgs) -> SearchRequest<'_> {
+    SearchRequest { args, min_relative_score: RELEVANCE_RATIO }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1216,15 +1209,8 @@ impl DaemonClient {
     }
 
     pub async fn search(&self, args: SearchArgs) -> Result<Found, ClientError> {
-        self.search_group(args, &[]).await
-    }
-
-    /// [`Self::search`] in every project of `group`, the hits joined by
-    /// score; an empty group is `args` as it is.
-    pub async fn search_group(&self, args: SearchArgs, group: &[String]) -> Result<Found, ClientError> {
-        let args = grouped(args, group);
         let answer = self
-            .send(Call::new(reqwest::Method::POST, "/v1/search").json(&search_request(&args, group))?)
+            .send(Call::new(reqwest::Method::POST, "/v1/search").json(&search_request(&args))?)
             .await?;
         read_response(answer)
     }
@@ -1916,24 +1902,27 @@ pub(crate) mod tests {
 
     #[test]
     fn a_search_names_its_language_only_when_it_has_one() {
-        let args = |lang| SearchArgs { query: "q".into(), agent_id: "a".into(), project_id: None, limit: None, lang };
-        let without = serde_json::to_value(search_request(&args(None), &[])).unwrap();
+        let args = |lang| SearchArgs { query: "q".into(), agent_id: "a".into(), project_id: None, project_ids: Vec::new(), limit: None, lang };
+        let without = serde_json::to_value(search_request(&args(None))).unwrap();
         assert!(without.get("lang").is_none(), "{without}");
-        let with = serde_json::to_value(search_request(&args(Some(Lang::Es)), &[])).unwrap();
+        let with = serde_json::to_value(search_request(&args(Some(Lang::Es)))).unwrap();
         assert_eq!(with["lang"], "es", "{with}");
     }
 
     #[test]
-    fn a_group_search_names_its_first_project_for_an_older_daemon() {
-        let args = SearchArgs { query: "q".into(), agent_id: "a".into(), project_id: None, limit: None, lang: None };
-        let group = ["pa".to_string(), "pb".to_string()];
-
-        let body = serde_json::to_value(search_request(&grouped(args.clone(), &group), &group)).unwrap();
-
-        assert_eq!(body["project_ids"], serde_json::json!(["pa", "pb"]), "{body}");
-        assert_eq!(body["project_id"], "pa", "an older daemon searches the first project, never every one: {body}");
-        let alone = serde_json::to_value(search_request(&args, &[])).unwrap();
-        assert!(alone.get("project_ids").is_none(), "a search in one project or in all sends no group: {alone}");
+    fn a_search_sends_a_group_only_when_it_has_one() {
+        let args = |project_ids: Vec<String>| SearchArgs {
+            query: "q".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            project_ids,
+            limit: None,
+            lang: None,
+        };
+        let one = serde_json::to_value(search_request(&args(Vec::new()))).unwrap();
+        assert!(one.get("project_ids").is_none(), "a daemon that predates groups reads what it always did: {one}");
+        let group = serde_json::to_value(search_request(&args(vec!["p".into(), "q".into()]))).unwrap();
+        assert_eq!(group["project_ids"], serde_json::json!(["p", "q"]), "{group}");
     }
 
     #[test]
@@ -2388,6 +2377,7 @@ pub(crate) mod tests {
             query: "a body travels over the socket as JSON".into(),
             agent_id: "agent-socket".into(),
             project_id: None,
+            project_ids: Vec::new(),
             limit: Some(5),
             lang: None,
         })
@@ -2525,6 +2515,7 @@ pub(crate) mod tests {
                 query: content.into(),
                 agent_id: "agent-client".into(),
                 project_id: None,
+                project_ids: Vec::new(),
                 limit: Some(5),
                 lang: None,
             })
@@ -2550,10 +2541,11 @@ pub(crate) mod tests {
             query: "q".into(),
             agent_id: "a".into(),
             project_id: None,
+            project_ids: Vec::new(),
             limit: Some(5),
             lang: None,
         };
-        let body = serde_json::to_value(search_request(&args, &[])).expect("serializes");
+        let body = serde_json::to_value(search_request(&args)).expect("serializes");
         assert_eq!(body["min_relative_score"], serde_json::json!(crate::relevance::RELEVANCE_RATIO));
         assert_eq!(body["query"], "q");
         assert_eq!(body["limit"], 5);
