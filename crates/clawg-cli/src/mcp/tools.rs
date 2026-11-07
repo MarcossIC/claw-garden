@@ -1121,16 +1121,17 @@ pub fn no_project_named(lang: Lang, open: &[ProjectIdentity]) -> String {
 }
 
 /// Why `tool`, whose answer is about one project, did nothing with several
-/// folders open: which to pass, and that `search_memory` reads them all.
+/// projects open: which to pass, and that `search_memory` reads them all.
+/// `open` holds a folder of each, offered as it is open, as [`listed`] does.
 /// `answer_suggestion` takes no path, so its folders come with their ids.
 pub fn several_folders(lang: Lang, tool: &str, open: &[(ProjectIdentity, String)]) -> String {
     let by_id = tool == "answer_suggestion";
     let folders = open
         .iter()
         .map(|(folder, id)| match (by_id, lang) {
-            (true, Lang::En) => format!("{id} at {}", folder.root.display()),
-            (true, Lang::Es) => format!("{id} en {}", folder.root.display()),
-            (false, _) => folder.root.display().to_string(),
+            (true, Lang::En) => format!("{id} at {}", folder.path.display()),
+            (true, Lang::Es) => format!("{id} en {}", folder.path.display()),
+            (false, _) => folder.path.display().to_string(),
         })
         .collect::<Vec<_>>()
         .join(", ");

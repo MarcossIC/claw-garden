@@ -628,11 +628,26 @@ impl ClawgMcp {
         roots::open_folders(&self.roots, self.default_project.as_ref(), self.home.as_deref(), ProjectIdentity::resolve)
     }
 
-    /// The open folder, when there is exactly one: what a call that names no
-    /// project reads and registers, as the bridge's own directory was.
-    fn one_folder(&self) -> Option<ProjectIdentity> {
-        let mut open = self.open_folders();
-        (open.len() == 1).then(|| open.remove(0))
+    /// The open folders, the first of each project the daemon gives them,
+    /// each registered as [`Self::ids_of`] does: two folders of one
+    /// repository are one project unless one is a declared subfolder.
+    async fn open_projects(&self, client: &DaemonClient) -> Result<Vec<(ProjectIdentity, ProjectIds)>, ClientError> {
+        let open = self.open_folders();
+        let mut projects: Vec<(ProjectIdentity, ProjectIds)> = Vec::new();
+        for folder in &open {
+            let ids = self.ids_of(client, folder.clone(), &open).await?;
+            if projects.iter().all(|(_, seen)| seen.project != ids.project) {
+                projects.push((folder.clone(), ids));
+            }
+        }
+        Ok(projects)
+    }
+
+    /// The open project, when the open folders lead to exactly one: what a
+    /// call that names no project reads, as the bridge's own directory was.
+    async fn one_project(&self, client: &DaemonClient) -> Result<Option<(ProjectIdentity, ProjectIds)>, ClientError> {
+        let mut open = self.open_projects(client).await?;
+        Ok((open.len() == 1).then(|| open.remove(0)))
     }
 
     /// The folders of `open`, as [`Self::open_folders`] gives them, whose
@@ -655,33 +670,38 @@ impl ClawgMcp {
     async fn known_ids(&self) -> Vec<String> {
         let mut ids = Vec::new();
         for folder in self.open_folders() {
-            ids.push(self.known_id(&folder).await);
+            let id = self.known_id(&folder).await;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
         }
         ids
     }
 
-    /// The refusal of `tool`, whose answer is about one project, with
-    /// several folders open; `None` with one or none.
-    async fn several_open(&self, tool: &str) -> Option<String> {
-        let open = self.open_folders();
+    /// The refusal of `tool`, whose answer is about one project, when the
+    /// open folders lead to several; `None` with one or none.
+    async fn several_open(&self, client: &DaemonClient, tool: &str) -> Result<Option<String>, ClientError> {
+        let open = self.open_projects(client).await?;
         if open.len() < 2 {
-            return None;
+            return Ok(None);
         }
-        let mut named = Vec::with_capacity(open.len());
-        for folder in open {
-            let id = self.known_id(&folder).await;
-            named.push((folder, id));
-        }
-        Some(several_folders(self.speaks(), tool, &named))
+        let named: Vec<(ProjectIdentity, String)> = open.into_iter().map(|(folder, ids)| (folder, ids.project)).collect();
+        Ok(Some(several_folders(self.speaks(), tool, &named)))
     }
 
     /// [`Self::several_open`] for a call that names neither `project` nor
     /// `project_path`; `None` for one that does.
-    async fn unnamed_with_several(&self, project: Option<&str>, project_path: Option<&str>, tool: &str) -> Option<String> {
+    async fn unnamed_with_several(
+        &self,
+        client: &DaemonClient,
+        project: Option<&str>,
+        project_path: Option<&str>,
+        tool: &str,
+    ) -> Result<Option<String>, ClientError> {
         if project.is_some() || project_path.is_some_and(|p| !p.is_empty()) {
-            return None;
+            return Ok(None);
         }
-        self.several_open(tool).await
+        self.several_open(client, tool).await
     }
 
     /// Which agent's memory a call reads and writes, and why.
@@ -1046,13 +1066,13 @@ impl ClawgMcp {
         project_path: Option<&str>,
         all_projects: bool,
     ) -> Result<Option<ProjectIds>, ClientError> {
-        let open = self.open_folders();
-        let one = match open.as_slice() {
-            [one] => Some(one),
-            _ => None,
+        let named = all_projects || project_path.is_some_and(|p| !p.is_empty());
+        let one = match named {
+            true => None,
+            false => self.one_project(client).await?.map(|(folder, _)| folder),
         };
-        match resolve_project(one, project_path, all_projects, ProjectIdentity::resolve) {
-            Some(project) => self.ids_of(client, project, &open).await.map(Some),
+        match resolve_project(one.as_ref(), project_path, all_projects, ProjectIdentity::resolve) {
+            Some(project) => self.ids_of(client, project, &self.open_folders()).await.map(Some),
             None => Ok(None),
         }
     }
@@ -1266,14 +1286,7 @@ impl ClawgMcp {
                     };
                     (project_id, Vec::new(), save_projects)
                 } else {
-                    let open = self.open_folders();
-                    let mut ids: Vec<String> = Vec::new();
-                    for folder in &open {
-                        let id = self.ids_of(&client, folder.clone(), &open).await?.project;
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                        }
-                    }
+                    let ids: Vec<String> = self.open_projects(&client).await?.into_iter().map(|(_, ids)| ids.project).collect();
                     match ids.as_slice() {
                         [one] => (Some(one.clone()), Vec::new(), ids),
                         _ => (None, ids.clone(), ids),
@@ -1310,12 +1323,14 @@ impl ClawgMcp {
         if let Some(both) = self.one_place(args.project.as_deref(), args.project_path.as_deref(), "project_path") {
             return Self::failed(both);
         }
-        if let Some(several) = self.unnamed_with_several(args.project.as_deref(), args.project_path.as_deref(), "recall_context").await {
-            return Self::failed(several);
-        }
         let args = &args;
         let result = self
             .call(|client| async move {
+                if let Some(several) =
+                    self.unnamed_with_several(&client, args.project.as_deref(), args.project_path.as_deref(), "recall_context").await?
+                {
+                    return Ok(Err(several));
+                }
                 let project_id = match self.scope_for(&client, args.project.as_deref(), args.project_path.as_deref(), false).await? {
                     Ok(project_id) => project_id,
                     Err(refusal) => return Ok(Err(refusal)),
@@ -1560,12 +1575,14 @@ impl ClawgMcp {
         if let Some(both) = self.one_place(args.project.as_deref(), args.project_path.as_deref(), "project_path") {
             return Self::failed(both);
         }
-        if let Some(several) = self.unnamed_with_several(args.project.as_deref(), args.project_path.as_deref(), "search_project").await {
-            return Self::failed(several);
-        }
         let args = &args;
         let result = self
             .call(|client| async move {
+                if let Some(several) =
+                    self.unnamed_with_several(&client, args.project.as_deref(), args.project_path.as_deref(), "search_project").await?
+                {
+                    return Ok(Err(several));
+                }
                 // A root's docs describe its checkout, so two clones of one
                 // project each search their own; a project named searches
                 // its oldest folder the daemon may read, else its oldest.
@@ -1627,14 +1644,16 @@ impl ClawgMcp {
             return Self::failed(both);
         }
         let all_projects = args.all_projects.unwrap_or(false);
-        if !all_projects {
-            if let Some(several) = self.unnamed_with_several(args.project.as_deref(), args.project_path.as_deref(), "synthesize").await {
-                return Self::failed(several);
-            }
-        }
         let args = &args;
         let result = self
             .call(|client| async move {
+                if !all_projects {
+                    if let Some(several) =
+                        self.unnamed_with_several(&client, args.project.as_deref(), args.project_path.as_deref(), "synthesize").await?
+                    {
+                        return Ok(Err(several));
+                    }
+                }
                 let project_id =
                     match self.scope_for(&client, args.project.as_deref(), args.project_path.as_deref(), all_projects).await? {
                         Ok(project_id) => project_id,
@@ -1657,12 +1676,12 @@ impl ClawgMcp {
     /// The user's answer to a suggestion `recall_context` showed: only a
     /// pending one is answered, and only with their words.
     pub async fn answer_suggestion_impl(&self, args: AnswerSuggestionArgs) -> Result<CallToolResult, rmcp::ErrorData> {
-        if let Some(several) = self.unnamed_with_several(args.project.as_deref(), None, "answer_suggestion").await {
-            return Self::failed(several);
-        }
         let args = &args;
         let result = self
             .call(|client| async move {
+                if let Some(several) = self.unnamed_with_several(&client, args.project.as_deref(), None, "answer_suggestion").await? {
+                    return Ok(Err(several));
+                }
                 // By id too, so the bridge's own project, merged since it
                 // registered, is the live one the suggestion names.
                 let reference = match args.project.clone() {
@@ -1708,13 +1727,15 @@ impl ClawgMcp {
                 // and the user has to learn that a change waits for a new one.
                 let language = format_language(self.language, clawg_core::preferences::language_in(client.base_dir()));
                 // A daemon that predates the pair table has nothing to count,
+                // a folder it cannot register leaves no project to count in,
                 // and a status must not fail over a line it can leave out.
-                let project = match self.one_folder() {
-                    Some(folder) => Some(self.known_id(&folder).await),
-                    None => None,
+                let conflicts = match self.one_project(&client).await {
+                    Ok(one) => {
+                        let project = one.map(|(_, ids)| ids.project);
+                        client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(lang, &open)).ok()
+                    }
+                    Err(_) => None,
                 };
-                let conflicts =
-                    client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(lang, &open)).ok();
                 Self::ok(format_status(
                     lang,
                     &health,
@@ -5504,12 +5525,17 @@ mod tests {
     /// Saves [`DEPLOY`] straight to the daemon in `project`, as another
     /// session would have, and returns its id.
     async fn seed_in(b: &ClawgMcp, project: &ProjectIdentity) -> i64 {
+        seed_under(b, &project.id).await
+    }
+
+    /// [`seed_in`] by the project's id.
+    async fn seed_under(b: &ClawgMcp, project_id: &str) -> i64 {
         let client = b.client.get().await.expect("daemon");
         let saved = client
             .save(SaveArgs {
                 content: DEPLOY.into(),
                 agent_id: "a".into(),
-                project_id: Some(project.id.clone()),
+                project_id: Some(project_id.to_string()),
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
@@ -5726,6 +5752,43 @@ mod tests {
 
         assert!(one.ends_with("\nconflict candidates: none open"), "the pair is of another project: {one}");
         assert!(several.contains("conflict candidates: 1 for you to judge"), "{several}");
+    }
+
+    #[tokio::test]
+    async fn the_open_subfolders_of_one_repository_are_each_its_own_project() {
+        let (_repo, mono) = monorepo();
+        let (b, _d) = bridge().await;
+        let web = declare_web(&b, &mono).await;
+        let m = project_of_root(&b, &mono).await;
+        let (web_dir, webapp_dir) = (mono.join("apps").join("web"), mono.join("apps").join("webapp"));
+        let ids = [seed_under(&b, &web).await, seed_under(&b, &m).await];
+        let open = b.with_roots(vec![web_dir.clone(), webapp_dir.clone()]);
+
+        let found = text(&open.search_memory_impl("a", search_args(DEPLOY)).await.unwrap());
+        let recall = RecallContextArgs { query: "deploys".into(), project_path: None, project: None, budget: None };
+        let refused = open.recall_context_impl("a", recall).await.unwrap();
+
+        assert!(shows(&found, ids[0]) && shows(&found, ids[1]), "both projects are searched: {found}");
+        assert!(found.contains(&format!(" project={web}]")) && found.contains(&format!(" project={m}]")), "{found}");
+        assert!(is_error(&refused), "{}", text(&refused));
+        for named in [web_dir.display().to_string(), webapp_dir.display().to_string()] {
+            assert!(text(&refused).contains(&named), "{named} in {}", text(&refused));
+        }
+    }
+
+    #[tokio::test]
+    async fn two_open_folders_of_one_project_count_once() {
+        let (_repo, mono) = monorepo();
+        let (b, _d) = bridge().await;
+        let id = seed_under(&b, &project_of_root(&b, &mono).await).await;
+        let open = b.with_roots(vec![mono.clone(), mono.join("apps").join("webapp")]);
+
+        let found = text(&open.search_memory_impl("a", search_args(DEPLOY)).await.unwrap());
+        let recall = RecallContextArgs { query: "deploys".into(), project_path: None, project: None, budget: None };
+        let recalled = open.recall_context_impl("a", recall).await.unwrap();
+
+        assert!(shows(&found, id) && !found.contains("project="), "one project names none: {found}");
+        assert!(!is_error(&recalled), "{}", text(&recalled));
     }
 
     #[tokio::test]
