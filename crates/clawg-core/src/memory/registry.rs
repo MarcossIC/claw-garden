@@ -444,10 +444,6 @@ pub async fn list_deletes(store: &MemoryStore) -> Result<Vec<ListedDelete>, Memo
             let mut stmt = c.prepare(
                 "SELECT d.delete_id, d.project_id, COALESCE(p.name, d.project_id), d.with_memories, d.deleted_at, \
                    (SELECT COUNT(*) FROM project_delete_row r JOIN memory m ON r.tbl = 'memory' AND m.id = r.row_id \
-                     WHERE r.delete_id = d.delete_id AND m.deleted_at IS NOT NULL) \
-                 + (SELECT COUNT(*) FROM project_delete_row r JOIN episodic_trajectory m ON r.tbl = 'episodic_trajectory' AND m.id = r.row_id \
-                     WHERE r.delete_id = d.delete_id AND m.deleted_at IS NOT NULL) \
-                 + (SELECT COUNT(*) FROM project_delete_row r JOIN procedural_skill m ON r.tbl = 'procedural_skill' AND m.id = r.row_id \
                      WHERE r.delete_id = d.delete_id AND m.deleted_at IS NOT NULL), \
                    p.deleted_at IS NULL \
                  FROM project_delete d LEFT JOIN project p ON p.id = d.project_id \

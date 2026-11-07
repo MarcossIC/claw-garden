@@ -2,10 +2,10 @@
 //!
 //! # Architecture
 //!
-//! A memory is a row of one of three tables, `memory`, `episodic_trajectory` or
-//! `procedural_skill`, each with a `vec0` virtual table of its embeddings for
-//! search. The rest of the schema (projects, the docs index, the ingest outbox,
-//! conflicts) is built around them by the refinery migrations in
+//! A memory is a row of `memory`, with its embedding in the `vec0` virtual
+//! table `memory_vectors` for search. The rest of the schema (projects, the
+//! docs index, the ingest outbox, conflicts) is built around it by the
+//! refinery migrations in
 //! `crates/clawg-core/migrations/`, which [`migrations`] embeds; opening a store
 //! applies the ones it has not run yet.
 //!
@@ -60,9 +60,7 @@ pub use contradiction::Candidate;
 pub use db::MemoryStore;
 pub use error::MemoryError;
 pub use identity::{derive_project_id, ProjectIdentity};
-pub use record::{
-    EpisodicTrajectoryRow, MemoryRecord, MemoryRow, ProceduralSkillRow, TableKind,
-};
+pub use record::{MemoryRecord, MemoryRow};
 /// Re-exported at the `memory` root because structured retrieval is now an
 /// entry point in its own right: the `clawg serve` daemon and the `clawg mcp`
 /// bridge call it directly, without the chat pipeline that used to be the only

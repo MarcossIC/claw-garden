@@ -1,10 +1,10 @@
-//! Inspection/override primitives for the 3 memory tables, plus 2 additive
-//! pure log-formatting helpers that measure the "Tier 1 covers 80%" criterion.
+//! Inspection/override primitives for `memory`, plus pure log-formatting
+//! helpers that measure the "Tier 1 covers 80%" criterion.
 //!
 //! The `pub async fn *_core(store: &MemoryStore, ...)` functions here are
 //! directly testable via `MemoryStore::new_for_test()`.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::memory::clock::TimestampMs;
 use crate::memory::chunker::embedding_text;
@@ -18,27 +18,7 @@ use crate::memory::sharing::{Reach, Reader};
 use crate::memory::store_insert::{MemoryType, UnknownMemoryType};
 use crate::memory::tier::retier;
 use crate::memory::topic::Replaced;
-use crate::memory::TableKind;
 use crate::memory::{MemoryError, MemoryStore};
-
-// ---------------------------------------------------------------------------
-// MemoryKind — a fresh enum, NOT a mutation of `record::TableKind`.
-//
-// `record::TableKind` is used as `RankedHit.kind` (search.rs:47) with
-// PascalCase serde (no rename) — it is a record-provenance concept consumed
-// by retrieval. `MemoryKind` here is a separate API-input concept: it
-// deserializes lowercase ("memory"|"episodic"|"procedural"), matching the
-// frontend invoke convention. Unifying the two is deliberately not done here
-// (ripple risk into RankedHit's existing serde shape).
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MemoryKind {
-    Memory,
-    Episodic,
-    Procedural,
-}
 
 // ---------------------------------------------------------------------------
 // Pure log-formatting helpers (tier-per-hit logging / tier-1 coverage
@@ -72,50 +52,31 @@ pub fn format_tier1_coverage(workspace_present: bool, hit_count: usize) -> Strin
     format!("tier1_present={workspace_present} tier23_hits={hit_count}")
 }
 
-/// Counts hits whose `kind == TableKind::Procedural` (skill hits) and renders
-/// `"skill_hits={n}"` — the single call site (`prompt_builder.rs`) logs this
-/// beside `format_tier1_coverage`, before `bucket_by_recency` moves `hits`.
-pub fn format_skill_hits(hits: &[RankedHit]) -> String {
-    let n = hits.iter().filter(|h| h.kind == TableKind::Procedural).count();
-    format!("skill_hits={n}")
-}
-
-/// Renders requested against returned pool size per table (`memory`,
-/// `episodic`, `procedural`, in that order).
+/// Renders the pool size the KNN arm was asked for against the one it
+/// returned.
 ///
 /// A returned count consistently below the requested one means rows are
 /// being dropped after the vector scan already committed to its candidates —
-/// the failure these two triples exist to expose. Neither number alone can
-/// show it: a low `returned` count is equally consistent with "the corpus
-/// genuinely has fewer matching rows" as with "another agent's rows starved
-/// the pool", so this only makes the symptom visible, not the diagnosis.
+/// the failure this pair exists to expose. Neither number alone can show it:
+/// a low `returned` count is equally consistent with "the corpus genuinely
+/// has fewer matching rows" as with "another agent's rows starved the pool",
+/// so this only makes the symptom visible, not the diagnosis.
 ///
 /// `requested` is always the pool size the caller asked for, never the wider
-/// window a starved table was re-queried with — otherwise the denominator
+/// window a starved pool was re-queried with — otherwise the denominator
 /// moves under the ratio and a rescued query reads as the worst one in the
-/// log. `retried` carries that fact separately, and only the tables it
-/// applies to are named, so a line with no marker means no table needed one.
-pub fn format_pool_survival(
-    requested: (usize, usize, usize),
-    returned: (usize, usize, usize),
-    retried: (bool, bool, bool),
-) -> String {
-    let base = format!(
-        "pool_req=({}+{}+{}) pool_ret=({}+{}+{})",
-        requested.0, requested.1, requested.2, returned.0, returned.1, returned.2,
-    );
-    let names: Vec<&str> = [("mem", retried.0), ("epi", retried.1), ("pro", retried.2)]
-        .into_iter()
-        .filter_map(|(name, did)| did.then_some(name))
-        .collect();
-    if names.is_empty() {
-        base
+/// log. `retried` carries that fact separately, so a line with no marker
+/// means the pool needed none.
+pub fn format_pool_survival(requested: usize, returned: usize, retried: bool) -> String {
+    let base = format!("pool_req={requested} pool_ret={returned}");
+    if retried {
+        format!("{base} retry")
     } else {
-        format!("{base} retry=({})", names.join(","))
+        base
     }
 }
 
-/// Renders how many memory-kind hits came from the dense (KNN) channel
+/// Renders how many hits came from the dense (KNN) channel
 /// versus how many the lexical (FTS5) channel found that the dense channel
 /// missed. `lexical_only` is exact — the size of the post-dedup leftover set
 /// — so it proves the lexical channel FIRED, never that what it found
@@ -132,9 +93,6 @@ pub fn format_channel_attribution(dense: usize, lexical_only: usize) -> String {
 // on what is stored (`relocate.rs`), and no reader can see the statements
 // apart.
 //
-// Outside `memory` the type is the table literal `store_insert.rs` writes at
-// INSERT time, so a tier recomputed here matches the one computed at ingest.
-//
 // Only a live row is changed: a deleted one no longer participates in
 // retrieval, and "missing", "deleted" and "another agent's" are one answer.
 // ---------------------------------------------------------------------------
@@ -148,14 +106,10 @@ pub enum PatchError {
     ImportanceOutOfScale(f64),
     #[error(transparent)]
     UnknownType(#[from] UnknownMemoryType),
-    #[error("memory_type can only be changed on memory rows, not on {0:?} rows")]
-    TypeOnlyOnMemory(MemoryKind),
-    #[error("only memory rows move to another project, not {0:?} rows")]
-    ProjectOnlyOnMemory(MemoryKind),
 }
 
-/// A valid change to one row: at least one field, importance on the store's
-/// scale, and a type or a project only where the table has one.
+/// A valid change to one row: at least one field, and importance on the
+/// store's scale.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryPatch {
     importance: Option<f64>,
@@ -171,7 +125,6 @@ impl MemoryPatch {
     /// an out-of-scale importance here is refused: a correction is explicit,
     /// and clamping it would report a value nobody asked for as done.
     pub fn new(
-        kind: MemoryKind,
         importance: Option<f64>,
         memory_type: Option<&str>,
         project: Option<Option<String>>,
@@ -179,19 +132,12 @@ impl MemoryPatch {
         if importance.is_none() && memory_type.is_none() && project.is_none() {
             return Err(PatchError::Empty);
         }
-        if project.is_some() && kind != MemoryKind::Memory {
-            return Err(PatchError::ProjectOnlyOnMemory(kind));
-        }
         if let Some(v) = importance {
             if !(0.0..=10.0).contains(&v) {
                 return Err(PatchError::ImportanceOutOfScale(v));
             }
         }
-        let memory_type = match memory_type {
-            None => None,
-            Some(_) if kind != MemoryKind::Memory => return Err(PatchError::TypeOnlyOnMemory(kind)),
-            Some(raw) => Some(raw.parse::<MemoryType>()?),
-        };
+        let memory_type = memory_type.map(str::parse::<MemoryType>).transpose()?;
         Ok(Self { importance, memory_type, project, user_answered: false })
     }
 
@@ -226,10 +172,8 @@ pub enum UpdateError {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UpdatedRow {
     pub id: i64,
-    pub kind: MemoryKind,
     pub importance: f64,
-    /// `Some` only for `kind == Memory`.
-    pub memory_type: Option<String>,
+    pub memory_type: String,
     pub tier: i64,
     /// The project the row is in after the change, `None` without one.
     pub project_id: Option<String>,
@@ -241,33 +185,17 @@ pub struct UpdatedRow {
     pub pulled_in: Vec<i64>,
 }
 
-const UPDATE_READ_MEMORY: &str = concat!(
+const UPDATE_READ: &str = concat!(
     "SELECT tier, importance, memory_type, access_count, project_id FROM memory \
      WHERE id = ?1 AND deleted_at IS NULL AND ",
     reader_predicate!("agent_id", "?2")
 );
-const UPDATE_READ_EPISODIC: &str = concat!(
-    "SELECT tier, importance, 'episodic_trajectory', access_count, project_id \
-     FROM episodic_trajectory WHERE id = ?1 AND deleted_at IS NULL AND ",
-    reader_predicate!("agent_id", "?2")
-);
-const UPDATE_READ_PROCEDURAL: &str = concat!(
-    "SELECT tier, importance, 'procedural_skill', access_count, project_id \
-     FROM procedural_skill WHERE id = ?1 AND deleted_at IS NULL AND ",
-    reader_predicate!("agent_id", "?2")
-);
 
-const UPDATE_WRITE_MEMORY: &str = "UPDATE memory \
+const UPDATE_WRITE: &str = "UPDATE memory \
      SET importance = ?1, memory_type = ?2, tier = ?3, last_modified_at = ?4, update_count = update_count + 1 \
      WHERE id = ?5";
-const UPDATE_WRITE_EPISODIC: &str = "UPDATE episodic_trajectory \
-     SET importance = ?1, tier = ?3, last_modified_at = ?4, update_count = update_count + 1 \
-     WHERE id = ?5";
-const UPDATE_WRITE_PROCEDURAL: &str = "UPDATE procedural_skill \
-     SET importance = ?1, tier = ?3, last_modified_at = ?4, update_count = update_count + 1 \
-     WHERE id = ?5";
 
-/// Applies `patch` to the live row `id` of `kind` and returns how it ended
+/// Applies `patch` to the live row `id` and returns how it ended
 /// up, or `None` when there is no such live row within `reader`'s reach — in
 /// which case nothing is written.
 ///
@@ -278,7 +206,6 @@ const UPDATE_WRITE_PROCEDURAL: &str = "UPDATE procedural_skill \
 pub async fn update_memory_core(
     store: &MemoryStore,
     id: i64,
-    kind: MemoryKind,
     patch: &MemoryPatch,
     reader: Option<&Reader>,
 ) -> Result<Option<UpdatedRow>, UpdateError> {
@@ -286,11 +213,6 @@ pub async fn update_memory_core(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    let (read_sql, write_sql) = match kind {
-        MemoryKind::Memory => (UPDATE_READ_MEMORY, UPDATE_WRITE_MEMORY),
-        MemoryKind::Episodic => (UPDATE_READ_EPISODIC, UPDATE_WRITE_EPISODIC),
-        MemoryKind::Procedural => (UPDATE_READ_PROCEDURAL, UPDATE_WRITE_PROCEDURAL),
-    };
     let patch = patch.clone();
     let reach = reader_bind(reader);
 
@@ -300,7 +222,7 @@ pub async fn update_memory_core(
             use rusqlite::OptionalExtension;
             let tx = c.transaction().map_err(MemoryError::Sqlite)?;
             let current: Option<(i64, f64, String, i64, Option<String>)> = tx
-                .query_row(read_sql, rusqlite::params![id, reach], |r| {
+                .query_row(UPDATE_READ, rusqlite::params![id, reach], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })
                 .optional()
@@ -329,7 +251,7 @@ pub async fn update_memory_core(
             let new_type = patch.memory_type.map_or(memory_type.clone(), |t| t.as_str().to_string());
             let new_tier = retier(tier, access_count, (importance, &memory_type), (new_importance, &new_type));
             if patch.importance.is_some() || patch.memory_type.is_some() {
-                tx.execute(write_sql, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])
+                tx.execute(UPDATE_WRITE, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])
                     .map_err(MemoryError::Sqlite)?;
             }
             if let Some(report) = &mut moved {
@@ -340,9 +262,8 @@ pub async fn update_memory_core(
             let project_id = patch.project.clone().unwrap_or(project_id);
             Ok(Some(UpdatedRow {
                 id,
-                kind,
                 importance: new_importance,
-                memory_type: (kind == MemoryKind::Memory).then_some(new_type),
+                memory_type: new_type,
                 tier: new_tier,
                 project_id,
                 move_id: moved.as_ref().and_then(|r| r.move_id),
@@ -360,29 +281,16 @@ pub async fn update_memory_core(
 }
 
 // ---------------------------------------------------------------------------
-// delete_memory — mandatory `kind` soft delete. `kind` disambiguates
-// colliding autoincrement ids across the 3 physical tables (each has its own
-// independent id sequence). `deleted_at IS NULL` in the WHERE clause makes a
-// second delete of the same row idempotent (0 rows affected instead of
+// delete_memory — soft delete. `deleted_at IS NULL` in the WHERE clause makes
+// a second delete of the same row idempotent (0 rows affected instead of
 // re-stamping `deleted_at`).
 // ---------------------------------------------------------------------------
 
-const DELETE_SQL_MEMORY: &str = "UPDATE memory SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL";
-const DELETE_SQL_EPISODIC: &str =
-    "UPDATE episodic_trajectory SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL";
-const DELETE_SQL_PROCEDURAL: &str =
-    "UPDATE procedural_skill SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL";
+const DELETE_SQL: &str = "UPDATE memory SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL";
 
-const OUT_OF_REACH_MEMORY: &str =
-    concat!("SELECT 1 FROM memory WHERE id = ?1 AND NOT ", reader_predicate!("agent_id", "?2"));
-const OUT_OF_REACH_EPISODIC: &str =
-    concat!("SELECT 1 FROM episodic_trajectory WHERE id = ?1 AND NOT ", reader_predicate!("agent_id", "?2"));
-const OUT_OF_REACH_PROCEDURAL: &str =
-    concat!("SELECT 1 FROM procedural_skill WHERE id = ?1 AND NOT ", reader_predicate!("agent_id", "?2"));
+const OUT_OF_REACH: &str = concat!("SELECT 1 FROM memory WHERE id = ?1 AND NOT ", reader_predicate!("agent_id", "?2"));
 
 pub(crate) const DELETE_VEC_MEMORY: &str = "DELETE FROM memory_vectors WHERE rowid = ?1";
-const DELETE_VEC_EPISODIC: &str = "DELETE FROM episodic_vectors WHERE rowid = ?1";
-const DELETE_VEC_PROCEDURAL: &str = "DELETE FROM procedural_vectors WHERE rowid = ?1";
 
 /// What a delete did. Deleting the current version of a topic brings back the
 /// version its revision replaced (`revival.rs`); a row a verdict replaced
@@ -394,11 +302,11 @@ pub struct Deleted {
     pub hidden: Vec<i64>,
 }
 
-/// Soft-deletes the row `id` in the table selected by `kind` by stamping
-/// `deleted_at = now_ms`, and prunes its vector row in the same transaction.
+/// Soft-deletes the row `id` by stamping `deleted_at = now_ms`, and prunes its
+/// vector row in the same transaction.
 /// Rows of `memory` that disputed it are released in that transaction too.
 /// Returns the number of rows affected by the UPDATE (`0` when `id` doesn't
-/// exist in that table or was already deleted — idempotent), with what its
+/// exist or was already deleted — idempotent), with what its
 /// delete brought back.
 ///
 /// A row out of `reader`'s reach is answered as missing and the transaction
@@ -413,44 +321,33 @@ pub struct Deleted {
 pub async fn delete_memory_core(
     store: &MemoryStore,
     id: i64,
-    kind: MemoryKind,
     reader: Option<&Reader>,
 ) -> Result<Deleted, MemoryError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    // Exhaustive match, not string interpolation: a new MemoryKind variant
-    // without a table pair here is a compile error, never a runtime SQL
-    // injection surface.
-    let (row_sql, vec_sql, out_of_reach_sql) = match kind {
-        MemoryKind::Memory => (DELETE_SQL_MEMORY, DELETE_VEC_MEMORY, OUT_OF_REACH_MEMORY),
-        MemoryKind::Episodic => (DELETE_SQL_EPISODIC, DELETE_VEC_EPISODIC, OUT_OF_REACH_EPISODIC),
-        MemoryKind::Procedural => (DELETE_SQL_PROCEDURAL, DELETE_VEC_PROCEDURAL, OUT_OF_REACH_PROCEDURAL),
-    };
     let reach = reader_bind(reader);
 
     store
         .conn
         .call(move |c| {
             let tx = c.transaction()?;
-            if reach.is_some() && tx.prepare(out_of_reach_sql)?.exists(rusqlite::params![id, reach])? {
+            if reach.is_some() && tx.prepare(OUT_OF_REACH)?.exists(rusqlite::params![id, reach])? {
                 return Ok(Deleted::default());
             }
-            let affected = tx.execute(row_sql, rusqlite::params![now_ms, id])?;
-            tx.execute(vec_sql, rusqlite::params![id])?;
+            let affected = tx.execute(DELETE_SQL, rusqlite::params![now_ms, id])?;
+            tx.execute(DELETE_VEC_MEMORY, rusqlite::params![id])?;
             let mut deleted = Deleted { deleted: affected, ..Deleted::default() };
             // Unconditional for the same reason as the vector delete: a row
             // deleted before deletes released its challengers gets them
             // released the next time anyone deletes it again.
-            if kind == MemoryKind::Memory {
-                let now = TimestampMs::from_unix_millis(now_ms);
-                release_challengers(&tx, id, now)?;
-                if affected == 1 {
-                    let revived = revive_after_delete_of_piece(&tx, id, now)?;
-                    deleted.revived = revived.revived;
-                    deleted.hidden = revived.hidden;
-                }
+            let now = TimestampMs::from_unix_millis(now_ms);
+            release_challengers(&tx, id, now)?;
+            if affected == 1 {
+                let revived = revive_after_delete_of_piece(&tx, id, now)?;
+                deleted.revived = revived.revived;
+                deleted.hidden = revived.hidden;
             }
             tx.commit()?;
             Ok(deleted)
@@ -466,16 +363,13 @@ pub async fn delete_memory_core(
 }
 
 // ---------------------------------------------------------------------------
-// restore_memory — the way back from `delete_memory`, for `memory` rows: the
-// only table production writes, and the only one with a text index, pieces
-// and a dedup to keep whole.
+// restore_memory — the way back from `delete_memory`, with the text index,
+// the pieces and the dedup kept whole.
 // ---------------------------------------------------------------------------
 
 /// Why a row was not restored. Nothing is written in any of these cases.
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreError {
-    #[error("only memory rows can be restored, not {0:?} rows")]
-    OnlyMemory(MemoryKind),
     /// Missing, live, purged or out of the reader's reach: a reader learns
     /// nothing about ids the policy hides from it.
     #[error("no deleted memory row with id {0}")]
@@ -688,13 +582,9 @@ fn take_back_revived(c: &rusqlite::Connection, id: i64, now: TimestampMs) -> rus
 pub async fn restore_memory_core(
     store: &MemoryStore,
     embedder: &dyn Embedder,
-    kind: MemoryKind,
     id: i64,
     reader: Option<&Reader>,
 ) -> Result<RestoredRow, RestoreError> {
-    if kind != MemoryKind::Memory {
-        return Err(RestoreError::OnlyMemory(kind));
-    }
     let reach = reader_bind(reader);
     let read_reach = reach.clone();
     let found = store
@@ -809,35 +699,28 @@ fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryErr
 }
 
 // ---------------------------------------------------------------------------
-// list_memories — one query per physical table. A UNION view over the three
-// would have to flatten them onto one column list, which drops `memory_type`
-// (only `memory` has one) — and filtering by memory type is something this
-// endpoint has to support.
-// `summary` is the table-specific content column:
-// `content` (memory) | `task` (episodic) | `skill_name` (procedural).
+// list_memories — the rows of `memory`, filtered and paged in SQL. `summary`
+// is the row's `content`.
 // ---------------------------------------------------------------------------
 
-// MemoryAdminRow, FailureHistogramRow and SkillStepsTrendRow keep bare i64
-// millisecond fields. They cross into the frontend through Serialize, and the
-// millisecond newtype the memory module uses internally deliberately implements
-// neither Serialize nor Deserialize: a tuple struct that derived it would emit
-// {"0":1700000000000} where the UI reads a bare number — it compiles, it runs,
-// and nothing logs. Leaving these three untyped is what turns that mistake into
-// a compile error instead of a wire-format surprise. If a timestamp here ever
-// needs the newtype it needs #[serde(transparent)] and a test asserting the
-// emitted JSON is a bare integer, in the same change.
+// MemoryAdminRow keeps bare i64 millisecond fields. It crosses into the
+// daemon's answers through Serialize, and the millisecond newtype the memory
+// module uses internally deliberately implements neither Serialize nor
+// Deserialize: a tuple struct that derived it would emit {"0":1700000000000}
+// where a reader expects a bare number — it compiles, it runs, and nothing
+// logs. Leaving it untyped is what turns that mistake into a compile error
+// instead of a wire-format surprise. If a timestamp here ever needs the
+// newtype it needs #[serde(transparent)] and a test asserting the emitted
+// JSON is a bare integer, in the same change.
 
-/// A single row from the `list_memories` inspection command, normalized
-/// across the 3 physical tables.
+/// A single row from the `list_memories` inspection command.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryAdminRow {
     pub id: i64,
-    pub kind: MemoryKind,
     pub scope: String,
     pub agent_id: Option<String>,
     pub project_id: Option<String>,
-    /// `Some` only for `kind == Memory`; `None` for episodic/procedural rows.
-    pub memory_type: Option<String>,
+    pub memory_type: String,
     pub summary: String,
     pub tier: i64,
     pub importance: f64,
@@ -847,15 +730,7 @@ pub struct MemoryAdminRow {
     pub last_accessed_at: i64,
     pub superseded_by: Option<i64>,
     pub deleted_at: Option<i64>,
-    /// `Some` only for `kind == Procedural`; `None` for memory/episodic rows.
-    pub success_count: Option<i64>,
-    /// `Some` only for `kind == Procedural`; `None` for memory/episodic rows.
-    pub trigger: Option<String>,
-    /// Raw JSON text (e.g. `"[42,7,55]"`). `Some` only for `kind ==
-    /// Procedural`; `None` for memory/episodic rows.
-    pub source_trajectory_ids: Option<String>,
-    // Provenance. Only `memory` rows carry it: the viewer shows where a stored
-    // fact came from, which the other two tables derive rather than record.
+    // Provenance: where a stored fact came from.
     pub source: Option<String>,
     pub source_session_id: Option<String>,
     pub created_by_type: Option<String>,
@@ -870,15 +745,13 @@ pub struct MemoryAdminRow {
     /// conclusion has them; every other row omits the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<Vec<i64>>,
-    /// The topic key the row was saved under; only `memory` rows have one.
+    /// The topic key the row was saved under.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
 }
 
-/// Filter/pagination params for `list_memories_core`. `kind: None` merges
-/// all 3 tables; `memory_type` and `query` are no-ops (silently ignored) on
-/// non-`Memory` kinds, the only table with a text index. `agent_id`,
-/// `project_id` and `status` are exact matches applied to every table.
+/// Filter/pagination params for `list_memories_core`. `agent_id`,
+/// `project_id` and `status` are exact matches.
 ///
 /// `agent_id` filters by author; `reader` is the agent the listing is for,
 /// which sees what the sharing policy lets it reach. Without one the listing
@@ -886,7 +759,6 @@ pub struct MemoryAdminRow {
 #[derive(Debug, Clone, Default)]
 pub struct ListParams {
     pub reader: Option<Reader>,
-    pub kind: Option<MemoryKind>,
     pub tier: Option<i64>,
     pub memory_type: Option<String>,
     pub agent_id: Option<String>,
@@ -895,8 +767,7 @@ pub struct ListParams {
     /// project; the caller does not set `project_id` with it.
     pub no_project: bool,
     pub status: Option<String>,
-    /// The project the row had in the tool it came from, compared whole; only
-    /// `memory` rows have one, so no other kind matches.
+    /// The project the row had in the tool it came from, compared whole.
     pub origin_project: Option<String>,
     /// Free text over `memory.content`: every token must match, each as a
     /// prefix, ignoring case and accents. A query with no token filters nothing.
@@ -943,15 +814,9 @@ impl RowFilter {
     }
 }
 
-/// Appends the filters every table understands, then the `memory`-only ones
-/// when `memory_table` is set. Pure: no I/O, so the SQL shape is testable
+/// Appends the filters of `f`. Pure: no I/O, so the SQL shape is testable
 /// without a connection.
-fn push_filters(
-    sql: &mut String,
-    params: &mut Vec<rusqlite::types::Value>,
-    f: &RowFilter,
-    memory_table: bool,
-) {
+fn push_filters(sql: &mut String, params: &mut Vec<rusqlite::types::Value>, f: &RowFilter) {
     use rusqlite::types::Value;
     if let Some(reach) = &f.reach {
         sql.push_str(concat!(" AND ", reach_predicate!("agent_id", "?")));
@@ -980,9 +845,6 @@ fn push_filters(
         sql.push_str(" AND status = ?");
         params.push(Value::Text(s.clone()));
     }
-    if !memory_table {
-        return;
-    }
     if let Some(mt) = &f.memory_type {
         sql.push_str(" AND memory_type = ?");
         params.push(Value::Text(mt.clone()));
@@ -999,21 +861,18 @@ fn push_filters(
     }
 }
 
-/// Lists rows from `memory` / `episodic_trajectory` / `procedural_skill`
-/// directly. `kind: None` runs all 3 per-table queries inside the
-/// SAME `conn.call` and merges + sorts (`created_at DESC`, or `deleted_at
-/// DESC` for deleted rows) + paginates in Rust; `kind: Some(_)` pushes
-/// `LIMIT`/`OFFSET` down to SQL directly. Only live rows are listed unless
-/// `deleted` asks for the deleted ones instead; `status` is only filtered when
-/// asked — `superseded` rows stay visible by default (inspection is an active
-/// inventory with superseded shown, distinct from retrieval's stricter filter).
+/// Lists rows of `memory`, `created_at DESC` (or `deleted_at DESC` for
+/// deleted rows), with `LIMIT`/`OFFSET` pushed down to SQL. Only live rows
+/// are listed unless `deleted` asks for the deleted ones instead; `status` is
+/// only filtered when asked — `superseded` rows stay visible by default
+/// (inspection is an active inventory with superseded shown, distinct from
+/// retrieval's stricter filter).
 pub async fn list_memories_core(
     store: &MemoryStore,
     params: ListParams,
 ) -> Result<Vec<MemoryAdminRow>, MemoryError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 100) as i64;
     let offset = params.offset.unwrap_or(0) as i64;
-    let kind = params.kind;
     let filter = RowFilter {
         reach: reader_bind(params.reader.as_ref()),
         tier: params.tier,
@@ -1026,50 +885,10 @@ pub async fn list_memories_core(
         match_expr: params.query.as_deref().and_then(viewer_match_expression),
         deleted: params.deleted,
     };
-    let deleted = params.deleted;
 
     store
         .conn
-        .call(move |c| -> rusqlite::Result<Vec<MemoryAdminRow>> {
-            let want_memory = matches!(kind, None | Some(MemoryKind::Memory));
-            let only_memory = filter.origin_project.is_some();
-            let want_episodic = !only_memory && matches!(kind, None | Some(MemoryKind::Episodic));
-            let want_procedural = !only_memory && matches!(kind, None | Some(MemoryKind::Procedural));
-
-            // When merging across tables (`kind: None`) each table is queried
-            // with LIMIT=offset+limit/OFFSET=0 so the post-merge global sort
-            // has enough candidates; the final skip/take happens in Rust
-            // below. For a single `kind`, SQL pushes LIMIT/OFFSET down directly.
-            let is_merge = kind.is_none();
-            let (per_table_limit, per_table_offset) =
-                if is_merge { (offset + limit, 0) } else { (limit, offset) };
-
-            let mut rows: Vec<MemoryAdminRow> = Vec::new();
-            if want_memory {
-                rows.extend(query_memory_rows(c, &filter, per_table_limit, per_table_offset)?);
-            }
-            if want_episodic {
-                rows.extend(query_episodic_rows(c, &filter, per_table_limit, per_table_offset)?);
-            }
-            if want_procedural {
-                rows.extend(query_procedural_rows(c, &filter, per_table_limit, per_table_offset)?);
-            }
-
-            if is_merge {
-                if deleted {
-                    rows.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at).then_with(|| b.id.cmp(&a.id)));
-                } else {
-                    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
-                }
-                rows = rows
-                    .into_iter()
-                    .skip(offset as usize)
-                    .take(limit as usize)
-                    .collect();
-            }
-
-            Ok(rows)
-        })
+        .call(move |c| query_memory_rows(c, &filter, limit, offset))
         .await
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
@@ -1080,7 +899,7 @@ pub async fn list_memories_core(
         })
 }
 
-// Column order here is the contract with the `map_*_row` functions below.
+// Column order here is the contract with `map_memory_row` below.
 pub(crate) const SELECT_MEMORY: &str = "SELECT id, scope, agent_id, project_id, memory_type, content, \
      tier, importance, status, access_count, created_at, last_accessed_at, superseded_by, \
      deleted_at, source, source_session_id, created_by_type, created_by_ref, \
@@ -1088,47 +907,18 @@ pub(crate) const SELECT_MEMORY: &str = "SELECT id, scope, agent_id, project_id, 
      (SELECT json_group_array(source_id) FROM memory_derivation WHERE memory_id = memory.id), \
      topic_key \
      FROM memory";
-const SELECT_EPISODIC: &str = "SELECT id, scope, agent_id, project_id, task, tier, importance, \
-     status, access_count, created_at, last_accessed_at, superseded_by, deleted_at \
-     FROM episodic_trajectory";
-const SELECT_PROCEDURAL: &str = "SELECT id, scope, agent_id, project_id, skill_name, tier, \
-     importance, status, access_count, created_at, last_accessed_at, superseded_by, \
-     deleted_at, success_count, trigger, source_trajectory_ids \
-     FROM procedural_skill";
 
-/// Reads one row by `(kind, id)` for inspection. Unlike the list it also
+/// Reads one row by id for inspection. Unlike the list it also
 /// returns soft-deleted rows, reporting them through `deleted_at`: someone
 /// holding an id from an earlier listing should learn the row was deleted,
 /// not that it never existed. Read-only on purpose — it records no access, so
 /// looking at a row never promotes it.
-pub async fn get_memory_core(
-    store: &MemoryStore,
-    kind: MemoryKind,
-    id: i64,
-) -> Result<Option<MemoryAdminRow>, MemoryError> {
+pub async fn get_memory_core(store: &MemoryStore, id: i64) -> Result<Option<MemoryAdminRow>, MemoryError> {
     store
         .conn
         .call(move |c| -> rusqlite::Result<Option<MemoryAdminRow>> {
             use rusqlite::OptionalExtension;
-            match kind {
-                MemoryKind::Memory => c
-                    .query_row(&format!("{SELECT_MEMORY} WHERE id = ?1"), [id], map_memory_row)
-                    .optional(),
-                MemoryKind::Episodic => c
-                    .query_row(
-                        &format!("{SELECT_EPISODIC} WHERE id = ?1"),
-                        [id],
-                        map_episodic_row,
-                    )
-                    .optional(),
-                MemoryKind::Procedural => c
-                    .query_row(
-                        &format!("{SELECT_PROCEDURAL} WHERE id = ?1"),
-                        [id],
-                        map_procedural_row,
-                    )
-                    .optional(),
-            }
+            c.query_row(&format!("{SELECT_MEMORY} WHERE id = ?1"), [id], map_memory_row).optional()
         })
         .await
         .map_err(|e| match e {
@@ -1149,7 +939,7 @@ fn query_memory_rows(
     let (lifecycle, order) = filter.lifecycle();
     let mut sql = format!("{SELECT_MEMORY}{lifecycle}");
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    push_filters(&mut sql, &mut params, filter, true);
+    push_filters(&mut sql, &mut params, filter);
     sql.push_str(order);
     params.push(rusqlite::types::Value::Integer(limit));
     params.push(rusqlite::types::Value::Integer(offset));
@@ -1166,7 +956,6 @@ fn query_memory_rows(
 pub(crate) fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow> {
     Ok(MemoryAdminRow {
         id: row.get(0)?,
-        kind: MemoryKind::Memory,
         scope: row.get(1)?,
         agent_id: row.get(2)?,
         project_id: row.get(3)?,
@@ -1180,9 +969,6 @@ pub(crate) fn map_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory
         last_accessed_at: row.get(11)?,
         superseded_by: row.get(12)?,
         deleted_at: row.get(13)?,
-        success_count: None,
-        trigger: None,
-        source_trajectory_ids: None,
         source: Some(row.get(14)?),
         source_session_id: row.get(15)?,
         created_by_type: Some(row.get(16)?),
@@ -1204,120 +990,6 @@ fn sources_from_json(json: &str) -> Option<Vec<i64>> {
     let mut ids: Vec<i64> = serde_json::from_str(json).unwrap_or_default();
     ids.sort_unstable();
     Some(ids).filter(|ids| !ids.is_empty())
-}
-
-fn query_episodic_rows(
-    c: &rusqlite::Connection,
-    filter: &RowFilter,
-    limit: i64,
-    offset: i64,
-) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let (lifecycle, order) = filter.lifecycle();
-    let mut sql = format!("{SELECT_EPISODIC}{lifecycle}");
-    let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    push_filters(&mut sql, &mut params, filter, false);
-    sql.push_str(order);
-    params.push(rusqlite::types::Value::Integer(limit));
-    params.push(rusqlite::types::Value::Integer(offset));
-
-    let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), map_episodic_row)?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
-}
-
-fn map_episodic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow> {
-    Ok(MemoryAdminRow {
-        id: row.get(0)?,
-        kind: MemoryKind::Episodic,
-        scope: row.get(1)?,
-        agent_id: row.get(2)?,
-        project_id: row.get(3)?,
-        memory_type: None,
-        summary: row.get(4)?,
-        tier: row.get(5)?,
-        importance: row.get(6)?,
-        status: row.get(7)?,
-        access_count: row.get(8)?,
-        created_at: row.get(9)?,
-        last_accessed_at: row.get(10)?,
-        superseded_by: row.get(11)?,
-        deleted_at: row.get(12)?,
-        success_count: None,
-        trigger: None,
-        source_trajectory_ids: None,
-        source: None,
-        source_session_id: None,
-        created_by_type: None,
-        created_by_ref: None,
-        last_modified_at: None,
-        update_count: None,
-        dispute_count: None,
-        disputed_against: None,
-        last_disputed_at: None,
-        derived_from: None,
-        topic_key: None,
-    })
-}
-
-fn query_procedural_rows(
-    c: &rusqlite::Connection,
-    filter: &RowFilter,
-    limit: i64,
-    offset: i64,
-) -> rusqlite::Result<Vec<MemoryAdminRow>> {
-    let (lifecycle, order) = filter.lifecycle();
-    let mut sql = format!("{SELECT_PROCEDURAL}{lifecycle}");
-    let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    push_filters(&mut sql, &mut params, filter, false);
-    sql.push_str(order);
-    params.push(rusqlite::types::Value::Integer(limit));
-    params.push(rusqlite::types::Value::Integer(offset));
-
-    let mut stmt = c.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), map_procedural_row)?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
-}
-
-fn map_procedural_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAdminRow> {
-    Ok(MemoryAdminRow {
-        id: row.get(0)?,
-        kind: MemoryKind::Procedural,
-        scope: row.get(1)?,
-        agent_id: row.get(2)?,
-        project_id: row.get(3)?,
-        memory_type: None,
-        summary: row.get(4)?,
-        tier: row.get(5)?,
-        importance: row.get(6)?,
-        status: row.get(7)?,
-        access_count: row.get(8)?,
-        created_at: row.get(9)?,
-        last_accessed_at: row.get(10)?,
-        superseded_by: row.get(11)?,
-        deleted_at: row.get(12)?,
-        success_count: Some(row.get(13)?),
-        trigger: Some(row.get(14)?),
-        source_trajectory_ids: Some(row.get(15)?),
-        source: None,
-        source_session_id: None,
-        created_by_type: None,
-        created_by_ref: None,
-        last_modified_at: None,
-        update_count: None,
-        dispute_count: None,
-        disputed_against: None,
-        last_disputed_at: None,
-        derived_from: None,
-        topic_key: None,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,14 +1016,11 @@ pub struct Count {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatsTotals {
     pub memory: u64,
-    pub episodic: u64,
-    pub procedural: u64,
-    /// Soft-deleted rows across the three tables; not part of the live counts.
+    /// Soft-deleted rows; not part of the live count.
     pub deleted: u64,
 }
 
-/// Snapshot of the stores. The groupings cover `memory` only: type and the
-/// dispute lifecycle are not columns of the other two tables.
+/// Snapshot of the store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoryStats {
     pub totals: StatsTotals,
@@ -1360,7 +1029,7 @@ pub struct MemoryStats {
     pub by_status: Vec<Count>,
     pub by_agent: Vec<Count>,
     pub by_project: Vec<Count>,
-    /// Newest `created_at` (ms) among live rows of any table.
+    /// Newest `created_at` (ms) among live rows.
     pub newest_created_at: Option<i64>,
 }
 
@@ -1388,8 +1057,6 @@ impl GroupBy {
     }
 }
 
-const STATS_TABLES: [&str; 3] = ["memory", "episodic_trajectory", "procedural_skill"];
-
 fn stats_where(deleted: bool, filter: &RowFilter) -> (String, Vec<rusqlite::types::Value>) {
     let mut sql = String::from(if deleted {
         " WHERE deleted_at IS NOT NULL"
@@ -1397,19 +1064,14 @@ fn stats_where(deleted: bool, filter: &RowFilter) -> (String, Vec<rusqlite::type
         " WHERE deleted_at IS NULL"
     });
     let mut params = Vec::new();
-    push_filters(&mut sql, &mut params, filter, false);
+    push_filters(&mut sql, &mut params, filter);
     (sql, params)
 }
 
-fn count_rows(
-    tx: &rusqlite::Transaction<'_>,
-    table: &str,
-    deleted: bool,
-    filter: &RowFilter,
-) -> rusqlite::Result<u64> {
+fn count_rows(tx: &rusqlite::Transaction<'_>, deleted: bool, filter: &RowFilter) -> rusqlite::Result<u64> {
     let (clause, params) = stats_where(deleted, filter);
     tx.query_row(
-        &format!("SELECT COUNT(*) FROM {table}{clause}"),
+        &format!("SELECT COUNT(*) FROM memory{clause}"),
         rusqlite::params_from_iter(params),
         |r| r.get(0),
     )
@@ -1447,26 +1109,16 @@ pub async fn memory_stats_core(
         .conn
         .call(move |c| -> rusqlite::Result<MemoryStats> {
             let tx = c.transaction()?;
-            let mut live = [0u64; 3];
-            let mut deleted = 0;
-            let mut newest: Option<i64> = None;
-            for (slot, table) in live.iter_mut().zip(STATS_TABLES) {
-                *slot = count_rows(&tx, table, false, &filter)?;
-                deleted += count_rows(&tx, table, true, &filter)?;
-                let (clause, params) = stats_where(false, &filter);
-                let max: Option<i64> = tx.query_row(
-                    &format!("SELECT MAX(created_at) FROM {table}{clause}"),
-                    rusqlite::params_from_iter(params),
-                    |r| r.get(0),
-                )?;
-                newest = newest.max(max);
-            }
+            let (clause, params) = stats_where(false, &filter);
+            let newest: Option<i64> = tx.query_row(
+                &format!("SELECT MAX(created_at) FROM memory{clause}"),
+                rusqlite::params_from_iter(params),
+                |r| r.get(0),
+            )?;
             let stats = MemoryStats {
                 totals: StatsTotals {
-                    memory: live[0],
-                    episodic: live[1],
-                    procedural: live[2],
-                    deleted,
+                    memory: count_rows(&tx, false, &filter)?,
+                    deleted: count_rows(&tx, true, &filter)?,
                 },
                 by_type: group_memory(&tx, GroupBy::Type, &filter)?,
                 by_tier: group_memory(&tx, GroupBy::Tier, &filter)?,
@@ -1504,30 +1156,11 @@ mod tests {
     }
 
 
-    // ── MemoryKind serde round-trip ─────────────────────
-
-    #[test]
-    fn memory_kind_serde_lowercase_roundtrip() {
-        let cases = [
-            (MemoryKind::Memory, "\"memory\""),
-            (MemoryKind::Episodic, "\"episodic\""),
-            (MemoryKind::Procedural, "\"procedural\""),
-        ];
-        for (kind, expected_json) in cases {
-            let json = serde_json::to_string(&kind).expect("serialize MemoryKind");
-            assert_eq!(json, expected_json, "unexpected JSON for {kind:?}");
-            let back: MemoryKind =
-                serde_json::from_str(&json).expect("deserialize MemoryKind");
-            assert_eq!(back, kind, "round-trip mismatch for {kind:?}");
-        }
-    }
-
     // ── format_tier_distribution ─────────────────────────
 
     fn make_hit(tier: i64) -> RankedHit {
         RankedHit {
             id: 1,
-            kind: crate::memory::TableKind::Memory,
             content: String::new(),
             memory_type: "chat_message".to_string(),
             tier,
@@ -1576,39 +1209,20 @@ mod tests {
     // ── format_pool_survival ──────────────────────────────────────────────
 
     #[test]
-    fn format_pool_survival_renders_both_triples() {
-        assert_eq!(
-            format_pool_survival((30, 5, 5), (28, 5, 2), (false, false, false)),
-            "pool_req=(30+5+5) pool_ret=(28+5+2)"
-        );
+    fn format_pool_survival_renders_requested_and_returned() {
+        assert_eq!(format_pool_survival(30, 28, false), "pool_req=30 pool_ret=28");
     }
 
     // A returned count below the requested one reads as "the corpus is thin"
-    // until you know whether a wider window was already tried. Naming the
-    // tables that retried is what separates a starved pool that recovered
-    // from one that was never crowded to begin with.
+    // until you know whether a wider window was already tried. The marker is
+    // what separates a starved pool that recovered from one that was never
+    // crowded to begin with. The requested side is the pool size the caller
+    // asked for, never the widened window a retry ran with: reporting the
+    // widened number would make the survival ratio look catastrophic exactly
+    // on the queries the retry just rescued.
     #[test]
-    fn format_pool_survival_names_the_tables_that_retried() {
-        assert_eq!(
-            format_pool_survival((30, 5, 5), (28, 5, 2), (true, false, true)),
-            "pool_req=(30+5+5) pool_ret=(28+5+2) retry=(mem,pro)"
-        );
-        assert_eq!(
-            format_pool_survival((30, 5, 5), (28, 5, 2), (false, true, false)),
-            "pool_req=(30+5+5) pool_ret=(28+5+2) retry=(epi)"
-        );
-    }
-
-    // The requested triple is the pool size the caller asked for, never the
-    // widened window a retry ran with. Reporting the widened number would make
-    // the survival ratio look catastrophic exactly on the queries the retry
-    // just rescued.
-    #[test]
-    fn format_pool_survival_denominator_survives_a_retry() {
-        assert_eq!(
-            format_pool_survival((30, 5, 5), (5, 5, 5), (true, false, false)),
-            "pool_req=(30+5+5) pool_ret=(5+5+5) retry=(mem)"
-        );
+    fn format_pool_survival_marks_a_retry_against_the_pool_asked_for() {
+        assert_eq!(format_pool_survival(30, 5, true), "pool_req=30 pool_ret=5 retry");
     }
 
     // ── format_channel_attribution ──────────────────────────────────────────
@@ -1624,14 +1238,6 @@ mod tests {
     }
 
     // ── update_memory_core ───────────────────────────────────────────────────
-    //
-    // Seed helpers mirror `memory/maintenance.rs`'s `seed_row` pattern: a
-    // monotonic NONCE keeps `episodic_trajectory.session_id` /
-    // `procedural_skill.skill_name` unique (both columns are effectively
-    // unique per test row here) across seeded rows within a single test.
-
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static NONCE: AtomicI64 = AtomicI64::new(0);
 
     async fn seed_memory_row(
         store: &MemoryStore,
@@ -1660,47 +1266,6 @@ mod tests {
             .expect("seed_memory_row failed")
     }
 
-    async fn seed_episodic_row(store: &MemoryStore, tier: i64, importance: f64) -> i64 {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        store
-            .conn
-            .call(move |c| -> rusqlite::Result<i64> {
-                c.execute(
-                    "INSERT INTO episodic_trajectory \
-                     (scope, agent_id, session_id, task, tier, importance, \
-                      created_at, last_modified_at, last_accessed_at, \
-                      created_by_type, created_by_ref) \
-                     VALUES ('agent', 'test-agent', ?, 'seed task', ?, ?, \
-                             0, 0, 0, 'agent', '')",
-                    rusqlite::params![format!("sess-{nonce}"), tier, importance],
-                )?;
-                Ok(c.last_insert_rowid())
-            })
-            .await
-            .expect("seed_episodic_row failed")
-    }
-
-    async fn seed_procedural_row(store: &MemoryStore, tier: i64, importance: f64) -> i64 {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        store
-            .conn
-            .call(move |c| -> rusqlite::Result<i64> {
-                c.execute(
-                    "INSERT INTO procedural_skill \
-                     (scope, agent_id, skill_name, trigger, tier, importance, \
-                      promoted_at, source_trajectory_ids, \
-                      created_at, last_modified_at, last_accessed_at, \
-                      created_by_type, created_by_ref) \
-                     VALUES ('agent', 'test-agent', ?, 'seed trigger', ?, ?, \
-                             0, '[]', 0, 0, 0, 'agent', '')",
-                    rusqlite::params![format!("skill-{nonce}"), tier, importance],
-                )?;
-                Ok(c.last_insert_rowid())
-            })
-            .await
-            .expect("seed_procedural_row failed")
-    }
-
     async fn memory_tier_importance(store: &MemoryStore, id: i64) -> (i64, f64) {
         store
             .conn
@@ -1715,36 +1280,8 @@ mod tests {
             .unwrap()
     }
 
-    async fn episodic_tier_importance(store: &MemoryStore, id: i64) -> (i64, f64) {
-        store
-            .conn
-            .call(move |c| {
-                c.query_row(
-                    "SELECT tier, importance FROM episodic_trajectory WHERE id = ?1",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-            })
-            .await
-            .unwrap()
-    }
-
-    async fn procedural_tier_importance(store: &MemoryStore, id: i64) -> (i64, f64) {
-        store
-            .conn
-            .call(move |c| {
-                c.query_row(
-                    "SELECT tier, importance FROM procedural_skill WHERE id = ?1",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-            })
-            .await
-            .unwrap()
-    }
-
     fn importance(v: f64) -> MemoryPatch {
-        MemoryPatch::new(MemoryKind::Memory, Some(v), None, None).unwrap()
+        MemoryPatch::new(Some(v), None, None).unwrap()
     }
 
     async fn memory_columns(store: &MemoryStore, id: i64) -> (String, i64, i64, String, i64, i64) {
@@ -1764,17 +1301,13 @@ mod tests {
 
     #[test]
     fn a_change_needs_at_least_one_field() {
-        assert_eq!(MemoryPatch::new(MemoryKind::Memory, None, None, None), Err(PatchError::Empty));
+        assert_eq!(MemoryPatch::new(None, None, None), Err(PatchError::Empty));
     }
 
     #[test]
-    fn a_patch_needs_a_change_and_moves_only_memory_rows() {
-        assert!(MemoryPatch::new(MemoryKind::Memory, None, None, Some(Some("q-1a2b".into()))).is_ok());
-        assert!(MemoryPatch::new(MemoryKind::Memory, None, None, Some(None)).is_ok(), "to no project");
-        for kind in [MemoryKind::Episodic, MemoryKind::Procedural] {
-            let err = MemoryPatch::new(kind, Some(5.0), None, Some(None)).unwrap_err();
-            assert_eq!(err, PatchError::ProjectOnlyOnMemory(kind));
-        }
+    fn a_patch_can_move_a_row_alone() {
+        assert!(MemoryPatch::new(None, None, Some(Some("q-1a2b".into()))).is_ok());
+        assert!(MemoryPatch::new(None, None, Some(None)).is_ok(), "to no project");
     }
 
     async fn register_project_row(store: &MemoryStore, id: &str) {
@@ -1790,7 +1323,7 @@ mod tests {
     }
 
     fn move_to(project: Option<&str>) -> MemoryPatch {
-        MemoryPatch::new(MemoryKind::Memory, None, None, Some(project.map(str::to_string))).unwrap()
+        MemoryPatch::new(None, None, Some(project.map(str::to_string))).unwrap()
     }
 
     async fn project_of(store: &MemoryStore, id: i64) -> Option<String> {
@@ -1808,7 +1341,7 @@ mod tests {
         let id = save(&store, "agent-a", "the parser is hand written").await;
         let before = memory_columns(&store, id).await;
 
-        let row = update_memory_core(&store, id, MemoryKind::Memory, &move_to(Some("q-1a2b")), None)
+        let row = update_memory_core(&store, id, &move_to(Some("q-1a2b")), None)
             .await
             .unwrap()
             .expect("updated");
@@ -1823,18 +1356,18 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         register_project_row(&store, "q-1a2b").await;
         let id = save(&store, "agent-a", "the parser is hand written").await;
-        let both = MemoryPatch::new(MemoryKind::Memory, Some(8.0), None, Some(Some("q-1a2b".into()))).unwrap();
+        let both = MemoryPatch::new(Some(8.0), None, Some(Some("q-1a2b".into()))).unwrap();
 
-        let row = update_memory_core(&store, id, MemoryKind::Memory, &both, None).await.unwrap().expect("updated");
+        let row = update_memory_core(&store, id, &both, None).await.unwrap().expect("updated");
         assert_eq!((row.importance, row.project_id.as_deref()), (8.0, Some("q-1a2b")));
 
         let other = save(&store, "agent-a", "the lexer is generated").await;
         let twin = save(&store, "agent-a", "the lexer is generated").await;
         assert_ne!(other, twin, "a twin in another project");
         store.conn.call(move |c| c.execute("UPDATE memory SET project_id = 'q-1a2b' WHERE id = ?1", [twin])).await.unwrap();
-        let clash = MemoryPatch::new(MemoryKind::Memory, Some(1.0), None, Some(Some("q-1a2b".into()))).unwrap();
+        let clash = MemoryPatch::new(Some(1.0), None, Some(Some("q-1a2b".into()))).unwrap();
 
-        let err = update_memory_core(&store, other, MemoryKind::Memory, &clash, None).await.unwrap_err();
+        let err = update_memory_core(&store, other, &clash, None).await.unwrap_err();
 
         assert!(err.to_string().contains(&format!("#{twin}")), "{err}");
         assert_eq!(memory_tier_importance(&store, other).await.1, 5.0, "the importance waits for the move");
@@ -1846,10 +1379,10 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = save(&store, "agent-a", "the parser is hand written").await;
 
-        let err = update_memory_core(&store, id, MemoryKind::Memory, &move_to(Some("typo-0000")), None).await.unwrap_err();
+        let err = update_memory_core(&store, id, &move_to(Some("typo-0000")), None).await.unwrap_err();
 
         assert!(matches!(err, UpdateError::Move(MoveError::UnknownProject(_))), "{err:?}");
-        let row = update_memory_core(&store, id, MemoryKind::Memory, &move_to(None), None).await.unwrap().unwrap();
+        let row = update_memory_core(&store, id, &move_to(None), None).await.unwrap().unwrap();
         assert_eq!(row.project_id, None, "no project is always a place");
     }
 
@@ -1864,14 +1397,14 @@ mod tests {
             .await
             .unwrap();
 
-        let err = update_memory_core(&store, id, MemoryKind::Memory, &move_to(Some("q-1a2b")), Some(&shared("agent-b")))
+        let err = update_memory_core(&store, id, &move_to(Some("q-1a2b")), Some(&shared("agent-b")))
             .await
             .unwrap_err();
         assert!(matches!(err, UpdateError::MoveNeedsUser { id: row, .. } if row == id), "{err:?}");
         assert_eq!(project_of(&store, id).await.as_deref(), Some("p"));
 
         let answered = move_to(Some("q-1a2b")).answered(true);
-        update_memory_core(&store, id, MemoryKind::Memory, &answered, Some(&shared("agent-b"))).await.unwrap().unwrap();
+        update_memory_core(&store, id, &answered, Some(&shared("agent-b"))).await.unwrap().unwrap();
         assert_eq!(project_of(&store, id).await.as_deref(), Some("q-1a2b"));
     }
 
@@ -1887,7 +1420,7 @@ mod tests {
             .await
             .unwrap();
 
-        let row = update_memory_core(&store, tail, MemoryKind::Memory, &move_to(Some("q-1a2b")), None).await.unwrap().unwrap();
+        let row = update_memory_core(&store, tail, &move_to(Some("q-1a2b")), None).await.unwrap().unwrap();
 
         assert_eq!(row.pulled_in, vec![head]);
         assert_eq!(project_of(&store, head).await.as_deref(), Some("q-1a2b"));
@@ -1896,31 +1429,21 @@ mod tests {
     #[test]
     fn importance_outside_the_scale_is_refused() {
         for v in [-0.5, 10.5, 50.0, f64::NAN, f64::INFINITY] {
-            let err = MemoryPatch::new(MemoryKind::Memory, Some(v), None, None).unwrap_err();
+            let err = MemoryPatch::new(Some(v), None, None).unwrap_err();
             assert!(matches!(err, PatchError::ImportanceOutOfScale(_)), "{v}: {err:?}");
             assert!(err.to_string().contains("importance"), "{err}");
         }
         for v in [0.0, 10.0, 7.5] {
-            assert!(MemoryPatch::new(MemoryKind::Memory, Some(v), None, None).is_ok(), "{v}");
+            assert!(MemoryPatch::new(Some(v), None, None).is_ok(), "{v}");
         }
     }
 
     #[test]
     fn an_unknown_memory_type_is_refused() {
-        let err = MemoryPatch::new(MemoryKind::Memory, None, Some("preference"), None).unwrap_err();
+        let err = MemoryPatch::new(None, Some("preference"), None).unwrap_err();
         assert_eq!(err, PatchError::UnknownType(UnknownMemoryType("preference".into())));
         assert!(err.to_string().contains("memory_type"), "{err}");
-        assert!(MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference"), None).is_ok());
-    }
-
-    #[test]
-    fn only_memory_rows_have_a_type_to_change() {
-        for kind in [MemoryKind::Episodic, MemoryKind::Procedural] {
-            let err = MemoryPatch::new(kind, Some(5.0), Some("user_preference"), None).unwrap_err();
-            assert_eq!(err, PatchError::TypeOnlyOnMemory(kind));
-            assert!(err.to_string().contains("memory_type"), "{err}");
-            assert!(MemoryPatch::new(kind, Some(5.0), None, None).is_ok());
-        }
+        assert!(MemoryPatch::new(None, Some("user_preference"), None).is_ok());
     }
 
     #[tokio::test]
@@ -1928,7 +1451,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "architectural_decision", 3, 5.0, false).await;
 
-        let row = update_memory_core(&store, id, MemoryKind::Memory, &importance(9.0), None)
+        let row = update_memory_core(&store, id, &importance(9.0), None)
             .await
             .unwrap()
             .expect("updated");
@@ -1942,7 +1465,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "chat_message", 1, 9.5, false).await;
 
-        let row = update_memory_core(&store, id, MemoryKind::Memory, &importance(2.0), None)
+        let row = update_memory_core(&store, id, &importance(2.0), None)
             .await
             .unwrap()
             .expect("updated");
@@ -1955,17 +1478,16 @@ mod tests {
     async fn an_update_writes_what_was_asked_and_counts_itself() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "semantic_fact", 3, 5.0, false).await;
-        let patch = MemoryPatch::new(MemoryKind::Memory, Some(8.0), Some("user_preference"), None).unwrap();
+        let patch = MemoryPatch::new(Some(8.0), Some("user_preference"), None).unwrap();
 
-        let row = update_memory_core(&store, id, MemoryKind::Memory, &patch, None).await.unwrap();
+        let row = update_memory_core(&store, id, &patch, None).await.unwrap();
 
         assert_eq!(
             row,
             Some(UpdatedRow {
                 id,
-                kind: MemoryKind::Memory,
                 importance: 8.0,
-                memory_type: Some("user_preference".into()),
+                memory_type: "user_preference".into(),
                 tier: 1,
                 project_id: None,
                 move_id: None,
@@ -1976,8 +1498,8 @@ mod tests {
         assert_eq!((memory_type.as_str(), update_count), ("user_preference", 1));
         assert!(last_modified_at > 0, "the seed wrote 0");
 
-        let type_only = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision"), None).unwrap();
-        let row = update_memory_core(&store, id, MemoryKind::Memory, &type_only, None).await.unwrap().unwrap();
+        let type_only = MemoryPatch::new(None, Some("architectural_decision"), None).unwrap();
+        let row = update_memory_core(&store, id, &type_only, None).await.unwrap().unwrap();
         assert_eq!(row.importance, 8.0, "a field not asked for stays as it was");
         assert_eq!(memory_columns(&store, id).await.1, 2);
     }
@@ -1987,9 +1509,9 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         for protected in ["user_preference", "architectural_decision"] {
             let id = seed_memory_row(&store, protected, 3, 5.0, false).await;
-            let demote = MemoryPatch::new(MemoryKind::Memory, Some(9.0), Some("semantic_fact"), None).unwrap();
+            let demote = MemoryPatch::new(Some(9.0), Some("semantic_fact"), None).unwrap();
 
-            let refused = update_memory_core(&store, id, MemoryKind::Memory, &demote, None).await;
+            let refused = update_memory_core(&store, id, &demote, None).await;
 
             assert!(
                 matches!(&refused, Err(UpdateError::NeedsUser { id: refused_id, from }) if *refused_id == id && from == protected),
@@ -1998,11 +1520,11 @@ mod tests {
             let (memory_type, update_count, ..) = memory_columns(&store, id).await;
             assert_eq!((memory_type.as_str(), update_count), (protected, 0), "a refused change writes nothing");
 
-            let row = update_memory_core(&store, id, MemoryKind::Memory, &demote.answered(true), None)
+            let row = update_memory_core(&store, id, &demote.answered(true), None)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!((row.memory_type.as_deref(), row.importance), (Some("semantic_fact"), 9.0));
+            assert_eq!((row.memory_type.as_str(), row.importance), ("semantic_fact", 9.0));
         }
     }
 
@@ -2010,13 +1532,13 @@ mod tests {
     async fn promoting_or_changing_importance_needs_no_answer() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let fact = seed_memory_row(&store, "semantic_fact", 3, 5.0, false).await;
-        let promote = MemoryPatch::new(MemoryKind::Memory, None, Some("user_preference"), None).unwrap();
-        assert!(update_memory_core(&store, fact, MemoryKind::Memory, &promote, None).await.unwrap().is_some());
+        let promote = MemoryPatch::new(None, Some("user_preference"), None).unwrap();
+        assert!(update_memory_core(&store, fact, &promote, None).await.unwrap().is_some());
 
         let preference = seed_memory_row(&store, "user_preference", 3, 5.0, false).await;
-        assert!(update_memory_core(&store, preference, MemoryKind::Memory, &importance(2.0), None).await.unwrap().is_some());
-        let between = MemoryPatch::new(MemoryKind::Memory, None, Some("architectural_decision"), None).unwrap();
-        assert!(update_memory_core(&store, preference, MemoryKind::Memory, &between, None).await.unwrap().is_some());
+        assert!(update_memory_core(&store, preference, &importance(2.0), None).await.unwrap().is_some());
+        let between = MemoryPatch::new(None, Some("architectural_decision"), None).unwrap();
+        assert!(update_memory_core(&store, preference, &between, None).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -2036,7 +1558,7 @@ mod tests {
         }
         let disputes_before = disputed_against(&store, id).await;
 
-        update_memory_core(&store, id, MemoryKind::Memory, &importance(7.0), None).await.unwrap().unwrap();
+        update_memory_core(&store, id, &importance(7.0), None).await.unwrap().unwrap();
 
         let after = memory_columns(&store, id).await;
         assert_eq!(after.3, before.3, "status");
@@ -2046,33 +1568,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_on_episodic_has_no_type_rule_below_importance_9() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_episodic_row(&store, 3, 5.0).await;
-        let patch = MemoryPatch::new(MemoryKind::Episodic, Some(7.0), None, None).unwrap();
-
-        let row = update_memory_core(&store, id, MemoryKind::Episodic, &patch, None).await.unwrap().unwrap();
-
-        assert_eq!((row.tier, row.memory_type), (3, None));
-        assert_eq!(episodic_tier_importance(&store, id).await, (3, 7.0));
-    }
-
-    #[tokio::test]
-    async fn update_on_procedural_keeps_the_tier_its_table_gives() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_procedural_row(&store, 1, 8.0).await;
-        let patch = MemoryPatch::new(MemoryKind::Procedural, Some(3.0), None, None).unwrap();
-
-        update_memory_core(&store, id, MemoryKind::Procedural, &patch, None).await.unwrap().unwrap();
-
-        assert_eq!(procedural_tier_importance(&store, id).await, (1, 3.0));
-    }
-
-    #[tokio::test]
     async fn update_on_a_missing_id_changes_nothing() {
         let store = MemoryStore::new_for_test().await.unwrap();
 
-        let row = update_memory_core(&store, 999_999, MemoryKind::Memory, &importance(9.0), None).await.unwrap();
+        let row = update_memory_core(&store, 999_999, &importance(9.0), None).await.unwrap();
 
         assert_eq!(row, None);
     }
@@ -2082,33 +1581,27 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "chat_message", 3, 5.0, true).await;
 
-        let row = update_memory_core(&store, id, MemoryKind::Memory, &importance(9.0), None).await.unwrap();
+        let row = update_memory_core(&store, id, &importance(9.0), None).await.unwrap();
 
         assert_eq!(row, None, "deleted rows must not be updated");
         assert_eq!(memory_tier_importance(&store, id).await, (3, 5.0));
         assert_eq!(memory_columns(&store, id).await.1, 0, "update_count");
     }
 
-    // Rows as the current version writes them, and as the desktop app left
-    // them: tiers no rule of today awards, which a change must not take.
+    // A tier no rule of today awards, as an older version or a moved row
+    // left it, is not taken by a change.
     #[tokio::test]
-    async fn rows_from_the_previous_version_can_be_updated() {
+    async fn a_tier_no_rule_awards_survives_an_update() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let earned = seed_memory_row(&store, "semantic_fact", 1, 9.5, false).await;
         let foreign = seed_memory_row(&store, "semantic_fact", 1, 5.0, false).await;
-        let epi = seed_episodic_row(&store, 1, 5.0).await;
-        let pro = seed_procedural_row(&store, 2, 5.0).await;
 
-        let lower = |kind| MemoryPatch::new(kind, Some(2.0), None, None).unwrap();
+        let lower = || MemoryPatch::new(Some(2.0), None, None).unwrap();
         let tier_of = |row: Option<UpdatedRow>| row.expect("updated").tier;
-        assert_eq!(tier_of(update_memory_core(&store, earned, MemoryKind::Memory, &lower(MemoryKind::Memory), None).await.unwrap()), 3);
-        assert_eq!(tier_of(update_memory_core(&store, foreign, MemoryKind::Memory, &lower(MemoryKind::Memory), None).await.unwrap()), 1);
-        assert_eq!(tier_of(update_memory_core(&store, epi, MemoryKind::Episodic, &lower(MemoryKind::Episodic), None).await.unwrap()), 1);
-        assert_eq!(tier_of(update_memory_core(&store, pro, MemoryKind::Procedural, &lower(MemoryKind::Procedural), None).await.unwrap()), 1);
+        assert_eq!(tier_of(update_memory_core(&store, earned, &lower(), None).await.unwrap()), 3);
+        assert_eq!(tier_of(update_memory_core(&store, foreign, &lower(), None).await.unwrap()), 1);
 
         assert_eq!(memory_tier_importance(&store, foreign).await, (1, 2.0));
-        assert_eq!(episodic_tier_importance(&store, epi).await, (1, 2.0));
-        assert_eq!(procedural_tier_importance(&store, pro).await, (1, 2.0));
     }
 
     // ── delete_memory_core ──────────────────────────
@@ -2127,20 +1620,6 @@ mod tests {
             .unwrap()
     }
 
-    async fn episodic_deleted_at(store: &MemoryStore, id: i64) -> Option<i64> {
-        store
-            .conn
-            .call(move |c| {
-                c.query_row(
-                    "SELECT deleted_at FROM episodic_trajectory WHERE id = ?1",
-                    [id],
-                    |r| r.get(0),
-                )
-            })
-            .await
-            .unwrap()
-    }
-
     // Seed → delete → deleted_at set (SELECT follow-up).
     #[tokio::test]
     async fn delete_memory_sets_deleted_at() {
@@ -2148,7 +1627,7 @@ mod tests {
         let id = seed_memory_row(&store, "chat_message", 3, 5.0, false).await;
         assert_eq!(memory_deleted_at(&store, id).await, None);
 
-        let affected = delete_memory_core(&store, id, MemoryKind::Memory, None)
+        let affected = delete_memory_core(&store, id, None)
             .await
             .unwrap();
 
@@ -2186,7 +1665,7 @@ mod tests {
         let old = seed_memory_scoped(&store, "old", "a", None, "active").await;
         let new = seed_disputing(&store, &[old]).await;
 
-        delete_memory_core(&store, old, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, old, None).await.unwrap();
 
         assert_eq!(memory_status(&store, new).await, "active");
     }
@@ -2198,7 +1677,7 @@ mod tests {
         let second = seed_memory_scoped(&store, "second", "a", None, "active").await;
         let new = seed_disputing(&store, &[first, second]).await;
 
-        delete_memory_core(&store, first, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, first, None).await.unwrap();
 
         assert_eq!(memory_status(&store, new).await, "disputed");
     }
@@ -2210,23 +1689,16 @@ mod tests {
     async fn a_hidden_authors_row_is_not_found_and_stays() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mem = seed_memory_row_with_vector(&store).await;
-        let epi = seed_episodic_row_with_vector(&store).await;
-        let pro = seed_procedural_row_with_vector(&store).await;
         let challenger = seed_disputing(&store, &[mem]).await;
 
-        for (id, kind) in [(mem, MemoryKind::Memory), (epi, MemoryKind::Episodic), (pro, MemoryKind::Procedural)] {
-            assert_eq!(delete_memory_core(&store, id, kind, Some(&hiding("other-agent", "test-agent"))).await.unwrap().deleted, 0);
-        }
+        assert_eq!(delete_memory_core(&store, mem, Some(&hiding("other-agent", "test-agent"))).await.unwrap().deleted, 0);
 
         assert_eq!(memory_deleted_at(&store, mem).await, None);
-        assert_eq!(episodic_deleted_at(&store, epi).await, None);
-        assert_eq!(vector_row_count(&store, "memory_vectors", mem).await, 1);
-        assert_eq!(vector_row_count(&store, "episodic_vectors", epi).await, 1);
-        assert_eq!(vector_row_count(&store, "procedural_vectors", pro).await, 1);
+        assert_eq!(vector_row_count(&store, mem).await, 1);
         assert_eq!(memory_status(&store, challenger).await, "disputed");
 
-        assert_eq!(delete_memory_core(&store, mem, MemoryKind::Memory, Some(&shared("other-agent"))).await.unwrap().deleted, 1);
-        assert_eq!(vector_row_count(&store, "memory_vectors", mem).await, 0);
+        assert_eq!(delete_memory_core(&store, mem, Some(&shared("other-agent"))).await.unwrap().deleted, 1);
+        assert_eq!(vector_row_count(&store, mem).await, 0);
         assert_eq!(memory_status(&store, challenger).await, "active");
     }
 
@@ -2234,61 +1706,17 @@ mod tests {
     async fn another_agent_updates_a_row_it_reaches_but_not_a_hidden_one() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mem = seed_memory_row(&store, "chat_message", 3, 5.0, false).await;
-        let epi = seed_episodic_row(&store, 3, 5.0).await;
-        let pro = seed_procedural_row(&store, 3, 5.0).await;
 
-        for (id, kind) in [(mem, MemoryKind::Memory), (epi, MemoryKind::Episodic), (pro, MemoryKind::Procedural)] {
-            let patch = MemoryPatch::new(kind, Some(9.5), None, None).unwrap();
-            let hidden = hiding("other-agent", "test-agent");
-            assert_eq!(update_memory_core(&store, id, kind, &patch, Some(&hidden)).await.unwrap(), None);
-        }
+        let hidden = hiding("other-agent", "test-agent");
+        assert_eq!(update_memory_core(&store, mem, &importance(9.5), Some(&hidden)).await.unwrap(), None);
 
         assert_eq!(memory_tier_importance(&store, mem).await, (3, 5.0));
-        assert_eq!(episodic_tier_importance(&store, epi).await, (3, 5.0));
-        assert_eq!(procedural_tier_importance(&store, pro).await, (3, 5.0));
         assert_eq!(memory_columns(&store, mem).await.1, 0, "update_count");
 
-        let row = update_memory_core(&store, mem, MemoryKind::Memory, &importance(9.5), Some(&shared("other-agent")))
+        let row = update_memory_core(&store, mem, &importance(9.5), Some(&shared("other-agent")))
             .await
             .unwrap();
         assert_eq!(row.map(|r| r.importance), Some(9.5), "another agent changes what it reaches");
-    }
-
-    #[tokio::test]
-    async fn deleting_an_episodic_row_leaves_memory_disputes_alone() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let old = seed_memory_scoped(&store, "old", "a", None, "active").await;
-        let new = seed_disputing(&store, &[old]).await;
-
-        delete_memory_core(&store, old, MemoryKind::Episodic, None).await.unwrap();
-
-        assert_eq!(memory_status(&store, new).await, "disputed", "ids are per table");
-    }
-
-    // Colliding autoincrement ids across tables: kind disambiguates.
-    #[tokio::test]
-    async fn delete_memory_kind_disambiguates_colliding_ids() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        // Both tables start empty in a fresh in-memory DB, so the first row
-        // inserted into each table gets id=1 — a genuine cross-table collision.
-        let mem_id = seed_memory_row(&store, "chat_message", 3, 5.0, false).await;
-        let epi_id = seed_episodic_row(&store, 3, 5.0).await;
-        assert_eq!(mem_id, epi_id, "test setup requires a real id collision");
-
-        let affected = delete_memory_core(&store, epi_id, MemoryKind::Episodic, None)
-            .await
-            .unwrap();
-
-        assert_eq!(affected.deleted, 1);
-        assert!(
-            episodic_deleted_at(&store, epi_id).await.is_some(),
-            "episodic row must be deleted"
-        );
-        assert_eq!(
-            memory_deleted_at(&store, mem_id).await,
-            None,
-            "memory row with the same id must NOT be affected"
-        );
     }
 
     // 2nd delete of the same id → 0 rows affected (idempotent).
@@ -2297,10 +1725,10 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_row(&store, "chat_message", 3, 5.0, false).await;
 
-        let first = delete_memory_core(&store, id, MemoryKind::Memory, None)
+        let first = delete_memory_core(&store, id, None)
             .await
             .unwrap();
-        let second = delete_memory_core(&store, id, MemoryKind::Memory, None)
+        let second = delete_memory_core(&store, id, None)
             .await
             .unwrap();
 
@@ -2357,7 +1785,7 @@ mod tests {
             .unwrap();
         assert!(before.iter().any(|h| h.id == id), "row must be findable before delete");
 
-        delete_memory_core(&store, id, MemoryKind::Memory, None)
+        delete_memory_core(&store, id, None)
             .await
             .unwrap();
 
@@ -2403,68 +1831,10 @@ mod tests {
             .expect("seed_memory_row_with_vector failed")
     }
 
-    async fn seed_episodic_row_with_vector(store: &MemoryStore) -> i64 {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        let emb = dummy_embedding_384();
+    async fn vector_row_count(store: &MemoryStore, id: i64) -> i64 {
         store
             .conn
-            .call(move |c| -> rusqlite::Result<i64> {
-                let tx = c.transaction()?;
-                tx.execute(
-                    "INSERT INTO episodic_trajectory \
-                     (scope, agent_id, session_id, task, tier, importance, \
-                      created_at, last_modified_at, last_accessed_at, \
-                      created_by_type, created_by_ref) \
-                     VALUES ('agent', 'test-agent', ?1, 'seed task', 3, 5.0, \
-                             0, 0, 0, 'agent', '')",
-                    rusqlite::params![format!("sess-vec-{nonce}")],
-                )?;
-                let id = tx.last_insert_rowid();
-                tx.execute(
-                    "INSERT INTO episodic_vectors(rowid, embedding) VALUES (?, ?)",
-                    rusqlite::params![id, emb],
-                )?;
-                tx.commit()?;
-                Ok(id)
-            })
-            .await
-            .expect("seed_episodic_row_with_vector failed")
-    }
-
-    async fn seed_procedural_row_with_vector(store: &MemoryStore) -> i64 {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        let emb = dummy_embedding_384();
-        store
-            .conn
-            .call(move |c| -> rusqlite::Result<i64> {
-                let tx = c.transaction()?;
-                tx.execute(
-                    "INSERT INTO procedural_skill \
-                     (scope, agent_id, skill_name, trigger, tier, importance, \
-                      promoted_at, source_trajectory_ids, \
-                      created_at, last_modified_at, last_accessed_at, \
-                      created_by_type, created_by_ref) \
-                     VALUES ('agent', 'test-agent', ?1, 'seed trigger', 1, 8.0, \
-                             0, '[]', 0, 0, 0, 'agent', '')",
-                    rusqlite::params![format!("skill-vec-{nonce}")],
-                )?;
-                let id = tx.last_insert_rowid();
-                tx.execute(
-                    "INSERT INTO procedural_vectors(rowid, embedding) VALUES (?, ?)",
-                    rusqlite::params![id, emb],
-                )?;
-                tx.commit()?;
-                Ok(id)
-            })
-            .await
-            .expect("seed_procedural_row_with_vector failed")
-    }
-
-    async fn vector_row_count(store: &MemoryStore, vectors_table: &'static str, id: i64) -> i64 {
-        let sql = format!("SELECT COUNT(*) FROM {vectors_table} WHERE rowid = ?1");
-        store
-            .conn
-            .call(move |c| c.query_row(&sql, [id], |r| r.get(0)))
+            .call(move |c| c.query_row("SELECT COUNT(*) FROM memory_vectors WHERE rowid = ?1", [id], |r| r.get(0)))
             .await
             .unwrap()
     }
@@ -2473,32 +1843,12 @@ mod tests {
     // live parent still costs the vec0 scan on every future query, forever,
     // for a row nothing can ever return again.
     #[tokio::test]
-    async fn delete_memory_removes_vector_row_all_kinds() {
+    async fn delete_memory_removes_the_vector_row() {
         let store = MemoryStore::new_for_test().await.unwrap();
 
         let mem_id = seed_memory_row_with_vector(&store).await;
-        delete_memory_core(&store, mem_id, MemoryKind::Memory, None).await.unwrap();
-        assert_eq!(
-            vector_row_count(&store, "memory_vectors", mem_id).await,
-            0,
-            "memory_vectors row must be gone after soft-delete"
-        );
-
-        let epi_id = seed_episodic_row_with_vector(&store).await;
-        delete_memory_core(&store, epi_id, MemoryKind::Episodic, None).await.unwrap();
-        assert_eq!(
-            vector_row_count(&store, "episodic_vectors", epi_id).await,
-            0,
-            "episodic_vectors row must be gone after soft-delete"
-        );
-
-        let proc_id = seed_procedural_row_with_vector(&store).await;
-        delete_memory_core(&store, proc_id, MemoryKind::Procedural, None).await.unwrap();
-        assert_eq!(
-            vector_row_count(&store, "procedural_vectors", proc_id).await,
-            0,
-            "procedural_vectors row must be gone after soft-delete"
-        );
+        delete_memory_core(&store, mem_id, None).await.unwrap();
+        assert_eq!(vector_row_count(&store, mem_id).await, 0, "memory_vectors row must be gone after soft-delete");
     }
 
     // Re-running delete on an already soft-deleted row must still clean up a
@@ -2523,59 +1873,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            vector_row_count(&store, "memory_vectors", id).await,
+            vector_row_count(&store, id).await,
             1,
             "test setup: the vector row must still be present before self-heal"
         );
 
-        let affected = delete_memory_core(&store, id, MemoryKind::Memory, None).await.unwrap();
+        let affected = delete_memory_core(&store, id, None).await.unwrap();
 
         assert_eq!(affected.deleted, 0, "the row was already deleted, so the UPDATE affects 0 rows");
         assert_eq!(
-            vector_row_count(&store, "memory_vectors", id).await,
+            vector_row_count(&store, id).await,
             0,
             "the orphaned vector must be pruned even though the row update affected 0 rows"
         );
-    }
-
-    // ── format_skill_hits ────────────────────────────────────────────────────
-
-    fn make_kind_hit(kind: crate::memory::TableKind) -> RankedHit {
-        RankedHit {
-            id: 1,
-            kind,
-            content: String::new(),
-            memory_type: "chat_message".to_string(),
-            tier: 2,
-            status: "active".to_string(),
-            score: 0.0,
-            distance: 0.0,
-            created_at: TimestampMs::from_unix_millis(0),
-            agent_id: None,
-            piece: None,
-            exact: false,
-            topic_key: None,
-            project_id: None,
-            origin: None,
-        }
-    }
-
-    #[test]
-    fn format_skill_hits_counts_only_procedural() {
-        let hits = vec![
-            make_kind_hit(crate::memory::TableKind::Procedural),
-            make_kind_hit(crate::memory::TableKind::Procedural),
-            make_kind_hit(crate::memory::TableKind::Memory),
-            make_kind_hit(crate::memory::TableKind::Memory),
-            make_kind_hit(crate::memory::TableKind::Memory),
-            make_kind_hit(crate::memory::TableKind::Episodic),
-        ];
-        assert_eq!(format_skill_hits(&hits), "skill_hits=2");
-    }
-
-    #[test]
-    fn format_skill_hits_empty_is_zero() {
-        assert_eq!(format_skill_hits(&[]), "skill_hits=0");
     }
 
     // ── list_memories_core ──────────────────────────
@@ -2636,17 +1946,13 @@ mod tests {
         let live = seed_memory_full(&store, "semantic_fact", 3, "active", false, 1).await;
         let gone = seed_memory_full(&store, "semantic_fact", 3, "active", false, 2).await;
         mark_deleted(&store, gone, 50).await;
-        let epi = seed_episodic_row(&store, 3, 5.0).await;
-        delete_memory_core(&store, epi, MemoryKind::Episodic, None).await.unwrap();
 
-        let listed = |rows: Vec<MemoryAdminRow>| rows.iter().map(|r| (r.kind, r.id)).collect::<Vec<_>>();
+        let listed = |rows: Vec<MemoryAdminRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
         let default = list_memories_core(&store, ListParams::default()).await.unwrap();
         let deleted = list_memories_core(&store, ListParams { deleted: true, ..Default::default() }).await.unwrap();
 
-        assert_eq!(listed(default), vec![(MemoryKind::Memory, live)]);
-        let deleted = listed(deleted);
-        assert_eq!(deleted.len(), 2, "{deleted:?}");
-        assert!(deleted.contains(&(MemoryKind::Memory, gone)) && deleted.contains(&(MemoryKind::Episodic, epi)));
+        assert_eq!(listed(default), vec![live]);
+        assert_eq!(listed(deleted), vec![gone]);
     }
 
     #[tokio::test]
@@ -2662,7 +1968,7 @@ mod tests {
         let rows = list_memories_core(&store, ListParams { deleted: true, ..Default::default() }).await.unwrap();
         let only_memory = list_memories_core(
             &store,
-            ListParams { deleted: true, kind: Some(MemoryKind::Memory), memory_type: Some("semantic_fact".into()), ..Default::default() },
+            ListParams { deleted: true, memory_type: Some("semantic_fact".into()), ..Default::default() },
         )
         .await
         .unwrap();
@@ -2686,49 +1992,11 @@ mod tests {
         assert_eq!(sources(c), Some(vec![a, b]));
         assert_eq!(sources(a), None);
 
-        let one = get_memory_core(&store, MemoryKind::Memory, c).await.unwrap().unwrap();
+        let one = get_memory_core(&store, c).await.unwrap().unwrap();
         assert_eq!(one.derived_from, Some(vec![a, b]));
         let json = serde_json::to_value(&rows).unwrap();
         let plain = json.as_array().unwrap().iter().find(|r| r["id"] == a).unwrap();
         assert!(plain.get("derived_from").is_none(), "a row with no sources omits the field: {plain}");
-    }
-
-    // Kind=Some filters to 1 table.
-    #[tokio::test]
-    async fn list_memories_kind_some_filters_to_one_table() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        seed_memory_full(&store, "chat_message", 3, "active", false, 100).await;
-        seed_episodic_row(&store, 3, 5.0).await;
-        seed_procedural_row(&store, 1, 8.0).await;
-
-        let rows = list_memories_core(
-            &store,
-            ListParams { kind: Some(MemoryKind::Memory), ..Default::default() },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, MemoryKind::Memory);
-    }
-
-    // Kind=None merges 3 tables, ORDER BY created_at DESC.
-    #[tokio::test]
-    async fn list_memories_kind_none_merges_all_tables_sorted_desc() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        seed_memory_full(&store, "chat_message", 3, "active", false, 100).await;
-        seed_episodic_row(&store, 3, 5.0).await; // created_at = 0
-        seed_procedural_row(&store, 1, 8.0).await; // created_at = 0
-
-        let rows = list_memories_core(&store, ListParams::default())
-            .await
-            .unwrap();
-
-        assert_eq!(rows.len(), 3, "expected rows merged from all 3 tables");
-        assert_eq!(rows[0].kind, MemoryKind::Memory, "highest created_at (100) must sort first");
-        for w in rows.windows(2) {
-            assert!(w[0].created_at >= w[1].created_at, "must be sorted DESC by created_at");
-        }
     }
 
     // Tier filter (WHERE).
@@ -2740,33 +2008,13 @@ mod tests {
 
         let rows = list_memories_core(
             &store,
-            ListParams { kind: Some(MemoryKind::Memory), tier: Some(2), ..Default::default() },
+            ListParams { tier: Some(2), ..Default::default() },
         )
         .await
         .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tier, 2);
-    }
-
-    // Memory_type filters ONLY the `memory` kind; no-op (no error) elsewhere.
-    #[tokio::test]
-    async fn list_memories_memory_type_is_noop_on_other_kinds() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        seed_episodic_row(&store, 3, 5.0).await;
-
-        let rows = list_memories_core(
-            &store,
-            ListParams {
-                kind: Some(MemoryKind::Episodic),
-                memory_type: Some("user_preference".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(rows.len(), 1, "memory_type filter must be ignored for non-Memory kinds");
     }
 
     // Limit=500 clamps to <=100.
@@ -2779,7 +2027,7 @@ mod tests {
 
         let rows = list_memories_core(
             &store,
-            ListParams { kind: Some(MemoryKind::Memory), limit: Some(500), ..Default::default() },
+            ListParams { limit: Some(500), ..Default::default() },
         )
         .await
         .unwrap();
@@ -2787,7 +2035,7 @@ mod tests {
         assert_eq!(rows.len(), 100, "limit must clamp to the hard cap of 100");
     }
 
-    // Offset paginates over the kind=None merge.
+    // Offset paginates.
     #[tokio::test]
     async fn list_memories_offset_paginates_merged_results() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -2817,31 +2065,24 @@ mod tests {
     // boundaries between equal timestamps are undefined.
     #[tokio::test]
     async fn list_memories_ties_on_created_at_order_by_id_desc() {
-        for kind in [Some(MemoryKind::Memory), None] {
-            let store = MemoryStore::new_for_test().await.unwrap();
-            let mut ids = Vec::new();
-            for _ in 0..5 {
-                ids.push(seed_memory_full(&store, "chat_message", 3, "active", false, 100).await);
-            }
-            let expected: Vec<i64> = ids.iter().rev().copied().collect();
-
-            let all = list_memories_core(&store, ListParams { kind, ..Default::default() })
-                .await
-                .unwrap();
-            assert_eq!(all.iter().map(|r| r.id).collect::<Vec<_>>(), expected, "kind={kind:?}");
-
-            let mut paged = Vec::new();
-            for offset in [0u32, 2, 4] {
-                let page = list_memories_core(
-                    &store,
-                    ListParams { kind, limit: Some(2), offset: Some(offset), ..Default::default() },
-                )
-                .await
-                .unwrap();
-                paged.extend(page.iter().map(|r| r.id));
-            }
-            assert_eq!(paged, expected, "pages must neither overlap nor skip, kind={kind:?}");
+        let store = MemoryStore::new_for_test().await.unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            ids.push(seed_memory_full(&store, "chat_message", 3, "active", false, 100).await);
         }
+        let expected: Vec<i64> = ids.iter().rev().copied().collect();
+
+        let all = list_memories_core(&store, ListParams::default()).await.unwrap();
+        assert_eq!(all.iter().map(|r| r.id).collect::<Vec<_>>(), expected);
+
+        let mut paged = Vec::new();
+        for offset in [0u32, 2, 4] {
+            let page = list_memories_core(&store, ListParams { limit: Some(2), offset: Some(offset), ..Default::default() })
+                .await
+                .unwrap();
+            paged.extend(page.iter().map(|r| r.id));
+        }
+        assert_eq!(paged, expected, "pages must neither overlap nor skip");
     }
 
     #[tokio::test]
@@ -2879,28 +2120,6 @@ mod tests {
         assert_eq!(row.last_disputed_at, Some(40));
     }
 
-    #[tokio::test]
-    async fn episodic_row_has_no_source() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        seed_episodic_row(&store, 3, 5.0).await;
-        seed_procedural_row(&store, 1, 8.0).await;
-
-        let rows = list_memories_core(&store, ListParams::default()).await.unwrap();
-
-        assert_eq!(rows.len(), 2);
-        for row in &rows {
-            assert_eq!(row.source, None, "{row:?}");
-            assert_eq!(row.source_session_id, None, "{row:?}");
-            assert_eq!(row.created_by_type, None, "{row:?}");
-            assert_eq!(row.created_by_ref, None, "{row:?}");
-            assert_eq!(row.last_modified_at, None, "{row:?}");
-            assert_eq!(row.update_count, None, "{row:?}");
-            assert_eq!(row.dispute_count, None, "{row:?}");
-            assert_eq!(row.disputed_against, None, "{row:?}");
-            assert_eq!(row.last_disputed_at, None, "{row:?}");
-        }
-    }
-
     // ── list_memories_core filters ──────────────────
 
     async fn seed_memory_scoped(
@@ -2933,43 +2152,6 @@ mod tests {
             .expect("seed_memory_scoped failed")
     }
 
-    async fn seed_episodic_scoped(store: &MemoryStore, agent: &str, task: &str) {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        let (agent, task) = (agent.to_string(), task.to_string());
-        store
-            .conn
-            .call(move |c| {
-                c.execute(
-                    "INSERT INTO episodic_trajectory \
-                     (scope, agent_id, session_id, task, created_at, last_modified_at, \
-                      last_accessed_at, created_by_type, created_by_ref) \
-                     VALUES ('agent', ?, ?, ?, 0, 0, 0, 'agent', '')",
-                    rusqlite::params![agent, format!("sess-scoped-{nonce}"), task],
-                )
-            })
-            .await
-            .expect("seed_episodic_scoped failed");
-    }
-
-    async fn seed_procedural_scoped(store: &MemoryStore, agent: &str) {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        let agent = agent.to_string();
-        store
-            .conn
-            .call(move |c| {
-                c.execute(
-                    "INSERT INTO procedural_skill \
-                     (scope, agent_id, skill_name, trigger, promoted_at, \
-                      source_trajectory_ids, created_at, last_modified_at, \
-                      last_accessed_at, created_by_type, created_by_ref) \
-                     VALUES ('agent', ?, ?, 'trig', 0, '[]', 0, 0, 0, 'agent', '')",
-                    rusqlite::params![agent, format!("skill-scoped-{nonce}")],
-                )
-            })
-            .await
-            .expect("seed_procedural_scoped failed");
-    }
-
     fn ids_of(rows: &[MemoryAdminRow]) -> Vec<i64> {
         let mut ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         ids.sort_unstable();
@@ -2999,7 +2181,7 @@ mod tests {
         let theirs = seed_memory_scoped(&store, "two", "agent-b", None, "active").await;
         let hidden = seed_memory_scoped(&store, "three", "agent-c", None, "active").await;
         let list = |reader: Reader, agent: Option<&str>| {
-            let params = ListParams { reader: Some(reader), agent_id: agent.map(Into::into), kind: Some(MemoryKind::Memory), ..Default::default() };
+            let params = ListParams { reader: Some(reader), agent_id: agent.map(Into::into), ..Default::default() };
             list_memories_core(&store, params)
         };
 
@@ -3046,7 +2228,6 @@ mod tests {
         let from_a_other = seed_memory_scoped(&store, "two", "agent-b", None, "active").await;
         let from_b = seed_memory_scoped(&store, "three", "agent-a", None, "active").await;
         seed_memory_scoped(&store, "four", "agent-a", None, "active").await;
-        seed_episodic_scoped(&store, "agent-a", "t1").await;
         store
             .conn
             .call(move |c| -> rusqlite::Result<()> {
@@ -3095,30 +2276,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_filter_applies_to_every_kind() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        seed_memory_scoped(&store, "m1", "a1", None, "active").await;
-        seed_memory_scoped(&store, "m2", "a2", None, "active").await;
-        seed_episodic_scoped(&store, "a1", "t1").await;
-        seed_episodic_scoped(&store, "a2", "t2").await;
-        seed_procedural_scoped(&store, "a1").await;
-        seed_procedural_scoped(&store, "a2").await;
-
-        let rows = list_memories_core(
-            &store,
-            ListParams { agent_id: Some("a1".into()), ..Default::default() },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(rows.len(), 3, "{rows:?}");
-        assert!(rows.iter().all(|r| r.agent_id.as_deref() == Some("a1")));
-        let mut kinds: Vec<_> = rows.iter().map(|r| format!("{:?}", r.kind)).collect();
-        kinds.sort();
-        assert_eq!(kinds, ["Episodic", "Memory", "Procedural"]);
-    }
-
-    #[tokio::test]
     async fn viewer_match_is_prefix_and_folds_accents() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_scoped(&store, "la configuración del núcleo", "a", None, "active").await;
@@ -3151,64 +2308,18 @@ mod tests {
         assert_eq!(ids_of(&rows), vec![both]);
     }
 
-    #[tokio::test]
-    async fn query_skips_tables_without_text_index() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        seed_episodic_scoped(&store, "a", "unrelated task").await;
-        seed_procedural_scoped(&store, "a").await;
-
-        let rows = list_memories_core(
-            &store,
-            ListParams { query: Some("needle".into()), ..Default::default() },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(rows.len(), 2, "episodic and procedural have no text index: {rows:?}");
-    }
-
     // ── get_memory_core ─────────────────────────────
 
     #[tokio::test]
-    async fn get_memory_by_kind_and_id() {
+    async fn get_memory_by_id() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let mem = seed_memory_scoped(&store, "full body text", "a1", Some("p1"), "active").await;
-        let proc_id = seed_procedural_full(&store, 4, "on failure", "[1]").await;
 
-        let row = get_memory_core(&store, MemoryKind::Memory, mem).await.unwrap().unwrap();
-        assert_eq!(row.kind, MemoryKind::Memory);
+        let row = get_memory_core(&store, mem).await.unwrap().unwrap();
         assert_eq!(row.summary, "full body text");
         assert_eq!(row.agent_id.as_deref(), Some("a1"));
         assert_eq!(row.project_id.as_deref(), Some("p1"));
         assert_eq!(row.source.as_deref(), Some("agent"));
-
-        let skill = get_memory_core(&store, MemoryKind::Procedural, proc_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(skill.kind, MemoryKind::Procedural);
-        assert_eq!(skill.trigger.as_deref(), Some("on failure"));
-        assert_eq!(skill.success_count, Some(4));
-    }
-
-    #[tokio::test]
-    async fn get_kind_disambiguates_colliding_ids() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let mem_id = seed_memory_scoped(&store, "a memory", "a", None, "active").await;
-        seed_episodic_scoped(&store, "a", "an episode").await;
-        let epi_id = mem_id; // fresh tables: both first rows get id 1
-        assert_eq!(
-            get_memory_core(&store, MemoryKind::Episodic, epi_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .summary,
-            "an episode"
-        );
-        assert_eq!(
-            get_memory_core(&store, MemoryKind::Memory, mem_id).await.unwrap().unwrap().summary,
-            "a memory"
-        );
     }
 
     #[tokio::test]
@@ -3216,17 +2327,16 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         seed_memory_scoped(&store, "x", "a", None, "active").await;
 
-        assert!(get_memory_core(&store, MemoryKind::Memory, 999).await.unwrap().is_none());
-        assert!(get_memory_core(&store, MemoryKind::Procedural, 1).await.unwrap().is_none());
+        assert!(get_memory_core(&store, 999).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn get_returns_soft_deleted() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let id = seed_memory_scoped(&store, "gone", "a", None, "active").await;
-        delete_memory_core(&store, id, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, id, None).await.unwrap();
 
-        let row = get_memory_core(&store, MemoryKind::Memory, id).await.unwrap().unwrap();
+        let row = get_memory_core(&store, id).await.unwrap().unwrap();
 
         assert!(row.deleted_at.is_some());
         assert_eq!(row.summary, "gone");
@@ -3248,7 +2358,7 @@ mod tests {
             .unwrap();
 
         for _ in 0..2 {
-            let row = get_memory_core(&store, MemoryKind::Memory, id).await.unwrap().unwrap();
+            let row = get_memory_core(&store, id).await.unwrap().unwrap();
             assert_eq!((row.access_count, row.last_accessed_at), (7, 55));
         }
     }
@@ -3290,22 +2400,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stats_counts_live_per_kind_and_deleted_apart() {
+    async fn stats_counts_live_and_deleted_apart() {
         let store = MemoryStore::new_for_test().await.unwrap();
         seed_memory_full(&store, "observation", 3, "active", false, 10).await;
         seed_memory_full(&store, "observation", 3, "active", false, 20).await;
         seed_memory_full(&store, "observation", 3, "active", true, 30).await;
-        seed_episodic_row(&store, 3, 5.0).await;
-        seed_procedural_row(&store, 1, 8.0).await;
-        let gone = seed_procedural_row(&store, 1, 8.0).await;
-        delete_memory_core(&store, gone, MemoryKind::Procedural, None).await.unwrap();
 
         let stats = memory_stats_core(&store, StatsParams::default()).await.unwrap();
 
-        assert_eq!(
-            stats.totals,
-            StatsTotals { memory: 2, episodic: 1, procedural: 1, deleted: 2 }
-        );
+        assert_eq!(stats.totals, StatsTotals { memory: 2, deleted: 1 });
         assert_eq!(stats.newest_created_at, Some(20), "newest live row, deleted ones ignored");
     }
 
@@ -3334,8 +2437,6 @@ mod tests {
         seed_stat_row(&store, ("fact", 3, "active"), ("a1", Some("p2")), 2, false).await;
         seed_stat_row(&store, ("fact", 3, "active"), ("a2", Some("p1")), 3, false).await;
         seed_stat_row(&store, ("fact", 3, "active"), ("a1", Some("p1")), 4, true).await;
-        seed_episodic_scoped(&store, "a1", "t").await;
-        seed_episodic_scoped(&store, "a2", "t").await;
 
         let stats = memory_stats_core(
             &store,
@@ -3355,7 +2456,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!((by_agent.totals.memory, by_agent.totals.episodic), (2, 1));
+        assert_eq!(by_agent.totals.memory, 2);
     }
 
     #[tokio::test]
@@ -3364,7 +2465,7 @@ mod tests {
 
         let stats = memory_stats_core(&store, StatsParams::default()).await.unwrap();
 
-        assert_eq!(stats.totals, StatsTotals { memory: 0, episodic: 0, procedural: 0, deleted: 0 });
+        assert_eq!(stats.totals, StatsTotals { memory: 0, deleted: 0 });
         assert!(stats.by_type.is_empty() && stats.by_tier.is_empty());
         assert!(stats.by_status.is_empty() && stats.by_agent.is_empty());
         assert!(stats.by_project.is_empty());
@@ -3393,7 +2494,7 @@ mod tests {
 
         let rows = list_memories_core(
             &store,
-            ListParams { kind: Some(MemoryKind::Memory), limit: Some(500), ..Default::default() },
+            ListParams { limit: Some(500), ..Default::default() },
         )
         .await
         .unwrap();
@@ -3401,129 +2502,6 @@ mod tests {
         assert_eq!(rows.len(), 1, "deleted row must be excluded");
         assert_eq!(rows[0].id, superseded_id);
         assert_eq!(rows[0].status, "superseded", "superseded rows must remain visible");
-    }
-
-    // ── MemoryAdminRow +3 skill fields ──────
-
-    /// Seeds a `procedural_skill` row with explicit `success_count`, `trigger`,
-    /// and `source_trajectory_ids` (`seed_procedural_row` above hardcodes
-    /// `trigger`/`success_count`/`ids`).
-    async fn seed_procedural_full(
-        store: &MemoryStore,
-        success_count: i64,
-        trigger: &str,
-        source_ids_json: &str,
-    ) -> i64 {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        let trigger = trigger.to_string();
-        let ids = source_ids_json.to_string();
-        store
-            .conn
-            .call(move |c| -> rusqlite::Result<i64> {
-                c.execute(
-                    "INSERT INTO procedural_skill \
-                     (scope, agent_id, skill_name, trigger, success_count, tier, importance, \
-                      promoted_at, source_trajectory_ids, \
-                      created_at, last_modified_at, last_accessed_at, \
-                      created_by_type, created_by_ref) \
-                     VALUES ('agent', 'test-agent', ?, ?, ?, 1, 8.0, \
-                             0, ?, 0, 0, 0, 'agent', '')",
-                    rusqlite::params![format!("skill-full-{nonce}"), trigger, success_count, ids],
-                )?;
-                Ok(c.last_insert_rowid())
-            })
-            .await
-            .expect("seed_procedural_full failed")
-    }
-
-    // Procedural row populates the 3 new fields.
-    #[tokio::test]
-    async fn list_memories_procedural_row_populates_skill_fields() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        seed_procedural_full(&store, 3, "when login fails", "[1,2,3]").await;
-
-        let rows = list_memories_core(
-            &store,
-            ListParams { kind: Some(MemoryKind::Procedural), ..Default::default() },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].success_count, Some(3));
-        assert_eq!(rows[0].trigger, Some("when login fails".to_string()));
-        assert_eq!(rows[0].source_trajectory_ids, Some("[1,2,3]".to_string()));
-    }
-
-    // Memory/episodic rows keep the 3 new fields as None.
-    #[tokio::test]
-    async fn list_memories_memory_and_episodic_rows_have_none_skill_fields() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        seed_memory_full(&store, "chat_message", 3, "active", false, 100).await;
-        seed_episodic_row(&store, 3, 5.0).await;
-
-        let rows = list_memories_core(&store, ListParams::default()).await.unwrap();
-
-        assert_eq!(rows.len(), 2);
-        for row in &rows {
-            assert_eq!(row.success_count, None, "row {row:?} must have success_count=None");
-            assert_eq!(row.trigger, None, "row {row:?} must have trigger=None");
-            assert_eq!(
-                row.source_trajectory_ids, None,
-                "row {row:?} must have source_trajectory_ids=None"
-            );
-        }
-    }
-
-    // ── skill hits never touch the access tracker ──
-    //
-    // `format_skill_hits` is a pure function — it touches ZERO DB. This
-    // asserts the orthogonal STATE invariant (not a call-count): a seeded
-    // `procedural_skill.access_count` must stay `0` after the skill-hits path
-    // runs, proving no procedural/episodic id ever reaches
-    // `AccessTracker::record` (which only ever `UPDATE memory` — access.rs).
-
-    #[tokio::test]
-    async fn skill_hits_path_never_touches_access_tracker() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let skill_id = seed_procedural_row(&store, 1, 8.0).await;
-
-        let hits = vec![RankedHit {
-            id: skill_id,
-            kind: crate::memory::TableKind::Procedural,
-            content: String::new(),
-            memory_type: "skill".to_string(),
-            tier: 1,
-            status: "active".to_string(),
-            score: 0.0,
-            distance: 0.0,
-            created_at: TimestampMs::from_unix_millis(0),
-            agent_id: None,
-            piece: None,
-            exact: false,
-            topic_key: None,
-            project_id: None,
-            origin: None,
-        }];
-
-        assert_eq!(format_skill_hits(&hits), "skill_hits=1");
-
-        let access_count: i64 = store
-            .conn
-            .call(move |c| {
-                c.query_row(
-                    "SELECT access_count FROM procedural_skill WHERE id = ?1",
-                    [skill_id],
-                    |r| r.get(0),
-                )
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            access_count, 0,
-            "format_skill_hits must never write to AccessTracker/DB; access_count must stay 0"
-        );
     }
 
     // ── restore_memory_core ──────────────────────────────────────────────────
@@ -3583,7 +2561,7 @@ mod tests {
     }
 
     async fn restore(store: &MemoryStore, id: i64, reader: Option<&Reader>) -> Result<RestoredRow, RestoreError> {
-        restore_memory_core(store, &FakeEmbedder::default(), MemoryKind::Memory, id, reader).await
+        restore_memory_core(store, &FakeEmbedder::default(), id, reader).await
     }
 
     async fn stored_vector(store: &MemoryStore, id: i64) -> Option<Vec<f32>> {
@@ -3662,7 +2640,7 @@ mod tests {
     }
 
     async fn delete(store: &MemoryStore, id: i64) {
-        assert_eq!(delete_memory_core(store, id, MemoryKind::Memory, None).await.unwrap().deleted, 1);
+        assert_eq!(delete_memory_core(store, id, None).await.unwrap().deleted, 1);
     }
 
     #[tokio::test]
@@ -3720,20 +2698,6 @@ mod tests {
         let row = restore(&store, theirs, Some(&shared("a"))).await.unwrap();
         assert_eq!(row.status, "active", "another agent restores what it reaches");
         assert!(stored_vector(&store, theirs).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn only_memory_rows_are_restored() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let epi = seed_episodic_row_with_vector(&store).await;
-        delete_memory_core(&store, epi, MemoryKind::Episodic, None).await.unwrap();
-
-        let err = restore_memory_core(&store, &FakeEmbedder::default(), MemoryKind::Episodic, epi, None)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, RestoreError::OnlyMemory(MemoryKind::Episodic)), "{err:?}");
-        assert!(episodic_deleted_at(&store, epi).await.is_some());
     }
 
     #[tokio::test]
@@ -3833,7 +2797,7 @@ mod tests {
         delete(&store, id).await;
         let before = columns(&store, id).await;
 
-        let err = restore_memory_core(&store, &BrokenEmbedder, MemoryKind::Memory, id, None).await.unwrap_err();
+        let err = restore_memory_core(&store, &BrokenEmbedder, id, None).await.unwrap_err();
 
         assert!(matches!(err, RestoreError::Embed(_, EmbedError::NotReady)), "{err:?}");
         assert_eq!(columns(&store, id).await, before);
@@ -3972,7 +2936,7 @@ mod tests {
         let third = save(&store, "a", "the third piece of a long save").await;
         link_save(&store, vec![(first, ""), (second, "Notes on clawg-ledger."), (third, "Notes on clawg-ledger.")]).await;
         delete(&store, second).await;
-        let gap = crate::memory::read_save_core(&store, MemoryKind::Memory, first, None).await.unwrap().unwrap();
+        let gap = crate::memory::read_save_core(&store, first, None).await.unwrap().unwrap();
         assert_eq!(gap.missing, vec![2]);
 
         restore(&store, second, Some(&shared("a"))).await.unwrap();
@@ -3980,7 +2944,7 @@ mod tests {
         let behind = crate::memory::chunker::embedding_text("Notes on clawg-ledger.", "the second piece of a long save");
         let expected = crate::memory::vector::to_unit(&passage(&behind).await).unwrap();
         assert_eq!(stored_vector(&store, second).await, Some(expected));
-        let whole = crate::memory::read_save_core(&store, MemoryKind::Memory, first, None).await.unwrap().unwrap();
+        let whole = crate::memory::read_save_core(&store, first, None).await.unwrap().unwrap();
         assert!(whole.missing.is_empty(), "{whole:?}");
         assert_eq!(whole.ids, vec![Some(first), Some(second), Some(third)]);
     }
@@ -4094,7 +3058,7 @@ mod tests {
     }
 
     async fn delete_reporting(store: &MemoryStore, id: i64) -> Deleted {
-        delete_memory_core(store, id, MemoryKind::Memory, Some(&shared("a"))).await.unwrap()
+        delete_memory_core(store, id, Some(&shared("a"))).await.unwrap()
     }
 
     #[tokio::test]
@@ -4427,7 +3391,7 @@ mod tests {
     }
 
     async fn restore_placed(store: &MemoryStore, id: i64) -> RestoredRow {
-        restore_memory_core(store, &PlacedEmbedder(placed(1, 0.0)), MemoryKind::Memory, id, Some(&shared("a"))).await.unwrap()
+        restore_memory_core(store, &PlacedEmbedder(placed(1, 0.0)), id, Some(&shared("a"))).await.unwrap()
     }
 
     #[tokio::test]

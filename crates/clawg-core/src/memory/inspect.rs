@@ -93,17 +93,13 @@ pub struct FolderPrint {
     pub root_commit: Option<String>,
 }
 
-/// An id rows are saved under, deleted ones too, with how many of each table
-/// and how many of them are live.
+/// An id rows are saved under, deleted ones too, with how many there are and
+/// how many of them are live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdRows {
     pub project_id: String,
     pub memories: i64,
-    pub trajectories: i64,
-    pub skills: i64,
     pub live_memories: i64,
-    pub live_trajectories: i64,
-    pub live_skills: i64,
 }
 
 /// Two live projects that may be one, the older first.
@@ -389,23 +385,11 @@ pub(crate) fn answered_pairs(c: &Connection) -> rusqlite::Result<Vec<(String, St
 
 fn id_rows(c: &Connection) -> rusqlite::Result<Vec<IdRows>> {
     let mut stmt = c.prepare(
-        "SELECT project_id, SUM(t = 'm'), SUM(t = 't'), SUM(t = 's'), \
-                SUM(t = 'm' AND live), SUM(t = 't' AND live), SUM(t = 's' AND live) FROM ( \
-           SELECT project_id, 'm' AS t, deleted_at IS NULL AS live FROM memory \
-           UNION ALL SELECT project_id, 't', deleted_at IS NULL FROM episodic_trajectory \
-           UNION ALL SELECT project_id, 's', deleted_at IS NULL FROM procedural_skill) \
+        "SELECT project_id, COUNT(*), SUM(deleted_at IS NULL) FROM memory \
          WHERE project_id IS NOT NULL GROUP BY project_id ORDER BY project_id",
     )?;
     let rows = stmt.query_map([], |r| {
-        Ok(IdRows {
-            project_id: r.get(0)?,
-            memories: r.get(1)?,
-            trajectories: r.get(2)?,
-            skills: r.get(3)?,
-            live_memories: r.get(4)?,
-            live_trajectories: r.get(5)?,
-            live_skills: r.get(6)?,
-        })
+        Ok(IdRows { project_id: r.get(0)?, memories: r.get(1)?, live_memories: r.get(2)? })
     })?;
     rows.collect()
 }
@@ -958,15 +942,14 @@ mod tests {
                  INSERT INTO project_path (id, root_path, created_at, project_id, root_commit) \
                    VALUES ('web-3c4d', '/work/web', 2, 'web-3c4d', 'c1');
                  INSERT INTO project_suggestion (project_id, other_id, reason, created_at, answer) VALUES \
-                   ('web-3c4d', 'api-5e6f', 'user', 4, 'apart'), ('web-3c4d', 'app-1a2b', 'root_commit', 5, NULL);
-                 INSERT INTO episodic_trajectory \
-                   (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
-                   VALUES ('agent', 'a', 'orphan-9f9f', 's', 't', 1, 1, 1);",
+                   ('web-3c4d', 'api-5e6f', 'user', 4, 'apart'), ('web-3c4d', 'app-1a2b', 'root_commit', 5, NULL);",
             )
             .unwrap();
-            for (content, project) in [("one", "web-3c4d"), ("two", "web-3c4d"), ("left", "app-1a2b")] {
+            for (content, project) in [("one", "web-3c4d"), ("two", "web-3c4d"), ("left", "app-1a2b"), ("lost", "orphan-9f9f")] {
                 insert(c, &Row { project: Some(project), ..row(content) });
             }
+            // A store edited by hand: the triggers adopt every id a row is written under.
+            c.execute("DELETE FROM project WHERE id = 'orphan-9f9f'", []).unwrap();
         })
         .await;
 
@@ -986,16 +969,8 @@ mod tests {
         let print = FolderPrint { root_id: "web-3c4d".into(), project_id: Some("web-3c4d".into()), remote: None, root_commit: Some("c1".into()) };
         assert_eq!(facts.folder_prints, vec![print]);
         assert_eq!(facts.answered_pairs, vec![("api-5e6f".to_string(), "web-3c4d".to_string())], "a pending one is not answered");
-        let rows = |id: &str, memories, trajectories| IdRows {
-            project_id: id.into(),
-            memories,
-            trajectories,
-            skills: 0,
-            live_memories: memories,
-            live_trajectories: trajectories,
-            live_skills: 0,
-        };
-        assert_eq!(facts.id_rows, vec![rows("app-1a2b", 1, 0), rows("orphan-9f9f", 0, 1), rows("web-3c4d", 2, 0)]);
+        let rows = |id: &str, memories| IdRows { project_id: id.into(), memories, live_memories: memories };
+        assert_eq!(facts.id_rows, vec![rows("app-1a2b", 1), rows("orphan-9f9f", 1), rows("web-3c4d", 2)]);
 
         let older = crate::test_dir::test_dir();
         seed_on_disk(older.path(), Some(27)).await;
@@ -1134,10 +1109,7 @@ mod tests {
                 "INSERT INTO project (id, name, born, reviewed, created_at, deleted_at) VALUES \
                    ('gone-1a2b', 'gone', 'root', 1, 1, NULL), ('web-3c4d', 'web', 'root', 1, 2, NULL);
                  INSERT INTO project_delete (delete_id, project_id, with_memories, deleted_at, undone_at) VALUES \
-                   (1, 'gone-1a2b', 1, 3, 4), (2, 'gone-1a2b', 1, 5, NULL), (3, 'web-3c4d', 0, 6, 7);
-                 INSERT INTO episodic_trajectory \
-                   (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
-                   VALUES ('agent', 'a', 'gone-1a2b', 's', 't', 1, 1, 1);",
+                   (1, 'gone-1a2b', 1, 3, 4), (2, 'gone-1a2b', 1, 5, NULL), (3, 'web-3c4d', 0, 6, 7);",
             )
             .unwrap();
             insert(c, &Row { project: Some("gone-1a2b"), deleted: true, ..row("one deleted") });
@@ -1154,15 +1126,7 @@ mod tests {
         assert_eq!(deleted, vec![("gone-1a2b", Some(5)), ("web-3c4d", None)]);
         assert_eq!(
             facts.id_rows,
-            vec![IdRows {
-                project_id: "gone-1a2b".into(),
-                memories: 2,
-                trajectories: 1,
-                skills: 0,
-                live_memories: 1,
-                live_trajectories: 1,
-                live_skills: 0
-            }]
+            vec![IdRows { project_id: "gone-1a2b".into(), memories: 2, live_memories: 1 }]
         );
         assert_eq!(facts.open_deletes, Some(vec![OpenDelete { project_id: "gone-1a2b".into(), delete_id: 2 }]), "an undone one is not open");
 

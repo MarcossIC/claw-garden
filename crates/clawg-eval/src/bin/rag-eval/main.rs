@@ -20,17 +20,15 @@ use std::path::PathBuf;
 
 use clawg_core::eval_api::{
     compose_query_context, copy_background, cosine_from_distance, model_is_cached, query_budget_tokens,
-    EmbedRole, EvalCaseRef, EvalEmbedder, EvalError, EvalKind, EvalResolveError, EvalResolved, EvalScope,
+    EmbedRole, EvalCaseRef, EvalEmbedder, EvalError, EvalResolveError, EvalResolved, EvalScope,
     EvalScoringConfig, EvalSearch, EvalStore, EvalTokenCounter, MIGRATION_FTS_TOKENIZER, EMBED_MAX_TOKENS,
     SPECIAL_TOKEN_RESERVE,
 };
 
 use golden::{CaseStatus, CaseSubset, PairLabel};
 
-/// Result-pool sizes handed to `EvalStore::search`. `memory` is the widest
-/// pool because every golden-set corpus row seeds into the memory table;
-/// `episodic`/`procedural` stay narrow since this harness never seeds either
-/// of those tables, so a wider pool there would only cost time.
+/// Result-pool sizes handed to `EvalStore::search`: the `memory` pool the
+/// shipped application asks for.
 ///
 /// `lexical` matches the shipped application's own default, and
 /// `k_pool_mirrors_the_production_lexical_budget` is what keeps it matching.
@@ -40,7 +38,7 @@ use golden::{CaseStatus, CaseSubset, PairLabel};
 /// numbers would be a comparison against fiction. Turning the channel off for
 /// a run is what `--sweep-lexical 0` is for — it is a question the operator
 /// asks, not the default state of the instrument.
-const K_POOL: EvalScope = EvalScope { memory: Some(30), episodic: Some(5), procedural: Some(5), lexical: Some(20) };
+const K_POOL: EvalScope = EvalScope { memory: Some(30), lexical: Some(20) };
 
 /// Cutoff production truncates search results to. Recall@10/nDCG@10 are
 /// defined against exactly this cutoff — raising it here would silently
@@ -389,7 +387,7 @@ async fn case_scale(
     expected: &HashSet<String>,
 ) -> Result<report::CaseScale, EvalError> {
     let top5 = &found.hits[..found.hits.len().min(5)];
-    let memory_ids = top5.iter().filter(|h| h.kind == EvalKind::Memory).map(|h| h.id).collect();
+    let memory_ids = top5.iter().map(|h| h.id).collect();
     let accessed: HashMap<i64, i64> = seeded.store.last_accessed(memory_ids).await?.into_iter().collect();
     let now = now_ms();
     let pool = report::PoolSurvival {
@@ -411,10 +409,7 @@ async fn case_scale(
         top5_types: top5.iter().map(|h| h.memory_type.clone()).collect(),
         decay_age_days: top5
             .iter()
-            .map(|h| match h.kind {
-                EvalKind::Memory => accessed.get(&h.id).map(|at| (now - at) as f64 / seed::DAY_MS),
-                _ => None,
-            })
+            .map(|h| accessed.get(&h.id).map(|at| (now - at) as f64 / seed::DAY_MS))
             .collect(),
         best_cosine: found.hits.iter().filter(|h| !h.exact).map(|h| cosine_from_distance(h.distance)).reduce(f64::max),
         score_gap_1_10: report::score_gap_1_10(&scores),
@@ -786,9 +781,9 @@ async fn measure(
             model_id: model_id.clone(),
             git_sha: git_sha.clone(),
             k_pool: if cli.lexical_only {
-                report::KPool { memory: 0, episodic: 0, procedural: 0, lexical: Some(K_FINAL) }
+                report::KPool { memory: 0, lexical: Some(K_FINAL) }
             } else {
-                report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: scope.lexical }
+                report::KPool { memory: 30, lexical: scope.lexical }
             },
             fts_tokenizer: fts_tokenizer.clone(),
             k_final: K_FINAL,
@@ -961,7 +956,7 @@ fn build_agent_view_run_results(
         tag: fold_tag(tag.as_deref(), background.as_ref().map(background_slug).as_deref()),
         model_id: embedder.model_id().to_string(),
         git_sha: report::git_sha(),
-        k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: K_POOL.lexical },
+        k_pool: report::KPool { memory: 30, lexical: K_POOL.lexical },
         fts_tokenizer: MIGRATION_FTS_TOKENIZER.to_string(),
         k_final: K_FINAL,
         corpus_size: golden_set.corpus.len(),
@@ -1204,7 +1199,7 @@ fn build_follow_up_run_results(
         tag: fold_tag(ctx.run_tag.as_deref(), Some(&format!("followup-{arm_name}"))),
         model_id: ctx.model_id.clone(),
         git_sha: ctx.git_sha.clone(),
-        k_pool: report::KPool { memory: 30, episodic: 5, procedural: 5, lexical: K_POOL.lexical },
+        k_pool: report::KPool { memory: 30, lexical: K_POOL.lexical },
         fts_tokenizer: ctx.fts_tokenizer.clone(),
         k_final: K_FINAL,
         corpus_size: ctx.golden_set.corpus.len(),

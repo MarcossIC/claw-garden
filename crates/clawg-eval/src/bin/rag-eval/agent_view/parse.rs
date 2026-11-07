@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn several_lines_keep_their_printed_order() {
-        let text = "1. #7 [Memory/code_block/t2 score=0.91] first\n2. #9 [Episodic/-/t1 score=0.50] second";
+        let text = "1. #7 [Memory/code_block/t2 score=0.91] first\n2. #9 [Memory/semantic_fact/t1 score=0.50] second";
         let lines = parse_search_output(text).unwrap();
         assert_eq!(lines.iter().map(|l| (l.rank, l.content.as_str())).collect::<Vec<_>>(), vec![(1, "first"), (2, "second")]);
     }
@@ -372,12 +372,6 @@ mod tests {
         assert_eq!(context_segments(text), vec!["tabs in go".to_string(), "short answers".to_string()]);
         let line = "1. #10 [Memory/user_preference/t1 inferred score=0.90] tabs in go";
         assert_eq!(parse_search_output(line).unwrap()[0].content, "tabs in go");
-    }
-
-    #[test]
-    fn a_hit_of_another_kind_is_one_segment() {
-        let text = "=== LONG-TERM KNOWLEDGE ===\n[2026-08-10 #3 procedural/procedure] run the release script\n";
-        assert_eq!(context_segments(text), vec!["run the release script".to_string()]);
     }
 
     #[test]

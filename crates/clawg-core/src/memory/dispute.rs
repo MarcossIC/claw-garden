@@ -512,7 +512,7 @@ pub async fn open_pairs(
 mod tests {
     use super::*;
     use crate::memory::sharing::Reach;
-    use crate::memory::admin::{list_memories_core, ListParams, MemoryKind};
+    use crate::memory::admin::{list_memories_core, ListParams};
 
     fn reader(agent: &str) -> Reader {
         Reader::new(agent, Reach::AllBut(Vec::new()))
@@ -742,7 +742,7 @@ mod tests {
         assert!(hits.iter().all(|h| h.id != old), "{hits:?}");
         assert!(hits.iter().any(|h| h.id == new), "{hits:?}");
 
-        let listed = list_memories_core(&store, ListParams { kind: Some(MemoryKind::Memory), ..Default::default() })
+        let listed = list_memories_core(&store, ListParams::default())
             .await
             .unwrap();
         let row = listed.iter().find(|r| r.id == old).expect("the superseded row is listed");

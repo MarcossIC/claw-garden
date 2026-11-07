@@ -681,12 +681,12 @@ pub async fn verify_or_reembed(
     log::info!("snapshot before re-embedding: {}", snapshot.display());
     let report = reembed_all(store, ReembedMode::ReInfer(ReInferPlan::new(embedder))).await;
     if report.contract_updated {
-        log::info!("re-embedded the stored vectors: {:?}", report.per_table);
+        log::info!("re-embedded the stored vectors: {:?}", report.memory);
         Ok(ContractStatus::Match)
     } else {
         log::warn!(
             "re-embedding did not finish ({:?}); the store keeps its previous contract",
-            report.per_table
+            report.memory
         );
         Ok(ContractStatus::Mismatch { stored, actual })
     }

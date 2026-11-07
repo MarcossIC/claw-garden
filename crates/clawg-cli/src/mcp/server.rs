@@ -54,7 +54,7 @@ use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_language, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
     format_answered, format_delete, format_open_pairs, format_refusal, format_restore, format_status, format_synthesis, format_update,
-    indexes_docs, no_folder, no_project_named, resolve_project, several_folders, topic_key_warning,
+    indexes_docs, kind_refusal, no_folder, no_project_named, resolve_project, several_folders, topic_key_warning,
 };
 
 /// The daemon refused a root because its id already belongs to another one.
@@ -299,14 +299,13 @@ pub struct ListMemoriesArgs {
     /// or a search. Lists every agent's you can read when omitted.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Which table to list: memory, episodic or procedural. Lists all three
-    /// when omitted.
     #[serde(default)]
+    #[schemars(skip)]
     pub kind: Option<String>,
     /// Only rows in this tier: 1 (hot), 2 (warm) or 3 (cold).
     #[serde(default)]
     pub tier: Option<i64>,
-    /// Only rows of this memory type. Applies to `memory` rows only.
+    /// Only memories of this type.
     #[serde(default)]
     pub memory_type: Option<String>,
     /// How many rows to return, 1 to 100. Defaults to 50.
@@ -321,20 +320,19 @@ pub struct ListMemoriesArgs {
 pub struct RestoreMemoryArgs {
     /// The id `delete_memory` was given.
     pub id: i64,
-    /// The kind `delete_memory` was given. Only memory rows can be restored.
-    pub kind: String,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DeleteMemoryArgs {
-    /// The id of the row to delete, as printed by `search_memory`,
-    /// `list_memories` or `recall_context`. A `recall_context` hit with no kind
-    /// in front of its type is a memory.
+    /// The id of the memory to delete, as printed by `search_memory`,
+    /// `list_memories` or `recall_context`.
     pub id: i64,
-    /// Which table the id belongs to: memory, episodic or procedural. Required,
-    /// because each table numbers its rows independently — id 7 exists in all
-    /// three and means something different in each.
-    pub kind: String,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -342,25 +340,24 @@ pub struct ReadMemoryArgs {
     /// The id of any piece of the save, as printed by `search_memory`,
     /// `list_memories`, `recall_context` or `save_memory`.
     pub id: i64,
-    /// Which table the id belongs to: memory, episodic or procedural.
-    /// Defaults to memory, the only kind saved in pieces.
     #[serde(default)]
+    #[schemars(skip)]
     pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct UpdateMemoryArgs {
-    /// The id of the row to change, as printed by `save_memory`,
-    /// `search_memory`, `list_memories` or `recall_context`. A `recall_context`
-    /// hit with no kind in front of its type is a memory.
+    /// The id of the memory to change, as printed by `save_memory`,
+    /// `search_memory`, `list_memories` or `recall_context`.
     pub id: i64,
-    /// Which table the id belongs to: memory, episodic or procedural.
-    pub kind: String,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub kind: Option<String>,
     /// The new importance, 0 to 10. Omit it to leave the importance as it is.
     #[serde(default)]
     pub importance: Option<f64>,
-    /// The new type, only for kind memory, one of the listed values. Omit it
-    /// to leave the type as it is.
+    /// The new type, one of the listed values. Omit it to leave the type as
+    /// it is.
     #[serde(default)]
     #[schemars(transform = memory_type_enum)]
     pub memory_type: Option<String>,
@@ -1318,12 +1315,14 @@ impl ClawgMcp {
         agent_id: &str,
         args: ListMemoriesArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(refusal) = kind_refusal(self.speaks(), args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
         let args = &args;
         let result = self
             .call(|client| async move {
                 client
                     .list(ListArgs {
-                        kind: args.kind.clone(),
                         tier: args.tier,
                         memory_type: args.memory_type.clone(),
                         limit: args.limit,
@@ -1350,9 +1349,12 @@ impl ClawgMcp {
         agent_id: &str,
         args: DeleteMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let args = &args;
+        if let Some(refusal) = kind_refusal(self.speaks(), args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
+        let id = args.id;
         let result = self
-            .call(|client| async move { client.delete(&args.kind, args.id, Some(agent_id)).await })
+            .call(|client| async move { client.delete("memory", id, Some(agent_id)).await })
             .await;
         match result {
             Ok(Ok(deleted)) => Self::ok(format_delete(self.speaks(), &deleted)),
@@ -1367,9 +1369,12 @@ impl ClawgMcp {
         agent_id: &str,
         args: RestoreMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let args = &args;
+        if let Some(refusal) = kind_refusal(self.speaks(), args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
+        let id = args.id;
         let result = self
-            .call(|client| async move { client.restore(&args.kind, args.id, Some(agent_id)).await })
+            .call(|client| async move { client.restore("memory", id, Some(agent_id)).await })
             .await;
         match result {
             Ok(Ok(restored)) => Self::ok(format_restore(self.speaks(), &restored)),
@@ -1385,11 +1390,12 @@ impl ClawgMcp {
         agent_id: &str,
         args: ReadMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let args = &args;
+        if let Some(refusal) = kind_refusal(self.speaks(), args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
+        let id = args.id;
         let result = self
-            .call(|client| async move {
-                client.read_save(args.kind.as_deref().unwrap_or("memory"), args.id, Some(agent_id)).await
-            })
+            .call(|client| async move { client.read_save("memory", id, Some(agent_id)).await })
             .await;
         match result {
             // `read_memory` names no project, so a save after it names one of
@@ -1436,6 +1442,9 @@ impl ClawgMcp {
         args: UpdateMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let lang = self.speaks();
+        if let Some(refusal) = kind_refusal(lang, args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
         if [args.to_project_path.is_some(), args.to_project.is_some(), args.clear_project].iter().filter(|p| **p).count() > 1 {
             return Self::failed(match lang {
                 Lang::En => "pass one of to_project_path, to_project or clear_project",
@@ -1466,7 +1475,7 @@ impl ClawgMcp {
                 };
                 client
                     .update(
-                        &args.kind,
+                        "memory",
                         args.id,
                         args.importance,
                         args.memory_type.as_deref(),
@@ -1733,7 +1742,7 @@ impl ClawgMcp {
                        finds memories written in other words, but often misses one written in \
                        another language than the query. Returns a \
                        numbered list of the memories close in relevance to the best match (at \
-                       least two), with their ids, kinds and relevance scores; a short list \
+                       least two), with their ids, types and relevance scores; a short list \
                        means the rest scored far lower, not that nothing else is stored. \
                        Content longer than 500 characters is truncated. A hit marked piece=K/N \
                        is the best matching piece K of a long text saved as N pieces; \
@@ -1771,7 +1780,7 @@ impl ClawgMcp {
         description = "Browse what is stored, newest first, without searching. Use this to \
                        show the user their memory inventory or to find an id to delete. Lists \
                        every memory you can read, yours and other agents'; `agent` lists one \
-                       agent's only. Returns one line per row: id, kind, type, tier, importance, \
+                       agent's only. Returns one line per memory: id, type, tier, importance, \
                        access count, status, `by <agent>` when another agent saved it, and a \
                        truncated summary."
     )]
@@ -1801,9 +1810,8 @@ impl ClawgMcp {
 
     #[tool(
         name = "delete_memory",
-        description = "Delete one stored memory by id and kind. Get the id from \
-                       `search_memory`, `list_memories` or `recall_context` first — ids are \
-                       per-kind, so the same number exists in all three tables. A memory marked \
+        description = "Delete one stored memory by id. Get the id from `search_memory`, \
+                       `list_memories` or `recall_context` first. A memory marked \
                        `by <agent>` was saved by another agent, and deleting it takes it from every \
                        agent. Deleting the current memory of a `topic_key` makes the version it \
                        replaced current again. `restore_memory` undoes it."
@@ -1818,8 +1826,8 @@ impl ClawgMcp {
 
     #[tool(
         name = "restore_memory",
-        description = "Undo a `delete_memory`: bring a deleted memory back, with the id and kind \
-                       it was deleted with, when the user says the delete was a mistake. Refused \
+        description = "Undo a `delete_memory`: bring a deleted memory back, with the id it was \
+                       deleted with, when the user says the delete was a mistake. Refused \
                        when the same text was saved again since, when a newer memory holds its \
                        `topic_key`, or when the memory holds a secret. Names the memories saved \
                        meanwhile that are close to it, to judge with `resolve_conflict`."
@@ -1834,9 +1842,9 @@ impl ClawgMcp {
 
     #[tool(
         name = "update_memory",
-        description = "Correct the importance, the type or the project of one stored memory, by id \
-                       and kind, when the user says it matters more or less than it was saved \
-                       with, that it is a different kind of memory, or that it belongs to another \
+        description = "Correct the importance, the type or the project of one stored memory, by id, \
+                       when the user says it matters more or less than it was saved \
+                       with, that it is a different type of memory, or that it belongs to another \
                        project (to_project_path) or to none (clear_project). Pass only what \
                        changes. A memory moves with the rest of its save and topic history, and \
                        does not move where the same text or topic key is live. Taking a \
@@ -3062,7 +3070,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         properties.sort();
-        assert_eq!(properties, ["agent", "kind", "limit", "memory_type", "offset", "tier"]);
+        assert_eq!(properties, ["agent", "limit", "memory_type", "offset", "tier"]);
     }
 
     /// The model has to pick `memory_type` from the set the store recognises;
@@ -3423,15 +3431,20 @@ mod tests {
         assert!(!schema.contains("Defaults to a plain chat message"), "schema: {schema}");
     }
 
-    /// `recall_context` prints `#id` before a `memory` hit's type and names
-    /// any other kind; the tools that take an id still require the kind.
+    /// `memory` is the only kind: a tool that takes an id names where the id
+    /// comes from and asks for no kind.
     #[tokio::test]
-    async fn memory_id_docs_name_recall_context_and_the_default_kind() {
+    async fn memory_id_docs_name_recall_context_and_no_kind() {
         let (b, _d) = bridge().await;
+        for name in ["delete_memory", "update_memory", "restore_memory", "read_memory", "list_memories"] {
+            let schema = serde_json::to_string(&tool(&b, name).input_schema).expect("schema");
+            assert!(!schema.contains("kind") && !schema.contains("table"), "{name} schema: {schema}");
+            let d = description(&b, name);
+            assert!(!d.contains(" kind") && !d.contains("table"), "{name} description: {d}");
+        }
         for name in ["delete_memory", "update_memory"] {
-            let schema = serde_json::to_string(&tool(&b, name).input_schema).expect("schema").replace("\\n", " ");
+            let schema = serde_json::to_string(&tool(&b, name).input_schema).expect("schema");
             assert!(schema.contains("recall_context"), "{name} schema: {schema}");
-            assert!(schema.contains("no kind in front of its type is a memory"), "{name} schema: {schema}");
         }
         let d = description(&b, "delete_memory");
         assert!(d.contains("recall_context"), "description: {d}");
@@ -3568,7 +3581,7 @@ mod tests {
         assert!(text(&found).contains(content), "text was: {}", text(&found));
 
         let deleted = b
-            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id, kind: None })
             .await
             .expect("delete");
         assert!(!is_error(&deleted), "delete failed: {}", text(&deleted));
@@ -3878,7 +3891,7 @@ mod tests {
         let status = text(&b.memory_status_impl(b.agent_for(None)).await.expect("status"));
         assert!(status.contains("\nperfil: dev\n") && status.contains("compartido: lee y cambia"), "{status}");
         let moved = UpdateMemoryArgs {
-            kind: "memory".into(),
+            kind: None,
             id: 1,
             importance: None,
             memory_type: None,
@@ -3967,7 +3980,7 @@ mod tests {
     async fn deleting_a_missing_row_is_an_error_result_the_model_can_read() {
         let (b, _d) = bridge().await;
         let r = b
-            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 999_999, kind: "memory".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 999_999, kind: None })
             .await
             .expect("the call itself must succeed");
         assert!(is_error(&r), "a failed delete must be marked as an error");
@@ -4266,11 +4279,31 @@ mod tests {
     async fn an_unknown_kind_is_reported_as_a_readable_error() {
         let (b, _d) = bridge().await;
         let r = b
-            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 1, kind: "bogus".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 1, kind: Some("bogus".into()) })
             .await
             .expect("call");
         assert!(is_error(&r));
         assert!(text(&r).contains("bogus"), "text was: {}", text(&r));
+    }
+
+    /// The daemon, not running here, would act on the row of `memory` with
+    /// the id a retired kind came with.
+    #[tokio::test]
+    async fn a_retired_kind_is_answered_without_calling_the_daemon() {
+        let b = dead_bridge();
+        let (episodic, procedural) = (Some("episodic".to_string()), Some("procedural".to_string()));
+        let answers = [
+            b.delete_memory_impl("a", DeleteMemoryArgs { id: 7, kind: episodic.clone() }).await,
+            b.restore_memory_impl("a", RestoreMemoryArgs { id: 7, kind: procedural.clone() }).await,
+            b.read_memory_impl("a", ReadMemoryArgs { id: 7, kind: episodic.clone() }).await,
+            b.update_memory_impl("a", UpdateMemoryArgs { kind: procedural, ..update_args(7, Some(2.0), None) }).await,
+            b.list_memories_impl("a", ListMemoriesArgs { kind: episodic, ..list_all() }).await,
+        ];
+        for answer in answers {
+            let answer = answer.expect("call");
+            assert!(is_error(&answer));
+            assert!(text(&answer).ends_with("find them with search_memory"), "{}", text(&answer));
+        }
     }
 
     /// The failure a user actually hits: the daemon died, or never started.
@@ -4314,7 +4347,7 @@ mod tests {
 
         hide(&d, "agent-b", "agent-a");
         let r = b
-            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: None })
             .await
             .expect("call");
         assert!(is_error(&r), "a hidden author's memory must not be deletable: {}", text(&r));
@@ -4323,7 +4356,7 @@ mod tests {
 
         share_all(&d);
         let r = b
-            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: None })
             .await
             .expect("call");
         assert!(!is_error(&r), "another agent deletes what it reaches: {}", text(&r));
@@ -4332,7 +4365,7 @@ mod tests {
     }
 
     fn restore_args(id: i64) -> RestoreMemoryArgs {
-        RestoreMemoryArgs { id, kind: "memory".into() }
+        RestoreMemoryArgs { id, kind: None }
     }
 
     #[tokio::test]
@@ -4341,7 +4374,7 @@ mod tests {
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
 
-        let deleted = b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        let deleted = b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: None }).await.expect("call");
         assert!(text(&deleted).contains("restore_memory"), "the delete says how to undo it: {}", text(&deleted));
         assert!(!text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
 
@@ -4360,7 +4393,7 @@ mod tests {
         let (b, d) = bridge().await;
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
-        b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: None }).await.expect("call");
 
         hide(&d, "agent-b", "agent-a");
         let r = b.restore_memory_impl("agent-b", restore_args(id)).await.expect("call");
@@ -4442,7 +4475,7 @@ mod tests {
     fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {
         UpdateMemoryArgs {
             id,
-            kind: "memory".into(),
+            kind: None,
             importance,
             memory_type: memory_type.map(Into::into),
             to_project_path: None,
@@ -4829,7 +4862,7 @@ mod tests {
         let listed = text(&b.list_memories_impl("claude-code", list_all()).await.expect("list"));
         assert!(listed.contains("imp=9.5") && listed.contains(&format!("#{id} ")), "its author sees the change: {listed}");
 
-        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: None }).await.expect("call");
         assert!(!is_error(&r), "and deletes it: {}", text(&r));
         assert!(!text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
     }

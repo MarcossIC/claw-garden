@@ -38,8 +38,9 @@ pub struct Export {
     pub conflicts: Vec<ConflictLine>,
     /// Saves of the exported agents still in the outbox, which do not travel.
     pub outbox_waiting: usize,
-    /// Live rows of `episodic_trajectory` and `procedural_skill`, which
-    /// nothing writes any more and which do not travel.
+    /// Live rows of `episodic_trajectory` and `procedural_skill` in a store
+    /// from before V32, which moves them into `memory` when it is opened:
+    /// read without migrating, they do not travel.
     pub legacy_rows: usize,
 }
 
@@ -215,12 +216,13 @@ pub(crate) fn read(c: &Connection, filter: &ExportFilter, now_ms: i64) -> Result
     } else {
         0
     };
-    let legacy_rows = c.query_row(
-        "SELECT (SELECT count(*) FROM episodic_trajectory WHERE deleted_at IS NULL) \
-              + (SELECT count(*) FROM procedural_skill WHERE deleted_at IS NULL)",
-        [],
-        |r| r.get::<_, i64>(0),
-    )? as usize;
+    let mut legacy_rows = 0;
+    for table in ["episodic_trajectory", "procedural_skill"] {
+        if has_table(c, table)? {
+            let live = c.query_row(&format!("SELECT count(*) FROM {table} WHERE deleted_at IS NULL"), [], |r| r.get::<_, i64>(0))?;
+            legacy_rows += live as usize;
+        }
+    }
 
     Ok(Export {
         header: Header {
@@ -596,6 +598,33 @@ mod tests {
 
         let pairs: Vec<(i64, i64, bool)> = exported.conflicts.iter().map(|p| (p.new_id, p.old_id, p.topic_key_warned)).collect();
         assert_eq!(pairs, vec![(2, 1, false)]);
+    }
+
+    /// The export reads a store without migrating it, so one from before V32
+    /// still holds rows of the two tables V32 moves into `memory`, which the
+    /// file does not carry. A store at V32 has neither table.
+    #[tokio::test]
+    async fn an_export_of_a_store_before_the_move_counts_the_rows_it_leaves() {
+        let dir = crate::test_dir::test_dir();
+        seed_on_disk(dir.path(), Some(31)).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        c.execute_batch(
+            "INSERT INTO episodic_trajectory (scope, agent_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
+               VALUES ('agent', 'a', 's-1', 'a trajectory', 1, 1, 1), ('agent', 'a', 's-2', 'a deleted one', 1, 1, 1);
+             UPDATE episodic_trajectory SET deleted_at = 2 WHERE session_id = 's-2';
+             INSERT INTO procedural_skill (scope, agent_id, skill_name, trigger, promoted_at, source_trajectory_ids, created_at, \
+               last_modified_at, last_accessed_at) VALUES ('agent', 'a', 'a skill', 'when asked', 1, '[]', 1, 1, 1);",
+        )
+        .unwrap();
+        drop(c);
+        assert_eq!(export(dir.path(), &ExportFilter::default(), 0).unwrap().legacy_rows, 2);
+
+        let dir = crate::test_dir::test_dir();
+        seed_on_disk(dir.path(), None).await;
+        let c = rusqlite::Connection::open(dir.path().join("memory.db")).unwrap();
+        assert!(!has_table(&c, "episodic_trajectory").unwrap() && !has_table(&c, "procedural_skill").unwrap());
+        drop(c);
+        assert_eq!(export(dir.path(), &ExportFilter::default(), 0).unwrap().legacy_rows, 0);
     }
 
     #[tokio::test]

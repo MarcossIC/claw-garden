@@ -717,13 +717,13 @@ pub fn project_duplicates(
     found
 }
 
-/// The ids rows are saved under that `project` does not have: V27's triggers
-/// adopt every id `memory` is written under, but not one of the other two
-/// tables.
+/// The ids rows are saved under that `project` does not have. V27's triggers
+/// adopt every id `memory` is written under, so one means a store edited by
+/// hand or read before V32, whose trajectories and skills they never saw.
 pub fn project_orphans(lang: Lang, registry: &[RegistryRow], rows: &[IdRows]) -> Vec<Finding> {
     let mut found = Vec::new();
     for r in rows.iter().filter(|r| !registry.iter().any(|p| p.id == r.project_id)) {
-        let (id, n) = (&r.project_id, r.memories + r.trajectories + r.skills);
+        let (id, n) = (&r.project_id, r.memories);
         let message = match (n == 1, lang) {
             (true, Lang::En) => format!("1 row is saved under {id}, which is no project"),
             (false, Lang::En) => format!("{n} rows are saved under {id}, which is no project"),
@@ -733,8 +733,6 @@ pub fn project_orphans(lang: Lang, registry: &[RegistryRow], rows: &[IdRows]) ->
         found.push(Finding::new("project_orphans", Severity::Warn, "no_project", message).evidence(json!({
             "project_id": id,
             "memories": r.memories,
-            "trajectories": r.trajectories,
-            "skills": r.skills,
         })));
     }
     if found.is_empty() {
@@ -759,7 +757,7 @@ pub fn project_merges(lang: Lang, registry: &[RegistryRow], rows: &[IdRows], pro
         let Some(live) = live_of(registry, &tombstone.id) else {
             continue;
         };
-        let (id, into, n) = (&tombstone.id, &live.id, r.memories + r.trajectories + r.skills);
+        let (id, into, n) = (&tombstone.id, &live.id, r.memories);
         let message = match (n == 1, lang) {
             (true, Lang::En) => format!("1 row is still under {id}, which was merged into {into}"),
             (false, Lang::En) => format!("{n} rows are still under {id}, which was merged into {into}"),
@@ -772,8 +770,6 @@ pub fn project_merges(lang: Lang, registry: &[RegistryRow], rows: &[IdRows], pro
                     "project_id": id,
                     "merged_into": into,
                     "memories": r.memories,
-                    "trajectories": r.trajectories,
-                    "skills": r.skills,
                 }))
                 .step(with_profile(&format!("clawg projects merge {id} --into {into} --dry-run"), profile)),
         );
@@ -800,10 +796,11 @@ pub fn project_merges(lang: Lang, registry: &[RegistryRow], rows: &[IdRows], pro
     found
 }
 
-/// Each deleted project that has live rows in some table. Only
-/// `episodic_trajectory` and `procedural_skill` can: a live row of `memory`
-/// under a deleted project brings it back, so one means a store edited by
-/// hand. Nothing repairs it on its own, and so there is no step.
+/// Each deleted project that has live rows. A live row written under a
+/// deleted project brings it back, so one means a store edited by hand, or a
+/// trajectory or skill that was live under it when V32 moved it into
+/// `memory`, which leaves every project as it was. Nothing repairs it on its
+/// own, and so there is no step.
 pub fn project_deletes(lang: Lang, registry: &[RegistryRow], rows: &[IdRows], opens: &[OpenDelete]) -> Vec<Finding> {
     let deleted: Vec<&RegistryRow> = registry.iter().filter(|p| p.deleted_at.is_some()).collect();
     let mut found = Vec::new();
@@ -811,7 +808,7 @@ pub fn project_deletes(lang: Lang, registry: &[RegistryRow], rows: &[IdRows], op
         let Some(r) = rows.iter().find(|r| r.project_id == project.id) else {
             continue;
         };
-        let n = r.live_memories + r.live_trajectories + r.live_skills;
+        let n = r.live_memories;
         if n == 0 {
             continue;
         }
@@ -827,8 +824,6 @@ pub fn project_deletes(lang: Lang, registry: &[RegistryRow], rows: &[IdRows], op
             "project_id": id,
             "delete_id": delete_id,
             "live_memories": r.live_memories,
-            "live_trajectories": r.live_trajectories,
-            "live_skills": r.live_skills,
         })));
     }
     if found.is_empty() {
@@ -1503,16 +1498,8 @@ mod tests {
         }
     }
 
-    fn id_rows(project_id: &str, memories: i64, trajectories: i64) -> IdRows {
-        IdRows {
-            project_id: project_id.into(),
-            memories,
-            trajectories,
-            skills: 0,
-            live_memories: memories,
-            live_trajectories: trajectories,
-            live_skills: 0,
-        }
+    fn id_rows(project_id: &str, memories: i64) -> IdRows {
+        IdRows { project_id: project_id.into(), memories, live_memories: memories }
     }
 
     /// Two that share a name, two whose folders share a first commit, two
@@ -1581,12 +1568,12 @@ mod tests {
     fn an_id_without_a_project_is_named() {
         let registry = registered(&[("web-3c4d", "web", 1, None)]);
 
-        let found = project_orphans(L, &registry, &[id_rows("orphan-9f9f", 0, 1), id_rows("web-3c4d", 2, 0)]);
+        let found = project_orphans(L, &registry, &[id_rows("orphan-9f9f", 1), id_rows("web-3c4d", 2)]);
 
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].reason_code, found[0].safe_next_step.as_deref()), ("no_project", None));
-        assert_eq!(found[0].evidence, json!({ "project_id": "orphan-9f9f", "memories": 0, "trajectories": 1, "skills": 0 }));
-        assert_eq!(project_orphans(L, &registry, &[id_rows("web-3c4d", 2, 0)])[0].reason_code, "healthy");
+        assert_eq!(found[0].evidence, json!({ "project_id": "orphan-9f9f", "memories": 1 }));
+        assert_eq!(project_orphans(L, &registry, &[id_rows("web-3c4d", 2)])[0].reason_code, "healthy");
     }
 
     #[test]
@@ -1599,7 +1586,7 @@ mod tests {
             ("lost-0003", "lost", 5, Some("gone-0004")),
         ]);
 
-        let found = project_merges(L, &registry, &[id_rows("app-1a2b", 1, 0), id_rows("web-3c4d", 3, 0)], P);
+        let found = project_merges(L, &registry, &[id_rows("app-1a2b", 1), id_rows("web-3c4d", 3)], P);
 
         let named: Vec<(&str, &serde_json::Value)> = found.iter().map(|f| (f.reason_code, &f.evidence["project_id"])).collect();
         assert_eq!(
@@ -1614,7 +1601,7 @@ mod tests {
         assert_eq!(found[0].evidence["merged_into"], "web-3c4d");
         assert_eq!(found[0].safe_next_step.as_deref(), Some("clawg projects merge app-1a2b --into web-3c4d --dry-run --profile dev"));
         assert_eq!(found[3].safe_next_step, None);
-        assert_eq!(project_merges(L, &registry[..2], &[id_rows("web-3c4d", 3, 0)], P)[0].reason_code, "healthy");
+        assert_eq!(project_merges(L, &registry[..2], &[id_rows("web-3c4d", 3)], P)[0].reason_code, "healthy");
     }
 
     /// Every finding a check can give, for the facts that give it.
@@ -1720,13 +1707,13 @@ mod tests {
         all.extend(project_duplicates(lang, &lookalike, &prints, &[], P));
         all.extend(project_duplicates(lang, &[], &[], &[], P));
         let registry = registered(&[("web-3c4d", "web", 1, None), ("app-1a2b", "app", 2, Some("web-3c4d")), ("lost-0003", "lost", 5, Some("gone-0004"))]);
-        all.extend(project_orphans(lang, &registry, &[id_rows("orphan-9f9f", 1, 0), id_rows("other-9f9e", 2, 0)]));
+        all.extend(project_orphans(lang, &registry, &[id_rows("orphan-9f9f", 1), id_rows("other-9f9e", 2)]));
         all.extend(project_orphans(lang, &registry, &[]));
-        all.extend(project_merges(lang, &registry, &[id_rows("app-1a2b", 1, 0), id_rows("app-1a2b", 2, 0)], P));
+        all.extend(project_merges(lang, &registry, &[id_rows("app-1a2b", 1), id_rows("app-1a2b", 2)], P));
         all.extend(project_merges(lang, &registry[..1], &[], P));
         let gone = RegistryRow { deleted_at: Some(9), ..registered(&[("gone-1a2b", "gone", 7, None)]).remove(0) };
         let opens = [OpenDelete { project_id: "gone-1a2b".into(), delete_id: 4 }];
-        all.extend(project_deletes(lang, std::slice::from_ref(&gone), &[id_rows("gone-1a2b", 1, 0)], &opens));
+        all.extend(project_deletes(lang, std::slice::from_ref(&gone), &[id_rows("gone-1a2b", 1)], &opens));
         all.extend(project_deletes(lang, &[gone], &[], &opens));
         let lost = DeclaredSubfolder { parent_id: "web-3c4d".into(), subpath: "apps/web".into(), project_id: "nowhere-9f9f".into() };
         all.extend(project_subfolders(lang, &registry, &[lost]));
@@ -1792,7 +1779,7 @@ mod tests {
         // and a tombstone leads to it: it is none of their duplicate.
         assert_eq!(project_duplicates(L, &registry, &prints, &[], P)[0].reason_code, "healthy");
         // Its rows, live or not, are saved under a project.
-        let found = project_orphans(L, &registry, &[id_rows("app-1a2b", 2, 1), id_rows("lib-5e6f", 0, 1)]);
+        let found = project_orphans(L, &registry, &[id_rows("app-1a2b", 3), id_rows("lib-5e6f", 1)]);
         assert_eq!(found[0].reason_code, "healthy", "{found:?}");
         // A chain of merges that ends in it is not broken.
         let found = project_merges(L, &registry, &[], P);
@@ -1804,9 +1791,9 @@ mod tests {
         let mut registry = registered(&[("web-3c4d", "web", 1, None)]);
         registry.extend([deleted("gone-1a2b", "gone", 2, None), deleted("quiet-3c4d", "quiet", 3, None)]);
         let rows = [
-            IdRows { project_id: "gone-1a2b".into(), memories: 3, trajectories: 1, skills: 0, live_memories: 1, live_trajectories: 1, live_skills: 0 },
-            IdRows { project_id: "quiet-3c4d".into(), memories: 3, trajectories: 0, skills: 0, live_memories: 0, live_trajectories: 0, live_skills: 0 },
-            id_rows("web-3c4d", 2, 0),
+            IdRows { project_id: "gone-1a2b".into(), memories: 3, live_memories: 1 },
+            IdRows { project_id: "quiet-3c4d".into(), memories: 3, live_memories: 0 },
+            id_rows("web-3c4d", 2),
         ];
         let opens = [OpenDelete { project_id: "gone-1a2b".into(), delete_id: 4 }];
 
@@ -1816,11 +1803,11 @@ mod tests {
         assert_eq!((found[0].reason_code, found[0].severity, found[0].safe_next_step.as_deref()), ("live_under_deleted", Severity::Warn, None));
         assert_eq!(
             found[0].evidence,
-            json!({ "project_id": "gone-1a2b", "delete_id": 4, "live_memories": 1, "live_trajectories": 1, "live_skills": 0 })
+            json!({ "project_id": "gone-1a2b", "delete_id": 4, "live_memories": 1 })
         );
         let without = project_deletes(L, &registry, &rows, &[]);
         assert_eq!(without[0].evidence["delete_id"], serde_json::Value::Null, "a deleted project with no open delete");
-        let healthy = project_deletes(L, &registry, &[id_rows("web-3c4d", 2, 0)], &opens);
+        let healthy = project_deletes(L, &registry, &[id_rows("web-3c4d", 2)], &opens);
         assert_eq!((healthy[0].reason_code, &healthy[0].evidence), ("healthy", &json!({ "deleted": 2 })));
     }
 

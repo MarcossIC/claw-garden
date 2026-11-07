@@ -946,25 +946,6 @@ where
     args.into_iter().nth(1).is_none()
 }
 
-/// The three tables a row can live in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum KindArg {
-    Memory,
-    Episodic,
-    Procedural,
-}
-
-impl KindArg {
-    /// The spelling the daemon's API takes.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            KindArg::Memory => "memory",
-            KindArg::Episodic => "episodic",
-            KindArg::Procedural => "procedural",
-        }
-    }
-}
-
 /// The lifecycle states a memory can be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum StatusArg {
@@ -1030,11 +1011,23 @@ pub struct Filters {
     pub no_project: bool,
 }
 
+/// `--kind`, out of the help: `memory` is the only kind, and a retired one
+/// says where its rows went.
+fn memory_kind(raw: &str) -> Result<String, String> {
+    match raw {
+        "memory" => Ok(raw.to_owned()),
+        "episodic" | "procedural" => Err(format!(
+            "kind {raw:?} no longer exists: its rows are memory rows now, of type semantic_fact, each with a new id; \
+             find them with `clawg memories search`"
+        )),
+        other => Err(format!("unknown kind {other:?}: the only kind is memory")),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct ListOpts {
-    /// Which table to list. Lists all three when omitted.
-    #[arg(long, value_enum)]
-    pub kind: Option<KindArg>,
+    #[arg(long, hide = true, value_parser = memory_kind)]
+    pub kind: Option<String>,
     #[command(flatten)]
     pub filters: Filters,
     /// How many rows to show (1 to 100).
@@ -1079,11 +1072,10 @@ pub struct SearchOpts {
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct ShowOpts {
-    /// The row id, as printed by `list` and `search`. Ids are per table.
+    /// The row id, as printed by `list` and `search`.
     pub id: i64,
-    /// Which table the id belongs to.
-    #[arg(long, value_enum, default_value_t = KindArg::Memory)]
-    pub kind: KindArg,
+    #[arg(long, hide = true, value_parser = memory_kind)]
+    pub kind: Option<String>,
     /// Print JSON instead of the detail view.
     #[arg(long)]
     pub json: bool,
@@ -2159,14 +2151,14 @@ mod tests {
     #[test]
     fn list_accepts_every_filter() {
         let action = memories(&[
-            "list", "--kind", "episodic", "--agent", "a1", "--project", "p1", "--type",
+            "list", "--kind", "memory", "--agent", "a1", "--project", "p1", "--type",
             "semantic_fact", "--tier", "2", "--status", "disputed", "--limit", "5", "--offset",
             "10", "--json", "--profile", "dev",
         ]);
         assert_eq!(
             action,
             MemoriesAction::List(ListOpts {
-                kind: Some(KindArg::Episodic),
+                kind: Some("memory".into()),
                 filters: Filters {
                     scope: Scope {
                         agent: Some("a1".into()),
@@ -2245,16 +2237,36 @@ mod tests {
             memories(&["show", "57"]),
             MemoriesAction::Show(ShowOpts {
                 id: 57,
-                kind: KindArg::Memory,
+                kind: None,
                 json: false,
                 profile: ProfileArg { profile: None },
             })
         );
-        match memories(&["show", "3", "--kind", "procedural", "--json"]) {
+        match memories(&["show", "3", "--kind", "memory", "--json"]) {
             MemoriesAction::Show(opts) => {
-                assert_eq!((opts.id, opts.kind, opts.json), (3, KindArg::Procedural, true));
+                assert_eq!((opts.id, opts.kind.as_deref(), opts.json), (3, Some("memory"), true));
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_retired_kind_is_a_usage_error_that_says_where_its_rows_went() {
+        for kind in ["episodic", "procedural"] {
+            for argv in [&["clawg", "memories", "list", "--kind", kind][..], &["clawg", "memories", "show", "3", "--kind", kind]] {
+                let err = Cli::try_parse_from(argv).expect_err("a retired kind");
+                assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{err}");
+                let text = err.to_string();
+                assert!(text.contains(&format!("kind \"{kind}\" no longer exists")), "{text}");
+                assert!(text.contains("of type semantic_fact, each with a new id"), "{text}");
+                assert!(text.contains("`clawg memories search`"), "{text}");
+            }
+        }
+        let err = Cli::try_parse_from(["clawg", "memories", "list", "--kind", "bogus"]).expect_err("an unknown kind");
+        assert!(err.to_string().contains("the only kind is memory"), "{err}");
+        for action in ["list", "show"] {
+            let help = Cli::try_parse_from(["clawg", "memories", action, "--help"]).expect_err("help").to_string();
+            assert!(!help.contains("--kind"), "memory is the only kind, which nobody chooses: {help}");
         }
     }
 

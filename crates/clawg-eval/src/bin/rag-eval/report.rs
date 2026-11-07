@@ -31,8 +31,6 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct KPool {
     pub memory: usize,
-    pub episodic: usize,
-    pub procedural: usize,
     /// The lexical-channel candidate budget this run actually searched with
     /// — `None` means the channel was off. Recorded so a reader of the
     /// results JSON can tell which channel config produced these numbers
@@ -1819,7 +1817,7 @@ mod tests {
             model_id: "fake-embedder".to_string(),
             git_sha: "deadbee".to_string(),
             fts_tokenizer: "unicode61 remove_diacritics 2".to_string(),
-            k_pool: KPool { memory: 30, episodic: 5, procedural: 5, lexical: None },
+            k_pool: KPool { memory: 30, lexical: None },
             k_final: 10,
             corpus_size: 1,
             n_retrieval_cases: 1,
