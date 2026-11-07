@@ -880,7 +880,7 @@ La transacción que lo crea MUST volver a mirar el paso 2 de PL32: si mientras t
 - Las demás resuelven sin `create`: un nombre que no es de ningún proyecto MUST NOT crear nada.
 - Un rechazo de PL32 MUST responder, sin guardar ni buscar, una frase que nombra cada candidato con su id y su nombre (y los borrados como tales) y dice qué hacer: preguntarle a la persona, y después usar el id, o `new_project` para un proyecto aparte. Un borrado se trae de vuelta guardando con su id.
 - `search_project` MUST buscar en la carpeta con `index_docs` más vieja del proyecto, o en la más vieja. Un proyecto sin carpeta MUST responder su propio mensaje: no tiene archivos que buscar en esta máquina.
-- `all_projects` y `project` juntos: `all_projects` gana, como gana hoy sobre `project_path`.
+- `all_projects` y `project` juntos: en `search_memory` y `synthesize`, `all_projects` gana, como gana sobre `project_path`. `save_memory` MUST negarse sin llamar al daemon con `all_projects` y `project`, o con `all_projects` y `project_path` ([`specs/mcp`](../mcp/spec.md), PM4).
 
 Cuando no hay carpetas abiertas ([`specs/mcp`](../mcp/spec.md), BI3) y la llamada no nombra un proyecto, la búsqueda sigue sin alcance.
 

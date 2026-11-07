@@ -869,8 +869,7 @@ impl ClawgMcp {
     }
 
     /// What `save_memory` tells the model: `Ok` is a success result, `Err` an
-    /// error result. Every id it names is one `delete_memory` takes with
-    /// `kind: "memory"`.
+    /// error result. Every id it names is one `delete_memory` takes.
     fn save_outcome_text(lang: Lang, result: Result<SaveOutcome, ClientError>) -> Result<String, String> {
         let ids = |memories: &[crate::client::SavedMemory]| {
             memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
@@ -4217,6 +4216,9 @@ mod tests {
         assert!(!here.contains("topic="), "{here}");
         let there = text(&search(Some(other.root.display().to_string())).await.unwrap());
         assert!(there.contains(" topic=style/indent]"), "{there}");
+        let by_id = SearchMemoryArgs { query: content.into(), limit: None, project_path: None, project: Some(other.id.clone()), all_projects: None };
+        let named = text(&b.search_memory_impl("a", by_id).await.unwrap());
+        assert!(named.contains(" topic=style/indent]"), "a search that names the project, not an open folder: {named}");
 
         let again = b.save_here("a", preference("Indent with two spaces", None)).await.unwrap();
         assert!(!text(&again).contains("replaces"), "{}", text(&again));

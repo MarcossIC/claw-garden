@@ -421,8 +421,8 @@ pub fn topic_key_warning(lang: Lang, id: i64) -> String {
 /// a row a verdict replaced stays out of searches with it.
 pub fn format_delete(lang: Lang, d: &Deleted) -> String {
     let mut out = match lang {
-        Lang::En => format!("deleted {}; restore_memory with the same id and kind undoes it", d.deleted),
-        Lang::Es => format!("se borró {}; restore_memory con el mismo id y kind lo deshace", d.deleted),
+        Lang::En => format!("deleted {}; restore_memory with the same id undoes it", d.deleted),
+        Lang::Es => format!("se borró {}; restore_memory con el mismo id lo deshace", d.deleted),
     };
     if !d.revived.is_empty() {
         let named: Vec<String> = d.revived.iter().map(|r| format!("#{} \"{}\"", r.id, r.excerpt)).collect();
@@ -1093,9 +1093,10 @@ pub fn indexes_docs(project: &ProjectIdentity, open: &[ProjectIdentity]) -> bool
     open.iter().any(|folder| folder.root == project.root)
 }
 
-/// The folders a refusal offers, each as its root, for `project_path`.
+/// The folders a refusal offers for `project_path`, each as it is open and
+/// not as its root: a declared subfolder leads to a project its root does not.
 fn listed(folders: &[ProjectIdentity]) -> String {
-    folders.iter().map(|f| f.root.display().to_string()).collect::<Vec<_>>().join(", ")
+    folders.iter().map(|f| f.path.display().to_string()).collect::<Vec<_>>().join(", ")
 }
 
 /// Why `save_memory` saved nothing: it names no project. `open` are the
@@ -1995,7 +1996,7 @@ mod tests {
     #[test]
     fn format_delete_names_what_came_back_and_what_stays_hidden() {
         let plain = Deleted { deleted: 1, ..Deleted::default() };
-        assert_eq!(format_delete(Lang::En, &plain), "deleted 1; restore_memory with the same id and kind undoes it");
+        assert_eq!(format_delete(Lang::En, &plain), "deleted 1; restore_memory with the same id undoes it");
         let both = Deleted {
             deleted: 1,
             revived: vec![ReplacedMemory { id: 4, excerpt: "Storage engine is SQLite".into() }],
@@ -2003,7 +2004,7 @@ mod tests {
         };
         assert_eq!(
             format_delete(Lang::En, &both),
-            "deleted 1; restore_memory with the same id and kind undoes it\n\
+            "deleted 1; restore_memory with the same id undoes it\n\
              the version it had replaced is current again: #4 \"Storage engine is SQLite\"\n\
              #7, #8 stay superseded by it, as a resolve_conflict verdict left them, so searches leave them out"
         );
@@ -2322,6 +2323,21 @@ mod tests {
         assert!(!indexes_docs(&twin, &[own]));
     }
 
+    /// A declared subfolder of a repository is a project of its own, which
+    /// its root as a `project_path` would not reach.
+    #[test]
+    fn a_save_refusal_offers_each_open_folder_rather_than_its_root() {
+        let web = ProjectIdentity { path: "/mono/apps/web".into(), ..identity("mono") };
+
+        assert_eq!(
+            no_project_named(Lang::En, &[web.clone(), identity("other")]),
+            "not saved: say which project this memory belongs to: project_path with one of the folders open here \
+             (/mono/apps/web, /other), project with a project's id or name, or all_projects for one that holds in \
+             every project"
+        );
+        assert!(no_project_named(Lang::Es, &[web]).contains("carpetas abiertas (/mono/apps/web)"));
+    }
+
     // ── format_status ───────────────────────────────────────────────────────
 
     fn health() -> Health {
@@ -2527,7 +2543,7 @@ mod tests {
         };
         assert_eq!(
             format_delete(Lang::Es, &both),
-            "se borró 1; restore_memory con el mismo id y kind lo deshace\n\
+            "se borró 1; restore_memory con el mismo id lo deshace\n\
              la versión que había reemplazado vuelve a ser la actual: #4 \"Storage engine is SQLite\"\n\
              #7 siguen reemplazadas por ella, como las dejó un veredicto de resolve_conflict, así que las búsquedas las \
              dejan afuera"
