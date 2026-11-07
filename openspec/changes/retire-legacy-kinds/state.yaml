@@ -1,7 +1,7 @@
 change: retire-legacy-kinds
 objective: "1"
 depends_on: []
-phase: verify  # pendiente en local: la migración sobre copias de prod y dev, search.duration y rag-eval --diff (verify.md)
+phase: archive  # queda para prod, con 0.79.0 instalada: search.duration y rag-eval --diff (verify.md, «Pendiente en prod»)
 artifacts:
   exploration: done  # con el resultado de la puerta y las cuatro decisiones tomadas
   proposal: done  # enfoque A; umbral de rag-eval --diff fijado: ningún caso se mueve
@@ -9,7 +9,7 @@ artifacts:
   design: done  # D1 a D9
   tasks: done  # partes 1 a 6; la 7 (archivo) queda fuera
   apply: done  # un commit por parte, con sus tests en rojo antes
-  verify: partial  # Linux: la suite y los dos clippy; el CI de #136 en Linux y Windows; falta lo pendiente en local
+  verify: done  # Linux: la suite y los dos clippy; el CI de #136 en Linux y Windows; V32 sobre copias de prod y dev, sin ninguna fila perdida; search.duration y rag-eval --diff quedan para prod
   archive: pending
 gates:
   "0": passed  # 0 filas y 0 entradas de diario en prod y en dev
