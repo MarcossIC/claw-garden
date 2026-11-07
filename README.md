@@ -445,6 +445,8 @@ No instala un recordatorio de guardar, porque el hook de Cursor antes de cada me
 
 Como `setup claude-code`, guarda una copia de cada archivo en `~/.clawg/backups/setup/` antes de cambiarlo, y con `--dry-run` muestra lo que haría sin tocar nada. Lo que no coincide con lo que instalaría (un `clawg` registrado con otro comando, otro hook de clawg en `sessionStart`) no lo reemplaza: lo dice y sale con 1. Para rehacerlo, `clawg setup cursor --remove` y otra vez `clawg setup cursor`.
 
+**Qué proyecto usa.** Cursor arranca el servidor MCP en tu carpeta personal, sea cual sea la ventana, así que clawg no se fija en ese directorio: en cada llamada le pide a Cursor las carpetas abiertas, que son las de todas sus ventanas. Una búsqueda sin proyecto lee esas carpetas, y con varias abiertas busca en todas; un save nombra siempre su proyecto, y si el agente no lo dice, clawg no guarda y le muestra las carpetas para que elija. Tu carpeta personal nunca es un proyecto.
+
 **Apagá la configuración de terceros de Cursor.** "Include Third-Party Plugins, Skills, and Other Configs" (Settings → Agents → Third-Party Imports) viene encendido y hace que Cursor también cargue los hooks de `~/.claude/settings.json` y los plugins de Claude Code; en Windows, un hook `.sh` de un plugin abre una ventana de Git Bash. clawg no puede leer ese ajuste, así que `setup cursor` lo recuerda cada vez. Si queda encendido, el hook que instaló `clawg setup claude-code` no hace nada cuando lo corre Cursor.
 
 Después **reiniciá Cursor**, abrí un chat y pedile al agente que use la herramienta `memory_status`: dice qué agente está en uso (`cursor`) y qué perfil.
@@ -569,8 +571,8 @@ Registra `clawg-dev` con la ruta de ese binario y sus hooks con `--profile dev`;
 
 ### Herramientas MCP
 
-- `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones. Con `all_projects`, la guarda sin proyecto, para lo que vale en todo lo que hacés.
-- `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia. Lo que guardó otro agente va marcado `by <agente>`.
+- `save_memory`: guarda un hecho, preferencia o decisión para que sobreviva entre sesiones. Cada save nombra su proyecto: `project_path` con su carpeta, `project` con su nombre o `all_projects`, que la guarda sin proyecto, para lo que vale en todo lo que hacés. Sin ninguno, clawg no guarda y le lista al agente las carpetas abiertas.
+- `search_memory`: busca memorias relacionadas con una consulta, con ids, tipos y puntajes de relevancia. Lo que guardó otro agente va marcado `by <agente>`. Sin proyecto, busca en las carpetas que el cliente tiene abiertas; con varias, en todas, y cada resultado dice su proyecto con `project=`.
 - `recall_context`: devuelve un bloque de contexto listo para leer (notas del workspace, memorias recientes y de largo plazo) para una consulta.
 - `search_project`: busca en la documentación del proyecto (los Markdown y los manifiestos como `Cargo.toml` o `package.json`, respetando `.gitignore`) y en su código Rust, Python y TypeScript, partido por definición, y devuelve cada pasaje con su ruta de encabezados o de definiciones. Sirve para preguntas sobre cómo funciona el proyecto. El índice se arma solo la primera vez que el agente abre el proyecto y se pone al día cuando cambian los archivos.
 - `list_memories`: recorre las memorias del agente, las más nuevas primero, sin buscar.

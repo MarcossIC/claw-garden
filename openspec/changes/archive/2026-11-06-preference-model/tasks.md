@@ -64,6 +64,10 @@ Los requisitos están en la [spec](spec.md); las decisiones, en la [propuesta](p
 - [x] `verify.md`, con lo que se mide contra `prod` como pendiente en local; `state.yaml`; la línea del cambio en `ROADMAP.md` y la fila 117 del mapa de openspec.
 - Commit: `docs(openspec): record preference-model applied`
 
+- [x] Los puntos 1 a 3 de lo que se mide contra `prod`, cada uno sobre una copia nueva del directorio de datos ([verify](verify.md#medido-sobre-una-copia-de-prod)); Cursor real queda para el piloto.
+- Commit: `docs(openspec): record the prod measurements of preference-model`
+
 ## 8. Archivo (fuera de este cambio)
 
-- [ ] Llevar PM1 a PM3 a `specs/retrieval` y R5 de `specs/sharing`, PM5 y PM9 a `specs/provenance` y PM5 también a `specs/retrieval`, PM4, PM6 y PM8 a `specs/mcp`, PM7 a `specs/retrieval`; mover la carpeta a `changes/archive/`; subir el minor.
+- [x] Llevar PM1 a PM3 a `specs/retrieval` y R5 de `specs/sharing`, PM5 y PM9 a `specs/provenance` y PM5 también a `specs/retrieval`, PM4, PM6 y PM8 a `specs/mcp`, PM7 a `specs/retrieval`; mover la carpeta a `changes/archive/`; subir el minor ([verify](verify.md#al-archivar-2026-11-06)).
+- Commits: `docs(openspec): archive preference-model and fold it into the specs`, `chore: bump version to 0.78.0`

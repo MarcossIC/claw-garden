@@ -10,6 +10,7 @@
 
 pub mod handshake;
 pub mod protocol;
+pub mod roots;
 pub mod server;
 pub mod startup;
 pub mod tools;

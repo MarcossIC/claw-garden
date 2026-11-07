@@ -23,27 +23,13 @@ Qué sigue y en qué orden. Es el único lugar que ordena lo pendiente: [README.
 
 Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismos archivos.
 
-## Antes de la primera noche (a mano)
-
-- Apagar en Cursor "Include Third-Party Plugins, Skills, and Other Configs" (Settings → Agents → Third-Party Imports). En Windows, los hooks `.sh` de un plugin de Claude Code abren una ventana de Git Bash. Va antes de instalar cualquier hook de clawg.
-- Publicar lo que hay en `develop`. Su pull request corre el CI que le falta al último arreglo de [hook-run-log](changes/archive/2026-11-04-hook-run-log/verify.md#veredicto), y lo que marque se arregla aparte.
-
 ## Noche 1
-
-| Cambio | Dónde | Qué deja resuelto |
-|---|---|---|
-| [history-reimport](changes/history-reimport/exploration.md), ensayo | Local: copia del store, export, transcripciones, línea base | Si el rendimiento mejoró de verdad, y un mapa para las notas sin proyecto |
-
-**Al otro día, con la persona:** decidir [preference-model](changes/preference-model/exploration.md) y hacer la prueba de 10 minutos de [bridge-project-identity](changes/bridge-project-identity/exploration.md).
-
-## Noche 2
 
 | Cambio | Dónde | Necesita antes |
 |---|---|---|
-| [preference-model](changes/preference-model/proposal.md) | Nube | Las decisiones, cerradas en la exploración. Aplicado y verificado en Linux y en el CI de Windows, con un PR abierto a `develop` ([verify](changes/preference-model/verify.md)); falta revisarlo, medir contra `prod` lo pendiente en local y archivarlo |
-| [bridge-project-identity](changes/bridge-project-identity/exploration.md) | Nube | La prueba con Cursor real |
+| [bridge-project-identity](changes/bridge-project-identity/verify.md#pendiente-en-local) | Nube, aplicado en un pull request a `develop` | — (la [prueba con Cursor real](changes/bridge-project-identity/exploration.md#resultado-de-la-prueba-con-cursor-2026-11-05-y-2026-11-06) está hecha). El pull request pasa en Linux y en Windows; queda pendiente en local, con Cursor, un save en un workspace con dos repositorios |
 
-## Noche 3
+## Noche 2
 
 | Cambio | Dónde | Por qué acá |
 |---|---|---|
@@ -52,7 +38,7 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 ## Piloto (una semana de trabajo real, no una noche)
 
-Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario, con una excepción: Cursor se conecta con `clawg setup cursor --profile prod`, porque esa es la prueba con Cursor real ([pendiente en prod](changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)). Esa instalación también es a nivel usuario y afecta a cada ventana de Cursor, no sólo a este repositorio. Los mismos hooks prueban el arranque real de session-start-context ([pendiente en prod](changes/archive/2026-11-04-session-start-context/verify.md#pendiente-en-prod)).
+Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario, con una excepción: Cursor se conecta con `clawg setup cursor --profile prod`, porque esa es la prueba con Cursor real ([pendiente en prod](changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)). Esa instalación también es a nivel usuario y afecta a cada ventana de Cursor, no sólo a este repositorio. Los mismos hooks prueban el arranque real de session-start-context ([pendiente en prod](changes/archive/2026-11-04-session-start-context/verify.md#pendiente-en-prod)), y que una preferencia declarada a Claude Code entre al arranque de Cursor en el mismo proyecto ([preference-model](changes/archive/2026-11-06-preference-model/verify.md#pendiente-en-prod)).
 
 **Pasa si:**
 - responde 10 preguntas reales cuya respuesta sólo está en el historial;
@@ -63,6 +49,8 @@ Se publica lo anterior y se instalan los hooks a mano en un repositorio real con
 - la RAM es aceptable: esta semana decide el brazo B de ram-footprint-gates, porque cada evento de hook despierta el modelo.
 
 ## Corte (una noche local, con el piloto aprobado)
+
+Antes, lo que dejó el ensayo de history-reimport en [«Para el corte»](changes/history-reimport/verify.md#para-el-corte): decidir qué snapshots automáticos de `prod` se copian aparte, porque el corte poda algunos, y volver a clasificar las notas de un export nuevo que el mapa no conoce.
 
 Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y después:
 
@@ -80,7 +68,7 @@ Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y despué
 | [knn-prefilter](changes/knn-prefilter/proposal.md) | Las búsquedas en un proyecto chico traen poco o nada que sí está guardado. La fracción de filas ajenas es lo que decide la pérdida |
 | [read-connections](changes/read-connections/exploration.md) | Un hook vence sus 3 s detrás de una operación larga y el arranque queda sin contexto |
 | [session-lifecycle](changes/session-lifecycle/exploration.md) | Dos sesiones en paralelo del mismo proyecto reciben el traspaso de la otra |
-| [agent-eval](changes/agent-eval/proposal.md) | El agente no busca ni guarda cuando debería, y hay que medirlo. Pide autorización de gasto |
+| [agent-eval](changes/agent-eval/proposal.md) | El agente no busca ni guarda cuando debería, y hay que medirlo. Tareas, fixtures y corredor listos para sesiones pagas; falta correr el piloto en local, con una clave de API ([tareas](changes/agent-eval/tasks.md#después-de-este-cambio)) |
 | [topic-key-warning](changes/topic-key-warning/proposal.md) | No sube: se cierra cuando aparezcan casos reales que verifiquen su criterio |
 
 ## Después del corte (no bloquean)

@@ -1,0 +1,17 @@
+{
+  "id": "amb-ts-ignore-gen-stale",
+  "category": "S",
+  "fixture": "amb-ts-ignore-gen",
+  "prompt": "The build now also produces a dist2/ directory in the repository root. Update the repository's ignore rules so dist2/ is not tracked by git. The updated .gitignore is the deliverable.",
+  "memories": [
+    {
+      "content": "Ordering of new .gitignore entries\nAgreed. Decision: recent additions at the top, directly under the header line, so a reviewer sees what the branch added in the first lines of the diff instead of hunting for a green line at the bottom of a long file. The existing rules keep the order they already have; only new entries go above them.",
+      "memory_type": "architectural_decision",
+      "age_days": 145
+    }
+  ],
+  "tracers": ["recent additions at the top"],
+  "checks": [
+    {"kind": "file_contains", "path": ".gitignore", "text": "# managed ignore rules\n*.pyc\n.venv/\n__pycache__/\nbuild/\ndist/\ndist2/\nlogs/\nnode_modules/"}
+  ]
+}

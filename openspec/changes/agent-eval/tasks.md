@@ -62,7 +62,23 @@ En Windows `clawg import` salía con 1: un import real pide el embedder y el dae
 - Commit: `docs: say that the agent-eval runner waits for the model`
 - [x] Suite completa y clippy sobre el último commit: pasan.
 
+## 11. Lo que pide una sesión real (AE2, AE5, AE7, AE8)
+
+Verificado en la documentación de Claude Code 2.1.318: desde 2.1.302, `claude -p` sin modo de permisos niega `Write`, `Edit` y las herramientas MCP, porque nada puede aprobarlas.
+
+- [x] Los checks de archivo comparan sin `\r`: `file_checks_ignore_carriage_returns` (`score.rs`). Commit: `fix(eval): compare file checks across line endings`
+- [x] `--permission-mode acceptEdits`, `Bash` negado y el servidor de clawg permitido (`arm.rs`). Commit: `feat(eval): let a session edit its directory and call clawg without prompts`
+- [x] Una corrida paga se niega sin clave, con `ANTHROPIC_AUTH_TOKEN` o `CLAUDE_CODE_EFFORT_LEVEL`, o con un `--out` debajo de un repositorio o de un archivo de instrucciones (`run.rs`). Commit: `feat(eval): refuse a paid run whose key or directory would skew it`
+- [x] `agent-eval report --runs DIR` (`report.rs`). Commit: `feat(eval): report a directory of runs by task and arm`
+- [x] `docs/reference/testing.md`. Commit: `docs: describe the agent-eval permissions, refusals and report`
+
+## 12. Las tareas del piloto (AE1)
+
+Salen de la investigación de fuentes externas: MemoryCode (K1 y K2), un ADR de MADR (K3), agent-memory-bench (S y C) y letta-evals (N y el fixture común). Las fuentes, los commits, las licencias y lo que escribió cada tarea quedan en `data/agent-tasks/SOURCES.md`. La C siembra las dos decisiones vivas y sin clave: con la vieja reemplazada, la sesión paga confirmaría lo que ya prueban los tests unitarios, y con la misma clave en un mismo import quedan las dos vivas, un estado que en producción no existe.
+
+- [x] `memorycode-d12-varsuffix-n` (K1), `memorycode-d14-import-secrets` (K2), `madr-0011-asterisk-list-marker` (K3), `amb-ts-ignore-gen-stale` (S), `amb-ts-semver-pin-conflict` (C), `letta-simple-edit-task1` (N); fixtures `letta-simple-edit`, `amb-ts-ignore-gen` y `amb-ts-semver-pin`; `agent-eval tasks` las da válidas y sin trazadores filtrados.
+- [x] Las categorías definidas en la spec y en `docs/reference/testing.md`.
+
 ## Después de este cambio
 
-- [ ] Las seis tareas del piloto y su fixture, revisadas antes de correr.
-- [ ] El piloto, con autorización y tope de gasto: la primera sesión real de `claude` confirma los nombres del cliente (decisión 8).
+- [ ] El piloto, con tope de gasto: una sesión humo por brazo (`a0`, `a3`, `a4`), las seis tareas sin memoria para descartar las que `a0` ya resuelve, y las que queden con `a3`, `a4` y `a3-eager`. La primera sesión real confirma los nombres del cliente (decisión 8).

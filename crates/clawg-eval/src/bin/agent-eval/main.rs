@@ -1,5 +1,6 @@
 mod arm;
 mod replay;
+mod report;
 mod rubric;
 mod run;
 mod score;
@@ -20,6 +21,7 @@ agent-eval tasks [--data DIR]
 agent-eval prepare RUN_OPTIONS
 agent-eval run RUN_OPTIONS (--replay STREAM | --max-budget-usd N --claude-version V)
 agent-eval score --run DIR
+agent-eval report --runs DIR
 agent-eval replay-client STREAM
 
   tasks          reads every task in DIR/tasks/*.json, checks each one and
@@ -43,11 +45,21 @@ agent-eval replay-client STREAM
                  session: the run needs --max-budget-usd, its hard cap, and
                  --claude-version, the Claude Code version it is pinned to,
                  and refuses before laying anything out a claude whose
-                 --version reports another one. On Windows clawg finds its
+                 --version reports another one. It also refuses, naming each
+                 problem, an environment without ANTHROPIC_API_KEY or with
+                 ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_EFFORT_LEVEL set, and
+                 an --out below a git repository or a CLAUDE.md,
+                 CLAUDE.local.md or .claude/CLAUDE.md. The session may edit
+                 its directory and call clawg's tools, and has no shell.
+                 On Windows clawg finds its
                  home through the system, so an arm with clawg needs a
                  `testing` build of it, which reads CLAWG_TEST_HOME; any
                  other is refused.
   score          scores a run directory again from its stream.jsonl.
+  report         reads the result.json of every directory up to 3 levels
+                 below DIR and prints a Markdown table by task and arm: runs,
+                 successes, runs that did not end, mean cost, turns, seconds
+                 and clawg calls, the tracer fates summed, and a totals line.
   replay-client  the client a dry run starts: prints STREAM after making
                  its file changes in the current directory.
 
@@ -88,6 +100,7 @@ enum Command {
     /// Without a replay, a run of the real client.
     Run { args: RunArgs, replay: Option<PathBuf> },
     Score { dir: PathBuf },
+    Report { dir: PathBuf },
     ReplayClient { stream: PathBuf },
 }
 
@@ -184,6 +197,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
             Command::Run { args, replay }
         }
         "score" => Command::Score { dir: PathBuf::from(required(&mut flags(rest, &["run"])?, "run")?) },
+        "report" => Command::Report { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
         "replay-client" => {
             let [stream]: [String; 1] = rest.collect::<Vec<_>>().try_into().map_err(|_| "replay-client takes one stream file")?;
             Command::ReplayClient { stream: PathBuf::from(stream) }
@@ -282,6 +296,9 @@ fn execute(command: Command) -> Result<(), String> {
             if let (Client::Claude, Some(version)) = (&client, &args.claude_version) {
                 run::check_client_version(arm::CLIENT, version).map_err(|e| e.to_string())?;
             }
+            if client == Client::Claude {
+                run::check_paid_run(&args.out).map_err(|e| e.to_string())?;
+            }
             let layout = prepare(&args, &client)?;
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
             run::execute(&layout.root, &exe).map_err(|e| e.to_string())?;
@@ -292,6 +309,11 @@ fn execute(command: Command) -> Result<(), String> {
         Command::Score { dir } => {
             let result = run::score_dir(&dir).map_err(|e| e.to_string())?;
             println!("{}", run::summary(&result));
+            Ok(())
+        }
+        Command::Report { dir } => {
+            let results = report::load(&dir).map_err(|e| e.to_string())?;
+            print!("{}", report::render(&report::aggregate(&results)));
             Ok(())
         }
         Command::ReplayClient { stream } => {
@@ -372,6 +394,9 @@ mod tests {
         assert_eq!(parse_args(args(&["tasks"])), Ok(Some(Command::Tasks { data: default_data() })));
         assert_eq!(parse_args(args(&["score", "--run", "r"])), Ok(Some(Command::Score { dir: "r".into() })));
         assert_eq!(parse_args(args(&["replay-client", "s"])), Ok(Some(Command::ReplayClient { stream: "s".into() })));
+        assert_eq!(parse_args(args(&["report", "--runs", "d"])), Ok(Some(Command::Report { dir: "d".into() })));
+        assert!(parse_args(args(&["report"])).unwrap_err().contains("--runs is required"));
+        assert!(parse_args(args(&["report", "--run", "d"])).unwrap_err().contains("unknown argument --run"));
         assert_eq!(parse_args(args(&["--help"])), Ok(None));
         assert_eq!(parse_args(args(&["run", "-h"])), Ok(None));
     }

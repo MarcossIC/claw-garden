@@ -239,9 +239,16 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
     if let Some(budget) = options.max_budget_usd {
         args.extend(["--max-budget-usd".into(), budget.to_string()]);
     }
+    // Nothing can approve a prompt in `-p`, so without a mode the client denies edits and MCP calls.
+    // Edits are approved inside the working directory only; a shell is the one way an unattended
+    // session could act outside it, and no task needs one. A denial outranks an allowance.
+    let mut denied: Vec<String> = vec!["Bash".into()];
     if arm == Arm::B {
-        let tools: Vec<String> = READ_TOOLS.iter().map(|t| format!("mcp__{server_name}__{t}")).collect();
-        args.extend(["--disallowedTools".into(), tools.join(",")]);
+        denied.extend(READ_TOOLS.iter().map(|t| format!("mcp__{server_name}__{t}")));
+    }
+    args.extend(["--permission-mode".into(), "acceptEdits".into(), "--disallowedTools".into(), denied.join(",")]);
+    if arm.has_clawg() {
+        args.extend(["--allowedTools".into(), format!("mcp__{server_name}")]);
     }
 
     let home = text(&layout.home())?;
@@ -435,9 +442,50 @@ mod tests {
         assert!(has_arg_pair(
             &plan,
             "--disallowedTools",
-            "mcp__clawg-dev__search_memory,mcp__clawg-dev__read_memory,mcp__clawg-dev__list_memories"
+            "Bash,mcp__clawg-dev__search_memory,mcp__clawg-dev__read_memory,mcp__clawg-dev__list_memories"
         ));
         assert!(file(&plan, "CLAUDE.md").is_some());
+    }
+
+    fn pair_value<'a>(plan: &'a RunPlan, flag: &str) -> Option<&'a str> {
+        plan.client.args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
+    }
+
+    #[test]
+    fn every_arm_may_edit_its_directory_and_none_may_run_a_shell() {
+        for arm in ARMS {
+            let plan = plan(&task(true), arm, &layout(), &options(None)).unwrap();
+            assert!(has_arg_pair(&plan, "--permission-mode", "acceptEdits"), "{}", arm.as_str());
+            let denied = pair_value(&plan, "--disallowedTools").unwrap();
+            assert!(denied.split(',').any(|t| t == "Bash"), "{}: {denied}", arm.as_str());
+        }
+    }
+
+    #[test]
+    fn the_arms_with_clawg_may_call_its_server_without_a_prompt() {
+        for arm in ARMS {
+            let plan = plan(&task(true), arm, &layout(), &options(None)).unwrap();
+            let allowed = pair_value(&plan, "--allowedTools");
+            if arm.has_clawg() {
+                assert_eq!(allowed, Some("mcp__clawg-dev"), "{}", arm.as_str());
+            } else {
+                assert_eq!(allowed, None, "{}", arm.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn a_denies_only_bash_while_b_also_denies_its_read_tools_in_one_value() {
+        let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        assert!(has_arg_pair(&a3, "--disallowedTools", "Bash"));
+        assert_eq!(a3.client.args.iter().filter(|a| *a == "--disallowedTools").count(), 1);
+        let b = plan(&task(true), Arm::B, &layout(), &options(None)).unwrap();
+        assert_eq!(b.client.args.iter().filter(|a| *a == "--disallowedTools").count(), 1);
+        assert!(has_arg_pair(
+            &b,
+            "--disallowedTools",
+            "Bash,mcp__clawg-dev__search_memory,mcp__clawg-dev__read_memory,mcp__clawg-dev__list_memories"
+        ));
     }
 
     #[test]

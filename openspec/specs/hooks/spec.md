@@ -10,7 +10,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - [language-preference](../../changes/archive/2026-10-23-language-preference/proposal.md), archivado el 2026-10-23 (R7, LP12 de esa spec, y la excepción que suma a R3).
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (AL6, y el idioma que suma a R4 y R5). Las notas que el daemon escribe en el contexto están en [`specs/retrieval`](../retrieval/spec.md), AL5.
 - [client-setup-cursor](../../changes/archive/2026-11-04-client-setup-cursor/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (CU6 a CU8): `clawg hook` toma `--client` para leer la entrada de `sessionStart` de Cursor, la carpeta sale de la única raíz de `workspace_roots`, y un hook de Claude Code que corre Cursor no imprime nada.
-- [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (HR1 a HR5 y HR8): `clawg hook session-start` deja una línea por corrida en `<data>/hook-runs.jsonl`. La espera acotada de esa escritura (HR4) sale en 0.77.0, y la de los archivos que el hook lee, en una versión posterior.
+- [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0 (HR1 a HR5 y HR8): `clawg hook session-start` deja una línea por corrida en `<data>/hook-runs.jsonl`. La espera acotada de esa escritura (HR4) y la de los archivos que el hook lee salen en 0.77.0.
 
 ## Definiciones
 

@@ -2,7 +2,7 @@
 
 Fuente de verdad del comportamiento actual de qué agentes leen las memorias de qué agentes: la política `sharing.json` y cómo se resuelve, cómo la búsqueda y `recall_context` alcanzan filas ajenas, cómo se presenta lo ajeno, qué sigue siendo de cada agente, qué dice `memory_status` y `clawg sharing`. El mismo alcance decide qué puede modificar, listar y leer entero cada agente ([`specs/visibility`](../visibility/spec.md)) y con qué filas se compara un save; el ranking, los hits y el formato de las líneas están en [`specs/retrieval`](../retrieval/spec.md); las herramientas del puente, en [`specs/mcp`](../mcp/spec.md).
 
-**Origen:** [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec. [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19, sumó a R2 el resumen de LAST SESSION y `Reach::admits`. [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20, sumó a R4 que el autor se muestra saneado (`display_author`). [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, quitó `OwnOnly`, llevó el alcance a lo que se modifica y a las reglas que comparan un save (R2, R5), y cambió la nota de R4 y la línea de R6.
+**Origen:** [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec. [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19, sumó a R2 el resumen de LAST SESSION y `Reach::admits`. [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20, sumó a R4 que el autor se muestra saneado (`display_author`). [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, quitó `OwnOnly`, llevó el alcance a lo que se modifica y a las reglas que comparan un save (R2, R5), y cambió la nota de R4 y la línea de R6. [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0, llevó las preferencias del workspace al alcance del lector (R5; el requisito es PM3 de [`specs/retrieval`](../retrieval/spec.md)).
 
 ## Definiciones
 
@@ -136,7 +136,7 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:191`; `sha
 
 ## R5. Lo que sigue siendo de cada agente, y lo que no
 
-- El workspace de L MUST cargar sólo filas de L (`regenerate_auto_section` con el agente del pedido). RECENT del contexto sin consulta, la sesión registrada (`POST /v1/sessions`) y el aviso del hook sobre su último save MUST seguir siendo de L: describen su propia actividad.
+- Las decisiones y los skills del workspace de L MUST ser sólo filas de L (`regenerate_auto_section` con el agente del pedido); sus preferencias siguen el alcance de L, como la búsqueda, porque describen a la persona y no la actividad de L ([`specs/retrieval`](../retrieval/spec.md), PM3). RECENT del contexto sin consulta, la sesión registrada (`POST /v1/sessions`) y el aviso del hook sobre su último save MUST seguir siendo de L: describen su propia actividad.
 - Todo lo demás MUST seguir el alcance de L y no su autoría: leer entero, cambiar, borrar, restaurar y juzgar ([`specs/visibility`](../visibility/spec.md) R3 y R4), `list_memories` (con ` by <autor>` en lo ajeno), ACTIVE CONFLICTS (los pares con un lado entre las filas del prompt cuyos dos lados L alcanza, [`specs/retrieval`](../retrieval/spec.md)), los pares de `memory_status` ([`specs/disputes`](../disputes/spec.md)), `synthesize` ([`specs/synthesis`](../synthesis/spec.md)), y la dedup, el detector y la clave de tema de cada save de L, que se aplican a su proyecto dentro de su alcance ([`specs/ingest`](../ingest/spec.md)).
 - Las descripciones de las herramientas MUST NOT decir que lo compartido es de sólo lectura.
 
@@ -146,11 +146,11 @@ En `search_memory` (`format_hits`, `crates/clawg-cli/src/mcp/tools.rs:191`; `sha
 - THEN la fila queda borrada; con `hide B A`, la respuesta es «no existe» y la fila sigue viva
 
 #### Escenario: el workspace no se mezcla
-- GIVEN una fila de A en tier 1
+- GIVEN una decisión de A de importancia 9 en tier 1, y una preferencia declarada de A de importancia 9 en tier 1
 - WHEN B llama `recall_context`
-- THEN la fila no está en el bloque WORKSPACE de B
+- THEN la decisión no está en el bloque WORKSPACE de B, y la preferencia sí; con `hide B A`, ninguna de las dos
 
-**Tests:** `a_shared_memory_is_changed_by_the_agent_that_found_it` y `tool_descriptions_say_shared_memories_can_be_changed` en `server.rs`; `the_workspace_stays_own_and_conflicts_are_shared` y `a_hidden_side_keeps_its_pair_out` en `prompt_builder.rs`.
+**Tests:** `a_shared_memory_is_changed_by_the_agent_that_found_it` y `tool_descriptions_say_shared_memories_can_be_changed` en `server.rs`; `the_workspace_stays_own_and_conflicts_are_shared` y `a_hidden_side_keeps_its_pair_out` en `prompt_builder.rs`; `the_workspace_takes_the_preferences_the_reader_reaches` en `workspace.rs` y `a_stated_preference_reaches_the_session_start_of_another_agent` en `crates/clawg-cli/tests/api.rs`.
 
 ## R6. `memory_status` dice a quién lee el agente
 

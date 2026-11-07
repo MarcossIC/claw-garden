@@ -79,7 +79,7 @@ impl Client {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: Option<String>,
     pub model: Option<String>,
@@ -98,7 +98,7 @@ pub struct Session {
     pub outcome: Option<Outcome>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResult {
     pub task: String,
     pub category: String,
@@ -207,6 +207,80 @@ pub enum RunError {
     Client { code: Option<i32>, log: PathBuf },
     #[error("the run asks for {program} {expected}, and `{program} --version` reports {}", .found.as_deref().unwrap_or("no version"))]
     ClientVersion { program: String, expected: String, found: Option<String> },
+    #[error("a paid run would be skewed: {}", join_leaks(.0))]
+    PaidRun(Vec<Leak>),
+}
+
+/// What would reach a paid session from outside the run, or keep it from running.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Leak {
+    #[error("ANTHROPIC_API_KEY is missing or empty (in `-p` the key pays for the session, and the run's config directory holds no login)")]
+    NoApiKey,
+    #[error("ANTHROPIC_AUTH_TOKEN is set (it outranks the key)")]
+    AuthToken,
+    #[error("CLAUDE_CODE_EFFORT_LEVEL is set (it overrides --effort)")]
+    EffortLevel,
+    #[error(
+        "--out {} is below {}, which holds {name} (the client reads the instruction files of every ancestor of its working directory and takes the enclosing git repository as its project)",
+        .out.display(), .dir.display()
+    )]
+    Context { out: PathBuf, dir: PathBuf, name: &'static str },
+}
+
+fn join_leaks(leaks: &[Leak]) -> String {
+    leaks.iter().map(|l| format!("\n- {l}")).collect()
+}
+
+/// What the client finds in a directory that changes what a session knows or
+/// where its project and native memory are.
+const CONTEXT_NAMES: [&str; 4] = [".git", "CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"];
+
+/// Every problem of a paid run, from the variables that matter and from
+/// `ancestors`, each directory from `out` up with the [`CONTEXT_NAMES`] it holds.
+fn leaks(
+    api_key: Option<&str>,
+    auth_token: Option<&str>,
+    effort_level: Option<&str>,
+    out: &Path,
+    ancestors: &[(PathBuf, Vec<&'static str>)],
+) -> Vec<Leak> {
+    let set = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
+    let mut found = Vec::new();
+    if !set(api_key) {
+        found.push(Leak::NoApiKey);
+    }
+    if set(auth_token) {
+        found.push(Leak::AuthToken);
+    }
+    if set(effort_level) {
+        found.push(Leak::EffortLevel);
+    }
+    for (dir, names) in ancestors {
+        found.extend(names.iter().map(|name| Leak::Context { out: out.to_owned(), dir: dir.clone(), name }));
+    }
+    found
+}
+
+/// `out` and each of its ancestors, with the [`CONTEXT_NAMES`] each holds; one
+/// that does not exist yet holds none.
+fn probe_ancestors(out: &Path) -> Vec<(PathBuf, Vec<&'static str>)> {
+    out.ancestors()
+        .map(|dir| (dir.to_owned(), CONTEXT_NAMES.into_iter().filter(|name| dir.join(name).exists()).collect()))
+        .collect()
+}
+
+/// Refuses a paid run whose key or `out` directory would skew it, naming each problem.
+pub fn check_paid_run(out: &Path) -> Result<(), RunError> {
+    let out = std::path::absolute(out).map_err(io(out))?;
+    let var = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+    let found = leaks(
+        var("ANTHROPIC_API_KEY").as_deref(),
+        var("ANTHROPIC_AUTH_TOKEN").as_deref(),
+        var("CLAUDE_CODE_EFFORT_LEVEL").as_deref(),
+        &out,
+        &probe_ancestors(&out),
+    );
+    if found.is_empty() { Ok(()) } else { Err(RunError::PaidRun(found)) }
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
@@ -605,6 +679,64 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn clean_ancestors(out: &Path) -> Vec<(PathBuf, Vec<&'static str>)> {
+        out.ancestors().map(|a| (a.to_owned(), Vec::new())).collect()
+    }
+
+    #[test]
+    fn a_paid_run_with_its_key_and_a_clean_directory_has_no_leaks() {
+        let out = Path::new("/runs/1");
+        assert_eq!(leaks(Some("sk-key"), None, None, out, &clean_ancestors(out)), []);
+    }
+
+    #[test]
+    fn a_missing_or_empty_key_a_token_and_an_effort_level_are_each_named() {
+        let out = Path::new("/runs/1");
+        let ancestors = clean_ancestors(out);
+        assert_eq!(leaks(None, None, None, out, &ancestors), [Leak::NoApiKey]);
+        assert_eq!(leaks(Some(""), None, None, out, &ancestors), [Leak::NoApiKey]);
+        assert_eq!(
+            leaks(None, Some("token"), Some("high"), out, &ancestors),
+            [Leak::NoApiKey, Leak::AuthToken, Leak::EffortLevel]
+        );
+        assert_eq!(leaks(Some("k"), Some(""), Some(""), out, &ancestors), [], "an empty variable sets nothing");
+    }
+
+    #[test]
+    fn an_out_below_a_repository_or_an_instruction_file_is_named_with_the_ancestor_that_holds_it() {
+        let out = Path::new("/repo/runs/1");
+        let ancestors = vec![
+            (PathBuf::from("/repo/runs/1"), vec![]),
+            (PathBuf::from("/repo/runs"), vec!["CLAUDE.local.md"]),
+            (PathBuf::from("/repo"), vec![".git", ".claude/CLAUDE.md"]),
+            (PathBuf::from("/"), vec![]),
+        ];
+        let found = leaks(Some("k"), None, None, out, &ancestors);
+        assert_eq!(
+            found,
+            [
+                Leak::Context { out: out.to_owned(), dir: PathBuf::from("/repo/runs"), name: "CLAUDE.local.md" },
+                Leak::Context { out: out.to_owned(), dir: PathBuf::from("/repo"), name: ".git" },
+                Leak::Context { out: out.to_owned(), dir: PathBuf::from("/repo"), name: ".claude/CLAUDE.md" },
+            ]
+        );
+        let said = RunError::PaidRun(found).to_string();
+        assert!(said.contains(".git") && said.contains("CLAUDE.local.md") && said.contains(".claude/CLAUDE.md"), "{said}");
+    }
+
+    #[test]
+    fn the_probe_finds_what_an_ancestor_of_a_missing_out_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude").join("CLAUDE.md"), "x").unwrap();
+        let out = dir.path().join("a").join("run");
+        let ancestors = probe_ancestors(&out);
+        let holder = ancestors.iter().find(|(d, _)| d == dir.path()).unwrap();
+        assert_eq!(holder.1, ["CLAUDE.md", ".claude/CLAUDE.md"]);
+        assert!(ancestors.iter().find(|(d, _)| d == &out).unwrap().1.is_empty());
+    }
 
     fn task() -> Task {
         task::parse(

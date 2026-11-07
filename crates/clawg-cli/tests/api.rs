@@ -659,6 +659,7 @@ async fn a_daemon_client_passes_the_guard() {
             query: "guard daemon client".into(),
             agent_id: "a".into(),
             project_id: None,
+            project_ids: Vec::new(),
             limit: None,
             lang: None,
         })
@@ -1257,6 +1258,45 @@ async fn search_finds_a_saved_memory() {
     assert!(hit["memory_type"].is_string());
     assert!(hit["tier"].is_i64());
     assert!(hit["score"].is_number());
+}
+
+#[tokio::test]
+async fn a_search_takes_a_group_of_projects() {
+    let h = Harness::start().await;
+    for project in ["p", "q", "r"] {
+        save_id(&h, json!({ "content": CONTENT, "agent_id": "a", "project_id": project })).await;
+    }
+
+    let (status, body) =
+        h.post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "a", "project_ids": ["p", "q"], "lang": "en" })).await;
+
+    assert_eq!(status, 200, "{body}");
+    let mut projects: Vec<&str> =
+        body["hits"].as_array().expect("hits array").iter().filter_map(|hit| hit["project_id"].as_str()).collect();
+    projects.sort_unstable();
+    assert_eq!(projects, ["p", "q"], "{body}");
+}
+
+/// A bridge names its group's first project as `project_id` too, which a
+/// daemon that predates groups searches alone; this one reads the group.
+#[tokio::test]
+async fn a_group_wins_over_the_project_of_a_search() {
+    let h = Harness::start().await;
+    for project in ["p", "q", "r"] {
+        save_id(&h, json!({ "content": CONTENT, "agent_id": "a", "project_id": project })).await;
+    }
+
+    let (status, body) =
+        h.post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "a", "project_id": "p", "project_ids": ["p", "q"] })).await;
+    let (empty, empty_body) =
+        h.post_json("/v1/search", json!({ "query": CONTENT, "agent_id": "a", "project_id": "p", "project_ids": [] })).await;
+
+    assert_eq!(status, 200, "{body}");
+    let mut projects: Vec<&str> =
+        body["hits"].as_array().expect("hits array").iter().filter_map(|hit| hit["project_id"].as_str()).collect();
+    projects.sort_unstable();
+    assert_eq!(projects, ["p", "q"], "{body}");
+    assert_eq!(empty, 400, "a group of none reads nothing it could name: {empty_body}");
 }
 
 #[tokio::test]
@@ -5345,7 +5385,7 @@ const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
     ("POST", "/memories", Some("body.project_id")),
     ("GET", "/memories", Some("query.project")),
     ("POST", "/memories/move", Some("body.to_project")),
-    ("POST", "/search", Some("body.project_id")),
+    ("POST", "/search", Some("body.project_id and body.project_ids[]")),
     ("POST", "/context", Some("body.project_id")),
     ("POST", "/sessions", Some("body.project_id")),
     ("GET", "/memories/{kind}/{id}", None),
@@ -5471,6 +5511,10 @@ async fn every_route_that_takes_a_project_follows_a_merge() {
                 let (status, body) = h.post_json("/v1/search", ask).await;
                 assert_eq!(status, 200, "{route}: {body}");
                 assert!(ids_in(&body["hits"]).contains(&on_web), "{route}: {body}");
+                let group = json!({ "agent_id": "agent-http", "query": "web server port 8080", "project_ids": [app, other] });
+                let (status, body) = h.post_json("/v1/search", group).await;
+                assert_eq!(status, 200, "{route}: {body}");
+                assert!(ids_in(&body["hits"]).contains(&on_web), "{route}, in a group: {body}");
             }
             ("POST", "/context") => {
                 // Without a query it lists the caller's recent saves of the

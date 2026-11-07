@@ -1,0 +1,17 @@
+{
+  "id": "memorycode-d12-varsuffix-n",
+  "category": "K1",
+  "fixture": "letta-simple-edit",
+  "prompt": "Create palindrome.py with a function that checks if a string is a valid palindrome.",
+  "memories": [
+    {
+      "content": "Variable naming preference: end variable names with '_n'\nWhen naming variables, I'd like you to end the name with '_n'. This is just a preference of mine, but it helps me quickly identify variables in code reviews.",
+      "memory_type": "user_preference",
+      "age_days": 30
+    }
+  ],
+  "tracers": ["'_n'", "code reviews"],
+  "checks": [
+    {"kind": "file_contains", "path": "palindrome.py", "text": "_n ="}
+  ]
+}

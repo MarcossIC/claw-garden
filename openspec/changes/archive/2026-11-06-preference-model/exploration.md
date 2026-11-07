@@ -13,7 +13,7 @@
 **Cuánto crece.** En prod hay 56.279 filas y 442 MB. 54.436 vienen de una importación de unas 3.800 notas, unas 14 filas por nota, porque cada nota larga se parte. Las propias son 1.843 en 22 días, casi todas de un solo proyecto, unas 84 por día. Con todos los proyectos activos, 100.000 filas o más en un año es un orden razonable, sin medir.
 
 **Lo que dicen las mediciones:**
-- El tamaño no cambia la pérdida de la búsqueda. 50.000 filas no pierden más que 10.000: decide la fracción de filas ajenas ([verify de knn-prefilter](../knn-prefilter/verify.md)).
+- El tamaño no cambia la pérdida de la búsqueda. 50.000 filas no pierden más que 10.000: decide la fracción de filas ajenas ([verify de knn-prefilter](../../knn-prefilter/verify.md)).
 - El costo sí crece: `knn_memory` da 175 ms de p50 en prod. Si eso molesta, lo decide knn-prefilter, no la forma de las tablas.
 
 **Conclusión:** la tabla aguanta para esta etapa. Lo que sí falta es una política de olvido, que no bloquea la migración y queda como pregunta para después del corte.
@@ -22,7 +22,7 @@
 
 El tipo ya existe: `user_preference`, con 141 filas. No es un problema de volumen.
 
-**Por qué no tablas por tipo.** Ya se probó: `episodic_trajectory` y `procedural_skill` son tablas por tipo, y [retire-legacy-kinds](../retire-legacy-kinds/exploration.md) las saca. Vacías, le cuestan a cada búsqueda dos KNN y dos consultas, y cada función que recorre filas tiene que acordarse de ellas.
+**Por qué no tablas por tipo.** Ya se probó: `episodic_trajectory` y `procedural_skill` son tablas por tipo, y [retire-legacy-kinds](../../retire-legacy-kinds/exploration.md) las saca. Vacías, le cuestan a cada búsqueda dos KNN y dos consultas, y cada función que recorre filas tiene que acordarse de ellas.
 
 **Lo que costaría una tabla nueva:** volver a escribir deduplicación, detector, enmascarado, exportación, importación con su deshacer, unión y borrado de proyectos.
 

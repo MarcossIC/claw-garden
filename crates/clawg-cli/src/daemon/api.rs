@@ -43,7 +43,7 @@ use clawg_core::memory::worker::{
 };
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::clock::TimestampMs;
-use clawg_core::memory::language::count_saves_in;
+use clawg_core::memory::language::{count_saves_in, count_saves_in_projects};
 use clawg_core::memory::portability::timing::{Step, Timing};
 use clawg_core::memory::portability::{
     self, ImportControl, ImportError, ImportInput, ImportOptions, ImportReport, ImportTimings, Imported, MapProject, MapTarget, UndoError,
@@ -424,6 +424,11 @@ pub struct SearchRequest {
     pub agent_id: String,
     #[serde(default)]
     pub project_id: Option<String>,
+    /// A group of projects to search at once, each read as `project_id` reads
+    /// one. It wins over `project_id`, where a bridge names the group's first
+    /// project for a daemon that predates groups.
+    #[serde(default)]
+    pub project_ids: Option<Vec<String>>,
     #[serde(default)]
     pub limit: Option<usize>,
     /// Share of the best hit's score the others need to be returned. Absent,
@@ -760,12 +765,16 @@ fn check_lang(lang: Option<&str>) -> Result<Option<Lang>, ApiError> {
         .transpose()
 }
 
-/// The other language's count for a search in `lang`, with the scope and the
-/// reach the search used. A count that fails is logged and left out: the
+/// The other language's count for a search in `lang`, with the projects and
+/// the reach the search used. A count that fails is logged and left out: the
 /// search already answered.
-async fn other_language(app: &AppCtx, lang: Lang, project_id: Option<&str>, reader: &Reader) -> Option<OtherLanguage> {
+async fn other_language(app: &AppCtx, lang: Lang, projects: Option<&[String]>, reader: &Reader) -> Option<OtherLanguage> {
     let other = lang.other();
-    match count_saves_in(&app.runtime.store, other, project_id, reader).await {
+    let counted = match projects {
+        Some(projects) => count_saves_in_projects(&app.runtime.store, other, projects, reader).await,
+        None => count_saves_in(&app.runtime.store, other, None, reader).await,
+    };
+    match counted {
         Ok(memories) => Some(OtherLanguage { lang: other, memories }),
         Err(e) => {
             log::warn!("could not count the memories in {}: {e}", other.name());
@@ -1493,10 +1502,12 @@ async fn search(
         .map_err(embed_failure)?;
 
     let caller = reader(&app, &body.agent_id);
-    let project_id = live_project(&app, body.project_id.clone()).await?;
-    let scope = SearchScope::all_default()
-        .with_project(project_id.as_deref())
-        .with_reach(caller.reach.clone());
+    let projects = searched_projects(&app, body.project_id.clone(), body.project_ids.clone()).await?;
+    let scope = SearchScope::all_default().with_reach(caller.reach.clone());
+    let scope = match &projects {
+        Some(projects) => scope.with_projects(projects.clone()),
+        None => scope,
+    };
     let mut hits = search_all_memories(
         &app.runtime.store,
         &embedding,
@@ -1523,10 +1534,34 @@ async fn search(
     app.runtime.metrics.gauge("search.hits", &[], hits.len() as f64);
     app.runtime.metrics.gauge("search.withheld", &[], withheld as f64);
     let other_language = match lang {
-        Some(lang) => other_language(&app, lang, project_id.as_deref(), &caller).await,
+        Some(lang) => other_language(&app, lang, projects.as_deref(), &caller).await,
         None => None,
     };
     Ok(Json(SearchBody { hits, withheld, other_language }))
+}
+
+/// The live projects a search reads: each of `project_ids` once, whatever
+/// `project_id` says, or else the one of `project_id`, or `None` for every
+/// project.
+async fn searched_projects(
+    app: &AppCtx,
+    project_id: Option<String>,
+    project_ids: Option<Vec<String>>,
+) -> ApiResult<Option<Vec<String>>> {
+    match project_ids {
+        Some(ids) if ids.is_empty() => Err(ApiError::bad_request("project_ids names no project")),
+        Some(ids) => {
+            let mut live: Vec<String> = Vec::with_capacity(ids.len());
+            for id in ids {
+                let id = canonical(&app.runtime.store, &id).await.map_err(ApiError::internal)?;
+                if !live.contains(&id) {
+                    live.push(id);
+                }
+            }
+            Ok(Some(live))
+        }
+        None => Ok(live_project(app, project_id).await?.map(|id| vec![id])),
+    }
 }
 
 /// The live project a request's `project` leads to: an open bridge keeps the
@@ -1633,7 +1668,10 @@ async fn context(
         });
 
     let other_language = match (lang, query) {
-        (Some(lang), Some(_)) => other_language(&app, lang, project_id, &caller).await,
+        (Some(lang), Some(_)) => {
+            let projects = project_id.map(|p| vec![p.to_owned()]);
+            other_language(&app, lang, projects.as_deref(), &caller).await
+        }
         _ => None,
     };
 
@@ -3136,10 +3174,10 @@ fn not_accepted(root: &std::path::Path, profile: Profile) -> String {
         other => format!(" --profile {}", other.as_str()),
     };
     format!(
-        "clawg reads the files of the projects the user added, and of the one a bridge was \
-         started in when that folder has a .git or a manifest and is not the home directory or a \
-         filesystem root; {root} is neither. Ask the user to run `clawg projects add \"{root}\"{flag}` \
-         if they want it searched, then call again",
+        "clawg reads the files of the projects the user added, and of a folder the MCP client has \
+         open or a bridge was started in when that folder has a .git or a manifest and is not the \
+         home directory or a filesystem root; {root} is neither. Ask the user to run `clawg projects \
+         add \"{root}\"{flag}` if they want it searched, then call again",
         root = root.display()
     )
 }
@@ -3267,6 +3305,14 @@ mod tests {
         let root = std::path::Path::new("/work/other");
         assert!(not_accepted(root, Profile::Prod).contains("`clawg projects add \"/work/other\"`"));
         assert!(not_accepted(root, Profile::Dev).contains("`clawg projects add \"/work/other\" --profile dev`"));
+    }
+
+    /// A folder the MCP client has open is read as the bridge's own
+    /// directory is, so the refusal names both.
+    #[test]
+    fn the_refusal_names_what_is_read_without_the_user_adding_it() {
+        let refusal = not_accepted(std::path::Path::new("/work/other"), Profile::Prod);
+        assert!(refusal.contains("a folder the MCP client has open or a bridge was started in"), "{refusal}");
     }
 
     #[test]

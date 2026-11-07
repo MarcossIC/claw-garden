@@ -670,6 +670,11 @@ pub struct SearchArgs {
     pub query: String,
     pub agent_id: String,
     pub project_id: Option<String>,
+    /// A group of projects to search at once, which wins over `project_id`.
+    /// Left out when empty. With a group the request also names its first
+    /// project as `project_id` ([`search_request`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub project_ids: Vec<String>,
     pub limit: Option<usize>,
     /// The language the query is in; the answer then counts the memories in
     /// the other one. Left out without it, as a daemon that predates it
@@ -685,14 +690,18 @@ pub struct SearchArgs {
 /// hits this client goes on to show; asking for the full list would count
 /// rows no agent ever read.
 #[derive(Serialize)]
-struct SearchRequest<'a> {
+struct SearchRequest {
     #[serde(flatten)]
-    args: &'a SearchArgs,
+    args: SearchArgs,
     min_relative_score: f64,
 }
 
-fn search_request(args: &SearchArgs) -> SearchRequest<'_> {
-    SearchRequest { args, min_relative_score: RELEVANCE_RATIO }
+/// A group names its first project as `project_id` too: a daemon that
+/// predates groups ignores `project_ids` and searches that project alone, a
+/// narrower search than the group and never one of every project.
+fn search_request(args: &SearchArgs) -> SearchRequest {
+    let project_id = args.project_ids.first().cloned().or_else(|| args.project_id.clone());
+    SearchRequest { args: SearchArgs { project_id, ..args.clone() }, min_relative_score: RELEVANCE_RATIO }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1898,11 +1907,44 @@ pub(crate) mod tests {
 
     #[test]
     fn a_search_names_its_language_only_when_it_has_one() {
-        let args = |lang| SearchArgs { query: "q".into(), agent_id: "a".into(), project_id: None, limit: None, lang };
+        let args = |lang| SearchArgs { query: "q".into(), agent_id: "a".into(), project_id: None, project_ids: Vec::new(), limit: None, lang };
         let without = serde_json::to_value(search_request(&args(None))).unwrap();
         assert!(without.get("lang").is_none(), "{without}");
         let with = serde_json::to_value(search_request(&args(Some(Lang::Es)))).unwrap();
         assert_eq!(with["lang"], "es", "{with}");
+    }
+
+    #[test]
+    fn a_search_sends_a_group_only_when_it_has_one() {
+        let args = |project_ids: Vec<String>| SearchArgs {
+            query: "q".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            project_ids,
+            limit: None,
+            lang: None,
+        };
+        let one = serde_json::to_value(search_request(&args(Vec::new()))).unwrap();
+        assert!(one.get("project_ids").is_none(), "a daemon that predates groups reads what it always did: {one}");
+        let group = serde_json::to_value(search_request(&args(vec!["p".into(), "q".into()]))).unwrap();
+        assert_eq!(group["project_ids"], serde_json::json!(["p", "q"]), "{group}");
+    }
+
+    #[test]
+    fn a_group_search_names_its_first_project_for_an_older_daemon() {
+        let args = SearchArgs {
+            query: "q".into(),
+            agent_id: "a".into(),
+            project_id: None,
+            project_ids: vec!["p".into(), "q".into()],
+            limit: None,
+            lang: None,
+        };
+
+        let body = serde_json::to_value(search_request(&args)).unwrap();
+
+        assert_eq!(body["project_ids"], serde_json::json!(["p", "q"]), "{body}");
+        assert_eq!(body["project_id"], "p", "an older daemon searches the first project alone, never every one: {body}");
     }
 
     #[test]
@@ -2357,6 +2399,7 @@ pub(crate) mod tests {
             query: "a body travels over the socket as JSON".into(),
             agent_id: "agent-socket".into(),
             project_id: None,
+            project_ids: Vec::new(),
             limit: Some(5),
             lang: None,
         })
@@ -2494,6 +2537,7 @@ pub(crate) mod tests {
                 query: content.into(),
                 agent_id: "agent-client".into(),
                 project_id: None,
+                project_ids: Vec::new(),
                 limit: Some(5),
                 lang: None,
             })
@@ -2519,6 +2563,7 @@ pub(crate) mod tests {
             query: "q".into(),
             agent_id: "a".into(),
             project_id: None,
+            project_ids: Vec::new(),
             limit: Some(5),
             lang: None,
         };

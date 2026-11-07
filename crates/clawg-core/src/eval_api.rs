@@ -118,7 +118,7 @@ impl EvalScope {
             memory: self.memory,
             episodic: self.episodic,
             procedural: self.procedural,
-            project_id: None,
+            projects: None,
             lexical: self.lexical,
             reach: crate::memory::sharing::Reach::Own,
         }

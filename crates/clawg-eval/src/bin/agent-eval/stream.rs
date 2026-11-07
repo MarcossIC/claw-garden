@@ -6,7 +6,7 @@
 //! reader is lenient: a line of a kind it does not know is counted, not an
 //! error, and a line that is not JSON is reported by its number.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -23,7 +23,7 @@ pub struct ToolCall {
     pub after_tool_search: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -31,7 +31,7 @@ pub struct Usage {
     pub cache_read_input_tokens: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
     pub subtype: String,
     pub is_error: bool,

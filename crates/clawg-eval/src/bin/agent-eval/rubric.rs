@@ -5,7 +5,7 @@
 
 use clawg_core::memory::language;
 use clawg_core::preferences::Lang;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::stream::{is_tool, ToolCall, Transcript};
@@ -21,7 +21,7 @@ const SUMMARY_SECTIONS_EN: [&str; 6] = ["Goal", "Instructions", "Discoveries", "
 const SUMMARY_SECTIONS_ES: [&str; 6] =
     ["Objetivo", "Instrucciones", "Descubrimientos", "Logrado", "Próximos pasos", "Archivos relevantes"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mark {
     Pass,
@@ -46,10 +46,10 @@ pub const CRITERIA: [&str; 12] = [
     "summary_sections",
 ];
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SaveMarks {
     pub content: String,
-    pub marks: Vec<(&'static str, Mark)>,
+    pub marks: Vec<(String, Mark)>,
 }
 
 impl SaveMarks {
@@ -122,7 +122,7 @@ pub fn judge(call: &ToolCall, lang: Option<Lang>) -> SaveMarks {
         ),
     ];
     debug_assert!(marks.iter().map(|(c, _)| *c).eq(CRITERIA));
-    SaveMarks { content: content.to_owned(), marks }
+    SaveMarks { content: content.to_owned(), marks: marks.into_iter().map(|(c, m)| (c.to_owned(), m)).collect() }
 }
 
 /// A word that names something in code: a path, a qualified name, a snake or

@@ -1,0 +1,9 @@
+{
+  "id": "letta-simple-edit-task1",
+  "category": "N",
+  "fixture": "letta-simple-edit",
+  "prompt": "Find and fix the bug in task_1.py.",
+  "checks": [
+    {"kind": "file_contains", "path": "task_1.py", "text": "def calculate_sum(numbers):"}
+  ]
+}
