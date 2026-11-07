@@ -9,6 +9,8 @@ En Linux x86_64, build debug, toolchain 1.99.1, sobre `2f63dd6`, el último comm
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` fallaron por la aserción con las descripciones nuevas y pasan después de `CLAWG_BLESS=1`; el diff de los dos contratos va en el pull request.
 - En Windows, el CI del pull request ([#133](https://github.com/MarcossIC/claw-garden/pull/133), `windows-latest`). Sobre `09aee6a` fallaron 18 tests de `crates/clawg-cli/src/mcp/server.rs`, todos por cómo los tests armaban un proyecto, no por el puente: `test_project()` armaba a mano la raíz `/proj-test`, que en Windows es una ruta de la unidad actual (`D:\proj-test`, otro id) y que ahora se resuelve porque los saves nombran su carpeta; `repo_with_src` derivaba el id viejo de la forma `\\?\` que da `canonicalize`, y el test del directorio personal comparaba con esa misma forma. `7671fce` arma los tres como el puente resuelve un `project_path`; sobre `7671fce`, Windows pasa los dos clippy y `cargo test --locked --workspace`, y Linux también (`ubuntu-latest`). En Linux, después de ese commit, pasan los tests de `mcp::` y `cargo clippy -p clawg-cli --all-targets -- -D warnings`. Lo `cfg(windows)` que toca este cambio es el de una raíz: `uri_path` saca la barra de antes de la unidad sólo en Windows (`crates/clawg-cli/src/mcp/roots.rs:63`), y `a_root_as_a_path_and_as_a_uri_is_one_project` escribe ahí la ruta con la unidad en minúscula, como la manda Cursor, y la URI con barras; pasó en las dos corridas.
 
+Con lo traído de la otra aplicación ([«Lo que trajo la otra aplicación»](#lo-que-trajo-la-otra-aplicación)), en Linux x86_64, build debug, toolchain 1.99.1, sobre `d7f9a74`, el último commit que toca código o docs (el que sigue sólo toca `openspec/`): `cargo test --workspace --locked` pasa entero, con los mismos ignorados, y `cargo clippy --workspace --all-targets -- -D warnings` y `cargo clippy -p clawg-cli -- -D warnings` salen con 0, sin ningún warning. Windows queda para el CI de [#134](https://github.com/MarcossIC/claw-garden/pull/134).
+
 ## Los tests en rojo
 
 Escritos antes del código de cada commit.
@@ -42,14 +44,14 @@ El cliente de prueba es el `Session` de los tests de `server.rs`, que habla JSON
 | Requisito | Dónde |
 |---|---|
 | BI1 | `roots::asked` y `ROOTS_TIMEOUT` (`crates/clawg-cli/src/mcp/roots.rs:20`, `:25`), `uris` con el `#[expect(deprecated)]` (`roots.rs:44`); `ClawgMcp::asking` (`crates/clawg-cli/src/mcp/server.rs:613`), que usan las ocho herramientas en sus métodos `#[tool]` |
-| BI2 | `folder_of` y `uri_path` (`roots.rs:51`, `:63`) |
-| BI3 | `open_folders` (`roots.rs:102`), `ClawgMcp::open_folders` y `canonical_home` (`server.rs:618`, `:531`) |
+| BI2 | `folder_of`, `is_absolute` y `uri_path` (`roots.rs:52`, `:64`, `:77`) |
+| BI3 | `open_folders` (`roots.rs:120`), `ClawgMcp::open_folders` y `canonical_home` (`server.rs:618`, `:531`) |
 | BI4 | `SaveMemoryArgs::names_its_project` (`server.rs:208`) en `save_memory_impl` (`server.rs:1139`), `no_project_named` (`crates/clawg-cli/src/mcp/tools.rs:1084`) |
-| BI5 | `search_memory_impl` (`server.rs:1217`), `ids_of` (`server.rs:1047`), `save_projects` (`server.rs:1088`); `format_hits`, `revised_from` y `display_project` (`tools.rs:231`, `:179`, `:207`); `SearchArgs.project_ids` (`crates/clawg-cli/src/client.rs:676`) |
-| BI6 | `memory_project_predicate!`, `table_project_predicate!`, `projects_bind` y `SearchScope::with_projects` (`crates/clawg-core/src/memory/search.rs:119`, `:131`, `:143`, `:60`); `count_saves_in_projects` (`crates/clawg-core/src/memory/language.rs:46`); `SearchRequest.project_ids` y `searched_projects` (`crates/clawg-cli/src/daemon/api.rs:430`, `:1544`) |
+| BI5 | `search_memory_impl` (`server.rs:1217`), `ids_of` (`server.rs:1047`), `save_projects` (`server.rs:1088`); `format_hits`, `revised_from` y `display_project` (`tools.rs:231`, `:179`, `:207`); `SearchArgs.project_ids` y `search_request` (`crates/clawg-cli/src/client.rs:677`, `:702`) |
+| BI6 | `memory_project_predicate!`, `table_project_predicate!`, `projects_bind` y `SearchScope::with_projects` (`crates/clawg-core/src/memory/search.rs:119`, `:131`, `:143`, `:60`); `count_saves_in_projects` (`crates/clawg-core/src/memory/language.rs:46`); `SearchRequest.project_ids` y `searched_projects` (`crates/clawg-cli/src/daemon/api.rs:431`, `:1546`) |
 | BI7 | `several_open` y `unnamed_with_several` (`server.rs:655`, `:670`), `several_folders` (`tools.rs:1106`), en `recall_context_impl`, `synthesize_impl`, `search_project_impl` y `answer_suggestion_impl` |
 | BI8 | `memory_status_impl` con `one_folder` (`server.rs:1662`, `:624`), `read_memory_impl` con `known_ids` (`server.rs:1383`, `:645`) |
-| BI9 | `indexable_folders` (`server.rs:631`) e `indexes_docs` (`tools.rs:1073`), en `ids_of` |
+| BI9 | `indexable_folders` (`server.rs:631`) e `indexes_docs` (`tools.rs:1073`), en `ids_of`; `not_accepted` (`crates/clawg-cli/src/daemon/api.rs:3171`) |
 | BI10 | Los comentarios `///` de los `*Args` y los atributos `#[tool]` de `save_memory` y `search_memory` (`server.rs`), `crates/clawg-cli/src/mcp/tools_es.rs`, la apertura y la sección de proyectos de `protocol.md` y `protocol.es.md`, y los dos contratos |
 
 ## Frente a lo previsto
@@ -66,6 +68,33 @@ El cliente de prueba es el `Session` de los tests de `server.rs`, que habla JSON
 | Las firmas de `clawg-eval` y `contradiction.rs` | Fuera del alcance | `rag-eval` y `revision-eval` pasan a `format_search` una lista (`&[]`, o la del proyecto que pasaban), y arman `SearchArgs` con `project_ids` vacío; `contradiction.rs` arma su `SearchScope` con `projects` | Son los llamadores de lo que cambió de firma; lo que hacen no cambia |
 | Los tests en Windows | No estaba | `7671fce`: `test_project()`, `repo_with_src` y el test del directorio personal arman sus carpetas como el puente resuelve un `project_path` | Con todo save nombrando su carpeta, la ruta de un proyecto de prueba se resuelve; armada a mano (`/proj-test`, o la forma `\\?\` de `canonicalize`) daba otro id en Windows |
 | `resolve_project` | No se nombraba | Sigue, con la única carpeta abierta como proyecto por defecto | Su orden (`all_projects`, después la ruta, después el proyecto por defecto) es el mismo, y sus tests no cambian |
+
+## Lo que trajo la otra aplicación
+
+El mismo cambio se aplicó también en otra rama ([#134](https://github.com/MarcossIC/claw-garden/pull/134)), con otro diseño en dos lugares. Se compararon por partes y queda esta:
+
+| Parte | Esta | La otra | Por qué queda esta |
+|---|---|---|---|
+| La búsqueda de un grupo | Una búsqueda sobre la unión de los proyectos: el predicado ata una lista JSON | Una búsqueda por proyecto, juntadas por puntaje (`search_projects`) | Un ranking con un solo `now` y los cupos de candidatos compartidos; una pasada en lugar de una por proyecto, y las métricas de latencia una vez por pedido; el grupo cuenta el otro idioma, que la otra deja afuera |
+| El puente | `open_folders` puro, con el resolvedor y el directorio personal como argumentos; las herramientas de un proyecto se niegan antes de llamar al daemon | Las carpetas se resuelven con I/O, y las de un grupo se registran antes de negarse | Lo que pide `.claude/CLAUDE.md` de separar la decisión del I/O, y una negativa sin efectos |
+| Los tests del puente | Un cliente por `duplex` que cuenta los `roots/list` y prueba un error de `roots/list`, `memory_status` y `read_memory` con varias carpetas | Un cliente por `duplex` que maneja el `run_with` entero | Cubren lo mismo de BI1 a BI5, y esta además los caminos de error |
+
+De la otra se trajo lo que esta no tenía, en un commit cada punto:
+
+| Commit | Antes | Después |
+|---|---|---|
+| `fix(mcp): show the key of a row without a project only as all_projects` | `a_hit_without_a_project_shows_how_a_save_revises_it` y `format_save_shows_the_key_only_where_a_save_revises_it` fallaban por la aserción: sin carpetas abiertas, una fila sin proyecto mostraba ` topic=K`, y un save sin proyecto se rechaza y uno con `project_path` deja otra versión al lado | pasan |
+| `fix(search): let an older daemon read a group as its first project` | `a_group_search_names_its_first_project_for_an_older_daemon` y `a_group_wins_over_the_project_of_a_search` fallaban por la aserción: el pedido no llevaba `project_id`, así que un daemon anterior buscaba en todos, y el daemon respondía 400 a los dos juntos | pasan; `every_route_that_takes_a_project_follows_a_merge`, que pasa también con `project_ids`, cubre el grupo |
+| `fix(mcp): read a Windows share as a root, and home inside a checkout as home` | No compilaba: `folder_of` no tomaba el sistema | pasan |
+| `fix(daemon): say that a folder the client has open is read without adding it` | `the_refusal_names_what_is_read_without_the_user_adding_it` fallaba por la aserción: el 403 decía que sólo se lee el directorio en el que arrancó un puente | pasa |
+| `docs(mcp): name all_projects in the opening, and the key of a group's hit` | `the_protocol_says_where_a_call_without_a_project_goes` fallaba por la aserción: la sección de proyectos escribía project= sin comillas y no nombraba `answer_suggestion`, y la apertura no nombraba `all_projects`; los dos contratos fallaron por la aserción con la apertura nueva | pasan, bendecidos; los contratos cambian sólo en esa oración |
+
+Lo que no se trajo:
+
+- `search_projects`, por lo de la tabla de arriba.
+- `ROOTS_WAIT` de 3 s: ninguno de los dos plazos se midió, y 2 s ya está en la spec y en la documentación.
+- Contar «varias carpetas» por proyecto registrado en lugar de por raíz: dos clones de un mismo remoto cuentan como dos carpetas para `recall_context`, pero contarlos como uno pide registrarlos antes de negarse, que es lo que esta evita.
+- El cliente de prueba que maneja `run_with`, con un `Start` inyectado: pide hacer públicos `Start`, `Folder` y `with_roots` sólo para los tests, y los escenarios que prueba ya los prueban los tests de `server.rs`.
 
 ## Pendiente en local
 

@@ -173,21 +173,21 @@ pub fn name_in_spanish(lang: Lang) -> &'static str {
 
 /// Whether a save in one of `save_projects` revises a row of `row_project`
 /// under its key: a key revises only the rows of the project the save goes
-/// to, so a row without one only from a save without one (no project). A row
-/// whose project the daemon did not send keeps its key, as before the daemon
-/// sent it.
+/// to, and a save names its project, so no save revises a row without one but
+/// a save with `all_projects`, which [`shown_key`] names. A row whose project
+/// the daemon did not send keeps its key, as before the daemon sent it.
 fn revised_from(row_project: &Option<Option<String>>, save_projects: &[String]) -> bool {
     match row_project {
         None => true,
-        Some(None) => save_projects.is_empty(),
+        Some(None) => false,
         Some(Some(project)) => save_projects.contains(project),
     }
 }
 
 /// A row's key as a search hit or `read_memory` shows it: only where a save can
 /// revise the row under it, since a key of another project would promise a
-/// revision the reader cannot make. From a bridge with a project, a preference
-/// without one is revised only by a save with `all_projects`, and says so.
+/// revision the reader cannot make. A preference without a project is revised
+/// only by a save with `all_projects`, and says so.
 fn shown_key(key: Option<&str>, memory_type: Option<&str>, row_project: &Option<Option<String>>, save_projects: &[String]) -> String {
     let Some(key) = key else {
         return String::new();
@@ -1505,20 +1505,20 @@ mod tests {
         assert!(format_hits(Lang::En, &[elsewhere], "a", &["other".into()]).contains(" score=0.56 topic=style/indent]"));
     }
 
-    /// A bridge with a project revises a preference of every project only by
-    /// saving with `all_projects`, so the hit says so. Another row without a
-    /// project keeps its key to a bridge without one.
+    /// Every save names its project, so only one with `all_projects` revises a
+    /// row without a project, from any bridge: a preference without one says
+    /// so, and another row without one shows no key, with folders open or
+    /// none.
     #[test]
     fn a_hit_without_a_project_shows_how_a_save_revises_it() {
         let unplaced = placed(preference(68), None);
-        assert!(
-            format_hits(Lang::En, std::slice::from_ref(&unplaced), "a", &["here".into()]).contains(" score=0.56 topic=style/indent all_projects]")
-        );
-        assert!(format_hits(Lang::En, &[unplaced], "a", &[]).contains(" score=0.56 topic=style/indent]"));
-
         let fact = placed(keyed(hit(68, "Memory", "semantic_fact", 2, 0.56, "tabs"), "style/indent"), None);
-        assert!(!format_hits(Lang::En, std::slice::from_ref(&fact), "a", &["here".into()]).contains("topic="));
-        assert!(format_hits(Lang::En, &[fact], "a", &[]).contains(" score=0.56 topic=style/indent]"));
+        for open in [vec!["here".to_string()], Vec::new()] {
+            let out = format_hits(Lang::En, std::slice::from_ref(&unplaced), "a", &open);
+            assert!(out.contains(" score=0.56 topic=style/indent all_projects]"), "{open:?}: {out}");
+            let out = format_hits(Lang::En, std::slice::from_ref(&fact), "a", &open);
+            assert!(!out.contains("topic="), "only a save with all_projects revises it: {open:?}: {out}");
+        }
     }
 
     /// With several folders open a search reads several projects, and each
@@ -1783,7 +1783,7 @@ mod tests {
         assert_eq!(format_save(Lang::En, &save, &["other".into()]), "#68 topic=style/indent\ntabs");
         let every_project = SavedText { project_id: Some(None), ..save.clone() };
         assert_eq!(format_save(Lang::En, &every_project, &["here".into()]), "#68 topic=style/indent all_projects\ntabs");
-        assert_eq!(format_save(Lang::En, &every_project, &[]), "#68 topic=style/indent\ntabs");
+        assert_eq!(format_save(Lang::En, &every_project, &[]), "#68 topic=style/indent all_projects\ntabs");
         let a_fact = SavedText { memory_type: Some("semantic_fact".into()), ..every_project.clone() };
         assert_eq!(format_save(Lang::En, &a_fact, &["here".into()]), "#68\ntabs");
         let no_type_sent = SavedText { memory_type: None, ..every_project };
