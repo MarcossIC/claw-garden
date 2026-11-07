@@ -425,7 +425,8 @@ pub struct SearchRequest {
     #[serde(default)]
     pub project_id: Option<String>,
     /// A group of projects to search at once, each read as `project_id` reads
-    /// one. Not with `project_id`.
+    /// one. It wins over `project_id`, where a bridge names the group's first
+    /// project for a daemon that predates groups.
     #[serde(default)]
     pub project_ids: Option<Vec<String>>,
     #[serde(default)]
@@ -1539,17 +1540,17 @@ async fn search(
     Ok(Json(SearchBody { hits, withheld, other_language }))
 }
 
-/// The live projects a search reads: the one of `project_id`, or each of
-/// `project_ids` once, or `None` for every project.
+/// The live projects a search reads: each of `project_ids` once, whatever
+/// `project_id` says, or else the one of `project_id`, or `None` for every
+/// project.
 async fn searched_projects(
     app: &AppCtx,
     project_id: Option<String>,
     project_ids: Option<Vec<String>>,
 ) -> ApiResult<Option<Vec<String>>> {
-    match (project_id, project_ids) {
-        (Some(_), Some(_)) => Err(ApiError::bad_request("pass project_id or project_ids, not both")),
-        (None, Some(ids)) if ids.is_empty() => Err(ApiError::bad_request("project_ids names no project")),
-        (None, Some(ids)) => {
+    match project_ids {
+        Some(ids) if ids.is_empty() => Err(ApiError::bad_request("project_ids names no project")),
+        Some(ids) => {
             let mut live: Vec<String> = Vec::with_capacity(ids.len());
             for id in ids {
                 let id = canonical(&app.runtime.store, &id).await.map_err(ApiError::internal)?;
@@ -1559,7 +1560,7 @@ async fn searched_projects(
             }
             Ok(Some(live))
         }
-        (project_id, None) => Ok(live_project(app, project_id).await?.map(|id| vec![id])),
+        None => Ok(live_project(app, project_id).await?.map(|id| vec![id])),
     }
 }
 
