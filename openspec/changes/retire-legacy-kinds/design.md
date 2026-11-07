@@ -73,10 +73,11 @@ Sin las dos tablas a los dos enums les queda una variante. Unificarlos es sacarl
 
 ## D6. Lo que ve un bridge de la versión anterior
 
-Después de actualizar, el editor puede seguir teniendo abierto un bridge de la versión anterior contra el daemon nuevo. Sus structs exigen `kind` en un hit, una fila, un `PATCH` y un `/save` (`crates/clawg-cli/src/client.rs:209`, `:265`, `:528`, `:599`) y los dos conteos de `GET /v1/stats` (`client.rs:452-457`). El daemon los sigue mandando:
+Después de actualizar, el editor puede seguir teniendo abierto un bridge de la versión anterior contra el daemon nuevo. Sus structs exigen `kind` en un hit, una fila (también las de `POST /v1/synthesis`), un `PATCH` y un `/save` (`crates/clawg-cli/src/client.rs:209`, `:265`, `:404-411`, `:528`, `:599`), los dos conteos de `GET /v1/stats` (`client.rs:452-457`) y `trajectories` y `skills` en el `MergeReport` (`crates/clawg-core/src/memory/merge.rs:178-179`), que el bridge lee en la respuesta de `answer_suggestion` (`crates/clawg-cli/src/mcp/server.rs:1651`), la única ruta con una unión que llama; las líneas son las de la versión anterior. El daemon los sigue mandando:
 
-- `kind`, con un envoltorio de `api.rs` que lo agrega a la fila que sale del núcleo (`#[serde(flatten)]`), `Memory` en un hit y `memory` en el resto, como ya lo escribe en `SavedMemory`, `ReplacedMemory` y `RelatedMemory` (`crates/clawg-cli/src/daemon/api.rs:708-724`, `:876`, `:909-914`). El núcleo no lleva un campo constante: lo que pide el protocolo vive en el daemon.
+- `kind`, con un envoltorio de `api.rs` que lo agrega a la fila que sale del núcleo (`#[serde(flatten)]`), `Memory` en un hit y `memory` en el resto, como ya lo escribe en `SavedMemory`, `ReplacedMemory` y `RelatedMemory` (`crates/clawg-cli/src/daemon/api.rs:708-724`, `:876`, `:909-914`). La respuesta de `synthesis` pasa por un cuerpo propio con las filas envueltas. El núcleo no lleva un campo constante: lo que pide el protocolo vive en el daemon.
 - `totals.episodic` y `totals.procedural` en 0.
+- `trajectories` y `skills` en 0 en la unión que hace una respuesta `merge` a una sugerencia. Las otras rutas que devuelven una unión (`POST /v1/projects/merge`, `POST /v1/projects/locate`) las llama la CLI, que es la versión nueva.
 
 `success_count`, `trigger` y `source_trajectory_ids` salen de la fila: el bridge anterior los lee con `#[serde(default)]`. El formato de la línea de un hit (`#12 [Memory/…]`) no cambia, porque lo arma el bridge con el `kind` que manda el daemon y cambiarlo movería los tokens que mide `rag-eval --agent-view`.
 

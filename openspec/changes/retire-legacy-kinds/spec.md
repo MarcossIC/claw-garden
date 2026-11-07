@@ -50,15 +50,15 @@ Una fila migrada borrada MUST poder restaurarse con `restore_memory_core` (vecto
 
 ## R4. Nada más las lee
 
-Ningún archivo de `crates/*/src` MUST nombrar las cuatro tablas salvo `migrations.rs`, que siembra la versión anterior, y `portability/export.rs`, que cuenta las filas viejas de una base que todavía no migró. La búsqueda MUST correr un solo KNN, sobre `memory`, y `search.duration` MUST NOT registrar `knn_episodic` ni `knn_skill`. Mantenimiento, el registro, la unión, el borrado, la purga y la deshechura de proyectos e importaciones, `inspect` y el espacio de trabajo MUST leer y escribir sólo `memory`. `TableKind` y `MemoryKind` MUST NOT existir.
+Ningún archivo de `crates/*/src` MUST nombrar las cuatro tablas fuera de sus tests, salvo `portability/export.rs`, que cuenta las filas viejas de una base que todavía no migró; los tests de `migrations.rs` las nombran porque siembran la versión anterior. La búsqueda MUST correr un solo KNN, sobre `memory`, y `search.duration` MUST NOT registrar `knn_episodic` ni `knn_skill`. Mantenimiento, el registro, la unión, el borrado, la purga y la deshechura de proyectos e importaciones, `inspect` y el espacio de trabajo MUST leer y escribir sólo `memory`. `TableKind` y `MemoryKind` MUST NOT existir.
 
-**Test:** `only_the_migrations_and_the_export_name_the_retired_tables` (`crates/clawg-cli/tests/conventions.rs`); `a_search_runs_one_knn` (`crates/clawg-core/src/memory/search.rs`).
+**Test:** `no_production_code_names_the_retired_tables` (`crates/clawg-cli/tests/conventions.rs`); `a_search_records_how_long_each_arm_took` (`crates/clawg-core/src/memory/search.rs`).
 
 ## R5. La API
 
-El segmento `{kind}` de `/v1/memories/{kind}/{id}`, `/save` y `/restore`, y el filtro `kind` de `GET /v1/memories`, MUST aceptar `memory`. Un kind retirado MUST dar un 400 con la explicación, que nombra `search_memory`; cualquier otro valor, un 400 que dice que `memory` es el único. Las respuestas MUST seguir llevando `kind` (`memory` en una fila, `Memory` en un hit) y `GET /v1/stats` MUST seguir llevando `totals.episodic` y `totals.procedural` en 0, porque un bridge de la versión anterior los exige; las filas MUST NOT llevar `success_count`, `trigger` ni `source_trajectory_ids`.
+El segmento `{kind}` de `/v1/memories/{kind}/{id}`, `/save` y `/restore`, y el filtro `kind` de `GET /v1/memories`, MUST aceptar `memory`. Un kind retirado MUST dar un 400 con la explicación, que nombra `search_memory`; cualquier otro valor, un 400 que dice que `memory` es el único. Las respuestas MUST seguir llevando `kind` (`memory` en una fila, también las de `POST /v1/synthesis`, `Memory` en un hit), `GET /v1/stats` MUST seguir llevando `totals.episodic` y `totals.procedural` en 0 y la unión de una respuesta `merge` a una sugerencia, `trajectories` y `skills` en 0, porque un bridge de la versión anterior los exige; las filas MUST NOT llevar `success_count`, `trigger` ni `source_trajectory_ids`.
 
-**Test:** `a_retired_kind_is_refused_with_where_its_rows_went` (`crates/clawg-cli/tests/api.rs`); `parse_kind_takes_memory_alone` y `a_retired_kind_says_where_its_rows_went` (`crates/clawg-cli/src/daemon/api.rs`).
+**Test:** `a_retired_kind_is_refused_with_where_its_rows_went` y `the_answers_keep_what_a_bridge_of_the_previous_version_requires` (`crates/clawg-cli/tests/api.rs`); `parse_kind_takes_memory_alone` y `a_retired_kind_says_where_its_rows_went` (`crates/clawg-cli/src/daemon/api.rs`).
 
 ## R6. La CLI
 
@@ -70,7 +70,7 @@ El segmento `{kind}` de `/v1/memories/{kind}/{id}`, `/save` y `/restore`, y el f
 
 `kind` MUST NOT estar en el esquema de `list_memories`, `delete_memory`, `restore_memory`, `read_memory` ni `update_memory`. Un llamado que igual lo manda MUST aceptar `memory`, y con un kind retirado MUST responder la explicación, en el idioma del bridge y nombrando `search_memory`, sin llamar al daemon. Las descripciones MUST NOT hablar de tablas ni de ids por tabla.
 
-**Test:** `a_retired_kind_is_answered_with_where_its_rows_went` (`crates/clawg-cli/src/mcp/tools.rs`); `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, bendecidos.
+**Test:** `a_retired_kind_is_answered_with_where_its_rows_went` (`crates/clawg-cli/src/mcp/tools.rs`); `a_retired_kind_is_answered_without_calling_the_daemon` (`crates/clawg-cli/src/mcp/server.rs`); `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, bendecidos.
 
 ## R8. `doctor` y las invariantes
 
