@@ -13,6 +13,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0: el chequeo `hooks.runs` (HR6 y HR7). Lo que lee está en [`specs/hooks`](../hooks/spec.md) (HR1 a HR5 y HR8).
 
 **Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`; la lectura del registro del hook en `crates/clawg-cli/src/hook_log.rs`, y si el hook de Cursor está instalado en `crates/clawg-cli/src/setup/cursor.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
+- [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL8, al final de esta spec; `project_orphans` y `project_deletes` dejan de nombrar las tablas que V32 retira). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
 
 ## R1. Un sobre uniforme y el JSON de antes
 
@@ -178,12 +179,12 @@ Las reglas 1 y 4 agrupan por proyecto, como la clave de tema y el dedup ([`specs
 | `project_duplicates` | dos proyectos vivos con el mismo nombre, sin distinguir mayúsculas | `warn` `same_name`, con los dos ids y sus nombres | `clawg projects merge <el más nuevo> --into <el más viejo> --dry-run --profile P` |
 | `project_duplicates` | carpetas de dos proyectos vivos con el mismo primer commit que ningún par de remotos distingue (alguna sin remoto, o el mismo) | `warn` `same_first_commit`, con los dos ids, sus nombres y el commit | el mismo |
 | `project_duplicates` | ninguno, o sólo pares con una sugerencia respondida (`apart`, `merged`) o con un proyecto borrado (que no es un duplicado, ni por el nombre ni por el primer commit, ni por una lápida que lleva a él) | `ok`, con cuántos proyectos vivos hay | — |
-| `project_orphans` | un id con filas en `memory`, `episodic_trajectory` o `procedural_skill`, borradas incluidas, que `project` no tiene | `warn` `no_project`, con el id y las filas de cada tabla | — |
+| `project_orphans` | un id con filas en `memory`, borradas incluidas, que `project` no tiene | `warn` `no_project`, con el id y sus filas | — |
 | `project_orphans` | ninguno | `ok`, con cuántos ids tienen filas | — |
 | `project_merges` | filas bajo una lápida | `warn` `rows_under_merged`, con el id, su proyecto vivo y las filas de cada tabla | `clawg projects merge <la lápida> --into <su proyecto vivo> --dry-run --profile P` |
 | `project_merges` | una lápida cuya cadena no termina en un proyecto vivo: un ciclo, más de `MAX_MERGE_HOPS` uniones o un id que `project` no tiene | `warn` `broken_merge`, con el id y su `merged_into` | — |
 | `project_merges` | ninguno | `ok`, con cuántas lápidas hay | — |
-| `project_deletes` | un proyecto borrado (`project.deleted_at`) con filas vivas en `memory`, `episodic_trajectory` o `procedural_skill`: sólo puede ser una trayectoria o una habilidad (una memoria viva lo hace volver al usarse), o un store editado a mano | `warn` `live_under_deleted`, con el id, su borrado abierto más reciente (o null) y las filas vivas de cada tabla | — |
+| `project_deletes` | un proyecto borrado (`project.deleted_at`) con filas vivas en `memory`: sólo puede pasar en un store editado a mano (una memoria viva lo hace volver al usarse) | `warn` `live_under_deleted`, con el id, su borrado abierto más reciente (o null) y las filas vivas | — |
 | `project_deletes` | ninguno | `ok`, con cuántos proyectos borrados hay | — |
 | `project_subfolders` | una subcarpeta declarada (`project_subfolder`, V30) cuyo repositorio o destino no está en `project`: sólo en un store editado a mano. Una lápida o un proyecto borrado en un lado no es un hallazgo | `warn` `broken_subfolder`, con el repositorio, el subcamino y el destino | — |
 | `project_subfolders` | ninguna | `ok`, con cuántas declaraciones hay | — |
@@ -247,3 +248,9 @@ Con el hook de Cursor del perfil instalado en `~/.cursor/hooks.json` (la regla d
 - THEN `hooks.runs` es `info` `not_run`; y sin `setup cursor` no hay ningún `hooks.runs`
 
 **Tests:** `an_installed_hook_with_no_runs_says_so_and_none_installed_says_nothing` (`checks.rs`), `the_hook_of_this_profile_is_found_in_hooks_json` (`setup/cursor.rs`), `doctor_says_when_the_installed_hook_has_no_runs` (`tests/binary.rs`).
+
+## RL8. Un store migrado no da hallazgos del almacén
+
+Sobre una base recién migrada desde V31 con filas viejas, las invariantes de `inspect` MUST estar vacías, y `clawg doctor` MUST NOT dar ningún hallazgo `error` ni `warn` del almacén ([`specs/storage`](../storage/spec.md), RL1).
+
+**Test:** `a_store_moved_from_trajectories_and_skills_breaks_no_invariant` (`crates/clawg-core/src/memory/migrations.rs`); `doctor_passes_over_a_store_whose_trajectories_and_skills_moved` (`crates/clawg-cli/tests/binary.rs`).

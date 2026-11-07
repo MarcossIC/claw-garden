@@ -45,4 +45,7 @@ La tarea 2 es un solo commit grande: V32 borra las tablas, así que todo lo que 
 
 ## 7. Archivo
 
-Fuera de esta tarea: consolidar las specs, mover el cambio al archivo y subir el minor.
+- [x] Las specs: RL1 y RL4 de [`storage`](../../../specs/storage/spec.md), RL2 de [`project`](../../../specs/project/spec.md), RL3 de [`restore`](../../../specs/restore/spec.md), RL5 a RL7 de [`mcp`](../../../specs/mcp/spec.md), RL8 de [`doctor`](../../../specs/doctor/spec.md), RL9 de [`portability`](../../../specs/portability/spec.md), RL10 de [`eval`](../../../specs/eval/spec.md) y RL4 (el KNN único) de [`retrieval`](../../../specs/retrieval/spec.md). Lo que las tres tablas o los skills decían en `visibility`, `update`, `sharing`, `synthesis`, `pieces`, `project-docs` y `metrics` se corrige en su lugar, sin requisito nuevo.
+- [x] La carpeta pasa a `changes/archive/2026-11-07-retire-legacy-kinds`, con sus enlaces corregidos; `state.yaml` en `archive: done`, sin subir la versión: 0.79.0 ya trae el código de #136.
+- [x] `openspec/README.md` y `openspec/ROADMAP.md`.
+- Commit: `docs(openspec): archive retire-legacy-kinds and fold it into the specs`

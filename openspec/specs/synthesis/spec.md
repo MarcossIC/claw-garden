@@ -1,12 +1,13 @@
 # synthesis — Especificación
 
-Fuente de verdad del comportamiento actual de la síntesis dirigida por el agente: cómo se guarda una conclusión con las memorias de las que sale, cómo se valida y se ve esa procedencia, qué devuelve `synthesize`, cuándo `recall_context` lo recuerda y cómo se revisa una conclusión que perdió una fuente. El ranking, los tiers y el umbral del detector no están acá: no cambiaron. Las filas `episodic_trajectory` y `procedural_skill` que dejó la app de escritorio siguen alcanzables por búsqueda, workspace y listado: eso está en [`specs/retrieval`](../retrieval/spec.md) (su apartado de las filas de la app). Qué filas ve y cita un agente lo decide su alcance ([`specs/sharing`](../sharing/spec.md)), no su autoría.
+Fuente de verdad del comportamiento actual de la síntesis dirigida por el agente: cómo se guarda una conclusión con las memorias de las que sale, cómo se valida y se ve esa procedencia, qué devuelve `synthesize`, cuándo `recall_context` lo recuerda y cómo se revisa una conclusión que perdió una fuente. El ranking, los tiers y el umbral del detector no están acá: no cambiaron. Las filas que dejó la app de escritorio son filas de `memory` desde V32 y se buscan como cualquier otra: eso está en [`specs/retrieval`](../retrieval/spec.md) (RL4). Qué filas ve y cita un agente lo decide su alcance ([`specs/sharing`](../sharing/spec.md)), no su autoría.
 
 **Origen:**
 - [knowledge-synthesis](../../changes/archive/2026-10-13-knowledge-synthesis/proposal.md), archivado el 2026-10-13. Los ids de requisito son los de esa spec (R1 vive en `specs/retrieval`).
 - [conclusion-upkeep](../../changes/archive/2026-10-19-conclusion-upkeep/proposal.md), archivado el 2026-10-19: «Conclusiones a revisar» y su aviso, el rechazo de una fuente reemplazada (R3) y el enlace que una purga conserva (R6).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: el alcance, la memoria pendiente, la revisión y las fuentes de otro agente pasan de agente a proyecto, dentro de lo que alcanza el lector.
 - [session-start-context](../../changes/archive/2026-11-04-session-start-context/proposal.md), archivado el 2026-11-04, que salió en 0.76.0: SC6 de esa spec cambia «Memoria sin revisar» y R8, porque el aviso deja afuera lo importado.
+- [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (sólo lo que decía de las tablas que V32 retira; no hay requisito nuevo).
 
 ## Definiciones
 

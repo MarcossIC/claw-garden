@@ -18,6 +18,7 @@ Fuente de verdad del comportamiento actual de la evaluación de recuperación: e
 - [perf-bench](../../changes/archive/2026-10-31-perf-bench/proposal.md), archivado el 2026-10-31, que sale en 0.70.0 (sólo «Banco de rendimiento del daemon» y su baseline).
 - [docs-search-quality](../../changes/archive/2026-10-31-docs-search-quality/proposal.md), archivado el 2026-10-31, que sale en 0.71.0 (sólo DQ1 a DQ5: los docs que citan una pregunta fuera del corpus medido, el golden inválido, el archivo de resultados de docs, su `--diff` y el golden de 40, en «`rag-eval --docs`: medir el índice de documentación», y la calidad en «Índice de docs», en la baseline). Sus pasos 2 a 4 (una expresión léxica propia de docs, los identificadores partidos y un prefijo de pasaje para docs) no entraron: los que se midieron no pasaron su puerta, y los léxicos que faltan no se pueden medir con este golden ([verify](../../changes/archive/2026-10-31-docs-search-quality/verify.md)).
 - [docs-index-speed](../../changes/archive/2026-11-01-docs-index-speed/proposal.md), archivado el 2026-11-01, que sale en 0.73.0 (sólo IS3 e IS15: `padded_sorted_queue` y el aviso de relleno, en IC6 de «`rag-eval --docs`: medir el índice de documentación», y lo medido en «Índice de docs», en la baseline). El orden y la cola con que el refresco embebe (IS1, IS2 e IS7 a IS14) están en [`specs/project-docs`](../project-docs/spec.md), «La cola del refresco».
+- [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL10, al final de esta spec). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
 
 ## Definiciones
 
@@ -1451,3 +1452,9 @@ Medido el 2026-10-31 en Linux x86_64 con 4 hilos, en un build debug con el embed
 - `--diff` es determinista: el bootstrap usa una semilla fija, y los mismos dos archivos dan siempre la misma salida.
 - Producción nunca enlaza esto: `clawg-eval` usa `clawg-core` a través de la feature `eval`, y el banco del daemon es un test ignorado de `clawg-cli`.
 - Ni la memoria de vectores de `rag-eval --docs` ni el bloque `index` de su archivo de resultados guardan el texto de un pasaje, el de una pregunta ni una ruta: la memoria sólo claves y vectores, el bloque sólo números, banderas y los nombres de build, sistema y arquitectura.
+
+## RL10. `rag-eval` pide sólo `memory`
+
+`rag-eval` MUST pedir sólo el pool de `memory` y el léxico, y `k_pool` MUST NOT registrar `episodic` ni `procedural`. `rag-eval --diff` contra la línea base de `openspec/config.yaml` MUST NOT mover ningún caso ([`specs/retrieval`](../retrieval/spec.md), RL4).
+
+**Test:** `k_pool_mirrors_the_production_lexical_budget` y los de `report.rs`, ajustados.

@@ -27,7 +27,6 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 | Cambio | Dónde | Por qué acá |
 |---|---|---|
-| [retire-legacy-kinds](changes/retire-legacy-kinds/exploration.md) | Nube | Saca dos KNN de cada búsqueda y borra tablas: conviene que salga solo y antes del corte |
 | Partir el mapa de openspec | Nube | Lleva las filas archivadas a `changes/archive/README.md`. Conserva el encabezado «Orden de ejecución de lo pendiente» y su razonamiento, que el caso d13 de `crates/clawg-eval/golden/project-docs.json` espera, o actualiza ese caso |
 
 ## Piloto (una semana de trabajo real, no una noche)

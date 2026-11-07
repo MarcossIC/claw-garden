@@ -7,11 +7,12 @@ Fuente de verdad del comportamiento actual de la identidad del agente y de qué 
 - [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14 (sólo lo que dice de lo ajeno compartido en R3 y R4).
 - [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22: R3 y R4 dejan la frontera por agente y pasan al alcance del lector.
 - [project-reassign](../../changes/archive/2026-10-22-project-reassign/proposal.md), archivado el 2026-10-22: el movimiento de un `PATCH` con lector (R4).
+- [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (sólo lo que decía de las tablas que V32 retira; no hay requisito nuevo).
 
 ## Definiciones
 
 - **Agente del puente:** el `agent_id` con el que el puente MCP lee y escribe en una llamada.
-- **Fila del agente A:** fila de `memory`, `episodic_trajectory` o `procedural_skill` con `agent_id = A`; A es su autor.
+- **Fila del agente A:** fila de `memory` con `agent_id = A`; A es su autor.
 - **Lector:** el agente que nombra una llamada al daemon (`agent` en la query de `DELETE`/`PATCH`, de `GET /v1/memories/{kind}/{id}/save` y de `POST /v1/memories/memory/{id}/restore`, `agent_id` en el cuerpo de `POST /v1/disputes/judge`, `/v1/disputes/resolve` y `POST /v1/synthesis` y en la query de `GET /v1/disputes`, `reader` en `GET /v1/memories`), con lo que `sharing.json` le deja alcanzar ([`specs/sharing`](../sharing/spec.md), definición «Alcance»). Una llamada sin lector es del usuario.
 - **Segmento seguro:** un `agent_id` no vacío, sin `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`, `%` ni caracteres de control, que no termina en `.` ni en espacio (lo que también excluye `.` y `..`) y que no es un nombre de dispositivo de Windows.
 - **Nombre de dispositivo de Windows:** un `agent_id` cuya parte antes del primer `.`, sin espacios finales y sin distinguir mayúsculas, es `CON`, `PRN`, `AUX`, `NUL`, o `COM`/`LPT` seguido de un dígito o de `¹`, `²`, `³`.
@@ -86,7 +87,7 @@ El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mis
 - Una fila fuera del alcance del lector (o alguna de las dos, al juzgar) MUST responderse `404`, igual que un id inexistente, sin cambiar nada: ni la fila, ni su vector, ni sus disputas, ni su `last_modified_at`, ni su `update_count`. En el `GET` del save, el alcance se aplica a la fila pedida y a cada posición: un pedazo fuera del alcance figura como faltante con `ids` en `null`.
 - Sin lector, la operación MUST valer sobre cualquier fila.
 - Un `PATCH` que mueve la fila de proyecto ([`specs/update`](../update/spec.md) R7) MUST rechazar, sin nombrarla, una unidad con una fila fuera del alcance del lector (`out_of_reach`), y MUST juzgar los choques en el destino sólo con las filas que el lector alcanza, como la dedup y la clave de un save. El lote de `POST /v1/memories/move` no tiene lector.
-- La misma regla vale para las tres tablas (`memory`, `episodic`, `procedural`), salvo el restore, que sólo existe para `memory`.
+- La misma regla vale para `memory`, la única tabla de filas desde V32 ([`specs/storage`](../storage/spec.md), RL4).
 
 #### Escenario: otro agente borra
 - GIVEN una fila de `memory` de A con su vector

@@ -26,6 +26,7 @@ Fuente de verdad del comportamiento actual del puente `clawg mcp`: cómo abre un
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (desde «AL1. Sin preferencia o con `en`, lo de antes» hasta el final, el protocolo en español en «El protocolo de memoria» y sus apartados, y LP9 con `es`). Las notas del contexto y el parser de `rag-eval` en español están en [`specs/retrieval`](../retrieval/spec.md) (AL5, AL7), los hooks en [`specs/hooks`](../hooks/spec.md) (AL6) y el contrato en español en [`specs/quality`](../quality/spec.md).
 - [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0 (PM4, PM6 y PM8 de esa spec, con esos nombres, y lo que PM8 cambia en «La clave de tema en las herramientas»). Qué preferencias entran al workspace y la marca de un hit están en [`specs/retrieval`](../retrieval/spec.md), PM1 a PM3, PM5 y PM7.
 - [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (BI1 a BI5 y BI7 a BI10 de esa spec, con esos nombres, sus definiciones, `project=` entre los marcadores, y lo que cambian en «Los conflictos en las herramientas», «La clave de tema en las herramientas», PM4 y PM8). La búsqueda de un grupo en el core y en `POST /v1/search` está en [`specs/retrieval`](../retrieval/spec.md), BI6.
+- [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL5 a RL7, al final de esta spec: la API y la CLI que un puente anterior usa, y las herramientas sin `kind`; el texto de la explicación de un kind retirado está en RL7). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec. Las specs de la API y de la CLI no existen aparte: RL5 y RL6 viven acá porque son lo que el puente, y los clientes que lo usan, reciben.
 
 ## Definiciones
 
@@ -328,7 +329,7 @@ Qué hace un save con clave y cómo se valida está en [`specs/ingest`](../inges
 - `read_memory` MUST mostrarla en la cabecera (`format_save`, `tools.rs:304`; [`specs/pieces`](../pieces/spec.md), R6) con la misma regla del proyecto, comparando con los proyectos de las carpetas abiertas ([BI8](#bi8-memory_status-y-read_memory)). Una fila de otro agente muestra su clave igual que una propia: un save bajo ella la revisa.
 - `protocol.md` MUST decir, en «How to write a save», que una clave nombra un tema del proyecto y no de un agente, así que guardar bajo ella reemplaza la versión que guardó otro agente, y que se elige un nombre que diga el tema; y en «The other tools», que `delete_memory` borra para todos una memoria propia o marcada `by <agent>` y que `list_memories` se acota con `agent`.
 - `protocol.md` MUST decir, en «How to write a save», que `search_memory` y `read_memory` muestran la clave sólo donde guardar bajo ella reemplaza la memoria, y que una memoria de otro proyecto, o de ninguno, no la muestra, salvo una preferencia sin proyecto (PM8) (`crates/clawg-cli/src/mcp/protocol.md:72-80`).
-- `POST /v1/search` MUST devolver `topic_key` en cada hit de una fila que la tiene (`RankedHit.topic_key`, `crates/clawg-core/src/memory/search.rs:129`; el cliente la lee con `#[serde(default)]` en `Hit`, `crates/clawg-cli/src/client.rs:206`), y `GET /v1/memories/{kind}/{id}/save` la de la fila pedida. Un hit de una fila sin clave, y el de `episodic_trajectory` o `procedural_skill`, que no tienen la columna, MUST NOT llevar el campo. Los dos MUST llevar siempre `project_id`, el proyecto de la fila, `null` para una sin proyecto y nunca omitido (`RankedHit.project_id`, `search.rs:133`; `SaveText.project_id`, `crates/clawg-core/src/memory/pieces.rs:51`): el cliente distingue el campo ausente, de un daemon anterior, del `null` (`Hit.project_id` y `SavedText.project_id`, `client.rs:210` y `client.rs:547`, `Option<Option<String>>`).
+- `POST /v1/search` MUST devolver `topic_key` en cada hit de una fila que la tiene (`RankedHit.topic_key`, `crates/clawg-core/src/memory/search.rs:129`; el cliente la lee con `#[serde(default)]` en `Hit`, `crates/clawg-cli/src/client.rs:206`), y `GET /v1/memories/{kind}/{id}/save` la de la fila pedida. Un hit de una fila sin clave MUST NOT llevar el campo. Los dos MUST llevar siempre `project_id`, el proyecto de la fila, `null` para una sin proyecto y nunca omitido (`RankedHit.project_id`, `search.rs:133`; `SaveText.project_id`, `crates/clawg-core/src/memory/pieces.rs:51`): el cliente distingue el campo ausente, de un daemon anterior, del `null` (`Hit.project_id` y `SavedText.project_id`, `client.rs:210` y `client.rs:547`, `Option<Option<String>>`).
 - `recall_context` no muestra la clave (`format_hit_line`, `crates/clawg-core/src/memory/prompt_builder.rs:763`): es un prompt con presupuesto y cada byte cuenta.
 
 #### Escenario: otra sesión revisa la decisión
@@ -367,7 +368,7 @@ Desde cualquier puente, con carpetas abiertas o sin ellas, `search_memory` y `re
 Qué hace el borrado y el restore está en [`specs/restore`](../restore/spec.md); acá está lo que el modelo lee.
 
 - La descripción de `delete_memory` (`crates/clawg-cli/src/mcp/server.rs:1400-1405`) MUST decir que borrar la vigente de un `topic_key` vuelve vigente la versión que reemplazó, y que `restore_memory` lo deshace.
-- La respuesta de `delete_memory` (`format_delete`, `crates/clawg-cli/src/mcp/tools.rs:389`) MUST empezar por `deleted N; restore_memory with the same id and kind undoes it`. Si el borrado revivió filas, MUST añadir una línea `the version it had replaced is current again: #M "<primera línea>"`; si dejó filas escondidas por un veredicto, MUST nombrarlas con `stay superseded by it, as a resolve_conflict verdict left them, so searches leave them out`.
+- La respuesta de `delete_memory` (`format_delete`, `crates/clawg-cli/src/mcp/tools.rs:389`) MUST empezar por `deleted N; restore_memory with the same id undoes it`. Si el borrado revivió filas, MUST añadir una línea `the version it had replaced is current again: #M "<primera línea>"`; si dejó filas escondidas por un veredicto, MUST nombrarlas con `stay superseded by it, as a resolve_conflict verdict left them, so searches leave them out`.
 - La descripción de `restore_memory` (`server.rs:1417-1421`) MUST nombrar el rechazo por clave: cuando otra memoria más nueva tiene su `topic_key`, además de la gemela y el secreto. Nombra también las memorias guardadas mientras estaba borrada que están cerca, para juzgar con `resolve_conflict`.
 - La respuesta de `restore_memory` (`format_restore`, `tools.rs:422`) MUST mostrar ` topic=K` después del id cuando la fila tiene clave; si sigue `superseded`, MUST decir por cuál y que la búsqueda no la muestra. Cuando la reemplazante está borrada (`superseded_by_deleted`), MUST decir que también está borrada (`which is deleted too`) y que la fila vuelve con `restore_memory` de esa o guardando otra vez el contenido, y MUST NOT mandar a `resolve_conflict`. MUST listar lo que volvió a reemplazar (`replaces again the version its delete had brought back`) y cada par nuevo (`saved while it was deleted, close to it`), marcando los escalados con `asks the user`.
 - `clawg undelete` (`crates/clawg-cli/src/undelete.rs:9`) MUST decir lo mismo: la clave, lo que volvió a reemplazar y el reemplazante borrado, con `clawg undelete <id>` como vuelta, y cada par nuevo en una línea, sin juzgarlo.
@@ -667,3 +668,28 @@ Con el idioma de la sesión `es`, la prosa de cada respuesta del puente MUST est
 - THEN la línea del hit es `1. #4 [memory/semantic_fact/t3 piece=2/3 score=0.91 topic=api/port by cursor] El puerto es 8080`, igual que en inglés, y la nota de lo compartido que la sigue está en español
 
 **Test:** `a_spanish_search_keeps_its_markers`, `the_spanish_answers_of_each_tool`, `the_spanish_synthesis_and_nudges`, `the_spanish_status_docs_and_recall` y los de la línea del otro idioma (`tools.rs`); `a_spanish_session_answers_in_spanish` y `memory_status_names_the_language_of_the_session` (`server.rs`).
+
+## RL5. La API que habla un puente anterior
+
+El segmento `{kind}` de `/v1/memories/{kind}/{id}`, `/save` y `/restore`, y el filtro `kind` de `GET /v1/memories`, MUST aceptar `memory`. Un kind retirado MUST dar un 400 con la explicación, que nombra `search_memory`; cualquier otro valor, un 400 que dice que `memory` es el único. Las respuestas MUST seguir llevando `kind` (`memory` en una fila, también las de `POST /v1/synthesis`; `Memory` en un hit), `GET /v1/stats` MUST seguir llevando `totals.episodic` y `totals.procedural` en 0, y la unión de una respuesta `merge` a una sugerencia, `trajectories` y `skills` en 0, porque un bridge de la versión anterior los exige. Las filas MUST NOT llevar `success_count`, `trigger` ni `source_trajectory_ids`.
+
+**Test:** `a_retired_kind_is_refused_with_where_its_rows_went` y `the_answers_keep_what_a_bridge_of_the_previous_version_requires` (`crates/clawg-cli/tests/api.rs`); `parse_kind_takes_memory_alone` y `a_retired_kind_says_where_its_rows_went` (`crates/clawg-cli/src/daemon/api.rs`).
+
+## RL6. La CLI
+
+`--kind` de `clawg memories list` y `show` MUST quedar fuera de la ayuda, aceptar `memory` y rechazar un kind retirado con un error de uso que lleva la explicación y nombra `clawg memories search`. `memories stats`, los informes de `projects` y `purge --project-delete` MUST NOT nombrar trayectorias ni habilidades.
+
+**Test:** `a_retired_kind_is_a_usage_error_that_says_where_its_rows_went` (`crates/clawg-cli/src/cli.rs`).
+
+## RL7. `kind` fuera de las herramientas MCP
+
+La **explicación** de un kind retirado (`episodic` o `procedural`) es el texto que dice que ese kind ya no existe, que sus filas son ahora filas de `memory` de tipo `semantic_fact` con otro id, y dónde se buscan.
+
+`kind` MUST NOT estar en el esquema de `list_memories`, `delete_memory`, `restore_memory`, `read_memory` ni `update_memory`. Un llamado que igual lo manda MUST aceptar `memory`, y con un kind retirado MUST responder la explicación, en el idioma del bridge y nombrando `search_memory`, sin llamar al daemon. Las descripciones MUST NOT hablar de tablas ni de ids por tabla.
+
+#### Escenario: un kind retirado en `read_memory`
+- GIVEN un llamado a `read_memory` con `kind = "procedural"`
+- WHEN el bridge lo recibe
+- THEN responde la explicación nombrando `search_memory`, y el daemon no recibe ninguna petición
+
+**Test:** `a_retired_kind_is_answered_with_where_its_rows_went` (`crates/clawg-cli/src/mcp/tools.rs`); `a_retired_kind_is_answered_without_calling_the_daemon` (`crates/clawg-cli/src/mcp/server.rs`); `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, bendecidos.
