@@ -7,7 +7,7 @@ En Linux x86_64, build debug, toolchain 1.99.1, en `target`, sobre `08560976`: e
 - `cargo test --workspace --no-fail-fast` pasa, sin ningún test fallado. Los ignorados son los `#[ignore]` que ya tenía el repositorio: este cambio no agrega ninguno.
 - `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también.
 - Los contratos del agente pasan después de bendecirlos con `CLAWG_BLESS=1`, en los dos idiomas ([abajo](#el-contrato-del-agente)).
-- Windows: lo revisa el CI del pull request. El cambio no toca código `cfg(windows)`.
+- En Windows, el CI de [#136](https://github.com/MarcossIC/claw-garden/pull/136) falló sobre `376e29c9` en `no_production_code_names_the_retired_tables`: nombraba las tablas en las líneas de los tests de `migrations.rs`. El checkout de Windows deja los fuentes con saltos `\r\n`, y el test buscaba el módulo de tests con `\n#[cfg(test)]\nmod `, así que tomaba el archivo entero como código de producción. Se reprodujo en Linux con `the_production_code_ends_at_the_test_module_with_either_line_end`, que daba `[2, 6]` en lugar de `[2]` con CRLF, y `006cc8d2` lee el fuente línea por línea, lo que descarta el `\r`; pasa con CRLF y con LF, y también con todo `crates/*/src` pasado a CRLF. Sobre `006cc8d2`, los jobs `test (ubuntu-latest)` y `test (windows-latest)` pasaron: los dos clippy y `cargo test --locked --workspace`. El cambio no toca código `cfg(windows)`.
 
 ## Los tests en rojo
 
@@ -129,4 +129,4 @@ Lo que sigue necesita los datos reales o el modelo real, y no corre en la nube. 
 
 ## Veredicto
 
-Sin CRITICAL en Linux. El CI del pull request revisa Windows. Los tres puntos de «Pendiente en local» quedan como WARNING hasta medirlos sobre copias.
+Sin CRITICAL en Linux ni en el CI de Windows. Los tres puntos de «Pendiente en local» quedan como WARNING hasta medirlos sobre copias.

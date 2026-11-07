@@ -39,7 +39,7 @@ La tarea 2 es un solo commit grande: V32 borra las tablas, así que todo lo que 
 ## 6. Verificación
 
 - [x] `cargo test --workspace` y `cargo clippy --workspace --all-targets -- -D warnings` sobre el último commit de código, en Linux.
-- [ ] El CI del PR, que corre también Windows (`cfg(windows)`).
+- [x] El CI del PR, que corre también Windows (`cfg(windows)`): el arreglo de los saltos `\r\n` en `conventions.rs` (`verify.md`).
 - [x] `verify.md` con lo que queda pendiente en local: la migración sobre una copia de `prod` y otra de `dev`, `search.duration` antes y después sobre una copia, y `rag-eval --diff` con el modelo real y el golden de `docs/eval/`.
 - Commit: `docs(openspec): record retire-legacy-kinds applied`
 
