@@ -106,14 +106,33 @@ fn no_production_code_names_the_retired_tables() {
             continue;
         }
         let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        let production = source.split("\n#[cfg(test)]\nmod ").next().unwrap_or_default();
-        for (n, line) in production.lines().enumerate() {
-            if RETIRED.iter().any(|t| line.contains(t)) {
-                found.push(format!("{shown}:{}", n + 1));
-            }
-        }
+        found.extend(production_lines_naming(&source, &RETIRED).into_iter().map(|n| format!("{shown}:{n}")));
     }
     assert!(found.is_empty(), "these lines name a table V32 dropped:\n{}", found.join("\n"));
+}
+
+/// The lines, from 1, of the code before the first `#[cfg(test)]` module of
+/// `source` that name one of `names`.
+fn production_lines_naming(source: &str, names: &[&str]) -> Vec<usize> {
+    let lines: Vec<&str> = source.lines().collect();
+    let tests = lines
+        .windows(2)
+        .position(|pair| pair[0] == "#[cfg(test)]" && pair[1].starts_with("mod "))
+        .unwrap_or(lines.len());
+    lines[..tests]
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| names.iter().any(|t| line.contains(t)))
+        .map(|(n, _)| n + 1)
+        .collect()
+}
+
+/// A Windows checkout has CRLF line ends.
+#[test]
+fn the_production_code_ends_at_the_test_module_with_either_line_end() {
+    let source = "use x;\nconst A: &str = \"old_table\";\n\n#[cfg(test)]\nmod tests {\n    const B: &str = \"old_table\";\n}\n";
+    assert_eq!(production_lines_naming(source, &["old_table"]), [2]);
+    assert_eq!(production_lines_naming(&source.replace('\n', "\r\n"), &["old_table"]), [2]);
 }
 
 /// Lines of a manifest that turn on clawg-core's `testing` feature outside
