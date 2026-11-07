@@ -204,7 +204,7 @@ fn render_rows(lang: Lang, rows: &[MemoryRow], now_ms: i64, limit: u32, offset: 
             Lang::Es => write!(out, " Más: --offset {next}"),
         };
     }
-    if matches!(listing, Listing::Deleted) && rows.iter().any(|r| r.kind == "memory") {
+    if matches!(listing, Listing::Deleted) {
         out.push_str(match lang {
             Lang::En => " Undo a memory row with 'clawg undelete <ID>'.",
             Lang::Es => " Una fila memory vuelve con 'clawg undelete <ID>'.",
@@ -387,7 +387,7 @@ fn filter_args(filters: &Filters, project: Option<String>) -> ListArgs {
 /// the caller, which is the part that reads the working directory.
 pub fn list_args(opts: &ListOpts, project: Option<String>) -> ListArgs {
     ListArgs {
-        kind: opts.kind.map(|k| k.as_str().to_owned()),
+        kind: opts.kind.clone(),
         limit: Some(opts.limit),
         offset: Some(opts.offset),
         deleted: opts.deleted,
@@ -459,7 +459,7 @@ pub async fn run(
             })
         }
         MemoriesAction::Show(opts) => {
-            let row = client.get(opts.kind.as_str(), opts.id).await?;
+            let row = client.get(opts.kind.as_deref().unwrap_or("memory"), opts.id).await?;
             Ok(if opts.json {
                 row_json(&row)
             } else {
@@ -485,7 +485,7 @@ mod tests {
     use super::*;
 
     use crate::cli::{
-        Filters, KindArg, ListOpts, ProfileArg, Scope, SearchOpts, ShowOpts, StatsOpts, StatusArg,
+        Filters, ListOpts, ProfileArg, Scope, SearchOpts, ShowOpts, StatsOpts, StatusArg,
     };
     use crate::client::tests::{publish, save_and_wait, start_daemon};
     use crate::client::{Count, DaemonClient, MemoryStats, StatsTotals};
@@ -541,15 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn deleted_episodes_alone_are_not_offered_an_undelete() {
-        let episode = MemoryRow { deleted_at: Some(NOW - 60_000), ..row(4, "episodic", "ran the migration") };
-
-        let out = render_deleted_table(Lang::En, &[episode], NOW, 20, 0);
-
-        assert!(out.ends_with("1 row, most recently deleted first."), "{out}");
-    }
-
-    #[test]
     fn table_one_line_per_row_plus_header() {
         let rows = [row(2, "memory", "second"), row(1, "memory", "first")];
         let out = render_table(Lang::En, &rows, NOW, 20, 0);
@@ -576,7 +567,7 @@ mod tests {
         let mut b = row(22, "memory", "two");
         b.agent_id = Some("🚀🚀🚀".into());
         b.project_id = Some("proyecto-ó".into());
-        let mut c = row(333, "episodic", "three");
+        let mut c = row(333, "memory", "three");
         c.agent_id = Some("plain".into());
         c.memory_type = None;
 
@@ -633,7 +624,7 @@ mod tests {
     fn dash_for_missing() {
         let bare = MemoryRow {
             id: 4,
-            kind: "episodic".into(),
+            kind: "memory".into(),
             summary: "x".into(),
             tier: 3,
             status: "active".into(),
@@ -765,7 +756,7 @@ mod tests {
         let out = render_detail(
             &MemoryRow {
                 id: 3,
-                kind: "episodic".into(),
+                kind: "memory".into(),
                 ..Default::default()
             },
             NOW,
@@ -926,7 +917,7 @@ mod tests {
 
     #[test]
     fn json_is_valid() {
-        let rows = [row(2, "memory", "naïve\ncontent"), row(1, "episodic", "x")];
+        let rows = [row(2, "memory", "naïve\ncontent"), row(1, "memory", "x")];
         let parsed: serde_json::Value = serde_json::from_str(&rows_json(&rows)).expect("array");
         let items = parsed.as_array().expect("an array");
         assert_eq!(items.len(), 2);
@@ -1020,7 +1011,7 @@ mod tests {
     #[test]
     fn list_args_carry_every_flag() {
         let opts = ListOpts {
-            kind: Some(KindArg::Procedural),
+            kind: Some("memory".into()),
             filters: Filters {
                 scope: Scope {
                     agent: Some("a1".into()),
@@ -1037,7 +1028,7 @@ mod tests {
             ..list_opts()
         };
         let args = list_args(&opts, Some("p1".into()));
-        assert_eq!(args.kind.as_deref(), Some("procedural"));
+        assert_eq!(args.kind.as_deref(), Some("memory"));
         assert_eq!(args.agent.as_deref(), Some("a1"));
         assert_eq!(
             args.project.as_deref(),
@@ -1162,7 +1153,7 @@ mod tests {
         let show = |id, json| {
             MemoriesAction::Show(ShowOpts {
                 id,
-                kind: KindArg::Memory,
+                kind: None,
                 json,
                 profile: ProfileArg { profile: None },
             })
@@ -1190,7 +1181,7 @@ mod tests {
         let (c, _d) = live_client().await;
         let action = MemoriesAction::Show(ShowOpts {
             id: 12345,
-            kind: KindArg::Memory,
+            kind: None,
             json: false,
             profile: ProfileArg { profile: None },
         });
