@@ -54,7 +54,7 @@ use crate::mcp::startup::{on_failure, ClientHandle, Next};
 use crate::mcp::tools::{
     format_docs, format_language, format_recall, format_resolution, format_rows, format_save, format_search, format_sharing,
     format_answered, format_delete, format_open_pairs, format_refusal, format_restore, format_status, format_synthesis, format_update,
-    indexes_docs, no_folder, no_project_named, resolve_project, several_folders, topic_key_warning,
+    indexes_docs, kind_refusal, no_folder, no_project_named, resolve_project, several_folders, topic_key_warning,
 };
 
 /// The daemon refused a root because its id already belongs to another one.
@@ -206,7 +206,9 @@ pub struct SaveMemoryArgs {
 impl SaveMemoryArgs {
     /// Whether the save says where it goes: a folder, a project or every one.
     fn names_its_project(&self) -> bool {
-        self.project.is_some() || self.project_path.as_deref().is_some_and(|p| !p.is_empty()) || self.all_projects == Some(true)
+        self.project.as_deref().is_some_and(|p| !p.trim().is_empty())
+            || self.project_path.as_deref().is_some_and(|p| !p.is_empty())
+            || self.all_projects == Some(true)
     }
 }
 
@@ -220,7 +222,9 @@ pub struct SearchMemoryArgs {
     pub limit: Option<usize>,
     /// Absolute path of the project to search in. Defaults to the folders the
     /// client has open, or else the directory this bridge was started in;
-    /// with several open it searches them all.
+    /// with several open it searches them all. The home directory is never
+    /// one of them, and with none left it searches every project, with hits
+    /// that do not name their project.
     #[serde(default)]
     pub project_path: Option<String>,
     /// The project by its id or its name, for one with no folder here or
@@ -299,14 +303,13 @@ pub struct ListMemoriesArgs {
     /// or a search. Lists every agent's you can read when omitted.
     #[serde(default)]
     pub agent: Option<String>,
-    /// Which table to list: memory, episodic or procedural. Lists all three
-    /// when omitted.
     #[serde(default)]
+    #[schemars(skip)]
     pub kind: Option<String>,
     /// Only rows in this tier: 1 (hot), 2 (warm) or 3 (cold).
     #[serde(default)]
     pub tier: Option<i64>,
-    /// Only rows of this memory type. Applies to `memory` rows only.
+    /// Only memories of this type.
     #[serde(default)]
     pub memory_type: Option<String>,
     /// How many rows to return, 1 to 100. Defaults to 50.
@@ -321,20 +324,19 @@ pub struct ListMemoriesArgs {
 pub struct RestoreMemoryArgs {
     /// The id `delete_memory` was given.
     pub id: i64,
-    /// The kind `delete_memory` was given. Only memory rows can be restored.
-    pub kind: String,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DeleteMemoryArgs {
-    /// The id of the row to delete, as printed by `search_memory`,
-    /// `list_memories` or `recall_context`. A `recall_context` hit with no kind
-    /// in front of its type is a memory.
+    /// The id of the memory to delete, as printed by `search_memory`,
+    /// `list_memories` or `recall_context`.
     pub id: i64,
-    /// Which table the id belongs to: memory, episodic or procedural. Required,
-    /// because each table numbers its rows independently — id 7 exists in all
-    /// three and means something different in each.
-    pub kind: String,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -342,25 +344,24 @@ pub struct ReadMemoryArgs {
     /// The id of any piece of the save, as printed by `search_memory`,
     /// `list_memories`, `recall_context` or `save_memory`.
     pub id: i64,
-    /// Which table the id belongs to: memory, episodic or procedural.
-    /// Defaults to memory, the only kind saved in pieces.
     #[serde(default)]
+    #[schemars(skip)]
     pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct UpdateMemoryArgs {
-    /// The id of the row to change, as printed by `save_memory`,
-    /// `search_memory`, `list_memories` or `recall_context`. A `recall_context`
-    /// hit with no kind in front of its type is a memory.
+    /// The id of the memory to change, as printed by `save_memory`,
+    /// `search_memory`, `list_memories` or `recall_context`.
     pub id: i64,
-    /// Which table the id belongs to: memory, episodic or procedural.
-    pub kind: String,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub kind: Option<String>,
     /// The new importance, 0 to 10. Omit it to leave the importance as it is.
     #[serde(default)]
     pub importance: Option<f64>,
-    /// The new type, only for kind memory, one of the listed values. Omit it
-    /// to leave the type as it is.
+    /// The new type, one of the listed values. Omit it to leave the type as
+    /// it is.
     #[serde(default)]
     #[schemars(transform = memory_type_enum)]
     pub memory_type: Option<String>,
@@ -511,7 +512,7 @@ pub struct ClawgMcp {
     /// sent to `POST /v1/projects` by this process, with the ids it gave
     /// them: a declared subfolder of a root leads to another project. Shared
     /// by every clone, because rmcp clones the server per call.
-    registered: Arc<tokio::sync::Mutex<HashMap<(PathBuf, PathBuf), ProjectIds>>>,
+    registered: Arc<tokio::sync::Mutex<HashMap<(PathBuf, PathBuf), Sent>>>,
     profile: Profile,
     /// The user's preferred language when the bridge started, which this
     /// session's instructions, searches and answers keep.
@@ -525,6 +526,14 @@ pub struct ClawgMcp {
 struct ProjectIds {
     project: String,
     root: String,
+}
+
+/// A root as this process sent it to `POST /v1/projects`: the ids the daemon
+/// gave it, and whether the daemon was asked to read its files.
+#[derive(Debug, Clone)]
+struct Sent {
+    ids: ProjectIds,
+    index_docs: bool,
 }
 
 /// The user's home directory, canonical, as a root resolves.
@@ -619,25 +628,41 @@ impl ClawgMcp {
         roots::open_folders(&self.roots, self.default_project.as_ref(), self.home.as_deref(), ProjectIdentity::resolve)
     }
 
-    /// The open folder, when there is exactly one: what a call that names no
-    /// project reads and registers, as the bridge's own directory was.
-    fn one_folder(&self) -> Option<ProjectIdentity> {
-        let mut open = self.open_folders();
-        (open.len() == 1).then(|| open.remove(0))
+    /// The open folders, the first of each project the daemon gives them,
+    /// each registered as [`Self::ids_of`] does: two folders of one
+    /// repository are one project unless one is a declared subfolder.
+    async fn open_projects(&self, client: &DaemonClient) -> Result<Vec<(ProjectIdentity, ProjectIds)>, ClientError> {
+        let open = self.open_folders();
+        let mut projects: Vec<(ProjectIdentity, ProjectIds)> = Vec::new();
+        for folder in &open {
+            let ids = self.ids_of(client, folder.clone(), &open).await?;
+            if projects.iter().all(|(_, seen)| seen.project != ids.project) {
+                projects.push((folder.clone(), ids));
+            }
+        }
+        Ok(projects)
     }
 
-    /// The open folders whose files the daemon may read on its own: each with
-    /// a `.git` or a manifest, other than the home directory.
-    fn indexable_folders(&self) -> Vec<ProjectIdentity> {
+    /// The open project, when the open folders lead to exactly one: what a
+    /// call that names no project reads, as the bridge's own directory was.
+    async fn one_project(&self, client: &DaemonClient) -> Result<Option<(ProjectIdentity, ProjectIds)>, ClientError> {
+        let mut open = self.open_projects(client).await?;
+        Ok((open.len() == 1).then(|| open.remove(0)))
+    }
+
+    /// The folders of `open`, as [`Self::open_folders`] gives them, whose
+    /// files the daemon may read on its own: each with a `.git` or a
+    /// manifest, other than the home directory.
+    fn indexable_folders(&self, open: &[ProjectIdentity]) -> Vec<ProjectIdentity> {
         let home = self.home.as_deref();
-        self.open_folders().into_iter().filter(|p| auto_indexable(&p.root, home, has_project_marker(&p.root))).collect()
+        open.iter().filter(|p| auto_indexable(&p.root, home, has_project_marker(&p.root))).cloned().collect()
     }
 
     /// The project id of `folder` as this process registered it, or the one
     /// derived from its root, without registering it.
     async fn known_id(&self, folder: &ProjectIdentity) -> String {
         let registered = self.registered.lock().await;
-        registered.get(&(folder.root.clone(), folder.path.clone())).map_or_else(|| folder.id.clone(), |ids| ids.project.clone())
+        registered.get(&(folder.root.clone(), folder.path.clone())).map_or_else(|| folder.id.clone(), |sent| sent.ids.project.clone())
     }
 
     /// [`Self::known_id`] of each open folder: where a save from here, naming
@@ -645,33 +670,38 @@ impl ClawgMcp {
     async fn known_ids(&self) -> Vec<String> {
         let mut ids = Vec::new();
         for folder in self.open_folders() {
-            ids.push(self.known_id(&folder).await);
+            let id = self.known_id(&folder).await;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
         }
         ids
     }
 
-    /// The refusal of `tool`, whose answer is about one project, with
-    /// several folders open; `None` with one or none.
-    async fn several_open(&self, tool: &str) -> Option<String> {
-        let open = self.open_folders();
+    /// The refusal of `tool`, whose answer is about one project, when the
+    /// open folders lead to several; `None` with one or none.
+    async fn several_open(&self, client: &DaemonClient, tool: &str) -> Result<Option<String>, ClientError> {
+        let open = self.open_projects(client).await?;
         if open.len() < 2 {
-            return None;
+            return Ok(None);
         }
-        let mut named = Vec::with_capacity(open.len());
-        for folder in open {
-            let id = self.known_id(&folder).await;
-            named.push((folder, id));
-        }
-        Some(several_folders(self.speaks(), tool, &named))
+        let named: Vec<(ProjectIdentity, String)> = open.into_iter().map(|(folder, ids)| (folder, ids.project)).collect();
+        Ok(Some(several_folders(self.speaks(), tool, &named)))
     }
 
     /// [`Self::several_open`] for a call that names neither `project` nor
     /// `project_path`; `None` for one that does.
-    async fn unnamed_with_several(&self, project: Option<&str>, project_path: Option<&str>, tool: &str) -> Option<String> {
+    async fn unnamed_with_several(
+        &self,
+        client: &DaemonClient,
+        project: Option<&str>,
+        project_path: Option<&str>,
+        tool: &str,
+    ) -> Result<Option<String>, ClientError> {
         if project.is_some() || project_path.is_some_and(|p| !p.is_empty()) {
-            return None;
+            return Ok(None);
         }
-        self.several_open(tool).await
+        self.several_open(client, tool).await
     }
 
     /// Which agent's memory a call reads and writes, and why.
@@ -859,8 +889,7 @@ impl ClawgMcp {
     }
 
     /// What `save_memory` tells the model: `Ok` is a success result, `Err` an
-    /// error result. Every id it names is one `delete_memory` takes with
-    /// `kind: "memory"`.
+    /// error result. Every id it names is one `delete_memory` takes.
     fn save_outcome_text(lang: Lang, result: Result<SaveOutcome, ClientError>) -> Result<String, String> {
         let ids = |memories: &[crate::client::SavedMemory]| {
             memories.iter().map(|m| format!("#{}", m.id)).collect::<Vec<_>>().join(", ")
@@ -1023,7 +1052,9 @@ impl ClawgMcp {
     /// Each root and path is sent once per process, even when the call
     /// fails: a daemon that cannot register (an older version, say) must not
     /// cost every tool call a round trip, and the ids derived from the root
-    /// are what such a daemon uses. The exceptions are a call the daemon
+    /// are what such a daemon uses. It is sent once more when its files become
+    /// the daemon's to read: a folder named before the client opened it, or
+    /// before it had a `.git` or a manifest. The exceptions are a call the daemon
     /// never got (a refused token or connection), which is sent again, and a
     /// root whose id belongs to another root, which only a daemon from before
     /// assigned ids answers: that is `Err`, because reading or writing under
@@ -1035,23 +1066,32 @@ impl ClawgMcp {
         project_path: Option<&str>,
         all_projects: bool,
     ) -> Result<Option<ProjectIds>, ClientError> {
-        match resolve_project(self.one_folder().as_ref(), project_path, all_projects, ProjectIdentity::resolve) {
-            Some(project) => self.ids_of(client, project).await.map(Some),
+        let named = all_projects || project_path.is_some_and(|p| !p.is_empty());
+        let one = match named {
+            true => None,
+            false => self.one_project(client).await?.map(|(folder, _)| folder),
+        };
+        match resolve_project(one.as_ref(), project_path, all_projects, ProjectIdentity::resolve) {
+            Some(project) => self.ids_of(client, project, &self.open_folders()).await.map(Some),
             None => Ok(None),
         }
     }
 
     /// The ids of `project`, registered as [`Self::ids_for`] says. Its files
-    /// are the daemon's to read only when it is an open folder that may be
-    /// read on its own ([`indexes_docs`]).
-    async fn ids_of(&self, client: &DaemonClient, project: ProjectIdentity) -> Result<ProjectIds, ClientError> {
+    /// are the daemon's to read only when it is one of `open`, the open
+    /// folders, that may be read on its own ([`indexes_docs`]).
+    async fn ids_of(&self, client: &DaemonClient, project: ProjectIdentity, open: &[ProjectIdentity]) -> Result<ProjectIds, ClientError> {
         let key = (project.root.clone(), project.path.clone());
         let mut registered = self.registered.lock().await;
-        if let Some(ids) = registered.get(&key) {
-            return Ok(ids.clone());
+        let sent = registered.get(&key);
+        if let Some(sent) = sent.filter(|sent| sent.index_docs) {
+            return Ok(sent.ids.clone());
+        }
+        let index_docs = indexes_docs(&project, &self.indexable_folders(open));
+        if let Some(sent) = sent.filter(|_| !index_docs) {
+            return Ok(sent.ids.clone());
         }
         let legacy = project.legacy_ids();
-        let index_docs = indexes_docs(&project, &self.indexable_folders());
         let ids = match client.register_project(&project.root, Some(&project.path), &legacy, index_docs).await {
             Ok(given) => ProjectIds { project: given.project_id, root: given.root_id },
             Err(e) if e.is_root_collision() => return Err(e),
@@ -1066,7 +1106,7 @@ impl ClawgMcp {
                 derived
             }
         };
-        registered.insert(key, ids.clone());
+        registered.insert(key, Sent { ids: ids.clone(), index_docs });
         Ok(ids)
     }
 
@@ -1246,13 +1286,7 @@ impl ClawgMcp {
                     };
                     (project_id, Vec::new(), save_projects)
                 } else {
-                    let mut ids: Vec<String> = Vec::new();
-                    for folder in self.open_folders() {
-                        let id = self.ids_of(&client, folder).await?.project;
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                        }
-                    }
+                    let ids: Vec<String> = self.open_projects(&client).await?.into_iter().map(|(_, ids)| ids.project).collect();
                     match ids.as_slice() {
                         [one] => (Some(one.clone()), Vec::new(), ids),
                         _ => (None, ids.clone(), ids),
@@ -1289,12 +1323,14 @@ impl ClawgMcp {
         if let Some(both) = self.one_place(args.project.as_deref(), args.project_path.as_deref(), "project_path") {
             return Self::failed(both);
         }
-        if let Some(several) = self.unnamed_with_several(args.project.as_deref(), args.project_path.as_deref(), "recall_context").await {
-            return Self::failed(several);
-        }
         let args = &args;
         let result = self
             .call(|client| async move {
+                if let Some(several) =
+                    self.unnamed_with_several(&client, args.project.as_deref(), args.project_path.as_deref(), "recall_context").await?
+                {
+                    return Ok(Err(several));
+                }
                 let project_id = match self.scope_for(&client, args.project.as_deref(), args.project_path.as_deref(), false).await? {
                     Ok(project_id) => project_id,
                     Err(refusal) => return Ok(Err(refusal)),
@@ -1318,12 +1354,14 @@ impl ClawgMcp {
         agent_id: &str,
         args: ListMemoriesArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(refusal) = kind_refusal(self.speaks(), args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
         let args = &args;
         let result = self
             .call(|client| async move {
                 client
                     .list(ListArgs {
-                        kind: args.kind.clone(),
                         tier: args.tier,
                         memory_type: args.memory_type.clone(),
                         limit: args.limit,
@@ -1350,9 +1388,12 @@ impl ClawgMcp {
         agent_id: &str,
         args: DeleteMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let args = &args;
+        if let Some(refusal) = kind_refusal(self.speaks(), args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
+        let id = args.id;
         let result = self
-            .call(|client| async move { client.delete(&args.kind, args.id, Some(agent_id)).await })
+            .call(|client| async move { client.delete("memory", id, Some(agent_id)).await })
             .await;
         match result {
             Ok(Ok(deleted)) => Self::ok(format_delete(self.speaks(), &deleted)),
@@ -1367,9 +1408,12 @@ impl ClawgMcp {
         agent_id: &str,
         args: RestoreMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let args = &args;
+        if let Some(refusal) = kind_refusal(self.speaks(), args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
+        let id = args.id;
         let result = self
-            .call(|client| async move { client.restore(&args.kind, args.id, Some(agent_id)).await })
+            .call(|client| async move { client.restore("memory", id, Some(agent_id)).await })
             .await;
         match result {
             Ok(Ok(restored)) => Self::ok(format_restore(self.speaks(), &restored)),
@@ -1385,11 +1429,12 @@ impl ClawgMcp {
         agent_id: &str,
         args: ReadMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let args = &args;
+        if let Some(refusal) = kind_refusal(self.speaks(), args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
+        let id = args.id;
         let result = self
-            .call(|client| async move {
-                client.read_save(args.kind.as_deref().unwrap_or("memory"), args.id, Some(agent_id)).await
-            })
+            .call(|client| async move { client.read_save("memory", id, Some(agent_id)).await })
             .await;
         match result {
             // `read_memory` names no project, so a save after it names one of
@@ -1436,6 +1481,9 @@ impl ClawgMcp {
         args: UpdateMemoryArgs,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let lang = self.speaks();
+        if let Some(refusal) = kind_refusal(lang, args.kind.as_deref()) {
+            return Self::failed(refusal);
+        }
         if [args.to_project_path.is_some(), args.to_project.is_some(), args.clear_project].iter().filter(|p| **p).count() > 1 {
             return Self::failed(match lang {
                 Lang::En => "pass one of to_project_path, to_project or clear_project",
@@ -1466,7 +1514,7 @@ impl ClawgMcp {
                 };
                 client
                     .update(
-                        &args.kind,
+                        "memory",
                         args.id,
                         args.importance,
                         args.memory_type.as_deref(),
@@ -1527,12 +1575,14 @@ impl ClawgMcp {
         if let Some(both) = self.one_place(args.project.as_deref(), args.project_path.as_deref(), "project_path") {
             return Self::failed(both);
         }
-        if let Some(several) = self.unnamed_with_several(args.project.as_deref(), args.project_path.as_deref(), "search_project").await {
-            return Self::failed(several);
-        }
         let args = &args;
         let result = self
             .call(|client| async move {
+                if let Some(several) =
+                    self.unnamed_with_several(&client, args.project.as_deref(), args.project_path.as_deref(), "search_project").await?
+                {
+                    return Ok(Err(several));
+                }
                 // A root's docs describe its checkout, so two clones of one
                 // project each search their own; a project named searches
                 // its oldest folder the daemon may read, else its oldest.
@@ -1594,14 +1644,16 @@ impl ClawgMcp {
             return Self::failed(both);
         }
         let all_projects = args.all_projects.unwrap_or(false);
-        if !all_projects {
-            if let Some(several) = self.unnamed_with_several(args.project.as_deref(), args.project_path.as_deref(), "synthesize").await {
-                return Self::failed(several);
-            }
-        }
         let args = &args;
         let result = self
             .call(|client| async move {
+                if !all_projects {
+                    if let Some(several) =
+                        self.unnamed_with_several(&client, args.project.as_deref(), args.project_path.as_deref(), "synthesize").await?
+                    {
+                        return Ok(Err(several));
+                    }
+                }
                 let project_id =
                     match self.scope_for(&client, args.project.as_deref(), args.project_path.as_deref(), all_projects).await? {
                         Ok(project_id) => project_id,
@@ -1624,12 +1676,12 @@ impl ClawgMcp {
     /// The user's answer to a suggestion `recall_context` showed: only a
     /// pending one is answered, and only with their words.
     pub async fn answer_suggestion_impl(&self, args: AnswerSuggestionArgs) -> Result<CallToolResult, rmcp::ErrorData> {
-        if let Some(several) = self.unnamed_with_several(args.project.as_deref(), None, "answer_suggestion").await {
-            return Self::failed(several);
-        }
         let args = &args;
         let result = self
             .call(|client| async move {
+                if let Some(several) = self.unnamed_with_several(&client, args.project.as_deref(), None, "answer_suggestion").await? {
+                    return Ok(Err(several));
+                }
                 // By id too, so the bridge's own project, merged since it
                 // registered, is the live one the suggestion names.
                 let reference = match args.project.clone() {
@@ -1675,13 +1727,15 @@ impl ClawgMcp {
                 // and the user has to learn that a change waits for a new one.
                 let language = format_language(self.language, clawg_core::preferences::language_in(client.base_dir()));
                 // A daemon that predates the pair table has nothing to count,
+                // a folder it cannot register leaves no project to count in,
                 // and a status must not fail over a line it can leave out.
-                let project = match self.one_folder() {
-                    Some(folder) => Some(self.known_id(&folder).await),
-                    None => None,
+                let conflicts = match self.one_project(&client).await {
+                    Ok(one) => {
+                        let project = one.map(|(_, ids)| ids.project);
+                        client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(lang, &open)).ok()
+                    }
+                    Err(_) => None,
                 };
-                let conflicts =
-                    client.open_disputes(&agent_id, project.as_deref()).await.map(|open| format_open_pairs(lang, &open)).ok();
                 Self::ok(format_status(
                     lang,
                     &health,
@@ -1733,13 +1787,15 @@ impl ClawgMcp {
                        finds memories written in other words, but often misses one written in \
                        another language than the query. Returns a \
                        numbered list of the memories close in relevance to the best match (at \
-                       least two), with their ids, kinds and relevance scores; a short list \
+                       least two), with their ids, types and relevance scores; a short list \
                        means the rest scored far lower, not that nothing else is stored. \
                        Content longer than 500 characters is truncated. A hit marked piece=K/N \
                        is the best matching piece K of a long text saved as N pieces; \
                        read_memory with its id returns the whole text. With several folders open \
-                       in the client it searches them all, and each hit names its project after \
-                       project=."
+                       in the client it searches them all, and a hit names its project after \
+                       project=. A hit without project= has no project or comes from an older \
+                       daemon, which does not make it all_projects: when you cannot tell which \
+                       project a save goes to, ask the user."
     )]
     async fn search_memory(
         &self,
@@ -1771,7 +1827,7 @@ impl ClawgMcp {
         description = "Browse what is stored, newest first, without searching. Use this to \
                        show the user their memory inventory or to find an id to delete. Lists \
                        every memory you can read, yours and other agents'; `agent` lists one \
-                       agent's only. Returns one line per row: id, kind, type, tier, importance, \
+                       agent's only. Returns one line per memory: id, type, tier, importance, \
                        access count, status, `by <agent>` when another agent saved it, and a \
                        truncated summary."
     )]
@@ -1801,9 +1857,8 @@ impl ClawgMcp {
 
     #[tool(
         name = "delete_memory",
-        description = "Delete one stored memory by id and kind. Get the id from \
-                       `search_memory`, `list_memories` or `recall_context` first — ids are \
-                       per-kind, so the same number exists in all three tables. A memory marked \
+        description = "Delete one stored memory by id. Get the id from `search_memory`, \
+                       `list_memories` or `recall_context` first. A memory marked \
                        `by <agent>` was saved by another agent, and deleting it takes it from every \
                        agent. Deleting the current memory of a `topic_key` makes the version it \
                        replaced current again. `restore_memory` undoes it."
@@ -1818,8 +1873,8 @@ impl ClawgMcp {
 
     #[tool(
         name = "restore_memory",
-        description = "Undo a `delete_memory`: bring a deleted memory back, with the id and kind \
-                       it was deleted with, when the user says the delete was a mistake. Refused \
+        description = "Undo a `delete_memory`: bring a deleted memory back, with the id it was \
+                       deleted with, when the user says the delete was a mistake. Refused \
                        when the same text was saved again since, when a newer memory holds its \
                        `topic_key`, or when the memory holds a secret. Names the memories saved \
                        meanwhile that are close to it, to judge with `resolve_conflict`."
@@ -1834,9 +1889,9 @@ impl ClawgMcp {
 
     #[tool(
         name = "update_memory",
-        description = "Correct the importance, the type or the project of one stored memory, by id \
-                       and kind, when the user says it matters more or less than it was saved \
-                       with, that it is a different kind of memory, or that it belongs to another \
+        description = "Correct the importance, the type or the project of one stored memory, by id, \
+                       when the user says it matters more or less than it was saved \
+                       with, that it is a different type of memory, or that it belongs to another \
                        project (to_project_path) or to none (clear_project). Pass only what \
                        changes. A memory moves with the rest of its save and topic history, and \
                        does not move where the same text or topic key is live. Taking a \
@@ -3062,7 +3117,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         properties.sort();
-        assert_eq!(properties, ["agent", "kind", "limit", "memory_type", "offset", "tier"]);
+        assert_eq!(properties, ["agent", "limit", "memory_type", "offset", "tier"]);
     }
 
     /// The model has to pick `memory_type` from the set the store recognises;
@@ -3423,15 +3478,20 @@ mod tests {
         assert!(!schema.contains("Defaults to a plain chat message"), "schema: {schema}");
     }
 
-    /// `recall_context` prints `#id` before a `memory` hit's type and names
-    /// any other kind; the tools that take an id still require the kind.
+    /// `memory` is the only kind: a tool that takes an id names where the id
+    /// comes from and asks for no kind.
     #[tokio::test]
-    async fn memory_id_docs_name_recall_context_and_the_default_kind() {
+    async fn memory_id_docs_name_recall_context_and_no_kind() {
         let (b, _d) = bridge().await;
+        for name in ["delete_memory", "update_memory", "restore_memory", "read_memory", "list_memories"] {
+            let schema = serde_json::to_string(&tool(&b, name).input_schema).expect("schema");
+            assert!(!schema.contains("kind") && !schema.contains("table"), "{name} schema: {schema}");
+            let d = description(&b, name);
+            assert!(!d.contains(" kind") && !d.contains("table"), "{name} description: {d}");
+        }
         for name in ["delete_memory", "update_memory"] {
-            let schema = serde_json::to_string(&tool(&b, name).input_schema).expect("schema").replace("\\n", " ");
+            let schema = serde_json::to_string(&tool(&b, name).input_schema).expect("schema");
             assert!(schema.contains("recall_context"), "{name} schema: {schema}");
-            assert!(schema.contains("no kind in front of its type is a memory"), "{name} schema: {schema}");
         }
         let d = description(&b, "delete_memory");
         assert!(d.contains("recall_context"), "description: {d}");
@@ -3568,7 +3628,7 @@ mod tests {
         assert!(text(&found).contains(content), "text was: {}", text(&found));
 
         let deleted = b
-            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id, kind: None })
             .await
             .expect("delete");
         assert!(!is_error(&deleted), "delete failed: {}", text(&deleted));
@@ -3878,7 +3938,7 @@ mod tests {
         let status = text(&b.memory_status_impl(b.agent_for(None)).await.expect("status"));
         assert!(status.contains("\nperfil: dev\n") && status.contains("compartido: lee y cambia"), "{status}");
         let moved = UpdateMemoryArgs {
-            kind: "memory".into(),
+            kind: None,
             id: 1,
             importance: None,
             memory_type: None,
@@ -3967,7 +4027,7 @@ mod tests {
     async fn deleting_a_missing_row_is_an_error_result_the_model_can_read() {
         let (b, _d) = bridge().await;
         let r = b
-            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 999_999, kind: "memory".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 999_999, kind: None })
             .await
             .expect("the call itself must succeed");
         assert!(is_error(&r), "a failed delete must be marked as an error");
@@ -4177,6 +4237,9 @@ mod tests {
         assert!(!here.contains("topic="), "{here}");
         let there = text(&search(Some(other.root.display().to_string())).await.unwrap());
         assert!(there.contains(" topic=style/indent]"), "{there}");
+        let by_id = SearchMemoryArgs { query: content.into(), limit: None, project_path: None, project: Some(other.id.clone()), all_projects: None };
+        let named = text(&b.search_memory_impl("a", by_id).await.unwrap());
+        assert!(named.contains(" topic=style/indent]"), "a search that names the project, not an open folder: {named}");
 
         let again = b.save_here("a", preference("Indent with two spaces", None)).await.unwrap();
         assert!(!text(&again).contains("replaces"), "{}", text(&again));
@@ -4266,11 +4329,31 @@ mod tests {
     async fn an_unknown_kind_is_reported_as_a_readable_error() {
         let (b, _d) = bridge().await;
         let r = b
-            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 1, kind: "bogus".into() })
+            .delete_memory_impl("agent-mcp", DeleteMemoryArgs { id: 1, kind: Some("bogus".into()) })
             .await
             .expect("call");
         assert!(is_error(&r));
         assert!(text(&r).contains("bogus"), "text was: {}", text(&r));
+    }
+
+    /// The daemon, not running here, would act on the row of `memory` with
+    /// the id a retired kind came with.
+    #[tokio::test]
+    async fn a_retired_kind_is_answered_without_calling_the_daemon() {
+        let b = dead_bridge();
+        let (episodic, procedural) = (Some("episodic".to_string()), Some("procedural".to_string()));
+        let answers = [
+            b.delete_memory_impl("a", DeleteMemoryArgs { id: 7, kind: episodic.clone() }).await,
+            b.restore_memory_impl("a", RestoreMemoryArgs { id: 7, kind: procedural.clone() }).await,
+            b.read_memory_impl("a", ReadMemoryArgs { id: 7, kind: episodic.clone() }).await,
+            b.update_memory_impl("a", UpdateMemoryArgs { kind: procedural, ..update_args(7, Some(2.0), None) }).await,
+            b.list_memories_impl("a", ListMemoriesArgs { kind: episodic, ..list_all() }).await,
+        ];
+        for answer in answers {
+            let answer = answer.expect("call");
+            assert!(is_error(&answer));
+            assert!(text(&answer).ends_with("find them with search_memory"), "{}", text(&answer));
+        }
     }
 
     /// The failure a user actually hits: the daemon died, or never started.
@@ -4314,7 +4397,7 @@ mod tests {
 
         hide(&d, "agent-b", "agent-a");
         let r = b
-            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: None })
             .await
             .expect("call");
         assert!(is_error(&r), "a hidden author's memory must not be deletable: {}", text(&r));
@@ -4323,7 +4406,7 @@ mod tests {
 
         share_all(&d);
         let r = b
-            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: "memory".into() })
+            .delete_memory_impl("agent-b", DeleteMemoryArgs { id, kind: None })
             .await
             .expect("call");
         assert!(!is_error(&r), "another agent deletes what it reaches: {}", text(&r));
@@ -4332,7 +4415,7 @@ mod tests {
     }
 
     fn restore_args(id: i64) -> RestoreMemoryArgs {
-        RestoreMemoryArgs { id, kind: "memory".into() }
+        RestoreMemoryArgs { id, kind: None }
     }
 
     #[tokio::test]
@@ -4341,7 +4424,7 @@ mod tests {
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
 
-        let deleted = b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        let deleted = b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: None }).await.expect("call");
         assert!(text(&deleted).contains("restore_memory"), "the delete says how to undo it: {}", text(&deleted));
         assert!(!text(&b.list_memories_impl("agent-a", list_all()).await.expect("list")).contains(content));
 
@@ -4360,7 +4443,7 @@ mod tests {
         let (b, d) = bridge().await;
         let content = "agent a keeps its release notes in the wiki";
         let id = saved_id(&b, "agent-a", content).await;
-        b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        b.delete_memory_impl("agent-a", DeleteMemoryArgs { id, kind: None }).await.expect("call");
 
         hide(&d, "agent-b", "agent-a");
         let r = b.restore_memory_impl("agent-b", restore_args(id)).await.expect("call");
@@ -4442,7 +4525,7 @@ mod tests {
     fn update_args(id: i64, importance: Option<f64>, memory_type: Option<&str>) -> UpdateMemoryArgs {
         UpdateMemoryArgs {
             id,
-            kind: "memory".into(),
+            kind: None,
             importance,
             memory_type: memory_type.map(Into::into),
             to_project_path: None,
@@ -4829,7 +4912,7 @@ mod tests {
         let listed = text(&b.list_memories_impl("claude-code", list_all()).await.expect("list"));
         assert!(listed.contains("imp=9.5") && listed.contains(&format!("#{id} ")), "its author sees the change: {listed}");
 
-        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: "memory".into() }).await.expect("call");
+        let r = b.delete_memory_impl("cursor", DeleteMemoryArgs { id, kind: None }).await.expect("call");
         assert!(!is_error(&r), "and deletes it: {}", text(&r));
         assert!(!text(&b.search_memory_impl("cursor", search_args(content)).await.expect("search")).contains(content));
     }
@@ -5442,12 +5525,17 @@ mod tests {
     /// Saves [`DEPLOY`] straight to the daemon in `project`, as another
     /// session would have, and returns its id.
     async fn seed_in(b: &ClawgMcp, project: &ProjectIdentity) -> i64 {
+        seed_under(b, &project.id).await
+    }
+
+    /// [`seed_in`] by the project's id.
+    async fn seed_under(b: &ClawgMcp, project_id: &str) -> i64 {
         let client = b.client.get().await.expect("daemon");
         let saved = client
             .save(SaveArgs {
                 content: DEPLOY.into(),
                 agent_id: "a".into(),
-                project_id: Some(project.id.clone()),
+                project_id: Some(project_id.to_string()),
                 memory_type: None,
                 importance: None,
                 derived_from: Vec::new(),
@@ -5514,6 +5602,20 @@ mod tests {
         let es = bridge().await.0.with_language(Some(Lang::Es));
         let refused = text(&es.save_memory_impl("a", save_args("el deploy corre los viernes")).await.unwrap());
         assert!(refused.starts_with("no se guardó: ") && refused.contains("project_path"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_save_with_a_blank_project_names_no_project() {
+        let (b, _d) = bridge().await;
+
+        for blank in ["", "   "] {
+            let refused =
+                b.save_memory_impl("a", SaveMemoryArgs { project: Some(blank.into()), ..save_args("the deploy runs on fridays") }).await.unwrap();
+
+            let out = text(&refused);
+            assert!(is_error(&refused) && out.starts_with("not saved: say which project"), "{blank:?}: {out}");
+        }
+        assert_eq!(memory_rows(&b).await, 0);
     }
 
     #[tokio::test]
@@ -5653,6 +5755,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_open_subfolders_of_one_repository_are_each_its_own_project() {
+        let (_repo, mono) = monorepo();
+        let (b, _d) = bridge().await;
+        let web = declare_web(&b, &mono).await;
+        let m = project_of_root(&b, &mono).await;
+        let (web_dir, webapp_dir) = (mono.join("apps").join("web"), mono.join("apps").join("webapp"));
+        let ids = [seed_under(&b, &web).await, seed_under(&b, &m).await];
+        let open = b.with_roots(vec![web_dir.clone(), webapp_dir.clone()]);
+
+        let found = text(&open.search_memory_impl("a", search_args(DEPLOY)).await.unwrap());
+        let recall = RecallContextArgs { query: "deploys".into(), project_path: None, project: None, budget: None };
+        let refused = open.recall_context_impl("a", recall).await.unwrap();
+
+        assert!(shows(&found, ids[0]) && shows(&found, ids[1]), "both projects are searched: {found}");
+        assert!(found.contains(&format!(" project={web}]")) && found.contains(&format!(" project={m}]")), "{found}");
+        assert!(is_error(&refused), "{}", text(&refused));
+        for named in [web_dir.display().to_string(), webapp_dir.display().to_string()] {
+            assert!(text(&refused).contains(&named), "{named} in {}", text(&refused));
+        }
+    }
+
+    #[tokio::test]
+    async fn two_open_folders_of_one_project_count_once() {
+        let (_repo, mono) = monorepo();
+        let (b, _d) = bridge().await;
+        let id = seed_under(&b, &project_of_root(&b, &mono).await).await;
+        let open = b.with_roots(vec![mono.clone(), mono.join("apps").join("webapp")]);
+
+        let found = text(&open.search_memory_impl("a", search_args(DEPLOY)).await.unwrap());
+        let recall = RecallContextArgs { query: "deploys".into(), project_path: None, project: None, budget: None };
+        let recalled = open.recall_context_impl("a", recall).await.unwrap();
+
+        assert!(shows(&found, id) && !found.contains("project="), "one project names none: {found}");
+        assert!(!is_error(&recalled), "{}", text(&recalled));
+    }
+
+    #[tokio::test]
     async fn read_memory_shows_the_key_of_a_row_in_any_open_folder() {
         let (_dir, alpha, beta, _gamma) = three_checkouts();
         let (b, _d) = bridge().await;
@@ -5684,6 +5823,22 @@ mod tests {
     async fn a_root_the_client_declares_is_indexed_like_the_directory() {
         let (_dir, alpha, _beta, _gamma) = three_checkouts();
         let (b, _d, store) = bridge_with_store(test_project()).await;
+
+        b.with_roots(folders(&[&alpha])).search_memory_impl("a", search_args(DEPLOY)).await.unwrap();
+
+        assert_eq!(index_docs_of(&store, &alpha.id).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_folder_named_before_it_was_open_is_indexed_once_open() {
+        let (_dir, alpha, _beta, _gamma) = three_checkouts();
+        let (b, _d, store) = bridge_with_store(test_project()).await;
+        let saved = b
+            .save_memory_impl("a", SaveMemoryArgs { project_path: Some(alpha.root.display().to_string()), ..save_args(DEPLOY) })
+            .await
+            .unwrap();
+        assert!(!is_error(&saved), "{}", text(&saved));
+        assert_eq!(index_docs_of(&store, &alpha.id).await, Some(0), "a folder that is not open is only a label");
 
         b.with_roots(folders(&[&alpha])).search_memory_impl("a", search_args(DEPLOY)).await.unwrap();
 

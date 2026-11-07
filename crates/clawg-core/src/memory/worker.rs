@@ -2505,7 +2505,7 @@ mod tests {
             .unwrap();
         assert_eq!(warned_pairs(&store).await, vec![(new, older)], "after a verdict");
 
-        crate::memory::admin::delete_memory_core(&store, new, crate::memory::admin::MemoryKind::Memory, None)
+        crate::memory::admin::delete_memory_core(&store, new, None)
             .await
             .unwrap();
         assert_eq!(warned_pairs(&store).await, vec![(new, older)], "after a delete");
@@ -2996,13 +2996,12 @@ mod tests {
         let wm = crate::memory::workspace::WorkspaceManager::new(tmp.path().join("workspaces"));
         let reach = crate::memory::sharing::Reach::Own;
         let before = wm.regenerate_auto_section("agent-test", None, &reach, &store).await.unwrap();
-        use crate::memory::record::TableKind;
-        assert!(!before.contains(TableKind::Memory, id), "inferred, and at importance 5");
+        assert!(!before.contains(id), "inferred, and at importance 5");
 
         process_with(embedder(), &store, &preference(true, Some(9.0), 2)).await;
 
         let after = wm.regenerate_auto_section("agent-test", None, &reach, &store).await.unwrap();
-        assert!(after.contains(TableKind::Memory, id), "what the user said opens every session");
+        assert!(after.contains(id), "what the user said opens every session");
     }
 
     /// The dedup check runs before the embedding and the contradiction probe,

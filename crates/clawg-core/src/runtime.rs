@@ -32,7 +32,7 @@ use crate::memory::embedder::Embedder;
 use crate::memory::events::MemoryEvent;
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::maintenance::{run_maintenance_loop, MAINTENANCE_PERIOD, STARTUP_DELAY};
-use crate::memory::admin::{delete_memory_core, MemoryKind};
+use crate::memory::admin::delete_memory_core;
 use crate::memory::outbox::{OutboxActionError, OutboxState, Recorded};
 use crate::memory::redact::{redact, SecretKind};
 use crate::memory::project_docs::DocIndex;
@@ -296,7 +296,7 @@ impl MemoryRuntime {
         let failed = self.store.outbox_find_failed(operation_id, agent).await?;
         let mut deleted = Vec::new();
         for id in failed.inserted() {
-            if delete_memory_core(&self.store, id, MemoryKind::Memory, None).await?.deleted == 1 {
+            if delete_memory_core(&self.store, id, None).await?.deleted == 1 {
                 deleted.push(id);
             }
         }

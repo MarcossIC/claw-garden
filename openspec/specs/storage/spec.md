@@ -27,6 +27,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [import-job](../../changes/archive/2026-10-30-import-job/proposal.md), archivado el 2026-10-30, que sale en 0.68.0 (sólo IJ18: el apagado con un trabajo de importación activo, que cambia «Cada fase del apagado tiene tope»). Qué es un trabajo de importación está en [`specs/portability`](../portability/spec.md) (IJ1 a IJ11).
 - [docs-index-speed](../../changes/archive/2026-11-01-docs-index-speed/proposal.md), archivado el 2026-11-01, que sale en 0.73.0 (sólo IS4: el caso de `e5_golden` con el orden en que el refresco de docs entrega los textos, en «Los mismos vectores que fastembed»). El orden y la cola están en [`specs/project-docs`](../project-docs/spec.md), «La cola del refresco».
 - [embedder-footprint](../../changes/archive/2026-11-03-embedder-footprint/proposal.md), archivado el 2026-11-03, cuyo código salió en 0.71.0 (sólo EF1: los hilos de la sesión, con su respaldo, en «Los mismos vectores que fastembed»).
+- [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (V32 y su vuelta atrás, RL1, y «Nadie más lee las tablas», RL4, en «Las tablas que retira V32»; el KNN único está en [`specs/retrieval`](../retrieval/spec.md), RL4, y los diarios de proyectos en [`specs/project`](../project/spec.md), RL2). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
 
 ## Definiciones
 
@@ -347,7 +348,7 @@ Las migraciones pendientes de un arranque MUST aplicarse en una sola transacció
 
 ### Checksums fijados
 
-Los checksums de las migraciones publicadas (hoy V1–V31) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
+Los checksums de las migraciones publicadas (hoy V1–V32) MUST coincidir con una lista fija en el código (`PINNED`, `crates/clawg-core/src/memory/migrations.rs:44`). Cambiar una migración publicada MUST romper un test. Una migración nueva agrega su fila a la lista en el mismo commit.
 
 **Test:** `published_migration_checksums_are_pinned` (`migrations.rs`).
 
@@ -482,7 +483,7 @@ Un binario anterior a V25 MUST NOT abrir una base en V25: la rechaza sin tocarla
 La decisión es pura (`schema_plan`, `backup.rs:93`). `MemoryStore::open` MUST calcularla antes de cualquier pragma y antes del runner (`check_schema`, `crates/clawg-core/src/memory/db.rs:432`, llamada en `db.rs:200`). Con `Newer` o `Diverged`, `open` MUST devolver `MemoryError::SchemaNewer` o `MemoryError::SchemaDiverged` (`crates/clawg-core/src/memory/error.rs:58` y `:64`) y MUST NOT escribir nada en `memory.db`. Los mensajes MUST decir las versiones, que nada cambió, y qué hacer: instalar la versión que la escribió o `clawg restore` de un backup anterior.
 
 #### Escenario: base más nueva
-- GIVEN una base en la última versión del binario, N (hoy V31), con una fila N + 1 agregada en `refinery_schema_history`
+- GIVEN una base en la última versión del binario, N (hoy V32), con una fila N + 1 agregada en `refinery_schema_history`
 - WHEN se abre
 - THEN el error es `SchemaNewer { db: N + 1, binary: N }`, nombra `clawg restore`, y `memory.db` es byte a byte igual
 
@@ -529,8 +530,8 @@ Un test MUST fijar juntos `E5_MODEL_ID` (`embedder.rs:135`), los dos prefijos (`
 Al arrancar, después de cargar el modelo y dentro del bootstrap del embedder, el daemon verifica el contrato (`verify_or_reembed`, `crates/clawg-core/src/memory/bootstrap.rs:550`, cableado por `contract_verifier`, `bootstrap.rs:259`, en `production_deps`, `bootstrap.rs:289`, que `serve_deps`, `bootstrap.rs:414`, entrega al daemon en `crates/clawg-cli/src/daemon/serve.rs:133`). Si el contrato guardado tiene `LEGACY_CLS_MODEL_ID` y el embedder cargado tiene `E5_MODEL_ID`, con la misma dimensión y los mismos prefijos (`is_pooling_upgrade`, `bootstrap.rs:536`, pura), MUST:
 
 1. escribir un snapshot `pre-reembed` en `<data>/backups`; si falla, no re-embebe, y el intento termina como un fallo de verificación, que se reintenta con la espera de siempre ([`specs/ingest`](../ingest/spec.md), «Reintento del bootstrap»);
-2. re-embeber `memory`, `episodic_trajectory` y `procedural_skill` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:507`);
-3. habilitar la memoria sólo si las tres tablas terminaron sin fallas, que es cuando `reembed_all` escribe el contrato nuevo. Si no, el contrato queda como estaba, la memoria sigue deshabilitada y el estado es el de un contrato que no coincide: ese bootstrap no se reintenta, pero el próximo arranque vuelve a empezar, y las filas ya hechas dan los mismos bytes.
+2. re-embeber `memory` con el embedder cargado (`reembed_all` en modo `ReInfer`, `crates/clawg-core/src/memory/maintenance.rs:507`; desde V32 es la única tabla, RL4);
+3. habilitar la memoria sólo si el re-embebido terminó sin fallas, que es cuando `reembed_all` escribe el contrato nuevo. Si no, el contrato queda como estaba, la memoria sigue deshabilitada y el estado es el de un contrato que no coincide: ese bootstrap no se reintenta, pero el próximo arranque vuelve a empezar, y las filas ya hechas dan los mismos bytes.
 
 Mientras el snapshot y el re-embebido corren, el estado del embedder MUST ser `loading`: el bootstrap publica `loading` antes de empezar y `ready` sólo cuando el embedder entró a su celda. Un save de ese lapso espera en la cola como con cualquier carga ([`specs/ingest`](../ingest/spec.md), «Embedder cargando»).
 
@@ -1170,7 +1171,7 @@ V28 (`crates/clawg-core/migrations/V28__project_merge.sql`) MUST:
 - crear `project_merge` (`merge_id` clave primaria, `source`, `target`, `move_id`, `snapshot`, `merged_at`, `undone_at`, `undo_move_id`), una fila por unión;
 - crear `project_merge_change` (`merge_id`, `kind`, `a`, `b`), con el índice `idx_project_merge_change` por `merge_id` y sin `CHECK` sobre `kind`, como aprendió V26: un `CHECK` no se amplía sin reconstruir la tabla.
 
-MUST NOT cambiar ninguna fila. Las filas de `memory` de una unión van en `memory_move` y `memory_move_supersede` bajo su `move_id`; el resto, con lo que había antes, en `project_merge_change` (`tombstoned`, `trajectory`, `skill`, `review`, `review_target`, `folder`, `remote`, `tombstone`, `suggestion`, `reviewed`, `workspace`). Su checksum MUST quedar fijado con los demás. Una unión escribe antes el snapshot `pre-merge` (`Reason::PreMerge`) y su deshacer, `pre-undo`; la poda conserva el más nuevo de cada uno.
+MUST NOT cambiar ninguna fila. Las filas de `memory` de una unión van en `memory_move` y `memory_move_supersede` bajo su `move_id`; el resto, con lo que había antes, en `project_merge_change` (`tombstoned`, `review`, `review_target`, `folder`, `remote`, `tombstone`, `suggestion`, `reviewed`, `workspace`; `trajectory` y `skill` se escribieron hasta V32, que las retira, [RL2](../project/spec.md#rl2-los-diarios-de-proyectos-nombran-las-filas-migradas)). Su checksum MUST quedar fijado con los demás. Una unión escribe antes el snapshot `pre-merge` (`Reason::PreMerge`) y su deshacer, `pre-undo`; la poda conserva el más nuevo de cada uno.
 
 #### Escenario: un store anterior
 - GIVEN un store en V27 con proyectos, carpetas, remotos, sugerencias, revisiones de `synthesize` y filas en las tres tablas
@@ -1282,3 +1283,32 @@ V22 (`crates/clawg-core/migrations/V22__memory_lang.sql`) MUST agregar a `memory
 #### Vuelta atrás de V22
 
 Un binario anterior a V22 MUST NOT abrir una base en V22: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`, que `clawg update` restaura sola si el binario viejo se niega ([`specs/self-update`](../self-update/spec.md)). Quitar V22 a mano no pierde ninguna fila: `DROP INDEX idx_memory_lang; DROP INDEX idx_memory_lang_unset; ALTER TABLE memory DROP COLUMN lang; DELETE FROM refinery_schema_history WHERE version = 22;` (SQLite no borra una columna indexada).
+
+## Las tablas que retira V32
+
+### RL1. V32
+
+V32 (`crates/clawg-core/migrations/V32__retire_legacy_kinds.sql`) MUST escribir, por cada fila de `episodic_trajectory` o `procedural_skill`, viva o borrada, una fila migrada en `memory`, con un id nuevo mayor que todo id que `memory` haya dado, `memory_type = 'semantic_fact'` y `source` igual al nombre de su tabla. Cada columna de la fila vieja MUST quedar en la columna de `memory` del mismo nombre, en `source_session_id` (`session_id` de una trayectoria) o en una línea del texto, y `content_hash` MUST ser el hash del texto, como lo calcula un save.
+
+Una fila viva MUST quedar con el vector de su tabla, si tenía, y en el índice de texto. Una borrada MUST quedar con su `deleted_at`, sin vector y fuera del índice de texto.
+
+`superseded_by`, cada id de `disputed_against` y cada id de `source_trajectory_ids` MUST nombrar el id nuevo de la fila a la que apuntaban; uno que no nombra ninguna fila de su tabla MUST quitarse. Una fila migrada `superseded` con reemplazante MUST tener `supersede_cause = 'verdict'`, y cada id que una disputada nombra MUST ser un par `escalated`, como V17 y V15 hicieron con las filas de `memory`.
+
+`legacy_kind_move` MUST tener una fila `(tbl, old_id, new_id)` por cada fila migrada. Después MUST NOT quedar `episodic_trajectory`, `procedural_skill`, `episodic_vectors`, `procedural_vectors` ni sus tablas sombra. Ninguna fila de `memory` que ya estaba, y ningún proyecto, MUST cambiar.
+
+#### Escenario: base de la versión anterior
+- GIVEN una base en V31 con una fila de `memory`, una trayectoria viva con vector, una reemplazada por otra, una borrada, una habilidad viva disputada contra otra que cita dos trayectorias, una de ellas inexistente, y un proyecto borrado
+- WHEN se abre con la versión nueva
+- THEN cada fila vieja está en `memory` como dice RL1, una búsqueda encuentra cada fila viva por su texto y por su vector, la borrada no aparece, el índice de texto tiene exactamente las filas vivas, la fila de `memory` y el proyecto borrado siguen igual, y no queda ninguna de las cuatro tablas
+
+**Test:** `trajectories_and_skills_move_to_memory_and_their_tables_go` (`crates/clawg-core/src/memory/migrations.rs`); el checksum de V32 en `published_migration_checksums_are_pinned`.
+
+#### Vuelta atrás de V32
+
+Un binario anterior a V32 MUST NOT abrir una base en V32: la rechaza sin tocarla con `SchemaNewer`, y la vuelta atrás es la copia `pre-migration`, que `clawg update` restaura sola si el binario viejo se niega ([`specs/self-update`](../self-update/spec.md)).
+
+### RL4. Nadie más lee las tablas
+
+Ningún archivo de `crates/*/src` MUST nombrar `episodic_trajectory`, `procedural_skill`, `episodic_vectors` ni `procedural_vectors` fuera de sus tests, salvo `portability/export.rs`, que cuenta las filas viejas de una base que todavía no migró ([`specs/portability`](../portability/spec.md), RL9). Mantenimiento, el registro, la unión, el borrado, la purga y la deshechura de proyectos e importaciones, `inspect` y el espacio de trabajo MUST leer y escribir sólo `memory`. `TableKind` y `MemoryKind` MUST NOT existir. La búsqueda, con un solo KNN, está en [`specs/retrieval`](../retrieval/spec.md), RL4.
+
+**Test:** `no_production_code_names_the_retired_tables` (`crates/clawg-cli/tests/conventions.rs`).

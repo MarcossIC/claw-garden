@@ -115,10 +115,11 @@ An unknown type is refused, and the error lists these seven.
 
 `importance` goes from 0 to 10 and defaults to 5. Leave it at 5 unless the
 memory matters more or less than usual. A `user_preference` at 8 or more that
-the user stated, saved with `user_stated`, is printed at the top of every
+the user stated, saved with `user_stated`, is printed at the top of the
 `recall_context` of its project, or of every project with `all_projects`, for
-every agent that reads it; one they did not state is found by search, marked
-inferred, imported or conclusion. An `architectural_decision` at 9 or more is
+every agent that reads it, only while it stays in tier 1; one the budget leaves
+out is named by id at the end. One they did not state is found by search,
+marked inferred, imported or conclusion. An `architectural_decision` at 9 or more is
 printed at the top of every `recall_context` of its project. At 9 or more a
 memory is never demoted for not being used. `update_memory` corrects the type or the importance later.
 When the user says a memory belongs to another project, or to none, `update_memory`

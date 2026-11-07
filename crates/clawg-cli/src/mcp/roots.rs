@@ -2,8 +2,8 @@
 //!
 //! A host does not say where the user works by the directory it starts the
 //! bridge in: Cursor starts it in the home directory whatever its windows
-//! hold. What it does answer is `roots/list`, with the folders of every
-//! window open at that moment, and it never notifies a change. So a call that
+//! hold. What it does answer is `roots/list`, with the folders its window
+//! has open at that moment, and it never notifies a change. So a call that
 //! names no project reads the roots the client gives in that call, and only a
 //! client that gives none falls back on the bridge's own directory.
 
@@ -113,10 +113,11 @@ fn percent_decode(text: &str) -> Option<String> {
 }
 
 /// The folders a call that names no project reads: the client's `roots`,
-/// resolved as a `project_path` is, in their order and once each root; when
-/// none is left, the project of the directory the bridge started in. A
-/// folder that is `home`, or whose root is, is never one of them, from
-/// either side.
+/// resolved as a `project_path` is, in their order and once each folder;
+/// when none is left, the project of the directory the bridge started in.
+/// Two folders of one root both stay, since a declared subfolder leads to a
+/// project of its own and only the daemon tells which do. A folder that is
+/// `home`, or whose root is, is never one of them, from either side.
 pub fn open_folders(
     roots: &[PathBuf],
     start: Option<&ProjectIdentity>,
@@ -126,7 +127,7 @@ pub fn open_folders(
     let not_home = |project: &ProjectIdentity| home.is_none_or(|home| project.root != home && project.path != home);
     let mut folders: Vec<ProjectIdentity> = Vec::new();
     for project in roots.iter().map(|root| resolve(root)).filter(not_home) {
-        if !folders.iter().any(|f| f.root == project.root) {
+        if !folders.iter().any(|f| f.path == project.path) {
             folders.push(project);
         }
     }
@@ -229,12 +230,20 @@ mod tests {
         folders.iter().map(|f| f.root.to_str().expect("utf-8")).collect()
     }
 
+    fn paths(folders: &[ProjectIdentity]) -> Vec<&str> {
+        folders.iter().map(|f| f.path.to_str().expect("utf-8")).collect()
+    }
+
+    /// Two folders of one root both stay: a declared subfolder leads to a
+    /// project of its own, which only the daemon can tell.
     #[test]
     fn the_open_folders_are_the_roots_else_the_directory() {
         let start = at("/start");
-        let declared = [PathBuf::from("/work/b"), PathBuf::from("/work/a"), PathBuf::from("/work/a/src")];
+        let declared = [PathBuf::from("/work/b"), PathBuf::from("/work/a"), PathBuf::from("/work/a/src"), PathBuf::from("/work/a")];
 
-        assert_eq!(roots(&open_folders(&declared, Some(&start), None, resolve)), ["/work/b", "/work/a"], "in their order, once each root");
+        let open = open_folders(&declared, Some(&start), None, resolve);
+        assert_eq!(paths(&open), ["/work/b", "/work/a", "/work/a/src"], "in their order, once each folder");
+        assert_eq!(roots(&open), ["/work/b", "/work/a", "/work/a"]);
         assert_eq!(roots(&open_folders(&[], Some(&start), None, resolve)), ["/start"]);
         assert!(open_folders(&[], None, None, resolve).is_empty());
     }

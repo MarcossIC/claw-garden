@@ -1,0 +1,16 @@
+change: bridge-project-identity
+objective: "2, 4"
+depends_on: []
+phase: archived
+release: "0.78.0"  # todo su código está en v0.78.0 (#135); al archivarlo la versión sube a 0.79.0 (verify.md, «Al archivar»)
+artifacts:
+  exploration: done  # con el resultado de la prueba con Cursor
+  proposal: done  # las tres decisiones de la exploración y la tabla de las otras herramientas que leen
+  spec: done  # BI1 a BI10; al archivar, BI1 a BI5 y BI7 a BI10 van a specs/mcp y BI6 a specs/retrieval, y cambian specs/project R3 y R6 y specs/project-docs
+  design: skipped  # las decisiones se cerraron en la exploración y la propuesta
+  tasks: done
+  apply: done  # un commit por paso, con sus tests en rojo antes
+  verify: done  # Linux y el CI de #134 y #135 en Linux y Windows; con Cursor 3.29.9, los puntos 1 a 3, el 2 con cada ventana leyendo sus carpetas; Claude Code queda para el piloto (verify.md)
+  archive: done
+main_spec: openspec/specs/mcp/spec.md, openspec/specs/retrieval/spec.md, openspec/specs/project/spec.md, openspec/specs/project-docs/spec.md
+updated: 2026-11-07

@@ -750,7 +750,7 @@ mod tests {
 
         let after = conn.call(snapshot).await.unwrap();
         assert_eq!(before, after);
-        assert_eq!(after.0, 31);
+        assert_eq!(after.0, 32);
     }
 
     /// Rows written before `project` existed keep their project ids when the
@@ -780,30 +780,13 @@ mod tests {
                     rusqlite::params![agent, project],
                 )?;
             }
-            c.execute(
-                "INSERT INTO episodic_trajectory \
-                 (scope, agent_id, project_id, session_id, task, created_at, \
-                  last_modified_at, last_accessed_at) \
-                 VALUES ('agent', 'a', 'repo-1a2b', 's', 't', 0, 0, 0)",
-                [],
-            )?;
-            c.execute(
-                "INSERT INTO procedural_skill \
-                 (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                  source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
-                 VALUES ('agent', 'a', 'src-3c4d', 'k', 't', 0, '[]', 0, 0, 0)",
-                [],
-            )?;
             Ok::<_, rusqlite::Error>(())
         })
         .await
         .unwrap();
 
         let project_ids = |c: &mut rusqlite::Connection| -> Result<Vec<Option<String>>, rusqlite::Error> {
-            let mut stmt = c.prepare(
-                "SELECT project_id FROM memory UNION ALL SELECT project_id FROM episodic_trajectory \
-                 UNION ALL SELECT project_id FROM procedural_skill",
-            )?;
+            let mut stmt = c.prepare("SELECT project_id FROM memory")?;
             let ids = stmt.query_map([], |r| r.get(0))?.collect();
             ids
         };
@@ -850,20 +833,6 @@ mod tests {
                   1, 'user', 'a', 1, 1, 7.0, 1, 'active')",
                 [],
             )?;
-            c.execute(
-                "INSERT INTO episodic_trajectory \
-                 (scope, agent_id, project_id, session_id, task, created_at, \
-                  last_modified_at, last_accessed_at) \
-                 VALUES ('agent', 'a', 'p', 's', 'fix the bug', 2, 2, 2)",
-                [],
-            )?;
-            c.execute(
-                "INSERT INTO procedural_skill \
-                 (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                  source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
-                 VALUES ('agent', 'a', 'p', 'Fix login flow', 'when login fails', 3, '[1]', 3, 3, 3)",
-                [],
-            )?;
             Ok::<_, rusqlite::Error>(())
         })
         .await
@@ -871,9 +840,7 @@ mod tests {
 
         let rows = |c: &mut rusqlite::Connection| -> Result<Vec<String>, rusqlite::Error> {
             let mut stmt = c.prepare(
-                "SELECT json_array(id, content, memory_type, tier, importance, status) FROM memory \
-                 UNION ALL SELECT json_array(id, task, tier, status) FROM episodic_trajectory \
-                 UNION ALL SELECT json_array(id, skill_name, trigger, tier, status) FROM procedural_skill",
+                "SELECT json_array(id, content, memory_type, tier, importance, status) FROM memory",
             )?;
             let rows = stmt.query_map([], |r| r.get(0))?.collect();
             rows
@@ -1890,8 +1857,6 @@ mod tests {
             let mut out = Vec::new();
             for sql in [
                 "SELECT * FROM memory ORDER BY id",
-                "SELECT * FROM episodic_trajectory ORDER BY id",
-                "SELECT * FROM procedural_skill ORDER BY id",
                 "SELECT * FROM project_remote ORDER BY remote",
             ] {
                 let mut stmt = c.prepare(sql)?;
@@ -1934,14 +1899,7 @@ mod tests {
                     )?;
                 }
                 c.execute_batch(
-                    "INSERT INTO episodic_trajectory \
-                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
-                      VALUES ('agent', 'a', 'traj-2b3c', 's', 't', 60, 60, 60);
-                     INSERT INTO procedural_skill \
-                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
-                      VALUES ('agent', 'a', 'skill-3c4d', 'k', 't', 70, '[]', 70, 70, 70);
-                     INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('a', 'old-9f9f', 1);
+                    "INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('a', 'old-9f9f', 1);
                      INSERT INTO memory_import_extra (import_id, kind, a, b, value) VALUES (1, 'project', NULL, 'old-9f9f', NULL);",
                 )?;
                 c.execute(
@@ -1981,7 +1939,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(folders_after, folders_before, "every folder keeps its values");
-        assert_eq!(rows_after, rows_before, "no row of the three tables or of project_remote changes");
+        assert_eq!(rows_after, rows_before, "no row of memory or of project_remote changes");
 
         let migrated = |id: &str, name: &str, created: i64| (id.to_string(), name.to_string(), "migrated".to_string(), 1, created);
         let mut expected = vec![
@@ -1993,8 +1951,6 @@ mod tests {
             migrated(&fused, "fused", 5),
             migrated("loose-1a2b", "loose", 7),
             migrated("p", "p", 109),
-            migrated("traj-2b3c", "traj", 60),
-            migrated("skill-3c4d", "skill", 70),
         ];
         expected.sort();
         assert_eq!(projects, expected, "no project for the clone's folder or for an id only the history names");
@@ -2046,8 +2002,6 @@ mod tests {
             let mut out = Vec::new();
             for sql in [
                 "SELECT * FROM memory ORDER BY id",
-                "SELECT * FROM episodic_trajectory ORDER BY id",
-                "SELECT * FROM procedural_skill ORDER BY id",
                 "SELECT id, name, born, reviewed, created_at FROM project ORDER BY id",
                 "SELECT * FROM project_path ORDER BY id",
                 "SELECT * FROM project_remote ORDER BY remote",
@@ -2072,14 +2026,7 @@ mod tests {
                        ('copia-85a9', '/work/copia', 2, 0, 'copia-85a9', NULL);
                      INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
                      INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('copia-85a9', 'app-1a2b', 'root_commit', 2);
-                     INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', 'app-1a2b', 4);
-                     INSERT INTO episodic_trajectory \
-                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
-                      VALUES ('agent', 'a', 'app-1a2b', 's', 't', 5, 5, 5);
-                     INSERT INTO procedural_skill \
-                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
-                      VALUES ('agent', 'a', 'idea', 'k', 't', 6, '[]', 6, 6, 6);",
+                     INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', 'app-1a2b', 4);",
                 )?;
                 for (id, project) in [(10, "app-1a2b"), (11, "copia-85a9"), (12, "idea")] {
                     c.execute(
@@ -2138,8 +2085,6 @@ mod tests {
             let mut out = Vec::new();
             for sql in [
                 "SELECT * FROM memory ORDER BY id",
-                "SELECT * FROM episodic_trajectory ORDER BY id",
-                "SELECT * FROM procedural_skill ORDER BY id",
                 "SELECT * FROM project ORDER BY id",
                 "SELECT * FROM project_path ORDER BY id",
                 "SELECT * FROM project_remote ORDER BY remote",
@@ -2162,15 +2107,7 @@ mod tests {
                      INSERT INTO project_path (id, root_path, created_at, index_docs, project_id, remote) VALUES \
                        ('app-1a2b', '/work/app', 1, 1, 'app-1a2b', 'github.com/acme/app'), \
                        ('copia-85a9', '/work/copia', 2, 0, 'app-1a2b', NULL);
-                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);
-                     INSERT INTO episodic_trajectory \
-                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at, deleted_at) \
-                      VALUES ('agent', 'a', 'app-1a2b', 's1', 't', 5, 5, 5, NULL), ('agent', 'a', 'app-1a2b', 's2', 'u', 5, 5, 5, 8);
-                     INSERT INTO procedural_skill \
-                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at, deleted_at) \
-                      VALUES ('agent', 'a', 'idea', 'k', 't', 6, '[]', 6, 6, 6, NULL), \
-                             ('agent', 'a', 'idea', 'l', 't', 6, '[]', 6, 6, 6, 8);",
+                     INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', 'app-1a2b', 1);",
                 )?;
                 for (id, project, deleted_at) in [(10, "app-1a2b", None), (11, "app-1a2b", Some(7)), (12, "idea", None)] {
                     c.execute(
@@ -2224,7 +2161,7 @@ mod tests {
         let trim = |w: Vec<Whole>| -> Vec<Whole> {
             w.into_iter()
                 .enumerate()
-                .map(|(i, rows)| if i == 3 { rows.into_iter().map(|mut r| { r.truncate(7); r }).collect() } else { rows })
+                .map(|(i, rows)| if i == 1 { rows.into_iter().map(|mut r| { r.truncate(7); r }).collect() } else { rows })
                 .collect()
         };
         assert_eq!(trim(after), trim(before), "migrating changes no row");
@@ -2246,8 +2183,6 @@ mod tests {
             let mut out = Vec::new();
             for sql in [
                 "SELECT * FROM memory ORDER BY id",
-                "SELECT * FROM episodic_trajectory ORDER BY id",
-                "SELECT * FROM procedural_skill ORDER BY id",
                 "SELECT * FROM project ORDER BY id",
                 "SELECT * FROM project_path ORDER BY id",
                 "SELECT * FROM project_remote ORDER BY remote",
@@ -2282,15 +2217,7 @@ mod tests {
                       VALUES (1, 'gone', 1, 'abcd1234', NULL, 12);
                      INSERT INTO project_delete_row (delete_id, tbl, row_id, deleted_at) VALUES (1, 'memory', 13, NULL);
                      INSERT INTO project_merge (merge_id, source, target, move_id, snapshot, merged_at) \
-                      VALUES (1, 'copia-85a9', 'app-1a2b', NULL, NULL, 9);
-                     INSERT INTO episodic_trajectory \
-                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at, deleted_at) \
-                      VALUES ('agent', 'a', 'app-1a2b', 's1', 't', 5, 5, 5, NULL), ('agent', 'a', 'app-1a2b', 's2', 'u', 5, 5, 5, 8);
-                     INSERT INTO procedural_skill \
-                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at, deleted_at) \
-                      VALUES ('agent', 'a', 'idea', 'k', 't', 6, '[]', 6, 6, 6, NULL), \
-                             ('agent', 'a', 'idea', 'l', 't', 6, '[]', 6, 6, 6, 8);",
+                      VALUES (1, 'copia-85a9', 'app-1a2b', NULL, NULL, 9);",
                 )?;
                 for (id, project, deleted_at) in
                     [(10, "app-1a2b", None), (11, "app-1a2b", Some(7)), (12, "idea", None), (13, "gone", Some(12))]
@@ -2338,8 +2265,6 @@ mod tests {
             let mut out = Vec::new();
             for sql in [
                 "SELECT * FROM memory ORDER BY id",
-                "SELECT * FROM episodic_trajectory ORDER BY id",
-                "SELECT * FROM procedural_skill ORDER BY id",
                 "SELECT * FROM project ORDER BY id",
                 "SELECT * FROM project_path ORDER BY id",
                 "SELECT * FROM project_remote ORDER BY remote",
@@ -2377,15 +2302,7 @@ mod tests {
                       VALUES (1, 'gone', 1, 'abcd1234', NULL, 12);
                      INSERT INTO project_delete_row (delete_id, tbl, row_id, deleted_at) VALUES (1, 'memory', 13, NULL);
                      INSERT INTO project_merge (merge_id, source, target, move_id, snapshot, merged_at) \
-                      VALUES (1, 'copia-85a9', 'app-1a2b', NULL, NULL, 9);
-                     INSERT INTO episodic_trajectory \
-                      (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at, deleted_at) \
-                      VALUES ('agent', 'a', 'app-1a2b', 's1', 't', 5, 5, 5, NULL), ('agent', 'a', 'app-1a2b', 's2', 'u', 5, 5, 5, 8);
-                     INSERT INTO procedural_skill \
-                      (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                       source_trajectory_ids, created_at, last_modified_at, last_accessed_at, deleted_at) \
-                      VALUES ('agent', 'a', 'web-7a8b', 'k', 't', 6, '[]', 6, 6, 6, NULL), \
-                             ('agent', 'a', 'web-7a8b', 'l', 't', 6, '[]', 6, 6, 6, 8);",
+                      VALUES (1, 'copia-85a9', 'app-1a2b', NULL, NULL, 9);",
                 )?;
                 for (id, project, deleted_at) in [
                     (10, "app-1a2b", None),
@@ -2575,14 +2492,6 @@ mod tests {
             .await
             .unwrap();
         assert!(tables.contains(&"memory".to_string()), "missing 'memory' table");
-        assert!(
-            tables.contains(&"episodic_trajectory".to_string()),
-            "missing 'episodic_trajectory' table"
-        );
-        assert!(
-            tables.contains(&"procedural_skill".to_string()),
-            "missing 'procedural_skill' table"
-        );
     }
 
     /// Virtual tables (vec0) present after open.
@@ -2605,14 +2514,6 @@ mod tests {
         assert!(
             names.contains(&"memory_vectors".to_string()),
             "missing 'memory_vectors'"
-        );
-        assert!(
-            names.contains(&"episodic_vectors".to_string()),
-            "missing 'episodic_vectors'"
-        );
-        assert!(
-            names.contains(&"procedural_vectors".to_string()),
-            "missing 'procedural_vectors'"
         );
     }
 
@@ -2719,14 +2620,6 @@ mod tests {
             "idx_memory_superseded",
             "idx_memory_disputed",
             "idx_memory_tier_status",
-            "idx_epi_agent_active",
-            "idx_epi_scope_project",
-            "idx_epi_last_accessed",
-            "idx_epi_tier_status",
-            "idx_proc_agent_active",
-            "idx_proc_scope_project",
-            "idx_proc_last_accessed",
-            "idx_proc_tier_status",
         ];
         for name in &expected {
             assert!(
@@ -2916,7 +2809,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(count, 31, "Expected exactly 31 applied migrations, got {}", count);
+        assert_eq!(count, 32, "Expected exactly 32 applied migrations, got {}", count);
     }
 
     /// V8 — a fresh store records V8 as applied and carries the FTS5 lexical
@@ -3280,8 +3173,6 @@ mod tests {
             .await
             .unwrap();
         assert!(tables.contains(&"memory".to_string()));
-        assert!(tables.contains(&"episodic_trajectory".to_string()));
-        assert!(tables.contains(&"procedural_skill".to_string()));
 
         // The schema defines no views — V3's `all_memories` was dropped by V7
         // after shipping unused for its whole life.
@@ -3377,7 +3268,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(migration_count, 31);
+        assert_eq!(migration_count, 32);
     }
 
     // -----------------------------------------------------------------------

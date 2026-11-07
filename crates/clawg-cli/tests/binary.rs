@@ -2904,6 +2904,73 @@ async fn an_update_over_a_store_without_supersede_causes_keeps_its_rows_and_tell
     assert_eq!(judged["hidden"], json!([5]), "{judged}");
 }
 
+/// The last schema with `episodic_trajectory` and `procedural_skill`.
+const LEGACY_KINDS_SCHEMA: i32 = 31;
+
+/// A memory, four trajectories (one replaced by another, one deleted) and
+/// two skills, one disputing the other, as a version that still wrote them
+/// left them.
+fn seed_legacy_kinds(db: &rusqlite::Connection) {
+    db.execute_batch(
+        "INSERT INTO memory (id, agent_id, content, created_at, last_modified_at, last_accessed_at)
+           VALUES (1, 'smoke', 'the release notes live in CHANGELOG.md', 1, 1, 1);
+         INSERT INTO episodic_trajectory (id, agent_id, session_id, task, tool_calls, resolution, success_score, created_at,
+           last_modified_at, last_accessed_at, status, superseded_by, deleted_at) VALUES
+           (1, 'smoke', 's-1', 'clean the build cache', '[\"rm\"]', 'cargo clean', 1.0, 2, 2, 2, 'active', NULL, NULL),
+           (2, 'smoke', 's-2', 'run the suite', '[\"test\"]', NULL, 0.0, 3, 3, 3, 'superseded', 3, NULL),
+           (3, 'smoke', 's-3', 'run the suite', '[\"test\"]', 'it passed', 1.0, 4, 4, 4, 'active', NULL, NULL),
+           (4, 'smoke', 's-4', 'rotate the logs', '[]', NULL, 0.0, 5, 5, 5, 'active', NULL, 9);
+         INSERT INTO procedural_skill (id, agent_id, skill_name, trigger, tool_sequence, success_count, promoted_at,
+           source_trajectory_ids, created_at, last_modified_at, last_accessed_at, status, dispute_count, disputed_against,
+           last_disputed_at) VALUES
+           (1, 'smoke', 'run-the-suite', 'before a commit', '[\"test\"]', 2, 6, '[2,3]', 6, 6, 6, 'disputed', 1, '[2]', 8),
+           (2, 'smoke', 'run-the-fast-suite', 'before a push', '[\"test\"]', 1, 7, '[3]', 7, 7, 7, 'active', 0, NULL, NULL);",
+    )
+    .expect("seed the rows of both tables");
+}
+
+#[tokio::test]
+async fn doctor_passes_over_a_store_whose_trajectories_and_skills_moved() {
+    let sandbox = Sandbox::new();
+    let (installed, old) = store_at(&sandbox, LEGACY_KINDS_SCHEMA, seed_legacy_kinds).await;
+    old.wait_until_ready().await;
+    let stopped = sandbox.command_of(&installed, &["stop", "--profile", "dev"]).output_copy().expect("run clawg stop");
+    assert!(stopped.status.success(), "{}", stderr_of(&stopped));
+    old.wait_for_exit(Duration::from_secs(10)).await;
+
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let (status, listed) = daemon.get("/v1/memories?limit=100").await;
+    assert_eq!(sandbox.run(&["stop", "--profile", "dev"]).status.code(), Some(0));
+    daemon.wait_for_exit(Duration::from_secs(10)).await;
+
+    assert_eq!(status, 200, "{listed}");
+    let firsts: Vec<&str> = listed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|r| r["summary"].as_str().expect("summary").lines().next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        firsts,
+        ["run-the-fast-suite", "run-the-suite", "run the suite", "run the suite", "clean the build cache", "the release notes live in CHANGELOG.md"],
+        "every live row is a memory, newest first: {listed}"
+    );
+    let (output, report) = doctor(&sandbox);
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    let store = |f: &&Value| f["check_id"].as_str().is_some_and(|id| id.starts_with("store.") || id.starts_with("memory."));
+    let raised: Vec<&Value> = report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .filter(store)
+        .filter(|f| matches!(f["severity"].as_str(), Some("warn" | "error")))
+        .collect();
+    assert!(raised.is_empty(), "{raised:?}");
+    assert_eq!(findings(&report, "store.schema"), [("ok", "healthy")], "{report}");
+    assert_eq!(report["summary"]["error"], 0, "{report}");
+}
+
 // The server runs in this process while the binary is waited on.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_binary_that_migrated_and_failed_gets_its_pre_migration_restored() {

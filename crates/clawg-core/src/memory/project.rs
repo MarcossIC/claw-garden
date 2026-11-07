@@ -5,11 +5,10 @@
 //! index uses. Its memories live under its project id, a row of `project`:
 //! the id the root's remote was first registered with (`project_remote`,
 //! V24), so the clones of one remote share them, or the root id without a
-//! remote. Rows of `memory` join through the move engine, which logs them in
+//! remote. Rows join through the move engine, which logs them in
 //! `memory_move` and leaves one live row per key and per text (see
-//! [`merge_in`]); the other tables move row by row with `project_rekey`,
-//! whose undo SQL is in the migration that creates it.
-//! `memory_fts` needs nothing: it reads `project_id` from `memory`.
+//! [`merge_in`]). `memory_fts` needs nothing: it reads `project_id` from
+//! `memory`.
 //!
 //! A path is not an identity: another repository can be cloned where one
 //! was. So a recorded folder serves a root only while its fingerprints, the
@@ -36,11 +35,6 @@ use crate::memory::relocate::{merge_in, Span};
 use crate::memory::subfolder::declared_in;
 use crate::memory::workspace::WorkspaceManager;
 use crate::memory::{MemoryError, MemoryStore};
-
-/// The tables besides `memory` whose rows carry a `project_id`. A literal
-/// list rather than interpolated input, so no caller value ever reaches a
-/// table name.
-const OTHER_PROJECT_TABLES: [&str; 2] = ["episodic_trajectory", "procedural_skill"];
 
 /// What a caller asks of [`register_project`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -786,9 +780,7 @@ fn plan_in(
     let ids = serde_json::to_string(&legacy).unwrap_or_default();
     let moves: bool = c
         .query_row(
-            "SELECT EXISTS (SELECT 1 FROM memory WHERE project_id IN (SELECT value FROM json_each(?1))) \
-             OR EXISTS (SELECT 1 FROM episodic_trajectory WHERE project_id IN (SELECT value FROM json_each(?1))) \
-             OR EXISTS (SELECT 1 FROM procedural_skill WHERE project_id IN (SELECT value FROM json_each(?1)))",
+            "SELECT EXISTS (SELECT 1 FROM memory WHERE project_id IN (SELECT value FROM json_each(?1)))",
             [ids],
             |r| r.get(0),
         )
@@ -881,21 +873,6 @@ fn write_in(
     if !plan.legacy.is_empty() {
         let merged = merge_in(c, &plan.legacy, &plan.project_id, Span::Keep, now)?;
         (moved, move_id) = (merged.moved.len(), merged.move_id);
-        for legacy_id in &plan.legacy {
-            for table in OTHER_PROJECT_TABLES {
-                c.execute(
-                    &format!(
-                        "INSERT INTO project_rekey (tbl, row_id, legacy_id, project_id, rekeyed_at) \
-                         SELECT '{table}', id, project_id, ?2, ?3 FROM {table} WHERE project_id = ?1"
-                    ),
-                    rusqlite::params![legacy_id, plan.project_id, now],
-                )?;
-                moved += c.execute(
-                    &format!("UPDATE {table} SET project_id = ?2 WHERE project_id = ?1"),
-                    rusqlite::params![legacy_id, plan.project_id],
-                )?;
-            }
-        }
     }
     Ok((moved, move_id, indexed || reg.index_docs))
 }
@@ -1063,27 +1040,6 @@ mod tests {
             {
                 f.memory(project, content, deleted, 0).await;
             }
-            f.store
-                .conn
-                .call(|c| {
-                    c.execute(
-                        "INSERT INTO episodic_trajectory \
-                         (scope, agent_id, project_id, session_id, task, created_at, \
-                          last_modified_at, last_accessed_at) \
-                         VALUES ('agent', 'agent-a', 'src-1a2b', 's', 't', 0, 0, 0)",
-                        [],
-                    )?;
-                    c.execute(
-                        "INSERT INTO procedural_skill \
-                         (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                          source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
-                         VALUES ('agent', 'agent-a', 'src-1a2b', 'k', 't', 0, '[]', 0, 0, 0)",
-                        [],
-                    )?;
-                    Ok::<_, rusqlite::Error>(())
-                })
-                .await
-                .unwrap();
             f
         }
 
@@ -1200,12 +1156,7 @@ mod tests {
         store
             .conn
             .call(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT 'memory', id, project_id FROM memory \
-                     UNION ALL SELECT 'episodic_trajectory', id, project_id FROM episodic_trajectory \
-                     UNION ALL SELECT 'procedural_skill', id, project_id FROM procedural_skill \
-                     ORDER BY 1, 2",
-                )?;
+                let mut stmt = c.prepare("SELECT 'memory', id, project_id FROM memory ORDER BY 1, 2")?;
                 let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect();
                 rows
             })
@@ -1257,13 +1208,13 @@ mod tests {
 
         let outcome = f.register(reg(root, &legacy)).await.unwrap();
 
-        assert_eq!((outcome.project_id.as_str(), outcome.root_id.as_str(), outcome.rekeyed, outcome.index_docs), (id.as_str(), id.as_str(), 4, true));
+        assert_eq!((outcome.project_id.as_str(), outcome.root_id.as_str(), outcome.rekeyed, outcome.index_docs), (id.as_str(), id.as_str(), 2, true));
         let ids = project_ids(&f.store).await;
         let moved = ids.iter().filter(|(_, _, p)| p.as_deref() == Some(id.as_str())).count();
-        assert_eq!(moved, 4, "{ids:?}");
+        assert_eq!(moved, 2, "{ids:?}");
         assert!(ids.iter().any(|(_, _, p)| p.as_deref() == Some("other-9f9f")), "{ids:?}");
         assert_eq!(f.count("SELECT COUNT(*) FROM memory_move").await, 2, "memory rows are logged as a move");
-        assert_eq!(f.count("SELECT COUNT(*) FROM project_rekey").await, 2, "the other tables in project_rekey");
+        assert_eq!(f.count("SELECT COUNT(*) FROM project_rekey").await, 0, "a registration logs no row in project_rekey");
         assert_eq!(f.count("SELECT COUNT(*) FROM project_path").await, 1);
     }
 
@@ -1278,7 +1229,6 @@ mod tests {
 
         assert_eq!((again.rekeyed, again.snapshot), (0, None));
         assert_eq!(f.count("SELECT COUNT(*) FROM memory_move").await, 2);
-        assert_eq!(f.count("SELECT COUNT(*) FROM project_rekey").await, 2);
         assert_eq!(f.snapshots().await, 1, "only the registration that moved rows took one");
     }
 
@@ -1302,7 +1252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_logs_restore_every_row_a_registration_moved() {
+    async fn the_move_log_restores_every_row_a_registration_moved() {
         let f = Fixture::seeded().await;
         let before = project_ids(&f.store).await;
         let legacy = ["src-1a2b".to_string()];
@@ -1311,23 +1261,6 @@ mod tests {
         assert_eq!((moved.move_id, again.move_id), (Some(1), None), "a registration that moves nothing makes no move");
 
         undo_move_core(&f.store, &f.backups, 1, false).await.unwrap();
-        f.store
-            .conn
-            .call(|c| {
-                for table in OTHER_PROJECT_TABLES {
-                    c.execute(
-                        &format!(
-                            "UPDATE {table} SET project_id = r.legacy_id FROM project_rekey AS r \
-                             WHERE r.tbl = '{table}' AND r.row_id = {table}.id \
-                               AND r.project_id = {table}.project_id"
-                        ),
-                        [],
-                    )?;
-                }
-                Ok::<_, rusqlite::Error>(())
-            })
-            .await
-            .unwrap();
 
         assert_eq!(project_ids(&f.store).await, before);
     }

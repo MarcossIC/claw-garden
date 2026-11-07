@@ -1,10 +1,10 @@
 # bridge-project-identity — Especificación
 
-De qué proyecto lee y en cuál guarda el puente `clawg mcp` cuando una herramienta no nombra uno. Al archivar, BI1 a BI5 y BI7 a BI10 se suman a [`specs/mcp`](../../specs/mcp/spec.md) y BI6 a [`specs/retrieval`](../../specs/retrieval/spec.md), y reemplazan lo que dicen del proyecto por defecto del puente:
+De qué proyecto lee y en cuál guarda el puente `clawg mcp` cuando una herramienta no nombra uno. Al archivar, BI1 a BI5 y BI7 a BI10 se suman a [`specs/mcp`](../../../specs/mcp/spec.md) y BI6 a [`specs/retrieval`](../../../specs/retrieval/spec.md), y reemplazan lo que dicen del proyecto por defecto del puente:
 
-- de [`specs/project`](../../specs/project/spec.md), R3 en lo que deja al puente sin otro proyecto que el de su `current_dir()` (y su escenario, un save sin `project_path` que cae en el proyecto del directorio), y la regla de `index_docs` («`index_docs` MUST ser `true` sólo cuando la raíz de la llamada es la raíz del puente»);
+- de [`specs/project`](../../../specs/project/spec.md), R3 en lo que deja al puente sin otro proyecto que el de su `current_dir()` (y su escenario, un save sin `project_path` que cae en el proyecto del directorio), y la regla de `index_docs` («`index_docs` MUST ser `true` sólo cuando la raíz de la llamada es la raíz del puente»);
 - de `specs/mcp`, la última frase de PM4 («Ausente o `false`, el save MUST guardarse en el proyecto que resuelve sin él»), la de PM8 («un puente sin proyecto MUST seguir viendo ` topic=K`») y, en «La clave de tema en las herramientas», «salvo que el save tampoco tenga»;
-- de [`specs/project-docs`](../../specs/project-docs/spec.md), que sólo la raíz del puente se acepta sola.
+- de [`specs/project-docs`](../../../specs/project-docs/spec.md), que sólo la raíz del puente se acepta sola.
 
 Lo que esas specs dicen de una herramienta que nombra su proyecto no cambia.
 
@@ -115,7 +115,7 @@ Una carpeta abierta MUST registrarse con `index_docs` si `auto_indexable` la ace
 - La descripción de `project_path` de `save_memory` MUST decir que no tiene valor por defecto y que un save pasa `project_path`, `project` o `all_projects`; las de `project_path` de las herramientas que leen, que sin él leen las carpetas que el cliente tiene abiertas, o el directorio del puente.
 - La de `search_memory` MUST decir que con varias carpetas busca en todas y que cada hit nombra su proyecto con `project=`, que es lo que `project` acepta.
 - La apertura de `protocol.md` y de `protocol.es.md`, lo que lee un cliente anterior, MUST pedir que cada save nombre su proyecto con `project_path`, `project` o `all_projects`. Su sección de proyectos MUST decir cuándo pasar `project_path` y que, con varias carpetas abiertas, `recall_context`, `search_project`, `synthesize` y `answer_suggestion` piden en cuál se trabaja; «How to write a save» y «Cómo escribir un save», que un hit de una búsqueda en varios proyectos muestra su clave junto a su `project=`, y que un save con ese `project` la revisa. Cada variante de la apertura MUST seguir cabiendo en 2048 caracteres.
-- `project=` se suma a los marcadores ([`specs/mcp`](../../specs/mcp/spec.md), «Definiciones»).
+- `project=` se suma a los marcadores ([`specs/mcp`](../../../specs/mcp/spec.md), «Definiciones»).
 - `agent_contract.json` y `agent_contract.es.json` MUST coincidir con lo que lista el servidor, bendecidos con `CLAWG_BLESS=1`.
 
 **Tests:** `the_agent_contract_matches_its_file`, `the_spanish_agent_contract_matches_its_file`, los del largo de la apertura, `the_protocol_names_only_what_exists` y `the_protocol_says_where_a_call_without_a_project_goes` (`protocol.rs`, en los dos idiomas).

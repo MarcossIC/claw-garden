@@ -304,7 +304,7 @@ Se pueden agregar estos filtros a `list` y `search`:
 Detalles útiles:
 
 - La búsqueda ignora mayúsculas y acentos: `configuracion` encuentra `configuración`.
-- `show` mira por defecto la tabla `memory`; con `--kind episodic` o `--kind procedural` mira las otras. Los ids son por tabla.
+- `show` muestra una memoria por su id. Las trayectorias y las habilidades de las versiones anteriores son memorias de tipo `semantic_fact` desde que el daemon abre la base con esta versión, cada una con otro id: se encuentran con `clawg memories search`, y `--kind episodic` o `--kind procedural` es un error que lo dice.
 - Un texto largo se guarda partido en fragmentos, y el visor los muestra como filas separadas.
 
 ### Llevar memorias a otro perfil o a otra máquina

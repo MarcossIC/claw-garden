@@ -75,3 +75,13 @@ El mismo cambio se aplicó también en otra rama ([#134](https://github.com/Marc
 - Commit: `docs(mcp): name all_projects in the opening, and the key of a group's hit`
 - [x] La spec, esta lista y `verify.md`.
 - Commit: `docs(openspec): record what bridge-project-identity took from its other application`
+
+## 9. La prueba con Cursor
+
+- [x] Los puntos 1 a 3 con Cursor 3.29.9 en Windows, contra un directorio de prueba ([verify](verify.md#con-cursor-2026-11-06)): el 2 pasa con lo que hace Cursor ahora, que manda sólo las carpetas de cada ventana. Claude Code queda para el piloto.
+- Commit: `docs(openspec): record the Cursor test of bridge-project-identity`
+
+## 10. Archivo (fuera de este cambio)
+
+- [x] Llevar BI1 a BI5 y BI7 a BI10 a `specs/mcp` y BI6 a `specs/retrieval`, y cambiar lo que reemplazan en `specs/project`, `specs/mcp` y `specs/project-docs`; mover la carpeta a `changes/archive/`; subir el minor ([verify](verify.md#al-archivar-2026-11-07)).
+- Commits: `docs(openspec): archive bridge-project-identity and fold it into the specs`, `chore: bump version to 0.79.0`

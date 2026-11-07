@@ -297,8 +297,8 @@ pub fn confirm_delete(lang: Lang, delete_id: i64, yes: bool) -> Result<(), Strin
     })
 }
 
-/// The lines printed after a project delete was purged: what went by table,
-/// what stayed because it is live again, the outbox rows removed, and, left
+/// The lines printed after a project delete was purged: what went, what
+/// stayed because it is live again, the outbox rows removed, and, left
 /// alone, the backups and workspace files that still hold its texts.
 pub fn purge_delete_report(lang: Lang, delete_id: i64, purged: &PurgedDelete) -> String {
     let project = &purged.project_id;
@@ -307,15 +307,8 @@ pub fn purge_delete_report(lang: Lang, delete_id: i64, purged: &PurgedDelete) ->
         Lang::En => format!("{n} {}", if n == 1 { en.0 } else { en.1 }),
         Lang::Es => format!("{n} {}", if n == 1 { es.0 } else { es.1 }),
     };
-    let parts: Vec<String> = [
-        (c.memories, ("memory", "memories"), ("memoria", "memorias")),
-        (c.trajectories, ("trajectory", "trajectories"), ("trayectoria", "trayectorias")),
-        (c.skills, ("skill", "skills"), ("habilidad", "habilidades")),
-    ]
-    .into_iter()
-    .filter(|(n, _, _)| *n > 0)
-    .map(|(n, en, es)| part(n, en, es))
-    .collect();
+    let parts: Vec<String> =
+        (c.memories > 0).then(|| part(c.memories, ("memory", "memories"), ("memoria", "memorias"))).into_iter().collect();
     let mut lines = vec![match (parts.is_empty(), lang) {
         (true, Lang::En) => format!("purged delete {delete_id} of project {project}: no row was left to remove"),
         (true, Lang::Es) => format!("se purgó el borrado {delete_id} del proyecto {project}: no quedaba ninguna fila por borrar"),
@@ -325,22 +318,11 @@ pub fn purge_delete_report(lang: Lang, delete_id: i64, purged: &PurgedDelete) ->
         }
     }];
     if !purged.live.is_empty() {
-        let rows: Vec<String> = purged
-            .live
-            .iter()
-            .map(|r| {
-                let table = match (r.table.as_str(), lang) {
-                    ("memory", Lang::En) => "memory",
-                    ("memory", Lang::Es) => "memoria",
-                    ("episodic_trajectory", Lang::En) => "trajectory",
-                    ("episodic_trajectory", Lang::Es) => "trayectoria",
-                    ("procedural_skill", Lang::En) => "skill",
-                    ("procedural_skill", Lang::Es) => "habilidad",
-                    (other, _) => other,
-                };
-                format!("{table} #{}", r.id)
-            })
-            .collect();
+        let table = match lang {
+            Lang::En => "memory",
+            Lang::Es => "memoria",
+        };
+        let rows: Vec<String> = purged.live.iter().map(|id| format!("{table} #{id}")).collect();
         let rows = rows.join(", ");
         lines.push(match lang {
             Lang::En => format!("live again, so they stay: {rows}"),
@@ -652,13 +634,13 @@ mod tests {
     #[test]
     fn the_purge_report_of_a_delete_names_what_went() {
         use clawg_core::memory::project_delete::Counts;
-        use clawg_core::memory::secrets::{LiveRow, OutboxRemoved, PurgedDelete, WorkspaceHolding};
+        use clawg_core::memory::secrets::{OutboxRemoved, PurgedDelete, WorkspaceHolding};
         use clawg_core::memory::workspace::Holding;
         use std::path::PathBuf;
         let purged = PurgedDelete {
             project_id: "app-1a2b".into(),
-            removed: Counts { memories: 3, trajectories: 1, skills: 0 },
-            live: vec![LiveRow { table: "memory".into(), id: 9 }],
+            removed: Counts { memories: 3 },
+            live: vec![9],
             outbox: vec![OutboxRemoved { operation_id: "op-1".into(), agent_id: "agent-a".into(), state: "failed".into() }],
             backups: vec![PathBuf::from("/b/memory-x-pre-delete.db")],
             project_workspaces: vec![PathBuf::from("/w/a/app-1a2b/workspace.md")],
@@ -669,7 +651,7 @@ mod tests {
         };
         assert_eq!(
             purge_delete_report(Lang::En, 4, &purged),
-            "purged delete 4 of project app-1a2b: 3 memories, 1 trajectory removed for good\n\
+            "purged delete 4 of project app-1a2b: 3 memories removed for good\n\
              live again, so they stay: memory #9\n\
              removed from the ingest outbox: op-1 (agent-a, failed)\n\
              these backups still hold it; delete them if it must be gone everywhere:\n  \
@@ -681,7 +663,7 @@ mod tests {
         );
         assert_eq!(
             purge_delete_report(Lang::Es, 4, &purged),
-            "se purgó el borrado 4 del proyecto app-1a2b: 3 memorias, 1 trayectoria borradas para siempre\n\
+            "se purgó el borrado 4 del proyecto app-1a2b: 3 memorias borradas para siempre\n\
              vuelven a estar vivas, así que quedan: memoria #9\n\
              se quitó del outbox de ingesta: op-1 (agent-a, failed)\n\
              estos backups todavía la guardan; bórralos si tiene que desaparecer de todas partes:\n  \

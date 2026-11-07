@@ -12,6 +12,8 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [project-registry](../../changes/archive/2026-10-25-project-registry/proposal.md), archivado el 2026-10-25 con su entrega 0, que sale en 0.63.0 (R20: una fila de un camino sirve a una raíz sólo si su remoto no la contradice; cambia R15, R16 y R18). Sus entregas 1 a 4 (el registro de proyectos, unir y borrar, los proyectos sin carpeta, el export por localizador) pasaron a [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md).
 - [ram-footprint](../../changes/archive/2026-10-24-ram-footprint/proposal.md), archivado el 2026-10-24 (RF1: un registro lanza el refresco de docs sólo si trae `index_docs: true`; cambia la nota de R4).
 - [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 1, que sale en 0.65.0 (PL1 a PL10: `project` es la referencia de cada proyecto y las carpetas pasan a `project_path`, el primer commit es la segunda huella de una carpeta, una mudanza conserva el proyecto, lo dudoso queda como sugerencia, y `clawg projects list` y `rename`; cambia R4, R10, R15, R16, R18 y R20), y su entrega 2a, en la misma versión (PL11 a PL20: `clawg projects merge` con su lápida y su `--undo`, `canonical` en cada entrada que recibe un proyecto, `clawg projects keep-apart` y los duplicados de `doctor`; cambia PL9), y su entrega 2b, en la misma versión (PL21 a PL31: `clawg projects delete` en sus dos etapas con su `--undo`, el proyecto borrado que vuelve al usarse, `clawg purge --project-delete` y el chequeo `project_deletes`; cambia PL9 y PL15), y su entrega 3a, en la misma versión (PL32 a PL42: el argumento `project` y `answer_suggestion` del contrato, `POST /v1/projects/resolve`, `suggestions/answer` y `locate`, los nombres en `--to-project` y `PATCH`, `clawg projects create` y `locate`, las sugerencias en el contexto y la sugerencia `folder_name`; cambia R10 y PL19), y su entrega 3b, en la misma versión (PL43 a PL52: las declaraciones de V30, el camino crudo en el registro, `clawg projects locate --subfolder` y el chequeo `project_subfolders`; cambia R1, R3, R4 y R6), y su entrega 4, en la misma versión (PL53 a PL65: el diario del registro de V31, una línea `project` por proyecto con sus localizadores, adónde va cada proyecto del archivo, las sugerencias, las declaraciones y lo borrado en un import, `--project-map NOMBRE=project:REF` y lo que retira el `--undo`; cambia PL6, PL7, PL47 y PL52).
+- [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (R3 deja de dar al puente sólo el proyecto de su directorio, R6 pide `index_docs` para una carpeta abierta, y PL34 busca sin alcance cuando no hay ninguna; las carpetas abiertas y el save que nombra su proyecto están en [`specs/mcp`](../mcp/spec.md), BI1 a BI10).
+- [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL2, «Los diarios de proyectos nombran las filas migradas», al final de esta spec: las uniones, los borrados y el registro dejan de tocar las tablas que V32 retira). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
 
 ## Definiciones
 
@@ -19,7 +21,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - **Raíz del proyecto:** el resultado de `resolve_project_root(ruta cruda)` (R1).
 - **Id viejo:** `derive_project_id(ruta cruda)`, el que se usaba antes de resolver rutas (`crates/clawg-core/src/memory/identity.rs:11-15`).
 - **Id nuevo:** `derive_project_id(raíz del proyecto)`. Mismo formato, `{basename}-{hash4}`.
-- **Tablas con proyecto:** `memory`, `episodic_trajectory` y `procedural_skill` (`crates/clawg-core/migrations/V1__init.sql`).
+- **Tabla con proyecto:** `memory`. Hasta V31 también lo eran `episodic_trajectory` y `procedural_skill` (`crates/clawg-core/migrations/V1__init.sql`); V32 las retira ([`specs/storage`](../storage/spec.md), RL1).
 - **Clave de una raíz:** el `origin` normalizado de su directorio git (R14), o ninguna.
 - **Proyecto:** una fila de `project`, la tabla de referencia. Tiene un id que no cambia, un nombre, cómo nació (`born`) y si el usuario ya lo revisó (`reviewed`). Las memorias, y cualquier tabla nueva, guardan este id. Un proyecto puede tener cero o más carpetas y cero o más remotos: sigue existiendo después de que se borró su carpeta.
 - **Carpeta:** una fila de `project_path` (la tabla `project` de antes de V27, renombrada): un camino de esta máquina, su id (el id de raíz), `index_docs`, el proyecto al que lleva y las huellas de lo que se encontró ahí. Es una forma de llegar a un proyecto, no el proyecto: se puede mover o desaparecer.
@@ -36,7 +38,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - **Proyecto vivo:** uno sin `merged_into`.
 - **`canonical(id)`:** el proyecto vivo al que lleva una lápida; para un proyecto vivo, o un id que `project` no conoce, el mismo id (`crates/clawg-core/src/memory/merge.rs`).
 - **Parte del usuario de un `workspace.md`:** lo que la regeneración de la sección AUTO conserva tal cual (`split_existing`, `crates/clawg-core/src/memory/workspace.rs`): lo de antes de `<!-- AUTO-START -->` y la sección USER con lo que la sigue.
-- **Filas de un proyecto:** las de `memory`, `episodic_trajectory` y `procedural_skill` cuyo `project_id` es el proyecto.
+- **Filas de un proyecto:** las de `memory` cuyo `project_id` es el proyecto.
 - **Fila viva** (de un borrado): una con `deleted_at` NULL, cualquiera sea su `status`. Una fila `superseded` está viva.
 - **Proyecto vacío:** uno sin filas vivas. Puede tener filas borradas.
 - **Proyecto borrado:** uno con `project.deleted_at`. No se lista y su nombre queda libre, pero su id sigue siendo suyo.
@@ -102,12 +104,12 @@ El id nuevo de una ruta que ya es la raíz canónica MUST ser igual a `derive_pr
 
 ## R3. Todos los caminos usan la misma resolución
 
-El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el id con `ProjectIdentity::resolve` (`crates/clawg-core/src/memory/identity.rs`). Si falla `current_dir()`, el puente MUST seguir como hoy: sin proyecto por defecto (`crates/clawg-cli/src/mcp/server.rs:470-472`).
+El puente MCP (las raíces del cliente, su cwd y `project_path`) y `clawg memories --here` MUST derivar el id con `ProjectIdentity::resolve` (`crates/clawg-core/src/memory/identity.rs`). El cwd es una carpeta abierta sólo cuando el cliente no tiene raíces; si falla `current_dir()`, no lo es ([`specs/mcp`](../mcp/spec.md), BI3). Lo que lee una llamada sin proyecto sale de las carpetas abiertas, y un save sin proyecto se niega ([`specs/mcp`](../mcp/spec.md), BI4 y BI5).
 
 #### Escenario
-- GIVEN un puente con cwd en `<tmp>/repo/src`
-- WHEN guarda una memoria sin `project_path`
-- THEN la fila queda con el id de `<tmp>/repo`
+- GIVEN un puente con cwd en `<tmp>/repo/src` y un cliente sin raíces
+- WHEN guarda una memoria con `project_path: <tmp>/repo/src`, y busca sin proyecto
+- THEN la fila queda con el id de `<tmp>/repo`, y la búsqueda lee ese proyecto
 
 `ProjectIdentity` guarda también el camino canónico desde el que subió a la raíz (`path`), que los clientes mandan como camino crudo (PL47).
 
@@ -123,7 +125,7 @@ El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el i
 - MUST guardar en `project_path` la carpeta de la raíz (su id de raíz, `root_path`, `index_docs`, su proyecto y sus huellas, PL4) cuando ninguna carpeta del camino le sirve, y crear en `project` su proyecto cuando no existe.
 - Si la fila existe con la misma raíz y el registro pide indexar, MUST pasar `index_docs` de 0 a 1. MUST NOT bajarlo de 1 a 0: un save en otra sesión no le quita a una raíz aceptada su índice (`project.rs:98-100`). El resultado (`RegisterOutcome::index_docs`) lleva el valor que quedó guardado.
 - Sin `assigned`, si `derive_project_id(root_path)` ya está registrado con **otra** `root_path`, o la raíz está guardada con otro id, MUST responder 409 sin mover ninguna fila y sin tocar la marca de la otra raíz. El cuerpo es `{ "error": "project_root_collision", "detail": "<raíz> gets the project id <id>, which already belongs to <otra raíz>" }`. Con `assigned` MUST NOT responder 409 por un choque.
-- Por cada id viejo distinto del de proyecto, y por el id de raíz cuando difiere de él, MUST unir al id de proyecto todas las filas que lo tengan, incluidas las borradas lógicamente, en **una** transacción: las de `memory` con R17, registradas en `memory_move`; las de `episodic_trajectory` y `procedural_skill` con una fila por fila movida en `project_rekey` (la tabla, el id de la fila, el id viejo, el nuevo y la fecha). Un id viejo que es el id de raíz de otra raíz MUST quedar como está.
+- Por cada id viejo distinto del de proyecto, y por el id de raíz cuando difiere de él, MUST unir al id de proyecto todas las filas que lo tengan, incluidas las borradas lógicamente, en **una** transacción: las de `memory` con R17, registradas en `memory_move`. Un id viejo que es el id de raíz de otra raíz MUST quedar como está.
 - Un id viejo con formato inválido (fuera de `{basename}-[0-9a-f]{4}`) MUST dar 400 sin mover nada.
 - La operación MUST ser idempotente: repetirla no mueve filas ni agrega entradas a `project_rekey`.
 - Un registro que tiene éxito (nuevo o ya conocido), trae `index_docs: true` y deja la raíz aceptada también lanza el refresco del índice de documentación del proyecto, en segundo plano y sin que la respuesta lo espere: [`specs/project-docs`](../project-docs/spec.md), «Un registro que lo pide indexa la raíz en segundo plano». No lo lanzan uno sin `index_docs`, aunque la raíz ya estuviera aceptada (los hooks registran así en cada evento), uno que deja la raíz sólo registrada ni uno que falla (400, 409).
@@ -139,9 +141,9 @@ El puente MCP (cwd y `project_path`) y `clawg memories --here` MUST derivar el i
 - THEN el registro falla con `RootCollision` (por HTTP, 409 `project_root_collision` con las dos raíces en `detail`), y la marca de `/elsewhere/repo` sigue en 0
 
 #### Escenario: filas viejas visibles bajo el id nuevo
-- GIVEN una base con 2 memorias, 1 trayectoria y 1 skill en el id viejo `src-1a2b`, y 1 memoria en otro proyecto
+- GIVEN una base con 3 memorias en el id viejo `src-1a2b`, y 1 memoria en otro proyecto
 - WHEN se registra la raíz con `legacy_ids = ["src-1a2b"]`
-- THEN las 4 filas tienen el id nuevo, la del otro proyecto no cambió, `memory_move` tiene las 2 memorias, `project_rekey` las otras 2 filas y la respuesta dice `rekeyed: 4`
+- THEN las 3 filas tienen el id nuevo, la del otro proyecto no cambió, `memory_move` tiene las 3 memorias, `project_rekey` no tiene filas y la respuesta dice `rekeyed: 3`
 
 #### Escenario: idempotencia
 - WHEN se repite el mismo registro
@@ -176,7 +178,7 @@ La columna `index_docs` (V13) llega con 1 en cada fila de `project` que ya exist
 
 Antes de la primera tool que use una raíz, el puente MUST llamar a `POST /v1/projects` con esa raíz, el id viejo de la ruta cruda (si difiere), `index_docs` y `assigned` (`ClawgMcp::ids_for`, `crates/clawg-cli/src/mcp/server.rs`), y usar los ids que responde: el de proyecto para las memorias, el de raíz para `search_project`. Un daemon anterior, que no responde `root_id`, da uno solo para las dos. Con la raíz manda el camino crudo en `path` (PL47), y la clave de lo que ya registró es la raíz y ese camino: una subcarpeta declarada de una raíz lleva a otro proyecto. MUST NOT volver a llamarlo para la misma raíz y camino en el mismo proceso, salvo en dos casos: una colisión (abajo) y una falla que se resuelve releyendo ([`specs/mcp`](../mcp/spec.md), «Registro del proyecto»).
 
-`index_docs` MUST ser `true` sólo cuando la raíz de la llamada es la raíz del puente, la que resolvió de su cwd al arrancar (`server.rs:470-472`), y esa raíz es un proyecto que se indexa solo: tiene un `.git` o un manifiesto, no es el directorio del usuario ni una raíz del sistema de archivos ([`specs/project-docs`](../project-docs/spec.md), «El puente acepta su raíz sola sólo si es un proyecto»). En cualquier otro caso MUST ser `false`. Una raíz que el modelo nombra en `project_path`, o la del puente cuando no es un proyecto, queda así sólo registrada hasta que el usuario la agregue con `clawg projects add`. La decisión es una función pura de las dos raíces, sin filesystem (`indexes_docs`, `crates/clawg-cli/src/mcp/tools.rs:876`): el puente le pasa su raíz sólo cuando `auto_indexable` la aceptó al construirse (`own_root_to_index`, `server.rs:451`), y si no, ninguna. Compara `root` y no el id, porque dos raíces que chocan comparten id.
+`index_docs` MUST ser `true` sólo cuando la raíz de la llamada es la de una carpeta abierta ([`specs/mcp`](../mcp/spec.md), BI3 y BI9) y esa raíz es un proyecto que se indexa solo: tiene un `.git` o un manifiesto, no es el directorio del usuario ni una raíz del sistema de archivos ([`specs/project-docs`](../project-docs/spec.md), «El puente acepta su raíz sola sólo si es un proyecto»). En cualquier otro caso MUST ser `false`. Una raíz que el modelo nombra en `project_path` y no es una carpeta abierta, o una carpeta abierta que no es un proyecto, queda así sólo registrada hasta que el usuario la agregue con `clawg projects add`. La decisión es una función pura de la raíz y de las carpetas abiertas, sin filesystem (`indexes_docs`, `crates/clawg-cli/src/mcp/tools.rs`): el puente le pasa las carpetas abiertas que `auto_indexable` acepta (`indexable_folders`, `server.rs`). Compara `root` y no el id, porque dos raíces que chocan comparten id.
 
 **Colisión.** Sólo un daemon anterior a los ids asignados responde 409 `project_root_collision`. Si lo hace, la tool MUST fallar sin guardar ni buscar. El texto MUST nombrar las dos raíces y decir que clawg no mezcla las memorias de dos proyectos bajo un id. También MUST decir que el proyecto no se puede usar hasta renombrar una de las dos carpetas, y que con `all_projects` se sigue llegando a todos: `search_memory` y `synthesize`, que lo toman, nombran sólo el argumento, y las demás tools nombran `search_memory` con él, porque no lo tienen (`ClawgMcp::refused_root`, `server.rs`). El puente MUST NOT recordar la raíz como registrada (`server.rs:874-876`): la llamada siguiente vuelve a preguntar y vuelve a fallar mientras el choque siga. Así, un `clawg restore` que lo resuelve se nota sin reiniciar el puente. Vale para las cinco tools con proyecto: `save_memory`, `search_memory`, `recall_context`, `search_project` y `synthesize`. Con `all_projects: true` (en `search_memory` y `synthesize`) no hay proyecto ni registro, así que no fallan.
 
@@ -519,14 +521,13 @@ Lo que administra proyectos MUST NOT seguir la lápida y responde 409 `project_m
 Cuando hay algo que cambiar, MUST escribir un snapshot `pre-merge` y, en una transacción que vuelve a decidir lo que vio una pasada en seco:
 
 1. pasar a Z cada fila de `memory` bajo X, borradas incluidas, con la parte de su unidad que está en X (`merge_in` con `Span::Carry`): la parte de una unidad en otro proyecto queda ahí y se nombra en `split`. Después Z conserva el save más nuevo de cada `topic_key` y la fila más vieja de cada `content_hash` que toca una fila movida, y las demás quedan `superseded` con causa `revision`, como en R17, bajo un número de `memory_move`;
-2. pasar a Z las filas de `episodic_trajectory` y `procedural_skill` de X;
-3. pasar a Z cada fila de `synthesis_review` del alcance X, con el `reviewed_at` más viejo cuando Z ya tiene una;
-4. pasar a Z las carpetas, los remotos y las lápidas que llevaban a X;
-5. responder `merged` las sugerencias pendientes cuyos dos lados pasan a ser un proyecto;
-6. dejar X con `merged_into = Z` y `merged_at`, y Z revisado;
-7. anotar cada cambio con lo que había antes en `project_merge_change`.
+2. pasar a Z cada fila de `synthesis_review` del alcance X, con el `reviewed_at` más viejo cuando Z ya tiene una;
+3. pasar a Z las carpetas, los remotos y las lápidas que llevaban a X;
+4. responder `merged` las sugerencias pendientes cuyos dos lados pasan a ser un proyecto;
+5. dejar X con `merged_into = Z` y `merged_at`, y Z revisado;
+6. anotar cada cambio con lo que había antes en `project_merge_change`.
 
-Después de la transacción, MUST copiar el `workspace.md` de X de cada agente donde Z no tiene uno, como `adopt_legacy`, sin cambiar nunca el de X; uno que Z ya tiene queda al lado y se nombra. Las copias se anotan en el diario; una que falla queda en el log y en el informe. La unión MUST NOT cambiar el texto, el vector, el índice de texto ni `last_modified_at` de ninguna fila, los pares de `memory_conflict`, los ids ni `index_docs` de las carpetas, ni el índice de docs, y no necesita el modelo. Con `dry_run` responde el mismo informe sin escribir, sin snapshot y sin tocar archivos. El informe tiene `dry_run`, `merge_id`, `source`, `target`, `move_id`, `memories`, `superseded`, `split`, `protected`, `trajectories`, `skills`, `reviews`, `folders`, `remotes`, `tombstones`, `suggestions`, `workspaces` (`copied`, `kept_beside`, `failed`) y `snapshot`.
+Después de la transacción, MUST copiar el `workspace.md` de X de cada agente donde Z no tiene uno, como `adopt_legacy`, sin cambiar nunca el de X; uno que Z ya tiene queda al lado y se nombra. Las copias se anotan en el diario; una que falla queda en el log y en el informe. La unión MUST NOT cambiar el texto, el vector, el índice de texto ni `last_modified_at` de ninguna fila, los pares de `memory_conflict`, los ids ni `index_docs` de las carpetas, ni el índice de docs, y no necesita el modelo. Con `dry_run` responde el mismo informe sin escribir, sin snapshot y sin tocar archivos. El informe tiene `dry_run`, `merge_id`, `source`, `target`, `move_id`, `memories`, `superseded`, `split`, `protected`, `reviews`, `folders`, `remotes`, `tombstones`, `suggestions`, `workspaces` (`copied`, `kept_beside`, `failed`) y `snapshot`.
 
 **Tests:** `merging_moves_every_row_and_locator_into_the_target`, `a_merge_keeps_the_newest_save_of_a_key_and_the_oldest_of_a_text`, `a_merge_moves_the_part_of_a_split_unit_it_holds`, `merging_a_target_repoints_its_tombstones`, `a_dry_run_merge_changes_nothing`, `a_merge_copies_a_workspace_only_where_the_target_has_none`, `a_merge_is_refused_while_a_save_of_its_projects_is_pending`, `a_merge_of_a_tombstone_into_its_target_repairs_it` y `a_merge_is_refused_for_an_unknown_the_same_or_a_merged_project` (`merge.rs`); `decide_merge_carrying_takes_the_joined_part_of_a_unit_elsewhere` (`relocate.rs`); `merging_through_the_daemon_leaves_everything_under_the_target` y `a_merge_waits_for_the_saves_of_its_projects` (`tests/api.rs`).
 
@@ -534,7 +535,7 @@ Después de la transacción, MUST copiar el `workspace.md` de X de cada agente d
 
 `POST /v1/projects/merge` con `{"undo": N, "dry_run"}` (`undo_merge_core`). Se rechaza sin escribir con 404 si la unión no existe, 409 `merge_undone` si ya se deshizo, 409 `merged_later` si su destino es ahora una lápida, nombrando la unión que hay que deshacer antes, y 409 `saves_pending` como en PL13.
 
-MUST escribir un snapshot `pre-undo` y, en una transacción, dejar X vivo otra vez, devolver las filas que la unión dejó `superseded` si siguen así, llevar de vuelta a X las de `memory` que siguen en Z como un movimiento propio (`undo_move_in`, el cuerpo de `undo_move_core`), y lo demás que la unión cambió y sigue apuntando a Z: trayectorias, habilidades, carpetas, remotos y lápidas. Las filas de `synthesis_review` de X vuelven, y la de Z vuelve a su valor de antes si sigue con el que escribió la unión. Las sugerencias que respondió `merged` vuelven a estar pendientes, y Z, a su marca de revisado de antes. Después, cada copia de `workspace.md` que hizo la unión MUST borrarse si su parte del usuario sigue siendo la del archivo de X; si no, queda y se nombra (`drop_adopted`). Lo guardado en Z después de la unión queda en Z, y una fila que se movió a otro lado queda donde está y se nombra en `kept`.
+MUST escribir un snapshot `pre-undo` y, en una transacción, dejar X vivo otra vez, devolver las filas que la unión dejó `superseded` si siguen así, llevar de vuelta a X las de `memory` que siguen en Z como un movimiento propio (`undo_move_in`, el cuerpo de `undo_move_core`), y lo demás que la unión cambió y sigue apuntando a Z: carpetas, remotos y lápidas. Las filas de `synthesis_review` de X vuelven, y la de Z vuelve a su valor de antes si sigue con el que escribió la unión. Las sugerencias que respondió `merged` vuelven a estar pendientes, y Z, a su marca de revisado de antes. Después, cada copia de `workspace.md` que hizo la unión MUST borrarse si su parte del usuario sigue siendo la del archivo de X; si no, queda y se nombra (`drop_adopted`). Lo guardado en Z después de la unión queda en Z, y una fila que se movió a otro lado queda donde está y se nombra en `kept`.
 
 **Tests:** `undoing_a_merge_leaves_the_store_as_it_was`, `undoing_a_merge_keeps_what_was_saved_after_it`, `a_merge_whose_target_was_merged_since_is_undone_after_that_one` y `a_workspace_edited_since_the_merge_is_kept` (`merge.rs`).
 
@@ -601,7 +602,7 @@ Así vuelve con un save de un puente abierto, que guarda los ids de su raíz tod
 
 MUST NOT revivirlo lo que no deja una fila viva bajo su id: registrar una de sus carpetas (que sigue llevando a él: `write_in` hace `INSERT OR IGNORE INTO project` y la respuesta nombra el proyecto borrado), buscar, pedir contexto, registrar una sesión o insertar una fila ya borrada. Lo que lo revive MUST NOT tocar sus filas borradas, el `index_docs` de sus carpetas ni su borrado: el borrado sigue abierto, con `back` en `deletes` (PL27), y su `--undo` (PL26) y su purga (PL28) siguen valiendo.
 
-`episodic_trajectory` y `procedural_skill` no llevan disparador: en producción nadie las escribe. `doctor` nombra una fila viva bajo un proyecto borrado (PL30).
+Desde V32 no existen `episodic_trajectory` ni `procedural_skill` (RL1 de [`specs/storage`](../storage/spec.md)): sus filas están en `memory`. `doctor` nombra una fila viva bajo un proyecto borrado (PL30).
 
 #### Escenario: un puente abierto después del borrado
 - GIVEN un puente que registró `/work/app`, y el proyecto A de esa carpeta borrado con sus memorias
@@ -662,7 +663,7 @@ El borrado MUST NOT cambiar las carpetas (salvo `index_docs`), los remotos, las 
 El informe (`DeleteReport`, que un lector acepta con campos de menos) tiene:
 
 - `project_id`, `name`, `with_memories`, `refused` (`not_empty`, `code_changed` o null), `code` (sólo en esta etapa; null en un `not_empty`), `delete_id` (cuando escribió) y `snapshot`;
-- `live` y `deleted`: cuántas filas vivas y cuántas borradas tiene en cada tabla (`memories`, `trajectories`, `skills`). En un borrado confirmado, `live` es lo que ese borrado borró;
+- `live` y `deleted`: cuántas filas vivas y cuántas borradas tiene en `memory` (`memories`). En un borrado confirmado, `live` es lo que ese borrado borró;
 - de sus filas vivas de `memory`: `by_type` y `by_status` (mapas) y `by_author`, una lista de `{agent_id, rows}` con `agent_id` null para las filas que no guardó ningún agente;
 - `protected`: los ids de sus `user_preference` y `architectural_decision` vivas;
 - `split_pairs`: cuántos pares de `memory_conflict` unen una fila suya con una de otro proyecto o de ninguno. Quedan como están;
@@ -694,7 +695,7 @@ El código MUST resumir el conjunto exacto y MUST NOT guardarse antes del segund
 
 Si el código coincide, MUST escribir un snapshot `pre-delete` y, en una transacción:
 
-1. marcar borradas a la vez, con el mismo `deleted_at`, todas las filas vivas del proyecto en las tres tablas, y sacar sus vectores (`memory_vectors`, `episodic_vectors`, `procedural_vectors`). El índice de texto lo resta su disparador (V8);
+1. marcar borradas a la vez, con el mismo `deleted_at`, todas las filas vivas del proyecto en `memory`, y sacar sus vectores (`memory_vectors`). El índice de texto lo resta su disparador (V8);
 2. anotar en `project_delete_row` cada fila del conjunto: las que borró, con `deleted_at` NULL, y las que ya estaban borradas, con el suyo;
 3. llevar a su estado de reposo a cada fila de afuera que disputaba una fila borrada (`release_challengers`, [`specs/disputes`](../disputes/spec.md)), que se anota la fecha como en cualquier borrado;
 4. el índice de docs y `index_docs`, como en PL23;
@@ -726,7 +727,7 @@ Como las filas se marcan juntas, MUST NOT revivir ninguna fila del proyecto (`RE
 - 409 `saves_pending`, como en PL23;
 - 503 `embedder_not_ready` o `embedder_failed` si hay filas que restaurar y el modelo no está listo. Una prueba en seco y el `--undo` de un borrado sin filas que restaurar no lo necesitan: el daemon le pasa el modelo si lo tiene y no fuerza una carga.
 
-Una primera pasada que no escribe decide qué filas vuelven y cuáles quedan; después se calculan fuera de la transacción los vectores de las que vuelven, en tandas de 32 con `embed_batch` (`embedding_text` para `memory`, `task` para una trayectoria y `skill_embedding_text` para una habilidad), se escribe un snapshot `pre-undo` (también para el de un proyecto vacío) y una transacción vuelve a decidir y escribe:
+Una primera pasada que no escribe decide qué filas vuelven y cuáles quedan; después se calculan fuera de la transacción los vectores de las que vuelven, en tandas de 32 con `embed_batch` (`embedding_text`), se escribe un snapshot `pre-undo` (también para el de un proyecto vacío) y una transacción vuelve a decidir y escribe:
 
 1. dejar vivo a X si sigue con el `deleted_at` de N. Si volvió al usarse, ya lo está. Es lo primero, así que el disparador de PL22 no le toca `reviewed`;
 2. subir `index_docs` en las carpetas de `project_delete_folder` que siguen en 0. El próximo refresco reconstruye su índice;
@@ -808,7 +809,7 @@ La tabla de PL19 suma `POST /projects/delete`, con el proyecto en `body.project_
 
 - `project_duplicates` MUST NOT tomar un proyecto borrado, ni un par cuyo primer commit llega por una lápida a uno borrado (`duplicates`).
 - Para `project_orphans` y `project_merges`, un proyecto borrado es un proyecto: sus filas no son huérfanas, y una cadena de lápidas que termina en él no está rota.
-- Un chequeo nuevo, `project_deletes`, MUST nombrar con `warn` y `live_under_deleted` cada proyecto borrado que tiene filas vivas en alguna de las tres tablas. Sólo puede pasar en `episodic_trajectory` o `procedural_skill` (PL22), o en un store editado a mano. Su evidencia nombra el proyecto, su borrado abierto más reciente y los conteos de filas vivas por tabla, y no tiene paso. En un store anterior a V29 no corre: sin la tabla `project_delete` no hay hallazgo, ni siquiera un `ok`.
+- Un chequeo nuevo, `project_deletes`, MUST nombrar con `warn` y `live_under_deleted` cada proyecto borrado que tiene filas vivas en `memory`. Desde V32 sólo puede pasar en un store editado a mano, porque ninguna otra tabla guarda filas de proyecto (RL1 de [`specs/storage`](../storage/spec.md)). Su evidencia nombra el proyecto, su borrado abierto más reciente y el conteo de filas vivas, y no tiene paso. En un store anterior a V29 no corre: sin la tabla `project_delete` no hay hallazgo, ni siquiera un `ok`.
 
 **Tests:** `a_deleted_project_is_no_duplicate_nor_orphan` y `live_rows_under_a_deleted_project_are_named` (`crates/clawg-cli/src/doctor/checks.rs`); `the_facts_read_a_deleted_project_where_the_schema_has_one` y `a_deleted_project_is_no_duplicate_and_leads_nowhere_for_a_tombstone` (`inspect.rs`); `the_findings_are_the_same_in_both_languages_but_their_message` sigue pasando.
 
@@ -879,9 +880,9 @@ La transacción que lo crea MUST volver a mirar el paso 2 de PL32: si mientras t
 - Las demás resuelven sin `create`: un nombre que no es de ningún proyecto MUST NOT crear nada.
 - Un rechazo de PL32 MUST responder, sin guardar ni buscar, una frase que nombra cada candidato con su id y su nombre (y los borrados como tales) y dice qué hacer: preguntarle a la persona, y después usar el id, o `new_project` para un proyecto aparte. Un borrado se trae de vuelta guardando con su id.
 - `search_project` MUST buscar en la carpeta con `index_docs` más vieja del proyecto, o en la más vieja. Un proyecto sin carpeta MUST responder su propio mensaje: no tiene archivos que buscar en esta máquina.
-- `all_projects` y `project` juntos: `all_projects` gana, como gana hoy sobre `project_path`.
+- `all_projects` y `project` juntos: en `search_memory` y `synthesize`, `all_projects` gana, como gana sobre `project_path`. `save_memory` MUST negarse sin llamar al daemon con `all_projects` y `project`, o con `all_projects` y `project_path` ([`specs/mcp`](../mcp/spec.md), PM4).
 
-Cuando el directorio del puente no da ningún proyecto y la llamada no nombra uno, la búsqueda sigue sin alcance, como hoy.
+Cuando no hay carpetas abiertas ([`specs/mcp`](../mcp/spec.md), BI3) y la llamada no nombra un proyecto, la búsqueda sigue sin alcance.
 
 #### Escenario: guardar en una idea
 - GIVEN ningún proyecto parecido a `ideas de producto`
@@ -1448,3 +1449,19 @@ Lo que queda MUST nombrarse en el reporte con su motivo: `in_use` (lo nombra alg
 - `doctor`: ningún chequeo nuevo. Los proyectos que crea un import salen en `project_duplicates` por su nombre, como cualquier otro.
 
 **Tests:** `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin volver a bendecir, y los de `specs/portability` y PL1 a PL52.
+
+## RL2. Los diarios de proyectos nombran las filas migradas
+
+V32 MUST reescribir cada entrada de `project_delete_row` y de `project_rekey` que nombra una fila vieja a `tbl = 'memory'` y el id nuevo ([`specs/storage`](../storage/spec.md), RL1). Cada cambio `trajectory` o `skill` de `project_merge_change` MUST pasar a ser una fila de `memory_move` de la unión, de `source` a `target`, con el alcance de la fila y el `merged_at` de la unión; una unión sin `move_id` MUST recibir uno nuevo. Una entrada que nombra una fila que ya no existe MUST quedar como está.
+
+#### Escenario: un proyecto borrado antes
+- GIVEN en V31 un proyecto borrado con sus memorias, con una trayectoria y una habilidad en su diario
+- WHEN se abre con la versión nueva y se deshace el borrado
+- THEN las dos vuelven vivas al proyecto, como `semantic_fact`, con su vector y en el índice de texto
+
+#### Escenario: una unión hecha antes
+- GIVEN en V31 la unión de A en B que movió una trayectoria y una habilidad, sin filas de `memory`
+- WHEN se abre con la versión nueva y se deshace la unión
+- THEN A vuelve a ser un proyecto y las dos filas vuelven a A
+
+**Test:** `a_project_deleted_before_the_move_comes_back_with_its_trajectories_and_skills`, `a_merge_from_before_the_move_takes_its_trajectories_and_skills_back` y, para `project_rekey`, `trajectories_and_skills_move_to_memory_and_their_tables_go` (`crates/clawg-core/src/memory/migrations.rs`).

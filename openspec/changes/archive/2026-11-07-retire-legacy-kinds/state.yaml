@@ -1,0 +1,23 @@
+change: retire-legacy-kinds
+objective: "1"
+depends_on: []
+phase: archived
+release: "0.79.0"  # todo su código está en v0.79.0 (#136); archivarlo no agrega código ni sube la versión. Quedan search.duration y rag-eval --diff para prod (verify.md, «Pendiente en prod»)
+artifacts:
+  exploration: done  # con el resultado de la puerta y las cuatro decisiones tomadas
+  proposal: done  # enfoque A; umbral de rag-eval --diff fijado: ningún caso se mueve
+  spec: done  # R1 a R10
+  design: done  # D1 a D9
+  tasks: done  # partes 1 a 7
+  apply: done  # un commit por parte, con sus tests en rojo antes
+  verify: done  # Linux: la suite y los dos clippy; el CI de #136 en Linux y Windows; V32 sobre copias de prod y dev, sin ninguna fila perdida; search.duration y rag-eval --diff quedan para prod
+  archive: done  # RL1 a RL10 en sus specs (storage, retrieval, project, restore, secrets, portability, doctor, mcp, eval; y visibility, update, sharing, synthesis, pieces, project-docs, metrics para lo que decían de las tablas)
+gates:
+  "0": passed  # 0 filas y 0 entradas de diario en prod y en dev
+decisions:
+  migrated_type: semantic_fact
+  old_ids: rewritten  # en la misma transacción que migra la fila
+  deleted_rows: migrated  # también las que ningún diario anotó
+  old_kind: error  # desde la primera versión, sin versión de tolerancia
+updated: 2026-11-07
+main_spec: openspec/specs/storage/spec.md, openspec/specs/retrieval/spec.md, openspec/specs/project/spec.md, openspec/specs/restore/spec.md, openspec/specs/secrets/spec.md, openspec/specs/portability/spec.md, openspec/specs/doctor/spec.md, openspec/specs/mcp/spec.md, openspec/specs/eval/spec.md, openspec/specs/visibility/spec.md, openspec/specs/update/spec.md, openspec/specs/sharing/spec.md, openspec/specs/synthesis/spec.md, openspec/specs/pieces/spec.md, openspec/specs/project-docs/spec.md, openspec/specs/metrics/spec.md

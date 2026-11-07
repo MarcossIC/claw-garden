@@ -25,20 +25,13 @@ Una noche lleva como mucho una tarea local y dos de nube que no toquen los mismo
 
 ## Noche 1
 
-| Cambio | Dónde | Necesita antes |
-|---|---|---|
-| [bridge-project-identity](changes/bridge-project-identity/verify.md#pendiente-en-local) | Nube, aplicado en un pull request a `develop` | — (la [prueba con Cursor real](changes/bridge-project-identity/exploration.md#resultado-de-la-prueba-con-cursor-2026-11-05-y-2026-11-06) está hecha). El pull request pasa en Linux y en Windows; queda pendiente en local, con Cursor, un save en un workspace con dos repositorios |
-
-## Noche 2
-
 | Cambio | Dónde | Por qué acá |
 |---|---|---|
-| [retire-legacy-kinds](changes/retire-legacy-kinds/exploration.md) | Nube | Saca dos KNN de cada búsqueda y borra tablas: conviene que salga solo y antes del corte |
 | Partir el mapa de openspec | Nube | Lleva las filas archivadas a `changes/archive/README.md`. Conserva el encabezado «Orden de ejecución de lo pendiente» y su razonamiento, que el caso d13 de `crates/clawg-eval/golden/project-docs.json` espera, o actualiza ese caso |
 
 ## Piloto (una semana de trabajo real, no una noche)
 
-Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario, con una excepción: Cursor se conecta con `clawg setup cursor --profile prod`, porque esa es la prueba con Cursor real ([pendiente en prod](changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)). Esa instalación también es a nivel usuario y afecta a cada ventana de Cursor, no sólo a este repositorio. Los mismos hooks prueban el arranque real de session-start-context ([pendiente en prod](changes/archive/2026-11-04-session-start-context/verify.md#pendiente-en-prod)), y que una preferencia declarada a Claude Code entre al arranque de Cursor en el mismo proyecto ([preference-model](changes/archive/2026-11-06-preference-model/verify.md#pendiente-en-prod)).
+Se publica lo anterior y se instalan los hooks a mano en un repositorio real con memorias importadas, en `.claude/settings.local.json`, junto con Cursor en el mismo repositorio. No se usa `clawg setup` todavía, porque escribe a nivel usuario, con una excepción: Cursor se conecta con `clawg setup cursor --profile prod`, porque esa es la prueba con Cursor real ([pendiente en prod](changes/archive/2026-11-04-client-setup-cursor/verify.md#pendiente-en-prod)). Esa instalación también es a nivel usuario y afecta a cada ventana de Cursor, no sólo a este repositorio. Los mismos hooks prueban el arranque real de session-start-context ([pendiente en prod](changes/archive/2026-11-04-session-start-context/verify.md#pendiente-en-prod)), y que una preferencia declarada a Claude Code entre al arranque de Cursor en el mismo proyecto ([preference-model](changes/archive/2026-11-06-preference-model/verify.md#pendiente-en-prod)). Con 0.78.0 instalado, Claude Code en una carpeta lee lo de antes, y un save sin proyecto se rechaza y el agente lo repite con `project_path` ([bridge-project-identity](changes/archive/2026-11-07-bridge-project-identity/verify.md#pendiente-en-prod)).
 
 **Pasa si:**
 - responde 10 preguntas reales cuya respuesta sólo está en el historial;

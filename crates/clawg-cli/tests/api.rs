@@ -2640,53 +2640,7 @@ async fn a_text_query_finds_a_saved_memory_without_the_embedder() {
     assert_eq!(items[0]["summary"], "la configuración del núcleo cambió");
 
     let (status, _) = h.get_json("/v1/memories?kind=episodic&q=configuracion").await;
-    assert_eq!(status, 400, "episodic rows have no text index");
-}
-
-/// Episodic rows have no text index, so a text query that names no kind must
-/// not list them beside the matches.
-#[tokio::test]
-async fn a_text_query_without_a_kind_lists_only_memory_rows() {
-    use clawg_core::memory::store_insert::{CreatedByType, NewEpisodicTrajectoryRecord};
-
-    let h = Harness::start().await;
-    h.post_json(
-        "/v1/memories",
-        json!({ "content": "la configuración del núcleo cambió", "agent_id": "agent-http" }),
-    )
-    .await;
-    h.wait_for_rows("memory", 1).await;
-
-    let record = NewEpisodicTrajectoryRecord {
-        scope: "agent",
-        agent_id: Some("agent-http".to_string()),
-        project_id: None,
-        session_id: "sess-text-query".to_string(),
-        task: "configuracion de un trabajo ajeno".to_string(),
-        tool_calls_json: "[]".to_string(),
-        errors_json: "[]".to_string(),
-        resolution: None,
-        success_score: 0.5,
-        created_by_type: CreatedByType::System,
-        created_by_ref: "agent-http".to_string(),
-        importance: 5.0,
-        created_at_ms: 1_000_000,
-    };
-    h.ctx
-        .runtime
-        .store
-        .insert_episodic_trajectory(record, vec![0.5; 384])
-        .await
-        .expect("seed an episodic row");
-
-    let (_, body) = h.get_json("/v1/memories").await;
-    assert_eq!(body["items"].as_array().expect("items").len(), 2, "both tables are seeded");
-
-    let (status, body) = h.get_json("/v1/memories?q=configuracion").await;
-    assert_eq!(status, 200, "{body}");
-    let items = body["items"].as_array().expect("items");
-    assert_eq!(items.len(), 1, "{body}");
-    assert_eq!(items[0]["kind"], "memory");
+    assert_eq!(status, 400, "a retired kind is refused");
 }
 
 #[tokio::test]
@@ -2746,11 +2700,9 @@ async fn show_returns_every_metadata_field_of_a_saved_memory() {
 #[tokio::test]
 async fn show_missing_is_404() {
     let h = Harness::start().await;
-    for path in ["/v1/memories/memory/999999", "/v1/memories/episodic/1"] {
-        let (status, body) = h.get_json(path).await;
-        assert_eq!(status, 404, "{path}");
-        assert!(body["error"].is_string(), "{body}");
-    }
+    let (status, body) = h.get_json("/v1/memories/memory/999999").await;
+    assert_eq!(status, 404, "{body}");
+    assert!(body["error"].is_string(), "{body}");
 }
 
 /// Looking at a row must not feed the signal that promotes it.
@@ -3627,6 +3579,34 @@ async fn restore_answers_each_refusal_with_its_status() {
     let (status, body) = without.restore("memory", 1, None).await;
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["error"], "embedder_not_ready");
+}
+
+/// A bridge from before V32, or a script, can still name the kinds whose
+/// tables V32 dropped. Every route that takes a kind says where their rows
+/// went instead of answering that the row is missing.
+#[tokio::test]
+async fn a_retired_kind_is_refused_with_where_its_rows_went() {
+    let h = Harness::start().await;
+    let requests = [
+        ("episodic", h.http.get(h.url("/v1/memories/episodic/1"))),
+        ("procedural", h.http.get(h.url("/v1/memories/procedural/1/save"))),
+        ("episodic", h.http.patch(h.url("/v1/memories/episodic/1")).json(&json!({ "importance": 2.0 }))),
+        ("procedural", h.http.delete(h.url("/v1/memories/procedural/1"))),
+        ("episodic", h.http.post(h.url("/v1/memories/episodic/1/restore"))),
+        ("procedural", h.http.get(h.url("/v1/memories?kind=procedural"))),
+    ];
+    for (kind, request) in requests {
+        let (status, body) = h.send(request).await;
+        assert_eq!(status, 400, "{kind}: {body}");
+        let error = body["error"].as_str().expect("an error");
+        for said in [format!("\"{kind}\""), "semantic_fact".to_string(), "new id".to_string(), "search_memory".to_string()] {
+            assert!(error.contains(&said), "{said} in {error}");
+        }
+    }
+
+    let (status, body) = h.get_json("/v1/memories/bogus/1").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("\"memory\""), "{body}");
 }
 
 #[tokio::test]
@@ -6242,6 +6222,28 @@ async fn answering_merge_merges_and_is_undone() {
     let (status, undone) = h.post_json("/v1/projects/merge", json!({ "undo": merge_id })).await;
     assert_eq!(status, 200, "{undone}");
     assert_eq!(project_of(&h, row).await, json!(copy));
+}
+
+/// A bridge of a version that still had `episodic_trajectory` and
+/// `procedural_skill` stays open in the editor after an update, and fails to
+/// read an answer without the fields it requires.
+#[tokio::test]
+async fn the_answers_keep_what_a_bridge_of_the_previous_version_requires() {
+    let h = Harness::start().await;
+    let (app, copy) = (registered(&h, "/work/app").await, registered(&h, "/work/copia").await);
+    let row = save_in(&h, &copy, "the copy keeps its own config").await;
+    suggest(&h, &copy, &app).await;
+
+    let (_, synthesis) = h.post_json("/v1/synthesis", json!({ "project_id": copy })).await;
+    let (_, stats) = h.get_json("/v1/stats").await;
+    let (_, answered) = h.post_json("/v1/projects/suggestions/answer", answer(&app, &copy, "merge")).await;
+
+    assert_eq!(synthesis["pending"][0]["id"], row, "{synthesis}");
+    assert_eq!(synthesis["pending"][0]["kind"], "memory", "{synthesis}");
+    assert_eq!((stats["totals"]["episodic"].as_u64(), stats["totals"]["procedural"].as_u64()), (Some(0), Some(0)), "{stats}");
+    let merge = &answered["merge"];
+    assert_eq!((merge["trajectories"].as_u64(), merge["skills"].as_u64()), (Some(0), Some(0)), "{answered}");
+    assert_eq!(merge["memories"], 1, "{answered}");
 }
 
 #[tokio::test]

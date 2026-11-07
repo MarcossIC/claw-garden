@@ -10,30 +10,22 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "delete_memory",
         None,
-        "Borra una memoria guardada por id y tipo de fila. Primero toma el id de `search_memory`, \
-         `list_memories` o `recall_context`: los ids son por tipo de fila, así que el mismo número existe en \
-         las tres tablas. Una memoria marcada `by <agent>` la guardó otro agente, y borrarla la quita para todos \
+        "Borra una memoria guardada por id. Primero toma el id de `search_memory`, `list_memories` o \
+         `recall_context`. Una memoria marcada `by <agent>` la guardó otro agente, y borrarla la quita para todos \
          los agentes. Borrar la memoria actual de un `topic_key` vuelve actual a la versión que reemplazó. \
          `restore_memory` lo deshace.",
     ),
     (
         "delete_memory",
         Some("id"),
-        "El id de la fila a borrar, como lo imprimen `search_memory`, `list_memories` o `recall_context`. Un hit \
-         de `recall_context` sin tipo de fila delante de su tipo es una memoria.",
-    ),
-    (
-        "delete_memory",
-        Some("kind"),
-        "A qué tabla pertenece el id: memory, episodic o procedural. Obligatorio, porque cada tabla numera sus \
-         filas por separado: el id 7 existe en las tres y en cada una es otra cosa.",
+        "El id de la memoria a borrar, como lo imprimen `search_memory`, `list_memories` o `recall_context`.",
     ),
     (
         "list_memories",
         None,
         "Recorre lo guardado, lo más nuevo primero, sin buscar. Úsala para mostrarle a la persona su inventario de \
          memorias o para encontrar un id que borrar. Lista cada memoria que puedes leer, tuyas y de otros agentes; \
-         `agent` lista sólo las de un agente. Devuelve una línea por fila: id, tipo de fila, tipo, tier, \
+         `agent` lista sólo las de un agente. Devuelve una línea por memoria: id, tipo, tier, \
          importancia, accesos, estado, `by <agent>` cuando la guardó otro agente, y un resumen recortado.",
     ),
     (
@@ -42,16 +34,11 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
         "Sólo las memorias que guardó este agente, como se nombra después de `by` en un listado o una búsqueda. \
          Sin él, lista las de cada agente que puedes leer.",
     ),
-    (
-        "list_memories",
-        Some("kind"),
-        "Qué tabla listar: memory, episodic o procedural. Sin él, lista las tres.",
-    ),
     ("list_memories", Some("limit"), "Cuántas filas devolver, de 1 a 100. Por defecto 50."),
     (
         "list_memories",
         Some("memory_type"),
-        "Sólo las filas de este tipo de memoria. Vale sólo para las filas `memory`.",
+        "Sólo las memorias de este tipo.",
     ),
     (
         "list_memories",
@@ -82,12 +69,6 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
         Some("id"),
         "El id de cualquier pieza del save, como lo imprimen `search_memory`, `list_memories`, `recall_context` o \
          `save_memory`.",
-    ),
-    (
-        "read_memory",
-        Some("kind"),
-        "A qué tabla pertenece el id: memory, episodic o procedural. Por defecto memory, el único tipo de fila que \
-         se guarda en piezas.",
     ),
     (
         "recall_context",
@@ -153,18 +134,13 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "restore_memory",
         None,
-        "Deshace un `delete_memory`: trae de vuelta una memoria borrada, con el id y el tipo de fila con que se \
-         borró, cuando la persona dice que el borrado fue un error. Se rechaza cuando el mismo texto se volvió a \
+        "Deshace un `delete_memory`: trae de vuelta una memoria borrada, con el id con que se borró, \
+         cuando la persona dice que el borrado fue un error. Se rechaza cuando el mismo texto se volvió a \
          guardar después, cuando una memoria más nueva tiene su `topic_key`, o cuando la memoria guarda un \
          secreto. Nombra las memorias guardadas mientras tanto que están cerca de ella, para juzgarlas con \
          `resolve_conflict`.",
     ),
     ("restore_memory", Some("id"), "El id que recibió `delete_memory`."),
-    (
-        "restore_memory",
-        Some("kind"),
-        "El tipo de fila que recibió `delete_memory`. Sólo se pueden restaurar filas memory.",
-    ),
     (
         "save_memory",
         None,
@@ -232,11 +208,13 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
          dependa de una sesión anterior. La coincidencia es por significado, así que pasa una pregunta completa en \
          lenguaje natural, no palabras clave; encuentra memorias escritas con otras palabras, pero a menudo pierde \
          una escrita en otro idioma que la consulta. Devuelve una lista numerada de las memorias cercanas en \
-         relevancia a la mejor (al menos dos), con sus ids, tipos de fila y puntajes; una lista corta significa que \
+         relevancia a la mejor (al menos dos), con sus ids, tipos y puntajes; una lista corta significa que \
          el resto puntuó mucho más bajo, no que no haya nada más guardado. El contenido de más de 500 caracteres se \
          recorta. Un hit marcado piece=K/N es la pieza K, la que mejor coincide, de un texto largo guardado en N \
          piezas; read_memory con su id devuelve el texto entero. Con varias carpetas abiertas en el cliente busca \
-         en todas, y cada hit nombra su proyecto después de project=.",
+         en todas, y un hit nombra su proyecto después de project=. Un hit sin project= no tiene proyecto o viene \
+         de un daemon anterior, y eso no lo vuelve all_projects: cuando no puedas saber a qué proyecto va un save, \
+         pregúntale a la persona.",
     ),
     (
         "search_memory",
@@ -249,7 +227,9 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
         "search_memory",
         Some("project_path"),
         "Ruta absoluta del proyecto en el que buscar. Por defecto, las carpetas que el cliente tiene abiertas, o si \
-         no el directorio en el que arrancó este puente; con varias abiertas busca en todas.",
+         no el directorio en el que arrancó este puente; con varias abiertas busca en todas. El directorio personal \
+         nunca es una de ellas, y si no queda ninguna busca en todos los proyectos, con hits que no nombran su \
+         proyecto.",
     ),
     (
         "search_memory",
@@ -305,7 +285,7 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "update_memory",
         None,
-        "Corrige la importancia, el tipo o el proyecto de una memoria guardada, por id y tipo de fila, cuando la \
+        "Corrige la importancia, el tipo o el proyecto de una memoria guardada, por id, cuando la \
          persona dice que importa más o menos de lo que se guardó, que es otro tipo de memoria, o que pertenece a \
          otro proyecto (to_project_path) o a ninguno (clear_project). Pasa sólo lo que cambia. Una memoria se mueve \
          con el resto de su save y de su historial de tema, y no se mueve adonde el mismo texto o la misma clave de \
@@ -323,8 +303,8 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     (
         "update_memory",
         Some("id"),
-        "El id de la fila a cambiar, como lo imprimen `save_memory`, `search_memory`, `list_memories` o \
-         `recall_context`. Un hit de `recall_context` sin tipo de fila delante de su tipo es una memoria.",
+        "El id de la memoria a cambiar, como lo imprimen `save_memory`, `search_memory`, `list_memories` o \
+         `recall_context`.",
     ),
     (
         "update_memory",
@@ -333,13 +313,8 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
     ),
     (
         "update_memory",
-        Some("kind"),
-        "A qué tabla pertenece el id: memory, episodic o procedural.",
-    ),
-    (
-        "update_memory",
         Some("memory_type"),
-        "El tipo nuevo, sólo para kind memory, uno de los valores listados. Omítelo para dejar el tipo como está.",
+        "El tipo nuevo, uno de los valores listados. Omítelo para dejar el tipo como está.",
     ),
     (
         "update_memory",

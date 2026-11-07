@@ -41,33 +41,11 @@ pub const MAINTENANCE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// that actually change tier get their `last_modified_at` bumped — avoids
 /// stamping every tier<3 row (and the WAL churn that would cause) on every
 /// pass.
-fn demote_sql(table: &str) -> String {
-    format!(
-        "UPDATE {table} \
-         SET tier = demote_tier(tier, (?1 - last_accessed_at) / 86400000.0, importance), \
-             last_modified_at = ?1 \
-         WHERE tier < 3 \
-           AND demote_tier(tier, (?1 - last_accessed_at) / 86400000.0, importance) <> tier"
-    )
-}
-
-/// Every table whose rows carry a tier that inactivity is allowed to lower.
-///
-/// All three, and the two beyond `memory` are not symmetry for its own sake.
-/// A skill is inserted at tier 1 with importance 8.0 — under the 9.0 pivotal
-/// cutoff — so one the user stopped reaching for a year ago kept a tier-1 floor
-/// forever and outranked fresh material on every query. That is the reachability
-/// bug this pass exists to prevent, and it was live on `procedural_skill`.
-///
-/// `episodic_trajectory` finds nothing today: the writer hands its insert a
-/// hardcoded importance of 5.0, which lands every trajectory on tier 3, and
-/// tier 3 is the floor. It is covered anyway because that is one literal, not a
-/// structural property — `compute_tier` fast-tracks importance >= 9.0 to tier 1
-/// before it looks at the type at all. Leaving the table out would mean the day
-/// someone derives trajectory importance from its success score, trajectories
-/// start promoting and never decay, and nothing says so. The cost of covering
-/// it is one UPDATE per day that matches zero rows.
-const DEMOTING_TABLES: [&str; 3] = ["memory", "episodic_trajectory", "procedural_skill"];
+const DEMOTE_SQL: &str = "UPDATE memory \
+     SET tier = demote_tier(tier, (?1 - last_accessed_at) / 86400000.0, importance), \
+         last_modified_at = ?1 \
+     WHERE tier < 3 \
+       AND demote_tier(tier, (?1 - last_accessed_at) / 86400000.0, importance) <> tier";
 
 /// Runs one bulk inactivity-demotion pass against `memory`.
 ///
@@ -92,19 +70,10 @@ pub(crate) async fn run_maintenance_once(store: &MemoryStore) {
 /// call returns — the caller (the maintenance loop) keeps ticking.
 pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: TimestampMs) {
     let started = std::time::Instant::now();
-    // One statement per table, and a failure moves to the next rather than
-    // aborting: the three tables decay independently, so one table's demotion
-    // failing is no reason to leave the other two stale for a whole day. Same
-    // per-table isolation `sweep_orphaned_vectors` applies below.
-    for table in DEMOTING_TABLES {
-        let sql = demote_sql(table);
-        if let Err(e) = store
-            .conn
-            .call(move |c| c.execute(&sql, rusqlite::params![now_ms]))
-            .await
-        {
-            log::warn!("maintenance: bulk tier demotion failed for {table}: {e}");
-        }
+    // A failure is logged and the pass goes on: the steps below do not need
+    // the demotion to have run.
+    if let Err(e) = store.conn.call(move |c| c.execute(DEMOTE_SQL, rusqlite::params![now_ms])).await {
+        log::warn!("maintenance: bulk tier demotion failed: {e}");
     }
 
     // Placed after the demotion pass (which can't orphan a vector — it never
@@ -155,15 +124,7 @@ pub(crate) async fn run_maintenance_once_at(store: &MemoryStore, now_ms: Timesta
     // losing one day's corpus-size log line is not worth stopping the loop.
     match count_rows(store).await {
         Ok(counts) => {
-            log::info!(
-                "corpus live/total memory={}/{} episodic={}/{} procedural={}/{}",
-                counts.memory.live,
-                counts.memory.total,
-                counts.episodic.live,
-                counts.episodic.total,
-                counts.procedural.live,
-                counts.procedural.total,
-            );
+            log::info!("corpus live/total memory={}/{}", counts.live, counts.total);
         }
         Err(e) => log::warn!("maintenance: row count query failed: {e}"),
     }
@@ -227,9 +188,9 @@ async fn classify_languages(store: &MemoryStore) -> usize {
     }
 }
 
-/// Deletes the vector row of every soft-deleted parent row, across all 3
-/// tables, and reports how many it found. Two steps per table — select the
-/// orphans, then one `DELETE FROM {vectors} WHERE rowid = ?1` per id — rather
+/// Deletes the vector row of every soft-deleted row of `memory`, and reports
+/// how many it found. Two steps — select the orphans, then one
+/// `DELETE FROM memory_vectors WHERE rowid = ?1` per id — rather
 /// than `DELETE ... WHERE rowid IN (subquery)`: a bare `rowid = ?` is the
 /// point-lookup plan the vector virtual table supports directly, while the
 /// `IN (subquery)` form drops to a full scan plus a per-row update on the
@@ -252,45 +213,33 @@ async fn classify_languages(store: &MemoryStore) -> usize {
 /// it is bounded by how many vectors are live — a number that shrinks as rows
 /// are deleted instead of growing with every tombstone the parent table keeps.
 ///
-/// A query failure is logged and this moves to the next table — one table's
-/// sweep failing must not block the others or abort the demotion pass already
-/// committed above.
+/// A query failure is logged and reported as 0 — the sweep failing must not
+/// abort the demotion pass already committed above.
 async fn sweep_orphaned_vectors(store: &MemoryStore) -> usize {
-    const TABLES: [(&str, &str); 3] = [
-        ("memory", "memory_vectors"),
-        ("episodic_trajectory", "episodic_vectors"),
-        ("procedural_skill", "procedural_vectors"),
-    ];
-
-    let mut swept = 0usize;
-    for (parent, vectors) in TABLES {
-        let select_sql = format!(
-            "SELECT p.id FROM {parent} p \
-             JOIN {vectors} v ON v.rowid = p.id \
-             WHERE p.deleted_at IS NOT NULL"
-        );
-        let delete_sql = format!("DELETE FROM {vectors} WHERE rowid = ?1");
-        let result = store
-            .conn
-            .call(move |c| -> rusqlite::Result<usize> {
-                let ids: Vec<i64> = {
-                    let mut stmt = c.prepare(&select_sql)?;
-                    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
-                    rows.collect::<rusqlite::Result<Vec<i64>>>()?
-                };
-                let n = ids.len();
-                for id in ids {
-                    c.execute(&delete_sql, rusqlite::params![id])?;
-                }
-                Ok(n)
-            })
-            .await;
-        match result {
-            Ok(n) => swept += n,
-            Err(e) => log::warn!("maintenance: orphaned-vector sweep failed for {parent}: {e}"),
+    let result = store
+        .conn
+        .call(|c| -> rusqlite::Result<usize> {
+            let ids: Vec<i64> = {
+                let mut stmt = c.prepare(
+                    "SELECT p.id FROM memory p JOIN memory_vectors v ON v.rowid = p.id WHERE p.deleted_at IS NOT NULL",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+                rows.collect::<rusqlite::Result<Vec<i64>>>()?
+            };
+            let n = ids.len();
+            for id in ids {
+                c.execute("DELETE FROM memory_vectors WHERE rowid = ?1", rusqlite::params![id])?;
+            }
+            Ok(n)
+        })
+        .await;
+    match result {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("maintenance: orphaned-vector sweep failed: {e}");
+            0
         }
     }
-    swept
 }
 
 /// Returns every `disputed` row with no live row left to dispute to
@@ -335,22 +284,15 @@ async fn drop_orphaned_pairs(store: &MemoryStore) -> usize {
     }
 }
 
-/// Total vs. live (`deleted_at IS NULL`) row count for one table.
+/// Total vs. live (`deleted_at IS NULL`) row count of `memory`, queried once
+/// per maintenance pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RowCounts {
     pub(crate) total: i64,
     pub(crate) live: i64,
 }
 
-/// Row counts for all three memory tables, queried once per maintenance pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TableRowCounts {
-    pub(crate) memory: RowCounts,
-    pub(crate) episodic: RowCounts,
-    pub(crate) procedural: RowCounts,
-}
-
-/// Two narrow `SELECT COUNT(*)` statements per table rather than one
+/// Two narrow `SELECT COUNT(*)` statements rather than one
 /// `SUM(deleted_at IS NULL)`: the bare count rides `idx_memory_last_accessed`
 /// (`V1__init.sql`, the only non-partial index on `memory`) as a
 /// covering-index scan, and the live count rides the partial
@@ -362,37 +304,21 @@ pub(crate) struct TableRowCounts {
 /// idx_memory_agent_active` respectively, while the folded `SUM` form falls
 /// back to a bare `SCAN memory`.
 ///
-/// Reporting only the live count would hide how much of each table is
-/// soft-deleted. Those rows stay in the parent table until `clawg purge`
-/// removes one from `memory` (nothing removes rows of `episodic_trajectory`
-/// or `procedural_skill`), so the gap between `total` and `live` is accumulated
-/// tombstone weight. Their vectors no longer sit in that gap: a delete drops
+/// Reporting only the live count would hide how much of the table is
+/// soft-deleted. Those rows stay until `clawg purge` removes one, so the gap
+/// between `total` and `live` is accumulated tombstone weight. Their vectors no longer sit in that gap: a delete drops
 /// the vector row inline and [`sweep_orphaned_vectors`] backfills the ones
 /// deleted before that existed, so the gap no longer inflates the vec0 scan.
 /// What it still measures is parent-table growth, which is what decides when
 /// a real purge becomes necessary.
-pub(crate) async fn count_rows(store: &MemoryStore) -> Result<TableRowCounts, MemoryError> {
+pub(crate) async fn count_rows(store: &MemoryStore) -> Result<RowCounts, MemoryError> {
     store
         .conn
-        .call(|c| -> rusqlite::Result<TableRowCounts> {
+        .call(|c| -> rusqlite::Result<RowCounts> {
             let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [], |r| r.get(0)) };
-            Ok(TableRowCounts {
-                memory: RowCounts {
-                    total: count("SELECT COUNT(*) FROM memory")?,
-                    live: count("SELECT COUNT(*) FROM memory WHERE deleted_at IS NULL")?,
-                },
-                episodic: RowCounts {
-                    total: count("SELECT COUNT(*) FROM episodic_trajectory")?,
-                    live: count(
-                        "SELECT COUNT(*) FROM episodic_trajectory WHERE deleted_at IS NULL",
-                    )?,
-                },
-                procedural: RowCounts {
-                    total: count("SELECT COUNT(*) FROM procedural_skill")?,
-                    live: count(
-                        "SELECT COUNT(*) FROM procedural_skill WHERE deleted_at IS NULL",
-                    )?,
-                },
+            Ok(RowCounts {
+                total: count("SELECT COUNT(*) FROM memory")?,
+                live: count("SELECT COUNT(*) FROM memory WHERE deleted_at IS NULL")?,
             })
         })
         .await
@@ -440,49 +366,9 @@ pub async fn run_maintenance_loop(
 /// never rewritten, so the cursor needs no re-scan of rows already passed.
 const REEMBED_BATCH: i64 = 200;
 
-/// Which of the three vector-bearing tables [`reembed_table`] is walking.
-/// A closed enum rather than a `(&str, &str)` pair like
-/// [`sweep_orphaned_vectors`]'s `TABLES`, because `procedural_skill` needs a
-/// THIRD column (`skill_name`, alongside `trigger`) the other two tables
-/// don't have — a uniform 2-column tuple can't express that without a
-/// sentinel value threaded through code that doesn't need it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReembedTable {
-    Memory,
-    Episodic,
-    Procedural,
-}
-
-impl ReembedTable {
-    fn parent(self) -> &'static str {
-        match self {
-            Self::Memory => "memory",
-            Self::Episodic => "episodic_trajectory",
-            Self::Procedural => "procedural_skill",
-        }
-    }
-
-    fn vectors(self) -> &'static str {
-        match self {
-            Self::Memory => "memory_vectors",
-            Self::Episodic => "episodic_vectors",
-            Self::Procedural => "procedural_vectors",
-        }
-    }
-}
-
-/// The text a `procedural_skill` row's vector was embedded from. It is the
-/// string the skill was first written with, so a re-embed must rebuild it
-/// exactly or the new vector lands somewhere the old one never was.
-pub(crate) fn skill_embedding_text(trigger: &str, skill_name: &str) -> String {
-    format!("{trigger} {skill_name}")
-}
-
 /// One row read by [`select_reembed_batch`]: its id, the text a `ReInfer`
-/// pass would embed (for `procedural_skill` this is already
-/// [`skill_embedding_text`]'s output — never rebuilt
-/// by hand here), and the raw bytes currently sitting in the matching
-/// vector row (what a `Normalize` pass renormalizes).
+/// pass would embed, and the raw bytes currently sitting in its vector row
+/// (what a `Normalize` pass renormalizes).
 struct ReembedRow {
     id: i64,
     text: String,
@@ -490,7 +376,7 @@ struct ReembedRow {
 }
 
 /// Two modes as types: which operation [`reembed_all`] performs against the
-/// store's three vector tables.
+/// store's vectors.
 ///
 /// `Normalize` carries no embedder and no identity — structurally, not by
 /// convention, it cannot reach the arm in [`reembed_all`] that writes
@@ -506,8 +392,8 @@ struct ReembedRow {
 /// Because a failed pass leaves `embedding_contract` untouched (see
 /// [`reembed_all`]'s failure semantics), re-running IS the recovery path,
 /// and it converges: rows already written get the same bytes back, rows
-/// that were skipped get done, and the contract flips only once all three
-/// tables come back clean.
+/// that were skipped get done, and the contract flips only once the table
+/// comes back clean.
 pub enum ReembedMode {
     Normalize,
     ReInfer(ReInferPlan),
@@ -535,7 +421,7 @@ impl ReInferPlan {
     }
 }
 
-/// Attempted/updated/failed/aborted counts for one table's pass. The unit
+/// Attempted/updated/failed/aborted counts for a pass over `memory`. The unit
 /// [`reembed_all`]'s caller reads to learn what actually happened, since
 /// [`reembed_all`] itself never returns `Err`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -547,28 +433,27 @@ pub(crate) struct TableOutcome {
     pub(crate) aborted: bool,
 }
 
-/// Outcome of a full [`reembed_all`] pass across all three tables.
+/// Outcome of a full [`reembed_all`] pass.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReembedReport {
-    pub(crate) per_table: [TableOutcome; 3],
+    pub(crate) memory: TableOutcome,
     pub(crate) contract_updated: bool,
 }
 
-/// Backfill for the three vector tables. The only automatic caller is the
+/// Backfill for the vectors of `memory`. The only automatic caller is the
 /// pooling upgrade in [`crate::memory::bootstrap::verify_or_reembed`], a
 /// mismatch this binary itself introduced and can name exactly; any other
 /// mismatch stays the embedding contract's loud, safe stop (an empty cell,
 /// an `error` event), because re-inferring the whole store whenever a config
 /// changed would be a CPU-heavy migration nobody asked for.
 ///
-/// Never returns `Err` — fail-soft like [`sweep_orphaned_vectors`]. Each
-/// table is walked independently; a failure in one (a batch's `UPDATE`
-/// transaction failing, which rolls the whole batch back and aborts the
-/// REST of that table) does not stop the other two from being attempted.
-/// [`ReembedReport`] is how the caller finds out what actually happened.
+/// Never returns `Err` — fail-soft like [`sweep_orphaned_vectors`]. A batch's
+/// `UPDATE` transaction failing rolls the whole batch back and aborts the
+/// rest of the pass; [`ReembedReport`] is how the caller finds out what
+/// actually happened.
 ///
 /// The `embedding_contract` row is written LAST, and only when `mode` is
-/// `ReInfer` AND every table came back with `failed == 0` and
+/// `ReInfer` AND the pass came back with `failed == 0` and
 /// `aborted == false`. After a partial `ReInfer` failure the store holds
 /// vectors from BOTH the old and the new embedding space, and no value
 /// written to the contract can describe that truthfully — so the choice is
@@ -582,23 +467,19 @@ pub struct ReembedReport {
 /// honest, so leaving the contract untouched on any failure is not an
 /// omission — it is the whole point of writing it last.
 pub async fn reembed_all(store: &MemoryStore, mode: ReembedMode) -> ReembedReport {
-    let memory = reembed_table(store, &mode, ReembedTable::Memory).await;
-    let episodic = reembed_table(store, &mode, ReembedTable::Episodic).await;
-    let procedural = reembed_table(store, &mode, ReembedTable::Procedural).await;
-    let per_table = [memory, episodic, procedural];
+    let memory = reembed_table(store, &mode).await;
 
     let contract_updated = match &mode {
         ReembedMode::Normalize => false,
         ReembedMode::ReInfer(plan) => {
-            let all_clean = per_table.iter().all(|t| t.failed == 0 && !t.aborted);
-            if !all_clean {
+            if memory.failed > 0 || memory.aborted {
                 false
             } else {
                 match write_embedding_contract(store, &plan.identity).await {
                     Ok(()) => true,
                     Err(e) => {
                         log::warn!(
-                            "reembed_all: all 3 tables migrated cleanly but the contract write \
+                            "reembed_all: every vector migrated cleanly but the contract write \
                              failed: {e} — embedding_contract still holds the OLD identity, so \
                              the next boot will report Mismatch rather than trust a migration \
                              that never got its receipt written"
@@ -610,10 +491,10 @@ pub async fn reembed_all(store: &MemoryStore, mode: ReembedMode) -> ReembedRepor
         }
     };
 
-    ReembedReport { per_table, contract_updated }
+    ReembedReport { memory, contract_updated }
 }
 
-/// Walks one table to completion via keyset pagination. Three steps per
+/// Walks `memory` to completion via keyset pagination. Three steps per
 /// batch, in this order and no other: (1) SELECT the batch inside
 /// `conn.call`, connection released immediately after; (2) OUTSIDE the
 /// connection, compute every row's new vector (`embed_with_role` is async
@@ -621,18 +502,18 @@ pub async fn reembed_all(store: &MemoryStore, mode: ReembedMode) -> ReembedRepor
 /// inside `conn.call`); (3) one `conn.call` transaction that `UPDATE`s
 /// every successfully-computed row and commits — the writer is held only
 /// for SQL, and the batch is all-or-nothing.
-async fn reembed_table(store: &MemoryStore, mode: &ReembedMode, table: ReembedTable) -> TableOutcome {
+async fn reembed_table(store: &MemoryStore, mode: &ReembedMode) -> TableOutcome {
     let mut attempted = 0usize;
     let mut updated = 0usize;
     let mut failed = 0usize;
     let mut after_id: i64 = 0;
 
     loop {
-        let batch = match select_reembed_batch(store, table, after_id, REEMBED_BATCH).await {
+        let batch = match select_reembed_batch(store, after_id, REEMBED_BATCH).await {
             Ok(rows) => rows,
             Err(e) => {
-                log::warn!("reembed_all: batch select failed for {}: {e}", table.parent());
-                return TableOutcome { table: table.parent(), attempted, updated, failed, aborted: true };
+                log::warn!("reembed_all: batch select failed: {e}");
+                return TableOutcome { table: "memory", attempted, updated, failed, aborted: true };
             }
         };
         if batch.is_empty() {
@@ -651,11 +532,7 @@ async fn reembed_table(store: &MemoryStore, mode: &ReembedMode, table: ReembedTa
             match compute_new_embedding(mode, row).await {
                 Ok(v) => writes.push((row.id, serialize_f32_vec(&v))),
                 Err(e) => {
-                    log::warn!(
-                        "reembed_all: embed failed for {} id={}: {e} — row keeps its old vector",
-                        table.parent(),
-                        row.id
-                    );
+                    log::warn!("reembed_all: embed failed for id={}: {e} — row keeps its old vector", row.id);
                     failed += 1;
                 }
             }
@@ -663,16 +540,15 @@ async fn reembed_table(store: &MemoryStore, mode: &ReembedMode, table: ReembedTa
 
         if !writes.is_empty() {
             let n = writes.len();
-            match write_reembed_batch(store, table, writes).await {
+            match write_reembed_batch(store, writes).await {
                 Ok(()) => updated += n,
                 Err(e) => {
                     // A write failure here is about the STORE refusing a
                     // write, not about any one row's content — burning
                     // inference against more batches would not change
-                    // that, so this table stops here while the other two
-                    // still get their own independent attempt.
-                    log::warn!("reembed_all: batch UPDATE failed for {}: {e}", table.parent());
-                    return TableOutcome { table: table.parent(), attempted, updated, failed, aborted: true };
+                    // that, so the pass stops here.
+                    log::warn!("reembed_all: batch UPDATE failed: {e}");
+                    return TableOutcome { table: "memory", attempted, updated, failed, aborted: true };
                 }
             }
         }
@@ -682,7 +558,7 @@ async fn reembed_table(store: &MemoryStore, mode: &ReembedMode, table: ReembedTa
         }
     }
 
-    TableOutcome { table: table.parent(), attempted, updated, failed, aborted: false }
+    TableOutcome { table: "memory", attempted, updated, failed, aborted: false }
 }
 
 /// Computes one row's new vector. `ReInfer` re-runs inference — always
@@ -708,87 +584,42 @@ async fn compute_new_embedding(mode: &ReembedMode, row: &ReembedRow) -> Result<V
     }
 }
 
-/// One batch's SELECT, joined to its vector table so the currently-stored
+/// One batch's SELECT, joined to `memory_vectors` so the currently-stored
 /// bytes ride along with the text in a single point-lookup pass (same
 /// `rowid = p.id` join shape as [`sweep_orphaned_vectors`]) — `Normalize`
 /// needs those bytes and `ReInfer` needs the text, and fetching both
 /// unconditionally is cheaper than a second round trip to find out which
 /// one the caller actually wanted.
-///
-/// `procedural_skill` is the one table where the "text" isn't a single
-/// column: it resolves `trigger`+`skill_name` through
-/// [`skill_embedding_text`] instead of concatenating them here by hand.
 async fn select_reembed_batch(
     store: &MemoryStore,
-    table: ReembedTable,
     after_id: i64,
     limit: i64,
 ) -> Result<Vec<ReembedRow>, tokio_rusqlite::Error> {
     store
         .conn
         .call(move |c| -> rusqlite::Result<Vec<ReembedRow>> {
-            match table {
-                ReembedTable::Procedural => {
-                    let mut stmt = c.prepare(
-                        "SELECT p.id, p.trigger, p.skill_name, v.embedding \
-                         FROM procedural_skill p JOIN procedural_vectors v ON v.rowid = p.id \
-                         WHERE p.deleted_at IS NULL AND p.id > ?1 ORDER BY p.id LIMIT ?2",
-                    )?;
-                    let rows = stmt.query_map(rusqlite::params![after_id, limit], |r| {
-                        let id: i64 = r.get(0)?;
-                        let trigger: String = r.get(1)?;
-                        let skill_name: String = r.get(2)?;
-                        let existing: Vec<u8> = r.get(3)?;
-                        Ok(ReembedRow {
-                            id,
-                            text: skill_embedding_text(&trigger, &skill_name),
-                            existing,
-                        })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                    Ok(rows)
-                }
-                ReembedTable::Memory => {
-                    // A piece of a long save was embedded behind the save's
-                    // head; its link keeps that head so the vector rebuilt
-                    // here is the one the piece was saved with.
-                    let mut stmt = c.prepare(
-                        "SELECT p.id, p.content, v.embedding, \
-                                (SELECT mp.context FROM memory_piece mp \
-                                 WHERE mp.memory_id = p.id AND mp.context <> '' \
-                                 ORDER BY mp.save_id LIMIT 1) \
-                         FROM memory p JOIN memory_vectors v ON v.rowid = p.id \
-                         WHERE p.deleted_at IS NULL AND p.id > ?1 ORDER BY p.id LIMIT ?2",
-                    )?;
-                    let rows = stmt
-                        .query_map(rusqlite::params![after_id, limit], |r| {
-                            let id: i64 = r.get(0)?;
-                            let content: String = r.get(1)?;
-                            let existing: Vec<u8> = r.get(2)?;
-                            let context: Option<String> = r.get(3)?;
-                            let text = embedding_text(context.as_deref().unwrap_or(""), &content).into_owned();
-                            Ok(ReembedRow { id, text, existing })
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    Ok(rows)
-                }
-                ReembedTable::Episodic => {
-                    let mut stmt = c.prepare(
-                        "SELECT p.id, p.task, v.embedding FROM episodic_trajectory p \
-                         JOIN episodic_vectors v ON v.rowid = p.id \
-                         WHERE p.deleted_at IS NULL AND p.id > ?1 ORDER BY p.id LIMIT ?2",
-                    )?;
-                    let rows = stmt
-                        .query_map(rusqlite::params![after_id, limit], |r| {
-                            let id: i64 = r.get(0)?;
-                            let text: String = r.get(1)?;
-                            let existing: Vec<u8> = r.get(2)?;
-                            Ok(ReembedRow { id, text, existing })
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    Ok(rows)
-                }
-            }
+            // A piece of a long save was embedded behind the save's head; its
+            // link keeps that head so the vector rebuilt here is the one the
+            // piece was saved with.
+            let mut stmt = c.prepare(
+                "SELECT p.id, p.content, v.embedding, \
+                        (SELECT mp.context FROM memory_piece mp \
+                         WHERE mp.memory_id = p.id AND mp.context <> '' \
+                         ORDER BY mp.save_id LIMIT 1) \
+                 FROM memory p JOIN memory_vectors v ON v.rowid = p.id \
+                 WHERE p.deleted_at IS NULL AND p.id > ?1 ORDER BY p.id LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![after_id, limit], |r| {
+                    let id: i64 = r.get(0)?;
+                    let content: String = r.get(1)?;
+                    let existing: Vec<u8> = r.get(2)?;
+                    let context: Option<String> = r.get(3)?;
+                    let text = embedding_text(context.as_deref().unwrap_or(""), &content).into_owned();
+                    Ok(ReembedRow { id, text, existing })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })
         .await
 }
@@ -802,19 +633,13 @@ async fn select_reembed_batch(
 /// against is unreachable against this schema. No DELETE+INSERT dance, and
 /// no `rowid IN (subquery)` either — a bare `rowid = ?` is the point-lookup
 /// plan the vector virtual table supports directly.
-async fn write_reembed_batch(
-    store: &MemoryStore,
-    table: ReembedTable,
-    updates: Vec<(i64, Vec<u8>)>,
-) -> Result<(), tokio_rusqlite::Error> {
-    let vectors = table.vectors();
-    let sql = format!("UPDATE {vectors} SET embedding = ?1 WHERE rowid = ?2");
+async fn write_reembed_batch(store: &MemoryStore, updates: Vec<(i64, Vec<u8>)>) -> Result<(), tokio_rusqlite::Error> {
     store
         .conn
         .call(move |c| -> rusqlite::Result<()> {
             let tx = c.transaction()?;
             for (id, bytes) in &updates {
-                tx.execute(&sql, rusqlite::params![bytes, id])?;
+                tx.execute("UPDATE memory_vectors SET embedding = ?1 WHERE rowid = ?2", rusqlite::params![bytes, id])?;
             }
             tx.commit()?;
             Ok(())
@@ -880,7 +705,6 @@ mod tests {
     use crate::memory::clock::TimestampMs;
     use crate::memory::db::MemoryStore;
     use crate::memory::embedder::{EmbedRole, Embedder};
-    use std::sync::atomic::{AtomicI64, Ordering};
 
     // ── Test helpers ──────────────────────────────────────────────────────
 
@@ -900,12 +724,7 @@ mod tests {
         TimestampMs::now()
     }
 
-    /// Monotonic counter to keep `episodic_trajectory.session_id` (UNIQUE)
-    /// distinct across seeded rows within a single test.
-    static NONCE: AtomicI64 = AtomicI64::new(0);
-
-    /// Seeds one row in `table` ("memory" | "episodic_trajectory" |
-    /// "procedural_skill") with the given `tier`/`importance`, and
+    /// Seeds one row of `memory` with the given `tier`/`importance`, and
     /// `last_accessed_at = now + offset_ms` (so a NEGATIVE `offset_ms`
     /// places the row that many milliseconds in the PAST — matching the
     /// boundary offsets, e.g. `-7_776_000_001` for "just over
@@ -914,63 +733,23 @@ mod tests {
     /// the 1ms-under-boundary offsets are racy otherwise.
     /// `last_modified_at`/`created_at` are seeded at `0` so tests can
     /// assert "untouched" by checking they stay `0`.
-    async fn seed_row(store: &MemoryStore, table: &str, tier: i64, importance: f64, now: TimestampMs, offset_ms: i64) -> i64 {
+    async fn seed_row(store: &MemoryStore, tier: i64, importance: f64, now: TimestampMs, offset_ms: i64) -> i64 {
         // Adding a millisecond offset to an instant leaves the type, because the
         // instant deliberately exposes no arithmetic — every value enters it through a
         // named constructor so the unit is written at each construction site.
         let last_accessed_at = now.as_millis_i64() + offset_ms;
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        let table = table.to_string();
         store
             .conn
             .call(move |c| -> rusqlite::Result<i64> {
-                match table.as_str() {
-                    "memory" => {
-                        c.execute(
-                            "INSERT INTO memory \
-                             (scope, agent_id, content, memory_type, tier, importance, \
-                              created_at, last_modified_at, last_accessed_at, \
-                              created_by_type, created_by_ref) \
-                             VALUES ('agent', 'test-agent', 'seed content', 'chat_message', \
-                                     ?1, ?2, 0, 0, ?3, 'agent', '')",
-                            rusqlite::params![tier, importance, last_accessed_at],
-                        )?;
-                    }
-                    "episodic_trajectory" => {
-                        c.execute(
-                            "INSERT INTO episodic_trajectory \
-                             (scope, agent_id, session_id, task, tier, importance, \
-                              created_at, last_modified_at, last_accessed_at, \
-                              created_by_type, created_by_ref) \
-                             VALUES ('agent', 'test-agent', ?4, 'seed task', \
-                                     ?1, ?2, 0, 0, ?3, 'agent', '')",
-                            rusqlite::params![
-                                tier,
-                                importance,
-                                last_accessed_at,
-                                format!("sess-{nonce}")
-                            ],
-                        )?;
-                    }
-                    "procedural_skill" => {
-                        c.execute(
-                            "INSERT INTO procedural_skill \
-                             (scope, agent_id, skill_name, trigger, tier, importance, \
-                              promoted_at, source_trajectory_ids, \
-                              created_at, last_modified_at, last_accessed_at, \
-                              created_by_type, created_by_ref) \
-                             VALUES ('agent', 'test-agent', ?4, 'seed trigger', \
-                                     ?1, ?2, 0, '[]', 0, 0, ?3, 'agent', '')",
-                            rusqlite::params![
-                                tier,
-                                importance,
-                                last_accessed_at,
-                                format!("skill-{nonce}")
-                            ],
-                        )?;
-                    }
-                    other => panic!("seed_row: unknown table '{other}'"),
-                }
+                c.execute(
+                    "INSERT INTO memory \
+                     (scope, agent_id, content, memory_type, tier, importance, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref) \
+                     VALUES ('agent', 'test-agent', 'seed content', 'chat_message', \
+                             ?1, ?2, 0, 0, ?3, 'agent', '')",
+                    rusqlite::params![tier, importance, last_accessed_at],
+                )?;
                 Ok(c.last_insert_rowid())
             })
             .await
@@ -980,60 +759,25 @@ mod tests {
     /// Seeds one row already soft-deleted (`deleted_at = 1`), plus its
     /// vector row, via a raw transaction that bypasses `delete_memory_core`
     /// entirely — the vector is never pruned, exactly like a row that was
-    /// soft-deleted before vector pruning existed. Returns the parent row's
-    /// id; the vector table's rowid is the same value.
-    async fn seed_orphaned_deleted_row(store: &MemoryStore, table: &str) -> i64 {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        let table = table.to_string();
+    /// soft-deleted before vector pruning existed. Returns the row's id; the
+    /// vector's rowid is the same value.
+    async fn seed_orphaned_deleted_row(store: &MemoryStore) -> i64 {
         let embedding = vec![0u8; 384 * 4];
         store
             .conn
             .call(move |c| -> rusqlite::Result<i64> {
                 let tx = c.transaction()?;
-                let (vectors_table, id) = match table.as_str() {
-                    "memory" => {
-                        tx.execute(
-                            "INSERT INTO memory \
-                             (scope, agent_id, content, memory_type, tier, importance, \
-                              created_at, last_modified_at, last_accessed_at, \
-                              created_by_type, created_by_ref, deleted_at) \
-                             VALUES ('agent', 'test-agent', 'seed content', 'chat_message', \
-                                     3, 5.0, 0, 0, 0, 'agent', '', 1)",
-                            [],
-                        )?;
-                        ("memory_vectors", tx.last_insert_rowid())
-                    }
-                    "episodic_trajectory" => {
-                        tx.execute(
-                            "INSERT INTO episodic_trajectory \
-                             (scope, agent_id, session_id, task, tier, importance, \
-                              created_at, last_modified_at, last_accessed_at, \
-                              created_by_type, created_by_ref, deleted_at) \
-                             VALUES ('agent', 'test-agent', ?1, 'seed task', \
-                                     3, 5.0, 0, 0, 0, 'agent', '', 1)",
-                            rusqlite::params![format!("sess-sweep-{nonce}")],
-                        )?;
-                        ("episodic_vectors", tx.last_insert_rowid())
-                    }
-                    "procedural_skill" => {
-                        tx.execute(
-                            "INSERT INTO procedural_skill \
-                             (scope, agent_id, skill_name, trigger, tier, importance, \
-                              promoted_at, source_trajectory_ids, \
-                              created_at, last_modified_at, last_accessed_at, \
-                              created_by_type, created_by_ref, deleted_at) \
-                             VALUES ('agent', 'test-agent', ?1, 'seed trigger', \
-                                     1, 8.0, 0, '[]', 0, 0, 0, 'agent', '', 1)",
-                            rusqlite::params![format!("skill-sweep-{nonce}")],
-                        )?;
-                        ("procedural_vectors", tx.last_insert_rowid())
-                    }
-                    other => panic!("seed_orphaned_deleted_row: unknown table '{other}'"),
-                };
                 tx.execute(
-                    &format!("INSERT INTO {vectors_table}(rowid, embedding) VALUES (?, ?)"),
-                    rusqlite::params![id, embedding],
+                    "INSERT INTO memory \
+                     (scope, agent_id, content, memory_type, tier, importance, \
+                      created_at, last_modified_at, last_accessed_at, \
+                      created_by_type, created_by_ref, deleted_at) \
+                     VALUES ('agent', 'test-agent', 'seed content', 'chat_message', \
+                             3, 5.0, 0, 0, 0, 'agent', '', 1)",
+                    [],
                 )?;
+                let id = tx.last_insert_rowid();
+                tx.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)", rusqlite::params![id, embedding])?;
                 tx.commit()?;
                 Ok(id)
             })
@@ -1041,34 +785,27 @@ mod tests {
             .expect("seed_orphaned_deleted_row failed")
     }
 
-    async fn vector_row_count(store: &MemoryStore, vectors_table: &'static str, id: i64) -> i64 {
-        let sql = format!("SELECT COUNT(*) FROM {vectors_table} WHERE rowid = ?1");
+    async fn vector_row_count(store: &MemoryStore, id: i64) -> i64 {
         store
             .conn
-            .call(move |c| c.query_row(&sql, [id], |r| r.get(0)))
+            .call(move |c| c.query_row("SELECT COUNT(*) FROM memory_vectors WHERE rowid = ?1", [id], |r| r.get(0)))
             .await
             .unwrap()
     }
 
-    async fn tier_of(store: &MemoryStore, table: &str, id: i64) -> i64 {
-        let sql = format!("SELECT tier FROM {table} WHERE id = ?1");
+    async fn tier_of(store: &MemoryStore, id: i64) -> i64 {
+        store.conn.call(move |c| c.query_row("SELECT tier FROM memory WHERE id = ?1", [id], |r| r.get(0))).await.unwrap()
+    }
+
+    async fn last_modified_at_of(store: &MemoryStore, id: i64) -> i64 {
         store
             .conn
-            .call(move |c| c.query_row(&sql, [id], |r| r.get(0)))
+            .call(move |c| c.query_row("SELECT last_modified_at FROM memory WHERE id = ?1", [id], |r| r.get(0)))
             .await
             .unwrap()
     }
 
-    async fn last_modified_at_of(store: &MemoryStore, table: &str, id: i64) -> i64 {
-        let sql = format!("SELECT last_modified_at FROM {table} WHERE id = ?1");
-        store
-            .conn
-            .call(move |c| c.query_row(&sql, [id], |r| r.get(0)))
-            .await
-            .unwrap()
-    }
-
-    /// Polls `tier_of(store, "memory", id)` until it equals `want`, bounded by
+    /// Polls `tier_of(store, id)` until it equals `want`, bounded by
     /// `budget` of REAL wall-clock time (`std::time::Instant`, never
     /// `tokio::time`). These loop tests run under a PAUSED tokio clock
     /// (`#[tokio::test(start_paused = true)]`); `tokio::time::sleep` auto-advances
@@ -1088,7 +825,7 @@ mod tests {
     ) -> Result<(), String> {
         let deadline = std::time::Instant::now() + budget;
         loop {
-            let got = tier_of(store, "memory", id).await;
+            let got = tier_of(store, id).await;
             if got == want {
                 return Ok(());
             }
@@ -1105,11 +842,11 @@ mod tests {
     async fn tier1_low_importance_over_90_days_demotes_to_2() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let now = now_ms();
-        let id = seed_row(&store, "memory", 1, 5.0, now, -7_776_000_001).await;
+        let id = seed_row(&store, 1, 5.0, now, -7_776_000_001).await;
 
         super::run_maintenance_once_at(&store, now).await;
 
-        assert_eq!(tier_of(&store, "memory", id).await, 2);
+        assert_eq!(tier_of(&store, id).await, 2);
     }
 
     #[tokio::test]
@@ -1118,13 +855,13 @@ mod tests {
         let now = now_ms();
         // 90 days minus exactly 1ms — deterministic ONLY because the pass
         // below runs against the same `now` the row was seeded with.
-        let id = seed_row(&store, "memory", 1, 5.0, now, -7_775_999_999).await;
+        let id = seed_row(&store, 1, 5.0, now, -7_775_999_999).await;
 
         super::run_maintenance_once_at(&store, now).await;
 
-        assert_eq!(tier_of(&store, "memory", id).await, 1, "must NOT demote before 90 days");
+        assert_eq!(tier_of(&store, id).await, 1, "must NOT demote before 90 days");
         assert_eq!(
-            last_modified_at_of(&store, "memory", id).await,
+            last_modified_at_of(&store, id).await,
             0,
             "last_modified_at must stay untouched (0) when the guard skips the row"
         );
@@ -1134,11 +871,11 @@ mod tests {
     async fn tier2_over_180_days_demotes_to_3() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let now = now_ms();
-        let id = seed_row(&store, "memory", 2, 5.0, now, -15_552_000_001).await;
+        let id = seed_row(&store, 2, 5.0, now, -15_552_000_001).await;
 
         super::run_maintenance_once_at(&store, now).await;
 
-        assert_eq!(tier_of(&store, "memory", id).await, 3);
+        assert_eq!(tier_of(&store, id).await, 3);
     }
 
     // ── tier2, <180 days → unchanged ─────────────────────────────────────────
@@ -1149,22 +886,22 @@ mod tests {
         let now = now_ms();
         // 180 days minus exactly 1ms — same shared-now discipline as the
         // 90-day under-boundary test above.
-        let id = seed_row(&store, "memory", 2, 5.0, now, -15_551_999_999).await;
+        let id = seed_row(&store, 2, 5.0, now, -15_551_999_999).await;
 
         super::run_maintenance_once_at(&store, now).await;
 
-        assert_eq!(tier_of(&store, "memory", id).await, 2, "must NOT demote before 180 days");
+        assert_eq!(tier_of(&store, id).await, 2, "must NOT demote before 180 days");
     }
 
     #[tokio::test]
     async fn tier1_pivotal_importance_never_demotes() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let now = now_ms();
-        let id = seed_row(&store, "memory", 1, 9.5, now, -31_536_000_000).await;
+        let id = seed_row(&store, 1, 9.5, now, -31_536_000_000).await;
 
         super::run_maintenance_once_at(&store, now).await;
 
-        assert_eq!(tier_of(&store, "memory", id).await, 1, "importance >= 9.0 must never demote");
+        assert_eq!(tier_of(&store, id).await, 1, "importance >= 9.0 must never demote");
     }
 
     #[tokio::test]
@@ -1175,103 +912,24 @@ mod tests {
         // unconditionally), so this test specifically pins tier staying 3
         // AND last_modified_at staying untouched (proving the row was never
         // part of the UPDATE's matched set).
-        let id = seed_row(&store, "memory", 3, 5.0, now_ms(), -15_552_000_001).await;
+        let id = seed_row(&store, 3, 5.0, now_ms(), -15_552_000_001).await;
 
         super::run_maintenance_once(&store).await;
 
-        assert_eq!(tier_of(&store, "memory", id).await, 3);
-        assert_eq!(last_modified_at_of(&store, "memory", id).await, 0);
+        assert_eq!(tier_of(&store, id).await, 3);
+        assert_eq!(last_modified_at_of(&store, id).await, 0);
     }
 
     #[tokio::test]
-    async fn inactivity_demotion_covers_memory_and_procedural_skills() {
+    async fn inactivity_demotion_lowers_a_stale_row() {
         let store = MemoryStore::new_for_test().await.unwrap();
 
         let now = now_ms();
-        let mem_id = seed_row(&store, "memory", 1, 5.0, now, -7_776_000_001).await;
-        let proc_id = seed_row(&store, "procedural_skill", 1, 5.0, now, -7_776_000_001).await;
+        let mem_id = seed_row(&store, 1, 5.0, now, -7_776_000_001).await;
 
         super::run_maintenance_once_at(&store, now).await;
 
-        assert_eq!(tier_of(&store, "memory", mem_id).await, 2, "memory row must demote");
-        assert_eq!(
-            tier_of(&store, "procedural_skill", proc_id).await,
-            2,
-            "a skill nobody has reached for in 90 days must lose its tier-1 floor \
-             like any other stale row"
-        );
-    }
-
-    /// A skill as the desktop app wrote it lands at tier 1 with importance 8.0 — under
-    /// the 9.0 pivotal cutoff — so the pass reaches the DEFAULT skill, not just
-    /// a hand-seeded low-importance one. Without this, the test above could pass
-    /// on a row shape production never writes.
-    #[tokio::test]
-    async fn default_importance_skill_still_demotes_after_90_days() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-
-        let now = now_ms();
-        let id = seed_row(&store, "procedural_skill", 1, 8.0, now, -7_776_000_001).await;
-
-        super::run_maintenance_once_at(&store, now).await;
-
-        assert_eq!(tier_of(&store, "procedural_skill", id).await, 2);
-    }
-
-    #[tokio::test]
-    async fn procedural_skill_under_90_days_is_not_demoted() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-
-        let now = now_ms();
-        let id = seed_row(&store, "procedural_skill", 1, 5.0, now, -7_775_999_999).await;
-
-        super::run_maintenance_once_at(&store, now).await;
-
-        assert_eq!(tier_of(&store, "procedural_skill", id).await, 1, "must NOT demote before 90 days");
-        assert_eq!(
-            last_modified_at_of(&store, "procedural_skill", id).await,
-            0,
-            "last_modified_at must stay untouched (0) when the guard skips the row"
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_episodic_trajectory_is_demoted() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-
-        let now = now_ms();
-        let id = seed_row(&store, "episodic_trajectory", 1, 5.0, now, -7_776_000_001).await;
-
-        super::run_maintenance_once_at(&store, now).await;
-
-        assert_eq!(tier_of(&store, "episodic_trajectory", id).await, 2);
-    }
-
-    /// Why the episodic arm of the pass finds nothing on today's corpus, and
-    /// why it is still there.
-    ///
-    /// `compute_tier` fast-tracks anything at importance >= 9.0 to tier 1 before
-    /// it ever looks at the memory type, so a trajectory is NOT structurally
-    /// pinned to tier 3 — it sits there only because the writer hands the insert
-    /// a hardcoded 5.0. That literal is one edit away from putting trajectories
-    /// on a tier that decays, and this test is what makes such an edit announce
-    /// itself instead of silently creating a row that promotes and never falls
-    /// back.
-    #[test]
-    fn trajectory_importance_is_the_only_thing_keeping_it_off_tier_1() {
-        use crate::memory::tier::compute_tier;
-
-        assert_eq!(
-            compute_tier(3, 5.0, 0, "episodic_trajectory"),
-            3,
-            "the importance the writer actually passes must keep trajectories at tier 3"
-        );
-        assert_eq!(
-            compute_tier(3, 9.0, 0, "episodic_trajectory"),
-            1,
-            "raising that importance past the pivotal cutoff WOULD put a trajectory \
-             on tier 1 — which is why the demotion pass covers this table"
-        );
+        assert_eq!(tier_of(&store, mem_id).await, 2, "memory row must demote");
     }
 
     use std::sync::Arc;
@@ -1286,7 +944,7 @@ mod tests {
         // The loop reads the real wall clock per pass, so the seed uses a
         // fresh now_ms(): the over-boundary offset only grows staler as
         // real time advances — safe direction, no shared-now needed.
-        let id = seed_row(&store, "memory", 1, 5.0, now_ms(), -7_776_000_001).await;
+        let id = seed_row(&store, 1, 5.0, now_ms(), -7_776_000_001).await;
         let store = Arc::new(store);
 
         let handle = tokio::spawn(super::run_maintenance_loop(
@@ -1300,7 +958,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            tier_of(&store, "memory", id).await,
+            tier_of(&store, id).await,
             1,
             "must NOT fire before startup_delay elapses (t=0 must be a no-op)"
         );
@@ -1330,7 +988,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn loop_second_pass_fires_only_after_full_period_not_before() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_row(&store, "memory", 1, 5.0, now_ms(), -15_552_000_001).await;
+        let id = seed_row(&store, 1, 5.0, now_ms(), -15_552_000_001).await;
         let store = Arc::new(store);
 
         let handle = tokio::spawn(super::run_maintenance_loop(
@@ -1343,7 +1001,7 @@ mod tests {
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(tier_of(&store, "memory", id).await, 1, "must NOT fire before startup_delay elapses");
+        assert_eq!(tier_of(&store, id).await, 1, "must NOT fire before startup_delay elapses");
 
         // ONE jump past startup_delay (1s) but well below the next deadline
         // (startup_delay + period = 61s) — tick 1 fires, tick 2 must NOT.
@@ -1380,8 +1038,8 @@ mod tests {
         let now = now_ms();
 
         // 2 memory rows, one soft-deleted -> total 2, live 1.
-        let live_id = seed_row(&store, "memory", 3, 5.0, now, 0).await;
-        let deleted_id = seed_row(&store, "memory", 3, 5.0, now, 0).await;
+        let live_id = seed_row(&store, 3, 5.0, now, 0).await;
+        let deleted_id = seed_row(&store, 3, 5.0, now, 0).await;
         store
             .conn
             .call(move |c| {
@@ -1394,16 +1052,9 @@ mod tests {
             .unwrap();
         let _ = live_id;
 
-        // 1 episodic row, not deleted -> total 1, live 1.
-        seed_row(&store, "episodic_trajectory", 3, 5.0, now, 0).await;
-
-        // 0 procedural rows -> total 0, live 0.
-
         let counts = super::count_rows(&store).await.unwrap();
 
-        assert_eq!((counts.memory.total, counts.memory.live), (2, 1));
-        assert_eq!((counts.episodic.total, counts.episodic.live), (1, 1));
-        assert_eq!((counts.procedural.total, counts.procedural.live), (0, 0));
+        assert_eq!((counts.total, counts.live), (2, 1));
     }
 
     // ── orphaned-vector sweep ─────────────────────────────────────────────
@@ -1412,27 +1063,23 @@ mod tests {
     async fn maintenance_sweeps_orphan_vectors() {
         let store = MemoryStore::new_for_test().await.unwrap();
 
-        let mem_id = seed_orphaned_deleted_row(&store, "memory").await;
-        let epi_id = seed_orphaned_deleted_row(&store, "episodic_trajectory").await;
-        let proc_id = seed_orphaned_deleted_row(&store, "procedural_skill").await;
+        let mem_id = seed_orphaned_deleted_row(&store).await;
 
-        assert_eq!(vector_row_count(&store, "memory_vectors", mem_id).await, 1, "test setup: orphan must exist before the sweep");
+        assert_eq!(vector_row_count(&store, mem_id).await, 1, "test setup: orphan must exist before the sweep");
 
         super::run_maintenance_once_at(&store, now_ms()).await;
 
-        assert_eq!(vector_row_count(&store, "memory_vectors", mem_id).await, 0, "memory vector orphan must be swept");
-        assert_eq!(vector_row_count(&store, "episodic_vectors", epi_id).await, 0, "episodic vector orphan must be swept");
-        assert_eq!(vector_row_count(&store, "procedural_vectors", proc_id).await, 0, "procedural vector orphan must be swept");
+        assert_eq!(vector_row_count(&store, mem_id).await, 0, "memory vector orphan must be swept");
     }
 
     #[tokio::test]
     async fn maintenance_sweep_idempotent() {
         let store = MemoryStore::new_for_test().await.unwrap();
-        let id = seed_orphaned_deleted_row(&store, "memory").await;
+        let id = seed_orphaned_deleted_row(&store).await;
 
         let first = super::sweep_orphaned_vectors(&store).await;
         assert_eq!(first, 1, "first pass must find and drop the one orphan");
-        assert_eq!(vector_row_count(&store, "memory_vectors", id).await, 0, "first pass must sweep the orphan");
+        assert_eq!(vector_row_count(&store, id).await, 0, "first pass must sweep the orphan");
 
         // The parent row is still there and still soft-deleted — nothing in
         // this codebase hard-deletes it. So "no work left" cannot mean "no
@@ -1443,7 +1090,7 @@ mod tests {
         // observable state at a cost that grows forever.
         let second = super::sweep_orphaned_vectors(&store).await;
         assert_eq!(second, 0, "an already-swept corpus must give the second pass nothing to do");
-        assert_eq!(vector_row_count(&store, "memory_vectors", id).await, 0, "second pass must stay a no-op, not error or re-delete");
+        assert_eq!(vector_row_count(&store, id).await, 0, "second pass must stay a no-op, not error or re-delete");
     }
 
     // ── orphaned-dispute release ──────────────────────────────────────────
@@ -1614,69 +1261,6 @@ mod tests {
             .expect("seed_reembed_memory failed")
     }
 
-    async fn seed_reembed_episodic(store: &MemoryStore, task: &str, raw_vector: Vec<f32>) -> i64 {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        let bytes = super::serialize_f32_vec(&raw_vector);
-        let task = task.to_string();
-        store
-            .conn
-            .call(move |c| -> rusqlite::Result<i64> {
-                let tx = c.transaction()?;
-                tx.execute(
-                    "INSERT INTO episodic_trajectory \
-                     (scope, agent_id, session_id, task, tier, importance, \
-                      created_at, last_modified_at, last_accessed_at, \
-                      created_by_type, created_by_ref) \
-                     VALUES ('agent', 'test-agent', ?1, ?2, 3, 5.0, 0, 0, 0, 'agent', '')",
-                    rusqlite::params![format!("sess-reembed-{nonce}"), task],
-                )?;
-                let id = tx.last_insert_rowid();
-                tx.execute(
-                    "INSERT INTO episodic_vectors(rowid, embedding) VALUES (?, ?)",
-                    rusqlite::params![id, bytes],
-                )?;
-                tx.commit()?;
-                Ok(id)
-            })
-            .await
-            .expect("seed_reembed_episodic failed")
-    }
-
-    async fn seed_reembed_procedural(
-        store: &MemoryStore,
-        trigger: &str,
-        skill_name: &str,
-        raw_vector: Vec<f32>,
-    ) -> i64 {
-        let nonce = NONCE.fetch_add(1, Ordering::SeqCst);
-        let bytes = super::serialize_f32_vec(&raw_vector);
-        let trigger = trigger.to_string();
-        let skill_name = skill_name.to_string();
-        store
-            .conn
-            .call(move |c| -> rusqlite::Result<i64> {
-                let tx = c.transaction()?;
-                tx.execute(
-                    "INSERT INTO procedural_skill \
-                     (scope, agent_id, skill_name, trigger, tier, importance, \
-                      promoted_at, source_trajectory_ids, \
-                      created_at, last_modified_at, last_accessed_at, \
-                      created_by_type, created_by_ref) \
-                     VALUES ('agent', 'test-agent', ?1, ?2, 3, 5.0, 0, '[]', 0, 0, 0, 'agent', ?3)",
-                    rusqlite::params![skill_name, trigger, format!("t-{nonce}")],
-                )?;
-                let id = tx.last_insert_rowid();
-                tx.execute(
-                    "INSERT INTO procedural_vectors(rowid, embedding) VALUES (?, ?)",
-                    rusqlite::params![id, bytes],
-                )?;
-                tx.commit()?;
-                Ok(id)
-            })
-            .await
-            .expect("seed_reembed_procedural failed")
-    }
-
     async fn read_vector_bytes(store: &MemoryStore, vectors_table: &'static str, id: i64) -> Vec<u8> {
         let sql = format!("SELECT embedding FROM {vectors_table} WHERE rowid = ?1");
         store.conn.call(move |c| c.query_row(&sql, [id], |r| r.get(0))).await.unwrap()
@@ -1698,9 +1282,8 @@ mod tests {
             .unwrap()
     }
 
-    /// Records `(role, text)` for every call. Used to pin which role `reembed_all` uses per table, and to
-    /// pin that `procedural_skill` embeds `skill_embedding_text(trigger,
-    /// skill_name)` rather than a hand-rebuilt string.
+    /// Records `(role, text)` for every call, to pin which role and which text
+    /// `reembed_all` embeds.
     struct RecordingEmbedder {
         calls: std::sync::Mutex<Vec<(EmbedRole, String)>>,
     }
@@ -1843,11 +1426,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reembed_reinfer_uses_passage_role_and_shared_skill_embedding_text() {
+    async fn reembed_reinfer_uses_passage_role_and_the_content() {
         let store = MemoryStore::new_for_test().await.unwrap();
         seed_reembed_memory(&store, "hello world", vec![0.3; 384]).await;
-        seed_reembed_episodic(&store, "fix the bug", vec![0.3; 384]).await;
-        seed_reembed_procedural(&store, "when login fails", "Fix login flow", vec![0.3; 384]).await;
 
         let recorder = std::sync::Arc::new(RecordingEmbedder::new());
         let embedder: std::sync::Arc<dyn Embedder> = recorder.clone();
@@ -1856,17 +1437,12 @@ mod tests {
         super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
 
         let calls = recorder.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3, "expected exactly one embed call per seeded row");
+        assert_eq!(calls.len(), 1, "expected exactly one embed call per seeded row");
         for (role, _) in calls.iter() {
             assert_eq!(*role, EmbedRole::Passage, "reembed_all must always embed with role Passage");
         }
         let texts: std::collections::HashSet<&str> = calls.iter().map(|(_, t)| t.as_str()).collect();
         assert!(texts.contains("hello world"), "memory.content must reach the embedder verbatim");
-        assert!(texts.contains("fix the bug"), "episodic_trajectory.task must reach the embedder verbatim");
-        assert!(
-            texts.contains("when login fails Fix login flow"),
-            "procedural_skill must embed skill_embedding_text(trigger, skill_name), not a hand-rebuilt string"
-        );
     }
 
     #[tokio::test]
@@ -1884,7 +1460,7 @@ mod tests {
         let plan = super::ReInferPlan::new(embedder);
         let report = super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
 
-        let memory_outcome = &report.per_table[0];
+        let memory_outcome = &report.memory;
         assert_eq!(memory_outcome.attempted, 3);
         assert_eq!(memory_outcome.updated, 2);
         assert_eq!(memory_outcome.failed, 1);
@@ -1896,7 +1472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reembed_reinfer_update_failure_aborts_only_that_table() {
+    async fn reembed_reinfer_update_failure_aborts_the_pass() {
         let store = MemoryStore::new_for_test().await.unwrap();
         seed_reembed_memory(&store, "will not survive the write", vec![1.0; 384]).await;
 
@@ -1910,11 +1486,9 @@ mod tests {
         let plan = super::ReInferPlan::new(embedder);
         let report = super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
 
-        let memory_outcome = &report.per_table[0];
+        let memory_outcome = &report.memory;
         assert!(memory_outcome.aborted, "a failing UPDATE transaction must abort the table");
         assert_eq!(memory_outcome.updated, 0, "no row can have been written if the UPDATE tx failed");
-        assert!(!report.per_table[1].aborted, "an empty table with no batch attempted must not be marked aborted");
-        assert!(!report.per_table[2].aborted, "an empty table with no batch attempted must not be marked aborted");
         assert!(!report.contract_updated);
     }
 
@@ -1928,7 +1502,7 @@ mod tests {
         let plan = super::ReInferPlan::new(embedder);
         let report = super::reembed_all(&store, super::ReembedMode::ReInfer(plan)).await;
 
-        assert!(report.per_table.iter().all(|t| t.failed == 0 && !t.aborted));
+        assert!(report.memory.failed == 0 && !report.memory.aborted);
         assert!(report.contract_updated, "a fully clean ReInfer pass must write the contract");
 
         let (model_id, dim, query_prefix, passage_prefix) =
@@ -1985,7 +1559,7 @@ mod tests {
 
         let report = super::reembed_all(&store, super::ReembedMode::Normalize).await;
 
-        let memory_outcome = &report.per_table[0];
+        let memory_outcome = &report.memory;
         assert_eq!(memory_outcome.attempted, 450);
         assert_eq!(memory_outcome.updated, 450);
         assert_eq!(memory_outcome.failed, 0);

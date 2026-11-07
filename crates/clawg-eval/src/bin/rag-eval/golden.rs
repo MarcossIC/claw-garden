@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// The `MemoryType` serde names a corpus row may declare, copied from
 /// `store_insert.rs`'s `#[serde(rename_all = "snake_case")]` enum rather than
-/// imported. `procedural_skill` is deliberately excluded: it lives in a
-/// separate table not reachable through the insert path this harness uses, so
-/// a golden-set row can never legitimately claim it.
+/// imported.
 const VALID_MEMORY_TYPES: [&str; 7] = [
     "chat_message",
     "tool_error",

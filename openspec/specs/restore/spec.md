@@ -3,6 +3,7 @@
 Fuente de verdad del comportamiento actual de la vuelta atrás de `delete_memory`: cómo una fila de `memory` borrada vuelve a estar viva con su mismo id, qué se rechaza, qué escribe el restore, y por dónde se lo pide (HTTP, la herramienta `restore_memory` y `clawg undelete`) y cómo se encuentran las borradas. El borrado en sí (`delete_memory_core`) y cómo libera a las filas que disputaban a la borrada están en [`specs/disputes`](../disputes/spec.md) (R4); la clave de tema, en [`specs/ingest`](../ingest/spec.md); los pedazos, en [`specs/pieces`](../pieces/spec.md); las conclusiones, en [`specs/synthesis`](../synthesis/spec.md). El ranking, el esquema y el detector de contradicciones no cambian.
 
 **Origen:** [recoverable-delete](../../changes/archive/2026-10-18-recoverable-delete/proposal.md), archivado el 2026-10-18. Los ids de requisito son los de esa spec; la negativa por clave de tema (R1) y el paso de las disputas (R2) son lo que el código hace hoy y la spec de ese cambio no decía. [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, cambió el dueño por el lector y el alcance de la gemela, el titular, el detector y el revivir, de agente y proyecto a proyecto.
+- [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL3, «Una fila migrada se restaura y se purga», al final de R7 y antes de «Límites conocidos»). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
 
 ## Definiciones
 
@@ -129,9 +130,9 @@ El puente MUST exponer `restore_memory` con `kind` e `id`, y MUST mandar siempre
 - Sobre una que `sharing.json` le oculta MUST fallar como si el id no existiera, y la fila MUST NOT cambiar ([`specs/visibility`](../visibility/spec.md) R3).
 - Una gemela viva, un titular de la clave o un secreto MUST fallar con el mensaje del daemon. La descripción de la herramienta nombra la gemela, la clave y el secreto; el mensaje del daemon dice cuál de los tres es.
 - Contra un daemon que no tiene la ruta, su 404 sin el error JSON del daemon (`404 Not Found`) MUST decir que hay que reiniciar el daemon con `clawg stop`, no que la fila no existe; cualquier otro 404 sigue siendo el "no existe" del daemon (`route_failure_text`, `server.rs:1088`).
-- La descripción MUST decir que deshace un `delete_memory`, con el id y el kind que se borraron, y MUST NOT decir que lo ajeno es de sólo lectura.
+- La descripción MUST decir que deshace un `delete_memory`, con el id que se borró, y MUST NOT decir que lo ajeno es de sólo lectura.
 
-`delete_memory` MUST nombrar `restore_memory` en su respuesta (`deleted N; restore_memory with the same id and kind undoes it`, `format_delete`, `crates/clawg-cli/src/mcp/tools.rs:389`, llamada desde `server.rs:1040`) y en su descripción (`server.rs:1400-1405`). `tools/list` MUST listar doce herramientas; la lista completa y el orden están en [`specs/mcp`](../mcp/spec.md) (R3).
+`delete_memory` MUST nombrar `restore_memory` en su respuesta (`deleted N; restore_memory with the same id undoes it`, `format_delete`, `crates/clawg-cli/src/mcp/tools.rs:389`, llamada desde `server.rs:1040`) y en su descripción (`server.rs:1400-1405`). `tools/list` MUST listar doce herramientas; la lista completa y el orden están en [`specs/mcp`](../mcp/spec.md) (R3).
 
 **Test:** `restore_memory_undoes_an_own_delete`, `another_agent_restores_a_memory_unless_hidden`, `delete_memory_names_the_way_back` y `restore_memory` en la lista de `tool_descriptions_say_shared_memories_can_be_changed` en `crates/clawg-cli/src/mcp/server.rs`; `a_daemon_without_the_restore_route_is_named_as_such` en `server.rs`; `format_restore_says_when_the_row_is_still_superseded` en `crates/clawg-cli/src/mcp/tools.rs`; los conteos de `every_tool_is_registered_under_its_wire_name` y `the_viewer_is_not_exposed_to_the_model` (`server.rs`) y de `a_session_without_initialize_lists_the_tools_in_name_order` (`crates/clawg-cli/src/mcp/handshake.rs`). Ningún test del puente restaura con una gemela, con un titular de la clave ni con un secreto: son los de R1 y R4.
 
@@ -229,6 +230,17 @@ La pasada de mantenimiento (`run_maintenance_once_at`, `crates/clawg-core/src/me
 ### Filas de una versión anterior a V17
 
 Abrir con V17 una base escrita por una versión anterior, en la que se borró la vigente de un tema, deja la versión anterior `superseded` por una fila borrada, con causa `revision` ([`specs/storage`](../storage/spec.md), «Una base en V16 abre con sus causas de reemplazo»). El primer paso de mantenimiento, `STARTUP_DELAY` después de arrancar el daemon (`crates/clawg-core/src/memory/maintenance.rs:25`), la trae de vuelta con el barrido. Esto se acepta como está diseñado: queda sólo en el log del daemon, `clawg update` no lo informa, y restaurar la borrada la vuelve a reemplazar (`revived_from`).
+
+## RL3. Una fila migrada se restaura y se purga
+
+Una fila migrada por V32 que está borrada MUST poder restaurarse con `restore_memory_core` (vector calculado al restaurar, de vuelta en el índice de texto) y purgarse con `purge` ([`specs/storage`](../storage/spec.md), RL1).
+
+#### Escenario: borradas a mano
+- GIVEN en V31 una trayectoria y una habilidad borradas que ningún diario nombra
+- WHEN se abre con la versión nueva
+- THEN se restaura la migrada de la trayectoria y una búsqueda la encuentra, y se purga la de la habilidad y no queda en `memory` ni en `memory_vectors`
+
+**Test:** `a_trajectory_and_a_skill_deleted_before_the_move_are_restored_and_purged` (`crates/clawg-core/src/memory/migrations.rs`).
 
 ## Límites conocidos
 

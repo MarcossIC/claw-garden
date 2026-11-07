@@ -12,7 +12,6 @@ use std::collections::HashMap;
 
 use crate::memory::search::{identifier_tokens, search_all_memories, SearchScope};
 use crate::memory::sharing::Reader;
-use crate::memory::record::TableKind;
 use crate::memory::store_insert::MemoryType;
 use crate::memory::MemoryStore;
 
@@ -139,10 +138,6 @@ pub(crate) fn excerpt(content: &str) -> String {
 /// `siblings`: the rows the same event already inserted. Each comes with the
 /// save it belongs to; the search already keeps the closest piece of each.
 ///
-/// Deliberately searches `memory` only. An episodic trajectory records what
-/// happened and a procedural skill records how something is done — neither
-/// asserts a claim, so neither can contradict one; widening the scope would
-/// only add near-neighbours that can never legitimately be disputed.
 /// Errors are swallowed as `log::warn!` — a detection failure must never abort ingest.
 /// Self-match is impossible: the new row is not yet in the DB at hook time.
 ///
@@ -173,8 +168,6 @@ pub(crate) fn excerpt(content: &str) -> String {
 fn contradiction_search_scope(project_id: Option<&str>, pool: usize, saver: &Reader) -> SearchScope {
     SearchScope {
         memory: Some(pool),
-        episodic: None,
-        procedural: None,
         projects: project_id.map(|p| vec![p.to_owned()]),
         lexical: None,
         // A save is compared with every row its agent reaches, whoever saved
@@ -216,8 +209,7 @@ pub(crate) async fn detect_contradiction(
     let found: Vec<Candidate> = hits
         .into_iter()
         .filter(|h| {
-            matches!(h.kind, TableKind::Memory)
-                && !siblings.contains(&h.id)
+            !siblings.contains(&h.id)
                 && h.distance >= NEAR_DUPLICATE_FLOOR as f64
                 && h.distance < CONTRADICTION_THRESHOLD as f64
         })

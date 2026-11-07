@@ -739,15 +739,11 @@ const PIECES_SQL: &str = "SELECT piece, memory_id FROM memory_piece WHERE save_i
 const NOW_SQL: &str = "SELECT update_count, deleted_at, supersede_cause, project_id, status, superseded_by, revived_from, \
      disputed_against FROM memory WHERE id = ?1";
 
-/// Rows of every kind under a project id.
-const PROJECT_ROWS_SQL: &str = "SELECT (SELECT COUNT(*) FROM memory WHERE project_id = ?1) \
-     + (SELECT COUNT(*) FROM episodic_trajectory WHERE project_id = ?1) \
-     + (SELECT COUNT(*) FROM procedural_skill WHERE project_id = ?1)";
+/// Rows under a project id.
+const PROJECT_ROWS_SQL: &str = "SELECT COUNT(*) FROM memory WHERE project_id = ?1";
 
-/// Live rows of every kind under a project id.
-const PROJECT_LIVE_SQL: &str = "SELECT (SELECT COUNT(*) FROM memory WHERE project_id = ?1 AND deleted_at IS NULL) \
-     + (SELECT COUNT(*) FROM episodic_trajectory WHERE project_id = ?1 AND deleted_at IS NULL) \
-     + (SELECT COUNT(*) FROM procedural_skill WHERE project_id = ?1 AND deleted_at IS NULL)";
+/// Live rows under a project id.
+const PROJECT_LIVE_SQL: &str = "SELECT COUNT(*) FROM memory WHERE project_id = ?1 AND deleted_at IS NULL";
 
 /// Nothing outside the registry tables an undo takes back from names the
 /// project `$id`: no tombstone of it or leading to it, merge, delete or
@@ -764,14 +760,10 @@ macro_rules! not_named {
     };
 }
 
-/// No row of any kind is under the project id `$id`.
+/// No row is under the project id `$id`.
 macro_rules! no_rows {
     ($id:literal) => {
-        concat!(
-            "NOT EXISTS (SELECT 1 FROM memory WHERE project_id = ", $id, ") \
-             AND NOT EXISTS (SELECT 1 FROM episodic_trajectory WHERE project_id = ", $id, ") \
-             AND NOT EXISTS (SELECT 1 FROM procedural_skill WHERE project_id = ", $id, ")"
-        )
+        concat!("NOT EXISTS (SELECT 1 FROM memory WHERE project_id = ", $id, ")")
     };
 }
 
@@ -1171,8 +1163,6 @@ fn take_back_registered_in(c: &Connection, entry: &Registered) -> rusqlite::Resu
         Registered::Revived { id, deleted_at } => c.execute(
             "UPDATE project SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL AND reviewed = 0 \
                AND NOT EXISTS (SELECT 1 FROM memory WHERE project_id = ?1 AND deleted_at IS NULL) \
-               AND NOT EXISTS (SELECT 1 FROM episodic_trajectory WHERE project_id = ?1 AND deleted_at IS NULL) \
-               AND NOT EXISTS (SELECT 1 FROM procedural_skill WHERE project_id = ?1 AND deleted_at IS NULL) \
                AND EXISTS (SELECT 1 FROM project_delete WHERE project_id = ?1 AND deleted_at = ?2 \
                              AND undone_at IS NULL AND purged_at IS NULL)",
             rusqlite::params![id, deleted_at],
@@ -1378,7 +1368,7 @@ fn rows_of(fills: &[Extra]) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::admin::{delete_memory_core, restore_memory_core, MemoryKind};
+    use crate::memory::admin::{delete_memory_core, restore_memory_core};
     use crate::memory::embedder::FakeEmbedder;
     use crate::memory::portability::foreign::{ForeignNote, When};
     use crate::memory::portability::import::tests::{
@@ -1831,8 +1821,8 @@ mod tests {
             (id("Cache policy: none").await, id("cargo build failed: linker not found").await, id("Every crate inherits the workspace version").await, id("Storage engine: SQLite with WAL").await);
 
         sql(&dst, format!("UPDATE memory SET update_count = update_count + 1 WHERE id IN ({edited}, {piece})")).await;
-        delete_memory_core(&dst, deleted, MemoryKind::Memory, None).await.unwrap();
-        restore_memory_core(&dst, &FakeEmbedder::default(), MemoryKind::Memory, restored, None).await.unwrap();
+        delete_memory_core(&dst, deleted, None).await.unwrap();
+        restore_memory_core(&dst, &FakeEmbedder::default(), restored, None).await.unwrap();
         sql(&dst, format!("UPDATE memory_conflict SET state = 'judged', verdict = 'compatible' WHERE new_id = {judged}")).await;
         let conclusion = insert_row(&dst, "claude-code", None, "A conclusion drawn since", None, 9).await;
         sql(&dst, format!("INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES ({conclusion}, {source}, 9)")).await;

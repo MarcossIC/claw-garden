@@ -9,7 +9,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::prompt_builder::indent_continuations;
 use crate::memory::search::{reach_predicate, reader_bind};
 use crate::memory::sharing::{Reach, Reader};
-use crate::memory::{record::TableKind, MemoryError, MemoryStore};
+use crate::memory::{MemoryError, MemoryStore};
 
 pub(crate) const DEFAULT_PROJECT_SEGMENT: &str = "default";
 pub const AUTO_START: &str = "<!-- AUTO-START -->";
@@ -206,7 +206,7 @@ impl WorkspaceManager {
 
     /// Regenerates the AUTO section from DB queries. USER section is preserved
     /// byte-for-byte. The preferences are those of every author `reach` lets
-    /// `agent_id` read; the decisions and skills are its own.
+    /// `agent_id` read; the decisions are its own.
     ///
     /// Returns the ids this call actually rendered, so the retrieval channel
     /// can skip them rather than delivering the same rows a second time. They
@@ -280,26 +280,10 @@ struct MemoryLine {
     created_at: TimestampMs,
 }
 
-/// One `procedural_skill` row selected for the AUTO section. `trigger` says
-/// WHEN to apply the skill and `tool_sequence` says WHAT it does — a bare
-/// `skill_name` tells the model neither, which is why all three travel
-/// together.
-#[derive(Clone)]
-struct SkillLine {
-    id: i64,
-    skill_name: String,
-    trigger: String,
-    /// Raw column value: a JSON array of tool names, parsed at render time.
-    tool_sequence_json: String,
-    importance: f64,
-    created_at: TimestampMs,
-}
-
 #[derive(Clone)]
 struct AutoRows {
     user_prefs: Vec<MemoryLine>,
     arch_decisions: Vec<MemoryLine>,
-    top_skills: Vec<SkillLine>,
 }
 
 /// The rows the deterministic workspace channel actually rendered.
@@ -322,7 +306,6 @@ pub struct EmittedIds {
 /// A row the AUTO section printed, in the order it printed them.
 #[derive(Debug, Clone)]
 pub(crate) struct EmittedRow {
-    pub(crate) kind: TableKind,
     pub(crate) id: i64,
     pub(crate) importance: f64,
     pub(crate) created_at: TimestampMs,
@@ -331,12 +314,12 @@ pub(crate) struct EmittedRow {
 }
 
 impl EmittedIds {
-    pub(crate) fn contains(&self, kind: TableKind, id: i64) -> bool {
-        self.rows.iter().any(|r| r.kind == kind && r.id == id)
+    pub(crate) fn contains(&self, id: i64) -> bool {
+        self.rows.iter().any(|r| r.id == id)
     }
 
-    pub(crate) fn memory_ids(&self) -> impl Iterator<Item = i64> + '_ {
-        self.rows.iter().filter(|r| r.kind == TableKind::Memory).map(|r| r.id)
+    pub(crate) fn ids(&self) -> impl Iterator<Item = i64> + '_ {
+        self.rows.iter().map(|r| r.id)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -400,9 +383,9 @@ async fn fetch_auto_rows(
             // Read by reach, not by author: a preference describes the person,
             // not the agent that heard it, so what the user told one client
             // holds in the others unless `sharing.json` hides its author. A
-            // decision or a skill stays the agent's own.
+            // decision stays the agent's own.
             //
-            // All three memory queries drop superseded rows but keep disputed
+            // Both queries drop superseded rows but keep disputed
             // ones: a disputed row ranks like an active one everywhere else,
             // and the conflicts block reaches the prompt for every row this
             // section emits, so the dispute is shown next to it.
@@ -456,55 +439,7 @@ async fn fetch_auto_rows(
                 rows
             };
 
-            // Query 3: top-5 procedural skills by access_count, under the same
-            // eligibility rule the KNN pool applies to this table — own project
-            // or unattributed. There are only five slots, so a skill learned in
-            // another codebase does not merely appear, it displaces one that
-            // belongs here. No cross-project carve-out exists for skills: a
-            // procedure is written against a specific stack and layout, and
-            // replaying it elsewhere is how the wrong command gets run.
-            let map_skill = |row: &rusqlite::Row<'_>| -> Result<SkillLine, rusqlite::Error> {
-                Ok(SkillLine {
-                    id: row.get(0)?,
-                    skill_name: row.get(1)?,
-                    trigger: row.get(2)?,
-                    tool_sequence_json: row.get(3)?,
-                    importance: row.get(4)?,
-                    created_at: TimestampMs::from_unix_millis(row.get(5)?),
-                })
-            };
-            let top_skills: Vec<SkillLine> = if let Some(ref pid) = proj {
-                let mut stmt3 = c.prepare(
-                    "SELECT id, skill_name, trigger, tool_sequence, importance, created_at FROM procedural_skill
-                     WHERE agent_id = ?1
-                       AND (project_id = ?2 OR project_id IS NULL)
-                       AND tier = 1
-                       AND deleted_at IS NULL
-                     ORDER BY access_count DESC
-                     LIMIT 5",
-                )?;
-                let rows: Vec<SkillLine> =
-                    readable(stmt3.query_map(rusqlite::params![agent, pid], |row| map_skill(row))?, "skill");
-                rows
-            } else {
-                let mut stmt3 = c.prepare(
-                    "SELECT id, skill_name, trigger, tool_sequence, importance, created_at FROM procedural_skill
-                     WHERE agent_id = ?1
-                       AND tier = 1
-                       AND deleted_at IS NULL
-                     ORDER BY access_count DESC
-                     LIMIT 5",
-                )?;
-                let rows: Vec<SkillLine> =
-                    readable(stmt3.query_map(rusqlite::params![agent], |row| map_skill(row))?, "skill");
-                rows
-            };
-
-            Ok(AutoRows {
-                user_prefs,
-                arch_decisions,
-                top_skills,
-            })
+            Ok(AutoRows { user_prefs, arch_decisions })
         })
         .await
         .map_err(|e| match e {
@@ -542,61 +477,21 @@ fn render_auto_section(rows: &AutoRows) -> (String, EmittedIds) {
     let mut kept = rows.clone();
     let mut content = render_rows(&kept);
 
-    // Reverse priority: skills → decisions. Preferences are never trimmed —
-    // they are the standing contract with the user, and dropping one silently
-    // changes how the model behaves for a whole session.
-    while content.len() > AUTO_BYTE_CAP && !kept.top_skills.is_empty() {
-        kept.top_skills.pop();
-        content = render_rows(&kept);
-    }
+    // Decisions go first. Preferences are never trimmed — they are the
+    // standing contract with the user, and dropping one silently changes how
+    // the model behaves for a whole session.
     while content.len() > AUTO_BYTE_CAP && !kept.arch_decisions.is_empty() {
         kept.arch_decisions.pop();
         content = render_rows(&kept);
     }
 
-    let memory = kept.user_prefs.iter().chain(&kept.arch_decisions).map(|r| EmittedRow {
-        kind: TableKind::Memory,
+    let rows = kept.user_prefs.iter().chain(&kept.arch_decisions).map(|r| EmittedRow {
         id: r.id,
         importance: r.importance,
         created_at: r.created_at,
         line: memory_line(r),
     });
-    let skills = kept.top_skills.iter().map(|s| EmittedRow {
-        kind: TableKind::Procedural,
-        id: s.id,
-        importance: s.importance,
-        created_at: s.created_at,
-        line: format_skill_line(s),
-    });
-    (content, EmittedIds { rows: memory.chain(skills).collect() })
-}
-
-/// `["read","edit"]` → `"read → edit"`. Returns `None` for an empty or
-/// unparseable column: a raw JSON blob in the prompt is noise the model has
-/// to decode, and a half-rendered sequence is worse than no sequence.
-fn format_tool_sequence(raw: &str) -> Option<String> {
-    let tools: Vec<String> = serde_json::from_str(raw).ok()?;
-    if tools.is_empty() {
-        return None;
-    }
-    Some(tools.join(" → "))
-}
-
-/// A skill is only actionable with all three parts: the name identifies it,
-/// the trigger says WHEN to reach for it, the sequence says what it does.
-/// Either optional part is dropped when absent rather than rendered empty.
-fn format_skill_line(skill: &SkillLine) -> String {
-    let mut line = format!("- {}", copied(&skill.skill_name));
-    let trigger = skill.trigger.trim();
-    if !trigger.is_empty() {
-        line.push_str(" — when: ");
-        line.push_str(&copied(trigger));
-    }
-    if let Some(seq) = format_tool_sequence(&skill.tool_sequence_json) {
-        line.push_str(" — tools: ");
-        line.push_str(&seq);
-    }
-    line
+    (content, EmittedIds { rows: rows.collect() })
 }
 
 /// The entry of a preference or a decision, without its line break.
@@ -624,11 +519,6 @@ fn render_rows(rows: &AutoRows) -> String {
     out.push_str("## Architectural Decisions\n");
     for row in &rows.arch_decisions {
         out.push_str(&memory_line(row));
-        out.push('\n');
-    }
-    out.push_str("## Procedural Skills\n");
-    for skill in &rows.top_skills {
-        out.push_str(&format_skill_line(skill));
         out.push('\n');
     }
     out.push_str(AUTO_END);
@@ -1361,41 +1251,6 @@ mod tests {
             .unwrap()
     }
 
-    async fn insert_skill(
-        store: &MemoryStore,
-        agent_id: &str,
-        skill_name: &str,
-        trigger: &str,
-        tool_sequence_json: &str,
-    ) -> i64 {
-        use crate::memory::store_insert::{NewProceduralSkillRecord, PromoteOutcome};
-        let mut embedding = vec![0.0_f32; 384];
-        // A distinct direction per skill: `promote_to_procedural_skill`
-        // rejects a zero vector, and identical vectors would make any later
-        // ranking assertion meaningless.
-        embedding[(skill_name.len() + tool_sequence_json.len()) % 384] = 1.0;
-        let outcome = store
-            .promote_to_procedural_skill(
-                NewProceduralSkillRecord {
-                    agent_id: agent_id.to_string(),
-                    project_id: None,
-                    skill_name: skill_name.to_string(),
-                    trigger: trigger.to_string(),
-                    tool_sequence_json: tool_sequence_json.to_string(),
-                    source_trajectory_ids: vec![1],
-                    importance: 8.0,
-                    now_ms: 1_700_000_000_000,
-                },
-                Some(embedding),
-            )
-            .await
-            .unwrap();
-        match outcome {
-            PromoteOutcome::Inserted(id) => id,
-            other => panic!("expected a fresh insert, got {other:?}"),
-        }
-    }
-
     #[tokio::test]
     async fn regenerate_reports_the_ids_it_rendered() {
         let tmp = crate::test_dir::test_dir();
@@ -1407,22 +1262,20 @@ mod tests {
             insert_tier1_memory(&store, "agent-emit", "hexagonal", "architectural_decision", 9.0).await;
         let weak =
             insert_tier1_memory(&store, "agent-emit", "prefiere tabs", "user_preference", 6.0).await;
-        let skill = insert_skill(&store, "agent-emit", "arreglar-test", "un test falla", "[\"read\"]").await;
 
         let emitted = wm
             .regenerate_auto_section("agent-emit", None, &Reach::Own, &store)
             .await
             .unwrap();
 
-        assert!(emitted.contains(TableKind::Memory, pref), "the rendered preference must be reported");
-        assert!(emitted.contains(TableKind::Memory, arch), "the rendered decision must be reported");
-        assert!(emitted.contains(TableKind::Procedural, skill), "the rendered skill must be reported");
+        assert!(emitted.contains(pref), "the rendered preference must be reported");
+        assert!(emitted.contains(arch), "the rendered decision must be reported");
         assert!(
-            !emitted.contains(TableKind::Memory, weak),
+            !emitted.contains(weak),
             "importance 6 never reaches the AUTO section, so reporting it as emitted would suppress \
              the only channel that can still deliver it"
         );
-        assert_eq!(emitted.len(), 3);
+        assert_eq!(emitted.len(), 2);
     }
 
     #[tokio::test]
@@ -1432,13 +1285,12 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let pref = insert_tier1_memory(&store, "agent-lines", "answer in spanish\nand keep it short", "user_preference", 9.0).await;
         store.conn.call(move |c| c.execute("UPDATE memory SET created_at = 1234 WHERE id = ?1", [pref])).await.unwrap();
-        let skill = insert_skill(&store, "agent-lines", "fix-a-test", "a test fails", "[\"read\",\"edit\"]").await;
 
         let emitted = wm.regenerate_auto_section("agent-lines", None, &Reach::Own, &store).await.unwrap();
 
-        let reported: Vec<(TableKind, i64, f64, i64)> =
-            emitted.rows().iter().map(|r| (r.kind, r.id, r.importance, r.created_at.as_millis_i64())).collect();
-        assert_eq!(reported, [(TableKind::Memory, pref, 9.0, 1234), (TableKind::Procedural, skill, 8.0, 1_700_000_000_000)]);
+        let reported: Vec<(i64, f64, i64)> =
+            emitted.rows().iter().map(|r| (r.id, r.importance, r.created_at.as_millis_i64())).collect();
+        assert_eq!(reported, [(pref, 9.0, 1234)]);
         assert_eq!(emitted.rows()[0].line, "- answer in spanish\n  | and keep it short");
         let file = tokio::fs::read_to_string(wm.workspace_path("agent-lines", None)).await.unwrap();
         let auto = &file[file.find(AUTO_START).unwrap()..file.find(AUTO_END).unwrap()];
@@ -1483,68 +1335,13 @@ mod tests {
 
             for (id, text) in [(winner, "prefers tabs"), (decision, "uses sqlite"), (disputed, "prefers dark mode")] {
                 assert!(content.contains(text), "{text} missing:\n{content}");
-                assert!(emitted.contains(TableKind::Memory, id));
+                assert!(emitted.contains(id));
             }
             for (id, text) in [(loser, "prefers spaces"), (replaced, "uses postgres")] {
                 assert!(!content.contains(text), "{text} was superseded:\n{content}");
-                assert!(!emitted.contains(TableKind::Memory, id));
+                assert!(!emitted.contains(id));
             }
         }
-    }
-
-    #[tokio::test]
-    async fn skill_line_carries_trigger_and_tool_sequence() {
-        let tmp = crate::test_dir::test_dir();
-        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        let store = MemoryStore::new_for_test().await.unwrap();
-
-        insert_skill(
-            &store,
-            "agent-skill-render",
-            "arreglar-test-roto",
-            "un test falla después de editar",
-            "[\"read\",\"edit\",\"test\"]",
-        )
-        .await;
-
-        wm.regenerate_auto_section("agent-skill-render", None, &Reach::Own, &store)
-            .await
-            .unwrap();
-
-        let content = tokio::fs::read_to_string(wm.workspace_path("agent-skill-render", None))
-            .await
-            .unwrap();
-
-        assert!(content.contains("arreglar-test-roto"), "skill name missing:\n{content}");
-        assert!(
-            content.contains("un test falla después de editar"),
-            "the trigger is what tells the model WHEN to apply the skill:\n{content}"
-        );
-        assert!(
-            content.contains("read → edit → test"),
-            "the tool sequence is the actionable part:\n{content}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_malformed_tool_sequence_degrades_to_name_and_trigger() {
-        let tmp = crate::test_dir::test_dir();
-        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        let store = MemoryStore::new_for_test().await.unwrap();
-
-        insert_skill(&store, "agent-bad-seq", "skill-rara", "cuando pasa X", "not json at all").await;
-
-        wm.regenerate_auto_section("agent-bad-seq", None, &Reach::Own, &store).await.unwrap();
-
-        let content = tokio::fs::read_to_string(wm.workspace_path("agent-bad-seq", None))
-            .await
-            .unwrap();
-        assert!(content.contains("skill-rara"), "the skill must still be rendered:\n{content}");
-        assert!(content.contains("cuando pasa X"));
-        assert!(
-            !content.contains("not json at all"),
-            "an unparseable sequence is dropped, never dumped raw into the prompt:\n{content}"
-        );
     }
 
     // The cap trims from the bottom of the AUTO section, and a trimmed row was
@@ -1619,11 +1416,7 @@ mod tests {
 
         assert_eq!(
             headings,
-            vec![
-                "## User Preferences (always active)",
-                "## Architectural Decisions",
-                "## Procedural Skills",
-            ],
+            vec!["## User Preferences (always active)", "## Architectural Decisions"],
             "each AUTO heading must have a query behind it; got:\n{content}"
         );
     }
@@ -1707,107 +1500,6 @@ mod tests {
             .unwrap()
     }
 
-    async fn insert_skill_with_project(
-        store: &MemoryStore,
-        agent_id: &str,
-        project_id: Option<&str>,
-        skill_name: &str,
-    ) -> i64 {
-        use crate::memory::store_insert::{NewProceduralSkillRecord, PromoteOutcome};
-        let mut embedding = vec![0.0_f32; 384];
-        embedding[skill_name.len() % 384] = 1.0;
-        let outcome = store
-            .promote_to_procedural_skill(
-                NewProceduralSkillRecord {
-                    agent_id: agent_id.to_string(),
-                    project_id: project_id.map(|p| p.to_string()),
-                    skill_name: skill_name.to_string(),
-                    trigger: format!("trigger-{skill_name}"),
-                    // The dedup key is (agent_id, tool_sequence): two rows for the
-                    // same agent sharing a sequence collapse into one UPDATE.
-                    tool_sequence_json: format!("[\"read\",\"{skill_name}\"]"),
-                    source_trajectory_ids: vec![1],
-                    importance: 8.0,
-                    now_ms: 1_700_000_000_000,
-                },
-                Some(embedding),
-            )
-            .await
-            .unwrap();
-        match outcome {
-            PromoteOutcome::Inserted(id) => id,
-            other => panic!("expected a fresh insert, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn workspace_top_skills_exclude_foreign_project() {
-        let tmp = crate::test_dir::test_dir();
-        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        let store = MemoryStore::new_for_test().await.unwrap();
-
-        let own = insert_skill_with_project(&store, "agent-skills", Some("P1"), "skill-own").await;
-        let foreign =
-            insert_skill_with_project(&store, "agent-skills", Some("P2"), "skill-foreign").await;
-
-        let emitted = wm
-            .regenerate_auto_section("agent-skills", Some("P1"), &Reach::Own, &store)
-            .await
-            .unwrap();
-
-        assert!(
-            emitted.contains(TableKind::Procedural, own),
-            "the skill belonging to the rendered project must be listed"
-        );
-        assert!(
-            !emitted.contains(TableKind::Procedural, foreign),
-            "a skill owned by another project must not occupy a slot in this project's listing"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_top_skills_include_null_project() {
-        let tmp = crate::test_dir::test_dir();
-        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        let store = MemoryStore::new_for_test().await.unwrap();
-
-        let unowned =
-            insert_skill_with_project(&store, "agent-skills-null", None, "skill-unowned").await;
-
-        let emitted = wm
-            .regenerate_auto_section("agent-skills-null", Some("P1"), &Reach::Own, &store)
-            .await
-            .unwrap();
-
-        assert!(
-            emitted.contains(TableKind::Procedural, unowned),
-            "a skill with no project of its own belongs to every project, so scoping must not hide it"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_top_skills_unscoped_listing_ignores_project() {
-        let tmp = crate::test_dir::test_dir();
-        let wm = WorkspaceManager::new(tmp.path().join("workspaces"));
-        let store = MemoryStore::new_for_test().await.unwrap();
-
-        let p1 = insert_skill_with_project(&store, "agent-skills-any", Some("P1"), "skill-p1").await;
-        let p2 = insert_skill_with_project(&store, "agent-skills-any", Some("P2"), "skill-p2").await;
-        let none = insert_skill_with_project(&store, "agent-skills-any", None, "skill-none").await;
-
-        let emitted = wm
-            .regenerate_auto_section("agent-skills-any", None, &Reach::Own, &store)
-            .await
-            .unwrap();
-
-        for id in [p1, p2, none] {
-            assert!(
-                emitted.contains(TableKind::Procedural, id),
-                "a caller that supplies no project must still see skill {id}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn workspace_decisions_include_null_project() {
         let tmp = crate::test_dir::test_dir();
@@ -1830,7 +1522,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            emitted.contains(TableKind::Memory, unowned),
+            emitted.contains(unowned),
             "a decision recorded without a project applies everywhere, so a scoped workspace must \
              still render it"
         );
@@ -1866,9 +1558,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(emitted.contains(TableKind::Memory, own), "own-project decision must be rendered");
+        assert!(emitted.contains(own), "own-project decision must be rendered");
         assert!(
-            !emitted.contains(TableKind::Memory, foreign),
+            !emitted.contains(foreign),
             "another project's decision must not be rendered here"
         );
     }
@@ -1884,9 +1576,9 @@ mod tests {
 
         let emitted = wm.regenerate_auto_section("agent-prefs", Some("P1"), &Reach::Own, &store).await.unwrap();
 
-        assert!(emitted.contains(TableKind::Memory, here), "a rule of this project is shown in it");
-        assert!(emitted.contains(TableKind::Memory, everywhere), "a rule saved without a project holds in every one");
-        assert!(!emitted.contains(TableKind::Memory, there), "a rule of another repository is not this one's");
+        assert!(emitted.contains(here), "a rule of this project is shown in it");
+        assert!(emitted.contains(everywhere), "a rule saved without a project holds in every one");
+        assert!(!emitted.contains(there), "a rule of another repository is not this one's");
     }
 
     #[tokio::test]
@@ -1902,7 +1594,7 @@ mod tests {
         let emitted = wm.regenerate_auto_section("agent-any", None, &Reach::Own, &store).await.unwrap();
 
         for id in ids {
-            assert!(emitted.contains(TableKind::Memory, id), "a workspace of no project lists #{id}, as it lists every decision");
+            assert!(emitted.contains(id), "a workspace of no project lists #{id}, as it lists every decision");
         }
     }
 
@@ -1915,8 +1607,8 @@ mod tests {
         let decided = insert_tier1_memory(&store, "claude-code", "sqlite for the store", "architectural_decision", 9.0).await;
 
         let shared = wm.regenerate_auto_section("cursor", None, &Reach::AllBut(Vec::new()), &store).await.unwrap();
-        assert!(shared.contains(TableKind::Memory, told), "the preference describes the same person");
-        assert!(!shared.contains(TableKind::Memory, decided), "a decision stays the agent's");
+        assert!(shared.contains(told), "the preference describes the same person");
+        assert!(!shared.contains(decided), "a decision stays the agent's");
         let file = tokio::fs::read_to_string(wm.workspace_path("cursor", None)).await.unwrap();
         assert!(file.contains("- never use emoji\n"), "the line is the one of an own preference:\n{file}");
 
@@ -1965,9 +1657,9 @@ mod tests {
 
         let emitted = wm.regenerate_auto_section("agent-seal", None, &Reach::Own, &store).await.unwrap();
 
-        assert!(emitted.contains(TableKind::Memory, stated), "what the user said opens every session");
+        assert!(emitted.contains(stated), "what the user said opens every session");
         for id in [inferred, concluded] {
-            assert!(!emitted.contains(TableKind::Memory, id), "#{id} is the agent's, reached by searching");
+            assert!(!emitted.contains(id), "#{id} is the agent's, reached by searching");
         }
         let file = tokio::fs::read_to_string(wm.workspace_path("agent-seal", None)).await.unwrap();
         assert!(file.contains("- stated tabs\n") && !file.contains("inferred tabs") && !file.contains("concluded tabs"), "{file}");

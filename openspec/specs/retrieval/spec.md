@@ -23,10 +23,12 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - [agent-language](../../changes/archive/2026-10-23-agent-language/proposal.md), archivado el 2026-10-23 (sólo «AL5. Las notas del contexto en el idioma del pedido», las respuestas vacías en español en el parser de `rag-eval --agent-view`, AL7 de esa spec, y el idioma de la NOTE, de la línea de omitidos y del bloque `BUDGET`; lo que el puente responde en español está en [`specs/mcp`](../mcp/spec.md), AL1 a AL4).
 - [session-start-context](../../changes/archive/2026-11-04-session-start-context/proposal.md), archivado el 2026-11-04, que salió en 0.76.0 (SC1 a SC5 de esa spec, con esos nombres, y lo que cambian en «Definiciones», «El prompt cumple el presupuesto» y «Lo cortado se nombra por id»; SC6 está en [`specs/synthesis`](../synthesis/spec.md), R8, y el bloque `workspace` de `context.cut`, en [`specs/metrics`](../metrics/spec.md), R14).
 - [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0 (PM1, PM2, PM3, PM5 y PM7 de esa spec, con esos nombres; las tres definiciones de las preferencias, y lo que cambian en «Hits de otros agentes», «Línea de hit en `recall_context`», «El parser de `rag-eval --agent-view`» y «Fuera de esta spec»). Dónde se muestra la marca y el sello de un save que repite una fila están en [`specs/provenance`](../provenance/spec.md), PM5 y PM9; `all_projects`, el protocolo y la clave de una preferencia sin proyecto, en [`specs/mcp`](../mcp/spec.md), PM4, PM6 y PM8.
+- [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (sólo BI6 de esa spec, con ese nombre). De qué carpetas sale el grupo y cómo lo muestra el puente está en [`specs/mcp`](../mcp/spec.md), BI1 a BI5.
+- [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL4 de esa spec, que se llama R4 allí: un solo KNN sobre `memory`, sin brazos por tabla; lo demás de RL4 está en [`specs/storage`](../storage/spec.md)). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
 
 ## Definiciones
 
-- **Hit exacto:** hit cuya fila recibió el bono léxico en esta búsqueda, es decir, `RawHit.lexical_match` (`crates/clawg-core/src/memory/score.rs:28-30`), una fila de `memory` que está en los matches de identificador de la consulta. Viaja en cada hit como `exact`. Un hit de `episodic` o `procedural` nunca es exacto.
+- **Hit exacto:** hit cuya fila recibió el bono léxico en esta búsqueda, es decir, `RawHit.lexical_match` (`crates/clawg-core/src/memory/score.rs:28-30`), una fila de `memory` que está en los matches de identificador de la consulta. Viaja en cada hit como `exact`.
 - **Fila de score 0:** hit no exacto cuyo score es 0, porque su coseno queda bajo el piso (`rescale_cosine`, `crates/clawg-core/src/memory/score.rs:219`) y no tiene el identificador de la consulta. Vuelve sólo porque el pool tenía lugar. Un hit exacto lleva el bono y nunca vale 0 mientras esté vivo.
 - **Frase de abstención:** `no relevant memories for this query: N searched, none close enough to show` (`NO_RELEVANT_MEMORIES` y `nothing_relevant`, `crates/clawg-cli/src/mcp/tools.rs:78-86`), con `N` el número de hits que la búsqueda trajo y no se muestran. Distingue «hay memorias y ninguna se acerca» de `no memories found`, que es un alcance sin nada.
 - **Corte relativo con ratio r (`shown_hits`, `crates/clawg-cli/src/relevance.rs:36`):** sobre hits ordenados mejor primero, cada uno con su score y su marca de exacto, pasa todo hit exacto, aunque quede detrás de uno cortado. Una fila de score 0 no pasa nunca y no cuenta para `MIN_SHOWN_HITS` (`relevance.rs:44-46`). Un hit no exacto con score mayor que 0 pasa si está entre los `MIN_SHOWN_HITS` primeros no exactos que puntuaron o si su score es `>= r × mejor score no exacto`. Los que pasan conservan su orden. Sin scores, no queda ninguno. Sin hits exactos ni filas de score 0, el resultado es el de cortar por prefijo: los primeros mientras la posición sea menor que `MIN_SHOWN_HITS` o el score sea `>= r × mejor`.
@@ -34,7 +36,7 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - **`MIN_SHOWN_HITS` (`relevance.rs:23`):** 2. Hits no exactos que pasan el corte sea cual sea su score, siempre que sea mayor que 0; los exactos no cuentan para este mínimo.
 - **Acceso:** un id que llega al access tracker. En el flush suma `access_count`, lleva `last_accessed_at` al máximo entre el actual y el del flush, y recalcula el tier en la misma sentencia (`flush`, `crates/clawg-core/src/memory/access.rs:175`; el `UPDATE` en `:204-209`). El flush corre cada 30 s o al juntar 500 ids (`access.rs:76-78` y `:90`).
 - **Decaimiento:** `exp(−λ · max(edad, 0))`, con la edad en días desde `last_accessed_at` y `λ` la del tipo de la fila (`score()`, `crates/clawg-core/src/memory/score.rs:285-289`). Una fecha futura (un reloj atrasado después de guardar, un restore de una máquina adelantada) dice que el reloj se movió, no que la fila es más nueva que una leída recién: MUST valer 1, nunca más. El flush conserva esa fecha (`MAX(last_accessed_at, …)`), así que la fila puntúa como recién leída hasta que el reloj la alcanza. **Test:** `an_access_stamped_in_the_future_scores_like_one_made_now` (`score.rs`).
-- **Hit contable:** hit de `kind = memory` con `score > 0` (`AccessTracker::record_hits`, `access.rs:151`). Sólo cuentan los de `memory` porque los ids son por tabla y el flush sólo actualiza `memory`. Un hit con score 0 está bajo el piso de similitud: ninguna herramienta lo muestra, y sólo lo devuelve `POST /v1/search` sin `min_relative_score`.
+- **Hit contable:** hit de `kind = memory` con `score > 0` (`AccessTracker::record_hits`, `access.rs:151`). El flush actualiza sólo `memory`, la única tabla de filas desde V32 ([`specs/storage`](../storage/spec.md), RL4). Un hit con score 0 está bajo el piso de similitud: ninguna herramienta lo muestra, y sólo lo devuelve `POST /v1/search` sin `min_relative_score`.
 - **Token:** cada tramo de `char::is_alphanumeric() || '_'` de la consulta, como los parte `fts_tokens` (`crates/clawg-core/src/memory/search.rs:700`).
 - **Token identificador (`is_identifier`, `search.rs:844`):** un token que cumple al menos una de:
   - tiene letras y dígitos (`getUser4821`, `v2`);
@@ -48,17 +50,17 @@ Fuente de verdad del comportamiento actual de la recuperación: el corte relativ
 - **Bono léxico:** `ScoringConfig.lexical_bonus`, 1,0 por defecto (`crates/clawg-core/src/memory/score.rs:190`).
 - **Presupuesto del contexto:** el `budget` de `POST /v1/context`, en bytes del prompt (unos 4 por token): `DEFAULT_BUDGET` 8.000 y `MAX_BUDGET` 24.000 (`crates/clawg-core/src/memory/prompt_builder.rs:64-66`). Cómo llega y se valida está en [`specs/mcp`](../mcp/spec.md).
 - **Hit candidato:** hit que el prompt de `recall_context` llevaría sin presupuesto: los de la búsqueda sin las filas del workspace ni las filas de score 0, cortados en `K_FINAL = 10` (`build_memory_prompt`, `prompt_builder.rs:170`; las filas del workspace salen en `:232`, las de score 0 en `:237` y el corte en `:239`).
-- **Hit mostrado:** hit candidato de `kind = memory` que el presupuesto dejó en RECENT o LONG-TERM, entero o recortado. Los ids son por tabla, así que un hit episodic o procedural nunca cuenta. Sin recorte, los hits mostrados son todos los candidatos de `memory`. El resumen de LAST SESSION ([«La última sesión»](#la-última-sesión)) no es hit candidato ni mostrado.
+- **Hit mostrado:** hit candidato de `kind = memory` que el presupuesto dejó en RECENT o LONG-TERM, entero o recortado. Sin recorte, los hits mostrados son todos los candidatos de `memory`. El resumen de LAST SESSION ([«La última sesión»](#la-última-sesión)) no es hit candidato ni mostrado.
 - **Cortado / recortado:** un hit candidato que el presupuesto dejó afuera / uno cuyo texto acortó.
 - **Fila del workspace:** id en `EmittedIds` (`crates/clawg-core/src/memory/workspace.rs:314`), que se suma a los candidatos de `memory` en `shown` (`assemble`, `prompt_builder.rs:374-379`), también si el presupuesto corta su entrada, porque esa lista se arma antes del recorte. Su bullet no tiene id: el prompt la reconoce por su texto. **No** es un hit mostrado.
 - **Parte de la persona:** lo que el prompt muestra de `workspace.md` antes de `AUTO-START` y después de `AUTO-END`, la sección USER incluida, sin marcadores. Un archivo sin `AUTO-START` es todo parte de la persona.
-- **Entrada de AUTO:** una línea de la sección AUTO que empieza con `- `, con las líneas que la siguen detrás del margen (`  |`). Así escribe la regeneración una preferencia, una decisión o un skill.
+- **Entrada de AUTO:** una línea de la sección AUTO que empieza con `- `, con las líneas que la siguen detrás del margen (`  |`). Así escribe la regeneración una preferencia o una decisión.
 - **Entrada conocida:** una entrada de AUTO cuyo texto es exactamente la línea que la regeneración del mismo pedido informó de una fila, junto con el kind, el id, la importancia y el `created_at` de esa fila. Si dos filas tienen la misma línea, las entradas se asignan en orden.
 - **Algo esperando:** el prompt todavía tiene un resumen de LAST SESSION, o algún hit en RECENT o LONG-TERM.
 - **Bytes de AUTO:** los bytes que la sección AUTO ocupa en el texto del prompt, con sus encabezados y sus entradas.
 - **Posición de un hit:** índice 0-based en el orden impreso: RECENT y luego LONG-TERM (`positions`, `prompt_builder.rs:548`). LAST SESSION no cuenta. Las posiciones se toman antes del presupuesto; el presupuesto puede quitar un hit del medio, pero los que quedan conservan su orden.
 - **Par de conflicto:** un par escalado: fila nueva (`disputed`) contra una fila vieja que nombra en `disputed_against` ([`specs/disputes`](../disputes/spec.md)). Los pares pendientes no entran al bloque; los ve el agente en la respuesta del save y en `memory_status`. `fetch_active_conflicts` (`prompt_builder.rs:1109`) sólo trae pares con al menos un lado en `shown`, es decir, hit candidato de `memory` o fila del workspace, antes del presupuesto; el otro lado puede estar fuera del prompt.
-- **Texto guardado:** todo texto que clawg no escribió y le muestra al modelo: el contenido de una memoria, de cualquier tabla y de cualquier agente, y el nombre y el disparador de un `procedural_skill`.
+- **Texto guardado:** todo texto que clawg no escribió y le muestra al modelo: el contenido de una memoria, de cualquier agente.
 - **Salto de línea:** `\n`, `\r\n`, `\r`, U+000B, U+000C, U+0085, U+2028 o U+2029 (`is_line_break`, `prompt_builder.rs:756`). Un tokenizador o un visor puede leer cualquiera de ellos como un salto.
 - **Margen:** `  | ` delante de cada línea de un texto guardado después de la primera, y `  |` solo en una línea vacía (`CONTINUATION`, `prompt_builder.rs:728`). Lo pone `indent_continuations` (`prompt_builder.rs:735`), una función pura que cambia cada salto de línea por `\n` y conserva cada línea, en orden y con su sangría propia después del margen.
 - **Preferencia elegible:** una fila de `memory` con `memory_type = 'user_preference'`, importancia 8 o más, tier 1, sin `deleted_at` y con estado distinto de `superseded` (`AUTO_PREFERENCES_SQL`, `crates/clawg-core/src/memory/workspace.rs:358`, sin el sello, el alcance ni el proyecto).
@@ -135,11 +137,6 @@ Como acceso, `build_memory_prompt` MUST registrar sólo los hits contables entre
 - WHEN se arma el prompt
 - THEN el prompt no tiene el bloque ACTIVE CONFLICTS
 
-#### Escenario: otra tabla
-- GIVEN un hit procedural con el mismo id que una fila `memory` que no es hit
-- WHEN se arma el prompt y se hace flush
-- THEN la fila `memory` no cambia
-
 #### Escenario: cortado por el presupuesto
 - GIVEN dos hits contables y un presupuesto que sólo deja entrar uno
 - WHEN se arma el prompt y se hace flush
@@ -170,6 +167,17 @@ Cuando no queda ninguna línea, `search_memory` MUST responder la frase de abste
 - THEN `search_memory` dice `no memories found`
 
 **Tests:** `search_request_carries_the_relevance_ratio` y `a_search_answer_without_withheld_still_parses` (`client.rs`, mod tests); `relevant_hits_keeps_the_ones_the_cut_lets_through_in_order`, `the_search_output_shows_only_the_relevant_hits`, `search_says_when_nothing_was_relevant` y `nothing_stored_is_not_called_irrelevant` (`tools.rs`, mod tests); `search_memory_tells_nothing_relevant_from_nothing_stored` y `search_with_nothing_stored_says_so_without_failing` (`crates/clawg-cli/src/mcp/server.rs`).
+
+## BI6. La búsqueda de un grupo
+
+Un grupo son dos o más proyectos que una búsqueda lee a la vez; el puente lo arma con las carpetas que el cliente tiene abiertas ([`specs/mcp`](../mcp/spec.md), BI5). El predicado de proyecto (`memory_project_predicate!`, `crates/clawg-core/src/memory/search.rs`) MUST atar una lista JSON de ids o NULL (`projects_bind`): con NULL, todas las filas; con una lista, las de cada proyecto de la lista, las sin proyecto y, en `memory`, toda `user_preference`. Un proyecto MUST atarse como una lista de uno, en cada consulta que usa el predicado. `SearchScope` MUST guardar la lista (`with_project` para uno, `with_projects` para varios). `POST /v1/search` MUST tomar `project_ids`, una lista de ids que pasan cada uno por `live_project` (`SearchRequest.project_ids` y `searched_projects`, `crates/clawg-cli/src/daemon/api.rs`); con `project_id` y `project_ids` a la vez MUST leer el grupo, y una lista vacía MUST responder 400. El conteo del otro idioma de esa búsqueda ([LP7](#lp7-other_language-en-la-búsqueda-y-el-contexto)) MUST contar el mismo grupo (`count_saves_in_projects`, `crates/clawg-core/src/memory/language.rs`). Lo que lee una consulta con un proyecto MUST NOT cambiar. La búsqueda de un grupo es una sola, con un ranking y los cupos de candidatos compartidos, y no una por proyecto juntadas por puntaje.
+
+#### Escenario: un grupo en el core
+- GIVEN filas en los proyectos `p`, `q` y `r`, una sin proyecto y una `user_preference` de `r`
+- WHEN se busca con el grupo `p`, `q`
+- THEN vuelven las de `p` y `q`, la sin proyecto y la preferencia, y no el resto de `r`
+
+**Tests:** `a_group_scope_reads_each_of_its_projects` (`search.rs`), `counting_a_group_counts_each_of_its_projects` (`language.rs`), `a_search_takes_a_group_of_projects`, `a_group_wins_over_the_project_of_a_search` y, con un proyecto unido a otro, `every_route_that_takes_a_project_follows_a_merge` (`crates/clawg-cli/tests/api.rs`). Los tests del core que buscan, cuentan pares o arman un contexto con un proyecto pasan sin cambiar lo que esperan, y los de `EXPLAIN QUERY PLAN` siguen viendo la tabla que manda.
 
 ## Identificadores de la consulta
 
@@ -273,23 +281,23 @@ Un error de la consulta de matches (FTS ausente, MATCH rechazado, conexión cerr
 
 **Test:** `a_failing_identifier_query_leaves_the_search_unboosted` en `search.rs`.
 
-## Las filas que dejó la app de escritorio siguen alcanzables
+## RL4. Un solo KNN, sobre `memory`
 
-Ningún código de producción escribe `episodic_trajectory` ni `procedural_skill`, pero una base puede traer filas de la app de escritorio. Esas filas MUST seguir alcanzables: la búsqueda MUST consultarlas (KNN de 5 + 5), el workspace MUST mostrar los skills del proyecto, y `list_memories`, `GET`, `PATCH` y `DELETE` MUST aceptarlas. El re-embed de `procedural_skill` MUST embeber `"{trigger} {skill_name}"`.
+La búsqueda MUST correr un solo KNN, sobre `memory`, y el canal léxico. MUST NOT haber brazos `knn_episodic` ni `knn_skill` ([`specs/metrics`](../metrics/spec.md), `search.duration`). Las filas que dejó la app de escritorio son desde V32 filas de `memory` de tipo `semantic_fact` ([`specs/storage`](../storage/spec.md), RL1), y la búsqueda, el workspace y el listado las tratan como a cualquier otra.
 
-#### Escenario: filas como las escribía la app de escritorio
-- GIVEN una trayectoria y un skill escritos con los mismos escritores que usaba la app (que quedan sólo para tests), y sus vectores
-- WHEN se busca con el vector del skill, se regenera el workspace del proyecto, se lista y se re-embebe
-- THEN el skill está entre los hits y en el workspace, las dos filas están en el listado, y el re-embed del skill embebe `"when login fails Fix login flow"` para `trigger = "when login fails"` y `skill_name = "Fix login flow"`
+#### Escenario: una trayectoria de la app tras V32
+- GIVEN una base en V31 con una trayectoria viva y su vector
+- WHEN se abre con esta versión y se busca con ese vector
+- THEN la fila sale como `semantic_fact`, con la línea `[<fecha> #id semantic_fact]`, y el brazo `knn_episodic` no existe
 
-**Test:** `episodic_trajectory_retrievable_by_same_agent_id` y `knn_procedural_returns_skill_rows` (`search.rs`), `regenerate_reports_the_ids_it_rendered` y `workspace_top_skills_exclude_foreign_project` (`workspace.rs`), `list_memories_kind_none_merges_all_tables_sorted_desc` (`admin.rs`) y `reembed_reinfer_uses_passage_role_and_shared_skill_embedding_text` (`maintenance.rs`, fija el texto literal). La apertura de una base en V9 con esas filas está en [`specs/synthesis`](../synthesis/spec.md) (su R9).
+**Test:** `trajectories_and_skills_move_to_memory_and_their_tables_go` (`crates/clawg-core/src/memory/migrations.rs`) y `a_search_records_how_long_each_arm_took` (`crates/clawg-core/src/memory/search.rs`). La apertura de una base en V9 con esas filas está en [`specs/synthesis`](../synthesis/spec.md) (su R9).
 
 ## Hits de otros agentes
 
 La búsqueda y el contexto traen, además de lo propio, las filas de los autores que la política de [`specs/sharing`](../sharing/spec.md) deja leer al llamador: `POST /v1/search` y `POST /v1/context` resuelven el alcance del agente del pedido en cada llamada (`reach`, `crates/clawg-cli/src/daemon/api.rs:1488`; usos en `api.rs:1443`, `:1527` y `:1536`). Sobre eso:
 
 - Cada hit de `POST /v1/search` MUST llevar su autor como `agent_id` (`RankedHit.agent_id`, `search.rs:119`); el cliente lo lee con `#[serde(default)]` y un hit sin autor cuenta como propio (`client.rs:193`).
-- RECENT del contexto sin consulta, y las decisiones y los skills del workspace, MUST seguir viendo sólo lo del agente; las preferencias del workspace siguen el alcance del lector ([PM3](#pm3-las-preferencias-siguen-el-alcance-del-lector)). ACTIVE CONFLICTS MUST mostrar los pares escalados con un lado entre las filas que el prompt puede mostrar, de cualquier autor, siempre que el agente alcance los dos lados (`fetch_active_conflicts`, `prompt_builder.rs`, filtra con `Reader::admits`): un lado oculto nunca se imprime, ni como el otro lado de un par que alcanza. El listado, la síntesis y el detector siguen el alcance, no la autoría ([`specs/sharing`](../sharing/spec.md) R5).
+- RECENT del contexto sin consulta, y las decisiones del workspace, MUST seguir viendo sólo lo del agente; las preferencias del workspace siguen el alcance del lector ([PM3](#pm3-las-preferencias-siguen-el-alcance-del-lector)). ACTIVE CONFLICTS MUST mostrar los pares escalados con un lado entre las filas que el prompt puede mostrar, de cualquier autor, siempre que el agente alcance los dos lados (`fetch_active_conflicts`, `prompt_builder.rs`, filtra con `Reader::admits`): un lado oculto nunca se imprime, ni como el otro lado de un par que alcanza. El listado, la síntesis y el detector siguen el alcance, no la autoría ([`specs/sharing`](../sharing/spec.md) R5).
 - Un hit ajeno MUST contar como acceso igual que uno propio (`api.rs:1464`).
 
 **Test:** `a_hit_carries_its_author` (`search.rs`), `search_returns_the_author_of_each_hit` y `search_and_context_follow_the_sharing_policy_from_the_next_call` (`crates/clawg-cli/tests/api.rs`), `the_workspace_stays_own_and_conflicts_are_shared` y `a_hidden_side_keeps_its_pair_out` (`prompt_builder.rs`) y `contradiction_probe_reaches_other_authors` (`contradiction.rs`).
@@ -299,7 +307,6 @@ La búsqueda y el contexto traen, además de lo propio, las filas de los autores
 Cada hit, y el resumen de LAST SESSION, MUST imprimirse como un encabezado de una línea seguido del texto en la misma línea (`format_hit_line`, `prompt_builder.rs:763`):
 
 - `kind = memory`: `[YYYY-MM-DD #id tipo] texto`
-- otro kind: `[YYYY-MM-DD #id kind/tipo] texto`, con `kind` en minúsculas (`episodic`, `procedural`). Para esos kinds la búsqueda pone el tipo fijo `episode` o `procedure`.
 - un hit de otro agente lleva ` by <autor>` antes del `]` (`[YYYY-MM-DD #id tipo by <autor>] texto`), con el autor saneado por `display_author`, y si hay alguno, contando el resumen de LAST SESSION, el prompt termina con un bloque `=== SHARED ===` con una nota (`render`, `prompt_builder.rs:591-597`): [`specs/sharing`](../sharing/spec.md) R4. Sin hits ajenos, el prompt es el de siempre.
 - una `user_preference` que la persona no declaró lleva su marca después del tipo (`[YYYY-MM-DD #id user_preference inferred] texto`): [PM5](#pm5-una-preferencia-que-no-declaró-la-persona-se-marca-al-buscarla).
 
@@ -308,10 +315,6 @@ Si el texto tiene varias líneas, cada una después de la primera MUST imprimirs
 #### Escenario: memory
 - GIVEN un hit memory id 57, tipo `semantic_fact`, creado el 2026-10-10, texto `usar sqlite`
 - THEN el prompt contiene la línea `[2026-10-10 #57 semantic_fact] usar sqlite`
-
-#### Escenario: otro kind
-- GIVEN un hit procedural id 3, tipo `procedure`
-- THEN su línea empieza con `[<fecha> #3 procedural/procedure] `
 
 #### Escenario: texto multilínea
 - GIVEN un hit con texto `fn main() {\n    run();\n\n    stop();\n}` seguido de otro hit
@@ -463,9 +466,7 @@ El workspace entregado al modelo (`workspace_for_prompt`, `prompt_builder.rs:122
 
 ## Un texto copiado al workspace no rompe `workspace.md`
 
-`render_rows` (`crates/clawg-core/src/memory/workspace.rs:456`) MUST escribir cada texto guardado que copia a la sección AUTO de `workspace.md` (el contenido de una preferencia o una decisión, y el nombre y el disparador de un skill en `format_skill_line`, `workspace.rs:433`) en su forma copiada (`copied`, `workspace.rs:452`): con el [margen](#definiciones) y con cada `<!--` cambiado por `<! --`. `split_existing` (`workspace.rs:550`) busca los marcadores con `find`, en cualquier lugar de una línea, así que el margen solo no alcanza: `<! --` desarma los cuatro marcadores (`AUTO-START`, `AUTO-END`, `USER-START`, `USER-END`) y cualquier comentario HTML, y se lee igual. Ningún texto guardado MUST poder poner un marcador dentro de la sección AUTO ni mover la sección USER, y lo que el usuario escribió fuera del AUTO MUST quedar igual. El AUTO se regenera desde la base en cada `recall_context`, así que un archivo de una versión anterior con un marcador copiado dentro del AUTO se repara en la próxima regeneración, salvo lo que ese marcador ya hubiera movido a la sección USER, que es del usuario y no se toca.
-
-La secuencia de herramientas de un skill no pasa por `copied`: son nombres de un arreglo JSON que `format_tool_sequence` une con ` → ` (`workspace.rs:422`).
+`render_rows` (`crates/clawg-core/src/memory/workspace.rs:456`) MUST escribir cada texto guardado que copia a la sección AUTO de `workspace.md` (el contenido de una preferencia o una decisión) en su forma copiada (`copied`, `workspace.rs:452`): con el [margen](#definiciones) y con cada `<!--` cambiado por `<! --`. `split_existing` (`workspace.rs:550`) busca los marcadores con `find`, en cualquier lugar de una línea, así que el margen solo no alcanza: `<! --` desarma los cuatro marcadores (`AUTO-START`, `AUTO-END`, `USER-START`, `USER-END`) y cualquier comentario HTML, y se lee igual. Ningún texto guardado MUST poder poner un marcador dentro de la sección AUTO ni mover la sección USER, y lo que el usuario escribió fuera del AUTO MUST quedar igual. El AUTO se regenera desde la base en cada `recall_context`, así que un archivo de una versión anterior con un marcador copiado dentro del AUTO se repara en la próxima regeneración, salvo lo que ese marcador ya hubiera movido a la sección USER, que es del usuario y no se toca.
 
 `clawg purge` MUST seguir nombrando un `workspace.md` que guarda el texto de la fila purgada en su forma cruda (la de un archivo de una versión anterior) o en la copiada (`sections_holding`, `workspace.rs:508`): [`specs/secrets`](../secrets/spec.md) R6.
 
@@ -654,8 +655,8 @@ Del workspace sólo se cortan entradas conocidas de la sección AUTO, nunca [lo 
 
 `regenerate_auto_section` (`crates/clawg-core/src/memory/workspace.rs:213`) MUST informar, de cada fila que imprimió en la sección AUTO, su kind, su id, su importancia, su `created_at` y la línea tal como quedó en el archivo, sin el salto final (`EmittedRow`, `:320`; `render_auto_section`, `:517`). MUST NOT cambiar qué filas imprime ni el texto del archivo. `workspace.md` no guarda ids: el daemon regenera antes de cada contexto (`crates/clawg-cli/src/daemon/api.rs:1580`), y `workspace_for_prompt` (`prompt_builder.rs:1225`) reconoce cada entrada del archivo por su texto. Si la regeneración falla, el informe queda vacío (`api.rs:1583-1586`) y ninguna entrada es conocida.
 
-#### Escenario: una preferencia de dos líneas y un skill
-- GIVEN una preferencia de importancia 9 cuyo texto tiene dos líneas, y un skill
+#### Escenario: una preferencia de dos líneas y una decisión
+- GIVEN una preferencia de importancia 9 cuyo texto tiene dos líneas, y una decisión
 - WHEN se regenera el workspace
 - THEN el informe trae las dos filas con su importancia y su fecha, y cada línea informada está en la sección AUTO del archivo
 
@@ -695,9 +696,9 @@ Cuando ya no queda nada esperando, ni resumen ni hits, y no quedan pares de conf
 
 ## SC4. El orden de AUTO y cómo se nombra lo cortado
 
-Entre las entradas conocidas, MUST salir primero la de menor importancia; a igual importancia, la de `created_at` más viejo, y a igual fecha, la de menor id (`PromptWorkspace::next_to_cut`, `prompt_builder.rs:1197`). Las preferencias, las decisiones y los skills compiten entre sí. Una entrada MUST quitarse entera, sin acortarse (`cut_auto`, `:556`). Una entrada que no es conocida MUST NOT quitarse, porque no se la puede nombrar. Un encabezado que se queda sin entradas MUST salir del prompt, como sale uno vacío ([«Workspace en el prompt»](#workspace-en-el-prompt)).
+Entre las entradas conocidas, MUST salir primero la de menor importancia; a igual importancia, la de `created_at` más viejo, y a igual fecha, la de menor id (`PromptWorkspace::next_to_cut`, `prompt_builder.rs:1197`). Las preferencias y las decisiones compiten entre sí. Una entrada MUST quitarse entera, sin acortarse (`cut_auto`, `:556`). Una entrada que no es conocida MUST NOT quitarse, porque no se la puede nombrar. Un encabezado que se queda sin entradas MUST salir del prompt, como sale uno vacío ([«Workspace en el prompt»](#workspace-en-el-prompt)).
 
-Cada entrada quitada MUST nombrarse en «Left out» / «Quedaron afuera» del bloque `BUDGET`, en el orden en que se imprimiría, antes que los hits. Un skill MUST llevar su kind (`procedural #id`). `MemoryPrompt.cut` MUST incluir `PromptBlock::Workspace` (`:147`), cuyo nombre es `workspace`, y el daemon MUST registrarlo en `context.cut` como los otros bloques ([`specs/metrics`](../metrics/spec.md), R14).
+Cada entrada quitada MUST nombrarse en «Left out» / «Quedaron afuera» del bloque `BUDGET`, en el orden en que se imprimiría, antes que los hits. `MemoryPrompt.cut` MUST incluir `PromptBlock::Workspace` (`:147`), cuyo nombre es `workspace`, y el daemon MUST registrarlo en `context.cut` como los otros bloques ([`specs/metrics`](../metrics/spec.md), R14).
 
 #### Escenario: importancia y edad
 - GIVEN cuatro entradas de AUTO: #1 de importancia 9 y #2 de importancia 8, de hace 10 días, y #3 de importancia 8 y #4 de importancia 10, de hace 1 día
@@ -714,7 +715,7 @@ Cuando el hit a quitar es el único que queda en su bloque, su texto MUST acorta
 
 ## Lo cortado se nombra por id
 
-Si algo se cortó o recortó, el prompt MUST terminar con un bloque `=== BUDGET ===` (`render`, `prompt_builder.rs:645`; su texto en `format_cut`, `:701`) que dice el presupuesto, cuántos bytes ocupa el contexto entero, los ids cortados en el orden en que se imprimirían (las entradas de AUTO primero, porque el workspace se imprime antes) y los recortados, el resumen de LAST SESSION entre ellos como un hit más, con su kind delante cuando no es `memory` (`episodic #3`), y que `read_memory` los devuelve enteros:
+Si algo se cortó o recortó, el prompt MUST terminar con un bloque `=== BUDGET ===` (`render`, `prompt_builder.rs:645`; su texto en `format_cut`, `:701`) que dice el presupuesto, cuántos bytes ocupa el contexto entero, los ids cortados en el orden en que se imprimirían (las entradas de AUTO primero, porque el workspace se imprime antes) y los recortados, el resumen de LAST SESSION entre ellos como un hit más, y que `read_memory` los devuelve enteros:
 
 ```
 === BUDGET ===
@@ -818,7 +819,7 @@ Con un proyecto indexado ([`specs/project-docs`](../project-docs/spec.md)), `sea
 
 - El orden entre hits con score 0: `hit_cmp` desempata por `(kind, id)` ascendente (`crates/clawg-core/src/memory/search.rs:200`). Desde lexical-fusion, un match de identificador ya no depende de ese desempate para llegar al top 10: el bono lo deja con score > 0 aunque su coseno quede bajo el piso. Ninguna herramienta muestra esas filas, pero las métricas de ranking de `rag-eval` miden la lista entera: un `recall@10` puede contar una fila de score 0 que llegó por su id (c09 y c10 del golden set).
 - Una puerta de abstención calibrada, que deje de mostrar también filas con score mayor que 0 en los casos sin respuesta. El piso es el percentil 5 de los cosenos consulta-pasaje, así que casi todo texto sin relación puntúa más que 0 y se sigue mostrando.
-- Un bono parcial (la fila tiene sólo algunos identificadores de la consulta), números solos como identificadores y FTS para `episodic` y `procedural`.
+- Un bono parcial (la fila tiene sólo algunos identificadores de la consulta), números solos como identificadores.
 - Qué pares se disputan y cómo se resuelven: [`specs/disputes`](../disputes/spec.md). Acá sólo está cómo se imprimen.
 - Un id en los bullets del workspace. Hoy no lo tienen, y por eso una fila del workspace que está en un conflicto lleva su texto también en el bloque.
 - Una línea de un texto guardado que diga algo con forma de orden («ignorá lo anterior»). El margen impide imitar la estructura del prompt, no el contenido: eso lo cubren la frase de evidencia de las instrucciones del servidor y la nota `SHARED`. Tampoco hay un clasificador de «parece una instrucción», ni se distingue en la sección AUTO lo que dijo el usuario de lo que infirió el agente en una decisión o un skill (`created_by_type`): de las preferencias sólo entran las declaradas ([PM2](#pm2-sólo-entra-sola-una-preferencia-declarada)).

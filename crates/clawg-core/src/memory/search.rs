@@ -1,6 +1,5 @@
-//! KNN search across memory + episodic + procedural, one table after another
-//! on the store's connection, merged + ranked by the score formula of
-//! `score.rs`.
+//! KNN and lexical search over `memory`, one arm after another on the
+//! store's connection, merged + ranked by the score formula of `score.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -11,10 +10,10 @@ use crate::memory::provenance::preference_mark;
 use crate::memory::score::{score as compute_score, RawHit, ScoringConfig};
 use crate::memory::sharing::{Reach, Reader};
 use crate::memory::vector::to_unit;
-use crate::memory::{MemoryError, MemoryStore, TableKind};
+use crate::memory::{MemoryError, MemoryStore};
 use crate::metrics::{Recorder, Unit};
 
-/// Per-table k_pool selection. `None` means "skip this table entirely".
+/// Pool sizes for one search. `None` means "skip this arm entirely".
 ///
 /// `projects: None` means unscoped — every caller that does not thread a
 /// project through (rag-eval, and any test that builds a scope directly)
@@ -25,8 +24,6 @@ use crate::metrics::{Recorder, Unit};
 #[derive(Debug, Clone)]
 pub struct SearchScope {
     pub memory: Option<usize>,
-    pub episodic: Option<usize>,
-    pub procedural: Option<usize>,
     /// The projects a search reads, each as one project scope reads it (see
     /// [`memory_project_predicate!`]); `None` reads every project.
     pub projects: Option<Vec<String>>,
@@ -42,8 +39,6 @@ impl SearchScope {
     pub fn all_default() -> Self {
         Self {
             memory: Some(30),
-            episodic: Some(5),
-            procedural: Some(5),
             projects: None,
             lexical: Some(20),
             reach: Reach::Own,
@@ -126,17 +121,6 @@ macro_rules! memory_project_predicate {
 }
 pub(crate) use memory_project_predicate;
 
-/// [`memory_project_predicate!`] for `episodic_trajectory` and
-/// `procedural_skill` under the prefix `$t`, which hold no preference.
-macro_rules! table_project_predicate {
-    ($t:literal, $param:literal) => {
-        concat!(
-            "(", $param, " IS NULL OR ", $t, "project_id IN (SELECT value FROM json_each(", $param, ")) OR ",
-            $t, "project_id IS NULL)"
-        )
-    };
-}
-
 /// What a query binds for the project predicates: NULL for every project,
 /// else the JSON array of the projects it reads. One project is a group of
 /// one, so every query states the rule once.
@@ -156,7 +140,6 @@ pub(crate) fn project_bind(project: Option<&str>) -> Option<String> {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RankedHit {
     pub id: i64,
-    pub kind: TableKind,
     pub content: String,
     pub memory_type: String,
     pub tier: i64,
@@ -174,7 +157,7 @@ pub struct RankedHit {
     /// bonus, so its score says nothing about how close the others are.
     pub exact: bool,
     /// The key a save revises this row under; absent for a row saved without
-    /// one and for the tables that have no such column.
+    /// one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
     /// The project the row was saved in; `None` for a row saved without one.
@@ -203,15 +186,11 @@ fn readable_hits(hits: Vec<RankedHit>, reader: &str, reach: &Reach) -> Vec<Ranke
 }
 
 /// Keeps the first, so best ranked, hit of each save and drops its other
-/// pieces, so one long text takes one slot. Only `memory` rows are pieces:
-/// the other tables number their rows independently.
+/// pieces, so one long text takes one slot.
 fn collapse_saves(hits: Vec<RankedHit>, links: &HashMap<i64, SaveLink>) -> Vec<RankedHit> {
     let mut seen = HashSet::new();
     hits.into_iter()
         .filter_map(|mut hit| {
-            if hit.kind != TableKind::Memory {
-                return Some(hit);
-            }
             match links.get(&hit.id) {
                 Some(link) if !seen.insert(link.save_id) => None,
                 Some(link) => {
@@ -257,16 +236,14 @@ const _: fn() = || {
     _ss::<RankedHit>();
 };
 
-/// Score first, then a key that cannot repeat: id is unique per table and
-/// kind separates the three, so two hits can never compare Equal. Without
-/// the second half, rows that score identically would land in whatever
-/// order the join emitted them, and the same query could answer differently
-/// on two runs.
+/// Score first, then a key that cannot repeat, so two hits can never compare
+/// Equal. Without the second half, rows that score identically would land in
+/// whatever order the join emitted them, and the same query could answer
+/// differently on two runs.
 fn hit_cmp(a: &RankedHit, b: &RankedHit) -> std::cmp::Ordering {
     b.score
         .partial_cmp(&a.score)
         .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.kind.cmp(&b.kind))
         .then_with(|| a.id.cmp(&b.id))
 }
 
@@ -316,50 +293,6 @@ const SEARCH_SQL_MEMORY: &str = concat!(
 "
 );
 
-// SQL for episodic table KNN. The 0.0077 lambda this table always used no
-// longer lives here — it is `DecayLambdas.episode` in score.rs, reached
-// through `lambda_for` dispatching on `TableKind::Episodic` rather than on
-// the `'episode'` string this query still selects for display.
-const SEARCH_SQL_EPISODIC: &str = concat!(
-    "
-    SELECT epi.id, epi.task, 'episode' AS memory_type, epi.tier, epi.status, knn.distance,
-        epi.created_at, epi.last_accessed_at, epi.importance, epi.agent_id, NULL, epi.project_id, NULL, NULL
-    FROM episodic_vectors knn
-    JOIN episodic_trajectory epi ON epi.id = knn.rowid
-    WHERE knn.embedding MATCH ?1
-      AND knn.k = ?2
-      AND epi.status IN ('active', 'disputed')
-      AND epi.deleted_at IS NULL
-      AND ",
-    reach_predicate!("epi.agent_id", "?3"),
-    "
-      AND ",
-    table_project_predicate!("epi.", "?4"),
-    "
-"
-);
-
-// SQL for procedural table KNN. Same as episodic: 0.0039 now lives in
-// `DecayLambdas.procedure`, dispatched by `TableKind::Procedural`.
-const SEARCH_SQL_PROCEDURAL: &str = concat!(
-    "
-    SELECT pro.id, pro.skill_name, 'procedure' AS memory_type, pro.tier, pro.status, knn.distance,
-        pro.created_at, pro.last_accessed_at, pro.importance, pro.agent_id, NULL, pro.project_id, NULL, NULL
-    FROM procedural_vectors knn
-    JOIN procedural_skill pro ON pro.id = knn.rowid
-    WHERE knn.embedding MATCH ?1
-      AND knn.k = ?2
-      AND pro.status IN ('active', 'disputed')
-      AND pro.deleted_at IS NULL
-      AND ",
-    reach_predicate!("pro.agent_id", "?3"),
-    "
-      AND ",
-    table_project_predicate!("pro.", "?4"),
-    "
-"
-);
-
 // How many rows THIS caller could receive at most, counted up to a ceiling of
 // `?1` (the pool size) because nothing above that changes any decision.
 //
@@ -390,82 +323,12 @@ const ELIGIBLE_SQL_MEMORY: &str = concat!(
 "
 );
 
-const ELIGIBLE_SQL_EPISODIC: &str = concat!(
-    "
-    SELECT COUNT(*) FROM (
-        SELECT epi.id FROM episodic_trajectory epi
-        WHERE epi.status IN ('active', 'disputed')
-          AND epi.deleted_at IS NULL
-          AND ",
-    reach_predicate!("epi.agent_id", "?2"),
-    "
-          AND ",
-    table_project_predicate!("epi.", "?3"),
-    "
-        LIMIT ?1
-    )
-"
-);
-
-const ELIGIBLE_SQL_PROCEDURAL: &str = concat!(
-    "
-    SELECT COUNT(*) FROM (
-        SELECT pro.id FROM procedural_skill pro
-        WHERE pro.status IN ('active', 'disputed')
-          AND pro.deleted_at IS NULL
-          AND ",
-    reach_predicate!("pro.agent_id", "?2"),
-    "
-          AND ",
-    table_project_predicate!("pro.", "?3"),
-    "
-        LIMIT ?1
-    )
-"
-);
-
 /// vec0 refuses to bind a `k` above this — it is the engine's own ceiling, not
 /// a policy choice made here. A widened window has to be clamped to it, or the
 /// second pass fails outright instead of simply returning fewer rows.
 const VEC0_MAX_K: usize = 4096;
 
-/// Everything that differs between the three vector-backed tables. Every field
-/// is static, so the descriptor is a `Copy` value the row-mapping closure can
-/// capture — one function over three descriptors instead of three functions
-/// that have to be kept identical by hand.
-#[derive(Clone, Copy)]
-struct KnnTable {
-    sql: &'static str,
-    eligible_sql: &'static str,
-    kind: TableKind,
-    /// Names the table in the "connection closed" message. The three branches
-    /// run concurrently, so a single shared message would leave the one fact
-    /// worth logging — which table lost the connection — unrecoverable.
-    label: &'static str,
-}
-
-const KNN_MEMORY: KnnTable = KnnTable {
-    sql: SEARCH_SQL_MEMORY,
-    eligible_sql: ELIGIBLE_SQL_MEMORY,
-    kind: TableKind::Memory,
-    label: "knn_memory",
-};
-
-const KNN_EPISODIC: KnnTable = KnnTable {
-    sql: SEARCH_SQL_EPISODIC,
-    eligible_sql: ELIGIBLE_SQL_EPISODIC,
-    kind: TableKind::Episodic,
-    label: "knn_episodic",
-};
-
-const KNN_PROCEDURAL: KnnTable = KnnTable {
-    sql: SEARCH_SQL_PROCEDURAL,
-    eligible_sql: ELIGIBLE_SQL_PROCEDURAL,
-    kind: TableKind::Procedural,
-    label: "knn_procedural",
-};
-
-/// One table's contribution to the merged result, plus how many KNN queries
+/// The KNN arm's contribution to the merged result, plus how many KNN queries
 /// producing it took. Carried out rather than logged here so the retrieval
 /// line stays a single record of the whole search.
 ///
@@ -488,14 +351,14 @@ struct KnnOutcome {
 }
 
 impl KnnOutcome {
-    /// A table the scope switched off: it asked for nothing, so nothing was
+    /// An arm the scope switched off: it asked for nothing, so nothing was
     /// queried and no pass ran.
     fn skipped() -> Self {
         Self { hits: Vec::new(), passes: 0, saves: 0, eligible: None, ran: Duration::ZERO }
     }
 
-    /// Whether recovery happened — a single pass is the ordinary path, and a
-    /// table that was never queried did not recover from anything.
+    /// Whether recovery happened — a single pass is the ordinary path, and an
+    /// arm that was never queried did not recover from anything.
     fn retried(&self) -> bool {
         self.passes > 1
     }
@@ -536,7 +399,7 @@ fn retry_window(k: usize) -> usize {
     k.saturating_mul(4).min(VEC0_MAX_K)
 }
 
-/// Runs one table's KNN query, recovering once from a window that the WHERE
+/// Runs the KNN query over `memory`, recovering once from a window that the WHERE
 /// clause emptied out, or that the pieces of one save filled.
 ///
 /// The second case is a full window that offers fewer than k memories: the
@@ -579,15 +442,11 @@ fn retry_window(k: usize) -> usize {
 /// without one would inflate `reachable` past what KNN can ever return, and
 /// the caller would pay a second pass on every one of its searches that a
 /// third or fourth pass could not fix either. Nothing in the schema enforces
-/// that pairing: no trigger, no foreign key ties `memory_vectors` (or the
-/// episodic/procedural equivalents) to its parent table. It holds today
-/// because every production insert path writes the parent row and its vector
-/// row together, in one transaction (`store_insert.rs`'s
-/// `insert_memory_with_vector`, `insert_episodic_trajectory`, and the
-/// procedural promote path, which short-circuits into `SkippedNoEmbedding`
-/// before touching the parent row when there is no vector to pair it with),
-/// and a delete only removes a row's vector after that row is already
-/// soft-deleted, so a live row is never left unpaired. A future insert path
+/// that pairing: no trigger, no foreign key ties `memory_vectors` to `memory`.
+/// It holds today because every production insert path writes the row and its
+/// vector together, in one transaction (`store_insert.rs`'s
+/// `insert_memory_with_vector`), and a delete only removes a row's vector after
+/// that row is already soft-deleted, so a live row is never left unpaired. A future insert path
 /// that skipped that pairing would break this invariant silently.
 ///
 /// The recovery is a single branch, deliberately, not a loop that widens until
@@ -600,7 +459,6 @@ fn retry_window(k: usize) -> usize {
 #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn knn_one(
     store: &MemoryStore,
-    table: KnnTable,
     q_bytes: &[u8],
     agents: &str,
     projects: Option<&str>,
@@ -618,7 +476,7 @@ async fn knn_one(
         .conn
         .call(move |c| {
             // Started here, on the connection's thread: the wait in its queue
-            // is the queue's, not this table's.
+            // is the queue's, not this arm's.
             let started = Instant::now();
             // Probe and both passes share one hop to the DB thread. `run` is a
             // free function rather than a closure so the row mapping exists in
@@ -628,10 +486,8 @@ async fn knn_one(
             // call site: counted here, the number cannot drift from the number
             // of queries actually issued, which is the whole reason it is
             // reported at all.
-            #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
             fn run(
                 c: &rusqlite::Connection,
-                table: KnnTable,
                 q: &[u8],
                 agent: &str,
                 proj: &Option<String>,
@@ -640,7 +496,7 @@ async fn knn_one(
                 lexical_matches: &HashSet<i64>,
             ) -> Result<Vec<RawHit>, rusqlite::Error> {
                 *passes += 1;
-                let mut stmt = c.prepare(table.sql)?;
+                let mut stmt = c.prepare(SEARCH_SQL_MEMORY)?;
                 let rows = stmt.query_map(
                     rusqlite::params![q, k as i64, agent, proj],
                     |row| {
@@ -649,7 +505,6 @@ async fn knn_one(
                         let (source, by): (Option<String>, Option<String>) = (row.get(12)?, row.get(13)?);
                         Ok(RawHit {
                             id,
-                            kind: table.kind,
                             content: row.get(1)?,
                             origin: preference_mark(&memory_type, source.as_deref(), by.as_deref()),
                             memory_type,
@@ -673,12 +528,9 @@ async fn knn_one(
                 Ok(hits)
             }
 
-            // Only `memory` rows are pieces of a save. Without the links the
-            // pool counts rows, as it did before saves were linked.
+            // Without the links the pool counts rows, as it did before saves
+            // were linked.
             let links_of = |raw: &[RawHit]| {
-                if table.kind != TableKind::Memory {
-                    return HashMap::new();
-                }
                 let ids: Vec<i64> = raw.iter().map(|r| r.id).collect();
                 crate::memory::pieces::read_links(c, &ids).unwrap_or_else(|e| {
                     log::warn!("knn: reading save links failed, the pool counts rows: {e}");
@@ -688,13 +540,13 @@ async fn knn_one(
 
             let mut passes = 0usize;
             let mut eligible = None;
-            let mut raw = run(c, table, &q, &agent, &proj, k, &mut passes, &lexical_matches)?;
+            let mut raw = run(c, &q, &agent, &proj, k, &mut passes, &lexical_matches)?;
             let mut links = links_of(&raw);
             let widen = if raw.len() < k {
                 // Capped at k by the SQL's own LIMIT, so this is
                 // `min(k, eligible)` — the most this query could ever return.
                 let reachable: i64 = c.query_row(
-                    table.eligible_sql,
+                    ELIGIBLE_SQL_MEMORY,
                     rusqlite::params![k as i64, &agent, &proj],
                     |row| row.get(0),
                 )?;
@@ -706,14 +558,13 @@ async fn knn_one(
                 distinct_saves(raw.iter().map(|r| r.id), &links) < k
             };
             if widen {
-                raw = run(c, table, &q, &agent, &proj, retry_window(k), &mut passes, &lexical_matches)?;
+                raw = run(c, &q, &agent, &proj, retry_window(k), &mut passes, &lexical_matches)?;
                 links = links_of(&raw);
             }
             let mut hits: Vec<RankedHit> = raw
                 .into_iter()
                 .map(|r| RankedHit {
                     id: r.id,
-                    kind: r.kind,
                     score: compute_score(&scoring, &r, now),
                     content: r.content,
                     memory_type: r.memory_type,
@@ -744,41 +595,28 @@ async fn knn_one(
         .map_err(|e| match e {
             tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
             tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend(format!("connection closed during {}", table.label))
+                MemoryError::Backend("connection closed during knn_memory".into())
             }
             other => MemoryError::Backend(other.to_string()),
         })
 }
 
-/// Renders the pool-survival fragment of the retrieval line from what each
-/// table was asked for and what it gave back.
+/// Renders the pool-survival fragment of the retrieval line from what the
+/// KNN arm was asked for and what it gave back.
 ///
-/// The requested side reads the scope, never the window a starved table was
+/// The requested side reads the scope, never the window a starved arm was
 /// re-queried with: the wider window is a means of filling the pool the caller
 /// asked for, and reporting it would move the denominator under the ratio so
-/// that a rescued search reads as the worst one in the log. A table the scope
+/// that a rescued search reads as the worst one in the log. An arm the scope
 /// switched off contributes 0 on both sides — it asked for nothing and got
 /// nothing, which is not a survival rate of zero.
-fn format_pool_line(
-    scope: &SearchScope,
-    mem: &KnnOutcome,
-    epi: &KnnOutcome,
-    pro: &KnnOutcome,
-) -> String {
-    crate::memory::admin::format_pool_survival(
-        (
-            scope.memory.unwrap_or(0),
-            scope.episodic.unwrap_or(0),
-            scope.procedural.unwrap_or(0),
-        ),
-        (mem.hits.len(), epi.hits.len(), pro.hits.len()),
-        (mem.retried(), epi.retried(), pro.retried()),
-    )
+fn format_pool_line(scope: &SearchScope, mem: &KnnOutcome) -> String {
+    crate::memory::admin::format_pool_survival(scope.memory.unwrap_or(0), mem.hits.len(), mem.retried())
 }
 
 // ── lexical (FTS5) candidate channel ──
 //
-// Wired into search_all_memories_inner as the arm after the three KNN.
+// Wired into search_all_memories_inner as the arm after the KNN.
 
 /// Maximum number of OR-ed terms an FTS5 MATCH expression may carry, taken
 /// from the front of the token list. Bounds the expression so a pasted
@@ -1279,7 +1117,6 @@ async fn score_lexical_candidates(
             let (source, by): (Option<String>, Option<String>) = (row.get(12)?, row.get(13)?);
             Ok(RawHit {
                 id,
-                kind: TableKind::Memory,
                 content: row.get(1)?,
                 origin: preference_mark(&memory_type, source.as_deref(), by.as_deref()),
                 memory_type,
@@ -1301,7 +1138,6 @@ async fn score_lexical_candidates(
             let r = row?;
             hits.push(RankedHit {
                 id: r.id,
-                kind: r.kind,
                 score: compute_score(&scoring, &r, now),
                 content: r.content,
                 memory_type: r.memory_type,
@@ -1365,9 +1201,9 @@ async fn search_all_memories_inner(
     let projects = projects.as_deref();
     let agents = reach_bind(agent_id, &scope.reach);
     let agents = agents.as_str();
-    // Read once and shared by every table: no two rows scored by this search
-    // may have their decay computed against a different instant, which three
-    // independent per-row `strftime('%s','now')` calls could never guarantee.
+    // Read once and shared by every arm: no two rows scored by this search may
+    // have their decay computed against a different instant, which per-row
+    // `strftime('%s','now')` calls could never guarantee.
     let now = TimestampMs::now();
 
     // The first arm: the bonus has to be in each row's score before
@@ -1381,34 +1217,13 @@ async fn search_all_memories_inner(
         }
         _ => HashSet::new(),
     };
-    // Ids are per table and only `memory` has a lexical index.
-    let no_matches = HashSet::new();
-
     // One arm after another, in the order they always reached the
     // connection: it runs one call at a time, so joining them ran nothing in
     // parallel. Each call goes in once the one before came back.
     let mem = match scope.memory {
         Some(k) => {
-            let outcome =
-                knn_one(store, KNN_MEMORY, &q_bytes, agents, projects, k, scoring, now, &lexical_matches).await?;
+            let outcome = knn_one(store, &q_bytes, agents, projects, k, scoring, now, &lexical_matches).await?;
             record_arm(metrics, "knn_memory", outcome.ran);
-            outcome
-        }
-        None => KnnOutcome::skipped(),
-    };
-    let epi = match scope.episodic {
-        Some(k) => {
-            let outcome = knn_one(store, KNN_EPISODIC, &q_bytes, agents, projects, k, scoring, now, &no_matches).await?;
-            record_arm(metrics, "knn_episodic", outcome.ran);
-            outcome
-        }
-        None => KnnOutcome::skipped(),
-    };
-    let pro = match scope.procedural {
-        Some(k) => {
-            let outcome =
-                knn_one(store, KNN_PROCEDURAL, &q_bytes, agents, projects, k, scoring, now, &no_matches).await?;
-            record_arm(metrics, "knn_skill", outcome.ran);
             outcome
         }
         None => KnnOutcome::skipped(),
@@ -1423,20 +1238,12 @@ async fn search_all_memories_inner(
         (Some(k), Some(q)) => Some(lexical_candidates(store, q, agents, projects, k).await),
         _ => None,
     };
-    for (outcome, table) in [(&mem, "memory"), (&epi, "episodic"), (&pro, "skill")] {
-        if outcome.retried() {
-            metrics.gauge("search.knn_retry", &[("table", table)], 1.0);
-        }
+    if mem.retried() {
+        metrics.gauge("search.knn_retry", &[("table", "memory")], 1.0);
     }
     let (lex_ids, lexical_took) = lex_ids.unzip();
     let lex_ids = lex_ids.unwrap_or_default();
 
-    // Differenced against memory-kind hits ONLY, never the merged 3-table
-    // pool: `memory`, `episodic_trajectory` and `procedural_skill` each keep
-    // their own independent autoincrement sequence, so an id from one table
-    // can equal an unrelated id from another by coincidence. Differencing
-    // against the merged pool would treat that coincidence as "already
-    // found" and silently drop a legitimate lexical candidate.
     let dense_ids: HashSet<i64> = mem.hits.iter().map(|h| h.id).collect();
     // An identifier match is a candidate even when the OR query left it out
     // (past its first tokens, or outranked by bm25) and the dense arm missed it.
@@ -1466,11 +1273,11 @@ async fn search_all_memories_inner(
         record_arm(metrics, "lexical", candidates_ran + scoring_ran);
     }
 
-    // Built before the merge below consumes the per-table hits, which is also
+    // Built before the merge below consumes the dense hits, which is also
     // what lets a test assemble it from real outcomes instead of from numbers
     // it invented: the requested/returned pairing lives in one place rather
     // than being reassembled at the log call.
-    let pool_survival = format_pool_line(&scope, &mem, &epi, &pro);
+    let pool_survival = format_pool_line(&scope, &mem);
     let channel_attribution =
         crate::memory::admin::format_channel_attribution(mem.hits.len(), lexical_only);
     let telemetry = format!("{pool_survival} {channel_attribution}");
@@ -1482,11 +1289,10 @@ async fn search_all_memories_inner(
     // only win by outscoring what it displaces. The union happens strictly
     // before this sort/truncate, so a lexical candidate is never exempt from
     // the ordering that decides who survives.
-    let mut all: Vec<RankedHit> =
-        mem.hits.into_iter().chain(epi.hits).chain(pro.hits).chain(lex_hits).collect();
+    let mut all: Vec<RankedHit> = mem.hits.into_iter().chain(lex_hits).collect();
     all.sort_by(hit_cmp);
     let all = readable_hits(all, agent_id, &scope.reach);
-    let memory_ids: Vec<i64> = all.iter().filter(|h| h.kind == TableKind::Memory).map(|h| h.id).collect();
+    let memory_ids: Vec<i64> = all.iter().map(|h| h.id).collect();
     // Without the links the pieces stay separate hits, as before they were
     // linked; a search never fails over them.
     let mut all = match store.save_links(memory_ids).await {
@@ -1652,8 +1458,6 @@ mod tests {
     fn scope_all_default_values() {
         let s = SearchScope::all_default();
         assert_eq!(s.memory, Some(30));
-        assert_eq!(s.episodic, Some(5));
-        assert_eq!(s.procedural, Some(5));
         assert_eq!(s.projects, None);
         // Every production search reaches the store through this constructor,
         // so this one field is what decides whether the lexical channel runs
@@ -1685,7 +1489,6 @@ mod tests {
     fn ranked_hit_sort_descending_by_score() {
         let h1 = RankedHit {
             id: 1,
-            kind: TableKind::Memory,
             content: "a".into(),
             memory_type: "chat_message".into(),
             tier: 3,
@@ -1702,7 +1505,6 @@ mod tests {
         };
         let h2 = RankedHit {
             id: 2,
-            kind: TableKind::Memory,
             content: "b".into(),
             memory_type: "chat_message".into(),
             tier: 3,
@@ -1722,19 +1524,14 @@ mod tests {
         assert!((hits[0].score - 0.9).abs() < 1e-9);
     }
 
-    // Score first, then a key that cannot repeat: id is unique per table and
-    // kind separates the three, so no two distinct hits may compare Equal —
-    // ties on score alone (same id, different kind is impossible in
-    // practice, but the comparator must still resolve it) fall through to
-    // kind, and ties on both score and kind fall through to id.
+    // Score first, then the id, so no two distinct hits may compare Equal.
     #[test]
     fn hit_cmp_is_a_strict_total_order_even_on_score_ties() {
         use std::cmp::Ordering;
 
-        fn make(id: i64, kind: TableKind, score: f64) -> RankedHit {
+        fn make(id: i64, score: f64) -> RankedHit {
             RankedHit {
                 id,
-                kind,
                 content: String::new(),
                 memory_type: String::new(),
                 tier: 3,
@@ -1751,19 +1548,15 @@ mod tests {
             }
         }
 
-        let a = make(1, TableKind::Memory, 0.5);
-        let b = make(2, TableKind::Memory, 0.5); // tied score+kind, id breaks it
-        let c = make(1, TableKind::Episodic, 0.5); // tied score+id, kind breaks it
-        let d = make(3, TableKind::Procedural, 0.9); // higher score sorts first
+        let a = make(1, 0.5);
+        let b = make(2, 0.5); // tied score, id breaks it
+        let d = make(3, 0.9); // higher score sorts first
 
-        assert_eq!(hit_cmp(&a, &b), Ordering::Less, "same score+kind: lower id sorts first");
+        assert_eq!(hit_cmp(&a, &b), Ordering::Less, "same score: lower id sorts first");
         assert_eq!(hit_cmp(&b, &a), Ordering::Greater);
-        assert_eq!(hit_cmp(&a, &c), Ordering::Less, "same score+id: Memory sorts before Episodic");
-        assert_eq!(hit_cmp(&c, &a), Ordering::Greater);
-        assert_eq!(hit_cmp(&d, &a), Ordering::Less, "higher score sorts first regardless of kind/id");
+        assert_eq!(hit_cmp(&d, &a), Ordering::Less, "higher score sorts first regardless of id");
 
         assert_ne!(hit_cmp(&a, &b), Ordering::Equal, "distinct hits must never compare Equal");
-        assert_ne!(hit_cmp(&a, &c), Ordering::Equal, "distinct hits must never compare Equal");
         assert_eq!(hit_cmp(&a, &a), Ordering::Equal, "a hit compares Equal to itself");
     }
 
@@ -1784,9 +1577,8 @@ mod tests {
     // Tier 1 is the hottest tier, not an excluded one. A row lands there by
     // being important or by being a type that is always kept close, and the
     // KNN pool has to be able to reach it — the deterministic workspace
-    // channel only carries a fixed slice of tier 1 (importance >= 8 and the
-    // top few skills), so anything the pool refuses to scan is delivered by
-    // nobody at all.
+    // channel only carries a fixed slice of tier 1 (importance >= 8), so
+    // anything the pool refuses to scan is delivered by nobody at all.
     #[tokio::test]
     async fn tier1_rows_are_reachable_by_knn() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -1814,67 +1606,10 @@ mod tests {
         // coincidentally landed on 4". Calling the pool query directly, before
         // any merge or truncation, tests the scan set in isolation.
         assert_eq!(
-            knn_one(&store, KNN_MEMORY, &emb, &only("agent-test"), None, 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap().hits.len(),
+            knn_one(&store, &emb, &only("agent-test"), None, 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap().hits.len(),
             4,
             "the tier-1 row must survive inside the query, before any merge or truncation"
         );
-    }
-
-    // `procedural_skill` rows are born at tier 1 (`compute_tier` pins that
-    // type there) and nothing demotes them, so a pool that skipped tier 1
-    // returned zero skills for every query ever issued — every stored skill
-    // was unreachable through this channel.
-    #[tokio::test]
-    async fn knn_procedural_returns_skill_rows() {
-        use crate::memory::embedder::FakeEmbedder;
-        use crate::memory::store_insert::{NewProceduralSkillRecord, PromoteOutcome};
-
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let trigger = "un test falla después de editar";
-        let q_vec = embedder.embed_with_role(trigger, EmbedRole::Passage).await.unwrap();
-
-        let outcome = store
-            .promote_to_procedural_skill(
-                NewProceduralSkillRecord {
-                    agent_id: "agent-skill".to_string(),
-                    project_id: None,
-                    skill_name: "reparar-test-roto".to_string(),
-                    trigger: trigger.to_string(),
-                    tool_sequence_json: "[\"read\",\"edit\",\"test\"]".to_string(),
-                    source_trajectory_ids: vec![1, 2, 3],
-                    importance: 8.0,
-                    now_ms: 1_700_000_000_000,
-                },
-                Some(q_vec.clone()),
-            )
-            .await
-            .unwrap();
-        let id = match outcome {
-            PromoteOutcome::Inserted(id) => id,
-            other => panic!("expected a fresh insert, got {other:?}"),
-        };
-
-        let q_bytes = serialize_f32_query(&to_unit(&q_vec).unwrap());
-        assert_eq!(
-            knn_one(&store, KNN_PROCEDURAL, &q_bytes, &only("agent-skill"), None, 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
-                .await
-                .unwrap()
-                .hits
-                .len(),
-            1,
-            "the procedural pool must return the skill row"
-        );
-
-        let hits = search_all_memories(&store, &q_vec, None, "agent-skill", SearchScope::all_default(), 10)
-            .await
-            .unwrap();
-        let hit = hits
-            .iter()
-            .find(|h| h.id == id && h.kind == TableKind::Procedural)
-            .expect("the skill must reach the merged result set");
-        assert_eq!(hit.tier, 1, "skills live at tier 1 — that is the point of this test");
-        assert_eq!(hit.memory_type, "procedure");
     }
 
     // A query vector reaching `search_all_memories` at any magnitude must be
@@ -2169,7 +1904,7 @@ mod tests {
     async fn search_respects_scope_none_skips_table() {
         let store = MemoryStore::new_for_test().await.unwrap();
         let q_vec = unit_basis_vec();
-        let scope = SearchScope { memory: None, episodic: None, procedural: None, projects: None, lexical: None, reach: Reach::Own };
+        let scope = SearchScope { memory: None, projects: None, lexical: None, reach: Reach::Own };
         let hits = search_all_memories(&store, &q_vec, None, "agent-x", scope, 10)
             .await.unwrap();
         assert!(hits.is_empty(), "all scopes None → empty results");
@@ -2212,7 +1947,7 @@ mod tests {
         // pre-truncation pool size directly proves k_final is what cuts the
         // result, not a starved pool.
         assert_eq!(
-            knn_one(&store, KNN_MEMORY, &emb, &only(agent), None, 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap().hits.len(),
+            knn_one(&store, &emb, &only(agent), None, 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap().hits.len(),
             5,
             "all five must survive the query; k_final is what cuts the result, not the pool"
         );
@@ -2319,81 +2054,6 @@ mod tests {
         assert!(hits[1].score >= hits[2].score, "sorted DESC");
     }
 
-    // ── episodic_trajectory KNN retrieval ──
-    //
-    // No production code change here: SEARCH_SQL_EPISODIC's `epi.agent_id = ?3`
-    // filter already supports `episodic_trajectory` rows without modification.
-    // These tests exist to prove that, not to add new behavior.
-
-    async fn insert_episodic_row_for_knn(
-        store: &MemoryStore,
-        agent_id: &str,
-        task: &str,
-        embedding: Vec<f32>,
-    ) -> i64 {
-        use crate::memory::store_insert::{CreatedByType, NewEpisodicTrajectoryRecord};
-        let record = NewEpisodicTrajectoryRecord {
-            scope: "agent",
-            agent_id: Some(agent_id.to_string()),
-            project_id: None,
-            session_id: format!("sess-knn-{agent_id}"),
-            task: task.to_string(),
-            tool_calls_json: "[]".to_string(),
-            errors_json: "[]".to_string(),
-            resolution: None,
-            success_score: 0.9,
-            created_by_type: CreatedByType::System,
-            created_by_ref: agent_id.to_string(),
-            importance: 5.0,
-            created_at_ms: 0,
-        };
-        store.insert_episodic_trajectory(record, embedding).await.unwrap()
-    }
-
-    // Row with agent_id="agent-a" is KNN-retrievable when the query is
-    // searched with the SAME agent_id; surfaced as memory_type='episode'.
-    #[tokio::test]
-    async fn episodic_trajectory_retrievable_by_same_agent_id() {
-        use crate::memory::embedder::FakeEmbedder;
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let task = "depurar timeout de red";
-        let emb = embedder.embed_with_role(task, EmbedRole::Passage).await.unwrap();
-        let id = insert_episodic_row_for_knn(&store, "agent-a", task, emb.clone()).await;
-
-        let hits = search_all_memories(&store, &emb, None, "agent-a", SearchScope::all_default(), 10)
-            .await
-            .unwrap();
-
-        let hit = hits
-            .iter()
-            .find(|h| h.id == id)
-            .expect("expected episodic row to be retrievable for the same agent_id");
-        assert_eq!(hit.memory_type, "episode", "episodic rows must surface memory_type='episode'");
-    }
-
-    // The SAME row is NOT retrievable for a DIFFERENT agent_id — expected
-    // behavior (filter exclusion), not a regression.
-    #[tokio::test]
-    async fn episodic_trajectory_not_retrievable_by_different_agent_id() {
-        use crate::memory::embedder::FakeEmbedder;
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let task = "depurar timeout de red";
-        let emb = embedder.embed_with_role(task, EmbedRole::Passage).await.unwrap();
-        let id = insert_episodic_row_for_knn(&store, "agent-a", task, emb.clone()).await;
-
-        let hits = search_all_memories(&store, &emb, None, "agent-b", SearchScope::all_default(), 10)
-            .await
-            .unwrap();
-
-        assert!(
-            !hits.iter().any(|h| h.id == id),
-            "row must NOT be retrievable for a different agent_id — each KNN query filters \
-             agent_id = ?3, so cross-agent isolation holds even for episodic rows"
-        );
-    }
-
     // ── project scoping ──
 
     /// `project` as the queries bind it.
@@ -2437,65 +2097,6 @@ mod tests {
             .unwrap()
     }
 
-    async fn insert_episodic_row_with_project(
-        store: &MemoryStore,
-        agent_id: &str,
-        project_id: Option<&str>,
-        session_id: &str,
-        embedding: Vec<f32>,
-    ) -> i64 {
-        use crate::memory::store_insert::{CreatedByType, NewEpisodicTrajectoryRecord};
-        let record = NewEpisodicTrajectoryRecord {
-            scope: "agent",
-            agent_id: Some(agent_id.to_string()),
-            project_id: project_id.map(|p| p.to_string()),
-            session_id: session_id.to_string(),
-            task: "scoped task".to_string(),
-            tool_calls_json: "[]".to_string(),
-            errors_json: "[]".to_string(),
-            resolution: None,
-            success_score: 0.9,
-            created_by_type: CreatedByType::System,
-            created_by_ref: agent_id.to_string(),
-            importance: 5.0,
-            created_at_ms: 0,
-        };
-        store.insert_episodic_trajectory(record, embedding).await.unwrap()
-    }
-
-    async fn insert_procedural_row_with_project(
-        store: &MemoryStore,
-        agent_id: &str,
-        project_id: Option<&str>,
-        skill_name: &str,
-        embedding: Vec<f32>,
-    ) -> i64 {
-        use crate::memory::store_insert::{NewProceduralSkillRecord, PromoteOutcome};
-        let outcome = store
-            .promote_to_procedural_skill(
-                NewProceduralSkillRecord {
-                    agent_id: agent_id.to_string(),
-                    project_id: project_id.map(|p| p.to_string()),
-                    skill_name: skill_name.to_string(),
-                    trigger: format!("trigger-{skill_name}"),
-                    // Dedup key is (agent_id, tool_sequence): distinct per skill_name
-                    // so two rows for the same agent in this test don't collapse
-                    // into one UPDATE instead of two separate inserts.
-                    tool_sequence_json: format!("[\"read\",\"{skill_name}\"]"),
-                    source_trajectory_ids: vec![1],
-                    importance: 8.0,
-                    now_ms: 0,
-                },
-                Some(embedding),
-            )
-            .await
-            .unwrap();
-        match outcome {
-            PromoteOutcome::Inserted(id) => id,
-            other => panic!("expected a fresh insert, got {other:?}"),
-        }
-    }
-
     #[tokio::test]
     async fn foreign_project_row_not_returned_memory() {
         let store = MemoryStore::new_for_test().await.unwrap();
@@ -2519,11 +2120,10 @@ mod tests {
     }
 
     /// A group reads each of its projects as a project scope does: its own
-    /// rows, those without a project and every preference, in each table, and
-    /// the lexical channel too.
+    /// rows, those without a project and every preference, in the dense and
+    /// the lexical channel.
     #[tokio::test]
     async fn a_group_scope_reads_each_of_its_projects() {
-        use crate::memory::embedder::FakeEmbedder;
         let store = MemoryStore::new_for_test().await.unwrap();
         let emb = unit_basis_embedding();
         let row = |project: Option<&'static str>, memory_type: &'static str, content: &'static str| {
@@ -2534,76 +2134,18 @@ mod tests {
         let in_r = row(Some("R"), "chat_message", "grouptok of R").await;
         let unscoped = row(None, "chat_message", "grouptok of none").await;
         let preference = row(Some("R"), "user_preference", "grouptok preferred in R").await;
-        let task = FakeEmbedder::default().embed_with_role("grouped episodic task", EmbedRole::Passage).await.unwrap();
-        let episode_q = insert_episodic_row_with_project(&store, "agent-group", Some("Q"), "sess-q", task.clone()).await;
-        let episode_r = insert_episodic_row_with_project(&store, "agent-group", Some("R"), "sess-r", task.clone()).await;
 
         let group = || SearchScope::all_default().with_projects(vec!["P".to_string(), "Q".to_string()]);
         let memories: HashSet<i64> = search_all_memories(&store, &unit_basis_vec(), Some("grouptok"), "agent-group", group(), 10)
             .await
             .unwrap()
             .iter()
-            .filter(|h| h.kind == TableKind::Memory)
-            .map(|h| h.id)
-            .collect();
-        let episodes: Vec<i64> = search_all_memories(&store, &task, None, "agent-group", group(), 10)
-            .await
-            .unwrap()
-            .iter()
-            .filter(|h| h.kind == TableKind::Episodic)
             .map(|h| h.id)
             .collect();
         let lexical = lexical_candidates(&store, "grouptok", &only("agent-group"), projects_bind(Some(&["P", "Q"])).as_deref(), 20).await.0;
 
         assert_eq!(memories, HashSet::from([in_p, in_q, unscoped, preference]), "not {in_r} of R");
-        assert_eq!(episodes, vec![episode_q], "not {episode_r} of R");
         assert_eq!(lexical.into_iter().collect::<HashSet<i64>>(), HashSet::from([in_p, in_q, unscoped, preference]));
-    }
-
-    #[tokio::test]
-    async fn foreign_project_row_not_returned_episodic() {
-        use crate::memory::embedder::FakeEmbedder;
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let emb = embedder.embed_with_role("scoped episodic task", EmbedRole::Passage).await.unwrap();
-        let own = insert_episodic_row_with_project(
-            &store, "agent-scope", Some("P1"), "sess-epi-own", emb.clone(),
-        ).await;
-        let foreign = insert_episodic_row_with_project(
-            &store, "agent-scope", Some("P2"), "sess-epi-foreign", emb.clone(),
-        ).await;
-
-        let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &emb, None, "agent-scope", scope, 10).await.unwrap();
-
-        assert!(hits.iter().any(|h| h.id == own && h.kind == TableKind::Episodic), "own-project episodic row must appear");
-        assert!(
-            !hits.iter().any(|h| h.id == foreign && h.kind == TableKind::Episodic),
-            "foreign-project episodic row must not appear when scoped to a different project"
-        );
-    }
-
-    #[tokio::test]
-    async fn foreign_project_row_not_returned_procedural() {
-        use crate::memory::embedder::FakeEmbedder;
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let emb = embedder.embed_with_role("scoped procedural trigger", EmbedRole::Passage).await.unwrap();
-        let own = insert_procedural_row_with_project(
-            &store, "agent-scope", Some("P1"), "skill-own", emb.clone(),
-        ).await;
-        let foreign = insert_procedural_row_with_project(
-            &store, "agent-scope", Some("P2"), "skill-foreign", emb.clone(),
-        ).await;
-
-        let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &emb, None, "agent-scope", scope, 10).await.unwrap();
-
-        assert!(hits.iter().any(|h| h.id == own && h.kind == TableKind::Procedural), "own-project procedural row must appear");
-        assert!(
-            !hits.iter().any(|h| h.id == foreign && h.kind == TableKind::Procedural),
-            "foreign-project procedural row must not appear when scoped to a different project"
-        );
     }
 
     #[tokio::test]
@@ -2621,44 +2163,6 @@ mod tests {
         assert!(
             hits.iter().any(|h| h.id == id),
             "a NULL-project memory row must remain visible from a scoped query"
-        );
-    }
-
-    #[tokio::test]
-    async fn null_project_row_visible_from_scoped_query_episodic() {
-        use crate::memory::embedder::FakeEmbedder;
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let emb = embedder.embed_with_role("scoped null episodic task", EmbedRole::Passage).await.unwrap();
-        let id = insert_episodic_row_with_project(
-            &store, "agent-scope-null", None, "sess-epi-null", emb.clone(),
-        ).await;
-
-        let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &emb, None, "agent-scope-null", scope, 10).await.unwrap();
-
-        assert!(
-            hits.iter().any(|h| h.id == id && h.kind == TableKind::Episodic),
-            "a NULL-project episodic row must remain visible from a scoped query"
-        );
-    }
-
-    #[tokio::test]
-    async fn null_project_row_visible_from_scoped_query_procedural() {
-        use crate::memory::embedder::FakeEmbedder;
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let emb = embedder.embed_with_role("scoped null procedural trigger", EmbedRole::Passage).await.unwrap();
-        let id = insert_procedural_row_with_project(
-            &store, "agent-scope-null", None, "skill-null", emb.clone(),
-        ).await;
-
-        let scope = SearchScope::all_default().with_project(Some("P1"));
-        let hits = search_all_memories(&store, &emb, None, "agent-scope-null", scope, 10).await.unwrap();
-
-        assert!(
-            hits.iter().any(|h| h.id == id && h.kind == TableKind::Procedural),
-            "a NULL-project procedural row must remain visible from a scoped query"
         );
     }
 
@@ -2706,7 +2210,7 @@ mod tests {
             &store, agent, Some("P2"), "user_preference", "pref content", far,
         ).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, &only(agent), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let outcome = knn_one(&store, &near, &only(agent), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2886,7 +2390,7 @@ mod tests {
         let emb = unit_basis_embedding();
         bulk_insert_memory_rows(&store, "agent-full", Some("P1"), 10, emb.clone()).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &emb, &only("agent-full"), Some(bound("P1").as_str()), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let outcome = knn_one(&store, &emb, &only("agent-full"), Some(bound("P1").as_str()), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2908,7 +2412,7 @@ mod tests {
         let emb = unit_basis_embedding();
         bulk_insert_memory_rows(&store, "agent-small", Some("P1"), 8, emb.clone()).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &emb, &only("agent-small"), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let outcome = knn_one(&store, &emb, &only("agent-small"), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2930,7 +2434,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-starved", Some("P2"), 100, near.clone()).await;
         let own = bulk_insert_memory_rows(&store, "agent-starved", Some("P1"), 5, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, &only("agent-starved"), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let outcome = knn_one(&store, &near, &only("agent-starved"), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2964,7 +2468,7 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-trunc", Some("P2"), 10, near.clone()).await;
         bulk_insert_memory_rows(&store, "agent-trunc", Some("P1"), 50, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, &only("agent-trunc"), Some(bound("P1").as_str()), 10, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let outcome = knn_one(&store, &near, &only("agent-trunc"), Some(bound("P1").as_str()), 10, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -2990,8 +2494,6 @@ mod tests {
         let far = off_axis_embedding();
         let scope = SearchScope {
             memory: Some(30),
-            episodic: None,
-            procedural: None,
             projects: Some(vec!["P1".to_string()]),
             lexical: None,
             reach: Reach::Own,
@@ -3002,23 +2504,23 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-telemetry", Some("P2"), 30, near.clone()).await;
         bulk_insert_memory_rows(&store, "agent-telemetry", Some("P1"), 40, far).await;
 
-        let mem = knn_one(&store, KNN_MEMORY, &near, &only("agent-telemetry"), Some(bound("P1").as_str()), k, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let mem = knn_one(&store, &near, &only("agent-telemetry"), Some(bound("P1").as_str()), k, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
         assert_eq!(mem.passes, 2, "test setup: the window has to have been starved");
 
-        let line = format_pool_line(&scope, &mem, &KnnOutcome::skipped(), &KnnOutcome::skipped());
+        let line = format_pool_line(&scope, &mem);
 
         assert!(
-            line.contains("pool_req=(30+0+0)"),
+            line.contains("pool_req=30 "),
             "the denominator is what the caller asked for, never the widened window: {line}"
         );
         assert!(
-            line.contains("pool_ret=(30+0+0)"),
+            line.contains("pool_ret=30 "),
             "enough eligible rows existed, so the recovered pool is full: {line}"
         );
         assert!(
-            line.contains("retry=(mem)"),
+            line.contains(" retry"),
             "a line whose numbers were reached through a second pass has to say so: {line}"
         );
     }
@@ -3026,8 +2528,8 @@ mod tests {
     // The test above drives `format_pool_line` directly with an outcome it
     // built by hand — it pins the formatter, not the one-line wiring at the
     // real call site inside `search_all_memories_inner` that hands that
-    // formatter the actual `mem`/`epi`/`pro` outcomes from a live search. A
-    // mutation there (wrong table in the wrong slot, wrong scope) would
+    // formatter the actual outcome from a live search. A mutation there
+    // (wrong outcome, wrong scope) would
     // change nothing this driven-by-hand test could see. This drives the same
     // starved-then-recovered fixture through the public orchestrator instead,
     // so it is the real per-search outcomes that reach the formatter.
@@ -3038,8 +2540,6 @@ mod tests {
         let far = off_axis_vec();
         let scope = SearchScope {
             memory: Some(30),
-            episodic: None,
-            procedural: None,
             projects: Some(vec!["P1".to_string()]),
             lexical: None,
             reach: Reach::Own,
@@ -3058,17 +2558,14 @@ mod tests {
             "the recovery has to reach the caller's own rows through the real orchestrator, not just knn_one"
         );
         assert!(
-            line.contains("pool_req=(30+0+0)"),
+            line.contains("pool_req=30 "),
             "the line built at the real call site must still read the requested pool: {line}"
         );
         assert!(
-            line.contains("pool_ret=(30+0+0)"),
+            line.contains("pool_ret=30 "),
             "the line built at the real call site must still read what came back: {line}"
         );
-        assert!(
-            line.contains("retry=(mem)"),
-            "the line built at the real call site must still say which table retried: {line}"
-        );
+        assert!(line.contains(" retry"), "the line built at the real call site must still say it retried: {line}");
     }
 
     /// Soft-deletes a row and leaves its vector in place, the way rows deleted
@@ -3101,7 +2598,7 @@ mod tests {
             soft_delete_keeping_vector(&store, *id).await;
         }
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, &only("agent-deleted"), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let outcome = knn_one(&store, &near, &only("agent-deleted"), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -3141,7 +2638,7 @@ mod tests {
         let own = bulk_insert_memory_rows(&store, "agent-shared", Some("P1"), 3, near.clone()).await;
         bulk_insert_memory_rows(&store, "agent-shared", Some("P2"), 1000, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, &only("agent-shared"), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let outcome = knn_one(&store, &near, &only("agent-shared"), Some(bound("P1").as_str()), 30, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -3219,7 +2716,7 @@ mod tests {
         ).await;
 
         let q_bytes = serialize_embedding(&unit_basis_vec());
-        let outcome = knn_one(&store, KNN_MEMORY, &q_bytes, &only(agent), Some(bound("P1").as_str()), 1, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let outcome = knn_one(&store, &q_bytes, &only(agent), Some(bound("P1").as_str()), 1, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .unwrap();
 
@@ -3245,153 +2742,13 @@ mod tests {
         bulk_insert_memory_rows(&store, "agent-ceiling", Some("P2"), k, near.clone()).await;
         let own = bulk_insert_memory_rows(&store, "agent-ceiling", Some("P1"), 5, far).await;
 
-        let outcome = knn_one(&store, KNN_MEMORY, &near, &only("agent-ceiling"), Some(bound("P1").as_str()), k, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
+        let outcome = knn_one(&store, &near, &only("agent-ceiling"), Some(bound("P1").as_str()), k, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
             .await
             .expect("the widened window must stay bindable");
 
         assert_eq!(outcome.passes, 2);
         for id in &own {
             assert!(outcome.hits.iter().any(|h| h.id == *id), "row {id} must be recovered");
-        }
-    }
-
-    // The recovery is wired per table through a descriptor, and only the
-    // memory branch was ever driven through a starved window. A descriptor
-    // pointing at the wrong table's count is a silent mistake as long as no
-    // test makes the other two tables recover anything: the memory table is
-    // empty in these fixtures, so borrowing its count would report nothing
-    // eligible and the rows below would never come back.
-    #[tokio::test]
-    async fn knn_retry_recovers_episodic_rows_crowded_out_of_the_window() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let near = unit_basis_vec();
-        let far = off_axis_vec();
-        for i in 0..15 {
-            insert_episodic_row_with_project(
-                &store, "agent-epi-retry", Some("P2"), &format!("sess-foreign-{i}"), near.clone(),
-            ).await;
-        }
-        let mut own = Vec::new();
-        for i in 0..3 {
-            own.push(
-                insert_episodic_row_with_project(
-                    &store, "agent-epi-retry", Some("P1"), &format!("sess-own-{i}"), far.clone(),
-                ).await,
-            );
-        }
-
-        let q_bytes = serialize_embedding(&near);
-        let outcome = knn_one(&store, KNN_EPISODIC, &q_bytes, &only("agent-epi-retry"), Some(bound("P1").as_str()), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.passes, 2, "the first window held nothing this caller may see");
-        for id in &own {
-            assert!(
-                outcome.hits.iter().any(|h| h.id == *id && h.kind == TableKind::Episodic),
-                "episodic row {id} must be recovered by the wider window"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn knn_retry_recovers_procedural_rows_crowded_out_of_the_window() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let near = unit_basis_vec();
-        let far = off_axis_vec();
-        for i in 0..15 {
-            insert_procedural_row_with_project(
-                &store, "agent-pro-retry", Some("P2"), &format!("skill-foreign-{i}"), near.clone(),
-            ).await;
-        }
-        let mut own = Vec::new();
-        for i in 0..3 {
-            own.push(
-                insert_procedural_row_with_project(
-                    &store, "agent-pro-retry", Some("P1"), &format!("skill-own-{i}"), far.clone(),
-                ).await,
-            );
-        }
-
-        let q_bytes = serialize_embedding(&near);
-        let outcome = knn_one(&store, KNN_PROCEDURAL, &q_bytes, &only("agent-pro-retry"), Some(bound("P1").as_str()), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new())
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.passes, 2, "the first window held nothing this caller may see");
-        for id in &own {
-            assert!(
-                outcome.hits.iter().any(|h| h.id == *id && h.kind == TableKind::Procedural),
-                "procedural row {id} must be recovered by the wider window"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn knn_one_reports_no_retry_for_episodic_and_procedural_small_corpora() {
-        use crate::memory::embedder::FakeEmbedder;
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        // Normalized before it is used on either side. The insert path unit-
-        // normalizes what it stores, so a raw query vector would be compared
-        // against something that no longer points the same length — distances
-        // stop being comparable to the cosine the score formula assumes, and
-        // any ordering read off them is an accident of the fixture.
-        let emb = to_unit(&embedder.embed_with_role("cross table outcome", EmbedRole::Passage).await.unwrap()).unwrap();
-        insert_episodic_row_with_project(&store, "agent-x", Some("P1"), "sess-x", emb.clone()).await;
-        insert_procedural_row_with_project(&store, "agent-x", Some("P1"), "skill-x", emb.clone()).await;
-
-        let q_bytes = serialize_f32_query(&emb);
-        let epi = knn_one(&store, KNN_EPISODIC, &q_bytes, &only("agent-x"), Some(bound("P1").as_str()), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap();
-        let pro = knn_one(&store, KNN_PROCEDURAL, &q_bytes, &only("agent-x"), Some(bound("P1").as_str()), 5, &ScoringConfig::DEFAULT, TimestampMs::now(), &HashSet::new()).await.unwrap();
-
-        assert_eq!(epi.hits.len(), 1);
-        assert_eq!(pro.hits.len(), 1);
-        assert_eq!(epi.passes, 1);
-        assert_eq!(pro.passes, 1);
-    }
-
-    #[tokio::test]
-    async fn unscoped_caller_sees_full_pre_scoping_row_set_episodic() {
-        use crate::memory::embedder::FakeEmbedder;
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let emb = embedder.embed_with_role("unscoped episodic task", EmbedRole::Passage).await.unwrap();
-        let p1 = insert_episodic_row_with_project(&store, "agent-uns-epi", Some("P1"), "sess-own", emb.clone()).await;
-        let p2 = insert_episodic_row_with_project(&store, "agent-uns-epi", Some("P2"), "sess-foreign", emb.clone()).await;
-        let none = insert_episodic_row_with_project(&store, "agent-uns-epi", None, "sess-unowned", emb.clone()).await;
-
-        let hits = search_all_memories(&store, &emb, None, "agent-uns-epi", SearchScope::all_default(), 10)
-            .await
-            .unwrap();
-
-        for id in [p1, p2, none] {
-            assert!(
-                hits.iter().any(|h| h.id == id && h.kind == TableKind::Episodic),
-                "unscoped query must return episodic row {id} regardless of its project_id"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn unscoped_caller_sees_full_pre_scoping_row_set_procedural() {
-        use crate::memory::embedder::FakeEmbedder;
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let embedder = FakeEmbedder::default();
-        let emb = embedder.embed_with_role("unscoped procedural trigger", EmbedRole::Passage).await.unwrap();
-        let p1 = insert_procedural_row_with_project(&store, "agent-uns-pro", Some("P1"), "skill-own", emb.clone()).await;
-        let p2 = insert_procedural_row_with_project(&store, "agent-uns-pro", Some("P2"), "skill-foreign", emb.clone()).await;
-        let none = insert_procedural_row_with_project(&store, "agent-uns-pro", None, "skill-unowned", emb.clone()).await;
-
-        let hits = search_all_memories(&store, &emb, None, "agent-uns-pro", SearchScope::all_default(), 10)
-            .await
-            .unwrap();
-
-        for id in [p1, p2, none] {
-            assert!(
-                hits.iter().any(|h| h.id == id && h.kind == TableKind::Procedural),
-                "unscoped query must return procedural row {id} regardless of its project_id"
-            );
         }
     }
 
@@ -3792,7 +3149,7 @@ mod tests {
         let lexical_id = insert_memory_row(&store, agent, "lexical row", "chat_message", 3, 5.0, "active", emb.clone()).await;
 
         let now = TimestampMs::now();
-        let dense_hits = knn_one(&store, KNN_MEMORY, &emb, &only(agent), None, 30, &ScoringConfig::DEFAULT, now, &HashSet::new())
+        let dense_hits = knn_one(&store, &emb, &only(agent), None, 30, &ScoringConfig::DEFAULT, now, &HashSet::new())
             .await
             .unwrap();
         let dense_score = dense_hits.hits.iter().find(|h| h.id == dense_id).unwrap().score;
@@ -4308,62 +3665,6 @@ mod tests {
     }
 
 
-    // `memory` and `episodic_trajectory` each keep their own independent
-    // autoincrement sequence, so their first-ever row both land on id 1 in a
-    // fresh store — a coincidence, not a bug, and the dedup step must not
-    // treat it as one. The episodic row (near, dense-visible) and M (far,
-    // lexical-only) share that same numeric id but different `TableKind`s;
-    // differencing lexical ids against the MERGED pool would see id 1
-    // "already found" via the episodic hit and wrongly drop M.
-    #[tokio::test]
-    async fn search_all_memories_inner_dedup_ignores_cross_table_id_collisions() {
-        let store = MemoryStore::new_for_test().await.unwrap();
-        let near = unit_basis_vec();
-        let far = far_vec(&near);
-        let agent = "agent-id-collision";
-
-        let epi_id = insert_episodic_row_for_knn(&store, agent, "collision episode", near.clone()).await;
-        let m_id = insert_memory_row(
-            &store,
-            agent,
-            "collision_unique_tok content",
-            "chat_message",
-            3,
-            5.0,
-            "active",
-            serialize_embedding(&far),
-        )
-        .await;
-        assert_eq!(epi_id, m_id, "test setup: the two independent autoincrement sequences must actually collide");
-
-        bulk_insert_memory_rows(&store, agent, None, 20, serialize_embedding(&near)).await;
-
-        let scope = SearchScope {
-            memory: Some(20),
-            episodic: Some(5),
-            procedural: None,
-            projects: None,
-            lexical: Some(20),
-            reach: Reach::Own,
-        };
-        let (hits, _telemetry, _) = search_all_memories_inner(
-            &store,
-            &near,
-            Some("collision_unique_tok"),
-            agent,
-            scope,
-            30,
-            &ScoringConfig::DEFAULT,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            hits.iter().any(|h| h.id == m_id && h.kind == TableKind::Memory),
-            "M must survive dedup even though its numeric id collides with an unrelated episodic hit"
-        );
-    }
-
     // The scenario the fail-soft contract exists for, exercised through the
     // real wired call site rather than `lexical_candidates` alone: a missing
     // `memory_fts` table must still leave `search_all_memories_inner`
@@ -4443,8 +3744,6 @@ mod tests {
 
         let scope = SearchScope {
             memory: Some(1),
-            episodic: None,
-            procedural: None,
             projects: None,
             lexical: Some(20),
             reach: Reach::Own,
@@ -4508,8 +3807,6 @@ mod tests {
 
         let scope = SearchScope {
             memory: None,
-            episodic: None,
-            procedural: None,
             lexical: Some(20),
             ..SearchScope::all_default()
         };
@@ -4559,8 +3856,6 @@ mod tests {
 
         let scope = SearchScope {
             memory: Some(20),
-            episodic: None,
-            procedural: None,
             projects: None,
             lexical: Some(20),
             reach: Reach::Own,
@@ -4686,8 +3981,6 @@ mod tests {
 
         let scope = SearchScope {
             memory: Some(20),
-            episodic: None,
-            procedural: None,
             projects: None,
             lexical: None,
             reach: Reach::Own,
@@ -4748,9 +4041,7 @@ mod tests {
 
         crate::memory::admin::delete_memory_core(
             &store,
-            id,
-            crate::memory::admin::MemoryKind::Memory,
-            None,
+            id, None,
         )
         .await
         .unwrap();
@@ -4795,9 +4086,7 @@ mod tests {
 
         crate::memory::admin::delete_memory_core(
             &store,
-            id,
-            crate::memory::admin::MemoryKind::Memory,
-            None,
+            id, None,
         )
         .await
         .unwrap();
@@ -4840,8 +4129,6 @@ mod tests {
 
         let scope = SearchScope {
             memory: Some(20),
-            episodic: None,
-            procedural: None,
             projects: None,
             lexical: Some(20),
             reach: Reach::Own,
@@ -4990,7 +4277,7 @@ mod tests {
         )
         .await;
 
-        let scope = SearchScope { memory: Some(20), episodic: None, procedural: None, ..SearchScope::all_default() };
+        let scope = SearchScope { memory: Some(20), ..SearchScope::all_default() };
         let query = Some("parseLedger7731");
         let hits = search_all_memories_inner(&store, &near, query, agent, scope, 25, &ScoringConfig::DEFAULT)
             .await
@@ -5021,7 +4308,7 @@ mod tests {
         let query = "the a of to in is it on at by be as or an we do so if up no parseLedger7731";
         assert!(fts_tokens(query).count() > MAX_LEXICAL_TOKENS);
 
-        let scope = SearchScope { memory: Some(20), episodic: None, procedural: None, ..SearchScope::all_default() };
+        let scope = SearchScope { memory: Some(20), ..SearchScope::all_default() };
         let hits = search_all_memories_inner(&store, &near, Some(query), agent, scope, 25, &ScoringConfig::DEFAULT)
             .await
             .unwrap()
@@ -5181,7 +4468,7 @@ mod tests {
     }
 
     fn lexical_only() -> SearchScope {
-        SearchScope { memory: None, episodic: None, procedural: None, ..SearchScope::all_default() }
+        SearchScope { memory: None, ..SearchScope::all_default() }
     }
 
     fn ids_of(hits: &[RankedHit]) -> Vec<i64> {
@@ -5401,7 +4688,6 @@ mod tests {
     fn memory_hit(id: i64, score: f64) -> RankedHit {
         RankedHit {
             id,
-            kind: TableKind::Memory,
             content: format!("row {id}"),
             memory_type: "chat_message".to_string(),
             tier: 3,
@@ -5438,17 +4724,12 @@ mod tests {
 
     #[test]
     fn rows_without_links_keep_their_place() {
-        let mut episode = memory_hit(11, 0.75);
-        episode.kind = TableKind::Episodic;
-        let hits = vec![memory_hit(3, 0.9), episode, memory_hit(2, 0.7), memory_hit(1, 0.6)];
-        // An episode shares its id with a linked memory row by coincidence;
-        // only `memory` rows are pieces.
-        let links = HashMap::from([(11, link(4, 2, 2)), (2, link(7, 1, 2))]);
+        let hits = vec![memory_hit(3, 0.9), memory_hit(11, 0.75), memory_hit(2, 0.7), memory_hit(1, 0.6)];
+        let links = HashMap::from([(2, link(7, 1, 2))]);
 
         let collapsed = collapse_saves(hits, &links);
 
         assert_eq!(ids_and_pieces(&collapsed), vec![(3, None), (11, None), (2, Some((1, 2))), (1, None)]);
-        assert_eq!(collapsed[1].kind, TableKind::Episodic);
     }
 
     /// `Reach::admits` and the SQL predicate are two spellings of one rule:
@@ -5567,13 +4848,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             arms_recorded(&store),
-            ["identifiers", "knn_episodic", "knn_memory", "knn_skill", "lexical", "total"],
-            "every arm that ran, and the whole search"
+            ["identifiers", "knn_memory", "lexical", "total"],
+            "one KNN, the lexical arms and the whole search"
         );
 
         let store = MemoryStore::new_for_test().await.unwrap();
-        let only_memory =
-            SearchScope { episodic: None, procedural: None, lexical: None, ..SearchScope::all_default() };
+        let only_memory = SearchScope { lexical: None, ..SearchScope::all_default() };
         search_all_memories(&store, &unit_basis_vec(), Some("vector arms"), agent, only_memory, 10).await.unwrap();
         assert_eq!(arms_recorded(&store), ["knn_memory", "total"], "an arm the scope switched off did not run");
         let gauges = store.metrics().minute().gauges;
@@ -5617,7 +4897,7 @@ mod tests {
     /// The `memory` KNN and the lexical channel, the arms that stay when the
     /// legacy tables go.
     fn memory_and_lexical() -> SearchScope {
-        SearchScope { episodic: None, procedural: None, ..SearchScope::all_default() }
+        SearchScope { ..SearchScope::all_default() }
     }
 
     #[tokio::test]
@@ -5712,7 +4992,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_memory_pool_counts_saves_and_reports_its_eligible_rows() {
-        let only_memory = SearchScope { memory: Some(30), episodic: None, procedural: None, ..SearchScope::all_default() };
+        let only_memory = SearchScope { memory: Some(30), ..SearchScope::all_default() };
 
         // A scope with fewer rows than the window: the count of what it holds
         // is read, and the three pieces of one save are one save.

@@ -52,7 +52,7 @@ Lo que la exploración no fijaba y se decide al aplicar, sin cambiar ninguna de 
 
 ## Fuera de alcance
 
-- El proyecto por defecto del puente (`crates/clawg-cli/src/mcp/server.rs`): lo resuelve [bridge-project-identity](../../bridge-project-identity/exploration.md).
+- El proyecto por defecto del puente (`crates/clawg-cli/src/mcp/server.rs`): lo resuelve [bridge-project-identity](../2026-11-07-bridge-project-identity/exploration.md).
 - `crates/clawg-core/src/memory/prompt_builder.rs`, que toca session-start-context en paralelo.
 - El contrato del agente (`agent_contract.json`, `agent_contract.es.json`): no cambia nada de lo que ve el modelo.
 - Un archivo de reglas para Cursor (decisión 8) y el hook `beforeSubmitPrompt` (decisión 3).

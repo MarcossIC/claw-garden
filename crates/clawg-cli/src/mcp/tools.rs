@@ -421,8 +421,8 @@ pub fn topic_key_warning(lang: Lang, id: i64) -> String {
 /// a row a verdict replaced stays out of searches with it.
 pub fn format_delete(lang: Lang, d: &Deleted) -> String {
     let mut out = match lang {
-        Lang::En => format!("deleted {}; restore_memory with the same id and kind undoes it", d.deleted),
-        Lang::Es => format!("se borró {}; restore_memory con el mismo id y kind lo deshace", d.deleted),
+        Lang::En => format!("deleted {}; restore_memory with the same id undoes it", d.deleted),
+        Lang::Es => format!("se borró {}; restore_memory con el mismo id lo deshace", d.deleted),
     };
     if !d.revived.is_empty() {
         let named: Vec<String> = d.revived.iter().map(|r| format!("#{} \"{}\"", r.id, r.excerpt)).collect();
@@ -508,6 +508,25 @@ pub fn format_restore(lang: Lang, r: &Restored) -> String {
     out
 }
 
+/// What a tool answers to a `kind`, which its schema no longer has but a
+/// model can still send from a contract of a version before V32: nothing
+/// for `memory`, the only kind.
+pub fn kind_refusal(lang: Lang, kind: Option<&str>) -> Option<String> {
+    let kind = kind.filter(|k| *k != "memory")?;
+    Some(match (["episodic", "procedural"].contains(&kind), lang) {
+        (true, Lang::En) => format!(
+            "kind {kind:?} no longer exists: its rows are memories now, of type semantic_fact, each with a new id; \
+             find them with search_memory"
+        ),
+        (true, Lang::Es) => format!(
+            "el kind {kind:?} ya no existe: sus filas son memorias ahora, de tipo semantic_fact, cada una con otro id; \
+             encuéntralas con search_memory"
+        ),
+        (false, Lang::En) => format!("unknown kind {kind:?}: memory is the only kind; omit kind"),
+        (false, Lang::Es) => format!("kind desconocido {kind:?}: memory es el único; omite kind"),
+    })
+}
+
 /// Renders inventory rows as a compact one-line-per-row table. A row another
 /// agent than `reader` saved names it after `by `, as a search hit does; the
 /// `by=#N` of a replaced row always carries its `=`.
@@ -531,8 +550,8 @@ pub fn format_rows(lang: Lang, rows: &[MemoryRow], reader: &str) -> String {
                 "#{} {} {} t{} imp={:.1} acc={} {}{by}{}{} {}",
                 r.id,
                 r.kind,
-                // Only `memory` rows have a type; a dash keeps every later
-                // field in the same column for the other two kinds.
+                // A daemon before V32 sends no type for a row of its other two
+                // kinds; a dash keeps every later field in the same column.
                 r.memory_type.as_deref().unwrap_or("-"),
                 r.tier,
                 r.importance,
@@ -1074,9 +1093,10 @@ pub fn indexes_docs(project: &ProjectIdentity, open: &[ProjectIdentity]) -> bool
     open.iter().any(|folder| folder.root == project.root)
 }
 
-/// The folders a refusal offers, each as its root, for `project_path`.
+/// The folders a refusal offers for `project_path`, each as it is open and
+/// not as its root: a declared subfolder leads to a project its root does not.
 fn listed(folders: &[ProjectIdentity]) -> String {
-    folders.iter().map(|f| f.root.display().to_string()).collect::<Vec<_>>().join(", ")
+    folders.iter().map(|f| f.path.display().to_string()).collect::<Vec<_>>().join(", ")
 }
 
 /// Why `save_memory` saved nothing: it names no project. `open` are the
@@ -1101,16 +1121,17 @@ pub fn no_project_named(lang: Lang, open: &[ProjectIdentity]) -> String {
 }
 
 /// Why `tool`, whose answer is about one project, did nothing with several
-/// folders open: which to pass, and that `search_memory` reads them all.
+/// projects open: which to pass, and that `search_memory` reads them all.
+/// `open` holds a folder of each, offered as it is open, as [`listed`] does.
 /// `answer_suggestion` takes no path, so its folders come with their ids.
 pub fn several_folders(lang: Lang, tool: &str, open: &[(ProjectIdentity, String)]) -> String {
     let by_id = tool == "answer_suggestion";
     let folders = open
         .iter()
         .map(|(folder, id)| match (by_id, lang) {
-            (true, Lang::En) => format!("{id} at {}", folder.root.display()),
-            (true, Lang::Es) => format!("{id} en {}", folder.root.display()),
-            (false, _) => folder.root.display().to_string(),
+            (true, Lang::En) => format!("{id} at {}", folder.path.display()),
+            (true, Lang::Es) => format!("{id} en {}", folder.path.display()),
+            (false, _) => folder.path.display().to_string(),
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -1655,6 +1676,47 @@ mod tests {
         assert_eq!(truncate_content("abc", 0), "…");
     }
 
+    // ── kind ────────────────────────────────────────────────────────────────
+
+    /// A model can still send `kind` from a contract of a version before V32:
+    /// the bridge reads it and answers it without calling the daemon, which
+    /// would otherwise act on the row of `memory` with that number.
+    #[test]
+    fn a_retired_kind_is_answered_with_where_its_rows_went() {
+        use crate::mcp::server::{DeleteMemoryArgs, ListMemoriesArgs, ReadMemoryArgs, RestoreMemoryArgs, UpdateMemoryArgs};
+        let sent = serde_json::json!({ "id": 7, "kind": "episodic" });
+        let kinds = [
+            serde_json::from_value::<DeleteMemoryArgs>(sent.clone()).expect("delete").kind,
+            serde_json::from_value::<RestoreMemoryArgs>(sent.clone()).expect("restore").kind,
+            serde_json::from_value::<ReadMemoryArgs>(sent.clone()).expect("read").kind,
+            serde_json::from_value::<UpdateMemoryArgs>(sent.clone()).expect("update").kind,
+            serde_json::from_value::<ListMemoriesArgs>(serde_json::json!({ "kind": "episodic" })).expect("list").kind,
+        ];
+        assert!(kinds.iter().all(|k| k.as_deref() == Some("episodic")), "{kinds:?}");
+        assert!(serde_json::from_value::<DeleteMemoryArgs>(serde_json::json!({ "id": 7 })).is_ok(), "kind is not required");
+
+        for kind in ["episodic", "procedural"] {
+            assert_eq!(
+                kind_refusal(Lang::En, Some(kind)).as_deref(),
+                Some(format!(
+                    "kind \"{kind}\" no longer exists: its rows are memories now, of type semantic_fact, each with a new id; \
+                     find them with search_memory"
+                ).as_str())
+            );
+            assert_eq!(
+                kind_refusal(Lang::Es, Some(kind)).as_deref(),
+                Some(format!(
+                    "el kind \"{kind}\" ya no existe: sus filas son memorias ahora, de tipo semantic_fact, cada una con otro id; \
+                     encuéntralas con search_memory"
+                ).as_str())
+            );
+        }
+        assert_eq!(kind_refusal(Lang::En, Some("memory")), None);
+        assert_eq!(kind_refusal(Lang::En, None), None);
+        assert_eq!(kind_refusal(Lang::En, Some("bogus")).as_deref(), Some("unknown kind \"bogus\": memory is the only kind; omit kind"));
+        assert_eq!(kind_refusal(Lang::Es, Some("bogus")).as_deref(), Some("kind desconocido \"bogus\": memory es el único; omite kind"));
+    }
+
     // ── format_hits ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1666,7 +1728,7 @@ mod tests {
     fn format_hits_numbers_rows_and_leads_with_the_id() {
         let out = format_hits(Lang::En, &[
             hit(42, "Memory", "semantic_fact", 2, 0.876, "first"),
-            hit(7, "Procedural", "procedural_skill", 1, 0.5, "second"),
+            hit(7, "Memory", "semantic_fact", 1, 0.5, "second"),
         ], "a", &[]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -1817,7 +1879,7 @@ mod tests {
     fn format_rows_renders_one_line_per_row_with_the_id_first() {
         let out = format_rows(Lang::En, &[
             row(12, "memory", Some("semantic_fact"), "a fact"),
-            row(3, "episodic", None, "a trajectory"),
+            row(3, "memory", Some("user_preference"), "a preference"),
         ], "a");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -1828,11 +1890,11 @@ mod tests {
         assert!(lines[1].starts_with("#3 "), "line was: {}", lines[1]);
     }
 
-    /// Only `memory` rows have a type; the column still has to line up for the
-    /// other two kinds rather than shifting every field after it.
+    /// A daemon before V32 sends no type for a row of its other two kinds; the
+    /// column still has to line up rather than shifting every field after it.
     #[test]
     fn format_rows_renders_a_missing_memory_type_as_a_dash() {
-        let out = format_rows(Lang::En, &[row(3, "episodic", None, "a trajectory")], "a");
+        let out = format_rows(Lang::En, &[row(3, "memory", None, "a row")], "a");
         assert!(out.contains(" - "), "out was: {out}");
     }
 
@@ -1856,8 +1918,8 @@ mod tests {
             pulled_in: Vec::new(),
         };
         assert_eq!(format_update(Lang::En, &memory, false), "updated #12 memory: user_preference, importance 8.0, tier 1");
-        let skill = Updated {
-            kind: "procedural".into(),
+        let untyped = Updated {
+            kind: "memory".into(),
             id: 3,
             importance: 2.0,
             memory_type: None,
@@ -1865,7 +1927,7 @@ mod tests {
             project_id: None,
             pulled_in: Vec::new(),
         };
-        assert_eq!(format_update(Lang::En, &skill, false), "updated #3 procedural: importance 2.0, tier 1");
+        assert_eq!(format_update(Lang::En, &untyped, false), "updated #3 memory: importance 2.0, tier 1");
     }
 
     #[test]
@@ -1935,7 +1997,7 @@ mod tests {
     #[test]
     fn format_delete_names_what_came_back_and_what_stays_hidden() {
         let plain = Deleted { deleted: 1, ..Deleted::default() };
-        assert_eq!(format_delete(Lang::En, &plain), "deleted 1; restore_memory with the same id and kind undoes it");
+        assert_eq!(format_delete(Lang::En, &plain), "deleted 1; restore_memory with the same id undoes it");
         let both = Deleted {
             deleted: 1,
             revived: vec![ReplacedMemory { id: 4, excerpt: "Storage engine is SQLite".into() }],
@@ -1943,7 +2005,7 @@ mod tests {
         };
         assert_eq!(
             format_delete(Lang::En, &both),
-            "deleted 1; restore_memory with the same id and kind undoes it\n\
+            "deleted 1; restore_memory with the same id undoes it\n\
              the version it had replaced is current again: #4 \"Storage engine is SQLite\"\n\
              #7, #8 stay superseded by it, as a resolve_conflict verdict left them, so searches leave them out"
         );
@@ -2262,6 +2324,21 @@ mod tests {
         assert!(!indexes_docs(&twin, &[own]));
     }
 
+    /// A declared subfolder of a repository is a project of its own, which
+    /// its root as a `project_path` would not reach.
+    #[test]
+    fn a_save_refusal_offers_each_open_folder_rather_than_its_root() {
+        let web = ProjectIdentity { path: "/mono/apps/web".into(), ..identity("mono") };
+
+        assert_eq!(
+            no_project_named(Lang::En, &[web.clone(), identity("other")]),
+            "not saved: say which project this memory belongs to: project_path with one of the folders open here \
+             (/mono/apps/web, /other), project with a project's id or name, or all_projects for one that holds in \
+             every project"
+        );
+        assert!(no_project_named(Lang::Es, &[web]).contains("carpetas abiertas (/mono/apps/web)"));
+    }
+
     // ── format_status ───────────────────────────────────────────────────────
 
     fn health() -> Health {
@@ -2467,7 +2544,7 @@ mod tests {
         };
         assert_eq!(
             format_delete(Lang::Es, &both),
-            "se borró 1; restore_memory con el mismo id y kind lo deshace\n\
+            "se borró 1; restore_memory con el mismo id lo deshace\n\
              la versión que había reemplazado vuelve a ser la actual: #4 \"Storage engine is SQLite\"\n\
              #7 siguen reemplazadas por ella, como las dejó un veredicto de resolve_conflict, así que las búsquedas las \
              dejan afuera"

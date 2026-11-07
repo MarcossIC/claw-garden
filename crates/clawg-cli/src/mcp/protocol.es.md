@@ -117,10 +117,11 @@ Un tipo desconocido se rechaza, y el error lista estos siete.
 
 `importance` va de 0 a 10 y por defecto es 5. Déjala en 5 salvo que la memoria
 importe más o menos que lo habitual. Una `user_preference` con 8 o más que dijo
-la persona, guardada con `user_stated`, se imprime arriba de cada
-`recall_context` de su proyecto, o de todos con `all_projects`, para cada agente
-que la lee; una que no dijo la encuentra la búsqueda, marcada inferred,
-imported o conclusion. Una `architectural_decision` con 9 o más se imprime
+la persona, guardada con `user_stated`, se imprime arriba del `recall_context`
+de su proyecto, o de todos con `all_projects`, para cada agente que la lee, sólo
+mientras siga en tier 1; una que el presupuesto deja afuera se nombra por id al
+final. Una que no dijo la encuentra la búsqueda, marcada inferred, imported o
+conclusion. Una `architectural_decision` con 9 o más se imprime
 arriba de cada `recall_context` de su proyecto. Con 9 o más una memoria nunca
 baja de tier por no usarse.
 `update_memory` corrige después el tipo o la importancia. Cuando la persona
