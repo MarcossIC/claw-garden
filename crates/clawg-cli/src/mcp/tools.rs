@@ -508,6 +508,25 @@ pub fn format_restore(lang: Lang, r: &Restored) -> String {
     out
 }
 
+/// What a tool answers to a `kind`, which its schema no longer has but a
+/// model can still send from a contract of a version before V32: nothing
+/// for `memory`, the only kind.
+pub fn kind_refusal(lang: Lang, kind: Option<&str>) -> Option<String> {
+    let kind = kind.filter(|k| *k != "memory")?;
+    Some(match (["episodic", "procedural"].contains(&kind), lang) {
+        (true, Lang::En) => format!(
+            "kind {kind:?} no longer exists: its rows are memories now, of type semantic_fact, each with a new id; \
+             find them with search_memory"
+        ),
+        (true, Lang::Es) => format!(
+            "el kind {kind:?} ya no existe: sus filas son memorias ahora, de tipo semantic_fact, cada una con otro id; \
+             encuéntralas con search_memory"
+        ),
+        (false, Lang::En) => format!("unknown kind {kind:?}: memory is the only kind; omit kind"),
+        (false, Lang::Es) => format!("kind desconocido {kind:?}: memory es el único; omite kind"),
+    })
+}
+
 /// Renders inventory rows as a compact one-line-per-row table. A row another
 /// agent than `reader` saved names it after `by `, as a search hit does; the
 /// `by=#N` of a replaced row always carries its `=`.
@@ -531,8 +550,8 @@ pub fn format_rows(lang: Lang, rows: &[MemoryRow], reader: &str) -> String {
                 "#{} {} {} t{} imp={:.1} acc={} {}{by}{}{} {}",
                 r.id,
                 r.kind,
-                // Only `memory` rows have a type; a dash keeps every later
-                // field in the same column for the other two kinds.
+                // A daemon before V32 sends no type for a row of its other two
+                // kinds; a dash keeps every later field in the same column.
                 r.memory_type.as_deref().unwrap_or("-"),
                 r.tier,
                 r.importance,
@@ -1655,6 +1674,47 @@ mod tests {
         assert_eq!(truncate_content("abc", 0), "…");
     }
 
+    // ── kind ────────────────────────────────────────────────────────────────
+
+    /// A model can still send `kind` from a contract of a version before V32:
+    /// the bridge reads it and answers it without calling the daemon, which
+    /// would otherwise act on the row of `memory` with that number.
+    #[test]
+    fn a_retired_kind_is_answered_with_where_its_rows_went() {
+        use crate::mcp::server::{DeleteMemoryArgs, ListMemoriesArgs, ReadMemoryArgs, RestoreMemoryArgs, UpdateMemoryArgs};
+        let sent = serde_json::json!({ "id": 7, "kind": "episodic" });
+        let kinds = [
+            serde_json::from_value::<DeleteMemoryArgs>(sent.clone()).expect("delete").kind,
+            serde_json::from_value::<RestoreMemoryArgs>(sent.clone()).expect("restore").kind,
+            serde_json::from_value::<ReadMemoryArgs>(sent.clone()).expect("read").kind,
+            serde_json::from_value::<UpdateMemoryArgs>(sent.clone()).expect("update").kind,
+            serde_json::from_value::<ListMemoriesArgs>(serde_json::json!({ "kind": "episodic" })).expect("list").kind,
+        ];
+        assert!(kinds.iter().all(|k| k.as_deref() == Some("episodic")), "{kinds:?}");
+        assert!(serde_json::from_value::<DeleteMemoryArgs>(serde_json::json!({ "id": 7 })).is_ok(), "kind is not required");
+
+        for kind in ["episodic", "procedural"] {
+            assert_eq!(
+                kind_refusal(Lang::En, Some(kind)).as_deref(),
+                Some(format!(
+                    "kind \"{kind}\" no longer exists: its rows are memories now, of type semantic_fact, each with a new id; \
+                     find them with search_memory"
+                ).as_str())
+            );
+            assert_eq!(
+                kind_refusal(Lang::Es, Some(kind)).as_deref(),
+                Some(format!(
+                    "el kind \"{kind}\" ya no existe: sus filas son memorias ahora, de tipo semantic_fact, cada una con otro id; \
+                     encuéntralas con search_memory"
+                ).as_str())
+            );
+        }
+        assert_eq!(kind_refusal(Lang::En, Some("memory")), None);
+        assert_eq!(kind_refusal(Lang::En, None), None);
+        assert_eq!(kind_refusal(Lang::En, Some("bogus")).as_deref(), Some("unknown kind \"bogus\": memory is the only kind; omit kind"));
+        assert_eq!(kind_refusal(Lang::Es, Some("bogus")).as_deref(), Some("kind desconocido \"bogus\": memory es el único; omite kind"));
+    }
+
     // ── format_hits ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1666,7 +1726,7 @@ mod tests {
     fn format_hits_numbers_rows_and_leads_with_the_id() {
         let out = format_hits(Lang::En, &[
             hit(42, "Memory", "semantic_fact", 2, 0.876, "first"),
-            hit(7, "Procedural", "procedural_skill", 1, 0.5, "second"),
+            hit(7, "Memory", "semantic_fact", 1, 0.5, "second"),
         ], "a", &[]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -1817,7 +1877,7 @@ mod tests {
     fn format_rows_renders_one_line_per_row_with_the_id_first() {
         let out = format_rows(Lang::En, &[
             row(12, "memory", Some("semantic_fact"), "a fact"),
-            row(3, "episodic", None, "a trajectory"),
+            row(3, "memory", Some("user_preference"), "a preference"),
         ], "a");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -1828,11 +1888,11 @@ mod tests {
         assert!(lines[1].starts_with("#3 "), "line was: {}", lines[1]);
     }
 
-    /// Only `memory` rows have a type; the column still has to line up for the
-    /// other two kinds rather than shifting every field after it.
+    /// A daemon before V32 sends no type for a row of its other two kinds; the
+    /// column still has to line up rather than shifting every field after it.
     #[test]
     fn format_rows_renders_a_missing_memory_type_as_a_dash() {
-        let out = format_rows(Lang::En, &[row(3, "episodic", None, "a trajectory")], "a");
+        let out = format_rows(Lang::En, &[row(3, "memory", None, "a row")], "a");
         assert!(out.contains(" - "), "out was: {out}");
     }
 
@@ -1856,8 +1916,8 @@ mod tests {
             pulled_in: Vec::new(),
         };
         assert_eq!(format_update(Lang::En, &memory, false), "updated #12 memory: user_preference, importance 8.0, tier 1");
-        let skill = Updated {
-            kind: "procedural".into(),
+        let untyped = Updated {
+            kind: "memory".into(),
             id: 3,
             importance: 2.0,
             memory_type: None,
@@ -1865,7 +1925,7 @@ mod tests {
             project_id: None,
             pulled_in: Vec::new(),
         };
-        assert_eq!(format_update(Lang::En, &skill, false), "updated #3 procedural: importance 2.0, tier 1");
+        assert_eq!(format_update(Lang::En, &untyped, false), "updated #3 memory: importance 2.0, tier 1");
     }
 
     #[test]

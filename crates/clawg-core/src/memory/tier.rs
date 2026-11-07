@@ -32,7 +32,7 @@ pub(crate) fn compute_tier(
 
     match memory_type {
         // Rule 2: type-based tier-1 types (initial and always).
-        "user_preference" | "procedural_skill" => current.min(1),
+        "user_preference" => current.min(1),
 
         // Rule 3: architectural_decision / session_summary
         //   – access_count >= 3: promote to tier 1.
@@ -54,7 +54,7 @@ pub(crate) fn compute_tier(
             }
         }
 
-        // No rule for chat_message, episodic_trajectory, or unknown types.
+        // No rule for chat_message or unknown types.
         _ => current,
     }
 }
@@ -62,8 +62,7 @@ pub(crate) fn compute_tier(
 /// Applies inactivity-based demotion to a memory tier.
 ///
 /// Runs in production today: the maintenance pass wires this in through the
-/// demote_tier UDF and sweeps `memory`, `episodic_trajectory` and
-/// `procedural_skill` on a timer.
+/// demote_tier UDF and sweeps `memory` on a timer.
 ///
 /// Takes a day count as f64, never a timestamp — the subtraction that produces
 /// it happens inside the demotion SQL, one expression for the whole table.
@@ -216,11 +215,6 @@ mod tests {
         assert_eq!(compute_tier(3, 5.0, 0, "user_preference"), 1);
     }
 
-    #[test]
-    fn compute_tier_procedural_skill_inserts_at_tier_1() {
-        assert_eq!(compute_tier(3, 5.0, 0, "procedural_skill"), 1);
-    }
-
     // INSERT tier-2 types (compute_tier(3, importance, 0, type) → 2)
 
     #[test]
@@ -238,11 +232,6 @@ mod tests {
     #[test]
     fn compute_tier_chat_message_inserts_at_tier_3() {
         assert_eq!(compute_tier(3, 5.0, 0, "chat_message"), 3);
-    }
-
-    #[test]
-    fn compute_tier_episodic_trajectory_inserts_at_tier_3() {
-        assert_eq!(compute_tier(3, 5.0, 0, "episodic_trajectory"), 3);
     }
 
     // Promote-only invariant — result MUST NOT exceed current.
@@ -323,7 +312,7 @@ mod tests {
     fn a_tier_the_rules_never_gave_survives_any_change() {
         assert_eq!(retier(1, 1, (5.0, "semantic_fact"), (3.0, "semantic_fact")), 1);
         assert_eq!(retier(1, 1, (5.0, "semantic_fact"), (5.0, "chat_message")), 1);
-        assert_eq!(retier(2, 1, (5.0, "episodic_trajectory"), (1.0, "episodic_trajectory")), 2);
+        assert_eq!(retier(2, 1, (5.0, "tool_error"), (1.0, "tool_error")), 2);
     }
 
     #[test]

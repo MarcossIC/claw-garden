@@ -23,7 +23,6 @@ use crate::memory::dispute::{release_challengers, settle_challengers, settle_row
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::inspect::{answered_pairs, duplicates, folder_prints, registry, Has, RegistryRow};
 use crate::memory::merge::{canonical_in, retrying, Retried};
-use crate::memory::maintenance::skill_embedding_text;
 use crate::memory::project_docs::drop_root_index_in;
 use crate::memory::redact::redact;
 use crate::memory::subfolder::{leading_to_in, SubfolderOf};
@@ -142,19 +141,15 @@ pub enum KeepReason {
 /// A row an undo leaves deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Kept {
-    /// `memory`, `episodic_trajectory` or `procedural_skill`.
-    pub table: String,
     pub id: i64,
     pub reason: KeepReason,
 }
 
-/// Rows by table.
+/// Rows of `memory`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Counts {
     pub memories: usize,
-    pub trajectories: usize,
-    pub skills: usize,
 }
 
 /// Live rows of `memory` one agent saved; `agent_id` is `None` for the rows
@@ -225,7 +220,7 @@ pub struct DeleteReport {
     /// For an undo: nothing was written, this is what it would do.
     #[serde(default)]
     pub dry_run: bool,
-    /// For an undo: the rows that came back, by table.
+    /// For an undo: the rows that came back.
     #[serde(default)]
     pub restored: Counts,
     /// For an undo: the rows that stay deleted, with why.
@@ -265,23 +260,15 @@ struct Set {
     remotes: Vec<String>,
     subfolders: Vec<SubfolderOf>,
     memories: Vec<SetRow>,
-    trajectories: Vec<SetRow>,
-    skills: Vec<SetRow>,
 }
 
 impl Set {
     fn live(&self) -> Counts {
-        let live = |rows: &[SetRow]| rows.iter().filter(|r| r.is_live()).count();
-        Counts { memories: live(&self.memories), trajectories: live(&self.trajectories), skills: live(&self.skills) }
+        Counts { memories: self.memories.iter().filter(|r| r.is_live()).count() }
     }
 
     fn deleted(&self) -> Counts {
-        let live = self.live();
-        Counts {
-            memories: self.memories.len() - live.memories,
-            trajectories: self.trajectories.len() - live.trajectories,
-            skills: self.skills.len() - live.skills,
-        }
+        Counts { memories: self.memories.len() - self.live().memories }
     }
 
     fn is_empty(&self) -> bool {
@@ -304,23 +291,20 @@ fn code_of(set: &Set) -> String {
     let mut subfolders: Vec<&SubfolderOf> = set.subfolders.iter().collect();
     subfolders.sort_unstable();
     lines.extend(subfolders.into_iter().map(|s| format!("subfolder {} {}", s.repository_id, s.subpath)));
-    for (table, rows) in [("memory", &set.memories), ("episodic_trajectory", &set.trajectories), ("procedural_skill", &set.skills)] {
-        let mut rows: Vec<&SetRow> = rows.iter().collect();
-        rows.sort_unstable_by_key(|r| r.id);
-        for r in rows {
-            let deleted_at = r.deleted_at.map_or("-".to_string(), |d| d.to_string());
-            lines.push(format!("{table} {} {} {deleted_at} {}", r.id, r.status, r.update_count));
-        }
+    let mut rows: Vec<&SetRow> = set.memories.iter().collect();
+    rows.sort_unstable_by_key(|r| r.id);
+    for r in rows {
+        let deleted_at = r.deleted_at.map_or("-".to_string(), |d| d.to_string());
+        lines.push(format!("memory {} {} {deleted_at} {}", r.id, r.status, r.update_count));
     }
     let digest = Sha256::digest(lines.join("\n").as_bytes());
     digest[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn rows_in(c: &Connection, table: &str, project_id: &str) -> rusqlite::Result<Vec<SetRow>> {
-    let kind = if table == "memory" { "memory_type" } else { "NULL" };
-    let mut stmt = c.prepare(&format!(
-        "SELECT id, status, deleted_at, update_count, agent_id, {kind} FROM {table} WHERE project_id = ?1 ORDER BY id"
-    ))?;
+fn rows_in(c: &Connection, project_id: &str) -> rusqlite::Result<Vec<SetRow>> {
+    let mut stmt = c.prepare(
+        "SELECT id, status, deleted_at, update_count, agent_id, memory_type FROM memory WHERE project_id = ?1 ORDER BY id",
+    )?;
     let rows = stmt.query_map([project_id], |r| {
         Ok(SetRow {
             id: r.get(0)?,
@@ -352,9 +336,7 @@ fn set_in(c: &Connection, project_id: &str, name: &str) -> rusqlite::Result<Set>
         folders,
         remotes,
         subfolders: leading_to_in(c, project_id)?,
-        memories: rows_in(c, "memory", project_id)?,
-        trajectories: rows_in(c, "episodic_trajectory", project_id)?,
-        skills: rows_in(c, "procedural_skill", project_id)?,
+        memories: rows_in(c, project_id)?,
     })
 }
 
@@ -496,13 +478,6 @@ fn report_of(c: &Connection, set: &Set, with_memories: bool) -> Result<DeleteRep
     Ok(report)
 }
 
-/// The vector table of each table of rows.
-const VECTORS: [(&str, &str); 3] = [
-    ("memory", "memory_vectors"),
-    ("episodic_trajectory", "episodic_vectors"),
-    ("procedural_skill", "procedural_vectors"),
-];
-
 /// Deletes a project inside the caller's transaction and returns the delete's
 /// number. With `taken`, the code and the snapshot of a delete with its rows,
 /// every live row of the set is marked deleted at once and loses its vector,
@@ -519,22 +494,16 @@ fn write_delete(c: &Connection, set: &Set, taken: Option<(&str, &str)>, now: Tim
     let delete_id = c.last_insert_rowid();
     let mut journal =
         c.prepare_cached("INSERT INTO project_delete_row (delete_id, tbl, row_id, deleted_at) VALUES (?1, ?2, ?3, ?4)")?;
-    for (table, rows) in [("memory", &set.memories), ("episodic_trajectory", &set.trajectories), ("procedural_skill", &set.skills)] {
-        for row in rows {
-            journal.execute(rusqlite::params![delete_id, table, row.id, row.deleted_at])?;
-        }
+    for row in &set.memories {
+        journal.execute(rusqlite::params![delete_id, "memory", row.id, row.deleted_at])?;
     }
     if taken.is_some() {
-        for ((table, vectors), rows) in VECTORS.iter().zip([&set.memories, &set.trajectories, &set.skills]) {
-            c.execute(
-                &format!("UPDATE {table} SET deleted_at = ?2 WHERE project_id = ?1 AND deleted_at IS NULL"),
-                rusqlite::params![set.project_id, now],
-            )?;
-            for row in rows.iter().filter(|r| r.is_live()) {
-                c.execute(&format!("DELETE FROM {vectors} WHERE rowid = ?1"), [row.id])?;
-            }
-        }
+        c.execute(
+            "UPDATE memory SET deleted_at = ?2 WHERE project_id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![set.project_id, now],
+        )?;
         for row in set.memories.iter().filter(|r| r.is_live()) {
+            c.execute("DELETE FROM memory_vectors WHERE rowid = ?1", [row.id])?;
             release_challengers(c, row.id, now)?;
         }
     }
@@ -654,41 +623,6 @@ pub async fn delete_core(
 /// Texts embedded per call.
 const EMBED_BATCH: usize = 32;
 
-/// The tables a delete takes rows from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum Table {
-    Memory,
-    Trajectory,
-    Skill,
-}
-
-impl Table {
-    fn of(name: &str) -> Option<Table> {
-        match name {
-            "memory" => Some(Table::Memory),
-            "episodic_trajectory" => Some(Table::Trajectory),
-            "procedural_skill" => Some(Table::Skill),
-            _ => None,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Table::Memory => "memory",
-            Table::Trajectory => "episodic_trajectory",
-            Table::Skill => "procedural_skill",
-        }
-    }
-
-    fn vectors(self) -> &'static str {
-        match self {
-            Table::Memory => "memory_vectors",
-            Table::Trajectory => "episodic_vectors",
-            Table::Skill => "procedural_vectors",
-        }
-    }
-}
-
 /// What an undo decided: the rows that come back and the ones that stay
 /// deleted, with why.
 struct Plan {
@@ -697,14 +631,13 @@ struct Plan {
     with_memories: bool,
     /// The `deleted_at` the delete gave the project and its rows.
     at: i64,
-    restore: Vec<(Table, i64)>,
+    restore: Vec<i64>,
     kept: Vec<Kept>,
 }
 
 impl Plan {
     fn restored(&self) -> Counts {
-        let of = |table| self.restore.iter().filter(|(t, _)| *t == table).count();
-        Counts { memories: of(Table::Memory), trajectories: of(Table::Trajectory), skills: of(Table::Skill) }
+        Counts { memories: self.restore.len() }
     }
 }
 
@@ -767,59 +700,58 @@ fn undo_plan_in(c: &Connection, delete_id: i64) -> Result<Plan, DeleteError> {
         return Err(DeleteError::SavesPending(pending as i64));
     }
 
-    let taken: Vec<(Table, i64)> = {
+    let taken: Vec<i64> = {
         let mut stmt = c.prepare(
-            "SELECT tbl, row_id FROM project_delete_row WHERE delete_id = ?1 AND deleted_at IS NULL ORDER BY tbl, row_id",
+            "SELECT tbl, row_id FROM project_delete_row WHERE delete_id = ?1 AND deleted_at IS NULL ORDER BY row_id",
         )?;
         let rows = stmt.query_map([delete_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         let mut taken = Vec::new();
         for row in rows {
-            let (tbl, id) = row?;
-            match Table::of(&tbl) {
-                Some(table) => taken.push((table, id)),
-                None => log::warn!("delete {delete_id} journaled a row of {tbl}, which no undo knows"),
+            match row? {
+                (tbl, id) if tbl == "memory" => taken.push(id),
+                (tbl, _) => log::warn!("delete {delete_id} journaled a row of {tbl}, which no undo knows"),
             }
         }
-        taken.sort();
         taken
     };
     let mut kept = Vec::new();
     let mut restore = Vec::new();
-    for (table, id) in taken {
-        let kept_as = |reason| Kept { table: table.name().to_string(), id, reason };
-        let now: Option<(Option<String>, Option<i64>)> = c
-            .query_row(&format!("SELECT project_id, deleted_at FROM {} WHERE id = ?1", table.name()), [id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+    for id in taken {
+        let kept_as = |reason| Kept { id, reason };
+        let now: Option<(Option<String>, Option<i64>, String)> = c
+            .query_row("SELECT project_id, deleted_at, content FROM memory WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .optional()?;
-        if now != Some((Some(project_id.clone()), Some(at))) {
+        let Some((Some(row_project), Some(row_deleted_at), content)) = now else {
+            kept.push(kept_as(KeepReason::Changed));
+            continue;
+        };
+        if row_project != project_id || row_deleted_at != at {
             kept.push(kept_as(KeepReason::Changed));
             continue;
         }
-        if table == Table::Memory {
-            let content: String = c.query_row("SELECT content FROM memory WHERE id = ?1", [id], |r| r.get(0))?;
-            let twin = c.query_row(RESTORE_TWIN, rusqlite::params![id, None::<String>], |r| r.get::<_, i64>(0)).optional()?;
-            let holder = c
-                .query_row(RESTORE_TOPIC_HOLDER, rusqlite::params![id, None::<String>], |r| r.get::<_, String>(0))
-                .optional()?;
-            let reason = if !redact(&content).kinds.is_empty() {
-                Some(KeepReason::HoldsSecret)
-            } else if twin.is_some() {
-                Some(KeepReason::LiveTwin)
-            } else if holder.is_some() {
-                Some(KeepReason::TopicTaken)
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                kept.push(kept_as(reason));
-                continue;
-            }
+        let twin = c.query_row(RESTORE_TWIN, rusqlite::params![id, None::<String>], |r| r.get::<_, i64>(0)).optional()?;
+        let holder = c
+            .query_row(RESTORE_TOPIC_HOLDER, rusqlite::params![id, None::<String>], |r| r.get::<_, String>(0))
+            .optional()?;
+        let reason = if !redact(&content).kinds.is_empty() {
+            Some(KeepReason::HoldsSecret)
+        } else if twin.is_some() {
+            Some(KeepReason::LiveTwin)
+        } else if holder.is_some() {
+            Some(KeepReason::TopicTaken)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            kept.push(kept_as(reason));
+            continue;
         }
-        restore.push((table, id));
+        restore.push(id);
     }
 
-    let memories: Vec<i64> = restore.iter().filter(|(t, _)| *t == Table::Memory).map(|(_, id)| *id).collect();
+    let memories = restore.clone();
     let mut siblings: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     let mut deleted: HashSet<i64> = HashSet::new();
     for id in &memories {
@@ -838,9 +770,9 @@ fn undo_plan_in(c: &Connection, delete_id: i64) -> Result<Plan, DeleteError> {
         }
     }
     let ties = tied(&memories, &siblings, &deleted);
-    restore.retain(|(table, id)| !(*table == Table::Memory && ties.contains(id)));
-    kept.extend(ties.into_iter().map(|id| Kept { table: Table::Memory.name().to_string(), id, reason: KeepReason::Tied }));
-    kept.sort_by(|a, b| (Table::of(&a.table), a.id).cmp(&(Table::of(&b.table), b.id)));
+    restore.retain(|id| !ties.contains(id));
+    kept.extend(ties.into_iter().map(|id| Kept { id, reason: KeepReason::Tied }));
+    kept.sort_by_key(|k| k.id);
     Ok(Plan { project_id, name, with_memories, at, restore, kept })
 }
 
@@ -856,29 +788,18 @@ fn plan_report(delete_id: i64, plan: &Plan) -> DeleteReport {
     }
 }
 
-/// The text each row of `restore` was embedded from.
-fn embedding_texts_in(c: &Connection, restore: &[(Table, i64)]) -> rusqlite::Result<Vec<(Table, i64, String)>> {
+/// The text each row of `restore` was embedded from: its content behind the
+/// head its save was embedded behind, as a restore reads it.
+fn embedding_texts_in(c: &Connection, restore: &[i64]) -> rusqlite::Result<Vec<(i64, String)>> {
     let mut texts = Vec::with_capacity(restore.len());
-    for (table, id) in restore {
-        let text = match table {
-            Table::Memory => {
-                // The head the row's save was embedded behind, as a restore reads it.
-                let (content, context): (String, Option<String>) = c.query_row(
-                    "SELECT content, (SELECT mp.context FROM memory_piece mp WHERE mp.memory_id = memory.id \
-                     AND mp.context <> '' ORDER BY mp.save_id LIMIT 1) FROM memory WHERE id = ?1",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                embedding_text(context.as_deref().unwrap_or(""), &content).into_owned()
-            }
-            Table::Trajectory => c.query_row("SELECT task FROM episodic_trajectory WHERE id = ?1", [id], |r| r.get(0))?,
-            Table::Skill => {
-                let (trigger, name): (String, String) =
-                    c.query_row("SELECT trigger, skill_name FROM procedural_skill WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                skill_embedding_text(&trigger, &name)
-            }
-        };
-        texts.push((*table, *id, text));
+    for id in restore {
+        let (content, context): (String, Option<String>) = c.query_row(
+            "SELECT content, (SELECT mp.context FROM memory_piece mp WHERE mp.memory_id = memory.id \
+             AND mp.context <> '' ORDER BY mp.save_id LIMIT 1) FROM memory WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        texts.push((*id, embedding_text(context.as_deref().unwrap_or(""), &content).into_owned()));
     }
     Ok(texts)
 }
@@ -889,7 +810,7 @@ fn embedding_texts_in(c: &Connection, restore: &[(Table, i64)]) -> rusqlite::Res
 fn undo_write_in(
     c: &Connection,
     delete_id: i64,
-    vectors: &HashMap<(Table, i64), Vec<u8>>,
+    vectors: &HashMap<i64, Vec<u8>>,
     now: TimestampMs,
 ) -> Result<DeleteReport, DeleteError> {
     let plan = undo_plan_in(c, delete_id)?;
@@ -909,33 +830,27 @@ fn undo_write_in(
         }
     }
     let mut memories = Vec::new();
-    for (table, id) in &plan.restore {
-        let Some(vector) = vectors.get(&(*table, *id)) else {
-            report.kept.push(Kept { table: table.name().to_string(), id: *id, reason: KeepReason::Changed });
+    for id in &plan.restore {
+        let Some(vector) = vectors.get(id) else {
+            report.kept.push(Kept { id: *id, reason: KeepReason::Changed });
             continue;
         };
         c.execute(
-            &format!("UPDATE {} SET deleted_at = NULL WHERE id = ?1 AND project_id = ?2 AND deleted_at = ?3", table.name()),
+            "UPDATE memory SET deleted_at = NULL WHERE id = ?1 AND project_id = ?2 AND deleted_at = ?3",
             rusqlite::params![id, plan.project_id, plan.at],
         )?;
-        c.execute(&format!("DELETE FROM {} WHERE rowid = ?1", table.vectors()), [id])?;
-        c.execute(&format!("INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)", table.vectors()), rusqlite::params![id, vector])?;
-        match table {
-            Table::Memory => {
-                c.execute(RESTORE_TEXT_INDEX, [id])?;
-                memories.push(*id);
-                report.restored.memories += 1;
-            }
-            Table::Trajectory => report.restored.trajectories += 1,
-            Table::Skill => report.restored.skills += 1,
-        }
+        c.execute("DELETE FROM memory_vectors WHERE rowid = ?1", [id])?;
+        c.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, vector])?;
+        c.execute(RESTORE_TEXT_INDEX, [id])?;
+        memories.push(*id);
+        report.restored.memories += 1;
     }
     // The rows that disputed or were disputed come back to what is live now.
     for id in memories {
         settle_row(c, id, now)?;
         settle_challengers(c, id, now)?;
     }
-    report.kept.sort_by(|a, b| (Table::of(&a.table), a.id).cmp(&(Table::of(&b.table), b.id)));
+    report.kept.sort_by_key(|k| k.id);
     c.execute("UPDATE project_delete SET undone_at = ?2 WHERE delete_id = ?1", rusqlite::params![delete_id, now])?;
     Ok(report)
 }
@@ -967,11 +882,11 @@ pub async fn undo_delete_core(
         let restore = plan.restore.clone();
         let texts = store.conn.call(move |c| embedding_texts_in(c, &restore)).await.map_err(MemoryError::Connection)?;
         for batch in texts.chunks(EMBED_BATCH) {
-            let inputs: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
+            let inputs: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
             let embedded = embedder.embed_batch(&inputs, EmbedRole::Passage).await?;
-            for ((table, id, _), vector) in batch.iter().zip(embedded) {
+            for ((id, _), vector) in batch.iter().zip(embedded) {
                 let unit = to_unit(&vector).map_err(|e| EmbedError::InferenceFailed(e.to_string()))?;
-                vectors.insert((*table, *id), unit.iter().flat_map(|f| f.to_le_bytes()).collect());
+                vectors.insert(*id, unit.iter().flat_map(|f| f.to_le_bytes()).collect());
             }
         }
     }
@@ -1229,8 +1144,6 @@ mod tests {
             let mut out = Vec::new();
             for sql in [
                 "SELECT json_array(id, project_id, status, deleted_at, update_count, last_modified_at) FROM memory",
-                "SELECT json_array('trajectory', id, project_id, status, deleted_at) FROM episodic_trajectory",
-                "SELECT json_array('skill', id, project_id, status, deleted_at) FROM procedural_skill",
                 "SELECT json_array(id, name, reviewed, merged_into, deleted_at) FROM project",
                 "SELECT json_array(id, project_id, index_docs) FROM project_path",
                 "SELECT json_array(remote, project_id) FROM project_remote",
@@ -1273,7 +1186,7 @@ mod tests {
 
         assert_eq!((report.refused, report.with_memories, report.delete_id), (None, false, Some(1)));
         assert_eq!((report.snapshot.clone(), report.code.clone()), (None, None), "no snapshot, and no code in the first stage");
-        assert_eq!((report.live, report.deleted), (Counts::default(), Counts { memories: 2, ..Counts::default() }));
+        assert_eq!((report.live, report.deleted), (Counts::default(), Counts { memories: 2 }));
         assert_eq!(report.folders, vec![A.to_string()], "only the folder that had its docs indexed");
 
         let state: Vec<Option<i64>> = f.rows(&format!("SELECT deleted_at FROM project WHERE id = '{A}'"), |r| r.get(0)).await;
@@ -1403,13 +1316,7 @@ mod tests {
         f.row(7, B, Some("agent-a"), "semantic_fact", "active", None).await;
         f.row(8, B, Some("agent-a"), "semantic_fact", "active", Some(3)).await;
         f.sql(&format!(
-            "INSERT INTO episodic_trajectory (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
-               VALUES ('agent', 'agent-a', '{A}', 's1', 't', 1, 1, 1);
-             INSERT INTO episodic_trajectory (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at, deleted_at) \
-               VALUES ('agent', 'agent-a', '{A}', 's2', 't', 1, 1, 1, 5);
-             INSERT INTO procedural_skill (scope, agent_id, project_id, skill_name, trigger, promoted_at, source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
-               VALUES ('agent', 'agent-a', '{A}', 'k', 't', 1, '[]', 1, 1, 1);
-             INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (6, 1, 0.1, 'pending', 1), (2, 1, 0.1, 'pending', 1), (3, 8, 0.1, 'pending', 1);
+            "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (6, 1, 0.1, 'pending', 1), (2, 1, 0.1, 'pending', 1), (3, 8, 0.1, 'pending', 1);
              INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES (7, 1, 1), (2, 1, 1), (8, 2, 1);
              INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', '{A}', 1);
              UPDATE project_path SET index_docs = 1 WHERE id = '{A}';"
@@ -1428,8 +1335,8 @@ mod tests {
         assert_eq!((report.project_id.as_str(), report.name.as_str(), report.with_memories, report.refused), (A, "app", true, None));
         assert!(report.code.as_deref().is_some_and(|c| c.len() == 8 && c.chars().all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))));
         assert_eq!((report.delete_id, report.snapshot.clone()), (None, None));
-        assert_eq!(report.live, Counts { memories: 4, trajectories: 1, skills: 1 });
-        assert_eq!(report.deleted, Counts { memories: 1, trajectories: 1, skills: 0 });
+        assert_eq!(report.live, Counts { memories: 4 });
+        assert_eq!(report.deleted, Counts { memories: 1 });
         assert_eq!(
             report.by_type,
             BTreeMap::from([
@@ -1533,23 +1440,19 @@ mod tests {
                 SubfolderOf { repository_id: "mono".into(), subpath: "libs/ui".into() },
             ],
             memories: vec![row(1, "active", None), row(2, "superseded", Some(5)), row(3, "active", None)],
-            trajectories: vec![row(1, "active", None), row(4, "active", None)],
-            skills: vec![row(9, "active", None)],
         };
         let shuffled = Set {
             folders: set.folders.iter().rev().cloned().collect(),
             remotes: set.remotes.iter().rev().cloned().collect(),
             subfolders: set.subfolders.iter().rev().cloned().collect(),
             memories: vec![set.memories[2].clone(), set.memories[0].clone(), set.memories[1].clone()],
-            trajectories: set.trajectories.iter().rev().cloned().collect(),
             ..set.clone()
         };
         assert_eq!(code_of(&set), code_of(&shuffled));
         assert_eq!(code_of(&set).len(), 8);
 
-        // The same rows in another table are another set.
-        let moved = Set { memories: vec![], trajectories: set.memories.clone(), ..set.clone() };
-        assert_ne!(code_of(&set), code_of(&moved));
+        let fewer = Set { memories: set.memories[..2].to_vec(), ..set.clone() };
+        assert_ne!(code_of(&set), code_of(&fewer));
         let other = Set { project_id: B.to_string(), ..set.clone() };
         assert_ne!(code_of(&set), code_of(&other));
     }
@@ -1572,8 +1475,6 @@ mod tests {
                 agent_id: Some("agent-a".into()),
                 memory_type: Some("semantic_fact".into()),
             }],
-            trajectories: Vec::new(),
-            skills: Vec::new(),
         };
         assert_eq!(code_of(&set), "9461170e", "the code a report gave before declarations");
         let declared = Set { subfolders: vec![SubfolderOf { repository_id: B.into(), subpath: "apps/web".into() }], ..set.clone() };
@@ -1619,11 +1520,12 @@ mod tests {
             self.delete(id, true).await.unwrap().code.unwrap()
         }
 
-        async fn vector(&self, table: &str, id: i64) {
-            let sql = format!("INSERT INTO {table}(rowid, embedding) VALUES (?1, ?2)");
+        async fn vector(&self, id: i64) {
             self.store
                 .conn
-                .call(move |c| c.execute(&sql, rusqlite::params![id, vec![0u8; 384 * 4]]))
+                .call(move |c| {
+                    c.execute("INSERT INTO memory_vectors(rowid, embedding) VALUES (?1, ?2)", rusqlite::params![id, vec![0u8; 384 * 4]])
+                })
                 .await
                 .unwrap();
         }
@@ -1633,8 +1535,6 @@ mod tests {
             let mut out = Vec::new();
             for sql in [
                 "SELECT json_array(id, status, update_count, last_modified_at, content, superseded_by, disputed_against, topic_key) FROM memory",
-                "SELECT json_array('t', id, status, update_count, last_modified_at) FROM episodic_trajectory",
-                "SELECT json_array('s', id, status, update_count, last_modified_at) FROM procedural_skill",
                 "SELECT json_array(new_id, old_id, state) FROM memory_conflict",
                 "SELECT json_array(memory_id, source_id) FROM memory_derivation",
                 "SELECT json_array(id, project_id) FROM project_path",
@@ -1655,8 +1555,8 @@ mod tests {
         }
     }
 
-    /// A with a key of two versions, a deleted row, a trajectory and a skill,
-    /// each with a vector, a folder with a docs index and a `workspace.md`;
+    /// A with a key of two versions and a deleted row, the live ones with a
+    /// vector, a folder with a docs index and a `workspace.md`;
     /// B with a row a verdict of A's replaced and a row that disputed A's.
     async fn project_with_its_rows(f: &Fixture) {
         f.sql(&format!(
@@ -1680,17 +1580,8 @@ mod tests {
              INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES (11, 2, 1);",
         )
         .await;
-        f.sql(&format!(
-            "INSERT INTO episodic_trajectory (id, scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
-               VALUES (50, 'agent', 'agent-a', '{A}', 's1', 't', 1, 1, 1);
-             INSERT INTO procedural_skill (id, scope, agent_id, project_id, skill_name, trigger, promoted_at, source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
-               VALUES (60, 'agent', 'agent-a', '{A}', 'k', 't', 1, '[]', 1, 1, 1);"
-        ))
-        .await;
-        f.vector("memory_vectors", 2).await;
-        f.vector("memory_vectors", 1).await;
-        f.vector("episodic_vectors", 50).await;
-        f.vector("procedural_vectors", 60).await;
+        f.vector(2).await;
+        f.vector(1).await;
         f.docs(A, 900).await;
         f.write_workspace("agent-a", A);
     }
@@ -1706,7 +1597,7 @@ mod tests {
         let report = f.confirm(A, &code).await.unwrap();
 
         assert_eq!((report.refused, report.code.as_deref(), report.delete_id), (None, Some(code.as_str()), Some(1)));
-        assert_eq!((report.live, report.deleted), (Counts { memories: 2, trajectories: 1, skills: 1 }, Counts { memories: 1, ..Counts::default() }));
+        assert_eq!((report.live, report.deleted), (Counts { memories: 2 }, Counts { memories: 1 }));
         let snapshot = report.snapshot.clone().expect("a snapshot before writing");
         assert!(snapshot.contains("pre-delete") && std::path::Path::new(&snapshot).exists(), "{snapshot}");
 
@@ -1715,16 +1606,9 @@ mod tests {
             .await;
         assert_eq!(marks[2], (3, Some(4)), "a row deleted before keeps its date");
         assert!(marks[0].1.is_some() && marks[0].1 == marks[1].1, "every live row is marked at once: {marks:?}");
-        let at = marks[0].1;
-        for table in ["episodic_trajectory", "procedural_skill"] {
-            let marked: Vec<Option<i64>> = f.rows(&format!("SELECT deleted_at FROM {table}"), |r| r.get(0)).await;
-            assert_eq!(marked, vec![at], "{table}");
-        }
         let status: Vec<String> = f.rows("SELECT status FROM memory WHERE id = 1", |r| r.get(0)).await;
         assert_eq!(status, vec!["superseded".to_string()], "the older version did not come back");
-        for table in ["memory_vectors", "episodic_vectors", "procedural_vectors"] {
-            assert_eq!(f.count(&format!("SELECT COUNT(*) FROM {table}")).await, 0, "{table}");
-        }
+        assert_eq!(f.count("SELECT COUNT(*) FROM memory_vectors").await, 0);
         let indexed: Vec<i64> = f.rows("SELECT rowid FROM memory_fts WHERE memory_fts MATCH 'note' ORDER BY rowid", |r| r.get(0)).await;
         assert_eq!(indexed, vec![3, 10, 11], "the rows deleted here left the text index; row 3 was inserted deleted, so it never did");
 
@@ -1740,13 +1624,7 @@ mod tests {
             .await;
         assert_eq!(
             rows,
-            vec![
-                ("episodic_trajectory".to_string(), 50, None),
-                ("memory".to_string(), 1, None),
-                ("memory".to_string(), 2, None),
-                ("memory".to_string(), 3, Some(4)),
-                ("procedural_skill".to_string(), 60, None),
-            ]
+            vec![("memory".to_string(), 1, None), ("memory".to_string(), 2, None), ("memory".to_string(), 3, Some(4))]
         );
         let state: Vec<Option<i64>> = f.rows(&format!("SELECT deleted_at FROM project WHERE id = '{A}'"), |r| r.get(0)).await;
         assert!(state[0].is_some());
@@ -1842,11 +1720,7 @@ mod tests {
             let mut out = Vec::new();
             for sql in [
                 "SELECT json_array('m', id, project_id, status, deleted_at, update_count, last_modified_at, superseded_by, disputed_against) FROM memory",
-                "SELECT json_array('t', id, project_id, status, deleted_at, update_count, last_modified_at) FROM episodic_trajectory",
-                "SELECT json_array('s', id, project_id, status, deleted_at, update_count, last_modified_at) FROM procedural_skill",
                 "SELECT json_array('mv', rowid) FROM memory_vectors",
-                "SELECT json_array('ev', rowid) FROM episodic_vectors",
-                "SELECT json_array('pv', rowid) FROM procedural_vectors",
                 "SELECT json_array('fts', rowid) FROM memory_fts WHERE memory_fts MATCH 'note'",
                 "SELECT json_array('p', id, deleted_at, reviewed) FROM project",
                 "SELECT json_array('f', id, index_docs) FROM project_path",
@@ -1881,7 +1755,7 @@ mod tests {
 
         let dry = f.undo(n, true, None).await.unwrap();
         assert!(dry.dry_run && dry.snapshot.is_none(), "a dry run needs no model and takes no snapshot");
-        assert_eq!(dry.restored, Counts { memories: 2, trajectories: 1, skills: 1 });
+        assert_eq!(dry.restored, Counts { memories: 2 });
         assert!(dry.kept.is_empty());
         assert_eq!((f.restored_state().await, f.pre_undo_snapshots()), (deleted, 0));
 
@@ -1943,7 +1817,7 @@ mod tests {
 
         let undone = f.undo(n, false, Some(&embedder)).await.unwrap();
 
-        assert_eq!(undone.restored, Counts { memories: 1, ..Counts::default() });
+        assert_eq!(undone.restored, Counts { memories: 1 });
         let kept: Vec<(i64, KeepReason)> = undone.kept.iter().map(|k| (k.id, k.reason)).collect();
         assert_eq!(
             kept,
@@ -1957,7 +1831,6 @@ mod tests {
                 (9, KeepReason::Changed),
             ]
         );
-        assert!(undone.kept.iter().all(|k| k.table == "memory"));
         let live: Vec<i64> = f
             .rows("SELECT id FROM memory WHERE project_id = 'app-aaaa' AND deleted_at IS NULL ORDER BY id", |r| r.get(0))
             .await;
@@ -1988,11 +1861,11 @@ mod tests {
         assert_eq!(f.restored_state().await, before);
 
         let undone = f.undo(second, false, Some(&embedder)).await.unwrap();
-        assert_eq!(undone.restored, Counts { memories: 1, ..Counts::default() });
+        assert_eq!(undone.restored, Counts { memories: 1 });
         assert_eq!(f.count("SELECT COUNT(*) FROM memory WHERE id = 2 AND deleted_at IS NULL").await, 1);
         assert_eq!(f.count("SELECT COUNT(*) FROM memory WHERE id = 1 AND deleted_at IS NULL").await, 0, "the earlier delete is still its own");
         let undone = f.undo(first, false, Some(&embedder)).await.unwrap();
-        assert_eq!(undone.restored, Counts { memories: 1, ..Counts::default() });
+        assert_eq!(undone.restored, Counts { memories: 1 });
         assert_eq!(f.count("SELECT COUNT(*) FROM memory WHERE project_id = 'app-aaaa' AND deleted_at IS NULL").await, 2);
 
         let unknown = f.undo(99, false, Some(&embedder)).await;

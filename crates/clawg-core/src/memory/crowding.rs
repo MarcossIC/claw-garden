@@ -24,7 +24,7 @@ use crate::memory::sharing::{Reach, Reader};
 use crate::memory::store_insert::MemoryType;
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::vector::{to_unit, EMBEDDING_DIM};
-use crate::memory::{MemoryStore, TableKind};
+use crate::memory::MemoryStore;
 use crate::metrics::SeriesKey;
 use crate::test_dir::{test_dir, TestDir};
 
@@ -509,7 +509,7 @@ async fn search(store: &MemoryStore, reader: &Reader, project: usize, vector: &[
     assert_eq!(scope.memory, Some(POOL), "the reference is cut at the pool a search asks for");
     store.metrics().take_minute();
     let hits = search_all_memories(store, vector, None, &reader.agent_id, scope, POOL).await.expect("the search runs");
-    ran(store, hits.into_iter().filter(|h| h.kind == TableKind::Memory).map(|h| h.id).collect())
+    ran(store, hits.into_iter().map(|h| h.id).collect())
 }
 
 /// A probe of the detector as a save without a key or siblings runs it.

@@ -417,7 +417,7 @@ mod tests {
     fn shared(agent: &str) -> Reader {
         Reader::new(agent, Reach::AllBut(Vec::new()))
     }
-    use crate::memory::admin::{delete_memory_core, MemoryKind};
+    use crate::memory::admin::delete_memory_core;
 
     async fn seed(store: &MemoryStore, project: Option<&str>, content: &str, created_at: i64) -> i64 {
         seed_as(store, "a", project, content, created_at).await
@@ -496,7 +496,7 @@ mod tests {
         let e = seed(&store, Some("p"), "the deploy runs on fridays", 3).await;
         let c = conclude(&store, Some("p"), &[a, b], 4).await;
 
-        delete_memory_core(&store, c, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, c, None).await.unwrap();
         let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
 
         assert_eq!(ids(&found.pending), vec![e, b, a]);
@@ -518,12 +518,12 @@ mod tests {
         let b = seed(&store, Some("p"), "tabs in rust", 2).await;
         let c = conclude(&store, Some("p"), &[a, b], 3).await;
         let lone = seed(&store, Some("p"), "the deploy runs on fridays", 4).await;
-        delete_memory_core(&store, c, MemoryKind::Memory, None).await.unwrap();
-        delete_memory_core(&store, a, MemoryKind::Memory, None).await.unwrap();
-        delete_memory_core(&store, lone, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, c, None).await.unwrap();
+        delete_memory_core(&store, a, None).await.unwrap();
+        delete_memory_core(&store, lone, None).await.unwrap();
 
         for id in [c, a, lone] {
-            restore_memory_core(&store, &FakeEmbedder::default(), MemoryKind::Memory, id, None).await.unwrap();
+            restore_memory_core(&store, &FakeEmbedder::default(), id, None).await.unwrap();
         }
         let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
 
@@ -644,7 +644,7 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let a = seed(&store, None, "kept", 1).await;
         let d = seed(&store, None, "deleted", 2).await;
-        delete_memory_core(&store, d, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, d, None).await.unwrap();
 
         assert_eq!(existing_memory_ids(&store, &[999_999, d, a, a], None).await.unwrap(), vec![a]);
     }
@@ -730,7 +730,7 @@ mod tests {
         let b = seed(&store, Some("p"), "tabs in rust", 2).await;
         let c = conclude(&store, Some("p"), &[a, b], 3).await;
 
-        delete_memory_core(&store, a, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, a, None).await.unwrap();
         let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
 
         assert_eq!(found.to_review_total, 1);
@@ -766,9 +766,9 @@ mod tests {
         let store = MemoryStore::new_for_test().await.unwrap();
         let a = seed(&store, Some("p"), "tabs in go", 1).await;
         conclude(&store, Some("p"), &[a], 2).await;
-        delete_memory_core(&store, a, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, a, None).await.unwrap();
 
-        restore_memory_core(&store, &FakeEmbedder::default(), MemoryKind::Memory, a, None).await.unwrap();
+        restore_memory_core(&store, &FakeEmbedder::default(), a, None).await.unwrap();
         let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(10)).await.unwrap();
 
         assert!(found.to_review.is_empty());
@@ -817,7 +817,7 @@ mod tests {
         let count = || conclusions_to_review_count(&store, None, Some("p"));
         assert_eq!(count().await.unwrap(), 0);
 
-        delete_memory_core(&store, a, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, a, None).await.unwrap();
         assert_eq!(count().await.unwrap(), 1, "never reviewed: every conclusion to review");
         assert_eq!(conclusions_to_review_count(&store, None, Some("q")).await.unwrap(), 0);
 
@@ -860,7 +860,7 @@ mod tests {
         for i in 0..(REVIEW_LIMIT as i64 + 2) {
             made.push(conclude(&store, Some("p"), &[gone], 2 + i).await);
         }
-        delete_memory_core(&store, gone, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, gone, None).await.unwrap();
 
         let found = synthesis_core(&store, in_project("p"), TimestampMs::from_unix_millis(100)).await.unwrap();
 
@@ -885,7 +885,7 @@ mod tests {
             })
             .await
             .unwrap();
-        delete_memory_core(&store, theirs, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, theirs, None).await.unwrap();
         let as_a = |reach: Reach| SynthesisParams { reader: Some(Reader::new("a", reach)), ..in_project("p") };
 
         let found = synthesis_core(&store, as_a(Reach::AllBut(Vec::new())), TimestampMs::from_unix_millis(10)).await.unwrap();

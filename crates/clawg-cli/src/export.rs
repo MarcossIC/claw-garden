@@ -204,12 +204,14 @@ pub fn report(lang: Lang, out: &Path, w: &Written, format: ExportFormat) -> Stri
         let one = w.legacy_rows == 1;
         lines.push(match lang {
             Lang::En => format!(
-                "{} of episodic_trajectory and procedural_skill {} not exported",
+                "{} of trajectories and skills {} not exported: the store is from before they moved into memory, \
+                 which a daemon of this version does when it opens it",
                 plural(w.legacy_rows, "row", "rows"),
                 if one { "is" } else { "are" },
             ),
             Lang::Es => format!(
-                "{} de episodic_trajectory y procedural_skill no se {}",
+                "{} de trayectorias y habilidades no se {}: la base es de antes de que pasaran a memory, \
+                 y un daemon de esta versión las pasa al abrirla",
                 plural(w.legacy_rows, "fila", "filas"),
                 if one { "exportó" } else { "exportaron" },
             ),
@@ -268,19 +270,21 @@ mod tests {
             "wrote 1 memory, 1 project, 1 derivation, 1 piece and 1 pair to /x/m.jsonl\n\
              the file holds the text of these memories as stored; `clawg secrets` lists the ones that hold a secret\n\
              1 save waiting in the outbox is not in the file; export again once the daemon has stored it\n\
-             1 row of episodic_trajectory and procedural_skill is not exported"
+             1 row of trajectories and skills is not exported: the store is from before they moved into memory, \
+             which a daemon of this version does when it opens it"
         );
         assert_eq!(
             report(Lang::Es, out, &one, ExportFormat::Jsonl),
             "se escribieron 1 memoria, 1 proyecto, 1 derivación, 1 pieza y 1 par en /x/m.jsonl\n\
              el archivo tiene el texto de estas memorias tal como están guardadas; `clawg secrets` lista las que guardan un secreto\n\
              1 save que espera en el outbox no está en el archivo; exporta de nuevo cuando el daemon lo haya guardado\n\
-             1 fila de episodic_trajectory y procedural_skill no se exportó"
+             1 fila de trayectorias y habilidades no se exportó: la base es de antes de que pasaran a memory, \
+             y un daemon de esta versión las pasa al abrirla"
         );
         let es = report(Lang::Es, out, &many, ExportFormat::Jsonl);
         assert!(es.starts_with("se escribieron 2 memorias, 0 proyectos, 3 derivaciones, 4 piezas y 5 pares en /x/m.jsonl\n"), "{es}");
         assert!(es.contains("2 saves que esperan en el outbox no están en el archivo; exporta de nuevo cuando el daemon los haya guardado"), "{es}");
-        assert!(es.ends_with("2 filas de episodic_trajectory y procedural_skill no se exportaron"), "{es}");
+        assert!(es.contains("\n2 filas de trayectorias y habilidades no se exportaron: la base es de antes"), "{es}");
         assert_eq!(
             report(Lang::Es, out, &Written { memories: 2, ..Written::default() }, ExportFormat::Markdown).lines().next(),
             Some("se escribió una vista de 2 memorias en /x/m.jsonl; clawg import no la lee")

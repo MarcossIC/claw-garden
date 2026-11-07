@@ -204,8 +204,7 @@ pub struct OtherLanguage {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hit {
     pub id: i64,
-    /// `"Memory"` | `"Episodic"` | `"Procedural"` — the core serializes
-    /// `TableKind` in PascalCase, and this type does not re-spell it.
+    /// `"Memory"`, the only kind, as the daemon spells it in a hit.
     pub kind: String,
     pub content: String,
     pub memory_type: String,
@@ -260,8 +259,7 @@ pub struct PiecePosition {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct MemoryRow {
     pub id: i64,
-    /// `"memory"` | `"episodic"` | `"procedural"` (lowercase — `MemoryKind`,
-    /// not `TableKind`; the two spellings are a known wart in core).
+    /// `"memory"`, the only kind: a hit spells it `"Memory"`.
     pub kind: String,
     pub memory_type: Option<String>,
     /// The row's full content, not a preview.
@@ -284,12 +282,6 @@ pub struct MemoryRow {
     pub superseded_by: Option<i64>,
     #[serde(default)]
     pub deleted_at: Option<i64>,
-    #[serde(default)]
-    pub success_count: Option<i64>,
-    #[serde(default)]
-    pub trigger: Option<String>,
-    #[serde(default)]
-    pub source_trajectory_ids: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
@@ -451,9 +443,7 @@ pub struct Count {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct StatsTotals {
     pub memory: u64,
-    pub episodic: u64,
-    pub procedural: u64,
-    /// Soft-deleted rows across the three tables; not part of the live counts.
+    /// Soft-deleted rows; not part of the live count.
     pub deleted: u64,
 }
 

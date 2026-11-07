@@ -204,7 +204,7 @@ fn render_rows(lang: Lang, rows: &[MemoryRow], now_ms: i64, limit: u32, offset: 
             Lang::Es => write!(out, " Más: --offset {next}"),
         };
     }
-    if matches!(listing, Listing::Deleted) && rows.iter().any(|r| r.kind == "memory") {
+    if matches!(listing, Listing::Deleted) {
         out.push_str(match lang {
             Lang::En => " Undo a memory row with 'clawg undelete <ID>'.",
             Lang::Es => " Una fila memory vuelve con 'clawg undelete <ID>'.",
@@ -234,7 +234,7 @@ pub fn render_detail(row: &MemoryRow, now_ms: i64) -> String {
         (Some(kind), _) => kind.clone(),
         (None, _) => "-".to_string(),
     };
-    let mut grid: Vec<(&str, String)> = vec![
+    let grid: Vec<(&str, String)> = vec![
         ("type", or_dash(&row.memory_type)),
         ("tier", row.tier.to_string()),
         ("importance", format!("{:.1}", row.importance)),
@@ -254,14 +254,6 @@ pub fn render_detail(row: &MemoryRow, now_ms: i64) -> String {
         ("superseded by", or_dash_num(row.superseded_by)),
         ("deleted", stamp(row.deleted_at, now_ms)),
     ];
-    // Only procedural rows have these; showing a dash for the others would be
-    // noise on every memory.
-    if let Some(trigger) = &row.trigger {
-        grid.push(("trigger", trigger.clone()));
-    }
-    if let Some(n) = row.success_count {
-        grid.push(("successes", n.to_string()));
-    }
 
     let label_width = grid.iter().map(|(l, _)| l.len()).max().unwrap_or(0) + 2;
     for (label, value) in grid {
@@ -274,22 +266,11 @@ pub fn render_detail(row: &MemoryRow, now_ms: i64) -> String {
 /// Totals first, then each grouping on one line as `key count | key count`.
 pub fn render_stats(lang: Lang, stats: &MemoryStats, now_ms: i64) -> String {
     let t = &stats.totals;
-    let live = t.memory + t.episodic + t.procedural;
     let mut out = match lang {
-        Lang::En => format!(
-            "{} (memory {}, episodic {}, procedural {}), {} deleted.",
-            plural(live, "live row", "live rows"),
-            t.memory,
-            t.episodic,
-            t.procedural,
-            t.deleted
-        ),
+        Lang::En => format!("{}, {} deleted.", plural(t.memory, "live row", "live rows"), t.deleted),
         Lang::Es => format!(
-            "{} (memory {}, episodic {}, procedural {}), {} {}.",
-            plural(live, "fila viva", "filas vivas"),
-            t.memory,
-            t.episodic,
-            t.procedural,
+            "{}, {} {}.",
+            plural(t.memory, "fila viva", "filas vivas"),
             t.deleted,
             if t.deleted == 1 { "borrada" } else { "borradas" }
         ),
@@ -406,7 +387,7 @@ fn filter_args(filters: &Filters, project: Option<String>) -> ListArgs {
 /// the caller, which is the part that reads the working directory.
 pub fn list_args(opts: &ListOpts, project: Option<String>) -> ListArgs {
     ListArgs {
-        kind: opts.kind.map(|k| k.as_str().to_owned()),
+        kind: opts.kind.clone(),
         limit: Some(opts.limit),
         offset: Some(opts.offset),
         deleted: opts.deleted,
@@ -478,7 +459,7 @@ pub async fn run(
             })
         }
         MemoriesAction::Show(opts) => {
-            let row = client.get(opts.kind.as_str(), opts.id).await?;
+            let row = client.get(opts.kind.as_deref().unwrap_or("memory"), opts.id).await?;
             Ok(if opts.json {
                 row_json(&row)
             } else {
@@ -504,7 +485,7 @@ mod tests {
     use super::*;
 
     use crate::cli::{
-        Filters, KindArg, ListOpts, ProfileArg, Scope, SearchOpts, ShowOpts, StatsOpts, StatusArg,
+        Filters, ListOpts, ProfileArg, Scope, SearchOpts, ShowOpts, StatsOpts, StatusArg,
     };
     use crate::client::tests::{publish, save_and_wait, start_daemon};
     use crate::client::{Count, DaemonClient, MemoryStats, StatsTotals};
@@ -560,15 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn deleted_episodes_alone_are_not_offered_an_undelete() {
-        let episode = MemoryRow { deleted_at: Some(NOW - 60_000), ..row(4, "episodic", "ran the migration") };
-
-        let out = render_deleted_table(Lang::En, &[episode], NOW, 20, 0);
-
-        assert!(out.ends_with("1 row, most recently deleted first."), "{out}");
-    }
-
-    #[test]
     fn table_one_line_per_row_plus_header() {
         let rows = [row(2, "memory", "second"), row(1, "memory", "first")];
         let out = render_table(Lang::En, &rows, NOW, 20, 0);
@@ -595,7 +567,7 @@ mod tests {
         let mut b = row(22, "memory", "two");
         b.agent_id = Some("🚀🚀🚀".into());
         b.project_id = Some("proyecto-ó".into());
-        let mut c = row(333, "episodic", "three");
+        let mut c = row(333, "memory", "three");
         c.agent_id = Some("plain".into());
         c.memory_type = None;
 
@@ -652,7 +624,7 @@ mod tests {
     fn dash_for_missing() {
         let bare = MemoryRow {
             id: 4,
-            kind: "episodic".into(),
+            kind: "memory".into(),
             summary: "x".into(),
             tier: 3,
             status: "active".into(),
@@ -784,7 +756,7 @@ mod tests {
         let out = render_detail(
             &MemoryRow {
                 id: 3,
-                kind: "episodic".into(),
+                kind: "memory".into(),
                 ..Default::default()
             },
             NOW,
@@ -852,12 +824,7 @@ mod tests {
 
     fn sample_stats() -> MemoryStats {
         MemoryStats {
-            totals: StatsTotals {
-                memory: 40,
-                episodic: 2,
-                procedural: 1,
-                deleted: 3,
-            },
+            totals: StatsTotals { memory: 40, deleted: 3 },
             by_type: vec![
                 count(Some("semantic_fact"), 30),
                 count(Some("preference"), 10),
@@ -886,7 +853,7 @@ mod tests {
         );
         let stats = render_stats(Lang::Es, &sample_stats(), NOW);
         assert!(
-            stats.starts_with("43 filas vivas (memory 40, episodic 2, procedural 1), 3 borradas. La más nueva, de hace 12s.\n"),
+            stats.starts_with("40 filas vivas, 3 borradas. La más nueva, de hace 12s.\n"),
             "{stats}"
         );
         assert!(stats.contains("\npor proyecto: claw-garden-1a2b 25 | (ninguno) 15"), "{stats}");
@@ -909,7 +876,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[0],
-            "43 live rows (memory 40, episodic 2, procedural 1), 3 deleted. Newest 12s ago."
+            "40 live rows, 3 deleted. Newest 12s ago."
         );
         let section = |label: &str| -> &str {
             lines
@@ -935,7 +902,7 @@ mod tests {
     fn stats_of_an_empty_store_says_so() {
         let out = render_stats(Lang::En, &MemoryStats::default(), NOW);
         assert!(
-            out.starts_with("0 live rows (memory 0, episodic 0, procedural 0), 0 deleted."),
+            out.starts_with("0 live rows, 0 deleted."),
             "{out}"
         );
         assert!(!out.contains("Newest"), "{out}");
@@ -950,7 +917,7 @@ mod tests {
 
     #[test]
     fn json_is_valid() {
-        let rows = [row(2, "memory", "naïve\ncontent"), row(1, "episodic", "x")];
+        let rows = [row(2, "memory", "naïve\ncontent"), row(1, "memory", "x")];
         let parsed: serde_json::Value = serde_json::from_str(&rows_json(&rows)).expect("array");
         let items = parsed.as_array().expect("an array");
         assert_eq!(items.len(), 2);
@@ -1044,7 +1011,7 @@ mod tests {
     #[test]
     fn list_args_carry_every_flag() {
         let opts = ListOpts {
-            kind: Some(KindArg::Procedural),
+            kind: Some("memory".into()),
             filters: Filters {
                 scope: Scope {
                     agent: Some("a1".into()),
@@ -1061,7 +1028,7 @@ mod tests {
             ..list_opts()
         };
         let args = list_args(&opts, Some("p1".into()));
-        assert_eq!(args.kind.as_deref(), Some("procedural"));
+        assert_eq!(args.kind.as_deref(), Some("memory"));
         assert_eq!(args.agent.as_deref(), Some("a1"));
         assert_eq!(
             args.project.as_deref(),
@@ -1186,7 +1153,7 @@ mod tests {
         let show = |id, json| {
             MemoriesAction::Show(ShowOpts {
                 id,
-                kind: KindArg::Memory,
+                kind: None,
                 json,
                 profile: ProfileArg { profile: None },
             })
@@ -1214,7 +1181,7 @@ mod tests {
         let (c, _d) = live_client().await;
         let action = MemoriesAction::Show(ShowOpts {
             id: 12345,
-            kind: KindArg::Episodic,
+            kind: None,
             json: false,
             profile: ProfileArg { profile: None },
         });
@@ -1239,7 +1206,7 @@ mod tests {
         };
         let out = run(Lang::En, &c, action(false), NOW).await.expect("run");
         assert!(
-            out.starts_with("1 live row (memory 1, episodic 0, procedural 0), 0 deleted."),
+            out.starts_with("1 live row, 0 deleted."),
             "{out}"
         );
         assert!(out.contains("agent-s 1"), "{out}");

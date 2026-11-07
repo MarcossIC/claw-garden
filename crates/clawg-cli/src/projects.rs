@@ -408,8 +408,8 @@ pub fn delete_refused(lang: Lang, undo: bool, err: &ClientError) -> Option<Strin
     })
 }
 
-/// The rows of each table, as a sentence part: `3 memories, 1 trajectory`.
-/// With `deleted`, the rows that were already deleted: `2 deleted memories`.
+/// The rows, as a sentence part: `3 memories`. With `deleted`, the rows that
+/// were already deleted: `2 deleted memories`.
 fn row_counts(lang: Lang, c: &Counts, deleted: bool) -> String {
     let part = |n: usize, en: (&str, &str), es: (&str, &str)| match (lang, deleted) {
         (Lang::En, false) => counted(lang, n, en, es),
@@ -417,20 +417,14 @@ fn row_counts(lang: Lang, c: &Counts, deleted: bool) -> String {
         (Lang::Es, false) => counted(lang, n, en, es),
         (Lang::Es, true) => counted(lang, n, en, (&format!("{} borrada", es.0), &format!("{} borradas", es.1))),
     };
-    let parts: Vec<String> = [
-        (c.memories, part(c.memories, ("memory", "memories"), ("memoria", "memorias"))),
-        (c.trajectories, part(c.trajectories, ("trajectory", "trajectories"), ("trayectoria", "trayectorias"))),
-        (c.skills, part(c.skills, ("skill", "skills"), ("habilidad", "habilidades"))),
-    ]
-    .into_iter()
-    .filter(|(n, _)| *n > 0)
-    .map(|(_, text)| text)
-    .collect();
-    parts.join(", ")
+    if c.memories == 0 {
+        return String::new();
+    }
+    part(c.memories, ("memory", "memories"), ("memoria", "memorias"))
 }
 
 fn total(c: &Counts) -> usize {
-    c.memories + c.trajectories + c.skills
+    c.memories
 }
 
 /// Why a project is offered to empty another into.
@@ -481,18 +475,6 @@ fn keep_reason(lang: Lang, reason: KeepReason) -> &'static str {
         (KeepReason::Changed, Lang::Es) => "ya no está como la dejó el borrado",
         (KeepReason::Tied, Lang::En) => "it is a piece of a save with a piece that stays",
         (KeepReason::Tied, Lang::Es) => "es una pieza de un save con una pieza que queda",
-    }
-}
-
-fn table_word(lang: Lang, table: &str) -> String {
-    match (table, lang) {
-        ("memory", Lang::En) => "memory".to_string(),
-        ("memory", Lang::Es) => "memoria".to_string(),
-        ("episodic_trajectory", Lang::En) => "trajectory".to_string(),
-        ("episodic_trajectory", Lang::Es) => "trayectoria".to_string(),
-        ("procedural_skill", Lang::En) => "skill".to_string(),
-        ("procedural_skill", Lang::Es) => "habilidad".to_string(),
-        (other, _) => other.to_string(),
     }
 }
 
@@ -749,10 +731,10 @@ fn render_undo(lang: Lang, report: &DeleteReport) -> String {
         }
     }];
     for k in &report.kept {
-        let (table, row, why) = (table_word(lang, &k.table), k.id, keep_reason(lang, k.reason));
+        let (row, why) = (k.id, keep_reason(lang, k.reason));
         lines.push(match lang {
-            Lang::En => format!("stays deleted: {table} #{row}: {why}"),
-            Lang::Es => format!("queda borrada: {table} #{row}: {why}"),
+            Lang::En => format!("stays deleted: memory #{row}: {why}"),
+            Lang::Es => format!("queda borrada: memoria #{row}: {why}"),
         });
     }
     if !report.folders.is_empty() {
@@ -843,8 +825,6 @@ pub fn render_merge(lang: Lang, report: &MergeReport, undo: bool) -> String {
         });
     }
     let also: Vec<String> = [
-        (report.trajectories, ("trajectory", "trajectories"), ("trayectoria", "trayectorias")),
-        (report.skills, ("skill", "skills"), ("habilidad", "habilidades")),
         (report.reviews, ("synthesize review", "synthesize reviews"), ("revisión de synthesize", "revisiones de synthesize")),
     ]
     .into_iter()
@@ -1554,7 +1534,7 @@ mod tests {
     fn merge_report(report: serde_json::Value) -> MergeReport {
         let mut whole = serde_json::json!({
             "dry_run": false, "merge_id": null, "source": "app-1a2b", "target": "web-3c4d", "move_id": null,
-            "memories": 0, "superseded": [], "split": [], "protected": 0, "trajectories": 0, "skills": 0,
+            "memories": 0, "superseded": [], "split": [], "protected": 0,
             "reviews": 0, "folders": [], "remotes": [], "tombstones": [], "suggestions": 0,
             "workspaces": { "copied": [], "kept_beside": [], "failed": [] }, "snapshot": null,
         });
@@ -1566,7 +1546,7 @@ mod tests {
     fn a_merge_report_names_what_moved_and_the_way_back() {
         let merged = merge_report(serde_json::json!({
             "merge_id": 4, "move_id": 9, "memories": 12, "superseded": [{ "row": 7, "by": 40 }], "split": [15],
-            "protected": 2, "trajectories": 1, "reviews": 1, "folders": ["app-1a2b"],
+            "protected": 2, "reviews": 1, "folders": ["app-1a2b"],
             "remotes": ["github.com/acme/app"], "tombstones": ["old-9f9f"], "suggestions": 1,
             "workspaces": {
                 "copied": ["/w/a/web-3c4d/workspace.md"],
@@ -1581,7 +1561,7 @@ mod tests {
              replaced by a memory of the same topic key or text in web-3c4d: #7 by #40\n\
              saved partly in another project, which keeps its part: #15\n\
              2 of them are preferences or decisions\n\
-             also: 1 trajectory, 1 synthesize review\n\
+             also: 1 synthesize review\n\
              folders that lead to web-3c4d: app-1a2b\n\
              remotes of web-3c4d: github.com/acme/app\n\
              projects merged into app-1a2b before, which lead to web-3c4d now: old-9f9f\n\
@@ -1598,7 +1578,7 @@ mod tests {
              reemplazadas por una memoria de la misma clave o el mismo texto en web-3c4d: #7 por #40\n\
              guardadas en parte en otro proyecto, que conserva su parte: #15\n\
              2 de ellas son preferencias o decisiones\n\
-             además: 1 trayectoria, 1 revisión de synthesize\n\
+             además: 1 revisión de synthesize\n\
              carpetas que llevan a web-3c4d: app-1a2b\n\
              remotos de web-3c4d: github.com/acme/app\n\
              proyectos que se habían unido en app-1a2b y ahora llevan a web-3c4d: old-9f9f\n\
@@ -1626,7 +1606,7 @@ mod tests {
         assert_eq!(render_merge(Lang::Es, &nothing, false), "no queda nada de app-1a2b para unir en web-3c4d");
 
         let undone = merge_report(serde_json::json!({
-            "merge_id": 4, "move_id": 11, "memories": 11, "kept": [15], "trajectories": 1, "reviews": 1, "folders": ["app-1a2b"],
+            "merge_id": 4, "move_id": 11, "memories": 11, "kept": [15], "reviews": 1, "folders": ["app-1a2b"],
             "workspaces": {
                 "copied": [], "kept_beside": [], "failed": [],
                 "removed": ["/w/a/web-3c4d/workspace.md"], "kept": ["/w/b/web-3c4d/workspace.md"],
@@ -1637,7 +1617,7 @@ mod tests {
             render_merge(Lang::En, &undone, true),
             "undid merge 4: 11 memories back in app-1a2b\n\
              moved elsewhere since, so left where they are: #15\n\
-             also: 1 trajectory, 1 synthesize review\n\
+             also: 1 synthesize review\n\
              folders that lead to app-1a2b again: app-1a2b\n\
              workspace.md copy taken back: /w/a/web-3c4d/workspace.md\n\
              workspace.md copy kept, the user edited it since: /w/b/web-3c4d/workspace.md\n\
@@ -1647,7 +1627,7 @@ mod tests {
             render_merge(Lang::Es, &undone, true),
             "se deshizo la unión 4: 11 memorias vuelven a app-1a2b\n\
              se movieron a otro lado después y quedan donde están: #15\n\
-             además: 1 trayectoria, 1 revisión de synthesize\n\
+             además: 1 revisión de synthesize\n\
              carpetas que vuelven a llevar a app-1a2b: app-1a2b\n\
              copia de workspace.md que se quita: /w/a/web-3c4d/workspace.md\n\
              copia de workspace.md que queda, porque se editó después: /w/b/web-3c4d/workspace.md\n\
@@ -1871,8 +1851,8 @@ mod tests {
     fn the_report() -> DeleteReport {
         delete_report(serde_json::json!({
             "with_memories": true, "code": "1a2b3c4d",
-            "live": { "memories": 3, "trajectories": 1, "skills": 0 },
-            "deleted": { "memories": 2, "trajectories": 0, "skills": 0 },
+            "live": { "memories": 3 },
+            "deleted": { "memories": 2 },
             "by_type": { "semantic_fact": 2, "user_preference": 1 },
             "by_author": [{ "agent_id": null, "rows": 1 }, { "agent_id": "agent-a", "rows": 2 }],
             "by_status": { "active": 3 }, "protected": [2], "split_pairs": 1, "conclusions": [7],
@@ -1886,7 +1866,7 @@ mod tests {
     fn a_delete_report_names_its_subfolders() {
         let report = delete_report(serde_json::json!({
             "with_memories": true, "code": "1a2b3c4d",
-            "live": { "memories": 1, "trajectories": 0, "skills": 0 },
+            "live": { "memories": 1 },
             "subfolders": [{ "repository_id": "mono-9f9f", "subpath": "apps/web" }],
         }));
         let line = |lang: Lang| render_delete(lang, &report, false).lines().find(|l| l.contains("apps/web")).map(str::to_string);
@@ -1904,7 +1884,7 @@ mod tests {
     fn a_delete_report_names_what_goes_and_the_exact_confirm() {
         assert_eq!(
             render_delete(Lang::En, &the_report(), false),
-            "deleting App web (app-1a2b) with its memories takes: 3 memories, 1 trajectory\n\
+            "deleting App web (app-1a2b) with its memories takes: 3 memories\n\
              already deleted: 2 memories\n\
              by type: semantic_fact 2, user_preference 1\n\
              by author: (none) 1, agent-a 2\n\
@@ -1924,7 +1904,7 @@ mod tests {
         );
         let es = render_delete(Lang::Es, &the_report(), false);
         for line in [
-            "borrar App web (app-1a2b) con sus memorias se lleva: 3 memorias, 1 trayectoria",
+            "borrar App web (app-1a2b) con sus memorias se lleva: 3 memorias",
             "ya borradas: 2 memorias",
             "por autor: (ninguno) 1, agent-a 2",
             "preferencias y decisiones entre ellas: #2",
@@ -1948,7 +1928,7 @@ mod tests {
 
         // An empty project, and one deleted with its memories.
         let empty = delete_report(serde_json::json!({
-            "delete_id": 4, "deleted": { "memories": 2, "trajectories": 0, "skills": 0 },
+            "delete_id": 4, "deleted": { "memories": 2 },
         }));
         assert_eq!(
             render_delete(Lang::En, &empty, false),
@@ -1962,7 +1942,7 @@ mod tests {
         );
         let done = delete_report(serde_json::json!({
             "with_memories": true, "delete_id": 5, "code": "1a2b3c4d", "snapshot": "/b/memory-x-pre-delete.db",
-            "live": { "memories": 3, "trajectories": 0, "skills": 0 },
+            "live": { "memories": 3 },
         }));
         assert_eq!(
             render_delete(Lang::En, &done, false),
@@ -1981,29 +1961,29 @@ mod tests {
         // An undo, and what stayed.
         let undone = delete_report(serde_json::json!({
             "delete_id": 5, "snapshot": "/b/memory-x-pre-undo.db", "folders": ["app-1a2b"],
-            "restored": { "memories": 2, "trajectories": 1, "skills": 0 },
-            "kept": [{ "table": "memory", "id": 9, "reason": "live_twin" }, { "table": "memory", "id": 10, "reason": "tied" }],
+            "restored": { "memories": 2 },
+            "kept": [{ "id": 9, "reason": "live_twin" }, { "id": 10, "reason": "tied" }],
         }));
         assert_eq!(
             render_delete(Lang::En, &undone, true),
-            "undid delete 5: 2 memories, 1 trajectory are back in App web (app-1a2b)\n\
+            "undid delete 5: 2 memories are back in App web (app-1a2b)\n\
              stays deleted: memory #9: a live memory has its text\n\
              stays deleted: memory #10: it is a piece of a save with a piece that stays\n\
              docs index turned on again for: app-1a2b; the next refresh rebuilds it\n\
              snapshot before the undo: /b/memory-x-pre-undo.db; `clawg restore` brings it back"
         );
-        let dry = delete_report(serde_json::json!({ "dry_run": true, "delete_id": 5, "restored": { "memories": 1, "trajectories": 0, "skills": 0 } }));
+        let dry = delete_report(serde_json::json!({ "dry_run": true, "delete_id": 5, "restored": { "memories": 1 } }));
         assert_eq!(render_delete(Lang::En, &dry, true), "would undo delete 5: 1 memory would be back in App web (app-1a2b)");
         assert_eq!(render_delete(Lang::Es, &dry, true), "se desharía el borrado 5: 1 memoria volvería a App web (app-1a2b)");
         let es = render_delete(Lang::Es, &undone, true);
-        assert!(es.starts_with("se deshizo el borrado 5: 2 memorias, 1 trayectoria vuelven a App web (app-1a2b)\n"), "{es}");
+        assert!(es.starts_with("se deshizo el borrado 5: 2 memorias vuelven a App web (app-1a2b)\n"), "{es}");
         assert!(es.contains("queda borrada: memoria #9: una memoria viva tiene su texto"), "{es}");
     }
 
     #[test]
     fn a_refused_delete_names_the_ways_to_empty_it() {
         let report = delete_report(serde_json::json!({
-            "refused": "not_empty", "live": { "memories": 3, "trajectories": 1, "skills": 0 },
+            "refused": "not_empty", "live": { "memories": 3 },
             "candidates": [
                 { "project_id": "web-3c4d", "name": "web", "reason": "same_name" },
                 { "project_id": "copia-5e6f", "name": "copia", "reason": "root_commit" },
@@ -2011,7 +1991,7 @@ mod tests {
         }));
         assert_eq!(
             render_delete(Lang::En, &report, false),
-            "App web (app-1a2b) has live rows: 3 memories, 1 trajectory, so it is not deleted. To empty it:\n\
+            "App web (app-1a2b) has live rows: 3 memories, so it is not deleted. To empty it:\n\
              `clawg projects merge app-1a2b --into web-3c4d --dry-run` joins it into web (web-3c4d): they have the same name\n\
              `clawg projects merge app-1a2b --into copia-5e6f --dry-run` joins it into copia (copia-5e6f): they share their first commit\n\
              `clawg projects move --from-project app-1a2b --to-project <ID>` moves its memories to another project\n\
@@ -2019,7 +1999,7 @@ mod tests {
         );
         assert_eq!(
             render_delete(Lang::Es, &report, false),
-            "App web (app-1a2b) tiene filas vivas: 3 memorias, 1 trayectoria, así que no se borra. Para vaciarlo:\n\
+            "App web (app-1a2b) tiene filas vivas: 3 memorias, así que no se borra. Para vaciarlo:\n\
              `clawg projects merge app-1a2b --into web-3c4d --dry-run` lo une a web (web-3c4d): tienen el mismo nombre\n\
              `clawg projects merge app-1a2b --into copia-5e6f --dry-run` lo une a copia (copia-5e6f): comparten el primer commit\n\
              `clawg projects move --from-project app-1a2b --to-project <ID>` mueve sus memorias a otro proyecto\n\
@@ -2077,7 +2057,7 @@ mod tests {
             { "project_id": "web-3c4d", "name": "App web", "reason": "same_name" },
         ]);
         let refused = delete_report(serde_json::json!({
-            "refused": "not_empty", "live": { "memories": 1, "trajectories": 0, "skills": 0 }, "candidates": candidates,
+            "refused": "not_empty", "live": { "memories": 1 }, "candidates": candidates,
         }));
         let merges: Vec<String> =
             render_delete(Lang::En, &refused, false).lines().filter(|l| l.contains("projects merge")).map(str::to_string).collect();

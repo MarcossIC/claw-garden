@@ -83,6 +83,58 @@ fn no_source_allows_dead_code() {
     assert!(found.is_empty(), "delete the unused code instead of allowing it:\n{}", found.join("\n"));
 }
 
+/// V32 moved the rows of these tables into `memory` and dropped them, so no
+/// code but the tests that seed a store from before it may name them. The
+/// export is the one exception: it reads a store without migrating it, and
+/// one from before V32 still has them. A file's tests start at its first
+/// `#[cfg(test)]` module.
+#[test]
+fn no_production_code_names_the_retired_tables() {
+    const RETIRED: [&str; 4] = ["episodic_trajectory", "procedural_skill", "episodic_vectors", "procedural_vectors"];
+    const ALLOWED: [&str; 1] = ["clawg-core/src/memory/portability/export.rs"];
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
+    let mut files = Vec::new();
+    for krate in fs::read_dir(crates).expect("read crates/").flatten() {
+        rust_files(&krate.path().join("src"), &mut files);
+    }
+    assert!(!files.is_empty(), "no sources found under {}", crates.display());
+
+    let mut found = Vec::new();
+    for file in &files {
+        let shown = file.strip_prefix(crates).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        if ALLOWED.contains(&shown.as_str()) {
+            continue;
+        }
+        let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        found.extend(production_lines_naming(&source, &RETIRED).into_iter().map(|n| format!("{shown}:{n}")));
+    }
+    assert!(found.is_empty(), "these lines name a table V32 dropped:\n{}", found.join("\n"));
+}
+
+/// The lines, from 1, of the code before the first `#[cfg(test)]` module of
+/// `source` that name one of `names`.
+fn production_lines_naming(source: &str, names: &[&str]) -> Vec<usize> {
+    let lines: Vec<&str> = source.lines().collect();
+    let tests = lines
+        .windows(2)
+        .position(|pair| pair[0] == "#[cfg(test)]" && pair[1].starts_with("mod "))
+        .unwrap_or(lines.len());
+    lines[..tests]
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| names.iter().any(|t| line.contains(t)))
+        .map(|(n, _)| n + 1)
+        .collect()
+}
+
+/// A Windows checkout has CRLF line ends.
+#[test]
+fn the_production_code_ends_at_the_test_module_with_either_line_end() {
+    let source = "use x;\nconst A: &str = \"old_table\";\n\n#[cfg(test)]\nmod tests {\n    const B: &str = \"old_table\";\n}\n";
+    assert_eq!(production_lines_naming(source, &["old_table"]), [2]);
+    assert_eq!(production_lines_naming(&source.replace('\n', "\r\n"), &["old_table"]), [2]);
+}
+
 /// Lines of a manifest that turn on clawg-core's `testing` feature outside
 /// `[dev-dependencies]`. That feature lets a binary read `CLAWG_TEST_HOME`
 /// and `CLAWG_TEST_EMBEDDER`, so a release build must never get it.
