@@ -2661,7 +2661,7 @@ fn with_foreign(mut report: ImportReport, mut foreign: ForeignReport, notes: &[N
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::memory::admin::{delete_memory_core, restore_memory_core, MemoryKind};
+    use crate::memory::admin::{delete_memory_core, restore_memory_core};
     use crate::memory::db::seed_on_disk;
     use crate::memory::embedder::FakeEmbedder;
     use crate::memory::events::{MemoryEvent, MemorySource};
@@ -3106,7 +3106,7 @@ pub(crate) mod tests {
         assert_eq!(has_vector, 0);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH '27390'").await, 0);
 
-        restore_memory_core(&dst, &FakeEmbedder::default(), MemoryKind::Memory, id, None).await.unwrap();
+        restore_memory_core(&dst, &FakeEmbedder::default(), id, None).await.unwrap();
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH '27390'").await, 1, "indexed once");
     }
 
@@ -4474,7 +4474,7 @@ pub(crate) mod tests {
         let port = || foreign_note("engram:port", "Port", "the daemon listens on 27380");
         run_foreign(&dst, vec![port()], ImportOptions::default()).await;
         let id = imported(&dst, "engram:port").await[0].id;
-        delete_memory_core(&dst, id, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&dst, id, None).await.unwrap();
         let before = dump(&dst, EVERYTHING).await;
 
         let rewritten = ForeignNote { written: When::At(T0 + 1000), ..foreign_note("engram:port", "Port", "the daemon listens on 27390") };
@@ -4609,7 +4609,7 @@ pub(crate) mod tests {
         assert_eq!(vectors, 0);
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH '27390'").await, 0);
 
-        restore_memory_core(&dst, &FakeEmbedder::default(), MemoryKind::Memory, id, None).await.unwrap();
+        restore_memory_core(&dst, &FakeEmbedder::default(), id, None).await.unwrap();
         assert_eq!(count(&dst, "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH '27390'").await, 1, "indexed once");
     }
 
@@ -5018,7 +5018,7 @@ pub(crate) mod tests {
             decides_alike(&dst, notes_of(&dst, notes, plain()).await, case).await;
         }
         let id = imported(&dst, "engram:port").await[0].id;
-        delete_memory_core(&dst, id, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&dst, id, None).await.unwrap();
         decides_alike(&dst, notes_of(&dst, vec![port("the daemon listens on 27380", T0)], plain()).await, "deleted here").await;
 
         let dst = destination().await;

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::memory::admin::{get_memory_core, MemoryKind};
+use crate::memory::admin::get_memory_core;
 use crate::memory::error::MemoryError;
 use crate::memory::search::PiecePosition;
 use crate::memory::sharing::Reader;
@@ -32,7 +32,6 @@ pub(crate) struct SaveLink {
 /// The save a row belongs to, as much of it as the caller may read.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SaveText {
-    pub kind: MemoryKind,
     /// The row that was asked for, and its position (from 1) in the save.
     pub id: i64,
     pub piece: i64,
@@ -50,9 +49,8 @@ pub struct SaveText {
     /// The project the row asked for was saved in, `None` without one; sent
     /// as `null` rather than left out, as a search hit's is.
     pub project_id: Option<String>,
-    /// The type of the row asked for, which only `memory` rows have.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_type: Option<String>,
+    /// The type of the row asked for.
+    pub memory_type: String,
 }
 
 /// Shortest repeated text treated as the overlap between two neighbours;
@@ -101,19 +99,18 @@ fn overlap(a: &str, b: &str) -> Option<usize> {
 /// deletion time, all `None` when the row is gone from `memory`.
 type Position = (i64, Option<String>, Option<String>, Option<i64>);
 
-/// Reads the save row `id` of `kind` is a piece of, every position as far as
+/// Reads the save row `id` is a piece of, every position as far as
 /// `reader` reaches it. `None` when the row itself is missing, deleted or out
 /// of the reader's reach; a row with no link is a save of one piece.
 pub async fn read_save_core(
     store: &MemoryStore,
-    kind: MemoryKind,
     id: i64,
     reader: Option<&Reader>,
 ) -> Result<Option<SaveText>, MemoryError> {
     let visible = |author: Option<&str>, deleted_at: Option<i64>| {
         deleted_at.is_none() && reader.is_none_or(|r| r.admits(author))
     };
-    let Some(row) = get_memory_core(store, kind, id).await? else {
+    let Some(row) = get_memory_core(store, id).await? else {
         return Ok(None);
     };
     if !visible(row.agent_id.as_deref(), row.deleted_at) {
@@ -123,7 +120,6 @@ pub async fn read_save_core(
     let project_id = row.project_id.clone();
     let memory_type = row.memory_type.clone();
     let single = |text: String| SaveText {
-        kind,
         id,
         piece: 1,
         pieces: 1,
@@ -134,9 +130,6 @@ pub async fn read_save_core(
         project_id: project_id.clone(),
         memory_type: memory_type.clone(),
     };
-    if kind != MemoryKind::Memory {
-        return Ok(Some(single(row.summary)));
-    }
     let Some(link) = store.save_links(vec![id]).await?.remove(&id) else {
         return Ok(Some(single(row.summary)));
     };
@@ -180,7 +173,6 @@ pub async fn read_save_core(
         .collect::<Vec<_>>()
         .join("\n");
     Ok(Some(SaveText {
-        kind,
         id,
         piece: link.position.piece,
         pieces: link.position.pieces,
@@ -422,7 +414,7 @@ mod tests {
             .await
             .unwrap();
 
-        let save = read_save_core(&store, MemoryKind::Memory, ids[1], Some(&shared("agent-a"))).await.unwrap().unwrap();
+        let save = read_save_core(&store, ids[1], Some(&shared("agent-a"))).await.unwrap().unwrap();
 
         assert_eq!(save.id, ids[1]);
         assert_eq!(save.piece, 2);
@@ -433,17 +425,17 @@ mod tests {
             save.text,
             "Notes on clawg-ledger: the retry budget was set to three attempts\nthe fourth and last piece"
         );
-        let unscoped = read_save_core(&store, MemoryKind::Memory, ids[1], None).await.unwrap();
+        let unscoped = read_save_core(&store, ids[1], None).await.unwrap();
         assert_eq!(unscoped, Some(save));
 
-        let by_another = read_save_core(&store, MemoryKind::Memory, ids[1], Some(&shared("agent-b"))).await.unwrap();
+        let by_another = read_save_core(&store, ids[1], Some(&shared("agent-b"))).await.unwrap();
         assert_eq!(by_another, unscoped, "another agent reads the save whole");
         let hidden = Reader::new("agent-b", Reach::AllBut(vec!["agent-a".into()]));
-        assert_eq!(read_save_core(&store, MemoryKind::Memory, ids[1], Some(&hidden)).await.unwrap(), None);
-        assert_eq!(read_save_core(&store, MemoryKind::Memory, deleted, Some(&shared("agent-a"))).await.unwrap(), None);
-        assert_eq!(read_save_core(&store, MemoryKind::Memory, 9_999, None).await.unwrap(), None);
+        assert_eq!(read_save_core(&store, ids[1], Some(&hidden)).await.unwrap(), None);
+        assert_eq!(read_save_core(&store, deleted, Some(&shared("agent-a"))).await.unwrap(), None);
+        assert_eq!(read_save_core(&store, 9_999, None).await.unwrap(), None);
 
-        let one = read_save_core(&store, MemoryKind::Memory, alone, Some(&shared("agent-a"))).await.unwrap().unwrap();
+        let one = read_save_core(&store, alone, Some(&shared("agent-a"))).await.unwrap().unwrap();
         assert_eq!((one.piece, one.pieces, one.ids, one.missing), (1, 1, vec![Some(alone)], vec![]));
         assert_eq!(one.text, "a save of one piece");
     }
@@ -470,13 +462,13 @@ mod tests {
             .unwrap();
 
         let b = Reader::new("agent-b", Reach::AllBut(vec!["agent-c".into()]));
-        let save = read_save_core(&store, MemoryKind::Memory, first, Some(&b)).await.unwrap().unwrap();
+        let save = read_save_core(&store, first, Some(&b)).await.unwrap().unwrap();
         assert_eq!((save.ids, save.missing), (vec![Some(first), None], vec![2]));
         assert_eq!(save.text, "Notes on clawg-ledger: the retry budget");
-        assert_eq!(read_save_core(&store, MemoryKind::Memory, second, Some(&b)).await.unwrap(), None);
+        assert_eq!(read_save_core(&store, second, Some(&b)).await.unwrap(), None);
 
         let own = Reader::new("agent-b", Reach::Own);
-        let note = read_save_core(&store, MemoryKind::Memory, nobodys, Some(&own)).await.unwrap().unwrap();
+        let note = read_save_core(&store, nobodys, Some(&own)).await.unwrap().unwrap();
         assert_eq!(note.text, "a note no agent saved", "every reader reaches a row no agent saved");
     }
 
@@ -497,7 +489,7 @@ mod tests {
             .unwrap();
 
         let reader = shared("agent-a");
-        let of = |id| read_save_core(&store, MemoryKind::Memory, id, Some(&reader));
+        let of = |id| read_save_core(&store, id, Some(&reader));
         assert_eq!(of(second).await.unwrap().unwrap().topic_key.as_deref(), Some("cli/export-format"));
         assert_eq!(of(alone).await.unwrap().unwrap().topic_key.as_deref(), Some("cli/alone"));
         let plain = insert_row(&store, "agent-a", "no key here").await;
@@ -558,7 +550,7 @@ mod tests {
         let found: Vec<(i64, i64)> = hits.iter().map(|h| (h.id, h.piece.expect("a linked row").pieces)).collect();
         assert_eq!(found, vec![(old_ids[0], old_pieces.len() as i64), (new_ids[0], new_pieces.len() as i64)]);
         for (ids, text) in [(&old_ids, &old_text), (&new_ids, &new_text)] {
-            let save = read_save_core(&store, MemoryKind::Memory, ids[1], Some(&shared("agent-a"))).await.unwrap().unwrap();
+            let save = read_save_core(&store, ids[1], Some(&shared("agent-a"))).await.unwrap().unwrap();
             assert_eq!(&save.text, text, "the save reads back whole, its overlap once");
         }
     }
@@ -632,7 +624,7 @@ mod tests {
         let found: Vec<(i64, i64)> = hits.iter().map(|h| (h.id, h.piece.expect("a linked row").pieces)).collect();
         assert_eq!(found, vec![(old_ids[0], 12), (new_ids[0], 12)], "one hit per save");
         for (ids, text) in [(&old_ids, &old_text), (&new_ids, &new_text)] {
-            let save = read_save_core(&store, MemoryKind::Memory, ids[5], Some(&shared("agent-a"))).await.unwrap().unwrap();
+            let save = read_save_core(&store, ids[5], Some(&shared("agent-a"))).await.unwrap().unwrap();
             assert_eq!(&save.text, text, "the save reads back as it was saved");
         }
 
@@ -710,7 +702,7 @@ mod tests {
         assert!(hits.iter().any(|h| h.content == pieces[1]), "an unlinked piece is still found: {hits:?}");
         let piece_two = hits.iter().find(|h| h.content == pieces[1]).unwrap();
         assert_eq!(piece_two.piece, None);
-        let save = read_save_core(&store, MemoryKind::Memory, piece_two.id, Some(&shared("agent-seed"))).await.unwrap().unwrap();
+        let save = read_save_core(&store, piece_two.id, Some(&shared("agent-seed"))).await.unwrap().unwrap();
         assert_eq!((save.pieces, save.text.as_str()), (1, pieces[1]), "an unlinked row reads as a save of one piece");
 
         let texts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

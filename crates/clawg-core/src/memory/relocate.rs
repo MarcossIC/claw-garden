@@ -980,7 +980,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::memory::admin::{delete_memory_core, restore_memory_core, MemoryKind};
+    use crate::memory::admin::{delete_memory_core, restore_memory_core};
     use crate::memory::embedder::{EmbedRole, Embedder, FakeEmbedder};
     use crate::memory::events::{MemoryEvent, MemorySource};
     use crate::memory::search::{search_all_memories, SearchScope};
@@ -1346,7 +1346,7 @@ mod tests {
         let report = move_to(&store, &ids(&[old]), Some(B)).await;
 
         assert_eq!(moved_ids(&report), vec![old, head]);
-        let deleted = delete_memory_core(&store, head, MemoryKind::Memory, None).await.unwrap();
+        let deleted = delete_memory_core(&store, head, None).await.unwrap();
         assert_eq!(deleted.revived.iter().map(|r| r.id).collect::<Vec<_>>(), vec![old]);
         assert_eq!(place(&store, old).await.0.as_deref(), Some(B));
     }
@@ -1485,12 +1485,12 @@ mod tests {
         let store = store().await;
         let pieces = save(&store, fact(&long_text("restore"), Some(A))).await;
         let gone = pieces[1];
-        delete_memory_core(&store, gone, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, gone, None).await.unwrap();
 
         let report = move_to(&store, &ids(&[pieces[0]]), Some(B)).await;
 
         assert!(moved_ids(&report).contains(&gone));
-        let restored = restore_memory_core(&store, &FakeEmbedder::default(), MemoryKind::Memory, gone, None).await.unwrap();
+        let restored = restore_memory_core(&store, &FakeEmbedder::default(), gone, None).await.unwrap();
         assert_eq!(restored.status, "active");
         assert_eq!(place(&store, gone).await.0.as_deref(), Some(B));
     }
@@ -1499,7 +1499,7 @@ mod tests {
     async fn a_deleted_row_is_selected_only_when_asked() {
         let store = store().await;
         let id = save_one(&store, fact("a deleted note", None)).await;
-        delete_memory_core(&store, id, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, id, None).await.unwrap();
 
         assert!(move_to(&store, &ids(&[id]), Some(B)).await.moved.is_empty());
         let report = move_to(&store, &MoveFilter { include_deleted: true, ..ids(&[id]) }, Some(B)).await;
@@ -1966,7 +1966,7 @@ mod tests {
         assert_eq!(report.superseded, vec![Supersede { row: ours, by: theirs }]);
         let after = states(&store).await;
         assert!(after.contains(&(ours, Some(B.into()), "superseded".into(), Some(theirs), Some("revision".into()))), "{after:?}");
-        let deleted = delete_memory_core(&store, theirs, MemoryKind::Memory, None).await.unwrap();
+        let deleted = delete_memory_core(&store, theirs, None).await.unwrap();
         assert_eq!(deleted.revived.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ours], "the older version comes back");
     }
 
@@ -2026,7 +2026,7 @@ mod tests {
         save_one(&store, at(fact("the daemon listens on clawg.sock", Some(A)), 5)).await;
         save_one(&store, at(fact("the daemon listens on clawg.sock", Some(B)), 9)).await;
         let deleted = save_one(&store, at(fact("an old note", Some(A)), 3)).await;
-        delete_memory_core(&store, deleted, MemoryKind::Memory, None).await.unwrap();
+        delete_memory_core(&store, deleted, None).await.unwrap();
         let before = (states(&store).await, everything_else(&store).await);
 
         let report = merge(&store, A, B).await;

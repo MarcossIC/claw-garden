@@ -234,7 +234,7 @@ pub fn render_detail(row: &MemoryRow, now_ms: i64) -> String {
         (Some(kind), _) => kind.clone(),
         (None, _) => "-".to_string(),
     };
-    let mut grid: Vec<(&str, String)> = vec![
+    let grid: Vec<(&str, String)> = vec![
         ("type", or_dash(&row.memory_type)),
         ("tier", row.tier.to_string()),
         ("importance", format!("{:.1}", row.importance)),
@@ -254,14 +254,6 @@ pub fn render_detail(row: &MemoryRow, now_ms: i64) -> String {
         ("superseded by", or_dash_num(row.superseded_by)),
         ("deleted", stamp(row.deleted_at, now_ms)),
     ];
-    // Only procedural rows have these; showing a dash for the others would be
-    // noise on every memory.
-    if let Some(trigger) = &row.trigger {
-        grid.push(("trigger", trigger.clone()));
-    }
-    if let Some(n) = row.success_count {
-        grid.push(("successes", n.to_string()));
-    }
 
     let label_width = grid.iter().map(|(l, _)| l.len()).max().unwrap_or(0) + 2;
     for (label, value) in grid {
@@ -274,22 +266,11 @@ pub fn render_detail(row: &MemoryRow, now_ms: i64) -> String {
 /// Totals first, then each grouping on one line as `key count | key count`.
 pub fn render_stats(lang: Lang, stats: &MemoryStats, now_ms: i64) -> String {
     let t = &stats.totals;
-    let live = t.memory + t.episodic + t.procedural;
     let mut out = match lang {
-        Lang::En => format!(
-            "{} (memory {}, episodic {}, procedural {}), {} deleted.",
-            plural(live, "live row", "live rows"),
-            t.memory,
-            t.episodic,
-            t.procedural,
-            t.deleted
-        ),
+        Lang::En => format!("{}, {} deleted.", plural(t.memory, "live row", "live rows"), t.deleted),
         Lang::Es => format!(
-            "{} (memory {}, episodic {}, procedural {}), {} {}.",
-            plural(live, "fila viva", "filas vivas"),
-            t.memory,
-            t.episodic,
-            t.procedural,
+            "{}, {} {}.",
+            plural(t.memory, "fila viva", "filas vivas"),
             t.deleted,
             if t.deleted == 1 { "borrada" } else { "borradas" }
         ),
@@ -852,12 +833,7 @@ mod tests {
 
     fn sample_stats() -> MemoryStats {
         MemoryStats {
-            totals: StatsTotals {
-                memory: 40,
-                episodic: 2,
-                procedural: 1,
-                deleted: 3,
-            },
+            totals: StatsTotals { memory: 40, deleted: 3 },
             by_type: vec![
                 count(Some("semantic_fact"), 30),
                 count(Some("preference"), 10),
@@ -886,7 +862,7 @@ mod tests {
         );
         let stats = render_stats(Lang::Es, &sample_stats(), NOW);
         assert!(
-            stats.starts_with("43 filas vivas (memory 40, episodic 2, procedural 1), 3 borradas. La más nueva, de hace 12s.\n"),
+            stats.starts_with("40 filas vivas, 3 borradas. La más nueva, de hace 12s.\n"),
             "{stats}"
         );
         assert!(stats.contains("\npor proyecto: claw-garden-1a2b 25 | (ninguno) 15"), "{stats}");
@@ -909,7 +885,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[0],
-            "43 live rows (memory 40, episodic 2, procedural 1), 3 deleted. Newest 12s ago."
+            "40 live rows, 3 deleted. Newest 12s ago."
         );
         let section = |label: &str| -> &str {
             lines
@@ -935,7 +911,7 @@ mod tests {
     fn stats_of_an_empty_store_says_so() {
         let out = render_stats(Lang::En, &MemoryStats::default(), NOW);
         assert!(
-            out.starts_with("0 live rows (memory 0, episodic 0, procedural 0), 0 deleted."),
+            out.starts_with("0 live rows, 0 deleted."),
             "{out}"
         );
         assert!(!out.contains("Newest"), "{out}");
@@ -1214,7 +1190,7 @@ mod tests {
         let (c, _d) = live_client().await;
         let action = MemoriesAction::Show(ShowOpts {
             id: 12345,
-            kind: KindArg::Episodic,
+            kind: KindArg::Memory,
             json: false,
             profile: ProfileArg { profile: None },
         });
@@ -1239,7 +1215,7 @@ mod tests {
         };
         let out = run(Lang::En, &c, action(false), NOW).await.expect("run");
         assert!(
-            out.starts_with("1 live row (memory 1, episodic 0, procedural 0), 0 deleted."),
+            out.starts_with("1 live row, 0 deleted."),
             "{out}"
         );
         assert!(out.contains("agent-s 1"), "{out}");

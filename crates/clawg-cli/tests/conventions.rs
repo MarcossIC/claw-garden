@@ -83,6 +83,39 @@ fn no_source_allows_dead_code() {
     assert!(found.is_empty(), "delete the unused code instead of allowing it:\n{}", found.join("\n"));
 }
 
+/// V32 moved the rows of these tables into `memory` and dropped them, so no
+/// code but the tests that seed a store from before it may name them. The
+/// export is the one exception: it reads a store without migrating it, and
+/// one from before V32 still has them. A file's tests start at its first
+/// `#[cfg(test)]` module.
+#[test]
+fn no_production_code_names_the_retired_tables() {
+    const RETIRED: [&str; 4] = ["episodic_trajectory", "procedural_skill", "episodic_vectors", "procedural_vectors"];
+    const ALLOWED: [&str; 1] = ["clawg-core/src/memory/portability/export.rs"];
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
+    let mut files = Vec::new();
+    for krate in fs::read_dir(crates).expect("read crates/").flatten() {
+        rust_files(&krate.path().join("src"), &mut files);
+    }
+    assert!(!files.is_empty(), "no sources found under {}", crates.display());
+
+    let mut found = Vec::new();
+    for file in &files {
+        let shown = file.strip_prefix(crates).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        if ALLOWED.contains(&shown.as_str()) {
+            continue;
+        }
+        let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let production = source.split("\n#[cfg(test)]\nmod ").next().unwrap_or_default();
+        for (n, line) in production.lines().enumerate() {
+            if RETIRED.iter().any(|t| line.contains(t)) {
+                found.push(format!("{shown}:{}", n + 1));
+            }
+        }
+    }
+    assert!(found.is_empty(), "these lines name a table V32 dropped:\n{}", found.join("\n"));
+}
+
 /// Lines of a manifest that turn on clawg-core's `testing` feature outside
 /// `[dev-dependencies]`. That feature lets a binary read `CLAWG_TEST_HOME`
 /// and `CLAWG_TEST_EMBEDDER`, so a release build must never get it.

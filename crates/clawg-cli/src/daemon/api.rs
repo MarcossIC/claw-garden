@@ -28,7 +28,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use clawg_core::memory::admin::{
     Deleted, delete_memory_core, get_memory_core, list_memories_core, memory_stats_core, query_has_tokens,
-    update_memory_core, ListParams, MemoryAdminRow, MemoryKind, MemoryPatch, MemoryStats, StatsParams,
+    update_memory_core, ListParams, MemoryAdminRow, MemoryPatch, StatsParams,
     UpdateError, UpdatedRow, restore_memory_core, RestoreError, RestoredRow,
 };
 use clawg_core::memory::backup::Reason;
@@ -66,7 +66,8 @@ use clawg_core::memory::prompt_builder::{
 use clawg_core::memory::sharing::{self, Reach, Reader};
 use clawg_core::memory::topic::validate_topic_key;
 use clawg_core::memory::synthesis::{
-    conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, Synthesis, SynthesisParams,
+    conclusions_to_review_count, existing_memory_ids, replaced_memory_ids, synthesis_core, unreviewed_count, ConclusionReview, LostSource,
+    Synthesis, SynthesisParams,
 };
 use clawg_core::memory::{read_save_core, search_all_memories, RankedHit, SaveText, SearchScope};
 use clawg_core::metrics::{EventKind, Recorder, Unit};
@@ -206,25 +207,30 @@ type ApiResult<T> = Result<T, ApiError>;
 
 // ── Pure helpers ────────────────────────────────────────────────────────────
 
-/// Parses the wire spelling of a memory kind.
+/// The kinds whose tables V32 dropped. A bridge of a version that still had
+/// them, or a script, can name them.
+const RETIRED_KINDS: [&str; 2] = ["episodic", "procedural"];
+
+/// Checks the wire spelling of a kind: `memory` is the only one.
 ///
-/// A free function rather than `serde` on the path segment so the 400 can name
-/// the accepted values; a deserializer failure would surface as axum's generic
-/// "invalid path" text.
-pub fn parse_kind(raw: &str) -> Option<MemoryKind> {
+/// A free function rather than `serde` on the path segment so the 400 can say
+/// what is wrong; a deserializer failure would surface as axum's generic
+/// "invalid path" text. A retired kind is told where its rows went, not that
+/// the row is missing.
+pub fn parse_kind(raw: &str) -> ApiResult<()> {
     match raw {
-        "memory" => Some(MemoryKind::Memory),
-        "episodic" => Some(MemoryKind::Episodic),
-        "procedural" => Some(MemoryKind::Procedural),
-        _ => None,
+        "memory" => Ok(()),
+        retired if RETIRED_KINDS.contains(&retired) => Err(ApiError::bad_request(retired_kind(retired))),
+        other => Err(ApiError::bad_request(format!("unknown kind {other:?}: the only kind is \"memory\""))),
     }
 }
 
-/// The 400 body for a kind that is not one of the three.
-fn unknown_kind(raw: &str) -> ApiError {
-    ApiError::bad_request(format!(
-        "unknown kind {raw:?}: accepted values are \"memory\", \"episodic\" and \"procedural\""
-    ))
+/// Where the rows of a retired kind went.
+fn retired_kind(kind: &str) -> String {
+    format!(
+        "kind {kind:?} no longer exists: episodic and procedural rows are memory rows now, of type semantic_fact, \
+         each with a new id; find them with search_memory (POST /v1/search)"
+    )
 }
 
 /// The lifecycle states a memory row can be filtered by.
@@ -236,10 +242,9 @@ const STATUSES: [&str; 3] = ["active", "disputed", "superseded"];
 /// naming what was wrong: a viewer that quietly answered an unfiltered list to
 /// a bad filter would present it as the result of that filter.
 pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
-    let mut kind = match q.kind.as_deref() {
-        None => None,
-        Some(raw) => Some(parse_kind(raw).ok_or_else(|| unknown_kind(raw))?),
-    };
+    if let Some(raw) = q.kind.as_deref() {
+        parse_kind(raw)?;
+    }
 
     if let Some(status) = q.status.as_deref() {
         if !STATUSES.contains(&status) {
@@ -257,22 +262,11 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
     }
 
     if let Some(text) = q.q.as_deref() {
-        // Only `memory` has a text index; another kind would silently ignore
-        // the query and list every row.
-        if kind.is_some_and(|k| k != MemoryKind::Memory) {
-            return Err(ApiError::bad_request(
-                "q only applies to kind \"memory\": the other kinds have no text index",
-            ));
-        }
         if !query_has_tokens(text) {
             return Err(ApiError::bad_request(
                 "q must contain at least one letter or digit to search for",
             ));
         }
-        // A text search names no kind when the caller means "any that can be
-        // searched". Left unset, the merge of all three tables would list every
-        // episodic and procedural row next to the matches.
-        kind.get_or_insert(MemoryKind::Memory);
     }
 
     let no_project = q.no_project.unwrap_or(false);
@@ -281,7 +275,6 @@ pub fn list_params_from_query(q: ListQuery) -> ApiResult<ListParams> {
     }
 
     Ok(ListParams {
-        kind,
         tier: q.tier,
         memory_type: q.memory_type,
         agent_id: q.agent,
@@ -724,9 +717,29 @@ impl From<SavedChunk> for SavedMemory {
     }
 }
 
+/// A row of `memory`, or a hit, as an answer carries it: with `kind`, which a
+/// bridge of a version before V32, that still read trajectories and skills,
+/// requires on every row (`memory`) and hit (`Memory`).
+#[derive(Debug, Serialize)]
+pub struct Kinded<T> {
+    pub kind: &'static str,
+    #[serde(flatten)]
+    pub row: T,
+}
+
+impl<T> Kinded<T> {
+    fn row(row: T) -> Self {
+        Self { kind: "memory", row }
+    }
+
+    fn hit(row: T) -> Self {
+        Self { kind: "Memory", row }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SearchBody {
-    pub hits: Vec<RankedHit>,
+    pub hits: Vec<Kinded<RankedHit>>,
     /// Hits the relevance cut kept back, so a caller handed none can tell
     /// "nothing came close" from "nothing is stored".
     pub withheld: usize,
@@ -842,19 +855,50 @@ pub struct SynthesisRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ListBody {
-    pub items: Vec<MemoryAdminRow>,
+    pub items: Vec<Kinded<MemoryAdminRow>>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ItemBody {
-    pub item: MemoryAdminRow,
+    pub item: Kinded<MemoryAdminRow>,
+}
+
+/// [`Synthesis`] with its rows [`Kinded`].
+#[derive(Debug, Serialize)]
+pub struct SynthesisBody {
+    pub pending: Vec<Kinded<MemoryAdminRow>>,
+    pub pending_total: usize,
+    pub conclusions: Vec<Kinded<MemoryAdminRow>>,
+    pub to_review: Vec<ReviewBody>,
+    pub to_review_total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReviewBody {
+    pub conclusion: Kinded<MemoryAdminRow>,
+    pub live: usize,
+    pub lost: Vec<LostSource>,
+}
+
+impl From<Synthesis> for SynthesisBody {
+    fn from(s: Synthesis) -> Self {
+        let rows = |rows: Vec<MemoryAdminRow>| rows.into_iter().map(Kinded::row).collect();
+        let review = |r: ConclusionReview| ReviewBody { conclusion: Kinded::row(r.conclusion), live: r.live, lost: r.lost };
+        Self {
+            pending: rows(s.pending),
+            pending_total: s.pending_total,
+            conclusions: rows(s.conclusions),
+            to_review: s.to_review.into_iter().map(review).collect(),
+            to_review_total: s.to_review_total,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct UpdatedBody {
     pub updated: usize,
     #[serde(flatten)]
-    pub row: UpdatedRow,
+    pub row: Kinded<UpdatedRow>,
 }
 
 /// What a delete did: deleting the current version of a topic brings back
@@ -1537,7 +1581,7 @@ async fn search(
         Some(lang) => other_language(&app, lang, projects.as_deref(), &caller).await,
         None => None,
     };
-    Ok(Json(SearchBody { hits, withheld, other_language }))
+    Ok(Json(SearchBody { hits: hits.into_iter().map(Kinded::hit).collect(), withheld, other_language }))
 }
 
 /// The live projects a search reads: each of `project_ids` once, whatever
@@ -1714,13 +1758,13 @@ async fn register_session(
 async fn synthesis(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SynthesisRequest>,
-) -> ApiResult<Json<Synthesis>> {
+) -> ApiResult<Json<SynthesisBody>> {
     let reader = named_reader(&app, body.agent_id.as_deref());
     let project_id = live_project(&app, body.project_id).await?;
     let params = SynthesisParams { reader, project_id, limit: body.limit };
     synthesis_core(&app.runtime.store, params, TimestampMs::now())
         .await
-        .map(Json)
+        .map(|s| Json(s.into()))
         .map_err(ApiError::internal)
 }
 
@@ -1735,7 +1779,7 @@ async fn list_memories(
         .await
         .map_err(ApiError::internal)?;
 
-    Ok(Json(ListBody { items }))
+    Ok(Json(ListBody { items: items.into_iter().map(Kinded::row).collect() }))
 }
 
 /// Counts what is stored, optionally narrowed to an agent and/or project.
@@ -1761,10 +1805,12 @@ async fn metrics(State(app): State<Arc<AppCtx>>, Query(q): Query<MetricsQuery>) 
     }
 }
 
+/// The stats of the store. A bridge of a version before V32 requires the
+/// counts of trajectories and skills, so they are sent as 0.
 async fn stats(
     State(app): State<Arc<AppCtx>>,
     Query(q): Query<StatsQuery>,
-) -> ApiResult<Json<MemoryStats>> {
+) -> ApiResult<Json<serde_json::Value>> {
     let project_id = live_project(&app, q.project).await?;
     let stats = memory_stats_core(
         &app.runtime.store,
@@ -1772,7 +1818,12 @@ async fn stats(
     )
     .await
     .map_err(ApiError::internal)?;
-    Ok(Json(stats))
+    let mut body = serde_json::to_value(stats).map_err(ApiError::internal)?;
+    if let Some(totals) = body.get_mut("totals").and_then(serde_json::Value::as_object_mut) {
+        totals.insert("episodic".into(), 0.into());
+        totals.insert("procedural".into(), 0.into());
+    }
+    Ok(Json(body))
 }
 
 /// One row with every column the viewer shows, soft-deleted rows included
@@ -1781,12 +1832,12 @@ async fn get_memory(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
 ) -> ApiResult<Json<ItemBody>> {
-    let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    let item = get_memory_core(&app.runtime.store, kind, id)
+    parse_kind(&kind)?;
+    let item = get_memory_core(&app.runtime.store, id)
         .await
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
-    Ok(Json(ItemBody { item }))
+        .ok_or_else(|| ApiError::not_found(format!("no memory row with id {id}")))?;
+    Ok(Json(ItemBody { item: Kinded::row(item) }))
 }
 
 /// The save the row is a piece of, as far as the reader reaches it: a row
@@ -1795,14 +1846,14 @@ async fn get_save(
     State(app): State<Arc<AppCtx>>,
     Path((kind, id)): Path<(String, i64)>,
     Query(q): Query<ReaderQuery>,
-) -> ApiResult<Json<SaveText>> {
-    let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
+) -> ApiResult<Json<Kinded<SaveText>>> {
+    parse_kind(&kind)?;
     let reader = named_reader(&app, q.agent.as_deref());
-    let save = read_save_core(&app.runtime.store, kind, id, reader.as_ref())
+    let save = read_save_core(&app.runtime.store, id, reader.as_ref())
         .await
         .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
-    Ok(Json(save))
+        .ok_or_else(|| ApiError::not_found(format!("no memory row with id {id}")))?;
+    Ok(Json(Kinded::row(save)))
 }
 
 async fn update_memory(
@@ -1811,27 +1862,27 @@ async fn update_memory(
     Query(q): Query<ReaderQuery>,
     Json(body): Json<UpdateRequest>,
 ) -> ApiResult<Json<UpdatedBody>> {
-    let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
+    parse_kind(&kind)?;
     let destination = match body.destination()? {
         Some(Some(target)) => Some(Some(target_named(&app, target).await?)),
         other => other,
     };
-    let patch = MemoryPatch::new(kind, body.importance, body.memory_type.as_deref(), destination)
+    let patch = MemoryPatch::new(body.importance, body.memory_type.as_deref(), destination)
         .map_err(|e| ApiError::bad_request(e.to_string()))?
         .answered(body.user_answered);
     // The core answers `None` for "no such row", "already soft-deleted" and
     // "out of reach" alike, and from the caller's side those are the same
     // fact: the row it named is not there to change.
     let reader = named_reader(&app, q.agent.as_deref());
-    let row = update_memory_core(&app.runtime.store, id, kind, &patch, reader.as_ref())
+    let row = update_memory_core(&app.runtime.store, id, &patch, reader.as_ref())
         .await
         .map_err(|e| match e {
             UpdateError::NeedsUser { .. } | UpdateError::MoveNeedsUser { .. } => ApiError::conflict(e.to_string()),
             UpdateError::Move(e) => move_error(e),
             UpdateError::Store(e) => ApiError::internal(e),
         })?
-        .ok_or_else(|| ApiError::not_found(format!("no {kind:?} row with id {id}")))?;
-    Ok(Json(UpdatedBody { updated: 1, row }))
+        .ok_or_else(|| ApiError::not_found(format!("no memory row with id {id}")))?;
+    Ok(Json(UpdatedBody { updated: 1, row: Kinded::row(row) }))
 }
 
 /// The project a target names: the id as given, else the one live project
@@ -1889,14 +1940,14 @@ async fn delete_memory(
     Path((kind, id)): Path<(String, i64)>,
     Query(q): Query<ReaderQuery>,
 ) -> ApiResult<Json<DeletedBody>> {
-    let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
+    parse_kind(&kind)?;
     let reader = named_reader(&app, q.agent.as_deref());
-    let deleted = delete_memory_core(&app.runtime.store, id, kind, reader.as_ref())
+    let deleted = delete_memory_core(&app.runtime.store, id, reader.as_ref())
         .await
         .map_err(ApiError::internal)?;
 
     if deleted.deleted == 0 {
-        return Err(ApiError::not_found(format!("no {kind:?} row with id {id}")));
+        return Err(ApiError::not_found(format!("no memory row with id {id}")));
     }
     Ok(Json(deleted.into()))
 }
@@ -1909,16 +1960,12 @@ async fn restore_memory(
     Path((kind, id)): Path<(String, i64)>,
     Query(q): Query<ReaderQuery>,
 ) -> ApiResult<Json<RestoredBody>> {
-    let kind = parse_kind(&kind).ok_or_else(|| unknown_kind(&kind))?;
-    if kind != MemoryKind::Memory {
-        return Err(ApiError::bad_request(RestoreError::OnlyMemory(kind).to_string()));
-    }
+    parse_kind(&kind)?;
     let embedder = ready_embedder(&app)?;
     let reader = named_reader(&app, q.agent.as_deref());
-    match restore_memory_core(&app.runtime.store, embedder.as_ref(), kind, id, reader.as_ref()).await {
+    match restore_memory_core(&app.runtime.store, embedder.as_ref(), id, reader.as_ref()).await {
         Ok(row) => Ok(Json(row.into())),
-        Err(e @ RestoreError::OnlyMemory(_)) => Err(ApiError::bad_request(e.to_string())),
-        Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted {kind:?} row with id {id}"))),
+        Err(RestoreError::NotFound(_)) => Err(ApiError::not_found(format!("no deleted memory row with id {id}"))),
         Err(e @ (RestoreError::LiveTwin { .. } | RestoreError::TopicTaken { .. } | RestoreError::HoldsSecret { .. })) => {
             Err(ApiError::conflict(e.to_string()))
         }
@@ -2825,7 +2872,17 @@ pub struct AnsweredBody {
     pub answer: SuggestionAnswer,
     /// The merge of `other_id` into `project_id`, which `--undo` takes back.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub merge: Option<MergeReport>,
+    pub merge: Option<AnsweredMerge>,
+}
+
+/// A [`MergeReport`] with `trajectories` and `skills`, always 0, which a
+/// bridge of a version before V32 requires in the merge an answer made.
+#[derive(Debug, Serialize)]
+pub struct AnsweredMerge {
+    #[serde(flatten)]
+    pub report: MergeReport,
+    pub trajectories: usize,
+    pub skills: usize,
 }
 
 /// The status of a refused check of two projects, as `keep-apart` answers it.
@@ -2874,7 +2931,7 @@ async fn answer_suggestion(
         SuggestionAnswer::Merge => {
             let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
             let merged = merge_core(store, &app.runtime.workspaces(), &backups, &body.other_id, &body.project_id, false).await;
-            Some(merged.map_err(merge_error)?)
+            Some(AnsweredMerge { report: merged.map_err(merge_error)?, trajectories: 0, skills: 0 })
         }
     };
     Ok(Json(AnsweredBody { project_id: body.project_id, other_id: body.other_id, answer, merge }))
@@ -3997,17 +4054,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_kind_accepts_the_three_wire_spellings() {
-        assert_eq!(parse_kind("memory"), Some(MemoryKind::Memory));
-        assert_eq!(parse_kind("episodic"), Some(MemoryKind::Episodic));
-        assert_eq!(parse_kind("procedural"), Some(MemoryKind::Procedural));
+    fn parse_kind_takes_memory_alone() {
+        assert!(parse_kind("memory").is_ok());
+        for other in ["Memory", "", "semantic"] {
+            let err = parse_kind(other).expect_err(other);
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{other:?}");
+            assert!(err.message.contains("the only kind is \"memory\""), "{other:?}: {}", err.message);
+        }
     }
 
+    /// Answering a retired kind as a missing row would read as the row being
+    /// gone, while it is in `memory` under another id.
     #[test]
-    fn parse_kind_rejects_anything_else() {
-        assert_eq!(parse_kind("Memory"), None, "the wire spelling is lowercase");
-        assert_eq!(parse_kind(""), None);
-        assert_eq!(parse_kind("semantic"), None);
+    fn a_retired_kind_says_where_its_rows_went() {
+        for kind in ["episodic", "procedural"] {
+            let err = parse_kind(kind).expect_err(kind);
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            for said in [format!("{kind:?}"), "semantic_fact".to_string(), "new id".to_string(), "search_memory".to_string()] {
+                assert!(err.message.contains(&said), "{said} in {}", err.message);
+            }
+        }
     }
 
     #[test]
@@ -4070,7 +4136,6 @@ mod tests {
         }))
         .expect("valid");
 
-        assert_eq!(params.kind, Some(MemoryKind::Memory));
         assert_eq!(params.tier, Some(2));
         assert_eq!(params.memory_type.as_deref(), Some("semantic_fact"));
         assert_eq!(params.agent_id.as_deref(), Some("a1"));
@@ -4113,15 +4178,11 @@ mod tests {
     }
 
     #[test]
-    fn a_text_query_with_a_non_memory_kind_is_rejected() {
+    fn a_listing_of_a_retired_kind_is_refused() {
         for kind in ["episodic", "procedural"] {
-            let err = list_params_from_query(query(|q| {
-                q.kind = Some(kind.into());
-                q.q = Some("deploy".into());
-            }))
-            .expect_err("only memory has a text index");
+            let err = list_params_from_query(query(|q| q.kind = Some(kind.into()))).expect_err(kind);
             assert_eq!(err.status, StatusCode::BAD_REQUEST);
-            assert!(err.message.contains("memory"), "{}", err.message);
+            assert!(err.message.contains("semantic_fact"), "{}", err.message);
         }
     }
 
@@ -4133,16 +4194,6 @@ mod tests {
             q.q = Some("deploy".into());
         }))
         .is_ok());
-    }
-
-    /// Without this, the unfiltered merge of the three tables would hand back
-    /// every episodic and procedural row beside the matches, since neither has
-    /// a text index to narrow it.
-    #[test]
-    fn a_text_query_without_a_kind_is_restricted_to_memory() {
-        let params = list_params_from_query(query(|q| q.q = Some("deploy".into())))
-            .expect("valid");
-        assert_eq!(params.kind, Some(MemoryKind::Memory));
     }
 
     #[test]
@@ -4198,12 +4249,6 @@ mod tests {
     }
 
     #[test]
-    fn a_listing_without_a_text_query_keeps_every_table() {
-        let params = list_params_from_query(query(|_| {})).expect("valid");
-        assert_eq!(params.kind, None);
-    }
-
-    #[test]
     fn a_text_query_without_any_word_is_rejected() {
         for text in ["", "   ", "-^()\"* :"] {
             let err = list_params_from_query(query(|q| q.q = Some(text.into())))
@@ -4213,11 +4258,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_kind_names_the_value_and_the_accepted_set() {
-        let msg = unknown_kind("bogus").message;
+    fn an_unknown_kind_names_the_value_and_the_only_kind() {
+        let msg = parse_kind("bogus").unwrap_err().message;
         assert!(msg.contains("bogus"), "{msg}");
-        assert!(msg.contains("memory"), "{msg}");
-        assert!(msg.contains("episodic"), "{msg}");
-        assert!(msg.contains("procedural"), "{msg}");
+        assert!(msg.contains("\"memory\""), "{msg}");
     }
 }

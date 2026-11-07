@@ -283,22 +283,14 @@ fn remove_in(tx: &rusqlite::Connection, id: i64, held: &OutboxMatch) -> rusqlite
     Ok((pieces, outbox))
 }
 
-/// A row of a delete that is live again, and so stays.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveRow {
-    /// `memory`, `episodic_trajectory` or `procedural_skill`.
-    pub table: String,
-    pub id: i64,
-}
-
 /// What [`purge_delete`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PurgedDelete {
     pub project_id: String,
-    /// The rows removed for good, by table.
+    /// The rows removed for good.
     pub removed: Counts,
     /// The rows of the delete that are live again, which stay.
-    pub live: Vec<LiveRow>,
+    pub live: Vec<i64>,
     /// The outbox rows removed with the texts of the rows.
     pub outbox: Vec<OutboxRemoved>,
     /// Snapshots in `<data>/backups` that still hold a row of the delete, by
@@ -313,8 +305,7 @@ pub struct PurgedDelete {
 }
 
 /// Removes for good every row of delete `delete_id` that is still deleted,
-/// wherever it is now, in the three tables: the row, its vector and, for a
-/// row of `memory`, what [`purge`] removes of a deleted row. The docs index
+/// wherever it is now: what [`purge`] removes of a deleted row. The docs index
 /// under the folders the delete turned off is emptied again, since a refresh
 /// in flight may have written after it, and the delete is marked purged. The
 /// project stays as it is.
@@ -349,7 +340,7 @@ pub fn purge_delete(base_dir: &Path, delete_id: i64) -> Result<PurgedDelete, Mem
     }
     let tx = c.transaction()?;
     let journaled: Vec<(String, i64)> = {
-        let mut stmt = tx.prepare("SELECT tbl, row_id FROM project_delete_row WHERE delete_id = ?1 ORDER BY tbl, row_id")?;
+        let mut stmt = tx.prepare("SELECT tbl, row_id FROM project_delete_row WHERE delete_id = ?1 ORDER BY row_id")?;
         let rows = stmt.query_map([delete_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
@@ -357,40 +348,24 @@ pub fn purge_delete(base_dir: &Path, delete_id: i64) -> Result<PurgedDelete, Mem
     let mut live = Vec::new();
     let mut gone: Vec<Gone> = Vec::new();
     for (table, id) in journaled {
-        let vectors = match table.as_str() {
-            "memory" => "memory_vectors",
-            "episodic_trajectory" => "episodic_vectors",
-            "procedural_skill" => "procedural_vectors",
-            other => {
-                log::warn!("delete {delete_id} journaled a row of {other}, which no purge knows");
-                continue;
-            }
-        };
-        let state: Option<bool> =
-            tx.query_row(&format!("SELECT deleted_at IS NULL FROM {table} WHERE id = ?1"), [id], |r| r.get(0)).optional()?;
-        match state {
-            None => continue,
-            Some(true) => {
-                live.push(LiveRow { table, id });
-                continue;
-            }
-            Some(false) => {}
+        if table != "memory" {
+            log::warn!("delete {delete_id} journaled a row of {table}, which no purge knows");
+            continue;
         }
-        if table == "memory" {
-            let (content, agent, piece): (String, Option<String>, bool) = tx.query_row(
-                "SELECT content, agent_id, EXISTS (SELECT 1 FROM memory_piece WHERE memory_id = ?1) FROM memory WHERE id = ?1",
+        let state: Option<(bool, String, Option<String>, bool)> = tx
+            .query_row(
+                "SELECT deleted_at IS NULL, content, agent_id, EXISTS (SELECT 1 FROM memory_piece WHERE memory_id = ?1) \
+                 FROM memory WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            gone.push(Gone { id, content, agent, piece });
-            removed.memories += 1;
-        } else {
-            tx.execute(&format!("DELETE FROM {vectors} WHERE rowid = ?1"), [id])?;
-            tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [id])?;
-            if table == "episodic_trajectory" {
-                removed.trajectories += 1;
-            } else {
-                removed.skills += 1;
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        match state {
+            None => {}
+            Some((true, ..)) => live.push(id),
+            Some((false, content, agent, piece)) => {
+                gone.push(Gone { id, content, agent, piece });
+                removed.memories += 1;
             }
         }
     }
@@ -1241,7 +1216,7 @@ mod tests {
     const WEB: &str = "web-bbbb";
 
     /// A project with a secret row, another live row, a row deleted before,
-    /// a trajectory, a docs index and a pending save, deleted with its
+    /// a docs index and a pending save, deleted with its
     /// memories; and another project that links to it. The store is closed.
     struct DeletedProject {
         dir: crate::test_dir::TestDir,
@@ -1295,10 +1270,7 @@ mod tests {
             .conn
             .call(move |c| {
                 c.execute_batch(&format!(
-                    "INSERT INTO episodic_trajectory (id, scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
-                       VALUES (50, 'agent', 'agent-s', '{GONE}', 's1', 'a trajectory of the gone project', 1, 1, 1);
-                     INSERT INTO episodic_vectors (rowid, embedding) VALUES (50, zeroblob(1536));
-                     INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES ({web}, {secret}, 0.1, 'pending', 1);
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES ({web}, {secret}, 0.1, 'pending', 1);
                      INSERT INTO memory_derivation (memory_id, source_id, created_at) VALUES ({web}, {secret}, 1), ({secret}, {other}, 1);
                      INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, created_at, updated_at) \
                        VALUES ('op-secret', 'agent-s', '{SECRET}', '{{}}', 'failed', 0, 0);"
@@ -1344,18 +1316,15 @@ mod tests {
         let purged = purge_delete(d.dir.path(), d.delete_id).unwrap();
 
         assert_eq!(purged.project_id, GONE);
-        assert_eq!(purged.removed, Counts { memories: 3, trajectories: 1, skills: 0 });
+        assert_eq!(purged.removed, Counts { memories: 3 });
         assert!(purged.live.is_empty());
         assert_eq!(
             purged.outbox,
             vec![OutboxRemoved { operation_id: "op-secret".into(), agent_id: "agent-s".into(), state: "failed".into() }]
         );
         let dir = d.dir.path();
-        for table in ["memory", "episodic_trajectory"] {
-            assert_eq!(total(dir, &format!("SELECT count(*) FROM {table} WHERE project_id = '{GONE}'")), 0, "{table}");
-        }
+        assert_eq!(total(dir, &format!("SELECT count(*) FROM memory WHERE project_id = '{GONE}'")), 0);
         assert_eq!(total(dir, "SELECT count(*) FROM memory_vectors WHERE rowid IN (1, 2, 3)"), 0, "the vectors went");
-        assert_eq!(total(dir, "SELECT count(*) FROM episodic_vectors WHERE rowid = 50"), 0);
         assert_eq!(total(dir, "SELECT count(*) FROM memory_conflict"), 0, "its pairs went");
         assert_eq!(
             total(dir, &format!("SELECT count(*) FROM memory_derivation WHERE memory_id = {}", d.secret)),
@@ -1385,8 +1354,8 @@ mod tests {
 
         let purged = purge_delete(d.dir.path(), d.delete_id).unwrap();
 
-        assert_eq!(purged.live, vec![LiveRow { table: "memory".into(), id: d.other }]);
-        assert_eq!(purged.removed, Counts { memories: 2, trajectories: 1, skills: 0 });
+        assert_eq!(purged.live, vec![d.other]);
+        assert_eq!(purged.removed, Counts { memories: 2 });
         let dir = d.dir.path();
         assert_eq!(total(dir, &format!("SELECT count(*) FROM memory WHERE id = {}", d.other)), 1);
         assert_eq!(total(dir, &format!("SELECT count(*) FROM memory WHERE id IN ({}, {})", d.secret, d.old)), 0);

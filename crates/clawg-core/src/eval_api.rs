@@ -10,7 +10,7 @@
 //! An internal refactor of the store must not be able to break this offline
 //! tool, and this tool must not be able to reach store methods it has no
 //! business calling. Wrapping the store in an opaque newtype and defining
-//! `EvalScope`/`EvalHit`/`EvalKind` as this module's own shapes means the
+//! `EvalScope`/`EvalHit` as this module's own shapes means the
 //! tooling only ever depends on what is explicitly mapped here — nothing
 //! more.
 //!
@@ -50,7 +50,6 @@ use crate::memory::search::{lexical_channel_only, search_all_memories_with_scori
 use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, ChunkOutcome, IngestRequest};
-use crate::memory::TableKind;
 use crate::metrics::Recorder;
 use crate::models::chat::Role;
 use crate::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
@@ -100,8 +99,6 @@ pub const MIGRATION_FTS_TOKENIZER: &str = "unicode61 remove_diacritics 2";
 #[derive(Debug, Clone, Copy)]
 pub struct EvalScope {
     pub memory: Option<usize>,
-    pub episodic: Option<usize>,
-    pub procedural: Option<usize>,
     /// Candidate budget for the lexical (FTS5) channel — `None` keeps the
     /// channel off, same meaning as `SearchScope::lexical`. This module's own
     /// copy so a change to the internal field cannot silently change what
@@ -116,8 +113,6 @@ impl EvalScope {
     fn into_search_scope(self) -> SearchScope {
         SearchScope {
             memory: self.memory,
-            episodic: self.episodic,
-            procedural: self.procedural,
             projects: None,
             lexical: self.lexical,
             reach: crate::memory::sharing::Reach::Own,
@@ -192,30 +187,10 @@ impl Default for EvalScoringConfig {
     }
 }
 
-/// Which backing table a hit came from — this module's own copy, so callers
-/// never need to name the internal table-kind type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvalKind {
-    Memory,
-    Episodic,
-    Procedural,
-}
-
-impl From<TableKind> for EvalKind {
-    fn from(kind: TableKind) -> Self {
-        match kind {
-            TableKind::Memory => EvalKind::Memory,
-            TableKind::Episodic => EvalKind::Episodic,
-            TableKind::Procedural => EvalKind::Procedural,
-        }
-    }
-}
-
 /// One ranked search result, translated out of the store's internal shape.
 #[derive(Debug, Clone)]
 pub struct EvalHit {
     pub id: i64,
-    pub kind: EvalKind,
     /// Carried through deliberately: the harness uses it to tell a row the
     /// KNN pool structurally excludes (tier <= 1 never reaches search) apart
     /// from one that was simply outranked.
@@ -403,7 +378,6 @@ impl EvalStore {
                 .into_iter()
                 .map(|h| EvalHit {
                     id: h.id,
-                    kind: h.kind.into(),
                     tier: h.tier,
                     score: h.score,
                     distance: h.distance,
@@ -2060,10 +2034,10 @@ mod tests {
         // carrying its value correctly. Nothing else in the eval binary
         // observes `SearchScope.lexical` directly, so this is the only place
         // that can catch it.
-        let on = EvalScope { memory: Some(30), episodic: Some(5), procedural: Some(5), lexical: Some(20) };
+        let on = EvalScope { memory: Some(30), lexical: Some(20) };
         assert_eq!(on.into_search_scope().lexical, Some(20));
 
-        let off = EvalScope { memory: Some(30), episodic: Some(5), procedural: Some(5), lexical: None };
+        let off = EvalScope { memory: Some(30), lexical: None };
         assert_eq!(off.into_search_scope().lexical, None);
     }
 
@@ -2114,8 +2088,6 @@ mod tests {
 
         let scope = EvalScope {
             memory: Some(30),
-            episodic: None,
-            procedural: None,
             lexical: Some(20),
         };
         let scoring = EvalScoringConfig::default();
@@ -3179,7 +3151,7 @@ second
         v
     }
 
-    const MEMORY_ONLY: EvalScope = EvalScope { memory: Some(30), episodic: None, procedural: None, lexical: None };
+    const MEMORY_ONLY: EvalScope = EvalScope { memory: Some(30), lexical: None };
 
     #[tokio::test]
     async fn production_reach_reads_other_agents_and_unowned_rows() {

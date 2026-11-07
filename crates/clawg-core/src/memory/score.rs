@@ -3,20 +3,16 @@
 //! an importance multiplier, and a live-status gate into one ranking value.
 
 use crate::memory::clock::TimestampMs;
-use crate::memory::TableKind;
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
 /// One row exactly as a KNN query returns it, before scoring: the columns
-/// `SEARCH_SQL_*` selects, plus the table it came from. `knn_one` attaches
-/// `kind` from its `KnnTable` descriptor rather than the query returning it —
-/// a single SQL string only ever serves one table and never says which.
+/// `SEARCH_SQL_MEMORY` selects.
 #[derive(Debug, Clone)]
 pub(crate) struct RawHit {
     pub id: i64,
-    pub kind: TableKind,
     pub content: String,
     pub memory_type: String,
     pub tier: i64,
@@ -47,12 +43,7 @@ pub(crate) struct TierFloors {
     pub other: f64,
 }
 
-/// Per-`memory_type` decay rates, plus the two table-level rates episodic and
-/// procedural rows use. Those two are NOT entries in this same string table:
-/// episodic/procedural rows carry no `memory_type` of their own (see
-/// `lambda_for`), and folding their spellings in here would let any memory
-/// row that ever carried them silently re-route through a rate meant for a
-/// different table.
+/// Per-`memory_type` decay rates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DecayLambdas {
     pub user_preference: f64,
@@ -62,8 +53,6 @@ pub(crate) struct DecayLambdas {
     pub chat_message: f64,
     pub tool_error: f64,
     pub fallback: f64,
-    pub episode: f64,
-    pub procedure: f64,
 }
 
 /// `base + clamp(importance, clamp_lo, clamp_hi) / divisor` — kept in this
@@ -136,8 +125,6 @@ impl ScoringConfig {
             chat_message: 0.023,
             tool_error: 0.099,
             fallback: 0.023,
-            episode: 0.0077,
-            procedure: 0.0039,
         },
         // Compression range narrowed from [0.55, 1.0] to [0.85, 1.0]. Over
         // the evaluation corpus the wider range let raw `importance` decide
@@ -222,24 +209,16 @@ fn rescale_cosine(cosine: f64, floor: f64) -> f64 {
     ((cosine - floor) / (1.0 - floor)).clamp(0.0, 1.0)
 }
 
-/// Resolves the decay rate for one row. Dispatches on `TableKind` FIRST:
-/// episodic and procedural rows have no `memory_type` of their own — their
-/// SQL selects the literal strings `'episode'`/`'procedure'` in that column —
-/// so ownership of their rate stays with the table it came from, not with a
-/// shared string match keyed on a spelling those rows never actually carry.
-pub(crate) fn lambda_for(cfg: &ScoringConfig, kind: TableKind, memory_type: &str) -> f64 {
-    match kind {
-        TableKind::Episodic => cfg.decay.episode,
-        TableKind::Procedural => cfg.decay.procedure,
-        TableKind::Memory => match memory_type {
-            "user_preference" => cfg.decay.user_preference,
-            "architectural_decision" => cfg.decay.architectural_decision,
-            "session_summary" => cfg.decay.session_summary,
-            "semantic_fact" => cfg.decay.semantic_fact,
-            "chat_message" => cfg.decay.chat_message,
-            "tool_error" => cfg.decay.tool_error,
-            _ => cfg.decay.fallback,
-        },
+/// Resolves the decay rate of a row by its `memory_type`.
+pub(crate) fn lambda_for(cfg: &ScoringConfig, memory_type: &str) -> f64 {
+    match memory_type {
+        "user_preference" => cfg.decay.user_preference,
+        "architectural_decision" => cfg.decay.architectural_decision,
+        "session_summary" => cfg.decay.session_summary,
+        "semantic_fact" => cfg.decay.semantic_fact,
+        "chat_message" => cfg.decay.chat_message,
+        "tool_error" => cfg.decay.tool_error,
+        _ => cfg.decay.fallback,
     }
 }
 
@@ -283,7 +262,7 @@ pub(crate) fn score(cfg: &ScoringConfig, hit: &RawHit, now: TimestampMs) -> f64 
         2 => cfg.tier_floors.tier2,
         _ => cfg.tier_floors.other,
     };
-    let lambda = lambda_for(cfg, hit.kind, &hit.memory_type);
+    let lambda = lambda_for(cfg, &hit.memory_type);
     let age_secs = age_secs_from(now, hit.last_accessed_at);
     let age_days = age_secs as f64 / 86_400.0;
     // A future stamp says the clock moved, not that the row is fresher than
@@ -316,7 +295,6 @@ mod tests {
     /// Builds a `RawHit` fixture — every field but the ones a test cares
     /// about is filled with an inert placeholder.
     fn make_raw_hit(
-        kind: TableKind,
         memory_type: &str,
         tier: i64,
         status: &str,
@@ -326,7 +304,6 @@ mod tests {
     ) -> RawHit {
         RawHit {
             id: 1,
-            kind,
             content: String::new(),
             memory_type: memory_type.to_string(),
             tier,
@@ -351,7 +328,6 @@ mod tests {
     /// used to give for free.
     fn neutral_hit_at_importance(importance: f64, status: &str) -> RawHit {
         make_raw_hit(
-            TableKind::Memory,
             "chat_message",
             1,
             status,
@@ -502,7 +478,7 @@ mod tests {
         let now = TimestampMs::from_unix_millis(1_700_000_000_000);
         let last_accessed_at = TimestampMs::from_unix_millis(now.as_millis_i64() - 86_400_000);
         let raw = make_raw_hit(
-            TableKind::Memory, "chat_message", 2, "active", 0.1, last_accessed_at, 5.0,
+            "chat_message", 2, "active", 0.1, last_accessed_at, 5.0,
         );
 
         let cosine_raw = cosine_from_l2_unit(raw.distance);
@@ -511,7 +487,7 @@ mod tests {
             None => cosine_raw,
         };
         let tier_floor = cfg.tier_floors.tier2; // raw.tier == 2
-        let lambda = lambda_for(&cfg, raw.kind, &raw.memory_type);
+        let lambda = lambda_for(&cfg, &raw.memory_type);
         let age_days = age_secs_from(now, raw.last_accessed_at) as f64 / 86_400.0;
         let decay = (-lambda * age_days).exp();
         let importance = expected_importance_factor(&cfg, raw.importance);
@@ -529,7 +505,7 @@ mod tests {
         let cfg = ScoringConfig::DEFAULT;
         let now = TimestampMs::from_unix_millis(1_700_000_000_000);
         let at = TimestampMs::from_unix_millis(now.as_millis_i64() - 86_400_000);
-        let hit = |status| make_raw_hit(TableKind::Memory, "semantic_fact", 2, status, 0.1, at, 5.0);
+        let hit = |status| make_raw_hit("semantic_fact", 2, status, 0.1, at, 5.0);
 
         let active = score(&cfg, &hit("active"), now);
         let disputed = score(&cfg, &hit("disputed"), now);
@@ -550,7 +526,7 @@ mod tests {
         let cfg = ScoringConfig::DEFAULT;
         let now = TimestampMs::from_unix_millis(1_700_000_000_000);
         let ahead = TimestampMs::from_unix_millis(now.as_millis_i64() + 30 * 86_400_000);
-        let hit = |at| make_raw_hit(TableKind::Memory, "tool_error", 3, "active", 0.1, at, 5.0);
+        let hit = |at| make_raw_hit("tool_error", 3, "active", 0.1, at, 5.0);
 
         assert_eq!(score(&cfg, &hit(ahead), now), score(&cfg, &hit(now), now));
     }
@@ -656,7 +632,7 @@ mod tests {
         // point, not which value happens to ship today.
         let now = TimestampMs::from_unix_millis(1_700_000_000_000);
         let last_accessed_at = TimestampMs::from_unix_millis(now.as_millis_i64() - 86_400_000);
-        let raw = make_raw_hit(TableKind::Memory, "chat_message", 2, "active", 0.1, last_accessed_at, 5.0);
+        let raw = make_raw_hit("chat_message", 2, "active", 0.1, last_accessed_at, 5.0);
 
         let without_floor = ScoringConfig { cosine_floor: None, ..ScoringConfig::DEFAULT };
         let some_zero_floor = ScoringConfig { cosine_floor: Some(0.0), ..ScoringConfig::DEFAULT };
@@ -770,7 +746,7 @@ mod tests {
         // since the production default now carries its own non-zero floor.
         let now = TimestampMs::from_unix_millis(1_700_000_000_000);
         let last_accessed_at = TimestampMs::from_unix_millis(now.as_millis_i64() - 86_400_000);
-        let raw = make_raw_hit(TableKind::Memory, "chat_message", 2, "active", 0.1, last_accessed_at, 5.0);
+        let raw = make_raw_hit("chat_message", 2, "active", 0.1, last_accessed_at, 5.0);
 
         let without_floor = ScoringConfig { cosine_floor: None, ..ScoringConfig::DEFAULT };
         let with_floor = ScoringConfig { cosine_floor: Some(0.8625), ..ScoringConfig::DEFAULT };
@@ -780,26 +756,14 @@ mod tests {
         assert_ne!(a.to_bits(), b.to_bits(), "a measured floor must change the score, got a={a} b={b}");
     }
 
-    // ── TableKind dispatch in lambda_for ──
-
-    #[test]
-    fn lambda_for_episodic_and_procedural_use_their_own_table_rate() {
-        let cfg = ScoringConfig::DEFAULT;
-        assert_eq!(lambda_for(&cfg, TableKind::Episodic, "episode"), cfg.decay.episode);
-        assert_eq!(lambda_for(&cfg, TableKind::Procedural, "procedure"), cfg.decay.procedure);
-        // Neither spelling is in the memory_type table, so if dispatch ever
-        // fell through to it by mistake these would silently read the
-        // fallback rate (0.023) instead.
-        assert_ne!(cfg.decay.episode, cfg.decay.fallback);
-        assert_ne!(cfg.decay.procedure, cfg.decay.fallback);
-    }
+    // ── lambda_for ──
 
     #[test]
     fn lambda_for_memory_dispatches_on_memory_type() {
         let cfg = ScoringConfig::DEFAULT;
-        assert_eq!(lambda_for(&cfg, TableKind::Memory, "user_preference"), cfg.decay.user_preference);
-        assert_eq!(lambda_for(&cfg, TableKind::Memory, "tool_error"), cfg.decay.tool_error);
-        assert_eq!(lambda_for(&cfg, TableKind::Memory, "unrecognized"), cfg.decay.fallback);
+        assert_eq!(lambda_for(&cfg, "user_preference"), cfg.decay.user_preference);
+        assert_eq!(lambda_for(&cfg, "tool_error"), cfg.decay.tool_error);
+        assert_eq!(lambda_for(&cfg, "unrecognized"), cfg.decay.fallback);
     }
 
     // ── lexical bonus ──
@@ -809,7 +773,7 @@ mod tests {
         // A distance whose cosine sits below the floor: cos' is 0, so before
         // the bonus this row scored exactly 0.
         let now = epoch();
-        let mut raw = make_raw_hit(TableKind::Memory, "chat_message", 1, "active", 1.0, now, 1.0);
+        let mut raw = make_raw_hit("chat_message", 1, "active", 1.0, now, 1.0);
         raw.lexical_match = true;
         let cfg = ScoringConfig::DEFAULT;
 
@@ -823,22 +787,22 @@ mod tests {
     fn without_a_match_the_score_is_unchanged() {
         let now = TimestampMs::from_unix_millis(1_700_000_000_000);
         let last_accessed_at = TimestampMs::from_unix_millis(now.as_millis_i64() - 86_400_000);
-        let raw = make_raw_hit(TableKind::Memory, "chat_message", 2, "active", 0.3, last_accessed_at, 5.0);
+        let raw = make_raw_hit("chat_message", 2, "active", 0.3, last_accessed_at, 5.0);
         let without_bonus = ScoringConfig { lexical_bonus: 0.0, ..ScoringConfig::DEFAULT };
 
         let a = score(&ScoringConfig::DEFAULT, &raw, now);
         let b = score(&without_bonus, &raw, now);
         assert_eq!(a.to_bits(), b.to_bits());
 
-        let below_floor = make_raw_hit(TableKind::Memory, "chat_message", 1, "active", 1.0, epoch(), 1.0);
+        let below_floor = make_raw_hit("chat_message", 1, "active", 1.0, epoch(), 1.0);
         assert_eq!(score(&ScoringConfig::DEFAULT, &below_floor, epoch()), 0.0);
     }
 
     #[test]
     fn a_match_outranks_a_closer_row_with_the_same_decay_and_importance() {
         let now = epoch();
-        let closer = make_raw_hit(TableKind::Memory, "code_block", 1, "active", 0.0, now, 5.0);
-        let mut matched = make_raw_hit(TableKind::Memory, "code_block", 1, "active", 0.3, now, 5.0);
+        let closer = make_raw_hit("code_block", 1, "active", 0.0, now, 5.0);
+        let mut matched = make_raw_hit("code_block", 1, "active", 0.3, now, 5.0);
         matched.lexical_match = true;
         let cfg = ScoringConfig::DEFAULT;
         assert!(score(&cfg, &matched, now) > score(&cfg, &closer, now));

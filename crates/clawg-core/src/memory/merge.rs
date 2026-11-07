@@ -175,8 +175,6 @@ pub struct MergeReport {
     pub split: Vec<i64>,
     /// How many live preferences and decisions went to the target.
     pub protected: usize,
-    pub trajectories: usize,
-    pub skills: usize,
     /// How many reviews of `synthesize` went to the target.
     pub reviews: usize,
     /// The folders that lead to the target now, by id.
@@ -271,15 +269,6 @@ fn merge_pass(
         ..MergeReport::default()
     };
     let mut changes = Vec::new();
-    for (table, kind) in [("episodic_trajectory", "trajectory"), ("procedural_skill", "skill")] {
-        let rows = texts_in(c, &format!("SELECT CAST(id AS TEXT) FROM {table} WHERE project_id = ?1 ORDER BY id"), source)?;
-        c.execute(&format!("UPDATE {table} SET project_id = ?2 WHERE project_id = ?1"), [source, target])?;
-        match kind {
-            "trajectory" => report.trajectories = rows.len(),
-            _ => report.skills = rows.len(),
-        }
-        changes.extend(rows.into_iter().map(|id| change(kind, id, None)));
-    }
 
     let reviews: Vec<(String, i64)> = {
         let mut stmt = c.prepare("SELECT agent_id, reviewed_at FROM synthesis_review WHERE scope_key = ?1 ORDER BY agent_id")?;
@@ -505,13 +494,6 @@ fn undo_pass(c: &Connection, merge_id: i64, now: TimestampMs) -> Result<(MergeRe
     for (kind, a, b) in &changes {
         let back = |sql: &str| c.execute(sql, [a.as_str(), source.as_str(), target.as_str()]);
         match kind.as_str() {
-            "trajectory" => {
-                report.trajectories +=
-                    back("UPDATE episodic_trajectory SET project_id = ?2 WHERE id = ?1 AND project_id = ?3")?;
-            }
-            "skill" => {
-                report.skills += back("UPDATE procedural_skill SET project_id = ?2 WHERE id = ?1 AND project_id = ?3")?;
-            }
             "folder" => {
                 if back("UPDATE project_path SET project_id = ?2 WHERE id = ?1 AND project_id = ?3")? > 0 {
                     report.folders.push(a.clone());
@@ -851,8 +833,6 @@ mod tests {
             let mut out = Vec::new();
             for sql in [
                 "SELECT json_array(id, project_id, scope, status, superseded_by, supersede_cause) FROM memory",
-                "SELECT json_array('trajectory', id, project_id) FROM episodic_trajectory",
-                "SELECT json_array('skill', id, project_id) FROM procedural_skill",
                 "SELECT json_array(id, name, reviewed, merged_into, merged_at) FROM project",
                 "SELECT json_array(id, project_id) FROM project_path",
                 "SELECT json_array(remote, project_id) FROM project_remote",
@@ -876,14 +856,7 @@ mod tests {
         let f = Fixture::new(&[A, B]).await;
         let note = f.save("the daemon listens on clawg.sock", A, None, 1).await;
         f.sql(&format!(
-            "INSERT INTO episodic_trajectory \
-               (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
-               VALUES ('agent', 'agent-a', '{A}', 's', 't', 1, 1, 1);
-             INSERT INTO procedural_skill \
-               (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
-               VALUES ('agent', 'agent-a', '{A}', 'k', 't', 1, '[]', 1, 1, 1);
-             INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', '{A}', 10), ('', '{B}', 20);
+            "INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', '{A}', 10), ('', '{B}', 20);
              INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', '{A}', 1);
              INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('{B}', '{A}', 'root_commit', 1);"
         ))
@@ -896,8 +869,8 @@ mod tests {
         assert_eq!(report.merge_id, Some(1));
         assert!(report.move_id.is_some());
         assert_eq!(
-            (report.memories, report.trajectories, report.skills, report.reviews, report.suggestions),
-            (1, 1, 1, 1, 1)
+            (report.memories, report.reviews, report.suggestions),
+            (1, 1, 1)
         );
         assert_eq!((report.folders.clone(), report.remotes.clone()), (vec![A.to_string()], vec!["github.com/acme/app".to_string()]));
         let snapshot = report.snapshot.clone().expect("a snapshot before writing");
@@ -908,13 +881,12 @@ mod tests {
         assert!(rows.iter().all(|r| r.1.as_deref() == Some(B)), "{rows:?}");
         let other: Vec<String> = f
             .rows(
-                "SELECT project_id FROM episodic_trajectory UNION ALL SELECT project_id FROM procedural_skill \
-                 UNION ALL SELECT project_id FROM project_path WHERE id = 'app-aaaa' \
+                "SELECT project_id FROM project_path WHERE id = 'app-aaaa' \
                  UNION ALL SELECT project_id FROM project_remote",
                 |r| r.get(0),
             )
             .await;
-        assert_eq!(other, vec![B; 4]);
+        assert_eq!(other, vec![B; 2]);
         let reviews: Vec<(String, i64)> =
             f.rows("SELECT scope_key, reviewed_at FROM synthesis_review", |r| Ok((r.get(0)?, r.get(1)?))).await;
         assert_eq!(reviews, vec![(B.to_string(), 10)], "the older review of the two");
@@ -1119,13 +1091,6 @@ mod tests {
             let deleted = self.save("an old note", A, None, 3).await;
             self.sql(&format!(
                 "UPDATE memory SET deleted_at = 4 WHERE id = {deleted};
-                 INSERT INTO episodic_trajectory \
-                   (scope, agent_id, project_id, session_id, task, created_at, last_modified_at, last_accessed_at) \
-                   VALUES ('agent', 'agent-a', '{A}', 's', 't', 1, 1, 1);
-                 INSERT INTO procedural_skill \
-                   (scope, agent_id, project_id, skill_name, trigger, promoted_at, \
-                    source_trajectory_ids, created_at, last_modified_at, last_accessed_at) \
-                   VALUES ('agent', 'agent-a', '{A}', 'k', 't', 1, '[]', 1, 1, 1);
                  INSERT INTO synthesis_review (agent_id, scope_key, reviewed_at) VALUES ('', '{A}', 10), ('', '{B}', 20);
                  INSERT INTO project_remote (remote, project_id, created_at) VALUES ('github.com/acme/app', '{A}', 1);
                  INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES ('{B}', '{A}', 'root_commit', 1);
@@ -1154,7 +1119,7 @@ mod tests {
         let undone = f.undo(merged.merge_id.unwrap(), false).await.unwrap();
 
         assert_eq!(f.state().await, before);
-        assert_eq!((undone.memories, undone.trajectories, undone.skills, undone.reviews), (merged.memories, 1, 1, 1));
+        assert_eq!((undone.memories, undone.reviews), (merged.memories, 1));
         assert_eq!((undone.folders.clone(), undone.remotes.clone(), undone.tombstones.clone()), (merged.folders, merged.remotes, merged.tombstones));
         assert!(undone.snapshot.as_deref().is_some_and(|s| s.contains("pre-undo")), "{:?}", undone.snapshot);
         assert!(undone.move_id.is_some(), "the rows went back as a move of their own");

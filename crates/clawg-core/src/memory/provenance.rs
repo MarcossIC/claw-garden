@@ -61,7 +61,7 @@ pub(crate) fn preference_mark(memory_type: &str, source: Option<&str>, created_b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::admin::{get_memory_core, MemoryKind};
+    use crate::memory::admin::get_memory_core;
     use crate::memory::MemoryStore;
 
     #[test]
@@ -124,7 +124,7 @@ mod tests {
             .await
             .unwrap();
 
-        let row = get_memory_core(&store, MemoryKind::Memory, id).await.unwrap().expect("the row opens");
+        let row = get_memory_core(&store, id).await.unwrap().expect("the row opens");
         let (source, by) = (row.source.unwrap(), row.created_by_type.unwrap());
         assert_eq!((source.as_str(), by.as_str()), ("explicit", "user"));
         assert_eq!(mark(&source, &by), None);

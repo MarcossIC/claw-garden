@@ -14,7 +14,7 @@ use clawg_core::memory::clock::TimestampMs;
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::{
-    search_all_memories, MemoryError, MemoryStore, RankedHit, SearchScope, TableKind,
+    search_all_memories, MemoryError, MemoryStore, RankedHit, SearchScope,
 };
 use clawg_core::models::chat::Role;
 use clawg_core::runtime::MemoryRuntime;
@@ -27,8 +27,6 @@ use clawg_core::runtime::MemoryRuntime;
 fn search_scope_constructors_and_fields_are_public() {
     let scope = SearchScope::all_default().with_project(Some("proj-1"));
     assert_eq!(scope.memory, Some(30));
-    assert_eq!(scope.episodic, Some(5));
-    assert_eq!(scope.procedural, Some(5));
     assert_eq!(scope.lexical, Some(20));
     assert_eq!(scope.projects, Some(vec!["proj-1".to_string()]));
 }
@@ -56,13 +54,12 @@ fn search_all_memories_is_public_with_the_expected_signature() {
     let _: SearchFn = |s, e, q, a, sc, k| Box::pin(search_all_memories(s, e, q, a, sc, k));
 }
 
-/// The daemon answers HTTP/MCP with hits as JSON, so `RankedHit` (and the
-/// `TableKind` it carries) must serialize without the caller re-shaping them.
+/// The daemon answers HTTP/MCP with hits as JSON, so `RankedHit` must
+/// serialize without the caller re-shaping it.
 #[test]
 fn ranked_hit_serializes_to_json() {
     let hit = RankedHit {
         id: 7,
-        kind: TableKind::Memory,
         content: "hello".into(),
         memory_type: "semantic_fact".into(),
         tier: 2,
@@ -80,7 +77,6 @@ fn ranked_hit_serializes_to_json() {
     let json = serde_json::to_value(&hit).expect("RankedHit must be Serialize");
     assert_eq!(json["id"], 7);
     assert_eq!(json["memory_type"], "semantic_fact");
-    assert_eq!(json["kind"], "Memory");
     assert!(json["created_at"].is_i64(), "created_at must serialize as a millisecond number");
     assert!(json.get("origin").is_none(), "a hit with no mark sends none: {json}");
     let inferred = RankedHit { memory_type: "user_preference".into(), origin: Some("inferred"), ..hit };
