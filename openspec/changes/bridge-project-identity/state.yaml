@@ -1,7 +1,8 @@
 change: bridge-project-identity
 objective: "2, 4"
 depends_on: []
-phase: verify  # pendiente en local: el save desde Cursor en un workspace con dos repositorios (verify.md)
+phase: verify  # probado con Cursor; falta archivar
+release: "0.78.0"  # todo su código está en v0.78.0 (#135)
 artifacts:
   exploration: done  # con el resultado de la prueba con Cursor
   proposal: done  # las tres decisiones de la exploración y la tabla de las otras herramientas que leen
@@ -9,6 +10,6 @@ artifacts:
   design: skipped  # las decisiones se cerraron en la exploración y la propuesta
   tasks: done
   apply: done  # un commit por paso, con sus tests en rojo antes
-  verify: partial  # Linux pasa, también con lo traído de la otra aplicación; faltan su CI de Windows y lo pendiente en local con Cursor
+  verify: done  # Linux y el CI de #134 y #135 en Linux y Windows; con Cursor 3.29.9, los puntos 1 a 3, el 2 con cada ventana leyendo sus carpetas; Claude Code queda para el piloto (verify.md)
   archive: pending
 updated: 2026-11-07

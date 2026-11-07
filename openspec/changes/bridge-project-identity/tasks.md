@@ -75,3 +75,8 @@ El mismo cambio se aplicó también en otra rama ([#134](https://github.com/Marc
 - Commit: `docs(mcp): name all_projects in the opening, and the key of a group's hit`
 - [x] La spec, esta lista y `verify.md`.
 - Commit: `docs(openspec): record what bridge-project-identity took from its other application`
+
+## 9. La prueba con Cursor
+
+- [x] Los puntos 1 a 3 con Cursor 3.29.9 en Windows, contra un directorio de prueba ([verify](verify.md#con-cursor-2026-11-06)): el 2 pasa con lo que hace Cursor ahora, que manda sólo las carpetas de cada ventana. Claude Code queda para el piloto.
+- Commit: `docs(openspec): record the Cursor test of bridge-project-identity`
