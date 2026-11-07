@@ -138,7 +138,7 @@ Sobre una fila que no existe, borrada o fuera del alcance del lector, MUST devol
 
 ## R5. Herramienta MCP `update_memory`
 
-El puente MUST exponer `update_memory` con `kind`, `id`, `importance` (opcional) y `memory_type` (opcional; su schema declara los tipos conocidos como `enum`, ver [`specs/mcp`](../mcp/spec.md), «El schema de `memory_type` declara los tipos») y `user_answered` (booleano, opcional) (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:311`), y MUST mandar siempre el agente que llama y la declaración (`update_memory_impl`, `server.rs:1115`).
+El puente MUST exponer `update_memory` con `id`, `importance` (opcional) y `memory_type` (opcional; su schema declara los tipos conocidos como `enum`, ver [`specs/mcp`](../mcp/spec.md), «El schema de `memory_type` declara los tipos») y `user_answered` (booleano, opcional) (`UpdateMemoryArgs`, `crates/clawg-cli/src/mcp/server.rs:353`), sin `kind` en el esquema: `kind` queda sólo como entrada de compatibilidad, y un llamado que igual lo manda sigue [`specs/mcp`](../mcp/spec.md) RL7. MUST mandar siempre el agente que llama y la declaración (`update_memory_impl`, `server.rs:1478`).
 
 - Un descenso de una fila protegida sin la declaración MUST fallar con el mensaje del daemon, que nombra `user_answered`.
 - Sobre una fila que el agente alcanza, propia o de otro agente, MUST devolver un texto que nombra el id y cómo quedaron importancia, tipo y tier (`format_update`, `crates/clawg-cli/src/mcp/tools.rs:338`): `updated #12 memory: user_preference, importance 8.0, tier 1`.

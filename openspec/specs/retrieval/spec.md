@@ -763,9 +763,9 @@ La salida de `search_memory` MUST leerse como cero líneas cuando es la de un al
 
 ## Los ids de `recall_context` en `delete_memory` y `update_memory`
 
-La doc de `DeleteMemoryArgs.id` (`server.rs:289-291`), la de `UpdateMemoryArgs.id` (`server.rs:312-314`) y la descripción de `delete_memory` (`server.rs:1399-1405`) MUST nombrar `recall_context` además de `search_memory` y `list_memories`, y decir que un hit sin kind explícito es `memory`. `kind` sigue siendo obligatorio en las dos.
+La doc de `DeleteMemoryArgs.id` (`server.rs:334-336`), la de `UpdateMemoryArgs.id` (`server.rs:354-356`) y la descripción de `delete_memory` (`server.rs:1859-1864`) MUST nombrar `recall_context` además de `search_memory` y `list_memories`. `kind` no está en el esquema de ninguna de las dos, y un llamado que igual lo manda sigue [`specs/mcp`](../mcp/spec.md) RL7.
 
-**Test:** `memory_id_docs_name_recall_context_and_the_default_kind` en `server.rs`.
+**Test:** `memory_id_docs_name_recall_context_and_no_kind` en `server.rs`.
 
 ## Medición del contexto
 
