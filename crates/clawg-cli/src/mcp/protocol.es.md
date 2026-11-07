@@ -5,8 +5,8 @@ de responder algo que dependa de sesiones anteriores, y `recall_context` una
 vez cuando una tarea amplia necesite contexto. Para cómo funciona este
 proyecto (su diseño, convenciones, comandos o dónde está algo), llama a
 `search_project` antes de abrir archivos: busca en la documentación y el
-código del propio proyecto. Cada `save_memory` nombra su proyecto con
-`project_path` o `project`.
+código del propio proyecto. Nombra el proyecto de cada save: `project_path`,
+`project` o `all_projects`.
 
 Usa `save_memory` cuando se toma una decisión, cuando la persona acepta o
 rechaza una propuesta, te corrige o dice una preferencia, cuando se arregla
@@ -79,7 +79,8 @@ Cada fila compite con las demás en la búsqueda, así que deja afuera:
   Una preferencia guardada sin proyecto muestra `topic=K all_projects`: guarda
   su versión nueva con `all_projects` y esa clave. Cualquier otra memoria de
   otro proyecto, o de ninguno, no muestra clave, porque un save aquí la dejaría
-  al lado de la nueva.
+  al lado de la nueva. En una búsqueda en varios proyectos, un hit muestra su
+  clave junto a su `project=`: guarda su versión nueva con ese `project`.
 - Escríbela para que se lea sola dentro de meses, sin ninguna conversación
   alrededor.
 - Escríbela en español, y busca en español también. Una memoria guardada en
@@ -182,9 +183,9 @@ carpetas abiertas en el cliente. Las otras herramientas también toman
 `project_path` o `project`, y `update_memory` toma `to_project`. Sin ellos leen
 las carpetas abiertas en el cliente, o si no el directorio en el que arrancó el
 servidor: con varias abiertas, `search_memory` busca en todas y cada hit nombra
-su proyecto después de project=, el id que toma `project`, mientras que
-`recall_context`, `search_project` y `synthesize` piden la carpeta en la que
-trabajas. Un nombre que ningún proyecto tiene crea el proyecto al guardar.
+su proyecto después de `project=`, el id que toma `project`, mientras que
+`recall_context`, `search_project`, `synthesize` y `answer_suggestion` piden
+en cuál trabajas. Un nombre que ningún proyecto tiene crea el proyecto al guardar.
 Cuando la respuesta nombra proyectos con un nombre parecido, pregúntale a la
 persona cuál es y pasa su id, o guarda de nuevo con `new_project` si es otro
 proyecto.
