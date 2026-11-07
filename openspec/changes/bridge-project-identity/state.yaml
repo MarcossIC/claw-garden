@@ -9,6 +9,6 @@ artifacts:
   design: skipped  # las decisiones se cerraron en la exploración y la propuesta
   tasks: done
   apply: done  # un commit por paso, con sus tests en rojo antes
-  verify: partial  # Linux y el CI de Windows pasan; falta lo pendiente en local con Cursor
+  verify: partial  # Linux pasa, también con lo traído de la otra aplicación; faltan su CI de Windows y lo pendiente en local con Cursor
   archive: pending
-updated: 2026-11-06
+updated: 2026-11-07

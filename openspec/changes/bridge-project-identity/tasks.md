@@ -53,3 +53,25 @@ Lo que se hizo distinto de lo previsto está en [«Frente a lo previsto»](verif
 - [x] `verify.md`, con el save desde Cursor en un workspace con dos repositorios pendiente en local; `state.yaml` y la línea de `openspec/ROADMAP.md`.
 - [x] El CI del pull request en Windows, y lo que marque, arreglado: 18 tests de `server.rs` armaban su proyecto con una ruta que en Windows resuelve a otro id; arreglado en `test(mcp): name the bridge's own folder as a project_path resolves it`.
 - Commit: `docs(openspec): record bridge-project-identity applied`
+
+## 8. Lo que trajo la otra aplicación
+
+El mismo cambio se aplicó también en otra rama ([#134](https://github.com/MarcossIC/claw-garden/pull/134)). Se compararon las dos por partes, y queda esta: la búsqueda de un grupo es una sola búsqueda, con un ranking y el conteo del otro idioma del grupo, y el puente decide sus carpetas sin I/O y se niega antes de llamar al daemon. De la otra se trajo lo que esta no tenía, cada punto con su test primero:
+
+- [x] Tests en rojo: `a_hit_without_a_project_shows_how_a_save_revises_it` y `format_save_shows_the_key_only_where_a_save_revises_it` (`tools.rs`): sin carpetas abiertas, una fila sin proyecto mostraba ` topic=K`, que ningún save podía usar.
+- [x] `revised_from`: una fila sin proyecto no la revisa ningún save salvo uno con `all_projects`, que `shown_key` nombra.
+- Commit: `fix(mcp): show the key of a row without a project only as all_projects`
+- [x] Tests en rojo: `a_group_search_names_its_first_project_for_an_older_daemon` (`client.rs`) y `a_group_wins_over_the_project_of_a_search` (`tests/api.rs`, en lugar de `a_search_refuses_a_project_and_a_group`); `every_route_that_takes_a_project_follows_a_merge` cubre `project_ids`.
+- [x] `search_request` nombra el primer proyecto del grupo en `project_id`, y `searched_projects` lee el grupo por encima de `project_id`.
+- Commit: `fix(search): let an older daemon read a group as its first project`
+- [x] Tests en rojo: `a_root_is_read_as_each_system_reads_it` y los casos nuevos de `a_root_is_read_as_a_uri_or_a_path` y `the_home_directory_is_never_a_project` (`roots.rs`; no compilaban: `folder_of` no tomaba el sistema).
+- [x] `folder_of` con el sistema como argumento, `is_absolute` sobre el texto, la carpeta compartida de otro host en Windows, el directorio personal dentro de un checkout, y un `roots/list` que falla como warning.
+- Commit: `fix(mcp): read a Windows share as a root, and home inside a checkout as home`
+- [x] Test en rojo: `the_refusal_names_what_is_read_without_the_user_adding_it` (`api.rs`).
+- [x] `not_accepted`, `clawg projects add` en `commands.md` y el índice de documentos en `daemon.md`.
+- Commit: `fix(daemon): say that a folder the client has open is read without adding it`
+- [x] Test en rojo: `the_protocol_says_where_a_call_without_a_project_goes` (`protocol.rs`).
+- [x] La apertura con `all_projects`, `answer_suggestion` en la sección de proyectos y la clave de un hit de un grupo en los dos idiomas; los dos contratos bendecidos, con sólo esa oración cambiada.
+- Commit: `docs(mcp): name all_projects in the opening, and the key of a group's hit`
+- [x] La spec, esta lista y `verify.md`.
+- Commit: `docs(openspec): record what bridge-project-identity took from its other application`
