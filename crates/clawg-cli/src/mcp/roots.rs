@@ -2,8 +2,8 @@
 //!
 //! A host does not say where the user works by the directory it starts the
 //! bridge in: Cursor starts it in the home directory whatever its windows
-//! hold. What it does answer is `roots/list`, with the folders of every
-//! window open at that moment, and it never notifies a change. So a call that
+//! hold. What it does answer is `roots/list`, with the folders its window
+//! has open at that moment, and it never notifies a change. So a call that
 //! names no project reads the roots the client gives in that call, and only a
 //! client that gives none falls back on the bridge's own directory.
 
