@@ -358,7 +358,7 @@
       "name": "save_memory"
     },
     "search_memory": {
-      "description": "Find stored memories related to a query. Use this first, before answering anything that depends on an earlier session. Matching is by meaning, so pass a full natural-language question, not keywords; it finds memories written in other words, but often misses one written in another language than the query. Returns a numbered list of the memories close in relevance to the best match (at least two), with their ids, types and relevance scores; a short list means the rest scored far lower, not that nothing else is stored. Content longer than 500 characters is truncated. A hit marked piece=K/N is the best matching piece K of a long text saved as N pieces; read_memory with its id returns the whole text. With several folders open in the client it searches them all, and each hit names its project after project=.",
+      "description": "Find stored memories related to a query. Use this first, before answering anything that depends on an earlier session. Matching is by meaning, so pass a full natural-language question, not keywords; it finds memories written in other words, but often misses one written in another language than the query. Returns a numbered list of the memories close in relevance to the best match (at least two), with their ids, types and relevance scores; a short list means the rest scored far lower, not that nothing else is stored. Content longer than 500 characters is truncated. A hit marked piece=K/N is the best matching piece K of a long text saved as N pieces; read_memory with its id returns the whole text. With several folders open in the client it searches them all, and a hit names its project after project=. A hit without project= has no project or comes from an older daemon, which does not make it all_projects: when you cannot tell which project a save goes to, ask the user.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -390,7 +390,7 @@
           },
           "project_path": {
             "default": null,
-            "description": "Absolute path of the project to search in. Defaults to the folders the\nclient has open, or else the directory this bridge was started in;\nwith several open it searches them all.",
+            "description": "Absolute path of the project to search in. Defaults to the folders the\nclient has open, or else the directory this bridge was started in;\nwith several open it searches them all. The home directory is never\none of them, and with none left it searches every project, with hits\nthat do not name their project.",
             "type": [
               "string",
               "null"

@@ -358,7 +358,7 @@
       "name": "save_memory"
     },
     "search_memory": {
-      "description": "Encuentra memorias guardadas relacionadas con una consulta. Úsala primero, antes de responder algo que dependa de una sesión anterior. La coincidencia es por significado, así que pasa una pregunta completa en lenguaje natural, no palabras clave; encuentra memorias escritas con otras palabras, pero a menudo pierde una escrita en otro idioma que la consulta. Devuelve una lista numerada de las memorias cercanas en relevancia a la mejor (al menos dos), con sus ids, tipos y puntajes; una lista corta significa que el resto puntuó mucho más bajo, no que no haya nada más guardado. El contenido de más de 500 caracteres se recorta. Un hit marcado piece=K/N es la pieza K, la que mejor coincide, de un texto largo guardado en N piezas; read_memory con su id devuelve el texto entero. Con varias carpetas abiertas en el cliente busca en todas, y cada hit nombra su proyecto después de project=.",
+      "description": "Encuentra memorias guardadas relacionadas con una consulta. Úsala primero, antes de responder algo que dependa de una sesión anterior. La coincidencia es por significado, así que pasa una pregunta completa en lenguaje natural, no palabras clave; encuentra memorias escritas con otras palabras, pero a menudo pierde una escrita en otro idioma que la consulta. Devuelve una lista numerada de las memorias cercanas en relevancia a la mejor (al menos dos), con sus ids, tipos y puntajes; una lista corta significa que el resto puntuó mucho más bajo, no que no haya nada más guardado. El contenido de más de 500 caracteres se recorta. Un hit marcado piece=K/N es la pieza K, la que mejor coincide, de un texto largo guardado en N piezas; read_memory con su id devuelve el texto entero. Con varias carpetas abiertas en el cliente busca en todas, y un hit nombra su proyecto después de project=. Un hit sin project= no tiene proyecto o viene de un daemon anterior, y eso no lo vuelve all_projects: cuando no puedas saber a qué proyecto va un save, pregúntale a la persona.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -390,7 +390,7 @@
           },
           "project_path": {
             "default": null,
-            "description": "Ruta absoluta del proyecto en el que buscar. Por defecto, las carpetas que el cliente tiene abiertas, o si no el directorio en el que arrancó este puente; con varias abiertas busca en todas.",
+            "description": "Ruta absoluta del proyecto en el que buscar. Por defecto, las carpetas que el cliente tiene abiertas, o si no el directorio en el que arrancó este puente; con varias abiertas busca en todas. El directorio personal nunca es una de ellas, y si no queda ninguna busca en todos los proyectos, con hits que no nombran su proyecto.",
             "type": [
               "string",
               "null"

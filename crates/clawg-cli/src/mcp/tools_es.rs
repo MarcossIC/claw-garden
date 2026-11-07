@@ -212,7 +212,9 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
          el resto puntuó mucho más bajo, no que no haya nada más guardado. El contenido de más de 500 caracteres se \
          recorta. Un hit marcado piece=K/N es la pieza K, la que mejor coincide, de un texto largo guardado en N \
          piezas; read_memory con su id devuelve el texto entero. Con varias carpetas abiertas en el cliente busca \
-         en todas, y cada hit nombra su proyecto después de project=.",
+         en todas, y un hit nombra su proyecto después de project=. Un hit sin project= no tiene proyecto o viene \
+         de un daemon anterior, y eso no lo vuelve all_projects: cuando no puedas saber a qué proyecto va un save, \
+         pregúntale a la persona.",
     ),
     (
         "search_memory",
@@ -225,7 +227,9 @@ pub const DESCRIPTIONS: &[(&str, Option<&str>, &str)] = &[
         "search_memory",
         Some("project_path"),
         "Ruta absoluta del proyecto en el que buscar. Por defecto, las carpetas que el cliente tiene abiertas, o si \
-         no el directorio en el que arrancó este puente; con varias abiertas busca en todas.",
+         no el directorio en el que arrancó este puente; con varias abiertas busca en todas. El directorio personal \
+         nunca es una de ellas, y si no queda ninguna busca en todos los proyectos, con hits que no nombran su \
+         proyecto.",
     ),
     (
         "search_memory",

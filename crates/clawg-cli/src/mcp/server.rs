@@ -206,7 +206,9 @@ pub struct SaveMemoryArgs {
 impl SaveMemoryArgs {
     /// Whether the save says where it goes: a folder, a project or every one.
     fn names_its_project(&self) -> bool {
-        self.project.is_some() || self.project_path.as_deref().is_some_and(|p| !p.is_empty()) || self.all_projects == Some(true)
+        self.project.as_deref().is_some_and(|p| !p.trim().is_empty())
+            || self.project_path.as_deref().is_some_and(|p| !p.is_empty())
+            || self.all_projects == Some(true)
     }
 }
 
@@ -220,7 +222,9 @@ pub struct SearchMemoryArgs {
     pub limit: Option<usize>,
     /// Absolute path of the project to search in. Defaults to the folders the
     /// client has open, or else the directory this bridge was started in;
-    /// with several open it searches them all.
+    /// with several open it searches them all. The home directory is never
+    /// one of them, and with none left it searches every project, with hits
+    /// that do not name their project.
     #[serde(default)]
     pub project_path: Option<String>,
     /// The project by its id or its name, for one with no folder here or
@@ -508,7 +512,7 @@ pub struct ClawgMcp {
     /// sent to `POST /v1/projects` by this process, with the ids it gave
     /// them: a declared subfolder of a root leads to another project. Shared
     /// by every clone, because rmcp clones the server per call.
-    registered: Arc<tokio::sync::Mutex<HashMap<(PathBuf, PathBuf), ProjectIds>>>,
+    registered: Arc<tokio::sync::Mutex<HashMap<(PathBuf, PathBuf), Sent>>>,
     profile: Profile,
     /// The user's preferred language when the bridge started, which this
     /// session's instructions, searches and answers keep.
@@ -522,6 +526,14 @@ pub struct ClawgMcp {
 struct ProjectIds {
     project: String,
     root: String,
+}
+
+/// A root as this process sent it to `POST /v1/projects`: the ids the daemon
+/// gave it, and whether the daemon was asked to read its files.
+#[derive(Debug, Clone)]
+struct Sent {
+    ids: ProjectIds,
+    index_docs: bool,
 }
 
 /// The user's home directory, canonical, as a root resolves.
@@ -623,18 +635,19 @@ impl ClawgMcp {
         (open.len() == 1).then(|| open.remove(0))
     }
 
-    /// The open folders whose files the daemon may read on its own: each with
-    /// a `.git` or a manifest, other than the home directory.
-    fn indexable_folders(&self) -> Vec<ProjectIdentity> {
+    /// The folders of `open`, as [`Self::open_folders`] gives them, whose
+    /// files the daemon may read on its own: each with a `.git` or a
+    /// manifest, other than the home directory.
+    fn indexable_folders(&self, open: &[ProjectIdentity]) -> Vec<ProjectIdentity> {
         let home = self.home.as_deref();
-        self.open_folders().into_iter().filter(|p| auto_indexable(&p.root, home, has_project_marker(&p.root))).collect()
+        open.iter().filter(|p| auto_indexable(&p.root, home, has_project_marker(&p.root))).cloned().collect()
     }
 
     /// The project id of `folder` as this process registered it, or the one
     /// derived from its root, without registering it.
     async fn known_id(&self, folder: &ProjectIdentity) -> String {
         let registered = self.registered.lock().await;
-        registered.get(&(folder.root.clone(), folder.path.clone())).map_or_else(|| folder.id.clone(), |ids| ids.project.clone())
+        registered.get(&(folder.root.clone(), folder.path.clone())).map_or_else(|| folder.id.clone(), |sent| sent.ids.project.clone())
     }
 
     /// [`Self::known_id`] of each open folder: where a save from here, naming
@@ -1020,7 +1033,9 @@ impl ClawgMcp {
     /// Each root and path is sent once per process, even when the call
     /// fails: a daemon that cannot register (an older version, say) must not
     /// cost every tool call a round trip, and the ids derived from the root
-    /// are what such a daemon uses. The exceptions are a call the daemon
+    /// are what such a daemon uses. It is sent once more when its files become
+    /// the daemon's to read: a folder named before the client opened it, or
+    /// before it had a `.git` or a manifest. The exceptions are a call the daemon
     /// never got (a refused token or connection), which is sent again, and a
     /// root whose id belongs to another root, which only a daemon from before
     /// assigned ids answers: that is `Err`, because reading or writing under
@@ -1032,23 +1047,32 @@ impl ClawgMcp {
         project_path: Option<&str>,
         all_projects: bool,
     ) -> Result<Option<ProjectIds>, ClientError> {
-        match resolve_project(self.one_folder().as_ref(), project_path, all_projects, ProjectIdentity::resolve) {
-            Some(project) => self.ids_of(client, project).await.map(Some),
+        let open = self.open_folders();
+        let one = match open.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        };
+        match resolve_project(one, project_path, all_projects, ProjectIdentity::resolve) {
+            Some(project) => self.ids_of(client, project, &open).await.map(Some),
             None => Ok(None),
         }
     }
 
     /// The ids of `project`, registered as [`Self::ids_for`] says. Its files
-    /// are the daemon's to read only when it is an open folder that may be
-    /// read on its own ([`indexes_docs`]).
-    async fn ids_of(&self, client: &DaemonClient, project: ProjectIdentity) -> Result<ProjectIds, ClientError> {
+    /// are the daemon's to read only when it is one of `open`, the open
+    /// folders, that may be read on its own ([`indexes_docs`]).
+    async fn ids_of(&self, client: &DaemonClient, project: ProjectIdentity, open: &[ProjectIdentity]) -> Result<ProjectIds, ClientError> {
         let key = (project.root.clone(), project.path.clone());
         let mut registered = self.registered.lock().await;
-        if let Some(ids) = registered.get(&key) {
-            return Ok(ids.clone());
+        let sent = registered.get(&key);
+        if let Some(sent) = sent.filter(|sent| sent.index_docs) {
+            return Ok(sent.ids.clone());
+        }
+        let index_docs = indexes_docs(&project, &self.indexable_folders(open));
+        if let Some(sent) = sent.filter(|_| !index_docs) {
+            return Ok(sent.ids.clone());
         }
         let legacy = project.legacy_ids();
-        let index_docs = indexes_docs(&project, &self.indexable_folders());
         let ids = match client.register_project(&project.root, Some(&project.path), &legacy, index_docs).await {
             Ok(given) => ProjectIds { project: given.project_id, root: given.root_id },
             Err(e) if e.is_root_collision() => return Err(e),
@@ -1063,7 +1087,7 @@ impl ClawgMcp {
                 derived
             }
         };
-        registered.insert(key, ids.clone());
+        registered.insert(key, Sent { ids: ids.clone(), index_docs });
         Ok(ids)
     }
 
@@ -1243,9 +1267,10 @@ impl ClawgMcp {
                     };
                     (project_id, Vec::new(), save_projects)
                 } else {
+                    let open = self.open_folders();
                     let mut ids: Vec<String> = Vec::new();
-                    for folder in self.open_folders() {
-                        let id = self.ids_of(&client, folder).await?.project;
+                    for folder in &open {
+                        let id = self.ids_of(&client, folder.clone(), &open).await?.project;
                         if !ids.contains(&id) {
                             ids.push(id);
                         }
@@ -1747,8 +1772,10 @@ impl ClawgMcp {
                        Content longer than 500 characters is truncated. A hit marked piece=K/N \
                        is the best matching piece K of a long text saved as N pieces; \
                        read_memory with its id returns the whole text. With several folders open \
-                       in the client it searches them all, and each hit names its project after \
-                       project=."
+                       in the client it searches them all, and a hit names its project after \
+                       project=. A hit without project= has no project or comes from an older \
+                       daemon, which does not make it all_projects: when you cannot tell which \
+                       project a save goes to, ask the user."
     )]
     async fn search_memory(
         &self,
@@ -5550,6 +5577,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_save_with_a_blank_project_names_no_project() {
+        let (b, _d) = bridge().await;
+
+        for blank in ["", "   "] {
+            let refused =
+                b.save_memory_impl("a", SaveMemoryArgs { project: Some(blank.into()), ..save_args("the deploy runs on fridays") }).await.unwrap();
+
+            let out = text(&refused);
+            assert!(is_error(&refused) && out.starts_with("not saved: say which project"), "{blank:?}: {out}");
+        }
+        assert_eq!(memory_rows(&b).await, 0);
+    }
+
+    #[tokio::test]
     async fn a_save_with_no_open_folder_asks_for_the_project_folder() {
         let (b, _d) = bridge_at(None, |r| r).await;
 
@@ -5717,6 +5758,22 @@ mod tests {
     async fn a_root_the_client_declares_is_indexed_like_the_directory() {
         let (_dir, alpha, _beta, _gamma) = three_checkouts();
         let (b, _d, store) = bridge_with_store(test_project()).await;
+
+        b.with_roots(folders(&[&alpha])).search_memory_impl("a", search_args(DEPLOY)).await.unwrap();
+
+        assert_eq!(index_docs_of(&store, &alpha.id).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_folder_named_before_it_was_open_is_indexed_once_open() {
+        let (_dir, alpha, _beta, _gamma) = three_checkouts();
+        let (b, _d, store) = bridge_with_store(test_project()).await;
+        let saved = b
+            .save_memory_impl("a", SaveMemoryArgs { project_path: Some(alpha.root.display().to_string()), ..save_args(DEPLOY) })
+            .await
+            .unwrap();
+        assert!(!is_error(&saved), "{}", text(&saved));
+        assert_eq!(index_docs_of(&store, &alpha.id).await, Some(0), "a folder that is not open is only a label");
 
         b.with_roots(folders(&[&alpha])).search_memory_impl("a", search_args(DEPLOY)).await.unwrap();
 
