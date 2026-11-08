@@ -35,6 +35,10 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 - ninguna ventana se abre sola;
 - la RAM es aceptable: esta semana decide el brazo B de ram-footprint-gates, porque cada evento de hook despierta el modelo.
 
+## En la nube mientras corre el piloto
+
+[session-usage](changes/session-usage/exploration.md) (121), partes A, B y C. Va ahora y no después del corte porque mide: lo que entre en una versión al empezar la semana deja contadas las sesiones del piloto. El conteo dice cuántas sesiones buscan, cuántas guardan, cuántas cierran con resumen y cuántas compactan, el dato que agent-eval y la parte B de session-lifecycle esperan para decidir. No toca `memory.db`, así que subir una versión durante el piloto no arriesga las memorias. La parte D espera al primer reporte. No va la misma noche que la parte A de session-lifecycle, porque las dos cambian `crates/clawg-cli/src/daemon/sessions.rs`.
+
 ## Corte (una noche local, con el piloto aprobado)
 
 Antes, lo que dejó el ensayo de history-reimport en [«Para el corte»](changes/history-reimport/verify.md#para-el-corte): decidir qué snapshots automáticos de `prod` se copian aparte, porque el corte poda algunos, y volver a clasificar las notas de un export nuevo que el mapa no conoce.
@@ -67,6 +71,8 @@ Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y despué
 **Instalación y distribución:** [claude-code-plugin](changes/claude-code-plugin/exploration.md), que decide si servidor y hooks se distribuyen como plugin de Claude Code y si el bloque de protocolo de `CLAUDE.md` sobra. Acerca la meta, pero el piloto corre con `--local`: sube si instalar a mano en el segundo repositorio resulta engorroso.
 
 **Calidad de lo guardado:** memory-anchors, y una política de olvido para `memory`, que hoy no existe y todavía no tiene cambio.
+
+**Costo por sesión:** [session-tokens](changes/session-tokens/exploration.md) (122) va en local, después de session-usage, y sólo si se quiere el costo de cada proyecto. Para saber si clawg ahorra alcanza agent-eval, que compara la misma tarea con y sin clawg.
 
 ## Cómo se mantiene
 
