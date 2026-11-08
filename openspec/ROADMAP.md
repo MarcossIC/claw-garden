@@ -64,6 +64,8 @@ Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y despué
 
 **Modelo y memoria del proceso:** tokenizer-footprint, embedder-bakeoff y model-reembed, que sólo sube si un modelo candidato pasa su umbral.
 
+**Instalación y distribución:** [claude-code-plugin](changes/claude-code-plugin/exploration.md), que decide si servidor y hooks se distribuyen como plugin de Claude Code y si el bloque de protocolo de `CLAUDE.md` sobra. Acerca la meta, pero el piloto corre con `--local`: sube si instalar a mano en el segundo repositorio resulta engorroso.
+
 **Calidad de lo guardado:** memory-anchors, y una política de olvido para `memory`, que hoy no existe y todavía no tiene cambio.
 
 ## Cómo se mantiene
