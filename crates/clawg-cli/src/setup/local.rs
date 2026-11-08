@@ -85,19 +85,9 @@ fn without_verbatim(path: PathBuf) -> PathBuf {
 }
 
 /// Whether git ignores the folder's `.claude/settings.local.json`: `None`
-/// when git cannot be run or the folder is not in a repository. The `GIT_*`
-/// of the caller's environment are left out, so they cannot point git at
-/// another repository.
+/// when git cannot be run or the folder is not in a repository.
 pub fn ignored_by_git(folder: &Path) -> Option<bool> {
-    let mut command = Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"GIT_")) {
-            command.env_remove(key);
-        }
-    }
-    let status = command
-        .arg("-C")
-        .arg(folder)
+    let status = git_in(folder)
         .args(["check-ignore", "-q", "--", LOCAL_FILE])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -109,6 +99,19 @@ pub fn ignored_by_git(folder: &Path) -> Option<bool> {
         Some(1) => Some(false),
         _ => None,
     }
+}
+
+/// `git -C folder` without the `GIT_*` of the caller's environment, which
+/// could point it at another repository.
+fn git_in(folder: &Path) -> Command {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"GIT_")) {
+            command.env_remove(key);
+        }
+    }
+    command.arg("-C").arg(folder);
+    command
 }
 
 /// The name the copies of a folder's file start with: the folder's name
@@ -423,7 +426,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         assert_eq!(ignored_by_git(&repo), None, "not a repository");
         let git = |args: &[&str]| {
-            let status = std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap();
+            let status = git_in(&repo).args(args).status().unwrap();
             assert!(status.success(), "git {args:?}");
         };
         git(&["init", "-q"]);

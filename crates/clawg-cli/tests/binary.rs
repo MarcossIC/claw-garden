@@ -3439,8 +3439,12 @@ async fn setup_local_installs_in_the_folder_and_remove_undoes_it() {
     let settings: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
     assert_eq!(settings["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact", "{settings}");
-    let bin = clawg_core::memory::identity::strip_verbatim(&std::fs::canonicalize(BIN).unwrap());
-    assert_eq!(hook["command"], json!(bin), "{settings}");
+    // The same file can be written more than one way on Windows (case, a
+    // junction, the `\\?\` prefix), so the paths are compared resolved.
+    let command = hook["command"].as_str().expect("the hook's command");
+    assert!(Path::new(command).is_absolute(), "{settings}");
+    let resolved = |path: &str| std::fs::canonicalize(path).unwrap_or_else(|e| panic!("{path}: {e}\n{settings}"));
+    assert_eq!(resolved(command), resolved(BIN), "{settings}");
     assert_eq!(hook["args"], json!(["hook", "session-start", "--agent", "claude-code", "--profile", "dev"]), "{settings}");
     assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][1], "user-prompt-submit", "{settings}");
     assert!(!config.exists(), "the user's settings, server and protocol are not touched");
