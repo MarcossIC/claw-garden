@@ -18,7 +18,7 @@ use clawg_core::preferences::{self, Lang};
 use serde_json::{Map, Value};
 
 use super::{
-    current_exe, describe_command, done_or_planned, event_groups, file_lines, is_clawg_server, matches_server, now_ms,
+    copy_name, current_exe, describe_command, done_or_planned, event_groups, file_lines, is_clawg_server, matches_server, now_ms,
     parse_object, read, runs_clawg_hook, sh_word, split_command, write_files, File, FileStep, Mode, Server, SetupError,
     Written,
 };
@@ -352,7 +352,11 @@ pub fn read_state(exe: PathBuf, profile: Profile, home: Option<&Path>, data_dir:
 /// Carries the plan out: each file that changes, copied first to
 /// `<data>/backups/setup` and written through a temporary file.
 pub fn apply(plan: &Plan, state: &State, base_dir: &Path, now_ms: i64) -> Written {
-    write_files(&[(&plan.servers, &state.servers), (&plan.hooks, &state.hooks)], base_dir, now_ms)
+    let files = [
+        (&plan.servers, &state.servers, copy_name(&state.servers.path)),
+        (&plan.hooks, &state.hooks, copy_name(&state.hooks.path)),
+    ];
+    write_files(&files, base_dir, now_ms)
 }
 
 /// The report, one line per file, and the exit code: 1 when a step did not
