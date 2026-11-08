@@ -27,6 +27,7 @@ use serde_json::{Map, Value};
 use crate::update::plan::stamp;
 
 pub mod cursor;
+pub mod local;
 
 /// The agent id the bridge and the hooks are pinned to: the name Claude Code
 /// reports of itself, so a user who never pinned it keeps their memories.
@@ -103,6 +104,15 @@ pub enum SetupError {
     Unexpected { path: PathBuf, layout: &'static str, what: &'static str },
     #[error("{path} has one clawg protocol marker without the other; fix or remove it by hand, nothing was changed")]
     LoneMarker { path: PathBuf },
+    #[error("{0} is not a folder; nothing was changed")]
+    NotAFolder(PathBuf),
+    #[error(
+        "{0} is the home directory, whose .claude holds the user's own settings; run it in the project's folder or pass \
+         --path, nothing was changed"
+    )]
+    HomeFolder(PathBuf),
+    #[error("--local and --path put Claude Code's hooks in one folder; `clawg setup cursor` installs Cursor's for the user")]
+    FolderForCursor,
 }
 
 /// The registration of the profile's MCP server.
@@ -203,10 +213,7 @@ pub struct Plan {
 /// Decides every step from what was read. Fails, so that nothing is written,
 /// when a file cannot be understood.
 pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
-    if !state.exe.is_absolute() {
-        return Err(SetupError::RelativeExe(state.exe.clone()));
-    }
-    let exe = state.exe.to_str().ok_or_else(|| SetupError::NonUnicodeExe(state.exe.clone()))?;
+    let exe = exe_text(&state.exe)?;
     let server = Server::planned(exe, state.profile);
     let servers = parse_object(&state.servers, CLAUDE_LAYOUT)?;
     let registered = |name: &str| servers.as_ref().and_then(|s| s.get("mcpServers")).and_then(|m| m.get(name));
@@ -238,6 +245,15 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
     };
 
     Ok(Plan { mode, server, server_step, hooks, settings: settings_step, block, instructions })
+}
+
+/// The binary's path as the server and the hooks name it: absolute, and
+/// valid Unicode, since the files are JSON.
+fn exe_text(exe: &Path) -> Result<&str, SetupError> {
+    if !exe.is_absolute() {
+        return Err(SetupError::RelativeExe(exe.to_path_buf()));
+    }
+    exe.to_str().ok_or_else(|| SetupError::NonUnicodeExe(exe.to_path_buf()))
 }
 
 /// What `mode` does to `profile`'s clawg hooks in one settings file: the
