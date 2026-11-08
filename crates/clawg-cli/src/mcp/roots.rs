@@ -47,12 +47,13 @@ async fn uris(ctx: &RequestContext<RoleServer>) -> Result<Vec<String>, rmcp::ser
 
 /// The folder a root's `uri` names, or `None` when it names none, read as
 /// Windows reads it when `windows`. A `file:` URI is read as one; anything
-/// else as the path itself, which is what Cursor sends (`c:\...`), when it
-/// is absolute. On Windows every `/` becomes `\`.
+/// else as the path itself, which is what Cursor sends (`c:\...` as a root,
+/// `/c:/...` in a hook's `workspace_roots`), when it is absolute. On Windows
+/// every `/` becomes `\`.
 pub fn folder_of(uri: &str, windows: bool) -> Option<PathBuf> {
     let text = match uri.get(..5) {
         Some(scheme) if scheme.eq_ignore_ascii_case("file:") => uri_path(uri, windows)?,
-        _ => uri.to_string(),
+        _ => without_slash_before_drive(uri, windows).to_string(),
     };
     let text = if windows { text.replace('/', "\\") } else { text };
     is_absolute(&text, windows).then(|| PathBuf::from(text))
@@ -89,9 +90,19 @@ fn uri_path(uri: &str, windows: bool) -> Option<String> {
         None => rest.starts_with('/').then_some(rest)?,
     };
     let path = percent_decode(path)?;
+    Some(without_slash_before_drive(&path, windows).to_string())
+}
+
+/// `path` without the `/` that comes before a drive on Windows (`/C:/x` is
+/// `C:/x`), as a URI's path has it.
+fn without_slash_before_drive(path: &str, windows: bool) -> &str {
     let bytes = path.as_bytes();
-    let drive = bytes.len() >= 3 && bytes[1].is_ascii_alphabetic() && bytes[2] == b':';
-    Some(if windows && drive { path[1..].to_string() } else { path })
+    let drive = bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':';
+    if windows && drive {
+        &path[1..]
+    } else {
+        path
+    }
 }
 
 /// `text` with each `%XX` turned into its byte, as long as the result is
@@ -172,18 +183,20 @@ mod tests {
         let on = |uri: &str, windows| folder_of(uri, windows).map(|p| p.display().to_string());
         let repo = Some(r"c:\Users\u\repo".to_string());
         assert_eq!(on(r"c:\Users\u\repo", true), repo, "as Cursor sends it");
+        assert_eq!(on("/c:/Users/u/repo", true), repo, "as Cursor writes a hook's workspace root");
         assert_eq!(on("file:///c%3A/Users/u/repo", true), repo, "as VS Code encodes it");
         assert_eq!(on("file://localhost/c:/Users/u/repo", true), repo);
         assert_eq!(on("c:/Users/u/repo", true), repo);
         assert_eq!(on("file://server/share/repo", true), Some(r"\\server\share\repo".into()), "another host is a share");
         assert_eq!(on(r"\\server\share\repo", true), Some(r"\\server\share\repo".into()));
         assert_eq!(on("/home/u/repo", false), Some("/home/u/repo".into()));
+        assert_eq!(on("/c:/Users/u/repo", false), Some("/c:/Users/u/repo".into()), "only Windows has drives");
         assert_eq!(on("file:///home/u/ni%C3%B1o", false), Some("/home/u/niño".into()));
 
         for uri in ["repo", "./repo", "vscode-remote://ssh-remote+box/home/u/repo", "file:///home/u/%F", "file://server/share", r"c:\repo"] {
             assert_eq!(on(uri, false), None, "{uri}");
         }
-        for uri in ["repo", r"..\repo", "file:///home/u/repo", "file://server", r"\repo"] {
+        for uri in ["repo", r"..\repo", "file:///home/u/repo", "file://server", r"\repo", "/c:", "/home/u/repo"] {
             assert_eq!(on(uri, true), None, "{uri}");
         }
     }

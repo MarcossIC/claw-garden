@@ -24,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::cli::{HookClient, HookEvent};
 use crate::client::{ClientError, Context, DaemonClient, Health, ListArgs};
 use crate::hook_log::{self, Outcome, Run};
+use crate::mcp::roots::folder_of;
 use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
 
 /// The most a hook takes, from reading stdin to the answer: under the five
@@ -66,9 +67,9 @@ pub struct HookInput {
     /// in this project carry it.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Cursor's folders of the window, in place of `cwd`.
+    /// Cursor's folders of the window, in place of `cwd`, as it writes them.
     #[serde(default)]
-    pub workspace_roots: Option<Vec<PathBuf>>,
+    pub workspace_roots: Option<Vec<String>>,
     /// Sent by Cursor only, whatever it holds: what tells that Cursor runs a
     /// hook installed for Claude Code.
     #[serde(default)]
@@ -203,15 +204,33 @@ pub fn envelope(host: HookClient, event: HookEvent, text: &str) -> String {
 
 /// The folder whose project the hook reads: Claude Code's `cwd`, or the
 /// directory the hook runs in without one. Cursor runs a user hook in
-/// `~/.cursor`, so its folder is its one workspace root, and with several or
-/// none there is no telling which: none.
+/// `~/.cursor`, so its folder is its one workspace root, read as the bridge
+/// reads a root, since on Windows Cursor writes it `/C:/Users/u/repo`. With
+/// several roots, none, or one that names no folder, there is no telling
+/// which: none.
 pub fn folder(host: HookClient, input: &HookInput, current_dir: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
     match host {
         HookClient::ClaudeCode => input.cwd.clone().or_else(current_dir),
-        HookClient::Cursor => match input.workspace_roots.as_deref() {
-            Some([root]) => Some(root.clone()),
-            _ => None,
-        },
+        HookClient::Cursor => one_root(input).and_then(|root| folder_of(root, cfg!(windows))),
+    }
+}
+
+/// Cursor's one workspace root as it wrote it, or `None` with several or none.
+fn one_root(input: &HookInput) -> Option<&str> {
+    match input.workspace_roots.as_deref() {
+        Some([root]) => Some(root),
+        _ => None,
+    }
+}
+
+/// The folder as the input names it, before it is read: what the record keeps,
+/// since the form a client writes is what tells why a run found no project.
+fn folder_as_sent(host: HookClient, input: &HookInput) -> Option<String> {
+    match host {
+        HookClient::ClaudeCode => {
+            folder(host, input, || std::env::current_dir().ok()).map(|f| f.to_string_lossy().into_owned())
+        }
+        HookClient::Cursor => one_root(input).map(str::to_string),
     }
 }
 
@@ -336,8 +355,8 @@ async fn respond_reading(
         folder: parsed
             .as_ref()
             .filter(|_| outcome != Outcome::OtherClient)
-            .and_then(|i| folder(host, i, || std::env::current_dir().ok()))
-            .map(|f| hook_log::cut(&f.to_string_lossy(), hook_log::FOLDER_CHARS)),
+            .and_then(|i| folder_as_sent(host, i))
+            .map(|f| hook_log::cut(&f, hook_log::FOLDER_CHARS)),
         cursor_version: parsed.as_ref().and_then(|i| i.cursor_version.as_ref()).and_then(version_text),
         input_keys: raw.as_deref().map(hook_log::input_keys).unwrap_or_default(),
     });
@@ -875,7 +894,7 @@ mod tests {
     #[test]
     fn the_hook_input_reads_what_cursor_sends() {
         let input = HookInput::parse(cursor_input(&[Path::new("/work/repo")]).as_bytes()).unwrap();
-        assert_eq!(input.workspace_roots, Some(vec![PathBuf::from("/work/repo")]));
+        assert_eq!(input.workspace_roots, Some(vec!["/work/repo".to_string()]));
         assert_eq!(input.session_id.as_deref(), Some("668320d2-2fd8-4888-b33c-2a466fec86e7"));
         assert!(input.cursor_version.is_some());
         assert_eq!((input.cwd, input.source), (None, None));
@@ -884,15 +903,29 @@ mod tests {
         assert_eq!(any_version.workspace_roots, None);
     }
 
+    /// A folder as Cursor writes it in `workspace_roots`: on Windows with a `/`
+    /// before the drive and `/` between the parts (`/C:/Users/u/repo`).
+    fn as_cursor_writes(path: &Path) -> String {
+        let text = path.display().to_string();
+        if cfg!(windows) {
+            format!("/{}", text.replace('\\', "/"))
+        } else {
+            text
+        }
+    }
+
     #[test]
     fn cursor_reads_the_project_of_its_one_workspace_root() {
-        let (repo, other, dot_cursor) = (PathBuf::from("/work/repo"), PathBuf::from("/work/other"), PathBuf::from("/home/u/.cursor"));
+        let work = if cfg!(windows) { Path::new(r"C:\work") } else { Path::new("/work") };
+        let (repo, other, dot_cursor) = (work.join("repo"), work.join("other"), work.join(".cursor"));
         let here = || Some(dot_cursor.clone());
-        let input = |roots: Option<Vec<PathBuf>>| HookInput { workspace_roots: roots, ..HookInput::default() };
+        let input = |roots: Option<Vec<String>>| HookInput { workspace_roots: roots, ..HookInput::default() };
+        let written = |roots: &[&Path]| input(Some(roots.iter().map(|r| as_cursor_writes(r)).collect()));
 
-        assert_eq!(folder(HookClient::Cursor, &input(Some(vec![repo.clone()])), here), Some(repo.clone()));
-        assert_eq!(folder(HookClient::Cursor, &input(Some(vec![repo.clone(), other])), here), None, "no guessing between two");
-        assert_eq!(folder(HookClient::Cursor, &input(Some(Vec::new())), here), None);
+        assert_eq!(folder(HookClient::Cursor, &written(&[&repo]), here), Some(repo.clone()), "{}", as_cursor_writes(&repo));
+        assert_eq!(folder(HookClient::Cursor, &written(&[&repo, &other]), here), None, "no guessing between two");
+        assert_eq!(folder(HookClient::Cursor, &written(&[]), here), None);
+        assert_eq!(folder(HookClient::Cursor, &input(Some(vec!["repo".into()])), here), None, "a relative root names no folder");
         assert_eq!(folder(HookClient::Cursor, &input(None), here), None, "never the directory the hook runs in");
 
         let claude = HookInput { cwd: Some(repo.clone()), ..HookInput::default() };

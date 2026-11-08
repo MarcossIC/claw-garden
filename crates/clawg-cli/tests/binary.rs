@@ -1746,9 +1746,22 @@ async fn a_hook_registers_the_session_of_the_saves() {
     assert_eq!(session_of(&list, "the release notes live in docs/releases"), "s2", "a later prompt of another session wins: {list}");
 }
 
+/// A folder as Cursor writes it in `workspace_roots`: on Windows with a `/`
+/// before the drive and `/` between the parts (`/C:/Users/u/repo`).
+fn as_cursor_writes(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        format!("/{}", text.replace('\\', "/"))
+    } else {
+        text
+    }
+}
+
 /// What Cursor hands a user hook at `sessionStart`, with `roots` as the
-/// window's folders: the fields its documentation lists, and no `cwd`.
+/// window's folders written as Cursor writes them: the fields its
+/// documentation lists, and no `cwd`.
 fn cursor_session_start(roots: &[&Path]) -> String {
+    let roots: Vec<String> = roots.iter().map(|root| as_cursor_writes(root)).collect();
     json!({
         "conversation_id": "668320d2-2fd8-4888-b33c-2a466fec86e7",
         "generation_id": "490b90b7-a2ce-4c2c-bb76-cb77b125df2f",
@@ -1870,7 +1883,7 @@ async fn a_cursor_session_start_leaves_its_line_and_no_input_value() {
     let run = &runs[0];
     assert_eq!((run["client"].as_str(), run["agent"].as_str(), run["outcome"].as_str()), (Some("cursor"), Some("smoke"), Some("injected")));
     assert_eq!(run["roots"], 1);
-    assert_eq!(run["folder"], root.to_str().unwrap());
+    assert_eq!(run["folder"], as_cursor_writes(&root), "the root as Cursor wrote it");
     assert_eq!(run["cursor_version"], "3.28.0");
     assert_eq!(run["bytes"], stdout_of(&out).trim_end().len());
     assert!(run["input_keys"].as_array().unwrap().contains(&json!("user_email")), "{run}");
