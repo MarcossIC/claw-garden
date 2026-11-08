@@ -1,0 +1,15 @@
+change: setup-local-hooks
+objective: "4"
+depends_on: []
+phase: proposal
+artifacts:
+  exploration: skipped  # el problema está verificado en la propuesta, con su código
+  proposal: done
+  spec: done  # SL1 a SL6
+  design: skipped  # sin alternativas de arquitectura: reusa el plan y la escritura de setup
+  tasks: done
+  apply: pending
+  verify: pending
+  archive: pending
+main_spec: openspec/specs/setup/spec.md
+updated: 2026-11-08
