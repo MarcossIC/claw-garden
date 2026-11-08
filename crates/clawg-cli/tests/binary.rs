@@ -3405,6 +3405,59 @@ async fn setup_cursor_installs_and_remove_undoes_it() {
     assert_eq!(hooks, json!({ "version": 1 }));
 }
 
+#[tokio::test]
+async fn setup_local_installs_in_the_folder_and_remove_undoes_it() {
+    let sandbox = Sandbox::new();
+    let app = sandbox.home.join("work").join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    let config = sandbox.home.join("claude-config");
+    let local = |args: &[&str], dir: &Path| {
+        sandbox
+            .command(&[&["setup", "claude-code", "--profile", "dev"], args].concat())
+            .env("CLAUDE_CONFIG_DIR", &config)
+            .current_dir(dir)
+            .output()
+            .expect("run clawg setup")
+    };
+
+    let out = local(&["--local"], &app);
+    assert_eq!(out.status.code(), Some(0), "{}{}", stdout_of(&out), stderr_of(&out));
+    let file = app.join(".claude").join("settings.local.json");
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
+    assert_eq!(settings["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact", "{settings}");
+    assert_eq!(hook["command"], json!(std::fs::canonicalize(BIN).unwrap()), "{settings}");
+    assert_eq!(hook["args"], json!(["hook", "session-start", "--agent", "claude-code", "--profile", "dev"]), "{settings}");
+    assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][1], "user-prompt-submit", "{settings}");
+    assert!(!config.exists(), "the user's settings, server and protocol are not touched");
+
+    let elsewhere = local(&["--path", "work/app", "--remove"], &sandbox.home);
+    assert_eq!(elsewhere.status.code(), Some(0), "{}{}", stdout_of(&elsewhere), stderr_of(&elsewhere));
+    assert!(!app.join(".claude").exists(), "{}", stdout_of(&elsewhere));
+
+    let copies = || std::fs::read_dir(sandbox.data_dir().join("backups").join("setup")).unwrap().count();
+    let before = copies();
+    let home = local(&["--local"], &sandbox.home);
+    assert_eq!(home.status.code(), Some(1), "{}", stdout_of(&home));
+    assert!(stderr_of(&home).contains("is the home directory"), "{}", stderr_of(&home));
+    let missing = local(&["--path", "nowhere"], &sandbox.home);
+    assert_eq!(missing.status.code(), Some(1), "{}", stdout_of(&missing));
+    assert!(stderr_of(&missing).contains("is not a folder"), "{}", stderr_of(&missing));
+    assert!(!sandbox.home.join(".claude").exists(), "a refusal writes nothing");
+    assert_eq!(copies(), before, "nor copies anything");
+}
+
+#[tokio::test]
+async fn setup_cursor_refuses_a_folder() {
+    let sandbox = Sandbox::new();
+    for args in [&["--local"][..], &["--path", "."][..]] {
+        let out = sandbox.run(&[&["setup", "cursor", "--profile", "dev"], args].concat());
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stdout_of(&out));
+        assert!(stderr_of(&out).contains("`clawg setup cursor` installs Cursor's for the user"), "{}", stderr_of(&out));
+    }
+    assert!(!sandbox.home.join(".cursor").exists() && !sandbox.home.join(".claude").exists());
+}
+
 /// The line `setup cursor` installs, run through `sh -c` in `~/.cursor` with
 /// what Cursor hands it: the quoting and `--client cursor` reach the hook.
 #[cfg(unix)]
