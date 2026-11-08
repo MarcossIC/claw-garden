@@ -44,7 +44,7 @@ Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y despué
 1. `clawg setup claude-code --remove` y `clawg setup claude-code`, porque el servidor ya registrado sin `--agent` no se actualiza solo. Después `clawg setup cursor`.
 2. Sacar el plugin de Engram, su bloque de protocolo del `CLAUDE.md` global y su servidor de Cursor.
 3. Decidir dónde guarda sus artefactos el flujo SDD de los skills de usuario: hoy usa Engram por omisión. Recomendado: `openspec`, que ya existe y no depende de una herramienta de memoria. No actualizar Engram antes del último export: clawg lee los formatos `0.1.0` y `0.2.0`.
-4. Decidir si hace falta la captura de `Stop` y `SubagentStop`, que Engram tiene y clawg no.
+4. Decidir si clawg necesita capturar en `Stop` y `SubagentStop`, donde hoy no instala hooks.
 5. Mirar el `--dry-run` de `clawg import --from claude-code` y decidir.
 6. Dejar Engram instalado y sin escrituras dos semanas, como vuelta atrás. Después, se desinstala.
 
