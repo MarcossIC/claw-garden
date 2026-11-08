@@ -21,7 +21,7 @@ Fuente de verdad del comportamiento actual de `clawg hook <evento>`: el subcoman
 - **Salida de Cursor:** `{"additional_context": T}` en stdout.
 - **Corrida:** una ejecución de `clawg hook session-start`, de `--client claude-code` o de `--client cursor`, que llegó a leer su entrada. `user-prompt-submit` no es una corrida, con ningún cliente.
 - **Registro:** `<data>/hook-runs.jsonl`, un objeto JSON por línea. Al llegar a 64 KiB (65.536 bytes) pasa a `hook-runs.1.jsonl`.
-- **Campos de una corrida:** `at_ms` (milisegundos Unix al empezar), `client` (`claude-code` o `cursor`), `agent`, `source` (el de la entrada, o `null`), `outcome`, `bytes` (los de la salida impresa en stdout, sin el salto de línea final; 0 si no se imprimió nada), `elapsed_ms`, `roots` (la cantidad de `workspace_roots`, o `null` si no se mandaron), `folder` (la carpeta cuyo proyecto se leyó, como llegó, o `null`), `cursor_version` (el texto de ese campo, o `null`) e `input_keys` (los nombres de los campos de primer nivel de la entrada, en su orden; vacío si la entrada no es un objeto JSON).
+- **Campos de una corrida:** `at_ms` (milisegundos Unix al empezar), `client` (`claude-code` o `cursor`), `agent`, `source` (el de la entrada, o `null`), `outcome`, `bytes` (los de la salida impresa en stdout, sin el salto de línea final; 0 si no se imprimió nada), `elapsed_ms`, `roots` (la cantidad de `workspace_roots`, o `null` si no se mandaron), `folder` (la carpeta de la entrada tal como llegó, el `cwd` o la única raíz de Cursor, aunque no nombre una carpeta, o `null`), `cursor_version` (el texto de ese campo, o `null`) e `input_keys` (los nombres de los campos de primer nivel de la entrada, en su orden; vacío si la entrada no es un objeto JSON).
 - **`outcome`:** uno de `injected`, `empty_context`, `several_folders`, `no_folder`, `no_daemon`, `project_refused`, `daemon_error`, `timed_out`, `bad_input`, `other_client`.
 
 ## R2. `clawg hook <evento>`
@@ -136,14 +136,19 @@ Los dos eventos MUST leer la preferencia en cada evento (`language_in`, `hook.rs
 
 ## CU7. La carpeta sale de la entrada
 
-Con `--client cursor`, la carpeta del proyecto MUST ser la única raíz de `workspace_roots`, y MUST NOT salir del directorio actual (`folder`, `crates/clawg-cli/src/hook.rs:194`). Con varias raíces o ninguna, el hook MUST NOT registrar ningún proyecto ni sesión y MUST imprimir sólo la línea del idioma, en la salida de Cursor, cuando hay preferencia, y nada si no.
+Con `--client cursor`, la carpeta del proyecto MUST ser la única raíz de `workspace_roots`, leída como el puente lee una raíz (BI2 de [`specs/mcp`](../mcp/spec.md), `folder_of`), y MUST NOT salir del directorio actual (`folder`, `crates/clawg-cli/src/hook.rs:211`). En Windows Cursor escribe esa raíz con una barra antes de la unidad y barras entre las partes (`/C:/Users/u/repo`). Con varias raíces, ninguna o una que no nombra una carpeta, el hook MUST NOT registrar ningún proyecto ni sesión y MUST imprimir sólo la línea del idioma, en la salida de Cursor, cuando hay preferencia, y nada si no.
+
+#### Escenario: la raíz como la escribe Cursor en Windows
+- GIVEN un daemon con un save del agente `smoke` en el proyecto de `C:\work\repo`
+- WHEN corre `clawg hook session-start --agent smoke --client cursor` con `workspace_roots` igual a `["/C:/work/repo"]`
+- THEN T trae ese save, y el daemon no tiene ningún proyecto con otra carpeta
 
 #### Escenario: dos raíces
 - GIVEN un daemon y una entrada de `sessionStart` con dos raíces
 - WHEN corre `clawg hook session-start --agent smoke --client cursor`
 - THEN stdout está vacío, sale con 0 y el daemon no tiene ningún proyecto
 
-**Tests:** `cursor_reads_the_project_of_its_one_workspace_root`, `cursor_without_one_root_gets_only_the_language_line` (`hook.rs`), `a_cursor_session_with_two_roots_registers_no_project` (`tests/binary.rs`).
+**Tests:** `cursor_reads_the_project_of_its_one_workspace_root`, `cursor_without_one_root_gets_only_the_language_line` (`hook.rs`), `a_root_is_read_as_each_system_reads_it` (`roots.rs`), `a_cursor_session_start_reads_its_one_root_and_not_its_directory` y `a_cursor_session_with_two_roots_registers_no_project` (`tests/binary.rs`, que escriben cada raíz como la escribe Cursor en el sistema que corre). Hasta 0.79.1 la raíz se tomaba tal como llegaba: en Windows `/C:/Users/u/repo` quedaba registrada como `C:Users\u\repo`, un proyecto nuevo y vacío, y el hook no inyectaba la memoria del proyecto.
 
 ## CU8. Un hook de Claude Code que corre Cursor no hace nada
 
@@ -177,7 +182,7 @@ Sin `--client cursor`, una entrada con `cursor_version` (de cualquier tipo) MUST
 | `other_client` | `--client claude-code` y la entrada trae `cursor_version` |
 | `timed_out` | el plazo del hook venció leyendo la entrada o llegando al daemon: sus archivos, la identidad del proyecto o su respuesta |
 | `several_folders` | `--client cursor` y `workspace_roots` tiene más de una raíz |
-| `no_folder` | no hay carpeta (Cursor sin raíces, o el directorio actual ilegible) |
+| `no_folder` | no hay carpeta (Cursor sin raíces o con una que no nombra una carpeta, o el directorio actual ilegible) |
 | `no_daemon` | no hay un daemon al que hablarle |
 | `project_refused` | el daemon rechaza la raíz porque su id pertenece a otra |
 | `daemon_error` | el daemon respondió con un error |

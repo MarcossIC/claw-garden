@@ -1746,9 +1746,22 @@ async fn a_hook_registers_the_session_of_the_saves() {
     assert_eq!(session_of(&list, "the release notes live in docs/releases"), "s2", "a later prompt of another session wins: {list}");
 }
 
+/// A folder as Cursor writes it in `workspace_roots`: on Windows with a `/`
+/// before the drive and `/` between the parts (`/C:/Users/u/repo`).
+fn as_cursor_writes(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        format!("/{}", text.replace('\\', "/"))
+    } else {
+        text
+    }
+}
+
 /// What Cursor hands a user hook at `sessionStart`, with `roots` as the
-/// window's folders: the fields its documentation lists, and no `cwd`.
+/// window's folders written as Cursor writes them: the fields its
+/// documentation lists, and no `cwd`.
 fn cursor_session_start(roots: &[&Path]) -> String {
+    let roots: Vec<String> = roots.iter().map(|root| as_cursor_writes(root)).collect();
     json!({
         "conversation_id": "668320d2-2fd8-4888-b33c-2a466fec86e7",
         "generation_id": "490b90b7-a2ce-4c2c-bb76-cb77b125df2f",
@@ -1870,7 +1883,7 @@ async fn a_cursor_session_start_leaves_its_line_and_no_input_value() {
     let run = &runs[0];
     assert_eq!((run["client"].as_str(), run["agent"].as_str(), run["outcome"].as_str()), (Some("cursor"), Some("smoke"), Some("injected")));
     assert_eq!(run["roots"], 1);
-    assert_eq!(run["folder"], root.to_str().unwrap());
+    assert_eq!(run["folder"], as_cursor_writes(&root), "the root as Cursor wrote it");
     assert_eq!(run["cursor_version"], "3.28.0");
     assert_eq!(run["bytes"], stdout_of(&out).trim_end().len());
     assert!(run["input_keys"].as_array().unwrap().contains(&json!("user_email")), "{run}");
@@ -3403,6 +3416,64 @@ async fn setup_cursor_installs_and_remove_undoes_it() {
     assert_eq!(std::fs::read_to_string(cursor.join("mcp.json")).unwrap(), mine);
     let hooks: Value = serde_json::from_str(&std::fs::read_to_string(cursor.join("hooks.json")).unwrap()).unwrap();
     assert_eq!(hooks, json!({ "version": 1 }));
+}
+
+#[tokio::test]
+async fn setup_local_installs_in_the_folder_and_remove_undoes_it() {
+    let sandbox = Sandbox::new();
+    let app = sandbox.home.join("work").join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    let config = sandbox.home.join("claude-config");
+    let local = |args: &[&str], dir: &Path| {
+        sandbox
+            .command(&[&["setup", "claude-code", "--profile", "dev"], args].concat())
+            .env("CLAUDE_CONFIG_DIR", &config)
+            .current_dir(dir)
+            .output()
+            .expect("run clawg setup")
+    };
+
+    let out = local(&["--local"], &app);
+    assert_eq!(out.status.code(), Some(0), "{}{}", stdout_of(&out), stderr_of(&out));
+    let file = app.join(".claude").join("settings.local.json");
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
+    assert_eq!(settings["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact", "{settings}");
+    // The same file can be written more than one way on Windows (case, a
+    // junction, the `\\?\` prefix), so the paths are compared resolved.
+    let command = hook["command"].as_str().expect("the hook's command");
+    assert!(Path::new(command).is_absolute(), "{settings}");
+    let resolved = |path: &str| std::fs::canonicalize(path).unwrap_or_else(|e| panic!("{path}: {e}\n{settings}"));
+    assert_eq!(resolved(command), resolved(BIN), "{settings}");
+    assert_eq!(hook["args"], json!(["hook", "session-start", "--agent", "claude-code", "--profile", "dev"]), "{settings}");
+    assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][1], "user-prompt-submit", "{settings}");
+    assert!(!config.exists(), "the user's settings, server and protocol are not touched");
+
+    let elsewhere = local(&["--path", "work/app", "--remove"], &sandbox.home);
+    assert_eq!(elsewhere.status.code(), Some(0), "{}{}", stdout_of(&elsewhere), stderr_of(&elsewhere));
+    assert!(!app.join(".claude").exists(), "{}", stdout_of(&elsewhere));
+
+    let copies = || std::fs::read_dir(sandbox.data_dir().join("backups").join("setup")).unwrap().count();
+    let before = copies();
+    let home = local(&["--local"], &sandbox.home);
+    assert_eq!(home.status.code(), Some(1), "{}", stdout_of(&home));
+    assert!(stderr_of(&home).contains("is the home directory"), "{}", stderr_of(&home));
+    let missing = local(&["--path", "nowhere"], &sandbox.home);
+    assert_eq!(missing.status.code(), Some(1), "{}", stdout_of(&missing));
+    assert!(stderr_of(&missing).contains("is not a folder"), "{}", stderr_of(&missing));
+    assert!(!sandbox.home.join(".claude").exists(), "a refusal writes nothing");
+    assert_eq!(copies(), before, "nor copies anything");
+}
+
+#[tokio::test]
+async fn setup_cursor_refuses_a_folder() {
+    let sandbox = Sandbox::new();
+    for args in [&["--local"][..], &["--path", "."][..]] {
+        let out = sandbox.run(&[&["setup", "cursor", "--profile", "dev"], args].concat());
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stdout_of(&out));
+        assert!(stderr_of(&out).contains("`clawg setup cursor` installs Cursor's for the user"), "{}", stderr_of(&out));
+    }
+    assert!(!sandbox.home.join(".cursor").exists() && !sandbox.home.join(".claude").exists());
 }
 
 /// The line `setup cursor` installs, run through `sh -c` in `~/.cursor` with

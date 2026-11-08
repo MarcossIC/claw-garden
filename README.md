@@ -388,6 +388,20 @@ Después **abrí una sesión nueva** de Claude Code. Adentro:
 3. Pedile que guarde algo, por ejemplo: "guardá en memoria que en este proyecto usamos pnpm".
 4. En una terminal, comprobalo con el visor: `clawg memories list --here`.
 
+### Sólo en un proyecto
+
+Para probar los hooks en un repositorio antes de instalarlos en todos, corré esto en la carpeta del proyecto:
+
+```powershell
+clawg setup claude-code --local
+```
+
+Instala los mismos dos hooks, pero en `.claude/settings.local.json` de esa carpeta, y no toca `~/.claude/settings.json`, el servidor MCP ni el protocolo: el servidor tiene que estar registrado para el usuario, con `clawg setup claude-code` o a mano. Para otra carpeta, `clawg setup claude-code --path <carpeta>`. Claude Code los lee en las sesiones que abras en esa carpeta. Si los hooks también están en `~/.claude/settings.json` y son idénticos, Claude Code los corre una sola vez.
+
+`clawg setup claude-code --local --remove` (o `--path <carpeta> --remove`) los saca. Si el archivo queda sin nada más, lo borra, y también la carpeta `.claude` si queda vacía. Como siempre, guarda antes una copia del archivo en `~/.clawg/backups/setup/`, con el nombre de la carpeta adelante, y con `--dry-run` muestra lo que haría.
+
+Ese archivo lleva la ruta completa de `clawg.exe`, que dice tu usuario. Si git no lo ignora, `setup` lo avisa: agregá `.claude/settings.local.json` al `.gitignore` del repositorio. En tu carpeta personal se niega, porque su `.claude` es la configuración de usuario de Claude Code, y una terminal nueva de Windows abre ahí.
+
 ### Fijar la identidad del agente
 
 Cada agente es dueño de sus memorias: las lista, las cambia, las borra y resuelve sus conflictos, pero no los de otro. Al buscar, también encuentra lo que guardaron los demás (ver [Compartir memorias entre agentes](#compartir-memorias-entre-agentes)). Sin configurar nada, el agente es el nombre que reporta el cliente MCP. Si el cliente cambia ese nombre, o deja de mandarlo (la versión nueva del protocolo lo vuelve opcional), lo guardado antes queda a nombre del agente viejo: la búsqueda lo sigue encontrando, marcado como de otro agente, pero el nuevo no lo puede listar, cambiar, borrar ni resolver como propio.
@@ -445,7 +459,7 @@ No instala un recordatorio de guardar, porque el hook de Cursor antes de cada me
 
 Como `setup claude-code`, guarda una copia de cada archivo en `~/.clawg/backups/setup/` antes de cambiarlo, y con `--dry-run` muestra lo que haría sin tocar nada. Lo que no coincide con lo que instalaría (un `clawg` registrado con otro comando, otro hook de clawg en `sessionStart`) no lo reemplaza: lo dice y sale con 1. Para rehacerlo, `clawg setup cursor --remove` y otra vez `clawg setup cursor`.
 
-**Qué proyecto usa.** Cursor arranca el servidor MCP en tu carpeta personal, sea cual sea la ventana, así que clawg no se fija en ese directorio: en cada llamada le pide a Cursor las carpetas abiertas, que son las de todas sus ventanas. Una búsqueda sin proyecto lee esas carpetas, y con varias abiertas busca en todas; un save nombra siempre su proyecto, y si el agente no lo dice, clawg no guarda y le muestra las carpetas para que elija. Tu carpeta personal nunca es un proyecto.
+**Qué proyecto usa.** Cursor arranca el servidor MCP en tu carpeta personal, sea cual sea la ventana, así que clawg no se fija en ese directorio: en cada llamada le pide a Cursor las carpetas abiertas, que son las de la ventana del chat, no las de las otras ventanas. Una búsqueda sin proyecto lee esas carpetas, y con varias abiertas en la ventana busca en todas; para leer lo de otra ventana, el agente pide `all_projects`. Un save nombra siempre su proyecto, y si el agente no lo dice, clawg no guarda y le muestra las carpetas para que elija. Tu carpeta personal nunca es un proyecto.
 
 **Apagá la configuración de terceros de Cursor.** "Include Third-Party Plugins, Skills, and Other Configs" (Settings → Agents → Third-Party Imports) viene encendido y hace que Cursor también cargue los hooks de `~/.claude/settings.json` y los plugins de Claude Code; en Windows, un hook `.sh` de un plugin abre una ventana de Git Bash. clawg no puede leer ese ajuste, así que `setup cursor` lo recuerda cada vez. Si queda encendido, el hook que instaló `clawg setup claude-code` no hace nada cuando lo corre Cursor.
 
@@ -553,6 +567,7 @@ clawg import --from engram e.json --profile dev   # las notas de otra herramient
 clawg import --from claude-code ~/.claude/projects --profile dev   # la memoria propia de Claude Code
 clawg import --undo 3 --profile dev       # deshace la importación 3 y conserva lo que cambió desde entonces (--dry-run)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
+clawg setup claude-code --local --profile dev   # sólo los hooks, en .claude/settings.local.json de esta carpeta (--path DIR, --dry-run, --remove)
 clawg setup cursor --profile dev        # conecta Cursor: servidor MCP y hook de inicio de sesión (--dry-run, --remove)
 clawg metrics report --metric http.duration --label route=/v1/search --by version   # latencias y memoria del daemon (--by day|hour, --since 7d)
 ```

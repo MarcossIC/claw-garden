@@ -124,7 +124,7 @@ Devuelve el id, el `status` y el `superseded_by` con que quedó la fila (`Restor
 
 ## R5. Herramienta MCP `restore_memory`
 
-El puente MUST exponer `restore_memory` con `kind` e `id`, y MUST mandar siempre el agente que llama (`restore_memory_impl`, `crates/clawg-cli/src/mcp/server.rs:1047`; la herramienta, `server.rs:1416`; `DaemonClient::restore`, `crates/clawg-cli/src/client.rs:1235`).
+El puente MUST exponer `restore_memory` sólo con `id`, sin `kind` en el esquema (un llamado que igual manda `kind` sigue [`specs/mcp`](../mcp/spec.md) RL7), y MUST mandar siempre el agente que llama (`restore_memory_impl`, `crates/clawg-cli/src/mcp/server.rs:1406`; la herramienta, `server.rs:1875`; `DaemonClient::restore`, `crates/clawg-cli/src/client.rs:1235`).
 
 - Sobre una borrada que el agente alcanza, de cualquier autor, MUST devolver un texto que nombra el id (`restored #N`); si sigue `superseded`, MUST decir por cuál y que la búsqueda no la muestra hasta que `resolve_conflict` la conserve, salvo que la que la reemplaza también esté borrada («Restaurar una fila reemplazada por una borrada») (`format_restore`, `crates/clawg-cli/src/mcp/tools.rs:422`).
 - Sobre una que `sharing.json` le oculta MUST fallar como si el id no existiera, y la fila MUST NOT cambiar ([`specs/visibility`](../visibility/spec.md) R3).
