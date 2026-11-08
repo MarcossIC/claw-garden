@@ -27,6 +27,7 @@ use serde_json::{Map, Value};
 use crate::update::plan::stamp;
 
 pub mod cursor;
+pub mod local;
 
 /// The agent id the bridge and the hooks are pinned to: the name Claude Code
 /// reports of itself, so a user who never pinned it keeps their memories.
@@ -103,6 +104,15 @@ pub enum SetupError {
     Unexpected { path: PathBuf, layout: &'static str, what: &'static str },
     #[error("{path} has one clawg protocol marker without the other; fix or remove it by hand, nothing was changed")]
     LoneMarker { path: PathBuf },
+    #[error("{0} is not a folder; nothing was changed")]
+    NotAFolder(PathBuf),
+    #[error(
+        "{0} is the home directory, whose .claude holds the user's own settings; run it in the project's folder or pass \
+         --path, nothing was changed"
+    )]
+    HomeFolder(PathBuf),
+    #[error("--local and --path put Claude Code's hooks in one folder; `clawg setup cursor` installs Cursor's for the user")]
+    FolderForCursor,
 }
 
 /// The registration of the profile's MCP server.
@@ -203,10 +213,7 @@ pub struct Plan {
 /// Decides every step from what was read. Fails, so that nothing is written,
 /// when a file cannot be understood.
 pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
-    if !state.exe.is_absolute() {
-        return Err(SetupError::RelativeExe(state.exe.clone()));
-    }
-    let exe = state.exe.to_str().ok_or_else(|| SetupError::NonUnicodeExe(state.exe.clone()))?;
+    let exe = exe_text(&state.exe)?;
     let server = Server::planned(exe, state.profile);
     let servers = parse_object(&state.servers, CLAUDE_LAYOUT)?;
     let registered = |name: &str| servers.as_ref().and_then(|s| s.get("mcpServers")).and_then(|m| m.get(name));
@@ -220,21 +227,8 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
         (_, Some(entry)) => ServerStep::Conflict(describe_command(entry)),
     };
 
-    let mut settings = parse_object(&state.settings, CLAUDE_LAYOUT)?;
-    if mode == Mode::Install && settings.is_none() {
-        settings = Some(Map::new());
-    }
-    let hooks = match (mode, settings.as_mut()) {
-        (_, None) => HooksStep::default(),
-        (Mode::Install, Some(s)) => install_hooks(s, exe, state.profile, &state.settings.path)?,
-        (Mode::Remove, Some(s)) => remove_hooks(s, state.profile, &state.settings.path)?,
-    };
-    let settings_step = if hooks.added.is_empty() && hooks.removed.is_empty() && hooks.migrated.is_empty() {
-        FileStep::Unchanged
-    } else {
-        let value = Value::Object(settings.unwrap_or_default());
-        FileStep::Write(serde_json::to_string_pretty(&value).expect("a JSON value serializes") + "\n")
-    };
+    let (hooks, changed) = plan_hooks(&state.settings, exe, state.profile, mode)?;
+    let settings_step = changed.map_or(FileStep::Unchanged, |settings| FileStep::Write(settings_text(settings)));
 
     let other = match state.profile {
         Profile::Dev => Profile::Prod,
@@ -251,6 +245,36 @@ pub fn plan(state: &State, mode: Mode) -> Result<Plan, SetupError> {
     };
 
     Ok(Plan { mode, server, server_step, hooks, settings: settings_step, block, instructions })
+}
+
+/// The binary's path as the server and the hooks name it: absolute, and
+/// valid Unicode, since the files are JSON.
+fn exe_text(exe: &Path) -> Result<&str, SetupError> {
+    if !exe.is_absolute() {
+        return Err(SetupError::RelativeExe(exe.to_path_buf()));
+    }
+    exe.to_str().ok_or_else(|| SetupError::NonUnicodeExe(exe.to_path_buf()))
+}
+
+/// What `mode` does to `profile`'s clawg hooks in one settings file: the
+/// step of each event, and the file's settings when the steps change them.
+fn plan_hooks(file: &File, exe: &str, profile: Profile, mode: Mode) -> Result<(HooksStep, Option<Map<String, Value>>), SetupError> {
+    let mut settings = parse_object(file, CLAUDE_LAYOUT)?;
+    if mode == Mode::Install && settings.is_none() {
+        settings = Some(Map::new());
+    }
+    let hooks = match (mode, settings.as_mut()) {
+        (_, None) => HooksStep::default(),
+        (Mode::Install, Some(s)) => install_hooks(s, exe, profile, &file.path)?,
+        (Mode::Remove, Some(s)) => remove_hooks(s, profile, &file.path)?,
+    };
+    let changed = !(hooks.added.is_empty() && hooks.removed.is_empty() && hooks.migrated.is_empty());
+    Ok((hooks, settings.filter(|_| changed)))
+}
+
+/// A settings file's text, as setup writes it.
+fn settings_text(settings: Map<String, Value>) -> String {
+    serde_json::to_string_pretty(&Value::Object(settings)).expect("a JSON value serializes") + "\n"
 }
 
 /// The file's JSON object, `None` when the file is missing; `layout` says
@@ -742,24 +766,27 @@ pub fn apply(plan: &Plan, state: &State, claude: Option<&Path>, base_dir: &Path,
         (Some(_), None) => ServerOutcome::Manual,
         (Some(args), Some(claude)) => run_claude(claude, &args),
     };
-    let files = [(&plan.settings, &state.settings), (&plan.instructions, &state.instructions)];
+    let files = [
+        (&plan.settings, &state.settings, copy_name(&state.settings.path)),
+        (&plan.instructions, &state.instructions, copy_name(&state.instructions.path)),
+    ];
     let Written { backups, pruned, failures } = write_files(&files, base_dir, now_ms);
     Applied { server, backups, pruned, failures }
 }
 
 /// Writes each file whose step changes it, through a temporary file and a
-/// rename after copying the old one to `<data>/backups/setup`, where only the
-/// newest [`KEPT_COPIES`] of each file stay. A file that fails does not stop
-/// the others.
-fn write_files(files: &[(&FileStep, &File)], base_dir: &Path, now_ms: i64) -> Written {
+/// rename after copying the old one to `<data>/backups/setup` under the name
+/// given with it, where only the newest [`KEPT_COPIES`] of each name stay. A
+/// file that fails does not stop the others.
+fn write_files(files: &[(&FileStep, &File, String)], base_dir: &Path, now_ms: i64) -> Written {
     let mut written = Written::default();
-    for &(step, file) in files {
-        if *step == FileStep::Unchanged {
+    for (step, file, name) in files {
+        if **step == FileStep::Unchanged {
             continue;
         }
-        match write_file(step, file, base_dir, now_ms) {
+        match write_file(step, file, name, base_dir, now_ms) {
             Ok(Some(backup)) => {
-                prune_copies(&copies_dir(base_dir), &copy_name(&file.path), &mut written);
+                prune_copies(&copies_dir(base_dir), name, &mut written);
                 written.backups.push(backup);
             }
             Ok(None) => {}
@@ -773,7 +800,7 @@ fn copies_dir(base_dir: &Path) -> PathBuf {
     backups_dir(base_dir).join("setup")
 }
 
-/// The name the copies of `path` start with.
+/// The name the copies of the user file at `path` start with.
 fn copy_name(path: &Path) -> String {
     path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned())
 }
@@ -822,7 +849,7 @@ fn run_claude(claude: &Path, args: &[String]) -> ServerOutcome {
     }
 }
 
-fn write_file(step: &FileStep, file: &File, base_dir: &Path, now_ms: i64) -> std::io::Result<Option<PathBuf>> {
+fn write_file(step: &FileStep, file: &File, name: &str, base_dir: &Path, now_ms: i64) -> std::io::Result<Option<PathBuf>> {
     let target = link_target(&file.path)?;
     let backup = match &file.text {
         Some(text) => {
@@ -831,7 +858,7 @@ fn write_file(step: &FileStep, file: &File, base_dir: &Path, now_ms: i64) -> std
             ensure_private_dir(base_dir)?;
             let dir = copies_dir(base_dir);
             ensure_private_dir(&dir)?;
-            let copy = dir.join(format!("{}-{}", copy_name(&file.path), stamp(now_ms)));
+            let copy = dir.join(format!("{name}-{}", stamp(now_ms)));
             create_fresh(&copy, Some(0o600))?.write_all(text.as_bytes())?;
             Some(copy)
         }
@@ -986,56 +1013,9 @@ pub fn report(plan: &Plan, state: &State, applied: Option<&Applied>) -> (String,
     };
     lines.push(server_line);
 
-    let hooks = &plan.hooks;
-    let mut parts = Vec::new();
-    if !hooks.added.is_empty() {
-        let step = will(("added", "add"), ("agregados", "se agregarían"));
-        parts.push(format!("{step} {}", hooks.added.join(", ")));
-    }
-    if !hooks.removed.is_empty() {
-        let step = will(("removed", "remove"), ("quitados", "se quitarían"));
-        parts.push(format!("{step} {}", hooks.removed.join(", ")));
-    }
-    if !hooks.migrated.is_empty() {
-        let step = will(("migrated", "migrate"), ("pasados", "se pasarían"));
-        let to = match lang {
-            Lang::En => "to run without a shell",
-            Lang::Es => "a correr sin shell",
-        };
-        parts.push(format!("{step} {} {to}", hooks.migrated.join(", ")));
-    }
-    if !hooks.unchanged.is_empty() {
-        let unchanged = hooks.unchanged.join(", ");
-        parts.push(match lang {
-            Lang::En => format!("{unchanged} already there"),
-            Lang::Es => format!("{unchanged} ya están"),
-        });
-    }
-    for (event, command) in &hooks.conflicts {
-        incomplete = true;
-        parts.push(match lang {
-            Lang::En => format!(
-                "{event} has another clawg hook, `{command}`; left as it is (`clawg setup claude-code --remove` takes it away)"
-            ),
-            Lang::Es => format!(
-                "{event} tiene otro hook de clawg, `{command}`; queda como está (`clawg setup claude-code --remove` lo quita)"
-            ),
-        });
-    }
-    if parts.is_empty() {
-        parts.push(
-            match lang {
-                Lang::En => "none of clawg's",
-                Lang::Es => "ninguno de clawg",
-            }
-            .to_string(),
-        );
-    }
-    let settings = state.settings.path.display();
-    lines.push(match lang {
-        Lang::En => format!("hooks in {settings}: {}", parts.join("; ")),
-        Lang::Es => format!("hooks en {settings}: {}", parts.join("; ")),
-    });
+    let (hooks, conflict) = hooks_line(lang, dry, &plan.hooks, &state.settings.path, "clawg setup claude-code --remove");
+    incomplete |= conflict;
+    lines.push(hooks);
 
     let block = match (plan.block, lang) {
         (BlockStep::Added, _) => will(("added", "add it"), ("agregado", "se agregaría")),
@@ -1085,6 +1065,61 @@ fn done_or_planned(lang: Lang, dry: bool, en: (&str, &str), es: (&str, &str)) ->
         (true, Lang::Es) => planned.to_string(),
     }
 }
+
+/// The report's line on the hooks of the settings file at `path`, and
+/// whether a step did not end as planned; `remove` is the command that takes a
+/// conflicting clawg hook away.
+fn hooks_line(lang: Lang, dry: bool, hooks: &HooksStep, path: &Path, remove: &str) -> (String, bool) {
+    let will = |en: (&str, &str), es: (&str, &str)| done_or_planned(lang, dry, en, es);
+    let mut incomplete = false;
+    let mut parts = Vec::new();
+    if !hooks.added.is_empty() {
+        let step = will(("added", "add"), ("agregados", "se agregarían"));
+        parts.push(format!("{step} {}", hooks.added.join(", ")));
+    }
+    if !hooks.removed.is_empty() {
+        let step = will(("removed", "remove"), ("quitados", "se quitarían"));
+        parts.push(format!("{step} {}", hooks.removed.join(", ")));
+    }
+    if !hooks.migrated.is_empty() {
+        let step = will(("migrated", "migrate"), ("pasados", "se pasarían"));
+        let to = match lang {
+            Lang::En => "to run without a shell",
+            Lang::Es => "a correr sin shell",
+        };
+        parts.push(format!("{step} {} {to}", hooks.migrated.join(", ")));
+    }
+    if !hooks.unchanged.is_empty() {
+        let unchanged = hooks.unchanged.join(", ");
+        parts.push(match lang {
+            Lang::En => format!("{unchanged} already there"),
+            Lang::Es => format!("{unchanged} ya están"),
+        });
+    }
+    for (event, command) in &hooks.conflicts {
+        incomplete = true;
+        parts.push(match lang {
+            Lang::En => format!("{event} has another clawg hook, `{command}`; left as it is (`{remove}` takes it away)"),
+            Lang::Es => format!("{event} tiene otro hook de clawg, `{command}`; queda como está (`{remove}` lo quita)"),
+        });
+    }
+    if parts.is_empty() {
+        parts.push(
+            match lang {
+                Lang::En => "none of clawg's",
+                Lang::Es => "ninguno de clawg",
+            }
+            .to_string(),
+        );
+    }
+    let settings = path.display();
+    let line = match lang {
+        Lang::En => format!("hooks in {settings}: {}", parts.join("; ")),
+        Lang::Es => format!("hooks en {settings}: {}", parts.join("; ")),
+    };
+    (line, incomplete)
+}
+
 
 /// The report's lines about the files written: the copies made, the older
 /// copies removed and each failure. Whether a failure kept a step from ending

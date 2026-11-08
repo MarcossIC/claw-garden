@@ -388,6 +388,20 @@ Después **abrí una sesión nueva** de Claude Code. Adentro:
 3. Pedile que guarde algo, por ejemplo: "guardá en memoria que en este proyecto usamos pnpm".
 4. En una terminal, comprobalo con el visor: `clawg memories list --here`.
 
+### Sólo en un proyecto
+
+Para probar los hooks en un repositorio antes de instalarlos en todos, corré esto en la carpeta del proyecto:
+
+```powershell
+clawg setup claude-code --local
+```
+
+Instala los mismos dos hooks, pero en `.claude/settings.local.json` de esa carpeta, y no toca `~/.claude/settings.json`, el servidor MCP ni el protocolo: el servidor tiene que estar registrado para el usuario, con `clawg setup claude-code` o a mano. Para otra carpeta, `clawg setup claude-code --path <carpeta>`. Claude Code los lee en las sesiones que abras en esa carpeta. Si los hooks también están en `~/.claude/settings.json` y son idénticos, Claude Code los corre una sola vez.
+
+`clawg setup claude-code --local --remove` (o `--path <carpeta> --remove`) los saca. Si el archivo queda sin nada más, lo borra, y también la carpeta `.claude` si queda vacía. Como siempre, guarda antes una copia del archivo en `~/.clawg/backups/setup/`, con el nombre de la carpeta adelante, y con `--dry-run` muestra lo que haría.
+
+Ese archivo lleva la ruta completa de `clawg.exe`, que dice tu usuario. Si git no lo ignora, `setup` lo avisa: agregá `.claude/settings.local.json` al `.gitignore` del repositorio. En tu carpeta personal se niega, porque su `.claude` es la configuración de usuario de Claude Code, y una terminal nueva de Windows abre ahí.
+
 ### Fijar la identidad del agente
 
 Cada agente es dueño de sus memorias: las lista, las cambia, las borra y resuelve sus conflictos, pero no los de otro. Al buscar, también encuentra lo que guardaron los demás (ver [Compartir memorias entre agentes](#compartir-memorias-entre-agentes)). Sin configurar nada, el agente es el nombre que reporta el cliente MCP. Si el cliente cambia ese nombre, o deja de mandarlo (la versión nueva del protocolo lo vuelve opcional), lo guardado antes queda a nombre del agente viejo: la búsqueda lo sigue encontrando, marcado como de otro agente, pero el nuevo no lo puede listar, cambiar, borrar ni resolver como propio.
@@ -553,6 +567,7 @@ clawg import --from engram e.json --profile dev   # las notas de otra herramient
 clawg import --from claude-code ~/.claude/projects --profile dev   # la memoria propia de Claude Code
 clawg import --undo 3 --profile dev       # deshace la importación 3 y conserva lo que cambió desde entonces (--dry-run)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
+clawg setup claude-code --local --profile dev   # sólo los hooks, en .claude/settings.local.json de esta carpeta (--path DIR, --dry-run, --remove)
 clawg setup cursor --profile dev        # conecta Cursor: servidor MCP y hook de inicio de sesión (--dry-run, --remove)
 clawg metrics report --metric http.duration --label route=/v1/search --by version   # latencias y memoria del daemon (--by day|hour, --since 7d)
 ```

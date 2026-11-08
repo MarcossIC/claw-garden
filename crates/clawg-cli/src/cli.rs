@@ -294,6 +294,14 @@ pub enum Command {
         /// Take away what setup installed. clawg's data stays.
         #[arg(long)]
         remove: bool,
+        /// Claude Code only: put the hooks in this folder's
+        /// `.claude/settings.local.json` alone, not in the user's settings,
+        /// and leave the server and the protocol as they are.
+        #[arg(long, conflicts_with = "path")]
+        local: bool,
+        /// Like `--local`, for the folder at DIR.
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1472,19 +1480,53 @@ mod tests {
     fn setup_takes_a_client_a_profile_dry_run_and_remove() {
         assert_eq!(
             parse(&["clawg", "setup", "claude-code"]).command,
-            Command::Setup { client: SetupClient::ClaudeCode, dry_run: false, remove: false, profile: ProfileArg { profile: None } }
+            Command::Setup {
+                client: SetupClient::ClaudeCode,
+                dry_run: false,
+                remove: false,
+                local: false,
+                path: None,
+                profile: ProfileArg { profile: None }
+            }
         );
         assert_eq!(
             parse(&["clawg", "setup", "claude-code", "--dry-run", "--remove", "--profile", "dev"]).command,
-            Command::Setup { client: SetupClient::ClaudeCode, dry_run: true, remove: true, profile: ProfileArg { profile: Some("dev".into()) } }
+            Command::Setup {
+                client: SetupClient::ClaudeCode,
+                dry_run: true,
+                remove: true,
+                local: false,
+                path: None,
+                profile: ProfileArg { profile: Some("dev".into()) }
+            }
         );
         assert_eq!(
             parse(&["clawg", "setup", "cursor", "--dry-run", "--profile", "dev"]).command,
-            Command::Setup { client: SetupClient::Cursor, dry_run: true, remove: false, profile: ProfileArg { profile: Some("dev".into()) } }
+            Command::Setup {
+                client: SetupClient::Cursor,
+                dry_run: true,
+                remove: false,
+                local: false,
+                path: None,
+                profile: ProfileArg { profile: Some("dev".into()) }
+            }
         );
         assert!(Cli::try_parse_from(["clawg", "setup"]).is_err(), "the client is required");
         assert!(Cli::try_parse_from(["clawg", "setup", "codex"]).is_err(), "only the clients it knows");
         assert!(!parse(&["clawg", "setup", "claude-code"]).command.loads_the_model());
+    }
+
+    #[test]
+    fn setup_takes_a_folder_for_claude_code_s_hooks() {
+        let setup = |args: &[&str]| match parse(&[&["clawg", "setup", "claude-code"], args].concat()).command {
+            Command::Setup { local, path, remove, .. } => (local, path, remove),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(setup(&[]), (false, None, false));
+        assert_eq!(setup(&["--local"]), (true, None, false));
+        assert_eq!(setup(&["--path", "../app", "--remove"]), (false, Some(PathBuf::from("../app")), true));
+        let both = Cli::try_parse_from(["clawg", "setup", "claude-code", "--local", "--path", "x"]);
+        assert!(both.is_err(), "one folder or the other");
     }
 
     #[test]

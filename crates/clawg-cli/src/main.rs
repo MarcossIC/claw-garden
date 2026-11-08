@@ -9,6 +9,7 @@
 //! where a usage error is `1`: a client reads `2` from a hook as "block", and a
 //! client that ignores a hook's `args` runs the binary alone.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clawg_cli::backup;
@@ -275,12 +276,15 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Setup { client, dry_run, remove, profile } => {
+        Command::Setup { client, dry_run, remove, local, path, profile } => {
             let profile = profile.resolve()?;
             let mode = if remove { setup::Mode::Remove } else { setup::Mode::Install };
-            let (text, code) = match client {
-                SetupClient::ClaudeCode => setup::run(profile, mode, dry_run)?,
-                SetupClient::Cursor => setup::cursor::run(profile, mode, dry_run)?,
+            let folder = path.or_else(|| local.then(|| PathBuf::from(".")));
+            let (text, code) = match (client, folder) {
+                (SetupClient::ClaudeCode, None) => setup::run(profile, mode, dry_run)?,
+                (SetupClient::ClaudeCode, Some(folder)) => setup::local::run(profile, mode, dry_run, &folder)?,
+                (SetupClient::Cursor, None) => setup::cursor::run(profile, mode, dry_run)?,
+                (SetupClient::Cursor, Some(_)) => return Err(setup::SetupError::FolderForCursor.into()),
             };
             println!("{text}");
             Ok(ExitCode::from(code))

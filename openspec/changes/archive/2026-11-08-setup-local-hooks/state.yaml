@@ -1,0 +1,16 @@
+change: setup-local-hooks
+objective: "4"
+depends_on: []
+phase: archived
+release: "0.80.0"  # el CI de Windows corre en el PR que lleva develop a main; Claude Code real, en el piloto (verify.md)
+artifacts:
+  exploration: skipped  # el problema está verificado en la propuesta, con su código
+  proposal: done
+  spec: done  # SL1 a SL6
+  design: skipped  # sin alternativas de arquitectura: reusa el plan y la escritura de setup
+  tasks: done
+  apply: done  # un commit por paso, con sus tests en rojo antes
+  verify: done  # Linux: la suite y los dos clippy; el CI de Windows y Claude Code real quedan pendientes (verify.md)
+  archive: done  # SL1 a SL6 en specs/setup
+main_spec: openspec/specs/setup/spec.md
+updated: 2026-11-08
