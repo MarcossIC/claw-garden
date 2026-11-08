@@ -34,7 +34,7 @@ El CI no corre en un push a `develop`. Los tests de este cambio no tienen ningun
 
 ## Pendiente en prod
 
-En el piloto del [ROADMAP](../../ROADMAP.md), con la versión publicada y el servidor ya registrado para el usuario, en Windows:
+En el piloto del [ROADMAP](../../../ROADMAP.md), con la versión publicada y el servidor ya registrado para el usuario, en Windows:
 
 1. `clawg setup claude-code --local --profile prod`, corrido en la carpeta del repositorio, deja los hooks en su `.claude/settings.local.json`, y una sesión nueva de Claude Code abierta en esa carpeta recibe el contexto: `clawg doctor` lo muestra en `hooks.runs`, con cliente `claude-code`.
 2. Con el archivo sin ignorar, el reporte avisa. Si Claude Code ya agregó `**/.claude/settings.local.json` a las exclusiones globales de git, no avisa.

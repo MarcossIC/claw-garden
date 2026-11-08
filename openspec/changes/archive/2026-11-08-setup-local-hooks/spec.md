@@ -1,6 +1,6 @@
 # setup-local-hooks — Spec
 
-Requisitos que este cambio agrega a [`specs/setup`](../../specs/setup/spec.md). Las definiciones (hook del plan, hook de clawg de un evento y un perfil, forma heredada idéntica) son las de esa spec.
+Requisitos que este cambio agrega a [`specs/setup`](../../../specs/setup/spec.md). Las definiciones (hook del plan, hook de clawg de un evento y un perfil, forma heredada idéntica) son las de esa spec.
 
 ## Definiciones
 

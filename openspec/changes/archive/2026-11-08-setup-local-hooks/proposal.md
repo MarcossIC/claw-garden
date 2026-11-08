@@ -6,7 +6,7 @@
 
 ## Problema
 
-`clawg setup claude-code` instala los hooks sólo en el `settings.json` del usuario: `read_state` toma esa ruta de `locations` (`crates/clawg-cli/src/setup.rs:645-658`, `:669-685`), y la CLI no tiene ninguna opción para otra carpeta (`Command::Setup`, `crates/clawg-cli/src/cli.rs:289-299`). Lo que escribe a nivel usuario afecta a todos los proyectos, y el [ROADMAP](../../ROADMAP.md) pide que el piloto corra primero en un repositorio real. Hoy eso obliga a copiar a mano en `<repo>/.claude/settings.local.json` los dos grupos que arma `install_hooks` (`setup.rs:476-514`), con la ruta absoluta del binario escrita en JSON, y a borrarlos a mano después. Un error de tipeo en esa ruta deja la sesión sin contexto y sin aviso, y nada vuelve a revisar que el bloque sea el que `setup` escribiría.
+`clawg setup claude-code` instala los hooks sólo en el `settings.json` del usuario: `read_state` toma esa ruta de `locations` (`crates/clawg-cli/src/setup.rs:645-658`, `:669-685`), y la CLI no tiene ninguna opción para otra carpeta (`Command::Setup`, `crates/clawg-cli/src/cli.rs:289-299`). Lo que escribe a nivel usuario afecta a todos los proyectos, y el [ROADMAP](../../../ROADMAP.md) pide que el piloto corra primero en un repositorio real. Hoy eso obliga a copiar a mano en `<repo>/.claude/settings.local.json` los dos grupos que arma `install_hooks` (`setup.rs:476-514`), con la ruta absoluta del binario escrita en JSON, y a borrarlos a mano después. Un error de tipeo en esa ruta deja la sesión sin contexto y sin aviso, y nada vuelve a revisar que el bloque sea el que `setup` escribiría.
 
 Claude Code lee hooks de `.claude/settings.local.json` de la carpeta del proyecto, y una definición idéntica en dos archivos corre una sola vez (code.claude.com/docs/en/hooks, «Hook handler fields», leído el 2026-11-08). Así, los mismos hooks del plan en ese archivo y en el `settings.json` del usuario no se duplican.
 
@@ -15,7 +15,7 @@ Claude Code lee hooks de `.claude/settings.local.json` de la carpeta del proyect
 Una carpeta como destino de los hooks, y nada más:
 
 - `clawg setup claude-code --local` instala en la carpeta donde se corre el comando; `clawg setup claude-code --path DIR`, en `DIR`. Las dos opciones se excluyen.
-- Se escribe sólo `<DIR>/.claude/settings.local.json`, con los mismos hooks del plan, las mismas reglas de conflicto y de migración y la misma escritura, copia y reporte que el `setup` de usuario (R3, R5 y R7 de [`specs/setup`](../../specs/setup/spec.md)).
+- Se escribe sólo `<DIR>/.claude/settings.local.json`, con los mismos hooks del plan, las mismas reglas de conflicto y de migración y la misma escritura, copia y reporte que el `setup` de usuario (R3, R5 y R7 de [`specs/setup`](../../../specs/setup/spec.md)).
 - `--remove` con cualquiera de las dos quita de ese archivo los hooks de clawg del perfil. Si no queda nada más, borra el archivo, y la carpeta `.claude` si queda vacía.
 
 ## Alcance
