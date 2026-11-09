@@ -1,14 +1,21 @@
 change: store-boundary
 objective: "transversal"
-depends_on: []
-phase: explore
+depends_on: []  # retire-legacy-kinds, que convenía antes, está archivado
+phase: apply  # el código espera a que entre a develop el otro cambio que toca crates/clawg-cli/src/daemon/api.rs
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done  # sus ruta:línea son de cuando se escribió; la propuesta las cita como están en develop
+  proposal: done  # los tres A de la exploración; el punto 5 del alcance candidato, confirmado
+  spec: done  # R1 a R10
+  design: done  # D1 a D11; las tres decisiones abiertas en D5, D7 y D9
+  tasks: done  # partes 1 a 9; archivar y subir la versión quedan fuera
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-01
+decisions:
+  storage_error_question: none  # nadie mira hoy el código de SQLite de un MemoryError (D5)
+  importing: runtime  # RunningImports en MemoryRuntime::imports (D7)
+  runtime_fields: public  # siete construcciones desde otro crate usan ..runtime (D9)
+  sharing_policy: worker  # el worker de ingest lee sharing.json del directorio que le da el runtime (D8)
+  error_texts: unchanged  # StorageError muestra la causa y cada envoltorio pone su encabezado (D5, D6)
+updated: 2026-11-09
+main_spec: openspec/specs/storage/spec.md, openspec/specs/portability/spec.md, openspec/specs/sharing/spec.md
