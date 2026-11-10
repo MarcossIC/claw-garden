@@ -685,6 +685,42 @@ pub enum MetricsAction {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Sum the client sessions the daemon kept by project, by agent or by
+    /// local day, and print how many there were, how they ended, how long
+    /// they lasted and what they did (prompts, tool calls, saves) as JSON;
+    /// or, with `--session`, one session row by row.
+    Sessions {
+        #[arg(long, value_enum, default_value_t = SessionsBy::Project)]
+        by: SessionsBy,
+        /// Only the sessions heard of since then, in days (`30d`) or hours
+        /// (`12h`).
+        #[arg(long, value_name = "AGE", value_parser = parse_since, default_value = "30d")]
+        since: std::time::Duration,
+        /// One session, by the id its client gives it, with each of its rows
+        /// whole, however old.
+        #[arg(long, value_name = "ID", conflicts_with = "by")]
+        session: Option<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+impl MetricsAction {
+    pub fn profile(&self) -> &ProfileArg {
+        match self {
+            MetricsAction::Report { profile, .. } | MetricsAction::Sessions { profile, .. } => profile,
+        }
+    }
+}
+
+/// What `clawg metrics sessions` groups by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SessionsBy {
+    /// The project's id; `clawg projects list` names each.
+    Project,
+    Agent,
+    /// The local date the session began on.
+    Day,
 }
 
 /// What `clawg metrics report` groups by.
@@ -1726,6 +1762,32 @@ mod tests {
             Command::Secrets { mask_reasons: true, yes: true, profile: ProfileArg { profile: None } }
         );
         assert!(Cli::try_parse_from(["clawg", "secrets", "--yes"]).is_err(), "--yes confirms a rewrite");
+    }
+
+    #[test]
+    fn metrics_sessions_takes_a_grouping_an_age_and_a_session() {
+        let Command::Metrics { action: MetricsAction::Sessions { by, since, session, .. } } = parse(&["clawg", "metrics", "sessions"]).command
+        else {
+            panic!("metrics sessions")
+        };
+        assert_eq!((by, since, session), (SessionsBy::Project, std::time::Duration::from_secs(30 * 86_400), None));
+        let Command::Metrics { action } = parse(&["clawg", "metrics", "sessions", "--by", "day", "--since", "12h", "--profile", "dev"]).command
+        else {
+            panic!("metrics sessions")
+        };
+        assert_eq!(action.profile(), &ProfileArg { profile: Some("dev".into()) });
+        let MetricsAction::Sessions { by, since, .. } = action else { panic!("metrics sessions") };
+        assert_eq!((by, since), (SessionsBy::Day, std::time::Duration::from_secs(12 * 3600)));
+        let Command::Metrics { action: MetricsAction::Sessions { session, .. } } =
+            parse(&["clawg", "metrics", "sessions", "--session", "2f1c9e9a", "--since", "1d"]).command
+        else {
+            panic!("metrics sessions")
+        };
+        assert_eq!(session.as_deref(), Some("2f1c9e9a"));
+        for refused in [&["--session", "s", "--by", "agent"][..], &["--by", "version"], &["--since", "soon"]] {
+            let args = [&["clawg", "metrics", "sessions"][..], refused].concat();
+            assert!(Cli::try_parse_from(args).is_err(), "{refused:?}");
+        }
     }
 
     #[test]

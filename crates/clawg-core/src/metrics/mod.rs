@@ -5,6 +5,7 @@ pub mod event;
 pub mod histogram;
 pub mod recorder;
 pub mod report;
+pub mod session_report;
 pub mod sessions;
 pub mod store;
 

@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clawg_cli::backup;
 use clawg_cli::cli::{
-    is_bare_invocation, is_hook_invocation, preferences_profile, sharing_profile, Cli, Command, MetricsAction,
+    is_bare_invocation, is_hook_invocation, preferences_profile, sharing_profile, Cli, Command,
     ProfileArg, SetupClient,
 };
 use clawg_cli::daemon::lifecycle::now_ms;
@@ -252,8 +252,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode, CliError> {
         }
 
         Command::Metrics { action } => {
-            let MetricsAction::Report { profile, .. } = &action;
-            let base_dir = data_dir(profile.resolve()?)?;
+            let base_dir = data_dir(action.profile().resolve()?)?;
             println!("{}", metrics::command(language(&base_dir), &base_dir, &action, now_ms() as i64)?);
             Ok(ExitCode::SUCCESS)
         }

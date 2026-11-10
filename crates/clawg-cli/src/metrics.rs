@@ -1,26 +1,56 @@
-//! `clawg metrics report`: reads `metrics.db` without the daemon and without
-//! the store's lock, as `export` reads `memory.db`.
+//! `clawg metrics report` and `clawg metrics sessions`: read `metrics.db`
+//! without the daemon and without the store's lock, as `export` reads
+//! `memory.db`.
 
 use std::path::Path;
 use std::time::Duration;
 
 use clawg_core::metrics::report::{report as group, since_for, By, Rows};
+use clawg_core::metrics::session_report::{self, SessionsBy as GroupBy};
 use clawg_core::metrics::store::{MetricsDb, MetricsError, METRICS_FILE};
 
 use clawg_core::preferences::Lang;
 
-use crate::cli::{MetricsAction, ReportBy};
+use crate::cli::{MetricsAction, ReportBy, SessionsBy};
 use crate::error::CliError;
 
 /// `clawg metrics report`: the report of `--metric`, or with `--events` the
-/// events of each run.
+/// events of each run. `clawg metrics sessions`: the sessions by group, or
+/// with `--session` one of them.
 pub fn command(lang: Lang, base_dir: &Path, action: &MetricsAction, now_ms: i64) -> Result<String, CliError> {
-    let MetricsAction::Report { metric, events: by_run, labels, by, since, .. } = action;
-    match metric {
-        Some(metric) if !by_run => report(lang, base_dir, metric, labels, *by, *since, now_ms),
-        _ => events(lang, base_dir, *since, now_ms),
+    match action {
+        MetricsAction::Report { metric: Some(metric), events: false, labels, by, since, .. } => {
+            report(lang, base_dir, metric, labels, *by, *since, now_ms)
+        }
+        MetricsAction::Report { since, .. } => events(lang, base_dir, *since, now_ms),
+        MetricsAction::Sessions { by, since, session, .. } => sessions(lang, base_dir, *by, *since, session.as_deref(), now_ms),
     }
     .map_err(CliError::Failed)
+}
+
+/// The sessions `base_dir`'s `metrics.db` holds, as pretty JSON: those heard
+/// of since `since` ago summed by `by`, or with `session` every row of that
+/// one. Projects are named by id; the file has no names and `memory.db` is
+/// not opened for them.
+pub fn sessions(lang: Lang, base_dir: &Path, by: SessionsBy, since: Duration, session: Option<&str>, now_ms: i64) -> Result<String, String> {
+    let (db, failed) = open(lang, base_dir)?;
+    let printed = match session {
+        Some(session_id) => {
+            let rows = db.sessions_of(session_id).map_err(&failed)?;
+            serde_json::to_string_pretty(&session_report::one_session(session_id, &rows, now_ms))
+        }
+        None => {
+            let by = match by {
+                SessionsBy::Project => GroupBy::Project,
+                SessionsBy::Agent => GroupBy::Agent,
+                SessionsBy::Day => GroupBy::Day,
+            };
+            let since_ms = now_ms.saturating_sub(i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+            let rows = db.sessions_since(since_ms).map_err(&failed)?;
+            serde_json::to_string_pretty(&session_report::report(&rows, by, since_ms, now_ms))
+        }
+    };
+    printed.map_err(|e| e.to_string())
 }
 
 /// The report of `metric` in `base_dir`'s `metrics.db` as pretty JSON, or
@@ -132,7 +162,7 @@ mod tests {
     use clawg_core::metrics::{EventKind, Recorder, Unit};
     use serde_json::Value;
 
-    use crate::cli::ProfileArg;
+    use crate::cli::{ProfileArg, SessionsBy};
 
     const NOW: i64 = 1_790_000_000_000;
 
@@ -253,6 +283,95 @@ mod tests {
         assert_eq!(older["runs"][0]["events"].as_array().map(Vec::len), Some(2));
         let empty = tempfile::tempdir().unwrap();
         assert!(events(Lang::Es, empty.path(), Duration::from_secs(60), NOW).unwrap_err().contains("no existe"));
+    }
+
+    /// Three rows in `dir`'s file: a session of project `p` that ended and
+    /// went on in a second row, and one without a project, ten days old.
+    fn seeded_sessions(dir: &Path) {
+        use clawg_core::metrics::sessions::{CountKind, Pending, SessionRow};
+        let row = |session_id: &str, project: Option<&str>, started_at_ms: i64, last_seen_at_ms: i64| SessionRow {
+            session_id: session_id.into(),
+            started_at_ms,
+            agent_id: "claude-code".into(),
+            project_id: project.map(String::from),
+            client: "claude-code".into(),
+            utc_offset_s: 0,
+            last_seen_at_ms,
+            last_save_at_ms: None,
+            ended_at_ms: None,
+            end_reason: None,
+            prompts: 2,
+            empty_searches: 0,
+            counts: Default::default(),
+        };
+        let hour = 3_600_000;
+        let mut first = row("s-1", Some("p"), NOW - 3 * hour, NOW - 2 * hour);
+        first.ended_at_ms = Some(NOW - 2 * hour);
+        first.end_reason = Some("clear".into());
+        first.counts.insert((CountKind::Call, "search_memory".into()), 3);
+        first.counts.insert((CountKind::Save, "session_summary".into()), 1);
+        let again = row("s-1", Some("p"), NOW - hour, NOW - 60_000);
+        let old = row("s-old", None, NOW - 10 * 24 * hour, NOW - 10 * 24 * hour);
+        let mut db = MetricsDb::open(&dir.join(METRICS_FILE), NOW).unwrap();
+        db.write_sessions(&Pending { changes: Vec::new(), rows: vec![first, again, old] }).unwrap();
+    }
+
+    #[test]
+    fn the_sessions_report_reads_the_file_without_a_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        seeded_sessions(dir.path());
+        let week = Duration::from_secs(7 * 86_400);
+        let asked = |by: SessionsBy, since: Duration| -> Value {
+            let action = MetricsAction::Sessions { by, since, session: None, profile: ProfileArg::default() };
+            serde_json::from_str(&command(Lang::En, dir.path(), &action, NOW).unwrap()).unwrap()
+        };
+
+        let by_project = asked(SessionsBy::Project, week);
+        assert_eq!((&by_project["by"], &by_project["since_ms"]), (&serde_json::json!("project"), &serde_json::json!(NOW - 7 * 86_400_000)));
+        let groups = by_project["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "the session of ten days ago is outside the week: {by_project}");
+        let p = &groups[0];
+        assert_eq!((&p["key"], &p["sessions"], &p["open"], &p["prompts"]), (&serde_json::json!("p"), &serde_json::json!(2), &serde_json::json!(1), &serde_json::json!(4)));
+        assert_eq!(p["ended"], serde_json::json!({ "clear": 1 }));
+        assert_eq!(p["calls"], serde_json::json!({ "search_memory": { "count": 3, "failed": 0 } }));
+        assert_eq!((&p["with_summary"], &p["with_summary_pct"]), (&serde_json::json!(1), &serde_json::json!(50.0)));
+
+        let month = asked(SessionsBy::Project, Duration::from_secs(30 * 86_400));
+        let none = &month["groups"][0];
+        assert_eq!((&none["key"], &none["ended"]), (&Value::Null, &serde_json::json!({ "idle": 1 })), "{month}");
+        assert_eq!(asked(SessionsBy::Agent, week)["groups"][0]["key"], "claude-code");
+        assert_eq!(asked(SessionsBy::Day, week)["by"], "day");
+
+        let empty = tempfile::tempdir().unwrap();
+        for (lang, said) in [(Lang::En, "CLAWG_METRICS=off"), (Lang::Es, "no existe")] {
+            let err = sessions(lang, empty.path(), SessionsBy::Project, week, None, NOW).unwrap_err();
+            assert!(err.contains(said), "{err}");
+        }
+        assert!(!empty.path().join(METRICS_FILE).exists(), "reading creates nothing");
+        seeded(empty.path());
+        assert_eq!(asked_in(empty.path(), week)["groups"], serde_json::json!([]), "a file without sessions has no groups");
+    }
+
+    fn asked_in(dir: &Path, since: Duration) -> Value {
+        serde_json::from_str(&sessions(Lang::En, dir, SessionsBy::Project, since, None, NOW).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn one_session_is_listed_with_each_of_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        seeded_sessions(dir.path());
+        let one = |id: &str| -> Value {
+            serde_json::from_str(&sessions(Lang::En, dir.path(), SessionsBy::Project, Duration::from_secs(3600), Some(id), NOW).unwrap()).unwrap()
+        };
+
+        let listed = one("s-1");
+        let rows = listed["rows"].as_array().unwrap();
+        assert_eq!((listed["session_id"].as_str(), rows.len()), (Some("s-1"), 2));
+        assert_eq!((&rows[0]["end_reason"], &rows[0]["duration_ms"]), (&serde_json::json!("clear"), &serde_json::json!(3_600_000)));
+        assert_eq!(rows[0]["saves"], serde_json::json!({ "session_summary": 1 }));
+        assert_eq!((&rows[1]["end_reason"], &rows[1]["ended_at_ms"]), (&Value::Null, &Value::Null), "the second row is open");
+        assert_eq!(one("s-old")["rows"][0]["end_reason"], "idle", "an age does not narrow one session");
+        assert_eq!(one("nobody")["rows"], serde_json::json!([]));
     }
 
     #[test]

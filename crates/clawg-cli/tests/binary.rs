@@ -136,10 +136,16 @@ impl Sandbox {
     fn bridge_with(&self, bin: &Path, args: &[&str]) -> Bridge {
         let root = self.home.join(format!("project-{}", now_ns()));
         std::fs::create_dir_all(&root).expect("project dir");
+        self.bridge_in(bin, args, &root)
+    }
+
+    /// A bridge started in `root`, as a client starts it in the folder it has
+    /// open.
+    fn bridge_in(&self, bin: &Path, args: &[&str], root: &Path) -> Bridge {
         let log = self.log(&format!("mcp-{}", now_ns()));
         let mut child = self
             .command_of(bin, args)
-            .current_dir(&root)
+            .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(File::create(&log).expect("log file"))
@@ -831,6 +837,79 @@ async fn metrics_off_leaves_no_metrics_file() {
     let out = sandbox.run(&["metrics", "report", "--profile", "dev", "--metric", "http.duration"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr_of(&out).contains("CLAWG_METRICS=off"), "{}", stderr_of(&out));
+}
+
+// ── Sessions ────────────────────────────────────────────────────────────────
+
+const SMOKE_HOOK: [&str; 4] = ["--agent", "smoke", "--profile", "dev"];
+
+/// Runs the hook of `event` for the agent the smoke bridge is pinned to.
+fn session_hook(sandbox: &Sandbox, event: &str, input: Value) {
+    let out = hook(sandbox, &[&[event], &SMOKE_HOOK[..]].concat(), &input.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+}
+
+fn sessions_report(sandbox: &Sandbox, args: &[&str]) -> Value {
+    let mut all = vec!["metrics", "sessions", "--profile", "dev"];
+    all.extend_from_slice(args);
+    let out = sandbox.run(&all);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    serde_json::from_slice(&out.stdout).expect("the sessions report prints JSON")
+}
+
+async fn stop(sandbox: &Sandbox, daemon: &Daemon) {
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stop.status.code(), Some(0), "{}", stderr_of(&stop));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn a_daemon_keeps_each_session_across_a_restart_and_reports_them() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    session_hook(&sandbox, "session-start", json!({ "session_id": "session-s", "cwd": root, "source": "startup" }));
+    let mut bridge = sandbox.bridge_in(Path::new(BIN), &["mcp", "--profile", "dev", "--no-autostart", "--agent", "smoke"], &root);
+    bridge.initialize();
+    let status = bridge.call(2, "memory_status", json!({}));
+    assert!(!tool_failed(&status), "{status}");
+    let search = bridge.call(3, "search_memory", json!({ "query": "where does the deploy script live" }));
+    assert!(!tool_failed(&search), "{search}");
+    session_hook(&sandbox, "user-prompt-submit", json!({ "session_id": "session-s", "cwd": root, "prompt": "go on" }));
+    session_hook(&sandbox, "session-start", json!({ "session_id": "session-s2", "cwd": root, "source": "clear" }));
+
+    stop(&sandbox, &daemon).await;
+    let before = sessions_report(&sandbox, &["--session", "session-s2"]);
+    assert_eq!(before["rows"].as_array().map(Vec::len), Some(1), "{before}");
+
+    let daemon = sandbox.serve().await;
+    session_hook(&sandbox, "user-prompt-submit", json!({ "session_id": "session-s2", "cwd": root, "prompt": "and now" }));
+    stop(&sandbox, &daemon).await;
+
+    let first = sessions_report(&sandbox, &["--session", "session-s"]);
+    let rows = first["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{first}");
+    assert_eq!(rows[0]["calls"], json!({ "memory_status": { "count": 1, "failed": 0 }, "search_memory": { "count": 1, "failed": 0 } }), "{first}");
+    assert_eq!((&rows[0]["prompts"], &rows[0]["starts"]), (&json!(1), &json!({ "startup": 1 })), "{first}");
+    assert_eq!((&rows[0]["agent_id"], &rows[0]["client"]), (&json!("smoke"), &json!("claude-code")), "{first}");
+    assert_eq!(rows[0]["empty_searches"], 1, "an empty store has no hit: {first}");
+
+    let second = sessions_report(&sandbox, &["--session", "session-s2"]);
+    let rows = second["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "a restart closes nothing: {second}");
+    assert_eq!(rows[0]["started_at_ms"], before["rows"][0]["started_at_ms"], "the row from before the restart: {second}");
+    assert_eq!((&rows[0]["prompts"], &rows[0]["starts"]), (&json!(1), &json!({ "clear": 1 })), "{second}");
+
+    let by_project = sessions_report(&sandbox, &[]);
+    let groups = by_project["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1, "{by_project}");
+    assert_eq!(groups[0]["key"], rows[0]["project_id"], "{by_project}");
+    assert!(groups[0]["key"].is_string(), "{by_project}");
+    assert_eq!((&groups[0]["sessions"], &groups[0]["prompts"]), (&json!(2), &json!(2)), "{by_project}");
+    assert_eq!(groups[0]["calls"]["search_memory"]["count"], 1, "{by_project}");
 }
 
 #[tokio::test]
