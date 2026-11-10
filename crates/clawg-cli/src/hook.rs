@@ -22,7 +22,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::cli::{HookClient, HookEvent};
-use crate::client::{ClientError, Context, DaemonClient, Health, ListArgs};
+use crate::client::{ClientError, Context, DaemonClient, Health, ListArgs, SessionEvent};
 use crate::hook_log::{self, Outcome, Run};
 use crate::mcp::roots::folder_of;
 use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
@@ -30,6 +30,18 @@ use crate::mcp::tools::{review_nudge, suggestion_note, synthesis_nudge};
 /// The most a hook takes, from reading stdin to the answer: under the five
 /// seconds a hook is configured with, so the client never cancels one.
 pub const HOOK_DEADLINE: Duration = Duration::from_secs(3);
+
+/// The most `session-end` takes: Claude Code gives the hooks of a session's
+/// end a second and a half between them, at an exit and at a `/clear`.
+pub const SESSION_END_DEADLINE: Duration = Duration::from_secs(1);
+
+/// How long the hook of `event` may take.
+pub fn deadline_of(event: HookEvent) -> Duration {
+    match event {
+        HookEvent::SessionStart | HookEvent::UserPromptSubmit => HOOK_DEADLINE,
+        HookEvent::SessionEnd => SESSION_END_DEADLINE,
+    }
+}
 
 /// What a session start keeps of its deadline for the record: a run that used
 /// up its time still leaves its line, which is what tells why that session
@@ -74,6 +86,9 @@ pub struct HookInput {
     /// hook installed for Claude Code.
     #[serde(default)]
     pub cursor_version: Option<serde_json::Value>,
+    /// Why the session ended, as the client says it at its end.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl HookInput {
@@ -193,6 +208,7 @@ pub fn envelope(host: HookClient, event: HookEvent, text: &str) -> String {
     let name = match event {
         HookEvent::SessionStart => "SessionStart",
         HookEvent::UserPromptSubmit => "UserPromptSubmit",
+        HookEvent::SessionEnd => "SessionEnd",
     };
     match host {
         HookClient::ClaudeCode => {
@@ -282,7 +298,7 @@ pub async fn respond_and_record(
     let end = tokio::time::Instant::now() + deadline;
     let to_answer = match event {
         HookEvent::SessionStart => deadline.saturating_sub(RECORD_RESERVE),
-        HookEvent::UserPromptSubmit => deadline,
+        HookEvent::UserPromptSubmit | HookEvent::SessionEnd => deadline,
     };
     let (out, run) = respond_with_run(event, host, agent, base_dir, input, to_answer).await;
     if let Some(run) = run {
@@ -319,6 +335,10 @@ async fn respond_reading(
     if host == HookClient::Cursor && event == HookEvent::UserPromptSubmit {
         return (None, None);
     }
+    if event == HookEvent::SessionEnd {
+        let _ = tokio::time::timeout(deadline, end_session(host, base_dir, input)).await;
+        return (None, None);
+    }
     let started = std::time::Instant::now();
     let at_ms = now_ms();
     let now = tokio::time::Instant::now();
@@ -340,7 +360,7 @@ async fn respond_reading(
     let text = match (event, outcome) {
         (_, Outcome::OtherClient) => None,
         (HookEvent::SessionStart, _) => answered.or_else(|| language.map(language_line)),
-        (HookEvent::UserPromptSubmit, _) => answered,
+        (HookEvent::UserPromptSubmit | HookEvent::SessionEnd, _) => answered,
     };
     let printed = text.map(|t| envelope(host, event, &t));
     let run = (event == HookEvent::SessionStart).then(|| Run {
@@ -408,6 +428,20 @@ async fn read_input(input: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= INPUT_LIMIT).then_some(bytes)
 }
 
+/// Tells the daemon that the session the client's input names ended, and
+/// why. Nothing else: no folder is read and no project registered, which
+/// would wake the model, and nothing is printed, since the session is over.
+async fn end_session(host: HookClient, base_dir: &Path, input: impl AsyncRead + Unpin) {
+    let Some(input) = read_input(input).await.as_deref().and_then(HookInput::parse) else { return };
+    if host == HookClient::ClaudeCode && input.cursor_version.is_some() {
+        return;
+    }
+    let Some(session) = input.session_id.as_deref() else { return };
+    let data_dir = base_dir.to_path_buf();
+    let Some(client) = blocking(move || DaemonClient::from_data_dir(&data_dir)).await.flatten() else { return };
+    let _ = client.end_session(session, input.reason.as_deref()).await;
+}
+
 /// The project the daemon gives the root of `cwd`, registered without
 /// letting the daemon read its files. A daemon that cannot register reads as
 /// the id derived from the root, as the bridge reads it; one from before
@@ -444,9 +478,14 @@ async fn answer(
     let Some(project) = project_of(&client, &dir).await else { return (None, Outcome::ProjectRefused) };
     // Both events register: a daemon started since the session began learns
     // it at the next prompt. A refusal changes nothing the hook prints.
+    // `session-end` never gets here: `respond_reading` answers it first.
+    let reported = match event {
+        HookEvent::SessionStart => SessionEvent { event: "start", source: input.source.as_deref(), client: client_name(host) },
+        HookEvent::UserPromptSubmit | HookEvent::SessionEnd => SessionEvent { event: "prompt", source: None, client: client_name(host) },
+    };
     let register = async {
         if let Some(session) = input.session_id.as_deref() {
-            let _ = client.register_session(agent, Some(&project), session).await;
+            let _ = client.register_session(agent, Some(&project), session, reported).await;
         }
     };
     match event {
@@ -461,6 +500,7 @@ async fn answer(
             let outcome = if context.prompt.trim().is_empty() { Outcome::EmptyContext } else { Outcome::Injected };
             (session_start_text(&context, health.ok().as_ref(), compacted, language), outcome)
         }
+        HookEvent::SessionEnd => (None, Outcome::EmptyContext),
         HookEvent::UserPromptSubmit => {
             let args = ListArgs {
                 kind: Some("memory".into()),
@@ -699,6 +739,99 @@ mod tests {
 
         assert!(inside.contains("renders on the server") && !inside.contains("one workspace"), "{inside}");
         assert!(at_root.contains("one workspace") && !at_root.contains("renders on the server"), "{at_root}");
+    }
+
+    /// A daemon that keeps its sessions, published where a hook finds it.
+    async fn daemon_keeping_sessions() -> crate::client::tests::TestDaemon {
+        let d = crate::client::tests::start_daemon().await;
+        crate::client::tests::publish(&d);
+        d.metrics.set_writing(true);
+        d
+    }
+
+    #[tokio::test]
+    async fn a_hook_names_its_event_and_its_source() {
+        use clawg_core::metrics::sessions::CountKind;
+        let d = daemon_keeping_sessions().await;
+        let repo = tempfile::tempdir().unwrap();
+        let run = |event: HookEvent, host: HookClient, agent: &'static str, input: serde_json::Value| {
+            let (stdin, dir) = (input.to_string(), d.dir.path().to_path_buf());
+            async move { respond(event, host, agent, &dir, stdin.as_bytes(), HOOK_DEADLINE).await }
+        };
+        let claude = |source: Option<&str>| serde_json::json!({ "cwd": repo.path(), "session_id": "s-claude", "source": source });
+        run(HookEvent::SessionStart, HookClient::ClaudeCode, "a", claude(Some("startup"))).await;
+        run(HookEvent::UserPromptSubmit, HookClient::ClaudeCode, "a", claude(None)).await;
+        run(HookEvent::UserPromptSubmit, HookClient::ClaudeCode, "a", claude(None)).await;
+        run(HookEvent::SessionStart, HookClient::ClaudeCode, "a", claude(Some("compact"))).await;
+        let root = serde_json::json!([repo.path()]);
+        let cursor = serde_json::json!({ "workspace_roots": root, "session_id": "s-cursor", "cursor_version": "2.0" });
+        run(HookEvent::SessionStart, HookClient::Cursor, "cursor", cursor).await;
+
+        run(HookEvent::UserPromptSubmit, HookClient::Cursor, "cursor", serde_json::json!({ "session_id": "s-cursor" })).await;
+
+        let rows = d.metrics.sessions().take().rows;
+        let row = rows.iter().find(|row| row.session_id == "s-claude").expect("the session of Claude Code");
+        assert_eq!((row.agent_id.as_str(), row.client.as_str(), row.prompts), ("a", "claude-code", 2));
+        assert_eq!((row.count(CountKind::Start, "startup"), row.count(CountKind::Start, "compact")), (1, 1));
+        assert!(row.project_id.is_some(), "the project of its folder");
+        let row = rows.iter().find(|row| row.session_id == "s-cursor").expect("the session of Cursor");
+        assert_eq!((row.agent_id.as_str(), row.client.as_str(), row.prompts), ("cursor", "cursor", 0));
+        assert_eq!(row.count(CountKind::Start, "unspecified"), 1, "Cursor does not say what started a session");
+    }
+
+    #[tokio::test]
+    async fn a_session_end_closes_the_session_and_prints_nothing() {
+        let d = daemon_keeping_sessions().await;
+        let repo = tempfile::tempdir().unwrap();
+        let run = |event: HookEvent, host: HookClient, input: serde_json::Value| {
+            let (stdin, dir) = (input.to_string(), d.dir.path().to_path_buf());
+            async move { respond_and_record(event, host, "a", &dir, stdin.as_bytes(), deadline_of(event)).await }
+        };
+        for id in ["s-claude", "s-cursor", "s-other"] {
+            let start = serde_json::json!({ "cwd": repo.path(), "session_id": id, "source": "startup" });
+            run(HookEvent::SessionStart, HookClient::ClaudeCode, start).await;
+        }
+        let projects = d.metrics.sessions().take().rows.len();
+        let before = std::fs::read_to_string(d.dir.path().join(crate::hook_log::FILE)).unwrap_or_default();
+
+        // No folder at all: an end is found by the session's own id.
+        let end = serde_json::json!({ "session_id": "s-claude", "reason": "clear", "hook_event_name": "SessionEnd" });
+        assert_eq!(run(HookEvent::SessionEnd, HookClient::ClaudeCode, end).await, None);
+        let end = serde_json::json!({ "session_id": "s-cursor", "reason": "window_close", "duration_ms": 12, "cursor_version": "2.0" });
+        assert_eq!(run(HookEvent::SessionEnd, HookClient::Cursor, end.clone()).await, None);
+        let foreign = serde_json::json!({ "session_id": "s-other", "reason": "user_close", "cursor_version": "2.0" });
+        assert_eq!(run(HookEvent::SessionEnd, HookClient::ClaudeCode, foreign).await, None);
+
+        let rows = d.metrics.sessions().take().rows;
+        let ended: Vec<(&str, Option<&str>)> = rows.iter().map(|r| (r.session_id.as_str(), r.end_reason.as_deref())).collect();
+        assert_eq!(projects, 3);
+        assert_eq!(ended.len(), 2, "a hook installed for Claude Code that Cursor runs does nothing: {ended:?}");
+        assert!(ended.contains(&("s-claude", Some("clear"))) && ended.contains(&("s-cursor", Some("window_close"))), "{ended:?}");
+        let after = std::fs::read_to_string(d.dir.path().join(crate::hook_log::FILE)).unwrap_or_default();
+        assert_eq!(after, before, "only a session start leaves a line in the record");
+    }
+
+    #[tokio::test]
+    async fn a_session_end_without_a_daemon_or_an_id_does_nothing() {
+        let empty = tempfile::tempdir().unwrap();
+        let end = br#"{"session_id":"s","reason":"clear"}"#;
+        let started = std::time::Instant::now();
+        assert_eq!(respond(HookEvent::SessionEnd, HookClient::ClaudeCode, "a", empty.path(), &end[..], SESSION_END_DEADLINE).await, None);
+        assert!(started.elapsed() < SESSION_END_DEADLINE, "no daemon is waited for");
+        assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0, "nothing is written");
+
+        let d = daemon_keeping_sessions().await;
+        for input in [&br#"{"reason":"clear"}"#[..], b"not json", b""] {
+            assert_eq!(respond(HookEvent::SessionEnd, HookClient::ClaudeCode, "a", d.dir.path(), input, SESSION_END_DEADLINE).await, None);
+        }
+        assert!(d.metrics.sessions().take().rows.is_empty());
+
+        let (_writer, silent) = tokio::io::duplex(64);
+        let started = std::time::Instant::now();
+        let deadline = Duration::from_millis(100);
+        assert_eq!(respond(HookEvent::SessionEnd, HookClient::ClaudeCode, "a", d.dir.path(), silent, deadline).await, None);
+        assert!(started.elapsed() < Duration::from_secs(1), "the deadline ends the wait for an input that never comes");
+        assert!(deadline_of(HookEvent::SessionEnd) < Duration::from_millis(1500), "under what Claude Code gives the end of a session");
     }
 
     #[test]

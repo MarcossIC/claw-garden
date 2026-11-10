@@ -1621,7 +1621,7 @@ async fn a_hook_with_input_that_is_not_json_prints_nothing() {
 #[tokio::test]
 async fn a_hook_usage_error_exits_1() {
     let sandbox = Sandbox::new();
-    for args in [&["session-start"][..], &["session-end", "--agent", "a"], &["session-start", "--agent", "a", "--profile", "prod"]] {
+    for args in [&["session-start"][..], &["pre-compact", "--agent", "a"], &["session-start", "--agent", "a", "--profile", "prod"]] {
         let out = hook(&sandbox, args, "{}");
         assert_eq!(out.status.code(), Some(1), "2 would block the client: {args:?} {}", stderr_of(&out));
         assert!(!stderr_of(&out).is_empty(), "{args:?}");

@@ -915,6 +915,8 @@ impl MemoriesAction {
 pub enum HookEvent {
     SessionStart,
     UserPromptSubmit,
+    /// The session ended: nothing is printed, the daemon is told.
+    SessionEnd,
 }
 
 /// The clients whose hook input and output `clawg hook` speaks: Claude
@@ -1724,6 +1726,19 @@ mod tests {
             Command::Secrets { mask_reasons: true, yes: true, profile: ProfileArg { profile: None } }
         );
         assert!(Cli::try_parse_from(["clawg", "secrets", "--yes"]).is_err(), "--yes confirms a rewrite");
+    }
+
+    #[test]
+    fn hook_takes_the_session_end_event() {
+        assert_eq!(
+            parse(&["clawg", "hook", "session-end", "--agent", "cursor", "--client", "cursor"]).command,
+            Command::Hook {
+                event: HookEvent::SessionEnd,
+                agent: "cursor".into(),
+                client: HookClient::Cursor,
+                profile: ProfileArg { profile: None },
+            }
+        );
     }
 
     #[test]

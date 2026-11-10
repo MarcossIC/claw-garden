@@ -967,6 +967,15 @@ pub struct Registered {
     pub rekeyed: usize,
 }
 
+/// What a hook reports of its session: `start` with what started it, or
+/// `prompt`, and the client whose hook it is.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionEvent<'a> {
+    pub event: &'a str,
+    pub source: Option<&'a str>,
+    pub client: &'a str,
+}
+
 /// A handle on one daemon: its address, its token, and a reusable HTTP client.
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -1254,16 +1263,32 @@ impl DaemonClient {
     }
 
     /// Tells the daemon which host session `agent_id` works in for
-    /// `project_id`; the saves that follow carry it. A daemon that predates
-    /// it answers 404.
+    /// `project_id`, and what `event` says happened in it; the saves that
+    /// follow carry the session. A daemon that predates it answers 404.
     pub async fn register_session(
         &self,
         agent_id: &str,
         project_id: Option<&str>,
         session_id: &str,
+        event: SessionEvent<'_>,
     ) -> Result<(), ClientError> {
-        let body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "session_id": session_id });
+        let body = serde_json::json!({
+            "agent_id": agent_id,
+            "project_id": project_id,
+            "session_id": session_id,
+            "event": event.event,
+            "source": event.source,
+            "client": event.client,
+        });
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/sessions").json(&body)?).await?;
+        check_status(&answer)
+    }
+
+    /// Tells the daemon the client ended `session_id`, for `reason` when it
+    /// gave one. It names no project, so nothing is registered.
+    pub async fn end_session(&self, session_id: &str, reason: Option<&str>) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "session_id": session_id, "reason": reason });
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/sessions/end").json(&body)?).await?;
         check_status(&answer)
     }
 
@@ -1973,6 +1998,8 @@ pub(crate) mod tests {
     /// An in-process daemon plus the tempdir holding its lifecycle files.
     pub(crate) struct TestDaemon {
         pub(crate) dir: tempfile::TempDir,
+        /// What the daemon records, its sessions with it.
+        pub(crate) metrics: Arc<clawg_core::metrics::Recorder>,
         addr: SocketAddr,
         token: String,
     }
@@ -1981,6 +2008,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
         tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+        let metrics = runtime.metrics.clone();
 
         let token = "0123456789abcdef0123456789abcdef".to_string();
         let (shutdown, _rx) = tokio::sync::watch::channel(false);
@@ -2001,7 +2029,7 @@ pub(crate) mod tests {
             let _ = axum::serve(listener, router(ctx)).await;
         });
 
-        TestDaemon { dir, addr, token }
+        TestDaemon { dir, metrics, addr, token }
     }
 
     /// Publishes the daemon's lifecycle files so `from_data_dir` can find it.
