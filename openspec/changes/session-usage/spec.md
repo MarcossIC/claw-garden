@@ -78,7 +78,9 @@ Un reinicio del daemon MUST NOT cerrar ninguna fila: el daemon que arranca retom
 - WHEN llega su cierre con motivo `clear`, y después un prompt de S
 - THEN S queda con una fila cerrada con `clear` y una fila nueva abierta
 
-**Tests:** `six_hours_without_activity_close_a_session_as_idle`, `a_closed_session_is_not_reopened`, `an_end_after_six_idle_hours_leaves_the_row_idle` en `sessions.rs`.
+Una fila que se abre en el mismo milisegundo en que cerró la anterior del mismo id MUST empezar un milisegundo después: (`session_id`, `started_at_ms`) es la clave.
+
+**Tests:** `six_hours_without_activity_close_a_session_as_idle`, `a_closed_session_is_not_reopened`, `an_end_after_six_idle_hours_leaves_the_row_idle`, `a_row_opened_as_the_one_before_it_closed_begins_a_millisecond_later` en `sessions.rs`.
 
 ## SU4. Se guarda con cada minuto y se retoma al arrancar
 
@@ -104,11 +106,11 @@ Todas detrás del token, y todas contestan `204` sin cuerpo.
 - `POST /v1/sessions/end` (`session_id`, `reason` opcional) MUST cerrar la fila abierta de ese id (SU3). No toma proyecto y no registra ninguno. Un `session_id` inválido es un 400, con la misma regla que `POST /v1/sessions`.
 - `POST /v1/sessions/calls` (`agent_id`, `project_id` opcional, `tool`, `failed`) MUST contar una llamada para la sesión vigente de ese agente y ese proyecto. Sin sesión vigente, no cuenta nada.
 
-`POST /v1/memories` MUST contar un save cuando lo acepta por primera vez (no cuando contesta por un `operation_id` repetido) y lo selló con una sesión. `POST /v1/search` MUST contar una búsqueda vacía cuando no devuelve ningún hit, para la sesión vigente del agente y del proyecto de la petición; una búsqueda sobre varios proyectos no se atribuye.
+`POST /v1/memories` MUST contar un save cuando lo acepta en el outbox (no cuando contesta por un `operation_id` cuyo save sigue esperando o falló) y lo selló con una sesión. `POST /v1/search` MUST contar una búsqueda vacía cuando no devuelve ningún hit, para la sesión vigente del agente y del proyecto de la petición; una búsqueda sobre varios proyectos no se atribuye.
 
 Nada de esto MUST cambiar lo que esas rutas contestan ni lo que se guarda en `memory.db`.
 
-**Tests:** `a_hook_event_opens_the_row_of_its_session_and_counts`, `a_session_end_closes_its_row_with_the_reason`, `a_tool_call_counts_for_the_session_of_its_agent_and_project`, `an_accepted_save_and_an_empty_search_count_for_their_session` en `crates/clawg-cli/tests/api.rs`.
+**Tests:** `a_hook_event_opens_the_row_of_its_session_and_counts`, `a_daemon_that_keeps_no_metrics_keeps_no_sessions`, `a_session_end_closes_its_row_with_the_reason`, `a_tool_call_counts_for_the_session_of_its_agent_and_project`, `an_accepted_save_and_an_empty_search_count_for_their_session` en `crates/clawg-cli/tests/api.rs`.
 
 ## SU7. Unir y borrar proyectos
 
@@ -118,11 +120,13 @@ Nada de esto MUST cambiar lo que esas rutas contestan ni lo que se guarda en `me
 
 ## SU8. El puente avisa cada llamada con su nombre
 
-Cuando una herramienta termina, el puente MUST mandar `POST /v1/sessions/calls` con el agente de la llamada, el proyecto de la carpeta abierta en la ventana (ninguno si hay varias o ninguna), el nombre de la herramienta y si su resultado fue un error. El aviso MUST NOT cambiar lo que la herramienta contesta, MUST NOT arrancar ni esperar un daemon, y MUST acotarse a `CALL_REPORT_WAIT` (500 ms).
+Cuando una herramienta termina, el puente MUST mandar `POST /v1/sessions/calls` con el agente de la llamada, el proyecto de la carpeta abierta en la ventana (ninguno si hay varias o ninguna), el nombre de la herramienta y si su resultado fue un error, también cuando el puente la rechazó sin pedirle nada al daemon. El aviso MUST NOT cambiar lo que la herramienta contesta, MUST NOT arrancar ni esperar un daemon, MUST NOT registrar ningún proyecto y MUST acotarse a `CALL_REPORT_WAIT` (500 ms).
+
+El proyecto de la carpeta es el id que el daemon ya le dio a este puente por ella, o si todavía no la registró, el que se deriva de su raíz; el daemon lo sigue hasta su proyecto vivo. Para saber qué carpeta hay abierta, cada herramienta MUST pedirle las carpetas al cliente que las declara (`roots/list`), también las cinco que no las usan para otra cosa (`list_memories`, `delete_memory`, `restore_memory`, `update_memory`, `resolve_conflict`).
 
 El nombre sale del conjunto cerrado de las herramientas del contrato del agente (`TOOLS`); el daemon MUST guardar `other` para uno que no conoce. Lo que el modelo ve del servidor MUST NOT cambiar.
 
-**Tests:** `the_counted_tools_are_the_tools_of_the_bridge`, `a_tool_reports_its_call_to_the_session_of_the_open_folder`, `a_failed_tool_is_reported_as_failed` en `crates/clawg-cli/src/mcp/server.rs`; `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin cambios.
+**Tests:** `the_counted_tools_are_the_tools_of_the_bridge`, `a_tool_reports_its_call_to_the_session_of_the_open_folder`, `a_failed_tool_is_reported_as_failed`, `a_call_is_not_reported_while_no_daemon_is_there` en `crates/clawg-cli/src/mcp/server.rs`; `a_tool_outside_the_set_is_counted_as_other` en `crates/clawg-cli/src/daemon/sessions.rs`; `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file`, sin cambios.
 
 ## SU9. Los hooks
 
@@ -134,9 +138,9 @@ El nombre sale del conjunto cerrado de las herramientas del contrato del agente 
 
 ## SU10. `setup` instala el hook de cierre
 
-`clawg setup claude-code`, con o sin `--local`, MUST instalar `SessionEnd` sin matcher junto a los otros dos, y `clawg setup cursor` MUST instalar `sessionEnd` junto a `sessionStart`. Sobre una instalación anterior, MUST agregar sólo el que falta y dejar los demás byte a byte. `--remove` MUST quitarlo.
+`clawg setup claude-code`, con o sin `--local`, MUST instalar `SessionEnd` sin matcher junto a los otros dos, y `clawg setup cursor` MUST instalar `sessionEnd` junto a `sessionStart`. Sobre una instalación anterior, MUST agregar sólo el que falta y dejar los demás byte a byte. `--remove` MUST quitarlo. En Cursor cada evento tiene su paso y su línea en el reporte: un hook de clawg que no coincide con el plan en un evento queda como está y sale con 1, y el otro evento se instala igual, como ya pasa en Claude Code. `hook_installed`, con lo que `doctor` dice que el hook instalado no dejó corridas, sigue mirando sólo `sessionStart`, el único que las deja.
 
-**Tests:** `a_rerun_adds_only_the_session_end_hook` en `crates/clawg-cli/src/setup.rs` y `a_rerun_adds_only_session_end` en `crates/clawg-cli/src/setup/cursor.rs`.
+**Tests:** `a_run_over_an_install_without_the_session_end_hook_adds_only_it` en `crates/clawg-cli/src/setup.rs` y en `crates/clawg-cli/src/setup/cursor.rs`, `a_local_run_over_an_install_without_the_session_end_hook_adds_only_it` en `crates/clawg-cli/src/setup/local.rs`, `remove_takes_each_hook_that_is_there` y `the_session_start_hook_of_this_profile_is_found_in_hooks_json` en `cursor.rs`; `setup_dry_run_writes_nothing`, `setup_cursor_installs_and_remove_undoes_it` y `setup_local_installs_in_the_folder_and_remove_undoes_it` en `crates/clawg-cli/tests/binary.rs`.
 
 ## SU11. `clawg metrics sessions`
 
@@ -190,6 +194,7 @@ El límite «Sin etiqueta de agente» de `specs/metrics` sigue valiendo para las
 - **Dos sesiones en paralelo del mismo agente y proyecto** no se distinguen en la actividad atribuida: va a la última que registró un hook, como los saves.
 - **Cursor no tiene un hook por prompt:** sus filas no cuentan prompts.
 - **Con varias carpetas abiertas, o ninguna,** el puente no nombra un proyecto y sus llamadas no se atribuyen. El hook de Cursor tampoco registra sesión en ese caso.
+- **Una carpeta cuyo proyecto no es el que se deriva de su raíz** (un clon reconocido por su remoto, una subcarpeta declarada) no se atribuye hasta que una herramienta de ese puente la registra: las herramientas que van por id de memoria no registran nada.
 - **Lo que no llega al daemon no se cuenta:** una llamada con el daemon caído, o un hook sin daemon.
 - **Después de un reinicio del daemon,** la actividad atribuida no se cuenta hasta que un hook registra la sesión otra vez, igual que un save sale sin sesión.
 - **El cierre que el cliente no avisa** (el proceso que muere, el equipo que se apaga) queda con `idle` en la última actividad.

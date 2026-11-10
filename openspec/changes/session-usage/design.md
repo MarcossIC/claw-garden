@@ -41,13 +41,17 @@ El puente manda `POST /v1/sessions/calls` cuando la herramienta terminó, con el
 
 El aviso cuesta una petición por loopback. Se espera, acotada a `CALL_REPORT_WAIT` (500 ms), antes de devolver el resultado: así el orden de lo contado es el de las llamadas y un test lo lee sin esperar. No usa `ClientHandle::get`, que puede esperar a un daemon que arranca: mira el cliente que ya hay (`ClientHandle::peek`) y, si no hay, no avisa.
 
-**El proyecto del aviso es el de la ventana,** no el que nombra la llamada: el de la única carpeta abierta (`roots` del cliente, o el directorio del puente), registrada sin pedirle al daemon que lea sus archivos, que es lo que hace el hook con su `cwd` (`project_of`, `crates/clawg-cli/src/hook.rs:415`). Es la clave bajo la que el hook registró la sesión, así que una llamada que guarda en otro proyecto por nombre sigue contando para la sesión que la hizo. Los ids que el daemon ya dio se guardan en el mapa del puente (`registered`), así que después de la primera llamada no cuesta ninguna petición.
+**El proyecto del aviso es el de la ventana,** no el que nombra la llamada: el de la única carpeta abierta (`roots` del cliente, o el directorio del puente). Es la clave bajo la que el hook registró la sesión con su `cwd` (`project_of`, `crates/clawg-cli/src/hook.rs:415`), así que una llamada que guarda en otro proyecto por nombre sigue contando para la sesión que la hizo. El id sale de lo que el puente ya sabe (`known_ids`: el que el daemon le dio por esa carpeta, o el derivado de su raíz), sin ninguna petición, y el daemon lo sigue hasta su proyecto vivo.
+
+**Descartado:** registrar la carpeta para pedirle el id al daemon, como hace el hook. Registrar un proyecto escribe en `memory.db`, y una llamada que hoy no registra ninguno (`delete_memory`, un `search_memory` con `all_projects`) pasaría a registrar uno sólo para ser contada. El costo es el límite de la spec: una carpeta cuyo proyecto no es el derivado de su raíz no se atribuye hasta que una herramienta la registra.
+
+Para saber qué carpeta hay abierta, las cinco herramientas que no les pedían las carpetas al cliente ahora se las piden (`asking`): un `roots/list` más en cada una, sólo a los clientes que declaran carpetas.
 
 **El conjunto cerrado** es `TOOLS` (`crates/clawg-cli/src/daemon/sessions.rs`), los trece nombres. Un test del puente comprueba que es exactamente la lista de su router, así que sumar una herramienta sin sumarla ahí falla. El daemon pasa lo que recibe por `tool_label`, que devuelve el nombre conocido o `other`: lo que se guarda nunca es el texto que llegó.
 
 ## D4. Los saves y las búsquedas vacías se cuentan en el daemon
 
-`POST /v1/memories` ya lee la sesión vigente del agente y del proyecto para sellar el save (`crates/clawg-cli/src/daemon/api.rs:1445`). Con ese mismo id cuenta el save cuando el outbox lo acepta por primera vez (`Accepted::Queued`), con el tipo que la petición declara. No espera al worker: un save que contesta `202` también es un save aceptado, y su tipo declarado es lo único que el handler sabe siempre. Un save sin tipo cuenta como `unspecified`.
+`POST /v1/memories` ya lee la sesión vigente del agente y del proyecto para sellar el save (`crates/clawg-cli/src/daemon/api.rs:1445`). Con ese mismo id cuenta el save cuando el outbox lo acepta (`Accepted::Queued`; no cuando la respuesta es la de un `operation_id` cuyo save sigue esperando o falló), con el tipo que la petición declara. No espera al worker: un save que contesta `202` también es un save aceptado, y su tipo declarado es lo único que el handler sabe siempre. Un save sin tipo cuenta como `unspecified`.
 
 `POST /v1/search` cuenta una búsqueda vacía cuando, después del corte por puntaje, no devuelve ningún hit. La atribuye con el proyecto de la petición, como el save.
 
