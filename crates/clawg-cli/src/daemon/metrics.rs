@@ -11,7 +11,7 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, Method};
 use axum::middleware::Next;
 use axum::response::Response;
-use clawg_core::metrics::store::{MetricsDb, RunInfo, METRICS_FILE};
+use clawg_core::metrics::store::{MetricsDb, MetricsError, RunInfo, METRICS_FILE};
 use clawg_core::metrics::{Gauge, Histogram, Recorder, SeriesKey, Unit};
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -150,13 +150,18 @@ impl Writer {
                     log::warn!("could not fold the old minutes of {}: {e}", path.display());
                 }
                 let run_id = db.start_run(run)?;
-                Ok(Sink { db, run_id })
+                db.close_idle_sessions(now_ms)?;
+                Ok((db.open_sessions()?, Sink { db, run_id }))
             });
             opened
                 .map_err(|e| log::warn!("metrics are not kept in {} until the next start: {e}", path.display()))
                 .ok()
         });
+        let (open, sink) = sink.unzip();
         recorder.set_writing(sink.is_some());
+        // After the log is on: the sessions an earlier run left open go on in
+        // their rows.
+        recorder.sessions().restore(open.unwrap_or_default());
         Self { recorder, sink, minute_start_ms: now_ms, last_prune_ms: now_ms, cpu: None, busy: None }
     }
 
@@ -212,6 +217,22 @@ impl Writer {
             self.last_prune_ms = now_ms;
             result = sink.db.prune(now_ms).map(drop);
         }
+        self.wrote(result);
+        self.flush_sessions(now_ms);
+    }
+
+    /// Writes the sessions that changed since the last write, those that
+    /// went idle by `now_ms` closed. A failure turns writing off as one of a
+    /// minute does.
+    pub fn flush_sessions(&mut self, now_ms: i64) {
+        let Some(sink) = self.sink.as_mut() else { return };
+        let sessions = self.recorder.sessions();
+        sessions.close_idle(now_ms);
+        let result = sink.db.write_sessions(&sessions.take());
+        self.wrote(result);
+    }
+
+    fn wrote(&mut self, result: Result<(), MetricsError>) {
         if let Err(e) = result {
             log::warn!("could not write the metrics, so they are not kept until the next start: {e}");
             self.sink = None;
@@ -266,15 +287,25 @@ impl WriterTask {
 async fn run_writer(mut writer: Writer, mut stopped: oneshot::Receiver<()>, resident: impl Fn() -> Option<bool>) {
     let handle = tokio::runtime::Handle::current();
     let now = || now_ms() as i64;
+    let recorder = writer.recorder.clone();
     loop {
         let wait = MINUTE_MS - now().rem_euclid(MINUTE_MS);
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
+        // A project that was merged or deleted takes its stored sessions
+        // along at once, not at the turn of the minute.
+        let minute = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(wait as u64)) => true,
+            _ = recorder.sessions().changed() => false,
             _ = &mut stopped => break,
+        };
+        if minute {
+            writer.sample(now(), process::sample(), process::runtime_sample(&handle), resident());
         }
-        writer.sample(now(), process::sample(), process::runtime_sample(&handle), resident());
         writer = match tokio::task::spawn_blocking(move || {
-            writer.flush(now());
+            if minute {
+                writer.flush(now());
+            } else {
+                writer.flush_sessions(now());
+            }
             writer
         })
         .await
@@ -615,6 +646,67 @@ mod tests {
         let body = serde_json::to_value(metrics_body(&recorder, "0.1.0", 0)).unwrap();
         assert_eq!(body["run"]["events"][0]["kind"], "backup");
         assert_eq!(body["run"]["events"][0]["detail"], serde_json::json!({ "ms": 7 }));
+    }
+
+    fn who(session_id: &str) -> clawg_core::metrics::sessions::Who<'_> {
+        clawg_core::metrics::sessions::Who { session_id, agent_id: "a", project_id: Some("p"), client: "claude-code", utc_offset_s: 0 }
+    }
+
+    #[test]
+    fn sessions_are_kept_with_each_minute_and_resumed_by_the_next_run() {
+        use clawg_core::metrics::sessions::{Activity, CountKind, HookEvent, IDLE_CLOSE_MS};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(METRICS_FILE);
+        let recorder = Arc::new(Recorder::default());
+        let mut writer = Writer::start(Some(&path), recorder.clone(), &run_info(), NOW);
+        recorder.sessions().hook(who("kept"), NOW, HookEvent::Start("startup"));
+        recorder.sessions().hook(who("left"), NOW, HookEvent::Start("startup"));
+        writer.flush(NOW + MINUTE_MS);
+        let read = || MetricsDb::open_read_only(&path).unwrap();
+        assert_eq!(read().sessions_of("kept").unwrap()[0].prompts, 0, "the minute wrote the row");
+        recorder.sessions().hook(who("kept"), NOW + MINUTE_MS + 5, HookEvent::Prompt);
+        writer.stop(NOW + MINUTE_MS + 10);
+        assert_eq!(read().sessions_of("kept").unwrap()[0].prompts, 1, "the stop wrote what came after the minute");
+
+        let later = NOW + IDLE_CLOSE_MS;
+        let recorder = Arc::new(Recorder::default());
+        let mut writer = Writer::start(Some(&path), recorder.clone(), &run_info(), later);
+        recorder.sessions().activity("kept", later + 5, Activity::EmptySearch);
+        recorder.sessions().activity("left", later + 5, Activity::EmptySearch);
+        writer.flush_sessions(later + 10);
+
+        let kept = read().sessions_of("kept").unwrap();
+        assert_eq!(kept.len(), 1, "a restart closes nothing");
+        assert_eq!((kept[0].started_at_ms, kept[0].prompts, kept[0].empty_searches), (NOW, 1, 1));
+        assert_eq!(kept[0].count(CountKind::Start, "startup"), 1);
+        let left = read().sessions_of("left").unwrap();
+        assert_eq!(left.len(), 1, "the start closed it, so this run knows nothing of it");
+        assert_eq!((left[0].ended_at_ms, left[0].end_reason.as_deref()), (Some(NOW), Some("idle")));
+
+        writer.flush_sessions(later + 5 + IDLE_CLOSE_MS);
+        let kept = read().sessions_of("kept").unwrap();
+        assert_eq!((kept[0].ended_at_ms, kept[0].end_reason.as_deref()), (Some(later + 5), Some("idle")), "a write closes what went idle");
+    }
+
+    #[test]
+    fn a_writer_turned_off_keeps_no_sessions() {
+        use clawg_core::metrics::sessions::{HookEvent, Pending};
+        let recorder = Arc::new(Recorder::default());
+        let mut writer = Writer::start(None, recorder.clone(), &run_info(), NOW);
+        recorder.sessions().hook(who("s"), NOW, HookEvent::Prompt);
+        assert_eq!(recorder.sessions().take(), Pending::default(), "with nowhere to write, nothing is held");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(METRICS_FILE);
+        let recorder = Arc::new(Recorder::default());
+        writer.flush(NOW);
+        let mut writer = Writer::start(Some(&path), recorder.clone(), &run_info(), NOW);
+        rusqlite::Connection::open(&path).unwrap().execute_batch("DROP TABLE session;").unwrap();
+        recorder.sessions().hook(who("s"), NOW, HookEvent::Prompt);
+        writer.flush_sessions(NOW + 1);
+        assert!(!writer.is_writing() && !recorder.writing());
+        recorder.sessions().hook(who("s"), NOW + 2, HookEvent::Prompt);
+        assert_eq!(recorder.sessions().take(), Pending::default(), "a failed write turns the log off");
     }
 
     #[test]

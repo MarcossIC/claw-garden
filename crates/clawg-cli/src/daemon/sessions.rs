@@ -26,6 +26,30 @@ pub fn check_session_id(id: &str) -> Result<(), InvalidSessionId> {
     Ok(())
 }
 
+/// The tools a call is counted under: those of the bridge, by the name the
+/// model calls them. A closed set, so what is stored of a call is one of
+/// these and never the text a request carried.
+pub const TOOLS: [&str; 13] = [
+    "save_memory",
+    "search_memory",
+    "recall_context",
+    "list_memories",
+    "read_memory",
+    "delete_memory",
+    "restore_memory",
+    "update_memory",
+    "resolve_conflict",
+    "answer_suggestion",
+    "synthesize",
+    "search_project",
+    "memory_status",
+];
+
+/// `raw` as [`TOOLS`] names it, or `other`.
+pub fn tool_label(raw: &str) -> &'static str {
+    clawg_core::metrics::sessions::label(&TOOLS, raw)
+}
+
 /// The last session registered for each (agent, project). Two sessions of
 /// one agent in one project cannot be told apart: the last to register wins,
 /// and since every prompt registers, that is the one the user spoke to last.
@@ -63,6 +87,13 @@ mod tests {
         assert_eq!(registry.current("a", None).as_deref(), Some("s3"));
         assert_eq!(registry.current("b", Some("p")), None);
         assert_eq!(registry.current("a", Some("q")), None);
+    }
+
+    #[test]
+    fn a_tool_outside_the_set_is_counted_as_other() {
+        assert_eq!(tool_label("search_memory"), "search_memory");
+        assert_eq!(tool_label("mcp__clawg__search_memory"), "other");
+        assert_eq!(tool_label("where is the deploy script"), "other");
     }
 
     #[test]

@@ -1,15 +1,15 @@
 change: session-usage
 objective: transversal
 depends_on: []
-phase: proposal  # las decisiones están en exploration.md; la propuesta, la spec, el diseño y las tareas van antes del código
+phase: verify  # aplicado y verificado en Linux; falta el CI de Windows y lo local de verify.md
 artifacts:
   exploration: done  # «Decisiones (2026-11-10)»: A, B, C y D entran; vigilar el proceso del cliente queda afuera
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
-  apply: pending
-  verify: pending
+  proposal: done  # cómo se aplican las seis decisiones; el aviso del puente y la atribución
+  spec: done  # SU1 a SU12 y el invariante de ids enmendado
+  design: done  # D1 a D8
+  tasks: done  # partes 1 a 10; lo local, el mapa, archivar y subir la versión quedan fuera
+  apply: done  # A, B, C y D: el registro, el esquema 3, las rutas, los hooks, el aviso del puente, el reporte y setup
+  verify: pending  # la suite y los dos clippy pasan en Linux; queda el CI de Windows y lo local: arranques y cierres reales, la X de la terminal, resume y el reporte de varios días (verify.md)
   archive: pending
 decisions:
   registry: metrics.db  # esquema 3, con el invariante de ids enmendado sólo para estas tablas
@@ -19,4 +19,8 @@ decisions:
   project_delete: deletes
   session_end_hook: installed  # parte D, en Claude Code y en Cursor
   report_command: clawg metrics sessions
+  tool_name: bridge_report  # el puente avisa al terminar cada herramienta, con POST /v1/sessions/calls (design.md, D3)
+  call_project: window  # la carpeta abierta en la ventana, sin registrarla
+  report_names: project_id  # el reporte no abre memory.db
 updated: 2026-11-10
+main_spec: openspec/specs/metrics/spec.md, openspec/specs/daemon-access/spec.md, openspec/specs/hooks/spec.md, openspec/specs/setup/spec.md

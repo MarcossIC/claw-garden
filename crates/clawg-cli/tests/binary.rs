@@ -136,10 +136,16 @@ impl Sandbox {
     fn bridge_with(&self, bin: &Path, args: &[&str]) -> Bridge {
         let root = self.home.join(format!("project-{}", now_ns()));
         std::fs::create_dir_all(&root).expect("project dir");
+        self.bridge_in(bin, args, &root)
+    }
+
+    /// A bridge started in `root`, as a client starts it in the folder it has
+    /// open.
+    fn bridge_in(&self, bin: &Path, args: &[&str], root: &Path) -> Bridge {
         let log = self.log(&format!("mcp-{}", now_ns()));
         let mut child = self
             .command_of(bin, args)
-            .current_dir(&root)
+            .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(File::create(&log).expect("log file"))
@@ -831,6 +837,107 @@ async fn metrics_off_leaves_no_metrics_file() {
     let out = sandbox.run(&["metrics", "report", "--profile", "dev", "--metric", "http.duration"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr_of(&out).contains("CLAWG_METRICS=off"), "{}", stderr_of(&out));
+}
+
+// ── Sessions ────────────────────────────────────────────────────────────────
+
+const SMOKE_HOOK: [&str; 4] = ["--agent", "smoke", "--profile", "dev"];
+
+/// Runs the hook of `event` for the agent the smoke bridge is pinned to.
+fn session_hook(sandbox: &Sandbox, event: &str, input: Value) {
+    let out = hook(sandbox, &[&[event], &SMOKE_HOOK[..]].concat(), &input.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+}
+
+fn sessions_report(sandbox: &Sandbox, args: &[&str]) -> Value {
+    let mut all = vec!["metrics", "sessions", "--profile", "dev"];
+    all.extend_from_slice(args);
+    let out = sandbox.run(&all);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    serde_json::from_slice(&out.stdout).expect("the sessions report prints JSON")
+}
+
+async fn stop(sandbox: &Sandbox, daemon: &Daemon) {
+    let stop = sandbox.run(&["stop", "--profile", "dev"]);
+    assert_eq!(stop.status.code(), Some(0), "{}", stderr_of(&stop));
+    daemon.wait_for_exit(Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn a_daemon_keeps_each_session_across_a_restart_and_reports_them() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    session_hook(&sandbox, "session-start", json!({ "session_id": "session-s", "cwd": root, "source": "startup" }));
+    let mut bridge = sandbox.bridge_in(Path::new(BIN), &["mcp", "--profile", "dev", "--no-autostart", "--agent", "smoke"], &root);
+    bridge.initialize();
+    let status = bridge.call(2, "memory_status", json!({}));
+    assert!(!tool_failed(&status), "{status}");
+    let search = bridge.call(3, "search_memory", json!({ "query": "where does the deploy script live" }));
+    assert!(!tool_failed(&search), "{search}");
+    session_hook(&sandbox, "user-prompt-submit", json!({ "session_id": "session-s", "cwd": root, "prompt": "go on" }));
+    session_hook(&sandbox, "session-start", json!({ "session_id": "session-s2", "cwd": root, "source": "clear" }));
+
+    stop(&sandbox, &daemon).await;
+    let before = sessions_report(&sandbox, &["--session", "session-s2"]);
+    assert_eq!(before["rows"].as_array().map(Vec::len), Some(1), "{before}");
+
+    let daemon = sandbox.serve().await;
+    session_hook(&sandbox, "user-prompt-submit", json!({ "session_id": "session-s2", "cwd": root, "prompt": "and now" }));
+    stop(&sandbox, &daemon).await;
+
+    let first = sessions_report(&sandbox, &["--session", "session-s"]);
+    let rows = first["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{first}");
+    assert_eq!(rows[0]["calls"], json!({ "memory_status": { "count": 1, "failed": 0 }, "search_memory": { "count": 1, "failed": 0 } }), "{first}");
+    assert_eq!((&rows[0]["prompts"], &rows[0]["starts"]), (&json!(1), &json!({ "startup": 1 })), "{first}");
+    assert_eq!((&rows[0]["agent_id"], &rows[0]["client"]), (&json!("smoke"), &json!("claude-code")), "{first}");
+    assert_eq!(rows[0]["empty_searches"], 1, "an empty store has no hit: {first}");
+
+    let second = sessions_report(&sandbox, &["--session", "session-s2"]);
+    let rows = second["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "a restart closes nothing: {second}");
+    assert_eq!(rows[0]["started_at_ms"], before["rows"][0]["started_at_ms"], "the row from before the restart: {second}");
+    assert_eq!((&rows[0]["prompts"], &rows[0]["starts"]), (&json!(1), &json!({ "clear": 1 })), "{second}");
+
+    let by_project = sessions_report(&sandbox, &[]);
+    let groups = by_project["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1, "{by_project}");
+    assert_eq!(groups[0]["key"], rows[0]["project_id"], "{by_project}");
+    assert!(groups[0]["key"].is_string(), "{by_project}");
+    assert_eq!((&groups[0]["sessions"], &groups[0]["prompts"]), (&json!(2), &json!(2)), "{by_project}");
+    assert_eq!(groups[0]["calls"]["search_memory"]["count"], 1, "{by_project}");
+}
+
+#[tokio::test]
+async fn a_session_end_closes_the_session_and_what_follows_opens_another() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    session_hook(&sandbox, "session-start", json!({ "session_id": "session-s", "cwd": root, "source": "startup" }));
+    // Run where nothing is a project: the end is found by the session's id.
+    let end = json!({ "session_id": "session-s", "reason": "clear", "hook_event_name": "SessionEnd" });
+    let out = hook(&sandbox, &[&["session-end"], &SMOKE_HOOK[..]].concat(), &end.to_string());
+    assert_eq!((out.status.code(), stdout_of(&out).as_str()), (Some(0), ""), "{}", stderr_of(&out));
+    session_hook(&sandbox, "user-prompt-submit", json!({ "session_id": "session-s", "cwd": root, "prompt": "once more" }));
+    stop(&sandbox, &daemon).await;
+
+    let report = sessions_report(&sandbox, &["--session", "session-s"]);
+    let rows = report["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "{report}");
+    assert_eq!((&rows[0]["end_reason"], &rows[0]["starts"], &rows[0]["prompts"]), (&json!("clear"), &json!({ "startup": 1 }), &json!(0)), "{report}");
+    assert!(rows[0]["ended_at_ms"].as_i64() >= rows[0]["started_at_ms"].as_i64(), "{report}");
+    assert_eq!((&rows[1]["end_reason"], &rows[1]["prompts"]), (&Value::Null, &json!(1)), "a closed session is not reopened: {report}");
+    assert!(rows[1]["started_at_ms"].as_i64() > rows[0]["started_at_ms"].as_i64(), "{report}");
+    let by_project = sessions_report(&sandbox, &[]);
+    assert_eq!(by_project["groups"][0]["ended"], json!({ "clear": 1 }), "{by_project}");
+    assert_eq!(by_project["groups"][0]["open"], 1, "{by_project}");
 }
 
 #[tokio::test]
@@ -1621,7 +1728,7 @@ async fn a_hook_with_input_that_is_not_json_prints_nothing() {
 #[tokio::test]
 async fn a_hook_usage_error_exits_1() {
     let sandbox = Sandbox::new();
-    for args in [&["session-start"][..], &["session-end", "--agent", "a"], &["session-start", "--agent", "a", "--profile", "prod"]] {
+    for args in [&["session-start"][..], &["pre-compact", "--agent", "a"], &["session-start", "--agent", "a", "--profile", "prod"]] {
         let out = hook(&sandbox, args, "{}");
         assert_eq!(out.status.code(), Some(1), "2 would block the client: {args:?} {}", stderr_of(&out));
         assert!(!stderr_of(&out).is_empty(), "{args:?}");
@@ -3321,7 +3428,7 @@ async fn setup_dry_run_writes_nothing() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     let text = stdout_of(&out);
     assert!(text.contains("mcp server clawg-dev: would register it"), "{text}");
-    assert!(text.contains("would add SessionStart, UserPromptSubmit"), "{text}");
+    assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd"), "{text}");
     assert!(!sandbox.home.join("claude-config").exists());
     assert!(!sandbox.data_dir().exists());
 }
@@ -3410,6 +3517,8 @@ async fn setup_cursor_installs_and_remove_undoes_it() {
     let hooks: Value = serde_json::from_str(&std::fs::read_to_string(cursor.join("hooks.json")).unwrap()).unwrap();
     let line = hooks["hooks"]["sessionStart"][0]["command"].as_str().expect("the hook");
     assert!(line.ends_with(" hook session-start --agent cursor --client cursor --profile dev"), "{hooks}");
+    let end = hooks["hooks"]["sessionEnd"][0]["command"].as_str().expect("the hook of the end");
+    assert!(end.ends_with(" hook session-end --agent cursor --client cursor --profile dev"), "{hooks}");
 
     let removed = setup(&["--remove"]);
     assert_eq!(removed.status.code(), Some(0), "{}", stdout_of(&removed));
@@ -3447,6 +3556,7 @@ async fn setup_local_installs_in_the_folder_and_remove_undoes_it() {
     assert_eq!(resolved(command), resolved(BIN), "{settings}");
     assert_eq!(hook["args"], json!(["hook", "session-start", "--agent", "claude-code", "--profile", "dev"]), "{settings}");
     assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][1], "user-prompt-submit", "{settings}");
+    assert_eq!(settings["hooks"]["SessionEnd"][0]["hooks"][0]["args"][1], "session-end", "{settings}");
     assert!(!config.exists(), "the user's settings, server and protocol are not touched");
 
     let elsewhere = local(&["--path", "work/app", "--remove"], &sandbox.home);
