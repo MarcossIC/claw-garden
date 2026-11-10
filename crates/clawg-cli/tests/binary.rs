@@ -913,6 +913,34 @@ async fn a_daemon_keeps_each_session_across_a_restart_and_reports_them() {
 }
 
 #[tokio::test]
+async fn a_session_end_closes_the_session_and_what_follows_opens_another() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.home.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+
+    session_hook(&sandbox, "session-start", json!({ "session_id": "session-s", "cwd": root, "source": "startup" }));
+    // Run where nothing is a project: the end is found by the session's id.
+    let end = json!({ "session_id": "session-s", "reason": "clear", "hook_event_name": "SessionEnd" });
+    let out = hook(&sandbox, &[&["session-end"], &SMOKE_HOOK[..]].concat(), &end.to_string());
+    assert_eq!((out.status.code(), stdout_of(&out).as_str()), (Some(0), ""), "{}", stderr_of(&out));
+    session_hook(&sandbox, "user-prompt-submit", json!({ "session_id": "session-s", "cwd": root, "prompt": "once more" }));
+    stop(&sandbox, &daemon).await;
+
+    let report = sessions_report(&sandbox, &["--session", "session-s"]);
+    let rows = report["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "{report}");
+    assert_eq!((&rows[0]["end_reason"], &rows[0]["starts"], &rows[0]["prompts"]), (&json!("clear"), &json!({ "startup": 1 }), &json!(0)), "{report}");
+    assert!(rows[0]["ended_at_ms"].as_i64() >= rows[0]["started_at_ms"].as_i64(), "{report}");
+    assert_eq!((&rows[1]["end_reason"], &rows[1]["prompts"]), (&Value::Null, &json!(1)), "a closed session is not reopened: {report}");
+    assert!(rows[1]["started_at_ms"].as_i64() > rows[0]["started_at_ms"].as_i64(), "{report}");
+    let by_project = sessions_report(&sandbox, &[]);
+    assert_eq!(by_project["groups"][0]["ended"], json!({ "clear": 1 }), "{by_project}");
+    assert_eq!(by_project["groups"][0]["open"], 1, "{by_project}");
+}
+
+#[tokio::test]
 async fn a_debug_binary_refuses_prod_even_with_a_test_home() {
     let sandbox = Sandbox::new();
     let out = sandbox.run(&["status", "--profile", "prod"]);
@@ -3400,7 +3428,7 @@ async fn setup_dry_run_writes_nothing() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
     let text = stdout_of(&out);
     assert!(text.contains("mcp server clawg-dev: would register it"), "{text}");
-    assert!(text.contains("would add SessionStart, UserPromptSubmit"), "{text}");
+    assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd"), "{text}");
     assert!(!sandbox.home.join("claude-config").exists());
     assert!(!sandbox.data_dir().exists());
 }
@@ -3489,6 +3517,8 @@ async fn setup_cursor_installs_and_remove_undoes_it() {
     let hooks: Value = serde_json::from_str(&std::fs::read_to_string(cursor.join("hooks.json")).unwrap()).unwrap();
     let line = hooks["hooks"]["sessionStart"][0]["command"].as_str().expect("the hook");
     assert!(line.ends_with(" hook session-start --agent cursor --client cursor --profile dev"), "{hooks}");
+    let end = hooks["hooks"]["sessionEnd"][0]["command"].as_str().expect("the hook of the end");
+    assert!(end.ends_with(" hook session-end --agent cursor --client cursor --profile dev"), "{hooks}");
 
     let removed = setup(&["--remove"]);
     assert_eq!(removed.status.code(), Some(0), "{}", stdout_of(&removed));
@@ -3526,6 +3556,7 @@ async fn setup_local_installs_in_the_folder_and_remove_undoes_it() {
     assert_eq!(resolved(command), resolved(BIN), "{settings}");
     assert_eq!(hook["args"], json!(["hook", "session-start", "--agent", "claude-code", "--profile", "dev"]), "{settings}");
     assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"][1], "user-prompt-submit", "{settings}");
+    assert_eq!(settings["hooks"]["SessionEnd"][0]["hooks"][0]["args"][1], "session-end", "{settings}");
     assert!(!config.exists(), "the user's settings, server and protocol are not touched");
 
     let elsewhere = local(&["--path", "work/app", "--remove"], &sandbox.home);
