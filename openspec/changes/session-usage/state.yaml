@@ -1,9 +1,9 @@
 change: session-usage
 objective: transversal
 depends_on: []
-phase: explore
+phase: proposal  # las decisiones están en exploration.md; la propuesta, la spec, el diseño y las tareas van antes del código
 artifacts:
-  exploration: draft
+  exploration: done  # «Decisiones (2026-11-10)»: A, B, C y D entran; vigilar el proceso del cliente queda afuera
   proposal: pending
   spec: pending
   design: pending
@@ -11,4 +11,12 @@ artifacts:
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-08
+decisions:
+  registry: metrics.db  # esquema 3, con el invariante de ids enmendado sólo para estas tablas
+  duration: start_to_end  # sin umbral de tiempo activo
+  idle_close: 6h  # sin cierre ni actividad en 6 horas, la sesión cierra con idle; lo que siga abre una fila nueva
+  project_merge: moves  # las sesiones pasan al proyecto que queda
+  project_delete: deletes
+  session_end_hook: installed  # parte D, en Claude Code y en Cursor
+  report_command: clawg metrics sessions
+updated: 2026-11-10
