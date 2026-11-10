@@ -1292,6 +1292,14 @@ impl DaemonClient {
         check_status(&answer)
     }
 
+    /// Tells the daemon that `tool` ran for `agent_id` in the session of
+    /// `project_id`, and whether it failed.
+    pub async fn report_call(&self, agent_id: &str, project_id: Option<&str>, tool: &str, failed: bool) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "tool": tool, "failed": failed });
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/sessions/calls").json(&body)?).await?;
+        check_status(&answer)
+    }
+
     pub async fn synthesis(&self, args: &SynthesisArgs) -> Result<Synthesis, ClientError> {
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/synthesis").json(args)?).await?;
         read_response(answer)

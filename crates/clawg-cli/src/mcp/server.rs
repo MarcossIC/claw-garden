@@ -520,6 +520,9 @@ pub struct ClawgMcp {
     tool_router: ToolRouter<Self>,
 }
 
+/// The most a tool's answer waits for the daemon to count its call.
+const CALL_REPORT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The ids the daemon gave a root: where its memories are, and its own,
 /// which its docs index uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -725,6 +728,34 @@ impl ClawgMcp {
         let name = ctx.client_info().map(|info| info.name).filter(|n| !n.trim().is_empty())?;
         *self.declared.lock().expect("declared lock") = Some(name.clone());
         Some(name)
+    }
+
+    /// Tells the daemon that `tool` ran for `agent_id` and whether what it
+    /// answered is an error, so the call counts for the session of the one
+    /// open folder, and hands `result` back as it came. Only a daemon that
+    /// is already there is told: none is started or waited for.
+    async fn counted(
+        &self,
+        tool: &'static str,
+        agent_id: &str,
+        result: Result<CallToolResult, rmcp::ErrorData>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let failed = result.as_ref().map_or(true, |answer| answer.is_error == Some(true));
+        if let Some(client) = self.client.peek() {
+            let project = self.window_project().await;
+            let report = client.report_call(agent_id, project.as_deref(), tool, failed);
+            let _ = tokio::time::timeout(CALL_REPORT_WAIT, report).await;
+        }
+        result
+    }
+
+    /// The project of the one folder the client has open, which is the one
+    /// its hooks register the session under; `None` with several or none.
+    /// Nothing is registered for it: a call that registers no project must
+    /// not register one to be counted.
+    async fn window_project(&self) -> Option<String> {
+        let mut ids = self.known_ids().await;
+        (ids.len() == 1).then(|| ids.remove(0))
     }
 
     fn ok(text: impl Into<String>) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -1776,7 +1807,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SaveMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.save_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.save_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("save_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1802,7 +1835,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.search_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.search_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("search_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1819,7 +1854,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<RecallContextArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.recall_context_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.recall_context_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("recall_context", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1836,7 +1873,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ListMemoriesArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.list_memories_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.list_memories_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("list_memories", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1852,7 +1891,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ReadMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.read_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.read_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("read_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1868,7 +1909,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.delete_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.delete_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("delete_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1884,7 +1927,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<RestoreMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.restore_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.restore_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("restore_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1906,7 +1951,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<UpdateMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.update_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.update_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("update_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1924,7 +1971,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ResolveConflictArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.resolve_conflict_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.resolve_conflict_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("resolve_conflict", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1941,7 +1990,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<AnswerSuggestionArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.answer_suggestion_impl(args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.answer_suggestion_impl(args).await;
+        bridge.counted("answer_suggestion", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1960,7 +2011,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SynthesizeArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.synthesize_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.synthesize_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("synthesize", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1979,7 +2032,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchProjectArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.search_project_impl(args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.search_project_impl(args).await;
+        bridge.counted("search_project", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1990,7 +2045,9 @@ impl ClawgMcp {
                        user why."
     )]
     async fn memory_status(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.memory_status_impl(self.agent_for(Some(&ctx))).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.memory_status_impl(self.agent_for(Some(&ctx))).await;
+        bridge.counted("memory_status", &self.agent_id_for(Some(&ctx)), result).await
     }
 }
 
@@ -5952,5 +6009,88 @@ mod tests {
 
         assert!(shows(&found, ids[0]) && !shows(&found, ids[1]), "{found}");
         assert_eq!(roots.asked(), 1);
+    }
+
+    #[test]
+    fn the_counted_tools_are_the_tools_of_the_bridge() {
+        let b = ClawgMcp::pending(ClientHandle::pending(Duration::ZERO, PathBuf::new()).1, Profile::Dev);
+        let mut served: Vec<String> = b.tool_router.list_all().iter().map(|tool| tool.name.to_string()).collect();
+        served.sort();
+        let mut counted = crate::daemon::sessions::TOOLS.map(String::from).to_vec();
+        counted.sort();
+        assert_eq!(served, counted, "a tool the daemon does not know would be counted as `other`");
+    }
+
+    /// A bridge pinned to the agent `counted`, the recorder of its daemon,
+    /// which keeps its sessions, and the session `s-1` registered for the
+    /// bridge's own folder as a hook registers it.
+    async fn bridge_in_a_session() -> (ClawgMcp, Arc<clawg_core::metrics::Recorder>, tempfile::TempDir) {
+        let kept = Arc::new(std::sync::Mutex::new(None));
+        let (b, dir) = bridge_with({
+            let kept = kept.clone();
+            move |runtime| {
+                runtime.metrics.set_writing(true);
+                *kept.lock().unwrap() = Some(runtime.metrics.clone());
+                runtime
+            }
+        })
+        .await;
+        let b = b.with_agent(Some("counted".into()));
+        let metrics = kept.lock().unwrap().take().expect("the recorder of the daemon");
+        let project = b.window_project().await.expect("the bridge's own folder");
+        let started = crate::client::SessionEvent { event: "start", source: Some("startup"), client: "claude-code" };
+        b.client.peek().expect("a daemon").register_session("counted", Some(&project), "s-1", started).await.expect("register");
+        (b, metrics, dir)
+    }
+
+    #[tokio::test]
+    async fn a_tool_reports_its_call_to_the_session_of_the_open_folder() {
+        use clawg_core::metrics::sessions::CountKind;
+        let (b, metrics, _dir) = bridge_in_a_session().await;
+        let mut session = Session::open(&b);
+        session.initialize("plain-host").await;
+
+        let (failed, said) = session.call_tool("memory_status", serde_json::json!({})).await;
+        assert!(!failed, "{said}");
+        let (failed, said) = session.call_tool("search_memory", serde_json::json!({ "query": DEPLOY })).await;
+        assert!(!failed, "{said}");
+        let (failed, said) = session.call_tool("list_memories", serde_json::json!({})).await;
+        assert!(!failed, "{said}");
+
+        let rows = metrics.sessions().take().rows;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let calls: Vec<(&str, u64)> =
+            rows[0].counts.iter().filter(|((kind, _), _)| *kind != CountKind::Start).map(|((_, name), n)| (name.as_str(), *n)).collect();
+        assert_eq!(calls, [("list_memories", 1), ("memory_status", 1), ("search_memory", 1)], "one call each, and none failed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_tool_is_reported_as_failed() {
+        use clawg_core::metrics::sessions::CountKind;
+        let (b, metrics, _dir) = bridge_in_a_session().await;
+        let mut session = Session::open(&b);
+        session.initialize("plain-host").await;
+
+        // Refused by the bridge before it asks the daemon anything.
+        let twice = serde_json::json!({ "content": "deploys happen on tuesdays", "all_projects": true, "project_path": "/work/app" });
+        let (failed, said) = session.call_tool("save_memory", twice).await;
+        assert!(failed, "{said}");
+        let (failed, said) = session.call_tool("read_memory", serde_json::json!({ "id": 999_999 })).await;
+        assert!(failed, "{said}");
+
+        let rows = metrics.sessions().take().rows;
+        let row = &rows[0];
+        assert_eq!((row.count(CountKind::Call, "save_memory"), row.count(CountKind::FailedCall, "save_memory")), (1, 1));
+        assert_eq!((row.count(CountKind::Call, "read_memory"), row.count(CountKind::FailedCall, "read_memory")), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_call_is_not_reported_while_no_daemon_is_there() {
+        let (_outcome, handle) = ClientHandle::pending(Duration::from_secs(30), PathBuf::new());
+        let b = ClawgMcp::pending(handle, Profile::Dev);
+        let started = Instant::now();
+        let answer = b.counted("memory_status", "a", ClawgMcp::ok("fine")).await.expect("the answer");
+        assert_eq!(answer.is_error, Some(false));
+        assert!(started.elapsed() < Duration::from_secs(5), "a start in progress is not waited for");
     }
 }
