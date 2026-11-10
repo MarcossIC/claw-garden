@@ -575,7 +575,8 @@ mod tests {
                 "sessionEnd": [planned_hook("session-end", Shell::Posix)]
             }})
         );
-        assert_eq!(hooks["hooks"]["sessionEnd"][0]["command"], format!("{} {END_ARGS}", exe().display()));
+        // As a POSIX shell reads the path: a Windows one, with its backslashes, is quoted.
+        assert_eq!(hooks["hooks"]["sessionEnd"][0]["command"], format!("{} {END_ARGS}", sh_word(exe().to_str().unwrap())));
         let keys: Vec<&String> = hooks.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["version", "hooks"]);
     }
