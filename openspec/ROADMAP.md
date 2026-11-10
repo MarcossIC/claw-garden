@@ -72,6 +72,8 @@ Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y despué
 
 **Calidad de lo guardado:** memory-anchors, y una política de olvido para `memory`, que hoy no existe y todavía no tiene cambio.
 
+**Organización de los proyectos:** [project-groups](changes/project-groups/exploration.md) (123), que agrupa proyectos en un árbol para guardar y leer a nivel de grupo. Agrega una columna a `project`, así que va después del corte, cuando los datos ya se tocaron.
+
 **Costo por sesión:** [session-tokens](changes/session-tokens/exploration.md) (122) va en local, después de session-usage, y sólo si se quiere el costo de cada proyecto. Para saber si clawg ahorra alcanza agent-eval, que compara la misma tarea con y sin clawg.
 
 ## Cómo se mantiene
