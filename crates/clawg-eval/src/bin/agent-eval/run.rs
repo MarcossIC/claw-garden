@@ -237,6 +237,8 @@ pub enum Leak {
         .out.display(), .dir.display()
     )]
     Context { out: PathBuf, dir: PathBuf, name: &'static str },
+    #[error("the working directory {} holds {what} (the client tells the session its working directory, so the agent reads it)", .workdir.display())]
+    Named { workdir: PathBuf, what: String },
 }
 
 fn join_leaks(leaks: &[Leak]) -> String {
@@ -247,14 +249,16 @@ fn join_leaks(leaks: &[Leak]) -> String {
 /// where its project and native memory are.
 const CONTEXT_NAMES: [&str; 4] = [".git", "CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"];
 
-/// Every problem of a paid run, from the variables that matter and from
-/// `ancestors`, each directory from `out` up with the [`CONTEXT_NAMES`] it holds.
+/// Every problem of a paid run of `task`, from the variables that matter, from
+/// `ancestors`, each directory from `out` up with the [`CONTEXT_NAMES`] it
+/// holds, and from the path of its working directory.
 fn leaks(
     api_key: Option<&str>,
     auth_token: Option<&str>,
     effort_level: Option<&str>,
     out: &Path,
     ancestors: &[(PathBuf, Vec<&'static str>)],
+    task: &Task,
 ) -> Vec<Leak> {
     let set = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
     let mut found = Vec::new();
@@ -270,6 +274,13 @@ fn leaks(
     for (dir, names) in ancestors {
         found.extend(names.iter().map(|name| Leak::Context { out: out.to_owned(), dir: dir.clone(), name }));
     }
+    let workdir = Layout { root: out.to_owned() }.workdir();
+    let path = workdir.to_string_lossy();
+    let named = |what: String| Leak::Named { workdir: workdir.clone(), what };
+    if task::contains_ci(&path, &task.id) {
+        found.push(named(format!("the id of its task, {}", task.id)));
+    }
+    found.extend(task.tracers.iter().filter(|tr| task::contains_ci(&path, tr)).map(|tr| named(format!("the tracer {tr:?}"))));
     found
 }
 
@@ -281,8 +292,8 @@ fn probe_ancestors(out: &Path) -> Vec<(PathBuf, Vec<&'static str>)> {
         .collect()
 }
 
-/// Refuses a paid run whose key or `out` directory would skew it, naming each problem.
-pub fn check_paid_run(out: &Path) -> Result<(), RunError> {
+/// Refuses a paid run of `task` whose key or `out` directory would skew it, naming each problem.
+pub fn check_paid_run(out: &Path, task: &Task) -> Result<(), RunError> {
     let out = std::path::absolute(out).map_err(io(out))?;
     let var = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
     let found = leaks(
@@ -291,6 +302,7 @@ pub fn check_paid_run(out: &Path) -> Result<(), RunError> {
         var("CLAUDE_CODE_EFFORT_LEVEL").as_deref(),
         &out,
         &probe_ancestors(&out),
+        task,
     );
     if found.is_empty() { Ok(()) } else { Err(RunError::PaidRun(found)) }
 }
@@ -704,23 +716,48 @@ mod tests {
         out.ancestors().map(|a| (a.to_owned(), Vec::new())).collect()
     }
 
+    fn staging_port() -> Task {
+        task::parse(
+            r#"{"id": "staging-port", "category": "K1", "fixture": "f", "prompt": "Which port?",
+                "memories": [{"content": "Staging port 48213"}], "tracers": ["48213"],
+                "checks": [{"kind": "answer_contains", "text": "48213"}]}"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn a_paid_run_with_its_key_and_a_clean_directory_has_no_leaks() {
         let out = Path::new("/runs/1");
-        assert_eq!(leaks(Some("sk-key"), None, None, out, &clean_ancestors(out)), []);
+        assert_eq!(leaks(Some("sk-key"), None, None, out, &clean_ancestors(out), &staging_port()), []);
     }
 
     #[test]
     fn a_missing_or_empty_key_a_token_and_an_effort_level_are_each_named() {
         let out = Path::new("/runs/1");
         let ancestors = clean_ancestors(out);
-        assert_eq!(leaks(None, None, None, out, &ancestors), [Leak::NoApiKey]);
-        assert_eq!(leaks(Some(""), None, None, out, &ancestors), [Leak::NoApiKey]);
+        let t = staging_port();
+        assert_eq!(leaks(None, None, None, out, &ancestors, &t), [Leak::NoApiKey]);
+        assert_eq!(leaks(Some(""), None, None, out, &ancestors, &t), [Leak::NoApiKey]);
         assert_eq!(
-            leaks(None, Some("token"), Some("high"), out, &ancestors),
+            leaks(None, Some("token"), Some("high"), out, &ancestors, &t),
             [Leak::NoApiKey, Leak::AuthToken, Leak::EffortLevel]
         );
-        assert_eq!(leaks(Some("k"), Some(""), Some(""), out, &ancestors), [], "an empty variable sets nothing");
+        assert_eq!(leaks(Some("k"), Some(""), Some(""), out, &ancestors, &t), [], "an empty variable sets nothing");
+    }
+
+    #[test]
+    fn a_working_directory_that_names_its_task_or_a_tracer_is_named() {
+        let t = staging_port();
+        let found = |out: &str| leaks(Some("k"), None, None, Path::new(out), &clean_ancestors(Path::new(out)), &t);
+        let workdir = |out: &str| Layout { root: PathBuf::from(out) }.workdir();
+        assert_eq!(found("/runs/t5f0c2a9e.a0.1"), []);
+        assert_eq!(
+            found("/runs/Staging-Port.a0.1"),
+            [Leak::Named { workdir: workdir("/runs/Staging-Port.a0.1"), what: "the id of its task, staging-port".into() }]
+        );
+        assert_eq!(found("/runs/48213/1"), [Leak::Named { workdir: workdir("/runs/48213/1"), what: "the tracer \"48213\"".into() }]);
+        let said = RunError::PaidRun(found("/runs/staging-port.a0.1")).to_string();
+        assert!(said.contains("staging-port") && said.contains("the agent reads it"), "{said}");
     }
 
     #[test]
@@ -732,7 +769,7 @@ mod tests {
             (PathBuf::from("/repo"), vec![".git", ".claude/CLAUDE.md"]),
             (PathBuf::from("/"), vec![]),
         ];
-        let found = leaks(Some("k"), None, None, out, &ancestors);
+        let found = leaks(Some("k"), None, None, out, &ancestors, &staging_port());
         assert_eq!(
             found,
             [

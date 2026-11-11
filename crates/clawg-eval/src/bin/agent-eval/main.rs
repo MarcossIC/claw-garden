@@ -50,7 +50,9 @@ agent-eval replay-client STREAM
                  problem, an environment without ANTHROPIC_API_KEY or with
                  ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_EFFORT_LEVEL set, and
                  an --out below a git repository or a CLAUDE.md,
-                 CLAUDE.local.md or .claude/CLAUDE.md. The session may edit
+                 CLAUDE.local.md or .claude/CLAUDE.md, or whose working
+                 directory holds the task's id or one of its tracers: the
+                 client tells the agent where it works. The session may edit
                  its directory and call clawg's tools, and has no shell.
                  On Windows clawg finds its
                  home through the system, so an arm with clawg needs a
@@ -260,9 +262,12 @@ fn read_files(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> std:
     Ok(())
 }
 
-fn prepare(args: &RunArgs, client: &Client) -> Result<Layout, String> {
+fn load_task(args: &RunArgs) -> Result<task::Task, String> {
     let tasks = task::load(&args.data).map_err(|e| e.to_string())?;
-    let t = task::find(tasks, &args.task).map_err(|e| e.to_string())?;
+    task::find(tasks, &args.task).map_err(|e| e.to_string())
+}
+
+fn prepare(args: &RunArgs, t: &task::Task, client: &Client) -> Result<Layout, String> {
     let layout = Layout { root: std::path::absolute(&args.out).map_err(|e| format!("{}: {e}", args.out.display()))? };
     let options = Options {
         clawg: args.clawg.clone(),
@@ -274,7 +279,7 @@ fn prepare(args: &RunArgs, client: &Client) -> Result<Layout, String> {
         claude_version: args.claude_version.clone(),
         now_ms: now_ms(),
     };
-    run::prepare(&t, args.arm, &task::fixture_dir(&args.data, &t), &layout, &options, client).map_err(|e| e.to_string())?;
+    run::prepare(t, args.arm, &task::fixture_dir(&args.data, t), &layout, &options, client).map_err(|e| e.to_string())?;
     Ok(layout)
 }
 
@@ -292,7 +297,7 @@ fn execute(command: Command) -> Result<(), String> {
     match command {
         Command::Tasks { data } => list_tasks(&data),
         Command::Prepare(args) => {
-            let layout = prepare(&args, &Client::Claude)?;
+            let layout = prepare(&args, &load_task(&args)?, &Client::Claude)?;
             println!("prepared {}", layout.root.display());
             Ok(())
         }
@@ -305,10 +310,11 @@ fn execute(command: Command) -> Result<(), String> {
             if let (Client::Claude, Some(version)) = (&client, &args.claude_version) {
                 run::check_client_version(arm::CLIENT, version).map_err(|e| e.to_string())?;
             }
+            let t = load_task(&args)?;
             if client == Client::Claude {
-                run::check_paid_run(&args.out).map_err(|e| e.to_string())?;
+                run::check_paid_run(&args.out, &t).map_err(|e| e.to_string())?;
             }
-            let layout = prepare(&args, &client)?;
+            let layout = prepare(&args, &t, &client)?;
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
             run::execute(&layout.root, &exe).map_err(|e| e.to_string())?;
             let result = run::score_dir(&layout.root).map_err(|e| e.to_string())?;
