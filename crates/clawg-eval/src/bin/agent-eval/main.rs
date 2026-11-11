@@ -22,6 +22,7 @@ agent-eval prepare RUN_OPTIONS
 agent-eval run RUN_OPTIONS (--replay STREAM | --max-budget-usd N --claude-version V)
 agent-eval score --run DIR
 agent-eval report --runs DIR
+agent-eval costs --runs DIR
 agent-eval replay-client STREAM
 
   tasks          reads every task in DIR/tasks/*.json, checks each one and
@@ -59,7 +60,13 @@ agent-eval replay-client STREAM
   report         reads the result.json of every directory up to 3 levels
                  below DIR and prints a Markdown table by task and arm: runs,
                  successes, runs that did not end, mean cost, turns, seconds
-                 and clawg calls, the tracer fates summed, and a totals line.
+                 and clawg calls, the tracer fates summed, a totals line and
+                 the tokens of every model summed.
+  costs          reads the same results and prints a CSV with a line per
+                 session and model: when the session started and ended
+                 (UTC), the credential that paid, the tokens by kind, the
+                 main loop's cache writes for 5 minutes and for 1 hour, and
+                 the client's estimate of the cost.
   replay-client  the client a dry run starts: prints STREAM after making
                  its file changes in the current directory.
 
@@ -101,6 +108,7 @@ enum Command {
     Run { args: RunArgs, replay: Option<PathBuf> },
     Score { dir: PathBuf },
     Report { dir: PathBuf },
+    Costs { dir: PathBuf },
     ReplayClient { stream: PathBuf },
 }
 
@@ -198,6 +206,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Command>, Str
         }
         "score" => Command::Score { dir: PathBuf::from(required(&mut flags(rest, &["run"])?, "run")?) },
         "report" => Command::Report { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
+        "costs" => Command::Costs { dir: PathBuf::from(required(&mut flags(rest, &["runs"])?, "runs")?) },
         "replay-client" => {
             let [stream]: [String; 1] = rest.collect::<Vec<_>>().try_into().map_err(|_| "replay-client takes one stream file")?;
             Command::ReplayClient { stream: PathBuf::from(stream) }
@@ -316,6 +325,11 @@ fn execute(command: Command) -> Result<(), String> {
             print!("{}", report::render(&report::aggregate(&results)));
             Ok(())
         }
+        Command::Costs { dir } => {
+            let runs = report::load_named(&dir).map_err(|e| e.to_string())?;
+            print!("{}", report::costs(&runs));
+            Ok(())
+        }
         Command::ReplayClient { stream } => {
             let cwd = std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
             replay::run(&stream, &cwd)
@@ -395,6 +409,8 @@ mod tests {
         assert_eq!(parse_args(args(&["score", "--run", "r"])), Ok(Some(Command::Score { dir: "r".into() })));
         assert_eq!(parse_args(args(&["replay-client", "s"])), Ok(Some(Command::ReplayClient { stream: "s".into() })));
         assert_eq!(parse_args(args(&["report", "--runs", "d"])), Ok(Some(Command::Report { dir: "d".into() })));
+        assert_eq!(parse_args(args(&["costs", "--runs", "d"])), Ok(Some(Command::Costs { dir: "d".into() })));
+        assert!(parse_args(args(&["costs"])).unwrap_err().contains("--runs is required"));
         assert!(parse_args(args(&["report"])).unwrap_err().contains("--runs is required"));
         assert!(parse_args(args(&["report", "--run", "d"])).unwrap_err().contains("unknown argument --run"));
         assert_eq!(parse_args(args(&["--help"])), Ok(None));

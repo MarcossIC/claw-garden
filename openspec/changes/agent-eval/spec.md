@@ -34,9 +34,9 @@ El export MUST ser un archivo `clawg-memories` que `clawg import` lee: la cabece
 
 ## AE4. El stream
 
-`stream::parse` MUST leer las llamadas a herramientas con su resultado, si son de un subagente y si hubo un `ToolSearch` antes, el texto de los eventos de hook, los textos del asistente, las compactaciones y el resultado final con su costo y sus tokens. Una línea de un tipo desconocido MUST contarse y una que no es JSON reportarse por número, sin fallar.
+`stream::parse` MUST leer las llamadas a herramientas con su resultado, si son de un subagente y si hubo un `ToolSearch` antes, el texto de los eventos de hook, los textos del asistente, las compactaciones, la credencial que pagó (`apiKeySource` de la línea `init`) y el resultado final con su costo y sus tokens. Los tokens del resultado MUST incluir los del bucle principal (`usage`), con las escrituras de caché de 5 minutos y de 1 hora por separado (`usage.cache_creation`), y los de cada modelo (`modelUsage`): entrada, salida, lectura y escritura de caché, el costo que estima el cliente y la tabla con que lo estimó (`costBasis`). `modelUsage` cuenta también los subagentes y la respuesta que pasó `--max-budget-usd`, que `usage` deja afuera. Un campo que el stream no trae MUST leerse como ausente o cero. Una línea de un tipo desconocido MUST contarse y una que no es JSON reportarse por número, sin fallar.
 
-**Tests:** los de `stream.rs`.
+**Tests:** los de `stream.rs` (entre ellos `the_outcome_carries_the_tokens_of_each_model_and_the_cache_writes_by_duration` y `a_stream_without_the_newer_fields_reads_them_as_absent`).
 
 ## AE5. El puntaje y la rúbrica
 
@@ -46,14 +46,14 @@ Una corrida MUST ser `success` sólo si terminó sin error y pasó todos sus che
 
 ## AE6. La corrida en seco
 
-`agent-eval run … --replay STREAM` MUST preparar la corrida en un directorio ausente o vacío (nunca sobre otra), lanzar `agent-eval replay-client STREAM` en su directorio de trabajo con las variables del brazo, guardar su salida en `stream.jsonl` y escribir `result.json`. El cliente reproducido MUST aplicar los `Write` y `Edit` del stream y MUST rechazar una ruta fuera del directorio de trabajo. `agent-eval score --run DIR` MUST reproducir el resultado.
+`agent-eval run … --replay STREAM` MUST preparar la corrida en un directorio ausente o vacío (nunca sobre otra), lanzar `agent-eval replay-client STREAM` en su directorio de trabajo con las variables del brazo, guardar su salida en `stream.jsonl` y escribir `result.json`. El cliente reproducido MUST aplicar los `Write` y `Edit` del stream y MUST rechazar una ruta fuera del directorio de trabajo. `agent-eval score --run DIR` MUST reproducir el resultado. `result.json` MUST llevar, en `session`, la credencial que pagó y cuándo empezó y terminó la sesión en UTC: la creación y la última escritura de `stream.jsonl`, que se crea justo antes de lanzar el cliente y se cierra cuando sale. Una plataforma que no da la creación de un archivo deja el inicio ausente.
 
 #### Escenario: con y sin clawg
 - GIVEN la tarea `example-staging-port`
 - WHEN se reproduce su stream de `a3` y el de `a0`
 - THEN la primera sale `success` con `48213` `used` y una llamada a `search_memory` después de un `ToolSearch`, y la segunda `failure` con `48213` `never_reached`
 
-**Tests:** los de `replay.rs`; `prepare_lays_out_the_run_and_never_writes_over_another`, `score_dir_reads_the_run_back_and_writes_its_result` (`run.rs`); `a_replayed_session_with_clawg_finds_the_fact_and_succeeds`, `a_replayed_session_without_memory_never_reaches_the_fact`, `a_replayed_edit_changes_the_working_directory_the_checks_read`, `a_run_never_writes_over_another` (`tests/agent_eval.rs`).
+**Tests:** los de `replay.rs`; `prepare_lays_out_the_run_and_never_writes_over_another`, `score_dir_reads_the_run_back_and_writes_its_result`, `score_dir_dates_the_session_by_its_stream_and_names_the_credential` (`run.rs`); `a_replayed_session_with_clawg_finds_the_fact_and_succeeds`, `a_replayed_session_without_memory_never_reaches_the_fact`, `a_replayed_edit_changes_the_working_directory_the_checks_read`, `a_run_never_writes_over_another` (`tests/agent_eval.rs`).
 
 ## AE7. El corredor
 
@@ -78,6 +78,12 @@ Una corrida MUST ser `success` sólo si terminó sin error y pasó todos sus che
 
 ## AE8. El reporte
 
-`agent-eval report --runs DIR` MUST leer cada `result.json` hasta tres niveles debajo de DIR, sin bajar dentro de una corrida, y escribir una tabla Markdown con una fila por tarea y brazo, en orden de tarea y de brazo: categoría, corridas, éxitos `k/n`, corridas que no terminaron bien, y las medias de costo, turnos, segundos y llamadas a clawg de las corridas que dan ese número, con el destino de los trazadores sumado. Una tarea de ejemplo MUST salir marcada. Al final MUST dar el total de corridas, de éxitos y de costo, y cuántas corridas no dieron costo. Un DIR sin ningún resultado, o con un `result.json` inválido, MUST ser un error.
+`agent-eval report --runs DIR` MUST leer cada `result.json` hasta tres niveles debajo de DIR, sin bajar dentro de una corrida, y escribir una tabla Markdown con una fila por tarea y brazo, en orden de tarea y de brazo: categoría, corridas, éxitos `k/n`, corridas que no terminaron bien, y las medias de costo, turnos, segundos y llamadas a clawg de las corridas que dan ese número, con el destino de los trazadores sumado. Una tarea de ejemplo MUST salir marcada. Al final MUST dar el total de corridas, de éxitos y de costo, y cuántas corridas no dieron costo, y en otra línea los tokens sumados: de cada modelo de una corrida que los da por modelo y del bucle principal de una que no, con las escrituras de caché de 5 minutos y de 1 hora del bucle principal. Un DIR sin ningún resultado, o con un `result.json` inválido, MUST ser un error.
 
-**Tests:** `rows_come_in_task_then_arm_order_with_their_means_and_sums`, `the_totals_count_runs_successes_and_cost_with_the_runs_that_report_none`, `a_group_without_any_cost_has_none`, `the_table_is_markdown_with_the_example_marked`, `load_finds_results_up_to_three_levels_down_and_skips_the_rest`, `load_reads_a_written_result_back_and_names_a_directory_without_any` (`report.rs`).
+**Tests:** `rows_come_in_task_then_arm_order_with_their_means_and_sums`, `the_totals_count_runs_successes_and_cost_with_the_runs_that_report_none`, `a_group_without_any_cost_has_none`, `the_table_is_markdown_with_the_example_marked`, `the_totals_add_the_tokens_of_every_model`, `load_finds_results_up_to_three_levels_down_and_skips_the_rest`, `load_reads_a_written_result_back_and_names_a_directory_without_any` (`report.rs`).
+
+## AE9. Los costos por sesión
+
+`agent-eval costs --runs DIR` MUST leer los mismos resultados que `report` y escribir un CSV con una línea por sesión y modelo: la ruta de la corrida debajo de DIR, la tarea, el brazo, el inicio y el fin en UTC, la credencial que pagó, el modelo, los tokens de entrada, salida, lectura y escritura de caché, las escrituras de caché de 5 minutos y de 1 hora, el costo que estimó el cliente y su `costBasis`. Las escrituras por duración son del bucle principal, así que MUST ir sólo en la línea del modelo de la sesión. Una sesión sin desglose por modelo MUST salir en una línea con los tokens de su bucle principal y su costo total. Una sesión que no imprimió resultado MUST salir en una línea sin cifras. Sirve para poner precio a una sesión por sus tokens y para encontrarla por su hora en el uso de la consola, que no conoce sesiones.
+
+**Tests:** `the_costs_have_a_line_per_session_and_model_with_the_cache_durations_on_the_session_model`, `a_session_without_a_breakdown_by_model_is_costed_from_its_main_loop` (`report.rs`); `the_other_commands_parse` (`main.rs`).

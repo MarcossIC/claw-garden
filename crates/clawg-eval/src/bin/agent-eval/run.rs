@@ -84,6 +84,15 @@ pub struct Session {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub client_version: Option<String>,
+    /// The credential that paid, as the client names it.
+    #[serde(default)]
+    pub api_key_source: Option<String>,
+    /// When the client started and last wrote its stream, in UTC: what a
+    /// session is found by in the console's usage, which knows no session.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub ended_at: Option<String>,
     pub mcp_servers: Vec<(String, String)>,
     pub tool_calls: usize,
     /// Calls to clawg's tools, by tool.
@@ -131,6 +140,9 @@ pub fn evaluate(
         session_id: t.session_id.clone(),
         model: t.model.clone(),
         client_version: t.client_version.clone(),
+        api_key_source: t.api_key_source.clone(),
+        started_at: None,
+        ended_at: None,
         mcp_servers: t.mcp_servers.clone(),
         tool_calls: t.calls.len(),
         clawg_calls,
@@ -670,7 +682,15 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     let stream = std::fs::read_to_string(&stream_path).map_err(io(&stream_path))?;
     let workdir = Layout { root: root.to_owned() }.workdir();
     let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
-    let result = evaluate(&task, &arm, client.name(), profile, lang, &stream::parse(&stream), read_file);
+    let mut result = evaluate(&task, &arm, client.name(), profile, lang, &stream::parse(&stream), read_file);
+    // The stream is created right before the client starts and closed when it exits.
+    let meta = std::fs::metadata(&stream_path).map_err(io(&stream_path))?;
+    let utc = |t: std::io::Result<std::time::SystemTime>| {
+        let since = t.ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(clawg_cli::memories::format_utc(i64::try_from(since.as_millis()).ok()?))
+    };
+    result.session.started_at = utc(meta.created());
+    result.session.ended_at = utc(meta.modified());
     let out = root.join(RESULT_FILE);
     std::fs::write(&out, serde_json::to_string_pretty(&result).expect("JSON serializes") + "\n").map_err(io(&out))?;
     Ok(result)
@@ -922,5 +942,25 @@ mod tests {
         prepare(&task(), Arm::A0, &fixture, &claude, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
         std::fs::write(claude.root.join(STREAM_FILE), STREAM).unwrap();
         assert_eq!(score_dir(&claude.root).unwrap().client, "claude");
+    }
+
+    #[test]
+    fn score_dir_dates_the_session_by_its_stream_and_names_the_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir_all(&fixture).unwrap();
+        let layout = Layout { root: dir.path().join("run") };
+        prepare(&task(), Arm::A0, &fixture, &layout, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
+        let stream = STREAM.replacen(r#""subtype":"init","#, r#""subtype":"init","apiKeySource":"ANTHROPIC_API_KEY","#, 1);
+        std::fs::write(layout.root.join(STREAM_FILE), stream).unwrap();
+
+        let r = score_dir(&layout.root).unwrap();
+
+        assert_eq!(r.session.api_key_source.as_deref(), Some("ANTHROPIC_API_KEY"));
+        let ended = r.session.ended_at.expect("every platform knows when a file was last written");
+        assert!(ended.ends_with(" UTC"), "{ended}");
+        if cfg!(windows) {
+            assert!(r.session.started_at.is_some(), "Windows knows when a file was created");
+        }
     }
 }
