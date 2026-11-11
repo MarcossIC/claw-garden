@@ -25,10 +25,10 @@ use crate::memory::MemoryStore;
 /// failed once fails the same way with the same text; the retries are for a
 /// process that died while ingesting it, and three deaths in a row on one
 /// save say the save is what kills it. A starting value, not measured.
-pub const MAX_ATTEMPTS: i64 = 3;
+pub(crate) const MAX_ATTEMPTS: i64 = 3;
 
 /// How many rows with a cause `/health` shows.
-pub const PROBLEMS_SHOWN: usize = 5;
+pub(crate) const PROBLEMS_SHOWN: usize = 5;
 
 /// Whether a row still waits for the worker or was given up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +39,7 @@ pub enum OutboxState {
 }
 
 impl OutboxState {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Failed => "failed",
@@ -126,7 +126,7 @@ pub(crate) fn apply_note(c: &rusqlite::Connection, note: &OutboxNote) -> rusqlit
 
 /// What recording a save found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Recorded {
+pub(crate) enum Recorded {
     /// A new row.
     New { row: i64 },
     /// The agent already has a row under this operation id.
@@ -191,7 +191,7 @@ pub(crate) struct FailedRow {
 
 impl FailedRow {
     /// The memories the save inserted before it stopped.
-    pub fn inserted(&self) -> Vec<i64> {
+    pub(crate) fn inserted(&self) -> Vec<i64> {
         self.progress.iter().filter(|p| p.inserted).map(|p| p.id).collect()
     }
 }

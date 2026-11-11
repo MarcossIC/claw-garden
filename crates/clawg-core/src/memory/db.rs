@@ -37,7 +37,7 @@ pub struct EmbeddingIdentity {
 impl EmbeddingIdentity {
     /// Reads all four fields off ONE embedder instance — a mismatch cannot be
     /// assembled by pairing metadata from two different sources.
-    pub fn of(e: &dyn Embedder) -> Self {
+    pub(crate) fn of(e: &dyn Embedder) -> Self {
         Self {
             model_id: e.model_id().to_string(),
             dim: e.dimensions(),
@@ -86,7 +86,7 @@ pub enum ContractStatus {
 /// naming the field and `{:?}`-quoting both sides so a one-trailing-space
 /// prefix difference is visible in a log line instead of looking identical.
 /// Pure — this is the message body, not a side-effecting log call.
-pub fn differing_fields(stored: &StoredContract, actual: &EmbeddingIdentity) -> Vec<String> {
+pub(crate) fn differing_fields(stored: &StoredContract, actual: &EmbeddingIdentity) -> Vec<String> {
     let mut out = Vec::new();
     if stored.model_id != actual.model_id {
         out.push(format!(
@@ -206,7 +206,7 @@ impl MemoryStore {
     /// lives. A process that loses gets [`MemoryError::StoreInUse`] and has not
     /// created, opened or migrated `memory.db`: those are the holder's alone.
     /// `holder` says who is asking, so the loser's message can name it.
-    pub async fn open(base_dir: &Path, holder: StoreHolder) -> Result<Self, MemoryError> {
+    pub(crate) async fn open(base_dir: &Path, holder: StoreHolder) -> Result<Self, MemoryError> {
         ensure_vec0_registered();
         crate::private_dir::ensure_private_dir(base_dir)
             .map_err(|source| MemoryError::DataDir { path: base_dir.to_path_buf(), source })?;
@@ -302,7 +302,7 @@ impl MemoryStore {
     /// whole copy. WAL lets that connection read one consistent state while
     /// this one keeps writing. The in-memory test store has no file for a
     /// second connection and copies through its own.
-    pub async fn snapshot(&self, into: PathBuf, reason: backup::Reason) -> Result<PathBuf, MemoryError> {
+    pub(crate) async fn snapshot(&self, into: PathBuf, reason: backup::Reason) -> Result<PathBuf, MemoryError> {
         let started = std::time::Instant::now();
         let written = self.snapshot_into(into, reason).await;
         if let Ok(path) = &written {
@@ -339,7 +339,7 @@ impl MemoryStore {
     }
 
     /// The recorder every clone of this store measures into.
-    pub fn metrics(&self) -> &Arc<Recorder> {
+    pub(crate) fn metrics(&self) -> &Arc<Recorder> {
         &self.metrics
     }
 
@@ -356,7 +356,7 @@ impl MemoryStore {
     /// properties the embedder itself reports — the four compared fields are
     /// all things the embedder tells you about itself (like `dim = 384`);
     /// `metric`/`normalized` are things this codebase decided.
-    pub async fn ensure_embedding_contract(
+    pub(crate) async fn ensure_embedding_contract(
         &self,
         identity: EmbeddingIdentity,
     ) -> Result<ContractStatus, MemoryError> {

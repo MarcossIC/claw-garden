@@ -17,7 +17,7 @@ pub struct MigrationId {
 /// Reads `refinery_schema_history`, empty when the table does not exist yet.
 ///
 /// Refinery stores the checksum as the decimal text of a `u64`.
-pub fn read_history(c: &rusqlite::Connection) -> rusqlite::Result<Vec<MigrationId>> {
+pub(crate) fn read_history(c: &rusqlite::Connection) -> rusqlite::Result<Vec<MigrationId>> {
     let exists: bool = c.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master \
          WHERE type = 'table' AND name = 'refinery_schema_history')",
@@ -90,7 +90,7 @@ pub enum SchemaPlan {
 /// A divergence inside the range this binary knows wins over `Newer`: a
 /// binary that disagrees about its own migrations has a different problem
 /// than one that is merely older.
-pub fn schema_plan(applied: &[MigrationId], known: &[MigrationId]) -> SchemaPlan {
+pub(crate) fn schema_plan(applied: &[MigrationId], known: &[MigrationId]) -> SchemaPlan {
     let Some(db) = applied.iter().map(|m| m.version).max() else {
         return SchemaPlan::Fresh;
     };
@@ -163,7 +163,7 @@ impl Reason {
         Reason::PreDelete,
     ];
 
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Reason::PreMigration => "pre-migration",
             Reason::PreRestore => "pre-restore",
@@ -295,14 +295,14 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// per restore, per import, per re-embed or per batch move, so five cover
 /// several in a row. A starting
 /// value, not measured.
-pub const AUTO_KEEP: usize = 5;
+pub(crate) const AUTO_KEEP: usize = 5;
 
 /// The automatic snapshots among `names` that fall outside the newest
 /// [`AUTO_KEEP`], except the newest of each reason: a burst of restores or
 /// re-embeds must not push out the `pre-migration` snapshot that is the way
 /// back from an upgrade. Manual snapshots and names this module did not
 /// produce are never chosen.
-pub fn to_prune(names: &[String]) -> Vec<String> {
+pub(crate) fn to_prune(names: &[String]) -> Vec<String> {
     let mut automatic: Vec<(&String, Reason)> = names
         .iter()
         .filter_map(|n| parse_snapshot_name(n).filter(|r| r.is_automatic()).map(|r| (n, r)))
@@ -359,7 +359,7 @@ fn now_ms() -> i64 {
 /// includes what is still in the WAL; the result has no WAL of its own. It is
 /// written under a `.tmp` name and renamed when complete, so an interrupted
 /// snapshot never passes for a finished one.
-pub fn snapshot_into(
+pub(crate) fn snapshot_into(
     c: &rusqlite::Connection,
     dir: &Path,
     reason: Reason,
@@ -492,7 +492,7 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
