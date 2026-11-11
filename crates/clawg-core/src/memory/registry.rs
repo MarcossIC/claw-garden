@@ -33,7 +33,7 @@ pub(crate) fn project_name(id: &str) -> &str {
 }
 
 /// The longest name a project may be given, in characters.
-pub const MAX_NAME_CHARS: usize = 80;
+pub(crate) const MAX_NAME_CHARS: usize = 80;
 
 /// A project as `project` holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,7 +648,7 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
 /// What tells two names apart for a person: the name in Unicode lower case,
 /// without anything that is not a letter or a digit. `Mi App`, `mi-app` and
 /// `mi_app` have one key.
-pub fn name_key(name: &str) -> String {
+pub(crate) fn name_key(name: &str) -> String {
     name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
