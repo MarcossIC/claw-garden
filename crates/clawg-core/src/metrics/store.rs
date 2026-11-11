@@ -6,6 +6,7 @@
 //! is set aside and started again instead of stopping the daemon.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 
@@ -30,6 +31,11 @@ pub const MINUTES_KEPT_MS: i64 = 14 * DAY_MS;
 /// How long the hours, the events, the sessions and the runs left without
 /// any are kept.
 pub const HOURS_KEPT_MS: i64 = 400 * DAY_MS;
+
+/// How long a reader waits for a journal its writer is removing, and how
+/// often it looks again.
+const JOURNAL_WAIT: Duration = Duration::from_secs(5);
+const JOURNAL_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetricsError {
@@ -152,9 +158,31 @@ impl MetricsDb {
     }
 
     /// Opens `path` to read, without creating or changing anything.
+    ///
+    /// A journal beside the file is its writer's to remove or to roll back,
+    /// and a reader that finds one is refused. The writer deletes it as it
+    /// commits, but on Windows the delete reaches the directory only when
+    /// the last handle on the journal closes, so a report asked for right
+    /// after `clawg stop` can still see it: the reader waits for it to go.
     pub fn open_read_only(path: &Path) -> Result<Self, MetricsError> {
+        Self::open_read_only_within(path, JOURNAL_WAIT)
+    }
+
+    fn open_read_only_within(path: &Path, wait: Duration) -> Result<Self, MetricsError> {
+        let deadline = Instant::now() + wait;
+        loop {
+            match Self::open_reader(path) {
+                Err(MetricsError::Sqlite(e)) if e.sqlite_error_code() == Some(ErrorCode::ReadOnly) && Instant::now() < deadline => {
+                    std::thread::sleep(JOURNAL_POLL);
+                }
+                opened => return opened,
+            }
+        }
+    }
+
+    fn open_reader(path: &Path) -> Result<Self, MetricsError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(MetricsError::Newer(version));
@@ -165,7 +193,7 @@ impl MetricsDb {
     fn open_writable(path: &Path) -> Result<Self, MetricsError> {
         create_private(path)?;
         let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(MetricsError::Newer(version));
@@ -807,6 +835,46 @@ mod tests {
         assert_eq!(runs[1].stopped_at_ms, Some(NOW + 5));
         assert_eq!(runs[1].utc_offset_s, -10_800);
         assert_eq!(runs[1].version, "0.49.0");
+    }
+
+    /// Leaves beside `path` the journal of a transaction that already
+    /// committed: what a reader finds when the writer's delete of it has not
+    /// reached the directory yet, as a Windows scanner holding the file does.
+    fn leave_a_journal(path: &Path) -> PathBuf {
+        let journal = PathBuf::from(format!("{}-journal", path.display()));
+        let kept = journal.with_extension("kept");
+        let writer = Connection::open(path).unwrap();
+        // A cache of one page spills to the file, which syncs the journal's header first.
+        writer.execute_batch("PRAGMA cache_size = 1; CREATE TABLE filler (text TEXT); BEGIN;").unwrap();
+        for _ in 0..200 {
+            writer.execute("INSERT INTO filler (text) VALUES (?1)", ["x".repeat(2_000)]).unwrap();
+        }
+        std::fs::copy(&journal, &kept).unwrap();
+        writer.execute_batch("COMMIT").unwrap();
+        drop(writer);
+        std::fs::rename(&kept, &journal).unwrap();
+        journal
+    }
+
+    #[test]
+    fn a_reader_waits_for_a_journal_its_writer_is_removing() {
+        let dir = crate::test_dir::test_dir();
+        let path = dir.path().join(METRICS_FILE);
+        let mut db = MetricsDb::open(&path, NOW).unwrap();
+        db.start_run(&run_info(NOW)).unwrap();
+        drop(db);
+        let journal = leave_a_journal(&path);
+
+        let stays = MetricsDb::open_read_only_within(&path, Duration::from_millis(50)).err().expect("a reader cannot roll a journal back");
+        assert_eq!(stays.to_string(), "attempt to write a readonly database");
+
+        let removal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            std::fs::remove_file(journal).unwrap();
+        });
+        let db = MetricsDb::open_read_only_within(&path, Duration::from_secs(10)).expect("the journal went away within the wait");
+        removal.join().unwrap();
+        assert_eq!(db.runs_since(NOW - 1).unwrap().len(), 1);
     }
 
     #[test]
