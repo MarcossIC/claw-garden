@@ -48,7 +48,7 @@ pub fn score(task: &Task, t: &Transcript, read_file: impl Fn(&str) -> Option<Str
         })
         .collect();
     let ended = t.result.as_ref().is_some_and(|r| !r.is_error);
-    let tracers = task.tracers.iter().map(|tr| (tr.clone(), fate(t, tr))).collect();
+    let tracers = task.tracers.iter().map(|tr| (tr.clone(), fate(t, &task.id, tr))).collect();
     Score { success: ended && checks.iter().all(|c| c.passed), ended, checks, tracers }
 }
 
@@ -58,12 +58,15 @@ fn file_has(body: &str, text: &str) -> bool {
     body.replace("\r\n", "\n").contains(&text.replace("\r\n", "\n"))
 }
 
-fn fate(t: &Transcript, tracer: &str) -> TracerFate {
-    let written = contains_ci(t.answer(), tracer)
-        || t.texts.iter().any(|s| contains_ci(s, tracer))
-        || t.calls.iter().any(|c| contains_ci(&c.input.to_string(), tracer));
-    let brought = t.calls.iter().any(|c| c.result.as_deref().is_some_and(|r| contains_ci(r, tracer)))
-        || t.hooks.iter().any(|h| contains_ci(&h.text, tracer));
+fn fate(t: &Transcript, task_id: &str, tracer: &str) -> TracerFate {
+    // A run's directory is named after its task, so every path the session
+    // writes or reads holds the task's id, and an id can hold a tracer.
+    let id = task_id.to_lowercase();
+    let shows = |text: &str| contains_ci(&text.to_lowercase().replace(&id, ""), tracer);
+    let written = shows(t.answer())
+        || t.texts.iter().any(|s| shows(s))
+        || t.calls.iter().any(|c| shows(&c.input.to_string()));
+    let brought = t.calls.iter().any(|c| c.result.as_deref().is_some_and(shows)) || t.hooks.iter().any(|h| shows(&h.text));
     match (written, brought) {
         (true, _) => TracerFate::Used,
         (false, true) => TracerFate::RetrievedButIgnored,
@@ -161,6 +164,24 @@ mod tests {
         let s = score(&task(), &t, files);
         assert!(s.tracers.iter().all(|(_, f)| *f == TracerFate::NeverReached));
         assert!(!s.checks[4].passed);
+    }
+
+    #[test]
+    fn a_tracer_in_the_task_id_is_not_seen_in_the_paths_of_the_run() {
+        let t = parse_task(
+            r#"{"id": "d14-import-secrets", "category": "K2", "fixture": "f", "prompt": "p",
+                "memories": [{"content": "Always import the secrets module"}],
+                "tracers": ["secrets"],
+                "checks": [{"kind": "file_contains", "path": "a.py", "text": "import secrets"}]}"#,
+        )
+        .unwrap();
+        let stream = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"w","name":"Write","input":{"file_path":"C:\\runs\\humo\\d14-import-secrets.a3.1\\work\\a.py","content":"def f(): pass\n"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"w","content":"File created successfully at: C:\\runs\\humo\\D14-Import-Secrets.a3.1\\work\\a.py"}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"Wrote C:/runs/humo/d14-import-secrets.a3.1/work/a.py"}"#;
+        assert_eq!(score(&t, &parse_stream(stream), |_| None).tracers[0].1, TracerFate::NeverReached);
+
+        let used = stream.replace(r#""content":"def f(): pass\n""#, r#""content":"import secrets\n""#);
+        assert_eq!(score(&t, &parse_stream(&used), |_| None).tracers[0].1, TracerFate::Used, "the word itself still counts");
     }
 
     #[test]

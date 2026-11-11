@@ -40,9 +40,9 @@ El export MUST ser un archivo `clawg-memories` que `clawg import` lee: la cabece
 
 ## AE5. El puntaje y la rúbrica
 
-Una corrida MUST ser `success` sólo si terminó sin error y pasó todos sus checks. Un check de archivo MUST comparar con `\r\n` vuelto `\n` en el archivo y en el texto, porque el agente puede escribir CRLF. Cada trazador MUST salir `used` si el agente lo escribió (respuesta, texto o entrada de una herramienta), `retrieved_but_ignored` si lo trajo un resultado o un hook y no lo escribió, y `never_reached` si no. Cada `save_memory` MUST juzgarse con los criterios de `rubric::CRITERIA`, cada uno `pass`, `fail` o `not_applicable`.
+Una corrida MUST ser `success` sólo si terminó sin error y pasó todos sus checks. Un check de archivo MUST comparar con `\r\n` vuelto `\n` en el archivo y en el texto, porque el agente puede escribir CRLF. Cada trazador MUST salir `used` si el agente lo escribió (respuesta, texto o entrada de una herramienta), `retrieved_but_ignored` si lo trajo un resultado o un hook y no lo escribió, y `never_reached` si no. El id de la tarea MUST quitarse de cada texto antes de buscar el trazador, sin distinguir mayúsculas: el directorio de una corrida lleva el nombre de su tarea, así que cada ruta que la sesión escribe o lee lo contiene, y un id como `memorycode-d14-import-secrets` contiene el trazador `secrets`. Cada `save_memory` MUST juzgarse con los criterios de `rubric::CRITERIA`, cada uno `pass`, `fail` o `not_applicable`.
 
-**Tests:** los de `score.rs` (entre ellos `file_checks_ignore_carriage_returns`) y `rubric.rs`; `evaluate_counts_clawg_calls_and_judges_the_saves`, `the_prod_server_is_counted_by_its_own_name` (`run.rs`).
+**Tests:** los de `score.rs` (entre ellos `file_checks_ignore_carriage_returns` y `a_tracer_in_the_task_id_is_not_seen_in_the_paths_of_the_run`) y `rubric.rs`; `evaluate_counts_clawg_calls_and_judges_the_saves`, `the_prod_server_is_counted_by_its_own_name` (`run.rs`).
 
 ## AE6. La corrida en seco
 
