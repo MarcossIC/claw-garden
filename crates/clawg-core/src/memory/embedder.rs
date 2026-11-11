@@ -756,7 +756,7 @@ pub fn keep_one_malloc_arena() {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub(crate) fn keep_one_malloc_arena() {}
+pub fn keep_one_malloc_arena() {}
 
 #[cfg(test)]
 impl E5Embedder {

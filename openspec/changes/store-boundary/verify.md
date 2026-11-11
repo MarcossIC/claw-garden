@@ -71,10 +71,10 @@ Las cuentas son de ítems de módulo y de métodos (`fn`, `struct`, `enum`, `con
 | `store_lock` | 6 | 6 | 0 | | 0 |
 | `identity` | 25 | 15 | 10 | `resolve_project_root` a `testing` | 0 |
 | `chunker` | 18 | 7 | 11 | `new_from_base_dir` a `cfg(test)`; `from_tokenizer`, `chunk` y `Source::Fixed` a `cfg(any(test, feature = "eval"))` | 0 |
-| `embedder` | 20 | 13 | 7 | | 0 |
+| `embedder` | 20 | 14 | 6 | | 0 |
 | `idle_embedder` | 10 | 8 | 2 | | 0 |
 | `bootstrap` | 27 | 11 | 16 | | 0 |
-| `backup` | 22 | 15 | 7 | | 0 |
+| `backup` | 22 | 16 | 6 | | 0 |
 | `db` | 12 | 6 | 6 | | 0 |
 | `store_insert` | 9 | 4 | 5 | `insert_memory_with_vector` e `insert_noting` a `cfg(any(test, feature = "eval"))` | 0 |
 | `outbox` | 11 | 6 | 5 | | 0 |
@@ -95,7 +95,7 @@ Las cuentas son de ítems de módulo y de métodos (`fn`, `struct`, `enum`, `con
 | `project_delete` | 12 | 11 | 1 | | 0 |
 | `portability` | 131 | 112 | 19 | `ImportTimings::steps` a `cfg(test)` | 0 |
 | `registry` | 31 | 29 | 2 | | 0 |
-| **Total** | **584** | **430** | **153** | 4 a `testing`, 4 a `cfg(test)`, 5 a `cfg(any(test, feature = "eval"))` | **1** |
+| **Total** | **584** | **432** | **151** | 4 a `testing`, 4 a `cfg(test)`, 5 a `cfg(any(test, feature = "eval"))` | **1** |
 
 «`testing`» es `cfg(any(test, feature = "testing"))`.
 
@@ -111,6 +111,7 @@ Las cuentas son de ítems de módulo y de métodos (`fn`, `struct`, `enum`, `con
 - **`public_api.rs`.** `memory_runtime_open_creates_the_db_and_returns_a_usable_store` lee una cuenta con SQL, y ahora lleva `cfg(feature = "testing")` como los demás tests del archivo que usan la conexión. Con `cargo test --workspace` corre igual que antes.
 - **Los reexports de `portability` y `chunker`.** `Progress` sale del `pub use` de `portability` y `SaveSplit` pasa a `pub(crate) use` en `chunker`: ningún otro crate los nombra por esa ruta. Los dos tipos siguen `pub`, porque están en la firma de métodos que sí se usan.
 - **Los commits de la tarea 7** van por grupos de módulos, en el orden de D10, y no de a uno: `redact`, `events`, `language` y `sharing`; `identity`; `chunker`; `embedder`, `idle_embedder` y `bootstrap`; `backup`, `db`, `store_insert` y `outbox`; `worker`, `workspace`, `prompt_builder` e `inspect`; `admin`, `synthesis` y `topic`; `project`, `project_docs`, `merge`, `subfolder` y `project_delete`; `portability`; `registry`. Los módulos que no cambiaron (`clock`, `vector`, `spill`, `provenance`, `store_lock`, `secrets`, `dispute`, `relocate`) no tienen commit.
+- **Dos gemelas de plataforma siguen `pub`.** `keep_one_malloc_arena` (`embedder.rs`) y `sync_dir` (`backup.rs`) tienen una definición por plataforma, y los otros crates usan las dos. Linux compila una sola, así que la otra había quedado `pub(crate)`: el job de Windows del CI lo marcó como código sin uso, y se corrigió en un commit aparte.
 - **`process_tracked`** pasa a ocho parámetros y lleva el mismo `#[expect(clippy::too_many_arguments)]` que `import_parsed`.
 
 ## Pendiente

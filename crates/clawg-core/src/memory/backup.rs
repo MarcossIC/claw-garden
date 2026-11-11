@@ -492,7 +492,7 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+pub fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
