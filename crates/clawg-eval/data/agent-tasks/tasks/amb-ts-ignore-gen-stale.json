@@ -7,7 +7,8 @@
     {
       "content": "Ordering of new .gitignore entries\nAgreed. Decision: recent additions at the top, directly under the header line, so a reviewer sees what the branch added in the first lines of the diff instead of hunting for a green line at the bottom of a long file. The existing rules keep the order they already have; only new entries go above them.",
       "memory_type": "architectural_decision",
-      "age_days": 145
+      "age_days": 145,
+      "rule": {"paths": [".gitignore"]}
     }
   ],
   "tracers": ["recent additions at the top"],

@@ -8,6 +8,7 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 - [local-transport](../../changes/archive/2026-10-20-local-transport/proposal.md), archivado el 2026-10-20: agrega R7 a R9 (el socket del directorio de datos, TCP a su lado y el cliente) y cambia el `Límite` y R3. Por qué el chequeo de uid además del directorio, la marca en `daemon.json` en lugar de la ruta y TCP no fatal sin `--port`, en su [diseño](../../changes/archive/2026-10-20-local-transport/design.md); la medición con dos cuentas, en su [verify](../../changes/archive/2026-10-20-local-transport/verify.md). Por qué el directorio y no cada archivo, sin `umask`, y por qué no poder apretar no detiene a clawg, en su [diseño](../../changes/archive/2026-10-19-local-isolation/design.md); la medición con dos cuentas, `memory.lock` incluido, en su [verify](../../changes/archive/2026-10-19-local-isolation/verify.md).
 - [windows-socket](../../changes/archive/2026-10-20-windows-socket/proposal.md), archivado el 2026-10-20: lleva R7 a R9 a Windows con AF_UNIX nativo y agrega R10 a R13 (el ACL del archivo del socket, sin AF_UNIX, la barra de rendimiento y la segunda cuenta). Por qué AF_UNIX y no la named pipe, socket2 con un hilo de `accept` y un conector propio de hyper en el cliente, en su [diseño](../../changes/archive/2026-10-20-windows-socket/design.md) y su [exploración](../../changes/archive/2026-10-20-windows-socket/exploration.md); la barra medida y lo que corrió el CI, en su [verify](../../changes/archive/2026-10-20-windows-socket/verify.md).
 - [import-job](../../changes/archive/2026-10-30-import-job/proposal.md), archivado el 2026-10-30, que sale en 0.68.0: agrega IJ12 a IJ14 (el bloque `import` de `/health`, las rutas de trabajos en `PROJECT_INPUTS` y detrás del guardia y el token). Qué hace un trabajo de importación está en [`specs/portability`](../portability/spec.md) (IJ1 a IJ11 e IJ15 a IJ17).
+- [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU6 de esa spec entra como SU6 (las rutas `POST /v1/sessions`, `/v1/sessions/end` y `/v1/sessions/calls`, detrás del guardia y del token). Qué cuenta cada una está en [`specs/metrics`](../metrics/spec.md) (SU1 a SU12).
 
 ## Definiciones
 
@@ -17,7 +18,7 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 - **Modo privado:** en Unix, un directorio sin ningún bit de grupo ni de otros (`modo & 0o077 == 0`).
 - **Socket del perfil:** `<data>/clawg.sock` (`socket_file`, `crates/clawg-core/src/paths.rs`), un socket AF_UNIX con ruta, nunca abstracto, en Unix y en Windows.
 - **Sistema sin AF_UNIX:** uno cuyo sistema operativo no puede crear un socket AF_UNIX (en Windows, `socket` da 10047).
-- **Guardia:** `admit_loopback` (`crates/clawg-cli/src/daemon/api.rs:1095`), la capa que `router` (`api.rs:1025`) aplica a todas sus rutas, `/health` y `/v1` incluidas, por fuera de `require_bearer` (`api.rs:1051`).
+- **Guardia:** `admit_loopback` (`crates/clawg-cli/src/daemon/api.rs:1231`), la capa que `router` (`api.rs:1149`) aplica a todas sus rutas, `/health` y `/v1` incluidas, por fuera de `require_bearer` (`api.rs:1254`).
 
 ## Límite
 
@@ -91,7 +92,7 @@ En Unix, `write_token` y `write_state` (`crates/clawg-cli/src/daemon/lifecycle.r
 
 `ensure_private_dir(dir)` (`crates/clawg-core/src/private_dir.rs:21`) MUST crear `dir` y cada antecesor que falte con modo 0700, sea cual sea el `umask`. Si `dir` ya existe y no tiene modo privado, MUST quitarle los bits de grupo y de otros, conservar los demás (`tightened`, `private_dir.rs:56`), y registrar un `warn` con la ruta, el modo anterior y el nuevo. MUST NOT cambiar el modo de un antecesor que ya existía ni el de ningún archivo. Si no puede cambiar el modo (el directorio es de otro usuario, o el sistema de archivos no lo admite), MUST registrar un `warn` con la causa y seguir. Si no puede crearlo, MUST devolver el error. En Windows MUST sólo crear lo que falte (`private_dir.rs:49`).
 
-Todo lugar de clawg que crea el directorio de datos o un subdirectorio suyo MUST hacerlo con el ayudante: el de datos en `clawg serve` (`crates/clawg-cli/src/daemon/serve.rs:80`), en el autoarranque del puente antes del daemon (`start_daemon`, `crates/clawg-cli/src/client.rs:1517`), al abrir el store (`MemoryStore::open`, `crates/clawg-core/src/memory/db.rs:191`), en `restore` (`crates/clawg-core/src/memory/backup.rs:365`), al guardar `sharing.json` (`crates/clawg-core/src/memory/sharing.rs:186`) y en el candado de `update` (`crates/clawg-cli/src/update/lock.rs:33`); `logs/` (`client.rs:1395`), `backups/` (`snapshot_into`, `backup.rs:310`), `backups/setup/` (`crates/clawg-cli/src/setup.rs:797`), `workspaces/…` (`crates/clawg-core/src/memory/workspace.rs:90`, `:134`) y `models/…` (`crates/clawg-core/src/memory/model_download.rs:451`, `:669`). `clawg setup` MUST pasar por el ayudante también el directorio de datos antes de copiar un archivo (`setup.rs:795`). Un error al crear el directorio al abrir el store MUST devolverse como `MemoryError::DataDir`.
+Todo lugar de clawg que crea el directorio de datos o un subdirectorio suyo MUST hacerlo con el ayudante: el de datos en `clawg serve` (`crates/clawg-cli/src/daemon/serve.rs:80`), en el autoarranque del puente antes del daemon (`start_daemon`, `crates/clawg-cli/src/client.rs:1830`), al abrir el store (`MemoryStore::open`, `crates/clawg-core/src/memory/db.rs:191`), en `restore` (`crates/clawg-core/src/memory/backup.rs:365`), al guardar `sharing.json` (`crates/clawg-core/src/memory/sharing.rs:186`) y en el candado de `update` (`crates/clawg-cli/src/update/lock.rs:33`); `logs/` (`client.rs:1708`), `backups/` (`snapshot_into`, `backup.rs:310`), `backups/setup/` (`crates/clawg-cli/src/setup.rs:861`), `workspaces/…` (`crates/clawg-core/src/memory/workspace.rs:90`, `:134`) y `models/…` (`crates/clawg-core/src/memory/model_download.rs:451`, `:669`). `clawg setup` MUST pasar por el ayudante también el directorio de datos antes de copiar un archivo (`setup.rs:859`). Un error al crear el directorio al abrir el store MUST devolverse como `MemoryError::DataDir`.
 
 #### Escenario: una instalación nueva
 - GIVEN un home sin directorio de datos y `umask` 022
@@ -258,3 +259,15 @@ Con una segunda cuenta local estándar y el daemon real, conectar al socket MUST
 Las rutas `POST /v1/imports`, `GET /v1/imports/{id}` y `DELETE /v1/imports/{id}` MUST estar detrás del guardia y del token como todo `/v1`, y se miden como cualquier ruta por su plantilla.
 
 **Test:** `the_job_routes_require_the_guard_and_the_token` (`crates/clawg-cli/tests/api.rs`, con `Host` ajeno y sin token).
+
+## SU6. Las rutas de sesiones
+
+`POST /v1/sessions`, `POST /v1/sessions/end` y `POST /v1/sessions/calls` MUST estar detrás del guardia y del token como todo `/v1`, MUST contestar `204` sin cuerpo y se miden como cualquier ruta por su plantilla. Qué cuenta cada una, y con qué sesión, está en [`specs/metrics`](../metrics/spec.md), SU6:
+
+- `POST /v1/sessions` (`agent_id`, `project_id` opcional, `session_id`) registra la sesión vigente del agente y del proyecto, y toma además `event` (`start` o `prompt`), `source` y `client`, los tres opcionales;
+- `POST /v1/sessions/end` (`session_id`, `reason` opcional) cierra la fila abierta de ese id y no toma proyecto;
+- `POST /v1/sessions/calls` (`agent_id`, `project_id` opcional, `tool`, `failed`) cuenta una llamada a una herramienta.
+
+`PROJECT_INPUTS` (IJ13) las clasifica: `("POST", "/sessions", Some("body.project_id"))`, `("POST", "/sessions/end", None)` y `("POST", "/sessions/calls", Some("body.project_id"))`.
+
+**Tests:** los de SU6 de [`specs/metrics`](../metrics/spec.md); `every_route_says_which_project_it_takes` con las tres filas (`crates/clawg-cli/tests/api.rs`).

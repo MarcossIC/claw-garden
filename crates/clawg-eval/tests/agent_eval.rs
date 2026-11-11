@@ -4,14 +4,26 @@
 //! model and no client. Every run is written under a temporary directory.
 
 use std::ffi::OsStr;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
 use serde_json::Value;
 
 fn data() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("data").join("agent-tasks")
+}
+
+/// How many rules of other topics every arm with memory is seeded with.
+fn noise() -> usize {
+    let text = std::fs::read_to_string(data().join("noise.json")).unwrap();
+    serde_json::from_str::<Vec<Value>>(&text).unwrap().len()
+}
+
+/// What `clawg import` prints for a seed of `n` memories.
+fn imported(n: usize) -> String {
+    format!("imported {n} of {n} memories")
 }
 
 /// The `clawg` that `cargo test --workspace` builds beside `agent-eval`: a
@@ -122,6 +134,8 @@ fn the_example_tasks_are_valid_and_leak_no_tracer() {
     let listed = stdout(&output);
     assert!(listed.contains("example-staging-port K1 fixture=example-tally memories=1 tracers=1 checks=1 example"), "{listed}");
     assert!(listed.contains("example-count-lines N"), "{listed}");
+    assert!(noise() > 0);
+    assert!(listed.contains(&format!("noise rules={}", noise())), "{listed}");
 }
 
 #[test]
@@ -147,7 +161,7 @@ fn a_replayed_session_with_clawg_finds_the_fact_and_succeeds() {
     assert!(!data.join("daemon.json").exists(), "clawg stop ended the daemon");
     let log = clawg_log(&run);
     let ready = log.find("\"embedder\": \"ready\"").unwrap_or_else(|| panic!("the run did not wait for the model:\n{log}"));
-    let imported = log.find("imported 1 of 1 memories").unwrap_or_else(|| panic!("the seed was not imported:\n{log}"));
+    let imported = log.find(&imported(noise() + 1)).unwrap_or_else(|| panic!("the seed and the noise were not imported:\n{log}"));
     assert!(ready < imported, "the seed went before the model was ready:\n{log}");
     assert!(log[imported..].contains(" stop --profile dev"), "{log}");
 }
@@ -176,7 +190,7 @@ fn a_replayed_edit_changes_the_working_directory_the_checks_read() {
     assert_eq!(r["saves"].as_array().unwrap().len(), 1);
     assert!(r["saves"][0]["marks"].as_array().unwrap().iter().all(|m| m[1] != "fail"), "{:#}", r["saves"][0]);
     let log = clawg_log(&run);
-    assert!(!log.contains(" import "), "a task without memories seeds nothing:\n{log}");
+    assert!(log.contains(&imported(noise())), "a task without memories seeds the noise:\n{log}");
     assert!(log.contains("\"embedder\": \"ready\""), "the session started before the model was ready:\n{log}");
     assert!(log.contains(" stop --profile dev"), "{log}");
     assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists());
@@ -184,6 +198,52 @@ fn a_replayed_edit_changes_the_working_directory_the_checks_read() {
     let again = agent_eval(&["score", "--run", run.to_str().unwrap()]);
     ok(&again);
     assert_eq!(result(&run)["score"], r["score"]);
+}
+
+#[test]
+fn the_harness_hooks_print_the_context_and_log_their_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = dir.path().join("startup-rules.md");
+    std::fs::write(&rules, "Rules\n- [3 days ago] Use f-strings\n").unwrap();
+    let output = agent_eval(&["hook-context", rules.to_str().unwrap()]);
+    ok(&output);
+    let printed: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(printed["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    assert_eq!(printed["hookSpecificOutput"]["additionalContext"], "Rules\n- [3 days ago] Use f-strings\n");
+    assert!(!agent_eval(&["hook-context", dir.path().join("missing.md").to_str().unwrap()]).status.success());
+
+    let log = dir.path().join("instructions.jsonl");
+    for input in ["{\n  \"file_path\": \"/w/.claude/rules/clawg/rules-1.md\",\n  \"load_reason\": \"path_glob_match\"\n}\n", "not json"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agent-eval")).args(["hook-log", log.to_str().unwrap()]).stdin(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+    let lines: Vec<Value> = std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["load_reason"], "path_glob_match");
+    assert_eq!(lines[1]["unparsed"], "not json");
+}
+
+#[test]
+fn a_prepared_l2_run_writes_the_rules_of_its_task_by_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("run");
+    let task = "madr-0011-asterisk-list-marker";
+    ok(&agent_eval(&["prepare", "--task", task, "--arm", "l2", "--out", out.to_str().unwrap(), "--clawg", clawg().to_str().unwrap(), "--model", "m"]));
+
+    let mut by_file = Vec::new();
+    files_below(&out.join("work").join(".claude").join("rules").join("clawg"), &mut by_file);
+    let markdown: Vec<String> = by_file.iter().map(|p| std::fs::read_to_string(p).unwrap()).filter(|t| t.contains("\"**/*.md\"")).collect();
+    assert_eq!(markdown.len(), 1, "{by_file:?}");
+    assert!(markdown[0].contains("asterisk") && markdown[0].contains("Markdown headings are in sentence case"), "{}", markdown[0]);
+    let startup = std::fs::read_to_string(out.join("startup-rules.md")).unwrap();
+    assert!(startup.contains("Commit messages follow conventional commits") && !startup.contains("asterisk"), "{startup}");
+
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(out.join("claude-config").join("settings.json")).unwrap()).unwrap();
+    let hook = &settings["hooks"]["SessionStart"][1]["hooks"][0];
+    let command = Path::new(hook["command"].as_str().unwrap());
+    assert_eq!(command.file_stem().and_then(OsStr::to_str), Some("agent-eval"), "{hook}");
+    assert_eq!(hook["args"][0], "hook-context");
 }
 
 #[test]
@@ -208,7 +268,7 @@ fn a_client_that_fails_still_stops_the_daemon_of_its_run() {
     assert!(stderr(&output).contains("client.log"), "{}", stderr(&output));
     assert!(!run.join("escaped.txt").exists());
     let log = clawg_log(&run);
-    assert!(log.contains("imported 1 of 1 memories") && log.contains(" stop --profile dev"), "{log}");
+    assert!(log.contains(&imported(noise() + 1)) && log.contains(" stop --profile dev"), "{log}");
     assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists(), "clawg stop ended the daemon");
     assert!(!run.join("result.json").exists());
 }

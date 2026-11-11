@@ -7,7 +7,8 @@
     {
       "content": "Decision: use an asterisk as the Markdown list marker\nLists in Markdown can be indicated by `*` (asterisk) or `-` (hyphen). Chosen option: \"Use an asterisk\", because an asterisk does not have a meaning of \"good\" or \"bad\", whereas a hyphen `-` could be read as indicator of something negative (in contrast to `+`, which could be more be read as \"good\").",
       "memory_type": "architectural_decision",
-      "age_days": 120
+      "age_days": 120,
+      "rule": {"paths": ["**/*.md"]}
     }
   ],
   "tracers": ["asterisk"],

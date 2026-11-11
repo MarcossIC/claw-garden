@@ -1,6 +1,6 @@
 # session-usage — Especificación
 
-Cambia [`specs/metrics`](../../specs/metrics/spec.md): R3 (el esquema de `metrics.db`), R4 (la retención), el primer invariante y el límite «Sin etiqueta de agente». Suma rutas a [`specs/daemon-access`](../../specs/daemon-access/spec.md), un evento y un hook a lo que instala `setup`, y un subcomando a `clawg metrics`. Al archivar, estos requisitos pasan a esas specs.
+Cambia [`specs/metrics`](../../../specs/metrics/spec.md): R3 (el esquema de `metrics.db`), R4 (la retención), el primer invariante y el límite «Sin etiqueta de agente». Suma rutas a [`specs/daemon-access`](../../../specs/daemon-access/spec.md), un evento y un hook a lo que instala `setup`, y un subcomando a `clawg metrics`. Al archivar, estos requisitos pasan a esas specs.
 
 ## Definiciones
 

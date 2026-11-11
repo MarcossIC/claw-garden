@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::arm::{Arm, Daemon, Layout, Options, RunPlan, Step, TEST_HOME_VAR};
+use crate::hooks::{self, Loaded};
 use crate::rubric::{self, Mark, SaveMarks};
 use crate::score::{self, Score, TracerFate};
 use crate::stream::{self, Outcome, Transcript};
@@ -84,6 +85,15 @@ pub struct Session {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub client_version: Option<String>,
+    /// The credential that paid, as the client names it.
+    #[serde(default)]
+    pub api_key_source: Option<String>,
+    /// When the client started and last wrote its stream, in UTC: what a
+    /// session is found by in the console's usage, which knows no session.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub ended_at: Option<String>,
     pub mcp_servers: Vec<(String, String)>,
     pub tool_calls: usize,
     /// Calls to clawg's tools, by tool.
@@ -95,6 +105,13 @@ pub struct Session {
     pub compactions: usize,
     pub unknown_lines: usize,
     pub invalid_lines: Vec<usize>,
+    /// [`Transcript::first_request_tokens`].
+    #[serde(default)]
+    pub first_request_tokens: Option<u64>,
+    /// Each instruction file the client reported loading, from the log the
+    /// hook of every arm writes.
+    #[serde(default)]
+    pub instructions_loaded: Vec<Loaded>,
     pub outcome: Option<Outcome>,
 }
 
@@ -131,6 +148,9 @@ pub fn evaluate(
         session_id: t.session_id.clone(),
         model: t.model.clone(),
         client_version: t.client_version.clone(),
+        api_key_source: t.api_key_source.clone(),
+        started_at: None,
+        ended_at: None,
         mcp_servers: t.mcp_servers.clone(),
         tool_calls: t.calls.len(),
         clawg_calls,
@@ -141,6 +161,8 @@ pub fn evaluate(
         compactions: t.compactions,
         unknown_lines: t.unknown_lines,
         invalid_lines: t.invalid_lines.clone(),
+        first_request_tokens: t.first_request_tokens,
+        instructions_loaded: Vec::new(),
         outcome: t.result.clone(),
     };
     RunResult {
@@ -154,6 +176,20 @@ pub fn evaluate(
         score: score::score(task, t, read_file),
         saves: rubric::judge_session(t, lang),
     }
+}
+
+/// The texts the plan put in the session's context that the stream does not
+/// show: the native memory, which the client loads at startup, and each file
+/// of the plan that `loaded` names. Paths match whatever their separators and
+/// case, since the client may write them either way.
+pub fn delivered(plan: &RunPlan, loaded: &[Loaded]) -> Vec<String> {
+    let norm = |path: &str| path.trim_start_matches(r"\\?\").replace('\\', "/").to_lowercase();
+    let loaded: Vec<String> = loaded.iter().map(|l| norm(&l.file_path)).collect();
+    plan.files
+        .iter()
+        .filter(|(path, _)| path.ends_with("memory/MEMORY.md") || loaded.contains(&norm(&path.to_string_lossy())))
+        .map(|(_, body)| body.clone())
+        .collect()
 }
 
 /// One line for the terminal.
@@ -225,6 +261,8 @@ pub enum Leak {
         .out.display(), .dir.display()
     )]
     Context { out: PathBuf, dir: PathBuf, name: &'static str },
+    #[error("the working directory {} holds {what} (the client tells the session its working directory, so the agent reads it)", .workdir.display())]
+    Named { workdir: PathBuf, what: String },
 }
 
 fn join_leaks(leaks: &[Leak]) -> String {
@@ -235,14 +273,16 @@ fn join_leaks(leaks: &[Leak]) -> String {
 /// where its project and native memory are.
 const CONTEXT_NAMES: [&str; 4] = [".git", "CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"];
 
-/// Every problem of a paid run, from the variables that matter and from
-/// `ancestors`, each directory from `out` up with the [`CONTEXT_NAMES`] it holds.
+/// Every problem of a paid run of `task`, from the variables that matter, from
+/// `ancestors`, each directory from `out` up with the [`CONTEXT_NAMES`] it
+/// holds, and from the path of its working directory.
 fn leaks(
     api_key: Option<&str>,
     auth_token: Option<&str>,
     effort_level: Option<&str>,
     out: &Path,
     ancestors: &[(PathBuf, Vec<&'static str>)],
+    task: &Task,
 ) -> Vec<Leak> {
     let set = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
     let mut found = Vec::new();
@@ -258,6 +298,13 @@ fn leaks(
     for (dir, names) in ancestors {
         found.extend(names.iter().map(|name| Leak::Context { out: out.to_owned(), dir: dir.clone(), name }));
     }
+    let workdir = Layout { root: out.to_owned() }.workdir();
+    let path = workdir.to_string_lossy();
+    let named = |what: String| Leak::Named { workdir: workdir.clone(), what };
+    if task::contains_ci(&path, &task.id) {
+        found.push(named(format!("the id of its task, {}", task.id)));
+    }
+    found.extend(task.tracers.iter().filter(|tr| task::contains_ci(&path, tr)).map(|tr| named(format!("the tracer {tr:?}"))));
     found
 }
 
@@ -269,8 +316,8 @@ fn probe_ancestors(out: &Path) -> Vec<(PathBuf, Vec<&'static str>)> {
         .collect()
 }
 
-/// Refuses a paid run whose key or `out` directory would skew it, naming each problem.
-pub fn check_paid_run(out: &Path) -> Result<(), RunError> {
+/// Refuses a paid run of `task` whose key or `out` directory would skew it, naming each problem.
+pub fn check_paid_run(out: &Path, task: &Task) -> Result<(), RunError> {
     let out = std::path::absolute(out).map_err(io(out))?;
     let var = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
     let found = leaks(
@@ -279,6 +326,7 @@ pub fn check_paid_run(out: &Path) -> Result<(), RunError> {
         var("CLAUDE_CODE_EFFORT_LEVEL").as_deref(),
         &out,
         &probe_ancestors(&out),
+        task,
     );
     if found.is_empty() { Ok(()) } else { Err(RunError::PaidRun(found)) }
 }
@@ -652,8 +700,9 @@ pub fn start_client(plan: &RunPlan, layout: &Layout, client: &Step) -> Result<Op
     Ok(status.code())
 }
 
-/// Scores the run in `root` from its `run.json`, `stream.jsonl` and working
-/// directory, and writes `result.json`.
+/// Scores the run in `root` from its `run.json`, `stream.jsonl`, the log of
+/// the instruction files the client loaded and the working directory, and
+/// writes `result.json`.
 pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     let not_a_run = |why: &str| RunError::NotARun(root.to_owned(), why.to_owned());
     let record = read_record(root)?;
@@ -670,7 +719,24 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     let stream = std::fs::read_to_string(&stream_path).map_err(io(&stream_path))?;
     let workdir = Layout { root: root.to_owned() }.workdir();
     let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
-    let result = evaluate(&task, &arm, client.name(), profile, lang, &stream::parse(&stream), read_file);
+    let mut result = evaluate(&task, &arm, client.name(), profile, lang, &stream::parse(&stream), read_file);
+    let plan: RunPlan = serde_json::from_value(record["plan"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
+    let log_path = Layout { root: root.to_owned() }.instructions_log();
+    let loaded = match std::fs::read_to_string(&log_path) {
+        Ok(text) => hooks::read_log(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(io(&log_path)(e)),
+    };
+    score::add_delivered(&mut result.score, &task.id, &delivered(&plan, &loaded));
+    result.session.instructions_loaded = loaded;
+    // The stream is created right before the client starts and closed when it exits.
+    let meta = std::fs::metadata(&stream_path).map_err(io(&stream_path))?;
+    let utc = |t: std::io::Result<std::time::SystemTime>| {
+        let since = t.ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(clawg_cli::memories::format_utc(i64::try_from(since.as_millis()).ok()?))
+    };
+    result.session.started_at = utc(meta.created());
+    result.session.ended_at = utc(meta.modified());
     let out = root.join(RESULT_FILE);
     std::fs::write(&out, serde_json::to_string_pretty(&result).expect("JSON serializes") + "\n").map_err(io(&out))?;
     Ok(result)
@@ -684,23 +750,48 @@ mod tests {
         out.ancestors().map(|a| (a.to_owned(), Vec::new())).collect()
     }
 
+    fn staging_port() -> Task {
+        task::parse(
+            r#"{"id": "staging-port", "category": "K1", "fixture": "f", "prompt": "Which port?",
+                "memories": [{"content": "Staging port 48213"}], "tracers": ["48213"],
+                "checks": [{"kind": "answer_contains", "text": "48213"}]}"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn a_paid_run_with_its_key_and_a_clean_directory_has_no_leaks() {
         let out = Path::new("/runs/1");
-        assert_eq!(leaks(Some("sk-key"), None, None, out, &clean_ancestors(out)), []);
+        assert_eq!(leaks(Some("sk-key"), None, None, out, &clean_ancestors(out), &staging_port()), []);
     }
 
     #[test]
     fn a_missing_or_empty_key_a_token_and_an_effort_level_are_each_named() {
         let out = Path::new("/runs/1");
         let ancestors = clean_ancestors(out);
-        assert_eq!(leaks(None, None, None, out, &ancestors), [Leak::NoApiKey]);
-        assert_eq!(leaks(Some(""), None, None, out, &ancestors), [Leak::NoApiKey]);
+        let t = staging_port();
+        assert_eq!(leaks(None, None, None, out, &ancestors, &t), [Leak::NoApiKey]);
+        assert_eq!(leaks(Some(""), None, None, out, &ancestors, &t), [Leak::NoApiKey]);
         assert_eq!(
-            leaks(None, Some("token"), Some("high"), out, &ancestors),
+            leaks(None, Some("token"), Some("high"), out, &ancestors, &t),
             [Leak::NoApiKey, Leak::AuthToken, Leak::EffortLevel]
         );
-        assert_eq!(leaks(Some("k"), Some(""), Some(""), out, &ancestors), [], "an empty variable sets nothing");
+        assert_eq!(leaks(Some("k"), Some(""), Some(""), out, &ancestors, &t), [], "an empty variable sets nothing");
+    }
+
+    #[test]
+    fn a_working_directory_that_names_its_task_or_a_tracer_is_named() {
+        let t = staging_port();
+        let found = |out: &str| leaks(Some("k"), None, None, Path::new(out), &clean_ancestors(Path::new(out)), &t);
+        let workdir = |out: &str| Layout { root: PathBuf::from(out) }.workdir();
+        assert_eq!(found("/runs/t5f0c2a9e.a0.1"), []);
+        assert_eq!(
+            found("/runs/Staging-Port.a0.1"),
+            [Leak::Named { workdir: workdir("/runs/Staging-Port.a0.1"), what: "the id of its task, staging-port".into() }]
+        );
+        assert_eq!(found("/runs/48213/1"), [Leak::Named { workdir: workdir("/runs/48213/1"), what: "the tracer \"48213\"".into() }]);
+        let said = RunError::PaidRun(found("/runs/staging-port.a0.1")).to_string();
+        assert!(said.contains("staging-port") && said.contains("the agent reads it"), "{said}");
     }
 
     #[test]
@@ -712,7 +803,7 @@ mod tests {
             (PathBuf::from("/repo"), vec![".git", ".claude/CLAUDE.md"]),
             (PathBuf::from("/"), vec![]),
         ];
-        let found = leaks(Some("k"), None, None, out, &ancestors);
+        let found = leaks(Some("k"), None, None, out, &ancestors, &staging_port());
         assert_eq!(
             found,
             [
@@ -787,6 +878,8 @@ mod tests {
             max_budget_usd: None,
             claude_version: Some("2.1.300".into()),
             now_ms: 0,
+            noise: Vec::new(),
+            agent_eval: PathBuf::from("/bin/agent-eval"),
         }
     }
 
@@ -922,5 +1015,74 @@ mod tests {
         prepare(&task(), Arm::A0, &fixture, &claude, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
         std::fs::write(claude.root.join(STREAM_FILE), STREAM).unwrap();
         assert_eq!(score_dir(&claude.root).unwrap().client, "claude");
+    }
+
+    #[test]
+    fn the_native_memory_and_the_loaded_rules_files_are_delivered() {
+        let layout = Layout { root: if cfg!(windows) { PathBuf::from(r"C:\runs\r") } else { PathBuf::from("/runs/r") } };
+        let opts = options(layout.root.join("clawg"));
+        let a4 = crate::arm::plan(&task(), Arm::A4, &layout, &opts).unwrap();
+        let native = delivered(&a4, &[]);
+        assert_eq!(native.len(), 1);
+        assert!(native[0].contains("Staging port 48213"), "{native:?}");
+        assert!(delivered(&crate::arm::plan(&task(), Arm::A3, &layout, &opts).unwrap(), &[]).is_empty());
+
+        let rules = task::parse(
+            r#"{"id": "t", "category": "K3", "fixture": "f", "prompt": "Write the notes.", "checks": [{"kind": "answer_contains", "text": "x"}],
+                "memories": [{"content": "Lists use an asterisk", "rule": {"paths": ["**/*.md"]}}, {"content": "Go errors are wrapped", "rule": {"paths": ["**/*.go"]}}]}"#,
+        )
+        .unwrap();
+        let l2 = crate::arm::plan(&rules, Arm::L2, &layout, &opts).unwrap();
+        let reported = layout.rules_dir().join("rules-1.md").to_string_lossy().to_uppercase().replace('\\', "/");
+        let loaded = [
+            Loaded { file_path: reported, load_reason: "path_glob_match".into() },
+            Loaded { file_path: "/elsewhere/CLAUDE.md".into(), load_reason: "session_start".into() },
+        ];
+        let texts = delivered(&l2, &loaded);
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].contains("asterisk") && !texts[0].contains("Go errors"), "{}", texts[0]);
+        assert!(delivered(&l2, &[]).is_empty(), "a rules file the client did not load reached nothing");
+    }
+
+    #[test]
+    fn score_dir_counts_what_reached_the_context_outside_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir_all(&fixture).unwrap();
+        let layout = Layout { root: dir.path().join("run") };
+        prepare(&task(), Arm::A4, &fixture, &layout, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
+        let stream = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":3,"cache_creation_input_tokens":40,"cache_read_input_tokens":500}}}
+{"type":"result","subtype":"success","is_error":false,"result":"done"}
+"#;
+        std::fs::write(layout.root.join(STREAM_FILE), stream).unwrap();
+        std::fs::write(layout.instructions_log(), "{\"file_path\":\"/c/CLAUDE.md\",\"load_reason\":\"session_start\"}\n").unwrap();
+
+        let r = score_dir(&layout.root).unwrap();
+
+        assert_eq!(r.score.tracers, vec![("48213".to_owned(), TracerFate::RetrievedButIgnored)], "MEMORY.md is in the context");
+        assert_eq!(r.session.first_request_tokens, Some(543));
+        assert_eq!(r.session.instructions_loaded, [Loaded { file_path: "/c/CLAUDE.md".into(), load_reason: "session_start".into() }]);
+        std::fs::remove_file(layout.instructions_log()).unwrap();
+        assert!(score_dir(&layout.root).unwrap().session.instructions_loaded.is_empty(), "a run without the log loaded none");
+    }
+
+    #[test]
+    fn score_dir_dates_the_session_by_its_stream_and_names_the_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir_all(&fixture).unwrap();
+        let layout = Layout { root: dir.path().join("run") };
+        prepare(&task(), Arm::A0, &fixture, &layout, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
+        let stream = STREAM.replacen(r#""subtype":"init","#, r#""subtype":"init","apiKeySource":"ANTHROPIC_API_KEY","#, 1);
+        std::fs::write(layout.root.join(STREAM_FILE), stream).unwrap();
+
+        let r = score_dir(&layout.root).unwrap();
+
+        assert_eq!(r.session.api_key_source.as_deref(), Some("ANTHROPIC_API_KEY"));
+        let ended = r.session.ended_at.expect("every platform knows when a file was last written");
+        assert!(ended.ends_with(" UTC"), "{ended}");
+        if cfg!(windows) {
+            assert!(r.session.started_at.is_some(), "Windows knows when a file was created");
+        }
     }
 }
