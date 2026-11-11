@@ -184,13 +184,13 @@ fn collapse_duplicate_chunks(chunks: Vec<Chunk>) -> Vec<PendingChunk> {
 }
 
 /// Outbox rows to ingest on this start, ahead of anything new on the channel.
-pub struct Replay {
+pub(crate) struct Replay {
     requests: VecDeque<IngestRequest>,
 }
 
 impl Replay {
     /// Nothing to replay.
-    pub fn none() -> Self {
+    pub(crate) fn none() -> Self {
         Self { requests: VecDeque::new() }
     }
 
@@ -304,7 +304,7 @@ impl DrainWatch<'_> {
 /// Also returns, with nothing spilled, when all `Sender`s are dropped and the
 /// queue is empty; events held for an embedder that never loaded are returned
 /// then too.
-pub async fn memory_worker(
+pub(crate) async fn memory_worker(
     mut rx: Receiver<IngestRequest>,
     drain: watch::Receiver<Option<Instant>>,
     mut replay: Replay,
@@ -1176,7 +1176,7 @@ async fn finish_save(
 /// Pulled out of the worker's setup so this wiring is unit-testable on its
 /// own. The loader is a parameter so the daemon can pass the one that checks
 /// the file's hash and tests can pass their own.
-pub fn resolve_tokenizer_and_chunker<L>(
+pub(crate) fn resolve_tokenizer_and_chunker<L>(
     base_dir: &std::path::Path,
     tokenizer_cell: &Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     load: L,

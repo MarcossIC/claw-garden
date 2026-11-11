@@ -233,7 +233,8 @@ pub struct Invariants {
 }
 
 impl Invariants {
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         *self == Invariants::default()
     }
 }
