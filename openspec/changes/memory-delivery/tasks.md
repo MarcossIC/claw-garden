@@ -22,7 +22,7 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla, por la 
 
 ## 4. La referencia
 
-- [ ] `docs/reference/testing.md`; esta propuesta, la spec, las tareas y el mapa de `openspec/README.md`.
+- [x] `docs/reference/testing.md`; esta propuesta, la spec, las tareas y el mapa de `openspec/README.md`.
 - Commit: `docs: describe the rule arms, the noise and the instruction log of agent-eval`
 
 ## 5. Verificación

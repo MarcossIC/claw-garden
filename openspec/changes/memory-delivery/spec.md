@@ -39,27 +39,27 @@ Todo brazo con memoria MUST sembrar el ruido junto a las memorias de la tarea, e
 - WHEN se planea bajo `l2`
 - THEN `.claude/rules/clawg/` tiene un archivo con `paths:` `"**/*.md"` y esa regla, y el texto del arranque tiene sólo la otra
 
-**Tests:** `a_rule_is_one_line_with_its_age`, `the_startup_holds_every_rule_or_only_those_without_paths`, `the_rules_by_file_share_a_file_by_their_globs`, `the_hook_output_is_the_additional_context_of_session_start` (`rules.rs`); `l0_is_a3_without_the_protocol`, `l1_adds_the_rules_at_startup_through_a_hook_of_the_harness`, `l2_moves_the_rules_with_globs_to_rules_files`, `l1_without_rules_adds_no_hook` (`arm.rs`); `the_hook_commands_parse` (`main.rs`); `the_harness_hooks_print_the_context_and_log_their_input` (`tests/agent_eval.rs`).
+**Tests:** `a_rule_is_one_line_with_its_age`, `the_startup_holds_every_rule_or_only_those_without_paths`, `the_rules_by_file_share_a_file_by_their_globs` (`rules.rs`); `the_hook_output_is_the_additional_context_of_session_start` (`hooks.rs`); `l0_is_a3_without_the_protocol`, `l1_adds_the_rules_at_startup_through_a_hook_of_the_harness`, `l2_moves_the_rules_with_globs_to_rules_files`, `l1_without_rules_adds_no_hook` (`arm.rs`); `the_hook_commands_parse` (`main.rs`); `the_harness_hooks_print_the_context_and_log_their_input`, `a_prepared_l2_run_writes_the_rules_of_its_task_by_file` (`tests/agent_eval.rs`).
 
 ## MD5. Los archivos de instrucciones que carga el cliente
 
 Todo brazo MUST llevar un hook `InstructionsLoaded` que corre `agent-eval hook-log FILE`, con FILE el `instructions.jsonl` del directorio de la corrida; `hook-log` MUST agregar su entrada a FILE en una línea, y una entrada que no es JSON MUST guardarse como texto sin fallar. En los brazos con `setup` los hooks MUST sumarse a los del `settings.json` que escribe `setup`, sin quitar ninguno. `result.json` MUST llevar, en `session`, cada archivo cargado con su `load_reason`, y un registro ausente MUST leerse como ninguno.
 
-**Tests:** `every_arm_logs_the_instruction_files_the_client_loads` (`arm.rs`); `a_log_line_keeps_the_input_on_one_line` (`main.rs`); `the_log_reads_each_loaded_file_and_skips_what_is_not_an_entry` (`run.rs`); `the_harness_hooks_print_the_context_and_log_their_input` (`tests/agent_eval.rs`).
+**Tests:** `every_arm_logs_the_instruction_files_the_client_loads` (`arm.rs`); `a_log_line_keeps_the_input_on_one_line`, `the_log_reads_each_loaded_file_and_skips_what_is_not_an_entry` (`hooks.rs`); `score_dir_counts_what_reached_the_context_outside_the_stream` (`run.rs`); `the_harness_hooks_print_the_context_and_log_their_input` (`tests/agent_eval.rs`).
 
 ## MD6. Lo que llegó sin pasar por el stream
 
-Un trazador MUST salir `retrieved_but_ignored`, si el agente no lo escribió, cuando está en un texto que llegó al contexto sin pasar por el stream: el `MEMORY.md` que el plan de `a4` escribe, y todo archivo del plan que el registro de instrucciones da por cargado, comparando las rutas desde el directorio de la corrida, sin distinguir separadores ni mayúsculas.
+Un trazador MUST salir `retrieved_but_ignored`, si el agente no lo escribió, cuando está en un texto que llegó al contexto sin pasar por el stream: el `MEMORY.md` que el plan de `a4` escribe, y todo archivo del plan que el registro de instrucciones da por cargado, comparando las rutas sin distinguir separadores ni mayúsculas. Las dos rutas son las de la corrida cuando corrió, así que un directorio de corridas movido después se puntúa igual. Un trazador que el agente escribió MUST seguir `used`.
 
 #### Escenario: la nativa
 - GIVEN una corrida de `a4` cuyo `MEMORY.md` tiene el trazador y un stream que no lo muestra
 - WHEN se puntúa
 - THEN el trazador sale `retrieved_but_ignored`, y bajo `a3` con el mismo stream `never_reached`
 
-**Tests:** `a_tracer_in_what_reached_the_context_counts_as_retrieved` (`score.rs`); `the_native_memory_and_the_loaded_rules_files_are_delivered` (`run.rs`).
+**Tests:** `a_tracer_in_what_reached_the_context_counts_as_retrieved` (`score.rs`); `the_native_memory_and_the_loaded_rules_files_are_delivered`, `score_dir_counts_what_reached_the_context_outside_the_stream` (`run.rs`).
 
 ## MD7. Los tokens del primer pedido y el reporte
 
 `stream::parse` MUST leer los tokens del primer pedido: la entrada, la caché leída y la caché escrita del `usage` del primer mensaje del asistente del bucle principal; un stream sin ese mensaje MUST dejarlos ausentes. `result.json` MUST llevarlos en `session`. `agent-eval report` MUST sumar a cada fila la mediana de los tokens del primer pedido de las corridas que los dan y la media de los archivos cargados por ruta (`load_reason` `path_glob_match`), y ordenar los brazos `l0`, `l1` y `l2` después de los demás.
 
-**Tests:** `the_first_request_is_the_first_message_of_the_main_loop` (`stream.rs`); `rows_carry_the_median_first_request_and_the_rules_loaded_by_path` (`report.rs`).
+**Tests:** `the_first_request_is_the_first_message_of_the_main_loop` (`stream.rs`); `score_dir_counts_what_reached_the_context_outside_the_stream` (`run.rs`); `rows_carry_the_median_first_request_and_the_rules_loaded_by_path` (`report.rs`).
