@@ -16,8 +16,8 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla, por la 
 
 ## 3. Lo que llegó al contexto y el primer pedido (MD5, MD6, MD7)
 
-- [ ] RED: `the_first_request_is_the_first_message_of_the_main_loop` (`stream.rs`); `a_tracer_in_what_reached_the_context_counts_as_retrieved` (`score.rs`); `the_log_reads_each_loaded_file_and_skips_what_is_not_an_entry`, `the_native_memory_and_the_loaded_rules_files_are_delivered` (`run.rs`); `rows_carry_the_median_first_request_and_the_rules_loaded_by_path` (`report.rs`).
-- [ ] GREEN: `Transcript::first_request_tokens`, lo entregado en `score::score`, el registro de instrucciones en `score_dir` y `Session`, y las dos columnas del reporte.
+- [x] RED: `the_first_request_is_the_first_message_of_the_main_loop` (`stream.rs`); `a_tracer_in_what_reached_the_context_counts_as_retrieved` (`score.rs`); `the_log_reads_each_loaded_file_and_skips_what_is_not_an_entry` (`hooks.rs`); `the_native_memory_and_the_loaded_rules_files_are_delivered`, `score_dir_counts_what_reached_the_context_outside_the_stream` (`run.rs`); `rows_carry_the_median_first_request_and_the_rules_loaded_by_path` (`report.rs`).
+- [x] GREEN: `Transcript::first_request_tokens`, `score::add_delivered`, `run::delivered`, `hooks::read_log`, el registro de instrucciones en `score_dir` y `Session`, y las dos columnas del reporte.
 - Commit: `feat(agent-eval): count what reached the context outside the stream and the first request`
 
 ## 4. La referencia

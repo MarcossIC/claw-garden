@@ -40,6 +40,11 @@ pub struct Row {
     pub used: usize,
     pub retrieved_but_ignored: usize,
     pub never_reached: usize,
+    /// The median over the runs that report it; `None` when none does.
+    pub first_request_tokens: Option<f64>,
+    /// The mean of the instruction files each run loaded for a path the
+    /// agent worked on.
+    pub rules_by_path: f64,
 }
 
 /// Tokens summed over runs: of every model a run reports, or of its main loop
@@ -92,6 +97,20 @@ fn mean(values: impl Iterator<Item = f64>) -> Option<f64> {
     (n > 0).then(|| sum / f64::from(n))
 }
 
+fn median(values: impl Iterator<Item = u64>) -> Option<f64> {
+    let mut sorted: Vec<u64> = values.collect();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    match n {
+        0 => None,
+        _ if n % 2 == 1 => Some(sorted[n / 2] as f64),
+        _ => Some((sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0),
+    }
+}
+
+/// The `load_reason` of an instruction file loaded for a path the agent worked on.
+const PATH_GLOB_MATCH: &str = "path_glob_match";
+
 /// Tasks by id, then arms in the order of [`crate::arm::ARMS`], an unknown one last.
 fn arm_rank(arm: &str) -> usize {
     Arm::parse(arm).and_then(|a| crate::arm::ARMS.iter().position(|x| *x == a)).unwrap_or(crate::arm::ARMS.len())
@@ -122,6 +141,12 @@ pub fn aggregate(results: &[RunResult]) -> Report {
                 used: fates(TracerFate::Used),
                 retrieved_but_ignored: fates(TracerFate::RetrievedButIgnored),
                 never_reached: fates(TracerFate::NeverReached),
+                first_request_tokens: median(group.iter().filter_map(|r| r.session.first_request_tokens)),
+                rules_by_path: group
+                    .iter()
+                    .map(|r| r.session.instructions_loaded.iter().filter(|l| l.load_reason == PATH_GLOB_MATCH).count())
+                    .sum::<usize>() as f64
+                    / group.len() as f64,
             }
         })
         .collect();
@@ -141,12 +166,12 @@ pub fn aggregate(results: &[RunResult]) -> Report {
 pub fn render(report: &Report) -> String {
     let figure = |v: Option<f64>, places: usize| v.map_or_else(|| "-".to_owned(), |v| format!("{v:.places$}"));
     let mut out = String::from(
-        "| task | category | arm | runs | successes | errors | cost USD | turns | seconds | clawg calls | used | retrieved_but_ignored | never_reached |\n\
-         | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| task | category | arm | runs | successes | errors | cost USD | turns | seconds | clawg calls | used | retrieved_but_ignored | never_reached | first request tokens | rules by path |\n\
+         | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for r in &report.rows {
         out.push_str(&format!(
-            "| {}{} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {:.1} | {} | {} | {} |\n",
+            "| {}{} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {:.1} | {} | {} | {} | {} | {:.1} |\n",
             r.task,
             if r.example { " (example)" } else { "" },
             r.category,
@@ -162,6 +187,8 @@ pub fn render(report: &Report) -> String {
             r.used,
             r.retrieved_but_ignored,
             r.never_reached,
+            figure(r.first_request_tokens, 0),
+            r.rules_by_path,
         ));
     }
     out.push_str(&format!(
@@ -287,6 +314,7 @@ pub fn load_named(dir: &Path) -> Result<Vec<(String, RunResult)>, ReportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::Loaded;
     use crate::run::Session;
     use crate::score::{CheckResult, Score};
     use crate::stream::{ModelUsage, Outcome, Usage};
@@ -342,6 +370,8 @@ mod tests {
                 compactions: 0,
                 unknown_lines: 0,
                 invalid_lines: vec![],
+                first_request_tokens: None,
+                instructions_loaded: vec![],
                 outcome: Some(Outcome {
                     subtype: "success".to_owned(),
                     is_error: false,
@@ -411,10 +441,43 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with("| task | category | arm | runs | successes | errors | cost USD |"));
         assert!(lines[1].starts_with("| --- |"));
-        assert_eq!(lines[2], "| a-count | K1 | a0 | 1 | 1/1 | 0 | 0.2500 | 4.0 | 10.0 | 2.0 | 1 | 0 | 1 |");
-        assert_eq!(lines[3], "| b-port | K1 | a3 | 3 | 1/3 | 1 | 0.2500 | 5.3 | 13.3 | 1.3 | 2 | 2 | 2 |");
+        assert_eq!(lines[2], "| a-count | K1 | a0 | 1 | 1/1 | 0 | 0.2500 | 4.0 | 10.0 | 2.0 | 1 | 0 | 1 | - | 0.0 |");
+        assert_eq!(lines[3], "| b-port | K1 | a3 | 3 | 1/3 | 1 | 0.2500 | 5.3 | 13.3 | 1.3 | 2 | 2 | 2 | - | 0.0 |");
         assert!(lines[5].starts_with("| z-example (example) | K1 | a0 |"));
         assert_eq!(lines[7], "Totals: 6 runs, 4 successes, cost 1.2500 USD (1 runs without a cost)");
+    }
+
+    #[test]
+    fn rows_carry_the_median_first_request_and_the_rules_loaded_by_path() {
+        let run = |arm: &'static str, tokens: Option<u64>, by_path: usize| {
+            let mut r = result(&spec("k", arm));
+            r.session.first_request_tokens = tokens;
+            r.session.instructions_loaded = (0..by_path)
+                .map(|i| Loaded { file_path: format!("/w/.claude/rules/clawg/rules-{i}.md"), load_reason: "path_glob_match".into() })
+                .chain([Loaded { file_path: "/c/CLAUDE.md".into(), load_reason: "session_start".into() }])
+                .collect();
+            r
+        };
+        let report = aggregate(&[
+            run("l2", Some(300), 3),
+            run("l2", Some(100), 0),
+            run("l2", None, 0),
+            run("l2", Some(200), 1),
+            run("a4", Some(100), 0),
+            run("a4", Some(300), 0),
+            run("l0", None, 0),
+            run("a3", None, 0),
+        ]);
+        let order: Vec<&str> = report.rows.iter().map(|r| r.arm.as_str()).collect();
+        assert_eq!(order, ["a3", "a4", "l0", "l2"]);
+        let l2 = &report.rows[3];
+        assert_eq!(l2.first_request_tokens, Some(200.0), "the median of the runs that give it");
+        assert!((l2.rules_by_path - 1.0).abs() < 1e-9);
+        assert_eq!(report.rows[1].first_request_tokens, Some(200.0), "an even count takes the mean of the middle two");
+        assert_eq!(report.rows[0].first_request_tokens, None);
+        let text = render(&report);
+        assert!(text.lines().next().unwrap().ends_with("| never_reached | first request tokens | rules by path |"), "{text}");
+        assert!(text.lines().nth(5).unwrap().ends_with("| 200 | 1.0 |"), "{text}");
     }
 
     fn model(input: u64, output: u64, read: u64, write: u64, cost: f64) -> ModelUsage {

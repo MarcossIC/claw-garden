@@ -58,11 +58,26 @@ fn file_has(body: &str, text: &str) -> bool {
     body.replace("\r\n", "\n").contains(&text.replace("\r\n", "\n"))
 }
 
+/// Whether `text` shows `tracer` once the task's id is taken out of it: a
+/// run's directory may be named after its task, so every path the session
+/// writes or reads holds the id, and an id can hold a tracer.
+fn shows(text: &str, task_id: &str, tracer: &str) -> bool {
+    contains_ci(&text.to_lowercase().replace(&task_id.to_lowercase(), ""), tracer)
+}
+
+/// Marks as retrieved each tracer that nothing in the stream showed and that
+/// a text in `delivered` holds: what reached the session's context without
+/// passing through the stream, such as the native memory loaded at startup.
+pub fn add_delivered(score: &mut Score, task_id: &str, delivered: &[String]) {
+    for (tracer, fate) in &mut score.tracers {
+        if *fate == TracerFate::NeverReached && delivered.iter().any(|text| shows(text, task_id, tracer)) {
+            *fate = TracerFate::RetrievedButIgnored;
+        }
+    }
+}
+
 fn fate(t: &Transcript, task_id: &str, tracer: &str) -> TracerFate {
-    // A run's directory is named after its task, so every path the session
-    // writes or reads holds the task's id, and an id can hold a tracer.
-    let id = task_id.to_lowercase();
-    let shows = |text: &str| contains_ci(&text.to_lowercase().replace(&id, ""), tracer);
+    let shows = |text: &str| shows(text, task_id, tracer);
     let written = shows(t.answer())
         || t.texts.iter().any(|s| shows(s))
         || t.calls.iter().any(|c| shows(&c.input.to_string()));
@@ -182,6 +197,23 @@ mod tests {
 
         let used = stream.replace(r#""content":"def f(): pass\n""#, r#""content":"import secrets\n""#);
         assert_eq!(score(&t, &parse_stream(&used), |_| None).tracers[0].1, TracerFate::Used, "the word itself still counts");
+    }
+
+    #[test]
+    fn a_tracer_in_what_reached_the_context_counts_as_retrieved() {
+        let t = parse_stream(r#"{"type":"result","subtype":"success","is_error":false,"result":"It is 48213."}"#);
+        let mut s = score(&task(), &t, files);
+        assert_eq!(s.tracers, vec![("48213".to_owned(), TracerFate::Used), ("quokka".to_owned(), TracerFate::NeverReached)]);
+        add_delivered(&mut s, "t", &["# Memory\n\nStaging port 48213, proxy alias QUOKKA\n".to_owned()]);
+        assert_eq!(
+            s.tracers,
+            vec![("48213".to_owned(), TracerFate::Used), ("quokka".to_owned(), TracerFate::RetrievedButIgnored)],
+            "a tracer the agent wrote stays used"
+        );
+
+        let mut alone = score(&task(), &t, files);
+        add_delivered(&mut alone, "t", &["nothing of it".to_owned()]);
+        assert_eq!(alone.tracers[1].1, TracerFate::NeverReached);
     }
 
     #[test]

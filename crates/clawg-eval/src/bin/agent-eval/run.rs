@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::arm::{Arm, Daemon, Layout, Options, RunPlan, Step, TEST_HOME_VAR};
+use crate::hooks::{self, Loaded};
 use crate::rubric::{self, Mark, SaveMarks};
 use crate::score::{self, Score, TracerFate};
 use crate::stream::{self, Outcome, Transcript};
@@ -104,6 +105,13 @@ pub struct Session {
     pub compactions: usize,
     pub unknown_lines: usize,
     pub invalid_lines: Vec<usize>,
+    /// [`Transcript::first_request_tokens`].
+    #[serde(default)]
+    pub first_request_tokens: Option<u64>,
+    /// Each instruction file the client reported loading, from the log the
+    /// hook of every arm writes.
+    #[serde(default)]
+    pub instructions_loaded: Vec<Loaded>,
     pub outcome: Option<Outcome>,
 }
 
@@ -153,6 +161,8 @@ pub fn evaluate(
         compactions: t.compactions,
         unknown_lines: t.unknown_lines,
         invalid_lines: t.invalid_lines.clone(),
+        first_request_tokens: t.first_request_tokens,
+        instructions_loaded: Vec::new(),
         outcome: t.result.clone(),
     };
     RunResult {
@@ -166,6 +176,20 @@ pub fn evaluate(
         score: score::score(task, t, read_file),
         saves: rubric::judge_session(t, lang),
     }
+}
+
+/// The texts the plan put in the session's context that the stream does not
+/// show: the native memory, which the client loads at startup, and each file
+/// of the plan that `loaded` names. Paths match whatever their separators and
+/// case, since the client may write them either way.
+pub fn delivered(plan: &RunPlan, loaded: &[Loaded]) -> Vec<String> {
+    let norm = |path: &str| path.trim_start_matches(r"\\?\").replace('\\', "/").to_lowercase();
+    let loaded: Vec<String> = loaded.iter().map(|l| norm(&l.file_path)).collect();
+    plan.files
+        .iter()
+        .filter(|(path, _)| path.ends_with("memory/MEMORY.md") || loaded.contains(&norm(&path.to_string_lossy())))
+        .map(|(_, body)| body.clone())
+        .collect()
 }
 
 /// One line for the terminal.
@@ -676,8 +700,9 @@ pub fn start_client(plan: &RunPlan, layout: &Layout, client: &Step) -> Result<Op
     Ok(status.code())
 }
 
-/// Scores the run in `root` from its `run.json`, `stream.jsonl` and working
-/// directory, and writes `result.json`.
+/// Scores the run in `root` from its `run.json`, `stream.jsonl`, the log of
+/// the instruction files the client loaded and the working directory, and
+/// writes `result.json`.
 pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     let not_a_run = |why: &str| RunError::NotARun(root.to_owned(), why.to_owned());
     let record = read_record(root)?;
@@ -695,6 +720,15 @@ pub fn score_dir(root: &Path) -> Result<RunResult, RunError> {
     let workdir = Layout { root: root.to_owned() }.workdir();
     let read_file = |rel: &str| task::is_relative_inside(rel).then(|| std::fs::read_to_string(workdir.join(rel)).ok()).flatten();
     let mut result = evaluate(&task, &arm, client.name(), profile, lang, &stream::parse(&stream), read_file);
+    let plan: RunPlan = serde_json::from_value(record["plan"].clone()).map_err(|e| not_a_run(&e.to_string()))?;
+    let log_path = Layout { root: root.to_owned() }.instructions_log();
+    let loaded = match std::fs::read_to_string(&log_path) {
+        Ok(text) => hooks::read_log(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(io(&log_path)(e)),
+    };
+    score::add_delivered(&mut result.score, &task.id, &delivered(&plan, &loaded));
+    result.session.instructions_loaded = loaded;
     // The stream is created right before the client starts and closed when it exits.
     let meta = std::fs::metadata(&stream_path).map_err(io(&stream_path))?;
     let utc = |t: std::io::Result<std::time::SystemTime>| {
@@ -981,6 +1015,55 @@ mod tests {
         prepare(&task(), Arm::A0, &fixture, &claude, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
         std::fs::write(claude.root.join(STREAM_FILE), STREAM).unwrap();
         assert_eq!(score_dir(&claude.root).unwrap().client, "claude");
+    }
+
+    #[test]
+    fn the_native_memory_and_the_loaded_rules_files_are_delivered() {
+        let layout = Layout { root: if cfg!(windows) { PathBuf::from(r"C:\runs\r") } else { PathBuf::from("/runs/r") } };
+        let opts = options(layout.root.join("clawg"));
+        let a4 = crate::arm::plan(&task(), Arm::A4, &layout, &opts).unwrap();
+        let native = delivered(&a4, &[]);
+        assert_eq!(native.len(), 1);
+        assert!(native[0].contains("Staging port 48213"), "{native:?}");
+        assert!(delivered(&crate::arm::plan(&task(), Arm::A3, &layout, &opts).unwrap(), &[]).is_empty());
+
+        let rules = task::parse(
+            r#"{"id": "t", "category": "K3", "fixture": "f", "prompt": "Write the notes.", "checks": [{"kind": "answer_contains", "text": "x"}],
+                "memories": [{"content": "Lists use an asterisk", "rule": {"paths": ["**/*.md"]}}, {"content": "Go errors are wrapped", "rule": {"paths": ["**/*.go"]}}]}"#,
+        )
+        .unwrap();
+        let l2 = crate::arm::plan(&rules, Arm::L2, &layout, &opts).unwrap();
+        let reported = layout.rules_dir().join("rules-1.md").to_string_lossy().to_uppercase().replace('\\', "/");
+        let loaded = [
+            Loaded { file_path: reported, load_reason: "path_glob_match".into() },
+            Loaded { file_path: "/elsewhere/CLAUDE.md".into(), load_reason: "session_start".into() },
+        ];
+        let texts = delivered(&l2, &loaded);
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].contains("asterisk") && !texts[0].contains("Go errors"), "{}", texts[0]);
+        assert!(delivered(&l2, &[]).is_empty(), "a rules file the client did not load reached nothing");
+    }
+
+    #[test]
+    fn score_dir_counts_what_reached_the_context_outside_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir_all(&fixture).unwrap();
+        let layout = Layout { root: dir.path().join("run") };
+        prepare(&task(), Arm::A4, &fixture, &layout, &options(dir.path().join("clawg")), &Client::Claude).unwrap();
+        let stream = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":3,"cache_creation_input_tokens":40,"cache_read_input_tokens":500}}}
+{"type":"result","subtype":"success","is_error":false,"result":"done"}
+"#;
+        std::fs::write(layout.root.join(STREAM_FILE), stream).unwrap();
+        std::fs::write(layout.instructions_log(), "{\"file_path\":\"/c/CLAUDE.md\",\"load_reason\":\"session_start\"}\n").unwrap();
+
+        let r = score_dir(&layout.root).unwrap();
+
+        assert_eq!(r.score.tracers, vec![("48213".to_owned(), TracerFate::RetrievedButIgnored)], "MEMORY.md is in the context");
+        assert_eq!(r.session.first_request_tokens, Some(543));
+        assert_eq!(r.session.instructions_loaded, [Loaded { file_path: "/c/CLAUDE.md".into(), load_reason: "session_start".into() }]);
+        std::fs::remove_file(layout.instructions_log()).unwrap();
+        assert!(score_dir(&layout.root).unwrap().session.instructions_loaded.is_empty(), "a run without the log loaded none");
     }
 
     #[test]

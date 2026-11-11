@@ -90,6 +90,9 @@ pub struct Transcript {
     /// The assistant's text blocks, in order.
     pub texts: Vec<String>,
     pub compactions: usize,
+    /// The input, cache written and cache read of the first message of the
+    /// main loop: what the session's context costs before the agent acts.
+    pub first_request_tokens: Option<u64>,
     pub result: Option<Outcome>,
     /// Lines of a kind this reader does not know.
     pub unknown_lines: usize,
@@ -152,6 +155,12 @@ pub fn parse(text: &str) -> Transcript {
                 t.hooks.push(HookEvent { subtype: s.to_owned(), text: strings.join("\n") });
             }
             ("assistant", _) => {
+                if !subagent && t.first_request_tokens.is_none() {
+                    t.first_request_tokens = event.get("message").and_then(|m| m.get("usage")).map(|u| {
+                        let tokens = |name: &str| u.get(name).and_then(Value::as_u64).unwrap_or(0);
+                        tokens("input_tokens") + tokens("cache_creation_input_tokens") + tokens("cache_read_input_tokens")
+                    });
+                }
                 for block in content(&event) {
                     match block.get("type").and_then(Value::as_str) {
                         Some("text") => t.texts.push(block.get("text").and_then(Value::as_str).unwrap_or("").to_owned()),
@@ -338,6 +347,17 @@ not json
         let outcome = t.result.unwrap();
         assert!(outcome.model_usage.is_empty());
         assert_eq!((outcome.usage.cache_creation_5m_input_tokens, outcome.usage.cache_creation_1h_input_tokens), (0, 0));
+    }
+
+    #[test]
+    fn the_first_request_is_the_first_message_of_the_main_loop() {
+        let t = parse(
+            r#"{"type":"assistant","message":{"content":[],"usage":{"input_tokens":9,"cache_creation_input_tokens":90,"cache_read_input_tokens":900}},"parent_tool_use_id":"sub"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":8733,"cache_read_input_tokens":11728,"output_tokens":16}},"parent_tool_use_id":null}
+{"type":"assistant","message":{"content":[],"usage":{"input_tokens":5,"cache_creation_input_tokens":5,"cache_read_input_tokens":5}},"parent_tool_use_id":null}"#,
+        );
+        assert_eq!(t.first_request_tokens, Some(2 + 8733 + 11728), "input, cache written and cache read; not the subagent's");
+        assert_eq!(parse(STREAM).first_request_tokens, None, "messages without usage");
     }
 
     #[test]
