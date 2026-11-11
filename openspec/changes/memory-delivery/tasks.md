@@ -27,7 +27,7 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla, por la 
 
 ## 5. Verificación
 
-- [ ] Suite completa y clippy sobre el último commit: pasan.
+- [x] Suite completa y clippy sobre el último commit: pasan, en Windows.
 
 ## Después de este paso
 
