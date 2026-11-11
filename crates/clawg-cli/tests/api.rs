@@ -496,7 +496,7 @@ async fn health_reports_a_failed_save_with_its_operation_id() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| {
             c.execute(
                 "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, attempts, last_error, created_at, updated_at) \
@@ -967,7 +967,7 @@ async fn outbox(h: &Harness) -> Vec<(String, String, Option<String>)> {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| {
             let mut stmt = c.prepare("SELECT state, content, last_error FROM ingest_outbox ORDER BY id")?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
@@ -1049,7 +1049,7 @@ async fn a_partial_save_answers_202_and_keeps_its_row() {
         .ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| c.query_row("SELECT progress FROM ingest_outbox", [], |r| r.get(0)))
         .await
         .expect("progress");
@@ -1073,7 +1073,7 @@ async fn seed_failed(h: &Harness, operation_id: &str, agent: &str, content: &str
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, attempts, last_error, progress, created_at, updated_at) \
@@ -2001,7 +2001,7 @@ async fn a_queued_save_keeps_its_session_in_the_outbox() {
         .ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| {
             let mut stmt = c.prepare("SELECT json_extract(event, '$.session_id') FROM ingest_outbox")?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -2192,7 +2192,7 @@ async fn seed_dispute(h: &Harness) -> (i64, i64) {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 &format!("UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new}"),
@@ -2288,7 +2288,7 @@ async fn a_protected_verdict_without_the_answer_is_a_409() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| c.execute("UPDATE memory SET memory_type = 'user_preference' WHERE id = ?1", [old]))
         .await
         .expect("make the old row a preference");
@@ -2319,7 +2319,7 @@ async fn disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
@@ -2828,7 +2828,7 @@ async fn registering_a_root_whose_id_is_taken_by_another_is_a_conflict() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [id])
         })
@@ -2851,7 +2851,7 @@ async fn registering_two_roots_that_collide_gives_each_its_own_id() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [seeded])
         })
@@ -2904,7 +2904,7 @@ async fn registering_without_assigned_ids_keeps_the_old_answer() {
         .ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| c.query_row("SELECT COUNT(*) FROM project_remote", [], |r| r.get(0)))
         .await
         .unwrap();
@@ -3146,7 +3146,7 @@ async fn project_with_docs(h: &Harness, docs: &[(&str, &str)]) -> (tempfile::Tem
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, ?2, 0)", [row_id, root]))
         .await
         .unwrap();
@@ -3299,7 +3299,7 @@ async fn index_docs_of(h: &Harness, id: &str) -> Option<i64> {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project_path WHERE id = ?1)", [id], |r| r.get(0)))
         .await
         .unwrap()
@@ -3758,7 +3758,7 @@ async fn a_restore_answers_its_key_and_its_new_pairs() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute("UPDATE memory SET memory_type = 'semantic_fact' WHERE id = ?1", [restored])?;
             c.execute("UPDATE memory SET memory_type = 'semantic_fact' WHERE id = ?1", [newer])?;
@@ -3955,7 +3955,7 @@ async fn the_synchronous_import_still_cancels_when_the_client_goes() {
         .ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| c.query_row("SELECT COUNT(*) FROM memory_import", [], |r| r.get(0)))
         .await
         .expect("count imports");
@@ -4221,7 +4221,7 @@ impl Harness {
     }
 
     async fn count_of(&self, sql: &'static str) -> i64 {
-        self.ctx.runtime.store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
+        self.ctx.runtime.store.conn_for_test().call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
     }
 }
 
@@ -4334,7 +4334,7 @@ async fn a_job_import_refuses_what_the_synchronous_import_refuses() {
         h.ctx
             .runtime
             .store
-            .conn
+            .conn_for_test()
             .call(move |c| c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, 'Twin', 'user', 1, 1)", [id]))
             .await
             .unwrap();
@@ -4445,7 +4445,7 @@ async fn health_carries_the_active_jobs_import_block_without_the_connection() {
     let store = h.ctx.runtime.store.clone();
     let hold = tokio::spawn(async move {
         store
-            .conn
+            .conn_for_test()
             .call(move |_| {
                 entered.send(()).ok();
                 released.recv_timeout(Duration::from_secs(30)).ok();
@@ -4552,7 +4552,7 @@ async fn accepting_a_job_reloads_a_released_model_before_embedding() {
     let store = h.ctx.runtime.store.clone();
     let hold = tokio::spawn(async move {
         store
-            .conn
+            .conn_for_test()
             .call(move |_| {
                 entered.send(()).ok();
                 released.recv_timeout(Duration::from_secs(30)).ok();
@@ -4801,7 +4801,7 @@ async fn a_project_map_to_a_deleted_ambiguous_or_unknown_project_is_refused() {
         h.ctx
             .runtime
             .store
-            .conn
+            .conn_for_test()
             .call(move |c| c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, 'Twin', 'user', 1, 1)", [name]))
             .await
             .unwrap();
@@ -5305,7 +5305,7 @@ async fn move_and_list_select_by_origin_project() {
             h.ctx
                 .runtime
                 .store
-                .conn
+                .conn_for_test()
                 .call(move |c| c.execute("UPDATE memory SET origin_project = ?1 WHERE id = ?2", rusqlite::params![origin, id]))
                 .await
                 .expect("seed");
@@ -5533,7 +5533,7 @@ async fn every_route_that_takes_a_project_follows_a_merge() {
                 h.ctx
                     .runtime
                     .store
-                    .conn
+                    .conn_for_test()
                     .call(move |c| {
                         c.execute(
                             "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
@@ -5752,7 +5752,7 @@ async fn pending_save(h: &Harness, operation: &'static str, project: &str) {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, created_at, updated_at) \
@@ -5776,7 +5776,7 @@ async fn a_merge_waits_for_the_saves_of_its_projects() {
     let started = Instant::now();
     let finish = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        store.conn.call(|c| c.execute("DELETE FROM ingest_outbox", [])).await.expect("the save ends");
+        store.conn_for_test().call(|c| c.execute("DELETE FROM ingest_outbox", [])).await.expect("the save ends");
     });
 
     let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
@@ -6151,7 +6151,7 @@ async fn suggest(h: &Harness, a: &str, b: &str) {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 "INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES (?1, ?2, 'root_commit', 1)",
@@ -6320,7 +6320,7 @@ async fn a_folder_shared_by_its_project_is_not_located() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| c.execute("UPDATE project_path SET project_id = ?1 WHERE id = ?2", [own2, shared2]))
         .await
         .expect("share the project");
@@ -6329,6 +6329,12 @@ async fn a_folder_shared_by_its_project_is_not_located() {
 
     assert_eq!((status, body["error"].as_str()), (409, Some("folder_shared")), "{body}");
     assert!(body["detail"].as_str().is_some_and(|d| d.contains(&own) && d.contains("projects merge")), "{body}");
+    let ideas = resolve(&h, json!({ "project": "ideas" })).await["project_id"].as_str().unwrap().to_string();
+    let detail = format!(
+        "{} leads to project {own}, which has 2 folders; `clawg projects merge {own} --into {ideas}` merges them all",
+        one.to_string_lossy()
+    );
+    assert_eq!(body["detail"].as_str(), Some(detail.as_str()), "{body}");
 }
 
 #[tokio::test]

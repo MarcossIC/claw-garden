@@ -55,7 +55,7 @@ use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
 use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
 use clawg_core::memory::registry::{
-    find_project, keep_apart, list_deletes, list_projects, pending_suggestions, rename_project, resolve_project, suggestion_between,
+    find_project, keep_apart, list_deletes, list_projects, own_folder_count, pending_suggestions, rename_project, resolve_project, suggestion_between,
     Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, Named, Project, RenameError,
     Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
 };
@@ -3120,18 +3120,7 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
     if own == target {
         return Ok(Json(located(true, None)));
     }
-    let own2 = own.clone();
-    let folders: i64 = store
-        .conn
-        .call(move |c| {
-            c.query_row(
-                "SELECT COUNT(*) FROM project_path WHERE project_id = ?1 OR (project_id IS NULL AND id = ?1)",
-                [own2],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .map_err(ApiError::internal)?;
+    let folders = own_folder_count(store, &own).await.map_err(ApiError::internal)?;
     if folders > 1 {
         return Err(ApiError {
             detail: Some(format!(
@@ -3663,7 +3652,7 @@ mod tests {
     }
 
     async fn count(app: &AppCtx, sql: &'static str) -> i64 {
-        app.runtime.store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
+        app.runtime.store.conn_for_test().call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
     }
 
     /// How many notes have rows, and how many different numbers of rows a
@@ -3671,7 +3660,7 @@ mod tests {
     async fn notes_stored(app: &AppCtx) -> (i64, i64) {
         app.runtime
             .store
-            .conn
+            .conn_for_test()
             .call(|c| {
                 c.query_row(
                     "SELECT COUNT(DISTINCT created_by_ref), COUNT(DISTINCT n) FROM (SELECT created_by_ref, COUNT(*) AS n FROM memory GROUP BY created_by_ref)",
@@ -3858,7 +3847,7 @@ mod tests {
                     let _ = held.recv();
                     Ok::<_, rusqlite::Error>(())
                 };
-                let mut call = Box::pin(queue.conn.call(hold));
+                let mut call = Box::pin(queue.conn_for_test().call(hold));
                 let _ = std::future::Future::poll(call.as_mut(), &mut std::task::Context::from_waker(std::task::Waker::noop()));
             }
         });

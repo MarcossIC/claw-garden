@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::memory::access::AccessTracker;
+use crate::memory::StorageError;
 use crate::memory::backup::Reason;
 use crate::memory::bootstrap::EmbedderStatus;
 use crate::memory::chunker::chat::ChatChunker;
@@ -351,11 +352,11 @@ impl MemoryRuntime {
     /// exit after a [`MemoryRuntime::shutdown`] that finished. Left to the
     /// last handle's drop, the close runs on the connection's own thread and
     /// the exit can cut it after the WAL index is removed and before the WAL
-    /// is. Every call on the store fails afterwards.
-    pub async fn close(&self) {
-        if let Err(e) = self.store.conn.clone().close().await {
-            log::warn!("closing memory.db failed: {e}; SQLite replays what is left on the next open");
-        }
+    /// is. Every call on the store fails afterwards. `Ok` when the
+    /// connection closed or was closed already; the error is SQLite's own
+    /// failure to close, and the WAL it leaves is replayed on the next open.
+    pub async fn close(&self) -> Result<(), StorageError> {
+        Ok(self.store.conn.clone().close().await?)
     }
 
     async fn finish(&self, workers: Workers) {
@@ -621,7 +622,7 @@ mod tests {
             .await
             .expect("vec_version");
         assert!(!version.is_empty());
-        rt.close().await;
+        rt.close().await.expect("the store closes");
     }
 
     /// `VACUUM INTO` reads the whole file, and every call queued behind it on
@@ -655,7 +656,7 @@ mod tests {
             .expect("snapshot");
         let bytes = std::fs::read(&path).expect("the snapshot exists");
         assert!(bytes.starts_with(b"SQLite format 3\0"), "a whole SQLite database");
-        rt.close().await;
+        rt.close().await.expect("the store closes");
     }
 
     /// The snapshot's own connection must still read what the store's
@@ -689,7 +690,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM memory WHERE content = 'only in the WAL'", [], |r| r.get(0))
             .expect("count");
         assert_eq!(rows, 1, "the snapshot must include what is still in the WAL");
-        rt.close().await;
+        rt.close().await.expect("the store closes");
     }
 
     /// Production `open()` must NOT fill the embedder cell: the 470 MB
@@ -704,7 +705,7 @@ mod tests {
         assert!(!rt.embedder_ready());
         assert_eq!(rt.embedder_status(), EmbedderStatus::Loading);
         assert!(rt.tokenizer.get().is_none());
-        rt.close().await;
+        rt.close().await.expect("the store closes");
     }
 
     /// The returned sender and receiver must be two ends of ONE channel, and
@@ -719,7 +720,7 @@ mod tests {
         rt.memory_tx.try_send(chat_event("hello").into()).expect("send");
         let req = rx.recv().await.expect("event");
         assert_eq!(req.event.content, "hello");
-        rt.close().await;
+        rt.close().await.expect("the store closes");
     }
 
     /// The flush worker is spawned inside `AccessTracker::new` during `open`,
@@ -733,7 +734,7 @@ mod tests {
             .expect("open");
         rt.access_tracker.record(vec![1, 2, 3]);
         rt.access_tracker.record(vec![]); // empty is a no-op, not an error
-        rt.close().await;
+        rt.close().await.expect("the store closes");
     }
 
     #[tokio::test]
@@ -750,7 +751,7 @@ mod tests {
                 .join("default")
                 .join("workspace.md")
         );
-        rt.close().await;
+        rt.close().await.expect("the store closes");
     }
 
     #[tokio::test]
@@ -844,7 +845,7 @@ mod tests {
         assert_eq!(gauges[&SeriesKey::new("ingest.queue_depth", &[])].last, 0.0);
 
         assert!(rt.shutdown(workers).await);
-        rt.close().await;
+        rt.close().await.expect("the store closes");
     }
 
     /// The maintenance loop never returns, so what is actually assertable is

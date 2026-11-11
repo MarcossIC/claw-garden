@@ -128,7 +128,7 @@ async fn a_second_runtime_open_on_the_same_dir_is_refused_naming_the_first_holde
         other => panic!("expected StoreInUse naming the daemon, got {other:?}"),
     }
     // On Windows a store still open cannot be deleted with its directory.
-    first.close().await;
+    first.close().await.expect("the store closes");
 }
 
 // ── Storage failures, seen from outside the crate ─────────────────────────
@@ -139,7 +139,23 @@ async fn a_second_runtime_open_on_the_same_dir_is_refused_naming_the_first_holde
 async fn a_call_on_a_closed_store_fails_with_a_storage_error() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (runtime, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Eval).await.expect("open");
-    runtime.close().await;
+    runtime.close().await.expect("the store closes");
+
+    let failure = runtime.store.probe_wait().await.expect_err("the store is closed");
+    assert!(matches!(failure, MemoryError::Storage(_)), "{failure:?}");
+}
+
+/// A host that is about to delete the store's directory has to know the
+/// connection let the files go.
+#[tokio::test]
+async fn a_runtime_closes_and_says_so() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (runtime, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Eval).await.expect("open");
+
+    let first: Result<(), clawg_core::memory::StorageError> = runtime.close().await;
+    assert!(first.is_ok(), "{first:?}");
+    let again = runtime.close().await;
+    assert!(again.is_ok(), "a closed store closes again: {again:?}");
 
     let failure = runtime.store.probe_wait().await.expect_err("the store is closed");
     assert!(matches!(failure, MemoryError::Storage(_)), "{failure:?}");
@@ -186,7 +202,7 @@ async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
     // The store is not merely constructed — the sqlite-vec extension is loaded.
     let version: String = rt
         .store
-        .conn
+        .conn_for_test()
         .call(|c| -> Result<String, rusqlite::Error> {
             c.query_row("SELECT vec_version()", [], |r| r.get(0))
         })
@@ -212,7 +228,7 @@ async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
         wm.workspace_path("agent-1", None),
         base.join("workspaces").join("agent-1").join("default").join("workspace.md")
     );
-    rt.close().await;
+    rt.close().await.expect("the store closes");
 }
 
 /// `new_for_test` is a shortcut for hosts' tests: an in-memory store with the
@@ -251,7 +267,7 @@ async fn memory_runtime_ingest_worker_drains_an_event_into_a_row() {
     worker.await.expect("worker must exit cleanly when every sender is dropped");
 
     let count: i64 = store
-        .conn
+        .conn_for_test()
         .call(|c| -> Result<i64, rusqlite::Error> {
             c.query_row("SELECT COUNT(*) FROM memory WHERE source = 'explicit'", [], |r| r.get(0))
         })
@@ -299,7 +315,7 @@ async fn explicit_overrides_reach_the_stored_row() {
     worker.await.expect("worker exits");
 
     let (mtype, importance, created_by): (String, f64, String) = store
-        .conn
+        .conn_for_test()
         .call(|c| -> Result<(String, f64, String), rusqlite::Error> {
             c.query_row(
                 "SELECT memory_type, importance, created_by_type FROM memory \

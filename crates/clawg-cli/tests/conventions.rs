@@ -106,7 +106,7 @@ fn no_production_code_names_the_retired_tables() {
             continue;
         }
         let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        found.extend(production_lines_naming(&source, &RETIRED).into_iter().map(|n| format!("{shown}:{n}")));
+        found.extend(production_lines_naming(&source, |line| RETIRED.iter().any(|table| line.contains(table))).into_iter().map(|n| format!("{shown}:{n}")));
     }
     assert!(found.is_empty(), "these lines name a table V32 dropped:\n{}", found.join("\n"));
 }
@@ -129,33 +129,76 @@ fn no_memory_code_translates_a_connection_error_by_hand() {
             continue;
         }
         let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        found.extend(production_lines_naming(&source, &["tokio_rusqlite::Error::"]).into_iter().map(|n| format!("{shown}:{n}")));
+        found.extend(production_lines_naming(&source, |line| line.contains("tokio_rusqlite::Error::")).into_iter().map(|n| format!("{shown}:{n}")));
     }
     assert!(found.is_empty(), "translate a failed call with `failed_call` or a `From` of {TRANSLATES}:\n{}", found.join("\n"));
 }
 
-/// The lines, from 1, of the code before the first `#[cfg(test)]` module of
-/// `source` that name one of `names`.
-fn production_lines_naming(source: &str, names: &[&str]) -> Vec<usize> {
+/// The lines, from 1, of the production code of `source` that `names` takes:
+/// the code before the first `#[cfg(test)]` followed by a `mod <name> {`. A
+/// `mod <name>;` declares a module kept in another file, and ends nothing.
+fn production_lines_naming(source: &str, names: impl Fn(&str) -> bool) -> Vec<usize> {
     let lines: Vec<&str> = source.lines().collect();
     let tests = lines
         .windows(2)
-        .position(|pair| pair[0] == "#[cfg(test)]" && pair[1].starts_with("mod "))
+        .position(|pair| pair[0] == "#[cfg(test)]" && pair[1].starts_with("mod ") && pair[1].trim_end().ends_with('{'))
         .unwrap_or(lines.len());
-    lines[..tests]
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| names.iter().any(|t| line.contains(t)))
-        .map(|(n, _)| n + 1)
-        .collect()
+    lines[..tests].iter().enumerate().filter(|(_, line)| names(line)).map(|(n, _)| n + 1).collect()
+}
+
+/// Whether `line` names `rusqlite` or reads a field or a method called
+/// `conn`: `.conn` not followed by a character that continues an identifier,
+/// so `.connect_timeout` and `.conn_for_test()` do not count.
+fn reaches_the_connection(line: &str) -> bool {
+    let continues = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    line.contains("rusqlite") || line.match_indices(".conn").any(|(at, found)| !line[at + found.len()..].starts_with(continues))
+}
+
+#[test]
+fn reaches_the_connection_tells_the_field_from_longer_names() {
+    for reaching in ["store.conn", "    .conn", "let c = &store.conn;", "store.conn.call(|c| Ok(()))", "use rusqlite::Connection;", "e: tokio_rusqlite::Error"] {
+        assert!(reaches_the_connection(reaching), "{reaching}");
+    }
+    for fine in ["builder.connect_timeout(wait)", "store.conn_for_test().call(f)", "let connection = open();", ".connected"] {
+        assert!(!reaches_the_connection(fine), "{fine}");
+    }
+}
+
+/// SQLite is the core's: the code of the other crates that a release builds
+/// neither names `rusqlite` nor reads the store's connection. Their tests
+/// reach it with `MemoryStore::conn_for_test`.
+#[test]
+fn no_production_code_outside_core_reaches_the_connection() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
+    let mut files = Vec::new();
+    for krate in ["clawg-cli", "clawg-eval"] {
+        rust_files(&crates.join(krate).join("src"), &mut files);
+    }
+    assert!(!files.is_empty(), "no sources found under {}", crates.display());
+
+    let mut found = Vec::new();
+    for file in &files {
+        let shown = file.strip_prefix(crates).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        found.extend(production_lines_naming(&source, reaches_the_connection).into_iter().map(|n| format!("{shown}:{n}")));
+    }
+    assert!(found.is_empty(), "ask clawg-core for what these lines read from SQLite:\n{}", found.join("\n"));
+}
+
+#[test]
+fn a_test_module_in_another_file_does_not_end_the_production_code() {
+    let source = "#[cfg(test)]\nmod helpers;\n\nuse rusqlite::Connection;\n\n#[cfg(test)]\nmod tests {\n    use rusqlite::params;\n}\n";
+    assert_eq!(production_lines_naming(source, reaches_the_connection), [4]);
+    assert_eq!(production_lines_naming(&source.replace('\n', "\r\n"), reaches_the_connection), [4]);
 }
 
 /// A Windows checkout has CRLF line ends.
 #[test]
 fn the_production_code_ends_at_the_test_module_with_either_line_end() {
     let source = "use x;\nconst A: &str = \"old_table\";\n\n#[cfg(test)]\nmod tests {\n    const B: &str = \"old_table\";\n}\n";
-    assert_eq!(production_lines_naming(source, &["old_table"]), [2]);
-    assert_eq!(production_lines_naming(&source.replace('\n', "\r\n"), &["old_table"]), [2]);
+    let names = |line: &str| line.contains("old_table");
+    assert_eq!(production_lines_naming(source, names), [2]);
+    assert_eq!(production_lines_naming(&source.replace('\n', "\r\n"), names), [2]);
 }
 
 /// Lines of a manifest that turn on clawg-core's `testing` feature outside

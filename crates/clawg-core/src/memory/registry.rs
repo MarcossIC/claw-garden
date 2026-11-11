@@ -19,7 +19,7 @@ use crate::memory::identity::Ground;
 use crate::memory::merge::{canonical_in, MAX_MERGE_HOPS};
 use crate::memory::project::is_project_id;
 use crate::memory::project_delete::{deleted_in, deleted_message};
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::{MemoryError, MemoryStore, StorageError};
 
 /// The name a project has until someone gives it one: its id without the
 /// `-` and four hex digits `derive_project_id` appends, or the whole id when
@@ -811,6 +811,13 @@ fn folders_of_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<Resolved
     Ok(folders.into_iter().map(|(_, f)| f).collect())
 }
 
+/// How many folders lead to `project`: those recorded with its id, and one
+/// from before folders named their project, whose own id is the project's.
+pub async fn own_folder_count(store: &MemoryStore, project: &str) -> Result<usize, StorageError> {
+    let project = project.to_string();
+    Ok(store.conn.call(move |c| own_folders_in(c, &project)).await?.len())
+}
+
 fn own_folders_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<ResolvedFolder>> {
     Ok(own_folders_dated_in(c, project)?.into_iter().map(|(_, f)| f).collect())
 }
@@ -961,6 +968,28 @@ mod tests {
     use crate::memory::worker::save_for_test;
     use crate::memory::MemoryStore;
     use crate::models::chat::Role;
+
+    #[tokio::test]
+    async fn own_folder_count_counts_the_folders_that_lead_to_a_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                         ('a-0001', 'a', 'root', 1, 1), ('b-0002', 'b', 'migrated', 1, 1), ('c-0003', 'c', 'named', 1, 1);
+                     INSERT INTO project_path (id, root_path, created_at, project_id) VALUES \
+                         ('a-0001', '/work/a', 1, 'a-0001'), ('a-0009', '/work/a-clone', 2, 'a-0001');
+                     INSERT INTO project_path (id, root_path, created_at) VALUES ('b-0002', '/work/b', 1);",
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(own_folder_count(&store, "a-0001").await.unwrap(), 2);
+        assert_eq!(own_folder_count(&store, "b-0002").await.unwrap(), 1, "a folder from before folders named their project");
+        assert_eq!(own_folder_count(&store, "c-0003").await.unwrap(), 0);
+    }
 
     /// `(name, born, reviewed, created_at)` of project `id`.
     type Project = (String, String, i64, i64);

@@ -153,9 +153,22 @@ pub(crate) fn ensure_vec0_registered() {
 /// Wraps a [`tokio_rusqlite::Connection`], which is itself `Clone` (channel
 /// handle) — cloning `MemoryStore` gives another handle to the same background
 /// thread. No `Mutex` is needed.
+///
+/// The connection is the crate's own. Another crate calls the store's
+/// methods:
+///
+/// ```
+/// fn reach(store: &clawg_core::memory::MemoryStore) { let _ = store.probe_wait(); }
+/// ```
+///
+/// and cannot read the field:
+///
+/// ```compile_fail,E0616
+/// fn reach(store: &clawg_core::memory::MemoryStore) { let _ = &store.conn; }
+/// ```
 #[derive(Clone)]
 pub struct MemoryStore {
-    pub conn: Connection,
+    pub(crate) conn: Connection,
     /// Shared with every clone deliberately: the handles all address one
     /// database, so they belong to one latency series instead of each
     /// keeping a private slice too short to mean anything.
@@ -285,6 +298,13 @@ impl MemoryStore {
             sharing_dir: None,
             importing: Arc::default(),
         })
+    }
+
+    /// The connection, for a test of another crate that seeds or reads rows
+    /// with SQL.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn conn_for_test(&self) -> &Connection {
+        &self.conn
     }
 
     /// This in-memory store reading `sharing.json` from `dir`, as a runtime
