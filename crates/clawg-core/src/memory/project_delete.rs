@@ -32,7 +32,7 @@ use crate::memory::{MemoryError, MemoryStore};
 
 /// What every refusal of a deleted project says: it is deleted, and, when the
 /// journal has an open delete for it, which one and how to undo it.
-pub fn deleted_message(id: &str, delete_id: &Option<i64>) -> String {
+pub(crate) fn deleted_message(id: &str, delete_id: &Option<i64>) -> String {
     match delete_id {
         Some(n) => format!("project {id} is deleted, in delete {n}: undo it with `clawg projects delete --undo {n}`"),
         None => format!("project {id} is deleted"),

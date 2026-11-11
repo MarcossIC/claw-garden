@@ -21,7 +21,7 @@ use crate::memory::{MemoryError, MemoryStore};
 
 /// A row of `project_subfolder`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Declaration {
+pub(crate) struct Declaration {
     /// The project of the repository, or a tombstone that leads to it.
     pub parent_id: String,
     /// Relative to the top of the checkout, its components joined by `/`.
@@ -33,14 +33,14 @@ pub struct Declaration {
 
 /// Whether the subpath `outer` holds `inner`, by whole components:
 /// `apps/web` holds `apps/web/src` but not `apps/webapp`.
-pub fn contains(outer: &str, inner: &str) -> bool {
+pub(crate) fn contains(outer: &str, inner: &str) -> bool {
     inner == outer || inner.strip_prefix(outer).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The declaration that decides `subpath` among `declared`, read under the
 /// repository's project `parent` and its tombstones: the deepest that holds
 /// it, then the one of `parent` before a tombstone's, then the oldest.
-pub fn deepest<'a>(declared: &'a [Declaration], parent: &str, subpath: &str) -> Option<&'a Declaration> {
+pub(crate) fn deepest<'a>(declared: &'a [Declaration], parent: &str, subpath: &str) -> Option<&'a Declaration> {
     declared
         .iter()
         .filter(|d| !d.subpath.is_empty() && contains(&d.subpath, subpath))

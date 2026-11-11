@@ -5,8 +5,8 @@
 //! Derived from the files on disk and rebuilt from them at will. Nothing here
 //! reads or writes a memory.
 
-pub mod chunk;
-pub mod code;
+pub(crate) mod chunk;
+pub(crate) mod code;
 pub mod corpus;
 
 use std::collections::{HashMap, HashSet};
@@ -31,12 +31,12 @@ use corpus::{CorpusError, DocFile, DocKind};
 /// How old the last refresh of a project may be before a search refreshes it
 /// again. Long enough that a burst of searches walks the tree once; short
 /// enough that a doc edited during a session is found in its new form.
-pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Passages each channel of a search proposes before fusion. With a top of 20
 /// at most, 50 per channel leaves room for a passage that only one channel
 /// ranks high.
-pub const CANDIDATES_PER_CHANNEL: usize = 50;
+pub(crate) const CANDIDATES_PER_CHANNEL: usize = 50;
 
 /// The constant of reciprocal rank fusion. 60 is the value the method was
 /// published with; it flattens the gap between the first ranks so that two
@@ -168,6 +168,7 @@ pub struct FailedDoc {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "testing"))]
 pub enum RefreshOutcome {
     Refreshed(RefreshReport),
     /// Another refresh of the project was running; this one did nothing.
@@ -176,7 +177,7 @@ pub enum RefreshOutcome {
 
 /// What the index holds for one doc.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fingerprint {
+pub(crate) struct Fingerprint {
     pub path: String,
     pub hash: String,
     pub model_id: String,
@@ -184,7 +185,7 @@ pub struct Fingerprint {
 
 /// Which docs a refresh rewrites, leaves alone and drops.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Plan {
+pub(crate) struct Plan {
     pub index: Vec<String>,
     pub keep: usize,
     pub remove: Vec<String>,
@@ -193,7 +194,7 @@ pub struct Plan {
 /// Decides a refresh from the `(path, sha256)` of every doc on disk and what
 /// the index holds. A doc is rewritten when it is new, its bytes changed, or
 /// its vectors came from another model.
-pub fn plan_refresh(disk: &[(String, String)], stored: &[Fingerprint], model_id: &str) -> Plan {
+pub(crate) fn plan_refresh(disk: &[(String, String)], stored: &[Fingerprint], model_id: &str) -> Plan {
     let stored_by_path: HashMap<&str, &Fingerprint> =
         stored.iter().map(|f| (f.path.as_str(), f)).collect();
     let mut plan = Plan::default();
@@ -210,7 +211,7 @@ pub fn plan_refresh(disk: &[(String, String)], stored: &[Fingerprint], model_id:
 
 /// Whether a project whose last refresh started at `last_started` is due for
 /// another at `now`.
-pub fn needs_refresh(last_started: Option<Instant>, now: Instant, interval: Duration) -> bool {
+pub(crate) fn needs_refresh(last_started: Option<Instant>, now: Instant, interval: Duration) -> bool {
     last_started.is_none_or(|t| now.saturating_duration_since(t) >= interval)
 }
 
@@ -312,6 +313,7 @@ impl DocIndex {
 
     /// Whether a search at `now` should refresh the project first: none is
     /// running and the last one started [`REFRESH_INTERVAL`] ago, or never.
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_due(&self, project_id: &str, now: Instant) -> bool {
         let p = self.progress(project_id);
         !p.running && needs_refresh(p.last_started, now, REFRESH_INTERVAL)
@@ -350,6 +352,7 @@ impl DocIndex {
     /// refresh of it is already running. `tokenizer` is the ingest's, so a
     /// passage is capped by the same count a memory is; without it passages
     /// are capped by bytes.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn try_refresh(
         self: &Arc<Self>,
         store: &MemoryStore,
@@ -387,7 +390,7 @@ pub(crate) fn passages(kind: DocKind, path: &str, masked: &str, splitter: &Token
 /// Reciprocal rank fusion of two ranked id lists: each list adds
 /// `1 / (RRF_K + rank)` to an id, rank from 1. Highest total first, ties by
 /// lower id, at most `limit`.
-pub fn fuse(dense: &[i64], lexical: &[i64], limit: usize) -> Vec<(i64, f64)> {
+pub(crate) fn fuse(dense: &[i64], lexical: &[i64], limit: usize) -> Vec<(i64, f64)> {
     let mut scores: HashMap<i64, f64> = HashMap::new();
     for list in [dense, lexical] {
         for (rank, id) in list.iter().enumerate() {

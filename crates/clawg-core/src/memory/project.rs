@@ -525,7 +525,7 @@ fn settle_in(
 /// without writing: the one a registration with assigned ids would give it,
 /// from what `ground` finds at the root, or the project a declared subfolder
 /// leads `path` to inside it.
-pub fn project_id_in(c: &Connection, root: &Path, path: Option<&Path>, ground: &dyn Ground) -> rusqlite::Result<String> {
+pub(crate) fn project_id_in(c: &Connection, root: &Path, path: Option<&Path>, ground: &dyn Ground) -> rusqlite::Result<String> {
     let project = plan_ids_in(c, &[root.to_path_buf()], ground, false)?.remove(0).project_id;
     let subpath = path.and_then(|p| ground.subpath(root, p));
     Ok(match subpath {

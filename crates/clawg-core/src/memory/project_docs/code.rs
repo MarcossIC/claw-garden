@@ -10,7 +10,7 @@ use crate::memory::chunker::token_splitter::TokenSplitter;
 /// not depend on how the code is formatted. Below the cAST paper's 2,000:
 /// e5-small reads 512 tokens and code cuts into short tokens. Every passage
 /// still goes through the token cap afterwards.
-pub const CODE_CHUNK_MAX_CHARS: usize = 1_200;
+pub(crate) const CODE_CHUNK_MAX_CHARS: usize = 1_200;
 
 /// Longest label a container adds to the breadcrumb, in bytes.
 const MAX_LABEL_BYTES: usize = 120;
@@ -39,7 +39,7 @@ pub enum CodeLang {
 }
 
 impl CodeLang {
-    pub fn from_extension(ext: &str) -> Option<Self> {
+    pub(crate) fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),

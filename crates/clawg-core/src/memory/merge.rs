@@ -21,7 +21,7 @@ use crate::memory::{MemoryError, MemoryStore};
 /// How far [`canonical_in`] follows `merged_into`. A merge points every
 /// tombstone at a live project, so a store it wrote needs one hop; the bound
 /// is for one edited by hand or restored broken.
-pub const MAX_MERGE_HOPS: usize = 8;
+pub(crate) const MAX_MERGE_HOPS: usize = 8;
 
 /// The live project `id` leads to: the one a tombstone was merged into, or
 /// `id` itself for a live project or an id `project` does not know. A cycle,
@@ -60,7 +60,7 @@ pub async fn canonical(store: &MemoryStore, id: &str) -> Result<String, MemoryEr
 /// How long a merge waits for the saves of its two projects still in the
 /// outbox: the worker reads a save's project more than once before it stores
 /// it, and a merge in between would split what it decides.
-pub const SAVES_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const SAVES_WAIT: Duration = Duration::from_secs(5);
 
 const SAVES_POLL: Duration = Duration::from_millis(100);
 
