@@ -15,7 +15,7 @@ use super::foreign::{parse_utc, ForeignError, ForeignExport, ForeignNote, NoteKi
 
 pub const SOURCE: &str = "claude-code";
 /// The index of a memory directory, one line per memory.
-pub const INDEX: &str = "MEMORY.md";
+pub(crate) const INDEX: &str = "MEMORY.md";
 /// The directory of a project that holds its memory.
 pub const MEMORY_DIR: &str = "memory";
 

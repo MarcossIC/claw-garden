@@ -2,22 +2,22 @@
 //! format, the export that writes it and the import that reads it.
 
 pub mod claude_code;
-pub mod control;
+pub(crate) mod control;
 pub mod engram;
 pub mod export;
-pub mod foreign;
+pub(crate) mod foreign;
 pub mod format;
 pub mod import;
 pub mod markdown;
-pub mod projects;
+pub(crate) mod projects;
 pub mod timing;
 pub mod translate;
-pub mod undo;
+pub(crate) mod undo;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub use control::{Counters, ImportControl, Progress, StopCause};
+pub use control::{Counters, ImportControl, StopCause};
 pub use export::{export, Export, ExportError, ExportFilter};
 pub use import::{
     import_parsed, map_project, ImportError, ImportInput, ImportOptions, ImportReport, Imported, ImportedProject,

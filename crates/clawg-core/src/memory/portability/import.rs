@@ -2062,7 +2062,7 @@ fn write_links<S: Seat>(seat: &mut S, prepared: &Prepared, ledger: &mut Ledger) 
 /// A dry run writes nothing and needs no embedder.
 #[cfg(test)]
 #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
-pub async fn import(
+pub(crate) async fn import(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
     chunker: Arc<ChatChunker>,
@@ -2235,7 +2235,7 @@ async fn prepare_parsed(
 /// its project, or in none.
 #[cfg(test)]
 #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
-pub async fn import_foreign(
+pub(crate) async fn import_foreign(
     store: &MemoryStore,
     embedder: Option<&dyn Embedder>,
     chunker: Arc<ChatChunker>,
