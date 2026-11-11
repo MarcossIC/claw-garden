@@ -24,6 +24,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::backup::Reason;
+use crate::memory::portability::RunningImports;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// Lookups per call while the store is read, each a seek in an index.
@@ -1204,8 +1205,14 @@ fn forget_in(c: &Connection, import_id: i64, entry: &Registered) -> rusqlite::Re
 /// after a `pre-undo` snapshot into `backups`. A dry run writes nothing.
 /// Undoing an import twice changes nothing the second time; what stayed is
 /// still in the journal, and a later undo weighs it again.
-pub async fn undo_import(store: &MemoryStore, backups: &Path, import_id: i64, dry_run: bool) -> Result<UndoReport, UndoError> {
-    if store.importing.lock().unwrap_or_else(|e| e.into_inner()).contains(&import_id) {
+pub async fn undo_import(
+    store: &MemoryStore,
+    running: &RunningImports,
+    backups: &Path,
+    import_id: i64,
+    dry_run: bool,
+) -> Result<UndoReport, UndoError> {
+    if running.holds(import_id) {
         return Err(UndoError::Running(import_id));
     }
     let facts = load(store, import_id).await?;
@@ -1484,7 +1491,7 @@ mod tests {
 
     async fn undo(store: &MemoryStore, id: i64) -> (UndoReport, crate::test_dir::TestDir) {
         let backups = crate::test_dir::test_dir();
-        (undo_import(store, backups.path(), id, false).await.unwrap(), backups)
+        (undo_import(store, &RunningImports::default(), backups.path(), id, false).await.unwrap(), backups)
     }
 
     async fn id_of(store: &MemoryStore, content: &'static str) -> i64 {
@@ -1613,7 +1620,7 @@ mod tests {
         assert!(imported.subfolders[0].written);
         let id = imported.import_id.unwrap();
 
-        let dry = undo_import(&dst, crate::test_dir::test_dir().path(), id, true).await.unwrap();
+        let dry = undo_import(&dst, &RunningImports::default(), crate::test_dir::test_dir().path(), id, true).await.unwrap();
         assert_ne!(registry_state(&dst).await, before, "a dry run writes nothing");
         let (report, _) = undo(&dst, id).await;
 
@@ -1909,14 +1916,15 @@ mod tests {
     async fn an_unknown_or_running_import_is_refused() {
         let dst = destination().await;
         let backups = crate::test_dir::test_dir();
-        let err = undo_import(&dst, backups.path(), 99, false).await.unwrap_err();
+        let err = undo_import(&dst, &RunningImports::default(), backups.path(), 99, false).await.unwrap_err();
         assert!(matches!(err, UndoError::UnknownImport(99)), "{err}");
         sql(&dst, "INSERT INTO memory_import (import_id, started_at, source) VALUES (5, 0, 'clawg')".into()).await;
-        dst.importing.lock().unwrap().insert(5);
-        let err = undo_import(&dst, backups.path(), 5, false).await.unwrap_err();
+        let running = RunningImports::default();
+        running.hold(5);
+        let err = undo_import(&dst, &running, backups.path(), 5, false).await.unwrap_err();
         assert!(matches!(err, UndoError::Running(5)), "{err}");
-        dst.importing.lock().unwrap().clear();
-        assert!(undo_import(&dst, backups.path(), 5, false).await.is_ok(), "an import cut short is undone as any");
+        running.release(5);
+        assert!(undo_import(&dst, &running, backups.path(), 5, false).await.is_ok(), "an import cut short is undone as any");
     }
 
     #[tokio::test]
@@ -1929,7 +1937,7 @@ mod tests {
         sql(&dst, format!("UPDATE memory SET update_count = update_count + 1 WHERE id = {kept}")).await;
         let before = state(&dst).await;
         let backups = crate::test_dir::test_dir();
-        let dry = undo_import(&dst, backups.path(), id, true).await.unwrap();
+        let dry = undo_import(&dst, &RunningImports::default(), backups.path(), id, true).await.unwrap();
         assert_eq!(state(&dst).await, before);
         assert_eq!(std::fs::read_dir(backups.path()).unwrap().count(), 0);
         let (real, _) = undo(&dst, id).await;

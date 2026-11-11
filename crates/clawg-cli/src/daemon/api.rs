@@ -2356,6 +2356,7 @@ async fn import_memories(
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
     let imported = portability::import_parsed(
         store,
+        &app.runtime.imports,
         embedder.as_deref(),
         chunker,
         &backups,
@@ -2556,6 +2557,7 @@ async fn import_as_job(app: &AppCtx, id: u64, mut job: Job) -> End {
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
     let imported = portability::import_parsed(
         &app.runtime.store,
+        &app.runtime.imports,
         job.embedder.as_deref(),
         chunker,
         &backups,
@@ -2618,7 +2620,7 @@ async fn undo_import(
     Json(body): Json<UndoImportRequest>,
 ) -> ApiResult<Json<UndoReport>> {
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-    match portability::undo_import(&app.runtime.store, &backups, body.import_id, body.dry_run).await {
+    match portability::undo_import(&app.runtime.store, &app.runtime.imports, &backups, body.import_id, body.dry_run).await {
         Ok(report) => Ok(Json(report)),
         Err(e @ UndoError::UnknownImport(_)) => Err(ApiError::not_found(e.to_string())),
         Err(e @ UndoError::Running(_)) => Err(ApiError::conflict(e.to_string())),
@@ -3702,7 +3704,7 @@ mod tests {
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import WHERE finished_at IS NULL").await, 1, "the journal stays open");
 
         let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-        let undone = portability::undo_import(&app.runtime.store, &backups, job["import_id"].as_i64().unwrap(), false).await;
+        let undone = portability::undo_import(&app.runtime.store, &app.runtime.imports, &backups, job["import_id"].as_i64().unwrap(), false).await;
         assert!(undone.is_ok(), "its number is free: {:?}", undone.err());
     }
 
@@ -3727,7 +3729,7 @@ mod tests {
         let import_id = stopped["import_id"].as_i64().expect("a number");
 
         let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-        let undone = portability::undo_import(&app.runtime.store, &backups, import_id, false).await.expect("an undo, not a refusal to touch a running import");
+        let undone = portability::undo_import(&app.runtime.store, &app.runtime.imports, &backups, import_id, false).await.expect("an undo, not a refusal to touch a running import");
 
         assert_eq!(undone.removed.len(), WRITE_BATCH);
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, 0);

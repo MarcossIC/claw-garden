@@ -52,6 +52,7 @@ use crate::memory::subfolder::declared_in;
 use crate::memory::language;
 use crate::memory::portability::foreign::ForeignExport;
 use crate::memory::portability::control::{ImportControl, StopCause};
+use crate::memory::portability::RunningImports;
 #[cfg(test)]
 use crate::memory::portability::format::parse;
 use crate::memory::portability::format::{ConflictLine, FormatError, Invalid, MemoryLine, Parsed, PieceLine};
@@ -949,22 +950,22 @@ struct Journal {
     /// The rows it inserted: what it writes in them goes with them, so only
     /// what it writes in other rows is an extra.
     inserted: HashSet<i64>,
-    /// The store's imports in progress, which hold this one's number until
+    /// The process's imports in progress, which hold this one's number until
     /// the journal is dropped.
-    running: Arc<std::sync::Mutex<HashSet<i64>>>,
+    running: RunningImports,
     /// The deleted projects a live row it inserted brought back.
     revived: BTreeSet<String>,
 }
 
 impl Journal {
-    fn new(store: &MemoryStore, source: &'static str, started_at: i64, snapshot: Option<String>) -> Self {
+    fn new(running: &RunningImports, source: &'static str, started_at: i64, snapshot: Option<String>) -> Self {
         Journal {
             id: None,
             source,
             started_at,
             snapshot,
             inserted: HashSet::new(),
-            running: store.importing.clone(),
+            running: running.clone(),
             revived: BTreeSet::new(),
         }
     }
@@ -978,7 +979,7 @@ impl Journal {
             "INSERT INTO memory_import (import_id, started_at, source, snapshot) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![id, self.started_at, self.source, self.snapshot],
         )?;
-        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+        self.running.hold(id);
         self.id = Some(id);
         Ok(id)
     }
@@ -1022,7 +1023,7 @@ impl Journal {
 impl Drop for Journal {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            self.running.release(id);
         }
     }
 }
@@ -2073,7 +2074,7 @@ pub async fn import(
 ) -> Result<ImportReport, ImportError> {
     let (_, parsed) = parse(text)?;
     let input = ImportInput::Clawg(parsed);
-    finished(import_parsed(store, embedder, chunker, backups, input, options, ground, timings, &ImportControl::default()).await?)
+    finished(import_parsed(store, &RunningImports::default(), embedder, chunker, backups, input, options, ground, timings, &ImportControl::default()).await?)
 }
 
 /// The report of an import nobody can stop.
@@ -2154,6 +2155,7 @@ fn stopped_after(control: &ImportControl, step: Step) -> Result<(), Cut> {
 #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 pub async fn import_parsed(
     store: &MemoryStore,
+    running: &RunningImports,
     embedder: Option<&dyn Embedder>,
     chunker: Arc<ChatChunker>,
     backups: &Path,
@@ -2169,7 +2171,7 @@ pub async fn import_parsed(
                 Ok(prepared) => prepared,
                 Err(cut) => return cut.into_result(),
             };
-            let written = match write(store, embedder, &chunker, backups, &prepared, options.dry_run, "clawg", timings, control).await {
+            let written = match write(store, running, embedder, &chunker, backups, &prepared, options.dry_run, "clawg", timings, control).await {
                 Ok(written) => written,
                 Err(cut) => return cut.into_result(),
             };
@@ -2181,7 +2183,7 @@ pub async fn import_parsed(
                 Ok(prepared) => prepared,
                 Err(cut) => return cut.into_result(),
             };
-            let written = match write(store, embedder, &chunker, backups, &prepared, options.dry_run, source, timings, control).await {
+            let written = match write(store, running, embedder, &chunker, backups, &prepared, options.dry_run, source, timings, control).await {
                 Ok(written) => written,
                 Err(cut) => return cut.into_result(),
             };
@@ -2243,7 +2245,7 @@ pub async fn import_foreign(
     ground: Arc<dyn Ground>,
     timings: &mut ImportTimings,
 ) -> Result<ImportReport, ImportError> {
-    finished(import_parsed(store, embedder, chunker, backups, ImportInput::Foreign(export), options, ground, timings, &ImportControl::default()).await?)
+    finished(import_parsed(store, &RunningImports::default(), embedder, chunker, backups, ImportInput::Foreign(export), options, ground, timings, &ImportControl::default()).await?)
 }
 
 /// Another tool's export translated into rows, with what the translation
@@ -2365,6 +2367,7 @@ struct Written {
 #[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn write(
     store: &MemoryStore,
+    running: &RunningImports,
     embedder: Option<&dyn Embedder>,
     chunker: &Arc<ChatChunker>,
     backups: &Path,
@@ -2434,7 +2437,7 @@ async fn write(
     let mut ledger = Ledger::default();
     // A transaction a cut leaves unwritten journals nothing, and the number
     // is the first write's, so an import that adds nothing has none.
-    let mut journal = Journal::new(store, source, now, Some(snapshot.clone()));
+    let mut journal = Journal::new(running, source, now, Some(snapshot.clone()));
     let units = prepared.units();
     let mut batches = note_batches(&units, WRITE_BATCH);
     if batches.is_empty() {
@@ -2958,9 +2961,16 @@ pub(crate) mod tests {
         let pairs = dump(&dst, EVERYTHING).await.conflicts.len();
         assert_eq!(extras, BTreeMap::from([("pair".to_owned(), pairs), ("project".to_owned(), 2)]), "the links of its own rows go with them");
 
-        let (foreign, _) = run_foreign(&dst, sample_notes(), ImportOptions::default()).await;
+        let running = RunningImports::default();
+        let backups = crate::test_dir::test_dir();
+        let input = ImportInput::Foreign(foreign_export(sample_notes()));
+        let chunker = Arc::new(ChatChunker::with_fallback());
+        let imported = import_parsed(&dst, &running, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &ImportControl::default())
+            .await
+            .unwrap();
+        let foreign = finished(imported).unwrap();
         assert_eq!(foreign.import_id, Some(2));
-        assert!(dst.importing.lock().unwrap().is_empty(), "an import lets its number go once it ends");
+        assert!(running.is_empty(), "an import lets its number go once it ends");
         let (header, rows, _) = journal_of(&dst, 2).await;
         assert_eq!(header.map(|h| h.0), Some("engram".to_owned()));
         assert_eq!(rows.len(), foreign.inserted);
@@ -4921,7 +4931,7 @@ pub(crate) mod tests {
             .conn
             .call(move |c| -> rusqlite::Result<Ledger> {
                 let tx = c.transaction()?;
-                let mut journal = Journal { id: None, source: "clawg", started_at: 0, snapshot: None, inserted: HashSet::new(), running: Arc::default(), revived: BTreeSet::new() };
+                let mut journal = Journal { id: None, source: "clawg", started_at: 0, snapshot: None, inserted: HashSet::new(), running: RunningImports::default(), revived: BTreeSet::new() };
                 let mut ledger = Ledger { taken: record_projects(&tx, &prepared, 0, &mut journal)?, ..Default::default() };
                 place_rows(&mut SqlSeat(&tx, &mut journal), &prepared, 0..prepared.rows.len(), &mut ledger, &HashMap::new(), false)?;
                 write_links(&mut SqlSeat(&tx, &mut journal), &prepared, &mut ledger)?;
@@ -5597,7 +5607,7 @@ pub(crate) mod tests {
         let backups = crate::test_dir::test_dir();
         let control = ImportControl::default();
         let chunker = Arc::new(ChatChunker::with_fallback());
-        let Imported::Done(report) = import_parsed(store, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
+        let Imported::Done(report) = import_parsed(store, &RunningImports::default(), Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
             .await
             .unwrap()
         else {
@@ -5666,6 +5676,12 @@ pub(crate) mod tests {
     /// `step`: its result, the store, the directory of its snapshots and its
     /// control.
     async fn cancelled_at(step: Step, input: ImportInput) -> (Imported, MemoryStore, crate::test_dir::TestDir, ImportControl) {
+        cancelled_holding(&RunningImports::default(), step, input).await
+    }
+
+    /// [`cancelled_at`] with the imports in progress the import writes its
+    /// number in.
+    async fn cancelled_holding(running: &RunningImports, step: Step, input: ImportInput) -> (Imported, MemoryStore, crate::test_dir::TestDir, ImportControl) {
         let store = MemoryStore::new_for_test().await.unwrap();
         let backups = crate::test_dir::test_dir();
         let control = ImportControl::default();
@@ -5676,7 +5692,7 @@ pub(crate) mod tests {
             }
         });
         let chunker = Arc::new(ChatChunker::with_fallback());
-        let imported = import_parsed(&store, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
+        let imported = import_parsed(&store, running, Some(&FakeEmbedder::default()), chunker, backups.path(), input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control)
             .await
             .unwrap();
         (imported, store, backups, control)
@@ -5740,7 +5756,8 @@ pub(crate) mod tests {
         let chunker = Arc::new(ChatChunker::with_fallback());
         let input = ImportInput::Clawg(parsed(&rows_file(3)));
         let (options, mut timings) = (ImportOptions::default(), ImportTimings::new(false));
-        let import = import_parsed(&store, Some(&embedder), chunker, backups.path(), input, &options, Arc::new(Disk), &mut timings, &control);
+        let running = RunningImports::default();
+        let import = import_parsed(&store, &running, Some(&embedder), chunker, backups.path(), input, &options, Arc::new(Disk), &mut timings, &control);
         let stop = async {
             gate.entered().await;
             control.stop(StopCause::Cancel);
@@ -5755,7 +5772,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_stop_between_write_batches_returns_the_committed_ledger() {
-        let (imported, store, _backups, control) = cancelled_at(Step::Write, ImportInput::Clawg(parsed(&rows_file(WRITE_BATCH + 1)))).await;
+        let running = RunningImports::default();
+        let (imported, store, _backups, control) = cancelled_holding(&running, Step::Write, ImportInput::Clawg(parsed(&rows_file(WRITE_BATCH + 1)))).await;
         let Imported::Stopped(stopped) = imported else { panic!("the write was not stopped") };
         assert_eq!((stopped.cause, stopped.step), (StopCause::Cancel, Step::Write));
         let report = stopped.report.expect("a batch was committed");
@@ -5774,7 +5792,7 @@ pub(crate) mod tests {
         assert_eq!((report.inserted, journaled), (WRITE_BATCH, WRITE_BATCH));
         assert_eq!(report.rows, WRITE_BATCH + 1, "the rows of the file, not the committed ones");
         assert!(report.import_id.is_some() && finished_at.is_none(), "the journal stays open for an undo");
-        assert!(store.importing.lock().unwrap().is_empty(), "a stopped import lets its number go");
+        assert!(running.is_empty(), "a stopped import lets its number go");
         assert_eq!(control.progress().counters.rows_written, WRITE_BATCH);
     }
 
@@ -5805,7 +5823,7 @@ pub(crate) mod tests {
             let (backups, input) = (backups.path().to_path_buf(), ImportInput::Clawg(parsed(&rows_file(WRITE_BATCH + 1))));
             async move {
                 let chunker = Arc::new(ChatChunker::with_fallback());
-                import_parsed(&store, Some(&FakeEmbedder::default()), chunker, &backups, input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control).await
+                import_parsed(&store, &RunningImports::default(), Some(&FakeEmbedder::default()), chunker, &backups, input, &ImportOptions::default(), Arc::new(Disk), &mut ImportTimings::new(false), &control).await
             }
         });
         while control.progress().step != Some(Step::Write) {

@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::memory::access::AccessTracker;
+use crate::memory::portability::RunningImports;
 use crate::memory::StorageError;
 use crate::memory::backup::Reason;
 use crate::memory::bootstrap::EmbedderStatus;
@@ -161,6 +162,9 @@ pub struct MemoryRuntime {
     /// the store's, so every clone of it measures into the same one. The
     /// daemon serves and keeps it beside its own series.
     pub metrics: Arc<Recorder>,
+    /// The imports this process is writing. An import and an undo take it
+    /// from here, so both see the same numbers whatever built the host.
+    pub imports: RunningImports,
 }
 
 impl MemoryRuntime {
@@ -200,6 +204,7 @@ impl MemoryRuntime {
                 tokenizer: Arc::new(OnceCell::new()),
                 access_tracker,
                 project_docs: Arc::default(),
+                imports: RunningImports::default(),
             },
             memory_rx,
         ))
@@ -450,6 +455,7 @@ impl MemoryRuntime {
                 tokenizer: Arc::new(OnceCell::new()),
                 access_tracker,
                 project_docs: Arc::default(),
+                imports: RunningImports::default(),
             },
             memory_rx,
         )
@@ -876,6 +882,7 @@ mod tests {
             access_tracker: _,
             project_docs: _,
             metrics: _,
+            imports: _,
         } = rt;
 
         let worker = tokio::spawn(ingest_worker_future(

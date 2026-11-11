@@ -191,9 +191,6 @@ pub struct MemoryStore {
     /// its agent reaches. The data directory; `None` for an in-memory store
     /// no runtime placed, which shares everything.
     sharing_dir: Option<PathBuf>,
-    /// The numbers of the imports this process is writing, shared with every
-    /// clone, which an undo refuses until they end.
-    pub(crate) importing: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
 }
 
 /// Bytes of WAL a checkpoint may leave on disk. A checkpoint rewinds the WAL
@@ -272,7 +269,6 @@ impl MemoryStore {
             _lock: Some(Arc::new(lock)),
             dir: Some(base_dir.to_path_buf()),
             sharing_dir: Some(base_dir.to_path_buf()),
-            importing: Arc::default(),
         })
     }
 
@@ -296,7 +292,6 @@ impl MemoryStore {
             _lock: None,
             dir: None,
             sharing_dir: None,
-            importing: Arc::default(),
         })
     }
 
@@ -2383,7 +2378,7 @@ mod tests {
         let backups = crate::paths::backups_dir(dir.path());
         assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1, "the pre-migration snapshot is the way back");
 
-        let undone = crate::memory::portability::undo::undo_import(&store, &backups, 1, false).await.unwrap();
+        let undone = crate::memory::portability::undo::undo_import(&store, &crate::memory::portability::RunningImports::default(), &backups, 1, false).await.unwrap();
         assert_eq!(undone.removed, vec![20, 21], "the rows it inserted go");
         assert_eq!(undone.restored, vec![10], "the row it replaced comes back");
         assert_eq!(undone.unfilled, vec![12], "the link it filled is emptied");

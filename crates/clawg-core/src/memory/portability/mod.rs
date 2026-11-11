@@ -14,6 +14,9 @@ pub mod timing;
 pub mod translate;
 pub mod undo;
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, MutexGuard};
+
 pub use control::{Counters, ImportControl, Progress, StopCause};
 pub use export::{export, Export, ExportError, ExportFilter};
 pub use import::{
@@ -23,6 +26,36 @@ pub use import::{
 pub use projects::By;
 pub use timing::ImportTimings;
 pub use undo::{undo_import, KeepReason, KeptEntry, KeptRow, RegistryKeep, RegistryUndo, UndoError, UndoReport};
+
+/// The imports this process is writing, by number: an undo refuses them until
+/// they end.
+#[derive(Debug, Clone, Default)]
+pub struct RunningImports(Arc<Mutex<HashSet<i64>>>);
+
+impl RunningImports {
+    /// The set, also after a thread panicked while holding it: a number is
+    /// inserted or removed whole, so what a panic leaves is still right.
+    fn numbers(&self) -> MutexGuard<'_, HashSet<i64>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn hold(&self, import_id: i64) {
+        self.numbers().insert(import_id);
+    }
+
+    pub(crate) fn release(&self, import_id: i64) {
+        self.numbers().remove(&import_id);
+    }
+
+    pub(crate) fn holds(&self, import_id: i64) -> bool {
+        self.numbers().contains(&import_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.numbers().is_empty()
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod fixtures {
