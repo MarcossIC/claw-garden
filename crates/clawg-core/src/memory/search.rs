@@ -253,9 +253,9 @@ fn serialize_f32_query(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Public test helper — exposes serialize_f32_query for cross-module test use.
-#[cfg(any(test, feature = "testing"))]
-pub fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
+/// Exposes serialize_f32_query to the tests of other modules.
+#[cfg(test)]
+pub(crate) fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
     serialize_f32_query(v)
 }
 

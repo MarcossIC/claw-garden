@@ -192,6 +192,89 @@ fn a_test_module_in_another_file_does_not_end_the_production_code() {
     assert_eq!(production_lines_naming(&source.replace('\n', "\r\n"), reaches_the_connection), [4]);
 }
 
+/// Whether `source` names the module `module` of `clawg_core::memory`: in a
+/// path `clawg_core::memory::<module>` that goes on or ends there, or as the
+/// start of a path inside a group `clawg_core::memory::{…}`.
+fn names_memory_module(source: &str, module: &str) -> bool {
+    const ROOT: &str = "clawg_core::memory::";
+    source.match_indices(ROOT).any(|(at, _)| {
+        let rest = &source[at + ROOT.len()..];
+        match rest.strip_prefix('{') {
+            Some(group) => top_level_paths(group).iter().any(|path| starts_with_segment(path, module)),
+            None => rest.strip_prefix(module).is_some_and(|after| after.starts_with("::") || after.starts_with([';', ',', '}'])),
+        }
+    })
+}
+
+/// The paths of a `use` group whose text after its `{` is `group`, each
+/// trimmed, a nested group kept inside its path.
+fn top_level_paths(group: &str) -> Vec<&str> {
+    let (mut depth, mut from, mut paths) = (0usize, 0, Vec::new());
+    for (at, c) in group.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' if depth == 0 => {
+                paths.push(group[from..at].trim());
+                return paths;
+            }
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                paths.push(group[from..at].trim());
+                from = at + 1;
+            }
+            _ => {}
+        }
+    }
+    paths
+}
+
+fn starts_with_segment(path: &str, segment: &str) -> bool {
+    path.strip_prefix(segment).is_some_and(|after| after.is_empty() || after.starts_with("::") || after.starts_with(' '))
+}
+
+#[test]
+fn names_memory_module_reads_paths_and_groups() {
+    for naming in [
+        "use clawg_core::memory::registry::find_project;",
+        "use clawg_core::memory::registry;",
+        "let n = clawg_core::memory::registry::own_folder_count(store, id).await?;",
+        "use clawg_core::memory::{clock::TimestampMs, registry::{self, Project}, MemoryStore};",
+        "use clawg_core::memory::{\n    events::MemoryEvent,\n    registry,\n};",
+    ] {
+        assert!(names_memory_module(naming, "registry"), "{naming}");
+    }
+    for other in [
+        "use clawg_core::memory::registry_of_something::Thing;",
+        "use clawg_core::memory::{MemoryStore, RankedHit};",
+        "use clawg_core::memory::{project::{registry, Other}};",
+        "use clawg_core::memory::MemoryStore; // the registry",
+    ] {
+        assert!(!names_memory_module(other, "registry"), "{other}");
+    }
+}
+
+/// What `clawg_core::memory` shows is what the other crates use: a module
+/// none of them names is the core's own, and `pub(crate)` lets the compiler
+/// say what in it nothing calls.
+#[test]
+fn every_public_memory_module_is_named_outside_core() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
+    let mut files = Vec::new();
+    for used_from in ["clawg-cli/src", "clawg-cli/tests", "clawg-eval/src", "clawg-core/tests"] {
+        rust_files(&crates.join(used_from), &mut files);
+    }
+    let outside: Vec<String> =
+        files.iter().map(|file| fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()))).collect();
+    assert!(!outside.is_empty(), "no sources found under {}", crates.display());
+
+    let root = read_repo_file("crates/clawg-core/src/memory/mod.rs");
+    let public: Vec<&str> = root.lines().filter_map(|line| line.strip_prefix("pub mod ")?.strip_suffix(';')).collect();
+    assert!(!public.is_empty(), "memory/mod.rs declares no public module");
+
+    let unnamed: Vec<&str> = public.into_iter().filter(|module| !outside.iter().any(|source| names_memory_module(source, module))).collect();
+    assert!(unnamed.is_empty(), "no other crate names these modules of clawg_core::memory, so they are `pub(crate) mod`: {unnamed:?}");
+}
+
 /// A Windows checkout has CRLF line ends.
 #[test]
 fn the_production_code_ends_at_the_test_module_with_either_line_end() {

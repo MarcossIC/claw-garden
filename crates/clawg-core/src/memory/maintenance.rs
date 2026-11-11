@@ -367,6 +367,7 @@ const REEMBED_BATCH: i64 = 200;
 struct ReembedRow {
     id: i64,
     text: String,
+    #[cfg(test)]
     existing: Vec<u8>,
 }
 
@@ -390,6 +391,8 @@ struct ReembedRow {
 /// that were skipped get done, and the contract flips only once the table
 /// comes back clean.
 pub enum ReembedMode {
+    /// Only the tests run it: no command asks for a renormalization.
+    #[cfg(test)]
     Normalize,
     ReInfer(ReInferPlan),
 }
@@ -465,6 +468,7 @@ pub async fn reembed_all(store: &MemoryStore, mode: ReembedMode) -> ReembedRepor
     let memory = reembed_table(store, &mode).await;
 
     let contract_updated = match &mode {
+        #[cfg(test)]
         ReembedMode::Normalize => false,
         ReembedMode::ReInfer(plan) => {
             if memory.failed > 0 || memory.aborted {
@@ -564,6 +568,7 @@ async fn reembed_table(store: &MemoryStore, mode: &ReembedMode) -> TableOutcome 
 /// inference, only on a corrupt stored blob.
 async fn compute_new_embedding(mode: &ReembedMode, row: &ReembedRow) -> Result<Vec<f32>, String> {
     match mode {
+        #[cfg(test)]
         ReembedMode::Normalize => {
             let existing = deserialize_f32_vec(&row.existing);
             to_unit(&existing).map_err(|e| e.to_string())
@@ -608,10 +613,14 @@ async fn select_reembed_batch(
                 .query_map(rusqlite::params![after_id, limit], |r| {
                     let id: i64 = r.get(0)?;
                     let content: String = r.get(1)?;
-                    let existing: Vec<u8> = r.get(2)?;
                     let context: Option<String> = r.get(3)?;
                     let text = embedding_text(context.as_deref().unwrap_or(""), &content).into_owned();
-                    Ok(ReembedRow { id, text, existing })
+                    Ok(ReembedRow {
+                        id,
+                        text,
+                        #[cfg(test)]
+                        existing: r.get(2)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
@@ -691,6 +700,7 @@ fn serialize_f32_vec(v: &[f32]) -> Vec<u8> {
 }
 
 /// Inverse of [`serialize_f32_vec`].
+#[cfg(test)]
 fn deserialize_f32_vec(bytes: &[u8]) -> Vec<f32> {
     bytes.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect()
 }

@@ -11,11 +11,13 @@
 //! the same gate `MemoryStore::new_for_test` itself carries.
 
 use clawg_core::memory::clock::TimestampMs;
+#[cfg(feature = "testing")]
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::{
     search_all_memories, MemoryError, MemoryStore, RankedHit, SearchScope,
 };
+#[cfg(feature = "testing")]
 use clawg_core::models::chat::Role;
 use clawg_core::runtime::MemoryRuntime;
 
@@ -85,6 +87,7 @@ fn ranked_hit_serializes_to_json() {
 
 // ── explicit memories are constructible from outside the crate ────────────
 
+#[cfg(feature = "testing")]
 fn explicit_event(content: &str, memory_type: Option<&str>, importance: Option<f64>) -> MemoryEvent {
     MemoryEvent {
         agent_id: "agent-1".into(),
@@ -187,6 +190,7 @@ fn memory_error_tells_apart_what_another_crate_handles() {
 
 /// A plain tokio runtime, with no host framework, can open the store and get a
 /// usable handle set back.
+#[cfg(feature = "testing")]
 #[tokio::test]
 async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
     let tmp = tempfile::tempdir().expect("tempdir");

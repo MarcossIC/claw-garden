@@ -26,7 +26,7 @@
 pub mod backup;
 pub mod bootstrap;
 pub mod chunker;
-pub mod conn_probe;
+pub(crate) mod conn_probe;
 pub mod db;
 pub mod embedder;
 pub mod events;
@@ -34,11 +34,11 @@ pub mod idle_embedder;
 pub mod store_insert;
 pub mod store_lock;
 pub mod worker;
-pub mod error;
+pub(crate) mod error;
 pub mod identity;
 pub mod language;
 pub mod merge;
-pub mod migrations;
+pub(crate) mod migrations;
 pub mod outbox;
 pub mod portability;
 pub(crate) mod pieces;
@@ -46,8 +46,8 @@ pub mod project;
 pub mod project_delete;
 pub mod project_docs;
 pub mod provenance;
-pub mod model_download;
-pub mod record;
+pub(crate) mod model_download;
+pub(crate) mod record;
 pub mod redact;
 pub mod registry;
 pub mod relocate;
@@ -68,20 +68,26 @@ pub use record::{MemoryRecord, MemoryRow};
 /// mirrors how [`MemoryStore`] is already re-exported out of `db`.
 pub use pieces::{read_save_core, SaveText};
 pub use search::{search_all_memories, PiecePosition, RankedHit, SearchScope};
+/// No other crate names it: `rag-eval` reads the pool through `eval_api`. It
+/// stays public so that its fields count as read in a build without `eval`.
+/// Private to the crate, that build would have to stop filling it, and a
+/// search would count its pool under test and not in a release.
+pub use search::MemoryPool;
 
 pub mod clock;
 pub(crate) mod latency;
-pub mod access;
+pub(crate) mod access;
 pub(crate) mod score;
 pub(crate) mod tier;
 pub(crate) mod dedup;
-pub mod search;
+pub(crate) mod search;
 pub mod workspace;
 pub mod prompt_builder;
 pub(crate) mod contradiction;
 pub mod spill;
-pub mod maintenance;
-pub mod query_context;
+pub(crate) mod maintenance;
+#[cfg(any(test, feature = "eval"))]
+pub(crate) mod query_context;
 pub mod vector;
 pub mod admin;
 pub mod dispute;
