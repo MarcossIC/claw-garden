@@ -37,7 +37,7 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 
 ## En la nube mientras corre el piloto
 
-[session-usage](changes/archive/2026-11-11-session-usage/proposal.md) (121), partes A, B, C y D, archivado el 2026-11-11, sale en 0.81.0 ([verify](changes/archive/2026-11-11-session-usage/verify.md)). Va ahora y no después del corte porque mide: lo que entre en una versión al empezar la semana deja contadas las sesiones del piloto. El conteo dice cuántas sesiones buscan, cuántas guardan, cuántas cierran con resumen y cuántas compactan, el dato que agent-eval y la parte B de session-lifecycle esperan para decidir. No toca `memory.db`, así que subir una versión durante el piloto no arriesga las memorias. La parte D entra en la misma versión: quien ya corrió `setup` lo corre otra vez para tener el hook de cierre. Lo que sólo se ve con los clientes del piloto pasó al párrafo del piloto.
+[session-usage](changes/archive/2026-11-11-session-usage/proposal.md) (121), partes A, B, C y D, archivado el 2026-11-11, sale en 0.81.0 ([verify](changes/archive/2026-11-11-session-usage/verify.md)). Va ahora y no después del corte porque mide: lo que entre en una versión al empezar la semana deja contadas las sesiones del piloto. El conteo dice cuántas sesiones buscan, cuántas guardan, cuántas cierran con resumen y cuántas compactan, el dato que agent-eval y la parte B de session-lifecycle esperan para decidir. No toca `memory.db`, así que subir una versión durante el piloto no arriesga las memorias. La parte D entra en la misma versión: quien ya corrió `setup` lo corre otra vez para tener el hook de cierre. Lo que sólo se ve con los clientes del piloto pasó al párrafo del piloto. [store-boundary](changes/store-boundary/proposal.md) (104) se implementa en la nube durante el piloto, ahora que session-usage, el otro cambio que tocaba `crates/clawg-cli/src/daemon/api.rs`, está en `develop`. Su PR espera al corte, así que no entra en ninguna versión del piloto.
 
 ## Corte (una noche local, con el piloto aprobado)
 
@@ -64,7 +64,7 @@ Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y despué
 
 ## Después del corte (no bloquean)
 
-**Arquitectura, en este orden, porque cada paso abarata el siguiente:** store-boundary, memory-module-layout, core-use-cases, domain-types, storage-read-side, storage-write-side, y después search-index-ports y storage-ports, que tienen puerta: sin un candidato o una pregunta concreta, cierran sin código.
+**Arquitectura, en este orden, porque cada paso abarata el siguiente:** store-boundary, que se implementa durante el piloto, entra con el corte, y la cadena sigue con memory-module-layout, core-use-cases, domain-types, storage-read-side, storage-write-side, y después search-index-ports y storage-ports, que tienen puerta: sin un candidato o una pregunta concreta, cierran sin código.
 
 **Modelo y memoria del proceso:** tokenizer-footprint, embedder-bakeoff y model-reembed, que sólo sube si un modelo candidato pasa su umbral.
 
