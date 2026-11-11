@@ -19,7 +19,7 @@ use crate::memory::sharing::Reader;
 use crate::memory::MemoryStore;
 
 /// Longest key accepted, in characters.
-pub const MAX_TOPIC_KEY_LEN: usize = 80;
+pub(crate) const MAX_TOPIC_KEY_LEN: usize = 80;
 
 /// Why a `topic_key` is refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

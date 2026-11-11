@@ -33,7 +33,7 @@ use crate::memory::{MemoryError, MemoryStore};
 ///
 /// All three counts can be non-zero: the KNN pool scans every tier, so `t1`
 /// reports how much of the hottest tier the query actually pulled in.
-pub fn format_tier_distribution(hits: &[RankedHit]) -> String {
+pub(crate) fn format_tier_distribution(hits: &[RankedHit]) -> String {
     let (mut t1, mut t2, mut t3) = (0u32, 0u32, 0u32);
     for h in hits {
         match h.tier {
@@ -49,7 +49,7 @@ pub fn format_tier_distribution(hits: &[RankedHit]) -> String {
 /// Renders whether tier-1 workspace content was present alongside the
 /// retrieval hit count — the real measure of the "Tier 1 covers 80%"
 /// criterion (neither signal alone can answer it).
-pub fn format_tier1_coverage(workspace_present: bool, hit_count: usize) -> String {
+pub(crate) fn format_tier1_coverage(workspace_present: bool, hit_count: usize) -> String {
     format!("tier1_present={workspace_present} tier23_hits={hit_count}")
 }
 
@@ -68,7 +68,7 @@ pub fn format_tier1_coverage(workspace_present: bool, hit_count: usize) -> Strin
 /// moves under the ratio and a rescued query reads as the worst one in the
 /// log. `retried` carries that fact separately, so a line with no marker
 /// means the pool needed none.
-pub fn format_pool_survival(requested: usize, returned: usize, retried: bool) -> String {
+pub(crate) fn format_pool_survival(requested: usize, returned: usize, retried: bool) -> String {
     let base = format!("pool_req={requested} pool_ret={returned}");
     if retried {
         format!("{base} retry")
@@ -83,7 +83,7 @@ pub fn format_pool_survival(requested: usize, returned: usize, retried: bool) ->
 /// — so it proves the lexical channel FIRED, never that what it found
 /// survived the final `k_final` truncation; only a measured eval delta can
 /// show that.
-pub fn format_channel_attribution(dense: usize, lexical_only: usize) -> String {
+pub(crate) fn format_channel_attribution(dense: usize, lexical_only: usize) -> String {
     format!("chan=(dense={dense},lex_only={lexical_only})")
 }
 
