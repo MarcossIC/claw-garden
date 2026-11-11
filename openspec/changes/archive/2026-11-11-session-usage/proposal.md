@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| transversal (medir el uso real por sesión, proyecto y agente) | M, por partes | —; se coordina con la parte A de [session-lifecycle](../session-lifecycle/exploration.md) | ver [`state.yaml`](state.yaml) |
+| transversal (medir el uso real por sesión, proyecto y agente) | M, por partes | —; se coordina con la parte A de [session-lifecycle](../../session-lifecycle/exploration.md) | ver [`state.yaml`](state.yaml) |
 
 ## Problema
 
@@ -11,14 +11,14 @@ Detalle y evidencia en la [exploración](exploration.md), verificado otra vez co
 - **Una sesión es un id en un mapa en memoria.** `SessionRegistry` guarda la última sesión de cada agente y proyecto (`crates/clawg-cli/src/daemon/sessions.rs:33-35`) y nada más: ni comienzo, ni fin, ni contador. Se pierde al reiniciar el daemon (`:6-7`).
 - **El id lo traen sólo los hooks, y sin decir qué pasó.** `session-start` y `user-prompt-submit` mandan el mismo cuerpo a `POST /v1/sessions` (`crates/clawg-cli/src/hook.rs:447-451`; `SessionRequest`, `crates/clawg-cli/src/daemon/api.rs:407-412`): agente, proyecto e id. El daemon no distingue un arranque de un prompt.
 - **El daemon no sabe qué herramienta se llamó.** Cada herramienta del puente pasa por `ClawgMcp::call` (`crates/clawg-cli/src/mcp/server.rs:747`) y llega como peticiones HTTP sin su nombre. Una herramienta hace varias peticiones, y varias herramientas comparten ruta.
-- **`metrics.db` mide el daemon.** Sus series se etiquetan por ruta, método y estado, y su spec prohíbe ids y deja fuera la etiqueta de agente ([`specs/metrics`](../../specs/metrics/spec.md), «Invariantes» y «Límites conocidos»). `clawg metrics report` no agrupa por proyecto, agente ni sesión (`crates/clawg-cli/src/metrics.rs:16`).
+- **`metrics.db` mide el daemon.** Sus series se etiquetan por ruta, método y estado, y su spec prohíbe ids y deja fuera la etiqueta de agente ([`specs/metrics`](../../../specs/metrics/spec.md), «Invariantes» y «Límites conocidos»). `clawg metrics report` no agrupa por proyecto, agente ni sesión (`crates/clawg-cli/src/metrics.rs:16`).
 - **Ningún hook ve el fin.** `setup` instala `SessionStart` y `UserPromptSubmit` en Claude Code (`crates/clawg-cli/src/setup.rs:51`) y `sessionStart` en Cursor (`crates/clawg-cli/src/setup/cursor.rs:31`); `HookEvent` no tiene más variantes (`crates/clawg-cli/src/cli.rs:915-918`).
 
 Con esto no se puede contestar cuánto se usa clawg: cuántas sesiones hay por proyecto, cuánto duran, cuántas veces llaman, cuántas guardan y cuántas cierran con resumen. Una sesión que llama 40 veces y no guarda nada no deja ninguna fila en `memory`.
 
 ## Objetivo que sirve
 
-Transversal. Sirve a 1, 2 y 4 porque dice qué sesiones buscan, guardan y cierran con resumen, por proyecto y por agente, en uso real y no sólo en las corridas controladas de [agent-eval](../agent-eval/proposal.md).
+Transversal. Sirve a 1, 2 y 4 porque dice qué sesiones buscan, guardan y cierran con resumen, por proyecto y por agente, en uso real y no sólo en las corridas controladas de [agent-eval](../../agent-eval/proposal.md).
 
 ## Decisiones
 

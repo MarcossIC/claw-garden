@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 2 (separar las memorias por proyecto y también usarlas entre proyectos) | M–L, por partes (A es M; B y D son S; C es M; E es S y opcional; F se pospone) | —; se coordina con [knn-prefilter](../knn-prefilter/exploration.md) (37), porque leer a los hermanos cambia qué fracción de la ventana de vec0 se admite, y con [session-usage](../session-usage/exploration.md) (121), que podría reportar por grupo | exploración (borrador) |
+| 2 (separar las memorias por proyecto y también usarlas entre proyectos) | M–L, por partes (A es M; B y D son S; C es M; E es S y opcional; F se pospone) | —; se coordina con [knn-prefilter](../knn-prefilter/exploration.md) (37), porque leer a los hermanos cambia qué fracción de la ventana de vec0 se admite, y con [session-usage](../archive/2026-11-11-session-usage/exploration.md) (121), que podría reportar por grupo | exploración (borrador) |
 
 **Tesis.** Una memoria de clawg tiene hoy dos alcances: un proyecto, o todos. No hay nada en el medio. Quien trabaja en diez repositorios de una misma empresa no puede guardar «en esta empresa los servicios se despliegan así» sin que esa fila aparezca también en sus proyectos personales y en los de otro cliente, y desde el repositorio `web` no llega a lo que se aprendió en `api` salvo buscando en todo. Lo que falta es una relación declarada y guardada entre proyectos: un **grupo** (la empresa, un producto, un área) que tiene proyectos y otros grupos adentro, que puede tener memorias propias, y que le dice a cada búsqueda qué proyectos son parientes. El alcance de lectura de varios proyectos a la vez ya existe; lo que no existe es dónde declararlo.
 
