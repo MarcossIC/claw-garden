@@ -45,9 +45,6 @@ pub fn shared_note(lang: Lang) -> &'static str {
     }
 }
 
-/// Exposed for cross-module test assertions only.
-#[cfg(any(test, feature = "testing"))]
-pub const SEP_WORKSPACE_TEST: &str = SEP_WORKSPACE;
 #[cfg(test)]
 pub(crate) const SEP_RECENT_TEST: &str = SEP_RECENT;
 #[cfg(test)]
