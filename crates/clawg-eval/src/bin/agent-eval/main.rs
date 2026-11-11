@@ -224,6 +224,7 @@ fn now_ms() -> i64 {
 
 fn list_tasks(data: &Path) -> Result<(), String> {
     let tasks = task::load(data).map_err(|e| e.to_string())?;
+    let noise = task::load_noise(data, &tasks).map_err(|e| e.to_string())?;
     let mut leaks = Vec::new();
     for t in &tasks {
         let mut files = Vec::new();
@@ -240,6 +241,7 @@ fn list_tasks(data: &Path) -> Result<(), String> {
             if t.example { " example" } else { "" }
         );
     }
+    println!("noise rules={}", noise.len());
     if leaks.is_empty() {
         Ok(())
     } else {
@@ -262,12 +264,14 @@ fn read_files(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> std:
     Ok(())
 }
 
-fn load_task(args: &RunArgs) -> Result<task::Task, String> {
+/// The task of the run and the noise every arm with memory is seeded with.
+fn load_task(args: &RunArgs) -> Result<(task::Task, Vec<task::SeedMemory>), String> {
     let tasks = task::load(&args.data).map_err(|e| e.to_string())?;
-    task::find(tasks, &args.task).map_err(|e| e.to_string())
+    let noise = task::load_noise(&args.data, &tasks).map_err(|e| e.to_string())?;
+    Ok((task::find(tasks, &args.task).map_err(|e| e.to_string())?, noise))
 }
 
-fn prepare(args: &RunArgs, t: &task::Task, client: &Client) -> Result<Layout, String> {
+fn prepare(args: &RunArgs, t: &task::Task, noise: Vec<task::SeedMemory>, client: &Client) -> Result<Layout, String> {
     let layout = Layout { root: std::path::absolute(&args.out).map_err(|e| format!("{}: {e}", args.out.display()))? };
     let options = Options {
         clawg: args.clawg.clone(),
@@ -278,6 +282,7 @@ fn prepare(args: &RunArgs, t: &task::Task, client: &Client) -> Result<Layout, St
         max_budget_usd: args.max_budget_usd,
         claude_version: args.claude_version.clone(),
         now_ms: now_ms(),
+        noise,
     };
     run::prepare(t, args.arm, &task::fixture_dir(&args.data, t), &layout, &options, client).map_err(|e| e.to_string())?;
     Ok(layout)
@@ -297,7 +302,8 @@ fn execute(command: Command) -> Result<(), String> {
     match command {
         Command::Tasks { data } => list_tasks(&data),
         Command::Prepare(args) => {
-            let layout = prepare(&args, &load_task(&args)?, &Client::Claude)?;
+            let (t, noise) = load_task(&args)?;
+            let layout = prepare(&args, &t, noise, &Client::Claude)?;
             println!("prepared {}", layout.root.display());
             Ok(())
         }
@@ -310,11 +316,11 @@ fn execute(command: Command) -> Result<(), String> {
             if let (Client::Claude, Some(version)) = (&client, &args.claude_version) {
                 run::check_client_version(arm::CLIENT, version).map_err(|e| e.to_string())?;
             }
-            let t = load_task(&args)?;
+            let (t, noise) = load_task(&args)?;
             if client == Client::Claude {
                 run::check_paid_run(&args.out, &t).map_err(|e| e.to_string())?;
             }
-            let layout = prepare(&args, &t, &client)?;
+            let layout = prepare(&args, &t, noise, &client)?;
             let exe = std::env::current_exe().map_err(|e| format!("cannot locate agent-eval: {e}"))?;
             run::execute(&layout.root, &exe).map_err(|e| e.to_string())?;
             let result = run::score_dir(&layout.root).map_err(|e| e.to_string())?;

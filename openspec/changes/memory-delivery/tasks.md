@@ -4,8 +4,8 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla, por la 
 
 ## 1. Las reglas, lo que dijo la persona y el ruido (MD1, MD2, MD3)
 
-- [ ] RED: `a_task_reads_with_its_defaults`, `a_rule_reads_with_or_without_paths`, `a_rule_path_must_stay_inside`, `the_noise_is_rules_that_hold_no_tracer`, `a_data_directory_without_noise_has_none` (`task.rs`); `a_seeded_memory_the_person_stated_is_the_persons`, `the_seed_goes_from_the_newest_memory_to_the_oldest` (`seed.rs`); `every_arm_with_memory_seeds_the_noise_with_the_task` (`arm.rs`); el conteo del import y la línea del ruido en `tests/agent_eval.rs`.
-- [ ] GREEN: `SeedMemory::user_stated` y `SeedMemory::rule`, `task::load_noise`, `seed::seeded`, el ruido en `Options` y en `run.json`, `data/agent-tasks/noise.json` y las memorias de las seis tareas del piloto marcadas como reglas.
+- [x] RED: `a_task_reads_with_its_defaults`, `a_rule_reads_with_or_without_paths`, `a_rule_path_must_stay_inside`, `the_noise_is_rules_that_hold_no_tracer`, `a_data_directory_without_noise_has_none` (`task.rs`); `a_seeded_memory_the_person_stated_is_the_persons`, `the_seed_goes_from_the_newest_memory_to_the_oldest` (`seed.rs`); `every_arm_with_memory_seeds_the_noise_with_the_task` (`arm.rs`); el conteo del import y la línea del ruido en `tests/agent_eval.rs`.
+- [x] GREEN: `SeedMemory::user_stated` y `SeedMemory::rule`, `task::load_noise`, `seed::seeded`, el ruido en `Options`, `data/agent-tasks/noise.json`, las memorias de las seis tareas del piloto marcadas como reglas y lo escrito aquí en `data/agent-tasks/SOURCES.md`.
 - Commit: `feat(agent-eval): seed rules, memories the person stated and the noise of other topics`
 
 ## 2. Los brazos de reglas y los hooks del arnés (MD4, MD5)

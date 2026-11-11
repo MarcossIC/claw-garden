@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::seed;
-use crate::task::Task;
+use crate::task::{SeedMemory, Task};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm {
@@ -110,6 +110,8 @@ pub struct Options {
     /// The Claude Code version the run is pinned to; recorded, not planned.
     pub claude_version: Option<String>,
     pub now_ms: i64,
+    /// The rules of other topics every arm with memory is seeded with.
+    pub noise: Vec<SeedMemory>,
 }
 
 /// One program and its arguments.
@@ -170,6 +172,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
     let mut before = Vec::new();
     let mut after = Vec::new();
     let mut servers = serde_json::Map::new();
+    let memories = seed::seeded(&task.memories, &options.noise);
 
     if arm.has_clawg() {
         let state = State {
@@ -203,8 +206,8 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         if let Some(lang) = options.lang {
             files.push((clawg_core::paths::preferences_file(&data), Preferences { language: Some(lang) }.to_json()));
         }
-        if !task.memories.is_empty() {
-            files.push((layout.seed(), seed::export(&task.memories, setup::AGENT, &workdir, &task.fixture, options.now_ms)));
+        if !memories.is_empty() {
+            files.push((layout.seed(), seed::export(&memories, setup::AGENT, &workdir, &task.fixture, options.now_ms)));
             before.push(Step {
                 program: clawg.clone(),
                 args: ["import", "--from", "clawg", &text(&layout.seed())?, "--profile", options.profile.as_str()]
@@ -214,9 +217,9 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         }
         after.push(Step { program: clawg, args: ["stop", "--profile", options.profile.as_str()].map(String::from).to_vec() });
     }
-    if arm == Arm::A4 && !task.memories.is_empty() {
+    if arm == Arm::A4 && !memories.is_empty() {
         let dir = layout.config_dir().join("projects").join(seed::project_slug(&workdir)).join("memory");
-        files.push((dir.join("MEMORY.md"), seed::native_memory(&task.memories)));
+        files.push((dir.join("MEMORY.md"), seed::native_memory(&memories)));
     }
     files.push((layout.mcp_config(), serde_json::to_string_pretty(&json!({ "mcpServers": servers })).expect("JSON serializes") + "\n"));
 
@@ -303,7 +306,41 @@ mod tests {
             max_budget_usd: Some(1.5),
             claude_version: Some("2.1.300".into()),
             now_ms: 1_800_000_000_000,
+            noise: Vec::new(),
         }
+    }
+
+    fn noise_rule() -> crate::task::SeedMemory {
+        let task = parse(
+            r#"{"id": "n", "category": "N", "fixture": "f", "prompt": "p", "checks": [{"kind": "answer_contains", "text": "x"}],
+                "memories": [{"content": "Go errors are wrapped\nWrap returned errors with %w.", "age_days": 20, "rule": {"paths": ["**/*.go"]}}]}"#,
+        )
+        .unwrap();
+        task.memories[0].clone()
+    }
+
+    #[test]
+    fn every_arm_with_memory_seeds_the_noise_with_the_task() {
+        let mut opts = options(None);
+        opts.noise = vec![noise_rule()];
+        for arm in ARMS {
+            let plan = plan(&task(true), arm, &layout(), &opts).unwrap();
+            let (seed, native) = (file(&plan, "seed.jsonl"), file(&plan, "MEMORY.md"));
+            match arm {
+                Arm::A0 => assert!(seed.is_none() && native.is_none()),
+                Arm::A4 => {
+                    let native = native.unwrap();
+                    assert!(native.find("Go errors").unwrap() < native.find("48213").unwrap(), "the newer memory goes first:\n{native}");
+                }
+                _ => {
+                    let seed = seed.unwrap();
+                    assert!(seed.contains("Go errors") && seed.contains("48213"), "{}: {seed}", arm.as_str());
+                }
+            }
+        }
+        let plan = plan(&task(false), Arm::A3, &layout(), &opts).unwrap();
+        assert!(file(&plan, "seed.jsonl").unwrap().contains("Go errors"), "a task without memories seeds the noise");
+        assert_eq!(plan.before.len(), 1);
     }
 
     fn layout() -> Layout {

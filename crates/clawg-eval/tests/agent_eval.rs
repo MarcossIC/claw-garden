@@ -14,6 +14,17 @@ fn data() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("data").join("agent-tasks")
 }
 
+/// How many rules of other topics every arm with memory is seeded with.
+fn noise() -> usize {
+    let text = std::fs::read_to_string(data().join("noise.json")).unwrap();
+    serde_json::from_str::<Vec<Value>>(&text).unwrap().len()
+}
+
+/// What `clawg import` prints for a seed of `n` memories.
+fn imported(n: usize) -> String {
+    format!("imported {n} of {n} memories")
+}
+
 /// The `clawg` that `cargo test --workspace` builds beside `agent-eval`: a
 /// `testing` build, which reads `CLAWG_TEST_HOME` and `CLAWG_TEST_EMBEDDER`.
 fn clawg() -> &'static Path {
@@ -122,6 +133,8 @@ fn the_example_tasks_are_valid_and_leak_no_tracer() {
     let listed = stdout(&output);
     assert!(listed.contains("example-staging-port K1 fixture=example-tally memories=1 tracers=1 checks=1 example"), "{listed}");
     assert!(listed.contains("example-count-lines N"), "{listed}");
+    assert!(noise() > 0);
+    assert!(listed.contains(&format!("noise rules={}", noise())), "{listed}");
 }
 
 #[test]
@@ -147,7 +160,7 @@ fn a_replayed_session_with_clawg_finds_the_fact_and_succeeds() {
     assert!(!data.join("daemon.json").exists(), "clawg stop ended the daemon");
     let log = clawg_log(&run);
     let ready = log.find("\"embedder\": \"ready\"").unwrap_or_else(|| panic!("the run did not wait for the model:\n{log}"));
-    let imported = log.find("imported 1 of 1 memories").unwrap_or_else(|| panic!("the seed was not imported:\n{log}"));
+    let imported = log.find(&imported(noise() + 1)).unwrap_or_else(|| panic!("the seed and the noise were not imported:\n{log}"));
     assert!(ready < imported, "the seed went before the model was ready:\n{log}");
     assert!(log[imported..].contains(" stop --profile dev"), "{log}");
 }
@@ -176,7 +189,7 @@ fn a_replayed_edit_changes_the_working_directory_the_checks_read() {
     assert_eq!(r["saves"].as_array().unwrap().len(), 1);
     assert!(r["saves"][0]["marks"].as_array().unwrap().iter().all(|m| m[1] != "fail"), "{:#}", r["saves"][0]);
     let log = clawg_log(&run);
-    assert!(!log.contains(" import "), "a task without memories seeds nothing:\n{log}");
+    assert!(log.contains(&imported(noise())), "a task without memories seeds the noise:\n{log}");
     assert!(log.contains("\"embedder\": \"ready\""), "the session started before the model was ready:\n{log}");
     assert!(log.contains(" stop --profile dev"), "{log}");
     assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists());
@@ -208,7 +221,7 @@ fn a_client_that_fails_still_stops_the_daemon_of_its_run() {
     assert!(stderr(&output).contains("client.log"), "{}", stderr(&output));
     assert!(!run.join("escaped.txt").exists());
     let log = clawg_log(&run);
-    assert!(log.contains("imported 1 of 1 memories") && log.contains(" stop --profile dev"), "{log}");
+    assert!(log.contains(&imported(noise() + 1)) && log.contains(" stop --profile dev"), "{log}");
     assert!(!run.join("home").join(".clawg-dev").join("daemon.json").exists(), "clawg stop ended the daemon");
     assert!(!run.join("result.json").exists());
 }

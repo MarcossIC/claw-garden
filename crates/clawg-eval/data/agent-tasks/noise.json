@@ -1,0 +1,90 @@
+[
+  {
+    "content": "Commit messages follow conventional commits\nWrite every commit message as a conventional commit (feat:, fix:, docs:, chore:) with a lowercase summary of at most 72 characters.",
+    "memory_type": "user_preference",
+    "user_stated": true,
+    "age_days": 23,
+    "rule": {}
+  },
+  {
+    "content": "Explain a change by its effect first\nWhen describing a change, say what it changes for whoever uses the project before saying how the code does it.",
+    "memory_type": "user_preference",
+    "user_stated": true,
+    "age_days": 66,
+    "rule": {}
+  },
+  {
+    "content": "Timestamps are UTC\nEvery timestamp the project writes, in logs, files or APIs, is UTC in ISO 8601 with a trailing Z; local time is only for display.",
+    "memory_type": "architectural_decision",
+    "age_days": 134,
+    "rule": {}
+  },
+  {
+    "content": "Pull requests say how they were tested\nEvery pull request description ends with a Testing section naming the commands that were run.",
+    "age_days": 47,
+    "rule": {}
+  },
+  {
+    "content": "Python strings are formatted with f-strings\nFormat strings with f-strings, not with % or str.format, in every Python module.",
+    "memory_type": "user_preference",
+    "age_days": 31,
+    "rule": {"paths": ["**/*.py"]}
+  },
+  {
+    "content": "Markdown headings are in sentence case\nWrite Markdown headings in sentence case: only the first word and proper names start with a capital letter.",
+    "memory_type": "architectural_decision",
+    "age_days": 93,
+    "rule": {"paths": ["**/*.md"]}
+  },
+  {
+    "content": "TypeScript modules use named exports\nTypeScript modules export by name and never with export default, so that a rename is caught by the compiler.",
+    "memory_type": "architectural_decision",
+    "age_days": 55,
+    "rule": {"paths": ["**/*.ts", "**/*.tsx"]}
+  },
+  {
+    "content": "Go errors are wrapped with their operation\nWrap every returned error with fmt.Errorf and %w, naming the operation that failed.",
+    "age_days": 16,
+    "rule": {"paths": ["**/*.go"]}
+  },
+  {
+    "content": "Containers run as a non-root user\nEvery Dockerfile ends with a USER line naming a user other than root.",
+    "memory_type": "architectural_decision",
+    "age_days": 110,
+    "rule": {"paths": ["Dockerfile", "**/Dockerfile"]}
+  },
+  {
+    "content": "Database migrations are never edited\nA migration that reached the main branch is never changed; a fix goes in a new migration.",
+    "memory_type": "architectural_decision",
+    "age_days": 78,
+    "rule": {"paths": ["**/*.sql", "migrations/**"]}
+  },
+  {
+    "content": "CI workflows cancel outdated runs\nEvery GitHub Actions workflow sets a concurrency group with cancel-in-progress, so that a new push stops the run of the previous one.",
+    "age_days": 38,
+    "rule": {"paths": [".github/workflows/*.yml", ".github/workflows/*.yaml"]}
+  },
+  {
+    "content": "Rust library errors use thiserror\nErrors of a library crate are enums that derive thiserror::Error; unwrap and expect are only for tests.",
+    "memory_type": "user_preference",
+    "age_days": 12,
+    "rule": {"paths": ["**/*.rs"]}
+  },
+  {
+    "content": "Colors come from the design tokens\nStylesheets never write a raw hex color; they use the variables of tokens.css.",
+    "memory_type": "architectural_decision",
+    "age_days": 170,
+    "rule": {"paths": ["**/*.css", "**/*.scss"]}
+  },
+  {
+    "content": "Java services use constructor injection\nInject a dependency through the constructor, never with field injection.",
+    "age_days": 205,
+    "rule": {"paths": ["**/*.java"]}
+  },
+  {
+    "content": "Terraform keeps its state in the shared backend\nEvery Terraform root module declares the shared remote backend, and no state file is committed.",
+    "memory_type": "architectural_decision",
+    "age_days": 9,
+    "rule": {"paths": ["terraform/**", "**/*.tf"]}
+  }
+]

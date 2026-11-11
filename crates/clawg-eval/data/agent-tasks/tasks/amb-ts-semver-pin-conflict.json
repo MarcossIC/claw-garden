@@ -7,12 +7,14 @@
     {
       "content": "Version specifiers for internal packages\nAgreed, that is the lag. Decision: internal packages move to the compatible-release operator, so patch releases flow to a service on its next build without anyone editing a file or opening a pull request. Same minor series, patch level free. External dependencies keep their existing floor constraints; this changes only packages we publish ourselves.",
       "memory_type": "architectural_decision",
-      "age_days": 187
+      "age_days": 187,
+      "rule": {"paths": ["requirements*.txt"]}
     },
     {
       "content": "Version specifiers for internal packages\nAgreed. Decision: internal packages are pinned exactly in requirements.txt, == not >=, never a range. Pin corekit==1.2.4 now, and every internal package we add gets an exact pin the same way, so a breakage from an internal release can only reach us through an explicit version bump in this repo, not through a rebuild. Third-party ranges stay as they are.",
       "memory_type": "architectural_decision",
-      "age_days": 18
+      "age_days": 18,
+      "rule": {"paths": ["requirements*.txt"]}
     }
   ],
   "tracers": ["compatible-release operator", "never a range", "corekit==1.2.4"],

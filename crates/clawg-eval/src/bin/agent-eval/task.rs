@@ -59,7 +59,27 @@ pub struct SeedMemory {
     pub access_count: i64,
     #[serde(default)]
     pub topic_key: Option<String>,
+    /// The person said it, so the row is theirs and not an agent's.
+    #[serde(default)]
+    pub user_stated: bool,
+    /// The memory holds as a rule, which the arms that deliver rules hand
+    /// the agent without a search.
+    #[serde(default)]
+    pub rule: Option<Rule>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    /// Globs relative to the working directory: the rule holds when the agent
+    /// works on a file they match, and in every session when there are none.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// The rules of other topics, in the data directory, that every arm with
+/// memory is seeded with besides a task's memories: what a real store holds.
+pub const NOISE_FILE: &str = "noise.json";
 
 fn default_type() -> String {
     "semantic_fact".to_owned()
@@ -107,6 +127,8 @@ pub enum TaskError {
     Read { path: PathBuf, source: std::io::Error },
     #[error("{path} is not a task: {source}")]
     Json { path: PathBuf, source: serde_json::Error },
+    #[error("{path} is not a list of seeded memories: {source}")]
+    NoiseJson { path: PathBuf, source: serde_json::Error },
     #[error("{path}: {problems}")]
     Invalid { path: PathBuf, problems: String },
     #[error("two tasks have the id {0}")]
@@ -146,18 +168,7 @@ pub fn problems(task: &Task) -> Vec<String> {
         }
     }
     for (i, memory) in task.memories.iter().enumerate() {
-        if memory.content.trim().is_empty() {
-            out.push(format!("memory {} is empty", i + 1));
-        }
-        if !MEMORY_TYPES.contains(&memory.memory_type.as_str()) {
-            out.push(format!("memory {} has the unknown type {}", i + 1, memory.memory_type));
-        }
-        if !(0.0..=10.0).contains(&memory.importance) {
-            out.push(format!("memory {} has importance {} outside 0 to 10", i + 1, memory.importance));
-        }
-        if memory.access_count < 1 {
-            out.push(format!("memory {} has fewer than one access", i + 1));
-        }
+        out.extend(memory_problems(&format!("memory {}", i + 1), memory));
     }
     for tracer in &task.tracers {
         if tracer.trim().is_empty() {
@@ -169,6 +180,57 @@ pub fn problems(task: &Task) -> Vec<String> {
         }
     }
     out
+}
+
+/// What is wrong with the seeded memory `name` names.
+fn memory_problems(name: &str, memory: &SeedMemory) -> Vec<String> {
+    let mut out = Vec::new();
+    if memory.content.trim().is_empty() {
+        out.push(format!("{name} is empty"));
+    }
+    if !MEMORY_TYPES.contains(&memory.memory_type.as_str()) {
+        out.push(format!("{name} has the unknown type {}", memory.memory_type));
+    }
+    if !(0.0..=10.0).contains(&memory.importance) {
+        out.push(format!("{name} has importance {} outside 0 to 10", memory.importance));
+    }
+    if memory.access_count < 1 {
+        out.push(format!("{name} has fewer than one access"));
+    }
+    for path in memory.rule.iter().flat_map(|r| &r.paths) {
+        if path.is_empty() {
+            out.push(format!("{name} has an empty rule path"));
+        } else if !is_relative_inside(path) {
+            out.push(format!("{name} has the rule path {path:?}, which leaves the working directory"));
+        }
+    }
+    out
+}
+
+/// The noise of `data`, each memory a rule that holds no tracer of `tasks`;
+/// none when the directory has no [`NOISE_FILE`].
+pub fn load_noise(data: &Path, tasks: &[Task]) -> Result<Vec<SeedMemory>, TaskError> {
+    let path = data.join(NOISE_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(TaskError::Read { path, source }),
+    };
+    let noise: Vec<SeedMemory> = serde_json::from_str(&text).map_err(|source| TaskError::NoiseJson { path: path.clone(), source })?;
+    let mut found = Vec::new();
+    for (i, memory) in noise.iter().enumerate() {
+        let name = format!("noise memory {}", i + 1);
+        found.extend(memory_problems(&name, memory));
+        if memory.rule.is_none() {
+            found.push(format!("{name} is not a rule"));
+        }
+        for task in tasks {
+            for tracer in task.tracers.iter().filter(|tr| contains_ci(&memory.content, tr)) {
+                found.push(format!("{name} holds the tracer {tracer:?} of the task {}", task.id));
+            }
+        }
+    }
+    if found.is_empty() { Ok(noise) } else { Err(TaskError::Invalid { path, problems: found.join("; ") }) }
 }
 
 /// The tracers of `task` that a fixture file already holds: the agent could
@@ -257,6 +319,8 @@ mod tests {
         let memory = &task.memories[0];
         assert_eq!((memory.memory_type.as_str(), memory.importance, memory.access_count), ("semantic_fact", 5.0, 1));
         assert_eq!(memory.age_days, 40);
+        assert!(!memory.user_stated, "an agent saved it");
+        assert_eq!(memory.rule, None);
         assert_eq!(task.checks[0], Check::AnswerContains { text: "48213".into() });
         assert_eq!(task.checks[1], Check::FileLacks { path: "src/app.py".into(), text: "8080".into() });
         assert!(problems(&task).is_empty(), "{:?}", problems(&task));
@@ -283,6 +347,8 @@ mod tests {
             age_days: 0,
             access_count: 0,
             topic_key: None,
+            user_stated: false,
+            rule: None,
         });
         task.tracers.push("not seeded".into());
         let found = problems(&task).join("\n");
@@ -299,6 +365,68 @@ mod tests {
         ] {
             assert!(found.contains(expected), "{expected} missing from:\n{found}");
         }
+    }
+
+    fn with_memory_fields(fields: &str) -> String {
+        TASK.replace(r#""age_days": 40}"#, &format!(r#""age_days": 40, {fields}}}"#))
+    }
+
+    #[test]
+    fn a_rule_reads_with_or_without_paths() {
+        let task = parse(&with_memory_fields(r#""user_stated": true, "rule": {"paths": ["deploy/*.env", "**/*.md"]}"#)).unwrap();
+        let memory = &task.memories[0];
+        assert!(memory.user_stated);
+        assert_eq!(memory.rule, Some(Rule { paths: vec!["deploy/*.env".into(), "**/*.md".into()] }));
+        assert!(problems(&task).is_empty(), "{:?}", problems(&task));
+
+        let always = parse(&with_memory_fields(r#""rule": {}"#)).unwrap();
+        assert_eq!(always.memories[0].rule, Some(Rule { paths: Vec::new() }), "a rule without paths is one of every session");
+        assert!(parse(&with_memory_fields(r#""rule": {"globs": ["*.md"]}"#)).is_err());
+    }
+
+    #[test]
+    fn a_rule_path_must_stay_inside() {
+        let mut task = parse(TASK).unwrap();
+        task.memories[0].rule = Some(Rule { paths: vec!["../*.md".into(), String::new(), "src/**/*.py".into()] });
+        let found = problems(&task).join("\n");
+        assert!(found.contains("memory 1 has the rule path \"../*.md\", which leaves the working directory"), "{found}");
+        assert!(found.contains("memory 1 has an empty rule path"), "{found}");
+        assert!(!found.contains("src/**/*.py"), "{found}");
+    }
+
+    #[test]
+    fn the_noise_is_rules_that_hold_no_tracer() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = vec![parse(TASK).unwrap()];
+        let write = |text: &str| std::fs::write(dir.path().join(NOISE_FILE), text).unwrap();
+
+        write(r#"[{"content": "Commit messages\nConventional commits.", "rule": {}},
+                  {"content": "Go errors\nWrap them.", "age_days": 30, "rule": {"paths": ["**/*.go"]}}]"#);
+        let noise = load_noise(dir.path(), &tasks).unwrap();
+        assert_eq!(noise.len(), 2);
+        assert_eq!(noise[1].rule, Some(Rule { paths: vec!["**/*.go".into()] }));
+
+        write(r#"[{"content": "Not a rule"}, {"content": "The proxy listens on 48213", "rule": {}},
+                  {"content": " ", "rule": {"paths": ["../x"]}}]"#);
+        let found = load_noise(dir.path(), &tasks).unwrap_err().to_string();
+        for expected in [
+            NOISE_FILE,
+            "noise memory 1 is not a rule",
+            "noise memory 2 holds the tracer \"48213\" of the task staging-port",
+            "noise memory 3 is empty",
+            "noise memory 3 has the rule path \"../x\"",
+        ] {
+            assert!(found.contains(expected), "{expected} missing from: {found}");
+        }
+
+        write("{}");
+        assert!(load_noise(dir.path(), &tasks).unwrap_err().to_string().contains("is not a list of seeded memories"));
+    }
+
+    #[test]
+    fn a_data_directory_without_noise_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_noise(dir.path(), &[]).unwrap(), Vec::<SeedMemory>::new());
     }
 
     #[test]

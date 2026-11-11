@@ -844,6 +844,7 @@ mod tests {
             max_budget_usd: None,
             claude_version: Some("2.1.300".into()),
             now_ms: 0,
+            noise: Vec::new(),
         }
     }
 
