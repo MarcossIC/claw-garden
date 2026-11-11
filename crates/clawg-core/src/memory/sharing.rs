@@ -69,12 +69,12 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new(agent_id: impl Into<String>, reach: Reach) -> Self {
+    pub(crate) fn new(agent_id: impl Into<String>, reach: Reach) -> Self {
         Self { agent_id: agent_id.into(), reach }
     }
 
     /// Whether this reader reaches a row `author` saved; `None` when no agent did.
-    pub fn admits(&self, author: Option<&str>) -> bool {
+    pub(crate) fn admits(&self, author: Option<&str>) -> bool {
         self.reach.admits(&self.agent_id, author)
     }
 }
@@ -144,7 +144,7 @@ impl SharingPolicy {
         Ok(policy)
     }
 
-    pub fn to_json(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         let on_disk = OnDisk {
             version: VERSION,
             hides: self.hides.iter().map(|(r, a)| (r.clone(), a.iter().cloned().collect())).collect(),

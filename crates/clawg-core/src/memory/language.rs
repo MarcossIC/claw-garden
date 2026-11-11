@@ -134,7 +134,7 @@ pub fn detect(text: &str) -> Option<Lang> {
 
 /// How `memory.lang` spells a detected language: `und` for undecided, so a
 /// row that was looked at reads apart from one not yet classified (NULL).
-pub fn column_value(lang: Option<Lang>) -> &'static str {
+pub(crate) fn column_value(lang: Option<Lang>) -> &'static str {
     lang.map_or("und", Lang::as_str)
 }
 
