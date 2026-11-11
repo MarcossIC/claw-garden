@@ -93,6 +93,16 @@ pub fn reader_in(base_dir: &Path, agent_id: &str) -> Reader {
     Reader::new(agent_id, reach)
 }
 
+/// `agent_id` as the policy in `dir` lets it reach, read now, so a change to
+/// the policy counts from the next read on. With no directory, as for a
+/// store in memory no runtime placed, everything is shared.
+pub(crate) fn reader_from(dir: Option<&Path>, agent_id: &str) -> Reader {
+    match dir {
+        Some(dir) => reader_in(dir, agent_id),
+        None => Reader::new(agent_id, SharingPolicy::default().reach_for(agent_id)),
+    }
+}
+
 /// The file as written. `deny_unknown_fields` because a misspelled key
 /// (`"hide"`) would otherwise parse as an empty policy, and a user who meant to
 /// hide something would see it shared with no word about why.

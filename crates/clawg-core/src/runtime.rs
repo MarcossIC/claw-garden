@@ -427,12 +427,7 @@ impl MemoryRuntime {
     ) -> (Self, Receiver<IngestRequest>) {
         use crate::memory::embedder::FakeEmbedder;
 
-        let store = Arc::new(
-            MemoryStore::new_for_test()
-                .await
-                .expect("in-memory test store")
-                .with_sharing_dir(base_dir.clone()),
-        );
+        let store = Arc::new(MemoryStore::new_for_test().await.expect("in-memory test store"));
         let (memory_tx, memory_rx) = tokio::sync::mpsc::channel(capacity);
         let access_tracker = Arc::new(AccessTracker::new(store.conn.clone()));
 
@@ -524,7 +519,7 @@ where
             Replay::none()
         }
     };
-    memory_worker(rx, drain, replay, store, embedder, chat_chunker).await
+    memory_worker(rx, drain, replay, store, embedder, chat_chunker, Some(base_dir)).await
 }
 
 /// Moves the events a previous version spilled to `ingest-pending.jsonl` into

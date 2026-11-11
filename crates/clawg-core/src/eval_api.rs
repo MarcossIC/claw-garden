@@ -59,7 +59,12 @@ pub use vector_memo::{EvalMemo, EvalMemoReport};
 
 /// Opaque handle to a memory store. Every operation available on it is a
 /// method below — the wrapped store itself is never reachable.
-pub struct EvalStore(MemoryStore);
+pub struct EvalStore(
+    MemoryStore,
+    /// The directory it was opened in, where `sharing.json` is read for a
+    /// search.
+    PathBuf,
+);
 
 /// The lexical-channel candidate budget the shipped application searches
 /// with, read off the production default itself rather than restated.
@@ -284,7 +289,7 @@ impl EvalStore {
     pub async fn open(base_dir: &Path) -> Result<Self, EvalError> {
         MemoryStore::open(base_dir, StoreHolder::Eval)
             .await
-            .map(EvalStore)
+            .map(|store| EvalStore(store, base_dir.to_path_buf()))
             .map_err(|e| EvalError::Open(e.to_string()))
     }
 
@@ -360,7 +365,7 @@ impl EvalStore {
         let scope = scope
             .into_search_scope()
             .with_project(project.as_deref())
-            .with_reach(self.0.reader_for(agent_id).reach);
+            .with_reach(crate::memory::sharing::reader_from(Some(&self.1), agent_id).reach);
         let (hits, pool) = search_all_memories_with_scoring(
             &self.0,
             embedding,
@@ -768,6 +773,7 @@ impl EvalIngest {
             runtime.store.clone(),
             runtime.embedder.clone(),
             chat_chunker,
+            Some(runtime.base_dir.clone()),
         ));
 
         Ok(Self { tx, worker, runtime })
