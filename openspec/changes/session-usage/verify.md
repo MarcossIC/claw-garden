@@ -8,6 +8,7 @@ En Linux x86_64, build debug, toolchain 1.99.1, en `target`, sobre `606ad66`: el
 - `cargo clippy --workspace --all-targets -- -D warnings` sale con 0, sin ningún warning, y `cargo clippy -p clawg-cli -- -D warnings`, lo que construye el release, también.
 - `the_agent_contract_matches_its_file` y `the_spanish_agent_contract_matches_its_file` pasan sin bendecir: `agent_contract.json` y `agent_contract.es.json` no cambiaron. El nombre de la herramienta va del puente al daemon.
 - El código `cfg(windows)` no se compiló ni se corrió acá. El cambio no agrega ninguno, pero pasa por código que lo tiene: el cliente del daemon por socket (`send_over_af_unix`, por donde van `POST /v1/sessions/end` y `POST /v1/sessions/calls`) y la línea del hook de Cursor para PowerShell. Lo revisa el job de Windows del CI del pull request.
+- El CI del pull request #142 corrió clippy y la suite en Linux y en Windows. En Windows falló una vez: `an_empty_state_plans_the_server_and_the_hooks` esperaba la línea POSIX de `session-end` de Cursor con la ruta del binario sin comillas, y en Windows esa ruta lleva barras invertidas, que la forma POSIX pone entre comillas. `b17ddf5` corrigió el test (`sh_word` sobre la ruta), y la corrida sobre ese commit pasó en los dos sistemas. El código no cambió.
 
 ## Los tests en rojo
 
@@ -49,24 +50,44 @@ Los demás tests de la spec se escribieron junto con el código de su tarea y no
 | Un save repetido | no cuenta dos veces | cuenta cada vez que el outbox lo acepta | Es lo que el daemon hace con un `operation_id` cuyo save ya se guardó |
 | `agent-eval` | sin cambios | el brazo que instala lo que `setup` escribe (`arm.rs`) instala también `SessionEnd` | Arma su `settings.json` con `setup::plan`. Su test sólo mira los otros dos eventos y pasa |
 
-## Pendiente en local
+## En local, Windows, 2026-11-11
 
-Linux con el embedder falso no comprueba nada de esto. Hace falta un clawg de esta versión instalado, `clawg setup claude-code` y `clawg setup cursor` corridos otra vez, y un perfil de datos con su daemon.
+Sobre `develop` en `aa025d6`, el mismo código que el pull request. Un build debug con la feature `testing`, copiado a una carpeta llamada `bin con espacios`, y un daemon de prueba (`CLAWG_TEST_HOME`, embedder falso, `--port 0`) que servía por el socket y por TCP. El cliente fue Claude Code 2.1.322 real, con una carpeta de configuración propia (`CLAUDE_CONFIG_DIR`) donde `clawg setup claude-code` registró el servidor, los hooks y el protocolo; la configuración de Claude Code de la máquina no cambió. Cursor no se abrió: `clawg setup cursor` escribió `hooks.json` en el home de prueba, y sus dos líneas se corrieron como las corre Cursor en Windows, con `powershell -NoProfile -NonInteractive -Command "<línea>"` y la entrada de Cursor por stdin. Cada fila se leyó con `clawg metrics sessions --session <id>`, con el id del nombre del transcript, pasado el minuto en que se escribe.
 
-1. **Claude Code, un arranque y un prompt reales.** Abrir una sesión, mandar un prompt que llame a una herramienta de clawg, y leer `clawg metrics sessions --session <id>` pasado un minuto: la fila tiene `client` `claude-code`, `starts` con `startup`, `prompts` 1 y la herramienta en `calls`.
-2. **Cursor, un arranque real.** Abrir un chat en una ventana con una sola carpeta: la fila tiene `client` `cursor` y `starts` con `unspecified`. Confirmar los campos que la exploración leyó de la documentación y no de una corrida: que `sessionStart` trae `session_id` y que es el mismo que trae `sessionEnd`.
-3. **Los cierres, con su motivo.** Que la fila quede con `ended_at_ms` y:
-   - `prompt_input_exit` o `logout` al salir de Claude Code;
-   - `clear` después de `/clear`, con una fila nueva de otro id para lo que sigue;
-   - el motivo de Cursor (`user_close`, `window_close`, `completed`, …) al cerrar la conversación. Un motivo que quede como `other` es uno que falta en `END_REASONS`.
-4. **Si cerrar la ventana de la terminal con la X dispara `SessionEnd` en Windows.** La decisión 6 de la exploración depende de esto. Si lo dispara, la fila cierra con el motivo que mande Claude Code. Si no, queda abierta y a las 6 horas se lee como `idle`, con el fin en la última actividad: ese es el caso que vigilar el proceso del cliente arreglaría, y se decide con este dato y con cuántas sesiones cierran con `idle` en el reporte.
-5. **Si `resume` conserva el id de la sesión,** que la exploración deja sin verificar: retomar una sesión con `claude --resume` y con `/resume`, y mirar si `starts` suma `resume` en la misma fila (mismo id) o si aparece una fila con otro id. Para la cuenta no cambia nada: una sesión cerrada no se reabre.
-6. **El hook de cierre dentro del presupuesto.** Que `clawg hook session-end` termine dentro de los 1,5 s de `SessionEnd` con el daemon real, y que `/clear` no se sienta más lento.
-7. **El reporte después de varios días de uso real.** `clawg metrics sessions --by project`, `--by agent` y `--by day` sobre una semana: cuántas sesiones cierran con `idle` frente a las que cierran por hook, el tiempo entre el último save y el cierre, el porcentaje con resumen, y si las llamadas se atribuyen (una sesión con prompts y sin ninguna llamada, en un proyecto donde se usó clawg, es una que no se atribuyó).
-8. **El archivo de un clawg anterior.** Arrancar esta versión sobre un `metrics.db` real del esquema 2 y comprobar con `clawg metrics report` que sus series siguen ahí. Volver a la versión anterior y seguir los pasos de `docs/reference/data-profiles.md`.
-9. **Windows,** si el CI no lo cubre: el hook de Cursor con la línea de PowerShell y una ruta con espacios, para `session-end`.
+1. **Claude Code, un arranque y un prompt reales: pasa.** Una sesión con un prompt que pidió `search_memory`: `client` `claude-code`, `starts` `startup` 1, `prompts` 1, `calls` `search_memory` 1 sin fallas y `empty_searches` 1 (la memoria de prueba estaba vacía). El aviso de la herramienta y el cierre llegaron al daemon por el socket.
+2. **Cursor: pasa lo que se puede simular.** La fila tiene `client` `cursor`, `starts` `unspecified` 1 y `prompts` 0. `session-start` leyó las claves de la entrada (`hook-runs.jsonl`) y registró la carpeta, escrita con barras invertidas o con barras normales: las dos dan el mismo proyecto. Que el `session_id` de `sessionStart` sea el mismo que el de `sessionEnd` sólo lo dice Cursor real: queda en prod.
+3. **Los cierres: pasa.**
+   - Al salir con `/exit`, la fila cierra con `prompt_input_exit`.
+   - Con `/clear`, la fila cierra con `clear`, y 55 ms después se abre una fila de otro id con `starts` `clear` 1, que cuenta su prompt y cierra con `prompt_input_exit` al salir.
+   - `logout` no se probó: es otro valor de la misma lista. En Claude Code 2.1.322, el `reason` de `SessionEnd` es uno de `clear`, `resume`, `logout`, `prompt_input_exit` y `other` (el esquema del evento en el ejecutable del cliente), y los cinco están en `END_REASONS`.
+   - Con la entrada de Cursor, `user_close`, `window_close`, `completed`, `aborted` y `error` quedan con su nombre, y un motivo inventado queda como `other`. Los motivos que manda Cursor real quedan en prod.
+4. **La X de la terminal en Windows dispara `SessionEnd`.** La fila de una sesión cuya ventana de PowerShell se cerró con la X, sin `/exit`, cerró 11 s después de su último prompt, con `other`. Ese cierre no espera las 6 horas. Lo que queda para decidir si hace falta vigilar el proceso del cliente es cuántas sesiones cierran con `idle` en el reporte del piloto.
+   - Una sesión que se cortó en el arranque, antes de su primer prompt (la persona cerró un aviso o salió enseguida), no avisó su cierre ni dejó transcript. Su fila quedó abierta y se cerrará con `idle` por la regla de las 6 horas. Es uno de los casos que ese reporte cuenta.
+   - Un `clawg stop`, un arranque, la escritura de un minuto y otro `clawg stop` dejaron esa fila abierta, como era (SU3, SU4).
+5. **`resume`: no se probó.** Queda en prod.
+6. **El hook de cierre dentro del presupuesto: pasa.** `clawg hook session-end`, en diez corridas contra el daemon de prueba, tardó de 87 a 101 ms de punta a punta (con el arranque del proceso, en un build debug), contra los 1,5 s de `SessionEnd`. `/clear` no se sintió más lento.
+7. **El reporte de varios días: queda en prod.** Sobre las filas de la prueba, `--by project`, `--by agent` y `--by day` dieron los grupos, cierres, arranques y llamadas esperados.
+8. **El archivo de un clawg anterior: pasa.** Sobre una copia del `metrics.db` de un perfil en uso (esquema 2, 17 ejecuciones):
+   - `metrics report`, `metrics report --events` y `metrics sessions` lo leyeron sin cambiarle un byte, y `metrics sessions` dio `groups` vacío.
+   - El daemon lo llevó al esquema 3. Por versión, las series de `http.duration`, `process.private_bytes` y `search.duration` y los eventos quedaron iguales; sólo se sumó la ejecución nueva.
+   - La vuelta: el SQL de `docs/reference/data-profiles.md`, sobre una copia del archivo ya en el esquema 3, deja `integrity_check` en `ok`, `user_version` 2 y las seis tablas del esquema 2 con las mismas filas.
+   - La 0.80.0 no se corrió. Su `open_read_only` y su `open_writable` rechazan sólo un esquema mayor que 2 (`MetricsError::Newer`, con `a_newer_schema_is_refused_untouched`), así que abre ese archivo y rechaza uno del esquema 3 sin tocarlo.
+9. **Windows, la línea de PowerShell de Cursor con una ruta con espacios: pasa.** `setup cursor` escribió `& "…\bin con espacios\clawg.exe" hook session-end --agent cursor --client cursor --profile dev`. Windows PowerShell 5.1 la corrió con la entrada por stdin y la fila cerró con su motivo. Con PowerShell 7 no se probó: no estaba instalado. El CI cubre el texto de la línea; esto cubre que PowerShell la lee así y le pasa la entrada al binario.
+
+## Pendiente en prod
+
+En el piloto del [ROADMAP](../../../ROADMAP.md), con 0.81.0 instalada y `clawg setup claude-code --local` y `clawg setup cursor` corridos otra vez, para tener el hook de cierre:
+
+1. **Cursor real.** Que `sessionStart` y `sessionEnd` traen el mismo `session_id`, y que la fila queda con `client` `cursor`, `starts` `unspecified` y el motivo con el que Cursor cierra la conversación. Un motivo que quede como `other` es uno que falta en `END_REASONS`.
+2. **`resume`.** Retomar una sesión con `claude --resume` y con `/resume`, y mirar si `starts` suma `resume` en la misma fila (mismo id) o si aparece una fila de otro id.
+3. **El reporte de una semana.** `clawg metrics sessions --by project`, `--by agent` y `--by day`:
+   - cuántas sesiones cierran con `idle` frente a las que cierran por hook, contando las que se cortan antes de su primer prompt;
+   - el tiempo entre el último save y el cierre, y el porcentaje con resumen;
+   - si las llamadas se atribuyen: una sesión con prompts y sin ninguna llamada, en un proyecto donde se usó clawg, es una que no se atribuyó.
+
+   Con ese reporte se decide si hace falta vigilar el proceso del cliente.
 
 ## Al archivar
 
-- SU1 a SU12 y el invariante enmendado pasan a `specs/metrics`; las tres rutas, a `specs/daemon-access`; `session-end`, a `specs/hooks`; los hooks que instala `setup`, a `specs/setup`.
-- La fila 121 del `README.md` de openspec y la línea del cambio en `ROADMAP.md`, que este cambio no tocó.
+- SU1 a SU12, el invariante enmendado y los límites pasan a `specs/metrics`; las tres rutas, a `specs/daemon-access`; `session-end`, a `specs/hooks`; los hooks que instala `setup`, a `specs/setup`.
+- La fila 121 del `README.md` de openspec pasa a `changes/archive/README.md`, y el párrafo del cambio en `ROADMAP.md` dice lo que salió; lo de «Pendiente en prod» pasa al párrafo del piloto.
