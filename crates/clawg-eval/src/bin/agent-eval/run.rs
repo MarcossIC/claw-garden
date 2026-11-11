@@ -845,6 +845,7 @@ mod tests {
             claude_version: Some("2.1.300".into()),
             now_ms: 0,
             noise: Vec::new(),
+            agent_eval: PathBuf::from("/bin/agent-eval"),
         }
     }
 

@@ -10,8 +10,8 @@ Strict TDD: en cada tarea con conducta nueva el test va primero y falla, por la 
 
 ## 2. Los brazos de reglas y los hooks del arnés (MD4, MD5)
 
-- [ ] RED: los tests de `rules.rs`; `l0_is_a3_without_the_protocol`, `l1_adds_the_rules_at_startup_through_a_hook_of_the_harness`, `l2_moves_the_rules_with_globs_to_rules_files`, `l1_without_rules_adds_no_hook`, `every_arm_logs_the_instruction_files_the_client_loads` (`arm.rs`); `the_hook_commands_parse`, `a_log_line_keeps_the_input_on_one_line` (`main.rs`); `the_harness_hooks_print_the_context_and_log_their_input` (`tests/agent_eval.rs`).
-- [ ] GREEN: `rules.rs`, `Arm::L0`, `Arm::L1` y `Arm::L2`, los hooks en el `settings.json` de cada brazo y `agent-eval hook-context` y `hook-log`.
+- [x] RED: los tests de `rules.rs` y de `hooks.rs`; `l0_is_a3_without_the_protocol`, `l1_adds_the_rules_at_startup_through_a_hook_of_the_harness`, `l2_moves_the_rules_with_globs_to_rules_files`, `l1_without_rules_adds_no_hook`, `every_arm_logs_the_instruction_files_the_client_loads` (`arm.rs`); `the_hook_commands_parse` (`main.rs`); `the_harness_hooks_print_the_context_and_log_their_input`, `a_prepared_l2_run_writes_the_rules_of_its_task_by_file` (`tests/agent_eval.rs`).
+- [x] GREEN: `rules.rs`, `hooks.rs`, `Arm::L0`, `Arm::L1` y `Arm::L2`, los hooks en el `settings.json` de cada brazo y `agent-eval hook-context` y `hook-log`.
 - Commit: `feat(agent-eval): deliver the seeded rules at startup or by file in arms l0, l1 and l2`
 
 ## 3. Lo que llegó al contexto y el primer pedido (MD5, MD6, MD7)

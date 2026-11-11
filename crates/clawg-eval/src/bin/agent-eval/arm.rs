@@ -9,10 +9,10 @@ use clawg_cli::setup::{self, FileStep, Mode, State};
 use clawg_core::paths::Profile;
 use clawg_core::preferences::{Lang, Preferences};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
-use crate::seed;
 use crate::task::{SeedMemory, Task};
+use crate::{rules, seed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arm {
@@ -29,9 +29,16 @@ pub enum Arm {
     /// A3 without the tools that read memories back: only what reaches the
     /// session by itself.
     B,
+    /// A3 without the protocol block in `CLAUDE.md`.
+    L0,
+    /// L0 with the seeded rules added at startup, by a hook of the harness.
+    L1,
+    /// L1 with the rules that have globs in rules files the client loads
+    /// when the agent works on a file they match, and not at startup.
+    L2,
 }
 
-pub const ARMS: [Arm; 6] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A4, Arm::B];
+pub const ARMS: [Arm; 9] = [Arm::A0, Arm::A2, Arm::A3, Arm::A3Eager, Arm::A4, Arm::B, Arm::L0, Arm::L1, Arm::L2];
 
 /// The tools arm B takes away.
 const READ_TOOLS: [&str; 3] = ["search_memory", "read_memory", "list_memories"];
@@ -56,16 +63,35 @@ impl Arm {
             Arm::A3Eager => "a3-eager",
             Arm::A4 => "a4",
             Arm::B => "b",
+            Arm::L0 => "l0",
+            Arm::L1 => "l1",
+            Arm::L2 => "l2",
         }
     }
 
     /// Whether a run of this arm starts clawg: its daemon, its bridge, its hooks.
     pub fn has_clawg(self) -> bool {
-        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::B)
+        matches!(self, Arm::A2 | Arm::A3 | Arm::A3Eager | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
     }
 
+    /// Whether the arm has the hooks `setup` writes in `settings.json`.
     fn has_setup(self) -> bool {
+        matches!(self, Arm::A3 | Arm::A3Eager | Arm::B | Arm::L0 | Arm::L1 | Arm::L2)
+    }
+
+    /// Whether the arm has the protocol block `setup` writes in `CLAUDE.md`.
+    fn has_protocol(self) -> bool {
         matches!(self, Arm::A3 | Arm::A3Eager | Arm::B)
+    }
+
+    /// Whether the arm delivers the seeded rules and, if it does, whether
+    /// the rules with globs go by file instead of at startup.
+    fn rules_by_file(self) -> Option<bool> {
+        match self {
+            Arm::L1 => Some(false),
+            Arm::L2 => Some(true),
+            _ => None,
+        }
     }
 }
 
@@ -94,6 +120,18 @@ impl Layout {
     pub fn data_dir(&self, profile: Profile) -> PathBuf {
         self.home().join(profile.dir_name())
     }
+    /// The rules the startup hook of an arm with rules prints.
+    pub fn startup_rules(&self) -> PathBuf {
+        self.root.join("startup-rules.md")
+    }
+    /// Where the hook of every arm logs each instruction file the client loads.
+    pub fn instructions_log(&self) -> PathBuf {
+        self.root.join("instructions.jsonl")
+    }
+    /// The project's rules files that an arm with rules by file writes.
+    pub fn rules_dir(&self) -> PathBuf {
+        self.workdir().join(".claude").join("rules").join("clawg")
+    }
 }
 
 /// What a run is asked for, besides the task and the arm.
@@ -112,6 +150,8 @@ pub struct Options {
     pub now_ms: i64,
     /// The rules of other topics every arm with memory is seeded with.
     pub noise: Vec<SeedMemory>,
+    /// The `agent-eval` binary the hooks of the harness run; absolute.
+    pub agent_eval: PathBuf,
 }
 
 /// One program and its arguments.
@@ -163,6 +203,22 @@ fn text(path: &Path) -> Result<String, ArmError> {
     path.to_str().map(str::to_owned).ok_or_else(|| ArmError::NonUnicode(path.to_owned()))
 }
 
+/// A hook that runs `agent-eval COMMAND FILE`.
+fn harness_hook(agent_eval: &str, command: &str, file: &str) -> Value {
+    json!({ "type": "command", "command": agent_eval, "args": [command, file], "timeout": 10 })
+}
+
+/// Adds `hook` to the hooks of `event` in `settings`, after any already there.
+fn add_hook(settings: &mut Value, event: &str, hook: Value) {
+    let groups = &mut settings["hooks"][event];
+    if !groups.is_array() {
+        *groups = json!([]);
+    }
+    if let Some(groups) = groups.as_array_mut() {
+        groups.push(json!({ "hooks": [hook] }));
+    }
+}
+
 pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result<RunPlan, ArmError> {
     let clawg = text(&options.clawg)?;
     let workdir = text(&layout.workdir())?;
@@ -172,6 +228,7 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
     let mut before = Vec::new();
     let mut after = Vec::new();
     let mut servers = serde_json::Map::new();
+    let mut settings = json!({});
     let memories = seed::seeded(&task.memories, &options.noise);
 
     if arm.has_clawg() {
@@ -188,12 +245,11 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
             setup_plan.server.name.to_owned(),
             json!({ "command": setup_plan.server.command, "args": setup_plan.server.args }),
         );
-        if arm.has_setup() {
-            for (step, file) in [(setup_plan.settings, &state.settings), (setup_plan.instructions, &state.instructions)] {
-                if let FileStep::Write(body) = step {
-                    files.push((file.path.clone(), body));
-                }
-            }
+        if let (true, FileStep::Write(body)) = (arm.has_setup(), setup_plan.settings) {
+            settings = serde_json::from_str(&body).expect("setup writes its settings as JSON");
+        }
+        if let (true, FileStep::Write(body)) = (arm.has_protocol(), setup_plan.instructions) {
+            files.push((state.instructions.path.clone(), body));
         }
         let data = layout.data_dir(options.profile);
         // An ephemeral port, so a run never takes the profile's port from a
@@ -221,6 +277,18 @@ pub fn plan(task: &Task, arm: Arm, layout: &Layout, options: &Options) -> Result
         let dir = layout.config_dir().join("projects").join(seed::project_slug(&workdir)).join("memory");
         files.push((dir.join("MEMORY.md"), seed::native_memory(&memories)));
     }
+    let harness = text(&options.agent_eval)?;
+    if let Some(by_file) = arm.rules_by_file() {
+        if let Some(rules) = rules::startup(&memories, by_file, options.lang) {
+            add_hook(&mut settings, "SessionStart", harness_hook(&harness, "hook-context", &text(&layout.startup_rules())?));
+            files.push((layout.startup_rules(), rules));
+        }
+        if by_file {
+            files.extend(rules::files(&memories, options.lang).into_iter().map(|(name, body)| (layout.rules_dir().join(name), body)));
+        }
+    }
+    add_hook(&mut settings, "InstructionsLoaded", harness_hook(&harness, "hook-log", &text(&layout.instructions_log())?));
+    files.push((layout.config_dir().join("settings.json"), serde_json::to_string_pretty(&settings).expect("JSON serializes") + "\n"));
     files.push((layout.mcp_config(), serde_json::to_string_pretty(&json!({ "mcpServers": servers })).expect("JSON serializes") + "\n"));
 
     let mut args: Vec<String> = vec![
@@ -307,6 +375,113 @@ mod tests {
             claude_version: Some("2.1.300".into()),
             now_ms: 1_800_000_000_000,
             noise: Vec::new(),
+            agent_eval: harness(),
+        }
+    }
+
+    fn harness() -> PathBuf {
+        root().join("bin").join("agent-eval")
+    }
+
+    fn settings(plan: &RunPlan) -> serde_json::Value {
+        serde_json::from_str(file(plan, "settings.json").unwrap()).unwrap()
+    }
+
+    fn task_with_rules() -> Task {
+        parse(
+            r#"{"id": "t", "category": "K3", "fixture": "tally", "prompt": "Write the notes.",
+                "memories": [{"content": "Lists use an asterisk\nNot a hyphen.", "age_days": 120, "rule": {"paths": ["**/*.md"]}},
+                             {"content": "Staging listens on port 48213", "age_days": 40}],
+                "checks": [{"kind": "file_contains", "path": "notes.md", "text": "* "}]}"#,
+        )
+        .unwrap()
+    }
+
+    fn always_noise() -> Vec<SeedMemory> {
+        let task = parse(
+            r#"{"id": "n", "category": "N", "fixture": "f", "prompt": "p", "checks": [{"kind": "answer_contains", "text": "x"}],
+                "memories": [{"content": "Commit messages\nConventional commits.", "age_days": 23, "rule": {}}]}"#,
+        )
+        .unwrap();
+        task.memories
+    }
+
+    fn startup_of(plan: &RunPlan) -> Option<&str> {
+        plan.files.iter().find(|(p, _)| *p == layout().startup_rules()).map(|(_, t)| t.as_str())
+    }
+
+    fn rules_files(plan: &RunPlan) -> Vec<&(PathBuf, String)> {
+        plan.files.iter().filter(|(p, _)| p.starts_with(layout().rules_dir())).collect()
+    }
+
+    #[test]
+    fn l0_is_a3_without_the_protocol() {
+        let a3 = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
+        let l0 = plan(&task(true), Arm::L0, &layout(), &options(None)).unwrap();
+        assert!(file(&a3, "CLAUDE.md").is_some());
+        assert!(file(&l0, "CLAUDE.md").is_none());
+        for name in ["mcp.json", "settings.json", "seed.jsonl"] {
+            assert_eq!(file(&l0, name), file(&a3, name), "{name}");
+        }
+        assert_eq!((&l0.daemon, &l0.before, &l0.after, &l0.client.args), (&a3.daemon, &a3.before, &a3.after, &a3.client.args));
+    }
+
+    #[test]
+    fn l1_adds_the_rules_at_startup_through_a_hook_of_the_harness() {
+        let mut opts = options(None);
+        opts.noise = always_noise();
+        let plan = plan(&task_with_rules(), Arm::L1, &layout(), &opts).unwrap();
+        let startup = startup_of(&plan).unwrap();
+        assert_eq!(Some(startup.to_owned()), crate::rules::startup(&seed::seeded(&task_with_rules().memories, &opts.noise), false, None));
+        assert!(startup.contains("[23 days ago] Commit messages") && startup.contains("[120 days ago] Lists use an asterisk"), "{startup}");
+        assert!(!startup.contains("48213"), "a memory that is not a rule is not delivered");
+        let start = &settings(&plan)["hooks"]["SessionStart"];
+        assert_eq!(start.as_array().unwrap().len(), 2, "clawg's own hook stays: {start}");
+        assert_eq!(
+            start[1]["hooks"][0],
+            json!({ "type": "command", "command": harness().to_str().unwrap(), "args": ["hook-context", layout().startup_rules().to_str().unwrap()], "timeout": 10 })
+        );
+        assert!(file(&plan, "CLAUDE.md").is_none());
+        assert!(rules_files(&plan).is_empty());
+    }
+
+    #[test]
+    fn l2_moves_the_rules_with_globs_to_rules_files() {
+        let mut opts = options(Some(Lang::Es));
+        opts.noise = always_noise();
+        let plan = plan(&task_with_rules(), Arm::L2, &layout(), &opts).unwrap();
+        let startup = startup_of(&plan).unwrap();
+        assert!(startup.contains("Commit messages") && !startup.contains("asterisk"), "{startup}");
+        let by_file = rules_files(&plan);
+        assert_eq!(by_file.len(), 1);
+        assert_eq!(by_file[0].0, layout().workdir().join(".claude").join("rules").join("clawg").join("rules-1.md"));
+        let body = &by_file[0].1;
+        assert!(body.starts_with("---\npaths:\n  - \"**/*.md\"\n---\n") && body.contains("[hace 120 días] Lists use an asterisk"), "{body}");
+        assert_eq!(settings(&plan)["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn l1_without_rules_adds_no_hook() {
+        for arm in [Arm::L1, Arm::L2] {
+            let plan = plan(&task(true), arm, &layout(), &options(None)).unwrap();
+            assert!(startup_of(&plan).is_none() && rules_files(&plan).is_empty(), "{}", arm.as_str());
+            assert_eq!(settings(&plan)["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "{}", arm.as_str());
+        }
+    }
+
+    #[test]
+    fn every_arm_logs_the_instruction_files_the_client_loads() {
+        let logged = json!([{ "hooks": [{
+            "type": "command", "command": harness().to_str().unwrap(),
+            "args": ["hook-log", layout().instructions_log().to_str().unwrap()], "timeout": 10
+        }] }]);
+        for arm in ARMS {
+            let plan = plan(&task(true), arm, &layout(), &options(None)).unwrap();
+            assert!(plan.files.iter().any(|(p, _)| *p == layout().config_dir().join("settings.json")), "{}", arm.as_str());
+            let settings = settings(&plan);
+            assert_eq!(settings["hooks"]["InstructionsLoaded"], logged, "{}", arm.as_str());
+            let with_setup = matches!(arm, Arm::A3 | Arm::A3Eager | Arm::B | Arm::L0 | Arm::L1 | Arm::L2);
+            assert_eq!(settings["hooks"]["UserPromptSubmit"].is_array(), with_setup, "setup's hooks stay: {}", arm.as_str());
         }
     }
 
@@ -370,7 +545,7 @@ mod tests {
     #[test]
     fn the_arms_with_clawg_start_a_daemon_of_the_run_on_an_ephemeral_port() {
         let with_daemon: Vec<Arm> = ARMS.into_iter().filter(|arm| plan(&task(true), *arm, &layout(), &options(None)).unwrap().daemon.is_some()).collect();
-        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::B]);
+        assert_eq!(with_daemon, [Arm::A2, Arm::A3, Arm::A3Eager, Arm::B, Arm::L0, Arm::L1, Arm::L2]);
 
         let plan = plan(&task(true), Arm::A3, &layout(), &options(None)).unwrap();
         let daemon = plan.daemon.unwrap();
@@ -398,11 +573,14 @@ mod tests {
     }
 
     #[test]
-    fn a0_has_no_server_no_hooks_no_seed_and_no_native_memory() {
+    fn a0_has_no_server_no_memory_hook_no_seed_and_no_native_memory() {
         let plan = plan(&task(true), Arm::A0, &layout(), &options(None)).unwrap();
         let mcp: serde_json::Value = serde_json::from_str(file(&plan, "mcp.json").unwrap()).unwrap();
         assert_eq!(mcp, json!({ "mcpServers": {} }));
-        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.files.len(), 2, "mcp.json and settings.json");
+        let settings = settings(&plan);
+        let hooks: Vec<&String> = settings["hooks"].as_object().unwrap().keys().collect();
+        assert_eq!(hooks, ["InstructionsLoaded"], "only the log of instruction files, which adds no context");
         assert!(plan.daemon.is_none() && plan.before.is_empty() && plan.after.is_empty());
         assert_eq!(env(&plan, "CLAUDE_CODE_DISABLE_AUTO_MEMORY"), Some("1"));
         assert!(plan.client.args.contains(&"--strict-mcp-config".to_owned()));
@@ -422,7 +600,7 @@ mod tests {
         let server = &mcp["mcpServers"]["clawg-dev"];
         assert_eq!(server["command"], json!(options(None).clawg.to_str().unwrap()));
         assert_eq!(server["args"], json!(["mcp", "--profile", "dev", "--agent", "claude-code"]));
-        assert!(file(&plan, "settings.json").is_none());
+        assert!(settings(&plan)["hooks"]["SessionStart"].is_null(), "no hook of setup");
         assert!(file(&plan, "CLAUDE.md").is_none());
         assert!(file(&plan, "preferences.json").is_none());
         assert!(file(&plan, "seed.jsonl").unwrap().contains("Staging listens on port 48213"));
