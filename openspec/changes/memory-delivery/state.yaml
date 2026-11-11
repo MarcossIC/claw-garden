@@ -1,0 +1,14 @@
+change: memory-delivery
+objective: "entrega y medición (1, 2)"
+depends_on: [agent-eval]
+phase: explore
+artifacts:
+  exploration: draft
+  proposal: pending
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-11-11
