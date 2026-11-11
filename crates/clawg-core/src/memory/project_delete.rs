@@ -95,20 +95,13 @@ pub enum DeleteError {
 
 impl From<rusqlite::Error> for DeleteError {
     fn from(e: rusqlite::Error) -> Self {
-        DeleteError::Store(MemoryError::Sqlite(e))
+        DeleteError::Store(MemoryError::from(e))
     }
 }
 
 impl Retried for DeleteError {
     fn saves_pending(&self) -> bool {
         matches!(self, DeleteError::SavesPending(_))
-    }
-
-    fn connection(e: tokio_rusqlite::Error<DeleteError>) -> DeleteError {
-        match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => DeleteError::Store(MemoryError::Backend(other.to_string())),
-        }
     }
 }
 
@@ -880,7 +873,7 @@ pub async fn undo_delete_core(
     if !plan.restore.is_empty() {
         let embedder = embedder.ok_or(DeleteError::NeedsModel)?;
         let restore = plan.restore.clone();
-        let texts = store.conn.call(move |c| embedding_texts_in(c, &restore)).await.map_err(MemoryError::Connection)?;
+        let texts = store.conn.call(move |c| embedding_texts_in(c, &restore)).await.map_err(MemoryError::from)?;
         for batch in texts.chunks(EMBED_BATCH) {
             let inputs: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
             let embedded = embedder.embed_batch(&inputs, EmbedRole::Passage).await?;

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::chunker::embedding_text;
 use crate::memory::clock::TimestampMs;
 use crate::memory::db::{EmbeddingIdentity, MemoryStore};
@@ -322,13 +323,7 @@ pub(crate) async fn count_rows(store: &MemoryStore) -> Result<RowCounts, MemoryE
             })
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during count_rows".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+        .map_err(failed_call(ClosedAs::During("count_rows")))
 }
 
 /// Drives [`run_maintenance_once`] on a timer: fires the first pass

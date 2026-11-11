@@ -11,6 +11,7 @@
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::metrics::EventKind;
 use crate::memory::error::MemoryError;
@@ -210,13 +211,6 @@ pub enum OutboxActionError {
     Store(#[from] MemoryError),
 }
 
-fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryError {
-    move |e| match e {
-        tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-        other => MemoryError::Backend(format!("{context}: {other}")),
-    }
-}
-
 /// The event without its text, which the row keeps in its own column.
 fn event_json(event: &MemoryEvent) -> String {
     let mut rest = event.clone();
@@ -275,7 +269,7 @@ impl MemoryStore {
                 })
             })
             .await
-            .map_err(backend("outbox_record"))
+            .map_err(failed_call(ClosedAs::Named("outbox_record")))
     }
 
     /// Records events a previous version spilled to a file, each under a new
@@ -293,7 +287,7 @@ impl MemoryStore {
                 })
             })
             .await
-            .map_err(backend("outbox_import"))
+            .map_err(failed_call(ClosedAs::Named("outbox_import")))
     }
 
     /// Takes `row` for ingesting: spends an attempt, or gives the row up when
@@ -348,7 +342,7 @@ impl MemoryStore {
                 Ok(claimed)
             })
             .await
-            .map_err(backend("outbox_claim"))
+            .map_err(failed_call(ClosedAs::Named("outbox_claim")))
             .inspect(|claimed| {
                 if *claimed == Claimed::GaveUp {
                     let attempts = MAX_ATTEMPTS.into();
@@ -380,7 +374,7 @@ impl MemoryStore {
                 Ok((state == OutboxState::Failed).then_some(attempts))
             })
             .await
-            .map_err(backend("outbox_fail"))?;
+            .map_err(failed_call::<_, MemoryError>(ClosedAs::Named("outbox_fail")))?;
         if let Some(attempts) = failed {
             self.metrics().event(EventKind::OutboxFailed, &[("cause", "failure".into()), ("attempts", attempts.into())]);
         }
@@ -395,7 +389,7 @@ impl MemoryStore {
                 c.execute("UPDATE ingest_outbox SET attempts = MAX(attempts - 1, 0) WHERE id = ?1", [row]).map(|_| ())
             })
             .await
-            .map_err(backend("outbox_pause"))
+            .map_err(failed_call(ClosedAs::Named("outbox_pause")))
     }
 
     /// The failed row of `operation_id`, of `agent` or of the only agent
@@ -413,7 +407,7 @@ impl MemoryStore {
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .await
-            .map_err(backend("outbox_find_failed"))?;
+            .map_err(failed_call::<_, MemoryError>(ClosedAs::Named("outbox_find_failed")))?;
         match rows.as_slice() {
             [] => Err(OutboxActionError::NotFound(operation_id.to_string())),
             [(row, agent_id, state, progress)] => {
@@ -464,7 +458,7 @@ impl MemoryStore {
                 Ok(Some((again, parsed)))
             })
             .await
-            .map_err(backend("outbox_requeue"))
+            .map_err(failed_call(ClosedAs::Named("outbox_requeue")))
     }
 
     /// Drops `row` once whoever saved it has been told how it ended.
@@ -472,7 +466,7 @@ impl MemoryStore {
         self.conn
             .call(move |c| c.execute("DELETE FROM ingest_outbox WHERE id = ?1", [row]).map(|_| ()))
             .await
-            .map_err(backend("outbox_forget"))
+            .map_err(failed_call(ClosedAs::Named("outbox_forget")))
     }
 
     /// Finishes `row`: links the save's pieces when there are two or more,
@@ -504,7 +498,7 @@ impl MemoryStore {
                 Ok(replaced)
             })
             .await
-            .map_err(backend("outbox_finish"))
+            .map_err(failed_call(ClosedAs::Named("outbox_finish")))
     }
 
     /// The pending rows, oldest first, with their events. A row whose event no
@@ -543,7 +537,7 @@ impl MemoryStore {
                 Ok((pending, unparsable))
             })
             .await
-            .map_err(backend("outbox_pending"))?;
+            .map_err(failed_call::<_, MemoryError>(ClosedAs::Named("outbox_pending")))?;
         for _ in 0..unparsable {
             self.metrics().event(EventKind::OutboxFailed, &[("cause", "unparsable".into())]);
         }
@@ -587,7 +581,7 @@ impl MemoryStore {
                 })
             })
             .await
-            .map_err(backend("outbox_summary"))
+            .map_err(failed_call(ClosedAs::Named("outbox_summary")))
     }
 }
 

@@ -8,6 +8,7 @@
 //! dependency; with too little evidence the answer is undecided. The detector
 //! is pure; [`count_saves_in`] reads the column it fills.
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::search::{memory_project_predicate, project_bind, projects_bind, reader_bind, reader_predicate};
 use crate::memory::sharing::Reader;
 use crate::memory::{MemoryError, MemoryStore};
@@ -67,10 +68,7 @@ async fn count_saves_bound(
                 .map(|n| n as usize)
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            other => MemoryError::Backend(format!("language count: {other}")),
-        })
+        .map_err(failed_call(ClosedAs::Named("language count")))
 }
 
 /// Fewest points of evidence, words and marks of both languages together,

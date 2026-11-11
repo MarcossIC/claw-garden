@@ -58,7 +58,7 @@ pub mod subfolder;
 
 pub use contradiction::Candidate;
 pub use db::MemoryStore;
-pub use error::MemoryError;
+pub use error::{MemoryError, StorageError};
 pub use identity::{derive_project_id, ProjectIdentity};
 pub use record::{MemoryRecord, MemoryRow};
 /// Re-exported at the `memory` root because structured retrieval is now an

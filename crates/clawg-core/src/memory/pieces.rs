@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::admin::get_memory_core;
 use crate::memory::error::MemoryError;
 use crate::memory::search::PiecePosition;
@@ -146,7 +147,7 @@ pub async fn read_save_core(
             rows.collect()
         })
         .await
-        .map_err(backend("read_save_core"))?;
+        .map_err(failed_call::<_, MemoryError>(ClosedAs::Named("read_save_core")))?;
 
     let mut ids = Vec::new();
     let mut missing = Vec::new();
@@ -185,13 +186,6 @@ pub async fn read_save_core(
     }))
 }
 
-fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryError {
-    move |e| match e {
-        tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-        other => MemoryError::Backend(format!("{context}: {other}")),
-    }
-}
-
 impl MemoryStore {
     /// Links `pieces`, in order, as one save and returns its id.
     ///
@@ -208,7 +202,7 @@ impl MemoryStore {
                 Ok(save_id)
             })
             .await
-            .map_err(backend("link_pieces"))
+            .map_err(failed_call(ClosedAs::Named("link_pieces")))
     }
 
     /// The save each of `memory_ids` is a piece of. A row linked in several
@@ -220,7 +214,7 @@ impl MemoryStore {
         self.conn
             .call(move |c| read_links(c, &memory_ids))
             .await
-            .map_err(backend("save_links"))
+            .map_err(failed_call(ClosedAs::Named("save_links")))
     }
 }
 

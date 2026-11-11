@@ -10,6 +10,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
 use crate::memory::project_delete::{deleted_in, deleted_message, ids_of_in};
@@ -53,7 +54,7 @@ pub(crate) fn canonical_in(c: &Connection, id: &str) -> rusqlite::Result<String>
 /// [`canonical_in`] on the store's connection.
 pub async fn canonical(store: &MemoryStore, id: &str) -> Result<String, MemoryError> {
     let id = id.to_string();
-    store.conn.call(move |c| canonical_in(c, &id)).await.map_err(MemoryError::Connection)
+    store.conn.call(move |c| canonical_in(c, &id)).await.map_err(MemoryError::from)
 }
 
 /// How long a merge waits for the saves of its two projects still in the
@@ -106,7 +107,7 @@ pub enum MergeError {
 
 impl From<rusqlite::Error> for MergeError {
     fn from(e: rusqlite::Error) -> Self {
-        MergeError::Store(MemoryError::Sqlite(e))
+        MergeError::Store(MemoryError::from(e))
     }
 }
 
@@ -350,22 +351,14 @@ fn merge_pass(
 }
 
 /// What [`retrying`] needs of the error of a pass: to tell the wait it
-/// repeats on from the rest, and to take a failure of the connection.
-pub(crate) trait Retried: From<rusqlite::Error> + Send + 'static {
+/// repeats on from the rest. A failure of the connection reaches it as a [`MemoryError`].
+pub(crate) trait Retried: From<rusqlite::Error> + From<MemoryError> + std::fmt::Display + Send + 'static {
     fn saves_pending(&self) -> bool;
-    fn connection(e: tokio_rusqlite::Error<Self>) -> Self;
 }
 
 impl Retried for MergeError {
     fn saves_pending(&self) -> bool {
         matches!(self, MergeError::SavesPending(_))
-    }
-
-    fn connection(e: tokio_rusqlite::Error<MergeError>) -> MergeError {
-        match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => MergeError::Store(MemoryError::Backend(other.to_string())),
-        }
     }
 }
 
@@ -391,7 +384,7 @@ where
                 Ok(out)
             })
             .await
-            .map_err(E::connection);
+            .map_err(failed_call::<_, E>(ClosedAs::AsIs));
         match result {
             Err(e) if e.saves_pending() && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(SAVES_POLL).await;
@@ -617,7 +610,7 @@ async fn record_copies(store: &MemoryStore, merge_id: i64, agents: Vec<String>) 
             tx.commit()
         })
         .await
-        .map_err(MemoryError::Connection)
+        .map_err(MemoryError::from)
 }
 
 /// Merges `source` into `target`: everything under `source` moves there and

@@ -4,6 +4,7 @@ use std::sync::{Arc, Once};
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
+use crate::memory::error::{failed_migration};
 use crate::memory::backup::{self, SchemaPlan};
 use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
@@ -208,7 +209,7 @@ impl MemoryStore {
         let path = base_dir.join("memory.db");
         // Connection::open returns Result<_, rusqlite::Error>
         let conn = Connection::open(&path).await
-            .map_err(MemoryError::Sqlite)?;
+            .map_err(MemoryError::from)?;
         // First, before any pragma: switching the journal mode rewrites the
         // file header, and a database this binary refuses must stay untouched.
         let plan = check_schema(&conn).await?;
@@ -248,7 +249,7 @@ impl MemoryStore {
                 Ok(backup::snapshot_into(c, &backups, backup::Reason::PreMigration))
             })
             .await
-            .map_err(MemoryError::Connection)??;
+            .map_err(MemoryError::from)??;
         }
         run_migrations(&conn).await?;
         Ok(Self {
@@ -272,7 +273,7 @@ impl MemoryStore {
         ensure_vec0_registered();
         // Connection::open_in_memory returns Result<_, rusqlite::Error>
         let conn = Connection::open_in_memory().await
-            .map_err(MemoryError::Sqlite)?;
+            .map_err(MemoryError::from)?;
         register_udfs(&conn).await?;
         run_migrations(&conn).await?;
         Ok(Self {
@@ -326,7 +327,7 @@ impl MemoryStore {
                 .conn
                 .call(move |c| -> rusqlite::Result<_> { Ok(backup::snapshot_into(c, &into, reason)) })
                 .await
-                .map_err(MemoryError::Connection)?
+                .map_err(MemoryError::from)?
                 .map_err(MemoryError::from);
         };
         tokio::task::spawn_blocking(move || {
@@ -415,7 +416,7 @@ impl MemoryStore {
                 }
             })
             .await
-            .map_err(MemoryError::Connection)
+            .map_err(MemoryError::from)
     }
 }
 
@@ -467,7 +468,7 @@ async fn check_schema(conn: &Connection) -> Result<SchemaPlan, MemoryError> {
     let applied = conn
         .call(|c| backup::read_history(c))
         .await
-        .map_err(MemoryError::Connection)?;
+        .map_err(MemoryError::from)?;
     match backup::schema_plan(&applied, &backup::known_migrations()) {
         SchemaPlan::Newer { db, binary } => Err(MemoryError::SchemaNewer { db, binary }),
         SchemaPlan::Diverged { version } => Err(MemoryError::SchemaDiverged { version }),
@@ -480,28 +481,7 @@ async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
         configured(crate::memory::migrations::runner()).run(c)
     })
     .await
-    .map_err(|e| match e {
-        tokio_rusqlite::Error::ConnectionClosed => {
-            // Connection was closed before migrations could run — treat as SQLite error.
-            MemoryError::Sqlite(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::InternalMalfunction,
-                    extended_code: 0,
-                },
-                Some("connection closed during migration".to_string()),
-            ))
-        }
-        tokio_rusqlite::Error::Close((_, db_err)) => {
-            MemoryError::Sqlite(db_err)
-        }
-        tokio_rusqlite::Error::Error(refinery_err) => {
-            MemoryError::Migration(refinery_err)
-        }
-        // non_exhaustive — catch-all for future tokio_rusqlite::Error variants
-        _ => MemoryError::Internal(
-            "unexpected tokio-rusqlite error during migration".to_string()
-        ),
-    })
+    .map_err(failed_migration)
     .map(|_report| ())?;
     Ok(())
 }
@@ -546,6 +526,28 @@ pub(crate) async fn seed_on_disk(dir: &Path, target: Option<i32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_migration_keeps_its_text() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        let broken = conn
+            .call(|c| {
+                let mut migrations = crate::memory::migrations::runner().get_migrations().clone();
+                migrations.push(refinery::Migration::unapplied("V9__broken", "THIS IS NOT SQL;").unwrap());
+                configured(refinery::Runner::new(&migrations)).run(c)
+            })
+            .await;
+        let Err(tokio_rusqlite::Error::Error(cause)) = broken else {
+            panic!("the broken V9 must fail the run: {broken:?}");
+        };
+        assert_eq!(MemoryError::from(cause).to_string(), "Migration failed: `error applying migrations`, `near \"THIS\": syntax error in THIS IS NOT SQL; at offset 0`");
+
+        conn.clone().close().await.unwrap();
+        let closed = run_migrations(&conn).await.unwrap_err();
+        assert_eq!(closed.to_string(), "SQLite error: connection closed during migration");
+    }
 
     #[tokio::test]
     async fn a_snapshot_is_an_event_with_its_reason_and_size() {

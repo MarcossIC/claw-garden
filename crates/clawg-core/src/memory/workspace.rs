@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::prompt_builder::indent_continuations;
 use crate::memory::search::{reach_predicate, reader_bind};
@@ -442,13 +443,7 @@ async fn fetch_auto_rows(
             Ok(AutoRows { user_prefs, arch_decisions })
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during fetch_auto_rows".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+        .map_err(failed_call(ClosedAs::During("fetch_auto_rows")))
 }
 
 fn map_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryLine> {

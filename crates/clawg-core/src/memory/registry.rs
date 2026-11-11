@@ -13,6 +13,7 @@ use std::sync::Arc;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::identity::Ground;
 use crate::memory::merge::{canonical_in, MAX_MERGE_HOPS};
@@ -237,7 +238,7 @@ struct Found {
 /// no registration recorded a project in, and whether each path of a declared
 /// subfolder is there are read from the disk on a blocking thread.
 pub async fn list_projects(store: &MemoryStore, ground: Arc<dyn Ground>) -> Result<Vec<ListedProject>, MemoryError> {
-    let stored = store.conn.call(|c| stored_in(c)).await.map_err(MemoryError::Connection)?;
+    let stored = store.conn.call(|c| stored_in(c)).await.map_err(MemoryError::from)?;
     tokio::task::spawn_blocking(move || {
         let found: Vec<Found> = stored
             .folders
@@ -374,7 +375,7 @@ fn pending_pairs(
 /// [`list_projects`] lists them, each with the other project.
 pub async fn pending_suggestions(store: &MemoryStore, id: &str) -> Result<Vec<ListedSuggestion>, MemoryError> {
     let id = id.to_string();
-    store.conn.call(move |c| pending_suggestions_in(c, &id)).await.map_err(MemoryError::Connection)
+    store.conn.call(move |c| pending_suggestions_in(c, &id)).await.map_err(MemoryError::from)
 }
 
 fn pending_suggestions_in(c: &Connection, id: &str) -> rusqlite::Result<Vec<ListedSuggestion>> {
@@ -408,7 +409,7 @@ pub async fn suggestion_between(store: &MemoryStore, a: &str, b: &str) -> Result
     store
         .conn
         .call(move |c| {
-            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::Sqlite(e));
+            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::from(e));
             for id in [&a, &b] {
                 let known: bool =
                     c.query_row("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1)", [id], |r| r.get(0)).map_err(sql)?;
@@ -429,10 +430,7 @@ pub async fn suggestion_between(store: &MemoryStore, a: &str, b: &str) -> Result
             Ok(pending_suggestions_in(c, &a).map_err(sql)?.into_iter().find(|s| s.other_id == b))
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => KeepApartError::Store(MemoryError::Backend(other.to_string())),
-        })
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 /// Every delete nobody undid or purged, oldest first, with the project it
@@ -463,7 +461,7 @@ pub async fn list_deletes(store: &MemoryStore) -> Result<Vec<ListedDelete>, Memo
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .await
-        .map_err(MemoryError::Connection)
+        .map_err(MemoryError::from)
 }
 
 /// Why a name may not be a project's.
@@ -520,7 +518,7 @@ pub async fn rename_project(store: &MemoryStore, id: &str, name: &str) -> Result
     store
         .conn
         .call(move |c| {
-            let sql = |e: rusqlite::Error| RenameError::Store(MemoryError::Sqlite(e));
+            let sql = |e: rusqlite::Error| RenameError::Store(MemoryError::from(e));
             let tx = c.transaction().map_err(sql)?;
             let project = tx
                 .query_row("SELECT id, name, born, reviewed, created_at FROM project WHERE id = ?1", [&id], project_from)
@@ -556,10 +554,7 @@ pub async fn rename_project(store: &MemoryStore, id: &str, name: &str) -> Result
             Ok(Project { name, reviewed: true, ..project })
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => RenameError::Store(MemoryError::Backend(other.to_string())),
-        })
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 /// What [`keep_apart`] answered.
@@ -595,7 +590,7 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
     store
         .conn
         .call(move |c| {
-            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::Sqlite(e));
+            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::from(e));
             let tx = c.transaction().map_err(sql)?;
             for id in [&a, &b] {
                 let known: bool =
@@ -647,10 +642,7 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
             Ok(KeptApart { project_id: a, other_id: b, answered })
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => KeepApartError::Store(MemoryError::Backend(other.to_string())),
-        })
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 /// What tells two names apart for a person: the name in Unicode lower case,
@@ -846,7 +838,7 @@ pub async fn resolve_project(store: &MemoryStore, reference: &str, options: Reso
     store
         .conn
         .call(move |c| {
-            let sql = |e: rusqlite::Error| ResolveError::Store(MemoryError::Sqlite(e));
+            let sql = |e: rusqlite::Error| ResolveError::Store(MemoryError::from(e));
             let tx = c.transaction().map_err(sql)?;
             let resolved = |id: String, created: bool| -> Result<Resolution, ResolveError> {
                 let (name, deleted): (String, bool) = tx
@@ -922,10 +914,7 @@ pub async fn resolve_project(store: &MemoryStore, reference: &str, options: Reso
             Ok(resolution)
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => ResolveError::Store(MemoryError::Backend(other.to_string())),
-        })
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 /// What a reference names where a project must already exist, as a move's
@@ -957,7 +946,7 @@ pub async fn find_project(store: &MemoryStore, reference: &str) -> Result<Named,
             })
         })
         .await
-        .map_err(MemoryError::Connection)
+        .map_err(MemoryError::from)
 }
 
 #[cfg(test)]

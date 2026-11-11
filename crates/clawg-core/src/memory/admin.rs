@@ -6,6 +6,7 @@
 
 use serde::Serialize;
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::chunker::embedding_text;
 use crate::memory::contradiction::{detect_contradiction, excerpt, Candidate};
@@ -220,13 +221,13 @@ pub async fn update_memory_core(
         .conn
         .call(move |c| -> Result<Option<UpdatedRow>, UpdateError> {
             use rusqlite::OptionalExtension;
-            let tx = c.transaction().map_err(MemoryError::Sqlite)?;
+            let tx = c.transaction().map_err(MemoryError::from)?;
             let current: Option<(i64, f64, String, i64, Option<String>)> = tx
                 .query_row(UPDATE_READ, rusqlite::params![id, reach], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })
                 .optional()
-                .map_err(MemoryError::Sqlite)?;
+                .map_err(MemoryError::from)?;
             let Some((tier, importance, memory_type, access_count, project_id)) = current else {
                 return Ok(None);
             };
@@ -252,12 +253,12 @@ pub async fn update_memory_core(
             let new_tier = retier(tier, access_count, (importance, &memory_type), (new_importance, &new_type));
             if patch.importance.is_some() || patch.memory_type.is_some() {
                 tx.execute(UPDATE_WRITE, rusqlite::params![new_importance, new_type, new_tier, now_ms, id])
-                    .map_err(MemoryError::Sqlite)?;
+                    .map_err(MemoryError::from)?;
             }
             if let Some(report) = &mut moved {
-                apply_one_in(&tx, report, TimestampMs::from_unix_millis(now_ms)).map_err(MemoryError::Sqlite)?;
+                apply_one_in(&tx, report, TimestampMs::from_unix_millis(now_ms)).map_err(MemoryError::from)?;
             }
-            tx.commit().map_err(MemoryError::Sqlite)?;
+            tx.commit().map_err(MemoryError::from)?;
             // Moved or already there, the row is in the target now.
             let project_id = patch.project.clone().unwrap_or(project_id);
             Ok(Some(UpdatedRow {
@@ -271,13 +272,7 @@ pub async fn update_memory_core(
             }))
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during update_memory_core".into()).into()
-            }
-            other => MemoryError::Backend(other.to_string()).into(),
-        })
+        .map_err(failed_call(ClosedAs::During("update_memory_core")))
 }
 
 // ---------------------------------------------------------------------------
@@ -353,13 +348,7 @@ pub async fn delete_memory_core(
             Ok(deleted)
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during delete_memory_core".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+        .map_err(failed_call::<rusqlite::Error, _>(ClosedAs::During("delete_memory_core")))
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +493,7 @@ async fn restore_candidates(
             rows.collect()
         })
         .await
-        .map_err(backend("restore_memory_core"))?;
+        .map_err(failed_call::<_, MemoryError>(ClosedAs::During("restore_memory_core")))?;
     Ok(detect_contradiction(store, unit, content, &saver, project_id.as_deref(), memory_type, &siblings)
         .await
         .into_iter()
@@ -602,7 +591,7 @@ pub async fn restore_memory_core(
             .optional()
         })
         .await
-        .map_err(backend("restore_memory_core"))?;
+        .map_err(failed_call::<_, MemoryError>(ClosedAs::During("restore_memory_core")))?;
     let Some(DeletedRow { content, context, project_id, memory_type }) = found else {
         return Err(RestoreError::NotFound(id));
     };
@@ -681,20 +670,12 @@ pub async fn restore_memory_core(
             Ok(Outcome::Restored(row))
         })
         .await
-        .map_err(backend("restore_memory_core"))?;
+        .map_err(failed_call::<rusqlite::Error, MemoryError>(ClosedAs::During("restore_memory_core")))?;
     match outcome {
         Outcome::Restored(row) => Ok(row),
         Outcome::Gone => Err(RestoreError::NotFound(id)),
         Outcome::Twin(twin) => Err(RestoreError::LiveTwin { id, twin }),
         Outcome::TopicTaken(key, live) => Err(RestoreError::TopicTaken { id, key, live }),
-    }
-}
-
-fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryError {
-    move |e| match e {
-        tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-        tokio_rusqlite::Error::ConnectionClosed => MemoryError::Backend(format!("connection closed during {context}")),
-        other => MemoryError::Backend(other.to_string()),
     }
 }
 
@@ -890,13 +871,7 @@ pub async fn list_memories_core(
         .conn
         .call(move |c| query_memory_rows(c, &filter, limit, offset))
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during list_memories_core".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+        .map_err(failed_call(ClosedAs::During("list_memories_core")))
 }
 
 // Column order here is the contract with `map_memory_row` below.
@@ -921,13 +896,7 @@ pub async fn get_memory_core(store: &MemoryStore, id: i64) -> Result<Option<Memo
             c.query_row(&format!("{SELECT_MEMORY} WHERE id = ?1"), [id], map_memory_row).optional()
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during get_memory_core".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+        .map_err(failed_call(ClosedAs::During("get_memory_core")))
 }
 
 fn query_memory_rows(
@@ -1131,13 +1100,7 @@ pub async fn memory_stats_core(
             Ok(stats)
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during memory_stats_core".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+        .map_err(failed_call(ClosedAs::During("memory_stats_core")))
 }
 
 #[cfg(test)]

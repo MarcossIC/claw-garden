@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
 use crate::memory::identity::{candidate_id, derive_project_id, Checkout, Ground, RootCommit, CANDIDATES};
@@ -487,7 +488,7 @@ fn settle_in(
     commit: &RootCommit,
     pending: &Pending,
 ) -> Result<Settlement, RegisterError> {
-    let sql = |e: rusqlite::Error| RegisterError::Store(MemoryError::Sqlite(e));
+    let sql = |e: rusqlite::Error| RegisterError::Store(MemoryError::from(e));
     let key = checkout.key.as_deref();
     let known = match commit {
         RootCommit::Known(commit) => Some(commit.as_str()),
@@ -563,7 +564,10 @@ pub(crate) fn plan_ids_in(c: &Connection, roots: &[PathBuf], ground: &dyn Ground
         let commit = recorded_commit(&folders, checkout.stamp.as_deref()).unwrap_or_else(|| ground.root_commit(root));
         let settled = match settle_in(c, root, &folders, &checkout, &commit, &pending) {
             Ok(settled) => Some(settled),
-            Err(RegisterError::Store(MemoryError::Sqlite(e))) => return Err(e),
+            Err(RegisterError::Store(e)) => match e.into_sqlite() {
+                Ok(e) => return Err(e),
+                Err(_) => None,
+            },
             Err(_) => None,
         };
         let root_id = settled.as_ref().map_or_else(|| derive_project_id(root), |s| s.folder.id.clone());
@@ -664,7 +668,7 @@ fn plan_in(
     may_look: bool,
 ) -> Result<Planned, RegisterError> {
     let root_path = reg.root.to_string_lossy().into_owned();
-    let sql = |e: rusqlite::Error| RegisterError::Store(MemoryError::Sqlite(e));
+    let sql = |e: rusqlite::Error| RegisterError::Store(MemoryError::from(e));
     let folders = folders_in(c, reg.root, &Pending::default()).map_err(sql)?;
     let commit = match (recorded_commit(&folders, reg.checkout.stamp.as_deref()), &disk.commit) {
         (Some(recorded), _) => recorded,
@@ -927,7 +931,7 @@ pub async fn register_project(
                 assigned,
                 subpath: subpath.as_deref(),
             };
-            let tx = c.transaction().map_err(MemoryError::Sqlite)?;
+            let tx = c.transaction().map_err(MemoryError::from)?;
             let plan = match plan_in(&tx, &reg, &disk, may_read, may_look)? {
                 Planned::Plan(plan) => plan,
                 Planned::Commit => return Ok(Pass::WouldRead),
@@ -937,14 +941,14 @@ pub async fn register_project(
                 return Ok(Pass::WouldMove);
             }
             let (rekeyed, move_id, index_docs) =
-                write_in(&tx, &reg, &plan, TimestampMs::now()).map_err(MemoryError::Sqlite)?;
+                write_in(&tx, &reg, &plan, TimestampMs::now()).map_err(MemoryError::from)?;
             // Only once the root settled and its ids joined there: a plan made
             // for the subproject would join the repository's rows into it.
             let subproject = match reg.subpath {
-                Some(subpath) if reg.assigned => declared_in(&tx, &plan.project_id, subpath).map_err(MemoryError::Sqlite)?,
+                Some(subpath) if reg.assigned => declared_in(&tx, &plan.project_id, subpath).map_err(MemoryError::from)?,
                 _ => None,
             };
-            tx.commit().map_err(MemoryError::Sqlite)?;
+            tx.commit().map_err(MemoryError::from)?;
             let outcome = RegisterOutcome {
                 project_id: plan.project_id,
                 root_id: plan.root_id,
@@ -958,14 +962,14 @@ pub async fn register_project(
         }
     };
     let mut disk = FromDisk::default();
-    let mut outcome = store.conn.call(pass(None, disk.clone(), true, true)).await.map_err(connection_error)?;
+    let mut outcome = store.conn.call(pass(None, disk.clone(), true, true)).await.map_err(failed_call::<_, RegisterError>(ClosedAs::AsIs))?;
     if let Pass::WouldRead = outcome {
         // `git` may take up to ROOT_COMMIT_WAIT, which the connection's
         // thread must not spend.
         let (root, ground) = (reg.root.to_path_buf(), ground.clone());
         let commit = tokio::task::spawn_blocking(move || ground.root_commit(&root)).await.unwrap_or(RootCommit::Later);
         disk.commit = Some(commit);
-        outcome = store.conn.call(pass(None, disk.clone(), false, true)).await.map_err(connection_error)?;
+        outcome = store.conn.call(pass(None, disk.clone(), false, true)).await.map_err(failed_call::<_, RegisterError>(ClosedAs::AsIs))?;
     }
     if let Pass::WouldLook(recorded) = outcome {
         // A look that fails finds nothing gone, which keeps the root apart.
@@ -973,11 +977,11 @@ pub async fn register_project(
             recorded.into_iter().filter(|(path, stamp)| !ground.recorded_checkout_present(path, stamp.as_deref())).collect()
         });
         disk.gone = Some(gone.await.unwrap_or_default());
-        outcome = store.conn.call(pass(None, disk.clone(), false, false)).await.map_err(connection_error)?;
+        outcome = store.conn.call(pass(None, disk.clone(), false, false)).await.map_err(failed_call::<_, RegisterError>(ClosedAs::AsIs))?;
     }
     if let Pass::WouldMove = outcome {
         let snapshot = store.snapshot(backups.to_path_buf(), Reason::PreRekey).await?;
-        outcome = store.conn.call(pass(Some(snapshot), disk, false, false)).await.map_err(connection_error)?;
+        outcome = store.conn.call(pass(Some(snapshot), disk, false, false)).await.map_err(failed_call::<_, RegisterError>(ClosedAs::AsIs))?;
     }
     let Pass::Done(outcome, legacy) = outcome else {
         unreachable!("a pass stops only for what no pass before it asked, and a pass after the snapshot always writes");
@@ -991,13 +995,6 @@ pub async fn register_project(
         }
     }
     Ok(outcome)
-}
-
-fn connection_error(e: tokio_rusqlite::Error<RegisterError>) -> RegisterError {
-    match e {
-        tokio_rusqlite::Error::Error(e) => e,
-        other => RegisterError::Store(MemoryError::Backend(other.to_string())),
-    }
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@
 
 use serde::Serialize;
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::admin::{map_memory_row, MemoryAdminRow, SELECT_MEMORY};
 use crate::memory::clock::TimestampMs;
 use crate::memory::search::{reach_predicate, reader_bind, reader_predicate};
@@ -238,13 +239,6 @@ fn reviewed_at(c: &rusqlite::Connection, scope: Scope<'_>) -> rusqlite::Result<O
     .optional()
 }
 
-fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryError {
-    move |e| match e {
-        tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-        other => MemoryError::Backend(format!("{context}: {other}")),
-    }
-}
-
 /// The memories of a scope that no conclusion covers yet, with the
 /// conclusions already drawn there, and the review recorded as of `now`.
 ///
@@ -281,7 +275,7 @@ pub async fn synthesis_core(
             Ok(found)
         })
         .await
-        .map_err(backend("synthesis"))
+        .map_err(failed_call(ClosedAs::Named("synthesis")))
 }
 
 /// How many pending memories of a scope that `reader` reaches arrived after
@@ -302,7 +296,7 @@ pub async fn unreviewed_count(
             count(c, &unreviewed_condition(), scope, after)
         })
         .await
-        .map_err(backend("unreviewed count"))
+        .map_err(failed_call(ClosedAs::Named("unreviewed count")))
 }
 
 /// How many conclusions of a scope that `reader` reaches lost a source after
@@ -342,7 +336,7 @@ pub async fn conclusions_to_review_count(
             Ok(n as usize)
         })
         .await
-        .map_err(backend("conclusions to review count"))
+        .map_err(failed_call(ClosedAs::Named("conclusions to review count")))
 }
 
 /// The ids among `ids` that name a `memory` row not deleted but superseded,
@@ -375,7 +369,7 @@ pub async fn replaced_memory_ids(
             Ok(found)
         })
         .await
-        .map_err(backend("source lookup"))
+        .map_err(failed_call(ClosedAs::Named("source lookup")))
 }
 
 /// The ids among `ids` that name a `memory` row not deleted, ascending. A row
@@ -406,7 +400,7 @@ pub async fn existing_memory_ids(
             Ok(found)
         })
         .await
-        .map_err(backend("source lookup"))
+        .map_err(failed_call(ClosedAs::Named("source lookup")))
 }
 
 #[cfg(test)]

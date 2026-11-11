@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::memory::store_lock::{StoreHolder, StoreLock};
-use crate::memory::MemoryError;
+use crate::memory::{MemoryError, StorageError};
 
 /// One migration as the schema plan compares it: applied to a database
 /// (`refinery_schema_history`) or embedded in this binary.
@@ -203,7 +203,7 @@ pub enum BackupError {
     Snapshot {
         path: PathBuf,
         #[source]
-        source: rusqlite::Error,
+        source: StorageError,
     },
     #[error("could not finish the snapshot {path}: {source}")]
     Io {
@@ -373,7 +373,7 @@ pub fn snapshot_into(
     let _ = std::fs::remove_file(&tmp);
     if let Err(source) = c.execute("VACUUM INTO ?1", [target]) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(BackupError::Snapshot { path, source });
+        return Err(BackupError::Snapshot { path, source: source.into() });
     }
     if let Err(source) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
@@ -1236,6 +1236,36 @@ mod tests {
 
         assert!(matches!(result, Err(BackupError::Snapshot { .. })), "got {result:?}");
         assert_eq!(files_in(&backups), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_in_a_transaction_says_why_it_failed() {
+        let dir = crate::test_dir::test_dir();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let target = dir.path().join("backups");
+
+        let result = store
+            .conn
+            .call(move |c| -> rusqlite::Result<_> {
+                c.execute_batch("BEGIN")?;
+                let result = snapshot_into(c, &target, Reason::Manual);
+                c.execute_batch("ROLLBACK")?;
+                Ok(result)
+            })
+            .await
+            .unwrap();
+        store.conn.clone().close().await.unwrap();
+
+        let failure = result.unwrap_err();
+        let BackupError::Snapshot { path, .. } = &failure else {
+            panic!("got {failure:?}");
+        };
+        assert_eq!(
+            failure.to_string(),
+            format!("could not write the snapshot {}: cannot VACUUM from within a transaction", path.display())
+        );
+        let cause = std::error::Error::source(&failure).expect("the snapshot error names its cause");
+        assert_eq!(cause.to_string(), "cannot VACUUM from within a transaction");
     }
 
     fn m(version: i32, checksum: u64) -> MigrationId {

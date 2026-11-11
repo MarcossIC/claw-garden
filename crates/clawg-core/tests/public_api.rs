@@ -131,6 +131,42 @@ async fn a_second_runtime_open_on_the_same_dir_is_refused_naming_the_first_holde
     first.close().await;
 }
 
+// ── Storage failures, seen from outside the crate ─────────────────────────
+
+/// Whatever the backend is, a call it fails reaches another crate as one
+/// variant.
+#[tokio::test]
+async fn a_call_on_a_closed_store_fails_with_a_storage_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (runtime, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Eval).await.expect("open");
+    runtime.close().await;
+
+    let failure = runtime.store.probe_wait().await.expect_err("the store is closed");
+    assert!(matches!(failure, MemoryError::Storage(_)), "{failure:?}");
+}
+
+/// The variants another crate can tell apart. A match with no wildcard, so a
+/// new variant, or one that names the backend again, has to be written here.
+#[test]
+fn memory_error_tells_apart_what_another_crate_handles() {
+    fn name(e: &MemoryError) -> &'static str {
+        match e {
+            MemoryError::Storage(_) => "storage",
+            MemoryError::Internal(_) => "internal",
+            MemoryError::WorkspaceIo { .. } => "workspace_io",
+            MemoryError::StoreInUse { .. } => "store_in_use",
+            MemoryError::SchemaNewer { .. } => "schema_newer",
+            MemoryError::SchemaDiverged { .. } => "schema_diverged",
+            MemoryError::Backup(_) => "backup",
+            MemoryError::Purge(_) => "purge",
+            MemoryError::DataDir { .. } => "data_dir",
+            MemoryError::StoreLockIo { .. } => "store_lock_io",
+        }
+    }
+    assert_eq!(name(&MemoryError::Internal("boom".into())), "internal");
+    assert_eq!(name(&MemoryError::SchemaDiverged { version: 3 }), "schema_diverged");
+}
+
 // ── MemoryRuntime boots on a plain tokio runtime ──────────────────────────
 
 /// A plain tokio runtime, with no host framework, can open the store and get a

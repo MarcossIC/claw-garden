@@ -111,6 +111,29 @@ fn no_production_code_names_the_retired_tables() {
     assert!(found.is_empty(), "these lines name a table V32 dropped:\n{}", found.join("\n"));
 }
 
+/// A failed call on the store's connection is worded in one place,
+/// `memory/error.rs`, so no other code of the core matches on the connection's
+/// error.
+#[test]
+fn no_memory_code_translates_a_connection_error_by_hand() {
+    const TRANSLATES: &str = "clawg-core/src/memory/error.rs";
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
+    let mut files = Vec::new();
+    rust_files(&crates.join("clawg-core/src"), &mut files);
+    assert!(!files.is_empty(), "no sources found under {}", crates.display());
+
+    let mut found = Vec::new();
+    for file in &files {
+        let shown = file.strip_prefix(crates).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        if shown == TRANSLATES {
+            continue;
+        }
+        let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        found.extend(production_lines_naming(&source, &["tokio_rusqlite::Error::"]).into_iter().map(|n| format!("{shown}:{n}")));
+    }
+    assert!(found.is_empty(), "translate a failed call with `failed_call` or a `From` of {TRANSLATES}:\n{}", found.join("\n"));
+}
+
 /// The lines, from 1, of the code before the first `#[cfg(test)]` module of
 /// `source` that name one of `names`.
 fn production_lines_naming(source: &str, names: &[&str]) -> Vec<usize> {

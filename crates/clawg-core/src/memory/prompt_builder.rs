@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::pieces::read_save_core;
 use crate::memory::provenance::{mark, preference_mark};
 use crate::preferences::Lang;
@@ -1014,7 +1015,7 @@ async fn fetch_last_session(
             Ok(None)
         })
         .await
-        .map_err(|e| MemoryError::Backend(format!("fetch_last_session: {e}")))
+        .map_err(|e| MemoryError::channel(format!("fetch_last_session: {e}")))
 }
 
 /// A row RECENT may print: a live row of the reader's own (`?1`) since `?3`,
@@ -1077,7 +1078,7 @@ async fn fetch_recent_saves(
 ) -> Result<Vec<RankedHit>, MemoryError> {
     let (agent, project) = (agent_id.to_string(), project_bind(project_id));
     let printed = serde_json::to_string(&emitted.ids().collect::<Vec<i64>>())
-        .map_err(|e| MemoryError::Backend(format!("fetch_recent_saves: {e}")))?;
+        .map_err(|e| MemoryError::channel(format!("fetch_recent_saves: {e}")))?;
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     store
         .conn
@@ -1107,7 +1108,7 @@ async fn fetch_recent_saves(
             rows.collect()
         })
         .await
-        .map_err(|e| MemoryError::Backend(format!("fetch_recent_saves: {e}")))
+        .map_err(|e| MemoryError::channel(format!("fetch_recent_saves: {e}")))
 }
 
 /// Partitions hits into (recent, longterm) at `now - RECENT_WINDOW_MS`. A stamp
@@ -1322,13 +1323,7 @@ async fn fetch_active_conflicts(
             Ok(pairs)
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during fetch_active_conflicts".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+        .map_err(failed_call(ClosedAs::During("fetch_active_conflicts")))
 }
 
 // ---------------------------------------------------------------------------

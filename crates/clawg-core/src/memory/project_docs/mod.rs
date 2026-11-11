@@ -20,7 +20,7 @@ use crate::memory::embedder::{longest_first, passage_token_counts, EmbedError, E
 use crate::memory::redact::redact;
 use crate::memory::search::{fts_match_expression, MAX_LEXICAL_TOKENS};
 use crate::memory::vector::to_unit;
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryStore, StorageError};
 
 use tokenizers::Tokenizer;
 
@@ -68,7 +68,13 @@ pub enum DocIndexError {
     #[error("embedding the query failed: {0}")]
     Query(String),
     #[error("documentation index store error: {0}")]
-    Store(#[from] tokio_rusqlite::Error),
+    Store(StorageError),
+}
+
+impl From<tokio_rusqlite::Error> for DocIndexError {
+    fn from(e: tokio_rusqlite::Error) -> Self {
+        DocIndexError::Store(e.into())
+    }
 }
 
 /// What one refresh did, counted in docs except for `passages` and `reused`.
@@ -1017,6 +1023,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::memory::embedder::{FakeEmbedder, EMBED_MAX_TOKENS};
+
+    #[test]
+    fn a_store_error_of_the_docs_index_keeps_its_text() {
+        let closed = DocIndexError::from(tokio_rusqlite::Error::ConnectionClosed);
+        assert_eq!(closed.to_string(), "documentation index store error: ConnectionClosed");
+        let sqlite = DocIndexError::from(tokio_rusqlite::Error::Error(rusqlite::Error::InvalidQuery));
+        assert_eq!(sqlite.to_string(), "documentation index store error: Error(\"Query is not read-only\")");
+    }
 
     #[test]
     fn production_never_names_the_archive() {

@@ -12,6 +12,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::merge::{canonical_in, merge_core, MergeError, MergeReport};
 use crate::memory::project_delete::{deleted_in, deleted_message};
@@ -152,7 +153,7 @@ pub enum SubfolderError {
 
 impl From<rusqlite::Error> for SubfolderError {
     fn from(e: rusqlite::Error) -> Self {
-        SubfolderError::Store(MemoryError::Sqlite(e))
+        SubfolderError::Store(MemoryError::from(e))
     }
 }
 
@@ -188,10 +189,7 @@ pub async fn declare_subfolder(
             Ok(step)
         }
     };
-    let step = store.conn.call(decide).await.map_err(|e| match e {
-        tokio_rusqlite::Error::Error(e) => e,
-        other => SubfolderError::Store(MemoryError::Backend(other.to_string())),
-    })?;
+    let step = store.conn.call(decide).await.map_err(failed_call::<_, SubfolderError>(ClosedAs::AsIs))?;
     match step {
         Step::Done(declared) => Ok(declared),
         Step::Merge { other } => {

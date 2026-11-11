@@ -138,7 +138,7 @@ pub enum UndoError {
 
 impl From<rusqlite::Error> for UndoError {
     fn from(e: rusqlite::Error) -> Self {
-        UndoError::Store(MemoryError::Sqlite(e))
+        UndoError::Store(MemoryError::from(e))
     }
 }
 
@@ -673,7 +673,7 @@ where
             .conn
             .call(move |c| batch.iter().map(|k| f(c, k)).collect::<rusqlite::Result<Vec<T>>>())
             .await
-            .map_err(MemoryError::Connection)?;
+            .map_err(MemoryError::from)?;
         out.extend(found);
     }
     Ok(out)
@@ -697,7 +697,7 @@ where
                 rows.collect()
             })
             .await
-            .map_err(MemoryError::Connection)?;
+            .map_err(MemoryError::from)?;
         let full = page.len() == PAGE;
         for (key, item) in page {
             after = key;
@@ -792,7 +792,7 @@ async fn load(store: &MemoryStore, import_id: i64) -> Result<Facts, UndoError> {
         .conn
         .call(move |c| c.query_row("SELECT EXISTS (SELECT 1 FROM memory_import WHERE import_id = ?1)", [import_id], |r| r.get(0)))
         .await
-        .map_err(MemoryError::Connection)?;
+        .map_err(MemoryError::from)?;
     if !known {
         return Err(UndoError::UnknownImport(import_id));
     }
@@ -856,7 +856,7 @@ async fn load(store: &MemoryStore, import_id: i64) -> Result<Facts, UndoError> {
             rows.collect()
         })
         .await
-        .map_err(MemoryError::Connection)?;
+        .map_err(MemoryError::from)?;
     references.extend(disputes.into_iter().filter(|(_, to)| present_set.contains(to)));
 
     let mut pairs: HashMap<(i64, i64), (String, Option<String>)> = each(store, present.clone(), |c, id| {
@@ -1280,7 +1280,7 @@ pub async fn undo_import(store: &MemoryStore, backups: &Path, import_id: i64, dr
                 Ok(done)
             })
             .await
-            .map_err(MemoryError::Connection)?;
+            .map_err(MemoryError::from)?;
         for (id, outcome) in done {
             match outcome {
                 Ok(restored) => {
@@ -1348,7 +1348,7 @@ pub async fn undo_import(store: &MemoryStore, backups: &Path, import_id: i64, dr
             Ok((restored, unfilled, links_removed, removed_projects, removed_remotes, registry))
         })
         .await
-        .map_err(MemoryError::Connection)?;
+        .map_err(MemoryError::from)?;
     report.restored.extend(restored);
     report.restored.sort_unstable();
     report.unfilled = unfilled;

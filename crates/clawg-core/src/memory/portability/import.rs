@@ -163,7 +163,7 @@ pub async fn map_project(store: &MemoryStore, reference: &str) -> Result<MapProj
             })
         })
         .await
-        .map_err(MemoryError::Connection)?;
+        .map_err(MemoryError::from)?;
     match live {
         Ok(id) => Ok(MapProject::Live(id)),
         Err(delete_id) => Err(ImportError::ProjectDeleted { id: reference.trim().to_owned(), delete_id }),
@@ -441,7 +441,7 @@ where
             Ok::<_, rusqlite::Error>((value, started.elapsed()))
         })
         .await
-        .map_err(MemoryError::Connection)?;
+        .map_err(MemoryError::from)?;
     timing.call(asked.elapsed(), ran);
     Ok(value)
 }
