@@ -24,9 +24,6 @@
 //! `None` for NULL or malformed JSON rather than panicking.
 
 pub mod bootstrap;
-pub mod store_insert;
-pub mod worker;
-pub mod outbox;
 pub mod portability;
 pub mod project_docs;
 pub mod secrets;
@@ -49,7 +46,6 @@ pub use search::{search_all_memories, PiecePosition, RankedHit, SearchScope};
 /// search would count its pool under test and not in a release.
 pub use search::MemoryPool;
 
-pub mod spill;
 pub(crate) mod maintenance;
 pub mod admin;
 pub mod synthesis;
@@ -107,3 +103,9 @@ pub use projects::project_delete;
 pub use projects::registry;
 pub use projects::relocate;
 pub use projects::subfolder;
+
+mod ingest;
+pub use ingest::outbox;
+pub use ingest::spill;
+pub use ingest::store_insert;
+pub use ingest::worker;
