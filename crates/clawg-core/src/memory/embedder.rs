@@ -152,6 +152,19 @@ pub const E5_MODEL_ID: &str = "multilingual-e5-small/mean";
 /// that must be re-embedded, never mixed with new ones.
 pub const LEGACY_CLS_MODEL_ID: &str = "multilingual-e5-small";
 
+impl EmbeddingIdentity {
+    /// Reads all four fields off ONE embedder instance — a mismatch cannot be
+    /// assembled by pairing metadata from two different sources.
+    pub(crate) fn of(e: &dyn Embedder) -> Self {
+        Self {
+            model_id: e.model_id().to_string(),
+            dim: e.dimensions(),
+            query_prefix: e.query_prefix().to_string(),
+            passage_prefix: e.passage_prefix().to_string(),
+        }
+    }
+}
+
 /// The contract this binary's embedder records its vectors under, known
 /// without loading the model, so a stopped store can be checked against it.
 pub fn expected_contract() -> EmbeddingIdentity {
@@ -1710,5 +1723,57 @@ mod tests {
         let pooled = pool_and_normalize(&hidden, &[1, 3, 2], &[1, 1, 0]).unwrap();
         let bits: Vec<u32> = pooled[0].iter().map(|x| x.to_bits()).collect();
         assert_eq!(bits, vec![0x3f0e00d5, 0x3f550140], "pooling and normalization changed: {ask}");
+    }
+
+    /// Test-only embedder double with configurable, independently-settable
+    /// query/passage prefixes — `FakeEmbedder` returns `""` for both, which
+    /// cannot exercise a prefix-only mismatch.
+    struct MockEmbedder {
+        model_id: String,
+        dim: usize,
+        query_prefix: String,
+        passage_prefix: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for MockEmbedder {
+        async fn embed_with_role(
+            &self,
+            _text: &str,
+            _role: EmbedRole,
+        ) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![0.0; self.dim])
+        }
+        fn dimensions(&self) -> usize {
+            self.dim
+        }
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+        fn query_prefix(&self) -> &str {
+            &self.query_prefix
+        }
+        fn passage_prefix(&self) -> &str {
+            &self.passage_prefix
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // EmbeddingIdentity::of — reads all 4 fields off one embedder instance
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn embedding_identity_of_reads_all_four_fields_off_one_embedder() {
+        let mock = MockEmbedder {
+            model_id: "multilingual-e5-small".to_string(),
+            dim: 384,
+            query_prefix: "query: ".to_string(),
+            passage_prefix: "passage: ".to_string(),
+        };
+        let got = EmbeddingIdentity::of(&mock);
+        assert_eq!(got.model_id, "multilingual-e5-small");
+        assert_eq!(got.dim, 384);
+        assert_eq!(got.query_prefix, "query: ");
+        assert_eq!(got.passage_prefix, "passage: ");
     }
 }

@@ -6,7 +6,6 @@ use tokio_rusqlite::Connection;
 
 use crate::memory::error::{failed_migration};
 use crate::memory::backup::{self, SchemaPlan};
-use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
 use crate::memory::store_lock::{StoreHolder, StoreLock};
@@ -32,19 +31,6 @@ pub struct EmbeddingIdentity {
     pub dim: usize,
     pub query_prefix: String,
     pub passage_prefix: String,
-}
-
-impl EmbeddingIdentity {
-    /// Reads all four fields off ONE embedder instance — a mismatch cannot be
-    /// assembled by pairing metadata from two different sources.
-    pub(crate) fn of(e: &dyn Embedder) -> Self {
-        Self {
-            model_id: e.model_id().to_string(),
-            dim: e.dimensions(),
-            query_prefix: e.query_prefix().to_string(),
-            passage_prefix: e.passage_prefix().to_string(),
-        }
-    }
 }
 
 /// The `embedding_contract` row as it was actually persisted. `dim` is `i64`
@@ -3269,39 +3255,6 @@ mod tests {
     // Embedding contract: write-if-absent, verify-if-present
     // -----------------------------------------------------------------------
 
-    /// Test-only embedder double with configurable, independently-settable
-    /// query/passage prefixes — `FakeEmbedder` returns `""` for both, which
-    /// cannot exercise a prefix-only mismatch.
-    struct MockEmbedder {
-        model_id: String,
-        dim: usize,
-        query_prefix: String,
-        passage_prefix: String,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::memory::embedder::Embedder for MockEmbedder {
-        async fn embed_with_role(
-            &self,
-            _text: &str,
-            _role: crate::memory::embedder::EmbedRole,
-        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
-            Ok(vec![0.0; self.dim])
-        }
-        fn dimensions(&self) -> usize {
-            self.dim
-        }
-        fn model_id(&self) -> &str {
-            &self.model_id
-        }
-        fn query_prefix(&self) -> &str {
-            &self.query_prefix
-        }
-        fn passage_prefix(&self) -> &str {
-            &self.passage_prefix
-        }
-    }
-
     fn identity(model_id: &str, dim: usize, query_prefix: &str, passage_prefix: &str) -> EmbeddingIdentity {
         EmbeddingIdentity {
             model_id: model_id.to_string(),
@@ -3309,25 +3262,6 @@ mod tests {
             query_prefix: query_prefix.to_string(),
             passage_prefix: passage_prefix.to_string(),
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // EmbeddingIdentity::of — reads all 4 fields off one embedder instance
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn embedding_identity_of_reads_all_four_fields_off_one_embedder() {
-        let mock = MockEmbedder {
-            model_id: "multilingual-e5-small".to_string(),
-            dim: 384,
-            query_prefix: "query: ".to_string(),
-            passage_prefix: "passage: ".to_string(),
-        };
-        let got = EmbeddingIdentity::of(&mock);
-        assert_eq!(got.model_id, "multilingual-e5-small");
-        assert_eq!(got.dim, 384);
-        assert_eq!(got.query_prefix, "query: ");
-        assert_eq!(got.passage_prefix, "passage: ");
     }
 
     // -----------------------------------------------------------------------
