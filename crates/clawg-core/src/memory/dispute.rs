@@ -88,6 +88,12 @@ pub enum ResolveError {
     NotFound(i64),
     #[error("memories {keep} and {other} are not in dispute with each other")]
     NotInDispute { keep: i64, other: i64 },
+    #[error(
+        "the saves of memories {keep} and {other} hold more than one pair ({list}); \
+         pass the two ids of the one to judge",
+        list = pairs.iter().map(|(k, o)| format!("{k} and {o}")).collect::<Vec<_>>().join(", ")
+    )]
+    SeveralPairs { keep: i64, other: i64, pairs: Vec<(i64, i64)> },
     #[error("memory {id} was replaced by memory {by}; resolve that pair instead")]
     SupersededElsewhere { id: i64, by: i64 },
     #[error(transparent)]
@@ -149,16 +155,19 @@ fn check_pair(keep: &PairRow, other: &PairRow, noted: bool) -> Result<(), Resolv
             return Err(ResolveError::SupersededElsewhere { id: row.id, by });
         }
     }
-    let linked = noted
-        || keep.disputes.contains(&other.id)
-        || other.disputes.contains(&keep.id)
-        || keep.replaced_by() == Some(other.id)
-        || other.replaced_by() == Some(keep.id);
-    if linked {
+    if linked(keep, other, noted) {
         Ok(())
     } else {
         Err(ResolveError::NotInDispute { keep: keep.id, other: other.id })
     }
+}
+
+fn linked(keep: &PairRow, other: &PairRow, noted: bool) -> bool {
+    noted
+        || keep.disputes.contains(&other.id)
+        || other.disputes.contains(&keep.id)
+        || keep.replaced_by() == Some(other.id)
+        || other.replaced_by() == Some(keep.id)
 }
 
 /// The rows `memory.disputed_against` names. A value that is not valid JSON
@@ -248,6 +257,70 @@ fn read_pair_row(c: &Connection, id: i64, reach: Option<&str>) -> Result<PairRow
     row.ok_or(ResolveError::NotFound(id))
 }
 
+/// The pieces of every save row `$id` is a piece of, and the row itself: a
+/// row no save links is a save of one piece.
+macro_rules! save_rows {
+    ($id:literal) => {
+        concat!(
+            "SELECT ", $id, " UNION SELECT q.memory_id FROM memory_piece p \
+             JOIN memory_piece q ON q.save_id = p.save_id WHERE p.memory_id = ", $id
+        )
+    };
+}
+
+/// The pairs noted between the save of `?1` and the save of `?2`, each as its
+/// row on `?1`'s side and its row on `?2`'s. Only rows that are not deleted
+/// and are within the reach bound to `?3` count, so a pair with a hidden side
+/// reads as not noted.
+const SAVE_PAIRS_SQL: &str = concat!(
+    "WITH k(id) AS (", save_rows!("?1"), "), o(id) AS (", save_rows!("?2"), ") \
+     SELECT k.id, o.id FROM k JOIN o \
+     JOIN memory_conflict c ON c.new_id = MAX(k.id, o.id) AND c.old_id = MIN(k.id, o.id) \
+     JOIN memory mk ON mk.id = k.id JOIN memory mo ON mo.id = o.id \
+     WHERE mk.deleted_at IS NULL AND mo.deleted_at IS NULL AND ",
+    reader_predicate!("mk.agent_id", "?3"),
+    " AND ",
+    reader_predicate!("mo.agent_id", "?3"),
+    " ORDER BY k.id, o.id"
+);
+
+/// Reads the two rows a verdict is about, and whether the detector paired
+/// them. `keep` and `other` name the pair itself or, when those two rows are
+/// not linked, any piece of each side's save: a long save is paired with an
+/// earlier one through whichever of its pieces found it, and the answer to
+/// the save names the earlier row alone. Two saves that hold several pairs
+/// are refused, since nothing says which one is meant.
+fn read_pair(
+    c: &Connection,
+    keep: i64,
+    other: i64,
+    reach: Option<&str>,
+) -> Result<(PairRow, PairRow, bool), ResolveError> {
+    use rusqlite::OptionalExtension;
+    let keep_row = read_pair_row(c, keep, reach)?;
+    let other_row = read_pair_row(c, other, reach)?;
+    let noted = c
+        .query_row(
+            "SELECT 1 FROM memory_conflict WHERE new_id = ?1 AND old_id = ?2",
+            [keep.max(other), keep.min(other)],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if linked(&keep_row, &other_row, noted) {
+        return Ok((keep_row, other_row, noted));
+    }
+    let pairs = c
+        .prepare(SAVE_PAIRS_SQL)?
+        .query_map(rusqlite::params![keep, other, reach], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
+    match pairs[..] {
+        [] => Ok((keep_row, other_row, false)),
+        [(k, o)] => Ok((read_pair_row(c, k, reach)?, read_pair_row(c, o, reach)?, true)),
+        _ => Err(ResolveError::SeveralPairs { keep, other, pairs }),
+    }
+}
+
 fn read_resolved(c: &Connection, id: i64) -> rusqlite::Result<ResolvedRow> {
     c.query_row("SELECT id, status, superseded_by FROM memory WHERE id = ?1", [id], |r| {
         Ok(ResolvedRow { id: r.get(0)?, status: r.get(1)?, superseded_by: r.get(2)? })
@@ -322,6 +395,8 @@ pub async fn resolve_dispute_core(
 /// Judges the pair `keep`, `other` in one transaction, and returns both rows
 /// as they stand afterwards. Both rows must be within `reader`'s reach, of
 /// whichever author. `keep` only matters for `supersedes`: it is the row that stays.
+/// Either id may be another piece of its save (`read_pair`); the rows
+/// returned are those of the pair that was judged.
 ///
 /// `user_answered` is the caller's declaration that the user said which
 /// holds, with their answer in `reason`. Superseding a preference or a
@@ -351,22 +426,14 @@ pub async fn judge_pair(
     };
     let now = TimestampMs::now();
     let reach = reader_bind(reader);
-    let (new, old) = (keep.max(other), keep.min(other));
     store
         .conn
         .call(move |c| -> Result<Resolution, ResolveError> {
-            use rusqlite::OptionalExtension;
             let tx = c.transaction()?;
-            let keep_row = read_pair_row(&tx, keep, reach.as_deref())?;
-            let other_row = read_pair_row(&tx, other, reach.as_deref())?;
-            let state: Option<String> = tx
-                .query_row(
-                    "SELECT state FROM memory_conflict WHERE new_id = ?1 AND old_id = ?2",
-                    [new, old],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            check_pair(&keep_row, &other_row, state.is_some())?;
+            let (keep_row, other_row, noted) = read_pair(&tx, keep, other, reach.as_deref())?;
+            check_pair(&keep_row, &other_row, noted)?;
+            let (keep, other) = (keep_row.id, other_row.id);
+            let (new, old) = (keep.max(other), keep.min(other));
             if verdict == Verdict::Supersedes && other_row.protected() && !user_answered {
                 return Err(ResolveError::NeedsUser { keep, other });
             }
@@ -513,6 +580,7 @@ mod tests {
     use super::*;
     use crate::memory::sharing::Reach;
     use crate::memory::admin::{list_memories_core, ListParams};
+    use crate::memory::pieces::StoredPiece;
 
     fn reader(agent: &str) -> Reader {
         Reader::new(agent, Reach::AllBut(Vec::new()))
@@ -1165,6 +1233,124 @@ mod tests {
         note_pair(&store, new, old, "pending").await;
 
         assert!(judge_pair(&store, new, old, Verdict::Compatible, None, false, None).await.is_ok());
+    }
+
+    // ── the pieces of a save ────────────────────────────────────────────────
+
+    /// Seeds `count` rows linked as one save, along the axes from `axis` on.
+    async fn seed_save(store: &MemoryStore, count: usize, axis: usize) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for i in 0..count {
+            ids.push(seed(store, &format!("piece {i} of the save on axis {axis}"), "active", &[], axis + i).await);
+        }
+        let pieces = ids.iter().map(|&memory_id| StoredPiece { memory_id, context: String::new() }).collect();
+        store.link_pieces(pieces).await.unwrap();
+        ids
+    }
+
+    async fn pair_count(store: &MemoryStore) -> i64 {
+        store
+            .conn
+            .call(|c| c.query_row("SELECT COUNT(*) FROM memory_conflict", [], |r| r.get(0)))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn any_piece_of_a_save_judges_the_pair_its_save_holds() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let save = seed_save(&store, 3, 1).await;
+        note_pair(&store, save[1], old, "pending").await;
+
+        let resolution = judge_pair(&store, save[0], old, Verdict::Compatible, None, false, None).await.unwrap();
+
+        assert_eq!((resolution.keep.id, resolution.other.id), (save[1], old), "the rows of the pair, not the ids sent");
+        assert_eq!(pair_of(&store, save[1], old).await, judged("compatible", None));
+        assert_eq!(pair_count(&store).await, 1, "no pair is made up for the piece that was named");
+    }
+
+    #[tokio::test]
+    async fn a_verdict_through_a_piece_supersedes_and_is_undone_through_another() {
+        let store = store().await;
+        let old = seed_save(&store, 2, 0).await;
+        let new = seed_save(&store, 3, 2).await;
+        note_pair(&store, new[2], old[1], "pending").await;
+
+        let resolution = judge_pair(&store, new[0], old[0], Verdict::Supersedes, None, false, None).await.unwrap();
+
+        assert_eq!(resolution.keep, ResolvedRow { id: new[2], status: "active".into(), superseded_by: None });
+        assert_eq!(resolution.other, ResolvedRow { id: old[1], status: "superseded".into(), superseded_by: Some(new[2]) });
+        assert_eq!(row(&store, old[0]).await.status, "active", "only the row of the pair is replaced");
+
+        let undone = judge_pair(&store, old[0], new[1], Verdict::Compatible, None, false, None).await.unwrap();
+        assert_eq!((undone.keep.id, undone.keep.status.as_str()), (old[1], "active"));
+        assert_eq!(pair_of(&store, new[2], old[1]).await, judged("compatible", None));
+    }
+
+    #[tokio::test]
+    async fn two_saves_with_several_pairs_ask_which_one() {
+        let store = store().await;
+        let old = seed_save(&store, 2, 0).await;
+        let new = seed_save(&store, 2, 2).await;
+        note_pair(&store, new[0], old[0], "pending").await;
+        note_pair(&store, new[1], old[1], "pending").await;
+
+        let refused = judge_pair(&store, new[0], old[1], Verdict::Compatible, None, false, None).await.unwrap_err();
+
+        assert!(
+            matches!(&refused, ResolveError::SeveralPairs { pairs, .. } if *pairs == [(new[0], old[0]), (new[1], old[1])]),
+            "{refused:?}"
+        );
+        let named = format!("{} and {}, {} and {}", new[0], old[0], new[1], old[1]);
+        assert!(refused.to_string().contains(&named), "{refused}");
+        assert_eq!(pair_of(&store, new[0], old[0]).await.state, "pending", "a refused verdict changes nothing");
+
+        judge_pair(&store, new[1], old[1], Verdict::Compatible, None, false, None).await.unwrap();
+        assert_eq!(pair_of(&store, new[1], old[1]).await, judged("compatible", None), "a pair named by its own rows");
+        assert_eq!(pair_of(&store, new[0], old[0]).await.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_pair_held_by_a_hidden_or_deleted_piece_is_not_in_dispute() {
+        let store = store().await;
+        let old = seed(&store, "old", "active", &[], 0).await;
+        let save = seed_save(&store, 2, 1).await;
+        let holder = save[1];
+        note_pair(&store, holder, old, "pending").await;
+        store
+            .conn
+            .call(move |c| c.execute("UPDATE memory SET agent_id = 'agent-h' WHERE id = ?1", [holder]))
+            .await
+            .unwrap();
+
+        let hiding = Reader::new("agent-x", Reach::AllBut(vec!["agent-h".into()]));
+        let refused = judge_pair(&store, save[0], old, Verdict::Compatible, None, false, Some(&hiding)).await;
+        assert!(
+            matches!(refused, Err(ResolveError::NotInDispute { keep, other }) if (keep, other) == (save[0], old)),
+            "a hidden piece is not named: {refused:?}"
+        );
+
+        soft_delete(&store, holder).await;
+        let refused = judge_pair(&store, save[0], old, Verdict::Compatible, None, false, None).await;
+        assert!(matches!(refused, Err(ResolveError::NotInDispute { .. })), "{refused:?}");
+        assert_eq!(pair_of(&store, holder, old).await.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_piece_replaced_by_a_third_row_still_names_its_saves_pair() {
+        let store = store().await;
+        let first = seed(&store, "first", "active", &[], 0).await;
+        let second = seed(&store, "second", "active", &[], 1).await;
+        let save = seed_save(&store, 2, 2).await;
+        note_pair(&store, save[0], first, "pending").await;
+        note_pair(&store, save[1], second, "pending").await;
+        judge_pair(&store, first, save[0], Verdict::Supersedes, None, false, None).await.unwrap();
+
+        let resolution = judge_pair(&store, save[0], second, Verdict::Compatible, None, false, None).await.unwrap();
+
+        assert_eq!((resolution.keep.id, resolution.other.id), (save[1], second));
+        assert_eq!(row(&store, save[0]).await.superseded_by, Some(first), "the earlier verdict stands");
     }
 
     #[tokio::test]

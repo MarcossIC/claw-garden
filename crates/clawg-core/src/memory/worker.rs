@@ -2563,6 +2563,32 @@ mod tests {
         assert_eq!(later.related.len(), 1, "{:?}", later.related);
     }
 
+    #[tokio::test]
+    async fn the_pair_a_long_save_names_is_judged_through_its_first_piece() {
+        use crate::memory::dispute::{judge_pair, Verdict};
+
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
+        let older = PlacedEmbedder { vectors: vec![turned(2, 0.2)] };
+        let older = process_with(Arc::new(older), &store, &explicit_fact("the build uses cargo")).await.memories[0].id;
+
+        // Only the pieces after the first sit in the band of the older row.
+        let content = distinct_text(400);
+        let chunks = chunk_count(&content);
+        assert!(chunks >= 2, "fixture must split into several chunks, got {chunks}");
+        let mut vectors = vec![turned(3, 1.5)];
+        vectors.extend((1..chunks).map(|i| turned(1, 0.01 * i as f32)));
+        let report = process_with(Arc::new(PlacedEmbedder { vectors }), &store, &explicit_fact(&content)).await;
+        assert_eq!(report.failure, None);
+        let (first, second) = (report.memories[0].id, report.memories[1].id);
+        assert_eq!(pairs(&store).await, vec![(second, older, "pending".to_string())]);
+        assert_eq!(report.related.iter().map(|c| c.id).collect::<Vec<_>>(), vec![older], "the answer names the older row alone");
+
+        let resolution = judge_pair(&store, first, older, Verdict::Compatible, None, false, None).await.unwrap();
+
+        assert_eq!((resolution.keep.id, resolution.other.id), (second, older));
+        assert_eq!(pairs(&store).await, vec![(second, older, "judged".to_string())]);
+    }
+
     // ── The pieces of a long save ───────────────────────────────────────────
 
     /// `FakeEmbedder`, keeping every text it was handed.

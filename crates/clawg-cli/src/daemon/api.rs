@@ -2104,6 +2104,7 @@ fn resolve_error(e: ResolveError) -> ApiError {
             }
             ResolveError::NotFound(_) => ApiError::not_found(e.to_string()),
             ResolveError::NotInDispute { .. }
+            | ResolveError::SeveralPairs { .. }
             | ResolveError::SupersededElsewhere { .. }
             | ResolveError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
             ResolveError::Store(_) => ApiError::internal(e),
