@@ -32,9 +32,9 @@ Lo que aplicar el cambio movió respecto del primer diseño, ya anotado en [desi
 - `files_done` avanza de a tandas de la cola del refresco, no archivo por archivo: los archivos de una tanda se cuentan cuando la tanda se embebió y se escribió. Con el modelo real, entre dos tandas el número puede quedarse quieto varios segundos. Está en el diseño (D2), y no se midió cuánto.
 - El disparador `search` se prueba en `clawg-core` (`a_failed_refresh_leaves_its_cause_until_one_succeeds`); por HTTP y por el binario sólo se prueba `registration`.
 
-## Pendiente en el CI
+## CI (2026-11-12)
 
-El CI en Linux y Windows, que corre con el pull request. El cambio no toca código `cfg(windows)`, pero los tests nuevos de `tests/api.rs` y `tests/binary.rs` corren también en Windows y ahí sólo los comprueba el CI.
+El CI del pull request pasó en Linux y en Windows sobre `8300329`: clippy con todos los targets, la suite entera y el clippy de `clawg-cli` sin tests. El cambio no toca código `cfg(windows)`; los tests nuevos de `tests/api.rs` y `tests/binary.rs` corrieron también en Windows.
 
 ## Pendiente en local
 

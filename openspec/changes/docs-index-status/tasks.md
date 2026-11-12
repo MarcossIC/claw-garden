@@ -32,7 +32,7 @@ Leen `/health`, el log y la salida de `clawg status` como JSON, así que compila
 
 - [x] `cargo test --workspace` y `cargo clippy --workspace --all-targets -- -D warnings` en Linux, una vez, sobre el último commit.
 - [x] El contrato fijado del agente pasa sin regenerarse (IS7).
-- [ ] El CI en verde en Linux y Windows.
+- [x] El CI en verde en Linux y Windows.
 - [ ] Pendiente en local: lo que dice [verify.md](verify.md).
 
 ## 7. Al archivar

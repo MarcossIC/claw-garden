@@ -9,6 +9,6 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: in-progress  # suite y clippy en verde en Linux; falta el CI y mirar clawg status con un refresco real de un repositorio grande
+  verify: in-progress  # suite y clippy en verde en Linux y en el CI (Linux y Windows); falta mirar clawg status con un refresco real de un repositorio grande
   archive: pending
 updated: 2026-11-12
