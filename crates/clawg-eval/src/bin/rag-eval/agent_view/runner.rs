@@ -175,7 +175,9 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
     // directory; checking the directory the runtime reports, not the one that
     // was asked for, is what makes "nothing outside temp is written" hold.
     if !runtime.base_dir.starts_with(&temp) {
-        runtime.close().await;
+        // Closed only so the directory can be removed: the answer is the
+        // error below, whatever the close says.
+        let _ = runtime.close().await;
         return Err(RunError::OutsideTemp(runtime.base_dir.clone(), temp));
     }
 
@@ -193,7 +195,8 @@ async fn start(input: &AgentViewInput<'_>, scratch: &Path) -> Result<Session, Ru
     let (addr, server) = match serve_ephemeral(app.clone()).await {
         Ok(served) => served,
         Err(e) => {
-            app.runtime.close().await;
+            // As above: the answer is the error of the server.
+            let _ = app.runtime.close().await;
             return Err(RunError::Serve(e));
         }
     };
@@ -308,7 +311,7 @@ async fn release(session: Session) -> Result<(), RunError> {
     // Dropping the last handle to the store only signals the connection's
     // thread, which closes the database a moment later; on Windows its files
     // cannot be deleted until then, so the close is awaited instead.
-    app.runtime.store.conn.clone().close().await.map_err(|e| RunError::Close(e.to_string()))?;
+    app.runtime.close().await.map_err(|e| RunError::Close(e.to_string()))?;
     Ok(())
 }
 

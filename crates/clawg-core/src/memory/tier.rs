@@ -8,6 +8,7 @@
 //! backwards. [`retier`] is the one other way down, and only on request: a
 //! correction takes away the tier the corrected field was giving.
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::MemoryError;
 
 // ---------------------------------------------------------------------------
@@ -155,13 +156,7 @@ pub(crate) async fn register_tier_udf(
         Ok(())
     })
     .await
-    .map_err(|e| match e {
-        tokio_rusqlite::Error::Error(rusqlite_err) => MemoryError::Sqlite(rusqlite_err),
-        tokio_rusqlite::Error::ConnectionClosed => {
-            MemoryError::Backend("connection closed during tier UDF registration".into())
-        }
-        other => MemoryError::Backend(other.to_string()),
-    })
+    .map_err(failed_call::<rusqlite::Error, _>(ClosedAs::During("tier UDF registration")))
 }
 
 /// Registers the `demote_tier` scalar UDF on the connection.
@@ -189,13 +184,7 @@ pub(crate) async fn register_demote_udf(
         Ok(())
     })
     .await
-    .map_err(|e| match e {
-        tokio_rusqlite::Error::Error(rusqlite_err) => MemoryError::Sqlite(rusqlite_err),
-        tokio_rusqlite::Error::ConnectionClosed => {
-            MemoryError::Backend("connection closed during demote UDF registration".into())
-        }
-        other => MemoryError::Backend(other.to_string()),
-    })
+    .map_err(failed_call::<rusqlite::Error, _>(ClosedAs::During("demote UDF registration")))
 }
 
 // ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ impl MemoryStore {
         self.conn
             .call(move |_| -> rusqlite::Result<Duration> { Ok(queued.elapsed()) })
             .await
-            .map_err(MemoryError::Connection)
+            .map_err(MemoryError::from)
     }
 
     /// The page cache and statement memory of the connection, restarting
@@ -55,7 +55,7 @@ impl MemoryStore {
                 })
             })
             .await
-            .map_err(MemoryError::Connection)
+            .map_err(MemoryError::from)
     }
 }
 

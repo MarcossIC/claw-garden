@@ -137,7 +137,7 @@ mod tests {
         let run = recorder.run();
         assert_eq!(run[&SeriesKey::new("db.probe_wait", &[])].count(), 2);
 
-        store.conn.clone().close().await.unwrap();
+        store.conn_for_test().clone().close().await.unwrap();
         probe(&store, &recorder).await;
         assert_eq!(recorder.run()[&SeriesKey::new("db.probe_wait", &[])].count(), 2, "a probe that did not run is not a wait");
     }

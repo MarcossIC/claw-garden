@@ -47,7 +47,7 @@ pub enum EmbedderStatus {
 
 /// Why one bootstrap attempt ended without an embedder.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum BootstrapError {
+pub(crate) enum BootstrapError {
     #[error("{0}")]
     Download(String),
     #[error("{0}")]
@@ -62,7 +62,7 @@ pub enum BootstrapError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetryDecision {
+pub(crate) enum RetryDecision {
     Retry,
     GiveUp,
 }
@@ -70,7 +70,7 @@ pub enum RetryDecision {
 /// A mismatch is the only permanent failure: the stored vectors belong to
 /// another model, and downloading this one again cannot change that. A
 /// verification error is retried because it is a failed read, not a verdict.
-pub fn classify(error: &BootstrapError) -> RetryDecision {
+pub(crate) fn classify(error: &BootstrapError) -> RetryDecision {
     match error {
         BootstrapError::Mismatch(_) => RetryDecision::GiveUp,
         BootstrapError::Download(_) | BootstrapError::Load(_) | BootstrapError::Verify(_) => {
@@ -88,7 +88,7 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 
 /// How long to wait after the `attempt`-th failed attempt (1-based):
 /// `min(30 s · 2^(attempt-1), 30 min)`, saturating instead of overflowing.
-pub fn retry_delay(attempt: u32) -> Duration {
+pub(crate) fn retry_delay(attempt: u32) -> Duration {
     2u32.checked_pow(attempt.saturating_sub(1))
         .and_then(|factor| RETRY_BASE_DELAY.checked_mul(factor))
         .map_or(RETRY_MAX_DELAY, |d| d.min(RETRY_MAX_DELAY))
@@ -100,7 +100,7 @@ pub fn retry_delay(attempt: u32) -> Duration {
 /// Pure function — no I/O, no allocation beyond the small string field. The
 /// translation is one-to-one with the download lifecycle (`start`,
 /// `downloading`, `verifying`, `done`, `error`).
-pub fn progress_to_stream_event(p: DownloadProgress) -> StreamEvent {
+pub(crate) fn progress_to_stream_event(p: DownloadProgress) -> StreamEvent {
     match p {
         DownloadProgress::Start { bytes_total } => StreamEvent::EmbedderDownload {
             phase: "start".into(),
@@ -190,7 +190,7 @@ impl EmbedderEventSink for LogSink {
 }
 
 /// Type alias for the injectable `ensure_model` seam.
-pub type EnsureModelFn = Arc<
+pub(crate) type EnsureModelFn = Arc<
     dyn Fn(
             std::path::PathBuf,
             Option<tokio::sync::mpsc::UnboundedSender<DownloadProgress>>,
@@ -206,7 +206,7 @@ pub type EnsureModelFn = Arc<
 
 /// Type alias for the injectable read of the model from its cache alone, with
 /// no download: what a reload of the idle model goes through.
-pub type CachedModelFn = Arc<
+pub(crate) type CachedModelFn = Arc<
     dyn Fn(std::path::PathBuf) -> futures::future::BoxFuture<'static, Result<ModelFiles, DownloadError>>
         + Send
         + Sync,
@@ -214,7 +214,7 @@ pub type CachedModelFn = Arc<
 
 /// Type alias for the injectable model-load seam (replaces
 /// [`E5Embedder::from_parts`] in tests).
-pub type LoadEmbedderFn = Arc<
+pub(crate) type LoadEmbedderFn = Arc<
     dyn Fn(crate::memory::model_download::ModelFiles) -> Result<Arc<dyn Embedder>, String>
         + Send
         + Sync,
@@ -224,7 +224,7 @@ pub type LoadEmbedderFn = Arc<
 ///
 /// It takes the loaded embedder itself, not only its identity: on a pooling
 /// upgrade the check re-embeds the store with it (see [`verify_or_reembed`]).
-pub type ContractVerifyFn = Arc<
+pub(crate) type ContractVerifyFn = Arc<
     dyn Fn(Arc<dyn Embedder>) -> futures::future::BoxFuture<'static, Result<ContractStatus, String>>
         + Send
         + Sync,
@@ -287,7 +287,7 @@ pub struct EmbedderDeps {
 /// ways.
 ///
 /// `backups` is where the snapshot taken before a pooling upgrade goes.
-pub fn production_deps(
+pub(crate) fn production_deps(
     store: Arc<MemoryStore>,
     backups: std::path::PathBuf,
     tokenizer: Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
@@ -412,12 +412,12 @@ fn record_load(metrics: &Recorder, phase: &'static str, took: std::time::Duratio
 ///
 /// [`FakeEmbedder`]: crate::memory::embedder::FakeEmbedder
 #[cfg(any(test, feature = "testing"))]
-pub const TEST_EMBEDDER_VAR: &str = "CLAWG_TEST_EMBEDDER";
+pub(crate) const TEST_EMBEDDER_VAR: &str = "CLAWG_TEST_EMBEDDER";
 
 /// The stand-in [`TEST_EMBEDDER_VAR`] names.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TestEmbedder {
+pub(crate) enum TestEmbedder {
     Fake,
     Stalled,
     Blocked,
@@ -427,7 +427,7 @@ pub enum TestEmbedder {
 impl TestEmbedder {
     /// `None` when unset or empty; an unknown value is an error rather than
     /// the real model, which would start a 470 MB download inside a test.
-    pub fn parse(raw: Option<&str>) -> Result<Option<Self>, String> {
+    pub(crate) fn parse(raw: Option<&str>) -> Result<Option<Self>, String> {
         match raw.map(str::trim) {
             None | Some("") => Ok(None),
             Some("fake") => Ok(Some(Self::Fake)),
@@ -444,7 +444,7 @@ impl TestEmbedder {
     /// store records and verifies the fake model's identity. A load fills
     /// `tokenizer` as the model's does, so what splits by tokens (an import
     /// of another tool's export) runs against the binary too.
-    pub fn deps(
+    pub(crate) fn deps(
         self,
         store: Arc<MemoryStore>,
         backups: std::path::PathBuf,
@@ -652,7 +652,7 @@ pub fn is_pooling_upgrade(stored: &StoredContract, actual: &EmbeddingIdentity) -
 /// the contract only changes once all of them were redone, so a pass that
 /// fails part-way still reports the mismatch and the next start tries again.
 /// Every other mismatch is returned as it is.
-pub async fn verify_or_reembed(
+pub(crate) async fn verify_or_reembed(
     store: &MemoryStore,
     embedder: Arc<dyn Embedder>,
     backups: std::path::PathBuf,
@@ -699,7 +699,7 @@ pub async fn verify_or_reembed(
 ///
 /// Publishes `Loading` while it runs, then `Ready` or `Failed` on `status`.
 /// On any error the cell stays empty, so a later attempt can still fill it.
-pub async fn run_embedder_bootstrap(
+pub(crate) async fn run_embedder_bootstrap(
     base_dir: std::path::PathBuf,
     embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
     status: watch::Sender<EmbedderStatus>,

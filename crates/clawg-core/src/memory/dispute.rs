@@ -16,6 +16,7 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::provenance::mark;
 use crate::memory::redact::redact;
@@ -102,7 +103,7 @@ pub enum ResolveError {
 
 impl From<rusqlite::Error> for ResolveError {
     fn from(e: rusqlite::Error) -> Self {
-        Self::Store(MemoryError::Sqlite(e))
+        Self::Store(MemoryError::from(e))
     }
 }
 
@@ -476,13 +477,7 @@ pub async fn judge_pair(
             Ok(resolution)
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            tokio_rusqlite::Error::ConnectionClosed => {
-                ResolveError::Store(MemoryError::Backend("connection closed during judge_pair".into()))
-            }
-            other => ResolveError::Store(MemoryError::Backend(other.to_string())),
-        })
+        .map_err(failed_call(ClosedAs::During("judge_pair")))
 }
 
 /// A pair waiting for the agent's verdict.
@@ -569,10 +564,7 @@ pub async fn open_pairs(
             Ok(OpenPairs { pending, escalated, pairs })
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            other => MemoryError::Backend(format!("open_pairs: {other}")),
-        })
+        .map_err(failed_call(ClosedAs::Named("open_pairs")))
 }
 
 #[cfg(test)]

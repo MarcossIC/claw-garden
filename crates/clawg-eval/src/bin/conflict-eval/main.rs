@@ -213,7 +213,7 @@ async fn measure_all<'a>(
         let runtime = ingest.finish().await.map_err(|e| e.to_string())?;
         let found = conflict_pairs(&runtime).await.map_err(|e| e.to_string())?;
         // On Windows a store still open cannot be deleted with its directory.
-        runtime.close().await;
+        runtime.close().await.map_err(|e| e.to_string())?;
         let outcome = PairOutcome { candidate: !found.is_empty(), escalated: found.iter().any(|p| p.escalated) };
         outcomes.push((pair.class, outcome));
         by_lang.push((format!("{}/{}", pair.class.as_str(), pair.lang), outcome));
@@ -231,7 +231,7 @@ async fn measure_all<'a>(
         .into_iter()
         .map(|p| (p.new_id, p.escalated))
         .collect();
-    runtime.close().await;
+    runtime.close().await.map_err(|e| e.to_string())?;
     let flow = flow_report(flow.len(), &flow_pairs);
 
     let classes = by(&outcomes);

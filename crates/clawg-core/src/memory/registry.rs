@@ -13,12 +13,13 @@ use std::sync::Arc;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::identity::Ground;
 use crate::memory::merge::{canonical_in, MAX_MERGE_HOPS};
 use crate::memory::project::is_project_id;
 use crate::memory::project_delete::{deleted_in, deleted_message};
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::{MemoryError, MemoryStore, StorageError};
 
 /// The name a project has until someone gives it one: its id without the
 /// `-` and four hex digits `derive_project_id` appends, or the whole id when
@@ -32,7 +33,7 @@ pub(crate) fn project_name(id: &str) -> &str {
 }
 
 /// The longest name a project may be given, in characters.
-pub const MAX_NAME_CHARS: usize = 80;
+pub(crate) const MAX_NAME_CHARS: usize = 80;
 
 /// A project as `project` holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,7 +238,7 @@ struct Found {
 /// no registration recorded a project in, and whether each path of a declared
 /// subfolder is there are read from the disk on a blocking thread.
 pub async fn list_projects(store: &MemoryStore, ground: Arc<dyn Ground>) -> Result<Vec<ListedProject>, MemoryError> {
-    let stored = store.conn.call(|c| stored_in(c)).await.map_err(MemoryError::Connection)?;
+    let stored = store.conn.call(|c| stored_in(c)).await.map_err(MemoryError::from)?;
     tokio::task::spawn_blocking(move || {
         let found: Vec<Found> = stored
             .folders
@@ -374,7 +375,7 @@ fn pending_pairs(
 /// [`list_projects`] lists them, each with the other project.
 pub async fn pending_suggestions(store: &MemoryStore, id: &str) -> Result<Vec<ListedSuggestion>, MemoryError> {
     let id = id.to_string();
-    store.conn.call(move |c| pending_suggestions_in(c, &id)).await.map_err(MemoryError::Connection)
+    store.conn.call(move |c| pending_suggestions_in(c, &id)).await.map_err(MemoryError::from)
 }
 
 fn pending_suggestions_in(c: &Connection, id: &str) -> rusqlite::Result<Vec<ListedSuggestion>> {
@@ -408,7 +409,7 @@ pub async fn suggestion_between(store: &MemoryStore, a: &str, b: &str) -> Result
     store
         .conn
         .call(move |c| {
-            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::Sqlite(e));
+            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::from(e));
             for id in [&a, &b] {
                 let known: bool =
                     c.query_row("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?1)", [id], |r| r.get(0)).map_err(sql)?;
@@ -429,10 +430,7 @@ pub async fn suggestion_between(store: &MemoryStore, a: &str, b: &str) -> Result
             Ok(pending_suggestions_in(c, &a).map_err(sql)?.into_iter().find(|s| s.other_id == b))
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => KeepApartError::Store(MemoryError::Backend(other.to_string())),
-        })
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 /// Every delete nobody undid or purged, oldest first, with the project it
@@ -463,7 +461,7 @@ pub async fn list_deletes(store: &MemoryStore) -> Result<Vec<ListedDelete>, Memo
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .await
-        .map_err(MemoryError::Connection)
+        .map_err(MemoryError::from)
 }
 
 /// Why a name may not be a project's.
@@ -520,7 +518,7 @@ pub async fn rename_project(store: &MemoryStore, id: &str, name: &str) -> Result
     store
         .conn
         .call(move |c| {
-            let sql = |e: rusqlite::Error| RenameError::Store(MemoryError::Sqlite(e));
+            let sql = |e: rusqlite::Error| RenameError::Store(MemoryError::from(e));
             let tx = c.transaction().map_err(sql)?;
             let project = tx
                 .query_row("SELECT id, name, born, reviewed, created_at FROM project WHERE id = ?1", [&id], project_from)
@@ -556,10 +554,7 @@ pub async fn rename_project(store: &MemoryStore, id: &str, name: &str) -> Result
             Ok(Project { name, reviewed: true, ..project })
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => RenameError::Store(MemoryError::Backend(other.to_string())),
-        })
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 /// What [`keep_apart`] answered.
@@ -595,7 +590,7 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
     store
         .conn
         .call(move |c| {
-            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::Sqlite(e));
+            let sql = |e: rusqlite::Error| KeepApartError::Store(MemoryError::from(e));
             let tx = c.transaction().map_err(sql)?;
             for id in [&a, &b] {
                 let known: bool =
@@ -647,16 +642,13 @@ pub async fn keep_apart(store: &MemoryStore, a: &str, b: &str) -> Result<KeptApa
             Ok(KeptApart { project_id: a, other_id: b, answered })
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => KeepApartError::Store(MemoryError::Backend(other.to_string())),
-        })
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 /// What tells two names apart for a person: the name in Unicode lower case,
 /// without anything that is not a letter or a digit. `Mi App`, `mi-app` and
 /// `mi_app` have one key.
-pub fn name_key(name: &str) -> String {
+pub(crate) fn name_key(name: &str) -> String {
     name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
@@ -819,6 +811,13 @@ fn folders_of_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<Resolved
     Ok(folders.into_iter().map(|(_, f)| f).collect())
 }
 
+/// How many folders lead to `project`: those recorded with its id, and one
+/// from before folders named their project, whose own id is the project's.
+pub async fn own_folder_count(store: &MemoryStore, project: &str) -> Result<usize, StorageError> {
+    let project = project.to_string();
+    Ok(store.conn.call(move |c| own_folders_in(c, &project)).await?.len())
+}
+
 fn own_folders_in(c: &Connection, project: &str) -> rusqlite::Result<Vec<ResolvedFolder>> {
     Ok(own_folders_dated_in(c, project)?.into_iter().map(|(_, f)| f).collect())
 }
@@ -846,7 +845,7 @@ pub async fn resolve_project(store: &MemoryStore, reference: &str, options: Reso
     store
         .conn
         .call(move |c| {
-            let sql = |e: rusqlite::Error| ResolveError::Store(MemoryError::Sqlite(e));
+            let sql = |e: rusqlite::Error| ResolveError::Store(MemoryError::from(e));
             let tx = c.transaction().map_err(sql)?;
             let resolved = |id: String, created: bool| -> Result<Resolution, ResolveError> {
                 let (name, deleted): (String, bool) = tx
@@ -922,10 +921,7 @@ pub async fn resolve_project(store: &MemoryStore, reference: &str, options: Reso
             Ok(resolution)
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(e) => e,
-            other => ResolveError::Store(MemoryError::Backend(other.to_string())),
-        })
+        .map_err(failed_call(ClosedAs::AsIs))
 }
 
 /// What a reference names where a project must already exist, as a move's
@@ -957,7 +953,7 @@ pub async fn find_project(store: &MemoryStore, reference: &str) -> Result<Named,
             })
         })
         .await
-        .map_err(MemoryError::Connection)
+        .map_err(MemoryError::from)
 }
 
 #[cfg(test)]
@@ -972,6 +968,28 @@ mod tests {
     use crate::memory::worker::save_for_test;
     use crate::memory::MemoryStore;
     use crate::models::chat::Role;
+
+    #[tokio::test]
+    async fn own_folder_count_counts_the_folders_that_lead_to_a_project() {
+        let store = MemoryStore::new_for_test().await.unwrap();
+        store
+            .conn
+            .call(|c| {
+                c.execute_batch(
+                    "INSERT INTO project (id, name, born, reviewed, created_at) VALUES \
+                         ('a-0001', 'a', 'root', 1, 1), ('b-0002', 'b', 'migrated', 1, 1), ('c-0003', 'c', 'named', 1, 1);
+                     INSERT INTO project_path (id, root_path, created_at, project_id) VALUES \
+                         ('a-0001', '/work/a', 1, 'a-0001'), ('a-0009', '/work/a-clone', 2, 'a-0001');
+                     INSERT INTO project_path (id, root_path, created_at) VALUES ('b-0002', '/work/b', 1);",
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(own_folder_count(&store, "a-0001").await.unwrap(), 2);
+        assert_eq!(own_folder_count(&store, "b-0002").await.unwrap(), 1, "a folder from before folders named their project");
+        assert_eq!(own_folder_count(&store, "c-0003").await.unwrap(), 0);
+    }
 
     /// `(name, born, reviewed, created_at)` of project `id`.
     type Project = (String, String, i64, i64);

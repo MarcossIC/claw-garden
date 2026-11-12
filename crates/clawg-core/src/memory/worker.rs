@@ -6,6 +6,7 @@
 //! Failure isolation: errors are logged and the worker NEVER panics.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
@@ -23,7 +24,7 @@ use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::events::{MemoryEvent, MemorySource};
 use crate::memory::provenance::{is_stated, seal};
 use crate::memory::redact::{redact, SecretKind};
-use crate::memory::sharing::Reader;
+use crate::memory::sharing::{self, Reader};
 use crate::memory::store_insert::{deliberate_importance, NewMemoryRecord, Repeat, Stored as Insert};
 use crate::memory::topic::{inherit, unkeyed_revision, Replaced, Revision, TopicScope};
 use crate::memory::clock::TimestampMs;
@@ -183,13 +184,13 @@ fn collapse_duplicate_chunks(chunks: Vec<Chunk>) -> Vec<PendingChunk> {
 }
 
 /// Outbox rows to ingest on this start, ahead of anything new on the channel.
-pub struct Replay {
+pub(crate) struct Replay {
     requests: VecDeque<IngestRequest>,
 }
 
 impl Replay {
     /// Nothing to replay.
-    pub fn none() -> Self {
+    pub(crate) fn none() -> Self {
         Self { requests: VecDeque::new() }
     }
 
@@ -303,13 +304,14 @@ impl DrainWatch<'_> {
 /// Also returns, with nothing spilled, when all `Sender`s are dropped and the
 /// queue is empty; events held for an embedder that never loaded are returned
 /// then too.
-pub async fn memory_worker(
+pub(crate) async fn memory_worker(
     mut rx: Receiver<IngestRequest>,
     drain: watch::Receiver<Option<Instant>>,
     mut replay: Replay,
     store: Arc<MemoryStore>,
     embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
     chat_chunker: Arc<ChatChunker>,
+    sharing: Option<PathBuf>,
 ) -> Vec<MemoryEvent> {
     // Running count of chunks absorbed by the write-border dedup gate.
     // Plain `u64`, no atomic: `memory_worker` is the single sequential
@@ -384,6 +386,7 @@ pub async fn memory_worker(
                 &mut absorbed_duplicates,
                 track,
                 watch,
+                sharing.as_deref(),
             )
             .await;
             record_outcome(store.metrics(), &report, outbox.is_some(), accepted);
@@ -678,13 +681,14 @@ async fn process_event(
     chat_chunker: &Arc<ChatChunker>,
     absorbed: &mut u64,
 ) -> IngestReport {
-    process_tracked(evt, store, embedder_cell, chat_chunker, absorbed, None, DrainWatch::default()).await
+    process_tracked(evt, store, embedder_cell, chat_chunker, absorbed, None, DrainWatch::default(), None).await
 }
 
 /// Ingests `evt` and, when it finished, links its pieces and applies its
 /// revision; for an event with an outbox row, those and the row's removal go
 /// in one transaction. A failure leaves the row, with the pieces stored so far
 /// noted in it, and replaces nothing.
+#[expect(clippy::too_many_arguments, reason = "the parameters have no type that groups them; adding one is a refactor of its own")]
 async fn process_tracked(
     evt: &MemoryEvent,
     store: &Arc<MemoryStore>,
@@ -693,6 +697,7 @@ async fn process_tracked(
     absorbed: &mut u64,
     track: Option<Track>,
     drain: DrainWatch<'_>,
+    sharing: Option<&Path>,
 ) -> IngestReport {
     let row = track.as_ref().map(|t| t.row);
     // A save its outbox held from before its project was merged names the
@@ -701,7 +706,7 @@ async fn process_tracked(
     let evt = followed.as_ref().unwrap_or(evt);
     // Read once per event: the dedup, the detector and the key all compare
     // the save with what its agent reaches in its project.
-    let saver = store.reader_for(&evt.agent_id);
+    let saver = sharing::reader_from(sharing, &evt.agent_id);
     let scope = evt.topic().map(|key| TopicScope {
         saver: saver.clone(),
         project_id: evt.project_id.clone(),
@@ -1171,7 +1176,7 @@ async fn finish_save(
 /// Pulled out of the worker's setup so this wiring is unit-testable on its
 /// own. The loader is a parameter so the daemon can pass the one that checks
 /// the file's hash and tests can pass their own.
-pub fn resolve_tokenizer_and_chunker<L>(
+pub(crate) fn resolve_tokenizer_and_chunker<L>(
     base_dir: &std::path::Path,
     tokenizer_cell: &Arc<OnceCell<Arc<tokenizers::Tokenizer>>>,
     load: L,
@@ -1273,7 +1278,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let evt = make_event(Role::User, "alpha", None, 1);
         let first = save_for_test(&store, &evt).await.memories[0].id;
-        let saver = store.reader_for(&evt.agent_id);
+        let saver = sharing::reader_from(None, &evt.agent_id);
         let chunks = |texts: &[&str]| texts.iter().map(|t| Chunk { text: t.to_string() }).collect::<Vec<_>>();
         let mut absorbed = 0;
 
@@ -1345,7 +1350,7 @@ mod tests {
     async fn the_store_writes_each_piece_notes_it_and_pauses_when_a_drain_is_due() {
         let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let evt = make_event(Role::User, "two pieces", None, 1);
-        let saver = store.reader_for(&evt.agent_id);
+        let saver = sharing::reader_from(None, &evt.agent_id);
         let gate = |texts: &[&str]| Gated {
             stored: vec![None; texts.len()],
             contexts: vec![String::new(); texts.len()],
@@ -3966,7 +3971,7 @@ mod tests {
         }
         drop(tx);
         let chat_chunker = Arc::new(ChatChunker::with_fallback());
-        memory_worker(rx, no_drain(), replay, store.clone(), Arc::new(cell), chat_chunker).await;
+        memory_worker(rx, no_drain(), replay, store.clone(), Arc::new(cell), chat_chunker, None).await;
     }
 
     async fn replay_pending(store: &Arc<MemoryStore>, embedder: Arc<dyn Embedder>) {
@@ -4201,6 +4206,7 @@ mod tests {
             store.clone(),
             Arc::new(cell),
             Arc::new(ChatChunker::with_fallback()),
+            None,
         ));
         (tx, drain_tx, worker)
     }
@@ -4357,7 +4363,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(crate::runtime::INGEST_QUEUE_CAPACITY);
         let handle = tokio::spawn(async move {
-            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker).await;
+            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker, None).await;
         });
         (tx, handle)
     }
@@ -4385,7 +4391,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(crate::runtime::INGEST_QUEUE_CAPACITY);
         let handle = tokio::spawn(async move {
-            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker).await;
+            memory_worker(rx, no_drain(), Replay::none(), store, cell, chat_chunker, None).await;
         });
         (tx, handle)
     }
@@ -4750,11 +4756,16 @@ mod tests {
         let mut policy = crate::memory::sharing::SharingPolicy::default();
         policy.hide("agent-other", "agent-test");
         crate::memory::sharing::save(dir.path(), &policy).unwrap();
-        let store = Arc::new(MemoryStore::new_for_test().await.unwrap().with_sharing_dir(dir.path().to_path_buf()));
+        let store = Arc::new(MemoryStore::new_for_test().await.unwrap());
         let old = only_id(&save(&store, &keyed("Storage engine is SQLite", "storage/engine")).await);
 
         let hidden = MemoryEvent { agent_id: "agent-other".into(), ..keyed("Storage engine moved to Postgres", "storage/engine") };
-        assert!(save(&store, &hidden).await.replaced.is_empty(), "a save never replaces what its agent cannot read");
+        let cell: OnceCell<Arc<dyn Embedder>> = OnceCell::new();
+        cell.set(Arc::new(FakeEmbedder::default())).ok();
+        let chat_chunker = Arc::new(ChatChunker::with_fallback());
+        let report = process_tracked(&hidden, &store, &Arc::new(cell), &chat_chunker, &mut 0, None, DrainWatch::default(), Some(dir.path())).await;
+        assert_eq!(report.failure, None);
+        assert!(report.replaced.is_empty(), "a save never replaces what its agent cannot read");
         assert_eq!(revision_state(&store, old).await.0, "active");
     }
 

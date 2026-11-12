@@ -20,7 +20,7 @@ pub fn derive_project_id(project_path: &Path) -> String {
 }
 
 /// How many ids a root may be given: [`candidate_id`] for `n` below this.
-pub const CANDIDATES: u32 = 64;
+pub(crate) const CANDIDATES: u32 = 64;
 
 /// The `n`th id a root may be given when the ones before belong to other
 /// roots: [`derive_project_id`] for 0, and the same format with `#n` after
@@ -73,6 +73,7 @@ impl ProjectIdentity {
 ///
 /// A path that does not exist cannot be canonicalized or searched for `.git`,
 /// so it is only made absolute and normalized textually.
+#[cfg(any(test, feature = "testing"))]
 pub fn resolve_project_root(path: &Path) -> PathBuf {
     root_above(&canonical_form(path))
 }
@@ -102,7 +103,7 @@ fn top_above(canonical: &Path) -> Option<(PathBuf, GitMarker)> {
 
 /// `path` below `top`, its components joined by `/`: empty at `top` itself,
 /// `None` outside it or when a component is not valid Unicode.
-pub fn subpath_of(top: &Path, path: &Path) -> Option<String> {
+pub(crate) fn subpath_of(top: &Path, path: &Path) -> Option<String> {
     let rest = path.strip_prefix(top).ok()?;
     let mut parts = Vec::new();
     for component in rest.components() {
@@ -132,7 +133,7 @@ fn read_marker(dir: &Path) -> Option<GitMarker> {
 
 /// What a directory's `.git` entry says about where its project's root is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GitMarker {
+pub(crate) enum GitMarker {
     /// `.git` is a directory: an ordinary checkout.
     Dir,
     /// `.git` is a file naming the real git directory, as worktrees and
@@ -147,7 +148,7 @@ pub enum GitMarker {
 /// checked out beside it shares one memory. That only holds when the common
 /// git directory is a `.git` inside a work tree; for a bare repository there
 /// is no such work tree, and the worktree stays its own root.
-pub fn root_from_marker(dir: &Path, marker: &GitMarker) -> PathBuf {
+pub(crate) fn root_from_marker(dir: &Path, marker: &GitMarker) -> PathBuf {
     let GitMarker::Link { gitdir, commondir: Some(common) } = marker else {
         return dir.to_path_buf();
     };
@@ -161,7 +162,7 @@ pub fn root_from_marker(dir: &Path, marker: &GitMarker) -> PathBuf {
 /// The git directory a `.git` file in `dir` points at, or `None` when the
 /// content is not a `gitdir:` line. A relative target is relative to `dir`,
 /// as git writes it with `worktree.useRelativePaths`.
-pub fn parse_gitdir(contents: &str, dir: &Path) -> Option<PathBuf> {
+pub(crate) fn parse_gitdir(contents: &str, dir: &Path) -> Option<PathBuf> {
     let target = contents.lines().next()?.strip_prefix("gitdir:")?.trim();
     if target.is_empty() {
         return None;
@@ -172,7 +173,7 @@ pub fn parse_gitdir(contents: &str, dir: &Path) -> Option<PathBuf> {
 /// `path` without `.` components, trailing separators or `..` that a
 /// preceding name cancels. Purely textual: it never asks the filesystem
 /// whether a name is a link.
-pub fn normalize_lexical(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -273,7 +274,7 @@ pub enum RootCommit {
 }
 
 /// How long `git` may take to give the first commit before it is stopped.
-pub const ROOT_COMMIT_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const ROOT_COMMIT_WAIT: Duration = Duration::from_secs(1);
 
 /// The first commit of the checkout at `root`, from `git rev-list
 /// --max-parents=0 --first-parent HEAD`: a history merged in later comes in
@@ -557,7 +558,7 @@ impl Ground for FakeGround {
 
 /// The directory whose `config` holds the remotes of the checkout at `dir`:
 /// the common git directory of a worktree, the git directory of a submodule.
-pub fn git_config_dir(dir: &Path, marker: &GitMarker) -> PathBuf {
+pub(crate) fn git_config_dir(dir: &Path, marker: &GitMarker) -> PathBuf {
     match marker {
         GitMarker::Dir => dir.join(".git"),
         GitMarker::Link { gitdir, commondir: Some(common) } => normalize_lexical(&gitdir.join(common.trim())),
@@ -568,7 +569,7 @@ pub fn git_config_dir(dir: &Path, marker: &GitMarker) -> PathBuf {
 /// The first `url` of the `origin` remote in the text of a git `config`.
 /// Section names are matched without case and the subsection exactly, as git
 /// does; `include` and `insteadOf` are not followed.
-pub fn origin_url(config: &str) -> Option<String> {
+pub(crate) fn origin_url(config: &str) -> Option<String> {
     let mut in_origin = false;
     for line in config.lines() {
         let line = line.trim();
@@ -607,7 +608,7 @@ pub fn origin_url(config: &str) -> Option<String> {
 /// `host/owner/repo` for a remote URL, in lower case, without scheme, user,
 /// password, port, trailing slash or `.git`. `None` for anything that is not
 /// a server two clones would name alike: a path, `file://`, an empty value.
-pub fn normalize_remote(url: &str) -> Option<String> {
+pub(crate) fn normalize_remote(url: &str) -> Option<String> {
     let url = url.trim();
     let (authority, path) = match url.split_once("://") {
         Some((scheme, rest)) => {

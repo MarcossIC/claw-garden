@@ -17,18 +17,18 @@ pub(crate) struct TokenSplitter {
 
 impl TokenSplitter {
     /// Real tokenizer-backed splitter (preferred, post-bootstrap).
-    pub fn with_tokenizer(tokenizer: Arc<tokenizers::Tokenizer>) -> Self {
+    pub(crate) fn with_tokenizer(tokenizer: Arc<tokenizers::Tokenizer>) -> Self {
         Self { tokenizer: Some(tokenizer) }
     }
 
     /// Byte-length fallback when `tokenizer.json` is not yet on disk.
     /// 1 token ≈ 4 bytes for the languages we support.
-    pub fn fallback() -> Self {
+    pub(crate) fn fallback() -> Self {
         Self { tokenizer: None }
     }
 
     /// The tokenizer the splitter counts with, if it has one.
-    pub fn tokenizer(&self) -> Option<&tokenizers::Tokenizer> {
+    pub(crate) fn tokenizer(&self) -> Option<&tokenizers::Tokenizer> {
         self.tokenizer.as_deref()
     }
 
@@ -44,7 +44,7 @@ impl TokenSplitter {
     /// How many tokens `text` is, by the same measure [`TokenSplitter::split`]
     /// caps at: the tokenizer's count, or a quarter of the bytes (rounded up)
     /// in fallback mode.
-    pub fn count(&self, text: &str) -> usize {
+    pub(crate) fn count(&self, text: &str) -> usize {
         match self.tokenizer.as_deref().map(|tok| tok.encode(text, false)) {
             Some(Ok(enc)) => enc.get_offsets().len(),
             _ => text.len().div_ceil(4),
@@ -53,7 +53,7 @@ impl TokenSplitter {
 
     /// [`TokenSplitter::count`] of each of `texts`, tokenized as one batch so
     /// the tokenizer spreads it over the cores.
-    pub fn count_all(&self, texts: &[&str]) -> Vec<usize> {
+    pub(crate) fn count_all(&self, texts: &[&str]) -> Vec<usize> {
         match self.tokenizer.as_deref().map(|tok| tok.encode_batch(texts.to_vec(), false)) {
             Some(Ok(encodings)) => encodings.iter().map(|enc| enc.get_offsets().len()).collect(),
             _ => texts.iter().map(|text| self.count(text)).collect(),
@@ -64,7 +64,7 @@ impl TokenSplitter {
     /// least `overlap` tokens repeated between adjacent chunks; `overlap == 0`
     /// tiles the text. With a tokenizer, every cut falls where a word starts
     /// when one is in reach ([`plan_word_windows`]). Preserves UTF-8 boundaries.
-    pub fn split(&self, text: &str, max_tokens: usize, overlap: usize) -> Vec<Chunk> {
+    pub(crate) fn split(&self, text: &str, max_tokens: usize, overlap: usize) -> Vec<Chunk> {
         if max_tokens == 0 || text.is_empty() {
             return vec![];
         }

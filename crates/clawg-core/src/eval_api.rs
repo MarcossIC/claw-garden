@@ -59,7 +59,12 @@ pub use vector_memo::{EvalMemo, EvalMemoReport};
 
 /// Opaque handle to a memory store. Every operation available on it is a
 /// method below — the wrapped store itself is never reachable.
-pub struct EvalStore(MemoryStore);
+pub struct EvalStore(
+    MemoryStore,
+    /// The directory it was opened in, where `sharing.json` is read for a
+    /// search.
+    PathBuf,
+);
 
 /// The lexical-channel candidate budget the shipped application searches
 /// with, read off the production default itself rather than restated.
@@ -284,7 +289,7 @@ impl EvalStore {
     pub async fn open(base_dir: &Path) -> Result<Self, EvalError> {
         MemoryStore::open(base_dir, StoreHolder::Eval)
             .await
-            .map(EvalStore)
+            .map(|store| EvalStore(store, base_dir.to_path_buf()))
             .map_err(|e| EvalError::Open(e.to_string()))
     }
 
@@ -360,7 +365,7 @@ impl EvalStore {
         let scope = scope
             .into_search_scope()
             .with_project(project.as_deref())
-            .with_reach(self.0.reader_for(agent_id).reach);
+            .with_reach(crate::memory::sharing::reader_from(Some(&self.1), agent_id).reach);
         let (hits, pool) = search_all_memories_with_scoring(
             &self.0,
             embedding,
@@ -753,7 +758,8 @@ impl EvalIngest {
             Ok(_) => None,
         };
         if let Some(refusal) = refusal {
-            runtime.close().await;
+            // The answer is the error below, whatever the close says.
+            let _ = runtime.close().await;
             return Err(refusal);
         }
         runtime.access_tracker = Arc::new(AccessTracker::inert());
@@ -767,6 +773,7 @@ impl EvalIngest {
             runtime.store.clone(),
             runtime.embedder.clone(),
             chat_chunker,
+            Some(runtime.base_dir.clone()),
         ));
 
         Ok(Self { tx, worker, runtime })
@@ -885,7 +892,8 @@ impl EvalIngest {
         let Self { tx, worker, runtime } = self;
         drop(tx);
         if let Err(e) = worker.await {
-            runtime.close().await;
+            // The answer is the error below, whatever the close says.
+            let _ = runtime.close().await;
             return Err(EvalError::Insert(format!("the ingest worker failed: {e}")));
         }
         Ok(runtime)
@@ -897,7 +905,8 @@ impl EvalIngest {
     /// deleted.
     pub async fn close(self) {
         if let Ok(runtime) = self.finish().await {
-            runtime.close().await;
+            // The caller is already answering with its own error.
+            let _ = runtime.close().await;
         }
     }
 }
@@ -2396,7 +2405,7 @@ mod tests {
             5,
             "finish() is the drained signal: every queued event must already be a row when it returns"
         );
-        runtime.close().await;
+        runtime.close().await.expect("the store closes");
     }
 
     #[tokio::test]
@@ -2422,7 +2431,7 @@ mod tests {
         assert_eq!(created.len(), 2);
         let gap = created[0] - created[1];
         assert!((gap - (300 * DAY_MS) as i64).abs() < 60_000, "gap was {gap} ms");
-        runtime.close().await;
+        runtime.close().await.expect("the store closes");
     }
 
     #[tokio::test]
@@ -2439,7 +2448,7 @@ mod tests {
         assert_eq!(held, vec![1], "a text is held as a save of it would hash it");
         assert!(ingest.composition().await.unwrap().rows >= 1);
         assert!(ingest.resolve_cases(&[]).await.unwrap().is_empty());
-        ingest.finish().await.unwrap().close().await;
+        ingest.finish().await.unwrap().close().await.expect("the store closes");
     }
 
     #[tokio::test]
@@ -2466,7 +2475,7 @@ mod tests {
             Err(EvalError::UnknownMemoryType(t)) => assert_eq!(t, "not_a_real_type"),
             other => panic!("expected UnknownMemoryType, got {other:?}"),
         }
-        ingest.finish().await.unwrap().close().await;
+        ingest.finish().await.unwrap().close().await.expect("the store closes");
     }
 
     #[tokio::test]
@@ -2588,7 +2597,7 @@ mod tests {
 
         assert!(first.replaced.is_empty());
         assert_eq!(second.replaced, vec![first.rows[0].0]);
-        ingest.finish().await.unwrap().close().await;
+        ingest.finish().await.unwrap().close().await.expect("the store closes");
     }
 
     #[tokio::test]
@@ -2605,7 +2614,7 @@ mod tests {
         assert_eq!(candidate.id, older.rows[0].0);
         assert!((candidate.distance - 0.2).abs() < 0.01, "distance was {}", candidate.distance);
         assert!(!candidate.escalated, "two facts are never put to the user");
-        ingest.finish().await.unwrap().close().await;
+        ingest.finish().await.unwrap().close().await.expect("the store closes");
     }
 
     #[tokio::test]
@@ -3440,7 +3449,7 @@ second
             .await
             .unwrap();
         assert_eq!(stored.map(|s| s.model_id), Some(fake_identity().model_id));
-        runtime.close().await;
+        runtime.close().await.expect("the store closes");
         drop(runtime);
 
         let refused = EvalIngest::open(dir.path(), &placed_embedder(), dir.path()).await;

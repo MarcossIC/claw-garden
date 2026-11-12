@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::memory::store_lock::{StoreHolder, StoreLock};
-use crate::memory::MemoryError;
+use crate::memory::{MemoryError, StorageError};
 
 /// One migration as the schema plan compares it: applied to a database
 /// (`refinery_schema_history`) or embedded in this binary.
@@ -17,7 +17,7 @@ pub struct MigrationId {
 /// Reads `refinery_schema_history`, empty when the table does not exist yet.
 ///
 /// Refinery stores the checksum as the decimal text of a `u64`.
-pub fn read_history(c: &rusqlite::Connection) -> rusqlite::Result<Vec<MigrationId>> {
+pub(crate) fn read_history(c: &rusqlite::Connection) -> rusqlite::Result<Vec<MigrationId>> {
     let exists: bool = c.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master \
          WHERE type = 'table' AND name = 'refinery_schema_history')",
@@ -90,7 +90,7 @@ pub enum SchemaPlan {
 /// A divergence inside the range this binary knows wins over `Newer`: a
 /// binary that disagrees about its own migrations has a different problem
 /// than one that is merely older.
-pub fn schema_plan(applied: &[MigrationId], known: &[MigrationId]) -> SchemaPlan {
+pub(crate) fn schema_plan(applied: &[MigrationId], known: &[MigrationId]) -> SchemaPlan {
     let Some(db) = applied.iter().map(|m| m.version).max() else {
         return SchemaPlan::Fresh;
     };
@@ -163,7 +163,7 @@ impl Reason {
         Reason::PreDelete,
     ];
 
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Reason::PreMigration => "pre-migration",
             Reason::PreRestore => "pre-restore",
@@ -203,7 +203,7 @@ pub enum BackupError {
     Snapshot {
         path: PathBuf,
         #[source]
-        source: rusqlite::Error,
+        source: StorageError,
     },
     #[error("could not finish the snapshot {path}: {source}")]
     Io {
@@ -295,14 +295,14 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// per restore, per import, per re-embed or per batch move, so five cover
 /// several in a row. A starting
 /// value, not measured.
-pub const AUTO_KEEP: usize = 5;
+pub(crate) const AUTO_KEEP: usize = 5;
 
 /// The automatic snapshots among `names` that fall outside the newest
 /// [`AUTO_KEEP`], except the newest of each reason: a burst of restores or
 /// re-embeds must not push out the `pre-migration` snapshot that is the way
 /// back from an upgrade. Manual snapshots and names this module did not
 /// produce are never chosen.
-pub fn to_prune(names: &[String]) -> Vec<String> {
+pub(crate) fn to_prune(names: &[String]) -> Vec<String> {
     let mut automatic: Vec<(&String, Reason)> = names
         .iter()
         .filter_map(|n| parse_snapshot_name(n).filter(|r| r.is_automatic()).map(|r| (n, r)))
@@ -359,7 +359,7 @@ fn now_ms() -> i64 {
 /// includes what is still in the WAL; the result has no WAL of its own. It is
 /// written under a `.tmp` name and renamed when complete, so an interrupted
 /// snapshot never passes for a finished one.
-pub fn snapshot_into(
+pub(crate) fn snapshot_into(
     c: &rusqlite::Connection,
     dir: &Path,
     reason: Reason,
@@ -373,7 +373,7 @@ pub fn snapshot_into(
     let _ = std::fs::remove_file(&tmp);
     if let Err(source) = c.execute("VACUUM INTO ?1", [target]) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(BackupError::Snapshot { path, source });
+        return Err(BackupError::Snapshot { path, source: source.into() });
     }
     if let Err(source) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
@@ -1236,6 +1236,36 @@ mod tests {
 
         assert!(matches!(result, Err(BackupError::Snapshot { .. })), "got {result:?}");
         assert_eq!(files_in(&backups), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_in_a_transaction_says_why_it_failed() {
+        let dir = crate::test_dir::test_dir();
+        let store = MemoryStore::open(dir.path(), StoreHolder::Eval).await.unwrap();
+        let target = dir.path().join("backups");
+
+        let result = store
+            .conn
+            .call(move |c| -> rusqlite::Result<_> {
+                c.execute_batch("BEGIN")?;
+                let result = snapshot_into(c, &target, Reason::Manual);
+                c.execute_batch("ROLLBACK")?;
+                Ok(result)
+            })
+            .await
+            .unwrap();
+        store.conn.clone().close().await.unwrap();
+
+        let failure = result.unwrap_err();
+        let BackupError::Snapshot { path, .. } = &failure else {
+            panic!("got {failure:?}");
+        };
+        assert_eq!(
+            failure.to_string(),
+            format!("could not write the snapshot {}: cannot VACUUM from within a transaction", path.display())
+        );
+        let cause = std::error::Error::source(&failure).expect("the snapshot error names its cause");
+        assert_eq!(cause.to_string(), "cannot VACUUM from within a transaction");
     }
 
     fn m(version: i32, checksum: u64) -> MigrationId {

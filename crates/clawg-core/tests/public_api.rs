@@ -11,11 +11,13 @@
 //! the same gate `MemoryStore::new_for_test` itself carries.
 
 use clawg_core::memory::clock::TimestampMs;
+#[cfg(feature = "testing")]
 use clawg_core::memory::events::{MemoryEvent, MemorySource};
 use clawg_core::memory::store_lock::StoreHolder;
 use clawg_core::memory::{
     search_all_memories, MemoryError, MemoryStore, RankedHit, SearchScope,
 };
+#[cfg(feature = "testing")]
 use clawg_core::models::chat::Role;
 use clawg_core::runtime::MemoryRuntime;
 
@@ -85,6 +87,7 @@ fn ranked_hit_serializes_to_json() {
 
 // ── explicit memories are constructible from outside the crate ────────────
 
+#[cfg(feature = "testing")]
 fn explicit_event(content: &str, memory_type: Option<&str>, importance: Option<f64>) -> MemoryEvent {
     MemoryEvent {
         agent_id: "agent-1".into(),
@@ -128,13 +131,66 @@ async fn a_second_runtime_open_on_the_same_dir_is_refused_naming_the_first_holde
         other => panic!("expected StoreInUse naming the daemon, got {other:?}"),
     }
     // On Windows a store still open cannot be deleted with its directory.
-    first.close().await;
+    first.close().await.expect("the store closes");
+}
+
+// ── Storage failures, seen from outside the crate ─────────────────────────
+
+/// Whatever the backend is, a call it fails reaches another crate as one
+/// variant.
+#[tokio::test]
+async fn a_call_on_a_closed_store_fails_with_a_storage_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (runtime, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Eval).await.expect("open");
+    runtime.close().await.expect("the store closes");
+
+    let failure = runtime.store.probe_wait().await.expect_err("the store is closed");
+    assert!(matches!(failure, MemoryError::Storage(_)), "{failure:?}");
+}
+
+/// A host that is about to delete the store's directory has to know the
+/// connection let the files go.
+#[tokio::test]
+async fn a_runtime_closes_and_says_so() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (runtime, _rx) = MemoryRuntime::open(tmp.path().to_path_buf(), StoreHolder::Eval).await.expect("open");
+
+    let first: Result<(), clawg_core::memory::StorageError> = runtime.close().await;
+    assert!(first.is_ok(), "{first:?}");
+    let again = runtime.close().await;
+    assert!(again.is_ok(), "a closed store closes again: {again:?}");
+
+    let failure = runtime.store.probe_wait().await.expect_err("the store is closed");
+    assert!(matches!(failure, MemoryError::Storage(_)), "{failure:?}");
+}
+
+/// The variants another crate can tell apart. A match with no wildcard, so a
+/// new variant, or one that names the backend again, has to be written here.
+#[test]
+fn memory_error_tells_apart_what_another_crate_handles() {
+    fn name(e: &MemoryError) -> &'static str {
+        match e {
+            MemoryError::Storage(_) => "storage",
+            MemoryError::Internal(_) => "internal",
+            MemoryError::WorkspaceIo { .. } => "workspace_io",
+            MemoryError::StoreInUse { .. } => "store_in_use",
+            MemoryError::SchemaNewer { .. } => "schema_newer",
+            MemoryError::SchemaDiverged { .. } => "schema_diverged",
+            MemoryError::Backup(_) => "backup",
+            MemoryError::Purge(_) => "purge",
+            MemoryError::DataDir { .. } => "data_dir",
+            MemoryError::StoreLockIo { .. } => "store_lock_io",
+        }
+    }
+    assert_eq!(name(&MemoryError::Internal("boom".into())), "internal");
+    assert_eq!(name(&MemoryError::SchemaDiverged { version: 3 }), "schema_diverged");
 }
 
 // ── MemoryRuntime boots on a plain tokio runtime ──────────────────────────
 
 /// A plain tokio runtime, with no host framework, can open the store and get a
 /// usable handle set back.
+#[cfg(feature = "testing")]
 #[tokio::test]
 async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -150,7 +206,7 @@ async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
     // The store is not merely constructed — the sqlite-vec extension is loaded.
     let version: String = rt
         .store
-        .conn
+        .conn_for_test()
         .call(|c| -> Result<String, rusqlite::Error> {
             c.query_row("SELECT vec_version()", [], |r| r.get(0))
         })
@@ -176,7 +232,7 @@ async fn memory_runtime_open_creates_the_db_and_returns_a_usable_store() {
         wm.workspace_path("agent-1", None),
         base.join("workspaces").join("agent-1").join("default").join("workspace.md")
     );
-    rt.close().await;
+    rt.close().await.expect("the store closes");
 }
 
 /// `new_for_test` is a shortcut for hosts' tests: an in-memory store with the
@@ -215,7 +271,7 @@ async fn memory_runtime_ingest_worker_drains_an_event_into_a_row() {
     worker.await.expect("worker must exit cleanly when every sender is dropped");
 
     let count: i64 = store
-        .conn
+        .conn_for_test()
         .call(|c| -> Result<i64, rusqlite::Error> {
             c.query_row("SELECT COUNT(*) FROM memory WHERE source = 'explicit'", [], |r| r.get(0))
         })
@@ -263,7 +319,7 @@ async fn explicit_overrides_reach_the_stored_row() {
     worker.await.expect("worker exits");
 
     let (mtype, importance, created_by): (String, f64, String) = store
-        .conn
+        .conn_for_test()
         .call(|c| -> Result<(String, f64, String), rusqlite::Error> {
             c.query_row(
                 "SELECT memory_type, importance, created_by_type FROM memory \
