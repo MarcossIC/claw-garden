@@ -1,0 +1,14 @@
+change: verdict-on-replace
+objective: "1"
+depends_on: []
+phase: propose
+artifacts:
+  exploration: done
+  proposal: draft  # toma las opciones recomendadas de las decisiones abiertas de la exploración
+  spec: pending
+  design: pending
+  tasks: pending
+  apply: pending
+  verify: pending
+  archive: pending
+updated: 2026-11-11
