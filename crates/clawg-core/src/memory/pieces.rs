@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::admin::get_memory_core;
+use crate::memory::listing::get_memory_core;
 use crate::memory::chunker::token_splitter::MIN_OVERLAP_CHARS;
 use crate::memory::error::MemoryError;
 use crate::memory::search::PiecePosition;

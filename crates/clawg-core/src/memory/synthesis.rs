@@ -15,7 +15,7 @@
 use serde::Serialize;
 
 use crate::memory::error::{ClosedAs, failed_call};
-use crate::memory::admin::{map_memory_row, MemoryAdminRow, SELECT_MEMORY};
+use crate::memory::listing::{map_memory_row, MemoryAdminRow, SELECT_MEMORY};
 use crate::memory::clock::TimestampMs;
 use crate::memory::search::{reach_predicate, reader_bind, reader_predicate};
 use crate::memory::sharing::Reader;
