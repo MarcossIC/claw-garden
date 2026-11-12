@@ -477,7 +477,7 @@ async fn check_schema(conn: &Connection) -> Result<SchemaPlan, MemoryError> {
 
 async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
     conn.call(|c: &mut rusqlite::Connection| -> Result<refinery::Report, refinery::Error> {
-        configured(crate::memory::migrations::runner()).run(c)
+        configured(crate::memory::migrations::runner()).run(&mut crate::memory::migrations::Driver(c))
     })
     .await
     .map_err(|e| match e {
@@ -519,7 +519,7 @@ pub(crate) async fn seed_on_disk(dir: &Path, target: Option<i32>) {
             Some(v) => runner.set_target(refinery::Target::Version(v)),
             None => runner,
         };
-        runner.run(c)
+        runner.run(&mut crate::memory::migrations::Driver(c))
     })
     .await
     .unwrap();
@@ -614,7 +614,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(5))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -634,7 +634,7 @@ mod tests {
         .unwrap();
 
         // Now run V6 — the row above is exactly the legacy case it targets.
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
 
@@ -688,7 +688,7 @@ mod tests {
                 migrations.push(
                     refinery::Migration::unapplied("V9__broken", "THIS IS NOT SQL;").unwrap(),
                 );
-                configured(refinery::Runner::new(&migrations)).run(c)
+                configured(refinery::Runner::new(&migrations)).run(&mut crate::memory::migrations::Driver(c))
             })
             .await;
         assert!(result.is_err(), "the broken V9 must fail the run");
@@ -717,7 +717,7 @@ mod tests {
         ensure_vec0_registered();
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
         conn.call(|c| {
@@ -764,7 +764,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(8))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -819,7 +819,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(9))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -875,7 +875,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(11))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -942,7 +942,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(12))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1012,7 +1012,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(13))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1068,7 +1068,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(14))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1139,7 +1139,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(15))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1202,7 +1202,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(16))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2377,7 +2377,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(18))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2421,7 +2421,7 @@ mod tests {
             let conn = Connection::open_in_memory().await.unwrap();
             register_udfs(&conn).await.unwrap();
 
-            conn.call(move |c| configured_to(crate::memory::migrations::runner(), cap).run(c))
+            conn.call(move |c| configured_to(crate::memory::migrations::runner(), cap).run(&mut crate::memory::migrations::Driver(c)))
                 .await
                 .unwrap();
 
@@ -2561,7 +2561,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(3))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2578,7 +2578,7 @@ mod tests {
             .unwrap();
         assert_eq!(before, 1, "V3 must have created the view for this test to mean anything");
 
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
 
@@ -2857,7 +2857,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(7))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2871,7 +2871,7 @@ mod tests {
         let to_v8 = |c: &mut rusqlite::Connection| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(8))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         };
         conn.call(to_v8).await.unwrap();
         let after: i64 = conn
@@ -2904,7 +2904,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(7))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2924,7 +2924,7 @@ mod tests {
         .unwrap();
 
         // Now run V8 — the row above predates the FTS table and its triggers.
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
 
@@ -3008,7 +3008,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(7))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -3029,7 +3029,7 @@ mod tests {
         .await
         .unwrap();
 
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
 

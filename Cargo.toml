@@ -31,7 +31,12 @@ once_cell = "1"
 # Storage and vector search
 tokio-rusqlite = "0.7"
 rusqlite = { version = "0.37", features = ["bundled", "load_extension", "functions"] }
-refinery = { version = "0.9", features = ["rusqlite"] }
+# Built without its rusqlite driver, which accepts a closed range of rusqlite
+# versions; `memory/migrations.rs` implements the driver over `refinery-core`'s
+# traits, and reads the history's timestamps with `time` as that driver does.
+refinery = "0.9"
+refinery-core = "0.9"
+time = { version = "0.3", features = ["parsing"] }
 sqlite-vec = "0.1"
 siphasher = "1.0"
 
