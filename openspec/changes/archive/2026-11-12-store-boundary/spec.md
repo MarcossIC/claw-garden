@@ -1,6 +1,6 @@
 # store-boundary — Especificación
 
-Son requisitos sobre [`specs/storage`](../../specs/storage/spec.md), [`specs/portability`](../../specs/portability/spec.md) y [`specs/sharing`](../../specs/sharing/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está.
+Son requisitos sobre [`specs/storage`](../../../specs/storage/spec.md), [`specs/portability`](../../../specs/portability/spec.md) y [`specs/sharing`](../../../specs/sharing/spec.md), y se consolidan al archivar. Lo que no se nombra acá sigue como está.
 
 Términos:
 

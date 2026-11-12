@@ -14,6 +14,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - [project-locators](../../changes/archive/2026-10-27-project-locators/proposal.md), archivado el 2026-10-27, su entrega 1, que sale en 0.65.0 (PL1 a PL10: `project` es la referencia de cada proyecto y las carpetas pasan a `project_path`, el primer commit es la segunda huella de una carpeta, una mudanza conserva el proyecto, lo dudoso queda como sugerencia, y `clawg projects list` y `rename`; cambia R4, R10, R15, R16, R18 y R20), y su entrega 2a, en la misma versión (PL11 a PL20: `clawg projects merge` con su lápida y su `--undo`, `canonical` en cada entrada que recibe un proyecto, `clawg projects keep-apart` y los duplicados de `doctor`; cambia PL9), y su entrega 2b, en la misma versión (PL21 a PL31: `clawg projects delete` en sus dos etapas con su `--undo`, el proyecto borrado que vuelve al usarse, `clawg purge --project-delete` y el chequeo `project_deletes`; cambia PL9 y PL15), y su entrega 3a, en la misma versión (PL32 a PL42: el argumento `project` y `answer_suggestion` del contrato, `POST /v1/projects/resolve`, `suggestions/answer` y `locate`, los nombres en `--to-project` y `PATCH`, `clawg projects create` y `locate`, las sugerencias en el contexto y la sugerencia `folder_name`; cambia R10 y PL19), y su entrega 3b, en la misma versión (PL43 a PL52: las declaraciones de V30, el camino crudo en el registro, `clawg projects locate --subfolder` y el chequeo `project_subfolders`; cambia R1, R3, R4 y R6), y su entrega 4, en la misma versión (PL53 a PL65: el diario del registro de V31, una línea `project` por proyecto con sus localizadores, adónde va cada proyecto del archivo, las sugerencias, las declaraciones y lo borrado en un import, `--project-map NOMBRE=project:REF` y lo que retira el `--undo`; cambia PL6, PL7, PL47 y PL52).
 - [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (R3 deja de dar al puente sólo el proyecto de su directorio, R6 pide `index_docs` para una carpeta abierta, y PL34 busca sin alcance cuando no hay ninguna; las carpetas abiertas y el save que nombra su proyecto están en [`specs/mcp`](../mcp/spec.md), BI1 a BI10).
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL2, «Los diarios de proyectos nombran las filas migradas», al final de esta spec: las uniones, los borrados y el registro dejan de tocar las tablas que V32 retira). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
+- [store-boundary](../../changes/archive/2026-11-12-store-boundary/proposal.md), archivado el 2026-11-12, que sale en 0.84.0 (SB3, «Las carpetas de un proyecto se cuentan en el núcleo», después de PL39: `locate_project` deja de leer `project_path` y cuenta con `registry::own_folder_count`). Los R1 a R10 de ese cambio son SB1 a SB10; los demás están en [`specs/storage`](../storage/spec.md), «El límite del almacenamiento», y SB8 también en [`specs/portability`](../portability/spec.md) y [`specs/sharing`](../sharing/spec.md).
 
 ## Definiciones
 
@@ -950,6 +951,22 @@ Un proyecto con una carpeta presente, uno sin carpetas, una lápida y un borrado
 Los dos MUST hablar con el daemon que corre, sin arrancar uno, e imprimir en el idioma de la preferencia, con una sentencia por `match` sobre `Lang`.
 
 **Tests:** `projects_create_and_locate_parse` (`cli.rs`); `a_created_project_or_its_candidates_are_printed` (`crates/clawg-cli/src/projects.rs`, en los dos idiomas); `locating_a_folder_merges_its_own_project_into_the_named_one` y `a_folder_shared_by_its_project_is_not_located` (`tests/api.rs`).
+
+## SB3. Las carpetas de un proyecto se cuentan en el núcleo
+
+`registry::own_folder_count(store, project)` (`crates/clawg-core/src/memory/projects/registry.rs:816`) MUST devolver cuántas carpetas de `project_path` llevan a `project`: las que tienen su `project_id`, y una de antes de V27 cuyo `id` es el del proyecto. Su error MUST ser `StorageError` ([`specs/storage`](../storage/spec.md), SB5).
+
+`locate_project` (`POST /v1/projects/locate`, `crates/clawg-cli/src/daemon/api.rs:3097`) MUST decidir con ese número, sin leer la base por su cuenta (SB1 de `specs/storage`):
+
+- con más de una carpeta, el 409 `folder_shared` MUST llevar el `detail` `<CAMINO> leads to project <P>, which has <N> folders; `clawg projects merge <P> --into <PROYECTO>` merges them all`;
+- el 500 de una consulta que falla MUST salir de `ApiError::internal`, con el texto del `StorageError`.
+
+#### Escenario
+- GIVEN el proyecto A con dos carpetas, el proyecto B cuya única carpeta es de antes de V27 (con el `id` de B y sin `project_id`), y el proyecto C sin carpetas
+- WHEN se cuentan las carpetas de cada uno
+- THEN A tiene 2, B 1 y C 0
+
+**Tests:** `own_folder_count_counts_the_folders_that_lead_to_a_project` (`crates/clawg-core/src/memory/projects/registry.rs`); `a_folder_shared_by_its_project_is_not_located` (`crates/clawg-cli/tests/api.rs`), que comprueba el `detail` entero.
 
 ## PL40. Ninguna ruta nueva se olvida de la lápida
 

@@ -1,6 +1,6 @@
 # store-boundary — Verificación
 
-**Resultado:** aplicado y verificado en Linux, y la suite pasa en el job de Windows del CI. La suite entera y los dos clippy pasan sobre el último commit de código. Ningún test de una respuesta ni de los contratos del agente cambió lo que comprueba. Queda lo que se lista en [«Pendiente»](#pendiente).
+**Resultado:** aplicado y verificado en Linux, y la suite pasa en el job de Windows del CI. La suite entera y los dos clippy pasan sobre el último commit de código. Ningún test de una respuesta ni de los contratos del agente cambió lo que comprueba. En Windows, las tres herramientas de evaluación borran su directorio temporal ([«En Windows, en local»](#en-windows-en-local)). Queda lo que se lista en [«Pendiente»](#pendiente).
 
 ## Qué se corrió
 
@@ -127,7 +127,28 @@ El check `advisories` falla por un aviso sobre `rmcp` 3.5.1 que `develop` tambi�
 
 Lo que el CI no comprueba:
 
-- **En Windows, en local**, con `--target-dir target-test`: que `rag-eval --agent-view`, `revision-eval` y `conflict-eval` borren su directorio temporal al terminar. Ahora cierran con `MemoryRuntime::close`, y en Windows un store que no cerró no se puede borrar.
-- **El `E0616` del doctest**, que sólo comprueba un `rustdoc` nightly.
+- **El `E0616` del doctest**, que sólo comprueba un `rustdoc` nightly. No se corrió.
 
-Fuera de estas tareas quedan archivar, las specs principales, `openspec/README.md`, `openspec/ROADMAP.md` y la subida de versión.
+El otro punto que el CI no comprueba, que las herramientas de evaluación borren su directorio temporal en Windows, se corrió al archivar: está en [«En Windows, en local»](#en-windows-en-local).
+
+## En Windows, en local
+
+`rag-eval --agent-view`, `revision-eval` y `conflict-eval` cierran con `MemoryRuntime::close`, y en Windows un store que no cerró no se puede borrar. Se corrieron el 2026-11-12 en Windows 11, sobre `develop` con este cambio, con el modelo falso, un build debug en `target-test` limpiado antes de compilar, y sin ningún perfil de datos. La compilación no dejó warnings.
+
+| Comando | Salida | Directorio temporal |
+|---|---|---|
+| `cargo run -p clawg-eval --bin rag-eval --target-dir target-test -- --fake --agent-view --out <dir>` | 0 | ningún `rag-eval-*` antes ni después |
+| `cargo run -p clawg-eval --bin revision-eval --target-dir target-test -- chains --fake` | 0 | ningún `revision-eval-*` antes ni después |
+| `cargo run -p clawg-eval --bin conflict-eval --target-dir target-test -- --fake` | 0 | ningún directorio nuevo |
+
+`conflict-eval` crea su directorio con `tempfile::tempdir_in`, sin un prefijo propio, así que se comparó el listado entero del directorio temporal del sistema antes y después de la corrida: no quedó ningún directorio nuevo. Aparecieron tres archivos `.tmp` sueltos; `tempdir_in` crea directorios, así que se leen como de otro proceso, pero no se comprobó cuál los creó.
+
+`revision-eval store --export` conserva su directorio a propósito hasta que se etiqueta, y no se corrió.
+
+## Al archivar (2026-11-12)
+
+- Los ids cambian al consolidar. R1 a R10 chocan con los ids de cada spec, así que los requisitos de este cambio pasan a SB. Mapeo: R1, R2, R4, R5, R6, R7 y R9 pasan a SB1, SB2, SB4, SB5, SB6, SB7 y SB9 en [`specs/storage`](../../../specs/storage/spec.md), en «El límite del almacenamiento». R3 pasa a SB3 en [`specs/project`](../../../specs/project/spec.md), después de PL39, que ya describe `locate_project` y el 409 `folder_shared`. R8 se parte: los imports en curso son SB8 en [`specs/portability`](../../../specs/portability/spec.md), después de IU5, y `sharing.json` es SB8 en [`specs/sharing`](../../../specs/sharing/spec.md), al final. R10 («Lo que ve un cliente no cambia») no se consolida, porque es de conservación. Este archivo conserva los ids R.
+- Sale en 0.84.0.
+- De «Pendiente» se corrió lo de Windows, que pasó a «En Windows, en local». Queda el `E0616` del doctest, que pide un `rustdoc` nightly.
+- Citas: el `spec.md` de este cambio no cita líneas de código, y los nombres de test que cita existen en los archivos que nombra. Las de lo que se consolidó se tomaron del código de hoy. En las secciones que se tocaron se corrieron las citas cercanas: en `specs/storage`, las del cierre de `clawg serve` en «Apagado sin pérdida» (`runtime.rs` y `serve.rs`); en `specs/sharing`, las cinco de `sharing.rs` en R1; en `specs/portability`, las de `Journal` y `write` en «Dónde está». Las citas `path:línea` de `proposal.md`, `design.md` y `exploration.md` describen el código de antes de este cambio y no se corrigieron.
+- Diferencias entre la spec del cambio y el código: las que ya están en «Lo que se resolvió distinto de lo escrito». En particular R9 pedía que un ítem fuera `pub` sólo si otro crate lo usa, y el código deja `pub` también lo que está en la firma de algo que otro crate usa (`MemoryPool`, `Progress`, `SaveSplit`) y las dos gemelas de plataforma; SB9 dice lo que hace el código. En lo demás que se rechequeó (los textos de SB6, la forma de `StorageError`, las variantes que quedan de `MemoryError`, `close`, `own_folder_count`, `RunningImports` y el directorio del worker) no se encontró ninguna.

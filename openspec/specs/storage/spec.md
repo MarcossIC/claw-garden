@@ -28,6 +28,7 @@ Fuente de verdad del comportamiento actual del almacenamiento: el outbox donde q
 - [docs-index-speed](../../changes/archive/2026-11-01-docs-index-speed/proposal.md), archivado el 2026-11-01, que sale en 0.73.0 (sólo IS4: el caso de `e5_golden` con el orden en que el refresco de docs entrega los textos, en «Los mismos vectores que fastembed»). El orden y la cola están en [`specs/project-docs`](../project-docs/spec.md), «La cola del refresco».
 - [embedder-footprint](../../changes/archive/2026-11-03-embedder-footprint/proposal.md), archivado el 2026-11-03, cuyo código salió en 0.71.0 (sólo EF1: los hilos de la sesión, con su respaldo, en «Los mismos vectores que fastembed»).
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (V32 y su vuelta atrás, RL1, y «Nadie más lee las tablas», RL4, en «Las tablas que retira V32»; el KNN único está en [`specs/retrieval`](../retrieval/spec.md), RL4, y los diarios de proyectos en [`specs/project`](../project/spec.md), RL2). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
+- [store-boundary](../../changes/archive/2026-11-12-store-boundary/proposal.md), archivado el 2026-11-12, que sale en 0.84.0 (SB1, SB2, SB4, SB5, SB6, SB7 y SB9, en «El límite del almacenamiento»: la conexión de SQLite es del núcleo, los errores de almacenamiento son un `StorageError` opaco con una sola traducción, `MemoryRuntime::close` dice si cerró y la superficie pública de `memory` es la que usan los otros crates). Sus R1 a R10 son SB1 a SB10 acá y en las demás specs, para no chocar con los ids de cada una. SB3 (las carpetas de un proyecto) está en [`specs/project`](../project/spec.md); SB8 está en [`specs/portability`](../portability/spec.md) (los imports en curso) y en [`specs/sharing`](../sharing/spec.md) (`sharing.json`). SB10, que un cliente no ve ningún cambio, es de conservación y no se consolida.
 
 ## Definiciones
 
@@ -233,7 +234,7 @@ Después de drenar y del flush del tracker, el apagado SHOULD hacer `PRAGMA wal_
 
 ### El daemon cierra `memory.db` antes de salir
 
-Después de un apagado que terminó dentro de su tope (`shutdown` devuelve `true`), `clawg serve` MUST cerrar la conexión del store y esperar el cierre (`MemoryRuntime::close`, `crates/clawg-core/src/runtime.rs:349`; en `crates/clawg-cli/src/daemon/serve.rs:291`), así SQLite quita `memory.db-wal` y `memory.db-shm` antes de que termine el proceso. Sin cerrarla, el cierre corre en el hilo propio de la conexión cuando cae su último handle, y la salida del proceso puede cortarlo después de quitar el índice del WAL y antes de quitar el WAL: queda un `memory.db-wal` vacío, y `clawg doctor`, que con un WAL presente abre sin `immutable`, crea un `memory.db-shm` junto a un store parado. Después de un apagado que el tope cortó no se cierra: una llamada puede tener todavía la conexión y el cierre esperaría detrás de ella, fuera de todo tope. Un cierre que falla MUST registrarse y nada más; SQLite reproduce lo que quede al abrir.
+Después de un apagado que terminó dentro de su tope (`shutdown` devuelve `true`), `clawg serve` MUST cerrar la conexión del store y esperar el cierre (`MemoryRuntime::close`, `crates/clawg-core/src/runtime.rs:363`; en `crates/clawg-cli/src/daemon/serve.rs:327`), así SQLite quita `memory.db-wal` y `memory.db-shm` antes de que termine el proceso. Sin cerrarla, el cierre corre en el hilo propio de la conexión cuando cae su último handle, y la salida del proceso puede cortarlo después de quitar el índice del WAL y antes de quitar el WAL: queda un `memory.db-wal` vacío, y `clawg doctor`, que con un WAL presente abre sin `immutable`, crea un `memory.db-shm` junto a un store parado. Después de un apagado que el tope cortó no se cierra: una llamada puede tener todavía la conexión y el cierre esperaría detrás de ella, fuera de todo tope. Un cierre que falla MUST registrarse y nada más; SQLite reproduce lo que quede al abrir.
 
 #### Escenario
 - GIVEN un runtime con un save recién guardado
@@ -1312,3 +1313,123 @@ Un binario anterior a V32 MUST NOT abrir una base en V32: la rechaza sin tocarla
 Ningún archivo de `crates/*/src` MUST nombrar `episodic_trajectory`, `procedural_skill`, `episodic_vectors` ni `procedural_vectors` fuera de sus tests, salvo `portability/export.rs`, que cuenta las filas viejas de una base que todavía no migró ([`specs/portability`](../portability/spec.md), RL9). Mantenimiento, el registro, la unión, el borrado, la purga y la deshechura de proyectos e importaciones, `inspect` y el espacio de trabajo MUST leer y escribir sólo `memory`. `TableKind` y `MemoryKind` MUST NOT existir. La búsqueda, con un solo KNN, está en [`specs/retrieval`](../retrieval/spec.md), RL4.
 
 **Test:** `no_production_code_names_the_retired_tables` (`crates/clawg-cli/tests/conventions.rs`).
+
+## El límite del almacenamiento
+
+La conexión de SQLite, sus errores y la superficie de `memory` son del núcleo (`clawg-core`). Los otros crates piden lo que necesitan por funciones del núcleo.
+
+Términos:
+
+- **Otro crate:** `clawg-cli`, `clawg-eval` o un test de integración de `crates/*/tests/`.
+- **Código de producción** de un archivo de `src/`: sus líneas antes del primer `#[cfg(test)]` seguido de una línea `mod <nombre> {`. Un `#[cfg(test)]` seguido de `mod <nombre>;`, que declara un módulo en otro archivo, no corta el código de producción.
+- **Una falla de almacenamiento:** un error de SQLite, de la conexión de `tokio-rusqlite` o de una migración de refinery.
+
+### SB1. El código de los otros crates no llega a la conexión
+
+El código de producción de `crates/clawg-cli/src` y de `crates/clawg-eval/src` MUST NOT contener `rusqlite` ni `.conn` seguido de un carácter que no pueda seguir en un identificador. Así, `.connect_timeout` y `.conn_for_test()` no cuentan.
+
+#### Escenario: un módulo de tests en otro archivo
+- GIVEN un fuente con `#[cfg(test)]` y `mod helpers;` en sus primeras líneas, y una línea que nombra `rusqlite` más abajo, fuera de todo módulo de tests
+- WHEN se separa su código de producción
+- THEN esa línea es de producción, con fin de línea LF y con CRLF
+
+**Tests:** `no_production_code_outside_core_reaches_the_connection` y `a_test_module_in_another_file_does_not_end_the_production_code` (`crates/clawg-cli/tests/conventions.rs`); `reaches_the_connection_tells_the_field_from_longer_names`, en el mismo archivo, comprueba qué cuenta como acceso.
+
+### SB2. La conexión es del núcleo
+
+`MemoryStore::conn` (`crates/clawg-core/src/memory/store/db.rs:156`) MUST ser `pub(crate)`. Desde otro crate, la conexión MUST alcanzarse sólo con `MemoryStore::conn_for_test()` (`db.rs:280`), compilado sólo con `cfg(any(test, feature = "testing"))`. Sólo un `[dev-dependencies]` enciende `testing`, y `only_dev_dependencies_turn_on_the_test_stand_ins` lo comprueba.
+
+#### Escenario
+- GIVEN un crate que usa `clawg_core` sin `testing`
+- WHEN lee `store.conn`, y en otra función llama a `store.probe_wait()`
+- THEN la primera no compila (E0616, campo privado) y la segunda sí
+
+**Tests:** los dos doctests de `MemoryStore` (`crates/clawg-core/src/memory/store/db.rs`), uno normal y uno `compile_fail,E0616`; `only_dev_dependencies_turn_on_the_test_stand_ins` (`crates/clawg-cli/tests/conventions.rs`). Un `rustdoc` estable no comprueba el código `E0616`; sólo lo hace uno nightly.
+
+### SB4. Cerrar dice si cerró
+
+`MemoryRuntime::close` (`crates/clawg-core/src/runtime.rs:363`) MUST devolver `Result<(), StorageError>`: `Ok` cuando la conexión cerró o ya estaba cerrada, y la falla de SQLite al cerrar cuando no.
+
+- `clawg serve` MUST registrar esa falla con una línea `warn` que dice que SQLite reproduce lo que quede al abrir, y seguir saliendo (`crates/clawg-cli/src/daemon/serve.rs:327`).
+- `rag-eval` (`release`) y `revision-eval` MUST cerrar con `close` y terminar con `RunError::Close` cuando falla, con la falla como texto.
+- `conflict-eval` MUST devolver esa falla como su error.
+- Un camino que ya devuelve otro error MUST seguir devolviendo ese error.
+
+#### Escenario
+- GIVEN un runtime abierto en un directorio temporal
+- WHEN se cierra dos veces
+- THEN las dos veces es `Ok`, y una llamada al store después es `Err(MemoryError::Storage(_))`
+
+**Tests:** `a_runtime_closes_and_says_so` (`crates/clawg-core/tests/public_api.rs`); `closing_after_the_shutdown_leaves_no_wal_beside_the_store` (`crates/clawg-core/tests/shutdown.rs`).
+
+### SB5. Una sola variante de almacenamiento
+
+Una falla de almacenamiento que llega a otro crate dentro de un `MemoryError` MUST ser `MemoryError::Storage(StorageError)` (`crates/clawg-core/src/memory/store/error.rs`). Una función que sólo puede fallar por el almacenamiento (`close`, `own_folder_count`) MAY devolver el `StorageError` solo.
+
+- `MemoryError` MUST NOT tener una variante con un tipo de `rusqlite`, `tokio_rusqlite` o `refinery`, ni directo ni dentro de un tipo que envuelva. Sus variantes son `Storage`, `Internal`, `WorkspaceIo`, `StoreInUse`, `SchemaNewer`, `SchemaDiverged`, `Backup`, `Purge`, `DataDir` y `StoreLockIo`.
+- `StorageError` MUST ser opaco: sin campos públicos y sin métodos públicos más allá de `Display`, `Debug` y `std::error::Error`, y se convierte desde los errores de `rusqlite`, de `tokio_rusqlite` y de `refinery`.
+- Los otros errores de `memory` que otro crate alcanza y llevan una falla de almacenamiento MUST llevar un `StorageError`:
+  - la causa (`source`) de `BackupError::Snapshot`;
+  - `DocIndexError::Store`;
+  - `ExportError::Storage`.
+
+#### Escenario
+- GIVEN un store cerrado
+- WHEN otro crate le hace una llamada
+- THEN recibe `MemoryError::Storage(_)`, y un `match` sin comodín sobre `MemoryError` nombra sólo las variantes de arriba
+
+**Tests:** `a_call_on_a_closed_store_fails_with_a_storage_error` y `memory_error_tells_apart_what_another_crate_handles` (`crates/clawg-core/tests/public_api.rs`).
+
+### SB6. Cada falla se muestra con su texto
+
+Cada falla de almacenamiento MUST mostrarse con este texto, que llega tal cual a las respuestas del daemon y a la línea de comandos:
+
+| Falla | Texto |
+|---|---|
+| Un error de SQLite como `MemoryError` | `SQLite error: <causa>` |
+| Una falla de la conexión de `tokio-rusqlite` como `MemoryError` (por ejemplo, `probe_wait`) | `Memory DB connection error: <causa>` |
+| Una conexión cerrada en `get_memory_core` | `memory backend channel error: connection closed during get_memory_core` |
+| Una conexión cerrada en `count_saves_in` | `memory backend channel error: language count: ConnectionClosed` |
+| Una conexión cerrada en `rename_project` | `memory backend channel error: ConnectionClosed` |
+| Una migración fallida | `Migration failed: <causa>`, o `SQLite error: connection closed during migration` con la conexión cerrada |
+| `BackupError::Snapshot` | `could not write the snapshot <ruta>: <causa>` |
+| `DocIndexError::Store` | `documentation index store error: <causa>` |
+| `ExportError::Storage` | `sqlite error: <causa>` |
+
+La causa MUST ser la que da `rusqlite`, `tokio-rusqlite` o refinery, sin un encabezado más: el `StorageError` la muestra sola y cada envoltorio pone el suyo. Las tres redacciones de una conexión cerrada son las de `ClosedAs` (`During`, `Named` y `AsIs`), y cada llamada conserva la suya.
+
+**Tests:**
+- `each_storage_failure_keeps_its_text` (`crates/clawg-core/src/memory/store/error.rs`), sobre un store cerrado.
+- `a_failed_migration_keeps_its_text` (`crates/clawg-core/src/memory/store/db.rs`): una migración rota y `run_migrations` sobre una conexión cerrada.
+- `a_snapshot_in_a_transaction_says_why_it_failed` (`crates/clawg-core/src/memory/store/backup.rs`).
+- `a_store_error_of_the_docs_index_keeps_its_text` (`crates/clawg-core/src/memory/project_docs/mod.rs`).
+- `a_sqlite_error_of_an_export_keeps_its_text` (`crates/clawg-core/src/memory/portability/export.rs`).
+
+### SB7. Una sola traducción
+
+Un `call` fallido sobre la conexión MUST traducirse con las conversiones de `crates/clawg-core/src/memory/store/error.rs`: los `From` de los errores de los tres crates y `failed_call` (`error.rs:65`). Una migración fallida se traduce con `failed_migration` (`error.rs:82`). Ningún archivo de `crates/clawg-core/src` MUST nombrar una variante de `tokio_rusqlite::Error` (`tokio_rusqlite::Error::`) en su código de producción, salvo `memory/store/error.rs`.
+
+**Test:** `no_memory_code_translates_a_connection_error_by_hand` (`crates/clawg-cli/tests/conventions.rs`).
+
+### SB9. La superficie de `memory` es la que usan los otros crates
+
+- Cada `pub mod` de `crates/clawg-core/src/memory/upkeep/mod.rs` MUST estar nombrado por otro crate, en una ruta `clawg_core::memory::<módulo>` o en un grupo `clawg_core::memory::{…}`. Los demás MUST ser `pub(crate)`.
+- Dentro de un módulo `pub`, un ítem MUST ser `pub` sólo si otro crate lo usa, o si está en la firma de algo que otro crate usa; las dos gemelas de plataforma que tienen una definición por sistema (`keep_one_malloc_arena`, `sync_dir`) siguen `pub` en ambas.
+- Un ítem que sólo usan los tests de otro crate MUST compilarse sólo con `cfg(any(test, feature = "testing"))`.
+- Un ítem que sólo usa `eval_api` MUST compilarse sólo con `cfg(feature = "eval")`, o con `cfg(any(test, feature = "eval"))` si también lo usan los tests del núcleo; `query_context` es uno de ellos, entero.
+- Un ítem que sólo usan los tests del núcleo MUST compilarse sólo con `cfg(test)`.
+- Ningún ítem MUST quedar sin uso: el compilador lo marca porque nada lo oculta tras un `pub`.
+
+Los dos clippy de `[workspace.lints.clippy]` MUST pasar con `-D warnings`:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+```bash
+cargo clippy -p clawg-cli -- -D warnings
+```
+
+El segundo es lo que construye el release, sin `testing` ni `eval`.
+
+**Tests:** `every_public_memory_module_is_named_outside_core` y `no_source_allows_dead_code` (`crates/clawg-cli/tests/conventions.rs`). Además, los dos clippy.
