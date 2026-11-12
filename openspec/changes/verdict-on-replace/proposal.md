@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 | S | — ; se coordina con [topic-key-warning](../topic-key-warning/proposal.md) (68) y [memory-delivery](../memory-delivery/proposal.md) (127) | propuesta (borrador: toma las opciones recomendadas de las decisiones abiertas de la exploración) |
+| 1 | S | — ; se coordina con [topic-key-warning](../topic-key-warning/proposal.md) (68) y [memory-delivery](../memory-delivery/proposal.md) (127) | propuesta; las cuatro decisiones abiertas de la exploración se cerraron con su opción recomendada |
 
 ## Problema
 

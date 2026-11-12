@@ -1,13 +1,13 @@
 change: verdict-on-replace
 objective: "1"
 depends_on: []
-phase: propose
+phase: tasks
 artifacts:
   exploration: done
-  proposal: draft  # toma las opciones recomendadas de las decisiones abiertas de la exploración
-  spec: pending
-  design: pending
-  tasks: pending
+  proposal: done
+  spec: done
+  design: skipped  # ninguna decisión de arquitectura: son textos del puente
+  tasks: done
   apply: pending
   verify: pending
   archive: pending
