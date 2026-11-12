@@ -7,7 +7,11 @@
 use std::sync::Arc;
 
 use super::Chunk;
-use crate::memory::pieces::MIN_OVERLAP_CHARS;
+
+/// Shortest repeated text treated as the overlap between two neighbours;
+/// anything shorter is as likely a coincidence as a repeat. The chunker
+/// keeps at least this much between the pieces it cuts.
+pub(crate) const MIN_OVERLAP_CHARS: usize = 16;
 
 /// Pure "split this text by token cap with overlap" helper.
 #[derive(Clone)]

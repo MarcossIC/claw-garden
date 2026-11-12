@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::admin::get_memory_core;
+use crate::memory::chunker::token_splitter::MIN_OVERLAP_CHARS;
 use crate::memory::error::MemoryError;
 use crate::memory::search::PiecePosition;
 use crate::memory::sharing::Reader;
@@ -54,10 +55,6 @@ pub struct SaveText {
     pub memory_type: String,
 }
 
-/// Shortest repeated text treated as the overlap between two neighbours;
-/// anything shorter is as likely a coincidence as a repeat. The chunker
-/// keeps at least this much between the pieces it cuts.
-pub(crate) const MIN_OVERLAP_CHARS: usize = 16;
 /// Farthest back an overlap is looked for. The chunker repeats at least 24
 /// tokens between the pieces of a save (64 between chunks), stretched back to
 /// where a word starts: well under this at any realistic token length.
