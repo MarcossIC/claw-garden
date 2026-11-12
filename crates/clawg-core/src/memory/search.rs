@@ -606,7 +606,7 @@ async fn knn_one(
 /// switched off contributes 0 on both sides — it asked for nothing and got
 /// nothing, which is not a survival rate of zero.
 fn format_pool_line(scope: &SearchScope, mem: &KnnOutcome) -> String {
-    crate::memory::admin::format_pool_survival(scope.memory.unwrap_or(0), mem.hits.len(), mem.retried())
+    crate::memory::search_log::format_pool_survival(scope.memory.unwrap_or(0), mem.hits.len(), mem.retried())
 }
 
 // ── lexical (FTS5) candidate channel ──
@@ -1274,7 +1274,7 @@ async fn search_all_memories_inner(
     // than being reassembled at the log call.
     let pool_survival = format_pool_line(&scope, &mem);
     let channel_attribution =
-        crate::memory::admin::format_channel_attribution(mem.hits.len(), lexical_only);
+        crate::memory::search_log::format_channel_attribution(mem.hits.len(), lexical_only);
     let telemetry = format!("{pool_survival} {channel_attribution}");
     let memory_pool = MemoryPool::of(scope.memory, &mem);
 
@@ -1322,7 +1322,7 @@ async fn search_all_memories_inner(
         all.len(),
         telemetry,
         k_final,
-        crate::memory::admin::format_tier_distribution(&all),
+        crate::memory::search_log::format_tier_distribution(&all),
         store.knn_latency().snapshot(),
     );
 
@@ -4140,7 +4140,7 @@ mod tests {
         .await
         .unwrap();
 
-        let expected = crate::memory::admin::format_channel_attribution(20, 1);
+        let expected = crate::memory::search_log::format_channel_attribution(20, 1);
         assert!(
             telemetry.contains(&expected),
             "the wired telemetry line must contain exactly what the formatter renders for (dense=20, lex_only=1): {telemetry}"

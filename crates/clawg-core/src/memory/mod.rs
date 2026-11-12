@@ -81,6 +81,7 @@ pub(crate) mod score;
 pub(crate) mod tier;
 pub(crate) mod dedup;
 pub(crate) mod search;
+pub(crate) mod search_log;
 pub mod workspace;
 pub mod prompt_builder;
 pub(crate) mod contradiction;

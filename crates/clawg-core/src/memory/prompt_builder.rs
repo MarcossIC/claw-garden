@@ -274,7 +274,7 @@ pub async fn build_memory_prompt(
     // search.rs's `log::debug!`) — this is the criterion's capturable signal.
     log::info!(
         "{}",
-        crate::memory::admin::format_tier1_coverage(
+        crate::memory::search_log::format_tier1_coverage(
             !workspace_content.render().is_empty(),
             hits.len()
         )
