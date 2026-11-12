@@ -1,14 +1,14 @@
 change: docs-index-status
 objective: 3
 depends_on: []
-phase: tasks
+phase: verify
 artifacts:
   exploration: done
   proposal: done
   spec: done
   design: done
   tasks: done
-  apply: pending
-  verify: pending
+  apply: done
+  verify: in-progress  # suite y clippy en verde en Linux; falta el CI y mirar clawg status con un refresco real de un repositorio grande
   archive: pending
 updated: 2026-11-12
