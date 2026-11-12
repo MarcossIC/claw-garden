@@ -1,14 +1,18 @@
 change: memory-module-layout
 objective: "transversal"
-depends_on: [store-boundary]
-phase: explore
+depends_on: [store-boundary]  # ya está en develop
+phase: tasks
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done  # anterior a store-boundary; la propuesta vuelve a comprobar sus rutas y sus números
+  proposal: done  # el enfoque A; dice qué resolvió store-boundary y sale del alcance
+  spec: done  # R1 a R7
+  design: done  # D1 a D10; las tres decisiones abiertas en D2, D3 y D4
+  tasks: done  # partes 1 a 9; archivar y subir la versión quedan fuera
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-01
+decisions:
+  dispute_topic_contradiction: revision  # carpeta propia, con revival (D2)
+  project_docs: own_domain_in_place  # fila propia de la tabla; no se mueve ni se edita (D3)
+  memory_level: kept  # las carpetas van bajo memory::, y las rutas públicas no cambian (D4)
+updated: 2026-11-12
