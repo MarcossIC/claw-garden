@@ -23,10 +23,8 @@
 //! [`MemoryRecord::disputed_against_ids`] parses it into `Vec<i64>`, returning
 //! `None` for NULL or malformed JSON rather than panicking.
 
-pub mod bootstrap;
 pub mod portability;
 pub mod project_docs;
-pub mod secrets;
 
 pub use contradiction::Candidate;
 pub use db::MemoryStore;
@@ -46,9 +44,6 @@ pub use search::{search_all_memories, PiecePosition, RankedHit, SearchScope};
 /// search would count its pool under test and not in a release.
 pub use search::MemoryPool;
 
-pub(crate) mod maintenance;
-pub mod admin;
-pub mod synthesis;
 
 mod domain;
 pub use domain::clock;
@@ -109,3 +104,10 @@ pub use ingest::outbox;
 pub use ingest::spill;
 pub use ingest::store_insert;
 pub use ingest::worker;
+
+mod upkeep;
+pub use upkeep::admin;
+pub use upkeep::bootstrap;
+pub(crate) use upkeep::maintenance;
+pub use upkeep::secrets;
+pub use upkeep::synthesis;
