@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use crate::memory::backup::civil_from_days;
 use crate::memory::portability::export::Export;
 use crate::memory::portability::format::{MemoryLine, ProjectLine};
-use crate::memory::store_insert::MemoryType;
+use crate::memory::record::MemoryType;
 
 /// The rows of `export` by project, then by type, then by id.
 pub fn render(export: &Export) -> String {

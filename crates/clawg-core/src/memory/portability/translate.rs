@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::memory::chunker::ChatChunker;
 use crate::memory::dedup::content_hash;
 use crate::memory::redact::redact;
-use crate::memory::store_insert::MemoryType;
+use crate::memory::record::MemoryType;
 use crate::memory::tier::compute_tier;
 use crate::memory::topic::{validate_topic_key, MAX_TOPIC_KEY_LEN};
 

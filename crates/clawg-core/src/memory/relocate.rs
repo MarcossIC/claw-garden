@@ -23,7 +23,7 @@ use crate::memory::clock::TimestampMs;
 use crate::memory::merge::canonical_in;
 use crate::memory::project_delete::{deleted_in, deleted_message};
 use crate::memory::search::{reader_predicate, viewer_match_expression};
-use crate::memory::store_insert::MemoryType;
+use crate::memory::record::MemoryType;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// Why a unit stays where it is. Nothing of it is written.

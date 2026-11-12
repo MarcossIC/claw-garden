@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::memory::store_insert::MemoryType;
+use crate::memory::record::MemoryType;
 use crate::memory::topic::validate_topic_key;
 
 /// The `format` every header names.

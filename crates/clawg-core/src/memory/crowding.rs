@@ -21,7 +21,7 @@ use crate::memory::contradiction::{detect_contradiction, CONTRADICTION_THRESHOLD
 use crate::memory::score::ScoringConfig;
 use crate::memory::search::{memory_project_predicate, project_bind, reach_predicate, reader_bind, search_all_memories, SearchScope};
 use crate::memory::sharing::{Reach, Reader};
-use crate::memory::store_insert::MemoryType;
+use crate::memory::record::MemoryType;
 use crate::memory::store_lock::StoreHolder;
 use crate::memory::vector::{to_unit, EMBEDDING_DIM};
 use crate::memory::MemoryStore;

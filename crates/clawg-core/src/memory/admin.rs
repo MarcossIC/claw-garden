@@ -16,7 +16,7 @@ use crate::memory::revival::{revive_after_delete, revive_after_delete_of_piece};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
 use crate::memory::search::{reach_predicate, reader_bind, reader_predicate, viewer_match_expression, RankedHit};
 use crate::memory::sharing::{Reach, Reader};
-use crate::memory::store_insert::{MemoryType, UnknownMemoryType};
+use crate::memory::record::{MemoryType, UnknownMemoryType};
 use crate::memory::tier::retier;
 use crate::memory::topic::Replaced;
 use crate::memory::{MemoryError, MemoryStore};

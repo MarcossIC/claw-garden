@@ -7,7 +7,7 @@
 //! a mark may be the user's.
 
 use crate::memory::events::MemorySource;
-use crate::memory::store_insert::CreatedByType;
+use crate::memory::record::CreatedByType;
 use crate::models::chat::Role;
 
 /// The `source` and `created_by_type` a row of this event is stored with.

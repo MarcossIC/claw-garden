@@ -22,7 +22,7 @@ use crate::memory::provenance::mark;
 use crate::memory::redact::redact;
 use crate::memory::search::{memory_project_predicate, project_bind, reader_bind, reader_predicate};
 use crate::memory::sharing::Reader;
-use crate::memory::store_insert::MemoryType;
+use crate::memory::record::MemoryType;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// How a dispute between two rows is closed.

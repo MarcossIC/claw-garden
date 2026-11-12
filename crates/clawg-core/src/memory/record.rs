@@ -90,6 +90,116 @@ impl MemoryRecord for MemoryRow {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryType {
+    ChatMessage,
+    ToolError,
+    CodeBlock,
+    SessionSummary,
+    UserPreference,
+    ArchitecturalDecision,
+    SemanticFact,
+}
+
+impl MemoryType {
+    /// Every type, in the order an error message lists them.
+    pub const ALL: [MemoryType; 7] = [
+        Self::SemanticFact,
+        Self::UserPreference,
+        Self::ArchitecturalDecision,
+        Self::SessionSummary,
+        Self::CodeBlock,
+        Self::ChatMessage,
+        Self::ToolError,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatMessage => "chat_message",
+            Self::ToolError => "tool_error",
+            Self::CodeBlock => "code_block",
+            Self::SessionSummary => "session_summary",
+            Self::UserPreference => "user_preference",
+            Self::ArchitecturalDecision => "architectural_decision",
+            Self::SemanticFact => "semantic_fact",
+        }
+    }
+
+    /// Only a type that asserts something can be contradicted. An explicit
+    /// `match` rather than `matches!`: adding an 8th variant is then a
+    /// compile error here, not a silent `false`.
+    pub(crate) fn is_claim_bearing(self) -> bool {
+        match self {
+            Self::UserPreference | Self::ArchitecturalDecision | Self::SemanticFact => true,
+            Self::ChatMessage | Self::ToolError | Self::CodeBlock | Self::SessionSummary => false,
+        }
+    }
+
+    /// A preference or a decision is replaced by a verdict, or loses its type,
+    /// only once the caller declares the user answered.
+    pub(crate) fn is_protected(self) -> bool {
+        match self {
+            Self::UserPreference | Self::ArchitecturalDecision => true,
+            Self::SemanticFact | Self::ChatMessage | Self::ToolError | Self::CodeBlock | Self::SessionSummary => false,
+        }
+    }
+
+    /// A stored type the parser does not know is not protected.
+    pub(crate) fn is_protected_name(s: &str) -> bool {
+        Self::from_db_str(s).is_some_and(Self::is_protected)
+    }
+
+    /// Parses the raw DB string. Unknown or legacy values return `None` —
+    /// treated as not eligible for the contradiction type gate rather than
+    /// panicking on a value written by a future or foreign schema version.
+    pub(crate) fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "chat_message" => Some(Self::ChatMessage),
+            "tool_error" => Some(Self::ToolError),
+            "code_block" => Some(Self::CodeBlock),
+            "session_summary" => Some(Self::SessionSummary),
+            "user_preference" => Some(Self::UserPreference),
+            "architectural_decision" => Some(Self::ArchitecturalDecision),
+            "semantic_fact" => Some(Self::SemanticFact),
+            _ => None,
+        }
+    }
+}
+
+/// A `memory_type` a caller named that is not one of [`MemoryType::ALL`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown memory_type {:?}; expected one of {}", .0, MemoryType::ALL.map(MemoryType::as_str).join(", "))]
+pub struct UnknownMemoryType(pub String);
+
+/// What a caller names: unlike [`MemoryType::from_db_str`], which reads values
+/// already stored, an unknown name here is a mistake to report.
+impl std::str::FromStr for MemoryType {
+    type Err = UnknownMemoryType;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_db_str(s).ok_or_else(|| UnknownMemoryType(s.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CreatedByType {
+    Agent,
+    User,
+    System,
+}
+
+impl CreatedByType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::User => "user",
+            Self::System => "system",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +295,117 @@ mod tests {
         let mut row = make_memory_row();
         row.disputed_against = Some("[]".to_string());
         assert_eq!(row.disputed_against_ids(), Some(vec![]));
+    }
+
+    #[test]
+    fn memory_type_session_summary_as_str() {
+        assert_eq!(MemoryType::SessionSummary.as_str(), "session_summary");
+    }
+
+    // ── New pivotal variants ──
+
+    #[test]
+    fn as_str_new_variants() {
+        assert_eq!(MemoryType::UserPreference.as_str(), "user_preference");
+        assert_eq!(MemoryType::ArchitecturalDecision.as_str(), "architectural_decision");
+        assert_eq!(MemoryType::SemanticFact.as_str(), "semantic_fact");
+    }
+
+    // ── is_claim_bearing — truth table over all 7 variants ─────────────────
+
+    #[test]
+    fn is_claim_bearing_true_for_user_preference() {
+        assert!(MemoryType::UserPreference.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_true_for_architectural_decision() {
+        assert!(MemoryType::ArchitecturalDecision.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_true_for_semantic_fact() {
+        assert!(MemoryType::SemanticFact.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_false_for_chat_message() {
+        assert!(!MemoryType::ChatMessage.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_false_for_tool_error() {
+        assert!(!MemoryType::ToolError.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_false_for_code_block() {
+        assert!(!MemoryType::CodeBlock.is_claim_bearing());
+    }
+
+    #[test]
+    fn is_claim_bearing_false_for_session_summary() {
+        assert!(!MemoryType::SessionSummary.is_claim_bearing());
+    }
+
+    // ── from_db_str — round-trips as_str(), unknown → None ─────────────────
+
+    #[test]
+    fn from_db_str_round_trips_every_variant() {
+        let variants = [
+            MemoryType::ChatMessage,
+            MemoryType::ToolError,
+            MemoryType::CodeBlock,
+            MemoryType::SessionSummary,
+            MemoryType::UserPreference,
+            MemoryType::ArchitecturalDecision,
+            MemoryType::SemanticFact,
+        ];
+        for v in variants {
+            assert_eq!(MemoryType::from_db_str(v.as_str()), Some(v), "round-trip failed for {v:?}");
+        }
+    }
+
+    #[test]
+    fn every_listed_type_parses_back_to_itself() {
+        // Exhaustive on purpose: an eighth variant fails to compile here until
+        // it is placed in `ALL` too.
+        let listed = |t: MemoryType| match t {
+            MemoryType::ChatMessage
+            | MemoryType::ToolError
+            | MemoryType::CodeBlock
+            | MemoryType::SessionSummary
+            | MemoryType::UserPreference
+            | MemoryType::ArchitecturalDecision
+            | MemoryType::SemanticFact => MemoryType::ALL.contains(&t),
+        };
+        for t in MemoryType::ALL {
+            assert!(listed(t));
+            assert_eq!(t.as_str().parse::<MemoryType>(), Ok(t));
+            assert_eq!(MemoryType::from_db_str(t.as_str()), Some(t));
+        }
+        let distinct: std::collections::BTreeSet<&str> = MemoryType::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(distinct.len(), 7);
+    }
+
+    #[test]
+    fn an_unknown_type_names_the_accepted_ones() {
+        let err = "preference".parse::<MemoryType>().unwrap_err();
+        assert_eq!(err, UnknownMemoryType("preference".into()));
+        assert_eq!(
+            err.to_string(),
+            "unknown memory_type \"preference\"; expected one of semantic_fact, user_preference, \
+             architectural_decision, session_summary, code_block, chat_message, tool_error"
+        );
+        for raw in ["", "Semantic_Fact", "episode"] {
+            assert!(raw.parse::<MemoryType>().is_err(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn from_db_str_unknown_value_returns_none() {
+        assert_eq!(MemoryType::from_db_str("episode"), None);
+        assert_eq!(MemoryType::from_db_str("not_a_real_type"), None);
+        assert_eq!(MemoryType::from_db_str(""), None);
     }
 }

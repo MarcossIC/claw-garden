@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use crate::memory::search::{identifier_tokens, search_all_memories, SearchScope};
 use crate::memory::sharing::Reader;
-use crate::memory::store_insert::MemoryType;
+use crate::memory::record::MemoryType;
 use crate::memory::MemoryStore;
 
 #[cfg(test)]
