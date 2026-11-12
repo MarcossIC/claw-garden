@@ -280,58 +280,15 @@ pub fn format_resolution(lang: Lang, r: &Resolution) -> String {
     }
 }
 
-/// One side of a pair: its id, then what is shown of its origin.
-fn side((id, mark): (i64, Option<&str>)) -> String {
-    match mark {
-        Some(mark) => format!("#{id} {mark}"),
-        None => format!("#{id}"),
-    }
-}
-
-/// What `memory_status` says about the pairs the agent has not judged.
+/// What `memory_status` says about the pairs: only those waiting for the user,
+/// since the agent judges a pair when a save names it, not from a list.
 pub fn format_open_pairs(lang: Lang, open: &OpenPairs) -> String {
-    if open.pending == 0 && open.escalated == 0 {
-        return match lang {
-            Lang::En => "conflict candidates: none open",
-            Lang::Es => "candidatos a conflicto: ninguno abierto",
-        }
-        .to_string();
+    match (open.escalated, lang) {
+        (0, Lang::En) => "conflict candidates: none open".to_string(),
+        (0, Lang::Es) => "candidatos a conflicto: ninguno abierto".to_string(),
+        (n, Lang::En) => format!("conflict candidates: {n} waiting for the user in ACTIVE CONFLICTS"),
+        (n, Lang::Es) => format!("candidatos a conflicto: {n} esperando a la persona en ACTIVE CONFLICTS"),
     }
-    let mut out = match lang {
-        Lang::En => format!(
-            "conflict candidates: {} for you to judge, {} waiting for the user in ACTIVE CONFLICTS",
-            open.pending, open.escalated
-        ),
-        Lang::Es => format!(
-            "candidatos a conflicto: {} para que juzgues, {} esperando a la persona en ACTIVE CONFLICTS",
-            open.pending, open.escalated
-        ),
-    };
-    let close = match lang {
-        Lang::En => "close to",
-        Lang::Es => "cerca de",
-    };
-    for p in &open.pairs {
-        let new = (p.new_id, p.new_mark.as_deref());
-        let old = (p.old_id, p.old_mark.as_deref());
-        // A side that may be the user's goes first: an inference is the one
-        // more likely to give way, though the agent still judges the pair.
-        let (first, second) = if new.1.is_some() && old.1.is_none() { (old, new) } else { (new, old) };
-        out.push_str(&format!("\n  {} {close} {}", side(first), side(second)));
-    }
-    if open.pending > 0 {
-        out.push_str(match lang {
-            Lang::En => {
-                "\nread_memory both sides, then resolve_conflict: supersedes, compatible, scoped (with a \
-                 reason) or conflicts to put the pair to the user"
-            }
-            Lang::Es => {
-                "\nread_memory de los dos lados, después resolve_conflict: supersedes, compatible, scoped (con un \
-                 reason) o conflicts para plantearle el par a la persona"
-            }
-        });
-    }
-    out
 }
 
 /// What `read_memory` tells the model: which piece it asked for and every
@@ -2432,42 +2389,21 @@ mod tests {
     }
 
     #[test]
-    fn the_unmarked_side_of_a_pair_goes_first() {
-        let open = OpenPairs {
-            pending: 3,
-            escalated: 0,
-            pairs: vec![
-                open_pair(9, 4, Some("inferred"), None),
-                open_pair(12, 4, None, Some("inferred")),
-                open_pair(15, 13, Some("conclusion"), Some("inferred")),
-            ],
-        };
-
-        let out = format_open_pairs(Lang::En, &open);
-
-        assert!(out.contains("\n  #4 close to #9 inferred\n"), "{out}");
-        assert!(out.contains("\n  #12 close to #4 inferred\n"), "{out}");
-        assert!(out.contains("\n  #15 conclusion close to #13 inferred\n"), "{out}");
+    fn pending_pairs_are_not_put_to_the_agent() {
+        let open = OpenPairs { pending: 3, escalated: 0, pairs: vec![open_pair(9, 4, None, None), open_pair(12, 4, None, None)] };
+        assert_eq!(format_open_pairs(Lang::En, &open), "conflict candidates: none open");
+        assert_eq!(format_open_pairs(Lang::Es, &open), "candidatos a conflicto: ninguno abierto");
     }
 
     #[test]
     fn format_status_ends_with_the_open_pairs() {
-        let open = OpenPairs {
-            pending: 2,
-            escalated: 1,
-            pairs: vec![
-                open_pair(9, 4, None, None),
-                open_pair(12, 4, None, None),
-            ],
-        };
+        let open = OpenPairs { pending: 2, escalated: 1, pairs: vec![open_pair(9, 4, None, None), open_pair(12, 4, None, None)] };
         let out = format_status(Lang::En, &health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(Lang::En, &open)), None);
-        assert!(
-            out.ends_with(
-                "\nconflict candidates: 2 for you to judge, 1 waiting for the user in ACTIVE CONFLICTS\n  #9 close to #4\n  \
-                 #12 close to #4\nread_memory both sides, then resolve_conflict: supersedes, compatible, scoped (with a \
-                 reason) or conflicts to put the pair to the user"
-            ),
-            "out was: {out}"
+        assert!(out.ends_with("
+conflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "out was: {out}");
+        assert_eq!(
+            format_open_pairs(Lang::Es, &open),
+            "candidatos a conflicto: 1 esperando a la persona en ACTIVE CONFLICTS"
         );
         assert_eq!(format_open_pairs(Lang::En, &OpenPairs::default()), "conflict candidates: none open");
     }

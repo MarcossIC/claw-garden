@@ -4050,37 +4050,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_status_counts_pending_candidates() {
+    async fn memory_status_counts_only_the_pairs_that_wait_for_the_user() {
         let mut store = None;
         let (b, _d) = bridge_with(|runtime| {
             store = Some(runtime.store.clone());
             runtime
         })
         .await;
+        let store = store.expect("the runtime's store");
         let old = saved_id(&b, "agent-mcp", "the cache expires after one hour").await;
         let new = saved_id(&b, "agent-mcp", "the cache expires after one day").await;
-        let status = |agent: &'static str| {
+        let newest = saved_id(&b, "agent-mcp", "the cache expires after one week").await;
+        let status = || {
             let b = b.clone();
-            async move { text(&b.memory_status_impl((agent.to_string(), AgentSource::Flag)).await.expect("status")) }
+            async move { text(&b.memory_status_impl(("agent-mcp".to_string(), AgentSource::Flag)).await.expect("status")) }
         };
-        assert!(status("agent-mcp").await.ends_with("\nconflict candidates: none open"));
-        store
-            .expect("the runtime's store")
-            .conn
-            .call(move |c| {
-                c.execute(
-                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
-                    [new, old],
-                )
-            })
-            .await
-            .expect("note the pair");
+        let note = |new: i64, old: i64, state: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .conn
+                    .call(move |c| {
+                        c.execute(
+                            "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, ?3, 1)",
+                            rusqlite::params![new, old, state],
+                        )
+                    })
+                    .await
+                    .expect("note the pair");
+            }
+        };
+        assert!(status().await.ends_with("
+conflict candidates: none open"));
 
-        let t = status("agent-mcp").await;
-        assert!(t.contains("conflict candidates: 1 for you to judge, 0 waiting for the user"), "{t}");
-        assert!(t.contains(&format!("#{new} inferred close to #{old} inferred")), "two undeclared saves: {t}");
-        let other = status("agent-other").await;
-        assert!(other.contains("conflict candidates: 1 for you to judge"), "another agent judges it too: {other}");
+        note(new, old, "pending").await;
+        note(newest, old, "pending").await;
+        let t = status().await;
+        assert!(t.ends_with("
+conflict candidates: none open"), "{t}");
+        assert!(!t.contains("resolve_conflict") && !t.contains("close to"), "pending pairs are not put to the agent: {t}");
+
+        note(newest, new, "escalated").await;
+        let t = status().await;
+        assert!(t.ends_with("
+conflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{t}");
+        assert!(!t.contains("resolve_conflict") && !t.contains("close to"), "{t}");
     }
 
     #[tokio::test]
@@ -5796,7 +5810,7 @@ mod tests {
             .conn
             .call(move |conn| {
                 conn.execute(
-                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'escalated', 1)",
                     [new, old],
                 )
             })
@@ -5811,7 +5825,8 @@ mod tests {
         let several = status(folders(&[&alpha, &beta])).await;
 
         assert!(one.ends_with("\nconflict candidates: none open"), "the pair is of another project: {one}");
-        assert!(several.contains("conflict candidates: 1 for you to judge"), "{several}");
+        assert!(several.ends_with("
+conflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{several}");
     }
 
     #[tokio::test]
