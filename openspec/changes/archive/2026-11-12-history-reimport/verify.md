@@ -237,7 +237,7 @@ Sobre todo el store, no sólo sobre lo importado como en la tabla del ensayo:
 - No se contó cuántas notas quedaron sin ninguna fila activa, las 27 del ensayo.
 - Los accesos y el tier de lo importado se perdieron, como en el ensayo.
 
-**Lo importado está en dos idiomas.** La importación 2 reportó 19.246 filas en inglés, 27.203 en español y 8.752 sin idioma detectado. En la prueba desde un proyecto, una consulta en español no trajo filas importadas que la misma consulta en inglés sí trajo. Es el cruce de idioma que mide [embedder-bakeoff](../embedder-bakeoff/exploration.md), no un defecto del corte.
+**Lo importado está en dos idiomas.** La importación 2 reportó 19.246 filas en inglés, 27.203 en español y 8.752 sin idioma detectado. En la prueba desde un proyecto, una consulta en español no trajo filas importadas que la misma consulta en inglés sí trajo. Es el cruce de idioma que mide [embedder-bakeoff](../../embedder-bakeoff/exploration.md), no un defecto del corte.
 
 ### Lo que pedía «Para el corte»
 

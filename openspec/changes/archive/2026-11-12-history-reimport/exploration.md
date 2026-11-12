@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 1 y 2 | M, operativo, sin código del producto | — | ensayo y corte hechos ([verify.md](verify.md)); el corte fue el 2026-11-08, antes del piloto |
+| 1 y 2 | M, operativo, sin código del producto | — | archivado el 2026-11-12: ensayo y corte hechos ([verify.md](verify.md)); el corte fue el 2026-11-08, antes del piloto |
 
 **Tesis:** el historial entró a prod una sola vez, el 2026-10-24, con el release 0.62.0. Repetir esa importación sirve para dos cosas que hoy nadie sabe: si el trabajo de rendimiento funcionó en una importación real de punta a punta con un binario release, y dónde va lo que quedó sin proyecto. Se ensaya primero en el perfil `dev`, sobre una copia del store de prod, y recién después de aprobar el piloto se hace en prod.
 
@@ -73,4 +73,4 @@ Cómo quedó cada una en el corte ([verify.md](verify.md#el-corte-en-prod)):
 - [x] Si se copia aparte algún snapshot automático de prod antes de que el corte lo empuje afuera. Se copiaron los 6, y la copia se borró después de la revisión.
 - [x] Nombre y alcance del proyecto de espera. `historial-sin-ubicar`, sin carpeta, para lo que no tiene señal y para las notas de proyectos de origen sin carpeta.
 - [x] Si las filas siguen bajo el autor `migrated`. Siguen.
-- [ ] Qué hacer con los archivos de la memoria nativa de Claude Code que `clawg doctor` cuenta sin importar. No se decidió en este corte: quedó en el paso de «Corte» de [ROADMAP.md](../../ROADMAP.md) que mira el `--dry-run` de `clawg import --from claude-code`.
+- [ ] Qué hacer con los archivos de la memoria nativa de Claude Code que `clawg doctor` cuenta sin importar. No se decidió en este corte: quedó en el paso de «Corte» de [ROADMAP.md](../../../ROADMAP.md) que mira el `--dry-run` de `clawg import --from claude-code`.

@@ -1,0 +1,10 @@
+change: history-reimport
+objective: "1, 2"
+depends_on: []
+phase: archived
+release: "0.82.0"  # sin código del producto: la versión sólo marca el cierre
+artifacts:
+  exploration: done  # «Decisiones» dice cómo quedó cada una en el corte
+  verify: done  # el ensayo en dev (2026-11-03) y el corte en prod (2026-11-08, con 0.79.1 y antes del piloto), en verify.md
+  archive: done  # sin specs que consolidar: es operativo y no cambia el comportamiento del producto
+updated: 2026-11-12

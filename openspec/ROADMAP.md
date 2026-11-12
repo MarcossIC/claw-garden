@@ -43,9 +43,7 @@ Se publica lo anterior y se instalan los hooks de Claude Code en un repositorio 
 
 ## Corte (una noche local, con el piloto aprobado)
 
-Antes, lo que dejó el ensayo de history-reimport en [«Para el corte»](changes/history-reimport/verify.md#para-el-corte): decidir qué snapshots automáticos de `prod` se copian aparte, porque el corte poda algunos, y volver a clasificar las notas de un export nuevo que el mapa no conoce.
-
-Paso 2 de [history-reimport](changes/history-reimport/exploration.md), y después:
+La reimportación del historial ya se hizo, el 2026-11-08 y antes del piloto ([history-reimport](changes/archive/2026-11-12-history-reimport/verify.md#el-corte-en-prod)). Queda:
 
 1. `clawg setup claude-code --remove` y `clawg setup claude-code`, porque el servidor ya registrado sin `--agent` no se actualiza solo. Después `clawg setup cursor`.
 2. Sacar el plugin de Engram, su bloque de protocolo del `CLAUDE.md` global y su servidor de Cursor.
