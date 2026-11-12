@@ -139,11 +139,15 @@ fn no_memory_code_translates_a_connection_error_by_hand() {
 /// `mod <name>;` declares a module kept in another file, and ends nothing.
 fn production_lines_naming(source: &str, names: impl Fn(&str) -> bool) -> Vec<usize> {
     let lines: Vec<&str> = source.lines().collect();
-    let tests = lines
+    lines[..production_end(&lines)].iter().enumerate().filter(|(_, line)| names(line)).map(|(n, _)| n + 1).collect()
+}
+
+/// How many of `lines` are production code.
+fn production_end(lines: &[&str]) -> usize {
+    lines
         .windows(2)
         .position(|pair| pair[0] == "#[cfg(test)]" && pair[1].starts_with("mod ") && pair[1].trim_end().ends_with('{'))
-        .unwrap_or(lines.len());
-    lines[..tests].iter().enumerate().filter(|(_, line)| names(line)).map(|(n, _)| n + 1).collect()
+        .unwrap_or(lines.len())
 }
 
 /// Whether `line` names `rusqlite` or reads a field or a method called
@@ -273,6 +277,422 @@ fn every_public_memory_module_is_named_outside_core() {
 
     let unnamed: Vec<&str> = public.into_iter().filter(|module| !outside.iter().any(|source| names_memory_module(source, module))).collect();
     assert!(unnamed.is_empty(), "no other crate names these modules of clawg_core::memory, so they are `pub(crate) mod`: {unnamed:?}");
+}
+
+/// The folders of `crates/clawg-core/src/memory`, each with the folders its
+/// production code may name. A row names only rows written above it, so the
+/// table holds no cycle.
+const MEMORY_FOLDERS: [(&str, &[&str]); 10] = [
+    ("domain", &[]),
+    ("store", &["domain"]),
+    ("embedding", &["domain", "store"]),
+    ("retrieval", &["domain", "store", "embedding"]),
+    ("revision", &["domain", "store", "retrieval"]),
+    ("project_docs", &["domain", "store", "embedding", "retrieval"]),
+    ("projects", &["domain", "store", "embedding", "retrieval", "revision", "project_docs"]),
+    ("ingest", &["domain", "store", "embedding", "retrieval", "revision", "projects"]),
+    ("upkeep", &["domain", "store", "embedding", "retrieval", "revision", "project_docs", "projects"]),
+    ("portability", &["domain", "store", "embedding", "retrieval", "revision", "projects", "ingest", "upkeep"]),
+];
+
+/// The folders that are one module each: the directory is the module.
+const ONE_MODULE_FOLDERS: [&str; 2] = ["project_docs", "portability"];
+
+/// The folders whose sources still name a module by the path the root of
+/// `memory` re-exports (`crate::memory::chunker`), and not by its folder.
+const NAMES_THROUGH_THE_ROOT: [&str; 1] = ["project_docs"];
+
+/// The groups of modules of `memory` that depend on each other in a circle,
+/// each inside one folder, with why it stays.
+const MEMORY_CYCLES: [(&[&str], &str); 5] = [
+    (
+        &["store/backup", "store/db", "store/dedup", "store/error", "store/store_lock", "store/tier"],
+        "MemoryError carries BackupError and StoreOwner, and the modules that define them, and the ones the store registers its SQL \
+         functions from, fail with MemoryError",
+    ),
+    (
+        &["retrieval/listing", "retrieval/pieces", "retrieval/search"],
+        "a hit carries the place of its piece in a save, and a save is read back whole from the row of its head",
+    ),
+    (&["retrieval/prompt_builder", "retrieval/workspace"], "workspace.md is written with the prompt's indentation, and the prompt reads it"),
+    (
+        &["projects/inspect", "projects/merge", "projects/project_delete", "projects/relocate", "projects/subfolder"],
+        "a merge, a move and a delete of a project run each other's steps inside one transaction",
+    ),
+    (&["projects/project", "projects/registry"], "registering a folder reads the registry's names, and the registry tells a project id by its shape"),
+];
+
+/// A module of `memory`: a source file or a directory of them.
+struct MemoryModule {
+    /// Empty for a module that lies in no folder of the table.
+    folder: String,
+    name: String,
+    files: Vec<PathBuf>,
+}
+
+impl MemoryModule {
+    fn shown(&self) -> String {
+        if self.folder.is_empty() || self.folder == self.name { self.name.clone() } else { format!("{}/{}", self.folder, self.name) }
+    }
+}
+
+fn is_memory_folder(name: &str) -> bool {
+    MEMORY_FOLDERS.iter().any(|(folder, _)| *folder == name)
+}
+
+/// The modules under `memory`, the root's own file left out: each entry of a
+/// folder of the table, a one-module folder as itself, and whatever else lies
+/// beside them as a module in no folder.
+fn memory_modules(memory: &Path) -> Vec<MemoryModule> {
+    fn entries(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())).flatten().map(|e| e.path()).collect();
+        found.retain(|path| path.file_name().is_some_and(|name| name != "mod.rs") && (path.is_dir() || path.extension().is_some_and(|e| e == "rs")));
+        found.sort();
+        found
+    }
+    fn module(folder: &str, path: &Path) -> MemoryModule {
+        let name = path.file_stem().expect("a file name").to_string_lossy().into_owned();
+        let mut files = Vec::new();
+        if path.is_dir() {
+            rust_files(path, &mut files);
+            files.sort();
+        } else {
+            files.push(path.to_path_buf());
+        }
+        MemoryModule { folder: folder.to_string(), name, files }
+    }
+
+    let mut modules = Vec::new();
+    for path in entries(memory) {
+        let name = path.file_stem().expect("a file name").to_string_lossy().into_owned();
+        if path.is_dir() && is_memory_folder(&name) && !ONE_MODULE_FOLDERS.contains(&name.as_str()) {
+            modules.extend(entries(&path).iter().map(|inside| module(&name, inside)));
+        } else {
+            modules.push(module(if is_memory_folder(&name) { &name } else { "" }, &path));
+        }
+    }
+    modules
+}
+
+/// The paths `text` starts with, each as its segments: one path, or every
+/// path of a `{…}` group, a nested group opened under what leads to it. A
+/// `self` or a `*` ends a path at what leads to it.
+fn leading_paths(text: &str) -> Vec<Vec<String>> {
+    fn walk(text: &str, prefix: &[String], out: &mut Vec<Vec<String>>) {
+        let text = text.trim_start();
+        if let Some(group) = text.strip_prefix('{') {
+            for path in top_level_paths(group) {
+                walk(path, prefix, out);
+            }
+            return;
+        }
+        let end = text.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(text.len());
+        let (segment, rest) = text.split_at(end);
+        if segment.is_empty() || segment == "self" {
+            out.push(prefix.to_vec());
+            return;
+        }
+        let mut path = prefix.to_vec();
+        path.push(segment.to_string());
+        match rest.strip_prefix("::") {
+            Some(rest) => walk(rest, &path, out),
+            None => out.push(path),
+        }
+    }
+    let mut out = Vec::new();
+    walk(text, &[], &mut out);
+    out
+}
+
+#[test]
+fn leading_paths_opens_groups_under_what_leads_to_them() {
+    let paths = |text: &str| -> Vec<String> { leading_paths(text).iter().map(|path| path.join("::")).collect() };
+    assert_eq!(paths("store::db::MemoryStore;"), ["store::db::MemoryStore"]);
+    assert_eq!(paths("search::reach_predicate!(\"a\", \"?1\")"), ["search::reach_predicate"]);
+    assert_eq!(
+        paths("{clock::TimestampMs, store::{db::{self, MemoryStore}, error::*},\n    MemoryError};"),
+        ["clock::TimestampMs", "store::db", "store::db::MemoryStore", "store::error", "MemoryError"]
+    );
+}
+
+/// The lines of the production code of `source`, a comment line left empty
+/// so that the others keep their numbers.
+fn production_code(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let code: Vec<&str> = lines[..production_end(&lines)].iter().map(|line| if line.trim_start().starts_with("//") { "" } else { *line }).collect();
+    code.join("\n")
+}
+
+/// A path under `memory` that the production code of a source names, with
+/// the line it is on and whether it is written from the crate's root.
+struct MemoryPath {
+    line: usize,
+    segments: Vec<String>,
+    absolute: bool,
+}
+
+/// Each path of `code` that starts at `crate::memory::`, and each one that
+/// starts at a `super::` of the module `at` (its segments under `memory`).
+fn memory_paths(code: &str, at: &[String]) -> Vec<MemoryPath> {
+    const ROOT: &str = "crate::memory::";
+    const SUPER: &str = "super::";
+    let line_of = |offset: usize| code[..offset].matches('\n').count() + 1;
+    let mut found = Vec::new();
+    for (offset, _) in code.match_indices(ROOT) {
+        for segments in leading_paths(&code[offset + ROOT.len()..]) {
+            found.push(MemoryPath { line: line_of(offset), segments, absolute: true });
+        }
+    }
+    let continues = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':';
+    for (offset, _) in code.match_indices(SUPER) {
+        if code[..offset].ends_with(continues) {
+            continue;
+        }
+        let mut rest = &code[offset..];
+        let mut base = at.to_vec();
+        while let Some(after) = rest.strip_prefix(SUPER) {
+            rest = after;
+            base.pop();
+        }
+        for tail in leading_paths(rest) {
+            found.push(MemoryPath { line: line_of(offset), segments: base.iter().cloned().chain(tail).collect(), absolute: false });
+        }
+    }
+    found
+}
+
+#[test]
+fn memory_paths_reads_absolute_and_relative_paths() {
+    let code = "use crate::memory::{clock::TimestampMs, MemoryStore};\nuse super::token_splitter::TokenSplitter;\nlet x = super::super::vector::to_unit(v);\n";
+    let at = ["embedding".to_string(), "chunker".to_string(), "chat".to_string()];
+    let read: Vec<(usize, String, bool)> = memory_paths(code, &at).into_iter().map(|p| (p.line, p.segments.join("::"), p.absolute)).collect();
+    assert_eq!(
+        read,
+        [
+            (1, "clock::TimestampMs".to_string(), true),
+            (1, "MemoryStore".to_string(), true),
+            (2, "embedding::chunker::token_splitter::TokenSplitter".to_string(), false),
+            (3, "embedding::vector::to_unit".to_string(), false),
+        ]
+    );
+}
+
+/// What each name the root of `memory` re-exports stands for: the last
+/// segment of every path of its `use` statements, with the path.
+fn root_reexports(root: &str) -> Vec<(String, Vec<String>)> {
+    let mut found = Vec::new();
+    let mut offset = 0;
+    for line in root.split_inclusive('\n') {
+        let statement = ["pub use ", "pub(crate) use ", "use "].iter().find_map(|opener| line.strip_prefix(opener));
+        if statement.is_some() {
+            let from = offset + line.find("use ").expect("the opener") + "use ".len();
+            for path in leading_paths(&root[from..]) {
+                if let Some(name) = path.last() {
+                    found.push((name.clone(), path));
+                }
+            }
+        }
+        offset += line.len();
+    }
+    found
+}
+
+/// The module `path` (segments under `memory`) leads to, and whether the
+/// path names its folder: `store::db::…`, the module `db` of the folder
+/// `store`; `db::…`, the module `db` wherever it lies; `MemoryStore`, the
+/// module the root re-exports it from.
+fn module_named(modules: &[MemoryModule], reexports: &[(String, Vec<String>)], path: &[String]) -> Option<(usize, bool)> {
+    let first = path.first()?;
+    if modules.iter().any(|module| module.folder == *first) {
+        let name = if ONE_MODULE_FOLDERS.contains(&first.as_str()) { first } else { path.get(1)? };
+        return modules.iter().position(|module| module.folder == *first && module.name == *name).map(|at| (at, true));
+    }
+    if let Some(at) = modules.iter().position(|module| module.name == *first) {
+        return Some((at, false));
+    }
+    let (_, target) = reexports.iter().find(|(name, target)| name == first && target.len() > 1)?;
+    module_named(modules, &[], target).map(|(at, _)| (at, false))
+}
+
+#[test]
+fn module_named_follows_a_folder_a_module_and_a_reexport() {
+    let module = |folder: &str, name: &str| MemoryModule { folder: folder.to_string(), name: name.to_string(), files: Vec::new() };
+    let modules = [module("store", "db"), module("store", "error"), module("portability", "portability"), module("", "loose")];
+    let reexports = root_reexports("pub use store::db;\npub use store::db::MemoryStore;\npub(crate) use store::error::{\n    MemoryError,\n};\n");
+    let named = |path: &str| {
+        let path: Vec<String> = path.split("::").map(str::to_string).collect();
+        module_named(&modules, &reexports, &path).map(|(at, by_folder)| (modules[at].shown(), by_folder))
+    };
+    assert_eq!(named("store::db::MemoryStore"), Some(("store/db".to_string(), true)));
+    assert_eq!(named("portability::import::Journal"), Some(("portability".to_string(), true)));
+    assert_eq!(named("db::MemoryStore"), Some(("store/db".to_string(), false)));
+    assert_eq!(named("loose::thing"), Some(("loose".to_string(), false)));
+    assert_eq!(named("MemoryStore"), Some(("store/db".to_string(), false)));
+    assert_eq!(named("MemoryError"), Some(("store/error".to_string(), false)));
+    assert_eq!(named("store::MemoryStore"), None);
+    assert_eq!(named("nothing"), None);
+}
+
+/// Whether `file` is compiled only for the tests: the `mod.rs` beside it, or
+/// the one of its directory, declares it under `#[cfg(test)]`.
+fn declared_for_tests_only(file: &Path) -> bool {
+    let is_root = file.file_name().is_some_and(|name| name == "mod.rs");
+    let module = if is_root { file.parent().expect("a directory") } else { file };
+    let Some(name) = module.file_stem().map(|stem| stem.to_string_lossy().into_owned()) else { return false };
+    let Ok(declarer) = fs::read_to_string(module.with_file_name("mod.rs")) else { return false };
+    let lines: Vec<&str> = declarer.lines().collect();
+    lines.windows(2).any(|pair| pair[0].trim() == "#[cfg(test)]" && pair[1].trim().trim_start_matches("pub(crate) ").trim_start_matches("pub ") == format!("mod {name};"))
+}
+
+/// One module of `memory` naming another in its production code.
+struct MemoryDependency {
+    from: usize,
+    to: usize,
+    /// `<file under memory>:<line>`.
+    at: String,
+    /// The path names the folder of the module it leads to.
+    by_folder: bool,
+}
+
+/// How a dependency between modules of `memory` is counted. Each source of a
+/// module gives its production code (what comes before its first
+/// `#[cfg(test)]` module, without the comment lines, and nothing when the
+/// file itself is declared under `#[cfg(test)]`). In it, every path that
+/// starts at `crate::memory::` or at a `super::` is a dependency on the
+/// module it leads to, a name the root re-exports followed to its module.
+/// A path into the module it is written in is none. The second list is the
+/// `crate::memory::` paths that lead to nothing the tree or the root has.
+fn memory_dependencies(memory: &Path, modules: &[MemoryModule]) -> (Vec<MemoryDependency>, Vec<String>) {
+    let root = fs::read_to_string(memory.join("mod.rs")).expect("read memory/mod.rs");
+    let reexports = root_reexports(&root);
+    let (mut found, mut unknown) = (Vec::new(), Vec::new());
+    for (from, module) in modules.iter().enumerate() {
+        for file in module.files.iter().filter(|file| !declared_for_tests_only(file)) {
+            let shown = file.strip_prefix(memory).unwrap_or(file).to_string_lossy().replace('\\', "/");
+            let mut at: Vec<String> = shown.trim_end_matches(".rs").split('/').map(str::to_string).collect();
+            if at.last().is_some_and(|last| last == "mod") {
+                at.pop();
+            }
+            let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+            for path in memory_paths(&production_code(&source), &at) {
+                match module_named(modules, &reexports, &path.segments) {
+                    Some((to, _)) if to == from => {}
+                    Some((to, by_folder)) => found.push(MemoryDependency { from, to, at: format!("{shown}:{}", path.line), by_folder }),
+                    None if path.absolute => unknown.push(format!("{shown}:{} crate::memory::{}", path.line, path.segments.join("::"))),
+                    None => {}
+                }
+            }
+        }
+    }
+    (found, unknown)
+}
+
+fn memory_dir() -> PathBuf {
+    repo_root().join("crates/clawg-core/src/memory")
+}
+
+/// The tree of `memory` says what the system does, and a folder reaches only
+/// what its row of [`MEMORY_FOLDERS`] lists: the storage knows nothing of
+/// the search, and nothing below the ingest knows of it.
+#[test]
+fn a_memory_folder_names_only_the_folders_its_row_allows() {
+    for (at, (folder, allowed)) in MEMORY_FOLDERS.iter().enumerate() {
+        let above: Vec<&str> = MEMORY_FOLDERS[..at].iter().map(|(name, _)| *name).collect();
+        assert!(allowed.iter().all(|name| above.contains(name)), "{folder} may name only folders written above it: {allowed:?}");
+    }
+
+    let memory = memory_dir();
+    let modules = memory_modules(&memory);
+    let loose: Vec<&str> = modules.iter().filter(|module| module.folder.is_empty()).map(|module| module.name.as_str()).collect();
+    assert!(loose.is_empty(), "these modules of memory lie in no folder of the table: {loose:?}");
+    let missing: Vec<&str> = MEMORY_FOLDERS.iter().map(|(folder, _)| *folder).filter(|folder| !modules.iter().any(|module| module.folder == *folder)).collect();
+    assert!(missing.is_empty(), "memory has no folder {missing:?}");
+
+    let (dependencies, unknown) = memory_dependencies(&memory, &modules);
+    assert!(unknown.is_empty(), "these paths lead to no module of memory:\n{}", unknown.join("\n"));
+
+    let allowed = |folder: &str| MEMORY_FOLDERS.iter().find(|(name, _)| *name == folder).map_or(&[][..], |(_, allowed)| *allowed);
+    let mut refused = Vec::new();
+    let mut through_the_root = Vec::new();
+    for dependency in &dependencies {
+        let (from, to) = (&modules[dependency.from], &modules[dependency.to]);
+        if from.folder != to.folder && !allowed(&from.folder).contains(&to.folder.as_str()) {
+            refused.push(format!("{} names {}", dependency.at, to.shown()));
+        }
+        if !dependency.by_folder && !NAMES_THROUGH_THE_ROOT.contains(&from.folder.as_str()) {
+            through_the_root.push(format!("{} names {} without its folder", dependency.at, to.shown()));
+        }
+    }
+    assert!(refused.is_empty(), "a folder of memory names one its row does not allow:\n{}", refused.join("\n"));
+    assert!(through_the_root.is_empty(), "write the path with the folder (crate::memory::<folder>::<module>):\n{}", through_the_root.join("\n"));
+
+    let mut unused = Vec::new();
+    for (folder, allowed) in MEMORY_FOLDERS {
+        for name in allowed {
+            if !dependencies.iter().any(|d| modules[d.from].folder == folder && modules[d.to].folder == *name) {
+                unused.push(format!("{folder} -> {name}"));
+            }
+        }
+    }
+    assert!(unused.is_empty(), "the table allows what no code uses; take it out of the row: {unused:?}");
+}
+
+/// The groups of more than one node that reach each other along `edges`,
+/// each in order, the groups by their first node.
+fn cycles(nodes: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    let mut reach = vec![vec![false; nodes]; nodes];
+    for &(from, to) in edges {
+        reach[from][to] = true;
+    }
+    for through in 0..nodes {
+        let onward = reach[through].clone();
+        for row in reach.iter_mut().filter(|row| row[through]) {
+            for (to, reached) in onward.iter().enumerate() {
+                row[to] |= reached;
+            }
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (node, onward) in reach.iter().enumerate() {
+        if groups.iter().any(|group| group.contains(&node)) {
+            continue;
+        }
+        let group: Vec<usize> = (node..nodes).filter(|&other| other == node || (onward[other] && reach[other][node])).collect();
+        if group.len() > 1 {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+#[test]
+fn cycles_groups_the_nodes_that_reach_each_other() {
+    assert_eq!(cycles(4, &[(0, 1), (1, 2), (2, 3)]), Vec::<Vec<usize>>::new());
+    assert_eq!(cycles(6, &[(0, 1), (1, 2), (2, 0), (2, 3), (4, 5), (5, 4), (3, 3)]), [vec![0, 1, 2], vec![4, 5]]);
+}
+
+/// No module of `memory` depends on itself through others, but for the
+/// groups of [`MEMORY_CYCLES`]. Counted as [`memory_dependencies`] says;
+/// a failure prints every group found, so the count can be read off it.
+#[test]
+fn the_memory_modules_cycle_only_where_listed() {
+    let memory = memory_dir();
+    let modules = memory_modules(&memory);
+    let (dependencies, _) = memory_dependencies(&memory, &modules);
+    let edges: Vec<(usize, usize)> = dependencies.iter().map(|d| (d.from, d.to)).collect();
+    let mut found: Vec<Vec<String>> = cycles(modules.len(), &edges).iter().map(|group| group.iter().map(|&at| modules[at].shown()).collect()).collect();
+    found.sort();
+    let mut listed: Vec<Vec<String>> = MEMORY_CYCLES.iter().map(|(group, _)| group.iter().map(|name| name.to_string()).collect()).collect();
+    listed.sort();
+
+    let shown = |groups: &[Vec<String>]| groups.iter().map(|group| format!("  {} modules: {}", group.len(), group.join(", "))).collect::<Vec<_>>().join("\n");
+    assert!(
+        found == listed,
+        "of the {} modules of memory, these depend on each other in a circle:\n{}\nand the listed circles are:\n{}",
+        modules.len(),
+        shown(&found),
+        shown(&listed)
+    );
 }
 
 /// A Windows checkout has CRLF line ends.
