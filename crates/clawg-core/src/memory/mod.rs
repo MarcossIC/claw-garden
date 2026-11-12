@@ -26,18 +26,10 @@
 pub mod bootstrap;
 pub mod store_insert;
 pub mod worker;
-pub mod identity;
-pub mod merge;
 pub mod outbox;
 pub mod portability;
-pub mod project;
-pub mod project_delete;
 pub mod project_docs;
-pub mod registry;
-pub mod relocate;
-pub mod inspect;
 pub mod secrets;
-pub mod subfolder;
 
 pub use contradiction::Candidate;
 pub use db::MemoryStore;
@@ -105,3 +97,13 @@ pub(crate) use revision::contradiction;
 pub use revision::dispute;
 pub(crate) use revision::revival;
 pub use revision::topic;
+
+mod projects;
+pub use projects::identity;
+pub use projects::inspect;
+pub use projects::merge;
+pub use projects::project;
+pub use projects::project_delete;
+pub use projects::registry;
+pub use projects::relocate;
+pub use projects::subfolder;
