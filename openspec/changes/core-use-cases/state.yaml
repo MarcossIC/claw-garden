@@ -1,14 +1,20 @@
 change: core-use-cases
 objective: "transversal"
-depends_on: [memory-module-layout]
-phase: explore
+depends_on: [memory-module-layout]  # aplicado en develop
+phase: apply  # la parte 1, el guardado completo
 artifacts:
-  exploration: draft
-  proposal: pending
-  spec: pending
-  design: pending
-  tasks: pending
+  exploration: done  # el borrador del 2026-11-01, revisado contra develop el 2026-11-12: rutas, líneas y conteos
+  proposal: done  # el enfoque A; la parte 1 es POST /v1/memories
+  spec: done  # R1 a R7, del guardado
+  design: done  # D1 a D9; las tres decisiones abiertas en D3, D4 y D6, y los handlers en D7
+  tasks: done  # tareas 1 a 5 de la parte 1; las partes 2 a 4, en «Partes siguientes»
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-01
+decisions:
+  error_texts: display_and_data  # cada SaveRejected muestra el texto de hoy y lleva sus datos (D3)
+  format_checks: domain  # check_content y check_operation_id bajan al núcleo (D4)
+  eval_api: unchanged  # EvalIngest no pasa por admit (D6)
+  event_memory_type: string  # el evento del outbox sigue con Option<String> (D5)
+  handlers: save_only  # locate_project y register_root en la parte 2; context no entra (D7)
+updated: 2026-11-12
