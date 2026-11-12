@@ -10,6 +10,10 @@ use crate::memory::events::MemorySource;
 use crate::memory::record::CreatedByType;
 use crate::models::chat::Role;
 
+/// The name an import of Claude Code's native memory goes by: the source of
+/// its notes, and what the `created_by_ref` of its rows starts with.
+pub const CLAUDE_CODE: &str = "claude-code";
+
 /// The `source` and `created_by_type` a row of this event is stored with.
 /// `has_sources` is whether a deliberate save names the rows it was drawn from.
 pub(crate) fn seal(source: MemorySource, role: &Role, has_sources: bool, user_stated: bool) -> (MemorySource, CreatedByType) {

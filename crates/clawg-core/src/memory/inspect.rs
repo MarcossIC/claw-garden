@@ -335,7 +335,7 @@ fn claude_code_imports(c: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = c.prepare(
         "SELECT DISTINCT created_by_ref FROM memory WHERE source = 'import' AND created_by_ref LIKE ?1 ORDER BY created_by_ref",
     )?;
-    let prefix = format!("{}:%", crate::memory::portability::claude_code::SOURCE);
+    let prefix = format!("{}:%", crate::memory::provenance::CLAUDE_CODE);
     let rows = stmt.query_map([prefix], |r| r.get(0))?;
     rows.collect()
 }
