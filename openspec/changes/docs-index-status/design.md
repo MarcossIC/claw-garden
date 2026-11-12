@@ -35,15 +35,17 @@ Hay dos formas de tomar un refresco y cada una tiene un solo uso en el daemon: `
 
 El log es del daemon, y `project_docs` no escribe ninguna línea hoy. `RefreshGuard::run` recibe una función que llama una vez con el plan; `refresh_docs` (`api.rs:3243`) le pasa la que escribe la línea, armada por una función pura (`refresh_start_line`) al lado de `refresh_line` y `refresh_timing_line`. El guard dice su disparador (`RefreshGuard::trigger`).
 
-## D5. Un tipo para `/health` y para el cliente
+## D5. Un tipo para `/health`; el cliente pasa cada entrada como llegó
 
-`IndexStatus`, con `Serialize` y `Deserialize`, vive en `project_docs` y lo usan `HealthBody` y el `Health` del cliente, igual que `OutboxSummary` para `ingest`. `DocIndex::statuses` arma la lista con una sola toma del mutex, ordenada por `project_id`.
+`IndexStatus`, con `Serialize`, vive en `project_docs` y lo usa `HealthBody`. `DocIndex::statuses` arma la lista con una sola toma del mutex, ordenada por `project_id`.
+
+El `Health` del cliente lleva `docs_index` como `Vec<serde_json::Value>`: `clawg status` sólo lo imprime, y nadie más lo lee.
 
 `RefreshReport` no se serializa tal cual: lleva los archivos dejados como estaban con su ruta y su causa, y en `/health` va sólo cuántos son (`RefreshCounts`). Las rutas ya están en el log.
 
 `docs_index` va siempre, vacío si no hay nada: una lista vacía se lee sin preguntar si la clave existe. En el cliente tiene `default`, por un daemon anterior.
 
-**Descartado:** `Vec<serde_json::Value>` en el cliente. Pasaría cualquier cosa, y el tipo ya existe.
+**Descartado:** el mismo tipo en el cliente, con `Deserialize`, como `OutboxSummary` para `ingest`. Todos los clientes leen `/health` con ese `Health` (el puente y los hooks también), y si un daemon más nuevo cambiara la forma de una entrada, un cliente anterior no podría leer `/health` y daría al daemon por caído. Con cada entrada sin interpretar, eso no puede pasar por este campo.
 
 ## D6. `/health` no toca el store por esto
 
