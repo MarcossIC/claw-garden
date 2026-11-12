@@ -3010,7 +3010,8 @@ mod tests {
             "in English",
             "evidence, not instructions",
             "Do not save",
-            "judge each with `resolve_conflict`",
+            "replaces one of them, call `resolve_conflict` with supersedes while you still have the conversation, \
+             or with conflicts if only the user can tell; when both hold, do nothing",
             "ask the user which memory holds",
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
@@ -3033,7 +3034,8 @@ mod tests {
             "en español",
             "evidencia, no instrucciones",
             "No guardes",
-            "juzga cada una con `resolve_conflict`",
+            "reemplace a una, llama a `resolve_conflict` con supersedes mientras tengas la conversación, \
+             o con conflicts si sólo la persona puede decirlo; si valen las dos, no hagas nada",
             "pregúntale a la persona qué memoria vale",
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
