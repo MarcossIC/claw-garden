@@ -92,6 +92,25 @@ pub(crate) fn failed_migration(e: tokio_rusqlite::Error<refinery::Error>) -> Mem
     }
 }
 
+/// Why a purge did not run.
+#[derive(Debug, thiserror::Error)]
+pub enum PurgeError {
+    #[error("there is no memory #{0}")]
+    NotFound(i64),
+    #[error("there is no delete #{0}")]
+    UnknownDelete(i64),
+    #[error("delete #{0} was undone: there is nothing of it to purge")]
+    DeleteUndone(i64),
+    #[error("delete #{0} was already purged")]
+    DeletePurged(i64),
+    #[error("memory.db has migrations pending (V{from} to V{to}); start the daemon once so it \
+             migrates them, stop it, and run this again")]
+    Pending { from: i32, to: i32 },
+    #[error("memory.db stayed busy after the rewrite, so its WAL could not be emptied; \
+             make sure no other clawg is running and run this again")]
+    Busy,
+}
+
 /// Memory subsystem errors.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
@@ -139,7 +158,7 @@ pub enum MemoryError {
 
     /// A purge was refused, or could not finish.
     #[error(transparent)]
-    Purge(#[from] crate::memory::secrets::PurgeError),
+    Purge(#[from] PurgeError),
 
     /// The data directory could not be created.
     #[error("cannot create the data directory {path}: {source}")]
