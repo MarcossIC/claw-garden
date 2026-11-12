@@ -1921,7 +1921,7 @@ impl ClawgMcp {
                        deleted with, when the user says the delete was a mistake. Refused \
                        when the same text was saved again since, when a newer memory holds its \
                        `topic_key`, or when the memory holds a secret. Names the memories saved \
-                       meanwhile that are close to it, to judge with `resolve_conflict`."
+                       meanwhile that are close to it, in case one replaces it."
     )]
     async fn restore_memory(
         &self,
@@ -1960,9 +1960,9 @@ impl ClawgMcp {
     #[tool(
         name = "resolve_conflict",
         description = "Judge a pair of memories the detector found close to each other: one \
-                       that `save_memory` or `memory_status` names, which you judge yourself, or \
-                       one under ACTIVE CONFLICTS in `recall_context`, once the user has said \
-                       which holds. A preference or a decision is superseded only on the user's \
+                       that `save_memory` names, when the new save replaces the old memory or \
+                       only the user can tell which holds, or one under ACTIVE CONFLICTS in \
+                       `recall_context`, once the user has said which holds. A preference or a decision is superseded only on the user's \
                        word: judge it conflicts and ask, then call supersedes with user_answered \
                        and their answer in reason. Returns the status of both memories. Either \
                        side may be another agent's."
