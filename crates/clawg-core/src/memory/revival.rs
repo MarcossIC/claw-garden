@@ -11,7 +11,44 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::memory::clock::TimestampMs;
 use crate::memory::contradiction::excerpt;
 use crate::memory::dispute::{settle_challengers, settle_row, REVIVE_SQL};
+use crate::memory::search::reader_predicate;
 use crate::memory::topic::Replaced;
+
+/// The live row a save of the same text would reinforce instead of storing
+/// it again (`REINFORCE_LOOKUP_SQL` in `store_insert.rs`): the project's, of
+/// any author the restoring reader (`?2`) reaches.
+pub(crate) const RESTORE_TWIN: &str = concat!(
+    "SELECT t.id FROM memory m JOIN memory t \
+     ON COALESCE(t.project_id, '') = COALESCE(m.project_id, '') AND t.content_hash = m.content_hash \
+     WHERE m.id = ?1 AND m.content_hash IS NOT NULL AND t.id <> m.id \
+     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') AND ",
+    reader_predicate!("t.agent_id", "?2"),
+    " ORDER BY t.created_at ASC LIMIT 1"
+);
+
+/// The live row that holds the deleted row's topic key now, in the same scope
+/// as `SCOPE_ROWS_SQL` in `topic.rs`, with the restoring reader (`?2`) as the
+/// saver. The other pieces of the row's own save are not holders: a keyed
+/// long save gives its key to every piece. Nor is a row the deleted one's
+/// delete brought back: the restore takes it back.
+pub(crate) const RESTORE_TOPIC_HOLDER: &str = concat!(
+    "SELECT m.topic_key, t.id FROM memory m JOIN memory t \
+     ON COALESCE(t.project_id, '') = COALESCE(m.project_id, '') AND t.topic_key = m.topic_key \
+     WHERE m.id = ?1 AND t.id <> m.id AND t.revived_from IS NOT m.id \
+     AND NOT EXISTS (SELECT 1 FROM memory_piece a JOIN memory_piece b ON b.save_id = a.save_id \
+                     WHERE a.memory_id = m.id AND b.memory_id = t.id) \
+     AND t.deleted_at IS NULL AND t.status IN ('active', 'disputed') AND ",
+    reader_predicate!("t.agent_id", "?2"),
+    " ORDER BY t.id LIMIT 1"
+);
+
+/// The row's text index entry, added back in the shape of the insert trigger
+/// of V8. V8 has no trigger for this transition because, when it was written,
+/// nothing undeleted a row; this statement is that missing half, and it runs
+/// only right after `RESTORE_ROW` turned a deleted row live, so every live row
+/// stays indexed exactly once.
+pub(crate) const RESTORE_TEXT_INDEX: &str = "INSERT INTO memory_fts(rowid, content, agent_id, project_id, memory_type) \
+     SELECT id, content, agent_id, project_id, memory_type FROM memory WHERE id = ?1";
 
 /// A live row superseded by the deleted one.
 #[derive(Debug, Clone, PartialEq, Eq)]

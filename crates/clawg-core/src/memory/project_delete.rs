@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
-use crate::memory::admin::{RESTORE_TEXT_INDEX, RESTORE_TOPIC_HOLDER, RESTORE_TWIN};
 use crate::memory::chunker::embedding_text;
 use crate::memory::dispute::{release_challengers, settle_challengers, settle_row};
 use crate::memory::embedder::{EmbedError, EmbedRole, Embedder};
@@ -25,6 +24,7 @@ use crate::memory::inspect::{answered_pairs, duplicates, folder_prints, registry
 use crate::memory::merge::{canonical_in, retrying, Retried};
 use crate::memory::project_docs::drop_root_index_in;
 use crate::memory::redact::redact;
+use crate::memory::revival::{RESTORE_TEXT_INDEX, RESTORE_TOPIC_HOLDER, RESTORE_TWIN};
 use crate::memory::subfolder::{leading_to_in, SubfolderOf};
 use crate::memory::vector::to_unit;
 use crate::memory::workspace::WorkspaceManager;
