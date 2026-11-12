@@ -12,6 +12,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::merge::{canonical_in, merge_core, MergeError, MergeReport};
 use crate::memory::project_delete::{deleted_in, deleted_message};
@@ -20,7 +21,7 @@ use crate::memory::{MemoryError, MemoryStore};
 
 /// A row of `project_subfolder`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Declaration {
+pub(crate) struct Declaration {
     /// The project of the repository, or a tombstone that leads to it.
     pub parent_id: String,
     /// Relative to the top of the checkout, its components joined by `/`.
@@ -32,14 +33,14 @@ pub struct Declaration {
 
 /// Whether the subpath `outer` holds `inner`, by whole components:
 /// `apps/web` holds `apps/web/src` but not `apps/webapp`.
-pub fn contains(outer: &str, inner: &str) -> bool {
+pub(crate) fn contains(outer: &str, inner: &str) -> bool {
     inner == outer || inner.strip_prefix(outer).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The declaration that decides `subpath` among `declared`, read under the
 /// repository's project `parent` and its tombstones: the deepest that holds
 /// it, then the one of `parent` before a tombstone's, then the oldest.
-pub fn deepest<'a>(declared: &'a [Declaration], parent: &str, subpath: &str) -> Option<&'a Declaration> {
+pub(crate) fn deepest<'a>(declared: &'a [Declaration], parent: &str, subpath: &str) -> Option<&'a Declaration> {
     declared
         .iter()
         .filter(|d| !d.subpath.is_empty() && contains(&d.subpath, subpath))
@@ -152,7 +153,7 @@ pub enum SubfolderError {
 
 impl From<rusqlite::Error> for SubfolderError {
     fn from(e: rusqlite::Error) -> Self {
-        SubfolderError::Store(MemoryError::Sqlite(e))
+        SubfolderError::Store(MemoryError::from(e))
     }
 }
 
@@ -188,10 +189,7 @@ pub async fn declare_subfolder(
             Ok(step)
         }
     };
-    let step = store.conn.call(decide).await.map_err(|e| match e {
-        tokio_rusqlite::Error::Error(e) => e,
-        other => SubfolderError::Store(MemoryError::Backend(other.to_string())),
-    })?;
+    let step = store.conn.call(decide).await.map_err(failed_call::<_, SubfolderError>(ClosedAs::AsIs))?;
     match step {
         Step::Done(declared) => Ok(declared),
         Step::Merge { other } => {

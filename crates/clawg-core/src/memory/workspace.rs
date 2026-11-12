@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::prompt_builder::indent_continuations;
 use crate::memory::search::{reach_predicate, reader_bind};
@@ -12,10 +13,10 @@ use crate::memory::sharing::{Reach, Reader};
 use crate::memory::{MemoryError, MemoryStore};
 
 pub(crate) const DEFAULT_PROJECT_SEGMENT: &str = "default";
-pub const AUTO_START: &str = "<!-- AUTO-START -->";
-pub const AUTO_END: &str = "<!-- AUTO-END -->";
-pub const USER_START: &str = "<!-- USER-START -->";
-pub const USER_END: &str = "<!-- USER-END -->";
+pub(crate) const AUTO_START: &str = "<!-- AUTO-START -->";
+pub(crate) const AUTO_END: &str = "<!-- AUTO-END -->";
+pub(crate) const USER_START: &str = "<!-- USER-START -->";
+pub(crate) const USER_END: &str = "<!-- USER-END -->";
 
 /// Hard cap on the AUTO section's token count (approximation: 4 bytes/token).
 pub(crate) const AUTO_TOKEN_CAP: usize = 1500;
@@ -23,7 +24,7 @@ pub(crate) const AUTO_BYTE_CAP: usize = AUTO_TOKEN_CAP * 4;
 
 /// What [`WorkspaceManager::adopt_legacy`] did, or would do without writing.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Adopted {
+pub(crate) struct Adopted {
     /// The agent's folder on disk and the path of each copy.
     pub copied: Vec<(String, PathBuf)>,
     /// Each legacy file left beside the project's own, which differs from it.
@@ -32,7 +33,7 @@ pub struct Adopted {
 
 /// What [`WorkspaceManager::drop_adopted`] did, or would do without writing.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Dropped {
+pub(crate) struct Dropped {
     pub removed: Vec<PathBuf>,
     /// The copies edited since, which stay.
     pub kept: Vec<PathBuf>,
@@ -63,7 +64,7 @@ const _: fn() = || {
 
 impl WorkspaceManager {
     /// Construct from the WORKSPACES root.
-    pub fn new(workspaces_root: PathBuf) -> Self {
+    pub(crate) fn new(workspaces_root: PathBuf) -> Self {
         Self { workspaces_root }
     }
 
@@ -81,7 +82,7 @@ impl WorkspaceManager {
     /// the user keeps editing it, both copies still exist. When both already
     /// exist nothing is merged, only reported, because either could be the one
     /// the user wants. Without `write` it only says what it would do.
-    pub async fn adopt_legacy(&self, legacy_id: &str, project_id: &str, write: bool) -> Result<Adopted, MemoryError> {
+    pub(crate) async fn adopt_legacy(&self, legacy_id: &str, project_id: &str, write: bool) -> Result<Adopted, MemoryError> {
         let io_err = |path: &std::path::Path| {
             let path = path.to_path_buf();
             move |source| MemoryError::WorkspaceIo { path, source }
@@ -135,7 +136,7 @@ impl WorkspaceManager {
 
     /// The `workspace.md` of every agent under `project_id`, by path. Reads
     /// the folders of the agents and changes nothing.
-    pub async fn project_files(&self, project_id: &str) -> Result<Vec<PathBuf>, MemoryError> {
+    pub(crate) async fn project_files(&self, project_id: &str) -> Result<Vec<PathBuf>, MemoryError> {
         let io_err = |path: &std::path::Path| {
             let path = path.to_path_buf();
             move |source| MemoryError::WorkspaceIo { path, source }
@@ -165,7 +166,7 @@ impl WorkspaceManager {
     /// user edited since stays. A folder name that is not one plain component
     /// is skipped, as is a copy, or a legacy file, no longer there. Without
     /// `write` it only says what it would do.
-    pub async fn drop_adopted(
+    pub(crate) async fn drop_adopted(
         &self,
         legacy_id: &str,
         project_id: &str,
@@ -442,13 +443,7 @@ async fn fetch_auto_rows(
             Ok(AutoRows { user_prefs, arch_decisions })
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during fetch_auto_rows".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+        .map_err(failed_call(ClosedAs::During("fetch_auto_rows")))
 }
 
 fn map_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryLine> {

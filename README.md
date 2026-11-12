@@ -372,7 +372,7 @@ clawg setup claude-code
 Hace tres cosas, y se puede repetir sin miedo:
 
 1. **Registra el servidor MCP** a nivel de usuario, así queda disponible en todos tus proyectos. Lo hace con el propio `claude mcp add --scope user`, con la ruta completa del `clawg` que corriste (para no depender del PATH del proceso que lanza Claude Code) y con la identidad del agente fijada en `--agent claude-code` (ver [Fijar la identidad del agente](#fijar-la-identidad-del-agente)).
-2. **Instala los hooks** de inicio de sesión y de cada mensaje en `~/.claude/settings.json`: al empezar (y después de compactar) la sesión recibe la memoria del proyecto, y a los 30 minutos sin guardar el agente se entera. Claude Code corre el binario directamente, sin pasar por un shell (hace falta Claude Code 2.1.139 o posterior), así que una ruta con espacios o un perfil de shell que imprime no los rompen. Los hooks que ya tenías no se tocan; los que instaló una versión anterior de `clawg setup` se pasan a la forma nueva.
+2. **Instala los hooks** de inicio de sesión, de cada mensaje y de fin de sesión en `~/.claude/settings.json`: al empezar (y después de compactar) la sesión recibe la memoria del proyecto, a los 30 minutos sin guardar el agente se entera, y al salir o hacer `/clear` clawg anota que la sesión terminó y por qué (ver [el uso por sesión](#el-uso-por-sesión)). Si instalaste con una versión anterior, corré `clawg setup claude-code` otra vez: agrega sólo el hook que falta. Claude Code corre el binario directamente, sin pasar por un shell (hace falta Claude Code 2.1.139 o posterior), así que una ruta con espacios o un perfil de shell que imprime no los rompen. Los hooks que ya tenías no se tocan; los que instaló una versión anterior de `clawg setup` se pasan a la forma nueva.
 3. **Agrega el protocolo de memoria** (cuándo guardar, cómo escribir un save, qué no guardar) a `~/.claude/CLAUDE.md`, entre `<!-- BEGIN CLAWG MEMORY PROTOCOL -->` y `<!-- END CLAWG MEMORY PROTOCOL -->`. Lo que escribiste fuera de esas marcas no cambia; lo de adentro lo reescribe clawg cuando el protocolo cambia.
 
 Antes de cambiar un archivo, guarda una copia en `~/.clawg/backups/setup/` y conserva las cinco más recientes de cada uno. Si `settings.json` o `CLAUDE.md` es un enlace simbólico (por ejemplo, de un repositorio de dotfiles), escribe en el archivo al que apunta y el enlace queda; el archivo conserva sus permisos. Con `--dry-run` muestra lo que haría sin tocar nada. Si `CLAUDE_CONFIG_DIR` está definido, usa ese directorio en vez de `~/.claude`.
@@ -396,7 +396,7 @@ Para probar los hooks en un repositorio antes de instalarlos en todos, corré es
 clawg setup claude-code --local
 ```
 
-Instala los mismos dos hooks, pero en `.claude/settings.local.json` de esa carpeta, y no toca `~/.claude/settings.json`, el servidor MCP ni el protocolo: el servidor tiene que estar registrado para el usuario, con `clawg setup claude-code` o a mano. Para otra carpeta, `clawg setup claude-code --path <carpeta>`. Claude Code los lee en las sesiones que abras en esa carpeta. Si los hooks también están en `~/.claude/settings.json` y son idénticos, Claude Code los corre una sola vez.
+Instala los mismos tres hooks, pero en `.claude/settings.local.json` de esa carpeta, y no toca `~/.claude/settings.json`, el servidor MCP ni el protocolo: el servidor tiene que estar registrado para el usuario, con `clawg setup claude-code` o a mano. Para otra carpeta, `clawg setup claude-code --path <carpeta>`. Claude Code los lee en las sesiones que abras en esa carpeta. Si los hooks también están en `~/.claude/settings.json` y son idénticos, Claude Code los corre una sola vez.
 
 `clawg setup claude-code --local --remove` (o `--path <carpeta> --remove`) los saca. Si el archivo queda sin nada más, lo borra, y también la carpeta `.claude` si queda vacía. Como siempre, guarda antes una copia del archivo en `~/.clawg/backups/setup/`, con el nombre de la carpeta adelante, y con `--dry-run` muestra lo que haría.
 
@@ -453,11 +453,11 @@ clawg setup cursor
 Hace dos cosas, y se puede repetir sin miedo:
 
 1. **Registra el servidor MCP** en `~/.cursor/mcp.json`, con la ruta completa del `clawg` que corriste y la identidad del agente fijada en `--agent cursor` (ver [Fijar la identidad del agente](#fijar-la-identidad-del-agente)). Los otros servidores del archivo no se tocan.
-2. **Instala el hook de inicio de sesión** (`sessionStart`) en `~/.cursor/hooks.json`: cada chat nuevo recibe la memoria del proyecto. Cursor corre los hooks de usuario en `~/.cursor`, así que el proyecto sale de la carpeta abierta en la ventana, nunca del directorio donde corre el hook. Si la ventana tiene varias carpetas, o ninguna, el hook no adivina: no inyecta memoria, sólo la línea del idioma si elegiste uno. En Windows la línea del hook está escrita para PowerShell, que es como Cursor la corre, también con espacios en la ruta.
+2. **Instala los hooks de inicio y de fin de sesión** (`sessionStart` y `sessionEnd`) en `~/.cursor/hooks.json`: cada chat nuevo recibe la memoria del proyecto, y al cerrarlo clawg anota que la sesión terminó y por qué. Si instalaste con una versión anterior, corré `clawg setup cursor` otra vez: agrega sólo el que falta. Cursor corre los hooks de usuario en `~/.cursor`, así que el proyecto sale de la carpeta abierta en la ventana, nunca del directorio donde corre el hook. Si la ventana tiene varias carpetas, o ninguna, el hook no adivina: no inyecta memoria, sólo la línea del idioma si elegiste uno. En Windows la línea del hook está escrita para PowerShell, que es como Cursor la corre, también con espacios en la ruta.
 
 No instala un recordatorio de guardar, porque el hook de Cursor antes de cada mensaje no puede agregar contexto, ni un archivo de reglas: Cursor ya recibe las instrucciones del servidor MCP.
 
-Como `setup claude-code`, guarda una copia de cada archivo en `~/.clawg/backups/setup/` antes de cambiarlo, y con `--dry-run` muestra lo que haría sin tocar nada. Lo que no coincide con lo que instalaría (un `clawg` registrado con otro comando, otro hook de clawg en `sessionStart`) no lo reemplaza: lo dice y sale con 1. Para rehacerlo, `clawg setup cursor --remove` y otra vez `clawg setup cursor`.
+Como `setup claude-code`, guarda una copia de cada archivo en `~/.clawg/backups/setup/` antes de cambiarlo, y con `--dry-run` muestra lo que haría sin tocar nada. Lo que no coincide con lo que instalaría (un `clawg` registrado con otro comando, otro hook de clawg en `sessionStart` o en `sessionEnd`) no lo reemplaza: lo dice y sale con 1. Para rehacerlo, `clawg setup cursor --remove` y otra vez `clawg setup cursor`.
 
 **Qué proyecto usa.** Cursor arranca el servidor MCP en tu carpeta personal, sea cual sea la ventana, así que clawg no se fija en ese directorio: en cada llamada le pide a Cursor las carpetas abiertas, que son las de la ventana del chat, no las de las otras ventanas. Una búsqueda sin proyecto lee esas carpetas, y con varias abiertas en la ventana busca en todas; para leer lo de otra ventana, el agente pide `all_projects`. Un save nombra siempre su proyecto, y si el agente no lo dice, clawg no guarda y le muestra las carpetas para que elija. Tu carpeta personal nunca es un proyecto.
 
@@ -568,8 +568,9 @@ clawg import --from claude-code ~/.claude/projects --profile dev   # la memoria 
 clawg import --undo 3 --profile dev       # deshace la importación 3 y conserva lo que cambió desde entonces (--dry-run)
 clawg setup claude-code --profile dev   # conecta Claude Code: servidor MCP, hooks y protocolo (--dry-run, --remove)
 clawg setup claude-code --local --profile dev   # sólo los hooks, en .claude/settings.local.json de esta carpeta (--path DIR, --dry-run, --remove)
-clawg setup cursor --profile dev        # conecta Cursor: servidor MCP y hook de inicio de sesión (--dry-run, --remove)
+clawg setup cursor --profile dev        # conecta Cursor: servidor MCP y hooks de inicio y de fin de sesión (--dry-run, --remove)
 clawg metrics report --metric http.duration --label route=/v1/search --by version   # latencias y memoria del daemon (--by day|hour, --since 7d)
+clawg metrics sessions --by project --since 7d   # el uso por sesión: cuántas, cuánto duran, qué llaman y qué guardan (--by agent|day, --session ID)
 ```
 
 `clawg mcp --no-autostart` falla en vez de arrancar un daemon, y `clawg mcp --agent <nombre>` fija el agente con el que guarda y busca. `clawg serve --port <n>` escucha también en ese puerto TCP (`0` elige uno libre). `clawg path add|remove [--dir <dir>]` edita el PATH del usuario en Windows.
@@ -609,6 +610,22 @@ El binario instalado usa `prod` sin que haga falta indicarlo. El perfil sale de 
 Cada directorio de datos contiene la base SQLite de memoria, `daemon.json` (pid, puerto, si hay socket, versión), `token`, `clawg.sock`, y `memory.lock` / `memory.owner`, que garantizan que un único proceso sea dueño del almacén. Si se excluyó algo con `clawg sharing`, también `sharing.json`.
 
 El daemon también guarda sus propias métricas en `metrics.db`, aparte de la memoria: cuánto tarda cada petición (por ruta, clase de estado y transporte, nunca la URL ni el texto), la memoria, la CPU y los descriptores del proceso, un minuto por fila durante 14 días y una hora por fila durante 400. Nada sale de la máquina. `clawg metrics report` lo resume por versión, por día o por hora del día, con el daemon corriendo o parado; `GET /v1/metrics` da el minuto en curso (o, con `?format=prometheus`, texto para Prometheus). `CLAWG_METRICS=off` evita que se escriba el archivo; borrarlo sólo pierde esa historia.
+
+### El uso por sesión
+
+En el mismo `metrics.db`, el daemon lleva una fila por cada sesión de Claude Code o de Cursor: cuándo empezó, cuándo fue su última actividad, cómo terminó, cuántos prompts tuvo, qué herramientas de clawg llamó (y cuántas fallaron), cuántas memorias guardó de cada tipo, cuántas búsquedas no encontraron nada y si cerró con un `session_summary`. Los hooks traen el id de la sesión; el puente le avisa al daemon cada herramienta que corre.
+
+```
+clawg metrics sessions                 # por proyecto, los últimos 30 días
+clawg metrics sessions --by agent      # por agente (--by day: por día)
+clawg metrics sessions --session <id>  # una sesión, fila por fila
+```
+
+Una sesión termina cuando el cliente lo avisa (salir, `/clear`, cerrar el chat), con su motivo, o después de 6 horas sin actividad, con motivo `idle` y con el fin en su última actividad. Una sesión cerrada no se reabre: si se la retoma, lo que sigue va en una fila nueva con el mismo id. El reporte nombra los proyectos por id (`clawg projects list` dice el nombre de cada uno) y lee el archivo con el daemon corriendo o parado; el daemon lo escribe una vez por minuto.
+
+Lo que se guarda de una sesión son tres ids (el de la sesión, el del agente y el del proyecto), horas y contadores. Nunca el texto de un prompt, de una consulta o de una memoria, ni una ruta, ni nada que identifique a la persona. Límites: con dos sesiones a la vez del mismo agente en el mismo proyecto, las llamadas y los saves cuentan para la última que habló; Cursor no avisa cada prompt, así que sus sesiones no los cuentan; y un cierre que el cliente no avisa (un proceso que muere, el equipo que se apaga) queda como `idle`. Con `CLAWG_METRICS=off` no se registra ninguna sesión.
+
+Para volver a una versión anterior de clawg: esa versión no abre un `metrics.db` de esta y deja de escribir métricas, sin afectar nada más. Con el daemon parado, apartá o borrá `metrics.db` y el próximo arranque crea uno nuevo. Tu memoria (`memory.db`) no cambia con esta versión. El detalle está en [`docs/reference/data-profiles.md`](docs/reference/data-profiles.md).
 
 ### Workspace
 

@@ -39,7 +39,7 @@ pub enum EmbedRole {
 
 impl EmbedRole {
     /// The role as a metric label names it.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             EmbedRole::Query => "query",
             EmbedRole::Passage => "passage",
@@ -175,14 +175,14 @@ fn cpu_provider() -> ort::ep::CPU {
 /// constant, because the query composer's budget
 /// (`memory::query_context::query_budget_tokens`) has to read the SAME number
 /// the embedder actually enforces.
-pub const EMBED_MAX_TOKENS: usize = 512;
+pub(crate) const EMBED_MAX_TOKENS: usize = 512;
 
 /// The most texts one inference run embeds. A run pads every text to the
 /// longest one, and its attention grows with texts × tokens², so the 248
 /// passages of one large source file at up to 512 tokens took gigabytes in a
 /// single run, which the process then kept. At 16 the peak stays in the
 /// hundreds of megabytes and indexing runs as fast as with one big batch.
-pub const EMBED_BATCH: usize = 16;
+pub(crate) const EMBED_BATCH: usize = 16;
 
 /// The indices of `tokens` from the largest count to the smallest, equal
 /// counts in the order they came.
@@ -197,7 +197,7 @@ pub(crate) fn longest_first(tokens: &[usize]) -> Vec<usize> {
 /// prefix/text boundary and tokenize slightly differently than summing
 /// `count(prefix) + count(text)` would predict. 4 covers both with room to
 /// spare.
-pub const SPECIAL_TOKEN_RESERVE: usize = 4;
+pub(crate) const SPECIAL_TOKEN_RESERVE: usize = 4;
 
 /// The single authority on how a role becomes a prefixed string. Pure: no
 /// I/O, no dependency on which embedder is active — the caller supplies the
@@ -450,7 +450,7 @@ pub(crate) struct EmbedRequest {
     pub(crate) queued: std::time::Instant,
 }
 
-pub struct E5Embedder {
+pub(crate) struct E5Embedder {
     req_tx: mpsc::UnboundedSender<EmbedRequest>,
     dimensions: usize,
     model_id: &'static str,
@@ -640,7 +640,7 @@ impl E5Embedder {
     /// route through the request channel; the session never crosses threads.
     ///
     /// Every batch is measured into `metrics`.
-    pub fn from_parts(
+    pub(crate) fn from_parts(
         onnx: &[u8],
         tokenizer: Arc<Tokenizer>,
         files: &TokenizerFiles,

@@ -44,7 +44,8 @@ pub fn export(memories: &[SeedMemory], agent: &str, root: &str, name: &str, now_
             memory_type: memory.memory_type.clone(),
             source: "explicit".into(),
             created_at,
-            created_by_type: "agent".into(),
+            // How `save_memory` stores an explicit memory with `user_stated`.
+            created_by_type: if memory.user_stated { "user" } else { "agent" }.into(),
             created_by_ref: String::new(),
             source_session_id: None,
             last_modified_at: created_at,
@@ -71,6 +72,15 @@ pub fn export(memories: &[SeedMemory], agent: &str, root: &str, name: &str, now_
         .iter()
         .map(|line| serde_json::to_string(line).expect("an export line serializes") + "\n")
         .collect()
+}
+
+/// The memories an arm with memory is seeded with: the noise and the task's,
+/// from the newest to the oldest and, at one age, the noise first, so that a
+/// task's own memory is not always in the same place.
+pub fn seeded(task: &[SeedMemory], noise: &[SeedMemory]) -> Vec<SeedMemory> {
+    let mut all: Vec<SeedMemory> = noise.iter().chain(task).cloned().collect();
+    all.sort_by_key(|m| m.age_days);
+    all
 }
 
 /// `memories` as a native memory file: one section per memory, its text whole.
@@ -104,7 +114,33 @@ mod tests {
             age_days,
             access_count,
             topic_key: Some("deploy/port".into()),
+            user_stated: false,
+            rule: None,
         }
+    }
+
+    #[test]
+    fn a_seeded_memory_the_person_stated_is_the_persons() {
+        let mut stated = memory("Name counters with _n", "user_preference", 30, 1);
+        stated.user_stated = true;
+        let text = export(&[stated, memory("Chose SQLite", "architectural_decision", 0, 1)], "claude-code", "/w", "f", 0);
+        let by: Vec<String> = text
+            .lines()
+            .filter_map(|l| match serde_json::from_str(l).unwrap() {
+                Line::Memory(m) => Some(m.created_by_type),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(by, ["user", "agent"]);
+    }
+
+    #[test]
+    fn the_seed_goes_from_the_newest_memory_to_the_oldest() {
+        let task = [memory("task old", "semantic_fact", 120, 1), memory("task new", "semantic_fact", 10, 1)];
+        let noise = [memory("noise mid", "semantic_fact", 60, 1), memory("noise new", "semantic_fact", 10, 1), memory("noise oldest", "semantic_fact", 200, 1)];
+        let order: Vec<String> = seeded(&task, &noise).into_iter().map(|m| m.content).collect();
+        assert_eq!(order, ["noise new", "task new", "noise mid", "task old", "noise oldest"], "at one age the noise goes first");
+        assert!(seeded(&[], &[]).is_empty());
     }
 
     #[test]

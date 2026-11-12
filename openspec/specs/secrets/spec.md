@@ -334,7 +334,7 @@ También MUST leer cada `workspaces/<agente>/<proyecto>/workspace.md` del direct
 
 ### R7. El `reason` de un veredicto se guarda enmascarado
 
-`judge_pair` (`crates/clawg-core/src/memory/dispute.rs:325`) MUST pasar el `reason`, ya recortado, por `redact` antes de guardarlo en `memory_conflict.reason` (`dispute.rs:338`): el par vive en `memory.db` y en cada snapshot, y lo llevaría un export. Un `reason` vacío después de recortarlo sigue siendo `None`.
+`judge_pair` (`crates/clawg-core/src/memory/dispute.rs:405`) MUST pasar el `reason`, ya recortado, por `redact` antes de guardarlo en `memory_conflict.reason` (`dispute.rs:418`): el par vive en `memory.db` y en cada snapshot, y lo llevaría un export. Un `reason` vacío después de recortarlo sigue siendo `None`.
 
 #### Escenario
 - GIVEN un par pendiente

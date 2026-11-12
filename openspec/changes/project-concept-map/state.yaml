@@ -1,5 +1,5 @@
-change: store-boundary
-objective: "transversal"
+change: project-concept-map
+objective: 3
 depends_on: []
 phase: explore
 artifacts:
@@ -11,4 +11,4 @@ artifacts:
   apply: pending
   verify: pending
   archive: pending
-updated: 2026-11-01
+updated: 2026-11-11

@@ -17,7 +17,7 @@ use crate::memory::portability::format::{
 };
 use crate::memory::merge::MAX_MERGE_HOPS;
 use crate::memory::registry::project_name;
-use crate::memory::MemoryError;
+use crate::memory::{MemoryError, StorageError};
 
 /// Which rows an export takes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -62,11 +62,17 @@ pub enum ExportError {
     #[error(transparent)]
     Store(#[from] MemoryError),
     #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Storage(StorageError),
     #[error("the store was written by a newer clawg (schema version {db}, this one knows up to {binary}); export it with that clawg")]
     Newer { db: i32, binary: i32 },
     #[error("the store's migration {0} differs from this clawg's, so it is not read")]
     Diverged(i32),
+}
+
+impl From<rusqlite::Error> for ExportError {
+    fn from(e: rusqlite::Error) -> Self {
+        ExportError::Storage(e.into())
+    }
 }
 
 /// Exports the rows of `<base_dir>/memory.db` that `filter` takes.
@@ -418,6 +424,12 @@ mod tests {
     use crate::memory::portability::fixtures::{other_project, project, seed, OTHER_ROOT};
     use crate::memory::portability::format::parse;
     use crate::memory::MemoryStore;
+
+    #[test]
+    fn a_sqlite_error_of_an_export_keeps_its_text() {
+        let failure = ExportError::from(rusqlite::Error::InvalidQuery);
+        assert_eq!(failure.to_string(), "sqlite error: Query is not read-only");
+    }
 
     async fn seeded_export(filter: ExportFilter) -> Export {
         let store = MemoryStore::new_for_test().await.unwrap();

@@ -69,12 +69,12 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new(agent_id: impl Into<String>, reach: Reach) -> Self {
+    pub(crate) fn new(agent_id: impl Into<String>, reach: Reach) -> Self {
         Self { agent_id: agent_id.into(), reach }
     }
 
     /// Whether this reader reaches a row `author` saved; `None` when no agent did.
-    pub fn admits(&self, author: Option<&str>) -> bool {
+    pub(crate) fn admits(&self, author: Option<&str>) -> bool {
         self.reach.admits(&self.agent_id, author)
     }
 }
@@ -91,6 +91,16 @@ pub fn reader_in(base_dir: &Path, agent_id: &str) -> Reader {
         }
     };
     Reader::new(agent_id, reach)
+}
+
+/// `agent_id` as the policy in `dir` lets it reach, read now, so a change to
+/// the policy counts from the next read on. With no directory, as for a
+/// store in memory no runtime placed, everything is shared.
+pub(crate) fn reader_from(dir: Option<&Path>, agent_id: &str) -> Reader {
+    match dir {
+        Some(dir) => reader_in(dir, agent_id),
+        None => Reader::new(agent_id, SharingPolicy::default().reach_for(agent_id)),
+    }
 }
 
 /// The file as written. `deny_unknown_fields` because a misspelled key
@@ -134,7 +144,7 @@ impl SharingPolicy {
         Ok(policy)
     }
 
-    pub fn to_json(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         let on_disk = OnDisk {
             version: VERSION,
             hides: self.hides.iter().map(|(r, a)| (r.clone(), a.iter().cloned().collect())).collect(),

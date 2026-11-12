@@ -48,7 +48,8 @@ const HOOK_TIMEOUT_SECS: u64 = 5;
 
 /// The client lifecycle events `clawg hook` answers, as the client names
 /// them and as `clawg hook` takes them.
-const HOOK_EVENTS: [(&str, &str); 2] = [("SessionStart", "session-start"), ("UserPromptSubmit", "user-prompt-submit")];
+const HOOK_EVENTS: [(&str, &str); 3] =
+    [("SessionStart", "session-start"), ("UserPromptSubmit", "user-prompt-submit"), ("SessionEnd", "session-end")];
 
 /// Copies of each file kept in `backups/setup`, the newest.
 const KEPT_COPIES: usize = 5;
@@ -1266,13 +1267,14 @@ mod tests {
             plan.server.add_args(),
             ["mcp", "add", "--scope", "user", "clawg-dev", "--", exe().to_str().unwrap(), "mcp", "--profile", "dev", "--agent", "claude-code"]
         );
-        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(plan.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
         let settings: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(
             settings,
             serde_json::json!({ "hooks": {
                 "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
-                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }]
+                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }],
+                "SessionEnd": [{ "hooks": [hook("session-end")] }]
             }})
         );
         assert_eq!(plan.block, BlockStep::Added);
@@ -1320,7 +1322,7 @@ mod tests {
         let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["theme", "hooks", "model"]);
         let events: Vec<&String> = value["hooks"].as_object().unwrap().keys().collect();
-        assert_eq!(events, ["UserPromptSubmit", "PreToolUse", "SessionStart"]);
+        assert_eq!(events, ["UserPromptSubmit", "PreToolUse", "SessionStart", "SessionEnd"]);
         let prompt = value["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(prompt[0]["hooks"][0]["command"], "~/bin/remind.sh");
         assert_eq!(prompt[1]["hooks"][0], hook("user-prompt-submit"));
@@ -1332,9 +1334,14 @@ mod tests {
         let settings = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"\"/old dir/clawg\" hook session-start --agent other --profile dev"}]}]}}"#;
         let plan = plan(&state(None, Some(settings), None), Mode::Install).unwrap();
         assert_eq!(plan.hooks.conflicts, [("SessionStart", "\"/old dir/clawg\" hook session-start --agent other --profile dev".to_string())]);
-        assert_eq!(plan.hooks.added, ["UserPromptSubmit"]);
+        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd"]);
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(value["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "the conflicting hook is not replaced");
+
+        let ended = shell_hook("/old/clawg hook session-end --agent other --profile dev");
+        let ended = super::plan(&state(None, Some(&settings_with(&[("SessionEnd", ended)])), None), Mode::Install).unwrap();
+        assert_eq!(ended.hooks.conflicts, [("SessionEnd", "/old/clawg hook session-end --agent other --profile dev".to_string())]);
+        assert_eq!(ended.hooks.added, ["SessionStart", "UserPromptSubmit"]);
 
         let moved = serde_json::json!({ "type": "command", "command": "/old/clawg",
             "args": ["hook", "session-start", "--agent", "claude-code", "--profile", "dev"] });
@@ -1353,7 +1360,7 @@ mod tests {
         let s = State { exe: PathBuf::from(exe), ..state(None, None, None) };
         let plan = plan(&s, Mode::Install).unwrap();
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
-        for (event, arg) in [("SessionStart", "session-start"), ("UserPromptSubmit", "user-prompt-submit")] {
+        for (event, arg) in [("SessionStart", "session-start"), ("UserPromptSubmit", "user-prompt-submit"), ("SessionEnd", "session-end")] {
             let hook = &value["hooks"][event][0]["hooks"][0];
             assert_eq!(hook["command"], exe, "the path as it is, unquoted");
             assert_eq!(hook["args"], serde_json::json!(["hook", arg, "--agent", "claude-code", "--profile", "dev"]));
@@ -1368,27 +1375,29 @@ mod tests {
             "UserPromptSubmit": [
                 { "hooks": [shell_hook(r#""/home/Ana María/clawg" hook user-prompt-submit --agent claude-code --profile dev"#)] },
                 { "hooks": [{ "type": "command", "command": "guard" }] }
-            ]
+            ],
+            "SessionEnd": [{ "hooks": [shell_hook("/old/clawg hook session-end --agent claude-code --profile dev")] }]
         }})
         .to_string();
         let first = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
-        assert_eq!(first.hooks.migrated, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(first.hooks.migrated, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
         assert!(first.hooks.added.is_empty() && first.hooks.conflicts.is_empty(), "{:?}", first.hooks);
         let value: Value = serde_json::from_str(written(&first.settings)).unwrap();
         assert_eq!(
             value,
             serde_json::json!({ "theme": "dark", "hooks": {
                 "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
-                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }, { "hooks": [{ "type": "command", "command": "guard" }] }]
+                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }, { "hooks": [{ "type": "command", "command": "guard" }] }],
+                "SessionEnd": [{ "hooks": [hook("session-end")] }]
             }})
         );
         let s = state(None, Some(&settings), None);
         let (text, code) = report(&first, &s, None);
         assert_eq!(code, 0, "{text}");
-        assert!(text.contains("would migrate SessionStart, UserPromptSubmit to run without a shell"), "{text}");
+        assert!(text.contains("would migrate SessionStart, UserPromptSubmit, SessionEnd to run without a shell"), "{text}");
 
         let second = plan(&state(None, after(Some(&settings), &first.settings).as_deref(), None), Mode::Install).unwrap();
-        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
         assert_eq!(second.settings, FileStep::Unchanged);
 
         let both = settings_with(&[
@@ -1397,6 +1406,7 @@ mod tests {
         ]);
         let plan = plan(&state(None, Some(&both), None), Mode::Install).unwrap();
         assert_eq!(plan.hooks.migrated, ["SessionStart"]);
+        assert_eq!(plan.hooks.added, ["UserPromptSubmit", "SessionEnd"]);
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(value["hooks"]["SessionStart"], serde_json::json!([{ "hooks": [hook("session-start")] }]), "it would run twice");
     }
@@ -1427,9 +1437,10 @@ mod tests {
             ("SessionStart", exec),
             ("SessionStart", foreign.clone()),
             ("UserPromptSubmit", shell_hook("clawg hook user-prompt-submit --agent a --profile dev")),
+            ("SessionEnd", hook("session-end")),
         ]);
         let plan = plan(&state(None, Some(&settings), None), Mode::Remove).unwrap();
-        assert_eq!(plan.hooks.removed, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(plan.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
         let value: Value = serde_json::from_str(written(&plan.settings)).unwrap();
         assert_eq!(value, serde_json::json!({ "hooks": { "SessionStart": [{ "hooks": [foreign] }] } }));
     }
@@ -1439,7 +1450,7 @@ mod tests {
         let prod = "clawg hook session-start --agent claude-code --profile prod";
         let settings = format!(r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"{prod}"}}]}}]}}}}"#);
         let plan_ = plan(&state(None, Some(&settings), None), Mode::Install).unwrap();
-        assert_eq!(plan_.hooks.added, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(plan_.hooks.added, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
         let removing = plan(&state(None, Some(&settings), None), Mode::Remove).unwrap();
         assert_eq!(removing.settings, FileStep::Unchanged, "the prod hook stays");
     }
@@ -1464,7 +1475,7 @@ mod tests {
         assert_eq!(code, 0);
         for needed in [
             "servidor mcp clawg-dev: se registraría (claude mcp add --scope user clawg-dev -- ",
-            ": se agregarían SessionStart, UserPromptSubmit",
+            ": se agregarían SessionStart, UserPromptSubmit, SessionEnd",
             "protocolo de memoria en ",
             ": se actualizaría",
         ] {
@@ -1480,7 +1491,7 @@ mod tests {
         assert_eq!(code, 1, "the manual command is not done");
         for needed in [
             "servidor mcp clawg-dev: claude no está en el PATH; regístralo con:\n  claude mcp add --scope user clawg-dev -- ",
-            ": agregados SessionStart, UserPromptSubmit",
+            ": agregados SessionStart, UserPromptSubmit, SessionEnd",
             ": actualizado",
             "archivo anterior copiado a /b/settings.json.1",
             "copia más vieja borrada: /b/settings.json.0",
@@ -1563,11 +1574,40 @@ mod tests {
         );
         let second = plan(&s, Mode::Install).unwrap();
         assert_eq!(second.server_step, ServerStep::Unchanged);
-        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit"]);
+        assert_eq!(second.hooks.unchanged, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
         assert_eq!((&second.settings, &second.instructions), (&FileStep::Unchanged, &FileStep::Unchanged));
         let (text, code) = report(&second, &s, Some(&Applied { server: ServerOutcome::NotRun, backups: vec![], pruned: vec![], failures: vec![] }));
         assert_eq!(code, 0);
         assert!(!text.contains("Open a new"), "{text}");
+    }
+
+    #[test]
+    fn a_run_over_an_install_without_the_session_end_hook_adds_only_it() {
+        let earlier = settings_text(
+            serde_json::json!({ "theme": "dark", "hooks": {
+                "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [hook("session-start")] }],
+                "UserPromptSubmit": [{ "hooks": [hook("user-prompt-submit")] }]
+            }})
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let s = state(Some(&planned_server_json()), Some(&earlier), None);
+        let plan = plan(&s, Mode::Install).unwrap();
+        assert_eq!(plan.hooks.added, ["SessionEnd"]);
+        assert_eq!(plan.hooks.unchanged, ["SessionStart", "UserPromptSubmit"]);
+        assert!(plan.hooks.migrated.is_empty() && plan.hooks.conflicts.is_empty(), "{:?}", plan.hooks);
+
+        let text = written(&plan.settings);
+        let kept = earlier.strip_suffix("\n  }\n}\n").expect("the end of the hooks and of the file");
+        let added = text.strip_prefix(kept).unwrap_or_else(|| panic!("what was there is as it was, byte for byte:\n{text}"));
+        let value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["hooks"]["SessionEnd"], serde_json::json!([{ "hooks": [hook("session-end")] }]), "no matcher");
+        assert!(added.starts_with(",\n    \"SessionEnd\": ["), "{added}");
+
+        let (report, code) = report(&plan, &s, None);
+        assert_eq!(code, 0, "{report}");
+        assert!(report.contains("would add SessionEnd; SessionStart, UserPromptSubmit already there"), "{report}");
     }
 
     #[test]
@@ -1581,7 +1621,7 @@ mod tests {
         let (text, code) = run_in(s, Mode::Install, true, Some(Path::new("/nonexistent/claude")), dir.path(), 0).unwrap();
         assert_eq!(code, 0);
         assert!(text.contains("would register it"), "{text}");
-        assert!(text.contains("would add SessionStart, UserPromptSubmit"), "{text}");
+        assert!(text.contains("would add SessionStart, UserPromptSubmit, SessionEnd"), "{text}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
@@ -1611,7 +1651,7 @@ mod tests {
             );
             let removed = plan(&s, Mode::Remove).unwrap();
             assert_eq!(removed.server_step, ServerStep::Remove);
-            assert_eq!(removed.hooks.removed, ["SessionStart", "UserPromptSubmit"]);
+            assert_eq!(removed.hooks.removed, ["SessionStart", "UserPromptSubmit", "SessionEnd"]);
             let settings_back = after(s.settings.text.as_deref(), &removed.settings);
             let expected_settings = match settings {
                 None | Some("{}") => Some("{}\n".to_string()),

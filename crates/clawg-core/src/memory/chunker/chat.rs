@@ -9,6 +9,7 @@
 //! No Markdown awareness: splitting by heading is the documentation index's
 //! job (`memory::project_docs::chunk`), not a chat turn's.
 
+#[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,6 +32,7 @@ pub struct ChatChunker {
 }
 
 enum Source {
+    #[cfg(any(test, feature = "eval"))]
     Fixed(TokenSplitter),
     /// Read on every call: the worker's chunker is built before a new
     /// install's first model download lands, and a splitter fixed at that
@@ -52,7 +54,8 @@ impl ChatChunker {
     /// `new_from_base_dir` so a caller that already loaded (or shares) a
     /// tokenizer via `model_download::load_tokenizer` never pays for a
     /// second parse of the same ~17 MB file.
-    pub fn from_tokenizer(tokenizer: Option<Arc<tokenizers::Tokenizer>>) -> Self {
+    #[cfg(any(test, feature = "eval"))]
+    pub(crate) fn from_tokenizer(tokenizer: Option<Arc<tokenizers::Tokenizer>>) -> Self {
         match tokenizer {
             Some(tok) => Self { source: Source::Fixed(TokenSplitter::with_tokenizer(tok)) },
             None => Self { source: Source::Fixed(TokenSplitter::fallback()) },
@@ -67,6 +70,7 @@ impl ChatChunker {
 
     fn splitter(&self) -> TokenSplitter {
         match &self.source {
+            #[cfg(any(test, feature = "eval"))]
             Source::Fixed(splitter) => splitter.clone(),
             Source::Cell(cell) => match cell.get() {
                 Some(tok) => TokenSplitter::with_tokenizer(tok.clone()),
@@ -79,19 +83,20 @@ impl ChatChunker {
     /// Falls back to the byte-length splitter if the file is absent — the
     /// tokenizer download can fail or still be in flight, and chunking must
     /// keep working (with a coarser cap estimate) rather than block ingestion.
-    pub fn new_from_base_dir(base_dir: &Path) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_from_base_dir(base_dir: &Path) -> Self {
         Self::from_tokenizer(crate::memory::model_download::load_tokenizer(base_dir))
     }
 
     /// Test-only — pre-wired tokenizer.
     #[cfg(test)]
-    pub fn with_tokenizer(tok: Arc<tokenizers::Tokenizer>) -> Self {
+    pub(crate) fn with_tokenizer(tok: Arc<tokenizers::Tokenizer>) -> Self {
         Self { source: Source::Fixed(TokenSplitter::with_tokenizer(tok)) }
     }
 
     /// Test-only — force fallback path.
     #[cfg(test)]
-    pub fn with_fallback() -> Self {
+    pub(crate) fn with_fallback() -> Self {
         Self { source: Source::Fixed(TokenSplitter::fallback()) }
     }
 
@@ -99,7 +104,8 @@ impl ChatChunker {
     /// the caller (worker) invokes this once per `MemoryEvent`. Adjacent
     /// chunks share `CHUNK_OVERLAP_TOKENS` tokens so a fact that would
     /// otherwise straddle a hard cut stays whole in at least one of them.
-    pub fn chunk(&self, content: &str, max_tokens: usize) -> Vec<Chunk> {
+    #[cfg(any(test, feature = "eval"))]
+    pub(crate) fn chunk(&self, content: &str, max_tokens: usize) -> Vec<Chunk> {
         chunk_with(&self.splitter(), content, max_tokens)
     }
 
@@ -111,7 +117,7 @@ impl ChatChunker {
     ///
     /// One splitter cuts all three, so a tokenizer that loads in between
     /// cannot leave a head cut by bytes over pieces cut by tokens.
-    pub fn split_save(&self, content: &str) -> SaveSplit {
+    pub(crate) fn split_save(&self, content: &str) -> SaveSplit {
         let splitter = self.splitter();
         let whole = chunk_with(&splitter, content, CHUNK_MAX_TOKENS);
         if whole.len() <= 1 {

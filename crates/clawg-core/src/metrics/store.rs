@@ -6,17 +6,20 @@
 //! is set aside and started again instead of stopping the daemon.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 
 use super::histogram::{Histogram, Unit};
 use super::event::{Event, EventRow};
 use super::recorder::{Gauge, SeriesKey, Window};
+use super::sessions::{CountKind, Pending, ProjectChange, SessionRow, IDLE, IDLE_CLOSE_MS};
 
 pub const METRICS_FILE: &str = "metrics.db";
 
-/// 2 added `event`, which a file of 1 gets when it is opened to write.
-const SCHEMA_VERSION: i64 = 2;
+/// 2 added `event` and 3 the sessions, which an older file gets when it is
+/// opened to write.
+const SCHEMA_VERSION: i64 = 3;
 
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MINUTES: i64 = 60;
@@ -25,8 +28,14 @@ const DAY_MS: i64 = 86_400_000;
 /// How long the minutes are kept before they fold into their hour.
 pub const MINUTES_KEPT_MS: i64 = 14 * DAY_MS;
 
-/// How long the hours, and the runs left without any, are kept.
+/// How long the hours, the events, the sessions and the runs left without
+/// any are kept.
 pub const HOURS_KEPT_MS: i64 = 400 * DAY_MS;
+
+/// How long a reader waits for a journal its writer is removing, and how
+/// often it looks again.
+const JOURNAL_WAIT: Duration = Duration::from_secs(5);
+const JOURNAL_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetricsError {
@@ -90,6 +99,7 @@ pub struct Pruned {
     pub folded_minutes: usize,
     pub dropped_hours: usize,
     pub dropped_events: usize,
+    pub dropped_sessions: usize,
     pub dropped_runs: usize,
 }
 
@@ -148,9 +158,31 @@ impl MetricsDb {
     }
 
     /// Opens `path` to read, without creating or changing anything.
+    ///
+    /// A journal beside the file is its writer's to remove or to roll back,
+    /// and a reader that finds one is refused. The writer deletes it as it
+    /// commits, but on Windows the delete reaches the directory only when
+    /// the last handle on the journal closes, so a report asked for right
+    /// after `clawg stop` can still see it: the reader waits for it to go.
     pub fn open_read_only(path: &Path) -> Result<Self, MetricsError> {
+        Self::open_read_only_within(path, JOURNAL_WAIT)
+    }
+
+    fn open_read_only_within(path: &Path, wait: Duration) -> Result<Self, MetricsError> {
+        let deadline = Instant::now() + wait;
+        loop {
+            match Self::open_reader(path) {
+                Err(MetricsError::Sqlite(e)) if e.sqlite_error_code() == Some(ErrorCode::ReadOnly) && Instant::now() < deadline => {
+                    std::thread::sleep(JOURNAL_POLL);
+                }
+                opened => return opened,
+            }
+        }
+    }
+
+    fn open_reader(path: &Path) -> Result<Self, MetricsError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(MetricsError::Newer(version));
@@ -161,7 +193,7 @@ impl MetricsDb {
     fn open_writable(path: &Path) -> Result<Self, MetricsError> {
         create_private(path)?;
         let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(MetricsError::Newer(version));
@@ -252,9 +284,136 @@ impl MetricsDb {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Applies the project changes of `pending` to the stored sessions, then
+    /// writes each of its rows whole over what the file had of it.
+    pub fn write_sessions(&mut self, pending: &Pending) -> Result<(), MetricsError> {
+        if pending.changes.is_empty() && pending.rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        for change in &pending.changes {
+            match change {
+                ProjectChange::Merged { from, into } => {
+                    tx.execute("UPDATE session SET project_id = ?2 WHERE project_id = ?1", params![from, into])?;
+                }
+                ProjectChange::Deleted(project_id) => {
+                    tx.execute(
+                        "DELETE FROM session_count WHERE EXISTS (SELECT 1 FROM session s WHERE s.session_id = session_count.session_id \
+                         AND s.started_at_ms = session_count.started_at_ms AND s.project_id = ?1)",
+                        [project_id],
+                    )?;
+                    tx.execute("DELETE FROM session WHERE project_id = ?1", [project_id])?;
+                }
+            }
+        }
+        for row in &pending.rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO session (session_id, started_at_ms, agent_id, project_id, client, utc_offset_s, \
+                 last_seen_at_ms, last_save_at_ms, ended_at_ms, end_reason, prompts, empty_searches) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    row.session_id,
+                    row.started_at_ms,
+                    row.agent_id,
+                    row.project_id,
+                    row.client,
+                    row.utc_offset_s,
+                    row.last_seen_at_ms,
+                    row.last_save_at_ms,
+                    row.ended_at_ms,
+                    row.end_reason,
+                    row.prompts as i64,
+                    row.empty_searches as i64
+                ],
+            )?;
+            tx.execute("DELETE FROM session_count WHERE session_id = ?1 AND started_at_ms = ?2", params![row.session_id, row.started_at_ms])?;
+            for ((kind, name), count) in &row.counts {
+                tx.execute(
+                    "INSERT INTO session_count (session_id, started_at_ms, kind, name, count) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![row.session_id, row.started_at_ms, kind.as_str(), name, *count as i64],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Closes as idle, at its last event, every stored session left open
+    /// that went [`IDLE_CLOSE_MS`] without one before `now_ms`.
+    pub fn close_idle_sessions(&mut self, now_ms: i64) -> Result<usize, MetricsError> {
+        Ok(self.conn.execute(
+            "UPDATE session SET ended_at_ms = last_seen_at_ms, end_reason = ?2 WHERE ended_at_ms IS NULL AND last_seen_at_ms <= ?1",
+            params![now_ms - IDLE_CLOSE_MS, IDLE],
+        )?)
+    }
+
+    /// The sessions stored without an end, oldest first.
+    pub fn open_sessions(&self) -> Result<Vec<SessionRow>, MetricsError> {
+        self.sessions_where("ended_at_ms IS NULL", &[])
+    }
+
+    /// The sessions last heard of at `since_ms` or later, oldest first. A
+    /// file from before the sessions has none.
+    pub fn sessions_since(&self, since_ms: i64) -> Result<Vec<SessionRow>, MetricsError> {
+        self.sessions_where("last_seen_at_ms >= ?1", &[&since_ms])
+    }
+
+    /// Every row of the session the client calls `session_id`, oldest first.
+    pub fn sessions_of(&self, session_id: &str) -> Result<Vec<SessionRow>, MetricsError> {
+        self.sessions_where("session_id = ?1", &[&session_id])
+    }
+
+    fn sessions_where(&self, filter: &str, values: &[&dyn rusqlite::ToSql]) -> Result<Vec<SessionRow>, MetricsError> {
+        let has_sessions: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_sessions {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT session_id, started_at_ms, agent_id, project_id, client, utc_offset_s, last_seen_at_ms, last_save_at_ms, \
+             ended_at_ms, end_reason, prompts, empty_searches FROM session WHERE {filter} ORDER BY started_at_ms, session_id"
+        ))?;
+        let rows = stmt.query_map(values, |r| {
+            Ok(SessionRow {
+                session_id: r.get(0)?,
+                started_at_ms: r.get(1)?,
+                agent_id: r.get(2)?,
+                project_id: r.get(3)?,
+                client: r.get(4)?,
+                utc_offset_s: r.get(5)?,
+                last_seen_at_ms: r.get(6)?,
+                last_save_at_ms: r.get(7)?,
+                ended_at_ms: r.get(8)?,
+                end_reason: r.get(9)?,
+                prompts: r.get::<_, i64>(10)? as u64,
+                empty_searches: r.get::<_, i64>(11)? as u64,
+                counts: Default::default(),
+            })
+        })?;
+        let mut rows = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut counts = self.conn.prepare("SELECT kind, name, count FROM session_count WHERE session_id = ?1 AND started_at_ms = ?2")?;
+        for row in &mut rows {
+            let stored = counts.query_map(params![row.session_id, row.started_at_ms], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            for count in stored {
+                let (kind, name, count) = count?;
+                // A kind a later clawg wrote is one this one does not report.
+                if let Some(kind) = CountKind::parse(&kind) {
+                    row.counts.insert((kind, name), count as u64);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     /// Folds the minutes older than [`MINUTES_KEPT_MS`] into their hour and
-    /// drops the hours and the events older than [`HOURS_KEPT_MS`], with the
-    /// runs that have nothing left, in one transaction.
+    /// drops the hours, the events and the sessions older than
+    /// [`HOURS_KEPT_MS`], with the runs that have nothing left, in one
+    /// transaction.
     pub fn prune(&mut self, now_ms: i64) -> Result<Pruned, MetricsError> {
         let minute_cut = (now_ms - MINUTES_KEPT_MS).div_euclid(MINUTE_MS);
         let hour_cut = (now_ms - HOURS_KEPT_MS).div_euclid(MINUTE_MS * HOUR_MINUTES);
@@ -274,6 +433,13 @@ impl MetricsDb {
         let dropped_hours = tx.execute("DELETE FROM hist_hour WHERE hour < ?1", [hour_cut])?
             + tx.execute("DELETE FROM gauge_hour WHERE hour < ?1", [hour_cut])?;
         let dropped_events = tx.execute("DELETE FROM event WHERE at_ms < ?1", [now_ms - HOURS_KEPT_MS])?;
+        let session_cut = now_ms - HOURS_KEPT_MS;
+        tx.execute(
+            "DELETE FROM session_count WHERE EXISTS (SELECT 1 FROM session s WHERE s.session_id = session_count.session_id \
+             AND s.started_at_ms = session_count.started_at_ms AND s.last_seen_at_ms < ?1)",
+            [session_cut],
+        )?;
+        let dropped_sessions = tx.execute("DELETE FROM session WHERE last_seen_at_ms < ?1", [session_cut])?;
         let dropped_runs = tx.execute(
             "DELETE FROM run WHERE started_at_ms < ?1 \
              AND id NOT IN (SELECT run_id FROM hist_minute UNION SELECT run_id FROM hist_hour \
@@ -282,7 +448,7 @@ impl MetricsDb {
             [now_ms - HOURS_KEPT_MS],
         )?;
         tx.commit()?;
-        Ok(Pruned { folded_minutes: folded, dropped_hours, dropped_events, dropped_runs })
+        Ok(Pruned { folded_minutes: folded, dropped_hours, dropped_events, dropped_sessions, dropped_runs })
     }
 
     /// The runs that started at `since_ms` or later, or that have rows from
@@ -420,6 +586,19 @@ CREATE TABLE IF NOT EXISTS gauge_hour (
 CREATE TABLE IF NOT EXISTS event (
     run_id INTEGER NOT NULL, at_ms INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS session (
+    session_id TEXT NOT NULL, started_at_ms INTEGER NOT NULL, agent_id TEXT NOT NULL, project_id TEXT,
+    client TEXT NOT NULL, utc_offset_s INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL,
+    last_save_at_ms INTEGER, ended_at_ms INTEGER, end_reason TEXT, prompts INTEGER NOT NULL,
+    empty_searches INTEGER NOT NULL,
+    PRIMARY KEY (session_id, started_at_ms)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS session_count (
+    session_id TEXT NOT NULL, started_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
+    count INTEGER NOT NULL,
+    PRIMARY KEY (session_id, started_at_ms, kind, name)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS session_by_last_seen ON session (last_seen_at_ms);
 CREATE INDEX IF NOT EXISTS event_by_time ON event (at_ms);
 CREATE INDEX IF NOT EXISTS hist_minute_by_name ON hist_minute (name, minute);
 CREATE INDEX IF NOT EXISTS gauge_minute_by_name ON gauge_minute (name, minute);
@@ -658,6 +837,46 @@ mod tests {
         assert_eq!(runs[1].version, "0.49.0");
     }
 
+    /// Leaves beside `path` the journal of a transaction that already
+    /// committed: what a reader finds when the writer's delete of it has not
+    /// reached the directory yet, as a Windows scanner holding the file does.
+    fn leave_a_journal(path: &Path) -> PathBuf {
+        let journal = PathBuf::from(format!("{}-journal", path.display()));
+        let kept = journal.with_extension("kept");
+        let writer = Connection::open(path).unwrap();
+        // A cache of one page spills to the file, which syncs the journal's header first.
+        writer.execute_batch("PRAGMA cache_size = 1; CREATE TABLE filler (text TEXT); BEGIN;").unwrap();
+        for _ in 0..200 {
+            writer.execute("INSERT INTO filler (text) VALUES (?1)", ["x".repeat(2_000)]).unwrap();
+        }
+        std::fs::copy(&journal, &kept).unwrap();
+        writer.execute_batch("COMMIT").unwrap();
+        drop(writer);
+        std::fs::rename(&kept, &journal).unwrap();
+        journal
+    }
+
+    #[test]
+    fn a_reader_waits_for_a_journal_its_writer_is_removing() {
+        let dir = crate::test_dir::test_dir();
+        let path = dir.path().join(METRICS_FILE);
+        let mut db = MetricsDb::open(&path, NOW).unwrap();
+        db.start_run(&run_info(NOW)).unwrap();
+        drop(db);
+        let journal = leave_a_journal(&path);
+
+        let stays = MetricsDb::open_read_only_within(&path, Duration::from_millis(50)).err().expect("a reader cannot roll a journal back");
+        assert_eq!(stays.to_string(), "attempt to write a readonly database");
+
+        let removal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            std::fs::remove_file(journal).unwrap();
+        });
+        let db = MetricsDb::open_read_only_within(&path, Duration::from_secs(10)).expect("the journal went away within the wait");
+        removal.join().unwrap();
+        assert_eq!(db.runs_since(NOW - 1).unwrap().len(), 1);
+    }
+
     #[test]
     fn a_minute_is_written_with_its_series() {
         let dir = crate::test_dir::test_dir();
@@ -793,7 +1012,7 @@ PRAGMA user_version = 1;
 
         let mut db = MetricsDb::open(&path, NOW).unwrap();
         let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(db.runs_since(0).unwrap().len(), 1, "its runs stay");
         assert_eq!(db.gauge_rows_since("process.rss_bytes", 0).unwrap()[0].gauge.last, 7.0, "its minutes stay");
 
@@ -809,6 +1028,173 @@ PRAGMA user_version = 1;
         assert_eq!(events[0].run_id, run);
         assert_eq!(events[0].detail, serde_json::json!({ "ms": 40, "reason": "manual" }));
         assert_eq!(db.events_since(NOW + 1).unwrap().len(), 1);
+    }
+
+    /// The tables of schema 2 as clawg wrote them before the sessions.
+    fn schema_2() -> String {
+        let events = "CREATE TABLE event (run_id INTEGER NOT NULL, at_ms INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL);
+CREATE INDEX event_by_time ON event (at_ms);
+CREATE INDEX hist_minute_by_name ON hist_minute (name, minute);
+CREATE INDEX gauge_minute_by_name ON gauge_minute (name, minute);
+PRAGMA user_version = 2;";
+        format!("{}{events}", SCHEMA_1.replace("PRAGMA user_version = 1;", ""))
+    }
+
+    fn session(session_id: &str, project_id: Option<&str>, started_at_ms: i64, last_seen_at_ms: i64) -> SessionRow {
+        SessionRow {
+            session_id: session_id.into(),
+            started_at_ms,
+            agent_id: "agent".into(),
+            project_id: project_id.map(String::from),
+            client: "claude-code".into(),
+            utc_offset_s: -10_800,
+            last_seen_at_ms,
+            last_save_at_ms: None,
+            ended_at_ms: None,
+            end_reason: None,
+            prompts: 0,
+            empty_searches: 0,
+            counts: Default::default(),
+        }
+    }
+
+    fn rows(rows: Vec<SessionRow>) -> Pending {
+        Pending { changes: Vec::new(), rows }
+    }
+
+    /// Every row of `table`, each column as text, in the file's order.
+    fn dump(conn: &Connection, table: &str) -> Vec<Vec<String>> {
+        let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        let columns = stmt.column_count();
+        let rows = stmt.query_map([], |r| (0..columns).map(|i| r.get_ref(i).map(|v| format!("{v:?}"))).collect::<Result<Vec<_>, _>>());
+        rows.unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn a_file_of_schema_2_gets_its_sessions_and_keeps_its_rows() {
+        let dir = crate::test_dir::test_dir();
+        let path = dir.path().join(METRICS_FILE);
+        const KEPT: [&str; 3] = ["run", "gauge_minute", "event"];
+        let before = {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(&schema_2()).unwrap();
+            c.execute(
+                "INSERT INTO run (id, started_at_ms, stopped_at_ms, version, profile, os, arch, cpus, embedding_model, utc_offset_s) \
+                 VALUES (1, ?1, ?1, '0.80.0', 'dev', 'linux', 'x86_64', 8, 'm', 0)",
+                [NOW],
+            )
+            .unwrap();
+            c.execute("INSERT INTO gauge_minute VALUES (1, ?1, 'process.rss_bytes', '', 1, 7.0, 7.0, 7.0, 7.0)", [NOW.div_euclid(MINUTE_MS)])
+                .unwrap();
+            c.execute("INSERT INTO event VALUES (1, ?1, 'backup', '{\"ms\":40}')", [NOW]).unwrap();
+            KEPT.map(|table| dump(&c, table))
+        };
+
+        let read = MetricsDb::open_read_only(&path).unwrap();
+        assert!(read.sessions_since(0).unwrap().is_empty(), "a file of schema 2 reads as one without sessions");
+        assert!(read.sessions_of("s").unwrap().is_empty());
+        assert_eq!(read.events_since(0).unwrap().len(), 1);
+        let version: i64 = read.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 2, "reading changes nothing");
+        drop(read);
+
+        let mut db = MetricsDb::open(&path, NOW).unwrap();
+        let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 3);
+        assert_eq!(KEPT.map(|table| dump(&db.conn, table)), before, "every row it had is as it was");
+        assert_eq!(db.runs_since(0).unwrap().len(), 1);
+        assert_eq!(db.gauge_rows_since("process.rss_bytes", 0).unwrap()[0].gauge.last, 7.0);
+
+        db.write_sessions(&rows(vec![session("s", Some("p"), NOW, NOW)])).unwrap();
+        assert_eq!(db.sessions_of("s").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sessions_are_written_whole_and_read_back() {
+        let dir = crate::test_dir::test_dir();
+        let path = dir.path().join(METRICS_FILE);
+        let mut db = MetricsDb::open(&path, NOW).unwrap();
+        let mut first = session("s", Some("p"), NOW, NOW + 5);
+        first.prompts = 2;
+        first.counts.insert((CountKind::Call, "search_memory".into()), 3);
+        first.counts.insert((CountKind::Start, "startup".into()), 1);
+        let other = session("t", None, NOW + 1, NOW + 1);
+        db.write_sessions(&rows(vec![first.clone(), other.clone()])).unwrap();
+
+        first.last_seen_at_ms = NOW + 9;
+        first.last_save_at_ms = Some(NOW + 9);
+        first.empty_searches = 1;
+        first.counts.remove(&(CountKind::Start, "startup".into()));
+        first.counts.insert((CountKind::Save, "session_summary".into()), 1);
+        first.ended_at_ms = Some(NOW + 9);
+        first.end_reason = Some("clear".into());
+        let again = session("s", Some("p"), NOW + 10, NOW + 10);
+        db.write_sessions(&rows(vec![first.clone(), again.clone()])).unwrap();
+        drop(db);
+
+        let db = MetricsDb::open_read_only(&path).unwrap();
+        assert_eq!(db.sessions_of("s").unwrap(), [first.clone(), again.clone()], "a second write replaces the row, counts included");
+        assert_eq!(db.sessions_since(NOW + 2).unwrap(), [first, again.clone()]);
+        assert_eq!(db.open_sessions().unwrap(), [other, again]);
+    }
+
+    #[test]
+    fn open_sessions_past_six_hours_are_closed_on_start() {
+        let dir = crate::test_dir::test_dir();
+        let mut db = MetricsDb::open(&dir.path().join(METRICS_FILE), NOW).unwrap();
+        let mut ended = session("ended", None, NOW - 9 * 3_600_000, NOW - 8 * 3_600_000);
+        ended.ended_at_ms = Some(NOW - 7 * 3_600_000);
+        ended.end_reason = Some("logout".into());
+        let stale = session("stale", None, NOW - 9 * 3_600_000, NOW - IDLE_CLOSE_MS);
+        let fresh = session("fresh", None, NOW - 9 * 3_600_000, NOW - IDLE_CLOSE_MS + 1);
+        db.write_sessions(&rows(vec![ended.clone(), stale, fresh.clone()])).unwrap();
+
+        assert_eq!(db.close_idle_sessions(NOW).unwrap(), 1);
+
+        assert_eq!(db.open_sessions().unwrap(), [fresh]);
+        let stale = &db.sessions_of("stale").unwrap()[0];
+        assert_eq!((stale.ended_at_ms, stale.end_reason.as_deref()), (Some(NOW - IDLE_CLOSE_MS), Some("idle")));
+        assert_eq!(db.sessions_of("ended").unwrap(), [ended], "a session a client ended keeps its end");
+    }
+
+    #[test]
+    fn sessions_past_the_retention_are_dropped() {
+        let dir = crate::test_dir::test_dir();
+        let mut db = MetricsDb::open(&dir.path().join(METRICS_FILE), NOW).unwrap();
+        let ancient = NOW - HOURS_KEPT_MS - DAY_MS;
+        let mut gone = session("gone", Some("p"), ancient, ancient);
+        gone.counts.insert((CountKind::Call, "search_memory".into()), 1);
+        let mut kept = session("kept", Some("p"), ancient, NOW);
+        kept.counts.insert((CountKind::Call, "search_memory".into()), 2);
+        db.write_sessions(&rows(vec![gone, kept.clone()])).unwrap();
+
+        let pruned = db.prune(NOW).unwrap();
+
+        assert_eq!(pruned.dropped_sessions, 1);
+        assert_eq!(db.sessions_since(0).unwrap(), [kept], "a session heard of since stays, however old its start");
+        let counts: i64 = db.conn.query_row("SELECT COUNT(*) FROM session_count", [], |r| r.get(0)).unwrap();
+        assert_eq!(counts, 1, "the counts go with their session");
+    }
+
+    #[test]
+    fn project_changes_reach_the_stored_sessions() {
+        let dir = crate::test_dir::test_dir();
+        let mut db = MetricsDb::open(&dir.path().join(METRICS_FILE), NOW).unwrap();
+        let mut old = session("old", Some("old"), NOW, NOW);
+        old.counts.insert((CountKind::Call, "search_memory".into()), 1);
+        let mut doomed = session("doomed", Some("doomed"), NOW + 1, NOW + 1);
+        doomed.counts.insert((CountKind::Save, "semantic_fact".into()), 1);
+        let none = session("none", None, NOW + 2, NOW + 2);
+        db.write_sessions(&rows(vec![old.clone(), doomed, none.clone()])).unwrap();
+
+        let fresh = session("fresh", Some("new"), NOW + 3, NOW + 3);
+        let changes = vec![ProjectChange::Merged { from: "old".into(), into: "new".into() }, ProjectChange::Deleted("doomed".into())];
+        db.write_sessions(&Pending { changes, rows: vec![fresh.clone()] }).unwrap();
+
+        old.project_id = Some("new".into());
+        assert_eq!(db.sessions_since(0).unwrap(), [old, none, fresh]);
+        let counts: i64 = db.conn.query_row("SELECT COUNT(*) FROM session_count", [], |r| r.get(0)).unwrap();
+        assert_eq!(counts, 1, "the counts of a deleted project's sessions go with them");
     }
 
     #[test]

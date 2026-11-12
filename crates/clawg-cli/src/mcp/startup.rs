@@ -93,6 +93,18 @@ impl ClientHandle {
         }
     }
 
+    /// The client there is now, without waiting for a start that has not
+    /// finished.
+    pub fn peek(&self) -> Option<DaemonClient> {
+        if let Some(client) = self.current.lock().expect("current lock").clone() {
+            return Some(client);
+        }
+        match &*self.rx.borrow() {
+            Startup::Ready(client) => Some(client.clone()),
+            Startup::Starting | Startup::Failed(_) => None,
+        }
+    }
+
     /// Looks the daemon up again from `daemon.json` and `token` and, when one
     /// answers, makes it the client of every later call.
     ///

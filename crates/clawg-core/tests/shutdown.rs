@@ -48,7 +48,7 @@ fn start(runtime: &MemoryRuntime, rx: Receiver<IngestRequest>) -> Workers {
 
 async fn stored_contents(store: &MemoryStore) -> Vec<String> {
     store
-        .conn
+        .conn_for_test()
         .call(|c| -> Result<Vec<String>, rusqlite::Error> {
             let mut stmt = c.prepare(
                 "SELECT content FROM memory WHERE agent_id = 'agent-shutdown' ORDER BY id",
@@ -62,7 +62,7 @@ async fn stored_contents(store: &MemoryStore) -> Vec<String> {
 
 async fn outbox_contents(store: &MemoryStore) -> Vec<String> {
     store
-        .conn
+        .conn_for_test()
         .call(|c| -> Result<Vec<String>, rusqlite::Error> {
             let mut stmt = c.prepare("SELECT content FROM ingest_outbox WHERE state = 'pending' ORDER BY id")?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -280,7 +280,7 @@ async fn a_save_accepted_while_the_model_loads_survives_a_process_that_dies() {
     let rows = wait_for_rows(&runtime.store, 1).await;
     runtime.shutdown(workers).await;
     let pending = outbox_contents(&runtime.store).await;
-    runtime.close().await;
+    runtime.close().await.expect("the store closes");
 
     assert_eq!(rows, vec!["accepted before the process died"]);
     assert!(pending.is_empty());
@@ -302,7 +302,7 @@ async fn closing_after_the_shutdown_leaves_no_wal_beside_the_store() {
     assert_eq!(wait_for_rows(&runtime.store, 1).await.len(), 1);
 
     assert!(runtime.shutdown(workers).await, "the shutdown finished within its bound");
-    runtime.close().await;
+    runtime.close().await.expect("the store closes");
 
     for name in ["memory.db-wal", "memory.db-shm"] {
         assert!(!tmp.path().join(name).exists(), "{name} is left beside the store");
@@ -329,7 +329,7 @@ async fn shutdown_checkpoints_the_wal_into_memory_db() {
     std::fs::copy(tmp.path().join("memory.db"), &copy).unwrap();
     // Read before the close, which folds the WAL by itself: this test is about
     // what the shutdown did.
-    runtime.close().await;
+    runtime.close().await.expect("the store closes");
 
     assert_eq!(wal_len, 0, "the WAL must be folded into memory.db");
     let conn = rusqlite::Connection::open(&copy).unwrap();

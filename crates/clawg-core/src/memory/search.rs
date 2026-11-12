@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::pieces::SaveLink;
 use crate::memory::provenance::preference_mark;
@@ -252,9 +253,9 @@ fn serialize_f32_query(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Public test helper — exposes serialize_f32_query for cross-module test use.
-#[cfg(any(test, feature = "testing"))]
-pub fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
+/// Exposes serialize_f32_query to the tests of other modules.
+#[cfg(test)]
+pub(crate) fn serialize_f32_query_pub(v: &[f32]) -> Vec<u8> {
     serialize_f32_query(v)
 }
 
@@ -592,13 +593,7 @@ async fn knn_one(
             Ok(KnnOutcome { hits, passes, saves, eligible, ran: started.elapsed() })
         })
         .await
-        .map_err(|e| match e {
-            tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-            tokio_rusqlite::Error::ConnectionClosed => {
-                MemoryError::Backend("connection closed during knn_memory".into())
-            }
-            other => MemoryError::Backend(other.to_string()),
-        })
+        .map_err(failed_call::<rusqlite::Error, _>(ClosedAs::During("knn_memory")))
 }
 
 /// Renders the pool-survival fragment of the retrieval line from what the

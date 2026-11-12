@@ -4,11 +4,11 @@ use std::sync::{Arc, Once};
 use rusqlite::OptionalExtension;
 use tokio_rusqlite::Connection;
 
+use crate::memory::error::{failed_migration};
 use crate::memory::backup::{self, SchemaPlan};
 use crate::memory::embedder::Embedder;
 use crate::memory::error::MemoryError;
 use crate::memory::latency::KnnLatency;
-use crate::memory::sharing::{self, Reader};
 use crate::memory::store_lock::{StoreHolder, StoreLock};
 use crate::metrics::{EventKind, Recorder};
 
@@ -37,7 +37,7 @@ pub struct EmbeddingIdentity {
 impl EmbeddingIdentity {
     /// Reads all four fields off ONE embedder instance — a mismatch cannot be
     /// assembled by pairing metadata from two different sources.
-    pub fn of(e: &dyn Embedder) -> Self {
+    pub(crate) fn of(e: &dyn Embedder) -> Self {
         Self {
             model_id: e.model_id().to_string(),
             dim: e.dimensions(),
@@ -86,7 +86,7 @@ pub enum ContractStatus {
 /// naming the field and `{:?}`-quoting both sides so a one-trailing-space
 /// prefix difference is visible in a log line instead of looking identical.
 /// Pure — this is the message body, not a side-effecting log call.
-pub fn differing_fields(stored: &StoredContract, actual: &EmbeddingIdentity) -> Vec<String> {
+pub(crate) fn differing_fields(stored: &StoredContract, actual: &EmbeddingIdentity) -> Vec<String> {
     let mut out = Vec::new();
     if stored.model_id != actual.model_id {
         out.push(format!(
@@ -124,7 +124,7 @@ static VEC0_REGISTERED: Once = Once::new();
 /// `sqlite3_open` call, including the in-memory connections used in tests.
 ///
 /// The `transmute` pattern matches the upstream `sqlite-vec` demo and is the
-/// correct approach for `rusqlite 0.37` (which still exposes the raw FFI).
+/// correct approach for `rusqlite`, which exposes the raw FFI.
 /// The `Once` guard makes this idempotent and thread-safe.
 pub(crate) fn ensure_vec0_registered() {
     // The entry point sqlite3_auto_extension takes; sqlite-vec declares its
@@ -152,9 +152,22 @@ pub(crate) fn ensure_vec0_registered() {
 /// Wraps a [`tokio_rusqlite::Connection`], which is itself `Clone` (channel
 /// handle) — cloning `MemoryStore` gives another handle to the same background
 /// thread. No `Mutex` is needed.
+///
+/// The connection is the crate's own. Another crate calls the store's
+/// methods:
+///
+/// ```
+/// fn reach(store: &clawg_core::memory::MemoryStore) { let _ = store.probe_wait(); }
+/// ```
+///
+/// and cannot read the field:
+///
+/// ```compile_fail,E0616
+/// fn reach(store: &clawg_core::memory::MemoryStore) { let _ = &store.conn; }
+/// ```
 #[derive(Clone)]
 pub struct MemoryStore {
-    pub conn: Connection,
+    pub(crate) conn: Connection,
     /// Shared with every clone deliberately: the handles all address one
     /// database, so they belong to one latency series instead of each
     /// keeping a private slice too short to mean anything.
@@ -173,13 +186,6 @@ pub struct MemoryStore {
     /// The data directory holding `memory.db`, where a second connection can
     /// open it. `None` for the in-memory test store, which has no file.
     dir: Option<PathBuf>,
-    /// Where `sharing.json` is read from when a save is compared with what
-    /// its agent reaches. The data directory; `None` for an in-memory store
-    /// no runtime placed, which shares everything.
-    sharing_dir: Option<PathBuf>,
-    /// The numbers of the imports this process is writing, shared with every
-    /// clone, which an undo refuses until they end.
-    pub(crate) importing: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
 }
 
 /// Bytes of WAL a checkpoint may leave on disk. A checkpoint rewinds the WAL
@@ -200,7 +206,7 @@ impl MemoryStore {
     /// lives. A process that loses gets [`MemoryError::StoreInUse`] and has not
     /// created, opened or migrated `memory.db`: those are the holder's alone.
     /// `holder` says who is asking, so the loser's message can name it.
-    pub async fn open(base_dir: &Path, holder: StoreHolder) -> Result<Self, MemoryError> {
+    pub(crate) async fn open(base_dir: &Path, holder: StoreHolder) -> Result<Self, MemoryError> {
         ensure_vec0_registered();
         crate::private_dir::ensure_private_dir(base_dir)
             .map_err(|source| MemoryError::DataDir { path: base_dir.to_path_buf(), source })?;
@@ -208,7 +214,7 @@ impl MemoryStore {
         let path = base_dir.join("memory.db");
         // Connection::open returns Result<_, rusqlite::Error>
         let conn = Connection::open(&path).await
-            .map_err(MemoryError::Sqlite)?;
+            .map_err(MemoryError::from)?;
         // First, before any pragma: switching the journal mode rewrites the
         // file header, and a database this binary refuses must stay untouched.
         let plan = check_schema(&conn).await?;
@@ -248,7 +254,7 @@ impl MemoryStore {
                 Ok(backup::snapshot_into(c, &backups, backup::Reason::PreMigration))
             })
             .await
-            .map_err(MemoryError::Connection)??;
+            .map_err(MemoryError::from)??;
         }
         run_migrations(&conn).await?;
         Ok(Self {
@@ -257,8 +263,6 @@ impl MemoryStore {
             metrics: Arc::default(),
             _lock: Some(Arc::new(lock)),
             dir: Some(base_dir.to_path_buf()),
-            sharing_dir: Some(base_dir.to_path_buf()),
-            importing: Arc::default(),
         })
     }
 
@@ -272,7 +276,7 @@ impl MemoryStore {
         ensure_vec0_registered();
         // Connection::open_in_memory returns Result<_, rusqlite::Error>
         let conn = Connection::open_in_memory().await
-            .map_err(MemoryError::Sqlite)?;
+            .map_err(MemoryError::from)?;
         register_udfs(&conn).await?;
         run_migrations(&conn).await?;
         Ok(Self {
@@ -281,25 +285,14 @@ impl MemoryStore {
             metrics: Arc::default(),
             _lock: None,
             dir: None,
-            sharing_dir: None,
-            importing: Arc::default(),
         })
     }
 
-    /// This in-memory store reading `sharing.json` from `dir`, as a runtime
-    /// over a real data directory does.
+    /// The connection, for a test of another crate that seeds or reads rows
+    /// with SQL.
     #[cfg(any(test, feature = "testing"))]
-    pub fn with_sharing_dir(self, dir: PathBuf) -> Self {
-        Self { sharing_dir: Some(dir), ..self }
-    }
-
-    /// `agent_id` with what the sharing policy lets it reach, read now, so a
-    /// change to the policy counts from the next save on.
-    pub(crate) fn reader_for(&self, agent_id: &str) -> Reader {
-        match &self.sharing_dir {
-            Some(dir) => sharing::reader_in(dir, agent_id),
-            None => Reader::new(agent_id, sharing::SharingPolicy::default().reach_for(agent_id)),
-        }
+    pub fn conn_for_test(&self) -> &Connection {
+        &self.conn
     }
 
     /// Writes a snapshot of the store into `into` and returns its path.
@@ -309,7 +302,7 @@ impl MemoryStore {
     /// whole copy. WAL lets that connection read one consistent state while
     /// this one keeps writing. The in-memory test store has no file for a
     /// second connection and copies through its own.
-    pub async fn snapshot(&self, into: PathBuf, reason: backup::Reason) -> Result<PathBuf, MemoryError> {
+    pub(crate) async fn snapshot(&self, into: PathBuf, reason: backup::Reason) -> Result<PathBuf, MemoryError> {
         let started = std::time::Instant::now();
         let written = self.snapshot_into(into, reason).await;
         if let Ok(path) = &written {
@@ -326,7 +319,7 @@ impl MemoryStore {
                 .conn
                 .call(move |c| -> rusqlite::Result<_> { Ok(backup::snapshot_into(c, &into, reason)) })
                 .await
-                .map_err(MemoryError::Connection)?
+                .map_err(MemoryError::from)?
                 .map_err(MemoryError::from);
         };
         tokio::task::spawn_blocking(move || {
@@ -346,7 +339,7 @@ impl MemoryStore {
     }
 
     /// The recorder every clone of this store measures into.
-    pub fn metrics(&self) -> &Arc<Recorder> {
+    pub(crate) fn metrics(&self) -> &Arc<Recorder> {
         &self.metrics
     }
 
@@ -363,7 +356,7 @@ impl MemoryStore {
     /// properties the embedder itself reports — the four compared fields are
     /// all things the embedder tells you about itself (like `dim = 384`);
     /// `metric`/`normalized` are things this codebase decided.
-    pub async fn ensure_embedding_contract(
+    pub(crate) async fn ensure_embedding_contract(
         &self,
         identity: EmbeddingIdentity,
     ) -> Result<ContractStatus, MemoryError> {
@@ -415,7 +408,7 @@ impl MemoryStore {
                 }
             })
             .await
-            .map_err(MemoryError::Connection)
+            .map_err(MemoryError::from)
     }
 }
 
@@ -467,7 +460,7 @@ async fn check_schema(conn: &Connection) -> Result<SchemaPlan, MemoryError> {
     let applied = conn
         .call(|c| backup::read_history(c))
         .await
-        .map_err(MemoryError::Connection)?;
+        .map_err(MemoryError::from)?;
     match backup::schema_plan(&applied, &backup::known_migrations()) {
         SchemaPlan::Newer { db, binary } => Err(MemoryError::SchemaNewer { db, binary }),
         SchemaPlan::Diverged { version } => Err(MemoryError::SchemaDiverged { version }),
@@ -477,31 +470,10 @@ async fn check_schema(conn: &Connection) -> Result<SchemaPlan, MemoryError> {
 
 async fn run_migrations(conn: &Connection) -> Result<(), MemoryError> {
     conn.call(|c: &mut rusqlite::Connection| -> Result<refinery::Report, refinery::Error> {
-        configured(crate::memory::migrations::runner()).run(c)
+        configured(crate::memory::migrations::runner()).run(&mut crate::memory::migrations::Driver(c))
     })
     .await
-    .map_err(|e| match e {
-        tokio_rusqlite::Error::ConnectionClosed => {
-            // Connection was closed before migrations could run — treat as SQLite error.
-            MemoryError::Sqlite(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ffi::ErrorCode::InternalMalfunction,
-                    extended_code: 0,
-                },
-                Some("connection closed during migration".to_string()),
-            ))
-        }
-        tokio_rusqlite::Error::Close((_, db_err)) => {
-            MemoryError::Sqlite(db_err)
-        }
-        tokio_rusqlite::Error::Error(refinery_err) => {
-            MemoryError::Migration(refinery_err)
-        }
-        // non_exhaustive — catch-all for future tokio_rusqlite::Error variants
-        _ => MemoryError::Internal(
-            "unexpected tokio-rusqlite error during migration".to_string()
-        ),
-    })
+    .map_err(failed_migration)
     .map(|_report| ())?;
     Ok(())
 }
@@ -519,7 +491,7 @@ pub(crate) async fn seed_on_disk(dir: &Path, target: Option<i32>) {
             Some(v) => runner.set_target(refinery::Target::Version(v)),
             None => runner,
         };
-        runner.run(c)
+        runner.run(&mut crate::memory::migrations::Driver(c))
     })
     .await
     .unwrap();
@@ -546,6 +518,28 @@ pub(crate) async fn seed_on_disk(dir: &Path, target: Option<i32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_migration_keeps_its_text() {
+        ensure_vec0_registered();
+        let conn = Connection::open_in_memory().await.unwrap();
+        register_udfs(&conn).await.unwrap();
+        let broken = conn
+            .call(|c| {
+                let mut migrations = crate::memory::migrations::runner().get_migrations().clone();
+                migrations.push(refinery::Migration::unapplied("V9__broken", "THIS IS NOT SQL;").unwrap());
+                configured(refinery::Runner::new(&migrations)).run(&mut crate::memory::migrations::Driver(c))
+            })
+            .await;
+        let Err(tokio_rusqlite::Error::Error(cause)) = broken else {
+            panic!("the broken V9 must fail the run: {broken:?}");
+        };
+        assert_eq!(MemoryError::from(cause).to_string(), "Migration failed: `error applying migrations`, `near \"THIS\": syntax error in THIS IS NOT SQL; at offset 0`");
+
+        conn.clone().close().await.unwrap();
+        let closed = run_migrations(&conn).await.unwrap_err();
+        assert_eq!(closed.to_string(), "SQLite error: connection closed during migration");
+    }
 
     #[tokio::test]
     async fn a_snapshot_is_an_event_with_its_reason_and_size() {
@@ -614,7 +608,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(5))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -634,7 +628,7 @@ mod tests {
         .unwrap();
 
         // Now run V6 — the row above is exactly the legacy case it targets.
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
 
@@ -688,7 +682,7 @@ mod tests {
                 migrations.push(
                     refinery::Migration::unapplied("V9__broken", "THIS IS NOT SQL;").unwrap(),
                 );
-                configured(refinery::Runner::new(&migrations)).run(c)
+                configured(refinery::Runner::new(&migrations)).run(&mut crate::memory::migrations::Driver(c))
             })
             .await;
         assert!(result.is_err(), "the broken V9 must fail the run");
@@ -717,7 +711,7 @@ mod tests {
         ensure_vec0_registered();
         let conn = Connection::open_in_memory().await.unwrap();
         register_udfs(&conn).await.unwrap();
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
         conn.call(|c| {
@@ -764,7 +758,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(8))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -819,7 +813,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(9))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -875,7 +869,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(11))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -942,7 +936,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(12))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1012,7 +1006,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(13))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1068,7 +1062,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(14))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1139,7 +1133,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(15))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1202,7 +1196,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(16))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -1575,7 +1569,7 @@ mod tests {
         // Every column, so a migration that rewrote any of them would show.
         let whole_rows = |c: &mut rusqlite::Connection| -> rusqlite::Result<Rows> {
             let mut stmt = c.prepare("SELECT * FROM memory WHERE id >= 10 ORDER BY id")?;
-            let names = stmt.column_names().into_iter().map(String::from).collect();
+            let names = stmt.column_names().map(String::from).collect();
             let n = stmt.column_count();
             let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
             Ok((names, rows))
@@ -2361,7 +2355,7 @@ mod tests {
         let backups = crate::paths::backups_dir(dir.path());
         assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1, "the pre-migration snapshot is the way back");
 
-        let undone = crate::memory::portability::undo::undo_import(&store, &backups, 1, false).await.unwrap();
+        let undone = crate::memory::portability::undo::undo_import(&store, &crate::memory::portability::RunningImports::default(), &backups, 1, false).await.unwrap();
         assert_eq!(undone.removed, vec![20, 21], "the rows it inserted go");
         assert_eq!(undone.restored, vec![10], "the row it replaced comes back");
         assert_eq!(undone.unfilled, vec![12], "the link it filled is emptied");
@@ -2377,7 +2371,7 @@ mod tests {
         conn.call(|c| {
             configured(crate::memory::migrations::runner())
                 .set_target(refinery::Target::Version(18))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2421,7 +2415,7 @@ mod tests {
             let conn = Connection::open_in_memory().await.unwrap();
             register_udfs(&conn).await.unwrap();
 
-            conn.call(move |c| configured_to(crate::memory::migrations::runner(), cap).run(c))
+            conn.call(move |c| configured_to(crate::memory::migrations::runner(), cap).run(&mut crate::memory::migrations::Driver(c)))
                 .await
                 .unwrap();
 
@@ -2561,7 +2555,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(3))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2578,7 +2572,7 @@ mod tests {
             .unwrap();
         assert_eq!(before, 1, "V3 must have created the view for this test to mean anything");
 
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
 
@@ -2857,7 +2851,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(7))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2871,7 +2865,7 @@ mod tests {
         let to_v8 = |c: &mut rusqlite::Connection| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(8))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         };
         conn.call(to_v8).await.unwrap();
         let after: i64 = conn
@@ -2904,7 +2898,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(7))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -2924,7 +2918,7 @@ mod tests {
         .unwrap();
 
         // Now run V8 — the row above predates the FTS table and its triggers.
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
 
@@ -3008,7 +3002,7 @@ mod tests {
         conn.call(|c| {
             crate::memory::migrations::runner()
                 .set_target(refinery::Target::Version(7))
-                .run(c)
+                .run(&mut crate::memory::migrations::Driver(c))
         })
         .await
         .unwrap();
@@ -3029,7 +3023,7 @@ mod tests {
         .await
         .unwrap();
 
-        conn.call(|c| crate::memory::migrations::runner().run(c))
+        conn.call(|c| crate::memory::migrations::runner().run(&mut crate::memory::migrations::Driver(c)))
             .await
             .unwrap();
 

@@ -1,30 +1,104 @@
 use crate::memory::store_lock::StoreOwner;
 
+/// A failure of the store's backend, shown as the backend gave it: the error
+/// that wraps it puts the heading.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct StorageError(Cause);
+
+#[derive(Debug, thiserror::Error)]
+enum Cause {
+    #[error("{0}")]
+    Sqlite(#[source] rusqlite::Error),
+    #[error("{0}")]
+    Connection(#[source] tokio_rusqlite::Error),
+    #[error("{0}")]
+    Migration(#[source] refinery::Error),
+    /// A call whose closure did not run or did not answer.
+    #[error("{0}")]
+    Channel(String),
+}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(e: rusqlite::Error) -> Self {
+        StorageError(Cause::Sqlite(e))
+    }
+}
+
+impl From<tokio_rusqlite::Error> for StorageError {
+    fn from(e: tokio_rusqlite::Error) -> Self {
+        StorageError(Cause::Connection(e))
+    }
+}
+
+impl From<refinery::Error> for StorageError {
+    fn from(e: refinery::Error) -> Self {
+        StorageError(Cause::Migration(e))
+    }
+}
+
+/// What a [`MemoryError`] says before a storage failure, by its cause.
+fn heading(e: &StorageError) -> &'static str {
+    match e.0 {
+        Cause::Sqlite(_) => "SQLite error: ",
+        Cause::Connection(_) => "Memory DB connection error: ",
+        Cause::Migration(_) => "Migration failed: ",
+        Cause::Channel(_) => "memory backend channel error: ",
+    }
+}
+
+/// How a call that failed because the connection is closed words it. The
+/// three wordings reach the daemon's answers, so each call keeps its own.
+pub(crate) enum ClosedAs {
+    /// `connection closed during <op>`; any other failure as the connection
+    /// gives it.
+    During(&'static str),
+    /// `<op>: <failure>`.
+    Named(&'static str),
+    /// The failure as the connection gives it.
+    AsIs,
+}
+
+/// Translates a failed `call` on the connection: the closure's own error
+/// becomes `Out`, and a failure of the connection a storage failure worded
+/// as `closed` says.
+pub(crate) fn failed_call<E, Out>(closed: ClosedAs) -> impl Fn(tokio_rusqlite::Error<E>) -> Out
+where
+    E: std::fmt::Display,
+    Out: From<E> + From<MemoryError>,
+{
+    move |e| {
+        let text = match (e, &closed) {
+            (tokio_rusqlite::Error::Error(e), _) => return Out::from(e),
+            (tokio_rusqlite::Error::ConnectionClosed, ClosedAs::During(op)) => format!("connection closed during {op}"),
+            (other, ClosedAs::Named(op)) => format!("{op}: {other}"),
+            (other, _) => other.to_string(),
+        };
+        Out::from(MemoryError::channel(text))
+    }
+}
+
+/// Translates a failed run of the migrations.
+pub(crate) fn failed_migration(e: tokio_rusqlite::Error<refinery::Error>) -> MemoryError {
+    match e {
+        tokio_rusqlite::Error::ConnectionClosed => MemoryError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error { code: rusqlite::ffi::ErrorCode::InternalMalfunction, extended_code: 0 },
+            Some("connection closed during migration".to_string()),
+        )),
+        tokio_rusqlite::Error::Close((_, db_err)) => MemoryError::from(db_err),
+        tokio_rusqlite::Error::Error(refinery_err) => MemoryError::from(refinery_err),
+        // `tokio_rusqlite::Error` is non_exhaustive.
+        _ => MemoryError::Internal("unexpected tokio-rusqlite error during migration".to_string()),
+    }
+}
+
 /// Memory subsystem errors.
-///
-/// This enum consolidates all failure modes of the persistent-memory substrate:
-/// migration failures, connection errors, raw SQLite errors, vec0 registration
-/// failures, and row-decode errors.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
-    #[error("Migration failed: {0}")]
-    Migration(#[from] refinery::Error),
-
-    #[error("Memory DB connection error: {0}")]
-    Connection(#[from] tokio_rusqlite::Error),
-
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-
-    #[error("Failed to register sqlite-vec extension: {0}")]
-    VecExtensionRegistration(String),
-
-    #[error("Failed to decode row from {table}: {source}")]
-    RowDecode {
-        table: &'static str,
-        #[source]
-        source: rusqlite::Error,
-    },
+    /// A failure of SQLite, of the connection or of a migration, under the
+    /// heading of its cause.
+    #[error("{}{}", heading(.0), .0)]
+    Storage(#[from] StorageError),
 
     #[error("internal memory error: {0}")]
     Internal(String),
@@ -36,10 +110,6 @@ pub enum MemoryError {
         #[source]
         source: std::io::Error,
     },
-
-    /// tokio_rusqlite channel error not tied to a SQLite error code.
-    #[error("memory backend channel error: {0}")]
-    Backend(String),
 
     /// Another process already owns this data directory's store. `owner` is
     /// whatever `memory.owner` said — best-effort, because the holder may not
@@ -89,10 +159,74 @@ pub enum MemoryError {
     },
 }
 
+impl MemoryError {
+    /// A storage failure that is not an error of SQLite's, worded by the
+    /// call that met it.
+    pub(crate) fn channel(text: String) -> Self {
+        MemoryError::Storage(StorageError(Cause::Channel(text)))
+    }
+
+    /// The error of SQLite's this is, for a caller that answers with one;
+    /// anything else comes back as it was.
+    pub(crate) fn into_sqlite(self) -> Result<rusqlite::Error, Self> {
+        match self {
+            MemoryError::Storage(StorageError(Cause::Sqlite(e))) => Ok(e),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for MemoryError {
+    fn from(e: rusqlite::Error) -> Self {
+        MemoryError::Storage(e.into())
+    }
+}
+
+impl From<tokio_rusqlite::Error> for MemoryError {
+    fn from(e: tokio_rusqlite::Error) -> Self {
+        MemoryError::Storage(e.into())
+    }
+}
+
+impl From<refinery::Error> for MemoryError {
+    fn from(e: refinery::Error) -> Self {
+        MemoryError::Storage(e.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    async fn closed_store() -> crate::memory::MemoryStore {
+        let store = crate::memory::MemoryStore::new_for_test().await.unwrap();
+        store.conn.clone().close().await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn each_storage_failure_keeps_its_text() {
+        use crate::preferences::Lang;
+        use crate::memory::sharing::{Reach, Reader};
+
+        let sqlite = MemoryError::from(rusqlite::Error::InvalidQuery);
+        assert_eq!(sqlite.to_string(), "SQLite error: Query is not read-only");
+
+        let store = closed_store().await;
+        let probe = store.probe_wait().await.unwrap_err();
+        assert_eq!(probe.to_string(), "Memory DB connection error: ConnectionClosed");
+
+        let during = crate::memory::admin::get_memory_core(&store, 1).await.unwrap_err();
+        assert_eq!(during.to_string(), "memory backend channel error: connection closed during get_memory_core");
+
+        let reader = Reader::new("agent", Reach::Own);
+        let named = crate::memory::language::count_saves_in(&store, Lang::Es, None, &reader).await.unwrap_err();
+        assert_eq!(named.to_string(), "memory backend channel error: language count: ConnectionClosed");
+
+        let as_is = crate::memory::registry::rename_project(&store, "p", "name").await.unwrap_err();
+        assert_eq!(as_is.to_string(), "memory backend channel error: ConnectionClosed");
+    }
 
     #[test]
     fn workspace_io_error_displays_path_and_source() {
@@ -107,7 +241,7 @@ mod tests {
 
     #[test]
     fn backend_error_displays_message() {
-        let e = MemoryError::Backend("closed".into());
+        let e = MemoryError::channel("closed".into());
         let msg = format!("{e}");
         assert!(msg.contains("closed"), "Expected 'closed' in: {msg}");
     }
@@ -161,24 +295,9 @@ mod tests {
         let rusqlite_err = rusqlite::Error::InvalidQuery;
         let memory_err: MemoryError = rusqlite_err.into();
         assert!(
-            matches!(memory_err, MemoryError::Sqlite(_)),
-            "Expected MemoryError::Sqlite, got {:?}",
+            matches!(memory_err, MemoryError::Storage(_)),
+            "Expected MemoryError::Storage, got {:?}",
             memory_err
-        );
-    }
-
-    /// RowDecode Display contains table name.
-    #[test]
-    fn row_decode_displays_table_name() {
-        let err = MemoryError::RowDecode {
-            table: "memory",
-            source: rusqlite::Error::InvalidQuery,
-        };
-        let display = format!("{}", err);
-        assert!(
-            display.contains("memory"),
-            "Expected 'memory' in display: {}",
-            display
         );
     }
 }

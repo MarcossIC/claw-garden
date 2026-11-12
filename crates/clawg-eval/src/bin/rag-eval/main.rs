@@ -1746,7 +1746,7 @@ mod tests {
         let names: Vec<(String, String)> = names.iter().map(|(id, name)| (id.to_string(), name.to_string())).collect();
         runtime
             .store
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 for (origin, ids) in &marks {
                     for id in ids {
@@ -1765,7 +1765,7 @@ mod tests {
             })
             .await
             .unwrap();
-        runtime.store.conn.clone().close().await.unwrap();
+        runtime.close().await.unwrap();
         Snapshot { file: dir.join("memory.db"), _dir: dir }
     }
 

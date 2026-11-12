@@ -496,7 +496,7 @@ async fn health_reports_a_failed_save_with_its_operation_id() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| {
             c.execute(
                 "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, attempts, last_error, created_at, updated_at) \
@@ -967,7 +967,7 @@ async fn outbox(h: &Harness) -> Vec<(String, String, Option<String>)> {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| {
             let mut stmt = c.prepare("SELECT state, content, last_error FROM ingest_outbox ORDER BY id")?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
@@ -1049,7 +1049,7 @@ async fn a_partial_save_answers_202_and_keeps_its_row() {
         .ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| c.query_row("SELECT progress FROM ingest_outbox", [], |r| r.get(0)))
         .await
         .expect("progress");
@@ -1073,7 +1073,7 @@ async fn seed_failed(h: &Harness, operation_id: &str, agent: &str, content: &str
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, state, attempts, last_error, progress, created_at, updated_at) \
@@ -2001,7 +2001,7 @@ async fn a_queued_save_keeps_its_session_in_the_outbox() {
         .ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| {
             let mut stmt = c.prepare("SELECT json_extract(event, '$.session_id') FROM ingest_outbox")?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -2192,7 +2192,7 @@ async fn seed_dispute(h: &Harness) -> (i64, i64) {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 &format!("UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new}"),
@@ -2288,7 +2288,7 @@ async fn a_protected_verdict_without_the_answer_is_a_409() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| c.execute("UPDATE memory SET memory_type = 'user_preference' WHERE id = ?1", [old]))
         .await
         .expect("make the old row a preference");
@@ -2319,7 +2319,7 @@ async fn disputes_lists_the_pending_pairs_an_agent_reaches_in_a_project() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
@@ -2828,7 +2828,7 @@ async fn registering_a_root_whose_id_is_taken_by_another_is_a_conflict() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [id])
         })
@@ -2851,7 +2851,7 @@ async fn registering_two_roots_that_collide_gives_each_its_own_id() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere/repo', 0)", [seeded])
         })
@@ -2904,7 +2904,7 @@ async fn registering_without_assigned_ids_keeps_the_old_answer() {
         .ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| c.query_row("SELECT COUNT(*) FROM project_remote", [], |r| r.get(0)))
         .await
         .unwrap();
@@ -3146,7 +3146,7 @@ async fn project_with_docs(h: &Harness, docs: &[(&str, &str)]) -> (tempfile::Tem
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, ?2, 0)", [row_id, root]))
         .await
         .unwrap();
@@ -3299,7 +3299,7 @@ async fn index_docs_of(h: &Harness, id: &str) -> Option<i64> {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project_path WHERE id = ?1)", [id], |r| r.get(0)))
         .await
         .unwrap()
@@ -3513,6 +3513,164 @@ async fn a_search_during_the_first_index_waits_for_it() {
     assert_eq!(body["indexing"], false, "{body}");
     assert_eq!(body["docs"], 1);
     assert_eq!(body["hits"][0]["text"], "found after the wait");
+}
+
+/// Registers a project of two docs for indexing and holds its refresh with
+/// the first one written: `a.md` has enough passages to fill the first flush
+/// of the queue on its own, and the flush of `b.md` waits at the gate.
+async fn refresh_held_halfway(h: &Harness, gate: &Gate) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sections: String = (0..20).map(|i| format!("## Section {i}\nbody of section {i}\n")).collect();
+    std::fs::write(dir.path().join("a.md"), format!("# A\nintro\n{sections}")).unwrap();
+    std::fs::write(dir.path().join("b.md"), "# B\nthe second doc\n").unwrap();
+    let (status, body) = h
+        .post_json("/v1/projects", json!({ "root_path": dir.path().display().to_string(), "index_docs": true }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["root_id"].as_str().expect("root_id").to_string();
+    let limit = Duration::from_secs(10);
+    tokio::time::timeout(limit, gate.entered()).await.expect("the first flush reached the embedder");
+    gate.release(1);
+    tokio::time::timeout(limit, gate.entered()).await.expect("the second flush reached the embedder");
+    (dir, id)
+}
+
+/// The entry of `id` in the `docs_index` of a health answer.
+fn docs_index_entry(health: &Value, id: &str) -> Value {
+    let entries = health["docs_index"].as_array().unwrap_or_else(|| panic!("health carries no docs_index: {health}"));
+    entries.iter().find(|e| e["project_id"] == id).unwrap_or_else(|| panic!("no entry for {id}: {health}")).clone()
+}
+
+/// Polls health until the project's last refresh has ended, and returns its entry.
+async fn ended_refresh(h: &Harness, id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, health) = h.get_json("/health").await;
+        let ended = health["docs_index"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|e| e["project_id"] == id && e["indexing"] == false && e.get("last").is_some()));
+        if let Some(entry) = ended {
+            return entry.clone();
+        }
+        assert!(Instant::now() < deadline, "health never showed the refresh of {id} as ended: {health}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn health_names_the_project_whose_refresh_runs_and_how_far_it_is() {
+    let (h, gate) = Harness::start_gated().await;
+    let before = clawg_core::memory::clock::TimestampMs::now().as_millis_i64();
+    let (_dir, id) = refresh_held_halfway(&h, &gate).await;
+
+    let (status, health) = h.get_json("/health").await;
+
+    assert_eq!(status, 200, "{health}");
+    let entry = docs_index_entry(&health, &id);
+    assert_eq!(entry["indexing"], true, "{health}");
+    let current = &entry["current"];
+    assert_eq!((current["files_done"].clone(), current["files_total"].clone()), (json!(1), json!(2)), "{health}");
+    assert_eq!(current["trigger"], "registration", "{health}");
+    assert!(current["started_at_ms"].as_i64().is_some_and(|at| at >= before), "{health}");
+    assert!(entry.get("last").is_none(), "no refresh of it has ended yet: {health}");
+
+    gate.release(10);
+    assert!(h.ctx.runtime.project_docs.wait_idle(&id, Duration::from_secs(10)).await);
+}
+
+#[tokio::test]
+async fn health_shows_a_running_refresh_without_the_connection() {
+    let (h, gate) = Harness::start_gated().await;
+    let (_dir, id) = refresh_held_halfway(&h, &gate).await;
+
+    // The store's one connection is held by a call that does not return until told to.
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let store = h.ctx.runtime.store.clone();
+    let hold = tokio::spawn(async move {
+        store
+            .conn_for_test()
+            .call(move |_| {
+                entered.send(()).ok();
+                released.recv_timeout(Duration::from_secs(30)).ok();
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+    });
+    held.await.expect("the connection is held");
+
+    let started = Instant::now();
+    let r = h.http.get(h.url("/health")).send().await.expect("request");
+    let waited = started.elapsed();
+    assert_eq!(r.status(), 200);
+    let health: Value = r.json().await.expect("json");
+    assert!(waited < Duration::from_secs(5), "health did not wait for the connection: {waited:?}");
+    assert!(health.get("ingest").is_none(), "the outbox counts need the connection: {health}");
+    let entry = docs_index_entry(&health, &id);
+    assert_eq!(
+        (entry["indexing"].clone(), entry["current"]["files_done"].clone(), entry["current"]["files_total"].clone()),
+        (json!(true), json!(1), json!(2)),
+        "{health}"
+    );
+
+    release.send(()).ok();
+    hold.await.expect("joined").expect("the held call ended");
+    gate.release(10);
+    assert!(h.ctx.runtime.project_docs.wait_idle(&id, Duration::from_secs(10)).await);
+}
+
+#[tokio::test]
+async fn health_says_when_a_refresh_ended_and_what_it_did() {
+    let (h, gate) = Harness::start_gated().await;
+    let (_dir, id) = refresh_held_halfway(&h, &gate).await;
+
+    gate.release(10);
+    let entry = ended_refresh(&h, &id).await;
+
+    assert!(entry.get("current").is_none(), "{entry}");
+    let last = &entry["last"];
+    assert_eq!(last["trigger"], "registration", "{entry}");
+    let (started, finished) = (last["started_at_ms"].as_i64().expect("started"), last["finished_at_ms"].as_i64().expect("finished"));
+    assert!(finished >= started, "{entry}");
+    assert!(finished <= clawg_core::memory::clock::TimestampMs::now().as_millis_i64(), "{entry}");
+    let report = &last["report"];
+    assert_eq!(
+        (report["docs"].clone(), report["indexed"].clone(), report["unchanged"].clone(), report["removed"].clone()),
+        (json!(2), json!(2), json!(0), json!(0)),
+        "{entry}"
+    );
+    assert_eq!((report["skipped"].clone(), report["failed"].clone()), (json!(0), json!(0)), "{entry}");
+    assert!(report["passages"].as_u64().is_some_and(|n| n > 16), "{entry}");
+    assert!(last.get("error").is_none(), "{entry}");
+}
+
+#[tokio::test]
+async fn health_keeps_the_cause_of_a_failed_refresh() {
+    let (embedder, _gate) = docs_embedder(true, true);
+    let h = Harness::start_inner(EmbedderState::Docs(embedder)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Readme\nnever embedded\n").unwrap();
+    let (status, body) = h
+        .post_json("/v1/projects", json!({ "root_path": dir.path().display().to_string(), "index_docs": true }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["root_id"].as_str().expect("root_id").to_string();
+
+    let entry = ended_refresh(&h, &id).await;
+
+    let last = &entry["last"];
+    assert!(last["error"].as_str().is_some_and(|e| e.contains("passages refused")), "{entry}");
+    assert!(last.get("report").is_none(), "a refresh that failed did not finish its plan: {entry}");
+    assert!(last["finished_at_ms"].is_i64(), "{entry}");
+}
+
+#[tokio::test]
+async fn health_lists_no_docs_index_before_any_refresh() {
+    let h = Harness::start().await;
+
+    let (_, health) = h.get_json("/health").await;
+
+    assert_eq!(health["docs_index"], json!([]), "{health}");
 }
 
 // ── restore ─────────────────────────────────────────────────────────────────
@@ -3758,7 +3916,7 @@ async fn a_restore_answers_its_key_and_its_new_pairs() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute("UPDATE memory SET memory_type = 'semantic_fact' WHERE id = ?1", [restored])?;
             c.execute("UPDATE memory SET memory_type = 'semantic_fact' WHERE id = ?1", [newer])?;
@@ -3955,7 +4113,7 @@ async fn the_synchronous_import_still_cancels_when_the_client_goes() {
         .ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(|c| c.query_row("SELECT COUNT(*) FROM memory_import", [], |r| r.get(0)))
         .await
         .expect("count imports");
@@ -4221,7 +4379,7 @@ impl Harness {
     }
 
     async fn count_of(&self, sql: &'static str) -> i64 {
-        self.ctx.runtime.store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
+        self.ctx.runtime.store.conn_for_test().call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
     }
 }
 
@@ -4334,7 +4492,7 @@ async fn a_job_import_refuses_what_the_synchronous_import_refuses() {
         h.ctx
             .runtime
             .store
-            .conn
+            .conn_for_test()
             .call(move |c| c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, 'Twin', 'user', 1, 1)", [id]))
             .await
             .unwrap();
@@ -4445,7 +4603,7 @@ async fn health_carries_the_active_jobs_import_block_without_the_connection() {
     let store = h.ctx.runtime.store.clone();
     let hold = tokio::spawn(async move {
         store
-            .conn
+            .conn_for_test()
             .call(move |_| {
                 entered.send(()).ok();
                 released.recv_timeout(Duration::from_secs(30)).ok();
@@ -4552,7 +4710,7 @@ async fn accepting_a_job_reloads_a_released_model_before_embedding() {
     let store = h.ctx.runtime.store.clone();
     let hold = tokio::spawn(async move {
         store
-            .conn
+            .conn_for_test()
             .call(move |_| {
                 entered.send(()).ok();
                 released.recv_timeout(Duration::from_secs(30)).ok();
@@ -4801,7 +4959,7 @@ async fn a_project_map_to_a_deleted_ambiguous_or_unknown_project_is_refused() {
         h.ctx
             .runtime
             .store
-            .conn
+            .conn_for_test()
             .call(move |c| c.execute("INSERT INTO project (id, name, born, reviewed, created_at) VALUES (?1, 'Twin', 'user', 1, 1)", [name]))
             .await
             .unwrap();
@@ -5305,7 +5463,7 @@ async fn move_and_list_select_by_origin_project() {
             h.ctx
                 .runtime
                 .store
-                .conn
+                .conn_for_test()
                 .call(move |c| c.execute("UPDATE memory SET origin_project = ?1 WHERE id = ?2", rusqlite::params![origin, id]))
                 .await
                 .expect("seed");
@@ -5368,6 +5526,9 @@ const PROJECT_INPUTS: &[(&str, &str, Option<&str>)] = &[
     ("POST", "/search", Some("body.project_id and body.project_ids[]")),
     ("POST", "/context", Some("body.project_id")),
     ("POST", "/sessions", Some("body.project_id")),
+    // A session's own id finds its row.
+    ("POST", "/sessions/end", None),
+    ("POST", "/sessions/calls", Some("body.project_id")),
     ("GET", "/memories/{kind}/{id}", None),
     ("PATCH", "/memories/{kind}/{id}", Some("body.project_id")),
     ("DELETE", "/memories/{kind}/{id}", None),
@@ -5512,6 +5673,13 @@ async fn every_route_that_takes_a_project_follows_a_merge() {
                 let id = save_in(&h, &web, "a note of that session").await;
                 assert_eq!(session_of(&h, id).await.as_deref(), Some("s-merged"), "{route}");
             }
+            ("POST", "/sessions/calls") => {
+                h.ctx.runtime.metrics.set_writing(true);
+                hook_event(&h, json!({ "agent_id": "agent-http", "project_id": web, "session_id": "s-called", "event": "prompt" })).await;
+                let call = json!({ "agent_id": "agent-http", "project_id": app, "tool": "search_memory" });
+                assert_eq!(h.post_json("/v1/sessions/calls", call).await.0, 204, "{route}");
+                assert_eq!(session_rows(&h, "s-called")[0].count(CountKind::Call, "search_memory"), 1, "{route}");
+            }
             ("PATCH", "/memories/{kind}/{id}") => {
                 let row = save_in(&h, &other, "a note to patch").await;
                 let (status, body) = patch(&h, row, json!({ "project_id": app })).await;
@@ -5523,7 +5691,7 @@ async fn every_route_that_takes_a_project_follows_a_merge() {
                 h.ctx
                     .runtime
                     .store
-                    .conn
+                    .conn_for_test()
                     .call(move |c| {
                         c.execute(
                             "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
@@ -5742,7 +5910,7 @@ async fn pending_save(h: &Harness, operation: &'static str, project: &str) {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 "INSERT INTO ingest_outbox (operation_id, agent_id, content, event, created_at, updated_at) \
@@ -5766,7 +5934,7 @@ async fn a_merge_waits_for_the_saves_of_its_projects() {
     let started = Instant::now();
     let finish = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        store.conn.call(|c| c.execute("DELETE FROM ingest_outbox", [])).await.expect("the save ends");
+        store.conn_for_test().call(|c| c.execute("DELETE FROM ingest_outbox", [])).await.expect("the save ends");
     });
 
     let (status, body) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
@@ -5966,6 +6134,10 @@ async fn every_route_that_takes_a_project_treats_a_deleted_one_by_its_rule() {
                     .await;
                 assert_eq!(status, 204, "{route}: {body}");
             }
+            ("POST", "/sessions/calls") => {
+                let call = json!({ "agent_id": "agent-http", "project_id": gone, "tool": "search_memory" });
+                assert_eq!(h.post_json("/v1/sessions/calls", call).await.0, 204, "{route}");
+            }
             ("PATCH", "/memories/{kind}/{id}") => {
                 let (status, body) = patch(&h, on_other, json!({ "project_id": gone })).await;
                 refused(&route, status, &body);
@@ -6137,7 +6309,7 @@ async fn suggest(h: &Harness, a: &str, b: &str) {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| {
             c.execute(
                 "INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES (?1, ?2, 'root_commit', 1)",
@@ -6306,7 +6478,7 @@ async fn a_folder_shared_by_its_project_is_not_located() {
     h.ctx
         .runtime
         .store
-        .conn
+        .conn_for_test()
         .call(move |c| c.execute("UPDATE project_path SET project_id = ?1 WHERE id = ?2", [own2, shared2]))
         .await
         .expect("share the project");
@@ -6315,6 +6487,12 @@ async fn a_folder_shared_by_its_project_is_not_located() {
 
     assert_eq!((status, body["error"].as_str()), (409, Some("folder_shared")), "{body}");
     assert!(body["detail"].as_str().is_some_and(|d| d.contains(&own) && d.contains("projects merge")), "{body}");
+    let ideas = resolve(&h, json!({ "project": "ideas" })).await["project_id"].as_str().unwrap().to_string();
+    let detail = format!(
+        "{} leads to project {own}, which has 2 folders; `clawg projects merge {own} --into {ideas}` merges them all",
+        one.to_string_lossy()
+    );
+    assert_eq!(body["detail"].as_str(), Some(detail.as_str()), "{body}");
 }
 
 #[tokio::test]
@@ -6455,4 +6633,202 @@ async fn a_subfolder_is_declared_through_the_daemon_and_refused_at_a_root() {
     let (status, removed) = locate_subfolder(&h, &m, &web_dir).await;
     assert_eq!((status, removed["removed"].as_bool(), removed["project_id"].as_str()), (200, Some(true), Some(m.as_str())), "{removed}");
     assert_eq!(register_from(&h, &mono, &web_dir).await["project_id"].as_str(), Some(m.as_str()), "it leads to the repository again");
+}
+
+// ── Sessions ────────────────────────────────────────────────────────────────
+
+use clawg_core::metrics::sessions::{CountKind, ProjectChange, SessionRow};
+
+/// Sends what a hook sends to `POST /v1/sessions`.
+async fn hook_event(h: &Harness, body: Value) {
+    let (status, answer) = h.post_json("/v1/sessions", body).await;
+    assert_eq!(status, 204, "{answer}");
+}
+
+/// The rows of `session_id` that changed since they were last read, oldest
+/// first.
+fn session_rows(h: &Harness, session_id: &str) -> Vec<SessionRow> {
+    h.ctx.runtime.metrics.sessions().take().rows.into_iter().filter(|row| row.session_id == session_id).collect()
+}
+
+/// A daemon that keeps its sessions, as one whose writer has `metrics.db`.
+async fn keeping_sessions() -> Harness {
+    let h = Harness::start().await;
+    h.ctx.runtime.metrics.set_writing(true);
+    h
+}
+
+#[tokio::test]
+async fn a_hook_event_opens_the_row_of_its_session_and_counts() {
+    let h = keeping_sessions().await;
+    let hook = |event: Value, source: Value, client: Value| {
+        json!({ "agent_id": "agent-http", "project_id": "p", "session_id": "s-1", "event": event, "source": source, "client": client })
+    };
+    hook_event(&h, hook(json!("start"), json!("clear"), json!("claude-code"))).await;
+    hook_event(&h, hook(json!("prompt"), Value::Null, json!("claude-code"))).await;
+    hook_event(&h, hook(json!("start"), Value::Null, json!("claude-code"))).await;
+    hook_event(&h, hook(json!("start"), json!("something else"), json!("claude-code"))).await;
+    hook_event(&h, json!({ "agent_id": "agent-http", "project_id": "p", "session_id": "s-1" })).await;
+    hook_event(&h, hook(json!("stop"), Value::Null, Value::Null)).await;
+
+    let rows = session_rows(&h, "s-1");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!((row.agent_id.as_str(), row.project_id.as_deref(), row.client.as_str()), ("agent-http", Some("p"), "claude-code"));
+    assert_eq!(row.prompts, 1, "an event that says nothing, or one this daemon does not know, counts nothing");
+    let starts = |source| row.count(CountKind::Start, source);
+    assert_eq!((starts("clear"), starts("unspecified"), starts("other")), (1, 1, 1));
+
+    hook_event(&h, json!({ "agent_id": "cursor", "session_id": "s-2", "event": "start", "client": "cursor" })).await;
+    hook_event(&h, json!({ "agent_id": "x", "session_id": "s-3", "event": "start", "client": "an editor" })).await;
+    assert_eq!(session_rows(&h, "s-2")[0].client, "cursor");
+    hook_event(&h, json!({ "agent_id": "x", "session_id": "s-3", "event": "prompt" })).await;
+    let other = &session_rows(&h, "s-3")[0];
+    assert_eq!((other.client.as_str(), other.project_id.as_deref(), other.prompts), ("other", None, 1));
+}
+
+#[tokio::test]
+async fn a_daemon_that_keeps_no_metrics_keeps_no_sessions() {
+    let h = Harness::start().await;
+    hook_event(&h, json!({ "agent_id": "agent-http", "session_id": "s-1", "event": "start" })).await;
+    assert_eq!(h.post_json("/v1/sessions/end", json!({ "session_id": "s-1" })).await.0, 204);
+    assert!(session_rows(&h, "s-1").is_empty());
+}
+
+#[tokio::test]
+async fn a_session_end_closes_its_row_with_the_reason() {
+    let h = keeping_sessions().await;
+    for id in ["s-1", "s-2", "s-3"] {
+        hook_event(&h, json!({ "agent_id": "agent-http", "session_id": id, "event": "start", "source": "startup" })).await;
+    }
+    let end = |body: Value| h.post_json("/v1/sessions/end", body);
+    assert_eq!(end(json!({ "session_id": "s-1", "reason": "logout" })).await.0, 204);
+    assert_eq!(end(json!({ "session_id": "s-2", "reason": "because of the weather" })).await.0, 204);
+    assert_eq!(end(json!({ "session_id": "s-3" })).await.0, 204);
+    assert_eq!(end(json!({ "session_id": "never-seen", "reason": "clear" })).await.0, 204);
+    assert_eq!(end(json!({ "session_id": "has space", "reason": "clear" })).await.0, 400);
+
+    let pending = h.ctx.runtime.metrics.sessions().take().rows;
+    let ended: Vec<(&str, Option<&str>, bool)> =
+        pending.iter().map(|r| (r.session_id.as_str(), r.end_reason.as_deref(), r.ended_at_ms.is_some_and(|at| at >= r.started_at_ms))).collect();
+    assert_eq!(ended.len(), 3, "an end of a session nobody saw opens nothing");
+    for expected in [("s-1", Some("logout"), true), ("s-2", Some("other"), true), ("s-3", Some("other"), true)] {
+        assert!(ended.contains(&expected), "{expected:?} in {ended:?}");
+    }
+
+    hook_event(&h, json!({ "agent_id": "agent-http", "session_id": "s-1", "event": "prompt" })).await;
+    let again = session_rows(&h, "s-1");
+    assert_eq!((again.len(), again[0].ended_at_ms, again[0].prompts), (1, None, 1), "what follows an end is another row");
+}
+
+#[tokio::test]
+async fn a_tool_call_counts_for_the_session_of_its_agent_and_project() {
+    let h = keeping_sessions().await;
+    hook_event(&h, json!({ "agent_id": "agent-http", "project_id": "p", "session_id": "in-p", "event": "start" })).await;
+    hook_event(&h, json!({ "agent_id": "agent-http", "session_id": "in-none", "event": "start" })).await;
+    let call = |agent: &str, project: Value, tool: &str, failed: bool| {
+        h.post_json("/v1/sessions/calls", json!({ "agent_id": agent, "project_id": project, "tool": tool, "failed": failed }))
+    };
+    assert_eq!(call("agent-http", json!("p"), "search_memory", false).await.0, 204);
+    assert_eq!(call("agent-http", json!("p"), "search_memory", true).await.0, 204);
+    assert_eq!(call("agent-http", Value::Null, "a tool nobody wrote", false).await.0, 204);
+    assert_eq!(call("another-agent", json!("p"), "save_memory", false).await.0, 204);
+    assert_eq!(call("agent-http", json!("q"), "save_memory", false).await.0, 204);
+
+    let in_p = &session_rows(&h, "in-p")[0];
+    assert_eq!((in_p.count(CountKind::Call, "search_memory"), in_p.count(CountKind::FailedCall, "search_memory")), (2, 1));
+    assert_eq!(in_p.count(CountKind::Call, "save_memory"), 0, "another agent's call, or one from another project, is not its");
+    hook_event(&h, json!({ "agent_id": "agent-http", "session_id": "in-none" })).await;
+    let in_none = &session_rows(&h, "in-none")[0];
+    assert_eq!(in_none.counts.keys().filter(|(kind, _)| *kind == CountKind::Call).map(|(_, name)| name.as_str()).collect::<Vec<_>>(), ["other"]);
+}
+
+#[tokio::test]
+async fn an_accepted_save_and_an_empty_search_count_for_their_session() {
+    let h = keeping_sessions().await;
+    let (app, bare) = (registered(&h, "/work/app").await, registered(&h, "/work/bare").await);
+    for (project, id) in [(&app, "s-app"), (&bare, "s-bare")] {
+        hook_event(&h, json!({ "agent_id": "agent-http", "project_id": project, "session_id": id, "event": "start" })).await;
+    }
+    let save = |body: Value| h.post_json("/v1/memories", body);
+    let summary = json!({ "agent_id": "agent-http", "project_id": app, "content": "the session moved the parser to its own crate",
+        "memory_type": "session_summary", "operation_id": "op-summary" });
+    assert_eq!(save(summary).await.0, 201);
+    assert_eq!(save(json!({ "agent_id": "agent-http", "project_id": app, "content": "the parser of app is written by hand" })).await.0, 201);
+    assert_eq!(save(json!({ "agent_id": "nobody-registered", "project_id": app, "content": "a save without a session" })).await.0, 201);
+
+    let search = |project: &str, query: &str| h.post_json("/v1/search", json!({ "agent_id": "agent-http", "project_id": project, "query": query }));
+    let (status, found) = search(&app, "the parser of app is written by hand").await;
+    assert_eq!(status, 200, "{found}");
+    assert!(!found["hits"].as_array().unwrap().is_empty(), "{found}");
+    let (status, nothing) = search(&bare, "the parser of app is written by hand").await;
+    assert_eq!((status, nothing["hits"].as_array().map(Vec::len)), (200, Some(0)), "{nothing}");
+    let several = json!({ "agent_id": "agent-http", "project_ids": [bare, registered(&h, "/work/void").await], "query": "anything at all" });
+    assert_eq!(h.post_json("/v1/search", several).await.0, 200);
+
+    let app_row = &session_rows(&h, "s-app")[0];
+    assert_eq!((app_row.count(CountKind::Save, "session_summary"), app_row.count(CountKind::Save, "unspecified")), (1, 1));
+    assert_eq!((app_row.empty_searches, app_row.last_save_at_ms.is_some()), (0, true));
+    hook_event(&h, json!({ "agent_id": "agent-http", "project_id": bare, "session_id": "s-bare" })).await;
+    let bare_row = &session_rows(&h, "s-bare")[0];
+    assert_eq!((bare_row.empty_searches, bare_row.last_save_at_ms), (1, None), "a search over several projects is nobody's");
+}
+
+#[tokio::test]
+async fn a_merge_moves_the_sessions_and_a_delete_drops_them() {
+    let h = keeping_sessions().await;
+    let (app, web, empty) = (registered(&h, "/work/app").await, registered(&h, "/work/web").await, registered(&h, "/work/empty").await);
+    for (project, id) in [(&app, "s-app"), (&web, "s-web"), (&empty, "s-empty")] {
+        hook_event(&h, json!({ "agent_id": "agent-http", "project_id": project, "session_id": id, "event": "start" })).await;
+    }
+    let log = h.ctx.runtime.metrics.sessions();
+    log.take();
+
+    let (status, dry) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web, "dry_run": true })).await;
+    assert_eq!(status, 200, "{dry}");
+    assert!(log.take().changes.is_empty(), "a dry run moves nothing");
+    let (status, merged) = h.post_json("/v1/projects/merge", json!({ "source": app, "target": web })).await;
+    assert_eq!(status, 200, "{merged}");
+    assert_eq!(log.take().changes, [ProjectChange::Merged { from: app.clone(), into: web.clone() }]);
+    hook_event(&h, json!({ "agent_id": "agent-http", "project_id": app, "session_id": "s-app", "event": "prompt" })).await;
+    assert_eq!(session_rows(&h, "s-app")[0].project_id.as_deref(), Some(web.as_str()));
+
+    let (status, deleted) = h.post_json("/v1/projects/delete", json!({ "project_id": empty })).await;
+    assert_eq!((status, deleted["delete_id"].is_i64()), (200, true), "{deleted}");
+    assert_eq!(log.take().changes, [ProjectChange::Deleted(empty)]);
+    h.post_json("/v1/sessions/calls", json!({ "agent_id": "agent-http", "project_id": Value::Null, "tool": "search_memory" })).await;
+    log.activity("s-empty", i64::MAX / 2, clawg_core::metrics::sessions::Activity::EmptySearch);
+    assert!(session_rows(&h, "s-empty").is_empty(), "nothing is left of a deleted project's session");
+}
+
+#[tokio::test]
+async fn no_text_path_or_user_reaches_a_session_row() {
+    let h = keeping_sessions().await;
+    let app = registered(&h, "/work/app").await;
+    hook_event(
+        &h,
+        json!({ "agent_id": "agent-http", "project_id": app, "session_id": "s-1", "event": "start",
+            "source": "SECRET-source", "client": "SECRET-client", "cwd": "/SECRET/cwd", "transcript_path": "/SECRET/transcript.jsonl",
+            "user_email": "SECRET@example.com", "prompt": "SECRET prompt" }),
+    )
+    .await;
+    let save = json!({ "agent_id": "agent-http", "project_id": app, "content": "SECRET content of a memory", "topic_key": "secret-topic" });
+    assert_eq!(h.post_json("/v1/memories", save).await.0, 201);
+    let search = json!({ "agent_id": "agent-http", "project_id": app, "query": "SECRET query that finds nothing zzzz" });
+    assert_eq!(h.post_json("/v1/search", search).await.0, 200);
+    let call = json!({ "agent_id": "agent-http", "project_id": app, "tool": "SECRET-tool", "failed": true });
+    assert_eq!(h.post_json("/v1/sessions/calls", call).await.0, 204);
+    assert_eq!(h.post_json("/v1/sessions/end", json!({ "session_id": "s-1", "reason": "SECRET reason" })).await.0, 204);
+
+    let rows = h.ctx.runtime.metrics.sessions().take().rows;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert!(!format!("{row:?}").to_lowercase().contains("secret"), "{row:?}");
+    assert_eq!((row.session_id.as_str(), row.agent_id.as_str(), row.project_id.as_deref()), ("s-1", "agent-http", Some(app.as_str())));
+    assert_eq!((row.client.as_str(), row.end_reason.as_deref()), ("other", Some("other")));
+    let names: Vec<(CountKind, &str)> = row.counts.keys().map(|(kind, name)| (*kind, name.as_str())).collect();
+    assert_eq!(
+        names,
+        [(CountKind::Start, "other"), (CountKind::Call, "other"), (CountKind::FailedCall, "other"), (CountKind::Save, "unspecified")]
+    );
 }

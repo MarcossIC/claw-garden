@@ -6,6 +6,8 @@
 //! reader is lenient: a line of a kind it does not know is counted, not an
 //! error, and a line that is not JSON is reported by its number.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -23,12 +25,33 @@ pub struct ToolCall {
     pub after_tool_search: bool,
 }
 
+/// The tokens of the main loop. A subagent's are left out, and so is the
+/// response that crossed `--max-budget-usd`: [`Outcome::model_usage`] has them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// The cache writes by how long they last, which bills them differently:
+    /// an API key gets 5 minutes and a subscription 1 hour.
+    #[serde(default)]
+    pub cache_creation_5m_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_1h_input_tokens: u64,
+}
+
+/// What one model spent in the whole session, its subagents included.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    /// The client's estimate, priced by its own table.
+    pub cost_usd: Option<f64>,
+    /// Which table priced it: `list`, `managed` or `unknown`.
+    pub cost_basis: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -40,6 +63,9 @@ pub struct Outcome {
     pub duration_ms: Option<u64>,
     pub total_cost_usd: Option<f64>,
     pub usage: Usage,
+    /// By model name.
+    #[serde(default)]
+    pub model_usage: BTreeMap<String, ModelUsage>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -55,6 +81,8 @@ pub struct Transcript {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub client_version: Option<String>,
+    /// The credential that paid, such as `ANTHROPIC_API_KEY`.
+    pub api_key_source: Option<String>,
     /// Each MCP server the session started with and its status.
     pub mcp_servers: Vec<(String, String)>,
     pub calls: Vec<ToolCall>,
@@ -62,6 +90,9 @@ pub struct Transcript {
     /// The assistant's text blocks, in order.
     pub texts: Vec<String>,
     pub compactions: usize,
+    /// The input, cache written and cache read of the first message of the
+    /// main loop: what the session's context costs before the agent acts.
+    pub first_request_tokens: Option<u64>,
     pub result: Option<Outcome>,
     /// Lines of a kind this reader does not know.
     pub unknown_lines: usize,
@@ -110,6 +141,7 @@ pub fn parse(text: &str) -> Transcript {
                 t.session_id = str_field(&event, "session_id");
                 t.model = str_field(&event, "model");
                 t.client_version = str_field(&event, "claude_code_version");
+                t.api_key_source = str_field(&event, "apiKeySource");
                 for server in event.get("mcp_servers").and_then(Value::as_array).into_iter().flatten() {
                     let name = server.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
                     let status = server.get("status").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -123,6 +155,12 @@ pub fn parse(text: &str) -> Transcript {
                 t.hooks.push(HookEvent { subtype: s.to_owned(), text: strings.join("\n") });
             }
             ("assistant", _) => {
+                if !subagent && t.first_request_tokens.is_none() {
+                    t.first_request_tokens = event.get("message").and_then(|m| m.get("usage")).map(|u| {
+                        let tokens = |name: &str| u.get(name).and_then(Value::as_u64).unwrap_or(0);
+                        tokens("input_tokens") + tokens("cache_creation_input_tokens") + tokens("cache_read_input_tokens")
+                    });
+                }
                 for block in content(&event) {
                     match block.get("type").and_then(Value::as_str) {
                         Some("text") => t.texts.push(block.get("text").and_then(Value::as_str).unwrap_or("").to_owned()),
@@ -158,6 +196,9 @@ pub fn parse(text: &str) -> Transcript {
             ("result", _) => {
                 let usage = event.get("usage");
                 let tokens = |name: &str| usage.and_then(|u| u.get(name)).and_then(Value::as_u64).unwrap_or(0);
+                let written = |name: &str| {
+                    usage.and_then(|u| u.get("cache_creation")).and_then(|c| c.get(name)).and_then(Value::as_u64).unwrap_or(0)
+                };
                 t.result = Some(Outcome {
                     subtype: subtype.to_owned(),
                     is_error: event.get("is_error").and_then(Value::as_bool).unwrap_or(false),
@@ -170,7 +211,16 @@ pub fn parse(text: &str) -> Transcript {
                         output_tokens: tokens("output_tokens"),
                         cache_creation_input_tokens: tokens("cache_creation_input_tokens"),
                         cache_read_input_tokens: tokens("cache_read_input_tokens"),
+                        cache_creation_5m_input_tokens: written("ephemeral_5m_input_tokens"),
+                        cache_creation_1h_input_tokens: written("ephemeral_1h_input_tokens"),
                     },
+                    model_usage: event
+                        .get("modelUsage")
+                        .and_then(Value::as_object)
+                        .into_iter()
+                        .flatten()
+                        .map(|(name, m)| (name.clone(), model_usage(m)))
+                        .collect(),
                 });
             }
             _ => t.unknown_lines += 1,
@@ -181,6 +231,19 @@ pub fn parse(text: &str) -> Transcript {
 
 fn str_field(event: &serde_json::Map<String, Value>, name: &str) -> Option<String> {
     event.get(name).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// One entry of `modelUsage`, whose fields the client names in camel case.
+fn model_usage(m: &Value) -> ModelUsage {
+    let tokens = |name: &str| m.get(name).and_then(Value::as_u64).unwrap_or(0);
+    ModelUsage {
+        input_tokens: tokens("inputTokens"),
+        output_tokens: tokens("outputTokens"),
+        cache_read_input_tokens: tokens("cacheReadInputTokens"),
+        cache_creation_input_tokens: tokens("cacheCreationInputTokens"),
+        cost_usd: m.get("costUSD").and_then(Value::as_f64),
+        cost_basis: m.get("costBasis").and_then(Value::as_str).map(str::to_owned),
+    }
 }
 
 fn content(event: &serde_json::Map<String, Value>) -> impl Iterator<Item = &Value> {
@@ -253,6 +316,48 @@ not json
         assert_eq!(t.answer(), "Port 48213.");
         assert_eq!((outcome.num_turns, outcome.duration_ms, outcome.total_cost_usd), (Some(4), Some(9100), Some(0.21)));
         assert_eq!(outcome.usage.cache_read_input_tokens, 41000);
+    }
+
+    /// The fields as Claude Code 2.1.322 prints them.
+    const PAID: &str = r#"{"type":"system","subtype":"init","session_id":"s2","model":"claude-sonnet-5-5","apiKeySource":"ANTHROPIC_API_KEY"}
+{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.0912,"usage":{"input_tokens":30,"output_tokens":800,"cache_creation_input_tokens":12000,"cache_read_input_tokens":50000,"cache_creation":{"ephemeral_5m_input_tokens":11000,"ephemeral_1h_input_tokens":1000}},"modelUsage":{"claude-sonnet-5-5":{"inputTokens":30,"outputTokens":800,"cacheReadInputTokens":50000,"cacheCreationInputTokens":12000,"webSearchRequests":0,"costUSD":0.09,"contextWindow":200000,"costBasis":"list"},"claude-haiku-5-5":{"inputTokens":400,"outputTokens":20,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":0.0012}}}
+"#;
+
+    #[test]
+    fn the_outcome_carries_the_tokens_of_each_model_and_the_cache_writes_by_duration() {
+        let t = parse(PAID);
+        assert_eq!(t.api_key_source.as_deref(), Some("ANTHROPIC_API_KEY"));
+        let outcome = t.result.unwrap();
+        assert_eq!((outcome.usage.cache_creation_5m_input_tokens, outcome.usage.cache_creation_1h_input_tokens), (11000, 1000));
+        assert_eq!(outcome.model_usage.len(), 2);
+        let sonnet = &outcome.model_usage["claude-sonnet-5-5"];
+        assert_eq!(
+            (sonnet.input_tokens, sonnet.output_tokens, sonnet.cache_read_input_tokens, sonnet.cache_creation_input_tokens),
+            (30, 800, 50000, 12000)
+        );
+        assert_eq!((sonnet.cost_usd, sonnet.cost_basis.as_deref()), (Some(0.09), Some("list")));
+        let haiku = &outcome.model_usage["claude-haiku-5-5"];
+        assert_eq!((haiku.input_tokens, haiku.cost_usd, haiku.cost_basis.as_deref()), (400, Some(0.0012), None));
+    }
+
+    #[test]
+    fn a_stream_without_the_newer_fields_reads_them_as_absent() {
+        let t = parse(STREAM);
+        assert_eq!(t.api_key_source, None);
+        let outcome = t.result.unwrap();
+        assert!(outcome.model_usage.is_empty());
+        assert_eq!((outcome.usage.cache_creation_5m_input_tokens, outcome.usage.cache_creation_1h_input_tokens), (0, 0));
+    }
+
+    #[test]
+    fn the_first_request_is_the_first_message_of_the_main_loop() {
+        let t = parse(
+            r#"{"type":"assistant","message":{"content":[],"usage":{"input_tokens":9,"cache_creation_input_tokens":90,"cache_read_input_tokens":900}},"parent_tool_use_id":"sub"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":8733,"cache_read_input_tokens":11728,"output_tokens":16}},"parent_tool_use_id":null}
+{"type":"assistant","message":{"content":[],"usage":{"input_tokens":5,"cache_creation_input_tokens":5,"cache_read_input_tokens":5}},"parent_tool_use_id":null}"#,
+        );
+        assert_eq!(t.first_request_tokens, Some(2 + 8733 + 11728), "input, cache written and cache read; not the subagent's");
+        assert_eq!(parse(STREAM).first_request_tokens, None, "messages without usage");
     }
 
     #[test]

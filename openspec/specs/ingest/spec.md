@@ -119,7 +119,7 @@ Un save explícito con clave, cuyas piezas se guardaron todas, MUST hacer cuatro
 
 Las filas reemplazadas conservan contenido, vector y texto: la historia de un tema es la cadena de sus filas `superseded`. Salen de la búsqueda por vectores y del índice de texto, como toda fila reemplazada.
 
-Cada fila que una revisión reemplaza MUST quedar con `supersede_cause = 'revision'`, en el mismo `UPDATE` que pone `superseded_by` (`SUPERSEDE_SQL`, `crates/clawg-core/src/memory/dispute.rs:272`, llamada con `"revision"` desde `revise_in`, `topic.rs:131`). Un veredicto escribe `verdict` ([`specs/disputes`](../disputes/spec.md), R1). Esa causa es la que decide, al borrar la fila que reemplazó, si la anterior vuelve ([`specs/restore`](../restore/spec.md), «Borrar la vigente revive a la anterior»). Una fila que vuelve a reemplazarse por una revisión, después de revivir, pierde su `revived_from`.
+Cada fila que una revisión reemplaza MUST quedar con `supersede_cause = 'revision'`, en el mismo `UPDATE` que pone `superseded_by` (`SUPERSEDE_SQL`, `crates/clawg-core/src/memory/dispute.rs:350`, llamada con `"revision"` desde `revise_in`, `topic.rs:131`). Un veredicto escribe `verdict` ([`specs/disputes`](../disputes/spec.md), R1). Esa causa es la que decide, al borrar la fila que reemplazó, si la anterior vuelve ([`specs/restore`](../restore/spec.md), «Borrar la vigente revive a la anterior»). Una fila que vuelve a reemplazarse por una revisión, después de revivir, pierde su `revived_from`.
 
 **Test:** `a_revision_records_why_it_replaced` en `crates/clawg-core/src/memory/worker.rs`.
 

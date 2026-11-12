@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use super::event::{DetailValue, Event, EventKind};
 use super::histogram::{Histogram, Unit};
+use super::sessions::SessionLog;
 
 /// How many of the run's latest events `GET /v1/metrics` can show.
 pub const RUN_EVENTS_KEPT: usize = 100;
@@ -112,6 +113,7 @@ struct State {
 pub struct Recorder {
     state: Mutex<State>,
     writing: AtomicBool,
+    sessions: SessionLog,
 }
 
 impl Recorder {
@@ -184,8 +186,16 @@ impl Recorder {
         self.writing.load(Ordering::Relaxed)
     }
 
+    /// Says whether the minutes are kept. The log of sessions follows it:
+    /// with nowhere to write, it holds nothing.
     pub fn set_writing(&self, writing: bool) {
         self.writing.store(writing, Ordering::Relaxed);
+        self.sessions.set_enabled(writing);
+    }
+
+    /// The client sessions of this run.
+    pub fn sessions(&self) -> &SessionLog {
+        &self.sessions
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {

@@ -7,6 +7,7 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::clock::TimestampMs;
 use crate::memory::contradiction::{excerpt, Candidate};
 use crate::memory::dispute::{release_challengers, SUPERSEDE_SQL};
@@ -18,7 +19,7 @@ use crate::memory::sharing::Reader;
 use crate::memory::MemoryStore;
 
 /// Longest key accepted, in characters.
-pub const MAX_TOPIC_KEY_LEN: usize = 80;
+pub(crate) const MAX_TOPIC_KEY_LEN: usize = 80;
 
 /// Why a `topic_key` is refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -197,7 +198,7 @@ impl MemoryStore {
         self.conn
             .call(move |c| scope_rows(c, &scope).map(|rows| rows.into_iter().map(|(row, ..)| row).collect()))
             .await
-            .map_err(backend("topic_rows"))
+            .map_err(failed_call(ClosedAs::During("topic_rows")))
     }
 
     /// Finishes a save no outbox row holds: links its pieces when there are
@@ -227,15 +228,7 @@ impl MemoryStore {
                 Ok(replaced)
             })
             .await
-            .map_err(backend("finish_save"))
-    }
-}
-
-fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryError {
-    move |e| match e {
-        tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-        tokio_rusqlite::Error::ConnectionClosed => MemoryError::Backend(format!("connection closed during {context}")),
-        other => MemoryError::Backend(other.to_string()),
+            .map_err(failed_call(ClosedAs::During("finish_save")))
     }
 }
 

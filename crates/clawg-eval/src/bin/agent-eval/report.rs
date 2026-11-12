@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::arm::Arm;
 use crate::run::{RunResult, RESULT_FILE};
 use crate::score::TracerFate;
+use crate::stream::{ModelUsage, Outcome};
 
 /// How many directories below the one given a `result.json` may be.
 const MAX_DEPTH: usize = 3;
@@ -39,6 +40,45 @@ pub struct Row {
     pub used: usize,
     pub retrieved_but_ignored: usize,
     pub never_reached: usize,
+    /// The median over the runs that report it; `None` when none does.
+    pub first_request_tokens: Option<f64>,
+    /// The mean of the instruction files each run loaded for a path the
+    /// agent worked on.
+    pub rules_by_path: f64,
+}
+
+/// Tokens summed over runs: of every model a run reports, or of its main loop
+/// when it reports none by model.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// The main loop's cache writes by how long they last; the client splits
+    /// no other model's.
+    pub cache_write_5m: u64,
+    pub cache_write_1h: u64,
+}
+
+impl Tokens {
+    fn add(&mut self, outcome: &Outcome) {
+        let u = &outcome.usage;
+        if outcome.model_usage.is_empty() {
+            self.input += u.input_tokens;
+            self.output += u.output_tokens;
+            self.cache_read += u.cache_read_input_tokens;
+            self.cache_write += u.cache_creation_input_tokens;
+        }
+        for m in outcome.model_usage.values() {
+            self.input += m.input_tokens;
+            self.output += m.output_tokens;
+            self.cache_read += m.cache_read_input_tokens;
+            self.cache_write += m.cache_creation_input_tokens;
+        }
+        self.cache_write_5m += u.cache_creation_5m_input_tokens;
+        self.cache_write_1h += u.cache_creation_1h_input_tokens;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,12 +89,27 @@ pub struct Report {
     /// The sum of the costs reported; a run that reports none adds 0.
     pub cost_usd: f64,
     pub runs_without_cost: usize,
+    pub tokens: Tokens,
 }
 
 fn mean(values: impl Iterator<Item = f64>) -> Option<f64> {
     let (sum, n) = values.fold((0.0, 0_u32), |(sum, n), v| (sum + v, n + 1));
     (n > 0).then(|| sum / f64::from(n))
 }
+
+fn median(values: impl Iterator<Item = u64>) -> Option<f64> {
+    let mut sorted: Vec<u64> = values.collect();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    match n {
+        0 => None,
+        _ if n % 2 == 1 => Some(sorted[n / 2] as f64),
+        _ => Some((sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0),
+    }
+}
+
+/// The `load_reason` of an instruction file loaded for a path the agent worked on.
+const PATH_GLOB_MATCH: &str = "path_glob_match";
 
 /// Tasks by id, then arms in the order of [`crate::arm::ARMS`], an unknown one last.
 fn arm_rank(arm: &str) -> usize {
@@ -86,28 +141,37 @@ pub fn aggregate(results: &[RunResult]) -> Report {
                 used: fates(TracerFate::Used),
                 retrieved_but_ignored: fates(TracerFate::RetrievedButIgnored),
                 never_reached: fates(TracerFate::NeverReached),
+                first_request_tokens: median(group.iter().filter_map(|r| r.session.first_request_tokens)),
+                rules_by_path: group
+                    .iter()
+                    .map(|r| r.session.instructions_loaded.iter().filter(|l| l.load_reason == PATH_GLOB_MATCH).count())
+                    .sum::<usize>() as f64
+                    / group.len() as f64,
             }
         })
         .collect();
     let costs = |r: &RunResult| r.session.outcome.as_ref().and_then(|o| o.total_cost_usd);
+    let mut tokens = Tokens::default();
+    results.iter().filter_map(|r| r.session.outcome.as_ref()).for_each(|o| tokens.add(o));
     Report {
         rows,
         runs: results.len(),
         successes: results.iter().filter(|r| r.score.success).count(),
         cost_usd: results.iter().filter_map(costs).sum(),
         runs_without_cost: results.iter().filter(|r| costs(r).is_none()).count(),
+        tokens,
     }
 }
 
 pub fn render(report: &Report) -> String {
     let figure = |v: Option<f64>, places: usize| v.map_or_else(|| "-".to_owned(), |v| format!("{v:.places$}"));
     let mut out = String::from(
-        "| task | category | arm | runs | successes | errors | cost USD | turns | seconds | clawg calls | used | retrieved_but_ignored | never_reached |\n\
-         | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| task | category | arm | runs | successes | errors | cost USD | turns | seconds | clawg calls | used | retrieved_but_ignored | never_reached | first request tokens | rules by path |\n\
+         | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for r in &report.rows {
         out.push_str(&format!(
-            "| {}{} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {:.1} | {} | {} | {} |\n",
+            "| {}{} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {:.1} | {} | {} | {} | {} | {:.1} |\n",
             r.task,
             if r.example { " (example)" } else { "" },
             r.category,
@@ -123,12 +187,76 @@ pub fn render(report: &Report) -> String {
             r.used,
             r.retrieved_but_ignored,
             r.never_reached,
+            figure(r.first_request_tokens, 0),
+            r.rules_by_path,
         ));
     }
     out.push_str(&format!(
         "\nTotals: {} runs, {} successes, cost {:.4} USD ({} runs without a cost)\n",
         report.runs, report.successes, report.cost_usd, report.runs_without_cost
     ));
+    let t = &report.tokens;
+    out.push_str(&format!(
+        "Tokens of every model: input {}, output {}, cache read {}, cache write {} (in the main loop, {} for 5 minutes and {} for 1 hour)\n",
+        t.input, t.output, t.cache_read, t.cache_write, t.cache_write_5m, t.cache_write_1h
+    ));
+    out
+}
+
+const COSTS_HEADER: &str = "run,task,arm,started_at,ended_at,api_key_source,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,cache_creation_5m_input_tokens,cache_creation_1h_input_tokens,cost_usd,cost_basis";
+
+/// A CSV with a line per session and model, to price the sessions by their
+/// tokens and to find each one in the console's usage by its times. The cache
+/// writes by duration are the main loop's, so they go on the line of the
+/// session's model only. A session that printed no result has a line without
+/// figures.
+pub fn costs(runs: &[(String, RunResult)]) -> String {
+    let field = |v: Option<&str>| match v {
+        Some(s) if s.contains([',', '"', '\n']) => format!("\"{}\"", s.replace('"', "\"\"")),
+        Some(s) => s.to_owned(),
+        None => String::new(),
+    };
+    let mut out = String::from(COSTS_HEADER);
+    out.push('\n');
+    for (name, r) in runs {
+        let s = &r.session;
+        let head = [Some(name.as_str()), Some(r.task.as_str()), Some(r.arm.as_str()), s.started_at.as_deref(), s.ended_at.as_deref(), s.api_key_source.as_deref()]
+            .map(field)
+            .join(",");
+        let Some(outcome) = &s.outcome else {
+            out.push_str(&format!("{head}{}\n", ",".repeat(9)));
+            continue;
+        };
+        let u = &outcome.usage;
+        let durations = format!("{},{}", u.cache_creation_5m_input_tokens, u.cache_creation_1h_input_tokens);
+        let mut line = |model: Option<&str>, m: &ModelUsage, durations: &str| {
+            out.push_str(&format!(
+                "{head},{},{},{},{},{},{durations},{},{}\n",
+                field(model),
+                m.input_tokens,
+                m.output_tokens,
+                m.cache_read_input_tokens,
+                m.cache_creation_input_tokens,
+                m.cost_usd.map(|c| c.to_string()).unwrap_or_default(),
+                field(m.cost_basis.as_deref()),
+            ));
+        };
+        if outcome.model_usage.is_empty() {
+            let main = ModelUsage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cache_read_input_tokens: u.cache_read_input_tokens,
+                cache_creation_input_tokens: u.cache_creation_input_tokens,
+                cost_usd: outcome.total_cost_usd,
+                cost_basis: None,
+            };
+            line(s.model.as_deref(), &main, &durations);
+        }
+        for (model, m) in &outcome.model_usage {
+            let own = s.model.as_deref() == Some(model.as_str());
+            line(Some(model), m, if own { &durations } else { "," });
+        }
+    }
     out
 }
 
@@ -160,6 +288,12 @@ fn find(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), ReportEr
 
 /// Every result below `dir`.
 pub fn load(dir: &Path) -> Result<Vec<RunResult>, ReportError> {
+    Ok(load_named(dir)?.into_iter().map(|(_, r)| r).collect())
+}
+
+/// Every result below `dir`, each named by the path of its run below `dir`,
+/// with `/` between directories.
+pub fn load_named(dir: &Path) -> Result<Vec<(String, RunResult)>, ReportError> {
     let mut paths = Vec::new();
     find(dir, 1, &mut paths)?;
     if paths.is_empty() {
@@ -169,7 +303,10 @@ pub fn load(dir: &Path) -> Result<Vec<RunResult>, ReportError> {
         .into_iter()
         .map(|path| {
             let text = std::fs::read_to_string(&path).map_err(|source| ReportError::Io { path: path.clone(), source })?;
-            serde_json::from_str(&text).map_err(|e| ReportError::Invalid(path, e.to_string()))
+            let result = serde_json::from_str(&text).map_err(|e| ReportError::Invalid(path.clone(), e.to_string()))?;
+            let run = path.parent().and_then(|p| p.strip_prefix(dir).ok()).unwrap_or(Path::new(""));
+            let name = run.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+            Ok((name, result))
         })
         .collect()
 }
@@ -177,9 +314,10 @@ pub fn load(dir: &Path) -> Result<Vec<RunResult>, ReportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::Loaded;
     use crate::run::Session;
     use crate::score::{CheckResult, Score};
-    use crate::stream::Outcome;
+    use crate::stream::{ModelUsage, Outcome, Usage};
 
     struct Spec {
         task: &'static str,
@@ -219,6 +357,9 @@ mod tests {
                 session_id: None,
                 model: None,
                 client_version: None,
+                api_key_source: None,
+                started_at: None,
+                ended_at: None,
                 mcp_servers: vec![],
                 tool_calls: 0,
                 clawg_calls: [("search_memory".to_owned(), s.calls)].into(),
@@ -229,6 +370,8 @@ mod tests {
                 compactions: 0,
                 unknown_lines: 0,
                 invalid_lines: vec![],
+                first_request_tokens: None,
+                instructions_loaded: vec![],
                 outcome: Some(Outcome {
                     subtype: "success".to_owned(),
                     is_error: false,
@@ -298,10 +441,131 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with("| task | category | arm | runs | successes | errors | cost USD |"));
         assert!(lines[1].starts_with("| --- |"));
-        assert_eq!(lines[2], "| a-count | K1 | a0 | 1 | 1/1 | 0 | 0.2500 | 4.0 | 10.0 | 2.0 | 1 | 0 | 1 |");
-        assert_eq!(lines[3], "| b-port | K1 | a3 | 3 | 1/3 | 1 | 0.2500 | 5.3 | 13.3 | 1.3 | 2 | 2 | 2 |");
+        assert_eq!(lines[2], "| a-count | K1 | a0 | 1 | 1/1 | 0 | 0.2500 | 4.0 | 10.0 | 2.0 | 1 | 0 | 1 | - | 0.0 |");
+        assert_eq!(lines[3], "| b-port | K1 | a3 | 3 | 1/3 | 1 | 0.2500 | 5.3 | 13.3 | 1.3 | 2 | 2 | 2 | - | 0.0 |");
         assert!(lines[5].starts_with("| z-example (example) | K1 | a0 |"));
         assert_eq!(lines[7], "Totals: 6 runs, 4 successes, cost 1.2500 USD (1 runs without a cost)");
+    }
+
+    #[test]
+    fn rows_carry_the_median_first_request_and_the_rules_loaded_by_path() {
+        let run = |arm: &'static str, tokens: Option<u64>, by_path: usize| {
+            let mut r = result(&spec("k", arm));
+            r.session.first_request_tokens = tokens;
+            r.session.instructions_loaded = (0..by_path)
+                .map(|i| Loaded { file_path: format!("/w/.claude/rules/clawg/rules-{i}.md"), load_reason: "path_glob_match".into() })
+                .chain([Loaded { file_path: "/c/CLAUDE.md".into(), load_reason: "session_start".into() }])
+                .collect();
+            r
+        };
+        let report = aggregate(&[
+            run("l2", Some(300), 3),
+            run("l2", Some(100), 0),
+            run("l2", None, 0),
+            run("l2", Some(200), 1),
+            run("a4", Some(100), 0),
+            run("a4", Some(300), 0),
+            run("l0", None, 0),
+            run("a3", None, 0),
+        ]);
+        let order: Vec<&str> = report.rows.iter().map(|r| r.arm.as_str()).collect();
+        assert_eq!(order, ["a3", "a4", "l0", "l2"]);
+        let l2 = &report.rows[3];
+        assert_eq!(l2.first_request_tokens, Some(200.0), "the median of the runs that give it");
+        assert!((l2.rules_by_path - 1.0).abs() < 1e-9);
+        assert_eq!(report.rows[1].first_request_tokens, Some(200.0), "an even count takes the mean of the middle two");
+        assert_eq!(report.rows[0].first_request_tokens, None);
+        let text = render(&report);
+        assert!(text.lines().next().unwrap().ends_with("| never_reached | first request tokens | rules by path |"), "{text}");
+        assert!(text.lines().nth(5).unwrap().ends_with("| 200 | 1.0 |"), "{text}");
+    }
+
+    fn model(input: u64, output: u64, read: u64, write: u64, cost: f64) -> ModelUsage {
+        ModelUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: read,
+            cache_creation_input_tokens: write,
+            cost_usd: Some(cost),
+            cost_basis: Some("list".to_owned()),
+        }
+    }
+
+    /// A paid session on two models, the way Claude Code reports one.
+    fn paid() -> RunResult {
+        let mut r = result(&spec("b-port", "a3"));
+        r.session.model = Some("claude-sonnet-5-5".to_owned());
+        r.session.api_key_source = Some("ANTHROPIC_API_KEY".to_owned());
+        r.session.started_at = Some("2026-11-11 15:00:00 UTC".to_owned());
+        r.session.ended_at = Some("2026-11-11 15:04:30 UTC".to_owned());
+        let outcome = r.session.outcome.as_mut().unwrap();
+        outcome.total_cost_usd = Some(0.0912);
+        outcome.usage = Usage {
+            input_tokens: 30,
+            output_tokens: 800,
+            cache_creation_input_tokens: 12000,
+            cache_read_input_tokens: 50000,
+            cache_creation_5m_input_tokens: 11000,
+            cache_creation_1h_input_tokens: 1000,
+        };
+        outcome.model_usage = [
+            ("claude-sonnet-5-5".to_owned(), model(30, 800, 50000, 12000, 0.09)),
+            ("claude-haiku-5-5".to_owned(), model(400, 20, 0, 0, 0.0012)),
+        ]
+        .into();
+        r
+    }
+
+    #[test]
+    fn the_totals_add_the_tokens_of_every_model() {
+        let mut no_models = result(&spec("a-count", "a0"));
+        no_models.session.outcome.as_mut().unwrap().usage =
+            Usage { input_tokens: 5, output_tokens: 7, cache_read_input_tokens: 100, cache_creation_input_tokens: 9, ..Usage::default() };
+        let report = aggregate(&[paid(), no_models]);
+        assert_eq!(
+            report.tokens,
+            Tokens { input: 435, output: 827, cache_read: 50100, cache_write: 12009, cache_write_5m: 11000, cache_write_1h: 1000 },
+            "a run without a breakdown by model adds its main loop"
+        );
+        let text = render(&report);
+        assert!(
+            text.ends_with("Tokens of every model: input 435, output 827, cache read 50100, cache write 12009 (in the main loop, 11000 for 5 minutes and 1000 for 1 hour)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_costs_have_a_line_per_session_and_model_with_the_cache_durations_on_the_session_model() {
+        let cut = {
+            let mut r = result(&spec("b-port", "a4"));
+            r.session.outcome = None;
+            r
+        };
+        let csv = costs(&[("humo/b-port.a3.1".to_owned(), paid()), ("humo/b-port.a4.1".to_owned(), cut)]);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "run,task,arm,started_at,ended_at,api_key_source,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,cache_creation_5m_input_tokens,cache_creation_1h_input_tokens,cost_usd,cost_basis"
+        );
+        assert_eq!(
+            lines[1],
+            "humo/b-port.a3.1,b-port,a3,2026-11-11 15:00:00 UTC,2026-11-11 15:04:30 UTC,ANTHROPIC_API_KEY,claude-haiku-5-5,400,20,0,0,,,0.0012,list"
+        );
+        assert_eq!(
+            lines[2],
+            "humo/b-port.a3.1,b-port,a3,2026-11-11 15:00:00 UTC,2026-11-11 15:04:30 UTC,ANTHROPIC_API_KEY,claude-sonnet-5-5,30,800,50000,12000,11000,1000,0.09,list"
+        );
+        assert_eq!(lines[3], "humo/b-port.a4.1,b-port,a4,,,,,,,,,,,,", "a session cut short is listed without figures");
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn a_session_without_a_breakdown_by_model_is_costed_from_its_main_loop() {
+        let mut r = result(&spec("a-count", "a0"));
+        r.session.model = Some("m".to_owned());
+        r.session.outcome.as_mut().unwrap().usage = Usage { input_tokens: 5, output_tokens: 7, ..Usage::default() };
+        let csv = costs(&[("r".to_owned(), r)]);
+        assert_eq!(csv.lines().nth(1), Some("r,a-count,a0,,,,m,5,7,0,0,0,0,0.25,"));
     }
 
     #[test]
@@ -330,7 +594,8 @@ mod tests {
         let run = dir.path().join("runs").join("r1");
         std::fs::create_dir_all(&run).unwrap();
         std::fs::write(run.join(RESULT_FILE), serde_json::to_string_pretty(&original).unwrap()).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), [original]);
+        assert_eq!(load(dir.path()).unwrap(), std::slice::from_ref(&original));
+        assert_eq!(load_named(dir.path()).unwrap(), [("runs/r1".to_owned(), original)], "a run is named by its path below the directory");
 
         let broken = dir.path().join("broken");
         std::fs::create_dir_all(&broken).unwrap();

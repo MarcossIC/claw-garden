@@ -55,7 +55,7 @@ use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
 use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
 use clawg_core::memory::registry::{
-    find_project, keep_apart, list_deletes, list_projects, pending_suggestions, rename_project, resolve_project, suggestion_between,
+    find_project, keep_apart, list_deletes, list_projects, own_folder_count, pending_suggestions, rename_project, resolve_project, suggestion_between,
     Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, Named, Project, RenameError,
     Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
 };
@@ -77,6 +77,7 @@ use clawg_core::preferences::Lang;
 use clawg_core::memory::outbox::{OutboxActionError, OutboxState, OutboxSummary};
 use clawg_core::memory::redact::SecretKind;
 use clawg_core::memory::store_insert::MemoryType;
+use clawg_core::metrics::sessions::{label, Activity, HookEvent, Who, CLIENTS, END_REASONS, OTHER, SOURCES, UNSPECIFIED};
 use clawg_core::runtime::{AcceptError, Accepted, MemoryRuntime};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -87,7 +88,7 @@ use super::guard::{admits, RefusalLog};
 use super::imports::{Busy, Cancel, End, ImportJobs, JobView, Meta};
 use super::lifecycle::now_ms;
 use super::metrics::{metrics_body, prometheus_text, time_request, HttpMeter, Transport};
-use super::sessions::{check_session_id, SessionRegistry};
+use super::sessions::{check_session_id, tool_label, SessionRegistry};
 
 /// Largest `limit` any search will honour. A retrieval request is a vector
 /// scan plus a rerank; letting a caller ask for thousands turns one HTTP call
@@ -409,6 +410,33 @@ pub struct SessionRequest {
     #[serde(default)]
     pub project_id: Option<String>,
     pub session_id: String,
+    /// What the hook reports: `start` or `prompt`. Absent, as a hook from
+    /// before the log of sessions sends it, the session is only registered.
+    #[serde(default)]
+    pub event: Option<String>,
+    /// What started the session, with `start`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The client whose hook this is.
+    #[serde(default)]
+    pub client: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionEndRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToolCallRequest {
+    pub agent_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub tool: String,
+    #[serde(default)]
+    pub failed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,6 +609,10 @@ pub struct HealthBody {
     /// there when the store is too busy to answer `ingest`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import: Option<JobView>,
+    /// The docs refresh that runs and the last one that ended, for each
+    /// project refreshed since the daemon started. Read from memory like
+    /// `import`, so it is there when the store is too busy to answer `ingest`.
+    pub docs_index: Vec<project_docs::IndexStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1125,6 +1157,8 @@ pub fn router(app: Arc<AppCtx>) -> Router {
         .route("/search", post(search))
         .route("/context", post(context))
         .route("/sessions", post(register_session))
+        .route("/sessions/end", post(end_session))
+        .route("/sessions/calls", post(count_tool_call))
         .route(
             "/memories/{kind}/{id}",
             get(get_memory).patch(update_memory).delete(delete_memory),
@@ -1272,6 +1306,7 @@ async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
         uptime_s: app.started_at.elapsed().as_secs(),
         ingest,
         import: app.imports.active(),
+        docs_index: app.runtime.project_docs.statuses(),
     })
 }
 
@@ -1443,6 +1478,8 @@ async fn save_memory(
     // Read now, not by the worker: a replay after a restart must keep the
     // session the save was accepted in.
     let session_id = app.sessions.current(&body.agent_id, project_id.as_deref());
+    let saved_in = session_id.clone();
+    let saved_as = body.memory_type.as_deref().and_then(|raw| raw.parse::<MemoryType>().ok()).map_or(UNSPECIFIED, MemoryType::as_str);
     let event = MemoryEvent {
         agent_id: body.agent_id,
         project_id,
@@ -1475,7 +1512,12 @@ async fn save_memory(
         AcceptError::Store(e) => ApiError::internal(e),
     })?;
     let (row, operation_id, masked) = match accepted {
-        Accepted::Queued { row, operation_id, redacted } => (row, operation_id, redacted),
+        Accepted::Queued { row, operation_id, redacted } => {
+            if let Some(session) = saved_in.as_deref() {
+                app.runtime.metrics.sessions().activity(session, now_ms() as i64, Activity::Save(saved_as));
+            }
+            (row, operation_id, redacted)
+        }
         Accepted::Existing { operation_id, state: OutboxState::Pending, .. } => {
             let body = SaveBody { topic_key, ..SaveBody::queued("already_queued", operation_id) };
             return Ok((StatusCode::ACCEPTED, Json(body)));
@@ -1577,6 +1619,9 @@ async fn search(
     let withheld = found - hits.len();
     app.runtime.metrics.gauge("search.hits", &[], hits.len() as f64);
     app.runtime.metrics.gauge("search.withheld", &[], withheld as f64);
+    if hits.is_empty() {
+        count_empty_search(&app, &body.agent_id, projects.as_deref());
+    }
     let other_language = match lang {
         Some(lang) => other_language(&app, lang, projects.as_deref(), &caller).await,
         None => None,
@@ -1744,7 +1789,8 @@ fn record_context(metrics: &Recorder, retrieval: &RetrievalState, prompt_bytes: 
 }
 
 /// Records the host session `agent_id` works in for `project_id`, as a hook
-/// reports it; the saves that follow are stamped with it.
+/// reports it; the saves that follow are stamped with it. What the hook says
+/// happened is counted in the row of that session.
 async fn register_session(
     State(app): State<Arc<AppCtx>>,
     Json(body): Json<SessionRequest>,
@@ -1752,7 +1798,61 @@ async fn register_session(
     check_session_id(&body.session_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let project_id = live_project(&app, body.project_id).await?;
     app.sessions.register(&body.agent_id, project_id.as_deref(), &body.session_id);
+    let who = Who {
+        session_id: &body.session_id,
+        agent_id: &body.agent_id,
+        project_id: project_id.as_deref(),
+        client: body.client.as_deref().map_or(OTHER, |client| label(&CLIENTS, client)),
+        utc_offset_s: super::process::utc_offset_s(),
+    };
+    let event = match body.event.as_deref() {
+        Some("start") => HookEvent::Start(body.source.as_deref().map_or(UNSPECIFIED, |source| label(&SOURCES, source))),
+        Some("prompt") => HookEvent::Prompt,
+        _ => HookEvent::Seen,
+    };
+    app.runtime.metrics.sessions().hook(who, now_ms() as i64, event);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Closes the row of a session its client says ended, with the reason it
+/// gives. It names no project, so a hook can send it without registering one.
+async fn end_session(State(app): State<Arc<AppCtx>>, Json(body): Json<SessionEndRequest>) -> ApiResult<StatusCode> {
+    check_session_id(&body.session_id).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let reason = body.reason.as_deref().map_or(OTHER, |reason| label(&END_REASONS, reason));
+    app.runtime.metrics.sessions().end(&body.session_id, now_ms() as i64, reason);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Counts a call of one of the bridge's tools for the session its agent and
+/// project are in, as the bridge reports it once the tool has answered.
+async fn count_tool_call(State(app): State<Arc<AppCtx>>, Json(body): Json<ToolCallRequest>) -> ApiResult<StatusCode> {
+    let project_id = live_project(&app, body.project_id).await?;
+    if let Some(session) = app.sessions.current(&body.agent_id, project_id.as_deref()) {
+        let call = Activity::Call { tool: tool_label(&body.tool), failed: body.failed };
+        app.runtime.metrics.sessions().activity(&session, now_ms() as i64, call);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Counts a search that found nothing for the session of `agent_id` in the
+/// one project it read, or in none; a search over several is nobody's.
+fn count_empty_search(app: &AppCtx, agent_id: &str, projects: Option<&[String]>) {
+    let project = match projects {
+        None => None,
+        Some([project]) => Some(project.as_str()),
+        Some(_) => return,
+    };
+    if let Some(session) = app.sessions.current(agent_id, project) {
+        app.runtime.metrics.sessions().activity(&session, now_ms() as i64, Activity::EmptySearch);
+    }
+}
+
+/// The sessions of a merged project go to the one that stays. A dry run, or
+/// a merge that wrote nothing, moves none.
+fn sessions_follow(app: &AppCtx, merged: &MergeReport) {
+    if merged.merge_id.is_some() && !merged.dry_run {
+        app.runtime.metrics.sessions().merge_project(&merged.source, &merged.target);
+    }
 }
 
 async fn synthesis(
@@ -2009,6 +2109,7 @@ fn resolve_error(e: ResolveError) -> ApiError {
             }
             ResolveError::NotFound(_) => ApiError::not_found(e.to_string()),
             ResolveError::NotInDispute { .. }
+            | ResolveError::SeveralPairs { .. }
             | ResolveError::SupersededElsewhere { .. }
             | ResolveError::NeedsUser { .. } => ApiError::conflict(e.to_string()),
             ResolveError::Store(_) => ApiError::internal(e),
@@ -2261,6 +2362,7 @@ async fn import_memories(
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
     let imported = portability::import_parsed(
         store,
+        &app.runtime.imports,
         embedder.as_deref(),
         chunker,
         &backups,
@@ -2461,6 +2563,7 @@ async fn import_as_job(app: &AppCtx, id: u64, mut job: Job) -> End {
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
     let imported = portability::import_parsed(
         &app.runtime.store,
+        &app.runtime.imports,
         job.embedder.as_deref(),
         chunker,
         &backups,
@@ -2523,7 +2626,7 @@ async fn undo_import(
     Json(body): Json<UndoImportRequest>,
 ) -> ApiResult<Json<UndoReport>> {
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-    match portability::undo_import(&app.runtime.store, &backups, body.import_id, body.dry_run).await {
+    match portability::undo_import(&app.runtime.store, &app.runtime.imports, &backups, body.import_id, body.dry_run).await {
         Ok(report) => Ok(Json(report)),
         Err(e @ UndoError::UnknownImport(_)) => Err(ApiError::not_found(e.to_string())),
         Err(e @ UndoError::Running(_)) => Err(ApiError::conflict(e.to_string())),
@@ -2730,7 +2833,13 @@ async fn merge_projects(
     let (store, workspaces) = (&app.runtime.store, app.runtime.workspaces());
     let report = match (body.undo, body.source, body.target) {
         (Some(merge_id), None, None) => undo_merge_core(store, &workspaces, &backups, merge_id, body.dry_run).await,
-        (None, Some(source), Some(target)) => merge_core(store, &workspaces, &backups, &source, &target, body.dry_run).await,
+        (None, Some(source), Some(target)) => {
+            let merged = merge_core(store, &workspaces, &backups, &source, &target, body.dry_run).await;
+            if let Ok(merged) = &merged {
+                sessions_follow(&app, merged);
+            }
+            merged
+        }
         _ => return Err(ApiError::bad_request("name a source and a target, or a merge to undo")),
     };
     report.map(Json).map_err(merge_error)
@@ -2790,7 +2899,12 @@ async fn delete_projects(
             if confirm.is_some() && !with_memories {
                 return Err(ApiError::bad_request("confirm goes with with_memories: it is the code of the report of a delete with its rows"));
             }
-            delete_core(store, &workspaces, &backups, &project_id, with_memories, confirm.as_deref()).await
+            let deleted = delete_core(store, &workspaces, &backups, &project_id, with_memories, confirm.as_deref()).await;
+            // So that a deleted project leaves no trace: its sessions go too.
+            if let Ok(DeleteReport { delete_id: Some(_), project_id, .. }) = &deleted {
+                app.runtime.metrics.sessions().delete_project(project_id);
+            }
+            deleted
         }
         _ => return Err(ApiError::bad_request("name a project to delete, or a delete to undo (dry_run goes with undo)")),
     };
@@ -2931,7 +3045,9 @@ async fn answer_suggestion(
         SuggestionAnswer::Merge => {
             let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
             let merged = merge_core(store, &app.runtime.workspaces(), &backups, &body.other_id, &body.project_id, false).await;
-            Some(AnsweredMerge { report: merged.map_err(merge_error)?, trajectories: 0, skills: 0 })
+            let merged = merged.map_err(merge_error)?;
+            sessions_follow(&app, &merged);
+            Some(AnsweredMerge { report: merged, trajectories: 0, skills: 0 })
         }
     };
     Ok(Json(AnsweredBody { project_id: body.project_id, other_id: body.other_id, answer, merge }))
@@ -3012,18 +3128,7 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
     if own == target {
         return Ok(Json(located(true, None)));
     }
-    let own2 = own.clone();
-    let folders: i64 = store
-        .conn
-        .call(move |c| {
-            c.query_row(
-                "SELECT COUNT(*) FROM project_path WHERE project_id = ?1 OR (project_id IS NULL AND id = ?1)",
-                [own2],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .map_err(ApiError::internal)?;
+    let folders = own_folder_count(store, &own).await.map_err(ApiError::internal)?;
     if folders > 1 {
         return Err(ApiError {
             detail: Some(format!(
@@ -3035,6 +3140,7 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
     }
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
     let merged = merge_core(store, &app.runtime.workspaces(), &backups, &own, &target, false).await.map_err(merge_error)?;
+    sessions_follow(&app, &merged);
     Ok(Json(located(false, Some(merged))))
 }
 
@@ -3120,6 +3226,18 @@ fn refresh_line(project_id: &str, r: &project_docs::RefreshReport) -> String {
     )
 }
 
+/// What the log says when a refresh knows its plan, before its first file:
+/// the one line a refresh that never ends leaves.
+fn refresh_start_line(project_id: &str, trigger: project_docs::RefreshTrigger, plan: project_docs::PlannedRefresh) -> String {
+    format!(
+        "docs refresh of {project_id}: started by {}: {} to index, {} unchanged, {} to remove",
+        trigger.as_str(),
+        plan.index,
+        plan.unchanged,
+        plan.remove
+    )
+}
+
 /// Where a refresh spent its time, the phases summed over its docs. `took` is
 /// the total the metrics record too, so the line and the series agree.
 fn refresh_timing_line(project_id: &str, took: Duration, timing: &project_docs::RefreshTiming) -> String {
@@ -3142,7 +3260,9 @@ fn refresh_timing_line(project_id: &str, took: Duration, timing: &project_docs::
 async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder, project_id: &str) {
     let tokenizer = app.runtime.tokenizer.get().cloned();
     let started = Instant::now();
-    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer).await;
+    let trigger = guard.trigger();
+    let planned = |plan| log::info!("{}", refresh_start_line(project_id, trigger, plan));
+    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer, &planned).await;
     let took = started.elapsed();
     record_refresh(&app.runtime.metrics, took, refreshed.as_ref().ok().map(|run| &run.report));
     match refreshed {
@@ -3297,6 +3417,16 @@ mod tests {
 
     fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
         SavedChunk { id, outcome }
+    }
+
+    #[test]
+    fn the_docs_start_line_names_the_project_the_trigger_and_the_plan() {
+        let plan = project_docs::PlannedRefresh { index: 36, unchanged: 865, remove: 2 };
+        assert_eq!(
+            refresh_start_line("repo-1a2b", project_docs::RefreshTrigger::Search, plan),
+            "docs refresh of repo-1a2b: started by search: 36 to index, 865 unchanged, 2 to remove"
+        );
+        assert!(refresh_start_line("p", project_docs::RefreshTrigger::Registration, plan).contains("started by registration"));
     }
 
     #[test]
@@ -3554,7 +3684,7 @@ mod tests {
     }
 
     async fn count(app: &AppCtx, sql: &'static str) -> i64 {
-        app.runtime.store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
+        app.runtime.store.conn_for_test().call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
     }
 
     /// How many notes have rows, and how many different numbers of rows a
@@ -3562,7 +3692,7 @@ mod tests {
     async fn notes_stored(app: &AppCtx) -> (i64, i64) {
         app.runtime
             .store
-            .conn
+            .conn_for_test()
             .call(|c| {
                 c.query_row(
                     "SELECT COUNT(DISTINCT created_by_ref), COUNT(DISTINCT n) FROM (SELECT created_by_ref, COUNT(*) AS n FROM memory GROUP BY created_by_ref)",
@@ -3604,7 +3734,7 @@ mod tests {
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import WHERE finished_at IS NULL").await, 1, "the journal stays open");
 
         let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-        let undone = portability::undo_import(&app.runtime.store, &backups, job["import_id"].as_i64().unwrap(), false).await;
+        let undone = portability::undo_import(&app.runtime.store, &app.runtime.imports, &backups, job["import_id"].as_i64().unwrap(), false).await;
         assert!(undone.is_ok(), "its number is free: {:?}", undone.err());
     }
 
@@ -3629,7 +3759,7 @@ mod tests {
         let import_id = stopped["import_id"].as_i64().expect("a number");
 
         let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-        let undone = portability::undo_import(&app.runtime.store, &backups, import_id, false).await.expect("an undo, not a refusal to touch a running import");
+        let undone = portability::undo_import(&app.runtime.store, &app.runtime.imports, &backups, import_id, false).await.expect("an undo, not a refusal to touch a running import");
 
         assert_eq!(undone.removed.len(), WRITE_BATCH);
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, 0);
@@ -3749,7 +3879,7 @@ mod tests {
                     let _ = held.recv();
                     Ok::<_, rusqlite::Error>(())
                 };
-                let mut call = Box::pin(queue.conn.call(hold));
+                let mut call = Box::pin(queue.conn_for_test().call(hold));
                 let _ = std::future::Future::poll(call.as_mut(), &mut std::task::Context::from_waker(std::task::Waker::noop()));
             }
         });

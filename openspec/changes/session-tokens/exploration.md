@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| medición (cuánto cuesta una sesión, por proyecto y por agente; la pregunta de fondo es si una sesión con clawg gasta más o menos) | M–L (el receptor es M; el lector del transcript es S pero frágil) | [session-usage](../session-usage/exploration.md) (121), que da la fila de sesión a la que se suman los tokens; contrasta con [agent-eval](../agent-eval/proposal.md) (96), que mide costo en corridas controladas | exploración (borrador) |
+| medición (cuánto cuesta una sesión, por proyecto y por agente; la pregunta de fondo es si una sesión con clawg gasta más o menos) | M–L (el receptor es M; el lector del transcript es S pero frágil) | [session-usage](../archive/2026-11-11-session-usage/exploration.md) (121), que da la fila de sesión a la que se suman los tokens; contrasta con [agent-eval](../agent-eval/proposal.md) (96), que mide costo en corridas controladas | exploración (borrador) |
 
 **Tesis.** clawg no ve ningún token: se gastan entre el cliente y el proveedor del modelo, y a clawg sólo le llegan llamadas a herramientas. Para contarlos alguien tiene que decírselos. En Claude Code hay una sola fuente documentada, su telemetría OpenTelemetry, que hay que encender a mano. Hay otra sin documentar, el transcript, y Anthropic avisa que su formato cambia entre versiones. Cursor no expone tokens en ningún hook. Este cambio decide si vale la pena y por cuál camino, y no se empieza antes de que exista el registro de sesiones de 121.
 

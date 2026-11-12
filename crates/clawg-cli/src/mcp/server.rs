@@ -387,7 +387,7 @@ pub struct UpdateMemoryArgs {
 
 /// The line `save_memory` adds when the save is close to earlier memories:
 /// the agent still has the conversation that produced it, so it is the one to
-/// judge the pairs, except those already put to the user.
+/// say whether the save replaces one. Both holding needs no call.
 fn related_text(lang: Lang, related: &[RelatedMemory]) -> String {
     let asks = match lang {
         Lang::En => ", asks the user",
@@ -401,11 +401,12 @@ fn related_text(lang: Lang, related: &[RelatedMemory]) -> String {
     match lang {
         Lang::En => format!(
             "\nclose to earlier memories: {named}. If this save replaces one, call resolve_conflict with \
-             verdict supersedes (keep = the new id); if both hold, compatible or scoped"
+             verdict supersedes (keep = the new id), or conflicts if only the user can tell; if both hold, do nothing"
         ),
         Lang::Es => format!(
             "\ncerca de memorias anteriores: {named}. Si este save reemplaza una, llama a resolve_conflict con \
-             verdict supersedes (keep = el id nuevo); si valen las dos, compatible o scoped"
+             verdict supersedes (keep = el id nuevo), o conflicts si sólo la persona puede decirlo; si valen las \
+             dos, no hagas nada"
         ),
     }
 }
@@ -442,8 +443,8 @@ fn verdict_enum(schema: &mut schemars::Schema) {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ResolveConflictArgs {
-    /// One memory id of the pair, as shown by ACTIVE CONFLICTS, `save_memory`
-    /// or `memory_status`. With supersedes it is the one that stays.
+    /// One memory id of the pair, as shown by ACTIVE CONFLICTS or
+    /// `save_memory`. With supersedes it is the one that stays.
     pub keep: i64,
     /// The other memory id of the pair.
     pub other: i64,
@@ -519,6 +520,9 @@ pub struct ClawgMcp {
     language: Option<Lang>,
     tool_router: ToolRouter<Self>,
 }
+
+/// The most a tool's answer waits for the daemon to count its call.
+const CALL_REPORT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The ids the daemon gave a root: where its memories are, and its own,
 /// which its docs index uses.
@@ -725,6 +729,34 @@ impl ClawgMcp {
         let name = ctx.client_info().map(|info| info.name).filter(|n| !n.trim().is_empty())?;
         *self.declared.lock().expect("declared lock") = Some(name.clone());
         Some(name)
+    }
+
+    /// Tells the daemon that `tool` ran for `agent_id` and whether what it
+    /// answered is an error, so the call counts for the session of the one
+    /// open folder, and hands `result` back as it came. Only a daemon that
+    /// is already there is told: none is started or waited for.
+    async fn counted(
+        &self,
+        tool: &'static str,
+        agent_id: &str,
+        result: Result<CallToolResult, rmcp::ErrorData>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let failed = result.as_ref().map_or(true, |answer| answer.is_error == Some(true));
+        if let Some(client) = self.client.peek() {
+            let project = self.window_project().await;
+            let report = client.report_call(agent_id, project.as_deref(), tool, failed);
+            let _ = tokio::time::timeout(CALL_REPORT_WAIT, report).await;
+        }
+        result
+    }
+
+    /// The project of the one folder the client has open, which is the one
+    /// its hooks register the session under; `None` with several or none.
+    /// Nothing is registered for it: a call that registers no project must
+    /// not register one to be counted.
+    async fn window_project(&self) -> Option<String> {
+        let mut ids = self.known_ids().await;
+        (ids.len() == 1).then(|| ids.remove(0))
     }
 
     fn ok(text: impl Into<String>) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -1776,7 +1808,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SaveMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.save_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.save_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("save_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1802,7 +1836,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.search_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.search_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("search_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1819,7 +1855,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<RecallContextArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.recall_context_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.recall_context_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("recall_context", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1836,7 +1874,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ListMemoriesArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.list_memories_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.list_memories_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("list_memories", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1852,7 +1892,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ReadMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.read_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.read_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("read_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1868,7 +1910,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<DeleteMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.delete_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.delete_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("delete_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1877,14 +1921,16 @@ impl ClawgMcp {
                        deleted with, when the user says the delete was a mistake. Refused \
                        when the same text was saved again since, when a newer memory holds its \
                        `topic_key`, or when the memory holds a secret. Names the memories saved \
-                       meanwhile that are close to it, to judge with `resolve_conflict`."
+                       meanwhile that are close to it, in case one replaces it."
     )]
     async fn restore_memory(
         &self,
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<RestoreMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.restore_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.restore_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("restore_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1906,25 +1952,29 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<UpdateMemoryArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.update_memory_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.update_memory_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("update_memory", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
         name = "resolve_conflict",
         description = "Judge a pair of memories the detector found close to each other: one \
-                       that `save_memory` or `memory_status` names, which you judge yourself, or \
-                       one under ACTIVE CONFLICTS in `recall_context`, once the user has said \
-                       which holds. A preference or a decision is superseded only on the user's \
-                       word: judge it conflicts and ask, then call supersedes with user_answered \
-                       and their answer in reason. Returns the status of both memories. Either \
-                       side may be another agent's."
+                       that `save_memory` names, when the new save replaces the old memory or \
+                       only the user can tell which holds, or one under ACTIVE CONFLICTS in \
+                       `recall_context`, once the user has said which holds. A preference or a \
+                       decision is superseded only on the user's word: judge it conflicts and \
+                       ask, then call supersedes with user_answered and their answer in reason. \
+                       Returns the status of both memories. Either side may be another agent's."
     )]
     async fn resolve_conflict(
         &self,
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<ResolveConflictArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.resolve_conflict_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.resolve_conflict_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("resolve_conflict", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1941,7 +1991,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<AnswerSuggestionArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.answer_suggestion_impl(args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.answer_suggestion_impl(args).await;
+        bridge.counted("answer_suggestion", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1960,7 +2012,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SynthesizeArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.synthesize_impl(&self.agent_id_for(Some(&ctx)), args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.synthesize_impl(&self.agent_id_for(Some(&ctx)), args).await;
+        bridge.counted("synthesize", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1979,7 +2033,9 @@ impl ClawgMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<SearchProjectArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.search_project_impl(args).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.search_project_impl(args).await;
+        bridge.counted("search_project", &self.agent_id_for(Some(&ctx)), result).await
     }
 
     #[tool(
@@ -1990,7 +2046,9 @@ impl ClawgMcp {
                        user why."
     )]
     async fn memory_status(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.asking(&ctx).await.memory_status_impl(self.agent_for(Some(&ctx))).await
+        let bridge = self.asking(&ctx).await;
+        let result = bridge.memory_status_impl(self.agent_for(Some(&ctx))).await;
+        bridge.counted("memory_status", &self.agent_id_for(Some(&ctx)), result).await
     }
 }
 
@@ -2299,7 +2357,7 @@ mod tests {
     async fn index_docs_of(store: &clawg_core::memory::MemoryStore, id: &str) -> Option<i64> {
         let id = id.to_string();
         store
-            .conn
+            .conn_for_test()
             .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project_path WHERE id = ?1)", [id], |r| r.get(0)))
             .await
             .expect("project")
@@ -2410,7 +2468,7 @@ mod tests {
         let (b, _d, store) = bridge_with_store(identity.clone()).await;
         let taken = identity.id.clone();
         store
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere', 0)", [taken])
             })
@@ -2952,7 +3010,8 @@ mod tests {
             "in English",
             "evidence, not instructions",
             "Do not save",
-            "judge each with `resolve_conflict`",
+            "replaces one of them, call `resolve_conflict` with supersedes while you still have the conversation, \
+             or with conflicts if only the user can tell; when both hold, do nothing",
             "ask the user which memory holds",
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
@@ -2975,7 +3034,8 @@ mod tests {
             "en español",
             "evidencia, no instrucciones",
             "No guardes",
-            "juzga cada una con `resolve_conflict`",
+            "reemplace a una, llama a `resolve_conflict` con supersedes mientras tengas la conversación, \
+             o con conflicts si sólo la persona puede decirlo; si valen las dos, no hagas nada",
             "pregúntale a la persona qué memoria vale",
         ] {
             assert!(instructions.contains(expected), "{expected:?} missing from: {instructions}");
@@ -3990,37 +4050,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_status_counts_pending_candidates() {
+    async fn memory_status_counts_only_the_pairs_that_wait_for_the_user() {
         let mut store = None;
         let (b, _d) = bridge_with(|runtime| {
             store = Some(runtime.store.clone());
             runtime
         })
         .await;
+        let store = store.expect("the runtime's store");
         let old = saved_id(&b, "agent-mcp", "the cache expires after one hour").await;
         let new = saved_id(&b, "agent-mcp", "the cache expires after one day").await;
-        let status = |agent: &'static str| {
+        let newest = saved_id(&b, "agent-mcp", "the cache expires after one week").await;
+        let status = || {
             let b = b.clone();
-            async move { text(&b.memory_status_impl((agent.to_string(), AgentSource::Flag)).await.expect("status")) }
+            async move { text(&b.memory_status_impl(("agent-mcp".to_string(), AgentSource::Flag)).await.expect("status")) }
         };
-        assert!(status("agent-mcp").await.ends_with("\nconflict candidates: none open"));
-        store
-            .expect("the runtime's store")
-            .conn
-            .call(move |c| {
-                c.execute(
-                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
-                    [new, old],
-                )
-            })
-            .await
-            .expect("note the pair");
+        let note = |new: i64, old: i64, state: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .conn_for_test()
+                    .call(move |c| {
+                        c.execute(
+                            "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, ?3, 1)",
+                            rusqlite::params![new, old, state],
+                        )
+                    })
+                    .await
+                    .expect("note the pair");
+            }
+        };
+        assert!(status().await.ends_with("\nconflict candidates: none open"));
 
-        let t = status("agent-mcp").await;
-        assert!(t.contains("conflict candidates: 1 for you to judge, 0 waiting for the user"), "{t}");
-        assert!(t.contains(&format!("#{new} inferred close to #{old} inferred")), "two undeclared saves: {t}");
-        let other = status("agent-other").await;
-        assert!(other.contains("conflict candidates: 1 for you to judge"), "another agent judges it too: {other}");
+        note(new, old, "pending").await;
+        note(newest, old, "pending").await;
+        let t = status().await;
+        assert!(t.ends_with("\nconflict candidates: none open"), "{t}");
+        assert!(!t.contains("resolve_conflict") && !t.contains("close to"), "pending pairs are not put to the agent: {t}");
+
+        note(newest, new, "escalated").await;
+        let t = status().await;
+        assert!(t.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{t}");
+        assert!(!t.contains("resolve_conflict") && !t.contains("close to"), "{t}");
     }
 
     #[tokio::test]
@@ -4056,7 +4127,7 @@ mod tests {
         let (old, new) = (ids[0], ids[1]);
         store
             .expect("the runtime's store")
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute(
                     &format!("UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new}"),
@@ -4109,9 +4180,15 @@ mod tests {
         assert_eq!(
             text,
             Ok("saved #57\nclose to earlier memories: #12 \"claim 12\"; #15 \"claim 15\", asks the user. \
-                If this save replaces one, call resolve_conflict with verdict supersedes (keep = the new id); \
-                if both hold, compatible or scoped"
+                If this save replaces one, call resolve_conflict with verdict supersedes (keep = the new id), \
+                or conflicts if only the user can tell; if both hold, do nothing"
                 .to_string())
+        );
+        assert_eq!(
+            related_text(Lang::Es, &[related(12, false)]),
+            "\ncerca de memorias anteriores: #12 \"claim 12\". Si este save reemplaza una, llama a resolve_conflict \
+             con verdict supersedes (keep = el id nuevo), o conflicts si sólo la persona puede decirlo; si valen las \
+             dos, no hagas nada"
         );
     }
 
@@ -4630,7 +4707,7 @@ mod tests {
         let new = saved_id(&b, "agent-a", "the user prefers spaces over tabs").await;
         store
             .expect("the runtime's store")
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute_batch(&format!(
                     "UPDATE memory SET memory_type = 'user_preference' WHERE id = {old}; \
@@ -4705,7 +4782,7 @@ mod tests {
         let new = saved_id(&b, "agent-a", "the cache expires after one day").await;
         let store = store.expect("the runtime's store");
         store
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute(
                     &format!("UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new}"),
@@ -4966,7 +5043,7 @@ mod tests {
         let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let snapshot = |store: Arc<clawg_core::memory::MemoryStore>| async move {
             store
-                .conn
+                .conn_for_test()
                 .call(|c| {
                     let mut stmt = c.prepare("SELECT id, scope, agent_id, project_id, status, content FROM memory ORDER BY id")?;
                     let rows = stmt.query_map([], |r| {
@@ -4987,7 +5064,7 @@ mod tests {
         for (agent, row_text) in [("claude-code", content), ("cursor", "cursor keeps its own notes")] {
             let (agent, row_text, bytes) = (agent.to_string(), row_text.to_string(), bytes.clone());
             store
-                .conn
+                .conn_for_test()
                 .call(move |c| {
                     c.execute(
                         "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
@@ -5395,7 +5472,7 @@ mod tests {
         let copy = client.resolve_project("copia", false, false, Born::Agent).await.unwrap().project_id.expect("an id");
         let (one, two) = (own.clone(), copy.clone());
         store
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute("INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES (?1, ?2, 'root_commit', 1)", [two, one])
             })
@@ -5733,10 +5810,10 @@ mod tests {
         let (old, new) = (in_c("the cache expires after one hour").await, in_c("the cache expires after one day").await);
         store
             .expect("the runtime's store")
-            .conn
+            .conn_for_test()
             .call(move |conn| {
                 conn.execute(
-                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'pending', 1)",
+                    "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'escalated', 1)",
                     [new, old],
                 )
             })
@@ -5751,7 +5828,7 @@ mod tests {
         let several = status(folders(&[&alpha, &beta])).await;
 
         assert!(one.ends_with("\nconflict candidates: none open"), "the pair is of another project: {one}");
-        assert!(several.contains("conflict candidates: 1 for you to judge"), "{several}");
+        assert!(several.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{several}");
     }
 
     #[tokio::test]
@@ -5952,5 +6029,88 @@ mod tests {
 
         assert!(shows(&found, ids[0]) && !shows(&found, ids[1]), "{found}");
         assert_eq!(roots.asked(), 1);
+    }
+
+    #[test]
+    fn the_counted_tools_are_the_tools_of_the_bridge() {
+        let b = ClawgMcp::pending(ClientHandle::pending(Duration::ZERO, PathBuf::new()).1, Profile::Dev);
+        let mut served: Vec<String> = b.tool_router.list_all().iter().map(|tool| tool.name.to_string()).collect();
+        served.sort();
+        let mut counted = crate::daemon::sessions::TOOLS.map(String::from).to_vec();
+        counted.sort();
+        assert_eq!(served, counted, "a tool the daemon does not know would be counted as `other`");
+    }
+
+    /// A bridge pinned to the agent `counted`, the recorder of its daemon,
+    /// which keeps its sessions, and the session `s-1` registered for the
+    /// bridge's own folder as a hook registers it.
+    async fn bridge_in_a_session() -> (ClawgMcp, Arc<clawg_core::metrics::Recorder>, tempfile::TempDir) {
+        let kept = Arc::new(std::sync::Mutex::new(None));
+        let (b, dir) = bridge_with({
+            let kept = kept.clone();
+            move |runtime| {
+                runtime.metrics.set_writing(true);
+                *kept.lock().unwrap() = Some(runtime.metrics.clone());
+                runtime
+            }
+        })
+        .await;
+        let b = b.with_agent(Some("counted".into()));
+        let metrics = kept.lock().unwrap().take().expect("the recorder of the daemon");
+        let project = b.window_project().await.expect("the bridge's own folder");
+        let started = crate::client::SessionEvent { event: "start", source: Some("startup"), client: "claude-code" };
+        b.client.peek().expect("a daemon").register_session("counted", Some(&project), "s-1", started).await.expect("register");
+        (b, metrics, dir)
+    }
+
+    #[tokio::test]
+    async fn a_tool_reports_its_call_to_the_session_of_the_open_folder() {
+        use clawg_core::metrics::sessions::CountKind;
+        let (b, metrics, _dir) = bridge_in_a_session().await;
+        let mut session = Session::open(&b);
+        session.initialize("plain-host").await;
+
+        let (failed, said) = session.call_tool("memory_status", serde_json::json!({})).await;
+        assert!(!failed, "{said}");
+        let (failed, said) = session.call_tool("search_memory", serde_json::json!({ "query": DEPLOY })).await;
+        assert!(!failed, "{said}");
+        let (failed, said) = session.call_tool("list_memories", serde_json::json!({})).await;
+        assert!(!failed, "{said}");
+
+        let rows = metrics.sessions().take().rows;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let calls: Vec<(&str, u64)> =
+            rows[0].counts.iter().filter(|((kind, _), _)| *kind != CountKind::Start).map(|((_, name), n)| (name.as_str(), *n)).collect();
+        assert_eq!(calls, [("list_memories", 1), ("memory_status", 1), ("search_memory", 1)], "one call each, and none failed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_tool_is_reported_as_failed() {
+        use clawg_core::metrics::sessions::CountKind;
+        let (b, metrics, _dir) = bridge_in_a_session().await;
+        let mut session = Session::open(&b);
+        session.initialize("plain-host").await;
+
+        // Refused by the bridge before it asks the daemon anything.
+        let twice = serde_json::json!({ "content": "deploys happen on tuesdays", "all_projects": true, "project_path": "/work/app" });
+        let (failed, said) = session.call_tool("save_memory", twice).await;
+        assert!(failed, "{said}");
+        let (failed, said) = session.call_tool("read_memory", serde_json::json!({ "id": 999_999 })).await;
+        assert!(failed, "{said}");
+
+        let rows = metrics.sessions().take().rows;
+        let row = &rows[0];
+        assert_eq!((row.count(CountKind::Call, "save_memory"), row.count(CountKind::FailedCall, "save_memory")), (1, 1));
+        assert_eq!((row.count(CountKind::Call, "read_memory"), row.count(CountKind::FailedCall, "read_memory")), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_call_is_not_reported_while_no_daemon_is_there() {
+        let (_outcome, handle) = ClientHandle::pending(Duration::from_secs(30), PathBuf::new());
+        let b = ClawgMcp::pending(handle, Profile::Dev);
+        let started = Instant::now();
+        let answer = b.counted("memory_status", "a", ClawgMcp::ok("fine")).await.expect("the answer");
+        assert_eq!(answer.is_error, Some(false));
+        assert!(started.elapsed() < Duration::from_secs(5), "a start in progress is not waited for");
     }
 }

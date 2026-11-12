@@ -1,8 +1,8 @@
-# history-reimport — Verificación del ensayo
+# history-reimport — Verificación del ensayo y del corte
 
-**Resultado:** la importación completa, en release, tardó 795,1 s contra los 1.146,9 s de la línea base, un 30,7 % menos. Las filas sin proyecto bajaron de 15.709 a 163. El perfil `dev` volvió a su contenido, pero perdió 4 snapshots automáticos viejos. Prod sólo recibió un `clawg backup`: terminó con las mismas 56.285 filas vivas y las mismas 15.709 sin proyecto.
+**Resultado del ensayo, en `dev`:** la importación completa, en release, tardó 795,1 s contra los 1.146,9 s de la línea base, un 30,7 % menos. Las filas sin proyecto bajaron de 15.709 a 163. El perfil `dev` volvió a su contenido, pero perdió 4 snapshots automáticos viejos. Prod sólo recibió un `clawg backup`: terminó con las mismas 56.285 filas vivas y las mismas 15.709 sin proyecto.
 
-El corte en prod no se hizo y espera la aprobación del piloto.
+**Resultado del corte, en prod:** se hizo el 2026-11-08 y tardó 813,1 s, un 29,1 % menos que la línea base. Las filas sin proyecto bajaron de 15.711 a 76. Está en [«El corte en prod»](#el-corte-en-prod), al final; lo que sigue hasta ahí es el ensayo.
 
 ## Qué se corrió
 
@@ -125,3 +125,139 @@ De las 546 filas `superseded`, 543 son revisiones y 3 vienen de un veredicto. La
 - **Después de importar:** colocar las 90 filas retenidas con `clawg projects move --id`.
 
 El mapa, los informes con nombres de proyecto y los scripts quedan en `docs/completed-impl/history-reimport/`, que no se commitea. El export, su copia y los snapshots con datos de prod que escribió el ensayo se borraron, salvo el `clawg backup` de prod.
+
+## El corte en prod
+
+Se hizo el 2026-11-08, con clawg 0.79.1 instalado y engram 3.5.2 sin actualizar. La exploración lo pedía con el piloto aprobado. Se adelantó, y el piloto arrancó sobre el store ya reimportado.
+
+- Requisitos: los del ensayo, y los clientes cerrados durante el deshacer y la importación, para que nada más embeba ni guarde en el medio.
+- Máquina: AMD Ryzen AI 7 350, 8 núcleos y 16 lógicos, 31 GiB, enchufada, con el plan de energía equilibrado.
+
+### Qué se hizo, en orden
+
+1. **La foto de antes:** 56.466 filas vivas, 15.711 sin proyecto, 18 proyectos con carpeta y `clawg doctor` sin errores.
+2. **Las redes:** los 6 snapshots automáticos de prod se copiaron aparte, 1.113 MB, y se hizo un `clawg backup`.
+3. **Un export nuevo de engram:** 4.024 observaciones y 14 prompts.
+4. **La clasificación** de las notas sin proyecto, y su mapa aplicado a una copia del export. Se importa la copia, no el export.
+5. **`clawg projects create`** del proyecto de espera, sin carpeta.
+6. **Dos ensayos con `--dry-run`** sobre el store de ese momento: la importación con el mapa y `clawg import --undo 1`. Ahí se frenó a revisar, y la clasificación se rehízo ([«Ubicación del corte»](#ubicación-del-corte)).
+7. **Un muestreo** de la CPU y la RAM de la máquina, que corrió hasta el final de la importación.
+8. **`clawg import --undo 1`:** quitó 54.151 filas y dejó 285, en 33,2 s.
+9. **La importación con el mapa,** primero con `--dry-run`. Es la importación 2: entraron 55.201 de las 55.510 filas del archivo, con código 0. De las otras 309, 285 son las que dejó el deshacer y 24 son piezas cuyo texto ya estaba vivo en su destino.
+10. **5 `clawg projects move --id`,** que colocaron 104 de las filas que dejó el deshacer.
+11. **La verificación,** y el borrado de un proyecto sin memorias que estaba de antes del corte.
+12. **La limpieza:** se borraron el export, su copia con el mapa y el caché de las transcripciones, y después de la revisión, las capturas y la copia aparte de los snapshots.
+
+### Tiempo del corte
+
+| | Línea base (0.62.0, prod) | Ensayo (0.73.0, `dev`) | Corte (0.79.1, prod) |
+|---|---:|---:|---:|
+| Total | 1.146,9 s | 795,1 s | 813,1 s |
+| Filas embebidas | 54.436 | 54.887 | 55.201 |
+| Filas por segundo, total | 47,46 | 69,03 | 67,89 |
+| `embed` | ≈1.114,8 s (97,2 %) | 762,9 s (96,0 %) | 765,3 s (94,1 %) |
+| Filas por segundo, `embed` | ≈48,8 | 71,9 | 72,1 |
+
+Contra la línea base, el corte tardó 333,8 s menos (−29,1 %) y embebió un 47,7 % más de filas por segundo.
+
+El reparto de `serve.log`, en segundos, fue: `read` 0,0, `plan` 0,7, `translate` 18,0, `load` 0,3, `decide` 0,2, `embed` 765,3, `snapshot` 1,2, `write` 26,6, `links` 0,6. El reloj de la terminal marcó 814,1 s. La tanda más lenta de `embed` tardó 3.360 ms.
+
+- **Memoria:** el máximo por minuto de `process.private_bytes` durante `embed` fue 1.021 MiB. `process.private_peak_bytes` llegó a 1.294 MiB, y lo marcó el minuto de `translate` y de la recarga del modelo, no `embed`.
+- **CPU del daemon:** `process.cpu_ratio` estuvo entre 10,7 y 11 durante `embed`, de 16 núcleos lógicos.
+- **Carga de la máquina:** promedió 71 % de CPU, sin otro proceso pesado. Es lo que el ensayo no pudo medir.
+
+**Lo que este número agrega.** Es la segunda corrida completa en release, y esta vez sobre el store de prod, como la línea base. Las dos corridas dan lo mismo por fila, 71,9 y 72,1 en `embed`. Sigue siendo una corrida por versión, sin repetición.
+
+### Ubicación del corte
+
+De 4.038 notas, 1.597 no tienen proyecto: 28 son preferencias o de alcance personal, y 1.569 se clasifican.
+
+**La clave de tema dejó de pasar su segundo control.** Con las tres señales aceptadas en el ensayo, sobre las notas sin proyecto la clave de tema coincidió con las otras en 72 de 81 casos y las rutas en 85 de 94, las dos debajo del 95 %. Quedaba aceptada sólo la señal de las transcripciones, que ubicaba 30 notas. Los 9 desacuerdos, mirados uno por uno, eran de la clave de tema:
+
+- 6 son de un segmento que nombra una funcionalidad con código en dos repositorios del mismo producto: la clave lo cuenta para uno, y las notas nombran archivos que sólo existen en el otro.
+- 3 son de un segmento genérico, los mismos 3 desacuerdos del ensayo.
+
+Se clasificó sin la clave de tema:
+
+| Señal | Aciertos | Contradice | Precisión | Alcance | Segundo control | Resultado |
+|---|---:|---:|---:|---:|---:|---|
+| Título del save en transcripciones | 631 | 0 | 100 % | 30 | 16 a 0 | aceptada |
+| Una ruta o más, únicas de un repositorio | 1.134 | 9 | 99,2 % | 767 | 16 a 0 | aceptada |
+| Primer segmento de la clave de tema, dejando afuera la nota | 182 | 2 | 98,9 % | 138 | 72 a 9 | sacada |
+
+**La salvedad:** sin la clave de tema, el segundo control de cada señal aceptada tiene 16 casos, todos de acuerdo. La regla pide 30. Se aceptó así en la revisión: con la clave de tema se ubicaban 30 notas y 1.539 iban al proyecto de espera.
+
+| Destino | Notas |
+|---|---:|
+| Ubicadas en un proyecto | 781 |
+| Proyecto de espera, sin señal | 788 |
+| Sin proyecto: preferencias y alcance personal | 28 |
+
+- De las 781, 751 dependen sólo de las rutas, 16 de las rutas y las transcripciones, y 14 sólo de las transcripciones.
+- Las 9 notas de los 3 proyectos de origen sin carpeta fueron también al proyecto de espera.
+- El riesgo de las 751 no se volvió a estimar: 16 casos no alcanzan. Con la tasa que midió el ensayo, 80 de 83, serían unas 27 notas mal ubicadas.
+
+| Filas vivas | Antes | Después |
+|---|---:|---:|
+| Total del store | 56.466 | 57.520 |
+| Sin proyecto | 15.711 | 76 |
+| En el proyecto de espera | — | 6.881 |
+
+- De las 76 sin proyecto, 70 entraron así con la importación 2, de preferencias y notas personales, y 3 son filas que dejó el deshacer y que tampoco tienen proyecto en la copia con el mapa. Las otras 3 no se desglosaron.
+- De las 6.881 del proyecto de espera, 6.826 se importaron ahí y 55 se movieron después.
+
+### Integridad del corte
+
+- **`clawg doctor`:** 0 errores antes y después, con los mismos 3 avisos.
+- **Segunda corrida con `--dry-run`:** `se importarían 0 de 55510`, con 55.486 ya presentes, que son las 55.201 importadas y las 285 que dejó el deshacer.
+- **Proyectos:** el deshacer quitó las 15 carpetas y los 15 remotos que había registrado la importación 1, y la importación 2 los devolvió con el mismo id de proyecto. Hay 18 proyectos con carpeta antes y después.
+- **Secretos:** 2 notas con un secreto se enmascararon enteras.
+
+### Las filas que dejó el deshacer en prod
+
+`--undo 1` dejó 285 filas: 48 con veredicto y 237 piezas de un save con una fila que se queda. En el ensayo eran 271.
+
+- 107 estaban vivas y sin proyecto.
+- 3 de esas tampoco tienen proyecto en la copia con el mapa, y se quedan así.
+- Las otras 104 se movieron en 5 movimientos, de 21, 53, 2, 16 y 12 filas: 49 a 3 proyectos con carpeta y 55 al proyecto de espera.
+
+### Lo que cambió en el store de prod
+
+Sobre todo el store, no sólo sobre lo importado como en la tabla del ensayo:
+
+| | Antes | Después |
+|---|---:|---:|
+| `superseded` | 285 | 810 |
+| `disputed` | 4 | 11 |
+| Tier 1 | 443 | 429 |
+| Tier 2 | 38.430 | 44.059 |
+| Tier 3 | 17.593 | 13.032 |
+
+- De las 55.201 filas importadas, 524 entraron `superseded`.
+- No se contó cuántas notas quedaron sin ninguna fila activa, las 27 del ensayo.
+- Los accesos y el tier de lo importado se perdieron, como en el ensayo.
+
+**Lo importado está en dos idiomas.** La importación 2 reportó 19.246 filas en inglés, 27.203 en español y 8.752 sin idioma detectado. En la prueba desde un proyecto, una consulta en español no trajo filas importadas que la misma consulta en inglés sí trajo. Es el cruce de idioma que mide [embedder-bakeoff](../../embedder-bakeoff/exploration.md), no un defecto del corte.
+
+### Lo que pedía «Para el corte»
+
+- **Los snapshots:** se copiaron aparte los 6 automáticos. La copia se borró el mismo día, después de la revisión. Con ella se fueron los automáticos viejos que el corte empujó afuera, entre ellos el `pre-import` de la primera importación.
+- **El export nuevo** se clasificó de nuevo, con el cambio de señales de [«Ubicación del corte»](#ubicación-del-corte).
+- **El `--dry-run` con el mapa** corrió después de `clawg projects create`.
+- **Las filas que dejó el deshacer** se colocaron: 104 y no 90, porque quedaron 285 y no 271.
+
+### Para volver atrás
+
+En los backups de prod quedaron tres snapshots del 2026-11-08, en hora UTC:
+
+| Snapshot | Hora | Qué tiene |
+|---|---|---|
+| `manual` | 04:09 | El store antes del corte |
+| `pre-undo` | 04:50 | El store antes de deshacer la importación 1 |
+| `pre-import` | 05:07 | El store después del deshacer y antes de la importación 2 |
+
+- **`clawg restore`** con cualquiera de los tres vuelve a ese punto, y antes guarda el store actual como snapshot. Lo guardado después del corte no está en ellos.
+- **`clawg import --undo 2`** deshace la importación y conserva lo que cambió desde entonces.
+- **`clawg projects move --undo 1`** a **`5`** deshacen cada movimiento, y **`clawg projects delete --undo 1`** trae de vuelta el proyecto borrado.
+- **Cuánto duran:** el `manual` no se poda. El `pre-undo` y el `pre-import` se conservan mientras sean el último de su motivo (`to_prune`, `crates/clawg-core/src/memory/backup.rs`): otra importación u otro deshacer los deja a merced de la poda.
+- **Lo que no vuelve:** el export y la copia aparte de los snapshots viejos, que se borraron. engram sigue instalado y con su base, así que un export nuevo se puede sacar.

@@ -167,6 +167,12 @@ pub struct Health {
     /// not answer health in time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingest: Option<OutboxSummary>,
+    /// Each project's docs refresh, as the daemon sends it; empty from a
+    /// daemon before it. Kept as it came: `clawg status` only prints it, and
+    /// an entry a newer daemon shapes differently must not make health
+    /// unreadable.
+    #[serde(default)]
+    pub docs_index: Vec<serde_json::Value>,
 }
 
 impl Health {
@@ -967,6 +973,15 @@ pub struct Registered {
     pub rekeyed: usize,
 }
 
+/// What a hook reports of its session: `start` with what started it, or
+/// `prompt`, and the client whose hook it is.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionEvent<'a> {
+    pub event: &'a str,
+    pub source: Option<&'a str>,
+    pub client: &'a str,
+}
+
 /// A handle on one daemon: its address, its token, and a reusable HTTP client.
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -1254,16 +1269,40 @@ impl DaemonClient {
     }
 
     /// Tells the daemon which host session `agent_id` works in for
-    /// `project_id`; the saves that follow carry it. A daemon that predates
-    /// it answers 404.
+    /// `project_id`, and what `event` says happened in it; the saves that
+    /// follow carry the session. A daemon that predates it answers 404.
     pub async fn register_session(
         &self,
         agent_id: &str,
         project_id: Option<&str>,
         session_id: &str,
+        event: SessionEvent<'_>,
     ) -> Result<(), ClientError> {
-        let body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "session_id": session_id });
+        let body = serde_json::json!({
+            "agent_id": agent_id,
+            "project_id": project_id,
+            "session_id": session_id,
+            "event": event.event,
+            "source": event.source,
+            "client": event.client,
+        });
         let answer = self.send(Call::new(reqwest::Method::POST, "/v1/sessions").json(&body)?).await?;
+        check_status(&answer)
+    }
+
+    /// Tells the daemon the client ended `session_id`, for `reason` when it
+    /// gave one. It names no project, so nothing is registered.
+    pub async fn end_session(&self, session_id: &str, reason: Option<&str>) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "session_id": session_id, "reason": reason });
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/sessions/end").json(&body)?).await?;
+        check_status(&answer)
+    }
+
+    /// Tells the daemon that `tool` ran for `agent_id` in the session of
+    /// `project_id`, and whether it failed.
+    pub async fn report_call(&self, agent_id: &str, project_id: Option<&str>, tool: &str, failed: bool) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "agent_id": agent_id, "project_id": project_id, "tool": tool, "failed": failed });
+        let answer = self.send(Call::new(reqwest::Method::POST, "/v1/sessions/calls").json(&body)?).await?;
         check_status(&answer)
     }
 
@@ -1452,9 +1491,8 @@ impl DaemonClient {
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/disputes/judge").json(&body)?).await?)
     }
 
-    /// The pairs `agent` has not judged yet. A daemon that predates the pair
-    /// table answers a bare 404.
-    /// The open pairs `agent` judges, in `project_id` when one is given.
+    /// The open pairs `agent` reaches, in `project_id` when one is given. A
+    /// daemon that predates the pair table answers a bare 404.
     pub async fn open_disputes(&self, agent: &str, project_id: Option<&str>) -> Result<OpenPairs, ClientError> {
         let mut query = vec![("agent_id", agent)];
         query.extend(project_id.map(|p| ("project_id", p)));
@@ -1870,6 +1908,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_health_without_a_docs_index_still_parses() {
+        let old = r#"{"status":"ok","version":"0.81.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3}"#;
+        let h: Health = serde_json::from_str(old).expect("a daemon that never said");
+        assert!(h.docs_index.is_empty());
+
+        let new = r#"{"status":"ok","version":"0.82.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3,"docs_index":[{"project_id":"p","indexing":true,"current":{"trigger":"search","started_at_ms":5,"files_done":1,"files_total":2},"later":"field"}]}"#;
+        let h: Health = serde_json::from_str(new).expect("a daemon with a refresh running");
+        assert_eq!(h.docs_index.len(), 1);
+        assert_eq!(serde_json::to_value(&h).unwrap()["docs_index"][0]["later"], "field", "an entry is passed on whole");
+    }
+
+    #[test]
     fn a_client_reads_a_health_with_an_import_block() {
         let busy = r#"{"status":"ok","version":"0.30.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3,"import":{"job_id":2,"phase":"embedding","rows_embedded":10}}"#;
         let h: Health = serde_json::from_str(busy).expect("a daemon with a job running");
@@ -1973,6 +2023,8 @@ pub(crate) mod tests {
     /// An in-process daemon plus the tempdir holding its lifecycle files.
     pub(crate) struct TestDaemon {
         pub(crate) dir: tempfile::TempDir,
+        /// What the daemon records, its sessions with it.
+        pub(crate) metrics: Arc<clawg_core::metrics::Recorder>,
         addr: SocketAddr,
         token: String,
     }
@@ -1981,6 +2033,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (runtime, rx) = MemoryRuntime::new_for_test(dir.path().to_path_buf()).await;
         tokio::spawn(runtime.ingest_worker(rx, tokio::sync::watch::channel(None).1));
+        let metrics = runtime.metrics.clone();
 
         let token = "0123456789abcdef0123456789abcdef".to_string();
         let (shutdown, _rx) = tokio::sync::watch::channel(false);
@@ -2001,7 +2054,7 @@ pub(crate) mod tests {
             let _ = axum::serve(listener, router(ctx)).await;
         });
 
-        TestDaemon { dir, addr, token }
+        TestDaemon { dir, metrics, addr, token }
     }
 
     /// Publishes the daemon's lifecycle files so `from_data_dir` can find it.

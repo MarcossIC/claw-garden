@@ -80,7 +80,7 @@ impl Timing {
 
     /// Counts a call that took `waited` from being asked for to its answer,
     /// `ran` of it on the connection.
-    pub fn call(&mut self, waited: Duration, ran: Duration) {
+    pub(crate) fn call(&mut self, waited: Duration, ran: Duration) {
         let calls = self.calls.get_or_insert_default();
         calls.count += 1;
         calls.in_sqlite += ran;
@@ -89,7 +89,7 @@ impl Timing {
     }
 
     /// Counts a batch that took `took`.
-    pub fn batch(&mut self, took: Duration) {
+    pub(crate) fn batch(&mut self, took: Duration) {
         *self.batches.get_or_insert(0) += 1;
         self.slower(took);
     }
@@ -160,11 +160,12 @@ impl ImportTimings {
         self.steps.push(timing);
     }
 
-    pub fn steps(&self) -> &[Timing] {
+    #[cfg(test)]
+    pub(crate) fn steps(&self) -> &[Timing] {
         &self.steps
     }
 
-    pub fn summary(&self, total: Duration) -> Summary<'_> {
+    pub(crate) fn summary(&self, total: Duration) -> Summary<'_> {
         Summary { timings: self, total }
     }
 
@@ -176,7 +177,7 @@ impl ImportTimings {
 }
 
 /// The line that closes an import: its total and every step.
-pub struct Summary<'a> {
+pub(crate) struct Summary<'a> {
     timings: &'a ImportTimings,
     total: Duration,
 }

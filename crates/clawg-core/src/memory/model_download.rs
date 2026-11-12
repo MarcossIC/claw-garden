@@ -150,6 +150,7 @@ pub fn tokenizer_path(base_dir: &Path) -> PathBuf {
 /// format): both are recoverable states a caller degrades from (byte-length
 /// chunking, or skipping query-context composition for this turn) rather
 /// than states that should crash chat or ingestion.
+#[cfg(any(test, feature = "eval"))]
 pub fn load_tokenizer(base_dir: &Path) -> Option<Arc<tokenizers::Tokenizer>> {
     let path = tokenizer_path(base_dir);
     match tokenizers::Tokenizer::from_file(&path) {

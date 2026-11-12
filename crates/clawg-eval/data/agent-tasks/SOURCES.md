@@ -25,3 +25,7 @@ The fixtures and the seeded memories below come from other projects, read at the
 **`amb-ts-semver-pin-conflict` (C).** Prompt from `tasks/ts-semver-pin/task.json`; the older memory is line 6 of `corpus/plants/ts-semver-pin/stale_compatible_release.jsonl` and the newer one line 7 of `corpus/sessions/ts-semver-pin/p01.jsonl`, both of agent-memory-bench at the commit above. Both are seeded live and without a topic key, as two saves the detector did not pair. The checks follow `tasks/ts-semver-pin/checker.py`, with `==` written without spaces. Written here: the subject lines and the ages.
 
 **`letta-simple-edit-task1` (N).** Prompt from the first line of `examples/letta-code-simple-edit/dataset.jsonl` of letta-evals at the commit above, without `sandbox/` and without its second sentence, which only served its grader. Its grader runs the file; the check here reads it.
+
+## Rules and noise
+
+Written here: which seeded memory is a rule and its globs (`rule`), and `user_stated` on the preference of `memorycode-d12-varsuffix-n`, which its dialogue has the person state. `noise.json` is written here entirely: rules on other topics that every arm with memory is seeded with. They stay away from what the checks read (variable names, imports, list markers, `.gitignore`, versions in `requirements.txt`, the signatures of the fixture's functions) and from every tracer, and they are older than 7 days, outside the recent context of clawg's startup.

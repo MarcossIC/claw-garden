@@ -2,7 +2,7 @@
 
 Fuente de verdad del comportamiento actual de qué agentes leen las memorias de qué agentes: la política `sharing.json` y cómo se resuelve, cómo la búsqueda y `recall_context` alcanzan filas ajenas, cómo se presenta lo ajeno, qué sigue siendo de cada agente, qué dice `memory_status` y `clawg sharing`. El mismo alcance decide qué puede modificar, listar y leer entero cada agente ([`specs/visibility`](../visibility/spec.md)) y con qué filas se compara un save; el ranking, los hits y el formato de las líneas están en [`specs/retrieval`](../retrieval/spec.md); las herramientas del puente, en [`specs/mcp`](../mcp/spec.md).
 
-**Origen:** [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec. [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19, sumó a R2 el resumen de LAST SESSION y `Reach::admits`. [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20, sumó a R4 que el autor se muestra saneado (`display_author`). [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, quitó `OwnOnly`, llevó el alcance a lo que se modifica y a las reglas que comparan un save (R2, R5), y cambió la nota de R4 y la línea de R6. [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0, llevó las preferencias del workspace al alcance del lector (R5; el requisito es PM3 de [`specs/retrieval`](../retrieval/spec.md)).
+**Origen:** [agent-sharing](../../changes/archive/2026-10-14-agent-sharing/proposal.md), archivado el 2026-10-14. Los ids de requisito son los de esa spec. [session-handoff](../../changes/archive/2026-10-19-session-handoff/proposal.md), archivado el 2026-10-19, sumó a R2 el resumen de LAST SESSION y `Reach::admits`. [untrusted-recall](../../changes/archive/2026-10-20-untrusted-recall/proposal.md), archivado el 2026-10-20, sumó a R4 que el autor se muestra saneado (`display_author`). [agent-authorship](../../changes/archive/2026-10-22-agent-authorship/proposal.md), archivado el 2026-10-22, quitó `OwnOnly`, llevó el alcance a lo que se modifica y a las reglas que comparan un save (R2, R5), y cambió la nota de R4 y la línea de R6. [preference-model](../../changes/archive/2026-11-06-preference-model/proposal.md), archivado el 2026-11-06, que salió en 0.77.0, llevó las preferencias del workspace al alcance del lector (R5; el requisito es PM3 de [`specs/retrieval`](../retrieval/spec.md)). [store-boundary](../../changes/archive/2026-11-12-store-boundary/proposal.md), archivado el 2026-11-12, que sale en 0.84.0, sumó que el worker de ingest lee `sharing.json` del directorio que le da el runtime y que el store ya no lo guarda (SB8, al final); sus R1 a R10 son SB1 a SB10, y los demás están en [`specs/storage`](../storage/spec.md), [`specs/project`](../project/spec.md) y [`specs/portability`](../portability/spec.md).
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (sólo lo que decía de las tablas y de los skills que V32 retira; no hay requisito nuevo).
 
 ## Definiciones
@@ -18,21 +18,21 @@ Por defecto, sin archivo, cada agente lee a todos los demás: ocultar es una dec
 
 ## R1. La política
 
-- Sin `<data>/sharing.json`, la política MUST ser vacía, y con política vacía cada agente lee a todos los demás (`load`, `sharing.rs:171`).
-- El archivo MUST tener esta forma, y cualquier otra MUST ser inválida (`OnDisk`, `sharing.rs:70`; `SharingPolicy::parse`, `sharing.rs:86`):
+- Sin `<data>/sharing.json`, la política MUST ser vacía, y con política vacía cada agente lee a todos los demás (`load`, `sharing.rs:220`).
+- El archivo MUST tener esta forma, y cualquier otra MUST ser inválida (`OnDisk`, `sharing.rs:111`; `SharingPolicy::parse`, `sharing.rs:127`):
 
   ```json
   { "version": 1, "hides": { "<lector>": ["<autor>", "..."] } }
   ```
 
   Inválido también: un campo desconocido (`deny_unknown_fields`: un `"hide"` mal escrito daría una política vacía, es decir, todo compartido sin aviso), una `version` distinta de 1, un nombre vacío o sólo espacios.
-- Los nombres MUST compararse exactos, sin recortar ni cambiar mayúsculas, como el `agent_id` en la base. Excluir a un agente de sí mismo y los repetidos MUST ignorarse; `*` excluido de `*` no es eso y MUST valer (`hide`, `sharing.rs:131`).
-- El alcance de L MUST ser (`reach_for`, `sharing.rs:119`):
+- Los nombres MUST compararse exactos, sin recortar ni cambiar mayúsculas, como el `agent_id` en la base. Excluir a un agente de sí mismo y los repetidos MUST ignorarse; `*` excluido de `*` no es eso y MUST valer (`hide`, `sharing.rs:172`).
+- El alcance de L MUST ser (`reach_for`, `sharing.rs:160`):
   - `Own` si entre las exclusiones de L o de `*` está el autor `*`;
   - si no, `AllBut` con la unión de las exclusiones de L y de `*`, sin L, en orden alfabético.
 - Un archivo inválido o ilegible MUST dar `Own` para todo lector: una exclusión que el usuario escribió no se pierde por un error de tipeo. Lo propio y las filas sin autor MUST seguir viéndose igual. El error MUST poder leerse: lo informan `memory_status` (R6), `clawg sharing` (R7) y el log del daemon (`reach`, `crates/clawg-cli/src/daemon/api.rs:1488`).
-- El daemon MUST leer el archivo en cada llamada que nombra a un agente (búsqueda, contexto, y las de [`specs/visibility`](../visibility/spec.md) R4), y el worker en cada save (`MemoryStore::reader_for`): un cambio vale desde la próxima llamada o el próximo save, sin reiniciar.
-- Parsear, validar y resolver el alcance MUST ser funciones puras, sin sistema de archivos; sólo `load` y `save` (`sharing.rs:171` y `:183`) tocan el disco.
+- El daemon MUST leer el archivo en cada llamada que nombra a un agente (búsqueda, contexto, y las de [`specs/visibility`](../visibility/spec.md) R4), y el worker en cada save (`sharing::reader_from`, SB8): un cambio vale desde la próxima llamada o el próximo save, sin reiniciar.
+- Parsear, validar y resolver el alcance MUST ser funciones puras, sin sistema de archivos; sólo `load` y `save` (`sharing.rs:220` y `:232`) tocan el disco.
 
 #### Escenario: sin archivo
 - GIVEN una base con filas de `claude-code` y de `cursor`, y sin `sharing.json`
@@ -191,3 +191,17 @@ Las filas guardadas antes de que existiera compartir (`scope = 'agent'` y su `ag
 No hay `enum Scope` en `clawg-core` ni su reexport. La columna `scope` y su CHECK (`crates/clawg-core/migrations/V1__init.sql:6-7`) siguen como están; `NewMemoryRecord` (`crates/clawg-core/src/memory/store_insert.rs:131`) sigue escribiendo `'agent'`.
 
 **Test:** ninguno propio: compila y pasa la suite sin él.
+
+## SB8. El worker lee `sharing.json` del directorio que le da el runtime
+
+`MemoryStore` MUST NOT guardar de dónde se lee `sharing.json`, y `MemoryStore::with_sharing_dir` y `MemoryStore::reader_for` MUST NOT existir.
+
+- El worker de ingest MUST leer la política del directorio de datos que le da el runtime (`memory_worker`, parámetro `sharing`, `crates/clawg-core/src/memory/worker.rs:314`; el runtime pasa su `base_dir`, `runtime.rs:522`, y la evaluación, `eval_api.rs:776`), una vez por save: `process_tracked` llama a `sharing::reader_from` (`crates/clawg-core/src/memory/sharing.rs:99`, `worker.rs:709`) y compara el save con lo que su agente alcanza.
+- Un worker sin directorio, como el de un test sobre un store en memoria, MUST compartir todo: `reader_from` con `None` usa la política vacía.
+
+#### Escenario
+- GIVEN un `sharing.json` donde `agent-other` no lee a `agent-test`, y una fila con la clave `storage/engine` de `agent-test`
+- WHEN `agent-other` guarda otro texto con esa clave, con el directorio de ese archivo
+- THEN el save no falla y no reemplaza la fila de `agent-test`, que sigue activa
+
+**Test:** `a_key_leaves_a_hidden_authors_holder` (`crates/clawg-core/src/memory/worker.rs`). Los demás tests del worker pasan `None` y siguen sin política.

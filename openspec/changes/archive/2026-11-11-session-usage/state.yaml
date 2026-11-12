@@ -1,0 +1,27 @@
+change: session-usage
+objective: transversal
+depends_on: []
+phase: archived
+release: "0.81.0"  # Cursor real, resume y el reporte de una semana, en el piloto (verify.md)
+artifacts:
+  exploration: done  # «Decisiones (2026-11-10)»: A, B, C y D entran; vigilar el proceso del cliente queda afuera
+  proposal: done  # cómo se aplican las seis decisiones; el aviso del puente y la atribución
+  spec: done  # SU1 a SU12 y el invariante de ids enmendado
+  design: done  # D1 a D8
+  tasks: done  # partes 1 a 10; lo local, el mapa, archivar y subir la versión quedan fuera
+  apply: done  # A, B, C y D: el registro, el esquema 3, las rutas, los hooks, el aviso del puente, el reporte y setup
+  verify: done  # Linux y el CI de Linux y Windows; en Windows, con Claude Code 2.1.322 real y la línea de Cursor por PowerShell, los puntos 1, 3, 4, 6, 8 y 9 pasan (verify.md)
+  archive: done  # SU1 a SU12 en specs/metrics; rutas en daemon-access, session-end en hooks, los hooks de setup en setup
+decisions:
+  registry: metrics.db  # esquema 3, con el invariante de ids enmendado sólo para estas tablas
+  duration: start_to_end  # sin umbral de tiempo activo
+  idle_close: 6h  # sin cierre ni actividad en 6 horas, la sesión cierra con idle; lo que siga abre una fila nueva
+  project_merge: moves  # las sesiones pasan al proyecto que queda
+  project_delete: deletes
+  session_end_hook: installed  # parte D, en Claude Code y en Cursor
+  report_command: clawg metrics sessions
+  tool_name: bridge_report  # el puente avisa al terminar cada herramienta, con POST /v1/sessions/calls (design.md, D3)
+  call_project: window  # la carpeta abierta en la ventana, sin registrarla
+  report_names: project_id  # el reporte no abre memory.db
+updated: 2026-11-11
+main_spec: openspec/specs/metrics/spec.md, openspec/specs/daemon-access/spec.md, openspec/specs/hooks/spec.md, openspec/specs/setup/spec.md

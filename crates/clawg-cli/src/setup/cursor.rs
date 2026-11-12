@@ -3,13 +3,13 @@
 //!
 //! Two files of `~/.cursor` change: `mcp.json`, where the MCP server goes
 //! with the absolute path of this binary and a pinned agent id, and
-//! `hooks.json`, where the `sessionStart` hook goes. Cursor has no command
-//! that registers a server, so both are written here, as `setup claude-code`
-//! writes `settings.json`: a pure [`plan`] over what was read, then
-//! [`apply`], and nothing that differs from the plan is replaced. There is no
-//! rules file, since Cursor reads the server's instructions, and no hook
-//! before a prompt, since Cursor's `beforeSubmitPrompt` cannot add to the
-//! context.
+//! `hooks.json`, where the `sessionStart` and `sessionEnd` hooks go. Cursor
+//! has no command that registers a server, so both are written here, as
+//! `setup claude-code` writes `settings.json`: a pure [`plan`] over what was
+//! read, then [`apply`], and nothing that differs from the plan is replaced.
+//! There is no rules file, since Cursor reads the server's instructions, and
+//! no hook before a prompt, since Cursor's `beforeSubmitPrompt` cannot add to
+//! the context.
 
 use std::path::{Path, PathBuf};
 
@@ -23,13 +23,14 @@ use super::{
     Written,
 };
 
-/// The agent id the bridge and the hook are pinned to.
+/// The agent id the bridge and the hooks are pinned to.
 pub const AGENT: &str = "cursor";
 
-/// The one event clawg installs, as Cursor names it, and as `clawg hook`
-/// takes it.
-const EVENT: &str = "sessionStart";
-const EVENT_ARG: &str = "session-start";
+/// The start of a session, as Cursor names it and as `clawg hook` takes it.
+const SESSION_START: (&str, &str) = ("sessionStart", "session-start");
+
+/// The events clawg installs a hook for, each as [`SESSION_START`] is.
+const HOOK_EVENTS: [(&str, &str); 2] = [SESSION_START, ("sessionEnd", "session-end")];
 
 /// How Cursor's files are expected to be laid out, as an error says it.
 const LAYOUT: &str = "as Cursor reads it";
@@ -134,43 +135,44 @@ fn powershell_word(word: &str) -> String {
     quoted
 }
 
-/// What `clawg hook` takes for Cursor's `sessionStart` and `profile`.
-fn hook_args(profile: Profile) -> [&'static str; 8] {
-    ["hook", EVENT_ARG, "--agent", AGENT, "--client", "cursor", "--profile", profile.as_str()]
+/// What `clawg hook` takes for Cursor's `event_arg` (`session-start`, …) and
+/// `profile`.
+fn hook_args(event_arg: &'static str, profile: Profile) -> [&'static str; 8] {
+    ["hook", event_arg, "--agent", AGENT, "--client", "cursor", "--profile", profile.as_str()]
 }
 
-/// The command line of the hook, for the shell Cursor runs it in: PowerShell
-/// takes the call operator and the path always quoted, a POSIX shell the path
-/// quoted only when it needs it.
-pub fn hook_line(exe: &str, profile: Profile, shell: Shell) -> String {
-    let args = hook_args(profile).join(" ");
+/// The command line of the hook for `event_arg`, for the shell Cursor runs
+/// it in: PowerShell takes the call operator and the path always quoted, a
+/// POSIX shell the path quoted only when it needs it.
+pub fn hook_line(exe: &str, event_arg: &'static str, profile: Profile, shell: Shell) -> String {
+    let args = hook_args(event_arg, profile).join(" ");
     match shell {
         Shell::Posix => format!("{} {args}", sh_word(exe)),
         Shell::PowerShell => format!("& {} {args}", powershell_word(exe)),
     }
 }
 
-/// Whether an entry of `sessionStart` is clawg's for `profile`.
-fn is_clawg_hook(hook: &Value, profile: Profile, shell: Shell) -> bool {
+/// Whether an entry of an event is clawg's for `event_arg` and `profile`.
+fn is_clawg_hook(hook: &Value, event_arg: &str, profile: Profile, shell: Shell) -> bool {
     let Some(command) = hook.get("command").and_then(Value::as_str) else { return false };
-    runs_clawg_hook(&shell.words(command), EVENT_ARG, profile)
+    runs_clawg_hook(&shell.words(command), event_arg, profile)
 }
 
 /// Everything setup decides from, read before anything is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
-    /// The binary the server and the hook will run.
+    /// The binary the server and the hooks will run.
     pub exe: PathBuf,
     pub profile: Profile,
     /// `~/.cursor/mcp.json`, where the server goes.
     pub servers: File,
-    /// `~/.cursor/hooks.json`, where the hook goes.
+    /// `~/.cursor/hooks.json`, where the hooks go.
     pub hooks: File,
     /// The profile's preferred language, which the report speaks.
     pub language: Option<Lang>,
 }
 
-/// What happens to the server or to the hook.
+/// What happens to the server or to one event's hook.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     Add,
@@ -188,11 +190,12 @@ pub struct Plan {
     pub server: &'static str,
     pub server_step: Step,
     pub servers: FileStep,
-    pub hook_step: Step,
+    /// The step of each event's hook, by the event as Cursor names it.
+    pub hook_steps: Vec<(&'static str, Step)>,
     pub hooks: FileStep,
 }
 
-/// Decides both steps from what was read, the hook's line for `shell`.
+/// Decides every step from what was read, the hooks' lines for `shell`.
 /// Fails, so that nothing is written, when a file cannot be understood.
 pub fn plan(state: &State, mode: Mode, shell: Shell) -> Result<Plan, SetupError> {
     if !state.exe.is_absolute() {
@@ -209,22 +212,27 @@ pub fn plan(state: &State, mode: Mode, shell: Shell) -> Result<Plan, SetupError>
         args: ["mcp", "--profile", state.profile.as_str(), "--agent", AGENT].map(String::from).to_vec(),
     };
     let server_step = server_step(&mut servers, &server, mode, &state.servers.path)?;
-    let planned = serde_json::json!({ "command": hook_line(exe, state.profile, shell) });
-    let hook_step = hook_step(&mut hooks, &planned, creates_hooks, mode, state.profile, shell, &state.hooks.path)?;
+    let mut hook_steps = Vec::new();
+    for (event, arg) in HOOK_EVENTS {
+        let planned = serde_json::json!({ "command": hook_line(exe, arg, state.profile, shell) });
+        let step = hook_step(&mut hooks, (event, arg), &planned, creates_hooks, mode, state.profile, shell, &state.hooks.path)?;
+        hook_steps.push((event, step));
+    }
 
-    let write = |step: &Step, map: Option<Map<String, Value>>| match step {
-        Step::Add | Step::Remove => {
-            FileStep::Write(serde_json::to_string_pretty(&Value::Object(map.unwrap_or_default())).expect("a JSON value serializes") + "\n")
+    let changes = |step: &Step| matches!(step, Step::Add | Step::Remove);
+    let write = |changed: bool, map: Option<Map<String, Value>>| {
+        if !changed {
+            return FileStep::Unchanged;
         }
-        _ => FileStep::Unchanged,
+        FileStep::Write(serde_json::to_string_pretty(&Value::Object(map.unwrap_or_default())).expect("a JSON value serializes") + "\n")
     };
     Ok(Plan {
         mode,
         server: server.name,
-        servers: write(&server_step, servers),
+        servers: write(changes(&server_step), servers),
         server_step,
-        hooks: write(&hook_step, hooks),
-        hook_step,
+        hooks: write(hook_steps.iter().any(|(_, step)| changes(step)), hooks),
+        hook_steps,
     })
 }
 
@@ -260,11 +268,13 @@ fn server_step(servers: &mut Option<Map<String, Value>>, planned: &Server, mode:
     })
 }
 
-/// clawg's entry under `hooks.sessionStart`: added, left, taken away or
+/// clawg's entry under one event of `hooks`: added, left, taken away or
 /// found to be another of clawg's. `hooks` is the file's object, changed in
 /// place; one that is created starts with `"version": 1`.
+#[expect(clippy::too_many_arguments, reason = "what was read, the event and what the plan was asked for, each used once")]
 fn hook_step(
     hooks: &mut Option<Map<String, Value>>,
+    (event, event_arg): (&str, &str),
     planned: &Value,
     creates: bool,
     mode: Mode,
@@ -272,9 +282,9 @@ fn hook_step(
     shell: Shell,
     path: &Path,
 ) -> Result<Step, SetupError> {
-    let ours = |hook: &&Value| is_clawg_hook(hook, profile, shell);
+    let ours = |hook: &&Value| is_clawg_hook(hook, event_arg, profile, shell);
     let listed = match hooks.as_mut() {
-        Some(map) => event_groups(map, EVENT, false, path, LAYOUT)?,
+        Some(map) => event_groups(map, event, false, path, LAYOUT)?,
         None => None,
     };
     match mode {
@@ -297,7 +307,7 @@ fn hook_step(
             if creates && !map.contains_key("version") {
                 map.insert("version".into(), Value::from(1));
             }
-            event_groups(map, EVENT, true, path, LAYOUT)?.expect("created").push(planned.clone());
+            event_groups(map, event, true, path, LAYOUT)?.expect("created").push(planned.clone());
             Ok(Step::Add)
         }
         Mode::Remove => {
@@ -309,8 +319,8 @@ fn hook_step(
             }
             let map = hooks.as_mut().expect("listed from it");
             let events = map.get_mut("hooks").and_then(Value::as_object_mut).expect("listed from it");
-            if events.get(EVENT).and_then(Value::as_array).is_some_and(Vec::is_empty) {
-                events.remove(EVENT);
+            if events.get(event).and_then(Value::as_array).is_some_and(Vec::is_empty) {
+                events.remove(event);
             }
             if events.is_empty() {
                 map.remove("hooks");
@@ -329,15 +339,17 @@ pub fn locations(home: Option<&Path>) -> Result<(PathBuf, PathBuf), SetupError> 
 
 /// Whether `text`, a `hooks.json`, has `profile`'s hook under `sessionStart`.
 fn installed_in(text: &str, profile: Profile, shell: Shell) -> bool {
+    let (event, event_arg) = SESSION_START;
     let Ok(Value::Object(file)) = serde_json::from_str::<Value>(text) else { return false };
     file.get("hooks")
-        .and_then(|hooks| hooks.get(EVENT))
+        .and_then(|hooks| hooks.get(event))
         .and_then(Value::as_array)
-        .is_some_and(|listed| listed.iter().any(|hook| is_clawg_hook(hook, profile, shell)))
+        .is_some_and(|listed| listed.iter().any(|hook| is_clawg_hook(hook, event_arg, profile, shell)))
 }
 
-/// Whether the `hooks.json` under `home` has the hook `setup cursor` writes
-/// for `profile`; a missing or unreadable file says no.
+/// Whether the `hooks.json` under `home` has the `sessionStart` hook `setup
+/// cursor` writes for `profile`, the one whose runs are recorded; a missing
+/// or unreadable file says no.
 pub fn hook_installed(home: Option<&Path>, profile: Profile) -> bool {
     let Ok((_, hooks)) = locations(home) else { return false };
     std::fs::read_to_string(hooks).is_ok_and(|text| installed_in(&text, profile, Shell::HOST))
@@ -359,7 +371,7 @@ pub fn apply(plan: &Plan, state: &State, base_dir: &Path, now_ms: i64) -> Writte
     write_files(&files, base_dir, now_ms)
 }
 
-/// The report, one line per file, and the exit code: 1 when a step did not
+/// The report, one line per step, and the exit code: 1 when a step did not
 /// end as planned (a conflict, a failure). It speaks the profile's preferred
 /// language; the paths and names it gives do not change.
 pub fn report(plan: &Plan, state: &State, written: Option<&Written>) -> (String, u8) {
@@ -404,31 +416,33 @@ pub fn report(plan: &Plan, state: &State, written: Option<&Written>) -> (String,
     });
 
     let hooks = state.hooks.path.display();
-    let hook = match &plan.hook_step {
-        Step::Add => will(("added", "add it"), ("agregado", "se agregaría")),
-        Step::Remove => will(("removed", "remove it"), ("quitado", "se quitaría")),
-        Step::Unchanged => match lang {
-            Lang::En => "already there".to_string(),
-            Lang::Es => "ya está".to_string(),
-        },
-        Step::Absent => match lang {
-            Lang::En => "none of clawg's".to_string(),
-            Lang::Es => "ninguno de clawg".to_string(),
-        },
-        Step::Conflict(found) => {
-            incomplete = true;
-            match lang {
-                Lang::En => format!(
-                    "another clawg hook is there, `{found}`; left as it is (`clawg setup cursor --remove` takes it away)"
-                ),
-                Lang::Es => format!("hay otro hook de clawg, `{found}`; queda como está (`clawg setup cursor --remove` lo quita)"),
+    for (event, step) in &plan.hook_steps {
+        let hook = match step {
+            Step::Add => will(("added", "add it"), ("agregado", "se agregaría")),
+            Step::Remove => will(("removed", "remove it"), ("quitado", "se quitaría")),
+            Step::Unchanged => match lang {
+                Lang::En => "already there".to_string(),
+                Lang::Es => "ya está".to_string(),
+            },
+            Step::Absent => match lang {
+                Lang::En => "none of clawg's".to_string(),
+                Lang::Es => "ninguno de clawg".to_string(),
+            },
+            Step::Conflict(found) => {
+                incomplete = true;
+                match lang {
+                    Lang::En => format!(
+                        "another clawg hook is there, `{found}`; left as it is (`clawg setup cursor --remove` takes it away)"
+                    ),
+                    Lang::Es => format!("hay otro hook de clawg, `{found}`; queda como está (`clawg setup cursor --remove` lo quita)"),
+                }
             }
-        }
-    };
-    lines.push(match lang {
-        Lang::En => format!("{EVENT} hook in {hooks}: {hook}"),
-        Lang::Es => format!("hook {EVENT} en {hooks}: {hook}"),
-    });
+        };
+        lines.push(match lang {
+            Lang::En => format!("{event} hook in {hooks}: {hook}"),
+            Lang::Es => format!("hook {event} en {hooks}: {hook}"),
+        });
+    }
 
     if let Some(written) = written {
         incomplete |= file_lines(lang, &written.backups, &written.pruned, &written.failures, &mut lines);
@@ -534,19 +548,35 @@ mod tests {
         serde_json::json!({ "type": "stdio", "command": exe().to_str().unwrap(), "args": ["mcp", "--profile", "dev", "--agent", "cursor"] })
     }
 
-    fn planned_hook(shell: Shell) -> Value {
-        serde_json::json!({ "command": hook_line(exe().to_str().unwrap(), Profile::Dev, shell) })
+    fn planned_hook(event_arg: &'static str, shell: Shell) -> Value {
+        serde_json::json!({ "command": hook_line(exe().to_str().unwrap(), event_arg, Profile::Dev, shell) })
+    }
+
+    /// The hooks' steps, in the order of the events: `sessionStart`, `sessionEnd`.
+    fn hook_steps(plan: &Plan) -> Vec<&Step> {
+        assert_eq!(plan.hook_steps.iter().map(|(event, _)| *event).collect::<Vec<_>>(), ["sessionStart", "sessionEnd"]);
+        plan.hook_steps.iter().map(|(_, step)| step).collect()
     }
 
     const ARGS: &str = "hook session-start --agent cursor --client cursor --profile dev";
+    const END_ARGS: &str = "hook session-end --agent cursor --client cursor --profile dev";
 
     #[test]
-    fn an_empty_state_plans_the_server_and_the_hook() {
+    fn an_empty_state_plans_the_server_and_the_hooks() {
         let plan = plan(&state(None, None), Mode::Install, Shell::Posix).unwrap();
-        assert_eq!((&plan.server_step, &plan.hook_step), (&Step::Add, &Step::Add));
+        assert_eq!(plan.server_step, Step::Add);
+        assert_eq!(hook_steps(&plan), [&Step::Add, &Step::Add]);
         assert_eq!(json(written(&plan.servers)), serde_json::json!({ "mcpServers": { "clawg-dev": planned_server() } }));
         let hooks = json(written(&plan.hooks));
-        assert_eq!(hooks, serde_json::json!({ "version": 1, "hooks": { "sessionStart": [planned_hook(Shell::Posix)] } }));
+        assert_eq!(
+            hooks,
+            serde_json::json!({ "version": 1, "hooks": {
+                "sessionStart": [planned_hook("session-start", Shell::Posix)],
+                "sessionEnd": [planned_hook("session-end", Shell::Posix)]
+            }})
+        );
+        // As a POSIX shell reads the path: a Windows one, with its backslashes, is quoted.
+        assert_eq!(hooks["hooks"]["sessionEnd"][0]["command"], format!("{} {END_ARGS}", sh_word(exe().to_str().unwrap())));
         let keys: Vec<&String> = hooks.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["version", "hooks"]);
     }
@@ -567,6 +597,7 @@ mod tests {
             (Some(r#"{"mcpServers":[]}"#), None, "mcp.json"),
             (Some(valid), Some(r#"{"version":1,"hooks":[]}"#), "hooks.json"),
             (Some(valid), Some(r#"{"version":1,"hooks":{"sessionStart":{}}}"#), "hooks.json"),
+            (Some(valid), Some(r#"{"version":1,"hooks":{"sessionEnd":{}}}"#), "hooks.json"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             for (name, text) in [("mcp.json", servers), ("hooks.json", hooks)] {
@@ -647,7 +678,7 @@ mod tests {
 
         let (text, code) = run_in(state_in(dir.path()), Mode::Install, false, Shell::Posix, &data, 2).unwrap();
         assert_eq!(code, 0, "{text}");
-        assert_eq!(text.matches("already there").count(), 2, "{text}");
+        assert_eq!(text.matches("already there").count(), 3, "the server and each hook: {text}");
         assert!(!text.contains("Restart Cursor"), "{text}");
         assert_eq!((read("mcp.json"), read("hooks.json")), (servers, hooks));
         assert_eq!(copies(), 1, "nothing was copied again");
@@ -658,7 +689,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (text, code) = run_in(state_in(dir.path()), Mode::Install, true, Shell::Posix, dir.path(), 0).unwrap();
         assert_eq!(code, 0);
-        assert_eq!(text.matches("would add it").count(), 2, "{text}");
+        assert_eq!(text.matches("would add it").count(), 3, "the server and each hook: {text}");
+        for line in ["sessionStart hook in ", "sessionEnd hook in "] {
+            assert!(text.contains(line), "{text}");
+        }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
@@ -670,7 +704,8 @@ mod tests {
             let installed = plan(&state(servers, hooks), Mode::Install, Shell::Posix).unwrap();
             let s = state(after(servers, &installed.servers).as_deref(), after(hooks, &installed.hooks).as_deref());
             let removed = plan(&s, Mode::Remove, Shell::Posix).unwrap();
-            assert_eq!((&removed.server_step, &removed.hook_step), (&Step::Remove, &Step::Remove));
+            assert_eq!(removed.server_step, Step::Remove);
+            assert_eq!(hook_steps(&removed), [&Step::Remove, &Step::Remove]);
             let servers_back = after(s.servers.text.as_deref(), &removed.servers).unwrap();
             let hooks_back = after(s.hooks.text.as_deref(), &removed.hooks).unwrap();
             match servers {
@@ -690,22 +725,29 @@ mod tests {
         let plan = plan(&state(Some(servers), None), Mode::Remove, Shell::Posix).unwrap();
         assert_eq!(plan.server_step, Step::Conflict("npx other-server".into()));
         assert_eq!(plan.servers, FileStep::Unchanged);
-        assert_eq!((&plan.hook_step, &plan.hooks), (&Step::Absent, &FileStep::Unchanged));
+        assert_eq!(hook_steps(&plan), [&Step::Absent, &Step::Absent]);
+        assert_eq!(plan.hooks, FileStep::Unchanged);
     }
 
     #[test]
     fn the_hook_line_is_written_for_the_shell_that_runs_it() {
-        assert_eq!(hook_line("/opt/clawg/clawg", Profile::Dev, Shell::Posix), format!("/opt/clawg/clawg {ARGS}"));
-        assert_eq!(hook_line("/home/Ana María/bin/clawg", Profile::Dev, Shell::Posix), format!("\"/home/Ana María/bin/clawg\" {ARGS}"));
+        let start = |exe: &str, profile: Profile, shell: Shell| hook_line(exe, "session-start", profile, shell);
+        assert_eq!(start("/opt/clawg/clawg", Profile::Dev, Shell::Posix), format!("/opt/clawg/clawg {ARGS}"));
+        assert_eq!(start("/home/Ana María/bin/clawg", Profile::Dev, Shell::Posix), format!("\"/home/Ana María/bin/clawg\" {ARGS}"));
         assert_eq!(
-            hook_line(r"C:\Users\Ana María\AppData\Local\Programs\clawg\clawg.exe", Profile::Dev, Shell::PowerShell),
+            start(r"C:\Users\Ana María\AppData\Local\Programs\clawg\clawg.exe", Profile::Dev, Shell::PowerShell),
             format!(r#"& "C:\Users\Ana María\AppData\Local\Programs\clawg\clawg.exe" {ARGS}"#)
         );
         assert_eq!(
-            hook_line(r"C:\tools\clawg.exe", Profile::Prod, Shell::PowerShell),
+            start(r"C:\tools\clawg.exe", Profile::Prod, Shell::PowerShell),
             r#"& "C:\tools\clawg.exe" hook session-start --agent cursor --client cursor --profile prod"#
         );
-        assert_eq!(hook_line(r"C:\a$b`c\clawg.exe", Profile::Dev, Shell::PowerShell), format!(r#"& "C:\a`$b``c\clawg.exe" {ARGS}"#));
+        assert_eq!(start(r"C:\a$b`c\clawg.exe", Profile::Dev, Shell::PowerShell), format!(r#"& "C:\a`$b``c\clawg.exe" {ARGS}"#));
+        assert_eq!(hook_line("/opt/clawg/clawg", "session-end", Profile::Dev, Shell::Posix), format!("/opt/clawg/clawg {END_ARGS}"));
+        assert_eq!(
+            hook_line(r"C:\tools\clawg.exe", "session-end", Profile::Dev, Shell::PowerShell),
+            format!(r#"& "C:\tools\clawg.exe" {END_ARGS}"#)
+        );
     }
 
     #[test]
@@ -717,7 +759,7 @@ mod tests {
             (r"C:\Users\Ana María\clawg.exe", Shell::PowerShell),
             (r"C:\a$b`c\clawg.exe", Shell::PowerShell),
         ] {
-            let words = shell.words(&hook_line(exe, Profile::Dev, shell));
+            let words = shell.words(&hook_line(exe, "session-start", Profile::Dev, shell));
             assert_eq!(words[0], exe, "{shell:?}");
             assert_eq!(words[1..], args[..], "{shell:?}");
         }
@@ -731,18 +773,26 @@ mod tests {
         let hooks = serde_json::json!({ "version": 1, "hooks": { "sessionStart": [{ "command": claude }] } }).to_string();
         let s = state(Some(&serde_json::json!({ "mcpServers": { "clawg-dev": planned_server() } }).to_string()), Some(&hooks));
         let plan_ = plan(&s, Mode::Install, Shell::Posix).unwrap();
-        assert_eq!(plan_.hook_step, Step::Conflict(claude.into()));
-        assert_eq!(plan_.hooks, FileStep::Unchanged);
+        assert_eq!(hook_steps(&plan_), [&Step::Conflict(claude.into()), &Step::Add]);
+        let value = json(written(&plan_.hooks));
+        assert_eq!(value["hooks"]["sessionStart"], serde_json::json!([{ "command": claude }]), "the conflicting hook is not replaced");
         let (text, code) = report(&plan_, &s, None);
         assert_eq!(code, 1, "{text}");
-        assert!(text.contains(&format!("another clawg hook is there, `{claude}`; left as it is")), "{text}");
+        assert!(text.contains(&format!("sessionStart hook in hooks.json: another clawg hook is there, `{claude}`; left as it is")), "{text}");
+        assert!(text.contains("sessionEnd hook in hooks.json: would add it"), "{text}");
+
+        let ended = "/old/clawg hook session-end --agent cursor --client cursor --profile dev";
+        let hooks = serde_json::json!({ "version": 1, "hooks": { "sessionEnd": [{ "command": ended }] } }).to_string();
+        let plan_ = plan(&state(None, Some(&hooks)), Mode::Install, Shell::Posix).unwrap();
+        assert_eq!(hook_steps(&plan_), [&Step::Add, &Step::Conflict(ended.into())]);
+        assert_eq!(json(written(&plan_.hooks))["hooks"]["sessionEnd"], serde_json::json!([{ "command": ended }]));
 
         let moved = r#"& "C:\old\clawg.exe" hook session-start --agent cursor --client cursor --profile=dev"#;
         let hooks = serde_json::json!({ "hooks": { "sessionStart": [{ "command": moved }] } }).to_string();
         let plan_ = plan(&state(None, Some(&hooks)), Mode::Install, Shell::PowerShell).unwrap();
-        assert_eq!(plan_.hook_step, Step::Conflict(moved.into()));
+        assert_eq!(hook_steps(&plan_), [&Step::Conflict(moved.into()), &Step::Add]);
         let removing = plan(&state(None, Some(&hooks)), Mode::Remove, Shell::PowerShell).unwrap();
-        assert_eq!(removing.hook_step, Step::Remove);
+        assert_eq!(hook_steps(&removing), [&Step::Remove, &Step::Absent]);
         assert_eq!(json(written(&removing.hooks)), serde_json::json!({}));
     }
 
@@ -754,9 +804,13 @@ mod tests {
         let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["version", "hooks", "note"]);
         let events: Vec<&String> = value["hooks"].as_object().unwrap().keys().collect();
-        assert_eq!(events, ["afterFileEdit", "sessionStart"]);
+        assert_eq!(events, ["afterFileEdit", "sessionStart", "sessionEnd"]);
         assert_eq!(value["hooks"]["afterFileEdit"], json(hooks)["hooks"]["afterFileEdit"]);
-        assert_eq!(value["hooks"]["sessionStart"], serde_json::json!([{ "command": "./start.sh", "timeout": 10 }, planned_hook(Shell::Posix)]));
+        assert_eq!(
+            value["hooks"]["sessionStart"],
+            serde_json::json!([{ "command": "./start.sh", "timeout": 10 }, planned_hook("session-start", Shell::Posix)])
+        );
+        assert_eq!(value["hooks"]["sessionEnd"], serde_json::json!([planned_hook("session-end", Shell::Posix)]));
     }
 
     #[test]
@@ -764,20 +818,23 @@ mod tests {
         let prod = "/opt/clawg/clawg hook session-start --agent cursor --client cursor --profile prod";
         let hooks = serde_json::json!({ "version": 1, "hooks": { "sessionStart": [{ "command": prod }] } }).to_string();
         let installing = plan(&state(None, Some(&hooks)), Mode::Install, Shell::Posix).unwrap();
-        assert_eq!(installing.hook_step, Step::Add);
+        assert_eq!(hook_steps(&installing), [&Step::Add, &Step::Add]);
         assert_eq!(json(written(&installing.hooks))["hooks"]["sessionStart"][0]["command"], prod);
         let removing = plan(&state(None, Some(&hooks)), Mode::Remove, Shell::Posix).unwrap();
-        assert_eq!((&removing.hook_step, &removing.hooks), (&Step::Absent, &FileStep::Unchanged), "the prod hook stays");
+        assert_eq!(hook_steps(&removing), [&Step::Absent, &Step::Absent]);
+        assert_eq!(removing.hooks, FileStep::Unchanged, "the prod hook stays");
     }
 
     #[test]
-    fn the_hook_of_this_profile_is_found_in_hooks_json() {
-        let ours = hook_line("/opt/clawg/clawg", Profile::Dev, Shell::Posix);
+    fn the_session_start_hook_of_this_profile_is_found_in_hooks_json() {
+        let ours = hook_line("/opt/clawg/clawg", "session-start", Profile::Dev, Shell::Posix);
         let hooks = |command: &str| serde_json::json!({ "version": 1, "hooks": { "sessionStart": [{ "command": "other" }, { "command": command }] } }).to_string();
 
         assert!(installed_in(&hooks(&ours), Profile::Dev, Shell::Posix));
         assert!(!installed_in(&hooks(&ours), Profile::Prod, Shell::Posix), "the other profile's hook is not ours");
         assert!(!installed_in(&hooks("echo hi"), Profile::Dev, Shell::Posix));
+        let end_alone = serde_json::json!({ "hooks": { "sessionEnd": [planned_hook("session-end", Shell::Posix)] } }).to_string();
+        assert!(!installed_in(&end_alone, Profile::Dev, Shell::Posix), "only the start of a session leaves runs");
         for text in ["", "not json", "[]", r#"{"hooks":{"sessionStart":"x"}}"#, r#"{"version":1}"#] {
             assert!(!installed_in(text, Profile::Dev, Shell::Posix), "{text:?}");
         }
@@ -787,7 +844,7 @@ mod tests {
         assert!(!hook_installed(None, Profile::Dev), "no home");
         let (_, hooks_path) = locations(Some(home.path())).unwrap();
         std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
-        std::fs::write(&hooks_path, hooks(&hook_line("/opt/clawg/clawg", Profile::Dev, Shell::HOST))).unwrap();
+        std::fs::write(&hooks_path, hooks(&hook_line("/opt/clawg/clawg", "session-start", Profile::Dev, Shell::HOST))).unwrap();
         assert!(hook_installed(Some(home.path()), Profile::Dev));
     }
 
@@ -796,7 +853,50 @@ mod tests {
         let plan = plan(&state(None, None), Mode::Install, Shell::HOST).unwrap();
         let hooks = json(written(&plan.hooks));
         let events: Vec<&String> = hooks["hooks"].as_object().unwrap().keys().collect();
-        assert_eq!(events, ["sessionStart"], "beforeSubmitPrompt cannot add to the context");
+        assert_eq!(events, ["sessionStart", "sessionEnd"], "beforeSubmitPrompt cannot add to the context");
+    }
+
+    #[test]
+    fn a_run_over_an_install_without_the_session_end_hook_adds_only_it() {
+        let earlier = pretty(&serde_json::json!({ "version": 1, "hooks": { "sessionStart": [planned_hook("session-start", Shell::Posix)] } }));
+        let s = state(Some(&serde_json::json!({ "mcpServers": { "clawg-dev": planned_server() } }).to_string()), Some(&earlier));
+        let plan_ = plan(&s, Mode::Install, Shell::Posix).unwrap();
+        assert_eq!(plan_.server_step, Step::Unchanged);
+        assert_eq!(hook_steps(&plan_), [&Step::Unchanged, &Step::Add]);
+
+        let text = written(&plan_.hooks);
+        let kept = earlier.strip_suffix("\n  }\n}\n").expect("the end of the hooks and of the file");
+        assert!(text.starts_with(kept), "what was there is as it was, byte for byte:\n{text}");
+        assert_eq!(json(text)["hooks"]["sessionEnd"], serde_json::json!([planned_hook("session-end", Shell::Posix)]));
+
+        let (report, code) = report(&plan_, &s, None);
+        assert_eq!(code, 0, "{report}");
+        assert!(report.contains("sessionStart hook in hooks.json: already there"), "{report}");
+        assert!(report.contains("sessionEnd hook in hooks.json: would add it"), "{report}");
+
+        let again = plan(&state(s.servers.text.as_deref(), Some(text)), Mode::Install, Shell::Posix).unwrap();
+        assert_eq!(hook_steps(&again), [&Step::Unchanged, &Step::Unchanged]);
+        assert_eq!(again.hooks, FileStep::Unchanged);
+    }
+
+    #[test]
+    fn remove_takes_each_hook_that_is_there() {
+        let earlier = serde_json::json!({ "version": 1, "hooks": {
+            "sessionStart": [{ "command": "./start.sh" }],
+            "sessionEnd": [{ "command": "./end.sh" }, planned_hook("session-end", Shell::Posix)]
+        }})
+        .to_string();
+        let s = state(None, Some(&earlier));
+        let removing = plan(&s, Mode::Remove, Shell::Posix).unwrap();
+        assert_eq!(hook_steps(&removing), [&Step::Absent, &Step::Remove]);
+        assert_eq!(
+            json(written(&removing.hooks)),
+            serde_json::json!({ "version": 1, "hooks": { "sessionStart": [{ "command": "./start.sh" }], "sessionEnd": [{ "command": "./end.sh" }] } })
+        );
+        let (text, code) = report(&removing, &s, None);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("sessionStart hook in hooks.json: none of clawg's"), "{text}");
+        assert!(text.contains("sessionEnd hook in hooks.json: would remove it"), "{text}");
     }
 
     #[test]
@@ -840,6 +940,7 @@ mod tests {
         for needed in [
             "servidor mcp clawg-dev en mcp.json: se agregaría",
             "hook sessionStart en hooks.json: se agregaría",
+            "hook sessionEnd en hooks.json: se agregaría",
             "Cursor: apaga \"Include Third-Party Plugins, Skills, and Other Configs\" (Settings → Agents → Third-Party Imports)",
         ] {
             assert!(dry.contains(needed), "missing {needed:?} in:\n{dry}");

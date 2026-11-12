@@ -9,13 +9,13 @@ use crate::memory::chunker::{CHUNK_MAX_TOKENS, CHUNK_OVERLAP_TOKENS};
 
 /// Longest breadcrumb kept, in bytes. Past it the front is cut, so a deeply
 /// nested section keeps the headings nearest to it and its body keeps room.
-pub const MAX_BREADCRUMB_BYTES: usize = 256;
+pub(crate) const MAX_BREADCRUMB_BYTES: usize = 256;
 
 /// Tokens reserved for the blank line between the breadcrumb and the body.
 const SEPARATOR_TOKENS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Passage {
+pub(crate) struct Passage {
     /// Position within its doc, from 0.
     pub ordinal: usize,
     pub breadcrumb: String,
@@ -25,7 +25,7 @@ pub struct Passage {
 impl Passage {
     /// What is embedded and indexed: the body under its breadcrumb, so a
     /// heading's words find the section and the vector knows where it sits.
-    pub fn indexed_text(&self) -> String {
+    pub(crate) fn indexed_text(&self) -> String {
         format!("{}\n\n{}", self.breadcrumb, self.body)
     }
 }
