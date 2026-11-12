@@ -57,14 +57,10 @@ pub use search::{search_all_memories, PiecePosition, RankedHit, SearchScope};
 /// search would count its pool under test and not in a release.
 pub use search::MemoryPool;
 
-pub(crate) mod contradiction;
 pub mod spill;
 pub(crate) mod maintenance;
 pub mod admin;
-pub mod dispute;
 pub mod synthesis;
-pub mod topic;
-pub(crate) mod revival;
 
 mod domain;
 pub use domain::clock;
@@ -103,3 +99,9 @@ pub(crate) use retrieval::score;
 pub(crate) use retrieval::search;
 pub(crate) use retrieval::search_log;
 pub use retrieval::workspace;
+
+mod revision;
+pub(crate) use revision::contradiction;
+pub use revision::dispute;
+pub(crate) use revision::revival;
+pub use revision::topic;
