@@ -19,7 +19,7 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 
 - **Ruta cruda:** la que llega tal cual: el cwd del puente, `project_path` de una tool, o el cwd de `clawg memories --here`.
 - **Raíz del proyecto:** el resultado de `resolve_project_root(ruta cruda)` (R1).
-- **Id viejo:** `derive_project_id(ruta cruda)`, el que se usaba antes de resolver rutas (`crates/clawg-core/src/memory/identity.rs:11-15`).
+- **Id viejo:** `derive_project_id(ruta cruda)`, el que se usaba antes de resolver rutas (`crates/clawg-core/src/memory/projects/identity.rs:11-15`).
 - **Id nuevo:** `derive_project_id(raíz del proyecto)`. Mismo formato, `{basename}-{hash4}`.
 - **Tabla con proyecto:** `memory`. Hasta V31 también lo eran `episodic_trajectory` y `procedural_skill` (`crates/clawg-core/migrations/V1__init.sql`); V32 las retira ([`specs/storage`](../storage/spec.md), RL1).
 - **Clave de una raíz:** el `origin` normalizado de su directorio git (R14), o ninguna.
@@ -36,18 +36,18 @@ Fuente de verdad del comportamiento actual de la identidad de proyecto. Cubre c�
 - **Checkout grabado de una carpeta:** su camino con la marca que guardó. **Ya no está** cuando el camino no existe o, si guardó una marca, la de lo que hay hoy en él es otra.
 - **Lápida:** un proyecto con `merged_into`, el que dejó una unión (PL13). No recibe nada: cada id que lo nombra lleva al proyecto en el que se unió. Queda porque los puentes abiertos guardan sus ids toda la sesión y los exports viejos los llevan.
 - **Proyecto vivo:** uno sin `merged_into`.
-- **`canonical(id)`:** el proyecto vivo al que lleva una lápida; para un proyecto vivo, o un id que `project` no conoce, el mismo id (`crates/clawg-core/src/memory/merge.rs`).
-- **Parte del usuario de un `workspace.md`:** lo que la regeneración de la sección AUTO conserva tal cual (`split_existing`, `crates/clawg-core/src/memory/workspace.rs`): lo de antes de `<!-- AUTO-START -->` y la sección USER con lo que la sigue.
+- **`canonical(id)`:** el proyecto vivo al que lleva una lápida; para un proyecto vivo, o un id que `project` no conoce, el mismo id (`crates/clawg-core/src/memory/projects/merge.rs`).
+- **Parte del usuario de un `workspace.md`:** lo que la regeneración de la sección AUTO conserva tal cual (`split_existing`, `crates/clawg-core/src/memory/retrieval/workspace.rs`): lo de antes de `<!-- AUTO-START -->` y la sección USER con lo que la sigue.
 - **Filas de un proyecto:** las de `memory` cuyo `project_id` es el proyecto.
 - **Fila viva** (de un borrado): una con `deleted_at` NULL, cualquiera sea su `status`. Una fila `superseded` está viva.
 - **Proyecto vacío:** uno sin filas vivas. Puede tener filas borradas.
 - **Proyecto borrado:** uno con `project.deleted_at`. No se lista y su nombre queda libre, pero su id sigue siendo suyo.
 - **Borrado N:** una fila de `project_delete`. El de la etapa 1 borra un proyecto vacío (`with_memories` falso). El de la etapa 2 borra un proyecto con sus filas.
-- **Conjunto de un borrado:** el proyecto, los ids de raíz de sus carpetas (`project_path` con su `project_id`), sus remotos (`project_remote`) y cada fila del proyecto, viva o borrada, con su id, `status`, `deleted_at` y `update_count` (`Set`, `crates/clawg-core/src/memory/project_delete.rs`).
+- **Conjunto de un borrado:** el proyecto, los ids de raíz de sus carpetas (`project_path` con su `project_id`), sus remotos (`project_remote`) y cada fila del proyecto, viva o borrada, con su id, `status`, `deleted_at` y `update_count` (`Set`, `crates/clawg-core/src/memory/projects/project_delete.rs`).
 - **Código:** los primeros 8 caracteres hexadecimales, en minúscula, del SHA-256 de una forma canónica del conjunto (`code_of`): una línea por dato, ordenadas (`project <id>`, `folder <raíz>`, `remote <remoto>` y, por tabla y por id, `<tabla> <id> <status> <deleted_at o -> <update_count>`). No entran el texto de las filas ni `last_modified_at`.
 - **Borrado abierto:** uno sin `undone_at` ni `purged_at`.
 - **Volver al usarse:** que un proyecto borrado deje de estarlo porque recibió una fila viva (PL22).
-- **Candidatos de una raíz:** `candidate_id(raíz, n)` para `n` de 0 a 63: el id nuevo para 0, y para el resto el mismo formato con el hash de los bytes de la ruta seguidos de `#n` (`crates/clawg-core/src/memory/identity.rs`).
+- **Candidatos de una raíz:** `candidate_id(raíz, n)` para `n` de 0 a 63: el id nuevo para 0, y para el resto el mismo formato con el hash de los bytes de la ruta seguidos de `#n` (`crates/clawg-core/src/memory/projects/identity.rs`).
 
 ## R1. Resolución de la raíz
 
@@ -104,7 +104,7 @@ El id nuevo de una ruta que ya es la raíz canónica MUST ser igual a `derive_pr
 
 ## R3. Todos los caminos usan la misma resolución
 
-El puente MCP (las raíces del cliente, su cwd y `project_path`) y `clawg memories --here` MUST derivar el id con `ProjectIdentity::resolve` (`crates/clawg-core/src/memory/identity.rs`). El cwd es una carpeta abierta sólo cuando el cliente no tiene raíces; si falla `current_dir()`, no lo es ([`specs/mcp`](../mcp/spec.md), BI3). Lo que lee una llamada sin proyecto sale de las carpetas abiertas, y un save sin proyecto se niega ([`specs/mcp`](../mcp/spec.md), BI4 y BI5).
+El puente MCP (las raíces del cliente, su cwd y `project_path`) y `clawg memories --here` MUST derivar el id con `ProjectIdentity::resolve` (`crates/clawg-core/src/memory/projects/identity.rs`). El cwd es una carpeta abierta sólo cuando el cliente no tiene raíces; si falla `current_dir()`, no lo es ([`specs/mcp`](../mcp/spec.md), BI3). Lo que lee una llamada sin proyecto sale de las carpetas abiertas, y un save sin proyecto se niega ([`specs/mcp`](../mcp/spec.md), BI4 y BI5).
 
 #### Escenario
 - GIVEN un puente con cwd en `<tmp>/repo/src` y un cliente sin raíces
@@ -117,7 +117,7 @@ El puente MCP (las raíces del cliente, su cwd y `project_path`) y `clawg memori
 
 ## R4. Registro de proyecto y re-key
 
-`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool>, "assigned": <bool>, "path": "..." }` (`path`, el camino crudo, es opcional y sólo cuenta con `assigned`: PL44) y responde `{ "project_id": "...", "root_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api.rs`; `register_project`, `crates/clawg-core/src/memory/project.rs`).
+`POST /v1/projects`, con token, recibe `{ "root_path": "...", "legacy_ids": ["..."], "index_docs": <bool>, "assigned": <bool>, "path": "..." }` (`path`, el camino crudo, es opcional y sólo cuenta con `assigned`: PL44) y responde `{ "project_id": "...", "root_id": "...", "rekeyed": <n> }` (`register`, `crates/clawg-cli/src/daemon/api.rs`; `register_project`, `crates/clawg-core/src/memory/projects/project.rs`).
 
 - El daemon MUST decidir los ids él mismo, de `root_path` y de las huellas que lee de su checkout (PL3); no los recibe. Con `assigned` los asigna (R15, R16); sin él (un cliente anterior) el id de raíz y de proyecto es `derive_project_id(root_path)`, sin clave (R18).
 - `index_docs` dice si el daemon puede leer los archivos de la raíz ([`specs/project-docs`](../project-docs/spec.md), «Qué raíces se leen»). Si falta MUST tomarse como `false` (`RegisterRequest::index_docs`, `api.rs:1920`): un puente de una versión anterior registra sin indexar, y lo arregla `clawg projects add` o un puente actual en esa raíz cuando es un proyecto.
@@ -159,7 +159,7 @@ El puente MCP (las raíces del cliente, su cwd y `project_path`) y `clawg memori
 - WHEN se busca ese término en el proyecto nuevo
 - THEN aparece por el canal léxico (FTS lee `project_id` de `memory`)
 
-**Tests:** `rows_of_a_legacy_id_move_to_the_resolved_root`, `registering_again_moves_nothing`, `the_logs_restore_every_row_a_registration_moved`, `a_moved_row_is_found_lexically_under_its_new_project`, `a_caller_that_derives_its_id_keeps_the_conflict`, `a_malformed_legacy_id_is_refused_before_anything_moves`, `registering_to_index_raises_the_mark_and_never_lowers_it` y `a_legacy_id_of_another_registered_project_keeps_its_rows_and_workspace` en `crates/clawg-core/src/memory/project.rs`; HTTP en `crates/clawg-cli/tests/api.rs` (`registering_a_root_moves_the_rows_of_its_legacy_id`, `registering_a_root_whose_id_is_taken_by_another_is_a_conflict`, `registering_without_assigned_ids_keeps_the_old_answer`, `registering_a_missing_root_to_index_it_is_a_bad_request`, y los de 400 y 401).
+**Tests:** `rows_of_a_legacy_id_move_to_the_resolved_root`, `registering_again_moves_nothing`, `the_logs_restore_every_row_a_registration_moved`, `a_moved_row_is_found_lexically_under_its_new_project`, `a_caller_that_derives_its_id_keeps_the_conflict`, `a_malformed_legacy_id_is_refused_before_anything_moves`, `registering_to_index_raises_the_mark_and_never_lowers_it` y `a_legacy_id_of_another_registered_project_keeps_its_rows_and_workspace` en `crates/clawg-core/src/memory/projects/project.rs`; HTTP en `crates/clawg-cli/tests/api.rs` (`registering_a_root_moves_the_rows_of_its_legacy_id`, `registering_a_root_whose_id_is_taken_by_another_is_a_conflict`, `registering_without_assigned_ids_keeps_the_old_answer`, `registering_a_missing_root_to_index_it_is_a_bad_request`, y los de 400 y 401).
 
 ## R5. Datos de la versión anterior
 
@@ -170,7 +170,7 @@ Una base creada por la versión anterior, con filas en ids viejos, MUST abrir co
 - WHEN se abre con la versión nueva
 - THEN las filas y sus `project_id` son idénticos, y existen `project` y `project_rekey` vacías
 
-**Test:** `a_database_from_the_previous_version_opens_with_its_project_ids_untouched` en `crates/clawg-core/src/memory/db.rs` (siembra con el runner hasta V8).
+**Test:** `a_database_from_the_previous_version_opens_with_its_project_ids_untouched` en `crates/clawg-core/src/memory/store/db.rs` (siembra con el runner hasta V8).
 
 La columna `index_docs` (V13) llega con 1 en cada fila de `project` que ya existía: [`specs/project-docs`](../project-docs/spec.md), «Datos de la versión anterior». Desde V27 esa tabla se llama `project_path`, y `project` es la de los proyectos (PL1).
 
@@ -215,11 +215,11 @@ En un re-key, por cada agente con `<workspaces>/<agente>/<id viejo>/workspace.md
 - WHEN se registra la raíz con ese id viejo
 - THEN `agent-a/<id nuevo>/workspace.md` tiene la misma sección USER, y el viejo sigue igual
 
-**Tests:** `a_rekey_copies_the_legacy_workspace_and_keeps_it`, `adopting_never_overwrites_the_projects_own_workspace` y `adopting_without_any_workspace_is_a_no_op` en `crates/clawg-core/src/memory/workspace.rs`; `registering_carries_the_legacy_workspace_over` en `project.rs`.
+**Tests:** `a_rekey_copies_the_legacy_workspace_and_keeps_it`, `adopting_never_overwrites_the_projects_own_workspace` y `adopting_without_any_workspace_is_a_no_op` en `crates/clawg-core/src/memory/retrieval/workspace.rs`; `registering_carries_the_legacy_workspace_over` en `project.rs`.
 
 ## R8. Mover cambia el proyecto de una unidad entera y nada más
 
-Un **movimiento** cambia el `project_id` de filas de `memory` a un **destino**: un id de proyecto o «sin proyecto». La **unidad** de una fila es su cierre: las filas de todo save de `memory_piece` que la contiene, las que reemplazó con causa `revision` y la que la reemplazó con esa causa, las que su borrado revivió (`revived_from`) y la que revivió por el suyo, repetido hasta que no entra ninguna más, borradas y `superseded` incluidas (`read_units_in`, `crates/clawg-core/src/memory/relocate.rs`).
+Un **movimiento** cambia el `project_id` de filas de `memory` a un **destino**: un id de proyecto o «sin proyecto». La **unidad** de una fila es su cierre: las filas de todo save de `memory_piece` que la contiene, las que reemplazó con causa `revision` y la que la reemplazó con esa causa, las que su borrado revivió (`revived_from`) y la que revivió por el suyo, repetido hasta que no entra ninguna más, borradas y `superseded` incluidas (`read_units_in`, `crates/clawg-core/src/memory/projects/relocate.rs`).
 
 Un movimiento MUST cambiar, en una transacción, `project_id` y, en una fila sin agente, `scope` (`project` con destino, `global` sin él; `scope_after`) de cada fila de cada unidad aceptada, y MUST NOT tocar otra columna de `memory` (ni `last_modified_at`, ni `update_count`, ni `status`), `memory_vectors`, `memory_fts`, `memory_conflict`, `memory_derivation` ni `memory_piece`. No MUST necesitar el embedder ni correr el detector. Después, la búsqueda, RECENT, LAST SESSION, la dedup, la clave de tema, el revivir y la revisión de conclusiones MUST tratar las filas como guardadas en el destino. Una fila sin proyecto se sigue viendo desde todos los proyectos.
 
@@ -274,11 +274,11 @@ Cada fila que un movimiento cambia, por cualquier puerta, MUST dejar en `memory_
 - WHEN se corre `clawg projects move --origin-project a --to RUTA`
 - THEN se mueven las de `a` con sus unidades y las de `b` quedan sin proyecto
 
-**Tests:** `a_batch_move_selects_by_origin_project` (`crates/clawg-core/src/memory/relocate.rs`); `a_listing_filters_by_origin_project` (`crates/clawg-core/src/memory/admin.rs`); `move_and_list_take_an_origin_project` (`crates/clawg-cli/src/cli.rs`); `move_and_list_select_by_origin_project` (`crates/clawg-cli/tests/api.rs`).
+**Tests:** `a_batch_move_selects_by_origin_project` (`crates/clawg-core/src/memory/projects/relocate.rs`); `a_listing_filters_by_origin_project` (`crates/clawg-core/src/memory/upkeep/admin.rs`); `move_and_list_take_an_origin_project` (`crates/clawg-cli/src/cli.rs`); `move_and_list_select_by_origin_project` (`crates/clawg-cli/tests/api.rs`).
 
 ## R14. La clave de una raíz
 
-`origin_key(raíz)` (`crates/clawg-core/src/memory/identity.rs`) MUST leer el `config` del directorio git de la raíz: `<raíz>/.git/config` si `.git` es un directorio; si es un archivo `gitdir:`, el del directorio común cuando ese `gitdir` tiene `commondir`, y si no el del propio `gitdir` (`git_config_dir`). MUST tomar el primer `url` de `[remote "origin"]` (nombre de sección y de clave sin mayúsculas, subsección exacta, comentarios `#` y `;`, valor entre comillas; `origin_url`) y normalizarlo con una función pura (`normalize_remote`): sin esquema (`https`, `http`, `ssh`, `git`, `git+ssh`, `ssh+git`), usuario, contraseña, puerto, barra final ni `.git`; `usuario@host:ruta` como `host/ruta`; todo en minúsculas. MUST dar ninguna clave para `file://`, una ruta (absoluta, relativa, `~`, `C:\`), un valor sin host o sin ruta, otro esquema y un archivo que no se lee. La clave MUST NOT llevar usuario, contraseña ni token, y no se guarda la URL. No sigue `include` ni `insteadOf`, y no mira otro remoto que `origin`.
+`origin_key(raíz)` (`crates/clawg-core/src/memory/projects/identity.rs`) MUST leer el `config` del directorio git de la raíz: `<raíz>/.git/config` si `.git` es un directorio; si es un archivo `gitdir:`, el del directorio común cuando ese `gitdir` tiene `commondir`, y si no el del propio `gitdir` (`git_config_dir`). MUST tomar el primer `url` de `[remote "origin"]` (nombre de sección y de clave sin mayúsculas, subsección exacta, comentarios `#` y `;`, valor entre comillas; `origin_url`) y normalizarlo con una función pura (`normalize_remote`): sin esquema (`https`, `http`, `ssh`, `git`, `git+ssh`, `ssh+git`), usuario, contraseña, puerto, barra final ni `.git`; `usuario@host:ruta` como `host/ruta`; todo en minúsculas. MUST dar ninguna clave para `file://`, una ruta (absoluta, relativa, `~`, `C:\`), un valor sin host o sin ruta, otro esquema y un archivo que no se lee. La clave MUST NOT llevar usuario, contraseña ni token, y no se guarda la URL. No sigue `include` ni `insteadOf`, y no mira otro remoto que `origin`.
 
 #### Escenario: las formas de un mismo remoto
 - GIVEN `https://github.com/Acme/App.git`, `git@github.com:acme/app.git`, `ssh://git@github.com:22/Acme/App` y `https://u:tok@github.com/Acme/App/`
@@ -310,7 +310,7 @@ Los clientes MUST usar el id que responde el daemon: el puente (R6), los hooks (
 
 ## R17. Unir reconcilia, se registra y se deshace
 
-Unir ids (R4) MUST mover las filas de `memory` como un movimiento de R8, registrado en `memory_move`, sin vectores, índice de texto ni detector, con cada unidad entera y sin rechazar por `live_twin` ni `topic_taken` (`merge_in`, `decide_merge`, `crates/clawg-core/src/memory/relocate.rs`). Una unidad con filas en un proyecto que no es el origen ni el destino MUST quedar donde está, con un warn. Después, en la misma transacción, sobre las filas vivas del destino de los grupos que toca una fila movida (`reconcile`, pura):
+Unir ids (R4) MUST mover las filas de `memory` como un movimiento de R8, registrado en `memory_move`, sin vectores, índice de texto ni detector, con cada unidad entera y sin rechazar por `live_twin` ni `topic_taken` (`merge_in`, `decide_merge`, `crates/clawg-core/src/memory/projects/relocate.rs`). Una unidad con filas en un proyecto que no es el origen ni el destino MUST quedar donde está, con un warn. Después, en la misma transacción, sobre las filas vivas del destino de los grupos que toca una fila movida (`reconcile`, pura):
 
 1. de cada `topic_key` con filas vivas de más de un save, MUST quedar vivo el save de la fila más nueva (`created_at`, luego id), y cada otra fila viva con esa clave fuera de él MUST pasar a `superseded` por la primera fila de ese save, con causa `revision`, salvo un pedazo de un save cuya primera fila está viva sin esa clave;
 2. de cada `content_hash` con más de una fila viva, MUST quedar la más vieja, y cada otra fuera de su save MUST pasar a `superseded` por ella con causa `revision`, sólo si es un save de una fila o si todas las filas vivas de su save se reemplazan así.
@@ -329,7 +329,7 @@ Un pedido sin `assigned` MUST recibir `derive_project_id(raíz)` como los dos id
 
 Una base en V23 con filas en dos proyectos MUST abrir con V24 sin cambiar ninguna fila de `memory` ni de `project` (desde V27, `project_path`), con `project_remote` y `memory_move_supersede` vacías ([`specs/storage`](../storage/spec.md), «Los remotos y lo que reemplaza una unión»).
 
-**Test:** `a_database_from_the_previous_version_opens_with_no_remote_recorded` (`crates/clawg-core/src/memory/db.rs`).
+**Test:** `a_database_from_the_previous_version_opens_with_no_remote_recorded` (`crates/clawg-core/src/memory/store/db.rs`).
 
 ## R20. Una carpeta de un camino sirve a una raíz sólo si su remoto no la contradice
 
@@ -363,11 +363,11 @@ El relleno MUST crear un proyecto por cada id distinto que tenga una fila de `me
 
 En cada carpeta MUST poner en `project_id` su propio id cuando es un proyecto (NULL si no: la carpeta de un clone, cuyas memorias están bajo el proyecto de su remoto, y la carpeta donde nunca se guardó nada, que se resuelven en su primer registro), y en `remote` el remoto que `project_remote` ata a su id sólo cuando le ata exactamente uno. Un id que sólo nombra un registro de historia (`memory_move`, `project_rekey`, `memory_import_extra`, `synthesis_review`) MUST NOT recibir un proyecto, y V27 MUST NOT cambiar ninguna fila de las tres tablas ni de `project_remote`.
 
-**Tests:** `a_database_from_the_previous_version_opens_with_a_project_for_every_id_in_use` (`crates/clawg-core/src/memory/db.rs`); `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_database_from_the_previous_version_opens_with_a_project_for_every_id_in_use` (`crates/clawg-core/src/memory/store/db.rs`); `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 ## PL2. Cada id que se escribe tiene su proyecto
 
-Cuando se inserta una fila de `memory` con un `project_id` que no está en `project`, o se le cambia el `project_id` a uno que no está, la misma escritura MUST crear el proyecto, con el nombre de PL1, `born = 'adopted'`, `reviewed = 0` y el `created_at` de la fila, sin rechazarla ni cambiar ninguna de sus columnas: un save, un import, un movimiento, su `--undo` o un `PATCH`. El nombre que da Rust (`project_name`, `crates/clawg-core/src/memory/registry.rs`) MUST ser el del disparador.
+Cuando se inserta una fila de `memory` con un `project_id` que no está en `project`, o se le cambia el `project_id` a uno que no está, la misma escritura MUST crear el proyecto, con el nombre de PL1, `born = 'adopted'`, `reviewed = 0` y el `created_at` de la fila, sin rechazarla ni cambiar ninguna de sus columnas: un save, un import, un movimiento, su `--undo` o un `PATCH`. El nombre que da Rust (`project_name`, `crates/clawg-core/src/memory/projects/registry.rs`) MUST ser el del disparador.
 
 #### Escenario: un movimiento de vuelta a un id de la historia
 - GIVEN un movimiento que llevó todas las filas de un id viejo a otro proyecto, y ese id sin proyecto
@@ -378,7 +378,7 @@ Cuando se inserta una fila de `memory` con un `project_id` que no está en `proj
 
 ## PL3. El primer commit se lee una vez por directorio git
 
-Cada registro MUST leer de la raíz su clave (R14) y la marca de su directorio git. El primer commit sólo se lee cuando ninguna carpeta del camino guardó esa misma marca: un camino nuevo, una carpeta de antes de V27, o un directorio git que no es el que se grabó. Si una carpeta guardó esa marca, el primer commit es el que guardó ella, también cuando guardó que no se pudo leer. Un camino grabado que se registra con el mismo directorio git MUST NOT correr `git`, y el daemon MUST correrlo en un hilo bloqueante, nunca en el de la conexión (`Ground`, `crates/clawg-core/src/memory/identity.rs`).
+Cada registro MUST leer de la raíz su clave (R14) y la marca de su directorio git. El primer commit sólo se lee cuando ninguna carpeta del camino guardó esa misma marca: un camino nuevo, una carpeta de antes de V27, o un directorio git que no es el que se grabó. Si una carpeta guardó esa marca, el primer commit es el que guardó ella, también cuando guardó que no se pudo leer. Un camino grabado que se registra con el mismo directorio git MUST NOT correr `git`, y el daemon MUST correrlo en un hilo bloqueante, nunca en el de la conexión (`Ground`, `crates/clawg-core/src/memory/projects/identity.rs`).
 
 La lectura (`root_commit`) MUST correr `git rev-list --max-parents=0 --first-parent HEAD` sobre el directorio git que nombra la raíz, sin las variables `GIT_*`, con la entrada cerrada y, en Windows, sin abrir una ventana; esperar como mucho `ROOT_COMMIT_WAIT` (1 s) y cortar el proceso después; y aceptar sólo una línea de 40 o 64 dígitos hex.
 
@@ -392,7 +392,7 @@ La lectura (`root_commit`) MUST correr `git rev-list --max-parents=0 --first-par
 
 ## PL4. Una carpeta sirve a una raíz sólo si sus huellas no la contradicen
 
-Cada carpeta del camino se compara con el checkout con una función pura (`fit`, `crates/clawg-core/src/memory/project.rs`):
+Cada carpeta del camino se compara con el checkout con una función pura (`fit`, `crates/clawg-core/src/memory/projects/project.rs`):
 
 1. si el remoto de la carpeta y la clave del checkout se conocen los dos, la carpeta es **la misma** cuando el checkout tiene uno de sus remotos, y **contradicha** cuando no;
 2. si no, y los dos primeros commits se conocen, es la misma cuando son iguales y contradicha cuando no;
@@ -451,7 +451,7 @@ Para las sugerencias de PL5 y PL6:
 ## PL7. Leer, planear, importar y el cliente anterior eligen igual
 
 - `project_id_in` (`clawg memories --here`, `clawg export --project`) y `plan_ids_in` (el import) MUST elegir con PL3 a PL5 sin escribir. En un lote, una raíz MUST elegir como si las anteriores ya estuvieran escritas, con sus huellas.
-- El import MUST leer lo que su plan necesita del disco en un hilo bloqueante, entre pasadas del plan sobre la conexión (`ReadAhead`, `crates/clawg-core/src/memory/identity.rs`; `plan`, `crates/clawg-core/src/memory/portability/import.rs`). Las carpetas nuevas que escribe MUST llevar lo que grabaría un registro (`project_id`, `remote`, `root_commit` y `git_stamp`), y su proyecto MUST existir en `project`, con `born = 'import'` cuando lo crea el import. Una carpeta que ya estaba no se toca. Adónde va cada proyecto del archivo, y qué graba de una carpeta de otra máquina, está en PL56 y PL57.
+- El import MUST leer lo que su plan necesita del disco en un hilo bloqueante, entre pasadas del plan sobre la conexión (`ReadAhead`, `crates/clawg-core/src/memory/projects/identity.rs`; `plan`, `crates/clawg-core/src/memory/portability/import.rs`). Las carpetas nuevas que escribe MUST llevar lo que grabaría un registro (`project_id`, `remote`, `root_commit` y `git_stamp`), y su proyecto MUST existir en `project`, con `born = 'import'` cuando lo crea el import. Una carpeta que ya estaba no se toca. Adónde va cada proyecto del archivo, y qué graba de una carpeta de otra máquina, está en PL56 y PL57.
 - Un pedido sin `assigned` sigue R18: elige la carpeta con PL4 y nunca sigue una mudanza.
 
 **Tests:** `a_moved_checkout_is_read_and_planned_alike_without_writing`, `a_caller_that_derives_its_id_is_refused_a_repository_without_origin_in_its_path`, `a_caller_that_derives_its_id_never_follows_a_move` (`project.rs`); `an_import_records_its_folders_as_a_registration_would` y `an_import_reads_the_first_commit_off_the_store_s_thread` (`crates/clawg-core/src/memory/portability/import.rs`).
@@ -460,11 +460,11 @@ Para las sugerencias de PL5 y PL6:
 
 El destino de un movimiento (`POST /v1/memories/move`, `PATCH` con `project_id`, `clawg projects move --to-project`) MUST aceptarse cuando está en `project`, tenga carpeta o no, y MUST seguir siendo un 404 sin escribir cuando no está (R10).
 
-**Tests:** `a_project_without_a_folder_is_a_target` (`crates/clawg-core/src/memory/relocate.rs`); `an_unregistered_target_is_refused` y `a_move_to_an_unregistered_project_is_404`.
+**Tests:** `a_project_without_a_folder_is_a_target` (`crates/clawg-core/src/memory/projects/relocate.rs`); `an_unregistered_target_is_refused` y `a_move_to_an_unregistered_project_is_404`.
 
 ## PL9. `clawg projects list` y `clawg projects rename`
 
-**`GET /v1/projects`** está detrás del token y MUST responder `{"projects": [...]}` con cada proyecto vivo (ni las lápidas, como dice PL15, ni los borrados, como dice PL27), tenga carpeta o no, por nombre sin distinguir mayúsculas y después por id (`list_projects`, `crates/clawg-core/src/memory/registry.rs`), con:
+**`GET /v1/projects`** está detrás del token y MUST responder `{"projects": [...]}` con cada proyecto vivo (ni las lápidas, como dice PL15, ni los borrados, como dice PL27), tenga carpeta o no, por nombre sin distinguir mayúsculas y después por id (`list_projects`, `crates/clawg-core/src/memory/projects/registry.rs`), con:
 
 - `id`, `name`, `born`, `reviewed` y `created_at`;
 - `folders`, de cero a muchas: `root_id`, `root_path`, `remote`, `index_docs` y `present`, que dice si el checkout grabado sigue ahí (sin marca grabada, si el camino existe);
@@ -498,7 +498,7 @@ Una carpeta con `project_id` NULL MUST listarse en el proyecto que le da R16, le
 
 V28 MUST agregar a `project` `merged_into` y `merged_at` (NULL por defecto, con un índice parcial por `merged_into`) y crear `project_merge` (`merge_id`, `source`, `target`, `move_id`, `snapshot`, `merged_at`, `undone_at`, `undo_move_id`) y `project_merge_change` (`merge_id`, `kind`, `a`, `b`, sin `CHECK` sobre `kind`), sin cambiar ninguna fila. Un store en V27 abre con todos sus proyectos vivos, y `canonical` de cada id es el mismo id. El detalle de V28 está en [`specs/storage`](../storage/spec.md).
 
-**Tests:** `a_database_from_the_previous_version_opens_with_every_project_live` (`crates/clawg-core/src/memory/db.rs`); la fila 28 de `published_migration_checksums_are_pinned`.
+**Tests:** `a_database_from_the_previous_version_opens_with_every_project_live` (`crates/clawg-core/src/memory/store/db.rs`); la fila 28 de `published_migration_checksums_are_pinned`.
 
 ## PL12. Cada entrada que recibe un proyecto sigue la lápida
 
@@ -507,7 +507,7 @@ Una unión deja cada lápida apuntando a un proyecto vivo (PL13), así que `cano
 `canonical` MUST correr:
 
 - al entrar, en `POST /v1/memories` (antes de buscar la sesión y de escribir el outbox), `POST /v1/search`, `POST /v1/context` (también para el camino del `workspace.md` y los conteos de `synthesize`), `POST /v1/sessions`, `POST /v1/synthesis`, `GET /v1/disputes`, `GET /v1/memories` y `GET /v1/stats` (`live_project`, `crates/clawg-cli/src/daemon/api.rs`);
-- en el worker, al empezar cada save (`follow_merge`, `crates/clawg-core/src/memory/worker.rs`), antes de leer nada del proyecto: cubre un save que estaba en el outbox, una reanudación y `clawg outbox retry`;
+- en el worker, al empezar cada save (`follow_merge`, `crates/clawg-core/src/memory/ingest/worker.rs`), antes de leer nada del proyecto: cubre un save que estaba en el outbox, una reanudación y `clawg outbox retry`;
 - en la transacción que escribe: el destino de un movimiento o de un `PATCH` (`target_in`, `relocate.rs`), el origen de cada fila en el `--undo` de un movimiento, el proyecto que recibe una raíz al registrarla, leerla o planearla (`plan_in`, `plan_ids_in`) y el de cada fila y carpeta de un import (`SqlSeat`, `record_projects`).
 
 Lo que administra proyectos MUST NOT seguir la lápida y responde 409 `project_merged`, con `detail` que nombra el proyecto vivo: `PATCH /v1/projects/{id}`, cualquiera de los lados de `POST /v1/projects/keep-apart`, el destino de `POST /v1/projects/merge` (y su origen cuando es la lápida de otro proyecto) y `from_project` de `POST /v1/memories/move`. El `undo` de `POST /v1/memories/move` que es el movimiento de una unión, o el de su `--undo`, MUST responder 409 `part_of_merge` nombrando la unión.
@@ -588,7 +588,7 @@ V29 (`crates/clawg-core/migrations/V29__project_delete.sql`) MUST:
 
 V29 MUST NOT cambiar ninguna fila. Un store en V28 abre con todos sus proyectos sin `deleted_at`, y un save bajo un id que `project` no conoce lo adopta como antes (PL2). El detalle de V29 y su vuelta atrás está en [`specs/storage`](../storage/spec.md).
 
-**Tests:** `a_database_from_the_previous_version_opens_with_no_project_deleted` (`crates/clawg-core/src/memory/db.rs`); la fila 29 de `published_migration_checksums_are_pinned` (`migrations.rs`).
+**Tests:** `a_database_from_the_previous_version_opens_with_no_project_deleted` (`crates/clawg-core/src/memory/store/db.rs`); la fila 29 de `published_migration_checksums_are_pinned` (`migrations.rs`).
 
 ## PL22. Un proyecto borrado vuelve al usarse
 
@@ -615,7 +615,7 @@ Desde V32 no existen `episodic_trajectory` ni `procedural_skill` (RL1 de [`specs
 - WHEN corre `session-start` en `/work/app`
 - THEN el registro responde A, el contexto no trae memorias de A, y A sigue borrado
 
-**Tests:** `a_live_row_brings_a_deleted_project_back_unreviewed` (por un insert, por un cambio de proyecto y por una restauración) y `a_deleted_row_or_a_registration_leaves_it_deleted` (`crates/clawg-core/src/memory/project_delete.rs`); `a_bridge_opened_before_a_delete_brings_its_project_back` (`crates/clawg-cli/tests/api.rs`).
+**Tests:** `a_live_row_brings_a_deleted_project_back_unreviewed` (por un insert, por un cambio de proyecto y por una restauración) y `a_deleted_row_or_a_registration_leaves_it_deleted` (`crates/clawg-core/src/memory/projects/project_delete.rs`); `a_bridge_opened_before_a_delete_brings_its_project_back` (`crates/clawg-cli/tests/api.rs`).
 
 ## PL23. Borrar un proyecto vacío (etapa 1)
 
@@ -632,7 +632,7 @@ Si X tiene filas vivas, MUST responder 200 con el informe de PL24 con `refused: 
 - los proyectos vivos con el mismo nombre, sin distinguir mayúsculas (`same_name`);
 - los proyectos vivos que tienen una carpeta con el mismo primer commit que una de X y cuyos remotos no la contradicen (`same_first_commit`), con la regla de PL18.
 
-Salen de la regla de `doctor` (`duplicates`, `crates/clawg-core/src/memory/inspect.rs`) sobre los hechos que lee la misma transacción. Un par ya respondido (`apart` o `merged`) y un proyecto borrado MUST NOT ser candidatos.
+Salen de la regla de `doctor` (`duplicates`, `crates/clawg-core/src/memory/projects/inspect.rs`) sobre los hechos que lee la misma transacción. Un par ya respondido (`apart` o `merged`) y un proyecto borrado MUST NOT ser candidatos.
 
 Si X está vacío, MUST hacer lo siguiente en una transacción, sin snapshot:
 
@@ -773,7 +773,7 @@ MUST responder 409 `project_deleted`, con `detail` que nombra el borrado abierto
 Lo que se ve, como con una lápida (PL15):
 
 - `GET /v1/projects` MUST NOT listar un proyecto borrado, ni sus carpetas, ni sus remotos, ni las lápidas que llevan a él, ni sus sugerencias. Una sugerencia con un lado borrado no se lista hasta que ese lado vuelva.
-- MUST responder también `deletes` (`list_deletes`, `crates/clawg-core/src/memory/registry.rs`): cada borrado abierto, por número, con `delete_id`, `project_id`, `name`, `with_memories`, `deleted_at`, `rows` y `back`. `rows` son las filas de su conjunto que siguen borradas, estén donde estén ahora: lo que su purga sacaría; `back` dice si el proyecto volvió al usarse. Un daemon anterior no lo manda, y la CLI lo lee como vacío.
+- MUST responder también `deletes` (`list_deletes`, `crates/clawg-core/src/memory/projects/registry.rs`): cada borrado abierto, por número, con `delete_id`, `project_id`, `name`, `with_memories`, `deleted_at`, `rows` y `back`. `rows` son las filas de su conjunto que siguen borradas, estén donde estén ahora: lo que su purga sacaría; `back` dice si el proyecto volvió al usarse. Un daemon anterior no lo manda, y la CLI lo lee como vacío.
 - El nombre de un proyecto borrado queda libre para `rename`. Su id no.
 
 La tabla de PL19 suma `POST /projects/delete`, con el proyecto en `body.project_id`, que responde `project_merged` a una lápida. Un test MUST mandar a cada ruta de esa tabla que recibe un proyecto el id de un proyecto borrado, y comprobar que pasa una de tres cosas: lo lee vacío, lo hace volver con un save, o responde `project_deleted` donde este requisito lo pide.
@@ -782,7 +782,7 @@ La tabla de PL19 suma `POST /projects/delete`, con el proyecto en `body.project_
 
 ## PL28. `clawg purge --project-delete N`
 
-`clawg purge --project-delete N --yes [--profile P]` (`purge_delete`, `crates/clawg-core/src/memory/secrets.rs`) MUST seguir las reglas de `clawg purge <ID>` ([`specs/secrets`](../secrets/spec.md), R5 y R5b de esa spec). El detalle de lo que saca, de lo que nombra y de sus negativas está ahí.
+`clawg purge --project-delete N --yes [--profile P]` (`purge_delete`, `crates/clawg-core/src/memory/upkeep/secrets.rs`) MUST seguir las reglas de `clawg purge <ID>` ([`specs/secrets`](../secrets/spec.md), R5 y R5b de esa spec). El detalle de lo que saca, de lo que nombra y de sus negativas está ahí.
 
 **Tests:** `purging_a_delete_leaves_no_trace_of_its_rows`, `purging_a_delete_keeps_a_row_restored_since`, `a_purge_of_a_delete_undone_or_purged_is_refused_untouched` y `purging_a_delete_names_the_backups_and_workspaces_that_hold_its_text` (`secrets.rs`); `purge_takes_an_id_or_a_delete` (`cli.rs`); `the_purge_report_of_a_delete_names_what_went` (`crates/clawg-cli/src/secrets.rs`); `a_deleted_project_is_purged_once_the_daemon_stops` (`tests/binary.rs`).
 
@@ -857,7 +857,7 @@ Un REF vacío, de más de 80 caracteres o con caracteres de control es un 400 qu
 - WHEN se resuelve con `create`
 - THEN se crea un proyecto `ideas de producto` con un id `ideas-de-producto-XXXX`, `born = 'agent'` y sin revisar
 
-**Tests:** `a_reference_is_an_id_before_a_name`, `a_name_two_projects_hold_is_ambiguous`, `a_similar_name_creates_nothing_unless_asked`, `a_deleted_project_is_a_candidate_by_name_and_itself_by_id` y `a_reference_is_bounded` (`crates/clawg-core/src/memory/registry.rs`); `a_reference_resolves_through_the_daemon` (`crates/clawg-cli/tests/api.rs`).
+**Tests:** `a_reference_is_an_id_before_a_name`, `a_name_two_projects_hold_is_ambiguous`, `a_similar_name_creates_nothing_unless_asked`, `a_deleted_project_is_a_candidate_by_name_and_itself_by_id` y `a_reference_is_bounded` (`crates/clawg-core/src/memory/projects/registry.rs`); `a_reference_resolves_through_the_daemon` (`crates/clawg-cli/tests/api.rs`).
 
 ## PL33. Un proyecto nuevo sin carpeta
 
@@ -940,7 +940,7 @@ Un proyecto con una carpeta presente, uno sin carpetas, una lápida y un borrado
 - THEN recibe un proyecto propio y una sugerencia `folder_name` con `notas`
 - AND con `/work/notas` todavía ahí no hay sugerencia
 
-**Tests:** `a_folder_named_as_a_project_whose_folders_are_gone_is_suggested`, `a_folder_named_as_a_project_still_there_is_not_suggested` (`crates/clawg-core/src/memory/project.rs`); `a_folder_without_vcs_moved_is_suggested_and_shown_until_answered` (`tests/api.rs`).
+**Tests:** `a_folder_named_as_a_project_whose_folders_are_gone_is_suggested`, `a_folder_named_as_a_project_still_there_is_not_suggested` (`crates/clawg-core/src/memory/projects/project.rs`); `a_folder_without_vcs_moved_is_suggested_and_shown_until_answered` (`tests/api.rs`).
 
 ## PL39. `clawg projects create` y `clawg projects locate`
 
@@ -998,7 +998,7 @@ V30 MUST crear `project_subfolder` (`parent_id`, `subpath`, `project_id`, `creat
 - THEN ninguna fila de ninguna tabla cambió, y `project_subfolder` existe y está vacía
 - AND hay un snapshot `pre-migration`
 
-**Tests:** `a_database_from_the_previous_version_opens_with_no_subfolder_declared` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(29))`); la fila 30 en `published_migration_checksums_are_pinned` (`migrations.rs`); los conteos de migraciones aplicadas de `db.rs`, que pasan de 29 a 30.
+**Tests:** `a_database_from_the_previous_version_opens_with_no_subfolder_declared` (`crates/clawg-core/src/memory/store/db.rs`, sembrado con `seed_on_disk(dir, Some(29))`); la fila 30 en `published_migration_checksums_are_pinned` (`migrations.rs`); los conteos de migraciones aplicadas de `db.rs`, que pasan de 29 a 30.
 
 ## PL44. El registro recibe el camino crudo
 
@@ -1011,7 +1011,7 @@ La respuesta MUST tener la forma de siempre (`project_id`, `root_id`, `rekeyed`)
 
 Sin `path`, con un subcamino vacío o sin `assigned`, MUST responder lo mismo que antes de V30 (R4, R18).
 
-El subcamino MUST salir de una función pura de la cima y el camino (`subpath_of`, `crates/clawg-core/src/memory/identity.rs`). No da nada cuando el camino sale de la cima o cuando uno de sus componentes no es Unicode válido. La lectura del disco va aparte, en `Ground`.
+El subcamino MUST salir de una función pura de la cima y el camino (`subpath_of`, `crates/clawg-core/src/memory/projects/identity.rs`). No da nada cuando el camino sale de la cima o cuando uno de sus componentes no es Unicode válido. La lectura del disco va aparte, en `Ground`.
 
 #### Escenario: un worktree
 - GIVEN `/work/mono`, con un worktree en `/work/mono-wt`
@@ -1060,7 +1060,7 @@ Resolver una declaración MUST NOT:
 - THEN `apps/web` lleva a W, y la raíz a Z
 - AND cuando después se une W en Z, `apps/web` lleva a Z, y el `--undo` de esa unión la devuelve a W
 
-**Tests:** la pura `the_deepest_declared_subfolder_wins` (`crates/clawg-core/src/memory/subfolder.rs`); `a_declared_subfolder_takes_what_is_saved_inside_it`, `a_declaration_follows_a_moved_checkout`, `a_declaration_is_read_through_merges` y `resolving_a_subfolder_joins_nothing` (`project.rs`, con el `Ground` falso); `a_declared_subfolder_takes_what_is_saved_inside_it_in_every_clone` (`tests/api.rs`, con repositorios reales).
+**Tests:** la pura `the_deepest_declared_subfolder_wins` (`crates/clawg-core/src/memory/projects/subfolder.rs`); `a_declared_subfolder_takes_what_is_saved_inside_it`, `a_declaration_follows_a_moved_checkout`, `a_declaration_is_read_through_merges` y `resolving_a_subfolder_joins_nothing` (`project.rs`, con el `Ground` falso); `a_declared_subfolder_takes_what_is_saved_inside_it_in_every_clone` (`tests/api.rs`, con repositorios reales).
 
 ## PL46. Declarar, cambiar y quitar una declaración
 
@@ -1155,13 +1155,13 @@ Un rechazo imprime la causa del daemon tal como llegó, y sale con 1.
 
 Un chequeo nuevo, `project_subfolders`, MUST nombrar con `warn` y `broken_subfolder` cada declaración cuyo repositorio o destino no está en `project`. Su evidencia es el repositorio, el subcamino y el destino, y no tiene paso. Sin hallazgos MUST dar `ok`, con cuántas declaraciones hay. Una declaración bajo una lápida, o hacia un proyecto borrado, no es un hallazgo. En un store anterior a V30 no corre.
 
-**Tests:** `a_declaration_whose_projects_are_gone_is_named` (`crates/clawg-cli/src/doctor/checks.rs`); la lectura del hecho nuevo en un store en V29 y en V30 (`crates/clawg-core/src/memory/inspect.rs`); `the_findings_are_the_same_in_both_languages_but_their_message` sigue pasando.
+**Tests:** `a_declaration_whose_projects_are_gone_is_named` (`crates/clawg-cli/src/doctor/checks.rs`); la lectura del hecho nuevo en un store en V29 y en V30 (`crates/clawg-core/src/memory/projects/inspect.rs`); `the_findings_are_the_same_in_both_languages_but_their_message` sigue pasando.
 
 ## PL52. Lo que no cambia en la entrega 3b
 
 - `project_remote`, su clave y quienes lo leen. `project_path` guarda sólo raíces, y el índice de docs sigue por carpeta de raíz.
 - R1: la raíz de un camino sigue siendo la del primer `.git`. Un subproyecto no es una raíz, y un puente abierto en él busca docs en su repositorio.
-- La búsqueda de memorias: desde un subproyecto no se leen las del repositorio (`memory_project_predicate!`, `crates/clawg-core/src/memory/search.rs:107-114`). `project` y `all_projects` llegan a ellas.
+- La búsqueda de memorias: desde un subproyecto no se leen las del repositorio (`memory_project_predicate!`, `crates/clawg-core/src/memory/retrieval/search.rs:107-114`). `project` y `all_projects` llegan a ellas.
 - Los ids viejos de un camino se unen en el proyecto del repositorio (R4).
 - El contrato del modelo: ninguna herramienta ni argumento cambia. `project_path` sigue siendo «Absolute path of the project», y uno dentro de una subcarpeta declarada lleva a su subproyecto.
 - Las sugerencias: declarar no crea ninguna.
@@ -1199,7 +1199,7 @@ V31 MUST NOT cambiar ninguna fila ni ninguna otra tabla. `memory_import_extra` q
 - AND `clawg import --undo N` de ese import retira lo que su diario anotó, como antes de V31
 - AND hay un snapshot `pre-migration`
 
-**Tests:** `a_database_from_the_previous_version_opens_with_its_imports_as_they_were` (`crates/clawg-core/src/memory/db.rs`, sembrado con `seed_on_disk(dir, Some(30))`); la fila 31 en `published_migration_checksums_are_pinned` (`migrations.rs`); los conteos de migraciones aplicadas de `db.rs`, que pasan de 30 a 31.
+**Tests:** `a_database_from_the_previous_version_opens_with_its_imports_as_they_were` (`crates/clawg-core/src/memory/store/db.rs`, sembrado con `seed_on_disk(dir, Some(30))`); la fila 31 en `published_migration_checksums_are_pinned` (`migrations.rs`); los conteos de migraciones aplicadas de `db.rs`, que pasan de 30 a 31.
 
 ## PL54. Una línea `project` por proyecto
 
@@ -1464,4 +1464,4 @@ V32 MUST reescribir cada entrada de `project_delete_row` y de `project_rekey` qu
 - WHEN se abre con la versión nueva y se deshace la unión
 - THEN A vuelve a ser un proyecto y las dos filas vuelven a A
 
-**Test:** `a_project_deleted_before_the_move_comes_back_with_its_trajectories_and_skills`, `a_merge_from_before_the_move_takes_its_trajectories_and_skills_back` y, para `project_rekey`, `trajectories_and_skills_move_to_memory_and_their_tables_go` (`crates/clawg-core/src/memory/migrations.rs`).
+**Test:** `a_project_deleted_before_the_move_comes_back_with_its_trajectories_and_skills`, `a_merge_from_before_the_move_takes_its_trajectories_and_skills_back` y, para `project_rekey`, `trajectories_and_skills_move_to_memory_and_their_tables_go` (`crates/clawg-core/src/memory/store/migrations.rs`).

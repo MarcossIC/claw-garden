@@ -12,7 +12,7 @@ Fuente de verdad de `clawg doctor`: qué `clawg` resuelve el PATH y qué está m
 - [native-memory-import](../../changes/archive/2026-10-31-native-memory-import/proposal.md), archivado el 2026-10-31, que sale en 0.72.0: el chequeo `native_memory` (NM7). Cómo se importa esa memoria está en [`specs/portability`](../portability/spec.md) (NM1 a NM6).
 - [hook-run-log](../../changes/archive/2026-11-04-hook-run-log/proposal.md), archivado el 2026-11-04, sale en 0.76.0: el chequeo `hooks.runs` (HR6 y HR7). Lo que lee está en [`specs/hooks`](../hooks/spec.md) (HR1 a HR5 y HR8).
 
-**Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/inspect.rs`; la lectura del registro del hook en `crates/clawg-cli/src/hook_log.rs`, y si el hook de Cursor está instalado en `crates/clawg-cli/src/setup/cursor.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
+**Dónde vive:** las decisiones en `crates/clawg-cli/src/doctor/` (`finding.rs`, el sobre y el resumen; `checks.rs`, los chequeos puros; `mcp.rs`, el registro; `mod.rs`, el PATH y la lectura en `run`); los hechos del store en `crates/clawg-core/src/memory/projects/inspect.rs`; la lectura del registro del hook en `crates/clawg-cli/src/hook_log.rs`, y si el hook de Cursor está instalado en `crates/clawg-cli/src/setup/cursor.rs`. Un test citado como «(`doctor`)» está en el `mod tests` de alguno de esos archivos.
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (RL8, al final de esta spec; `project_orphans` y `project_deletes` dejan de nombrar las tablas que V32 retira). Los requisitos de ese cambio se numeran R1 a R10 allí y RL1 a RL10 acá, para no chocar con los ids de cada spec.
 
 ## R1. Un sobre uniforme y el JSON de antes
@@ -87,7 +87,7 @@ Un store más nuevo, divergente, ilegible o sin migraciones MUST NOT leerse más
 - WHEN se inspecciona
 - THEN `store.schema` es `pending`, los chequeos que necesitan V11 o posteriores no aportan nada y el archivo no cambia
 
-**Tests:** `inspecting_leaves_the_store_unchanged`, `a_store_at_an_older_schema_is_read_with_what_it_has`, `a_newer_store_is_not_read_past_its_history`, `a_missing_store_has_no_facts` (`crates/clawg-core/src/memory/inspect.rs`); `schema_findings_follow_the_plan`, `owner_findings` (`doctor`); `doctor_reads_a_running_daemons_store_without_changing_it` (`binary.rs`).
+**Tests:** `inspecting_leaves_the_store_unchanged`, `a_store_at_an_older_schema_is_read_with_what_it_has`, `a_newer_store_is_not_read_past_its_history`, `a_missing_store_has_no_facts` (`crates/clawg-core/src/memory/projects/inspect.rs`); `schema_findings_follow_the_plan`, `owner_findings` (`doctor`); `doctor_reads_a_running_daemons_store_without_changing_it` (`binary.rs`).
 
 ## R4. Contrato de embedding sin cargar el modelo
 
@@ -253,4 +253,4 @@ Con el hook de Cursor del perfil instalado en `~/.cursor/hooks.json` (la regla d
 
 Sobre una base recién migrada desde V31 con filas viejas, las invariantes de `inspect` MUST estar vacías, y `clawg doctor` MUST NOT dar ningún hallazgo `error` ni `warn` del almacén ([`specs/storage`](../storage/spec.md), RL1).
 
-**Test:** `a_store_moved_from_trajectories_and_skills_breaks_no_invariant` (`crates/clawg-core/src/memory/migrations.rs`); `doctor_passes_over_a_store_whose_trajectories_and_skills_moved` (`crates/clawg-cli/tests/binary.rs`).
+**Test:** `a_store_moved_from_trajectories_and_skills_breaks_no_invariant` (`crates/clawg-core/src/memory/store/migrations.rs`); `doctor_passes_over_a_store_whose_trajectories_and_skills_moved` (`crates/clawg-cli/tests/binary.rs`).
