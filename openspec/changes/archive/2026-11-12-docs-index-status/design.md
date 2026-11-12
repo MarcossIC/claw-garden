@@ -49,4 +49,4 @@ El `Health` del cliente lleva `docs_index` como `Vec<serde_json::Value>`: `clawg
 
 ## D6. `/health` no toca el store por esto
 
-`health` (`api.rs:1279`) espera hasta 250 ms por `ingest` y lo deja afuera si el store no contesta. `docs_index` se arma después, de memoria, así que está en los dos casos. No se suma una lectura de `project_doc_file`: una consulta que vence queda igual en la cola de la única conexión ([read-connections](../read-connections/exploration.md)), y `/health` ya deja una.
+`health` (`api.rs:1279`) espera hasta 250 ms por `ingest` y lo deja afuera si el store no contesta. `docs_index` se arma después, de memoria, así que está en los dos casos. No se suma una lectura de `project_doc_file`: una consulta que vence queda igual en la cola de la única conexión ([read-connections](../../read-connections/exploration.md)), y `/health` ya deja una.

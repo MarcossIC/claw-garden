@@ -46,3 +46,11 @@ Linux con el embedder falso no comprueba esto. Con un build debug y el perfil `d
 4. **`/health` con el escritor ocupado.** Durante el refresco real, `clawg status` contesta sin demora perceptible y con `docs_index`, aunque `ingest` falte.
 5. **Windows.** Repetir el punto 1 en Windows, donde el daemon atiende por su socket AF_UNIX nativo: nada del cambio depende del sistema, pero ahí no se miró.
 6. **Después de reiniciar el daemon,** `docs_index` vuelve vacío y el proyecto reaparece cuando el cliente lo registra de nuevo o una búsqueda lo refresca.
+
+## Al archivar (2026-11-12)
+
+- Los ids cambian al consolidar. IS1 a IS15 ya nombran a docs-index-speed en el `Origen` de [`specs/project-docs`](../../../specs/project-docs/spec.md), así que los requisitos de este cambio pasan a ST para no chocar con ellos. Mapeo: IS1, IS2, IS4 e IS6 pasan a ST1, ST2, ST4 y ST6 en `specs/project-docs`; IS3 e IS5 pasan a ST3 y ST5 en [`specs/daemon-access`](../../../specs/daemon-access/spec.md). IS7 («Lo que no cambia») no se consolida. Este archivo conserva los ids IS.
+- Sale en 0.83.0.
+- «Pendiente en local» no se corrió y queda pendiente. Necesita un build debug, el perfil `dev`, el modelo real y un repositorio grande; ninguno de los seis puntos se midió.
+- Citas: el `spec.md` de este cambio no cita líneas de código, y los nombres de test que cita existen en los archivos que nombra. Las citas `path:línea` de `proposal.md`, `design.md` y `exploration.md` describen el código de antes de este cambio y no se corrigieron. En `specs/project-docs`, IC2 tenía cinco líneas de `crates/clawg-cli/src/daemon/api.rs` corridas: se corrigieron al consolidar.
+- Diferencias entre la spec del cambio y el código: no se encontró ninguna en lo rechequeado (el log al conocer el plan, `files_total` que viene del plan, `last_error` que dice lo mismo que antes, y el `Drop` del guardia que deja de mostrar el refresco como en curso).

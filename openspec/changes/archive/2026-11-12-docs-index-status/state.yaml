@@ -1,7 +1,8 @@
 change: docs-index-status
 objective: 3
 depends_on: []
-phase: verify
+phase: archived
+release: "0.83.0"  # docs_index en /health y en clawg status, y la línea de log al conocer el plan (verify.md)
 artifacts:
   exploration: done
   proposal: done
@@ -9,6 +10,7 @@ artifacts:
   design: done
   tasks: done
   apply: done
-  verify: in-progress  # suite y clippy en verde en Linux y en el CI (Linux y Windows); falta mirar clawg status con un refresco real de un repositorio grande
-  archive: pending
+  verify: done  # suite y clippy en verde en Linux y en el CI (Linux y Windows); mirar clawg status con un refresco real de un repositorio grande queda pendiente (verify.md, «Pendiente en local»)
+  archive: done  # IS1, IS2, IS4 e IS6 son ST1, ST2, ST4 y ST6 en specs/project-docs; IS3 e IS5 son ST3 y ST5 en specs/daemon-access
 updated: 2026-11-12
+main_spec: openspec/specs/project-docs/spec.md, openspec/specs/daemon-access/spec.md

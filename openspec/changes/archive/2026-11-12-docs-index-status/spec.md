@@ -160,5 +160,5 @@ El avance MUST contarse en archivos del plan, no en pasajes. `files_total` es la
 
 ## Specs que se consolidan al archivar
 
-- IS1, IS2, IS4 e IS6, en [`specs/project-docs`](../../specs/project-docs/spec.md), junto a «Refresco incremental» e «IC2. La línea del daemon».
-- IS3 e IS5, en [`specs/daemon-access`](../../specs/daemon-access/spec.md), junto a IJ12 (el bloque `import` de `/health`).
+- IS1, IS2, IS4 e IS6, en [`specs/project-docs`](../../../specs/project-docs/spec.md), junto a «Refresco incremental» e «IC2. La línea del daemon».
+- IS3 e IS5, en [`specs/daemon-access`](../../../specs/daemon-access/spec.md), junto a IJ12 (el bloque `import` de `/health`).

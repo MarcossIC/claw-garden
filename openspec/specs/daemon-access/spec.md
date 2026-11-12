@@ -9,6 +9,7 @@ Fuente de verdad de qué peticiones llegan a la API HTTP del daemon antes de mir
 - [windows-socket](../../changes/archive/2026-10-20-windows-socket/proposal.md), archivado el 2026-10-20: lleva R7 a R9 a Windows con AF_UNIX nativo y agrega R10 a R13 (el ACL del archivo del socket, sin AF_UNIX, la barra de rendimiento y la segunda cuenta). Por qué AF_UNIX y no la named pipe, socket2 con un hilo de `accept` y un conector propio de hyper en el cliente, en su [diseño](../../changes/archive/2026-10-20-windows-socket/design.md) y su [exploración](../../changes/archive/2026-10-20-windows-socket/exploration.md); la barra medida y lo que corrió el CI, en su [verify](../../changes/archive/2026-10-20-windows-socket/verify.md).
 - [import-job](../../changes/archive/2026-10-30-import-job/proposal.md), archivado el 2026-10-30, que sale en 0.68.0: agrega IJ12 a IJ14 (el bloque `import` de `/health`, las rutas de trabajos en `PROJECT_INPUTS` y detrás del guardia y el token). Qué hace un trabajo de importación está en [`specs/portability`](../portability/spec.md) (IJ1 a IJ11 e IJ15 a IJ17).
 - [session-usage](../../changes/archive/2026-11-11-session-usage/proposal.md), archivado el 2026-11-11, sale en 0.81.0: SU6 de esa spec entra como SU6 (las rutas `POST /v1/sessions`, `/v1/sessions/end` y `/v1/sessions/calls`, detrás del guardia y del token). Qué cuenta cada una está en [`specs/metrics`](../metrics/spec.md) (SU1 a SU12).
+- [docs-index-status](../../changes/archive/2026-11-12-docs-index-status/proposal.md), archivado el 2026-11-12, sale en 0.83.0: agrega ST3 y ST5 (el bloque `docs_index` de `/health`, sacado de la memoria del proceso, y lo que `clawg status` muestra de él). Son IS3 e IS5 en la spec de ese cambio y ST3 y ST5 acá, con el mismo prefijo que llevan en [`specs/project-docs`](../project-docs/spec.md), donde IS ya nombra los requisitos de docs-index-speed. Qué guarda el índice de cada refresco y la línea de log (ST1, ST2, ST4 y ST6) están en esa spec.
 
 ## Definiciones
 
@@ -242,6 +243,82 @@ Con una segunda cuenta local estándar y el daemon real, conectar al socket MUST
 - THEN contesta dentro de `HEALTH_INGEST_WAIT` con el bloque `import` y sin `ingest`
 
 **Tests:** `health_carries_the_active_jobs_import_block_without_the_connection` y `health_has_no_import_block_without_an_active_job` (`crates/clawg-cli/tests/api.rs`); `a_client_reads_a_health_with_an_import_block` (`crates/clawg-cli/src/client.rs`).
+
+## ST3. `/health` lleva `docs_index`, de memoria
+
+`GET /health` MUST llevar `docs_index`: una lista con una entrada por cada proyecto que tuvo un refresco tomado en esta ejecución del daemon, ordenada por `project_id`, y vacía si no hubo ninguno. La lista MUST salir de la memoria del proceso, sin usar la conexión del store: está aunque `ingest` falte.
+
+Cada entrada:
+
+| Campo | Qué es |
+|---|---|
+| `project_id` | el proyecto |
+| `indexing` | si un refresco corre ahora |
+| `current` | el refresco que corre; falta si no corre ninguno |
+| `current.trigger` | `registration` o `search` |
+| `current.started_at_ms` | cuándo empezó |
+| `current.files_done` | archivos terminados del plan |
+| `current.files_total` | archivos del plan; falta mientras se recorre el árbol |
+| `last` | el último refresco que terminó; falta si ninguno terminó |
+| `last.trigger`, `last.started_at_ms`, `last.finished_at_ms` | quién lo disparó, cuándo empezó y cuándo terminó |
+| `last.report` | si terminó bien: `docs`, `indexed`, `unchanged`, `removed`, `skipped`, `failed`, `passages`, `reused` |
+| `last.error` | si falló: la causa |
+
+```json
+"docs_index": [
+  {
+    "project_id": "claw-garden-3f9a",
+    "indexing": true,
+    "current": { "trigger": "search", "started_at_ms": 1794000000000, "files_done": 12, "files_total": 36 },
+    "last": {
+      "trigger": "registration",
+      "started_at_ms": 1793999000000,
+      "finished_at_ms": 1793999042400,
+      "report": { "docs": 901, "indexed": 36, "unchanged": 865, "removed": 0, "skipped": 0, "failed": 0, "passages": 412, "reused": 120 }
+    }
+  }
+]
+```
+
+Lo que guardan `current` y `last` lo fijan ST1 y ST2 de [`specs/project-docs`](../project-docs/spec.md).
+
+#### Escenario: un refresco detenido a mitad
+- GIVEN un proyecto con dos archivos por indexar, cuyo refresco escribió el primero y espera al embedder por el segundo
+- WHEN se pide `/health`
+- THEN `docs_index` tiene una entrada con ese `project_id`, `indexing` `true`, `current.files_done` 1 y `current.files_total` 2
+
+#### Escenario: la conexión está ocupada
+- GIVEN ese refresco, y la única conexión del store tomada por otra llamada
+- WHEN se pide `/health`
+- THEN contesta sin esperar la conexión, sin `ingest` y con la entrada del proyecto
+
+#### Escenario: al terminar
+- GIVEN ese refresco, al que el embedder deja terminar
+- WHEN se pide `/health`
+- THEN la entrada tiene `indexing` `false`, no tiene `current`, y `last` tiene `finished_at_ms` y `report.indexed` 2
+
+#### Escenario: un fallo
+- GIVEN un proyecto cuyo refresco falla en el embedder
+- WHEN se pide `/health`
+- THEN `last.error` tiene la causa y `last` no tiene `report`
+
+#### Escenario: ningún refresco
+- GIVEN un daemon que no refrescó ningún proyecto
+- WHEN se pide `/health`
+- THEN `docs_index` es una lista vacía
+
+**Tests:** `an_index_status_serializes_what_health_shows` (`crates/clawg-core/src/memory/project_docs/mod.rs`); `health_names_the_project_whose_refresh_runs_and_how_far_it_is`, `health_shows_a_running_refresh_without_the_connection`, `health_says_when_a_refresh_ended_and_what_it_did`, `health_keeps_the_cause_of_a_failed_refresh` y `health_lists_no_docs_index_before_any_refresh` (`crates/clawg-cli/tests/api.rs`).
+
+## ST5. `clawg status` muestra `docs_index`
+
+El bloque `health` de `clawg status` MUST llevar `docs_index` como lo manda el daemon. Contra un daemon que no lo manda, MUST leer su `/health` sin fallar y mostrar una lista vacía. El cliente MUST pasar cada entrada como llegó, sin interpretarla: una entrada con una forma que no conoce no le impide leer `/health`.
+
+#### Escenario: después de un refresco
+- GIVEN un daemon que indexó una carpeta registrada
+- WHEN corre `clawg status`
+- THEN `health.docs_index` tiene la entrada del proyecto, con `last.report.indexed` 1
+
+**Tests:** `the_status_report_shows_the_docs_index` (`crates/clawg-cli/src/status.rs`), `a_health_without_a_docs_index_still_parses` (`crates/clawg-cli/src/client.rs`) y `status_shows_the_docs_index_and_the_log_says_when_a_refresh_starts` (`crates/clawg-cli/tests/binary.rs`).
 
 ## IJ13. `PROJECT_INPUTS` clasifica las rutas nuevas y los recorridos cubren `POST /imports`
 

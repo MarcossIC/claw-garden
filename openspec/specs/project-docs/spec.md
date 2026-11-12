@@ -15,6 +15,7 @@ Fuente de verdad del comportamiento actual del índice de la documentación y el
 - [docs-index-speed](../../changes/archive/2026-11-01-docs-index-speed/proposal.md), archivado el 2026-11-01, que sale en 0.73.0 (IS1, IS2 e IS7 a IS14: el refresco embebe del pasaje más largo al más corto y los docs comparten las llamadas al embedder a través de una cola acotada, en «Refresco incremental» y «La cola del refresco»). El relleno que mide `rag-eval --docs` (IS3 e IS15) está en [`specs/eval`](../eval/spec.md), IC6, y el caso de `e5_golden` que fija el orden (IS4), en [`specs/storage`](../storage/spec.md).
 - [bridge-project-identity](../../changes/archive/2026-11-07-bridge-project-identity/proposal.md), archivado el 2026-11-07, que salió en 0.78.0 (se acepta sola una carpeta que el cliente MCP tiene abierta, y no sólo la raíz del puente, en «Qué raíces se leen», «El puente acepta su raíz sola sólo si es un proyecto» y la herramienta `search_project`; la frase del 403). Las carpetas abiertas están en [`specs/mcp`](../mcp/spec.md), BI3 y BI9.
 - [retire-legacy-kinds](../../changes/archive/2026-11-07-retire-legacy-kinds/proposal.md), archivado el 2026-11-07, que sale en 0.79.0 (sólo lo que decía de las tablas que V32 retira; no hay requisito nuevo).
+- [docs-index-status](../../changes/archive/2026-11-12-docs-index-status/proposal.md), archivado el 2026-11-12, que sale en 0.83.0 (ST1, ST2, ST4 y ST6: el índice guarda en memoria el refresco que corre y el último que terminó, contados en archivos, y el daemon escribe una línea de log cuando el refresco conoce su plan, en «Refresco incremental», después de «IC2. La línea del daemon»). Lo que `/health` y `clawg status` muestran de ese estado está en [`specs/daemon-access`](../daemon-access/spec.md), ST3 y ST5. Son IS1 a IS6 en la spec de ese cambio y ST1 a ST6 acá, para no chocar con los ids de docs-index-speed, que ya usa IS en esta spec.
 
 ## Definiciones
 
@@ -398,13 +399,13 @@ Lo que el refresco devuelve de cada doc reindexado MUST llevar su ruta relativa,
 
 ### IC2. La línea del daemon
 
-Después de `indexed the docs of …` (`refresh_docs`, `crates/clawg-cli/src/daemon/api.rs:3046`) el daemon MUST escribir una línea `info`, armada por `refresh_timing_line` (`api.rs:3029`):
+Después de `indexed the docs of …` (`refresh_docs`, `crates/clawg-cli/src/daemon/api.rs:3260`) el daemon MUST escribir una línea `info`, armada por `refresh_timing_line` (`api.rs:3243`):
 
 ```
 docs refresh of {project_id}: done in {s} s: scan {s}, read {s}, mask {s}, split {s}, lookup {s}, embed {s}, write {s}
 ```
 
-con `done in` el tiempo total del refresco y cada fase en segundos, `read` a `write` sumados sobre los docs, en el formato de segundos del resumen de una importación (`seconds`, `crates/clawg-core/src/memory/portability/timing.rs:102`, que usa `Summary`, `:179`): una cifra decimal. La línea MUST salir sólo cuando el refresco terminó bien, sin nombres de doc ni rutas. `refresh_line` (`api.rs:3020`) MUST NOT cambiar. MUST NOT haber series nuevas en `metrics.db`: `record_refresh` (`api.rs:3066`) sigue registrando `docs.refresh.duration` y `docs.refresh.files` y nada más.
+con `done in` el tiempo total del refresco y cada fase en segundos, `read` a `write` sumados sobre los docs, en el formato de segundos del resumen de una importación (`seconds`, `crates/clawg-core/src/memory/portability/timing.rs:102`, que usa `Summary`, `:180`): una cifra decimal. La línea MUST salir sólo cuando el refresco terminó bien, sin nombres de doc ni rutas. `refresh_line` (`api.rs:3222`) MUST NOT cambiar. MUST NOT haber series nuevas en `metrics.db`: `record_refresh` (`api.rs:3282`) sigue registrando `docs.refresh.duration` y `docs.refresh.files` y nada más.
 
 #### Escenario: la línea
 - GIVEN los tiempos de un refresco con `scan` 0,5 s, `read` 0,25 s, `mask` 0,5 s, `split` 1 s, `lookup` 0 s, `embed` 3 s y `write` 0,75 s, y 6 s de total
@@ -417,6 +418,77 @@ con `done in` el tiempo total del refresco y cada fase en segundos, `read` a `wr
 - THEN sigue siendo `indexed the docs of p: 4 docs, 2 reindexed, 1 removed, 3 skipped, 9 passages, 7 reused`
 
 **Tests:** `the_docs_timing_line_names_every_phase` (función pura que arma la línea, con una tabla de duraciones) y `the_docs_log_line_shows_the_reused_passages` en `crates/clawg-cli/src/daemon/api.rs`; `a_docs_search_records_the_refresh_and_how_long_it_waited_for_it`, que fija las series de `metrics.db`, en `crates/clawg-cli/tests/api.rs`.
+
+### ST1. El índice guarda en memoria el refresco que corre
+
+Mientras un refresco de un proyecto está tomado, `DocIndex` MUST guardar su disparador y la hora en que empezó, en milisegundos Unix. Cuando el refresco conoce su plan MUST guardar cuántos archivos va a indexar, y MUST sumar uno por cada archivo terminado. Antes del plan, el total MUST NOT tener valor: el refresco todavía recorre el árbol.
+
+Cuando el refresco se suelta, termine como termine, el índice MUST dejar de mostrarlo como en curso.
+
+Definiciones de este requisito:
+
+- **Disparador:** quién empezó el refresco. `registration`: un registro del proyecto que pide indexar (`DocIndex::begin`). `search`: una búsqueda sobre un índice que lleva más de `REFRESH_INTERVAL` sin refrescar (`DocIndex::begin_if_due`).
+- **Plan:** qué archivos el refresco vuelve a indexar, cuáles deja y cuáles saca (`plan_refresh`). Se conoce después de recorrer el árbol.
+- **Archivo terminado:** un archivo del plan que el refresco ya escribió en el índice, o que dejó como estaba porque no pudo leerlo o porque uno de sus vectores no sirvió.
+
+#### Escenario: un refresco a mitad
+- GIVEN un proyecto con dos archivos por indexar y un embedder que deja pasar el primero y retiene el segundo
+- WHEN se lee el estado del proyecto
+- THEN dice que corre, con 1 archivo hecho de 2
+- AND su disparador y su hora de comienzo
+
+#### Escenario: los archivos que no se escriben también cuentan
+- GIVEN un plan de dos archivos, uno de ellos con un vector que no sirve
+- WHEN el refresco termina
+- THEN avisó dos archivos terminados
+
+**Tests:** `the_status_follows_a_refresh_from_its_plan_to_its_end`, `a_refresh_reports_its_plan_and_each_file_it_finishes` y `a_claimed_refresh_shows_as_running_until_it_is_released` (`crates/clawg-core/src/memory/project_docs/mod.rs`).
+
+### ST2. El índice guarda en memoria el último refresco que terminó
+
+Cuando un refresco termina, `DocIndex` MUST guardar, antes de soltarlo, su disparador, cuándo empezó y cuándo terminó, y
+
+- si terminó bien, lo que hizo: archivos en disco, reindexados, sin cambios, sacados, salteados y dejados como estaban, y pasajes escritos y reutilizados;
+- si falló, su causa, sin cuentas.
+
+Un refresco que termina reemplaza al anterior: uno que termina bien borra la causa del que falló. `DocIndex::last_error`, que alimenta el `warning` de una búsqueda, da la causa del último refresco que terminó mal, hasta que uno termina bien.
+
+Un refresco tomado que se suelta sin haber corrido MUST NOT cambiar el último.
+
+#### Escenario: termina bien
+- GIVEN un refresco que indexó 2 archivos
+- WHEN se lee el estado
+- THEN no corre, y el último tiene `finished_at_ms` ≥ `started_at_ms` y `indexed` 2, sin `error`
+
+#### Escenario: falla
+- GIVEN un refresco cuyo embedder falla
+- WHEN se lee el estado
+- THEN el último tiene la causa en `error` y no tiene cuentas
+
+**Tests:** `the_status_follows_a_refresh_from_its_plan_to_its_end`, `a_failed_refresh_leaves_its_cause_until_one_succeeds` y `a_claimed_refresh_shows_as_running_until_it_is_released` (`crates/clawg-core/src/memory/project_docs/mod.rs`).
+
+### ST4. Una línea de log cuando el refresco conoce su plan
+
+Cuando un refresco del daemon conoce su plan, y antes de indexar el primer archivo, el daemon MUST escribir en su log, a nivel `info`:
+
+```
+docs refresh of <project_id>: started by <registration|search>: <n> to index, <n> unchanged, <n> to remove
+```
+
+Las dos líneas del final (`indexed the docs of …` y `docs refresh of …: done in …`, IC2) salen después, cuando el refresco termina. Un refresco que falla antes del plan (una raíz que ya no existe) no escribe la línea: su fallo ya se escribe.
+
+#### Escenario: un registro que pide indexar
+- GIVEN un daemon y una carpeta con un `README.md`
+- WHEN se registra la carpeta con `index_docs`
+- THEN el log tiene `docs refresh of <id>: started by registration: 1 to index, 0 unchanged, 0 to remove`
+
+**Tests:** `the_docs_start_line_names_the_project_the_trigger_and_the_plan` (`crates/clawg-cli/src/daemon/api.rs`) y `status_shows_the_docs_index_and_the_log_says_when_a_refresh_starts` (`crates/clawg-cli/tests/binary.rs`).
+
+### ST6. Se cuentan archivos
+
+El avance MUST contarse en archivos del plan, no en pasajes. `files_total` es la cantidad de archivos por reindexar; los que el plan deja como están no entran, y sacar los que ya no existen no suma.
+
+**Tests:** los de ST1.
 
 ## Secretos
 

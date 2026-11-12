@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 3 (y transversal: ver lo que el daemon hace en segundo plano) | S | —; se coordina con [read-connections](../read-connections/exploration.md) (57) | propuesta; las tres decisiones abiertas de la exploración se cerraron con su opción recomendada |
+| 3 (y transversal: ver lo que el daemon hace en segundo plano) | S | —; se coordina con [read-connections](../../read-connections/exploration.md) (57) | propuesta; las tres decisiones abiertas de la exploración se cerraron con su opción recomendada |
 
 Las citas son `ruta:línea` de `develop` en `0716645`.
 

@@ -2,7 +2,7 @@
 
 | Objetivo | Tamaño | Depende de | Estado |
 |---|---|---|---|
-| 3 (y transversal: ver lo que el daemon hace en segundo plano) | S | —; se coordina con [read-connections](../read-connections/exploration.md) (57), que mide cuánto frena un refresco a lo demás | exploración (borrador); prioridad baja |
+| 3 (y transversal: ver lo que el daemon hace en segundo plano) | S | —; se coordina con [read-connections](../../read-connections/exploration.md) (57), que mide cuánto frena un refresco a lo demás | exploración (borrador); prioridad baja |
 
 **Tesis.** El índice de un proyecto se arma y se pone al día en segundo plano, dentro del daemon y fuera del agente. Mientras corre, nada dice de qué proyecto es, cuánto lleva ni cuánto falta, y cuando termina sólo queda una línea en el log. La única señal en vivo es un booleano dentro de la respuesta de una búsqueda. Un trabajo que corre fuera del agente tiene que poder mirarse sin abrir el log ni adivinar.
 
