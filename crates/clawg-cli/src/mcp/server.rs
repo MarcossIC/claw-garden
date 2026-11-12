@@ -2357,7 +2357,7 @@ mod tests {
     async fn index_docs_of(store: &clawg_core::memory::MemoryStore, id: &str) -> Option<i64> {
         let id = id.to_string();
         store
-            .conn
+            .conn_for_test()
             .call(move |c| c.query_row("SELECT (SELECT index_docs FROM project_path WHERE id = ?1)", [id], |r| r.get(0)))
             .await
             .expect("project")
@@ -2468,7 +2468,7 @@ mod tests {
         let (b, _d, store) = bridge_with_store(identity.clone()).await;
         let taken = identity.id.clone();
         store
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute("INSERT INTO project_path (id, root_path, created_at) VALUES (?1, '/elsewhere', 0)", [taken])
             })
@@ -4069,7 +4069,7 @@ mod tests {
             let store = store.clone();
             async move {
                 store
-                    .conn
+                    .conn_for_test()
                     .call(move |c| {
                         c.execute(
                             "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, ?3, 1)",
@@ -4127,7 +4127,7 @@ mod tests {
         let (old, new) = (ids[0], ids[1]);
         store
             .expect("the runtime's store")
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute(
                     &format!("UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new}"),
@@ -4707,7 +4707,7 @@ mod tests {
         let new = saved_id(&b, "agent-a", "the user prefers spaces over tabs").await;
         store
             .expect("the runtime's store")
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute_batch(&format!(
                     "UPDATE memory SET memory_type = 'user_preference' WHERE id = {old}; \
@@ -4782,7 +4782,7 @@ mod tests {
         let new = saved_id(&b, "agent-a", "the cache expires after one day").await;
         let store = store.expect("the runtime's store");
         store
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute(
                     &format!("UPDATE memory SET status = 'disputed', disputed_against = '[{old}]' WHERE id = {new}"),
@@ -5043,7 +5043,7 @@ mod tests {
         let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let snapshot = |store: Arc<clawg_core::memory::MemoryStore>| async move {
             store
-                .conn
+                .conn_for_test()
                 .call(|c| {
                     let mut stmt = c.prepare("SELECT id, scope, agent_id, project_id, status, content FROM memory ORDER BY id")?;
                     let rows = stmt.query_map([], |r| {
@@ -5064,7 +5064,7 @@ mod tests {
         for (agent, row_text) in [("claude-code", content), ("cursor", "cursor keeps its own notes")] {
             let (agent, row_text, bytes) = (agent.to_string(), row_text.to_string(), bytes.clone());
             store
-                .conn
+                .conn_for_test()
                 .call(move |c| {
                     c.execute(
                         "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
@@ -5472,7 +5472,7 @@ mod tests {
         let copy = client.resolve_project("copia", false, false, Born::Agent).await.unwrap().project_id.expect("an id");
         let (one, two) = (own.clone(), copy.clone());
         store
-            .conn
+            .conn_for_test()
             .call(move |c| {
                 c.execute("INSERT INTO project_suggestion (project_id, other_id, reason, created_at) VALUES (?1, ?2, 'root_commit', 1)", [two, one])
             })
@@ -5810,7 +5810,7 @@ mod tests {
         let (old, new) = (in_c("the cache expires after one hour").await, in_c("the cache expires after one day").await);
         store
             .expect("the runtime's store")
-            .conn
+            .conn_for_test()
             .call(move |conn| {
                 conn.execute(
                     "INSERT INTO memory_conflict (new_id, old_id, distance, state, created_at) VALUES (?1, ?2, 0.3, 'escalated', 1)",

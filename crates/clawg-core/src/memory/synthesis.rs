@@ -14,6 +14,7 @@
 
 use serde::Serialize;
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::admin::{map_memory_row, MemoryAdminRow, SELECT_MEMORY};
 use crate::memory::clock::TimestampMs;
 use crate::memory::search::{reach_predicate, reader_bind, reader_predicate};
@@ -21,12 +22,12 @@ use crate::memory::sharing::Reader;
 use crate::memory::{MemoryError, MemoryStore};
 
 /// Pending memories returned when the caller does not say how many.
-pub const DEFAULT_PENDING_LIMIT: u32 = 30;
+pub(crate) const DEFAULT_PENDING_LIMIT: u32 = 30;
 /// Most pending memories one call returns.
-pub const MAX_PENDING_LIMIT: u32 = 100;
+pub(crate) const MAX_PENDING_LIMIT: u32 = 100;
 /// Existing conclusions returned with them, newest first: enough for the agent
 /// to see what it already concluded without crowding out the memories.
-pub const CONCLUSIONS_LIMIT: u32 = 20;
+pub(crate) const CONCLUSIONS_LIMIT: u32 = 20;
 
 /// A live `memory` row that is not a conclusion and that no live conclusion,
 /// of any author, was drawn from. A deleted or superseded conclusion stops
@@ -55,7 +56,7 @@ const LOST_SOURCE: &str = "NOT EXISTS (SELECT 1 FROM memory s WHERE s.id = d.sou
 
 /// Conclusions to review returned at most: each line names what it lost, so
 /// they are longer than the conclusions listed beside them.
-pub const REVIEW_LIMIT: u32 = 10;
+pub(crate) const REVIEW_LIMIT: u32 = 10;
 
 fn to_review_condition() -> String {
     format!(
@@ -79,7 +80,7 @@ pub enum SourceState {
 
 impl SourceState {
     /// From the source's row as `(deleted, status)`, `None` when it has none.
-    pub fn of(row: Option<(bool, &str)>) -> Self {
+    pub(crate) fn of(row: Option<(bool, &str)>) -> Self {
         match row {
             None => Self::Purged,
             Some((true, _)) => Self::Deleted,
@@ -92,7 +93,7 @@ impl SourceState {
 /// A conclusion is to review once one source is lost: the user deleting or
 /// replacing a memory is a statement about it, and only whoever reads the
 /// conclusion can tell whether what is left still carries it.
-pub fn needs_review(sources: &[SourceState]) -> bool {
+pub(crate) fn needs_review(sources: &[SourceState]) -> bool {
     sources.iter().any(|s| *s != SourceState::Live)
 }
 
@@ -238,13 +239,6 @@ fn reviewed_at(c: &rusqlite::Connection, scope: Scope<'_>) -> rusqlite::Result<O
     .optional()
 }
 
-fn backend(context: &'static str) -> impl Fn(tokio_rusqlite::Error) -> MemoryError {
-    move |e| match e {
-        tokio_rusqlite::Error::Error(re) => MemoryError::Sqlite(re),
-        other => MemoryError::Backend(format!("{context}: {other}")),
-    }
-}
-
 /// The memories of a scope that no conclusion covers yet, with the
 /// conclusions already drawn there, and the review recorded as of `now`.
 ///
@@ -281,7 +275,7 @@ pub async fn synthesis_core(
             Ok(found)
         })
         .await
-        .map_err(backend("synthesis"))
+        .map_err(failed_call(ClosedAs::Named("synthesis")))
 }
 
 /// How many pending memories of a scope that `reader` reaches arrived after
@@ -302,7 +296,7 @@ pub async fn unreviewed_count(
             count(c, &unreviewed_condition(), scope, after)
         })
         .await
-        .map_err(backend("unreviewed count"))
+        .map_err(failed_call(ClosedAs::Named("unreviewed count")))
 }
 
 /// How many conclusions of a scope that `reader` reaches lost a source after
@@ -342,7 +336,7 @@ pub async fn conclusions_to_review_count(
             Ok(n as usize)
         })
         .await
-        .map_err(backend("conclusions to review count"))
+        .map_err(failed_call(ClosedAs::Named("conclusions to review count")))
 }
 
 /// The ids among `ids` that name a `memory` row not deleted but superseded,
@@ -375,7 +369,7 @@ pub async fn replaced_memory_ids(
             Ok(found)
         })
         .await
-        .map_err(backend("source lookup"))
+        .map_err(failed_call(ClosedAs::Named("source lookup")))
 }
 
 /// The ids among `ids` that name a `memory` row not deleted, ascending. A row
@@ -406,7 +400,7 @@ pub async fn existing_memory_ids(
             Ok(found)
         })
         .await
-        .map_err(backend("source lookup"))
+        .map_err(failed_call(ClosedAs::Named("source lookup")))
 }
 
 #[cfg(test)]

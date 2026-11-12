@@ -17,6 +17,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::backup::Reason;
 use crate::memory::clock::TimestampMs;
 use crate::memory::merge::canonical_in;
@@ -135,7 +136,7 @@ pub enum MoveError {
 
 impl From<rusqlite::Error> for MoveError {
     fn from(e: rusqlite::Error) -> Self {
-        MoveError::Store(MemoryError::Sqlite(e))
+        MoveError::Store(MemoryError::from(e))
     }
 }
 
@@ -599,7 +600,7 @@ where
             find_out(&tx, false)
         })
         .await
-        .map_err(connection_error)?;
+        .map_err(failed_call::<_, MoveError>(ClosedAs::AsIs))?;
     report.dry_run = dry_run;
     if dry_run || report.moved.is_empty() {
         return Ok(report);
@@ -614,16 +615,9 @@ where
             Ok(report)
         })
         .await
-        .map_err(connection_error)?;
+        .map_err(failed_call::<_, MoveError>(ClosedAs::AsIs))?;
     report.snapshot = Some(snapshot.display().to_string());
     Ok(report)
-}
-
-fn connection_error(e: tokio_rusqlite::Error<MoveError>) -> MoveError {
-    match e {
-        tokio_rusqlite::Error::Error(e) => e,
-        other => MoveError::Store(MemoryError::Backend(other.to_string())),
-    }
 }
 
 /// Moves the rows `filter` selects, with their units, to `target` (`None`:

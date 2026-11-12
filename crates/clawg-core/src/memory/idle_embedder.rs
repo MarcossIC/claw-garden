@@ -39,7 +39,7 @@ pub const DEFAULT_IDLE: Duration = Duration::from_secs(10 * 60);
 /// The least time between two loads that replace a model whose worker was
 /// gone. A model that dies on every call would otherwise be read, checked and
 /// built again on every call.
-pub const RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The idle time [`IDLE_MINUTES_VAR`] asks for: `None` keeps the model
 /// loaded. Unset or empty is [`DEFAULT_IDLE`]; anything but a whole number
@@ -59,7 +59,7 @@ pub fn idle_after(raw: Option<&str>) -> Result<Option<Duration>, String> {
 
 /// Whether a model last used at `last_used` should go at `now`. A call in
 /// flight, or a load other calls are waiting on, always keeps it.
-pub fn should_unload(now: Instant, last_used: Instant, in_flight: usize, idle: Duration) -> bool {
+pub(crate) fn should_unload(now: Instant, last_used: Instant, in_flight: usize, idle: Duration) -> bool {
     in_flight == 0 && now.saturating_duration_since(last_used) >= idle
 }
 

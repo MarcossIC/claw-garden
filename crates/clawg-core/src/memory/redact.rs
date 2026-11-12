@@ -66,7 +66,7 @@ impl SecretKind {
 
 /// One secret in a text: its byte range and kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Found {
+pub(crate) struct Found {
     pub range: Range<usize>,
     pub kind: SecretKind,
 }
@@ -74,7 +74,7 @@ pub struct Found {
 /// A text with its secrets replaced by `[REDACTED:<kind>]`, and the kinds that
 /// were replaced, each once, in order of first appearance.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Redacted {
+pub(crate) struct Redacted {
     pub text: String,
     pub kinds: Vec<SecretKind>,
 }
@@ -201,7 +201,7 @@ fn is_literal_secret(value: &str) -> bool {
 /// Every secret in `text`, in order, none overlapping. Of two that overlap,
 /// the one that starts first wins, and of two that start together, the
 /// longer.
-pub fn find_secrets(text: &str) -> Vec<Found> {
+pub(crate) fn find_secrets(text: &str) -> Vec<Found> {
     let mut found: Vec<Found> = Vec::new();
     for (kind, regex) in PATTERNS.iter() {
         for caps in regex.captures_iter(text) {
@@ -232,7 +232,7 @@ pub fn find_secrets(text: &str) -> Vec<Found> {
 
 /// `text` with every secret [`find_secrets`] reports replaced by its
 /// placeholder.
-pub fn redact(text: &str) -> Redacted {
+pub(crate) fn redact(text: &str) -> Redacted {
     let mut out = String::with_capacity(text.len());
     let mut kinds: Vec<SecretKind> = Vec::new();
     let mut at = 0;

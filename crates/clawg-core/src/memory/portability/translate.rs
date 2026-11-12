@@ -27,10 +27,10 @@ use super::format::{ConflictLine, MemoryLine, Parsed, PieceLine, ProjectLine};
 
 /// The agent rows from another tool are stored under: the tool does not say
 /// which agent wrote each note.
-pub const MIGRATED_AGENT: &str = "migrated";
+pub(crate) const MIGRATED_AGENT: &str = "migrated";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranslateOptions {
+pub(crate) struct TranslateOptions {
     /// The agent every row is stored under.
     pub agent: String,
     /// The first entry of a name counts.
@@ -41,7 +41,7 @@ pub struct TranslateOptions {
 /// rows of that root go to, as registering the root gives it: two clones of
 /// one remote are one project here.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MappedProject {
+pub(crate) struct MappedProject {
     pub name: String,
     /// None when the map names a project rather than a folder.
     pub root: Option<String>,
@@ -50,7 +50,7 @@ pub struct MappedProject {
 
 /// An export as the lines to import.
 #[derive(Debug, Clone)]
-pub struct Translated {
+pub(crate) struct Translated {
     /// Rows and pieces with ids that only mean something here, numbered from
     /// 1 by the date of their note's text, each note's first row first. A
     /// memory line's number is its id.
@@ -63,7 +63,7 @@ pub struct Translated {
 
 /// The rows one note gave.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoteRows {
+pub(crate) struct NoteRows {
     pub origin: String,
     /// The project it goes to here.
     pub project_id: Option<String>,
@@ -306,7 +306,7 @@ impl<'a> Draft<'a> {
 }
 
 /// Translates `export`, every date after `now_ms` taken as `now_ms`.
-pub fn translate(export: &ForeignExport, options: &TranslateOptions, chunker: &ChatChunker, now_ms: i64) -> Translated {
+pub(crate) fn translate(export: &ForeignExport, options: &TranslateOptions, chunker: &ChatChunker, now_ms: i64) -> Translated {
     let mut report = ForeignReport {
         source: export.source.to_owned(),
         version: export.version.clone(),
@@ -506,7 +506,7 @@ fn set_keys(drafts: &mut [Draft<'_>], report: &mut ForeignReport) {
 /// otherwise in lowercase, every other character a `-` and no empty segment,
 /// cut to leave room for a `-` and the start of the original's SHA-256, so
 /// the same original always gives the same key and two never give one.
-pub fn rewrite_key(original: &str) -> String {
+pub(crate) fn rewrite_key(original: &str) -> String {
     if validate_topic_key(original).is_ok() {
         return original.to_owned();
     }

@@ -47,6 +47,8 @@ once_cell.workspace = true
 tokio-rusqlite.workspace = true
 rusqlite.workspace = true
 refinery.workspace = true
+refinery-core.workspace = true
+time.workspace = true
 sqlite-vec.workspace = true
 siphasher.workspace = true
 

@@ -55,7 +55,7 @@ use clawg_core::memory::subfolder::{declare_subfolder, SubfolderError};
 use clawg_core::memory::merge::{canonical, merge_core, undo_merge_core, MergeError, MergeReport};
 use clawg_core::memory::project_delete::{delete_core, undo_delete_core, DeleteError, DeleteReport};
 use clawg_core::memory::registry::{
-    find_project, keep_apart, list_deletes, list_projects, pending_suggestions, rename_project, resolve_project, suggestion_between,
+    find_project, keep_apart, list_deletes, list_projects, own_folder_count, pending_suggestions, rename_project, resolve_project, suggestion_between,
     Born, KeepApartError, KeptApart, ListedDelete, ListedProject, ListedSuggestion, Named, Project, RenameError,
     Resolution as ProjectResolution, ResolveError as ProjectResolveError, ResolveOptions,
 };
@@ -2357,6 +2357,7 @@ async fn import_memories(
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
     let imported = portability::import_parsed(
         store,
+        &app.runtime.imports,
         embedder.as_deref(),
         chunker,
         &backups,
@@ -2557,6 +2558,7 @@ async fn import_as_job(app: &AppCtx, id: u64, mut job: Job) -> End {
     let chunker = Arc::new(ChatChunker::from_cell(app.runtime.tokenizer.clone()));
     let imported = portability::import_parsed(
         &app.runtime.store,
+        &app.runtime.imports,
         job.embedder.as_deref(),
         chunker,
         &backups,
@@ -2619,7 +2621,7 @@ async fn undo_import(
     Json(body): Json<UndoImportRequest>,
 ) -> ApiResult<Json<UndoReport>> {
     let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-    match portability::undo_import(&app.runtime.store, &backups, body.import_id, body.dry_run).await {
+    match portability::undo_import(&app.runtime.store, &app.runtime.imports, &backups, body.import_id, body.dry_run).await {
         Ok(report) => Ok(Json(report)),
         Err(e @ UndoError::UnknownImport(_)) => Err(ApiError::not_found(e.to_string())),
         Err(e @ UndoError::Running(_)) => Err(ApiError::conflict(e.to_string())),
@@ -3121,18 +3123,7 @@ async fn locate_project(State(app): State<Arc<AppCtx>>, Json(body): Json<LocateR
     if own == target {
         return Ok(Json(located(true, None)));
     }
-    let own2 = own.clone();
-    let folders: i64 = store
-        .conn
-        .call(move |c| {
-            c.query_row(
-                "SELECT COUNT(*) FROM project_path WHERE project_id = ?1 OR (project_id IS NULL AND id = ?1)",
-                [own2],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .map_err(ApiError::internal)?;
+    let folders = own_folder_count(store, &own).await.map_err(ApiError::internal)?;
     if folders > 1 {
         return Err(ApiError {
             detail: Some(format!(
@@ -3664,7 +3655,7 @@ mod tests {
     }
 
     async fn count(app: &AppCtx, sql: &'static str) -> i64 {
-        app.runtime.store.conn.call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
+        app.runtime.store.conn_for_test().call(move |c| c.query_row(sql, [], |r| r.get(0))).await.expect("count")
     }
 
     /// How many notes have rows, and how many different numbers of rows a
@@ -3672,7 +3663,7 @@ mod tests {
     async fn notes_stored(app: &AppCtx) -> (i64, i64) {
         app.runtime
             .store
-            .conn
+            .conn_for_test()
             .call(|c| {
                 c.query_row(
                     "SELECT COUNT(DISTINCT created_by_ref), COUNT(DISTINCT n) FROM (SELECT created_by_ref, COUNT(*) AS n FROM memory GROUP BY created_by_ref)",
@@ -3714,7 +3705,7 @@ mod tests {
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory_import WHERE finished_at IS NULL").await, 1, "the journal stays open");
 
         let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-        let undone = portability::undo_import(&app.runtime.store, &backups, job["import_id"].as_i64().unwrap(), false).await;
+        let undone = portability::undo_import(&app.runtime.store, &app.runtime.imports, &backups, job["import_id"].as_i64().unwrap(), false).await;
         assert!(undone.is_ok(), "its number is free: {:?}", undone.err());
     }
 
@@ -3739,7 +3730,7 @@ mod tests {
         let import_id = stopped["import_id"].as_i64().expect("a number");
 
         let backups = clawg_core::paths::backups_dir(&app.runtime.base_dir);
-        let undone = portability::undo_import(&app.runtime.store, &backups, import_id, false).await.expect("an undo, not a refusal to touch a running import");
+        let undone = portability::undo_import(&app.runtime.store, &app.runtime.imports, &backups, import_id, false).await.expect("an undo, not a refusal to touch a running import");
 
         assert_eq!(undone.removed.len(), WRITE_BATCH);
         assert_eq!(count(&app, "SELECT COUNT(*) FROM memory").await, 0);
@@ -3859,7 +3850,7 @@ mod tests {
                     let _ = held.recv();
                     Ok::<_, rusqlite::Error>(())
                 };
-                let mut call = Box::pin(queue.conn.call(hold));
+                let mut call = Box::pin(queue.conn_for_test().call(hold));
                 let _ = std::future::Future::poll(call.as_mut(), &mut std::task::Context::from_waker(std::task::Waker::noop()));
             }
         });

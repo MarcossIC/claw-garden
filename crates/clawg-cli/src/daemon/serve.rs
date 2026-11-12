@@ -324,7 +324,9 @@ pub async fn run(profile: Profile, port: Option<u16>) -> Result<(), ServeError> 
     // close runs at once; after one its bound cut, a call may still hold the
     // connection, and the close would wait behind it past every bound.
     if finished {
-        ctx.runtime.close().await;
+        if let Err(e) = ctx.runtime.close().await {
+            log::warn!("closing memory.db failed: {e}; SQLite replays what is left on the next open");
+        }
     }
 
     // Always, on every exit path: a stale `daemon.json` sends the next client

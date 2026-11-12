@@ -1,9 +1,10 @@
 //! Chunker selector + shared types.
 
 pub(crate) mod chat;
-pub(crate) mod token_splitter;
+pub mod token_splitter;
 
-pub use chat::{ChatChunker, SaveSplit};
+pub use chat::ChatChunker;
+pub(crate) use chat::SaveSplit;
 
 use std::borrow::Cow;
 

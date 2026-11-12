@@ -114,7 +114,7 @@ impl std::str::FromStr for MemoryType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CreatedByType {
+pub(crate) enum CreatedByType {
     Agent,
     User,
     System,
@@ -131,7 +131,7 @@ impl CreatedByType {
 }
 
 #[derive(Debug, Clone)]
-pub struct NewMemoryRecord {
+pub(crate) struct NewMemoryRecord {
     pub scope: &'static str,
     pub agent_id: Option<String>,
     pub project_id: Option<String>,
@@ -172,7 +172,7 @@ const IMPORTANCE_MIN: f64 = 0.0;
 const IMPORTANCE_MAX: f64 = 10.0;
 
 impl NewMemoryRecord {
-    pub fn from_event_and_chunk(evt: &MemoryEvent, chunk: &Chunk) -> Self {
+    pub(crate) fn from_event_and_chunk(evt: &MemoryEvent, chunk: &Chunk) -> Self {
         // Source-first: Compaction-sourced events always map to SessionSummary,
         // regardless of role, BEFORE the role-based derivation below runs.
         let (memory_type, importance) = if evt.source == MemorySource::Explicit {
@@ -282,7 +282,7 @@ fn note_candidates(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum MemoryStoreError {
+pub(crate) enum MemoryStoreError {
     /// Covers every way an embedding fails the shared vector-space invariant
     /// (`memory::vector::to_unit`): wrong dimension, a non-finite component, or
     /// zero/non-normalizable magnitude. One variant because the caller's response
@@ -436,7 +436,8 @@ impl MemoryStore {
             .map_err(MemoryStoreError::from)
     }
 
-    pub async fn insert_memory_with_vector(
+    #[cfg(any(test, feature = "eval"))]
+    pub(crate) async fn insert_memory_with_vector(
         &self,
         record: NewMemoryRecord,
         embedding: Vec<f32>,
@@ -447,6 +448,7 @@ impl MemoryStore {
     /// [`MemoryStore::insert_memory_with_vector`] that writes the outbox
     /// progress `note(id)` names in the same transaction as the row, so a
     /// process that dies after it leaves both or neither.
+    #[cfg(any(test, feature = "eval"))]
     pub(crate) async fn insert_noting(
         &self,
         record: NewMemoryRecord,

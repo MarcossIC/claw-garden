@@ -7,6 +7,7 @@
 //! differently, backfilled rows land in a different hash space than newly
 //! written ones and dedup silently stops matching history.
 
+use crate::memory::error::{ClosedAs, failed_call};
 use crate::memory::MemoryError;
 use unicode_normalization::UnicodeNormalization;
 
@@ -61,13 +62,7 @@ pub(crate) async fn register_content_hash_udf(
         Ok(())
     })
     .await
-    .map_err(|e| match e {
-        tokio_rusqlite::Error::Error(rusqlite_err) => MemoryError::Sqlite(rusqlite_err),
-        tokio_rusqlite::Error::ConnectionClosed => {
-            MemoryError::Backend("connection closed during content_hash UDF registration".into())
-        }
-        other => MemoryError::Backend(other.to_string()),
-    })
+    .map_err(failed_call::<rusqlite::Error, _>(ClosedAs::During("content_hash UDF registration")))
 }
 
 #[cfg(test)]

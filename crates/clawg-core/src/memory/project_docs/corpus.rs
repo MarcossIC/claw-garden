@@ -11,10 +11,10 @@ use super::code::CodeLang;
 
 /// A file larger than this is skipped: past it a "doc" is generated output or
 /// a data dump, and its passages would crowd out the prose around them.
-pub const MAX_DOC_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_DOC_BYTES: u64 = 256 * 1024;
 
 /// How many docs one project indexes at most, taken in path order.
-pub const MAX_DOCS: usize = 2_000;
+pub(crate) const MAX_DOCS: usize = 2_000;
 
 const MANIFESTS: &[&str] = &["Cargo.toml", "package.json", "pyproject.toml", "go.mod"];
 
@@ -42,7 +42,7 @@ pub enum DocKind {
 
 /// Whether the file at `rel_path` (relative to the project root, `/`-separated)
 /// is indexed, and as which kind.
-pub fn classify(rel_path: &str) -> Option<DocKind> {
+pub(crate) fn classify(rel_path: &str) -> Option<DocKind> {
     let name = rel_path.rsplit('/').next()?;
     if MANIFESTS.contains(&name) {
         return Some(DocKind::Manifest);
@@ -56,7 +56,7 @@ pub fn classify(rel_path: &str) -> Option<DocKind> {
 
 /// A doc found on disk, not read yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocFile {
+pub(crate) struct DocFile {
     /// Relative to the root, `/`-separated on every platform.
     pub path: String,
     pub abs: PathBuf,
@@ -64,7 +64,7 @@ pub struct DocFile {
 }
 
 #[derive(Debug, Default)]
-pub struct Walk {
+pub(crate) struct Walk {
     /// In path order, at most [`MAX_DOCS`].
     pub docs: Vec<DocFile>,
     /// Docs left out for their size or past [`MAX_DOCS`].
@@ -81,7 +81,7 @@ pub enum CorpusError {
 /// would: `.gitignore`, `.ignore` and `.git/info/exclude`, even with no `.git`
 /// there. Hidden directories count (`.claude/`, `.github/`), `.git` itself and
 /// symbolic links do not.
-pub fn walk(root: &Path) -> Result<Walk, CorpusError> {
+pub(crate) fn walk(root: &Path) -> Result<Walk, CorpusError> {
     if !root.is_dir() {
         return Err(CorpusError::NotADirectory(root.to_path_buf()));
     }
@@ -124,7 +124,7 @@ pub fn walk(root: &Path) -> Result<Walk, CorpusError> {
 
 /// A doc's text and the sha256 of its bytes, or `None` when it is not UTF-8
 /// (or can no longer be read).
-pub fn read(doc: &DocFile) -> Option<(String, String)> {
+pub(crate) fn read(doc: &DocFile) -> Option<(String, String)> {
     let bytes = std::fs::read(&doc.abs).ok()?;
     let hash = sha256_hex(&bytes);
     String::from_utf8(bytes).ok().map(|text| (text, hash))

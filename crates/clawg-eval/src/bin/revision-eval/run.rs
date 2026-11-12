@@ -487,7 +487,7 @@ async fn release(session: Session) -> Result<(), RunError> {
     // Dropping the last handle to the store only signals the connection's
     // thread, which closes the database a moment later; on Windows its files
     // cannot be deleted until then, so the close is awaited instead.
-    app.runtime.store.conn.clone().close().await.map_err(|e| RunError::Close(e.to_string()))?;
+    app.runtime.close().await.map_err(|e| RunError::Close(e.to_string()))?;
     Ok(())
 }
 
@@ -631,7 +631,7 @@ async fn replay_in(dir: &Path, export: &Path, input: &ReplayInput<'_>) -> Result
     }
     // Closing is awaited, as in `release`: Windows cannot delete the files
     // of a store whose connection has not closed yet.
-    runtime.store.conn.clone().close().await.map_err(|e| RunError::Close(e.to_string()))?;
+    runtime.close().await.map_err(|e| RunError::Close(e.to_string()))?;
     drop(runtime);
     remove_scratch(&store_dir).await;
 
@@ -796,7 +796,7 @@ async fn warned_replay_in(
     }
     // Closing is awaited, as in `release`: Windows cannot delete the files
     // of a store whose connection has not closed yet.
-    runtime.store.conn.clone().close().await.map_err(|e| RunError::Close(e.to_string()))?;
+    runtime.close().await.map_err(|e| RunError::Close(e.to_string()))?;
     drop(runtime);
     remove_scratch(&store_dir).await;
 

@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::chat::{ChatMessage, Role};
+#[cfg(test)]
+use crate::models::chat::ChatMessage;
+use crate::models::chat::Role;
 
 /// One persisted chat message → one event on the ingest channel.
 ///
@@ -113,7 +115,8 @@ impl MemoryEvent {
     ///   - `Role::System` (never reaches `push_and_persist` anyway; defensive)
     ///   - `Role::Assistant` with empty content AND `tool_calls = Some(_)`
     ///     (the "I'm about to call a tool" announcement — no content to embed)
-    pub fn from_message(
+    #[cfg(test)]
+    pub(crate) fn from_message(
         agent_id: String,
         project_id: Option<String>,
         msg: &ChatMessage,
