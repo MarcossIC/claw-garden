@@ -24,9 +24,6 @@
 //! `None` for NULL or malformed JSON rather than panicking.
 
 pub mod bootstrap;
-pub mod chunker;
-pub mod embedder;
-pub mod idle_embedder;
 pub mod store_insert;
 pub mod worker;
 pub mod identity;
@@ -38,7 +35,6 @@ pub(crate) mod pieces;
 pub mod project;
 pub mod project_delete;
 pub mod project_docs;
-pub(crate) mod model_download;
 pub mod registry;
 pub mod relocate;
 pub mod inspect;
@@ -101,3 +97,9 @@ pub(crate) use store::latency;
 pub(crate) use store::migrations;
 pub use store::store_lock;
 pub(crate) use store::tier;
+
+mod embedding;
+pub use embedding::chunker;
+pub use embedding::embedder;
+pub use embedding::idle_embedder;
+pub(crate) use embedding::model_download;
