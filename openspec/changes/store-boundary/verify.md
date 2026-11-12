@@ -1,6 +1,6 @@
 # store-boundary — Verificación
 
-**Resultado:** aplicado y verificado en Linux. La suite entera y los dos clippy pasan sobre el último commit de código. Ningún test de una respuesta ni de los contratos del agente cambió lo que comprueba. Queda el CI del PR, que es quien compila el código `cfg(windows)`, y lo que se lista en [«Pendiente»](#pendiente).
+**Resultado:** aplicado y verificado en Linux, y la suite pasa en el job de Windows del CI. La suite entera y los dos clippy pasan sobre el último commit de código. Ningún test de una respuesta ni de los contratos del agente cambió lo que comprueba. Queda lo que se lista en [«Pendiente»](#pendiente).
 
 ## Qué se corrió
 
@@ -114,13 +114,20 @@ Las cuentas son de ítems de módulo y de métodos (`fn`, `struct`, `enum`, `con
 - **Dos gemelas de plataforma siguen `pub`.** `keep_one_malloc_arena` (`embedder.rs`) y `sync_dir` (`backup.rs`) tienen una definición por plataforma, y los otros crates usan las dos. Linux compila una sola, así que la otra había quedado `pub(crate)`: el job de Windows del CI lo marcó como código sin uso, y se corrigió en un commit aparte.
 - **`process_tracked`** pasa a ocho parámetros y lleva el mismo `#[expect(clippy::too_many_arguments)]` que `import_parsed`.
 
+## El CI en Windows
+
+El job `test (windows-latest)` compila el código `cfg(windows)` de los tres crates y corre la suite con finales de línea CRLF. Marcó dos cosas:
+
+- **Las dos gemelas de plataforma** de arriba, que eran de este cambio.
+- **`a_daemon_records_its_requests_and_report_reads_them_after_stop`** (`crates/clawg-cli/tests/binary.rs`) falló una vez y pasó al repetir el job con el mismo commit: `clawg metrics report`, pedido justo después de `clawg stop`, contestó `attempt to write a readonly database`. Este cambio no toca `metrics.db`. Es el texto de SQLite cuando una conexión de sólo lectura encuentra un journal junto al archivo: en Windows el borrado del journal llega al directorio recién cuando se cierra el último handle sobre él. Se reprodujo en Linux dejando el journal a mano (`a_reader_waits_for_a_journal_its_writer_is_removing`, `crates/clawg-core/src/metrics/store.rs`), y `MetricsDb::open_read_only` ahora vuelve a mirar durante 5 s. Que esa sea la causa del fallo del CI es la lectura que mejor encaja con el texto y con que no se repita; no se observó el journal en el runner.
+
+El check `advisories` falla por un aviso sobre `rmcp` 3.5.1 que `develop` también tiene: no es de este cambio.
+
 ## Pendiente
 
-Lo que Linux no comprueba:
+Lo que el CI no comprueba:
 
-- **El CI del PR en Windows.** Compila el código `cfg(windows)` de los tres crates, que acá no se construyó, y corre la suite con finales de línea CRLF: las reglas nuevas de `conventions.rs` leen los fuentes como texto, y sólo `a_test_module_in_another_file_does_not_end_the_production_code` y `the_production_code_ends_at_the_test_module_with_either_line_end` los prueban con CRLF acá.
 - **En Windows, en local**, con `--target-dir target-test`: que `rag-eval --agent-view`, `revision-eval` y `conflict-eval` borren su directorio temporal al terminar. Ahora cierran con `MemoryRuntime::close`, y en Windows un store que no cerró no se puede borrar.
-- **`cargo clippy -p clawg-cli -- -D warnings` en Windows**, que construye el núcleo como el release de esa plataforma. El CI lo corre.
 - **El `E0616` del doctest**, que sólo comprueba un `rustdoc` nightly.
 
 Fuera de estas tareas quedan archivar, las specs principales, `openspec/README.md`, `openspec/ROADMAP.md` y la subida de versión.

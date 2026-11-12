@@ -231,7 +231,7 @@ No tiene un test en rojo propio: su rojo es el del compilador. El paso 1 rompe l
   cargo clippy -p clawg-cli -- -D warnings
   ```
 
-- [ ] El CI del PR, que corre también Windows.
+- [x] El CI del PR, que corre también Windows.
 - [x] Las comprobaciones de [D11](design.md#d11-cómo-se-comprueba-que-nada-de-lo-que-ve-un-cliente-cambia):
   - el `git diff --word-diff` de los tests, en el que una línea de `assert` sólo cambia en las formas permitidas;
   - el diff vacío de los dos contratos del agente;

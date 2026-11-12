@@ -1,7 +1,7 @@
 change: store-boundary
 objective: "transversal"
 depends_on: []  # retire-legacy-kinds, que convenía antes, está archivado
-phase: verify  # aplicado y verificado en Linux; falta el CI de Windows y lo pendiente de verify.md
+phase: verify  # aplicado y verificado en Linux y en el CI de Windows; falta lo local de verify.md
 artifacts:
   exploration: done  # sus ruta:línea son de cuando se escribió; la propuesta las cita como están en develop
   proposal: done  # los tres A de la exploración; el punto 5 del alcance candidato, confirmado
@@ -9,7 +9,7 @@ artifacts:
   design: done  # D1 a D11; las tres decisiones abiertas en D5, D7 y D9
   tasks: done  # partes 1 a 9; archivar y subir la versión quedan fuera
   apply: done  # las tareas 2 a 8: StorageError y la traducción única, la conexión, RunningImports, sharing.json en el worker y la superficie de memory
-  verify: pending  # la suite y los dos clippy pasan en Linux; queda el CI de Windows y lo local de verify.md
+  verify: pending  # la suite y los dos clippy pasan en Linux y la suite en el CI de Windows; queda lo local de verify.md
   archive: pending
 decisions:
   storage_error_question: none  # nadie mira hoy el código de SQLite de un MemoryError (D5)
