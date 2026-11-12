@@ -528,7 +528,7 @@ mod tests {
             .call(|c| {
                 let mut migrations = crate::memory::migrations::runner().get_migrations().clone();
                 migrations.push(refinery::Migration::unapplied("V9__broken", "THIS IS NOT SQL;").unwrap());
-                configured(refinery::Runner::new(&migrations)).run(c)
+                configured(refinery::Runner::new(&migrations)).run(&mut crate::memory::migrations::Driver(c))
             })
             .await;
         let Err(tokio_rusqlite::Error::Error(cause)) = broken else {
