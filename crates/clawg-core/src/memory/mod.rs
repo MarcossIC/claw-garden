@@ -27,11 +27,9 @@ pub mod bootstrap;
 pub mod store_insert;
 pub mod worker;
 pub mod identity;
-pub mod language;
 pub mod merge;
 pub mod outbox;
 pub mod portability;
-pub(crate) mod pieces;
 pub mod project;
 pub mod project_delete;
 pub mod project_docs;
@@ -59,25 +57,14 @@ pub use search::{search_all_memories, PiecePosition, RankedHit, SearchScope};
 /// search would count its pool under test and not in a release.
 pub use search::MemoryPool;
 
-pub(crate) mod access;
-pub(crate) mod score;
-pub(crate) mod search;
-pub(crate) mod listing;
-pub(crate) mod search_log;
-pub mod workspace;
-pub mod prompt_builder;
 pub(crate) mod contradiction;
 pub mod spill;
 pub(crate) mod maintenance;
-#[cfg(any(test, feature = "eval"))]
-pub(crate) mod query_context;
 pub mod admin;
 pub mod dispute;
 pub mod synthesis;
 pub mod topic;
 pub(crate) mod revival;
-#[cfg(test)]
-mod crowding;
 
 mod domain;
 pub use domain::clock;
@@ -103,3 +90,16 @@ pub use embedding::chunker;
 pub use embedding::embedder;
 pub use embedding::idle_embedder;
 pub(crate) use embedding::model_download;
+
+mod retrieval;
+pub(crate) use retrieval::access;
+pub use retrieval::language;
+pub(crate) use retrieval::listing;
+pub(crate) use retrieval::pieces;
+pub use retrieval::prompt_builder;
+#[cfg(any(test, feature = "eval"))]
+pub(crate) use retrieval::query_context;
+pub(crate) use retrieval::score;
+pub(crate) use retrieval::search;
+pub(crate) use retrieval::search_log;
+pub use retrieval::workspace;
