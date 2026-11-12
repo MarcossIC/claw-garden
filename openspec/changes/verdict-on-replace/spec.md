@@ -25,7 +25,7 @@ cerca de memorias anteriores: #412 "Build tool". Si este save reemplaza una, lla
 - AND termina en `if both hold, do nothing`
 - AND no contiene `compatible` ni `scoped`
 
-**Test:** `save_outcome_text_names_related_memories` (`crates/clawg-cli/src/mcp/server.rs`).
+**Test:** `save_outcome_text_names_related_memories` (`crates/clawg-cli/src/mcp/server.rs`), en los dos idiomas.
 
 ## R2. La respuesta de `restore_memory` pide lo mismo
 
@@ -39,7 +39,7 @@ En español: `guardadas mientras estaba borrada, cerca de ella: {named}. Si una 
 
 ## R3. El protocolo ya no manda juzgar cada cercana
 
-La frase de la apertura sobre las cercanas MUST decir, en `protocol.md` y en `protocol.es.md`, que el agente llama a `resolve_conflict` sólo cuando la memoria nueva reemplaza a una de las que nombra `save_memory` (`supersedes`), mientras todavía tiene la conversación, o cuando sólo la persona puede decir cuál vale (`conflicts`), y que si valen las dos no hace nada. MUST NOT decir `judge each` ni `juzga cada una`, ni nombrar `compatible` o `scoped` en esa frase. La frase sobre ACTIVE CONFLICTS no cambia. La apertura MUST seguir entrando en 2.048 caracteres en los dos idiomas.
+La frase de la apertura sobre las cercanas MUST decir, en `protocol.md` y en `protocol.es.md`, que el agente llama a `resolve_conflict` sólo cuando la memoria nueva reemplaza a una de las que nombra `save_memory` (`supersedes`), mientras todavía tiene la conversación, o cuando sólo la persona puede decir cuál vale (`conflicts`), y que si valen las dos no hace nada. MUST NOT decir `judge each` ni `juzga cada una`, ni nombrar `compatible` o `scoped` en esa frase. La frase sobre ACTIVE CONFLICTS no cambia. La apertura MUST seguir entrando en 2.048 caracteres en los dos idiomas: en inglés la frase nueva la pasaba por tres, y la apertura cede la palabra `own` de «the project's own documentation and code».
 
 En inglés:
 
@@ -68,7 +68,7 @@ La línea de conflictos de `memory_status` MUST decir sólo cuántos pares esper
 - sin pares escalados, `conflict candidates: none open` (`candidatos a conflicto: ninguno abierto`), haya o no pares pendientes;
 - con `n` escalados, `conflict candidates: n waiting for the user in ACTIVE CONFLICTS` (`candidatos a conflicto: n esperando a la persona en ACTIVE CONFLICTS`).
 
-MUST NOT contar los pares pendientes, listar ninguno, ni decir cómo juzgarlos. Contra un daemon sin `GET /v1/disputes` MUST omitir la línea, como hoy. El puente MUST NOT conservar código que ya no usa: lo que lee de `GET /v1/disputes` es lo que imprime.
+MUST NOT contar los pares pendientes, listar ninguno, ni decir cómo juzgarlos. Contra un daemon sin `GET /v1/disputes` MUST omitir la línea, como hoy. El puente MUST NOT conservar código que ya no usa. La respuesta de `GET /v1/disputes` se sigue leyendo con el tipo que el daemon serializa (`OpenPairs`, de `clawg-core`), del que el puente imprime sólo `escalated`.
 
 #### Escenario: pendientes y ninguno escalado
 - GIVEN un store con dos pares `pending` y ninguno `escalated`
@@ -87,6 +87,7 @@ MUST NOT contar los pares pendientes, listar ninguno, ni decir cómo juzgarlos. 
 
 - La de `resolve_conflict` MUST decir que el agente juzga un par que nombra `save_memory` cuando el save nuevo reemplaza a la memoria vieja o cuando sólo la persona puede decir cuál vale, y uno bajo ACTIVE CONFLICTS una vez que la persona contestó. MUST NOT nombrar `memory_status` como fuente de pares para juzgar. La regla de que una preferencia o una decisión sólo se reemplaza por palabra de la persona no cambia.
 - La de `restore_memory` MUST decir que nombra las memorias cercanas guardadas mientras tanto por si una la reemplaza, y MUST NOT pedir que se juzguen todas.
+- La de `keep` MUST decir que el id es el que muestran ACTIVE CONFLICTS o `save_memory`, y ya no `memory_status`, que dejó de mostrar ids.
 - Las descripciones de `verdict` y de los demás parámetros no cambian: la herramienta acepta los cuatro veredictos.
 
 Lo mismo en `tools_es.rs`. `agent_contract.json` y `agent_contract.es.json` MUST coincidir con lo que el servidor declara.
