@@ -387,7 +387,7 @@ pub struct UpdateMemoryArgs {
 
 /// The line `save_memory` adds when the save is close to earlier memories:
 /// the agent still has the conversation that produced it, so it is the one to
-/// judge the pairs, except those already put to the user.
+/// say whether the save replaces one. Both holding needs no call.
 fn related_text(lang: Lang, related: &[RelatedMemory]) -> String {
     let asks = match lang {
         Lang::En => ", asks the user",
@@ -401,11 +401,12 @@ fn related_text(lang: Lang, related: &[RelatedMemory]) -> String {
     match lang {
         Lang::En => format!(
             "\nclose to earlier memories: {named}. If this save replaces one, call resolve_conflict with \
-             verdict supersedes (keep = the new id); if both hold, compatible or scoped"
+             verdict supersedes (keep = the new id), or conflicts if only the user can tell; if both hold, do nothing"
         ),
         Lang::Es => format!(
             "\ncerca de memorias anteriores: {named}. Si este save reemplaza una, llama a resolve_conflict con \
-             verdict supersedes (keep = el id nuevo); si valen las dos, compatible o scoped"
+             verdict supersedes (keep = el id nuevo), o conflicts si sólo la persona puede decirlo; si valen las \
+             dos, no hagas nada"
         ),
     }
 }
@@ -4166,8 +4167,8 @@ mod tests {
         assert_eq!(
             text,
             Ok("saved #57\nclose to earlier memories: #12 \"claim 12\"; #15 \"claim 15\", asks the user. \
-                If this save replaces one, call resolve_conflict with verdict supersedes (keep = the new id); \
-                if both hold, compatible or scoped"
+                If this save replaces one, call resolve_conflict with verdict supersedes (keep = the new id), \
+                or conflicts if only the user can tell; if both hold, do nothing"
                 .to_string())
         );
     }

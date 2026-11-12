@@ -497,11 +497,13 @@ pub fn format_restore(lang: Lang, r: &Restored) -> String {
         out.push_str(&match lang {
             Lang::En => format!(
                 "\nsaved while it was deleted, close to it: {named}. If a newer one replaces it, call resolve_conflict \
-                 with verdict supersedes (keep = the newer id); if both hold, compatible or scoped"
+                 with verdict supersedes (keep = the newer id), or conflicts if only the user can tell; if both \
+                 hold, do nothing"
             ),
             Lang::Es => format!(
                 "\nguardadas mientras estaba borrada, cerca de ella: {named}. Si una más nueva la reemplaza, llama a \
-                 resolve_conflict con verdict supersedes (keep = el id más nuevo); si valen las dos, compatible o scoped"
+                 resolve_conflict con verdict supersedes (keep = el id más nuevo), o conflicts si sólo la persona \
+                 puede decirlo; si valen las dos, no hagas nada"
             ),
         });
     }
@@ -1990,7 +1992,8 @@ mod tests {
              replaces again the version its delete had brought back: #4 \"Storage engine is SQLite\"\n\
              saved while it was deleted, close to it: #20 \"the store keeps one file\"; \
              #21 \"storage engine is postgres\", asks the user. If a newer one replaces it, call \
-             resolve_conflict with verdict supersedes (keep = the newer id); if both hold, compatible or scoped"
+             resolve_conflict with verdict supersedes (keep = the newer id), or conflicts if only the user can \
+             tell; if both hold, do nothing"
         );
     }
 
