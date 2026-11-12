@@ -167,6 +167,12 @@ pub struct Health {
     /// not answer health in time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingest: Option<OutboxSummary>,
+    /// Each project's docs refresh, as the daemon sends it; empty from a
+    /// daemon before it. Kept as it came: `clawg status` only prints it, and
+    /// an entry a newer daemon shapes differently must not make health
+    /// unreadable.
+    #[serde(default)]
+    pub docs_index: Vec<serde_json::Value>,
 }
 
 impl Health {
@@ -1899,6 +1905,18 @@ pub(crate) mod tests {
         let old = r#"{"status":"ok","version":"0.11.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3}"#;
         let h: Health = serde_json::from_str(old).expect("a daemon that always keeps its model");
         assert_eq!(h.embedder_resident, None);
+    }
+
+    #[test]
+    fn a_health_without_a_docs_index_still_parses() {
+        let old = r#"{"status":"ok","version":"0.81.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3}"#;
+        let h: Health = serde_json::from_str(old).expect("a daemon that never said");
+        assert!(h.docs_index.is_empty());
+
+        let new = r#"{"status":"ok","version":"0.82.0","profile":"dev","pid":1,"embedder":"ready","uptime_s":3,"docs_index":[{"project_id":"p","indexing":true,"current":{"trigger":"search","started_at_ms":5,"files_done":1,"files_total":2},"later":"field"}]}"#;
+        let h: Health = serde_json::from_str(new).expect("a daemon with a refresh running");
+        assert_eq!(h.docs_index.len(), 1);
+        assert_eq!(serde_json::to_value(&h).unwrap()["docs_index"][0]["later"], "field", "an entry is passed on whole");
     }
 
     #[test]

@@ -120,7 +120,23 @@ mod tests {
             embedder_resident: None,
             uptime_s: 12,
             ingest: None,
+            docs_index: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_status_report_shows_the_docs_index() {
+        let entry = json!({
+            "project_id": "repo-1a2b",
+            "indexing": true,
+            "current": { "trigger": "search", "started_at_ms": 5, "files_done": 12, "files_total": 36 },
+        });
+        let busy = Health { docs_index: vec![entry.clone()], ..health() };
+        let v = status_report(Profile::Dev, Path::new("/x"), Some(&state()), Some(&busy), None);
+        assert_eq!(v["health"]["docs_index"], json!([entry]));
+
+        let idle = status_report(Profile::Dev, Path::new("/x"), Some(&state()), Some(&health()), None);
+        assert_eq!(idle["health"]["docs_index"], json!([]), "an empty list, not a missing key");
     }
 
     #[test]

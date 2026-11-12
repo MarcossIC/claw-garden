@@ -2321,6 +2321,7 @@ mod tests {
             embedder_resident: None,
             uptime_s: 12,
             ingest: None,
+            docs_index: Vec::new(),
         }
     }
 
