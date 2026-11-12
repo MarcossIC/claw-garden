@@ -3515,6 +3515,164 @@ async fn a_search_during_the_first_index_waits_for_it() {
     assert_eq!(body["hits"][0]["text"], "found after the wait");
 }
 
+/// Registers a project of two docs for indexing and holds its refresh with
+/// the first one written: `a.md` has enough passages to fill the first flush
+/// of the queue on its own, and the flush of `b.md` waits at the gate.
+async fn refresh_held_halfway(h: &Harness, gate: &Gate) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sections: String = (0..20).map(|i| format!("## Section {i}\nbody of section {i}\n")).collect();
+    std::fs::write(dir.path().join("a.md"), format!("# A\nintro\n{sections}")).unwrap();
+    std::fs::write(dir.path().join("b.md"), "# B\nthe second doc\n").unwrap();
+    let (status, body) = h
+        .post_json("/v1/projects", json!({ "root_path": dir.path().display().to_string(), "index_docs": true }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["root_id"].as_str().expect("root_id").to_string();
+    let limit = Duration::from_secs(10);
+    tokio::time::timeout(limit, gate.entered()).await.expect("the first flush reached the embedder");
+    gate.release(1);
+    tokio::time::timeout(limit, gate.entered()).await.expect("the second flush reached the embedder");
+    (dir, id)
+}
+
+/// The entry of `id` in the `docs_index` of a health answer.
+fn docs_index_entry(health: &Value, id: &str) -> Value {
+    let entries = health["docs_index"].as_array().unwrap_or_else(|| panic!("health carries no docs_index: {health}"));
+    entries.iter().find(|e| e["project_id"] == id).unwrap_or_else(|| panic!("no entry for {id}: {health}")).clone()
+}
+
+/// Polls health until the project's last refresh has ended, and returns its entry.
+async fn ended_refresh(h: &Harness, id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, health) = h.get_json("/health").await;
+        let ended = health["docs_index"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|e| e["project_id"] == id && e["indexing"] == false && e.get("last").is_some()));
+        if let Some(entry) = ended {
+            return entry.clone();
+        }
+        assert!(Instant::now() < deadline, "health never showed the refresh of {id} as ended: {health}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn health_names_the_project_whose_refresh_runs_and_how_far_it_is() {
+    let (h, gate) = Harness::start_gated().await;
+    let before = clawg_core::memory::clock::TimestampMs::now().as_millis_i64();
+    let (_dir, id) = refresh_held_halfway(&h, &gate).await;
+
+    let (status, health) = h.get_json("/health").await;
+
+    assert_eq!(status, 200, "{health}");
+    let entry = docs_index_entry(&health, &id);
+    assert_eq!(entry["indexing"], true, "{health}");
+    let current = &entry["current"];
+    assert_eq!((current["files_done"].clone(), current["files_total"].clone()), (json!(1), json!(2)), "{health}");
+    assert_eq!(current["trigger"], "registration", "{health}");
+    assert!(current["started_at_ms"].as_i64().is_some_and(|at| at >= before), "{health}");
+    assert!(entry.get("last").is_none(), "no refresh of it has ended yet: {health}");
+
+    gate.release(10);
+    assert!(h.ctx.runtime.project_docs.wait_idle(&id, Duration::from_secs(10)).await);
+}
+
+#[tokio::test]
+async fn health_shows_a_running_refresh_without_the_connection() {
+    let (h, gate) = Harness::start_gated().await;
+    let (_dir, id) = refresh_held_halfway(&h, &gate).await;
+
+    // The store's one connection is held by a call that does not return until told to.
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let store = h.ctx.runtime.store.clone();
+    let hold = tokio::spawn(async move {
+        store
+            .conn_for_test()
+            .call(move |_| {
+                entered.send(()).ok();
+                released.recv_timeout(Duration::from_secs(30)).ok();
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+    });
+    held.await.expect("the connection is held");
+
+    let started = Instant::now();
+    let r = h.http.get(h.url("/health")).send().await.expect("request");
+    let waited = started.elapsed();
+    assert_eq!(r.status(), 200);
+    let health: Value = r.json().await.expect("json");
+    assert!(waited < Duration::from_secs(5), "health did not wait for the connection: {waited:?}");
+    assert!(health.get("ingest").is_none(), "the outbox counts need the connection: {health}");
+    let entry = docs_index_entry(&health, &id);
+    assert_eq!(
+        (entry["indexing"].clone(), entry["current"]["files_done"].clone(), entry["current"]["files_total"].clone()),
+        (json!(true), json!(1), json!(2)),
+        "{health}"
+    );
+
+    release.send(()).ok();
+    hold.await.expect("joined").expect("the held call ended");
+    gate.release(10);
+    assert!(h.ctx.runtime.project_docs.wait_idle(&id, Duration::from_secs(10)).await);
+}
+
+#[tokio::test]
+async fn health_says_when_a_refresh_ended_and_what_it_did() {
+    let (h, gate) = Harness::start_gated().await;
+    let (_dir, id) = refresh_held_halfway(&h, &gate).await;
+
+    gate.release(10);
+    let entry = ended_refresh(&h, &id).await;
+
+    assert!(entry.get("current").is_none(), "{entry}");
+    let last = &entry["last"];
+    assert_eq!(last["trigger"], "registration", "{entry}");
+    let (started, finished) = (last["started_at_ms"].as_i64().expect("started"), last["finished_at_ms"].as_i64().expect("finished"));
+    assert!(finished >= started, "{entry}");
+    assert!(finished <= clawg_core::memory::clock::TimestampMs::now().as_millis_i64(), "{entry}");
+    let report = &last["report"];
+    assert_eq!(
+        (report["docs"].clone(), report["indexed"].clone(), report["unchanged"].clone(), report["removed"].clone()),
+        (json!(2), json!(2), json!(0), json!(0)),
+        "{entry}"
+    );
+    assert_eq!((report["skipped"].clone(), report["failed"].clone()), (json!(0), json!(0)), "{entry}");
+    assert!(report["passages"].as_u64().is_some_and(|n| n > 16), "{entry}");
+    assert!(last.get("error").is_none(), "{entry}");
+}
+
+#[tokio::test]
+async fn health_keeps_the_cause_of_a_failed_refresh() {
+    let (embedder, _gate) = docs_embedder(true, true);
+    let h = Harness::start_inner(EmbedderState::Docs(embedder)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("README.md"), "# Readme\nnever embedded\n").unwrap();
+    let (status, body) = h
+        .post_json("/v1/projects", json!({ "root_path": dir.path().display().to_string(), "index_docs": true }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["root_id"].as_str().expect("root_id").to_string();
+
+    let entry = ended_refresh(&h, &id).await;
+
+    let last = &entry["last"];
+    assert!(last["error"].as_str().is_some_and(|e| e.contains("passages refused")), "{entry}");
+    assert!(last.get("report").is_none(), "a refresh that failed did not finish its plan: {entry}");
+    assert!(last["finished_at_ms"].is_i64(), "{entry}");
+}
+
+#[tokio::test]
+async fn health_lists_no_docs_index_before_any_refresh() {
+    let h = Harness::start().await;
+
+    let (_, health) = h.get_json("/health").await;
+
+    assert_eq!(health["docs_index"], json!([]), "{health}");
+}
+
 // ── restore ─────────────────────────────────────────────────────────────────
 
 impl Harness {
