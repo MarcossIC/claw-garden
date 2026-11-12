@@ -1485,9 +1485,8 @@ impl DaemonClient {
         read_response(self.send(Call::new(reqwest::Method::POST, "/v1/disputes/judge").json(&body)?).await?)
     }
 
-    /// The pairs `agent` has not judged yet. A daemon that predates the pair
-    /// table answers a bare 404.
-    /// The open pairs `agent` judges, in `project_id` when one is given.
+    /// The open pairs `agent` reaches, in `project_id` when one is given. A
+    /// daemon that predates the pair table answers a bare 404.
     pub async fn open_disputes(&self, agent: &str, project_id: Option<&str>) -> Result<OpenPairs, ClientError> {
         let mut query = vec![("agent_id", agent)];
         query.extend(project_id.map(|p| ("project_id", p)));

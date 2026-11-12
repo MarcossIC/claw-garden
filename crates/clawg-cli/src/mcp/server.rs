@@ -443,8 +443,8 @@ fn verdict_enum(schema: &mut schemars::Schema) {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ResolveConflictArgs {
-    /// One memory id of the pair, as shown by ACTIVE CONFLICTS, `save_memory`
-    /// or `memory_status`. With supersedes it is the one that stays.
+    /// One memory id of the pair, as shown by ACTIVE CONFLICTS or
+    /// `save_memory`. With supersedes it is the one that stays.
     pub keep: i64,
     /// The other memory id of the pair.
     pub other: i64,
@@ -1962,10 +1962,10 @@ impl ClawgMcp {
         description = "Judge a pair of memories the detector found close to each other: one \
                        that `save_memory` names, when the new save replaces the old memory or \
                        only the user can tell which holds, or one under ACTIVE CONFLICTS in \
-                       `recall_context`, once the user has said which holds. A preference or a decision is superseded only on the user's \
-                       word: judge it conflicts and ask, then call supersedes with user_answered \
-                       and their answer in reason. Returns the status of both memories. Either \
-                       side may be another agent's."
+                       `recall_context`, once the user has said which holds. A preference or a \
+                       decision is superseded only on the user's word: judge it conflicts and \
+                       ask, then call supersedes with user_answered and their answer in reason. \
+                       Returns the status of both memories. Either side may be another agent's."
     )]
     async fn resolve_conflict(
         &self,
@@ -4080,20 +4080,17 @@ mod tests {
                     .expect("note the pair");
             }
         };
-        assert!(status().await.ends_with("
-conflict candidates: none open"));
+        assert!(status().await.ends_with("\nconflict candidates: none open"));
 
         note(new, old, "pending").await;
         note(newest, old, "pending").await;
         let t = status().await;
-        assert!(t.ends_with("
-conflict candidates: none open"), "{t}");
+        assert!(t.ends_with("\nconflict candidates: none open"), "{t}");
         assert!(!t.contains("resolve_conflict") && !t.contains("close to"), "pending pairs are not put to the agent: {t}");
 
         note(newest, new, "escalated").await;
         let t = status().await;
-        assert!(t.ends_with("
-conflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{t}");
+        assert!(t.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{t}");
         assert!(!t.contains("resolve_conflict") && !t.contains("close to"), "{t}");
     }
 
@@ -4186,6 +4183,12 @@ conflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{t}");
                 If this save replaces one, call resolve_conflict with verdict supersedes (keep = the new id), \
                 or conflicts if only the user can tell; if both hold, do nothing"
                 .to_string())
+        );
+        assert_eq!(
+            related_text(Lang::Es, &[related(12, false)]),
+            "\ncerca de memorias anteriores: #12 \"claim 12\". Si este save reemplaza una, llama a resolve_conflict \
+             con verdict supersedes (keep = el id nuevo), o conflicts si sólo la persona puede decirlo; si valen las \
+             dos, no hagas nada"
         );
     }
 
@@ -5825,8 +5828,7 @@ conflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{t}");
         let several = status(folders(&[&alpha, &beta])).await;
 
         assert!(one.ends_with("\nconflict candidates: none open"), "the pair is of another project: {one}");
-        assert!(several.ends_with("
-conflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{several}");
+        assert!(several.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "{several}");
     }
 
     #[tokio::test]

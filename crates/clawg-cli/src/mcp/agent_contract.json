@@ -193,7 +193,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "keep": {
-            "description": "One memory id of the pair, as shown by ACTIVE CONFLICTS, `save_memory`\nor `memory_status`. With supersedes it is the one that stays.",
+            "description": "One memory id of the pair, as shown by ACTIVE CONFLICTS or\n`save_memory`. With supersedes it is the one that stays.",
             "format": "int64",
             "type": "integer"
           },

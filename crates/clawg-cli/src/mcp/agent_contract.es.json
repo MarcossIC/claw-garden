@@ -193,7 +193,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "keep": {
-            "description": "Un id de memoria del par, como lo muestran ACTIVE CONFLICTS, `save_memory` o `memory_status`. Con supersedes es el que queda.",
+            "description": "Un id de memoria del par, como lo muestran ACTIVE CONFLICTS o `save_memory`. Con supersedes es el que queda.",
             "format": "int64",
             "type": "integer"
           },

@@ -1952,6 +1952,14 @@ mod tests {
              resolve_conflict with verdict supersedes (keep = the newer id), or conflicts if only the user can \
              tell; if both hold, do nothing"
         );
+        let spanish = format_restore(Lang::Es, &r);
+        assert!(
+            spanish.ends_with(
+                "Si una más nueva la reemplaza, llama a resolve_conflict con verdict supersedes (keep = el id más \
+                 nuevo), o conflicts si sólo la persona puede decirlo; si valen las dos, no hagas nada"
+            ),
+            "{spanish}"
+        );
     }
 
     #[test]
@@ -2399,8 +2407,7 @@ mod tests {
     fn format_status_ends_with_the_open_pairs() {
         let open = OpenPairs { pending: 2, escalated: 1, pairs: vec![open_pair(9, 4, None, None), open_pair(12, 4, None, None)] };
         let out = format_status(Lang::En, &health(), Profile::Dev, Path::new("/d"), "a", "from --agent", "shared: none", Some(&format_open_pairs(Lang::En, &open)), None);
-        assert!(out.ends_with("
-conflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "out was: {out}");
+        assert!(out.ends_with("\nconflict candidates: 1 waiting for the user in ACTIVE CONFLICTS"), "out was: {out}");
         assert_eq!(
             format_open_pairs(Lang::Es, &open),
             "candidatos a conflicto: 1 esperando a la persona en ACTIVE CONFLICTS"
