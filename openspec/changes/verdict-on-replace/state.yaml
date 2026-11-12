@@ -9,6 +9,6 @@ artifacts:
   design: skipped  # ninguna decisión de arquitectura: son textos del puente
   tasks: done
   apply: done
-  verify: pending
+  verify: in-progress  # suite y clippy en verde en Windows; falta el CI y la medición con uso real
   archive: pending
 updated: 2026-11-11
