@@ -4393,4 +4393,144 @@ mod tests {
         assert!(msg.contains("bogus"), "{msg}");
         assert!(msg.contains("\"memory\""), "{msg}");
     }
+
+    /// The status and the whole body `save_memory` answers a refused save
+    /// with, for every rule it holds a save to and in the order it checks
+    /// them: what a client branches on and what it shows.
+    #[tokio::test]
+    async fn each_refused_save_keeps_its_status_and_body() {
+        use serde_json::{json, Value};
+
+        async fn refused(app: &Arc<AppCtx>, body: Value) -> (StatusCode, Value) {
+            let body: SaveRequest = serde_json::from_value(body).expect("a save body");
+            let response = save_memory(State(app.clone()), Json(body)).await.expect_err("the save is refused").into_response();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("the body");
+            (status, serde_json::from_slice(&bytes).expect("a JSON body"))
+        }
+        async fn seed(app: &AppCtx, agent: &'static str) -> i64 {
+            app.runtime
+                .store
+                .conn_for_test()
+                .call(move |c| {
+                    c.execute(
+                        "INSERT INTO memory (scope, agent_id, content, memory_type, source, created_at, created_by_type, \
+                         created_by_ref, last_modified_at, last_accessed_at, importance, tier, status) \
+                         VALUES ('agent', ?1, 'a source', 'semantic_fact', 'explicit', 1, 'agent', ?1, 1, 1, 5.0, 3, 'active')",
+                        [agent],
+                    )?;
+                    Ok::<_, rusqlite::Error>(c.last_insert_rowid())
+                })
+                .await
+                .expect("seed a row")
+        }
+        async fn run(app: &AppCtx, sql: String) {
+            app.runtime.store.conn_for_test().call(move |c| c.execute_batch(&sql)).await.expect("update the rows");
+        }
+        let bad = |message: &str| (StatusCode::BAD_REQUEST, json!({ "error": message }));
+
+        let (app, dir) = daemon_for_jobs().await;
+        let kept = seed(&app, "a").await;
+        let deleted = seed(&app, "a").await;
+        let theirs = seed(&app, "b").await;
+        let old = seed(&app, "a").await;
+        let new = seed(&app, "a").await;
+        run(&app, format!("UPDATE memory SET deleted_at = 2 WHERE id = {deleted}; UPDATE memory SET status = 'superseded', superseded_by = {new} WHERE id = {old};")).await;
+        std::fs::write(dir.path().join("sharing.json"), r#"{"version":1,"hides":{"a":["b"]}}"#).expect("write the policy");
+        let types = "semantic_fact, user_preference, architectural_decision, session_summary, code_block, chat_message, tool_error";
+        let stated = "user_stated cannot go with derived_from: a conclusion is drawn by the agent, not stated by the user";
+        let many: Vec<i64> = (1..=51).collect();
+
+        let cases = [
+            (json!({ "content": "  \n", "agent_id": "a" }), bad("content must not be empty")),
+            (
+                json!({ "content": "x".repeat(MAX_CONTENT_BYTES + 1), "agent_id": "a" }),
+                bad("content is 65537 bytes; at most 65536 are accepted: split it into several saves, one fact each"),
+            ),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "memory_type": "preference" }),
+                bad(&format!("unknown memory_type \"preference\"; expected one of {types}")),
+            ),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "operation_id": "has space" }),
+                bad("operation_id must be 1 to 128 visible ASCII characters"),
+            ),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "topic_key": "Storage Engine" }),
+                bad("topic_key is segments of a-z, 0-9, '.', '_' or '-' joined by '/', with no empty segment"),
+            ),
+            (json!({ "content": "a fact", "agent_id": "a", "topic_key": "" }), bad("topic_key must be 1 to 80 characters")),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "derived_from": many }),
+                bad("derived_from names 51 memories; at most 50 are accepted"),
+            ),
+            (json!({ "content": "a fact", "agent_id": "a", "derived_from": [kept], "user_stated": true }), bad(stated)),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "derived_from": [999_999, theirs, kept, deleted, kept] }),
+                bad(&format!("derived_from names memories that do not exist or were deleted: {deleted}, {theirs}, 999999")),
+            ),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "derived_from": [old, kept] }),
+                bad(&format!("derived_from names memories that were replaced: {old} (by {new}); draw the conclusion from the current ones")),
+            ),
+            (json!({ "content": "", "agent_id": "a", "memory_type": "preference" }), bad("content must not be empty")),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "memory_type": "preference", "operation_id": "" }),
+                bad(&format!("unknown memory_type \"preference\"; expected one of {types}")),
+            ),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "operation_id": "", "topic_key": "" }),
+                bad("operation_id must be 1 to 128 visible ASCII characters"),
+            ),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "topic_key": "", "derived_from": many }),
+                bad("topic_key must be 1 to 80 characters"),
+            ),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "derived_from": many, "user_stated": true }),
+                bad("derived_from names 51 memories; at most 50 are accepted"),
+            ),
+            (
+                json!({ "content": "a fact", "agent_id": "a", "derived_from": [old, deleted] }),
+                bad(&format!("derived_from names memories that do not exist or were deleted: {deleted}")),
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(refused(&app, body.clone()).await, expected, "{body}");
+        }
+
+        app.runtime.embedder_status.send_replace(EmbedderStatus::Failed { error: "disk full".into(), retryable: false });
+        assert_eq!(
+            refused(&app, json!({ "content": "a fact", "agent_id": "a" })).await,
+            (StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "embedder_failed", "detail": "disk full", "retryable": false }))
+        );
+        assert_eq!(
+            refused(&app, json!({ "content": "a fact", "agent_id": "a", "derived_from": [deleted] })).await,
+            bad(&format!("derived_from names memories that do not exist or were deleted: {deleted}")),
+            "the sources are checked before the embedder"
+        );
+        app.runtime.embedder_status.send_replace(EmbedderStatus::Failed { error: "the model is still downloading".into(), retryable: true });
+        assert_eq!(
+            refused(&app, json!({ "content": "a fact", "agent_id": "a" })).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": "embedder_failed", "detail": "the model is still downloading", "retryable": true })
+            )
+        );
+
+        app.runtime.embedder_status.send_replace(EmbedderStatus::Ready);
+        app.runtime.close().await.expect("the store closes");
+        let cases = [
+            (json!({ "content": "a fact", "agent_id": "a", "derived_from": [kept] }), "memory backend channel error: source lookup: ConnectionClosed"),
+            (json!({ "content": "a fact", "agent_id": "a", "project_id": "app" }), "Memory DB connection error: ConnectionClosed"),
+            (json!({ "content": "a fact", "agent_id": "a" }), "memory backend channel error: outbox_record: ConnectionClosed"),
+        ];
+        for (body, message) in cases {
+            assert_eq!(
+                refused(&app, body.clone()).await,
+                (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": message })),
+                "{body}"
+            );
+        }
+    }
 }
