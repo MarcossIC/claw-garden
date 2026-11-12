@@ -4,7 +4,7 @@
 
 ## Qué se corrió
 
-Sobre el último commit de código, en Linux, con el directorio de build limpio al empezar:
+Sobre el último commit de código, en Linux, con el directorio de build limpio al empezar, y otra vez, también con el directorio limpio, sobre el merge de `develop` que trajo el archivo de store-boundary y la versión 0.84.0:
 
 | Comando | Resultado |
 |---|---|
@@ -63,6 +63,7 @@ Los cinco grupos y su motivo están en `MEMORY_CYCLES` y en la tabla de D7:
 ## Las citas
 
 - **Specs y docs:** 370 rutas pasaron a su carpeta y 143 citas `ruta:línea` cambiaron de línea o de archivo, en 26 archivos de `openspec/specs` y `docs/reference`. Las que apuntaban a código que salió de `admin.rs`, `store_insert.rs`, `db.rs`, `secrets.rs` o `pieces.rs` nombran ahora el archivo donde quedó.
+- **El merge de `develop`** cambió cuatro specs (`portability`, `project`, `sharing` y `storage`) al archivar store-boundary. En esas cuatro se tomó el texto de `develop` y se rehízo el barrido: 124 rutas y 31 líneas.
 - **Una cita no se pudo llevar:** `openspec/specs/storage/spec.md` cita `store_insert.rs:2165`, y en `develop` ese archivo tiene 1.702 líneas. Quedó con su número y la ruta nueva.
 - **El golden de docs:** las 13 rutas esperadas de `memory`.
 - **Para comprobar que ninguna ruta citada falta:**
