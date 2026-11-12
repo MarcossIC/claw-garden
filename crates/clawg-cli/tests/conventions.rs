@@ -272,11 +272,34 @@ fn every_public_memory_module_is_named_outside_core() {
     assert!(!outside.is_empty(), "no sources found under {}", crates.display());
 
     let root = read_repo_file("crates/clawg-core/src/memory/mod.rs");
-    let public: Vec<&str> = root.lines().filter_map(|line| line.strip_prefix("pub mod ")?.strip_suffix(';')).collect();
-    assert!(!public.is_empty(), "memory/mod.rs declares no public module");
+    let public = public_memory_modules(&root);
+    assert!(!public.is_empty(), "memory/mod.rs shows no module");
 
     let unnamed: Vec<&str> = public.into_iter().filter(|module| !outside.iter().any(|source| names_memory_module(source, module))).collect();
-    assert!(unnamed.is_empty(), "no other crate names these modules of clawg_core::memory, so they are `pub(crate) mod`: {unnamed:?}");
+    assert!(unnamed.is_empty(), "no other crate names these modules of clawg_core::memory, so the root does not show them: {unnamed:?}");
+}
+
+/// The modules the root of `memory` shows to the other crates: each
+/// `pub mod <module>;` it declares, and each `pub use <folder>::<module>;`
+/// that re-exports a module of a folder it declares with `mod <folder>;`.
+fn public_memory_modules(root: &str) -> Vec<&str> {
+    let folders: Vec<&str> = root.lines().filter_map(|line| line.strip_prefix("mod ")?.strip_suffix(';')).collect();
+    let is_module = |name: &str| !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    root.lines()
+        .filter_map(|line| {
+            if let Some(declared) = line.strip_prefix("pub mod ") {
+                return declared.strip_suffix(';');
+            }
+            let (folder, module) = line.strip_prefix("pub use ")?.strip_suffix(';')?.split_once("::")?;
+            (folders.contains(&folder) && is_module(module)).then_some(module)
+        })
+        .collect()
+}
+
+#[test]
+fn public_memory_modules_reads_declarations_and_reexports() {
+    let root = "pub mod portability;\nmod store;\npub(crate) mod hidden;\npub use store::db;\npub use store::db::MemoryStore;\npub(crate) use store::error;\npub use elsewhere::thing;\n";
+    assert_eq!(public_memory_modules(root), ["portability", "db"]);
 }
 
 /// The folders of `crates/clawg-core/src/memory`, each with the folders its
