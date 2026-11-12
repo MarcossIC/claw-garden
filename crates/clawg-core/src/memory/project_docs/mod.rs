@@ -215,18 +215,132 @@ pub(crate) fn needs_refresh(last_started: Option<Instant>, now: Instant, interva
     last_started.is_none_or(|t| now.saturating_duration_since(t) >= interval)
 }
 
-#[derive(Debug, Default, Clone)]
-struct Progress {
-    running: bool,
-    last_started: Option<Instant>,
-    /// Why the last refresh that ran to its end failed; cleared by one that
-    /// succeeds.
-    last_error: Option<String>,
+/// Who started a refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshTrigger {
+    /// A registration of the project that asked for its index.
+    Registration,
+    /// A search over an index whose last refresh was [`REFRESH_INTERVAL`] ago.
+    Search,
 }
 
-/// Which projects are being refreshed and when each last started, so one
-/// project is never refreshed twice at once and a search knows whether to
-/// refresh first.
+impl RefreshTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefreshTrigger::Registration => "registration",
+            RefreshTrigger::Search => "search",
+        }
+    }
+}
+
+/// What a refresh found it has to do, in files, once it walked the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedRefresh {
+    pub index: usize,
+    pub unchanged: usize,
+    pub remove: usize,
+}
+
+/// What a refresh tells whoever watches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshStep {
+    /// Once, before the first file of the plan.
+    Planned(PlannedRefresh),
+    /// A file of the plan was written, or left as it was because it could
+    /// not be read or a vector of its was unusable.
+    FileDone,
+}
+
+/// A refresh that runs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RunningRefresh {
+    pub trigger: RefreshTrigger,
+    pub started_at_ms: i64,
+    /// Files of the plan already written or left as they were.
+    pub files_done: usize,
+    /// Files the plan indexes; `None` while the tree is still being walked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_total: Option<usize>,
+}
+
+/// A [`RefreshReport`] in counts alone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RefreshCounts {
+    pub docs: usize,
+    pub indexed: usize,
+    pub unchanged: usize,
+    pub removed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub passages: usize,
+    pub reused: usize,
+}
+
+impl From<&RefreshReport> for RefreshCounts {
+    fn from(r: &RefreshReport) -> Self {
+        RefreshCounts {
+            docs: r.docs,
+            indexed: r.indexed,
+            unchanged: r.unchanged,
+            removed: r.removed,
+            skipped: r.skipped,
+            failed: r.failed.len(),
+            passages: r.passages,
+            reused: r.reused,
+        }
+    }
+}
+
+/// A refresh that ran to its end: `report` when it succeeded, `error` when
+/// it failed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FinishedRefresh {
+    pub trigger: RefreshTrigger,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<RefreshCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A project's index as the daemon's health shows it: the refresh that runs
+/// and the last one that ended, both since the daemon started.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IndexStatus {
+    pub project_id: String,
+    pub indexing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<RunningRefresh>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last: Option<FinishedRefresh>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct Progress {
+    /// Decides when the next refresh is due; `current` and `last` carry the
+    /// times that are shown.
+    last_started: Option<Instant>,
+    /// The claimed refresh, until its guard is dropped.
+    current: Option<RunningRefresh>,
+    /// The last refresh that ran to its end; one that fails keeps its cause
+    /// here until another ends.
+    last: Option<FinishedRefresh>,
+}
+
+impl Progress {
+    fn claim(&mut self, trigger: RefreshTrigger) -> i64 {
+        let started_at_ms = TimestampMs::now().as_millis_i64();
+        self.last_started = Some(Instant::now());
+        self.current = Some(RunningRefresh { trigger, started_at_ms, files_done: 0, files_total: None });
+        started_at_ms
+    }
+}
+
+/// Which projects are being refreshed, how far each is and how its last
+/// refresh ended, so one project is never refreshed twice at once, a search
+/// knows whether to refresh first and the daemon can show the work.
 #[derive(Debug, Default)]
 pub struct DocIndex {
     projects: Mutex<HashMap<String, Progress>>,
@@ -239,13 +353,15 @@ pub struct DocIndex {
 pub struct RefreshGuard {
     index: Arc<DocIndex>,
     project_id: String,
+    trigger: RefreshTrigger,
+    started_at_ms: i64,
 }
 
 impl Drop for RefreshGuard {
     fn drop(&mut self) {
         let mut projects = self.index.projects.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = projects.get_mut(&self.project_id) {
-            p.running = false;
+            p.current = None;
         }
         drop(projects);
         self.index.finished.notify_waiters();
@@ -253,44 +369,79 @@ impl Drop for RefreshGuard {
 }
 
 impl RefreshGuard {
-    /// Brings the project's index in step with its registered root and keeps
-    /// how it ended for [`DocIndex::last_error`], written before the claim is
-    /// released so whoever waited for it reads it already there.
+    pub fn trigger(&self) -> RefreshTrigger {
+        self.trigger
+    }
+
+    /// Brings the project's index in step with its registered root, calling
+    /// `planned` once the refresh knows its plan, and keeps how far it is and
+    /// how it ended for [`DocIndex::statuses`] and [`DocIndex::last_error`].
+    /// The end is written before the claim is released, so whoever waited
+    /// for it reads it already there.
     pub async fn run(
         self,
         store: &MemoryStore,
         embedder: &dyn Embedder,
         tokenizer: Option<Arc<tokenizers::Tokenizer>>,
+        planned: &(dyn Fn(PlannedRefresh) + Sync),
     ) -> Result<RefreshRun, DocIndexError> {
+        let watch = |step: RefreshStep| {
+            self.note(step);
+            if let RefreshStep::Planned(plan) = step {
+                planned(plan);
+            }
+        };
         let result = async {
             let root = root_of(store, &self.project_id).await?;
             let splitter = match tokenizer {
                 Some(tok) => TokenSplitter::with_tokenizer(tok),
                 None => TokenSplitter::fallback(),
             };
-            refresh(store, embedder, &splitter, &self.project_id, &root, &HashSet::new()).await
+            refresh(store, embedder, &splitter, &self.project_id, &root, &HashSet::new(), &watch).await
         }
         .await;
+        let finished = FinishedRefresh {
+            trigger: self.trigger,
+            started_at_ms: self.started_at_ms,
+            finished_at_ms: TimestampMs::now().as_millis_i64(),
+            report: result.as_ref().ok().map(|run| RefreshCounts::from(&run.report)),
+            error: result.as_ref().err().map(ToString::to_string),
+        };
         let mut projects = self.index.projects.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = projects.get_mut(&self.project_id) {
-            p.last_error = result.as_ref().err().map(ToString::to_string);
+            p.last = Some(finished);
         }
         drop(projects);
         result
     }
+
+    fn note(&self, step: RefreshStep) {
+        let mut projects = self.index.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(current) = projects.get_mut(&self.project_id).and_then(|p| p.current.as_mut()) else {
+            return;
+        };
+        match step {
+            RefreshStep::Planned(plan) => current.files_total = Some(plan.index),
+            RefreshStep::FileDone => current.files_done += 1,
+        }
+    }
 }
 
 impl DocIndex {
-    /// Claims the project's refresh, or `None` if one is already running.
+    /// Claims the refresh a registration of the project asks for, or `None`
+    /// if one is already running.
     pub fn begin(self: &Arc<Self>, project_id: &str) -> Option<RefreshGuard> {
         let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
         let progress = projects.entry(project_id.to_string()).or_default();
-        if progress.running {
+        if progress.current.is_some() {
             return None;
         }
-        progress.running = true;
-        progress.last_started = Some(Instant::now());
-        Some(RefreshGuard { index: self.clone(), project_id: project_id.to_string() })
+        Some(self.guard(project_id, progress, RefreshTrigger::Registration))
+    }
+
+    fn guard(self: &Arc<Self>, project_id: &str, progress: &mut Progress, trigger: RefreshTrigger) -> RefreshGuard {
+        let started_at_ms = progress.claim(trigger);
+        RefreshGuard { index: self.clone(), project_id: project_id.to_string(), trigger, started_at_ms }
     }
 
     /// Claims the project's refresh if a search at `now` should start one
@@ -299,16 +450,32 @@ impl DocIndex {
     pub fn begin_if_due(self: &Arc<Self>, project_id: &str, now: Instant) -> Option<RefreshGuard> {
         let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
         let progress = projects.entry(project_id.to_string()).or_default();
-        if progress.running || !needs_refresh(progress.last_started, now, REFRESH_INTERVAL) {
+        if progress.current.is_some() || !needs_refresh(progress.last_started, now, REFRESH_INTERVAL) {
             return None;
         }
-        progress.running = true;
-        progress.last_started = Some(Instant::now());
-        Some(RefreshGuard { index: self.clone(), project_id: project_id.to_string() })
+        Some(self.guard(project_id, progress, RefreshTrigger::Search))
     }
 
     pub fn is_running(&self, project_id: &str) -> bool {
-        self.progress(project_id).running
+        self.progress(project_id).current.is_some()
+    }
+
+    /// Every project a refresh was claimed for since the daemon started, by
+    /// id. Read from memory alone: health calls it without touching the store.
+    pub fn statuses(&self) -> Vec<IndexStatus> {
+        let projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all: Vec<IndexStatus> = projects
+            .iter()
+            .map(|(id, p)| IndexStatus {
+                project_id: id.clone(),
+                indexing: p.current.is_some(),
+                current: p.current.clone(),
+                last: p.last.clone(),
+            })
+            .collect();
+        drop(projects);
+        all.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        all
     }
 
     /// Whether a search at `now` should refresh the project first: none is
@@ -316,7 +483,7 @@ impl DocIndex {
     #[cfg(any(test, feature = "testing"))]
     pub fn is_due(&self, project_id: &str, now: Instant) -> bool {
         let p = self.progress(project_id);
-        !p.running && needs_refresh(p.last_started, now, REFRESH_INTERVAL)
+        p.current.is_none() && needs_refresh(p.last_started, now, REFRESH_INTERVAL)
     }
 
     /// Waits until no refresh of the project is running, or `limit` passed.
@@ -340,7 +507,7 @@ impl DocIndex {
 
     /// Why the project's last finished refresh failed, until one succeeds.
     pub fn last_error(&self, project_id: &str) -> Option<String> {
-        self.progress(project_id).last_error
+        self.progress(project_id).last.and_then(|last| last.error)
     }
 
     fn progress(&self, project_id: &str) -> Progress {
@@ -363,7 +530,7 @@ impl DocIndex {
         let Some(guard) = self.begin(project_id) else {
             return Ok(RefreshOutcome::AlreadyRunning);
         };
-        guard.run(store, embedder, tokenizer).await.map(|run| RefreshOutcome::Refreshed(run.report))
+        guard.run(store, embedder, tokenizer, &|_| {}).await.map(|run| RefreshOutcome::Refreshed(run.report))
     }
 }
 
@@ -493,7 +660,8 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 }
 
 /// Brings the index of `project_id` up to the docs under `root`, treating the
-/// relative paths in `left_out` as absent. The daemon leaves none out.
+/// relative paths in `left_out` as absent. The daemon leaves none out. `watch`
+/// hears the plan and each of its files as it is done.
 pub(crate) async fn refresh(
     store: &MemoryStore,
     embedder: &dyn Embedder,
@@ -501,6 +669,7 @@ pub(crate) async fn refresh(
     project_id: &str,
     root: &Path,
     left_out: &HashSet<String>,
+    watch: &(dyn Fn(RefreshStep) + Sync),
 ) -> Result<RefreshRun, DocIndexError> {
     let mut mark = Instant::now();
     // Walked before anything is read from the index: a root that is gone must
@@ -511,6 +680,7 @@ pub(crate) async fn refresh(
     let disk: Vec<(String, String)> = scan.docs.iter().map(|d| (d.file.path.clone(), d.hash.clone())).collect();
     let model_id = embedder.model_id().to_string();
     let plan = plan_refresh(&disk, &stored, &model_id);
+    watch(RefreshStep::Planned(PlannedRefresh { index: plan.index.len(), unchanged: plan.keep, remove: plan.remove.len() }));
 
     let mut report = RefreshReport {
         docs: disk.len(),
@@ -521,7 +691,7 @@ pub(crate) async fn refresh(
     let files: HashMap<&str, &DocFile> = scan.docs.iter().map(|d| (d.file.path.as_str(), &d.file)).collect();
     let indexed_before: HashSet<&str> = stored.iter().map(|f| f.path.as_str()).collect();
     let mut timing = RefreshTiming { scan: lap(&mut mark), ..Default::default() };
-    let target = Target { store, embedder, tokenizer: splitter.tokenizer(), project_id, model_id: &model_id };
+    let target = Target { store, embedder, tokenizer: splitter.tokenizer(), project_id, model_id: &model_id, watch };
     let mut queue = Queue::new(QUEUE_PASSAGES);
     let mut waiting: Vec<QueuedDoc> = Vec::new();
     for path in &plan.index {
@@ -536,6 +706,7 @@ pub(crate) async fn refresh(
         let Some((text, hash)) = read else {
             report.skipped += 1;
             timing.docs.push(DocTiming { path: path.clone(), kind, passages: 0, phases });
+            watch(RefreshStep::FileDone);
             continue;
         };
         let masked = redact(&text).text;
@@ -726,6 +897,7 @@ struct Target<'a> {
     tokenizer: Option<&'a Tokenizer>,
     project_id: &'a str,
     model_id: &'a str,
+    watch: &'a (dyn Fn(RefreshStep) + Sync),
 }
 
 /// A doc read, split and matched with its stored vectors, waiting in the queue
@@ -772,6 +944,7 @@ async fn write_queued(
             Err(DocIndexError::Vector { path, reason }) => {
                 report.failed.push(FailedDoc { path, reason });
                 timing.docs.push(DocTiming { path: doc.path, kind: doc.kind, passages: 0, phases: doc.phases });
+                (target.watch)(RefreshStep::FileDone);
                 continue;
             }
             Err(e) => return Err(e),
@@ -791,6 +964,7 @@ async fn write_queued(
         report.indexed += 1;
         doc.phases.write = lap(mark);
         timing.docs.push(DocTiming { path: doc.path, kind: doc.kind, passages: written, phases: doc.phases });
+        (target.watch)(RefreshStep::FileDone);
     }
     Ok(())
 }
@@ -1263,7 +1437,7 @@ mod tests {
         let store = store_with_project("p", dir.path()).await;
         let left_out = HashSet::from(["notes/b.md".to_string()]);
 
-        let report = refresh(&store, &Counting::new("m1"), &TokenSplitter::fallback(), "p", dir.path(), &left_out)
+        let report = refresh(&store, &Counting::new("m1"), &TokenSplitter::fallback(), "p", dir.path(), &left_out, &|_| {})
             .await
             .unwrap()
             .report;
@@ -1288,7 +1462,7 @@ mod tests {
     }
 
     async fn run_refresh(store: &MemoryStore, root: &Path) -> RefreshRun {
-        refresh(store, &Counting::new("m1"), &TokenSplitter::fallback(), "p", root, &HashSet::new())
+        refresh(store, &Counting::new("m1"), &TokenSplitter::fallback(), "p", root, &HashSet::new(), &|_| {})
             .await
             .unwrap()
     }
@@ -1488,7 +1662,7 @@ a
         write(dir.path(), "b.md", "# B\nsound passage\n");
         let store = store_with_project("p", dir.path()).await;
 
-        let run = refresh(&store, &Unusable, &TokenSplitter::fallback(), "p", dir.path(), &HashSet::new())
+        let run = refresh(&store, &Unusable, &TokenSplitter::fallback(), "p", dir.path(), &HashSet::new(), &|_| {})
             .await
             .unwrap();
 
@@ -1535,6 +1709,160 @@ a
 
         refreshed(&index, &store, &Counting::new("m1"), "p").await;
         assert_eq!(index.last_error("p"), None);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_reports_its_plan_and_each_file_it_finishes() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "kept.md", "# Kept\nstays\n");
+        write(dir.path(), "gone.md", "# Gone\nleaves\n");
+        let store = store_with_project("p", dir.path()).await;
+        run_refresh(&store, dir.path()).await;
+        std::fs::remove_file(dir.path().join("gone.md")).unwrap();
+        write(dir.path(), "a.md", "# A\nBROKEN passage\n");
+        write(dir.path(), "b.md", "# B\nsound passage\n");
+        let steps = Mutex::new(Vec::new());
+
+        let run = refresh(&store, &Unusable, &TokenSplitter::fallback(), "p", dir.path(), &HashSet::new(), &|step| {
+            steps.lock().unwrap().push(step)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!((run.report.indexed, run.report.failed.len()), (1, 1), "{:?}", run.report);
+        assert_eq!(
+            steps.into_inner().unwrap(),
+            [
+                RefreshStep::Planned(PlannedRefresh { index: 2, unchanged: 1, remove: 1 }),
+                RefreshStep::FileDone,
+                RefreshStep::FileDone,
+            ],
+            "a file left as it was is done too"
+        );
+    }
+
+    fn status_of(index: &DocIndex, project_id: &str) -> IndexStatus {
+        index.statuses().into_iter().find(|s| s.project_id == project_id).expect("the project has a status")
+    }
+
+    #[tokio::test]
+    async fn the_status_follows_a_refresh_from_its_plan_to_its_end() {
+        let dir = crate::test_dir::test_dir();
+        // Enough passages to fill the first flush of the queue on its own.
+        let sections: String = (0..20).map(|i| format!("## Section {i}\nbody of section {i}\n")).collect();
+        write(dir.path(), "a.md", &format!("# A\nintro\n{sections}"));
+        write(dir.path(), "b.md", "# B\nthe second doc\n");
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+        let (embedder, gate) = crate::memory::embedder::GatedEmbedder::new();
+        let before = TimestampMs::now().as_millis_i64();
+
+        let guard = index.begin("p").expect("nothing is running yet");
+        let claimed = status_of(&index, "p");
+        assert!(claimed.indexing);
+        let current = claimed.current.expect("a claimed refresh is the current one");
+        assert_eq!((current.trigger, current.files_done, current.files_total), (RefreshTrigger::Registration, 0, None));
+        assert!(current.started_at_ms >= before, "{current:?}");
+
+        let planned = Mutex::new(Vec::new());
+        let note = |plan| planned.lock().unwrap().push(plan);
+        let run = guard.run(&store, &embedder, None, &note);
+        tokio::pin!(run);
+        let limit = Duration::from_secs(10);
+        tokio::select! {
+            _ = &mut run => panic!("the refresh ended behind a closed gate"),
+            entered = tokio::time::timeout(limit, gate.entered()) => entered.expect("the first flush reached the embedder"),
+        }
+        let waiting = status_of(&index, "p").current.expect("still running");
+        assert_eq!((waiting.files_done, waiting.files_total), (0, Some(2)));
+        assert_eq!(*planned.lock().unwrap(), [PlannedRefresh { index: 2, unchanged: 0, remove: 0 }]);
+
+        gate.release(1);
+        tokio::select! {
+            _ = &mut run => panic!("the refresh ended behind a closed gate"),
+            entered = tokio::time::timeout(limit, gate.entered()) => entered.expect("the second flush reached the embedder"),
+        }
+        let halfway = status_of(&index, "p");
+        assert_eq!(halfway.current.map(|c| (c.files_done, c.files_total)), Some((1, Some(2))));
+        assert_eq!(halfway.last, None, "nothing has ended yet");
+
+        gate.release(1);
+        let report = run.await.unwrap().report;
+        let ended = status_of(&index, "p");
+        assert!(!ended.indexing);
+        assert_eq!(ended.current, None);
+        let last = ended.last.expect("the refresh that ended");
+        assert_eq!(last.trigger, RefreshTrigger::Registration);
+        assert_eq!(last.started_at_ms, current.started_at_ms);
+        assert!(last.finished_at_ms >= last.started_at_ms, "{last:?}");
+        assert_eq!(last.report, Some(RefreshCounts::from(&report)));
+        assert_eq!(last.report.map(|r| (r.docs, r.indexed, r.failed)), Some((2, 2, 0)));
+        assert_eq!(last.error, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_leaves_its_cause_until_one_succeeds() {
+        let dir = crate::test_dir::test_dir();
+        write(dir.path(), "a.md", "# A\na\n");
+        let store = store_with_project("p", dir.path()).await;
+        let index = Arc::new(DocIndex::default());
+
+        let guard = index.begin_if_due("p", Instant::now()).expect("never refreshed, so due");
+        assert_eq!(guard.trigger(), RefreshTrigger::Search);
+        guard.run(&store, &Failing, None, &|_| {}).await.unwrap_err();
+
+        let failed = status_of(&index, "p").last.expect("the refresh that failed");
+        assert_eq!(failed.trigger, RefreshTrigger::Search);
+        assert!(failed.error.as_deref().is_some_and(|e| e.contains("boom")), "{failed:?}");
+        assert_eq!(failed.report, None);
+
+        refreshed(&index, &store, &Counting::new("m1"), "p").await;
+        let recovered = status_of(&index, "p").last.expect("the refresh that succeeded");
+        assert_eq!(recovered.error, None);
+        assert_eq!(recovered.report.map(|r| r.indexed), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_claimed_refresh_shows_as_running_until_it_is_released() {
+        let index = Arc::new(DocIndex::default());
+        assert_eq!(index.statuses(), []);
+
+        let second = index.begin("b").unwrap();
+        let first = index.begin_if_due("a", Instant::now()).unwrap();
+        let listed: Vec<(String, bool)> = index.statuses().into_iter().map(|s| (s.project_id, s.indexing)).collect();
+        assert_eq!(listed, [("a".to_string(), true), ("b".to_string(), true)], "by project id");
+
+        drop(first);
+        drop(second);
+        let released = status_of(&index, "a");
+        assert_eq!((released.indexing, released.current, released.last), (false, None, None), "one that never ran left no end");
+    }
+
+    #[test]
+    fn an_index_status_serializes_what_health_shows() {
+        let status = IndexStatus {
+            project_id: "p".into(),
+            indexing: true,
+            current: Some(RunningRefresh { trigger: RefreshTrigger::Search, started_at_ms: 5, files_done: 1, files_total: None }),
+            last: Some(FinishedRefresh {
+                trigger: RefreshTrigger::Registration,
+                started_at_ms: 1,
+                finished_at_ms: 2,
+                report: None,
+                error: Some("boom".into()),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            serde_json::json!({
+                "project_id": "p",
+                "indexing": true,
+                "current": { "trigger": "search", "started_at_ms": 5, "files_done": 1 },
+                "last": { "trigger": "registration", "started_at_ms": 1, "finished_at_ms": 2, "error": "boom" },
+            })
+        );
+        assert_eq!(RefreshTrigger::Search.as_str(), "search");
+        assert_eq!(RefreshTrigger::Registration.as_str(), "registration");
     }
 
     #[tokio::test]
@@ -3234,7 +3562,7 @@ old
         let store = store_with_project("p", dir.path()).await;
         let embedder = Batches::new();
 
-        let run = refresh(&store, &embedder, &TokenSplitter::fallback(), "p", dir.path(), &HashSet::new()).await.unwrap();
+        let run = refresh(&store, &embedder, &TokenSplitter::fallback(), "p", dir.path(), &HashSet::new(), &|_| {}).await.unwrap();
 
         assert_eq!(embedder.take().iter().map(Vec::len).collect::<Vec<_>>(), [6], "one call for the three docs");
         assert_eq!(run.timing.docs.len(), 3);

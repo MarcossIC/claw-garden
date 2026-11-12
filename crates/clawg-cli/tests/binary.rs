@@ -580,6 +580,45 @@ async fn status_and_stop_follow_the_daemon_process() {
     assert_eq!(after.status.code(), Some(1));
 }
 
+#[tokio::test]
+async fn status_shows_the_docs_index_and_the_log_says_when_a_refresh_starts() {
+    let sandbox = Sandbox::new();
+    let daemon = sandbox.serve().await;
+    daemon.wait_until_ready().await;
+    let root = sandbox.home.join("indexed-project");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("README.md"), "# Indexed\nThe status names this project.\n").unwrap();
+    let (status, registered) = daemon
+        .post("/v1/projects", json!({ "root_path": root.to_string_lossy(), "assigned": true, "index_docs": true }))
+        .await;
+    assert_eq!(status, 200, "{registered}");
+    let id = registered["root_id"].as_str().expect("root_id").to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let entry = loop {
+        let out = sandbox.run(&["status", "--profile", "dev"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        let report: Value = serde_json::from_slice(&out.stdout).expect("status prints JSON");
+        let ended = report["health"]["docs_index"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|e| e["project_id"] == id.as_str() && e.get("last").is_some()).cloned());
+        if let Some(entry) = ended {
+            break entry;
+        }
+        assert!(Instant::now() < deadline, "status never showed the refresh of {id}: {report}\n{}", daemon.log_text());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert_eq!(entry["indexing"], false, "{entry}");
+    assert_eq!((entry["last"]["trigger"].as_str(), entry["last"]["report"]["indexed"].as_u64()), (Some("registration"), Some(1)), "{entry}");
+    assert!(entry["last"]["finished_at_ms"].is_i64(), "{entry}");
+    let started = format!("docs refresh of {id}: started by registration: 1 to index, 0 unchanged, 0 to remove");
+    let log = daemon.log_text();
+    assert!(log.contains(&started), "{log}");
+    let done = log.find(&format!("indexed the docs of {id}")).expect("the refresh logged its end");
+    assert!(log.find(&started).is_some_and(|at| at < done), "the start is logged before the end:\n{log}");
+}
+
 /// `systemctl stop` or a plain `kill` asks with SIGTERM: the daemon stops as
 /// it does for `clawg stop`, and leaves no state file sending clients nowhere.
 #[cfg(unix)]

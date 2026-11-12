@@ -1491,7 +1491,7 @@ impl EvalDocIndex {
     /// `left_out`, which the index never sees.
     pub async fn index(&self, root: &Path, left_out: &[String]) -> Result<EvalIndexRun, EvalError> {
         let left_out: std::collections::HashSet<String> = left_out.iter().cloned().collect();
-        let run = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root, &left_out)
+        let run = project_docs::refresh(&self.store, self.embedder.as_ref(), &self.splitter, EVAL_DOCS_PROJECT, root, &left_out, &|_| {})
             .await
             .map_err(|e| EvalError::Insert(e.to_string()))?;
         let r = run.report;

@@ -609,6 +609,10 @@ pub struct HealthBody {
     /// there when the store is too busy to answer `ingest`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import: Option<JobView>,
+    /// The docs refresh that runs and the last one that ended, for each
+    /// project refreshed since the daemon started. Read from memory like
+    /// `import`, so it is there when the store is too busy to answer `ingest`.
+    pub docs_index: Vec<project_docs::IndexStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1302,6 +1306,7 @@ async fn health(State(app): State<Arc<AppCtx>>) -> Json<HealthBody> {
         uptime_s: app.started_at.elapsed().as_secs(),
         ingest,
         import: app.imports.active(),
+        docs_index: app.runtime.project_docs.statuses(),
     })
 }
 
@@ -3221,6 +3226,18 @@ fn refresh_line(project_id: &str, r: &project_docs::RefreshReport) -> String {
     )
 }
 
+/// What the log says when a refresh knows its plan, before its first file:
+/// the one line a refresh that never ends leaves.
+fn refresh_start_line(project_id: &str, trigger: project_docs::RefreshTrigger, plan: project_docs::PlannedRefresh) -> String {
+    format!(
+        "docs refresh of {project_id}: started by {}: {} to index, {} unchanged, {} to remove",
+        trigger.as_str(),
+        plan.index,
+        plan.unchanged,
+        plan.remove
+    )
+}
+
 /// Where a refresh spent its time, the phases summed over its docs. `took` is
 /// the total the metrics record too, so the line and the series agree.
 fn refresh_timing_line(project_id: &str, took: Duration, timing: &project_docs::RefreshTiming) -> String {
@@ -3243,7 +3260,9 @@ fn refresh_timing_line(project_id: &str, took: Duration, timing: &project_docs::
 async fn refresh_docs(app: &AppCtx, guard: RefreshGuard, embedder: &dyn Embedder, project_id: &str) {
     let tokenizer = app.runtime.tokenizer.get().cloned();
     let started = Instant::now();
-    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer).await;
+    let trigger = guard.trigger();
+    let planned = |plan| log::info!("{}", refresh_start_line(project_id, trigger, plan));
+    let refreshed = guard.run(&app.runtime.store, embedder, tokenizer, &planned).await;
     let took = started.elapsed();
     record_refresh(&app.runtime.metrics, took, refreshed.as_ref().ok().map(|run| &run.report));
     match refreshed {
@@ -3398,6 +3417,16 @@ mod tests {
 
     fn chunk(id: i64, outcome: ChunkOutcome) -> SavedChunk {
         SavedChunk { id, outcome }
+    }
+
+    #[test]
+    fn the_docs_start_line_names_the_project_the_trigger_and_the_plan() {
+        let plan = project_docs::PlannedRefresh { index: 36, unchanged: 865, remove: 2 };
+        assert_eq!(
+            refresh_start_line("repo-1a2b", project_docs::RefreshTrigger::Search, plan),
+            "docs refresh of repo-1a2b: started by search: 36 to index, 865 unchanged, 2 to remove"
+        );
+        assert!(refresh_start_line("p", project_docs::RefreshTrigger::Registration, plan).contains("started by registration"));
     }
 
     #[test]
