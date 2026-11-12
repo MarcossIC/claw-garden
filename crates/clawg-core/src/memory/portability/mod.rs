@@ -61,8 +61,8 @@ impl RunningImports {
 pub(crate) mod fixtures {
     use std::path::Path;
 
-    use crate::memory::identity::derive_project_id;
-    use crate::memory::MemoryStore;
+    use crate::memory::projects::identity::derive_project_id;
+    use crate::memory::store::db::MemoryStore;
 
     /// The project most rows belong to, and its root.
     pub(crate) const ROOT: &str = "/work/repo";

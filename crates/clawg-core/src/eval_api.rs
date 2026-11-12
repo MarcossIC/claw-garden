@@ -25,31 +25,31 @@ use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
-use crate::memory::access::AccessTracker;
-use crate::memory::backup::{check_restorable, known_migrations, open_for_probe, wal_with_commits, BackupError, SchemaPlan};
-use crate::memory::bootstrap::is_pooling_upgrade;
-use crate::memory::db::{differing_fields, ContractStatus, EmbeddingIdentity, MemoryStore, StoredContract};
-use crate::memory::chunker::token_splitter::TokenSplitter;
-use crate::memory::embedder::{E5Embedder, Embedder, FakeEmbedder};
+use crate::memory::retrieval::access::AccessTracker;
+use crate::memory::store::backup::{check_restorable, known_migrations, open_for_probe, wal_with_commits, BackupError, SchemaPlan};
+use crate::memory::upkeep::bootstrap::is_pooling_upgrade;
+use crate::memory::store::db::{differing_fields, ContractStatus, EmbeddingIdentity, MemoryStore, StoredContract};
+use crate::memory::embedding::chunker::token_splitter::TokenSplitter;
+use crate::memory::embedding::embedder::{E5Embedder, Embedder, FakeEmbedder};
 
 /// Re-exported so the `rag-eval` and `golden-mine` binaries can name a role
 /// without reaching into the private `memory` module tree.
-pub use crate::memory::embedder::EmbedRole;
-use crate::memory::events::{MemoryEvent, MemorySource};
-use crate::memory::language;
-use crate::memory::merge::{canonical, canonical_in};
-use crate::memory::model_download;
-use crate::memory::pieces::read_links;
+pub use crate::memory::embedding::embedder::EmbedRole;
+use crate::memory::domain::events::{MemoryEvent, MemorySource};
+use crate::memory::retrieval::language;
+use crate::memory::projects::merge::{canonical, canonical_in};
+use crate::memory::embedding::model_download;
+use crate::memory::retrieval::pieces::read_links;
 use crate::memory::project_docs;
-use crate::memory::prompt_builder::LAST_SESSION_SQL;
-use crate::memory::registry::{
+use crate::memory::retrieval::prompt_builder::LAST_SESSION_SQL;
+use crate::memory::projects::registry::{
     resolve_project, Refusal as ResolveRefusal, ResolveError as RegistryResolveError, ResolveOptions,
 };
-use crate::memory::score::{ImportanceFactor, ScoringConfig};
-use crate::memory::search::{lexical_channel_only, search_all_memories_with_scoring, SearchScope};
-use crate::memory::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
-use crate::memory::store_lock::StoreHolder;
-use crate::memory::worker::{memory_worker, resolve_tokenizer_and_chunker, ChunkOutcome, IngestRequest};
+use crate::memory::retrieval::score::{ImportanceFactor, ScoringConfig};
+use crate::memory::retrieval::search::{lexical_channel_only, search_all_memories_with_scoring, SearchScope};
+use crate::memory::ingest::store_insert::{CreatedByType, MemoryType, NewMemoryRecord};
+use crate::memory::store::store_lock::StoreHolder;
+use crate::memory::ingest::worker::{memory_worker, resolve_tokenizer_and_chunker, ChunkOutcome, IngestRequest};
 use crate::metrics::Recorder;
 use crate::models::chat::Role;
 use crate::runtime::{MemoryRuntime, INGEST_QUEUE_CAPACITY};
@@ -85,7 +85,7 @@ pub fn production_lexical_budget() -> Option<usize> {
 /// The cap is the caller's: a golden set sized against one must not change
 /// when production splits at another.
 pub fn fallback_pieces(text: &str, max_tokens: usize) -> Vec<String> {
-    crate::memory::chunker::ChatChunker::from_tokenizer(None)
+    crate::memory::embedding::chunker::ChatChunker::from_tokenizer(None)
         .chunk(text, max_tokens)
         .into_iter()
         .map(|c| c.text)
@@ -120,7 +120,7 @@ impl EvalScope {
             memory: self.memory,
             projects: None,
             lexical: self.lexical,
-            reach: crate::memory::sharing::Reach::Own,
+            reach: crate::memory::domain::sharing::Reach::Own,
         }
     }
 }
@@ -231,7 +231,7 @@ pub struct EvalSearch {
 /// The cosine a search reads from the L2 distance of two unit vectors, the
 /// function the score itself uses, so a measurement never reads a copy.
 pub fn cosine_from_distance(distance: f64) -> f64 {
-    crate::memory::score::cosine_from_l2_unit(distance)
+    crate::memory::retrieval::score::cosine_from_l2_unit(distance)
 }
 
 /// Errors surfaced by [`EvalStore`]. Its own type rather than a re-export of
@@ -365,7 +365,7 @@ impl EvalStore {
         let scope = scope
             .into_search_scope()
             .with_project(project.as_deref())
-            .with_reach(crate::memory::sharing::reader_from(Some(&self.1), agent_id).reach);
+            .with_reach(crate::memory::domain::sharing::reader_from(Some(&self.1), agent_id).reach);
         let (hits, pool) = search_all_memories_with_scoring(
             &self.0,
             embedding,
@@ -648,7 +648,7 @@ impl EvalCpu {
 
 /// The intra-op threads the embedding session is built with.
 pub fn session_threads() -> usize {
-    crate::memory::embedder::session_threads()
+    crate::memory::embedding::embedder::session_threads()
 }
 
 /// One save for [`EvalIngest::save`].
@@ -769,7 +769,7 @@ impl EvalIngest {
         let worker = tokio::spawn(memory_worker(
             rx,
             tokio::sync::watch::channel(None).1,
-            crate::memory::worker::Replay::none(),
+            crate::memory::ingest::worker::Replay::none(),
             runtime.store.clone(),
             runtime.embedder.clone(),
             chat_chunker,
@@ -809,7 +809,7 @@ impl EvalIngest {
     pub async fn save(&self, save: EvalSave<'_>) -> Result<EvalSaved, EvalError> {
         parse_memory_type(save.memory_type)?;
         if let Some(key) = save.topic_key {
-            crate::memory::topic::validate_topic_key(key).map_err(|e| EvalError::TopicKey(e.to_string()))?;
+            crate::memory::revision::topic::validate_topic_key(key).map_err(|e| EvalError::TopicKey(e.to_string()))?;
         }
         let (reply, report) = tokio::sync::oneshot::channel();
         let event = explicit_event(
@@ -858,7 +858,7 @@ impl EvalIngest {
     pub async fn holding(&self, texts: Vec<String>) -> Result<Vec<usize>, EvalError> {
         let hashes: Vec<String> = texts
             .iter()
-            .map(|t| crate::memory::dedup::content_hash(&crate::memory::redact::redact(t).text))
+            .map(|t| crate::memory::store::dedup::content_hash(&crate::memory::domain::redact::redact(t).text))
             .collect();
         self.runtime
             .store
@@ -1002,7 +1002,7 @@ pub async fn drop_superseded_vectors(runtime: &MemoryRuntime) -> Result<usize, E
                 .collect::<rusqlite::Result<_>>()?;
             let mut dropped = 0;
             {
-                let mut delete = tx.prepare(crate::memory::admin::DELETE_VEC_MEMORY)?;
+                let mut delete = tx.prepare(crate::memory::upkeep::admin::DELETE_VEC_MEMORY)?;
                 for id in ids {
                     dropped += delete.execute([id])?;
                 }
@@ -1046,14 +1046,14 @@ pub async fn drop_superseded_text(runtime: &MemoryRuntime) -> Result<usize, Eval
 
 /// Joins the pieces of one save into its text the way `read_memory` does.
 pub fn join_pieces(pieces: &[&str]) -> String {
-    crate::memory::pieces::join_pieces(pieces)
+    crate::memory::retrieval::pieces::join_pieces(pieces)
 }
 
 /// The tier a row inserted at tier 3 earns from its importance, accesses and
 /// type, the promotion the store applies: a seeded row lands where the store
 /// would have put it.
 pub fn earned_tier(importance: f64, access_count: i64, memory_type: &str) -> i64 {
-    crate::memory::tier::compute_tier(3, importance, access_count, memory_type)
+    crate::memory::store::tier::compute_tier(3, importance, access_count, memory_type)
 }
 
 /// Whether a memory type asserts something the detector can pair; a name that
@@ -1064,26 +1064,26 @@ pub fn is_claim_type(memory_type: &str) -> bool {
 
 /// The detector's band, `[NEAR_DUPLICATE_FLOOR, CONTRADICTION_THRESHOLD)`:
 /// re-exported so a measurement reads the shipped numbers, not copies.
-pub const NEAR_DUPLICATE_FLOOR: f32 = crate::memory::contradiction::NEAR_DUPLICATE_FLOOR;
-pub const CONTRADICTION_THRESHOLD: f32 = crate::memory::contradiction::CONTRADICTION_THRESHOLD;
+pub const NEAR_DUPLICATE_FLOOR: f32 = crate::memory::revision::contradiction::NEAR_DUPLICATE_FLOOR;
+pub const CONTRADICTION_THRESHOLD: f32 = crate::memory::revision::contradiction::CONTRADICTION_THRESHOLD;
 
 /// The most texts one inference run embeds: a doc's passages are embedded in
 /// runs of this many, each padded to its longest.
-pub const EMBED_BATCH: usize = crate::memory::embedder::EMBED_BATCH;
+pub const EMBED_BATCH: usize = crate::memory::embedding::embedder::EMBED_BATCH;
 
 /// The indices of `tokens` from the largest count to the smallest, equal
 /// counts in the order they came: the order an import embeds its rows in.
 pub fn longest_first(tokens: &[usize]) -> Vec<usize> {
-    crate::memory::embedder::longest_first(tokens)
+    crate::memory::embedding::embedder::longest_first(tokens)
 }
 
 /// The token window the live embedder truncates to — re-exported so the eval
 /// binary's `--follow-up` budget reads the exact same number production's
 /// embedder enforces, rather than a second copy that could drift from it.
-pub const EMBED_MAX_TOKENS: usize = crate::memory::embedder::EMBED_MAX_TOKENS;
+pub const EMBED_MAX_TOKENS: usize = crate::memory::embedding::embedder::EMBED_MAX_TOKENS;
 /// Special-token headroom the query-context budget reserves — see
 /// `EMBED_MAX_TOKENS`'s doc comment for why this is a re-export, not a copy.
-pub const SPECIAL_TOKEN_RESERVE: usize = crate::memory::embedder::SPECIAL_TOKEN_RESERVE;
+pub const SPECIAL_TOKEN_RESERVE: usize = crate::memory::embedding::embedder::SPECIAL_TOKEN_RESERVE;
 
 /// Delegates to `memory::query_context::compose_query_context` — one source
 /// of truth for both production and this harness, so the `--follow-up`
@@ -1095,7 +1095,7 @@ pub fn compose_query_context(
     budget_tokens: usize,
     count_tokens: &dyn Fn(&str) -> usize,
 ) -> String {
-    crate::memory::query_context::compose_query_context(
+    crate::memory::retrieval::query_context::compose_query_context(
         current,
         prior_turns_newest_first,
         budget_tokens,
@@ -1106,7 +1106,7 @@ pub fn compose_query_context(
 /// Delegates to `memory::query_context::query_budget_tokens` — same
 /// one-source-of-truth reasoning as [`compose_query_context`].
 pub fn query_budget_tokens(max_tokens: usize, reserve: usize, prefix_tokens: usize) -> usize {
-    crate::memory::query_context::query_budget_tokens(max_tokens, reserve, prefix_tokens)
+    crate::memory::retrieval::query_context::query_budget_tokens(max_tokens, reserve, prefix_tokens)
 }
 
 /// A token counter for the eval binary's own query-context composition —
@@ -1166,7 +1166,7 @@ impl EvalTokenCounter {
             EvalTokenCounterInner::Real(tok) => Some(tok.clone()),
             EvalTokenCounterInner::Fake => None,
         };
-        let split = crate::memory::chunker::ChatChunker::from_tokenizer(tokenizer).split_save(text);
+        let split = crate::memory::embedding::chunker::ChatChunker::from_tokenizer(tokenizer).split_save(text);
         (split.pieces.into_iter().map(|c| c.text).collect(), split.head)
     }
 }
@@ -1243,7 +1243,7 @@ pub fn load_once(model_dir: &Path, arm: LoadArm) -> Result<LoadTiming, EvalError
             }
             let verify_ms = built(start);
             let start = Instant::now();
-            crate::memory::embedder::build_session(&bytes).map_err(|e| failed(e.to_string()))?;
+            crate::memory::embedding::embedder::build_session(&bytes).map_err(|e| failed(e.to_string()))?;
             Ok(LoadTiming { verify_ms, session_ms: built(start) })
         }
         LoadArm::File => {
@@ -1274,7 +1274,7 @@ pub fn load_once(model_dir: &Path, arm: LoadArm) -> Result<LoadTiming, EvalError
             let verify_ms = built(start);
             let start = Instant::now();
             // `file` is still open: the handle outlives the build, as a held view would.
-            crate::memory::embedder::session_builder()
+            crate::memory::embedding::embedder::session_builder()
                 .map_err(|e| failed(e.to_string()))?
                 .commit_from_file(&path)
                 .map_err(|e| failed(e.to_string()))?;
@@ -1287,7 +1287,7 @@ pub fn load_once(model_dir: &Path, arm: LoadArm) -> Result<LoadTiming, EvalError
                 .map_err(|e| failed(format!("{}: {e:?}", path.display())))?;
             let verify_ms = built(start);
             let start = Instant::now();
-            crate::memory::embedder::build_session(&view).map_err(|e| failed(e.to_string()))?;
+            crate::memory::embedding::embedder::build_session(&view).map_err(|e| failed(e.to_string()))?;
             Ok(LoadTiming { verify_ms, session_ms: built(start) })
         }
     }
@@ -1410,7 +1410,7 @@ fn lengths_by_doc(
         for run in texts[start..end].chunks(EMBED_BATCH) {
             let run: Vec<&str> = run.iter().map(|(_, text)| text.as_str()).collect();
             let counting = std::time::Instant::now();
-            let counts = crate::memory::embedder::passage_token_counts(tokenizer, embedder, &run)
+            let counts = crate::memory::embedding::embedder::passage_token_counts(tokenizer, embedder, &run)
                 .map_err(|e| EvalError::Embed(e.to_string()))?;
             took += counting.elapsed();
             lengths.extend(counts);
@@ -1539,7 +1539,7 @@ impl EvalDocIndex {
     pub fn breadcrumbs(&self, root: &Path, path: &str) -> Result<Vec<String>, EvalError> {
         let kind = project_docs::corpus::classify(path).ok_or_else(|| EvalError::Doc(format!("{path}: not a doc")))?;
         let text = std::fs::read_to_string(root.join(path)).map_err(|e| EvalError::Doc(format!("{path}: {e}")))?;
-        let masked = crate::memory::redact::redact(&text).text;
+        let masked = crate::memory::domain::redact::redact(&text).text;
         Ok(project_docs::passages(kind, path, &masked, &self.splitter).into_iter().map(|p| p.breadcrumb).collect())
     }
 
@@ -1699,7 +1699,7 @@ fn stored_contract(path: &Path) -> rusqlite::Result<Option<StoredContract>> {
         |r| r.get(0),
     )?;
     if has_table {
-        crate::memory::inspect::contract(&c)
+        crate::memory::projects::inspect::contract(&c)
     } else {
         Ok(None)
     }
@@ -1929,7 +1929,7 @@ fn expected_save_in(
     rows.sort_by_key(|r| (save(r.0), links.get(&r.0).map_or(1, |l| l.position.piece)));
     let text = rows
         .chunk_by(|a, b| save(a.0) == save(b.0))
-        .map(|pieces| crate::memory::pieces::join_pieces(&pieces.iter().map(|r| r.4.as_str()).collect::<Vec<_>>()))
+        .map(|pieces| crate::memory::retrieval::pieces::join_pieces(&pieces.iter().map(|r| r.4.as_str()).collect::<Vec<_>>()))
         .collect::<Vec<_>>()
         .join("\n");
     let memory_type = rows[0].2.clone();
@@ -1952,10 +1952,10 @@ fn expected_save_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::backup::{latest_known, read_history};
-    use crate::memory::db::{seed_on_disk, StoredContract};
-    use crate::memory::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
-    use crate::memory::pieces::StoredPiece;
+    use crate::memory::store::backup::{latest_known, read_history};
+    use crate::memory::store::db::{seed_on_disk, StoredContract};
+    use crate::memory::embedding::embedder::{E5_MODEL_ID, LEGACY_CLS_MODEL_ID};
+    use crate::memory::retrieval::pieces::StoredPiece;
 
     #[test]
     fn a_seeded_row_earns_the_tier_the_store_promotes_it_to() {
@@ -1990,10 +1990,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Embedder for Measuring {
-        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
             FakeEmbedder::default().embed_with_role(text, role).await
         }
-        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, crate::memory::embedder::EmbedError> {
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, crate::memory::embedding::embedder::EmbedError> {
             let label = match role {
                 EmbedRole::Passage => "passage",
                 EmbedRole::Query => "query",
@@ -2206,7 +2206,7 @@ mod tests {
     fn eval_scoring_config_default_matches_scoring_config_default_field_for_field() {
         assert_eq!(
             EvalScoringConfig::default().into_scoring_config(),
-            crate::memory::score::ScoringConfig::DEFAULT,
+            crate::memory::retrieval::score::ScoringConfig::DEFAULT,
             "the sweep's implicit zero point must reproduce today's baseline exactly"
         );
     }
@@ -2258,7 +2258,7 @@ mod tests {
     #[tokio::test]
     async fn embed_batch_returns_one_vector_per_text_in_input_order() {
         let e = EvalEmbedder::fake();
-        let texts: Vec<String> = (0..2 * crate::memory::embedder::EMBED_BATCH + 1)
+        let texts: Vec<String> = (0..2 * crate::memory::embedding::embedder::EMBED_BATCH + 1)
             .map(|i| format!("text number {i}"))
             .collect();
 
@@ -2312,8 +2312,8 @@ mod tests {
     /// hardcoded literals that drift from `memory::embedder`.
     #[test]
     fn the_embedder_window_constants_are_re_exports_not_second_copies() {
-        assert_eq!(EMBED_MAX_TOKENS, crate::memory::embedder::EMBED_MAX_TOKENS);
-        assert_eq!(SPECIAL_TOKEN_RESERVE, crate::memory::embedder::SPECIAL_TOKEN_RESERVE);
+        assert_eq!(EMBED_MAX_TOKENS, crate::memory::embedding::embedder::EMBED_MAX_TOKENS);
+        assert_eq!(SPECIAL_TOKEN_RESERVE, crate::memory::embedding::embedder::SPECIAL_TOKEN_RESERVE);
     }
 
     // --- EvalTokenCounter ----------------------------------------------------
@@ -2340,7 +2340,7 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        let target = crate::memory::model_download::tokenizer_path(&base_dir);
+        let target = crate::memory::embedding::model_download::tokenizer_path(&base_dir);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         let vocab_path = target.parent().unwrap().join("vocab.json");
         std::fs::write(&vocab_path, r#"{"[UNK]":0,"hello":1,"world":2}"#).unwrap();
@@ -2519,7 +2519,7 @@ mod tests {
             &self,
             text: &str,
             role: EmbedRole,
-        ) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+        ) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
             let turned = |toward: usize, angle: f32| {
                 let mut v = vec![0.0_f32; 384];
                 v[0] = angle.cos();
@@ -2658,8 +2658,8 @@ mod tests {
 
     #[test]
     fn the_band_constants_are_the_detectors() {
-        assert_eq!(NEAR_DUPLICATE_FLOOR, crate::memory::contradiction::NEAR_DUPLICATE_FLOOR);
-        assert_eq!(CONTRADICTION_THRESHOLD, crate::memory::contradiction::CONTRADICTION_THRESHOLD);
+        assert_eq!(NEAR_DUPLICATE_FLOOR, crate::memory::revision::contradiction::NEAR_DUPLICATE_FLOOR);
+        assert_eq!(CONTRADICTION_THRESHOLD, crate::memory::revision::contradiction::CONTRADICTION_THRESHOLD);
     }
 
     #[test]
@@ -2868,7 +2868,7 @@ second
 
     #[async_trait::async_trait]
     impl Embedder for Prefixed {
-        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
             FakeEmbedder::default().embed_with_role(text, role).await
         }
         fn dimensions(&self) -> usize { 384 }
@@ -2885,10 +2885,10 @@ second
 
     #[async_trait::async_trait]
     impl Embedder for CallSizes {
-        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
             FakeEmbedder::default().embed_with_role(text, role).await
         }
-        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, crate::memory::embedder::EmbedError> {
+        async fn embed_batch(&self, texts: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>, crate::memory::embedding::embedder::EmbedError> {
             self.sizes.lock().unwrap().push(texts.len());
             let mut out = Vec::with_capacity(texts.len());
             for text in texts {
@@ -2943,7 +2943,7 @@ second
         let index = EvalDocIndex::open(store_dir.path(), &embedder, store_dir.path())
             .await
             .unwrap()
-            .with_tokenizer(crate::memory::chunker::word_tokenizer());
+            .with_tokenizer(crate::memory::embedding::chunker::word_tokenizer());
         index.index(root.path(), &[]).await.unwrap();
         let lengths = index.passage_lengths().await.unwrap().expect("a tokenizer is set");
         index.close().await.unwrap();
@@ -2971,7 +2971,7 @@ second
 
     #[test]
     fn lengths_are_counted_in_batches_of_the_embedder() {
-        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let tokenizer = crate::memory::embedding::chunker::word_tokenizer();
         let texts: Vec<(String, String)> = (0..19)
             .map(|i| ("a.md".to_string(), vec!["w"; i + 1].join(" ")))
             .chain([("b.md".to_string(), "x y".to_string())])
@@ -2988,7 +2988,7 @@ second
 
     #[test]
     fn a_passage_longer_than_the_window_counts_the_window() {
-        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let tokenizer = crate::memory::embedding::chunker::word_tokenizer();
         let long = vec!["w"; EMBED_MAX_TOKENS + 188].join(" ");
         let texts = vec![("a.md".to_string(), long), ("a.md".to_string(), "x y".to_string())];
 
@@ -2999,7 +2999,7 @@ second
 
     #[test]
     fn passage_order_is_the_order_a_refresh_embeds_in() {
-        let tokenizer = crate::memory::chunker::word_tokenizer();
+        let tokenizer = crate::memory::embedding::chunker::word_tokenizer();
         let counter = EvalTokenCounter(EvalTokenCounterInner::Real(tokenizer.clone()));
         let embedder = EvalEmbedder::of(Arc::new(Prefixed), Arc::default());
         let texts = |lengths: &[usize]| -> Vec<String> { lengths.iter().map(|&n| vec!["w"; n].join(" ")).collect() };
@@ -3033,7 +3033,7 @@ second
         index.close().await.unwrap();
 
         assert!(lengths.is_none());
-        assert_eq!(EMBED_BATCH, crate::memory::embedder::EMBED_BATCH);
+        assert_eq!(EMBED_BATCH, crate::memory::embedding::embedder::EMBED_BATCH);
     }
 
     #[tokio::test]
@@ -3066,7 +3066,7 @@ second
 
     #[async_trait::async_trait]
     impl Embedder for Unusable {
-        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedder::EmbedError> {
+        async fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>, crate::memory::embedding::embedder::EmbedError> {
             let mut v = FakeEmbedder::default().embed_with_role(text, role).await?;
             if text.contains("BROKEN") {
                 v[0] = f32::NAN;
@@ -3445,7 +3445,7 @@ second
         let stored = runtime
             .store
             .conn
-            .call(|c| -> rusqlite::Result<_> { crate::memory::inspect::contract(c) })
+            .call(|c| -> rusqlite::Result<_> { crate::memory::projects::inspect::contract(c) })
             .await
             .unwrap();
         assert_eq!(stored.map(|s| s.model_id), Some(fake_identity().model_id));

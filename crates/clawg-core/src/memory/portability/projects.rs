@@ -10,10 +10,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::memory::merge::MAX_MERGE_HOPS;
+use crate::memory::projects::merge::MAX_MERGE_HOPS;
 use crate::memory::portability::format::{FolderLine, ProjectLine, SubfolderLine};
-use crate::memory::project::RootPlan;
-use crate::memory::registry::name_key;
+use crate::memory::projects::project::RootPlan;
+use crate::memory::projects::registry::name_key;
 
 /// The lines of one id of a file: one project of the source store.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

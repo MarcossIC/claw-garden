@@ -94,7 +94,7 @@ El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mis
 - WHEN se llama `DELETE /v1/memories/memory/{id}?agent=B`
 - THEN responde `200` con `deleted = 1`; con `hide B A`, `404`, y la fila y su vector siguen ahí
 
-**Test:** `get_save_of_another_agent_reads_whole_unless_hidden`, `delete_with_a_hidden_author_is_404_and_another_agent_deletes_otherwise`, `patch_with_a_hidden_author_is_404_and_another_agent_patches_otherwise`, `resolve_with_a_hidden_author_is_404_and_another_agent_resolves_otherwise`, `restore_brings_a_deleted_memory_back_for_any_agent_that_reaches_it` y `an_unreadable_policy_leaves_an_agent_its_own_rows_and_the_authorless` en `crates/clawg-cli/tests/api.rs`; `a_hidden_authors_row_is_not_found_and_stays`, `another_agent_updates_a_row_it_reaches_but_not_a_hidden_one` y `restoring_needs_a_deleted_row_in_reach` en `crates/clawg-core/src/memory/admin.rs`; `another_agent_judges_a_pair_it_reaches` y `a_pair_with_a_hidden_side_is_not_found` en `crates/clawg-core/src/memory/dispute.rs`.
+**Test:** `get_save_of_another_agent_reads_whole_unless_hidden`, `delete_with_a_hidden_author_is_404_and_another_agent_deletes_otherwise`, `patch_with_a_hidden_author_is_404_and_another_agent_patches_otherwise`, `resolve_with_a_hidden_author_is_404_and_another_agent_resolves_otherwise`, `restore_brings_a_deleted_memory_back_for_any_agent_that_reaches_it` y `an_unreadable_policy_leaves_an_agent_its_own_rows_and_the_authorless` en `crates/clawg-cli/tests/api.rs`; `a_hidden_authors_row_is_not_found_and_stays`, `another_agent_updates_a_row_it_reaches_but_not_a_hidden_one` y `restoring_needs_a_deleted_row_in_reach` en `crates/clawg-core/src/memory/upkeep/admin.rs`; `another_agent_judges_a_pair_it_reaches` y `a_pair_with_a_hidden_side_is_not_found` en `crates/clawg-core/src/memory/revision/dispute.rs`.
 
 ## R5. Ruta del workspace
 
@@ -119,7 +119,7 @@ El `--agent` de `clawg hook` MUST ser el del puente, para que el hook lea al mis
 - WHEN se regenera
 - THEN la ruta es `<workspaces>/claude-code/<proyecto>/workspace.md` y la sección USER se conserva
 
-**Test:** `a_safe_agent_id_is_its_own_segment`, `an_unsafe_agent_id_is_encoded_inside_the_root`, `encoding_never_makes_two_agents_share_a_folder`, `adopting_a_legacy_workspace_keeps_an_encoded_folder`, `a_name_windows_would_rewrite_is_encoded` y `windows_naming_rules_keep_agents_apart_on_disk` en `crates/clawg-core/src/memory/workspace.rs`.
+**Test:** `a_safe_agent_id_is_its_own_segment`, `an_unsafe_agent_id_is_encoded_inside_the_root`, `encoding_never_makes_two_agents_share_a_folder`, `adopting_a_legacy_workspace_keeps_an_encoded_folder`, `a_name_windows_would_rewrite_is_encoded` y `windows_naming_rules_keep_agents_apart_on_disk` en `crates/clawg-core/src/memory/retrieval/workspace.rs`.
 
 ## R6. Datos de la versión anterior
 

@@ -7,7 +7,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::memory::clock::TimestampMs;
+use crate::memory::domain::clock::TimestampMs;
 use crate::memory::portability::timing::{Step, Timing};
 
 /// Rows and notes an import went through, by step. None of it depends on how

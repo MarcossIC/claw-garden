@@ -137,57 +137,57 @@
   {
     "id": "c02",
     "question": "where are API keys and passwords hidden before text is stored?",
-    "expected": [{"path": "crates/clawg-core/src/memory/redact.rs"}, {"path": "crates/clawg-core/src/memory/secrets.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/domain/redact.rs"}, {"path": "crates/clawg-core/src/memory/upkeep/secrets.rs"}]
   },
   {
     "id": "c03",
     "question": "¿qué guarda en disco lo que no alcanzó a procesarse al apagar, para retomarlo en el próximo arranque?",
-    "expected": [{"path": "crates/clawg-core/src/memory/outbox.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/ingest/outbox.rs"}]
   },
   {
     "id": "c04",
     "question": "how does it tell that a linked checkout shares the folder of its parent repository?",
-    "expected": [{"path": "crates/clawg-core/src/memory/identity.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/projects/identity.rs"}]
   },
   {
     "id": "c05",
     "question": "¿qué código sube o baja la temperatura de un recuerdo según cuánto se usa?",
-    "expected": [{"path": "crates/clawg-core/src/memory/tier.rs"}, {"path": "crates/clawg-core/src/memory/access.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/store/tier.rs"}, {"path": "crates/clawg-core/src/memory/retrieval/access.rs"}]
   },
   {
     "id": "c06",
     "question": "where is a saved text reduced to one key, so the same sentence with its accents encoded another way counts as a repeat?",
-    "expected": [{"path": "crates/clawg-core/src/memory/dedup.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/store/dedup.rs"}]
   },
   {
     "id": "c07",
     "question": "¿qué código hace que, al eliminar lo último que se guardó sobre un asunto, vuelva a quedar visible lo anterior?",
-    "expected": [{"path": "crates/clawg-core/src/memory/revival.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/revision/revival.rs"}]
   },
   {
     "id": "c08",
     "question": "¿cómo adivina en qué idioma está escrito un recuerdo sin ninguna red neuronal?",
-    "expected": [{"path": "crates/clawg-core/src/memory/language.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/retrieval/language.rs"}]
   },
   {
     "id": "c09",
     "question": "¿qué hace que el modelo que convierte texto en vectores deje de ocupar RAM cuando nadie lo usa un rato y se cargue de nuevo después?",
-    "expected": [{"path": "crates/clawg-core/src/memory/idle_embedder.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/embedding/idle_embedder.rs"}]
   },
   {
     "id": "c10",
     "question": "where is the label naming the subject of a note checked so it holds nothing but permitted symbols and stays short enough?",
-    "expected": [{"path": "crates/clawg-core/src/memory/topic.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/revision/topic.rs"}]
   },
   {
     "id": "c11",
     "question": "¿dónde se evita cortar un texto largo en medio de una palabra cuando se lo parte por tamaño?",
-    "expected": [{"path": "crates/clawg-core/src/memory/chunker/token_splitter.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/embedding/chunker/token_splitter.rs"}]
   },
   {
     "id": "c12",
     "question": "what keeps two programs from writing the same saved memories at once, even when neither one is the service?",
-    "expected": [{"path": "crates/clawg-core/src/memory/store_lock.rs"}]
+    "expected": [{"path": "crates/clawg-core/src/memory/store/store_lock.rs"}]
   },
   {
     "id": "c13",

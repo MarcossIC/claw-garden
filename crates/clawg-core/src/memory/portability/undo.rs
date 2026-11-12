@@ -23,9 +23,9 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::backup::Reason;
+use crate::memory::store::backup::Reason;
 use crate::memory::portability::RunningImports;
-use crate::memory::{MemoryError, MemoryStore};
+use crate::memory::{store::error::MemoryError, store::db::MemoryStore};
 
 /// Lookups per call while the store is read, each a seek in an index.
 const LOAD_BATCH: usize = 256;
@@ -1375,8 +1375,8 @@ fn rows_of(fills: &[Extra]) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::admin::{delete_memory_core, restore_memory_core};
-    use crate::memory::embedder::FakeEmbedder;
+    use crate::memory::upkeep::admin::{delete_memory_core, restore_memory_core};
+    use crate::memory::embedding::embedder::FakeEmbedder;
     use crate::memory::portability::foreign::{ForeignNote, When};
     use crate::memory::portability::import::tests::{
         clawg_file, count, destination, dump, exec, insert_row, relation, run, run_export, run_foreign, sample_notes, seeded_file,
@@ -1384,7 +1384,7 @@ mod tests {
     };
     use crate::memory::portability::import::{ImportOptions, ImportReport};
     use crate::memory::portability::translate::tests::{export as foreign_export, note as foreign_note, T0};
-    use crate::memory::relocate::{move_memories_core, MoveFilter};
+    use crate::memory::projects::relocate::{move_memories_core, MoveFilter};
 
     fn logged(id: i64) -> Logged {
         Logged { id, update_count: 0, deleted_at: None, cause: None }

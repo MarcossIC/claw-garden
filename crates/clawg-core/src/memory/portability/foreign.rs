@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::memory::backup::days_from_civil;
+use crate::memory::store::backup::days_from_civil;
 
 /// Everything an adapter read out of one export.
 #[derive(Debug, Clone, PartialEq, Eq)]
