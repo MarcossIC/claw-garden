@@ -29,8 +29,10 @@ rand = "0.9"
 once_cell = "1"
 
 # Storage and vector search
-tokio-rusqlite = "0.7"
-rusqlite = { version = "0.37", features = ["bundled", "load_extension", "functions"] }
+tokio-rusqlite = "0.9"
+# `fallible_uint` keeps `u64` and `usize` as column and parameter types, checked
+# against SQLite's signed range at run time; rusqlite leaves them out by default.
+rusqlite = { version = "0.42", features = ["bundled", "load_extension", "functions", "fallible_uint"] }
 # Built without its rusqlite driver, which accepts a closed range of rusqlite
 # versions; `memory/migrations.rs` implements the driver over `refinery-core`'s
 # traits, and reads the history's timestamps with `time` as that driver does.

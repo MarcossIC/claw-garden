@@ -124,7 +124,7 @@ static VEC0_REGISTERED: Once = Once::new();
 /// `sqlite3_open` call, including the in-memory connections used in tests.
 ///
 /// The `transmute` pattern matches the upstream `sqlite-vec` demo and is the
-/// correct approach for `rusqlite 0.37` (which still exposes the raw FFI).
+/// correct approach for `rusqlite`, which exposes the raw FFI.
 /// The `Once` guard makes this idempotent and thread-safe.
 pub(crate) fn ensure_vec0_registered() {
     // The entry point sqlite3_auto_extension takes; sqlite-vec declares its
@@ -1575,7 +1575,7 @@ mod tests {
         // Every column, so a migration that rewrote any of them would show.
         let whole_rows = |c: &mut rusqlite::Connection| -> rusqlite::Result<Rows> {
             let mut stmt = c.prepare("SELECT * FROM memory WHERE id >= 10 ORDER BY id")?;
-            let names = stmt.column_names().into_iter().map(String::from).collect();
+            let names = stmt.column_names().map(String::from).collect();
             let n = stmt.column_count();
             let rows = stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?.collect::<rusqlite::Result<_>>()?;
             Ok((names, rows))
