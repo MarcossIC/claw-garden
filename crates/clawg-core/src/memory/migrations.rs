@@ -22,6 +22,60 @@ embed_migrations!("migrations");
 // Re-export so callers can write `crate::memory::migrations::runner()`.
 pub use migrations::runner;
 
+use refinery_core::traits::sync::{Query, Transaction};
+use rusqlite::types::Type;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+/// The connection refinery migrates through.
+///
+/// refinery's own rusqlite driver accepts a closed range of rusqlite versions,
+/// which would decide the SQLite this crate bundles. The driver is the three
+/// traits below, so it lives here and refinery is built without it.
+pub struct Driver<'c>(pub &'c mut rusqlite::Connection);
+
+impl Transaction for Driver<'_> {
+    type Error = rusqlite::Error;
+
+    fn execute<'a, T: Iterator<Item = &'a str>>(&mut self, queries: T) -> Result<usize, Self::Error> {
+        let transaction = self.0.transaction()?;
+        let mut count = 0;
+        for query in queries {
+            transaction.execute_batch(query)?;
+            count += 1;
+        }
+        transaction.commit()?;
+        Ok(count)
+    }
+}
+
+impl Query<Vec<refinery::Migration>> for Driver<'_> {
+    fn query(&mut self, query: &str) -> Result<Vec<refinery::Migration>, Self::Error> {
+        let transaction = self.0.transaction()?;
+        let applied = {
+            let mut stmt = transaction.prepare(query)?;
+            let rows = stmt.query_map([], applied_migration)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
+        Ok(applied)
+    }
+}
+
+impl refinery::Migrate for Driver<'_> {}
+
+/// One row of the history table: version, name, applied_on, checksum.
+fn applied_migration(row: &rusqlite::Row<'_>) -> rusqlite::Result<refinery::Migration> {
+    let applied_on: String = row.get(2)?;
+    let applied_on = OffsetDateTime::parse(&applied_on, &Rfc3339)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(e)))?;
+    let checksum: String = row.get(3)?;
+    let checksum = checksum
+        .parse::<u64>()
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(e)))?;
+    Ok(refinery::Migration::applied(row.get(0)?, row.get(1)?, applied_on, checksum))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +140,57 @@ mod tests {
             .map(|&(v, n, c)| (v, n.to_string(), c))
             .collect();
         assert_eq!(actual, pinned);
+    }
+
+    fn two_migrations() -> Vec<refinery::Migration> {
+        vec![
+            refinery::Migration::unapplied("V1__first", "CREATE TABLE first (x INTEGER);").unwrap(),
+            refinery::Migration::unapplied("V2__second", "CREATE TABLE second (x INTEGER);").unwrap(),
+        ]
+    }
+
+    #[test]
+    fn the_driver_applies_migrations_and_reads_them_back() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        let runner = refinery::Runner::new(&two_migrations());
+
+        let first = runner.run(&mut Driver(&mut conn)).unwrap();
+        assert_eq!(first.applied_migrations().len(), 2);
+
+        let applied = runner.get_applied_migrations(&mut Driver(&mut conn)).unwrap();
+        let read: Vec<(i32, &str, u64)> = applied.iter().map(|m| (m.version(), m.name(), m.checksum())).collect();
+        let embedded = two_migrations();
+        let expected: Vec<(i32, &str, u64)> = embedded.iter().map(|m| (m.version(), m.name(), m.checksum())).collect();
+        assert_eq!(read, expected);
+        assert!(applied.iter().all(|m| m.applied_on().is_some()));
+
+        let second = runner.run(&mut Driver(&mut conn)).unwrap();
+        assert!(second.applied_migrations().is_empty());
+    }
+
+    #[test]
+    fn the_driver_rolls_back_a_group_that_fails() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut migrations = two_migrations();
+        migrations.push(refinery::Migration::unapplied("V3__broken", "THIS IS NOT SQL;").unwrap());
+
+        let outcome = refinery::Runner::new(&migrations).set_grouped(true).run(&mut Driver(&mut conn));
+        assert!(outcome.is_err());
+
+        let tables: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('first', 'second')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0);
+    }
+
+    #[test]
+    fn a_history_row_with_a_bad_checksum_is_an_error_not_a_panic() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        let runner = refinery::Runner::new(&two_migrations());
+        runner.run(&mut Driver(&mut conn)).unwrap();
+        conn.execute("UPDATE refinery_schema_history SET checksum = 'not a number' WHERE version = 2", []).unwrap();
+
+        assert!(runner.get_applied_migrations(&mut Driver(&mut conn)).is_err());
     }
 
     // ── the rows of episodic_trajectory and procedural_skill ────────────
